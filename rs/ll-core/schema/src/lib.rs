@@ -6,7 +6,7 @@
 use anyhow::Result;
 use rusqlite::{Connection, params};
 
-/// The `nodes` table DDL — the shared contract across ley-line.
+/// The `nodes` table DDL — the shared contract across ley-line and mache.
 ///
 /// ```sql
 /// CREATE TABLE IF NOT EXISTS nodes (
@@ -16,9 +16,16 @@ use rusqlite::{Connection, params};
 ///     kind INTEGER NOT NULL,   -- 0=file, 1=dir
 ///     size INTEGER DEFAULT 0,
 ///     mtime INTEGER NOT NULL,
-///     record JSON
+///     record_id TEXT,          -- optional: FK into results table (mache lazy loading)
+///     record JSON,
+///     source_file TEXT         -- optional: originating source file path (mache file tracking)
 /// );
 /// ```
+///
+/// The `record_id` and `source_file` columns are nullable and default to NULL.
+/// They are used by mache's SQLiteGraph for lazy content resolution and
+/// incremental re-ingestion tracking. Ley-line crates that don't need these
+/// features can ignore them — `insert_node()` leaves them NULL.
 pub const NODES_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS nodes (
     id TEXT PRIMARY KEY,
@@ -27,9 +34,12 @@ CREATE TABLE IF NOT EXISTS nodes (
     kind INTEGER NOT NULL,
     size INTEGER DEFAULT 0,
     mtime INTEGER NOT NULL,
-    record JSON
+    record_id TEXT,
+    record JSON,
+    source_file TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_parent_name ON nodes(parent_id, name);";
+CREATE INDEX IF NOT EXISTS idx_parent_name ON nodes(parent_id, name);
+CREATE INDEX IF NOT EXISTS idx_source_file ON nodes(source_file);";
 
 /// Create the `nodes` table and index (idempotent).
 pub fn create_schema(conn: &Connection) -> Result<()> {

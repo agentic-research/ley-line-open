@@ -17,9 +17,9 @@ fn create_test_arena(dir: &std::path::Path) -> Result<std::path::PathBuf> {
     let source = Connection::open_in_memory()?;
     create_schema(&source)?;
     source.execute_batch(
-        "INSERT INTO nodes VALUES ('vulns', '', 'vulns', 1, 0, 1000, NULL);
-        INSERT INTO nodes VALUES ('vulns/CVE-1', 'vulns', 'CVE-1', 0, 23, 2000, '{\"severity\":\"critical\"}');
-        INSERT INTO nodes VALUES ('vulns/CVE-2', 'vulns', 'CVE-2', 0, 10, 3000, '{\"severity\":\"high\"}');",
+        "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('vulns', '', 'vulns', 1, 0, 1000, NULL);
+        INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('vulns/CVE-1', 'vulns', 'CVE-1', 0, 23, 2000, '{\"severity\":\"critical\"}');
+        INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('vulns/CVE-2', 'vulns', 'CVE-2', 0, 10, 3000, '{\"severity\":\"high\"}');",
     )?;
     let serialized = source.serialize(DatabaseName::Main)?;
     let db_bytes = serialized.as_ref();

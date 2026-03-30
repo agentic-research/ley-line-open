@@ -17,9 +17,9 @@ use leyline_schema::create_schema;
 
 /// Seed SQL for the common 3-node test dataset.
 const SEED_DATA: &str = "\
-    INSERT INTO nodes VALUES ('docs', '', 'docs', 1, 0, 1000, NULL);
-    INSERT INTO nodes VALUES ('docs/readme', 'docs', 'readme', 0, 5, 2000, 'hello');
-    INSERT INTO nodes VALUES ('docs/notes', 'docs', 'notes', 0, 5, 3000, 'world');";
+    INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs', '', 'docs', 1, 0, 1000, NULL);
+    INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs/readme', 'docs', 'readme', 0, 5, 2000, 'hello');
+    INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs/notes', 'docs', 'notes', 0, 5, 3000, 'world');";
 
 /// Create a writable adapter seeded with test data.
 fn test_adapter() -> SqliteGraphAdapter {

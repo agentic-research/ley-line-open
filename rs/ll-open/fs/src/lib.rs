@@ -562,9 +562,9 @@ mod tests {
         create_schema(&source).unwrap();
         source
             .execute_batch(
-                "INSERT INTO nodes VALUES ('vulns', '', 'vulns', 1, 0, 1000, NULL);
-                INSERT INTO nodes VALUES ('vulns/CVE-1', 'vulns', 'CVE-1', 0, 23, 2000, '{\"severity\":\"critical\"}');
-                INSERT INTO nodes VALUES ('vulns/CVE-2', 'vulns', 'CVE-2', 0, 10, 3000, '{\"severity\":\"high\"}');",
+                "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('vulns', '', 'vulns', 1, 0, 1000, NULL);
+                INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('vulns/CVE-1', 'vulns', 'CVE-1', 0, 23, 2000, '{\"severity\":\"critical\"}');
+                INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('vulns/CVE-2', 'vulns', 'CVE-2', 0, 10, 3000, '{\"severity\":\"high\"}');",
             )
             .unwrap();
 
@@ -672,31 +672,31 @@ mod tests {
         // Use schema helper, then parameterized inserts for special chars
         create_schema(&source).unwrap();
         source
-            .execute_batch("INSERT INTO nodes VALUES ('root', '', 'root', 1, 0, 1000, NULL);")
+            .execute_batch("INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('root', '', 'root', 1, 0, 1000, NULL);")
             .unwrap();
 
         // Insert nodes with real special characters via params
         source
             .execute(
-                "INSERT INTO nodes VALUES (?1, 'root', ?2, 0, 0, 2000, NULL)",
+                "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES (?1, 'root', ?2, 0, 0, 2000, NULL)",
                 rusqlite::params!["root/tricky", "line1\nline2"],
             )
             .unwrap();
         source
             .execute(
-                "INSERT INTO nodes VALUES (?1, 'root', ?2, 0, 0, 3000, NULL)",
+                "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES (?1, 'root', ?2, 0, 0, 3000, NULL)",
                 rusqlite::params!["root/bs", "back\\slash"],
             )
             .unwrap();
         source
             .execute(
-                "INSERT INTO nodes VALUES (?1, 'root', ?2, 0, 0, 4000, NULL)",
+                "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES (?1, 'root', ?2, 0, 0, 4000, NULL)",
                 rusqlite::params!["root/qt", "has\"quote"],
             )
             .unwrap();
         source
             .execute(
-                "INSERT INTO nodes VALUES (?1, 'root', ?2, 0, 0, 5000, NULL)",
+                "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES (?1, 'root', ?2, 0, 0, 5000, NULL)",
                 rusqlite::params!["root/tab", "col1\tcol2"],
             )
             .unwrap();

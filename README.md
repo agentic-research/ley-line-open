@@ -48,15 +48,18 @@ CREATE TABLE IF NOT EXISTS nodes (
     id TEXT PRIMARY KEY,
     parent_id TEXT,
     name TEXT NOT NULL,
-    kind INTEGER NOT NULL,
+    kind INTEGER NOT NULL,   -- 0=file, 1=dir
     size INTEGER DEFAULT 0,
     mtime INTEGER NOT NULL,
-    record JSON
+    record_id TEXT,          -- optional: FK into results table (mache lazy loading)
+    record JSON,
+    source_file TEXT         -- optional: originating source file (mache file tracking)
 );
 CREATE INDEX IF NOT EXISTS idx_parent_name ON nodes(parent_id, name);
+CREATE INDEX IF NOT EXISTS idx_source_file ON nodes(source_file);
 ```
 
-Defined once in `leyline-schema`. Used by [mache](https://github.com/agentic-research/mache) and ley-line.
+Defined once in `leyline-schema`. Used by [mache](https://github.com/agentic-research/mache) and ley-line. The `record_id` and `source_file` columns are nullable — ley-line crates leave them NULL; mache populates them for lazy content resolution and incremental re-ingestion.
 
 ## License
 

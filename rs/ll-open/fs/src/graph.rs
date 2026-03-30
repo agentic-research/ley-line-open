@@ -1223,9 +1223,9 @@ mod tests {
         let source = Connection::open_in_memory()?;
         create_schema(&source)?;
         source.execute_batch(
-            "INSERT INTO nodes VALUES ('vulns', '', 'vulns', 1, 0, 1000, NULL);
-            INSERT INTO nodes VALUES ('vulns/CVE-2024-0001', 'vulns', 'CVE-2024-0001', 1, 0, 2000, NULL);
-            INSERT INTO nodes VALUES ('vulns/CVE-2024-0001/source', 'vulns/CVE-2024-0001', 'source', 0, 42, 3000, '{\"severity\":\"critical\"}');",
+            "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('vulns', '', 'vulns', 1, 0, 1000, NULL);
+            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('vulns/CVE-2024-0001', 'vulns', 'CVE-2024-0001', 1, 0, 2000, NULL);
+            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('vulns/CVE-2024-0001/source', 'vulns/CVE-2024-0001', 'source', 0, 42, 3000, '{\"severity\":\"critical\"}');",
         )?;
 
         let data = source.serialize(DatabaseName::Main)?;
@@ -1272,8 +1272,8 @@ mod tests {
         let source = Connection::open_in_memory()?;
         create_schema(&source)?;
         source.execute_batch(
-            "INSERT INTO nodes VALUES ('docs', '', 'docs', 1, 0, 1000, NULL);
-            INSERT INTO nodes VALUES ('docs/readme', 'docs', 'readme', 0, 5, 2000, 'hello');",
+            "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs', '', 'docs', 1, 0, 1000, NULL);
+            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs/readme', 'docs', 'readme', 0, 5, 2000, 'hello');",
         )?;
         let data = source.serialize(DatabaseName::Main)?;
         SqliteGraphAdapter::new_writable(data.as_ref())
@@ -1426,8 +1426,8 @@ mod tests {
         let source = Connection::open_in_memory()?;
         create_schema(&source)?;
         source.execute_batch(
-            "INSERT INTO nodes VALUES ('docs', '', 'docs', 1, 0, 1000, NULL);
-            INSERT INTO nodes VALUES ('docs/readme', 'docs', 'readme', 0, 5, 2000, 'hello');",
+            "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs', '', 'docs', 1, 0, 1000, NULL);
+            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs/readme', 'docs', 'readme', 0, 5, 2000, 'hello');",
         )?;
         let db_bytes = source.serialize(DatabaseName::Main)?;
 
@@ -1453,24 +1453,14 @@ mod tests {
 
     #[test]
     fn extra_columns_safe() -> Result<()> {
-        // Mache's nodes table has `record_id TEXT` that ley-line doesn't use.
-        // Verify SqliteGraphAdapter queries work when extra columns exist.
+        // Mache's nodes table has `record_id TEXT` and `source_file TEXT` columns.
+        // Verify SqliteGraphAdapter queries work with the full shared schema.
         let source = Connection::open_in_memory()?;
+        create_schema(&source)?;
         source.execute_batch(
-            "CREATE TABLE nodes (
-                id TEXT PRIMARY KEY,
-                parent_id TEXT,
-                name TEXT NOT NULL,
-                kind INTEGER NOT NULL,
-                size INTEGER DEFAULT 0,
-                mtime INTEGER NOT NULL,
-                record_id TEXT,
-                record JSON
-            );
-            CREATE INDEX idx_parent_name ON nodes(parent_id, name);
-            INSERT INTO nodes VALUES ('funcs', '', 'funcs', 1, 0, 1000, NULL, NULL);
-            INSERT INTO nodes VALUES ('funcs/Validate', 'funcs', 'Validate', 1, 0, 2000, 'rec-1', NULL);
-            INSERT INTO nodes VALUES ('funcs/Validate/source', 'funcs/Validate', 'source', 0, 18, 3000, NULL, 'func Validate(){}');",
+            "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record_id, record) VALUES ('funcs', '', 'funcs', 1, 0, 1000, NULL, NULL);
+            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record_id, record) VALUES ('funcs/Validate', 'funcs', 'Validate', 1, 0, 2000, 'rec-1', NULL);
+            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record, source_file) VALUES ('funcs/Validate/source', 'funcs/Validate', 'source', 0, 18, 3000, 'func Validate(){}', 'validate.go');",
         )?;
 
         let data = source.serialize(DatabaseName::Main)?;
@@ -1504,7 +1494,7 @@ mod tests {
         let source = Connection::open_in_memory()?;
         create_schema(&source)?;
         source.execute_batch(&format!(
-            "INSERT INTO nodes VALUES ('f', '', 'f', 0, 0, {go_mtime}, NULL);"
+            "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('f', '', 'f', 0, 0, {go_mtime}, NULL);"
         ))?;
 
         let data = source.serialize(DatabaseName::Main)?;
@@ -1546,13 +1536,13 @@ mod tests {
         let source = Connection::open_in_memory()?;
         create_schema(&source)?;
         source.execute_batch(
-            "INSERT INTO nodes VALUES ('functions', '', 'functions', 1, 0, 1000, NULL);
-            INSERT INTO nodes VALUES ('functions/main', 'functions', 'main', 1, 0, 2000, NULL);
-            INSERT INTO nodes VALUES ('functions/main/source', 'functions/main', 'source', 0, 37, 3000, 'package main\n\nfunc main() {\n}\n');
-            INSERT INTO nodes VALUES ('docs', '', 'docs', 1, 0, 1000, NULL);
-            INSERT INTO nodes VALUES ('docs/readme.txt', 'docs', 'readme.txt', 0, 5, 2000, 'hello');
-            INSERT INTO nodes VALUES ('src', '', 'src', 1, 0, 1000, NULL);
-            INSERT INTO nodes VALUES ('src/main.go', 'src', 'main.go', 0, 37, 3000, 'package main\n\nfunc main() {\n}\n');",
+            "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('functions', '', 'functions', 1, 0, 1000, NULL);
+            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('functions/main', 'functions', 'main', 1, 0, 2000, NULL);
+            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('functions/main/source', 'functions/main', 'source', 0, 37, 3000, 'package main\n\nfunc main() {\n}\n');
+            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs', '', 'docs', 1, 0, 1000, NULL);
+            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs/readme.txt', 'docs', 'readme.txt', 0, 5, 2000, 'hello');
+            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('src', '', 'src', 1, 0, 1000, NULL);
+            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('src/main.go', 'src', 'main.go', 0, 37, 3000, 'package main\n\nfunc main() {\n}\n');",
         )?;
         let data = source.serialize(DatabaseName::Main)?;
         let mut adapter = SqliteGraphAdapter::new_writable(data.as_ref())?;

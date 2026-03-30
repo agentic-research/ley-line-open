@@ -14,10 +14,10 @@ fn setup_graph() -> Result<SqliteGraphAdapter> {
     let source = Connection::open_in_memory()?;
     create_schema(&source)?;
     source.execute_batch(
-        "INSERT INTO nodes VALUES ('docs', '', 'docs', 1, 0, 1000, NULL);
-         INSERT INTO nodes VALUES ('docs/intro', 'docs', 'intro', 0, 14, 2000, 'Introduction');
-         INSERT INTO nodes VALUES ('docs/setup', 'docs', 'setup', 0, 11, 3000, 'Setup guide');
-         INSERT INTO nodes VALUES ('docs/api', 'docs', 'api', 0, 13, 4000, 'API reference');",
+        "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs', '', 'docs', 1, 0, 1000, NULL);
+         INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs/intro', 'docs', 'intro', 0, 14, 2000, 'Introduction');
+         INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs/setup', 'docs', 'setup', 0, 11, 3000, 'Setup guide');
+         INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs/api', 'docs', 'api', 0, 13, 4000, 'API reference');",
     )?;
     let data = source.serialize(DatabaseName::Main)?;
     let graph = SqliteGraph::from_bytes(data.as_ref())?;
@@ -67,12 +67,12 @@ fn all_file_contents_bulk_query() -> Result<()> {
     let source = Connection::open_in_memory()?;
     create_schema(&source)?;
     source.execute_batch(
-        "INSERT INTO nodes VALUES ('a', '', 'a', 1, 0, 1000, NULL);
-         INSERT INTO nodes VALUES ('a/b', 'a', 'b', 1, 0, 1000, NULL);
-         INSERT INTO nodes VALUES ('a/b/c', 'a/b', 'c', 0, 5, 2000, 'hello');
-         INSERT INTO nodes VALUES ('a/b/d', 'a/b', 'd', 0, 0, 3000, NULL);
-         INSERT INTO nodes VALUES ('a/b/e', 'a/b', 'e', 0, 0, 4000, '');
-         INSERT INTO nodes VALUES ('a/f', 'a', 'f', 0, 11, 5000, 'world hello');",
+        "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('a', '', 'a', 1, 0, 1000, NULL);
+         INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('a/b', 'a', 'b', 1, 0, 1000, NULL);
+         INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('a/b/c', 'a/b', 'c', 0, 5, 2000, 'hello');
+         INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('a/b/d', 'a/b', 'd', 0, 0, 3000, NULL);
+         INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('a/b/e', 'a/b', 'e', 0, 0, 4000, '');
+         INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('a/f', 'a', 'f', 0, 11, 5000, 'world hello');",
     )?;
     let data = source.serialize(DatabaseName::Main)?;
     let graph = SqliteGraph::from_bytes(data.as_ref())?;

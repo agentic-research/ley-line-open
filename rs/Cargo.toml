@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "ll-core/*",
+    "ll-open/*",
+]
+resolver = "2"

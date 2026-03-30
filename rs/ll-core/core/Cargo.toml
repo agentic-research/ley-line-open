@@ -1,0 +1,17 @@
+[package]
+name = "leyline-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+memmap2 = "0.9"
+bytemuck = { version = "1.14", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+
+[features]
+default = []
+interrupt = []
+
+[dev-dependencies]
+tempfile = "3"

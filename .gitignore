@@ -1,0 +1,32 @@
+# Default deny — only explicitly allowed files are tracked.
+# Deny all files by default.
+*
+
+# Allow traversing directories (required for nested allow rules).
+!*/
+
+# Root files
+!.gitignore
+!LICENSE
+!README.md
+
+# GitHub Actions
+!.github/**
+
+# Rust workspace
+!rs/Cargo.toml
+!rs/Cargo.lock
+
+# ll-core crates (Tier 1: OSS infrastructure)
+!rs/ll-core/**
+
+# ll-open crates (Tier 2: OSS projection engine)
+!rs/ll-open/**
+
+# Re-deny build artifacts
+**/target/
+**/*.a
+**/*.o
+**/*.so
+**/*.dylib
+**/*.d

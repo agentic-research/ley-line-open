@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package leyline.v2;
+
+// The GraphProjection is the core "packet" sent from Mache to Ley-line.
+// It contains a serialized subgraph or a set of updates.
+message GraphProjection {
+    string id = 1;
+    bytes payload = 2;
+    uint64 timestamp = 3;
+    
+    enum Type {
+        FULL = 0;
+        DELTA = 1;
+        DIAGNOSTIC = 2;
+    }
+    Type type = 4;
+}
+
+// Response from Ley-line after processing a projection.
+message ProjectionResponse {
+    string id = 1;
+    bool success = 2;
+    string error_message = 3;
+}

@@ -1,0 +1,55 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check + Clippy + Test
+    runs-on: ubuntu-latest
+    steps:
+      # SHA-pinned: actions/checkout@v4
+      - uses: actions/checkout@de0fac2550c1e8af18ae4eefe72ec16b25e8917e
+      # SHA-pinned: dtolnay/rust-toolchain (latest nightly for edition 2024)
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: nightly
+          components: clippy, rustfmt
+
+      - name: Check
+        working-directory: rs
+        run: cargo check --workspace
+
+      - name: Clippy
+        working-directory: rs
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: Format
+        working-directory: rs
+        run: cargo fmt --all -- --check
+
+      - name: Build staticlib (for FFI test)
+        working-directory: rs
+        run: cargo build -p leyline-fs --lib
+
+      - name: Test
+        working-directory: rs
+        run: cargo test --workspace
+
+  tier-isolation:
+    name: Tier isolation — ll-core builds alone
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2550c1e8af18ae4eefe72ec16b25e8917e
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: nightly
+
+      - name: Build only ll-core crates
+        working-directory: rs
+        run: cargo build -p leyline-core -p leyline-schema -p leyline-public-schema

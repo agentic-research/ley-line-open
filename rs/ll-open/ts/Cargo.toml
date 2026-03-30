@@ -1,0 +1,36 @@
+[package]
+name = "leyline-ts"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["html", "markdown", "json", "yaml"]
+html = ["dep:tree-sitter-html"]
+markdown = ["dep:tree-sitter-md"]
+json = ["dep:tree-sitter-json"]
+yaml = ["dep:tree-sitter-yaml"]
+go = ["dep:tree-sitter-go"]
+python = ["dep:tree-sitter-python"]
+elixir = ["dep:tree-sitter-elixir"]
+pyproject = ["dep:uv-pep508", "dep:uv-pep440", "dep:uv-normalize", "dep:toml"]
+
+[dependencies]
+tree-sitter = "0.26"
+tree-sitter-html = { version = "0.23", optional = true }
+tree-sitter-md = { version = "0.5", optional = true }
+tree-sitter-json = { version = "0.24", optional = true }
+tree-sitter-yaml = { version = "0.7", optional = true }
+tree-sitter-go = { version = "0.25", optional = true }
+tree-sitter-python = { version = "0.25", optional = true }
+tree-sitter-elixir = { version = "0.3.5", optional = true }
+leyline-schema = { path = "../../ll-core/schema" }
+rusqlite = { version = "0.34", features = ["bundled", "serialize"] }
+serde_json = "1"
+anyhow = "1"
+uv-pep508 = { version = "0.0.29", optional = true }
+uv-pep440 = { version = "0.0.29", optional = true }
+uv-normalize = { version = "0.0.29", optional = true }
+toml = { version = "0.8", optional = true }
+
+[dev-dependencies]
+rusqlite = { version = "0.34", features = ["bundled", "serialize"] }

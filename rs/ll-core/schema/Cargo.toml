@@ -1,0 +1,8 @@
+[package]
+name = "leyline-schema"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rusqlite = { version = "0.34", features = ["bundled", "serialize"] }
+anyhow = "1"

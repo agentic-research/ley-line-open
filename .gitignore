@@ -30,3 +30,6 @@
 **/*.so
 **/*.dylib
 **/*.d
+
+# CRUMB - personal memory (not tracked)
+.crumb/

@@ -23,6 +23,9 @@
 # ll-open crates (Tier 2: OSS projection engine)
 !rs/ll-open/**
 
+# Documentation
+!docs/**
+
 # Re-deny build artifacts
 **/target/
 **/*.a

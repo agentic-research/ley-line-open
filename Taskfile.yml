@@ -1,0 +1,89 @@
+version: '3'
+
+# Golden path: CI and local dev both use these tasks.
+# Workflows (.github/workflows/) should call `task <name>`, never raw cargo.
+
+vars:
+  # macOS needs our fuse-t pkg-config wrapper; Linux uses system libfuse3.
+  FUSE_PKG_CONFIG_PATH:
+    sh: 'if [ "$(uname)" = "Darwin" ]; then echo "{{.ROOT_DIR}}/rs/pkgconfig"; fi'
+
+env:
+  PKG_CONFIG_PATH: '{{.FUSE_PKG_CONFIG_PATH}}'
+
+tasks:
+  default:
+    desc: Show available tasks
+    cmds:
+      - task --list
+
+  # --------------------------------------------------------------------------
+  # Build
+  # --------------------------------------------------------------------------
+  build:
+    desc: Build the leyline binary (debug)
+    dir: rs
+    cmds:
+      - cargo build -p leyline-cli
+
+  release:
+    desc: Build the leyline binary (release, optimized)
+    dir: rs
+    cmds:
+      - cargo build --release -p leyline-cli
+
+  install:
+    desc: Build release and install to ~/.local/bin
+    deps: [release]
+    cmds:
+      - mkdir -p ~/.local/bin
+      - cp rs/target/release/leyline ~/.local/bin/leyline
+      - cmd: install_name_tool -add_rpath /usr/local/lib ~/.local/bin/leyline 2>/dev/null || true
+        platforms: [darwin]
+      - echo "installed $(~/.local/bin/leyline --version)"
+
+  # --------------------------------------------------------------------------
+  # Test
+  # --------------------------------------------------------------------------
+  test:
+    desc: Run all tests
+    dir: rs
+    cmds:
+      - cargo test --workspace
+
+  test:lib:
+    desc: Run library tests only (no integration tests)
+    dir: rs
+    cmds:
+      - cargo test --workspace --lib
+
+  test:cli:
+    desc: Run CLI integration tests
+    dir: rs
+    cmds:
+      - cargo test -p leyline-cli-lib
+
+  # --------------------------------------------------------------------------
+  # Quality
+  # --------------------------------------------------------------------------
+  clippy:
+    desc: Run clippy on all crates
+    dir: rs
+    cmds:
+      - cargo clippy --workspace -- -D warnings
+
+  check:
+    desc: Fast type-check without codegen
+    dir: rs
+    cmds:
+      - cargo check --workspace
+
+  # --------------------------------------------------------------------------
+  # All-in-one
+  # --------------------------------------------------------------------------
+  ci:
+    desc: Full CI pipeline (check + clippy + test)
+    cmds:
+      - task: check
+      - task: clippy
+      - task: test

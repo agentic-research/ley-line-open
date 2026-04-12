@@ -23,6 +23,10 @@
 # ll-open crates (Tier 2: OSS projection engine)
 !rs/ll-open/**
 
+# Build infrastructure
+!Taskfile.yml
+!rs/pkgconfig/**
+
 # Documentation
 !docs/**
 

@@ -1,0 +1,11 @@
+# Wrapper for fuse-t on macOS — fuser crate looks for "fuse", fuse-t installs as "fuse-t"
+prefix=/usr/local
+exec_prefix=${prefix}
+libdir=${prefix}/lib
+includedir=${prefix}/include/fuse
+
+Name: fuse
+Description: fuse-t compatibility wrapper
+Version: 2.9.9
+Libs: -L${libdir} -Wl,-rpath,${libdir} -lfuse-t
+Cflags: -I${includedir} -D_FILE_OFFSET_BITS=64

@@ -3,10 +3,16 @@ name = "leyline-cli-lib"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["lsp"]
+lsp = ["dep:leyline-lsp"]
+
 [dependencies]
+leyline-lsp = { path = "../lsp", optional = true }
 leyline-ts = { path = "../ts", features = ["html", "markdown", "json", "yaml", "go", "python", "elixir"] }
 leyline-schema = { path = "../../ll-core/schema" }
 leyline-core = { path = "../../ll-core/core" }
+leyline-fs = { path = "../fs" }
 rusqlite = { version = "0.34", features = ["bundled", "serialize"] }
 tree-sitter = "0.26"
 clap = { version = "4", features = ["derive"] }
@@ -14,6 +20,7 @@ anyhow = "1"
 log = "0.4"
 memmap2 = "0.9"
 bytemuck = { version = "1.14", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -6,7 +6,10 @@
 
 pub mod cmd_inspect;
 pub mod cmd_load;
+#[cfg(feature = "lsp")]
+pub mod cmd_lsp;
 pub mod cmd_parse;
+pub mod cmd_serve;
 pub mod cmd_splice;
 
 use std::path::PathBuf;
@@ -78,6 +81,69 @@ pub enum Commands {
         #[arg(long)]
         text: String,
     },
+
+    /// Spawn a language server, collect symbols + diagnostics, and write a .db.
+    #[cfg(feature = "lsp")]
+    Lsp {
+        /// LSP server command (e.g. "gopls", "pyright-langserver").
+        #[arg(long)]
+        server: String,
+
+        /// Arguments passed to the LSP server.
+        #[arg(long, num_args = 0.., allow_hyphen_values = true)]
+        server_args: Vec<String>,
+
+        /// Source file to analyse.
+        #[arg(long)]
+        input: PathBuf,
+
+        /// Output .db path.
+        #[arg(long)]
+        output: PathBuf,
+
+        /// Existing .db to merge LSP data into (enables merge mode).
+        #[arg(long)]
+        merge_db: Option<PathBuf>,
+
+        /// Override the language ID sent to the server (inferred from extension if omitted).
+        #[arg(long)]
+        language_id: Option<String>,
+    },
+
+    /// Create an arena, mount it via NFS or FUSE, and wait for shutdown.
+    Serve {
+        /// Path to the arena file.
+        #[arg(long, default_value = "./leyline.arena")]
+        arena: PathBuf,
+
+        /// Arena size in MiB.
+        #[arg(long, default_value_t = 64)]
+        arena_size_mib: u64,
+
+        /// Path to the controller (.ctrl) file. Defaults to arena path with .ctrl extension.
+        #[arg(long)]
+        control: Option<PathBuf>,
+
+        /// Directory to mount the filesystem at.
+        #[arg(long)]
+        mount: PathBuf,
+
+        /// Filesystem backend: "nfs" or "fuse".
+        #[arg(long, default_value_t = cmd_serve::default_backend())]
+        backend: String,
+
+        /// NFS listen port (0 = auto-assign).
+        #[arg(long, default_value_t = 0)]
+        nfs_port: u16,
+
+        /// Default language for validation of extensionless files (e.g. "go", "py").
+        #[arg(long)]
+        language: Option<String>,
+
+        /// Timeout before automatic shutdown (e.g. "30s", "5m", "2h").
+        #[arg(long)]
+        timeout: Option<String>,
+    },
 }
 
 /// Dispatch a command to its implementation.
@@ -101,5 +167,46 @@ pub async fn run(cmd: Commands) -> Result<()> {
         ),
         Commands::Load { db, control } => cmd_load::cmd_load(&db, &control),
         Commands::Splice { db, node, text } => cmd_splice::cmd_splice(&db, &node, &text),
+        #[cfg(feature = "lsp")]
+        Commands::Lsp {
+            server,
+            server_args,
+            input,
+            output,
+            merge_db,
+            language_id,
+        } => {
+            cmd_lsp::cmd_lsp(
+                &server,
+                &server_args,
+                &input,
+                &output,
+                merge_db.as_deref(),
+                language_id.as_deref(),
+            )
+            .await
+        }
+        Commands::Serve {
+            arena,
+            arena_size_mib,
+            control,
+            mount,
+            backend,
+            nfs_port,
+            language,
+            timeout,
+        } => {
+            cmd_serve::cmd_serve(
+                &arena,
+                arena_size_mib,
+                control.as_deref(),
+                &mount,
+                &backend,
+                nfs_port,
+                language.as_deref(),
+                timeout.as_deref(),
+            )
+            .await
+        }
     }
 }

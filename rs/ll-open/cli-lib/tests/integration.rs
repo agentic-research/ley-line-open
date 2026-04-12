@@ -293,7 +293,160 @@ fn test_inspect_node_lookup() {
     assert!(result.is_err(), "inspect missing node should fail");
 }
 
+/// Verify that serve's setup phase creates the arena file and controller with
+/// correct state, without actually mounting a filesystem (which needs privileges).
+#[test]
+fn test_serve_creates_arena() {
+    use leyline_core::Controller;
+
+    let dir = TempDir::new().expect("create temp dir");
+    let arena_path = dir.path().join("test.arena");
+    let ctrl_path = dir.path().join("test.ctrl");
+
+    let arena_size_mib: u64 = 2;
+    let arena_bytes = arena_size_mib * 1024 * 1024;
+
+    // Run setup_arena — the reusable core of cmd_serve.
+    let returned_ctrl = leyline_cli_lib::cmd_serve::setup_arena(
+        &arena_path,
+        arena_bytes,
+        Some(&ctrl_path),
+    )
+    .expect("setup_arena should succeed");
+
+    // Verify the arena file was created with the expected size.
+    assert!(arena_path.exists(), "arena file should exist");
+    let arena_meta = fs::metadata(&arena_path).expect("stat arena");
+    assert_eq!(
+        arena_meta.len(),
+        arena_bytes,
+        "arena file should be {arena_bytes} bytes"
+    );
+
+    // Verify the controller file was created.
+    assert_eq!(returned_ctrl, ctrl_path, "returned ctrl path should match");
+    assert!(ctrl_path.exists(), "controller file should exist");
+
+    // Verify controller state: generation 0 and arena path is set.
+    let ctrl = Controller::open_or_create(&ctrl_path).expect("open controller");
+    assert_eq!(ctrl.generation(), 0, "fresh controller should be gen 0");
+    assert_eq!(
+        ctrl.arena_size(),
+        arena_bytes,
+        "controller should record arena size"
+    );
+    // The arena path in the controller is canonicalized, so just check it ends with our filename.
+    let stored_path = ctrl.arena_path();
+    assert!(
+        stored_path.ends_with("test.arena"),
+        "controller arena path should reference the arena file, got: {stored_path}"
+    );
+}
+
+/// Verify that setup_arena derives the control path from the arena path when
+/// no explicit control path is given (arena.ctrl next to arena file).
+#[test]
+fn test_serve_derives_control_path() {
+    let dir = TempDir::new().expect("create temp dir");
+    let arena_path = dir.path().join("my.arena");
+
+    let ctrl_path = leyline_cli_lib::cmd_serve::setup_arena(
+        &arena_path,
+        2 * 1024 * 1024,
+        None,
+    )
+    .expect("setup_arena should succeed");
+
+    // Should derive .ctrl extension from .arena
+    let expected = dir.path().join("my.ctrl");
+    assert_eq!(ctrl_path, expected, "derived ctrl path should use .ctrl extension");
+    assert!(expected.exists(), "derived controller file should exist");
+}
+
 #[test]
 fn test_edition_is_open() {
     assert_eq!(EDITION, "open");
+}
+
+/// Compile-time proof that the Lsp variant exists when the `lsp` feature is enabled.
+/// We can't spawn a real LSP server in CI, so we just prove the variant parses and matches.
+#[cfg(feature = "lsp")]
+#[test]
+fn test_lsp_variant_exists() {
+    use std::path::PathBuf;
+
+    let cmd = Commands::Lsp {
+        server: "gopls".to_string(),
+        server_args: vec!["-remote=auto".to_string()],
+        input: PathBuf::from("/tmp/main.go"),
+        output: PathBuf::from("/tmp/out.db"),
+        merge_db: None,
+        language_id: Some("go".to_string()),
+    };
+
+    match cmd {
+        Commands::Lsp {
+            server,
+            server_args,
+            input,
+            output,
+            merge_db,
+            language_id,
+        } => {
+            assert_eq!(server, "gopls");
+            assert_eq!(server_args, vec!["-remote=auto"]);
+            assert_eq!(input, PathBuf::from("/tmp/main.go"));
+            assert_eq!(output, PathBuf::from("/tmp/out.db"));
+            assert!(merge_db.is_none());
+            assert_eq!(language_id.as_deref(), Some("go"));
+        }
+        _ => panic!("expected Lsp variant"),
+    }
+}
+
+/// Verify that `lsp` subcommand is parseable via clap when the feature is enabled.
+#[cfg(feature = "lsp")]
+#[test]
+fn test_lsp_clap_parsing() {
+    use clap::Parser;
+
+    #[derive(Parser)]
+    #[command(name = "test")]
+    struct TestCli {
+        #[command(subcommand)]
+        command: Commands,
+    }
+
+    // Note: --server-args must come last because num_args=0.. consumes remaining values.
+    let cli = TestCli::try_parse_from([
+        "test",
+        "lsp",
+        "--server",
+        "pyright-langserver",
+        "--input",
+        "/tmp/test.py",
+        "--output",
+        "/tmp/out.db",
+        "--language-id",
+        "python",
+        "--server-args",
+        "--stdio",
+    ])
+    .expect("should parse lsp subcommand");
+
+    match cli.command {
+        Commands::Lsp {
+            server,
+            server_args,
+            input,
+            language_id,
+            ..
+        } => {
+            assert_eq!(server, "pyright-langserver");
+            assert_eq!(server_args, vec!["--stdio"]);
+            assert_eq!(input, Path::new("/tmp/test.py"));
+            assert_eq!(language_id.as_deref(), Some("python"));
+        }
+        _ => panic!("expected Lsp variant"),
+    }
 }

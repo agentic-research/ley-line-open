@@ -82,7 +82,7 @@ pub fn setup_arena(
 }
 
 /// Shell out to mount_nfs (macOS) or mount.nfs (Linux) to mount the NFS export.
-fn mount_nfs_cmd(port: u16, mountpoint: &Path) -> Result<()> {
+pub fn mount_nfs_cmd(port: u16, mountpoint: &Path) -> Result<()> {
     std::fs::create_dir_all(mountpoint)
         .with_context(|| format!("create mountpoint {}", mountpoint.display()))?;
 
@@ -174,7 +174,7 @@ pub async fn cmd_serve(
 }
 
 /// Wait for Ctrl+C or an optional timeout, whichever comes first.
-async fn wait_for_shutdown(timeout: Option<&str>) -> Result<()> {
+pub async fn wait_for_shutdown(timeout: Option<&str>) -> Result<()> {
     let timeout_dur = match timeout {
         Some(s) => Some(parse_duration(s)?),
         None => None,

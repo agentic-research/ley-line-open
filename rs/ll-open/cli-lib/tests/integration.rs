@@ -73,8 +73,8 @@ fn test_commands_flattenable() {
     enum ExtendedCommands {
         #[command(flatten)]
         Open(Commands),
-        /// A private-only subcommand.
-        Daemon,
+        /// A private-only subcommand (named differently to avoid clash with open's daemon).
+        Embed,
     }
 
     #[derive(Parser)]
@@ -95,11 +95,11 @@ fn test_commands_flattenable() {
         _ => panic!("expected Open(Parse {{ .. }})"),
     }
 
-    // Parse a `daemon` subcommand through the wrapper — proves extension works.
-    let cli2 = ExtendedCli::try_parse_from(["leyline-extended", "daemon"])
-        .expect("should parse 'daemon' subcommand");
+    // Parse an `embed` subcommand through the wrapper — proves extension works.
+    let cli2 = ExtendedCli::try_parse_from(["leyline-extended", "embed"])
+        .expect("should parse 'embed' subcommand");
 
-    assert!(matches!(cli2.command, ExtendedCommands::Daemon));
+    assert!(matches!(cli2.command, ExtendedCommands::Embed));
 }
 
 #[tokio::test]
@@ -521,6 +521,14 @@ fn test_lsp_variant_exists() {
         }
         _ => panic!("expected Lsp variant"),
     }
+}
+
+#[test]
+fn test_daemon_variant_in_help() {
+    use clap::Subcommand;
+    let cmd = leyline_cli_lib::Commands::augment_subcommands(clap::Command::new("test"));
+    let sub_names: Vec<&str> = cmd.get_subcommands().map(|s| s.get_name()).collect();
+    assert!(sub_names.contains(&"daemon"), "daemon subcommand should exist: {sub_names:?}");
 }
 
 /// Verify that `lsp` subcommand is parseable via clap when the feature is enabled.

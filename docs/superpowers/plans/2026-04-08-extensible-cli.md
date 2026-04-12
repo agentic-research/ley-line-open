@@ -8,6 +8,14 @@
 
 **Tech Stack:** Rust (edition 2024), clap 4 (derive), anyhow, tokio, rusqlite, leyline-ts, leyline-fs, leyline-lsp, leyline-core
 
+## Hard Rules
+
+1. **Every command gets an integration test.** No command ships without a test that exercises it end-to-end against a real .db file.
+2. **No code duplication.** Each `cmd_*.rs` is a thin wiring layer (~30 lines) that calls library functions from `leyline-ts`, `leyline-fs`, `leyline-core`, `leyline-lsp`. If you're writing business logic in the CLI, you're doing it wrong.
+3. **Tests use a shared fixture.** A helper function creates a small .db from embedded Go source. Every integration test starts from this fixture.
+4. **Readability over cleverness.** Future-you reads this code. Clear names, one responsibility per file, no magic.
+5. **Test the extension point.** At least one test proves `Commands` can be flattened into a wrapper enum (simulating what ley-line does).
+
 ---
 
 ### Task 1: Create `cli-lib` crate with `Commands` enum and move `parse` logic

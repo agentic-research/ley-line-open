@@ -955,9 +955,13 @@ name = "leyline-cli-lib"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "clap",
+ "leyline-core",
  "leyline-schema",
  "leyline-ts",
+ "log",
+ "memmap2",
  "rusqlite",
  "tempfile",
  "tokio",

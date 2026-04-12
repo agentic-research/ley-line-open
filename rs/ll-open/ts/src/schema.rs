@@ -73,3 +73,93 @@ pub fn insert_ast(
     )?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Refs / Defs / Imports tables
+// ---------------------------------------------------------------------------
+
+/// DDL for the `node_refs` table — stores identifier references.
+pub const REFS_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS node_refs (
+    token TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    source_id TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_refs_token ON node_refs(token);
+CREATE INDEX IF NOT EXISTS idx_refs_node ON node_refs(node_id);";
+
+/// DDL for the `node_defs` table — stores identifier definitions.
+pub const DEFS_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS node_defs (
+    token TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    source_id TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_defs_token ON node_defs(token);";
+
+/// DDL for the `_imports` table — stores import/require mappings.
+pub const IMPORTS_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS _imports (
+    alias TEXT NOT NULL,
+    path TEXT NOT NULL,
+    source_id TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_imports_source ON _imports(source_id);";
+
+/// Create `node_refs`, `node_defs`, and `_imports` tables (idempotent).
+pub fn create_refs_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(REFS_DDL)?;
+    conn.execute_batch(DEFS_DDL)?;
+    conn.execute_batch(IMPORTS_DDL)?;
+    Ok(())
+}
+
+/// Insert a reference row.
+pub fn insert_ref(conn: &Connection, token: &str, node_id: &str, source_id: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO node_refs (token, node_id, source_id) VALUES (?1, ?2, ?3)",
+        params![token, node_id, source_id],
+    )?;
+    Ok(())
+}
+
+/// Insert a definition row.
+pub fn insert_def(conn: &Connection, token: &str, node_id: &str, source_id: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO node_defs (token, node_id, source_id) VALUES (?1, ?2, ?3)",
+        params![token, node_id, source_id],
+    )?;
+    Ok(())
+}
+
+/// Insert an import row.
+pub fn insert_import(conn: &Connection, alias: &str, path: &str, source_id: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO _imports (alias, path, source_id) VALUES (?1, ?2, ?3)",
+        params![alias, path, source_id],
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refs_schema_creates_tables() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_schema(&conn).unwrap();
+        create_refs_schema(&conn).unwrap();
+
+        insert_ref(&conn, "Println", "main.go/call_expression", "main.go").unwrap();
+        insert_def(&conn, "Add", "main.go/function_declaration", "main.go").unwrap();
+        insert_import(&conn, "fmt", "fmt", "main.go").unwrap();
+
+        let ref_count: i64 = conn.query_row("SELECT COUNT(*) FROM node_refs", [], |r| r.get(0)).unwrap();
+        assert_eq!(ref_count, 1);
+        let def_count: i64 = conn.query_row("SELECT COUNT(*) FROM node_defs", [], |r| r.get(0)).unwrap();
+        assert_eq!(def_count, 1);
+        let import_count: i64 = conn.query_row("SELECT COUNT(*) FROM _imports", [], |r| r.get(0)).unwrap();
+        assert_eq!(import_count, 1);
+    }
+}

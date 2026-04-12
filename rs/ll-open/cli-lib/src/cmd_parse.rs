@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use leyline_ts::languages::TsLanguage;
-use leyline_ts::schema::{create_ast_schema, insert_ast, insert_node, insert_source};
+use leyline_ts::refs::extract_go_refs;
+use leyline_ts::schema::{create_ast_schema, create_refs_schema, insert_ast, insert_node, insert_source};
 use rusqlite::Connection;
 use tree_sitter::TreeCursor;
 
@@ -30,6 +31,7 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
 
     conn.pragma_update(None, "journal_mode", "WAL")?;
     create_ast_schema(&conn)?;
+    create_refs_schema(&conn)?;
 
     let mtime = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -172,7 +174,7 @@ fn project_file(
     )?;
 
     let mut cursor = root.walk();
-    walk_children(content, &mut cursor, source_id, mtime, conn, source_id)?;
+    walk_children(content, &mut cursor, source_id, mtime, conn, source_id, language)?;
 
     Ok(())
 }
@@ -186,6 +188,7 @@ fn walk_children(
     mtime: i64,
     conn: &Connection,
     source_id: &str,
+    language: TsLanguage,
 ) -> Result<()> {
     let node = cursor.node();
 
@@ -236,6 +239,10 @@ fn walk_children(
             child.end_position().column,
         )?;
 
+        if language == TsLanguage::Go {
+            extract_go_refs(child, content, &id, source_id, conn)?;
+        }
+
         let has_named_children = {
             let mut c = child.walk();
             let mut found = false;
@@ -256,7 +263,7 @@ fn walk_children(
         if has_named_children {
             insert_node(conn, &id, parent_id, &name, 1, 0, mtime, "")?;
             let mut sub_cursor = child.walk();
-            walk_children(content, &mut sub_cursor, &id, mtime, conn, source_id)?;
+            walk_children(content, &mut sub_cursor, &id, mtime, conn, source_id, language)?;
         } else {
             let text = child.utf8_text(content).unwrap_or("");
             insert_node(conn, &id, parent_id, &name, 0, text.len() as i64, mtime, text)?;

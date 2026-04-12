@@ -531,6 +531,120 @@ fn test_daemon_variant_in_help() {
     assert!(sub_names.contains(&"daemon"), "daemon subcommand should exist: {sub_names:?}");
 }
 
+// ---------------------------------------------------------------------------
+// Go ref extraction + mache schema compat tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_parse_produces_go_refs() {
+    let src = tempfile::TempDir::new().unwrap();
+    let out_dir = tempfile::TempDir::new().unwrap();
+    let db_path = out_dir.path().join("refs-test.db");
+
+    std::fs::write(
+        src.path().join("main.go"),
+        b"package main\n\nimport (\n\t\"fmt\"\n\tauth \"github.com/foo/auth\"\n)\n\nfunc main() {\n\tfmt.Println(\"hi\")\n\tauth.Validate()\n\thelper()\n}\n\nfunc helper() {}\n",
+    ).unwrap();
+
+    let cmd = leyline_cli_lib::Commands::Parse {
+        source: src.path().to_path_buf(),
+        output: db_path.clone(),
+        lang: Some("go".to_string()),
+    };
+    leyline_cli_lib::run(cmd).await.unwrap();
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+    // node_defs: should have "main" and "helper"
+    let def_count: i64 = conn.query_row("SELECT COUNT(*) FROM node_defs", [], |r| r.get(0)).unwrap();
+    assert!(def_count >= 2, "should have at least 2 defs, got {def_count}");
+
+    let main_def: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM node_defs WHERE token = 'main'", [], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(main_def, 1, "should have 'main' def");
+
+    let helper_def: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM node_defs WHERE token = 'helper'", [], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(helper_def, 1, "should have 'helper' def");
+
+    // node_refs: should have calls
+    let ref_count: i64 = conn.query_row("SELECT COUNT(*) FROM node_refs", [], |r| r.get(0)).unwrap();
+    assert!(ref_count >= 3, "should have at least 3 refs, got {ref_count}");
+
+    let println_ref: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM node_refs WHERE token = 'fmt.Println'", [], |r| r.get(0),
+    ).unwrap();
+    assert!(println_ref >= 1, "should have 'fmt.Println' ref");
+
+    let helper_ref: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM node_refs WHERE token = 'helper'", [], |r| r.get(0),
+    ).unwrap();
+    assert!(helper_ref >= 1, "should have 'helper' call ref");
+
+    // _imports
+    let import_count: i64 = conn.query_row("SELECT COUNT(*) FROM _imports", [], |r| r.get(0)).unwrap();
+    assert_eq!(import_count, 2, "should have 2 imports");
+
+    let auth_import: String = conn.query_row(
+        "SELECT path FROM _imports WHERE alias = 'auth'", [], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(auth_import, "github.com/foo/auth");
+}
+
+#[tokio::test]
+async fn test_refs_tables_match_mache_schema() {
+    let src = tempfile::TempDir::new().unwrap();
+    let out_dir = tempfile::TempDir::new().unwrap();
+    let db_path = out_dir.path().join("mache-compat.db");
+
+    std::fs::write(
+        src.path().join("main.go"),
+        b"package main\n\nfunc main() {}\n",
+    ).unwrap();
+
+    let cmd = leyline_cli_lib::Commands::Parse {
+        source: src.path().to_path_buf(),
+        output: db_path.clone(),
+        lang: Some("go".to_string()),
+    };
+    leyline_cli_lib::run(cmd).await.unwrap();
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+    // Verify all tables mache expects exist
+    let tables: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        ).unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+
+    assert!(tables.contains(&"nodes".to_string()), "missing nodes: {tables:?}");
+    assert!(tables.contains(&"_ast".to_string()), "missing _ast: {tables:?}");
+    assert!(tables.contains(&"_source".to_string()), "missing _source: {tables:?}");
+    assert!(tables.contains(&"node_refs".to_string()), "missing node_refs: {tables:?}");
+    assert!(tables.contains(&"node_defs".to_string()), "missing node_defs: {tables:?}");
+    assert!(tables.contains(&"_imports".to_string()), "missing _imports: {tables:?}");
+
+    // Verify mache fast-path trigger
+    let nodes_exists: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='nodes'",
+        [], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(nodes_exists, 1);
+
+    // Verify node_refs columns match mache's expected query pattern
+    // mache does: SELECT node_id FROM node_refs WHERE token = ?
+    conn.execute("SELECT token, node_id, source_id FROM node_refs LIMIT 0", []).unwrap();
+    conn.execute("SELECT token, node_id, source_id FROM node_defs LIMIT 0", []).unwrap();
+    conn.execute("SELECT alias, path, source_id FROM _imports LIMIT 0", []).unwrap();
+}
+
 /// Verify that `lsp` subcommand is parseable via clap when the feature is enabled.
 #[cfg(feature = "lsp")]
 #[test]

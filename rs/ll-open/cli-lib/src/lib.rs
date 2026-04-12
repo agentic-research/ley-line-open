@@ -147,40 +147,6 @@ pub enum Commands {
         timeout: Option<String>,
     },
 
-    /// Run the daemon: arena + mount + UDS socket for coordination.
-    Daemon {
-        /// Path to the arena file.
-        #[arg(long, default_value = "./leyline.arena")]
-        arena: PathBuf,
-
-        /// Arena size in MiB.
-        #[arg(long, default_value_t = 64)]
-        arena_size_mib: u64,
-
-        /// Path to the controller (.ctrl) file. Defaults to arena path with .ctrl extension.
-        #[arg(long)]
-        control: Option<PathBuf>,
-
-        /// Directory to mount the filesystem at.
-        #[arg(long)]
-        mount: PathBuf,
-
-        /// Filesystem backend: "nfs" or "fuse".
-        #[arg(long, default_value_t = cmd_serve::default_backend())]
-        backend: String,
-
-        /// NFS listen port (0 = auto-assign).
-        #[arg(long, default_value_t = 0)]
-        nfs_port: u16,
-
-        /// Default language for validation of extensionless files (e.g. "go", "py").
-        #[arg(long)]
-        language: Option<String>,
-
-        /// Timeout before automatic shutdown (e.g. "30s", "5m", "2h").
-        #[arg(long)]
-        timeout: Option<String>,
-    },
 }
 
 /// Dispatch a command to its implementation.
@@ -234,28 +200,6 @@ pub async fn run(cmd: Commands) -> Result<()> {
             timeout,
         } => {
             cmd_serve::cmd_serve(
-                &arena,
-                arena_size_mib,
-                control.as_deref(),
-                &mount,
-                &backend,
-                nfs_port,
-                language.as_deref(),
-                timeout.as_deref(),
-            )
-            .await
-        }
-        Commands::Daemon {
-            arena,
-            arena_size_mib,
-            control,
-            mount,
-            backend,
-            nfs_port,
-            language,
-            timeout,
-        } => {
-            cmd_daemon::cmd_daemon(
                 &arena,
                 arena_size_mib,
                 control.as_deref(),

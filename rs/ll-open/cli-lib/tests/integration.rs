@@ -523,13 +523,9 @@ fn test_lsp_variant_exists() {
     }
 }
 
-#[test]
-fn test_daemon_variant_in_help() {
-    use clap::Subcommand;
-    let cmd = leyline_cli_lib::Commands::augment_subcommands(clap::Command::new("test"));
-    let sub_names: Vec<&str> = cmd.get_subcommands().map(|s| s.get_name()).collect();
-    assert!(sub_names.contains(&"daemon"), "daemon subcommand should exist: {sub_names:?}");
-}
+// Daemon variant is defined in the binary (not Commands), so each binary
+// (open vs extended) can define its own args. The daemon logic is tested
+// via the socket tests above.
 
 // ---------------------------------------------------------------------------
 // Go ref extraction + mache schema compat tests

@@ -11,6 +11,7 @@ pub mod cmd_lsp;
 pub mod cmd_parse;
 pub mod cmd_serve;
 pub mod cmd_splice;
+pub mod daemon;
 
 use std::path::PathBuf;
 

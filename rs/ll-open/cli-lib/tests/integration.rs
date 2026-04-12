@@ -368,6 +368,125 @@ fn test_edition_is_open() {
     assert_eq!(EDITION, "open");
 }
 
+// ---------------------------------------------------------------------------
+// Daemon socket tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_daemon_socket_status_op() {
+    use leyline_cli_lib::daemon::{DaemonContext, EventRouter, NoExt};
+    use leyline_core::{Controller, create_arena};
+    use std::sync::Arc;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let dir = TempDir::new().unwrap();
+
+    // Set up arena + controller.
+    let arena_path = dir.path().join("test.arena");
+    let ctrl_path = dir.path().join("test.ctrl");
+    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
+    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0)
+        .unwrap();
+    drop(ctrl);
+
+    let ctx = Arc::new(DaemonContext {
+        ctrl_path,
+        ext: Arc::new(NoExt),
+        router: EventRouter::new(16),
+    });
+
+    let sock_path = dir.path().join("test.sock");
+    leyline_cli_lib::daemon::socket::spawn(ctx, sock_path.clone());
+
+    // Give the listener a moment to bind.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let stream = UnixStream::connect(&sock_path).await.expect("connect to socket");
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    writer
+        .write_all(b"{\"op\":\"status\"}\n")
+        .await
+        .expect("write status op");
+
+    let response = lines.next_line().await.unwrap().expect("read response");
+    let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(parsed["generation"], 0);
+}
+
+#[tokio::test]
+async fn test_daemon_ext_dispatches_to_extension() {
+    use leyline_cli_lib::daemon::ext::DaemonExt;
+    use leyline_cli_lib::daemon::{DaemonContext, EventRouter};
+    use leyline_core::{Controller, create_arena};
+    use std::sync::Arc;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    /// Custom extension that handles "custom_op".
+    struct TestExt;
+    impl DaemonExt for TestExt {
+        fn handle_op(&self, op: &str, _req: &serde_json::Value) -> Option<String> {
+            if op == "custom_op" {
+                Some(r#"{"ok":true,"custom":"hello from extension"}"#.to_string())
+            } else {
+                None
+            }
+        }
+    }
+
+    let dir = TempDir::new().unwrap();
+
+    // Set up arena + controller.
+    let arena_path = dir.path().join("test.arena");
+    let ctrl_path = dir.path().join("test.ctrl");
+    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
+    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0)
+        .unwrap();
+    drop(ctrl);
+
+    let ctx = Arc::new(DaemonContext {
+        ctrl_path,
+        ext: Arc::new(TestExt),
+        router: EventRouter::new(16),
+    });
+
+    let sock_path = dir.path().join("ext_test.sock");
+    leyline_cli_lib::daemon::socket::spawn(ctx, sock_path.clone());
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let stream = UnixStream::connect(&sock_path).await.expect("connect to socket");
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    // Test custom extension op.
+    writer
+        .write_all(b"{\"op\":\"custom_op\"}\n")
+        .await
+        .expect("write custom_op");
+    let response = lines.next_line().await.unwrap().expect("read custom response");
+    let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(parsed["custom"], "hello from extension");
+
+    // Test unknown op returns error.
+    writer
+        .write_all(b"{\"op\":\"nonexistent\"}\n")
+        .await
+        .expect("write unknown op");
+    let response = lines.next_line().await.unwrap().expect("read unknown response");
+    let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert!(parsed.get("error").is_some());
+    let err_str = parsed["error"].as_str().unwrap();
+    assert!(err_str.contains("unknown op"), "error should mention 'unknown op', got: {err_str}");
+}
+
 /// Compile-time proof that the Lsp variant exists when the `lsp` feature is enabled.
 /// We can't spawn a real LSP server in CI, so we just prove the variant parses and matches.
 #[cfg(feature = "lsp")]

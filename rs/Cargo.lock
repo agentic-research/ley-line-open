@@ -941,6 +941,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
+name = "leyline-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "leyline-cli-lib",
+ "tokio",
+]
+
+[[package]]
+name = "leyline-cli-lib"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "leyline-schema",
+ "leyline-ts",
+ "rusqlite",
+ "tempfile",
+ "tokio",
+ "tree-sitter",
+]
+
+[[package]]
 name = "leyline-core"
 version = "0.1.0"
 dependencies = [
@@ -1077,18 +1101,6 @@ name = "litemap"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
-
-[[package]]
-name = "ll-open"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "leyline-schema",
- "leyline-ts",
- "rusqlite",
- "tree-sitter",
-]
 
 [[package]]
 name = "log"

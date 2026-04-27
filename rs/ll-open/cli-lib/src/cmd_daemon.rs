@@ -70,18 +70,39 @@ pub async fn run_daemon(
     ext: Arc<dyn DaemonExt>,
     source: Option<&Path>,
 ) -> Result<()> {
-    // 1. Arena setup.
-    let arena_bytes = arena_size_mib * 1024 * 1024;
-    let ctrl_path = cmd_serve::setup_arena(arena, arena_bytes, control)?;
+    // 1. If --source: parse first so we know the .db size for arena sizing.
+    let mut arena_bytes = arena_size_mib * 1024 * 1024;
+    let ctrl_path = control
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| arena.with_extension("ctrl"));
+    let db_path = ctrl_path.with_extension("db");
 
-    // 2. If --source: parse and load into arena.
-    //    Uses the language filter if provided, otherwise parses all recognized languages.
-    //    The parse is incremental — unchanged files are skipped on re-runs.
     if let Some(source_dir) = source {
         eprintln!("parsing {} ...", source_dir.display());
-        let db_path = ctrl_path.with_extension("db");
         crate::cmd_parse::cmd_parse(source_dir, &db_path, language)?;
 
+        // Auto-size arena: header (4KB) + 2 buffers + 1MB margin.
+        // Each buffer must hold the full serialized .db.
+        let db_size = std::fs::metadata(&db_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let min_arena = leyline_core::ArenaHeader::HEADER_SIZE + db_size * 2 + (1024 * 1024);
+        if min_arena > arena_bytes {
+            eprintln!(
+                "auto-sizing arena: {}MB → {}MB (db is {}MB)",
+                arena_bytes / (1024 * 1024),
+                min_arena / (1024 * 1024),
+                db_size / (1024 * 1024),
+            );
+            arena_bytes = min_arena;
+        }
+    }
+
+    // 2. Arena setup (now with correct size).
+    let ctrl_path = cmd_serve::setup_arena(arena, arena_bytes, control)?;
+
+    // 3. If --source: load parsed .db into arena.
+    if source.is_some() && db_path.exists() {
         let db_bytes = std::fs::read(&db_path)
             .with_context(|| format!("read parsed db: {}", db_path.display()))?;
         crate::cmd_load::load_into_arena(&ctrl_path, &db_bytes)?;

@@ -116,11 +116,17 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
     let mut unchanged = 0u64;
 
     for path in &files {
-        let ext = match path.extension().and_then(|e| e.to_str()) {
-            Some(e) => e,
-            None => continue,
-        };
-        let lang = match TsLanguage::from_extension(ext) {
+        // Try extension first, then filename for extensionless files (Dockerfile, etc).
+        let lang = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(TsLanguage::from_extension)
+            .or_else(|| {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(TsLanguage::from_filename)
+            });
+        let lang = match lang {
             Some(l) => l,
             None => continue,
         };
@@ -186,6 +192,13 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
         .map(|(rel, abs_path, lang, file_mtime, file_size)| {
             let content = std::fs::read(abs_path)
                 .with_context(|| format!("read {}", abs_path.display()))?;
+
+            // Skip binary files (null byte in first 8KB — same heuristic as git).
+            let check_len = content.len().min(8192);
+            if content[..check_len].contains(&0) {
+                bail!("binary file (null byte in first 8KB): {}", abs_path.display());
+            }
+
             let abs_str = abs_path.to_string_lossy().to_string();
             parse_file_pure(&content, *lang, rel, &abs_str, *file_mtime, *file_size)
         })

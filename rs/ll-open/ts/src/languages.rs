@@ -84,6 +84,21 @@ impl TsLanguage {
         }
     }
 
+    /// Detect language from filename (for extensionless files like Dockerfile, Makefile).
+    pub fn from_filename(name: &str) -> Option<Self> {
+        match name {
+            #[cfg(feature = "json")]
+            ".json" | "package.json" | "tsconfig.json" | "composer.json" => Some(TsLanguage::Json),
+            #[cfg(feature = "yaml")]
+            ".yml" | ".yaml" | "docker-compose.yml" | "docker-compose.yaml" => Some(TsLanguage::Yaml),
+            #[cfg(feature = "markdown")]
+            "README" | "CHANGELOG" | "CONTRIBUTING" | "LICENSE.md" => Some(TsLanguage::Markdown),
+            #[cfg(feature = "python")]
+            "Pipfile" => Some(TsLanguage::Python),
+            _ => None,
+        }
+    }
+
     /// Detect language from file extension.
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext.to_lowercase().as_str() {

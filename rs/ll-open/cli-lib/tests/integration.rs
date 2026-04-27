@@ -528,6 +528,198 @@ fn test_lsp_variant_exists() {
 // via the socket tests above.
 
 // ---------------------------------------------------------------------------
+// Incremental reparse tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_incremental_skip_unchanged() {
+    let src = tempfile::TempDir::new().unwrap();
+    let out_dir = tempfile::TempDir::new().unwrap();
+    let db_path = out_dir.path().join("incr.db");
+
+    std::fs::write(src.path().join("a.go"), b"package main\n\nfunc A() {}\n").unwrap();
+    std::fs::write(src.path().join("b.go"), b"package main\n\nfunc B() {}\n").unwrap();
+
+    // First parse
+    let cmd = leyline_cli_lib::Commands::Parse {
+        source: src.path().to_path_buf(),
+        output: db_path.clone(),
+        lang: Some("go".to_string()),
+    };
+    leyline_cli_lib::run(cmd).await.unwrap();
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let defs_first: i64 = conn
+        .query_row("SELECT COUNT(*) FROM node_defs", [], |r| r.get(0))
+        .unwrap();
+    assert!(defs_first >= 2);
+    drop(conn);
+
+    // Second parse — no changes
+    let cmd = leyline_cli_lib::Commands::Parse {
+        source: src.path().to_path_buf(),
+        output: db_path.clone(),
+        lang: Some("go".to_string()),
+    };
+    leyline_cli_lib::run(cmd).await.unwrap();
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let defs_second: i64 = conn
+        .query_row("SELECT COUNT(*) FROM node_defs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(defs_first, defs_second, "no changes = same data");
+
+    let index_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM _file_index", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(index_count, 2);
+}
+
+#[tokio::test]
+async fn test_incremental_reparse_changed_file() {
+    let src = tempfile::TempDir::new().unwrap();
+    let out_dir = tempfile::TempDir::new().unwrap();
+    let db_path = out_dir.path().join("incr-change.db");
+
+    std::fs::write(src.path().join("main.go"), b"package main\n\nfunc Old() {}\n").unwrap();
+
+    // First parse
+    let cmd = leyline_cli_lib::Commands::Parse {
+        source: src.path().to_path_buf(),
+        output: db_path.clone(),
+        lang: Some("go".to_string()),
+    };
+    leyline_cli_lib::run(cmd).await.unwrap();
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let old_def: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM node_defs WHERE token = 'Old'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(old_def, 1);
+    drop(conn);
+
+    // Modify file — sleep to ensure mtime changes
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    std::fs::write(
+        src.path().join("main.go"),
+        b"package main\n\nfunc New() {}\nfunc Extra() {}\n",
+    )
+    .unwrap();
+
+    // Second parse
+    let cmd = leyline_cli_lib::Commands::Parse {
+        source: src.path().to_path_buf(),
+        output: db_path.clone(),
+        lang: Some("go".to_string()),
+    };
+    leyline_cli_lib::run(cmd).await.unwrap();
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let old_def: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM node_defs WHERE token = 'Old'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(old_def, 0, "Old should be gone");
+    let new_def: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM node_defs WHERE token = 'New'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(new_def, 1);
+    let extra_def: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM node_defs WHERE token = 'Extra'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(extra_def, 1);
+}
+
+#[tokio::test]
+async fn test_incremental_deleted_file() {
+    let src = tempfile::TempDir::new().unwrap();
+    let out_dir = tempfile::TempDir::new().unwrap();
+    let db_path = out_dir.path().join("incr-delete.db");
+
+    std::fs::write(src.path().join("keep.go"), b"package main\n\nfunc Keep() {}\n").unwrap();
+    std::fs::write(
+        src.path().join("remove.go"),
+        b"package main\n\nfunc Remove() {}\n",
+    )
+    .unwrap();
+
+    // First parse
+    let cmd = leyline_cli_lib::Commands::Parse {
+        source: src.path().to_path_buf(),
+        output: db_path.clone(),
+        lang: Some("go".to_string()),
+    };
+    leyline_cli_lib::run(cmd).await.unwrap();
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let remove_def: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM node_defs WHERE token = 'Remove'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(remove_def, 1);
+    drop(conn);
+
+    // Delete file from disk
+    std::fs::remove_file(src.path().join("remove.go")).unwrap();
+
+    // Second parse
+    let cmd = leyline_cli_lib::Commands::Parse {
+        source: src.path().to_path_buf(),
+        output: db_path.clone(),
+        lang: Some("go".to_string()),
+    };
+    leyline_cli_lib::run(cmd).await.unwrap();
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let remove_def: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM node_defs WHERE token = 'Remove'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(remove_def, 0, "Remove should be deleted");
+    let remove_source: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM _source WHERE id = 'remove.go'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(remove_source, 0);
+    let keep_def: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM node_defs WHERE token = 'Keep'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(keep_def, 1, "Keep should still exist");
+    let index_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM _file_index", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(index_count, 1);
+}
+
+// ---------------------------------------------------------------------------
 // Go ref extraction + mache schema compat tests
 // ---------------------------------------------------------------------------
 

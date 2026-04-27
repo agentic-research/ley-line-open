@@ -107,11 +107,12 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
     let mut unchanged = 0u64;
 
     for (rel, (file_mtime, file_size, abs_path, lang)) in &current_files {
-        if let Some(&(old_m, old_s)) = old_index.get(rel) {
-            if *file_mtime == old_m && *file_size == old_s {
-                unchanged += 1;
-                continue;
-            }
+        if let Some(&(old_m, old_s)) = old_index.get(rel)
+            && *file_mtime == old_m
+            && *file_size == old_s
+        {
+            unchanged += 1;
+            continue;
         }
         to_parse.push((rel.clone(), abs_path.clone(), *lang));
     }

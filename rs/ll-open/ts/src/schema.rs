@@ -63,7 +63,7 @@ pub fn insert_ast(
     end_col: usize,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO _ast (node_id, source_id, node_kind, start_byte, end_byte, \
+        "INSERT OR REPLACE INTO _ast (node_id, source_id, node_kind, start_byte, end_byte, \
          start_row, start_col, end_row, end_col) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![

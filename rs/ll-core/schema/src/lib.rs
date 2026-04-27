@@ -60,7 +60,7 @@ pub fn insert_node(
     record: &str,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) \
+        "INSERT OR REPLACE INTO nodes (id, parent_id, name, kind, size, mtime, record) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![id, parent_id, name, kind, size, mtime, record],
     )?;

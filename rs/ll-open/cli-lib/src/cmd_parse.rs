@@ -80,8 +80,12 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
 
     let conn =
         Connection::open(output).with_context(|| format!("open {}", output.display()))?;
-    // Perf pragmas: WAL mode, large pages, no fsync during batch insert.
-    conn.pragma_update(None, "journal_mode", "WAL")?;
+    // Perf pragmas for bulk insert.
+    // DELETE journal (not WAL) — the .db is a portable snapshot. WAL requires
+    // -shm/-wal sidecar files on the same filesystem, breaking portability.
+    // synchronous=OFF — no fsync during batch (re-parse on crash is safe).
+    // page_size=65536 — larger B-tree pages, fewer page splits.
+    conn.pragma_update(None, "journal_mode", "DELETE")?;
     conn.pragma_update(None, "synchronous", "OFF")?;
     conn.pragma_update(None, "page_size", "65536")?;
     conn.pragma_update(None, "cache_size", "-64000")?; // 64MB cache

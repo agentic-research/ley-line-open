@@ -141,6 +141,64 @@ pub fn insert_import(conn: &Connection, alias: &str, path: &str, source_id: &str
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// File-index & meta tables (incremental reparse)
+// ---------------------------------------------------------------------------
+
+/// DDL for the `_file_index` table — tracks file mtime/size for incremental reparse.
+pub const FILE_INDEX_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS _file_index (
+    path TEXT PRIMARY KEY,
+    mtime INTEGER NOT NULL,
+    size INTEGER NOT NULL
+);";
+
+/// DDL for the `_meta` table — key/value store for parse metadata.
+pub const META_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS _meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);";
+
+/// Create `_file_index` and `_meta` tables (idempotent).
+pub fn create_index_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(FILE_INDEX_DDL)?;
+    conn.execute_batch(META_DDL)?;
+    Ok(())
+}
+
+/// Insert or replace a file-index row.
+pub fn upsert_file_index(conn: &Connection, path: &str, mtime: i64, size: i64) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO _file_index (path, mtime, size) VALUES (?1, ?2, ?3)",
+        params![path, mtime, size],
+    )?;
+    Ok(())
+}
+
+/// Read the full file index into a HashMap.
+pub fn read_file_index(conn: &Connection) -> Result<std::collections::HashMap<String, (i64, i64)>> {
+    let mut stmt = conn.prepare("SELECT path, mtime, size FROM _file_index")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)))
+    })?;
+    let mut map = std::collections::HashMap::new();
+    for row in rows {
+        let (path, (mtime, size)) = row?;
+        map.insert(path, (mtime, size));
+    }
+    Ok(map)
+}
+
+/// Insert or replace a meta key/value pair.
+pub fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO _meta (key, value) VALUES (?1, ?2)",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,5 +219,38 @@ mod tests {
         assert_eq!(def_count, 1);
         let import_count: i64 = conn.query_row("SELECT COUNT(*) FROM _imports", [], |r| r.get(0)).unwrap();
         assert_eq!(import_count, 1);
+    }
+
+    #[test]
+    fn file_index_roundtrip() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_schema(&conn).unwrap();
+        create_refs_schema(&conn).unwrap();
+        create_index_schema(&conn).unwrap();
+
+        upsert_file_index(&conn, "main.go", 1000, 500).unwrap();
+        upsert_file_index(&conn, "util.go", 2000, 300).unwrap();
+
+        let index = read_file_index(&conn).unwrap();
+        assert_eq!(index.len(), 2);
+        assert_eq!(index["main.go"], (1000, 500));
+        assert_eq!(index["util.go"], (2000, 300));
+
+        // Upsert overwrites
+        upsert_file_index(&conn, "main.go", 3000, 600).unwrap();
+        let index = read_file_index(&conn).unwrap();
+        assert_eq!(index["main.go"], (3000, 600));
+    }
+
+    #[test]
+    fn meta_roundtrip() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_index_schema(&conn).unwrap();
+
+        set_meta(&conn, "source_root", "/tmp/project").unwrap();
+        let val: String = conn.query_row(
+            "SELECT value FROM _meta WHERE key = 'source_root'", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(val, "/tmp/project");
     }
 }

@@ -75,15 +75,21 @@ pub async fn run_daemon(
     let ctrl_path = cmd_serve::setup_arena(arena, arena_bytes, control)?;
 
     // 2. If --source: parse and load into arena.
+    //    Uses the language filter if provided, otherwise parses all recognized languages.
+    //    The parse is incremental — unchanged files are skipped on re-runs.
     if let Some(source_dir) = source {
         eprintln!("parsing {} ...", source_dir.display());
         let db_path = ctrl_path.with_extension("db");
-        crate::cmd_parse::cmd_parse(source_dir, &db_path, None)?;
+        crate::cmd_parse::cmd_parse(source_dir, &db_path, language)?;
 
         let db_bytes = std::fs::read(&db_path)
             .with_context(|| format!("read parsed db: {}", db_path.display()))?;
         crate::cmd_load::load_into_arena(&ctrl_path, &db_bytes)?;
-        eprintln!("loaded into arena (generation 1)");
+
+        let generation = leyline_core::Controller::open_or_create(&ctrl_path)
+            .map(|c| c.generation())
+            .unwrap_or(0);
+        eprintln!("loaded into arena (generation {generation})");
     }
 
     // 3. Event router.
@@ -142,11 +148,12 @@ pub async fn run_daemon(
     // 8. Auto-spawn mache if on PATH.
     let mut mache_child: Option<Child> = None;
     if let Ok(mache_bin) = which::which("mache") {
-        eprintln!("found mache at {}, spawning...", mache_bin.display());
         let ctrl_str = ctrl_path.to_string_lossy().to_string();
+        eprintln!("spawning mache: {} serve --control {}", mache_bin.display(), ctrl_str);
         match std::process::Command::new(&mache_bin)
             .args(["serve", "--control", &ctrl_str])
-            .stdout(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
             .spawn()
         {
@@ -158,6 +165,8 @@ pub async fn run_daemon(
                 eprintln!("warn: failed to start mache: {e}");
             }
         }
+    } else {
+        eprintln!("mache not found on PATH — skipping auto-spawn");
     }
 
     eprintln!("daemon ready — press Ctrl+C to stop");

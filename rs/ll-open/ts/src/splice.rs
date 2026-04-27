@@ -29,14 +29,28 @@ pub fn splice(conn: &Connection, node_id: &str, new_text: &str) -> Result<Vec<u8
         )
         .with_context(|| format!("node '{}' not found in _ast table", node_id))?;
 
-    // Read original source
+    // Read original source — inline content or from disk via path reference.
     let source: Vec<u8> = conn
         .query_row(
-            "SELECT content FROM _source WHERE id = ?1",
+            "SELECT content, path FROM _source WHERE id = ?1",
             [&source_id],
-            |r| r.get(0),
+            |r| {
+                let content: Option<Vec<u8>> = r.get(0)?;
+                let path: Option<String> = r.get(1)?;
+                Ok((content, path))
+            },
         )
-        .with_context(|| format!("source '{}' not found in _source table", source_id))?;
+        .with_context(|| format!("source '{}' not found in _source table", source_id))
+        .and_then(|(content, path)| {
+            if let Some(c) = content {
+                Ok(c)
+            } else if let Some(p) = path {
+                std::fs::read(&p)
+                    .with_context(|| format!("read source file: {p}"))
+            } else {
+                bail!("source '{}' has neither content nor path", source_id)
+            }
+        })?;
 
     if start_byte > source.len() || end_byte > source.len() || start_byte > end_byte {
         bail!(

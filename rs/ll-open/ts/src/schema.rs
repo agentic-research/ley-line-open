@@ -8,12 +8,18 @@ pub use leyline_schema::{NODES_DDL, create_schema, insert_node};
 use anyhow::Result;
 use rusqlite::{Connection, params};
 
-/// DDL for the `_source` table — stores original source text for splice reconstruction.
+/// DDL for the `_source` table — tracks source files for splice and content resolution.
+///
+/// Two modes:
+/// - **Inline** (single-file API): `content` is populated, `path` is NULL.
+/// - **Reference** (multi-file CLI): `path` is populated, `content` is NULL.
+///   Consumers read source from disk via `path` when `content` is NULL.
 pub const SOURCE_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS _source (
     id TEXT PRIMARY KEY,
     language TEXT NOT NULL,
-    content BLOB NOT NULL
+    content BLOB,
+    path TEXT
 );";
 
 /// DDL for the `_ast` table — maps node IDs to byte ranges in the source.
@@ -39,11 +45,21 @@ pub fn create_ast_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Insert or replace a source row.
+/// Insert or replace a source row with inline content (single-file API).
 pub fn insert_source(conn: &Connection, id: &str, language: &str, content: &[u8]) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO _source (id, language, content) VALUES (?1, ?2, ?3)",
         params![id, language, content],
+    )?;
+    Ok(())
+}
+
+/// Insert or replace a source row with a file path reference (multi-file CLI).
+/// No content BLOB is stored — consumers read from disk via `path`.
+pub fn insert_source_ref(conn: &Connection, id: &str, language: &str, path: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO _source (id, language, path) VALUES (?1, ?2, ?3)",
+        params![id, language, path],
     )?;
     Ok(())
 }

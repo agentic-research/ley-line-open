@@ -13,7 +13,8 @@ use leyline_ts::languages::TsLanguage;
 use leyline_ts::refs::extract_go_refs;
 use leyline_ts::schema::{
     create_ast_schema, create_index_schema, create_refs_schema, delete_file_rows, insert_ast,
-    insert_node, insert_source, read_file_index, set_meta, sweep_orphaned_dirs, upsert_file_index,
+    insert_node, insert_source_ref, read_file_index, set_meta, sweep_orphaned_dirs,
+    upsert_file_index,
 };
 use rusqlite::Connection;
 use tree_sitter::TreeCursor;
@@ -150,7 +151,8 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
         // Create intermediate directory nodes.
         ensure_dirs(&conn, rel_path, mtime, &mut dirs_created)?;
 
-        match project_file(&conn, &content, *lang, rel, mtime) {
+        let abs_str = abs_path.to_string_lossy();
+        match project_file(&conn, &content, *lang, rel, mtime, &abs_str) {
             Ok(()) => {
                 // Record stat in file index for future incremental runs.
                 let (file_mtime, file_size, _, _) = current_files[rel];
@@ -231,8 +233,10 @@ fn project_file(
     language: TsLanguage,
     source_id: &str,
     mtime: i64,
+    abs_path: &str,
 ) -> Result<()> {
-    insert_source(conn, source_id, language.name(), content)?;
+    // Store file path reference, not content BLOB. Consumers read from disk.
+    insert_source_ref(conn, source_id, language.name(), abs_path)?;
 
     let mut parser = tree_sitter::Parser::new();
     parser

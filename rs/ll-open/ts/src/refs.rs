@@ -1,131 +1,215 @@
-//! Go ref extraction — definitions, call references, and imports from tree-sitter AST nodes.
+//! Cross-reference extraction from tree-sitter AST nodes.
 //!
-//! Called for every named node during AST traversal. Inspects `node.kind()` and
-//! populates `node_defs`, `node_refs`, and `_imports` tables for Go source files.
+//! Language-specific extractors produce `ExtractedRef` values.
+//! The caller decides how to store them (SQLite, vector, etc.).
 
-use anyhow::Result;
-use rusqlite::Connection;
 use tree_sitter::Node;
 
-use crate::schema::{insert_def, insert_import, insert_ref};
+/// A single extracted reference, definition, or import.
+///
+/// Universal across languages — Go, Python, JS, etc. all produce these.
+/// The extraction function is language-specific; the data type is not.
+#[derive(Debug, Clone)]
+pub enum ExtractedRef {
+    /// A function/method/type definition.
+    Def {
+        token: String,
+        node_id: String,
+        source_id: String,
+    },
+    /// A call-site reference.
+    Ref {
+        token: String,
+        node_id: String,
+        source_id: String,
+    },
+    /// An import alias→path mapping.
+    Import {
+        alias: String,
+        path: String,
+        source_id: String,
+    },
+}
 
-/// Extract Go definitions, call references, and imports from a single AST node.
+/// Insert extracted refs into SQLite tables.
 ///
-/// Called for EVERY named node during `walk_children()`. Inspects `node.kind()`
-/// and only acts on relevant kinds:
+/// Universal — works with output from any language extractor.
+pub fn insert_extracted_refs(
+    conn: &rusqlite::Connection,
+    refs: &[ExtractedRef],
+) -> anyhow::Result<()> {
+    for r in refs {
+        match r {
+            ExtractedRef::Def {
+                token,
+                node_id,
+                source_id,
+            } => crate::schema::insert_def(conn, token, node_id, source_id)?,
+            ExtractedRef::Ref {
+                token,
+                node_id,
+                source_id,
+            } => crate::schema::insert_ref(conn, token, node_id, source_id)?,
+            ExtractedRef::Import {
+                alias,
+                path,
+                source_id,
+            } => crate::schema::insert_import(conn, alias, path, source_id)?,
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Language dispatcher (factory)
+// ---------------------------------------------------------------------------
+
+/// Extract refs/defs/imports from an AST node, dispatching by language.
 ///
-/// - **Definitions** (`function_declaration`, `method_declaration`, `type_spec`)
-///   → inserted into `node_defs`
-/// - **Call references** (`call_expression`) → inserted into `node_refs`
-///   - Simple calls: `Add()` → ref "Add"
-///   - Qualified calls: `fmt.Println()` → refs "fmt.Println" and "Println"
-/// - **Imports** (`import_spec`) → inserted into `_imports`
-pub fn extract_go_refs(
-    node: &Node,
+/// Unsupported languages return an empty vec (no refs, no error).
+/// Add new languages by adding a match arm here + an `extract_<lang>` function.
+pub fn extract_refs(
+    node: &tree_sitter::Node,
     source: &[u8],
     node_id: &str,
     source_id: &str,
-    conn: &Connection,
-) -> Result<()> {
+    language: crate::languages::TsLanguage,
+) -> Vec<ExtractedRef> {
+    match language {
+        #[cfg(feature = "go")]
+        crate::languages::TsLanguage::Go => extract_go(node, source, node_id, source_id),
+        _ => Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Go extractor
+// ---------------------------------------------------------------------------
+
+/// Extract Go definitions, call references, and imports from a single AST node.
+///
+/// Pure data — no database access, safe for parallel use.
+///
+/// Node kinds handled:
+/// - `function_declaration`, `method_declaration`, `type_spec` → Def
+/// - `call_expression` → Ref (simple) or Ref (qualified: "pkg.Func")
+/// - `import_spec` → Import
+pub fn extract_go(node: &Node, source: &[u8], node_id: &str, source_id: &str) -> Vec<ExtractedRef> {
+    let mut out = Vec::new();
+
     match node.kind() {
-        // -----------------------------------------------------------------
-        // Definitions
-        // -----------------------------------------------------------------
-        "function_declaration" => {
+        "function_declaration" | "method_declaration" => {
             if let Some(name_node) = node.child_by_field_name("name") {
-                let token = name_node.utf8_text(source).unwrap_or("");
-                if !token.is_empty() {
-                    insert_def(conn, token, node_id, source_id)?;
-                }
-            }
-        }
-        "method_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let token = name_node.utf8_text(source).unwrap_or("");
-                if !token.is_empty() {
-                    insert_def(conn, token, node_id, source_id)?;
+                if let Ok(token) = name_node.utf8_text(source) {
+                    if !token.is_empty() {
+                        out.push(ExtractedRef::Def {
+                            token: token.to_string(),
+                            node_id: node_id.to_string(),
+                            source_id: source_id.to_string(),
+                        });
+                    }
                 }
             }
         }
         "type_spec" => {
             if let Some(name_node) = node.child_by_field_name("name") {
-                let token = name_node.utf8_text(source).unwrap_or("");
-                if !token.is_empty() {
-                    insert_def(conn, token, node_id, source_id)?;
+                if let Ok(token) = name_node.utf8_text(source) {
+                    if !token.is_empty() {
+                        out.push(ExtractedRef::Def {
+                            token: token.to_string(),
+                            node_id: node_id.to_string(),
+                            source_id: source_id.to_string(),
+                        });
+                    }
                 }
             }
         }
-
-        // -----------------------------------------------------------------
-        // Call references
-        // -----------------------------------------------------------------
         "call_expression" => {
             if let Some(func_node) = node.child_by_field_name("function") {
                 match func_node.kind() {
                     "identifier" => {
-                        // Simple call: Add()
-                        let token = func_node.utf8_text(source).unwrap_or("");
-                        if !token.is_empty() {
-                            insert_ref(conn, token, node_id, source_id)?;
+                        if let Ok(token) = func_node.utf8_text(source) {
+                            if !token.is_empty() {
+                                out.push(ExtractedRef::Ref {
+                                    token: token.to_string(),
+                                    node_id: node_id.to_string(),
+                                    source_id: source_id.to_string(),
+                                });
+                            }
                         }
                     }
                     "selector_expression" => {
-                        // Qualified call: fmt.Println()
-                        let operand = func_node.child_by_field_name("operand");
-                        let field = func_node.child_by_field_name("field");
-
-                        if let (Some(op), Some(f)) = (operand, field) {
-                            let pkg = op.utf8_text(source).unwrap_or("");
-                            let func = f.utf8_text(source).unwrap_or("");
-                            if !pkg.is_empty() && !func.is_empty() {
-                                let qualified = format!("{pkg}.{func}");
-                                insert_ref(conn, &qualified, node_id, source_id)?;
-                                insert_ref(conn, func, node_id, source_id)?;
+                        let pkg = func_node
+                            .child_by_field_name("operand")
+                            .and_then(|n| n.utf8_text(source).ok())
+                            .unwrap_or("");
+                        let func = func_node
+                            .child_by_field_name("field")
+                            .and_then(|n| n.utf8_text(source).ok())
+                            .unwrap_or("");
+                        if !func.is_empty() {
+                            if !pkg.is_empty() {
+                                out.push(ExtractedRef::Ref {
+                                    token: format!("{pkg}.{func}"),
+                                    node_id: node_id.to_string(),
+                                    source_id: source_id.to_string(),
+                                });
                             }
+                            out.push(ExtractedRef::Ref {
+                                token: func.to_string(),
+                                node_id: node_id.to_string(),
+                                source_id: source_id.to_string(),
+                            });
                         }
                     }
                     _ => {}
                 }
             }
         }
-
-        // -----------------------------------------------------------------
-        // Imports
-        // -----------------------------------------------------------------
         "import_spec" => {
-            if let Some(path_node) = node.child_by_field_name("path") {
-                let raw_path = path_node.utf8_text(source).unwrap_or("");
-                // Strip surrounding quotes
-                let path = raw_path.trim_matches('"');
+            let path = node
+                .child_by_field_name("path")
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("")
+                .trim_matches('"');
 
-                let alias = if let Some(name_node) = node.child_by_field_name("name") {
-                    name_node.utf8_text(source).unwrap_or("").to_string()
+            if !path.is_empty() {
+                let alias = node
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or("");
+
+                let alias = if alias.is_empty() || alias == "." {
+                    path.rsplit('/').next().unwrap_or(path)
                 } else {
-                    // Default alias = last path segment
-                    path.rsplit('/').next().unwrap_or(path).to_string()
+                    alias
                 };
 
-                if !alias.is_empty() && !path.is_empty() {
-                    insert_import(conn, &alias, path, source_id)?;
-                }
+                out.push(ExtractedRef::Import {
+                    alias: alias.to_string(),
+                    path: path.to_string(),
+                    source_id: source_id.to_string(),
+                });
             }
         }
-
-        // All other node kinds — nothing to do
         _ => {}
     }
 
-    Ok(())
+    out
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 #[cfg(feature = "go")]
 mod tests {
     use super::*;
     use crate::schema::{create_ast_schema, create_refs_schema};
+    use rusqlite::Connection;
     use tree_sitter::Parser;
 
-    /// Set up an in-memory DB and parse Go source.
     fn parse_go(src: &[u8]) -> (Connection, tree_sitter::Tree) {
         let conn = Connection::open_in_memory().unwrap();
         create_ast_schema(&conn).unwrap();
@@ -137,16 +221,16 @@ mod tests {
         (conn, tree)
     }
 
-    /// Recursively walk all named children, calling extract_go_refs on each.
-    fn walk_all(node: tree_sitter::Node, src: &[u8], conn: &Connection, prefix: &str) {
+    fn walk_and_insert(node: tree_sitter::Node, src: &[u8], conn: &Connection, prefix: &str) {
         let mut cursor = node.walk();
         if cursor.goto_first_child() {
             loop {
                 let child = cursor.node();
                 if child.is_named() {
                     let id = format!("{prefix}/{}", child.kind());
-                    let _ = extract_go_refs(&child, src, &id, "test.go", conn);
-                    walk_all(child, src, conn, &id);
+                    let refs = extract_go(&child, src, &id, "test.go");
+                    insert_extracted_refs(conn, &refs).unwrap();
+                    walk_and_insert(child, src, conn, &id);
                 }
                 if !cursor.goto_next_sibling() {
                     break;
@@ -155,105 +239,61 @@ mod tests {
         }
     }
 
-    /// Collect all tokens from node_defs.
     fn all_defs(conn: &Connection) -> Vec<String> {
-        let mut stmt = conn
-            .prepare("SELECT token FROM node_defs ORDER BY token")
-            .unwrap();
-        stmt.query_map([], |r| r.get(0))
-            .unwrap()
-            .collect::<Result<Vec<String>, _>>()
-            .unwrap()
+        let mut stmt = conn.prepare("SELECT token FROM node_defs ORDER BY token").unwrap();
+        stmt.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect()
     }
 
-    /// Collect all tokens from node_refs.
     fn all_refs(conn: &Connection) -> Vec<String> {
-        let mut stmt = conn
-            .prepare("SELECT token FROM node_refs ORDER BY token")
-            .unwrap();
-        stmt.query_map([], |r| r.get(0))
-            .unwrap()
-            .collect::<Result<Vec<String>, _>>()
-            .unwrap()
+        let mut stmt = conn.prepare("SELECT token FROM node_refs ORDER BY token").unwrap();
+        stmt.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect()
     }
 
-    /// Collect all (alias, path) pairs from _imports.
     fn all_imports(conn: &Connection) -> Vec<(String, String)> {
-        let mut stmt = conn
-            .prepare("SELECT alias, path FROM _imports ORDER BY path")
-            .unwrap();
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .collect::<Result<Vec<(String, String)>, _>>()
-            .unwrap()
+        let mut stmt = conn.prepare("SELECT alias, path FROM _imports ORDER BY path").unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(|r| r.unwrap()).collect()
     }
 
     #[test]
     fn extract_function_defs() {
         let src = b"package main\n\nfunc Add() {}\nfunc Sub() {}\n";
         let (conn, tree) = parse_go(src);
-        let root = tree.root_node();
-        walk_all(root, src, &conn, "");
-
+        walk_and_insert(tree.root_node(), src, &conn, "");
         let defs = all_defs(&conn);
-        assert!(defs.contains(&"Add".to_string()), "expected Add def, got: {defs:?}");
-        assert!(defs.contains(&"Sub".to_string()), "expected Sub def, got: {defs:?}");
-        assert_eq!(defs.len(), 2, "expected exactly 2 defs, got: {defs:?}");
+        assert!(defs.contains(&"Add".to_string()));
+        assert!(defs.contains(&"Sub".to_string()));
+        assert_eq!(defs.len(), 2);
     }
 
     #[test]
     fn extract_call_refs() {
         let src = b"package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"hello\")\n\tAdd()\n}\n";
         let (conn, tree) = parse_go(src);
-        let root = tree.root_node();
-        walk_all(root, src, &conn, "");
-
+        walk_and_insert(tree.root_node(), src, &conn, "");
         let refs = all_refs(&conn);
-        assert!(refs.contains(&"Add".to_string()), "expected Add ref, got: {refs:?}");
-        assert!(
-            refs.contains(&"Println".to_string()),
-            "expected Println ref, got: {refs:?}"
-        );
-        assert!(
-            refs.contains(&"fmt.Println".to_string()),
-            "expected fmt.Println ref, got: {refs:?}"
-        );
+        assert!(refs.contains(&"Add".to_string()));
+        assert!(refs.contains(&"Println".to_string()));
+        assert!(refs.contains(&"fmt.Println".to_string()));
     }
 
     #[test]
     fn extract_imports() {
         let src = b"package main\n\nimport (\n\t\"fmt\"\n\tauth \"github.com/foo/auth\"\n)\n";
         let (conn, tree) = parse_go(src);
-        let root = tree.root_node();
-        walk_all(root, src, &conn, "");
-
+        walk_and_insert(tree.root_node(), src, &conn, "");
         let imports = all_imports(&conn);
-        assert!(
-            imports.contains(&("fmt".to_string(), "fmt".to_string())),
-            "expected fmt import, got: {imports:?}"
-        );
-        assert!(
-            imports.contains(&("auth".to_string(), "github.com/foo/auth".to_string())),
-            "expected auth import, got: {imports:?}"
-        );
-        assert_eq!(imports.len(), 2, "expected exactly 2 imports, got: {imports:?}");
+        assert!(imports.contains(&("fmt".to_string(), "fmt".to_string())));
+        assert!(imports.contains(&("auth".to_string(), "github.com/foo/auth".to_string())));
+        assert_eq!(imports.len(), 2);
     }
 
     #[test]
     fn extract_method_and_type_defs() {
         let src = b"package main\n\ntype Server struct{}\n\nfunc (s *Server) Start() {}\n";
         let (conn, tree) = parse_go(src);
-        let root = tree.root_node();
-        walk_all(root, src, &conn, "");
-
+        walk_and_insert(tree.root_node(), src, &conn, "");
         let defs = all_defs(&conn);
-        assert!(
-            defs.contains(&"Server".to_string()),
-            "expected Server def, got: {defs:?}"
-        );
-        assert!(
-            defs.contains(&"Start".to_string()),
-            "expected Start def, got: {defs:?}"
-        );
+        assert!(defs.contains(&"Server".to_string()));
+        assert!(defs.contains(&"Start".to_string()));
     }
 }

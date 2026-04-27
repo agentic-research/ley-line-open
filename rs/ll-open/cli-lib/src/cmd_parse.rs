@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use leyline_ts::languages::TsLanguage;
-use leyline_ts::refs::extract_go_refs;
+use leyline_ts::refs::{extract_refs, insert_extracted_refs};
 use leyline_ts::schema::{
     create_ast_schema, create_index_schema, create_refs_schema, delete_file_rows, insert_ast,
     insert_node, insert_source_ref, read_file_index, set_meta, sweep_orphaned_dirs,
@@ -340,8 +340,10 @@ fn walk_children(
             child.end_position().column,
         )?;
 
-        if language == TsLanguage::Go {
-            extract_go_refs(child, content, &id, source_id, conn)?;
+        // Extract refs/defs/imports — dispatches by language automatically.
+        let refs = extract_refs(child, content, &id, source_id, language);
+        if !refs.is_empty() {
+            insert_extracted_refs(conn, &refs)?;
         }
 
         let has_named_children = {

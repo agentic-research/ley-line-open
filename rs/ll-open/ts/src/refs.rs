@@ -99,43 +99,41 @@ pub fn extract_go(node: &Node, source: &[u8], node_id: &str, source_id: &str) ->
 
     match node.kind() {
         "function_declaration" | "method_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                if let Ok(token) = name_node.utf8_text(source) {
-                    if !token.is_empty() {
-                        out.push(ExtractedRef::Def {
-                            token: token.to_string(),
-                            node_id: node_id.to_string(),
-                            source_id: source_id.to_string(),
-                        });
-                    }
-                }
+            if let Some(name_node) = node.child_by_field_name("name")
+                && let Ok(token) = name_node.utf8_text(source)
+                && !token.is_empty()
+            {
+                out.push(ExtractedRef::Def {
+                    token: token.to_string(),
+                    node_id: node_id.to_string(),
+                    source_id: source_id.to_string(),
+                });
             }
         }
         "type_spec" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                if let Ok(token) = name_node.utf8_text(source) {
-                    if !token.is_empty() {
-                        out.push(ExtractedRef::Def {
-                            token: token.to_string(),
-                            node_id: node_id.to_string(),
-                            source_id: source_id.to_string(),
-                        });
-                    }
-                }
+            if let Some(name_node) = node.child_by_field_name("name")
+                && let Ok(token) = name_node.utf8_text(source)
+                && !token.is_empty()
+            {
+                out.push(ExtractedRef::Def {
+                    token: token.to_string(),
+                    node_id: node_id.to_string(),
+                    source_id: source_id.to_string(),
+                });
             }
         }
         "call_expression" => {
             if let Some(func_node) = node.child_by_field_name("function") {
                 match func_node.kind() {
                     "identifier" => {
-                        if let Ok(token) = func_node.utf8_text(source) {
-                            if !token.is_empty() {
-                                out.push(ExtractedRef::Ref {
-                                    token: token.to_string(),
-                                    node_id: node_id.to_string(),
-                                    source_id: source_id.to_string(),
-                                });
-                            }
+                        if let Ok(token) = func_node.utf8_text(source)
+                            && !token.is_empty()
+                        {
+                            out.push(ExtractedRef::Ref {
+                                token: token.to_string(),
+                                node_id: node_id.to_string(),
+                                source_id: source_id.to_string(),
+                            });
                         }
                     }
                     "selector_expression" => {

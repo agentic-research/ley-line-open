@@ -49,6 +49,11 @@ enum Cmd {
         /// Timeout before automatic shutdown (e.g. "30s", "5m", "2h").
         #[arg(long)]
         timeout: Option<String>,
+
+        /// Source directory to parse on startup. Creates .db and loads into arena.
+        /// If mache is on PATH, also spawns mache as a managed child process.
+        #[arg(long)]
+        source: Option<PathBuf>,
     },
 }
 
@@ -83,6 +88,7 @@ async fn main() -> Result<()> {
             nfs_port,
             language,
             timeout,
+            source,
         } => {
             leyline_cli_lib::cmd_daemon::run_daemon(
                 &arena,
@@ -94,6 +100,7 @@ async fn main() -> Result<()> {
                 language.as_deref(),
                 timeout.as_deref(),
                 Arc::new(leyline_cli_lib::daemon::NoExt),
+                source.as_deref(),
             )
             .await
         }

@@ -6,6 +6,7 @@
 //!   called by ley-line (private) with its own extension.
 
 use std::path::Path;
+use std::process::Child;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -25,6 +26,7 @@ pub async fn cmd_daemon(
     nfs_port: u16,
     language: Option<&str>,
     timeout: Option<&str>,
+    source: Option<&Path>,
 ) -> Result<()> {
     let ext: Arc<dyn DaemonExt> = Arc::new(NoExt);
     run_daemon(
@@ -37,6 +39,7 @@ pub async fn cmd_daemon(
         language,
         timeout,
         ext,
+        source,
     )
     .await
 }
@@ -45,13 +48,15 @@ pub async fn cmd_daemon(
 ///
 /// Lifecycle:
 /// 1. Arena setup (create/open arena + controller)
-/// 2. Event router created
-/// 3. `ext.on_init(emitter)` — extension initializes state
-/// 4. UDS socket spawned (base ops + extension ops)
-/// 5. Mount via NFS/FUSE
-/// 6. `ext.on_post_mount(ctrl_path, router)` — extension spawns background tasks
-/// 7. Wait for shutdown (Ctrl+C or timeout)
-/// 8. Cleanup (remove socket file)
+/// 2. If `--source`: parse source dir → load .db into arena
+/// 3. Event router created
+/// 4. `ext.on_init(emitter)` — extension initializes state
+/// 5. UDS socket spawned (base ops + extension ops)
+/// 6. Mount via NFS/FUSE
+/// 7. `ext.on_post_mount(ctrl_path, router)` — extension spawns background tasks
+/// 8. If mache on PATH: spawn `mache serve --control <ctrl>` as child
+/// 9. Wait for shutdown (Ctrl+C or timeout)
+/// 10. Cleanup (kill mache child, remove socket file)
 #[allow(clippy::too_many_arguments)]
 pub async fn run_daemon(
     arena: &Path,
@@ -63,18 +68,31 @@ pub async fn run_daemon(
     language: Option<&str>,
     timeout: Option<&str>,
     ext: Arc<dyn DaemonExt>,
+    source: Option<&Path>,
 ) -> Result<()> {
     // 1. Arena setup.
     let arena_bytes = arena_size_mib * 1024 * 1024;
     let ctrl_path = cmd_serve::setup_arena(arena, arena_bytes, control)?;
 
-    // 2. Event router.
+    // 2. If --source: parse and load into arena.
+    if let Some(source_dir) = source {
+        eprintln!("parsing {} ...", source_dir.display());
+        let db_path = ctrl_path.with_extension("db");
+        crate::cmd_parse::cmd_parse(source_dir, &db_path, None)?;
+
+        let db_bytes = std::fs::read(&db_path)
+            .with_context(|| format!("read parsed db: {}", db_path.display()))?;
+        crate::cmd_load::load_into_arena(&ctrl_path, &db_bytes)?;
+        eprintln!("loaded into arena (generation 1)");
+    }
+
+    // 3. Event router.
     let router = EventRouter::new(10_000);
 
-    // 3. Extension init — pass emitter for background event emission.
+    // 4. Extension init.
     ext.on_init(router.emitter());
 
-    // 4. Build context + spawn UDS socket.
+    // 5. Build context + spawn UDS socket.
     let ctx = Arc::new(DaemonContext {
         ctrl_path: ctrl_path.clone(),
         ext: ext.clone(),
@@ -85,7 +103,7 @@ pub async fn run_daemon(
     crate::daemon::socket::spawn(ctx, sock_path.clone());
     eprintln!("daemon socket at {}", sock_path.display());
 
-    // 5. Mount.
+    // 6. Mount.
     let graph = HotSwapGraph::new(ctrl_path.clone())?;
     let graph = if let Some(lang_ext) = language {
         let ts_lang = leyline_fs::validate::language_for_extension(lang_ext)
@@ -114,15 +132,41 @@ pub async fn run_daemon(
         other => anyhow::bail!("unknown backend: {other} (expected 'nfs' or 'fuse')"),
     }
 
-    // 6. Extension post-mount — spawn background tasks (receiver, TCP control, etc.).
+    // 7. Extension post-mount.
     ext.on_post_mount(&ctrl_path, &router);
+
+    // 8. Auto-spawn mache if on PATH.
+    let mut mache_child: Option<Child> = None;
+    if let Ok(mache_bin) = which::which("mache") {
+        eprintln!("found mache at {}, spawning...", mache_bin.display());
+        let ctrl_str = ctrl_path.to_string_lossy().to_string();
+        match std::process::Command::new(&mache_bin)
+            .args(["serve", "--control", &ctrl_str])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+        {
+            Ok(child) => {
+                eprintln!("mache started (pid={})", child.id());
+                mache_child = Some(child);
+            }
+            Err(e) => {
+                eprintln!("warn: failed to start mache: {e}");
+            }
+        }
+    }
 
     eprintln!("daemon ready — press Ctrl+C to stop");
 
-    // 7. Wait for shutdown.
+    // 9. Wait for shutdown.
     cmd_serve::wait_for_shutdown(timeout).await?;
 
-    // 8. Cleanup.
+    // 10. Cleanup: kill mache child, remove socket.
+    if let Some(mut child) = mache_child {
+        eprintln!("stopping mache (pid={})...", child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
     let _ = std::fs::remove_file(&sock_path);
 
     Ok(())

@@ -199,6 +199,37 @@ pub fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Delete all rows for a source file across ALL tables.
+///
+/// The `nodes` table uses path-prefix deletion because node IDs are structured
+/// as `<file>/<ast_path>` (e.g. `main.go/function_declaration_0/identifier`).
+pub fn delete_file_rows(conn: &Connection, path: &str) -> Result<()> {
+    conn.execute("DELETE FROM nodes WHERE id = ?1 OR id LIKE ?1 || '/%'", [path])?;
+    conn.execute("DELETE FROM _ast WHERE source_id = ?1", [path])?;
+    conn.execute("DELETE FROM _source WHERE id = ?1", [path])?;
+    conn.execute("DELETE FROM node_refs WHERE source_id = ?1", [path])?;
+    conn.execute("DELETE FROM node_defs WHERE source_id = ?1", [path])?;
+    conn.execute("DELETE FROM _imports WHERE source_id = ?1", [path])?;
+    conn.execute("DELETE FROM _file_index WHERE path = ?1", [path])?;
+    Ok(())
+}
+
+/// Remove directory nodes (kind = 1) that have no children, iterating until
+/// no more orphans remain. Returns the total number of rows removed.
+pub fn sweep_orphaned_dirs(conn: &Connection) -> Result<usize> {
+    let mut total = 0;
+    loop {
+        let removed = conn.execute(
+            "DELETE FROM nodes WHERE kind = 1 AND id != '' \
+             AND id NOT IN (SELECT DISTINCT parent_id FROM nodes WHERE parent_id IS NOT NULL AND parent_id != '')",
+            [],
+        )?;
+        if removed == 0 { break; }
+        total += removed;
+    }
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,5 +283,65 @@ mod tests {
             "SELECT value FROM _meta WHERE key = 'source_root'", [], |r| r.get(0),
         ).unwrap();
         assert_eq!(val, "/tmp/project");
+    }
+
+    #[test]
+    fn delete_file_rows_cleans_all_tables() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_schema(&conn).unwrap();
+        create_refs_schema(&conn).unwrap();
+        create_index_schema(&conn).unwrap();
+
+        // Two files
+        insert_node(&conn, "", "", "", 1, 0, 0, "").unwrap();
+        insert_node(&conn, "a.go", "", "a.go", 1, 0, 0, "").unwrap();
+        insert_node(&conn, "a.go/func", "a.go", "func", 0, 10, 0, "body").unwrap();
+        insert_node(&conn, "b.go", "", "b.go", 1, 0, 0, "").unwrap();
+        insert_node(&conn, "b.go/func", "b.go", "func", 0, 10, 0, "body").unwrap();
+        insert_source(&conn, "a.go", "go", b"package a").unwrap();
+        insert_source(&conn, "b.go", "go", b"package b").unwrap();
+        insert_ref(&conn, "Foo", "a.go/call", "a.go").unwrap();
+        insert_ref(&conn, "Bar", "b.go/call", "b.go").unwrap();
+        insert_def(&conn, "Foo", "a.go/func", "a.go").unwrap();
+        insert_def(&conn, "Bar", "b.go/func", "b.go").unwrap();
+        upsert_file_index(&conn, "a.go", 100, 50).unwrap();
+        upsert_file_index(&conn, "b.go", 200, 60).unwrap();
+
+        delete_file_rows(&conn, "a.go").unwrap();
+
+        // a.go gone
+        let a_nodes: i64 = conn.query_row("SELECT COUNT(*) FROM nodes WHERE id = 'a.go' OR id LIKE 'a.go/%'", [], |r| r.get(0)).unwrap();
+        assert_eq!(a_nodes, 0);
+        let a_source: i64 = conn.query_row("SELECT COUNT(*) FROM _source WHERE id = 'a.go'", [], |r| r.get(0)).unwrap();
+        assert_eq!(a_source, 0);
+        let a_refs: i64 = conn.query_row("SELECT COUNT(*) FROM node_refs WHERE source_id = 'a.go'", [], |r| r.get(0)).unwrap();
+        assert_eq!(a_refs, 0);
+        let a_index: i64 = conn.query_row("SELECT COUNT(*) FROM _file_index WHERE path = 'a.go'", [], |r| r.get(0)).unwrap();
+        assert_eq!(a_index, 0);
+
+        // b.go intact
+        let b_nodes: i64 = conn.query_row("SELECT COUNT(*) FROM nodes WHERE id = 'b.go' OR id LIKE 'b.go/%'", [], |r| r.get(0)).unwrap();
+        assert!(b_nodes >= 2);
+        let b_refs: i64 = conn.query_row("SELECT COUNT(*) FROM node_refs WHERE source_id = 'b.go'", [], |r| r.get(0)).unwrap();
+        assert_eq!(b_refs, 1);
+    }
+
+    #[test]
+    fn sweep_orphaned_dirs_removes_empty_parents() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_schema(&conn).unwrap();
+
+        insert_node(&conn, "", "", "", 1, 0, 0, "").unwrap();
+        insert_node(&conn, "src", "", "src", 1, 0, 0, "").unwrap();
+        insert_node(&conn, "src/pkg", "src", "pkg", 1, 0, 0, "").unwrap();
+        insert_node(&conn, "src/pkg/a.go", "src/pkg", "a.go", 1, 0, 0, "").unwrap();
+
+        conn.execute("DELETE FROM nodes WHERE id = 'src/pkg/a.go'", []).unwrap();
+
+        let removed = sweep_orphaned_dirs(&conn).unwrap();
+        assert_eq!(removed, 2, "should remove src/pkg and src");
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1, "only root node should remain");
     }
 }

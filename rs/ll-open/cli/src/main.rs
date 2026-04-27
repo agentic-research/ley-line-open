@@ -18,9 +18,9 @@ enum Cmd {
 
     /// Run the daemon: arena + mount + UDS socket for coordination.
     Daemon {
-        /// Path to the arena file.
-        #[arg(long, default_value = "./leyline.arena")]
-        arena: PathBuf,
+        /// Path to the arena file. Defaults to ~/.mache/default.arena.
+        #[arg(long)]
+        arena: Option<PathBuf>,
 
         /// Arena size in MiB.
         #[arg(long, default_value_t = 64)]
@@ -90,6 +90,13 @@ async fn main() -> Result<()> {
             timeout,
             source,
         } => {
+            // Default arena/ctrl to ~/.mache/ so mache's path containment check passes.
+            let mache_dir = dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".mache");
+            let _ = std::fs::create_dir_all(&mache_dir);
+            let arena = arena.unwrap_or_else(|| mache_dir.join("default.arena"));
+
             leyline_cli_lib::cmd_daemon::run_daemon(
                 &arena,
                 arena_size_mib,

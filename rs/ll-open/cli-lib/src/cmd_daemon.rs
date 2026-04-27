@@ -21,7 +21,7 @@ pub async fn cmd_daemon(
     arena: &Path,
     arena_size_mib: u64,
     control: Option<&Path>,
-    mount: &Path,
+    mount: Option<&Path>,
     backend: &str,
     nfs_port: u16,
     language: Option<&str>,
@@ -52,7 +52,7 @@ pub async fn cmd_daemon(
 /// 3. Event router created
 /// 4. `ext.on_init(emitter)` — extension initializes state
 /// 5. UDS socket spawned (base ops + extension ops)
-/// 6. Mount via NFS/FUSE
+/// 6. If `--mount`: mount via NFS/FUSE (omit for headless mode)
 /// 7. `ext.on_post_mount(ctrl_path, router)` — extension spawns background tasks
 /// 8. If mache on PATH: spawn `mache serve --control <ctrl>` as child
 /// 9. Wait for shutdown (Ctrl+C or timeout)
@@ -62,7 +62,7 @@ pub async fn run_daemon(
     arena: &Path,
     arena_size_mib: u64,
     control: Option<&Path>,
-    mount: &Path,
+    mount: Option<&Path>,
     backend: &str,
     nfs_port: u16,
     language: Option<&str>,
@@ -103,33 +103,37 @@ pub async fn run_daemon(
     crate::daemon::socket::spawn(ctx, sock_path.clone());
     eprintln!("daemon socket at {}", sock_path.display());
 
-    // 6. Mount.
-    let graph = HotSwapGraph::new(ctrl_path.clone())?;
-    let graph = if let Some(lang_ext) = language {
-        let ts_lang = leyline_fs::validate::language_for_extension(lang_ext)
-            .with_context(|| format!("unsupported language: {lang_ext}"))?;
-        graph.with_validation(Some(ts_lang))
+    // 6. Mount (optional — omit --mount for headless mode).
+    if let Some(mount_path) = mount {
+        let graph = HotSwapGraph::new(ctrl_path.clone())?;
+        let graph = if let Some(lang_ext) = language {
+            let ts_lang = leyline_fs::validate::language_for_extension(lang_ext)
+                .with_context(|| format!("unsupported language: {lang_ext}"))?;
+            graph.with_validation(Some(ts_lang))
+        } else {
+            graph.with_writable()
+        };
+        let graph: Arc<dyn leyline_fs::graph::Graph> = Arc::new(graph);
+
+        std::fs::create_dir_all(mount_path)
+            .with_context(|| format!("create mountpoint {}", mount_path.display()))?;
+
+        match backend {
+            "nfs" => {
+                let listen_addr = format!("0.0.0.0:{nfs_port}");
+                let (port, _handle) = leyline_fs::nfs::serve_nfs(graph, &listen_addr).await?;
+                eprintln!("NFS server listening on port {port}");
+                cmd_serve::mount_nfs_cmd(port, mount_path)?;
+                eprintln!("mounted at {}", mount_path.display());
+            }
+            "fuse" => {
+                let _session = leyline_fs::fuse::mount_fuse(graph, mount_path)?;
+                eprintln!("FUSE mounted at {}", mount_path.display());
+            }
+            other => anyhow::bail!("unknown backend: {other} (expected 'nfs' or 'fuse')"),
+        }
     } else {
-        graph.with_writable()
-    };
-    let graph: Arc<dyn leyline_fs::graph::Graph> = Arc::new(graph);
-
-    std::fs::create_dir_all(mount)
-        .with_context(|| format!("create mountpoint {}", mount.display()))?;
-
-    match backend {
-        "nfs" => {
-            let listen_addr = format!("0.0.0.0:{nfs_port}");
-            let (port, _handle) = leyline_fs::nfs::serve_nfs(graph, &listen_addr).await?;
-            eprintln!("NFS server listening on port {port}");
-            cmd_serve::mount_nfs_cmd(port, mount)?;
-            eprintln!("mounted at {}", mount.display());
-        }
-        "fuse" => {
-            let _session = leyline_fs::fuse::mount_fuse(graph, mount)?;
-            eprintln!("FUSE mounted at {}", mount.display());
-        }
-        other => anyhow::bail!("unknown backend: {other} (expected 'nfs' or 'fuse')"),
+        eprintln!("headless mode (no mount)");
     }
 
     // 7. Extension post-mount.

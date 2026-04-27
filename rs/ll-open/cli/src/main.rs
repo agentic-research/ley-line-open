@@ -30,9 +30,9 @@ enum Cmd {
         #[arg(long)]
         control: Option<PathBuf>,
 
-        /// Directory to mount the filesystem at.
+        /// Directory to mount the filesystem at. If omitted, no mount (headless mode).
         #[arg(long)]
-        mount: PathBuf,
+        mount: Option<PathBuf>,
 
         /// Filesystem backend: "nfs" or "fuse".
         #[arg(long, default_value_t = cmd_serve::default_backend())]
@@ -94,7 +94,7 @@ async fn main() -> Result<()> {
                 &arena,
                 arena_size_mib,
                 control.as_deref(),
-                &mount,
+                mount.as_deref(),
                 &backend,
                 nfs_port,
                 language.as_deref(),

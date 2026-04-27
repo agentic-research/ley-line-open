@@ -6,7 +6,7 @@ pub mod ops;
 pub mod socket;
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub use ext::{DaemonExt, NoExt};
 pub use events::EventRouter;
@@ -16,4 +16,7 @@ pub struct DaemonContext {
     pub ctrl_path: PathBuf,
     pub ext: Arc<dyn DaemonExt>,
     pub router: Arc<EventRouter>,
+    /// Cached arena SQLite connection — invalidated when generation changes.
+    /// (generation, Connection). Mutex because ops are called from async tasks.
+    pub arena_conn: Mutex<Option<(u64, rusqlite::Connection)>>,
 }

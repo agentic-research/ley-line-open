@@ -124,6 +124,7 @@ pub async fn run_daemon(
         ctrl_path: ctrl_path.clone(),
         ext: ext.clone(),
         router: router.clone(),
+        arena_conn: std::sync::Mutex::new(None),
     });
 
     let sock_path = ctrl_path.with_extension("sock");

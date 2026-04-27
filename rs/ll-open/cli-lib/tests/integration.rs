@@ -395,6 +395,7 @@ async fn test_daemon_socket_status_op() {
         ctrl_path,
         ext: Arc::new(NoExt),
         router: EventRouter::new(16),
+        arena_conn: std::sync::Mutex::new(None),
     });
 
     let sock_path = dir.path().join("test.sock");
@@ -454,6 +455,7 @@ async fn test_daemon_ext_dispatches_to_extension() {
         ctrl_path,
         ext: Arc::new(TestExt),
         router: EventRouter::new(16),
+        arena_conn: std::sync::Mutex::new(None),
     });
 
     let sock_path = dir.path().join("ext_test.sock");

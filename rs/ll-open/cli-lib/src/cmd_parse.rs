@@ -11,11 +11,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use leyline_ts::languages::TsLanguage;
-use leyline_ts::refs::{ExtractedRef, extract_refs, insert_extracted_refs};
+use leyline_ts::refs::{ExtractedRef, extract_refs};
 use leyline_ts::schema::{
-    create_ast_schema, create_index_schema, create_refs_schema, delete_file_rows, insert_ast,
-    insert_node, insert_source_ref, read_file_index, set_meta, sweep_orphaned_dirs,
-    upsert_file_index,
+    create_ast_schema, create_index_schema, create_refs_schema, delete_file_rows,
+    read_file_index, set_meta, sweep_orphaned_dirs,
 };
 use rayon::prelude::*;
 use rusqlite::Connection;
@@ -81,7 +80,11 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
 
     let conn =
         Connection::open(output).with_context(|| format!("open {}", output.display()))?;
+    // Perf pragmas: WAL mode, large pages, no fsync during batch insert.
     conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "OFF")?;
+    conn.pragma_update(None, "page_size", "65536")?;
+    conn.pragma_update(None, "cache_size", "-64000")?; // 64MB cache
     create_ast_schema(&conn)?;
     create_refs_schema(&conn)?;
     create_index_schema(&conn)?;
@@ -186,7 +189,7 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
 
     let parse_elapsed = parse_start.elapsed();
 
-    // ---- Batch insert (single transaction) ----
+    // ---- Batch insert (prepared statements + single transaction) ----
 
     let insert_start = std::time::Instant::now();
     let mut dirs_created: HashSet<String> = HashSet::new();
@@ -195,32 +198,68 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
 
     conn.execute_batch("BEGIN")?;
 
+    // Prepare statements once — reuse for all rows (avoids SQL parse per INSERT).
+    let mut stmt_node = conn.prepare_cached(
+        "INSERT OR REPLACE INTO nodes (id, parent_id, name, kind, size, mtime, record) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+    let mut stmt_ast = conn.prepare_cached(
+        "INSERT OR REPLACE INTO _ast (node_id, source_id, node_kind, start_byte, end_byte, \
+         start_row, start_col, end_row, end_col) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?;
+    let mut stmt_source = conn.prepare_cached(
+        "INSERT OR REPLACE INTO _source (id, language, path) VALUES (?1, ?2, ?3)",
+    )?;
+    let mut stmt_ref = conn.prepare_cached(
+        "INSERT INTO node_refs (token, node_id, source_id) VALUES (?1, ?2, ?3)",
+    )?;
+    let mut stmt_def = conn.prepare_cached(
+        "INSERT INTO node_defs (token, node_id, source_id) VALUES (?1, ?2, ?3)",
+    )?;
+    let mut stmt_import = conn.prepare_cached(
+        "INSERT INTO _imports (alias, path, source_id) VALUES (?1, ?2, ?3)",
+    )?;
+    let mut stmt_file_idx = conn.prepare_cached(
+        "INSERT OR REPLACE INTO _file_index (path, mtime, size) VALUES (?1, ?2, ?3)",
+    )?;
+
     for result in parsed_files {
         match result {
             Ok(pf) => {
                 let rel_path = Path::new(&pf.rel);
                 ensure_dirs(&conn, rel_path, mtime, &mut dirs_created)?;
 
-                insert_source_ref(&conn, &pf.rel, &pf.language, &pf.abs_path)?;
+                stmt_source.execute(rusqlite::params![&pf.rel, &pf.language, &pf.abs_path])?;
 
                 for n in &pf.nodes {
-                    insert_node(
-                        &conn, &n.id, &n.parent_id, &n.name, n.kind, n.size, mtime, &n.record,
-                    )?;
+                    stmt_node.execute(rusqlite::params![
+                        &n.id, &n.parent_id, &n.name, n.kind, n.size, mtime, &n.record
+                    ])?;
                 }
 
                 for a in &pf.ast_entries {
-                    insert_ast(
-                        &conn, &a.node_id, &a.source_id, &a.node_kind, a.start_byte,
-                        a.end_byte, a.start_row, a.start_col, a.end_row, a.end_col,
-                    )?;
+                    stmt_ast.execute(rusqlite::params![
+                        &a.node_id, &a.source_id, &a.node_kind,
+                        a.start_byte, a.end_byte, a.start_row, a.start_col,
+                        a.end_row, a.end_col
+                    ])?;
                 }
 
-                if !pf.refs.is_empty() {
-                    insert_extracted_refs(&conn, &pf.refs)?;
+                for r in &pf.refs {
+                    match r {
+                        ExtractedRef::Ref { token, node_id, source_id } => {
+                            stmt_ref.execute(rusqlite::params![token, node_id, source_id])?;
+                        }
+                        ExtractedRef::Def { token, node_id, source_id } => {
+                            stmt_def.execute(rusqlite::params![token, node_id, source_id])?;
+                        }
+                        ExtractedRef::Import { alias, path, source_id } => {
+                            stmt_import.execute(rusqlite::params![alias, path, source_id])?;
+                        }
+                    }
                 }
 
-                upsert_file_index(&conn, &pf.rel, pf.file_mtime, pf.file_size)?;
+                stmt_file_idx.execute(rusqlite::params![&pf.rel, pf.file_mtime, pf.file_size])?;
                 parsed += 1;
             }
             Err(e) => {
@@ -229,6 +268,15 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
             }
         }
     }
+
+    // Drop prepared statements before COMMIT (releases borrow on conn).
+    drop(stmt_node);
+    drop(stmt_ast);
+    drop(stmt_source);
+    drop(stmt_ref);
+    drop(stmt_def);
+    drop(stmt_import);
+    drop(stmt_file_idx);
 
     conn.execute_batch("COMMIT")?;
 

@@ -1,64 +1,15 @@
-//! Integration test: build a graph + vector index, search for node_ids,
-//! resolve them against the graph to get node names.
-
-#![cfg(feature = "vec")]
+//! Integration test: bulk-content lookup via SqliteGraphAdapter.
+//!
+//! Originally this file also covered the on-disk `VectorIndex` sidecar, but
+//! that has moved to `leyline-cli-lib::daemon::vec_index` (closer to the
+//! enrichment pipeline). The remaining test still exercises the FS adapter's
+//! optimized `all_file_contents` query.
 
 use anyhow::Result;
 use leyline_fs::SqliteGraph;
 use leyline_fs::graph::{Graph, SqliteGraphAdapter};
-use leyline_fs::vector::{VectorIndex, register_vec};
 use leyline_schema::create_schema;
 use rusqlite::{Connection, DatabaseName};
-
-fn setup_graph() -> Result<SqliteGraphAdapter> {
-    let source = Connection::open_in_memory()?;
-    create_schema(&source)?;
-    source.execute_batch(
-        "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs', '', 'docs', 1, 0, 1000, NULL);
-         INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs/intro', 'docs', 'intro', 0, 14, 2000, 'Introduction');
-         INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs/setup', 'docs', 'setup', 0, 11, 3000, 'Setup guide');
-         INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs/api', 'docs', 'api', 0, 13, 4000, 'API reference');",
-    )?;
-    let data = source.serialize(DatabaseName::Main)?;
-    let graph = SqliteGraph::from_bytes(data.as_ref())?;
-    Ok(SqliteGraphAdapter::new(graph))
-}
-
-#[test]
-fn vector_index_with_graph() -> Result<()> {
-    register_vec();
-
-    let adapter = setup_graph()?;
-    let idx = VectorIndex::new(4, None)?;
-
-    // Simulate embeddings for each document node
-    idx.insert("docs/intro", &[1.0, 0.0, 0.0, 0.0])?;
-    idx.insert("docs/setup", &[0.0, 1.0, 0.0, 0.0])?;
-    idx.insert("docs/api", &[0.8, 0.2, 0.0, 0.0])?;
-
-    // Search for nearest to [1, 0, 0, 0] — should find intro first, then api
-    let results = idx.search(&[1.0, 0.0, 0.0, 0.0], 3)?;
-    assert_eq!(results.len(), 3);
-
-    // Resolve node_ids against the graph
-    let mut resolved = Vec::new();
-    for (node_id, distance) in &results {
-        let node = adapter.get_node(node_id)?.unwrap();
-        resolved.push((node.name.clone(), *distance));
-    }
-
-    assert_eq!(resolved[0].0, "intro");
-    assert!(resolved[0].1 < f64::EPSILON); // exact match
-    assert_eq!(resolved[1].0, "api");
-    assert_eq!(resolved[2].0, "setup");
-
-    // Verify we can read content through the graph for the top result
-    let mut buf = [0u8; 256];
-    let n = adapter.read_content(&results[0].0, &mut buf, 0)?;
-    assert_eq!(&buf[..n], b"Introduction");
-
-    Ok(())
-}
 
 /// Verify `all_file_contents` returns exactly the file nodes with non-empty
 /// content via the optimized single-query path in SqliteGraphAdapter.

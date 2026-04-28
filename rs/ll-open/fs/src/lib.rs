@@ -5,8 +5,6 @@ pub mod graph;
 pub mod nfs;
 pub mod staging;
 pub mod validate;
-#[cfg(feature = "vec")]
-pub mod vector;
 
 use anyhow::{Context, Result};
 use leyline_core::{ArenaHeader, Controller};
@@ -372,64 +370,6 @@ pub unsafe extern "C" fn leyline_query(
     unsafe { leyline_get_node(ctx, id, out_buf, len) }
 }
 
-/// KNN search over the attached VectorIndex.
-///
-/// Returns a heap-allocated JSON C string: `[{"id":"...","distance":0.023}, ...]`.
-/// Returns null if no VectorIndex is attached, ctx is null, dim mismatches, or on error.
-/// Caller **must** free the returned string with `leyline_free_string`.
-///
-/// # Safety
-/// `ctx` from `leyline_open`. `query_floats` points to `dim` contiguous floats.
-#[cfg(feature = "vec")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn leyline_knn_search(
-    ctx: *const LeylineCtx,
-    query_floats: *const f32,
-    dim: usize,
-    k: usize,
-) -> *mut std::os::raw::c_char {
-    let ctx = match unsafe { ctx.as_ref() } {
-        Some(c) => c,
-        None => return std::ptr::null_mut(),
-    };
-    let vectors = match ctx.adapter.vectors() {
-        Some(v) => v,
-        None => return std::ptr::null_mut(),
-    };
-    if query_floats.is_null() || dim == 0 {
-        return std::ptr::null_mut();
-    }
-    let query = unsafe { std::slice::from_raw_parts(query_floats, dim) };
-    let results = match vectors.search(query, k) {
-        Ok(r) => r,
-        Err(_) => return std::ptr::null_mut(),
-    };
-    let json_entries: Vec<serde_json::Value> = results
-        .iter()
-        .map(|(id, distance)| serde_json::json!({"id": id, "distance": distance}))
-        .collect();
-    let json = match serde_json::to_string(&json_entries) {
-        Ok(j) => j,
-        Err(_) => return std::ptr::null_mut(),
-    };
-    match std::ffi::CString::new(json) {
-        Ok(cs) => cs.into_raw(),
-        Err(_) => std::ptr::null_mut(),
-    }
-}
-
-/// Free a string returned by `leyline_knn_search`.
-///
-/// # Safety
-/// `ptr` must be a pointer returned by `leyline_knn_search`, or null.
-#[cfg(feature = "vec")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn leyline_free_string(ptr: *mut std::os::raw::c_char) {
-    if !ptr.is_null() {
-        drop(unsafe { std::ffi::CString::from_raw(ptr) });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -780,66 +720,4 @@ mod tests {
         Ok(())
     }
 
-    /// Verify KNN search via FFI returns valid JSON results.
-    #[cfg(feature = "vec")]
-    #[test]
-    fn ffi_knn_search() -> Result<()> {
-        crate::vector::register_vec();
-
-        let (ctx, _source) = make_test_ctx();
-
-        // Attach a VectorIndex with test embeddings
-        let idx = crate::vector::VectorIndex::new(4, None)?;
-        idx.insert("vulns/CVE-1", &[1.0, 0.0, 0.0, 0.0])?;
-        idx.insert("vulns/CVE-2", &[0.0, 1.0, 0.0, 0.0])?;
-        unsafe { &mut *(ctx as *mut LeylineCtx) }
-            .adapter
-            .attach_vectors(idx);
-
-        // Search nearest to [1, 0, 0, 0]
-        let query = [1.0f32, 0.0, 0.0, 0.0];
-        let ptr = unsafe { leyline_knn_search(ctx, query.as_ptr(), 4, 5) };
-        assert!(!ptr.is_null(), "knn_search should return non-null");
-
-        let c_str = unsafe { std::ffi::CStr::from_ptr(ptr) };
-        let json_str = c_str.to_str()?;
-        let results: Vec<serde_json::Value> = serde_json::from_str(json_str)?;
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0]["id"], "vulns/CVE-1");
-        assert!(results[0]["distance"].as_f64().unwrap() < f64::EPSILON);
-
-        unsafe { leyline_free_string(ptr) };
-        unsafe { leyline_close(ctx as *mut _) };
-        Ok(())
-    }
-
-    /// Verify KNN search returns null when no VectorIndex is attached.
-    #[cfg(feature = "vec")]
-    #[test]
-    fn ffi_knn_search_no_index() {
-        let (ctx, _source) = make_test_ctx();
-
-        let query = [1.0f32, 0.0, 0.0, 0.0];
-        let ptr = unsafe { leyline_knn_search(ctx, query.as_ptr(), 4, 5) };
-        assert!(ptr.is_null(), "should return null without VectorIndex");
-
-        unsafe { leyline_close(ctx as *mut _) };
-    }
-
-    /// Verify KNN search returns null on null ctx.
-    #[cfg(feature = "vec")]
-    #[test]
-    fn ffi_knn_search_null_ctx() {
-        let query = [1.0f32, 0.0, 0.0, 0.0];
-        let ptr = unsafe { leyline_knn_search(std::ptr::null(), query.as_ptr(), 4, 5) };
-        assert!(ptr.is_null(), "should return null for null ctx");
-    }
-
-    /// Verify leyline_free_string handles null safely.
-    #[cfg(feature = "vec")]
-    #[test]
-    fn ffi_free_string_null_safe() {
-        unsafe { leyline_free_string(std::ptr::null_mut()) };
-        // No crash = pass
-    }
 }

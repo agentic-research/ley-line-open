@@ -133,9 +133,6 @@ pub struct SqliteGraphAdapter {
     /// Key: node ID, Value: old content before truncate.
     #[cfg(feature = "validate")]
     shadow: Mutex<HashMap<String, String>>,
-    /// Optional isolated vector index (own Connection, never touches the arena).
-    #[cfg(feature = "vec")]
-    vectors: Option<crate::vector::VectorIndex>,
     /// Nodes with pending splice (write accumulated, splice fires on flush).
     #[cfg(feature = "splice")]
     pending_splice: Mutex<HashSet<String>>,
@@ -171,8 +168,6 @@ impl SqliteGraphAdapter {
             default_language: None,
             #[cfg(feature = "validate")]
             shadow: Mutex::new(HashMap::new()),
-            #[cfg(feature = "vec")]
-            vectors: None,
             #[cfg(feature = "splice")]
             pending_splice: Mutex::new(HashSet::new()),
         }
@@ -192,18 +187,6 @@ impl SqliteGraphAdapter {
     #[cfg(feature = "validate")]
     pub fn set_default_language(&mut self, lang: tree_sitter::Language) {
         self.default_language = Some(lang);
-    }
-
-    /// Attach an isolated vector index to this adapter.
-    #[cfg(feature = "vec")]
-    pub fn attach_vectors(&mut self, index: crate::vector::VectorIndex) {
-        self.vectors = Some(index);
-    }
-
-    /// Access the attached vector index, if any.
-    #[cfg(feature = "vec")]
-    pub fn vectors(&self) -> Option<&crate::vector::VectorIndex> {
-        self.vectors.as_ref()
     }
 
     /// Create a writable adapter from raw bytes (for FUSE write-back).

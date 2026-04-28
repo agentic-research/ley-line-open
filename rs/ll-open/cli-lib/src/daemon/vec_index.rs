@@ -1,8 +1,10 @@
 //! Isolated vector store for KNN search over graph nodes.
 //!
 //! Holds its own SQLite connection (in-memory or disk-backed) with a
-//! `vec0` virtual table. Completely separate from the arena — vectors
-//! never touch serialization.
+//! `vec0` virtual table. Sidecar by design: vec0 cannot survive
+//! `sqlite3_serialize`/`deserialize`, so the index never enters the
+//! living db or the arena. The EmbeddingPass writes here, and the
+//! `vec_search` op reads here.
 
 use anyhow::{Result, ensure};
 use rusqlite::Connection;

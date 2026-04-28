@@ -7,6 +7,8 @@ pub mod events;
 pub mod lsp_pass;
 pub mod ops;
 pub mod socket;
+#[cfg(feature = "vec")]
+pub mod vec_index;
 
 use std::collections::HashMap;
 use std::path::PathBuf;

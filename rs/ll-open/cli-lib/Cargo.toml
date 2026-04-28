@@ -7,6 +7,7 @@ edition = "2024"
 default = ["lsp"]
 lsp = ["dep:leyline-lsp"]
 mount = ["leyline-fs/nfs", "leyline-fs/fuse", "leyline-fs/validate"]
+vec = ["dep:sqlite-vec"]
 
 [dependencies]
 leyline-lsp = { path = "../lsp", optional = true }
@@ -15,6 +16,7 @@ leyline-schema = { path = "../../ll-core/schema" }
 leyline-core = { path = "../../ll-core/core" }
 leyline-fs = { path = "../fs", default-features = false }
 rusqlite = { version = "0.34", features = ["bundled", "serialize"] }
+sqlite-vec = { version = "0.1", optional = true }
 tree-sitter = "0.26"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"

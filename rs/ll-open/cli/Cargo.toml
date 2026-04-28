@@ -11,6 +11,7 @@ path = "src/main.rs"
 default = ["lsp"]
 lsp = ["leyline-cli-lib/lsp"]
 mount = ["leyline-cli-lib/mount"]
+vec = ["leyline-cli-lib/vec"]
 
 [dependencies]
 leyline-cli-lib = { path = "../cli-lib", default-features = false }

@@ -19,7 +19,6 @@ validate = [
 ]
 fuse = ["dep:fuser", "dep:libc"]
 nfs = ["dep:nfsserve"]
-vec = ["dep:sqlite-vec"]
 splice = ["dep:leyline-ts"]
 
 [dependencies]
@@ -45,7 +44,6 @@ tree-sitter-javascript = { version = "0.25", optional = true }
 tree-sitter-typescript = { version = "0.23", optional = true }
 tree-sitter-rust = { version = "0.24", optional = true }
 tree-sitter-elixir = { version = "0.3.5", optional = true }
-sqlite-vec = { version = "0.1", optional = true }
 leyline-ts = { path = "../ts", optional = true }
 
 [dev-dependencies]

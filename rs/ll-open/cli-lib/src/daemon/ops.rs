@@ -33,6 +33,12 @@ pub fn handle_base_op(ctx: &DaemonContext, op: &str, req: &serde_json::Value) ->
         "find_callers" => Some(op_find_callers(ctx, req)),
         "find_defs" => Some(op_find_defs(ctx, req)),
         "get_node" => Some(op_get_node(ctx, req)),
+        // Position-based LSP queries — translate (file, line, col) to node lookups.
+        "lsp_hover" => Some(op_lsp_hover(ctx, req)),
+        "lsp_defs" => Some(op_lsp_defs(ctx, req)),
+        "lsp_refs" => Some(op_lsp_refs(ctx, req)),
+        "lsp_symbols" => Some(op_lsp_symbols(ctx, req)),
+        "lsp_diagnostics" => Some(op_lsp_diagnostics(ctx, req)),
         _ => None,
     };
     result.map(|r| match r {
@@ -337,6 +343,203 @@ fn op_get_node(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
             }
             Err(e) => Err(e.into()),
         }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Position-based LSP query ops
+// ---------------------------------------------------------------------------
+
+/// Find the node_id at a given (file, line, col) position via the _ast table.
+fn find_node_at_position(conn: &Connection, file: &str, line: u32, col: u32) -> Result<Option<String>> {
+    // Find the most specific (smallest range) AST node containing this position.
+    let result = conn.query_row(
+        "SELECT node_id FROM _ast \
+         WHERE source_id = ?1 \
+           AND start_row <= ?2 AND end_row >= ?2 \
+           AND (start_row < ?2 OR start_col <= ?3) \
+           AND (end_row > ?2 OR end_col >= ?3) \
+         ORDER BY (end_byte - start_byte) ASC \
+         LIMIT 1",
+        rusqlite::params![file, line, col],
+        |row| row.get::<_, String>(0),
+    );
+    match result {
+        Ok(id) => Ok(Some(id)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Parse file + line + col from request. File can be a path or file:// URI.
+fn parse_position(req: &serde_json::Value) -> Result<(String, u32, u32)> {
+    let file = req
+        .get("file")
+        .and_then(|v| v.as_str())
+        .context("missing \"file\" field")?;
+    // Strip file:// prefix if present.
+    let file = file.strip_prefix("file://").unwrap_or(file);
+    // Use relative path (source_id in _source/_ast is relative).
+    let file = file.to_string();
+
+    let line = req
+        .get("line")
+        .and_then(|v| v.as_u64())
+        .context("missing \"line\" field")? as u32;
+    let col = req
+        .get("col")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+
+    Ok((file, line, col))
+}
+
+/// Hover info at a position.
+fn op_lsp_hover(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
+    let (file, line, col) = parse_position(req)?;
+
+    with_live_db(ctx, |conn| {
+        let node_id = find_node_at_position(conn, &file, line, col)?;
+        let node_id = match node_id {
+            Some(id) => id,
+            None => return Ok(json!({"ok": true, "hover": null}).to_string()),
+        };
+
+        let hover = conn.query_row(
+            "SELECT hover_text FROM _lsp_hover WHERE node_id = ?1",
+            [&node_id],
+            |row| row.get::<_, String>(0),
+        );
+        match hover {
+            Ok(text) => Ok(json!({"ok": true, "hover": text, "node_id": node_id}).to_string()),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                Ok(json!({"ok": true, "hover": null, "node_id": node_id}).to_string())
+            }
+            Err(e) => Err(e.into()),
+        }
+    })
+}
+
+/// Go-to-definition at a position.
+fn op_lsp_defs(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
+    let (file, line, col) = parse_position(req)?;
+
+    with_live_db(ctx, |conn| {
+        let node_id = find_node_at_position(conn, &file, line, col)?;
+        let node_id = match node_id {
+            Some(id) => id,
+            None => return Ok(json!({"ok": true, "definitions": []}).to_string()),
+        };
+
+        let mut stmt = conn.prepare_cached(
+            "SELECT def_uri, def_start_line, def_start_col, def_end_line, def_end_col \
+             FROM _lsp_defs WHERE node_id = ?1",
+        )?;
+        let rows: Vec<serde_json::Value> = stmt
+            .query_map([&node_id], |row| {
+                Ok(json!({
+                    "uri": row.get::<_, String>(0)?,
+                    "start_line": row.get::<_, i32>(1)?,
+                    "start_col": row.get::<_, i32>(2)?,
+                    "end_line": row.get::<_, i32>(3)?,
+                    "end_col": row.get::<_, i32>(4)?,
+                }))
+            })?
+            .collect::<Result<_, _>>()?;
+
+        Ok(json!({"ok": true, "definitions": rows, "node_id": node_id}).to_string())
+    })
+}
+
+/// Find references at a position.
+fn op_lsp_refs(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
+    let (file, line, col) = parse_position(req)?;
+
+    with_live_db(ctx, |conn| {
+        let node_id = find_node_at_position(conn, &file, line, col)?;
+        let node_id = match node_id {
+            Some(id) => id,
+            None => return Ok(json!({"ok": true, "references": []}).to_string()),
+        };
+
+        let mut stmt = conn.prepare_cached(
+            "SELECT ref_uri, ref_start_line, ref_start_col, ref_end_line, ref_end_col \
+             FROM _lsp_refs WHERE node_id = ?1",
+        )?;
+        let rows: Vec<serde_json::Value> = stmt
+            .query_map([&node_id], |row| {
+                Ok(json!({
+                    "uri": row.get::<_, String>(0)?,
+                    "start_line": row.get::<_, i32>(1)?,
+                    "start_col": row.get::<_, i32>(2)?,
+                    "end_line": row.get::<_, i32>(3)?,
+                    "end_col": row.get::<_, i32>(4)?,
+                }))
+            })?
+            .collect::<Result<_, _>>()?;
+
+        Ok(json!({"ok": true, "references": rows, "node_id": node_id}).to_string())
+    })
+}
+
+/// Document symbols for a file.
+fn op_lsp_symbols(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
+    let file = req
+        .get("file")
+        .and_then(|v| v.as_str())
+        .context("missing \"file\" field")?;
+    let file = file.strip_prefix("file://").unwrap_or(file);
+
+    with_live_db(ctx, |conn| {
+        let mut stmt = conn.prepare_cached(
+            "SELECT node_id, symbol_kind, detail, start_line, start_col, end_line, end_col \
+             FROM _lsp WHERE node_id LIKE ?1 || '%'",
+        )?;
+        let rows: Vec<serde_json::Value> = stmt
+            .query_map([file], |row| {
+                Ok(json!({
+                    "node_id": row.get::<_, String>(0)?,
+                    "kind": row.get::<_, String>(1)?,
+                    "detail": row.get::<_, String>(2)?,
+                    "start_line": row.get::<_, i32>(3)?,
+                    "start_col": row.get::<_, i32>(4)?,
+                    "end_line": row.get::<_, i32>(5)?,
+                    "end_col": row.get::<_, i32>(6)?,
+                }))
+            })?
+            .collect::<Result<_, _>>()?;
+
+        Ok(json!({"ok": true, "symbols": rows}).to_string())
+    })
+}
+
+/// Diagnostics for a file.
+fn op_lsp_diagnostics(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
+    let file = req
+        .get("file")
+        .and_then(|v| v.as_str())
+        .context("missing \"file\" field")?;
+    let file = file.strip_prefix("file://").unwrap_or(file);
+
+    with_live_db(ctx, |conn| {
+        let mut stmt = conn.prepare_cached(
+            "SELECT node_id, diagnostics, start_line, start_col, end_line, end_col \
+             FROM _lsp WHERE node_id LIKE ?1 || '%' AND diagnostics IS NOT NULL AND diagnostics != ''",
+        )?;
+        let rows: Vec<serde_json::Value> = stmt
+            .query_map([file], |row| {
+                Ok(json!({
+                    "node_id": row.get::<_, String>(0)?,
+                    "diagnostics": row.get::<_, String>(1)?,
+                    "start_line": row.get::<_, i32>(2)?,
+                    "start_col": row.get::<_, i32>(3)?,
+                    "end_line": row.get::<_, i32>(4)?,
+                    "end_col": row.get::<_, i32>(5)?,
+                }))
+            })?
+            .collect::<Result<_, _>>()?;
+
+        Ok(json!({"ok": true, "diagnostics": rows}).to_string())
     })
 }
 

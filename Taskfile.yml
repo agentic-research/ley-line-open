@@ -21,25 +21,35 @@ tasks:
   # Build
   # --------------------------------------------------------------------------
   build:
-    desc: Build the leyline binary (debug)
+    desc: Build the leyline binary (debug, headless — no FUSE/NFS required)
     dir: rs
     cmds:
       - cargo build -p leyline-cli
 
+  build:mount:
+    desc: Build with FUSE/NFS mount support (requires libfuse-t on macOS)
+    dir: rs
+    cmds:
+      - cargo build -p leyline-cli --features mount
+
   release:
-    desc: Build the leyline binary (release, optimized)
+    desc: Build the leyline binary (release, headless)
     dir: rs
     cmds:
       - cargo build --release -p leyline-cli
 
+  release:mount:
+    desc: Release build with FUSE/NFS mount support
+    dir: rs
+    cmds:
+      - cargo build --release -p leyline-cli --features mount
+
   install:
-    desc: Build release and install to ~/.local/bin
+    desc: Build release and install to ~/.local/bin (headless — no FUSE required)
     deps: [release]
     cmds:
       - mkdir -p ~/.local/bin
       - cp rs/target/release/leyline ~/.local/bin/leyline
-      - cmd: install_name_tool -add_rpath /usr/local/lib ~/.local/bin/leyline 2>/dev/null || true
-        platforms: [darwin]
       - echo "installed $(~/.local/bin/leyline --version)"
 
   # --------------------------------------------------------------------------

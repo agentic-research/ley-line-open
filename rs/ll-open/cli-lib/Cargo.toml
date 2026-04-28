@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["lsp", "mount"]
+default = ["lsp"]
 lsp = ["dep:leyline-lsp"]
 mount = ["leyline-fs/nfs", "leyline-fs/fuse", "leyline-fs/validate"]
 

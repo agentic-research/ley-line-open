@@ -1,6 +1,7 @@
 //! Serve command — create arena, mount via NFS or FUSE, wait for shutdown.
 
 use std::path::{Path, PathBuf};
+#[cfg(feature = "mount")]
 use std::sync::Arc;
 use std::time::Duration;
 

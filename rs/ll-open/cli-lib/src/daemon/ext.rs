@@ -6,6 +6,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use super::enrichment::EnrichmentPass;
 use super::events::{EventEmitter, EventRouter};
 
 /// Extension point for private daemon ops and lifecycle hooks.
@@ -46,6 +47,14 @@ pub trait DaemonExt: Send + Sync {
     /// pub/sub). Background tasks should be spawned via `tokio::spawn` —
     /// they run until the daemon shuts down.
     fn on_post_mount(&self, _ctrl_path: &Path, _router: &Arc<EventRouter>) {}
+
+    /// Register additional enrichment passes.
+    ///
+    /// The base daemon provides `TreeSitterPass`. Extensions add LSP,
+    /// embeddings, sheaf, etc. Each pass must own a disjoint set of tables.
+    fn enrichment_passes(&self) -> Vec<Box<dyn EnrichmentPass>> {
+        vec![]
+    }
 }
 
 /// No-op extension that rejects all ops. Used when no private extension is registered.

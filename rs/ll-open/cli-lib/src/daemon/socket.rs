@@ -12,7 +12,7 @@ use crate::daemon::ops;
 use crate::daemon::DaemonContext;
 
 /// State-changing ops that should emit events after completion.
-const STATE_CHANGING_OPS: &[&str] = &["load", "reparse", "flush", "snapshot"];
+const STATE_CHANGING_OPS: &[&str] = &["load", "reparse", "flush", "snapshot", "enrich"];
 
 /// Spawn the UDS socket listener as a background tokio task.
 ///

@@ -398,6 +398,7 @@ async fn test_daemon_socket_status_op() {
         live_db: std::sync::Mutex::new(rusqlite::Connection::open_in_memory().unwrap()),
         source_dir: None,
         lang_filter: None,
+        enrichment_passes: vec![],
     });
 
     let sock_path = dir.path().join("test.sock");
@@ -460,6 +461,7 @@ async fn test_daemon_ext_dispatches_to_extension() {
         live_db: std::sync::Mutex::new(rusqlite::Connection::open_in_memory().unwrap()),
         source_dir: None,
         lang_filter: None,
+        enrichment_passes: vec![],
     });
 
     let sock_path = dir.path().join("ext_test.sock");

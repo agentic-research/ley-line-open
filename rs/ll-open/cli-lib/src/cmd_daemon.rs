@@ -98,6 +98,13 @@ pub async fn run_daemon(
         live_db: std::sync::Mutex::new(live_conn),
         source_dir: source.map(|p| p.to_path_buf()),
         lang_filter: language.map(|s| s.to_string()),
+        enrichment_passes: {
+            let mut passes: Vec<Box<dyn crate::daemon::enrichment::EnrichmentPass>> = vec![
+                Box::new(crate::daemon::enrichment::TreeSitterPass),
+            ];
+            passes.extend(ext.enrichment_passes());
+            passes
+        },
     });
 
     let sock_path = ctrl_path.with_extension("sock");

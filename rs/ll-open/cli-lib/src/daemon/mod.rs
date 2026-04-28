@@ -1,5 +1,6 @@
 //! Open daemon: UDS socket + event router + extensible ops.
 
+pub mod enrichment;
 pub mod ext;
 pub mod events;
 pub mod ops;
@@ -23,4 +24,6 @@ pub struct DaemonContext {
     pub source_dir: Option<PathBuf>,
     /// Language filter for parsing.
     pub lang_filter: Option<String>,
+    /// Registered enrichment passes (tree-sitter + extension passes).
+    pub enrichment_passes: Vec<Box<dyn enrichment::EnrichmentPass>>,
 }

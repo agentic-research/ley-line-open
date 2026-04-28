@@ -25,6 +25,7 @@ pub fn handle_base_op(ctx: &DaemonContext, op: &str, req: &serde_json::Value) ->
         "query" => Some(op_query(ctx, req)),
         "reparse" => Some(op_reparse(ctx, req)),
         "snapshot" => Some(op_snapshot(ctx)),
+        "enrich" => Some(op_enrich(ctx, req)),
         // Structured query ops — direct from living db.
         "list_roots" => Some(op_list_children(ctx, &json!({"id": ""}))),
         "list_children" => Some(op_list_children(ctx, req)),
@@ -127,6 +128,46 @@ fn op_reparse(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
         "deleted": result.deleted,
         "errors": result.errors,
         "changed_files": result.changed_files,
+    })
+    .to_string())
+}
+
+fn op_enrich(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
+    let pass_name = req
+        .get("pass")
+        .and_then(|v| v.as_str())
+        .context("missing \"pass\" field")?;
+    let files: Option<Vec<String>> = req
+        .get("files")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+
+    let source_dir = ctx
+        .source_dir
+        .as_deref()
+        .context("no --source configured; cannot run enrichment")?;
+
+    let guard = ctx.live_db.lock().unwrap();
+    let stats = crate::daemon::enrichment::run_pass(
+        &ctx.enrichment_passes,
+        pass_name,
+        &guard,
+        source_dir,
+        files.as_deref(),
+    )?;
+    drop(guard);
+
+    // Snapshot to arena after enrichment.
+    crate::cmd_daemon::snapshot_to_arena(
+        &ctx.live_db.lock().unwrap(),
+        &ctx.ctrl_path,
+    )?;
+
+    let ctrl = Controller::open_or_create(&ctx.ctrl_path).context("open controller")?;
+    Ok(json!({
+        "ok": true,
+        "generation": ctrl.generation(),
+        "passes": stats,
     })
     .to_string())
 }
@@ -330,6 +371,7 @@ mod tests {
             live_db: Mutex::new(conn),
             source_dir: None,
             lang_filter: None,
+            enrichment_passes: vec![],
         };
         (dir, ctx)
     }

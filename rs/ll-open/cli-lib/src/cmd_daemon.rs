@@ -171,8 +171,17 @@ pub async fn run_daemon(
         eprintln!("mache not found on PATH — skipping auto-spawn");
     }
 
-    // 9. Periodic snapshot timer — debounce-flush living db to arena.
-    //    Subscribes to state-changing events and snapshots after 500ms quiet.
+    // 9. Git-aware file watcher — poll git status, reparse on change.
+    if let Some(ref source_dir) = ctx.source_dir {
+        let watch_ctx = ctx.clone();
+        let watch_source = source_dir.clone();
+        let watch_emitter = router.emitter();
+        tokio::spawn(async move {
+            git_watch_loop(watch_ctx, &watch_source, watch_emitter).await;
+        });
+    }
+
+    // 10. Periodic snapshot timer — debounce-flush living db to arena.
     {
         let snap_ctx = ctx.clone();
         let snap_ctrl = ctrl_path.clone();
@@ -182,7 +191,6 @@ pub async fn run_daemon(
             let mut tick = interval(Duration::from_millis(500));
             loop {
                 tick.tick().await;
-                // Snapshot the living db to arena.
                 let guard = snap_ctx.live_db.lock().unwrap();
                 if let Err(e) = snapshot_to_arena(&guard, &snap_ctrl) {
                     log::error!("periodic snapshot failed: {e:#}");
@@ -195,10 +203,10 @@ pub async fn run_daemon(
 
     eprintln!("daemon ready — press Ctrl+C to stop");
 
-    // 10. Wait for shutdown.
+    // 11. Wait for shutdown.
     cmd_serve::wait_for_shutdown(timeout).await?;
 
-    // 11. Graceful shutdown: final snapshot + cleanup.
+    // 12. Graceful shutdown: final snapshot + cleanup.
     {
         let guard = ctx.live_db.lock().unwrap();
         if let Err(e) = snapshot_to_arena(&guard, &ctrl_path) {
@@ -368,4 +376,141 @@ pub(crate) fn snapshot_to_arena(
 
     eprintln!("snapshot to arena (generation {new_gen}, {} bytes)", db_bytes.len());
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Git-aware file watcher
+// ---------------------------------------------------------------------------
+
+/// Poll `git status` to detect source changes, trigger incremental reparse.
+///
+/// Runs as a background tokio task. On each tick:
+/// 1. Run `git status --porcelain` in the source directory
+/// 2. Run `git rev-parse HEAD` to detect branch switches
+/// 3. If the dirty set or HEAD changed since last check, reparse
+/// 4. Snapshot to arena + emit events
+async fn git_watch_loop(
+    ctx: Arc<DaemonContext>,
+    source_dir: &Path,
+    emitter: crate::daemon::events::EventEmitter,
+) {
+    use std::collections::HashSet;
+    use tokio::time::{interval, Duration};
+
+    let mut tick = interval(Duration::from_secs(2));
+    let mut last_dirty: HashSet<String> = HashSet::new();
+    let mut last_head: String = git_head(source_dir).unwrap_or_default();
+
+    eprintln!("git watcher started (polling every 2s)");
+
+    loop {
+        tick.tick().await;
+
+        // 1. Check HEAD for branch switches.
+        let current_head = git_head(source_dir).unwrap_or_default();
+        let head_changed = !current_head.is_empty() && current_head != last_head;
+
+        // 2. Check dirty files.
+        let current_dirty = match git_dirty_files(source_dir) {
+            Ok(files) => files,
+            Err(e) => {
+                log::debug!("git status failed: {e:#}");
+                continue;
+            }
+        };
+
+        let dirty_changed = current_dirty != last_dirty;
+
+        if !head_changed && !dirty_changed {
+            continue;
+        }
+
+        if head_changed {
+            eprintln!("HEAD changed: {} → {}", &last_head[..7.min(last_head.len())], &current_head[..7.min(current_head.len())]);
+            last_head = current_head;
+        }
+
+        if dirty_changed {
+            let new_files: Vec<&String> = current_dirty.difference(&last_dirty).collect();
+            if !new_files.is_empty() {
+                eprintln!("git: {} file(s) changed", new_files.len());
+            }
+            last_dirty = current_dirty;
+        }
+
+        // 3. Incremental reparse.
+        let lang = ctx.lang_filter.as_deref();
+        let guard = ctx.live_db.lock().unwrap();
+        match crate::cmd_parse::parse_into_conn(&guard, source_dir, lang) {
+            Ok(result) => {
+                if result.parsed > 0 || result.deleted > 0 {
+                    eprintln!(
+                        "watch: {} parsed, {} unchanged, {} deleted",
+                        result.parsed, result.unchanged, result.deleted,
+                    );
+                    drop(guard);
+
+                    // 4. Snapshot to arena.
+                    let guard = ctx.live_db.lock().unwrap();
+                    if let Err(e) = snapshot_to_arena(&guard, &ctx.ctrl_path) {
+                        log::error!("watch snapshot failed: {e:#}");
+                    }
+                    drop(guard);
+
+                    // 5. Emit events.
+                    emitter.emit(
+                        "daemon.reparse.complete",
+                        "leyline",
+                        serde_json::json!({
+                            "parsed": result.parsed,
+                            "deleted": result.deleted,
+                            "changed_files": result.changed_files,
+                        }),
+                    );
+                }
+            }
+            Err(e) => {
+                log::error!("watch reparse failed: {e:#}");
+            }
+        }
+    }
+}
+
+/// Get the current HEAD commit hash.
+fn git_head(dir: &Path) -> Option<String> {
+    std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+}
+
+/// Get the set of dirty files (modified, added, untracked) via git status.
+fn git_dirty_files(dir: &Path) -> Result<std::collections::HashSet<String>> {
+    let output = std::process::Command::new("git")
+        .args(["status", "--porcelain", "-z"])
+        .current_dir(dir)
+        .output()
+        .context("run git status")?;
+
+    if !output.status.success() {
+        anyhow::bail!("git status failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    // --porcelain -z: NUL-separated entries, each starts with 2-char status + space + path
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let files: std::collections::HashSet<String> = stdout
+        .split('\0')
+        .filter(|entry| entry.len() > 3)
+        .map(|entry| entry[3..].to_string())
+        .collect();
+
+    Ok(files)
 }

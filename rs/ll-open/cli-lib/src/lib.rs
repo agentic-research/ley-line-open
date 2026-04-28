@@ -199,17 +199,25 @@ pub async fn run(cmd: Commands) -> Result<()> {
             language,
             timeout,
         } => {
-            cmd_serve::cmd_serve(
-                &arena,
-                arena_size_mib,
-                control.as_deref(),
-                &mount,
-                &backend,
-                nfs_port,
-                language.as_deref(),
-                timeout.as_deref(),
-            )
-            .await
+            #[cfg(feature = "mount")]
+            {
+                cmd_serve::cmd_serve(
+                    &arena,
+                    arena_size_mib,
+                    control.as_deref(),
+                    &mount,
+                    &backend,
+                    nfs_port,
+                    language.as_deref(),
+                    timeout.as_deref(),
+                )
+                .await
+            }
+            #[cfg(not(feature = "mount"))]
+            {
+                let _ = (arena, arena_size_mib, control, mount, backend, nfs_port, language, timeout);
+                anyhow::bail!("serve requires the 'mount' feature (compile with --features mount)")
+            }
         }
     }
 }

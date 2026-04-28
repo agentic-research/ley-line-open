@@ -10,6 +10,7 @@ use std::process::Child;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+#[cfg(feature = "mount")]
 use leyline_fs::graph::HotSwapGraph;
 
 use crate::cmd_serve;
@@ -113,7 +114,8 @@ pub async fn run_daemon(
     crate::daemon::socket::spawn(ctx.clone(), sock_path.clone());
     eprintln!("daemon socket at {}", sock_path.display());
 
-    // 6. Mount (optional — omit --mount for headless mode).
+    // 7. Mount (optional — omit --mount for headless mode).
+    #[cfg(feature = "mount")]
     if let Some(mount_path) = mount {
         let graph = HotSwapGraph::new(ctrl_path.clone())?;
         let graph = if let Some(lang_ext) = language {
@@ -144,6 +146,11 @@ pub async fn run_daemon(
         }
     } else {
         eprintln!("headless mode (no mount)");
+    }
+    #[cfg(not(feature = "mount"))]
+    {
+        let _ = (mount, backend, nfs_port);
+        eprintln!("headless mode (mount features not compiled)");
     }
 
     // 7. Extension post-mount.

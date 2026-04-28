@@ -31,13 +31,15 @@ pub fn spawn(ctx: Arc<DaemonContext>, sock_path: PathBuf) -> PathBuf {
     let listener = UnixListener::bind(&sock_path).expect("bind UDS socket");
 
     // Symlink to ~/.mache/default.sock for auto-discovery.
+    // Skip if sock_path is already at the default location (avoids self-referencing symlink).
     if let Some(home) = dirs::home_dir() {
         let mache_dir = home.join(".mache");
-        let _ = std::fs::create_dir_all(&mache_dir);
         let symlink_path = mache_dir.join("default.sock");
-        let _ = std::fs::remove_file(&symlink_path);
-        // Best-effort symlink; don't fail the daemon if it can't be created.
-        let _ = std::os::unix::fs::symlink(&sock_path, &symlink_path);
+        if sock_path != symlink_path {
+            let _ = std::fs::create_dir_all(&mache_dir);
+            let _ = std::fs::remove_file(&symlink_path);
+            let _ = std::os::unix::fs::symlink(&sock_path, &symlink_path);
+        }
     }
 
     let path = sock_path.clone();

@@ -1,5 +1,7 @@
+#[cfg(feature = "fuse")]
 pub mod fuse;
 pub mod graph;
+#[cfg(feature = "nfs")]
 pub mod nfs;
 pub mod staging;
 pub mod validate;

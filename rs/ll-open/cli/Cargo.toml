@@ -7,8 +7,13 @@ edition = "2024"
 name = "leyline"
 path = "src/main.rs"
 
+[features]
+default = ["lsp", "mount"]
+lsp = ["leyline-cli-lib/lsp"]
+mount = ["leyline-cli-lib/mount"]
+
 [dependencies]
-leyline-cli-lib = { path = "../cli-lib" }
+leyline-cli-lib = { path = "../cli-lib", default-features = false }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 dirs = "5"

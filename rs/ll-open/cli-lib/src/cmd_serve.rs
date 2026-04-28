@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use leyline_core::{Controller, create_arena};
+#[cfg(feature = "mount")]
 use leyline_fs::graph::HotSwapGraph;
 
 /// Return the default filesystem backend for the current platform.
@@ -82,6 +83,7 @@ pub fn setup_arena(
 }
 
 /// Shell out to mount_nfs (macOS) or mount.nfs (Linux) to mount the NFS export.
+#[cfg(feature = "mount")]
 pub fn mount_nfs_cmd(port: u16, mountpoint: &Path) -> Result<()> {
     std::fs::create_dir_all(mountpoint)
         .with_context(|| format!("create mountpoint {}", mountpoint.display()))?;
@@ -113,6 +115,7 @@ pub fn mount_nfs_cmd(port: u16, mountpoint: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "mount")]
 /// Main serve entry point.
 #[allow(clippy::too_many_arguments)]
 pub async fn cmd_serve(

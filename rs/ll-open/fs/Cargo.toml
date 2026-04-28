@@ -7,7 +7,7 @@ edition = "2024"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [features]
-default = ["validate"]
+default = ["validate", "fuse", "nfs"]
 validate = [
     "dep:tree-sitter",
     "dep:tree-sitter-go",
@@ -17,6 +17,8 @@ validate = [
     "dep:tree-sitter-rust",
     "dep:tree-sitter-elixir",
 ]
+fuse = ["dep:fuser", "dep:libc"]
+nfs = ["dep:nfsserve"]
 vec = ["dep:sqlite-vec"]
 splice = ["dep:leyline-ts"]
 
@@ -26,13 +28,13 @@ leyline-schema = { path = "../../ll-core/schema" }
 anyhow = "1.0"
 memmap2 = "0.9"
 bytemuck = { version = "1.14", features = ["derive"] }
-fuser = "0.15"
-libc = "0.2"
+fuser = { version = "0.15", optional = true }
+libc = { version = "0.2", optional = true }
 log = "0.4"
 rusqlite = { version = "0.34", features = ["bundled", "serialize"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-nfsserve = "0.10"
+nfsserve = { version = "0.10", optional = true }
 crossbeam-queue = "0.3"
 async-trait = "0.1"
 tokio = { version = "1", features = ["net"] }

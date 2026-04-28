@@ -147,7 +147,7 @@ fn op_reparse(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
     // Parse directly into the living db.
     ctx.state.write().unwrap().phase = DaemonPhase::Parsing;
     let guard = ctx.live_db.lock().unwrap();
-    let result = match crate::cmd_parse::parse_into_conn(&guard, Path::new(&source), lang) {
+    let result = match crate::cmd_parse::parse_into_conn(&guard, Path::new(&source), lang, None) {
         Ok(r) => r,
         Err(e) => {
             drop(guard);

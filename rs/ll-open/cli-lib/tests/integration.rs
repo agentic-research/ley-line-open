@@ -562,7 +562,7 @@ fn test_warm_start_crash_recovery() {
     // --- Phase 1: Cold start — parse into :memory:, snapshot to arena ---
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    let result = parse_into_conn(&conn, src.path(), Some("go")).unwrap();
+    let result = parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
     assert!(result.parsed >= 2, "should parse at least main.go + util.go");
     assert_eq!(result.unchanged, 0, "cold start has no unchanged files");
 
@@ -655,7 +655,7 @@ fn test_warm_start_crash_recovery() {
     )
     .unwrap();
 
-    let result2 = parse_into_conn(&recovered, src.path(), Some("go")).unwrap();
+    let result2 = parse_into_conn(&recovered, src.path(), Some("go"), None).unwrap();
     assert_eq!(result2.parsed, 1, "only main.go should be reparsed");
     assert_eq!(result2.unchanged, 1, "util.go should be unchanged");
     assert!(
@@ -762,7 +762,7 @@ fn test_multiple_snapshot_cycles() {
     ctrl.set_arena(&arena_path.to_string_lossy(), arena_size, 0).unwrap();
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    parse_into_conn(&conn, src.path(), Some("go")).unwrap();
+    parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
 
     // Run 5 snapshot cycles, modifying the file each time.
     for i in 0..5 {
@@ -774,7 +774,7 @@ fn test_multiple_snapshot_cycles() {
         )
         .unwrap();
 
-        let result = parse_into_conn(&conn, src.path(), Some("go")).unwrap();
+        let result = parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
         assert_eq!(result.parsed, 1, "cycle {i}: only main.go should reparse");
 
         snapshot_to_arena(&conn, &ctrl_path).unwrap();
@@ -1243,6 +1243,108 @@ async fn test_status_reports_phase_and_enrichment() {
         parsed["enrichment"]["tree-sitter"]["last_run_at_ms"],
         1_700_000_000_000_i64,
     );
+}
+
+/// Verify scoped reparse only touches the files in `scope`.
+///
+/// Cold-parse three Go files into an in-memory db. Modify file A on disk.
+/// Call `parse_into_conn` with `scope=Some(&["a.go"])`. Confirm:
+///   - file A's _file_index row reflects the new mtime/size.
+///   - files B and C are untouched (mtime/size match the cold-parse values).
+///   - the scoped pass parses 1 (the others were never visited).
+#[test]
+fn test_scoped_reparse_only_touches_scoped_files() {
+    use leyline_cli_lib::cmd_parse::parse_into_conn;
+    use rusqlite::Connection;
+    use std::collections::HashMap;
+
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("a.go"), b"package m\n\nfunc A() {}\n").unwrap();
+    fs::write(dir.path().join("b.go"), b"package m\n\nfunc B() {}\n").unwrap();
+    fs::write(dir.path().join("c.go"), b"package m\n\nfunc C() {}\n").unwrap();
+
+    let conn = Connection::open_in_memory().unwrap();
+    let r1 = parse_into_conn(&conn, dir.path(), Some("go"), None).unwrap();
+    assert_eq!(r1.parsed, 3, "cold parse should hit all 3 files");
+
+    let snapshot: HashMap<String, (i64, i64)> = conn
+        .prepare("SELECT path, mtime, size FROM _file_index")
+        .unwrap()
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))
+        })
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert_eq!(snapshot.len(), 3);
+
+    // Wait long enough that mtime resolution actually advances.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    fs::write(dir.path().join("a.go"), b"package m\n\nfunc A() { let _ = 1; }\n").unwrap();
+
+    let r2 = parse_into_conn(
+        &conn,
+        dir.path(),
+        Some("go"),
+        Some(&["a.go".to_string()]),
+    )
+    .unwrap();
+    assert_eq!(r2.parsed, 1, "scoped reparse should only parse a.go");
+    assert_eq!(r2.deleted, 0);
+    assert_eq!(r2.changed_files, vec!["a.go".to_string()]);
+
+    let after: HashMap<String, (i64, i64)> = conn
+        .prepare("SELECT path, mtime, size FROM _file_index")
+        .unwrap()
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))
+        })
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+
+    assert_eq!(after.len(), 3, "all 3 files should still be tracked");
+    assert_ne!(after["a.go"], snapshot["a.go"], "a.go mtime/size must change");
+    assert_eq!(after["b.go"], snapshot["b.go"], "b.go must be untouched");
+    assert_eq!(after["c.go"], snapshot["c.go"], "c.go must be untouched");
+}
+
+/// Verify scoped reparse handles a deleted file: vanished files in the scope
+/// are removed from the index, files outside the scope remain.
+#[test]
+fn test_scoped_reparse_handles_deletion_in_scope() {
+    use leyline_cli_lib::cmd_parse::parse_into_conn;
+    use rusqlite::Connection;
+
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("a.go"), b"package m\n\nfunc A() {}\n").unwrap();
+    fs::write(dir.path().join("b.go"), b"package m\n\nfunc B() {}\n").unwrap();
+
+    let conn = Connection::open_in_memory().unwrap();
+    let r1 = parse_into_conn(&conn, dir.path(), Some("go"), None).unwrap();
+    assert_eq!(r1.parsed, 2);
+
+    fs::remove_file(dir.path().join("a.go")).unwrap();
+
+    let r2 = parse_into_conn(
+        &conn,
+        dir.path(),
+        Some("go"),
+        Some(&["a.go".to_string()]),
+    )
+    .unwrap();
+    assert_eq!(r2.parsed, 0);
+    assert_eq!(r2.deleted, 1);
+
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM _file_index", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 1, "only b.go should remain in _file_index");
+    let remaining: String = conn
+        .query_row("SELECT path FROM _file_index", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(remaining, "b.go");
 }
 
 /// Verify the error phase is surfaced through `op_status`.

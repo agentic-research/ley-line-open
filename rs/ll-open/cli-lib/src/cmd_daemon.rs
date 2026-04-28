@@ -276,7 +276,7 @@ fn init_living_db(
         eprintln!("warm start from arena");
         if let Some(source_dir) = source {
             eprintln!("incremental reparse {} ...", source_dir.display());
-            let result = crate::cmd_parse::parse_into_conn(&conn, source_dir, language)?;
+            let result = crate::cmd_parse::parse_into_conn(&conn, source_dir, language, None)?;
             eprintln!(
                 "{} parsed, {} unchanged, {} deleted, {} errors",
                 result.parsed, result.unchanged, result.deleted, result.errors,
@@ -292,7 +292,7 @@ fn init_living_db(
 
     if let Some(source_dir) = source {
         eprintln!("parsing {} ...", source_dir.display());
-        let result = crate::cmd_parse::parse_into_conn(&conn, source_dir, language)?;
+        let result = crate::cmd_parse::parse_into_conn(&conn, source_dir, language, None)?;
         eprintln!(
             "{} parsed, {} unchanged, {} deleted, {} errors",
             result.parsed, result.unchanged, result.deleted, result.errors,
@@ -471,11 +471,15 @@ async fn git_watch_loop(
             last_dirty = current_dirty;
         }
 
-        // 3. Incremental reparse.
+        // 3. Incremental reparse, scoped to the dirty set so we don't re-stat
+        //    the entire source tree on every tick.
         ctx.state.write().unwrap().phase = DaemonPhase::Parsing;
         let lang = ctx.lang_filter.as_deref();
+        let dirty_vec: Vec<String> = last_dirty.iter().cloned().collect();
+        let scope: Option<&[String]> =
+            if dirty_vec.is_empty() { None } else { Some(dirty_vec.as_slice()) };
         let guard = ctx.live_db.lock().unwrap();
-        match crate::cmd_parse::parse_into_conn(&guard, source_dir, lang) {
+        match crate::cmd_parse::parse_into_conn(&guard, source_dir, lang, scope) {
             Ok(result) => {
                 if result.parsed > 0 || result.deleted > 0 {
                     eprintln!(

@@ -98,7 +98,7 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
     conn.pragma_update(None, "page_size", "65536")?;
     conn.pragma_update(None, "cache_size", "-64000")?; // 64MB cache
 
-    let result = parse_into_conn(&conn, source, lang_filter)?;
+    let result = parse_into_conn(&conn, source, lang_filter, None)?;
     eprintln!(
         "{} parsed, {} unchanged, {} deleted, {} errors -> {}",
         result.parsed, result.unchanged, result.deleted, result.errors,
@@ -113,7 +113,17 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
 /// The caller is responsible for opening the connection (file-backed or
 /// `:memory:`) and setting appropriate pragmas. This function creates
 /// the schema if needed, then runs incremental parallel parse.
-pub fn parse_into_conn(conn: &Connection, source: &Path, lang_filter: Option<&str>) -> Result<ParseResult> {
+///
+/// `scope` restricts the parse to a subset of relative paths (e.g. the dirty
+/// set from the git watcher). When `Some`, only files in the scope are stat'd
+/// and reparsed, and only those paths are considered for deletion. When
+/// `None`, the entire `source` tree is walked.
+pub fn parse_into_conn(
+    conn: &Connection,
+    source: &Path,
+    lang_filter: Option<&str>,
+    scope: Option<&[String]>,
+) -> Result<ParseResult> {
     if !source.is_dir() {
         bail!("{} is not a directory", source.display());
     }
@@ -124,7 +134,19 @@ pub fn parse_into_conn(conn: &Connection, source: &Path, lang_filter: Option<&st
         .context("invalid --lang")?;
 
     let mut files = Vec::new();
-    collect_files(source, &mut files)?;
+    if let Some(scope) = scope {
+        // Scoped pass — caller (typically git watcher) supplied the file set.
+        // Only include paths that still exist; vanished paths fall through
+        // to the deletion sweep below.
+        for rel in scope {
+            let abs = source.join(rel);
+            if abs.exists() {
+                files.push(abs);
+            }
+        }
+    } else {
+        collect_files(source, &mut files)?;
+    }
 
     // Check if tables already exist (incremental mode).
     let incremental = conn
@@ -206,7 +228,19 @@ pub fn parse_into_conn(conn: &Connection, source: &Path, lang_filter: Option<&st
 
     let mut deleted = 0u64;
     let current_rels: HashSet<&str> = to_parse.iter().map(|(r, _, _, _, _)| r.as_str()).collect();
+
+    // For a full-tree pass, every path in old_index that isn't in `files` is
+    // a deletion candidate. For a scoped pass, only paths in scope can be
+    // deleted — paths outside scope are simply not visible to this pass.
+    let scope_set: Option<HashSet<&str>> =
+        scope.map(|s| s.iter().map(|p| p.as_str()).collect());
+
     for old_path in old_index.keys() {
+        if let Some(set) = &scope_set
+            && !set.contains(old_path.as_str())
+        {
+            continue;
+        }
         if !current_rels.contains(old_path.as_str())
             && !files.iter().any(|f| {
                 f.strip_prefix(source)
@@ -345,10 +379,15 @@ pub fn parse_into_conn(conn: &Connection, source: &Path, lang_filter: Option<&st
     let insert_elapsed = insert_start.elapsed();
 
     // ---- Post-sweep ----
-
-    let swept = sweep_orphaned_dirs(conn)?;
-    if swept > 0 {
-        eprintln!("{swept} orphaned dirs removed");
+    //
+    // Skip orphaned-dir sweep on scoped passes: it would walk the full
+    // _file_index tree and incorrectly drop dirs whose other (out-of-scope)
+    // files weren't loaded into this run. Full-tree passes still run it.
+    if scope.is_none() {
+        let swept = sweep_orphaned_dirs(conn)?;
+        if swept > 0 {
+            eprintln!("{swept} orphaned dirs removed");
+        }
     }
 
     // ---- Metadata ----

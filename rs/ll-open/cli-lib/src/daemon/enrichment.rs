@@ -283,11 +283,13 @@ impl EnrichmentPass for TreeSitterPass {
         &self,
         conn: &Connection,
         source_dir: &Path,
-        _changed_files: Option<&[String]>,
+        changed_files: Option<&[String]>,
     ) -> Result<EnrichmentStats> {
         let start = Instant::now();
-        // parse_into_conn handles incrementality via _file_index internally.
-        let result = crate::cmd_parse::parse_into_conn(conn, source_dir, None)?;
+        // Forward `changed_files` as the parse scope. When the caller knows
+        // which files changed (e.g. lazy LSP enrichment), we skip the full
+        // tree walk; otherwise parse_into_conn does its own _file_index diff.
+        let result = crate::cmd_parse::parse_into_conn(conn, source_dir, None, changed_files)?;
 
         Ok(EnrichmentStats {
             pass_name: "tree-sitter".to_string(),

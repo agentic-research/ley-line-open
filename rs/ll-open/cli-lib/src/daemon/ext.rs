@@ -55,6 +55,20 @@ pub trait DaemonExt: Send + Sync {
     fn enrichment_passes(&self) -> Vec<Box<dyn EnrichmentPass>> {
         vec![]
     }
+
+    /// Called when the source repo's HEAD commit changes (e.g. branch switch,
+    /// new commit). Use to invalidate VCS-keyed caches in the extension.
+    ///
+    /// `old_sha` may be empty on first transition. The same information is
+    /// also emitted as a `daemon.head.changed` event — extensions can use
+    /// either pattern.
+    fn on_head_changed(&self, _old_sha: &str, _new_sha: &str) {}
+
+    /// Called when the source repo's dirty file set changes (file edits,
+    /// adds, removes). `paths` is the new dirty set in full — not a delta.
+    ///
+    /// Mirrors the `daemon.files.changed` event payload.
+    fn on_files_changed(&self, _paths: &[String]) {}
 }
 
 /// No-op extension that rejects all ops. Used when no private extension is registered.

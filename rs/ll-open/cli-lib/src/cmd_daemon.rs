@@ -458,8 +458,21 @@ async fn git_watch_loop(
         }
 
         if head_changed {
-            eprintln!("HEAD changed: {} → {}", &last_head[..7.min(last_head.len())], &current_head[..7.min(current_head.len())]);
+            eprintln!(
+                "HEAD changed: {} → {}",
+                &last_head[..7.min(last_head.len())],
+                &current_head[..7.min(current_head.len())],
+            );
             ctx.state.write().unwrap().head_sha = Some(current_head.clone());
+            emitter.emit(
+                "daemon.head.changed",
+                "leyline",
+                serde_json::json!({
+                    "old_sha": last_head,
+                    "new_sha": current_head,
+                }),
+            );
+            ctx.ext.on_head_changed(&last_head, &current_head);
             last_head = current_head;
         }
 
@@ -468,6 +481,13 @@ async fn git_watch_loop(
             if !new_files.is_empty() {
                 eprintln!("git: {} file(s) changed", new_files.len());
             }
+            let dirty_paths: Vec<String> = current_dirty.iter().cloned().collect();
+            emitter.emit(
+                "daemon.files.changed",
+                "leyline",
+                serde_json::json!({ "paths": dirty_paths.clone() }),
+            );
+            ctx.ext.on_files_changed(&dirty_paths);
             last_dirty = current_dirty;
         }
 
@@ -569,4 +589,210 @@ fn git_dirty_files(dir: &Path) -> Result<std::collections::HashSet<String>> {
         .collect();
 
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+    use tempfile::TempDir;
+
+    /// DaemonExt that records every VCS hook invocation.
+    struct RecordingExt {
+        head_changes: StdMutex<Vec<(String, String)>>,
+        file_changes: StdMutex<Vec<Vec<String>>>,
+    }
+
+    impl RecordingExt {
+        fn new() -> Self {
+            Self {
+                head_changes: StdMutex::new(Vec::new()),
+                file_changes: StdMutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl DaemonExt for RecordingExt {
+        fn on_head_changed(&self, old_sha: &str, new_sha: &str) {
+            self.head_changes
+                .lock()
+                .unwrap()
+                .push((old_sha.to_string(), new_sha.to_string()));
+        }
+        fn on_files_changed(&self, paths: &[String]) {
+            self.file_changes.lock().unwrap().push(paths.to_vec());
+        }
+    }
+
+    /// Run a shell command in a directory, panicking on failure.
+    fn sh(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new(args[0])
+            .args(&args[1..])
+            .current_dir(dir)
+            .status()
+            .expect("spawn");
+        assert!(status.success(), "command failed: {args:?}");
+    }
+
+    /// Set up a temp git repo with one committed file, return the path.
+    fn fixture_repo() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        sh(dir.path(), &["git", "init", "-q"]);
+        sh(dir.path(), &["git", "config", "user.email", "test@example.com"]);
+        sh(dir.path(), &["git", "config", "user.name", "test"]);
+        sh(dir.path(), &["git", "config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.path().join("a.go"), "package m\n\nfunc A() {}\n").unwrap();
+        sh(dir.path(), &["git", "add", "."]);
+        sh(dir.path(), &["git", "commit", "-q", "-m", "init"]);
+        dir
+    }
+
+    /// Build a DaemonContext suitable for git_watch_loop testing.
+    fn test_ctx(
+        ctrl_path: &Path,
+        ext: Arc<dyn DaemonExt>,
+        source: &Path,
+    ) -> Arc<DaemonContext> {
+        let _ = leyline_core::create_arena(
+            &ctrl_path.with_extension("arena"),
+            2 * 1024 * 1024,
+        )
+        .unwrap();
+        let mut ctrl = leyline_core::Controller::open_or_create(ctrl_path).unwrap();
+        ctrl.set_arena(
+            ctrl_path.with_extension("arena").to_string_lossy().as_ref(),
+            2 * 1024 * 1024,
+            0,
+        )
+        .unwrap();
+        drop(ctrl);
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        Arc::new(DaemonContext {
+            ctrl_path: ctrl_path.to_path_buf(),
+            ext,
+            router: crate::daemon::EventRouter::new(64),
+            live_db: std::sync::Mutex::new(conn),
+            source_dir: Some(source.to_path_buf()),
+            lang_filter: Some("go".to_string()),
+            enrichment_passes: vec![Box::new(crate::daemon::enrichment::TreeSitterPass)],
+            state: Arc::new(std::sync::RwLock::new(DaemonState::initializing())),
+        })
+    }
+
+    /// Subscribe to one topic, return the event receiver.
+    async fn subscribe_to(
+        router: &Arc<crate::daemon::EventRouter>,
+        topic: &str,
+    ) -> tokio::sync::mpsc::Receiver<crate::daemon::events::Event> {
+        let (_id, rx, _replay, _gap) = router
+            .subscribe(
+                &[topic.to_string()],
+                None,
+                u64::MAX, // skip replay
+                crate::daemon::events::OverflowPolicy::DropOldest,
+                64,
+            )
+            .await;
+        rx
+    }
+
+    /// `git_watch_loop` ticks every 2s. Modify a file, wait one full tick + a
+    /// generous slack, and verify both the typed hook and the event fire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watcher_invokes_files_changed_hook_and_event() {
+        let repo = fixture_repo();
+        let dir = TempDir::new().unwrap();
+        let ctrl_path = dir.path().join("test.ctrl");
+
+        let ext = Arc::new(RecordingExt::new());
+        let ctx = test_ctx(&ctrl_path, ext.clone(), repo.path());
+
+        let mut events_rx = subscribe_to(&ctx.router, "daemon.files.changed").await;
+        let emitter = ctx.router.emitter();
+
+        let watch_ctx = ctx.clone();
+        let watch_source = repo.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            git_watch_loop(watch_ctx, &watch_source, emitter).await;
+        });
+
+        // Let the watcher tick once with no changes (establishes baseline).
+        tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+
+        // Now make the file dirty.
+        std::fs::write(repo.path().join("a.go"), "package m\n\nfunc A() { /* edit */ }\n")
+            .unwrap();
+
+        // Wait up to 5s for the next tick to detect the change.
+        let saw_files_event = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            events_rx.recv(),
+        )
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+
+        task.abort();
+
+        assert!(saw_files_event, "expected daemon.files.changed event");
+        let recorded = ext.file_changes.lock().unwrap();
+        assert!(
+            !recorded.is_empty(),
+            "expected on_files_changed to be invoked at least once",
+        );
+        let last_set = recorded.last().unwrap();
+        assert!(
+            last_set.iter().any(|p| p == "a.go"),
+            "expected dirty set to include a.go, got {last_set:?}",
+        );
+    }
+
+    /// HEAD changes (e.g. new commit) should fire both the event and the hook.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watcher_invokes_head_changed_hook_and_event() {
+        let repo = fixture_repo();
+        let initial_head = git_head(repo.path()).unwrap();
+        let dir = TempDir::new().unwrap();
+        let ctrl_path = dir.path().join("test.ctrl");
+
+        let ext = Arc::new(RecordingExt::new());
+        let ctx = test_ctx(&ctrl_path, ext.clone(), repo.path());
+
+        let mut events_rx = subscribe_to(&ctx.router, "daemon.head.changed").await;
+        let emitter = ctx.router.emitter();
+
+        let watch_ctx = ctx.clone();
+        let watch_source = repo.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            git_watch_loop(watch_ctx, &watch_source, emitter).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+
+        // New commit — bumps HEAD.
+        std::fs::write(repo.path().join("b.go"), "package m\n\nfunc B() {}\n").unwrap();
+        sh(repo.path(), &["git", "add", "."]);
+        sh(repo.path(), &["git", "commit", "-q", "-m", "add b"]);
+        let new_head = git_head(repo.path()).unwrap();
+        assert_ne!(initial_head, new_head);
+
+        let saw_head_event = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            events_rx.recv(),
+        )
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+
+        task.abort();
+
+        assert!(saw_head_event, "expected daemon.head.changed event");
+        let head_calls = ext.head_changes.lock().unwrap();
+        assert!(!head_calls.is_empty(), "expected on_head_changed to fire");
+        let (_old, new) = head_calls.last().unwrap();
+        assert_eq!(new, &new_head, "hook should report the new HEAD sha");
+    }
 }

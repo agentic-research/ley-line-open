@@ -1,9 +1,9 @@
-// Public Intermediate Representation (IR) for Ley-line
-// This schema allows Mache (Go) and other clients to communicate with
-// the Ley-line Data Plane without direct dependency on the Private Core.
+// Daemon protocol schema — Cap'n Proto types generated from capnp/daemon.capnp.
+//
+// This is the public contract between the ley-line daemon and consumers
+// (mache, CLI tools, etc.). The .capnp file is the single source of truth.
 
-pub mod v2 {
-    tonic::include_proto!("leyline.v2");
+#[allow(unused, clippy::all)]
+pub mod daemon_capnp {
+    include!(concat!(env!("OUT_DIR"), "/capnp/daemon_capnp.rs"));
 }
-
-pub use v2::*;

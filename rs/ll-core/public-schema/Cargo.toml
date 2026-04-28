@@ -4,10 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-prost = "0.12"
-serde = { version = "1", features = ["derive"] }
-tonic = "0.11"
+capnp = "0.20"
 
 [build-dependencies]
-prost-build = "0.12"
-tonic-build = "0.11"
+capnpc = "0.20"

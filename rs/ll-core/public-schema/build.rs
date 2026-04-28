@@ -1,4 +1,6 @@
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    prost_build::compile_protos(&["proto/graph.proto"], &["proto/"])?;
-    Ok(())
+fn main() {
+    capnpc::CompilerCommand::new()
+        .file("capnp/daemon.capnp")
+        .run()
+        .expect("capnp compile daemon.capnp");
 }

@@ -379,7 +379,6 @@ fn parse_position(req: &serde_json::Value) -> Result<(String, u32, u32)> {
         .context("missing \"file\" field")?;
     // Strip file:// prefix if present.
     let file = file.strip_prefix("file://").unwrap_or(file);
-    // Use relative path (source_id in _source/_ast is relative).
     let file = file.to_string();
 
     let line = req
@@ -394,92 +393,219 @@ fn parse_position(req: &serde_json::Value) -> Result<(String, u32, u32)> {
     Ok((file, line, col))
 }
 
-/// Hover info at a position.
+/// Check if a file has ANY _lsp enrichment data. If not, auto-trigger
+/// enrichment and return true (caller should retry the query).
+fn maybe_enrich(ctx: &DaemonContext, conn: &Connection, file: &str) -> bool {
+    // Check if _lsp table exists at all.
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='_lsp'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+
+    if !table_exists {
+        return try_enrich_file(ctx, file);
+    }
+
+    // Check if this file has any _lsp rows.
+    let has_data: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM _lsp WHERE node_id LIKE ?1 || '%'",
+            [file],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+
+    if has_data {
+        return false; // already enriched, don't retry
+    }
+
+    try_enrich_file(ctx, file)
+}
+
+/// Trigger LSP enrichment for a single file. Returns true if enrichment ran.
+fn try_enrich_file(ctx: &DaemonContext, file: &str) -> bool {
+    let source_dir = match &ctx.source_dir {
+        Some(d) => d.clone(),
+        None => return false,
+    };
+
+    eprintln!("lazy enrich: triggering LSP for {file}");
+
+    let guard = ctx.live_db.lock().unwrap();
+    let result = crate::daemon::enrichment::run_pass(
+        &ctx.enrichment_passes,
+        "lsp",
+        &guard,
+        &source_dir,
+        Some(&[file.to_string()]),
+    );
+    drop(guard);
+
+    match result {
+        Ok(stats) => {
+            if let Some(s) = stats.last() {
+                eprintln!("lazy enrich: {} items for {file}", s.items_added);
+            }
+            true
+        }
+        Err(e) => {
+            eprintln!("lazy enrich failed for {file}: {e:#}");
+            false
+        }
+    }
+}
+
+/// Hover info at a position. Auto-enriches if no data exists.
 fn op_lsp_hover(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
     let (file, line, col) = parse_position(req)?;
 
-    with_live_db(ctx, |conn| {
-        let node_id = find_node_at_position(conn, &file, line, col)?;
-        let node_id = match node_id {
-            Some(id) => id,
-            None => return Ok(json!({"ok": true, "hover": null}).to_string()),
-        };
+    // First attempt.
+    let result = with_live_db(ctx, |conn| {
+        lsp_hover_query(conn, &file, line, col)
+    })?;
 
-        let hover = conn.query_row(
-            "SELECT hover_text FROM _lsp_hover WHERE node_id = ?1",
-            [&node_id],
-            |row| row.get::<_, String>(0),
-        );
-        match hover {
-            Ok(text) => Ok(json!({"ok": true, "hover": text, "node_id": node_id}).to_string()),
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                Ok(json!({"ok": true, "hover": null, "node_id": node_id}).to_string())
+    // If no data and file not enriched yet, trigger enrichment and retry.
+    if result.is_none() {
+        let enriched = with_live_db(ctx, |conn| Ok(maybe_enrich(ctx, conn, &file)))?;
+        if enriched {
+            let result = with_live_db(ctx, |conn| lsp_hover_query(conn, &file, line, col))?;
+            if let Some((hover, node_id)) = result {
+                return Ok(json!({"ok": true, "hover": hover, "node_id": node_id, "enriched": true}).to_string());
             }
-            Err(e) => Err(e.into()),
         }
-    })
+    }
+
+    match result {
+        Some((hover, node_id)) => Ok(json!({"ok": true, "hover": hover, "node_id": node_id}).to_string()),
+        None => Ok(json!({"ok": true, "hover": null}).to_string()),
+    }
 }
 
-/// Go-to-definition at a position.
+fn lsp_hover_query(conn: &Connection, file: &str, line: u32, col: u32) -> Result<Option<(String, String)>> {
+    let node_id = match find_node_at_position(conn, file, line, col)? {
+        Some(id) => id,
+        None => return Ok(None),
+    };
+    let hover = conn.query_row(
+        "SELECT hover_text FROM _lsp_hover WHERE node_id = ?1",
+        [&node_id],
+        |row| row.get::<_, String>(0),
+    );
+    match hover {
+        Ok(text) => Ok(Some((text, node_id))),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Go-to-definition at a position. Auto-enriches if no data exists.
 fn op_lsp_defs(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
     let (file, line, col) = parse_position(req)?;
 
-    with_live_db(ctx, |conn| {
-        let node_id = find_node_at_position(conn, &file, line, col)?;
-        let node_id = match node_id {
-            Some(id) => id,
-            None => return Ok(json!({"ok": true, "definitions": []}).to_string()),
-        };
+    let result = with_live_db(ctx, |conn| lsp_defs_query(conn, &file, line, col))?;
 
-        let mut stmt = conn.prepare_cached(
-            "SELECT def_uri, def_start_line, def_start_col, def_end_line, def_end_col \
-             FROM _lsp_defs WHERE node_id = ?1",
-        )?;
-        let rows: Vec<serde_json::Value> = stmt
-            .query_map([&node_id], |row| {
-                Ok(json!({
-                    "uri": row.get::<_, String>(0)?,
-                    "start_line": row.get::<_, i32>(1)?,
-                    "start_col": row.get::<_, i32>(2)?,
-                    "end_line": row.get::<_, i32>(3)?,
-                    "end_col": row.get::<_, i32>(4)?,
-                }))
-            })?
-            .collect::<Result<_, _>>()?;
+    if result.is_empty() {
+        let enriched = with_live_db(ctx, |conn| Ok(maybe_enrich(ctx, conn, &file)))?;
+        if enriched {
+            let result = with_live_db(ctx, |conn| lsp_defs_query(conn, &file, line, col))?;
+            return Ok(json!({"ok": true, "definitions": result, "enriched": true}).to_string());
+        }
+    }
 
-        Ok(json!({"ok": true, "definitions": rows, "node_id": node_id}).to_string())
-    })
+    Ok(json!({"ok": true, "definitions": result}).to_string())
 }
 
-/// Find references at a position.
+fn lsp_defs_query(conn: &Connection, file: &str, line: u32, col: u32) -> Result<Vec<serde_json::Value>> {
+    let node_id = match find_node_at_position(conn, file, line, col)? {
+        Some(id) => id,
+        None => return Ok(vec![]),
+    };
+
+    // Check if table exists.
+    let exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='_lsp_defs'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if !exists {
+        return Ok(vec![]);
+    }
+
+    let mut stmt = conn.prepare_cached(
+        "SELECT def_uri, def_start_line, def_start_col, def_end_line, def_end_col \
+         FROM _lsp_defs WHERE node_id = ?1",
+    )?;
+    let rows: Vec<serde_json::Value> = stmt
+        .query_map([&node_id], |row| {
+            Ok(json!({
+                "uri": row.get::<_, String>(0)?,
+                "start_line": row.get::<_, i32>(1)?,
+                "start_col": row.get::<_, i32>(2)?,
+                "end_line": row.get::<_, i32>(3)?,
+                "end_col": row.get::<_, i32>(4)?,
+            }))
+        })?
+        .collect::<Result<_, _>>()?;
+
+    Ok(rows)
+}
+
+/// Find references at a position. Auto-enriches if no data exists.
 fn op_lsp_refs(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
     let (file, line, col) = parse_position(req)?;
 
-    with_live_db(ctx, |conn| {
-        let node_id = find_node_at_position(conn, &file, line, col)?;
-        let node_id = match node_id {
-            Some(id) => id,
-            None => return Ok(json!({"ok": true, "references": []}).to_string()),
-        };
+    let result = with_live_db(ctx, |conn| lsp_refs_query(conn, &file, line, col))?;
 
-        let mut stmt = conn.prepare_cached(
-            "SELECT ref_uri, ref_start_line, ref_start_col, ref_end_line, ref_end_col \
-             FROM _lsp_refs WHERE node_id = ?1",
-        )?;
-        let rows: Vec<serde_json::Value> = stmt
-            .query_map([&node_id], |row| {
-                Ok(json!({
-                    "uri": row.get::<_, String>(0)?,
-                    "start_line": row.get::<_, i32>(1)?,
-                    "start_col": row.get::<_, i32>(2)?,
-                    "end_line": row.get::<_, i32>(3)?,
-                    "end_col": row.get::<_, i32>(4)?,
-                }))
-            })?
-            .collect::<Result<_, _>>()?;
+    if result.is_empty() {
+        let enriched = with_live_db(ctx, |conn| Ok(maybe_enrich(ctx, conn, &file)))?;
+        if enriched {
+            let result = with_live_db(ctx, |conn| lsp_refs_query(conn, &file, line, col))?;
+            return Ok(json!({"ok": true, "references": result, "enriched": true}).to_string());
+        }
+    }
 
-        Ok(json!({"ok": true, "references": rows, "node_id": node_id}).to_string())
-    })
+    Ok(json!({"ok": true, "references": result}).to_string())
+}
+
+fn lsp_refs_query(conn: &Connection, file: &str, line: u32, col: u32) -> Result<Vec<serde_json::Value>> {
+    let node_id = match find_node_at_position(conn, file, line, col)? {
+        Some(id) => id,
+        None => return Ok(vec![]),
+    };
+
+    let exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='_lsp_refs'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if !exists {
+        return Ok(vec![]);
+    }
+
+    let mut stmt = conn.prepare_cached(
+        "SELECT ref_uri, ref_start_line, ref_start_col, ref_end_line, ref_end_col \
+         FROM _lsp_refs WHERE node_id = ?1",
+    )?;
+    let rows: Vec<serde_json::Value> = stmt
+        .query_map([&node_id], |row| {
+            Ok(json!({
+                "uri": row.get::<_, String>(0)?,
+                "start_line": row.get::<_, i32>(1)?,
+                "start_col": row.get::<_, i32>(2)?,
+                "end_line": row.get::<_, i32>(3)?,
+                "end_col": row.get::<_, i32>(4)?,
+            }))
+        })?
+        .collect::<Result<_, _>>()?;
+
+    Ok(rows)
 }
 
 /// Document symbols for a file.

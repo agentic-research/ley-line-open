@@ -56,14 +56,64 @@ struct ParsedFile {
 }
 
 // ---------------------------------------------------------------------------
-// Public entry point
+// Public types
 // ---------------------------------------------------------------------------
 
-/// Orchestrate a multi-file parse of `source` into `output`.
+/// Result of a parse operation, including stats and changed file list.
+pub struct ParseResult {
+    /// Number of files successfully parsed.
+    pub parsed: u64,
+    /// Number of files skipped (unchanged mtime+size).
+    pub unchanged: u64,
+    /// Number of stale files deleted.
+    pub deleted: u64,
+    /// Number of files that failed to parse.
+    pub errors: u64,
+    /// Relative paths of files that were actually parsed (not skipped).
+    pub changed_files: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Public entry points
+// ---------------------------------------------------------------------------
+
+/// Orchestrate a multi-file parse of `source` into `output` (file-backed).
 ///
-/// Files are parsed in parallel via rayon, then batch-inserted into SQLite
-/// in a single transaction. Incremental mode skips unchanged files.
+/// Opens a file-backed SQLite connection with portable pragmas, then
+/// delegates to [`parse_into_conn`].
 pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Result<()> {
+    if !source.is_dir() {
+        bail!("{} is not a directory", source.display());
+    }
+
+    let conn =
+        Connection::open(output).with_context(|| format!("open {}", output.display()))?;
+    // Perf pragmas for file-backed bulk insert.
+    // DELETE journal (not WAL) — the .db is a portable snapshot. WAL requires
+    // -shm/-wal sidecar files on the same filesystem, breaking portability.
+    // synchronous=OFF — no fsync during batch (re-parse on crash is safe).
+    // page_size=65536 — larger B-tree pages, fewer page splits.
+    conn.pragma_update(None, "journal_mode", "DELETE")?;
+    conn.pragma_update(None, "synchronous", "OFF")?;
+    conn.pragma_update(None, "page_size", "65536")?;
+    conn.pragma_update(None, "cache_size", "-64000")?; // 64MB cache
+
+    let result = parse_into_conn(&conn, source, lang_filter)?;
+    eprintln!(
+        "{} parsed, {} unchanged, {} deleted, {} errors -> {}",
+        result.parsed, result.unchanged, result.deleted, result.errors,
+        output.display()
+    );
+
+    Ok(())
+}
+
+/// Parse `source` into an already-open connection.
+///
+/// The caller is responsible for opening the connection (file-backed or
+/// `:memory:`) and setting appropriate pragmas. This function creates
+/// the schema if needed, then runs incremental parallel parse.
+pub fn parse_into_conn(conn: &Connection, source: &Path, lang_filter: Option<&str>) -> Result<ParseResult> {
     if !source.is_dir() {
         bail!("{} is not a directory", source.display());
     }
@@ -76,22 +126,14 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
     let mut files = Vec::new();
     collect_files(source, &mut files)?;
 
-    let incremental = output.exists();
+    // Check if tables already exist (incremental mode).
+    let incremental = conn
+        .prepare("SELECT 1 FROM _file_index LIMIT 1")
+        .is_ok();
 
-    let conn =
-        Connection::open(output).with_context(|| format!("open {}", output.display()))?;
-    // Perf pragmas for bulk insert.
-    // DELETE journal (not WAL) — the .db is a portable snapshot. WAL requires
-    // -shm/-wal sidecar files on the same filesystem, breaking portability.
-    // synchronous=OFF — no fsync during batch (re-parse on crash is safe).
-    // page_size=65536 — larger B-tree pages, fewer page splits.
-    conn.pragma_update(None, "journal_mode", "DELETE")?;
-    conn.pragma_update(None, "synchronous", "OFF")?;
-    conn.pragma_update(None, "page_size", "65536")?;
-    conn.pragma_update(None, "cache_size", "-64000")?; // 64MB cache
-    create_ast_schema(&conn)?;
-    create_refs_schema(&conn)?;
-    create_index_schema(&conn)?;
+    create_ast_schema(conn)?;
+    create_refs_schema(conn)?;
+    create_index_schema(conn)?;
 
     let mtime = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -107,7 +149,7 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
     // ---- Classify files ----
 
     let old_index = if incremental {
-        read_file_index(&conn)?
+        read_file_index(conn)?
     } else {
         HashMap::new()
     };
@@ -173,13 +215,13 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
                     == *old_path
             })
         {
-            delete_file_rows(&conn, old_path)?;
+            delete_file_rows(conn, old_path)?;
             deleted += 1;
         }
     }
     for (rel, _, _, _, _) in &to_parse {
         if old_index.contains_key(rel) {
-            delete_file_rows(&conn, rel)?;
+            delete_file_rows(conn, rel)?;
         }
     }
 
@@ -240,11 +282,13 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
         "INSERT OR REPLACE INTO _file_index (path, mtime, size) VALUES (?1, ?2, ?3)",
     )?;
 
+    let mut changed_files: Vec<String> = Vec::new();
+
     for result in parsed_files {
         match result {
             Ok(pf) => {
                 let rel_path = Path::new(&pf.rel);
-                ensure_dirs(&conn, rel_path, mtime, &mut dirs_created)?;
+                ensure_dirs(conn, rel_path, mtime, &mut dirs_created)?;
 
                 stmt_source.execute(rusqlite::params![&pf.rel, &pf.language, &pf.abs_path])?;
 
@@ -277,6 +321,7 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
                 }
 
                 stmt_file_idx.execute(rusqlite::params![&pf.rel, pf.file_mtime, pf.file_size])?;
+                changed_files.push(pf.rel.clone());
                 parsed += 1;
             }
             Err(e) => {
@@ -301,7 +346,7 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
 
     // ---- Post-sweep ----
 
-    let swept = sweep_orphaned_dirs(&conn)?;
+    let swept = sweep_orphaned_dirs(conn)?;
     if swept > 0 {
         eprintln!("{swept} orphaned dirs removed");
     }
@@ -309,20 +354,25 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
     // ---- Metadata ----
 
     let source_abs = source.canonicalize().unwrap_or_else(|_| source.to_path_buf());
-    set_meta(&conn, "source_root", &source_abs.to_string_lossy())?;
+    set_meta(conn, "source_root", &source_abs.to_string_lossy())?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    set_meta(&conn, "parse_time", &now.to_string())?;
+    set_meta(conn, "parse_time", &now.to_string())?;
 
     eprintln!(
         "{parsed} parsed, {unchanged} unchanged, {deleted} deleted, {errors} errors \
-         (parse {parse_elapsed:.1?}, insert {insert_elapsed:.1?}) -> {}",
-        output.display()
+         (parse {parse_elapsed:.1?}, insert {insert_elapsed:.1?})",
     );
 
-    Ok(())
+    Ok(ParseResult {
+        parsed,
+        unchanged,
+        deleted,
+        errors,
+        changed_files,
+    })
 }
 
 // ---------------------------------------------------------------------------

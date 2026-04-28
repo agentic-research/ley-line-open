@@ -16,7 +16,11 @@ pub struct DaemonContext {
     pub ctrl_path: PathBuf,
     pub ext: Arc<dyn DaemonExt>,
     pub router: Arc<EventRouter>,
-    /// Cached arena SQLite connection — invalidated when generation changes.
-    /// (generation, Connection). Mutex because ops are called from async tasks.
-    pub arena_conn: Mutex<Option<(u64, rusqlite::Connection)>>,
+    /// The living database — owned for the daemon's lifetime.
+    /// All queries go through this. `:memory:` SQLite, crash-recovered from arena.
+    pub live_db: Mutex<rusqlite::Connection>,
+    /// Source directory being tracked (if --source was given).
+    pub source_dir: Option<PathBuf>,
+    /// Language filter for parsing.
+    pub lang_filter: Option<String>,
 }

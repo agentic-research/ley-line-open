@@ -70,65 +70,38 @@ pub async fn run_daemon(
     ext: Arc<dyn DaemonExt>,
     source: Option<&Path>,
 ) -> Result<()> {
-    // 1. If --source: parse first so we know the .db size for arena sizing.
-    let mut arena_bytes = arena_size_mib * 1024 * 1024;
-    let ctrl_path = control
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| arena.with_extension("ctrl"));
-    let db_path = ctrl_path.with_extension("db");
-
-    if let Some(source_dir) = source {
-        eprintln!("parsing {} ...", source_dir.display());
-        crate::cmd_parse::cmd_parse(source_dir, &db_path, language)?;
-
-        // Auto-size arena: header (4KB) + 2 buffers + 1MB margin.
-        // Each buffer must hold the full serialized .db.
-        let db_size = std::fs::metadata(&db_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let min_arena = leyline_core::ArenaHeader::HEADER_SIZE + db_size * 2 + (1024 * 1024);
-        if min_arena > arena_bytes {
-            eprintln!(
-                "auto-sizing arena: {}MB → {}MB (db is {}MB)",
-                arena_bytes / (1024 * 1024),
-                min_arena / (1024 * 1024),
-                db_size / (1024 * 1024),
-            );
-            arena_bytes = min_arena;
-        }
-    }
-
-    // 2. Arena setup (now with correct size).
+    // 1. Arena setup.
+    let arena_bytes = arena_size_mib * 1024 * 1024;
     let ctrl_path = cmd_serve::setup_arena(arena, arena_bytes, control)?;
 
-    // 3. If --source: load parsed .db into arena.
-    if source.is_some() && db_path.exists() {
-        let db_bytes = std::fs::read(&db_path)
-            .with_context(|| format!("read parsed db: {}", db_path.display()))?;
-        crate::cmd_load::load_into_arena(&ctrl_path, &db_bytes)?;
+    // 2. Initialize the living database.
+    //
+    // Warm start: if the arena has a valid snapshot, deserialize it into a
+    // writable :memory: connection. This recovers state across crashes.
+    // Cold start: fresh :memory: connection + parse from --source.
+    let live_conn = init_living_db(&ctrl_path, source, language)?;
 
-        let generation = leyline_core::Controller::open_or_create(&ctrl_path)
-            .map(|c| c.generation())
-            .unwrap_or(0);
-        eprintln!("loaded into arena (generation {generation})");
-    }
+    // 3. Snapshot living db into arena (initial snapshot for mache/remote consumers).
+    snapshot_to_arena(&live_conn, &ctrl_path)?;
 
-    // 3. Event router.
+    // 4. Event router.
     let router = EventRouter::new(10_000);
 
-    // 4. Extension init.
+    // 5. Extension init.
     ext.on_init(router.emitter());
 
-    // 5. Build context + spawn UDS socket.
+    // 6. Build context + spawn UDS socket.
     let ctx = Arc::new(DaemonContext {
         ctrl_path: ctrl_path.clone(),
         ext: ext.clone(),
         router: router.clone(),
-        arena_conn: std::sync::Mutex::new(None),
+        live_db: std::sync::Mutex::new(live_conn),
+        source_dir: source.map(|p| p.to_path_buf()),
+        lang_filter: language.map(|s| s.to_string()),
     });
 
     let sock_path = ctrl_path.with_extension("sock");
-    crate::daemon::socket::spawn(ctx, sock_path.clone());
+    crate::daemon::socket::spawn(ctx.clone(), sock_path.clone());
     eprintln!("daemon socket at {}", sock_path.display());
 
     // 6. Mount (optional — omit --mount for headless mode).
@@ -191,12 +164,42 @@ pub async fn run_daemon(
         eprintln!("mache not found on PATH — skipping auto-spawn");
     }
 
+    // 9. Periodic snapshot timer — debounce-flush living db to arena.
+    //    Subscribes to state-changing events and snapshots after 500ms quiet.
+    {
+        let snap_ctx = ctx.clone();
+        let snap_ctrl = ctrl_path.clone();
+        let emitter = router.emitter();
+        tokio::spawn(async move {
+            use tokio::time::{interval, Duration};
+            let mut tick = interval(Duration::from_millis(500));
+            loop {
+                tick.tick().await;
+                // Snapshot the living db to arena.
+                let guard = snap_ctx.live_db.lock().unwrap();
+                if let Err(e) = snapshot_to_arena(&guard, &snap_ctrl) {
+                    log::error!("periodic snapshot failed: {e:#}");
+                }
+                drop(guard);
+                emitter.emit("daemon.snapshot", "leyline", serde_json::json!({}));
+            }
+        });
+    }
+
     eprintln!("daemon ready — press Ctrl+C to stop");
 
-    // 9. Wait for shutdown.
+    // 10. Wait for shutdown.
     cmd_serve::wait_for_shutdown(timeout).await?;
 
-    // 10. Cleanup: kill mache child, remove socket.
+    // 11. Graceful shutdown: final snapshot + cleanup.
+    {
+        let guard = ctx.live_db.lock().unwrap();
+        if let Err(e) = snapshot_to_arena(&guard, &ctrl_path) {
+            eprintln!("warn: final snapshot failed: {e:#}");
+        } else {
+            eprintln!("final snapshot saved to arena");
+        }
+    }
     if let Some(mut child) = mache_child {
         eprintln!("stopping mache (pid={})...", child.id());
         let _ = child.kill();
@@ -204,5 +207,158 @@ pub async fn run_daemon(
     }
     let _ = std::fs::remove_file(&sock_path);
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Living database helpers
+// ---------------------------------------------------------------------------
+
+/// Initialize the living database.
+///
+/// **Warm start**: if the arena has a valid snapshot, deserialize it into a
+/// writable `:memory:` connection, then incrementally reparse if `--source`.
+/// **Cold start**: fresh `:memory:` connection + full parse from `--source`.
+fn init_living_db(
+    ctrl_path: &Path,
+    source: Option<&Path>,
+    language: Option<&str>,
+) -> Result<rusqlite::Connection> {
+    // Try warm start from arena.
+    if let Some(conn) = try_warm_start(ctrl_path)? {
+        eprintln!("warm start from arena");
+        if let Some(source_dir) = source {
+            eprintln!("incremental reparse {} ...", source_dir.display());
+            let result = crate::cmd_parse::parse_into_conn(&conn, source_dir, language)?;
+            eprintln!(
+                "{} parsed, {} unchanged, {} deleted, {} errors",
+                result.parsed, result.unchanged, result.deleted, result.errors,
+            );
+        }
+        return Ok(conn);
+    }
+
+    // Cold start: fresh :memory: connection.
+    eprintln!("cold start");
+    let conn = rusqlite::Connection::open_in_memory()
+        .context("open :memory: connection")?;
+
+    if let Some(source_dir) = source {
+        eprintln!("parsing {} ...", source_dir.display());
+        let result = crate::cmd_parse::parse_into_conn(&conn, source_dir, language)?;
+        eprintln!(
+            "{} parsed, {} unchanged, {} deleted, {} errors",
+            result.parsed, result.unchanged, result.deleted, result.errors,
+        );
+    }
+
+    Ok(conn)
+}
+
+/// Try to restore the living db from the arena's active buffer.
+/// Returns `None` if the arena doesn't exist or has no valid data.
+fn try_warm_start(ctrl_path: &Path) -> Result<Option<rusqlite::Connection>> {
+    use std::io::Cursor;
+
+    let ctrl = match leyline_core::Controller::open_or_create(ctrl_path) {
+        Ok(c) => c,
+        Err(_) => return Ok(None),
+    };
+
+    let arena_path = ctrl.arena_path();
+    if arena_path.is_empty() {
+        return Ok(None);
+    }
+
+    let file = match std::fs::File::open(&arena_path) {
+        Ok(f) => f,
+        Err(_) => return Ok(None),
+    };
+
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    if mmap.len() < std::mem::size_of::<leyline_core::ArenaHeader>() {
+        return Ok(None);
+    }
+
+    let header: &leyline_core::ArenaHeader =
+        bytemuck::from_bytes(&mmap[..std::mem::size_of::<leyline_core::ArenaHeader>()]);
+
+    let file_size = mmap.len() as u64;
+    let offset = match header.active_buffer_offset(file_size) {
+        Some(o) => o,
+        None => return Ok(None),
+    };
+    let buf_size = leyline_core::ArenaHeader::buffer_size(file_size);
+    let buf = &mmap[offset as usize..(offset + buf_size) as usize];
+
+    // Check if the buffer has any data (not all zeros).
+    if buf.iter().take(16).all(|&b| b == 0) {
+        return Ok(None);
+    }
+
+    // Deserialize as writable :memory: connection.
+    let mut conn = rusqlite::Connection::open_in_memory()?;
+    conn.deserialize_read_exact(
+        rusqlite::DatabaseName::Main,
+        Cursor::new(buf),
+        buf.len(),
+        false, // writable
+    )
+    .context("warm start: sqlite3_deserialize failed")?;
+
+    let generation = ctrl.generation();
+    eprintln!("recovered from arena (generation {generation})");
+
+    Ok(Some(conn))
+}
+
+/// Serialize the living db and write it into the arena.
+pub(crate) fn snapshot_to_arena(
+    conn: &rusqlite::Connection,
+    ctrl_path: &Path,
+) -> Result<()> {
+    let db_bytes = conn.serialize(rusqlite::DatabaseName::Main)
+        .context("serialize living db")?;
+
+    // Ensure arena is large enough.
+    let mut ctrl = leyline_core::Controller::open_or_create(ctrl_path)
+        .context("open controller")?;
+    let arena_path = ctrl.arena_path();
+    let arena_size = ctrl.arena_size();
+
+    let min_arena = leyline_core::ArenaHeader::HEADER_SIZE + db_bytes.len() as u64 * 2 + (1024 * 1024);
+    let arena_size = if min_arena > arena_size {
+        eprintln!(
+            "auto-sizing arena: {}MB → {}MB (db is {}MB)",
+            arena_size / (1024 * 1024),
+            min_arena / (1024 * 1024),
+            db_bytes.len() / (1024 * 1024),
+        );
+        let _ = ctrl.set_arena(&arena_path, min_arena, ctrl.generation());
+        min_arena
+    } else {
+        arena_size
+    };
+
+    let buf_capacity = leyline_core::ArenaHeader::buffer_size(arena_size) as usize;
+    if db_bytes.len() > buf_capacity {
+        anyhow::bail!(
+            "db ({} bytes) exceeds arena buffer capacity ({} bytes)",
+            db_bytes.len(),
+            buf_capacity,
+        );
+    }
+
+    let mut mmap = leyline_core::create_arena(Path::new(&arena_path), arena_size)
+        .context("open arena file")?;
+
+    leyline_core::write_to_arena(&mut mmap, &db_bytes)
+        .context("write to arena")?;
+
+    let new_gen = ctrl.generation() + 1;
+    ctrl.set_arena(&arena_path, arena_size, new_gen)
+        .context("bump generation")?;
+
+    eprintln!("snapshot to arena (generation {new_gen}, {} bytes)", db_bytes.len());
     Ok(())
 }

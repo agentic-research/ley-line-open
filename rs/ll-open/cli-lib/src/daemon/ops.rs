@@ -1,15 +1,13 @@
 //! Base op handlers for the daemon's UDS protocol.
 //!
-//! Each op queries the arena's active SQLite buffer via `sqlite3_deserialize`.
-//! A cached connection is reused across requests, invalidated on generation change.
+//! Each op queries the living in-memory SQLite database directly.
+//! The arena is used only for periodic snapshots (crash recovery + mache).
 
-use std::io::Cursor;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use leyline_core::{ArenaHeader, Controller};
-use memmap2::Mmap;
-use rusqlite::{Connection, DatabaseName};
+use leyline_core::Controller;
+use rusqlite::Connection;
 use serde_json::json;
 
 use super::DaemonContext;
@@ -25,8 +23,9 @@ pub fn handle_base_op(ctx: &DaemonContext, op: &str, req: &serde_json::Value) ->
         "flush" => Some(op_flush(&ctx.ctrl_path)),
         "load" => Some(op_load(&ctx.ctrl_path, req)),
         "query" => Some(op_query(ctx, req)),
-        "reparse" => Some(op_reparse(&ctx.ctrl_path, req)),
-        // Structured query ops — zero-copy from arena via cached connection.
+        "reparse" => Some(op_reparse(ctx, req)),
+        "snapshot" => Some(op_snapshot(ctx)),
+        // Structured query ops — direct from living db.
         "list_roots" => Some(op_list_children(ctx, &json!({"id": ""}))),
         "list_children" => Some(op_list_children(ctx, req)),
         "read_content" => Some(op_read_content(ctx, req)),
@@ -42,35 +41,20 @@ pub fn handle_base_op(ctx: &DaemonContext, op: &str, req: &serde_json::Value) ->
 }
 
 // ---------------------------------------------------------------------------
-// Connection cache
+// Living db access
 // ---------------------------------------------------------------------------
 
-/// Get the cached arena connection, refreshing if the generation changed.
-fn with_arena_conn<F, T>(ctx: &DaemonContext, f: F) -> Result<T>
+/// Execute a closure with the living database connection.
+fn with_live_db<F, T>(ctx: &DaemonContext, f: F) -> Result<T>
 where
     F: FnOnce(&Connection) -> Result<T>,
 {
-    let ctrl = Controller::open_or_create(&ctx.ctrl_path).context("open controller")?;
-    let current_gen = ctrl.generation();
-
-    let mut guard = ctx.arena_conn.lock().unwrap();
-
-    let needs_refresh = match &*guard {
-        Some((cached_gen, _)) => *cached_gen != current_gen,
-        None => true,
-    };
-
-    if needs_refresh {
-        let conn = open_arena_db(&ctx.ctrl_path)?;
-        *guard = Some((current_gen, conn));
-    }
-
-    let (_, conn) = guard.as_ref().unwrap();
-    f(conn)
+    let guard = ctx.live_db.lock().unwrap();
+    f(&guard)
 }
 
 // ---------------------------------------------------------------------------
-// Control ops (don't need arena connection)
+// Control ops (don't need the living db)
 // ---------------------------------------------------------------------------
 
 fn op_status(ctrl_path: &Path) -> Result<String> {
@@ -107,25 +91,57 @@ fn op_load(ctrl_path: &Path, req: &serde_json::Value) -> Result<String> {
     Ok(json!({"ok": true, "generation": ctrl.generation()}).to_string())
 }
 
-fn op_reparse(ctrl_path: &Path, req: &serde_json::Value) -> Result<String> {
+// ---------------------------------------------------------------------------
+// Reparse + snapshot ops
+// ---------------------------------------------------------------------------
+
+fn op_reparse(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
     let source = req
         .get("source")
         .and_then(|v| v.as_str())
-        .context("missing \"source\" field")?;
-    let lang = req.get("lang").and_then(|v| v.as_str());
+        .or_else(|| ctx.source_dir.as_ref().map(|p| p.to_str().unwrap_or("")))
+        .context("missing \"source\" field and no --source configured")?
+        .to_string();
+    let lang = req
+        .get("lang")
+        .and_then(|v| v.as_str())
+        .or(ctx.lang_filter.as_deref());
 
-    let tmp = tempfile::NamedTempFile::new().context("create temp .db")?;
-    let db_path = tmp.path().to_path_buf();
-    crate::cmd_parse::cmd_parse(Path::new(source), &db_path, lang)?;
-    let db_bytes = std::fs::read(&db_path).context("read temp .db")?;
-    crate::cmd_load::load_into_arena(ctrl_path, &db_bytes)?;
+    // Parse directly into the living db.
+    let guard = ctx.live_db.lock().unwrap();
+    let result = crate::cmd_parse::parse_into_conn(&guard, Path::new(&source), lang)?;
+    drop(guard);
 
-    let ctrl = Controller::open_or_create(ctrl_path).context("open controller")?;
+    // Snapshot to arena for mache/remote consumers.
+    crate::cmd_daemon::snapshot_to_arena(
+        &ctx.live_db.lock().unwrap(),
+        &ctx.ctrl_path,
+    )?;
+
+    let ctrl = Controller::open_or_create(&ctx.ctrl_path).context("open controller")?;
+    Ok(json!({
+        "ok": true,
+        "generation": ctrl.generation(),
+        "parsed": result.parsed,
+        "unchanged": result.unchanged,
+        "deleted": result.deleted,
+        "errors": result.errors,
+        "changed_files": result.changed_files,
+    })
+    .to_string())
+}
+
+fn op_snapshot(ctx: &DaemonContext) -> Result<String> {
+    crate::cmd_daemon::snapshot_to_arena(
+        &ctx.live_db.lock().unwrap(),
+        &ctx.ctrl_path,
+    )?;
+    let ctrl = Controller::open_or_create(&ctx.ctrl_path).context("open controller")?;
     Ok(json!({"ok": true, "generation": ctrl.generation()}).to_string())
 }
 
 // ---------------------------------------------------------------------------
-// Query ops (use cached arena connection)
+// Query ops (use living db directly)
 // ---------------------------------------------------------------------------
 
 /// Raw SQL query — for ad-hoc inspection.
@@ -135,7 +151,7 @@ fn op_query(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .context("missing \"sql\" field")?;
 
-    with_arena_conn(ctx, |conn| {
+    with_live_db(ctx, |conn| {
         let mut stmt = conn.prepare(sql).context("prepare SQL")?;
         let col_count = stmt.column_count();
         let headers: Vec<String> = (0..col_count)
@@ -161,7 +177,7 @@ fn op_query(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
 fn op_list_children(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
     let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("");
 
-    with_arena_conn(ctx, |conn| {
+    with_live_db(ctx, |conn| {
         let mut stmt = conn.prepare_cached(
             "SELECT id, name, kind, size FROM nodes WHERE parent_id = ?1 ORDER BY name",
         )?;
@@ -187,7 +203,7 @@ fn op_read_content(ctx: &DaemonContext, req: &serde_json::Value) -> Result<Strin
         .and_then(|v| v.as_str())
         .context("missing \"id\" field")?;
 
-    with_arena_conn(ctx, |conn| {
+    with_live_db(ctx, |conn| {
         let result = conn.query_row(
             "SELECT record FROM nodes WHERE id = ?1",
             [id],
@@ -210,7 +226,7 @@ fn op_find_callers(ctx: &DaemonContext, req: &serde_json::Value) -> Result<Strin
         .and_then(|v| v.as_str())
         .context("missing \"token\" field")?;
 
-    with_arena_conn(ctx, |conn| {
+    with_live_db(ctx, |conn| {
         let mut stmt = conn.prepare_cached(
             "SELECT node_id, source_id FROM node_refs WHERE token = ?1",
         )?;
@@ -234,7 +250,7 @@ fn op_find_defs(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> 
         .and_then(|v| v.as_str())
         .context("missing \"token\" field")?;
 
-    with_arena_conn(ctx, |conn| {
+    with_live_db(ctx, |conn| {
         let mut stmt = conn.prepare_cached(
             "SELECT node_id, source_id FROM node_defs WHERE token = ?1",
         )?;
@@ -258,7 +274,7 @@ fn op_get_node(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .context("missing \"id\" field")?;
 
-    with_arena_conn(ctx, |conn| {
+    with_live_db(ctx, |conn| {
         let result = conn.query_row(
             "SELECT id, parent_id, name, kind, size, record FROM nodes WHERE id = ?1",
             [id],
@@ -284,38 +300,6 @@ fn op_get_node(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Open the arena's active buffer as a read-only in-memory SQLite connection.
-fn open_arena_db(ctrl_path: &Path) -> Result<Connection> {
-    let ctrl = Controller::open_or_create(ctrl_path).context("open controller")?;
-    let arena_path = ctrl.arena_path();
-    anyhow::ensure!(!arena_path.is_empty(), "controller has no arena path");
-
-    let file = std::fs::File::open(&arena_path)
-        .with_context(|| format!("open arena file: {arena_path}"))?;
-    let mmap = unsafe { Mmap::map(&file)? };
-
-    let header: &ArenaHeader =
-        bytemuck::from_bytes(&mmap[..std::mem::size_of::<ArenaHeader>()]);
-
-    let file_size = mmap.len() as u64;
-    let offset = header
-        .active_buffer_offset(file_size)
-        .context("invalid arena header")?;
-    let buf_size = ArenaHeader::buffer_size(file_size);
-
-    let buf = &mmap[offset as usize..(offset + buf_size) as usize];
-
-    let mut conn = Connection::open_in_memory()?;
-    conn.deserialize_read_exact(DatabaseName::Main, Cursor::new(buf), buf.len(), true)
-        .context("sqlite3_deserialize failed")?;
-
-    Ok(conn)
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -334,11 +318,18 @@ mod tests {
         ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0)
             .unwrap();
 
+        // Create a living db with the nodes schema.
+        let conn = Connection::open_in_memory().unwrap();
+        leyline_ts::schema::create_ast_schema(&conn).unwrap();
+        leyline_ts::schema::create_refs_schema(&conn).unwrap();
+
         let ctx = DaemonContext {
             ctrl_path,
             ext: Arc::new(crate::daemon::NoExt),
             router: crate::daemon::EventRouter::new(16),
-            arena_conn: Mutex::new(None),
+            live_db: Mutex::new(conn),
+            source_dir: None,
+            lang_filter: None,
         };
         (dir, ctx)
     }

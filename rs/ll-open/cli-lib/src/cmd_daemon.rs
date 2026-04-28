@@ -14,7 +14,9 @@ use anyhow::{Context, Result};
 use leyline_fs::graph::HotSwapGraph;
 
 use crate::cmd_serve;
-use crate::daemon::{DaemonContext, DaemonExt, EventRouter, NoExt};
+use crate::daemon::{
+    DaemonContext, DaemonExt, DaemonPhase, DaemonState, EventRouter, NoExt,
+};
 
 /// Open edition entry point — runs the daemon with no private extensions.
 #[allow(clippy::too_many_arguments)]
@@ -75,15 +77,32 @@ pub async fn run_daemon(
     let arena_bytes = arena_size_mib * 1024 * 1024;
     let ctrl_path = cmd_serve::setup_arena(arena, arena_bytes, control)?;
 
+    // Lifecycle state — starts as Initializing, transitions through Parsing /
+    // Enriching / Ready / Error. Shared with op_status and background tasks.
+    let state = Arc::new(std::sync::RwLock::new(DaemonState::initializing()));
+
     // 2. Initialize the living database.
     //
     // Warm start: if the arena has a valid snapshot, deserialize it into a
     // writable :memory: connection. This recovers state across crashes.
     // Cold start: fresh :memory: connection + parse from --source.
-    let live_conn = init_living_db(&ctrl_path, source, language)?;
+    let live_conn = match init_living_db(&ctrl_path, source, language) {
+        Ok(conn) => conn,
+        Err(e) => {
+            state.write().unwrap().phase = DaemonPhase::Error(format!("init failed: {e:#}"));
+            return Err(e);
+        }
+    };
 
     // 3. Snapshot living db into arena (initial snapshot for mache/remote consumers).
     snapshot_to_arena(&live_conn, &ctrl_path)?;
+
+    // Capture initial HEAD if --source is set.
+    if let Some(src) = source
+        && let Some(sha) = git_head(src)
+    {
+        state.write().unwrap().head_sha = Some(sha);
+    }
 
     // 4. Event router.
     let router = EventRouter::new(10_000);
@@ -108,7 +127,11 @@ pub async fn run_daemon(
             passes.extend(ext.enrichment_passes());
             passes
         },
+        state: state.clone(),
     });
+
+    // Initial parse (during init_living_db) is done — daemon is ready to serve.
+    state.write().unwrap().phase = DaemonPhase::Ready;
 
     let sock_path = ctrl_path.with_extension("sock");
     crate::daemon::socket::spawn(ctx.clone(), sock_path.clone());
@@ -436,6 +459,7 @@ async fn git_watch_loop(
 
         if head_changed {
             eprintln!("HEAD changed: {} → {}", &last_head[..7.min(last_head.len())], &current_head[..7.min(current_head.len())]);
+            ctx.state.write().unwrap().head_sha = Some(current_head.clone());
             last_head = current_head;
         }
 
@@ -448,6 +472,7 @@ async fn git_watch_loop(
         }
 
         // 3. Incremental reparse.
+        ctx.state.write().unwrap().phase = DaemonPhase::Parsing;
         let lang = ctx.lang_filter.as_deref();
         let guard = ctx.live_db.lock().unwrap();
         match crate::cmd_parse::parse_into_conn(&guard, source_dir, lang) {
@@ -466,7 +491,12 @@ async fn git_watch_loop(
                     }
                     drop(guard);
 
-                    // 5. Emit events.
+                    // 5. Update state + emit events.
+                    {
+                        let mut s = ctx.state.write().unwrap();
+                        s.last_reparse_at_ms = Some(now_ms());
+                        s.phase = DaemonPhase::Ready;
+                    }
                     emitter.emit(
                         "daemon.reparse.complete",
                         "leyline",
@@ -476,13 +506,26 @@ async fn git_watch_loop(
                             "changed_files": result.changed_files,
                         }),
                     );
+                } else {
+                    drop(guard);
+                    ctx.state.write().unwrap().phase = DaemonPhase::Ready;
                 }
             }
             Err(e) => {
                 log::error!("watch reparse failed: {e:#}");
+                ctx.state.write().unwrap().phase =
+                    DaemonPhase::Error(format!("watch reparse failed: {e:#}"));
             }
         }
     }
+}
+
+/// Wall-clock millis since UNIX_EPOCH. Used for `last_*_ms` state fields.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Get the current HEAD commit hash.

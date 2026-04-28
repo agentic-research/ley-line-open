@@ -10,7 +10,7 @@ use leyline_core::Controller;
 use rusqlite::Connection;
 use serde_json::json;
 
-use super::DaemonContext;
+use super::{DaemonContext, DaemonPhase};
 
 // ---------------------------------------------------------------------------
 // Public dispatch
@@ -19,7 +19,7 @@ use super::DaemonContext;
 /// Dispatch a base op. Returns `Some(json_string)` if handled, `None` if unrecognized.
 pub fn handle_base_op(ctx: &DaemonContext, op: &str, req: &serde_json::Value) -> Option<String> {
     let result = match op {
-        "status" => Some(op_status(&ctx.ctrl_path)),
+        "status" => Some(op_status(ctx)),
         "flush" => Some(op_flush(&ctx.ctrl_path)),
         "load" => Some(op_load(&ctx.ctrl_path, req)),
         "query" => Some(op_query(ctx, req)),
@@ -64,15 +64,45 @@ where
 // Control ops (don't need the living db)
 // ---------------------------------------------------------------------------
 
-fn op_status(ctrl_path: &Path) -> Result<String> {
-    let ctrl = Controller::open_or_create(ctrl_path).context("open controller")?;
-    Ok(json!({
+fn op_status(ctx: &DaemonContext) -> Result<String> {
+    let ctrl = Controller::open_or_create(&ctx.ctrl_path).context("open controller")?;
+    let state = ctx.state.read().unwrap();
+
+    let mut enrichment = serde_json::Map::new();
+    for (name, status) in &state.enrichment {
+        let mut s = serde_json::Map::new();
+        if let Some(t) = status.last_run_at_ms {
+            s.insert("last_run_at_ms".into(), json!(t));
+        }
+        if let Some(b) = status.basis {
+            s.insert("basis".into(), json!(b));
+        }
+        if let Some(e) = &status.error {
+            s.insert("error".into(), json!(e));
+        }
+        enrichment.insert(name.clone(), serde_json::Value::Object(s));
+    }
+
+    let mut out = json!({
         "ok": true,
+        "phase": state.phase.as_str(),
         "generation": ctrl.generation(),
         "arena_path": ctrl.arena_path(),
         "arena_size": ctrl.arena_size(),
-    })
-    .to_string())
+        "enrichment": enrichment,
+    });
+    if let serde_json::Value::Object(ref mut map) = out {
+        if let Some(sha) = &state.head_sha {
+            map.insert("head_sha".into(), json!(sha));
+        }
+        if let Some(ts) = state.last_reparse_at_ms {
+            map.insert("last_reparse_at_ms".into(), json!(ts));
+        }
+        if let DaemonPhase::Error(msg) = &state.phase {
+            map.insert("error".into(), json!(msg));
+        }
+    }
+    Ok(out.to_string())
 }
 
 fn op_flush(ctrl_path: &Path) -> Result<String> {
@@ -115,8 +145,17 @@ fn op_reparse(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
         .or(ctx.lang_filter.as_deref());
 
     // Parse directly into the living db.
+    ctx.state.write().unwrap().phase = DaemonPhase::Parsing;
     let guard = ctx.live_db.lock().unwrap();
-    let result = crate::cmd_parse::parse_into_conn(&guard, Path::new(&source), lang)?;
+    let result = match crate::cmd_parse::parse_into_conn(&guard, Path::new(&source), lang) {
+        Ok(r) => r,
+        Err(e) => {
+            drop(guard);
+            ctx.state.write().unwrap().phase =
+                DaemonPhase::Error(format!("reparse failed: {e:#}"));
+            return Err(e);
+        }
+    };
     drop(guard);
 
     // Snapshot to arena for mache/remote consumers.
@@ -124,6 +163,12 @@ fn op_reparse(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
         &ctx.live_db.lock().unwrap(),
         &ctx.ctrl_path,
     )?;
+
+    {
+        let mut s = ctx.state.write().unwrap();
+        s.phase = DaemonPhase::Ready;
+        s.last_reparse_at_ms = Some(now_ms());
+    }
 
     let ctrl = Controller::open_or_create(&ctx.ctrl_path).context("open controller")?;
     Ok(json!({
@@ -136,6 +181,13 @@ fn op_reparse(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
         "changed_files": result.changed_files,
     })
     .to_string())
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn op_enrich(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
@@ -153,6 +205,7 @@ fn op_enrich(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
         .as_deref()
         .context("no --source configured; cannot run enrichment")?;
 
+    ctx.state.write().unwrap().phase = DaemonPhase::Enriching;
     let guard = ctx.live_db.lock().unwrap();
     let stats = crate::daemon::enrichment::run_pass(
         &ctx.enrichment_passes,
@@ -160,8 +213,10 @@ fn op_enrich(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
         &guard,
         source_dir,
         files.as_deref(),
+        Some(&ctx.state),
     )?;
     drop(guard);
+    ctx.state.write().unwrap().phase = DaemonPhase::Ready;
 
     // Snapshot to arena after enrichment.
     crate::cmd_daemon::snapshot_to_arena(
@@ -441,6 +496,7 @@ fn try_enrich_file(ctx: &DaemonContext, file: &str) -> bool {
         &guard,
         &source_dir,
         Some(&[file.to_string()]),
+        Some(&ctx.state),
     );
     drop(guard);
 
@@ -676,7 +732,7 @@ fn op_lsp_diagnostics(ctx: &DaemonContext, req: &serde_json::Value) -> Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, RwLock};
     use tempfile::TempDir;
 
     fn setup() -> (TempDir, DaemonContext) {
@@ -701,6 +757,7 @@ mod tests {
             source_dir: None,
             lang_filter: None,
             enrichment_passes: vec![],
+            state: Arc::new(RwLock::new(crate::daemon::DaemonState::initializing())),
         };
         (dir, ctx)
     }

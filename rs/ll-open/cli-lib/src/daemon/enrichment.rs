@@ -5,11 +5,14 @@
 //! The pipeline tracks version vectors in `_meta` for staleness detection.
 
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde::Serialize;
+
+use super::{DaemonState, PassStatus};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -72,12 +75,16 @@ pub trait EnrichmentPass: Send + Sync {
 ///
 /// The executor resolves dependencies in topological order and runs each
 /// pass that is stale (its basis version is behind the current parse version).
+///
+/// If `state` is provided, each pass's outcome is recorded in
+/// `state.enrichment[pass_name]` (last_run_at_ms / basis / error).
 pub fn run_pass(
     passes: &[Box<dyn EnrichmentPass>],
     target: &str,
     conn: &Connection,
     source_dir: &Path,
     changed_files: Option<&[String]>,
+    state: Option<&Arc<RwLock<DaemonState>>>,
 ) -> Result<Vec<EnrichmentStats>> {
     let order = resolve_order(passes, target)?;
     let mut stats = Vec::new();
@@ -89,7 +96,9 @@ pub fn run_pass(
             .unwrap();
 
         let start = Instant::now();
-        let result = pass.run(conn, source_dir, changed_files)?;
+        let outcome = pass.run(conn, source_dir, changed_files);
+        record_pass_outcome(state, pass.name(), &outcome, conn);
+        let result = outcome?;
         stats.push(result);
 
         // Update version in _meta.
@@ -113,6 +122,7 @@ pub fn run_all(
     conn: &Connection,
     source_dir: &Path,
     changed_files: Option<&[String]>,
+    state: Option<&Arc<RwLock<DaemonState>>>,
 ) -> Result<Vec<EnrichmentStats>> {
     let mut stats = Vec::new();
     // Simple topological sort: run passes with no unmet dependencies first.
@@ -127,7 +137,9 @@ pub fn run_all(
         match next {
             Some(idx) => {
                 let pass = remaining.remove(idx);
-                let result = pass.run(conn, source_dir, changed_files)?;
+                let outcome = pass.run(conn, source_dir, changed_files);
+                record_pass_outcome(state, pass.name(), &outcome, conn);
+                let result = outcome?;
 
                 let version_key = format!("{}_version", pass.name());
                 let current: u64 = get_meta_u64(conn, &version_key).unwrap_or(0);
@@ -147,6 +159,42 @@ pub fn run_all(
     }
 
     Ok(stats)
+}
+
+/// Wall-clock millis since UNIX_EPOCH.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Record a pass's success or failure into `DaemonState.enrichment[name]`.
+/// On success, captures the parse_version basis at completion. On failure,
+/// records the error message.
+fn record_pass_outcome(
+    state: Option<&Arc<RwLock<DaemonState>>>,
+    name: &str,
+    outcome: &Result<EnrichmentStats>,
+    conn: &Connection,
+) {
+    let Some(state) = state else { return };
+    let basis = get_meta_u64(conn, "tree-sitter_version");
+    let mut s = match state.write() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let entry = s.enrichment.entry(name.to_string()).or_insert_with(PassStatus::default);
+    entry.last_run_at_ms = Some(now_ms());
+    match outcome {
+        Ok(_) => {
+            entry.basis = basis;
+            entry.error = None;
+        }
+        Err(e) => {
+            entry.error = Some(format!("{e:#}"));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

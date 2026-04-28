@@ -399,6 +399,9 @@ async fn test_daemon_socket_status_op() {
         source_dir: None,
         lang_filter: None,
         enrichment_passes: vec![],
+        state: Arc::new(std::sync::RwLock::new(
+            leyline_cli_lib::daemon::DaemonState::initializing(),
+        )),
     });
 
     let sock_path = dir.path().join("test.sock");
@@ -462,6 +465,9 @@ async fn test_daemon_ext_dispatches_to_extension() {
         source_dir: None,
         lang_filter: None,
         enrichment_passes: vec![],
+        state: Arc::new(std::sync::RwLock::new(
+            leyline_cli_lib::daemon::DaemonState::initializing(),
+        )),
     });
 
     let sock_path = dir.path().join("ext_test.sock");
@@ -1164,4 +1170,124 @@ fn test_lsp_clap_parsing() {
         }
         _ => panic!("expected Lsp variant"),
     }
+}
+
+/// Verify that `op_status` reports lifecycle phase, head_sha, and per-pass enrichment status.
+///
+/// We construct a DaemonContext directly (skipping run_daemon) so we can
+/// drive the state machine deterministically. The socket+UDS path is
+/// already covered by `test_daemon_socket_dispatches_status_op`; this test
+/// focuses on the readiness signal payload.
+#[tokio::test]
+async fn test_status_reports_phase_and_enrichment() {
+    use leyline_cli_lib::daemon::{
+        DaemonContext, DaemonPhase, DaemonState, EventRouter, NoExt, PassStatus,
+    };
+    use leyline_core::{Controller, create_arena};
+    use std::sync::{Arc, RwLock};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let dir = TempDir::new().unwrap();
+    let arena_path = dir.path().join("test.arena");
+    let ctrl_path = dir.path().join("test.ctrl");
+    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
+    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0).unwrap();
+    drop(ctrl);
+
+    // Pre-populate state with one enrichment record + a head SHA + Ready phase.
+    let mut state = DaemonState::initializing();
+    state.phase = DaemonPhase::Ready;
+    state.head_sha = Some("abc1234".to_string());
+    state.last_reparse_at_ms = Some(1_700_000_000_000);
+    state.enrichment.insert(
+        "tree-sitter".to_string(),
+        PassStatus {
+            last_run_at_ms: Some(1_700_000_000_000),
+            basis: Some(1),
+            error: None,
+        },
+    );
+
+    let ctx = Arc::new(DaemonContext {
+        ctrl_path,
+        ext: Arc::new(NoExt),
+        router: EventRouter::new(16),
+        live_db: std::sync::Mutex::new(rusqlite::Connection::open_in_memory().unwrap()),
+        source_dir: None,
+        lang_filter: None,
+        enrichment_passes: vec![],
+        state: Arc::new(RwLock::new(state)),
+    });
+
+    let sock_path = dir.path().join("status_phase.sock");
+    leyline_cli_lib::daemon::socket::spawn(ctx, sock_path.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let stream = UnixStream::connect(&sock_path).await.expect("connect");
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+    writer.write_all(b"{\"op\":\"status\"}\n").await.unwrap();
+
+    let response = lines.next_line().await.unwrap().expect("response");
+    let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(parsed["phase"], "ready");
+    assert_eq!(parsed["head_sha"], "abc1234");
+    assert_eq!(parsed["last_reparse_at_ms"], 1_700_000_000_000_i64);
+    assert!(parsed["enrichment"].is_object());
+    assert_eq!(parsed["enrichment"]["tree-sitter"]["basis"], 1);
+    assert_eq!(
+        parsed["enrichment"]["tree-sitter"]["last_run_at_ms"],
+        1_700_000_000_000_i64,
+    );
+}
+
+/// Verify the error phase is surfaced through `op_status`.
+#[tokio::test]
+async fn test_status_reports_error_phase() {
+    use leyline_cli_lib::daemon::{DaemonContext, DaemonPhase, DaemonState, EventRouter, NoExt};
+    use leyline_core::{Controller, create_arena};
+    use std::sync::{Arc, RwLock};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let dir = TempDir::new().unwrap();
+    let arena_path = dir.path().join("test.arena");
+    let ctrl_path = dir.path().join("test.ctrl");
+    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
+    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0).unwrap();
+    drop(ctrl);
+
+    let mut state = DaemonState::initializing();
+    state.phase = DaemonPhase::Error("boom: parse failed".to_string());
+
+    let ctx = Arc::new(DaemonContext {
+        ctrl_path,
+        ext: Arc::new(NoExt),
+        router: EventRouter::new(16),
+        live_db: std::sync::Mutex::new(rusqlite::Connection::open_in_memory().unwrap()),
+        source_dir: None,
+        lang_filter: None,
+        enrichment_passes: vec![],
+        state: Arc::new(RwLock::new(state)),
+    });
+
+    let sock_path = dir.path().join("status_error.sock");
+    leyline_cli_lib::daemon::socket::spawn(ctx, sock_path.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let stream = UnixStream::connect(&sock_path).await.expect("connect");
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+    writer.write_all(b"{\"op\":\"status\"}\n").await.unwrap();
+
+    let response = lines.next_line().await.unwrap().expect("response");
+    let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+    assert_eq!(parsed["phase"], "error");
+    assert_eq!(parsed["error"], "boom: parse failed");
 }

@@ -53,6 +53,21 @@ pub fn handle_base_op(ctx: &DaemonContext, op: &str, req: &serde_json::Value) ->
 // Living db access
 // ---------------------------------------------------------------------------
 
+/// Promote one or more node ids to the embed queue (no-op without `vec`).
+///
+/// Called from query ops so the touched nodes' embeddings get refreshed soon
+/// by the background drainer.
+#[inline]
+#[allow(unused_variables)]
+fn promote_touched(ctx: &DaemonContext, ids: &[&str]) {
+    #[cfg(feature = "vec")]
+    {
+        for id in ids {
+            crate::daemon::embed::promote(&ctx.embed_queue, id);
+        }
+    }
+}
+
 /// Execute a closure with the living database connection.
 fn with_live_db<F, T>(ctx: &DaemonContext, f: F) -> Result<T>
 where
@@ -281,23 +296,32 @@ fn op_query(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
 fn op_list_children(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
     let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("");
 
-    with_live_db(ctx, |conn| {
+    let response = with_live_db(ctx, |conn| {
         let mut stmt = conn.prepare_cached(
             "SELECT id, name, kind, size FROM nodes WHERE parent_id = ?1 ORDER BY name",
         )?;
-        let rows: Vec<serde_json::Value> = stmt
+        let raw: Vec<(String, String, i32, i64)> = stmt
             .query_map([id], |row| {
-                Ok(json!({
-                    "id": row.get::<_, String>(0)?,
-                    "name": row.get::<_, String>(1)?,
-                    "kind": row.get::<_, i32>(2)?,
-                    "size": row.get::<_, i64>(3)?,
-                }))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i32>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
             })?
             .collect::<Result<_, _>>()?;
-
-        Ok(json!({"ok": true, "children": rows}).to_string())
-    })
+        let rows: Vec<serde_json::Value> = raw
+            .iter()
+            .map(|(id, name, kind, size)| {
+                json!({"id": id, "name": name, "kind": kind, "size": size})
+            })
+            .collect();
+        let touched: Vec<&str> = raw.iter().map(|(id, ..)| id.as_str()).collect();
+        Ok((json!({"ok": true, "children": rows}).to_string(), touched.into_iter().map(String::from).collect::<Vec<_>>()))
+    })?;
+    let touched_refs: Vec<&str> = response.1.iter().map(String::as_str).collect();
+    promote_touched(ctx, &touched_refs);
+    Ok(response.0)
 }
 
 /// Read a node's content (the `record` column).
@@ -306,6 +330,7 @@ fn op_read_content(ctx: &DaemonContext, req: &serde_json::Value) -> Result<Strin
         .get("id")
         .and_then(|v| v.as_str())
         .context("missing \"id\" field")?;
+    promote_touched(ctx, &[id]);
 
     with_live_db(ctx, |conn| {
         let result = conn.query_row(
@@ -377,6 +402,7 @@ fn op_get_node(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
         .get("id")
         .and_then(|v| v.as_str())
         .context("missing \"id\" field")?;
+    promote_touched(ctx, &[id]);
 
     with_live_db(ctx, |conn| {
         let result = conn.query_row(
@@ -796,6 +822,8 @@ mod tests {
             vec_index,
             #[cfg(feature = "vec")]
             embedder,
+            #[cfg(feature = "vec")]
+            embed_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
         };
         (dir, ctx)
     }

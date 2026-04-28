@@ -13,6 +13,8 @@ pub mod socket;
 pub mod vec_index;
 
 use std::collections::HashMap;
+#[cfg(feature = "vec")]
+use std::collections::BinaryHeap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -105,4 +107,9 @@ pub struct DaemonContext {
     /// `ZeroEmbedder`; private extensions override via `DaemonExt::embedder`.
     #[cfg(feature = "vec")]
     pub embedder: Arc<dyn embed::Embedder>,
+    /// Priority queue of node ids to re-embed. Query ops push when a node is
+    /// touched; the background drainer pops batches and refreshes the
+    /// VectorIndex.
+    #[cfg(feature = "vec")]
+    pub embed_queue: Arc<Mutex<BinaryHeap<embed::EmbedTask>>>,
 }

@@ -409,6 +409,8 @@ async fn test_daemon_socket_status_op() {
         },
         #[cfg(feature = "vec")]
         embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
+        #[cfg(feature = "vec")]
+        embed_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
     });
 
     let sock_path = dir.path().join("test.sock");
@@ -482,6 +484,8 @@ async fn test_daemon_ext_dispatches_to_extension() {
         },
         #[cfg(feature = "vec")]
         embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
+        #[cfg(feature = "vec")]
+        embed_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
     });
 
     let sock_path = dir.path().join("ext_test.sock");
@@ -1186,6 +1190,97 @@ fn test_lsp_clap_parsing() {
     }
 }
 
+/// Verify the embed-queue drainer: when a node is promoted to the queue,
+/// the background loop picks it up, embeds the node's content via the
+/// active Embedder, and writes the vector into the sidecar VectorIndex.
+///
+/// We seed a tiny living db with one file node, manually push to the queue
+/// (skipping the MCP op path), spawn the drainer, and wait for the result.
+#[cfg(feature = "vec")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_embed_queue_drainer_refreshes_index() {
+    use leyline_cli_lib::daemon::{
+        DaemonContext, DaemonState, EventRouter, NoExt,
+    };
+    use leyline_cli_lib::daemon::embed::{self, EmbedTask, Embedder, ZeroEmbedder};
+    use leyline_cli_lib::daemon::vec_index::{register_vec, VectorIndex};
+    use leyline_core::{Controller, create_arena};
+    use std::sync::{Arc, Mutex, RwLock};
+
+    register_vec();
+
+    let dir = TempDir::new().unwrap();
+    let arena_path = dir.path().join("test.arena");
+    let ctrl_path = dir.path().join("test.ctrl");
+    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
+    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0).unwrap();
+    drop(ctrl);
+
+    let dim = 4;
+    let index = Arc::new(VectorIndex::new(dim, None).unwrap());
+    let embedder: Arc<dyn Embedder> = Arc::new(ZeroEmbedder { dim });
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE nodes (
+            id TEXT PRIMARY KEY,
+            parent_id TEXT,
+            name TEXT,
+            kind INTEGER,
+            size INTEGER,
+            mtime INTEGER,
+            record TEXT
+        );
+        INSERT INTO nodes VALUES ('a.go', '', 'a.go', 0, 9, 1, 'package a');",
+    )
+    .unwrap();
+
+    let queue: embed::EmbedQueue =
+        Arc::new(Mutex::new(std::collections::BinaryHeap::new()));
+
+    let ctx = Arc::new(DaemonContext {
+        ctrl_path,
+        ext: Arc::new(NoExt),
+        router: EventRouter::new(16),
+        live_db: std::sync::Mutex::new(conn),
+        source_dir: None,
+        lang_filter: None,
+        enrichment_passes: vec![],
+        state: Arc::new(RwLock::new(DaemonState::initializing())),
+        vec_index: index.clone(),
+        embedder,
+        embed_queue: queue.clone(),
+    });
+
+    // Pre-condition: index is empty.
+    assert_eq!(index.len().unwrap(), 0);
+
+    // Push directly to bypass any other side-effect of MCP ops.
+    queue.lock().unwrap().push(EmbedTask {
+        priority: 1,
+        node_id: "a.go".to_string(),
+    });
+
+    embed::start_drain(ctx);
+
+    // Wait up to 2.5s (drain runs every 1s) for the index to populate.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2_500);
+    let mut populated = false;
+    while std::time::Instant::now() < deadline {
+        if index.len().unwrap() == 1 {
+            populated = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(populated, "drainer should have embedded a.go within 2.5s");
+    assert!(
+        index.get("a.go").unwrap().is_some(),
+        "a.go embedding should be present",
+    );
+}
+
 /// Verify that EmbeddingPass + op_vec_search round-trip through the daemon
 /// with the default ZeroEmbedder. We build a DaemonContext directly with a
 /// pre-populated VectorIndex (skipping the parse pass) and confirm:
@@ -1234,6 +1329,7 @@ async fn test_op_vec_search_round_trip() {
         state: Arc::new(RwLock::new(DaemonState::initializing())),
         vec_index: index.clone(),
         embedder,
+        embed_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
     });
 
     let sock_path = dir.path().join("vec_search.sock");
@@ -1322,6 +1418,8 @@ async fn test_status_reports_phase_and_enrichment() {
         },
         #[cfg(feature = "vec")]
         embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
+        #[cfg(feature = "vec")]
+        embed_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
     });
 
     let sock_path = dir.path().join("status_phase.sock");
@@ -1486,6 +1584,8 @@ async fn test_status_reports_error_phase() {
         },
         #[cfg(feature = "vec")]
         embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
+        #[cfg(feature = "vec")]
+        embed_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
     });
 
     let sock_path = dir.path().join("status_error.sock");

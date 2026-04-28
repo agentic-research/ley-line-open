@@ -8,16 +8,18 @@
 //! `sqlite3_serialize`/`deserialize`). It reads `nodes`/`_source` for file
 //! contents.
 
-use std::collections::HashSet;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use rusqlite::Connection;
 
 use super::enrichment::{EnrichmentPass, EnrichmentStats};
 use super::vec_index::VectorIndex;
+use super::DaemonContext;
 
 /// An object that can produce a fixed-dimension embedding for text input.
 ///
@@ -128,6 +130,131 @@ impl EnrichmentPass for EmbeddingPass {
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// Priority queue for MCP-driven re-embedding
+// ---------------------------------------------------------------------------
+
+/// One unit of re-embedding work. Higher `priority` drains first
+/// (max-heap on `priority`).
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct EmbedTask {
+    pub priority: u64,
+    pub node_id: String,
+}
+
+impl Ord for EmbedTask {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Tie-break on node_id so we have a total order; both a and b's
+        // priorities being equal shouldn't make `BinaryHeap` think they
+        // are the same element.
+        self.priority
+            .cmp(&other.priority)
+            .then_with(|| self.node_id.cmp(&other.node_id))
+    }
+}
+
+impl PartialOrd for EmbedTask {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Type alias for the shared embed-task queue stored on `DaemonContext`.
+pub type EmbedQueue = Arc<Mutex<BinaryHeap<EmbedTask>>>;
+
+/// Promote `node_id` to the front of the embed queue. Called from query ops
+/// when a node is touched, so its embedding gets refreshed soon.
+pub fn promote(queue: &EmbedQueue, node_id: &str) {
+    let priority = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0);
+    if let Ok(mut q) = queue.lock() {
+        q.push(EmbedTask {
+            priority,
+            node_id: node_id.to_string(),
+        });
+    }
+}
+
+/// Spawn the background embed-queue drainer. Every 1s it pops up to 32 tasks
+/// (highest priority first), looks up each node's source content from the
+/// living db, embeds it, and writes the vector to the sidecar index. Emits
+/// `daemon.embed.complete` after each non-empty batch.
+pub fn start_drain(ctx: Arc<DaemonContext>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        // Don't burst on catch-up — we'd rather smoothly drain than spike.
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let emitter = ctx.router.emitter();
+        loop {
+            tick.tick().await;
+            let batch: Vec<EmbedTask> = {
+                let mut q = match ctx.embed_queue.lock() {
+                    Ok(g) => g,
+                    Err(_) => continue,
+                };
+                let mut out = Vec::with_capacity(32);
+                for _ in 0..32 {
+                    match q.pop() {
+                        Some(t) => out.push(t),
+                        None => break,
+                    }
+                }
+                out
+            };
+            if batch.is_empty() {
+                continue;
+            }
+
+            let mut count = 0u64;
+            for task in batch {
+                let content = {
+                    let conn = match ctx.live_db.lock() {
+                        Ok(g) => g,
+                        Err(_) => continue,
+                    };
+                    conn.query_row(
+                        "SELECT record FROM nodes WHERE id = ?1",
+                        [&task.node_id],
+                        |r| r.get::<_, Option<String>>(0),
+                    )
+                    .ok()
+                    .flatten()
+                };
+                let Some(content) = content else { continue };
+                if content.is_empty() {
+                    continue;
+                }
+                let v = match ctx.embedder.embed(&content) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::debug!("embed failed for {}: {e:#}", task.node_id);
+                        continue;
+                    }
+                };
+                if let Err(e) = ctx.vec_index.insert(&task.node_id, &v) {
+                    log::debug!("vec insert failed for {}: {e:#}", task.node_id);
+                    continue;
+                }
+                count += 1;
+            }
+
+            if count > 0 {
+                emitter.emit(
+                    "daemon.embed.complete",
+                    "leyline",
+                    serde_json::json!({ "count": count }),
+                );
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

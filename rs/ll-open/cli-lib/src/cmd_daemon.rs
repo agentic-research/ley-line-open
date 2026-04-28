@@ -125,6 +125,9 @@ pub async fn run_daemon(
                 .context("create sidecar VectorIndex")?,
         )
     };
+    #[cfg(feature = "vec")]
+    let embed_queue: crate::daemon::embed::EmbedQueue =
+        Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new()));
 
     // 6. Build context + spawn UDS socket.
     let ctx = Arc::new(DaemonContext {
@@ -162,7 +165,14 @@ pub async fn run_daemon(
         vec_index: vec_index.clone(),
         #[cfg(feature = "vec")]
         embedder: embedder.clone(),
+        #[cfg(feature = "vec")]
+        embed_queue: embed_queue.clone(),
     });
+
+    // Spawn the embed-queue drainer: query ops promote node_ids; this loop
+    // drains them in priority order and refreshes the sidecar VectorIndex.
+    #[cfg(feature = "vec")]
+    crate::daemon::embed::start_drain(ctx.clone());
 
     // Initial parse (during init_living_db) is done — daemon is ready to serve.
     state.write().unwrap().phase = DaemonPhase::Ready;
@@ -723,6 +733,8 @@ mod tests {
             vec_index,
             #[cfg(feature = "vec")]
             embedder,
+            #[cfg(feature = "vec")]
+            embed_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
         })
     }
 

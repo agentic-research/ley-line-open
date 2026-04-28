@@ -3,6 +3,8 @@
 pub mod enrichment;
 pub mod ext;
 pub mod events;
+#[cfg(feature = "lsp")]
+pub mod lsp_pass;
 pub mod ops;
 pub mod socket;
 

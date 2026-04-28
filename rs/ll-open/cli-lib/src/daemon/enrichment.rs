@@ -52,6 +52,10 @@ pub trait EnrichmentPass: Send + Sync {
     ///
     /// `changed_files` lists files that changed since the last run.
     /// `None` means "all files" (full enrichment).
+    ///
+    /// Sync by default. Passes that need async (e.g., LSP server spawning)
+    /// should use `tokio::task::block_in_place` + `Handle::block_on`
+    /// internally — this tells tokio to move other tasks off the thread.
     fn run(
         &self,
         conn: &Connection,

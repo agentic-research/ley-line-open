@@ -102,6 +102,8 @@ pub async fn run_daemon(
             let mut passes: Vec<Box<dyn crate::daemon::enrichment::EnrichmentPass>> = vec![
                 Box::new(crate::daemon::enrichment::TreeSitterPass),
             ];
+            #[cfg(feature = "lsp")]
+            passes.push(Box::new(crate::daemon::lsp_pass::LspEnrichmentPass));
             passes.extend(ext.enrichment_passes());
             passes
         },

@@ -536,6 +536,284 @@ fn test_lsp_variant_exists() {
 // via the socket tests above.
 
 // ---------------------------------------------------------------------------
+// Warm start + crash recovery stress tests
+// ---------------------------------------------------------------------------
+
+/// Full lifecycle: cold start → parse → snapshot → "crash" → warm start
+/// → verify data survived → modify file → incremental reparse → verify
+/// only the changed file was updated.
+#[test]
+fn test_warm_start_crash_recovery() {
+    use leyline_core::{Controller, create_arena};
+    use leyline_cli_lib::cmd_parse::parse_into_conn;
+    use leyline_cli_lib::cmd_daemon::snapshot_to_arena;
+
+    let src = create_go_fixture();
+    let arena_dir = TempDir::new().unwrap();
+    let arena_path = arena_dir.path().join("test.arena");
+    let ctrl_path = arena_dir.path().join("test.ctrl");
+
+    // --- Phase 1: Cold start — parse into :memory:, snapshot to arena ---
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let result = parse_into_conn(&conn, src.path(), Some("go")).unwrap();
+    assert!(result.parsed >= 2, "should parse at least main.go + util.go");
+    assert_eq!(result.unchanged, 0, "cold start has no unchanged files");
+
+    // Count nodes before snapshot.
+    let node_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+        .unwrap();
+    assert!(node_count > 0, "should have nodes after parse");
+
+    // Count refs.
+    let ref_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM node_refs", [], |r| r.get(0))
+        .unwrap();
+
+    // Set up arena + controller.
+    let arena_size = 4 * 1024 * 1024; // 4MB
+    let _mmap = create_arena(&arena_path, arena_size).unwrap();
+    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size, 0)
+        .unwrap();
+
+    // Snapshot living db to arena.
+    snapshot_to_arena(&conn, &ctrl_path).unwrap();
+
+    let gen_after_snapshot = Controller::open_or_create(&ctrl_path)
+        .unwrap()
+        .generation();
+    assert_eq!(gen_after_snapshot, 1, "generation should be 1 after snapshot");
+
+    // --- Phase 2: Simulate crash — drop the connection ---
+
+    drop(conn);
+
+    // --- Phase 3: Warm start — deserialize arena into new :memory: ---
+
+    // Read arena active buffer.
+    let file = std::fs::File::open(&arena_path).unwrap();
+    let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+    let header: &leyline_core::ArenaHeader =
+        bytemuck::from_bytes(&mmap[..std::mem::size_of::<leyline_core::ArenaHeader>()]);
+
+    let file_size = mmap.len() as u64;
+    let offset = header.active_buffer_offset(file_size).unwrap();
+    let buf_size = leyline_core::ArenaHeader::buffer_size(file_size);
+    let buf = &mmap[offset as usize..(offset + buf_size) as usize];
+
+    // Deserialize as writable.
+    let mut recovered = rusqlite::Connection::open_in_memory().unwrap();
+    recovered
+        .deserialize_read_exact(
+            rusqlite::DatabaseName::Main,
+            std::io::Cursor::new(buf),
+            buf.len(),
+            false, // writable
+        )
+        .expect("warm start: sqlite3_deserialize should succeed");
+
+    // Verify data survived the crash.
+    let recovered_nodes: i64 = recovered
+        .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        recovered_nodes, node_count,
+        "warm start should recover all nodes"
+    );
+
+    let recovered_refs: i64 = recovered
+        .query_row("SELECT COUNT(*) FROM node_refs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        recovered_refs, ref_count,
+        "warm start should recover all refs"
+    );
+
+    // Verify specific file exists.
+    let main_exists: bool = recovered
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM _source WHERE id = 'main.go'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(main_exists, "main.go should exist after warm start");
+
+    // --- Phase 4: Modify a file, incremental reparse ---
+
+    fs::write(
+        src.path().join("main.go"),
+        b"package main\n\nfunc main() {\n\tprintln(\"modified!\")\n}\n\nfunc newFunc() {}\n",
+    )
+    .unwrap();
+
+    let result2 = parse_into_conn(&recovered, src.path(), Some("go")).unwrap();
+    assert_eq!(result2.parsed, 1, "only main.go should be reparsed");
+    assert_eq!(result2.unchanged, 1, "util.go should be unchanged");
+    assert!(
+        result2.changed_files.contains(&"main.go".to_string()),
+        "changed_files should contain main.go"
+    );
+
+    // Verify we have more nodes for main.go after adding a function.
+    // The file now has 2 functions (main + newFunc), so there should be
+    // at least 2 function_declaration AST entries for main.go.
+    let func_count: i64 = recovered
+        .query_row(
+            "SELECT COUNT(*) FROM _ast WHERE source_id = 'main.go' AND node_kind = 'function_declaration'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        func_count >= 2,
+        "main.go should have at least 2 function_declarations after adding newFunc, got {func_count}"
+    );
+
+    // --- Phase 5: Snapshot again and verify generation bumped ---
+
+    snapshot_to_arena(&recovered, &ctrl_path).unwrap();
+
+    let gen_after_reparse = Controller::open_or_create(&ctrl_path)
+        .unwrap()
+        .generation();
+    assert_eq!(
+        gen_after_reparse, 2,
+        "generation should be 2 after second snapshot"
+    );
+}
+
+/// Verify that warm start from an empty/invalid arena returns None
+/// and falls through to cold start gracefully.
+#[test]
+fn test_warm_start_empty_arena_falls_through() {
+    let dir = TempDir::new().unwrap();
+    let arena_path = dir.path().join("empty.arena");
+    let ctrl_path = dir.path().join("empty.ctrl");
+
+    // Create an arena with no data loaded.
+    let arena_size = 2 * 1024 * 1024;
+    let _mmap = leyline_core::create_arena(&arena_path, arena_size).unwrap();
+    let mut ctrl = leyline_core::Controller::open_or_create(&ctrl_path).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size, 0)
+        .unwrap();
+
+    // Read the empty arena — active buffer is all zeros.
+    let file = std::fs::File::open(&arena_path).unwrap();
+    let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+    let header: &leyline_core::ArenaHeader =
+        bytemuck::from_bytes(&mmap[..std::mem::size_of::<leyline_core::ArenaHeader>()]);
+
+    let file_size = mmap.len() as u64;
+    let offset = header.active_buffer_offset(file_size).unwrap();
+    let buf_size = leyline_core::ArenaHeader::buffer_size(file_size);
+    let buf = &mmap[offset as usize..(offset + buf_size) as usize];
+
+    // All zeros — deserialize should fail or produce empty db.
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    let result = conn.deserialize_read_exact(
+        rusqlite::DatabaseName::Main,
+        std::io::Cursor::new(buf),
+        buf.len(),
+        false,
+    );
+
+    // sqlite3_deserialize accepts any buffer (even zeros), but querying
+    // will fail because it's not a valid SQLite database.
+    if result.is_ok() {
+        let tables = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+            [],
+            |r| r.get::<_, i64>(0),
+        );
+        // Either the query fails (not a valid db) or returns 0 tables.
+        match tables {
+            Ok(0) => {} // empty db, fine
+            Err(_) => {} // not a valid db, fine
+            Ok(n) => panic!("expected 0 tables in empty arena, got {n}"),
+        }
+    }
+    // If deserialize itself failed, that's also fine — cold start path.
+}
+
+/// Stress test: multiple parse-snapshot cycles to verify no corruption.
+#[test]
+fn test_multiple_snapshot_cycles() {
+    use leyline_core::{Controller, create_arena};
+    use leyline_cli_lib::cmd_parse::parse_into_conn;
+    use leyline_cli_lib::cmd_daemon::snapshot_to_arena;
+
+    let src = create_go_fixture();
+    let arena_dir = TempDir::new().unwrap();
+    let arena_path = arena_dir.path().join("cycle.arena");
+    let ctrl_path = arena_dir.path().join("cycle.ctrl");
+
+    let arena_size = 4 * 1024 * 1024;
+    let _mmap = create_arena(&arena_path, arena_size).unwrap();
+    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size, 0).unwrap();
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    parse_into_conn(&conn, src.path(), Some("go")).unwrap();
+
+    // Run 5 snapshot cycles, modifying the file each time.
+    for i in 0..5 {
+        fs::write(
+            src.path().join("main.go"),
+            format!(
+                "package main\n\nfunc main() {{\n\tprintln(\"iteration {i}\")\n}}\n"
+            ),
+        )
+        .unwrap();
+
+        let result = parse_into_conn(&conn, src.path(), Some("go")).unwrap();
+        assert_eq!(result.parsed, 1, "cycle {i}: only main.go should reparse");
+
+        snapshot_to_arena(&conn, &ctrl_path).unwrap();
+
+        let current_gen = Controller::open_or_create(&ctrl_path).unwrap().generation();
+        assert_eq!(current_gen, (i + 1) as u64, "cycle {i}: generation should match");
+    }
+
+    // Verify final state is consistent.
+    let final_nodes: i64 = conn
+        .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+        .unwrap();
+    assert!(final_nodes > 0, "should have nodes after 5 cycles");
+
+    // Warm start from final arena and verify.
+    drop(conn);
+
+    let file = std::fs::File::open(&arena_path).unwrap();
+    let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+    let header: &leyline_core::ArenaHeader =
+        bytemuck::from_bytes(&mmap[..std::mem::size_of::<leyline_core::ArenaHeader>()]);
+    let offset = header.active_buffer_offset(mmap.len() as u64).unwrap();
+    let buf_size = leyline_core::ArenaHeader::buffer_size(mmap.len() as u64);
+    let buf = &mmap[offset as usize..(offset + buf_size) as usize];
+
+    let mut recovered = rusqlite::Connection::open_in_memory().unwrap();
+    recovered
+        .deserialize_read_exact(
+            rusqlite::DatabaseName::Main,
+            std::io::Cursor::new(buf),
+            buf.len(),
+            false,
+        )
+        .unwrap();
+
+    let recovered_nodes: i64 = recovered
+        .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        recovered_nodes, final_nodes,
+        "warm start after 5 cycles should recover all nodes"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Incremental reparse tests
 // ---------------------------------------------------------------------------
 

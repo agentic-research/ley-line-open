@@ -330,7 +330,7 @@ fn try_warm_start(ctrl_path: &Path) -> Result<Option<rusqlite::Connection>> {
 }
 
 /// Serialize the living db and write it into the arena.
-pub(crate) fn snapshot_to_arena(
+pub fn snapshot_to_arena(
     conn: &rusqlite::Connection,
     ctrl_path: &Path,
 ) -> Result<()> {

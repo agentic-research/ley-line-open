@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 use super::enrichment::EnrichmentPass;
 use super::events::{EventEmitter, EventRouter};
+#[cfg(feature = "vec")]
+use super::embed::Embedder;
 
 /// Extension point for private daemon ops and lifecycle hooks.
 ///
@@ -69,6 +71,18 @@ pub trait DaemonExt: Send + Sync {
     ///
     /// Mirrors the `daemon.files.changed` event payload.
     fn on_files_changed(&self, _paths: &[String]) {}
+
+    /// Provide a custom text embedder. The returned embedder is used both
+    /// by the EmbeddingPass (to populate the sidecar VectorIndex) and by
+    /// `op_vec_search` (to embed the query text).
+    ///
+    /// Default `None` falls back to LLO's `ZeroEmbedder`. Private repos
+    /// return their model wrapper here. The index dimension is derived
+    /// from `Embedder::dimensions()`.
+    #[cfg(feature = "vec")]
+    fn embedder(&self) -> Option<std::sync::Arc<dyn Embedder>> {
+        None
+    }
 }
 
 /// No-op extension that rejects all ops. Used when no private extension is registered.

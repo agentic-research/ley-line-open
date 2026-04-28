@@ -39,6 +39,8 @@ pub fn handle_base_op(ctx: &DaemonContext, op: &str, req: &serde_json::Value) ->
         "lsp_refs" => Some(op_lsp_refs(ctx, req)),
         "lsp_symbols" => Some(op_lsp_symbols(ctx, req)),
         "lsp_diagnostics" => Some(op_lsp_diagnostics(ctx, req)),
+        #[cfg(feature = "vec")]
+        "vec_search" => Some(op_vec_search(ctx, req)),
         _ => None,
     };
     result.map(|r| match r {
@@ -726,6 +728,30 @@ fn op_lsp_diagnostics(ctx: &DaemonContext, req: &serde_json::Value) -> Result<St
 }
 
 // ---------------------------------------------------------------------------
+// vec_search — KNN over the sidecar VectorIndex
+// ---------------------------------------------------------------------------
+
+/// `{"op":"vec_search", "query":"text", "k":10}` — embed the query via the
+/// active embedder and KNN-search the sidecar VectorIndex. Returns
+/// `{ok, results: [{node_id, distance}]}`.
+#[cfg(feature = "vec")]
+fn op_vec_search(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
+    let query = req
+        .get("query")
+        .and_then(|v| v.as_str())
+        .context("missing \"query\" field")?;
+    let k = req.get("k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+
+    let qvec = ctx.embedder.embed(query).context("embed query")?;
+    let results = ctx.vec_index.search(&qvec, k).context("vec search")?;
+    let rows: Vec<serde_json::Value> = results
+        .into_iter()
+        .map(|(id, d)| json!({"node_id": id, "distance": d}))
+        .collect();
+    Ok(json!({"ok": true, "results": rows}).to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -749,6 +775,14 @@ mod tests {
         leyline_ts::schema::create_ast_schema(&conn).unwrap();
         leyline_ts::schema::create_refs_schema(&conn).unwrap();
 
+        #[cfg(feature = "vec")]
+        let vec_index = {
+            crate::daemon::vec_index::register_vec();
+            Arc::new(crate::daemon::vec_index::VectorIndex::new(4, None).unwrap())
+        };
+        #[cfg(feature = "vec")]
+        let embedder: Arc<dyn crate::daemon::embed::Embedder> =
+            Arc::new(crate::daemon::embed::ZeroEmbedder { dim: 4 });
         let ctx = DaemonContext {
             ctrl_path,
             ext: Arc::new(crate::daemon::NoExt),
@@ -758,6 +792,10 @@ mod tests {
             lang_filter: None,
             enrichment_passes: vec![],
             state: Arc::new(RwLock::new(crate::daemon::DaemonState::initializing())),
+            #[cfg(feature = "vec")]
+            vec_index,
+            #[cfg(feature = "vec")]
+            embedder,
         };
         (dir, ctx)
     }

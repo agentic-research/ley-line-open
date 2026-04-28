@@ -402,6 +402,13 @@ async fn test_daemon_socket_status_op() {
         state: Arc::new(std::sync::RwLock::new(
             leyline_cli_lib::daemon::DaemonState::initializing(),
         )),
+        #[cfg(feature = "vec")]
+        vec_index: {
+            leyline_cli_lib::daemon::vec_index::register_vec();
+            Arc::new(leyline_cli_lib::daemon::vec_index::VectorIndex::new(4, None).unwrap())
+        },
+        #[cfg(feature = "vec")]
+        embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
     });
 
     let sock_path = dir.path().join("test.sock");
@@ -468,6 +475,13 @@ async fn test_daemon_ext_dispatches_to_extension() {
         state: Arc::new(std::sync::RwLock::new(
             leyline_cli_lib::daemon::DaemonState::initializing(),
         )),
+        #[cfg(feature = "vec")]
+        vec_index: {
+            leyline_cli_lib::daemon::vec_index::register_vec();
+            Arc::new(leyline_cli_lib::daemon::vec_index::VectorIndex::new(4, None).unwrap())
+        },
+        #[cfg(feature = "vec")]
+        embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
     });
 
     let sock_path = dir.path().join("ext_test.sock");
@@ -1172,6 +1186,88 @@ fn test_lsp_clap_parsing() {
     }
 }
 
+/// Verify that EmbeddingPass + op_vec_search round-trip through the daemon
+/// with the default ZeroEmbedder. We build a DaemonContext directly with a
+/// pre-populated VectorIndex (skipping the parse pass) and confirm:
+/// 1. `op_vec_search` returns k results (zero distance — same vector).
+/// 2. Result `node_id`s match what we inserted.
+#[cfg(feature = "vec")]
+#[tokio::test]
+async fn test_op_vec_search_round_trip() {
+    use leyline_cli_lib::daemon::{
+        DaemonContext, DaemonState, EventRouter, NoExt,
+    };
+    use leyline_cli_lib::daemon::embed::{Embedder, ZeroEmbedder};
+    use leyline_cli_lib::daemon::vec_index::{register_vec, VectorIndex};
+    use leyline_core::{Controller, create_arena};
+    use std::sync::{Arc, RwLock};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    register_vec();
+
+    let dir = TempDir::new().unwrap();
+    let arena_path = dir.path().join("test.arena");
+    let ctrl_path = dir.path().join("test.ctrl");
+    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
+    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0).unwrap();
+    drop(ctrl);
+
+    let dim = 4;
+    let index = Arc::new(VectorIndex::new(dim, None).unwrap());
+    // Pre-populate so the test doesn't depend on the enrichment pipeline.
+    index.insert("file/a.go", &[0.0_f32; 4]).unwrap();
+    index.insert("file/b.go", &[0.0_f32; 4]).unwrap();
+    index.insert("file/c.go", &[0.0_f32; 4]).unwrap();
+
+    let embedder: Arc<dyn Embedder> = Arc::new(ZeroEmbedder { dim });
+
+    let ctx = Arc::new(DaemonContext {
+        ctrl_path,
+        ext: Arc::new(NoExt),
+        router: EventRouter::new(16),
+        live_db: std::sync::Mutex::new(rusqlite::Connection::open_in_memory().unwrap()),
+        source_dir: None,
+        lang_filter: None,
+        enrichment_passes: vec![],
+        state: Arc::new(RwLock::new(DaemonState::initializing())),
+        vec_index: index.clone(),
+        embedder,
+    });
+
+    let sock_path = dir.path().join("vec_search.sock");
+    leyline_cli_lib::daemon::socket::spawn(ctx, sock_path.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let stream = UnixStream::connect(&sock_path).await.expect("connect");
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+    writer
+        .write_all(b"{\"op\":\"vec_search\",\"query\":\"hello\",\"k\":3}\n")
+        .await
+        .unwrap();
+
+    let response = lines.next_line().await.unwrap().expect("response");
+    let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+    assert_eq!(parsed["ok"], true);
+    let results = parsed["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 3);
+    let ids: Vec<&str> = results
+        .iter()
+        .map(|r| r["node_id"].as_str().unwrap())
+        .collect();
+    for id in ["file/a.go", "file/b.go", "file/c.go"] {
+        assert!(ids.contains(&id), "expected {id} in results, got {ids:?}");
+    }
+    // ZeroEmbedder + zero vectors → distance 0 for all matches.
+    for r in results {
+        let d = r["distance"].as_f64().unwrap();
+        assert!(d < f64::EPSILON, "expected zero distance, got {d}");
+    }
+}
+
 /// Verify that `op_status` reports lifecycle phase, head_sha, and per-pass enrichment status.
 ///
 /// We construct a DaemonContext directly (skipping run_daemon) so we can
@@ -1219,6 +1315,13 @@ async fn test_status_reports_phase_and_enrichment() {
         lang_filter: None,
         enrichment_passes: vec![],
         state: Arc::new(RwLock::new(state)),
+        #[cfg(feature = "vec")]
+        vec_index: {
+            leyline_cli_lib::daemon::vec_index::register_vec();
+            Arc::new(leyline_cli_lib::daemon::vec_index::VectorIndex::new(4, None).unwrap())
+        },
+        #[cfg(feature = "vec")]
+        embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
     });
 
     let sock_path = dir.path().join("status_phase.sock");
@@ -1376,6 +1479,13 @@ async fn test_status_reports_error_phase() {
         lang_filter: None,
         enrichment_passes: vec![],
         state: Arc::new(RwLock::new(state)),
+        #[cfg(feature = "vec")]
+        vec_index: {
+            leyline_cli_lib::daemon::vec_index::register_vec();
+            Arc::new(leyline_cli_lib::daemon::vec_index::VectorIndex::new(4, None).unwrap())
+        },
+        #[cfg(feature = "vec")]
+        embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
     });
 
     let sock_path = dir.path().join("status_error.sock");

@@ -110,6 +110,22 @@ pub async fn run_daemon(
     // 5. Extension init.
     ext.on_init(router.emitter());
 
+    // Resolve the embedder and sidecar vector index up front: the embedder
+    // is provided by the extension (or defaults to ZeroEmbedder), and the
+    // index is sized to match its dimensions.
+    #[cfg(feature = "vec")]
+    let embedder: Arc<dyn crate::daemon::embed::Embedder> = ext
+        .embedder()
+        .unwrap_or_else(|| Arc::new(crate::daemon::embed::ZeroEmbedder { dim: 384 }));
+    #[cfg(feature = "vec")]
+    let vec_index = {
+        crate::daemon::vec_index::register_vec();
+        Arc::new(
+            crate::daemon::vec_index::VectorIndex::new(embedder.dimensions(), None)
+                .context("create sidecar VectorIndex")?,
+        )
+    };
+
     // 6. Build context + spawn UDS socket.
     let ctx = Arc::new(DaemonContext {
         ctrl_path: ctrl_path.clone(),
@@ -124,10 +140,28 @@ pub async fn run_daemon(
             ];
             #[cfg(feature = "lsp")]
             passes.push(Box::new(crate::daemon::lsp_pass::LspEnrichmentPass));
-            passes.extend(ext.enrichment_passes());
+            #[cfg(feature = "vec")]
+            passes.push(Box::new(crate::daemon::embed::EmbeddingPass::new(
+                vec_index.clone(),
+                embedder.clone(),
+            )));
+            // Extension passes go last; if any have the same name as a
+            // base pass, they replace it (extensions win).
+            for ext_pass in ext.enrichment_passes() {
+                let name = ext_pass.name().to_string();
+                if let Some(idx) = passes.iter().position(|p| p.name() == name) {
+                    passes[idx] = ext_pass;
+                } else {
+                    passes.push(ext_pass);
+                }
+            }
             passes
         },
         state: state.clone(),
+        #[cfg(feature = "vec")]
+        vec_index: vec_index.clone(),
+        #[cfg(feature = "vec")]
+        embedder: embedder.clone(),
     });
 
     // Initial parse (during init_living_db) is done — daemon is ready to serve.
@@ -668,6 +702,14 @@ mod tests {
         drop(ctrl);
 
         let conn = rusqlite::Connection::open_in_memory().unwrap();
+        #[cfg(feature = "vec")]
+        let vec_index = {
+            crate::daemon::vec_index::register_vec();
+            Arc::new(crate::daemon::vec_index::VectorIndex::new(4, None).unwrap())
+        };
+        #[cfg(feature = "vec")]
+        let embedder: Arc<dyn crate::daemon::embed::Embedder> =
+            Arc::new(crate::daemon::embed::ZeroEmbedder { dim: 4 });
         Arc::new(DaemonContext {
             ctrl_path: ctrl_path.to_path_buf(),
             ext,
@@ -677,6 +719,10 @@ mod tests {
             lang_filter: Some("go".to_string()),
             enrichment_passes: vec![Box::new(crate::daemon::enrichment::TreeSitterPass)],
             state: Arc::new(std::sync::RwLock::new(DaemonState::initializing())),
+            #[cfg(feature = "vec")]
+            vec_index,
+            #[cfg(feature = "vec")]
+            embedder,
         })
     }
 

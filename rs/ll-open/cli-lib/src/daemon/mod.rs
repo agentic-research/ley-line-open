@@ -1,5 +1,7 @@
 //! Open daemon: UDS socket + event router + extensible ops.
 
+#[cfg(feature = "vec")]
+pub mod embed;
 pub mod enrichment;
 pub mod ext;
 pub mod events;
@@ -95,4 +97,12 @@ pub struct DaemonContext {
     /// Shared via `Arc` so background tasks and the run_daemon scope can both
     /// mutate it.
     pub state: Arc<RwLock<DaemonState>>,
+    /// Sidecar vector index used by `op_vec_search`. Populated when the
+    /// `vec` feature is enabled.
+    #[cfg(feature = "vec")]
+    pub vec_index: Arc<vec_index::VectorIndex>,
+    /// Embedder used to vectorize text (queries + node content). Defaults to
+    /// `ZeroEmbedder`; private extensions override via `DaemonExt::embedder`.
+    #[cfg(feature = "vec")]
+    pub embedder: Arc<dyn embed::Embedder>,
 }

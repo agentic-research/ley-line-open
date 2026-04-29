@@ -82,6 +82,28 @@ fn default_test_ctx(ctrl_path: PathBuf) -> leyline_cli_lib::daemon::DaemonContex
     }
 }
 
+/// One UDS round trip: connect, write `body` (with trailing newline if
+/// missing), read one response line, parse JSON. Centralizes the connect
+/// + write + read + parse boilerplate that several tests duplicate.
+///
+/// Tests that drive multiple requests on one connection should still use
+/// raw `UnixStream` — the helper is for single round-trip cases, which is
+/// the common shape.
+#[allow(dead_code)]
+async fn uds_round_trip(sock: &Path, body: &str) -> serde_json::Value {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+    let stream = UnixStream::connect(sock).await.expect("connect");
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+    writer.write_all(body.as_bytes()).await.unwrap();
+    if !body.ends_with('\n') {
+        writer.write_all(b"\n").await.unwrap();
+    }
+    let line = lines.next_line().await.unwrap().expect("response");
+    serde_json::from_str(&line).expect("response is JSON")
+}
+
 /// Create a temporary directory containing two small `.go` files for testing.
 fn create_go_fixture() -> TempDir {
     let dir = TempDir::new().expect("create temp dir");
@@ -1850,11 +1872,7 @@ async fn test_op_reparse_accepts_files_scope_with_dir_source() {
 ///   - subsequent successful reparse resets phase to Ready (recovery)
 #[tokio::test]
 async fn test_op_reparse_nonexistent_source_sets_error_phase_and_recovers() {
-    
-    
     use std::sync::Arc;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
 
     let dir = TempDir::new().unwrap();
     let (_arena, ctrl_path) = fresh_arena(dir.path());
@@ -1865,17 +1883,14 @@ async fn test_op_reparse_nonexistent_source_sets_error_phase_and_recovers() {
     leyline_cli_lib::daemon::socket::spawn(ctx, sock_path.clone());
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // Helper: send a JSON op + receive one line, parse.
+    // Helper: send a JSON op + receive one line, parse. Delegates to the
+    // shared `uds_round_trip` so the two test-local duplicates of this
+    // pattern stay in sync.
     async fn round_trip(
         sock: &std::path::Path,
         body: serde_json::Value,
     ) -> serde_json::Value {
-        let stream = UnixStream::connect(sock).await.expect("connect");
-        let (reader, mut writer) = stream.into_split();
-        let mut lines = BufReader::new(reader).lines();
-        writer.write_all(format!("{body}\n").as_bytes()).await.unwrap();
-        let line = lines.next_line().await.unwrap().expect("response");
-        serde_json::from_str(&line).expect("response is JSON")
+        uds_round_trip(sock, &body.to_string()).await
     }
 
     // 1. op_reparse with a path that doesn't exist anywhere on disk.
@@ -2054,10 +2069,7 @@ async fn test_op_vec_search_dim_mismatch_returns_clean_error() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_concurrent_uds_load_completes_bounded() {
     use leyline_cli_lib::daemon::{DaemonContext, EventRouter};
-    
     use std::sync::{Arc, Mutex};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
 
     let dir = TempDir::new().unwrap();
     let (_arena, ctrl_path) = fresh_arena(dir.path());
@@ -2081,17 +2093,13 @@ async fn test_concurrent_uds_load_completes_bounded() {
     tokio::time::sleep(std::time::Duration::from_millis(80)).await;
 
     /// One client: open, send one op, read one response, parse, return.
+    /// Wraps the shared `uds_round_trip` so this test's owned-PathBuf +
+    /// `'static str` calling convention stays usable inside `tokio::spawn`.
     async fn one_call(
         sock: std::path::PathBuf,
         body: &'static str,
     ) -> serde_json::Value {
-        let stream = UnixStream::connect(&sock).await.expect("connect");
-        let (reader, mut writer) = stream.into_split();
-        let mut lines = BufReader::new(reader).lines();
-        writer.write_all(body.as_bytes()).await.unwrap();
-        writer.write_all(b"\n").await.unwrap();
-        let line = lines.next_line().await.unwrap().expect("response");
-        serde_json::from_str(&line).expect("response is JSON")
+        uds_round_trip(&sock, body).await
     }
 
     // Spawn 20 concurrent clients: half issue status, half issue a SELECT.

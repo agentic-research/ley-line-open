@@ -82,6 +82,33 @@ fn default_test_ctx(ctrl_path: PathBuf) -> leyline_cli_lib::daemon::DaemonContex
     }
 }
 
+/// Spawn the daemon's UDS listener and wait until it accepts connections.
+///
+/// Replaces the previous `socket::spawn(...) + sleep(50ms)` pair scattered
+/// across tests. The fixed sleep was timing-flaky on overloaded CI, and
+/// arbitrary on healthy machines (bind() is synchronous, so the listener
+/// is in the kernel queue immediately on return). This helper polls
+/// `connect().await` instead — fast machines see ~1ms, slow machines wait
+/// only as long as needed, and the 2s ceiling turns a wedged listener
+/// into a clean test failure rather than a hang.
+#[allow(dead_code)]
+async fn spawn_test_socket(
+    ctx: std::sync::Arc<leyline_cli_lib::daemon::DaemonContext>,
+    sock_path: PathBuf,
+) -> PathBuf {
+    use tokio::net::UnixStream;
+
+    let path = leyline_cli_lib::daemon::socket::spawn(ctx, sock_path);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if UnixStream::connect(&path).await.is_ok() {
+            return path;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("UDS listener at {} did not accept within 2s", path.display());
+}
+
 /// One UDS round trip: connect, write `body` (with trailing newline if
 /// missing), read one response line, parse JSON. Centralizes the connect
 /// + write + read + parse boilerplate that several tests duplicate.
@@ -481,10 +508,7 @@ async fn test_daemon_socket_status_op() {
     let ctx = Arc::new(default_test_ctx(ctrl_path));
 
     let sock_path = dir.path().join("test.sock");
-    leyline_cli_lib::daemon::socket::spawn(ctx, sock_path.clone());
-
-    // Give the listener a moment to bind.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    spawn_test_socket(ctx, sock_path.clone()).await;
 
     let stream = UnixStream::connect(&sock_path).await.expect("connect to socket");
     let (reader, mut writer) = stream.into_split();
@@ -532,9 +556,7 @@ async fn test_daemon_ext_dispatches_to_extension() {
     });
 
     let sock_path = dir.path().join("ext_test.sock");
-    leyline_cli_lib::daemon::socket::spawn(ctx, sock_path.clone());
-
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    spawn_test_socket(ctx, sock_path.clone()).await;
 
     let stream = UnixStream::connect(&sock_path).await.expect("connect to socket");
     let (reader, mut writer) = stream.into_split();
@@ -1518,8 +1540,7 @@ async fn test_op_vec_search_round_trip() {
     });
 
     let sock_path = dir.path().join("vec_search.sock");
-    leyline_cli_lib::daemon::socket::spawn(ctx, sock_path.clone());
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    spawn_test_socket(ctx, sock_path.clone()).await;
 
     let stream = UnixStream::connect(&sock_path).await.expect("connect");
     let (reader, mut writer) = stream.into_split();
@@ -1588,8 +1609,7 @@ async fn test_status_reports_phase_and_enrichment() {
     });
 
     let sock_path = dir.path().join("status_phase.sock");
-    leyline_cli_lib::daemon::socket::spawn(ctx, sock_path.clone());
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    spawn_test_socket(ctx, sock_path.clone()).await;
 
     let stream = UnixStream::connect(&sock_path).await.expect("connect");
     let (reader, mut writer) = stream.into_split();
@@ -1758,8 +1778,7 @@ async fn test_op_reparse_accepts_single_file_source() {
     });
 
     let sock_path = dir.path().join("reparse.sock");
-    leyline_cli_lib::daemon::socket::spawn(ctx.clone(), sock_path.clone());
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    spawn_test_socket(ctx.clone(), sock_path.clone()).await;
 
     // The hook posts {source: "<absolute file path>"} — what tool_input.file_path looks like.
     let edited = src.path().join("a.go");
@@ -1831,8 +1850,7 @@ async fn test_op_reparse_accepts_files_scope_with_dir_source() {
     });
 
     let sock_path = dir.path().join("reparse-files.sock");
-    leyline_cli_lib::daemon::socket::spawn(ctx, sock_path.clone());
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    spawn_test_socket(ctx, sock_path.clone()).await;
 
     let body = serde_json::json!({
         "op": "reparse",
@@ -1880,8 +1898,7 @@ async fn test_op_reparse_nonexistent_source_sets_error_phase_and_recovers() {
     let ctx = Arc::new(default_test_ctx(ctrl_path));
 
     let sock_path = dir.path().join("reparse-bad.sock");
-    leyline_cli_lib::daemon::socket::spawn(ctx, sock_path.clone());
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    spawn_test_socket(ctx, sock_path.clone()).await;
 
     // Helper: send a JSON op + receive one line, parse. Delegates to the
     // shared `uds_round_trip` so the two test-local duplicates of this
@@ -1963,8 +1980,7 @@ async fn test_op_query_destructive_runs_today_pin_for_6213d4() {
     });
 
     let sock_path = dir.path().join("query-destructive.sock");
-    leyline_cli_lib::daemon::socket::spawn(ctx.clone(), sock_path.clone());
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    spawn_test_socket(ctx.clone(), sock_path.clone()).await;
 
     let stream = UnixStream::connect(&sock_path).await.unwrap();
     let (reader, mut writer) = stream.into_split();
@@ -2033,8 +2049,7 @@ async fn test_op_vec_search_dim_mismatch_returns_clean_error() {
     });
 
     let sock_path = dir.path().join("vec_dim_mismatch.sock");
-    leyline_cli_lib::daemon::socket::spawn(ctx, sock_path.clone());
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    spawn_test_socket(ctx, sock_path.clone()).await;
 
     let stream = UnixStream::connect(&sock_path).await.unwrap();
     let (reader, mut writer) = stream.into_split();
@@ -2089,8 +2104,7 @@ async fn test_concurrent_uds_load_completes_bounded() {
     });
 
     let sock_path = dir.path().join("concurrent.sock");
-    leyline_cli_lib::daemon::socket::spawn(ctx, sock_path.clone());
-    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    spawn_test_socket(ctx, sock_path.clone()).await;
 
     /// One client: open, send one op, read one response, parse, return.
     /// Wraps the shared `uds_round_trip` so this test's owned-PathBuf +
@@ -2161,8 +2175,7 @@ async fn test_status_reports_error_phase() {
     });
 
     let sock_path = dir.path().join("status_error.sock");
-    leyline_cli_lib::daemon::socket::spawn(ctx, sock_path.clone());
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    spawn_test_socket(ctx, sock_path.clone()).await;
 
     let stream = UnixStream::connect(&sock_path).await.expect("connect");
     let (reader, mut writer) = stream.into_split();
@@ -2226,8 +2239,7 @@ async fn test_op_reparse_snapshot_race_keeps_monotonic_generation() {
     });
 
     let sock_path = dir.path().join("reparse_snapshot_race.sock");
-    leyline_cli_lib::daemon::socket::spawn(ctx, sock_path.clone());
-    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    spawn_test_socket(ctx, sock_path.clone()).await;
 
     /// One round-trip — open, send body, parse one line back.
     async fn round_trip(

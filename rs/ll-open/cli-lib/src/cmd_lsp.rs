@@ -19,37 +19,8 @@ const SYMBOL_POLL_MAX_ATTEMPTS: usize = 10;
 /// roughly `(SYMBOL_POLL_MAX_ATTEMPTS - 1) * SYMBOL_POLL_DELAY`.
 const SYMBOL_POLL_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 
-/// Infer LSP language ID from file extension.
-fn infer_language_id(ext: &str) -> Option<&'static str> {
-    match ext {
-        "py" => Some("python"),
-        "rs" => Some("rust"),
-        "go" => Some("go"),
-        "js" => Some("javascript"),
-        "ts" => Some("typescript"),
-        "jsx" => Some("javascriptreact"),
-        "tsx" => Some("typescriptreact"),
-        "c" => Some("c"),
-        "cpp" | "cc" | "cxx" => Some("cpp"),
-        "h" | "hpp" => Some("cpp"),
-        "java" => Some("java"),
-        "rb" => Some("ruby"),
-        "ex" | "exs" => Some("elixir"),
-        "lua" => Some("lua"),
-        "sh" | "bash" => Some("shellscript"),
-        "css" => Some("css"),
-        "html" | "htm" => Some("html"),
-        "json" => Some("json"),
-        "yaml" | "yml" => Some("yaml"),
-        "toml" => Some("toml"),
-        "md" => Some("markdown"),
-        "zig" => Some("zig"),
-        "swift" => Some("swift"),
-        "kt" | "kts" => Some("kotlin"),
-        "tf" | "hcl" => Some("terraform"),
-        _ => None,
-    }
-}
+// Language ID inference moved to leyline-lsp::languages — single source of
+// truth shared with the daemon's lsp_pass.
 
 /// Run the LSP subcommand.
 ///
@@ -75,7 +46,7 @@ pub async fn cmd_lsp(
                 .extension()
                 .and_then(|e| e.to_str())
                 .context("input file has no extension; pass --language-id")?;
-            infer_language_id(ext)
+            leyline_lsp::languages::language_id_from_ext(ext)
                 .map(|s| s.to_string())
                 .with_context(|| format!("unknown extension .{ext}; pass --language-id"))?
         }

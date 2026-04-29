@@ -15,5 +15,6 @@
 //! ```
 
 pub mod client;
+pub mod languages;
 pub mod project;
 pub mod protocol;

@@ -24,8 +24,17 @@ const STATE_CHANGING_OPS: &[&str] = &["load", "reparse", "flush", "snapshot", "e
 ///
 /// Returns the socket path. The listener runs in the background.
 pub fn spawn(ctx: Arc<DaemonContext>, sock_path: PathBuf) -> PathBuf {
-    // Remove stale socket file if it exists.
-    let _ = std::fs::remove_file(&sock_path);
+    // Remove any stale socket left from a previous run. Missing-file is the
+    // common case (fresh start), so swallow ENOENT silently and only warn on
+    // unexpected errors (permissions, EBUSY, etc).
+    if let Err(e) = std::fs::remove_file(&sock_path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        log::warn!(
+            "could not remove stale socket {}: {e}",
+            sock_path.display(),
+        );
+    }
 
     // Bind the listener synchronously so the path is ready on return.
     let listener = UnixListener::bind(&sock_path).expect("bind UDS socket");
@@ -36,9 +45,28 @@ pub fn spawn(ctx: Arc<DaemonContext>, sock_path: PathBuf) -> PathBuf {
         let mache_dir = home.join(".mache");
         let symlink_path = mache_dir.join("default.sock");
         if sock_path != symlink_path {
-            let _ = std::fs::create_dir_all(&mache_dir);
-            let _ = std::fs::remove_file(&symlink_path);
-            let _ = std::os::unix::fs::symlink(&sock_path, &symlink_path);
+            // Each step is best-effort — a daemon that can't auto-symlink
+            // is still functional, just not discoverable via the default
+            // path. Log so a broken mache discovery is debuggable.
+            if let Err(e) = std::fs::create_dir_all(&mache_dir) {
+                log::warn!(
+                    "could not create {} for socket auto-discovery: {e}",
+                    mache_dir.display(),
+                );
+            }
+            if let Err(e) = std::fs::remove_file(&symlink_path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                log::warn!(
+                    "could not remove old default.sock symlink: {e}",
+                );
+            }
+            if let Err(e) = std::os::unix::fs::symlink(&sock_path, &symlink_path) {
+                log::warn!(
+                    "could not create default.sock symlink at {}: {e}",
+                    symlink_path.display(),
+                );
+            }
         }
     }
 
@@ -69,6 +97,23 @@ async fn handle_connection(ctx: Arc<DaemonContext>, stream: tokio::net::UnixStre
     let mut lines = BufReader::new(reader).lines();
     let mut conn_state = ConnectionState::new(ctx.router.clone());
 
+    /// Write a line back to the client, log::trace! on disconnect. Returns
+    /// false if the write failed so the caller can break out of the loop.
+    async fn write_line(
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
+        body: &str,
+    ) -> bool {
+        if let Err(e) = writer.write_all(body.as_bytes()).await {
+            log::trace!("UDS client gone (mid-body): {e}");
+            return false;
+        }
+        if let Err(e) = writer.write_all(b"\n").await {
+            log::trace!("UDS client gone (newline): {e}");
+            return false;
+        }
+        true
+    }
+
     while let Ok(Some(line)) = lines.next_line().await {
         let line = line.trim().to_string();
         if line.is_empty() {
@@ -79,8 +124,7 @@ async fn handle_connection(ctx: Arc<DaemonContext>, stream: tokio::net::UnixStre
             Ok(v) => v,
             Err(e) => {
                 let err = json!({"error": format!("invalid JSON: {e}")}).to_string();
-                let _ = writer.write_all(err.as_bytes()).await;
-                let _ = writer.write_all(b"\n").await;
+                if !write_line(&mut writer, &err).await { break; }
                 continue;
             }
         };
@@ -89,16 +133,13 @@ async fn handle_connection(ctx: Arc<DaemonContext>, stream: tokio::net::UnixStre
             Some(s) => s.to_string(),
             None => {
                 let err = json!({"error": "missing 'op' field"}).to_string();
-                let _ = writer.write_all(err.as_bytes()).await;
-                let _ = writer.write_all(b"\n").await;
+                if !write_line(&mut writer, &err).await { break; }
                 continue;
             }
         };
 
         let response = dispatch(&ctx, &mut conn_state, &op, &req).await;
-
-        let _ = writer.write_all(response.as_bytes()).await;
-        let _ = writer.write_all(b"\n").await;
+        if !write_line(&mut writer, &response).await { break; }
     }
 
     // Clean up subscriptions on disconnect.

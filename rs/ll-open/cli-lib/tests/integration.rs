@@ -2113,6 +2113,118 @@ async fn test_op_query_destructive_runs_today_pin_for_6213d4() {
     assert!(table_gone, "DROP TABLE actually executed");
 }
 
+/// Concurrent UDS load: spin up the daemon socket, hit it with N parallel
+/// clients each issuing a mix of `status` + `query` ops, assert all complete
+/// in bounded time and every response is well-formed.
+///
+/// This is the test that would have flagged ley-line-open-5fea4e
+/// (mutex-held-across-await deadlock) earlier — under contention the
+/// existing std::sync::Mutex serializes everything, but we *should* still
+/// make forward progress and never starve a connection. If the daemon
+/// deadlocks, this test will hang and CI will time out (5s wall ceiling
+/// makes it visible).
+///
+/// Bead: ley-line-open-5f7100-12 (item #1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_uds_load_completes_bounded() {
+    use leyline_cli_lib::daemon::{DaemonContext, DaemonState, EventRouter, NoExt};
+    use leyline_core::{Controller, create_arena};
+    use std::sync::{Arc, Mutex, RwLock};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let dir = TempDir::new().unwrap();
+    let arena_path = dir.path().join("test.arena");
+    let ctrl_path = dir.path().join("test.ctrl");
+    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
+    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0).unwrap();
+    drop(ctrl);
+
+    // Pre-populate a tiny living db so query ops have something to hit.
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT);
+         INSERT INTO _meta VALUES ('parse_version', '1');",
+    )
+    .unwrap();
+
+    let ctx = Arc::new(DaemonContext {
+        ctrl_path,
+        ext: Arc::new(NoExt),
+        router: EventRouter::new(64),
+        live_db: Mutex::new(conn),
+        source_dir: None,
+        lang_filter: None,
+        enrichment_passes: vec![],
+        state: Arc::new(RwLock::new(DaemonState::initializing())),
+        #[cfg(feature = "vec")]
+        vec_index: {
+            leyline_cli_lib::daemon::vec_index::register_vec();
+            Arc::new(leyline_cli_lib::daemon::vec_index::VectorIndex::new(4, None).unwrap())
+        },
+        #[cfg(feature = "vec")]
+        embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
+        #[cfg(feature = "vec")]
+        embed_queue: Arc::new(Mutex::new(std::collections::BinaryHeap::new())),
+    });
+
+    let sock_path = dir.path().join("concurrent.sock");
+    leyline_cli_lib::daemon::socket::spawn(ctx, sock_path.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+    /// One client: open, send one op, read one response, parse, return.
+    async fn one_call(
+        sock: std::path::PathBuf,
+        body: &'static str,
+    ) -> serde_json::Value {
+        let stream = UnixStream::connect(&sock).await.expect("connect");
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        writer.write_all(body.as_bytes()).await.unwrap();
+        writer.write_all(b"\n").await.unwrap();
+        let line = lines.next_line().await.unwrap().expect("response");
+        serde_json::from_str(&line).expect("response is JSON")
+    }
+
+    // Spawn 20 concurrent clients: half issue status, half issue a SELECT.
+    // Each completes independently. Wrap the whole thing in a 5s tokio
+    // timeout so a deadlock turns into a test failure rather than a hang.
+    let n = 20;
+    let deadline = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut tasks = Vec::with_capacity(n);
+        for i in 0..n {
+            let sp = sock_path.clone();
+            tasks.push(tokio::spawn(async move {
+                let body = if i % 2 == 0 {
+                    r#"{"op":"status"}"#
+                } else {
+                    r#"{"op":"query","sql":"SELECT key, value FROM _meta"}"#
+                };
+                one_call(sp, body).await
+            }));
+        }
+        let mut results = Vec::with_capacity(n);
+        for t in tasks {
+            results.push(t.await.expect("task panic"));
+        }
+        results
+    })
+    .await;
+
+    let results = deadline.expect("daemon deadlocked under concurrent load");
+    assert_eq!(results.len(), n);
+    for (i, r) in results.iter().enumerate() {
+        if i % 2 == 0 {
+            assert_eq!(r["ok"], true, "status #{i} failed: {r}");
+            assert!(r.get("phase").is_some(), "status #{i} missing phase: {r}");
+        } else {
+            assert_eq!(r["ok"], true, "query #{i} failed: {r}");
+            assert!(r.get("rows").is_some(), "query #{i} missing rows: {r}");
+        }
+    }
+}
+
 /// Verify the error phase is surfaced through `op_status`.
 #[tokio::test]
 async fn test_status_reports_error_phase() {

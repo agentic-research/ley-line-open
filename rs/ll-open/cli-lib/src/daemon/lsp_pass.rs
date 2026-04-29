@@ -12,40 +12,56 @@ use rusqlite::Connection;
 
 use super::enrichment::{EnrichmentPass, EnrichmentStats};
 
-/// Known language server commands by language ID.
-fn language_server(lang: &str) -> Option<(&'static str, &'static [&'static str])> {
-    match lang {
-        "go" => Some(("gopls", &["serve"])),
-        "python" => Some(("pyright-langserver", &["--stdio"])),
-        "rust" => Some(("rust-analyzer", &[])),
-        "typescript" | "javascript" | "typescriptreact" | "javascriptreact" => {
-            Some(("typescript-language-server", &["--stdio"]))
-        }
-        "c" | "cpp" => Some(("clangd", &[])),
-        "java" => Some(("jdtls", &[])),
-        "zig" => Some(("zls", &[])),
-        _ => None,
-    }
+/// Single-source-of-truth for LSP language support: ID + extensions + the
+/// server invocation. Adding a language means adding one record; this makes
+/// drift between "we recognize the file" and "we can launch a server for it"
+/// structurally impossible.
+///
+/// `id` is the canonical LSP language identifier (matches LSP spec values
+/// where applicable). `exts` is the set of file extensions that map to this
+/// language. `server` is `(binary, args)` for spawning the language server.
+struct LspLanguage {
+    id: &'static str,
+    exts: &'static [&'static str],
+    server: (&'static str, &'static [&'static str]),
 }
 
-/// Infer LSP language ID from file extension.
+const LSP_LANGUAGES: &[LspLanguage] = &[
+    LspLanguage { id: "go",        exts: &["go"],
+        server: ("gopls", &["serve"]) },
+    LspLanguage { id: "python",    exts: &["py"],
+        server: ("pyright-langserver", &["--stdio"]) },
+    LspLanguage { id: "rust",      exts: &["rs"],
+        server: ("rust-analyzer", &[]) },
+    LspLanguage { id: "typescript", exts: &["ts"],
+        server: ("typescript-language-server", &["--stdio"]) },
+    LspLanguage { id: "typescriptreact", exts: &["tsx"],
+        server: ("typescript-language-server", &["--stdio"]) },
+    LspLanguage { id: "javascript", exts: &["js"],
+        server: ("typescript-language-server", &["--stdio"]) },
+    LspLanguage { id: "javascriptreact", exts: &["jsx"],
+        server: ("typescript-language-server", &["--stdio"]) },
+    LspLanguage { id: "c",         exts: &["c"],
+        server: ("clangd", &[]) },
+    LspLanguage { id: "cpp",       exts: &["cpp", "cc", "cxx", "h", "hpp"],
+        server: ("clangd", &[]) },
+    LspLanguage { id: "java",      exts: &["java"],
+        server: ("jdtls", &[]) },
+    LspLanguage { id: "zig",       exts: &["zig"],
+        server: ("zls", &[]) },
+];
+
+/// Look up the language server invocation for an LSP language ID.
+fn language_server(lang: &str) -> Option<(&'static str, &'static [&'static str])> {
+    LSP_LANGUAGES.iter().find(|l| l.id == lang).map(|l| l.server)
+}
+
+/// Infer the LSP language ID from a file extension.
 fn language_id_from_ext(ext: &str) -> Option<&'static str> {
-    match ext {
-        "py" => Some("python"),
-        "rs" => Some("rust"),
-        "go" => Some("go"),
-        "js" => Some("javascript"),
-        "ts" => Some("typescript"),
-        "jsx" => Some("javascriptreact"),
-        "tsx" => Some("typescriptreact"),
-        "c" => Some("c"),
-        "cpp" | "cc" | "cxx" => Some("cpp"),
-        "h" | "hpp" => Some("cpp"),
-        "java" => Some("java"),
-        "rb" => Some("ruby"),
-        "zig" => Some("zig"),
-        _ => None,
-    }
+    LSP_LANGUAGES
+        .iter()
+        .find(|l| l.exts.contains(&ext))
+        .map(|l| l.id)
 }
 
 /// LSP enrichment pass.
@@ -275,3 +291,86 @@ async fn enrich_files(
     client.shutdown().await?;
     Ok((total_symbols, total_enriched))
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_language_has_a_server_and_at_least_one_ext() {
+        for lang in LSP_LANGUAGES {
+            assert!(!lang.id.is_empty(), "language id must not be empty");
+            assert!(
+                !lang.exts.is_empty(),
+                "language `{}` must register at least one extension",
+                lang.id,
+            );
+            assert!(
+                !lang.server.0.is_empty(),
+                "language `{}` must have a server binary",
+                lang.id,
+            );
+        }
+    }
+
+    #[test]
+    fn drift_guard_every_ext_resolves_to_a_server() {
+        // The whole point of unifying the maps: if we recognize a file
+        // extension, we can launch a server for it. If this test fails,
+        // a language was registered without a server (or with an empty
+        // one), which would cause silent enrichment skips downstream.
+        for lang in LSP_LANGUAGES {
+            for ext in lang.exts {
+                let id = language_id_from_ext(ext)
+                    .unwrap_or_else(|| panic!("ext `{ext}` not resolved"));
+                let server = language_server(id)
+                    .unwrap_or_else(|| panic!("language `{id}` has no server"));
+                assert!(!server.0.is_empty(), "ext `{ext}` resolved to empty server");
+            }
+        }
+    }
+
+    #[test]
+    fn extension_lookup_known_cases() {
+        assert_eq!(language_id_from_ext("rs"),  Some("rust"));
+        assert_eq!(language_id_from_ext("go"),  Some("go"));
+        assert_eq!(language_id_from_ext("py"),  Some("python"));
+        assert_eq!(language_id_from_ext("ts"),  Some("typescript"));
+        assert_eq!(language_id_from_ext("tsx"), Some("typescriptreact"));
+        assert_eq!(language_id_from_ext("hpp"), Some("cpp"));
+    }
+
+    #[test]
+    fn extension_lookup_unknown_returns_none() {
+        // Drift fix: ruby was previously mapped from `.rb` but had no
+        // server, producing silent skips. Removed from the table.
+        assert_eq!(language_id_from_ext("rb"),     None);
+        assert_eq!(language_id_from_ext("md"),     None);
+        assert_eq!(language_id_from_ext("foobar"), None);
+        assert_eq!(language_id_from_ext(""),       None);
+    }
+
+    #[test]
+    fn server_lookup_unknown_returns_none() {
+        assert!(language_server("brainfuck").is_none());
+        assert!(language_server("").is_none());
+        // Sanity: ruby is now genuinely unsupported (was the drift case).
+        assert!(language_server("ruby").is_none());
+    }
+
+    #[test]
+    fn typescript_family_shares_one_server() {
+        // Sanity-check the four-way ts/tsx/js/jsx mapping: all four route
+        // to typescript-language-server but each declares its own LSP id.
+        let ts = language_server("typescript").unwrap();
+        let tsx = language_server("typescriptreact").unwrap();
+        let js = language_server("javascript").unwrap();
+        let jsx = language_server("javascriptreact").unwrap();
+        assert_eq!(ts.0, "typescript-language-server");
+        assert_eq!(ts, tsx);
+        assert_eq!(ts, js);
+        assert_eq!(ts, jsx);
+    }
+}
+

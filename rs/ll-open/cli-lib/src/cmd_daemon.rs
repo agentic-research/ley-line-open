@@ -399,12 +399,7 @@ fn init_living_db(
     if let Some(conn) = try_warm_start(ctrl_path)? {
         eprintln!("warm start from arena");
         if let Some(source_dir) = source {
-            eprintln!("incremental reparse {} ...", source_dir.display());
-            let result = crate::cmd_parse::parse_into_conn(&conn, source_dir, language, None)?;
-            eprintln!(
-                "{} parsed, {} unchanged, {} deleted, {} errors",
-                result.parsed, result.unchanged, result.deleted, result.errors,
-            );
+            run_initial_parse(&conn, source_dir, language, "incremental reparse")?;
         }
         return Ok(conn);
     }
@@ -415,15 +410,30 @@ fn init_living_db(
         .context("open :memory: connection")?;
 
     if let Some(source_dir) = source {
-        eprintln!("parsing {} ...", source_dir.display());
-        let result = crate::cmd_parse::parse_into_conn(&conn, source_dir, language, None)?;
-        eprintln!(
-            "{} parsed, {} unchanged, {} deleted, {} errors",
-            result.parsed, result.unchanged, result.deleted, result.errors,
-        );
+        run_initial_parse(&conn, source_dir, language, "parsing")?;
     }
 
     Ok(conn)
+}
+
+/// Run a full-tree parse + log the standard `N parsed, N unchanged, N
+/// deleted, N errors` summary. Shared by the warm-start and cold-start
+/// branches of `init_living_db`. The `kind` prefix lets each branch
+/// label its log line ("incremental reparse" vs "parsing") while
+/// keeping the summary format identical so log scrapers see one shape.
+fn run_initial_parse(
+    conn: &rusqlite::Connection,
+    source_dir: &Path,
+    language: Option<&str>,
+    kind: &str,
+) -> Result<()> {
+    eprintln!("{kind} {} ...", source_dir.display());
+    let result = crate::cmd_parse::parse_into_conn(conn, source_dir, language, None)?;
+    eprintln!(
+        "{} parsed, {} unchanged, {} deleted, {} errors",
+        result.parsed, result.unchanged, result.deleted, result.errors,
+    );
+    Ok(())
 }
 
 /// Try to restore the living db from the arena's active buffer.

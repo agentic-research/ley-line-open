@@ -335,6 +335,28 @@ mod tests {
         );
     }
 
+    /// Pin: the embed queue is unbounded today. 100k promotions all land
+    /// in the BinaryHeap. ley-line-open-5f7100-12 #9 wants this gated
+    /// (max-cap, eviction policy). When that bead lands, the assertion
+    /// here will need updating — that's the signal.
+    ///
+    /// We use 100k (not 1M) to keep CI fast; the invariant being pinned
+    /// is "no implicit cap" so any cap added later will be smaller than 100k.
+    #[test]
+    fn embed_queue_unbounded_growth_pin_for_5f7100_12_9() {
+        let queue: EmbedQueue = Arc::new(Mutex::new(BinaryHeap::new()));
+        for i in 0..100_000 {
+            promote(&queue, &format!("n{i}"));
+        }
+        let q = queue.lock().unwrap();
+        assert_eq!(
+            q.len(),
+            100_000,
+            "today the queue is unbounded — 100k promotions = 100k entries. \
+             When 5f7100-12 #9 lands the bound, update this assertion to the new cap."
+        );
+    }
+
     #[test]
     fn embed_task_ordering_matches_priority() {
         // Direct test of the Ord impl: the heap is keyed on priority, with

@@ -708,6 +708,39 @@ mod tests {
         }
     }
 
+    // ── git helpers: behavior on a non-repo directory ──────────────────
+    //
+    // git_watch_loop calls git_dirty_files / git_head every 2s. If the
+    // user points --source at a directory that isn't a git repo, the
+    // watcher today logs at debug level and re-runs forever (no auto-
+    // disable after N failures yet — see 5f7100-12 #4). These tests pin
+    // the underlying helper behavior so a future fix is intentional.
+
+    #[test]
+    fn git_dirty_files_on_non_repo_returns_err() {
+        // A bare temp dir is not a git repo. `git status` exits non-zero
+        // and writes to stderr; git_dirty_files must surface that as a
+        // Result::Err with the stderr message included so the watcher
+        // can log something useful (today it just log::debug!s).
+        let dir = TempDir::new().unwrap();
+        let result = git_dirty_files(dir.path());
+        assert!(result.is_err(), "non-repo should return Err");
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            err_msg.contains("git status failed") || err_msg.contains("not a git"),
+            "error should describe the failure mode; got: {err_msg}",
+        );
+    }
+
+    #[test]
+    fn git_head_on_non_repo_returns_none() {
+        // git_head returns Option (not Result) — non-repo silently returns
+        // None. Pin: this is the watcher's current "skip HEAD-change
+        // detection on non-repo" signal.
+        let dir = TempDir::new().unwrap();
+        assert!(git_head(dir.path()).is_none());
+    }
+
     #[test]
     fn warm_start_returns_none_on_missing_arena_file() {
         // ctrl exists and is valid, but the arena_path it points at does

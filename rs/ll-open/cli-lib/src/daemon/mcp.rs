@@ -62,11 +62,12 @@ fn tool_registry() -> Vec<McpTool> {
         },
         McpTool {
             name: "reparse",
-            description: "Re-run tree-sitter parsing over the source tree (or a single file via `source`).",
+            description: "Re-run tree-sitter parsing. Pass `files: [paths]` to scope to specific files (preferred for hooks). `source` may be a directory or a single file path; a file is auto-rewritten to (parent, scope=[basename]) so PostToolUse hooks can forward `tool_input.file_path` directly.",
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "source": {"type": "string", "description": "Source dir; falls back to --source"},
+                    "source": {"type": "string", "description": "Source dir or file; falls back to daemon --source"},
+                    "files":  {"type": "array", "items": {"type": "string"}, "description": "Scope to these files (relative to source dir)"},
                     "lang":   {"type": "string", "description": "Optional language filter"}
                 }
             }),

@@ -3,7 +3,7 @@
 //! Each op queries the living in-memory SQLite database directly.
 //! The arena is used only for periodic snapshots (crash recovery + mache).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use leyline_core::Controller;
@@ -150,7 +150,17 @@ fn op_load(ctrl_path: &Path, req: &serde_json::Value) -> Result<String> {
 // ---------------------------------------------------------------------------
 
 fn op_reparse(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
-    let source = req
+    // Inputs:
+    //   `source` — directory or single file. If omitted, falls back to ctx.source_dir.
+    //   `files`  — optional explicit scope (relative paths under source). When set,
+    //              only those files are parsed; unscoped files are untouched.
+    //   `lang`   — optional language filter.
+    //
+    // For Claude Code's PostToolUse hook the natural shape is
+    // `{source: "<file>"}`. We accept that and auto-rewrite to
+    // `(parent, scope=[basename])` so existing hook callers don't need to
+    // know about the directory invariant.
+    let source_arg = req
         .get("source")
         .and_then(|v| v.as_str())
         .or_else(|| ctx.source_dir.as_ref().map(|p| p.to_str().unwrap_or("")))
@@ -161,10 +171,69 @@ fn op_reparse(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .or(ctx.lang_filter.as_deref());
 
+    // Explicit `files: [...]` always takes precedence as the scope.
+    let mut explicit_files: Option<Vec<String>> = req
+        .get("files")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+
+    // If the caller passed a single-file `source`, reinterpret as parent +
+    // scope so we satisfy parse_into_conn's directory invariant. This lets
+    // hooks blindly forward `tool_input.file_path` without knowing the
+    // project root.
+    let source_path = Path::new(&source_arg);
+    let (source_dir, derived_scope): (PathBuf, Option<Vec<String>>) =
+        if source_path.is_dir() {
+            (source_path.to_path_buf(), None)
+        } else if source_path.is_file() {
+            // Fall back to ctx.source_dir as the project root if available
+            // (lets the relative path stay short); otherwise use the file's
+            // own parent directory.
+            let project_root = ctx
+                .source_dir
+                .as_ref()
+                .filter(|root| source_path.starts_with(root))
+                .cloned();
+            match project_root {
+                Some(root) => {
+                    let rel = source_path
+                        .strip_prefix(&root)
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| {
+                            source_path
+                                .file_name()
+                                .map(|f| f.to_string_lossy().to_string())
+                                .unwrap_or_default()
+                        });
+                    (root, Some(vec![rel]))
+                }
+                None => {
+                    let parent = source_path
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| PathBuf::from("."));
+                    let basename = source_path
+                        .file_name()
+                        .map(|f| f.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    (parent, Some(vec![basename]))
+                }
+            }
+        } else {
+            // Path doesn't exist — bubble up the error from parse_into_conn
+            // so the caller sees a helpful message.
+            (source_path.to_path_buf(), None)
+        };
+
+    if explicit_files.is_none() {
+        explicit_files = derived_scope;
+    }
+    let scope: Option<&[String]> = explicit_files.as_deref();
+
     // Parse directly into the living db.
     ctx.state.write().unwrap().phase = DaemonPhase::Parsing;
     let guard = ctx.live_db.lock().unwrap();
-    let result = match crate::cmd_parse::parse_into_conn(&guard, Path::new(&source), lang, None) {
+    let result = match crate::cmd_parse::parse_into_conn(&guard, &source_dir, lang, scope) {
         Ok(r) => r,
         Err(e) => {
             drop(guard);

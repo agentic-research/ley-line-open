@@ -1743,6 +1743,187 @@ fn test_scoped_reparse_handles_deletion_in_scope() {
     assert_eq!(remaining, "b.go");
 }
 
+/// Verify `op_reparse` accepts a single-file `source` (the shape Claude
+/// Code's PostToolUse hook produces) and auto-rewrites it to (parent,
+/// scope=[basename]) instead of erroring with "not a directory".
+#[tokio::test]
+async fn test_op_reparse_accepts_single_file_source() {
+    use leyline_cli_lib::daemon::{DaemonContext, DaemonState, EventRouter, NoExt};
+    use leyline_core::{Controller, create_arena};
+    use std::sync::{Arc, Mutex, RwLock};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    // Source tree with two go files. The hook will only "edit" one.
+    let src = TempDir::new().unwrap();
+    fs::write(src.path().join("a.go"), "package m\n\nfunc A() {}\n").unwrap();
+    fs::write(src.path().join("b.go"), "package m\n\nfunc B() {}\n").unwrap();
+
+    // Cold-parse so _file_index is populated.
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    leyline_cli_lib::cmd_parse::parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
+    let snapshot: std::collections::HashMap<String, (i64, i64)> = conn
+        .prepare("SELECT path, mtime, size FROM _file_index")
+        .unwrap()
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))
+        })
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert_eq!(snapshot.len(), 2);
+
+    // Modify a.go and let the daemon serve.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    fs::write(src.path().join("a.go"), "package m\n\nfunc A() { /* edited */ }\n").unwrap();
+
+    let dir = TempDir::new().unwrap();
+    let arena_path = dir.path().join("test.arena");
+    let ctrl_path = dir.path().join("test.ctrl");
+    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
+    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0).unwrap();
+    drop(ctrl);
+
+    let ctx = Arc::new(DaemonContext {
+        ctrl_path,
+        ext: Arc::new(NoExt),
+        router: EventRouter::new(16),
+        live_db: Mutex::new(conn),
+        source_dir: Some(src.path().to_path_buf()),
+        lang_filter: Some("go".to_string()),
+        enrichment_passes: vec![],
+        state: Arc::new(RwLock::new(DaemonState::initializing())),
+        #[cfg(feature = "vec")]
+        vec_index: {
+            leyline_cli_lib::daemon::vec_index::register_vec();
+            Arc::new(leyline_cli_lib::daemon::vec_index::VectorIndex::new(4, None).unwrap())
+        },
+        #[cfg(feature = "vec")]
+        embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
+        #[cfg(feature = "vec")]
+        embed_queue: Arc::new(Mutex::new(std::collections::BinaryHeap::new())),
+    });
+
+    let sock_path = dir.path().join("reparse.sock");
+    leyline_cli_lib::daemon::socket::spawn(ctx.clone(), sock_path.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // The hook posts {source: "<absolute file path>"} — what tool_input.file_path looks like.
+    let edited = src.path().join("a.go");
+    let body = serde_json::json!({
+        "op": "reparse",
+        "source": edited.to_string_lossy().to_string(),
+    });
+
+    let stream = UnixStream::connect(&sock_path).await.unwrap();
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+    writer.write_all(format!("{body}\n").as_bytes()).await.unwrap();
+    let response = lines.next_line().await.unwrap().expect("response");
+    let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+    assert_eq!(parsed["ok"], true, "single-file reparse should succeed: {parsed}");
+    assert_eq!(parsed["parsed"], 1, "only a.go should be reparsed");
+    let changed = parsed["changed_files"].as_array().expect("changed_files array");
+    let names: Vec<&str> = changed.iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(names, vec!["a.go"], "scope should be exactly [a.go]");
+
+    // Verify b.go was NOT touched (its mtime/size in _file_index is unchanged).
+    let after: std::collections::HashMap<String, (i64, i64)> = ctx
+        .live_db
+        .lock()
+        .unwrap()
+        .prepare("SELECT path, mtime, size FROM _file_index")
+        .unwrap()
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))
+        })
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert_eq!(after.get("b.go"), snapshot.get("b.go"), "b.go must be untouched");
+    assert_ne!(after.get("a.go"), snapshot.get("a.go"), "a.go must be updated");
+}
+
+/// Verify explicit `files: [...]` arg takes precedence over auto-derivation
+/// and works with a directory `source`. This is the shape the cloister hook
+/// will eventually use.
+#[tokio::test]
+async fn test_op_reparse_accepts_files_scope_with_dir_source() {
+    use leyline_cli_lib::daemon::{DaemonContext, DaemonState, EventRouter, NoExt};
+    use leyline_core::{Controller, create_arena};
+    use std::sync::{Arc, Mutex, RwLock};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let src = TempDir::new().unwrap();
+    fs::write(src.path().join("a.go"), "package m\n\nfunc A() {}\n").unwrap();
+    fs::write(src.path().join("b.go"), "package m\n\nfunc B() {}\n").unwrap();
+    fs::write(src.path().join("c.go"), "package m\n\nfunc C() {}\n").unwrap();
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    leyline_cli_lib::cmd_parse::parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    fs::write(src.path().join("b.go"), "package m\n\nfunc B() { /* edit */ }\n").unwrap();
+
+    let dir = TempDir::new().unwrap();
+    let arena_path = dir.path().join("test.arena");
+    let ctrl_path = dir.path().join("test.ctrl");
+    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
+    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0).unwrap();
+    drop(ctrl);
+
+    let ctx = Arc::new(DaemonContext {
+        ctrl_path,
+        ext: Arc::new(NoExt),
+        router: EventRouter::new(16),
+        live_db: Mutex::new(conn),
+        source_dir: Some(src.path().to_path_buf()),
+        lang_filter: Some("go".to_string()),
+        enrichment_passes: vec![],
+        state: Arc::new(RwLock::new(DaemonState::initializing())),
+        #[cfg(feature = "vec")]
+        vec_index: {
+            leyline_cli_lib::daemon::vec_index::register_vec();
+            Arc::new(leyline_cli_lib::daemon::vec_index::VectorIndex::new(4, None).unwrap())
+        },
+        #[cfg(feature = "vec")]
+        embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
+        #[cfg(feature = "vec")]
+        embed_queue: Arc::new(Mutex::new(std::collections::BinaryHeap::new())),
+    });
+
+    let sock_path = dir.path().join("reparse-files.sock");
+    leyline_cli_lib::daemon::socket::spawn(ctx, sock_path.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let body = serde_json::json!({
+        "op": "reparse",
+        "source": src.path().to_string_lossy().to_string(),
+        "files": ["b.go"],
+    });
+
+    let stream = UnixStream::connect(&sock_path).await.unwrap();
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+    writer.write_all(format!("{body}\n").as_bytes()).await.unwrap();
+    let response = lines.next_line().await.unwrap().expect("response");
+    let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(parsed["parsed"], 1);
+    let changed: Vec<&str> = parsed["changed_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(changed, vec!["b.go"]);
+}
+
 /// Verify the error phase is surfaced through `op_status`.
 #[tokio::test]
 async fn test_status_reports_error_phase() {

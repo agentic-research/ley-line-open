@@ -64,6 +64,70 @@ pub fn handle_base_op(ctx: &DaemonContext, op: &str, req: &serde_json::Value) ->
 /// scopes a query to all nodes in a single file.
 const NODE_ID_FOR_FILE: &str = "node_id LIKE ?1 || '%'";
 
+/// Query a `(token) → (node_id, source_id)` table, used by find_callers
+/// (node_refs) and find_defs (node_defs). The two ops differ only in
+/// table name + the JSON output key, so this helper handles the SQL +
+/// row decoding once.
+fn query_token_in_table(
+    conn: &Connection,
+    token: &str,
+    table: &str,
+) -> Result<Vec<serde_json::Value>> {
+    let sql = format!("SELECT node_id, source_id FROM {table} WHERE token = ?1");
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt
+        .query_map([token], |row| {
+            Ok(json!({
+                "node_id":   row.get::<_, String>(0)?,
+                "source_id": row.get::<_, String>(1)?,
+            }))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Helper for `_lsp_defs` / `_lsp_refs` queries. Both share the
+/// `(uri, start_line, start_col, end_line, end_col)` shape with a
+/// table-specific column prefix (`def_` / `ref_`). Returns an empty
+/// vec if the table doesn't exist yet — that's the "not enriched"
+/// signal callers use to trigger lazy enrichment.
+fn lsp_5col_position_rows(
+    conn: &Connection,
+    node_id: &str,
+    table: &str,
+    col_prefix: &str,
+) -> Result<Vec<serde_json::Value>> {
+    // Skip silently if the table hasn't been enriched yet.
+    let exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name=?1",
+            [table],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if !exists {
+        return Ok(vec![]);
+    }
+    let sql = format!(
+        "SELECT {col_prefix}_uri, {col_prefix}_start_line, {col_prefix}_start_col, \
+                {col_prefix}_end_line, {col_prefix}_end_col \
+         FROM {table} WHERE node_id = ?1"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt
+        .query_map([node_id], |row| {
+            Ok(json!({
+                "uri":        row.get::<_, String>(0)?,
+                "start_line": row.get::<_, i32>(1)?,
+                "start_col":  row.get::<_, i32>(2)?,
+                "end_line":   row.get::<_, i32>(3)?,
+                "end_col":    row.get::<_, i32>(4)?,
+            }))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Strip a leading `file://` from an LSP-style URI. Returns the input
 /// unchanged if no prefix is present. Centralized so the rule for what
 /// counts as "the file path" stays in one spot.
@@ -442,20 +506,8 @@ fn op_find_callers(ctx: &DaemonContext, req: &serde_json::Value) -> Result<Strin
         .get("token")
         .and_then(|v| v.as_str())
         .context("missing \"token\" field")?;
-
     with_live_db(ctx, |conn| {
-        let mut stmt = conn.prepare_cached(
-            "SELECT node_id, source_id FROM node_refs WHERE token = ?1",
-        )?;
-        let rows: Vec<serde_json::Value> = stmt
-            .query_map([token], |row| {
-                Ok(json!({
-                    "node_id": row.get::<_, String>(0)?,
-                    "source_id": row.get::<_, String>(1)?,
-                }))
-            })?
-            .collect::<Result<_, _>>()?;
-
+        let rows = query_token_in_table(conn, token, "node_refs")?;
         Ok(json!({"ok": true, "callers": rows}).to_string())
     })
 }
@@ -466,20 +518,8 @@ fn op_find_defs(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> 
         .get("token")
         .and_then(|v| v.as_str())
         .context("missing \"token\" field")?;
-
     with_live_db(ctx, |conn| {
-        let mut stmt = conn.prepare_cached(
-            "SELECT node_id, source_id FROM node_defs WHERE token = ?1",
-        )?;
-        let rows: Vec<serde_json::Value> = stmt
-            .query_map([token], |row| {
-                Ok(json!({
-                    "node_id": row.get::<_, String>(0)?,
-                    "source_id": row.get::<_, String>(1)?,
-                }))
-            })?
-            .collect::<Result<_, _>>()?;
-
+        let rows = query_token_in_table(conn, token, "node_defs")?;
         Ok(json!({"ok": true, "defs": rows}).to_string())
     })
 }
@@ -693,36 +733,7 @@ fn lsp_defs_query(conn: &Connection, file: &str, line: u32, col: u32) -> Result<
         Some(id) => id,
         None => return Ok(vec![]),
     };
-
-    // Check if table exists.
-    let exists: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='_lsp_defs'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(false);
-    if !exists {
-        return Ok(vec![]);
-    }
-
-    let mut stmt = conn.prepare_cached(
-        "SELECT def_uri, def_start_line, def_start_col, def_end_line, def_end_col \
-         FROM _lsp_defs WHERE node_id = ?1",
-    )?;
-    let rows: Vec<serde_json::Value> = stmt
-        .query_map([&node_id], |row| {
-            Ok(json!({
-                "uri": row.get::<_, String>(0)?,
-                "start_line": row.get::<_, i32>(1)?,
-                "start_col": row.get::<_, i32>(2)?,
-                "end_line": row.get::<_, i32>(3)?,
-                "end_col": row.get::<_, i32>(4)?,
-            }))
-        })?
-        .collect::<Result<_, _>>()?;
-
-    Ok(rows)
+    lsp_5col_position_rows(conn, &node_id, "_lsp_defs", "def")
 }
 
 /// Find references at a position. Auto-enriches if no data exists.
@@ -747,35 +758,7 @@ fn lsp_refs_query(conn: &Connection, file: &str, line: u32, col: u32) -> Result<
         Some(id) => id,
         None => return Ok(vec![]),
     };
-
-    let exists: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='_lsp_refs'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(false);
-    if !exists {
-        return Ok(vec![]);
-    }
-
-    let mut stmt = conn.prepare_cached(
-        "SELECT ref_uri, ref_start_line, ref_start_col, ref_end_line, ref_end_col \
-         FROM _lsp_refs WHERE node_id = ?1",
-    )?;
-    let rows: Vec<serde_json::Value> = stmt
-        .query_map([&node_id], |row| {
-            Ok(json!({
-                "uri": row.get::<_, String>(0)?,
-                "start_line": row.get::<_, i32>(1)?,
-                "start_col": row.get::<_, i32>(2)?,
-                "end_line": row.get::<_, i32>(3)?,
-                "end_col": row.get::<_, i32>(4)?,
-            }))
-        })?
-        .collect::<Result<_, _>>()?;
-
-    Ok(rows)
+    lsp_5col_position_rows(conn, &node_id, "_lsp_refs", "ref")
 }
 
 /// Document symbols for a file.
@@ -907,6 +890,91 @@ mod tests {
         // must be updated in lockstep.
         assert!(NODE_ID_FOR_FILE.contains("?1"));
         assert!(NODE_ID_FOR_FILE.starts_with("node_id"));
+    }
+
+    #[test]
+    fn query_token_in_table_returns_matching_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE node_refs (token TEXT, node_id TEXT, source_id TEXT);
+             INSERT INTO node_refs VALUES
+               ('foo', 'a/x', 'a.go'),
+               ('foo', 'b/y', 'b.go'),
+               ('bar', 'c/z', 'c.go');",
+        )
+        .unwrap();
+
+        let rows = query_token_in_table(&conn, "foo", "node_refs").unwrap();
+        assert_eq!(rows.len(), 2);
+        let ids: std::collections::HashSet<&str> = rows
+            .iter()
+            .map(|r| r["node_id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains("a/x"));
+        assert!(ids.contains("b/y"));
+
+        let none = query_token_in_table(&conn, "missing", "node_refs").unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn lsp_5col_position_rows_returns_empty_when_table_missing() {
+        // Pre-enrichment state: callers must get an empty vec, not an
+        // error. This is the signal that lazy enrichment should fire.
+        let conn = Connection::open_in_memory().unwrap();
+        let rows = lsp_5col_position_rows(&conn, "any/node", "_lsp_defs", "def").unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn lsp_5col_position_rows_decodes_def_shape() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _lsp_defs (
+                node_id TEXT,
+                def_uri TEXT,
+                def_start_line INTEGER,
+                def_start_col INTEGER,
+                def_end_line INTEGER,
+                def_end_col INTEGER
+             );
+             INSERT INTO _lsp_defs VALUES
+               ('foo/main', 'file:///foo.rs', 10, 4, 12, 0),
+               ('bar/baz', 'file:///bar.rs', 1, 0, 1, 8);",
+        )
+        .unwrap();
+
+        let rows = lsp_5col_position_rows(&conn, "foo/main", "_lsp_defs", "def").unwrap();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r["uri"], "file:///foo.rs");
+        assert_eq!(r["start_line"], 10);
+        assert_eq!(r["start_col"], 4);
+        assert_eq!(r["end_line"], 12);
+        assert_eq!(r["end_col"], 0);
+    }
+
+    #[test]
+    fn lsp_5col_position_rows_handles_ref_prefix() {
+        // The same helper services _lsp_refs with a different col prefix.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _lsp_refs (
+                node_id TEXT,
+                ref_uri TEXT,
+                ref_start_line INTEGER,
+                ref_start_col INTEGER,
+                ref_end_line INTEGER,
+                ref_end_col INTEGER
+             );
+             INSERT INTO _lsp_refs VALUES ('x/y', 'file:///z.rs', 5, 2, 5, 7);",
+        )
+        .unwrap();
+
+        let rows = lsp_5col_position_rows(&conn, "x/y", "_lsp_refs", "ref").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["uri"], "file:///z.rs");
+        assert_eq!(rows[0]["start_line"], 5);
     }
 
 

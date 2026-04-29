@@ -10,9 +10,7 @@ use tokio::net::UnixListener;
 use crate::daemon::events::ConnectionState;
 use crate::daemon::ops;
 use crate::daemon::DaemonContext;
-
-/// State-changing ops that should emit events after completion.
-const STATE_CHANGING_OPS: &[&str] = &["load", "reparse", "flush", "snapshot", "enrich"];
+use crate::daemon::ops::is_state_changing;
 
 /// Spawn the UDS socket listener as a background tokio task.
 ///
@@ -169,7 +167,7 @@ async fn dispatch(
     // 2. Base ops
     if let Some(response) = ops::handle_base_op(ctx, op, req) {
         // Emit event for state-changing ops.
-        if STATE_CHANGING_OPS.contains(&op) {
+        if is_state_changing(op) {
             let emitter = conn_state.emitter();
             emitter.emit(
                 &format!("daemon.{op}"),

@@ -16,6 +16,27 @@ use super::{DaemonContext, DaemonPhase};
 // Public dispatch
 // ---------------------------------------------------------------------------
 
+/// Names of ops that mutate the daemon's state and should emit a
+/// `daemon.<op>` event after completion. Lives next to the dispatch
+/// table so a new mutating op gets a one-stop checklist (add a match
+/// arm in `handle_base_op` AND list the name here).
+///
+/// Single source of truth — `daemon::socket` reads this via
+/// `is_state_changing()` rather than maintaining a parallel list.
+pub(crate) const STATE_CHANGING_OPS: &[&str] = &[
+    "load",
+    "reparse",
+    "flush",
+    "snapshot",
+    "enrich",
+];
+
+/// Whether an op name belongs to `STATE_CHANGING_OPS`. Used by the UDS
+/// dispatch loop to decide if the op deserves a follow-up event.
+pub(crate) fn is_state_changing(op: &str) -> bool {
+    STATE_CHANGING_OPS.contains(&op)
+}
+
 /// Dispatch a base op. Returns `Some(json_string)` if handled, `None` if unrecognized.
 pub fn handle_base_op(ctx: &DaemonContext, op: &str, req: &serde_json::Value) -> Option<String> {
     let result = match op {
@@ -884,6 +905,43 @@ mod tests {
         // must be updated in lockstep.
         assert!(NODE_ID_FOR_FILE.contains("?1"));
         assert!(NODE_ID_FOR_FILE.starts_with("node_id"));
+    }
+
+    #[test]
+    fn state_changing_ops_pin_known_set() {
+        // Adding a mutating op? Add it here AND to STATE_CHANGING_OPS.
+        // socket.rs reads via is_state_changing() — single source of truth.
+        let known: std::collections::HashSet<&str> = STATE_CHANGING_OPS.iter().copied().collect();
+        for op in ["load", "reparse", "flush", "snapshot", "enrich"] {
+            assert!(
+                is_state_changing(op),
+                "expected `{op}` to be state-changing",
+            );
+            assert!(known.contains(op));
+        }
+    }
+
+    #[test]
+    fn state_changing_ops_excludes_pure_reads() {
+        // The query/observation ops must NOT trigger an event emission.
+        for op in [
+            "status", "query", "list_children", "read_content",
+            "find_callers", "find_defs", "get_node",
+            "lsp_hover", "lsp_defs", "lsp_refs", "lsp_symbols", "lsp_diagnostics",
+        ] {
+            assert!(
+                !is_state_changing(op),
+                "read-only op `{op}` should not be state-changing",
+            );
+        }
+    }
+
+    #[test]
+    fn state_changing_ops_unknown_returns_false() {
+        // Defensive: an op that doesn't exist in the dispatch table must
+        // not be called state-changing (avoids spurious events).
+        assert!(!is_state_changing("nonexistent_op"));
+        assert!(!is_state_changing(""));
     }
 
     #[test]

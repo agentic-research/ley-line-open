@@ -647,7 +647,7 @@ async fn git_watch_loop(
                     // 5. Update state + emit events.
                     {
                         let mut s = ctx.state.write().unwrap();
-                        s.last_reparse_at_ms = Some(now_ms());
+                        s.last_reparse_at_ms = Some(crate::daemon::now_ms());
                         s.phase = DaemonPhase::Ready;
                     }
                     emitter.emit(
@@ -671,14 +671,6 @@ async fn git_watch_loop(
             }
         }
     }
-}
-
-/// Wall-clock millis since UNIX_EPOCH. Used for `last_*_ms` state fields.
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 /// Get the current HEAD commit hash.

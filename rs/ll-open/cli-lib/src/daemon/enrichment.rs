@@ -170,14 +170,6 @@ pub fn run_all(
     Ok(stats)
 }
 
-/// Wall-clock millis since UNIX_EPOCH.
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 /// Record a pass's success or failure into `DaemonState.enrichment[name]`.
 /// On success, captures the parse_version basis at completion. On failure,
 /// records the error message.
@@ -194,7 +186,7 @@ fn record_pass_outcome(
         Err(_) => return,
     };
     let entry = s.enrichment.entry(name.to_string()).or_insert_with(PassStatus::default);
-    entry.last_run_at_ms = Some(now_ms());
+    entry.last_run_at_ms = Some(super::now_ms());
     match outcome {
         Ok(_) => {
             entry.basis = basis;

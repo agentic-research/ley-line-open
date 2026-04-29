@@ -22,6 +22,24 @@ use std::sync::{Arc, Mutex, RwLock};
 pub use ext::{DaemonExt, NoExt};
 pub use events::EventRouter;
 
+/// Wall-clock millis since UNIX_EPOCH. Used by the daemon's `last_*_ms`
+/// state fields, embed-priority records, and pass-outcome timestamps —
+/// anywhere we need a comparable timestamp that can survive a JSON
+/// round-trip.
+///
+/// Returns 0 if the system clock is before 1970 (effectively impossible
+/// in practice; the fallback exists so callers don't have to plumb a
+/// Result through cold paths). Callers that need *monotonic* ordering
+/// should use a separate counter — wall-clock is wrong for ordering
+/// across NTP steps. See `daemon::embed::next_priority` for the
+/// monotonic-counter pattern.
+pub(crate) fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// Lifecycle phase of the daemon.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DaemonPhase {
@@ -114,3 +132,32 @@ pub struct DaemonContext {
     #[cfg(feature = "vec")]
     pub embed_queue: Arc<Mutex<BinaryHeap<embed::EmbedTask>>>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn now_ms_is_positive_after_unix_epoch() {
+        // We are well past 1970 — now_ms() should always be a large
+        // positive number. The unwrap_or(0) fallback only fires if
+        // SystemTime::now() is *before* UNIX_EPOCH (impossible
+        // outside a deliberately tampered system clock).
+        let t = now_ms();
+        assert!(t > 1_700_000_000_000, "now_ms should be > 2023, got {t}");
+    }
+
+    #[test]
+    fn now_ms_is_monotonic_within_a_call_burst() {
+        // Wall-clock isnt strictly monotonic across NTP steps, but two
+        // calls in immediate succession on the same thread should not
+        // observe a backwards step. If this test ever flakes it is
+        // either an NTP step in the middle of CI (rare) or a serious
+        // platform issue.
+        let a = now_ms();
+        let b = now_ms();
+        let c = now_ms();
+        assert!(a <= b && b <= c, "now_ms went backwards: {a} {b} {c}");
+    }
+}
+

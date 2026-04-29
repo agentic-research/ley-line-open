@@ -336,7 +336,7 @@ fn op_reparse(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
     {
         let mut s = ctx.state.write().unwrap();
         s.phase = DaemonPhase::Ready;
-        s.last_reparse_at_ms = Some(now_ms());
+        s.last_reparse_at_ms = Some(super::now_ms());
     }
 
     let ctrl = Controller::open_or_create(&ctx.ctrl_path).context("open controller")?;
@@ -352,12 +352,6 @@ fn op_reparse(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
     .to_string())
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
 
 fn op_enrich(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
     let pass_name = req

@@ -163,13 +163,29 @@ impl PartialOrd for EmbedTask {
 /// Type alias for the shared embed-task queue stored on `DaemonContext`.
 pub type EmbedQueue = Arc<Mutex<BinaryHeap<EmbedTask>>>;
 
+/// Monotonic counter for embed-task priorities.
+///
+/// Earlier revisions used wall-clock micros, but NTP steps (or DST jumps,
+/// or the user moving the laptop's clock) could reorder tasks
+/// unpredictably. A monotonic counter guarantees promotion ordering is
+/// strictly newest-first regardless of wall-clock skew. The counter is
+/// process-local; restarts reset to zero, which is fine because the
+/// queue itself doesn't survive restart.
+static EMBED_PRIORITY_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Allocate the next priority value. Strictly increasing across the
+/// process lifetime; safe to call from any thread.
+fn next_priority() -> u64 {
+    // Relaxed is fine — we only need monotonicity within a single
+    // process, not synchronization with anything else.
+    EMBED_PRIORITY_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Promote `node_id` to the front of the embed queue. Called from query ops
 /// when a node is touched, so its embedding gets refreshed soon.
 pub fn promote(queue: &EmbedQueue, node_id: &str) {
-    let priority = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() as u64)
-        .unwrap_or(0);
+    let priority = next_priority();
     if let Ok(mut q) = queue.lock() {
         q.push(EmbedTask {
             priority,
@@ -260,6 +276,86 @@ pub fn start_drain(ctx: Arc<DaemonContext>) {
 mod tests {
     use super::*;
     use crate::daemon::vec_index::register_vec;
+
+    // ── Priority counter invariants ────────────────────────────────────
+    //
+    // These tests establish that promote() ordering is wall-clock-independent
+    // (monotonic counter, not SystemTime). The previous implementation could
+    // reorder tasks under NTP step / DST jump / user clock change.
+
+    #[test]
+    fn next_priority_is_strictly_monotonic() {
+        let a = next_priority();
+        let b = next_priority();
+        let c = next_priority();
+        assert!(a < b, "next_priority must be strictly increasing: {a} < {b}");
+        assert!(b < c, "next_priority must be strictly increasing: {b} < {c}");
+    }
+
+    #[test]
+    fn promote_orders_newer_first_in_queue() {
+        let queue: EmbedQueue = Arc::new(Mutex::new(BinaryHeap::new()));
+        promote(&queue, "first");
+        promote(&queue, "second");
+        promote(&queue, "third");
+
+        // BinaryHeap is max-heap on priority; later promotions get higher
+        // priority numbers, so they pop out first.
+        let mut q = queue.lock().unwrap();
+        assert_eq!(q.pop().map(|t| t.node_id), Some("third".to_string()));
+        assert_eq!(q.pop().map(|t| t.node_id), Some("second".to_string()));
+        assert_eq!(q.pop().map(|t| t.node_id), Some("first".to_string()));
+    }
+
+    #[test]
+    fn promote_concurrent_does_not_collide() {
+        // Spawn 4 threads, each promoting 100 ids. All 400 priorities must
+        // be unique — a guarantee the previous wall-clock impl could not
+        // make if two threads called within the same microsecond.
+        let queue: EmbedQueue = Arc::new(Mutex::new(BinaryHeap::new()));
+        let mut handles = vec![];
+        for t in 0..4 {
+            let q = queue.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..100 {
+                    promote(&q, &format!("t{t}-{i}"));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let q = queue.lock().unwrap();
+        let priorities: std::collections::HashSet<u64> =
+            q.iter().map(|t| t.priority).collect();
+        assert_eq!(
+            priorities.len(),
+            q.len(),
+            "all 400 priorities should be unique under contention",
+        );
+    }
+
+    #[test]
+    fn embed_task_ordering_matches_priority() {
+        // Direct test of the Ord impl: the heap is keyed on priority, with
+        // node_id as tie-breaker. Two tasks with identical priorities must
+        // never compare Equal — that would let one shadow the other in
+        // BinaryHeap. Since promote() always allocates a fresh priority,
+        // the tie-break path is only exercised by direct construction
+        // (tests / edge cases).
+        let a = EmbedTask { priority: 5, node_id: "a".into() };
+        let b = EmbedTask { priority: 5, node_id: "b".into() };
+        assert!(a < b, "tie-broken on node_id ascending");
+
+        let high = EmbedTask { priority: 10, node_id: "z".into() };
+        let low  = EmbedTask { priority: 1,  node_id: "a".into() };
+        assert!(low < high, "lower priority compares less");
+
+        let mut heap: BinaryHeap<EmbedTask> = BinaryHeap::new();
+        heap.push(low);
+        heap.push(high);
+        assert_eq!(heap.pop().unwrap().node_id, "z", "max-heap pops highest");
+    }
 
     /// Set up a minimal living-db with a couple of file nodes, then run
     /// EmbeddingPass with the default ZeroEmbedder. Verify the index has

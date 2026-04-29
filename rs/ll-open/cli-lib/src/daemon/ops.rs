@@ -53,6 +53,25 @@ pub fn handle_base_op(ctx: &DaemonContext, op: &str, req: &serde_json::Value) ->
 // Living db access
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Small shared helpers — keep these one-liner-trivial so callers stay readable.
+// ---------------------------------------------------------------------------
+
+/// SQL fragment for "the row's `node_id` belongs to file ?1". Use as the WHERE
+/// clause of any per-file `_lsp` query. Bind the file path as the first param.
+///
+/// Convention: node ids look like `"<file>/<ast-path>"`, so the LIKE prefix
+/// scopes a query to all nodes in a single file.
+const NODE_ID_FOR_FILE: &str = "node_id LIKE ?1 || '%'";
+
+/// Strip a leading `file://` from an LSP-style URI. Returns the input
+/// unchanged if no prefix is present. Centralized so the rule for what
+/// counts as "the file path" stays in one spot.
+#[inline]
+fn normalize_file_uri(s: &str) -> &str {
+    s.strip_prefix("file://").unwrap_or(s)
+}
+
 /// Promote one or more node ids to the embed queue (no-op without `vec`).
 ///
 /// Called from query ops so the touched nodes' embeddings get refreshed soon
@@ -529,9 +548,7 @@ fn parse_position(req: &serde_json::Value) -> Result<(String, u32, u32)> {
         .get("file")
         .and_then(|v| v.as_str())
         .context("missing \"file\" field")?;
-    // Strip file:// prefix if present.
-    let file = file.strip_prefix("file://").unwrap_or(file);
-    let file = file.to_string();
+    let file = normalize_file_uri(file).to_string();
 
     let line = req
         .get("line")
@@ -564,7 +581,7 @@ fn maybe_enrich(ctx: &DaemonContext, conn: &Connection, file: &str) -> bool {
     // Check if this file has any _lsp rows.
     let has_data: bool = conn
         .query_row(
-            "SELECT COUNT(*) > 0 FROM _lsp WHERE node_id LIKE ?1 || '%'",
+            &format!("SELECT COUNT(*) > 0 FROM _lsp WHERE {NODE_ID_FOR_FILE}"),
             [file],
             |r| r.get(0),
         )
@@ -767,12 +784,14 @@ fn op_lsp_symbols(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String
         .get("file")
         .and_then(|v| v.as_str())
         .context("missing \"file\" field")?;
-    let file = file.strip_prefix("file://").unwrap_or(file);
+    let file = normalize_file_uri(file);
 
     with_live_db(ctx, |conn| {
         let mut stmt = conn.prepare_cached(
-            "SELECT node_id, symbol_kind, detail, start_line, start_col, end_line, end_col \
-             FROM _lsp WHERE node_id LIKE ?1 || '%'",
+            &format!(
+                "SELECT node_id, symbol_kind, detail, start_line, start_col, end_line, end_col \
+                 FROM _lsp WHERE {NODE_ID_FOR_FILE}"
+            ),
         )?;
         let rows: Vec<serde_json::Value> = stmt
             .query_map([file], |row| {
@@ -798,12 +817,15 @@ fn op_lsp_diagnostics(ctx: &DaemonContext, req: &serde_json::Value) -> Result<St
         .get("file")
         .and_then(|v| v.as_str())
         .context("missing \"file\" field")?;
-    let file = file.strip_prefix("file://").unwrap_or(file);
+    let file = normalize_file_uri(file);
 
     with_live_db(ctx, |conn| {
         let mut stmt = conn.prepare_cached(
-            "SELECT node_id, diagnostics, start_line, start_col, end_line, end_col \
-             FROM _lsp WHERE node_id LIKE ?1 || '%' AND diagnostics IS NOT NULL AND diagnostics != ''",
+            &format!(
+                "SELECT node_id, diagnostics, start_line, start_col, end_line, end_col \
+                 FROM _lsp WHERE {NODE_ID_FOR_FILE} \
+                 AND diagnostics IS NOT NULL AND diagnostics != ''"
+            ),
         )?;
         let rows: Vec<serde_json::Value> = stmt
             .query_map([file], |row| {
@@ -855,6 +877,38 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex, RwLock};
     use tempfile::TempDir;
+
+    // ── Helper unit tests ───────────────────────────────────────────────
+
+    #[test]
+    fn normalize_file_uri_strips_prefix() {
+        assert_eq!(normalize_file_uri("file:///abs/foo.rs"), "/abs/foo.rs");
+    }
+
+    #[test]
+    fn normalize_file_uri_passes_through_plain_path() {
+        // Already-relative paths and bare paths come through untouched.
+        assert_eq!(normalize_file_uri("src/foo.rs"), "src/foo.rs");
+        assert_eq!(normalize_file_uri("/abs/foo.rs"), "/abs/foo.rs");
+        assert_eq!(normalize_file_uri(""), "");
+    }
+
+    #[test]
+    fn normalize_file_uri_only_strips_one_prefix() {
+        // Defensive: avoid eating extra slashes if the caller has already
+        // stripped once. The strip is exact, not greedy.
+        assert_eq!(normalize_file_uri("file://file:///x"), "file:///x");
+    }
+
+    #[test]
+    fn node_id_for_file_clause_shape() {
+        // Sanity-check the SQL fragment hasn't drifted from the bind index.
+        // If this fragment ever needs ?2 or a different column the call sites
+        // must be updated in lockstep.
+        assert!(NODE_ID_FOR_FILE.contains("?1"));
+        assert!(NODE_ID_FOR_FILE.starts_with("node_id"));
+    }
+
 
     fn setup() -> (TempDir, DaemonContext) {
         let dir = TempDir::new().unwrap();

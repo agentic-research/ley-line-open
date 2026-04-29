@@ -382,15 +382,24 @@ const SUBSCRIBER_CHANNEL_BUFFER: usize = 1024;
 /// Pull a JSON string-array field out of a request, returning a fresh
 /// `Vec<String>`. Missing field, wrong type, or non-string members all
 /// silently fall back to `vec![]` — handlers check for empty themselves.
-fn json_string_array(req: &serde_json::Value, key: &str) -> Vec<String> {
-    req.get(key)
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
+pub(crate) fn json_string_array(req: &serde_json::Value, key: &str) -> Vec<String> {
+    json_string_array_opt(req, key).unwrap_or_default()
+}
+
+/// Variant of `json_string_array` that preserves the missing/empty
+/// distinction. Returns `None` only when the field is absent or not an
+/// array; non-string members of an array are filtered (matching the
+/// non-opt variant). Use when callers need to differentiate "no scope
+/// supplied" from "scope is the empty list".
+pub(crate) fn json_string_array_opt(
+    req: &serde_json::Value,
+    key: &str,
+) -> Option<Vec<String>> {
+    req.get(key).and_then(|v| v.as_array()).map(|a| {
+        a.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
+    })
 }
 
 /// Per-connection state for the UDS socket.
@@ -563,6 +572,58 @@ mod tests {
 
         let v = serde_json::json!({"topics": 42});
         assert!(json_string_array(&v, "topics").is_empty());
+    }
+
+    #[test]
+    fn json_string_array_opt_preserves_empty_vs_missing_distinction() {
+        // The opt variant is for callers (op_reparse, op_enrich) that
+        // need to distinguish "no scope supplied" (parse everything)
+        // from "scope is empty" (parse nothing). The non-opt variant
+        // collapses both into an empty Vec.
+        let missing = serde_json::json!({});
+        assert_eq!(json_string_array_opt(&missing, "files"), None);
+
+        let empty_array = serde_json::json!({"files": []});
+        assert_eq!(json_string_array_opt(&empty_array, "files"), Some(vec![]));
+
+        let some = serde_json::json!({"files": ["a.go", "b.go"]});
+        assert_eq!(
+            json_string_array_opt(&some, "files"),
+            Some(vec!["a.go".into(), "b.go".into()]),
+        );
+    }
+
+    #[test]
+    fn json_string_array_opt_returns_none_on_wrong_type() {
+        // Same fallback as the non-opt variant for non-array values:
+        // not an array → None (treat as "field unset"). Callers must
+        // not see a partial Some([]) for malformed input.
+        for bad in [
+            serde_json::json!({"files": "not an array"}),
+            serde_json::json!({"files": 42}),
+            serde_json::json!({"files": null}),
+            serde_json::json!({"files": {"a": 1}}),
+        ] {
+            assert_eq!(
+                json_string_array_opt(&bad, "files"),
+                None,
+                "expected None for {bad}",
+            );
+        }
+    }
+
+    #[test]
+    fn json_string_array_opt_filters_non_string_members() {
+        // Same member-level filtering as non-opt: arrays containing
+        // non-strings keep only the strings. The contract for what
+        // counts as "a string-array field" must agree across both
+        // variants — otherwise a caller switching from one to the
+        // other would silently change behavior.
+        let v = serde_json::json!({"files": ["x.go", 1, null, "y.go", true]});
+        assert_eq!(
+            json_string_array_opt(&v, "files"),
+            Some(vec!["x.go".into(), "y.go".into()]),
+        );
     }
 
     #[test]

@@ -10,6 +10,7 @@ use leyline_core::Controller;
 use rusqlite::Connection;
 use serde_json::json;
 
+use super::events::json_string_array_opt;
 use super::{DaemonContext, DaemonPhase};
 
 // ---------------------------------------------------------------------------
@@ -315,10 +316,7 @@ fn op_reparse(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
         .or(ctx.lang_filter.as_deref());
 
     // Explicit `files: [...]` always takes precedence as the scope.
-    let mut explicit_files: Option<Vec<String>> = req
-        .get("files")
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+    let mut explicit_files: Option<Vec<String>> = json_string_array_opt(req, "files");
 
     // If the caller passed a single-file `source`, reinterpret as parent +
     // scope so we satisfy parse_into_conn's directory invariant. This lets
@@ -415,10 +413,7 @@ fn op_reparse(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
 
 fn op_enrich(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
     let pass_name = required_str_field(req, "pass")?;
-    let files: Option<Vec<String>> = req
-        .get("files")
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+    let files: Option<Vec<String>> = json_string_array_opt(req, "files");
 
     let source_dir = ctx
         .source_dir

@@ -500,8 +500,6 @@ fn test_edition_is_open() {
 #[tokio::test]
 async fn test_daemon_socket_status_op() {
     use std::sync::Arc;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
 
     let dir = TempDir::new().unwrap();
     let (_arena, ctrl_path) = fresh_arena(dir.path());
@@ -510,17 +508,7 @@ async fn test_daemon_socket_status_op() {
     let sock_path = dir.path().join("test.sock");
     spawn_test_socket(ctx, sock_path.clone()).await;
 
-    let stream = UnixStream::connect(&sock_path).await.expect("connect to socket");
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
-
-    writer
-        .write_all(b"{\"op\":\"status\"}\n")
-        .await
-        .expect("write status op");
-
-    let response = lines.next_line().await.unwrap().expect("read response");
-    let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+    let parsed = uds_round_trip(&sock_path, r#"{"op":"status"}"#).await;
     assert_eq!(parsed["ok"], true);
     assert_eq!(parsed["generation"], 0);
 }
@@ -1513,10 +1501,7 @@ async fn test_op_vec_search_round_trip() {
     use leyline_cli_lib::daemon::DaemonContext;
     use leyline_cli_lib::daemon::embed::{Embedder, ZeroEmbedder};
     use leyline_cli_lib::daemon::vec_index::{register_vec, VectorIndex};
-    
     use std::sync::Arc;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
 
     register_vec();
 
@@ -1542,16 +1527,11 @@ async fn test_op_vec_search_round_trip() {
     let sock_path = dir.path().join("vec_search.sock");
     spawn_test_socket(ctx, sock_path.clone()).await;
 
-    let stream = UnixStream::connect(&sock_path).await.expect("connect");
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
-    writer
-        .write_all(b"{\"op\":\"vec_search\",\"query\":\"hello\",\"k\":3}\n")
-        .await
-        .unwrap();
-
-    let response = lines.next_line().await.unwrap().expect("response");
-    let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+    let parsed = uds_round_trip(
+        &sock_path,
+        r#"{"op":"vec_search","query":"hello","k":3}"#,
+    )
+    .await;
 
     assert_eq!(parsed["ok"], true);
     let results = parsed["results"].as_array().expect("results array");
@@ -1581,10 +1561,7 @@ async fn test_status_reports_phase_and_enrichment() {
     use leyline_cli_lib::daemon::{
         DaemonContext, DaemonPhase, DaemonState, PassStatus,
     };
-    
     use std::sync::{Arc, RwLock};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
 
     let dir = TempDir::new().unwrap();
     let (_arena, ctrl_path) = fresh_arena(dir.path());
@@ -1611,13 +1588,7 @@ async fn test_status_reports_phase_and_enrichment() {
     let sock_path = dir.path().join("status_phase.sock");
     spawn_test_socket(ctx, sock_path.clone()).await;
 
-    let stream = UnixStream::connect(&sock_path).await.expect("connect");
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
-    writer.write_all(b"{\"op\":\"status\"}\n").await.unwrap();
-
-    let response = lines.next_line().await.unwrap().expect("response");
-    let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+    let parsed = uds_round_trip(&sock_path, r#"{"op":"status"}"#).await;
 
     assert_eq!(parsed["ok"], true);
     assert_eq!(parsed["phase"], "ready");
@@ -2026,10 +1997,7 @@ async fn test_op_vec_search_dim_mismatch_returns_clean_error() {
     use leyline_cli_lib::daemon::embed::{Embedder, ZeroEmbedder};
     use leyline_cli_lib::daemon::vec_index::{register_vec, VectorIndex};
     use leyline_cli_lib::daemon::DaemonContext;
-    
     use std::sync::{Arc, Mutex};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
 
     register_vec();
 
@@ -2051,15 +2019,11 @@ async fn test_op_vec_search_dim_mismatch_returns_clean_error() {
     let sock_path = dir.path().join("vec_dim_mismatch.sock");
     spawn_test_socket(ctx, sock_path.clone()).await;
 
-    let stream = UnixStream::connect(&sock_path).await.unwrap();
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
-    writer
-        .write_all(b"{\"op\":\"vec_search\",\"query\":\"hello\",\"k\":3}\n")
-        .await
-        .unwrap();
-    let resp = lines.next_line().await.unwrap().expect("response");
-    let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let parsed = uds_round_trip(
+        &sock_path,
+        r#"{"op":"vec_search","query":"hello","k":3}"#,
+    )
+    .await;
 
     assert_eq!(parsed["ok"], false, "dim mismatch must surface as ok:false: {parsed}");
     let err = parsed["error"].as_str().unwrap_or("");

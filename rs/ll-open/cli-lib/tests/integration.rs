@@ -2113,6 +2113,75 @@ async fn test_op_query_destructive_runs_today_pin_for_6213d4() {
     assert!(table_gone, "DROP TABLE actually executed");
 }
 
+/// `vec_search` with a dim-mismatched embedder must surface a clean error,
+/// not panic. This can happen if a private extension swaps in a different
+/// embedder after the VectorIndex was already created (cmd_daemon sizes
+/// the index from the embedder at startup, but the trait API allows later
+/// substitution by tests / experiments / hot-reload).
+///
+/// Bead: ley-line-open-5f7100-12 (item #6 — vec_search dim mismatch).
+#[cfg(feature = "vec")]
+#[tokio::test]
+async fn test_op_vec_search_dim_mismatch_returns_clean_error() {
+    use leyline_cli_lib::daemon::embed::{Embedder, ZeroEmbedder};
+    use leyline_cli_lib::daemon::vec_index::{register_vec, VectorIndex};
+    use leyline_cli_lib::daemon::{DaemonContext, DaemonState, EventRouter, NoExt};
+    use leyline_core::{Controller, create_arena};
+    use std::sync::{Arc, Mutex, RwLock};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    register_vec();
+
+    let dir = TempDir::new().unwrap();
+    let arena_path = dir.path().join("test.arena");
+    let ctrl_path = dir.path().join("test.ctrl");
+    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
+    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0).unwrap();
+    drop(ctrl);
+
+    // Mismatch on purpose: 4-dim index, 8-dim embedder. The query vector
+    // will be 8-dim, but the index will refuse anything that isn't 4-dim.
+    let index = Arc::new(VectorIndex::new(4, None).unwrap());
+    let embedder: Arc<dyn Embedder> = Arc::new(ZeroEmbedder { dim: 8 });
+
+    let ctx = Arc::new(DaemonContext {
+        ctrl_path,
+        ext: Arc::new(NoExt),
+        router: EventRouter::new(16),
+        live_db: Mutex::new(rusqlite::Connection::open_in_memory().unwrap()),
+        source_dir: None,
+        lang_filter: None,
+        enrichment_passes: vec![],
+        state: Arc::new(RwLock::new(DaemonState::initializing())),
+        vec_index: index,
+        embedder,
+        embed_queue: Arc::new(Mutex::new(std::collections::BinaryHeap::new())),
+    });
+
+    let sock_path = dir.path().join("vec_dim_mismatch.sock");
+    leyline_cli_lib::daemon::socket::spawn(ctx, sock_path.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let stream = UnixStream::connect(&sock_path).await.unwrap();
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+    writer
+        .write_all(b"{\"op\":\"vec_search\",\"query\":\"hello\",\"k\":3}\n")
+        .await
+        .unwrap();
+    let resp = lines.next_line().await.unwrap().expect("response");
+    let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+
+    assert_eq!(parsed["ok"], false, "dim mismatch must surface as ok:false: {parsed}");
+    let err = parsed["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("dim") || err.contains("expected") || err.contains("4"),
+        "error should describe the dim mismatch; got: {err:?}",
+    );
+}
+
 /// Concurrent UDS load: spin up the daemon socket, hit it with N parallel
 /// clients each issuing a mix of `status` + `query` ops, assert all complete
 /// in bounded time and every response is well-formed.

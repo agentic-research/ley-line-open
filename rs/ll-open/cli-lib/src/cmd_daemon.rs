@@ -661,6 +661,69 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use tempfile::TempDir;
 
+    // ── try_warm_start: error-handling pins ────────────────────────────
+    //
+    // Today the function returns Ok(None) on every error path, silently
+    // falling through to cold start. ley-line-open-5f7100-6 plans to
+    // replace the silent swallow with a log::warn (or surface the error).
+    // These tests pin the *current* behavior so the fix lands as an
+    // intentional, visible change.
+
+    #[test]
+    fn warm_start_returns_none_on_missing_ctrl() {
+        let dir = TempDir::new().unwrap();
+        let ctrl = dir.path().join("nonexistent.ctrl");
+        // No file exists yet — Controller::open_or_create will create one,
+        // but it'll be empty (no arena_path). Should fall through cleanly.
+        let result = try_warm_start(&ctrl).unwrap();
+        assert!(result.is_none(), "missing-ctrl path should return None");
+    }
+
+    #[test]
+    fn warm_start_returns_none_on_corrupted_ctrl() {
+        // Pin for ley-line-open-5f7100-6: when the controller file is
+        // present but corrupt, today's code silently cold-starts. Test
+        // asserts that fact so the fix (log::warn or harder failure) is
+        // a visible behavior change.
+        let dir = TempDir::new().unwrap();
+        let ctrl = dir.path().join("corrupt.ctrl");
+        std::fs::write(&ctrl, b"\x00\x01\x02 not a valid controller \xff\xfe").unwrap();
+
+        // Whether Controller::open_or_create accepts or rejects garbage is
+        // an implementation detail of leyline_core. The contract we lock
+        // in here: try_warm_start MUST NOT panic and MUST return None
+        // (today's silent-cold-start behavior). When 5f7100-6 lands, this
+        // test will need updating to assert the new visibility behavior
+        // (e.g. a log capture, or a Result::Err return).
+        let result = try_warm_start(&ctrl);
+        match result {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("garbage ctrl should not produce a usable connection"),
+            Err(e) => {
+                // After 5f7100-6 lands, this Err branch may become the
+                // expected outcome. Today it usually means leyline_core
+                // surfaced the corruption — also acceptable.
+                eprintln!("warm_start surfaced error (acceptable): {e:#}");
+            }
+        }
+    }
+
+    #[test]
+    fn warm_start_returns_none_on_missing_arena_file() {
+        // ctrl exists and is valid, but the arena_path it points at does
+        // not exist on disk. Should fall through to cold start (today
+        // silently — pin for 5f7100-6).
+        let dir = TempDir::new().unwrap();
+        let ctrl = dir.path().join("orphan.ctrl");
+        let mut c = leyline_core::Controller::open_or_create(&ctrl).unwrap();
+        c.set_arena("/tmp/cloister-no-such-arena-xyzzy", 1024 * 1024, 0)
+            .unwrap();
+        drop(c);
+
+        let result = try_warm_start(&ctrl).unwrap();
+        assert!(result.is_none(), "missing-arena path should return None");
+    }
+
     /// DaemonExt that records every VCS hook invocation.
     struct RecordingExt {
         head_changes: StdMutex<Vec<(String, String)>>,

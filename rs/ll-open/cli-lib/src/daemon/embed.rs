@@ -163,6 +163,17 @@ impl PartialOrd for EmbedTask {
 /// Type alias for the shared embed-task queue stored on `DaemonContext`.
 pub type EmbedQueue = Arc<Mutex<BinaryHeap<EmbedTask>>>;
 
+/// How often the background drainer wakes up to process queued embed
+/// tasks. 1s is a balance between freshness (re-embedding accessed nodes
+/// soon after the access) and amortizing the per-tick mutex traffic.
+const EMBED_DRAIN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Maximum number of tasks pulled from the queue per drain tick. Keeps a
+/// long backlog from monopolizing one tick while still amortizing the
+/// per-tick overhead. With `EMBED_DRAIN_INTERVAL = 1s` the steady-state
+/// max throughput is `EMBED_DRAIN_BATCH` embeddings/sec.
+const EMBED_DRAIN_BATCH: usize = 32;
+
 /// Monotonic counter for embed-task priorities.
 ///
 /// Earlier revisions used wall-clock micros, but NTP steps (or DST jumps,
@@ -200,7 +211,7 @@ pub fn promote(queue: &EmbedQueue, node_id: &str) {
 /// `daemon.embed.complete` after each non-empty batch.
 pub fn start_drain(ctx: Arc<DaemonContext>) {
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let mut tick = tokio::time::interval(EMBED_DRAIN_INTERVAL);
         // Don't burst on catch-up — we'd rather smoothly drain than spike.
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let emitter = ctx.router.emitter();
@@ -211,8 +222,8 @@ pub fn start_drain(ctx: Arc<DaemonContext>) {
                     Ok(g) => g,
                     Err(_) => continue,
                 };
-                let mut out = Vec::with_capacity(32);
-                for _ in 0..32 {
+                let mut out = Vec::with_capacity(EMBED_DRAIN_BATCH);
+                for _ in 0..EMBED_DRAIN_BATCH {
                     match q.pop() {
                         Some(t) => out.push(t),
                         None => break,

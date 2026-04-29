@@ -18,6 +18,64 @@ use crate::daemon::{
     DaemonContext, DaemonExt, DaemonPhase, DaemonState, EventRouter, NoExt,
 };
 
+// ---------------------------------------------------------------------------
+// Tuning constants — extracted from the daemon orchestration so each magic
+// value has one named, documented home. Resist inlining literals; if you
+// need a different value at runtime, plumb a CLI flag instead.
+// ---------------------------------------------------------------------------
+
+/// Capacity of the in-memory event log behind `EventRouter`. Each emit
+/// either delivers to a subscriber or lands in the log; old entries roll
+/// off when the log fills. 10k is enough headroom for a session of busy
+/// edits + reparses without losing recent history.
+const EVENT_LOG_CAPACITY: usize = 10_000;
+
+/// Default embedding dimension when no `DaemonExt::embedder()` is
+/// provided. Matches MiniLM-L6-v2 / many small open models. Extensions
+/// that ship a different model override this implicitly via
+/// `Embedder::dimensions()`.
+#[cfg(feature = "vec")]
+const DEFAULT_EMBEDDING_DIM: usize = 384;
+
+/// How often the periodic snapshot timer fires. Each tick takes the live
+/// db lock, serializes, and writes to the arena. 500ms is the
+/// crash-recovery window: at most this much data is lost if the process
+/// dies between snapshots.
+const SNAPSHOT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How often `git_watch_loop` polls `git status` / `rev-parse HEAD`.
+/// 2s is the change-detection window — files edited since the last tick
+/// won't be reparsed until the next one.
+const GIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// When the live db outgrows the arena, auto-resize to `db_bytes *
+/// ARENA_GROWTH_FACTOR + ARENA_HEADROOM_BYTES` so the next few
+/// snapshots don't trigger another resize. Factor must be ≥2 (each
+/// arena holds two buffers — one active, one inactive).
+const ARENA_GROWTH_FACTOR: u64 = 2;
+
+/// Slack added on top of `db_bytes * ARENA_GROWTH_FACTOR` during arena
+/// auto-resize, so a slowly growing db doesn't churn through resizes.
+const ARENA_HEADROOM_BYTES: u64 = 1024 * 1024; // 1 MiB
+
+// Compile-time invariants on the tuning constants. Each fails the build
+// if a future edit violates the documented constraint — cheaper than a
+// runtime test and impossible to skip in CI.
+//
+// (Clippy correctly notes that runtime assertions on these would be
+// constant-folded; const _ asserts are the idiomatic Rust answer.)
+const _: () = assert!(
+    ARENA_GROWTH_FACTOR >= 2,
+    "arena holds 2 buffers (active + inactive); growth factor < 2 \
+     can't fit both copies after a resize",
+);
+const _: () = assert!(
+    SNAPSHOT_INTERVAL.as_millis() < GIT_POLL_INTERVAL.as_millis(),
+    "crash-recovery window (SNAPSHOT_INTERVAL) must be shorter than the \
+     watcher's reparse cadence (GIT_POLL_INTERVAL) so dirty edits get \
+     snapshotted before the next watcher tick captures more",
+);
+
 /// Open edition entry point — runs the daemon with no private extensions.
 #[allow(clippy::too_many_arguments)]
 pub async fn cmd_daemon(
@@ -108,7 +166,7 @@ pub async fn run_daemon(
     }
 
     // 4. Event router.
-    let router = EventRouter::new(10_000);
+    let router = EventRouter::new(EVENT_LOG_CAPACITY);
 
     // 5. Extension init.
     ext.on_init(router.emitter());
@@ -119,7 +177,9 @@ pub async fn run_daemon(
     #[cfg(feature = "vec")]
     let embedder: Arc<dyn crate::daemon::embed::Embedder> = ext
         .embedder()
-        .unwrap_or_else(|| Arc::new(crate::daemon::embed::ZeroEmbedder { dim: 384 }));
+        .unwrap_or_else(|| Arc::new(crate::daemon::embed::ZeroEmbedder {
+            dim: DEFAULT_EMBEDDING_DIM,
+        }));
     #[cfg(feature = "vec")]
     let vec_index = {
         crate::daemon::vec_index::register_vec();
@@ -280,8 +340,8 @@ pub async fn run_daemon(
         let snap_ctrl = ctrl_path.clone();
         let emitter = router.emitter();
         tokio::spawn(async move {
-            use tokio::time::{interval, Duration};
-            let mut tick = interval(Duration::from_millis(500));
+            use tokio::time::interval;
+            let mut tick = interval(SNAPSHOT_INTERVAL);
             loop {
                 tick.tick().await;
                 let guard = snap_ctx.live_db.lock().unwrap();
@@ -437,7 +497,9 @@ pub fn snapshot_to_arena(
     let arena_path = ctrl.arena_path();
     let arena_size = ctrl.arena_size();
 
-    let min_arena = leyline_core::ArenaHeader::HEADER_SIZE + db_bytes.len() as u64 * 2 + (1024 * 1024);
+    let min_arena = leyline_core::ArenaHeader::HEADER_SIZE
+        + db_bytes.len() as u64 * ARENA_GROWTH_FACTOR
+        + ARENA_HEADROOM_BYTES;
     let arena_size = if min_arena > arena_size {
         eprintln!(
             "auto-sizing arena: {}MB → {}MB (db is {}MB)",
@@ -491,13 +553,16 @@ async fn git_watch_loop(
     emitter: crate::daemon::events::EventEmitter,
 ) {
     use std::collections::HashSet;
-    use tokio::time::{interval, Duration};
+    use tokio::time::interval;
 
-    let mut tick = interval(Duration::from_secs(2));
+    let mut tick = interval(GIT_POLL_INTERVAL);
     let mut last_dirty: HashSet<String> = HashSet::new();
     let mut last_head: String = git_head(source_dir).unwrap_or_default();
 
-    eprintln!("git watcher started (polling every 2s)");
+    eprintln!(
+        "git watcher started (polling every {}s)",
+        GIT_POLL_INTERVAL.as_secs(),
+    );
 
     loop {
         tick.tick().await;

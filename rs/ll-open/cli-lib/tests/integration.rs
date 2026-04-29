@@ -1924,6 +1924,195 @@ async fn test_op_reparse_accepts_files_scope_with_dir_source() {
     assert_eq!(changed, vec!["b.go"]);
 }
 
+/// `op_reparse` against a source path that doesn't exist on disk should
+/// return a clean JSON-RPC-shaped error (`ok: false`, error message
+/// present), AND the daemon's phase machine should land in `Error(...)`
+/// with the failure visible via `op_status`. This locks in the
+/// observability contract so a future regression that swallows the error
+/// or leaves phase stuck at `Parsing` is caught.
+///
+/// First test from `5f7100-12: edge-case test sweep` — covers:
+///   - op_reparse with a nonexistent source path
+///   - error response shape
+///   - phase persists as Error in the next status call
+///   - subsequent successful reparse resets phase to Ready (recovery)
+#[tokio::test]
+async fn test_op_reparse_nonexistent_source_sets_error_phase_and_recovers() {
+    use leyline_cli_lib::daemon::{DaemonContext, DaemonState, EventRouter, NoExt};
+    use leyline_core::{Controller, create_arena};
+    use std::sync::{Arc, Mutex, RwLock};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let dir = TempDir::new().unwrap();
+    let arena_path = dir.path().join("test.arena");
+    let ctrl_path = dir.path().join("test.ctrl");
+    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
+    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0).unwrap();
+    drop(ctrl);
+
+    let ctx = Arc::new(DaemonContext {
+        ctrl_path,
+        ext: Arc::new(NoExt),
+        router: EventRouter::new(16),
+        live_db: Mutex::new(rusqlite::Connection::open_in_memory().unwrap()),
+        source_dir: None,
+        lang_filter: None,
+        enrichment_passes: vec![],
+        state: Arc::new(RwLock::new(DaemonState::initializing())),
+        #[cfg(feature = "vec")]
+        vec_index: {
+            leyline_cli_lib::daemon::vec_index::register_vec();
+            Arc::new(leyline_cli_lib::daemon::vec_index::VectorIndex::new(4, None).unwrap())
+        },
+        #[cfg(feature = "vec")]
+        embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
+        #[cfg(feature = "vec")]
+        embed_queue: Arc::new(Mutex::new(std::collections::BinaryHeap::new())),
+    });
+
+    let sock_path = dir.path().join("reparse-bad.sock");
+    leyline_cli_lib::daemon::socket::spawn(ctx, sock_path.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Helper: send a JSON op + receive one line, parse.
+    async fn round_trip(
+        sock: &std::path::Path,
+        body: serde_json::Value,
+    ) -> serde_json::Value {
+        let stream = UnixStream::connect(sock).await.expect("connect");
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        writer.write_all(format!("{body}\n").as_bytes()).await.unwrap();
+        let line = lines.next_line().await.unwrap().expect("response");
+        serde_json::from_str(&line).expect("response is JSON")
+    }
+
+    // 1. op_reparse with a path that doesn't exist anywhere on disk.
+    let bogus = "/tmp/cloister-e2e-no-such-thing-xyzzy";
+    let resp = round_trip(
+        &sock_path,
+        serde_json::json!({"op": "reparse", "source": bogus}),
+    )
+    .await;
+    assert_eq!(resp["ok"], false, "expected error response, got {resp}");
+    assert!(
+        resp["error"].as_str().unwrap_or("").contains("not a directory")
+            || resp["error"].as_str().unwrap_or("").contains("No such file"),
+        "error should mention the path problem; got: {resp:?}",
+    );
+
+    // 2. op_status now reports phase: error with the message preserved.
+    let status = round_trip(&sock_path, serde_json::json!({"op": "status"})).await;
+    assert_eq!(status["phase"], "error", "phase should be error: {status}");
+    assert!(
+        status["error"].as_str().unwrap_or("").contains("reparse failed"),
+        "status error field should describe the failure; got: {status:?}",
+    );
+
+    // 3. Recovery: a successful reparse against a real (empty) dir flips
+    //    phase back to Ready and clears the error state.
+    let good = TempDir::new().unwrap();
+    let resp = round_trip(
+        &sock_path,
+        serde_json::json!({"op": "reparse", "source": good.path().to_string_lossy().to_string()}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "successful reparse: {resp}");
+
+    let status = round_trip(&sock_path, serde_json::json!({"op": "status"})).await;
+    assert_eq!(status["phase"], "ready", "phase should recover to ready: {status}");
+    assert!(
+        status["error"].is_null() || status["error"].as_str() == Some(""),
+        "error field should be cleared after successful reparse; got: {status:?}",
+    );
+}
+
+/// `op_query` is a SQL injection foot-gun (cf. ley-line-open-6213d4 — MCP
+/// trust boundary doc). This test pins the *current* behavior so a future
+/// fix (gate destructive verbs, restrict to SELECT-only, require auth) is
+/// caught as an intentional change rather than a silent one.
+///
+/// Specifically: today, sending arbitrary DDL via `op_query` succeeds and
+/// runs against the living db. That's the foot-gun; this test documents it.
+#[tokio::test]
+async fn test_op_query_destructive_runs_today_pin_for_6213d4() {
+    use leyline_cli_lib::daemon::{DaemonContext, DaemonState, EventRouter, NoExt};
+    use leyline_core::{Controller, create_arena};
+    use std::sync::{Arc, Mutex, RwLock};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let dir = TempDir::new().unwrap();
+    let arena_path = dir.path().join("test.arena");
+    let ctrl_path = dir.path().join("test.ctrl");
+    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
+    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0).unwrap();
+    drop(ctrl);
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE doomed (id INTEGER PRIMARY KEY); INSERT INTO doomed VALUES (1);",
+    )
+    .unwrap();
+
+    let ctx = Arc::new(DaemonContext {
+        ctrl_path,
+        ext: Arc::new(NoExt),
+        router: EventRouter::new(16),
+        live_db: Mutex::new(conn),
+        source_dir: None,
+        lang_filter: None,
+        enrichment_passes: vec![],
+        state: Arc::new(RwLock::new(DaemonState::initializing())),
+        #[cfg(feature = "vec")]
+        vec_index: {
+            leyline_cli_lib::daemon::vec_index::register_vec();
+            Arc::new(leyline_cli_lib::daemon::vec_index::VectorIndex::new(4, None).unwrap())
+        },
+        #[cfg(feature = "vec")]
+        embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
+        #[cfg(feature = "vec")]
+        embed_queue: Arc::new(Mutex::new(std::collections::BinaryHeap::new())),
+    });
+
+    let sock_path = dir.path().join("query-destructive.sock");
+    leyline_cli_lib::daemon::socket::spawn(ctx.clone(), sock_path.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let stream = UnixStream::connect(&sock_path).await.unwrap();
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+    writer
+        .write_all(b"{\"op\":\"query\",\"sql\":\"DROP TABLE doomed\"}\n")
+        .await
+        .unwrap();
+    let resp = lines.next_line().await.unwrap().expect("response");
+    let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+
+    // Today: the DROP succeeds. This pins that fact so 6213d4 can land an
+    // intentional behavior change (gate / SELECT-only / require auth) and
+    // this test will fail loudly, prompting an update.
+    assert_eq!(
+        parsed["ok"], true,
+        "today op_query runs raw DDL — see 6213d4 for the lockdown plan; got: {parsed}",
+    );
+
+    let table_gone: bool = ctx
+        .live_db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) = 0 FROM sqlite_master WHERE type='table' AND name='doomed'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(table_gone, "DROP TABLE actually executed");
+}
+
 /// Verify the error phase is surfaced through `op_status`.
 #[tokio::test]
 async fn test_status_reports_error_phase() {

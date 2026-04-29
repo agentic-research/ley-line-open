@@ -71,6 +71,30 @@ pub trait EnrichmentPass: Send + Sync {
 // Pipeline executor
 // ---------------------------------------------------------------------------
 
+/// Execute a single pass: run it, record outcome in DaemonState, bump its
+/// `<name>_version` in `_meta` on success. Returns the pass's stats.
+///
+/// Both `run_pass` (target + deps) and `run_all` (every registered pass)
+/// loop over this — keep the per-pass invariants in one place so a future
+/// schema change to `_meta` versioning lands once, not twice.
+fn execute_pass(
+    pass: &dyn EnrichmentPass,
+    conn: &Connection,
+    source_dir: &Path,
+    changed_files: Option<&[String]>,
+    state: Option<&Arc<RwLock<DaemonState>>>,
+) -> Result<EnrichmentStats> {
+    let outcome = pass.run(conn, source_dir, changed_files);
+    record_pass_outcome(state, pass.name(), &outcome, conn);
+    let result = outcome?;
+
+    let version_key = format!("{}_version", pass.name());
+    let current: u64 = get_meta_u64(conn, &version_key).unwrap_or(0);
+    set_meta(conn, &version_key, &(current + 1).to_string())?;
+
+    Ok(result)
+}
+
 /// Run a named pass (and its dependencies) against the living db.
 ///
 /// The executor resolves dependencies in topological order and runs each
@@ -96,16 +120,8 @@ pub fn run_pass(
             .unwrap();
 
         let start = Instant::now();
-        let outcome = pass.run(conn, source_dir, changed_files);
-        record_pass_outcome(state, pass.name(), &outcome, conn);
-        let result = outcome?;
+        let result = execute_pass(pass.as_ref(), conn, source_dir, changed_files, state)?;
         stats.push(result);
-
-        // Update version in _meta.
-        let version_key = format!("{}_version", pass_name);
-        let current: u64 = get_meta_u64(conn, &version_key).unwrap_or(0);
-        set_meta(conn, &version_key, &(current + 1).to_string())?;
-
         eprintln!(
             "enrichment pass '{}' completed in {:?}",
             pass_name,
@@ -137,14 +153,7 @@ pub fn run_all(
         match next {
             Some(idx) => {
                 let pass = remaining.remove(idx);
-                let outcome = pass.run(conn, source_dir, changed_files);
-                record_pass_outcome(state, pass.name(), &outcome, conn);
-                let result = outcome?;
-
-                let version_key = format!("{}_version", pass.name());
-                let current: u64 = get_meta_u64(conn, &version_key).unwrap_or(0);
-                set_meta(conn, &version_key, &(current + 1).to_string())?;
-
+                let result = execute_pass(pass, conn, source_dir, changed_files, state)?;
                 completed.push(pass.name());
                 stats.push(result);
             }
@@ -328,6 +337,84 @@ mod tests {
                 duration_ms: 0,
             })
         }
+    }
+
+    /// Pass that always errors — for the failure-path test.
+    struct FailingPass;
+    impl EnrichmentPass for FailingPass {
+        fn name(&self) -> &str { "failing" }
+        fn reads(&self) -> &[&str] { &[] }
+        fn writes(&self) -> &[&str] { &[] }
+        fn run(&self, _conn: &Connection, _source: &Path, _changed: Option<&[String]>) -> Result<EnrichmentStats> {
+            anyhow::bail!("intentional pass failure");
+        }
+    }
+
+    /// Set up a minimal in-memory db with the `_meta` table, ready for
+    /// version bumps.
+    fn meta_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT);").unwrap();
+        conn
+    }
+
+    #[test]
+    fn execute_pass_bumps_version_on_success() {
+        let conn = meta_conn();
+        let pass = MockPass {
+            name: "alpha",
+            deps: &[],
+            reads: &[],
+            writes: &["t"],
+        };
+        let stats = execute_pass(&pass, &conn, Path::new("/"), None, None).unwrap();
+        assert_eq!(stats.pass_name, "alpha");
+
+        // First run: alpha_version = 1
+        let v: Option<u64> = get_meta_u64(&conn, "alpha_version");
+        assert_eq!(v, Some(1));
+
+        // Second run: bumps to 2
+        execute_pass(&pass, &conn, Path::new("/"), None, None).unwrap();
+        assert_eq!(get_meta_u64(&conn, "alpha_version"), Some(2));
+    }
+
+    #[test]
+    fn execute_pass_does_not_bump_version_on_failure() {
+        let conn = meta_conn();
+        let pass = FailingPass;
+        let result = execute_pass(&pass, &conn, Path::new("/"), None, None);
+        assert!(result.is_err(), "failing pass must propagate error");
+
+        // Failed pass must NOT have bumped its version. This is the
+        // invariant — staleness detection downstream relies on the
+        // version reflecting *successful* runs only.
+        let v = get_meta_u64(&conn, "failing_version");
+        assert_eq!(v, None, "failing pass version must remain unset");
+    }
+
+    #[test]
+    fn execute_pass_records_outcome_in_state() {
+        use std::sync::{Arc, RwLock};
+        let conn = meta_conn();
+        // Pre-populate tree-sitter_version so basis tracking can capture it.
+        set_meta(&conn, "tree-sitter_version", "5").unwrap();
+
+        let pass = MockPass {
+            name: "beta",
+            deps: &[],
+            reads: &[],
+            writes: &["t"],
+        };
+        let state = Arc::new(RwLock::new(DaemonState::initializing()));
+        execute_pass(&pass, &conn, Path::new("/"), None, Some(&state)).unwrap();
+
+        // record_pass_outcome should have written a PassStatus entry.
+        let s = state.read().unwrap();
+        let status = s.enrichment.get("beta").expect("beta status recorded");
+        assert!(status.last_run_at_ms.is_some());
+        assert_eq!(status.basis, Some(5), "basis should snapshot tree-sitter_version");
+        assert!(status.error.is_none());
     }
 
     #[test]

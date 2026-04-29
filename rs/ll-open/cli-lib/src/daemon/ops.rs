@@ -414,10 +414,7 @@ fn op_reparse(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
 
 
 fn op_enrich(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
-    let pass_name = req
-        .get("pass")
-        .and_then(|v| v.as_str())
-        .context("missing \"pass\" field")?;
+    let pass_name = required_str_field(req, "pass")?;
     let files: Option<Vec<String>> = req
         .get("files")
         .and_then(|v| v.as_array())
@@ -471,10 +468,7 @@ fn op_snapshot(ctx: &DaemonContext) -> Result<String> {
 
 /// Raw SQL query — for ad-hoc inspection.
 fn op_query(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
-    let sql = req
-        .get("sql")
-        .and_then(|v| v.as_str())
-        .context("missing \"sql\" field")?;
+    let sql = required_str_field(req, "sql")?;
 
     with_live_db(ctx, |conn| {
         let mut stmt = conn.prepare(sql).context("prepare SQL")?;
@@ -532,10 +526,7 @@ fn op_list_children(ctx: &DaemonContext, req: &serde_json::Value) -> Result<Stri
 
 /// Read a node's content (the `record` column).
 fn op_read_content(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
-    let id = req
-        .get("id")
-        .and_then(|v| v.as_str())
-        .context("missing \"id\" field")?;
+    let id = required_str_field(req, "id")?;
     promote_touched(ctx, &[id]);
 
     with_live_db(ctx, |conn| {
@@ -556,34 +547,36 @@ fn op_read_content(ctx: &DaemonContext, req: &serde_json::Value) -> Result<Strin
 
 /// Find callers of a token (queries node_refs).
 fn op_find_callers(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
-    let token = req
-        .get("token")
-        .and_then(|v| v.as_str())
-        .context("missing \"token\" field")?;
-    with_live_db(ctx, |conn| {
-        let rows = query_token_in_table(conn, token, "node_refs")?;
-        Ok(json!({"ok": true, "callers": rows}).to_string())
-    })
+    op_find_token(ctx, req, "node_refs", "callers")
 }
 
 /// Find definitions of a token (queries node_defs).
 fn op_find_defs(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
-    let token = req
-        .get("token")
-        .and_then(|v| v.as_str())
-        .context("missing \"token\" field")?;
+    op_find_token(ctx, req, "node_defs", "defs")
+}
+
+/// Shared body for `find_callers` and `find_defs`. Both ops differ only
+/// in which `(token → node_id)` table they consult and the JSON key
+/// under which results are returned.
+fn op_find_token(
+    ctx: &DaemonContext,
+    req: &serde_json::Value,
+    table: &str,
+    json_key: &str,
+) -> Result<String> {
+    let token = required_str_field(req, "token")?;
     with_live_db(ctx, |conn| {
-        let rows = query_token_in_table(conn, token, "node_defs")?;
-        Ok(json!({"ok": true, "defs": rows}).to_string())
+        let rows = query_token_in_table(conn, token, table)?;
+        let mut obj = serde_json::Map::new();
+        obj.insert("ok".to_string(), json!(true));
+        obj.insert(json_key.to_string(), json!(rows));
+        Ok(serde_json::Value::Object(obj).to_string())
     })
 }
 
 /// Get a single node by ID.
 fn op_get_node(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
-    let id = req
-        .get("id")
-        .and_then(|v| v.as_str())
-        .context("missing \"id\" field")?;
+    let id = required_str_field(req, "id")?;
     promote_touched(ctx, &[id]);
 
     with_live_db(ctx, |conn| {
@@ -642,11 +635,19 @@ fn find_node_at_position(conn: &Connection, file: &str, line: u32, col: u32) -> 
 /// for the "missing \"file\" field" error message — every op that takes
 /// a file argument routes through here.
 fn parse_file_arg(req: &serde_json::Value) -> Result<&str> {
-    let file = req
-        .get("file")
-        .and_then(|v| v.as_str())
-        .context("missing \"file\" field")?;
+    let file = required_str_field(req, "file")?;
     Ok(normalize_file_uri(file))
+}
+
+/// Required-string-field extractor with a uniform error message shape.
+///
+/// Centralizes the "missing \"<field>\" field" wording — clients see this
+/// directly when they make a malformed request, so it's part of the wire
+/// contract. Drift would silently change error strings under callers.
+fn required_str_field<'a>(req: &'a serde_json::Value, field: &'static str) -> Result<&'a str> {
+    req.get(field)
+        .and_then(|v| v.as_str())
+        .with_context(|| format!("missing \"{field}\" field"))
 }
 
 /// Parse file + line + col from request. File can be a path or file:// URI.
@@ -898,10 +899,7 @@ fn op_lsp_diagnostics(ctx: &DaemonContext, req: &serde_json::Value) -> Result<St
 /// `{ok, results: [{node_id, distance}]}`.
 #[cfg(feature = "vec")]
 fn op_vec_search(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
-    let query = req
-        .get("query")
-        .and_then(|v| v.as_str())
-        .context("missing \"query\" field")?;
+    let query = required_str_field(req, "query")?;
     let k = req.get("k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
     let qvec = ctx.embedder.embed(query).context("embed query")?;
@@ -1155,6 +1153,39 @@ mod tests {
                 handle_base_op(&ctx, name, &json!({})).is_some(),
                 "handle_base_op did not recognize canonical op `{name}`",
             );
+        }
+    }
+
+    #[test]
+    fn required_str_field_returns_borrowed_value() {
+        let req = json!({"token": "Foo", "id": "abc"});
+        assert_eq!(required_str_field(&req, "token").unwrap(), "Foo");
+        assert_eq!(required_str_field(&req, "id").unwrap(), "abc");
+    }
+
+    #[test]
+    fn required_str_field_error_includes_field_name() {
+        // Wire contract: clients see this error string and key off the
+        // field name. If we drop the field name from the message,
+        // user-facing errors get worse without anyone noticing.
+        let req = json!({});
+        for field in ["token", "id", "sql", "pass", "query"] {
+            let err = required_str_field(&req, field).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(&format!("\"{field}\"")),
+                "expected error to name field `{field}`, got: {msg}",
+            );
+        }
+    }
+
+    #[test]
+    fn required_str_field_rejects_non_string_values() {
+        // Numbers, nulls, arrays, objects all fail the same way. None
+        // of these should slip past `as_str()` and hit downstream code.
+        for bad in [json!(42), json!(null), json!([]), json!({"x": 1})] {
+            let req = json!({"k": bad});
+            assert!(required_str_field(&req, "k").is_err());
         }
     }
 

@@ -1,10 +1,86 @@
 //! Integration tests for leyline-cli-lib.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use leyline_cli_lib::{Commands, EDITION};
 use tempfile::TempDir;
+
+// ── Shared test scaffolding ──────────────────────────────────────────────
+//
+// 14 of the integration tests construct an arena + controller + DaemonContext
+// from scratch with mostly identical boilerplate. The two helpers below
+// collapse that to two short calls per test:
+//
+//   let dir = TempDir::new().unwrap();
+//   let (_arena, ctrl_path) = fresh_arena(dir.path());
+//   let ctx = Arc::new(default_test_ctx(ctrl_path));
+//
+// Tests that need a non-default field (custom live_db, source_dir,
+// state) construct via struct-update syntax:
+//
+//   let ctx = Arc::new(DaemonContext {
+//       source_dir: Some(src.path().to_path_buf()),
+//       ..default_test_ctx(ctrl_path)
+//   });
+//
+// `..` covers all default fields, including the cfg-gated `vec_index`,
+// `embedder`, and `embed_queue` — no need to spell them out per-test.
+
+/// Create a fresh arena + controller pair under `dir`. Returns
+/// `(arena_path, ctrl_path)`. The arena is sized at 2 MiB which is
+/// enough headroom for any of our integration fixtures.
+#[allow(dead_code)] // used by tests; rust sees only public surface
+fn fresh_arena(dir: &Path) -> (PathBuf, PathBuf) {
+    use leyline_core::{Controller, create_arena};
+    let arena_path = dir.join("test.arena");
+    let ctrl_path = dir.join("test.ctrl");
+    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
+    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0)
+        .unwrap();
+    drop(ctrl);
+    (arena_path, ctrl_path)
+}
+
+/// Build a vanilla `DaemonContext` for tests. Returns the value (not an
+/// Arc) so callers can use struct-update syntax to override fields and
+/// then wrap in `Arc::new(...)` themselves.
+///
+/// Defaults:
+/// - `ext`: `NoExt`
+/// - `router`: capacity 16 (small, tests don't need a big log)
+/// - `live_db`: fresh `:memory:` connection (no schema)
+/// - `source_dir`: None — tests that drive reparse override this
+/// - `lang_filter`: None
+/// - `enrichment_passes`: empty
+/// - `state`: `DaemonState::initializing()`
+/// - vec fields: 4-dim `ZeroEmbedder` + 4-dim VectorIndex + empty queue
+#[allow(dead_code)]
+fn default_test_ctx(ctrl_path: PathBuf) -> leyline_cli_lib::daemon::DaemonContext {
+    use leyline_cli_lib::daemon::{DaemonContext, DaemonState, EventRouter, NoExt};
+    use std::sync::{Arc, Mutex, RwLock};
+
+    DaemonContext {
+        ctrl_path,
+        ext: Arc::new(NoExt),
+        router: EventRouter::new(16),
+        live_db: Mutex::new(rusqlite::Connection::open_in_memory().unwrap()),
+        source_dir: None,
+        lang_filter: None,
+        enrichment_passes: vec![],
+        state: Arc::new(RwLock::new(DaemonState::initializing())),
+        #[cfg(feature = "vec")]
+        vec_index: {
+            leyline_cli_lib::daemon::vec_index::register_vec();
+            Arc::new(leyline_cli_lib::daemon::vec_index::VectorIndex::new(4, None).unwrap())
+        },
+        #[cfg(feature = "vec")]
+        embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
+        #[cfg(feature = "vec")]
+        embed_queue: Arc::new(Mutex::new(std::collections::BinaryHeap::new())),
+    }
+}
 
 /// Create a temporary directory containing two small `.go` files for testing.
 fn create_go_fixture() -> TempDir {
@@ -374,44 +450,13 @@ fn test_edition_is_open() {
 
 #[tokio::test]
 async fn test_daemon_socket_status_op() {
-    use leyline_cli_lib::daemon::{DaemonContext, EventRouter, NoExt};
-    use leyline_core::{Controller, create_arena};
     use std::sync::Arc;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
     let dir = TempDir::new().unwrap();
-
-    // Set up arena + controller.
-    let arena_path = dir.path().join("test.arena");
-    let ctrl_path = dir.path().join("test.ctrl");
-    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
-    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0)
-        .unwrap();
-    drop(ctrl);
-
-    let ctx = Arc::new(DaemonContext {
-        ctrl_path,
-        ext: Arc::new(NoExt),
-        router: EventRouter::new(16),
-        live_db: std::sync::Mutex::new(rusqlite::Connection::open_in_memory().unwrap()),
-        source_dir: None,
-        lang_filter: None,
-        enrichment_passes: vec![],
-        state: Arc::new(std::sync::RwLock::new(
-            leyline_cli_lib::daemon::DaemonState::initializing(),
-        )),
-        #[cfg(feature = "vec")]
-        vec_index: {
-            leyline_cli_lib::daemon::vec_index::register_vec();
-            Arc::new(leyline_cli_lib::daemon::vec_index::VectorIndex::new(4, None).unwrap())
-        },
-        #[cfg(feature = "vec")]
-        embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
-        #[cfg(feature = "vec")]
-        embed_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
-    });
+    let (_arena, ctrl_path) = fresh_arena(dir.path());
+    let ctx = Arc::new(default_test_ctx(ctrl_path));
 
     let sock_path = dir.path().join("test.sock");
     leyline_cli_lib::daemon::socket::spawn(ctx, sock_path.clone());
@@ -437,8 +482,8 @@ async fn test_daemon_socket_status_op() {
 #[tokio::test]
 async fn test_daemon_ext_dispatches_to_extension() {
     use leyline_cli_lib::daemon::ext::DaemonExt;
-    use leyline_cli_lib::daemon::{DaemonContext, EventRouter};
-    use leyline_core::{Controller, create_arena};
+    use leyline_cli_lib::daemon::DaemonContext;
+    
     use std::sync::Arc;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
@@ -457,35 +502,11 @@ async fn test_daemon_ext_dispatches_to_extension() {
 
     let dir = TempDir::new().unwrap();
 
-    // Set up arena + controller.
-    let arena_path = dir.path().join("test.arena");
-    let ctrl_path = dir.path().join("test.ctrl");
-    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
-    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0)
-        .unwrap();
-    drop(ctrl);
+    let (_arena, ctrl_path) = fresh_arena(dir.path());
 
     let ctx = Arc::new(DaemonContext {
-        ctrl_path,
         ext: Arc::new(TestExt),
-        router: EventRouter::new(16),
-        live_db: std::sync::Mutex::new(rusqlite::Connection::open_in_memory().unwrap()),
-        source_dir: None,
-        lang_filter: None,
-        enrichment_passes: vec![],
-        state: Arc::new(std::sync::RwLock::new(
-            leyline_cli_lib::daemon::DaemonState::initializing(),
-        )),
-        #[cfg(feature = "vec")]
-        vec_index: {
-            leyline_cli_lib::daemon::vec_index::register_vec();
-            Arc::new(leyline_cli_lib::daemon::vec_index::VectorIndex::new(4, None).unwrap())
-        },
-        #[cfg(feature = "vec")]
-        embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
-        #[cfg(feature = "vec")]
-        embed_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
+        ..default_test_ctx(ctrl_path)
     });
 
     let sock_path = dir.path().join("ext_test.sock");
@@ -643,39 +664,14 @@ async fn mcp_post(port: u16, body: &str) -> serde_json::Value {
 /// and that `tools/call → status` round-trips through the dispatch table.
 #[tokio::test]
 async fn test_mcp_http_tools_list_and_status_call() {
-    use leyline_cli_lib::daemon::{DaemonContext, EventRouter, NoExt};
-    use leyline_core::{Controller, create_arena};
+    
+    
     use std::sync::Arc;
 
     let dir = TempDir::new().unwrap();
-    let arena_path = dir.path().join("test.arena");
-    let ctrl_path = dir.path().join("test.ctrl");
-    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
-    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0).unwrap();
-    drop(ctrl);
+    let (_arena, ctrl_path) = fresh_arena(dir.path());
 
-    let ctx = Arc::new(DaemonContext {
-        ctrl_path,
-        ext: Arc::new(NoExt),
-        router: EventRouter::new(16),
-        live_db: std::sync::Mutex::new(rusqlite::Connection::open_in_memory().unwrap()),
-        source_dir: None,
-        lang_filter: None,
-        enrichment_passes: vec![],
-        state: Arc::new(std::sync::RwLock::new(
-            leyline_cli_lib::daemon::DaemonState::initializing(),
-        )),
-        #[cfg(feature = "vec")]
-        vec_index: {
-            leyline_cli_lib::daemon::vec_index::register_vec();
-            Arc::new(leyline_cli_lib::daemon::vec_index::VectorIndex::new(4, None).unwrap())
-        },
-        #[cfg(feature = "vec")]
-        embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
-        #[cfg(feature = "vec")]
-        embed_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
-    });
+    let ctx = Arc::new(default_test_ctx(ctrl_path));
 
     // Bind to port 0 (any free port), then read the assigned port. We pick
     // it by binding once, dropping, and using the same port; that's racy
@@ -1394,23 +1390,16 @@ fn test_lsp_clap_parsing() {
 #[cfg(feature = "vec")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_embed_queue_drainer_refreshes_index() {
-    use leyline_cli_lib::daemon::{
-        DaemonContext, DaemonState, EventRouter, NoExt,
-    };
+    use leyline_cli_lib::daemon::DaemonContext;
     use leyline_cli_lib::daemon::embed::{self, EmbedTask, Embedder, ZeroEmbedder};
     use leyline_cli_lib::daemon::vec_index::{register_vec, VectorIndex};
-    use leyline_core::{Controller, create_arena};
-    use std::sync::{Arc, Mutex, RwLock};
+    
+    use std::sync::{Arc, Mutex};
 
     register_vec();
 
     let dir = TempDir::new().unwrap();
-    let arena_path = dir.path().join("test.arena");
-    let ctrl_path = dir.path().join("test.ctrl");
-    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
-    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0).unwrap();
-    drop(ctrl);
+    let (_arena, ctrl_path) = fresh_arena(dir.path());
 
     let dim = 4;
     let index = Arc::new(VectorIndex::new(dim, None).unwrap());
@@ -1435,17 +1424,10 @@ async fn test_embed_queue_drainer_refreshes_index() {
         Arc::new(Mutex::new(std::collections::BinaryHeap::new()));
 
     let ctx = Arc::new(DaemonContext {
-        ctrl_path,
-        ext: Arc::new(NoExt),
-        router: EventRouter::new(16),
-        live_db: std::sync::Mutex::new(conn),
-        source_dir: None,
-        lang_filter: None,
-        enrichment_passes: vec![],
-        state: Arc::new(RwLock::new(DaemonState::initializing())),
-        vec_index: index.clone(),
+        live_db: std::sync::Mutex::new(conn),        vec_index: index.clone(),
         embedder,
         embed_queue: queue.clone(),
+        ..default_test_ctx(ctrl_path)
     });
 
     // Pre-condition: index is empty.
@@ -1484,25 +1466,18 @@ async fn test_embed_queue_drainer_refreshes_index() {
 #[cfg(feature = "vec")]
 #[tokio::test]
 async fn test_op_vec_search_round_trip() {
-    use leyline_cli_lib::daemon::{
-        DaemonContext, DaemonState, EventRouter, NoExt,
-    };
+    use leyline_cli_lib::daemon::DaemonContext;
     use leyline_cli_lib::daemon::embed::{Embedder, ZeroEmbedder};
     use leyline_cli_lib::daemon::vec_index::{register_vec, VectorIndex};
-    use leyline_core::{Controller, create_arena};
-    use std::sync::{Arc, RwLock};
+    
+    use std::sync::Arc;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
     register_vec();
 
     let dir = TempDir::new().unwrap();
-    let arena_path = dir.path().join("test.arena");
-    let ctrl_path = dir.path().join("test.ctrl");
-    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
-    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0).unwrap();
-    drop(ctrl);
+    let (_arena, ctrl_path) = fresh_arena(dir.path());
 
     let dim = 4;
     let index = Arc::new(VectorIndex::new(dim, None).unwrap());
@@ -1514,17 +1489,10 @@ async fn test_op_vec_search_round_trip() {
     let embedder: Arc<dyn Embedder> = Arc::new(ZeroEmbedder { dim });
 
     let ctx = Arc::new(DaemonContext {
-        ctrl_path,
-        ext: Arc::new(NoExt),
-        router: EventRouter::new(16),
-        live_db: std::sync::Mutex::new(rusqlite::Connection::open_in_memory().unwrap()),
-        source_dir: None,
-        lang_filter: None,
-        enrichment_passes: vec![],
-        state: Arc::new(RwLock::new(DaemonState::initializing())),
         vec_index: index.clone(),
         embedder,
         embed_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
+        ..default_test_ctx(ctrl_path)
     });
 
     let sock_path = dir.path().join("vec_search.sock");
@@ -1568,20 +1536,15 @@ async fn test_op_vec_search_round_trip() {
 #[tokio::test]
 async fn test_status_reports_phase_and_enrichment() {
     use leyline_cli_lib::daemon::{
-        DaemonContext, DaemonPhase, DaemonState, EventRouter, NoExt, PassStatus,
+        DaemonContext, DaemonPhase, DaemonState, PassStatus,
     };
-    use leyline_core::{Controller, create_arena};
+    
     use std::sync::{Arc, RwLock};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
     let dir = TempDir::new().unwrap();
-    let arena_path = dir.path().join("test.arena");
-    let ctrl_path = dir.path().join("test.ctrl");
-    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
-    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0).unwrap();
-    drop(ctrl);
+    let (_arena, ctrl_path) = fresh_arena(dir.path());
 
     // Pre-populate state with one enrichment record + a head SHA + Ready phase.
     let mut state = DaemonState::initializing();
@@ -1598,23 +1561,8 @@ async fn test_status_reports_phase_and_enrichment() {
     );
 
     let ctx = Arc::new(DaemonContext {
-        ctrl_path,
-        ext: Arc::new(NoExt),
-        router: EventRouter::new(16),
-        live_db: std::sync::Mutex::new(rusqlite::Connection::open_in_memory().unwrap()),
-        source_dir: None,
-        lang_filter: None,
-        enrichment_passes: vec![],
         state: Arc::new(RwLock::new(state)),
-        #[cfg(feature = "vec")]
-        vec_index: {
-            leyline_cli_lib::daemon::vec_index::register_vec();
-            Arc::new(leyline_cli_lib::daemon::vec_index::VectorIndex::new(4, None).unwrap())
-        },
-        #[cfg(feature = "vec")]
-        embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
-        #[cfg(feature = "vec")]
-        embed_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
+        ..default_test_ctx(ctrl_path)
     });
 
     let sock_path = dir.path().join("status_phase.sock");
@@ -1748,9 +1696,9 @@ fn test_scoped_reparse_handles_deletion_in_scope() {
 /// scope=[basename]) instead of erroring with "not a directory".
 #[tokio::test]
 async fn test_op_reparse_accepts_single_file_source() {
-    use leyline_cli_lib::daemon::{DaemonContext, DaemonState, EventRouter, NoExt};
-    use leyline_core::{Controller, create_arena};
-    use std::sync::{Arc, Mutex, RwLock};
+    use leyline_cli_lib::daemon::DaemonContext;
+    
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
@@ -1778,31 +1726,13 @@ async fn test_op_reparse_accepts_single_file_source() {
     fs::write(src.path().join("a.go"), "package m\n\nfunc A() { /* edited */ }\n").unwrap();
 
     let dir = TempDir::new().unwrap();
-    let arena_path = dir.path().join("test.arena");
-    let ctrl_path = dir.path().join("test.ctrl");
-    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
-    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0).unwrap();
-    drop(ctrl);
+    let (_arena, ctrl_path) = fresh_arena(dir.path());
 
     let ctx = Arc::new(DaemonContext {
-        ctrl_path,
-        ext: Arc::new(NoExt),
-        router: EventRouter::new(16),
         live_db: Mutex::new(conn),
         source_dir: Some(src.path().to_path_buf()),
         lang_filter: Some("go".to_string()),
-        enrichment_passes: vec![],
-        state: Arc::new(RwLock::new(DaemonState::initializing())),
-        #[cfg(feature = "vec")]
-        vec_index: {
-            leyline_cli_lib::daemon::vec_index::register_vec();
-            Arc::new(leyline_cli_lib::daemon::vec_index::VectorIndex::new(4, None).unwrap())
-        },
-        #[cfg(feature = "vec")]
-        embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
-        #[cfg(feature = "vec")]
-        embed_queue: Arc::new(Mutex::new(std::collections::BinaryHeap::new())),
+        ..default_test_ctx(ctrl_path)
     });
 
     let sock_path = dir.path().join("reparse.sock");
@@ -1851,9 +1781,9 @@ async fn test_op_reparse_accepts_single_file_source() {
 /// will eventually use.
 #[tokio::test]
 async fn test_op_reparse_accepts_files_scope_with_dir_source() {
-    use leyline_cli_lib::daemon::{DaemonContext, DaemonState, EventRouter, NoExt};
-    use leyline_core::{Controller, create_arena};
-    use std::sync::{Arc, Mutex, RwLock};
+    use leyline_cli_lib::daemon::DaemonContext;
+    
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
@@ -1869,31 +1799,13 @@ async fn test_op_reparse_accepts_files_scope_with_dir_source() {
     fs::write(src.path().join("b.go"), "package m\n\nfunc B() { /* edit */ }\n").unwrap();
 
     let dir = TempDir::new().unwrap();
-    let arena_path = dir.path().join("test.arena");
-    let ctrl_path = dir.path().join("test.ctrl");
-    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
-    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0).unwrap();
-    drop(ctrl);
+    let (_arena, ctrl_path) = fresh_arena(dir.path());
 
     let ctx = Arc::new(DaemonContext {
-        ctrl_path,
-        ext: Arc::new(NoExt),
-        router: EventRouter::new(16),
         live_db: Mutex::new(conn),
         source_dir: Some(src.path().to_path_buf()),
         lang_filter: Some("go".to_string()),
-        enrichment_passes: vec![],
-        state: Arc::new(RwLock::new(DaemonState::initializing())),
-        #[cfg(feature = "vec")]
-        vec_index: {
-            leyline_cli_lib::daemon::vec_index::register_vec();
-            Arc::new(leyline_cli_lib::daemon::vec_index::VectorIndex::new(4, None).unwrap())
-        },
-        #[cfg(feature = "vec")]
-        embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
-        #[cfg(feature = "vec")]
-        embed_queue: Arc::new(Mutex::new(std::collections::BinaryHeap::new())),
+        ..default_test_ctx(ctrl_path)
     });
 
     let sock_path = dir.path().join("reparse-files.sock");
@@ -1938,39 +1850,16 @@ async fn test_op_reparse_accepts_files_scope_with_dir_source() {
 ///   - subsequent successful reparse resets phase to Ready (recovery)
 #[tokio::test]
 async fn test_op_reparse_nonexistent_source_sets_error_phase_and_recovers() {
-    use leyline_cli_lib::daemon::{DaemonContext, DaemonState, EventRouter, NoExt};
-    use leyline_core::{Controller, create_arena};
-    use std::sync::{Arc, Mutex, RwLock};
+    
+    
+    use std::sync::Arc;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
     let dir = TempDir::new().unwrap();
-    let arena_path = dir.path().join("test.arena");
-    let ctrl_path = dir.path().join("test.ctrl");
-    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
-    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0).unwrap();
-    drop(ctrl);
+    let (_arena, ctrl_path) = fresh_arena(dir.path());
 
-    let ctx = Arc::new(DaemonContext {
-        ctrl_path,
-        ext: Arc::new(NoExt),
-        router: EventRouter::new(16),
-        live_db: Mutex::new(rusqlite::Connection::open_in_memory().unwrap()),
-        source_dir: None,
-        lang_filter: None,
-        enrichment_passes: vec![],
-        state: Arc::new(RwLock::new(DaemonState::initializing())),
-        #[cfg(feature = "vec")]
-        vec_index: {
-            leyline_cli_lib::daemon::vec_index::register_vec();
-            Arc::new(leyline_cli_lib::daemon::vec_index::VectorIndex::new(4, None).unwrap())
-        },
-        #[cfg(feature = "vec")]
-        embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
-        #[cfg(feature = "vec")]
-        embed_queue: Arc::new(Mutex::new(std::collections::BinaryHeap::new())),
-    });
+    let ctx = Arc::new(default_test_ctx(ctrl_path));
 
     let sock_path = dir.path().join("reparse-bad.sock");
     leyline_cli_lib::daemon::socket::spawn(ctx, sock_path.clone());
@@ -2038,19 +1927,14 @@ async fn test_op_reparse_nonexistent_source_sets_error_phase_and_recovers() {
 /// runs against the living db. That's the foot-gun; this test documents it.
 #[tokio::test]
 async fn test_op_query_destructive_runs_today_pin_for_6213d4() {
-    use leyline_cli_lib::daemon::{DaemonContext, DaemonState, EventRouter, NoExt};
-    use leyline_core::{Controller, create_arena};
-    use std::sync::{Arc, Mutex, RwLock};
+    use leyline_cli_lib::daemon::DaemonContext;
+    
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
     let dir = TempDir::new().unwrap();
-    let arena_path = dir.path().join("test.arena");
-    let ctrl_path = dir.path().join("test.ctrl");
-    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
-    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0).unwrap();
-    drop(ctrl);
+    let (_arena, ctrl_path) = fresh_arena(dir.path());
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch(
@@ -2059,23 +1943,8 @@ async fn test_op_query_destructive_runs_today_pin_for_6213d4() {
     .unwrap();
 
     let ctx = Arc::new(DaemonContext {
-        ctrl_path,
-        ext: Arc::new(NoExt),
-        router: EventRouter::new(16),
         live_db: Mutex::new(conn),
-        source_dir: None,
-        lang_filter: None,
-        enrichment_passes: vec![],
-        state: Arc::new(RwLock::new(DaemonState::initializing())),
-        #[cfg(feature = "vec")]
-        vec_index: {
-            leyline_cli_lib::daemon::vec_index::register_vec();
-            Arc::new(leyline_cli_lib::daemon::vec_index::VectorIndex::new(4, None).unwrap())
-        },
-        #[cfg(feature = "vec")]
-        embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
-        #[cfg(feature = "vec")]
-        embed_queue: Arc::new(Mutex::new(std::collections::BinaryHeap::new())),
+        ..default_test_ctx(ctrl_path)
     });
 
     let sock_path = dir.path().join("query-destructive.sock");
@@ -2125,21 +1994,16 @@ async fn test_op_query_destructive_runs_today_pin_for_6213d4() {
 async fn test_op_vec_search_dim_mismatch_returns_clean_error() {
     use leyline_cli_lib::daemon::embed::{Embedder, ZeroEmbedder};
     use leyline_cli_lib::daemon::vec_index::{register_vec, VectorIndex};
-    use leyline_cli_lib::daemon::{DaemonContext, DaemonState, EventRouter, NoExt};
-    use leyline_core::{Controller, create_arena};
-    use std::sync::{Arc, Mutex, RwLock};
+    use leyline_cli_lib::daemon::DaemonContext;
+    
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
     register_vec();
 
     let dir = TempDir::new().unwrap();
-    let arena_path = dir.path().join("test.arena");
-    let ctrl_path = dir.path().join("test.ctrl");
-    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
-    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0).unwrap();
-    drop(ctrl);
+    let (_arena, ctrl_path) = fresh_arena(dir.path());
 
     // Mismatch on purpose: 4-dim index, 8-dim embedder. The query vector
     // will be 8-dim, but the index will refuse anything that isn't 4-dim.
@@ -2147,17 +2011,10 @@ async fn test_op_vec_search_dim_mismatch_returns_clean_error() {
     let embedder: Arc<dyn Embedder> = Arc::new(ZeroEmbedder { dim: 8 });
 
     let ctx = Arc::new(DaemonContext {
-        ctrl_path,
-        ext: Arc::new(NoExt),
-        router: EventRouter::new(16),
-        live_db: Mutex::new(rusqlite::Connection::open_in_memory().unwrap()),
-        source_dir: None,
-        lang_filter: None,
-        enrichment_passes: vec![],
-        state: Arc::new(RwLock::new(DaemonState::initializing())),
         vec_index: index,
         embedder,
         embed_queue: Arc::new(Mutex::new(std::collections::BinaryHeap::new())),
+        ..default_test_ctx(ctrl_path)
     });
 
     let sock_path = dir.path().join("vec_dim_mismatch.sock");
@@ -2196,19 +2053,14 @@ async fn test_op_vec_search_dim_mismatch_returns_clean_error() {
 /// Bead: ley-line-open-5f7100-12 (item #1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_concurrent_uds_load_completes_bounded() {
-    use leyline_cli_lib::daemon::{DaemonContext, DaemonState, EventRouter, NoExt};
-    use leyline_core::{Controller, create_arena};
-    use std::sync::{Arc, Mutex, RwLock};
+    use leyline_cli_lib::daemon::{DaemonContext, EventRouter};
+    
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
     let dir = TempDir::new().unwrap();
-    let arena_path = dir.path().join("test.arena");
-    let ctrl_path = dir.path().join("test.ctrl");
-    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
-    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0).unwrap();
-    drop(ctrl);
+    let (_arena, ctrl_path) = fresh_arena(dir.path());
 
     // Pre-populate a tiny living db so query ops have something to hit.
     let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -2219,23 +2071,9 @@ async fn test_concurrent_uds_load_completes_bounded() {
     .unwrap();
 
     let ctx = Arc::new(DaemonContext {
-        ctrl_path,
-        ext: Arc::new(NoExt),
         router: EventRouter::new(64),
         live_db: Mutex::new(conn),
-        source_dir: None,
-        lang_filter: None,
-        enrichment_passes: vec![],
-        state: Arc::new(RwLock::new(DaemonState::initializing())),
-        #[cfg(feature = "vec")]
-        vec_index: {
-            leyline_cli_lib::daemon::vec_index::register_vec();
-            Arc::new(leyline_cli_lib::daemon::vec_index::VectorIndex::new(4, None).unwrap())
-        },
-        #[cfg(feature = "vec")]
-        embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
-        #[cfg(feature = "vec")]
-        embed_queue: Arc::new(Mutex::new(std::collections::BinaryHeap::new())),
+        ..default_test_ctx(ctrl_path)
     });
 
     let sock_path = dir.path().join("concurrent.sock");
@@ -2297,41 +2135,21 @@ async fn test_concurrent_uds_load_completes_bounded() {
 /// Verify the error phase is surfaced through `op_status`.
 #[tokio::test]
 async fn test_status_reports_error_phase() {
-    use leyline_cli_lib::daemon::{DaemonContext, DaemonPhase, DaemonState, EventRouter, NoExt};
-    use leyline_core::{Controller, create_arena};
+    use leyline_cli_lib::daemon::{DaemonContext, DaemonPhase, DaemonState};
+    
     use std::sync::{Arc, RwLock};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
     let dir = TempDir::new().unwrap();
-    let arena_path = dir.path().join("test.arena");
-    let ctrl_path = dir.path().join("test.ctrl");
-    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
-    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0).unwrap();
-    drop(ctrl);
+    let (_arena, ctrl_path) = fresh_arena(dir.path());
 
     let mut state = DaemonState::initializing();
     state.phase = DaemonPhase::Error("boom: parse failed".to_string());
 
     let ctx = Arc::new(DaemonContext {
-        ctrl_path,
-        ext: Arc::new(NoExt),
-        router: EventRouter::new(16),
-        live_db: std::sync::Mutex::new(rusqlite::Connection::open_in_memory().unwrap()),
-        source_dir: None,
-        lang_filter: None,
-        enrichment_passes: vec![],
         state: Arc::new(RwLock::new(state)),
-        #[cfg(feature = "vec")]
-        vec_index: {
-            leyline_cli_lib::daemon::vec_index::register_vec();
-            Arc::new(leyline_cli_lib::daemon::vec_index::VectorIndex::new(4, None).unwrap())
-        },
-        #[cfg(feature = "vec")]
-        embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
-        #[cfg(feature = "vec")]
-        embed_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
+        ..default_test_ctx(ctrl_path)
     });
 
     let sock_path = dir.path().join("status_error.sock");
@@ -2361,9 +2179,9 @@ async fn test_status_reports_error_phase() {
 /// Bead: ley-line-open-5f7100-12 (item #8 — reparse/snapshot race).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_op_reparse_snapshot_race_keeps_monotonic_generation() {
-    use leyline_cli_lib::daemon::{DaemonContext, DaemonState, EventRouter, NoExt};
+    use leyline_cli_lib::daemon::{DaemonContext, EventRouter};
     use leyline_core::{Controller, create_arena};
-    use std::sync::{Arc, Mutex, RwLock};
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
@@ -2392,23 +2210,11 @@ async fn test_op_reparse_snapshot_race_keeps_monotonic_generation() {
     leyline_cli_lib::cmd_parse::parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
 
     let ctx = Arc::new(DaemonContext {
-        ctrl_path: ctrl_path.clone(),
-        ext: Arc::new(NoExt),
-        router: EventRouter::new(64),
+        ctrl_path: ctrl_path.clone(),        router: EventRouter::new(64),
         live_db: Mutex::new(conn),
         source_dir: Some(src.path().to_path_buf()),
         lang_filter: Some("go".to_string()),
-        enrichment_passes: vec![],
-        state: Arc::new(RwLock::new(DaemonState::initializing())),
-        #[cfg(feature = "vec")]
-        vec_index: {
-            leyline_cli_lib::daemon::vec_index::register_vec();
-            Arc::new(leyline_cli_lib::daemon::vec_index::VectorIndex::new(4, None).unwrap())
-        },
-        #[cfg(feature = "vec")]
-        embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
-        #[cfg(feature = "vec")]
-        embed_queue: Arc::new(Mutex::new(std::collections::BinaryHeap::new())),
+        ..default_test_ctx(ctrl_path)
     });
 
     let sock_path = dir.path().join("reparse_snapshot_race.sock");

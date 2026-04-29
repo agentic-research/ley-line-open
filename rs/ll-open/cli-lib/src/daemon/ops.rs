@@ -636,13 +636,22 @@ fn find_node_at_position(conn: &Connection, file: &str, line: u32, col: u32) -> 
     }
 }
 
-/// Parse file + line + col from request. File can be a path or file:// URI.
-fn parse_position(req: &serde_json::Value) -> Result<(String, u32, u32)> {
+/// Extract the `file` field from a request, normalizing any leading
+/// `file://` prefix. Returns the borrowed slice on success so callers
+/// can decide whether to copy or pass through. Single source of truth
+/// for the "missing \"file\" field" error message — every op that takes
+/// a file argument routes through here.
+fn parse_file_arg(req: &serde_json::Value) -> Result<&str> {
     let file = req
         .get("file")
         .and_then(|v| v.as_str())
         .context("missing \"file\" field")?;
-    let file = normalize_file_uri(file).to_string();
+    Ok(normalize_file_uri(file))
+}
+
+/// Parse file + line + col from request. File can be a path or file:// URI.
+fn parse_position(req: &serde_json::Value) -> Result<(String, u32, u32)> {
+    let file = parse_file_arg(req)?.to_string();
 
     let line = req
         .get("line")
@@ -824,11 +833,7 @@ fn lsp_position_response(json_key: &str, rows: Vec<serde_json::Value>, enriched:
 
 /// Document symbols for a file.
 fn op_lsp_symbols(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
-    let file = req
-        .get("file")
-        .and_then(|v| v.as_str())
-        .context("missing \"file\" field")?;
-    let file = normalize_file_uri(file);
+    let file = parse_file_arg(req)?;
 
     with_live_db(ctx, |conn| {
         let mut stmt = conn.prepare_cached(
@@ -857,11 +862,7 @@ fn op_lsp_symbols(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String
 
 /// Diagnostics for a file.
 fn op_lsp_diagnostics(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
-    let file = req
-        .get("file")
-        .and_then(|v| v.as_str())
-        .context("missing \"file\" field")?;
-    let file = normalize_file_uri(file);
+    let file = parse_file_arg(req)?;
 
     with_live_db(ctx, |conn| {
         let mut stmt = conn.prepare_cached(
@@ -1154,6 +1155,45 @@ mod tests {
                 handle_base_op(&ctx, name, &json!({})).is_some(),
                 "handle_base_op did not recognize canonical op `{name}`",
             );
+        }
+    }
+
+    #[test]
+    fn parse_file_arg_strips_file_uri_prefix() {
+        // The helper centralizes `file://` stripping. If a caller passes
+        // an LSP-style URI, we must hand back the bare path so the SQL
+        // `node_id LIKE ?1 || '%'` clause matches our node-id convention.
+        let req = json!({"file": "file:///tmp/foo.rs"});
+        assert_eq!(parse_file_arg(&req).unwrap(), "/tmp/foo.rs");
+    }
+
+    #[test]
+    fn parse_file_arg_passes_plain_path_through() {
+        // Plain paths must round-trip unchanged.
+        let req = json!({"file": "src/lib.rs"});
+        assert_eq!(parse_file_arg(&req).unwrap(), "src/lib.rs");
+    }
+
+    #[test]
+    fn parse_file_arg_errors_on_missing_field() {
+        // The error message is part of the wire contract — clients show
+        // it directly. Pin its shape so a refactor doesn't silently
+        // change what users see.
+        let req = json!({});
+        let err = parse_file_arg(&req).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("missing \"file\""),
+            "unexpected error: {err:#}",
+        );
+    }
+
+    #[test]
+    fn parse_file_arg_errors_on_non_string_field() {
+        // A non-string `file` (e.g. number, object) must hit the same
+        // error path as a missing key — both are equally broken from
+        // the caller's perspective.
+        for bad in [json!({"file": 42}), json!({"file": null}), json!({"file": []})] {
+            assert!(parse_file_arg(&bad).is_err(), "expected error for {bad}");
         }
     }
 

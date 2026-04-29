@@ -372,6 +372,27 @@ impl EventEmitter {
 
 // -- ConnectionState (per-connection UDS state) -------------------------------
 
+/// Per-subscriber event-channel buffer, set when `Router::subscribe` is
+/// called from `handle_subscribe`. 1024 leaves enough headroom for a
+/// burst (e.g. a reparse fanning out files.changed + reparse.complete +
+/// snapshot in quick succession) before backpressure or drop-oldest
+/// kicks in.
+const SUBSCRIBER_CHANNEL_BUFFER: usize = 1024;
+
+/// Pull a JSON string-array field out of a request, returning a fresh
+/// `Vec<String>`. Missing field, wrong type, or non-string members all
+/// silently fall back to `vec![]` — handlers check for empty themselves.
+fn json_string_array(req: &serde_json::Value, key: &str) -> Vec<String> {
+    req.get(key)
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Per-connection state for the UDS socket.
 pub struct ConnectionState {
     router: Arc<EventRouter>,
@@ -395,15 +416,7 @@ impl ConnectionState {
 
     /// Handle a subscribe command. Returns the JSON response.
     pub async fn handle_subscribe(&mut self, req: &serde_json::Value) -> String {
-        let topics: Vec<String> = req
-            .get("topics")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let topics = json_string_array(req, "topics");
 
         if topics.is_empty() {
             return r#"{"error":"subscribe requires non-empty 'topics' array"}"#.to_string();
@@ -428,7 +441,7 @@ impl ConnectionState {
 
         let (sub_id, event_rx, replay, gap) = self
             .router
-            .subscribe(&topics, identity, since, overflow, 1024)
+            .subscribe(&topics, identity, since, overflow, SUBSCRIBER_CHANNEL_BUFFER)
             .await;
 
         self.sub_id = Some(sub_id);
@@ -469,15 +482,7 @@ impl ConnectionState {
 
     /// Handle an unsubscribe command.
     pub async fn handle_unsubscribe(&mut self, req: &serde_json::Value) -> String {
-        let topics: Vec<String> = req
-            .get("topics")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let topics = json_string_array(req, "topics");
 
         if let Some(sub_id) = self.sub_id {
             self.router.unsubscribe_topics(sub_id, &topics).await;
@@ -521,6 +526,44 @@ impl ConnectionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── json_string_array helper ────────────────────────────────────────
+
+    #[test]
+    fn json_string_array_extracts_strings() {
+        let v = serde_json::json!({"topics": ["a", "b.c", "x"]});
+        assert_eq!(
+            json_string_array(&v, "topics"),
+            vec!["a".to_string(), "b.c".into(), "x".into()],
+        );
+    }
+
+    #[test]
+    fn json_string_array_filters_non_string_members() {
+        // Mixed-type arrays drop non-strings rather than erroring —
+        // matches both handle_subscribe and handle_unsubscribe's prior
+        // inline behavior, which empty-checks afterwards.
+        let v = serde_json::json!({"topics": ["a", 1, true, null, "b"]});
+        assert_eq!(
+            json_string_array(&v, "topics"),
+            vec!["a".to_string(), "b".into()],
+        );
+    }
+
+    #[test]
+    fn json_string_array_returns_empty_on_missing_field() {
+        let v = serde_json::json!({});
+        assert!(json_string_array(&v, "topics").is_empty());
+    }
+
+    #[test]
+    fn json_string_array_returns_empty_on_wrong_type() {
+        let v = serde_json::json!({"topics": "not an array"});
+        assert!(json_string_array(&v, "topics").is_empty());
+
+        let v = serde_json::json!({"topics": 42});
+        assert!(json_string_array(&v, "topics").is_empty());
+    }
 
     #[test]
     fn topic_exact_match() {

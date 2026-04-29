@@ -525,17 +525,15 @@ fn op_read_content(ctx: &DaemonContext, req: &serde_json::Value) -> Result<Strin
     promote_touched(ctx, &[id]);
 
     with_live_db(ctx, |conn| {
-        let result = conn.query_row(
+        let content = query_row_opt(
+            conn,
             "SELECT record FROM nodes WHERE id = ?1",
             [id],
             |row| row.get::<_, String>(0),
-        );
-        match result {
-            Ok(content) => Ok(json!({"ok": true, "content": content}).to_string()),
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                Ok(json!({"ok": false, "error": format!("node '{id}' not found")}).to_string())
-            }
-            Err(e) => Err(e.into()),
+        )?;
+        match content {
+            Some(c) => Ok(json!({"ok": true, "content": c}).to_string()),
+            None => Ok(node_not_found_response(id)),
         }
     })
 }
@@ -575,7 +573,8 @@ fn op_get_node(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
     promote_touched(ctx, &[id]);
 
     with_live_db(ctx, |conn| {
-        let result = conn.query_row(
+        let node = query_row_opt(
+            conn,
             "SELECT id, parent_id, name, kind, size, record FROM nodes WHERE id = ?1",
             [id],
             |row| {
@@ -588,13 +587,10 @@ fn op_get_node(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
                     "record": row.get::<_, String>(5)?,
                 }))
             },
-        );
-        match result {
-            Ok(node) => Ok(json!({"ok": true, "node": node}).to_string()),
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                Ok(json!({"ok": false, "error": format!("node '{id}' not found")}).to_string())
-            }
-            Err(e) => Err(e.into()),
+        )?;
+        match node {
+            Some(n) => Ok(json!({"ok": true, "node": n}).to_string()),
+            None => Ok(node_not_found_response(id)),
         }
     })
 }
@@ -606,7 +602,8 @@ fn op_get_node(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
 /// Find the node_id at a given (file, line, col) position via the _ast table.
 fn find_node_at_position(conn: &Connection, file: &str, line: u32, col: u32) -> Result<Option<String>> {
     // Find the most specific (smallest range) AST node containing this position.
-    let result = conn.query_row(
+    query_row_opt(
+        conn,
         "SELECT node_id FROM _ast \
          WHERE source_id = ?1 \
            AND start_row <= ?2 AND end_row >= ?2 \
@@ -616,12 +613,7 @@ fn find_node_at_position(conn: &Connection, file: &str, line: u32, col: u32) -> 
          LIMIT 1",
         rusqlite::params![file, line, col],
         |row| row.get::<_, String>(0),
-    );
-    match result {
-        Ok(id) => Ok(Some(id)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(e.into()),
-    }
+    )
 }
 
 /// Extract the `file` field from a request, normalizing any leading
@@ -643,6 +635,34 @@ fn required_str_field<'a>(req: &'a serde_json::Value, field: &'static str) -> Re
     req.get(field)
         .and_then(|v| v.as_str())
         .with_context(|| format!("missing \"{field}\" field"))
+}
+
+/// Run a `query_row`, mapping `QueryReturnedNoRows` to `Ok(None)`. Other
+/// errors propagate. Replaces the four-arm match (`Ok→Some / NoRows→None /
+/// Err→Err`) that several "id-or-position lookup" ops were carrying inline.
+fn query_row_opt<T, P, F>(
+    conn: &Connection,
+    sql: &str,
+    params: P,
+    mapper: F,
+) -> Result<Option<T>>
+where
+    P: rusqlite::Params,
+    F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+{
+    match conn.query_row(sql, params, mapper) {
+        Ok(v) => Ok(Some(v)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Wire-contract error response when a node id doesn't resolve. Used by
+/// `op_read_content` and `op_get_node` — both must return the same shape
+/// and message so clients can detect "no such node" without brittle string
+/// matching.
+fn node_not_found_response(id: &str) -> String {
+    json!({"ok": false, "error": format!("node '{id}' not found")}).to_string()
 }
 
 /// Parse file + line + col from request. File can be a path or file:// URI.
@@ -758,16 +778,13 @@ fn lsp_hover_query(conn: &Connection, file: &str, line: u32, col: u32) -> Result
         Some(id) => id,
         None => return Ok(None),
     };
-    let hover = conn.query_row(
+    let hover = query_row_opt(
+        conn,
         "SELECT hover_text FROM _lsp_hover WHERE node_id = ?1",
         [&node_id],
         |row| row.get::<_, String>(0),
-    );
-    match hover {
-        Ok(text) => Ok(Some((text, node_id))),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(e.into()),
-    }
+    )?;
+    Ok(hover.map(|text| (text, node_id)))
 }
 
 /// Go-to-definition at a position. Auto-enriches if no data exists.
@@ -1147,6 +1164,82 @@ mod tests {
             assert!(
                 handle_base_op(&ctx, name, &json!({})).is_some(),
                 "handle_base_op did not recognize canonical op `{name}`",
+            );
+        }
+    }
+
+    #[test]
+    fn query_row_opt_returns_none_for_no_rows() {
+        // The whole point of the helper: NoRows must not propagate as an
+        // error. If a future rusqlite bump changed that, callers (read_content,
+        // get_node, find_node_at_position, lsp_hover_query) would all start
+        // returning Err for legitimate "id not found" lookups.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER, name TEXT);").unwrap();
+        let r: Option<String> = query_row_opt(
+            &conn,
+            "SELECT name FROM t WHERE id = ?1",
+            [42],
+            |row| row.get(0),
+        )
+        .unwrap();
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn query_row_opt_returns_some_for_match() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (id INTEGER, name TEXT);
+             INSERT INTO t VALUES (1, 'alpha'), (2, 'beta');",
+        )
+        .unwrap();
+        let r: Option<String> = query_row_opt(
+            &conn,
+            "SELECT name FROM t WHERE id = ?1",
+            [2],
+            |row| row.get(0),
+        )
+        .unwrap();
+        assert_eq!(r.as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn query_row_opt_propagates_real_errors() {
+        // SQL errors (bad table, bad column, type mismatch) must NOT be
+        // swallowed as None — that would hide bugs at runtime. Only the
+        // QueryReturnedNoRows variant collapses to None.
+        let conn = Connection::open_in_memory().unwrap();
+        let r = query_row_opt(
+            &conn,
+            "SELECT * FROM definitely_not_a_table",
+            [],
+            |row| row.get::<_, String>(0),
+        );
+        assert!(r.is_err(), "expected error for missing table, got Ok");
+    }
+
+    #[test]
+    fn node_not_found_response_pins_wire_contract() {
+        // Clients (mache, hooks, etc) parse this error message. Pin the
+        // exact shape so a refactor doesn't silently break their detection.
+        let body = node_not_found_response("a/b/c");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"], "node 'a/b/c' not found");
+    }
+
+    #[test]
+    fn node_not_found_response_quotes_id_for_disambiguation() {
+        // The ID is wrapped in single quotes so an empty or whitespace
+        // ID still produces a parseable message. If the quoting were
+        // dropped, an empty id would yield "node  not found" which
+        // looks like a different bug class.
+        for id in ["", " ", "a/b", "weird id with spaces"] {
+            let body = node_not_found_response(id);
+            assert!(
+                body.contains(&format!("'{id}'")),
+                "expected single-quoted id `{id}` in response, got: {body}",
             );
         }
     }

@@ -37,6 +37,45 @@ pub(crate) fn is_state_changing(op: &str) -> bool {
     STATE_CHANGING_OPS.contains(&op)
 }
 
+/// Canonical list of op names that `handle_base_op` dispatches.
+///
+/// Single source of truth shared with `daemon::mcp::tool_registry` — every
+/// MCP tool name must be in this list. A drift test in `mcp::tests`
+/// catches mismatches; another in this module's tests verifies that
+/// `handle_base_op` recognizes every name here.
+///
+/// If you add a new op:
+///   1. Add a match arm in `handle_base_op`.
+///   2. Add the name here (and in `STATE_CHANGING_OPS` if mutating).
+///   3. Optionally expose it via `tool_registry()` in `daemon::mcp`.
+#[cfg(test)]
+pub(crate) fn base_op_names() -> Vec<&'static str> {
+    #[cfg_attr(not(feature = "vec"), allow(unused_mut))]
+    let mut v = vec![
+        "status",
+        "flush",
+        "load",
+        "query",
+        "reparse",
+        "snapshot",
+        "enrich",
+        "list_roots",
+        "list_children",
+        "read_content",
+        "find_callers",
+        "find_defs",
+        "get_node",
+        "lsp_hover",
+        "lsp_defs",
+        "lsp_refs",
+        "lsp_symbols",
+        "lsp_diagnostics",
+    ];
+    #[cfg(feature = "vec")]
+    v.push("vec_search");
+    v
+}
+
 /// Dispatch a base op. Returns `Some(json_string)` if handled, `None` if unrecognized.
 pub fn handle_base_op(ctx: &DaemonContext, op: &str, req: &serde_json::Value) -> Option<String> {
     let result = match op {
@@ -1094,5 +1133,35 @@ mod tests {
     async fn test_unknown_op_returns_none() {
         let (_dir, ctx) = setup();
         assert!(handle_base_op(&ctx, "nonexistent", &json!({})).is_none());
+    }
+
+    #[tokio::test]
+    async fn handle_base_op_dispatches_every_canonical_name() {
+        // Drift guard: if a name is added to `base_op_names()` but not to
+        // the `handle_base_op` match table, this test fails. We don't care
+        // that some ops return errors with empty bodies — we only care that
+        // dispatch returns `Some(...)`.
+        let (_dir, ctx) = setup();
+        for name in base_op_names() {
+            assert!(
+                handle_base_op(&ctx, name, &json!({})).is_some(),
+                "handle_base_op did not recognize canonical op `{name}`",
+            );
+        }
+    }
+
+    #[test]
+    fn state_changing_ops_subset_of_canonical_names() {
+        // Mutating ops must be a subset of the canonical dispatch list.
+        // Catches the case where someone retires an op from `handle_base_op`
+        // but forgets to remove it from `STATE_CHANGING_OPS`.
+        let canonical: std::collections::HashSet<&str> =
+            base_op_names().into_iter().collect();
+        for name in STATE_CHANGING_OPS {
+            assert!(
+                canonical.contains(name),
+                "STATE_CHANGING_OPS contains `{name}` but base_op_names() does not",
+            );
+        }
     }
 }

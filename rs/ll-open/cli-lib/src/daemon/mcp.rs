@@ -445,4 +445,22 @@ mod tests {
             assert!(names.contains(op), "missing LSP tool: {op}");
         }
     }
+
+    #[test]
+    fn registry_names_are_subset_of_canonical_op_names() {
+        // Drift guard: every MCP tool's `name` must correspond to an op
+        // that `handle_base_op` dispatches. If you add a tool here but
+        // forget the match arm in `daemon::ops`, this test fails — and
+        // MCP requests would otherwise silently return "unknown op"
+        // errors at runtime.
+        let canonical: std::collections::HashSet<&str> =
+            crate::daemon::ops::base_op_names().into_iter().collect();
+        for tool in tool_registry() {
+            assert!(
+                canonical.contains(tool.name),
+                "MCP tool `{}` is not in base_op_names() — handle_base_op cannot dispatch it",
+                tool.name,
+            );
+        }
+    }
 }

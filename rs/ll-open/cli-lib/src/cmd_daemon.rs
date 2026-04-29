@@ -30,6 +30,7 @@ pub async fn cmd_daemon(
     language: Option<&str>,
     timeout: Option<&str>,
     source: Option<&Path>,
+    mcp_port: Option<u16>,
 ) -> Result<()> {
     let ext: Arc<dyn DaemonExt> = Arc::new(NoExt);
     run_daemon(
@@ -43,6 +44,7 @@ pub async fn cmd_daemon(
         timeout,
         ext,
         source,
+        mcp_port,
     )
     .await
 }
@@ -72,6 +74,7 @@ pub async fn run_daemon(
     timeout: Option<&str>,
     ext: Arc<dyn DaemonExt>,
     source: Option<&Path>,
+    mcp_port: Option<u16>,
 ) -> Result<()> {
     // 1. Arena setup.
     let arena_bytes = arena_size_mib * 1024 * 1024;
@@ -180,6 +183,20 @@ pub async fn run_daemon(
     let sock_path = ctrl_path.with_extension("sock");
     crate::daemon::socket::spawn(ctx.clone(), sock_path.clone());
     eprintln!("daemon socket at {}", sock_path.display());
+
+    // Optional MCP HTTP transport — feeds cloister gateway / any MCP client.
+    // Same dispatch table as the UDS socket; just an MCP-shaped wrapper.
+    let mcp_handle = if let Some(port) = mcp_port {
+        match crate::daemon::mcp::spawn(ctx.clone(), port) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                log::error!("MCP HTTP server failed to start on port {port}: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // 7. Mount (optional — omit --mount for headless mode).
     #[cfg(feature = "mount")]
@@ -295,6 +312,9 @@ pub async fn run_daemon(
         eprintln!("stopping mache (pid={})...", child.id());
         let _ = child.kill();
         let _ = child.wait();
+    }
+    if let Some(handle) = mcp_handle {
+        handle.abort();
     }
     let _ = std::fs::remove_file(&sock_path);
 

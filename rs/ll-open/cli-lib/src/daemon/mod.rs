@@ -7,6 +7,7 @@ pub mod ext;
 pub mod events;
 #[cfg(feature = "lsp")]
 pub mod lsp_pass;
+pub mod mcp;
 pub mod ops;
 pub mod socket;
 #[cfg(feature = "vec")]

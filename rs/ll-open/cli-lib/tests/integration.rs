@@ -560,6 +560,201 @@ fn test_lsp_variant_exists() {
 // via the socket tests above.
 
 // ---------------------------------------------------------------------------
+// MCP HTTP transport tests
+// ---------------------------------------------------------------------------
+
+fn twoway_find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|w| w == needle)
+}
+
+fn parse_content_length(headers: &str) -> Option<usize> {
+    for line in headers.split("\r\n") {
+        let mut parts = line.splitn(2, ':');
+        if parts.next()?.eq_ignore_ascii_case("content-length") {
+            return parts.next()?.trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// Round-trip a JSON-RPC request through the MCP HTTP transport. Returns the
+/// parsed response body. Uses a raw TcpStream to keep the dev-dep set lean.
+#[cfg(test)]
+async fn mcp_post(port: u16, body: &str) -> serde_json::Value {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
+    let req = format!(
+        "POST /mcp HTTP/1.1\r\n\
+         Host: 127.0.0.1\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        body.len(),
+        body,
+    );
+    stream.write_all(req.as_bytes()).await.expect("write");
+    stream.flush().await.expect("flush");
+
+    let mut buf = Vec::new();
+    // Read until the server closes the connection (Connection: close).
+    loop {
+        let mut chunk = [0u8; 4096];
+        match stream.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(_) => break,
+        }
+        // Heuristic stop: full HTTP/1.1 200 response with body fits in the
+        // first read for these small payloads. If we have headers + a body,
+        // we're done.
+        if let Some(idx) = twoway_find(&buf, b"\r\n\r\n") {
+            let headers = std::str::from_utf8(&buf[..idx]).unwrap_or("");
+            if let Some(cl) = parse_content_length(headers)
+                && buf.len() >= idx + 4 + cl
+            {
+                break;
+            }
+        }
+    }
+    let raw = String::from_utf8_lossy(&buf);
+
+    // Split off headers; everything after the blank line is the JSON body.
+    let body_start = match raw.find("\r\n\r\n") {
+        Some(i) => i + 4,
+        None => panic!("no HTTP body separator in response: {raw:?}"),
+    };
+    let body = &raw[body_start..];
+    // axum may emit chunked transfer encoding; strip the chunk header if so.
+    // In our case Content-Length is set, so body is a single chunk.
+    let body = body.trim_start_matches(|c: char| c.is_ascii_hexdigit());
+    let body = body.trim_start_matches("\r\n");
+    let body = body.trim_end_matches("\r\n0\r\n\r\n");
+    serde_json::from_str(body)
+        .unwrap_or_else(|e| panic!("response is not valid JSON: {e}\nbody: {body:?}\nraw: {raw:?}"))
+}
+
+/// Verify `tools/list` returns the expected core tools (status / lsp_diagnostics)
+/// and that `tools/call → status` round-trips through the dispatch table.
+#[tokio::test]
+async fn test_mcp_http_tools_list_and_status_call() {
+    use leyline_cli_lib::daemon::{DaemonContext, EventRouter, NoExt};
+    use leyline_core::{Controller, create_arena};
+    use std::sync::Arc;
+
+    let dir = TempDir::new().unwrap();
+    let arena_path = dir.path().join("test.arena");
+    let ctrl_path = dir.path().join("test.ctrl");
+    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
+    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0).unwrap();
+    drop(ctrl);
+
+    let ctx = Arc::new(DaemonContext {
+        ctrl_path,
+        ext: Arc::new(NoExt),
+        router: EventRouter::new(16),
+        live_db: std::sync::Mutex::new(rusqlite::Connection::open_in_memory().unwrap()),
+        source_dir: None,
+        lang_filter: None,
+        enrichment_passes: vec![],
+        state: Arc::new(std::sync::RwLock::new(
+            leyline_cli_lib::daemon::DaemonState::initializing(),
+        )),
+        #[cfg(feature = "vec")]
+        vec_index: {
+            leyline_cli_lib::daemon::vec_index::register_vec();
+            Arc::new(leyline_cli_lib::daemon::vec_index::VectorIndex::new(4, None).unwrap())
+        },
+        #[cfg(feature = "vec")]
+        embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
+        #[cfg(feature = "vec")]
+        embed_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
+    });
+
+    // Bind to port 0 (any free port), then read the assigned port. We pick
+    // it by binding once, dropping, and using the same port; that's racy
+    // but acceptable for this test. Instead, hand the port choice to the
+    // OS via a quick probe.
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let handle = leyline_cli_lib::daemon::mcp::spawn(ctx, port).expect("spawn MCP HTTP");
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+    // 1. tools/list
+    let listing = mcp_post(
+        port,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+    )
+    .await;
+    assert_eq!(listing["jsonrpc"], "2.0");
+    assert_eq!(listing["id"], 1);
+    let tools = listing["result"]["tools"].as_array().expect("tools array");
+    let names: std::collections::HashSet<&str> =
+        tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    for required in [
+        "status",
+        "snapshot",
+        "reparse",
+        "lsp_hover",
+        "lsp_diagnostics",
+        "find_callers",
+        "get_node",
+    ] {
+        assert!(names.contains(required), "tools/list missing {required}");
+    }
+
+    // 2. tools/call → status
+    let call = mcp_post(
+        port,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"status","arguments":{}}}"#,
+    )
+    .await;
+    assert_eq!(call["jsonrpc"], "2.0");
+    assert_eq!(call["id"], 2);
+    let content = call["result"]["content"].as_array().expect("content array");
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0]["type"], "text");
+    let text = content[0]["text"].as_str().expect("text payload");
+    let inner: serde_json::Value = serde_json::from_str(text).expect("inner JSON");
+    assert_eq!(inner["ok"], true);
+    assert_eq!(inner["phase"], "initializing");
+
+    // 3. tools/call with unknown tool → error response
+    let bad = mcp_post(
+        port,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"does_not_exist","arguments":{}}}"#,
+    )
+    .await;
+    assert!(bad["error"].is_object(), "expected error response");
+    assert_eq!(bad["error"]["code"], -32601);
+
+    // 4. tools/call → lsp_diagnostics on empty db should set isError=true
+    //    (the inner op returns {ok: false, error: ...} when _lsp table is missing).
+    let lsp = mcp_post(
+        port,
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call",
+            "params":{"name":"lsp_diagnostics","arguments":{"file":"/tmp/no.rs"}}}"#,
+    )
+    .await;
+    assert_eq!(
+        lsp["result"]["isError"], true,
+        "isError must be true when inner op returns ok:false (got {lsp})",
+    );
+
+    handle.abort();
+}
+
+// ---------------------------------------------------------------------------
 // Warm start + crash recovery stress tests
 // ---------------------------------------------------------------------------
 

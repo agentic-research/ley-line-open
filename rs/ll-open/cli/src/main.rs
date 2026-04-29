@@ -54,6 +54,13 @@ enum Cmd {
         /// If mache is on PATH, also spawns mache as a managed child process.
         #[arg(long)]
         source: Option<PathBuf>,
+
+        /// Expose the daemon's ops as MCP tools over HTTP on this port.
+        /// Same dispatch table as the UDS socket — POST /mcp speaks JSON-RPC,
+        /// `tools/list` and `tools/call` are wired. cloister gateway routes
+        /// `lsp_*` calls here.
+        #[arg(long)]
+        mcp_port: Option<u16>,
     },
 }
 
@@ -89,6 +96,7 @@ async fn main() -> Result<()> {
             language,
             timeout,
             source,
+            mcp_port,
         } => {
             // Default arena/ctrl to ~/.mache/ so mache's path containment check passes.
             let mache_dir = dirs::home_dir()
@@ -108,6 +116,7 @@ async fn main() -> Result<()> {
                 timeout.as_deref(),
                 Arc::new(leyline_cli_lib::daemon::NoExt),
                 source.as_deref(),
+                mcp_port,
             )
             .await
         }

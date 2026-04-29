@@ -10,6 +10,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{RwLock, mpsc};
 
+/// Soft cap on the EventLog's initial backing allocation. The deque
+/// grows on demand up to its configured `capacity`, but we don't
+/// pre-allocate a multi-MB slab just because someone passed a big
+/// log capacity. 1024 is enough headroom for a normal session burst.
+const EVENT_LOG_INITIAL_ALLOC: usize = 1024;
+
 // -- Event types --------------------------------------------------------------
 
 /// A fully sequenced event ready for dispatch.
@@ -134,7 +140,7 @@ struct EventLog {
 impl EventLog {
     fn new(capacity: usize) -> Self {
         EventLog {
-            events: VecDeque::with_capacity(capacity.min(1024)),
+            events: VecDeque::with_capacity(capacity.min(EVENT_LOG_INITIAL_ALLOC)),
             capacity,
         }
     }

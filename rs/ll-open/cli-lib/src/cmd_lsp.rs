@@ -10,6 +10,15 @@ use rusqlite::{Connection, DatabaseName};
 use leyline_lsp::client::LspClient;
 use leyline_lsp::project;
 
+/// Maximum poll attempts for `documentSymbol` after opening a file.
+/// Some servers (rust-analyzer) need a beat to index — try a few times
+/// before giving up.
+const SYMBOL_POLL_MAX_ATTEMPTS: usize = 10;
+
+/// Delay between `documentSymbol` poll attempts. Total max wait is
+/// roughly `(SYMBOL_POLL_MAX_ATTEMPTS - 1) * SYMBOL_POLL_DELAY`.
+const SYMBOL_POLL_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// Infer LSP language ID from file extension.
 fn infer_language_id(ext: &str) -> Option<&'static str> {
     match ext {
@@ -96,23 +105,25 @@ pub async fn cmd_lsp(
 
     // Poll for document symbols (servers may need time to index).
     let mut symbols = Vec::new();
-    for attempt in 0..10 {
+    for attempt in 0..SYMBOL_POLL_MAX_ATTEMPTS {
         match client.document_symbols(&file_uri).await {
             Ok(s) if !s.is_empty() => {
                 symbols = s;
                 break;
             }
             Ok(_) => {
-                if attempt < 9 {
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                if attempt + 1 < SYMBOL_POLL_MAX_ATTEMPTS {
+                    tokio::time::sleep(SYMBOL_POLL_DELAY).await;
                 }
             }
             Err(e) => {
-                if attempt < 9 {
+                if attempt + 1 < SYMBOL_POLL_MAX_ATTEMPTS {
                     log::debug!("symbol poll attempt {attempt}: {e}");
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    tokio::time::sleep(SYMBOL_POLL_DELAY).await;
                 } else {
-                    bail!("failed to get document symbols after 10 attempts: {e}");
+                    bail!(
+                        "failed to get document symbols after {SYMBOL_POLL_MAX_ATTEMPTS} attempts: {e}"
+                    );
                 }
             }
         }

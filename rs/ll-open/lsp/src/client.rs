@@ -6,6 +6,21 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
+/// Buffer for the channel that carries server→client responses + notifs.
+/// 64 is enough for a typical request/response burst (initialize +
+/// didOpen + symbols + diagnostics) without blocking the reader task.
+const RESPONSE_CHANNEL_BUFFER: usize = 64;
+
+/// How long `drain_notifications` waits before checking the response
+/// channel — gives the server a moment to publish diagnostics after a
+/// didOpen/didChange before we move on.
+const DIAGNOSTIC_DRAIN_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Maximum time `shutdown()` waits for a graceful exit before killing.
+/// Some servers (notably terraform-ls) hang on `exit` — keep this
+/// short so a daemon shutdown doesn't stall on a misbehaving language.
+const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 use crate::protocol::{
     CompletionItem, CompletionResponse, Diagnostic, DocumentSymbol, GotoDefinitionResponse, Hover,
     Location, Notification, Request, Response,
@@ -36,7 +51,7 @@ impl LspClient {
         let stdout = child.stdout.take().unwrap();
 
         // Reader task: parse LSP messages from stdout, forward to channel
-        let (tx, rx) = mpsc::channel::<Response>(64);
+        let (tx, rx) = mpsc::channel::<Response>(RESPONSE_CHANNEL_BUFFER);
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
             loop {
@@ -272,7 +287,7 @@ impl LspClient {
     /// Drain any pending diagnostic notifications.
     pub async fn drain_notifications(&mut self) {
         // Give the server a moment to send notifications
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(DIAGNOSTIC_DRAIN_DELAY).await;
         while let Ok(msg) = self.rx.try_recv() {
             if msg.id.is_none() {
                 self.handle_notification(&msg);
@@ -288,7 +303,7 @@ impl LspClient {
             let _ = self.child.wait().await;
         };
         // Some servers (terraform-ls) hang on shutdown — don't block forever
-        if tokio::time::timeout(std::time::Duration::from_secs(3), graceful)
+        if tokio::time::timeout(SHUTDOWN_TIMEOUT, graceful)
             .await
             .is_err()
         {

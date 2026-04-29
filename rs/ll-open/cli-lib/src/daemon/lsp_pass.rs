@@ -12,6 +12,13 @@ use rusqlite::Connection;
 
 use super::enrichment::{EnrichmentPass, EnrichmentStats};
 
+/// Symbol-poll cadence for daemon-driven enrichment. Tighter than the
+/// one-shot `cmd_lsp` path because the daemon reuses the same server
+/// across many files in a batch — by the time a second file is opened
+/// the server is usually already indexed.
+const PASS_SYMBOL_POLL_MAX_ATTEMPTS: usize = 5;
+const PASS_SYMBOL_POLL_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// Single-source-of-truth for LSP language support: ID + extensions + the
 /// server invocation. Adding a language means adding one record; this makes
 /// drift between "we recognize the file" and "we can launch a server for it"
@@ -249,14 +256,14 @@ async fn enrich_files(
 
         // Poll for symbols (servers may need indexing time).
         let mut symbols = Vec::new();
-        for attempt in 0..5 {
+        for attempt in 0..PASS_SYMBOL_POLL_MAX_ATTEMPTS {
             match client.document_symbols(&file_uri).await {
                 Ok(s) if !s.is_empty() => {
                     symbols = s;
                     break;
                 }
-                _ if attempt < 4 => {
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                _ if attempt + 1 < PASS_SYMBOL_POLL_MAX_ATTEMPTS => {
+                    tokio::time::sleep(PASS_SYMBOL_POLL_DELAY).await;
                 }
                 _ => break,
             }

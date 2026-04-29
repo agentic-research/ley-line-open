@@ -767,52 +767,59 @@ fn lsp_hover_query(conn: &Connection, file: &str, line: u32, col: u32) -> Result
 
 /// Go-to-definition at a position. Auto-enriches if no data exists.
 fn op_lsp_defs(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
-    let (file, line, col) = parse_position(req)?;
-
-    let result = with_live_db(ctx, |conn| lsp_defs_query(conn, &file, line, col))?;
-
-    if result.is_empty() {
-        let enriched = with_live_db(ctx, |conn| Ok(maybe_enrich(ctx, conn, &file)))?;
-        if enriched {
-            let result = with_live_db(ctx, |conn| lsp_defs_query(conn, &file, line, col))?;
-            return Ok(json!({"ok": true, "definitions": result, "enriched": true}).to_string());
-        }
-    }
-
-    Ok(json!({"ok": true, "definitions": result}).to_string())
-}
-
-fn lsp_defs_query(conn: &Connection, file: &str, line: u32, col: u32) -> Result<Vec<serde_json::Value>> {
-    let node_id = match find_node_at_position(conn, file, line, col)? {
-        Some(id) => id,
-        None => return Ok(vec![]),
-    };
-    lsp_5col_position_rows(conn, &node_id, "_lsp_defs", "def")
+    op_lsp_position(ctx, req, "_lsp_defs", "def", "definitions")
 }
 
 /// Find references at a position. Auto-enriches if no data exists.
 fn op_lsp_refs(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
+    op_lsp_position(ctx, req, "_lsp_refs", "ref", "references")
+}
+
+/// Shared body for `lsp_defs` and `lsp_refs`. They differ only in the
+/// `_lsp_*` table queried, the column prefix in that table, and the JSON
+/// key under which results are returned. Both follow the same shape:
+/// resolve the node at (file, line, col), pull rows from the 5-column
+/// position table, retry once after lazy enrichment if the first attempt
+/// is empty.
+fn op_lsp_position(
+    ctx: &DaemonContext,
+    req: &serde_json::Value,
+    table: &str,
+    col_prefix: &str,
+    json_key: &str,
+) -> Result<String> {
     let (file, line, col) = parse_position(req)?;
 
-    let result = with_live_db(ctx, |conn| lsp_refs_query(conn, &file, line, col))?;
+    let do_query = |conn: &Connection| -> Result<Vec<serde_json::Value>> {
+        match find_node_at_position(conn, &file, line, col)? {
+            Some(id) => lsp_5col_position_rows(conn, &id, table, col_prefix),
+            None => Ok(vec![]),
+        }
+    };
 
+    let result = with_live_db(ctx, |conn| do_query(conn))?;
     if result.is_empty() {
         let enriched = with_live_db(ctx, |conn| Ok(maybe_enrich(ctx, conn, &file)))?;
         if enriched {
-            let result = with_live_db(ctx, |conn| lsp_refs_query(conn, &file, line, col))?;
-            return Ok(json!({"ok": true, "references": result, "enriched": true}).to_string());
+            let result = with_live_db(ctx, |conn| do_query(conn))?;
+            return Ok(lsp_position_response(json_key, result, true));
         }
     }
-
-    Ok(json!({"ok": true, "references": result}).to_string())
+    Ok(lsp_position_response(json_key, result, false))
 }
 
-fn lsp_refs_query(conn: &Connection, file: &str, line: u32, col: u32) -> Result<Vec<serde_json::Value>> {
-    let node_id = match find_node_at_position(conn, file, line, col)? {
-        Some(id) => id,
-        None => return Ok(vec![]),
-    };
-    lsp_5col_position_rows(conn, &node_id, "_lsp_refs", "ref")
+/// Build the JSON response for a position-based LSP query. Inserts the
+/// `enriched: true` marker only when the second attempt succeeded — the
+/// shape clients see on a fresh-cache hit must be identical to the
+/// shape on a warm hit (same fields, just no `enriched` key).
+fn lsp_position_response(json_key: &str, rows: Vec<serde_json::Value>, enriched: bool) -> String {
+    let mut obj = serde_json::Map::new();
+    obj.insert("ok".to_string(), json!(true));
+    obj.insert(json_key.to_string(), json!(rows));
+    if enriched {
+        obj.insert("enriched".to_string(), json!(true));
+    }
+    serde_json::Value::Object(obj).to_string()
 }
 
 /// Document symbols for a file.
@@ -1146,6 +1153,50 @@ mod tests {
             assert!(
                 handle_base_op(&ctx, name, &json!({})).is_some(),
                 "handle_base_op did not recognize canonical op `{name}`",
+            );
+        }
+    }
+
+    #[test]
+    fn lsp_position_response_omits_enriched_when_false() {
+        // Pinned shape: `enriched: true` must NOT appear when rows came
+        // from the warm cache. Clients distinguish "served from cache"
+        // vs "served after a lazy refresh" by the *presence* of the
+        // key — adding it always would silently break that signal.
+        let body = lsp_position_response("definitions", vec![], false);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ok"], true);
+        assert!(v["definitions"].is_array());
+        assert!(
+            v.get("enriched").is_none(),
+            "warm hit should not include `enriched` key, got {body}",
+        );
+    }
+
+    #[test]
+    fn lsp_position_response_includes_enriched_when_true() {
+        // Symmetric guard: when the helper is told to mark the response
+        // as enriched (i.e. second attempt succeeded), the marker must
+        // be present and equal to `true`.
+        let body = lsp_position_response("references", vec![json!({"x": 1})], true);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["enriched"], true);
+        assert_eq!(v["references"][0]["x"], 1);
+    }
+
+    #[test]
+    fn lsp_position_response_uses_caller_supplied_key() {
+        // Drift guard: the helper must use whatever `json_key` the caller
+        // passes — `definitions` for op_lsp_defs, `references` for op_lsp_refs.
+        // If a future caller picks a new key (e.g. `decls`), the helper must
+        // honor it without modification.
+        for key in ["definitions", "references", "decls"] {
+            let body = lsp_position_response(key, vec![], false);
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert!(
+                v.get(key).is_some(),
+                "expected key `{key}` in {body}",
             );
         }
     }

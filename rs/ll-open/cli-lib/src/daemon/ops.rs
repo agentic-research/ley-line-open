@@ -824,17 +824,21 @@ fn op_lsp_position(
         let enriched = with_live_db(ctx, |conn| Ok(maybe_enrich(ctx, conn, &file)))?;
         if enriched {
             let result = with_live_db(ctx, |conn| do_query(conn))?;
-            return Ok(lsp_position_response(json_key, result, true));
+            return Ok(lsp_rows_response(json_key, result, true));
         }
     }
-    Ok(lsp_position_response(json_key, result, false))
+    Ok(lsp_rows_response(json_key, result, false))
 }
 
-/// Build the JSON response for a position-based LSP query. Inserts the
-/// `enriched: true` marker only when the second attempt succeeded — the
+/// Build the JSON response for an LSP query. Inserts the
+/// `enriched: true` marker only when a lazy refresh just ran — the
 /// shape clients see on a fresh-cache hit must be identical to the
 /// shape on a warm hit (same fields, just no `enriched` key).
-fn lsp_position_response(json_key: &str, rows: Vec<serde_json::Value>, enriched: bool) -> String {
+///
+/// Used by both position queries (defs/refs/hover) where `enriched`
+/// reflects whether a retry happened, and by file-level queries
+/// (symbols/diagnostics) which always pass `enriched=false`.
+fn lsp_rows_response(json_key: &str, rows: Vec<serde_json::Value>, enriched: bool) -> String {
     let mut obj = serde_json::Map::new();
     obj.insert("ok".to_string(), json!(true));
     obj.insert(json_key.to_string(), json!(rows));
@@ -844,61 +848,70 @@ fn lsp_position_response(json_key: &str, rows: Vec<serde_json::Value>, enriched:
     serde_json::Value::Object(obj).to_string()
 }
 
+/// Run a single-file LSP rows query: `prepare_cached` the supplied SQL,
+/// bind `file` as `?1`, decode each row via `mapper`, collect into a
+/// `Vec<Value>`. Used by `op_lsp_symbols` and `op_lsp_diagnostics`,
+/// which differ only in the SELECTed columns and how each row is
+/// decoded — both share this pipeline.
+fn query_lsp_rows_for_file<F>(
+    conn: &Connection,
+    file: &str,
+    sql: &str,
+    mapper: F,
+) -> Result<Vec<serde_json::Value>>
+where
+    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value>,
+{
+    let mut stmt = conn.prepare_cached(sql)?;
+    let rows = stmt
+        .query_map([file], mapper)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// Document symbols for a file.
 fn op_lsp_symbols(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
     let file = parse_file_arg(req)?;
-
+    let sql = format!(
+        "SELECT node_id, symbol_kind, detail, start_line, start_col, end_line, end_col \
+         FROM _lsp WHERE {NODE_ID_FOR_FILE}"
+    );
     with_live_db(ctx, |conn| {
-        let mut stmt = conn.prepare_cached(
-            &format!(
-                "SELECT node_id, symbol_kind, detail, start_line, start_col, end_line, end_col \
-                 FROM _lsp WHERE {NODE_ID_FOR_FILE}"
-            ),
-        )?;
-        let rows: Vec<serde_json::Value> = stmt
-            .query_map([file], |row| {
-                Ok(json!({
-                    "node_id": row.get::<_, String>(0)?,
-                    "kind": row.get::<_, String>(1)?,
-                    "detail": row.get::<_, String>(2)?,
-                    "start_line": row.get::<_, i32>(3)?,
-                    "start_col": row.get::<_, i32>(4)?,
-                    "end_line": row.get::<_, i32>(5)?,
-                    "end_col": row.get::<_, i32>(6)?,
-                }))
-            })?
-            .collect::<Result<_, _>>()?;
-
-        Ok(json!({"ok": true, "symbols": rows}).to_string())
+        let rows = query_lsp_rows_for_file(conn, file, &sql, |row| {
+            Ok(json!({
+                "node_id": row.get::<_, String>(0)?,
+                "kind": row.get::<_, String>(1)?,
+                "detail": row.get::<_, String>(2)?,
+                "start_line": row.get::<_, i32>(3)?,
+                "start_col": row.get::<_, i32>(4)?,
+                "end_line": row.get::<_, i32>(5)?,
+                "end_col": row.get::<_, i32>(6)?,
+            }))
+        })?;
+        Ok(lsp_rows_response("symbols", rows, false))
     })
 }
 
 /// Diagnostics for a file.
 fn op_lsp_diagnostics(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
     let file = parse_file_arg(req)?;
-
+    let sql = format!(
+        "SELECT node_id, diagnostics, start_line, start_col, end_line, end_col \
+         FROM _lsp WHERE {NODE_ID_FOR_FILE} \
+         AND diagnostics IS NOT NULL AND diagnostics != ''"
+    );
     with_live_db(ctx, |conn| {
-        let mut stmt = conn.prepare_cached(
-            &format!(
-                "SELECT node_id, diagnostics, start_line, start_col, end_line, end_col \
-                 FROM _lsp WHERE {NODE_ID_FOR_FILE} \
-                 AND diagnostics IS NOT NULL AND diagnostics != ''"
-            ),
-        )?;
-        let rows: Vec<serde_json::Value> = stmt
-            .query_map([file], |row| {
-                Ok(json!({
-                    "node_id": row.get::<_, String>(0)?,
-                    "diagnostics": row.get::<_, String>(1)?,
-                    "start_line": row.get::<_, i32>(2)?,
-                    "start_col": row.get::<_, i32>(3)?,
-                    "end_line": row.get::<_, i32>(4)?,
-                    "end_col": row.get::<_, i32>(5)?,
-                }))
-            })?
-            .collect::<Result<_, _>>()?;
-
-        Ok(json!({"ok": true, "diagnostics": rows}).to_string())
+        let rows = query_lsp_rows_for_file(conn, file, &sql, |row| {
+            Ok(json!({
+                "node_id": row.get::<_, String>(0)?,
+                "diagnostics": row.get::<_, String>(1)?,
+                "start_line": row.get::<_, i32>(2)?,
+                "start_col": row.get::<_, i32>(3)?,
+                "end_line": row.get::<_, i32>(4)?,
+                "end_col": row.get::<_, i32>(5)?,
+            }))
+        })?;
+        Ok(lsp_rows_response("diagnostics", rows, false))
     })
 }
 
@@ -1317,12 +1330,61 @@ mod tests {
     }
 
     #[test]
-    fn lsp_position_response_omits_enriched_when_false() {
+    fn query_lsp_rows_for_file_returns_empty_when_no_match() {
+        // Pre-enrichment / no-rows-for-file is the common pre-LSP case;
+        // callers expect an empty Vec, not an error.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _lsp (node_id TEXT, foo TEXT);
+             INSERT INTO _lsp VALUES ('other.rs/x', 'bar');",
+        )
+        .unwrap();
+        let sql = format!(
+            "SELECT node_id, foo FROM _lsp WHERE {NODE_ID_FOR_FILE}"
+        );
+        let rows = query_lsp_rows_for_file(&conn, "src/lib.rs", &sql, |row| {
+            Ok(json!({"node_id": row.get::<_, String>(0)?, "foo": row.get::<_, String>(1)?}))
+        })
+        .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn query_lsp_rows_for_file_collects_matching_rows() {
+        // The helper must hand back exactly the rows whose node_id starts
+        // with `<file>/` — the LIKE prefix from NODE_ID_FOR_FILE is the
+        // boundary between scoped queries (used by symbols/diagnostics)
+        // and global queries (used by find_callers/find_defs).
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _lsp (node_id TEXT, foo TEXT);
+             INSERT INTO _lsp VALUES
+                ('src/lib.rs/a', 'one'),
+                ('src/lib.rs/b', 'two'),
+                ('src/other.rs/c', 'three');",
+        )
+        .unwrap();
+        let sql = format!(
+            "SELECT node_id, foo FROM _lsp WHERE {NODE_ID_FOR_FILE}"
+        );
+        let rows = query_lsp_rows_for_file(&conn, "src/lib.rs", &sql, |row| {
+            Ok(json!({"node_id": row.get::<_, String>(0)?, "foo": row.get::<_, String>(1)?}))
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 2, "expected 2 scoped rows, got {rows:?}");
+        let foos: std::collections::HashSet<&str> =
+            rows.iter().map(|r| r["foo"].as_str().unwrap()).collect();
+        assert!(foos.contains("one"));
+        assert!(foos.contains("two"));
+    }
+
+    #[test]
+    fn lsp_rows_response_omits_enriched_when_false() {
         // Pinned shape: `enriched: true` must NOT appear when rows came
         // from the warm cache. Clients distinguish "served from cache"
         // vs "served after a lazy refresh" by the *presence* of the
         // key — adding it always would silently break that signal.
-        let body = lsp_position_response("definitions", vec![], false);
+        let body = lsp_rows_response("definitions", vec![], false);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["ok"], true);
         assert!(v["definitions"].is_array());
@@ -1333,11 +1395,11 @@ mod tests {
     }
 
     #[test]
-    fn lsp_position_response_includes_enriched_when_true() {
+    fn lsp_rows_response_includes_enriched_when_true() {
         // Symmetric guard: when the helper is told to mark the response
         // as enriched (i.e. second attempt succeeded), the marker must
         // be present and equal to `true`.
-        let body = lsp_position_response("references", vec![json!({"x": 1})], true);
+        let body = lsp_rows_response("references", vec![json!({"x": 1})], true);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["ok"], true);
         assert_eq!(v["enriched"], true);
@@ -1345,13 +1407,13 @@ mod tests {
     }
 
     #[test]
-    fn lsp_position_response_uses_caller_supplied_key() {
+    fn lsp_rows_response_uses_caller_supplied_key() {
         // Drift guard: the helper must use whatever `json_key` the caller
         // passes — `definitions` for op_lsp_defs, `references` for op_lsp_refs.
         // If a future caller picks a new key (e.g. `decls`), the helper must
         // honor it without modification.
         for key in ["definitions", "references", "decls"] {
-            let body = lsp_position_response(key, vec![], false);
+            let body = lsp_rows_response(key, vec![], false);
             let v: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert!(
                 v.get(key).is_some(),

@@ -644,6 +644,35 @@ mod tests {
     use rusqlite::DatabaseName;
     use std::io::Cursor;
 
+    #[test]
+    fn create_lsp_schema_creates_all_indexes() {
+        // Scale-problem pin. The 4 _lsp* indexes accelerate the
+        // hot-path MCP queries (find_callers, find_defs, hover) on
+        // populated repos. The helm/charts ingest hit idx_parent_name
+        // at 185 MB doing real work; LSP indexes scale similarly when
+        // a real language server populates _lsp_refs/defs across a
+        // 50k-symbol corpus. A refactor that DROP'd any of these from
+        // their _DDL would silently degrade query latency to full-
+        // table scan. Pin existence directly via sqlite_master.
+        let conn = Connection::open_in_memory().unwrap();
+        create_lsp_schema(&conn).unwrap();
+        for index_name in [
+            "idx_lsp_kind",
+            "idx_lsp_defs_node",
+            "idx_lsp_refs_node",
+            "idx_lsp_completions_node",
+        ] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND name=?1",
+                    [index_name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(exists, "missing LSP index: {index_name}");
+        }
+    }
+
     fn make_symbol(
         name: &str,
         kind: SymbolKind,

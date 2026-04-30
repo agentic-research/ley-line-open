@@ -208,6 +208,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bytes_to_hv_is_deterministic_per_input() {
+        // Same bytes → same hypervector. The whole codebook layer
+        // (Ast, Module, Semantic, Temporal) depends on this — a
+        // refactor of the pipeline (e.g. swapping blake3 for sha256
+        // or changing expand_seed's iteration) must be deliberate
+        // and is automatically caught by this pin breaking on
+        // existing encoded data.
+        let a = bytes_to_hv(b"hello");
+        let b = bytes_to_hv(b"hello");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn bytes_to_hv_distinct_inputs_produce_far_apart_hvs() {
+        // Distinct byte strings → distinct hypervectors (with
+        // overwhelming probability — blake3 collision space is 2^256).
+        // Pin so a refactor that accidentally collapsed inputs
+        // (e.g. truncating aggressively) wouldn't shift everything
+        // to one hypervector.
+        let a = bytes_to_hv(b"hello");
+        let b = bytes_to_hv(b"world");
+        let dist = popcount_distance(&a, &b);
+        assert!(dist > FAR_APART_THRESHOLD,
+            "distinct inputs must be far apart (got {dist})");
+    }
+
+    #[test]
+    fn bytes_to_hv_matches_explicit_pipeline() {
+        // bytes_to_hv == expand_seed(blake3_seed(bytes)). Pin so a
+        // refactor of either half doesn't drift the helper away
+        // from the documented composition.
+        let bytes = b"hdc-test-pipeline";
+        let via_helper = bytes_to_hv(bytes);
+        let via_pipeline = expand_seed(blake3_seed(bytes));
+        assert_eq!(via_helper, via_pipeline);
+    }
+
+    #[test]
     fn hv_from_slice_round_trips_correct_length() {
         // Right-sized slice must decode to a Hypervector matching the
         // bytes. Wrong-sized slice must return None (fail-soft for

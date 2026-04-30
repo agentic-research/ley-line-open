@@ -18,7 +18,7 @@
 //! fixed seed string `"hdc-semantic-v1"`, so any daemon instance with
 //! the same embedder produces identical projections.
 
-use crate::util::{blake3_seed, Hypervector};
+use crate::util::Hypervector;
 use crate::{D_BITS, D_BYTES};
 
 /// Domain seed for the semantic codebook's hyperplane matrix. NEVER
@@ -49,19 +49,10 @@ impl SemanticCodebook {
     /// Construct with a custom seed. Useful for test fixtures and
     /// migration scenarios. Production callers should use `new`.
     pub fn new_with_seed(emb_dim: usize, seed_tag: &str) -> Self {
-        let base_seed = blake3_seed(seed_tag.as_bytes());
-        let mut hyperplanes = Vec::with_capacity(D_BITS);
-        for i in 0..D_BITS {
-            // Each hyperplane gets its own seed derived from base + index.
-            // Box-Muller uses two uniforms per Gaussian; pull from a
-            // dedicated PRNG state per row so rows are independent.
-            let row_seed = blake3_seed(
-                &[base_seed.to_le_bytes().as_slice(), (i as u64).to_le_bytes().as_slice()]
-                    .concat(),
-            );
-            hyperplanes.push(gaussian_row(row_seed, emb_dim));
+        SemanticCodebook {
+            hyperplanes: super::build_hyperplane_matrix(seed_tag, emb_dim),
+            emb_dim,
         }
-        SemanticCodebook { hyperplanes, emb_dim }
     }
 
     /// Project a dense embedding to a D-bit hypervector. Bit `i` is

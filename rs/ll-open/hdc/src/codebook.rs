@@ -105,6 +105,36 @@ pub fn canonical_signature_bytes(
     buf
 }
 
+/// Build a `D_BITS × width` Gaussian-random hyperplane matrix
+/// deterministically from a seed tag. Used by every Charikar
+/// simhash codebook (Semantic, Temporal). Each row gets a
+/// blake3-derived per-row seed so rows are independent.
+///
+/// Returns row-major `Vec<Vec<f32>>` where `hyperplanes[i]` is the
+/// i-th hyperplane normal vector of length `width`.
+///
+/// CHANGING THE LAYOUT (per-row seeding, Box-Muller transform, etc.)
+/// breaks every encoded simhash hypervector. Bump a layer's seed tag
+/// for migration; don't silently rewrite this function.
+pub fn build_hyperplane_matrix(seed_tag: &str, width: usize) -> Vec<Vec<f32>> {
+    let base_seed = crate::util::blake3_seed(seed_tag.as_bytes());
+    let mut hyperplanes = Vec::with_capacity(crate::D_BITS);
+    for i in 0..crate::D_BITS {
+        // Each hyperplane gets its own seed derived from base + index.
+        // Box-Muller uses two uniforms per Gaussian; per-row PRNG state
+        // keeps rows independent.
+        let row_seed = crate::util::blake3_seed(
+            &[
+                base_seed.to_le_bytes().as_slice(),
+                (i as u64).to_le_bytes().as_slice(),
+            ]
+            .concat(),
+        );
+        hyperplanes.push(crate::codebook::semantic::gaussian_row(row_seed, width));
+    }
+    hyperplanes
+}
+
 pub mod ast;
 pub use ast::AstCodebook;
 

@@ -29,7 +29,7 @@
 
 use std::collections::HashMap;
 
-use crate::util::{blake3_seed, Hypervector};
+use crate::util::Hypervector;
 use crate::{D_BITS, D_BYTES};
 
 /// Default decay constant: commits older than τ contribute weight
@@ -159,16 +159,10 @@ impl TemporalCodebook {
     }
 
     pub fn new_with_seed(max_scopes: usize, seed_tag: &str) -> Self {
-        let base_seed = blake3_seed(seed_tag.as_bytes());
-        let mut hyperplanes = Vec::with_capacity(D_BITS);
-        for i in 0..D_BITS {
-            let row_seed = blake3_seed(
-                &[base_seed.to_le_bytes().as_slice(), (i as u64).to_le_bytes().as_slice()]
-                    .concat(),
-            );
-            hyperplanes.push(super::semantic::gaussian_row(row_seed, max_scopes));
+        TemporalCodebook {
+            hyperplanes: super::build_hyperplane_matrix(seed_tag, max_scopes),
+            max_scopes,
         }
-        TemporalCodebook { hyperplanes, max_scopes }
     }
 
     /// Project a sparse row to a D-bit hypervector. Bit `i` is

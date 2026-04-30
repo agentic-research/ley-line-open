@@ -98,6 +98,13 @@ async fn main() -> Result<()> {
             source,
             mcp_port,
         } => {
+            // KNOWN scale limitation: arena_size_mib defaults to 64
+            // (see Cmd::Daemon { arena_size_mib, default_value_t = 64 }).
+            // For registry-scale ingest (helm/charts: 1.1 GB output db
+            // for 4.5k YAML files) the user must pass --arena-size-mib
+            // explicitly or `op_load` will error with "exceeds arena
+            // buffer capacity". A future bump should be deliberate;
+            // pinned in tests::default_arena_size_is_64.
             // Default arena/ctrl to ~/.mache/ so mache's path containment check passes.
             let mache_dir = dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
@@ -119,6 +126,46 @@ async fn main() -> Result<()> {
                 mcp_port,
             )
             .await
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn default_arena_size_is_64_mib_known_scale_limit() {
+        // KNOWN scale limit pinned. The CLI's --arena-size-mib defaults
+        // to 64 MiB (~32 MiB per buffer after header). At registry-
+        // scale (helm/charts 1.1 GB ingest, 50k-file Aports clones) the
+        // default is too small and op_load errors with "exceeds arena
+        // buffer capacity". This pin makes a future default-bump a
+        // deliberate, visible behavior change rather than a silent
+        // shift. Update this test alongside any default_value_t change.
+        let cli = Cli::try_parse_from(["leyline", "daemon"]).unwrap();
+        match cli.command {
+            Cmd::Daemon { arena_size_mib, .. } => {
+                assert_eq!(
+                    arena_size_mib, 64,
+                    "default arena size pinned at 64 MiB (registry-scale workflows must pass --arena-size-mib explicitly)",
+                );
+            }
+            _ => panic!("expected Daemon variant"),
+        }
+    }
+
+    #[test]
+    fn default_nfs_port_is_zero() {
+        // 0 = "auto-assign". Pin so a refactor doesn't silently bind
+        // to a fixed port and break parallel daemon launches.
+        let cli = Cli::try_parse_from(["leyline", "daemon"]).unwrap();
+        match cli.command {
+            Cmd::Daemon { nfs_port, .. } => {
+                assert_eq!(nfs_port, 0, "nfs_port=0 means auto-assign");
+            }
+            _ => panic!("expected Daemon variant"),
         }
     }
 }

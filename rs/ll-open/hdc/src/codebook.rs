@@ -317,6 +317,37 @@ mod tests {
     }
 
     #[test]
+    fn simhash_signs_fewer_planes_than_d_bits_clears_remainder() {
+        // If hyperplanes has fewer than D_BITS rows, only the first
+        // N bits can be set; the remaining D_BITS - N bits stay 0
+        // (the for-loop never visits them). Production callers always
+        // supply D_BITS rows via build_hyperplane_matrix, but the
+        // function's signature accepts any &[Vec<f32>]. A refactor
+        // that filled the remainder with default-bits ("zero-pad
+        // wraparound") would silently shift the high bits of the
+        // output for sub-D inputs.
+        let n = 100; // arbitrary, < D_BITS
+        let hyperplanes: Vec<Vec<f32>> = (0..n).map(|_| vec![1.0]).collect();
+        let signs = simhash_signs(&hyperplanes, |_| 1.0);
+        // Bits 0..n: set (positive dot, >= 0).
+        for bit in 0..n {
+            assert_eq!(
+                (signs[bit / 8] >> (bit % 8)) & 1,
+                1,
+                "bit {bit} (within plane range) must be set",
+            );
+        }
+        // Bits n..D_BITS: must remain 0.
+        for bit in n..D_BITS {
+            assert_eq!(
+                (signs[bit / 8] >> (bit % 8)) & 1,
+                0,
+                "bit {bit} (beyond plane range) must remain 0",
+            );
+        }
+    }
+
+    #[test]
     fn simhash_signs_all_negative_dots_yield_zero_hv() {
         // Sister pin to simhash_signs_thresholds_at_zero_inclusive
         // (which covers the >= 0 inclusive case via per-bit probes)

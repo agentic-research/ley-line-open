@@ -93,6 +93,19 @@ mod tests {
         parse_and_encode_tree(src, &lang, &GoCanonicalMap).expect("parse Go")
     }
 
+    /// Parse + encode in one step. Used by clustering tests where the
+    /// EncoderNode is intermediate — only the final hypervector matters.
+    fn encode_go(src: &str, cb: &leyline_hdc::codebook::AstCodebook) -> leyline_hdc::Hypervector {
+        leyline_hdc::encode_fresh(&parse_go(src), cb)
+    }
+
+    /// Hamming distance normalized to [0, 1] (d/D). Clustering tests
+    /// compare against fractional thresholds because absolute distance
+    /// scales with D.
+    fn normalized_distance(a: &leyline_hdc::Hypervector, b: &leyline_hdc::Hypervector) -> f64 {
+        leyline_hdc::popcount_distance(a, b) as f64 / (leyline_hdc::D_BYTES * 8) as f64
+    }
+
     #[test]
     fn parses_simple_go_function() {
         // Sanity: parsing must produce a non-trivial tree.
@@ -140,9 +153,6 @@ mod tests {
     #[test]
     fn ast_codebook_clusters_near_clones_in_real_go_code() {
         use leyline_hdc::codebook::AstCodebook;
-        use leyline_hdc::{encode_fresh, popcount_distance, D_BYTES};
-
-        const D_BITS: f64 = (D_BYTES * 8) as f64;
 
         // A and A_prime: same shape, different identifiers and literal value.
         // Both: package + func with one int param, returning param + literal.
@@ -156,15 +166,15 @@ mod tests {
         let src_c = "package m\n\nfunc Loop() { for i := 0; i < 10; i++ { println(i) } }\n";
 
         let cb = AstCodebook::new();
-        let hv_a = encode_fresh(&parse_go(src_a), &cb);
-        let hv_a_prime = encode_fresh(&parse_go(src_a_prime), &cb);
-        let hv_b = encode_fresh(&parse_go(src_b), &cb);
-        let hv_c = encode_fresh(&parse_go(src_c), &cb);
+        let hv_a = encode_go(src_a, &cb);
+        let hv_a_prime = encode_go(src_a_prime, &cb);
+        let hv_b = encode_go(src_b, &cb);
+        let hv_c = encode_go(src_c, &cb);
 
-        let d_clones = popcount_distance(&hv_a, &hv_a_prime) as f64 / D_BITS;
-        let d_a_b = popcount_distance(&hv_a, &hv_b) as f64 / D_BITS;
-        let d_a_c = popcount_distance(&hv_a, &hv_c) as f64 / D_BITS;
-        let d_b_c = popcount_distance(&hv_b, &hv_c) as f64 / D_BITS;
+        let d_clones = normalized_distance(&hv_a, &hv_a_prime);
+        let d_a_b = normalized_distance(&hv_a, &hv_b);
+        let d_a_c = normalized_distance(&hv_a, &hv_c);
+        let d_b_c = normalized_distance(&hv_b, &hv_c);
 
         eprintln!("d(A,A') = {d_clones:.4} (clones — expect < 0.20)");
         eprintln!("d(A,B)  = {d_a_b:.4} (distinct — expect > 0.35)");

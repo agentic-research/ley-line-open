@@ -773,27 +773,66 @@ fn try_enrich_file(ctx: &DaemonContext, file: &str) -> bool {
 /// Hover info at a position. Auto-enriches if no data exists.
 fn op_lsp_hover(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
     let (file, line, col) = parse_position(req)?;
+    let (result, enriched) = with_lazy_enrich_retry(
+        ctx,
+        &file,
+        |conn| lsp_hover_query(conn, &file, line, col),
+        |opt| opt.is_none(),
+    )?;
+    Ok(hover_response(result, enriched))
+}
 
-    // First attempt.
-    let result = with_live_db(ctx, |conn| {
-        lsp_hover_query(conn, &file, line, col)
-    })?;
-
-    // If no data and file not enriched yet, trigger enrichment and retry.
-    if result.is_none() {
-        let enriched = with_live_db(ctx, |conn| Ok(maybe_enrich(ctx, conn, &file)))?;
-        if enriched {
-            let result = with_live_db(ctx, |conn| lsp_hover_query(conn, &file, line, col))?;
-            if let Some((hover, node_id)) = result {
-                return Ok(json!({"ok": true, "hover": hover, "node_id": node_id, "enriched": true}).to_string());
-            }
+/// Build the JSON response for `lsp_hover`. The `enriched: true` marker
+/// is set whenever a lazy refresh just ran — independent of whether the
+/// retry produced a hit. Clients use this to distinguish "no data, never
+/// enriched" (worth retrying) from "no data, just enriched" (don't retry).
+fn hover_response(result: Option<(String, String)>, enriched: bool) -> String {
+    let mut obj = serde_json::Map::new();
+    obj.insert("ok".to_string(), json!(true));
+    match result {
+        Some((hover, node_id)) => {
+            obj.insert("hover".to_string(), json!(hover));
+            obj.insert("node_id".to_string(), json!(node_id));
+        }
+        None => {
+            obj.insert("hover".to_string(), serde_json::Value::Null);
         }
     }
-
-    match result {
-        Some((hover, node_id)) => Ok(json!({"ok": true, "hover": hover, "node_id": node_id}).to_string()),
-        None => Ok(json!({"ok": true, "hover": null}).to_string()),
+    if enriched {
+        obj.insert("enriched".to_string(), json!(true));
     }
+    serde_json::Value::Object(obj).to_string()
+}
+
+/// Run an LSP query with one optional lazy-enrichment retry. If the first
+/// attempt's result satisfies `is_empty` AND the file hasn't been enriched
+/// yet, trigger enrichment and re-run the query once. Returns the final
+/// result paired with a flag indicating whether the retry actually ran
+/// (whether or not it produced a hit).
+///
+/// Centralizing this collapses the previously-divergent retry logic in
+/// `op_lsp_hover` (which dropped `enriched: true` on a null retry) and
+/// `op_lsp_position` (which kept it). Both now share one code path.
+fn with_lazy_enrich_retry<T, IsEmpty, Query>(
+    ctx: &DaemonContext,
+    file: &str,
+    mut query: Query,
+    is_empty: IsEmpty,
+) -> Result<(T, bool)>
+where
+    Query: FnMut(&Connection) -> Result<T>,
+    IsEmpty: Fn(&T) -> bool,
+{
+    let result = with_live_db(ctx, |conn| query(conn))?;
+    if !is_empty(&result) {
+        return Ok((result, false));
+    }
+    let enriched = with_live_db(ctx, |conn| Ok(maybe_enrich(ctx, conn, file)))?;
+    if !enriched {
+        return Ok((result, false));
+    }
+    let result = with_live_db(ctx, |conn| query(conn))?;
+    Ok((result, true))
 }
 
 fn lsp_hover_query(conn: &Connection, file: &str, line: u32, col: u32) -> Result<Option<(String, String)>> {
@@ -834,23 +873,16 @@ fn op_lsp_position(
     json_key: &str,
 ) -> Result<String> {
     let (file, line, col) = parse_position(req)?;
-
-    let do_query = |conn: &Connection| -> Result<Vec<serde_json::Value>> {
-        match find_node_at_position(conn, &file, line, col)? {
+    let (rows, enriched) = with_lazy_enrich_retry(
+        ctx,
+        &file,
+        |conn| match find_node_at_position(conn, &file, line, col)? {
             Some(id) => lsp_5col_position_rows(conn, &id, table, col_prefix),
             None => Ok(vec![]),
-        }
-    };
-
-    let result = with_live_db(ctx, |conn| do_query(conn))?;
-    if result.is_empty() {
-        let enriched = with_live_db(ctx, |conn| Ok(maybe_enrich(ctx, conn, &file)))?;
-        if enriched {
-            let result = with_live_db(ctx, |conn| do_query(conn))?;
-            return Ok(lsp_rows_response(json_key, result, true));
-        }
-    }
-    Ok(lsp_rows_response(json_key, result, false))
+        },
+        |v: &Vec<serde_json::Value>| v.is_empty(),
+    )?;
+    Ok(lsp_rows_response(json_key, rows, enriched))
 }
 
 /// Build the JSON response for an LSP query. Inserts the
@@ -1678,6 +1710,61 @@ mod tests {
         assert_eq!(v["ok"], true);
         assert_eq!(v["enriched"], true);
         assert_eq!(v["references"][0]["x"], 1);
+    }
+
+    #[test]
+    fn hover_response_some_warm_hit_omits_enriched() {
+        // Symmetric to lsp_rows_response_omits_enriched_when_false:
+        // warm hover hit must NOT carry `enriched` key.
+        let body = hover_response(Some(("docs".into(), "n0".into())), false);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["hover"], "docs");
+        assert_eq!(v["node_id"], "n0");
+        assert!(
+            v.get("enriched").is_none(),
+            "warm hover hit should not include `enriched`, got {body}",
+        );
+    }
+
+    #[test]
+    fn hover_response_some_after_enrich_marks_enriched() {
+        // Lazy-refresh that produced a hit: `enriched: true` must appear.
+        let body = hover_response(Some(("docs".into(), "n0".into())), true);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["enriched"], true);
+        assert_eq!(v["hover"], "docs");
+    }
+
+    #[test]
+    fn hover_response_none_after_enrich_still_marks_enriched() {
+        // Regression pin for the bug fixed in this commit. Previously when
+        // op_lsp_hover ran enrichment but the retry returned None, the
+        // response dropped `enriched: true` — clients couldn't distinguish
+        // "no data, never enriched" from "no data, just enriched (don't
+        // retry)". The new contract: `enriched` reflects whether the retry
+        // RAN, not whether it produced a hit.
+        let body = hover_response(None, true);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ok"], true);
+        assert!(v["hover"].is_null(), "hover must be JSON null, got {body}");
+        assert_eq!(
+            v["enriched"], true,
+            "post-enrich null hover MUST still mark enriched=true: {body}",
+        );
+    }
+
+    #[test]
+    fn hover_response_none_warm_omits_enriched() {
+        // Pre-enrichment cold miss: no `enriched` marker (signals to the
+        // client that a retry is worth attempting).
+        let body = hover_response(None, false);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["hover"].is_null());
+        assert!(
+            v.get("enriched").is_none(),
+            "cold-miss hover should omit `enriched`, got {body}",
+        );
     }
 
     #[test]

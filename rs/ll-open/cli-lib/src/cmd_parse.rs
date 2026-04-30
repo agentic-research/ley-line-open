@@ -146,20 +146,27 @@ pub fn parse_into_conn(
         .transpose()
         .context("invalid --lang")?;
 
-    let mut files = Vec::new();
-    if let Some(scope) = scope {
+    let files = if let Some(scope) = scope {
         // Scoped pass — caller (typically git watcher) supplied the file set.
-        // Only include paths that still exist; vanished paths fall through
-        // to the deletion sweep below.
+        // Pre-size to scope.len(): we may filter out vanished paths but
+        // never grow beyond that bound.
+        let mut v: Vec<PathBuf> = Vec::with_capacity(scope.len());
         for rel in scope {
             let abs = source.join(rel);
             if abs.exists() {
-                files.push(abs);
+                v.push(abs);
             }
         }
+        v
     } else {
-        collect_files(source, &mut files)?;
-    }
+        // Full-tree walk — collect_files doesn't know the file count up
+        // front (no cheap way without a pre-pass), so the inner Vec
+        // resizes during traversal. Acceptable trade-off: registry-scale
+        // walks dominated by stat/readdir cost, not Vec resizing.
+        let mut v = Vec::new();
+        collect_files(source, &mut v)?;
+        v
+    };
 
     // Check if tables already exist (incremental mode).
     let incremental = conn
@@ -189,7 +196,12 @@ pub fn parse_into_conn(
         HashMap::new()
     };
 
-    let mut to_parse: Vec<(String, PathBuf, TsLanguage, i64, i64)> = Vec::new();
+    // Pre-allocate worst-case (every file gets reparsed) to avoid Vec
+    // resizes during the classification loop. At registry-repo scale
+    // (50k+ files) the default doubling-resize pattern would do
+    // ~16 reallocations from 4-element initial capacity to 50000.
+    let mut to_parse: Vec<(String, PathBuf, TsLanguage, i64, i64)> =
+        Vec::with_capacity(files.len());
     let mut unchanged = 0u64;
     let mut oversized = 0u64;
 

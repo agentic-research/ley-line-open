@@ -559,6 +559,17 @@ mod tests {
         HvCell::new(id, kind).with_stalk(LayerKind::Ast, stalk_for(ast_seed))
     }
 
+    /// Bytewise XOR of two 32-byte blake3 hashes. Used by the
+    /// structural-root tests to compute deltas. Replaces a 3-line
+    /// for-loop that appeared 3× across two tests.
+    fn xor32(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for i in 0..32 {
+            out[i] = a[i] ^ b[i];
+        }
+        out
+    }
+
     #[test]
     fn empty_complex_has_stable_root() {
         // Empty-complex root must be deterministic — clients use it as
@@ -785,12 +796,8 @@ mod tests {
         // two structural roots — the AST contribution is the only
         // difference.
         let ast_2 = cx2.merkle_root_for_layer(LayerKind::Ast);
-        let mut delta_layer = [0u8; 32];
-        let mut delta_struct = [0u8; 32];
-        for i in 0..32 {
-            delta_layer[i] = ast[i] ^ ast_2[i];
-            delta_struct[i] = structural[i] ^ structural_2[i];
-        }
+        let delta_layer = xor32(&ast, &ast_2);
+        let delta_struct = xor32(&structural, &structural_2);
         assert_eq!(delta_layer, delta_struct, "structural root delta == AST delta when only AST changed");
         // sem unused but kept for documentation: confirm Semantic
         // root is non-zero (sanity).
@@ -1122,12 +1129,10 @@ mod tests {
         let ast_after = cx.merkle_root_for_layer(LayerKind::Ast);
         let sem_after = cx.merkle_root_for_layer(LayerKind::Semantic);
 
-        let mut delta_struct = [0u8; 32];
-        let mut delta_combined = [0u8; 32];
-        for i in 0..32 {
-            delta_struct[i] = struct_before[i] ^ struct_after[i];
-            delta_combined[i] = (ast_before[i] ^ ast_after[i]) ^ (sem_before[i] ^ sem_after[i]);
-        }
+        let delta_struct = xor32(&struct_before, &struct_after);
+        let delta_ast = xor32(&ast_before, &ast_after);
+        let delta_sem = xor32(&sem_before, &sem_after);
+        let delta_combined = xor32(&delta_ast, &delta_sem);
         assert_eq!(
             delta_struct, delta_combined,
             "structural delta must equal XOR of all changed-layer deltas"

@@ -124,7 +124,7 @@ fn next_uniform(state: &mut u64) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::popcount_distance;
+    use crate::util::{assert_far_apart, popcount_distance, ZERO_HV};
 
     /// Tolerance margin for distance assertions on small embedding
     /// dims — Box-Muller variance + small-sample-projection noise
@@ -165,7 +165,7 @@ mod tests {
         // mid-query shouldn't crash on a single bad embedding.
         let cb = SemanticCodebook::new(16);
         let bad: Vec<f32> = vec![0.1; 32];
-        assert_eq!(cb.project(&bad), crate::util::ZERO_HV);
+        assert_eq!(cb.project(&bad), ZERO_HV);
     }
 
     #[test]
@@ -258,7 +258,7 @@ mod tests {
         let emb: Vec<f32> = (0..32).map(|i| i as f32 - 16.0).collect();
         let hv_v1 = cb_v1.project(&emb);
         let hv_v2 = cb_v2.project(&emb);
-        crate::util::assert_far_apart(
+        assert_far_apart(
             &hv_v1,
             &hv_v2,
             "semantic codebook v1 vs v2 must produce far-apart projections",

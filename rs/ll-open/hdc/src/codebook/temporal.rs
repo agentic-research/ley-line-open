@@ -196,7 +196,7 @@ impl TemporalCodebook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::popcount_distance;
+    use crate::util::{assert_far_apart, popcount_distance};
 
     /// One day in seconds — convenience for time-decay tests.
     const DAY: f64 = 86_400.0;
@@ -371,7 +371,7 @@ mod tests {
         let cb_v2 = TemporalCodebook::new_with_seed(8, "hdc-temporal-v2");
         let hv_v1 = cb_v1.project_scope(&m, "a");
         let hv_v2 = cb_v2.project_scope(&m, "a");
-        crate::util::assert_far_apart(
+        assert_far_apart(
             &hv_v1,
             &hv_v2,
             "temporal codebook v1 vs v2 must produce far-apart projections",

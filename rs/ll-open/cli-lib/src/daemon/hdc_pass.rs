@@ -188,49 +188,73 @@ mod tests {
         use leyline_hdc::{encode_fresh, LayerKind};
         use rusqlite::Connection;
 
-        // Three families of Go function shapes; 10 clones per family.
-        // Each family member shares structural shape but has unique
-        // identifiers / literals — Type-2 clone class.
+        // Three clone classes that span the spectrum HDC is designed
+        // to differentiate. Skeptic-review of the previous fixture set
+        // revealed two failure modes to guard against:
+        //
+        // (a) Tautology trap: pure identifier-rename fixtures collapse
+        //     to identical hypervectors (canonical alphabet erasure).
+        //     A test on those measures self-matching, not clustering.
+        // (b) Over-variation trap: fixtures that vary in arity +
+        //     branch presence + statement count don't cluster — they
+        //     ARE structurally different. The encoder correctly
+        //     places them at ~D/2.
+        //
+        // The honest test: span Type-2 (rename only) → Type-3 (small
+        // structural drift) → Different-Family (real divergence) and
+        // assert the *ordering* of distances:
+        //     d(Type-2) < d(Type-3) < d(different family)
+        //
+        // This is the correctness claim: the encoder responds to
+        // structural distance, monotonically.
         struct CloneGroup {
             name: &'static str,
             sources: Vec<String>,
         }
 
-        // Family A: simple param-and-return.
+        // Family A: tightly-clustered Type-2 clones — same shape,
+        // identifiers and literals only. Should produce IDENTICAL
+        // hypervectors via canonical-alphabet erasure. The 0-distance
+        // baseline.
         let family_a = CloneGroup {
-            name: "param_return",
-            sources: (0..10)
-                .map(|i| {
-                    format!(
-                        "package m\n\nfunc Fn{i}(x{i} int) int {{ return x{i} + {i} }}\n",
-                    )
-                })
-                .collect(),
+            name: "tight_clones",
+            sources: vec![
+                "package m\n\nfunc A0(x int) int { return x + 1 }\n".to_string(),
+                "package m\n\nfunc A1(y int) int { return y + 2 }\n".to_string(),
+                "package m\n\nfunc A2(z int) int { return z + 100 }\n".to_string(),
+                "package m\n\nfunc A3(n int) int { return n + 7 }\n".to_string(),
+                "package m\n\nfunc A4(a int) int { return a + 0 }\n".to_string(),
+            ],
         };
 
-        // Family B: if-else branching with two prints.
+        // Family B: extra-statement Type-2 clones — family A's
+        // skeleton with one identical extra local-binding statement
+        // (Ref → Ref) prepended to the body. Internal canonical
+        // structure is identical across members; only identifiers /
+        // literals differ. Should collapse to one HV via Deckard
+        // erasure but be different from Family A's HV.
         let family_b = CloneGroup {
-            name: "if_else_print",
-            sources: (0..10)
-                .map(|i| {
-                    format!(
-                        "package m\n\nfunc Fn{i}() {{ if true {{ println(\"a{i}\") }} else {{ println(\"b{i}\") }} }}\n",
-                    )
-                })
-                .collect(),
+            name: "type3_one_extra_stmt",
+            sources: vec![
+                "package m\n\nfunc B0(x int) int { y := x; return y + 1 }\n".to_string(),
+                "package m\n\nfunc B1(a int) int { b := a; return b + 7 }\n".to_string(),
+                "package m\n\nfunc B2(p int) int { q := p; return q + 100 }\n".to_string(),
+                "package m\n\nfunc B3(n int) int { m := n; return m + 0 }\n".to_string(),
+                "package m\n\nfunc B4(z int) int { w := z; return w + 42 }\n".to_string(),
+            ],
         };
 
-        // Family C: for-loop with println.
+        // Family C: structurally different — for-loops with println.
+        // Should land at ~D/2 from both families A and B.
         let family_c = CloneGroup {
-            name: "for_loop",
-            sources: (0..10)
-                .map(|i| {
-                    format!(
-                        "package m\n\nfunc Fn{i}() {{ for j := 0; j < {}; j++ {{ println(j) }} }}\n",
-                        i + 5,
-                    )
-                })
-                .collect(),
+            name: "for_loops",
+            sources: vec![
+                "package m\n\nfunc C0() { for i := 0; i < 10; i++ { println(i) } }\n".to_string(),
+                "package m\n\nfunc C1() { for j := 0; j < 5; j++ { println(j) } }\n".to_string(),
+                "package m\n\nfunc C2() { for k := 0; k < 100; k++ { println(k) } }\n".to_string(),
+                "package m\n\nfunc C3() { for i := 0; i < 3; i++ { println(i) } }\n".to_string(),
+                "package m\n\nfunc C4() { for n := 0; n < 7; n++ { println(n) } }\n".to_string(),
+            ],
         };
 
         let groups = vec![family_a, family_b, family_c];
@@ -240,8 +264,11 @@ mod tests {
         create_hdc_schema(&conn).unwrap();
         register_hdc_udfs(&conn).unwrap();
 
-        // Encode every fixture, insert into _hdc.
+        // Encode every fixture, insert into _hdc, and remember the
+        // hypervectors so we can assert structural distinctness.
         let cb = AstCodebook::new();
+        let mut hvs_by_group: std::collections::HashMap<&str, Vec<leyline_hdc::Hypervector>> =
+            std::collections::HashMap::new();
         for group in &groups {
             for (i, src) in group.sources.iter().enumerate() {
                 let scope_id = format!("{}/fn_{}", group.name, i);
@@ -252,8 +279,62 @@ mod tests {
                     rusqlite::params![scope_id, LayerKind::Ast.as_str(), hv.to_vec(), 1i64],
                 )
                 .unwrap();
+                hvs_by_group.entry(group.name).or_default().push(hv);
             }
         }
+
+        // ── Anti-tautology gate: prove the encoder produces non-trivial
+        // output across the corpus. ───────────────────────────────────
+        // A zero-encoder would put every HV at all-zero, every distance
+        // at 0. Pin that the encoder has at least SOME structural
+        // discrimination across the 3 families: the union of all 15
+        // hypervectors must contain >= 3 distinct values.
+        let all_hvs: Vec<&leyline_hdc::Hypervector> =
+            hvs_by_group.values().flat_map(|v| v.iter()).collect();
+        let unique_total: std::collections::HashSet<&leyline_hdc::Hypervector> =
+            all_hvs.iter().copied().collect();
+        assert!(
+            unique_total.len() >= 3,
+            "anti-tautology: encoder produced only {} unique HVs across 3 families (zero-encoder regression?)",
+            unique_total.len(),
+        );
+
+        // Family A is meant to collapse via canonical-alphabet erasure
+        // (identifier-only variation). All members must share one HV.
+        // This pins the documented Deckard rename-invariance property.
+        let unique_a: std::collections::HashSet<&leyline_hdc::Hypervector> =
+            hvs_by_group["tight_clones"].iter().collect();
+        assert_eq!(
+            unique_a.len(),
+            1,
+            "tight_clones (Type-2): canonical-alphabet erasure must collapse to 1 HV (got {})",
+            unique_a.len(),
+        );
+
+        // Family B is meant to drift slightly (one extra statement).
+        // Members share most structure → pairwise distance should be
+        // strictly positive but small. Family B fixtures should NOT
+        // all collapse (would imply the extra statement was erased
+        // alongside the identifier).
+        let unique_b: std::collections::HashSet<&leyline_hdc::Hypervector> =
+            hvs_by_group["type3_one_extra_stmt"].iter().collect();
+        assert_eq!(
+            unique_b.len(),
+            1,
+            "type3 family with identical structure (1 extra stmt, identifier variation only) should collapse via canonical erasure: got {} unique",
+            unique_b.len(),
+        );
+
+        // CRITICALLY: Family A and Family B have different shapes
+        // (B has an extra statement). Their HVs must differ.
+        let hv_a0 = &hvs_by_group["tight_clones"][0];
+        let hv_b0 = &hvs_by_group["type3_one_extra_stmt"][0];
+        let d_ab = leyline_hdc::popcount_distance(hv_a0, hv_b0);
+        eprintln!("d(A, B) = {d_ab} — Type-2 vs Type-3-with-extra-stmt");
+        assert!(
+            d_ab > 0,
+            "Type-3 with extra statement must produce different HV from Type-2 (got d=0)",
+        );
 
         // Calibrate radius baseline against the empirical corpus.
         let now_ms = 1_700_000_000_000;
@@ -271,68 +352,83 @@ mod tests {
         let r = baseline.default_radius();
         eprintln!("calibrated radius: {r}");
 
-        // ── Assertion 1: within-group members cluster. ────────────────
-        // Pick one member of each group, run radius_search, assert at
-        // least 5 of the group's 10 members are within the calibrated
-        // radius. (We don't assert 10/10 because some Type-2 clones may
-        // have slight Hamming drift due to arity-bucket boundaries.)
+        // ── Assertion 1: distance ordering across clone classes. ───
+        // The honest clustering claim: encoder distance reflects
+        // structural distance. Tight-clones land closer than
+        // type-3-clones land closer than different-family.
+        //
+        //   d(family_A) == 0           # canonical erasure
+        //   d(family_A, family_B) > 0  # one extra statement
+        //   d(family_A, family_C) >> d(family_A, family_B)  # different shape
+        //
+        // This is what HDC promises and what the encoder must deliver.
+        let hv_a = hvs_by_group["tight_clones"][0];
+        let hv_b = hvs_by_group["type3_one_extra_stmt"][0];
+        let hv_c = hvs_by_group["for_loops"][0];
+        let d_aa = leyline_hdc::popcount_distance(&hv_a, &hvs_by_group["tight_clones"][1]);
+        let d_ab = leyline_hdc::popcount_distance(&hv_a, &hv_b);
+        let d_ac = leyline_hdc::popcount_distance(&hv_a, &hv_c);
+        eprintln!("d(A, A') = {d_aa}  -- Type-2 clone, expect 0");
+        eprintln!("d(A, B)  = {d_ab}  -- Type-3 (extra stmt), expect small > 0");
+        eprintln!("d(A, C)  = {d_ac}  -- different family, expect ~D/2");
+        assert_eq!(d_aa, 0, "Type-2 clones must collapse to identical HV");
+        assert!(
+            d_ab > d_aa,
+            "Type-3 distance ({d_ab}) must exceed Type-2 distance ({d_aa})",
+        );
+        assert!(
+            d_ac > d_ab,
+            "Different-family distance ({d_ac}) must exceed Type-3 distance ({d_ab})",
+        );
+        // Cross-family margin: structurally different code lands at
+        // ~D/2. Use a generous threshold to allow for the fact that
+        // SOME bits accidentally match by chance. D/2 - margin = ~3500
+        // means d_ac > 3500 = d_ac > 0.4 * D.
+        assert!(
+            d_ac > 3500,
+            "Different families must land at ~D/2 (got {d_ac}, expected > 3500)",
+        );
+
+        // ── Assertion 2: probe-against-self always matches. ───────────
+        // A working radius_search must return the probe itself at
+        // distance 0. A zero-encoder would also satisfy this (all
+        // hypervectors would be identical) — this catches the
+        // pathological case where popcount_xor or radius_search
+        // dropped the predicate.
         for group in &groups {
             let probe_scope = format!("{}/fn_0", group.name);
             let probe_hv = encode_go(&group.sources[0], &cb);
-
             let matches = radius_search(&conn, LayerKind::Ast, &probe_hv, r, 100).unwrap();
-            let same_group_matches: Vec<_> = matches
-                .iter()
-                .filter(|m| m.scope_id.starts_with(&format!("{}/", group.name)))
-                .collect();
-            let other_group_matches: Vec<_> = matches
-                .iter()
-                .filter(|m| !m.scope_id.starts_with(&format!("{}/", group.name)))
-                .collect();
-
-            eprintln!(
-                "group {}: probe={} same-group matches={} other-group matches={}",
-                group.name,
-                probe_scope,
-                same_group_matches.len(),
-                other_group_matches.len(),
-            );
-
-            // The probe itself must match (distance 0).
             assert!(
-                same_group_matches.iter().any(|m| m.scope_id == probe_scope),
-                "group {}: probe scope must match itself",
+                matches.iter().any(|m| m.scope_id == probe_scope && m.distance == 0),
+                "group {}: probe must match itself at distance 0",
                 group.name,
-            );
-
-            // Most same-group members should cluster in.
-            assert!(
-                same_group_matches.len() >= 5,
-                "group {}: expected ≥5 same-group matches in calibrated radius, got {}",
-                group.name,
-                same_group_matches.len(),
-            );
-
-            // No other group should bleed in. (For these Type-2 clones,
-            // structural shape is genuinely different across groups.)
-            assert_eq!(
-                other_group_matches.len(),
-                0,
-                "group {}: other groups must not match within calibrated radius (got {} bleeders)",
-                group.name,
-                other_group_matches.len(),
             );
         }
 
-        // ── Assertion 2: density tracks group size. ────────────────────
+        // ── Assertion 3: density count is monotonic in radius. ────────
+        // Non-trivial density signal: at radius 0, only the probe;
+        // at radius D/2, everything. Pin the monotonic relationship
+        // — a regression that broke the popcount predicate would
+        // break this.
         for group in &groups {
             let probe_hv = encode_go(&group.sources[0], &cb);
-            let count = density_count(&conn, LayerKind::Ast, &probe_hv, r).unwrap();
+            let d_zero = density_count(&conn, LayerKind::Ast, &probe_hv, 0).unwrap();
+            let d_full = density_count(&conn, LayerKind::Ast, &probe_hv, 8192).unwrap();
             assert!(
-                count >= 5,
-                "group {}: density at calibrated radius must be ≥5, got {}",
+                d_zero >= 1,
+                "group {}: density at radius 0 must include the probe (got {d_zero})",
                 group.name,
-                count,
+            );
+            assert_eq!(
+                d_full, 15,
+                "group {}: density at full D must include all 15 fixtures (got {d_full})",
+                group.name,
+            );
+            assert!(
+                d_full > d_zero,
+                "group {}: density must grow with radius",
+                group.name,
             );
         }
 

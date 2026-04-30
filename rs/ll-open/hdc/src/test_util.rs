@@ -112,6 +112,30 @@ mod tests {
     }
 
     #[test]
+    fn insert_layer_hv_writes_to_hdc_table() {
+        // Sister self-test to insert_combined_hv_writes_to_combined_
+        // table. insert_layer_hv must round-trip through `_hdc` —
+        // the (scope_id, layer_kind, hv, basis) tuple must come back
+        // intact. A refactor that swapped column order (e.g. inserted
+        // layer.as_str() into the hv column) would silently corrupt
+        // every test that relies on the helper.
+        use crate::util::expand_seed;
+        let conn = conn_with_schema();
+        let hv = expand_seed(0xDEED);
+        insert_layer_hv(&conn, "fn_y", LayerKind::Module, &hv, 11);
+
+        let (got_hv, got_basis): (Vec<u8>, i64) = conn
+            .query_row(
+                "SELECT hv, basis FROM _hdc WHERE scope_id = ?1 AND layer_kind = ?2",
+                ["fn_y", LayerKind::Module.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(got_hv, hv.to_vec());
+        assert_eq!(got_basis, 11);
+    }
+
+    #[test]
     fn insert_combined_hv_writes_to_combined_table() {
         // Mirrors the per-layer insert_layer_hv self-test discipline:
         // the combined-view fixture helper must round-trip through

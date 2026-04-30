@@ -480,6 +480,30 @@ mod tests {
     }
 
     #[test]
+    fn rotate_left_distributes_over_xor() {
+        // Homomorphism property: rotate_left(a XOR b, n) ==
+        // rotate_left(a, n) XOR rotate_left(b, n). Load-bearing for
+        // unbind: each child's HV is rotated independently then
+        // XOR'd into the parent. Equivalent to rotating the XOR
+        // accumulator. A refactor that introduced a non-XOR-
+        // preserving transformation (e.g. added a constant offset
+        // before rotating) would silently break the entire
+        // bind/unbind algebra.
+        let a = expand_seed(11);
+        let b = expand_seed(22);
+        for n in [0usize, 1, 7, 100, 1024, 4095] {
+            let mut a_xor_b = a;
+            xor_into(&mut a_xor_b, &b);
+            let lhs = rotate_left(&a_xor_b, n);
+
+            let mut rhs = rotate_left(&a, n);
+            xor_into(&mut rhs, &rotate_left(&b, n));
+
+            assert_eq!(lhs, rhs, "rotate_left distributes over XOR (n={n})");
+        }
+    }
+
+    #[test]
     fn rotate_left_preserves_popcount() {
         // Bit rotation is a permutation: number of set bits is
         // preserved. Pin so a refactor that accidentally cleared a

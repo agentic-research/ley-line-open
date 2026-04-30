@@ -2,48 +2,75 @@
 //! consistency reasoning. Each code unit (function/file/module) becomes
 //! a [`HvCell`] carrying its hypervector as a stalk over its region of
 //! the codebase. Edges between cells (containment, sibling, calls)
-//! carry a Boolean *agreement* check — the HDC analogue of the
-//! coboundary operator δ⁰ in `leyline-sheaf`.
+//! carry an agreement check — the HDC analogue of the coboundary
+//! operator δ⁰ in `leyline-sheaf`.
 //!
-//! ## Boolean Heyting algebra of binary stalks
+//! ## Heyting algebra of stalks (specialized to Boolean for binary HVs)
 //!
-//! Binary hypervectors under XOR/AND/OR form a Boolean algebra. Boolean
-//! algebras are the strongest case of a Heyting algebra (every element
-//! has a complement; double-negation elimination holds). Sheaf theory
-//! works over any topos; the internal logic of a topos is a Heyting
-//! algebra. So the binary-stalk specialization isn't a weaker sheaf —
-//! it's the strongest case, where every operation is bitwise and
-//! everything is `O(D)` instead of `O(D²)`.
+//! The conceptual home is the **internal logic of a sheaf topos: a
+//! Heyting algebra**. Heyting is the right level of generality because
+//! it handles "missing", "partial", and "unverified" stalks naturally —
+//! a missing stalk is ⊥, an enriched stalk is "true on its layer", and
+//! consistency is `meet`. Heyting drops excluded middle (a ∨ ¬a ≠ ⊤
+//! in general) and double-negation elimination (¬¬a ≠ a), which is
+//! precisely what we need when reasoning about a partially-encoded
+//! codebase: "we haven't seen this yet" is genuinely distinct from
+//! "this is absent."
+//!
+//! With binary D-bit hypervectors as stalk values, the *value space*
+//! collapses to a Boolean algebra (the strongest Heyting algebra:
+//! every element has a complement, ¬¬a = a, excluded middle holds).
+//! That's a deliberate engineering specialization — XOR/AND/OR run at
+//! `O(D)` bitwise speed, not `O(D²)` matrix-style. The Heyting
+//! machinery survives at the **stalk-presence layer**: missing stalks
+//! are skipped via `Option<Hypervector>`, so partial complexes
+//! propagate without forcing a "phantom value" interpretation. See
+//! `merkle_root_for_layer_skips_cells_without_stalks`,
+//! `propagate_sections_layer_with_no_stalks_yields_zero_hvs`, and the
+//! `edge_hamming → None` skip path in `compute_h0` /
+//! `detect_violations` — those are where the non-Boolean Heyting
+//! flavor lives in the current implementation.
+//!
+//! Future stalk types (ternary, fractional, partial-confidence) would
+//! re-open the strictly-Heyting (non-Boolean) cases at the value
+//! layer; this module's algebraic framing is forward-compatible with
+//! that change.
 //!
 //! Concretely, in this module:
-//! - **Stalks**: `[u8; D_BYTES]` binary vectors
+//! - **Stalks**: `Option<[u8; D_BYTES]>` per (cell, layer). The
+//!   Some/None split is the Heyting layer; the bit-value algebra is
+//!   the Boolean specialization.
 //! - **Restriction maps**: lattice homomorphisms — bit permutations
 //!   (`rotate_left` is one canonical form) that preserve XOR/AND/OR.
 //!   A permutation IS the structure-preserving map between stalks in
-//!   the category of Boolean algebras — not an approximation.
+//!   the category of Boolean algebras (and trivially in Heyting too).
 //! - **Section propagation**: majority-rule bundle (`bundle_majority`)
 //!   is the lattice meet over a set of consistent sections.
 //! - **δ⁰ at an edge** (u→v with restriction maps r_u, r_v): apply
 //!   r_u to stalk(u) and r_v to stalk(v); check
 //!   `popcount(r_u(stalk_u) XOR r_v(stalk_v)) ≤ threshold`.
 //!   When both restrictions are the identity, this reduces to plain
-//!   `popcount(stalk_u XOR stalk_v)`.
+//!   `popcount(stalk_u XOR stalk_v)`. Missing stalks short-circuit to
+//!   "edge unobservable on this layer" rather than a synthetic value.
 //! - **H⁰** is the connected-component count of the consistent
 //!   subgraph — cells whose stalks bundle into one majority section
 //!   without contradiction.
 //! - **Merkle tree** sits on top: blake3 leaves over (cell_id,
 //!   stalk_bytes) per layer, internal nodes are content-addressed.
+//!   Cells without a stalk on the queried layer are skipped (Heyting
+//!   ⊥), not represented as an empty-bytes leaf.
 //!
-//! Every operation here is `O(D)` bitwise. At D=8192 that's one cache
-//! line per stalk and sub-microsecond per check on a modern CPU.
+//! Every value-level operation here is `O(D)` bitwise. At D=8192
+//! that's one cache line per stalk and sub-microsecond per check on
+//! a modern CPU.
 //!
 //! ## What this module is NOT
 //!
-//! This is the **Boolean specialization** of the sheaf algebra — it
-//! deliberately does NOT compute δ¹, H¹, or 2-faces because those need
-//! the cycle structure of the full Čech complex. Callers that want
-//! the full algebra can convert HV→bit-as-f32 and plug into the
-//! closed `leyline-sheaf` crate; that's out of scope here.
+//! This is the **Boolean-value specialization** of the sheaf algebra
+//! — it deliberately does NOT compute δ¹, H¹, or 2-faces because
+//! those need the cycle structure of the full Čech complex. Callers
+//! that want the full algebra can convert HV→bit-as-f32 and plug
+//! into the closed `leyline-sheaf` crate; that's out of scope here.
 //!
 //! Additive: lives entirely inside `leyline-hdc`, no other crate
 //! touched, no schema changes. The cell-complex is built in-memory from

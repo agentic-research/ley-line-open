@@ -7,7 +7,7 @@
 //! See bead `ley-line-open-96b1a9` for the per-layer codebook plan.
 
 use crate::canonical::CanonicalKind;
-use crate::util::Hypervector;
+use crate::util::{blake3_seed, tagged_seed_vector, Hypervector};
 
 /// Per-layer codebook: maps domain-specific node fingerprints to base
 /// hypervectors. Implementors must be `Send + Sync` so the encoder can
@@ -65,7 +65,7 @@ pub trait BaseCodebook: Send + Sync {
     /// override; now the default suffices and the dedup is real).
     fn role_vector(&self, role_index: usize) -> Hypervector {
         let tag = format!("{}-role", self.codebook_tag());
-        crate::util::tagged_seed_vector(&tag, role_index)
+        tagged_seed_vector(&tag, role_index)
     }
 }
 
@@ -134,9 +134,9 @@ impl AstNodeFingerprint {
 /// tag if you need to migrate, don't silently rewrite the format.
 pub fn canonical_signature_bytes(
     codebook_tag: &str,
-    kind: crate::canonical::CanonicalKind,
+    kind: CanonicalKind,
     arity_bucket: u8,
-    child_kinds: &[crate::canonical::CanonicalKind],
+    child_kinds: &[CanonicalKind],
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(codebook_tag.len() + 5 + child_kinds.len());
     buf.extend_from_slice(codebook_tag.as_bytes());
@@ -159,7 +159,7 @@ pub fn canonical_signature_bytes(
 /// (Semantic dense, Temporal sparse, future ones). Each codebook
 /// supplies its own dot-product semantics via the closure; the
 /// thresholding + bit-packing logic is uniform and lives here.
-pub fn simhash_signs<F>(hyperplanes: &[Vec<f32>], dot: F) -> crate::util::Hypervector
+pub fn simhash_signs<F>(hyperplanes: &[Vec<f32>], dot: F) -> Hypervector
 where
     F: Fn(&[f32]) -> f64,
 {
@@ -184,13 +184,13 @@ where
 /// breaks every encoded simhash hypervector. Bump a layer's seed tag
 /// for migration; don't silently rewrite this function.
 pub fn build_hyperplane_matrix(seed_tag: &str, width: usize) -> Vec<Vec<f32>> {
-    let base_seed = crate::util::blake3_seed(seed_tag.as_bytes());
+    let base_seed = blake3_seed(seed_tag.as_bytes());
     let mut hyperplanes = Vec::with_capacity(crate::D_BITS);
     for i in 0..crate::D_BITS {
         // Each hyperplane gets its own seed derived from base + index.
         // Box-Muller uses two uniforms per Gaussian; per-row PRNG state
         // keeps rows independent.
-        let row_seed = crate::util::blake3_seed(
+        let row_seed = blake3_seed(
             &[
                 base_seed.to_le_bytes().as_slice(),
                 (i as u64).to_le_bytes().as_slice(),

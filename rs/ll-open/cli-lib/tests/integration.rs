@@ -131,6 +131,21 @@ async fn uds_round_trip(sock: &Path, body: &str) -> serde_json::Value {
     serde_json::from_str(&line).expect("response is JSON")
 }
 
+/// Write a Go file at `dir/<file>` containing a single empty function:
+///   package <pkg>
+///
+///   func <fn_name>() {}
+///
+/// Centralizes the most-common test fixture so a future tweak to the
+/// stub shape (Go syntax version, `package _` convention, etc.) is one
+/// site, not 12+. For non-trivial fixtures (real LSP-style tests with
+/// imports, bodies, multiple decls), inline `fs::write` is still fine.
+#[allow(dead_code)]
+fn write_empty_go_func(dir: &Path, file: &str, pkg: &str, fn_name: &str) {
+    let content = format!("package {pkg}\n\nfunc {fn_name}() {{}}\n");
+    fs::write(dir.join(file), content).expect("write go fixture");
+}
+
 /// Create a temporary directory containing two small `.go` files for testing.
 fn create_go_fixture() -> TempDir {
     let dir = TempDir::new().expect("create temp dir");
@@ -1080,8 +1095,8 @@ async fn test_incremental_skip_unchanged() {
     let out_dir = tempfile::TempDir::new().unwrap();
     let db_path = out_dir.path().join("incr.db");
 
-    std::fs::write(src.path().join("a.go"), b"package main\n\nfunc A() {}\n").unwrap();
-    std::fs::write(src.path().join("b.go"), b"package main\n\nfunc B() {}\n").unwrap();
+    write_empty_go_func(src.path(), "a.go", "main", "A");
+    write_empty_go_func(src.path(), "b.go", "main", "B");
 
     // First parse
     let cmd = leyline_cli_lib::Commands::Parse {
@@ -1124,7 +1139,7 @@ async fn test_incremental_reparse_changed_file() {
     let out_dir = tempfile::TempDir::new().unwrap();
     let db_path = out_dir.path().join("incr-change.db");
 
-    std::fs::write(src.path().join("main.go"), b"package main\n\nfunc Old() {}\n").unwrap();
+    write_empty_go_func(src.path(), "main.go", "main", "Old");
 
     // First parse
     let cmd = leyline_cli_lib::Commands::Parse {
@@ -1194,7 +1209,7 @@ async fn test_incremental_deleted_file() {
     let out_dir = tempfile::TempDir::new().unwrap();
     let db_path = out_dir.path().join("incr-delete.db");
 
-    std::fs::write(src.path().join("keep.go"), b"package main\n\nfunc Keep() {}\n").unwrap();
+    write_empty_go_func(src.path(), "keep.go", "main", "Keep");
     std::fs::write(
         src.path().join("remove.go"),
         b"package main\n\nfunc Remove() {}\n",
@@ -1626,9 +1641,9 @@ fn test_scoped_reparse_only_touches_scoped_files() {
     use std::collections::HashMap;
 
     let dir = TempDir::new().unwrap();
-    fs::write(dir.path().join("a.go"), b"package m\n\nfunc A() {}\n").unwrap();
-    fs::write(dir.path().join("b.go"), b"package m\n\nfunc B() {}\n").unwrap();
-    fs::write(dir.path().join("c.go"), b"package m\n\nfunc C() {}\n").unwrap();
+    write_empty_go_func(dir.path(), "a.go", "m", "A");
+    write_empty_go_func(dir.path(), "b.go", "m", "B");
+    write_empty_go_func(dir.path(), "c.go", "m", "C");
 
     let conn = Connection::open_in_memory().unwrap();
     let r1 = parse_into_conn(&conn, dir.path(), Some("go"), None).unwrap();
@@ -1685,8 +1700,8 @@ fn test_scoped_reparse_handles_deletion_in_scope() {
     use rusqlite::Connection;
 
     let dir = TempDir::new().unwrap();
-    fs::write(dir.path().join("a.go"), b"package m\n\nfunc A() {}\n").unwrap();
-    fs::write(dir.path().join("b.go"), b"package m\n\nfunc B() {}\n").unwrap();
+    write_empty_go_func(dir.path(), "a.go", "m", "A");
+    write_empty_go_func(dir.path(), "b.go", "m", "B");
 
     let conn = Connection::open_in_memory().unwrap();
     let r1 = parse_into_conn(&conn, dir.path(), Some("go"), None).unwrap();
@@ -1724,8 +1739,8 @@ async fn test_op_reparse_accepts_single_file_source() {
 
     // Source tree with two go files. The hook will only "edit" one.
     let src = TempDir::new().unwrap();
-    fs::write(src.path().join("a.go"), "package m\n\nfunc A() {}\n").unwrap();
-    fs::write(src.path().join("b.go"), "package m\n\nfunc B() {}\n").unwrap();
+    write_empty_go_func(src.path(), "a.go", "m", "A");
+    write_empty_go_func(src.path(), "b.go", "m", "B");
 
     // Cold-parse so _file_index is populated.
     let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -1799,9 +1814,9 @@ async fn test_op_reparse_accepts_files_scope_with_dir_source() {
     use std::sync::{Arc, Mutex};
 
     let src = TempDir::new().unwrap();
-    fs::write(src.path().join("a.go"), "package m\n\nfunc A() {}\n").unwrap();
-    fs::write(src.path().join("b.go"), "package m\n\nfunc B() {}\n").unwrap();
-    fs::write(src.path().join("c.go"), "package m\n\nfunc C() {}\n").unwrap();
+    write_empty_go_func(src.path(), "a.go", "m", "A");
+    write_empty_go_func(src.path(), "b.go", "m", "B");
+    write_empty_go_func(src.path(), "c.go", "m", "C");
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     leyline_cli_lib::cmd_parse::parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();

@@ -137,9 +137,8 @@ mod tests {
 
     #[test]
     fn single_layer_returns_rotated_layer_hv() {
-        let mut layers = HashMap::new();
         let ast_hv = expand_seed(0x42);
-        layers.insert(LayerKind::Ast, ast_hv);
+        let layers = HashMap::from([(LayerKind::Ast, ast_hv)]);
         let combined = build_combined_hv(&layers);
         // Ast role-index = 0 → no rotation → combined = ast_hv.
         assert_eq!(combined, ast_hv);
@@ -148,9 +147,8 @@ mod tests {
     #[test]
     fn module_layer_rotation_applied() {
         // Module role-index = 1, so the contribution is rotate_left(hv, 1).
-        let mut layers = HashMap::new();
         let mod_hv = expand_seed(0x99);
-        layers.insert(LayerKind::Module, mod_hv);
+        let layers = HashMap::from([(LayerKind::Module, mod_hv)]);
         let combined = build_combined_hv(&layers);
         let expected = rotate_left(&mod_hv, 1);
         assert_eq!(combined, expected);
@@ -166,15 +164,16 @@ mod tests {
         let module = expand_seed(2);
         let semantic = expand_seed(3);
 
-        let mut order_a = HashMap::new();
-        order_a.insert(LayerKind::Ast, ast);
-        order_a.insert(LayerKind::Module, module);
-        order_a.insert(LayerKind::Semantic, semantic);
-
-        let mut order_b = HashMap::new();
-        order_b.insert(LayerKind::Semantic, semantic);
-        order_b.insert(LayerKind::Module, module);
-        order_b.insert(LayerKind::Ast, ast);
+        let order_a = HashMap::from([
+            (LayerKind::Ast, ast),
+            (LayerKind::Module, module),
+            (LayerKind::Semantic, semantic),
+        ]);
+        let order_b = HashMap::from([
+            (LayerKind::Semantic, semantic),
+            (LayerKind::Module, module),
+            (LayerKind::Ast, ast),
+        ]);
 
         assert_eq!(build_combined_hv(&order_a), build_combined_hv(&order_b));
     }
@@ -185,10 +184,8 @@ mod tests {
         // must produce different combined HVs because Module's
         // role-index = 1 rotates the bits.
         let hv = expand_seed(0xCAFE);
-        let mut as_ast = HashMap::new();
-        as_ast.insert(LayerKind::Ast, hv);
-        let mut as_module = HashMap::new();
-        as_module.insert(LayerKind::Module, hv);
+        let as_ast = HashMap::from([(LayerKind::Ast, hv)]);
+        let as_module = HashMap::from([(LayerKind::Module, hv)]);
         assert_far_apart(
             &build_combined_hv(&as_ast),
             &build_combined_hv(&as_module),
@@ -203,21 +200,17 @@ mod tests {
         let ast = expand_seed(0xAA);
         let module = expand_seed(0xBB);
 
-        let mut just_ast = HashMap::new();
-        just_ast.insert(LayerKind::Ast, ast);
-
-        let mut ast_and_module = HashMap::new();
-        ast_and_module.insert(LayerKind::Ast, ast);
-        ast_and_module.insert(LayerKind::Module, module);
+        let just_ast = HashMap::from([(LayerKind::Ast, ast)]);
+        let ast_and_module =
+            HashMap::from([(LayerKind::Ast, ast), (LayerKind::Module, module)]);
 
         let combined_1 = build_combined_hv(&just_ast);
         let combined_2 = build_combined_hv(&ast_and_module);
         assert_ne!(combined_1, combined_2, "adding Module must change combined");
 
         // Zero-HV layer addition is a no-op.
-        let mut ast_plus_zero = HashMap::new();
-        ast_plus_zero.insert(LayerKind::Ast, ast);
-        ast_plus_zero.insert(LayerKind::Semantic, ZERO_HV);
+        let ast_plus_zero =
+            HashMap::from([(LayerKind::Ast, ast), (LayerKind::Semantic, ZERO_HV)]);
         assert_eq!(
             build_combined_hv(&ast_plus_zero),
             combined_1,
@@ -236,9 +229,8 @@ mod tests {
 
         let (combined, basis) = build_combined_for_scope(&conn, "fn_foo").unwrap();
         // Compare against in-memory build.
-        let mut expected_layers = HashMap::new();
-        expected_layers.insert(LayerKind::Ast, ast);
-        expected_layers.insert(LayerKind::Module, module);
+        let expected_layers =
+            HashMap::from([(LayerKind::Ast, ast), (LayerKind::Module, module)]);
         assert_eq!(combined, build_combined_hv(&expected_layers));
         // Basis should be max(1, 2) = 2.
         assert_eq!(basis, 2);

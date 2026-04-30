@@ -75,19 +75,8 @@ pub fn create_hdc_schema(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::conn_with_schema as fresh_schema_conn;
     use crate::{LayerKind, D_BYTES};
-
-    /// Open a fresh in-memory connection and apply the HDC schema.
-    /// Used by every schema test as the standard setup — collapses the
-    /// `Connection::open_in_memory + create_hdc_schema` pair to one
-    /// call. If a future refactor changes how the schema is bootstrapped
-    /// (e.g. needs migration step before tests can run), every test
-    /// picks up the change for free.
-    fn fresh_schema_conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        create_hdc_schema(&conn).unwrap();
-        conn
-    }
 
     /// Assert a `sqlite_master` row of `kind` ("table" or "index") and
     /// `name` exists. Centralizes the SELECT-COUNT(*)>0 dance so the

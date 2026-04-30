@@ -223,6 +223,25 @@ mod tests {
     }
 
     #[test]
+    fn encode_fresh_matches_encode_tree_on_fresh_cache() {
+        // encode_fresh is documented as "encode a tree against a fresh
+        // empty cache". Pin the equivalence so a refactor that, say,
+        // pre-seeded the cache with a debug entry or wrapped the call
+        // in something stateful would surface immediately.
+        let cb = AstCodebook::new();
+        let tree = node(
+            CanonicalKind::Block,
+            vec![
+                leaf(CanonicalKind::Op),
+                node(CanonicalKind::Stmt, vec![leaf(CanonicalKind::Lit)]),
+            ],
+        );
+        let via_fresh = encode_fresh(&tree, &cb);
+        let via_tree_with_fresh_cache = encode_tree(&tree, &cb, &SubtreeCache::new());
+        assert_eq!(via_fresh, via_tree_with_fresh_cache);
+    }
+
+    #[test]
     fn encode_tree_leaf_equals_base_vector() {
         // For a leaf node (no children), encode_tree must produce
         // exactly the codebook's base_vector for that leaf — there

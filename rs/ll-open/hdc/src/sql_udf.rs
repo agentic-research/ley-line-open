@@ -240,6 +240,34 @@ mod tests {
             .unwrap();
     }
 
+    /// Run `SELECT BUNDLE(hv) FROM hvs` and unwrap to `Vec<u8>`.
+    /// Replaces the ~6 verbatim copies of this query in the BUNDLE
+    /// test cases. Use [`select_bundle_or_null`] when the test
+    /// expects the empty-set NULL.
+    fn select_bundle(conn: &Connection) -> Vec<u8> {
+        conn.query_row("SELECT BUNDLE(hv) FROM hvs", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Like [`select_bundle`] but returns `Option<Vec<u8>>` so an
+    /// empty-set NULL doesn't blow up the test.
+    fn select_bundle_or_null(conn: &Connection) -> Option<Vec<u8>> {
+        conn.query_row("SELECT BUNDLE(hv) FROM hvs", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// `SELECT BUNDLE_MAJORITY(hv) FROM hvs` — non-empty input.
+    fn select_bundle_majority(conn: &Connection) -> Vec<u8> {
+        conn.query_row("SELECT BUNDLE_MAJORITY(hv) FROM hvs", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// `SELECT BUNDLE_MAJORITY(hv) FROM hvs` — may be empty (NULL).
+    fn select_bundle_majority_or_null(conn: &Connection) -> Option<Vec<u8>> {
+        conn.query_row("SELECT BUNDLE_MAJORITY(hv) FROM hvs", [], |r| r.get(0))
+            .unwrap()
+    }
+
     #[test]
     fn popcount_xor_zero_to_zero_is_zero() {
         let conn = fixture_conn();
@@ -289,10 +317,7 @@ mod tests {
         // friends. Callers can COALESCE if they want zero-vector
         // semantics for empty sets.
         let conn = fixture_conn();
-        let result: Option<Vec<u8>> = conn
-            .query_row("SELECT BUNDLE(hv) FROM hvs", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(result, None);
+        assert_eq!(select_bundle_or_null(&conn), None);
     }
 
     #[test]
@@ -300,10 +325,7 @@ mod tests {
         let conn = fixture_conn();
         let hv = crate::util::expand_seed(0x42);
         insert_hv(&conn, 1, &hv);
-        let result: Vec<u8> = conn
-            .query_row("SELECT BUNDLE(hv) FROM hvs", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(result, hv.to_vec());
+        assert_eq!(select_bundle(&conn), hv.to_vec());
     }
 
     #[test]
@@ -316,10 +338,7 @@ mod tests {
         let hv = crate::util::expand_seed(0xAAAA);
         insert_hv(&conn, 1, &hv);
         insert_hv(&conn, 2, &hv);
-        let result: Vec<u8> = conn
-            .query_row("SELECT BUNDLE(hv) FROM hvs", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(result, vec![0u8; D_BYTES]);
+        assert_eq!(select_bundle(&conn), vec![0u8; D_BYTES]);
     }
 
     #[test]
@@ -331,9 +350,6 @@ mod tests {
         insert_hv(&conn, 1, &a);
         insert_hv(&conn, 2, &b);
         insert_hv(&conn, 3, &c);
-        let result: Vec<u8> = conn
-            .query_row("SELECT BUNDLE(hv) FROM hvs", [], |r| r.get(0))
-            .unwrap();
         // Build expected: a XOR b XOR c.
         let mut expected = a;
         for (e, x) in expected.iter_mut().zip(b.iter()) {
@@ -342,7 +358,7 @@ mod tests {
         for (e, x) in expected.iter_mut().zip(c.iter()) {
             *e ^= *x;
         }
-        assert_eq!(result, expected.to_vec());
+        assert_eq!(select_bundle(&conn), expected.to_vec());
     }
 
     #[test]
@@ -370,10 +386,7 @@ mod tests {
     #[test]
     fn bundle_majority_empty_set_is_null() {
         let conn = fixture_conn();
-        let result: Option<Vec<u8>> = conn
-            .query_row("SELECT BUNDLE_MAJORITY(hv) FROM hvs", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(result, None);
+        assert_eq!(select_bundle_majority_or_null(&conn), None);
     }
 
     #[test]
@@ -381,12 +394,9 @@ mod tests {
         let conn = fixture_conn();
         let hv = crate::util::expand_seed(0xBEEF);
         insert_hv(&conn, 1, &hv);
-        let result: Vec<u8> = conn
-            .query_row("SELECT BUNDLE_MAJORITY(hv) FROM hvs", [], |r| r.get(0))
-            .unwrap();
         // 1 row, half = 0, so any cnt > 0 wins — i.e., bit set in input
         // is set in output. Result equals the input.
-        assert_eq!(result, hv.to_vec());
+        assert_eq!(select_bundle_majority(&conn), hv.to_vec());
     }
 
     #[test]
@@ -398,10 +408,7 @@ mod tests {
         for i in 1..=3 {
             insert_hv(&conn, i, &hv);
         }
-        let result: Vec<u8> = conn
-            .query_row("SELECT BUNDLE_MAJORITY(hv) FROM hvs", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(result, hv.to_vec());
+        assert_eq!(select_bundle_majority(&conn), hv.to_vec());
     }
 
     #[test]
@@ -426,10 +433,7 @@ mod tests {
             insert_hv(&conn, id, hv);
         }
 
-        let bundle: Vec<u8> = conn
-            .query_row("SELECT BUNDLE_MAJORITY(hv) FROM hvs", [], |r| r.get(0))
-            .unwrap();
-        let bundle_arr: Hypervector = bundle.try_into().unwrap();
+        let bundle_arr: Hypervector = select_bundle_majority(&conn).try_into().unwrap();
 
         // Target appears 7/10 = 70% — bundle should be very close to target.
         let d_target = popcount_distance(&bundle_arr, &target);
@@ -460,12 +464,9 @@ mod tests {
         let b_arr: Hypervector = b.try_into().unwrap();
         insert_hv(&conn, 1, &a_arr);
         insert_hv(&conn, 2, &b_arr);
-        let result: Vec<u8> = conn
-            .query_row("SELECT BUNDLE_MAJORITY(hv) FROM hvs", [], |r| r.get(0))
-            .unwrap();
         // 2 rows, half = 1, threshold cnt > 1. Bit 0: cnt=1 (only a),
         // not > 1, output 0. Bit 1: cnt=1 (only b), not > 1, output 0.
-        assert_eq!(result[0], 0, "ties must resolve to 0");
+        assert_eq!(select_bundle_majority(&conn)[0], 0, "ties must resolve to 0");
     }
 
     #[test]

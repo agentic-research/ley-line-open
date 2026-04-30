@@ -221,16 +221,14 @@ where
 
         let unbound = unbind_child_at_position(centroid, &parent_base, &siblings_at_i, i);
 
-        let mut best: Option<(CanonicalKind, u32)> = None;
-        for &kind in candidate_child_kinds {
-            let d = popcount_distance(&unbound, &leaf_base(kind));
-            match best {
-                None => best = Some((kind, d)),
-                Some((_, prev_d)) if d < prev_d => best = Some((kind, d)),
-                _ => {}
-            }
-        }
-        if let Some((kind, d)) = best {
+        // Cleanup memory: find the candidate kind whose leaf-base
+        // hypervector is closest to the unbound residual. min_by_key
+        // collapses the imperative track-best loop.
+        if let Some((kind, d)) = candidate_child_kinds
+            .iter()
+            .map(|&kind| (kind, popcount_distance(&unbound, &leaf_base(kind))))
+            .min_by_key(|(_, d)| *d)
+        {
             recovered.push((i, kind, d));
         }
     }

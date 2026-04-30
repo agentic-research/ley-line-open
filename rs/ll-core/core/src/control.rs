@@ -266,6 +266,34 @@ mod tests {
     }
 
     #[test]
+    fn control_field_offsets_consistent_layout() {
+        // The offset constants (OFF_MAGIC, OFF_VERSION, …) define the
+        // exact byte layout of every .ctrl file. A typo (e.g.
+        // OFF_GENERATION=12 instead of 8) would mis-read every
+        // existing file. Pin the values AND the consistency relations
+        // so a future field addition has to thread the offsets
+        // correctly. Format on disk:
+        //   [0..4]    magic (u32)
+        //   [4..8]    version (u32)
+        //   [8..16]   generation (u64)
+        //   [16..272] arena_path (256 bytes, NUL-padded)
+        //   [272..280] arena_size (u64)
+        //   [280..]   interrupt fields when feature enabled
+        assert_eq!(OFF_MAGIC, 0);
+        assert_eq!(OFF_VERSION, OFF_MAGIC + 4, "version follows magic (u32)");
+        assert_eq!(OFF_GENERATION, OFF_VERSION + 4, "generation follows version (u32)");
+        assert_eq!(OFF_ARENA_PATH, OFF_GENERATION + 8, "arena_path follows generation (u64)");
+        assert_eq!(ARENA_PATH_LEN, 256, "arena path is fixed 256 bytes");
+        assert_eq!(
+            OFF_ARENA_SIZE,
+            OFF_ARENA_PATH + ARENA_PATH_LEN,
+            "arena_size follows arena_path",
+        );
+        // arena_size occupies 8 bytes (u64).
+        assert!(OFF_ARENA_SIZE + 8 <= CONTROL_SIZE);
+    }
+
+    #[test]
     fn control_disk_format_constants() {
         // Sister disk-format-stability pin to layout.rs's MAGIC +
         // VERSION + HEADER_SIZE triplet. CONTROL_SIZE (4096) is the

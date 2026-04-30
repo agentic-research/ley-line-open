@@ -12,6 +12,20 @@ use crate::daemon::ops;
 use crate::daemon::DaemonContext;
 use crate::daemon::ops::is_state_changing;
 
+/// `rm -f` semantics: remove `path` if present, log a warning when
+/// removal fails for any reason other than "file does not exist". Both
+/// the stale-socket cleanup and the default.sock symlink-replacement
+/// path want exactly this behavior — missing-file is the common case
+/// (fresh start), and other errors (permissions, EBUSY, etc) deserve
+/// to be surfaced without aborting the daemon's bring-up.
+fn remove_file_best_effort(path: &std::path::Path, what: &str) {
+    if let Err(e) = std::fs::remove_file(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        log::warn!("could not remove {what} {}: {e}", path.display());
+    }
+}
+
 /// Spawn the UDS socket listener as a background tokio task.
 ///
 /// 1. Removes any stale socket file at `sock_path`.
@@ -22,17 +36,8 @@ use crate::daemon::ops::is_state_changing;
 ///
 /// Returns the socket path. The listener runs in the background.
 pub fn spawn(ctx: Arc<DaemonContext>, sock_path: PathBuf) -> PathBuf {
-    // Remove any stale socket left from a previous run. Missing-file is the
-    // common case (fresh start), so swallow ENOENT silently and only warn on
-    // unexpected errors (permissions, EBUSY, etc).
-    if let Err(e) = std::fs::remove_file(&sock_path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        log::warn!(
-            "could not remove stale socket {}: {e}",
-            sock_path.display(),
-        );
-    }
+    // Remove any stale socket left from a previous run.
+    remove_file_best_effort(&sock_path, "stale socket");
 
     // Bind the listener synchronously so the path is ready on return.
     let listener = UnixListener::bind(&sock_path).expect("bind UDS socket");
@@ -52,13 +57,7 @@ pub fn spawn(ctx: Arc<DaemonContext>, sock_path: PathBuf) -> PathBuf {
                     mache_dir.display(),
                 );
             }
-            if let Err(e) = std::fs::remove_file(&symlink_path)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                log::warn!(
-                    "could not remove old default.sock symlink: {e}",
-                );
-            }
+            remove_file_best_effort(&symlink_path, "old default.sock symlink");
             if let Err(e) = std::os::unix::fs::symlink(&sock_path, &symlink_path) {
                 log::warn!(
                     "could not create default.sock symlink at {}: {e}",
@@ -190,4 +189,50 @@ async fn dispatch(
 
     // 5. Unknown op
     json!({"error": format!("unknown op: {op}")}).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn remove_file_best_effort_succeeds_on_existing_file() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("victim");
+        std::fs::write(&p, b"x").unwrap();
+        assert!(p.exists());
+        remove_file_best_effort(&p, "test");
+        assert!(!p.exists(), "file should be removed");
+    }
+
+    #[test]
+    fn remove_file_best_effort_silent_on_missing() {
+        // The whole point: ENOENT is the common case (fresh start) and
+        // must not produce a warning. We can't easily assert "no log
+        // output" in unit tests, but we can assert the function returns
+        // without panicking and leaves no side effects.
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("does-not-exist");
+        assert!(!p.exists());
+        remove_file_best_effort(&p, "test");
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn remove_file_best_effort_swallows_other_errors() {
+        // If the path is a non-empty directory, std::fs::remove_file
+        // returns an error other than NotFound. The helper must NOT
+        // propagate or panic — it logs and returns. Verify no panic.
+        let dir = TempDir::new().unwrap();
+        let nested = dir.path().join("sub");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("file"), b"keep").unwrap();
+        // remove_file on a non-empty directory fails on most platforms;
+        // the helper must swallow that without panicking.
+        remove_file_best_effort(&nested, "non-empty dir");
+        // The dir is still there because the call was a no-op (errored
+        // and was swallowed).
+        assert!(nested.exists());
+    }
 }

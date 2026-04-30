@@ -185,8 +185,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codebook::AstCodebook;
-    use crate::util::assert_far_apart;
+    use crate::codebook::{AstCodebook, ModuleCodebook};
+    use crate::util::{assert_far_apart, rotate_right};
 
     // Test convenience aliases — `leaf` and `node` are short stand-ins
     // for `EncoderNode::leaf` / `EncoderNode::new` to keep the test
@@ -346,8 +346,6 @@ mod tests {
         // hash. Same content + different tag → distinct keys.
         //
         // This test would have failed before the fix.
-        use crate::codebook::{AstCodebook, ModuleCodebook};
-
         let cache = SubtreeCache::new();
         let tree = node(
             CanonicalKind::Block,
@@ -427,7 +425,6 @@ mod tests {
         // Same bidi property but for a child at position 1 — needs
         // rotate_right(•, 1) after stripping the position-0 child and
         // the parent's base.
-        use crate::util::rotate_right;
         let cb = AstCodebook::new();
         let kind0 = CanonicalKind::Op;
         let kind1 = CanonicalKind::Lit;

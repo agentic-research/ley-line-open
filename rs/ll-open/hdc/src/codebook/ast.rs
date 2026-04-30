@@ -67,6 +67,7 @@ impl AstCodebook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::tagged_seed_vector;
 
     fn fp(
         kind: CanonicalKind,
@@ -159,7 +160,6 @@ mod tests {
         // output to the previous `tagged_seed_vector("hdc-ast-role", N)`
         // form so a future refactor of the default suffix scheme would
         // catch breakage immediately.
-        use crate::util::tagged_seed_vector;
         let cb = AstCodebook::new();
         for i in [0usize, 1, 7, 42, 1024] {
             let actual = cb.role_vector(i);

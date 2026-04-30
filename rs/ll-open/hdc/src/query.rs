@@ -387,8 +387,6 @@ mod tests {
         //   residual = parent ⊕ base ⊕ rotate_left(child0, 0)
         //            = rotate_left(child1, 1)
         //   rotate_right(residual, 1) = child1
-        use crate::canonical::CanonicalKind;
-        use crate::util::rotate_left;
         let cb = AstCodebook::new();
         let parent_base = expand_seed(0xBA5E);
         let child0 = cb.base_vector(&AstNodeFingerprint::leaf(CanonicalKind::Op));

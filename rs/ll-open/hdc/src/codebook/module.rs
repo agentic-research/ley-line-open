@@ -138,7 +138,8 @@ pub fn module_zero() -> Hypervector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::assert_far_apart;
+    use crate::codebook::AstCodebook;
+    use crate::util::{assert_far_apart, tagged_seed_vector};
 
     // Test convenience aliases mirroring encoder.rs — both forward
     // directly to `EncoderNode::leaf` / `EncoderNode::new`.
@@ -298,8 +299,6 @@ mod tests {
         // distinct hypervectors per role index. If they collide, an
         // unbind in a multi-layer combined view could mis-route a child
         // hypervector to the wrong layer.
-        use crate::codebook::AstCodebook;
-
         let module_cb = ModuleCodebook::new();
         let ast_cb = AstCodebook::new();
         let m_role0 = module_cb.role_vector(0);
@@ -314,7 +313,6 @@ mod tests {
         // "hdc-module-role" from codebook_tag(). Pin that the default
         // produces byte-identical output to the previous explicit
         // `tagged_seed_vector("hdc-module-role", N)` form.
-        use crate::util::tagged_seed_vector;
         let cb = ModuleCodebook::new();
         for i in [0usize, 1, 7, 42, 1024] {
             let actual = cb.role_vector(i);

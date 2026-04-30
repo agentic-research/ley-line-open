@@ -160,6 +160,31 @@ mod tests {
     }
 
     #[test]
+    fn gaussian_row_outputs_are_always_finite() {
+        // next_uniform's `f.max(f32::EPSILON)` floor (semantic.rs:121)
+        // is what keeps Box-Muller's `ln(u)` from blowing up on the
+        // exact-zero u case. If the floor is dropped or the bit-shift
+        // reordered, any state that hashed to a high-zero result would
+        // produce NaN/inf gaussians and downstream simhash projections
+        // would set bits arbitrarily. Pin: drive gaussian_row over a
+        // diverse set of seeds and a variety of lengths (including
+        // odd lengths that exercise the truncate branch) and assert
+        // every output is finite (not NaN, not inf).
+        for &seed in &[0u64, 1, u64::MAX, 0xCAFE_BABE_DEAD_BEEF, 42] {
+            for &n in &[1usize, 2, 7, 64, 128] {
+                let row = gaussian_row(seed, n);
+                assert_eq!(row.len(), n);
+                for (i, &x) in row.iter().enumerate() {
+                    assert!(
+                        x.is_finite(),
+                        "gaussian_row({seed:#x}, {n})[{i}] = {x} is not finite",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn gaussian_row_returns_n_floats_deterministically() {
         // gaussian_row(seed, n) must produce exactly `n` floats
         // (Box-Muller pairs handle odd n via the truncate-to-cos

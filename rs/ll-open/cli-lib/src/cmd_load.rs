@@ -61,3 +61,56 @@ pub fn load_into_arena(control: &Path, db_bytes: &[u8]) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn load_errors_when_arena_path_unset() {
+        // Scale-pin the explicit ensure! in load_into_arena. A
+        // controller without an arena set is a misconfigured state
+        // (e.g. a control file created via Controller::open_or_create
+        // but never set_arena'd). Pin: load surfaces the
+        // "no arena path" error rather than panicking on empty
+        // string mmap.
+        let td = TempDir::new().unwrap();
+        let ctrl_path = td.path().join("test.ctrl");
+        // Create the controller without setting the arena.
+        let _ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+        let err = load_into_arena(&ctrl_path, &[0u8; 16])
+            .expect_err("must error on no-arena-path");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("arena path") || msg.contains("set_arena"),
+            "error must mention arena path; got: {msg}",
+        );
+    }
+
+    #[test]
+    fn load_errors_when_db_exceeds_arena_capacity() {
+        // The registry-scale failure mode. A 1.1 GB ingest db loaded
+        // into a 256 MB arena would ensure!-fail here. Pin the error
+        // message so a misconfigured daemon/serve invocation surfaces
+        // an actionable diagnostic rather than mmap-corruption when a
+        // refactor dropped the bounds check.
+        let td = TempDir::new().unwrap();
+        let arena_path = td.path().join("small.arena");
+        let ctrl_path = td.path().join("test.ctrl");
+        // Arena tiny — minimum-sized so buffer_capacity is small.
+        let arena_size = 4 * 1024; // 4 KB total → ~2 KB per buffer
+        let _mmap = leyline_core::create_arena(&arena_path, arena_size).unwrap();
+        let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+        ctrl.set_arena(&arena_path.to_string_lossy(), arena_size, 0).unwrap();
+        // Attempt to load 16 KB into ~2 KB buffer capacity.
+        let too_big = vec![0u8; 16 * 1024];
+        let err = load_into_arena(&ctrl_path, &too_big)
+            .expect_err("must error on db exceeds capacity");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("exceeds arena buffer capacity"),
+            "error must mention capacity; got: {msg}",
+        );
+    }
+}

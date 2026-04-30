@@ -224,7 +224,7 @@ impl Aggregate<MajorityState, Value> for BundleMajorityAgg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::{popcount_distance, xor_into};
+    use crate::util::{expand_seed, popcount_distance, xor_into};
     use crate::Hypervector;
 
     fn fixture_conn() -> Connection {
@@ -285,8 +285,8 @@ mod tests {
         // big-endian u64 chunks), Hamming queries via SQL would
         // differ from queries via host code. Pin equality.
         let conn = fixture_conn();
-        let a = crate::util::expand_seed(0xDEAD_BEEF);
-        let b = crate::util::expand_seed(0xCAFE_BABE);
+        let a = expand_seed(0xDEAD_BEEF);
+        let b = expand_seed(0xCAFE_BABE);
         let d_udf: i64 = conn
             .query_row(
                 "SELECT popcount_xor(?1, ?2)",
@@ -323,7 +323,7 @@ mod tests {
     #[test]
     fn bundle_xor_single_row_returns_that_row() {
         let conn = fixture_conn();
-        let hv = crate::util::expand_seed(0x42);
+        let hv = expand_seed(0x42);
         insert_hv(&conn, 1, &hv);
         assert_eq!(select_bundle(&conn), hv.to_vec());
     }
@@ -335,7 +335,7 @@ mod tests {
         // accidentally switched to OR or AND semantics is caught
         // immediately.
         let conn = fixture_conn();
-        let hv = crate::util::expand_seed(0xAAAA);
+        let hv = expand_seed(0xAAAA);
         insert_hv(&conn, 1, &hv);
         insert_hv(&conn, 2, &hv);
         assert_eq!(select_bundle(&conn), vec![0u8; D_BYTES]);
@@ -344,9 +344,9 @@ mod tests {
     #[test]
     fn bundle_xor_three_rows_xors_all() {
         let conn = fixture_conn();
-        let a = crate::util::expand_seed(1);
-        let b = crate::util::expand_seed(2);
-        let c = crate::util::expand_seed(3);
+        let a = expand_seed(1);
+        let b = expand_seed(2);
+        let c = expand_seed(3);
         insert_hv(&conn, 1, &a);
         insert_hv(&conn, 2, &b);
         insert_hv(&conn, 3, &c);
@@ -363,7 +363,7 @@ mod tests {
         // must not change the result.
         let conn1 = fixture_conn();
         let conn2 = fixture_conn();
-        let hvs: Vec<_> = (0..10).map(crate::util::expand_seed).collect();
+        let hvs: Vec<_> = (0..10).map(expand_seed).collect();
         for (i, hv) in hvs.iter().enumerate() {
             insert_hv(&conn1, i as i64, hv);
         }
@@ -388,7 +388,7 @@ mod tests {
     #[test]
     fn bundle_majority_single_row_returns_that_row() {
         let conn = fixture_conn();
-        let hv = crate::util::expand_seed(0xBEEF);
+        let hv = expand_seed(0xBEEF);
         insert_hv(&conn, 1, &hv);
         // 1 row, half = 0, so any cnt > 0 wins — i.e., bit set in input
         // is set in output. Result equals the input.
@@ -400,7 +400,7 @@ mod tests {
         // Three identical rows: every bit's count is either 0 or 3.
         // Half = 1, so cnt > 1 ⇒ output=1 iff input bit was set.
         let conn = fixture_conn();
-        let hv = crate::util::expand_seed(42);
+        let hv = expand_seed(42);
         for i in 1..=3 {
             insert_hv(&conn, i, &hv);
         }
@@ -415,8 +415,8 @@ mod tests {
         // signal. With N=10 and target appearing 7 times, the bundle
         // should be much closer to M_target than to a random vector.
         let conn = fixture_conn();
-        let target = crate::util::expand_seed(0xC0DE_C0DE);
-        let other_hvs: Vec<_> = (1..10).map(crate::util::expand_seed).collect();
+        let target = expand_seed(0xC0DE_C0DE);
+        let other_hvs: Vec<_> = (1..10).map(expand_seed).collect();
 
         // Insert: 7 copies of target + 3 distinct others.
         let mut id = 0;
@@ -479,11 +479,11 @@ mod tests {
         )
         .unwrap();
         let hvs_a = [
-            crate::util::expand_seed(11),
-            crate::util::expand_seed(12),
-            crate::util::expand_seed(13),
+            expand_seed(11),
+            expand_seed(12),
+            expand_seed(13),
         ];
-        let hvs_b = [crate::util::expand_seed(21), crate::util::expand_seed(22)];
+        let hvs_b = [expand_seed(21), expand_seed(22)];
         for (i, hv) in hvs_a.iter().enumerate() {
             conn.execute(
                 "INSERT INTO hvs(id, hv, scope) VALUES (?1, ?2, ?3)",

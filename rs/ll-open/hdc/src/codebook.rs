@@ -81,3 +81,6 @@ pub use ast::AstCodebook;
 
 pub mod module;
 pub use module::{encode_module, module_distance, ModuleCodebook};
+
+pub mod semantic;
+pub use semantic::{SemanticCodebook, SEMANTIC_HYPERPLANE_SEED};

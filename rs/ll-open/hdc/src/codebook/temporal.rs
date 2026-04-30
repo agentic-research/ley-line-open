@@ -208,6 +208,15 @@ mod tests {
     /// uniform and pins one canonical reference point.
     const NOW: f64 = 1_700_000_000.0;
 
+    /// Add a "fresh" commit (commit_time == now, no decay applied).
+    /// Replaces the `m.add_commit(&[...], NOW, NOW)` pattern that
+    /// repeated 12× across the temporal tests. Tests that need a
+    /// commit_time != now still call `m.add_commit` directly with
+    /// their custom commit-age offset.
+    fn fresh(m: &mut TemporalCoEditMatrix, scopes: &[&str]) {
+        m.add_commit(scopes, NOW, NOW);
+    }
+
     #[test]
     fn matrix_intern_assigns_stable_indices() {
         let mut m = TemporalCoEditMatrix::new();
@@ -225,8 +234,7 @@ mod tests {
     #[test]
     fn fresh_commit_has_unit_weight() {
         let mut m = TemporalCoEditMatrix::new();
-        let now = NOW;
-        m.add_commit(&["a", "b"], now, now);
+        fresh(&mut m, &["a", "b"]);
         let row = m.sparse_row("a");
         assert_eq!(row.len(), 1);
         let (_, w) = row[0];
@@ -265,9 +273,8 @@ mod tests {
         // Multiple commits touching the same pair accumulate weight.
         // Three fresh commits → weight = 3.0.
         let mut m = TemporalCoEditMatrix::new();
-        let now = NOW;
         for _ in 0..3 {
-            m.add_commit(&["a", "b"], now, now);
+            fresh(&mut m, &["a", "b"]);
         }
         let row = m.sparse_row("a");
         let (_, w) = row[0];
@@ -306,10 +313,9 @@ mod tests {
         // scope C co-edits with D (only). Project both rows; they
         // should land far apart in Hamming because the dot products
         // hit different hyperplane components.
-        let now = NOW;
         let mut m = TemporalCoEditMatrix::new();
-        m.add_commit(&["a", "b"], now, now);
-        m.add_commit(&["c", "d"], now, now);
+        fresh(&mut m, &["a", "b"]);
+        fresh(&mut m, &["c", "d"]);
 
         let cb = TemporalCodebook::new(8);
         let hv_a = cb.project_scope(&m, "a");
@@ -331,13 +337,12 @@ mod tests {
         // most of their non-zero row support. Their projections should
         // therefore be much closer than two scopes with disjoint
         // partners.
-        let now = NOW;
         let mut m = TemporalCoEditMatrix::new();
         // a and c both co-edit with b.
-        m.add_commit(&["a", "b"], now, now);
-        m.add_commit(&["c", "b"], now, now);
+        fresh(&mut m, &["a", "b"]);
+        fresh(&mut m, &["c", "b"]);
         // d co-edits with e (disjoint).
-        m.add_commit(&["d", "e"], now, now);
+        fresh(&mut m, &["d", "e"]);
 
         let cb = TemporalCodebook::new(16);
         let hv_a = cb.project_scope(&m, "a");
@@ -359,9 +364,8 @@ mod tests {
     fn temporal_codebook_seed_versioning_changes_hv() {
         // Bumping the seed produces a different hyperplane matrix,
         // and therefore a different projection. Migration safety pin.
-        let now = NOW;
         let mut m = TemporalCoEditMatrix::new();
-        m.add_commit(&["a", "b"], now, now);
+        fresh(&mut m, &["a", "b"]);
 
         let cb_v1 = TemporalCodebook::new_with_seed(8, "hdc-temporal-v1");
         let cb_v2 = TemporalCodebook::new_with_seed(8, "hdc-temporal-v2");
@@ -381,10 +385,9 @@ mod tests {
         // This is the load-bearing property that makes temporal HVs
         // useful for delta sync — if every commit shifted every scope's
         // HV substantially, we'd never converge on stable hotspots.
-        let now = NOW;
         let mut m = TemporalCoEditMatrix::new();
-        m.add_commit(&["a", "b"], now, now);
-        m.add_commit(&["a", "c"], now, now);
+        fresh(&mut m, &["a", "b"]);
+        fresh(&mut m, &["a", "c"]);
 
         // Use max_scopes=64 so any scopes added by future commits have
         // valid hyperplane columns.
@@ -392,7 +395,7 @@ mod tests {
         let hv_before = cb.project_scope(&m, "a");
 
         // New commit on completely unrelated scopes.
-        m.add_commit(&["x", "y"], now, now);
+        fresh(&mut m, &["x", "y"]);
 
         let hv_after = cb.project_scope(&m, "a");
         // Bit churn for an unaffected scope should be 0% — since "a"'s
@@ -412,12 +415,11 @@ mod tests {
         // is the "matrix grew past my pre-allocation" recovery path —
         // production callers should size max_scopes generously, but a
         // test fixture that overfills must not crash.
-        let now = NOW;
         let mut m = TemporalCoEditMatrix::new();
         // Force scope "x" to index 0.
-        m.add_commit(&["x", "y"], now, now);
+        fresh(&mut m, &["x", "y"]);
         // Force scope "z" to index 2 (since x=0, y=1).
-        m.add_commit(&["x", "z"], now, now);
+        fresh(&mut m, &["x", "z"]);
 
         // Codebook with max_scopes=2 — index 2 (scope "z") will be out
         // of bounds and must be filtered, not panic.
@@ -434,9 +436,8 @@ mod tests {
         // the matrix. Pin the combinatorics so a refactor that switched
         // to "every pair against every later pair" or some other
         // off-by-one would be caught.
-        let now = NOW;
         let mut m = TemporalCoEditMatrix::new();
-        m.add_commit(&["a", "b", "c", "d"], now, now);
+        fresh(&mut m, &["a", "b", "c", "d"]);
         // (a,b), (a,c), (a,d), (b,c), (b,d), (c,d) = 6 pairs
         assert_eq!(m.nnz(), 6);
     }
@@ -446,9 +447,8 @@ mod tests {
         // A commit that touches one scope adds zero pairs (no co-edits
         // possible with self). Pin the corner case so a future refactor
         // doesn't accidentally count self-pairs.
-        let now = NOW;
         let mut m = TemporalCoEditMatrix::new();
-        m.add_commit(&["a"], now, now);
+        fresh(&mut m, &["a"]);
         // Scope is registered (so future commits can refer to it)…
         assert_eq!(m.scope_count(), 1);
         // …but no co-edit cells exist (no partner to pair with).
@@ -483,16 +483,15 @@ mod tests {
 
     #[test]
     fn nnz_grows_with_distinct_pairs() {
-        let now = NOW;
         let mut m = TemporalCoEditMatrix::new();
         // First commit: {a,b,c} → 3 distinct unordered pairs.
-        m.add_commit(&["a", "b", "c"], now, now);
+        fresh(&mut m, &["a", "b", "c"]);
         assert_eq!(m.nnz(), 3);
         // Second commit: {a,b} → existing pair, no new cells.
-        m.add_commit(&["a", "b"], now, now);
+        fresh(&mut m, &["a", "b"]);
         assert_eq!(m.nnz(), 3);
         // Third commit: {a,d} → one new pair.
-        m.add_commit(&["a", "d"], now, now);
+        fresh(&mut m, &["a", "d"]);
         assert_eq!(m.nnz(), 4);
     }
 }

@@ -69,16 +69,15 @@ mod tests {
     use super::*;
     use crate::util::tagged_seed_vector;
 
+    /// Test convenience: like `AstNodeFingerprint::new` but takes
+    /// `&[CanonicalKind]` instead of an owned Vec — the test bodies
+    /// build inline arrays which `&[K]` is the natural type for.
     fn fp(
         kind: CanonicalKind,
         arity: u8,
         children: &[CanonicalKind],
     ) -> AstNodeFingerprint {
-        AstNodeFingerprint {
-            canonical_kind: kind,
-            arity_bucket: arity,
-            child_canonical_kinds: children.to_vec(),
-        }
+        AstNodeFingerprint::new(kind, arity, children.to_vec())
     }
 
     #[test]

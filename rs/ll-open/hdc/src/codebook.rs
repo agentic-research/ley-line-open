@@ -101,17 +101,25 @@ pub struct AstNodeFingerprint {
 }
 
 impl AstNodeFingerprint {
-    /// Construct a leaf-node fingerprint: zero arity, no children.
-    /// Replaces the verbatim `AstNodeFingerprint { kind, 0, vec![] }`
-    /// pattern that was duplicated across multiple call sites
-    /// (4 in query.rs alone). Stable shape — used by cleanup-memory
-    /// to probe for "what kind would a leaf at this position be".
-    pub fn leaf(kind: CanonicalKind) -> Self {
+    /// Construct a fingerprint from its three fields. Mirrors the
+    /// struct-init shape but eliminates the `canonical_kind: ...,
+    /// arity_bucket: ..., child_canonical_kinds: ...` boilerplate at
+    /// every call site (encoder::fingerprint, query::explain_cluster_
+    /// centroid, codebook/ast tests).
+    pub fn new(canonical_kind: CanonicalKind, arity_bucket: u8, child_canonical_kinds: Vec<CanonicalKind>) -> Self {
         Self {
-            canonical_kind: kind,
-            arity_bucket: 0,
-            child_canonical_kinds: Vec::new(),
+            canonical_kind,
+            arity_bucket,
+            child_canonical_kinds,
         }
+    }
+
+    /// Construct a leaf-node fingerprint: zero arity, no children.
+    /// Convenience for the common case where cleanup-memory probes
+    /// "what kind would a leaf at this position be" — replaces the
+    /// `AstNodeFingerprint { kind, 0, vec![] }` literal pattern.
+    pub fn leaf(kind: CanonicalKind) -> Self {
+        Self::new(kind, 0, Vec::new())
     }
 }
 
@@ -252,12 +260,9 @@ mod tests {
         assert_eq!(fp.arity_bucket, 0);
         assert!(fp.child_canonical_kinds.is_empty());
 
-        // Equivalence with the literal struct construction it replaces:
-        let manual = AstNodeFingerprint {
-            canonical_kind: CanonicalKind::Op,
-            arity_bucket: 0,
-            child_canonical_kinds: vec![],
-        };
+        // Equivalence with the explicit `::new(kind, 0, vec![])` form:
+        // leaf must produce byte-identical fields.
+        let manual = AstNodeFingerprint::new(CanonicalKind::Op, 0, vec![]);
         let via_helper = AstNodeFingerprint::leaf(CanonicalKind::Op);
         // Vec<CanonicalKind> doesn't impl PartialEq directly via derive
         // (the enum does), so compare fields explicitly.

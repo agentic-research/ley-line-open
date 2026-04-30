@@ -50,11 +50,11 @@ impl EncoderNode {
 
     /// Build the codebook fingerprint for this node.
     fn fingerprint(&self) -> AstNodeFingerprint {
-        AstNodeFingerprint {
-            canonical_kind: self.canonical_kind,
-            arity_bucket: bucket_arity(self.children.len()),
-            child_canonical_kinds: self.child_canonical_kinds_sorted.clone(),
-        }
+        AstNodeFingerprint::new(
+            self.canonical_kind,
+            bucket_arity(self.children.len()),
+            self.child_canonical_kinds_sorted.clone(),
+        )
     }
 
     /// Content hash for cache lookup. Deterministic across machines —

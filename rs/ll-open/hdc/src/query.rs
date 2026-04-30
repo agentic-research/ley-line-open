@@ -195,11 +195,11 @@ where
     let leaf_base =
         |kind: CanonicalKind| codebook.base_vector(&AstNodeFingerprint::leaf(kind));
 
-    let parent_fp = AstNodeFingerprint {
-        canonical_kind: centroid_root_kind,
-        arity_bucket: centroid_arity,
-        child_canonical_kinds: centroid_child_kinds_positional.to_vec(),
-    };
+    let parent_fp = AstNodeFingerprint::new(
+        centroid_root_kind,
+        centroid_arity,
+        centroid_child_kinds_positional.to_vec(),
+    );
     let parent_base = codebook.base_vector(&parent_fp);
 
     // Build the sum of all positional rotated leaf bases — what the

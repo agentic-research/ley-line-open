@@ -947,18 +947,33 @@ mod tests {
         rx
     }
 
-    /// `git_watch_loop` ticks every 2s. Modify a file, wait one full tick + a
-    /// generous slack, and verify both the typed hook and the event fire.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn watcher_invokes_files_changed_hook_and_event() {
+    /// Bundle for `start_watcher_test` — keeps the fixture's owned values
+    /// alive (TempDir auto-cleanup at drop; abort the task at test end).
+    /// `_ctx` and `_dir` are stored only for their RAII lifetime — neither
+    /// test reads them through the bundle, but dropping them early would
+    /// kill the daemon context / TempDir mid-test.
+    struct WatcherTestBed {
+        repo: TempDir,
+        _dir: TempDir,
+        _ctx: Arc<DaemonContext>,
+        ext: Arc<RecordingExt>,
+        events_rx: tokio::sync::mpsc::Receiver<crate::daemon::events::Event>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    /// Spin up a fresh git fixture + DaemonContext + RecordingExt, subscribe
+    /// to `topic`, and spawn `git_watch_loop`. Sleeps 2500ms so the watcher
+    /// has ticked once before the test makes its first observable change —
+    /// otherwise the first tick's "establish baseline" call could race with
+    /// the test's modification and miss the event. Returns a bundle the
+    /// caller can drive with arbitrary file/HEAD changes.
+    async fn start_watcher_test(topic: &str) -> WatcherTestBed {
         let repo = fixture_repo();
         let dir = TempDir::new().unwrap();
         let ctrl_path = dir.path().join("test.ctrl");
-
         let ext = Arc::new(RecordingExt::new());
         let ctx = test_ctx(&ctrl_path, ext.clone(), repo.path());
-
-        let mut events_rx = subscribe_to(&ctx.router, "daemon.files.changed").await;
+        let events_rx = subscribe_to(&ctx.router, topic).await;
         let emitter = ctx.router.emitter();
 
         let watch_ctx = ctx.clone();
@@ -967,27 +982,35 @@ mod tests {
             git_watch_loop(watch_ctx, &watch_source, emitter).await;
         });
 
-        // Let the watcher tick once with no changes (establishes baseline).
         tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
 
-        // Now make the file dirty.
-        std::fs::write(repo.path().join("a.go"), "package m\n\nfunc A() { /* edit */ }\n")
+        WatcherTestBed { repo, _dir: dir, _ctx: ctx, ext, events_rx, task }
+    }
+
+    /// `git_watch_loop` ticks every 2s. Modify a file, wait one full tick + a
+    /// generous slack, and verify both the typed hook and the event fire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watcher_invokes_files_changed_hook_and_event() {
+        let mut tb = start_watcher_test("daemon.files.changed").await;
+
+        // Make the file dirty after the baseline tick.
+        std::fs::write(tb.repo.path().join("a.go"), "package m\n\nfunc A() { /* edit */ }\n")
             .unwrap();
 
         // Wait up to 5s for the next tick to detect the change.
         let saw_files_event = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            events_rx.recv(),
+            tb.events_rx.recv(),
         )
         .await
         .ok()
         .flatten()
         .is_some();
 
-        task.abort();
+        tb.task.abort();
 
         assert!(saw_files_event, "expected daemon.files.changed event");
-        let recorded = ext.file_changes.lock().unwrap();
+        let recorded = tb.ext.file_changes.lock().unwrap();
         assert!(
             !recorded.is_empty(),
             "expected on_files_changed to be invoked at least once",
@@ -1002,45 +1025,29 @@ mod tests {
     /// HEAD changes (e.g. new commit) should fire both the event and the hook.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn watcher_invokes_head_changed_hook_and_event() {
-        let repo = fixture_repo();
-        let initial_head = git_head(repo.path()).unwrap();
-        let dir = TempDir::new().unwrap();
-        let ctrl_path = dir.path().join("test.ctrl");
-
-        let ext = Arc::new(RecordingExt::new());
-        let ctx = test_ctx(&ctrl_path, ext.clone(), repo.path());
-
-        let mut events_rx = subscribe_to(&ctx.router, "daemon.head.changed").await;
-        let emitter = ctx.router.emitter();
-
-        let watch_ctx = ctx.clone();
-        let watch_source = repo.path().to_path_buf();
-        let task = tokio::spawn(async move {
-            git_watch_loop(watch_ctx, &watch_source, emitter).await;
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+        let mut tb = start_watcher_test("daemon.head.changed").await;
+        let initial_head = git_head(tb.repo.path()).unwrap();
 
         // New commit — bumps HEAD.
-        std::fs::write(repo.path().join("b.go"), "package m\n\nfunc B() {}\n").unwrap();
-        sh(repo.path(), &["git", "add", "."]);
-        sh(repo.path(), &["git", "commit", "-q", "-m", "add b"]);
-        let new_head = git_head(repo.path()).unwrap();
+        std::fs::write(tb.repo.path().join("b.go"), "package m\n\nfunc B() {}\n").unwrap();
+        sh(tb.repo.path(), &["git", "add", "."]);
+        sh(tb.repo.path(), &["git", "commit", "-q", "-m", "add b"]);
+        let new_head = git_head(tb.repo.path()).unwrap();
         assert_ne!(initial_head, new_head);
 
         let saw_head_event = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            events_rx.recv(),
+            tb.events_rx.recv(),
         )
         .await
         .ok()
         .flatten()
         .is_some();
 
-        task.abort();
+        tb.task.abort();
 
         assert!(saw_head_event, "expected daemon.head.changed event");
-        let head_calls = ext.head_changes.lock().unwrap();
+        let head_calls = tb.ext.head_changes.lock().unwrap();
         assert!(!head_calls.is_empty(), "expected on_head_changed to fire");
         let (_old, new) = head_calls.last().unwrap();
         assert_eq!(new, &new_head, "hook should report the new HEAD sha");

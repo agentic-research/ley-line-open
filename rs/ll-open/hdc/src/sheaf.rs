@@ -642,6 +642,25 @@ mod tests {
     }
 
     #[test]
+    fn add_edge_does_not_deduplicate() {
+        // add_cell overwrites by id (mirrors `_hdc`'s primary key
+        // semantics) but add_edge appends to a Vec — duplicates are
+        // allowed. Pin the asymmetry so a refactor that switched
+        // edges to a HashSet (deduplicating) would surface; it would
+        // silently drop duplicate-but-meaningful structural relations
+        // (e.g. two Calls edges between the same pair recorded under
+        // different code paths).
+        let mut cx = HvCellComplex::new();
+        cx.add_cell(make_cell("a", CanonicalKind::Decl, 1));
+        cx.add_cell(make_cell("b", CanonicalKind::Decl, 1));
+        let e = HvEdge::identity("a", "b", EdgeKind::Sibling, LayerKind::Ast);
+        cx.add_edge(e.clone());
+        cx.add_edge(e.clone());
+        cx.add_edge(e);
+        assert_eq!(cx.edges.len(), 3, "add_edge must append, not deduplicate");
+    }
+
+    #[test]
     fn add_cell_with_same_id_overwrites() {
         // BTreeMap-backed: same id replaces. Mirrors `_hdc`'s
         // (scope_id, layer_kind) PRIMARY KEY semantics — the SQL

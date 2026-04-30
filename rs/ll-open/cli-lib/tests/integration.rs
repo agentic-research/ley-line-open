@@ -517,10 +517,7 @@ async fn test_daemon_socket_status_op() {
 async fn test_daemon_ext_dispatches_to_extension() {
     use leyline_cli_lib::daemon::ext::DaemonExt;
     use leyline_cli_lib::daemon::DaemonContext;
-    
     use std::sync::Arc;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
 
     /// Custom extension that handles "custom_op".
     struct TestExt;
@@ -535,7 +532,6 @@ async fn test_daemon_ext_dispatches_to_extension() {
     }
 
     let dir = TempDir::new().unwrap();
-
     let (_arena, ctrl_path) = fresh_arena(dir.path());
 
     let ctx = Arc::new(DaemonContext {
@@ -546,27 +542,14 @@ async fn test_daemon_ext_dispatches_to_extension() {
     let sock_path = dir.path().join("ext_test.sock");
     spawn_test_socket(ctx, sock_path.clone()).await;
 
-    let stream = UnixStream::connect(&sock_path).await.expect("connect to socket");
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
-
-    // Test custom extension op.
-    writer
-        .write_all(b"{\"op\":\"custom_op\"}\n")
-        .await
-        .expect("write custom_op");
-    let response = lines.next_line().await.unwrap().expect("read custom response");
-    let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+    // Custom op routes to extension.
+    let parsed = uds_round_trip(&sock_path, r#"{"op":"custom_op"}"#).await;
     assert_eq!(parsed["ok"], true);
     assert_eq!(parsed["custom"], "hello from extension");
 
-    // Test unknown op returns error.
-    writer
-        .write_all(b"{\"op\":\"nonexistent\"}\n")
-        .await
-        .expect("write unknown op");
-    let response = lines.next_line().await.unwrap().expect("read unknown response");
-    let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+    // Unknown op surfaces error string. Daemon is stateless across connections,
+    // so a fresh round-trip suffices for the second probe.
+    let parsed = uds_round_trip(&sock_path, r#"{"op":"nonexistent"}"#).await;
     assert!(parsed.get("error").is_some());
     let err_str = parsed["error"].as_str().unwrap();
     assert!(err_str.contains("unknown op"), "error should mention 'unknown op', got: {err_str}");

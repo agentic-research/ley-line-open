@@ -334,6 +334,28 @@ mod tests {
     }
 
     #[test]
+    fn default_radius_uses_default_tightness() {
+        // `default_radius` must delegate to `recommended_radius` with
+        // `DEFAULT_RADIUS_TIGHTNESS` (= 3.0). Pin so a refactor that
+        // hard-coded a different constant or routed through a
+        // different formula would diverge from the documented
+        // contract `median - 3·MAD`.
+        let baseline = RadiusBaseline {
+            layer: LayerKind::Ast,
+            median_distance: 4096,
+            mad: 100,
+            sample_size: 10000,
+            computed_at_ms: 0,
+        };
+        assert_eq!(
+            baseline.default_radius(),
+            baseline.recommended_radius(DEFAULT_RADIUS_TIGHTNESS),
+        );
+        // And to the explicit formula: 4096 - 3.0 * 100 = 3796.
+        assert_eq!(baseline.default_radius(), 3796);
+    }
+
+    #[test]
     fn recommended_radius_clamps_to_zero() {
         // If MAD * tightness > median (small/skewed corpus), recommended
         // radius would go negative — clamp to 0. Pin the corner case so

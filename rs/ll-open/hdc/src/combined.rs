@@ -246,6 +246,40 @@ mod tests {
     }
 
     #[test]
+    fn build_combined_for_scope_skips_unknown_layer_kinds() {
+        // Forward-compat path: a row written by a newer daemon may
+        // carry an unrecognized `layer_kind` string. build_combined_
+        // for_scope must skip such rows (not panic, not pollute the
+        // combined HV with the orphaned blob), but should still bump
+        // `max_basis` since the row's revision counter is meaningful
+        // regardless of layer interpretability. Pin both halves —
+        // a refactor that hard-erred on unknown layers would crash
+        // readers running against newer-schema data; one that
+        // silently used the unknown blob would corrupt downstream
+        // distance queries.
+        let conn = fresh();
+        let known = expand_seed(0x55);
+        insert_layer(&conn, "fn_foo", LayerKind::Ast, &known, 3);
+        // Sneak in an "unknown layer kind" row directly via SQL
+        // (the helper insists on a real LayerKind enum).
+        conn.execute(
+            "INSERT INTO _hdc(scope_id, layer_kind, hv, basis) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["fn_foo", "future_layer", expand_seed(0x99).to_vec(), 9i64],
+        )
+        .unwrap();
+
+        let (combined, basis) = build_combined_for_scope(&conn, "fn_foo").unwrap();
+        // Combined HV = build_combined_hv on the known-layer-only map
+        // — the unknown-layer blob doesn't contribute.
+        let expected = build_combined_hv(&HashMap::from([(LayerKind::Ast, known)]));
+        assert_eq!(combined, expected, "unknown layer must not contribute");
+        // But max_basis is still pulled from every row, including the
+        // skipped one — its revision counter is part of the scope's
+        // freshness signal.
+        assert_eq!(basis, 9, "unknown layer's basis must still bump max");
+    }
+
+    #[test]
     fn build_combined_for_unknown_scope_returns_zero_hv() {
         // No rows in _hdc for that scope → empty layer map → zero HV,
         // basis 0. The radius calibration should treat zero-HV

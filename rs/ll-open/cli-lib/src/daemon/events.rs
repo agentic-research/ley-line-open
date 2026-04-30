@@ -687,6 +687,24 @@ mod tests {
     }
 
     #[test]
+    fn overflow_policy_deserialize_wire_format_pin() {
+        // OverflowPolicy uses #[serde(rename_all = "snake_case")] so
+        // the wire format is "drop_oldest" / "disconnect" — clients
+        // pass these strings in the subscribe op. A refactor that
+        // removed the rename_all attribute would emit "DropOldest" /
+        // "Disconnect" instead, silently breaking every existing
+        // client. Pin both variants + the Default.
+        let dropped: OverflowPolicy = serde_json::from_str("\"drop_oldest\"").unwrap();
+        assert_eq!(dropped, OverflowPolicy::DropOldest);
+        let disc: OverflowPolicy = serde_json::from_str("\"disconnect\"").unwrap();
+        assert_eq!(disc, OverflowPolicy::Disconnect);
+        // Wrong case must fail.
+        assert!(serde_json::from_str::<OverflowPolicy>("\"DropOldest\"").is_err());
+        // Default is DropOldest.
+        assert_eq!(OverflowPolicy::default(), OverflowPolicy::DropOldest);
+    }
+
+    #[test]
     fn event_serialize_to_expected_json_shape() {
         // Event is Serialize'd into the subscribe response stream.
         // Clients dispatch on `event: true` to tell pushed events

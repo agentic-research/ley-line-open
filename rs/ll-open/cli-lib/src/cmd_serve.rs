@@ -241,6 +241,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_duration_rejects_unparseable_huge_integer() {
+        // Inputs that don't fit in u64 fail at the parse() step before
+        // multiplication can overflow. Pin: a 26-digit input is
+        // rejected as "invalid duration number" rather than silently
+        // accepted or panicking. Sister coverage to
+        // parse_duration_invalid which only tests "abc".
+        assert!(
+            parse_duration("99999999999999999999999999h").is_err(),
+            "input too large for u64 must Err",
+        );
+        // KNOWN GAP (intentionally not pinned by behavior): inputs
+        // that DO fit in u64 but overflow when multiplied by the
+        // suffix multiplier (e.g. format!("{}h", u64::MAX / 3600 +
+        // 1)) currently panic in debug mode and silently wrap in
+        // release. parse_duration uses unchecked `value * multiplier`
+        // (line 48). A future fix to checked_mul + Err would be a
+        // deliberate behavior change. The threshold is u64::MAX /
+        // 3600 ≈ 5.13e15 hours — far beyond any real --timeout flag.
+    }
+
+    #[test]
     fn default_backend_is_known() {
         let b = default_backend();
         assert!(b == "nfs" || b == "fuse", "unexpected backend: {b}");

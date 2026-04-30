@@ -23,8 +23,8 @@ pub mod encoder;
 pub mod schema;
 pub mod util;
 
-pub use encoder::{encode_fresh, encode_tree, distance, EncoderNode, SubtreeCache};
-pub use util::{Hypervector, ZERO_HV};
+pub use encoder::{encode_fresh, encode_tree, EncoderNode, SubtreeCache};
+pub use util::{popcount_distance, Hypervector, ZERO_HV};
 
 /// Hypervector dimensionality in bits. Default = 8192. Single source of truth
 /// — every layer, every codebook, every BLOB column shares this value.

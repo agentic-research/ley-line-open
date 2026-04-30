@@ -12,7 +12,7 @@ use std::sync::Mutex;
 
 use crate::canonical::CanonicalKind;
 use crate::codebook::{AstNodeFingerprint, BaseCodebook};
-use crate::util::{popcount_distance, rotate_left, xor_into, Hypervector, ZERO_HV};
+use crate::util::{rotate_left, xor_into, Hypervector};
 
 /// One node in a tree to encode. Owns its children so the encoder can
 /// recurse without borrow-lifetime gymnastics. Built from tree-sitter
@@ -156,16 +156,6 @@ where
 {
     let cache = SubtreeCache::new();
     encode_tree(node, codebook, &cache)
-}
-
-/// Re-export for callers that want to inspect distance without importing util.
-pub fn distance(a: &Hypervector, b: &Hypervector) -> u32 {
-    popcount_distance(a, b)
-}
-
-/// Identity hypervector for callers that want to start a custom XOR fold.
-pub fn zero_hv() -> Hypervector {
-    ZERO_HV
 }
 
 #[cfg(test)]

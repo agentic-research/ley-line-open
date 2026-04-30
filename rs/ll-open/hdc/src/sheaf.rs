@@ -804,6 +804,33 @@ mod tests {
     }
 
     #[test]
+    fn merkle_root_empty_sentinel_byte_pin() {
+        // Skeptic 72deb2 (regression pin): the empty-complex sentinel
+        // is `blake3(b"hdc-sheaf-empty\0")` — full 256-bit blake3 hash
+        // of the domain-tagged empty input. Previous impl truncated
+        // to u64 with zero-pad, leaving only 64 bits of collision
+        // resistance. Pin the exact byte sequence so a refactor of
+        // the domain tag, the trailing 0x00 separator, or the hash
+        // function would surface immediately.
+        let cx = HvCellComplex::new();
+        let actual = cx.merkle_root_for_layer(LayerKind::Ast);
+
+        let mut expected_buf = b"hdc-sheaf-empty".to_vec();
+        expected_buf.push(0u8);
+        let expected: [u8; 32] = blake3::hash(&expected_buf).into();
+        assert_eq!(actual, expected, "empty sentinel byte format drifted");
+        // The expected sentinel must NOT be zero (skeptic 72deb2):
+        // the truncate-to-u64 bug would produce a sentinel with
+        // 192 zero high bits.
+        assert_ne!(expected, [0u8; 32], "sentinel must be non-zero");
+        // And the sentinel must NOT equal blake3 of just b"hdc-sheaf-
+        // empty" (without the 0x00 separator) — that would mean the
+        // separator was dropped.
+        let no_sep: [u8; 32] = blake3::hash(b"hdc-sheaf-empty").into();
+        assert_ne!(expected, no_sep, "0x00 separator must be present");
+    }
+
+    #[test]
     fn merkle_root_promotes_unpaired_odd_leaf() {
         // With 3 leaves [a, b, c]: round 1 produces [hash(0x01 || a
         // || b), c] — the unpaired c is promoted as-is. Round 2

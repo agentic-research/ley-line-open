@@ -642,7 +642,11 @@ fn ensure_dirs(
     Ok(())
 }
 
-/// Recursively collect files, skipping hidden/vendor/target directories.
+/// Recursively collect files, skipping hidden/vendor/target/node_modules
+/// directories. The skip-list is load-bearing for scale: at registry-repo
+/// scale (50k+ files) a single un-skipped `vendor/` or `node_modules/` can
+/// 10× the walk's file count and parse time. See
+/// `tests::collect_files_skips_known_bloat_dirs` for the skip-list pin.
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     let entries =
         std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))?;
@@ -667,4 +671,61 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn collect_files_skips_known_bloat_dirs() {
+        // Scale-problem pin. The skip-list (.hidden, node_modules,
+        // vendor, target) keeps registry-repo walks bounded — a 50k-
+        // file Aports clone with a vendored copy of any large
+        // dependency would 10× the walk if any of these names slipped
+        // out of the skip-list. Pin every entry by constructing a
+        // minimal repo that has each bloat dir + a sibling source file
+        // and asserting only the source file is collected.
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+
+        // The one file we expect to find.
+        std::fs::write(root.join("source.go"), b"package m").unwrap();
+
+        // Create one bloat dir per skip-list entry, each containing a
+        // file we DON'T want collected.
+        for bloat in [".git", "node_modules", "vendor", "target", ".cache"] {
+            let dir = root.join(bloat);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("inner.go"), b"package x").unwrap();
+        }
+
+        let mut found = Vec::new();
+        collect_files(root, &mut found).unwrap();
+        assert_eq!(found.len(), 1, "only source.go should be collected, got {found:?}");
+        assert_eq!(
+            found[0].file_name().and_then(|s| s.to_str()),
+            Some("source.go"),
+        );
+    }
+
+    #[test]
+    fn collect_files_descends_into_normal_dirs() {
+        // Sister pin: normal directories ARE descended. Pin so a
+        // refactor over-aggressively pruning (e.g. skip every dir
+        // starting with a letter) wouldn't silently miss source.
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        let pkg = root.join("pkg");
+        std::fs::create_dir(&pkg).unwrap();
+        let nested = pkg.join("util");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("helper.go"), b"package u").unwrap();
+
+        let mut found = Vec::new();
+        collect_files(root, &mut found).unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(found[0].ends_with("pkg/util/helper.go"));
+    }
 }

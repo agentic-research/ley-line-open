@@ -156,3 +156,67 @@ pub async fn cmd_lsp(
     eprintln!("wrote {}", output.display());
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    /// Scale-problem pin: detect drift between leyline-ts and
+    /// leyline-lsp extension registries. cmd_lsp passes a language id
+    /// from `leyline_lsp::languages::language_id_from_ext` into the
+    /// LSP `didOpen` notification — but the same files were (or will
+    /// be) parsed via `leyline_ts::TsLanguage::from_extension`
+    /// upstream. If the two registries disagree on which extensions
+    /// belong to a language, a file silently lands in one path but
+    /// not the other.
+    ///
+    /// Already-known drift cases (which the test accepts via the
+    /// allowlist):
+    ///   - python: ts knows .pyi (stubs), lsp doesn't.
+    ///   - markdown: ts knows .markdown, lsp only knows .md.
+    ///
+    /// A future fix lands by adding the missing ext to lsp::
+    /// LSP_LANGUAGES and removing from KNOWN_DIVERGENCES. Any new
+    /// silent skip surfaces as a test failure.
+    #[test]
+    fn ts_and_lsp_extension_registries_align_or_known_drift() {
+        use leyline_lsp::languages::language_id_from_ext;
+        use leyline_ts::languages::TsLanguage;
+
+        const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
+            ("pyi", "python"),
+            ("markdown", "markdown"),
+        ];
+
+        let probes: &[(&str, &str)] = &[
+            ("html", "html"),
+            ("htm", "html"),
+            ("md", "markdown"),
+            ("markdown", "markdown"),
+            ("json", "json"),
+            ("yaml", "yaml"),
+            ("yml", "yaml"),
+            ("go", "go"),
+            ("py", "python"),
+            ("pyi", "python"),
+            ("ex", "elixir"),
+            ("exs", "elixir"),
+        ];
+
+        for (ext, expected_id) in probes {
+            assert!(
+                TsLanguage::from_extension(ext).is_some(),
+                "ts must recognize ext `{ext}`",
+            );
+            let lsp_id = language_id_from_ext(ext);
+            if KNOWN_DIVERGENCES.contains(&(ext, expected_id)) {
+                continue;
+            }
+            assert_eq!(
+                lsp_id,
+                Some(*expected_id),
+                "registry drift: ts knows `{ext}` as `{expected_id}` but \
+                 lsp::language_id_from_ext returned {lsp_id:?}; either fix \
+                 the registry or add to KNOWN_DIVERGENCES",
+            );
+        }
+    }
+}

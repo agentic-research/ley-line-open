@@ -746,6 +746,35 @@ mod tests {
     }
 
     #[test]
+    fn compute_h0_empty_complex_yields_empty() {
+        // No cells → no groups. Pin so a future refactor that
+        // accidentally returned `vec![vec![]]` (one empty group)
+        // or panicked on the empty case is caught.
+        let cx = HvCellComplex::new();
+        let groups = cx.compute_h0(LayerKind::Ast);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn compute_h0_no_edges_yields_one_singleton_per_cell() {
+        // With cells but no edges, every cell is its own component
+        // regardless of threshold or stalk equality. Pin: union-find
+        // never merges without an explicit edge — visual proximity
+        // (same stalk) doesn't imply structural connection.
+        let mut cx = HvCellComplex::new();
+        cx.add_cell(make_cell("fn_a", CanonicalKind::Decl, 1));
+        cx.add_cell(make_cell("fn_b", CanonicalKind::Decl, 1)); // same seed!
+        cx.add_cell(make_cell("fn_c", CanonicalKind::Decl, 1)); // also same!
+        cx.set_threshold(LayerKind::Ast, 10);
+        // Same stalks but no edges → 3 singletons.
+        let groups = cx.compute_h0(LayerKind::Ast);
+        assert_eq!(groups.len(), 3);
+        for group in &groups {
+            assert_eq!(group.len(), 1);
+        }
+    }
+
+    #[test]
     fn compute_h0_no_threshold_yields_singletons() {
         // No threshold set for the layer → can't determine consistency
         // → every cell is its own component. Defensible default

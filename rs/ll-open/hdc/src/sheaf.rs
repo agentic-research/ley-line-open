@@ -1306,6 +1306,44 @@ mod tests {
     // -- Skeptic findings (7293f3, 731bff, 734d65) regression pins --
 
     #[test]
+    fn bundle_majority_elects_2_of_3() {
+        // The load-bearing "election" property: with 3 stalks, half=1
+        // (integer div) and threshold is `cnt > 1`. A bit set in
+        // exactly 2 stalks (cnt=2) elects to 1; a bit set in exactly
+        // 1 stalk (cnt=1, not > 1) elects to 0.
+        //
+        // Existing tests cover empty, singleton, all-identical, and
+        // tied-pair edge cases but never the canonical "minority loses,
+        // majority wins" case on a heterogeneous odd-count input. Pin
+        // it: a refactor that flipped `cnt > half` to `cnt >= half`
+        // would silently invert the singleton path (cnt=1 == half=1
+        // would become "elect" when it shouldn't).
+        let all_zero = ZERO_HV;
+        let all_ones: Hypervector = [0xFFu8; D_BYTES];
+        // Mixed pattern: bit 0 set in stalks 0,1 but not 2; bit 1 set
+        // in stalk 2 only.
+        let mut s0 = ZERO_HV; s0[0] = 0b0000_0001;
+        let mut s1 = ZERO_HV; s1[0] = 0b0000_0001;
+        let mut s2 = ZERO_HV; s2[0] = 0b0000_0010;
+        let bundle = HvCellComplex::bundle_majority(&[s0, s1, s2]);
+        // Bit 0: 2/3 → elect to 1.
+        // Bit 1: 1/3 → elect to 0.
+        // All other bits: 0/3 → 0.
+        assert_eq!(bundle[0], 0b0000_0001, "2-of-3 elects bit 0; 1-of-3 loses bit 1");
+        for &b in &bundle[1..] {
+            assert_eq!(b, 0, "untouched bytes must remain zero");
+        }
+
+        // Sanity: 2-of-3 all-ones vs one all-zeros → output is all-ones.
+        let bundle_all_ones = HvCellComplex::bundle_majority(&[all_ones, all_ones, all_zero]);
+        assert_eq!(bundle_all_ones, all_ones);
+
+        // Sanity: 1-of-3 all-ones vs two all-zeros → output is all-zeros.
+        let bundle_all_zero = HvCellComplex::bundle_majority(&[all_ones, all_zero, all_zero]);
+        assert_eq!(bundle_all_zero, all_zero);
+    }
+
+    #[test]
     fn bundle_majority_recovers_noisy_cluster_centroid() {
         // Skeptic 731bff: prior cluster-recovery test only used
         // *identical* stalks, where majority-bundle is trivially the

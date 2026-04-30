@@ -285,6 +285,27 @@ mod tests {
     }
 
     #[test]
+    fn sparse_row_is_symmetric_across_co_edit_partners() {
+        // Internally weights[(i, j)] is canonicalized to i < j (line
+        // 102), so the (a, b) cell lands at (a_idx, b_idx) when a was
+        // interned first. sparse_row must surface that cell whether
+        // queried via "a" (matching the i-side) or "b" (matching the
+        // j-side). Pin the symmetric retrieval — a refactor that
+        // dropped the `else if j == idx` branch (line 118-120) would
+        // make sparse_row("b") miss the (a, b) cell entirely.
+        let mut m = TemporalCoEditMatrix::new();
+        fresh(&mut m, &["a", "b"]);
+
+        let row_a = m.sparse_row("a");
+        let row_b = m.sparse_row("b");
+        assert_eq!(row_a.len(), 1, "a's row sees b");
+        assert_eq!(row_b.len(), 1, "b's row sees a (symmetric)");
+        // Same weight, partner index reflects the *other* scope.
+        assert!((row_a[0].1 - row_b[0].1).abs() < 1e-9);
+        assert_ne!(row_a[0].0, row_b[0].0, "partner index differs by side");
+    }
+
+    #[test]
     fn unknown_scope_yields_empty_row() {
         let m = TemporalCoEditMatrix::new();
         assert!(m.sparse_row("never_seen").is_empty());

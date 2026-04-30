@@ -613,6 +613,7 @@ async fn git_watch_loop(
     let mut tick = interval(GIT_POLL_INTERVAL);
     let mut last_dirty: HashSet<String> = HashSet::new();
     let mut last_head: String = git_head(source_dir).unwrap_or_default();
+    let mut git_failure_streak: u32 = 0;
 
     eprintln!(
         "git watcher started (polling every {}s)",
@@ -626,11 +627,28 @@ async fn git_watch_loop(
         let current_head = git_head(source_dir).unwrap_or_default();
         let head_changed = !current_head.is_empty() && current_head != last_head;
 
-        // 2. Check dirty files.
+        // 2. Check dirty files. On a non-repo --source, every poll fails.
+        // Log the first failure at WARN so the user can act, then dedupe
+        // to DEBUG to avoid 30-line/minute spam. The streak resets on the
+        // next success — if the user runs `git init` mid-session we
+        // resume normally and emit a fresh WARN if it fails again.
         let current_dirty = match git_dirty_files(source_dir) {
-            Ok(files) => files,
+            Ok(files) => {
+                git_failure_streak = 0;
+                files
+            }
             Err(e) => {
-                log::debug!("git status failed: {e:#}");
+                if git_failure_streak == 0 {
+                    log::warn!(
+                        "git status failed at {}: {e:#} — watcher will keep \
+                         polling at debug level. Hint: --source must point \
+                         at a git repo for branch/HEAD tracking.",
+                        source_dir.display(),
+                    );
+                } else {
+                    log::debug!("git status failed (streak {}): {e:#}", git_failure_streak);
+                }
+                git_failure_streak = git_failure_streak.saturating_add(1);
                 continue;
             }
         };
@@ -843,11 +861,12 @@ mod tests {
 
     // ── git helpers: behavior on a non-repo directory ──────────────────
     //
-    // git_watch_loop calls git_dirty_files / git_head every 2s. If the
-    // user points --source at a directory that isn't a git repo, the
-    // watcher today logs at debug level and re-runs forever (no auto-
-    // disable after N failures yet — see 5f7100-12 #4). These tests pin
-    // the underlying helper behavior so a future fix is intentional.
+    // git_watch_loop calls git_dirty_files / git_head every 2s. On a
+    // non-repo --source, the watcher logs the FIRST failure at WARN
+    // (with a hint) and dedupes subsequent identical failures to DEBUG.
+    // The streak resets on the next success, so a mid-session `git init`
+    // recovers cleanly. These tests pin the underlying helper behavior;
+    // streak/dedup is exercised end-to-end via integration tests.
 
     #[test]
     fn git_dirty_files_handles_renames_correctly() {

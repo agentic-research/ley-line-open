@@ -26,6 +26,8 @@ pub mod query;
 pub mod schema;
 pub mod sheaf;
 pub mod sql_udf;
+#[cfg(test)]
+mod test_util;
 pub mod util;
 
 pub use encoder::{encode_fresh, encode_tree, EncoderNode, SubtreeCache};

@@ -125,15 +125,9 @@ pub fn refresh_all_combined(conn: &Connection) -> rusqlite::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::create_hdc_schema;
+    use crate::test_util::conn_with_schema as fresh;
     use crate::util::{assert_far_apart, expand_seed, popcount_distance};
     use crate::D_BYTES;
-
-    fn fresh() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        create_hdc_schema(&conn).unwrap();
-        conn
-    }
 
     fn insert_layer(conn: &Connection, scope: &str, layer: LayerKind, hv: &Hypervector, basis: i64) {
         conn.execute(

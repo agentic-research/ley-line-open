@@ -1027,14 +1027,11 @@ mod tests {
         // through the SQL `BUNDLE_MAJORITY` aggregate; assert they
         // produce identical bytes. Pin so a future divergence in
         // either implementation gets caught.
-        use rusqlite::Connection;
-
         let stalks: Vec<Hypervector> =
             vec![stalk_for(101), stalk_for(202), stalk_for(303)];
         let rust_bundle = HvCellComplex::bundle_majority(&stalks);
 
-        let conn = Connection::open_in_memory().unwrap();
-        crate::sql_udf::register_hdc_udfs(&conn).unwrap();
+        let conn = crate::test_util::conn_with_udfs();
         conn.execute("CREATE TABLE hvs(hv BLOB NOT NULL)", []).unwrap();
         for s in &stalks {
             conn.execute("INSERT INTO hvs(hv) VALUES (?1)", [s.as_slice()])
@@ -1058,13 +1055,11 @@ mod tests {
         // If either side ever changes, this test fails and forces an
         // audit + doc update.
         use rusqlite::types::Value;
-        use rusqlite::Connection;
 
         let rust_empty = HvCellComplex::bundle_majority(&[]);
         assert_eq!(rust_empty, [0u8; D_BYTES], "Rust empty must be ZERO_HV");
 
-        let conn = Connection::open_in_memory().unwrap();
-        crate::sql_udf::register_hdc_udfs(&conn).unwrap();
+        let conn = crate::test_util::conn_with_udfs();
         conn.execute("CREATE TABLE hvs(hv BLOB NOT NULL)", []).unwrap();
         let sql_empty: Value = conn
             .query_row("SELECT BUNDLE_MAJORITY(hv) FROM hvs", [], |r| r.get(0))

@@ -228,8 +228,7 @@ mod tests {
     use crate::Hypervector;
 
     fn fixture_conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        register_hdc_udfs(&conn).unwrap();
+        let conn = crate::test_util::conn_with_udfs();
         // Test schema: a tiny hv-blob table.
         conn.execute_batch("CREATE TABLE hvs (id INTEGER PRIMARY KEY, hv BLOB);")
             .unwrap();

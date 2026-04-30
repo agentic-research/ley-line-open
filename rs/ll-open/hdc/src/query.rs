@@ -240,16 +240,8 @@ where
 mod tests {
     use super::*;
     use crate::codebook::AstCodebook;
-    use crate::schema::create_hdc_schema;
-    use crate::sql_udf::register_hdc_udfs;
+    use crate::test_util::conn_with_schema_and_udfs as fresh_with_udfs;
     use crate::util::{expand_seed, ZERO_HV};
-
-    fn fresh_with_udfs() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        create_hdc_schema(&conn).unwrap();
-        register_hdc_udfs(&conn).unwrap();
-        conn
-    }
 
     fn insert(conn: &Connection, scope: &str, layer: LayerKind, hv: &Hypervector, basis: i64) {
         conn.execute(

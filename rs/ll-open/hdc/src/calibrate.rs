@@ -237,14 +237,8 @@ fn next_u64(state: &mut u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::create_hdc_schema;
+    use crate::test_util::conn_with_schema as fresh;
     use crate::util::expand_seed;
-
-    fn fresh() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        create_hdc_schema(&conn).unwrap();
-        conn
-    }
 
     fn insert_layer_hv(conn: &Connection, scope: &str, layer: LayerKind, hv: &Hypervector, basis: i64) {
         conn.execute(

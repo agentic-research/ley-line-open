@@ -116,9 +116,12 @@ pub async fn cmd_lsp(
         diagnostics.len()
     );
 
-    // Build the output database.
-    if let Some(db_path) = merge_db {
-        // Merge mode: load existing .db, add LSP data alongside AST.
+    // Build the output database. Merge-mode loads an existing .db
+    // and grafts LSP data alongside the AST; standalone-mode starts
+    // fresh. Both paths converge to a single conn that's then
+    // enriched, serialized, and written — factored out below to
+    // remove a 6-line duplication.
+    let conn = if let Some(db_path) = merge_db {
         let db_bytes =
             std::fs::read(db_path).with_context(|| format!("read {}", db_path.display()))?;
 
@@ -133,25 +136,19 @@ pub async fn cmd_lsp(
 
         let matched = project::merge_lsp_into_ast(&symbols, &diagnostics, &conn)?;
         eprintln!("{matched} symbols matched to AST nodes");
-
-        let enrichment = project::enrich_symbols(&mut client, &conn, &symbols, &file_uri).await?;
-        eprintln!("enrichment: {enrichment}");
-
-        let data = conn.serialize(DatabaseName::Main)?;
-        std::fs::write(output, &*data)
-            .with_context(|| format!("write {}", output.display()))?;
+        conn
     } else {
-        // Standalone mode: create a fresh .db with LSP data.
         let conn = Connection::open_in_memory()?;
         project::project_lsp_into(&symbols, &diagnostics, &file_uri, &conn)?;
+        conn
+    };
 
-        let enrichment = project::enrich_symbols(&mut client, &conn, &symbols, &file_uri).await?;
-        eprintln!("enrichment: {enrichment}");
+    let enrichment = project::enrich_symbols(&mut client, &conn, &symbols, &file_uri).await?;
+    eprintln!("enrichment: {enrichment}");
 
-        let data = conn.serialize(DatabaseName::Main)?;
-        std::fs::write(output, &*data)
-            .with_context(|| format!("write {}", output.display()))?;
-    }
+    let data = conn.serialize(DatabaseName::Main)?;
+    std::fs::write(output, &*data)
+        .with_context(|| format!("write {}", output.display()))?;
 
     // Graceful shutdown.
     client.shutdown().await?;

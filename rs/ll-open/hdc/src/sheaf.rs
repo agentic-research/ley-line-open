@@ -634,6 +634,29 @@ mod tests {
     }
 
     #[test]
+    fn cell_stalk_returns_none_for_missing_layer() {
+        // HvCell::stalk(layer) returns Option<&Hypervector>. A layer
+        // that was never attached must yield None — never panic, never
+        // return a phantom default. The Some(&hv) case is covered by
+        // attach_stalk_overwrites_existing_layer; pin the None case so
+        // a refactor that swapped HashMap for "always present, default
+        // to ZERO_HV" would surface immediately. detect_violations and
+        // edge_hamming both lean on the None signal to skip
+        // unobservable edges (see missing_layer_skipped_not_violated).
+        let cell = HvCell::new("fn", CanonicalKind::Decl)
+            .with_stalk(LayerKind::Ast, stalk_for(1));
+        assert_eq!(cell.stalk(LayerKind::Ast), Some(&stalk_for(1)));
+        assert_eq!(cell.stalk(LayerKind::Semantic), None);
+        assert_eq!(cell.stalk(LayerKind::Module), None);
+
+        // Empty cell: every layer is None.
+        let empty = HvCell::new("fn", CanonicalKind::Decl);
+        for layer in LayerKind::ALL {
+            assert_eq!(empty.stalk(layer), None, "empty cell must report None on {layer:?}");
+        }
+    }
+
+    #[test]
     fn attach_stalk_overwrites_existing_layer() {
         // Documented contract: re-encoding overwrites. A subsequent
         // `stalk(layer)` must return the latest hv, not the first.

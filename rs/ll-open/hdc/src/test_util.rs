@@ -112,6 +112,28 @@ mod tests {
     }
 
     #[test]
+    fn insert_combined_hv_writes_to_combined_table() {
+        // Mirrors the per-layer insert_layer_hv self-test discipline:
+        // the combined-view fixture helper must round-trip through
+        // _hdc_combined so a refactor that mistakenly targets _hdc
+        // (or the wrong column order) is caught immediately.
+        use crate::util::expand_seed;
+        let conn = conn_with_schema();
+        let hv = expand_seed(0xC0DE);
+        insert_combined_hv(&conn, "fn_x", &hv, 7);
+
+        let (got_hv, got_basis): (Vec<u8>, i64) = conn
+            .query_row(
+                "SELECT hv, basis FROM _hdc_combined WHERE scope_id = ?1",
+                ["fn_x"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(got_hv, hv.to_vec());
+        assert_eq!(got_basis, 7);
+    }
+
+    #[test]
     fn conn_with_schema_and_udfs_provides_both() {
         // Pin: combined helper applies schema AND registers UDFs.
         // Catches a refactor that accidentally calls only one.

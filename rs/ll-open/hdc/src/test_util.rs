@@ -11,6 +11,7 @@ use rusqlite::Connection;
 
 use crate::schema::create_hdc_schema;
 use crate::sql_udf::register_hdc_udfs;
+use crate::{Hypervector, LayerKind};
 
 /// Open an in-memory SQLite connection with the HDC schema applied
 /// but no UDFs registered. Tests that exercise schema/storage logic
@@ -42,6 +43,39 @@ pub(crate) fn conn_with_schema_and_udfs() -> Connection {
     create_hdc_schema(&conn).unwrap();
     register_hdc_udfs(&conn).unwrap();
     conn
+}
+
+/// Insert a per-layer hypervector into `_hdc`. Replaces the
+/// byte-identical `insert` / `insert_layer` / `insert_layer_hv`
+/// helpers that calibrate.rs, combined.rs, and query.rs each
+/// re-implemented under different names.
+pub(crate) fn insert_layer_hv(
+    conn: &Connection,
+    scope: &str,
+    layer: LayerKind,
+    hv: &Hypervector,
+    basis: i64,
+) {
+    conn.execute(
+        "INSERT INTO _hdc(scope_id, layer_kind, hv, basis) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![scope, layer.as_str(), hv.to_vec(), basis],
+    )
+    .unwrap();
+}
+
+/// Insert a combined-view hypervector into `_hdc_combined`. Used by
+/// query-layer tests that exercise the prefilter table.
+pub(crate) fn insert_combined_hv(
+    conn: &Connection,
+    scope: &str,
+    hv: &Hypervector,
+    basis: i64,
+) {
+    conn.execute(
+        "INSERT INTO _hdc_combined(scope_id, hv, basis) VALUES (?1, ?2, ?3)",
+        rusqlite::params![scope, hv.to_vec(), basis],
+    )
+    .unwrap();
 }
 
 #[cfg(test)]

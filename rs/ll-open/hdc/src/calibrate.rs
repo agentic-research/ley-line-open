@@ -237,16 +237,8 @@ fn next_u64(state: &mut u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::conn_with_schema as fresh;
+    use crate::test_util::{conn_with_schema as fresh, insert_layer_hv};
     use crate::util::expand_seed;
-
-    fn insert_layer_hv(conn: &Connection, scope: &str, layer: LayerKind, hv: &Hypervector, basis: i64) {
-        conn.execute(
-            "INSERT INTO _hdc(scope_id, layer_kind, hv, basis) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![scope, layer.as_str(), hv.to_vec(), basis],
-        )
-        .unwrap();
-    }
 
     #[test]
     fn empty_layer_returns_none() {

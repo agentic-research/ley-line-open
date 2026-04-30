@@ -125,17 +125,9 @@ pub fn refresh_all_combined(conn: &Connection) -> rusqlite::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::conn_with_schema as fresh;
+    use crate::test_util::{conn_with_schema as fresh, insert_layer_hv as insert_layer};
     use crate::util::{assert_far_apart, expand_seed, popcount_distance};
     use crate::D_BYTES;
-
-    fn insert_layer(conn: &Connection, scope: &str, layer: LayerKind, hv: &Hypervector, basis: i64) {
-        conn.execute(
-            "INSERT INTO _hdc(scope_id, layer_kind, hv, basis) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![scope, layer.as_str(), hv.to_vec(), basis],
-        )
-        .unwrap();
-    }
 
     #[test]
     fn empty_layer_map_returns_zero() {

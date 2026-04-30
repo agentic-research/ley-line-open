@@ -240,24 +240,11 @@ where
 mod tests {
     use super::*;
     use crate::codebook::AstCodebook;
-    use crate::test_util::conn_with_schema_and_udfs as fresh_with_udfs;
+    use crate::test_util::{
+        conn_with_schema_and_udfs as fresh_with_udfs, insert_combined_hv as insert_combined,
+        insert_layer_hv as insert,
+    };
     use crate::util::{expand_seed, ZERO_HV};
-
-    fn insert(conn: &Connection, scope: &str, layer: LayerKind, hv: &Hypervector, basis: i64) {
-        conn.execute(
-            "INSERT INTO _hdc(scope_id, layer_kind, hv, basis) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![scope, layer.as_str(), hv.to_vec(), basis],
-        )
-        .unwrap();
-    }
-
-    fn insert_combined(conn: &Connection, scope: &str, hv: &Hypervector, basis: i64) {
-        conn.execute(
-            "INSERT INTO _hdc_combined(scope_id, hv, basis) VALUES (?1, ?2, ?3)",
-            rusqlite::params![scope, hv.to_vec(), basis],
-        )
-        .unwrap();
-    }
 
     #[test]
     fn radius_search_returns_only_within_radius() {

@@ -751,6 +751,32 @@ mod tests {
     }
 
     #[test]
+    fn merkle_root_for_layer_skips_cells_without_stalks() {
+        // The all-cells-skip case is pinned by merkle_root_for_layer
+        // _with_no_matching_stalks_is_empty_sentinel. The partial
+        // case (some cells have stalks, some don't) isn't directly
+        // pinned. Pin: a complex with one stalk-bearing cell + one
+        // bare cell on the queried layer must produce the same root
+        // as a complex with just the stalk-bearing cell. Catches a
+        // refactor that pushed a phantom leaf for the bare cell
+        // (e.g. blake3 of empty stalk bytes), shifting every per-
+        // layer root downstream.
+        let stalk = stalk_for(7);
+        let mut full = HvCellComplex::new();
+        full.add_cell(HvCell::new("fn_a", CanonicalKind::Decl).with_stalk(LayerKind::Ast, stalk));
+        full.add_cell(HvCell::new("fn_bare", CanonicalKind::Decl)); // no stalks
+
+        let mut single = HvCellComplex::new();
+        single.add_cell(HvCell::new("fn_a", CanonicalKind::Decl).with_stalk(LayerKind::Ast, stalk));
+
+        assert_eq!(
+            full.merkle_root_for_layer(LayerKind::Ast),
+            single.merkle_root_for_layer(LayerKind::Ast),
+            "bare cells must not contribute leaves to the per-layer root",
+        );
+    }
+
+    #[test]
     fn merkle_leaf_format_byte_pin() {
         // Pin the leaf byte layout so a refactor that drops a 0x00
         // separator or reorders fields gets caught — every encoded

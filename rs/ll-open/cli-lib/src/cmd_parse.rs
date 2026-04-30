@@ -11,6 +11,19 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use leyline_ts::languages::TsLanguage;
+
+/// Maximum file size that the parse pass will read into memory. Files
+/// larger than this are skipped with a warning and counted as `errors`
+/// in the summary. Bound chosen empirically: most source files are well
+/// under 1 MiB; common "huge file" cases at registry-repo scale are
+/// generated YAML/JSON dumps, vendored package-locks, and minified JS,
+/// none of which carry semantic value worth parsing.
+///
+/// At 8 MiB × N parallel rayon workers, peak memory stays bounded even
+/// in the worst case (one max-sized file per worker simultaneously).
+/// Without this cap, a single 1 GiB file in the source tree would OOM
+/// the daemon during full reparse on small machines.
+pub const MAX_PARSE_FILE_SIZE: i64 = 8 * 1024 * 1024;
 use leyline_ts::refs::{ExtractedRef, extract_refs};
 use leyline_ts::schema::{
     create_ast_schema, create_index_schema, create_refs_schema, delete_file_rows,
@@ -178,6 +191,7 @@ pub fn parse_into_conn(
 
     let mut to_parse: Vec<(String, PathBuf, TsLanguage, i64, i64)> = Vec::new();
     let mut unchanged = 0u64;
+    let mut oversized = 0u64;
 
     for path in &files {
         // Try extension first, then filename for extensionless files (Dockerfile, etc).
@@ -218,6 +232,20 @@ pub fn parse_into_conn(
             && file_size == old_s
         {
             unchanged += 1;
+            continue;
+        }
+
+        // Scale guard: reject files above MAX_PARSE_FILE_SIZE. tree-sitter
+        // parses the full source in memory; a 100MB+ file (generated YAML
+        // dump, vendored package-lock, minified bundle) would either OOM
+        // the worker or take many minutes producing nodes that have no
+        // semantic value anyway.
+        if file_size > MAX_PARSE_FILE_SIZE {
+            log::warn!(
+                "skip {rel_str}: size {file_size} bytes exceeds MAX_PARSE_FILE_SIZE \
+                 ({MAX_PARSE_FILE_SIZE} bytes)",
+            );
+            oversized += 1;
             continue;
         }
 
@@ -400,16 +428,29 @@ pub fn parse_into_conn(
         .as_secs();
     set_meta(conn, "parse_time", &now.to_string())?;
 
-    eprintln!(
-        "{parsed} parsed, {unchanged} unchanged, {deleted} deleted, {errors} errors \
-         (parse {parse_elapsed:.1?}, insert {insert_elapsed:.1?})",
-    );
+    if oversized > 0 {
+        eprintln!(
+            "{parsed} parsed, {unchanged} unchanged, {deleted} deleted, \
+             {errors} errors, {oversized} skipped >{}MB \
+             (parse {parse_elapsed:.1?}, insert {insert_elapsed:.1?})",
+            MAX_PARSE_FILE_SIZE / (1024 * 1024),
+        );
+    } else {
+        eprintln!(
+            "{parsed} parsed, {unchanged} unchanged, {deleted} deleted, {errors} errors \
+             (parse {parse_elapsed:.1?}, insert {insert_elapsed:.1?})",
+        );
+    }
 
+    // Oversized files count as errors at the result level — they
+    // weren't parsed, so the caller's "did this run produce data for
+    // every file" check stays honest. The dedicated summary field makes
+    // it easy for clients to distinguish skip-by-size from parse failure.
     Ok(ParseResult {
         parsed,
         unchanged,
         deleted,
-        errors,
+        errors: errors + oversized,
         changed_files,
     })
 }
@@ -779,6 +820,61 @@ mod tests {
                 "is_bloat_dir(`{name}`) must be false, but matched",
             );
         }
+    }
+
+    #[test]
+    fn parse_into_conn_skips_oversized_files() {
+        // Scale-guard pin. parse_into_conn must skip files larger than
+        // MAX_PARSE_FILE_SIZE rather than reading them into memory. A
+        // 100MB+ generated YAML in a registry repo would otherwise OOM
+        // a worker or take many minutes producing nodes with no semantic
+        // value. The skip is reflected in the returned `errors` count
+        // (so callers' "did every file land?" check stays honest) and
+        // logged via log::warn with the path.
+        //
+        // Construct a 9 MiB file (1 byte over the cap) alongside a
+        // small one. The small file must parse, the big one must skip,
+        // and the result MUST count exactly one error from the skip.
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+
+        // Small file — must parse.
+        std::fs::write(root.join("small.go"), b"package m\n").unwrap();
+
+        // Huge file — `MAX_PARSE_FILE_SIZE + 1` bytes of valid Go.
+        // Padding with newlines keeps it valid Go (just a `package m\n`
+        // followed by a million empty lines).
+        let mut huge = Vec::with_capacity(MAX_PARSE_FILE_SIZE as usize + 1);
+        huge.extend_from_slice(b"package m\n");
+        huge.resize(MAX_PARSE_FILE_SIZE as usize + 1, b'\n');
+        std::fs::write(root.join("huge.go"), &huge).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        let result = parse_into_conn(&conn, root, None, None).unwrap();
+
+        assert_eq!(result.parsed, 1, "small.go must parse cleanly");
+        assert_eq!(
+            result.errors, 1,
+            "huge.go must contribute exactly 1 error (skip-by-size)",
+        );
+
+        // Sanity: the small file's nodes are present, huge.go's are absent.
+        let small_present: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _file_index WHERE path = 'small.go'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(small_present, 1);
+        let huge_present: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _file_index WHERE path = 'huge.go'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(huge_present, 0, "huge.go must NOT have been indexed");
     }
 
     #[test]

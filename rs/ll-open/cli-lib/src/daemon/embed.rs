@@ -288,6 +288,30 @@ mod tests {
     use super::*;
     use crate::daemon::vec_index::register_vec;
 
+    /// `nodes` table CREATE statement for embed-pass tests. Two tests
+    /// duplicated this verbatim before extraction; one source of truth
+    /// here so a future schema column change ripples to every test
+    /// that builds an in-memory living-db.
+    const NODES_SCHEMA: &str = "CREATE TABLE nodes (
+        id TEXT PRIMARY KEY,
+        parent_id TEXT,
+        name TEXT,
+        kind INTEGER,
+        size INTEGER,
+        mtime INTEGER,
+        record TEXT
+    );";
+
+    /// Open an in-memory connection with the `nodes` table created and
+    /// `vec0` extension registered. Replaces 2 byte-identical setup
+    /// sequences across embed-pass tests.
+    fn fresh_conn_with_nodes() -> Result<Connection> {
+        register_vec();
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(NODES_SCHEMA)?;
+        Ok(conn)
+    }
+
     // ── Priority counter invariants ────────────────────────────────────
     //
     // These tests establish that promote() ordering is wall-clock-independent
@@ -395,20 +419,9 @@ mod tests {
     /// the right node ids and vectors of the right shape.
     #[test]
     fn embedding_pass_zero_embedder_populates_index() -> Result<()> {
-        register_vec();
-        let conn = Connection::open_in_memory()?;
-        // Minimal schema — only the nodes table is needed.
+        let conn = fresh_conn_with_nodes()?;
         conn.execute_batch(
-            "CREATE TABLE nodes (
-                id TEXT PRIMARY KEY,
-                parent_id TEXT,
-                name TEXT,
-                kind INTEGER,
-                size INTEGER,
-                mtime INTEGER,
-                record TEXT
-            );
-            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record)
+            "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record)
                 VALUES ('src/a.go', '', 'a.go', 0, 12, 1, 'package main');
             INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record)
                 VALUES ('src/b.go', '', 'b.go', 0, 13, 2, 'package other');
@@ -437,19 +450,9 @@ mod tests {
     /// Scoped run only embeds files in the changed set.
     #[test]
     fn embedding_pass_scope_limits_files() -> Result<()> {
-        register_vec();
-        let conn = Connection::open_in_memory()?;
+        let conn = fresh_conn_with_nodes()?;
         conn.execute_batch(
-            "CREATE TABLE nodes (
-                id TEXT PRIMARY KEY,
-                parent_id TEXT,
-                name TEXT,
-                kind INTEGER,
-                size INTEGER,
-                mtime INTEGER,
-                record TEXT
-            );
-            INSERT INTO nodes VALUES ('a.go', '', 'a.go', 0, 1, 1, 'package a');
+            "INSERT INTO nodes VALUES ('a.go', '', 'a.go', 0, 1, 1, 'package a');
             INSERT INTO nodes VALUES ('b.go', '', 'b.go', 0, 1, 1, 'package b');
             INSERT INTO nodes VALUES ('c.go', '', 'c.go', 0, 1, 1, 'package c');",
         )?;

@@ -547,6 +547,24 @@ mod tests {
     // ── json_string_array helper ────────────────────────────────────────
 
     #[test]
+    fn error_response_wire_format() {
+        // error_response is the centralized error envelope builder
+        // for event-router handlers (subscribe/unsubscribe/emit). Pin
+        // the wire shape: a single field named `error` carrying the
+        // message verbatim. The doc comment notes a future `ok: false`
+        // addition — when that lands, this pin's failure is the
+        // signal to update every client. assert_op_errors and the
+        // ops-side error tests already lean on the `error` field
+        // name; document the pin here so the cross-module contract
+        // is enforced from one site.
+        let resp = super::error_response("bad request");
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let obj = parsed.as_object().unwrap();
+        assert_eq!(obj.get("error").and_then(|v| v.as_str()), Some("bad request"));
+        assert_eq!(obj.len(), 1, "envelope must have exactly one key today");
+    }
+
+    #[test]
     fn json_string_array_extracts_strings() {
         let v = serde_json::json!({"topics": ["a", "b.c", "x"]});
         assert_eq!(

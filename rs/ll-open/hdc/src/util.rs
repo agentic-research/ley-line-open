@@ -308,6 +308,53 @@ mod tests {
     }
 
     #[test]
+    fn rotate_left_zero_is_identity() {
+        // rotate_left(_, 0) must return the input unchanged. Pin so a
+        // refactor that always entered the bit-loop (and produced the
+        // same output by accident) wouldn't drift on the zero-cost
+        // fast path.
+        let hv = expand_seed(0xCAFE);
+        assert_eq!(rotate_left(&hv, 0), hv);
+        assert_eq!(rotate_right(&hv, 0), hv);
+    }
+
+    #[test]
+    fn rotate_left_d_bits_is_identity() {
+        // rotate_left(_, D_BITS) wraps to 0 → identity. Pin the
+        // mod-D_BITS shortcut.
+        let hv = expand_seed(0x42);
+        assert_eq!(rotate_left(&hv, crate::D_BITS), hv);
+        assert_eq!(rotate_left(&hv, crate::D_BITS * 2), hv);
+        assert_eq!(rotate_right(&hv, crate::D_BITS), hv);
+    }
+
+    #[test]
+    fn rotate_left_then_right_is_identity() {
+        // For any n ∈ [0, D_BITS), rotate_right(rotate_left(hv, n), n) == hv.
+        // The inverse property is what makes unbind work.
+        let hv = expand_seed(0xBEEF);
+        for n in [1usize, 7, 64, 1234, crate::D_BITS - 1] {
+            let rotated = rotate_left(&hv, n);
+            let restored = rotate_right(&rotated, n);
+            assert_eq!(restored, hv, "rotate_right(rotate_left(_, {n}), {n}) must be identity");
+        }
+    }
+
+    #[test]
+    fn rotate_left_preserves_popcount() {
+        // Bit rotation is a permutation: number of set bits is
+        // preserved. Pin so a refactor that accidentally cleared a
+        // bit (e.g. `|=` typo'd to `=`) is caught.
+        let hv = expand_seed(0xDEAD_C0DE);
+        let original_ones: u32 = hv.iter().map(|b| b.count_ones()).sum();
+        for n in [1usize, 17, 1023, 4095] {
+            let rotated = rotate_left(&hv, n);
+            let rotated_ones: u32 = rotated.iter().map(|b| b.count_ones()).sum();
+            assert_eq!(rotated_ones, original_ones, "rotate_left({n}) changed popcount");
+        }
+    }
+
+    #[test]
     fn bucket_arity_table() {
         // Pin the bucket boundaries — these are part of the canonical
         // signature, changing one value would shift hypervectors for

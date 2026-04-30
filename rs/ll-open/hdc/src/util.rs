@@ -367,6 +367,33 @@ mod tests {
     }
 
     #[test]
+    fn xor_into_is_order_independent() {
+        // XOR is commutative + associative — applying multiple
+        // operands in any order produces the same result. This is
+        // what makes BUNDLE (XOR-aggregate) order-independent at the
+        // SQL level (pinned in sql_udf::bundle_xor_order_independent);
+        // pin the underlying Rust primitive directly so a refactor
+        // introducing path-dependent behavior (e.g. XOR with carry)
+        // would surface here before bubbling up to the SQL parity
+        // pin. Three operands, two distinct application orders.
+        let b = expand_seed(11);
+        let c = expand_seed(22);
+        let d = expand_seed(33);
+
+        let mut forward = expand_seed(1);
+        xor_into(&mut forward, &b);
+        xor_into(&mut forward, &c);
+        xor_into(&mut forward, &d);
+
+        let mut reverse = expand_seed(1);
+        xor_into(&mut reverse, &d);
+        xor_into(&mut reverse, &c);
+        xor_into(&mut reverse, &b);
+
+        assert_eq!(forward, reverse, "XOR must be order-independent");
+    }
+
+    #[test]
     fn xor_into_self_yields_zero() {
         // A XOR A = 0 — the load-bearing collapse property used by
         // bundle-cancellation tests across the crate.

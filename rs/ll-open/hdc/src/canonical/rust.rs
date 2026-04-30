@@ -1,0 +1,156 @@
+//! Rust tree-sitter kind → CanonicalKind map.
+//!
+//! Sourced from the tree-sitter-rust grammar's named node-kinds. Bucket each
+//! kind into one of the seven canonical roles. Anything not listed falls
+//! through to `FALLBACK_KIND` (Block).
+//!
+//! Adding to this map is non-breaking. *Removing* or *changing* an existing
+//! entry is breaking — every hypervector encoded against the old mapping
+//! becomes incomparable with new ones. Don't churn this without a basis bump.
+
+use super::{CanonicalKind, CanonicalKindMap, FALLBACK_KIND};
+
+pub struct RustCanonicalMap;
+
+impl CanonicalKindMap for RustCanonicalMap {
+    fn lookup(&self, kind: &str) -> CanonicalKind {
+        match kind {
+            // Declarations
+            "function_item"
+            | "function_signature_item"
+            | "struct_item"
+            | "enum_item"
+            | "union_item"
+            | "trait_item"
+            | "impl_item"
+            | "type_item"
+            | "const_item"
+            | "static_item"
+            | "mod_item"
+            | "use_declaration"
+            | "extern_crate_declaration"
+            | "let_declaration"
+            | "macro_definition"
+            | "parameter"
+            | "self_parameter"
+            | "field_declaration"
+            | "enum_variant"
+            | "associated_type"
+            | "where_predicate" => CanonicalKind::Decl,
+
+            // Expressions
+            "call_expression"
+            | "macro_invocation"
+            | "field_expression"
+            | "index_expression"
+            | "method_call_expression"
+            | "binary_expression"
+            | "unary_expression"
+            | "assignment_expression"
+            | "compound_assignment_expr"
+            | "type_cast_expression"
+            | "reference_expression"
+            | "closure_expression"
+            | "range_expression"
+            | "try_expression"
+            | "await_expression"
+            | "parenthesized_expression"
+            | "tuple_expression"
+            | "array_expression"
+            | "struct_expression"
+            | "if_expression"
+            | "match_expression"
+            | "while_expression"
+            | "loop_expression"
+            | "for_expression"
+            | "yield_expression"
+            | "async_block"
+            | "unsafe_block" => CanonicalKind::Expr,
+
+            // Statements
+            "expression_statement"
+            | "let_chain"
+            | "return_expression"
+            | "break_expression"
+            | "continue_expression" => CanonicalKind::Stmt,
+
+            // Blocks / scopes
+            "block"
+            | "source_file"
+            | "declaration_list"
+            | "field_declaration_list"
+            | "enum_variant_list"
+            | "match_block"
+            | "match_arm" => CanonicalKind::Block,
+
+            // References
+            "identifier"
+            | "field_identifier"
+            | "type_identifier"
+            | "scoped_identifier"
+            | "scoped_type_identifier"
+            | "scoped_use_list"
+            | "use_list"
+            | "shorthand_field_initializer"
+            | "lifetime"
+            | "self" => CanonicalKind::Ref,
+
+            // Literals
+            "integer_literal"
+            | "float_literal"
+            | "string_literal"
+            | "raw_string_literal"
+            | "char_literal"
+            | "boolean_literal"
+            | "byte_string_literal"
+            | "raw_byte_string_literal" => CanonicalKind::Lit,
+
+            // Operators / control-flow tags
+            "if" | "else" | "match" | "while" | "loop" | "for" | "in" | "break"
+            | "continue" | "return" | "yield" | "await" | "fn" | "let" | "const"
+            | "static" | "mut" | "ref" | "&" | "*" | "+" | "-" | "/" | "%" | "&&"
+            | "||" | "!" | "==" | "!=" | "<" | "<=" | ">" | ">=" | "=" | "+="
+            | "-=" | "*=" | "/=" | ".." | "..=" | "->" | "=>" | "::" | "?" => {
+                CanonicalKind::Op
+            }
+
+            _ => FALLBACK_KIND,
+        }
+    }
+
+    fn lang(&self) -> &'static str {
+        "rust"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn common_rust_kinds_map_correctly() {
+        let m = RustCanonicalMap;
+        assert_eq!(m.lookup("function_item"), CanonicalKind::Decl);
+        assert_eq!(m.lookup("if_expression"), CanonicalKind::Expr);
+        assert_eq!(m.lookup("expression_statement"), CanonicalKind::Stmt);
+        assert_eq!(m.lookup("block"), CanonicalKind::Block);
+        assert_eq!(m.lookup("identifier"), CanonicalKind::Ref);
+        assert_eq!(m.lookup("integer_literal"), CanonicalKind::Lit);
+        assert_eq!(m.lookup("if"), CanonicalKind::Op);
+    }
+
+    #[test]
+    fn unknown_kind_falls_back_to_block() {
+        // Forward compat: a future tree-sitter-rust adds a new kind we
+        // haven't mapped. The encoder must keep working — the new
+        // kind silently buckets to Block until the map is updated.
+        let m = RustCanonicalMap;
+        assert_eq!(m.lookup("future_unknown_kind"), CanonicalKind::Block);
+        assert_eq!(m.lookup(""), CanonicalKind::Block);
+    }
+
+    #[test]
+    fn lang_is_rust() {
+        assert_eq!(RustCanonicalMap.lang(), "rust");
+    }
+}

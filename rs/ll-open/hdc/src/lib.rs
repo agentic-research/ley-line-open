@@ -17,6 +17,7 @@
 //! deeper trees the encoder uses recursive (hierarchical) bundling, which
 //! sidesteps the saturation ceiling on flat bundles.
 
+pub mod canonical;
 pub mod schema;
 
 /// Hypervector dimensionality in bits. Default = 8192. Single source of truth

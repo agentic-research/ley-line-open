@@ -224,7 +224,7 @@ impl Aggregate<MajorityState, Value> for BundleMajorityAgg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::popcount_distance;
+    use crate::util::{popcount_distance, xor_into};
     use crate::Hypervector;
 
     fn fixture_conn() -> Connection {
@@ -352,12 +352,8 @@ mod tests {
         insert_hv(&conn, 3, &c);
         // Build expected: a XOR b XOR c.
         let mut expected = a;
-        for (e, x) in expected.iter_mut().zip(b.iter()) {
-            *e ^= *x;
-        }
-        for (e, x) in expected.iter_mut().zip(c.iter()) {
-            *e ^= *x;
-        }
+        xor_into(&mut expected, &b);
+        xor_into(&mut expected, &c);
         assert_eq!(select_bundle(&conn), expected.to_vec());
     }
 
@@ -511,12 +507,8 @@ mod tests {
             .unwrap();
         // Reconstruct expected: hvs_a[0] XOR hvs_a[1] XOR hvs_a[2]
         let mut expected = hvs_a[0];
-        for (e, x) in expected.iter_mut().zip(hvs_a[1].iter()) {
-            *e ^= *x;
-        }
-        for (e, x) in expected.iter_mut().zip(hvs_a[2].iter()) {
-            *e ^= *x;
-        }
+        xor_into(&mut expected, &hvs_a[1]);
+        xor_into(&mut expected, &hvs_a[2]);
         assert_eq!(bundle_a, expected.to_vec());
     }
 }

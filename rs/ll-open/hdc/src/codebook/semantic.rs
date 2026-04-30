@@ -19,7 +19,8 @@
 //! the same embedder produces identical projections.
 
 use crate::util::Hypervector;
-use crate::{D_BITS, D_BYTES};
+#[cfg(test)]
+use crate::D_BITS;
 
 /// Domain seed for the semantic codebook's hyperplane matrix. NEVER
 /// change once production data is encoded — bumping this orphans every
@@ -69,20 +70,13 @@ impl SemanticCodebook {
             );
             return crate::util::ZERO_HV;
         }
-        let mut out = [0u8; D_BYTES];
-        for i in 0..D_BITS {
-            let dot: f32 = embedding
+        super::simhash_signs(&self.hyperplanes, |plane| {
+            embedding
                 .iter()
-                .zip(self.hyperplanes[i].iter())
-                .map(|(a, b)| a * b)
-                .sum();
-            if dot >= 0.0 {
-                let byte = i / 8;
-                let bit = i % 8;
-                out[byte] |= 1 << bit;
-            }
-        }
-        out
+                .zip(plane.iter())
+                .map(|(a, b)| (a * b) as f64)
+                .sum()
+        })
     }
 
     pub fn embedding_dim(&self) -> usize {

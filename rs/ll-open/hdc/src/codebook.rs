@@ -105,6 +105,27 @@ pub fn canonical_signature_bytes(
     buf
 }
 
+/// Charikar simhash threshold step: for each hyperplane, compute its
+/// dot product with the input via the caller-supplied closure, set
+/// bit `i` in the output if the dot ≥ 0.
+///
+/// Centralizes the bit-loop shared by every signed-projection codebook
+/// (Semantic dense, Temporal sparse, future ones). Each codebook
+/// supplies its own dot-product semantics via the closure; the
+/// thresholding + bit-packing logic is uniform and lives here.
+pub fn simhash_signs<F>(hyperplanes: &[Vec<f32>], dot: F) -> crate::util::Hypervector
+where
+    F: Fn(&[f32]) -> f64,
+{
+    let mut out = [0u8; crate::D_BYTES];
+    for (i, plane) in hyperplanes.iter().enumerate().take(crate::D_BITS) {
+        if dot(plane) >= 0.0 {
+            out[i / 8] |= 1 << (i % 8);
+        }
+    }
+    out
+}
+
 /// Build a `D_BITS × width` Gaussian-random hyperplane matrix
 /// deterministically from a seed tag. Used by every Charikar
 /// simhash codebook (Semantic, Temporal). Each row gets a

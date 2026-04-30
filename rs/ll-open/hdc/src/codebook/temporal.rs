@@ -30,7 +30,8 @@
 use std::collections::HashMap;
 
 use crate::util::Hypervector;
-use crate::{D_BITS, D_BYTES};
+#[cfg(test)]
+use crate::D_BITS;
 
 /// Default decay constant: commits older than τ contribute weight
 /// `exp(-1) ≈ 0.37` of a fresh commit. 90 days expressed in seconds.
@@ -168,19 +169,13 @@ impl TemporalCodebook {
     /// Project a sparse row to a D-bit hypervector. Bit `i` is
     /// `sign(Σ_{(idx, w) in row} hyperplanes[i][idx] * w)`.
     pub fn project_sparse(&self, row: &[(usize, f64)]) -> Hypervector {
-        let mut out = [0u8; D_BYTES];
-        for i in 0..D_BITS {
-            let plane = &self.hyperplanes[i];
-            let dot: f64 = row
-                .iter()
-                .filter(|(idx, _)| *idx < self.max_scopes)
+        let max_scopes = self.max_scopes;
+        super::simhash_signs(&self.hyperplanes, |plane| {
+            row.iter()
+                .filter(|(idx, _)| *idx < max_scopes)
                 .map(|(idx, w)| plane[*idx] as f64 * w)
-                .sum();
-            if dot >= 0.0 {
-                out[i / 8] |= 1 << (i % 8);
-            }
-        }
-        out
+                .sum()
+        })
     }
 
     /// Project a scope's temporal row through the simhash. Wrapper

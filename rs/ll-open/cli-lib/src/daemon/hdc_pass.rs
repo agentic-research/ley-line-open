@@ -85,7 +85,9 @@ pub fn extract_functions(
 mod tests {
     use super::*;
     use leyline_hdc::canonical::{CanonicalKind, GoCanonicalMap};
-    use leyline_hdc::popcount_distance;
+    use leyline_hdc::codebook::AstCodebook;
+    use leyline_hdc::util::bucket_arity;
+    use leyline_hdc::{encode_fresh, popcount_distance, Hypervector, D_BYTES};
 
     fn parse_go(src: &str) -> EncoderNode {
         // tree-sitter-go is exposed via leyline-ts's TsLanguage::Go.
@@ -96,15 +98,15 @@ mod tests {
 
     /// Parse + encode in one step. Used by clustering tests where the
     /// EncoderNode is intermediate — only the final hypervector matters.
-    fn encode_go(src: &str, cb: &leyline_hdc::codebook::AstCodebook) -> leyline_hdc::Hypervector {
-        leyline_hdc::encode_fresh(&parse_go(src), cb)
+    fn encode_go(src: &str, cb: &AstCodebook) -> Hypervector {
+        encode_fresh(&parse_go(src), cb)
     }
 
     /// Hamming distance normalized to [0, 1] (d/D). Clustering tests
     /// compare against fractional thresholds because absolute distance
     /// scales with D.
-    fn normalized_distance(a: &leyline_hdc::Hypervector, b: &leyline_hdc::Hypervector) -> f64 {
-        popcount_distance(a, b) as f64 / (leyline_hdc::D_BYTES * 8) as f64
+    fn normalized_distance(a: &Hypervector, b: &Hypervector) -> f64 {
+        popcount_distance(a, b) as f64 / (D_BYTES * 8) as f64
     }
 
     /// Math-friend's empirical threshold for the upper bound of the
@@ -281,7 +283,7 @@ mod tests {
         // Encode every fixture, insert into _hdc, and remember the
         // hypervectors so we can assert structural distinctness.
         let cb = AstCodebook::new();
-        let mut hvs_by_group: std::collections::HashMap<&str, Vec<leyline_hdc::Hypervector>> =
+        let mut hvs_by_group: std::collections::HashMap<&str, Vec<Hypervector>> =
             std::collections::HashMap::new();
         for group in &groups {
             for (i, src) in group.sources.iter().enumerate() {
@@ -302,9 +304,9 @@ mod tests {
         // at 0. Pin that the encoder has at least SOME structural
         // discrimination across the 3 families: the union of all 15
         // hypervectors must contain >= 3 distinct values.
-        let all_hvs: Vec<&leyline_hdc::Hypervector> =
+        let all_hvs: Vec<&Hypervector> =
             hvs_by_group.values().flat_map(|v| v.iter()).collect();
-        let unique_total: std::collections::HashSet<&leyline_hdc::Hypervector> =
+        let unique_total: std::collections::HashSet<&Hypervector> =
             all_hvs.iter().copied().collect();
         assert!(
             unique_total.len() >= 3,
@@ -315,7 +317,7 @@ mod tests {
         // Family A is meant to collapse via canonical-alphabet erasure
         // (identifier-only variation). All members must share one HV.
         // This pins the documented Deckard rename-invariance property.
-        let unique_a: std::collections::HashSet<&leyline_hdc::Hypervector> =
+        let unique_a: std::collections::HashSet<&Hypervector> =
             hvs_by_group["tight_clones"].iter().collect();
         assert_eq!(
             unique_a.len(),
@@ -329,7 +331,7 @@ mod tests {
         // strictly positive but small. Family B fixtures should NOT
         // all collapse (would imply the extra statement was erased
         // alongside the identifier).
-        let unique_b: std::collections::HashSet<&leyline_hdc::Hypervector> =
+        let unique_b: std::collections::HashSet<&Hypervector> =
             hvs_by_group["type3_one_extra_stmt"].iter().collect();
         assert_eq!(
             unique_b.len(),
@@ -461,7 +463,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            let centroid: leyline_hdc::Hypervector = centroid_blob.try_into().unwrap();
+            let centroid: Hypervector = centroid_blob.try_into().unwrap();
 
             // The centroid's "root kind" + arity is approximately what
             // we'd find in the parsed source: a Block (file root) with
@@ -471,7 +473,7 @@ mod tests {
             let recovered = explain_cluster_centroid(
                 &centroid,
                 CanonicalKind::Block,
-                leyline_hdc::util::bucket_arity(2),
+                bucket_arity(2),
                 &[CanonicalKind::Decl, CanonicalKind::Decl],
                 &cb,
                 &candidate_kinds,

@@ -850,6 +850,25 @@ mod tests {
     }
 
     #[test]
+    fn propagate_sections_layer_with_no_stalks_yields_zero_hvs() {
+        // Cells exist on Ast layer but none have Semantic stalks.
+        // compute_h0(Semantic) treats them all as singletons (no
+        // edges on Semantic layer), and each singleton group has
+        // 0 Semantic stalks → bundle_majority(&[]) = ZERO_HV.
+        // Pin: a partially-encoded complex doesn't propagate
+        // garbage through to phantom centroids on the missing layer.
+        let mut cx = HvCellComplex::new();
+        cx.add_cell(make_cell("fn_a", CanonicalKind::Decl, 1));
+        cx.add_cell(make_cell("fn_b", CanonicalKind::Decl, 2));
+        // No threshold for Semantic either, so compute_h0 → singletons.
+        let centroids = cx.propagate_sections(LayerKind::Semantic);
+        assert_eq!(centroids.len(), 2);
+        for c in &centroids {
+            assert_eq!(*c, ZERO_HV, "missing-stalk group must propagate ZERO_HV");
+        }
+    }
+
+    #[test]
     fn propagate_sections_empty_complex_yields_empty() {
         // Same edge case as compute_h0: empty complex → empty
         // centroids. The propagation is built on H⁰ partitions, so

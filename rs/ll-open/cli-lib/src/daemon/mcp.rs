@@ -424,6 +424,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn jsonrpc_response_serialize_skips_none_fields() {
+        // skip_serializing_if = "Option::is_none" on id/result/error
+        // is the JSON-RPC 2.0 wire-format guarantee: an ok response
+        // emits {jsonrpc, id, result} but NOT error; an err response
+        // emits {jsonrpc, id, error} but NOT result. Strict clients
+        // (and the JSON-RPC 2.0 spec) reject explicit-null fields.
+        // Pin both directions so a refactor dropping skip_
+        // serializing_if would surface as a wire-format break.
+        let ok = JsonRpcResponse::ok(Some(serde_json::json!(1)), serde_json::json!({"x": 2}));
+        let ok_json = serde_json::to_value(&ok).unwrap();
+        let ok_obj = ok_json.as_object().unwrap();
+        assert!(ok_obj.contains_key("jsonrpc"));
+        assert!(ok_obj.contains_key("id"));
+        assert!(ok_obj.contains_key("result"));
+        assert!(!ok_obj.contains_key("error"), "ok response must not include error field");
+
+        let err = JsonRpcResponse::err(Some(serde_json::json!(2)), -32601, "method not found");
+        let err_json = serde_json::to_value(&err).unwrap();
+        let err_obj = err_json.as_object().unwrap();
+        assert!(err_obj.contains_key("jsonrpc"));
+        assert!(err_obj.contains_key("id"));
+        assert!(err_obj.contains_key("error"));
+        assert!(!err_obj.contains_key("result"), "err response must not include result field");
+
+        // JsonRpcError: data field skipped when None.
+        let err_inner = err_obj.get("error").and_then(|v| v.as_object()).unwrap();
+        assert!(err_inner.contains_key("code"));
+        assert!(err_inner.contains_key("message"));
+        assert!(!err_inner.contains_key("data"), "data field must skip when None");
+    }
+
+    #[test]
     fn jsonrpc_response_factories_set_protocol_version() {
         // JsonRpcResponse::ok and ::err embed jsonrpc: "2.0" — the
         // JSON-RPC 2.0 protocol identifier. Clients dispatch on it;

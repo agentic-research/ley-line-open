@@ -291,6 +291,23 @@ mod tests {
     }
 
     #[test]
+    fn expand_seed_zero_seed_is_nonzero_output() {
+        // Defensive pin: seed=0 must produce a non-trivial hypervector.
+        // splitmix64's wrapping_add(constant) step transforms state=0
+        // into a non-zero first output before any shifts. A refactor
+        // that "specialized" zero (e.g. early-returned ZERO_HV for
+        // seed=0 as a "fast path") would silently degenerate every
+        // codebook entry whose blake3 hash happens to truncate to 0
+        // — vanishingly rare but production-fatal if hit.
+        let hv = expand_seed(0);
+        assert_ne!(hv, ZERO_HV, "seed=0 must NOT produce ZERO_HV");
+        // Sanity: at least 30% of bits set (well above any "early
+        // return" pathology).
+        let ones: u32 = hv.iter().map(|b| b.count_ones()).sum();
+        assert!(ones > 1024, "seed=0 output must be non-degenerate (got {ones} ones)");
+    }
+
+    #[test]
     fn expand_seed_balanced_output() {
         // HDC capacity bounds assume each base vector has roughly equal
         // numbers of 0-bits and 1-bits. A skew (e.g. 70%/30%) would shift

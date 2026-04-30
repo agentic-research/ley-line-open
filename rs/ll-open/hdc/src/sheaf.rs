@@ -600,6 +600,53 @@ mod tests {
     }
 
     #[test]
+    fn add_cell_with_same_id_overwrites() {
+        // BTreeMap-backed: same id replaces. Mirrors `_hdc`'s
+        // (scope_id, layer_kind) PRIMARY KEY semantics — the SQL
+        // store overwrites on conflict, the in-memory complex must
+        // do the same so a re-encoded cell doesn't leave stale data.
+        let mut cx = HvCellComplex::new();
+        cx.add_cell(make_cell("fn_a", CanonicalKind::Decl, 1));
+        let r1 = cx.merkle_root_for_layer(LayerKind::Ast);
+        cx.add_cell(make_cell("fn_a", CanonicalKind::Decl, 999));
+        let r2 = cx.merkle_root_for_layer(LayerKind::Ast);
+        // Both inserts had id="fn_a", so cells.len() stayed 1.
+        assert_eq!(cx.cells.len(), 1);
+        // The root differs because the stalk seed (1 vs 999) changed.
+        assert_ne!(r1, r2, "overwriting a cell must change the layer root");
+    }
+
+    #[test]
+    fn set_threshold_overwrites_per_layer() {
+        // Setting the same layer twice with different values keeps
+        // only the latest. Pin so a refactor that accidentally
+        // accumulated thresholds (e.g. `Vec<u32>` instead of
+        // HashMap-style replace) wouldn't drift detection thresholds
+        // upward over time.
+        let mut cx = HvCellComplex::new();
+        cx.set_threshold(LayerKind::Ast, 100);
+        cx.set_threshold(LayerKind::Ast, 50);
+        assert_eq!(cx.agreement_threshold.get(&LayerKind::Ast), Some(&50));
+        // Different layer doesn't displace.
+        cx.set_threshold(LayerKind::Module, 200);
+        assert_eq!(cx.agreement_threshold.get(&LayerKind::Ast), Some(&50));
+        assert_eq!(cx.agreement_threshold.get(&LayerKind::Module), Some(&200));
+    }
+
+    #[test]
+    fn attach_stalk_overwrites_existing_layer() {
+        // Documented contract: re-encoding overwrites. A subsequent
+        // `stalk(layer)` must return the latest hv, not the first.
+        let mut cell = HvCell::new("fn", CanonicalKind::Decl);
+        let hv1 = stalk_for(1);
+        let hv2 = stalk_for(2);
+        cell.attach_stalk(LayerKind::Ast, hv1);
+        cell.attach_stalk(LayerKind::Ast, hv2);
+        assert_eq!(cell.stalk(LayerKind::Ast), Some(&hv2));
+        assert_eq!(cell.stalks.len(), 1, "same layer must not duplicate");
+    }
+
+    #[test]
     fn merkle_root_for_layer_with_no_matching_stalks_is_empty_sentinel() {
         // A complex with cells that don't carry stalks on the queried
         // layer should produce the same root as an empty complex —

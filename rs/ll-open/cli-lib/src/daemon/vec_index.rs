@@ -183,6 +183,30 @@ mod tests {
     }
 
     #[test]
+    fn get_returns_inserted_embedding() -> Result<()> {
+        // VectorIndex::get(node_id) round-trips an inserted embedding
+        // and returns None for an unknown node. Pin both halves so a
+        // refactor that reused search() under the hood (potentially
+        // shifting the float bytes via distance computations) or
+        // dropped the unknown-id None path would surface.
+        setup();
+        let idx = VectorIndex::new(4, None)?;
+        let emb = [0.5_f32, -0.25, 1.0, 0.0];
+        idx.insert("node-a", &emb)?;
+
+        let got = idx.get("node-a")?;
+        assert_eq!(
+            got.as_deref(),
+            Some(emb.as_slice()),
+            "get must return the inserted embedding byte-for-byte",
+        );
+
+        // Unknown node → None, not panic, not phantom zero-vector.
+        assert!(idx.get("never_seen")?.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn search_empty_index() -> Result<()> {
         setup();
         let idx = VectorIndex::new(4, None)?;

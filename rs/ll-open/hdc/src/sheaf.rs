@@ -104,6 +104,22 @@ impl HvCell {
         self.stalks.insert(layer, hv);
     }
 
+    /// Chainable variant of [`HvCell::attach_stalk`]. Builds an
+    /// `HvCell` with one or more layer stalks in a single expression:
+    ///
+    /// ```ignore
+    /// let cell = HvCell::new("fn", kind)
+    ///     .with_stalk(LayerKind::Ast, ast_hv)
+    ///     .with_stalk(LayerKind::Semantic, sem_hv);
+    /// ```
+    ///
+    /// Eliminates the `let mut + N attach_stalks` pattern that was
+    /// duplicated across multi-layer test fixtures.
+    pub fn with_stalk(mut self, layer: LayerKind, hv: Hypervector) -> Self {
+        self.attach_stalk(layer, hv);
+        self
+    }
+
     pub fn stalk(&self, layer: LayerKind) -> Option<&Hypervector> {
         self.stalks.get(&layer)
     }
@@ -548,9 +564,7 @@ mod tests {
     }
 
     fn make_cell(id: &str, kind: CanonicalKind, ast_seed: u64) -> HvCell {
-        let mut c = HvCell::new(id, kind);
-        c.attach_stalk(LayerKind::Ast, stalk_for(ast_seed));
-        c
+        HvCell::new(id, kind).with_stalk(LayerKind::Ast, stalk_for(ast_seed))
     }
 
     #[test]
@@ -562,6 +576,23 @@ mod tests {
         let r1 = cx.merkle_root_for_layer(LayerKind::Ast);
         let r2 = cx.merkle_root_for_layer(LayerKind::Ast);
         assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn with_stalk_chains_match_imperative_attach_stalk() {
+        // Pin: the chainable `with_stalk` builder must produce a cell
+        // byte-equivalent to the imperative `let mut + attach_stalk`
+        // form. Catches a future refactor that accidentally cloned
+        // wrong, or made `with_stalk` insert into a different map.
+        let chain = HvCell::new("fn", CanonicalKind::Decl)
+            .with_stalk(LayerKind::Ast, stalk_for(1))
+            .with_stalk(LayerKind::Semantic, stalk_for(2));
+        let mut imperative = HvCell::new("fn", CanonicalKind::Decl);
+        imperative.attach_stalk(LayerKind::Ast, stalk_for(1));
+        imperative.attach_stalk(LayerKind::Semantic, stalk_for(2));
+        assert_eq!(chain.id, imperative.id);
+        assert_eq!(chain.source_kind, imperative.source_kind);
+        assert_eq!(chain.stalks, imperative.stalks);
     }
 
     #[test]
@@ -587,16 +618,18 @@ mod tests {
         // semantic-only edit (refactor that preserved structure) avoid
         // invalidating the AST cache.
         let mut cx_a = HvCellComplex::new();
-        let mut cell_a = HvCell::new("fn_x", CanonicalKind::Decl);
-        cell_a.attach_stalk(LayerKind::Ast, stalk_for(1));
-        cell_a.attach_stalk(LayerKind::Semantic, stalk_for(100));
-        cx_a.add_cell(cell_a);
+        cx_a.add_cell(
+            HvCell::new("fn_x", CanonicalKind::Decl)
+                .with_stalk(LayerKind::Ast, stalk_for(1))
+                .with_stalk(LayerKind::Semantic, stalk_for(100)),
+        );
 
         let mut cx_b = HvCellComplex::new();
-        let mut cell_b = HvCell::new("fn_x", CanonicalKind::Decl);
-        cell_b.attach_stalk(LayerKind::Ast, stalk_for(1));
-        cell_b.attach_stalk(LayerKind::Semantic, stalk_for(101));
-        cx_b.add_cell(cell_b);
+        cx_b.add_cell(
+            HvCell::new("fn_x", CanonicalKind::Decl)
+                .with_stalk(LayerKind::Ast, stalk_for(1))
+                .with_stalk(LayerKind::Semantic, stalk_for(101)),
+        );
 
         let ast_a = cx_a.merkle_root_for_layer(LayerKind::Ast);
         let ast_b = cx_b.merkle_root_for_layer(LayerKind::Ast);
@@ -733,10 +766,11 @@ mod tests {
         // structural root. Pin the XOR-fold property: structural root
         // is the layer-XOR of per-layer Merkle roots.
         let mut cx = HvCellComplex::new();
-        let mut cell = HvCell::new("fn_a", CanonicalKind::Decl);
-        cell.attach_stalk(LayerKind::Ast, stalk_for(1));
-        cell.attach_stalk(LayerKind::Semantic, stalk_for(2));
-        cx.add_cell(cell);
+        cx.add_cell(
+            HvCell::new("fn_a", CanonicalKind::Decl)
+                .with_stalk(LayerKind::Ast, stalk_for(1))
+                .with_stalk(LayerKind::Semantic, stalk_for(2)),
+        );
 
         let structural = cx.structural_root();
         let ast = cx.merkle_root_for_layer(LayerKind::Ast);
@@ -846,12 +880,8 @@ mod tests {
         let mut cx = HvCellComplex::new();
         let canonical = stalk_for(1);
         let rotated = rotate_left(&canonical, 100);
-        let mut a = HvCell::new("fn_a", CanonicalKind::Decl);
-        a.attach_stalk(LayerKind::Ast, rotated);
-        let mut b = HvCell::new("fn_b", CanonicalKind::Decl);
-        b.attach_stalk(LayerKind::Ast, canonical);
-        cx.add_cell(a);
-        cx.add_cell(b);
+        cx.add_cell(HvCell::new("fn_a", CanonicalKind::Decl).with_stalk(LayerKind::Ast, rotated));
+        cx.add_cell(HvCell::new("fn_b", CanonicalKind::Decl).with_stalk(LayerKind::Ast, canonical));
         cx.set_threshold(LayerKind::Ast, 0); // exact match required
         cx.add_edge(HvEdge {
             source: "fn_a".into(),
@@ -936,13 +966,11 @@ mod tests {
         let s_cluster = stalk_for(11);
         let s_singleton = stalk_for(99);
         for id in &["a", "b", "c"] {
-            let mut cell = HvCell::new(*id, CanonicalKind::Decl);
-            cell.attach_stalk(LayerKind::Ast, s_cluster);
-            cx.add_cell(cell);
+            cx.add_cell(
+                HvCell::new(*id, CanonicalKind::Decl).with_stalk(LayerKind::Ast, s_cluster),
+            );
         }
-        let mut iso = HvCell::new("z", CanonicalKind::Decl);
-        iso.attach_stalk(LayerKind::Ast, s_singleton);
-        cx.add_cell(iso);
+        cx.add_cell(HvCell::new("z", CanonicalKind::Decl).with_stalk(LayerKind::Ast, s_singleton));
         cx.set_threshold(LayerKind::Ast, 0);
         cx.add_edge(HvEdge::identity("a", "b", EdgeKind::Sibling, LayerKind::Ast));
         cx.add_edge(HvEdge::identity("b", "c", EdgeKind::Sibling, LayerKind::Ast));
@@ -1078,10 +1106,11 @@ mod tests {
         // A refactor that accidentally cached an intermediate per
         // layer would pass the single-layer test and fail this one.
         let mut cx = HvCellComplex::new();
-        let mut cell = HvCell::new("fn_a", CanonicalKind::Decl);
-        cell.attach_stalk(LayerKind::Ast, stalk_for(1));
-        cell.attach_stalk(LayerKind::Semantic, stalk_for(2));
-        cx.add_cell(cell);
+        cx.add_cell(
+            HvCell::new("fn_a", CanonicalKind::Decl)
+                .with_stalk(LayerKind::Ast, stalk_for(1))
+                .with_stalk(LayerKind::Semantic, stalk_for(2)),
+        );
 
         let struct_before = cx.structural_root();
         let ast_before = cx.merkle_root_for_layer(LayerKind::Ast);

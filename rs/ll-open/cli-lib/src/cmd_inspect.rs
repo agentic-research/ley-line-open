@@ -128,3 +128,35 @@ fn run_sql(conn: &Connection, sql: &str) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leyline_schema::{create_schema, insert_node};
+
+    #[test]
+    fn lookup_node_errors_with_actionable_message_on_missing_id() {
+        // Scale-pin the inspect-CLI error UX. lookup_node is called
+        // from `leyline inspect <id>` — at registry scale (50k+ nodes)
+        // a typo in the id is the most common mistake. Pin the error
+        // message so a refactor doesn't silently change to a less
+        // helpful "row not found" / generic SQL error. Clients
+        // (script wrappers, mache tooling) parse this string.
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        // Insert one known node so the table exists but the queried
+        // id doesn't match.
+        insert_node(&conn, "real_node", "", "real_node", 1, 0, 0, "").unwrap();
+
+        let err = lookup_node(&conn, "missing_id").expect_err("must error on missing id");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("node not found"),
+            "error must mention 'node not found'; got: {msg}",
+        );
+        assert!(
+            msg.contains("missing_id"),
+            "error must echo the queried id for debuggability; got: {msg}",
+        );
+    }
+}

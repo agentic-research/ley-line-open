@@ -963,6 +963,33 @@ mod tests {
     }
 
     #[test]
+    fn compute_h0_ignores_edges_on_other_layers() {
+        // compute_h0(L) walks only edges whose `layer == L`
+        // (sheaf.rs:414 `if edge.layer != layer { continue; }`).
+        // Pin: a Module-layer edge between two cells that share an
+        // Ast stalk must NOT merge them in compute_h0(Ast). Catches a
+        // refactor that drops the per-edge layer filter and silently
+        // mixes consistency edges across layers.
+        let mut cx = HvCellComplex::new();
+        cx.add_cell(make_cell("fn_a", CanonicalKind::Decl, 1));
+        cx.add_cell(make_cell("fn_b", CanonicalKind::Decl, 1)); // same Ast stalk
+        cx.set_threshold(LayerKind::Ast, 10);
+        // Edge declared on Module layer — compute_h0(Ast) must skip it.
+        cx.add_edge(HvEdge::identity(
+            "fn_a",
+            "fn_b",
+            EdgeKind::Sibling,
+            LayerKind::Module,
+        ));
+        let groups = cx.compute_h0(LayerKind::Ast);
+        assert_eq!(
+            groups.len(),
+            2,
+            "Module-layer edge must not merge cells in Ast H0",
+        );
+    }
+
+    #[test]
     fn compute_h0_no_edges_yields_one_singleton_per_cell() {
         // With cells but no edges, every cell is its own component
         // regardless of threshold or stalk equality. Pin: union-find

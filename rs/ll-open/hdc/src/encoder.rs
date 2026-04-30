@@ -41,6 +41,13 @@ impl EncoderNode {
         }
     }
 
+    /// Convenience constructor for a leaf node (no children).
+    /// Equivalent to `EncoderNode::new(kind, vec![])`. Eliminates
+    /// the `leaf(kind)` helper that several test modules duplicated.
+    pub fn leaf(kind: CanonicalKind) -> Self {
+        Self::new(kind, vec![])
+    }
+
     /// Build the codebook fingerprint for this node.
     fn fingerprint(&self) -> AstNodeFingerprint {
         AstNodeFingerprint {
@@ -180,8 +187,11 @@ mod tests {
     use super::*;
     use crate::codebook::AstCodebook;
 
+    // Test convenience aliases — `leaf` and `node` are short stand-ins
+    // for `EncoderNode::leaf` / `EncoderNode::new` to keep the test
+    // bodies readable. Both forward directly with no extra logic.
     fn leaf(kind: CanonicalKind) -> EncoderNode {
-        EncoderNode::new(kind, vec![])
+        EncoderNode::leaf(kind)
     }
 
     fn node(kind: CanonicalKind, children: Vec<EncoderNode>) -> EncoderNode {

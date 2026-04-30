@@ -462,15 +462,7 @@ mod tests {
         );
         let centroid = encode_fresh(&tree, &cb);
 
-        let candidate_kinds = [
-            CanonicalKind::Decl,
-            CanonicalKind::Expr,
-            CanonicalKind::Stmt,
-            CanonicalKind::Block,
-            CanonicalKind::Ref,
-            CanonicalKind::Lit,
-            CanonicalKind::Op,
-        ];
+        let candidate_kinds = CanonicalKind::ALL;
 
         let recovered = explain_cluster_centroid(
             &centroid,
@@ -545,15 +537,7 @@ mod tests {
         let centroid = HvCellComplex::bundle_majority(&centroids);
         assert_eq!(centroid, centroids[0], "homogeneous bundle must equal input");
 
-        let candidate_kinds = [
-            CanonicalKind::Decl,
-            CanonicalKind::Expr,
-            CanonicalKind::Stmt,
-            CanonicalKind::Block,
-            CanonicalKind::Ref,
-            CanonicalKind::Lit,
-            CanonicalKind::Op,
-        ];
+        let candidate_kinds = CanonicalKind::ALL;
         let recovered = explain_cluster_centroid(
             &centroid,
             CanonicalKind::Decl,
@@ -642,15 +626,7 @@ mod tests {
 
         let centroid = HvCellComplex::bundle_majority(&centroids);
 
-        let candidate_kinds = [
-            CanonicalKind::Decl,
-            CanonicalKind::Expr,
-            CanonicalKind::Stmt,
-            CanonicalKind::Block,
-            CanonicalKind::Ref,
-            CanonicalKind::Lit,
-            CanonicalKind::Op,
-        ];
+        let candidate_kinds = CanonicalKind::ALL;
         // The function takes the parent's positional kind sequence as
         // the caller's hypothesis. We hypothesize the modal kind at
         // position 1 (Stmt appears 3× — most frequent in the cycle).

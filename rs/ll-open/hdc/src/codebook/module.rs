@@ -141,8 +141,10 @@ mod tests {
     use super::*;
     use crate::util::assert_far_apart;
 
+    // Test convenience aliases mirroring encoder.rs — both forward
+    // directly to `EncoderNode::leaf` / `EncoderNode::new`.
     fn leaf(kind: CanonicalKind) -> EncoderNode {
-        EncoderNode::new(kind, vec![])
+        EncoderNode::leaf(kind)
     }
 
     fn node(kind: CanonicalKind, children: Vec<EncoderNode>) -> EncoderNode {

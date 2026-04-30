@@ -50,6 +50,21 @@ impl CanonicalKind {
             CanonicalKind::Op => 6,
         }
     }
+
+    /// All seven canonical kinds in discriminant order. Useful as the
+    /// `candidate_child_kinds` argument to [`crate::query::
+    /// explain_cluster_centroid`] when the caller wants the cleanup-
+    /// memory to consider every kind. Replaces the 7-element array
+    /// literal that was duplicated across multiple test modules.
+    pub const ALL: [CanonicalKind; 7] = [
+        CanonicalKind::Decl,
+        CanonicalKind::Expr,
+        CanonicalKind::Stmt,
+        CanonicalKind::Block,
+        CanonicalKind::Ref,
+        CanonicalKind::Lit,
+        CanonicalKind::Op,
+    ];
 }
 
 /// Lookup interface — every supported language ships an implementation that
@@ -138,19 +153,31 @@ mod tests {
         assert_eq!(CanonicalKind::Lit.discriminant(), 5);
         assert_eq!(CanonicalKind::Op.discriminant(), 6);
 
-        // Distinctness check — defensive in case a refactor accidentally
-        // collapses two variants to the same value.
+        // Distinctness check via the `ALL` constant — also catches a
+        // refactor that adds a variant without updating ALL or that
+        // collapses two variants to the same discriminant.
         let mut seen = std::collections::HashSet::new();
-        for k in [
-            CanonicalKind::Decl,
-            CanonicalKind::Expr,
-            CanonicalKind::Stmt,
-            CanonicalKind::Block,
-            CanonicalKind::Ref,
-            CanonicalKind::Lit,
-            CanonicalKind::Op,
-        ] {
+        for k in CanonicalKind::ALL {
             assert!(seen.insert(k.discriminant()), "duplicate discriminant for {k:?}");
+        }
+    }
+
+    #[test]
+    fn all_constant_in_discriminant_order() {
+        // `ALL` is exposed as the canonical "every kind" array used by
+        // cleanup-memory consumers (e.g. `explain_cluster_centroid`).
+        // Pin the order matches the discriminant assignment so callers
+        // that iterate `CanonicalKind::ALL` get a predictable sequence.
+        // Also catches a future refactor that adds a variant without
+        // appending it here (the length assertion would fail).
+        assert_eq!(CanonicalKind::ALL.len(), 7);
+        for (i, k) in CanonicalKind::ALL.iter().enumerate() {
+            assert_eq!(
+                k.discriminant() as usize,
+                i,
+                "CanonicalKind::ALL[{i}] = {k:?} but discriminant() = {}",
+                k.discriminant()
+            );
         }
     }
 

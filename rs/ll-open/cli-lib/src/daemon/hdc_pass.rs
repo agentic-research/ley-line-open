@@ -454,15 +454,7 @@ mod tests {
             // The centroid's "root kind" + arity is approximately what
             // we'd find in the parsed source: a Block (file root) with
             // ~1 child (the func decl).
-            let candidate_kinds = [
-                CanonicalKind::Decl,
-                CanonicalKind::Expr,
-                CanonicalKind::Stmt,
-                CanonicalKind::Block,
-                CanonicalKind::Ref,
-                CanonicalKind::Lit,
-                CanonicalKind::Op,
-            ];
+            let candidate_kinds = CanonicalKind::ALL;
 
             let recovered = explain_cluster_centroid(
                 &centroid,

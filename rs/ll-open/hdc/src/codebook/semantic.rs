@@ -18,7 +18,7 @@
 //! fixed seed string `"hdc-semantic-v1"`, so any daemon instance with
 //! the same embedder produces identical projections.
 
-use crate::util::Hypervector;
+use crate::util::{splitmix64, Hypervector, ZERO_HV};
 #[cfg(test)]
 use crate::D_BITS;
 
@@ -68,7 +68,7 @@ impl SemanticCodebook {
                 embedding.len(),
                 self.emb_dim,
             );
-            return crate::util::ZERO_HV;
+            return ZERO_HV;
         }
         super::simhash_signs(&self.hyperplanes, |plane| {
             embedding
@@ -114,7 +114,7 @@ pub(super) fn gaussian_row(seed: u64, n: usize) -> Vec<f32> {
 /// Uniform [eps, 1) sample from a SplitMix64 stream. Avoids 0 because
 /// Box-Muller calls `ln(u)` and ln(0) = -infinity.
 fn next_uniform(state: &mut u64) -> f32 {
-    let bits = crate::util::splitmix64(state);
+    let bits = splitmix64(state);
     // Map to [eps, 1) by setting the high 24 bits as fraction; the
     // floor of 1ULP avoids the exact-zero pathology.
     let f = (bits >> 40) as f32 / (1u32 << 24) as f32;
@@ -124,7 +124,7 @@ fn next_uniform(state: &mut u64) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::{assert_far_apart, popcount_distance, ZERO_HV};
+    use crate::util::{assert_far_apart, popcount_distance};
 
     /// Tolerance margin for distance assertions on small embedding
     /// dims — Box-Muller variance + small-sample-projection noise

@@ -549,7 +549,8 @@ fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::expand_seed;
+    use crate::test_util::conn_with_udfs;
+    use crate::util::{blake3_seed, expand_seed, splitmix64};
 
     fn stalk_for(seed: u64) -> Hypervector {
         expand_seed(seed)
@@ -1004,10 +1005,10 @@ mod tests {
             // would leave copies sharing many low-order bits and the
             // flip patterns would overlap, defeating the independence
             // assumption of majority-rule denoising.
-            let mut state = crate::util::blake3_seed(&seed.to_le_bytes());
+            let mut state = blake3_seed(&seed.to_le_bytes());
             let mut copy = base;
             for _ in 0..(D_BITS / 20) {
-                let bit = (crate::util::splitmix64(&mut state) as usize) % D_BITS;
+                let bit = (splitmix64(&mut state) as usize) % D_BITS;
                 let byte_idx = bit / 8;
                 let bit_off = bit % 8;
                 copy[byte_idx] ^= 1 << bit_off;
@@ -1043,7 +1044,7 @@ mod tests {
             vec![stalk_for(101), stalk_for(202), stalk_for(303)];
         let rust_bundle = HvCellComplex::bundle_majority(&stalks);
 
-        let conn = crate::test_util::conn_with_udfs();
+        let conn = conn_with_udfs();
         conn.execute("CREATE TABLE hvs(hv BLOB NOT NULL)", []).unwrap();
         for s in &stalks {
             conn.execute("INSERT INTO hvs(hv) VALUES (?1)", [s.as_slice()])
@@ -1071,7 +1072,7 @@ mod tests {
         let rust_empty = HvCellComplex::bundle_majority(&[]);
         assert_eq!(rust_empty, ZERO_HV, "Rust empty must be ZERO_HV");
 
-        let conn = crate::test_util::conn_with_udfs();
+        let conn = conn_with_udfs();
         conn.execute("CREATE TABLE hvs(hv BLOB NOT NULL)", []).unwrap();
         let sql_empty: Value = conn
             .query_row("SELECT BUNDLE_MAJORITY(hv) FROM hvs", [], |r| r.get(0))

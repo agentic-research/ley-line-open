@@ -13,7 +13,7 @@
 
 use rusqlite::Connection;
 
-use crate::util::{popcount_distance, Hypervector};
+use crate::util::{blake3_seed, hv_from_slice, popcount_distance, splitmix64, Hypervector};
 use crate::LayerKind;
 #[cfg(test)]
 use crate::D_BYTES;
@@ -90,8 +90,8 @@ pub fn calibrate_layer(
     let mut distances: Vec<u32> = Vec::with_capacity(target);
     let mut sampled = 0;
     while sampled < target {
-        let i = (crate::util::splitmix64(&mut state) as usize) % n;
-        let j = (crate::util::splitmix64(&mut state) as usize) % n;
+        let i = (splitmix64(&mut state) as usize) % n;
+        let j = (splitmix64(&mut state) as usize) % n;
         if i == j {
             continue;
         }
@@ -138,7 +138,7 @@ fn collect_layer_hvs(
     let mut out = Vec::new();
     for row in rows {
         let blob = row?;
-        if let Some(hv) = crate::util::hv_from_slice(&blob) {
+        if let Some(hv) = hv_from_slice(&blob) {
             out.push(hv);
         }
     }
@@ -214,7 +214,7 @@ fn compute_mad(values: &[u32], median: u32) -> u32 {
 }
 
 fn blake3_seed_from(layer: LayerKind) -> u64 {
-    crate::util::blake3_seed(format!("hdc-calibrate/{}", layer.as_str()).as_bytes())
+    blake3_seed(format!("hdc-calibrate/{}", layer.as_str()).as_bytes())
 }
 
 #[cfg(test)]

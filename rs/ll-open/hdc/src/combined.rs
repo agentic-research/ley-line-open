@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use rusqlite::Connection;
 
-use crate::util::{rotate_left, xor_into, Hypervector, ZERO_HV};
+use crate::util::{hv_from_slice, rotate_left, xor_into, Hypervector, ZERO_HV};
 use crate::LayerKind;
 
 /// Stable role-permutation index per layer. Layer-tagged so a
@@ -79,7 +79,7 @@ pub fn build_combined_for_scope(
     for row in rows {
         let (kind_str, blob, basis) = row?;
         if let Some(kind) = LayerKind::parse_str(&kind_str)
-            && let Some(hv) = crate::util::hv_from_slice(&blob)
+            && let Some(hv) = hv_from_slice(&blob)
         {
             layers.insert(kind, hv);
         }

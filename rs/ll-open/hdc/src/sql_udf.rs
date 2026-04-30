@@ -224,11 +224,12 @@ impl Aggregate<MajorityState, Value> for BundleMajorityAgg {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::conn_with_udfs;
     use crate::util::{expand_seed, popcount_distance, xor_into};
     use crate::Hypervector;
 
     fn fixture_conn() -> Connection {
-        let conn = crate::test_util::conn_with_udfs();
+        let conn = conn_with_udfs();
         // Test schema: a tiny hv-blob table.
         conn.execute_batch("CREATE TABLE hvs (id INTEGER PRIMARY KEY, hv BLOB);")
             .unwrap();

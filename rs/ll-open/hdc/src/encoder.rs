@@ -12,7 +12,7 @@ use std::sync::Mutex;
 
 use crate::canonical::CanonicalKind;
 use crate::codebook::{AstNodeFingerprint, BaseCodebook};
-use crate::util::{rotate_left, xor_into, Hypervector};
+use crate::util::{bucket_arity, rotate_left, xor_into, Hypervector};
 
 /// One node in a tree to encode. Owns its children so the encoder can
 /// recurse without borrow-lifetime gymnastics. Built from tree-sitter
@@ -52,7 +52,7 @@ impl EncoderNode {
     fn fingerprint(&self) -> AstNodeFingerprint {
         AstNodeFingerprint {
             canonical_kind: self.canonical_kind,
-            arity_bucket: crate::util::bucket_arity(self.children.len()),
+            arity_bucket: bucket_arity(self.children.len()),
             child_canonical_kinds: self.child_canonical_kinds_sorted.clone(),
         }
     }
@@ -64,7 +64,7 @@ impl EncoderNode {
     pub fn content_hash(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&[self.canonical_kind.discriminant()]);
-        hasher.update(&[crate::util::bucket_arity(self.children.len())]);
+        hasher.update(&[bucket_arity(self.children.len())]);
         for k in &self.child_canonical_kinds_sorted {
             hasher.update(&[k.discriminant()]);
         }

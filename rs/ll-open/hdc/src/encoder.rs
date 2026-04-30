@@ -445,6 +445,36 @@ mod tests {
     }
 
     #[test]
+    fn content_hash_distinguishes_child_order() {
+        // child_canonical_kinds_sorted is sorted (order-invariant at
+        // the codebook lookup level), but content_hash also recurses
+        // through `node.children` in PARSER order (encoder.rs:71-73),
+        // so two trees with the same kinds in swapped order produce
+        // different content_hashes. This is what makes the encoder's
+        // rotation-based positional encoding consistent with
+        // cache_key. A refactor that sorted node.children before
+        // hashing would silently merge cache entries that should
+        // stay separate.
+        let a = node(
+            CanonicalKind::Block,
+            vec![
+                node(CanonicalKind::Stmt, vec![leaf(CanonicalKind::Op)]),
+                leaf(CanonicalKind::Lit),
+            ],
+        );
+        let b = node(
+            CanonicalKind::Block,
+            vec![
+                leaf(CanonicalKind::Lit),
+                node(CanonicalKind::Stmt, vec![leaf(CanonicalKind::Op)]),
+            ],
+        );
+        // Same kinds (sorted: Block, Stmt, Lit, Op...) but different
+        // parser order → different content_hashes.
+        assert_ne!(a.content_hash(), b.content_hash());
+    }
+
+    #[test]
     fn content_hash_distinguishes_nesting_from_flat() {
         // Same kinds, different topology: `Block[Op, Lit]` (flat,
         // 2 children) vs `Block[Op[Lit]]` (nested, 1 child whose

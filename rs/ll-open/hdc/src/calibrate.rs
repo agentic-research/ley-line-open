@@ -366,6 +366,24 @@ mod tests {
     }
 
     #[test]
+    fn recommended_radius_at_zero_tightness_equals_median() {
+        // tightness=0.0 short-circuits the MAD subtraction:
+        //   r = median - 0 * mad = median
+        // Boundary value pin between the clamp-to-zero case and the
+        // default 3.0 tightness. Catches a refactor that pre-applied
+        // a non-zero offset before multiplying by tightness, which
+        // would shift radius away from median for tightness=0.
+        let baseline = RadiusBaseline {
+            layer: LayerKind::Ast,
+            median_distance: 4096,
+            mad: 100,
+            sample_size: 10000,
+            computed_at_ms: 0,
+        };
+        assert_eq!(baseline.recommended_radius(0.0), 4096);
+    }
+
+    #[test]
     fn recommended_radius_clamps_to_zero() {
         // If MAD * tightness > median (small/skewed corpus), recommended
         // radius would go negative — clamp to 0. Pin the corner case so

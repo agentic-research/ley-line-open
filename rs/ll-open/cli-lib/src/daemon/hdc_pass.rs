@@ -136,6 +136,28 @@ mod tests {
     }
 
     #[test]
+    fn extract_functions_with_predicate_never_matches_yields_empty() {
+        // Predicate that always returns false → empty Vec, regardless
+        // of tree shape or size. Pins the early-skip path.
+        let src = "package m\n\nfunc A() {}\n";
+        let tree = parse_go(src);
+        let funcs = extract_functions(&tree, |_| false);
+        assert!(funcs.is_empty());
+    }
+
+    #[test]
+    fn extract_functions_includes_root_when_predicate_matches() {
+        // Predicate matching the root must include the root itself
+        // (not just descendants). The walk function checks
+        // is_function(node) before recursing into children, so the
+        // root is the first checked. Pin the inclusive semantics.
+        let leaf_tree = EncoderNode::leaf(CanonicalKind::Decl);
+        let funcs = extract_functions(&leaf_tree, |n| n.canonical_kind == CanonicalKind::Decl);
+        assert_eq!(funcs.len(), 1);
+        assert_eq!(funcs[0].canonical_kind, CanonicalKind::Decl);
+    }
+
+    #[test]
     fn extract_functions_finds_function_decls() {
         let src = "package m\n\nfunc A() {}\n\nfunc B() {}\n";
         let tree = parse_go(src);

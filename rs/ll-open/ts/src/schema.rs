@@ -302,6 +302,37 @@ mod tests {
     }
 
     #[test]
+    fn meta_upsert_overwrites_existing_key() {
+        // _meta uses TEXT PRIMARY KEY on key + INSERT OR REPLACE in
+        // set_meta. Pin the overwrite path: subsequent set_meta on
+        // the same key replaces the value, doesn't error or duplicate.
+        // Load-bearing for the daemon's `tree-sitter_version` /
+        // `lsp_version` / per-pass-version meta tracking — these are
+        // bumped on every successful pass.
+        let conn = Connection::open_in_memory().unwrap();
+        create_index_schema(&conn).unwrap();
+
+        set_meta(&conn, "tree-sitter_version", "1").unwrap();
+        set_meta(&conn, "tree-sitter_version", "5").unwrap();
+        set_meta(&conn, "tree-sitter_version", "12").unwrap();
+
+        let val: String = conn
+            .query_row(
+                "SELECT value FROM _meta WHERE key = 'tree-sitter_version'",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(val, "12", "third write must win");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _meta WHERE key = 'tree-sitter_version'",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "must not duplicate rows");
+    }
+
+    #[test]
     fn delete_file_rows_cleans_all_tables() {
         let conn = Connection::open_in_memory().unwrap();
         create_ast_schema(&conn).unwrap();

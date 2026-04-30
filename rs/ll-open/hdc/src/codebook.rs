@@ -8,6 +8,7 @@
 
 use crate::canonical::CanonicalKind;
 use crate::util::{blake3_seed, tagged_seed_vector, Hypervector};
+use crate::{D_BITS, D_BYTES};
 
 /// Per-layer codebook: maps domain-specific node fingerprints to base
 /// hypervectors. Implementors must be `Send + Sync` so the encoder can
@@ -163,8 +164,8 @@ pub fn simhash_signs<F>(hyperplanes: &[Vec<f32>], dot: F) -> Hypervector
 where
     F: Fn(&[f32]) -> f64,
 {
-    let mut out = [0u8; crate::D_BYTES];
-    for (i, plane) in hyperplanes.iter().enumerate().take(crate::D_BITS) {
+    let mut out = [0u8; D_BYTES];
+    for (i, plane) in hyperplanes.iter().enumerate().take(D_BITS) {
         if dot(plane) >= 0.0 {
             out[i / 8] |= 1 << (i % 8);
         }
@@ -185,8 +186,8 @@ where
 /// for migration; don't silently rewrite this function.
 pub fn build_hyperplane_matrix(seed_tag: &str, width: usize) -> Vec<Vec<f32>> {
     let base_seed = blake3_seed(seed_tag.as_bytes());
-    let mut hyperplanes = Vec::with_capacity(crate::D_BITS);
-    for i in 0..crate::D_BITS {
+    let mut hyperplanes = Vec::with_capacity(D_BITS);
+    for i in 0..D_BITS {
         // Each hyperplane gets its own seed derived from base + index.
         // Box-Muller uses two uniforms per Gaussian; per-row PRNG state
         // keeps rows independent.
@@ -197,7 +198,7 @@ pub fn build_hyperplane_matrix(seed_tag: &str, width: usize) -> Vec<Vec<f32>> {
             ]
             .concat(),
         );
-        hyperplanes.push(crate::codebook::semantic::gaussian_row(row_seed, width));
+        hyperplanes.push(semantic::gaussian_row(row_seed, width));
     }
     hyperplanes
 }
@@ -217,7 +218,7 @@ mod tests {
         let m1 = build_hyperplane_matrix("test-seed-A", 16);
         let m2 = build_hyperplane_matrix("test-seed-A", 16);
         assert_eq!(m1.len(), m2.len(), "row count must match");
-        assert_eq!(m1.len(), crate::D_BITS, "row count must equal D_BITS");
+        assert_eq!(m1.len(), D_BITS, "row count must equal D_BITS");
         for (r1, r2) in m1.iter().zip(m2.iter()) {
             assert_eq!(r1, r2, "rows must match byte-for-byte");
         }

@@ -11,7 +11,7 @@ use rusqlite::Connection;
 
 use crate::schema::create_hdc_schema;
 use crate::sql_udf::register_hdc_udfs;
-use crate::{Hypervector, LayerKind};
+use crate::{Hypervector, LayerKind, D_BITS, D_BYTES};
 
 /// Open an in-memory SQLite connection with the HDC schema applied
 /// but no UDFs registered. Tests that exercise schema/storage logic
@@ -103,12 +103,12 @@ mod tests {
         // Pin: the UDF-only helper registers all three UDFs. Probe one
         // (`popcount_xor`) by calling it on two trivial blobs.
         let conn = conn_with_udfs();
-        let zeros = vec![0u8; crate::D_BYTES];
-        let ones = vec![0xFFu8; crate::D_BYTES];
+        let zeros = vec![0u8; D_BYTES];
+        let ones = vec![0xFFu8; D_BYTES];
         let dist: i64 = conn
             .query_row("SELECT popcount_xor(?1, ?2)", [zeros, ones], |r| r.get(0))
             .unwrap();
-        assert_eq!(dist as usize, crate::D_BITS);
+        assert_eq!(dist as usize, D_BITS);
     }
 
     #[test]

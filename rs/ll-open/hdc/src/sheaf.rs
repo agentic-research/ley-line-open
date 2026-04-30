@@ -715,6 +715,58 @@ mod tests {
     }
 
     #[test]
+    fn detect_violations_skipped_when_endpoint_cell_missing() {
+        // Edge references a non-existent cell ("fn_ghost") — must
+        // be silently skipped, not panic on `cells.get` returning
+        // None. Mirrors the missing-stalk skip; partial cell
+        // populations during a daemon mid-flight reparse must not
+        // crash the violation detector.
+        let mut cx = HvCellComplex::new();
+        cx.add_cell(make_cell("fn_a", CanonicalKind::Decl, 1));
+        cx.set_threshold(LayerKind::Ast, 0);
+        cx.add_edge(HvEdge::identity(
+            "fn_a",
+            "fn_ghost", // doesn't exist
+            EdgeKind::Sibling,
+            LayerKind::Ast,
+        ));
+        assert!(cx.detect_violations().is_empty());
+        // edge_hamming exposes the same skip path — must be None.
+        assert_eq!(cx.edge_hamming(&cx.edges[0]), None);
+    }
+
+    #[test]
+    fn detect_violations_skipped_when_no_threshold_for_layer() {
+        // An edge whose layer has no threshold registered must be
+        // skipped (not crash, not produce a phantom violation). A
+        // partially-calibrated daemon shouldn't generate noise.
+        let mut cx = HvCellComplex::new();
+        cx.add_cell(make_cell("fn_a", CanonicalKind::Decl, 1));
+        cx.add_cell(make_cell("fn_b", CanonicalKind::Decl, 999)); // far
+        // Note: no `set_threshold` for Ast.
+        cx.add_edge(HvEdge::identity(
+            "fn_a",
+            "fn_b",
+            EdgeKind::Sibling,
+            LayerKind::Ast,
+        ));
+        assert!(
+            cx.detect_violations().is_empty(),
+            "no threshold → skip, even on a far pair"
+        );
+    }
+
+    #[test]
+    fn propagate_sections_empty_complex_yields_empty() {
+        // Same edge case as compute_h0: empty complex → empty
+        // centroids. The propagation is built on H⁰ partitions, so
+        // empty input should propagate (sic) through cleanly.
+        let cx = HvCellComplex::new();
+        let centroids = cx.propagate_sections(LayerKind::Ast);
+        assert!(centroids.is_empty());
+    }
+
+    #[test]
     fn compute_h0_groups_consistent_cells() {
         // Three cells: a, b share a stalk; c is far. With a tight
         // threshold and a Sibling edge a-b, h0 should return a 2-cell

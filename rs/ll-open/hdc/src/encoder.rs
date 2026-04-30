@@ -591,6 +591,27 @@ mod tests {
     }
 
     #[test]
+    fn cache_put_overwrites_on_duplicate_key() {
+        // SubtreeCache::put delegates to HashMap::insert, which
+        // replaces. Pin the overwrite contract: same key inserted
+        // twice → len stays 1, get returns the second value. A
+        // refactor that switched to entry().or_insert (which would
+        // keep the FIRST value) would silently mean a re-encoded
+        // subtree never updates the cache, even if its content
+        // changed (impossible in production thanks to content-hash
+        // keys, but a real bug if the cache were ever used as a
+        // mutable store).
+        let cache = SubtreeCache::new();
+        let key: [u8; 32] = [0xCD; 32];
+        let v1 = crate::util::expand_seed(1);
+        let v2 = crate::util::expand_seed(2);
+        cache.put(key, v1);
+        cache.put(key, v2);
+        assert_eq!(cache.len(), 1, "duplicate key must not grow cache");
+        assert_eq!(cache.get(&key), Some(v2), "second put must win");
+    }
+
+    #[test]
     fn cache_get_unknown_key_returns_none() {
         // No phantom values for keys that were never put. Pin so a
         // refactor that defaulted to ZERO_HV or panicked on miss

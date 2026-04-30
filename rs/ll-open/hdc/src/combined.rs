@@ -121,6 +121,24 @@ mod tests {
     use crate::util::{assert_far_apart, expand_seed, popcount_distance};
 
     #[test]
+    fn layer_role_index_pin_per_variant() {
+        // Direct mapping pin: each LayerKind variant has a permanent
+        // role-index used as the rotate_left amount when binding into
+        // the combined view. The function comment notes "Indices are
+        // permanent — bumping them orphans every encoded combined
+        // hypervector". Pin all 7 explicitly so a reorder can't slip
+        // past `layer_kind_all_in_role_index_order` (which only pins
+        // the array order, not the index function).
+        assert_eq!(layer_role_index(LayerKind::Ast), 0);
+        assert_eq!(layer_role_index(LayerKind::Module), 1);
+        assert_eq!(layer_role_index(LayerKind::Semantic), 2);
+        assert_eq!(layer_role_index(LayerKind::Temporal), 3);
+        assert_eq!(layer_role_index(LayerKind::Hir), 4);
+        assert_eq!(layer_role_index(LayerKind::Lex), 5);
+        assert_eq!(layer_role_index(LayerKind::Fs), 6);
+    }
+
+    #[test]
     fn empty_layer_map_returns_zero() {
         let layers = HashMap::new();
         assert_eq!(build_combined_hv(&layers), ZERO_HV);

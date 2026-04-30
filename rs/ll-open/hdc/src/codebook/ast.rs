@@ -8,7 +8,7 @@
 //! identical hypervectors — that's the structural-equivalence-class
 //! property the whole HDC stack rests on.
 
-use crate::codebook::{AstNodeFingerprint, BaseCodebook};
+use crate::codebook::{canonical_signature_bytes, AstNodeFingerprint, BaseCodebook};
 
 #[cfg(test)]
 use crate::canonical::CanonicalKind;
@@ -32,7 +32,7 @@ impl AstCodebook {
     /// (`signature_byte_format_pin`) doesn't have to know which crate
     /// module owns the canonical format.
     fn signature_bytes(item: &AstNodeFingerprint) -> Vec<u8> {
-        crate::codebook::canonical_signature_bytes(
+        canonical_signature_bytes(
             "hdc-ast",
             item.canonical_kind,
             item.arity_bucket,

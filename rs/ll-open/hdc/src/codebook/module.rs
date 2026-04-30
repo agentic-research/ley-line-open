@@ -18,7 +18,7 @@
 //! mirror directories (`mod.rs` + `mod_test.rs`), repeated scaffolding
 //! across crates.
 
-use crate::codebook::{AstNodeFingerprint, BaseCodebook};
+use crate::codebook::{canonical_signature_bytes, AstNodeFingerprint, BaseCodebook};
 use crate::encoder::EncoderNode;
 use crate::util::{
     bucket_arity, bytes_to_hv, popcount_distance, rotate_left, xor_into,
@@ -53,7 +53,7 @@ impl ModuleCodebook {
     /// (decl-header data here, full-fingerprint data there).
     fn header_signature_bytes(node: &EncoderNode) -> Vec<u8> {
         let child_kinds: Vec<_> = node.children.iter().map(|c| c.canonical_kind).collect();
-        crate::codebook::canonical_signature_bytes(
+        canonical_signature_bytes(
             "hdc-module",
             node.canonical_kind,
             bucket_arity(node.children.len()),
@@ -81,7 +81,7 @@ impl BaseCodebook for ModuleCodebook {
         // (Skeptic-review bead 4bb8a0: identical base_vector across
         // codebooks would mean ModuleCodebook silently produces
         // AstCodebook output via encode_tree.)
-        let buf = crate::codebook::canonical_signature_bytes(
+        let buf = canonical_signature_bytes(
             "hdc-module",
             item.canonical_kind,
             item.arity_bucket,
@@ -345,6 +345,6 @@ mod tests {
         // Sanity: the identity helper returns the canonical zero
         // hypervector. Drift guard if a future refactor accidentally
         // changes the constant.
-        assert_eq!(module_zero(), [0u8; crate::D_BYTES]);
+        assert_eq!(module_zero(), ZERO_HV);
     }
 }

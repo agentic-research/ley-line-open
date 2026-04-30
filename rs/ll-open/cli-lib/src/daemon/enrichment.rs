@@ -489,6 +489,88 @@ mod tests {
     }
 
     #[test]
+    fn execute_pass_records_failure_in_state() {
+        // Sister to execute_pass_records_outcome_in_state. The success
+        // path is pinned (basis set, error=None); pin the failure path
+        // too so a refactor that swaps the Ok/Err arms in
+        // record_pass_outcome surfaces here. The error message must be
+        // stored verbatim — operators see it via op_status's
+        // enrichment[name].error field.
+        use std::sync::{Arc, RwLock};
+        let conn = meta_conn();
+        // Pre-populate tree-sitter_version. On failure the basis MUST
+        // NOT be updated (staleness detection relies on basis lagging
+        // behind the parse_version when a pass is broken).
+        set_meta(&conn, "tree-sitter_version", "5").unwrap();
+
+        let pass = FailingPass;
+        let state = Arc::new(RwLock::new(DaemonState::initializing()));
+        let result = execute_pass(&pass, &conn, Path::new("/"), None, Some(&state));
+        assert!(result.is_err(), "failing pass must propagate Err");
+
+        let s = state.read().unwrap();
+        let status = s.enrichment.get("failing").expect("failing status recorded");
+        assert!(
+            status.last_run_at_ms.is_some(),
+            "last_run_at_ms must be set even on failure (so operators \
+             can see *when* the pass last failed)",
+        );
+        assert!(
+            status.basis.is_none(),
+            "basis must NOT be set on failure (staleness detection \
+             depends on basis lagging behind parse_version when broken)",
+        );
+        let err_msg = status.error.as_ref().expect("error field must be populated");
+        assert!(
+            err_msg.contains("intentional pass failure"),
+            "error message must include the pass's bail! string, got {err_msg:?}",
+        );
+    }
+
+    #[test]
+    fn execute_pass_recovery_clears_error_on_next_success() {
+        // Operators rely on PassStatus.error being None to mean "this
+        // pass is healthy now." If a pass fails once then succeeds, the
+        // error MUST be cleared — otherwise op_status keeps reporting
+        // a stale failure forever. Pin the recovery path explicitly
+        // (the previous test only covers fresh-failure; without this
+        // pin a refactor that wrote `entry.error = entry.error.take()`
+        // — keeping last error around — would silently regress the
+        // health signal).
+        use std::sync::{Arc, RwLock};
+        let conn = meta_conn();
+        let state = Arc::new(RwLock::new(DaemonState::initializing()));
+
+        // 1. Fail once — error gets recorded.
+        let _ = execute_pass(&FailingPass, &conn, Path::new("/"), None, Some(&state));
+        {
+            let s = state.read().unwrap();
+            let status = s.enrichment.get("failing").expect("failing status recorded");
+            assert!(status.error.is_some(), "fresh failure must record error");
+        }
+
+        // 2. Now succeed under the SAME pass name — error must clear.
+        // Build a MockPass that reuses the "failing" name to simulate
+        // the same pass recovering on a subsequent run.
+        let recovered = MockPass {
+            name: "failing",
+            deps: &[],
+            reads: &[],
+            writes: &["t"],
+        };
+        execute_pass(&recovered, &conn, Path::new("/"), None, Some(&state)).unwrap();
+
+        let s = state.read().unwrap();
+        let status = s.enrichment.get("failing").expect("failing status still recorded");
+        assert!(
+            status.error.is_none(),
+            "successful run after a failure MUST clear the error field; \
+             got {:?}",
+            status.error,
+        );
+    }
+
+    #[test]
     fn resolve_order_simple() {
         let passes = vec![
             mock("a", &[], &[], &["t1"]),

@@ -146,6 +146,19 @@ fn write_empty_go_func(dir: &Path, file: &str, pkg: &str, fn_name: &str) {
     fs::write(dir.join(file), content).expect("write go fixture");
 }
 
+/// Cold-parse a Go source directory into a fresh `:memory:` Connection.
+/// The dominant test setup for "cold-parse, then assert" — 4+ sites
+/// previously inlined this exact pair. Returns just the connection
+/// because that's all most tests need; sites that want the
+/// `ParseResult` keep calling `parse_into_conn` directly.
+#[allow(dead_code)]
+fn cold_parse_go(src_dir: &Path) -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    leyline_cli_lib::cmd_parse::parse_into_conn(&conn, src_dir, Some("go"), None)
+        .expect("cold parse Go fixture");
+    conn
+}
+
 /// Create a temporary directory containing two small `.go` files for testing.
 fn create_go_fixture() -> TempDir {
     let dir = TempDir::new().expect("create temp dir");
@@ -1027,8 +1040,7 @@ fn test_multiple_snapshot_cycles() {
     let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
     ctrl.set_arena(&arena_path.to_string_lossy(), arena_size, 0).unwrap();
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
+    let conn = cold_parse_go(src.path());
 
     // Run 5 snapshot cycles, modifying the file each time.
     for i in 0..5 {
@@ -1743,8 +1755,7 @@ async fn test_op_reparse_accepts_single_file_source() {
     write_empty_go_func(src.path(), "b.go", "m", "B");
 
     // Cold-parse so _file_index is populated.
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    leyline_cli_lib::cmd_parse::parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
+    let conn = cold_parse_go(src.path());
     let snapshot: std::collections::HashMap<String, (i64, i64)> = conn
         .prepare("SELECT path, mtime, size FROM _file_index")
         .unwrap()
@@ -1818,8 +1829,7 @@ async fn test_op_reparse_accepts_files_scope_with_dir_source() {
     write_empty_go_func(src.path(), "b.go", "m", "B");
     write_empty_go_func(src.path(), "c.go", "m", "C");
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    leyline_cli_lib::cmd_parse::parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
+    let conn = cold_parse_go(src.path());
 
     std::thread::sleep(std::time::Duration::from_millis(50));
     fs::write(src.path().join("b.go"), "package m\n\nfunc B() { /* edit */ }\n").unwrap();
@@ -2181,8 +2191,7 @@ async fn test_op_reparse_snapshot_race_keeps_monotonic_generation() {
 
     // Cold-parse so _file_index is populated and reparse calls have
     // something to diff against.
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    leyline_cli_lib::cmd_parse::parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
+    let conn = cold_parse_go(src.path());
 
     let ctx = Arc::new(DaemonContext {
         ctrl_path: ctrl_path.clone(),        router: EventRouter::new(64),

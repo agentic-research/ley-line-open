@@ -140,17 +140,10 @@ mod tests {
     }
 
     #[test]
-    fn unknown_kind_falls_back_to_block() {
-        // Forward compat: a future tree-sitter-rust adds a new kind we
-        // haven't mapped. The encoder must keep working — the new
-        // kind silently buckets to Block until the map is updated.
-        let m = RustCanonicalMap;
-        assert_eq!(m.lookup("future_unknown_kind"), CanonicalKind::Block);
-        assert_eq!(m.lookup(""), CanonicalKind::Block);
-    }
-
-    #[test]
-    fn lang_is_rust() {
-        assert_eq!(RustCanonicalMap.lang(), "rust");
+    fn baseline_invariants() {
+        // Shared invariants every CanonicalKindMap must hold (forward-
+        // compat fallback + lang identity). Defined in canonical.rs so
+        // every future language gets them for free.
+        super::super::assert_canonical_map_baseline(&RustCanonicalMap, "rust");
     }
 }

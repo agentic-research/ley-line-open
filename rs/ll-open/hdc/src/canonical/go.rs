@@ -134,14 +134,9 @@ mod tests {
     }
 
     #[test]
-    fn unknown_kind_falls_back_to_block() {
-        let m = GoCanonicalMap;
-        assert_eq!(m.lookup("future_unknown_kind"), CanonicalKind::Block);
-    }
-
-    #[test]
-    fn lang_is_go() {
-        assert_eq!(GoCanonicalMap.lang(), "go");
+    fn baseline_invariants() {
+        // Shared invariants — see `canonical::assert_canonical_map_baseline`.
+        super::super::assert_canonical_map_baseline(&GoCanonicalMap, "go");
     }
 
     #[test]

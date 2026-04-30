@@ -75,6 +75,35 @@ pub use rust::RustCanonicalMap;
 pub mod go;
 pub use go::GoCanonicalMap;
 
+/// Test invariants every `CanonicalKindMap` impl must satisfy. Centralizes
+/// the boilerplate that would otherwise be copied per-language: forward-
+/// compat fallback, empty-string fallback, and lang-id identification.
+/// Adding a new language map gets these checks for free by calling
+/// `assert_canonical_map_baseline(&MyMap, "mylang")`.
+#[cfg(test)]
+pub fn assert_canonical_map_baseline(m: &dyn CanonicalKindMap, expected_lang: &str) {
+    // Forward compat: a future grammar adds a kind we don't know yet.
+    // Encoder must keep working — unknown kinds bucket to FALLBACK_KIND
+    // (Block) until the map is updated. Pin so a refactor that changed
+    // the fallback (e.g. to Stmt) is caught immediately.
+    assert_eq!(
+        m.lookup("future_unknown_kind"),
+        FALLBACK_KIND,
+        "{}: unknown kind must fall back to FALLBACK_KIND",
+        m.lang(),
+    );
+    assert_eq!(
+        m.lookup(""),
+        FALLBACK_KIND,
+        "{}: empty kind name must fall back to FALLBACK_KIND",
+        m.lang(),
+    );
+
+    // Language identity: each map must self-identify so multi-language
+    // collections can disambiguate without out-of-band metadata.
+    assert_eq!(m.lang(), expected_lang);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

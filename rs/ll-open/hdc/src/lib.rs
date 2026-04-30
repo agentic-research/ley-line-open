@@ -17,6 +17,7 @@
 //! deeper trees the encoder uses recursive (hierarchical) bundling, which
 //! sidesteps the saturation ceiling on flat bundles.
 
+pub mod calibrate;
 pub mod canonical;
 pub mod codebook;
 pub mod combined;

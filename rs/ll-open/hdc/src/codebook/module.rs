@@ -339,6 +339,42 @@ mod tests {
     }
 
     #[test]
+    fn module_distance_far_for_distinct_layouts() {
+        // Two files with totally different decl compositions must
+        // produce a large module distance — far above the zero
+        // self-distance baseline. Pin the discrimination property
+        // that the module layer is meant to deliver.
+        let cb = ModuleCodebook::new();
+        // File A: 3 functions
+        let file_a = node(
+            CanonicalKind::Block,
+            vec![fake_func(), fake_func(), fake_func()],
+        );
+        // File B: 1 type, 1 var (different shape entirely)
+        let file_b = node(
+            CanonicalKind::Block,
+            vec![fake_type(), fake_var()],
+        );
+        let d = module_distance(&file_a, &file_b, &cb);
+        assert!(
+            d > 1000,
+            "distinct module layouts should differ substantially (got {d})"
+        );
+    }
+
+    #[test]
+    fn module_distance_is_symmetric() {
+        // module_distance is built on popcount_distance which is
+        // symmetric — d(a, b) == d(b, a). Pin so a refactor that
+        // accidentally introduced asymmetry (e.g. masking one
+        // input) would fail.
+        let cb = ModuleCodebook::new();
+        let a = node(CanonicalKind::Block, vec![fake_func()]);
+        let b = node(CanonicalKind::Block, vec![fake_var(), fake_type()]);
+        assert_eq!(module_distance(&a, &b, &cb), module_distance(&b, &a, &cb));
+    }
+
+    #[test]
     fn module_zero_is_zero_hv() {
         // Sanity: the identity helper returns the canonical zero
         // hypervector. Drift guard if a future refactor accidentally

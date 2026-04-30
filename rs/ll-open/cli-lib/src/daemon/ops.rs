@@ -1232,6 +1232,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn op_status_wire_format_pins_required_fields() {
+        // Wire-format pin parallel to enrichment_stats_serialize_to_
+        // expected_json_shape and event_serialize_to_expected_json_
+        // shape. op_status response is consumed by mache + cli
+        // status checks; clients dispatch on every field name. The
+        // existing test_op_status_returns_generation only checks ok
+        // and generation. A refactor that renamed any required field
+        // (or dropped one) would silently break every status-check
+        // path. Pin all 6 always-emitted fields (ok, phase,
+        // generation, arena_path, arena_size, enrichment).
+        let (_dir, ctx) = setup();
+        let result = handle_base_op(&ctx, "status", &json!({})).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let obj = parsed.as_object().expect("op_status returns an object");
+
+        for required_field in ["ok", "phase", "generation", "arena_path", "arena_size", "enrichment"] {
+            assert!(
+                obj.contains_key(required_field),
+                "op_status JSON must include `{required_field}`; got keys {:?}",
+                obj.keys().collect::<Vec<_>>(),
+            );
+        }
+        // phase from a fresh setup is "initializing".
+        assert_eq!(parsed["phase"], "initializing");
+        // enrichment is an object (possibly empty).
+        assert!(parsed["enrichment"].is_object());
+    }
+
+    #[tokio::test]
     async fn test_op_flush_returns_ok() {
         let (_dir, ctx) = setup();
         let result = handle_base_op(&ctx, "flush", &json!({}));

@@ -215,6 +215,24 @@ pub fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Read a meta key. Returns `Ok(None)` when the row is absent. SQL errors
+/// (broken connection, missing _meta table, etc.) propagate as `Err`.
+///
+/// Counterpart to `set_meta`. Centralizes the `SELECT value FROM _meta`
+/// query so callers can't independently drift on column name or NULL
+/// handling.
+pub fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
+    match conn.query_row(
+        "SELECT value FROM _meta WHERE key = ?1",
+        [key],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(v) => Ok(Some(v)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Delete all rows for a source file across ALL tables.
 ///
 /// The `nodes` table uses path-prefix deletion because node IDs are structured
@@ -330,6 +348,42 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1, "must not duplicate rows");
+    }
+
+    #[test]
+    fn get_meta_roundtrip_and_missing_key() {
+        // Counterpart to meta_roundtrip: pin get_meta's three-way
+        // contract. Drift here would silently change every
+        // enrichment-pass version-tracking decision.
+        let conn = Connection::open_in_memory().unwrap();
+        create_index_schema(&conn).unwrap();
+
+        // Missing key → Ok(None), NOT Err.
+        assert_eq!(get_meta(&conn, "absent_key").unwrap(), None);
+
+        // Round-trip: set then get returns the exact value.
+        set_meta(&conn, "k1", "v1").unwrap();
+        assert_eq!(get_meta(&conn, "k1").unwrap(), Some("v1".to_string()));
+
+        // Overwrite: get reflects the latest set.
+        set_meta(&conn, "k1", "v2").unwrap();
+        assert_eq!(get_meta(&conn, "k1").unwrap(), Some("v2".to_string()));
+    }
+
+    #[test]
+    fn get_meta_propagates_sql_errors() {
+        // Drift guard against the silent-swallow pattern. If `_meta`
+        // doesn't exist (caller has the wrong connection / pre-schema
+        // database), get_meta MUST return Err so callers can see and
+        // log it. Callers that want "treat missing-table as None" can
+        // .ok() at the call site — making the choice explicit.
+        let conn = Connection::open_in_memory().unwrap();
+        // Note: no create_index_schema call.
+        let r = get_meta(&conn, "any");
+        assert!(
+            r.is_err(),
+            "missing _meta table must propagate as Err, got {r:?}",
+        );
     }
 
     #[test]

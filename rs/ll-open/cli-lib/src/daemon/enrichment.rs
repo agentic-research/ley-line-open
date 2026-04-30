@@ -204,7 +204,13 @@ fn record_pass_outcome(
     let basis = get_meta_u64(conn, "tree-sitter_version");
     let mut s = match state.write() {
         Ok(g) => g,
-        Err(_) => return,
+        Err(poisoned) => {
+            // A previous writer panicked. Recover the inner state so
+            // status reporting keeps working — losing one update is
+            // better than wedging the daemon's state machine.
+            log::error!("daemon state RwLock poisoned in record_pass_outcome, recovering");
+            poisoned.into_inner()
+        }
     };
     let entry = s.enrichment.entry(name.to_string()).or_insert_with(PassStatus::default);
     entry.last_run_at_ms = Some(super::now_ms());
@@ -263,23 +269,26 @@ fn resolve_recursive(
 // _meta helpers
 // ---------------------------------------------------------------------------
 
+/// Read a `_meta` value as a u64. Returns `None` for both "key absent" and
+/// "value present but doesn't parse as u64" — a malformed value is treated
+/// the same as missing so a stale schema can't wedge enrichment forever.
+/// SQL errors (broken connection, missing table) DO propagate via the
+/// underlying `leyline_ts::schema::get_meta` so the caller sees them.
 fn get_meta_u64(conn: &Connection, key: &str) -> Option<u64> {
-    conn.query_row(
-        "SELECT value FROM _meta WHERE key = ?1",
-        [key],
-        |row| row.get::<_, String>(0),
-    )
-    .ok()
-    .and_then(|v| v.parse().ok())
+    match leyline_ts::schema::get_meta(conn, key) {
+        Ok(Some(v)) => v.parse().ok(),
+        Ok(None) => None,
+        Err(e) => {
+            log::warn!("get_meta_u64({key}) failed: {e:#}");
+            None
+        }
+    }
 }
 
-fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
-    conn.execute(
-        "INSERT OR REPLACE INTO _meta (key, value) VALUES (?1, ?2)",
-        rusqlite::params![key, value],
-    )?;
-    Ok(())
-}
+// `set_meta` is now `leyline_ts::schema::set_meta` — the local copy was a
+// behavioral duplicate of the public version. Keep the import here to
+// preserve the existing call sites without touching them.
+use leyline_ts::schema::set_meta;
 
 // ---------------------------------------------------------------------------
 // TreeSitterPass — the base enrichment pass

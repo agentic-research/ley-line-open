@@ -68,6 +68,11 @@ pub fn insert_extracted_refs(
 ///
 /// Unsupported languages return an empty vec (no refs, no error).
 /// Add new languages by adding a match arm here + an `extract_<lang>` function.
+//
+// `#[allow(unused_variables)]`: every match arm is feature-gated, so when
+// no language with a refs extractor is enabled the parameters are unused.
+// They're load-bearing when any extractor feature is on.
+#[allow(unused_variables)]
 pub fn extract_refs(
     node: &tree_sitter::Node,
     source: &[u8],

@@ -245,4 +245,22 @@ mod tests {
         let b = default_backend();
         assert!(b == "nfs" || b == "fuse", "unexpected backend: {b}");
     }
+
+    #[test]
+    fn default_backend_per_platform() {
+        // Tightening pin. The platform-specific choice is load-bearing
+        // for daemon DX: on macOS, FUSE requires macFUSE/osxfuse which
+        // is third-party and often unavailable, so the daemon defaults
+        // to NFS via the `nfsserve` crate. On Linux/BSD, FUSE is the
+        // standard. A refactor that flipped the cfg or removed the
+        // platform branch would silently break daemon mount UX. Pin
+        // platform-specific defaults so a typo (e.g. swapping the
+        // arms) surfaces as a test failure.
+        let b = default_backend();
+        if cfg!(target_os = "macos") {
+            assert_eq!(b, "nfs", "macOS must default to NFS (FUSE needs macFUSE)");
+        } else {
+            assert_eq!(b, "fuse", "non-macOS must default to FUSE");
+        }
+    }
 }

@@ -263,6 +263,32 @@ mod tests {
     }
 
     #[test]
+    fn splitmix64_is_deterministic_and_advances_state() {
+        // splitmix64 is the PRNG primitive underneath expand_seed
+        // and next_uniform. Pin: same starting state + same number
+        // of calls → byte-identical output sequence (cross-machine
+        // reproducibility). State must advance — two consecutive
+        // calls must produce different state values, otherwise the
+        // PRNG is degenerate. Also pin: zero state produces non-zero
+        // first output via the `wrapping_add(0x9E37_79B9_…)` step.
+        let mut a = 42u64;
+        let mut b = 42u64;
+        let out_a = (splitmix64(&mut a), splitmix64(&mut a), splitmix64(&mut a));
+        let out_b = (splitmix64(&mut b), splitmix64(&mut b), splitmix64(&mut b));
+        assert_eq!(out_a, out_b, "deterministic across runs");
+        assert_eq!(a, b, "state advances identically");
+        // State advances: two calls must produce distinct outputs
+        // (avalanche). Not a strict guarantee for any specific PRNG
+        // but holds for SplitMix64 by construction.
+        assert_ne!(out_a.0, out_a.1, "consecutive outputs must differ");
+
+        // Zero state → non-zero output (load-bearing for expand_seed(0)).
+        let mut zero = 0u64;
+        let first = splitmix64(&mut zero);
+        assert_ne!(first, 0, "splitmix64 from state=0 must not produce 0");
+    }
+
+    #[test]
     fn expand_seed_is_deterministic() {
         // Same seed must produce the same bytes every call. This is the
         // load-bearing reproducibility property — every machine, every

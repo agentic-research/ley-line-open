@@ -94,12 +94,54 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_id_is_rejected() {
+    fn duplicate_id_overwrites_on_upsert() {
+        // insert_node uses INSERT OR REPLACE so a re-inserted id
+        // overwrites the existing row. The ingest pipeline relies on
+        // this: parse_into_conn re-runs over the same source dir
+        // produce identical rows + INSERT OR REPLACE no-ops them,
+        // and a changed file simply rewrites its row in place. Pin
+        // both halves: second call succeeds, AND the row reflects
+        // the second insert's values.
         let conn = Connection::open_in_memory().unwrap();
         create_schema(&conn).unwrap();
         insert_node(&conn, "dup", "", "dup", 1, 0, 100, "").unwrap();
-        // Second insert with same id must fail (PRIMARY KEY constraint).
-        assert!(insert_node(&conn, "dup", "", "dup", 1, 0, 200, "").is_err());
+        // Second insert with same id MUST succeed (INSERT OR REPLACE).
+        insert_node(&conn, "dup", "", "dup", 1, 99, 200, "updated").unwrap();
+        let (size, mtime, record): (i64, i64, String) = conn
+            .query_row(
+                "SELECT size, mtime, record FROM nodes WHERE id = 'dup'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(size, 99, "second insert's size must replace");
+        assert_eq!(mtime, 200, "second insert's mtime must replace");
+        assert_eq!(record, "updated", "second insert's record must replace");
+    }
+
+    #[test]
+    fn create_schema_creates_both_indexes() {
+        // Scale-problem pin. The two indexes (idx_parent_name and
+        // idx_source_file) do real work at scale — on the helm/charts
+        // ingest (4.5k YAML files, 629k nodes), idx_parent_name
+        // alone is 185 MB and accelerates every parent→children
+        // walk. parent_child_index_lookup uses 4 rows where SQLite
+        // can full-scan instantly, so a refactor that DROP'd either
+        // index from NODES_DDL would still pass that test. Pin
+        // existence directly via sqlite_master.
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        for index_name in ["idx_parent_name", "idx_source_file"] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND name=?1",
+                    [index_name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(exists, "missing index: {index_name}");
+        }
     }
 
     #[test]

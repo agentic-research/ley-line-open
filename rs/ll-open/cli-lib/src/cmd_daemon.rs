@@ -793,6 +793,43 @@ mod tests {
     // the underlying helper behavior so a future fix is intentional.
 
     #[test]
+    fn git_dirty_files_extracts_paths_correctly() {
+        // Pin the porcelain -z parsing: each entry starts with 2-char
+        // status + space; path is at offset 3. Pinning here matters
+        // because the reparse path keys on this set — a parsing bug
+        // would either reparse the wrong files or skip changed ones.
+        // Sister to git_dirty_files_on_clean_repo_returns_empty_set.
+        let dir = TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        // Write files in distinct states: untracked, modified, added.
+        std::fs::write(dir.path().join("untracked.txt"), b"hello").unwrap();
+        std::fs::write(dir.path().join("tracked.txt"), b"v1").unwrap();
+        std::process::Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t",
+                   "add", "tracked.txt"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t",
+                   "commit", "-q", "-m", "init"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        std::fs::write(dir.path().join("tracked.txt"), b"v2").unwrap();
+
+        let dirty = git_dirty_files(dir.path()).unwrap();
+        assert!(dirty.contains("untracked.txt"), "untracked file must be in dirty set");
+        assert!(dirty.contains("tracked.txt"), "modified tracked file must be in dirty set");
+        // No phantom paths.
+        assert_eq!(dirty.len(), 2, "exactly 2 dirty paths, got {dirty:?}");
+    }
+
+    #[test]
     fn git_dirty_files_on_clean_repo_returns_empty_set() {
         // Scale-problem pin. Most working repos are mostly-clean, so
         // this is the most-common code path. With clean repo,

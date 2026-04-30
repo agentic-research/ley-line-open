@@ -20,6 +20,7 @@
 
 use rusqlite::Connection;
 
+use crate::canonical::CanonicalKind;
 use crate::codebook::{AstNodeFingerprint, BaseCodebook};
 use crate::util::{rotate_left, rotate_right, xor_into, Hypervector};
 use crate::LayerKind;
@@ -180,19 +181,19 @@ pub fn unbind_child_at_position(
 ///   each position. Typically the union of all canonical kinds.
 pub fn explain_cluster_centroid<C>(
     centroid: &Hypervector,
-    centroid_root_kind: crate::canonical::CanonicalKind,
+    centroid_root_kind: CanonicalKind,
     centroid_arity: u8,
-    centroid_child_kinds_positional: &[crate::canonical::CanonicalKind],
+    centroid_child_kinds_positional: &[CanonicalKind],
     codebook: &C,
-    candidate_child_kinds: &[crate::canonical::CanonicalKind],
-) -> Vec<(usize, crate::canonical::CanonicalKind, u32)>
+    candidate_child_kinds: &[CanonicalKind],
+) -> Vec<(usize, CanonicalKind, u32)>
 where
     C: BaseCodebook<Item = AstNodeFingerprint>,
 {
     use crate::util::{popcount_distance, ZERO_HV};
 
     let leaf_base =
-        |kind: crate::canonical::CanonicalKind| codebook.base_vector(&AstNodeFingerprint::leaf(kind));
+        |kind: CanonicalKind| codebook.base_vector(&AstNodeFingerprint::leaf(kind));
 
     let parent_fp = AstNodeFingerprint {
         canonical_kind: centroid_root_kind,
@@ -220,7 +221,7 @@ where
 
         let unbound = unbind_child_at_position(centroid, &parent_base, &siblings_at_i, i);
 
-        let mut best: Option<(crate::canonical::CanonicalKind, u32)> = None;
+        let mut best: Option<(CanonicalKind, u32)> = None;
         for &kind in candidate_child_kinds {
             let d = popcount_distance(&unbound, &leaf_base(kind));
             match best {
@@ -244,7 +245,7 @@ mod tests {
         conn_with_schema_and_udfs as fresh_with_udfs, insert_combined_hv as insert_combined,
         insert_layer_hv as insert,
     };
-    use crate::util::{expand_seed, ZERO_HV};
+    use crate::util::{bucket_arity, expand_seed, ZERO_HV};
 
     #[test]
     fn radius_search_returns_only_within_radius() {
@@ -384,11 +385,12 @@ mod tests {
         //   residual = parent ⊕ base ⊕ rotate_left(child0, 0)
         //            = rotate_left(child1, 1)
         //   rotate_right(residual, 1) = child1
+        use crate::canonical::CanonicalKind;
         use crate::util::rotate_left;
         let cb = AstCodebook::new();
         let parent_base = expand_seed(0xBA5E);
-        let child0 = cb.base_vector(&AstNodeFingerprint::leaf(crate::canonical::CanonicalKind::Op));
-        let child1 = cb.base_vector(&AstNodeFingerprint::leaf(crate::canonical::CanonicalKind::Lit));
+        let child0 = cb.base_vector(&AstNodeFingerprint::leaf(CanonicalKind::Op));
+        let child1 = cb.base_vector(&AstNodeFingerprint::leaf(CanonicalKind::Lit));
 
         // Build parent the way the encoder would.
         let mut parent = parent_base;
@@ -409,7 +411,6 @@ mod tests {
         // distance metric. With sibling cancellation now implemented
         // (skeptic 4bace1) recovery on a single tree should ALSO
         // succeed — pin both shape AND correctness here.
-        use crate::canonical::CanonicalKind;
         use crate::encoder::{encode_fresh, EncoderNode};
 
         let cb = AstCodebook::new();
@@ -427,7 +428,7 @@ mod tests {
         let recovered = explain_cluster_centroid(
             &centroid,
             CanonicalKind::Block,
-            crate::util::bucket_arity(2),
+            bucket_arity(2),
             // Positional (order matches the encoded tree):
             &[CanonicalKind::Op, CanonicalKind::Lit],
             &cb,
@@ -478,7 +479,6 @@ mod tests {
         // job of `unbind_child_at_position`. The next test
         // (`real_cluster_via_unbind_recovers_each_position`) pins
         // that path on a real heterogeneous cluster.
-        use crate::canonical::CanonicalKind;
         use crate::encoder::{encode_fresh, EncoderNode};
         use crate::sheaf::HvCellComplex;
 
@@ -501,7 +501,7 @@ mod tests {
         let recovered = explain_cluster_centroid(
             &centroid,
             CanonicalKind::Decl,
-            crate::util::bucket_arity(3),
+            bucket_arity(3),
             &[CanonicalKind::Ref, CanonicalKind::Block, CanonicalKind::Op],
             &cb,
             &candidate_kinds,
@@ -546,7 +546,6 @@ mod tests {
         //
         // Math-friend ≥80% target: 2/2 constant positions = 100%
         // expected. Plus position 1 is plausible.
-        use crate::canonical::CanonicalKind;
         use crate::encoder::{encode_fresh, EncoderNode};
         use crate::sheaf::HvCellComplex;
 
@@ -598,7 +597,7 @@ mod tests {
         let recovered = explain_cluster_centroid(
             &centroid,
             CanonicalKind::Decl,
-            crate::util::bucket_arity(3),
+            bucket_arity(3),
             &[CanonicalKind::Ref, CanonicalKind::Stmt, CanonicalKind::Op],
             &cb,
             &candidate_kinds,
@@ -639,7 +638,6 @@ mod tests {
     fn explain_cluster_centroid_handles_zero_arity() {
         // Edge case: leaf node (no children). Should return an empty
         // vec, not panic.
-        use crate::canonical::CanonicalKind;
         let cb = AstCodebook::new();
         let candidate_kinds = [CanonicalKind::Lit, CanonicalKind::Op];
         let centroid = cb.base_vector(&AstNodeFingerprint::leaf(CanonicalKind::Lit));

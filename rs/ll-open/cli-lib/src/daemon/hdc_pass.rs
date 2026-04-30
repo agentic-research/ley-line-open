@@ -198,8 +198,11 @@ mod tests {
     ///   on real codebases; this test pins API correctness).
     #[test]
     fn validation_gate_full_stack_on_real_go() {
+        // AstCodebook is already imported at the test-module level.
+        // The other validation-only items stay inline — they're not
+        // used by sibling tests, so keeping them scoped to this
+        // function communicates "validation gate's deps".
         use leyline_hdc::calibrate::{calibrate_and_persist, load_baseline};
-        use leyline_hdc::codebook::AstCodebook;
         use leyline_hdc::query::{density_count, radius_search};
         use leyline_hdc::schema::create_hdc_schema;
         use leyline_hdc::sql_udf::register_hdc_udfs;

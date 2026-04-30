@@ -601,6 +601,30 @@ mod tests {
     }
 
     #[test]
+    fn structural_root_is_deterministic_across_calls() {
+        // Sister pin to empty_complex_has_stable_root for the
+        // multi-layer XOR fold path. structural_root iterates
+        // LayerKind::ALL — a refactor that read state from a HashMap
+        // (instead of the const ALL) would silently introduce
+        // non-determinism. Pin via two back-to-back calls on a
+        // populated multi-layer complex.
+        let mut cx = HvCellComplex::new();
+        cx.add_cell(
+            HvCell::new("fn_a", CanonicalKind::Decl)
+                .with_stalk(LayerKind::Ast, stalk_for(11))
+                .with_stalk(LayerKind::Semantic, stalk_for(22))
+                .with_stalk(LayerKind::Module, stalk_for(33)),
+        );
+        cx.add_cell(
+            HvCell::new("fn_b", CanonicalKind::Stmt)
+                .with_stalk(LayerKind::Ast, stalk_for(44)),
+        );
+        let r1 = cx.structural_root();
+        let r2 = cx.structural_root();
+        assert_eq!(r1, r2, "structural_root must be byte-identical across calls");
+    }
+
+    #[test]
     fn with_stalk_chains_match_imperative_attach_stalk() {
         // Pin: the chainable `with_stalk` builder must produce a cell
         // byte-equivalent to the imperative `let mut + attach_stalk`

@@ -642,11 +642,36 @@ fn ensure_dirs(
     Ok(())
 }
 
-/// Recursively collect files, skipping hidden/vendor/target/node_modules
-/// directories. The skip-list is load-bearing for scale: at registry-repo
-/// scale (50k+ files) a single un-skipped `vendor/` or `node_modules/` can
-/// 10× the walk's file count and parse time. See
-/// `tests::collect_files_skips_known_bloat_dirs` for the skip-list pin.
+/// True when the directory name should be excluded from the parse walk.
+/// Decoupled from `collect_files` so tests can assert membership without
+/// constructing a temp-dir per case, and so future entries can be added
+/// in one place. The list is conservative — only directories that are
+/// *definitively* generated/cached/vendored, never legitimate sources.
+///
+/// At registry-repo scale (50k+ files) a single un-skipped vendored copy
+/// or pyc cache can 10× the walk's file count.
+pub(crate) fn is_bloat_dir(name: &str) -> bool {
+    // Hidden directories: .git, .venv, .tox, .pytest_cache, .next, .cache, ...
+    if name.starts_with('.') {
+        return true;
+    }
+    matches!(
+        name,
+        "node_modules"
+        | "vendor"
+        | "target"
+        // Python bytecode cache. Always generated; never legitimate source.
+        | "__pycache__"
+        // PEP 582 local-deps (rare but real, contains third-party packages).
+        | "__pypackages__"
+        // Python virtualenv (when not dot-prefixed). Common: `python -m venv venv`.
+        | "venv"
+    )
+}
+
+/// Recursively collect files, skipping bloat directories per
+/// `is_bloat_dir`. See `tests::collect_files_skips_known_bloat_dirs`
+/// for the skip-list pin.
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     let entries =
         std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))?;
@@ -656,10 +681,7 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         let path = entry.path();
 
         if let Some(name) = path.file_name().and_then(|n| n.to_str())
-            && (name.starts_with('.')
-                || name == "node_modules"
-                || name == "vendor"
-                || name == "target")
+            && is_bloat_dir(name)
         {
             continue;
         }
@@ -680,22 +702,35 @@ mod tests {
 
     #[test]
     fn collect_files_skips_known_bloat_dirs() {
-        // Scale-problem pin. The skip-list (.hidden, node_modules,
-        // vendor, target) keeps registry-repo walks bounded — a 50k-
-        // file Aports clone with a vendored copy of any large
-        // dependency would 10× the walk if any of these names slipped
-        // out of the skip-list. Pin every entry by constructing a
-        // minimal repo that has each bloat dir + a sibling source file
-        // and asserting only the source file is collected.
+        // Scale-problem pin. The skip-list keeps registry-repo walks
+        // bounded — a 50k-file Aports clone with a vendored copy of
+        // any large dependency, or a Python repo with __pycache__
+        // hierarchies under every package, would 10× the walk if any
+        // entry slipped out of the skip-list. Pin every entry by
+        // constructing a minimal repo with each bloat dir + a sibling
+        // source file and asserting only the source file is collected.
         let td = TempDir::new().unwrap();
         let root = td.path();
 
         // The one file we expect to find.
         std::fs::write(root.join("source.go"), b"package m").unwrap();
 
-        // Create one bloat dir per skip-list entry, each containing a
-        // file we DON'T want collected.
-        for bloat in [".git", "node_modules", "vendor", "target", ".cache"] {
+        // Create one bloat dir per skip-list entry. The set must stay
+        // in sync with `is_bloat_dir`; a refactor that drops one of
+        // these names from the matcher fails this test loudly.
+        let bloat_names = [
+            ".git",
+            ".cache",
+            ".venv",        // dot-prefix
+            ".pytest_cache",// dot-prefix
+            "node_modules",
+            "vendor",
+            "target",
+            "__pycache__",
+            "__pypackages__",
+            "venv",
+        ];
+        for bloat in bloat_names {
             let dir = root.join(bloat);
             std::fs::create_dir(&dir).unwrap();
             std::fs::write(dir.join("inner.go"), b"package x").unwrap();
@@ -703,11 +738,47 @@ mod tests {
 
         let mut found = Vec::new();
         collect_files(root, &mut found).unwrap();
-        assert_eq!(found.len(), 1, "only source.go should be collected, got {found:?}");
+        assert_eq!(
+            found.len(),
+            1,
+            "only source.go should be collected, got {found:?}",
+        );
         assert_eq!(
             found[0].file_name().and_then(|s| s.to_str()),
             Some("source.go"),
         );
+    }
+
+    #[test]
+    fn is_bloat_dir_does_not_falsely_match_normal_names() {
+        // Sister pin: legitimate source-bearing directory names must
+        // not be caught by the bloat matcher. Pinning these explicitly
+        // means a future "skip all uppercase dirs" or similar over-
+        // aggressive rewrite would break here. Includes names that
+        // *contain* bloat substrings (e.g. "node_modules_helper",
+        // "venvironment") to catch a refactor that switched from
+        // exact-match to substring-match.
+        for name in [
+            "src",
+            "lib",
+            "pkg",
+            "internal",
+            "cmd",
+            "tests",
+            "vendored_data", // contains "vendor"
+            "subtarget",     // contains "target"
+            "venvironment",  // contains "venv"
+            "node_modules_helper", // contains "node_modules"
+            "__init__.py",   // begins with __ but is not __pycache__/__pypackages__
+            "_internal",     // begins with _ but not __
+            "build",         // intentionally NOT in skip-list (often source)
+            "dist",          // intentionally NOT in skip-list (often source)
+        ] {
+            assert!(
+                !is_bloat_dir(name),
+                "is_bloat_dir(`{name}`) must be false, but matched",
+            );
+        }
     }
 
     #[test]

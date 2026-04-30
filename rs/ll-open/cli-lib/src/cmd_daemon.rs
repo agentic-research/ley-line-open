@@ -987,6 +987,22 @@ mod tests {
         WatcherTestBed { repo, _dir: dir, _ctx: ctx, ext, events_rx, task }
     }
 
+    /// Wait up to 5s for the next event from a watcher subscription.
+    /// Returns `true` if an event arrived within the deadline. Used by
+    /// watcher tests where 5s covers two full git_watch_loop ticks at
+    /// 2s each plus slack. Centralizes the timeout-to-bool chain so a
+    /// future change to the deadline (or to the receiver type) is one
+    /// site, not N.
+    async fn recv_event_within_5s(
+        rx: &mut tokio::sync::mpsc::Receiver<crate::daemon::events::Event>,
+    ) -> bool {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
     /// `git_watch_loop` ticks every 2s. Modify a file, wait one full tick + a
     /// generous slack, and verify both the typed hook and the event fire.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -997,16 +1013,7 @@ mod tests {
         std::fs::write(tb.repo.path().join("a.go"), "package m\n\nfunc A() { /* edit */ }\n")
             .unwrap();
 
-        // Wait up to 5s for the next tick to detect the change.
-        let saw_files_event = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            tb.events_rx.recv(),
-        )
-        .await
-        .ok()
-        .flatten()
-        .is_some();
-
+        let saw_files_event = recv_event_within_5s(&mut tb.events_rx).await;
         tb.task.abort();
 
         assert!(saw_files_event, "expected daemon.files.changed event");
@@ -1035,15 +1042,7 @@ mod tests {
         let new_head = git_head(tb.repo.path()).unwrap();
         assert_ne!(initial_head, new_head);
 
-        let saw_head_event = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            tb.events_rx.recv(),
-        )
-        .await
-        .ok()
-        .flatten()
-        .is_some();
-
+        let saw_head_event = recv_event_within_5s(&mut tb.events_rx).await;
         tb.task.abort();
 
         assert!(saw_head_event, "expected daemon.head.changed event");

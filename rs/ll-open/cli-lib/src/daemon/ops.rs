@@ -152,21 +152,26 @@ fn query_token_in_table(
 /// table-specific column prefix (`def_` / `ref_`). Returns an empty
 /// vec if the table doesn't exist yet — that's the "not enriched"
 /// signal callers use to trigger lazy enrichment.
+/// Whether a table exists in the connection. Used by every LSP-rows
+/// helper so a query against a not-yet-enriched table returns an
+/// empty Vec (the "needs enrichment" signal callers act on) instead
+/// of bubbling up a `no such table` SQL error.
+fn table_exists(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name=?1",
+        [name],
+        |r| r.get(0),
+    )
+    .unwrap_or(false)
+}
+
 fn lsp_5col_position_rows(
     conn: &Connection,
     node_id: &str,
     table: &str,
     col_prefix: &str,
 ) -> Result<Vec<serde_json::Value>> {
-    // Skip silently if the table hasn't been enriched yet.
-    let exists: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name=?1",
-            [table],
-            |r| r.get(0),
-        )
-        .unwrap_or(false);
-    if !exists {
+    if !table_exists(conn, table) {
         return Ok(vec![]);
     }
     let sql = format!(
@@ -232,11 +237,20 @@ fn read_generation(ctrl_path: &Path) -> Result<u64> {
         .map(|c| c.generation())
 }
 
-/// Acquire the living-db lock just long enough to snapshot to the arena.
-/// Used by every state-changing op (reparse, enrich, snapshot) to publish
-/// the latest db image to mache/remote consumers. The guard's release is
-/// implicit at function return — keeps the lock-window minimal so concurrent
-/// readers aren't blocked longer than necessary.
+/// Acquire the living-db lock and snapshot to the arena. Used by every
+/// state-changing op (reparse, enrich, snapshot) to publish the latest
+/// db image to mache/remote consumers.
+///
+/// **Lock window:** the write lock is held for the *full* duration of
+/// `snapshot_to_arena`, which serializes the entire SQLite database to
+/// the on-disk arena (a disk write proportional to db size). This is
+/// not a cheap window. Concurrent readers and writers block until the
+/// snapshot completes. Don't add work inside this function expecting
+/// the lock to be held briefly — it isn't. If we ever want concurrent
+/// reads during snapshot, the path is `serialize_with_flags(NO_COPY)`
+/// followed by an out-of-lock disk write, but that's a deliberate
+/// refactor, not something to assume here. Doc rewritten after iter-35
+/// adversarial review caught the previous false minimal-lock claim.
 fn snapshot_living_db(ctx: &DaemonContext) -> Result<()> {
     crate::cmd_daemon::snapshot_to_arena(
         &ctx.live_db.lock().unwrap(),
@@ -862,15 +876,26 @@ fn lsp_rows_response(json_key: &str, rows: Vec<serde_json::Value>, enriched: boo
 /// `Vec<Value>`. Used by `op_lsp_symbols` and `op_lsp_diagnostics`,
 /// which differ only in the SELECTed columns and how each row is
 /// decoded — both share this pipeline.
+///
+/// Returns `Ok(vec![])` when `table` doesn't exist yet (the pre-enrichment
+/// state). This matches `lsp_5col_position_rows`'s contract — without
+/// the guard, queries against a not-yet-enriched `_lsp` raise a SQL
+/// error which clients have to special-case. `op_lsp_symbols` and
+/// `op_lsp_defs`/`refs` were behaviorally divergent in this respect
+/// before the guard was added (caught by adversarial review).
 fn query_lsp_rows_for_file<F>(
     conn: &Connection,
     file: &str,
+    table: &str,
     sql: &str,
     mapper: F,
 ) -> Result<Vec<serde_json::Value>>
 where
     F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value>,
 {
+    if !table_exists(conn, table) {
+        return Ok(vec![]);
+    }
     let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt
         .query_map([file], mapper)?
@@ -886,7 +911,7 @@ fn op_lsp_symbols(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String
          FROM _lsp WHERE {NODE_ID_FOR_FILE}"
     );
     with_live_db(ctx, |conn| {
-        let rows = query_lsp_rows_for_file(conn, file, &sql, |row| {
+        let rows = query_lsp_rows_for_file(conn, file, "_lsp", &sql, |row| {
             Ok(json!({
                 "node_id": row.get::<_, String>(0)?,
                 "kind": row.get::<_, String>(1)?,
@@ -910,7 +935,7 @@ fn op_lsp_diagnostics(ctx: &DaemonContext, req: &serde_json::Value) -> Result<St
          AND diagnostics IS NOT NULL AND diagnostics != ''"
     );
     with_live_db(ctx, |conn| {
-        let rows = query_lsp_rows_for_file(conn, file, &sql, |row| {
+        let rows = query_lsp_rows_for_file(conn, file, "_lsp", &sql, |row| {
             Ok(json!({
                 "node_id": row.get::<_, String>(0)?,
                 "diagnostics": row.get::<_, String>(1)?,
@@ -988,16 +1013,25 @@ mod tests {
 
     #[test]
     fn state_changing_ops_pin_known_set() {
-        // Adding a mutating op? Add it here AND to STATE_CHANGING_OPS.
-        // socket.rs reads via is_state_changing() — single source of truth.
-        let known: std::collections::HashSet<&str> = STATE_CHANGING_OPS.iter().copied().collect();
-        for op in ["load", "reparse", "flush", "snapshot", "enrich"] {
-            assert!(
-                is_state_changing(op),
-                "expected `{op}` to be state-changing",
-            );
-            assert!(known.contains(op));
-        }
+        // Bidirectional drift guard: the canonical set must be exactly
+        // the hardcoded list, in some order. Iterating the hardcoded
+        // list (the previous form) only caught *removal* — adding a
+        // new op to STATE_CHANGING_OPS without updating the test
+        // would silently pass and a state-changing op would silently
+        // emit no event. Equality assertion fails in both directions.
+        // (Caught by iter-35 adversarial review.)
+        let mut actual: Vec<&str> = STATE_CHANGING_OPS.to_vec();
+        actual.sort();
+        let expected: Vec<&str> = {
+            let mut v = vec!["load", "reparse", "flush", "snapshot", "enrich"];
+            v.sort();
+            v
+        };
+        assert_eq!(
+            actual, expected,
+            "STATE_CHANGING_OPS drift detected — update the hardcoded list \
+             (and the matching test) when adding/removing mutating ops",
+        );
     }
 
     #[test]
@@ -1021,6 +1055,38 @@ mod tests {
         // not be called state-changing (avoids spurious events).
         assert!(!is_state_changing("nonexistent_op"));
         assert!(!is_state_changing(""));
+    }
+
+    #[tokio::test]
+    async fn op_find_token_preserves_caller_supplied_json_key() {
+        // Wire contract: op_find_callers must return rows under "callers",
+        // op_find_defs under "defs". Clients (mache, hooks) parse the
+        // specific key — a refactor that swapped them silently would
+        // break clients without any test failing. Pin the dispatch
+        // direction explicitly. (Caught by iter-35 adversarial review.)
+        // setup() already creates the node_refs/node_defs tables via
+        // create_refs_schema; we just need empty tables for the shape
+        // test. handle_base_op routes find_callers → node_refs and
+        // find_defs → node_defs.
+        let (_dir, ctx) = setup();
+        let callers = handle_base_op(&ctx, "find_callers", &json!({"token": "x"}))
+            .unwrap();
+        let defs = handle_base_op(&ctx, "find_defs", &json!({"token": "x"}))
+            .unwrap();
+        let callers_v: serde_json::Value = serde_json::from_str(&callers).unwrap();
+        let defs_v: serde_json::Value = serde_json::from_str(&defs).unwrap();
+        assert!(
+            callers_v.get("callers").is_some(),
+            "find_callers must use \"callers\" key; got {callers_v}",
+        );
+        assert!(
+            defs_v.get("defs").is_some(),
+            "find_defs must use \"defs\" key; got {defs_v}",
+        );
+        assert!(
+            callers_v.get("defs").is_none() && defs_v.get("callers").is_none(),
+            "keys must not cross-pollinate",
+        );
     }
 
     #[test]
@@ -1264,10 +1330,11 @@ mod tests {
     }
 
     #[test]
-    fn query_row_opt_propagates_real_errors() {
-        // SQL errors (bad table, bad column, type mismatch) must NOT be
-        // swallowed as None — that would hide bugs at runtime. Only the
-        // QueryReturnedNoRows variant collapses to None.
+    fn query_row_opt_propagates_prepare_phase_errors() {
+        // SQL errors at the prepare/query phase (bad table, bad column,
+        // syntax) must NOT be swallowed as None — that would hide bugs
+        // at runtime. Only the QueryReturnedNoRows variant collapses
+        // to None.
         let conn = Connection::open_in_memory().unwrap();
         let r = query_row_opt(
             &conn,
@@ -1276,6 +1343,35 @@ mod tests {
             |row| row.get::<_, String>(0),
         );
         assert!(r.is_err(), "expected error for missing table, got Ok");
+    }
+
+    #[test]
+    fn query_row_opt_propagates_mapper_phase_errors() {
+        // Distinct from the prepare-phase test: the mapper closure can
+        // also fail (type-mismatch, missing column index). Those errors
+        // also must propagate, not collapse to None. The previous test
+        // only exercised the prepare path — this one exercises the
+        // path through the mapper, where rusqlite returns the error
+        // from inside `query_row` itself. (Caught by iter-35 adversarial
+        // review.)
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (id INTEGER, val TEXT); INSERT INTO t VALUES (1, 'hi');",
+        )
+        .unwrap();
+        // Mapper asks for column 1 as i32 but it's TEXT — runtime type
+        // mismatch surfaces from inside query_row. Must not be swallowed
+        // as None (that would silently hide real type bugs).
+        let r: Result<Option<i32>> = query_row_opt(
+            &conn,
+            "SELECT val FROM t WHERE id = ?1",
+            [1],
+            |row| row.get::<_, i32>(0),
+        );
+        assert!(
+            r.is_err(),
+            "type-mismatch in mapper must propagate as Err, got: {r:?}",
+        );
     }
 
     #[test]
@@ -1376,6 +1472,23 @@ mod tests {
     }
 
     #[test]
+    fn query_lsp_rows_for_file_returns_empty_when_table_missing() {
+        // Pre-enrichment: the `_lsp` table doesn't exist yet. Helper
+        // must return Ok(empty), NOT propagate "no such table" SQL
+        // error. Mirrors the behavior of `lsp_5col_position_rows`
+        // for defs/refs — both op families behave identically when
+        // the underlying enrichment hasn't run. This pins the fix
+        // for the asymmetry caught by the iter-35 adversarial review.
+        let conn = Connection::open_in_memory().unwrap();
+        let sql = format!("SELECT node_id FROM _lsp WHERE {NODE_ID_FOR_FILE}");
+        let rows = query_lsp_rows_for_file(&conn, "src/lib.rs", "_lsp", &sql, |row| {
+            Ok(json!({"node_id": row.get::<_, String>(0)?}))
+        })
+        .unwrap();
+        assert!(rows.is_empty(), "missing table must yield empty, not error");
+    }
+
+    #[test]
     fn query_lsp_rows_for_file_returns_empty_when_no_match() {
         // Pre-enrichment / no-rows-for-file is the common pre-LSP case;
         // callers expect an empty Vec, not an error.
@@ -1388,7 +1501,7 @@ mod tests {
         let sql = format!(
             "SELECT node_id, foo FROM _lsp WHERE {NODE_ID_FOR_FILE}"
         );
-        let rows = query_lsp_rows_for_file(&conn, "src/lib.rs", &sql, |row| {
+        let rows = query_lsp_rows_for_file(&conn, "src/lib.rs", "_lsp", &sql, |row| {
             Ok(json!({"node_id": row.get::<_, String>(0)?, "foo": row.get::<_, String>(1)?}))
         })
         .unwrap();
@@ -1413,7 +1526,7 @@ mod tests {
         let sql = format!(
             "SELECT node_id, foo FROM _lsp WHERE {NODE_ID_FOR_FILE}"
         );
-        let rows = query_lsp_rows_for_file(&conn, "src/lib.rs", &sql, |row| {
+        let rows = query_lsp_rows_for_file(&conn, "src/lib.rs", "_lsp", &sql, |row| {
             Ok(json!({"node_id": row.get::<_, String>(0)?, "foo": row.get::<_, String>(1)?}))
         })
         .unwrap();

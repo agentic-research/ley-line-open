@@ -697,7 +697,21 @@ async fn test_mcp_http_tools_list_and_status_call() {
     drop(probe);
 
     let handle = leyline_cli_lib::daemon::mcp::spawn(ctx, port).expect("spawn MCP HTTP");
-    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+    // Wait for the HTTP listener to accept connections. Same discipline
+    // as `spawn_test_socket` for UDS — a fixed sleep races on overloaded
+    // CI; polling connect-readiness is robust on fast and slow machines
+    // alike. (Caught by iter-35 adversarial review — magic sleep
+    // surviving from before the spawn_test_socket pattern.)
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
 
     // 1. tools/list
     let listing = mcp_post(
@@ -749,8 +763,13 @@ async fn test_mcp_http_tools_list_and_status_call() {
     assert!(bad["error"].is_object(), "expected error response");
     assert_eq!(bad["error"]["code"], -32601);
 
-    // 4. tools/call → lsp_diagnostics on empty db should set isError=true
-    //    (the inner op returns {ok: false, error: ...} when _lsp table is missing).
+    // 4. tools/call → lsp_diagnostics on empty db (pre-enrichment, no
+    //    `_lsp` table yet). Returns ok:true with an empty diagnostics
+    //    array — the `query_lsp_rows_for_file` table-existence guard
+    //    treats "table missing" as "no rows yet" rather than as an
+    //    error. This matches `lsp_defs` / `lsp_refs` behavior on the
+    //    same pre-enrichment state. Behavioral asymmetry between op
+    //    families was caught + fixed by iter-35 adversarial review.
     let lsp = mcp_post(
         port,
         r#"{"jsonrpc":"2.0","id":4,"method":"tools/call",
@@ -758,8 +777,16 @@ async fn test_mcp_http_tools_list_and_status_call() {
     )
     .await;
     assert_eq!(
-        lsp["result"]["isError"], true,
-        "isError must be true when inner op returns ok:false (got {lsp})",
+        lsp["result"]["isError"], false,
+        "pre-enrichment lsp_diagnostics must be ok:true (got {lsp})",
+    );
+    let inner: serde_json::Value =
+        serde_json::from_str(lsp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(inner["ok"], true);
+    assert_eq!(
+        inner["diagnostics"].as_array().map(|a| a.len()),
+        Some(0),
+        "pre-enrichment must yield empty diagnostics array, got {inner}",
     );
 
     handle.abort();

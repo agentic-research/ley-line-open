@@ -556,6 +556,31 @@ mod tests {
     }
 
     #[test]
+    fn staging_creates_shadow_parent_index() -> Result<()> {
+        // Scale-problem pin parallel to the schema/lsp/ts index pins.
+        // idx_shadow_parent is what makes lookup_child / list_children
+        // O(log N) on the staging shadow rather than full-table scan.
+        // At scale (a daemon mid-edit on a 50k-file repo with hundreds
+        // of dirty nodes), losing the index would push every staging
+        // query to scan every dirty row. A refactor that DROP'd the
+        // index from the DDL would still pass behavior tests on small
+        // fixtures. Pin existence directly via sqlite_master against
+        // the shadow connection.
+        let live = test_live();
+        let staging = StagingGraph::new(live)?;
+        let conn = staging.shadow.lock().unwrap();
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND name=?1",
+                ["idx_shadow_parent"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(exists, "missing idx_shadow_parent");
+        Ok(())
+    }
+
+    #[test]
     fn read_through_to_live() -> Result<()> {
         let live = test_live();
         let staging = StagingGraph::new(live)?;

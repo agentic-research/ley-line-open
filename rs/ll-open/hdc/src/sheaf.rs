@@ -1030,6 +1030,30 @@ mod tests {
     }
 
     #[test]
+    fn restriction_composite_empty_is_identity() {
+        // Composite([]) — empty chain should pass the input through
+        // unchanged (no iterations of the apply loop). Pin the
+        // identity element of composition so a refactor that
+        // panicked or returned ZERO_HV on the empty case fails
+        // loudly.
+        let hv = stalk_for(99);
+        let composite = Restriction::Composite(vec![]);
+        assert_eq!(composite.apply(&hv), hv);
+    }
+
+    #[test]
+    fn restriction_rotate_left_d_bits_is_identity() {
+        // `RotateLeft(D_BITS)` mods to 0 — same as Identity.
+        // Catches a refactor that dropped the `% D_BITS` shortcut
+        // and looped D_BITS-times instead.
+        let hv = stalk_for(7);
+        assert_eq!(Restriction::RotateLeft(D_BITS).apply(&hv), hv);
+        assert_eq!(Restriction::RotateLeft(D_BITS * 3).apply(&hv), hv);
+        // Zero rotation is also identity.
+        assert_eq!(Restriction::RotateLeft(0).apply(&hv), hv);
+    }
+
+    #[test]
     fn restriction_composite_chains_in_order() {
         // Composite([a, b]).apply(x) == b.apply(a.apply(x)). Pin this
         // so a future "fold from the right" refactor would fail loudly.

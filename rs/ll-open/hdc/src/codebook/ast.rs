@@ -33,6 +33,7 @@ impl AstCodebook {
     /// module owns the canonical format.
     fn signature_bytes(item: &AstNodeFingerprint) -> Vec<u8> {
         crate::codebook::canonical_signature_bytes(
+            "hdc-ast",
             item.canonical_kind,
             item.arity_bucket,
             &item.child_canonical_kinds,
@@ -42,6 +43,10 @@ impl AstCodebook {
 
 impl BaseCodebook for AstCodebook {
     type Item = AstNodeFingerprint;
+
+    fn codebook_tag(&self) -> &'static str {
+        "hdc-ast"
+    }
 
     fn base_vector(&self, item: &Self::Item) -> Hypervector {
         let bytes = Self::signature_bytes(item);
@@ -168,14 +173,19 @@ mod tests {
     #[test]
     fn signature_byte_format_pin() {
         // Pin the signature byte layout — changing it breaks every
-        // existing encoded vector. Format: kind_disc (1B), arity (1B),
-        // child_count_le (2B), sorted_child_discs (NB).
+        // existing encoded vector. Format:
+        //   tag_bytes ("hdc-ast") + 0x00 separator
+        //   + kind_disc (1B) + arity (1B) + child_count_le (2B)
+        //   + sorted_child_discs (NB).
         let f = fp(
             CanonicalKind::Stmt,         // disc=2
             3,
             &[CanonicalKind::Op, CanonicalKind::Block, CanonicalKind::Op], // discs 6, 3, 6 → sorted 3, 6, 6
         );
         let bytes = AstCodebook::signature_bytes(&f);
-        assert_eq!(bytes, vec![2u8, 3, 3, 0, 3, 6, 6]);
+        let mut expected: Vec<u8> = b"hdc-ast".to_vec();
+        expected.push(0); // tag/payload separator
+        expected.extend_from_slice(&[2u8, 3, 3, 0, 3, 6, 6]);
+        assert_eq!(bytes, expected);
     }
 }

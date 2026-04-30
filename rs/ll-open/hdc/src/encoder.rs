@@ -68,6 +68,18 @@ impl EncoderNode {
     }
 }
 
+/// Codebook-tagged cache key. Same `node` under two different codebooks
+/// (e.g. AstCodebook and ModuleCodebook) produces two distinct keys,
+/// so a shared cache cannot return one codebook's entries when queried
+/// by another. Tag prefix is hashed alongside the content hash.
+fn cache_key(node: &EncoderNode, codebook_tag: &str) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(codebook_tag.as_bytes());
+    hasher.update(b"\0"); // separator
+    hasher.update(&node.content_hash());
+    *hasher.finalize().as_bytes()
+}
+
 /// Content-hash → hypervector cache. Identical subtrees encode once;
 /// structurally-equivalent subtrees in different files re-use the same
 /// hypervector. Critical for bidi recovery — without the cache, the
@@ -124,7 +136,12 @@ pub fn encode_tree<C>(node: &EncoderNode, codebook: &C, cache: &SubtreeCache) ->
 where
     C: BaseCodebook<Item = AstNodeFingerprint>,
 {
-    let key = node.content_hash();
+    // Cache key mixes the codebook's tag into the content-hash so
+    // the same SubtreeCache can safely be shared across codebooks
+    // without one codebook's entries leaking back to another.
+    // Skeptic-review (bead 4ba0cf) caught the silent cross-poisoning
+    // bug; this closes it without changing the cache's API.
+    let key = cache_key(node, codebook.codebook_tag());
     if let Some(cached) = cache.get(&key) {
         return cached;
     }
@@ -305,6 +322,49 @@ mod tests {
         let cache = SubtreeCache::new();
         assert!(cache.is_empty());
         assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn shared_cache_does_not_cross_pollute_across_codebooks() {
+        // Skeptic-flagged bug (bead ley-line-open-4ba0cf): the
+        // SubtreeCache key was content-only, so encoding the same
+        // tree under two different codebooks would silently return
+        // the first codebook's hypervector for both calls.
+        //
+        // Fix: cache_key() mixes codebook.codebook_tag() into the
+        // hash. Same content + different tag → distinct keys.
+        //
+        // This test would have failed before the fix.
+        use crate::codebook::{AstCodebook, ModuleCodebook};
+
+        let cache = SubtreeCache::new();
+        let tree = node(
+            CanonicalKind::Block,
+            vec![leaf(CanonicalKind::Op), leaf(CanonicalKind::Lit)],
+        );
+
+        let ast = AstCodebook::new();
+        let module = ModuleCodebook::new();
+
+        let hv_ast = encode_tree(&tree, &ast, &cache);
+        let hv_module = encode_tree(&tree, &module, &cache);
+
+        // Different codebooks → different hypervectors. Without the
+        // fix, the second call would return hv_ast from the cache.
+        assert_ne!(
+            hv_ast, hv_module,
+            "shared cache must not return one codebook's HV when queried by another",
+        );
+
+        // Cache must contain BOTH entries — one per codebook — not
+        // a single entry shadowed by whichever ran first. The tree
+        // has 3 nodes (Block + 2 leaves) so each codebook contributes
+        // 3 cache entries.
+        assert_eq!(
+            cache.len(),
+            6,
+            "two codebooks × 3 nodes each = 6 distinct cache entries",
+        );
     }
 
     #[test]

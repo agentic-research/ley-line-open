@@ -23,6 +23,12 @@ use crate::util::Hypervector;
 /// set"). The AST encoder doesn't use it — AST positional encoding
 /// is via circular bit-rotation in `encoder::encode_tree`, which
 /// preserves order in a way XOR-binding can't (XOR is commutative).
+///
+/// `codebook_tag()` produces a stable identity string for the
+/// codebook. Used in subtree cache keys to prevent cross-codebook
+/// poisoning: a cache warmed by codebook A must NOT return entries
+/// when queried by codebook B even on the same input tree. Skeptic
+/// (bead 4ba0cf) caught this latent bug; the tag closes it.
 pub trait BaseCodebook: Send + Sync {
     /// What this codebook accepts. For the AST codebook it's
     /// `AstNodeFingerprint`; for module/semantic/etc. it'll be
@@ -33,6 +39,16 @@ pub trait BaseCodebook: Send + Sync {
     /// pure function of the input — same item, same vector, on
     /// every call, every machine, every version.
     fn base_vector(&self, item: &Self::Item) -> Hypervector;
+
+    /// Stable identity string for this codebook. Used as part of
+    /// subtree cache keys so a cache shared across codebooks doesn't
+    /// silently return one codebook's hypervectors when queried by
+    /// another. Must NEVER change once production data is encoded —
+    /// changing the tag invalidates every cached entry.
+    ///
+    /// Convention: lowercase, hyphen-separated, prefixed with the
+    /// crate domain (`hdc-ast`, `hdc-module`, etc.).
+    fn codebook_tag(&self) -> &'static str;
 
     /// Map a logical role to a role hypervector. Used by codebooks that
     /// need non-positional binding (e.g. layer-tagged combined view,
@@ -80,7 +96,12 @@ pub struct AstNodeFingerprint {
 /// every codebook that hashes "(kind, arity bucket, sorted child kinds)"
 /// — currently AstCodebook and ModuleCodebook. Format:
 ///
-///   `[kind_disc(1), arity_bucket(1), child_count_le(2), sorted_child_discs(N)]`
+///   `[codebook_tag, 0x00, kind_disc(1), arity_bucket(1), child_count_le(2), sorted_child_discs(N)]`
+///
+/// The codebook tag prefix is what makes ModuleCodebook's base_vector
+/// distinct from AstCodebook's for the same fingerprint — without it,
+/// both codebooks produce IDENTICAL hypervectors per fingerprint (per
+/// skeptic-review bead 4bb8a0; same fix as the cache_key issue).
 ///
 /// The length prefix prevents `(k, [])` from colliding with `(k, [k])`
 /// (both would otherwise hash to the same bytes if a sub-pattern crosses
@@ -90,11 +111,14 @@ pub struct AstNodeFingerprint {
 /// CHANGING THIS BREAKS EVERY ENCODED HYPERVECTOR. Bump a layer's seed
 /// tag if you need to migrate, don't silently rewrite the format.
 pub fn canonical_signature_bytes(
+    codebook_tag: &str,
     kind: crate::canonical::CanonicalKind,
     arity_bucket: u8,
     child_kinds: &[crate::canonical::CanonicalKind],
 ) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(4 + child_kinds.len());
+    let mut buf = Vec::with_capacity(codebook_tag.len() + 5 + child_kinds.len());
+    buf.extend_from_slice(codebook_tag.as_bytes());
+    buf.push(0u8); // separator between tag and structural payload
     buf.push(kind.discriminant());
     buf.push(arity_bucket);
     let len = child_kinds.len() as u16;

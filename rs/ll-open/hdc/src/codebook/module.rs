@@ -54,6 +54,7 @@ impl ModuleCodebook {
     fn header_signature_bytes(node: &EncoderNode) -> Vec<u8> {
         let child_kinds: Vec<_> = node.children.iter().map(|c| c.canonical_kind).collect();
         crate::codebook::canonical_signature_bytes(
+            "hdc-module",
             node.canonical_kind,
             bucket_arity(node.children.len()),
             &child_kinds,
@@ -69,14 +70,19 @@ impl ModuleCodebook {
 impl BaseCodebook for ModuleCodebook {
     type Item = AstNodeFingerprint;
 
+    fn codebook_tag(&self) -> &'static str {
+        "hdc-module"
+    }
+
     fn base_vector(&self, item: &Self::Item) -> Hypervector {
         // Shares the canonical signature byte layout with AstCodebook
-        // so a single fingerprint maps to a single deterministic
-        // vector. The difference between AST and Module behavior
-        // comes from what's INSIDE the fingerprint: AST builds it
-        // from a recursive subtree, Module builds it from one decl's
-        // header (no body).
+        // but uses the "hdc-module" tag so the resulting hypervector
+        // is distinct from AstCodebook's even on the same fingerprint.
+        // (Skeptic-review bead 4bb8a0: identical base_vector across
+        // codebooks would mean ModuleCodebook silently produces
+        // AstCodebook output via encode_tree.)
         let buf = crate::codebook::canonical_signature_bytes(
+            "hdc-module",
             item.canonical_kind,
             item.arity_bucket,
             &item.child_canonical_kinds,

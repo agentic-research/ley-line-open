@@ -21,6 +21,7 @@ pub mod canonical;
 pub mod codebook;
 pub mod encoder;
 pub mod schema;
+pub mod sql_udf;
 pub mod util;
 
 pub use encoder::{encode_fresh, encode_tree, EncoderNode, SubtreeCache};

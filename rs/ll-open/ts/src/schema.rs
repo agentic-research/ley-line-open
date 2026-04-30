@@ -343,6 +343,42 @@ mod tests {
     }
 
     #[test]
+    fn sweep_orphaned_dirs_handles_deep_nesting() {
+        // Scale-problem pin. sweep_orphaned_dirs runs DELETE in a
+        // loop until no rows are removed — depth-N nesting needs N
+        // iterations because each pass only deletes the
+        // currently-leaf dirs. Helm-charts ingest sweeps 2k+ orphan
+        // dirs across many depths; a 50k-file registry repo could
+        // hit depth 20+. Pin: a 30-deep chain terminates and removes
+        // all 30 orphan dirs in one call. A refactor that capped
+        // iterations or used a single non-recursive DELETE would
+        // leave deep orphans behind.
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_schema(&conn).unwrap();
+
+        // Build a deeply-nested chain: ""→d0→d0/d1→...→d0/.../d29→file.
+        insert_node(&conn, "", "", "", 1, 0, 0, "").unwrap();
+        let mut current = String::new();
+        for i in 0..30 {
+            let parent = current.clone();
+            current = if i == 0 { format!("d{i}") } else { format!("{current}/d{i}") };
+            insert_node(&conn, &current, &parent, &format!("d{i}"), 1, 0, 0, "").unwrap();
+        }
+        let file_id = format!("{current}/leaf.go");
+        insert_node(&conn, &file_id, &current, "leaf.go", 1, 0, 0, "").unwrap();
+
+        // Delete the file — every dir in the chain is now orphaned.
+        conn.execute("DELETE FROM nodes WHERE id = ?1", [&file_id]).unwrap();
+
+        let removed = sweep_orphaned_dirs(&conn).unwrap();
+        assert_eq!(removed, 30, "must sweep all 30 nested dirs");
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 1, "only root node should remain");
+    }
+
+    #[test]
     fn sweep_orphaned_dirs_removes_empty_parents() {
         let conn = Connection::open_in_memory().unwrap();
         create_ast_schema(&conn).unwrap();

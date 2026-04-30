@@ -140,6 +140,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pass_status_default_is_all_none() {
+        // PassStatus uses #[derive(Default)] — all three Option
+        // fields must start as None. enrichment.rs:188 calls
+        // or_insert_with(PassStatus::default) on first run of any
+        // pass; a refactor that hand-rolled Default with phantom
+        // values (e.g. last_run_at_ms: Some(0)) would silently make
+        // every pass appear to have run before it actually did.
+        let s = PassStatus::default();
+        assert!(s.last_run_at_ms.is_none());
+        assert!(s.basis.is_none());
+        assert!(s.error.is_none());
+    }
+
+    #[test]
     fn daemon_state_initializing_factory_contract() {
         // DaemonState::initializing() is the canonical "fresh daemon"
         // factory — used at startup (cmd_daemon) and in fixtures

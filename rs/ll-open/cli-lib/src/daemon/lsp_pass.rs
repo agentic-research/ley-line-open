@@ -258,20 +258,15 @@ mod tests {
 
     #[test]
     fn lsp_enrichment_pass_trait_metadata_pin() {
-        // Sister pin to tree_sitter_pass_trait_metadata_pin and
-        // embedding_pass_trait_metadata_pin. resolve_order keys on
-        // name() and depends_on() — drift breaks dep resolution
-        // silently. The 5 _lsp* tables in writes() are the
-        // schema-partition contract: enrichment passes own disjoint
-        // table sets, and dropping one here while a refactor
-        // simultaneously renamed the schema would silently bypass
-        // the basis-bump for that table.
-        let pass = LspEnrichmentPass;
-        assert_eq!(pass.name(), "lsp");
-        assert_eq!(pass.depends_on(), &["tree-sitter"]);
-        assert_eq!(pass.reads(), &["_source", "_ast", "nodes"]);
-        assert_eq!(
-            pass.writes(),
+        // Third in the EnrichmentPass-metadata triplet. resolve_order
+        // keys on name + depends_on; drift breaks dep resolution
+        // silently. The 5 _lsp* tables in writes are the schema-
+        // partition contract.
+        crate::daemon::enrichment::assert_pass_metadata(
+            &LspEnrichmentPass,
+            "lsp",
+            &["tree-sitter"],
+            &["_source", "_ast", "nodes"],
             &["_lsp", "_lsp_defs", "_lsp_refs", "_lsp_hover", "_lsp_completions"],
         );
     }

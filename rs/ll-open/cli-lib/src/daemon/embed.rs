@@ -434,11 +434,9 @@ mod tests {
 
     #[test]
     fn embedding_pass_trait_metadata_pin() {
-        // EmbeddingPass advertises its name + dependency + reads/writes
-        // through the EnrichmentPass trait. resolve_order keys on
-        // these strings; a typo (e.g. "tree_sitter" with underscore
-        // vs hyphen) would silently break dep resolution and the
-        // pass would never run. Pin all four metadata methods.
+        // EmbeddingPass writes via sidecar VectorIndex (not living db),
+        // so writes() is empty. Pin via the shared assert_pass_metadata
+        // helper so the EnrichmentPass-metadata triplet stays uniform.
         let pass = EmbeddingPass::new(
             Arc::new({
                 register_vec();
@@ -446,10 +444,13 @@ mod tests {
             }),
             Arc::new(ZeroEmbedder { dim: 4 }),
         );
-        assert_eq!(pass.name(), "embed");
-        assert_eq!(pass.depends_on(), &["tree-sitter"]);
-        assert_eq!(pass.reads(), &["nodes", "_source"]);
-        assert!(pass.writes().is_empty(), "embed pass writes via sidecar, not living db");
+        crate::daemon::enrichment::assert_pass_metadata(
+            &pass,
+            "embed",
+            &["tree-sitter"],
+            &["nodes", "_source"],
+            &[],
+        );
     }
 
     /// Set up a minimal living-db with a couple of file nodes, then run

@@ -67,6 +67,27 @@ pub trait EnrichmentPass: Send + Sync {
     ) -> Result<EnrichmentStats>;
 }
 
+/// Test-helper: assert an `EnrichmentPass` reports the expected
+/// `(name, depends_on, reads, writes)` metadata. resolve_order keys
+/// on `name` and `depends_on`; drift between the two breaks dep
+/// resolution silently. The `writes` set is the schema-partition
+/// contract — losing or renaming a table here while the schema
+/// simultaneously renamed it would silently bypass that table's
+/// basis-bump. Used by every pass's metadata pin.
+#[cfg(test)]
+pub fn assert_pass_metadata(
+    pass: &dyn EnrichmentPass,
+    name: &str,
+    depends_on: &[&str],
+    reads: &[&str],
+    writes: &[&str],
+) {
+    assert_eq!(pass.name(), name, "pass name drifted");
+    assert_eq!(pass.depends_on(), depends_on, "{name}: depends_on drifted");
+    assert_eq!(pass.reads(), reads, "{name}: reads drifted");
+    assert_eq!(pass.writes(), writes, "{name}: writes drifted");
+}
+
 // ---------------------------------------------------------------------------
 // Pipeline executor
 // ---------------------------------------------------------------------------
@@ -366,19 +387,13 @@ mod tests {
     #[test]
     fn tree_sitter_pass_trait_metadata_pin() {
         // The base TreeSitterPass advertises name="tree-sitter" — the
-        // string EmbeddingPass.depends_on cites. Drift here breaks
-        // dep resolution silently. Pin name + writes-table-list so a
-        // refactor that renamed a table or the pass would surface.
-        let pass = TreeSitterPass;
-        assert_eq!(pass.name(), "tree-sitter");
-        // Default depends_on returns &[] — TreeSitterPass has no deps.
-        assert!(pass.depends_on().is_empty());
-        // reads is &[] — TreeSitterPass reads source files, not db tables.
-        assert!(pass.reads().is_empty());
-        // writes covers the 7 living-db tables the parser populates;
-        // a refactor that dropped or renamed any would surface.
-        assert_eq!(
-            pass.writes(),
+        // string EmbeddingPass + LspEnrichmentPass.depends_on cite.
+        // Drift breaks dep resolution silently.
+        assert_pass_metadata(
+            &TreeSitterPass,
+            "tree-sitter",
+            &[],
+            &[], // reads source files, not db tables
             &["nodes", "_ast", "_source", "node_refs", "node_defs", "_imports", "_file_index"],
         );
     }

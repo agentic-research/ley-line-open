@@ -249,6 +249,36 @@ mod tests {
     }
 
     #[test]
+    fn simhash_signs_thresholds_at_zero_inclusive() {
+        // simhash_signs sets bit i iff dot(plane_i) >= 0. The >= 0
+        // (not strict >) is the load-bearing convention shared with
+        // `project_zero_embedding_yields_all_ones`. Encode the bit
+        // index in plane[0] so the closure (which is `Fn`) can read
+        // it without interior mutability.
+        // plane[0] = i as f32; closure returns sign based on i:
+        //   i < 100   → +1.0 (set)
+        //   100..200  → 0.0  (set, by >= 0 convention)
+        //   i >= 200  → -1.0 (clear)
+        let hyperplanes: Vec<Vec<f32>> = (0..D_BITS).map(|i| vec![i as f32]).collect();
+        let signs = simhash_signs(&hyperplanes, |plane| {
+            let i = plane[0] as usize;
+            if i < 100 {
+                1.0
+            } else if i < 200 {
+                0.0
+            } else {
+                -1.0
+            }
+        });
+        // Bit 50 (positive) → 1
+        assert_eq!((signs[50 / 8] >> (50 % 8)) & 1, 1);
+        // Bit 150 (exactly 0, >= 0 → positive in our convention) → 1
+        assert_eq!((signs[150 / 8] >> (150 % 8)) & 1, 1);
+        // Bit 300 (negative) → 0
+        assert_eq!((signs[300 / 8] >> (300 % 8)) & 1, 0);
+    }
+
+    #[test]
     fn ast_node_fingerprint_leaf_has_zero_arity_no_children() {
         // Pin the leaf constructor's contract: arity=0, empty child
         // vec, exact kind preserved. Catches a refactor that

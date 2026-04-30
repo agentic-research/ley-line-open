@@ -160,6 +160,19 @@ mod tests {
     }
 
     #[test]
+    fn project_zero_embedding_yields_all_ones_per_simhash_convention() {
+        // Zero embedding has zero dot product against every
+        // hyperplane; sign(0) is non-negative in our convention so
+        // all bits set to 1. Mirrors `temporal::project_empty_row_
+        // yields_balanced_zero_dot` for the dense path.
+        let cb = SemanticCodebook::new(16);
+        let zero_emb: Vec<f32> = vec![0.0; 16];
+        let hv = cb.project(&zero_emb);
+        let ones: u32 = hv.iter().map(|b| b.count_ones()).sum();
+        assert_eq!(ones as usize, D_BITS, "zero-embedding must produce all-1 HV");
+    }
+
+    #[test]
     fn project_dim_mismatch_returns_zero_hv() {
         // Wrong dimension → log + return ZERO_HV, no panic. A daemon
         // mid-query shouldn't crash on a single bad embedding.

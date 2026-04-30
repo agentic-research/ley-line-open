@@ -2,6 +2,8 @@
 
 #[cfg(feature = "vec")]
 pub mod embed;
+#[cfg(feature = "hdc")]
+pub mod hdc_pass;
 pub mod enrichment;
 pub mod ext;
 pub mod events;

@@ -312,6 +312,24 @@ mod tests {
         Ok(conn)
     }
 
+    #[test]
+    fn zero_embedder_returns_zero_vec_of_dim() -> Result<()> {
+        // ZeroEmbedder is the public-shipping default. Pin its three
+        // contract pieces directly (the EmbeddingPass integration test
+        // exercises them transitively, but doesn't pin them). A
+        // refactor that introduced a non-zero "padding" vector or
+        // varied output by input text would shift every default-
+        // shipped embedding silently.
+        let e = ZeroEmbedder { dim: 7 };
+        assert_eq!(e.dimensions(), 7);
+        let v = e.embed("any text whatsoever")?;
+        assert_eq!(v.len(), 7, "output length must match dimensions()");
+        assert!(v.iter().all(|&x| x == 0.0), "output must be all zeros");
+        // Different inputs produce the same output (text-independent).
+        assert_eq!(e.embed("")?, e.embed("different content")?);
+        Ok(())
+    }
+
     // ── Priority counter invariants ────────────────────────────────────
     //
     // These tests establish that promote() ordering is wall-clock-independent

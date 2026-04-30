@@ -191,13 +191,8 @@ where
 {
     use crate::util::{popcount_distance, ZERO_HV};
 
-    let leaf_base = |kind: crate::canonical::CanonicalKind| {
-        codebook.base_vector(&AstNodeFingerprint {
-            canonical_kind: kind,
-            arity_bucket: 0,
-            child_canonical_kinds: Vec::new(),
-        })
-    };
+    let leaf_base =
+        |kind: crate::canonical::CanonicalKind| codebook.base_vector(&AstNodeFingerprint::leaf(kind));
 
     let parent_fp = AstNodeFingerprint {
         canonical_kind: centroid_root_kind,
@@ -415,16 +410,8 @@ mod tests {
         use crate::util::rotate_left;
         let cb = AstCodebook::new();
         let parent_base = expand_seed(0xBA5E);
-        let child0 = cb.base_vector(&AstNodeFingerprint {
-            canonical_kind: crate::canonical::CanonicalKind::Op,
-            arity_bucket: 0,
-            child_canonical_kinds: vec![],
-        });
-        let child1 = cb.base_vector(&AstNodeFingerprint {
-            canonical_kind: crate::canonical::CanonicalKind::Lit,
-            arity_bucket: 0,
-            child_canonical_kinds: vec![],
-        });
+        let child0 = cb.base_vector(&AstNodeFingerprint::leaf(crate::canonical::CanonicalKind::Op));
+        let child1 = cb.base_vector(&AstNodeFingerprint::leaf(crate::canonical::CanonicalKind::Lit));
 
         // Build parent the way the encoder would.
         let mut parent = parent_base;
@@ -682,11 +669,7 @@ mod tests {
         use crate::canonical::CanonicalKind;
         let cb = AstCodebook::new();
         let candidate_kinds = [CanonicalKind::Lit, CanonicalKind::Op];
-        let centroid = cb.base_vector(&AstNodeFingerprint {
-            canonical_kind: CanonicalKind::Lit,
-            arity_bucket: 0,
-            child_canonical_kinds: vec![],
-        });
+        let centroid = cb.base_vector(&AstNodeFingerprint::leaf(CanonicalKind::Lit));
         let recovered = explain_cluster_centroid(
             &centroid,
             CanonicalKind::Lit,

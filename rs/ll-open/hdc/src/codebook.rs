@@ -99,6 +99,21 @@ pub struct AstNodeFingerprint {
     pub child_canonical_kinds: Vec<CanonicalKind>,
 }
 
+impl AstNodeFingerprint {
+    /// Construct a leaf-node fingerprint: zero arity, no children.
+    /// Replaces the verbatim `AstNodeFingerprint { kind, 0, vec![] }`
+    /// pattern that was duplicated across multiple call sites
+    /// (4 in query.rs alone). Stable shape — used by cleanup-memory
+    /// to probe for "what kind would a leaf at this position be".
+    pub fn leaf(kind: CanonicalKind) -> Self {
+        Self {
+            canonical_kind: kind,
+            arity_bucket: 0,
+            child_canonical_kinds: Vec::new(),
+        }
+    }
+}
+
 /// Canonical byte layout for a node's structural signature, used by
 /// every codebook that hashes "(kind, arity bucket, sorted child kinds)"
 /// — currently AstCodebook and ModuleCodebook. Format:
@@ -185,6 +200,37 @@ pub fn build_hyperplane_matrix(seed_tag: &str, width: usize) -> Vec<Vec<f32>> {
         hyperplanes.push(crate::codebook::semantic::gaussian_row(row_seed, width));
     }
     hyperplanes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ast_node_fingerprint_leaf_has_zero_arity_no_children() {
+        // Pin the leaf constructor's contract: arity=0, empty child
+        // vec, exact kind preserved. Catches a refactor that
+        // accidentally promoted leaf to "1 child of itself" or some
+        // other clever shortcut that would shift the produced
+        // base_vector.
+        let fp = AstNodeFingerprint::leaf(CanonicalKind::Lit);
+        assert_eq!(fp.canonical_kind, CanonicalKind::Lit);
+        assert_eq!(fp.arity_bucket, 0);
+        assert!(fp.child_canonical_kinds.is_empty());
+
+        // Equivalence with the literal struct construction it replaces:
+        let manual = AstNodeFingerprint {
+            canonical_kind: CanonicalKind::Op,
+            arity_bucket: 0,
+            child_canonical_kinds: vec![],
+        };
+        let via_helper = AstNodeFingerprint::leaf(CanonicalKind::Op);
+        // Vec<CanonicalKind> doesn't impl PartialEq directly via derive
+        // (the enum does), so compare fields explicitly.
+        assert_eq!(manual.canonical_kind, via_helper.canonical_kind);
+        assert_eq!(manual.arity_bucket, via_helper.arity_bucket);
+        assert_eq!(manual.child_canonical_kinds, via_helper.child_canonical_kinds);
+    }
 }
 
 pub mod ast;

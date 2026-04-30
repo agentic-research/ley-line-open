@@ -343,6 +343,34 @@ mod tests {
     }
 
     #[test]
+    fn read_file_index_handles_thousand_entries() {
+        // Scale-problem pin. read_file_index loads ALL _file_index
+        // rows into a HashMap at once — at 50k files (a registry-
+        // sized repo) this is ~3 MB held in memory per call. The
+        // existing roundtrip test covers 2 entries, which can't catch
+        // a refactor that introduced a LIMIT, an early break, or a
+        // chunked read that silently dropped the tail. Pin: 1000
+        // entries round-trip identity (a refactor stopping at
+        // SQLite's default page-size boundary would catch here).
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_schema(&conn).unwrap();
+        create_refs_schema(&conn).unwrap();
+        create_index_schema(&conn).unwrap();
+
+        for i in 0..1000 {
+            upsert_file_index(&conn, &format!("path/{i:04}.go"), i as i64, (i * 7) as i64)
+                .unwrap();
+        }
+
+        let index = read_file_index(&conn).unwrap();
+        assert_eq!(index.len(), 1000, "must read every row, no truncation");
+        // Spot-check the first, middle, and last entries.
+        assert_eq!(index["path/0000.go"], (0, 0));
+        assert_eq!(index["path/0500.go"], (500, 500 * 7));
+        assert_eq!(index["path/0999.go"], (999, 999 * 7));
+    }
+
+    #[test]
     fn sweep_orphaned_dirs_handles_deep_nesting() {
         // Scale-problem pin. sweep_orphaned_dirs runs DELETE in a
         // loop until no rows are removed — depth-N nesting needs N

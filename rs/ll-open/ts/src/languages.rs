@@ -120,3 +120,54 @@ impl TsLanguage {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_extension_pins_alias_sets() {
+        // Scale-problem pin. The extension-set choices are load-bearing
+        // for registry-style ingest: a 50k-file Aports clone uses
+        // "yaml" but third-party tooling/conventions may write "yml".
+        // Dropping either alias (or losing case-insensitivity) would
+        // silently skip files at parse time. Existing parse paths
+        // exercise the function but never pin the alias mappings
+        // directly. Pin every alias set.
+        #[cfg(feature = "yaml")]
+        {
+            assert_eq!(TsLanguage::from_extension("yaml"), Some(TsLanguage::Yaml));
+            assert_eq!(TsLanguage::from_extension("yml"), Some(TsLanguage::Yaml));
+            // Case-insensitive: APK packages occasionally land .YAML.
+            assert_eq!(TsLanguage::from_extension("YAML"), Some(TsLanguage::Yaml));
+        }
+        #[cfg(feature = "markdown")]
+        {
+            assert_eq!(TsLanguage::from_extension("md"), Some(TsLanguage::Markdown));
+            assert_eq!(TsLanguage::from_extension("markdown"), Some(TsLanguage::Markdown));
+        }
+        #[cfg(feature = "json")]
+        assert_eq!(TsLanguage::from_extension("json"), Some(TsLanguage::Json));
+        #[cfg(feature = "html")]
+        {
+            assert_eq!(TsLanguage::from_extension("html"), Some(TsLanguage::Html));
+            assert_eq!(TsLanguage::from_extension("htm"), Some(TsLanguage::Html));
+        }
+        #[cfg(feature = "go")]
+        assert_eq!(TsLanguage::from_extension("go"), Some(TsLanguage::Go));
+        #[cfg(feature = "python")]
+        {
+            assert_eq!(TsLanguage::from_extension("py"), Some(TsLanguage::Python));
+            assert_eq!(TsLanguage::from_extension("pyi"), Some(TsLanguage::Python));
+        }
+        #[cfg(feature = "elixir")]
+        {
+            assert_eq!(TsLanguage::from_extension("ex"), Some(TsLanguage::Elixir));
+            assert_eq!(TsLanguage::from_extension("exs"), Some(TsLanguage::Elixir));
+        }
+
+        // Unknown extension → None, never default to one language.
+        assert_eq!(TsLanguage::from_extension("unknown_lang_ext"), None);
+        assert_eq!(TsLanguage::from_extension(""), None);
+    }
+}

@@ -285,6 +285,53 @@ mod tests {
     }
 
     #[test]
+    fn xor_into_zero_is_identity() {
+        // XOR with the zero vector preserves the input — the additive
+        // identity element of GF(2)^D. Pin so a refactor that
+        // accidentally normalized inputs (e.g. flipped bits in the
+        // zero pad) would catch the change.
+        let a = expand_seed(0xCAFE);
+        let mut hv = a;
+        xor_into(&mut hv, &ZERO_HV);
+        assert_eq!(hv, a);
+    }
+
+    #[test]
+    fn xor_into_self_yields_zero() {
+        // A XOR A = 0 — the load-bearing collapse property used by
+        // bundle-cancellation tests across the crate.
+        let a = expand_seed(0xBEEF);
+        let mut hv = a;
+        xor_into(&mut hv, &a);
+        assert_eq!(hv, ZERO_HV);
+    }
+
+    #[test]
+    fn popcount_distance_is_symmetric() {
+        // d(a, b) == d(b, a). Pin so a refactor that, say, compared
+        // `a` and `b` differently (e.g. masked one before XOR) would
+        // produce asymmetric distances and fail this.
+        let a = expand_seed(11);
+        let b = expand_seed(22);
+        assert_eq!(popcount_distance(&a, &b), popcount_distance(&b, &a));
+    }
+
+    #[test]
+    fn popcount_distance_self_is_zero() {
+        // d(a, a) == 0 for any a, not just ZERO_HV. The existing
+        // `popcount_distance_zero_to_zero_is_zero` only covered the
+        // zero case.
+        for seed in [1u64, 0x42, 0xCAFE_BABE, u64::MAX] {
+            let a = expand_seed(seed);
+            assert_eq!(
+                popcount_distance(&a, &a),
+                0,
+                "self-distance must be 0 for seed {seed:#x}"
+            );
+        }
+    }
+
+    #[test]
     fn popcount_distance_zero_to_zero_is_zero() {
         let z = ZERO_HV;
         assert_eq!(popcount_distance(&z, &z), 0);

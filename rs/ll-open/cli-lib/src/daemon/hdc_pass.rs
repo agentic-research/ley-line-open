@@ -471,7 +471,6 @@ mod tests {
                 &[CanonicalKind::Decl, CanonicalKind::Decl],
                 &cb,
                 &candidate_kinds,
-                2,
             );
 
             assert_eq!(

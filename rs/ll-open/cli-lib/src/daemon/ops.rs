@@ -542,22 +542,17 @@ fn op_list_children(ctx: &DaemonContext, req: &serde_json::Value) -> Result<Stri
     Ok(response.0)
 }
 
-/// Read a node's content (the `record` column).
+/// Read a node's content (the `record` column). Returns
+/// `node_not_found_response` for both "no such node" and "node exists but
+/// record is NULL" — the helper handles that distinction so all node-by-
+/// id lookups share a single semantics.
 fn op_read_content(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
     let id = required_str_field(req, "id")?;
     promote_touched(ctx, &[id]);
 
-    with_live_db(ctx, |conn| {
-        let content = query_row_opt(
-            conn,
-            "SELECT record FROM nodes WHERE id = ?1",
-            [id],
-            |row| row.get::<_, String>(0),
-        )?;
-        match content {
-            Some(c) => Ok(json!({"ok": true, "content": c}).to_string()),
-            None => Ok(node_not_found_response(id)),
-        }
+    with_live_db(ctx, |conn| match query_node_record(conn, id)? {
+        Some(c) => Ok(json!({"ok": true, "content": c}).to_string()),
+        None => Ok(node_not_found_response(id)),
     })
 }
 
@@ -686,6 +681,25 @@ where
 /// matching.
 fn node_not_found_response(id: &str) -> String {
     json!({"ok": false, "error": format!("node '{id}' not found")}).to_string()
+}
+
+/// Fetch the `record` column for a node id. Returns `Ok(None)` for both
+/// "no such row" and "row exists but record is NULL" — they're equivalent
+/// from a "no content available" client perspective. SQL errors (broken
+/// connection, type mismatch, etc.) propagate as `Err`.
+///
+/// Single source of truth for the `SELECT record FROM nodes WHERE id = ?1`
+/// query. Used by `op_read_content` and the embed drain loop. Without this
+/// helper the two diverged: `op_read_content` errored on NULL records and
+/// the embed loop swallowed all SQL errors via `.ok().flatten()`.
+pub(crate) fn query_node_record(conn: &Connection, id: &str) -> Result<Option<String>> {
+    let row: Option<Option<String>> = query_row_opt(
+        conn,
+        "SELECT record FROM nodes WHERE id = ?1",
+        [id],
+        |row| row.get::<_, Option<String>>(0),
+    )?;
+    Ok(row.flatten())
 }
 
 /// Parse file + line + col from request. File can be a path or file:// URI.
@@ -1515,6 +1529,45 @@ mod tests {
         assert!(
             r.is_err(),
             "type-mismatch in mapper must propagate as Err, got: {r:?}",
+        );
+    }
+
+    #[test]
+    fn query_node_record_handles_missing_node_and_null_record() {
+        // Single source of truth for "no record available." Exercise both
+        // states callers care about:
+        //   - row absent → Ok(None)
+        //   - row present, record IS NULL → Ok(None) (NOT Err)
+        //   - row present, record is non-empty → Ok(Some(_))
+        // op_read_content used to error on NULL records (mapper asked
+        // for non-nullable String); the embed drain handled NULL via
+        // Option<String> mapper. Centralizing here unifies behavior.
+        let conn = Connection::open_in_memory().unwrap();
+        leyline_schema::create_schema(&conn).unwrap();
+        leyline_schema::insert_node(&conn, "n_with", "", "n_with", 1, 0, 0, "hello").unwrap();
+        // Row with record IS NULL — bypass insert_node since it always
+        // takes a non-null record. Use a direct UPDATE.
+        leyline_schema::insert_node(&conn, "n_null", "", "n_null", 1, 0, 0, "x").unwrap();
+        conn.execute("UPDATE nodes SET record = NULL WHERE id = 'n_null'", [])
+            .unwrap();
+
+        assert_eq!(query_node_record(&conn, "n_with").unwrap(), Some("hello".to_string()));
+        assert_eq!(query_node_record(&conn, "n_null").unwrap(), None);
+        assert_eq!(query_node_record(&conn, "n_missing").unwrap(), None);
+    }
+
+    #[test]
+    fn query_node_record_propagates_sql_errors() {
+        // Drift guard: if `nodes` table doesn't exist (caller has the
+        // wrong connection / pre-schema), the helper must surface the
+        // error rather than silently return None. embed.rs previously
+        // did `.ok().flatten()` which swallowed every SQL failure into
+        // a no-op skip — now SQL errors are visible to the caller.
+        let conn = Connection::open_in_memory().unwrap();
+        let r = query_node_record(&conn, "any-id");
+        assert!(
+            r.is_err(),
+            "missing nodes table must propagate as Err, got {r:?}",
         );
     }
 

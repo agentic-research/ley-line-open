@@ -251,13 +251,16 @@ pub fn start_drain(ctx: Arc<DaemonContext>) {
                             poisoned.into_inner()
                         }
                     };
-                    conn.query_row(
-                        "SELECT record FROM nodes WHERE id = ?1",
-                        [&task.node_id],
-                        |r| r.get::<_, Option<String>>(0),
-                    )
-                    .ok()
-                    .flatten()
+                    match crate::daemon::ops::query_node_record(&conn, &task.node_id) {
+                        Ok(opt) => opt,
+                        Err(e) => {
+                            // Don't silently skip every task forever if the
+                            // connection's broken — surface the error so
+                            // operators can investigate.
+                            log::warn!("embed drain: failed to read record for {}: {e:#}", task.node_id);
+                            continue;
+                        }
+                    }
                 };
                 let Some(content) = content else { continue };
                 if content.is_empty() {

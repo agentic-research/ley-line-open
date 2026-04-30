@@ -300,6 +300,40 @@ mod tests {
     }
 
     #[test]
+    fn popcount_xor_handles_non_8_aligned_blobs() {
+        // The UDF processes 8-byte chunks via u64::count_ones, then
+        // a per-byte remainder loop for any leftover. D_BYTES=1024 is
+        // divisible by 8 so production never enters the remainder
+        // branch — but the SQL UDF is callable on arbitrary equal-
+        // length blobs. Pin the remainder path so a refactor that
+        // dropped it (or mismatched the iterator zip) would surface
+        // when called from custom SQL on a small blob.
+        let conn = fixture_conn();
+        // 7 bytes: pure remainder path, no chunk loop iterations.
+        // a = 0b10101010 0xFF 0x00 ... → set bits in different positions
+        // b = 0b01010101 0x00 0xFF ... → flipped pattern
+        let a: Vec<u8> = vec![0b1010_1010, 0xFF, 0x00, 0x33, 0x55, 0xAA, 0x80];
+        let b: Vec<u8> = vec![0b0101_0101, 0x00, 0xFF, 0x33, 0x00, 0xAA, 0x7F];
+        // XOR per byte, popcount per byte:
+        //   0xFF=8, 0xFF=8, 0xFF=8, 0x00=0, 0x55=4, 0x00=0, 0xFF=8 → 36
+        let expected: i64 = a.iter().zip(&b).map(|(&x, &y)| (x ^ y).count_ones() as i64).sum();
+        let d: i64 = conn
+            .query_row("SELECT popcount_xor(?1, ?2)", (a, b), |r| r.get(0))
+            .unwrap();
+        assert_eq!(d, expected, "remainder-only path must produce correct popcount");
+
+        // 9 bytes: one full u64 chunk + 1 byte remainder. Exercises
+        // the boundary between chunk-loop and remainder-loop.
+        let a9: Vec<u8> = vec![0xAA; 9];
+        let b9: Vec<u8> = vec![0x55; 9];
+        let expected9: i64 = a9.iter().zip(&b9).map(|(&x, &y)| (x ^ y).count_ones() as i64).sum();
+        let d9: i64 = conn
+            .query_row("SELECT popcount_xor(?1, ?2)", (a9, b9), |r| r.get(0))
+            .unwrap();
+        assert_eq!(d9, expected9, "chunk + remainder must produce correct popcount");
+    }
+
+    #[test]
     fn popcount_xor_length_mismatch_errors() {
         let conn = fixture_conn();
         let short = vec![0u8; 16];

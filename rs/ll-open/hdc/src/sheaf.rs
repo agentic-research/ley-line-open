@@ -1046,6 +1046,27 @@ mod tests {
     // -- Boolean Heyting algebra: restriction maps + propagation -----
 
     #[test]
+    fn hv_edge_identity_constructor_pins_both_restrictions() {
+        // HvEdge::identity is widely used (12+ call sites) on the
+        // assumption that BOTH restrict_source and restrict_target
+        // default to Restriction::Identity. Existing tests cover the
+        // behavior end-to-end (edge_hamming returns the un-rotated
+        // popcount), but never pin the constructor's contract directly.
+        // A refactor that defaulted one endpoint to RotateLeft(0)
+        // (still equivalent to Identity but a different variant) would
+        // pass behavior tests yet break PartialEq-based equality
+        // assertions and serialization. Pin the variant.
+        let edge = HvEdge::identity("a", "b", EdgeKind::Sibling, LayerKind::Ast);
+        assert_eq!(edge.restrict_source, Restriction::Identity);
+        assert_eq!(edge.restrict_target, Restriction::Identity);
+        // Other fields echoed verbatim:
+        assert_eq!(edge.source, "a");
+        assert_eq!(edge.target, "b");
+        assert_eq!(edge.kind, EdgeKind::Sibling);
+        assert_eq!(edge.layer, LayerKind::Ast);
+    }
+
+    #[test]
     fn restriction_default_is_identity() {
         // The `#[default]` annotation on the enum picks `Identity`.
         // That's the safe default — applying `Restriction::default()`

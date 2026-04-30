@@ -125,6 +125,23 @@ mod tests {
     const DISTINCT_DISTANCE_LOWER: f64 = 0.35;
 
     #[test]
+    fn parse_and_encode_tree_handles_empty_source() {
+        // Empty source isn't malformed for tree-sitter — it parses to
+        // a source_file (Block) with zero children. parse_and_encode_
+        // tree should therefore return Some with a leaf-shaped tree,
+        // not None. Pin the boundary so a refactor that started
+        // rejecting empty input as "no parseable content" would
+        // surface immediately. Daemons reparsing on file deletion
+        // (file goes from full source to empty before unlink) should
+        // not crash.
+        let lang = leyline_ts::languages::TsLanguage::Go.ts_language();
+        let result = parse_and_encode_tree("", &lang, &GoCanonicalMap);
+        let tree = result.expect("empty Go source must parse to Some");
+        assert_eq!(tree.canonical_kind, CanonicalKind::Block);
+        assert!(tree.children.is_empty(), "empty source must yield no named children");
+    }
+
+    #[test]
     fn tree_to_encoder_node_filters_anonymous_children() {
         // tree_to_encoder_node has `if child.is_named()` on line 28 —
         // anonymous tokens (braces, parens, keyword tokens like

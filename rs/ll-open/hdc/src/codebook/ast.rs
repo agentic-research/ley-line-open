@@ -14,7 +14,7 @@ use crate::codebook::{AstNodeFingerprint, BaseCodebook};
 use crate::canonical::CanonicalKind;
 #[cfg(test)]
 use crate::util::assert_far_apart;
-use crate::util::{blake3_seed, expand_seed, Hypervector};
+use crate::util::{bytes_to_hv, Hypervector};
 
 /// Default AST codebook. Stateless — same input always produces same
 /// output, no per-instance state to ship between machines.
@@ -49,9 +49,7 @@ impl BaseCodebook for AstCodebook {
     }
 
     fn base_vector(&self, item: &Self::Item) -> Hypervector {
-        let bytes = Self::signature_bytes(item);
-        let seed = blake3_seed(&bytes);
-        expand_seed(seed)
+        bytes_to_hv(&Self::signature_bytes(item))
     }
 
     // role_vector: uses the trait default (codebook_tag + "-role").

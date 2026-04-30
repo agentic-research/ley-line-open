@@ -21,7 +21,7 @@
 use crate::codebook::{AstNodeFingerprint, BaseCodebook};
 use crate::encoder::EncoderNode;
 use crate::util::{
-    bucket_arity, expand_seed, popcount_distance, rotate_left, xor_into,
+    bucket_arity, bytes_to_hv, popcount_distance, rotate_left, xor_into,
     Hypervector, ZERO_HV,
 };
 
@@ -87,7 +87,7 @@ impl BaseCodebook for ModuleCodebook {
             item.arity_bucket,
             &item.child_canonical_kinds,
         );
-        expand_seed(crate::util::blake3_seed(&buf))
+        bytes_to_hv(&buf)
     }
 
     // role_vector: uses the trait default (codebook_tag + "-role").
@@ -107,15 +107,14 @@ impl BaseCodebook for ModuleCodebook {
 /// things work internally*.
 pub fn encode_module(tree: &EncoderNode, _cb: &ModuleCodebook) -> Hypervector {
     // Start with the root container's kind as the file-level identity.
-    let mut hv = expand_seed(crate::util::blake3_seed(&[
+    let mut hv = bytes_to_hv(&[
         tree.canonical_kind.discriminant(),
         b'M', // domain tag so module-root vectors don't collide with AST-leaf vectors
-    ]));
+    ]);
 
     for (i, child) in tree.children.iter().enumerate() {
         let sig = ModuleCodebook::header_signature_bytes(child);
-        let seed = crate::util::blake3_seed(&sig);
-        let child_hv = expand_seed(seed);
+        let child_hv = bytes_to_hv(&sig);
         let permuted = rotate_left(&child_hv, i);
         xor_into(&mut hv, &permuted);
     }

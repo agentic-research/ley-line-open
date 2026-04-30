@@ -142,6 +142,16 @@ pub fn blake3_seed(bytes: &[u8]) -> u64 {
     u64::from_le_bytes([bs[0], bs[1], bs[2], bs[3], bs[4], bs[5], bs[6], bs[7]])
 }
 
+/// Canonical "bytes → hypervector" pipeline: `expand_seed(blake3_seed(
+/// bytes))`. The two-step idiom appeared verbatim in 4 sites
+/// (AstCodebook::base_vector, ModuleCodebook::base_vector,
+/// `encode_module`, and `tagged_seed_vector`); centralizing it here
+/// gives one canonical path that any future bytes-derived HV uses.
+#[inline]
+pub fn bytes_to_hv(bytes: &[u8]) -> Hypervector {
+    expand_seed(blake3_seed(bytes))
+}
+
 /// Build a deterministic hypervector tagged by a domain string and index.
 /// Used by codebooks for role / position / dimension vectors that must
 /// be reproducible across machines AND non-colliding across domains.
@@ -152,9 +162,7 @@ pub fn blake3_seed(bytes: &[u8]) -> u64 {
 /// collision when an unbind cleanup-memory runs against a multi-layer
 /// codebook collection.
 pub fn tagged_seed_vector(tag: &str, index: usize) -> Hypervector {
-    let bytes = format!("{tag}/{index}");
-    let seed = blake3_seed(bytes.as_bytes());
-    expand_seed(seed)
+    bytes_to_hv(format!("{tag}/{index}").as_bytes())
 }
 
 /// Hamming-distance threshold used by tests to assert "these two

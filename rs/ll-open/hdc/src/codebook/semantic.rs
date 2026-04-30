@@ -319,6 +319,20 @@ mod tests {
     }
 
     #[test]
+    fn semantic_new_matches_new_with_seed_at_default_constant() {
+        // SemanticCodebook::new(dim) is documented as a convenience
+        // wrapper for `new_with_seed(dim, SEMANTIC_HYPERPLANE_SEED)`.
+        // Pin the equivalence so a refactor that bumped the default
+        // seed without bumping the constant — or vice versa — would
+        // surface immediately. Same emb input through both must
+        // produce byte-identical projections.
+        let cb_default = SemanticCodebook::new(32);
+        let cb_explicit = SemanticCodebook::new_with_seed(32, SEMANTIC_HYPERPLANE_SEED);
+        let emb: Vec<f32> = (0..32).map(|i| (i as f32 * 0.07).cos()).collect();
+        assert_eq!(cb_default.project(&emb), cb_explicit.project(&emb));
+    }
+
+    #[test]
     fn embedding_dim_accessor() {
         let cb = SemanticCodebook::new(384);
         assert_eq!(cb.embedding_dim(), 384);

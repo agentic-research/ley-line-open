@@ -186,6 +186,7 @@ where
 mod tests {
     use super::*;
     use crate::codebook::AstCodebook;
+    use crate::util::assert_far_apart;
 
     // Test convenience aliases — `leaf` and `node` are short stand-ins
     // for `EncoderNode::leaf` / `EncoderNode::new` to keep the test
@@ -254,7 +255,7 @@ mod tests {
             CanonicalKind::Stmt,
             vec![leaf(CanonicalKind::Block), leaf(CanonicalKind::Op)],
         );
-        crate::util::assert_far_apart(
+        assert_far_apart(
             &encode_fresh(&tree_a, &cb),
             &encode_fresh(&tree_b, &cb),
             "child order must affect HV",
@@ -275,7 +276,7 @@ mod tests {
                 node(CanonicalKind::Expr, vec![leaf(CanonicalKind::Lit)]),
             ],
         );
-        crate::util::assert_far_apart(
+        assert_far_apart(
             &encode_fresh(&tree_simple, &cb),
             &encode_fresh(&tree_complex, &cb),
             "different shapes must be far apart",
@@ -386,7 +387,7 @@ mod tests {
         let cb = AstCodebook::new();
         let parent_a = node(CanonicalKind::Stmt, vec![leaf(CanonicalKind::Op)]);
         let parent_b = node(CanonicalKind::Stmt, vec![leaf(CanonicalKind::Lit)]);
-        crate::util::assert_far_apart(
+        assert_far_apart(
             &encode_fresh(&parent_a, &cb),
             &encode_fresh(&parent_b, &cb),
             "different child kinds must produce different parent HVs",

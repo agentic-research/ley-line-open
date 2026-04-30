@@ -90,8 +90,8 @@ pub fn calibrate_layer(
     let mut distances: Vec<u32> = Vec::with_capacity(target);
     let mut sampled = 0;
     while sampled < target {
-        let i = (next_u64(&mut state) as usize) % n;
-        let j = (next_u64(&mut state) as usize) % n;
+        let i = (crate::util::splitmix64(&mut state) as usize) % n;
+        let j = (crate::util::splitmix64(&mut state) as usize) % n;
         if i == j {
             continue;
         }
@@ -215,15 +215,6 @@ fn compute_mad(values: &[u32], median: u32) -> u32 {
 
 fn blake3_seed_from(layer: LayerKind) -> u64 {
     crate::util::blake3_seed(format!("hdc-calibrate/{}", layer.as_str()).as_bytes())
-}
-
-#[inline]
-fn next_u64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
 }
 
 #[cfg(test)]

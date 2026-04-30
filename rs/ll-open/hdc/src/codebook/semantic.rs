@@ -114,19 +114,11 @@ pub(super) fn gaussian_row(seed: u64, n: usize) -> Vec<f32> {
 /// Uniform [eps, 1) sample from a SplitMix64 stream. Avoids 0 because
 /// Box-Muller calls `ln(u)` and ln(0) = -infinity.
 fn next_uniform(state: &mut u64) -> f32 {
-    let bits = next_u64(state);
+    let bits = crate::util::splitmix64(state);
     // Map to [eps, 1) by setting the high 24 bits as fraction; the
     // floor of 1ULP avoids the exact-zero pathology.
     let f = (bits >> 40) as f32 / (1u32 << 24) as f32;
     f.max(f32::EPSILON)
-}
-
-fn next_u64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
 }
 
 #[cfg(test)]

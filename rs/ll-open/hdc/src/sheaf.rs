@@ -1017,12 +1017,7 @@ mod tests {
             let mut state = crate::util::blake3_seed(&seed.to_le_bytes());
             let mut copy = base;
             for _ in 0..(D_BITS / 20) {
-                // SplitMix64 step inlined to avoid pulling util private fns
-                state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-                let mut z = state;
-                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-                let bit = ((z ^ (z >> 31)) as usize) % D_BITS;
+                let bit = (crate::util::splitmix64(&mut state) as usize) % D_BITS;
                 let byte_idx = bit / 8;
                 let bit_off = bit % 8;
                 copy[byte_idx] ^= 1 << bit_off;

@@ -18,8 +18,14 @@ pub const ZERO_HV: Hypervector = [0u8; D_BYTES];
 
 /// SplitMix64 PRNG step. Deterministic, fast, statistically-balanced.
 /// Stateful by construction — each call advances the seed.
+///
+/// `pub(crate)` so calibrate / semantic / sheaf-tests can share the
+/// canonical impl instead of each maintaining a byte-identical local
+/// `next_u64`. Internal-only — production callers outside the crate
+/// should use higher-level primitives like `expand_seed` rather than
+/// the raw PRNG.
 #[inline]
-fn splitmix64(state: &mut u64) -> u64 {
+pub(crate) fn splitmix64(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut z = *state;
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);

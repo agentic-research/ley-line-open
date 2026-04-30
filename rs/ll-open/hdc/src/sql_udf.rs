@@ -464,6 +464,34 @@ mod tests {
     }
 
     #[test]
+    fn bundle_majority_sql_elects_2_of_3() {
+        // Mirror of `sheaf::tests::bundle_majority_elects_2_of_3` for
+        // the SQL UDF path. With 3 rows, half = 1 and threshold is
+        // `cnt > 1`. A bit set in 2 rows (cnt=2) elects to 1; a bit
+        // set in 1 row (cnt=1, not > 1) elects to 0. The Rust path
+        // has a bit-precise pin; without this, a divergence between
+        // the two implementations on the canonical odd-count
+        // election case could slip past `bundle_majority_matches_sql_
+        // udf_on_nonempty` (which uses random stalks where
+        // bit-precise expectations aren't asserted).
+        let conn = fixture_conn();
+        // Bit 0 set in s0, s1, NOT s2 → cnt=2 → elect 1
+        // Bit 1 set ONLY in s2 → cnt=1 → elect 0
+        let mut s0 = ZERO_HV; s0[0] = 0b0000_0001;
+        let mut s1 = ZERO_HV; s1[0] = 0b0000_0001;
+        let mut s2 = ZERO_HV; s2[0] = 0b0000_0010;
+        insert_hv(&conn, 1, &s0);
+        insert_hv(&conn, 2, &s1);
+        insert_hv(&conn, 3, &s2);
+        let bundle = select_bundle_majority(&conn);
+        assert_eq!(bundle[0], 0b0000_0001, "2-of-3 elects bit 0; 1-of-3 loses bit 1");
+        // All other bytes untouched (every other bit cnt=0).
+        for &b in &bundle[1..] {
+            assert_eq!(b, 0, "untouched bytes must remain zero");
+        }
+    }
+
+    #[test]
     fn bundle_xor_rejects_wrong_length_row() {
         // BUNDLE's step() guards against length mismatches with the
         // accumulator (which is always D_BYTES). A row of the wrong

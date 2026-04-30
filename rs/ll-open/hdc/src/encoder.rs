@@ -223,6 +223,28 @@ mod tests {
     }
 
     #[test]
+    fn encode_tree_leaf_equals_base_vector() {
+        // For a leaf node (no children), encode_tree must produce
+        // exactly the codebook's base_vector for that leaf — there
+        // are no children to rotate-and-XOR. The for-loop in
+        // encode_tree (line 159) iterates `node.children` zero times
+        // for a leaf, so the accumulator equals the initial
+        // `codebook.base_vector(&fp)` unchanged. Pin so a refactor
+        // that always XOR'd a "phantom" role_vector(0) or initialized
+        // to ZERO_HV instead of base_vector would surface immediately.
+        let cb = AstCodebook::new();
+        for kind in CanonicalKind::ALL {
+            let leaf_node = leaf(kind);
+            let encoded = encode_fresh(&leaf_node, &cb);
+            let expected = cb.base_vector(&leaf_node.fingerprint());
+            assert_eq!(
+                encoded, expected,
+                "encode_tree(leaf({kind:?})) must equal codebook.base_vector(fp)",
+            );
+        }
+    }
+
+    #[test]
     fn encoder_node_new_sorts_child_kinds_by_discriminant() {
         // EncoderNode::new sorts `child_canonical_kinds_sorted` (line
         // 36 `sorted.sort_unstable_by_key(|k| k.discriminant())`) so

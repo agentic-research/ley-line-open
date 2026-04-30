@@ -793,6 +793,34 @@ mod tests {
     // the underlying helper behavior so a future fix is intentional.
 
     #[test]
+    fn git_dirty_files_on_clean_repo_returns_empty_set() {
+        // Scale-problem pin. Most working repos are mostly-clean, so
+        // this is the most-common code path. With clean repo,
+        // `git status --porcelain -z` produces empty stdout → split
+        // by NUL yields one empty entry → filter `entry.len() > 3`
+        // excludes it. Pin: empty HashSet, no Err. A refactor that
+        // off-by-one'd the filter (e.g. `> 0` instead of `> 3`) or
+        // failed to handle empty-stdout cleanly would surface here.
+        let dir = TempDir::new().unwrap();
+        // git init + initial commit produces a clean repo with no
+        // dirty files.
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t",
+                   "commit", "--allow-empty", "-q", "-m", "init"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+
+        let dirty = git_dirty_files(dir.path()).expect("clean repo must succeed");
+        assert!(dirty.is_empty(), "clean repo dirty set must be empty, got {dirty:?}");
+    }
+
+    #[test]
     fn git_dirty_files_on_non_repo_returns_err() {
         // A bare temp dir is not a git repo. `git status` exits non-zero
         // and writes to stderr; git_dirty_files must surface that as a

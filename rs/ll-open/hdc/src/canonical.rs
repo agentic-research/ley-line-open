@@ -96,6 +96,29 @@ pub use yaml::YamlCanonicalMap;
 pub mod json;
 pub use json::JsonCanonicalMap;
 
+/// Look up a canonical-kind map by language id. Single dispatch point for
+/// "I have a parser, I have a language id, give me the right map." Without
+/// this helper every caller would hardcode the language→map mapping
+/// inline, drifting on every new language addition.
+///
+/// Returns `None` if the language has no canonical map registered yet —
+/// callers can fall back to a Block-defaulting map (`leyline_hdc` doesn't
+/// ship one) or skip HDC encoding for that file.
+///
+/// The match must agree with the language ids that
+/// `leyline_lsp::languages::language_id_from_ext` and
+/// `leyline_ts::languages::TsLanguage` use, so a `.go` file routed via
+/// either registry resolves to `GoCanonicalMap` here.
+pub fn select_canonical_map(lang: &str) -> Option<Box<dyn CanonicalKindMap>> {
+    match lang {
+        "rust" => Some(Box::new(RustCanonicalMap)),
+        "go" => Some(Box::new(GoCanonicalMap)),
+        "yaml" => Some(Box::new(YamlCanonicalMap)),
+        "json" => Some(Box::new(JsonCanonicalMap)),
+        _ => None,
+    }
+}
+
 /// Test invariants every `CanonicalKindMap` impl must satisfy. Centralizes
 /// the boilerplate that would otherwise be copied per-language: forward-
 /// compat fallback, empty-string fallback, and lang-id identification.
@@ -217,5 +240,43 @@ mod tests {
         // changed the fallback (e.g. to Stmt) would silently shift
         // hypervectors for every parser-version-skewed kind. Pin it.
         assert_eq!(FALLBACK_KIND, CanonicalKind::Block);
+    }
+
+    #[test]
+    fn select_canonical_map_returns_correct_map_for_known_languages() {
+        // Single dispatch point. Pin every registered language so a
+        // future addition that forgets to wire up a new language fails
+        // here. Each entry: (lang_id, expected_self_reported_lang).
+        let probes: &[(&str, &str)] = &[
+            ("rust", "rust"),
+            ("go", "go"),
+            ("yaml", "yaml"),
+            ("json", "json"),
+        ];
+        for (lang, expected) in probes {
+            let m = select_canonical_map(lang).unwrap_or_else(|| {
+                panic!("select_canonical_map returned None for known lang `{lang}`")
+            });
+            assert_eq!(
+                m.lang(),
+                *expected,
+                "select_canonical_map(`{lang}`) returned a map identifying as `{}`, expected `{expected}`",
+                m.lang(),
+            );
+        }
+    }
+
+    #[test]
+    fn select_canonical_map_returns_none_for_unknown_languages() {
+        // Forward-compat: caller-provided unknown languages must return
+        // None (callers fall back to skipping HDC for that file). A
+        // refactor that erroneously returned a default map would inject
+        // wrong-language hypervectors silently.
+        for unknown in ["", "elixir", "ruby", "future_lang"] {
+            assert!(
+                select_canonical_map(unknown).is_none(),
+                "select_canonical_map(`{unknown}`) must return None for unregistered language",
+            );
+        }
     }
 }

@@ -600,6 +600,52 @@ mod tests {
     }
 
     #[test]
+    fn merkle_root_for_layer_with_no_matching_stalks_is_empty_sentinel() {
+        // A complex with cells that don't carry stalks on the queried
+        // layer should produce the same root as an empty complex —
+        // the per-layer root is computed only from cells that have
+        // a stalk for that layer. Pin so a partially-encoded complex
+        // (e.g. only AST encoded, no Semantic yet) doesn't invalidate
+        // a cached "no Semantic data" sentinel.
+        let mut cx_only_ast = HvCellComplex::new();
+        cx_only_ast.add_cell(make_cell("fn_a", CanonicalKind::Decl, 1));
+        cx_only_ast.add_cell(make_cell("fn_b", CanonicalKind::Decl, 2));
+        // No Semantic stalks anywhere → Semantic root == empty-complex sentinel.
+        let cx_empty = HvCellComplex::new();
+        assert_eq!(
+            cx_only_ast.merkle_root_for_layer(LayerKind::Semantic),
+            cx_empty.merkle_root_for_layer(LayerKind::Semantic),
+            "no-matching-stalks root must equal empty-complex sentinel",
+        );
+    }
+
+    #[test]
+    fn merkle_leaf_format_byte_pin() {
+        // Pin the leaf byte layout so a refactor that drops a 0x00
+        // separator or reorders fields gets caught — every encoded
+        // Merkle root depends on this exact byte sequence:
+        //
+        //   layer.as_str() + 0x00 + cell_id + 0x00 + stalk_bytes (D_BYTES)
+        //
+        // Computed manually here so the test is independent of the
+        // production code path.
+        let mut cx = HvCellComplex::new();
+        let stalk = stalk_for(7);
+        cx.add_cell(HvCell::new("fn_x", CanonicalKind::Decl).with_stalk(LayerKind::Ast, stalk));
+        let actual = cx.merkle_root_for_layer(LayerKind::Ast);
+
+        // Single-leaf case: the layer root IS the leaf hash.
+        let mut buf = Vec::with_capacity(LayerKind::Ast.as_str().len() + 2 + 4 + D_BYTES);
+        buf.extend_from_slice(LayerKind::Ast.as_str().as_bytes()); // "ast"
+        buf.push(0u8); // separator 1
+        buf.extend_from_slice(b"fn_x"); // id
+        buf.push(0u8); // separator 2
+        buf.extend_from_slice(&stalk); // D_BYTES of stalk
+        let expected: [u8; 32] = blake3::hash(&buf).into();
+        assert_eq!(actual, expected, "leaf byte format drifted");
+    }
+
+    #[test]
     fn single_cell_root_is_leaf_hash() {
         // Per the merkle_root contract: one leaf → root == leaf. A
         // future refactor that forgot the single-leaf case would

@@ -1693,10 +1693,7 @@ fn test_scoped_reparse_handles_deletion_in_scope() {
 #[tokio::test]
 async fn test_op_reparse_accepts_single_file_source() {
     use leyline_cli_lib::daemon::DaemonContext;
-    
     use std::sync::{Arc, Mutex};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
 
     // Source tree with two go files. The hook will only "edit" one.
     let src = TempDir::new().unwrap();
@@ -1741,12 +1738,7 @@ async fn test_op_reparse_accepts_single_file_source() {
         "source": edited.to_string_lossy().to_string(),
     });
 
-    let stream = UnixStream::connect(&sock_path).await.unwrap();
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
-    writer.write_all(format!("{body}\n").as_bytes()).await.unwrap();
-    let response = lines.next_line().await.unwrap().expect("response");
-    let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+    let parsed = uds_round_trip(&sock_path, &body.to_string()).await;
 
     assert_eq!(parsed["ok"], true, "single-file reparse should succeed: {parsed}");
     assert_eq!(parsed["parsed"], 1, "only a.go should be reparsed");
@@ -1777,10 +1769,7 @@ async fn test_op_reparse_accepts_single_file_source() {
 #[tokio::test]
 async fn test_op_reparse_accepts_files_scope_with_dir_source() {
     use leyline_cli_lib::daemon::DaemonContext;
-    
     use std::sync::{Arc, Mutex};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
 
     let src = TempDir::new().unwrap();
     fs::write(src.path().join("a.go"), "package m\n\nfunc A() {}\n").unwrap();
@@ -1812,12 +1801,7 @@ async fn test_op_reparse_accepts_files_scope_with_dir_source() {
         "files": ["b.go"],
     });
 
-    let stream = UnixStream::connect(&sock_path).await.unwrap();
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
-    writer.write_all(format!("{body}\n").as_bytes()).await.unwrap();
-    let response = lines.next_line().await.unwrap().expect("response");
-    let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+    let parsed = uds_round_trip(&sock_path, &body.to_string()).await;
 
     assert_eq!(parsed["ok"], true);
     assert_eq!(parsed["parsed"], 1);

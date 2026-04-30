@@ -279,6 +279,38 @@ mod tests {
     }
 
     #[test]
+    fn module_root_does_not_collide_with_ast_leaf() {
+        // The b'M' domain tag at module.rs:112 is documented as
+        // preventing the module-root vector from colliding with the
+        // AST codebook's base_vector for a leaf of the same kind.
+        // Pin the property: encode_module of a childless root must
+        // be far from AstCodebook::base_vector(leaf(same_kind)). A
+        // refactor that dropped the b'M' suffix would still produce
+        // *some* HV but it might land suspiciously close to the AST
+        // leaf vector, causing the multi-layer combined view to
+        // double-count the same identity.
+        let module_cb = ModuleCodebook::new();
+        let ast_cb = AstCodebook::new();
+        for kind in [
+            CanonicalKind::Block,
+            CanonicalKind::Decl,
+            CanonicalKind::Stmt,
+        ] {
+            // Empty file with just a root of `kind`.
+            let empty_root = node(kind, vec![]);
+            let module_hv = encode_module(&empty_root, &module_cb);
+            let ast_leaf_hv = ast_cb.base_vector(
+                &crate::codebook::AstNodeFingerprint::leaf(kind),
+            );
+            assert_far_apart(
+                &module_hv,
+                &ast_leaf_hv,
+                "module root vs AST leaf must not collide",
+            );
+        }
+    }
+
+    #[test]
     fn module_root_kind_changes_hv() {
         // Two files with the same top-level decls but different file-root
         // kinds (e.g. Block vs Stmt) produce different HVs. This catches

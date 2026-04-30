@@ -8,9 +8,11 @@ default = ["lsp"]
 lsp = ["dep:leyline-lsp"]
 mount = ["leyline-fs/nfs", "leyline-fs/fuse", "leyline-fs/validate"]
 vec = ["dep:sqlite-vec"]
+hdc = ["dep:leyline-hdc"]
 
 [dependencies]
 leyline-lsp = { path = "../lsp", optional = true }
+leyline-hdc = { path = "../hdc", optional = true }
 leyline-ts = { path = "../ts", features = ["html", "markdown", "json", "yaml", "go", "python", "elixir"] }
 leyline-schema = { path = "../../ll-core/schema" }
 leyline-core = { path = "../../ll-core/core" }

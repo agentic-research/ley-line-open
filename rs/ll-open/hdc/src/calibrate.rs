@@ -138,7 +138,7 @@ fn collect_layer_hvs(
     let mut out = Vec::new();
     for row in rows {
         let blob = row?;
-        if let Ok(hv) = <Hypervector>::try_from(&blob[..]) {
+        if let Some(hv) = crate::util::hv_from_slice(&blob) {
             out.push(hv);
         }
     }

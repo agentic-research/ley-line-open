@@ -152,6 +152,18 @@ pub fn bytes_to_hv(bytes: &[u8]) -> Hypervector {
     expand_seed(blake3_seed(bytes))
 }
 
+/// Decode a SQLite BLOB row into a `Hypervector`, returning `None` if
+/// the byte length doesn't match `D_BYTES`. Fail-soft form for
+/// production callers that need to skip malformed rows (a mid-flight
+/// schema bug or a row from a different D would otherwise crash the
+/// daemon). Replaces the inline `try_into() as Result<Hypervector,
+/// Vec<u8>>` and `<Hypervector>::try_from(&blob[..])` patterns that
+/// each calibrate / combined-view path used.
+#[inline]
+pub fn hv_from_slice(slice: &[u8]) -> Option<Hypervector> {
+    Hypervector::try_from(slice).ok()
+}
+
 /// Build a deterministic hypervector tagged by a domain string and index.
 /// Used by codebooks for role / position / dimension vectors that must
 /// be reproducible across machines AND non-colliding across domains.
@@ -194,6 +206,23 @@ pub fn assert_far_apart(a: &Hypervector, b: &Hypervector, label: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hv_from_slice_round_trips_correct_length() {
+        // Right-sized slice must decode to a Hypervector matching the
+        // bytes. Wrong-sized slice must return None (fail-soft for
+        // production rows from a different D, schema bug, or
+        // truncation). Pin both halves so a future refactor that
+        // turned this into `unwrap()` would be caught.
+        let hv = expand_seed(0xCAFE);
+        let slice: &[u8] = hv.as_slice();
+        assert_eq!(hv_from_slice(slice), Some(hv));
+
+        // Too short, too long, empty — all None.
+        assert_eq!(hv_from_slice(&[0u8; 0]), None);
+        assert_eq!(hv_from_slice(&[0u8; 100]), None);
+        assert_eq!(hv_from_slice(&vec![0u8; D_BYTES + 1]), None);
+    }
 
     #[test]
     fn expand_seed_is_deterministic() {

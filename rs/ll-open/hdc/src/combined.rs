@@ -79,7 +79,7 @@ pub fn build_combined_for_scope(
     for row in rows {
         let (kind_str, blob, basis) = row?;
         if let Some(kind) = LayerKind::parse_str(&kind_str)
-            && let Ok(hv) = blob.try_into() as std::result::Result<Hypervector, Vec<u8>>
+            && let Some(hv) = crate::util::hv_from_slice(&blob)
         {
             layers.insert(kind, hv);
         }

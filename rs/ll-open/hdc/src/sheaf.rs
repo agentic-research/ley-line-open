@@ -911,6 +911,26 @@ mod tests {
     }
 
     #[test]
+    fn propagate_sections_output_is_deterministic_across_calls() {
+        // propagate_sections is built on compute_h0's BTreeMap-sorted
+        // group order. Same complex twice must produce byte-identical
+        // Vec<Hypervector>. The compute_h0 determinism pin already
+        // covers the upstream half; pin the downstream
+        // bundle_majority composition produces stable output too —
+        // a refactor that introduced HashMap iteration into the
+        // mapping or stalk-collect step would surface here.
+        let mut cx = HvCellComplex::new();
+        for (id, seed) in &[("fn_z", 1u64), ("fn_a", 1), ("fn_m", 999)] {
+            cx.add_cell(make_cell(id, CanonicalKind::Decl, *seed));
+        }
+        cx.set_threshold(LayerKind::Ast, 10);
+        cx.add_edge(HvEdge::identity("fn_z", "fn_a", EdgeKind::Sibling, LayerKind::Ast));
+        let c1 = cx.propagate_sections(LayerKind::Ast);
+        let c2 = cx.propagate_sections(LayerKind::Ast);
+        assert_eq!(c1, c2, "propagate_sections must produce byte-identical output");
+    }
+
+    #[test]
     fn propagate_sections_layer_with_no_stalks_yields_zero_hvs() {
         // Cells exist on Ast layer but none have Semantic stalks.
         // compute_h0(Semantic) treats them all as singletons (no

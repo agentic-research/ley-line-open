@@ -793,6 +793,65 @@ mod tests {
     // the underlying helper behavior so a future fix is intentional.
 
     #[test]
+    fn git_dirty_files_mishandles_renames_known_bug() {
+        // KNOWN BUG documented as a pin. `git status --porcelain -z`
+        // emits a rename as TWO nul-separated entries:
+        //   entry1: "R  newpath\0"  (status + space + new path)
+        //   entry2: "oldpath\0"     (bare old path, NO status prefix)
+        // The current parser does `entry[3..]` for every entry — so
+        // for entry2 it chops the first 3 characters of the old path,
+        // emitting a phantom truncated entry in the dirty set.
+        //
+        // For our reparse-on-edit case this is mostly harmless (the
+        // truncated path won't match any real file, so collect_files
+        // skips it; the deletion sweep finds the real old.go via
+        // _file_index diff). But it pollutes the dirty set with a
+        // phantom entry that scoped-reparse iterates uselessly.
+        //
+        // Pin the current behavior so a future fix (parse the status
+        // byte properly, or split renames into new-only) is a
+        // deliberate behavior change. Once fixed, update this test
+        // to assert the corrected behavior.
+        let dir = TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        std::fs::write(dir.path().join("old.go"), b"package m").unwrap();
+        std::process::Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t",
+                   "add", "old.go"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t",
+                   "commit", "-m", "init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        // Rename via `git mv` to ensure git tracks it as a rename.
+        std::process::Command::new("git")
+            .args(["mv", "old.go", "new.go"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+
+        let dirty = git_dirty_files(dir.path()).unwrap();
+        // The new path comes through cleanly.
+        assert!(dirty.contains("new.go"), "new path must be in dirty set, got {dirty:?}");
+        // KNOWN BUG: the old path is currently ".go" (truncated by 3
+        // chars). When the bug is fixed (rename parsing rewritten),
+        // this assertion flips to: dirty.contains("old.go") OR
+        // !dirty.contains(...) depending on the chosen semantics.
+        assert!(
+            dirty.contains(".go"),
+            "KNOWN BUG: rename old-path arrives truncated; got {dirty:?}",
+        );
+    }
+
+    #[test]
     fn git_dirty_files_extracts_paths_correctly() {
         // Pin the porcelain -z parsing: each entry starts with 2-char
         // status + space; path is at offset 3. Pinning here matters

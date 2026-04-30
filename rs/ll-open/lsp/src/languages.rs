@@ -43,7 +43,7 @@ pub const LSP_LANGUAGES: &[LspLanguage] = &[
     },
     LspLanguage {
         id: "python",
-        exts: &["py"],
+        exts: &["py", "pyi"],
         server: Some(("pyright-langserver", &["--stdio"])),
     },
     LspLanguage {
@@ -103,7 +103,7 @@ pub const LSP_LANGUAGES: &[LspLanguage] = &[
     LspLanguage { id: "json",        exts: &["json"],        server: None },
     LspLanguage { id: "yaml",        exts: &["yaml", "yml"], server: None },
     LspLanguage { id: "toml",        exts: &["toml"],        server: None },
-    LspLanguage { id: "markdown",    exts: &["md"],          server: None },
+    LspLanguage { id: "markdown",    exts: &["md", "markdown"], server: None },
     LspLanguage { id: "swift",       exts: &["swift"],       server: None },
     LspLanguage { id: "kotlin",      exts: &["kt", "kts"],   server: None },
     LspLanguage { id: "terraform",   exts: &["tf", "hcl"],   server: None },

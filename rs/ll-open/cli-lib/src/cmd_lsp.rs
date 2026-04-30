@@ -159,32 +159,25 @@ pub async fn cmd_lsp(
 
 #[cfg(test)]
 mod tests {
-    /// Scale-problem pin: detect drift between leyline-ts and
-    /// leyline-lsp extension registries. cmd_lsp passes a language id
-    /// from `leyline_lsp::languages::language_id_from_ext` into the
-    /// LSP `didOpen` notification — but the same files were (or will
-    /// be) parsed via `leyline_ts::TsLanguage::from_extension`
-    /// upstream. If the two registries disagree on which extensions
-    /// belong to a language, a file silently lands in one path but
+    /// Cross-registry alignment pin. cmd_lsp passes a language id from
+    /// `leyline_lsp::languages::language_id_from_ext` into the LSP
+    /// `didOpen` notification; the same files are parsed via
+    /// `leyline_ts::TsLanguage::from_extension` upstream. The two
+    /// registries must agree on every extension they share so a
+    /// file's parser-id and lsp-id stay in lockstep — otherwise a
+    /// .pyi stub or .markdown file silently lands in one path but
     /// not the other.
     ///
-    /// Already-known drift cases (which the test accepts via the
-    /// allowlist):
-    ///   - python: ts knows .pyi (stubs), lsp doesn't.
-    ///   - markdown: ts knows .markdown, lsp only knows .md.
+    /// Past drift cases that have been closed:
+    ///   - python now includes .pyi in lsp registry (Python stubs).
+    ///   - markdown now includes .markdown in lsp registry.
     ///
-    /// A future fix lands by adding the missing ext to lsp::
-    /// LSP_LANGUAGES and removing from KNOWN_DIVERGENCES. Any new
-    /// silent skip surfaces as a test failure.
+    /// If a new ext is added to ts but missed in lsp, this test fails
+    /// with a clear "registry drift" message pointing at the ext.
     #[test]
-    fn ts_and_lsp_extension_registries_align_or_known_drift() {
+    fn ts_and_lsp_extension_registries_agree() {
         use leyline_lsp::languages::language_id_from_ext;
         use leyline_ts::languages::TsLanguage;
-
-        const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
-            ("pyi", "python"),
-            ("markdown", "markdown"),
-        ];
 
         let probes: &[(&str, &str)] = &[
             ("html", "html"),
@@ -207,15 +200,12 @@ mod tests {
                 "ts must recognize ext `{ext}`",
             );
             let lsp_id = language_id_from_ext(ext);
-            if KNOWN_DIVERGENCES.contains(&(ext, expected_id)) {
-                continue;
-            }
             assert_eq!(
                 lsp_id,
                 Some(*expected_id),
                 "registry drift: ts knows `{ext}` as `{expected_id}` but \
-                 lsp::language_id_from_ext returned {lsp_id:?}; either fix \
-                 the registry or add to KNOWN_DIVERGENCES",
+                 lsp::language_id_from_ext returned {lsp_id:?}; add `{ext}` \
+                 to the corresponding LspLanguage entry in lsp/languages.rs",
             );
         }
     }

@@ -27,27 +27,16 @@ impl Default for AstCodebook {
 }
 
 impl AstCodebook {
-    /// Build the canonical-signature byte array for hashing. Format:
-    /// `[kind_disc, arity_bucket, len_low, len_high, child_disc...]`.
-    /// Sorted children → order-invariant signature; role-binding at the
-    /// encoder restores order-sensitivity per slot.
+    /// Wrapper for the shared `codebook::canonical_signature_bytes` —
+    /// kept as a method so the test that pins the byte layout
+    /// (`signature_byte_format_pin`) doesn't have to know which crate
+    /// module owns the canonical format.
     fn signature_bytes(item: &AstNodeFingerprint) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(4 + item.child_canonical_kinds.len());
-        buf.push(item.canonical_kind.discriminant());
-        buf.push(item.arity_bucket);
-        // Length prefix so a (k, []) signature can never collide with
-        // a (k, [k]) signature (defensive — unlikely with discriminants
-        // in [0, 6] but cheap to be explicit).
-        let len = item.child_canonical_kinds.len() as u16;
-        buf.extend_from_slice(&len.to_le_bytes());
-        let mut sorted: Vec<u8> = item
-            .child_canonical_kinds
-            .iter()
-            .map(|k| k.discriminant())
-            .collect();
-        sorted.sort_unstable();
-        buf.extend_from_slice(&sorted);
-        buf
+        crate::codebook::canonical_signature_bytes(
+            item.canonical_kind,
+            item.arity_bucket,
+            &item.child_canonical_kinds,
+        )
     }
 }
 

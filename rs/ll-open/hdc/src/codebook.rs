@@ -76,6 +76,35 @@ pub struct AstNodeFingerprint {
     pub child_canonical_kinds: Vec<CanonicalKind>,
 }
 
+/// Canonical byte layout for a node's structural signature, used by
+/// every codebook that hashes "(kind, arity bucket, sorted child kinds)"
+/// — currently AstCodebook and ModuleCodebook. Format:
+///
+///   `[kind_disc(1), arity_bucket(1), child_count_le(2), sorted_child_discs(N)]`
+///
+/// The length prefix prevents `(k, [])` from colliding with `(k, [k])`
+/// (both would otherwise hash to the same bytes if a sub-pattern crosses
+/// the boundary). Sorted children → order-invariant at the codebook
+/// level; encoder restores positional order via rotation.
+///
+/// CHANGING THIS BREAKS EVERY ENCODED HYPERVECTOR. Bump a layer's seed
+/// tag if you need to migrate, don't silently rewrite the format.
+pub fn canonical_signature_bytes(
+    kind: crate::canonical::CanonicalKind,
+    arity_bucket: u8,
+    child_kinds: &[crate::canonical::CanonicalKind],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(4 + child_kinds.len());
+    buf.push(kind.discriminant());
+    buf.push(arity_bucket);
+    let len = child_kinds.len() as u16;
+    buf.extend_from_slice(&len.to_le_bytes());
+    let mut sorted: Vec<u8> = child_kinds.iter().map(|k| k.discriminant()).collect();
+    sorted.sort_unstable();
+    buf.extend_from_slice(&sorted);
+    buf
+}
+
 pub mod ast;
 pub use ast::AstCodebook;
 

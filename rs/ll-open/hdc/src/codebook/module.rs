@@ -47,24 +47,17 @@ impl ModuleCodebook {
     /// immediate named children. This captures the decl's *shape*
     /// without recursing into its body — a function and its body are
     /// the AST layer's job, not the module layer's.
+    ///
+    /// Delegates to the shared `codebook::canonical_signature_bytes` so
+    /// the byte layout matches the AST layer; only the inputs differ
+    /// (decl-header data here, full-fingerprint data there).
     fn header_signature_bytes(node: &EncoderNode) -> Vec<u8> {
-        let kind_disc = node.canonical_kind.discriminant();
-        let arity = bucket_arity(node.children.len());
-        let mut buf = Vec::with_capacity(4 + node.children.len());
-        buf.push(kind_disc);
-        buf.push(arity);
-        let len = node.children.len() as u16;
-        buf.extend_from_slice(&len.to_le_bytes());
-        // Sorted child kinds for order-invariant signature; positional
-        // order is restored at the bundle level via rotation.
-        let mut sorted: Vec<u8> = node
-            .children
-            .iter()
-            .map(|c| c.canonical_kind.discriminant())
-            .collect();
-        sorted.sort_unstable();
-        buf.extend_from_slice(&sorted);
-        buf
+        let child_kinds: Vec<_> = node.children.iter().map(|c| c.canonical_kind).collect();
+        crate::codebook::canonical_signature_bytes(
+            node.canonical_kind,
+            bucket_arity(node.children.len()),
+            &child_kinds,
+        )
     }
 }
 
@@ -77,25 +70,18 @@ impl BaseCodebook for ModuleCodebook {
     type Item = AstNodeFingerprint;
 
     fn base_vector(&self, item: &Self::Item) -> Hypervector {
-        // Same hash shape as AstCodebook so a single fingerprint maps
-        // to a single deterministic vector. The difference between
-        // AST and Module behavior comes from what's INSIDE the
-        // fingerprint: AST builds it from a recursive subtree, Module
-        // builds it from one decl's header (no body).
-        let mut buf = Vec::with_capacity(4 + item.child_canonical_kinds.len());
-        buf.push(item.canonical_kind.discriminant());
-        buf.push(item.arity_bucket);
-        let len = item.child_canonical_kinds.len() as u16;
-        buf.extend_from_slice(&len.to_le_bytes());
-        let mut sorted: Vec<u8> = item
-            .child_canonical_kinds
-            .iter()
-            .map(|k| k.discriminant())
-            .collect();
-        sorted.sort_unstable();
-        buf.extend_from_slice(&sorted);
-        let seed = crate::util::blake3_seed(&buf);
-        expand_seed(seed)
+        // Shares the canonical signature byte layout with AstCodebook
+        // so a single fingerprint maps to a single deterministic
+        // vector. The difference between AST and Module behavior
+        // comes from what's INSIDE the fingerprint: AST builds it
+        // from a recursive subtree, Module builds it from one decl's
+        // header (no body).
+        let buf = crate::codebook::canonical_signature_bytes(
+            item.canonical_kind,
+            item.arity_bucket,
+            &item.child_canonical_kinds,
+        );
+        expand_seed(crate::util::blake3_seed(&buf))
     }
 
     fn role_vector(&self, role_index: usize) -> Hypervector {

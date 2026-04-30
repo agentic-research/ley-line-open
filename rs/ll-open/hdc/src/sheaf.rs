@@ -804,6 +804,54 @@ mod tests {
     }
 
     #[test]
+    fn merkle_root_promotes_unpaired_odd_leaf() {
+        // With 3 leaves [a, b, c]: round 1 produces [hash(0x01 || a
+        // || b), c] — the unpaired c is promoted as-is. Round 2
+        // hashes the pair. Pin the promote-not-pad-empty behavior:
+        // a refactor that hashed `0x01 || c || c` (Bitcoin-style
+        // duplication) or padded with zeros would silently shift
+        // every odd-cell-count root.
+        let mut cx = HvCellComplex::new();
+        for (id, seed) in &[("a", 1u64), ("b", 2), ("c", 3)] {
+            cx.add_cell(
+                HvCell::new(*id, CanonicalKind::Decl)
+                    .with_stalk(LayerKind::Ast, stalk_for(*seed)),
+            );
+        }
+        let actual = cx.merkle_root_for_layer(LayerKind::Ast);
+
+        // Compute the expected merkle root by hand.
+        let leaf_hash = |id: &str, seed: u64| -> [u8; 32] {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(LayerKind::Ast.as_str().as_bytes());
+            buf.push(0u8);
+            buf.extend_from_slice(id.as_bytes());
+            buf.push(0u8);
+            buf.extend_from_slice(&stalk_for(seed));
+            blake3::hash(&buf).into()
+        };
+        let leaf_a = leaf_hash("a", 1);
+        let leaf_b = leaf_hash("b", 2);
+        let leaf_c = leaf_hash("c", 3);
+
+        // Round 1: pair (a, b) → internal; (c) → c.
+        let mut buf = Vec::with_capacity(65);
+        buf.push(0x01);
+        buf.extend_from_slice(&leaf_a);
+        buf.extend_from_slice(&leaf_b);
+        let internal_ab: [u8; 32] = blake3::hash(&buf).into();
+
+        // Round 2: pair (internal_ab, leaf_c) → root.
+        let mut buf = Vec::with_capacity(65);
+        buf.push(0x01);
+        buf.extend_from_slice(&internal_ab);
+        buf.extend_from_slice(&leaf_c);
+        let expected: [u8; 32] = blake3::hash(&buf).into();
+
+        assert_eq!(actual, expected, "odd-leaf promote drifted");
+    }
+
+    #[test]
     fn merkle_internal_node_format_byte_pin() {
         // Internal nodes are blake3(0x01 || left || right) per the
         // doc comment at sheaf.rs:463 and impl at line 563. Sister

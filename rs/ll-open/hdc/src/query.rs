@@ -241,6 +241,8 @@ where
 mod tests {
     use super::*;
     use crate::codebook::AstCodebook;
+    use crate::encoder::{encode_fresh, EncoderNode};
+    use crate::sheaf::HvCellComplex;
     use crate::test_util::{
         conn_with_schema_and_udfs as fresh_with_udfs, insert_combined_hv as insert_combined,
         insert_layer_hv as insert,
@@ -411,7 +413,6 @@ mod tests {
         // distance metric. With sibling cancellation now implemented
         // (skeptic 4bace1) recovery on a single tree should ALSO
         // succeed — pin both shape AND correctness here.
-        use crate::encoder::{encode_fresh, EncoderNode};
 
         let cb = AstCodebook::new();
         let tree = EncoderNode::new(
@@ -479,8 +480,6 @@ mod tests {
         // job of `unbind_child_at_position`. The next test
         // (`real_cluster_via_unbind_recovers_each_position`) pins
         // that path on a real heterogeneous cluster.
-        use crate::encoder::{encode_fresh, EncoderNode};
-        use crate::sheaf::HvCellComplex;
 
         let cb = AstCodebook::new();
         let tree = EncoderNode::new(
@@ -546,8 +545,6 @@ mod tests {
         //
         // Math-friend ≥80% target: 2/2 constant positions = 100%
         // expected. Plus position 1 is plausible.
-        use crate::encoder::{encode_fresh, EncoderNode};
-        use crate::sheaf::HvCellComplex;
 
         let cb = AstCodebook::new();
         let varying_kinds = [

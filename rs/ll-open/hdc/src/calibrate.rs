@@ -233,6 +233,18 @@ mod tests {
     }
 
     #[test]
+    fn default_radius_tightness_constant_is_three() {
+        // Sister pin to default_calibration_samples_constant_is_10k.
+        // 3.0 is the conventional "3-sigma" tightness in MAD units —
+        // ~99% confidence the matched pair is a structural neighbor,
+        // not a random pair from the corpus distribution. Bumping
+        // would shift every default-tightness radius. The
+        // default_radius_uses_default_tightness test pins the formula
+        // chain via this constant; this pins the literal value.
+        assert_eq!(DEFAULT_RADIUS_TIGHTNESS, 3.0);
+    }
+
+    #[test]
     fn default_calibration_samples_constant_is_10k() {
         // Public API guideline (math-friend review B): 10k random
         // pairs is the sweet spot between speed and statistical

@@ -1232,6 +1232,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn op_load_errors_on_missing_or_invalid_db_field() {
+        // op_load takes a base64-encoded .db payload. Pin error
+        // surfacing for the three expected failure modes:
+        //   - missing "db" field
+        //   - "db" field present but not a string
+        //   - "db" field present but invalid base64
+        // At scale a misconfigured client (or one sending raw bytes
+        // instead of base64) would otherwise see the daemon hang or
+        // panic. Pin that all three surface as Err with an actionable
+        // message, not as silent success.
+        let (_dir, ctx) = setup();
+        // Missing field.
+        let resp = handle_base_op(&ctx, "load", &json!({})).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert!(parsed.get("error").is_some(), "missing db must error: {parsed}");
+
+        // Wrong type (number instead of string).
+        let resp = handle_base_op(&ctx, "load", &json!({"db": 42})).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert!(parsed.get("error").is_some(), "non-string db must error: {parsed}");
+
+        // Invalid base64.
+        let resp = handle_base_op(&ctx, "load", &json!({"db": "!@#not-base64$%^"})).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert!(parsed.get("error").is_some(), "invalid base64 must error: {parsed}");
+    }
+
+    #[tokio::test]
     async fn op_status_wire_format_pins_required_fields() {
         // Wire-format pin parallel to enrichment_stats_serialize_to_
         // expected_json_shape and event_serialize_to_expected_json_

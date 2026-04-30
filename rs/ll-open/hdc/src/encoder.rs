@@ -382,6 +382,32 @@ mod tests {
     }
 
     #[test]
+    fn encode_tree_cache_is_transparent() {
+        // The cache is a performance optimization — warm-cache result
+        // MUST equal cold-cache result for the same tree+codebook. A
+        // refactor that mis-derived cache_key (e.g. dropped a field
+        // from content_hash) could populate the cache with a value
+        // distinct from what fresh encoding produces, silently making
+        // cache hits return wrong HVs. Pin transparency directly.
+        let cb = AstCodebook::new();
+        let tree = node(
+            CanonicalKind::Block,
+            vec![
+                node(CanonicalKind::Stmt, vec![leaf(CanonicalKind::Op)]),
+                leaf(CanonicalKind::Lit),
+                node(CanonicalKind::Expr, vec![leaf(CanonicalKind::Ref)]),
+            ],
+        );
+        let cold = encode_tree(&tree, &cb, &SubtreeCache::new());
+        // Warm: pre-populate cache with the same tree, then encode
+        // again. The second call should hit the cache for every node.
+        let warm_cache = SubtreeCache::new();
+        encode_tree(&tree, &cb, &warm_cache);
+        let warm = encode_tree(&tree, &cb, &warm_cache);
+        assert_eq!(cold, warm, "cache must be transparent to encode_tree output");
+    }
+
+    #[test]
     fn cache_dedups_identical_subtrees() {
         // Two functions that share an inner subtree should hit the cache.
         // Build a tree with a repeated subtree, encode, verify the cache

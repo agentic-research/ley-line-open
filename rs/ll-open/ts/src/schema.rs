@@ -343,6 +343,38 @@ mod tests {
     }
 
     #[test]
+    fn ts_schema_creates_all_indexes() {
+        // Scale-problem pin completing the index-existence triplet
+        // (leyline-schema ✓, leyline-lsp ✓, leyline-ts ←). Five
+        // indexes accelerate per-source AST lookup, ref/def token
+        // search, and per-source import enumeration. At registry-
+        // scale (helm/charts: 4.5k files, 629k _ast rows) idx_ast_
+        // source is the difference between O(N) full-scan and O(log
+        // N) point lookup per file. A refactor DROP'ing any silently
+        // degrades query latency on every populated db.
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_schema(&conn).unwrap();
+        create_refs_schema(&conn).unwrap();
+        create_index_schema(&conn).unwrap();
+        for index_name in [
+            "idx_ast_source",
+            "idx_refs_token",
+            "idx_refs_node",
+            "idx_defs_token",
+            "idx_imports_source",
+        ] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND name=?1",
+                    [index_name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(exists, "missing index: {index_name}");
+        }
+    }
+
+    #[test]
     fn read_file_index_handles_thousand_entries() {
         // Scale-problem pin. read_file_index loads ALL _file_index
         // rows into a HashMap at once — at 50k files (a registry-

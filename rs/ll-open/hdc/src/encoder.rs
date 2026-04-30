@@ -501,6 +501,18 @@ mod tests {
     }
 
     #[test]
+    fn subtree_cache_default_matches_new() {
+        // `impl Default for SubtreeCache` delegates to `new()` (line
+        // 125). Pin the equivalence so a refactor that pre-populated
+        // the default cache (e.g. for a "warm start" optimization)
+        // couldn't silently inject phantom entries that downstream
+        // encoders would treat as legitimate cache hits.
+        let via_default = SubtreeCache::default();
+        assert!(via_default.is_empty());
+        assert_eq!(via_default.len(), 0);
+    }
+
+    #[test]
     fn shared_cache_does_not_cross_pollute_across_codebooks() {
         // Skeptic-flagged bug (bead ley-line-open-4ba0cf): the
         // SubtreeCache key was content-only, so encoding the same

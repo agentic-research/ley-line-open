@@ -572,6 +572,24 @@ mod tests {
     }
 
     #[test]
+    fn hv_cell_complex_default_matches_new() {
+        // `impl Default for HvCellComplex` delegates to `new()` (line
+        // 256). Pin the equivalence so a refactor that pre-seeded the
+        // default with phantom cells, edges, or thresholds (e.g. for
+        // a "convenient demo" purpose) couldn't slip in unobserved.
+        let via_default = HvCellComplex::default();
+        let via_new = HvCellComplex::new();
+        assert!(via_default.cells.is_empty());
+        assert!(via_default.edges.is_empty());
+        assert!(via_default.agreement_threshold.is_empty());
+        // Layer-root determinism crosses both constructors.
+        assert_eq!(
+            via_default.merkle_root_for_layer(LayerKind::Ast),
+            via_new.merkle_root_for_layer(LayerKind::Ast),
+        );
+    }
+
+    #[test]
     fn empty_complex_has_stable_root() {
         // Empty-complex root must be deterministic — clients use it as
         // a "no codebase yet" sentinel; if it drifted across calls the

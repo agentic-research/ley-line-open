@@ -106,6 +106,19 @@ mod tests {
         leyline_hdc::popcount_distance(a, b) as f64 / (leyline_hdc::D_BYTES * 8) as f64
     }
 
+    /// Math-friend's empirical threshold for the upper bound of the
+    /// "clones" cluster: pairs of near-clones should land at d/D
+    /// strictly below this value. Random pairs sit at ~0.50 (D/2 ±
+    /// √D/2), so 0.20 leaves comfortable margin between the clone
+    /// regime and the noise floor.
+    const CLONE_DISTANCE_UPPER: f64 = 0.20;
+
+    /// Lower bound for "distinct family" pair distance: structurally
+    /// different functions should land at d/D strictly above this
+    /// value. Margin ≈ 0.15 between this and `CLONE_DISTANCE_UPPER`
+    /// is what makes the binary clone-vs-distinct verdict reliable.
+    const DISTINCT_DISTANCE_LOWER: f64 = 0.35;
+
     #[test]
     fn parses_simple_go_function() {
         // Sanity: parsing must produce a non-trivial tree.
@@ -512,29 +525,29 @@ mod tests {
         let d_a_c = normalized_distance(&hv_a, &hv_c);
         let d_b_c = normalized_distance(&hv_b, &hv_c);
 
-        eprintln!("d(A,A') = {d_clones:.4} (clones — expect < 0.20)");
-        eprintln!("d(A,B)  = {d_a_b:.4} (distinct — expect > 0.35)");
-        eprintln!("d(A,C)  = {d_a_c:.4} (distinct — expect > 0.35)");
-        eprintln!("d(B,C)  = {d_b_c:.4} (distinct — expect > 0.35)");
+        eprintln!("d(A,A') = {d_clones:.4} (clones — expect < {CLONE_DISTANCE_UPPER})");
+        eprintln!("d(A,B)  = {d_a_b:.4} (distinct — expect > {DISTINCT_DISTANCE_LOWER})");
+        eprintln!("d(A,C)  = {d_a_c:.4} (distinct — expect > {DISTINCT_DISTANCE_LOWER})");
+        eprintln!("d(B,C)  = {d_b_c:.4} (distinct — expect > {DISTINCT_DISTANCE_LOWER})");
 
         // Clones cluster.
         assert!(
-            d_clones < 0.20,
-            "near-clone pair too far apart: d/D = {d_clones:.4} (expected < 0.20)",
+            d_clones < CLONE_DISTANCE_UPPER,
+            "near-clone pair too far apart: d/D = {d_clones:.4} (expected < {CLONE_DISTANCE_UPPER})",
         );
 
         // Distinct pairs land far.
         assert!(
-            d_a_b > 0.35,
-            "A vs B too close: d/D = {d_a_b:.4} (expected > 0.35)",
+            d_a_b > DISTINCT_DISTANCE_LOWER,
+            "A vs B too close: d/D = {d_a_b:.4} (expected > {DISTINCT_DISTANCE_LOWER})",
         );
         assert!(
-            d_a_c > 0.35,
-            "A vs C too close: d/D = {d_a_c:.4} (expected > 0.35)",
+            d_a_c > DISTINCT_DISTANCE_LOWER,
+            "A vs C too close: d/D = {d_a_c:.4} (expected > {DISTINCT_DISTANCE_LOWER})",
         );
         assert!(
-            d_b_c > 0.35,
-            "B vs C too close: d/D = {d_b_c:.4} (expected > 0.35)",
+            d_b_c > DISTINCT_DISTANCE_LOWER,
+            "B vs C too close: d/D = {d_b_c:.4} (expected > {DISTINCT_DISTANCE_LOWER})",
         );
 
         // Margin: clones MUST be closer to each other than to any distinct.

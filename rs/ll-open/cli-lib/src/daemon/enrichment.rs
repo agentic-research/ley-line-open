@@ -385,6 +385,28 @@ mod tests {
     }
 
     #[test]
+    fn enrichment_stats_serialize_to_expected_json_shape() {
+        // EnrichmentStats is Serialize'd into op_enrich responses —
+        // clients depend on these field names. A refactor renaming
+        // pass_name → name (or _ms suffix drops) would silently
+        // break the wire format. Pin the JSON shape directly.
+        let stats = EnrichmentStats {
+            pass_name: "demo".to_string(),
+            files_processed: 4,
+            items_added: 17,
+            duration_ms: 250,
+        };
+        let json = serde_json::to_value(&stats).unwrap();
+        let obj = json.as_object().expect("must serialize as object");
+        assert_eq!(obj.get("pass_name").and_then(|v| v.as_str()), Some("demo"));
+        assert_eq!(obj.get("files_processed").and_then(|v| v.as_u64()), Some(4));
+        assert_eq!(obj.get("items_added").and_then(|v| v.as_u64()), Some(17));
+        assert_eq!(obj.get("duration_ms").and_then(|v| v.as_u64()), Some(250));
+        // No surprise extra fields.
+        assert_eq!(obj.len(), 4, "exactly four fields expected, got {}", obj.len());
+    }
+
+    #[test]
     fn tree_sitter_pass_trait_metadata_pin() {
         // The base TreeSitterPass advertises name="tree-sitter" — the
         // string EmbeddingPass + LspEnrichmentPass.depends_on cite.

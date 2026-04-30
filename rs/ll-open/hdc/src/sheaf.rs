@@ -1068,6 +1068,36 @@ mod tests {
     }
 
     #[test]
+    fn compute_h0_uses_restriction_maps() {
+        // Two cells whose stalks differ by a fixed rotation should
+        // be merged in H⁰ when the edge's restriction_source undoes
+        // the rotation. Without restriction support, compute_h0
+        // would see Hamming ≈ D/2 and leave them as singletons.
+        // Pins that compute_h0 routes through `edge_hamming` (which
+        // applies restrictions), not through raw popcount_distance.
+        let mut cx = HvCellComplex::new();
+        let canonical = stalk_for(1);
+        let rotated = rotate_left(&canonical, 50);
+        cx.add_cell(HvCell::new("fn_a", CanonicalKind::Decl).with_stalk(LayerKind::Ast, rotated));
+        cx.add_cell(HvCell::new("fn_b", CanonicalKind::Decl).with_stalk(LayerKind::Ast, canonical));
+        cx.set_threshold(LayerKind::Ast, 0); // exact match required
+        cx.add_edge(HvEdge {
+            source: "fn_a".into(),
+            target: "fn_b".into(),
+            kind: EdgeKind::Sibling,
+            layer: LayerKind::Ast,
+            // Undo the source's rotation so it aligns with target.
+            restrict_source: Restriction::RotateLeft(D_BITS - 50),
+            restrict_target: Restriction::Identity,
+        });
+        let groups = cx.compute_h0(LayerKind::Ast);
+        // With restrictions aligning the stalks, fn_a and fn_b
+        // should merge into a single H⁰ component.
+        assert_eq!(groups.len(), 1, "restriction-aligned cells must merge");
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
     fn edge_with_matching_restrictions_is_consistent() {
         // Two cells whose stalks differ only by a known rotation
         // (one cell holds the rotated form, the other holds the

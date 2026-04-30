@@ -1493,19 +1493,25 @@ mod tests {
         assert!(rows.is_empty(), "missing table must yield empty, not error");
     }
 
+    /// Open an in-memory conn with a minimal `_lsp(node_id, foo)`
+    /// table — the fixture shape used by the
+    /// `query_lsp_rows_for_file_*` tests below. Centralizes the
+    /// CREATE so the table shape stays consistent.
+    fn lsp_test_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE _lsp (node_id TEXT, foo TEXT);")
+            .unwrap();
+        conn
+    }
+
     #[test]
     fn query_lsp_rows_for_file_returns_empty_when_no_match() {
         // Pre-enrichment / no-rows-for-file is the common pre-LSP case;
         // callers expect an empty Vec, not an error.
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE _lsp (node_id TEXT, foo TEXT);
-             INSERT INTO _lsp VALUES ('other.rs/x', 'bar');",
-        )
-        .unwrap();
-        let sql = format!(
-            "SELECT node_id, foo FROM _lsp WHERE {NODE_ID_FOR_FILE}"
-        );
+        let conn = lsp_test_conn();
+        conn.execute_batch("INSERT INTO _lsp VALUES ('other.rs/x', 'bar');")
+            .unwrap();
+        let sql = format!("SELECT node_id, foo FROM _lsp WHERE {NODE_ID_FOR_FILE}");
         let rows = query_lsp_rows_for_file(&conn, "src/lib.rs", "_lsp", &sql, |row| {
             Ok(json!({"node_id": row.get::<_, String>(0)?, "foo": row.get::<_, String>(1)?}))
         })
@@ -1519,18 +1525,15 @@ mod tests {
         // with `<file>/` — the LIKE prefix from NODE_ID_FOR_FILE is the
         // boundary between scoped queries (used by symbols/diagnostics)
         // and global queries (used by find_callers/find_defs).
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = lsp_test_conn();
         conn.execute_batch(
-            "CREATE TABLE _lsp (node_id TEXT, foo TEXT);
-             INSERT INTO _lsp VALUES
+            "INSERT INTO _lsp VALUES
                 ('src/lib.rs/a', 'one'),
                 ('src/lib.rs/b', 'two'),
                 ('src/other.rs/c', 'three');",
         )
         .unwrap();
-        let sql = format!(
-            "SELECT node_id, foo FROM _lsp WHERE {NODE_ID_FOR_FILE}"
-        );
+        let sql = format!("SELECT node_id, foo FROM _lsp WHERE {NODE_ID_FOR_FILE}");
         let rows = query_lsp_rows_for_file(&conn, "src/lib.rs", "_lsp", &sql, |row| {
             Ok(json!({"node_id": row.get::<_, String>(0)?, "foo": row.get::<_, String>(1)?}))
         })

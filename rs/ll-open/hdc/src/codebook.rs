@@ -317,6 +317,22 @@ mod tests {
     }
 
     #[test]
+    fn simhash_signs_all_negative_dots_yield_zero_hv() {
+        // Sister pin to simhash_signs_thresholds_at_zero_inclusive
+        // (which covers the >= 0 inclusive case via per-bit probes)
+        // and project_zero_embedding_yields_all_ones (which covers
+        // the all-zero-dot case). Closes the gap: when every dot
+        // is strictly negative, no bit is set — output is the all-
+        // zero hypervector. Catches a refactor that flipped the
+        // sign convention to `dot < 0 sets bit` or that initialized
+        // the accumulator to all-ones instead of ZERO_HV.
+        let hyperplanes: Vec<Vec<f32>> = (0..D_BITS).map(|_| vec![0.0]).collect();
+        let signs = simhash_signs(&hyperplanes, |_| -1.0);
+        let ones: u32 = signs.iter().map(|b| b.count_ones()).sum();
+        assert_eq!(ones, 0, "all-negative dots must yield ZERO_HV");
+    }
+
+    #[test]
     fn ast_node_fingerprint_leaf_has_zero_arity_no_children() {
         // Pin the leaf constructor's contract: arity=0, empty child
         // vec, exact kind preserved. Catches a refactor that

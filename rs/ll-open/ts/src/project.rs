@@ -490,4 +490,97 @@ mod tests {
         project_ast(src, lang, &conn).unwrap();
         assert!(count_nodes(&conn) >= 1);
     }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn json_deeply_nested_object() {
+        // Scale pin for registry-repo data: helm chart values, JSON Schema
+        // documents, and OpenAPI specs commonly nest 50–100 levels deep.
+        // Pin that 256-level nesting (~2.5x typical) parses without
+        // stack overflow OR runaway recursion in the projection walk.
+        // If this regresses, registry-repo ingest crashes silently on
+        // pathological-but-legal data.
+        let conn = open_mem();
+        let depth = 256;
+        let mut src = String::new();
+        for _ in 0..depth {
+            src.push_str("{\"k\":");
+        }
+        src.push_str("42");
+        for _ in 0..depth {
+            src.push('}');
+        }
+        let lang: Language = tree_sitter_json::LANGUAGE.into();
+        project_ast(src.as_bytes(), lang, &conn).unwrap();
+        // At least one node per nesting level + the leaf number.
+        assert!(
+            count_nodes(&conn) >= depth as i64,
+            "expected ≥{depth} nodes for {depth}-deep nesting, got {}",
+            count_nodes(&conn),
+        );
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn yaml_deeply_nested_mapping() {
+        // Scale pin parallel to json_deeply_nested_object. YAML block
+        // mappings nest naturally in helm charts (values.yaml under
+        // multi-tenant overlays).
+        let conn = open_mem();
+        let depth = 100;
+        let mut src = String::new();
+        for i in 0..depth {
+            // Use 2-space indent per level. YAML can't reasonably go to
+            // 256 levels because the indentation alone would consume
+            // 512 bytes per leaf line; 100 is comfortably above the
+            // ~30-50 levels real registry repos hit.
+            for _ in 0..i {
+                src.push_str("  ");
+            }
+            src.push_str(&format!("k{i}:\n"));
+        }
+        // Final value at the deepest level.
+        for _ in 0..depth {
+            src.push_str("  ");
+        }
+        src.push_str("leaf: ok\n");
+
+        let lang: Language = tree_sitter_yaml::LANGUAGE.into();
+        project_ast(src.as_bytes(), lang, &conn).unwrap();
+        assert!(
+            count_nodes(&conn) >= depth as i64,
+            "expected ≥{depth} nodes for {depth}-deep nesting, got {}",
+            count_nodes(&conn),
+        );
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn json_wide_array() {
+        // Scale pin: arrays with thousands of siblings (e.g. helm values
+        // overrides, Kubernetes resource lists). The projection walk
+        // iterates siblings linearly; pin that 5000 siblings stays
+        // tractable + every sibling gets a unique id.
+        let conn = open_mem();
+        let n = 5000;
+        let elements: Vec<String> = (0..n).map(|i| i.to_string()).collect();
+        let src = format!("[{}]", elements.join(","));
+
+        let lang: Language = tree_sitter_json::LANGUAGE.into();
+        project_ast(src.as_bytes(), lang, &conn).unwrap();
+
+        let ids = all_ids(&conn);
+        let mut seen = std::collections::HashSet::new();
+        for id in &ids {
+            assert!(
+                seen.insert(id.clone()),
+                "duplicate id in wide array: {id}",
+            );
+        }
+        assert!(
+            ids.len() >= n,
+            "expected ≥{n} unique ids for {n}-element array, got {}",
+            ids.len(),
+        );
+    }
 }

@@ -449,6 +449,28 @@ mod tests {
     }
 
     #[test]
+    fn resolve_order_cycle_does_not_infinite_loop() {
+        // resolve_recursive's visited-set check (line 223) doubles as
+        // a cycle breaker: A depends on B, B depends on A. Without
+        // the visited-set short-circuit the recursion would never
+        // terminate. Today the function returns an order containing
+        // both names — undocumented but pinning the current behavior
+        // means a refactor that switched to "error on cycle" (perhaps
+        // the right call!) requires a deliberate test update.
+        let passes = vec![
+            mock("a", &["b"], &[], &[]),
+            mock("b", &["a"], &[], &[]),
+        ];
+        let order = resolve_order(&passes, "a").expect("must terminate, not loop");
+        // Both names present, in some order — invariants we DO pin:
+        //   - termination (no infinite recursion)
+        //   - both names in the result (no silent drop)
+        assert_eq!(order.len(), 2);
+        assert!(order.contains(&"a".to_string()));
+        assert!(order.contains(&"b".to_string()));
+    }
+
+    #[test]
     fn resolve_order_diamond_deps() {
         let passes = vec![
             mock("base", &[], &[], &["t0"]),

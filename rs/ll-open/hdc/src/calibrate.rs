@@ -15,8 +15,6 @@ use rusqlite::Connection;
 
 use crate::util::{blake3_seed, hv_from_slice, popcount_distance, splitmix64, Hypervector};
 use crate::LayerKind;
-#[cfg(test)]
-use crate::D_BYTES;
 
 /// Default sample size for calibration. Math-friend review B
 /// recommended 10k random pairs as the sweet spot between speed
@@ -281,14 +279,14 @@ mod tests {
         let boilerplate = expand_seed(0xBADC_AFFE);
         for i in 0..50 {
             let mut hv = boilerplate;
-            // Set only a small number of differing bits per scope,
-            // so all pairs share most of their bits.
+            // XOR a per-scope diff into the first 128 bytes (1024 bits)
+            // so all pairs share the remaining 896 bytes verbatim.
             let diff = expand_seed(i + 1);
-            // Take only the first 1024 bits of diff as the unique part.
-            for byte in hv.iter_mut().take(128) {
-                *byte ^= diff[(byte as *mut u8 as usize) % D_BYTES];
+            for (idx, byte) in hv.iter_mut().enumerate().take(128) {
+                *byte ^= diff[idx];
             }
-            // Add minimal per-scope variation.
+            // Per-scope tweak so two different `i` values that pulled
+            // the same diff prefix still differ.
             hv[0] ^= i as u8;
             insert_layer_hv(&conn, &format!("s{i}"), LayerKind::Ast, &hv, 1);
         }

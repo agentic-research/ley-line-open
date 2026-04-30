@@ -687,6 +687,31 @@ mod tests {
     }
 
     #[test]
+    fn event_serialize_to_expected_json_shape() {
+        // Event is Serialize'd into the subscribe response stream.
+        // Clients dispatch on `event: true` to tell pushed events
+        // apart from request/response. Field-rename or accidental
+        // skip-serialize would silently break every subscriber. Pin
+        // the wire shape: 5 fields with exact names and pass-through
+        // values; the `event` flag must be true.
+        let evt = Event {
+            event: true,
+            seq: 42,
+            topic: "node.spliced".into(),
+            source: "leyline".into(),
+            data: serde_json::json!({"node_ids": ["abc"]}),
+        };
+        let json = serde_json::to_value(&evt).unwrap();
+        let obj = json.as_object().expect("Event must serialize as object");
+        assert_eq!(obj.get("event").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(obj.get("seq").and_then(|v| v.as_u64()), Some(42));
+        assert_eq!(obj.get("topic").and_then(|v| v.as_str()), Some("node.spliced"));
+        assert_eq!(obj.get("source").and_then(|v| v.as_str()), Some("leyline"));
+        assert!(obj.get("data").is_some(), "data field must serialize");
+        assert_eq!(obj.len(), 5, "exactly 5 fields expected, got {}", obj.len());
+    }
+
+    #[test]
     fn event_log_capacity() {
         let mut log = EventLog::new(3);
         for i in 1..=5 {

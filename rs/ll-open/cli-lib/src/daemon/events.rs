@@ -704,6 +704,28 @@ mod tests {
     }
 
     #[test]
+    fn event_log_head_seq_returns_zero_when_empty_else_last_seq() {
+        // EventRouter::head_seq surfaces this in the subscribe
+        // response (events.rs:467) — clients use it to decide their
+        // initial since-watermark. Empty log → 0; populated log →
+        // back's seq. Untested directly. A refactor that returned
+        // the front's seq, or u64::MAX on empty, would silently
+        // misalign client watermarks.
+        let mut log = EventLog::new(10);
+        assert_eq!(log.head_seq(), 0, "empty log must report 0");
+        for i in 1..=4 {
+            log.push(Event {
+                event: true,
+                seq: i,
+                topic: "test".into(),
+                source: "test".into(),
+                data: serde_json::json!({}),
+            });
+        }
+        assert_eq!(log.head_seq(), 4, "head_seq must reflect last-pushed seq");
+    }
+
+    #[test]
     fn event_log_replay_since() {
         let mut log = EventLog::new(100);
         for i in 1..=5 {

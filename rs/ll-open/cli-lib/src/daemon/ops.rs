@@ -221,6 +221,17 @@ where
     f(&guard)
 }
 
+/// Open the controller and return its current generation. Centralizes the
+/// "open ctrl + read generation" pair that every op which mutates state
+/// needs to include in its JSON response. The `"open controller"` context
+/// string is part of the wire-error contract — clients see this when the
+/// controller path is broken.
+fn read_generation(ctrl_path: &Path) -> Result<u64> {
+    Controller::open_or_create(ctrl_path)
+        .context("open controller")
+        .map(|c| c.generation())
+}
+
 // ---------------------------------------------------------------------------
 // Control ops (don't need the living db)
 // ---------------------------------------------------------------------------
@@ -267,10 +278,9 @@ fn op_status(ctx: &DaemonContext) -> Result<String> {
 }
 
 fn op_flush(ctrl_path: &Path) -> Result<String> {
-    let ctrl = Controller::open_or_create(ctrl_path).context("open controller")?;
     Ok(json!({
         "ok": true,
-        "generation": ctrl.generation(),
+        "generation": read_generation(ctrl_path)?,
     })
     .to_string())
 }
@@ -285,8 +295,7 @@ fn op_load(ctrl_path: &Path, req: &serde_json::Value) -> Result<String> {
         .decode(b64)
         .context("invalid base64 in \"db\" field")?;
     crate::cmd_load::load_into_arena(ctrl_path, &db_bytes)?;
-    let ctrl = Controller::open_or_create(ctrl_path).context("open controller")?;
-    Ok(json!({"ok": true, "generation": ctrl.generation()}).to_string())
+    Ok(json!({"ok": true, "generation": read_generation(ctrl_path)?}).to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -397,10 +406,9 @@ fn op_reparse(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
         s.last_reparse_at_ms = Some(super::now_ms());
     }
 
-    let ctrl = Controller::open_or_create(&ctx.ctrl_path).context("open controller")?;
     Ok(json!({
         "ok": true,
-        "generation": ctrl.generation(),
+        "generation": read_generation(&ctx.ctrl_path)?,
         "parsed": result.parsed,
         "unchanged": result.unchanged,
         "deleted": result.deleted,
@@ -439,10 +447,9 @@ fn op_enrich(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
         &ctx.ctrl_path,
     )?;
 
-    let ctrl = Controller::open_or_create(&ctx.ctrl_path).context("open controller")?;
     Ok(json!({
         "ok": true,
-        "generation": ctrl.generation(),
+        "generation": read_generation(&ctx.ctrl_path)?,
         "passes": stats,
     })
     .to_string())
@@ -453,8 +460,7 @@ fn op_snapshot(ctx: &DaemonContext) -> Result<String> {
         &ctx.live_db.lock().unwrap(),
         &ctx.ctrl_path,
     )?;
-    let ctrl = Controller::open_or_create(&ctx.ctrl_path).context("open controller")?;
-    Ok(json!({"ok": true, "generation": ctrl.generation()}).to_string())
+    Ok(json!({"ok": true, "generation": read_generation(&ctx.ctrl_path)?}).to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1179,6 +1185,43 @@ mod tests {
                 "handle_base_op did not recognize canonical op `{name}`",
             );
         }
+    }
+
+    #[test]
+    fn read_generation_starts_at_zero_for_fresh_controller() {
+        // Wire-contract: a brand-new controller reports generation 0.
+        // This is what op_status / op_flush / op_load / op_reparse /
+        // op_enrich / op_snapshot all surface to clients in the
+        // `generation` field. If a future Controller bump changes the
+        // initial value silently, integration tests that pin
+        // `parsed["generation"] == 0` would fail mysteriously without
+        // this unit test.
+        let dir = TempDir::new().unwrap();
+        let arena_path = dir.path().join("g.arena");
+        let ctrl_path = dir.path().join("g.ctrl");
+        let _mmap = leyline_core::create_arena(&arena_path, 1024 * 1024).unwrap();
+        let mut ctrl = leyline_core::Controller::open_or_create(&ctrl_path).unwrap();
+        ctrl.set_arena(&arena_path.to_string_lossy(), 1024 * 1024, 0)
+            .unwrap();
+        drop(ctrl);
+
+        assert_eq!(read_generation(&ctrl_path).unwrap(), 0);
+    }
+
+    #[test]
+    fn read_generation_propagates_open_failure() {
+        // The "open controller" context string is part of the wire-error
+        // contract. Pin its presence by triggering a path-doesn't-resolve
+        // error. The test asserts the message reaches the caller through
+        // anyhow's chain — without it, debugging a broken controller path
+        // would be much harder.
+        let bad_path = std::path::Path::new("/dev/null/definitely_not_a_directory/ctrl");
+        let err = read_generation(bad_path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("open controller"),
+            "expected error chain to mention 'open controller', got: {msg}",
+        );
     }
 
     #[test]

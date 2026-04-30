@@ -660,4 +660,37 @@ mod tests {
         let count = density_count(&conn, LayerKind::Ast, &q, 1000).unwrap();
         assert_eq!(count, 0);
     }
+
+    #[test]
+    fn combined_prefilter_empty_table_returns_empty() {
+        // Symmetric edge case to the radius/density empty-table pins:
+        // a fresh DB with no rows in `_hdc_combined` must produce an
+        // empty top-K, never propagate a SQL error or panic. This is
+        // what a daemon that just started (before any reparse) sees.
+        let conn = fresh_with_udfs();
+        let q = expand_seed(1);
+        let topk = combined_prefilter(&conn, &q, 10).unwrap();
+        assert!(topk.is_empty());
+    }
+
+    #[test]
+    fn radius_search_radius_zero_returns_only_exact_matches() {
+        // Radius 0 = Hamming distance ≤ 0 = exact match. A scope
+        // 1 bit away from the query must NOT be returned. Pin so a
+        // refactor that flipped `<=` to `<` (which would still exclude
+        // the same rows) or `<=` to `<` with subtle off-by-one
+        // doesn't sneak in.
+        let conn = fresh_with_udfs();
+        let q = expand_seed(0xCAFE);
+        let mut one_bit_off = q;
+        one_bit_off[0] ^= 1;
+
+        insert(&conn, "exact", LayerKind::Ast, &q, 1);
+        insert(&conn, "one_off", LayerKind::Ast, &one_bit_off, 1);
+
+        let matches = radius_search(&conn, LayerKind::Ast, &q, 0, 10).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].scope_id, "exact");
+        assert_eq!(matches[0].distance, 0);
+    }
 }

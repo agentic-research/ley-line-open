@@ -1349,6 +1349,31 @@ mod tests {
     }
 
     #[test]
+    fn restriction_composite_recurses_through_nested_composites() {
+        // Composite::apply calls `r.apply(...)` on each child — if a
+        // child is itself a Composite, the recursion handles it
+        // naturally. Pin via Composite([RotateLeft(3),
+        // Composite([RotateLeft(7)])]) == Composite([RotateLeft(3),
+        // RotateLeft(7)]) == RotateLeft(10). A refactor that flattened
+        // the parts list at construction (or, worse, panicked on
+        // nested Composite to "force linear chains") would surface.
+        let hv = stalk_for(2024);
+        let nested = Restriction::Composite(vec![
+            Restriction::RotateLeft(3),
+            Restriction::Composite(vec![Restriction::RotateLeft(7)]),
+        ])
+        .apply(&hv);
+        let flat = Restriction::Composite(vec![
+            Restriction::RotateLeft(3),
+            Restriction::RotateLeft(7),
+        ])
+        .apply(&hv);
+        assert_eq!(nested, flat);
+        // And both equal direct RotateLeft(10):
+        assert_eq!(nested, Restriction::RotateLeft(10).apply(&hv));
+    }
+
+    #[test]
     fn restriction_composite_chains_in_order() {
         // Composite([a, b]).apply(x) == b.apply(a.apply(x)). Pin this
         // so a future "fold from the right" refactor would fail loudly.

@@ -101,7 +101,9 @@ impl SemanticCodebook {
 
 /// Box-Muller transform: produce `n` independent Gaussian-distributed
 /// f32 values from a SplitMix64 seed. Standard normal (mean 0, var 1).
-fn gaussian_row(seed: u64, n: usize) -> Vec<f32> {
+/// Shared with TemporalCodebook (which uses the same simhash projection
+/// machinery on a different input shape).
+pub(super) fn gaussian_row(seed: u64, n: usize) -> Vec<f32> {
     use std::f32::consts::TAU;
 
     let mut state = seed;

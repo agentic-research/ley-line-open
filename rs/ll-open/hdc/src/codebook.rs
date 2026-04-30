@@ -113,3 +113,8 @@ pub use module::{encode_module, module_distance, ModuleCodebook};
 
 pub mod semantic;
 pub use semantic::{SemanticCodebook, SEMANTIC_HYPERPLANE_SEED};
+
+pub mod temporal;
+pub use temporal::{
+    TemporalCodebook, TemporalCoEditMatrix, DEFAULT_TAU_SECONDS, TEMPORAL_HYPERPLANE_SEED,
+};

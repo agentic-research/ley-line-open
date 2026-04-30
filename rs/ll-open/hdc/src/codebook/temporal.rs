@@ -201,6 +201,13 @@ mod tests {
     /// One day in seconds — convenience for time-decay tests.
     const DAY: f64 = 86_400.0;
 
+    /// A "now" timestamp shared across temporal tests (Unix epoch
+    /// Nov 14 2023). Replaces the literal `1_700_000_000.0` that
+    /// appeared 11× in the test bodies. Any reasonable past time
+    /// works; using the same value everywhere makes test output
+    /// uniform and pins one canonical reference point.
+    const NOW: f64 = 1_700_000_000.0;
+
     #[test]
     fn matrix_intern_assigns_stable_indices() {
         let mut m = TemporalCoEditMatrix::new();
@@ -218,7 +225,7 @@ mod tests {
     #[test]
     fn fresh_commit_has_unit_weight() {
         let mut m = TemporalCoEditMatrix::new();
-        let now = 1_700_000_000.0;
+        let now = NOW;
         m.add_commit(&["a", "b"], now, now);
         let row = m.sparse_row("a");
         assert_eq!(row.len(), 1);
@@ -232,7 +239,7 @@ mod tests {
     #[test]
     fn old_commit_decays_exponentially() {
         let mut m = TemporalCoEditMatrix::with_tau(DAY * 90.0);
-        let now = 1_700_000_000.0;
+        let now = NOW;
         // Commit from τ seconds ago: weight should be exp(-1) ≈ 0.368.
         m.add_commit(&["a", "b"], now, now - DAY * 90.0);
         let row = m.sparse_row("a");
@@ -258,7 +265,7 @@ mod tests {
         // Multiple commits touching the same pair accumulate weight.
         // Three fresh commits → weight = 3.0.
         let mut m = TemporalCoEditMatrix::new();
-        let now = 1_700_000_000.0;
+        let now = NOW;
         for _ in 0..3 {
             m.add_commit(&["a", "b"], now, now);
         }
@@ -299,7 +306,7 @@ mod tests {
         // scope C co-edits with D (only). Project both rows; they
         // should land far apart in Hamming because the dot products
         // hit different hyperplane components.
-        let now = 1_700_000_000.0;
+        let now = NOW;
         let mut m = TemporalCoEditMatrix::new();
         m.add_commit(&["a", "b"], now, now);
         m.add_commit(&["c", "d"], now, now);
@@ -324,7 +331,7 @@ mod tests {
         // most of their non-zero row support. Their projections should
         // therefore be much closer than two scopes with disjoint
         // partners.
-        let now = 1_700_000_000.0;
+        let now = NOW;
         let mut m = TemporalCoEditMatrix::new();
         // a and c both co-edit with b.
         m.add_commit(&["a", "b"], now, now);
@@ -352,7 +359,7 @@ mod tests {
     fn temporal_codebook_seed_versioning_changes_hv() {
         // Bumping the seed produces a different hyperplane matrix,
         // and therefore a different projection. Migration safety pin.
-        let now = 1_700_000_000.0;
+        let now = NOW;
         let mut m = TemporalCoEditMatrix::new();
         m.add_commit(&["a", "b"], now, now);
 
@@ -374,7 +381,7 @@ mod tests {
         // This is the load-bearing property that makes temporal HVs
         // useful for delta sync — if every commit shifted every scope's
         // HV substantially, we'd never converge on stable hotspots.
-        let now = 1_700_000_000.0;
+        let now = NOW;
         let mut m = TemporalCoEditMatrix::new();
         m.add_commit(&["a", "b"], now, now);
         m.add_commit(&["a", "c"], now, now);
@@ -405,7 +412,7 @@ mod tests {
         // is the "matrix grew past my pre-allocation" recovery path —
         // production callers should size max_scopes generously, but a
         // test fixture that overfills must not crash.
-        let now = 1_700_000_000.0;
+        let now = NOW;
         let mut m = TemporalCoEditMatrix::new();
         // Force scope "x" to index 0.
         m.add_commit(&["x", "y"], now, now);
@@ -427,7 +434,7 @@ mod tests {
         // the matrix. Pin the combinatorics so a refactor that switched
         // to "every pair against every later pair" or some other
         // off-by-one would be caught.
-        let now = 1_700_000_000.0;
+        let now = NOW;
         let mut m = TemporalCoEditMatrix::new();
         m.add_commit(&["a", "b", "c", "d"], now, now);
         // (a,b), (a,c), (a,d), (b,c), (b,d), (c,d) = 6 pairs
@@ -439,7 +446,7 @@ mod tests {
         // A commit that touches one scope adds zero pairs (no co-edits
         // possible with self). Pin the corner case so a future refactor
         // doesn't accidentally count self-pairs.
-        let now = 1_700_000_000.0;
+        let now = NOW;
         let mut m = TemporalCoEditMatrix::new();
         m.add_commit(&["a"], now, now);
         // Scope is registered (so future commits can refer to it)…
@@ -476,7 +483,7 @@ mod tests {
 
     #[test]
     fn nnz_grows_with_distinct_pairs() {
-        let now = 1_700_000_000.0;
+        let now = NOW;
         let mut m = TemporalCoEditMatrix::new();
         // First commit: {a,b,c} → 3 distinct unordered pairs.
         m.add_commit(&["a", "b", "c"], now, now);

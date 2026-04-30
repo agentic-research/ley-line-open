@@ -8,6 +8,8 @@
 //!
 //! Feature-gated behind `hdc`.
 
+use tree_sitter::{Language, Node, Parser};
+
 use leyline_hdc::canonical::CanonicalKindMap;
 use leyline_hdc::EncoderNode;
 
@@ -15,7 +17,7 @@ use leyline_hdc::EncoderNode;
 /// children contribute (matching the Deckard production-signature
 /// discipline — anonymous nodes are parser implementation detail and
 /// shouldn't drive the equivalence relation).
-pub fn tree_to_encoder_node(node: tree_sitter::Node<'_>, kind_map: &dyn CanonicalKindMap) -> EncoderNode {
+pub fn tree_to_encoder_node(node: Node<'_>, kind_map: &dyn CanonicalKindMap) -> EncoderNode {
     let canonical = kind_map.lookup(node.kind());
 
     let mut children: Vec<EncoderNode> = Vec::new();
@@ -41,10 +43,10 @@ pub fn tree_to_encoder_node(node: tree_sitter::Node<'_>, kind_map: &dyn Canonica
 /// returns `None` on extreme malformations).
 pub fn parse_and_encode_tree(
     source: &str,
-    language: &tree_sitter::Language,
+    language: &Language,
     kind_map: &dyn CanonicalKindMap,
 ) -> Option<EncoderNode> {
-    let mut parser = tree_sitter::Parser::new();
+    let mut parser = Parser::new();
     parser.set_language(language).ok()?;
     let tree = parser.parse(source, None)?;
     Some(tree_to_encoder_node(tree.root_node(), kind_map))

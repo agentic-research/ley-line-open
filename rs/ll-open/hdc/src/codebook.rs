@@ -53,12 +53,19 @@ pub trait BaseCodebook: Send + Sync {
     /// Map a logical role to a role hypervector. Used by codebooks that
     /// need non-positional binding (e.g. layer-tagged combined view,
     /// module method-set vs field-set). The AST encoder doesn't call
-    /// this — positional encoding is via permutation. Default impl
-    /// uses the generic `"hdc-role"` tag; impls override with their
-    /// own tag (e.g. `"hdc-ast-role"`) to avoid cross-codebook
-    /// collisions.
+    /// this — positional encoding is via permutation.
+    ///
+    /// Default impl derives the role tag from `codebook_tag()` by
+    /// appending `"-role"`, so AstCodebook ("hdc-ast") yields role
+    /// tag "hdc-ast-role" and ModuleCodebook ("hdc-module") yields
+    /// "hdc-module-role" — automatically domain-separated per
+    /// codebook without each impl having to override. Impls only
+    /// need to override if they want a non-standard tag scheme
+    /// (skeptic 4bbc54: previously every impl wrote an identical
+    /// override; now the default suffices and the dedup is real).
     fn role_vector(&self, role_index: usize) -> Hypervector {
-        crate::util::tagged_seed_vector("hdc-role", role_index)
+        let tag = format!("{}-role", self.codebook_tag());
+        crate::util::tagged_seed_vector(&tag, role_index)
     }
 }
 

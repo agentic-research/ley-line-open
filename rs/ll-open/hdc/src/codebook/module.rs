@@ -21,7 +21,7 @@
 use crate::codebook::{AstNodeFingerprint, BaseCodebook};
 use crate::encoder::EncoderNode;
 use crate::util::{
-    bucket_arity, expand_seed, popcount_distance, rotate_left, tagged_seed_vector, xor_into,
+    bucket_arity, expand_seed, popcount_distance, rotate_left, xor_into,
     Hypervector, ZERO_HV,
 };
 
@@ -90,11 +90,9 @@ impl BaseCodebook for ModuleCodebook {
         expand_seed(crate::util::blake3_seed(&buf))
     }
 
-    fn role_vector(&self, role_index: usize) -> Hypervector {
-        // Domain-tagged so module roles never collide with AST roles
-        // at unbind cleanup-memory time.
-        tagged_seed_vector("hdc-module-role", role_index)
-    }
+    // role_vector: uses the trait default (codebook_tag + "-role").
+    // Default produces tag "hdc-module-role" — byte-identical to the
+    // previous explicit override (skeptic 4bbc54 dedup).
 }
 
 /// Encode a tree at the *module* level: only the file-root's immediate
@@ -306,6 +304,25 @@ mod tests {
         let m_role0 = module_cb.role_vector(0);
         let a_role0 = ast_cb.role_vector(0);
         assert_far_apart(&m_role0, &a_role0, "module role-0 must not collide with AST role-0");
+    }
+
+    #[test]
+    fn module_role_vector_default_matches_explicit_tag() {
+        // Skeptic 4bbc54: deleted the explicit override on
+        // ModuleCodebook, relying on the trait default to derive
+        // "hdc-module-role" from codebook_tag(). Pin that the default
+        // produces byte-identical output to the previous explicit
+        // `tagged_seed_vector("hdc-module-role", N)` form.
+        use crate::util::tagged_seed_vector;
+        let cb = ModuleCodebook::new();
+        for i in [0usize, 1, 7, 42, 1024] {
+            let actual = cb.role_vector(i);
+            let expected = tagged_seed_vector("hdc-module-role", i);
+            assert_eq!(
+                actual, expected,
+                "role_vector({i}) must match tagged_seed_vector(\"hdc-module-role\", {i})"
+            );
+        }
     }
 
     #[test]

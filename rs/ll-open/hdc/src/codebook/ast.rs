@@ -14,7 +14,7 @@ use crate::codebook::{AstNodeFingerprint, BaseCodebook};
 use crate::canonical::CanonicalKind;
 #[cfg(test)]
 use crate::util::assert_far_apart;
-use crate::util::{blake3_seed, expand_seed, tagged_seed_vector, Hypervector};
+use crate::util::{blake3_seed, expand_seed, Hypervector};
 
 /// Default AST codebook. Stateless — same input always produces same
 /// output, no per-instance state to ship between machines.
@@ -54,13 +54,9 @@ impl BaseCodebook for AstCodebook {
         expand_seed(seed)
     }
 
-    fn role_vector(&self, role_index: usize) -> Hypervector {
-        // Role vectors are independent of the codebook content — they
-        // just need to be deterministic per index. Domain-tagged so AST
-        // role-vectors never collide with module/semantic/etc. role
-        // vectors at unbind cleanup-memory time.
-        tagged_seed_vector("hdc-ast-role", role_index)
-    }
+    // role_vector: uses the trait default (codebook_tag + "-role").
+    // Default produces tag "hdc-ast-role" — byte-identical to the
+    // previous explicit override (skeptic 4bbc54 dedup).
 }
 
 /// Convenience constructor for tests / examples — same as `Default`.
@@ -155,6 +151,26 @@ mod tests {
         let r1 = cb.role_vector(1);
         assert_eq!(r0, r0_again, "role_vector must be deterministic per index");
         assert_far_apart(&r0, &r1, "role 0 vs 1");
+    }
+
+    #[test]
+    fn role_vector_default_uses_codebook_tag_plus_role_suffix() {
+        // Skeptic 4bbc54: deleted the explicit override on AstCodebook,
+        // relying on the trait default to derive "hdc-ast-role" from
+        // codebook_tag(). Pin that the default produces byte-identical
+        // output to the previous `tagged_seed_vector("hdc-ast-role", N)`
+        // form so a future refactor of the default suffix scheme would
+        // catch breakage immediately.
+        use crate::util::tagged_seed_vector;
+        let cb = AstCodebook::new();
+        for i in [0usize, 1, 7, 42, 1024] {
+            let actual = cb.role_vector(i);
+            let expected = tagged_seed_vector("hdc-ast-role", i);
+            assert_eq!(
+                actual, expected,
+                "role_vector({i}) must match tagged_seed_vector(\"hdc-ast-role\", {i})"
+            );
+        }
     }
 
     #[test]

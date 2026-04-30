@@ -662,6 +662,25 @@ mod tests {
     }
 
     #[test]
+    fn density_count_respects_layer_filter() {
+        // The SQL `WHERE layer_kind = ?1` clause must isolate counts
+        // per layer. Same scope_id under two distinct layers must NOT
+        // be summed when querying one. Pin so a refactor that drops
+        // the layer predicate (or rewrites it as a JOIN) doesn't
+        // silently inflate density measurements across layers.
+        let conn = fresh_with_udfs();
+        let q = expand_seed(0xABCD);
+        insert(&conn, "in_ast_1", LayerKind::Ast, &q, 1);
+        insert(&conn, "in_ast_2", LayerKind::Ast, &q, 1);
+        insert(&conn, "in_module_1", LayerKind::Module, &q, 1);
+
+        let ast_count = density_count(&conn, LayerKind::Ast, &q, 0).unwrap();
+        let module_count = density_count(&conn, LayerKind::Module, &q, 0).unwrap();
+        assert_eq!(ast_count, 2, "Ast layer must count only Ast rows");
+        assert_eq!(module_count, 1, "Module layer must count only Module rows");
+    }
+
+    #[test]
     fn combined_prefilter_empty_table_returns_empty() {
         // Symmetric edge case to the radius/density empty-table pins:
         // a fresh DB with no rows in `_hdc_combined` must produce an

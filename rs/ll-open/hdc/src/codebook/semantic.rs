@@ -151,20 +151,12 @@ mod tests {
         dot(a, b) / (norm(a) * norm(b))
     }
 
-    #[test]
-    fn semantic_codebook_construction_is_deterministic() {
-        // Same seed-tag + emb_dim must produce identical hyperplane
-        // matrices on every call. This is the cross-machine
-        // reproducibility property — daemon A and daemon B must
-        // produce identical semantic hypervectors for the same
-        // embedding input.
-        let cb1 = SemanticCodebook::new(64);
-        let cb2 = SemanticCodebook::new(64);
-        assert_eq!(cb1.hyperplanes.len(), cb2.hyperplanes.len());
-        for (r1, r2) in cb1.hyperplanes.iter().zip(cb2.hyperplanes.iter()) {
-            assert_eq!(r1, r2);
-        }
-    }
+    // Determinism of `build_hyperplane_matrix` (same tag+width →
+    // same matrix) is pinned once at the source in
+    // `codebook::tests::build_hyperplane_matrix_is_deterministic_per_seed_and_width`.
+    // SemanticCodebook::new just calls that helper, so its
+    // determinism is implied; consumer-side test removed to avoid
+    // duplicating the same property pin.
 
     #[test]
     fn project_identical_embeddings_produces_identical_hvs() {

@@ -207,6 +207,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn build_hyperplane_matrix_is_deterministic_per_seed_and_width() {
+        // Cross-machine reproducibility: same (seed_tag, width) → same
+        // matrix on every call, every machine, every version. Both
+        // SemanticCodebook and TemporalCodebook used to duplicate this
+        // pin in their own test modules; consolidated here at the
+        // source so a future change to build_hyperplane_matrix's
+        // determinism is caught once.
+        let m1 = build_hyperplane_matrix("test-seed-A", 16);
+        let m2 = build_hyperplane_matrix("test-seed-A", 16);
+        assert_eq!(m1.len(), m2.len(), "row count must match");
+        assert_eq!(m1.len(), crate::D_BITS, "row count must equal D_BITS");
+        for (r1, r2) in m1.iter().zip(m2.iter()) {
+            assert_eq!(r1, r2, "rows must match byte-for-byte");
+        }
+    }
+
+    #[test]
+    fn build_hyperplane_matrix_seed_tags_produce_distinct_matrices() {
+        // Different seed_tags must yield different matrices — that's
+        // the property both SemanticCodebook (SEMANTIC_HYPERPLANE_SEED)
+        // and TemporalCodebook (TEMPORAL_HYPERPLANE_SEED) rely on so
+        // their hypervectors don't collide. Sample one row to assert
+        // distinctness without comparing all D_BITS rows.
+        let m_a = build_hyperplane_matrix("hdc-test-tag-A", 8);
+        let m_b = build_hyperplane_matrix("hdc-test-tag-B", 8);
+        assert_eq!(m_a.len(), m_b.len());
+        // At least the first row should differ — Box-Muller from
+        // distinct seeds is overwhelmingly likely to give distinct
+        // floats; a hash collision in row 0 alone is ≈ 2^-64.
+        assert_ne!(m_a[0], m_b[0]);
+    }
+
+    #[test]
     fn ast_node_fingerprint_leaf_has_zero_arity_no_children() {
         // Pin the leaf constructor's contract: arity=0, empty child
         // vec, exact kind preserved. Catches a refactor that

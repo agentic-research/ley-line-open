@@ -276,15 +276,8 @@ mod tests {
         assert!(m.sparse_row("never_seen").is_empty());
     }
 
-    #[test]
-    fn temporal_codebook_construction_is_deterministic() {
-        // Same seed-tag + max_scopes → identical hyperplane matrices.
-        let cb1 = TemporalCodebook::new(64);
-        let cb2 = TemporalCodebook::new(64);
-        for (r1, r2) in cb1.hyperplanes.iter().zip(cb2.hyperplanes.iter()) {
-            assert_eq!(r1, r2);
-        }
-    }
+    // Determinism of build_hyperplane_matrix is pinned once in
+    // `codebook::tests` (see semantic.rs note for the same).
 
     #[test]
     fn project_empty_row_yields_balanced_zero_dot() {

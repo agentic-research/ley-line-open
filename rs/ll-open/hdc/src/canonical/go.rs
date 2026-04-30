@@ -153,8 +153,6 @@ mod tests {
         // for. Not a full end-to-end test (no actual parsing), but
         // pins that `if`-equivalents collapse to a comparable
         // canonical role across the two languages.
-        let rust = super::super::RustCanonicalMap;
-        let go = GoCanonicalMap;
         // Rust: if_expression (Expr) — Go: if_statement (Stmt)
         // These are NOT identical canonical roles because the
         // underlying language semantics differ (Rust's if is an
@@ -162,11 +160,21 @@ mod tests {
         // condition (Expr) and body (Block) — are the same. The
         // alphabet captures the universally-true facts, not
         // language-specific framing.
-        assert_eq!(rust.lookup("identifier"), CanonicalKind::Ref);
-        assert_eq!(go.lookup("identifier"), CanonicalKind::Ref);
-        assert_eq!(rust.lookup("integer_literal"), CanonicalKind::Lit);
-        assert_eq!(go.lookup("int_literal"), CanonicalKind::Lit);
-        assert_eq!(rust.lookup("block"), CanonicalKind::Block);
-        assert_eq!(go.lookup("block"), CanonicalKind::Block);
+        super::super::assert_kinds_match(
+            &super::super::RustCanonicalMap,
+            &[
+                ("identifier", CanonicalKind::Ref),
+                ("integer_literal", CanonicalKind::Lit),
+                ("block", CanonicalKind::Block),
+            ],
+        );
+        super::super::assert_kinds_match(
+            &GoCanonicalMap,
+            &[
+                ("identifier", CanonicalKind::Ref),
+                ("int_literal", CanonicalKind::Lit),
+                ("block", CanonicalKind::Block),
+            ],
+        );
     }
 }

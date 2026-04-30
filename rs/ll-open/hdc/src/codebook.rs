@@ -216,6 +216,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn canonical_signature_bytes_format_pin() {
+        // Pin the canonical byte layout shared by AstCodebook,
+        // ModuleCodebook, and any future codebook that hashes
+        // (kind, arity_bucket, sorted_child_kinds). Format:
+        //   tag_bytes + 0x00 separator
+        //   + kind_disc(1B) + arity(1B) + child_count_le(2B)
+        //   + sorted_child_discs(N B).
+        //
+        // Sister test to ast.rs::signature_byte_format_pin which
+        // pins the same format with the "hdc-ast" tag. This one
+        // uses an arbitrary tag to verify the format is
+        // tag-agnostic.
+        let bytes = canonical_signature_bytes(
+            "test-tag",
+            CanonicalKind::Stmt,        // disc=2
+            3,
+            &[CanonicalKind::Op, CanonicalKind::Block, CanonicalKind::Op], // discs 6, 3, 6 → sorted 3, 6, 6
+        );
+        let mut expected: Vec<u8> = b"test-tag".to_vec();
+        expected.push(0); // tag/payload separator
+        expected.extend_from_slice(&[2u8, 3, 3, 0, 3, 6, 6]);
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn canonical_signature_bytes_distinct_for_distinct_tags() {
+        // Same `(kind, arity, children)` with different tags must
+        // produce different bytes — this is what makes AstCodebook's
+        // base_vector distinct from ModuleCodebook's even when the
+        // structural payload matches (skeptic-review bead 4bb8a0).
+        let payload = (CanonicalKind::Decl, 2u8, vec![CanonicalKind::Block, CanonicalKind::Ref]);
+        let ast_bytes = canonical_signature_bytes("hdc-ast", payload.0, payload.1, &payload.2);
+        let module_bytes =
+            canonical_signature_bytes("hdc-module", payload.0, payload.1, &payload.2);
+        assert_ne!(ast_bytes, module_bytes);
+    }
+
+    #[test]
     fn build_hyperplane_matrix_is_deterministic_per_seed_and_width() {
         // Cross-machine reproducibility: same (seed_tag, width) → same
         // matrix on every call, every machine, every version. Both

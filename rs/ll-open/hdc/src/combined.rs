@@ -280,6 +280,35 @@ mod tests {
     }
 
     #[test]
+    fn build_combined_for_scope_skips_wrong_sized_hv_blobs() {
+        // Sister forward-compat path: a malformed blob (wrong byte
+        // length, e.g. corruption or migration mid-flight) is the
+        // other skip case combined.rs:81 handles via
+        // hv_from_slice(&blob) returning None. Pin: a too-short blob
+        // is silently dropped (not a panic, not interpreted as
+        // partially-meaningful data) but max_basis still tracks the
+        // row's revision so freshness queries upstream see the new
+        // basis. Mirrors test above for the unknown-layer skip path.
+        let conn = fresh();
+        let known = expand_seed(0x44);
+        insert_layer(&conn, "fn_bar", LayerKind::Ast, &known, 5);
+        // Insert a Module-layer row with a half-size blob — accepted
+        // by SQLite (BLOB has no fixed length), rejected by hv_from_
+        // slice.
+        let half_size = vec![0u8; crate::D_BYTES / 2];
+        conn.execute(
+            "INSERT INTO _hdc(scope_id, layer_kind, hv, basis) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["fn_bar", LayerKind::Module.as_str(), half_size, 12i64],
+        )
+        .unwrap();
+
+        let (combined, basis) = build_combined_for_scope(&conn, "fn_bar").unwrap();
+        let expected = build_combined_hv(&HashMap::from([(LayerKind::Ast, known)]));
+        assert_eq!(combined, expected, "malformed blob must not contribute");
+        assert_eq!(basis, 12, "malformed blob's basis must still bump max");
+    }
+
+    #[test]
     fn build_combined_for_unknown_scope_returns_zero_hv() {
         // No rows in _hdc for that scope → empty layer map → zero HV,
         // basis 0. The radius calibration should treat zero-HV

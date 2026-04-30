@@ -745,6 +745,38 @@ mod tests {
     }
 
     #[test]
+    fn event_log_since_zero_returns_all_without_gap() {
+        // since=0 is the canonical "give me everything" watermark.
+        // Pin: returns every event in order, gap=false. The gap
+        // detection uses `since > 0 && since < first_seq` (line 158);
+        // since=0 short-circuits the strict-greater-than check, so a
+        // refactor that flipped the comparison or removed the > 0
+        // guard would surface immediately as a phantom gap on first
+        // subscribe.
+        let mut log = EventLog::new(10);
+        for i in 1..=3 {
+            log.push(Event {
+                event: true,
+                seq: i,
+                topic: "test".into(),
+                source: "test".into(),
+                data: serde_json::json!({}),
+            });
+        }
+        let (events, gap) = log.since(0);
+        assert!(!gap, "since=0 must never report a gap");
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].seq, 1);
+        assert_eq!(events[2].seq, 3);
+
+        // Empty log + since=0 → empty events, no gap.
+        let empty = EventLog::new(10);
+        let (events, gap) = empty.since(0);
+        assert!(events.is_empty());
+        assert!(!gap);
+    }
+
+    #[test]
     fn event_log_replay_gap() {
         let mut log = EventLog::new(3);
         for i in 1..=5 {

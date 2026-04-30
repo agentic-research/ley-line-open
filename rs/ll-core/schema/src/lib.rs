@@ -39,7 +39,13 @@ CREATE TABLE IF NOT EXISTS nodes (
     source_file TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_parent_name ON nodes(parent_id, name);
-CREATE INDEX IF NOT EXISTS idx_source_file ON nodes(source_file);";
+-- Partial index: ley-line's parse paths leave source_file NULL (only
+-- mache's lazy-resolution flow populates it). A full index over a NULL-
+-- only column adds B-tree pages per row to every registry-repo db
+-- without ever serving a query. WHERE source_file IS NOT NULL skips
+-- those rows entirely; the index materializes only when mache (or any
+-- future caller) actually populates the column.
+CREATE INDEX IF NOT EXISTS idx_source_file ON nodes(source_file) WHERE source_file IS NOT NULL;";
 
 /// Create the `nodes` table and index (idempotent).
 pub fn create_schema(conn: &Connection) -> Result<()> {
@@ -121,13 +127,12 @@ mod tests {
 
     #[test]
     fn create_schema_creates_both_indexes() {
-        // Scale-problem pin. The two indexes (idx_parent_name and
-        // idx_source_file) do real work at scale — on the helm/charts
-        // ingest (4.5k YAML files, 629k nodes), idx_parent_name
-        // alone is 185 MB and accelerates every parent→children
-        // walk. parent_child_index_lookup uses 4 rows where SQLite
-        // can full-scan instantly, so a refactor that DROP'd either
-        // index from NODES_DDL would still pass that test. Pin
+        // Scale-problem pin. The two indexes do real work at scale — on
+        // the helm/charts ingest (4.5k YAML files, 629k nodes),
+        // idx_parent_name alone is 185 MB and accelerates every parent→
+        // children walk. parent_child_index_lookup uses 4 rows where
+        // SQLite can full-scan instantly, so a refactor that DROP'd
+        // either index from NODES_DDL would still pass that test. Pin
         // existence directly via sqlite_master.
         let conn = Connection::open_in_memory().unwrap();
         create_schema(&conn).unwrap();
@@ -142,6 +147,79 @@ mod tests {
                 .unwrap();
             assert!(exists, "missing index: {index_name}");
         }
+    }
+
+    #[test]
+    fn idx_source_file_is_partial_on_not_null() {
+        // Schema-bloat pin. Ley-line's production parse paths leave
+        // source_file NULL (only mache's lazy-resolution flow ever
+        // populates it). A full index over a NULL-only column would add
+        // B-tree pages per row to every registry-repo db without
+        // serving a query. We make idx_source_file a partial index so
+        // it materializes only when source_file is actually populated.
+        //
+        // Pin the partial predicate explicitly — sqlite_master.sql
+        // contains the original CREATE INDEX statement verbatim, so a
+        // refactor that drops `WHERE source_file IS NOT NULL` would
+        // surface here as a substring miss.
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_source_file'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("WHERE source_file IS NOT NULL"),
+            "idx_source_file must be partial (WHERE source_file IS NOT NULL); got: {sql}",
+        );
+    }
+
+    #[test]
+    fn idx_source_file_indexes_only_non_null_rows() {
+        // Behavioral pin: insert a mix of NULL and non-NULL source_file
+        // rows, query the index via EXPLAIN QUERY PLAN to confirm
+        // SQLite uses idx_source_file only for non-NULL lookups. The
+        // partial-index optimization relies on this.
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        // Insert rows: 3 with NULL source_file (what insert_node does),
+        // 1 with explicit source_file = 'foo.go'.
+        insert_node(&conn, "n1", "", "n1", 0, 0, 0, "").unwrap();
+        insert_node(&conn, "n2", "", "n2", 0, 0, 0, "").unwrap();
+        insert_node(&conn, "n3", "", "n3", 0, 0, 0, "").unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record, source_file) \
+             VALUES ('n4', '', 'n4', 0, 0, 0, '', 'foo.go')",
+            [],
+        )
+        .unwrap();
+
+        // Lookup by non-NULL source_file MUST be able to use the index.
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT id FROM nodes WHERE source_file = 'foo.go'",
+                [],
+                |r| r.get::<_, String>(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("idx_source_file"),
+            "non-NULL lookup must use partial index; plan: {plan}",
+        );
+
+        // Sanity: the matching row is found.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE source_file = 'foo.go'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]

@@ -289,8 +289,11 @@ mod tests {
             OFF_ARENA_PATH + ARENA_PATH_LEN,
             "arena_size follows arena_path",
         );
-        // arena_size occupies 8 bytes (u64).
-        assert!(OFF_ARENA_SIZE + 8 <= CONTROL_SIZE);
+        // arena_size occupies 8 bytes (u64). Promote to a const-time
+        // assert so the check fires at compile time rather than per
+        // test-run; clippy (rightly) flags runtime asserts on
+        // compile-time-constant expressions.
+        const _: () = assert!(OFF_ARENA_SIZE + 8 <= CONTROL_SIZE);
     }
 
     #[test]

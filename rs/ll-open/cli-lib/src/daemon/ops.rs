@@ -1273,6 +1273,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn required_string_ops_all_error_on_missing_field() {
+        // Sweep every op that uses required_str_field. Each must
+        // surface an actionable error when its required string field
+        // is missing — otherwise a misconfigured client (or a future
+        // typo in the MCP tool schema) could silently no-op or panic.
+        // Uses the shared assert_op_errors helper to keep the sweep
+        // compact. If a new op lands that takes a required string
+        // field via required_str_field, add it here.
+        let (_dir, ctx) = setup();
+        let cases: &[(&str, &str)] = &[
+            ("enrich", "pass"),
+            ("get_node", "id"),
+            ("read_content", "id"),
+            ("find_callers", "token"),
+            ("find_defs", "token"),
+            ("lsp_symbols", "file"),
+            ("lsp_diagnostics", "file"),
+        ];
+        for (op, _missing_field) in cases {
+            assert_op_errors(&ctx, op, json!({}), &format!("{op} with no required field"));
+        }
+    }
+
+    #[tokio::test]
     async fn op_load_errors_on_missing_or_invalid_db_field() {
         // Input-validation triplet: op_load takes a base64-encoded .db
         // payload. At scale a misconfigured client sending raw bytes,

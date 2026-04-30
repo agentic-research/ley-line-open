@@ -1180,6 +1180,20 @@ mod tests {
     }
 
 
+    /// Test-helper: dispatch `op` with `req` and assert the response
+    /// is a JSON object containing an `error` field. Used by the
+    /// input-validation pin triplet (op_load, op_query, op_reparse)
+    /// which all share the same expected error-shape contract.
+    fn assert_op_errors(ctx: &DaemonContext, op: &str, req: serde_json::Value, why: &str) {
+        let resp = handle_base_op(ctx, op, &req)
+            .unwrap_or_else(|| panic!("op {op} returned None for {why}"));
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert!(
+            parsed.get("error").is_some(),
+            "{op}: {why} should error; got {parsed}",
+        );
+    }
+
     fn setup() -> (TempDir, DaemonContext) {
         let dir = TempDir::new().unwrap();
         let arena_path = dir.path().join("test.arena");
@@ -1235,75 +1249,40 @@ mod tests {
     async fn op_reparse_errors_when_source_neither_field_nor_ctx() {
         // op_reparse pulls `source` from req or falls back to
         // ctx.source_dir. When neither is set, it must surface an
-        // actionable error rather than panicking or silently no-op'ing.
-        // The setup() helper builds a ctx with `source_dir: None`, so
-        // a request without "source" should hit the missing-everything
-        // path. Sister to op_load_errors and op_query_errors.
+        // actionable error. setup() builds ctx with source_dir: None
+        // so this test exercises the missing-everything fallthrough.
         let (_dir, ctx) = setup();
-        let resp = handle_base_op(&ctx, "reparse", &json!({})).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
-        assert!(
-            parsed.get("error").is_some(),
-            "missing source with no ctx fallback must error: {parsed}",
-        );
+        assert_op_errors(&ctx, "reparse", json!({}), "missing source + no ctx fallback");
     }
 
     #[tokio::test]
     async fn op_query_errors_on_missing_or_invalid_sql() {
-        // Sister pin to op_load_errors_on_missing_or_invalid_db_field.
-        // op_query is the ad-hoc inspection escape hatch. At scale (an
-        // ops-engineer poking around a misconfigured daemon) a missing
-        // or malformed sql field should produce an actionable error,
-        // not a silent panic on a large registry db. Pin three modes:
-        //   - missing "sql" field
-        //   - "sql" present but wrong type
-        //   - "sql" present but unparseable
+        // Input-validation triplet: op_query is the ad-hoc inspection
+        // escape hatch. At scale a misconfigured client would
+        // otherwise see panic / hang on a large registry db. Pin all
+        // three failure modes via the shared assert_op_errors helper.
         let (_dir, ctx) = setup();
-
-        let resp = handle_base_op(&ctx, "query", &json!({})).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
-        assert!(parsed.get("error").is_some(), "missing sql must error: {parsed}");
-
-        let resp = handle_base_op(&ctx, "query", &json!({"sql": 42})).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
-        assert!(parsed.get("error").is_some(), "non-string sql must error: {parsed}");
-
-        let resp = handle_base_op(
+        assert_op_errors(&ctx, "query", json!({}), "missing sql");
+        assert_op_errors(&ctx, "query", json!({"sql": 42}), "non-string sql");
+        assert_op_errors(
             &ctx,
             "query",
-            &json!({"sql": "SELECT garbage FROM nowhere WHERE x SYNTAX_ERROR"}),
-        )
-        .unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
-        assert!(parsed.get("error").is_some(), "invalid sql must error: {parsed}");
+            json!({"sql": "SELECT garbage FROM nowhere WHERE x SYNTAX_ERROR"}),
+            "invalid sql",
+        );
     }
 
     #[tokio::test]
     async fn op_load_errors_on_missing_or_invalid_db_field() {
-        // op_load takes a base64-encoded .db payload. Pin error
-        // surfacing for the three expected failure modes:
-        //   - missing "db" field
-        //   - "db" field present but not a string
-        //   - "db" field present but invalid base64
-        // At scale a misconfigured client (or one sending raw bytes
-        // instead of base64) would otherwise see the daemon hang or
-        // panic. Pin that all three surface as Err with an actionable
-        // message, not as silent success.
+        // Input-validation triplet: op_load takes a base64-encoded .db
+        // payload. At scale a misconfigured client sending raw bytes,
+        // forgetting the field, or with the wrong type would otherwise
+        // see daemon hang or panic. Pin all three via the shared
+        // assert_op_errors helper.
         let (_dir, ctx) = setup();
-        // Missing field.
-        let resp = handle_base_op(&ctx, "load", &json!({})).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
-        assert!(parsed.get("error").is_some(), "missing db must error: {parsed}");
-
-        // Wrong type (number instead of string).
-        let resp = handle_base_op(&ctx, "load", &json!({"db": 42})).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
-        assert!(parsed.get("error").is_some(), "non-string db must error: {parsed}");
-
-        // Invalid base64.
-        let resp = handle_base_op(&ctx, "load", &json!({"db": "!@#not-base64$%^"})).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
-        assert!(parsed.get("error").is_some(), "invalid base64 must error: {parsed}");
+        assert_op_errors(&ctx, "load", json!({}), "missing db field");
+        assert_op_errors(&ctx, "load", json!({"db": 42}), "non-string db");
+        assert_op_errors(&ctx, "load", json!({"db": "!@#not-base64$%^"}), "invalid base64");
     }
 
     #[tokio::test]

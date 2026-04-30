@@ -22,6 +22,7 @@ pub mod canonical;
 pub mod codebook;
 pub mod combined;
 pub mod encoder;
+pub mod query;
 pub mod schema;
 pub mod sql_udf;
 pub mod util;

@@ -160,6 +160,21 @@ mod tests {
     }
 
     #[test]
+    fn gaussian_row_returns_n_floats_deterministically() {
+        // gaussian_row(seed, n) must produce exactly `n` floats
+        // (Box-Muller pairs handle odd n via the truncate-to-cos
+        // branch). Same seed → byte-identical output.
+        let r1 = gaussian_row(0x42, 8);
+        let r2 = gaussian_row(0x42, 8);
+        assert_eq!(r1.len(), 8);
+        assert_eq!(r1, r2, "same seed must produce byte-identical row");
+
+        // Odd width exercises the truncate branch (line 107-109).
+        let odd = gaussian_row(0x42, 7);
+        assert_eq!(odd.len(), 7);
+    }
+
+    #[test]
     fn project_zero_embedding_yields_all_ones_per_simhash_convention() {
         // Zero embedding has zero dot product against every
         // hyperplane; sign(0) is non-negative in our convention so

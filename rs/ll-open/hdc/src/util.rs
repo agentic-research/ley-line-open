@@ -285,6 +285,38 @@ mod tests {
     }
 
     #[test]
+    fn tagged_seed_vector_deterministic_per_tag_index() {
+        // Same (tag, index) produces the same hypervector. Cross-
+        // machine reproducibility depends on this — every codebook
+        // role-vector lookup has to match between daemon instances.
+        let a = tagged_seed_vector("hdc-test", 0);
+        let b = tagged_seed_vector("hdc-test", 0);
+        assert_eq!(a, b, "same tag + index must produce same HV");
+    }
+
+    #[test]
+    fn tagged_seed_vector_distinct_for_distinct_tags() {
+        // Different tags → different hypervectors. This is what
+        // prevents AST role-N from colliding with Module role-N.
+        let ast = tagged_seed_vector("hdc-ast-role", 0);
+        let module = tagged_seed_vector("hdc-module-role", 0);
+        let d = popcount_distance(&ast, &module);
+        assert!(d > FAR_APART_THRESHOLD,
+            "distinct tags must produce far-apart HVs (distance {d})");
+    }
+
+    #[test]
+    fn tagged_seed_vector_distinct_for_distinct_indices() {
+        // Same tag, different index → different HVs. Pins per-index
+        // role separation that the encoder relies on.
+        let r0 = tagged_seed_vector("hdc-test", 0);
+        let r1 = tagged_seed_vector("hdc-test", 1);
+        let d = popcount_distance(&r0, &r1);
+        assert!(d > FAR_APART_THRESHOLD,
+            "distinct indices must produce far-apart HVs (distance {d})");
+    }
+
+    #[test]
     fn xor_into_zero_is_identity() {
         // XOR with the zero vector preserves the input — the additive
         // identity element of GF(2)^D. Pin so a refactor that

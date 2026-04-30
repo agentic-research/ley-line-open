@@ -329,6 +329,31 @@ mod tests {
     }
 
     #[test]
+    fn cache_put_then_get_round_trips() {
+        // The cache is a content-addressed map [u8;32] → Hypervector.
+        // Pin the put/get contract: same key returns the value
+        // unchanged. Catches a refactor that changed the storage
+        // format (e.g. swapped key bytes order, or hashed the
+        // bytes again on get).
+        let cache = SubtreeCache::new();
+        let key: [u8; 32] = [0xAB; 32];
+        let value = crate::util::expand_seed(42);
+        cache.put(key, value);
+        assert_eq!(cache.get(&key), Some(value));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn cache_get_unknown_key_returns_none() {
+        // No phantom values for keys that were never put. Pin so a
+        // refactor that defaulted to ZERO_HV or panicked on miss
+        // would fail loudly.
+        let cache = SubtreeCache::new();
+        let unknown_key: [u8; 32] = [0u8; 32];
+        assert_eq!(cache.get(&unknown_key), None);
+    }
+
+    #[test]
     fn fresh_cache_starts_empty() {
         let cache = SubtreeCache::new();
         assert!(cache.is_empty());

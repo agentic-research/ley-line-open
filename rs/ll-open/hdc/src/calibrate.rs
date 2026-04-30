@@ -358,6 +358,22 @@ mod tests {
     }
 
     #[test]
+    fn calibrate_and_persist_empty_db_returns_zero() {
+        // Fresh schema, no `_hdc` rows on any layer. Must return
+        // Ok(0) — never panic, never error, never insert phantom
+        // baselines. Pin for the daemon's first-startup case before
+        // any reparse has populated `_hdc`.
+        let conn = fresh();
+        let count = calibrate_and_persist(&conn, 100, 1_700_000_000_000).unwrap();
+        assert_eq!(count, 0, "empty DB → no layers calibrated");
+        // _hdc_baseline must remain empty too.
+        let stored: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _hdc_baseline", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, 0, "no phantom baselines inserted");
+    }
+
+    #[test]
     fn calibrate_and_persist_writes_to_baseline_table() {
         let conn = fresh();
         populate_iid(&conn, LayerKind::Ast, 30);

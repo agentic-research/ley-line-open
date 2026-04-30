@@ -226,7 +226,7 @@ mod tests {
     use super::*;
     use crate::test_util::conn_with_udfs;
     use crate::util::{expand_seed, popcount_distance, xor_into};
-    use crate::Hypervector;
+    use crate::{Hypervector, ZERO_HV};
 
     fn fixture_conn() -> Connection {
         let conn = conn_with_udfs();
@@ -272,7 +272,7 @@ mod tests {
     #[test]
     fn popcount_xor_zero_to_zero_is_zero() {
         let conn = fixture_conn();
-        let zero = vec![0u8; D_BYTES];
+        let zero = ZERO_HV.to_vec();
         let d: i64 = conn
             .query_row("SELECT popcount_xor(?1, ?2)", (&zero, &zero), |r| r.get(0))
             .unwrap();
@@ -339,7 +339,7 @@ mod tests {
         let hv = expand_seed(0xAAAA);
         insert_hv(&conn, 1, &hv);
         insert_hv(&conn, 2, &hv);
-        assert_eq!(select_bundle(&conn), vec![0u8; D_BYTES]);
+        assert_eq!(select_bundle(&conn), ZERO_HV.to_vec());
     }
 
     #[test]
@@ -451,16 +451,13 @@ mod tests {
         // refactor that switched to "round up" or "use random" is
         // caught.
         let conn = fixture_conn();
-        let mut a = vec![0u8; D_BYTES];
-        let mut b = vec![0u8; D_BYTES];
-        // a has bit 0 set; b doesn't.
+        // a has bit 0 set; b has bit 1 set; everything else zero.
+        let mut a = ZERO_HV;
+        let mut b = ZERO_HV;
         a[0] = 0b0000_0001;
-        // b has bit 1 set; a doesn't.
         b[0] = 0b0000_0010;
-        let a_arr: Hypervector = a.try_into().unwrap();
-        let b_arr: Hypervector = b.try_into().unwrap();
-        insert_hv(&conn, 1, &a_arr);
-        insert_hv(&conn, 2, &b_arr);
+        insert_hv(&conn, 1, &a);
+        insert_hv(&conn, 2, &b);
         // 2 rows, half = 1, threshold cnt > 1. Bit 0: cnt=1 (only a),
         // not > 1, output 0. Bit 1: cnt=1 (only b), not > 1, output 0.
         assert_eq!(select_bundle_majority(&conn)[0], 0, "ties must resolve to 0");

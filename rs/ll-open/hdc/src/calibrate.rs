@@ -240,6 +240,17 @@ mod tests {
     use crate::test_util::{conn_with_schema as fresh, insert_layer_hv};
     use crate::util::expand_seed;
 
+    /// Populate `n` iid-random hypervectors on `layer` with scope_ids
+    /// `s0..s{n-1}` and seeds `1..n+1`. Replaces a 5-site loop-pattern
+    /// duplicate that all calibrate tests started with — keeps test
+    /// bodies focused on the calibrate-specific assertion instead of
+    /// the corpus-population boilerplate.
+    fn populate_iid(conn: &Connection, layer: LayerKind, n: u64) {
+        for i in 0..n {
+            insert_layer_hv(conn, &format!("s{i}"), layer, &expand_seed(i + 1), 1);
+        }
+    }
+
     #[test]
     fn empty_layer_returns_none() {
         let conn = fresh();
@@ -261,9 +272,7 @@ mod tests {
         // random, so pairwise Hamming should distribute around D/2 = 4096
         // with std-dev ≈ √D/2 ≈ 45.
         let conn = fresh();
-        for i in 0..200 {
-            insert_layer_hv(&conn, &format!("s{i}"), LayerKind::Ast, &expand_seed(i + 1), 1);
-        }
+        populate_iid(&conn, LayerKind::Ast, 200);
         let baseline = calibrate_layer(&conn, LayerKind::Ast, 1000, 0).unwrap().unwrap();
         // Median should be near 4096, well within a few std-devs.
         assert!(
@@ -315,9 +324,7 @@ mod tests {
         // SplitMix64 seed is derived from the layer's name, so two
         // calls produce identical samples.
         let conn = fresh();
-        for i in 0..50 {
-            insert_layer_hv(&conn, &format!("s{i}"), LayerKind::Ast, &expand_seed(i + 1), 1);
-        }
+        populate_iid(&conn, LayerKind::Ast, 50);
         let b1 = calibrate_layer(&conn, LayerKind::Ast, 100, 0).unwrap().unwrap();
         let b2 = calibrate_layer(&conn, LayerKind::Ast, 100, 0).unwrap().unwrap();
         assert_eq!(b1.median_distance, b2.median_distance);
@@ -331,10 +338,8 @@ mod tests {
         // Even if the corpora were identical, the seeds differ, so
         // the random pair selection differs.
         let conn = fresh();
-        for i in 0..50 {
-            insert_layer_hv(&conn, &format!("s{i}"), LayerKind::Ast, &expand_seed(i + 1), 1);
-            insert_layer_hv(&conn, &format!("s{i}"), LayerKind::Module, &expand_seed(i + 1), 1);
-        }
+        populate_iid(&conn, LayerKind::Ast, 50);
+        populate_iid(&conn, LayerKind::Module, 50);
         let ast = calibrate_layer(&conn, LayerKind::Ast, 100, 0).unwrap().unwrap();
         let module = calibrate_layer(&conn, LayerKind::Module, 100, 0).unwrap().unwrap();
         // Sample seeds differ; with small sample the medians may
@@ -372,9 +377,7 @@ mod tests {
     #[test]
     fn calibrate_and_persist_writes_to_baseline_table() {
         let conn = fresh();
-        for i in 0..30 {
-            insert_layer_hv(&conn, &format!("s{i}"), LayerKind::Ast, &expand_seed(i + 1), 1);
-        }
+        populate_iid(&conn, LayerKind::Ast, 30);
         let count = calibrate_and_persist(&conn, 100, 1_700_000_000_000).unwrap();
         assert_eq!(count, 1, "only Ast layer has rows");
 
@@ -388,9 +391,7 @@ mod tests {
         // Re-running calibration after the corpus changes should
         // overwrite the stored baseline, not error.
         let conn = fresh();
-        for i in 0..20 {
-            insert_layer_hv(&conn, &format!("s{i}"), LayerKind::Ast, &expand_seed(i + 1), 1);
-        }
+        populate_iid(&conn, LayerKind::Ast, 20);
         calibrate_and_persist(&conn, 100, 1_700_000_000_000).unwrap();
 
         // Add more rows (simulating corpus growth).
@@ -414,9 +415,7 @@ mod tests {
         // 5 scopes → C(5, 2) = 10 unordered pairs. Requesting 1000
         // samples should clamp gracefully rather than loop forever.
         let conn = fresh();
-        for i in 0..5 {
-            insert_layer_hv(&conn, &format!("s{i}"), LayerKind::Ast, &expand_seed(i + 1), 1);
-        }
+        populate_iid(&conn, LayerKind::Ast, 5);
         let baseline = calibrate_layer(&conn, LayerKind::Ast, 1000, 0).unwrap().unwrap();
         // Sample size capped at the available pair count.
         assert!(

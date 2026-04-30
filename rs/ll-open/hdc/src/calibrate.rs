@@ -233,6 +233,18 @@ mod tests {
     }
 
     #[test]
+    fn default_calibration_samples_constant_is_10k() {
+        // Public API guideline (math-friend review B): 10k random
+        // pairs is the sweet spot between speed and statistical
+        // stability. Callers reference DEFAULT_CALIBRATION_SAMPLES
+        // when they don't have a corpus-specific override. Pin so a
+        // careless edit (e.g. dropped a zero, made it 1k) wouldn't
+        // silently degrade calibration quality at every default
+        // call site.
+        assert_eq!(DEFAULT_CALIBRATION_SAMPLES, 10_000);
+    }
+
+    #[test]
     fn empty_layer_returns_none() {
         let conn = fresh();
         assert_eq!(calibrate_layer(&conn, LayerKind::Ast, 100, 0).unwrap(), None);

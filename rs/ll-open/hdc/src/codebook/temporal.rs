@@ -382,6 +382,19 @@ mod tests {
     }
 
     #[test]
+    fn default_tau_seconds_is_ninety_days() {
+        // DEFAULT_TAU_SECONDS = 90 * 86_400. The decay constant is
+        // baked into every temporal-codebook calibration: at age τ
+        // a commit weight is exp(-1) ≈ 0.37. Bumping it would shift
+        // the temporal HV for every scope. Pin the literal so a
+        // unit-confusion typo (90 days vs 90 hours, 86_400 sec/day
+        // vs 3_600) surfaces immediately.
+        assert_eq!(DEFAULT_TAU_SECONDS, 90.0 * 86_400.0);
+        // Sanity: this should also equal 7_776_000 seconds (90 days).
+        assert_eq!(DEFAULT_TAU_SECONDS, 7_776_000.0);
+    }
+
+    #[test]
     fn temporal_hyperplane_seed_constant_literal() {
         // Sister pin to semantic_hyperplane_seed_constant_literal.
         // TEMPORAL_HYPERPLANE_SEED feeds the hyperplane matrix and is

@@ -94,6 +94,17 @@ mod tests {
     }
 
     #[test]
+    fn hdc_schema_version_constant_is_one() {
+        // Documented as the migration trigger — bumping it forces
+        // existing daemons to re-run schema setup. Pin the literal
+        // so a careless edit (or merge-conflict resolution that
+        // bumped to an unintended value) surfaces immediately. When
+        // a real migration ships, update this assertion alongside
+        // the migration code.
+        assert_eq!(HDC_SCHEMA_VERSION, 1);
+    }
+
+    #[test]
     fn create_hdc_schema_is_idempotent() {
         // Running twice on the same connection must succeed both times.
         // CREATE TABLE IF NOT EXISTS is the discipline, but the test

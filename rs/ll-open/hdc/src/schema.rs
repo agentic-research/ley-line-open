@@ -77,8 +77,30 @@ mod tests {
     use super::*;
     use crate::{LayerKind, D_BYTES};
 
-    fn open_in_memory() -> Connection {
-        Connection::open_in_memory().unwrap()
+    /// Open a fresh in-memory connection and apply the HDC schema.
+    /// Used by every schema test as the standard setup — collapses the
+    /// `Connection::open_in_memory + create_hdc_schema` pair to one
+    /// call. If a future refactor changes how the schema is bootstrapped
+    /// (e.g. needs migration step before tests can run), every test
+    /// picks up the change for free.
+    fn fresh_schema_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        create_hdc_schema(&conn).unwrap();
+        conn
+    }
+
+    /// Assert a `sqlite_master` row of `kind` ("table" or "index") and
+    /// `name` exists. Centralizes the SELECT-COUNT(*)>0 dance so the
+    /// SQL doesn't drift between tests.
+    fn assert_schema_object_exists(conn: &Connection, kind: &str, name: &str) {
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type=?1 AND name=?2",
+                [kind, name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(exists, "expected {kind} {name} to exist");
     }
 
     #[test]
@@ -88,7 +110,7 @@ mod tests {
         // exercises it explicitly so a future migration that breaks
         // idempotence (e.g. accidentally adds CREATE INDEX without IF
         // NOT EXISTS) is caught.
-        let conn = open_in_memory();
+        let conn = Connection::open_in_memory().unwrap();
         create_hdc_schema(&conn).unwrap();
         create_hdc_schema(&conn).unwrap();
         // A third run for good measure — if any statement isn't truly
@@ -98,18 +120,9 @@ mod tests {
 
     #[test]
     fn create_hdc_schema_creates_all_four_tables() {
-        let conn = open_in_memory();
-        create_hdc_schema(&conn).unwrap();
+        let conn = fresh_schema_conn();
         for table in ["_hdc", "_hdc_combined", "_hdc_baseline", "_hdc_subtree_cache"] {
-            let exists: bool = conn
-                .query_row(
-                    "SELECT COUNT(*) > 0 FROM sqlite_master \
-                     WHERE type='table' AND name=?1",
-                    [table],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert!(exists, "expected {table} to be created");
+            assert_schema_object_exists(&conn, "table", table);
         }
     }
 
@@ -118,8 +131,7 @@ mod tests {
         // (scope_id, layer_kind) must be the composite primary key.
         // The same scope can have rows in many layers; the same
         // (scope, layer) pair must not have duplicates.
-        let conn = open_in_memory();
-        create_hdc_schema(&conn).unwrap();
+        let conn = fresh_schema_conn();
         let zero_hv = vec![0u8; D_BYTES];
 
         // First insert — fine.
@@ -151,23 +163,13 @@ mod tests {
         // freshness queries (`WHERE layer_kind=? AND basis>?`) cheap on
         // large corpuses; dropping it silently would degrade throughput
         // without anyone noticing.
-        let conn = open_in_memory();
-        create_hdc_schema(&conn).unwrap();
-        let exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM sqlite_master \
-                 WHERE type='index' AND name='_hdc_layer_basis_idx'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(exists, "expected _hdc_layer_basis_idx to exist");
+        let conn = fresh_schema_conn();
+        assert_schema_object_exists(&conn, "index", "_hdc_layer_basis_idx");
     }
 
     #[test]
     fn _hdc_baseline_keyed_per_layer() {
-        let conn = open_in_memory();
-        create_hdc_schema(&conn).unwrap();
+        let conn = fresh_schema_conn();
         // One baseline per layer is the contract — same layer twice
         // must be rejected.
         conn.execute(
@@ -196,8 +198,7 @@ mod tests {
         // are cryptographically negligible, so a duplicate insert
         // always means the caller is doing something wrong (re-encoding
         // the same subtree without checking the cache).
-        let conn = open_in_memory();
-        create_hdc_schema(&conn).unwrap();
+        let conn = fresh_schema_conn();
         let hash: Vec<u8> = vec![0xAB; 32];
         let hv = vec![0u8; D_BYTES];
 

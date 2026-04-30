@@ -185,6 +185,24 @@ mod tests {
     }
 
     #[test]
+    fn next_uniform_is_in_eps_to_one_open_interval() {
+        // next_uniform must produce values in [f32::EPSILON, 1.0) for
+        // any state — Box-Muller's `ln(u)` blows up at u=0 and the
+        // f.max(f32::EPSILON) floor (line 121) is what guards against
+        // it. Pin the range directly so a refactor of the bit-shift
+        // (e.g. >> 41 instead of >> 40, halving the high bits) or
+        // the floor (e.g. dropped or replaced with f32::MIN_POSITIVE)
+        // would surface. Also pin strict-less-than-one upper bound
+        // (the function divides by 2^24 from a 24-bit input).
+        let mut state: u64 = 0xCAFE_BABE;
+        for i in 0..1000 {
+            let u = next_uniform(&mut state);
+            assert!(u >= f32::EPSILON, "iter {i}: u={u} below EPSILON floor");
+            assert!(u < 1.0, "iter {i}: u={u} not strictly < 1.0");
+        }
+    }
+
+    #[test]
     fn gaussian_row_is_prefix_stable_across_lengths() {
         // Same seed, different n: the first n floats must match.
         // build_hyperplane_matrix derives per-row seeds via blake3

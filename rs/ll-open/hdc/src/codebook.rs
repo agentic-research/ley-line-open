@@ -78,3 +78,6 @@ pub struct AstNodeFingerprint {
 
 pub mod ast;
 pub use ast::AstCodebook;
+
+pub mod module;
+pub use module::{encode_module, module_distance, ModuleCodebook};

@@ -140,6 +140,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn daemon_phase_as_str_pin() {
+        // DaemonPhase::as_str() backs op_status's "phase" field —
+        // clients depend on these exact strings ("ready" → daemon is
+        // serving queries, "parsing" → wait, etc.). A refactor that
+        // shortened or capitalized any variant would break the
+        // client-side state machine. Pin all five.
+        assert_eq!(DaemonPhase::Initializing.as_str(), "initializing");
+        assert_eq!(DaemonPhase::Parsing.as_str(), "parsing");
+        assert_eq!(DaemonPhase::Enriching.as_str(), "enriching");
+        assert_eq!(DaemonPhase::Ready.as_str(), "ready");
+        // Error variant carries a message but `as_str()` returns the
+        // bare tag — the message is exposed elsewhere in op_status.
+        assert_eq!(DaemonPhase::Error("oops".into()).as_str(), "error");
+        assert_eq!(DaemonPhase::Error(String::new()).as_str(), "error");
+    }
+
+    #[test]
     fn now_ms_is_positive_after_unix_epoch() {
         // We are well past 1970 — now_ms() should always be a large
         // positive number. The unwrap_or(0) fallback only fires if

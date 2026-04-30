@@ -146,6 +146,23 @@ fn write_empty_go_func(dir: &Path, file: &str, pkg: &str, fn_name: &str) {
     fs::write(dir.join(file), content).expect("write go fixture");
 }
 
+/// Snapshot the `_file_index` table into `{path -> (mtime, size)}`.
+/// Used by reparse-scope tests to compare before/after states — four
+/// sites previously inlined this 8-line query+decode chain. Future
+/// schema changes (e.g. adding hash column to _file_index) are now
+/// one site, not four.
+#[allow(dead_code)]
+fn file_index_snapshot(conn: &rusqlite::Connection) -> std::collections::HashMap<String, (i64, i64)> {
+    conn.prepare("SELECT path, mtime, size FROM _file_index")
+        .unwrap()
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))
+        })
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect()
+}
+
 /// Cold-parse a Go source directory into a fresh `:memory:` Connection.
 /// The dominant test setup for "cold-parse, then assert" — 4+ sites
 /// previously inlined this exact pair. Returns just the connection
@@ -1650,7 +1667,6 @@ async fn test_status_reports_phase_and_enrichment() {
 fn test_scoped_reparse_only_touches_scoped_files() {
     use leyline_cli_lib::cmd_parse::parse_into_conn;
     use rusqlite::Connection;
-    use std::collections::HashMap;
 
     let dir = TempDir::new().unwrap();
     write_empty_go_func(dir.path(), "a.go", "m", "A");
@@ -1661,15 +1677,7 @@ fn test_scoped_reparse_only_touches_scoped_files() {
     let r1 = parse_into_conn(&conn, dir.path(), Some("go"), None).unwrap();
     assert_eq!(r1.parsed, 3, "cold parse should hit all 3 files");
 
-    let snapshot: HashMap<String, (i64, i64)> = conn
-        .prepare("SELECT path, mtime, size FROM _file_index")
-        .unwrap()
-        .query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))
-        })
-        .unwrap()
-        .filter_map(Result::ok)
-        .collect();
+    let snapshot = file_index_snapshot(&conn);
     assert_eq!(snapshot.len(), 3);
 
     // Wait long enough that mtime resolution actually advances.
@@ -1688,15 +1696,7 @@ fn test_scoped_reparse_only_touches_scoped_files() {
     assert_eq!(r2.deleted, 0);
     assert_eq!(r2.changed_files, vec!["a.go".to_string()]);
 
-    let after: HashMap<String, (i64, i64)> = conn
-        .prepare("SELECT path, mtime, size FROM _file_index")
-        .unwrap()
-        .query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))
-        })
-        .unwrap()
-        .filter_map(Result::ok)
-        .collect();
+    let after = file_index_snapshot(&conn);
 
     assert_eq!(after.len(), 3, "all 3 files should still be tracked");
     assert_ne!(after["a.go"], snapshot["a.go"], "a.go mtime/size must change");
@@ -1756,15 +1756,7 @@ async fn test_op_reparse_accepts_single_file_source() {
 
     // Cold-parse so _file_index is populated.
     let conn = cold_parse_go(src.path());
-    let snapshot: std::collections::HashMap<String, (i64, i64)> = conn
-        .prepare("SELECT path, mtime, size FROM _file_index")
-        .unwrap()
-        .query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))
-        })
-        .unwrap()
-        .filter_map(Result::ok)
-        .collect();
+    let snapshot = file_index_snapshot(&conn);
     assert_eq!(snapshot.len(), 2);
 
     // Modify a.go and let the daemon serve.
@@ -1800,18 +1792,7 @@ async fn test_op_reparse_accepts_single_file_source() {
     assert_eq!(names, vec!["a.go"], "scope should be exactly [a.go]");
 
     // Verify b.go was NOT touched (its mtime/size in _file_index is unchanged).
-    let after: std::collections::HashMap<String, (i64, i64)> = ctx
-        .live_db
-        .lock()
-        .unwrap()
-        .prepare("SELECT path, mtime, size FROM _file_index")
-        .unwrap()
-        .query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))
-        })
-        .unwrap()
-        .filter_map(Result::ok)
-        .collect();
+    let after = file_index_snapshot(&ctx.live_db.lock().unwrap());
     assert_eq!(after.get("b.go"), snapshot.get("b.go"), "b.go must be untouched");
     assert_ne!(after.get("a.go"), snapshot.get("a.go"), "a.go must be updated");
 }

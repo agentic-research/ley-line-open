@@ -437,23 +437,48 @@ fn run_initial_parse(
 fn try_warm_start(ctrl_path: &Path) -> Result<Option<rusqlite::Connection>> {
     use std::io::Cursor;
 
+    // Two classes of "fall through to cold start":
+    //   - FRESH state (no warm data exists yet): return Ok(None) silently.
+    //     These are normal first-launch / fresh-ctrl conditions.
+    //   - REAL ERROR (data exists but is malformed/inaccessible): return
+    //     Ok(None) but log::warn so the failure is visible to operators.
+    //     Cold start still works, but the warm-start path produced
+    //     unexpected output that's worth investigating.
     let ctrl = match leyline_core::Controller::open_or_create(ctrl_path) {
         Ok(c) => c,
-        Err(_) => return Ok(None),
+        Err(e) => {
+            log::warn!(
+                "warm start: open Controller at {}: {e:#} — falling through to cold start",
+                ctrl_path.display(),
+            );
+            return Ok(None);
+        }
     };
 
     let arena_path = ctrl.arena_path();
     if arena_path.is_empty() {
+        // FRESH: ctrl exists but no arena registered yet (set_arena hasn't run).
         return Ok(None);
     }
 
     let file = match std::fs::File::open(&arena_path) {
         Ok(f) => f,
-        Err(_) => return Ok(None),
+        Err(e) => {
+            log::warn!(
+                "warm start: arena file {arena_path} unreadable: {e:#} — \
+                 falling through to cold start",
+            );
+            return Ok(None);
+        }
     };
 
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
     if mmap.len() < std::mem::size_of::<leyline_core::ArenaHeader>() {
+        log::warn!(
+            "warm start: arena {arena_path} too small ({} bytes) for header — \
+             falling through to cold start",
+            mmap.len(),
+        );
         return Ok(None);
     }
 
@@ -463,12 +488,19 @@ fn try_warm_start(ctrl_path: &Path) -> Result<Option<rusqlite::Connection>> {
     let file_size = mmap.len() as u64;
     let offset = match header.active_buffer_offset(file_size) {
         Some(o) => o,
-        None => return Ok(None),
+        None => {
+            log::warn!(
+                "warm start: arena {arena_path} header invalid (bad magic, version, \
+                 or active_buffer) — falling through to cold start",
+            );
+            return Ok(None);
+        }
     };
     let buf_size = leyline_core::ArenaHeader::buffer_size(file_size);
     let buf = &mmap[offset as usize..(offset + buf_size) as usize];
 
-    // Check if the buffer has any data (not all zeros).
+    // FRESH: arena exists but the active buffer hasn't been written to yet
+    // (no snapshot has flipped the header). Not an error.
     if buf.iter().take(16).all(|&b| b == 0) {
         return Ok(None);
     }
@@ -765,11 +797,17 @@ mod tests {
 
     // ── try_warm_start: error-handling pins ────────────────────────────
     //
-    // Today the function returns Ok(None) on every error path, silently
-    // falling through to cold start. ley-line-open-5f7100-6 plans to
-    // replace the silent swallow with a log::warn (or surface the error).
-    // These tests pin the *current* behavior so the fix lands as an
-    // intentional, visible change.
+    // try_warm_start distinguishes two classes of "fall through to cold
+    // start":
+    //   - FRESH state (no warm data exists yet): silent Ok(None). Normal
+    //     first-launch / fresh-ctrl conditions.
+    //   - REAL ERROR (data exists but is malformed/inaccessible): log::warn
+    //     before Ok(None). Cold start still works, but the warm-start path
+    //     produced unexpected output that's worth investigating.
+    //
+    // The tests below assert Ok(None) is returned in both cases (cold
+    // start always remains the safe fallback) and exercise both fresh
+    // and error code paths.
 
     #[test]
     fn warm_start_returns_none_on_missing_ctrl() {
@@ -783,28 +821,21 @@ mod tests {
 
     #[test]
     fn warm_start_returns_none_on_corrupted_ctrl() {
-        // Pin for ley-line-open-5f7100-6: when the controller file is
-        // present but corrupt, today's code silently cold-starts. Test
-        // asserts that fact so the fix (log::warn or harder failure) is
-        // a visible behavior change.
+        // Garbage ctrl: try_warm_start MUST NOT panic and MUST return
+        // None so cold start remains a safe fallback. The fix (5f7100-6)
+        // logs a warn alongside the None — captured behavior is unchanged
+        // from the caller's perspective; the new visibility is in the log.
         let dir = TempDir::new().unwrap();
         let ctrl = dir.path().join("corrupt.ctrl");
         std::fs::write(&ctrl, b"\x00\x01\x02 not a valid controller \xff\xfe").unwrap();
 
-        // Whether Controller::open_or_create accepts or rejects garbage is
-        // an implementation detail of leyline_core. The contract we lock
-        // in here: try_warm_start MUST NOT panic and MUST return None
-        // (today's silent-cold-start behavior). When 5f7100-6 lands, this
-        // test will need updating to assert the new visibility behavior
-        // (e.g. a log capture, or a Result::Err return).
         let result = try_warm_start(&ctrl);
         match result {
             Ok(None) => {}
             Ok(Some(_)) => panic!("garbage ctrl should not produce a usable connection"),
             Err(e) => {
-                // After 5f7100-6 lands, this Err branch may become the
-                // expected outcome. Today it usually means leyline_core
-                // surfaced the corruption — also acceptable.
+                // leyline_core may surface the corruption directly — also
+                // acceptable. The contract is "no panic, no usable conn."
                 eprintln!("warm_start surfaced error (acceptable): {e:#}");
             }
         }

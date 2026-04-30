@@ -1067,6 +1067,30 @@ mod tests {
     }
 
     #[test]
+    fn compute_h0_skips_edges_with_missing_endpoint_cells() {
+        // Sister pin to detect_violations_skipped_when_endpoint_cell_
+        // missing. compute_h0 inherits the skip via edge_hamming
+        // returning None on missing endpoints (sheaf.rs:419). An edge
+        // referencing a ghost cell must NOT panic and must NOT merge
+        // the present cell with anything. Catches a refactor that
+        // pre-validated edges (rejecting ghosts) but lost the runtime
+        // skip — partial cell populations during mid-flight reparse
+        // would crash union-find lookups.
+        let mut cx = HvCellComplex::new();
+        cx.add_cell(make_cell("fn_a", CanonicalKind::Decl, 1));
+        cx.set_threshold(LayerKind::Ast, 10);
+        cx.add_edge(HvEdge::identity(
+            "fn_a",
+            "fn_ghost",
+            EdgeKind::Sibling,
+            LayerKind::Ast,
+        ));
+        let groups = cx.compute_h0(LayerKind::Ast);
+        assert_eq!(groups.len(), 1, "ghost-edge must not introduce a group");
+        assert_eq!(groups[0], vec!["fn_a"]);
+    }
+
+    #[test]
     fn compute_h0_ignores_edges_on_other_layers() {
         // compute_h0(L) walks only edges whose `layer == L`
         // (sheaf.rs:414 `if edge.layer != layer { continue; }`).

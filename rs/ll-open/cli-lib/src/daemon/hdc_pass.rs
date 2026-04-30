@@ -185,7 +185,7 @@ mod tests {
         use leyline_hdc::query::{density_count, radius_search};
         use leyline_hdc::schema::create_hdc_schema;
         use leyline_hdc::sql_udf::register_hdc_udfs;
-        use leyline_hdc::{encode_fresh, LayerKind};
+        use leyline_hdc::LayerKind;
         use rusqlite::Connection;
 
         // Three clone classes that span the spectrum HDC is designed
@@ -272,8 +272,7 @@ mod tests {
         for group in &groups {
             for (i, src) in group.sources.iter().enumerate() {
                 let scope_id = format!("{}/fn_{}", group.name, i);
-                let tree = parse_go(src);
-                let hv = encode_fresh(&tree, &cb);
+                let hv = encode_go(src, &cb);
                 conn.execute(
                     "INSERT INTO _hdc(scope_id, layer_kind, hv, basis) VALUES (?1, ?2, ?3, ?4)",
                     rusqlite::params![scope_id, LayerKind::Ast.as_str(), hv.to_vec(), 1i64],

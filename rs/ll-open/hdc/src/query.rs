@@ -422,8 +422,8 @@ mod tests {
         let tree = EncoderNode::new(
             CanonicalKind::Block,
             vec![
-                EncoderNode::new(CanonicalKind::Op, vec![]),
-                EncoderNode::new(CanonicalKind::Lit, vec![]),
+                EncoderNode::leaf(CanonicalKind::Op),
+                EncoderNode::leaf(CanonicalKind::Lit),
             ],
         );
         let centroid = encode_fresh(&tree, &cb);
@@ -492,9 +492,9 @@ mod tests {
         let tree = EncoderNode::new(
             CanonicalKind::Decl,
             vec![
-                EncoderNode::new(CanonicalKind::Ref, vec![]),
-                EncoderNode::new(CanonicalKind::Block, vec![]),
-                EncoderNode::new(CanonicalKind::Op, vec![]),
+                EncoderNode::leaf(CanonicalKind::Ref),
+                EncoderNode::leaf(CanonicalKind::Block),
+                EncoderNode::leaf(CanonicalKind::Op),
             ],
         );
         // 10 identical encodings — homogeneous cluster.
@@ -574,9 +574,9 @@ mod tests {
             let tree = EncoderNode::new(
                 CanonicalKind::Decl,
                 vec![
-                    EncoderNode::new(CanonicalKind::Ref, vec![]),
-                    EncoderNode::new(mid_kind, vec![]),
-                    EncoderNode::new(CanonicalKind::Op, vec![]),
+                    EncoderNode::leaf(CanonicalKind::Ref),
+                    EncoderNode::leaf(mid_kind),
+                    EncoderNode::leaf(CanonicalKind::Op),
                 ],
             );
             centroids.push(encode_fresh(&tree, &cb));

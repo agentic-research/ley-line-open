@@ -1007,6 +1007,20 @@ mod tests {
     // -- Boolean Heyting algebra: restriction maps + propagation -----
 
     #[test]
+    fn restriction_default_is_identity() {
+        // The `#[default]` annotation on the enum picks `Identity`.
+        // That's the safe default — applying `Restriction::default()`
+        // to a stalk must leave it unchanged. Pin so a future
+        // refactor that moved `#[default]` to a different variant
+        // (e.g. RotateLeft(0)) wouldn't silently change behavior
+        // for callers using `Default::default()`.
+        let hv = stalk_for(123);
+        let r = Restriction::default();
+        assert_eq!(r, Restriction::Identity);
+        assert_eq!(r.apply(&hv), hv);
+    }
+
+    #[test]
     fn restriction_identity_is_no_op() {
         // The identity restriction must reproduce its input bit-for-bit.
         // Pin this so a refactor that swaps `Identity` to "rotate by 0"

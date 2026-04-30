@@ -45,7 +45,10 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
     let value: u64 = num_part
         .parse()
         .with_context(|| format!("invalid duration number: {num_part:?}"))?;
-    Ok(Duration::from_secs(value * multiplier))
+    let secs = value
+        .checked_mul(multiplier)
+        .with_context(|| format!("duration overflow: {value} × {multiplier} exceeds u64"))?;
+    Ok(Duration::from_secs(secs))
 }
 
 /// Set up the arena and controller without mounting.
@@ -297,24 +300,28 @@ mod tests {
     }
 
     #[test]
-    fn parse_duration_rejects_unparseable_huge_integer() {
-        // Inputs that don't fit in u64 fail at the parse() step before
-        // multiplication can overflow. Pin: a 26-digit input is
-        // rejected as "invalid duration number" rather than silently
-        // accepted or panicking. Sister coverage to
-        // parse_duration_invalid which only tests "abc".
+    fn parse_duration_rejects_overflow_on_either_step() {
+        // Two overflow paths, both must Err cleanly:
+        //   (a) input too large for u64 — fails at parse()
+        //   (b) input fits in u64 but overflows when multiplied by
+        //       the suffix multiplier — fails at checked_mul
+        // Path (a):
+        let err_a = parse_duration("99999999999999999999999999h")
+            .expect_err("26-digit prefix must Err on parse");
         assert!(
-            parse_duration("99999999999999999999999999h").is_err(),
-            "input too large for u64 must Err",
+            format!("{err_a:#}").contains("invalid duration number"),
+            "expected parse error; got: {err_a:#}",
         );
-        // KNOWN GAP (intentionally not pinned by behavior): inputs
-        // that DO fit in u64 but overflow when multiplied by the
-        // suffix multiplier (e.g. format!("{}h", u64::MAX / 3600 +
-        // 1)) currently panic in debug mode and silently wrap in
-        // release. parse_duration uses unchecked `value * multiplier`
-        // (line 48). A future fix to checked_mul + Err would be a
-        // deliberate behavior change. The threshold is u64::MAX /
-        // 3600 ≈ 5.13e15 hours — far beyond any real --timeout flag.
+        // Path (b): u64::MAX / 3600 + 1 fits in u64 but overflows × 3600.
+        let huge_h = format!("{}h", u64::MAX / 3600 + 1);
+        let err_b = parse_duration(&huge_h).expect_err("× 3600 must Err");
+        assert!(
+            format!("{err_b:#}").contains("overflow"),
+            "expected overflow error; got: {err_b:#}",
+        );
+        // Path (b) for minutes: u64::MAX / 60 + 1 fits in u64.
+        let huge_m = format!("{}m", u64::MAX / 60 + 1);
+        assert!(parse_duration(&huge_m).is_err());
     }
 
     #[test]

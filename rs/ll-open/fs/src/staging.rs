@@ -649,6 +649,36 @@ mod tests {
     }
 
     #[test]
+    fn dirty_and_tombstone_lists_partition_cleanly() -> Result<()> {
+        // Scale-problem pin. shadow_nodes carries both dirty edits
+        // (tombstone=0) and tombstones (tombstone=1) in the same
+        // table, distinguished only by the column. dirty_nodes
+        // queries `WHERE tombstone = 0`, tombstone_nodes queries
+        // `WHERE tombstone = 1`. A refactor that flipped the
+        // predicates (or typo'd != for =) would silently make
+        // tombstoned files re-enter the parse pipeline. At registry
+        // scale (50k files mid-edit during a branch switch) this
+        // would mis-classify hundreds of files. Pin both halves AND
+        // the partition: every shadow row is in exactly one list.
+        let live = test_live();
+        let staging = StagingGraph::new(live)?;
+
+        // One dirty edit + one tombstone.
+        staging.write_content("docs/readme", b"edited", 0)?;
+        staging.remove_node("docs/notes")?;
+
+        let dirty = staging.dirty_nodes()?;
+        let tombs = staging.tombstone_nodes()?;
+        assert!(dirty.contains(&"docs/readme".to_string()), "edit in dirty");
+        assert!(tombs.contains(&"docs/notes".to_string()), "remove in tombstones");
+        // Critical: the lists must NOT overlap — readme is dirty, not
+        // tombstoned; notes is tombstoned, not dirty.
+        assert!(!dirty.contains(&"docs/notes".to_string()), "tombstone leaked into dirty");
+        assert!(!tombs.contains(&"docs/readme".to_string()), "edit leaked into tombstones");
+        Ok(())
+    }
+
+    #[test]
     fn tombstone_hides_live_node() -> Result<()> {
         let live = test_live();
         let staging = StagingGraph::new(live)?;

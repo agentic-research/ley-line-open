@@ -51,15 +51,7 @@ pub fn build_combined_hv(layers: &HashMap<LayerKind, Hypervector>) -> Hypervecto
     // Iterate in deterministic layer-role-index order, not HashMap
     // iteration order, so the output is independent of insertion
     // order.
-    for kind in [
-        LayerKind::Ast,
-        LayerKind::Module,
-        LayerKind::Semantic,
-        LayerKind::Temporal,
-        LayerKind::Hir,
-        LayerKind::Lex,
-        LayerKind::Fs,
-    ] {
+    for kind in LayerKind::ALL {
         if let Some(hv) = layers.get(&kind) {
             let permuted = rotate_left(hv, layer_role_index(kind));
             xor_into(&mut acc, &permuted);

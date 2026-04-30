@@ -471,15 +471,7 @@ impl HvCellComplex {
     /// collision-resistant under the random-oracle assumption.
     pub fn structural_root(&self) -> [u8; 32] {
         let mut acc = [0u8; 32];
-        for layer in [
-            LayerKind::Ast,
-            LayerKind::Module,
-            LayerKind::Semantic,
-            LayerKind::Temporal,
-            LayerKind::Hir,
-            LayerKind::Lex,
-            LayerKind::Fs,
-        ] {
+        for layer in LayerKind::ALL {
             let root = self.merkle_root_for_layer(layer);
             for i in 0..32 {
                 acc[i] ^= root[i];

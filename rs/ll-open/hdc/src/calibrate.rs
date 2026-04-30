@@ -120,15 +120,7 @@ pub fn calibrate_and_persist(
     now_ms: i64,
 ) -> rusqlite::Result<usize> {
     let mut count = 0;
-    for layer in [
-        LayerKind::Ast,
-        LayerKind::Module,
-        LayerKind::Semantic,
-        LayerKind::Temporal,
-        LayerKind::Hir,
-        LayerKind::Lex,
-        LayerKind::Fs,
-    ] {
+    for layer in LayerKind::ALL {
         if let Some(baseline) = calibrate_layer(conn, layer, sample_size, now_ms)? {
             persist_baseline(conn, &baseline)?;
             count += 1;

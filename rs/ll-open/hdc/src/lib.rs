@@ -106,6 +106,26 @@ impl LayerKind {
             _ => None,
         }
     }
+
+    /// All seven layer kinds in the canonical iteration order used by
+    /// `calibrate_and_persist`, `build_combined_hv`,
+    /// `HvCellComplex::structural_root`, and the `layer_role_index`
+    /// permutation. Single source of truth replaces three verbatim
+    /// 7-element array literals across calibrate.rs / combined.rs /
+    /// sheaf.rs.
+    ///
+    /// The order MUST match `as_str` and `parse_str` such that
+    /// `LayerKind::ALL[layer_role_index(k)]` round-trips on every
+    /// variant — pinned by `layer_kind_all_matches_role_index` test.
+    pub const ALL: [LayerKind; 7] = [
+        LayerKind::Ast,
+        LayerKind::Module,
+        LayerKind::Semantic,
+        LayerKind::Temporal,
+        LayerKind::Hir,
+        LayerKind::Lex,
+        LayerKind::Fs,
+    ];
 }
 
 #[cfg(test)]
@@ -125,8 +145,21 @@ mod tests {
     fn layer_kind_round_trip_through_string() {
         // Every variant must round-trip cleanly. If a new variant is
         // added without updating both as_str and from_str, this test
-        // surfaces the gap.
-        for k in [
+        // surfaces the gap. Iterating over `ALL` also catches a refactor
+        // that adds a variant without appending to the const.
+        for k in LayerKind::ALL {
+            assert_eq!(LayerKind::parse_str(k.as_str()), Some(k), "round-trip failed for {k:?}");
+        }
+    }
+
+    #[test]
+    fn layer_kind_all_in_role_index_order() {
+        // `LayerKind::ALL` is the canonical iteration order used by
+        // `build_combined_hv` (combined.rs) and the role-permutation
+        // step. Pin that `ALL[i]` matches the ad-hoc enumeration order
+        // baked into `layer_role_index` (Ast=0, Module=1, …, Fs=6) so
+        // a refactor that reshuffles either side gets caught.
+        let expected_in_order = [
             LayerKind::Ast,
             LayerKind::Module,
             LayerKind::Semantic,
@@ -134,9 +167,10 @@ mod tests {
             LayerKind::Hir,
             LayerKind::Lex,
             LayerKind::Fs,
-        ] {
-            assert_eq!(LayerKind::parse_str(k.as_str()), Some(k), "round-trip failed for {k:?}");
-        }
+        ];
+        assert_eq!(LayerKind::ALL, expected_in_order);
+        // Length must be 7 — pins the variant count too.
+        assert_eq!(LayerKind::ALL.len(), 7);
     }
 
     #[test]

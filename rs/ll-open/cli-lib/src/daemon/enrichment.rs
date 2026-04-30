@@ -350,6 +350,19 @@ mod tests {
         conn
     }
 
+    /// Build a boxed `MockPass` from its four static-str slices.
+    /// Replaces 8 byte-similar `Box::new(MockPass { name, deps,
+    /// reads, writes })` literal constructions across the
+    /// resolve_order tests.
+    fn mock(
+        name: &'static str,
+        deps: &'static [&'static str],
+        reads: &'static [&'static str],
+        writes: &'static [&'static str],
+    ) -> Box<dyn EnrichmentPass> {
+        Box::new(MockPass { name, deps, reads, writes })
+    }
+
     #[test]
     fn execute_pass_bumps_version_on_success() {
         let conn = meta_conn();
@@ -411,10 +424,10 @@ mod tests {
 
     #[test]
     fn resolve_order_simple() {
-        let passes: Vec<Box<dyn EnrichmentPass>> = vec![
-            Box::new(MockPass { name: "a", deps: &[], reads: &[], writes: &["t1"] }),
-            Box::new(MockPass { name: "b", deps: &["a"], reads: &["t1"], writes: &["t2"] }),
-            Box::new(MockPass { name: "c", deps: &["b"], reads: &["t2"], writes: &["t3"] }),
+        let passes = vec![
+            mock("a", &[], &[], &["t1"]),
+            mock("b", &["a"], &["t1"], &["t2"]),
+            mock("c", &["b"], &["t2"], &["t3"]),
         ];
 
         let order = resolve_order(&passes, "c").unwrap();
@@ -423,9 +436,7 @@ mod tests {
 
     #[test]
     fn resolve_order_no_deps() {
-        let passes: Vec<Box<dyn EnrichmentPass>> = vec![
-            Box::new(MockPass { name: "x", deps: &[], reads: &[], writes: &["t1"] }),
-        ];
+        let passes = vec![mock("x", &[], &[], &["t1"])];
 
         let order = resolve_order(&passes, "x").unwrap();
         assert_eq!(order, vec!["x"]);
@@ -439,11 +450,11 @@ mod tests {
 
     #[test]
     fn resolve_order_diamond_deps() {
-        let passes: Vec<Box<dyn EnrichmentPass>> = vec![
-            Box::new(MockPass { name: "base", deps: &[], reads: &[], writes: &["t0"] }),
-            Box::new(MockPass { name: "left", deps: &["base"], reads: &["t0"], writes: &["t1"] }),
-            Box::new(MockPass { name: "right", deps: &["base"], reads: &["t0"], writes: &["t2"] }),
-            Box::new(MockPass { name: "top", deps: &["left", "right"], reads: &["t1", "t2"], writes: &["t3"] }),
+        let passes = vec![
+            mock("base", &[], &[], &["t0"]),
+            mock("left", &["base"], &["t0"], &["t1"]),
+            mock("right", &["base"], &["t0"], &["t2"]),
+            mock("top", &["left", "right"], &["t1", "t2"], &["t3"]),
         ];
 
         let order = resolve_order(&passes, "top").unwrap();

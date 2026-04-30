@@ -85,6 +85,7 @@ pub fn extract_functions(
 mod tests {
     use super::*;
     use leyline_hdc::canonical::{CanonicalKind, GoCanonicalMap};
+    use leyline_hdc::popcount_distance;
 
     fn parse_go(src: &str) -> EncoderNode {
         // tree-sitter-go is exposed via leyline-ts's TsLanguage::Go.
@@ -103,7 +104,7 @@ mod tests {
     /// compare against fractional thresholds because absolute distance
     /// scales with D.
     fn normalized_distance(a: &leyline_hdc::Hypervector, b: &leyline_hdc::Hypervector) -> f64 {
-        leyline_hdc::popcount_distance(a, b) as f64 / (leyline_hdc::D_BYTES * 8) as f64
+        popcount_distance(a, b) as f64 / (leyline_hdc::D_BYTES * 8) as f64
     }
 
     /// Math-friend's empirical threshold for the upper bound of the
@@ -341,7 +342,7 @@ mod tests {
         // (B has an extra statement). Their HVs must differ.
         let hv_a0 = &hvs_by_group["tight_clones"][0];
         let hv_b0 = &hvs_by_group["type3_one_extra_stmt"][0];
-        let d_ab = leyline_hdc::popcount_distance(hv_a0, hv_b0);
+        let d_ab = popcount_distance(hv_a0, hv_b0);
         eprintln!("d(A, B) = {d_ab} — Type-2 vs Type-3-with-extra-stmt");
         assert!(
             d_ab > 0,
@@ -377,9 +378,9 @@ mod tests {
         let hv_a = hvs_by_group["tight_clones"][0];
         let hv_b = hvs_by_group["type3_one_extra_stmt"][0];
         let hv_c = hvs_by_group["for_loops"][0];
-        let d_aa = leyline_hdc::popcount_distance(&hv_a, &hvs_by_group["tight_clones"][1]);
-        let d_ab = leyline_hdc::popcount_distance(&hv_a, &hv_b);
-        let d_ac = leyline_hdc::popcount_distance(&hv_a, &hv_c);
+        let d_aa = popcount_distance(&hv_a, &hvs_by_group["tight_clones"][1]);
+        let d_ab = popcount_distance(&hv_a, &hv_b);
+        let d_ac = popcount_distance(&hv_a, &hv_c);
         eprintln!("d(A, A') = {d_aa}  -- Type-2 clone, expect 0");
         eprintln!("d(A, B)  = {d_ab}  -- Type-3 (extra stmt), expect ~D/2 (sensitive)");
         eprintln!("d(A, C)  = {d_ac}  -- different family, expect ~D/2");
@@ -449,7 +450,6 @@ mod tests {
         // run explain. The test asserts API correctness (right number
         // of tuples, valid kinds) — the ≥80% recovery accuracy target
         // is a production-corpus measurement, not synthetic.
-        use leyline_hdc::canonical::CanonicalKind;
         use leyline_hdc::query::explain_cluster_centroid;
 
         for group in &groups {

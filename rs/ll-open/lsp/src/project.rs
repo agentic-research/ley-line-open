@@ -353,10 +353,15 @@ pub fn project_definitions_into_nodes(
     if locations.is_empty() {
         return Ok(());
     }
-    let _ = insert_node(conn, "definitions", "", "definitions", 1, 0, mtime, "");
+    // Both inserts use INSERT OR REPLACE so re-inserting an existing
+    // dir-node is a no-op. Real errors (missing schema, locked db,
+    // type mismatch) MUST propagate — silently swallowing them via
+    // `let _ =` would let children land under a missing parent dir,
+    // producing orphaned nodes that downstream walks can't navigate to.
+    insert_node(conn, "definitions", "", "definitions", 1, 0, mtime, "")?;
 
     let parent_id = format!("definitions/{node_id}");
-    let _ = insert_node(conn, &parent_id, "definitions", node_id, 1, 0, mtime, "");
+    insert_node(conn, &parent_id, "definitions", node_id, 1, 0, mtime, "")?;
 
     for (i, loc) in locations.iter().enumerate() {
         let def_id = format!("{parent_id}/{i}");
@@ -391,10 +396,14 @@ pub fn project_references_into_nodes(
     if locations.is_empty() {
         return Ok(());
     }
-    let _ = insert_node(conn, "references", "", "references", 1, 0, mtime, "");
+    // INSERT OR REPLACE is idempotent for the dir-nodes; propagate the
+    // real errors (missing schema, locked db) instead of orphaning
+    // children under a parent that failed to insert. See the matching
+    // explanation in project_definitions_into_nodes.
+    insert_node(conn, "references", "", "references", 1, 0, mtime, "")?;
 
     let parent_id = format!("references/{node_id}");
-    let _ = insert_node(conn, &parent_id, "references", node_id, 1, 0, mtime, "");
+    insert_node(conn, &parent_id, "references", node_id, 1, 0, mtime, "")?;
 
     for (i, loc) in locations.iter().enumerate() {
         let ref_id = format!("{parent_id}/{i}");

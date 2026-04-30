@@ -210,7 +210,13 @@ impl LspClient {
                     range: l.target_selection_range,
                 })
                 .collect()),
-            Err(_) => Ok(vec![]),
+            Err(e) => {
+                // Don't fail the whole pass on a single malformed
+                // server response — but make it visible so operators
+                // can see "this LSP server is sending us garbage".
+                log::warn!("LSP definition response parse failed: {e}");
+                Ok(vec![])
+            }
         }
     }
 
@@ -280,7 +286,10 @@ impl LspClient {
         match serde_json::from_value::<CompletionResponse>(result) {
             Ok(CompletionResponse::Array(items)) => Ok(items),
             Ok(CompletionResponse::List(list)) => Ok(list.items),
-            Err(_) => Ok(vec![]),
+            Err(e) => {
+                log::warn!("LSP completion response parse failed: {e}");
+                Ok(vec![])
+            }
         }
     }
 

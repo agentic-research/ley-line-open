@@ -402,6 +402,14 @@ pub(crate) fn json_string_array_opt(
     })
 }
 
+/// Build a `{"error": "msg"}` JSON response — the wire shape used by the
+/// event-router handlers (subscribe/unsubscribe/emit) when their request
+/// is malformed. Centralizes the format so a future change to the error
+/// envelope (e.g. adding `ok: false`) is one site, not N.
+fn error_response(msg: &str) -> String {
+    serde_json::json!({"error": msg}).to_string()
+}
+
 /// Per-connection state for the UDS socket.
 pub struct ConnectionState {
     router: Arc<EventRouter>,
@@ -428,7 +436,7 @@ impl ConnectionState {
         let topics = json_string_array(req, "topics");
 
         if topics.is_empty() {
-            return r#"{"error":"subscribe requires non-empty 'topics' array"}"#.to_string();
+            return error_response("subscribe requires non-empty 'topics' array");
         }
 
         let identity = req
@@ -504,7 +512,7 @@ impl ConnectionState {
     pub async fn handle_emit(&self, req: &serde_json::Value) -> String {
         let topic = match req.get("topic").and_then(|v| v.as_str()) {
             Some(s) => s.to_string(),
-            None => return r#"{"error":"emit requires 'topic' field"}"#.to_string(),
+            None => return error_response("emit requires 'topic' field"),
         };
         let source = req
             .get("source")

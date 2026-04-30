@@ -215,6 +215,29 @@ mod tests {
     }
 
     #[test]
+    fn every_bundled_language_resolves_id_and_has_server() {
+        // Sister pin to every_unbundled_language_resolves_id_but_not_
+        // server. server_lookup_for_bundled_languages already pins the
+        // non-empty server-cmd invariant; this pin adds the resolve-
+        // back-from-ext half so a refactor that reorganized
+        // LSP_LANGUAGES (or shadowed an ext) would surface for both
+        // halves of the table consistently. Walk
+        // LSP_LANGUAGES.iter().filter(server.is_some()).
+        for lang in LSP_LANGUAGES.iter().filter(|l| l.server.is_some()) {
+            let ext = lang.exts.first().expect("must have at least one ext");
+            assert_eq!(
+                language_id_from_ext(ext),
+                Some(lang.id),
+                "ext `{ext}` must resolve to bundled lang `{}`", lang.id,
+            );
+            assert!(
+                language_server(lang.id).is_some(),
+                "bundled lang `{}` must report a server", lang.id,
+            );
+        }
+    }
+
+    #[test]
     fn every_unbundled_language_resolves_id_but_not_server() {
         // Sweep pin extending unbundled_languages_resolve_id_but_not_
         // server. At scale a registry repo touches many languages

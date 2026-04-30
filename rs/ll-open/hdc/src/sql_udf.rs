@@ -464,6 +464,45 @@ mod tests {
     }
 
     #[test]
+    fn bundle_xor_rejects_wrong_length_row() {
+        // BUNDLE's step() guards against length mismatches with the
+        // accumulator (which is always D_BYTES). A row of the wrong
+        // size must surface as a SQL error, not silently truncate or
+        // panic. Pins the safety check at sql_udf.rs:119-127.
+        let conn = fixture_conn();
+        let bad_row = vec![0u8; D_BYTES / 2]; // half-size — not a valid HV
+        conn.execute("INSERT INTO hvs(id, hv) VALUES (?1, ?2)", (1i64, &bad_row))
+            .unwrap();
+        let result: Result<Vec<u8>> =
+            conn.query_row("SELECT BUNDLE(hv) FROM hvs", [], |r| r.get(0));
+        assert!(
+            result.is_err(),
+            "BUNDLE must error on wrong-length row, not silently produce garbage",
+        );
+    }
+
+    #[test]
+    fn bundle_majority_rejects_wrong_length_row() {
+        // BUNDLE_MAJORITY's step() rejects rows whose length isn't
+        // exactly D_BYTES (the counter array is sized for D bits).
+        // A wrong-length row must surface as a SQL error. Pins
+        // sql_udf.rs:178-187.
+        let conn = fixture_conn();
+        let bad_row = vec![0u8; D_BYTES + 1]; // off-by-one
+        conn.execute("INSERT INTO hvs(id, hv) VALUES (?1, ?2)", (1i64, &bad_row))
+            .unwrap();
+        let result: Result<Vec<u8>> = conn.query_row(
+            "SELECT BUNDLE_MAJORITY(hv) FROM hvs",
+            [],
+            |r| r.get(0),
+        );
+        assert!(
+            result.is_err(),
+            "BUNDLE_MAJORITY must error on wrong-length row",
+        );
+    }
+
+    #[test]
     fn bundle_xor_used_with_filter() {
         // Real-world usage: BUNDLE filtered by a layer or scope prefix.
         // SELECT BUNDLE(hv) FROM _hdc WHERE layer_kind='ast' AND

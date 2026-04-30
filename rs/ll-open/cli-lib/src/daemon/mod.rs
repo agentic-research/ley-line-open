@@ -140,6 +140,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn daemon_state_initializing_factory_contract() {
+        // DaemonState::initializing() is the canonical "fresh daemon"
+        // factory — used at startup (cmd_daemon) and in fixtures
+        // (ops, enrichment tests). Four call sites depend on the
+        // exact starting state. Pin so a refactor that pre-seeded
+        // any field (e.g. set phase=Ready prematurely, or planted a
+        // stale head_sha) would surface immediately.
+        let s = DaemonState::initializing();
+        assert_eq!(s.phase, DaemonPhase::Initializing);
+        assert!(s.head_sha.is_none());
+        assert!(s.last_reparse_at_ms.is_none());
+        assert!(s.enrichment.is_empty(), "enrichment map must start empty");
+    }
+
+    #[test]
     fn daemon_phase_as_str_pin() {
         // DaemonPhase::as_str() backs op_status's "phase" field —
         // clients depend on these exact strings ("ready" → daemon is

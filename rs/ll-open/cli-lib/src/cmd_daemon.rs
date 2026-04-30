@@ -720,13 +720,39 @@ fn git_dirty_files(dir: &Path) -> Result<std::collections::HashSet<String>> {
         anyhow::bail!("git status failed: {}", String::from_utf8_lossy(&output.stderr));
     }
 
-    // --porcelain -z: NUL-separated entries, each starts with 2-char status + space + path
+    // --porcelain -z: NUL-separated entries, each starts with 2-char
+    // status + space + path. For renames + copies (status code R/C),
+    // the rename produces TWO consecutive entries:
+    //   entry N:   "RX newpath\0"  (status, space, NEW path)
+    //   entry N+1: "oldpath\0"     (BARE old path, no status prefix)
+    // We want the new path in the dirty set; the old path's removal
+    // is already handled by the _file_index diff downstream.
+    //
+    // The state machine: walk entries in order. If we see a status
+    // entry with code R or C, the NEXT non-empty entry is the rename
+    // source and must be skipped, not stripped of 3 chars.
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let files: std::collections::HashSet<String> = stdout
-        .split('\0')
-        .filter(|entry| entry.len() > 3)
-        .map(|entry| entry[3..].to_string())
-        .collect();
+    let mut files = std::collections::HashSet::new();
+    let mut skip_next_as_rename_source = false;
+    for entry in stdout.split('\0') {
+        if entry.is_empty() {
+            continue;
+        }
+        if skip_next_as_rename_source {
+            skip_next_as_rename_source = false;
+            continue;
+        }
+        if entry.len() < 4 {
+            // Not a status-prefixed entry; defensive skip.
+            continue;
+        }
+        // Status byte at index 0 (X = index status). R = renamed, C = copied.
+        let xy_first = entry.as_bytes()[0];
+        if xy_first == b'R' || xy_first == b'C' {
+            skip_next_as_rename_source = true;
+        }
+        files.insert(entry[3..].to_string());
+    }
 
     Ok(files)
 }
@@ -793,25 +819,15 @@ mod tests {
     // the underlying helper behavior so a future fix is intentional.
 
     #[test]
-    fn git_dirty_files_mishandles_renames_known_bug() {
-        // KNOWN BUG documented as a pin. `git status --porcelain -z`
-        // emits a rename as TWO nul-separated entries:
+    fn git_dirty_files_handles_renames_correctly() {
+        // `git status --porcelain -z` emits a rename as TWO nul-
+        // separated entries:
         //   entry1: "R  newpath\0"  (status + space + new path)
         //   entry2: "oldpath\0"     (bare old path, NO status prefix)
-        // The current parser does `entry[3..]` for every entry — so
-        // for entry2 it chops the first 3 characters of the old path,
-        // emitting a phantom truncated entry in the dirty set.
-        //
-        // For our reparse-on-edit case this is mostly harmless (the
-        // truncated path won't match any real file, so collect_files
-        // skips it; the deletion sweep finds the real old.go via
-        // _file_index diff). But it pollutes the dirty set with a
-        // phantom entry that scoped-reparse iterates uselessly.
-        //
-        // Pin the current behavior so a future fix (parse the status
-        // byte properly, or split renames into new-only) is a
-        // deliberate behavior change. Once fixed, update this test
-        // to assert the corrected behavior.
+        // The parser detects status code R/C in entry1 and skips
+        // entry2 as the rename-source. The dirty set should contain
+        // ONLY the new path. (Old-path removal is handled downstream
+        // by the _file_index diff during reparse.)
         let dir = TempDir::new().unwrap();
         std::process::Command::new("git")
             .args(["init", "-q"])
@@ -839,16 +855,15 @@ mod tests {
             .unwrap();
 
         let dirty = git_dirty_files(dir.path()).unwrap();
-        // The new path comes through cleanly.
         assert!(dirty.contains("new.go"), "new path must be in dirty set, got {dirty:?}");
-        // KNOWN BUG: the old path is currently ".go" (truncated by 3
-        // chars). When the bug is fixed (rename parsing rewritten),
-        // this assertion flips to: dirty.contains("old.go") OR
-        // !dirty.contains(...) depending on the chosen semantics.
+        // The old path's removal is handled by _file_index diff
+        // during reparse; the dirty set should NOT carry it (and
+        // certainly not the truncated ".go" phantom).
         assert!(
-            dirty.contains(".go"),
-            "KNOWN BUG: rename old-path arrives truncated; got {dirty:?}",
+            !dirty.contains("old.go") && !dirty.contains(".go"),
+            "rename source must not appear in dirty set; got {dirty:?}",
         );
+        assert_eq!(dirty.len(), 1, "exactly one entry expected: {dirty:?}");
     }
 
     #[test]

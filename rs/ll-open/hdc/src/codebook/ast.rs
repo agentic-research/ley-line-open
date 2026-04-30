@@ -152,6 +152,35 @@ mod tests {
     }
 
     #[test]
+    fn ast_base_vector_is_balanced_around_half_d() {
+        // Base vectors must have ~D/2 ones for HDC capacity bounds to
+        // hold (random-pair Hamming ≈ D/2). The underlying primitive
+        // (expand_seed) is pinned balanced; pin the codebook's
+        // base_vector (which goes through canonical_signature_bytes
+        // and bytes_to_hv) too — a refactor that introduced bias
+        // (e.g. a deterministic post-processing step that flipped
+        // bits based on some predicate) would shift the random-pair
+        // baseline and silently break radius calibration.
+        let cb = AstCodebook::new();
+        for fp in [
+            fp(CanonicalKind::Decl, 0, &[]),
+            fp(CanonicalKind::Stmt, 2, &[CanonicalKind::Op, CanonicalKind::Lit]),
+            fp(CanonicalKind::Block, 5, &[
+                CanonicalKind::Decl, CanonicalKind::Stmt, CanonicalKind::Expr,
+                CanonicalKind::Ref, CanonicalKind::Lit,
+            ]),
+        ] {
+            let hv = cb.base_vector(&fp);
+            let ones: u32 = hv.iter().map(|b| b.count_ones()).sum();
+            let expected = (crate::D_BITS / 2) as u32;
+            assert!(
+                ones.abs_diff(expected) < 200,
+                "base_vector for {fp:?}: {ones} ones, expected ~{expected}",
+            );
+        }
+    }
+
+    #[test]
     fn ast_codebook_tag_literal_is_hdc_ast() {
         // codebook_tag() is hashed into every cache_key and every
         // canonical_signature_bytes call. Bumping it orphans every

@@ -200,6 +200,29 @@ mod tests {
     }
 
     #[test]
+    fn encoder_node_leaf_constructor_pin() {
+        // `EncoderNode::leaf(kind)` is the canonical "leaf" form —
+        // zero children, kind preserved. Pin so a future refactor
+        // that promoted leaf to "1 child of itself" or some clever
+        // shortcut would shift produced base_vectors.
+        let leaf_node = EncoderNode::leaf(CanonicalKind::Lit);
+        assert_eq!(leaf_node.canonical_kind, CanonicalKind::Lit);
+        assert!(leaf_node.children.is_empty());
+        assert!(leaf_node.child_canonical_kinds_sorted.is_empty());
+
+        // Should be byte-equivalent to `EncoderNode::new(kind, vec![])`.
+        let manual = EncoderNode::new(CanonicalKind::Op, vec![]);
+        let via_helper = EncoderNode::leaf(CanonicalKind::Op);
+        assert_eq!(manual.canonical_kind, via_helper.canonical_kind);
+        assert!(manual.children.is_empty());
+        assert!(via_helper.children.is_empty());
+        assert_eq!(
+            manual.child_canonical_kinds_sorted,
+            via_helper.child_canonical_kinds_sorted,
+        );
+    }
+
+    #[test]
     fn encoder_is_deterministic() {
         // Same tree → same hypervector. The content-hash cache must not
         // introduce any non-determinism (e.g. via HashMap iteration order

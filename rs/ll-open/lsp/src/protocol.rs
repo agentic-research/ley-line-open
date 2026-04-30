@@ -168,3 +168,42 @@ pub fn completion_doc_text(doc: &lsp_types::Documentation) -> String {
         lsp_types::Documentation::MarkupContent(m) => m.value.clone(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_factory_sets_jsonrpc_2_0() {
+        // Request::new bakes in jsonrpc: "2.0". The LSP server
+        // dispatches on this exact string per the JSON-RPC 2.0 spec;
+        // a typo or version bump would break every server we talk to.
+        // Sister pin to mcp::JsonRpcResponse factory contract.
+        let req = Request::new(7, "initialize", serde_json::json!({"x": 1}));
+        assert_eq!(req.jsonrpc, "2.0");
+        assert_eq!(req.id, 7);
+        assert_eq!(req.method, "initialize");
+        let json = serde_json::to_value(&req).unwrap();
+        let obj = json.as_object().unwrap();
+        assert_eq!(obj.get("jsonrpc").and_then(|v| v.as_str()), Some("2.0"));
+        // id is u64 in our framing.
+        assert_eq!(obj.get("id").and_then(|v| v.as_u64()), Some(7));
+        assert_eq!(obj.get("method").and_then(|v| v.as_str()), Some("initialize"));
+        assert!(obj.get("params").is_some());
+    }
+
+    #[test]
+    fn notification_factory_sets_jsonrpc_2_0_no_id() {
+        // Sister pin: Notification differs from Request in lacking
+        // the `id` field. The LSP spec uses absence of `id` to
+        // distinguish notifications from requests; misencoding here
+        // would cause the server to wait for our reply forever.
+        let n = Notification::new("textDocument/didOpen", serde_json::json!({}));
+        assert_eq!(n.jsonrpc, "2.0");
+        let json = serde_json::to_value(&n).unwrap();
+        let obj = json.as_object().unwrap();
+        assert_eq!(obj.get("jsonrpc").and_then(|v| v.as_str()), Some("2.0"));
+        assert!(!obj.contains_key("id"), "Notification must NOT carry an id");
+        assert_eq!(obj.get("method").and_then(|v| v.as_str()), Some("textDocument/didOpen"));
+    }
+}

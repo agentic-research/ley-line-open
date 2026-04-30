@@ -319,6 +319,18 @@ mod tests {
     }
 
     #[test]
+    fn semantic_hyperplane_seed_constant_literal() {
+        // SEMANTIC_HYPERPLANE_SEED is hashed into the hyperplane
+        // matrix via build_hyperplane_matrix. Bumping it orphans
+        // every encoded semantic hypervector. The convenience
+        // wrapper pin (semantic_new_matches_new_with_seed_at_default
+        // _constant) confirms `new()` uses this constant, but the
+        // literal value itself wasn't pinned. Pin so a typo or
+        // unintentional version bump surfaces immediately.
+        assert_eq!(SEMANTIC_HYPERPLANE_SEED, "hdc-semantic-v1");
+    }
+
+    #[test]
     fn semantic_new_matches_new_with_seed_at_default_constant() {
         // SemanticCodebook::new(dim) is documented as a convenience
         // wrapper for `new_with_seed(dim, SEMANTIC_HYPERPLANE_SEED)`.

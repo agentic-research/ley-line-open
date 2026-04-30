@@ -382,6 +382,16 @@ mod tests {
     }
 
     #[test]
+    fn temporal_hyperplane_seed_constant_literal() {
+        // Sister pin to semantic_hyperplane_seed_constant_literal.
+        // TEMPORAL_HYPERPLANE_SEED feeds the hyperplane matrix and is
+        // baked into encoded temporal HVs. Pin the literal so a typo
+        // or unintentional version bump (e.g. v1 → v2) surfaces
+        // immediately rather than after migration tests notice.
+        assert_eq!(TEMPORAL_HYPERPLANE_SEED, "hdc-temporal-v1");
+    }
+
+    #[test]
     fn temporal_new_matches_new_with_seed_at_default_constant() {
         // Sister pin to semantic::semantic_new_matches_new_with_seed_
         // at_default_constant. TemporalCodebook::new(dim) is a

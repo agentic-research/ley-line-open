@@ -1114,6 +1114,23 @@ mod tests {
         assert!(none.is_empty());
     }
 
+    /// Build the `CREATE TABLE` statement for an LSP 5-col position
+    /// table (`_lsp_defs` with `def_*` columns, or `_lsp_refs` with
+    /// `ref_*`). Replaces two byte-similar CREATE statements that
+    /// only differed in their column-prefix substring.
+    fn lsp_5col_create_sql(table: &str, prefix: &str) -> String {
+        format!(
+            "CREATE TABLE {table} (
+                node_id TEXT,
+                {prefix}_uri TEXT,
+                {prefix}_start_line INTEGER,
+                {prefix}_start_col INTEGER,
+                {prefix}_end_line INTEGER,
+                {prefix}_end_col INTEGER
+            );"
+        )
+    }
+
     #[test]
     fn lsp_5col_position_rows_returns_empty_when_table_missing() {
         // Pre-enrichment state: callers must get an empty vec, not an
@@ -1126,19 +1143,13 @@ mod tests {
     #[test]
     fn lsp_5col_position_rows_decodes_def_shape() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE _lsp_defs (
-                node_id TEXT,
-                def_uri TEXT,
-                def_start_line INTEGER,
-                def_start_col INTEGER,
-                def_end_line INTEGER,
-                def_end_col INTEGER
-             );
+        let create = lsp_5col_create_sql("_lsp_defs", "def");
+        conn.execute_batch(&format!(
+            "{create}
              INSERT INTO _lsp_defs VALUES
                ('foo/main', 'file:///foo.rs', 10, 4, 12, 0),
-               ('bar/baz', 'file:///bar.rs', 1, 0, 1, 8);",
-        )
+               ('bar/baz', 'file:///bar.rs', 1, 0, 1, 8);"
+        ))
         .unwrap();
 
         let rows = lsp_5col_position_rows(&conn, "foo/main", "_lsp_defs", "def").unwrap();
@@ -1155,17 +1166,11 @@ mod tests {
     fn lsp_5col_position_rows_handles_ref_prefix() {
         // The same helper services _lsp_refs with a different col prefix.
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE _lsp_refs (
-                node_id TEXT,
-                ref_uri TEXT,
-                ref_start_line INTEGER,
-                ref_start_col INTEGER,
-                ref_end_line INTEGER,
-                ref_end_col INTEGER
-             );
-             INSERT INTO _lsp_refs VALUES ('x/y', 'file:///z.rs', 5, 2, 5, 7);",
-        )
+        let create = lsp_5col_create_sql("_lsp_refs", "ref");
+        conn.execute_batch(&format!(
+            "{create}
+             INSERT INTO _lsp_refs VALUES ('x/y', 'file:///z.rs', 5, 2, 5, 7);"
+        ))
         .unwrap();
 
         let rows = lsp_5col_position_rows(&conn, "x/y", "_lsp_refs", "ref").unwrap();

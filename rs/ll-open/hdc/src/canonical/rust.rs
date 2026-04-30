@@ -129,14 +129,18 @@ mod tests {
 
     #[test]
     fn common_rust_kinds_map_correctly() {
-        let m = RustCanonicalMap;
-        assert_eq!(m.lookup("function_item"), CanonicalKind::Decl);
-        assert_eq!(m.lookup("if_expression"), CanonicalKind::Expr);
-        assert_eq!(m.lookup("expression_statement"), CanonicalKind::Stmt);
-        assert_eq!(m.lookup("block"), CanonicalKind::Block);
-        assert_eq!(m.lookup("identifier"), CanonicalKind::Ref);
-        assert_eq!(m.lookup("integer_literal"), CanonicalKind::Lit);
-        assert_eq!(m.lookup("if"), CanonicalKind::Op);
+        super::super::assert_kinds_match(
+            &RustCanonicalMap,
+            &[
+                ("function_item", CanonicalKind::Decl),
+                ("if_expression", CanonicalKind::Expr),
+                ("expression_statement", CanonicalKind::Stmt),
+                ("block", CanonicalKind::Block),
+                ("identifier", CanonicalKind::Ref),
+                ("integer_literal", CanonicalKind::Lit),
+                ("if", CanonicalKind::Op),
+            ],
+        );
     }
 
     #[test]

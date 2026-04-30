@@ -104,6 +104,23 @@ pub fn assert_canonical_map_baseline(m: &dyn CanonicalKindMap, expected_lang: &s
     assert_eq!(m.lang(), expected_lang);
 }
 
+/// Assert each `(kind_str, expected_canonical)` pair maps as expected.
+/// Use to pin a sample of important kinds per language without copying
+/// the same `assert_eq!(m.lookup("X"), CanonicalKind::Y)` shape
+/// per-language. Diagnostic includes the language id and the kind so a
+/// failure tells you exactly which mapping drifted.
+#[cfg(test)]
+pub fn assert_kinds_match(m: &dyn CanonicalKindMap, pairs: &[(&str, CanonicalKind)]) {
+    for (kind, expected) in pairs {
+        assert_eq!(
+            m.lookup(kind),
+            *expected,
+            "{}: lookup(\"{kind}\") expected {expected:?}",
+            m.lang(),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

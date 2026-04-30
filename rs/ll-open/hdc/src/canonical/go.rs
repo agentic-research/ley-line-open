@@ -123,14 +123,18 @@ mod tests {
 
     #[test]
     fn common_go_kinds_map_correctly() {
-        let m = GoCanonicalMap;
-        assert_eq!(m.lookup("function_declaration"), CanonicalKind::Decl);
-        assert_eq!(m.lookup("call_expression"), CanonicalKind::Expr);
-        assert_eq!(m.lookup("if_statement"), CanonicalKind::Stmt);
-        assert_eq!(m.lookup("block"), CanonicalKind::Block);
-        assert_eq!(m.lookup("identifier"), CanonicalKind::Ref);
-        assert_eq!(m.lookup("int_literal"), CanonicalKind::Lit);
-        assert_eq!(m.lookup("if"), CanonicalKind::Op);
+        super::super::assert_kinds_match(
+            &GoCanonicalMap,
+            &[
+                ("function_declaration", CanonicalKind::Decl),
+                ("call_expression", CanonicalKind::Expr),
+                ("if_statement", CanonicalKind::Stmt),
+                ("block", CanonicalKind::Block),
+                ("identifier", CanonicalKind::Ref),
+                ("int_literal", CanonicalKind::Lit),
+                ("if", CanonicalKind::Op),
+            ],
+        );
     }
 
     #[test]

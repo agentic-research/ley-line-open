@@ -185,6 +185,18 @@ mod tests {
     }
 
     #[test]
+    fn gaussian_row_zero_length_returns_empty() {
+        // Boundary pin: gaussian_row(_, 0) must return an empty Vec
+        // without panicking. The caller (build_hyperplane_matrix)
+        // always passes width > 0 in production, but defensive: a
+        // refactor that index-allocated `out[0] = ...` before the
+        // bounds check would crash on zero. The while-loop entry
+        // condition (line 97 `while i < n`) is what protects us.
+        assert!(gaussian_row(0xDEAD, 0).is_empty());
+        assert!(gaussian_row(0, 0).is_empty());
+    }
+
+    #[test]
     fn gaussian_row_returns_n_floats_deterministically() {
         // gaussian_row(seed, n) must produce exactly `n` floats
         // (Box-Muller pairs handle odd n via the truncate-to-cos

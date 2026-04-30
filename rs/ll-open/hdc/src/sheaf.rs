@@ -52,7 +52,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::canonical::CanonicalKind;
-use crate::util::{popcount_distance, rotate_left, Hypervector};
+use crate::util::{popcount_distance, rotate_left, Hypervector, ZERO_HV};
 use crate::{D_BITS, D_BYTES, LayerKind};
 
 /// A stalk: one hypervector over one layer at one cell.
@@ -350,7 +350,7 @@ impl HvCellComplex {
     /// "more 1s ≥". Useful for computing a canonical centroid of a
     /// consistent group returned by `compute_h0`.
     pub fn bundle_majority(stalks: &[Hypervector]) -> Hypervector {
-        let mut out = [0u8; D_BYTES];
+        let mut out = ZERO_HV;
         if stalks.is_empty() {
             return out;
         }
@@ -905,7 +905,7 @@ mod tests {
         // Pin this so a refactor that returned "all-ones" or panicked
         // for empty input would fail loudly.
         let out = HvCellComplex::bundle_majority(&[]);
-        assert_eq!(out, [0u8; D_BYTES]);
+        assert_eq!(out, ZERO_HV);
     }
 
     #[test]
@@ -937,12 +937,12 @@ mod tests {
         for i in 0..D_BYTES {
             assert_eq!(a[i] ^ b[i], 0xFF);
         }
-        assert_eq!(HvCellComplex::bundle_majority(&[a, b]), [0u8; D_BYTES]);
+        assert_eq!(HvCellComplex::bundle_majority(&[a, b]), ZERO_HV);
         // Also verify the path doesn't depend on which bit-pattern we
         // used: switch `a` to a different fixed pattern and re-confirm.
         let a2 = [0xAA_u8; D_BYTES];
         let b2 = a2.map(|x| !x);
-        assert_eq!(HvCellComplex::bundle_majority(&[a2, b2]), [0u8; D_BYTES]);
+        assert_eq!(HvCellComplex::bundle_majority(&[a2, b2]), ZERO_HV);
     }
 
     #[test]
@@ -1069,7 +1069,7 @@ mod tests {
         use rusqlite::types::Value;
 
         let rust_empty = HvCellComplex::bundle_majority(&[]);
-        assert_eq!(rust_empty, [0u8; D_BYTES], "Rust empty must be ZERO_HV");
+        assert_eq!(rust_empty, ZERO_HV, "Rust empty must be ZERO_HV");
 
         let conn = crate::test_util::conn_with_udfs();
         conn.execute("CREATE TABLE hvs(hv BLOB NOT NULL)", []).unwrap();

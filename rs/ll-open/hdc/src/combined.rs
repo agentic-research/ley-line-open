@@ -119,12 +119,11 @@ mod tests {
     use super::*;
     use crate::test_util::{conn_with_schema as fresh, insert_layer_hv as insert_layer};
     use crate::util::{assert_far_apart, expand_seed, popcount_distance};
-    use crate::D_BYTES;
 
     #[test]
     fn empty_layer_map_returns_zero() {
         let layers = HashMap::new();
-        assert_eq!(build_combined_hv(&layers), [0u8; D_BYTES]);
+        assert_eq!(build_combined_hv(&layers), ZERO_HV);
     }
 
     #[test]

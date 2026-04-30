@@ -151,6 +151,27 @@ mod tests {
     }
 
     #[test]
+    fn _hdc_combined_scope_id_pkey() {
+        // _hdc_combined uses `scope_id` alone as the primary key (one
+        // combined HV per scope, layer-agnostic). Pin uniqueness so a
+        // refactor that loosened the constraint to permit per-layer or
+        // per-basis duplicates would surface immediately. Sister pin
+        // to `_hdc_pkey_enforces_layer_uniqueness` for the per-layer
+        // table.
+        let conn = fresh_schema_conn();
+        conn.execute(
+            "INSERT INTO _hdc_combined(scope_id, hv, basis) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["fn_foo", ZERO_HV.to_vec(), 1i64],
+        )
+        .unwrap();
+        let dup = conn.execute(
+            "INSERT INTO _hdc_combined(scope_id, hv, basis) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["fn_foo", ZERO_HV.to_vec(), 2i64],
+        );
+        assert!(dup.is_err(), "duplicate scope_id must be rejected");
+    }
+
+    #[test]
     fn _hdc_baseline_keyed_per_layer() {
         let conn = fresh_schema_conn();
         // One baseline per layer is the contract — same layer twice

@@ -372,9 +372,7 @@ mod tests {
         let recovered = unbind_child_at_position(&parent, &base, &siblings, 0);
         // Compute expected: parent ⊕ base
         let mut expected = parent;
-        for (e, b) in expected.iter_mut().zip(base.iter()) {
-            *e ^= *b;
-        }
+        xor_into(&mut expected, &base);
         assert_eq!(recovered, expected);
     }
 
@@ -395,13 +393,9 @@ mod tests {
         // Build parent the way the encoder would.
         let mut parent = parent_base;
         let p0 = rotate_left(&child0, 0);
-        for (a, b) in parent.iter_mut().zip(p0.iter()) {
-            *a ^= *b;
-        }
+        xor_into(&mut parent, &p0);
         let p1 = rotate_left(&child1, 1);
-        for (a, b) in parent.iter_mut().zip(p1.iter()) {
-            *a ^= *b;
-        }
+        xor_into(&mut parent, &p1);
 
         // Strip child0 from siblings_acc (already rotated as it sits in parent).
         let recovered = unbind_child_at_position(&parent, &parent_base, &p0, 1);

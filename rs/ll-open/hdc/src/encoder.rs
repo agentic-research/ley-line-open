@@ -406,13 +406,12 @@ mod tests {
         let child_hv_direct = encode_fresh(&leaf(child_kind), &cb);
 
         // For position 0: parent_hv = base ⊕ rotate_left(child, 0) = base ⊕ child
-        // So child = parent ⊕ base.
-        let parent_fp = AstNodeFingerprint {
-            canonical_kind: CanonicalKind::Stmt,
-            arity_bucket: 1,
-            child_canonical_kinds: vec![child_kind],
-        };
-        let parent_base = cb.base_vector(&parent_fp);
+        // So child = parent ⊕ base. Use tree.fingerprint() so the
+        // arity_bucket and sorted child kinds derive from the same
+        // EncoderNode the encoder saw — the alternative (hand-built
+        // AstNodeFingerprint) duplicated EncoderNode::fingerprint's
+        // sort logic.
+        let parent_base = cb.base_vector(&tree.fingerprint());
 
         let mut recovered = parent_hv;
         xor_into(&mut recovered, &parent_base);
@@ -436,20 +435,11 @@ mod tests {
         let child0_hv = encode_fresh(&leaf(kind0), &cb);
         let child1_hv = encode_fresh(&leaf(kind1), &cb);
 
-        // Children sorted at codebook level: discriminants Op=6, Lit=5
-        // → sorted = [Lit, Op]. So fingerprint child_canonical_kinds
-        // is [Lit, Op]. But child_canonical_kinds_sorted on EncoderNode
-        // also sorts. Match that.
-        let parent_fp = AstNodeFingerprint {
-            canonical_kind: CanonicalKind::Stmt,
-            arity_bucket: 2,
-            child_canonical_kinds: {
-                let mut v = vec![kind0, kind1];
-                v.sort_unstable_by_key(|k| k.discriminant());
-                v
-            },
-        };
-        let parent_base = cb.base_vector(&parent_fp);
+        // Use tree.fingerprint() so the sort matches encode_tree's
+        // input by construction — duplicating the sort_unstable_by_key
+        // dance inline (as the prior version did) was a near-miss
+        // for drift if the codebook ever changed its sort key.
+        let parent_base = cb.base_vector(&tree.fingerprint());
 
         // parent = base ⊕ rotate_left(child0, 0) ⊕ rotate_left(child1, 1)
         //        = base ⊕ child0 ⊕ rotate_left(child1, 1)

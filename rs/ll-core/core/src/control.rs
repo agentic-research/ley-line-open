@@ -266,6 +266,28 @@ mod tests {
     }
 
     #[test]
+    fn control_disk_format_constants() {
+        // Sister disk-format-stability pin to layout.rs's MAGIC +
+        // VERSION + HEADER_SIZE triplet. CONTROL_SIZE (4096) is the
+        // exact byte size of every .ctrl file on disk; bumping it
+        // invalidates every existing controller. MAGIC = 0x4C455943
+        // = ASCII "LEYC" (big-endian) — distinct from arena's "LEY0"
+        // so a tool reading either can dispatch on the magic. VERSION
+        // = 1 until a deliberate migration ships.
+        assert_eq!(CONTROL_SIZE, 4096, "CONTROL_SIZE pinned at one OS page");
+        assert_eq!(MAGIC, 0x4C455943, "MAGIC must be ASCII 'LEYC'");
+        let bytes = MAGIC.to_be_bytes();
+        assert_eq!(bytes, *b"LEYC", "MAGIC bytes must spell 'LEYC'");
+        assert_eq!(VERSION, 1, "VERSION must be 1 until a deliberate migration");
+        // Distinct from the arena's MAGIC ("LEY0"). A tool reading
+        // either header dispatches on the magic to pick the parser.
+        assert_ne!(
+            MAGIC, crate::layout::ArenaHeader::MAGIC,
+            "control + arena MAGIC must differ for dispatch",
+        );
+    }
+
+    #[test]
     fn test_invalid_magic() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("bad.ctrl");

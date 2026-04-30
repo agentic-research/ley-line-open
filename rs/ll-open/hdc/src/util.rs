@@ -489,6 +489,28 @@ mod tests {
     }
 
     #[test]
+    fn assert_far_apart_passes_on_distinct_seeds_panics_on_self() {
+        // Self-test for the test fixture. Two distinct seeds produce
+        // ~D/2 distance — well above FAR_APART_THRESHOLD=3500 — so
+        // assert_far_apart must not panic. Same vector self-compared
+        // is at distance 0, which MUST panic. A refactor that
+        // inverted the comparison (passes on close, panics on far)
+        // would silently invert every assert_far_apart call site
+        // across the crate.
+        let a = expand_seed(1);
+        let b = expand_seed(2);
+        // Distinct seeds: should not panic.
+        assert_far_apart(&a, &b, "distinct seeds");
+
+        // Self-comparison: should panic. Use a closure inside a thread
+        // so we can assert the panic without poisoning the test.
+        let result = std::panic::catch_unwind(|| {
+            assert_far_apart(&a, &a, "self");
+        });
+        assert!(result.is_err(), "self-compare must panic (d=0 < threshold)");
+    }
+
+    #[test]
     fn blake3_seed_is_deterministic() {
         let s1 = blake3_seed(b"hello");
         let s2 = blake3_seed(b"hello");

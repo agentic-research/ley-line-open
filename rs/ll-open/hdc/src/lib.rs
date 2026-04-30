@@ -18,7 +18,11 @@
 //! sidesteps the saturation ceiling on flat bundles.
 
 pub mod canonical;
+pub mod codebook;
 pub mod schema;
+pub mod util;
+
+pub use util::{Hypervector, ZERO_HV};
 
 /// Hypervector dimensionality in bits. Default = 8192. Single source of truth
 /// — every layer, every codebook, every BLOB column shares this value.

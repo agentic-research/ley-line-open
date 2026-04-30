@@ -90,6 +90,12 @@ pub use rust::RustCanonicalMap;
 pub mod go;
 pub use go::GoCanonicalMap;
 
+pub mod yaml;
+pub use yaml::YamlCanonicalMap;
+
+pub mod json;
+pub use json::JsonCanonicalMap;
+
 /// Test invariants every `CanonicalKindMap` impl must satisfy. Centralizes
 /// the boilerplate that would otherwise be copied per-language: forward-
 /// compat fallback, empty-string fallback, and lang-id identification.

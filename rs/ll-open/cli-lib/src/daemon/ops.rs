@@ -1232,6 +1232,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn op_reparse_errors_when_source_neither_field_nor_ctx() {
+        // op_reparse pulls `source` from req or falls back to
+        // ctx.source_dir. When neither is set, it must surface an
+        // actionable error rather than panicking or silently no-op'ing.
+        // The setup() helper builds a ctx with `source_dir: None`, so
+        // a request without "source" should hit the missing-everything
+        // path. Sister to op_load_errors and op_query_errors.
+        let (_dir, ctx) = setup();
+        let resp = handle_base_op(&ctx, "reparse", &json!({})).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert!(
+            parsed.get("error").is_some(),
+            "missing source with no ctx fallback must error: {parsed}",
+        );
+    }
+
+    #[tokio::test]
     async fn op_query_errors_on_missing_or_invalid_sql() {
         // Sister pin to op_load_errors_on_missing_or_invalid_db_field.
         // op_query is the ad-hoc inspection escape hatch. At scale (an

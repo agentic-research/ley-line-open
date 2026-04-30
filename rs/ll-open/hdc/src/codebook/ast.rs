@@ -29,7 +29,7 @@ impl AstCodebook {
     /// `[kind_disc, arity_bucket, len_low, len_high, child_disc...]`.
     /// Sorted children → order-invariant signature; role-binding at the
     /// encoder restores order-sensitivity per slot.
-    fn signature_bytes(item: &AstNodeFingerprint<'_>) -> Vec<u8> {
+    fn signature_bytes(item: &AstNodeFingerprint) -> Vec<u8> {
         let mut buf = Vec::with_capacity(4 + item.child_canonical_kinds.len());
         buf.push(item.canonical_kind.discriminant());
         buf.push(item.arity_bucket);
@@ -50,7 +50,7 @@ impl AstCodebook {
 }
 
 impl BaseCodebook for AstCodebook {
-    type Item = AstNodeFingerprint<'static>;
+    type Item = AstNodeFingerprint;
 
     fn base_vector(&self, item: &Self::Item) -> Hypervector {
         let bytes = Self::signature_bytes(item);
@@ -83,12 +83,12 @@ mod tests {
     fn fp(
         kind: CanonicalKind,
         arity: u8,
-        children: &'static [CanonicalKind],
-    ) -> AstNodeFingerprint<'static> {
+        children: &[CanonicalKind],
+    ) -> AstNodeFingerprint {
         AstNodeFingerprint {
             canonical_kind: kind,
             arity_bucket: arity,
-            child_canonical_kinds: children,
+            child_canonical_kinds: children.to_vec(),
         }
     }
 

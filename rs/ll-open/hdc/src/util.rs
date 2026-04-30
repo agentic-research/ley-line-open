@@ -56,6 +56,39 @@ pub fn xor_into(dst: &mut Hypervector, src: &Hypervector) {
     }
 }
 
+/// Rotate the bits of a hypervector left by `n` positions (modulo D_BITS).
+/// Used as the positional-encoding primitive in the encoder: each child
+/// position rotates the child's HV by its index, breaking the XOR-bundle
+/// commutativity that would otherwise lose order information.
+///
+/// Operates on the full D_BITS-bit value as a single circular shift —
+/// not a per-byte shift. Deterministic and bijective; the inverse is
+/// `rotate_right(hv, n)` (used by unbind).
+pub fn rotate_left(hv: &Hypervector, n: usize) -> Hypervector {
+    use crate::D_BITS;
+    let n = n % D_BITS;
+    if n == 0 {
+        return *hv;
+    }
+    let mut out = [0u8; D_BYTES];
+    for src_bit in 0..D_BITS {
+        let src_byte = src_bit / 8;
+        let src_off = src_bit % 8;
+        let bit = (hv[src_byte] >> src_off) & 1;
+        let dst_bit = (src_bit + n) % D_BITS;
+        let dst_byte = dst_bit / 8;
+        let dst_off = dst_bit % 8;
+        out[dst_byte] |= bit << dst_off;
+    }
+    out
+}
+
+/// Inverse of `rotate_left` — rotate bits right by `n`. Used by unbind.
+pub fn rotate_right(hv: &Hypervector, n: usize) -> Hypervector {
+    use crate::D_BITS;
+    rotate_left(hv, D_BITS - (n % D_BITS))
+}
+
 /// Hamming distance between two hypervectors via popcount over the XOR.
 /// O(D_BYTES / 8) u64 popcounts — ~16 cycles each on x86_64 SSE 4.2 /
 /// AArch64 NEON. No allocation.

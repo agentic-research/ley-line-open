@@ -19,9 +19,11 @@
 
 pub mod canonical;
 pub mod codebook;
+pub mod encoder;
 pub mod schema;
 pub mod util;
 
+pub use encoder::{encode_fresh, encode_tree, distance, EncoderNode, SubtreeCache};
 pub use util::{Hypervector, ZERO_HV};
 
 /// Hypervector dimensionality in bits. Default = 8192. Single source of truth

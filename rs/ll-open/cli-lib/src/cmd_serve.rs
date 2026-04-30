@@ -241,6 +241,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_duration_boundary_inputs() {
+        // Valid: zero. Some users will type "0s" to mean immediate.
+        assert_eq!(parse_duration("0s").unwrap(), Duration::from_secs(0));
+        assert_eq!(parse_duration("0").unwrap(), Duration::from_secs(0));
+
+        // Trim handles surrounding whitespace (line 30 `s.trim()`).
+        assert_eq!(parse_duration("  5m  ").unwrap(), Duration::from_secs(300));
+        assert_eq!(parse_duration("\t30s\n").unwrap(), Duration::from_secs(30));
+
+        // Suffix without number → Err (parse() of "" fails).
+        assert!(parse_duration("h").is_err(), "h alone must error");
+        assert!(parse_duration("m").is_err());
+        assert!(parse_duration("s").is_err());
+
+        // Unsupported suffix `d` for days. The current impl falls
+        // through to bare-number path, where "5d".parse::<u64>()
+        // fails. Error message says "invalid duration number" not
+        // "unsupported suffix". Documented limitation.
+        assert!(parse_duration("5d").is_err(), "d (days) is not supported");
+        assert!(parse_duration("5w").is_err(), "w (weeks) is not supported");
+    }
+
+    #[test]
     fn setup_arena_derives_ctrl_path_from_arena_extension() {
         // Convention pin: when control is None, ctrl_path defaults to
         // arena.with_extension("ctrl"). Daemons / tools rely on this

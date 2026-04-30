@@ -1332,6 +1332,23 @@ mod tests {
     }
 
     #[test]
+    fn restriction_composite_single_element_equals_that_element() {
+        // Boundary between empty Composite (identity) and multi-element
+        // Composite (chain). A single-element Composite should behave
+        // as that element alone — the for-loop runs once, applying
+        // exactly that restriction. Pin so a refactor that introduced
+        // pre/post hooks (e.g. always XOR'd a sentinel for "Composite
+        // entered") would catch it.
+        let hv = stalk_for(101);
+        let direct = Restriction::RotateLeft(13).apply(&hv);
+        let composite = Restriction::Composite(vec![Restriction::RotateLeft(13)]).apply(&hv);
+        assert_eq!(direct, composite);
+        // And a single-Identity Composite is also identity.
+        let composite_id = Restriction::Composite(vec![Restriction::Identity]).apply(&hv);
+        assert_eq!(composite_id, hv);
+    }
+
+    #[test]
     fn restriction_composite_chains_in_order() {
         // Composite([a, b]).apply(x) == b.apply(a.apply(x)). Pin this
         // so a future "fold from the right" refactor would fail loudly.

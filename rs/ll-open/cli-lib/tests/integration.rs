@@ -1306,6 +1306,119 @@ async fn test_incremental_deleted_file() {
     assert_eq!(index_count, 1);
 }
 
+/// End-to-end pin for the schema-bloat fix: delete_file_rows must
+/// clean up _lsp* table rows when a file is removed AND the
+/// integration with cmd_parse must trigger that cleanup.
+///
+/// The unit test in leyline-ts (delete_file_rows_cleans_lsp_tables_
+/// when_present) pins the helper behavior. This integration test pins
+/// that the helper actually fires from the reparse path on a
+/// real-deletion-then-reparse cycle: without the integration coverage
+/// a refactor that stopped calling delete_file_rows from cmd_parse
+/// would silently regress at registry scale (orphan _lsp rows
+/// accumulating across file churn).
+#[tokio::test]
+async fn test_incremental_deletion_cleans_lsp_orphans() {
+    let src = tempfile::TempDir::new().unwrap();
+    let out_dir = tempfile::TempDir::new().unwrap();
+    let db_path = out_dir.path().join("incr-lsp-cleanup.db");
+
+    write_empty_go_func(src.path(), "keep.go", "main", "Keep");
+    std::fs::write(
+        src.path().join("remove.go"),
+        b"package main\n\nfunc Remove() {}\n",
+    )
+    .unwrap();
+
+    // First parse to populate nodes.
+    let cmd = leyline_cli_lib::Commands::Parse {
+        source: src.path().to_path_buf(),
+        output: db_path.clone(),
+        lang: Some("go".to_string()),
+    };
+    leyline_cli_lib::run(cmd).await.unwrap();
+
+    // Simulate LSP enrichment having run: create the leyline-lsp
+    // schema directly + insert rows for both files. We use the same
+    // shape as leyline_lsp::project::create_lsp_schema (no cross-crate
+    // dep needed; the schema is a small constant string).
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _lsp (
+                node_id TEXT PRIMARY KEY,
+                symbol_kind TEXT,
+                detail TEXT,
+                start_line INTEGER NOT NULL,
+                start_col INTEGER NOT NULL,
+                end_line INTEGER NOT NULL,
+                end_col INTEGER NOT NULL,
+                diagnostics TEXT
+            );
+            CREATE TABLE _lsp_hover (node_id TEXT PRIMARY KEY, hover_text TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO _lsp (node_id, symbol_kind, detail, start_line, start_col, end_line, end_col) \
+             VALUES ('keep.go/func', 'function', 'k', 0, 0, 1, 0), \
+                    ('remove.go/func', 'function', 'r', 0, 0, 1, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO _lsp_hover (node_id, hover_text) VALUES \
+             ('keep.go/func', 'k-doc'), ('remove.go/func', 'r-doc')",
+            [],
+        )
+        .unwrap();
+    }
+
+    // Delete the file from disk.
+    std::fs::remove_file(src.path().join("remove.go")).unwrap();
+
+    // Reparse — this must trigger delete_file_rows, which must in turn
+    // clean up the _lsp* rows for remove.go.
+    let cmd = leyline_cli_lib::Commands::Parse {
+        source: src.path().to_path_buf(),
+        output: db_path.clone(),
+        lang: Some("go".to_string()),
+    };
+    leyline_cli_lib::run(cmd).await.unwrap();
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+    // remove.go's _lsp rows: gone.
+    let remove_lsp: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM _lsp WHERE node_id LIKE 'remove.go%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(remove_lsp, 0, "_lsp rows for remove.go must be cleaned up");
+    let remove_hover: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM _lsp_hover WHERE node_id LIKE 'remove.go%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        remove_hover, 0,
+        "_lsp_hover rows for remove.go must be cleaned up",
+    );
+
+    // keep.go's _lsp rows: intact.
+    let keep_lsp: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM _lsp WHERE node_id LIKE 'keep.go%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(keep_lsp, 1, "_lsp rows for keep.go must NOT be cleaned up");
+}
+
 // ---------------------------------------------------------------------------
 // Go ref extraction + mache schema compat tests
 // ---------------------------------------------------------------------------

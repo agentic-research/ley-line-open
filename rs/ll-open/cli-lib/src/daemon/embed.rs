@@ -432,6 +432,26 @@ mod tests {
         assert_eq!(heap.pop().unwrap().node_id, "z", "max-heap pops highest");
     }
 
+    #[test]
+    fn embedding_pass_trait_metadata_pin() {
+        // EmbeddingPass advertises its name + dependency + reads/writes
+        // through the EnrichmentPass trait. resolve_order keys on
+        // these strings; a typo (e.g. "tree_sitter" with underscore
+        // vs hyphen) would silently break dep resolution and the
+        // pass would never run. Pin all four metadata methods.
+        let pass = EmbeddingPass::new(
+            Arc::new({
+                register_vec();
+                VectorIndex::new(4, None).unwrap()
+            }),
+            Arc::new(ZeroEmbedder { dim: 4 }),
+        );
+        assert_eq!(pass.name(), "embed");
+        assert_eq!(pass.depends_on(), &["tree-sitter"]);
+        assert_eq!(pass.reads(), &["nodes", "_source"]);
+        assert!(pass.writes().is_empty(), "embed pass writes via sidecar, not living db");
+    }
+
     /// Set up a minimal living-db with a couple of file nodes, then run
     /// EmbeddingPass with the default ZeroEmbedder. Verify the index has
     /// the right node ids and vectors of the right shape.

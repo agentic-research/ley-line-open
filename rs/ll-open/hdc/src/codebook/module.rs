@@ -279,6 +279,31 @@ mod tests {
     }
 
     #[test]
+    fn ast_and_module_base_vectors_differ_on_same_fingerprint() {
+        // Skeptic 4bb8a0 (regression pin): same AstNodeFingerprint
+        // run through AstCodebook::base_vector vs ModuleCodebook::
+        // base_vector must produce DIFFERENT hypervectors. Without
+        // codebook-tag prefixing in canonical_signature_bytes, both
+        // codebooks would collapse to identical HVs and ModuleCodebook
+        // would silently emit AstCodebook output. Existing pins cover
+        // the byte-level format (canonical_signature_bytes_distinct_
+        // for_distinct_tags); this is the end-to-end HV-level
+        // confirmation.
+        let ast = AstCodebook::new();
+        let module = ModuleCodebook::new();
+        let fp = AstNodeFingerprint::new(
+            CanonicalKind::Decl,
+            2,
+            vec![CanonicalKind::Block, CanonicalKind::Ref],
+        );
+        assert_far_apart(
+            &ast.base_vector(&fp),
+            &module.base_vector(&fp),
+            "AstCodebook and ModuleCodebook must produce far-apart base_vector for the same fingerprint",
+        );
+    }
+
+    #[test]
     fn module_root_does_not_collide_with_ast_leaf() {
         // The b'M' domain tag at module.rs:112 is documented as
         // preventing the module-root vector from colliding with the

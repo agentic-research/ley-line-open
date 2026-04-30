@@ -223,6 +223,40 @@ mod tests {
     }
 
     #[test]
+    fn encoder_node_new_sorts_child_kinds_by_discriminant() {
+        // EncoderNode::new sorts `child_canonical_kinds_sorted` (line
+        // 36 `sorted.sort_unstable_by_key(|k| k.discriminant())`) so
+        // the codebook receives a canonical, order-invariant child
+        // sequence. Existing tests cover the downstream consequence
+        // (child order doesn't affect base_vector) but never assert
+        // the field is sorted directly. A refactor that dropped the
+        // sort would still pass the codebook tests if the unsorted
+        // order happened to coincide with the sorted one — pin the
+        // invariant directly via a deliberately-unsorted child input.
+        let children = vec![
+            EncoderNode::leaf(CanonicalKind::Op),    // disc=6
+            EncoderNode::leaf(CanonicalKind::Decl),  // disc=0
+            EncoderNode::leaf(CanonicalKind::Stmt),  // disc=2
+            EncoderNode::leaf(CanonicalKind::Block), // disc=3
+        ];
+        let node = EncoderNode::new(CanonicalKind::Stmt, children);
+        // Sorted-by-discriminant: [Decl(0), Stmt(2), Block(3), Op(6)].
+        let discs: Vec<u8> = node
+            .child_canonical_kinds_sorted
+            .iter()
+            .map(|k| k.discriminant())
+            .collect();
+        assert_eq!(discs, vec![0, 2, 3, 6], "must be sorted by discriminant");
+        // `children` (parser order) preserved separately:
+        let children_discs: Vec<u8> = node
+            .children
+            .iter()
+            .map(|c| c.canonical_kind.discriminant())
+            .collect();
+        assert_eq!(children_discs, vec![6, 0, 2, 3], "children must keep parser order");
+    }
+
+    #[test]
     fn encoder_is_deterministic() {
         // Same tree → same hypervector. The content-hash cache must not
         // introduce any non-determinism (e.g. via HashMap iteration order

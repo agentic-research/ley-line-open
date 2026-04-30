@@ -241,6 +241,39 @@ mod tests {
     }
 
     #[test]
+    fn setup_arena_derives_ctrl_path_from_arena_extension() {
+        // Convention pin: when control is None, ctrl_path defaults to
+        // arena.with_extension("ctrl"). Daemons / tools rely on this
+        // to discover the controller from the arena alone (e.g.
+        // /foo/bar.arena → /foo/bar.ctrl). A refactor that changed
+        // the extension or moved to a sibling directory would silently
+        // break the discovery convention used by mache + cli tools.
+        use tempfile::TempDir;
+        let td = TempDir::new().unwrap();
+        let arena_path = td.path().join("test.arena");
+        let ctrl_path = setup_arena(&arena_path, 4096, None).expect("setup_arena");
+        assert_eq!(
+            ctrl_path,
+            arena_path.with_extension("ctrl"),
+            "ctrl path must derive as arena.with_extension(ctrl)",
+        );
+        assert!(ctrl_path.exists(), "controller file must be created");
+    }
+
+    #[test]
+    fn setup_arena_respects_explicit_control_path() {
+        // Sister pin: when explicit ctrl path is supplied, it's used
+        // verbatim — no .ctrl appending, no parent-dir mucking.
+        use tempfile::TempDir;
+        let td = TempDir::new().unwrap();
+        let arena_path = td.path().join("test.arena");
+        let explicit_ctrl = td.path().join("custom_name.weird");
+        let returned = setup_arena(&arena_path, 4096, Some(&explicit_ctrl))
+            .expect("setup_arena with explicit ctrl");
+        assert_eq!(returned, explicit_ctrl, "explicit ctrl path must be used verbatim");
+    }
+
+    #[test]
     fn parse_duration_rejects_unparseable_huge_integer() {
         // Inputs that don't fit in u64 fail at the parse() step before
         // multiplication can overflow. Pin: a 26-digit input is

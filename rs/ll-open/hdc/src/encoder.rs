@@ -427,6 +427,24 @@ mod tests {
     }
 
     #[test]
+    fn content_hash_distinguishes_root_kind() {
+        // The root canonical_kind discriminant is the first byte
+        // hashed (encoder.rs:66). Two leaves with different kinds
+        // must produce different content_hashes — this pins that
+        // root-kind contribution. content_hash_is_structure_only
+        // varies the children's kinds; this test varies the root
+        // itself. A refactor that dropped the root-kind hashing
+        // step would still pass on differently-shaped trees but
+        // collapse all leaves of different kinds to one hash.
+        let lits = leaf(CanonicalKind::Lit).content_hash();
+        let decls = leaf(CanonicalKind::Decl).content_hash();
+        let ops = leaf(CanonicalKind::Op).content_hash();
+        assert_ne!(lits, decls, "different root kinds must hash differently");
+        assert_ne!(lits, ops);
+        assert_ne!(decls, ops);
+    }
+
+    #[test]
     fn content_hash_distinguishes_nesting_from_flat() {
         // Same kinds, different topology: `Block[Op, Lit]` (flat,
         // 2 children) vs `Block[Op[Lit]]` (nested, 1 child whose

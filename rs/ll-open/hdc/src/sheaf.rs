@@ -52,7 +52,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::canonical::CanonicalKind;
-use crate::util::{blake3_seed, popcount_distance, rotate_left, Hypervector};
+use crate::util::{popcount_distance, rotate_left, Hypervector};
 use crate::{D_BITS, D_BYTES, LayerKind};
 
 /// A stalk: one hypervector over one layer at one cell.
@@ -313,10 +313,20 @@ impl HvCellComplex {
 
     /// Majority-rule section propagation: bundle a slice of stalks
     /// bit-for-bit, taking the majority bit at each position. Ties go
-    /// to 0 (matches the SQLite `BUNDLE_MAJORITY` UDF semantics so
-    /// SQL-side and Rust-side bundles produce identical results on
-    /// the same inputs). Returns `ZERO_HV` for an empty input — the
-    /// identity element of the bundle operation.
+    /// to 0 (matches the SQLite `BUNDLE_MAJORITY` UDF tie-break so
+    /// non-empty inputs produce identical results SQL-side and
+    /// Rust-side).
+    ///
+    /// **Empty-input divergence (skeptic 7293f3):** this Rust function
+    /// returns `ZERO_HV` for empty input — the identity element of
+    /// the bundle operation under XOR. The SQL `BUNDLE_MAJORITY`
+    /// aggregate returns `NULL` for zero rows, because that's how
+    /// SQLite aggregates universally signal "no rows". Callers that
+    /// shuttle bundles between Rust and SQL must therefore handle
+    /// the empty case explicitly (e.g. `COALESCE(BUNDLE_MAJORITY(hv),
+    /// ZEROBLOB(1024))` SQL-side, or check for `&[]` Rust-side).
+    /// Cross-implementation parity is pinned for non-empty inputs by
+    /// `bundle_majority_matches_sql_udf_on_nonempty`.
     ///
     /// In the Boolean-Heyting view this is the *meet* of the
     /// supplied sections in the lattice of binary stalks: the
@@ -497,14 +507,14 @@ fn union<'a>(parent: &mut HashMap<&'a str, &'a str>, a: &'a str, b: &'a str) {
 /// like `leyline-sheaf::merkle`; the algebra is identical).
 fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     if leaves.is_empty() {
-        // Domain-tagged empty root so the empty-complex root is
-        // distinguishable from blake3("") at the type level.
+        // Domain-tagged empty root: full 256-bit blake3 of the
+        // domain-tag bytes so the empty-complex root has full hash
+        // entropy (skeptic 72deb2: previous impl truncated to a u64
+        // and zero-padded, leaving only 64 bits of collision
+        // resistance).
         let mut buf = b"hdc-sheaf-empty".to_vec();
         buf.push(0u8);
-        let seed = blake3_seed(&buf);
-        let mut out = [0u8; 32];
-        out[..8].copy_from_slice(&seed.to_le_bytes());
-        return out;
+        return blake3::hash(&buf).into();
     }
     if leaves.len() == 1 {
         return leaves[0];
@@ -947,6 +957,164 @@ mod tests {
         assert!(
             centroids.contains(&s_singleton),
             "singleton centroid must equal lone stalk"
+        );
+    }
+
+    // -- Skeptic findings (7293f3, 731bff, 734d65) regression pins --
+
+    #[test]
+    fn bundle_majority_recovers_noisy_cluster_centroid() {
+        // Skeptic 731bff: prior cluster-recovery test only used
+        // *identical* stalks, where majority-bundle is trivially the
+        // input. This pins the actual claim: a cluster of stalks that
+        // each differ from a base by independent ~5% bit-flip noise
+        // still bundles back to a stalk close to the base — the
+        // BUNDLE_MAJORITY denoising property.
+        //
+        // Theory: with 5 noisy copies, each bit flips independently
+        // with p=0.05. Majority-rule preserves the original bit unless
+        // ≥3 of the 5 copies happened to flip it (probability
+        // C(5,3)·p³ + C(5,4)·p⁴ + p⁵ ≈ 0.00116). Expected bits-wrong
+        // in the bundle ≈ 0.00116 · 8192 ≈ 9.5. We assert the bundle
+        // lands within Hamming 50 of the base — generous enough to
+        // tolerate seed-dependent variance, tight enough to fail a
+        // refactor that broke majority-rule.
+        let base = stalk_for(2024);
+        let mut copies = Vec::with_capacity(5);
+        for seed in 100u64..105u64 {
+            // Mix the seed via blake3 first so the per-copy PRNG state
+            // is well-distributed across copies — using `seed` directly
+            // would leave copies sharing many low-order bits and the
+            // flip patterns would overlap, defeating the independence
+            // assumption of majority-rule denoising.
+            let mut state = crate::util::blake3_seed(&seed.to_le_bytes());
+            let mut copy = base;
+            for _ in 0..(D_BITS / 20) {
+                // SplitMix64 step inlined to avoid pulling util private fns
+                state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                let bit = ((z ^ (z >> 31)) as usize) % D_BITS;
+                let byte_idx = bit / 8;
+                let bit_off = bit % 8;
+                copy[byte_idx] ^= 1 << bit_off;
+            }
+            copies.push(copy);
+        }
+        let bundle = HvCellComplex::bundle_majority(&copies);
+        let dist = popcount_distance(&bundle, &base);
+        assert!(
+            dist <= 50,
+            "noisy-cluster bundle should denoise back near base; got Hamming {dist}"
+        );
+        // Also assert the bundle is closer to base than any single
+        // noisy copy is (the actual denoising property — not just
+        // "close enough").
+        for (i, c) in copies.iter().enumerate() {
+            let copy_dist = popcount_distance(c, &base);
+            assert!(
+                dist <= copy_dist,
+                "bundle Hamming {dist} should be ≤ copy[{i}] Hamming {copy_dist}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_majority_matches_sql_udf_on_nonempty() {
+        // Skeptic 7293f3: cross-implementation parity. Run the same
+        // three concrete stalks through the Rust `bundle_majority` and
+        // through the SQL `BUNDLE_MAJORITY` aggregate; assert they
+        // produce identical bytes. Pin so a future divergence in
+        // either implementation gets caught.
+        use rusqlite::Connection;
+
+        let stalks: Vec<Hypervector> =
+            vec![stalk_for(101), stalk_for(202), stalk_for(303)];
+        let rust_bundle = HvCellComplex::bundle_majority(&stalks);
+
+        let conn = Connection::open_in_memory().unwrap();
+        crate::sql_udf::register_hdc_udfs(&conn).unwrap();
+        conn.execute("CREATE TABLE hvs(hv BLOB NOT NULL)", []).unwrap();
+        for s in &stalks {
+            conn.execute("INSERT INTO hvs(hv) VALUES (?1)", [s.as_slice()])
+                .unwrap();
+        }
+        let sql_bundle: Vec<u8> = conn
+            .query_row("SELECT BUNDLE_MAJORITY(hv) FROM hvs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sql_bundle.len(), D_BYTES);
+        assert_eq!(
+            sql_bundle.as_slice(),
+            rust_bundle.as_slice(),
+            "Rust bundle_majority and SQL BUNDLE_MAJORITY must agree on non-empty input"
+        );
+    }
+
+    #[test]
+    fn bundle_majority_empty_divergence_documented() {
+        // Skeptic 7293f3: pin the documented divergence so it can't
+        // change silently. Rust returns ZERO_HV; SQL returns NULL.
+        // If either side ever changes, this test fails and forces an
+        // audit + doc update.
+        use rusqlite::types::Value;
+        use rusqlite::Connection;
+
+        let rust_empty = HvCellComplex::bundle_majority(&[]);
+        assert_eq!(rust_empty, [0u8; D_BYTES], "Rust empty must be ZERO_HV");
+
+        let conn = Connection::open_in_memory().unwrap();
+        crate::sql_udf::register_hdc_udfs(&conn).unwrap();
+        conn.execute("CREATE TABLE hvs(hv BLOB NOT NULL)", []).unwrap();
+        let sql_empty: Value = conn
+            .query_row("SELECT BUNDLE_MAJORITY(hv) FROM hvs", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            matches!(sql_empty, Value::Null),
+            "SQL empty must be NULL, got {sql_empty:?}"
+        );
+    }
+
+    #[test]
+    fn structural_root_xor_fold_holds_for_multi_layer_change() {
+        // Skeptic 734d65: prior test only changed AST. This pins the
+        // mathematical property for *simultaneous* multi-layer
+        // changes: delta(structural) == delta(AST) XOR delta(Sem).
+        // A refactor that accidentally cached an intermediate per
+        // layer would pass the single-layer test and fail this one.
+        let mut cx = HvCellComplex::new();
+        let mut cell = HvCell::new("fn_a", CanonicalKind::Decl);
+        cell.attach_stalk(LayerKind::Ast, stalk_for(1));
+        cell.attach_stalk(LayerKind::Semantic, stalk_for(2));
+        cx.add_cell(cell);
+
+        let struct_before = cx.structural_root();
+        let ast_before = cx.merkle_root_for_layer(LayerKind::Ast);
+        let sem_before = cx.merkle_root_for_layer(LayerKind::Semantic);
+
+        // Mutate BOTH layers.
+        cx.cells
+            .get_mut("fn_a")
+            .unwrap()
+            .attach_stalk(LayerKind::Ast, stalk_for(99));
+        cx.cells
+            .get_mut("fn_a")
+            .unwrap()
+            .attach_stalk(LayerKind::Semantic, stalk_for(88));
+
+        let struct_after = cx.structural_root();
+        let ast_after = cx.merkle_root_for_layer(LayerKind::Ast);
+        let sem_after = cx.merkle_root_for_layer(LayerKind::Semantic);
+
+        let mut delta_struct = [0u8; 32];
+        let mut delta_combined = [0u8; 32];
+        for i in 0..32 {
+            delta_struct[i] = struct_before[i] ^ struct_after[i];
+            delta_combined[i] = (ast_before[i] ^ ast_after[i]) ^ (sem_before[i] ^ sem_after[i]);
+        }
+        assert_eq!(
+            delta_struct, delta_combined,
+            "structural delta must equal XOR of all changed-layer deltas"
         );
     }
 }

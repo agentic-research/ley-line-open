@@ -220,7 +220,13 @@ pub fn start_drain(ctx: Arc<DaemonContext>) {
             let batch: Vec<EmbedTask> = {
                 let mut q = match ctx.embed_queue.lock() {
                     Ok(g) => g,
-                    Err(_) => continue,
+                    Err(poisoned) => {
+                        // Some task panicked while holding the queue. Recover
+                        // the inner state and keep draining — losing a tick is
+                        // better than wedging the embedding loop forever.
+                        log::error!("embed_queue mutex poisoned, recovering");
+                        poisoned.into_inner()
+                    }
                 };
                 let mut out = Vec::with_capacity(EMBED_DRAIN_BATCH);
                 for _ in 0..EMBED_DRAIN_BATCH {
@@ -240,7 +246,10 @@ pub fn start_drain(ctx: Arc<DaemonContext>) {
                 let content = {
                     let conn = match ctx.live_db.lock() {
                         Ok(g) => g,
-                        Err(_) => continue,
+                        Err(poisoned) => {
+                            log::error!("live_db mutex poisoned in embed drain, recovering");
+                            poisoned.into_inner()
+                        }
                     };
                     conn.query_row(
                         "SELECT record FROM nodes WHERE id = ?1",

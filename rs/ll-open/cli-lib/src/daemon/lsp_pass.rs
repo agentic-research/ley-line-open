@@ -193,7 +193,14 @@ async fn enrich_files(
         let abs_path = source_dir.join(rel);
         let source_text = match std::fs::read_to_string(&abs_path) {
             Ok(t) => t,
-            Err(_) => continue,
+            Err(e) => {
+                // File in the dirty set but unreadable (deleted, permission
+                // denied, race with mid-edit save). Log so operators can
+                // investigate "why didn't this file get LSP-enriched"
+                // without it killing the whole pass.
+                log::debug!("lsp_pass: skip {}: {e}", abs_path.display());
+                continue;
+            }
         };
 
         let file_uri = format!("file://{}", abs_path.canonicalize().unwrap_or(abs_path.clone()).display());

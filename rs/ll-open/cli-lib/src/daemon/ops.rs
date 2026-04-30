@@ -232,6 +232,18 @@ fn read_generation(ctrl_path: &Path) -> Result<u64> {
         .map(|c| c.generation())
 }
 
+/// Acquire the living-db lock just long enough to snapshot to the arena.
+/// Used by every state-changing op (reparse, enrich, snapshot) to publish
+/// the latest db image to mache/remote consumers. The guard's release is
+/// implicit at function return — keeps the lock-window minimal so concurrent
+/// readers aren't blocked longer than necessary.
+fn snapshot_living_db(ctx: &DaemonContext) -> Result<()> {
+    crate::cmd_daemon::snapshot_to_arena(
+        &ctx.live_db.lock().unwrap(),
+        &ctx.ctrl_path,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Control ops (don't need the living db)
 // ---------------------------------------------------------------------------
@@ -395,10 +407,7 @@ fn op_reparse(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
     drop(guard);
 
     // Snapshot to arena for mache/remote consumers.
-    crate::cmd_daemon::snapshot_to_arena(
-        &ctx.live_db.lock().unwrap(),
-        &ctx.ctrl_path,
-    )?;
+    snapshot_living_db(ctx)?;
 
     {
         let mut s = ctx.state.write().unwrap();
@@ -442,10 +451,7 @@ fn op_enrich(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
     ctx.state.write().unwrap().phase = DaemonPhase::Ready;
 
     // Snapshot to arena after enrichment.
-    crate::cmd_daemon::snapshot_to_arena(
-        &ctx.live_db.lock().unwrap(),
-        &ctx.ctrl_path,
-    )?;
+    snapshot_living_db(ctx)?;
 
     Ok(json!({
         "ok": true,
@@ -456,10 +462,7 @@ fn op_enrich(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
 }
 
 fn op_snapshot(ctx: &DaemonContext) -> Result<String> {
-    crate::cmd_daemon::snapshot_to_arena(
-        &ctx.live_db.lock().unwrap(),
-        &ctx.ctrl_path,
-    )?;
+    snapshot_living_db(ctx)?;
     Ok(json!({"ok": true, "generation": read_generation(&ctx.ctrl_path)?}).to_string())
 }
 

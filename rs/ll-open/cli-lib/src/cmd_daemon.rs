@@ -344,11 +344,7 @@ pub async fn run_daemon(
             let mut tick = interval(SNAPSHOT_INTERVAL);
             loop {
                 tick.tick().await;
-                let guard = snap_ctx.live_db.lock().unwrap();
-                if let Err(e) = snapshot_to_arena(&guard, &snap_ctrl) {
-                    log::error!("periodic snapshot failed: {e:#}");
-                }
-                drop(guard);
+                snapshot_or_log(&snap_ctx.live_db, &snap_ctrl, "periodic snapshot failed");
                 emitter.emit("daemon.snapshot", "leyline", serde_json::json!({}));
             }
         });
@@ -491,6 +487,23 @@ fn try_warm_start(ctrl_path: &Path) -> Result<Option<rusqlite::Connection>> {
     eprintln!("recovered from arena (generation {generation})");
 
     Ok(Some(conn))
+}
+
+/// Take the live-db lock, snapshot to arena, and log any failure under
+/// `label`. Used by the background timers (periodic snapshot, post-watch
+/// snapshot) where a snapshot failure is recoverable — the next tick
+/// retries — but should still surface in logs. The graceful-shutdown
+/// path uses `eprintln!` directly because it has a distinct success
+/// message; this helper is for the fire-and-forget periodic shape.
+pub fn snapshot_or_log(
+    live_db: &std::sync::Mutex<rusqlite::Connection>,
+    ctrl_path: &Path,
+    label: &str,
+) {
+    let guard = live_db.lock().unwrap();
+    if let Err(e) = snapshot_to_arena(&guard, ctrl_path) {
+        log::error!("{label}: {e:#}");
+    }
 }
 
 /// Serialize the living db and write it into the arena.
@@ -648,11 +661,7 @@ async fn git_watch_loop(
                     drop(guard);
 
                     // 4. Snapshot to arena.
-                    let guard = ctx.live_db.lock().unwrap();
-                    if let Err(e) = snapshot_to_arena(&guard, &ctx.ctrl_path) {
-                        log::error!("watch snapshot failed: {e:#}");
-                    }
-                    drop(guard);
+                    snapshot_or_log(&ctx.live_db, &ctx.ctrl_path, "watch snapshot failed");
 
                     // 5. Update state + emit events.
                     {

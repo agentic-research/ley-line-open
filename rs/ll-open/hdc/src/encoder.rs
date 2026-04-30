@@ -329,6 +329,48 @@ mod tests {
     }
 
     #[test]
+    fn content_hash_distinguishes_nesting_from_flat() {
+        // Same kinds, different topology: `Block[Op, Lit]` (flat,
+        // 2 children) vs `Block[Op[Lit]]` (nested, 1 child whose
+        // child is Lit). Total kind count is identical but the
+        // shape differs. content_hash must distinguish these — the
+        // recursive child-hash inclusion is what makes this work.
+        // Catches a refactor that flattened the recursion or only
+        // hashed kind-counts.
+        let flat = node(
+            CanonicalKind::Block,
+            vec![leaf(CanonicalKind::Op), leaf(CanonicalKind::Lit)],
+        );
+        let nested = node(
+            CanonicalKind::Block,
+            vec![node(CanonicalKind::Op, vec![leaf(CanonicalKind::Lit)])],
+        );
+        assert_ne!(
+            flat.content_hash(),
+            nested.content_hash(),
+            "flat vs nested topology must produce different content_hashes",
+        );
+    }
+
+    #[test]
+    fn content_hash_changes_with_arity_at_same_kind_set() {
+        // Same canonical-kind composition, different arity at root.
+        // Two trees that both produce {Block, Op, Op} but with
+        // different topology — `Block[Op, Op]` (arity 2) vs the
+        // `Block[Op[Op]]` shape — must produce different content
+        // hashes because arity_bucket is part of the hash input.
+        let arity_2 = node(
+            CanonicalKind::Block,
+            vec![leaf(CanonicalKind::Op), leaf(CanonicalKind::Op)],
+        );
+        let arity_1_nested = node(
+            CanonicalKind::Block,
+            vec![node(CanonicalKind::Op, vec![leaf(CanonicalKind::Op)])],
+        );
+        assert_ne!(arity_2.content_hash(), arity_1_nested.content_hash());
+    }
+
+    #[test]
     fn cache_put_then_get_round_trips() {
         // The cache is a content-addressed map [u8;32] → Hypervector.
         // Pin the put/get contract: same key returns the value

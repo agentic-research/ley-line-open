@@ -184,6 +184,17 @@ mod tests {
     }
 
     #[test]
+    fn arena_header_size_constant_is_4096() {
+        // ArenaHeader::HEADER_SIZE = 4096 is a disk-format constant
+        // baked into every arena file: buffer_size and active_buffer_
+        // offset both subtract / add this value. Bumping it silently
+        // shifts every buffer offset, making prior arenas unreadable.
+        // Sister pin to MAGIC + VERSION literals. 4096 = one OS page,
+        // load-bearing for mmap alignment.
+        assert_eq!(ArenaHeader::HEADER_SIZE, 4096);
+    }
+
+    #[test]
     fn arena_header_magic_and_version_literals() {
         // ArenaHeader::MAGIC and VERSION are baked into every arena
         // file on disk. Bumping either silently invalidates every

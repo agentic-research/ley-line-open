@@ -218,6 +218,20 @@ mod tests {
     }
 
     #[test]
+    fn temporal_matrix_default_starts_empty() {
+        // `impl Default for TemporalCoEditMatrix` delegates to
+        // new() which delegates to with_tau(DEFAULT_TAU_SECONDS).
+        // Pin: starts with no scopes and no co-edit cells. A
+        // refactor that pre-seeded one of these would silently
+        // corrupt cold-start daemon state.
+        let m = TemporalCoEditMatrix::default();
+        assert_eq!(m.scope_count(), 0);
+        assert_eq!(m.nnz(), 0);
+        // Sister: lookup of any scope on default matrix yields no row.
+        assert!(m.sparse_row("any").is_empty());
+    }
+
+    #[test]
     fn matrix_intern_assigns_stable_indices() {
         let mut m = TemporalCoEditMatrix::new();
         let now = 0.0;

@@ -185,6 +185,27 @@ mod tests {
     }
 
     #[test]
+    fn gaussian_row_is_prefix_stable_across_lengths() {
+        // Same seed, different n: the first n floats must match.
+        // build_hyperplane_matrix derives per-row seeds via blake3
+        // mixing, so this matters cross-time: if a future grammar
+        // forces a wider matrix (D bumped), the first D_old rows
+        // remain stable so existing encoded HVs don't drift.
+        // A refactor that tied internal PRNG advancement to total n
+        // (e.g. seeded the state with `seed ^ n`) would break this.
+        let short = gaussian_row(0xCAFE, 4);
+        let long = gaussian_row(0xCAFE, 8);
+        assert_eq!(short.len(), 4);
+        assert_eq!(long.len(), 8);
+        assert_eq!(short.as_slice(), &long[..4]);
+
+        // Odd-length boundary: 5 vs 4. The 5th uses the truncate
+        // branch but the first 4 are still independent of n.
+        let five = gaussian_row(0xCAFE, 5);
+        assert_eq!(short.as_slice(), &five[..4]);
+    }
+
+    #[test]
     fn gaussian_row_zero_length_returns_empty() {
         // Boundary pin: gaussian_row(_, 0) must return an empty Vec
         // without panicking. The caller (build_hyperplane_matrix)

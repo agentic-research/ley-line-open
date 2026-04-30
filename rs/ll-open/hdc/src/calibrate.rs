@@ -378,6 +378,34 @@ mod tests {
     }
 
     #[test]
+    fn calibrate_skips_wrong_sized_hv_blobs() {
+        // collect_layer_hvs (calibrate.rs:139) silently drops rows
+        // whose blob isn't D_BYTES — sister forward-compat path to
+        // build_combined_for_scope_skips_wrong_sized_hv_blobs in
+        // combined.rs. Insert two valid HVs + one malformed; expect
+        // calibration to use only the two valid (sample_size ≤ 1
+        // pair). Pin so a refactor that hard-erred on bad blobs
+        // would crash startup-time calibration on a corrupt
+        // _hdc table.
+        let conn = fresh();
+        insert_layer_hv(&conn, "s0", LayerKind::Ast, &expand_seed(1), 1);
+        insert_layer_hv(&conn, "s1", LayerKind::Ast, &expand_seed(2), 1);
+        // Malformed: half-size blob via raw SQL.
+        let half = vec![0u8; crate::D_BYTES / 2];
+        conn.execute(
+            "INSERT INTO _hdc(scope_id, layer_kind, hv, basis) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["s_bad", LayerKind::Ast.as_str(), half, 1i64],
+        )
+        .unwrap();
+
+        let baseline = calibrate_layer(&conn, LayerKind::Ast, 100, 0)
+            .unwrap()
+            .expect("two valid rows must produce a baseline");
+        // Two valid HVs → 1 unordered pair → sample_size capped at 1.
+        assert_eq!(baseline.sample_size, 1, "malformed row must be skipped, not paired");
+    }
+
+    #[test]
     fn calibrate_and_persist_empty_db_returns_zero() {
         // Fresh schema, no `_hdc` rows on any layer. Must return
         // Ok(0) — never panic, never error, never insert phantom

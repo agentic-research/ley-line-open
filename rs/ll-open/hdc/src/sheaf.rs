@@ -2,45 +2,48 @@
 //! consistency reasoning. Each code unit (function/file/module) becomes
 //! a [`HvCell`] carrying its hypervector as a stalk over its region of
 //! the codebase. Edges between cells (containment, sibling, calls)
-//! carry a *Hamming agreement* check — the HDC analogue of the
+//! carry a Boolean *agreement* check — the HDC analogue of the
 //! coboundary operator δ⁰ in `leyline-sheaf`.
 //!
-//! ## Why HDC + sheaf
+//! ## Boolean Heyting algebra of binary stalks
 //!
-//! The closed `leyline-sheaf` crate operates on `Vec<f32>` stalks with
-//! linear restriction maps and Čech cohomology. HDC stalks are
-//! `[u8; D_BYTES]` — binary, byte-aligned — so the right consistency
-//! measure is **Hamming distance**, not vector subtraction. Two stalks
-//! are "consistent across an edge" if their popcount-distance falls
-//! below a calibrated threshold; the threshold itself comes from
-//! [`crate::calibrate::RadiusBaseline`] (median + k·MAD), so it's
-//! data-driven rather than handcrafted.
+//! Binary hypervectors under XOR/AND/OR form a Boolean algebra. Boolean
+//! algebras are the strongest case of a Heyting algebra (every element
+//! has a complement; double-negation elimination holds). Sheaf theory
+//! works over any topos; the internal logic of a topos is a Heyting
+//! algebra. So the binary-stalk specialization isn't a weaker sheaf —
+//! it's the strongest case, where every operation is bitwise and
+//! everything is `O(D)` instead of `O(D²)`.
 //!
-//! The HDC analogue of:
-//! - `Stalk` (data over a cell) → [`HvStalk`] (hypervector + layer tag)
-//! - `Cell` (region with stalk) → [`HvCell`] (id + canonical kind +
-//!   per-layer stalks, so one cell can carry AST + Module + Semantic
-//!   + Temporal stalks simultaneously)
-//! - `RestrictionMap` (linear projection) → implicit identity for HV
-//!   stalks; the Hamming check IS the restriction (any pair of HVs
-//!   in the same layer can be compared directly)
-//! - δ⁰ (coboundary) → [`HvCellComplex::detect_violations`] returning
-//!   edges whose Hamming distance exceeds the agreement threshold
-//! - H⁰ (cohomology) → [`HvCellComplex::compute_h0`] returning groups
-//!   of cells whose stalks are mutually consistent (i.e. the
-//!   structurally-equivalent code clusters)
-//! - Merkle-tree leaf hashing → [`HvCellComplex::merkle_root_for_layer`]
-//!   so a cell-complex has a single content-addressed identity that
-//!   changes when any cell stalk changes (cache-invalidation hook).
+//! Concretely, in this module:
+//! - **Stalks**: `[u8; D_BYTES]` binary vectors
+//! - **Restriction maps**: lattice homomorphisms — bit permutations
+//!   (`rotate_left` is one canonical form) that preserve XOR/AND/OR.
+//!   A permutation IS the structure-preserving map between stalks in
+//!   the category of Boolean algebras — not an approximation.
+//! - **Section propagation**: majority-rule bundle (`bundle_majority`)
+//!   is the lattice meet over a set of consistent sections.
+//! - **δ⁰ at an edge** (u→v with restriction maps r_u, r_v): apply
+//!   r_u to stalk(u) and r_v to stalk(v); check
+//!   `popcount(r_u(stalk_u) XOR r_v(stalk_v)) ≤ threshold`.
+//!   When both restrictions are the identity, this reduces to plain
+//!   `popcount(stalk_u XOR stalk_v)`.
+//! - **H⁰** is the connected-component count of the consistent
+//!   subgraph — cells whose stalks bundle into one majority section
+//!   without contradiction.
+//! - **Merkle tree** sits on top: blake3 leaves over (cell_id,
+//!   stalk_bytes) per layer, internal nodes are content-addressed.
+//!
+//! Every operation here is `O(D)` bitwise. At D=8192 that's one cache
+//! line per stalk and sub-microsecond per check on a modern CPU.
 //!
 //! ## What this module is NOT
 //!
-//! This is a **specialization** of the sheaf algebra to binary HV
-//! stalks. It deliberately does NOT compute δ¹, H¹, faces, or the full
-//! Čech cochain complex — those need linear restriction maps and
-//! make sense over `Vec<f32>` stalks, not over Hamming geometry.
-//! Callers that need the full complex can convert HV → bit-as-f32 and
-//! plug into `leyline-sheaf` (out of scope here).
+//! This is the **Boolean specialization** of the sheaf algebra — it
+//! deliberately does NOT compute δ¹, H¹, or 2-faces because those need
+//! the cycle structure of the full Čech complex. Callers that want
+//! the full algebra can convert HV→bit-as-f32 and plug into the
+//! closed `leyline-sheaf` crate; that's out of scope here.
 //!
 //! Additive: lives entirely inside `leyline-hdc`, no other crate
 //! touched, no schema changes. The cell-complex is built in-memory from
@@ -49,8 +52,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::canonical::CanonicalKind;
-use crate::util::{blake3_seed, popcount_distance, Hypervector};
-use crate::{D_BYTES, LayerKind};
+use crate::util::{blake3_seed, popcount_distance, rotate_left, Hypervector};
+use crate::{D_BITS, D_BYTES, LayerKind};
 
 /// A stalk: one hypervector over one layer at one cell.
 ///
@@ -106,17 +109,85 @@ impl HvCell {
     }
 }
 
+/// A Boolean restriction map: a structure-preserving endomorphism on
+/// `[u8; D_BYTES]` that the sheaf applies to a stalk before the
+/// agreement XOR. In the category of Boolean algebras, the canonical
+/// such maps are bit permutations (`rotate_left` being one canonical
+/// instance) — they preserve XOR/AND/OR/NOT, hence are lattice
+/// homomorphisms.
+///
+/// `Identity` is the no-op restriction (the most common case: the
+/// stalk is already in the target's coordinate system). `RotateLeft`
+/// applies a circular bit rotation, which is the natural way to align
+/// stalks that differ in role-positional encoding (e.g. when one cell
+/// holds a child encoded under role-index `i` and the edge wants to
+/// "undo" that role before comparing). `Composite` lets callers stack
+/// multiple permutations into one map, still `O(D)` per application.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Restriction {
+    #[default]
+    Identity,
+    RotateLeft(usize),
+    Composite(Vec<Restriction>),
+}
+
+impl Restriction {
+    /// Apply the restriction map to a stalk. Always `O(D)`.
+    pub fn apply(&self, hv: &Hypervector) -> Hypervector {
+        match self {
+            Restriction::Identity => *hv,
+            Restriction::RotateLeft(n) => rotate_left(hv, *n % D_BITS),
+            Restriction::Composite(parts) => {
+                let mut out = *hv;
+                for r in parts {
+                    out = r.apply(&out);
+                }
+                out
+            }
+        }
+    }
+}
+
 /// A directed edge between two cells with a label describing the
 /// structural relationship. The `layer` field nominates which stalk
 /// layer the agreement check operates on — different relationships
 /// care about different layers (a Calls edge cares about Semantic
 /// agreement; a Contains edge cares about AST or Module).
+///
+/// `restrict_source` and `restrict_target` are the per-endpoint
+/// restriction maps applied before the XOR-popcount agreement check.
+/// Default to `Identity` (the common case where stalks are already in
+/// the same coordinate system); use `RotateLeft(n)` to align stalks
+/// that differ by a known role permutation.
 #[derive(Debug, Clone)]
 pub struct HvEdge {
     pub source: String,
     pub target: String,
     pub kind: EdgeKind,
     pub layer: LayerKind,
+    pub restrict_source: Restriction,
+    pub restrict_target: Restriction,
+}
+
+impl HvEdge {
+    /// Convenience constructor for an identity-restricted edge — the
+    /// common case where both endpoints share a coordinate system.
+    /// Reduces test boilerplate vs. constructing the struct directly.
+    pub fn identity(
+        source: impl Into<String>,
+        target: impl Into<String>,
+        kind: EdgeKind,
+        layer: LayerKind,
+    ) -> Self {
+        Self {
+            source: source.into(),
+            target: target.into(),
+            kind,
+            layer,
+            restrict_source: Restriction::Identity,
+            restrict_target: Restriction::Identity,
+        }
+    }
 }
 
 /// Kinds of structural edges between code-unit cells. Closed set;
@@ -196,9 +267,11 @@ impl HvCellComplex {
         self.agreement_threshold.insert(layer, threshold);
     }
 
-    /// δ⁰-equivalent: walk every edge, look up both endpoints' stalks
-    /// on the edge's layer, return edges whose Hamming distance
-    /// exceeds the layer's threshold.
+    /// δ⁰-equivalent: for each edge u→v, apply the per-endpoint
+    /// restriction maps (Boolean algebra automorphisms) to each
+    /// stalk, then check
+    /// `popcount(restrict_source(stalk_u) XOR restrict_target(stalk_v)) ≤ threshold`.
+    /// Edges that exceed the threshold are returned as violations.
     ///
     /// Edges where one or both endpoints are missing the layer's
     /// stalk are silently skipped — they're not violations, they're
@@ -207,22 +280,12 @@ impl HvCellComplex {
     pub fn detect_violations(&self) -> Vec<HvViolation> {
         let mut out = Vec::new();
         for (i, edge) in self.edges.iter().enumerate() {
-            let Some(src_cell) = self.cells.get(&edge.source) else {
-                continue;
-            };
-            let Some(tgt_cell) = self.cells.get(&edge.target) else {
-                continue;
-            };
-            let Some(src_hv) = src_cell.stalk(edge.layer) else {
-                continue;
-            };
-            let Some(tgt_hv) = tgt_cell.stalk(edge.layer) else {
+            let Some(hamming) = self.edge_hamming(edge) else {
                 continue;
             };
             let Some(&threshold) = self.agreement_threshold.get(&edge.layer) else {
                 continue;
             };
-            let hamming = popcount_distance(src_hv, tgt_hv);
             if hamming > threshold {
                 out.push(HvViolation {
                     edge_index: i,
@@ -233,6 +296,74 @@ impl HvCellComplex {
             }
         }
         out
+    }
+
+    /// Compute the Hamming distance an edge sees after applying its
+    /// restriction maps. `None` if either endpoint is absent or
+    /// missing the layer's stalk. Pure read; no side effects.
+    pub fn edge_hamming(&self, edge: &HvEdge) -> Option<u32> {
+        let src_cell = self.cells.get(&edge.source)?;
+        let tgt_cell = self.cells.get(&edge.target)?;
+        let src_hv = src_cell.stalk(edge.layer)?;
+        let tgt_hv = tgt_cell.stalk(edge.layer)?;
+        let src_restricted = edge.restrict_source.apply(src_hv);
+        let tgt_restricted = edge.restrict_target.apply(tgt_hv);
+        Some(popcount_distance(&src_restricted, &tgt_restricted))
+    }
+
+    /// Majority-rule section propagation: bundle a slice of stalks
+    /// bit-for-bit, taking the majority bit at each position. Ties go
+    /// to 0 (matches the SQLite `BUNDLE_MAJORITY` UDF semantics so
+    /// SQL-side and Rust-side bundles produce identical results on
+    /// the same inputs). Returns `ZERO_HV` for an empty input — the
+    /// identity element of the bundle operation.
+    ///
+    /// In the Boolean-Heyting view this is the *meet* of the
+    /// supplied sections in the lattice of binary stalks: the
+    /// largest stalk that is ≤ every input under the dual ordering
+    /// "more 1s ≥". Useful for computing a canonical centroid of a
+    /// consistent group returned by `compute_h0`.
+    pub fn bundle_majority(stalks: &[Hypervector]) -> Hypervector {
+        let mut out = [0u8; D_BYTES];
+        if stalks.is_empty() {
+            return out;
+        }
+        let half = stalks.len() as u32 / 2;
+        // Tie-break: a tie occurs only when len() is even AND count == half.
+        // Matches BUNDLE_MAJORITY: ties → 0.
+        for bit in 0..D_BITS {
+            let byte_idx = bit / 8;
+            let bit_off = bit % 8;
+            let mut count: u32 = 0;
+            for s in stalks {
+                count += ((s[byte_idx] >> bit_off) & 1) as u32;
+            }
+            if count > half {
+                out[byte_idx] |= 1 << bit_off;
+            }
+        }
+        out
+    }
+
+    /// Propagate a layer's stalks across a connected component into
+    /// a single canonical "centroid" via majority-rule bundling.
+    /// Returns one centroid per component. Useful for cluster
+    /// summarization and for verifying that members of a consistent
+    /// group are all near their bundle (the "the bundle is recoverable"
+    /// property the math friend flagged).
+    pub fn propagate_sections(&self, layer: LayerKind) -> Vec<Hypervector> {
+        let groups = self.compute_h0(layer);
+        groups
+            .iter()
+            .map(|group| {
+                let stalks: Vec<Hypervector> = group
+                    .iter()
+                    .filter_map(|id| self.cells.get(id))
+                    .filter_map(|c| c.stalk(layer).copied())
+                    .collect();
+                Self::bundle_majority(&stalks)
+            })
+            .collect()
     }
 
     /// H⁰-equivalent on a single layer: union-find over cells, where
@@ -257,15 +388,10 @@ impl HvCellComplex {
             if edge.layer != layer {
                 continue;
             }
-            let (Some(a_cell), Some(b_cell)) =
-                (self.cells.get(&edge.source), self.cells.get(&edge.target))
-            else {
+            let Some(hamming) = self.edge_hamming(edge) else {
                 continue;
             };
-            let (Some(a_hv), Some(b_hv)) = (a_cell.stalk(layer), b_cell.stalk(layer)) else {
-                continue;
-            };
-            if popcount_distance(a_hv, b_hv) <= threshold {
+            if hamming <= threshold {
                 union(&mut parent, edge.source.as_str(), edge.target.as_str());
             }
         }
@@ -505,18 +631,18 @@ mod tests {
         cx.add_cell(make_cell("fn_b", CanonicalKind::Decl, 1));  // same as fn_a
         cx.add_cell(make_cell("fn_c", CanonicalKind::Decl, 999)); // different
         cx.set_threshold(LayerKind::Ast, 100); // tight threshold
-        cx.add_edge(HvEdge {
-            source: "fn_a".into(),
-            target: "fn_b".into(),
-            kind: EdgeKind::Sibling,
-            layer: LayerKind::Ast,
-        });
-        cx.add_edge(HvEdge {
-            source: "fn_a".into(),
-            target: "fn_c".into(),
-            kind: EdgeKind::Sibling,
-            layer: LayerKind::Ast,
-        });
+        cx.add_edge(HvEdge::identity(
+            "fn_a",
+            "fn_b",
+            EdgeKind::Sibling,
+            LayerKind::Ast,
+        ));
+        cx.add_edge(HvEdge::identity(
+            "fn_a",
+            "fn_c",
+            EdgeKind::Sibling,
+            LayerKind::Ast,
+        ));
         let v = cx.detect_violations();
         assert_eq!(v.len(), 1, "exactly one violation expected (a-c, not a-b)");
         assert_eq!(v[0].edge_index, 1);
@@ -532,12 +658,12 @@ mod tests {
         cx.add_cell(make_cell("fn_a", CanonicalKind::Decl, 1));
         cx.add_cell(HvCell::new("fn_b", CanonicalKind::Decl)); // no stalks
         cx.set_threshold(LayerKind::Ast, 0);
-        cx.add_edge(HvEdge {
-            source: "fn_a".into(),
-            target: "fn_b".into(),
-            kind: EdgeKind::Sibling,
-            layer: LayerKind::Ast,
-        });
+        cx.add_edge(HvEdge::identity(
+            "fn_a",
+            "fn_b",
+            EdgeKind::Sibling,
+            LayerKind::Ast,
+        ));
         assert!(cx.detect_violations().is_empty());
     }
 
@@ -551,18 +677,18 @@ mod tests {
         cx.add_cell(make_cell("fn_b", CanonicalKind::Decl, 1));
         cx.add_cell(make_cell("fn_c", CanonicalKind::Decl, 999));
         cx.set_threshold(LayerKind::Ast, 10);
-        cx.add_edge(HvEdge {
-            source: "fn_a".into(),
-            target: "fn_b".into(),
-            kind: EdgeKind::Sibling,
-            layer: LayerKind::Ast,
-        });
-        cx.add_edge(HvEdge {
-            source: "fn_b".into(),
-            target: "fn_c".into(),
-            kind: EdgeKind::Sibling,
-            layer: LayerKind::Ast,
-        });
+        cx.add_edge(HvEdge::identity(
+            "fn_a",
+            "fn_b",
+            EdgeKind::Sibling,
+            LayerKind::Ast,
+        ));
+        cx.add_edge(HvEdge::identity(
+            "fn_b",
+            "fn_c",
+            EdgeKind::Sibling,
+            LayerKind::Ast,
+        ));
         let groups = cx.compute_h0(LayerKind::Ast);
         let sizes: Vec<usize> = {
             let mut s: Vec<usize> = groups.iter().map(|g| g.len()).collect();
@@ -581,12 +707,12 @@ mod tests {
         let mut cx = HvCellComplex::new();
         cx.add_cell(make_cell("fn_a", CanonicalKind::Decl, 1));
         cx.add_cell(make_cell("fn_b", CanonicalKind::Decl, 1));
-        cx.add_edge(HvEdge {
-            source: "fn_a".into(),
-            target: "fn_b".into(),
-            kind: EdgeKind::Sibling,
-            layer: LayerKind::Ast,
-        });
+        cx.add_edge(HvEdge::identity(
+            "fn_a",
+            "fn_b",
+            EdgeKind::Sibling,
+            LayerKind::Ast,
+        ));
         let groups = cx.compute_h0(LayerKind::Ast);
         assert_eq!(groups.len(), 2);
     }
@@ -657,6 +783,170 @@ mod tests {
         assert_eq!(
             forward.merkle_root_for_layer(LayerKind::Ast),
             reverse.merkle_root_for_layer(LayerKind::Ast)
+        );
+    }
+
+    // -- Boolean Heyting algebra: restriction maps + propagation -----
+
+    #[test]
+    fn restriction_identity_is_no_op() {
+        // The identity restriction must reproduce its input bit-for-bit.
+        // Pin this so a refactor that swaps `Identity` to "rotate by 0"
+        // would still pass — but a refactor that defaulted to "rotate
+        // by N" would fail loudly.
+        let hv = stalk_for(42);
+        assert_eq!(Restriction::Identity.apply(&hv), hv);
+    }
+
+    #[test]
+    fn restriction_rotate_left_inverts_to_rotate_right() {
+        // Rotation is the canonical Boolean automorphism. Compose
+        // `RotateLeft(n)` with `RotateLeft(D_BITS - n)` and you get
+        // back the identity — the pair are inverses, which is the
+        // group-automorphism property.
+        let hv = stalk_for(7);
+        let n = 1234usize;
+        let rotated = Restriction::RotateLeft(n).apply(&hv);
+        let restored = Restriction::RotateLeft(D_BITS - n).apply(&rotated);
+        assert_eq!(restored, hv, "rotate(n) ∘ rotate(D-n) must be identity");
+    }
+
+    #[test]
+    fn restriction_composite_chains_in_order() {
+        // Composite([a, b]).apply(x) == b.apply(a.apply(x)). Pin this
+        // so a future "fold from the right" refactor would fail loudly.
+        let hv = stalk_for(13);
+        let direct = Restriction::RotateLeft(7).apply(&Restriction::RotateLeft(3).apply(&hv));
+        let composite =
+            Restriction::Composite(vec![Restriction::RotateLeft(3), Restriction::RotateLeft(7)])
+                .apply(&hv);
+        assert_eq!(composite, direct);
+        // Equivalent to a single rotation by 10:
+        assert_eq!(composite, Restriction::RotateLeft(10).apply(&hv));
+    }
+
+    #[test]
+    fn edge_with_matching_restrictions_is_consistent() {
+        // Two cells whose stalks differ only by a known rotation
+        // (one cell holds the rotated form, the other holds the
+        // canonical form). Use restrict_source to "undo" the rotation
+        // so the agreement check succeeds. This is the use case for
+        // Restriction maps: align stalks that live in different
+        // role-position frames.
+        let mut cx = HvCellComplex::new();
+        let canonical = stalk_for(1);
+        let rotated = rotate_left(&canonical, 100);
+        let mut a = HvCell::new("fn_a", CanonicalKind::Decl);
+        a.attach_stalk(LayerKind::Ast, rotated);
+        let mut b = HvCell::new("fn_b", CanonicalKind::Decl);
+        b.attach_stalk(LayerKind::Ast, canonical);
+        cx.add_cell(a);
+        cx.add_cell(b);
+        cx.set_threshold(LayerKind::Ast, 0); // exact match required
+        cx.add_edge(HvEdge {
+            source: "fn_a".into(),
+            target: "fn_b".into(),
+            kind: EdgeKind::Sibling,
+            layer: LayerKind::Ast,
+            // Undo the rotation on the source side; identity on target.
+            restrict_source: Restriction::RotateLeft(D_BITS - 100),
+            restrict_target: Restriction::Identity,
+        });
+        let v = cx.detect_violations();
+        assert!(
+            v.is_empty(),
+            "matched restrictions must produce zero Hamming and no violation"
+        );
+        assert_eq!(cx.edge_hamming(&cx.edges[0]).unwrap(), 0);
+    }
+
+    #[test]
+    fn bundle_majority_empty_is_zero() {
+        // Empty bundle = identity element of the bundle operation.
+        // Pin this so a refactor that returned "all-ones" or panicked
+        // for empty input would fail loudly.
+        let out = HvCellComplex::bundle_majority(&[]);
+        assert_eq!(out, [0u8; D_BYTES]);
+    }
+
+    #[test]
+    fn bundle_majority_single_input_is_identity() {
+        // One stalk in → that stalk out. The bundle operation is
+        // idempotent on singletons.
+        let s = stalk_for(123);
+        assert_eq!(HvCellComplex::bundle_majority(&[s]), s);
+    }
+
+    #[test]
+    fn bundle_majority_recovers_centroid_of_consistent_group() {
+        // Three identical stalks bundle to themselves (each bit is
+        // either 0/0/0 → 0 or 1/1/1 → 1; majority preserves it).
+        // Pin: the bundle of a consistent group IS its centroid.
+        let s = stalk_for(777);
+        let bundle = HvCellComplex::bundle_majority(&[s, s, s]);
+        assert_eq!(bundle, s);
+    }
+
+    #[test]
+    fn bundle_majority_tie_resolves_to_zero() {
+        // Two stalks that disagree at every bit (one = !other) —
+        // every bit position is a 0/1 tie. With the tie-→-0 rule the
+        // bundle is all zeros. Matches BUNDLE_MAJORITY UDF semantics.
+        let mut a = stalk_for(2);
+        let mut b = stalk_for(2);
+        // Force every bit to disagree: flip every bit of b.
+        for i in 0..D_BYTES {
+            b[i] = !a[i];
+        }
+        // Sanity: a and b are bit-complements.
+        for i in 0..D_BYTES {
+            assert_eq!(a[i] ^ b[i], 0xFF);
+        }
+        let bundle = HvCellComplex::bundle_majority(&[a, b]);
+        assert_eq!(bundle, [0u8; D_BYTES]);
+        // Also verify the path doesn't depend on which bit-pattern we used:
+        // mutate `a` and re-confirm.
+        for byte in a.iter_mut() {
+            *byte = 0xAA;
+        }
+        for i in 0..D_BYTES {
+            b[i] = !a[i];
+        }
+        let bundle = HvCellComplex::bundle_majority(&[a, b]);
+        assert_eq!(bundle, [0u8; D_BYTES]);
+    }
+
+    #[test]
+    fn propagate_sections_returns_centroid_per_component() {
+        // Two consistent groups (one cluster of 3 identical stalks,
+        // one singleton). propagate_sections should return one
+        // centroid per group; the 3-cell group's centroid equals its
+        // shared stalk.
+        let mut cx = HvCellComplex::new();
+        let s_cluster = stalk_for(11);
+        let s_singleton = stalk_for(99);
+        for id in &["a", "b", "c"] {
+            let mut cell = HvCell::new(*id, CanonicalKind::Decl);
+            cell.attach_stalk(LayerKind::Ast, s_cluster);
+            cx.add_cell(cell);
+        }
+        let mut iso = HvCell::new("z", CanonicalKind::Decl);
+        iso.attach_stalk(LayerKind::Ast, s_singleton);
+        cx.add_cell(iso);
+        cx.set_threshold(LayerKind::Ast, 0);
+        cx.add_edge(HvEdge::identity("a", "b", EdgeKind::Sibling, LayerKind::Ast));
+        cx.add_edge(HvEdge::identity("b", "c", EdgeKind::Sibling, LayerKind::Ast));
+
+        let centroids = cx.propagate_sections(LayerKind::Ast);
+        assert_eq!(centroids.len(), 2, "one centroid per H0 component");
+        // Each centroid must equal exactly one of the two input stalks.
+        assert!(
+            centroids.contains(&s_cluster),
+            "cluster centroid must equal shared stalk"
+        );
+        assert!(
+            centroids.contains(&s_singleton),
+            "singleton centroid must equal lone stalk"
         );
     }
 }

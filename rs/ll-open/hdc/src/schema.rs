@@ -196,6 +196,31 @@ mod tests {
     }
 
     #[test]
+    fn _hdc_subtree_cache_ref_count_defaults_to_one() {
+        // Schema declares `ref_count INTEGER NOT NULL DEFAULT 1`. An
+        // INSERT that omits ref_count must populate it with 1, not 0
+        // (which would mean "no references" the moment the cache
+        // entry was written and break ref-count GC). Pin the default.
+        let conn = fresh_schema_conn();
+        let hash: Vec<u8> = vec![0xCD; 32];
+        let hv = vec![0u8; D_BYTES];
+        // Note: omit `ref_count` from the column list and VALUES.
+        conn.execute(
+            "INSERT INTO _hdc_subtree_cache(content_hash, hv) VALUES (?1, ?2)",
+            rusqlite::params![hash, hv],
+        )
+        .unwrap();
+        let rc: i64 = conn
+            .query_row(
+                "SELECT ref_count FROM _hdc_subtree_cache WHERE content_hash = ?1",
+                [vec![0xCD; 32]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rc, 1, "ref_count must default to 1, not 0");
+    }
+
+    #[test]
     fn _hdc_subtree_cache_content_hash_pkey() {
         // Same content-hash twice must be rejected. The cache uses
         // BLAKE3 of the canonical subtree form as the key; collisions

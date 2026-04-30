@@ -126,10 +126,11 @@ impl CanonicalKindMap for RustCanonicalMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::canonical::{assert_canonical_map_baseline, assert_kinds_match};
 
     #[test]
     fn common_rust_kinds_map_correctly() {
-        super::super::assert_kinds_match(
+        assert_kinds_match(
             &RustCanonicalMap,
             &[
                 ("function_item", CanonicalKind::Decl),
@@ -148,6 +149,6 @@ mod tests {
         // Shared invariants every CanonicalKindMap must hold (forward-
         // compat fallback + lang identity). Defined in canonical.rs so
         // every future language gets them for free.
-        super::super::assert_canonical_map_baseline(&RustCanonicalMap, "rust");
+        assert_canonical_map_baseline(&RustCanonicalMap, "rust");
     }
 }

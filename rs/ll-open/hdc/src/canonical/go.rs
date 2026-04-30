@@ -120,10 +120,11 @@ impl CanonicalKindMap for GoCanonicalMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::canonical::{assert_canonical_map_baseline, assert_kinds_match, RustCanonicalMap};
 
     #[test]
     fn common_go_kinds_map_correctly() {
-        super::super::assert_kinds_match(
+        assert_kinds_match(
             &GoCanonicalMap,
             &[
                 ("function_declaration", CanonicalKind::Decl),
@@ -140,7 +141,7 @@ mod tests {
     #[test]
     fn baseline_invariants() {
         // Shared invariants — see `canonical::assert_canonical_map_baseline`.
-        super::super::assert_canonical_map_baseline(&GoCanonicalMap, "go");
+        assert_canonical_map_baseline(&GoCanonicalMap, "go");
     }
 
     #[test]
@@ -160,15 +161,15 @@ mod tests {
         // condition (Expr) and body (Block) — are the same. The
         // alphabet captures the universally-true facts, not
         // language-specific framing.
-        super::super::assert_kinds_match(
-            &super::super::RustCanonicalMap,
+        assert_kinds_match(
+            &RustCanonicalMap,
             &[
                 ("identifier", CanonicalKind::Ref),
                 ("integer_literal", CanonicalKind::Lit),
                 ("block", CanonicalKind::Block),
             ],
         );
-        super::super::assert_kinds_match(
+        assert_kinds_match(
             &GoCanonicalMap,
             &[
                 ("identifier", CanonicalKind::Ref),

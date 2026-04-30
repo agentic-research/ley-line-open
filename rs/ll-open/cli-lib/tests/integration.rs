@@ -1898,10 +1898,7 @@ async fn test_op_reparse_nonexistent_source_sets_error_phase_and_recovers() {
 #[tokio::test]
 async fn test_op_query_destructive_runs_today_pin_for_6213d4() {
     use leyline_cli_lib::daemon::DaemonContext;
-    
     use std::sync::{Arc, Mutex};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
 
     let dir = TempDir::new().unwrap();
     let (_arena, ctrl_path) = fresh_arena(dir.path());
@@ -1920,15 +1917,11 @@ async fn test_op_query_destructive_runs_today_pin_for_6213d4() {
     let sock_path = dir.path().join("query-destructive.sock");
     spawn_test_socket(ctx.clone(), sock_path.clone()).await;
 
-    let stream = UnixStream::connect(&sock_path).await.unwrap();
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
-    writer
-        .write_all(b"{\"op\":\"query\",\"sql\":\"DROP TABLE doomed\"}\n")
-        .await
-        .unwrap();
-    let resp = lines.next_line().await.unwrap().expect("response");
-    let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let parsed = uds_round_trip(
+        &sock_path,
+        r#"{"op":"query","sql":"DROP TABLE doomed"}"#,
+    )
+    .await;
 
     // Today: the DROP succeeds. This pins that fact so 6213d4 can land an
     // intentional behavior change (gate / SELECT-only / require auth) and
@@ -2089,10 +2082,7 @@ async fn test_concurrent_uds_load_completes_bounded() {
 #[tokio::test]
 async fn test_status_reports_error_phase() {
     use leyline_cli_lib::daemon::{DaemonContext, DaemonPhase, DaemonState};
-    
     use std::sync::{Arc, RwLock};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
 
     let dir = TempDir::new().unwrap();
     let (_arena, ctrl_path) = fresh_arena(dir.path());
@@ -2108,14 +2098,7 @@ async fn test_status_reports_error_phase() {
     let sock_path = dir.path().join("status_error.sock");
     spawn_test_socket(ctx, sock_path.clone()).await;
 
-    let stream = UnixStream::connect(&sock_path).await.expect("connect");
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
-    writer.write_all(b"{\"op\":\"status\"}\n").await.unwrap();
-
-    let response = lines.next_line().await.unwrap().expect("response");
-    let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
-
+    let parsed = uds_round_trip(&sock_path, r#"{"op":"status"}"#).await;
     assert_eq!(parsed["phase"], "error");
     assert_eq!(parsed["error"], "boom: parse failed");
 }
@@ -2134,8 +2117,6 @@ async fn test_op_reparse_snapshot_race_keeps_monotonic_generation() {
     use leyline_cli_lib::daemon::{DaemonContext, EventRouter};
     use leyline_core::{Controller, create_arena};
     use std::sync::{Arc, Mutex};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
 
     // Source: 4 files. Reparse will rebuild the whole tree each time
     // (no scope), so two concurrent reparses both touch every row.
@@ -2172,18 +2153,14 @@ async fn test_op_reparse_snapshot_race_keeps_monotonic_generation() {
     let sock_path = dir.path().join("reparse_snapshot_race.sock");
     spawn_test_socket(ctx, sock_path.clone()).await;
 
-    /// One round-trip — open, send body, parse one line back.
+    /// One round-trip — wraps the shared `uds_round_trip` so the
+    /// owned-PathBuf + `'static str` calling convention works inside
+    /// `tokio::spawn`.
     async fn round_trip(
         sock: std::path::PathBuf,
         body: &'static str,
     ) -> serde_json::Value {
-        let stream = UnixStream::connect(&sock).await.expect("connect");
-        let (reader, mut writer) = stream.into_split();
-        let mut lines = BufReader::new(reader).lines();
-        writer.write_all(body.as_bytes()).await.unwrap();
-        writer.write_all(b"\n").await.unwrap();
-        let line = lines.next_line().await.unwrap().expect("response");
-        serde_json::from_str(&line).expect("response is JSON")
+        uds_round_trip(&sock, body).await
     }
 
     // Fire 6 reparses + 6 snapshots concurrently, plus 6 status reads

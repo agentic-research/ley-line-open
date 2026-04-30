@@ -786,6 +786,26 @@ mod tests {
         let v = cx.detect_violations();
         assert_eq!(v.len(), 1, "exactly one violation expected (a-c, not a-b)");
         assert_eq!(v[0].edge_index, 1);
+        // Pin the rest of the HvViolation payload so a refactor that
+        // populated `edge_index` correctly but dropped/swapped the
+        // other fields would fail loudly. Threshold + layer are
+        // constants from the setup; hamming must exceed threshold by
+        // construction (the contract that triggered the violation).
+        assert_eq!(v[0].threshold, 100, "threshold must echo set_threshold value");
+        assert_eq!(v[0].layer, LayerKind::Ast, "violation layer must echo edge layer");
+        assert!(
+            v[0].hamming > v[0].threshold,
+            "violation must satisfy hamming > threshold (got h={}, t={})",
+            v[0].hamming,
+            v[0].threshold,
+        );
+        // And it must equal what edge_hamming reports for the same edge —
+        // detect_violations is just a filter over edge_hamming + threshold.
+        assert_eq!(
+            Some(v[0].hamming),
+            cx.edge_hamming(&cx.edges[1]),
+            "violation hamming must match edge_hamming() output for the same edge",
+        );
     }
 
     #[test]

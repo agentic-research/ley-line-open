@@ -215,6 +215,31 @@ mod tests {
     }
 
     #[test]
+    fn every_unbundled_language_resolves_id_but_not_server() {
+        // Sweep pin extending unbundled_languages_resolve_id_but_not_
+        // server. At scale a registry repo touches many languages
+        // (helm/charts: yaml + json + md). The cmd_lsp path needs the
+        // language id even when there's no server (caller supplies
+        // --server). A refactor that conflated "no server" with "not
+        // recognized" would break recognition for every unbundled
+        // language. Walk LSP_LANGUAGES.iter().filter(server.is_none())
+        // and pin both halves: the first ext resolves to the language
+        // id, AND language_server returns None for the id.
+        for lang in LSP_LANGUAGES.iter().filter(|l| l.server.is_none()) {
+            let ext = lang.exts.first().expect("must have at least one ext");
+            assert_eq!(
+                language_id_from_ext(ext),
+                Some(lang.id),
+                "ext `{ext}` must resolve to `{}`", lang.id,
+            );
+            assert!(
+                language_server(lang.id).is_none(),
+                "unbundled lang `{}` must report no server", lang.id,
+            );
+        }
+    }
+
+    #[test]
     fn known_extension_lookups() {
         assert_eq!(language_id_from_ext("rs"),  Some("rust"));
         assert_eq!(language_id_from_ext("go"),  Some("go"));

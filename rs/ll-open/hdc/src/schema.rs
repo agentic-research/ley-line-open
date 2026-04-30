@@ -75,7 +75,8 @@ pub fn create_hdc_schema(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::conn_with_schema as fresh_schema_conn;
+    use crate::test_util::{conn_with_schema as fresh_schema_conn, insert_layer_hv};
+    use crate::util::ZERO_HV;
     use crate::{LayerKind, D_BYTES};
 
     /// Assert a `sqlite_master` row of `kind` ("table" or "index") and
@@ -121,28 +122,21 @@ mod tests {
         // The same scope can have rows in many layers; the same
         // (scope, layer) pair must not have duplicates.
         let conn = fresh_schema_conn();
-        let zero_hv = vec![0u8; D_BYTES];
 
         // First insert — fine.
-        conn.execute(
-            "INSERT INTO _hdc(scope_id, layer_kind, hv, basis) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params!["fn_foo", LayerKind::Ast.as_str(), zero_hv, 1i64],
-        )
-        .unwrap();
+        insert_layer_hv(&conn, "fn_foo", LayerKind::Ast, &ZERO_HV, 1);
 
-        // Second insert with same (scope, layer) — must reject.
+        // Second insert with same (scope, layer) — must reject. Uses
+        // raw `conn.execute` because the helper unwraps; the Err is
+        // exactly what we're asserting on.
         let dup = conn.execute(
             "INSERT INTO _hdc(scope_id, layer_kind, hv, basis) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params!["fn_foo", LayerKind::Ast.as_str(), zero_hv, 2i64],
+            rusqlite::params!["fn_foo", LayerKind::Ast.as_str(), ZERO_HV.to_vec(), 2i64],
         );
         assert!(dup.is_err(), "duplicate (scope, layer) must be rejected");
 
         // Same scope, different layer — fine.
-        conn.execute(
-            "INSERT INTO _hdc(scope_id, layer_kind, hv, basis) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params!["fn_foo", LayerKind::Module.as_str(), zero_hv, 1i64],
-        )
-        .unwrap();
+        insert_layer_hv(&conn, "fn_foo", LayerKind::Module, &ZERO_HV, 1);
     }
 
     #[test]

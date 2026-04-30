@@ -523,4 +523,17 @@ mod tests {
         // Deviations: 1, 1, 0, 0, 2, 4, 7 → sorted 0,0,1,1,2,4,7 → median 1
         assert_eq!(compute_mad(&values, median), 1);
     }
+
+    #[test]
+    fn compute_mad_empty_returns_zero() {
+        // Boundary pin: empty values must short-circuit to 0 (line
+        // 207). quickselect_median on empty also returns 0; the
+        // contract is consistent. A refactor that dropped the
+        // empty-check guard would crash on `select_nth_unstable` of
+        // an empty slice. Pin so daemon-startup-on-empty-corpus
+        // calibration paths can't regress.
+        assert_eq!(compute_mad(&[], 0), 0);
+        // Median value is irrelevant for empty input.
+        assert_eq!(compute_mad(&[], 4096), 0);
+    }
 }

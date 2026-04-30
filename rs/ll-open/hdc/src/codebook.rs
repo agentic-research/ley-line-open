@@ -7,8 +7,8 @@
 //! See bead `ley-line-open-96b1a9` for the per-layer codebook plan.
 
 use crate::canonical::CanonicalKind;
-use crate::util::{blake3_seed, tagged_seed_vector, Hypervector};
-use crate::{D_BITS, D_BYTES};
+use crate::util::{blake3_seed, tagged_seed_vector, Hypervector, ZERO_HV};
+use crate::D_BITS;
 
 /// Per-layer codebook: maps domain-specific node fingerprints to base
 /// hypervectors. Implementors must be `Send + Sync` so the encoder can
@@ -164,7 +164,7 @@ pub fn simhash_signs<F>(hyperplanes: &[Vec<f32>], dot: F) -> Hypervector
 where
     F: Fn(&[f32]) -> f64,
 {
-    let mut out = [0u8; D_BYTES];
+    let mut out = ZERO_HV;
     for (i, plane) in hyperplanes.iter().enumerate().take(D_BITS) {
         if dot(plane) >= 0.0 {
             out[i / 8] |= 1 << (i % 8);

@@ -424,6 +424,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn jsonrpc_response_factories_set_protocol_version() {
+        // JsonRpcResponse::ok and ::err embed jsonrpc: "2.0" — the
+        // JSON-RPC 2.0 protocol identifier. Clients dispatch on it;
+        // a typo (e.g. "2.O") would break MCP interop. ok must set
+        // result=Some, error=None; err inverts. id must round-trip
+        // verbatim.
+        let id = Some(serde_json::json!(7));
+        let ok = JsonRpcResponse::ok(id.clone(), serde_json::json!({"x": 1}));
+        assert_eq!(ok.jsonrpc, "2.0");
+        assert_eq!(ok.id, id);
+        assert!(ok.result.is_some());
+        assert!(ok.error.is_none());
+
+        let err = JsonRpcResponse::err(id.clone(), -32600, "bad request");
+        assert_eq!(err.jsonrpc, "2.0");
+        assert_eq!(err.id, id);
+        assert!(err.result.is_none());
+        let je = err.error.as_ref().unwrap();
+        assert_eq!(je.code, -32600);
+        assert_eq!(je.message, "bad request");
+        assert!(je.data.is_none());
+    }
+
+    #[test]
     fn registry_is_non_empty_and_unique() {
         let tools = tool_registry();
         assert!(!tools.is_empty(), "registry should expose at least one tool");

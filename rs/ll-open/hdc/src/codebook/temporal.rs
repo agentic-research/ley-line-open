@@ -382,6 +382,25 @@ mod tests {
     }
 
     #[test]
+    fn temporal_new_matches_new_with_seed_at_default_constant() {
+        // Sister pin to semantic::semantic_new_matches_new_with_seed_
+        // at_default_constant. TemporalCodebook::new(dim) is a
+        // convenience for new_with_seed(dim, TEMPORAL_HYPERPLANE_SEED).
+        // Bump-without-bump on either side would silently shift every
+        // default-seeded temporal projection. Pin via byte-identical
+        // project_scope output.
+        let mut m = TemporalCoEditMatrix::new();
+        fresh(&mut m, &["a", "b"]);
+
+        let cb_default = TemporalCodebook::new(8);
+        let cb_explicit = TemporalCodebook::new_with_seed(8, TEMPORAL_HYPERPLANE_SEED);
+        assert_eq!(
+            cb_default.project_scope(&m, "a"),
+            cb_explicit.project_scope(&m, "a"),
+        );
+    }
+
+    #[test]
     fn temporal_codebook_seed_versioning_changes_hv() {
         // Bumping the seed produces a different hyperplane matrix,
         // and therefore a different projection. Migration safety pin.

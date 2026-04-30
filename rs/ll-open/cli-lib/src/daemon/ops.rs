@@ -1392,6 +1392,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn op_status_recovers_from_poisoned_state_lock() {
+        // op_status is the operator's diagnostic endpoint — when
+        // something has gone wrong elsewhere in the daemon, this MUST
+        // still respond. RwLock poisoning happens when a writer panics
+        // while holding the lock; before this fix, every subsequent
+        // op_status call panicked with the same poison error, making
+        // the daemon opaque exactly when introspection was needed.
+        //
+        // Deliberately poison ctx.state by panicking inside a write
+        // guard, then call op_status and assert it returns a valid
+        // JSON status response.
+        let (_dir, ctx) = setup();
+        let state = ctx.state.clone();
+
+        // Spawn a thread that takes the write lock and panics.
+        // std::panic::catch_unwind requires UnwindSafe; the simplest
+        // approach is std::thread which catches the panic in the
+        // JoinHandle.
+        let join = std::thread::spawn(move || {
+            let _guard = state.write().unwrap();
+            panic!("deliberate panic to poison the lock");
+        });
+        // The thread panicked — join returns Err but the lock is now
+        // poisoned for everyone else.
+        assert!(join.join().is_err(), "spawned thread should have panicked");
+
+        // Sanity: confirm the lock IS poisoned. Direct read().unwrap()
+        // would panic now.
+        assert!(
+            ctx.state.read().is_err(),
+            "state lock must be poisoned after writer panic",
+        );
+
+        // The contract: op_status MUST succeed despite the poison.
+        let result = handle_base_op(&ctx, "status", &json!({}))
+            .expect("op_status must dispatch");
+        let parsed: serde_json::Value = serde_json::from_str(&result)
+            .expect("op_status must return valid JSON");
+        assert_eq!(parsed["ok"], true, "op_status must report ok=true");
+        // Required fields still present.
+        assert!(parsed.get("phase").is_some(), "phase field must survive poison recovery");
+        assert!(parsed.get("enrichment").is_some(), "enrichment field must survive poison recovery");
+    }
+
+    #[tokio::test]
     async fn test_op_flush_returns_ok() {
         let (_dir, ctx) = setup();
         let result = handle_base_op(&ctx, "flush", &json!({}));

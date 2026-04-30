@@ -237,10 +237,10 @@ mod tests {
             CanonicalKind::Stmt,
             vec![leaf(CanonicalKind::Block), leaf(CanonicalKind::Op)],
         );
-        let d = distance(&encode_fresh(&tree_a, &cb), &encode_fresh(&tree_b, &cb));
-        assert!(
-            d > 3500,
-            "child order must affect HV (got distance {d}, expected ~D/2)",
+        crate::util::assert_far_apart(
+            &encode_fresh(&tree_a, &cb),
+            &encode_fresh(&tree_b, &cb),
+            "child order must affect HV",
         );
     }
 
@@ -258,8 +258,11 @@ mod tests {
                 node(CanonicalKind::Expr, vec![leaf(CanonicalKind::Lit)]),
             ],
         );
-        let d = distance(&encode_fresh(&tree_simple, &cb), &encode_fresh(&tree_complex, &cb));
-        assert!(d > 3500, "different shapes must be far apart, got {d}");
+        crate::util::assert_far_apart(
+            &encode_fresh(&tree_simple, &cb),
+            &encode_fresh(&tree_complex, &cb),
+            "different shapes must be far apart",
+        );
     }
 
     #[test]
@@ -323,10 +326,10 @@ mod tests {
         let cb = AstCodebook::new();
         let parent_a = node(CanonicalKind::Stmt, vec![leaf(CanonicalKind::Op)]);
         let parent_b = node(CanonicalKind::Stmt, vec![leaf(CanonicalKind::Lit)]);
-        let d = distance(&encode_fresh(&parent_a, &cb), &encode_fresh(&parent_b, &cb));
-        assert!(
-            d > 3500,
-            "different child kinds must produce different parent HVs (got {d})",
+        crate::util::assert_far_apart(
+            &encode_fresh(&parent_a, &cb),
+            &encode_fresh(&parent_b, &cb),
+            "different child kinds must produce different parent HVs",
         );
     }
 

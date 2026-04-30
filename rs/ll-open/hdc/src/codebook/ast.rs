@@ -12,6 +12,8 @@ use crate::codebook::{AstNodeFingerprint, BaseCodebook};
 
 #[cfg(test)]
 use crate::canonical::CanonicalKind;
+#[cfg(test)]
+use crate::util::assert_far_apart;
 use crate::util::{blake3_seed, expand_seed, Hypervector};
 
 /// Default AST codebook. Stateless — same input always produces same
@@ -78,7 +80,6 @@ impl AstCodebook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::popcount_distance;
 
     fn fp(
         kind: CanonicalKind,
@@ -112,10 +113,10 @@ mod tests {
         let cb = AstCodebook::new();
         let f_stmt = fp(CanonicalKind::Stmt, 0, &[]);
         let f_expr = fp(CanonicalKind::Expr, 0, &[]);
-        let dist = popcount_distance(&cb.base_vector(&f_stmt), &cb.base_vector(&f_expr));
-        assert!(
-            dist > 3500,
-            "Stmt vs Expr distance {dist} suspiciously low (expected ~4096 ± 200)",
+        assert_far_apart(
+            &cb.base_vector(&f_stmt),
+            &cb.base_vector(&f_expr),
+            "Stmt vs Expr base vectors",
         );
     }
 
@@ -143,8 +144,11 @@ mod tests {
         let cb = AstCodebook::new();
         let f1 = fp(CanonicalKind::Stmt, 2, &[CanonicalKind::Op, CanonicalKind::Block]);
         let f2 = fp(CanonicalKind::Stmt, 3, &[CanonicalKind::Op, CanonicalKind::Block]);
-        let d = popcount_distance(&cb.base_vector(&f1), &cb.base_vector(&f2));
-        assert!(d > 3500, "arity 2 vs 3 distance {d} suspiciously low");
+        assert_far_apart(
+            &cb.base_vector(&f1),
+            &cb.base_vector(&f2),
+            "arity 2 vs 3 base vectors",
+        );
     }
 
     #[test]
@@ -157,8 +161,7 @@ mod tests {
         let r0_again = cb.role_vector(0);
         let r1 = cb.role_vector(1);
         assert_eq!(r0, r0_again, "role_vector must be deterministic per index");
-        let d = popcount_distance(&r0, &r1);
-        assert!(d > 3500, "role 0 vs 1 distance {d} too small");
+        assert_far_apart(&r0, &r1, "role 0 vs 1");
     }
 
     #[test]
@@ -171,8 +174,7 @@ mod tests {
         // base_vector for the simplest signature
         let base = cb.base_vector(&fp(CanonicalKind::Stmt, 0, &[]));
         let role = cb.role_vector(0);
-        let d = popcount_distance(&base, &role);
-        assert!(d > 3500, "base/role collision distance {d} too small");
+        assert_far_apart(&base, &role, "base vs role-0 must not collide");
     }
 
     #[test]

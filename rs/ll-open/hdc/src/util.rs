@@ -136,6 +136,32 @@ pub fn blake3_seed(bytes: &[u8]) -> u64 {
     u64::from_le_bytes([bs[0], bs[1], bs[2], bs[3], bs[4], bs[5], bs[6], bs[7]])
 }
 
+/// Hamming-distance threshold used by tests to assert "these two
+/// hypervectors are far apart" — i.e., they're distinct base/encoded
+/// vectors, not accidentally collapsed to identical or near-identical
+/// bit patterns. Random-pair baseline is D/2 = 4096; ±3σ ≈ ±136 with
+/// D=8192. Threshold 3500 gives ~4σ headroom — failing this means
+/// something genuinely went wrong (a hash collision, a code path
+/// that silently dropped a layer of binding, etc.).
+#[cfg(test)]
+pub const FAR_APART_THRESHOLD: u32 = 3500;
+
+/// Test-helper: assert two hypervectors are "far apart" in Hamming
+/// space. Centralizes the threshold + the diagnostic message so a
+/// future tuning of the threshold doesn't have to touch every test
+/// site. Use whenever a test claims "X must produce a different vector
+/// than Y" — the assertion needs more than `assert_ne!` because random
+/// hash collisions on a single bit would still pass `!=` while the
+/// vectors are effectively identical for similarity-search purposes.
+#[cfg(test)]
+pub fn assert_far_apart(a: &Hypervector, b: &Hypervector, label: &str) {
+    let d = popcount_distance(a, b);
+    assert!(
+        d > FAR_APART_THRESHOLD,
+        "{label}: hypervectors too close (distance {d}, threshold {FAR_APART_THRESHOLD})",
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

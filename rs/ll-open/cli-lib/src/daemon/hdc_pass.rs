@@ -218,6 +218,27 @@ mod tests {
     }
 
     #[test]
+    fn extract_functions_recurses_into_matched_subtrees() {
+        // The walk function (hdc_pass.rs:75-81) checks is_function
+        // BEFORE recursing into children — both the matched node and
+        // its descendants get visited. So a nested function (closure
+        // inside a function) gets listed alongside its parent. Pin
+        // the recursion semantics so a refactor that switched to
+        // "stop recursing once matched" (a defensible choice but a
+        // breaking one) requires a deliberate test update. Daemons
+        // that hash function-level subtrees independently rely on
+        // catching every match, including nested ones.
+        let inner = EncoderNode::leaf(CanonicalKind::Decl);
+        let outer = EncoderNode::new(CanonicalKind::Decl, vec![inner]);
+        let funcs = extract_functions(&outer, |n| n.canonical_kind == CanonicalKind::Decl);
+        assert_eq!(
+            funcs.len(),
+            2,
+            "matched root + matched child both produced — recursion past match",
+        );
+    }
+
+    #[test]
     fn extract_functions_finds_function_decls() {
         let src = "package m\n\nfunc A() {}\n\nfunc B() {}\n";
         let tree = parse_go(src);

@@ -264,7 +264,14 @@ fn snapshot_living_db(ctx: &DaemonContext) -> Result<()> {
 
 fn op_status(ctx: &DaemonContext) -> Result<String> {
     let ctrl = Controller::open_or_create(&ctx.ctrl_path).context("open controller")?;
-    let state = ctx.state.read().unwrap();
+    // Recover from a poisoned lock instead of propagating panic — a
+    // status query MUST succeed even if a previous writer panicked, so
+    // operators can see the failed state. Same pattern as
+    // record_pass_outcome and the embed drain loop.
+    let state = ctx.state.read().unwrap_or_else(|poisoned| {
+        log::error!("daemon state RwLock poisoned in op_status, recovering");
+        poisoned.into_inner()
+    });
 
     let mut enrichment = serde_json::Map::new();
     for (name, status) in &state.enrichment {

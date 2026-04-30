@@ -1056,6 +1056,36 @@ mod tests {
     }
 
     #[test]
+    fn compute_h0_groups_partition_the_cell_set() {
+        // compute_h0 returns connected components of the consistent
+        // subgraph. As a partition of the cell set, the union of all
+        // groups must equal the cells, with no duplicates and no
+        // omissions: sum(|group|) == cells.len(), and the union of
+        // ids equals the cell-id set. A refactor that double-counted
+        // a cell (assigned it to two groups) or dropped one (missed
+        // a singleton) would surface here. Pin via a 4-cell complex
+        // with a partial merge.
+        let mut cx = HvCellComplex::new();
+        for (id, seed) in &[("a", 1u64), ("b", 1), ("c", 999), ("d", 5)] {
+            cx.add_cell(make_cell(id, CanonicalKind::Decl, *seed));
+        }
+        cx.set_threshold(LayerKind::Ast, 100);
+        // Edge merging a-b only.
+        cx.add_edge(HvEdge::identity("a", "b", EdgeKind::Sibling, LayerKind::Ast));
+
+        let groups = cx.compute_h0(LayerKind::Ast);
+        // Sum of group sizes must equal total cells.
+        let total: usize = groups.iter().map(|g| g.len()).sum();
+        assert_eq!(total, cx.cells.len(), "groups must partition cells (no dup, no omit)");
+        // Union of ids equals the cell-id set.
+        let mut all_ids: Vec<&str> = groups.iter().flatten().map(|s| s.as_str()).collect();
+        all_ids.sort_unstable();
+        let mut expected: Vec<&str> = cx.cells.keys().map(|s| s.as_str()).collect();
+        expected.sort_unstable();
+        assert_eq!(all_ids, expected, "id union must equal cell-id set");
+    }
+
+    #[test]
     fn compute_h0_groups_consistent_cells() {
         // Three cells: a, b share a stalk; c is far. With a tight
         // threshold and a Sibling edge a-b, h0 should return a 2-cell

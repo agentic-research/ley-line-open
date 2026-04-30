@@ -94,17 +94,14 @@ impl LayerKind {
     /// `Result`, our parser returns `Option` because forward
     /// compatibility is the contract — unknown variants are not
     /// errors, just unrecognized).
+    ///
+    /// Derived from `as_str` via `LayerKind::ALL` so adding a new
+    /// variant requires updating only `as_str` (plus appending to
+    /// `ALL`); the parser stays in sync automatically. The
+    /// `layer_kind_round_trip_through_string` test pins the
+    /// equivalence on every variant.
     pub fn parse_str(s: &str) -> Option<Self> {
-        match s {
-            "ast" => Some(LayerKind::Ast),
-            "module" => Some(LayerKind::Module),
-            "semantic" => Some(LayerKind::Semantic),
-            "temporal" => Some(LayerKind::Temporal),
-            "hir" => Some(LayerKind::Hir),
-            "lex" => Some(LayerKind::Lex),
-            "fs" => Some(LayerKind::Fs),
-            _ => None,
-        }
+        LayerKind::ALL.iter().copied().find(|k| k.as_str() == s)
     }
 
     /// All seven layer kinds in the canonical iteration order used by

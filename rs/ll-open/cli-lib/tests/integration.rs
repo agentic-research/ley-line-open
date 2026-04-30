@@ -1704,6 +1704,71 @@ fn test_scoped_reparse_only_touches_scoped_files() {
     assert_eq!(after["c.go"], snapshot["c.go"], "c.go must be untouched");
 }
 
+/// Scoped reparse must NOT trigger sweep_orphaned_dirs — that sweep
+/// walks the full _file_index and would incorrectly drop dir nodes
+/// whose out-of-scope file siblings weren't reloaded into this run.
+/// At registry scale (50k+ files, 5 dirty), the sweep would catastrophic
+/// ally delete dir nodes whose only file in this scoped pass was the
+/// dirty one. Pin: after a scoped reparse, dir nodes for non-edited
+/// siblings still exist.
+#[test]
+fn test_scoped_reparse_preserves_sibling_dir_nodes() {
+    use leyline_cli_lib::cmd_parse::parse_into_conn;
+    use rusqlite::Connection;
+
+    let dir = TempDir::new().unwrap();
+    let pkg = dir.path().join("pkg");
+    fs::create_dir(&pkg).unwrap();
+    write_empty_go_func(&pkg, "a.go", "pkg", "A");
+    write_empty_go_func(&pkg, "b.go", "pkg", "B");
+
+    let conn = Connection::open_in_memory().unwrap();
+    parse_into_conn(&conn, dir.path(), Some("go"), None).unwrap();
+
+    // Verify pkg/ dir node exists after cold parse.
+    let pkg_dir_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM nodes WHERE id = 'pkg' AND kind = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(pkg_dir_count, 1, "pkg/ dir node must exist after cold parse");
+
+    // Modify only a.go and run a SCOPED reparse.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    fs::write(pkg.join("a.go"), b"package pkg\n\nfunc A() { let _ = 1; }\n").unwrap();
+    parse_into_conn(
+        &conn,
+        dir.path(),
+        Some("go"),
+        Some(&["pkg/a.go".to_string()]),
+    )
+    .unwrap();
+
+    // Critical pin: pkg/ dir node must STILL exist. If sweep_orphaned_
+    // dirs ran during the scoped pass, it would have deleted pkg/
+    // because b.go (the only other child) wasn't reloaded into the
+    // scoped run's _file_index addition.
+    let pkg_after: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM nodes WHERE id = 'pkg' AND kind = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(pkg_after, 1, "pkg/ dir node must survive scoped reparse");
+    // And b.go's file row also.
+    let b_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM nodes WHERE id = 'pkg/b.go'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(b_count, 1, "pkg/b.go file row must survive scoped reparse");
+}
+
 /// Verify scoped reparse handles a deleted file: vanished files in the scope
 /// are removed from the index, files outside the scope remain.
 #[test]

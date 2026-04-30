@@ -343,6 +343,40 @@ mod tests {
     }
 
     #[test]
+    fn delete_file_rows_does_not_match_prefix_siblings() {
+        // Scale-problem pin. The LIKE clause `id LIKE ?1 || '/%'` is
+        // designed to delete descendants of `?1` — but at registry
+        // scale (50k+ files) prefix-similar names are common. E.g.,
+        // "templates" and "templates_dir", or "a.go" and "a.go.bak".
+        // A refactor that simplified to `LIKE ?1 || '%'` (dropping
+        // the slash) would silently delete every file whose name
+        // starts with the same string. Pin via deliberately
+        // prefix-similar siblings.
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_schema(&conn).unwrap();
+        create_refs_schema(&conn).unwrap();
+        create_index_schema(&conn).unwrap();
+
+        // "a" and "ab" — would collide under `LIKE 'a%'` but must NOT
+        // collide under `LIKE 'a/%'`.
+        insert_node(&conn, "a", "", "a", 1, 0, 0, "").unwrap();
+        insert_node(&conn, "a/sub", "a", "sub", 0, 1, 0, "x").unwrap();
+        insert_node(&conn, "ab", "", "ab", 1, 0, 0, "").unwrap();
+        insert_node(&conn, "ab/sub", "ab", "sub", 0, 1, 0, "y").unwrap();
+
+        // Delete "a" — should remove "a" and "a/sub" only.
+        delete_file_rows(&conn, "a").unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes WHERE id IN ('ab', 'ab/sub')", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2, "prefix-similar `ab` siblings must survive deletion of `a`");
+        let a_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes WHERE id IN ('a', 'a/sub')", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(a_count, 0, "`a` and its descendants must be gone");
+    }
+
+    #[test]
     fn ts_schema_creates_all_indexes() {
         // Scale-problem pin completing the index-existence triplet
         // (leyline-schema ✓, leyline-lsp ✓, leyline-ts ←). Five

@@ -125,6 +125,49 @@ mod tests {
     const DISTINCT_DISTANCE_LOWER: f64 = 0.35;
 
     #[test]
+    fn tree_to_encoder_node_filters_anonymous_children() {
+        // tree_to_encoder_node has `if child.is_named()` on line 28 —
+        // anonymous tokens (braces, parens, keyword tokens like
+        // `func`, `if`, `{`, `}`) are filtered out. The Deckard
+        // production-signature discipline depends on this. A refactor
+        // that dropped the named-child filter would inflate the
+        // EncoderNode child counts, shift arity buckets, and shift
+        // every encoded hypervector for every source. Pin via Go
+        // source where anonymous tokens dominate: compare child
+        // counts between sources whose only difference is "more
+        // braces/parens" — but the named-child set is identical.
+
+        // Empty function: Decl with [Ref name, Block body] — exactly 2
+        // named children. If anonymous tokens leaked through we'd
+        // see additional children for `func`, `(`, `)`, `{`, `}`.
+        let src = "package m\n\nfunc A() {}\n";
+        let tree = parse_go(src);
+        // Find the function_declaration: source_file → [package, fn].
+        let func = tree
+            .children
+            .iter()
+            .find(|c| {
+                c.canonical_kind == CanonicalKind::Decl
+                    && c.children.len() >= 2
+            })
+            .expect("expected a Decl with named children");
+        // Just 2 named children: identifier (Ref) + parameter_list +
+        // block. tree-sitter-go's parameter_list has no canonical map
+        // entry so it's Block (FALLBACK_KIND). Pin EXACTLY 3 named
+        // children — any more would indicate anonymous-token leakage.
+        // The exact count depends on grammar details, but it must be
+        // strictly less than the 8 we'd see if anonymous tokens
+        // (`func`, `(`, `)`, `{`, `}`) leaked through alongside
+        // identifier/parameter_list/block.
+        assert!(
+            func.children.len() <= 4,
+            "expected at most 4 named children (identifier, parameters, body); \
+             got {} — anonymous tokens leaked?",
+            func.children.len(),
+        );
+    }
+
+    #[test]
     fn parses_simple_go_function() {
         // Sanity: parsing must produce a non-trivial tree.
         let src = "package m\n\nfunc A(x int) int { return x + 1 }\n";

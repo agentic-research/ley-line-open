@@ -381,6 +381,23 @@ mod tests {
     }
 
     #[test]
+    fn refresh_all_combined_returns_zero_on_empty_hdc() {
+        // Empty `_hdc` → no distinct scope_ids → zero refreshes,
+        // zero rows inserted into `_hdc_combined`. Pin the no-op
+        // path so a refactor that incorrectly inserted a phantom
+        // empty-scope row, or that errored on no-rows-to-process,
+        // would surface. Daemon startup before any reparse hits
+        // exactly this case.
+        let conn = fresh();
+        let count = refresh_all_combined(&conn).unwrap();
+        assert_eq!(count, 0);
+        let stored: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _hdc_combined", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, 0, "no phantom rows inserted on empty input");
+    }
+
+    #[test]
     fn combined_distance_smaller_when_more_layers_match() {
         // Two scopes that share AST + Module layers should produce
         // closer combined HVs than two scopes that share only AST.

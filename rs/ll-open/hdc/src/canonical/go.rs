@@ -120,7 +120,10 @@ impl CanonicalKindMap for GoCanonicalMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canonical::{assert_canonical_map_baseline, assert_kinds_match, RustCanonicalMap};
+    use crate::canonical::{
+        assert_canonical_map_baseline, assert_kinds_cover_all_canonical, assert_kinds_match,
+        RustCanonicalMap,
+    };
 
     #[test]
     fn common_go_kinds_map_correctly() {
@@ -140,31 +143,23 @@ mod tests {
 
     #[test]
     fn go_map_covers_every_canonical_kind() {
-        // The GoCanonicalMap must produce at least one example for
-        // each of the seven canonical roles. Without this, a refactor
-        // that accidentally dropped an entire bucket (e.g. removed
-        // every `CanonicalKind::Ref` arm) would silently shift parsed
-        // Go output: every former Ref token would fall through to
-        // FALLBACK_KIND (Block), invalidating every encoded
-        // hypervector that contained an identifier.
-        let probes: &[(&str, CanonicalKind)] = &[
-            ("function_declaration", CanonicalKind::Decl),
-            ("call_expression", CanonicalKind::Expr),
-            ("if_statement", CanonicalKind::Stmt),
-            ("block", CanonicalKind::Block),
-            ("identifier", CanonicalKind::Ref),
-            ("int_literal", CanonicalKind::Lit),
-            ("if", CanonicalKind::Op),
-        ];
-        let covered: std::collections::HashSet<CanonicalKind> =
-            probes.iter().map(|(_, k)| *k).collect();
-        assert_eq!(
-            covered.len(),
-            CanonicalKind::ALL.len(),
-            "Go map probe set must hit every CanonicalKind exactly once",
+        // GoCanonicalMap must produce at least one example for each
+        // of the seven canonical roles. A refactor dropping an entire
+        // bucket (e.g. removed every `CanonicalKind::Ref` arm) would
+        // silently shift parsed Go output via FALLBACK_KIND. See the
+        // shared helper for the diagnostic.
+        assert_kinds_cover_all_canonical(
+            &GoCanonicalMap,
+            &[
+                ("function_declaration", CanonicalKind::Decl),
+                ("call_expression", CanonicalKind::Expr),
+                ("if_statement", CanonicalKind::Stmt),
+                ("block", CanonicalKind::Block),
+                ("identifier", CanonicalKind::Ref),
+                ("int_literal", CanonicalKind::Lit),
+                ("if", CanonicalKind::Op),
+            ],
         );
-        // And each probe must actually map to its declared kind.
-        assert_kinds_match(&GoCanonicalMap, probes);
     }
 
     #[test]

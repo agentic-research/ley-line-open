@@ -136,6 +136,30 @@ pub fn assert_kinds_match(m: &dyn CanonicalKindMap, pairs: &[(&str, CanonicalKin
     }
 }
 
+/// Assert that the given probe set covers every variant in
+/// `CanonicalKind::ALL` AND that each probe maps to its declared
+/// kind. Used by per-language tests to enforce "no canonical role
+/// silently dropped from the map" — a refactor that removed all
+/// `CanonicalKind::Ref` arms would silently funnel every former-Ref
+/// kind into `FALLBACK_KIND` and shift every encoded hypervector
+/// that contained the lost role.
+#[cfg(test)]
+pub fn assert_kinds_cover_all_canonical(
+    m: &dyn CanonicalKindMap,
+    probes: &[(&str, CanonicalKind)],
+) {
+    let covered: std::collections::HashSet<CanonicalKind> =
+        probes.iter().map(|(_, k)| *k).collect();
+    assert_eq!(
+        covered.len(),
+        CanonicalKind::ALL.len(),
+        "{}: probe set must hit every CanonicalKind exactly once (got {} unique)",
+        m.lang(),
+        covered.len(),
+    );
+    assert_kinds_match(m, probes);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

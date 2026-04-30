@@ -126,7 +126,9 @@ impl CanonicalKindMap for RustCanonicalMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canonical::{assert_canonical_map_baseline, assert_kinds_match};
+    use crate::canonical::{
+        assert_canonical_map_baseline, assert_kinds_cover_all_canonical, assert_kinds_match,
+    };
 
     #[test]
     fn common_rust_kinds_map_correctly() {
@@ -146,30 +148,22 @@ mod tests {
 
     #[test]
     fn rust_map_covers_every_canonical_kind() {
-        // Sister pin to GoCanonicalMap's `go_map_covers_every_
-        // canonical_kind`: verify the RustCanonicalMap reaches every
-        // canonical role via at least one parser-kind. A refactor
-        // that dropped an entire bucket (e.g. removed every
-        // CanonicalKind::Lit arm) would silently funnel every literal
-        // into FALLBACK_KIND (Block) and shift every encoded
-        // hypervector for Rust source that contained literals.
-        let probes: &[(&str, CanonicalKind)] = &[
-            ("function_item", CanonicalKind::Decl),
-            ("if_expression", CanonicalKind::Expr),
-            ("expression_statement", CanonicalKind::Stmt),
-            ("block", CanonicalKind::Block),
-            ("identifier", CanonicalKind::Ref),
-            ("integer_literal", CanonicalKind::Lit),
-            ("if", CanonicalKind::Op),
-        ];
-        let covered: std::collections::HashSet<CanonicalKind> =
-            probes.iter().map(|(_, k)| *k).collect();
-        assert_eq!(
-            covered.len(),
-            CanonicalKind::ALL.len(),
-            "Rust map probe set must hit every CanonicalKind exactly once",
+        // Sister pin to GoCanonicalMap's go_map_covers_every_
+        // canonical_kind: ensure RustCanonicalMap reaches every
+        // canonical role via at least one parser-kind. See the shared
+        // helper for the diagnostic.
+        assert_kinds_cover_all_canonical(
+            &RustCanonicalMap,
+            &[
+                ("function_item", CanonicalKind::Decl),
+                ("if_expression", CanonicalKind::Expr),
+                ("expression_statement", CanonicalKind::Stmt),
+                ("block", CanonicalKind::Block),
+                ("identifier", CanonicalKind::Ref),
+                ("integer_literal", CanonicalKind::Lit),
+                ("if", CanonicalKind::Op),
+            ],
         );
-        assert_kinds_match(&RustCanonicalMap, probes);
     }
 
     #[test]

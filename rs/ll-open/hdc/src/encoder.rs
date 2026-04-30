@@ -499,6 +499,39 @@ mod tests {
     }
 
     #[test]
+    fn content_hash_distinguishes_arity_within_same_bucket() {
+        // bucket_arity collapses 3 and 4 children to the same bucket=3
+        // (per util.rs:124). content_hash MUST still distinguish them
+        // — the children-iteration step folds each child's content_
+        // hash, so 3 vs 4 children produce different bytes. Pin so a
+        // refactor that REPLACED `child_canonical_kinds_sorted` with
+        // `bucket_arity(children.len())` in the hash would surface
+        // immediately. content_hash is finer-grained than
+        // `arity_bucket` by construction.
+        let three = node(
+            CanonicalKind::Block,
+            vec![leaf(CanonicalKind::Op), leaf(CanonicalKind::Op), leaf(CanonicalKind::Op)],
+        );
+        let four = node(
+            CanonicalKind::Block,
+            vec![
+                leaf(CanonicalKind::Op),
+                leaf(CanonicalKind::Op),
+                leaf(CanonicalKind::Op),
+                leaf(CanonicalKind::Op),
+            ],
+        );
+        // Sanity: bucket_arity(3) == bucket_arity(4) (both bucket to 3).
+        assert_eq!(
+            crate::util::bucket_arity(3),
+            crate::util::bucket_arity(4),
+            "test premise: 3 and 4 children must bucket to same value",
+        );
+        // But content_hash must distinguish them.
+        assert_ne!(three.content_hash(), four.content_hash());
+    }
+
+    #[test]
     fn content_hash_changes_with_arity_at_same_kind_set() {
         // Same canonical-kind composition, different arity at root.
         // Two trees that both produce {Block, Op, Op} but with

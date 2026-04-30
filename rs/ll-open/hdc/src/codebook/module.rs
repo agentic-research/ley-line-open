@@ -364,6 +364,14 @@ mod tests {
     }
 
     #[test]
+    fn module_codebook_tag_literal_is_hdc_module() {
+        // Sister pin to ast_codebook_tag_literal_is_hdc_ast. This tag
+        // is hashed into cache_keys and canonical_signature_bytes
+        // outputs — bumping it orphans every encoded module-layer HV.
+        assert_eq!(ModuleCodebook::new().codebook_tag(), "hdc-module");
+    }
+
+    #[test]
     fn module_role_vector_default_matches_explicit_tag() {
         // Skeptic 4bbc54: deleted the explicit override on
         // ModuleCodebook, relying on the trait default to derive

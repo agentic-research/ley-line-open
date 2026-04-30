@@ -152,6 +152,18 @@ mod tests {
     }
 
     #[test]
+    fn ast_codebook_tag_literal_is_hdc_ast() {
+        // codebook_tag() is hashed into every cache_key and every
+        // canonical_signature_bytes call. Bumping it orphans every
+        // encoded HV in production. The role_vector default-derivation
+        // tests pin "hdc-ast-role" transitively, but the literal
+        // "hdc-ast" itself wasn't pinned. Pin it directly so a typo
+        // (e.g. "hdc-ast-v2") gets caught even before downstream
+        // migration tests notice.
+        assert_eq!(AstCodebook::new().codebook_tag(), "hdc-ast");
+    }
+
+    #[test]
     fn role_vector_default_uses_codebook_tag_plus_role_suffix() {
         // Skeptic 4bbc54: deleted the explicit override on AstCodebook,
         // relying on the trait default to derive "hdc-ast-role" from

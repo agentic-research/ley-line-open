@@ -804,6 +804,45 @@ mod tests {
     }
 
     #[test]
+    fn merkle_internal_node_format_byte_pin() {
+        // Internal nodes are blake3(0x01 || left || right) per the
+        // doc comment at sheaf.rs:463 and impl at line 563. Sister
+        // pin to merkle_leaf_format_byte_pin. Two leaves → root is
+        // one internal hash. A refactor that dropped the 0x01 domain
+        // separator (or swapped left/right) would silently shift
+        // every multi-cell merkle root.
+        let mut cx = HvCellComplex::new();
+        // Two cells, sorted by id: "a" before "b" (BTreeMap order).
+        let stalk_a = stalk_for(11);
+        let stalk_b = stalk_for(22);
+        cx.add_cell(HvCell::new("a", CanonicalKind::Decl).with_stalk(LayerKind::Ast, stalk_a));
+        cx.add_cell(HvCell::new("b", CanonicalKind::Decl).with_stalk(LayerKind::Ast, stalk_b));
+        let actual = cx.merkle_root_for_layer(LayerKind::Ast);
+
+        // Compute leaf hashes manually using the leaf format.
+        let leaf_hash = |id: &str, stalk: &[u8]| -> [u8; 32] {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(LayerKind::Ast.as_str().as_bytes());
+            buf.push(0u8);
+            buf.extend_from_slice(id.as_bytes());
+            buf.push(0u8);
+            buf.extend_from_slice(stalk);
+            blake3::hash(&buf).into()
+        };
+        let leaf_a = leaf_hash("a", &stalk_a);
+        let leaf_b = leaf_hash("b", &stalk_b);
+
+        // Internal node: blake3(0x01 || left || right) where left=a, right=b
+        // (sorted-by-id, so 'a' is the left).
+        let mut internal_buf = Vec::with_capacity(65);
+        internal_buf.push(0x01);
+        internal_buf.extend_from_slice(&leaf_a);
+        internal_buf.extend_from_slice(&leaf_b);
+        let expected: [u8; 32] = blake3::hash(&internal_buf).into();
+        assert_eq!(actual, expected, "internal node format drifted");
+    }
+
+    #[test]
     fn merkle_leaf_format_byte_pin() {
         // Pin the leaf byte layout so a refactor that drops a 0x00
         // separator or reorders fields gets caught — every encoded

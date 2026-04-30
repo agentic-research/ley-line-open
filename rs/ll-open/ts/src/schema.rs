@@ -237,6 +237,12 @@ pub fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
 ///
 /// The `nodes` table uses path-prefix deletion because node IDs are structured
 /// as `<file>/<ast_path>` (e.g. `main.go/function_declaration_0/identifier`).
+///
+/// Optional `_lsp*` tables are handled defensively: if LSP enrichment has
+/// run on this database the tables exist and rows keyed by node_id need
+/// to follow the file deletion (otherwise stale `_lsp*` rows orphan and
+/// accumulate at registry-repo scale across file churn). If LSP has
+/// never run, the tables don't exist and we skip.
 pub fn delete_file_rows(conn: &Connection, path: &str) -> Result<()> {
     conn.execute("DELETE FROM nodes WHERE id = ?1 OR id LIKE ?1 || '/%'", [path])?;
     conn.execute("DELETE FROM _ast WHERE source_id = ?1", [path])?;
@@ -245,6 +251,47 @@ pub fn delete_file_rows(conn: &Connection, path: &str) -> Result<()> {
     conn.execute("DELETE FROM node_defs WHERE source_id = ?1", [path])?;
     conn.execute("DELETE FROM _imports WHERE source_id = ?1", [path])?;
     conn.execute("DELETE FROM _file_index WHERE path = ?1", [path])?;
+    delete_lsp_rows_for_path(conn, path)?;
+    Ok(())
+}
+
+/// Delete `_lsp*` rows whose `node_id` is in the deleted file's path
+/// namespace. Tables created by leyline-lsp's `create_lsp_schema` are
+/// optional; we discover their presence via `sqlite_master` and skip
+/// missing ones so callers that never enabled LSP enrichment pay
+/// nothing.
+///
+/// Without this cleanup, `_lsp*` rows accumulate at registry scale as
+/// files churn — every file deleted+reparsed leaves the prior LSP
+/// enrichment as orphans keyed by node_ids that no longer resolve.
+fn delete_lsp_rows_for_path(conn: &Connection, path: &str) -> Result<()> {
+    // Feature-gated tables — skip cleanly when absent.
+    const LSP_TABLES: &[&str] = &[
+        "_lsp",
+        "_lsp_defs",
+        "_lsp_refs",
+        "_lsp_hover",
+        "_lsp_completions",
+    ];
+    for table in LSP_TABLES {
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        if !exists {
+            continue;
+        }
+        // Both equal-match and prefix-match: the file's "root" node_id
+        // (the path itself) AND every descendant
+        // (`<path>/<ast_path>`).
+        let sql = format!(
+            "DELETE FROM {table} WHERE node_id = ?1 OR node_id LIKE ?1 || '/%'",
+        );
+        conn.execute(&sql, [path])?;
+    }
     Ok(())
 }
 
@@ -425,6 +472,104 @@ mod tests {
         assert!(b_nodes >= 2);
         let b_refs: i64 = conn.query_row("SELECT COUNT(*) FROM node_refs WHERE source_id = 'b.go'", [], |r| r.get(0)).unwrap();
         assert_eq!(b_refs, 1);
+    }
+
+    #[test]
+    fn delete_file_rows_cleans_lsp_tables_when_present() {
+        // Cross-crate cleanup pin. _lsp* tables are created by leyline-
+        // lsp::project::create_lsp_schema; if LSP enrichment ran at
+        // least once they exist on the connection, and rows are keyed
+        // by node_id (matching the file's path namespace). Without
+        // explicit cleanup, _lsp* rows accumulate as files churn at
+        // registry scale — every file delete+reparse cycle leaves the
+        // prior LSP enrichment as orphaned rows.
+        //
+        // Simulate the leyline-lsp schema in-place (we can't use it
+        // directly without inverting the dep graph; the schema is
+        // simple enough to recreate here with the same column shapes).
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_schema(&conn).unwrap();
+        create_refs_schema(&conn).unwrap();
+        create_index_schema(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _lsp (
+                node_id TEXT PRIMARY KEY,
+                symbol_kind TEXT,
+                detail TEXT,
+                start_line INTEGER NOT NULL,
+                start_col INTEGER NOT NULL,
+                end_line INTEGER NOT NULL,
+                end_col INTEGER NOT NULL,
+                diagnostics TEXT
+            );
+            CREATE TABLE _lsp_defs (node_id TEXT, def_uri TEXT, def_start_line INT, def_start_col INT, def_end_line INT, def_end_col INT);
+            CREATE TABLE _lsp_refs (node_id TEXT, ref_uri TEXT, ref_start_line INT, ref_start_col INT, ref_end_line INT, ref_end_col INT);
+            CREATE TABLE _lsp_hover (node_id TEXT PRIMARY KEY, hover_text TEXT);
+            CREATE TABLE _lsp_completions (node_id TEXT, label TEXT, kind TEXT, detail TEXT, documentation TEXT, sort_text TEXT);",
+        )
+        .unwrap();
+
+        // Two files' worth of LSP rows. Use the file's own path as one
+        // of the node_ids and a descendant for the other.
+        conn.execute(
+            "INSERT INTO _lsp (node_id, symbol_kind, detail, start_line, start_col, end_line, end_col) \
+             VALUES ('a.go/func', 'function', 'a-detail', 0, 0, 1, 0), \
+                    ('b.go/func', 'function', 'b-detail', 0, 0, 1, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO _lsp_hover (node_id, hover_text) VALUES ('a.go/func', 'a-hover'), ('b.go/func', 'b-hover')",
+            [],
+        )
+        .unwrap();
+
+        // Pre-condition: a.go's LSP rows exist.
+        let a_pre: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _lsp WHERE node_id LIKE 'a.go%'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(a_pre, 1, "pre-condition: a.go LSP row should exist");
+
+        delete_file_rows(&conn, "a.go").unwrap();
+
+        // a.go's LSP rows: gone.
+        let a_lsp: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _lsp WHERE node_id LIKE 'a.go%'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(a_lsp, 0, "_lsp rows for a.go must be cleaned up");
+        let a_hover: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _lsp_hover WHERE node_id LIKE 'a.go%'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(a_hover, 0, "_lsp_hover rows for a.go must be cleaned up");
+
+        // b.go's LSP rows: intact.
+        let b_lsp: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _lsp WHERE node_id LIKE 'b.go%'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(b_lsp, 1, "_lsp rows for b.go must NOT be cleaned up");
+    }
+
+    #[test]
+    fn delete_file_rows_skips_lsp_tables_when_absent() {
+        // The optional _lsp* cleanup must NOT error when the tables
+        // don't exist (i.e. LSP enrichment never ran on this database).
+        // Without the IF EXISTS guard, every parse-pass deletion on a
+        // never-LSP'd db would hit "no such table: _lsp" and error.
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_schema(&conn).unwrap();
+        create_refs_schema(&conn).unwrap();
+        create_index_schema(&conn).unwrap();
+        // Note: NO _lsp* tables created.
+
+        insert_node(&conn, "a.go", "", "a.go", 1, 0, 0, "").unwrap();
+        upsert_file_index(&conn, "a.go", 100, 50).unwrap();
+
+        // delete_file_rows must succeed even without _lsp* tables.
+        delete_file_rows(&conn, "a.go").unwrap();
+        let a_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes WHERE id = 'a.go'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(a_count, 0);
     }
 
     #[test]

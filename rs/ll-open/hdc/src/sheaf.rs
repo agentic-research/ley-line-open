@@ -963,6 +963,29 @@ mod tests {
     }
 
     #[test]
+    fn compute_h0_output_is_deterministic_across_calls() {
+        // compute_h0 collects groups into a BTreeMap keyed by root
+        // cell-id, then `into_values()` yields them in sorted-key
+        // order (sheaf.rs:425, 430). This is a load-bearing
+        // reproducibility property — downstream consumers (the
+        // daemon's MCP query path, propagate_sections) depend on
+        // identical inputs producing identical outputs.
+        //
+        // Existing tests sort sizes or use `contains` checks so this
+        // determinism wasn't directly pinned. A refactor that swapped
+        // BTreeMap for HashMap would silently break it.
+        let mut cx = HvCellComplex::new();
+        for (id, seed) in &[("fn_z", 1u64), ("fn_a", 1), ("fn_m", 999)] {
+            cx.add_cell(make_cell(id, CanonicalKind::Decl, *seed));
+        }
+        cx.set_threshold(LayerKind::Ast, 10);
+        cx.add_edge(HvEdge::identity("fn_z", "fn_a", EdgeKind::Sibling, LayerKind::Ast));
+        let g1 = cx.compute_h0(LayerKind::Ast);
+        let g2 = cx.compute_h0(LayerKind::Ast);
+        assert_eq!(g1, g2, "compute_h0 must produce byte-identical output across calls");
+    }
+
+    #[test]
     fn compute_h0_ignores_edges_on_other_layers() {
         // compute_h0(L) walks only edges whose `layer == L`
         // (sheaf.rs:414 `if edge.layer != layer { continue; }`).

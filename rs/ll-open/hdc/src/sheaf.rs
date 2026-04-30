@@ -931,28 +931,18 @@ mod tests {
         // Two stalks that disagree at every bit (one = !other) —
         // every bit position is a 0/1 tie. With the tie-→-0 rule the
         // bundle is all zeros. Matches BUNDLE_MAJORITY UDF semantics.
-        let mut a = stalk_for(2);
-        let mut b = stalk_for(2);
-        // Force every bit to disagree: flip every bit of b.
-        for i in 0..D_BYTES {
-            b[i] = !a[i];
-        }
+        let a = stalk_for(2);
+        let b = a.map(|x| !x);
         // Sanity: a and b are bit-complements.
         for i in 0..D_BYTES {
             assert_eq!(a[i] ^ b[i], 0xFF);
         }
-        let bundle = HvCellComplex::bundle_majority(&[a, b]);
-        assert_eq!(bundle, [0u8; D_BYTES]);
-        // Also verify the path doesn't depend on which bit-pattern we used:
-        // mutate `a` and re-confirm.
-        for byte in a.iter_mut() {
-            *byte = 0xAA;
-        }
-        for i in 0..D_BYTES {
-            b[i] = !a[i];
-        }
-        let bundle = HvCellComplex::bundle_majority(&[a, b]);
-        assert_eq!(bundle, [0u8; D_BYTES]);
+        assert_eq!(HvCellComplex::bundle_majority(&[a, b]), [0u8; D_BYTES]);
+        // Also verify the path doesn't depend on which bit-pattern we
+        // used: switch `a` to a different fixed pattern and re-confirm.
+        let a2 = [0xAA_u8; D_BYTES];
+        let b2 = a2.map(|x| !x);
+        assert_eq!(HvCellComplex::bundle_majority(&[a2, b2]), [0u8; D_BYTES]);
     }
 
     #[test]

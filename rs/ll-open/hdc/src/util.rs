@@ -408,6 +408,28 @@ mod tests {
     }
 
     #[test]
+    fn popcount_distance_complement_pair_is_d_bits() {
+        // Sister to popcount_distance_self_is_zero (min, d=0). The
+        // complement pair (a, !a) is the maximum-distance case: every
+        // bit differs, so d == D_BITS = 8192. Pin the upper bound so
+        // a refactor that capped popcount at D/2 (a defensible
+        // "Hamming similarity" choice but a contract change) would
+        // surface immediately. Try across multiple seeds.
+        for seed in [1u64, 0xCAFE, u64::MAX, 0x42] {
+            let a = expand_seed(seed);
+            let mut b = a;
+            for byte in b.iter_mut() {
+                *byte = !*byte;
+            }
+            assert_eq!(
+                popcount_distance(&a, &b) as usize,
+                crate::D_BITS,
+                "complement pair must have max Hamming distance for seed {seed:#x}",
+            );
+        }
+    }
+
+    #[test]
     fn popcount_distance_random_pair_near_half_d() {
         // Random pairs of base vectors should have Hamming distance near
         // D/2 = 4096. ±3σ ≈ ±136. This is the iid baseline that

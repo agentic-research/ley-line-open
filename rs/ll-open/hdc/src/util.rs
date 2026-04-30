@@ -136,6 +136,21 @@ pub fn blake3_seed(bytes: &[u8]) -> u64 {
     u64::from_le_bytes([bs[0], bs[1], bs[2], bs[3], bs[4], bs[5], bs[6], bs[7]])
 }
 
+/// Build a deterministic hypervector tagged by a domain string and index.
+/// Used by codebooks for role / position / dimension vectors that must
+/// be reproducible across machines AND non-colliding across domains.
+///
+/// E.g. `tagged_seed_vector("hdc-ast-role", 0)` produces the AST-codebook
+/// role-0 vector; `tagged_seed_vector("hdc-module-role", 0)` produces a
+/// distinct module-codebook role-0 vector. Tag prevents accidental
+/// collision when an unbind cleanup-memory runs against a multi-layer
+/// codebook collection.
+pub fn tagged_seed_vector(tag: &str, index: usize) -> Hypervector {
+    let bytes = format!("{tag}/{index}");
+    let seed = blake3_seed(bytes.as_bytes());
+    expand_seed(seed)
+}
+
 /// Hamming-distance threshold used by tests to assert "these two
 /// hypervectors are far apart" — i.e., they're distinct base/encoded
 /// vectors, not accidentally collapsed to identical or near-identical

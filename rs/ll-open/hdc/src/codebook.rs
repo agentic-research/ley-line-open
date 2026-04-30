@@ -38,12 +38,11 @@ pub trait BaseCodebook: Send + Sync {
     /// need non-positional binding (e.g. layer-tagged combined view,
     /// module method-set vs field-set). The AST encoder doesn't call
     /// this — positional encoding is via permutation. Default impl
-    /// derives a vector from `format!("hdc-role/{role_index}")`; impls
-    /// may override if they want a domain-tagged seed.
+    /// uses the generic `"hdc-role"` tag; impls override with their
+    /// own tag (e.g. `"hdc-ast-role"`) to avoid cross-codebook
+    /// collisions.
     fn role_vector(&self, role_index: usize) -> Hypervector {
-        let bytes = format!("hdc-role/{role_index}");
-        let seed = crate::util::blake3_seed(bytes.as_bytes());
-        crate::util::expand_seed(seed)
+        crate::util::tagged_seed_vector("hdc-role", role_index)
     }
 }
 

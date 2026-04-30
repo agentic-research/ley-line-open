@@ -14,7 +14,7 @@ use crate::codebook::{AstNodeFingerprint, BaseCodebook};
 use crate::canonical::CanonicalKind;
 #[cfg(test)]
 use crate::util::assert_far_apart;
-use crate::util::{blake3_seed, expand_seed, Hypervector};
+use crate::util::{blake3_seed, expand_seed, tagged_seed_vector, Hypervector};
 
 /// Default AST codebook. Stateless — same input always produces same
 /// output, no per-instance state to ship between machines.
@@ -62,11 +62,10 @@ impl BaseCodebook for AstCodebook {
 
     fn role_vector(&self, role_index: usize) -> Hypervector {
         // Role vectors are independent of the codebook content — they
-        // just need to be deterministic per index. Use a domain-tagged
-        // hash so role-vectors never collide with base vectors.
-        let bytes = format!("hdc-ast-role/{role_index}");
-        let seed = blake3_seed(bytes.as_bytes());
-        expand_seed(seed)
+        // just need to be deterministic per index. Domain-tagged so AST
+        // role-vectors never collide with module/semantic/etc. role
+        // vectors at unbind cleanup-memory time.
+        tagged_seed_vector("hdc-ast-role", role_index)
     }
 }
 

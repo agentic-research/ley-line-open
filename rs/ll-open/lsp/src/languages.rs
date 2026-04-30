@@ -132,6 +132,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn no_extension_appears_under_two_languages() {
+        // Scale-problem pin. language_id_from_ext does a `find()`
+        // over LSP_LANGUAGES — first match wins. If a future entry
+        // accidentally re-registered an existing ext (e.g. adding
+        // "node" with exts=["js"]), the second entry would be
+        // silently shadowed and every .js file would still resolve
+        // to "javascript" — but the new entry would be invisible.
+        // Worse: file-of-truth drift between this table and the
+        // ts::TsLanguage table. Pin uniqueness across the whole
+        // registry.
+        let mut seen = std::collections::HashMap::<&str, &str>::new();
+        for lang in LSP_LANGUAGES {
+            for ext in lang.exts {
+                if let Some(prev_id) = seen.insert(ext, lang.id) {
+                    panic!(
+                        "extension `{ext}` registered under both `{prev_id}` and `{}`",
+                        lang.id,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn every_entry_has_id_and_at_least_one_ext() {
         for lang in LSP_LANGUAGES {
             assert!(!lang.id.is_empty(), "language id must not be empty");

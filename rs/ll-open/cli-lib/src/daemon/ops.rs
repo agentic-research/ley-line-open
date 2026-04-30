@@ -1232,6 +1232,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn op_query_errors_on_missing_or_invalid_sql() {
+        // Sister pin to op_load_errors_on_missing_or_invalid_db_field.
+        // op_query is the ad-hoc inspection escape hatch. At scale (an
+        // ops-engineer poking around a misconfigured daemon) a missing
+        // or malformed sql field should produce an actionable error,
+        // not a silent panic on a large registry db. Pin three modes:
+        //   - missing "sql" field
+        //   - "sql" present but wrong type
+        //   - "sql" present but unparseable
+        let (_dir, ctx) = setup();
+
+        let resp = handle_base_op(&ctx, "query", &json!({})).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert!(parsed.get("error").is_some(), "missing sql must error: {parsed}");
+
+        let resp = handle_base_op(&ctx, "query", &json!({"sql": 42})).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert!(parsed.get("error").is_some(), "non-string sql must error: {parsed}");
+
+        let resp = handle_base_op(
+            &ctx,
+            "query",
+            &json!({"sql": "SELECT garbage FROM nowhere WHERE x SYNTAX_ERROR"}),
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert!(parsed.get("error").is_some(), "invalid sql must error: {parsed}");
+    }
+
+    #[tokio::test]
     async fn op_load_errors_on_missing_or_invalid_db_field() {
         // op_load takes a base64-encoded .db payload. Pin error
         // surfacing for the three expected failure modes:

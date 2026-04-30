@@ -184,6 +184,27 @@ mod tests {
     }
 
     #[test]
+    fn arena_header_magic_and_version_literals() {
+        // ArenaHeader::MAGIC and VERSION are baked into every arena
+        // file on disk. Bumping either silently invalidates every
+        // existing file — daemons and tools would fail to read prior
+        // arenas with no clear migration path. The
+        // active_buffer_offset_rejects_bad_header test pins the
+        // rejection behavior; this pins the literal values directly
+        // so a typo in the constant is caught at the unit level
+        // rather than only via downstream parsing failures.
+        assert_eq!(
+            ArenaHeader::MAGIC,
+            0x4C455930,
+            "MAGIC must be ASCII bytes 'LEY0' = 0x4C455930",
+        );
+        // Sanity: those bytes are literally L, E, Y, 0 in big-endian.
+        let bytes = ArenaHeader::MAGIC.to_be_bytes();
+        assert_eq!(bytes, *b"LEY0", "MAGIC bytes must spell 'LEY0'");
+        assert_eq!(ArenaHeader::VERSION, 1, "VERSION must be 1 until a deliberate migration");
+    }
+
+    #[test]
     fn buffer_size_calculation() {
         // 4096 header + 2 * N buffers
         assert_eq!(ArenaHeader::buffer_size(4096 + 4096 * 2), 4096);

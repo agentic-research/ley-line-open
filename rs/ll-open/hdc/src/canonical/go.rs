@@ -139,6 +139,35 @@ mod tests {
     }
 
     #[test]
+    fn go_map_covers_every_canonical_kind() {
+        // The GoCanonicalMap must produce at least one example for
+        // each of the seven canonical roles. Without this, a refactor
+        // that accidentally dropped an entire bucket (e.g. removed
+        // every `CanonicalKind::Ref` arm) would silently shift parsed
+        // Go output: every former Ref token would fall through to
+        // FALLBACK_KIND (Block), invalidating every encoded
+        // hypervector that contained an identifier.
+        let probes: &[(&str, CanonicalKind)] = &[
+            ("function_declaration", CanonicalKind::Decl),
+            ("call_expression", CanonicalKind::Expr),
+            ("if_statement", CanonicalKind::Stmt),
+            ("block", CanonicalKind::Block),
+            ("identifier", CanonicalKind::Ref),
+            ("int_literal", CanonicalKind::Lit),
+            ("if", CanonicalKind::Op),
+        ];
+        let covered: std::collections::HashSet<CanonicalKind> =
+            probes.iter().map(|(_, k)| *k).collect();
+        assert_eq!(
+            covered.len(),
+            CanonicalKind::ALL.len(),
+            "Go map probe set must hit every CanonicalKind exactly once",
+        );
+        // And each probe must actually map to its declared kind.
+        assert_kinds_match(&GoCanonicalMap, probes);
+    }
+
+    #[test]
     fn baseline_invariants() {
         // Shared invariants — see `canonical::assert_canonical_map_baseline`.
         assert_canonical_map_baseline(&GoCanonicalMap, "go");

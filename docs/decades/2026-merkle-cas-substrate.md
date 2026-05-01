@@ -15,13 +15,18 @@
 
 ## 0. One-line claim
 
-> A content-addressed, Merkle-structured, CAS-advanced state substrate
-> Σ = (𝓥, 𝓒, ρ, σ, R, S) is *necessary* — not sufficient, *necessary* —
-> to satisfy the requirements R1–R7 enumerated below. The existing arena
-> protocol is a degenerate case of Σ (sequence-named instead of
-> hash-named); ADR-A and ADR-B are upper layers built on Σ. This decade
-> formalizes Σ, makes its claims falsifiable, and proves necessity from
-> requirements.
+> A content-addressed, vector-commitment-rooted, CAS-advanced state
+> substrate Σ = (𝓥, 𝓒, ρ, σ, R, S) is the *canonical* realization of
+> the requirements R1–R7 enumerated below — necessary in spirit
+> (the requirements force a Σ-shaped commit-point) but not in
+> implementation detail (Verkle, accumulator, and skip-list variants
+> are admissible substitutes). The existing arena protocol is a
+> degenerate case of Σ (sequence-named instead of hash-named);
+> ADR-A and ADR-B are upper layers built on Σ. This decade formalizes
+> Σ, makes its claims falsifiable, and argues canonicality from
+> requirements (per the §3 red-team in
+> `docs/decades/red-team/2026-05-01-section-3-necessity.md`, which
+> downgraded the original "necessity" claim).
 
 ---
 
@@ -101,112 +106,205 @@ a re-architecture.
 ## 2. Requirements (R1–R7)
 
 These are the load-bearing requirements for the agentic platform.
-*Necessity of Σ is proved against this set.*
+*Canonicality of Σ is argued against this set in §3.* Each requirement
+is operationalized below — no informal hand-wave; each is a property
+testable in TLA+ (Bead 1.2) and falsifiable by F1–F6 (§4).
 
-| ID | Requirement                                                                          |
-|----|---------------------------------------------------------------------------------------|
-| R1 | Concurrent writers without global lock                                                 |
-| R2 | Cross-host distribution without central authority                                      |
-| R3 | Cryptographic integrity: signed identity bound to content                              |
-| R4 | Crash consistency: atomic visibility of completed writes; partial writes invisible     |
-| R5 | Time-travel / versioning: any past state addressable                                  |
-| R6 | Registry-scale partial updates: O(log n) propagation for k-leaf changes (n total)      |
-| R7 | Composes with: workerd execution, signet identity, mache projection, rosary dispatch   |
+| ID | Requirement                                                                          | Operationalization                                                                            |
+|----|---------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------|
+| R1 | Concurrent writers without global lock                                                 | At any time t, at most one writer holds an exclusive lock; the longest such hold ≤ ε (e.g. 1 ms)  |
+| R2 | Cross-host distribution without central authority                                      | No single online entity is required for liveness; integrity is verifiable from cryptographic primitives alone |
+| R3 | Cryptographic integrity: **content** identity self-naming + actor identity exogenous   | (R3a) Content c is named by σ(c); no external NS resolves identity-of-content. (R3b) Actor identity (S's pk) is bootstrapped exogenously and is *not* required to be content-addressed. |
+| R4 | Crash consistency: atomic visibility of completed writes; partial writes invisible     | For every observed root R, ρ(R) is complete; no observer ever sees a half-committed state    |
+| R5 | Time-travel / versioning: addressability of past states **within a retention horizon** | For every R_i committed within retention horizon T (default: 100 most recent advances), ρ(R_i) remains retrievable. GC of unreachable history outside T is permitted. |
+| R6 | Registry-scale partial updates: O(log n) propagation for k = O(1) leaf changes         | For k = O(1), single-leaf updates touch at most ⌈log_b n⌉ + O(1) commitment nodes (b = fan-out). For k = O(n), bound degrades gracefully to O(k log_b(n/k)). |
+| R7 | Hash-only interface: external systems interact with Σ via (σ, ρ, R, S) only            | No external system holds Σ-mutable runtime state. Static crypto config (σ params, S params, trust roots) is shared *immutable* configuration and is permitted. |
 
 ---
 
-## 3. Necessity proof (sketch)
+## 3. Canonicality argument
 
-> Theorem. Any system meeting R1–R7 must implement Σ up to isomorphism.
+> Claim. Any system meeting R1–R7 implements Σ up to isomorphism in
+> the *vector-commitment family*. Σ as defined in §1 is the canonical
+> representative of that family; substitutes (Verkle trees, RSA
+> accumulators, authenticated skip lists) are admissible.
 
-The proof is a chain of forced moves. Each step shows that dropping the
-named substrate component invalidates at least one requirement.
+**This is a downgrade from the original "necessity" framing**, applied
+2026-05-01 after the §3 red-team
+(`docs/decades/red-team/2026-05-01-section-3-necessity.md`) found five
+counterexamples — cited inline below. The operational program (T1–T7,
+F1–F6) is unaffected by the weakening; only Bead 1.2 adjusts scope
+("canonicality search" rather than "necessity proof").
 
-### 3.1 R2 ∧ R3 ⟹ identity = content (forces σ : 𝓥 → 𝓒)
+The argument is a chain of forced moves. Each step shows that dropping
+the named substrate component invalidates at least one requirement, OR
+admits the named family of substitutes.
 
-Suppose identity ≠ content. Then some external name N maps to content C
-through a name service NS.
+### 3.1 R2 ∧ R3a ⟹ content-of-data is self-named (forces σ : 𝓥 → 𝓒)
+
+Suppose identity-of-content ≠ content. Then some external name N maps
+to content C through a name service NS.
 
 - If NS is centralized: violates R2 (no central authority).
-- If NS is distributed: NS itself requires identity binding ⟹ recurse on
-  the same problem. The recursion terminates only if the binding
-  *terminates in content-addressing* — i.e., names *are* hashes of
-  content somewhere in the chain.
+- If NS is distributed and **does not** terminate in content-addressing
+  (federated PKI, DNSSEC, Web PKI, Matrix): the *actor* identities at
+  the recursion's terminus are exogenously bootstrapped pubkeys. R3b
+  permits this. But R3a still requires that **content** be self-named
+  by σ(content), independent of who signed it. So even systems with
+  exogenous actor identity (signet, IANA, Matrix) end up content-
+  addressing the data they sign.
 
-∴ identity must equal content somewhere; the minimal such system uses
-content addressing throughout. ∎ (R2 ∧ R3 forces σ.)
+∴ R3a forces σ : 𝓥 → 𝓒 over content. R3b explicitly carves out actor
+identity as exogenous — signet's CA pubkey is not required to be a
+content hash. ∎
 
-### 3.2 R4 ⟹ immutability (IM) and atomic root (CAS)
+(*Red-team Gap 2 fix:* the original §3.1 conflated content-identity
+with actor-identity. The fix splits R3 into R3a (content) and R3b
+(actor) and applies σ-forcing only to R3a.)
 
-Atomic visibility requires that the post-write state be referenceable by
-a stable identifier *the moment* the write completes, with no
-intermediate visible state.
+### 3.2 R4 ∧ R5 ⟹ immutability (IM); R4 alone forces only atomic publish
 
-- If artifacts are mutable: a reader can observe state mid-mutation
-  (violates R4 unless mutation is atomic, which for arbitrary-size
-  artifacts is impossible without a swap primitive).
-- The minimal swap primitive is CAS on a pointer to immutable content.
+Atomic visibility (R4) requires that the post-write state be
+referenceable by a stable identifier the moment the write completes,
+with no intermediate visible state.
 
-∴ writes produce immutable artifacts; visibility is governed by CAS on a
-pointer (R). ∎
+R4 alone admits *mutable-but-atomically-published* designs: LMDB
+(superblock swap over a CoW B+tree, intermediate pages mutable
+during txn), PostgreSQL WAL+MVCC (in-place mutation under redo log),
+ZFS/Btrfs (transaction-group rotation). All satisfy R4; none satisfy
+IM in the strict sense — past page-states are reused or coalesced.
 
-### 3.3 R1 ∧ R4 ⟹ optimistic CCC via single advancement primitive
+What forces IM is **R5 — past states must remain addressable within
+the retention horizon**. If past R_i must be re-fetchable, then ρ(R_i)
+cannot be overwritten; combined with σ's collision-resistance, this
+means content-addressed blobs are write-once-keyed. The CAS publish
+mechanism is the minimal *implementation* of R4 atomicity; IM is
+contributed by R5.
 
-Concurrent writers without a global lock require a serialization point.
+∴ R5 forces IM; R4 forces atomic publish (whose lowest-overhead
+realization is single-pointer CAS, but cf. §3.3). ∎
 
-- Pessimistic locks violate R1 (some writer holds, others wait).
-- Lock-free protocols at the data-structure level (DLHT-shape) work
-  in-process but require the data-structure to be the data plane, not a
-  blob.
-- Optimistic CCC against a single CAS-advanced root pointer is the
-  minimal protocol that admits both R1 and R4: writers compute a new
-  root from the same parent and race to advance R; only one wins per
-  generation; losers rebase.
+(*Red-team Gap 3 fix:* the original §3.2 attributed IM to R4 alone.
+LMDB and WAL+MVCC are direct counterexamples. Re-attribution to
+R4 ∧ R5 makes the claim defensible.)
 
-∴ R is a single-pointer CAS primitive; advancement is optimistic. ∎
+### 3.3 R5 ∧ R6 ⟹ single-root commit point; CAS is the lowest-overhead realization
 
-### 3.4 R6 ⟹ Merkle structure
+R1 (concurrent writers without global lock) admits multiple
+linearization protocols:
 
-R6 requires that a k-leaf change propagate in O(log n) work, where n is
-total leaves.
+- **Single-pointer CAS** on a root: writers race; loser rebases. The
+  approach Σ specifies.
+- **CRDTs** (Shapiro et al. 2011): commutative merges, no
+  serialization point at all.
+- **MVCC without root pointer** (PostgreSQL, Spanner): per-row
+  visibility ranges.
+- **Replicated logs** (Raft, Multi-Paxos): leader-elected log index.
+
+What forces a *single-root commit point* is not R1 ∧ R4 (each of the
+above satisfies both) but **R5 ∧ R6 jointly**: verifiable past states
+(R5) with O(log n) authenticated diff (R6) require a single agreed
+root hash per epoch. CRDTs natively give a state but not an
+authenticated diff-root; MVCC has no global root; logs have a log
+index that is not a content hash.
+
+∴ R5 ∧ R6 force a single-root commit point. Single-pointer CAS is the
+lowest-overhead realization (no leader election, no quorum) and is what
+Σ canonicalizes. ∎
+
+(*Red-team Gap 4 fix:* the original §3.3 claimed CAS was "minimal"
+without justification. The fix attributes the single-root requirement
+to R5 ∧ R6 and downgrades CAS from "minimal" to "lowest-overhead
+realization" of an abstract single-root commit point.)
+
+### 3.4 R6 ⟹ vector-commitment-rooted structure (Merkle is the canonical case)
+
+R6 requires that k = O(1) leaf changes propagate in O(log n) work.
 
 - Flat addressing: any change re-hashes the entire blob ⟹ O(n).
-- A k-ary tree where each parent's hash = H(child hashes): change to one
-  leaf re-hashes O(log_k n) parents.
+  Insufficient.
+- **The vector-commitment family** is the set of data structures
+  C : 𝓥* → 𝓒 such that single-leaf updates are sublinear and the root
+  preserves collision-resistance. Members include:
+  - **Merkle tree**: each internal node = σ(child‖child‖…). O(log_k n) updates.
+  - **Verkle tree** (Kuszmaul 2018, Buterin 2021): vector commitment per
+    internal node (KZG or IPA). O(log_k n) updates, **O(1) proofs**.
+  - **RSA / class-group accumulators** (Camenisch-Lysyanskaya 2002,
+    Boneh-Bünz-Fisch 2019): single group element. O(1) amortized.
+  - **Authenticated skip lists** (Goodrich-Tamassia 2001): randomized
+    DAG, expected O(log n).
+  - **Sparse Merkle trees + non-membership proofs** (RFC 6962): same
+    big-O, different commitment domain.
 
-The Merkle tree is the unique structure (up to k-ary fan-out) that
-achieves O(log n) propagation while preserving (CR) at the root. ∎
+∴ Σ requires a vector-commitment family member at the root. The Merkle
+tree is the canonical representative — chosen for Σ because BLAKE3 is
+production-ready, the implementation cost is bounded, and ADR-A/B
+already assume Merkle stalks. **Substitutes are admissible**: a future
+Σ' built on Verkle would inherit Σ's correctness arguments with a
+proof-size optimization. ∎
 
-### 3.5 R5 ⟹ retention of past R_i
+(*Red-team Gap 1 fix:* the original §3.4 claimed Merkle uniqueness,
+which Verkle/accumulator/skip-list literature directly contradicts.
+The fix downgrades from "unique" to "canonical representative of the
+family."*)
 
-If past states must be addressable, then for every prior R_i the blob
-ρ(R_i) must remain retrievable.
+### 3.5 R5 ⟹ retention of past R_i within horizon T
 
-Combined with (IM), this means writes never overwrite. Storage grows
-monotonically (mod GC of unreachable history). ∎
+If past states must be addressable within retention horizon T, then for
+every prior R_i committed within T the blob ρ(R_i) must remain
+retrievable.
 
-### 3.6 R7 ⟹ no shared state across composition seams
+Combined with (IM) (§3.2), this means writes within T never overwrite.
+Storage grows linearly with retained history; GC of states outside T is
+permitted (T3.3). ∎
+
+### 3.6 R7 ⟹ hash-only mutable runtime interface; static crypto config admitted
 
 Compositionality requires that signet, workerd, mache, rosary all
-interact with Σ without coordinating internal state.
+interact with Σ without coordinating internal mutable runtime state.
 
-- σ provides the universal address.
+- σ provides the universal content address.
 - S provides the universal binding (sign the root).
 - ρ provides the universal retrieval.
 
-Each composing system holds *only* a hash and a signature. State sharing
-is through `cas(R_old, R_new)`, not through mutable handles. ∎
+Each composing system holds *only* (R_n, sig_n) at runtime. State
+sharing is through `cas(R_old, R_new)`, not through mutable handles.
+
+**Static crypto config is shared and permitted by R7's
+operationalization**: σ parameters (BLAKE3 variant, key context), S
+parameters (curve, domain separators), trust roots (signet's CA
+pubkey), and Merkle schema (fan-out, child encoding, leaf
+canonicalization) are *immutable* configuration agreed at deployment
+time. F5 (§4) tests that no *mutable runtime* state crosses
+composition seams — which is the genuine R7 invariant.
+
+∴ R7 forces hash-only mutable runtime interfaces; static crypto config
+is shared immutable bootstrap. ∎
+
+(*Red-team Gap 5 fix:* the original §3.6 said "no shared state
+across composition seams" too strongly; trust roots and σ parameters
+are necessarily shared. The fix admits static crypto config as
+immutable bootstrap distinct from mutable runtime state.)
 
 ### 3.7 Conclusion
 
-R1–R7 force every component of Σ. None can be dropped without losing a
-requirement.
+R1–R7 (operationalized per §2) force every component of Σ up to
+isomorphism in the vector-commitment family. The Merkle tree is the
+canonical realization; Verkle / accumulator / skip-list members are
+admissible substitutes that inherit Σ's correctness arguments.
 
-> ∴ Σ is **necessary**. ∎
+> ∴ Σ is **canonical**. ∎
 
-(The proof is sketch-level. Formalizing R1–R7 in a temporal logic
-[TLA+ or Apalache] and mechanizing the necessity argument is **Bead
-1.2** below.)
+The argument is sketch-level. Mechanizing it in TLA+/Apalache is
+**Bead 1.2** below — scoped to *canonicality search* (does any system
+satisfy R1–R7 outside the vector-commitment family?) rather than the
+stronger original "necessity" framing.
+
+(*The downgrade from "necessity" to "canonicality" was applied
+2026-05-01 after a math-friend red-team. The full red-team analysis is
+preserved at `docs/decades/red-team/2026-05-01-section-3-necessity.md`
+for audit. The operational program — T1–T7, F1–F6, the feature-
+completion criterion — is unchanged by the weakening.*)
 
 ---
 
@@ -222,7 +320,7 @@ protocols, each an executable test:
 | F3 | MITM gossip with crafted blob            | (CR) — content addressing prevents tampering               |
 | F4 | k-leaf edit in n-leaf tree, count hashes | R6 — O(log n) Merkle propagation                           |
 | F5 | Compose Σ with signet/workerd/rosary     | R7 — boundaries are hash-only, no per-blob coordination    |
-| F6 | Adversarial: build a system meeting R1–R7 *without* Σ | Necessity claim itself                              |
+| F6 | Adversarial: search for a vector-commitment-family member outside Σ that meets R1–R7 | Canonicality claim |
 
 **F1 — Crash consistency.** Spawn a writer that performs a snapshot;
 SIGKILL at random points during write; verify that for every observed
@@ -254,11 +352,16 @@ documents. Edit k = 1 leaf. Count hashes recomputed. Predicted:
 If any of those requires per-blob coordination beyond `(R_n, sig_n)`,
 R7 (compositionality) is falsified.
 
-**F6 — Necessity counterexample.** Adversarial: search for a system that
-satisfies R1–R7 without using content-addressed identity, immutability,
-CAS-advanced root, or Merkle structure. If found, the necessity proof
-has a gap and we revisit. (This is the formal-methods bead — likely
-TLA+/Apalache to bound the search space.)
+**F6 — Canonicality counterexample.** Adversarial: search for a system
+that satisfies R1–R7 *outside* the vector-commitment family — i.e.,
+without content-addressed identity, without immutable past states
+within retention horizon, without single-root commit point, without
+sublinear authenticated update at the root. If found, the canonicality
+argument has a gap and we revisit (or accept that R1–R7 admit a
+broader family than Σ canonicalizes). Note: a counterexample using
+Verkle, accumulator, or auth-skip-list is *not* a falsification — the
+argument explicitly admits these as substitutes (§3.4). (Formal-methods
+bead — TLA+/Apalache bounded search.)
 
 ---
 
@@ -277,7 +380,7 @@ Establishes the formal substrate as a Rust module + machine-checked proof.
 | Bead   | Title                                                              | Channel    |
 |--------|--------------------------------------------------------------------|------------|
 | 1.1    | Substrate types in Rust: `H`, `ρ`, `σ`, `R`, signing trait         | final      |
-| 1.2    | TLA+ / Apalache spec of R1–R7 + necessity argument                 | analysis   |
+| 1.2    | TLA+ / Apalache spec of R1–R7 + canonicality argument              | analysis   |
 | 1.3    | Falsification suite F1–F6 as integration tests                     | final      |
 | 1.4    | ADR amendments: link ADR-A and ADR-B as upper layers on Σ          | commentary |
 
@@ -345,7 +448,7 @@ Each protocol F1–F6 as a continuous test that can fail in CI.
 | 7.3    | F3: MITM gossip integrity test                                      | final      |
 | 7.4    | F4: O(log n) diff-complexity benchmark                              | final      |
 | 7.5    | F5: end-to-end composition test                                     | final      |
-| 7.6    | F6: TLA+ necessity counterexample search                            | analysis   |
+| 7.6    | F6: TLA+ canonicality counterexample search                         | analysis   |
 
 ### Thread ordering
 
@@ -373,7 +476,7 @@ once their dependencies land.
 Σ is *feature-complete* when:
 
 1. **All R1–R7** have at least one falsification protocol (F1–F6) passing in CI
-2. **Necessity proof (Bead 1.2)** is mechanized in TLA+/Apalache with bounded model checking finding no counterexample at depth ≥ 7 (one per requirement)
+2. **Canonicality argument (Bead 1.2)** is mechanized in TLA+/Apalache with bounded model checking finding no counterexample at depth ≥ 7 (one per requirement) outside the vector-commitment family (Verkle / accumulator / auth-skip-list members are admitted as Σ-isomorphic, not counterexamples)
 3. **All composition seams (T5)** are exercised by a single integration test that touches signet, workerd, rosary, mache simultaneously
 4. **The arena migration (T2)** is shipped: `current_root` is the canonical advancement primitive; `generation` is removed
 5. **F2 throughput** at N=10 concurrent writers exceeds serial by ≥ 4× (validates R1 isn't lock-hidden)

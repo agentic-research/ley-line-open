@@ -562,7 +562,16 @@ pub fn snapshot_to_arena(
             min_arena / (1024 * 1024),
             db_bytes.len() / (1024 * 1024),
         );
-        let _ = ctrl.set_arena(&arena_path, min_arena, ctrl.generation());
+        // Best-effort early size update — the definitive set_arena
+        // below uses `?`, so a failure here gets retried with the new
+        // generation. Log debug-level so the failure is visible if
+        // operators are debugging "why is the arena re-sizing every
+        // snapshot" without spamming on every transient.
+        if let Err(e) = ctrl.set_arena(&arena_path, min_arena, ctrl.generation()) {
+            log::debug!(
+                "arena early-resize set_arena failed (will retry below): {e:#}",
+            );
+        }
         min_arena
     } else {
         arena_size

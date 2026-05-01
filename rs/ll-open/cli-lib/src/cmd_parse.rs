@@ -269,6 +269,22 @@ pub fn parse_into_conn(
     let mut deleted = 0u64;
     let current_rels: HashSet<&str> = to_parse.iter().map(|(r, _, _, _, _)| r.as_str()).collect();
 
+    // Build the rel-path set ONCE for the deletion sweep below. Without
+    // this, the inner check did `files.iter().any(|f| strip_prefix +
+    // to_string_lossy + cmp)` per old_path — at registry-repo scale
+    // (50k old × 50k files) that's billions of string comparisons. The
+    // HashSet of relative paths makes the lookup O(1) at the cost of
+    // one rel-string per file (already paid by `current_rels`).
+    let all_file_rels: HashSet<String> = files
+        .iter()
+        .map(|f| {
+            f.strip_prefix(source)
+                .unwrap_or(f)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+
     // For a full-tree pass, every path in old_index that isn't in `files` is
     // a deletion candidate. For a scoped pass, only paths in scope can be
     // deleted — paths outside scope are simply not visible to this pass.
@@ -281,13 +297,13 @@ pub fn parse_into_conn(
         {
             continue;
         }
+        // Two ways an old_path can survive deletion:
+        //   1. It's being reparsed this run (in current_rels), OR
+        //   2. It exists on disk but was filtered out (in all_file_rels
+        //      but not in current_rels — e.g. extension lost a tree-
+        //      sitter mapping or --lang filter excluded it).
         if !current_rels.contains(old_path.as_str())
-            && !files.iter().any(|f| {
-                f.strip_prefix(source)
-                    .unwrap_or(f)
-                    .to_string_lossy()
-                    == *old_path
-            })
+            && !all_file_rels.contains(old_path.as_str())
         {
             delete_file_rows(conn, old_path)?;
             deleted += 1;

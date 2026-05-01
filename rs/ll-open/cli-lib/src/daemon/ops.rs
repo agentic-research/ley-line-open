@@ -491,9 +491,27 @@ fn op_snapshot(ctx: &DaemonContext) -> Result<String> {
 // Query ops (use living db directly)
 // ---------------------------------------------------------------------------
 
+/// Default row cap for the ad-hoc `op_query` escape hatch. Without a
+/// cap, an accidental `SELECT * FROM nodes` on a registry-repo db
+/// (629k+ rows) would load every row into memory and serialize a
+/// hundreds-of-MB JSON response, locking the daemon and the client.
+/// Callers that legitimately need more rows pass `limit` explicitly
+/// (with the understanding that they're opting into the cost).
+pub(crate) const OP_QUERY_DEFAULT_ROW_LIMIT: usize = 1000;
+
 /// Raw SQL query — for ad-hoc inspection.
+///
+/// Caps row output at `req["limit"]` (or `OP_QUERY_DEFAULT_ROW_LIMIT` if
+/// not provided). Sets `truncated: true` in the response when the cap is
+/// hit, so callers can paginate via `LIMIT/OFFSET` in the SQL itself if
+/// they need everything.
 fn op_query(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
     let sql = required_str_field(req, "sql")?;
+    let limit = req
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(OP_QUERY_DEFAULT_ROW_LIMIT);
 
     with_live_db(ctx, |conn| {
         let mut stmt = conn.prepare(sql).context("prepare SQL")?;
@@ -504,7 +522,15 @@ fn op_query(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
 
         let mut rows_out: Vec<serde_json::Value> = Vec::new();
         let mut rows = stmt.query([]).context("execute SQL")?;
+        let mut truncated = false;
         while let Some(row) = rows.next()? {
+            if rows_out.len() >= limit {
+                // Stop iterating: SQLite has more rows but the caller
+                // capped the response. Mark as truncated so clients can
+                // paginate with an explicit LIMIT/OFFSET in their SQL.
+                truncated = true;
+                break;
+            }
             let mut obj = serde_json::Map::new();
             for (i, col) in headers.iter().enumerate() {
                 let val: String = row.get::<_, String>(i).unwrap_or_default();
@@ -513,7 +539,15 @@ fn op_query(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
             rows_out.push(serde_json::Value::Object(obj));
         }
 
-        Ok(json!({"ok": true, "columns": headers, "rows": rows_out}).to_string())
+        let mut response = serde_json::Map::new();
+        response.insert("ok".into(), json!(true));
+        response.insert("columns".into(), json!(headers));
+        response.insert("rows".into(), json!(rows_out));
+        if truncated {
+            response.insert("truncated".into(), json!(true));
+            response.insert("limit".into(), json!(limit));
+        }
+        Ok(serde_json::Value::Object(response).to_string())
     })
 }
 
@@ -1322,6 +1356,111 @@ mod tests {
             "query",
             json!({"sql": "SELECT garbage FROM nowhere WHERE x SYNTAX_ERROR"}),
             "invalid sql",
+        );
+    }
+
+    #[tokio::test]
+    async fn op_query_caps_rows_at_default_limit() {
+        // Scale-guard pin: op_query's default row cap protects clients
+        // from accidental `SELECT * FROM nodes` on a 629k-row registry
+        // db (which would serialize hundreds of MB into one JSON
+        // response and lock the daemon while doing it).
+        //
+        // Insert a probe table with > OP_QUERY_DEFAULT_ROW_LIMIT rows;
+        // run an unbounded SELECT * via op_query; assert:
+        //   - rows length == default cap
+        //   - truncated: true is set
+        //   - limit field reports the cap that was applied
+        let (_dir, ctx) = setup();
+        {
+            let conn = ctx.live_db.lock().unwrap();
+            conn.execute(
+                "CREATE TABLE probe (id INTEGER PRIMARY KEY, payload TEXT)",
+                [],
+            )
+            .unwrap();
+            // Use a single batched insert via VALUES for speed.
+            let n = OP_QUERY_DEFAULT_ROW_LIMIT + 50;
+            let mut sql = String::from("INSERT INTO probe (id, payload) VALUES ");
+            for i in 0..n {
+                if i > 0 {
+                    sql.push(',');
+                }
+                sql.push_str(&format!("({i}, 'p{i}')"));
+            }
+            conn.execute(&sql, []).unwrap();
+        }
+
+        let result = handle_base_op(&ctx, "query", &json!({"sql": "SELECT id FROM probe"}))
+            .expect("op_query must dispatch");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["ok"], true);
+        let rows = parsed["rows"].as_array().expect("rows must be an array");
+        assert_eq!(
+            rows.len(),
+            OP_QUERY_DEFAULT_ROW_LIMIT,
+            "default row cap must apply when caller omits `limit`",
+        );
+        assert_eq!(parsed["truncated"], true, "truncated flag must be set");
+        assert_eq!(
+            parsed["limit"], OP_QUERY_DEFAULT_ROW_LIMIT as u64,
+            "response must report the cap that was applied",
+        );
+    }
+
+    #[tokio::test]
+    async fn op_query_respects_explicit_limit() {
+        // Sister to the default-cap pin: caller-supplied `limit`
+        // overrides the default. Pinning both halves so a refactor
+        // that hardcoded the limit (or accidentally swapped the
+        // unwrap_or fallback) surfaces here.
+        let (_dir, ctx) = setup();
+        {
+            let conn = ctx.live_db.lock().unwrap();
+            conn.execute("CREATE TABLE p (i INTEGER)", []).unwrap();
+            for i in 0..50 {
+                conn.execute("INSERT INTO p VALUES (?1)", [i]).unwrap();
+            }
+        }
+
+        let result = handle_base_op(
+            &ctx,
+            "query",
+            &json!({"sql": "SELECT i FROM p", "limit": 10}),
+        )
+        .expect("op_query must dispatch");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["rows"].as_array().unwrap().len(), 10);
+        assert_eq!(parsed["truncated"], true);
+        assert_eq!(parsed["limit"], 10);
+    }
+
+    #[tokio::test]
+    async fn op_query_omits_truncated_when_under_limit() {
+        // A query that returns fewer rows than the cap MUST NOT carry
+        // the truncated flag — clients use the *presence* of the key
+        // to decide whether to paginate. Set-when-not-needed would
+        // cause unnecessary follow-up queries.
+        let (_dir, ctx) = setup();
+        {
+            let conn = ctx.live_db.lock().unwrap();
+            conn.execute("CREATE TABLE small (i INTEGER)", []).unwrap();
+            for i in 0..5 {
+                conn.execute("INSERT INTO small VALUES (?1)", [i]).unwrap();
+            }
+        }
+
+        let result = handle_base_op(&ctx, "query", &json!({"sql": "SELECT i FROM small"}))
+            .expect("op_query must dispatch");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["rows"].as_array().unwrap().len(), 5);
+        assert!(
+            parsed.get("truncated").is_none(),
+            "under-limit response must omit `truncated` field, got {parsed}",
+        );
+        assert!(
+            parsed.get("limit").is_none(),
+            "under-limit response must omit `limit` field, got {parsed}",
         );
     }
 

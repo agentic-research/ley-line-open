@@ -56,10 +56,11 @@ CREATE TABLE IF NOT EXISTS nodes (
     source_file TEXT         -- optional: originating source file (mache file tracking)
 );
 CREATE INDEX IF NOT EXISTS idx_parent_name ON nodes(parent_id, name);
-CREATE INDEX IF NOT EXISTS idx_source_file ON nodes(source_file);
+CREATE INDEX IF NOT EXISTS idx_source_file ON nodes(source_file)
+    WHERE source_file IS NOT NULL;
 ```
 
-Defined once in `leyline-schema`. Used by [mache](https://github.com/agentic-research/mache) and ley-line. The `record_id` and `source_file` columns are nullable — ley-line crates leave them NULL; mache populates them for lazy content resolution and incremental re-ingestion.
+Defined once in `leyline-schema`. Used by [mache](https://github.com/agentic-research/mache) and ley-line. The `record_id` and `source_file` columns are nullable — ley-line crates leave them NULL; mache populates them for lazy content resolution and incremental re-ingestion. `idx_source_file` is partial so registry-repo dbs (where every row has `source_file IS NULL`) carry an empty index that costs nothing.
 
 ## License
 

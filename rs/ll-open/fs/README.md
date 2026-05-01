@@ -14,5 +14,7 @@ Filesystem presentation — mounts the arena as NFS or FUSE.
 
 ## Feature flags
 
+- `validate` (default), `fuse` (default), `nfs` (default) — see `Cargo.toml` for dependency mapping.
 - `splice` — FUSE write-back triggers `splice_and_reproject` for AST-tracked nodes.
-- `vec` — optional `VectorIndex` sidecar for nearest-neighbor search over node embeddings.
+
+The `VectorIndex` sidecar previously lived here under a `vec` feature; it's now part of `leyline-cli-lib`'s daemon module so vectors live next to the `EmbeddingPass` framework that produces them.

@@ -8,16 +8,17 @@ Tree-sitter AST projection and bidirectional splice.
 - **Splice** — edit an AST node's text content → patch the original source at the tracked byte range → re-parse → atomically update all tables. Batch splice handles multiple edits with byte-range overlap detection.
 - **Reproject** — after splice, re-parse the patched source and replace the old AST. Syntax errors are attributed to the responsible node.
 - **Languages** — feature-gated grammars:
-  - `html` — tree-sitter-html
-  - `markdown` — tree-sitter-md
-  - `json` — tree-sitter-json
-  - `yaml` — tree-sitter-yaml
+  - `html` — tree-sitter-html *(default)*
+  - `markdown` — tree-sitter-md *(default)*
+  - `json` — tree-sitter-json *(default)*
+  - `yaml` — tree-sitter-yaml *(default)*
   - `go` — tree-sitter-go
   - `python` — tree-sitter-python
+  - `elixir` — tree-sitter-elixir
 
 ## Feature flags
 
-- `html`, `markdown`, `json`, `yaml`, `go`, `python` — enable the corresponding tree-sitter grammar.
+- `html`, `markdown`, `json`, `yaml`, `go`, `python`, `elixir` — enable the corresponding tree-sitter grammar.
 - `pyproject` — parse `pyproject.toml` using uv crates (PEP 508 dependency specifiers, PEP 440 versions, package normalization). Projects `/project/*`, `/deps/*`, `/{group}/*`, `/optional/{extra}/*`.
 
 ## Standalone crate

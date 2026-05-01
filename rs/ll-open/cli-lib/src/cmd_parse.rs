@@ -301,6 +301,23 @@ pub fn parse_into_conn(
 
     // ---- Parallel parse (CPU-bound tree-sitter on all cores) ----
 
+    // DX: surface a progress line BEFORE the silent rayon parse.
+    // At registry-repo scale (50k files) the parallel parse runs
+    // ~30s, with no output until the final summary. A user invoking
+    // `leyline parse ./helm-charts` would otherwise see silence and
+    // wonder if it's hung. This line tells them the work is real
+    // and bounded; the final summary still reports timing + counts.
+    // Suppress at low scale where the silent path is fine.
+    const PARSE_PROGRESS_THRESHOLD: usize = 200;
+    if to_parse.len() >= PARSE_PROGRESS_THRESHOLD {
+        eprintln!(
+            "parsing {} files (skipped {unchanged} unchanged{}{})",
+            to_parse.len(),
+            if oversized > 0 { format!(", {oversized} oversized") } else { String::new() },
+            if deleted > 0 { format!(", {deleted} deleted") } else { String::new() },
+        );
+    }
+
     let parse_start = std::time::Instant::now();
 
     let parsed_files: Vec<Result<ParsedFile>> = to_parse

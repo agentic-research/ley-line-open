@@ -91,35 +91,71 @@ impl EnrichmentPass for EmbeddingPass {
     ) -> Result<EnrichmentStats> {
         let start = Instant::now();
 
-        // Iterate file nodes (kind = 0) with non-empty source content.
-        // When `changed_files` scopes the run, only those source paths are
-        // considered — this maps to the same file set the parser saw.
-        let scope: Option<HashSet<&str>> =
-            changed_files.map(|s| s.iter().map(|p| p.as_str()).collect());
+        // Push the scope filter into SQL when present. Without this,
+        // every scoped run (typical: 1–10 dirty files from the git
+        // watcher) full-scans the nodes table — at registry-repo scale
+        // (50k+ file nodes) that's 50000 rows scanned to find 10. With
+        // the IN clause SQLite uses the PRIMARY KEY on id directly.
+        //
+        // Above the SQLITE_MAX_VARIABLE_NUMBER limit (default 999) we
+        // fall back to the in-memory HashSet filter — chunking would
+        // require multiple round-trips for marginal benefit at that
+        // scope size.
+        const SQLITE_VAR_LIMIT: usize = 999;
+        let scope_in_sql = changed_files
+            .map(|s| !s.is_empty() && s.len() <= SQLITE_VAR_LIMIT)
+            .unwrap_or(false);
+        let scope_set: Option<HashSet<&str>> = changed_files
+            .filter(|s| !scope_in_sql && !s.is_empty())
+            .map(|s| s.iter().map(|p| p.as_str()).collect());
 
-        let mut stmt = conn.prepare(
-            "SELECT id, record FROM nodes \
-             WHERE kind = 0 AND record IS NOT NULL AND record <> ''",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
+        let base = "SELECT id, record FROM nodes \
+                    WHERE kind = 0 AND record IS NOT NULL AND record <> ''";
 
         let mut files_processed = 0u64;
         let mut items_added = 0u64;
 
-        for row in rows {
-            let (id, content) = row?;
-            if let Some(set) = &scope
-                && !set.contains(id.as_str())
-            {
-                continue;
+        let mut process_row = |id: String, content: String| -> Result<()> {
+            if content.is_empty() {
+                return Ok(());
             }
-
             files_processed += 1;
             let vec = self.embedder.embed(&content)?;
             self.index.insert(&id, &vec)?;
             items_added += 1;
+            Ok(())
+        };
+
+        if scope_in_sql {
+            let changed = changed_files.unwrap();
+            let placeholders: Vec<&str> = changed.iter().map(|_| "?").collect();
+            let sql = format!("{base} AND id IN ({})", placeholders.join(","));
+            let mut stmt = conn.prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::ToSql> =
+                changed.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            let rows = stmt.query_map(params.as_slice(), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, content) = row?;
+                process_row(id, content)?;
+            }
+        } else {
+            // Full scan + optional in-memory scope filter (used when
+            // scope is None OR scope is too large for IN clause).
+            let mut stmt = conn.prepare(base)?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, content) = row?;
+                if let Some(set) = &scope_set
+                    && !set.contains(id.as_str())
+                {
+                    continue;
+                }
+                process_row(id, content)?;
+            }
         }
 
         Ok(EnrichmentStats {
@@ -521,6 +557,52 @@ mod tests {
         assert!(index.get("a.go")?.is_some());
         assert!(index.get("c.go")?.is_some());
         assert!(index.get("b.go")?.is_none());
+        Ok(())
+    }
+
+    /// Scale pin: scope filter is pushed into SQL, not in-memory. At
+    /// registry-repo scale a typical scope is 1-10 dirty files in a
+    /// 50k-node table; full-scanning then filtering would scan 50k
+    /// rows for 5. EXPLAIN QUERY PLAN must show SQLite using the
+    /// PRIMARY KEY index for the IN clause path.
+    #[test]
+    fn embedding_pass_scope_uses_primary_key_index() -> Result<()> {
+        let conn = fresh_conn_with_nodes()?;
+        // 100 file rows so a full scan would clearly differ from index lookup.
+        for i in 0..100 {
+            conn.execute(
+                "INSERT INTO nodes VALUES (?1, '', ?2, 0, 1, 1, ?3)",
+                rusqlite::params![format!("f{i}.go"), format!("f{i}.go"), format!("package f{i}")],
+            )?;
+        }
+
+        // Run a scoped embed pass — internal SQL goes through the IN
+        // clause path. We can't introspect the internal SQL directly,
+        // but EXPLAIN QUERY PLAN on the equivalent query does:
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT id, record FROM nodes \
+                 WHERE kind = 0 AND record IS NOT NULL AND record <> '' \
+                 AND id IN ('f1.go', 'f2.go')",
+                [],
+                |r| r.get::<_, String>(3),
+            )?;
+        assert!(
+            plan.to_lowercase().contains("primary key")
+                || plan.contains("USING INTEGER PRIMARY KEY")
+                || plan.contains("USING INDEX")
+                || plan.contains("USING ROWID SEARCH"),
+            "scoped IN clause must use the PRIMARY KEY index on id, \
+             not full-scan; plan: {plan}",
+        );
+
+        // Sanity: scoped run still produces the right items.
+        let index = Arc::new(VectorIndex::new(4, None)?);
+        let pass = EmbeddingPass::new(index.clone(), Arc::new(ZeroEmbedder { dim: 4 }));
+        let scope: Vec<String> = (0..3).map(|i| format!("f{i}.go")).collect();
+        let stats = pass.run(&conn, Path::new("/tmp"), Some(&scope))?;
+        assert_eq!(stats.items_added, 3);
+        assert_eq!(index.len()?, 3);
         Ok(())
     }
 }

@@ -10,7 +10,16 @@
 //!   [8..16]    Generation: u64 (atomic)
 //!   [16..272]  ArenaPath: [u8; 256] (null-terminated)
 //!   [272..280] ArenaSize: u64
-//!   [280..4096] Padding
+//!   [280..320] Interrupt fields (feature = "interrupt"; reserved otherwise)
+//!   [320..352] CurrentRoot: [u8; 32]  — Σ root pointer (T2.1, ley-line-open-baa90a)
+//!   [352..4096] Padding
+//!
+//! T2.1 NOTE: `CurrentRoot` is additive. Reader logic still keys on
+//! `generation` for the current cutover (T2.2/T2.3 wire it into the
+//! verify-on-read path; T2.4 deprecates `generation` once verification
+//! is the canonical advancement signal). On existing control files
+//! the bytes at [320..352] are zero (sentinel `Hash::ZERO`), which
+//! callers interpret as "no current root yet".
 
 use std::fs::OpenOptions;
 use std::path::Path;
@@ -47,6 +56,13 @@ const OFF_INTERRUPT_ACK: usize = 296;
 const OFF_PAYLOAD_OFFSET: usize = 304;
 #[cfg(feature = "interrupt")]
 const OFF_PAYLOAD_LEN: usize = 312;
+
+/// CurrentRoot: 32-byte content address of the current arena root (Σ).
+/// T2.1 (ley-line-open-baa90a) — additive; existing readers ignore this
+/// region and key on `generation`. T2.2 (`ley-line-open-babf6a`) wires
+/// the writer side; T2.3 (`ley-line-open-bad8f1`) wires verify-on-read.
+const OFF_CURRENT_ROOT: usize = 320;
+const CURRENT_ROOT_LEN: usize = 32;
 
 /// Controller manages a memory-mapped control file.
 pub struct Controller {
@@ -111,6 +127,43 @@ impl Controller {
                 .try_into()
                 .unwrap(),
         )
+    }
+
+    /// Read the current arena root (Σ root pointer).
+    ///
+    /// Returns `[0u8; 32]` — equivalent to [`crate::substrate::Hash::ZERO`] —
+    /// when no root has been written yet (fresh control file or
+    /// pre-T2.1 control file). Callers MUST treat the zero hash as
+    /// the "no current root" sentinel and not as a valid root address.
+    ///
+    /// This read is a non-atomic byte copy. Atomicity of the
+    /// (`generation`, `current_root`) pair across writes is provided
+    /// by [`Self::set_arena`]'s ordering: writers update
+    /// `current_root` *before* the Release-store of `generation`.
+    /// Readers issuing `generation()` first then `current_root()` see
+    /// a consistent pair via the Acquire load of `generation`.
+    pub fn current_root(&self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&self.mmap[OFF_CURRENT_ROOT..OFF_CURRENT_ROOT + CURRENT_ROOT_LEN]);
+        out
+    }
+
+    /// Set the current arena root.
+    ///
+    /// **T2.1 additive — do not call from the snapshot critical path
+    /// in production yet.** T2.2 (`ley-line-open-babf6a`) integrates
+    /// this with `set_arena` so the root and the generation cutover
+    /// happen under the same Release-ordering. Until then, this method
+    /// is a non-atomic byte write available for tests and the early
+    /// migration path.
+    ///
+    /// To clear the root (downgrade to the "no current root" sentinel),
+    /// pass `[0u8; 32]`.
+    pub fn set_current_root(&mut self, root: [u8; 32]) -> Result<()> {
+        self.mmap[OFF_CURRENT_ROOT..OFF_CURRENT_ROOT + CURRENT_ROOT_LEN]
+            .copy_from_slice(&root);
+        self.mmap.flush().context("flush control block")?;
+        Ok(())
     }
 
     /// Atomically update the control block to point to a new arena.
@@ -294,6 +347,108 @@ mod tests {
         // test-run; clippy (rightly) flags runtime asserts on
         // compile-time-constant expressions.
         const _: () = assert!(OFF_ARENA_SIZE + 8 <= CONTROL_SIZE);
+    }
+
+    #[test]
+    fn current_root_layout_pin() {
+        // Σ root pointer lives at OFF_CURRENT_ROOT = 320, occupies 32
+        // bytes. T2.1 (ley-line-open-baa90a) places it after the
+        // interrupt block (which reserves 280..320 even when the
+        // feature is off — those bytes are unused but the offset is
+        // disk-format reserved).
+        //
+        // A future field that mis-overlaps OFF_CURRENT_ROOT would
+        // silently corrupt every .ctrl's root on first write. Pin the
+        // value AND the relation to the interrupt block AND the bound
+        // against CONTROL_SIZE.
+        assert_eq!(OFF_CURRENT_ROOT, 320, "current_root at offset 320");
+        assert_eq!(CURRENT_ROOT_LEN, 32, "current_root is 32 bytes (BLAKE3)");
+        const _: () =
+            assert!(OFF_CURRENT_ROOT + CURRENT_ROOT_LEN <= CONTROL_SIZE);
+        // Reserved gap [280..320] for interrupt fields, regardless of
+        // feature. current_root must not collide. Const assert at
+        // compile-time so a refactor that moved OFF_CURRENT_ROOT below
+        // the interrupt block would fail to build.
+        const _: () = assert!(OFF_CURRENT_ROOT >= 320);
+    }
+
+    #[test]
+    fn fresh_control_has_zero_current_root() {
+        // T2.1 contract: a freshly opened control file has
+        // current_root = [0; 32], the "no current root yet" sentinel.
+        // Every reader treats Hash::ZERO as "fall back to non-root
+        // path" — a refactor that initialized current_root to garbage
+        // would silently advertise a valid-looking root that no blob
+        // store has.
+        let dir = tempdir().unwrap();
+        let ctrl_path = dir.path().join("fresh.ctrl");
+        let ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+        assert_eq!(
+            ctrl.current_root(),
+            [0u8; 32],
+            "fresh control file must have zero current_root (sentinel)",
+        );
+    }
+
+    #[test]
+    fn current_root_round_trips_through_set() {
+        // T2.1 reader/writer pairing: set + get produces the same
+        // bytes. Pin both directions so a refactor that introduced
+        // byte-order swapping or accidental truncation would surface
+        // here.
+        let dir = tempdir().unwrap();
+        let ctrl_path = dir.path().join("rt.ctrl");
+        let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+
+        let root: [u8; 32] = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+            0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+            0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
+        ];
+        ctrl.set_current_root(root).unwrap();
+        assert_eq!(ctrl.current_root(), root);
+    }
+
+    #[test]
+    fn current_root_persists_across_reopen() {
+        // T2.1: current_root is stored in mmap and survives Controller
+        // re-open (which is how a fresh process picks up the previous
+        // state). Pin so a refactor that kept current_root in an
+        // in-memory cache only would surface here.
+        let dir = tempdir().unwrap();
+        let ctrl_path = dir.path().join("persist.ctrl");
+        let root: [u8; 32] = [0xab; 32];
+        {
+            let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+            ctrl.set_current_root(root).unwrap();
+            // Drop ctrl, mmap unmaps + flushes
+        }
+        let ctrl2 = Controller::open_or_create(&ctrl_path).unwrap();
+        assert_eq!(
+            ctrl2.current_root(),
+            root,
+            "current_root must persist across Controller re-open",
+        );
+    }
+
+    #[test]
+    fn current_root_does_not_collide_with_existing_fields() {
+        // Drift guard: writing current_root must not corrupt any other
+        // field. Set arena + generation, then set current_root, then
+        // verify all earlier fields still read correctly.
+        let dir = tempdir().unwrap();
+        let ctrl_path = dir.path().join("nocollide.ctrl");
+        let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+
+        ctrl.set_arena("/some/arena/path", 1024 * 1024, 42).unwrap();
+        let root: [u8; 32] = [0x55; 32];
+        ctrl.set_current_root(root).unwrap();
+
+        assert_eq!(ctrl.arena_path(), "/some/arena/path");
+        assert_eq!(ctrl.arena_size(), 1024 * 1024);
+        assert_eq!(ctrl.generation(), 42);
+        assert_eq!(ctrl.current_root(), root);
     }
 
     #[test]

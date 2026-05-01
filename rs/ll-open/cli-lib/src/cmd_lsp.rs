@@ -52,6 +52,23 @@ pub async fn cmd_lsp(
         }
     };
 
+    // Scale guard: refuse oversized files before reading. cmd_lsp is a
+    // one-shot CLI tool but it reads the full source into memory and
+    // ships it to the LSP server, which then parses it. A 100MB+ file
+    // would OOM both ends. Reuse cmd_parse's MAX_PARSE_FILE_SIZE so the
+    // CLI and daemon enrichment paths share a single ceiling.
+    let file_size = std::fs::metadata(&input)
+        .with_context(|| format!("stat {}", input.display()))?
+        .len();
+    if file_size as i64 > crate::cmd_parse::MAX_PARSE_FILE_SIZE {
+        anyhow::bail!(
+            "file too large for LSP enrichment: {} is {} bytes (cap: {} bytes)",
+            input.display(),
+            file_size,
+            crate::cmd_parse::MAX_PARSE_FILE_SIZE,
+        );
+    }
+
     let source_text =
         std::fs::read_to_string(&input).with_context(|| format!("read {}", input.display()))?;
 
@@ -208,5 +225,47 @@ mod tests {
                  to the corresponding LspLanguage entry in lsp/languages.rs",
             );
         }
+    }
+
+    /// Scale-guard pin for cmd_lsp. The MAX_PARSE_FILE_SIZE check must
+    /// fire BEFORE the LSP server is spawned — otherwise a 100MB+ file
+    /// would OOM both the daemon and the spawned language-server child
+    /// process. By using a non-existent server in the test, we know
+    /// the bail came from the size check (server spawn happens later
+    /// and would also error with a different message). A regression
+    /// that moved the guard after server spawn would surface here as
+    /// a different error ("start LSP server: nonexistent_server_xyz").
+    #[tokio::test]
+    async fn cmd_lsp_rejects_oversize_file_before_server_spawn() {
+        use std::io::Write;
+
+        let td = tempfile::TempDir::new().unwrap();
+        let big = td.path().join("big.go");
+
+        // Write MAX_PARSE_FILE_SIZE + 1 bytes of valid Go padding.
+        let mut f = std::fs::File::create(&big).unwrap();
+        f.write_all(b"package m\n").unwrap();
+        let pad_len = (crate::cmd_parse::MAX_PARSE_FILE_SIZE as usize + 1) - b"package m\n".len();
+        let pad = vec![b'\n'; pad_len];
+        f.write_all(&pad).unwrap();
+        drop(f);
+
+        let out = td.path().join("out.db");
+        let result = super::cmd_lsp(
+            "definitely_not_a_real_lsp_server_zzz",
+            &[],
+            &big,
+            &out,
+            None,
+            None,
+        )
+        .await;
+
+        let err = result.expect_err("oversize file must produce Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("file too large"),
+            "size-guard error must surface BEFORE server spawn; got {msg}",
+        );
     }
 }

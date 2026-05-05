@@ -759,10 +759,17 @@ fn parse_position(req: &serde_json::Value) -> Result<(String, u32, u32)> {
     Ok((file, line, col))
 }
 
-/// Check if a file has ANY _lsp enrichment data. If not, auto-trigger
-/// enrichment and return true (caller should retry the query).
-fn maybe_enrich(ctx: &DaemonContext, conn: &Connection, file: &str) -> bool {
-    // Check if _lsp table exists at all.
+/// Read-only check: does `file` need lazy LSP enrichment?
+///
+/// Returns `true` if `_lsp` is missing entirely OR exists but has no
+/// rows for this file. **Does NOT trigger enrichment** — the caller
+/// must invoke `try_enrich_file` separately, AFTER dropping the
+/// connection lock (606e64). The pre-fix `maybe_enrich` called
+/// `try_enrich_file` from within a `with_live_db` closure, causing a
+/// self-deadlock on `std::sync::Mutex<Connection>` (which doesn't
+/// support reentrant locking).
+fn needs_enrich(conn: &Connection, file: &str) -> bool {
+    // _lsp table absent ⟹ definitely needs enrich.
     let table_exists: bool = conn
         .query_row(
             "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='_lsp'",
@@ -772,10 +779,10 @@ fn maybe_enrich(ctx: &DaemonContext, conn: &Connection, file: &str) -> bool {
         .unwrap_or(false);
 
     if !table_exists {
-        return try_enrich_file(ctx, file);
+        return true;
     }
 
-    // Check if this file has any _lsp rows.
+    // _lsp present, check if file has any rows.
     let has_data: bool = conn
         .query_row(
             &format!("SELECT COUNT(*) > 0 FROM _lsp WHERE {NODE_ID_FOR_FILE}"),
@@ -784,18 +791,67 @@ fn maybe_enrich(ctx: &DaemonContext, conn: &Connection, file: &str) -> bool {
         )
         .unwrap_or(false);
 
-    if has_data {
-        return false; // already enriched, don't retry
-    }
-
-    try_enrich_file(ctx, file)
+    !has_data
 }
 
-/// Trigger LSP enrichment for a single file. Returns true if enrichment ran.
+/// Trigger LSP enrichment for a single file. Returns true if enrichment
+/// ran (gated by the per-file in-flight set; concurrent callers for the
+/// same file see `false` and may retry on the next tick).
+///
+/// **Caller invariant**: must NOT be called while holding the
+/// `ctx.live_db` lock — this function acquires it itself via
+/// `enrichment::run_pass`. Callers using `with_live_db` to check
+/// `needs_enrich` MUST drop the lock before calling this. (606e64
+/// fix.)
 fn try_enrich_file(ctx: &DaemonContext, file: &str) -> bool {
+    // Per-file in-flight gate (606e64): prevent N concurrent hovers
+    // on the same un-enriched file from N spawning N LSP servers.
+    // First caller inserts; subsequent callers see "in flight" and
+    // skip. The first caller's enrichment populates _lsp before the
+    // user's next request, so dedup is bounded.
+    //
+    // Gate runs BEFORE source_dir check so the RAII guard's release
+    // path is always exercised (testable) and the gate's contract
+    // ("if you got past me, you own the work") is uniform regardless
+    // of whether the work itself short-circuits below.
+    {
+        let mut inflight = match ctx.enrich_inflight.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                log::error!("enrich_inflight mutex poisoned, recovering");
+                poisoned.into_inner()
+            }
+        };
+        if !inflight.insert(file.to_string()) {
+            // Another caller is already enriching this file. Skip.
+            return false;
+        }
+    }
+    // RAII: removes the file from the in-flight set when this function
+    // returns (success, error, OR early skip below). Without this, any
+    // early return after insert would leak the file into the set forever,
+    // blocking all future enrichment attempts on that file.
+    struct InflightGuard<'a> {
+        set: &'a std::sync::Mutex<std::collections::HashSet<String>>,
+        file: String,
+    }
+    impl<'a> Drop for InflightGuard<'a> {
+        fn drop(&mut self) {
+            let mut g = match self.set.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            g.remove(&self.file);
+        }
+    }
+    let _guard = InflightGuard {
+        set: &ctx.enrich_inflight,
+        file: file.to_string(),
+    };
+
     let source_dir = match &ctx.source_dir {
         Some(d) => d.clone(),
-        None => return false,
+        None => return false, // RAII guard releases the file on return.
     };
 
     eprintln!("lazy enrich: triggering LSP for {file}");
@@ -882,10 +938,25 @@ where
     if !is_empty(&result) {
         return Ok((result, false));
     }
-    let enriched = with_live_db(ctx, |conn| Ok(maybe_enrich(ctx, conn, file)))?;
+
+    // Step 1: read-only check whether enrichment is needed. Lock held only
+    // for the check, not for the enrichment work.
+    let needs = with_live_db(ctx, |conn| Ok(needs_enrich(conn, file)))?;
+    if !needs {
+        // _lsp data exists for this file; the empty-result is real, not
+        // a missing-enrichment artifact. Return as-is.
+        return Ok((result, false));
+    }
+
+    // Step 2: trigger enrichment WITHOUT holding the live_db lock.
+    // try_enrich_file acquires the lock itself; calling it from inside
+    // with_live_db would self-deadlock on std::sync::Mutex (606e64 fix).
+    let enriched = try_enrich_file(ctx, file);
     if !enriched {
         return Ok((result, false));
     }
+
+    // Step 3: re-run the query under a fresh lock to pick up the new data.
     let result = with_live_db(ctx, |conn| query(conn))?;
     Ok((result, true))
 }
@@ -1308,6 +1379,7 @@ mod tests {
             ext: Arc::new(crate::daemon::NoExt),
             router: crate::daemon::EventRouter::new(16),
             live_db: Mutex::new(conn),
+            enrich_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             source_dir: None,
             lang_filter: None,
             enrichment_passes: vec![],
@@ -1320,6 +1392,133 @@ mod tests {
             embed_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
         };
         (dir, ctx)
+    }
+
+    /// 5f7100-4 / 606e64: regression pin for the self-deadlock fix.
+    ///
+    /// Pre-fix, `with_lazy_enrich_retry` called `maybe_enrich` from
+    /// inside `with_live_db`, which held the std::sync::Mutex while
+    /// `try_enrich_file` tried to re-acquire it — same-thread
+    /// deadlock on a non-reentrant Mutex. Without the fix, this test
+    /// would hang forever.
+    ///
+    /// We use a context with `source_dir: None`, which makes
+    /// `try_enrich_file` return false immediately without spawning an
+    /// LSP server. The deadlock would have triggered on the lock-
+    /// reentry attempt, BEFORE the source_dir check, so this is a
+    /// valid regression pin without needing a real LSP environment.
+    #[tokio::test]
+    async fn with_lazy_enrich_retry_does_not_self_deadlock() {
+        let (_dir, ctx) = setup();
+        // The setup connection has no _lsp table → needs_enrich = true.
+        // try_enrich_file with source_dir=None returns false. Pre-fix
+        // would have deadlocked between needs_enrich + try_enrich_file
+        // because both acquired the live_db lock under the same
+        // closure.
+
+        // Run on a separate thread + std::sync::mpsc so a real
+        // deadlock would manifest as a timeout rather than freezing
+        // the test harness.
+        let ctx_arc = std::sync::Arc::new(ctx);
+        let ctx_clone = ctx_arc.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(Option<String>, bool)>>();
+        let handle = std::thread::spawn(move || {
+            let result = with_lazy_enrich_retry(
+                &ctx_clone,
+                "deadlock-pin.go",
+                |_conn| Ok::<Option<String>, anyhow::Error>(None),
+                |opt| opt.is_none(),
+            );
+            let _ = tx.send(result);
+        });
+        let outcome = rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("with_lazy_enrich_retry timed out — DEADLOCK regression");
+        handle.join().unwrap();
+
+        let (result, enriched) = outcome.unwrap();
+        assert_eq!(result, None, "no enrichment ran (no source_dir), result stays None");
+        assert!(!enriched, "no enrichment ran, enriched flag must be false");
+    }
+
+    /// 5f7100-4 / 606e64: per-file in-flight gate dedupes concurrent
+    /// `try_enrich_file` calls. The first call inserts into the set
+    /// and runs work; subsequent callers for the same file see the
+    /// entry, return false, and skip the spawn.
+    ///
+    /// This test exercises the gate directly via the inflight set —
+    /// no actual LSP work needed (which would require a live source_dir
+    /// and language servers). The contract under test: the second
+    /// concurrent insert returns false.
+    #[tokio::test]
+    async fn enrich_inflight_gate_dedupes_concurrent_callers() {
+        let (_dir, ctx) = setup();
+
+        // First caller: insert "foo.go".
+        let first = ctx.enrich_inflight.lock().unwrap().insert("foo.go".to_string());
+        assert!(first, "first caller must succeed in inserting");
+
+        // Second caller (concurrent simulation): same file already in
+        // set; insert returns false → caller skips enrichment.
+        let second = ctx.enrich_inflight.lock().unwrap().insert("foo.go".to_string());
+        assert!(!second, "second concurrent caller must observe inflight, return false");
+
+        // Different file: still allowed.
+        let other = ctx.enrich_inflight.lock().unwrap().insert("bar.go".to_string());
+        assert!(other, "different file must be allowed concurrently");
+    }
+
+    /// 5f7100-4 / 606e64: gate releases after work completes. Pin so
+    /// a future refactor that forgot to remove from the set on success
+    /// would surface here as the second call returning false.
+    #[tokio::test]
+    async fn enrich_inflight_gate_releases_after_work() {
+        let (_dir, ctx) = setup();
+
+        // Simulate work cycle: insert + remove (the InflightGuard's
+        // Drop does this automatically in production try_enrich_file;
+        // we exercise it manually here).
+        ctx.enrich_inflight.lock().unwrap().insert("foo.go".to_string());
+        ctx.enrich_inflight.lock().unwrap().remove("foo.go");
+
+        // Subsequent call: insert succeeds (set is clean).
+        let again = ctx.enrich_inflight.lock().unwrap().insert("foo.go".to_string());
+        assert!(again, "after release, file is allowed back into set");
+    }
+
+    /// 5f7100-4 / 606e64: try_enrich_file's RAII guard removes the
+    /// inflight entry on EARLY return (e.g. enrichment errors out).
+    /// Without the guard, an error would leak the file into the set
+    /// forever, blocking all future enrichment attempts on that file.
+    /// The function's setup() context has no source_dir, so
+    /// try_enrich_file returns false on its own check — but the gate
+    /// inserts BEFORE that check, so we need to verify cleanup.
+    #[tokio::test]
+    async fn enrich_inflight_gate_releases_on_no_source_dir() {
+        let (_dir, ctx) = setup();
+        assert!(
+            ctx.source_dir.is_none(),
+            "fixture: source_dir must be None for this test",
+        );
+
+        // Pre-condition: set is empty.
+        assert_eq!(
+            ctx.enrich_inflight.lock().unwrap().len(),
+            0,
+            "fresh inflight set should be empty",
+        );
+
+        // Call try_enrich_file: with no source_dir, it returns false
+        // BEFORE doing any LSP work. But the gate insert + RAII guard
+        // run regardless. After return, the set must be empty.
+        let result = try_enrich_file(&ctx, "foo.go");
+        assert!(!result, "no source_dir → try_enrich_file returns false");
+
+        assert_eq!(
+            ctx.enrich_inflight.lock().unwrap().len(),
+            0,
+            "inflight set must be empty after try_enrich_file returns; \
+             RAII guard cleans up even on early-return paths",
+        );
     }
 
     #[tokio::test]

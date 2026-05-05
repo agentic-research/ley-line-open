@@ -198,6 +198,7 @@ pub async fn run_daemon(
         ext: ext.clone(),
         router: router.clone(),
         live_db: std::sync::Mutex::new(live_conn),
+        enrich_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         source_dir: source.map(|p| p.to_path_buf()),
         lang_filter: language.map(|s| s.to_string()),
         enrichment_passes: {
@@ -1260,6 +1261,7 @@ mod tests {
             ext,
             router: crate::daemon::EventRouter::new(64),
             live_db: std::sync::Mutex::new(conn),
+            enrich_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             source_dir: Some(source.to_path_buf()),
             lang_filter: Some("go".to_string()),
             enrichment_passes: vec![Box::new(crate::daemon::enrichment::TreeSitterPass)],

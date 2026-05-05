@@ -66,6 +66,7 @@ fn default_test_ctx(ctrl_path: PathBuf) -> leyline_cli_lib::daemon::DaemonContex
         ext: Arc::new(NoExt),
         router: EventRouter::new(16),
         live_db: Mutex::new(rusqlite::Connection::open_in_memory().unwrap()),
+        enrich_inflight: Arc::new(Mutex::new(std::collections::HashSet::new())),
         source_dir: None,
         lang_filter: None,
         enrichment_passes: vec![],

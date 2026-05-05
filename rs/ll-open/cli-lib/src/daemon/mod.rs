@@ -128,6 +128,22 @@ pub struct DaemonContext {
     ///   `tokio::task::spawn_blocking` to move the blocking work to the
     ///   blocking pool. Tracked as a follow-up under 5fea4e.
     pub live_db: Mutex<rusqlite::Connection>,
+    /// Per-file in-flight set for lazy LSP enrichment dedup (606e64).
+    /// When `try_enrich_file(ctx, file)` is called and `file` is already
+    /// in this set, the caller skips enrichment (the in-flight call will
+    /// complete and populate `_lsp` rows for the next query).
+    ///
+    /// Without this gate, N concurrent `lsp_hover` calls on the same
+    /// un-enriched file would each spawn an LSP server and write to
+    /// `_lsp` (causing duplicate spawns, wasted work, and possible
+    /// PRIMARY KEY collisions on the symbol_kind table).
+    ///
+    /// The gate is "skip-without-waiting" — concurrent callers get the
+    /// current (possibly empty) data and must retry on the client side.
+    /// A waiting variant (Notify-based) is more invasive and tracked as
+    /// a follow-up; this fix prevents the duplicate-work pathology
+    /// without introducing async coordination on the sync path.
+    pub enrich_inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Source directory being tracked (if --source was given).
     pub source_dir: Option<PathBuf>,
     /// Language filter for parsing.

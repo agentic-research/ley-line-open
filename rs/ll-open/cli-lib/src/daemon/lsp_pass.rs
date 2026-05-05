@@ -21,6 +21,22 @@ use super::enrichment::{EnrichmentPass, EnrichmentStats};
 const PASS_SYMBOL_POLL_MAX_ATTEMPTS: usize = 5;
 const PASS_SYMBOL_POLL_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// Hard ceiling on total time spent enriching a single file (60f75d).
+///
+/// The poll loop above is a soft 5×200ms = 1s wait for symbol
+/// availability. This wraps the entire per-file work (open_file →
+/// poll → drain → merge) in a `tokio::time::timeout` so a
+/// misbehaving language server (one that returns `Ok(empty)`
+/// indefinitely on `documentSymbol`, or hangs on `didOpen`) can't
+/// stall the enrichment loop forever.
+///
+/// Set to 5 seconds — generous enough for cold-start indexing on
+/// large files (rust-analyzer first-touch can be slow), tight enough
+/// that 50 files × 5s = 4 minutes is the worst-case batch instead of
+/// indefinite. Per-file timeout failure logs at warn and the batch
+/// proceeds to the next file.
+const PASS_FILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// LSP enrichment pass.
 ///
 /// Spawns language servers for each language found in `_source`, collects
@@ -242,47 +258,72 @@ async fn enrich_files(
         let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let language_id = language_id_from_ext(ext).unwrap_or(lang);
 
-        client.open_file(&file_uri, language_id, &source_text).await?;
+        // 60f75d: wrap the per-file work in a hard timeout so a
+        // misbehaving language server can't stall the enrichment loop
+        // forever. On timeout we log::warn, skip this file, and proceed
+        // to the next one — the LSP client itself stays alive so a
+        // single bad file doesn't poison the whole batch.
+        let per_file = async {
+            client.open_file(&file_uri, language_id, &source_text).await?;
 
-        // Poll for symbols (servers may need indexing time).
-        let mut symbols = Vec::new();
-        for attempt in 0..PASS_SYMBOL_POLL_MAX_ATTEMPTS {
-            match client.document_symbols(&file_uri).await {
-                Ok(s) if !s.is_empty() => {
-                    symbols = s;
-                    break;
+            // Poll for symbols (servers may need indexing time).
+            let mut symbols = Vec::new();
+            for attempt in 0..PASS_SYMBOL_POLL_MAX_ATTEMPTS {
+                match client.document_symbols(&file_uri).await {
+                    Ok(s) if !s.is_empty() => {
+                        symbols = s;
+                        break;
+                    }
+                    _ if attempt + 1 < PASS_SYMBOL_POLL_MAX_ATTEMPTS => {
+                        tokio::time::sleep(PASS_SYMBOL_POLL_DELAY).await;
+                    }
+                    _ => break,
                 }
-                _ if attempt + 1 < PASS_SYMBOL_POLL_MAX_ATTEMPTS => {
-                    tokio::time::sleep(PASS_SYMBOL_POLL_DELAY).await;
-                }
-                _ => break,
+            }
+
+            if symbols.is_empty() {
+                return Ok::<(u64, u64), anyhow::Error>((0, 0));
+            }
+
+            // Drain diagnostics.
+            client.drain_notifications().await;
+            let diagnostics: Vec<_> = client
+                .diagnostics
+                .iter()
+                .flat_map(|(_, diags)| diags.clone())
+                .collect();
+
+            // Merge symbols into AST nodes.
+            let matched = leyline_lsp::project::merge_lsp_into_ast(&symbols, &diagnostics, conn)?;
+
+            // Enrich with definitions, hover, references.
+            let stats = leyline_lsp::project::enrich_symbols(&mut client, conn, &symbols, &file_uri).await?;
+
+            eprintln!(
+                "lsp: {rel} — {matched} symbols, {} defs, {} hovers, {} refs",
+                stats.definitions, stats.hovers, stats.references
+            );
+
+            let enriched = (stats.definitions + stats.hovers + stats.references) as u64;
+            Ok((matched as u64, enriched))
+        };
+
+        match tokio::time::timeout(PASS_FILE_TIMEOUT, per_file).await {
+            Ok(Ok((symbols, enriched))) => {
+                total_symbols += symbols;
+                total_enriched += enriched;
+            }
+            Ok(Err(e)) => {
+                log::warn!("lsp: enrich failed for {rel}: {e:#}");
+            }
+            Err(_elapsed) => {
+                log::warn!(
+                    "lsp: per-file timeout ({:?}) exceeded for {rel}; skipping. \
+                     Server may be misbehaving on this file.",
+                    PASS_FILE_TIMEOUT,
+                );
             }
         }
-
-        if symbols.is_empty() {
-            continue;
-        }
-
-        // Drain diagnostics.
-        client.drain_notifications().await;
-        let diagnostics: Vec<_> = client
-            .diagnostics
-            .iter()
-            .flat_map(|(_, diags)| diags.clone())
-            .collect();
-
-        // Merge symbols into AST nodes.
-        let matched = leyline_lsp::project::merge_lsp_into_ast(&symbols, &diagnostics, conn)?;
-        total_symbols += matched as u64;
-
-        // Enrich with definitions, hover, references.
-        let stats = leyline_lsp::project::enrich_symbols(&mut client, conn, &symbols, &file_uri).await?;
-        total_enriched += (stats.definitions + stats.hovers + stats.references) as u64;
-
-        eprintln!(
-            "lsp: {rel} — {matched} symbols, {} defs, {} hovers, {} refs",
-            stats.definitions, stats.hovers, stats.references
-        );
     }
 
     client.shutdown().await?;
@@ -295,6 +336,32 @@ async fn enrich_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 60f75d: the per-file timeout caps worst-case batch duration.
+    /// Pin both the value (5s) and the relation to the soft poll
+    /// timeout (PASS_SYMBOL_POLL_MAX_ATTEMPTS * PASS_SYMBOL_POLL_DELAY
+    /// = 1s) — the hard timeout MUST exceed the soft poll's max wait,
+    /// otherwise normal cold-start indexing trips the timeout.
+    #[test]
+    fn pass_file_timeout_exceeds_symbol_poll_max() {
+        let soft_max = PASS_SYMBOL_POLL_DELAY * PASS_SYMBOL_POLL_MAX_ATTEMPTS as u32;
+        assert!(
+            PASS_FILE_TIMEOUT > soft_max,
+            "PASS_FILE_TIMEOUT ({:?}) must exceed soft poll max ({:?}) — \
+             otherwise cold-start indexing trips the timeout on every file",
+            PASS_FILE_TIMEOUT, soft_max,
+        );
+        // Pin the actual value too. A refactor that bumped this to
+        // 5 minutes (effectively unbounded for an interactive
+        // workflow) would surface here. If the value legitimately
+        // needs to change, update the doc on PASS_FILE_TIMEOUT and
+        // this assertion together.
+        assert_eq!(
+            PASS_FILE_TIMEOUT,
+            std::time::Duration::from_secs(5),
+            "PASS_FILE_TIMEOUT pinned at 5s — see doc comment for rationale",
+        );
+    }
 
     #[test]
     fn lsp_enrichment_pass_trait_metadata_pin() {

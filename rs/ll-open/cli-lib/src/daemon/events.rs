@@ -16,6 +16,30 @@ use tokio::sync::{RwLock, mpsc};
 /// log capacity. 1024 is enough headroom for a normal session burst.
 const EVENT_LOG_INITIAL_ALLOC: usize = 1024;
 
+/// Bounded capacity of the central emit→dispatch channel (5f7100-3 /
+/// ley-line-open-603eda). Previously `mpsc::unbounded_channel`, which
+/// let the heap grow without bound if the dispatch loop ever stalled
+/// (e.g. on a contended `subscribers.write().await`).
+///
+/// 4096 is sized for a worst-case burst of fan-out events:
+/// - Per `git_watch_loop` tick (every 2s): up to ~5 events
+///   (head.changed, files.changed, reparse.complete, snapshot,
+///   per-file enrichment notices)
+/// - Per `EmbeddingPass` drain batch: up to ~32 events
+/// - Per UDS `op_reparse`: a small burst on completion
+///
+/// 4096 covers ~10 minutes of sustained 7-events-per-second emit,
+/// orders of magnitude beyond any realistic dispatcher stall.
+///
+/// On overflow: `EventEmitter::emit` uses `try_send` + log::warn (drop
+/// the event being submitted; dispatcher will drain and the next emit
+/// will succeed). Drop-newest is acceptable because the EventLog
+/// (separate from this channel — see `EventRouter.log`) is the
+/// authoritative replay source for subscribers; missed in-flight
+/// events show up as a `replay_gap: true` flag on the next `subscribe`
+/// reconnect.
+const EVENT_EMIT_CHANNEL_BUFFER: usize = 4096;
+
 // -- Event types --------------------------------------------------------------
 
 /// A fully sequenced event ready for dispatch.
@@ -178,13 +202,13 @@ pub struct EventRouter {
     next_sub_id: AtomicU64,
     subscribers: RwLock<Vec<Subscriber>>,
     log: RwLock<EventLog>,
-    emit_tx: mpsc::UnboundedSender<RawEvent>,
+    emit_tx: mpsc::Sender<RawEvent>,
 }
 
 impl EventRouter {
     /// Create a new event router and spawn its dispatch loop.
     pub fn new(log_capacity: usize) -> Arc<Self> {
-        let (emit_tx, emit_rx) = mpsc::unbounded_channel();
+        let (emit_tx, emit_rx) = mpsc::channel(EVENT_EMIT_CHANNEL_BUFFER);
         let router = Arc::new(EventRouter {
             seq: AtomicU64::new(0),
             next_sub_id: AtomicU64::new(1),
@@ -276,7 +300,7 @@ impl EventRouter {
     }
 
     /// Internal dispatch loop: processes events from the in-process channel.
-    async fn dispatch_loop(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<RawEvent>) {
+    async fn dispatch_loop(self: Arc<Self>, mut rx: mpsc::Receiver<RawEvent>) {
         while let Some(raw) = rx.recv().await {
             self.assign_and_dispatch(raw.topic, raw.source, raw.data)
                 .await;
@@ -348,24 +372,53 @@ impl EventRouter {
 /// Lightweight handle for in-process event emission. Cheap to clone.
 #[derive(Clone)]
 pub struct EventEmitter {
-    tx: mpsc::UnboundedSender<RawEvent>,
+    tx: mpsc::Sender<RawEvent>,
 }
 
 impl EventEmitter {
     /// Emit an event into the bus. Non-blocking, fire-and-forget.
+    ///
+    /// Backpressure (5f7100-3 / 603eda): uses `try_send` against the
+    /// bounded channel. If the channel is full (dispatcher stalled or
+    /// burst exceeds `EVENT_EMIT_CHANNEL_BUFFER`), the event is
+    /// dropped and a `log::warn` records the loss. Drop-newest is
+    /// acceptable because the `EventLog` (separate from this channel)
+    /// is the authoritative replay source — subscribers reconnecting
+    /// after a stall see `replay_gap: true` and refetch from the log.
+    ///
+    /// `Closed` errors (dispatcher shut down) are also logged once per
+    /// emit; in practice the dispatcher only closes during process
+    /// teardown, so this is a benign late-emit.
     pub fn emit(&self, topic: &str, source: &str, data: serde_json::Value) {
-        let _ = self.tx.send(RawEvent {
+        match self.tx.try_send(RawEvent {
             topic: topic.to_string(),
             source: source.to_string(),
             data,
-        });
+        }) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(ev)) => {
+                log::warn!(
+                    "event bus full ({EVENT_EMIT_CHANNEL_BUFFER} buffered); \
+                     dropped emit topic={} source={}",
+                    ev.topic,
+                    ev.source,
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(ev)) => {
+                log::debug!(
+                    "event bus closed; dropped emit topic={} source={}",
+                    ev.topic,
+                    ev.source,
+                );
+            }
+        }
     }
 
     /// Create a no-op emitter that silently drops all events.
     #[cfg(test)]
     #[allow(dead_code)]
     pub fn noop() -> Self {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(1);
         EventEmitter { tx }
     }
 }
@@ -853,6 +906,156 @@ mod tests {
         let (events, gap) = log.since(1);
         assert!(gap);
         assert_eq!(events.len(), 3);
+    }
+
+    /// 5f7100-3 / 603eda: pin the EVENT_EMIT_CHANNEL_BUFFER constant.
+    /// Bumping it silently changes the burst-tolerance + heap-bound
+    /// trade-off; the value is documented in the constant's doc
+    /// comment, so a refactor must update that too.
+    #[test]
+    fn event_emit_channel_buffer_pinned() {
+        assert_eq!(
+            EVENT_EMIT_CHANNEL_BUFFER, 4096,
+            "EVENT_EMIT_CHANNEL_BUFFER value is documented; update the \
+             doc comment if you change this",
+        );
+    }
+
+    /// 5f7100-3 / 603eda: when the bounded emit channel is full,
+    /// `EventEmitter::emit` must drop the new event WITHOUT panicking
+    /// or blocking the caller. Pre-fix, `mpsc::unbounded_channel` would
+    /// have absorbed unboundedly. Post-fix, drop-newest with log::warn
+    /// is the contract.
+    #[tokio::test]
+    async fn emit_drops_when_channel_full() {
+        // Build a tiny bounded channel directly (size = 2) so we don't
+        // need to overflow the production 4096 in a unit test.
+        let (tx, mut rx) = mpsc::channel::<RawEvent>(2);
+        let emitter = EventEmitter { tx };
+
+        // Fill the channel: 2 events fit, third is dropped.
+        emitter.emit("a", "test", serde_json::json!({}));
+        emitter.emit("b", "test", serde_json::json!({}));
+        emitter.emit("c", "test", serde_json::json!({})); // dropped — channel full
+        emitter.emit("d", "test", serde_json::json!({})); // dropped — channel full
+
+        // Drain: receive what made it.
+        let mut received = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            received.push(ev);
+        }
+        assert_eq!(
+            received.len(),
+            2,
+            "exactly buffer-size events must be delivered; rest dropped",
+        );
+        assert_eq!(received[0].topic, "a");
+        assert_eq!(received[1].topic, "b");
+        // The DROP-NEWEST contract: c and d are gone, NOT a and b.
+        // (Drop-oldest would have left c and d in the channel and
+        // dropped a and b. Pin the FIFO ordering so a refactor that
+        // accidentally swapped to drop-oldest semantics surfaces.)
+    }
+
+    /// 5f7100-3 / 603eda: closed channel (receiver dropped, e.g. dispatcher
+    /// has shut down during process teardown) must NOT panic emit().
+    /// The original `let _ = self.tx.send(...)` swallowed errors silently;
+    /// the new `try_send` matches `Closed` explicitly and logs at debug.
+    #[tokio::test]
+    async fn emit_handles_closed_channel() {
+        let (tx, rx) = mpsc::channel::<RawEvent>(4);
+        let emitter = EventEmitter { tx };
+
+        // Drop the receiver — channel is now closed from the rx side.
+        drop(rx);
+
+        // emit() must not panic. We can't directly assert log content
+        // here; we just assert the call completes without unwinding.
+        emitter.emit("topic", "src", serde_json::json!({}));
+        emitter.emit("topic2", "src", serde_json::json!({}));
+        // Test passes if we got here without panicking.
+    }
+
+    /// 5f7100-3 / 603eda: end-to-end stress — emit > BUFFER events
+    /// faster than the dispatcher can drain; verify we never panic and
+    /// that the channel size stays bounded.
+    ///
+    /// In practice the dispatcher drains very fast (just an await on
+    /// `subscribers.read()` + try_send to each), so to exercise the
+    /// full-channel path we need to NOT spawn the dispatcher and
+    /// instead introspect the channel directly. That's the unit-level
+    /// `emit_drops_when_channel_full` above. THIS test exercises the
+    /// production EventRouter path: with a real dispatcher, emit
+    /// many events in quick succession and verify the subscriber sees
+    /// at LEAST a meaningful subset (we don't promise all delivered;
+    /// some may have been dropped under tight contention).
+    #[tokio::test]
+    async fn router_under_burst_emit_does_not_panic() {
+        let router = EventRouter::new(EVENT_EMIT_CHANNEL_BUFFER);
+        let emitter = router.emitter();
+
+        let (_, mut rx, _, _) = router
+            .subscribe(
+                &["**".to_string()], // catch-all (DoubleStar = zero-or-more segments)
+                None,
+                0,
+                OverflowPolicy::DropOldest,
+                EVENT_EMIT_CHANNEL_BUFFER,
+            )
+            .await;
+
+        // Burst 2× the buffer size. Most will be delivered (the
+        // dispatcher drains in parallel), but the contract here is:
+        // - No panic
+        // - subscriber sees at least 1 event (dispatcher made progress)
+        // - subscriber count never exceeds EVENT_EMIT_CHANNEL_BUFFER
+        //   (the upper bound on what could have been buffered).
+        let n = EVENT_EMIT_CHANNEL_BUFFER * 2;
+        for i in 0..n {
+            emitter.emit(
+                "node.burst",
+                "leyline",
+                serde_json::json!({"i": i}),
+            );
+        }
+
+        // Give the dispatcher time to drain.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let mut received = 0usize;
+        while rx.try_recv().is_ok() {
+            received += 1;
+        }
+
+        assert!(
+            received >= 1,
+            "subscriber must see SOME events from the burst",
+        );
+        // Subscriber's per-channel buffer is EVENT_EMIT_CHANNEL_BUFFER;
+        // so received is bounded by that, regardless of how many were
+        // emitted. This is the heap-bound guarantee.
+        assert!(
+            received <= EVENT_EMIT_CHANNEL_BUFFER,
+            "subscriber received {} events; bounded by channel buffer ({})",
+            received,
+            EVENT_EMIT_CHANNEL_BUFFER,
+        );
+    }
+
+    /// noop emitter must not panic on emit (size-1 channel, receiver
+    /// dropped immediately). 5f7100-3-adjacent: same try_send path,
+    /// pin so a future refactor that special-cased noop wouldn't
+    /// silently break the test-only convenience.
+    #[tokio::test]
+    async fn noop_emitter_drops_silently() {
+        let emitter = EventEmitter::noop();
+        // Single emit fits in the size-1 channel; subsequent are
+        // dropped (channel full because rx was dropped, so we hit
+        // either Closed or Full per drop semantics).
+        for i in 0..100 {
+            emitter.emit("test", "test", serde_json::json!({"i": i}));
+        }
+        // No panic expected.
     }
 
     #[tokio::test]

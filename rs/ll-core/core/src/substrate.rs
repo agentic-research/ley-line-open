@@ -24,12 +24,21 @@
 
 use anyhow::Result;
 
-/// Content address. 256-bit cryptographic hash of a blob.
+/// Content address. 256-bit BLAKE3 hash of a blob.
 ///
-/// Concrete hash function is BLAKE3 (decided in T1.1 design). The choice
-/// is captured here so all callers share one address space — mixing hash
-/// functions inside a single substrate breaks (DET) and (CR) at the
-/// composition boundary.
+/// **The hash function is BLAKE3, locked 2026-05-05** (decade §3.4).
+/// This is not a placeholder for "any 32-byte commitment" — it is
+/// specifically a BLAKE3 hash. Callers MUST NOT treat `Hash` as a
+/// generic content commitment; mixing hash functions inside a single
+/// substrate breaks (DET) and (CR) at the composition boundary.
+///
+/// Future migration to a different family member (Verkle vector
+/// commitments, lattice-based VCs, etc.) is scoped as a separate
+/// `Σ'` decade (§8.1 of the substrate doc) with `Hash` replaced by
+/// a `Commitment<C>` trait. Until that decade ships, **everything
+/// downstream of this type assumes BLAKE3** — verify-on-read,
+/// content-addressed blob store, signed roots, the wire protocol
+/// (BEP-52 64KB Merkle per closed-source ADR-012), all of it.
 ///
 /// **Axioms enforced by this type:**
 /// - **(DET)** Determinism: implementing `ContentAddressed` for the same

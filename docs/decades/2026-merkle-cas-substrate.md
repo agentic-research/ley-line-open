@@ -15,18 +15,28 @@
 
 ## 0. One-line claim
 
-> A content-addressed, vector-commitment-rooted, CAS-advanced state
-> substrate Σ = (𝓥, 𝓒, ρ, σ, R, S) is the *canonical* realization of
-> the requirements R1–R7 enumerated below — necessary in spirit
-> (the requirements force a Σ-shaped commit-point) but not in
-> implementation detail (Verkle, accumulator, and skip-list variants
-> are admissible substitutes). The existing arena protocol is a
-> degenerate case of Σ (sequence-named instead of hash-named);
-> ADR-A and ADR-B are upper layers built on Σ. This decade formalizes
-> Σ, makes its claims falsifiable, and argues canonicality from
-> requirements (per the §3 red-team in
-> `docs/decades/red-team/2026-05-01-section-3-necessity.md`, which
-> downgraded the original "necessity" claim).
+> Σ = (𝓥, 𝓒, ρ, σ, R, S) is a content-addressed, **Merkle-rooted with
+> BLAKE3** as the hash, CAS-advanced state substrate. R1–R7 force a
+> Σ-shaped commit-point (canonicality argument in §3); we **commit to
+> Merkle-BLAKE3 as the implementation**, not as a placeholder
+> "admissible representative" of a wider family. The wider family
+> (Verkle, lattice-VC, auth skip-list) is real and tracked as a
+> *future* migration decade `Σ'` (§8); this is a deliberate decision,
+> not a hedge. The existing arena protocol is a degenerate case of Σ
+> (sequence-named instead of hash-named); ADR-A and ADR-B are upper
+> layers built on Σ.
+>
+> **Why Merkle-BLAKE3 specifically** (locked 2026-05-05): BLAKE3 is
+> hash-based, PQ-safe at 128-bit margin via Grover (NIST SP 800-208
+> acceptable), production-deployable in audited Rust crates today.
+> Verkle (KZG/IPA) variants beat Merkle on proof size but rest on
+> discrete-log assumptions Shor breaks; not PQ-safe today. Lattice-
+> based vector commitments are the future PQ-safe Verkle but aren't
+> production-deployable. The closed-source ley-line ADR-012 wire
+> protocol already specifies BEP-52 Merkle at the 64KB layer —
+> committing Σ to Merkle aligns with that. PQ at the *signature*
+> layer is handled by signet's ML-DSA-44, independent of the tree
+> primitive.
 
 ---
 
@@ -217,36 +227,62 @@ without justification. The fix attributes the single-root requirement
 to R5 ∧ R6 and downgrades CAS from "minimal" to "lowest-overhead
 realization" of an abstract single-root commit point.)
 
-### 3.4 R6 ⟹ vector-commitment-rooted structure (Merkle is the canonical case)
+### 3.4 R6 ⟹ Σ commits to Merkle-BLAKE3
 
 R6 requires that k = O(1) leaf changes propagate in O(log n) work.
 
 - Flat addressing: any change re-hashes the entire blob ⟹ O(n).
   Insufficient.
-- **The vector-commitment family** is the set of data structures
-  C : 𝓥* → 𝓒 such that single-leaf updates are sublinear and the root
-  preserves collision-resistance. Members include:
-  - **Merkle tree**: each internal node = σ(child‖child‖…). O(log_k n) updates.
-  - **Verkle tree** (Kuszmaul 2018, Buterin 2021): vector commitment per
-    internal node (KZG or IPA). O(log_k n) updates, **O(1) proofs**.
+- **The vector-commitment family** is the abstract set of data
+  structures C : 𝓥* → 𝓒 such that single-leaf updates are sublinear
+  and the root preserves collision-resistance. Known instantiations:
+  - **Merkle tree**: parent = σ(child‖child‖…). O(log_k n) updates.
+    Hash-based — PQ-safe at half-margin via Grover.
+  - **Verkle tree** (Kuszmaul 2018, Buterin 2021): vector commitment
+    per internal node (KZG or IPA). O(log_k n) updates, **O(1)
+    proofs**. Discrete-log-based — **NOT PQ-safe**, broken by Shor.
   - **RSA / class-group accumulators** (Camenisch-Lysyanskaya 2002,
     Boneh-Bünz-Fisch 2019): single group element. O(1) amortized.
-  - **Authenticated skip lists** (Goodrich-Tamassia 2001): randomized
-    DAG, expected O(log n).
-  - **Sparse Merkle trees + non-membership proofs** (RFC 6962): same
-    big-O, different commitment domain.
+    Group-theoretic — NOT PQ-safe.
+  - **Lattice-based vector commitments** (Wee 2014, Catalano-Fiore
+    2013, BBF18): Module-LWE / SIS based. PQ-safe **but research-
+    grade** — no production-audited Rust crate as of 2026-05.
+  - **Authenticated skip lists** (Goodrich-Tamassia 2001),
+    **Sparse Merkle Trees** (RFC 6962): hash-based variants.
 
-∴ Σ requires a vector-commitment family member at the root. The Merkle
-tree is the canonical representative — chosen for Σ because BLAKE3 is
-production-ready, the implementation cost is bounded, and ADR-A/B
-already assume Merkle stalks. **Substitutes are admissible**: a future
-Σ' built on Verkle would inherit Σ's correctness arguments with a
-proof-size optimization. ∎
+∴ R6 forces a vector-commitment family member at the root.
 
-(*Red-team Gap 1 fix:* the original §3.4 claimed Merkle uniqueness,
-which Verkle/accumulator/skip-list literature directly contradicts.
-The fix downgrades from "unique" to "canonical representative of the
-family."*)
+**Σ commits to Merkle-BLAKE3** as the implementation (locked
+2026-05-05). The reasons are not "Merkle is uniquely correct" — the
+red-team established that Verkle/accumulators/skip-lists are
+mathematically also valid roots — but rather a **deliberate
+deployment-time choice**:
+
+1. **PQ-safety today.** BLAKE3 gives 128-bit PQ via Grover; meets NIST
+   SP 800-208. Verkle (KZG/IPA) is broken by Shor and lattice-VCs
+   aren't deployable.
+2. **Production-readiness.** Audited Rust crates (`blake3`) exist;
+   no equivalent for Verkle-IPA or lattice-VCs.
+3. **Wire-protocol alignment.** Closed-source ley-line ADR-012 already
+   specifies BEP-52 Merkle at 64KB layer. Σ choosing Merkle keeps a
+   single primitive across local + network.
+4. **Bounded migration scope.** If lattice-VCs become production-ready
+   in 1–2 years, the migration is a discrete decade (`Σ'`, §8) — not
+   a hot-swap inside Σ. The substrate types (`Hash`, `BlobStore`,
+   `RootPointer`, `RootSigner`) are designed so that swap is a trait
+   re-impl, not a substrate rewrite.
+
+The wider vector-commitment family is **NOT an "admissible substitute"
+inside Σ** — that framing was previously a hedge that creates a
+refactor-trap (downstream beads land against ambiguous types).
+Future Verkle/lattice-VC adoption is scoped as a separate decade,
+not a hot-pluggable variant. ∎
+
+(*The original §3.4 claimed Merkle uniqueness, which the red-team
+correctly contradicted. The fix is NOT to weaken to "any family
+member is fine" — it's to commit to one specific implementation and
+schedule the alternate-family migration as a future deliberate
+decade.*)
 
 ### 3.5 R5 ⟹ retention of past R_i within horizon T
 
@@ -289,22 +325,30 @@ immutable bootstrap distinct from mutable runtime state.)
 ### 3.7 Conclusion
 
 R1–R7 (operationalized per §2) force every component of Σ up to
-isomorphism in the vector-commitment family. The Merkle tree is the
-canonical realization; Verkle / accumulator / skip-list members are
-admissible substitutes that inherit Σ's correctness arguments.
+isomorphism in the vector-commitment family. **Σ commits to
+Merkle-BLAKE3 as the implementation choice within that family**
+(§3.4 rationale; locked 2026-05-05). Other family members (Verkle,
+accumulators, lattice-VC, auth skip-list) are mathematically admissible
+roots but are **not interchangeable inside Σ** — adopting one is a
+deliberate `Σ'` migration decade (§8), not a hot-swap.
 
-> ∴ Σ is **canonical**. ∎
+> ∴ Σ is **Merkle-BLAKE3, locked.** ∎
 
-The argument is sketch-level. Mechanizing it in TLA+/Apalache is
-**Bead 1.2** below — scoped to *canonicality search* (does any system
-satisfy R1–R7 outside the vector-commitment family?) rather than the
-stronger original "necessity" framing.
+The canonicality-of-the-family argument is sketch-level and
+mechanizing it in TLA+/Apalache is **Bead 1.2** — scoped to
+"canonicality search": does any system satisfy R1–R7 outside the
+vector-commitment family entirely? Members of the family that are
+not Merkle-BLAKE3 are not counterexamples (they're sibling
+implementations); systems that are NOT vector-commitment-shaped
+would be (none expected, but bounded TLA+ checks the search).
 
-(*The downgrade from "necessity" to "canonicality" was applied
-2026-05-01 after a math-friend red-team. The full red-team analysis is
-preserved at `docs/decades/red-team/2026-05-01-section-3-necessity.md`
-for audit. The operational program — T1–T7, F1–F6, the feature-
-completion criterion — is unchanged by the weakening.*)
+(*Two amendments tracked in this section:
+- 2026-05-01: red-team downgraded "necessity" → "canonicality" of the
+  family (preserved at `docs/decades/red-team/2026-05-01-section-3-
+  necessity.md`).
+- 2026-05-05: locked **Merkle-BLAKE3** as the implementation. Removed
+  the "admissible substitute" hedge that allowed downstream beads to
+  land against ambiguous types — that was a refactor trap.*)
 
 ---
 
@@ -476,10 +520,11 @@ once their dependencies land.
 Σ is *feature-complete* when:
 
 1. **All R1–R7** have at least one falsification protocol (F1–F6) passing in CI
-2. **Canonicality argument (Bead 1.2)** is mechanized in TLA+/Apalache with bounded model checking finding no counterexample at depth ≥ 7 (one per requirement) outside the vector-commitment family (Verkle / accumulator / auth-skip-list members are admitted as Σ-isomorphic, not counterexamples)
+2. **Canonicality argument (Bead 1.2)** is mechanized in TLA+/Apalache with bounded model checking finding no counterexample at depth ≥ 7 (one per requirement) outside the vector-commitment family. Members of the family (Verkle, accumulators, lattice-VCs, skip-lists) are *not* Σ counterexamples — they're sibling implementations. Σ's lock to Merkle-BLAKE3 (§3.4) is a deployment choice, not a uniqueness claim.
 3. **All composition seams (T5)** are exercised by a single integration test that touches signet, workerd, rosary, mache simultaneously
 4. **The arena migration (T2)** is shipped: `current_root` is the canonical advancement primitive; `generation` is removed
 5. **F2 throughput** at N=10 concurrent writers exceeds serial by ≥ 4× (validates R1 isn't lock-hidden)
+6. **All `Hash` types are BLAKE3-bound** (locked 2026-05-05, §3.4): no downstream bead lands against ambiguous "any 32-byte commitment" semantics. Type docs in `leyline_core::substrate` explicitly cite BLAKE3.
 
 This is the operational definition of "the substrate works."
 
@@ -508,6 +553,38 @@ The current arena protocol (`Controller`, `ArenaHeader`, `HotSwapGraph`)
 and reader hot-swap. It's missing σ (content addressing) and the Merkle
 structure. This decade closes that gap by treating the existing
 implementation as a starting point, not a replacement target.
+
+### 8.1 Future migration decade `Σ'` (placeholder)
+
+Σ commits to Merkle-BLAKE3 in the present (§3.4). When the
+crypto landscape changes — specifically, when production-audited
+Rust crates for **lattice-based vector commitments** (Module-LWE,
+SIS-based) ship — the migration to a Verkle-shaped or
+lattice-VC-shaped substrate is a separate decade `Σ'`, not a hot-
+swap inside Σ.
+
+Bounded migration scope (recorded here so it's not lost):
+
+| Piece                              | Σ (Merkle-BLAKE3)                  | Σ' (lattice-VC) target            |
+|------------------------------------|------------------------------------|-----------------------------------|
+| `Hash` type (`leyline_core::substrate`) | `[u8; 32]` BLAKE3                  | `Commitment<C>` trait, possibly larger |
+| Reduce function                    | `σ(child‖child‖…)` = BLAKE3        | `VC.commit(children)`              |
+| Verify path                        | Merkle proof (O(log n) hashes)     | VC opening proof (constant size)   |
+| Wire protocol (closed-source ADR-012) | BEP-52 64KB Merkle                 | Update ADR-012 in lockstep         |
+| Signature layer                    | signet ML-DSA-44 over root         | Unchanged (already PQ-safe)        |
+
+Σ' decade is **not created yet** — it's named here as a deliberate
+future-work token so the decision is reachable, not buried. Trigger
+condition: a production-audited Rust crate for lattice-based vector
+commitments ships, OR Verkle-IPA becomes the dominant substrate in
+adjacent projects we federate with (e.g., Ethereum stateless clients
+matures to a point where Σ benefits from interop). Re-evaluate
+2027-Q2 at the latest.
+
+What does NOT trigger Σ': improvements to BLAKE3, new hash-based
+zero-knowledge constructions over Merkle (those slot into Σ's
+existing primitive), or constant-size proof requirements alone (we
+can build BEP-52-style sub-tree verification within Merkle).
 
 ---
 

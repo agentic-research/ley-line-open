@@ -344,8 +344,12 @@ pub async fn run_daemon(
             let mut tick = interval(SNAPSHOT_INTERVAL);
             loop {
                 tick.tick().await;
-                snapshot_or_log(&snap_ctx.live_db, &snap_ctrl, "periodic snapshot failed");
-                emitter.emit("daemon.snapshot", "leyline", serde_json::json!({}));
+                // Non-blocking: skip this tick if op_reparse / op_enrich
+                // is mid-flight rather than queuing snapshots behind it.
+                // 5fea4e — block-the-tokio-worker prevention.
+                if try_snapshot_or_log(&snap_ctx.live_db, &snap_ctrl, "periodic snapshot failed") {
+                    emitter.emit("daemon.snapshot", "leyline", serde_json::json!({}));
+                }
             }
         });
     }
@@ -535,6 +539,51 @@ pub fn snapshot_or_log(
     let guard = live_db.lock().unwrap();
     if let Err(e) = snapshot_to_arena(&guard, ctrl_path) {
         log::error!("{label}: {e:#}");
+    }
+}
+
+/// Non-blocking variant of `snapshot_or_log` for the periodic snapshot
+/// timer (5fea4e). Uses `try_lock`: if the live_db lock is contended
+/// (e.g. `op_reparse` holds it across `parse_into_conn`), this tick is
+/// skipped with a debug log instead of blocking the tokio worker for
+/// the duration of the long-running operation.
+///
+/// Without this guard, a 500ms+ reparse would queue every subsequent
+/// snapshot tick behind it; on completion the queue drains in a burst,
+/// and any concurrent UDS query (which only borrows the db read-only)
+/// blocks behind the burst. `WouldBlock` and `Poisoned` are both
+/// recoverable — the next tick retries the lock.
+pub fn try_snapshot_or_log(
+    live_db: &std::sync::Mutex<rusqlite::Connection>,
+    ctrl_path: &Path,
+    label: &str,
+) -> bool {
+    use std::sync::TryLockError;
+    match live_db.try_lock() {
+        Ok(guard) => {
+            if let Err(e) = snapshot_to_arena(&guard, ctrl_path) {
+                log::error!("{label}: {e:#}");
+            }
+            true
+        }
+        Err(TryLockError::WouldBlock) => {
+            log::debug!("{label}: live_db contended, skipping this tick");
+            false
+        }
+        Err(TryLockError::Poisoned(poisoned)) => {
+            // A previous writer panicked. Recover the inner state and
+            // retry once — better to take a single hit than wedge the
+            // snapshot timer permanently. Same recovery strategy as the
+            // embed drainer (294fd6b).
+            log::error!(
+                "{label}: live_db mutex poisoned; recovering inner state",
+            );
+            let guard = poisoned.into_inner();
+            if let Err(e) = snapshot_to_arena(&guard, ctrl_path) {
+                log::error!("{label}: post-recovery snapshot failed: {e:#}");
+            }
+            true
+        }
     }
 }
 
@@ -866,6 +915,71 @@ mod tests {
     // The tests below assert Ok(None) is returned in both cases (cold
     // start always remains the safe fallback) and exercise both fresh
     // and error code paths.
+
+    #[test]
+    fn try_snapshot_or_log_skips_when_lock_contended() {
+        // 5fea4e contract: when the live_db mutex is contended (e.g.
+        // op_reparse holds it across parse_into_conn), the periodic
+        // snapshot timer must skip the tick — NOT block the tokio
+        // worker thread waiting for the lock to release. Pin so a
+        // refactor that swapped try_lock for blocking lock would
+        // surface here as a hung test.
+        let dir = TempDir::new().unwrap();
+        let ctrl_path = dir.path().join("contended.ctrl");
+        // Need a real arena for snapshot_to_arena to find — it'll
+        // bail when called, but the lock-skip path returns BEFORE we
+        // get there, so we don't need a working snapshot.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let live_db = StdMutex::new(conn);
+
+        // Hold the lock from this thread.
+        let _held_guard = live_db.lock().unwrap();
+
+        // Now invoke try_snapshot_or_log — it must observe WouldBlock
+        // and return false WITHOUT trying to take the lock again
+        // (which would deadlock since we hold it on the same thread).
+        let snapshotted = try_snapshot_or_log(&live_db, &ctrl_path, "contention test");
+        assert!(
+            !snapshotted,
+            "try_snapshot_or_log must return false when lock is held by another holder",
+        );
+    }
+
+    #[test]
+    fn try_snapshot_or_log_recovers_from_poisoned_lock() {
+        // Sister contract: when the lock is poisoned (a previous
+        // writer panicked), the timer recovers via into_inner() and
+        // attempts the snapshot anyway. Same recovery strategy as
+        // the embed drainer (294fd6b). Without recovery, one panic
+        // would wedge the snapshot timer permanently — silent
+        // freshness regression.
+        let dir = TempDir::new().unwrap();
+        let ctrl_path = dir.path().join("poisoned.ctrl");
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let live_db = std::sync::Arc::new(StdMutex::new(conn));
+
+        // Poison the lock by panicking inside a write guard.
+        let live_db_p = live_db.clone();
+        let join = std::thread::spawn(move || {
+            let _guard = live_db_p.lock().unwrap();
+            panic!("deliberate panic to poison the lock");
+        });
+        let _ = join.join(); // expect panic; ignore result
+
+        // Sanity: lock is poisoned.
+        assert!(live_db.lock().is_err(), "pre-condition: lock should be poisoned");
+
+        // try_snapshot_or_log MUST recover and attempt the snapshot.
+        // The snapshot itself will fail (no arena registered in this
+        // test), but `try_snapshot_or_log` returns true to indicate
+        // the lock was acquired (via into_inner) and the snapshot was
+        // attempted (and logged as a recoverable failure).
+        let attempted = try_snapshot_or_log(&live_db, &ctrl_path, "poison-recovery test");
+        assert!(
+            attempted,
+            "try_snapshot_or_log must recover from poisoned lock and report attempt",
+        );
+    }
 
     #[test]
     fn warm_start_returns_none_on_missing_ctrl() {

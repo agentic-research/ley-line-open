@@ -109,6 +109,24 @@ pub struct DaemonContext {
     pub router: Arc<EventRouter>,
     /// The living database — owned for the daemon's lifetime.
     /// All queries go through this. `:memory:` SQLite, crash-recovered from arena.
+    ///
+    /// **Why `std::sync::Mutex`, not `tokio::sync::Mutex`** (5fea4e):
+    /// `rusqlite::Connection` is `!Send` (it holds a raw `*mut sqlite3`
+    /// that's bound to the thread that opened it). `MutexGuard<Connection>`
+    /// is therefore also `!Send`. Holding the guard across an `.await`
+    /// would require Send for the future returned by the async block —
+    /// which is a compile error. **Rust's type system enforces "no
+    /// `.await` while holding the lock" for free.** Long-running operations
+    /// (parse, enrich) MUST do their work synchronously while the guard is
+    /// held; if the work needs to await, drop the guard first.
+    ///
+    /// The downside is that long sync work blocks the tokio worker thread.
+    /// Mitigations:
+    /// - Periodic snapshot timer uses `try_snapshot_or_log` (try_lock + skip)
+    ///   so it doesn't queue behind a long reparse.
+    /// - Future op_reparse refactor: wrap the lock+work in
+    ///   `tokio::task::spawn_blocking` to move the blocking work to the
+    ///   blocking pool. Tracked as a follow-up under 5fea4e.
     pub live_db: Mutex<rusqlite::Connection>,
     /// Source directory being tracked (if --source was given).
     pub source_dir: Option<PathBuf>,

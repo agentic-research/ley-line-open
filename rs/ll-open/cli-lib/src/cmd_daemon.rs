@@ -539,6 +539,35 @@ pub fn snapshot_or_log(
 }
 
 /// Serialize the living db and write it into the arena.
+///
+/// **Ordering contract** (load-bearing — see closed-source ley-line
+/// ADR-001 §5 "Demand-Paged Strategy" + ADR-012 sync sequence):
+///
+/// The dual `set_arena` calls below mirror the network manifest-
+/// then-data wire protocol. The first call is the local single-host
+/// analog of the QUIC reliable-stream manifest publish; the second is
+/// the atomic CAS commit point. Three invariants must hold:
+///
+/// 1. **File grown BEFORE size advertised.** A fresh-opening reader
+///    that fetches `ctrl.arena_size()` and tries to mmap that many
+///    bytes must never see `arena_size > file_size`. Therefore
+///    `create_arena` (which calls `set_len`) precedes the early
+///    `set_arena`. Reversing this order produces torn reads in
+///    cross-process consumers (ADR-fixed bug ley-line-open-609d6a).
+///
+/// 2. **Generation bump is the publish point.** Polling readers
+///    (HotSwapGraph) key on `generation`; they don't refresh until
+///    it bumps. The early `set_arena` keeps the OLD generation so
+///    polling readers stay on the old buffer until the data is
+///    fully written. The final `set_arena` flips generation, making
+///    the new buffer visible.
+///
+/// 3. **Advertisement errors abort the snapshot.** If the early
+///    `set_arena` fails, a partially-grown file may be on disk with
+///    the controller state half-published. Propagate the error;
+///    callers (snapshot_or_log) move the daemon into Error phase so
+///    operators see it. Silently continuing is the original bug
+///    described in ley-line-open-609d6a.
 pub fn snapshot_to_arena(
     conn: &rusqlite::Connection,
     ctrl_path: &Path,
@@ -546,7 +575,6 @@ pub fn snapshot_to_arena(
     let db_bytes = conn.serialize(rusqlite::DatabaseName::Main)
         .context("serialize living db")?;
 
-    // Ensure arena is large enough.
     let mut ctrl = leyline_core::Controller::open_or_create(ctrl_path)
         .context("open controller")?;
     let arena_path = ctrl.arena_path();
@@ -555,46 +583,49 @@ pub fn snapshot_to_arena(
     let min_arena = leyline_core::ArenaHeader::HEADER_SIZE
         + db_bytes.len() as u64 * ARENA_GROWTH_FACTOR
         + ARENA_HEADROOM_BYTES;
-    let arena_size = if min_arena > arena_size {
-        eprintln!(
-            "auto-sizing arena: {}MB → {}MB (db is {}MB)",
-            arena_size / (1024 * 1024),
-            min_arena / (1024 * 1024),
-            db_bytes.len() / (1024 * 1024),
-        );
-        // Best-effort early size update — the definitive set_arena
-        // below uses `?`, so a failure here gets retried with the new
-        // generation. Log debug-level so the failure is visible if
-        // operators are debugging "why is the arena re-sizing every
-        // snapshot" without spamming on every transient.
-        if let Err(e) = ctrl.set_arena(&arena_path, min_arena, ctrl.generation()) {
-            log::debug!(
-                "arena early-resize set_arena failed (will retry below): {e:#}",
-            );
-        }
-        min_arena
-    } else {
-        arena_size
-    };
+    let new_size = std::cmp::max(arena_size, min_arena);
 
-    let buf_capacity = leyline_core::ArenaHeader::buffer_size(arena_size) as usize;
+    let buf_capacity = leyline_core::ArenaHeader::buffer_size(new_size) as usize;
     if db_bytes.len() > buf_capacity {
         anyhow::bail!(
-            "db ({} bytes) exceeds arena buffer capacity ({} bytes)",
+            "db ({} bytes) exceeds arena buffer capacity ({} bytes) at new_size {} bytes",
             db_bytes.len(),
             buf_capacity,
+            new_size,
         );
     }
 
-    let mut mmap = leyline_core::create_arena(Path::new(&arena_path), arena_size)
+    // Step 1: grow the file (no-op if new_size == arena_size). Must
+    // precede advertisement — see ordering invariant 1.
+    let mut mmap = leyline_core::create_arena(Path::new(&arena_path), new_size)
         .context("open arena file")?;
 
+    // Step 2: advertise new size to controller, but keep OLD generation.
+    // Fresh-opening readers see (arena_size = new_size, gen = old_gen);
+    // file is already at new_size from step 1 so the advertised size is
+    // safe to mmap. Polling readers don't refresh because gen hasn't
+    // bumped. Failure here MUST abort the snapshot — see invariant 3.
+    if new_size != arena_size {
+        eprintln!(
+            "auto-sizing arena: {}MB → {}MB (db is {}MB)",
+            arena_size / (1024 * 1024),
+            new_size / (1024 * 1024),
+            db_bytes.len() / (1024 * 1024),
+        );
+        ctrl.set_arena(&arena_path, new_size, ctrl.generation())
+            .context("advertise new arena size before write")?;
+    }
+
+    // Step 3: write into the inactive buffer. ArenaHeader.active_buffer
+    // is unchanged; old buffer remains the readable one until step 4.
     leyline_core::write_to_arena(&mut mmap, &db_bytes)
         .context("write to arena")?;
 
+    // Step 4: atomic publish — bump generation. Polling readers see
+    // gen change, refresh, observe (new_size, new_gen, new active_buffer).
     let new_gen = ctrl.generation() + 1;
-    ctrl.set_arena(&arena_path, arena_size, new_gen)
-        .context("bump generation")?;
+    ctrl.set_arena(&arena_path, new_size, new_gen)
+        .context("bump generation (publish snapshot)")?;
 
     eprintln!("snapshot to arena (generation {new_gen}, {} bytes)", db_bytes.len());
     Ok(())

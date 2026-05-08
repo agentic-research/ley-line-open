@@ -348,7 +348,18 @@ pub fn parse_into_conn(
                 bail!("binary file (null byte in first 8KB): {}", abs_path.display());
             }
 
-            let abs_str = abs_path.to_string_lossy().to_string();
+            // Canonicalize so `_source.path` matches the LSP-derived
+            // file:// URI (lsp_pass.rs canonicalizes before constructing
+            // the URI). Without this, on macOS `/tmp` vs `/private/tmp`
+            // and elsewhere any symlink-rooted path produces a path
+            // mismatch in `lookup_referrer_node_id` — every lookup
+            // misses, every `_lsp_refs.referrer_node_id` is NULL
+            // (be6136). Fall back to the original path if canonicalize
+            // fails (e.g. broken symlink), preserving prior behavior.
+            let canon = abs_path
+                .canonicalize()
+                .unwrap_or_else(|_| abs_path.clone());
+            let abs_str = canon.to_string_lossy().to_string();
             parse_file_pure(&content, *lang, rel, &abs_str, *file_mtime, *file_size)
         })
         .collect();

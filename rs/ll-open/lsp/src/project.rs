@@ -1342,6 +1342,134 @@ mod tests {
         );
     }
 
+    /// ADR-0013 Step 1 (be6136): when `_source` and `_ast` are
+    /// populated and the LSP location's URI resolves to a known source
+    /// path, `referrer_node_id` is set to the smallest enclosing AST
+    /// node (not NULL). Pin the byte-range join: this is the table that
+    /// mache's canonical views read.
+    #[test]
+    fn project_references_populates_referrer_node_id() {
+        use std::collections::HashMap;
+        let conn = Connection::open_in_memory().unwrap();
+
+        // _source: id is the rel path; .path is the absolute
+        // (canonicalized) path used as the file:// URI body.
+        conn.execute_batch(
+            "CREATE TABLE _source (id TEXT PRIMARY KEY, language TEXT, path TEXT);
+             CREATE TABLE _ast (
+                 node_id TEXT PRIMARY KEY,
+                 source_id TEXT NOT NULL,
+                 node_kind TEXT NOT NULL,
+                 start_byte INTEGER NOT NULL,
+                 end_byte INTEGER NOT NULL,
+                 start_row INTEGER NOT NULL,
+                 start_col INTEGER NOT NULL,
+                 end_row INTEGER NOT NULL,
+                 end_col INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO _source VALUES ('main.go', 'go', '/canonical/main.go')",
+            [],
+        )
+        .unwrap();
+        // Enclosing function at lines 0..3, plus a tighter inner block
+        // at lines 1..2. The smaller (end_byte - start_byte) wins —
+        // pinning the ORDER BY in lookup_referrer_node_id.
+        conn.execute(
+            "INSERT INTO _ast VALUES \
+             ('fn_outer', 'main.go', 'function_declaration', 0, 100, 0, 0, 3, 0), \
+             ('block_inner', 'main.go', 'block', 30, 60, 1, 0, 2, 0)",
+            [],
+        )
+        .unwrap();
+
+        // ref at line 1, col 4 in /canonical/main.go.
+        let mut locs = vec![make_location("file:///canonical/main.go", 1, 4)];
+        locs[0].range.end.character = 7;
+
+        let bytes_by_uri: HashMap<String, String> = HashMap::from([(
+            "file:///canonical/main.go".to_string(),
+            "fn foo() {\n    bar(baz);\n}\n".to_string(),
+        )]);
+        let mut lookup = |uri: &str| bytes_by_uri.get(uri).cloned();
+
+        project_references(&conn, "fn_foo", &locs, &mut lookup).unwrap();
+
+        let referrer: Option<String> = conn
+            .query_row(
+                "SELECT referrer_node_id FROM _lsp_refs WHERE node_id = 'fn_foo' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            referrer.as_deref(),
+            Some("block_inner"),
+            "referrer_node_id must resolve to the smallest enclosing AST node",
+        );
+    }
+
+    /// be6136: lookup_referrer_node_id misses when `_source.path`
+    /// disagrees with the file:// URI by even one byte (e.g. macOS
+    /// `/tmp` vs `/private/tmp`). This is the regression: when the
+    /// stored path is un-canonicalized but the URI is canonicalized,
+    /// every join misses and every row's referrer_node_id is NULL.
+    /// Pin the *negative* path so a future change that re-introduces
+    /// a normalization mismatch surfaces here.
+    #[test]
+    fn lookup_referrer_node_id_returns_none_on_path_mismatch() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        conn.execute_batch(
+            "CREATE TABLE _source (id TEXT PRIMARY KEY, language TEXT, path TEXT);
+             CREATE TABLE _ast (
+                 node_id TEXT PRIMARY KEY,
+                 source_id TEXT NOT NULL,
+                 node_kind TEXT NOT NULL,
+                 start_byte INTEGER NOT NULL,
+                 end_byte INTEGER NOT NULL,
+                 start_row INTEGER NOT NULL,
+                 start_col INTEGER NOT NULL,
+                 end_row INTEGER NOT NULL,
+                 end_col INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        // Stored path is un-canonicalized.
+        conn.execute(
+            "INSERT INTO _source VALUES ('main.go', 'go', '/tmp/main.go')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO _ast VALUES \
+             ('fn_outer', 'main.go', 'function_declaration', 0, 100, 0, 0, 3, 0)",
+            [],
+        )
+        .unwrap();
+
+        // URI is canonicalized.
+        let mut locs = vec![make_location("file:///private/tmp/main.go", 1, 4)];
+        locs[0].range.end.character = 7;
+
+        let mut nop_lookup = |_uri: &str| -> Option<String> { None };
+        project_references(&conn, "fn_foo", &locs, &mut nop_lookup).unwrap();
+
+        let referrer: Option<String> = conn
+            .query_row(
+                "SELECT referrer_node_id FROM _lsp_refs WHERE node_id = 'fn_foo' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            referrer.is_none(),
+            "path mismatch must produce NULL referrer_node_id (regression pin)",
+        );
+    }
+
     /// ADR-0013 Step 1: when source_lookup returns None (file
     /// unavailable, cross-repo URI), ref_token defaults to empty
     /// string — NEVER NULL. Pin so consumer queries on `ref_token != ''`

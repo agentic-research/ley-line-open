@@ -41,3 +41,13 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 rusqlite = { version = "0.34", features = ["bundled", "serialize"] }
 leyline-core = { path = "../../ll-core/core" }
 bytemuck = { version = "1.14", features = ["derive"] }
+
+[[bench]]
+name = "wal_snapshot_experiment"
+path = "benches/wal_snapshot_experiment.rs"
+harness = false
+
+[[bench]]
+name = "wal_concurrent_readers"
+path = "benches/wal_concurrent_readers.rs"
+harness = false

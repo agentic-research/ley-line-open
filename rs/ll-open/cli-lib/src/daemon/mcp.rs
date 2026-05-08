@@ -358,7 +358,7 @@ fn handle_tools_list(id: Value) -> JsonRpcResponse {
 
 /// `tools/call` — translate `{ name, arguments }` into the daemon's existing
 /// op shape and dispatch through `handle_base_op`.
-fn handle_tools_call(ctx: &DaemonContext, id: Value, params: &Value) -> JsonRpcResponse {
+fn handle_tools_call(ctx: &std::sync::Arc<DaemonContext>, id: Value, params: &Value) -> JsonRpcResponse {
     let Some(name) = params.get("name").and_then(|v| v.as_str()) else {
         return JsonRpcResponse::err(Some(id), -32602, "missing `name` in params");
     };

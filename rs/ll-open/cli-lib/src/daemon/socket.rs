@@ -150,7 +150,7 @@ async fn handle_connection(ctx: Arc<DaemonContext>, stream: tokio::net::UnixStre
 /// 4. Extension sync -> ctx.ext.handle_op()
 /// 5. Unknown -> error
 async fn dispatch(
-    ctx: &DaemonContext,
+    ctx: &Arc<DaemonContext>,
     conn_state: &mut ConnectionState,
     op: &str,
     req: &serde_json::Value,

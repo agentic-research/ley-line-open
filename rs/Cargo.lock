@@ -1285,6 +1285,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "leyline-schema-capnp"
+version = "0.1.0"
+dependencies = [
+ "capnp",
+ "capnpc",
+]
+
+[[package]]
 name = "leyline-ts"
 version = "0.1.0"
 dependencies = [

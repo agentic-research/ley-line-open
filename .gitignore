@@ -26,6 +26,7 @@
 # Build infrastructure
 !Taskfile.yml
 !rs/pkgconfig/**
+!entitlements.plist
 
 # Documentation
 !docs/**

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Network: leyline daemon binds MCP HTTP port and (optionally)
+         NFS port; quic-go needs UDP socket access; LSP servers
+         spawned as children may use network for module resolution. -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+    <key>com.apple.security.network.server</key>
+    <true/>
+    <!-- File access: arena + control files written under user-chosen
+         paths (often outside ~). Without this, macOS sandbox blocks
+         the open() before SIGKILL. Granted via "no sandbox" mode
+         (no app-sandbox key); ad-hoc signing has no sandbox by
+         default, but explicit network entitlements force the system
+         to evaluate the binary's policy — listing network here keeps
+         the unrestricted FS surface intact. -->
+</dict>
+</plist>

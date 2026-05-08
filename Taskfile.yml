@@ -45,11 +45,19 @@ tasks:
       - cargo build --release -p leyline-cli --features mount
 
   install:
-    desc: Build release and install to ~/.local/bin (headless — no FUSE required)
+    desc: Build release, codesign (macOS), and install to ~/.local/bin
     deps: [release]
     cmds:
       - mkdir -p ~/.local/bin
       - cp rs/target/release/leyline ~/.local/bin/leyline
+      # macOS: ad-hoc codesign with explicit network entitlements.
+      # Without this, the binary launches but is SIGKILLed on first
+      # network/socket use (exit 137). The linker's adhoc signature
+      # alone is insufficient — macOS evaluates the entitlements
+      # plist on launch and refuses unentitled network ops. Mirrors
+      # mache's install flow (which hit the same issue).
+      - cmd: codesign -s - --force --deep --entitlements entitlements.plist ~/.local/bin/leyline
+        platforms: [darwin]
       - echo "installed $(~/.local/bin/leyline --version)"
 
   # --------------------------------------------------------------------------

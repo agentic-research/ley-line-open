@@ -42,7 +42,43 @@ const PASS_FILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5)
 /// Spawns language servers for each language found in `_source`, collects
 /// document symbols, merges into the living db's `_lsp*` tables. Enriches
 /// each symbol with go-to-definition, hover, and references.
-pub struct LspEnrichmentPass;
+///
+/// **60f75d-7b — server pool**: holds a `tokio::sync::Mutex<HashMap<String,
+/// LspClient>>` keyed by language id. First call for a language spawns
+/// the server (gopls/rust-analyzer/pyright/clangd/jdtls/zls); subsequent
+/// calls reuse the cached client. The pre-7b implementation spawned a
+/// fresh server per call and shut it down on completion — every lazy-
+/// enrich on a previously-seen language paid the full cold-start cost
+/// (gopls index, rust-analyzer build graph, etc.).
+///
+/// The pool is global per-pass (one HashMap protected by one async
+/// Mutex) so concurrent same-language enrichments serialize through it.
+/// LSP servers are mostly single-threaded over their stdin pipe anyway;
+/// the serialization is rarely the bottleneck. Per-language sub-mutexes
+/// (cross-language concurrency) is a future optimization.
+///
+/// Lifecycle: pool grows until daemon shutdown. No idle eviction in v1
+/// — typical session uses 1-3 languages, ~hundreds of MB each, total
+/// well under 1GB. The OS reclaims spawned servers on daemon exit.
+pub struct LspEnrichmentPass {
+    pool: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, leyline_lsp::client::LspClient>>>,
+}
+
+impl Default for LspEnrichmentPass {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LspEnrichmentPass {
+    /// Construct a new pass with an empty server pool. Servers are
+    /// spawned lazily on first use per language.
+    pub fn new() -> Self {
+        Self {
+            pool: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+}
 
 impl EnrichmentPass for LspEnrichmentPass {
     fn name(&self) -> &str {
@@ -122,10 +158,14 @@ impl EnrichmentPass for LspEnrichmentPass {
                     .display()
             );
 
-            // Spawn one server per language, enrich all files.
+            // 60f75d-7b: reuse pooled client across enrichment batches.
+            // First call for `lang` spawns the server; subsequent calls
+            // skip the spawn cost entirely.
+            let pool = self.pool.clone();
             let result = tokio::task::block_in_place(|| {
-                handle.block_on(enrich_files(
+                handle.block_on(enrich_files_pooled(
                     conn,
+                    pool,
                     server_cmd,
                     server_args,
                     &root_uri,
@@ -221,9 +261,19 @@ fn collect_enrichment_targets(
     }
 }
 
-/// Spawn an LSP server, enrich a batch of files, shut down.
-async fn enrich_files(
+/// 60f75d-7b: pool-aware wrapper. Locks the pool, finds-or-spawns
+/// the client for `lang`, runs `enrich_files_with_client` against
+/// the pooled handle, returns. The client is NOT shut down — it
+/// stays in the pool for the next call.
+///
+/// Holds the pool lock across the entire enrichment batch (single
+/// concurrent enrichment globally during this call). Per-language
+/// sub-mutexes for cross-language concurrency is a future
+/// optimization tracked under 60f75d.
+#[allow(clippy::too_many_arguments)]
+async fn enrich_files_pooled(
     conn: &Connection,
+    pool: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, leyline_lsp::client::LspClient>>>,
     server_cmd: &str,
     server_args: &[&str],
     root_uri: &str,
@@ -231,10 +281,34 @@ async fn enrich_files(
     lang: &str,
     files: &[(String, String)],
 ) -> Result<(u64, u64)> {
-    let mut client = leyline_lsp::client::LspClient::start(server_cmd, server_args, root_uri)
-        .await
-        .with_context(|| format!("start {server_cmd}"))?;
+    let mut pool_guard = pool.lock().await;
 
+    // Lookup-or-spawn for this language.
+    let client = match pool_guard.get_mut(lang) {
+        Some(c) => c,
+        None => {
+            let new_client = leyline_lsp::client::LspClient::start(
+                server_cmd, server_args, root_uri,
+            )
+            .await
+            .with_context(|| format!("start {server_cmd} (pool insert)"))?;
+            pool_guard.entry(lang.to_string()).or_insert(new_client)
+        }
+    };
+
+    enrich_files_with_client(client, conn, source_dir, lang, files).await
+}
+
+/// Run a batch of files through an existing LspClient. Does NOT
+/// spawn or shut down the client — caller manages lifecycle (the pool
+/// keeps it alive across calls).
+async fn enrich_files_with_client(
+    client: &mut leyline_lsp::client::LspClient,
+    conn: &Connection,
+    source_dir: &Path,
+    lang: &str,
+    files: &[(String, String)],
+) -> Result<(u64, u64)> {
     let mut total_symbols = 0u64;
     let mut total_enriched = 0u64;
 
@@ -297,7 +371,7 @@ async fn enrich_files(
             let matched = leyline_lsp::project::merge_lsp_into_ast(&symbols, &diagnostics, conn)?;
 
             // Enrich with definitions, hover, references.
-            let stats = leyline_lsp::project::enrich_symbols(&mut client, conn, &symbols, &file_uri).await?;
+            let stats = leyline_lsp::project::enrich_symbols(client, conn, &symbols, &file_uri).await?;
 
             eprintln!(
                 "lsp: {rel} — {matched} symbols, {} defs, {} hovers, {} refs",
@@ -326,7 +400,7 @@ async fn enrich_files(
         }
     }
 
-    client.shutdown().await?;
+    // No shutdown — the pool keeps the client alive across calls (60f75d-7b).
     Ok((total_symbols, total_enriched))
 }
 
@@ -370,11 +444,40 @@ mod tests {
         // silently. The 5 _lsp* tables in writes are the schema-
         // partition contract.
         crate::daemon::enrichment::assert_pass_metadata(
-            &LspEnrichmentPass,
+            &LspEnrichmentPass::new(),
             "lsp",
             &["tree-sitter"],
             &["_source", "_ast", "nodes"],
             &["_lsp", "_lsp_defs", "_lsp_refs", "_lsp_hover", "_lsp_completions"],
+        );
+    }
+
+    /// 60f75d-7b: pool starts empty. First call for a language inserts;
+    /// subsequent calls find the cached client. Pin the empty-on-new
+    /// invariant — without it, a refactor that pre-populated the pool
+    /// (e.g. for "warm-start") would silently change spawn semantics.
+    #[tokio::test]
+    async fn lsp_pass_pool_starts_empty() {
+        let pass = LspEnrichmentPass::new();
+        let pool = pass.pool.lock().await;
+        assert_eq!(pool.len(), 0, "fresh pool must be empty");
+    }
+
+    /// 60f75d-7b: each `LspEnrichmentPass::new()` gets its own pool
+    /// (fresh empty HashMap). Pin so a refactor that accidentally made
+    /// the pool a `static`/global (which would break per-daemon
+    /// isolation) surfaces here.
+    #[tokio::test]
+    async fn lsp_pass_pool_is_per_instance() {
+        let p1 = LspEnrichmentPass::new();
+        let p2 = LspEnrichmentPass::new();
+        // Insert a sentinel into p1's pool by direct manipulation.
+        // (Real spawn requires gopls-on-PATH; pinning structural
+        // isolation doesn't need a real client.)
+        // Compare Arc identities — they must be distinct.
+        assert!(
+            !std::sync::Arc::ptr_eq(&p1.pool, &p2.pool),
+            "two pass instances must have independent pools",
         );
     }
 

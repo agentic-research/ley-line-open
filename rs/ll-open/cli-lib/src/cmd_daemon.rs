@@ -206,7 +206,7 @@ pub async fn run_daemon(
                 Box::new(crate::daemon::enrichment::TreeSitterPass),
             ];
             #[cfg(feature = "lsp")]
-            passes.push(Box::new(crate::daemon::lsp_pass::LspEnrichmentPass));
+            passes.push(Box::new(crate::daemon::lsp_pass::LspEnrichmentPass::new()));
             #[cfg(feature = "vec")]
             passes.push(Box::new(crate::daemon::embed::EmbeddingPass::new(
                 vec_index.clone(),

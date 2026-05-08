@@ -27,6 +27,10 @@ pub mod common_capnp {
     include!(concat!(env!("OUT_DIR"), "/common_capnp.rs"));
 }
 
+pub mod binding_capnp {
+    include!(concat!(env!("OUT_DIR"), "/binding_capnp.rs"));
+}
+
 #[cfg(test)]
 mod tests {
     use super::common_capnp::{position, range};

@@ -1259,12 +1259,15 @@ name = "leyline-lsp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "capnp",
  "leyline-schema",
+ "leyline-schema-capnp",
  "log",
  "lsp-types",
  "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

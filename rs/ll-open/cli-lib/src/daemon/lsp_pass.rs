@@ -14,6 +14,29 @@ use leyline_lsp::languages::{language_id_from_ext, language_server};
 
 use super::enrichment::{EnrichmentPass, EnrichmentStats};
 
+/// T8.2: derive the capnp binding-event-log path from a connection's
+/// backing file. Returns `None` for `:memory:` connections (where
+/// dual-write would have nowhere to land); the daemon's current
+/// shape hits this branch until 5f7100-15a switches to a file-backed
+/// live db. File-backed connections (the standalone `leyline lsp
+/// out.db` path, and any future daemon WAL adoption) get
+/// `Some(${db_path}.bindings.capnp)`.
+fn sibling_capnp_log(conn: &Connection) -> Option<std::path::PathBuf> {
+    let row: rusqlite::Result<String> = conn.query_row(
+        "SELECT file FROM pragma_database_list WHERE name = 'main' LIMIT 1",
+        [],
+        |r| r.get(0),
+    );
+    match row {
+        Ok(s) if !s.is_empty() => {
+            let mut p = std::path::PathBuf::from(s);
+            p.set_extension("bindings.capnp");
+            Some(p)
+        }
+        _ => None,
+    }
+}
+
 /// Symbol-poll cadence for daemon-driven enrichment. Tighter than the
 /// one-shot `cmd_lsp` path because the daemon reuses the same server
 /// across many files in a batch — by the time a second file is opened
@@ -370,8 +393,22 @@ async fn enrich_files_with_client(
             // Merge symbols into AST nodes.
             let matched = leyline_lsp::project::merge_lsp_into_ast(&symbols, &diagnostics, conn)?;
 
+            // T8.2: capnp BindingRecord dual-write target — sit next to
+            // the live db file. `:memory:` connections (current daemon
+            // shape) report empty; we skip the dual-write there. Lights
+            // up automatically once 5f7100-15a switches the daemon to a
+            // file-backed live db.
+            let binding_log = sibling_capnp_log(conn);
+
             // Enrich with definitions, hover, references.
-            let stats = leyline_lsp::project::enrich_symbols(client, conn, &symbols, &file_uri).await?;
+            let stats = leyline_lsp::project::enrich_symbols(
+                client,
+                conn,
+                &symbols,
+                &file_uri,
+                binding_log.as_deref(),
+            )
+            .await?;
 
             eprintln!(
                 "lsp: {rel} — {matched} symbols, {} defs, {} hovers, {} refs",

@@ -160,7 +160,18 @@ pub async fn cmd_lsp(
         conn
     };
 
-    let enrichment = project::enrich_symbols(&mut client, &conn, &symbols, &file_uri).await?;
+    // T8.2: dual-write the capnp binding event log next to `output`.
+    // CLI path always knows where to land; daemon path defers to
+    // pragma_database_list per lsp_pass.rs::sibling_capnp_log.
+    let binding_log = output.with_extension("bindings.capnp");
+    let enrichment = project::enrich_symbols(
+        &mut client,
+        &conn,
+        &symbols,
+        &file_uri,
+        Some(&binding_log),
+    )
+    .await?;
     eprintln!("enrichment: {enrichment}");
 
     let data = conn.serialize(DatabaseName::Main)?;

@@ -10,7 +10,7 @@
 //! - `_lsp_hover` — hover text per node
 //! - `_lsp_completions` — completion items per position
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -402,9 +402,24 @@ pub fn project_references(
     target_node_id: &str,
     locations: &[Location],
     source_lookup: &mut dyn FnMut(&str) -> Option<String>,
+    binding_log: Option<&std::path::Path>,
 ) -> Result<usize> {
     conn.execute_batch(LSP_REFS_DDL)?;
     migrate_lsp_schema(conn)?;
+
+    // T8.2: open the binding event log for append. `None` skips the
+    // dual-write (e.g. tests, :memory: connections without a path).
+    let mut binding_writer = match binding_log {
+        Some(p) => Some(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .with_context(|| format!("open binding event log {}", p.display()))?,
+        ),
+        None => None,
+    };
+
     let mut count = 0;
     for loc in locations {
         let uri = loc.uri.as_str();
@@ -419,6 +434,13 @@ pub fn project_references(
         // in _ast (cross-repo refs to dependencies, etc.). The call
         // takes the SAME conn that holds _ast — load-bearing.
         let referrer_node_id = lookup_referrer_node_id(conn, uri, &loc.range);
+
+        // T8.2: also resolve the smallest enclosing function/method
+        // construct. `find_callers` MCP and `node_refs` shape want
+        // construct level, not leaf. This is the disambiguation that
+        // Falsifiability B's 100% mismatch revealed at the SQL boundary
+        // (cdcae2 alignment-options comment, 2026-05-08).
+        let construct_node_id = lookup_construct_node_id(conn, uri, &loc.range);
 
         conn.execute(
             "INSERT INTO _lsp_refs (node_id, referrer_node_id, ref_token, ref_uri, \
@@ -435,9 +457,150 @@ pub fn project_references(
                 loc.range.end.character,
             ],
         )?;
+
+        // T8.2: dual-write the typed BindingRecord. `_lsp_refs` row
+        // stays the local SQL projection; the capnp record is the
+        // cross-process contract per the L2/L3 reframe.
+        if let Some(w) = binding_writer.as_mut() {
+            write_binding_record(
+                w,
+                target_node_id,
+                &ref_token,
+                construct_node_id.as_deref().unwrap_or(""),
+                referrer_node_id.as_deref().unwrap_or(""),
+                uri,
+                &loc.range,
+            )?;
+        }
+
         count += 1;
     }
     Ok(count)
+}
+
+/// AST node kinds that count as a "callable construct" for
+/// `constructNodeId` resolution. Curated per language; intentionally
+/// excludes inline lambdas (`arrow_function`, `anonymous_function`,
+/// `lambda`) — `find_callers` UX wants the named scope, not the
+/// closure that hosts the call.
+///
+/// Adding a language: append the kind names tree-sitter produces for
+/// "directly callable named scope." Don't add class/struct/impl —
+/// those are container kinds, not constructs (a different layer
+/// consumers can derive on their own by walking parents).
+const CONSTRUCT_KINDS: &[&str] = &[
+    // Go
+    "function_declaration",
+    "method_declaration",
+    // Python
+    "function_definition",
+    // Rust
+    "function_item",
+    // TypeScript / JavaScript
+    "method_definition",
+    // Java / Kotlin / C#
+    "constructor_declaration",
+];
+
+/// T8.2: resolve the smallest enclosing function/method/constructor
+/// node at the ref site. Mirrors `lookup_referrer_node_id` but filters
+/// by `node_kind IN CONSTRUCT_KINDS`. Returns `None` when the file
+/// isn't projected, when the ref sits outside any construct (top-level
+/// declarations), or when the source language uses construct kinds we
+/// don't yet recognize.
+fn lookup_construct_node_id(
+    conn: &Connection,
+    ref_uri: &str,
+    range: &protocol::Range,
+) -> Option<String> {
+    let abs_path = ref_uri.strip_prefix("file://").unwrap_or(ref_uri);
+    let source_id: String = conn
+        .query_row(
+            "SELECT id FROM _source WHERE path = ?1 LIMIT 1",
+            [abs_path],
+            |r| r.get(0),
+        )
+        .ok()?;
+
+    let line = range.start.line as i64;
+    let col = range.start.character as i64;
+
+    // Build the SQL `IN (...)` placeholders from CONSTRUCT_KINDS at
+    // call time — keeping the kind list in one place (the const
+    // above) avoids drift between the schema's documented set and the
+    // SQL filter.
+    let placeholders = (0..CONSTRUCT_KINDS.len())
+        .map(|i| format!("?{}", i + 4))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT node_id FROM _ast \
+         WHERE source_id = ?1 \
+           AND start_row <= ?2 AND end_row >= ?2 \
+           AND (start_row < ?2 OR start_col <= ?3) \
+           AND (end_row > ?2 OR end_col >= ?3) \
+           AND node_kind IN ({placeholders}) \
+         ORDER BY (end_byte - start_byte) ASC \
+         LIMIT 1"
+    );
+
+    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![
+        Box::new(source_id),
+        Box::new(line),
+        Box::new(col),
+    ];
+    for kind in CONSTRUCT_KINDS {
+        params_vec.push(Box::new(*kind));
+    }
+    let params_refs: Vec<&dyn rusqlite::ToSql> =
+        params_vec.iter().map(|b| b.as_ref()).collect();
+
+    conn.query_row(&sql, params_refs.as_slice(), |r| r.get::<_, String>(0))
+        .ok()
+}
+
+/// T8.2: serialize a single BindingRecord and append it to the binding
+/// event log. The log is plain capnp framed messages back-to-back —
+/// readers iterate via `capnp::serialize::read_message` until EOF.
+fn write_binding_record(
+    writer: &mut std::fs::File,
+    target_node_id: &str,
+    ref_token: &str,
+    construct_node_id: &str,
+    ref_site_node_id: &str,
+    ref_uri: &str,
+    range: &protocol::Range,
+) -> Result<()> {
+    use leyline_schema_capnp::binding_capnp::binding_record;
+
+    let mut msg = capnp::message::Builder::new_default();
+    {
+        let mut rec: binding_record::Builder = msg.init_root();
+        rec.set_target_node_id(target_node_id);
+        rec.set_ref_token(ref_token);
+        rec.set_construct_node_id(construct_node_id);
+        rec.set_ref_site_node_id(ref_site_node_id);
+        rec.set_ref_uri(ref_uri);
+        // parseGen left at 0 for now; T8.5 wires it to Σ generation.
+        rec.set_parse_gen(0);
+        let mut r = rec.init_ref_range();
+        {
+            let mut s = r.reborrow().init_start();
+            s.set_line(range.start.line);
+            s.set_column(range.start.character);
+            s.set_byte(0); // byte offset not available from LSP Range
+        }
+        {
+            let mut e = r.reborrow().init_end();
+            e.set_line(range.end.line);
+            e.set_column(range.end.character);
+            e.set_byte(0);
+        }
+    }
+
+    capnp::serialize::write_message(writer, &msg)
+        .context("write BindingRecord to event log")?;
+    Ok(())
 }
 
 /// Extract the textual token at an LSP `Range` from source bytes.
@@ -711,6 +874,7 @@ pub async fn enrich_symbols(
     conn: &Connection,
     symbols: &[DocumentSymbol],
     file_uri: &str,
+    binding_log: Option<&std::path::Path>,
 ) -> Result<EnrichmentStats> {
     let positions = flatten_symbols(symbols, "symbols");
     let mut stats = EnrichmentStats::default();
@@ -751,7 +915,8 @@ pub async fn enrich_symbols(
                     source_cache.insert(uri.to_string(), bytes.clone());
                     bytes
                 };
-                stats.references += project_references(conn, &pos.node_id, &locs, &mut lookup)?;
+                stats.references +=
+                    project_references(conn, &pos.node_id, &locs, &mut lookup, binding_log)?;
             }
             _ => {}
         }
@@ -1239,7 +1404,8 @@ mod tests {
         // through to empty. Per ADR-0013 contract: ref_token defaults
         // to '' on lookup failure, never NULL.
         let mut nop_lookup = |_uri: &str| -> Option<String> { None };
-        let count = project_references(&conn, "my_var", &locs, &mut nop_lookup).unwrap();
+        let count =
+            project_references(&conn, "my_var", &locs, &mut nop_lookup, None).unwrap();
         assert_eq!(count, 3);
 
         let rows: i64 = conn
@@ -1327,7 +1493,7 @@ mod tests {
         )]);
         let mut lookup = |uri: &str| bytes_by_uri.get(uri).cloned();
 
-        project_references(&conn, "fn_foo", &locs, &mut lookup).unwrap();
+        project_references(&conn, "fn_foo", &locs, &mut lookup, None).unwrap();
 
         let token: String = conn
             .query_row(
@@ -1340,6 +1506,157 @@ mod tests {
             token, "bar",
             "ADR-0013 Step 1: ref_token must be populated from source bytes",
         );
+    }
+
+    /// T8.2: when binding_log = Some(path), each location emits a
+    /// capnp BindingRecord readable back. Pin the round-trip and
+    /// the parity invariant: every SQL `_lsp_refs` row has a
+    /// corresponding capnp record with the same target/refUri/range.
+    #[test]
+    fn project_references_dual_writes_capnp_binding_log() {
+        use std::collections::HashMap;
+        use leyline_schema_capnp::binding_capnp::binding_record;
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("test.bindings.capnp");
+        let conn = Connection::open_in_memory().unwrap();
+
+        // Seed _ast + _source so construct/refSite resolution exercises
+        // the full lookup paths (not just the SQL writes).
+        conn.execute_batch(
+            "CREATE TABLE _source (id TEXT PRIMARY KEY, language TEXT, path TEXT);
+             CREATE TABLE _ast (
+                 node_id TEXT PRIMARY KEY,
+                 source_id TEXT NOT NULL,
+                 node_kind TEXT NOT NULL,
+                 start_byte INTEGER NOT NULL,
+                 end_byte INTEGER NOT NULL,
+                 start_row INTEGER NOT NULL,
+                 start_col INTEGER NOT NULL,
+                 end_row INTEGER NOT NULL,
+                 end_col INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO _source VALUES ('main.go', 'go', '/canon/main.go')",
+            [],
+        )
+        .unwrap();
+        // Function (construct level) wraps the inner identifier (leaf).
+        conn.execute(
+            "INSERT INTO _ast VALUES \
+             ('fn_outer', 'main.go', 'function_declaration', 0, 100, 0, 0, 3, 0), \
+             ('id_inner', 'main.go', 'identifier', 30, 33, 1, 4, 1, 7)",
+            [],
+        )
+        .unwrap();
+
+        let mut locs = vec![make_location("file:///canon/main.go", 1, 4)];
+        locs[0].range.end.character = 7;
+
+        let bytes_by_uri: HashMap<String, String> = HashMap::from([(
+            "file:///canon/main.go".to_string(),
+            "fn foo() {\n    bar(baz);\n}\n".to_string(),
+        )]);
+        let mut lookup = |uri: &str| bytes_by_uri.get(uri).cloned();
+
+        project_references(&conn, "fn_bar", &locs, &mut lookup, Some(&log_path)).unwrap();
+
+        // Read the capnp log back.
+        let mut bytes: &[u8] = &std::fs::read(&log_path).unwrap();
+        let msg = capnp::serialize::read_message(&mut bytes, capnp::message::ReaderOptions::new())
+            .unwrap();
+        let rec: binding_record::Reader = msg.get_root().unwrap();
+
+        assert_eq!(rec.get_target_node_id().unwrap().to_str().unwrap(), "fn_bar");
+        assert_eq!(rec.get_ref_token().unwrap().to_str().unwrap(), "bar");
+        assert_eq!(
+            rec.get_construct_node_id().unwrap().to_str().unwrap(),
+            "fn_outer",
+            "T8.2: constructNodeId resolves to function_declaration",
+        );
+        assert_eq!(
+            rec.get_ref_site_node_id().unwrap().to_str().unwrap(),
+            "id_inner",
+            "T8.2: refSiteNodeId resolves to leaf identifier",
+        );
+        assert_eq!(
+            rec.get_ref_uri().unwrap().to_str().unwrap(),
+            "file:///canon/main.go",
+        );
+        let r = rec.get_ref_range().unwrap();
+        let s = r.get_start().unwrap();
+        let e = r.get_end().unwrap();
+        assert_eq!(s.get_line(), 1);
+        assert_eq!(s.get_column(), 4);
+        assert_eq!(e.get_column(), 7);
+
+        // Parity: SQL row's referrer_node_id == capnp's refSiteNodeId
+        // (both the leaf-identifier path). Eyeballs the dual-write
+        // invariant the schema is supposed to enforce.
+        let sql_referrer: String = conn
+            .query_row(
+                "SELECT referrer_node_id FROM _lsp_refs WHERE node_id = 'fn_bar' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sql_referrer, "id_inner");
+    }
+
+    /// T8.2: lookup_construct_node_id finds the smallest enclosing
+    /// function/method/constructor. Pin the per-language kind set
+    /// (CONSTRUCT_KINDS) by exercising all of them.
+    #[test]
+    fn lookup_construct_node_id_per_language() {
+        let cases = [
+            ("function_declaration", "go_fn"),
+            ("method_declaration", "go_method"),
+            ("function_definition", "py_fn"),
+            ("function_item", "rs_fn"),
+            ("method_definition", "ts_method"),
+            ("constructor_declaration", "java_ctor"),
+        ];
+
+        for (kind, expected_id) in cases {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE _source (id TEXT PRIMARY KEY, language TEXT, path TEXT);
+                 CREATE TABLE _ast (
+                     node_id TEXT PRIMARY KEY,
+                     source_id TEXT NOT NULL,
+                     node_kind TEXT NOT NULL,
+                     start_byte INTEGER NOT NULL,
+                     end_byte INTEGER NOT NULL,
+                     start_row INTEGER NOT NULL,
+                     start_col INTEGER NOT NULL,
+                     end_row INTEGER NOT NULL,
+                     end_col INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO _source VALUES ('f', '?', '/x/f')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                &format!(
+                    "INSERT INTO _ast VALUES \
+                     ('{expected_id}', 'f', '{kind}', 0, 100, 0, 0, 3, 0), \
+                     ('inside', 'f', 'identifier', 30, 33, 1, 4, 1, 7)"
+                ),
+                [],
+            )
+            .unwrap();
+            let mut range = make_location("file:///x/f", 1, 4).range;
+            range.end.character = 7;
+            assert_eq!(
+                lookup_construct_node_id(&conn, "file:///x/f", &range).as_deref(),
+                Some(expected_id),
+                "construct kind {kind} must resolve",
+            );
+        }
     }
 
     /// ADR-0013 Step 1 (be6136): when `_source` and `_ast` are
@@ -1395,7 +1712,7 @@ mod tests {
         )]);
         let mut lookup = |uri: &str| bytes_by_uri.get(uri).cloned();
 
-        project_references(&conn, "fn_foo", &locs, &mut lookup).unwrap();
+        project_references(&conn, "fn_foo", &locs, &mut lookup, None).unwrap();
 
         let referrer: Option<String> = conn
             .query_row(
@@ -1455,7 +1772,7 @@ mod tests {
         locs[0].range.end.character = 7;
 
         let mut nop_lookup = |_uri: &str| -> Option<String> { None };
-        project_references(&conn, "fn_foo", &locs, &mut nop_lookup).unwrap();
+        project_references(&conn, "fn_foo", &locs, &mut nop_lookup, None).unwrap();
 
         let referrer: Option<String> = conn
             .query_row(
@@ -1480,7 +1797,7 @@ mod tests {
         let locs = vec![make_location("file:///unreachable.rs", 0, 0)];
         let mut nop_lookup = |_uri: &str| -> Option<String> { None };
 
-        project_references(&conn, "n0", &locs, &mut nop_lookup).unwrap();
+        project_references(&conn, "n0", &locs, &mut nop_lookup, None).unwrap();
 
         let token: String = conn
             .query_row(

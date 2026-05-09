@@ -19,8 +19,8 @@ use std::collections::HashMap;
 
 use rusqlite::Connection;
 
-use crate::util::{hv_from_slice, rotate_left, xor_into, Hypervector, ZERO_HV};
 use crate::LayerKind;
+use crate::util::{Hypervector, ZERO_HV, hv_from_slice, rotate_left, xor_into};
 
 /// Stable role-permutation index per layer. Layer-tagged so a
 /// combined view can recover the per-layer contribution at unbind
@@ -70,11 +70,14 @@ pub fn build_combined_for_scope(
 ) -> rusqlite::Result<(Hypervector, i64)> {
     let mut layers = HashMap::new();
     let mut max_basis: i64 = 0;
-    let mut stmt = conn.prepare_cached(
-        "SELECT layer_kind, hv, basis FROM _hdc WHERE scope_id = ?1",
-    )?;
+    let mut stmt =
+        conn.prepare_cached("SELECT layer_kind, hv, basis FROM _hdc WHERE scope_id = ?1")?;
     let rows = stmt.query_map([scope_id], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, i64>(2)?))
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Vec<u8>>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
     })?;
     for row in rows {
         let (kind_str, blob, basis) = row?;
@@ -210,16 +213,14 @@ mod tests {
         let module = expand_seed(0xBB);
 
         let just_ast = HashMap::from([(LayerKind::Ast, ast)]);
-        let ast_and_module =
-            HashMap::from([(LayerKind::Ast, ast), (LayerKind::Module, module)]);
+        let ast_and_module = HashMap::from([(LayerKind::Ast, ast), (LayerKind::Module, module)]);
 
         let combined_1 = build_combined_hv(&just_ast);
         let combined_2 = build_combined_hv(&ast_and_module);
         assert_ne!(combined_1, combined_2, "adding Module must change combined");
 
         // Zero-HV layer addition is a no-op.
-        let ast_plus_zero =
-            HashMap::from([(LayerKind::Ast, ast), (LayerKind::Semantic, ZERO_HV)]);
+        let ast_plus_zero = HashMap::from([(LayerKind::Ast, ast), (LayerKind::Semantic, ZERO_HV)]);
         assert_eq!(
             build_combined_hv(&ast_plus_zero),
             combined_1,
@@ -238,8 +239,7 @@ mod tests {
 
         let (combined, basis) = build_combined_for_scope(&conn, "fn_foo").unwrap();
         // Compare against in-memory build.
-        let expected_layers =
-            HashMap::from([(LayerKind::Ast, ast), (LayerKind::Module, module)]);
+        let expected_layers = HashMap::from([(LayerKind::Ast, ast), (LayerKind::Module, module)]);
         assert_eq!(combined, build_combined_hv(&expected_layers));
         // Basis should be max(1, 2) = 2.
         assert_eq!(basis, 2);

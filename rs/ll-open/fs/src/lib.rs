@@ -6,7 +6,7 @@ pub mod nfs;
 pub mod staging;
 pub mod validate;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use leyline_core::{ArenaHeader, Controller};
 use memmap2::Mmap;
 use rusqlite::{Connection, DatabaseName};
@@ -47,7 +47,8 @@ fn verify_arena_root<'a>(
         bail!(
             "T2.3: ArenaHeader.data_size ({}) > active buffer size ({}). \
              Header corruption — refusing to hash.",
-            data_size, buf.len()
+            data_size,
+            buf.len()
         );
     }
     let data = &buf[..data_size];
@@ -808,5 +809,4 @@ mod tests {
         unsafe { leyline_close(ctx as *mut _) };
         Ok(())
     }
-
 }

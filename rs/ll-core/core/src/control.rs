@@ -84,8 +84,14 @@ const CURRENT_ROOT_LEN: usize = 32;
 // it gives an 8-byte-aligned pointer. If a future field reorder violates
 // this, the cast becomes UB on architectures requiring naturally-aligned
 // atomics (e.g. aarch64 LSE) — fail compilation instead.
-const _: () = assert!(OFF_GENERATION.is_multiple_of(8), "sync atom must be 8-byte aligned");
-const _: () = assert!(OFF_ARENA_SIZE.is_multiple_of(8), "ArenaSize must be 8-byte aligned");
+const _: () = assert!(
+    OFF_GENERATION.is_multiple_of(8),
+    "sync atom must be 8-byte aligned"
+);
+const _: () = assert!(
+    OFF_ARENA_SIZE.is_multiple_of(8),
+    "ArenaSize must be 8-byte aligned"
+);
 
 /// Controller manages a memory-mapped control file.
 pub struct Controller {
@@ -125,19 +131,20 @@ impl Controller {
         } else if existing_magic != MAGIC {
             bail!("invalid control block magic: 0x{:08X}", existing_magic);
         } else {
-            // T2.4: VERSION mismatch is now a hard error. V1 controllers
-            // (pre-T2.4) had a public `generation` API; V2 removed it.
-            // Reading a V1 file as V2 (or vice versa) would silently
-            // misinterpret the sync atom — refuse explicitly.
-            let existing_version = u32::from_ne_bytes(
-                mmap[OFF_VERSION..OFF_VERSION + 4].try_into().unwrap(),
-            );
+            // VERSION mismatch is a hard error. V1 controllers
+            // exposed a public `generation` API that v0.2.0 removed;
+            // reading a V1 file as V2 (or vice versa) would silently
+            // misinterpret the sync atom slot — refuse explicitly.
+            let existing_version =
+                u32::from_ne_bytes(mmap[OFF_VERSION..OFF_VERSION + 4].try_into().unwrap());
             if existing_version != VERSION {
                 bail!(
                     "control block VERSION mismatch: file has v{}, this binary expects v{}. \
-                     T2.4 dropped public `generation`; old binaries cannot read new files \
-                     and vice versa. Coordinate LLO + mache release cutover (decade 9d30ac).",
-                    existing_version, VERSION
+                     LLO v0.2.0 removed the V1 `generation` field from the public API; \
+                     old binaries cannot read new files and vice versa. Coordinate LLO + \
+                     mache release cutover (LLO v0.2.0 + mache v0.8.0 ship together).",
+                    existing_version,
+                    VERSION
                 );
             }
         }
@@ -208,8 +215,7 @@ impl Controller {
     /// to seed or clobber the root region directly.
     #[cfg(test)]
     fn set_current_root(&mut self, root: [u8; 32]) -> Result<()> {
-        self.mmap[OFF_CURRENT_ROOT..OFF_CURRENT_ROOT + CURRENT_ROOT_LEN]
-            .copy_from_slice(&root);
+        self.mmap[OFF_CURRENT_ROOT..OFF_CURRENT_ROOT + CURRENT_ROOT_LEN].copy_from_slice(&root);
         self.mmap.flush().context("flush control block")?;
         Ok(())
     }
@@ -483,8 +489,16 @@ mod tests {
         //   [280..]   interrupt fields when feature enabled
         assert_eq!(OFF_MAGIC, 0);
         assert_eq!(OFF_VERSION, OFF_MAGIC + 4, "version follows magic (u32)");
-        assert_eq!(OFF_GENERATION, OFF_VERSION + 4, "generation follows version (u32)");
-        assert_eq!(OFF_ARENA_PATH, OFF_GENERATION + 8, "arena_path follows generation (u64)");
+        assert_eq!(
+            OFF_GENERATION,
+            OFF_VERSION + 4,
+            "generation follows version (u32)"
+        );
+        assert_eq!(
+            OFF_ARENA_PATH,
+            OFF_GENERATION + 8,
+            "arena_path follows generation (u64)"
+        );
         assert_eq!(ARENA_PATH_LEN, 256, "arena path is fixed 256 bytes");
         assert_eq!(
             OFF_ARENA_SIZE,
@@ -512,8 +526,7 @@ mod tests {
         // against CONTROL_SIZE.
         assert_eq!(OFF_CURRENT_ROOT, 320, "current_root at offset 320");
         assert_eq!(CURRENT_ROOT_LEN, 32, "current_root is 32 bytes (BLAKE3)");
-        const _: () =
-            assert!(OFF_CURRENT_ROOT + CURRENT_ROOT_LEN <= CONTROL_SIZE);
+        const _: () = assert!(OFF_CURRENT_ROOT + CURRENT_ROOT_LEN <= CONTROL_SIZE);
         // Reserved gap [280..320] for interrupt fields, regardless of
         // feature. current_root must not collide. Const assert at
         // compile-time so a refactor that moved OFF_CURRENT_ROOT below
@@ -550,10 +563,9 @@ mod tests {
         let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
 
         let root: [u8; 32] = [
-            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-            0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-            0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+            0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0xfe, 0xdc, 0xba, 0x98,
+            0x76, 0x54, 0x32, 0x10,
         ];
         ctrl.set_current_root(root).unwrap();
         assert_eq!(ctrl.current_root(), root);
@@ -621,7 +633,8 @@ mod tests {
         // Distinct from the arena's MAGIC ("LEY0"). A tool reading
         // either header dispatches on the magic to pick the parser.
         assert_ne!(
-            MAGIC, crate::layout::ArenaHeader::MAGIC,
+            MAGIC,
+            crate::layout::ArenaHeader::MAGIC,
             "control + arena MAGIC must differ for dispatch",
         );
     }
@@ -776,8 +789,8 @@ mod tests {
     /// prior writes to current_root.
     #[test]
     fn set_arena_with_root_root_never_stale_under_writer_race() {
-        use std::sync::atomic::{AtomicBool, Ordering as AOrd};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering as AOrd};
         use std::thread;
 
         let dir = tempdir().unwrap();
@@ -812,9 +825,7 @@ mod tests {
         });
 
         for n in 1u8..=50 {
-            writer
-                .set_arena_with_root("/x", 8, [n; 32])
-                .unwrap();
+            writer.set_arena_with_root("/x", 8, [n; 32]).unwrap();
             std::thread::sleep(std::time::Duration::from_micros(100));
         }
         stop.store(true, AOrd::Release);

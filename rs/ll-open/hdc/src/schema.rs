@@ -77,7 +77,7 @@ mod tests {
     use super::*;
     use crate::test_util::{conn_with_schema as fresh_schema_conn, insert_layer_hv};
     use crate::util::ZERO_HV;
-    use crate::{LayerKind, D_BYTES};
+    use crate::{D_BYTES, LayerKind};
 
     /// Assert a `sqlite_master` row of `kind` ("table" or "index") and
     /// `name` exists. Centralizes the SELECT-COUNT(*)>0 dance so the
@@ -122,7 +122,12 @@ mod tests {
     #[test]
     fn create_hdc_schema_creates_all_four_tables() {
         let conn = fresh_schema_conn();
-        for table in ["_hdc", "_hdc_combined", "_hdc_baseline", "_hdc_subtree_cache"] {
+        for table in [
+            "_hdc",
+            "_hdc_combined",
+            "_hdc_baseline",
+            "_hdc_subtree_cache",
+        ] {
             assert_schema_object_exists(&conn, "table", table);
         }
     }
@@ -196,7 +201,10 @@ mod tests {
             "INSERT INTO _hdc_baseline VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params!["ast", 4000i64, 60i64, 10000i64, 1_700_000_001_000i64],
         );
-        assert!(dup.is_err(), "duplicate baseline for same layer must be rejected");
+        assert!(
+            dup.is_err(),
+            "duplicate baseline for same layer must be rejected"
+        );
 
         // Different layer is fine.
         conn.execute(

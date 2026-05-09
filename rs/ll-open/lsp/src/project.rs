@@ -121,7 +121,9 @@ fn migrate_lsp_schema(conn: &Connection) -> Result<()> {
         ensure_column(conn, "_lsp_defs", "def_token", "TEXT NOT NULL DEFAULT ''")?;
         // ALTER TABLE doesn't add CREATE INDEX clauses; ensure the
         // index exists separately.
-        conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_lsp_defs_token ON _lsp_defs(def_token);")?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_lsp_defs_token ON _lsp_defs(def_token);",
+        )?;
     }
 
     let lsp_refs_exists: bool = conn
@@ -602,16 +604,12 @@ fn lookup_construct_node_id(
          LIMIT 1"
     );
 
-    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![
-        Box::new(source_id),
-        Box::new(line),
-        Box::new(col),
-    ];
+    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
+        vec![Box::new(source_id), Box::new(line), Box::new(col)];
     for kind in CONSTRUCT_KINDS {
         params_vec.push(Box::new(*kind));
     }
-    let params_refs: Vec<&dyn rusqlite::ToSql> =
-        params_vec.iter().map(|b| b.as_ref()).collect();
+    let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
 
     conn.query_row(&sql, params_refs.as_slice(), |r| r.get::<_, String>(0))
         .ok()
@@ -745,7 +743,11 @@ fn extract_token_at_range(source: &str, range: &protocol::Range) -> Option<Strin
 /// where `path` is the absolute path. ADR-0013 Step 1's "byte-range
 /// join at write time" — done once here so consumers don't need to
 /// JOIN at query time.
-fn lookup_referrer_node_id(conn: &Connection, ref_uri: &str, range: &protocol::Range) -> Option<String> {
+fn lookup_referrer_node_id(
+    conn: &Connection,
+    ref_uri: &str,
+    range: &protocol::Range,
+) -> Option<String> {
     // Translate file:// URI to absolute path.
     let abs_path = ref_uri.strip_prefix("file://").unwrap_or(ref_uri);
 
@@ -1483,8 +1485,7 @@ mod tests {
             make_location("file:///c.py", 100, 2),
         ];
         let mut nop_lookup = |_uri: &str| -> Option<String> { None };
-        let count =
-            project_references(&conn, "my_var", &locs, &mut nop_lookup, None).unwrap();
+        let count = project_references(&conn, "my_var", &locs, &mut nop_lookup, None).unwrap();
         assert_eq!(count, 3, "one record per Location");
     }
 
@@ -1497,8 +1498,14 @@ mod tests {
         let src = "fn foo() {\n    bar(baz);\n}\n";
         // bar at line 1, col 4..7
         let range = Range {
-            start: Position { line: 1, character: 4 },
-            end: Position { line: 1, character: 7 },
+            start: Position {
+                line: 1,
+                character: 4,
+            },
+            end: Position {
+                line: 1,
+                character: 7,
+            },
         };
         assert_eq!(extract_token_at_range(src, &range).as_deref(), Some("bar"));
     }
@@ -1512,8 +1519,14 @@ mod tests {
         let src = "abc\ndef\nghi\n";
         // From line 0 col 1 to line 2 col 2 → "bc\ndef\ngh"
         let range = Range {
-            start: Position { line: 0, character: 1 },
-            end: Position { line: 2, character: 2 },
+            start: Position {
+                line: 0,
+                character: 1,
+            },
+            end: Position {
+                line: 2,
+                character: 2,
+            },
         };
         assert_eq!(
             extract_token_at_range(src, &range).as_deref(),
@@ -1529,14 +1542,26 @@ mod tests {
         use crate::protocol::{Position, Range};
         let src = "abc\n";
         let too_far = Range {
-            start: Position { line: 0, character: 0 },
-            end: Position { line: 99, character: 0 },
+            start: Position {
+                line: 0,
+                character: 0,
+            },
+            end: Position {
+                line: 99,
+                character: 0,
+            },
         };
         assert!(extract_token_at_range(src, &too_far).is_none());
 
         let off_end = Range {
-            start: Position { line: 0, character: 5 },
-            end: Position { line: 0, character: 6 },
+            start: Position {
+                line: 0,
+                character: 5,
+            },
+            end: Position {
+                line: 0,
+                character: 6,
+            },
         };
         assert!(extract_token_at_range(src, &off_end).is_none());
     }
@@ -1550,8 +1575,8 @@ mod tests {
     /// post-ley-line-open-6b332d contract; SQL `_lsp_refs` writes are retired).
     #[test]
     fn project_references_populates_ref_token() {
-        use std::collections::HashMap;
         use leyline_schema_capnp::binding_capnp::binding_record;
+        use std::collections::HashMap;
         let tmp = tempfile::tempdir().unwrap();
         let log_path = tmp.path().join("test.bindings.capnp");
         let conn = Connection::open_in_memory().unwrap();
@@ -1570,11 +1595,8 @@ mod tests {
 
         let bytes = std::fs::read(&log_path).unwrap();
         let mut slice: &[u8] = &bytes;
-        let msg = capnp::serialize::read_message(
-            &mut slice,
-            capnp::message::ReaderOptions::new(),
-        )
-        .unwrap();
+        let msg = capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new())
+            .unwrap();
         let rec: binding_record::Reader = msg.get_root().unwrap();
         assert_eq!(
             rec.get_ref_token().unwrap().to_str().unwrap(),
@@ -1589,8 +1611,8 @@ mod tests {
     /// corresponding capnp record with the same target/refUri/range.
     #[test]
     fn project_references_dual_writes_capnp_binding_log() {
-        use std::collections::HashMap;
         use leyline_schema_capnp::binding_capnp::binding_record;
+        use std::collections::HashMap;
         let tmp = tempfile::tempdir().unwrap();
         let log_path = tmp.path().join("test.bindings.capnp");
         let conn = Connection::open_in_memory().unwrap();
@@ -1643,7 +1665,10 @@ mod tests {
             .unwrap();
         let rec: binding_record::Reader = msg.get_root().unwrap();
 
-        assert_eq!(rec.get_target_node_id().unwrap().to_str().unwrap(), "fn_bar");
+        assert_eq!(
+            rec.get_target_node_id().unwrap().to_str().unwrap(),
+            "fn_bar"
+        );
         assert_eq!(rec.get_ref_token().unwrap().to_str().unwrap(), "bar");
         assert_eq!(
             rec.get_construct_node_id().unwrap().to_str().unwrap(),
@@ -1739,8 +1764,8 @@ mod tests {
     /// without an internal AST rewalker.
     #[test]
     fn project_references_writes_qualifier_when_qualified() {
-        use std::collections::HashMap;
         use leyline_schema_capnp::binding_capnp::binding_record;
+        use std::collections::HashMap;
         let tmp = tempfile::tempdir().unwrap();
         let log_path = tmp.path().join("test.bindings.capnp");
         let conn = Connection::open_in_memory().unwrap();
@@ -1801,11 +1826,8 @@ mod tests {
                  );",
             )
             .unwrap();
-            conn.execute(
-                "INSERT INTO _source VALUES ('f', '?', '/x/f')",
-                [],
-            )
-            .unwrap();
+            conn.execute("INSERT INTO _source VALUES ('f', '?', '/x/f')", [])
+                .unwrap();
             conn.execute(
                 &format!(
                     "INSERT INTO _ast VALUES \
@@ -1832,8 +1854,8 @@ mod tests {
     /// join via the capnp output (the post-ley-line-open-6b332d contract).
     #[test]
     fn project_references_populates_referrer_node_id() {
-        use std::collections::HashMap;
         use leyline_schema_capnp::binding_capnp::binding_record;
+        use std::collections::HashMap;
         let tmp = tempfile::tempdir().unwrap();
         let log_path = tmp.path().join("test.bindings.capnp");
         let conn = Connection::open_in_memory().unwrap();
@@ -1882,11 +1904,8 @@ mod tests {
 
         let bytes = std::fs::read(&log_path).unwrap();
         let mut slice: &[u8] = &bytes;
-        let msg = capnp::serialize::read_message(
-            &mut slice,
-            capnp::message::ReaderOptions::new(),
-        )
-        .unwrap();
+        let msg = capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new())
+            .unwrap();
         let rec: binding_record::Reader = msg.get_root().unwrap();
         assert_eq!(
             rec.get_ref_site_node_id().unwrap().to_str().unwrap(),
@@ -1942,16 +1961,12 @@ mod tests {
         locs[0].range.end.character = 7;
 
         let mut nop_lookup = |_uri: &str| -> Option<String> { None };
-        project_references(&conn, "fn_foo", &locs, &mut nop_lookup, Some(&log_path))
-            .unwrap();
+        project_references(&conn, "fn_foo", &locs, &mut nop_lookup, Some(&log_path)).unwrap();
 
         let bytes = std::fs::read(&log_path).unwrap();
         let mut slice: &[u8] = &bytes;
-        let msg = capnp::serialize::read_message(
-            &mut slice,
-            capnp::message::ReaderOptions::new(),
-        )
-        .unwrap();
+        let msg = capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new())
+            .unwrap();
         let rec: binding_record::Reader = msg.get_root().unwrap();
         assert_eq!(
             rec.get_ref_site_node_id().unwrap().to_str().unwrap(),
@@ -1977,11 +1992,8 @@ mod tests {
 
         let bytes = std::fs::read(&log_path).unwrap();
         let mut slice: &[u8] = &bytes;
-        let msg = capnp::serialize::read_message(
-            &mut slice,
-            capnp::message::ReaderOptions::new(),
-        )
-        .unwrap();
+        let msg = capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new())
+            .unwrap();
         let rec: binding_record::Reader = msg.get_root().unwrap();
         assert_eq!(
             rec.get_ref_token().unwrap().to_str().unwrap(),
@@ -2069,13 +2081,21 @@ mod tests {
 
         // Old data preserved.
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM _lsp_defs WHERE node_id = 'legacy_def'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM _lsp_defs WHERE node_id = 'legacy_def'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(count, 1, "legacy data must survive migration");
 
         // New column present + default empty for legacy row.
         let token: String = conn
-            .query_row("SELECT def_token FROM _lsp_defs WHERE node_id = 'legacy_def'", [], |r| r.get(0))
+            .query_row(
+                "SELECT def_token FROM _lsp_defs WHERE node_id = 'legacy_def'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(token, "", "legacy rows have empty def_token (DEFAULT '')");
     }

@@ -47,9 +47,7 @@ impl CanonicalKindMap for JsonCanonicalMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canonical::{
-        assert_canonical_map_baseline, assert_kinds_match, CanonicalKind,
-    };
+    use crate::canonical::{CanonicalKind, assert_canonical_map_baseline, assert_kinds_match};
 
     #[test]
     fn baseline_invariants() {
@@ -61,20 +59,23 @@ mod tests {
         // Pin every documented mapping. If a tree-sitter-json upgrade
         // renames a kind (e.g. `pair` → `member`), this test fails with
         // a clear message pointing at the drifted kind.
-        assert_kinds_match(&JsonCanonicalMap, &[
-            ("pair", CanonicalKind::Decl),
-            ("object", CanonicalKind::Block),
-            ("array", CanonicalKind::Block),
-            ("document", CanonicalKind::Block),
-            ("string", CanonicalKind::Lit),
-            ("string_content", CanonicalKind::Lit),
-            ("number", CanonicalKind::Lit),
-            ("true", CanonicalKind::Lit),
-            ("false", CanonicalKind::Lit),
-            ("null", CanonicalKind::Lit),
-            ("escape_sequence", CanonicalKind::Lit),
-            ("comment", CanonicalKind::Op),
-        ]);
+        assert_kinds_match(
+            &JsonCanonicalMap,
+            &[
+                ("pair", CanonicalKind::Decl),
+                ("object", CanonicalKind::Block),
+                ("array", CanonicalKind::Block),
+                ("document", CanonicalKind::Block),
+                ("string", CanonicalKind::Lit),
+                ("string_content", CanonicalKind::Lit),
+                ("number", CanonicalKind::Lit),
+                ("true", CanonicalKind::Lit),
+                ("false", CanonicalKind::Lit),
+                ("null", CanonicalKind::Lit),
+                ("escape_sequence", CanonicalKind::Lit),
+                ("comment", CanonicalKind::Op),
+            ],
+        );
     }
 
     #[test]

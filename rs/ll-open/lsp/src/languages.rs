@@ -94,19 +94,71 @@ pub const LSP_LANGUAGES: &[LspLanguage] = &[
     // ── Recognized but no bundled server ─────────────────────────────────
     // CLI path works (user supplies --server); daemon enrichment skips
     // with a log message until a server is added here.
-    LspLanguage { id: "ruby",        exts: &["rb"],          server: None },
-    LspLanguage { id: "elixir",      exts: &["ex", "exs"],   server: None },
-    LspLanguage { id: "lua",         exts: &["lua"],         server: None },
-    LspLanguage { id: "shellscript", exts: &["sh", "bash"],  server: None },
-    LspLanguage { id: "css",         exts: &["css"],         server: None },
-    LspLanguage { id: "html",        exts: &["html", "htm"], server: None },
-    LspLanguage { id: "json",        exts: &["json"],        server: None },
-    LspLanguage { id: "yaml",        exts: &["yaml", "yml"], server: None },
-    LspLanguage { id: "toml",        exts: &["toml"],        server: None },
-    LspLanguage { id: "markdown",    exts: &["md", "markdown"], server: None },
-    LspLanguage { id: "swift",       exts: &["swift"],       server: None },
-    LspLanguage { id: "kotlin",      exts: &["kt", "kts"],   server: None },
-    LspLanguage { id: "terraform",   exts: &["tf", "hcl"],   server: None },
+    LspLanguage {
+        id: "ruby",
+        exts: &["rb"],
+        server: None,
+    },
+    LspLanguage {
+        id: "elixir",
+        exts: &["ex", "exs"],
+        server: None,
+    },
+    LspLanguage {
+        id: "lua",
+        exts: &["lua"],
+        server: None,
+    },
+    LspLanguage {
+        id: "shellscript",
+        exts: &["sh", "bash"],
+        server: None,
+    },
+    LspLanguage {
+        id: "css",
+        exts: &["css"],
+        server: None,
+    },
+    LspLanguage {
+        id: "html",
+        exts: &["html", "htm"],
+        server: None,
+    },
+    LspLanguage {
+        id: "json",
+        exts: &["json"],
+        server: None,
+    },
+    LspLanguage {
+        id: "yaml",
+        exts: &["yaml", "yml"],
+        server: None,
+    },
+    LspLanguage {
+        id: "toml",
+        exts: &["toml"],
+        server: None,
+    },
+    LspLanguage {
+        id: "markdown",
+        exts: &["md", "markdown"],
+        server: None,
+    },
+    LspLanguage {
+        id: "swift",
+        exts: &["swift"],
+        server: None,
+    },
+    LspLanguage {
+        id: "kotlin",
+        exts: &["kt", "kts"],
+        server: None,
+    },
+    LspLanguage {
+        id: "terraform",
+        exts: &["tf", "hcl"],
+        server: None,
+    },
 ];
 
 /// Look up the language server invocation for an LSP language ID. Returns
@@ -228,11 +280,13 @@ mod tests {
             assert_eq!(
                 language_id_from_ext(ext),
                 Some(lang.id),
-                "ext `{ext}` must resolve to bundled lang `{}`", lang.id,
+                "ext `{ext}` must resolve to bundled lang `{}`",
+                lang.id,
             );
             assert!(
                 language_server(lang.id).is_some(),
-                "bundled lang `{}` must report a server", lang.id,
+                "bundled lang `{}` must report a server",
+                lang.id,
             );
         }
     }
@@ -253,21 +307,23 @@ mod tests {
             assert_eq!(
                 language_id_from_ext(ext),
                 Some(lang.id),
-                "ext `{ext}` must resolve to `{}`", lang.id,
+                "ext `{ext}` must resolve to `{}`",
+                lang.id,
             );
             assert!(
                 language_server(lang.id).is_none(),
-                "unbundled lang `{}` must report no server", lang.id,
+                "unbundled lang `{}` must report no server",
+                lang.id,
             );
         }
     }
 
     #[test]
     fn known_extension_lookups() {
-        assert_eq!(language_id_from_ext("rs"),  Some("rust"));
-        assert_eq!(language_id_from_ext("go"),  Some("go"));
-        assert_eq!(language_id_from_ext("py"),  Some("python"));
-        assert_eq!(language_id_from_ext("ts"),  Some("typescript"));
+        assert_eq!(language_id_from_ext("rs"), Some("rust"));
+        assert_eq!(language_id_from_ext("go"), Some("go"));
+        assert_eq!(language_id_from_ext("py"), Some("python"));
+        assert_eq!(language_id_from_ext("ts"), Some("typescript"));
         assert_eq!(language_id_from_ext("tsx"), Some("typescriptreact"));
         assert_eq!(language_id_from_ext("hpp"), Some("cpp"));
     }
@@ -275,8 +331,8 @@ mod tests {
     #[test]
     fn unknown_extension_returns_none() {
         assert_eq!(language_id_from_ext("foobar"), None);
-        assert_eq!(language_id_from_ext(""),       None);
-        assert_eq!(language_id_from_ext("xyz"),    None);
+        assert_eq!(language_id_from_ext(""), None);
+        assert_eq!(language_id_from_ext("xyz"), None);
     }
 
     #[test]

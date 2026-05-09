@@ -107,7 +107,10 @@ async fn spawn_test_socket(
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    panic!("UDS listener at {} did not accept within 2s", path.display());
+    panic!(
+        "UDS listener at {} did not accept within 2s",
+        path.display()
+    );
 }
 
 /// One UDS round trip: connect, write `body` (with trailing newline if
@@ -153,11 +156,16 @@ fn write_empty_go_func(dir: &Path, file: &str, pkg: &str, fn_name: &str) {
 /// schema changes (e.g. adding hash column to _file_index) are now
 /// one site, not four.
 #[allow(dead_code)]
-fn file_index_snapshot(conn: &rusqlite::Connection) -> std::collections::HashMap<String, (i64, i64)> {
+fn file_index_snapshot(
+    conn: &rusqlite::Connection,
+) -> std::collections::HashMap<String, (i64, i64)> {
     conn.prepare("SELECT path, mtime, size FROM _file_index")
         .unwrap()
         .query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))
+            Ok((
+                r.get::<_, String>(0)?,
+                (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?),
+            ))
         })
         .unwrap()
         .filter_map(Result::ok)
@@ -208,7 +216,9 @@ async fn test_parse_creates_db() {
         lang: Some("go".to_string()),
     };
 
-    leyline_cli_lib::run(cmd).await.expect("parse should succeed");
+    leyline_cli_lib::run(cmd)
+        .await
+        .expect("parse should succeed");
 
     // Verify the database was created.
     assert!(db_path.exists(), "database file should exist");
@@ -220,17 +230,26 @@ async fn test_parse_creates_db() {
         .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
         .expect("query nodes");
     // At minimum: root + 2 files + their AST children.
-    assert!(nodes_count >= 3, "nodes should have at least 3 rows (root + 2 files), got {nodes_count}");
+    assert!(
+        nodes_count >= 3,
+        "nodes should have at least 3 rows (root + 2 files), got {nodes_count}"
+    );
 
     let source_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM _source", [], |r| r.get(0))
         .expect("query _source");
-    assert_eq!(source_count, 2, "_source should have 2 rows (one per .go file)");
+    assert_eq!(
+        source_count, 2,
+        "_source should have 2 rows (one per .go file)"
+    );
 
     let ast_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM _ast", [], |r| r.get(0))
         .expect("query _ast");
-    assert!(ast_count >= 2, "_ast should have at least 2 rows, got {ast_count}");
+    assert!(
+        ast_count >= 2,
+        "_ast should have at least 2 rows, got {ast_count}"
+    );
 }
 
 /// Proves that `Commands` can be embedded in a wrapper enum via `#[command(flatten)]`,
@@ -285,7 +304,9 @@ async fn test_splice_modifies_node() {
         output: db_path.clone(),
         lang: Some("go".to_string()),
     };
-    leyline_cli_lib::run(cmd).await.expect("parse should succeed");
+    leyline_cli_lib::run(cmd)
+        .await
+        .expect("parse should succeed");
 
     // Step 2: Find a node_id from the _ast table that we can splice.
     let conn = rusqlite::Connection::open(&db_path).expect("open db");
@@ -305,7 +326,9 @@ async fn test_splice_modifies_node() {
         node: node_id.clone(),
         text: new_func.to_string(),
     };
-    leyline_cli_lib::run(cmd).await.expect("splice should succeed");
+    leyline_cli_lib::run(cmd)
+        .await
+        .expect("splice should succeed");
 
     // Step 4: Verify the source changed in the database.
     let conn = rusqlite::Connection::open(&db_path).expect("open db after splice");
@@ -341,7 +364,9 @@ async fn test_load_into_arena() {
         output: db_path.clone(),
         lang: Some("go".to_string()),
     };
-    leyline_cli_lib::run(cmd).await.expect("parse should succeed");
+    leyline_cli_lib::run(cmd)
+        .await
+        .expect("parse should succeed");
     assert!(db_path.exists(), "db should exist after parse");
 
     let db_bytes = fs::read(&db_path).expect("read db bytes");
@@ -371,7 +396,9 @@ async fn test_load_into_arena() {
         db: db_path.clone(),
         control: ctrl_path.clone(),
     };
-    leyline_cli_lib::run(cmd).await.expect("load should succeed");
+    leyline_cli_lib::run(cmd)
+        .await
+        .expect("load should succeed");
 
     // Step 5: T2.4 — verify load advanced current_root from sentinel.
     let ctrl = Controller::open_or_create(&ctrl_path).expect("reopen controller");
@@ -437,12 +464,16 @@ fn test_inspect_node_lookup() {
 
     // Step 3: Inspect the root node (id="").
     let result = leyline_cli_lib::cmd_inspect::cmd_inspect(
-        "",              // root node id
+        "", // root node id
         &arena_path,
-        None,            // no controller
-        None,            // node-lookup mode
+        None, // no controller
+        None, // node-lookup mode
     );
-    assert!(result.is_ok(), "inspect root node should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "inspect root node should succeed: {:?}",
+        result.err()
+    );
 
     // Step 4: Test SQL mode.
     let result = leyline_cli_lib::cmd_inspect::cmd_inspect(
@@ -451,15 +482,14 @@ fn test_inspect_node_lookup() {
         None,
         Some("SELECT COUNT(*) FROM nodes"),
     );
-    assert!(result.is_ok(), "inspect SQL mode should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "inspect SQL mode should succeed: {:?}",
+        result.err()
+    );
 
     // Step 5: Verify a missing node returns an error.
-    let result = leyline_cli_lib::cmd_inspect::cmd_inspect(
-        "nonexistent",
-        &arena_path,
-        None,
-        None,
-    );
+    let result = leyline_cli_lib::cmd_inspect::cmd_inspect("nonexistent", &arena_path, None, None);
     assert!(result.is_err(), "inspect missing node should fail");
 }
 
@@ -477,12 +507,9 @@ fn test_serve_creates_arena() {
     let arena_bytes = arena_size_mib * 1024 * 1024;
 
     // Run setup_arena — the reusable core of cmd_serve.
-    let returned_ctrl = leyline_cli_lib::cmd_serve::setup_arena(
-        &arena_path,
-        arena_bytes,
-        Some(&ctrl_path),
-    )
-    .expect("setup_arena should succeed");
+    let returned_ctrl =
+        leyline_cli_lib::cmd_serve::setup_arena(&arena_path, arena_bytes, Some(&ctrl_path))
+            .expect("setup_arena should succeed");
 
     // Verify the arena file was created with the expected size.
     assert!(arena_path.exists(), "arena file should exist");
@@ -526,16 +553,15 @@ fn test_serve_derives_control_path() {
     let dir = TempDir::new().expect("create temp dir");
     let arena_path = dir.path().join("my.arena");
 
-    let ctrl_path = leyline_cli_lib::cmd_serve::setup_arena(
-        &arena_path,
-        2 * 1024 * 1024,
-        None,
-    )
-    .expect("setup_arena should succeed");
+    let ctrl_path = leyline_cli_lib::cmd_serve::setup_arena(&arena_path, 2 * 1024 * 1024, None)
+        .expect("setup_arena should succeed");
 
     // Should derive .ctrl extension from .arena
     let expected = dir.path().join("my.ctrl");
-    assert_eq!(ctrl_path, expected, "derived ctrl path should use .ctrl extension");
+    assert_eq!(
+        ctrl_path, expected,
+        "derived ctrl path should use .ctrl extension"
+    );
     assert!(expected.exists(), "derived controller file should exist");
 }
 
@@ -567,8 +593,8 @@ async fn test_daemon_socket_status_op() {
 
 #[tokio::test]
 async fn test_daemon_ext_dispatches_to_extension() {
-    use leyline_cli_lib::daemon::ext::DaemonExt;
     use leyline_cli_lib::daemon::DaemonContext;
+    use leyline_cli_lib::daemon::ext::DaemonExt;
     use std::sync::Arc;
 
     /// Custom extension that handles "custom_op".
@@ -604,7 +630,10 @@ async fn test_daemon_ext_dispatches_to_extension() {
     let parsed = uds_round_trip(&sock_path, r#"{"op":"nonexistent"}"#).await;
     assert!(parsed.get("error").is_some());
     let err_str = parsed["error"].as_str().unwrap();
-    assert!(err_str.contains("unknown op"), "error should mention 'unknown op', got: {err_str}");
+    assert!(
+        err_str.contains("unknown op"),
+        "error should mention 'unknown op', got: {err_str}"
+    );
 }
 
 /// Compile-time proof that the Lsp variant exists when the `lsp` feature is enabled.
@@ -652,9 +681,7 @@ fn test_lsp_variant_exists() {
 // ---------------------------------------------------------------------------
 
 fn twoway_find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 fn parse_content_length(headers: &str) -> Option<usize> {
@@ -674,7 +701,9 @@ async fn mcp_post(port: u16, body: &str) -> serde_json::Value {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
     let req = format!(
         "POST /mcp HTTP/1.1\r\n\
          Host: 127.0.0.1\r\n\
@@ -731,8 +760,6 @@ async fn mcp_post(port: u16, body: &str) -> serde_json::Value {
 /// and that `tools/call → status` round-trips through the dispatch table.
 #[tokio::test]
 async fn test_mcp_http_tools_list_and_status_call() {
-    
-    
     use std::sync::Arc;
 
     let dir = TempDir::new().unwrap();
@@ -758,7 +785,10 @@ async fn test_mcp_http_tools_list_and_status_call() {
     {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
-            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -766,11 +796,7 @@ async fn test_mcp_http_tools_list_and_status_call() {
     }
 
     // 1. tools/list
-    let listing = mcp_post(
-        port,
-        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
-    )
-    .await;
+    let listing = mcp_post(port, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).await;
     assert_eq!(listing["jsonrpc"], "2.0");
     assert_eq!(listing["id"], 1);
     let tools = listing["result"]["tools"].as_array().expect("tools array");
@@ -853,9 +879,9 @@ async fn test_mcp_http_tools_list_and_status_call() {
 /// only the changed file was updated.
 #[test]
 fn test_warm_start_crash_recovery() {
-    use leyline_core::{Controller, create_arena};
-    use leyline_cli_lib::cmd_parse::parse_into_conn;
     use leyline_cli_lib::cmd_daemon::snapshot_to_arena;
+    use leyline_cli_lib::cmd_parse::parse_into_conn;
+    use leyline_core::{Controller, create_arena};
 
     let src = create_go_fixture();
     let arena_dir = TempDir::new().unwrap();
@@ -866,7 +892,10 @@ fn test_warm_start_crash_recovery() {
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     let result = parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
-    assert!(result.parsed >= 2, "should parse at least main.go + util.go");
+    assert!(
+        result.parsed >= 2,
+        "should parse at least main.go + util.go"
+    );
     assert_eq!(result.unchanged, 0, "cold start has no unchanged files");
 
     // Count nodes before snapshot.
@@ -1043,7 +1072,7 @@ fn test_warm_start_empty_arena_falls_through() {
         );
         // Either the query fails (not a valid db) or returns 0 tables.
         match tables {
-            Ok(0) => {} // empty db, fine
+            Ok(0) => {}  // empty db, fine
             Err(_) => {} // not a valid db, fine
             Ok(n) => panic!("expected 0 tables in empty arena, got {n}"),
         }
@@ -1054,9 +1083,9 @@ fn test_warm_start_empty_arena_falls_through() {
 /// Stress test: multiple parse-snapshot cycles to verify no corruption.
 #[test]
 fn test_multiple_snapshot_cycles() {
-    use leyline_core::{Controller, create_arena};
-    use leyline_cli_lib::cmd_parse::parse_into_conn;
     use leyline_cli_lib::cmd_daemon::snapshot_to_arena;
+    use leyline_cli_lib::cmd_parse::parse_into_conn;
+    use leyline_core::{Controller, create_arena};
 
     let src = create_go_fixture();
     let arena_dir = TempDir::new().unwrap();
@@ -1066,7 +1095,8 @@ fn test_multiple_snapshot_cycles() {
     let arena_size = 4 * 1024 * 1024;
     let _mmap = create_arena(&arena_path, arena_size).unwrap();
     let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size)
+        .unwrap();
 
     let conn = cold_parse_go(src.path());
 
@@ -1078,9 +1108,7 @@ fn test_multiple_snapshot_cycles() {
     for i in 0..5 {
         fs::write(
             src.path().join("main.go"),
-            format!(
-                "package main\n\nfunc main() {{\n\tprintln(\"iteration {i}\")\n}}\n"
-            ),
+            format!("package main\n\nfunc main() {{\n\tprintln(\"iteration {i}\")\n}}\n"),
         )
         .unwrap();
 
@@ -1089,9 +1117,14 @@ fn test_multiple_snapshot_cycles() {
 
         snapshot_to_arena(&conn, &ctrl_path).unwrap();
 
-        let cur_root = Controller::open_or_create(&ctrl_path).unwrap().current_root();
+        let cur_root = Controller::open_or_create(&ctrl_path)
+            .unwrap()
+            .current_root();
         assert_ne!(cur_root, [0u8; 32], "cycle {i}: root must leave sentinel");
-        assert_ne!(cur_root, prev_root, "cycle {i}: root must advance from prior cycle");
+        assert_ne!(
+            cur_root, prev_root,
+            "cycle {i}: root must advance from prior cycle"
+        );
         prev_root = cur_root;
     }
 
@@ -1140,9 +1173,9 @@ fn test_multiple_snapshot_cycles() {
 /// after the snapshot returns sees the matching root.
 #[test]
 fn snapshot_populates_current_root_with_blake3_of_db_bytes() {
-    use leyline_core::{Controller, create_arena};
-    use leyline_cli_lib::cmd_parse::parse_into_conn;
     use leyline_cli_lib::cmd_daemon::snapshot_to_arena;
+    use leyline_cli_lib::cmd_parse::parse_into_conn;
+    use leyline_core::{Controller, create_arena};
 
     let src = create_go_fixture();
     let arena_dir = TempDir::new().unwrap();
@@ -1152,7 +1185,8 @@ fn snapshot_populates_current_root_with_blake3_of_db_bytes() {
     let arena_size = 4 * 1024 * 1024;
     let _mmap = create_arena(&arena_path, arena_size).unwrap();
     let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size)
+        .unwrap();
     drop(ctrl);
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -1185,9 +1219,9 @@ fn snapshot_populates_current_root_with_blake3_of_db_bytes() {
 /// Pin idempotency — `current_root` is a pure function of the bytes.
 #[test]
 fn snapshot_idempotent_root_for_same_db_state() {
-    use leyline_core::{Controller, create_arena};
-    use leyline_cli_lib::cmd_parse::parse_into_conn;
     use leyline_cli_lib::cmd_daemon::snapshot_to_arena;
+    use leyline_cli_lib::cmd_parse::parse_into_conn;
+    use leyline_core::{Controller, create_arena};
 
     let src = create_go_fixture();
     let arena_dir = TempDir::new().unwrap();
@@ -1197,14 +1231,17 @@ fn snapshot_idempotent_root_for_same_db_state() {
     let arena_size = 4 * 1024 * 1024;
     let _mmap = create_arena(&arena_path, arena_size).unwrap();
     let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size)
+        .unwrap();
     drop(ctrl);
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
 
     snapshot_to_arena(&conn, &ctrl_path).unwrap();
-    let root_after_first = Controller::open_or_create(&ctrl_path).unwrap().current_root();
+    let root_after_first = Controller::open_or_create(&ctrl_path)
+        .unwrap()
+        .current_root();
 
     // Snapshot again with no db changes. T2.4: root stays — purely
     // a function of bytes; no generation surface to observe.
@@ -1224,9 +1261,9 @@ fn snapshot_idempotent_root_for_same_db_state() {
 /// different stage), this would fail.
 #[test]
 fn snapshot_root_advances_when_db_changes() {
-    use leyline_core::{Controller, create_arena};
-    use leyline_cli_lib::cmd_parse::parse_into_conn;
     use leyline_cli_lib::cmd_daemon::snapshot_to_arena;
+    use leyline_cli_lib::cmd_parse::parse_into_conn;
+    use leyline_core::{Controller, create_arena};
 
     let src = create_go_fixture();
     let arena_dir = TempDir::new().unwrap();
@@ -1236,14 +1273,17 @@ fn snapshot_root_advances_when_db_changes() {
     let arena_size = 4 * 1024 * 1024;
     let _mmap = create_arena(&arena_path, arena_size).unwrap();
     let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size)
+        .unwrap();
     drop(ctrl);
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
 
     snapshot_to_arena(&conn, &ctrl_path).unwrap();
-    let root_v1 = Controller::open_or_create(&ctrl_path).unwrap().current_root();
+    let root_v1 = Controller::open_or_create(&ctrl_path)
+        .unwrap()
+        .current_root();
 
     // Modify a file, reparse, snapshot again.
     fs::write(
@@ -1254,13 +1294,18 @@ fn snapshot_root_advances_when_db_changes() {
     parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
     snapshot_to_arena(&conn, &ctrl_path).unwrap();
 
-    let root_v2 = Controller::open_or_create(&ctrl_path).unwrap().current_root();
+    let root_v2 = Controller::open_or_create(&ctrl_path)
+        .unwrap()
+        .current_root();
 
     assert_ne!(
         root_v2, root_v1,
         "T2.2: db change must produce different current_root",
     );
-    assert_ne!(root_v2, [0u8; 32], "post-change root must not be zero sentinel");
+    assert_ne!(
+        root_v2, [0u8; 32],
+        "post-change root must not be zero sentinel"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1274,9 +1319,9 @@ fn snapshot_root_advances_when_db_changes() {
 /// before use, both sides agree.
 #[test]
 fn t23_reader_accepts_arena_when_root_matches() {
-    use leyline_core::{Controller, create_arena};
-    use leyline_cli_lib::cmd_parse::parse_into_conn;
     use leyline_cli_lib::cmd_daemon::snapshot_to_arena;
+    use leyline_cli_lib::cmd_parse::parse_into_conn;
+    use leyline_core::{Controller, create_arena};
     use leyline_fs::SqliteGraph;
 
     let src = create_go_fixture();
@@ -1287,7 +1332,8 @@ fn t23_reader_accepts_arena_when_root_matches() {
     let arena_size = 4 * 1024 * 1024;
     let _mmap = create_arena(&arena_path, arena_size).unwrap();
     let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size)
+        .unwrap();
     drop(ctrl);
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -1296,9 +1342,8 @@ fn t23_reader_accepts_arena_when_root_matches() {
 
     // Reader path — should succeed because the writer published the
     // matching root via set_arena_with_root.
-    let graph = SqliteGraph::from_arena(&ctrl_path).expect(
-        "T2.3: reader must accept arena when current_root matches BLAKE3(buffer)",
-    );
+    let graph = SqliteGraph::from_arena(&ctrl_path)
+        .expect("T2.3: reader must accept arena when current_root matches BLAKE3(buffer)");
     // Sanity: graph is usable.
     let _ = graph.conn();
 }
@@ -1308,9 +1353,9 @@ fn t23_reader_accepts_arena_when_root_matches() {
 /// — the substrate's content-addressed correctness pin in action.
 #[test]
 fn t23_reader_refuses_arena_when_buffer_corrupted() {
-    use leyline_core::{Controller, ArenaHeader, create_arena};
-    use leyline_cli_lib::cmd_parse::parse_into_conn;
     use leyline_cli_lib::cmd_daemon::snapshot_to_arena;
+    use leyline_cli_lib::cmd_parse::parse_into_conn;
+    use leyline_core::{ArenaHeader, Controller, create_arena};
     use leyline_fs::SqliteGraph;
 
     let src = create_go_fixture();
@@ -1321,7 +1366,8 @@ fn t23_reader_refuses_arena_when_buffer_corrupted() {
     let arena_size = 4 * 1024 * 1024;
     let _mmap = create_arena(&arena_path, arena_size).unwrap();
     let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size)
+        .unwrap();
     drop(ctrl);
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -1475,7 +1521,7 @@ fn t24_reader_accepts_zero_root_with_empty_data() {
 /// arena file passed in or post-publish tampering).
 #[test]
 fn t23_reader_errors_clearly_on_non_sqlite_buffer() {
-    use leyline_core::{Controller, ArenaHeader, create_arena, layout::write_to_arena};
+    use leyline_core::{ArenaHeader, Controller, create_arena, layout::write_to_arena};
     use leyline_fs::SqliteGraph;
 
     let arena_dir = TempDir::new().unwrap();
@@ -1515,12 +1561,8 @@ fn t23_reader_errors_clearly_on_non_sqlite_buffer() {
     let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
     // Publish a non-zero root that does NOT match the (now-corrupt)
     // buffer hash → verifier must reject.
-    ctrl.set_arena_with_root(
-        &arena_path.to_string_lossy(),
-        arena_size,
-        [0xAB; 32],
-    )
-    .unwrap();
+    ctrl.set_arena_with_root(&arena_path.to_string_lossy(), arena_size, [0xAB; 32])
+        .unwrap();
     drop(ctrl);
 
     let result = SqliteGraph::from_arena(&ctrl_path);
@@ -1869,40 +1911,70 @@ async fn test_parse_produces_go_refs() {
     let conn = rusqlite::Connection::open(&db_path).unwrap();
 
     // node_defs: should have "main" and "helper"
-    let def_count: i64 = conn.query_row("SELECT COUNT(*) FROM node_defs", [], |r| r.get(0)).unwrap();
-    assert!(def_count >= 2, "should have at least 2 defs, got {def_count}");
+    let def_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM node_defs", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        def_count >= 2,
+        "should have at least 2 defs, got {def_count}"
+    );
 
-    let main_def: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM node_defs WHERE token = 'main'", [], |r| r.get(0),
-    ).unwrap();
+    let main_def: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM node_defs WHERE token = 'main'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert_eq!(main_def, 1, "should have 'main' def");
 
-    let helper_def: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM node_defs WHERE token = 'helper'", [], |r| r.get(0),
-    ).unwrap();
+    let helper_def: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM node_defs WHERE token = 'helper'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert_eq!(helper_def, 1, "should have 'helper' def");
 
     // node_refs: should have calls
-    let ref_count: i64 = conn.query_row("SELECT COUNT(*) FROM node_refs", [], |r| r.get(0)).unwrap();
-    assert!(ref_count >= 3, "should have at least 3 refs, got {ref_count}");
+    let ref_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM node_refs", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        ref_count >= 3,
+        "should have at least 3 refs, got {ref_count}"
+    );
 
-    let println_ref: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM node_refs WHERE token = 'fmt.Println'", [], |r| r.get(0),
-    ).unwrap();
+    let println_ref: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM node_refs WHERE token = 'fmt.Println'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert!(println_ref >= 1, "should have 'fmt.Println' ref");
 
-    let helper_ref: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM node_refs WHERE token = 'helper'", [], |r| r.get(0),
-    ).unwrap();
+    let helper_ref: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM node_refs WHERE token = 'helper'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert!(helper_ref >= 1, "should have 'helper' call ref");
 
     // _imports
-    let import_count: i64 = conn.query_row("SELECT COUNT(*) FROM _imports", [], |r| r.get(0)).unwrap();
+    let import_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM _imports", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(import_count, 2, "should have 2 imports");
 
-    let auth_import: String = conn.query_row(
-        "SELECT path FROM _imports WHERE alias = 'auth'", [], |r| r.get(0),
-    ).unwrap();
+    let auth_import: String = conn
+        .query_row("SELECT path FROM _imports WHERE alias = 'auth'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
     assert_eq!(auth_import, "github.com/foo/auth");
 }
 
@@ -1915,7 +1987,8 @@ async fn test_refs_tables_match_mache_schema() {
     std::fs::write(
         src.path().join("main.go"),
         b"package main\n\nfunc main() {}\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     let cmd = leyline_cli_lib::Commands::Parse {
         source: src.path().to_path_buf(),
@@ -1928,34 +2001,64 @@ async fn test_refs_tables_match_mache_schema() {
 
     // Verify all tables mache expects exist
     let tables: Vec<String> = {
-        let mut stmt = conn.prepare(
-            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-        ).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap();
         stmt.query_map([], |r| r.get(0))
             .unwrap()
             .map(|r| r.unwrap())
             .collect()
     };
 
-    assert!(tables.contains(&"nodes".to_string()), "missing nodes: {tables:?}");
-    assert!(tables.contains(&"_ast".to_string()), "missing _ast: {tables:?}");
-    assert!(tables.contains(&"_source".to_string()), "missing _source: {tables:?}");
-    assert!(tables.contains(&"node_refs".to_string()), "missing node_refs: {tables:?}");
-    assert!(tables.contains(&"node_defs".to_string()), "missing node_defs: {tables:?}");
-    assert!(tables.contains(&"_imports".to_string()), "missing _imports: {tables:?}");
+    assert!(
+        tables.contains(&"nodes".to_string()),
+        "missing nodes: {tables:?}"
+    );
+    assert!(
+        tables.contains(&"_ast".to_string()),
+        "missing _ast: {tables:?}"
+    );
+    assert!(
+        tables.contains(&"_source".to_string()),
+        "missing _source: {tables:?}"
+    );
+    assert!(
+        tables.contains(&"node_refs".to_string()),
+        "missing node_refs: {tables:?}"
+    );
+    assert!(
+        tables.contains(&"node_defs".to_string()),
+        "missing node_defs: {tables:?}"
+    );
+    assert!(
+        tables.contains(&"_imports".to_string()),
+        "missing _imports: {tables:?}"
+    );
 
     // Verify mache fast-path trigger
-    let nodes_exists: i64 = conn.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='nodes'",
-        [], |r| r.get(0),
-    ).unwrap();
+    let nodes_exists: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='nodes'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert_eq!(nodes_exists, 1);
 
     // Verify node_refs columns match mache's expected query pattern
     // mache does: SELECT node_id FROM node_refs WHERE token = ?
-    conn.execute("SELECT token, node_id, source_id FROM node_refs LIMIT 0", []).unwrap();
-    conn.execute("SELECT token, node_id, source_id FROM node_defs LIMIT 0", []).unwrap();
-    conn.execute("SELECT alias, path, source_id FROM _imports LIMIT 0", []).unwrap();
+    conn.execute(
+        "SELECT token, node_id, source_id FROM node_refs LIMIT 0",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "SELECT token, node_id, source_id FROM node_defs LIMIT 0",
+        [],
+    )
+    .unwrap();
+    conn.execute("SELECT alias, path, source_id FROM _imports LIMIT 0", [])
+        .unwrap();
 }
 
 /// Verify that `lsp` subcommand is parseable via clap when the feature is enabled.
@@ -2016,8 +2119,8 @@ fn test_lsp_clap_parsing() {
 async fn test_embed_queue_drainer_refreshes_index() {
     use leyline_cli_lib::daemon::DaemonContext;
     use leyline_cli_lib::daemon::embed::{self, EmbedTask, Embedder, ZeroEmbedder};
-    use leyline_cli_lib::daemon::vec_index::{register_vec, VectorIndex};
-    
+    use leyline_cli_lib::daemon::vec_index::{VectorIndex, register_vec};
+
     use std::sync::{Arc, Mutex};
 
     register_vec();
@@ -2044,11 +2147,11 @@ async fn test_embed_queue_drainer_refreshes_index() {
     )
     .unwrap();
 
-    let queue: embed::EmbedQueue =
-        Arc::new(Mutex::new(std::collections::BinaryHeap::new()));
+    let queue: embed::EmbedQueue = Arc::new(Mutex::new(std::collections::BinaryHeap::new()));
 
     let ctx = Arc::new(DaemonContext {
-        live_db: std::sync::Mutex::new(conn),        vec_index: index.clone(),
+        live_db: std::sync::Mutex::new(conn),
+        vec_index: index.clone(),
         embedder,
         embed_queue: queue.clone(),
         ..default_test_ctx(ctrl_path)
@@ -2092,7 +2195,7 @@ async fn test_embed_queue_drainer_refreshes_index() {
 async fn test_op_vec_search_round_trip() {
     use leyline_cli_lib::daemon::DaemonContext;
     use leyline_cli_lib::daemon::embed::{Embedder, ZeroEmbedder};
-    use leyline_cli_lib::daemon::vec_index::{register_vec, VectorIndex};
+    use leyline_cli_lib::daemon::vec_index::{VectorIndex, register_vec};
     use std::sync::Arc;
 
     register_vec();
@@ -2119,11 +2222,7 @@ async fn test_op_vec_search_round_trip() {
     let sock_path = dir.path().join("vec_search.sock");
     spawn_test_socket(ctx, sock_path.clone()).await;
 
-    let parsed = uds_round_trip(
-        &sock_path,
-        r#"{"op":"vec_search","query":"hello","k":3}"#,
-    )
-    .await;
+    let parsed = uds_round_trip(&sock_path, r#"{"op":"vec_search","query":"hello","k":3}"#).await;
 
     assert_eq!(parsed["ok"], true);
     let results = parsed["results"].as_array().expect("results array");
@@ -2150,9 +2249,7 @@ async fn test_op_vec_search_round_trip() {
 /// focuses on the readiness signal payload.
 #[tokio::test]
 async fn test_status_reports_phase_and_enrichment() {
-    use leyline_cli_lib::daemon::{
-        DaemonContext, DaemonPhase, DaemonState, PassStatus,
-    };
+    use leyline_cli_lib::daemon::{DaemonContext, DaemonPhase, DaemonState, PassStatus};
     use std::sync::{Arc, RwLock};
 
     let dir = TempDir::new().unwrap();
@@ -2221,15 +2318,13 @@ fn test_scoped_reparse_only_touches_scoped_files() {
     // Wait long enough that mtime resolution actually advances.
     std::thread::sleep(std::time::Duration::from_millis(50));
 
-    fs::write(dir.path().join("a.go"), b"package m\n\nfunc A() { let _ = 1; }\n").unwrap();
-
-    let r2 = parse_into_conn(
-        &conn,
-        dir.path(),
-        Some("go"),
-        Some(&["a.go".to_string()]),
+    fs::write(
+        dir.path().join("a.go"),
+        b"package m\n\nfunc A() { let _ = 1; }\n",
     )
     .unwrap();
+
+    let r2 = parse_into_conn(&conn, dir.path(), Some("go"), Some(&["a.go".to_string()])).unwrap();
     assert_eq!(r2.parsed, 1, "scoped reparse should only parse a.go");
     assert_eq!(r2.deleted, 0);
     assert_eq!(r2.changed_files, vec!["a.go".to_string()]);
@@ -2237,7 +2332,10 @@ fn test_scoped_reparse_only_touches_scoped_files() {
     let after = file_index_snapshot(&conn);
 
     assert_eq!(after.len(), 3, "all 3 files should still be tracked");
-    assert_ne!(after["a.go"], snapshot["a.go"], "a.go mtime/size must change");
+    assert_ne!(
+        after["a.go"], snapshot["a.go"],
+        "a.go mtime/size must change"
+    );
     assert_eq!(after["b.go"], snapshot["b.go"], "b.go must be untouched");
     assert_eq!(after["c.go"], snapshot["c.go"], "c.go must be untouched");
 }
@@ -2271,11 +2369,18 @@ fn test_scoped_reparse_preserves_sibling_dir_nodes() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(pkg_dir_count, 1, "pkg/ dir node must exist after cold parse");
+    assert_eq!(
+        pkg_dir_count, 1,
+        "pkg/ dir node must exist after cold parse"
+    );
 
     // Modify only a.go and run a SCOPED reparse.
     std::thread::sleep(std::time::Duration::from_millis(50));
-    fs::write(pkg.join("a.go"), b"package pkg\n\nfunc A() { let _ = 1; }\n").unwrap();
+    fs::write(
+        pkg.join("a.go"),
+        b"package pkg\n\nfunc A() { let _ = 1; }\n",
+    )
+    .unwrap();
     parse_into_conn(
         &conn,
         dir.path(),
@@ -2324,13 +2429,7 @@ fn test_scoped_reparse_handles_deletion_in_scope() {
 
     fs::remove_file(dir.path().join("a.go")).unwrap();
 
-    let r2 = parse_into_conn(
-        &conn,
-        dir.path(),
-        Some("go"),
-        Some(&["a.go".to_string()]),
-    )
-    .unwrap();
+    let r2 = parse_into_conn(&conn, dir.path(), Some("go"), Some(&["a.go".to_string()])).unwrap();
     assert_eq!(r2.parsed, 0);
     assert_eq!(r2.deleted, 1);
 
@@ -2364,7 +2463,11 @@ async fn test_op_reparse_accepts_single_file_source() {
 
     // Modify a.go and let the daemon serve.
     std::thread::sleep(std::time::Duration::from_millis(50));
-    fs::write(src.path().join("a.go"), "package m\n\nfunc A() { /* edited */ }\n").unwrap();
+    fs::write(
+        src.path().join("a.go"),
+        "package m\n\nfunc A() { /* edited */ }\n",
+    )
+    .unwrap();
 
     let dir = TempDir::new().unwrap();
     let (_arena, ctrl_path) = fresh_arena(dir.path());
@@ -2388,16 +2491,29 @@ async fn test_op_reparse_accepts_single_file_source() {
 
     let parsed = uds_round_trip(&sock_path, &body.to_string()).await;
 
-    assert_eq!(parsed["ok"], true, "single-file reparse should succeed: {parsed}");
+    assert_eq!(
+        parsed["ok"], true,
+        "single-file reparse should succeed: {parsed}"
+    );
     assert_eq!(parsed["parsed"], 1, "only a.go should be reparsed");
-    let changed = parsed["changed_files"].as_array().expect("changed_files array");
+    let changed = parsed["changed_files"]
+        .as_array()
+        .expect("changed_files array");
     let names: Vec<&str> = changed.iter().filter_map(|v| v.as_str()).collect();
     assert_eq!(names, vec!["a.go"], "scope should be exactly [a.go]");
 
     // Verify b.go was NOT touched (its mtime/size in _file_index is unchanged).
     let after = file_index_snapshot(&ctx.live_db.lock().unwrap());
-    assert_eq!(after.get("b.go"), snapshot.get("b.go"), "b.go must be untouched");
-    assert_ne!(after.get("a.go"), snapshot.get("a.go"), "a.go must be updated");
+    assert_eq!(
+        after.get("b.go"),
+        snapshot.get("b.go"),
+        "b.go must be untouched"
+    );
+    assert_ne!(
+        after.get("a.go"),
+        snapshot.get("a.go"),
+        "a.go must be updated"
+    );
 }
 
 /// Verify explicit `files: [...]` arg takes precedence over auto-derivation
@@ -2416,7 +2532,11 @@ async fn test_op_reparse_accepts_files_scope_with_dir_source() {
     let conn = cold_parse_go(src.path());
 
     std::thread::sleep(std::time::Duration::from_millis(50));
-    fs::write(src.path().join("b.go"), "package m\n\nfunc B() { /* edit */ }\n").unwrap();
+    fs::write(
+        src.path().join("b.go"),
+        "package m\n\nfunc B() { /* edit */ }\n",
+    )
+    .unwrap();
 
     let dir = TempDir::new().unwrap();
     let (_arena, ctrl_path) = fresh_arena(dir.path());
@@ -2477,10 +2597,7 @@ async fn test_op_reparse_nonexistent_source_sets_error_phase_and_recovers() {
     // Helper: send a JSON op + receive one line, parse. Delegates to the
     // shared `uds_round_trip` so the two test-local duplicates of this
     // pattern stay in sync.
-    async fn round_trip(
-        sock: &std::path::Path,
-        body: serde_json::Value,
-    ) -> serde_json::Value {
+    async fn round_trip(sock: &std::path::Path, body: serde_json::Value) -> serde_json::Value {
         uds_round_trip(sock, &body.to_string()).await
     }
 
@@ -2493,8 +2610,14 @@ async fn test_op_reparse_nonexistent_source_sets_error_phase_and_recovers() {
     .await;
     assert_eq!(resp["ok"], false, "expected error response, got {resp}");
     assert!(
-        resp["error"].as_str().unwrap_or("").contains("not a directory")
-            || resp["error"].as_str().unwrap_or("").contains("No such file"),
+        resp["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not a directory")
+            || resp["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("No such file"),
         "error should mention the path problem; got: {resp:?}",
     );
 
@@ -2502,7 +2625,10 @@ async fn test_op_reparse_nonexistent_source_sets_error_phase_and_recovers() {
     let status = round_trip(&sock_path, serde_json::json!({"op": "status"})).await;
     assert_eq!(status["phase"], "error", "phase should be error: {status}");
     assert!(
-        status["error"].as_str().unwrap_or("").contains("reparse failed"),
+        status["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("reparse failed"),
         "status error field should describe the failure; got: {status:?}",
     );
 
@@ -2517,7 +2643,10 @@ async fn test_op_reparse_nonexistent_source_sets_error_phase_and_recovers() {
     assert_eq!(resp["ok"], true, "successful reparse: {resp}");
 
     let status = round_trip(&sock_path, serde_json::json!({"op": "status"})).await;
-    assert_eq!(status["phase"], "ready", "phase should recover to ready: {status}");
+    assert_eq!(
+        status["phase"], "ready",
+        "phase should recover to ready: {status}"
+    );
     assert!(
         status["error"].is_null() || status["error"].as_str() == Some(""),
         "error field should be cleared after successful reparse; got: {status:?}",
@@ -2553,11 +2682,7 @@ async fn test_op_query_destructive_runs_today_pin_for_6213d4() {
     let sock_path = dir.path().join("query-destructive.sock");
     spawn_test_socket(ctx.clone(), sock_path.clone()).await;
 
-    let parsed = uds_round_trip(
-        &sock_path,
-        r#"{"op":"query","sql":"DROP TABLE doomed"}"#,
-    )
-    .await;
+    let parsed = uds_round_trip(&sock_path, r#"{"op":"query","sql":"DROP TABLE doomed"}"#).await;
 
     // Today: the DROP succeeds. This pins that fact so 6213d4 can land an
     // intentional behavior change (gate / SELECT-only / require auth) and
@@ -2590,9 +2715,9 @@ async fn test_op_query_destructive_runs_today_pin_for_6213d4() {
 #[cfg(feature = "vec")]
 #[tokio::test]
 async fn test_op_vec_search_dim_mismatch_returns_clean_error() {
-    use leyline_cli_lib::daemon::embed::{Embedder, ZeroEmbedder};
-    use leyline_cli_lib::daemon::vec_index::{register_vec, VectorIndex};
     use leyline_cli_lib::daemon::DaemonContext;
+    use leyline_cli_lib::daemon::embed::{Embedder, ZeroEmbedder};
+    use leyline_cli_lib::daemon::vec_index::{VectorIndex, register_vec};
     use std::sync::{Arc, Mutex};
 
     register_vec();
@@ -2615,13 +2740,12 @@ async fn test_op_vec_search_dim_mismatch_returns_clean_error() {
     let sock_path = dir.path().join("vec_dim_mismatch.sock");
     spawn_test_socket(ctx, sock_path.clone()).await;
 
-    let parsed = uds_round_trip(
-        &sock_path,
-        r#"{"op":"vec_search","query":"hello","k":3}"#,
-    )
-    .await;
+    let parsed = uds_round_trip(&sock_path, r#"{"op":"vec_search","query":"hello","k":3}"#).await;
 
-    assert_eq!(parsed["ok"], false, "dim mismatch must surface as ok:false: {parsed}");
+    assert_eq!(
+        parsed["ok"], false,
+        "dim mismatch must surface as ok:false: {parsed}"
+    );
     let err = parsed["error"].as_str().unwrap_or("");
     assert!(
         err.contains("dim") || err.contains("expected") || err.contains("4"),
@@ -2669,10 +2793,7 @@ async fn test_concurrent_uds_load_completes_bounded() {
     /// One client: open, send one op, read one response, parse, return.
     /// Wraps the shared `uds_round_trip` so this test's owned-PathBuf +
     /// `'static str` calling convention stays usable inside `tokio::spawn`.
-    async fn one_call(
-        sock: std::path::PathBuf,
-        body: &'static str,
-    ) -> serde_json::Value {
+    async fn one_call(sock: std::path::PathBuf, body: &'static str) -> serde_json::Value {
         uds_round_trip(&sock, body).await
     }
 
@@ -2771,7 +2892,8 @@ async fn test_op_reparse_snapshot_race_publishes_well_formed_root() {
     let ctrl_path = dir.path().join("test.ctrl");
     let _mmap = create_arena(&arena_path, 4 * 1024 * 1024).unwrap();
     let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), 4 * 1024 * 1024).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), 4 * 1024 * 1024)
+        .unwrap();
     drop(ctrl);
 
     // Cold-parse so _file_index is populated and reparse calls have
@@ -2779,7 +2901,8 @@ async fn test_op_reparse_snapshot_race_publishes_well_formed_root() {
     let conn = cold_parse_go(src.path());
 
     let ctx = Arc::new(DaemonContext {
-        ctrl_path: ctrl_path.clone(),        router: EventRouter::new(64),
+        ctrl_path: ctrl_path.clone(),
+        router: EventRouter::new(64),
         live_db: Mutex::new(conn),
         source_dir: Some(src.path().to_path_buf()),
         lang_filter: Some("go".to_string()),
@@ -2792,10 +2915,7 @@ async fn test_op_reparse_snapshot_race_publishes_well_formed_root() {
     /// One round-trip — wraps the shared `uds_round_trip` so the
     /// owned-PathBuf + `'static str` calling convention works inside
     /// `tokio::spawn`.
-    async fn round_trip(
-        sock: std::path::PathBuf,
-        body: &'static str,
-    ) -> serde_json::Value {
+    async fn round_trip(sock: std::path::PathBuf, body: &'static str) -> serde_json::Value {
         uds_round_trip(&sock, body).await
     }
 
@@ -2841,8 +2961,11 @@ async fn test_op_reparse_snapshot_race_publishes_well_formed_root() {
     // least one snapshot completed and published a non-zero root.
     let roots: Vec<String> = outcome
         .iter()
-        .filter_map(|r| r.get("current_root")
-            .and_then(|s| s.as_str()).map(str::to_string))
+        .filter_map(|r| {
+            r.get("current_root")
+                .and_then(|s| s.as_str())
+                .map(str::to_string)
+        })
         .collect();
     assert!(
         roots.len() >= 12,

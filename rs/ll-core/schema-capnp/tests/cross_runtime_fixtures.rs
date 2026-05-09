@@ -111,10 +111,13 @@ fn read_fixture(name: &str) -> Vec<u8> {
 #[cfg(feature = "regen-fixtures")]
 fn write_fixture(name: &str, bytes: &[u8]) {
     let path = fixtures_dir().join(name);
-    std::fs::write(&path, bytes).unwrap_or_else(|_| {
-        panic!("T8.10: failed to write fixture {}", path.display())
-    });
-    eprintln!("T8.10: wrote fixture {} ({} bytes)", path.display(), bytes.len());
+    std::fs::write(&path, bytes)
+        .unwrap_or_else(|_| panic!("T8.10: failed to write fixture {}", path.display()));
+    eprintln!(
+        "T8.10: wrote fixture {} ({} bytes)",
+        path.display(),
+        bytes.len()
+    );
 }
 
 /// Default mode: assert producer bytes byte-equal the committed
@@ -125,7 +128,8 @@ fn write_fixture(name: &str, bytes: &[u8]) {
 fn assert_or_regen(name: &str, produced: &[u8]) {
     let committed = read_fixture(name);
     assert_eq!(
-        produced, committed.as_slice(),
+        produced,
+        committed.as_slice(),
         "T8.10: producer bytes for {name} drifted from committed fixture.\n\
          Produced: {} bytes\n\
          Committed: {} bytes\n\
@@ -135,7 +139,8 @@ fn assert_or_regen(name: &str, produced: &[u8]) {
          Then commit the new fixtures + update ADR-0014 if the wire format \
          changed substantively. Cross-runtime: every consumer (mache Go, \
          future TS/Swift) MUST also pass after this regen.",
-        produced.len(), committed.len(),
+        produced.len(),
+        committed.len(),
     );
 }
 
@@ -176,11 +181,8 @@ fn binding_record_realistic_matches_fixture() {
 fn binding_record_realistic_round_trips_via_decoder() {
     let bytes = build_binding_record_realistic();
     let mut slice: &[u8] = &bytes;
-    let msg = capnp::serialize::read_message(
-        &mut slice,
-        capnp::message::ReaderOptions::new(),
-    )
-    .expect("decode realistic fixture");
+    let msg = capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new())
+        .expect("decode realistic fixture");
     let rec: binding_record::Reader = msg.get_root().expect("get_root");
 
     assert_eq!(

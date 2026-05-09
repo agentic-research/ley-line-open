@@ -45,8 +45,7 @@ pub fn splice(conn: &Connection, node_id: &str, new_text: &str) -> Result<Vec<u8
             if let Some(c) = content {
                 Ok(c)
             } else if let Some(p) = path {
-                std::fs::read(&p)
-                    .with_context(|| format!("read source file: {p}"))
+                std::fs::read(&p).with_context(|| format!("read source file: {p}"))
             } else {
                 bail!("source '{}' has neither content nor path", source_id)
             }

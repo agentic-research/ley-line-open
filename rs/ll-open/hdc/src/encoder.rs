@@ -12,7 +12,7 @@ use std::sync::Mutex;
 
 use crate::canonical::CanonicalKind;
 use crate::codebook::{AstNodeFingerprint, BaseCodebook};
-use crate::util::{bucket_arity, rotate_left, xor_into, Hypervector};
+use crate::util::{Hypervector, bucket_arity, rotate_left, xor_into};
 
 /// One node in a tree to encode. Owns its children so the encoder can
 /// recurse without borrow-lifetime gymnastics. Built from tree-sitter
@@ -294,7 +294,11 @@ mod tests {
             .iter()
             .map(|c| c.canonical_kind.discriminant())
             .collect();
-        assert_eq!(children_discs, vec![6, 0, 2, 3], "children must keep parser order");
+        assert_eq!(
+            children_discs,
+            vec![6, 0, 2, 3],
+            "children must keep parser order"
+        );
     }
 
     #[test]
@@ -370,7 +374,10 @@ mod tests {
         let tree_complex = node(
             CanonicalKind::Block,
             vec![
-                node(CanonicalKind::Stmt, vec![leaf(CanonicalKind::Op), leaf(CanonicalKind::Ref)]),
+                node(
+                    CanonicalKind::Stmt,
+                    vec![leaf(CanonicalKind::Op), leaf(CanonicalKind::Ref)],
+                ),
                 node(CanonicalKind::Expr, vec![leaf(CanonicalKind::Lit)]),
             ],
         );
@@ -404,7 +411,10 @@ mod tests {
         let warm_cache = SubtreeCache::new();
         encode_tree(&tree, &cb, &warm_cache);
         let warm = encode_tree(&tree, &cb, &warm_cache);
-        assert_eq!(cold, warm, "cache must be transparent to encode_tree output");
+        assert_eq!(
+            cold, warm,
+            "cache must be transparent to encode_tree output"
+        );
     }
 
     #[test]
@@ -448,8 +458,16 @@ mod tests {
             CanonicalKind::Block,
             vec![leaf(CanonicalKind::Op), leaf(CanonicalKind::Ref)],
         );
-        assert_eq!(a.content_hash(), b.content_hash(), "identical structure must hash same");
-        assert_ne!(a.content_hash(), c.content_hash(), "different structure must differ");
+        assert_eq!(
+            a.content_hash(),
+            b.content_hash(),
+            "identical structure must hash same"
+        );
+        assert_ne!(
+            a.content_hash(),
+            c.content_hash(),
+            "different structure must differ"
+        );
     }
 
     #[test]
@@ -536,7 +554,11 @@ mod tests {
         // `arity_bucket` by construction.
         let three = node(
             CanonicalKind::Block,
-            vec![leaf(CanonicalKind::Op), leaf(CanonicalKind::Op), leaf(CanonicalKind::Op)],
+            vec![
+                leaf(CanonicalKind::Op),
+                leaf(CanonicalKind::Op),
+                leaf(CanonicalKind::Op),
+            ],
         );
         let four = node(
             CanonicalKind::Block,

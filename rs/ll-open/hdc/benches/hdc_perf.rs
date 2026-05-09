@@ -12,15 +12,15 @@
 use std::hint::black_box;
 use std::sync::Mutex;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
+use leyline_hdc::D_BYTES;
 use leyline_hdc::canonical::CanonicalKind;
 use leyline_hdc::codebook::AstCodebook;
-use leyline_hdc::encoder::{encode_tree, EncoderNode, SubtreeCache};
+use leyline_hdc::encoder::{EncoderNode, SubtreeCache, encode_tree};
 use leyline_hdc::sheaf::HvCellComplex;
 use leyline_hdc::sql_udf::register_hdc_udfs;
-use leyline_hdc::util::{expand_seed, popcount_distance, Hypervector};
-use leyline_hdc::D_BYTES;
+use leyline_hdc::util::{Hypervector, expand_seed, popcount_distance};
 
 /// Build a balanced ternary-fanout tree of given depth.
 /// Depth 5 ≈ 121 nodes (3⁵+...+1), depth 7 ≈ 1093, depth 9 ≈ 9841.
@@ -92,9 +92,11 @@ fn bench_bundle_majority(c: &mut Criterion) {
         // is one-shot per run, but bencher iterates the SELECT only.
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         register_hdc_udfs(&conn).unwrap();
-        conn.execute("CREATE TABLE hvs(hv BLOB NOT NULL)", []).unwrap();
+        conn.execute("CREATE TABLE hvs(hv BLOB NOT NULL)", [])
+            .unwrap();
         for s in &stalks {
-            conn.execute("INSERT INTO hvs(hv) VALUES (?1)", [s.as_slice()]).unwrap();
+            conn.execute("INSERT INTO hvs(hv) VALUES (?1)", [s.as_slice()])
+                .unwrap();
         }
         // Wrap in a Mutex so the closure can hold a non-Sync ref across
         // criterion's iteration model.

@@ -211,7 +211,10 @@ mod tests {
         // collapses two variants to the same discriminant.
         let mut seen = std::collections::HashSet::new();
         for k in CanonicalKind::ALL {
-            assert!(seen.insert(k.discriminant()), "duplicate discriminant for {k:?}");
+            assert!(
+                seen.insert(k.discriminant()),
+                "duplicate discriminant for {k:?}"
+            );
         }
     }
 

@@ -13,8 +13,8 @@
 
 use rusqlite::Connection;
 
-use crate::util::{blake3_seed, hv_from_slice, popcount_distance, splitmix64, Hypervector};
 use crate::LayerKind;
+use crate::util::{Hypervector, blake3_seed, hv_from_slice, popcount_distance, splitmix64};
 
 /// Default sample size for calibration. Math-friend review B
 /// recommended 10k random pairs as the sweet spot between speed
@@ -43,11 +43,7 @@ impl RadiusBaseline {
     /// layer. `median − tightness * MAD` clamped at 0.
     pub fn recommended_radius(&self, tightness: f64) -> u32 {
         let r = self.median_distance as f64 - tightness * self.mad as f64;
-        if r < 0.0 {
-            0
-        } else {
-            r as u32
-        }
+        if r < 0.0 { 0 } else { r as u32 }
     }
 
     /// Convenience: recommended radius using `DEFAULT_RADIUS_TIGHTNESS`.
@@ -127,10 +123,7 @@ pub fn calibrate_and_persist(
     Ok(count)
 }
 
-fn collect_layer_hvs(
-    conn: &Connection,
-    layer: LayerKind,
-) -> rusqlite::Result<Vec<Hypervector>> {
+fn collect_layer_hvs(conn: &Connection, layer: LayerKind) -> rusqlite::Result<Vec<Hypervector>> {
     let mut stmt = conn.prepare_cached("SELECT hv FROM _hdc WHERE layer_kind = ?1")?;
     let rows = stmt.query_map([layer.as_str()], |r| r.get::<_, Vec<u8>>(0))?;
     let mut out = Vec::new();
@@ -204,10 +197,7 @@ fn compute_mad(values: &[u32], median: u32) -> u32 {
     if values.is_empty() {
         return 0;
     }
-    let mut deviations: Vec<u32> = values
-        .iter()
-        .map(|&v| v.abs_diff(median))
-        .collect();
+    let mut deviations: Vec<u32> = values.iter().map(|&v| v.abs_diff(median)).collect();
     quickselect_median(&mut deviations)
 }
 
@@ -259,7 +249,10 @@ mod tests {
     #[test]
     fn empty_layer_returns_none() {
         let conn = fresh();
-        assert_eq!(calibrate_layer(&conn, LayerKind::Ast, 100, 0).unwrap(), None);
+        assert_eq!(
+            calibrate_layer(&conn, LayerKind::Ast, 100, 0).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -267,7 +260,10 @@ mod tests {
         // Need at least 2 rows to form a pair.
         let conn = fresh();
         insert_layer_hv(&conn, "x", LayerKind::Ast, &expand_seed(1), 1);
-        assert_eq!(calibrate_layer(&conn, LayerKind::Ast, 100, 0).unwrap(), None);
+        assert_eq!(
+            calibrate_layer(&conn, LayerKind::Ast, 100, 0).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -278,7 +274,9 @@ mod tests {
         // with std-dev ≈ √D/2 ≈ 45.
         let conn = fresh();
         populate_iid(&conn, LayerKind::Ast, 200);
-        let baseline = calibrate_layer(&conn, LayerKind::Ast, 1000, 0).unwrap().unwrap();
+        let baseline = calibrate_layer(&conn, LayerKind::Ast, 1000, 0)
+            .unwrap()
+            .unwrap();
         // Median should be near 4096, well within a few std-devs.
         assert!(
             baseline.median_distance.abs_diff(4096) < 200,
@@ -314,7 +312,9 @@ mod tests {
             hv[0] ^= i as u8;
             insert_layer_hv(&conn, &format!("s{i}"), LayerKind::Ast, &hv, 1);
         }
-        let baseline = calibrate_layer(&conn, LayerKind::Ast, 1000, 0).unwrap().unwrap();
+        let baseline = calibrate_layer(&conn, LayerKind::Ast, 1000, 0)
+            .unwrap()
+            .unwrap();
         // Correlated corpus → median below D/2.
         assert!(
             baseline.median_distance < 4000,
@@ -330,8 +330,12 @@ mod tests {
         // calls produce identical samples.
         let conn = fresh();
         populate_iid(&conn, LayerKind::Ast, 50);
-        let b1 = calibrate_layer(&conn, LayerKind::Ast, 100, 0).unwrap().unwrap();
-        let b2 = calibrate_layer(&conn, LayerKind::Ast, 100, 0).unwrap().unwrap();
+        let b1 = calibrate_layer(&conn, LayerKind::Ast, 100, 0)
+            .unwrap()
+            .unwrap();
+        let b2 = calibrate_layer(&conn, LayerKind::Ast, 100, 0)
+            .unwrap()
+            .unwrap();
         assert_eq!(b1.median_distance, b2.median_distance);
         assert_eq!(b1.mad, b2.mad);
     }
@@ -345,8 +349,12 @@ mod tests {
         let conn = fresh();
         populate_iid(&conn, LayerKind::Ast, 50);
         populate_iid(&conn, LayerKind::Module, 50);
-        let ast = calibrate_layer(&conn, LayerKind::Ast, 100, 0).unwrap().unwrap();
-        let module = calibrate_layer(&conn, LayerKind::Module, 100, 0).unwrap().unwrap();
+        let ast = calibrate_layer(&conn, LayerKind::Ast, 100, 0)
+            .unwrap()
+            .unwrap();
+        let module = calibrate_layer(&conn, LayerKind::Module, 100, 0)
+            .unwrap()
+            .unwrap();
         // Sample seeds differ; with small sample the medians may
         // coincidentally land equal, but the underlying sampling MUST
         // differ — pin via the public layer field which is part of
@@ -444,7 +452,10 @@ mod tests {
             .unwrap()
             .expect("two valid rows must produce a baseline");
         // Two valid HVs → 1 unordered pair → sample_size capped at 1.
-        assert_eq!(baseline.sample_size, 1, "malformed row must be skipped, not paired");
+        assert_eq!(
+            baseline.sample_size, 1,
+            "malformed row must be skipped, not paired"
+        );
     }
 
     #[test]
@@ -485,7 +496,13 @@ mod tests {
 
         // Add more rows (simulating corpus growth).
         for i in 20..50 {
-            insert_layer_hv(&conn, &format!("s{i}"), LayerKind::Ast, &expand_seed(i + 1), 1);
+            insert_layer_hv(
+                &conn,
+                &format!("s{i}"),
+                LayerKind::Ast,
+                &expand_seed(i + 1),
+                1,
+            );
         }
         calibrate_and_persist(&conn, 100, 1_800_000_000_000).unwrap();
 
@@ -505,7 +522,9 @@ mod tests {
         // samples should clamp gracefully rather than loop forever.
         let conn = fresh();
         populate_iid(&conn, LayerKind::Ast, 5);
-        let baseline = calibrate_layer(&conn, LayerKind::Ast, 1000, 0).unwrap().unwrap();
+        let baseline = calibrate_layer(&conn, LayerKind::Ast, 1000, 0)
+            .unwrap()
+            .unwrap();
         // Sample size capped at the available pair count.
         assert!(
             baseline.sample_size <= 10,

@@ -6,9 +6,9 @@
 //!
 //! See bead `ley-line-open-96b1a9` for the per-layer codebook plan.
 
-use crate::canonical::CanonicalKind;
-use crate::util::{blake3_seed, tagged_seed_vector, Hypervector, ZERO_HV};
 use crate::D_BITS;
+use crate::canonical::CanonicalKind;
+use crate::util::{Hypervector, ZERO_HV, blake3_seed, tagged_seed_vector};
 
 /// Per-layer codebook: maps domain-specific node fingerprints to base
 /// hypervectors. Implementors must be `Send + Sync` so the encoder can
@@ -106,7 +106,11 @@ impl AstNodeFingerprint {
     /// arity_bucket: ..., child_canonical_kinds: ...` boilerplate at
     /// every call site (encoder::fingerprint, query::explain_cluster_
     /// centroid, codebook/ast tests).
-    pub fn new(canonical_kind: CanonicalKind, arity_bucket: u8, child_canonical_kinds: Vec<CanonicalKind>) -> Self {
+    pub fn new(
+        canonical_kind: CanonicalKind,
+        arity_bucket: u8,
+        child_canonical_kinds: Vec<CanonicalKind>,
+    ) -> Self {
         Self {
             canonical_kind,
             arity_bucket,
@@ -230,7 +234,7 @@ mod tests {
         // tag-agnostic.
         let bytes = canonical_signature_bytes(
             "test-tag",
-            CanonicalKind::Stmt,        // disc=2
+            CanonicalKind::Stmt, // disc=2
             3,
             &[CanonicalKind::Op, CanonicalKind::Block, CanonicalKind::Op], // discs 6, 3, 6 → sorted 3, 6, 6
         );
@@ -246,7 +250,11 @@ mod tests {
         // produce different bytes — this is what makes AstCodebook's
         // base_vector distinct from ModuleCodebook's even when the
         // structural payload matches (skeptic-review bead 4bb8a0).
-        let payload = (CanonicalKind::Decl, 2u8, vec![CanonicalKind::Block, CanonicalKind::Ref]);
+        let payload = (
+            CanonicalKind::Decl,
+            2u8,
+            vec![CanonicalKind::Block, CanonicalKind::Ref],
+        );
         let ast_bytes = canonical_signature_bytes("hdc-ast", payload.0, payload.1, &payload.2);
         let module_bytes =
             canonical_signature_bytes("hdc-module", payload.0, payload.1, &payload.2);
@@ -383,7 +391,10 @@ mod tests {
         // (the enum does), so compare fields explicitly.
         assert_eq!(manual.canonical_kind, via_helper.canonical_kind);
         assert_eq!(manual.arity_bucket, via_helper.arity_bucket);
-        assert_eq!(manual.child_canonical_kinds, via_helper.child_canonical_kinds);
+        assert_eq!(
+            manual.child_canonical_kinds,
+            via_helper.child_canonical_kinds
+        );
     }
 }
 
@@ -391,12 +402,12 @@ pub mod ast;
 pub use ast::AstCodebook;
 
 pub mod module;
-pub use module::{encode_module, module_distance, ModuleCodebook};
+pub use module::{ModuleCodebook, encode_module, module_distance};
 
 pub mod semantic;
-pub use semantic::{SemanticCodebook, SEMANTIC_HYPERPLANE_SEED};
+pub use semantic::{SEMANTIC_HYPERPLANE_SEED, SemanticCodebook};
 
 pub mod temporal;
 pub use temporal::{
-    TemporalCodebook, TemporalCoEditMatrix, DEFAULT_TAU_SECONDS, TEMPORAL_HYPERPLANE_SEED,
+    DEFAULT_TAU_SECONDS, TEMPORAL_HYPERPLANE_SEED, TemporalCoEditMatrix, TemporalCodebook,
 };

@@ -79,7 +79,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::canonical::CanonicalKind;
-use crate::util::{popcount_distance, rotate_left, Hypervector, ZERO_HV};
+use crate::util::{Hypervector, ZERO_HV, popcount_distance, rotate_left};
 use crate::{D_BITS, D_BYTES, LayerKind};
 
 /// A stalk: one hypervector over one layer at one cell.
@@ -643,12 +643,14 @@ mod tests {
                 .with_stalk(LayerKind::Module, stalk_for(33)),
         );
         cx.add_cell(
-            HvCell::new("fn_b", CanonicalKind::Stmt)
-                .with_stalk(LayerKind::Ast, stalk_for(44)),
+            HvCell::new("fn_b", CanonicalKind::Stmt).with_stalk(LayerKind::Ast, stalk_for(44)),
         );
         let r1 = cx.structural_root();
         let r2 = cx.structural_root();
-        assert_eq!(r1, r2, "structural_root must be byte-identical across calls");
+        assert_eq!(
+            r1, r2,
+            "structural_root must be byte-identical across calls"
+        );
     }
 
     #[test]
@@ -731,8 +733,7 @@ mod tests {
         // to ZERO_HV" would surface immediately. detect_violations and
         // edge_hamming both lean on the None signal to skip
         // unobservable edges (see missing_layer_skipped_not_violated).
-        let cell = HvCell::new("fn", CanonicalKind::Decl)
-            .with_stalk(LayerKind::Ast, stalk_for(1));
+        let cell = HvCell::new("fn", CanonicalKind::Decl).with_stalk(LayerKind::Ast, stalk_for(1));
         assert_eq!(cell.stalk(LayerKind::Ast), Some(&stalk_for(1)));
         assert_eq!(cell.stalk(LayerKind::Semantic), None);
         assert_eq!(cell.stalk(LayerKind::Module), None);
@@ -740,7 +741,11 @@ mod tests {
         // Empty cell: every layer is None.
         let empty = HvCell::new("fn", CanonicalKind::Decl);
         for layer in LayerKind::ALL {
-            assert_eq!(empty.stalk(layer), None, "empty cell must report None on {layer:?}");
+            assert_eq!(
+                empty.stalk(layer),
+                None,
+                "empty cell must report None on {layer:?}"
+            );
         }
     }
 
@@ -841,8 +846,7 @@ mod tests {
         let mut cx = HvCellComplex::new();
         for (id, seed) in &[("a", 1u64), ("b", 2), ("c", 3)] {
             cx.add_cell(
-                HvCell::new(*id, CanonicalKind::Decl)
-                    .with_stalk(LayerKind::Ast, stalk_for(*seed)),
+                HvCell::new(*id, CanonicalKind::Decl).with_stalk(LayerKind::Ast, stalk_for(*seed)),
             );
         }
         let actual = cx.merkle_root_for_layer(LayerKind::Ast);
@@ -985,7 +989,10 @@ mod tests {
         let sem_b = cx_b.merkle_root_for_layer(LayerKind::Semantic);
 
         assert_eq!(ast_a, ast_b, "AST stalks identical → AST root identical");
-        assert_ne!(sem_a, sem_b, "Semantic stalks differ → Semantic root differs");
+        assert_ne!(
+            sem_a, sem_b,
+            "Semantic stalks differ → Semantic root differs"
+        );
     }
 
     #[test]
@@ -1019,7 +1026,7 @@ mod tests {
         // any threshold below D/2 (random pair → ~D/2 hamming).
         let mut cx = HvCellComplex::new();
         cx.add_cell(make_cell("fn_a", CanonicalKind::Decl, 1));
-        cx.add_cell(make_cell("fn_b", CanonicalKind::Decl, 1));  // same as fn_a
+        cx.add_cell(make_cell("fn_b", CanonicalKind::Decl, 1)); // same as fn_a
         cx.add_cell(make_cell("fn_c", CanonicalKind::Decl, 999)); // different
         cx.set_threshold(LayerKind::Ast, 100); // tight threshold
         cx.add_edge(HvEdge::identity(
@@ -1042,8 +1049,15 @@ mod tests {
         // other fields would fail loudly. Threshold + layer are
         // constants from the setup; hamming must exceed threshold by
         // construction (the contract that triggered the violation).
-        assert_eq!(v[0].threshold, 100, "threshold must echo set_threshold value");
-        assert_eq!(v[0].layer, LayerKind::Ast, "violation layer must echo edge layer");
+        assert_eq!(
+            v[0].threshold, 100,
+            "threshold must echo set_threshold value"
+        );
+        assert_eq!(
+            v[0].layer,
+            LayerKind::Ast,
+            "violation layer must echo edge layer"
+        );
         assert!(
             v[0].hamming > v[0].threshold,
             "violation must satisfy hamming > threshold (got h={}, t={})",
@@ -1134,10 +1148,18 @@ mod tests {
             cx.add_cell(make_cell(id, CanonicalKind::Decl, *seed));
         }
         cx.set_threshold(LayerKind::Ast, 10);
-        cx.add_edge(HvEdge::identity("fn_z", "fn_a", EdgeKind::Sibling, LayerKind::Ast));
+        cx.add_edge(HvEdge::identity(
+            "fn_z",
+            "fn_a",
+            EdgeKind::Sibling,
+            LayerKind::Ast,
+        ));
         let c1 = cx.propagate_sections(LayerKind::Ast);
         let c2 = cx.propagate_sections(LayerKind::Ast);
-        assert_eq!(c1, c2, "propagate_sections must produce byte-identical output");
+        assert_eq!(
+            c1, c2,
+            "propagate_sections must produce byte-identical output"
+        );
     }
 
     #[test]
@@ -1185,12 +1207,21 @@ mod tests {
         }
         cx.set_threshold(LayerKind::Ast, 100);
         // Edge merging a-b only.
-        cx.add_edge(HvEdge::identity("a", "b", EdgeKind::Sibling, LayerKind::Ast));
+        cx.add_edge(HvEdge::identity(
+            "a",
+            "b",
+            EdgeKind::Sibling,
+            LayerKind::Ast,
+        ));
 
         let groups = cx.compute_h0(LayerKind::Ast);
         // Sum of group sizes must equal total cells.
         let total: usize = groups.iter().map(|g| g.len()).sum();
-        assert_eq!(total, cx.cells.len(), "groups must partition cells (no dup, no omit)");
+        assert_eq!(
+            total,
+            cx.cells.len(),
+            "groups must partition cells (no dup, no omit)"
+        );
         // Union of ids equals the cell-id set.
         let mut all_ids: Vec<&str> = groups.iter().flatten().map(|s| s.as_str()).collect();
         all_ids.sort_unstable();
@@ -1257,10 +1288,18 @@ mod tests {
             cx.add_cell(make_cell(id, CanonicalKind::Decl, *seed));
         }
         cx.set_threshold(LayerKind::Ast, 10);
-        cx.add_edge(HvEdge::identity("fn_z", "fn_a", EdgeKind::Sibling, LayerKind::Ast));
+        cx.add_edge(HvEdge::identity(
+            "fn_z",
+            "fn_a",
+            EdgeKind::Sibling,
+            LayerKind::Ast,
+        ));
         let g1 = cx.compute_h0(LayerKind::Ast);
         let g2 = cx.compute_h0(LayerKind::Ast);
-        assert_eq!(g1, g2, "compute_h0 must produce byte-identical output across calls");
+        assert_eq!(
+            g1, g2,
+            "compute_h0 must produce byte-identical output across calls"
+        );
     }
 
     #[test]
@@ -1387,7 +1426,10 @@ mod tests {
         let ast_2 = cx2.merkle_root_for_layer(LayerKind::Ast);
         let delta_layer = xor32(&ast, &ast_2);
         let delta_struct = xor32(&structural, &structural_2);
-        assert_eq!(delta_layer, delta_struct, "structural root delta == AST delta when only AST changed");
+        assert_eq!(
+            delta_layer, delta_struct,
+            "structural root delta == AST delta when only AST changed"
+        );
         // sem unused but kept for documentation: confirm Semantic
         // root is non-zero (sanity).
         assert_ne!(sem, [0u8; 32]);
@@ -1534,11 +1576,9 @@ mod tests {
             Restriction::Composite(vec![Restriction::RotateLeft(7)]),
         ])
         .apply(&hv);
-        let flat = Restriction::Composite(vec![
-            Restriction::RotateLeft(3),
-            Restriction::RotateLeft(7),
-        ])
-        .apply(&hv);
+        let flat =
+            Restriction::Composite(vec![Restriction::RotateLeft(3), Restriction::RotateLeft(7)])
+                .apply(&hv);
         assert_eq!(nested, flat);
         // And both equal direct RotateLeft(10):
         assert_eq!(nested, Restriction::RotateLeft(10).apply(&hv));
@@ -1681,8 +1721,18 @@ mod tests {
         }
         cx.add_cell(HvCell::new("z", CanonicalKind::Decl).with_stalk(LayerKind::Ast, s_singleton));
         cx.set_threshold(LayerKind::Ast, 0);
-        cx.add_edge(HvEdge::identity("a", "b", EdgeKind::Sibling, LayerKind::Ast));
-        cx.add_edge(HvEdge::identity("b", "c", EdgeKind::Sibling, LayerKind::Ast));
+        cx.add_edge(HvEdge::identity(
+            "a",
+            "b",
+            EdgeKind::Sibling,
+            LayerKind::Ast,
+        ));
+        cx.add_edge(HvEdge::identity(
+            "b",
+            "c",
+            EdgeKind::Sibling,
+            LayerKind::Ast,
+        ));
 
         let centroids = cx.propagate_sections(LayerKind::Ast);
         assert_eq!(centroids.len(), 2, "one centroid per H0 component");
@@ -1716,14 +1766,20 @@ mod tests {
         let all_ones: Hypervector = [0xFFu8; D_BYTES];
         // Mixed pattern: bit 0 set in stalks 0,1 but not 2; bit 1 set
         // in stalk 2 only.
-        let mut s0 = ZERO_HV; s0[0] = 0b0000_0001;
-        let mut s1 = ZERO_HV; s1[0] = 0b0000_0001;
-        let mut s2 = ZERO_HV; s2[0] = 0b0000_0010;
+        let mut s0 = ZERO_HV;
+        s0[0] = 0b0000_0001;
+        let mut s1 = ZERO_HV;
+        s1[0] = 0b0000_0001;
+        let mut s2 = ZERO_HV;
+        s2[0] = 0b0000_0010;
         let bundle = HvCellComplex::bundle_majority(&[s0, s1, s2]);
         // Bit 0: 2/3 → elect to 1.
         // Bit 1: 1/3 → elect to 0.
         // All other bits: 0/3 → 0.
-        assert_eq!(bundle[0], 0b0000_0001, "2-of-3 elects bit 0; 1-of-3 loses bit 1");
+        assert_eq!(
+            bundle[0], 0b0000_0001,
+            "2-of-3 elects bit 0; 1-of-3 loses bit 1"
+        );
         for &b in &bundle[1..] {
             assert_eq!(b, 0, "untouched bytes must remain zero");
         }
@@ -1797,12 +1853,12 @@ mod tests {
         // through the SQL `BUNDLE_MAJORITY` aggregate; assert they
         // produce identical bytes. Pin so a future divergence in
         // either implementation gets caught.
-        let stalks: Vec<Hypervector> =
-            vec![stalk_for(101), stalk_for(202), stalk_for(303)];
+        let stalks: Vec<Hypervector> = vec![stalk_for(101), stalk_for(202), stalk_for(303)];
         let rust_bundle = HvCellComplex::bundle_majority(&stalks);
 
         let conn = conn_with_udfs();
-        conn.execute("CREATE TABLE hvs(hv BLOB NOT NULL)", []).unwrap();
+        conn.execute("CREATE TABLE hvs(hv BLOB NOT NULL)", [])
+            .unwrap();
         for s in &stalks {
             conn.execute("INSERT INTO hvs(hv) VALUES (?1)", [s.as_slice()])
                 .unwrap();
@@ -1830,7 +1886,8 @@ mod tests {
         assert_eq!(rust_empty, ZERO_HV, "Rust empty must be ZERO_HV");
 
         let conn = conn_with_udfs();
-        conn.execute("CREATE TABLE hvs(hv BLOB NOT NULL)", []).unwrap();
+        conn.execute("CREATE TABLE hvs(hv BLOB NOT NULL)", [])
+            .unwrap();
         let sql_empty: Value = conn
             .query_row("SELECT BUNDLE_MAJORITY(hv) FROM hvs", [], |r| r.get(0))
             .unwrap();

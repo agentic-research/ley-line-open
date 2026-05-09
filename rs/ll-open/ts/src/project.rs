@@ -572,10 +572,7 @@ mod tests {
         let ids = all_ids(&conn);
         let mut seen = std::collections::HashSet::new();
         for id in &ids {
-            assert!(
-                seen.insert(id.clone()),
-                "duplicate id in wide array: {id}",
-            );
+            assert!(seen.insert(id.clone()), "duplicate id in wide array: {id}",);
         }
         assert!(
             ids.len() >= n,

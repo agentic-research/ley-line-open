@@ -18,9 +18,9 @@
 //! fixed seed string `"hdc-semantic-v1"`, so any daemon instance with
 //! the same embedder produces identical projections.
 
-use crate::util::{splitmix64, Hypervector, ZERO_HV};
 #[cfg(test)]
 use crate::D_BITS;
+use crate::util::{Hypervector, ZERO_HV, splitmix64};
 
 /// Domain seed for the semantic codebook's hyperplane matrix. NEVER
 /// change once production data is encoded — bumping this orphans every
@@ -260,7 +260,10 @@ mod tests {
         let zero_emb: Vec<f32> = vec![0.0; 16];
         let hv = cb.project(&zero_emb);
         let ones: u32 = hv.iter().map(|b| b.count_ones()).sum();
-        assert_eq!(ones as usize, D_BITS, "zero-embedding must produce all-1 HV");
+        assert_eq!(
+            ones as usize, D_BITS,
+            "zero-embedding must produce all-1 HV"
+        );
     }
 
     #[test]

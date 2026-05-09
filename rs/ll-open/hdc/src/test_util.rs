@@ -11,7 +11,7 @@ use rusqlite::Connection;
 
 use crate::schema::create_hdc_schema;
 use crate::sql_udf::register_hdc_udfs;
-use crate::{Hypervector, LayerKind, D_BITS, D_BYTES};
+use crate::{D_BITS, D_BYTES, Hypervector, LayerKind};
 
 /// Open an in-memory SQLite connection with the HDC schema applied
 /// but no UDFs registered. Tests that exercise schema/storage logic
@@ -65,12 +65,7 @@ pub(crate) fn insert_layer_hv(
 
 /// Insert a combined-view hypervector into `_hdc_combined`. Used by
 /// query-layer tests that exercise the prefilter table.
-pub(crate) fn insert_combined_hv(
-    conn: &Connection,
-    scope: &str,
-    hv: &Hypervector,
-    basis: i64,
-) {
+pub(crate) fn insert_combined_hv(conn: &Connection, scope: &str, hv: &Hypervector, basis: i64) {
     conn.execute(
         "INSERT INTO _hdc_combined(scope_id, hv, basis) VALUES (?1, ?2, ?3)",
         rusqlite::params![scope, hv.to_vec(), basis],

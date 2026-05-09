@@ -18,11 +18,10 @@
 //! mirror directories (`mod.rs` + `mod_test.rs`), repeated scaffolding
 //! across crates.
 
-use crate::codebook::{canonical_signature_bytes, AstNodeFingerprint, BaseCodebook};
+use crate::codebook::{AstNodeFingerprint, BaseCodebook, canonical_signature_bytes};
 use crate::encoder::EncoderNode;
 use crate::util::{
-    bucket_arity, bytes_to_hv, popcount_distance, rotate_left, xor_into,
-    Hypervector, ZERO_HV,
+    Hypervector, ZERO_HV, bucket_arity, bytes_to_hv, popcount_distance, rotate_left, xor_into,
 };
 
 #[cfg(test)]
@@ -324,9 +323,7 @@ mod tests {
             // Empty file with just a root of `kind`.
             let empty_root = node(kind, vec![]);
             let module_hv = encode_module(&empty_root, &module_cb);
-            let ast_leaf_hv = ast_cb.base_vector(
-                &crate::codebook::AstNodeFingerprint::leaf(kind),
-            );
+            let ast_leaf_hv = ast_cb.base_vector(&crate::codebook::AstNodeFingerprint::leaf(kind));
             assert_far_apart(
                 &module_hv,
                 &ast_leaf_hv,
@@ -360,7 +357,11 @@ mod tests {
         let ast_cb = AstCodebook::new();
         let m_role0 = module_cb.role_vector(0);
         let a_role0 = ast_cb.role_vector(0);
-        assert_far_apart(&m_role0, &a_role0, "module role-0 must not collide with AST role-0");
+        assert_far_apart(
+            &m_role0,
+            &a_role0,
+            "module role-0 must not collide with AST role-0",
+        );
     }
 
     #[test]
@@ -416,10 +417,7 @@ mod tests {
             vec![fake_func(), fake_func(), fake_func()],
         );
         // File B: 1 type, 1 var (different shape entirely)
-        let file_b = node(
-            CanonicalKind::Block,
-            vec![fake_type(), fake_var()],
-        );
+        let file_b = node(CanonicalKind::Block, vec![fake_type(), fake_var()]);
         let d = module_distance(&file_a, &file_b, &cb);
         assert!(
             d > 1000,

@@ -65,10 +65,7 @@ enum Cmd {
 }
 
 #[derive(Parser)]
-#[command(
-    name = "leyline",
-    about = "Pre-bake source code into a .db for mache"
-)]
+#[command(name = "leyline", about = "Pre-bake source code into a .db for mache")]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
@@ -79,7 +76,12 @@ async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let version: &'static str = Box::leak(
-        format!("{} ({})", env!("CARGO_PKG_VERSION"), leyline_cli_lib::EDITION).into_boxed_str(),
+        format!(
+            "{} ({})",
+            env!("CARGO_PKG_VERSION"),
+            leyline_cli_lib::EDITION
+        )
+        .into_boxed_str(),
     );
     let matches = Cli::command().version(version).get_matches();
     let cli = Cli::from_arg_matches(&matches)?;

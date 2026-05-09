@@ -114,8 +114,9 @@ impl std::fmt::Display for ArenaHeaderError {
             Self::VersionMismatch { file, expected } => write!(
                 f,
                 "ArenaHeader VERSION mismatch: file has v{file}, this binary expects v{expected}. \
-                 T2.4 (decade ley-line-open-9d30ac) bumped to v2; old binaries cannot read \
-                 new arenas and vice versa. Coordinate LLO + mache release cutover."
+                 LLO v0.2.0 bumped the on-disk format to v2 to drop the V1 generation field; \
+                 old binaries cannot read new arenas and vice versa. Coordinate LLO + mache \
+                 release cutover (LLO v0.2.0 + mache v0.8.0 ship together)."
             ),
             Self::BadActiveBuffer(b) => {
                 write!(f, "invalid active_buffer: {b} (expected 0 or 1)")
@@ -311,7 +312,8 @@ mod tests {
         let bytes = ArenaHeader::MAGIC.to_be_bytes();
         assert_eq!(bytes, *b"LEY0", "MAGIC bytes must spell 'LEY0'");
         assert_eq!(
-            ArenaHeader::VERSION, 2,
+            ArenaHeader::VERSION,
+            2,
             "T2.4: ArenaHeader VERSION must be 2 (paired with control::VERSION=2)"
         );
     }

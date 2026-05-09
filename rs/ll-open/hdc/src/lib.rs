@@ -30,8 +30,8 @@ pub mod sql_udf;
 mod test_util;
 pub mod util;
 
-pub use encoder::{encode_fresh, encode_tree, EncoderNode, SubtreeCache};
-pub use util::{popcount_distance, Hypervector, ZERO_HV};
+pub use encoder::{EncoderNode, SubtreeCache, encode_fresh, encode_tree};
+pub use util::{Hypervector, ZERO_HV, popcount_distance};
 
 /// Hypervector dimensionality in bits. Default = 8192. Single source of truth
 /// — every layer, every codebook, every BLOB column shares this value.
@@ -145,7 +145,11 @@ mod tests {
         // surfaces the gap. Iterating over `ALL` also catches a refactor
         // that adds a variant without appending to the const.
         for k in LayerKind::ALL {
-            assert_eq!(LayerKind::parse_str(k.as_str()), Some(k), "round-trip failed for {k:?}");
+            assert_eq!(
+                LayerKind::parse_str(k.as_str()),
+                Some(k),
+                "round-trip failed for {k:?}"
+            );
         }
     }
 

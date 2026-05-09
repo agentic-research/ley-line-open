@@ -84,17 +84,12 @@ fn build_source_tree(root: &Path, n_files: usize, bytes_per_file: usize) {
 /// set_arena). `serialize()` returns SQLITE_SERIALIZE_NOCOPY on `:memory:`
 /// connections, so the bytes are borrowed from the live connection — the
 /// lock MUST be held while `db_bytes` is in scope.
-fn snapshot_baseline(
-    live_db: &Mutex<Connection>,
-    ctrl_path: &Path,
-) -> (Duration, Duration, usize) {
+fn snapshot_baseline(live_db: &Mutex<Connection>, ctrl_path: &Path) -> (Duration, Duration, usize) {
     let lock_acquired = Instant::now();
     let guard = live_db.lock().unwrap();
 
     let serialize_start = Instant::now();
-    let db_bytes = guard
-        .serialize(DatabaseName::Main)
-        .expect("serialize");
+    let db_bytes = guard.serialize(DatabaseName::Main).expect("serialize");
     let serialize_dur = serialize_start.elapsed();
 
     let mut ctrl = Controller::open_or_create(ctrl_path).expect("ctrl");
@@ -111,8 +106,7 @@ fn snapshot_baseline(
         arena_size
     };
 
-    let mut mmap =
-        create_arena(Path::new(&arena_path), arena_size).expect("create_arena");
+    let mut mmap = create_arena(Path::new(&arena_path), arena_size).expect("create_arena");
     write_to_arena(&mut mmap, &db_bytes).expect("write_to_arena");
     let root: [u8; 32] = blake3::hash(&db_bytes).into();
     ctrl.set_arena_with_root(&arena_path, arena_size, root)
@@ -169,8 +163,7 @@ fn snapshot_shortened(
         arena_size
     };
 
-    let mut mmap =
-        create_arena(Path::new(&arena_path), arena_size).expect("create_arena");
+    let mut mmap = create_arena(Path::new(&arena_path), arena_size).expect("create_arena");
     write_to_arena(&mut mmap, &db_bytes_owned).expect("write_to_arena");
     let root: [u8; 32] = blake3::hash(&db_bytes_owned).into();
     ctrl.set_arena_with_root(&arena_path, arena_size, root)
@@ -222,13 +215,8 @@ fn build_fixture(
     // Build the in-memory live_db and parse the tree once.
     let conn = Connection::open_in_memory().unwrap();
     let parse_start = Instant::now();
-    let result = leyline_cli_lib::cmd_parse::parse_into_conn(
-        &conn,
-        &src,
-        Some("python"),
-        None,
-    )
-    .expect("parse_into_conn");
+    let result = leyline_cli_lib::cmd_parse::parse_into_conn(&conn, &src, Some("python"), None)
+        .expect("parse_into_conn");
     eprintln!(
         "fixture: parsed {} files ({} parsed, {} unchanged) in {:.2?}",
         n_files,
@@ -280,11 +268,11 @@ fn phase1_decomposition(n_files: usize, bytes_per_file: usize, iters: usize) {
     let sh_locked = mean(&shortened_locked);
     let sh_serialize = mean(&shortened_serialize);
 
-    println!("\n  serialized DB size:                {} KiB", db_size / 1024);
     println!(
-        "  BASELINE  total lock-held (mean):  {:>9.2?}",
-        bs_total
+        "\n  serialized DB size:                {} KiB",
+        db_size / 1024
     );
+    println!("  BASELINE  total lock-held (mean):  {:>9.2?}", bs_total);
     println!(
         "  BASELINE  ├ serialize() share:     {:>9.2?}  ({:.1}%)",
         bs_serialize,
@@ -295,10 +283,7 @@ fn phase1_decomposition(n_files: usize, bytes_per_file: usize, iters: usize) {
         bs_total - bs_serialize,
         100.0 * (bs_total - bs_serialize).as_secs_f64() / bs_total.as_secs_f64()
     );
-    println!(
-        "  SHORTENED lock-held (mean):        {:>9.2?}",
-        sh_locked
-    );
+    println!("  SHORTENED lock-held (mean):        {:>9.2?}", sh_locked);
     println!(
         "  SHORTENED ├ serialize() share:     {:>9.2?}  ({:.1}%)",
         sh_serialize,
@@ -346,8 +331,7 @@ fn phase2_contention(
     // Per-writer wait-for-lock latency samples.
     let writer_stats: Arc<Mutex<Vec<Vec<Duration>>>> =
         Arc::new(Mutex::new(vec![Vec::new(); n_writers]));
-    let writer_counts: Arc<Mutex<Vec<u64>>> =
-        Arc::new(Mutex::new(vec![0u64; n_writers]));
+    let writer_counts: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(vec![0u64; n_writers]));
 
     let mut handles = Vec::new();
 
@@ -388,8 +372,7 @@ fn phase2_contention(
     let snap_db = live_db.clone();
     let snap_ctrl = ctrl_path.clone();
     let snap_shape = shape.to_string();
-    let snap_lock_holds: Arc<Mutex<Vec<Duration>>> =
-        Arc::new(Mutex::new(Vec::new()));
+    let snap_lock_holds: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::new()));
     let snap_lock_holds_t = snap_lock_holds.clone();
     let snap_handle = std::thread::spawn(move || {
         let mut next = Instant::now() + snapshot_period;
@@ -461,10 +444,20 @@ struct ContentionResult {
 fn print_contention_table(rows: &[ContentionResult]) {
     println!(
         "\n  {:<10} {:>4} {:>12} {:>10} {:>10} {:>10} {:>8} {:>11} {:>11}",
-        "shape", "N", "writes/sec", "wait p50", "wait p99", "wait max", "snaps",
-        "lock_hold μ", "lock_hold p99",
+        "shape",
+        "N",
+        "writes/sec",
+        "wait p50",
+        "wait p99",
+        "wait max",
+        "snaps",
+        "lock_hold μ",
+        "lock_hold p99",
     );
-    println!("  {}", "─".repeat(10 + 4 + 12 + 10 + 10 + 10 + 8 + 11 + 11 + 16));
+    println!(
+        "  {}",
+        "─".repeat(10 + 4 + 12 + 10 + 10 + 10 + 8 + 11 + 11 + 16)
+    );
     for r in rows {
         println!(
             "  {:<10} {:>4} {:>12.0} {:>10.2?} {:>10.2?} {:>10.2?} {:>8} {:>11.2?} {:>11.2?}",
@@ -485,12 +478,8 @@ fn print_contention_table(rows: &[ContentionResult]) {
 
 fn main() {
     eprintln!("=== WAL snapshot lock-hold experiment ===");
-    eprintln!(
-        "VERIFIED PRECONDITION: `:memory:` SQLite ignores `PRAGMA journal_mode = WAL`."
-    );
-    eprintln!(
-        "Premise tested: 'shorten lock-hold by releasing writer mutex after serialize().'"
-    );
+    eprintln!("VERIFIED PRECONDITION: `:memory:` SQLite ignores `PRAGMA journal_mode = WAL`.");
+    eprintln!("Premise tested: 'shorten lock-hold by releasing writer mutex after serialize().'");
 
     // Scale: aim for a serialized DB of a few hundred MiB to imitate
     // registry-relevant lock-hold-time ranges. 5_000 files × 4 KiB of
@@ -500,13 +489,9 @@ fn main() {
     let scales = [(2_000usize, 2_048usize), (5_000usize, 4_096usize)];
 
     for (nf, bpf) in scales {
-        println!(
-            "\n────────────────────────────────────────────────────────────"
-        );
+        println!("\n────────────────────────────────────────────────────────────");
         println!("FIXTURE: {} files × {} bytes/file", nf, bpf);
-        println!(
-            "────────────────────────────────────────────────────────────"
-        );
+        println!("────────────────────────────────────────────────────────────");
 
         // Phase 1: lock-hold decomposition.
         phase1_decomposition(nf, bpf, 5);
@@ -541,8 +526,8 @@ fn main() {
                 .find(|r| r.n_writers == n && r.shape == "shortened")
                 .unwrap();
             let throughput_ratio = s.write_throughput / b.write_throughput;
-            let lock_hold_ratio = b.snap_lock_held_mean.as_secs_f64()
-                / s.snap_lock_held_mean.as_secs_f64();
+            let lock_hold_ratio =
+                b.snap_lock_held_mean.as_secs_f64() / s.snap_lock_held_mean.as_secs_f64();
             println!(
                 "    N={:>2}: throughput ×{:.2}, lock-hold ×{:.2}",
                 n, throughput_ratio, lock_hold_ratio

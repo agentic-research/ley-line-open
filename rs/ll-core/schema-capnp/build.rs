@@ -16,5 +16,6 @@ fn main() {
         }
     }
 
-    cmd.run().expect("capnp codegen failed (is `capnp` on PATH?)");
+    cmd.run()
+        .expect("capnp codegen failed (is `capnp` on PATH?)");
 }

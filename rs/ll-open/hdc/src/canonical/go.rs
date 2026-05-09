@@ -69,21 +69,12 @@ impl CanonicalKindMap for GoCanonicalMap {
             | "select_statement" => CanonicalKind::Stmt,
 
             // Blocks / scopes
-            "block"
-            | "source_file"
-            | "function_body"
-            | "case_clause"
-            | "default_case"
-            | "communication_case"
-            | "expression_case" => CanonicalKind::Block,
+            "block" | "source_file" | "function_body" | "case_clause" | "default_case"
+            | "communication_case" | "expression_case" => CanonicalKind::Block,
 
             // References
-            "identifier"
-            | "field_identifier"
-            | "type_identifier"
-            | "package_identifier"
-            | "qualified_type"
-            | "label_name" => CanonicalKind::Ref,
+            "identifier" | "field_identifier" | "type_identifier" | "package_identifier"
+            | "qualified_type" | "label_name" => CanonicalKind::Ref,
 
             // Literals
             "int_literal"
@@ -99,14 +90,11 @@ impl CanonicalKindMap for GoCanonicalMap {
             | "iota" => CanonicalKind::Lit,
 
             // Operators / control-flow tags
-            "if" | "else" | "for" | "range" | "switch" | "case" | "default"
-            | "break" | "continue" | "goto" | "return" | "go" | "defer"
-            | "func" | "var" | "const" | "type" | "package" | "import" | "+"
-            | "-" | "*" | "/" | "%" | "&" | "|" | "^" | "<<" | ">>" | "&&"
-            | "||" | "!" | "==" | "!=" | "<" | "<=" | ">" | ">=" | "="
-            | ":=" | "+=" | "-=" | "*=" | "/=" | "<-" | "..." => {
-                CanonicalKind::Op
-            }
+            "if" | "else" | "for" | "range" | "switch" | "case" | "default" | "break"
+            | "continue" | "goto" | "return" | "go" | "defer" | "func" | "var" | "const"
+            | "type" | "package" | "import" | "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^"
+            | "<<" | ">>" | "&&" | "||" | "!" | "==" | "!=" | "<" | "<=" | ">" | ">=" | "="
+            | ":=" | "+=" | "-=" | "*=" | "/=" | "<-" | "..." => CanonicalKind::Op,
 
             _ => FALLBACK_KIND,
         }
@@ -121,8 +109,8 @@ impl CanonicalKindMap for GoCanonicalMap {
 mod tests {
     use super::*;
     use crate::canonical::{
-        assert_canonical_map_baseline, assert_kinds_cover_all_canonical, assert_kinds_match,
-        RustCanonicalMap,
+        RustCanonicalMap, assert_canonical_map_baseline, assert_kinds_cover_all_canonical,
+        assert_kinds_match,
     };
 
     #[test]

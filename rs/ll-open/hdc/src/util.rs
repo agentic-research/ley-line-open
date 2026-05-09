@@ -104,8 +104,26 @@ pub fn popcount_distance(a: &Hypervector, b: &Hypervector) -> u32 {
     // Process 8 bytes at a time (one u64). D_BYTES is a multiple of 8 by
     // the const-assertion in lib.rs, so no leftover handling needed.
     while i + 8 <= D_BYTES {
-        let xa = u64::from_le_bytes([a[i], a[i + 1], a[i + 2], a[i + 3], a[i + 4], a[i + 5], a[i + 6], a[i + 7]]);
-        let xb = u64::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3], b[i + 4], b[i + 5], b[i + 6], b[i + 7]]);
+        let xa = u64::from_le_bytes([
+            a[i],
+            a[i + 1],
+            a[i + 2],
+            a[i + 3],
+            a[i + 4],
+            a[i + 5],
+            a[i + 6],
+            a[i + 7],
+        ]);
+        let xb = u64::from_le_bytes([
+            b[i],
+            b[i + 1],
+            b[i + 2],
+            b[i + 3],
+            b[i + 4],
+            b[i + 5],
+            b[i + 6],
+            b[i + 7],
+        ]);
         acc += (xa ^ xb).count_ones();
         i += 8;
     }
@@ -230,8 +248,10 @@ mod tests {
         let a = bytes_to_hv(b"hello");
         let b = bytes_to_hv(b"world");
         let dist = popcount_distance(&a, &b);
-        assert!(dist > FAR_APART_THRESHOLD,
-            "distinct inputs must be far apart (got {dist})");
+        assert!(
+            dist > FAR_APART_THRESHOLD,
+            "distinct inputs must be far apart (got {dist})"
+        );
     }
 
     #[test]
@@ -312,8 +332,14 @@ mod tests {
         // Random pairs have ~D/2 expected Hamming distance. With D=8192
         // and ±√D/2 ≈ 45 std deviation, a difference under 3000 is
         // overwhelmingly improbable for random output.
-        assert!(dist > 3000, "seeds 0 and 1 produced suspiciously similar vectors: dist={dist}");
-        assert!(dist < 5200, "seeds 0 and 1 produced suspiciously different vectors: dist={dist}");
+        assert!(
+            dist > 3000,
+            "seeds 0 and 1 produced suspiciously similar vectors: dist={dist}"
+        );
+        assert!(
+            dist < 5200,
+            "seeds 0 and 1 produced suspiciously different vectors: dist={dist}"
+        );
     }
 
     #[test]
@@ -330,7 +356,10 @@ mod tests {
         // Sanity: at least 30% of bits set (well above any "early
         // return" pathology).
         let ones: u32 = hv.iter().map(|b| b.count_ones()).sum();
-        assert!(ones > 1024, "seed=0 output must be non-degenerate (got {ones} ones)");
+        assert!(
+            ones > 1024,
+            "seed=0 output must be non-degenerate (got {ones} ones)"
+        );
     }
 
     #[test]
@@ -382,8 +411,10 @@ mod tests {
         let ast = tagged_seed_vector("hdc-ast-role", 0);
         let module = tagged_seed_vector("hdc-module-role", 0);
         let d = popcount_distance(&ast, &module);
-        assert!(d > FAR_APART_THRESHOLD,
-            "distinct tags must produce far-apart HVs (distance {d})");
+        assert!(
+            d > FAR_APART_THRESHOLD,
+            "distinct tags must produce far-apart HVs (distance {d})"
+        );
     }
 
     #[test]
@@ -393,8 +424,10 @@ mod tests {
         let r0 = tagged_seed_vector("hdc-test", 0);
         let r1 = tagged_seed_vector("hdc-test", 1);
         let d = popcount_distance(&r0, &r1);
-        assert!(d > FAR_APART_THRESHOLD,
-            "distinct indices must produce far-apart HVs (distance {d})");
+        assert!(
+            d > FAR_APART_THRESHOLD,
+            "distinct indices must produce far-apart HVs (distance {d})"
+        );
     }
 
     #[test]
@@ -545,7 +578,10 @@ mod tests {
         for n in [1usize, 7, 64, 1234, crate::D_BITS - 1] {
             let rotated = rotate_left(&hv, n);
             let restored = rotate_right(&rotated, n);
-            assert_eq!(restored, hv, "rotate_right(rotate_left(_, {n}), {n}) must be identity");
+            assert_eq!(
+                restored, hv,
+                "rotate_right(rotate_left(_, {n}), {n}) must be identity"
+            );
         }
     }
 
@@ -583,7 +619,10 @@ mod tests {
         for n in [1usize, 17, 1023, 4095] {
             let rotated = rotate_left(&hv, n);
             let rotated_ones: u32 = rotated.iter().map(|b| b.count_ones()).sum();
-            assert_eq!(rotated_ones, original_ones, "rotate_left({n}) changed popcount");
+            assert_eq!(
+                rotated_ones, original_ones,
+                "rotate_left({n}) changed popcount"
+            );
         }
     }
 

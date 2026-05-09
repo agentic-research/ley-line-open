@@ -103,10 +103,16 @@ silently misreading the byte layout.
   the lifted `vcs` and `sign` crates; the rest of LLO was already
   AGPL.
 - Stale doc comments referencing the V1 `generation` API rewritten
-  across `control.rs`, `cmd_load.rs`, `cmd_daemon.rs`,
-  `daemon/ops.rs`, `fs/graph.rs`, `lsp/src/project.rs`.
-- Forward-reference doc-comment shortcodes (e.g. `T3.1`, `T3.3`,
-  `T8.x`) replaced with canonical `ley-line-open-…` bead IDs.
+  in the substrate's hot-path files: `control.rs`, `cmd_load.rs`,
+  `cmd_daemon.rs`, `daemon/ops.rs`, `fs/graph.rs`,
+  `lsp/src/project.rs`.
+- Operator-facing strings (error messages, log warnings) scrubbed
+  of T-shortcodes: `ArenaHeaderError::VersionMismatch` Display,
+  `Controller::open_or_create` VERSION-mismatch bail, the
+  `cmd_parse::write_head_after_parse` warn line. Substrate
+  internals still use `T2.x` / `T8.x` shorthand in dev-facing
+  comments paired with the canonical `ley-line-open-…` bead ID
+  in adjacent context (full sweep deferred — comment churn).
 
 ### Removed
 - Public `Controller::generation()` method.

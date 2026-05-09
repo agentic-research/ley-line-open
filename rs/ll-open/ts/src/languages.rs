@@ -90,7 +90,9 @@ impl TsLanguage {
             #[cfg(feature = "json")]
             ".json" | "package.json" | "tsconfig.json" | "composer.json" => Some(TsLanguage::Json),
             #[cfg(feature = "yaml")]
-            ".yml" | ".yaml" | "docker-compose.yml" | "docker-compose.yaml" => Some(TsLanguage::Yaml),
+            ".yml" | ".yaml" | "docker-compose.yml" | "docker-compose.yaml" => {
+                Some(TsLanguage::Yaml)
+            }
             #[cfg(feature = "markdown")]
             "README" | "CHANGELOG" | "CONTRIBUTING" | "LICENSE.md" => Some(TsLanguage::Markdown),
             #[cfg(feature = "python")]
@@ -144,7 +146,10 @@ mod tests {
         #[cfg(feature = "markdown")]
         {
             assert_eq!(TsLanguage::from_extension("md"), Some(TsLanguage::Markdown));
-            assert_eq!(TsLanguage::from_extension("markdown"), Some(TsLanguage::Markdown));
+            assert_eq!(
+                TsLanguage::from_extension("markdown"),
+                Some(TsLanguage::Markdown)
+            );
         }
         #[cfg(feature = "json")]
         assert_eq!(TsLanguage::from_extension("json"), Some(TsLanguage::Json));

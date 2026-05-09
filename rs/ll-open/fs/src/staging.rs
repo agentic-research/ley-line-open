@@ -670,11 +670,20 @@ mod tests {
         let dirty = staging.dirty_nodes()?;
         let tombs = staging.tombstone_nodes()?;
         assert!(dirty.contains(&"docs/readme".to_string()), "edit in dirty");
-        assert!(tombs.contains(&"docs/notes".to_string()), "remove in tombstones");
+        assert!(
+            tombs.contains(&"docs/notes".to_string()),
+            "remove in tombstones"
+        );
         // Critical: the lists must NOT overlap — readme is dirty, not
         // tombstoned; notes is tombstoned, not dirty.
-        assert!(!dirty.contains(&"docs/notes".to_string()), "tombstone leaked into dirty");
-        assert!(!tombs.contains(&"docs/readme".to_string()), "edit leaked into tombstones");
+        assert!(
+            !dirty.contains(&"docs/notes".to_string()),
+            "tombstone leaked into dirty"
+        );
+        assert!(
+            !tombs.contains(&"docs/readme".to_string()),
+            "edit leaked into tombstones"
+        );
         Ok(())
     }
 

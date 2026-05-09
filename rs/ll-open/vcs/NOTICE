@@ -1,0 +1,21 @@
+leyline-vcs
+===========
+
+This crate was originally developed in the (private) ley-line repository
+under the Apache License 2.0 (Copyright James Gardner / agentic-research).
+On 2026-05-09 it was lifted into ley-line-open as part of the public
+"ll-open" tier and is distributed here under AGPL-3.0-or-later (the
+license governing ley-line-open as a whole — see ../../LICENSE).
+
+The original Apache-2.0 copy remains unchanged in:
+  - ley-line/rs/crates/vcs/        (private; still Apache-2.0)
+
+Per Apache 2.0 §4(c), copyright and license notices from the original
+work are retained. New contributions in this directory are AGPL-3.0
+under ley-line-open's project license.
+
+Pair with: ../sign (this crate uses leyline-sign for jj commit signing).
+
+API note: this version was migrated to the T2.4 Controller API
+(current_root: [u8; 32]) when it landed in ll-open, replacing calls
+to the now-removed Controller::generation() polling pattern.

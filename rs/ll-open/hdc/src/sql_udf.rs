@@ -25,9 +25,9 @@
 //! below.
 
 use rusqlite::{
+    Connection, Error, Result,
     functions::{Aggregate, FunctionFlags},
     types::Value,
-    Connection, Error, Result,
 };
 
 use crate::D_BYTES;
@@ -47,12 +47,7 @@ pub fn register_hdc_udfs(conn: &Connection) -> Result<()> {
             let b = ctx.get::<Vec<u8>>(1)?;
             if a.len() != b.len() {
                 return Err(Error::UserFunctionError(
-                    format!(
-                        "popcount_xor: length mismatch ({} vs {})",
-                        a.len(),
-                        b.len(),
-                    )
-                    .into(),
+                    format!("popcount_xor: length mismatch ({} vs {})", a.len(), b.len(),).into(),
                 ));
             }
             let mut acc: u32 = 0;
@@ -316,21 +311,35 @@ mod tests {
         let b: Vec<u8> = vec![0b0101_0101, 0x00, 0xFF, 0x33, 0x00, 0xAA, 0x7F];
         // XOR per byte, popcount per byte:
         //   0xFF=8, 0xFF=8, 0xFF=8, 0x00=0, 0x55=4, 0x00=0, 0xFF=8 → 36
-        let expected: i64 = a.iter().zip(&b).map(|(&x, &y)| (x ^ y).count_ones() as i64).sum();
+        let expected: i64 = a
+            .iter()
+            .zip(&b)
+            .map(|(&x, &y)| (x ^ y).count_ones() as i64)
+            .sum();
         let d: i64 = conn
             .query_row("SELECT popcount_xor(?1, ?2)", (a, b), |r| r.get(0))
             .unwrap();
-        assert_eq!(d, expected, "remainder-only path must produce correct popcount");
+        assert_eq!(
+            d, expected,
+            "remainder-only path must produce correct popcount"
+        );
 
         // 9 bytes: one full u64 chunk + 1 byte remainder. Exercises
         // the boundary between chunk-loop and remainder-loop.
         let a9: Vec<u8> = vec![0xAA; 9];
         let b9: Vec<u8> = vec![0x55; 9];
-        let expected9: i64 = a9.iter().zip(&b9).map(|(&x, &y)| (x ^ y).count_ones() as i64).sum();
+        let expected9: i64 = a9
+            .iter()
+            .zip(&b9)
+            .map(|(&x, &y)| (x ^ y).count_ones() as i64)
+            .sum();
         let d9: i64 = conn
             .query_row("SELECT popcount_xor(?1, ?2)", (a9, b9), |r| r.get(0))
             .unwrap();
-        assert_eq!(d9, expected9, "chunk + remainder must produce correct popcount");
+        assert_eq!(
+            d9, expected9,
+            "chunk + remainder must produce correct popcount"
+        );
     }
 
     #[test]
@@ -338,12 +347,12 @@ mod tests {
         let conn = fixture_conn();
         let short = vec![0u8; 16];
         let long = vec![0u8; 32];
-        let result: Result<i64> = conn.query_row(
-            "SELECT popcount_xor(?1, ?2)",
-            (&short, &long),
-            |r| r.get(0),
+        let result: Result<i64> =
+            conn.query_row("SELECT popcount_xor(?1, ?2)", (&short, &long), |r| r.get(0));
+        assert!(
+            result.is_err(),
+            "length mismatch must error, not silently truncate"
         );
-        assert!(result.is_err(), "length mismatch must error, not silently truncate");
     }
 
     #[test]
@@ -494,7 +503,11 @@ mod tests {
         insert_hv(&conn, 2, &b);
         // 2 rows, half = 1, threshold cnt > 1. Bit 0: cnt=1 (only a),
         // not > 1, output 0. Bit 1: cnt=1 (only b), not > 1, output 0.
-        assert_eq!(select_bundle_majority(&conn)[0], 0, "ties must resolve to 0");
+        assert_eq!(
+            select_bundle_majority(&conn)[0],
+            0,
+            "ties must resolve to 0"
+        );
     }
 
     #[test]
@@ -511,14 +524,20 @@ mod tests {
         let conn = fixture_conn();
         // Bit 0 set in s0, s1, NOT s2 → cnt=2 → elect 1
         // Bit 1 set ONLY in s2 → cnt=1 → elect 0
-        let mut s0 = ZERO_HV; s0[0] = 0b0000_0001;
-        let mut s1 = ZERO_HV; s1[0] = 0b0000_0001;
-        let mut s2 = ZERO_HV; s2[0] = 0b0000_0010;
+        let mut s0 = ZERO_HV;
+        s0[0] = 0b0000_0001;
+        let mut s1 = ZERO_HV;
+        s1[0] = 0b0000_0001;
+        let mut s2 = ZERO_HV;
+        s2[0] = 0b0000_0010;
         insert_hv(&conn, 1, &s0);
         insert_hv(&conn, 2, &s1);
         insert_hv(&conn, 3, &s2);
         let bundle = select_bundle_majority(&conn);
-        assert_eq!(bundle[0], 0b0000_0001, "2-of-3 elects bit 0; 1-of-3 loses bit 1");
+        assert_eq!(
+            bundle[0], 0b0000_0001,
+            "2-of-3 elects bit 0; 1-of-3 loses bit 1"
+        );
         // All other bytes untouched (every other bit cnt=0).
         for &b in &bundle[1..] {
             assert_eq!(b, 0, "untouched bytes must remain zero");
@@ -553,11 +572,8 @@ mod tests {
         let bad_row = vec![0u8; D_BYTES + 1]; // off-by-one
         conn.execute("INSERT INTO hvs(id, hv) VALUES (?1, ?2)", (1i64, &bad_row))
             .unwrap();
-        let result: Result<Vec<u8>> = conn.query_row(
-            "SELECT BUNDLE_MAJORITY(hv) FROM hvs",
-            [],
-            |r| r.get(0),
-        );
+        let result: Result<Vec<u8>> =
+            conn.query_row("SELECT BUNDLE_MAJORITY(hv) FROM hvs", [], |r| r.get(0));
         assert!(
             result.is_err(),
             "BUNDLE_MAJORITY must error on wrong-length row",
@@ -573,15 +589,9 @@ mod tests {
         // filter+aggregate composition.
         let conn = fixture_conn();
         // Simulate: 3 rows for "src/a.rs", 2 for "src/b.rs".
-        conn.execute_batch(
-            "ALTER TABLE hvs ADD COLUMN scope TEXT;",
-        )
-        .unwrap();
-        let hvs_a = [
-            expand_seed(11),
-            expand_seed(12),
-            expand_seed(13),
-        ];
+        conn.execute_batch("ALTER TABLE hvs ADD COLUMN scope TEXT;")
+            .unwrap();
+        let hvs_a = [expand_seed(11), expand_seed(12), expand_seed(13)];
         let hvs_b = [expand_seed(21), expand_seed(22)];
         for (i, hv) in hvs_a.iter().enumerate() {
             conn.execute(

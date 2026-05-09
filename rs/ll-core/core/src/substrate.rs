@@ -1,9 +1,10 @@
-//! T1.1 stub: Σ — Merkle-CAS substrate types.
+//! Σ — Merkle-CAS substrate types (bead `ley-line-open-9e3a5f`).
 //!
-//! See `docs/decades/2026-merkle-cas-substrate.md` for the formal substrate
-//! definition. This module declares the type surface only — no behavior
-//! is implemented here. Implementations land in T2 (controller migration)
-//! and T3 (content-addressed blob store).
+//! See `docs/decades/2026-merkle-cas-substrate.md` for the formal
+//! substrate definition. This module declares the type surface only —
+//! no behavior is implemented here. Implementations land in the T2
+//! controller-migration thread (T2.4 = `ley-line-open-baee26`,
+//! shipped) and the T3 content-addressed blob store thread.
 //!
 //! The substrate is the six-tuple Σ = (𝓥, 𝓒, ρ, σ, R, S) where:
 //!
@@ -16,11 +17,11 @@
 //! | R      | [`RootPointer`]                  | Atomic root pointer             |
 //! | S      | [`RootSigner`]                   | Signature scheme over roots     |
 //!
-//! The substrate axioms are documented per-item below. Bead T1.3 turns
-//! each axiom into an executable falsification test.
+//! The substrate axioms are documented per-item below. The follow-up
+//! "axiom → executable falsification" bead (formerly tracked as T1.3)
+//! is not yet filed in rsry — file before scheduling that work.
 //!
-//! Bead: ley-line-open-9e3a5f (T1.1)
-//! Decade: ley-line-open-9d30ac
+//! Decade: `ley-line-open-9d30ac`
 
 use anyhow::Result;
 
@@ -118,8 +119,8 @@ impl std::fmt::Display for Hash {
 ///   structured types must canonicalize** (sorted keys, fixed field
 ///   order, NULL vs missing distinction) before hashing.
 ///
-/// The default impl for `[u8]` and `Vec<u8>` (in T1.1 implementation
-/// land) hashes the raw bytes via BLAKE3.
+/// The default impl for `[u8]` and `Vec<u8>` hashes the raw bytes
+/// via BLAKE3 (bead `ley-line-open-9e3a5f`).
 pub trait ContentAddressed {
     /// Compute `σ(self)`.
     fn hash(&self) -> Hash;
@@ -133,12 +134,14 @@ pub trait ContentAddressed {
 /// - **(CA)** `put(v).then(get) == Some(v)`. Round-trip.
 /// - **(IM)** Once `get(h)` returns `Some(_)`, it returns the same
 ///   `Some(_)` forever (or `None` after explicit GC of unreachable
-///   blobs — see T3.3). No in-place mutation of stored blobs.
+///   blobs — see bead `ley-line-open-bb330d`). No in-place mutation
+///   of stored blobs.
 /// - **(CR)** Collision resistance is delegated to `Hash`, not the
 ///   store: a `BlobStore` indexed by `Hash` cannot store two distinct
 ///   bytes under the same key.
 ///
-/// Implementations: `FsBlobStore` (T3.1), `MemBlobStore` (testing).
+/// Implementations: `FsBlobStore` (bead `ley-line-open-bb0316`),
+/// `MemBlobStore` (testing).
 pub trait BlobStore {
     /// Insert `bytes` into the store. Returns the content address.
     /// Idempotent: inserting the same bytes twice returns the same hash
@@ -147,8 +150,9 @@ pub trait BlobStore {
 
     /// Retrieve the bytes stored under `h`, or `None` if absent.
     /// Implementations MUST verify `σ(retrieved) == h` before returning
-    /// (T2.3 verify-on-read pattern). A returned `Some(v)` carries an
-    /// implicit "the substrate vouches for `σ(v) == h`" guarantee.
+    /// (verify-on-read pattern from bead `ley-line-open-bad8f1`). A
+    /// returned `Some(v)` carries an implicit "the substrate vouches
+    /// for `σ(v) == h`" guarantee.
     fn get(&self, h: Hash) -> Result<Option<Vec<u8>>>;
 
     /// True iff `h` is in the store. Useful for "should I fetch this
@@ -171,9 +175,9 @@ pub trait BlobStore {
 ///   has its blob in the store; the store retains them per its GC
 ///   policy).
 ///
-/// Implementations: `MmapRootPointer` (T2.4 — replaces the existing
-/// `Controller.generation` field), in-memory `AtomicRootPointer` for
-/// testing.
+/// Implementations: `MmapRootPointer` (bead `ley-line-open-baee26`,
+/// shipped — replaces the prior `Controller.generation` field),
+/// in-memory `AtomicRootPointer` for testing.
 pub trait RootPointer {
     /// Read the current root.
     fn current(&self) -> Hash;
@@ -193,12 +197,13 @@ pub trait RootPointer {
 /// - **(SIG)** `verify(h, sign(h, sk), pk) = true` iff `pk` is the
 ///   public key matching `sk`; `false` otherwise.
 /// - The signing key never sees raw blob content — it sees only `Hash`.
-///   This is load-bearing: it lets composition seams (T5.1: signet
-///   signs roots) operate on a 32-byte value rather than the entire
-///   serialized arena.
+///   This is load-bearing: it lets composition seams (signet signs
+///   roots) operate on a 32-byte value rather than the entire
+///   serialized arena. The "signet integration" follow-up bead
+///   (formerly tracked as T5.1) is not yet filed in rsry.
 ///
-/// Implementations: signet integration (T5.1), in-memory Ed25519 for
-/// testing.
+/// Implementations: signet integration (bead pending), in-memory
+/// Ed25519 for testing.
 pub trait RootSigner {
     /// Opaque signature type. 64 bytes for Ed25519 in practice.
     type Signature;
@@ -247,10 +252,9 @@ mod tests {
     #[test]
     fn hash_from_bytes_round_trip() {
         let bytes = [
-            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-            0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-            0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+            0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0xfe, 0xdc, 0xba, 0x98,
+            0x76, 0x54, 0x32, 0x10,
         ];
         let h = Hash::from_bytes(bytes);
         assert_eq!(h.as_bytes(), &bytes);

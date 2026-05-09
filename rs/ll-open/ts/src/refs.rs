@@ -243,18 +243,33 @@ mod tests {
     }
 
     fn all_defs(conn: &Connection) -> Vec<String> {
-        let mut stmt = conn.prepare("SELECT token FROM node_defs ORDER BY token").unwrap();
-        stmt.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect()
+        let mut stmt = conn
+            .prepare("SELECT token FROM node_defs ORDER BY token")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
     }
 
     fn all_refs(conn: &Connection) -> Vec<String> {
-        let mut stmt = conn.prepare("SELECT token FROM node_refs ORDER BY token").unwrap();
-        stmt.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect()
+        let mut stmt = conn
+            .prepare("SELECT token FROM node_refs ORDER BY token")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
     }
 
     fn all_imports(conn: &Connection) -> Vec<(String, String)> {
-        let mut stmt = conn.prepare("SELECT alias, path FROM _imports ORDER BY path").unwrap();
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(|r| r.unwrap()).collect()
+        let mut stmt = conn
+            .prepare("SELECT alias, path FROM _imports ORDER BY path")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
     }
 
     #[test]

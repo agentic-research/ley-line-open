@@ -41,8 +41,8 @@ fn open_arena_db(arena_path: &Path, control_path: Option<&Path>) -> Result<Conne
 
     let file_size = mmap.len() as u64;
     let offset = header
-        .active_buffer_offset(file_size)
-        .context("invalid arena header (bad magic, version, or active_buffer)")?;
+        .validate_header(file_size)
+        .context("arena header validation failed")?;
     let buf_size = ArenaHeader::buffer_size(file_size);
 
     let buf = &mmap[offset as usize..(offset + buf_size) as usize];

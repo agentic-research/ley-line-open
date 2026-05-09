@@ -276,15 +276,7 @@ fn run_concurrency(
 fn print_table(rows: &[ConcurrencyResult]) {
     println!(
         "\n  {:<8} {:>4} {:>10} {:>11} {:>9} {:>9} {:>9} {:>9} {:>9}",
-        "mode",
-        "N_r",
-        "writes/s",
-        "reads/s",
-        "r p50",
-        "r p99",
-        "r max",
-        "w p50",
-        "w p99",
+        "mode", "N_r", "writes/s", "reads/s", "r p50", "r p99", "r max", "w p50", "w p99",
     );
     println!("  {}", "─".repeat(90));
     for r in rows {
@@ -391,8 +383,5 @@ fn main() {
     );
 
     let overall = read_pass && write_pass && wal_better_p99;
-    println!(
-        "\n  H1 overall: {}",
-        if overall { "PASS" } else { "FAIL" }
-    );
+    println!("\n  H1 overall: {}", if overall { "PASS" } else { "FAIL" });
 }

@@ -30,7 +30,9 @@ pub fn cmd_load(db: &Path, control: &Path) -> Result<()> {
 /// 3. Open the arena file via mmap.
 /// 4. Initialize the arena header if fresh (magic == 0).
 /// 5. Write to the inactive buffer and flip via [`write_to_arena`].
-/// 6. Bump the generation in the Controller.
+/// 6. Publish current_root via set_arena_with_root (atomic substrate
+///    advance — readers see the new buffer once the Release-store of
+///    the sync atom completes).
 pub fn load_into_arena(control: &Path, db_bytes: &[u8]) -> Result<()> {
     let mut ctrl = Controller::open_or_create(control).context("open controller")?;
 
@@ -55,9 +57,9 @@ pub fn load_into_arena(control: &Path, db_bytes: &[u8]) -> Result<()> {
 
     write_to_arena(&mut mmap, db_bytes).context("write to arena")?;
 
-    // T2.4: publish via current_root (BLAKE3 of db bytes). The CAS
-    // root advance IS the publish event; readers detect by comparing
-    // current_root, not generation.
+    // Publish via current_root (BLAKE3 of db bytes) — bead
+    // `ley-line-open-baee26`. The CAS root advance IS the publish
+    // event; readers detect by comparing current_root.
     let current_root: [u8; 32] = blake3::hash(db_bytes).into();
     ctrl.set_arena_with_root(&arena_path, arena_size, current_root)
         .context("publish current_root (load advance)")?;

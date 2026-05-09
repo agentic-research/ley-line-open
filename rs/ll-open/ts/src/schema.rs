@@ -196,7 +196,10 @@ pub fn upsert_file_index(conn: &Connection, path: &str, mtime: i64, size: i64) -
 pub fn read_file_index(conn: &Connection) -> Result<std::collections::HashMap<String, (i64, i64)>> {
     let mut stmt = conn.prepare("SELECT path, mtime, size FROM _file_index")?;
     let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)))
+        Ok((
+            row.get::<_, String>(0)?,
+            (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?),
+        ))
     })?;
     let mut map = std::collections::HashMap::new();
     for row in rows {
@@ -222,11 +225,9 @@ pub fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
 /// query so callers can't independently drift on column name or NULL
 /// handling.
 pub fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
-    match conn.query_row(
-        "SELECT value FROM _meta WHERE key = ?1",
-        [key],
-        |row| row.get::<_, String>(0),
-    ) {
+    match conn.query_row("SELECT value FROM _meta WHERE key = ?1", [key], |row| {
+        row.get::<_, String>(0)
+    }) {
         Ok(v) => Ok(Some(v)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(e.into()),
@@ -244,7 +245,10 @@ pub fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
 /// accumulate at registry-repo scale across file churn). If LSP has
 /// never run, the tables don't exist and we skip.
 pub fn delete_file_rows(conn: &Connection, path: &str) -> Result<()> {
-    conn.execute("DELETE FROM nodes WHERE id = ?1 OR id LIKE ?1 || '/%'", [path])?;
+    conn.execute(
+        "DELETE FROM nodes WHERE id = ?1 OR id LIKE ?1 || '/%'",
+        [path],
+    )?;
     conn.execute("DELETE FROM _ast WHERE source_id = ?1", [path])?;
     conn.execute("DELETE FROM _source WHERE id = ?1", [path])?;
     conn.execute("DELETE FROM node_refs WHERE source_id = ?1", [path])?;
@@ -287,9 +291,7 @@ fn delete_lsp_rows_for_path(conn: &Connection, path: &str) -> Result<()> {
         // Both equal-match and prefix-match: the file's "root" node_id
         // (the path itself) AND every descendant
         // (`<path>/<ast_path>`).
-        let sql = format!(
-            "DELETE FROM {table} WHERE node_id = ?1 OR node_id LIKE ?1 || '/%'",
-        );
+        let sql = format!("DELETE FROM {table} WHERE node_id = ?1 OR node_id LIKE ?1 || '/%'",);
         conn.execute(&sql, [path])?;
     }
     Ok(())
@@ -305,7 +307,9 @@ pub fn sweep_orphaned_dirs(conn: &Connection) -> Result<usize> {
              AND id NOT IN (SELECT DISTINCT parent_id FROM nodes WHERE parent_id IS NOT NULL AND parent_id != '')",
             [],
         )?;
-        if removed == 0 { break; }
+        if removed == 0 {
+            break;
+        }
         total += removed;
     }
     Ok(total)
@@ -325,11 +329,17 @@ mod tests {
         insert_def(&conn, "Add", "main.go/function_declaration", "main.go").unwrap();
         insert_import(&conn, "fmt", "fmt", "main.go").unwrap();
 
-        let ref_count: i64 = conn.query_row("SELECT COUNT(*) FROM node_refs", [], |r| r.get(0)).unwrap();
+        let ref_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM node_refs", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(ref_count, 1);
-        let def_count: i64 = conn.query_row("SELECT COUNT(*) FROM node_defs", [], |r| r.get(0)).unwrap();
+        let def_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM node_defs", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(def_count, 1);
-        let import_count: i64 = conn.query_row("SELECT COUNT(*) FROM _imports", [], |r| r.get(0)).unwrap();
+        let import_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _imports", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(import_count, 1);
     }
 
@@ -360,9 +370,13 @@ mod tests {
         create_index_schema(&conn).unwrap();
 
         set_meta(&conn, "source_root", "/tmp/project").unwrap();
-        let val: String = conn.query_row(
-            "SELECT value FROM _meta WHERE key = 'source_root'", [], |r| r.get(0),
-        ).unwrap();
+        let val: String = conn
+            .query_row(
+                "SELECT value FROM _meta WHERE key = 'source_root'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(val, "/tmp/project");
     }
 
@@ -384,14 +398,16 @@ mod tests {
         let val: String = conn
             .query_row(
                 "SELECT value FROM _meta WHERE key = 'tree-sitter_version'",
-                [], |r| r.get(0),
+                [],
+                |r| r.get(0),
             )
             .unwrap();
         assert_eq!(val, "12", "third write must win");
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM _meta WHERE key = 'tree-sitter_version'",
-                [], |r| r.get(0),
+                [],
+                |r| r.get(0),
             )
             .unwrap();
         assert_eq!(count, 1, "must not duplicate rows");
@@ -458,19 +474,53 @@ mod tests {
         delete_file_rows(&conn, "a.go").unwrap();
 
         // a.go gone
-        let a_nodes: i64 = conn.query_row("SELECT COUNT(*) FROM nodes WHERE id = 'a.go' OR id LIKE 'a.go/%'", [], |r| r.get(0)).unwrap();
+        let a_nodes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE id = 'a.go' OR id LIKE 'a.go/%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(a_nodes, 0);
-        let a_source: i64 = conn.query_row("SELECT COUNT(*) FROM _source WHERE id = 'a.go'", [], |r| r.get(0)).unwrap();
+        let a_source: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _source WHERE id = 'a.go'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(a_source, 0);
-        let a_refs: i64 = conn.query_row("SELECT COUNT(*) FROM node_refs WHERE source_id = 'a.go'", [], |r| r.get(0)).unwrap();
+        let a_refs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_refs WHERE source_id = 'a.go'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(a_refs, 0);
-        let a_index: i64 = conn.query_row("SELECT COUNT(*) FROM _file_index WHERE path = 'a.go'", [], |r| r.get(0)).unwrap();
+        let a_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _file_index WHERE path = 'a.go'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(a_index, 0);
 
         // b.go intact
-        let b_nodes: i64 = conn.query_row("SELECT COUNT(*) FROM nodes WHERE id = 'b.go' OR id LIKE 'b.go/%'", [], |r| r.get(0)).unwrap();
+        let b_nodes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE id = 'b.go' OR id LIKE 'b.go/%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert!(b_nodes >= 2);
-        let b_refs: i64 = conn.query_row("SELECT COUNT(*) FROM node_refs WHERE source_id = 'b.go'", [], |r| r.get(0)).unwrap();
+        let b_refs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_refs WHERE source_id = 'b.go'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(b_refs, 1);
     }
 
@@ -526,7 +576,11 @@ mod tests {
 
         // Pre-condition: a.go's LSP rows exist.
         let a_pre: i64 = conn
-            .query_row("SELECT COUNT(*) FROM _lsp WHERE node_id LIKE 'a.go%'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM _lsp WHERE node_id LIKE 'a.go%'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(a_pre, 1, "pre-condition: a.go LSP row should exist");
 
@@ -534,17 +588,29 @@ mod tests {
 
         // a.go's LSP rows: gone.
         let a_lsp: i64 = conn
-            .query_row("SELECT COUNT(*) FROM _lsp WHERE node_id LIKE 'a.go%'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM _lsp WHERE node_id LIKE 'a.go%'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(a_lsp, 0, "_lsp rows for a.go must be cleaned up");
         let a_hover: i64 = conn
-            .query_row("SELECT COUNT(*) FROM _lsp_hover WHERE node_id LIKE 'a.go%'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM _lsp_hover WHERE node_id LIKE 'a.go%'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(a_hover, 0, "_lsp_hover rows for a.go must be cleaned up");
 
         // b.go's LSP rows: intact.
         let b_lsp: i64 = conn
-            .query_row("SELECT COUNT(*) FROM _lsp WHERE node_id LIKE 'b.go%'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM _lsp WHERE node_id LIKE 'b.go%'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(b_lsp, 1, "_lsp rows for b.go must NOT be cleaned up");
     }
@@ -567,7 +633,9 @@ mod tests {
         // delete_file_rows must succeed even without _lsp* tables.
         delete_file_rows(&conn, "a.go").unwrap();
         let a_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM nodes WHERE id = 'a.go'", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM nodes WHERE id = 'a.go'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(a_count, 0);
     }
@@ -597,11 +665,22 @@ mod tests {
         // Delete "a" — should remove "a" and "a/sub" only.
         delete_file_rows(&conn, "a").unwrap();
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM nodes WHERE id IN ('ab', 'ab/sub')", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE id IN ('ab', 'ab/sub')",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(count, 2, "prefix-similar `ab` siblings must survive deletion of `a`");
+        assert_eq!(
+            count, 2,
+            "prefix-similar `ab` siblings must survive deletion of `a`"
+        );
         let a_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM nodes WHERE id IN ('a', 'a/sub')", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE id IN ('a', 'a/sub')",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(a_count, 0, "`a` and its descendants must be gone");
     }
@@ -654,8 +733,7 @@ mod tests {
         create_index_schema(&conn).unwrap();
 
         for i in 0..1000 {
-            upsert_file_index(&conn, &format!("path/{i:04}.go"), i as i64, (i * 7) as i64)
-                .unwrap();
+            upsert_file_index(&conn, &format!("path/{i:04}.go"), i as i64, (i * 7) as i64).unwrap();
         }
 
         let index = read_file_index(&conn).unwrap();
@@ -685,14 +763,19 @@ mod tests {
         let mut current = String::new();
         for i in 0..30 {
             let parent = current.clone();
-            current = if i == 0 { format!("d{i}") } else { format!("{current}/d{i}") };
+            current = if i == 0 {
+                format!("d{i}")
+            } else {
+                format!("{current}/d{i}")
+            };
             insert_node(&conn, &current, &parent, &format!("d{i}"), 1, 0, 0, "").unwrap();
         }
         let file_id = format!("{current}/leaf.go");
         insert_node(&conn, &file_id, &current, "leaf.go", 1, 0, 0, "").unwrap();
 
         // Delete the file — every dir in the chain is now orphaned.
-        conn.execute("DELETE FROM nodes WHERE id = ?1", [&file_id]).unwrap();
+        conn.execute("DELETE FROM nodes WHERE id = ?1", [&file_id])
+            .unwrap();
 
         let removed = sweep_orphaned_dirs(&conn).unwrap();
         assert_eq!(removed, 30, "must sweep all 30 nested dirs");
@@ -712,12 +795,15 @@ mod tests {
         insert_node(&conn, "src/pkg", "src", "pkg", 1, 0, 0, "").unwrap();
         insert_node(&conn, "src/pkg/a.go", "src/pkg", "a.go", 1, 0, 0, "").unwrap();
 
-        conn.execute("DELETE FROM nodes WHERE id = 'src/pkg/a.go'", []).unwrap();
+        conn.execute("DELETE FROM nodes WHERE id = 'src/pkg/a.go'", [])
+            .unwrap();
 
         let removed = sweep_orphaned_dirs(&conn).unwrap();
         assert_eq!(removed, 2, "should remove src/pkg and src");
 
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 1, "only root node should remain");
     }
 }

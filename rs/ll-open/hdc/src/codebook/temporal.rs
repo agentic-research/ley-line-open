@@ -29,9 +29,9 @@
 
 use std::collections::HashMap;
 
-use crate::util::Hypervector;
 #[cfg(test)]
 use crate::D_BITS;
+use crate::util::Hypervector;
 
 /// Default decay constant: commits older than τ contribute weight
 /// `exp(-1) ≈ 0.37` of a fresh commit. 90 days expressed in seconds.
@@ -180,11 +180,7 @@ impl TemporalCodebook {
 
     /// Project a scope's temporal row through the simhash. Wrapper
     /// for `project_sparse(matrix.sparse_row(scope_id))`.
-    pub fn project_scope(
-        &self,
-        matrix: &TemporalCoEditMatrix,
-        scope_id: &str,
-    ) -> Hypervector {
+    pub fn project_scope(&self, matrix: &TemporalCoEditMatrix, scope_id: &str) -> Hypervector {
         self.project_sparse(&matrix.sparse_row(scope_id))
     }
 

@@ -20,10 +20,10 @@
 
 use rusqlite::Connection;
 
+use crate::LayerKind;
 use crate::canonical::CanonicalKind;
 use crate::codebook::{AstNodeFingerprint, BaseCodebook};
-use crate::util::{rotate_left, rotate_right, xor_into, Hypervector};
-use crate::LayerKind;
+use crate::util::{Hypervector, rotate_left, rotate_right, xor_into};
 
 /// One row of a radius-search result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,15 +101,12 @@ pub fn combined_prefilter(
          ORDER BY d ASC \
          LIMIT ?2",
     )?;
-    let rows = stmt.query_map(
-        rusqlite::params![query.to_vec(), limit as i64],
-        |r| {
-            Ok(ScopeMatch {
-                scope_id: r.get::<_, String>(0)?,
-                distance: r.get::<_, i64>(1)? as u32,
-            })
-        },
-    )?;
+    let rows = stmt.query_map(rusqlite::params![query.to_vec(), limit as i64], |r| {
+        Ok(ScopeMatch {
+            scope_id: r.get::<_, String>(0)?,
+            distance: r.get::<_, i64>(1)? as u32,
+        })
+    })?;
     rows.collect()
 }
 
@@ -190,10 +187,9 @@ pub fn explain_cluster_centroid<C>(
 where
     C: BaseCodebook<Item = AstNodeFingerprint>,
 {
-    use crate::util::{popcount_distance, ZERO_HV};
+    use crate::util::{ZERO_HV, popcount_distance};
 
-    let leaf_base =
-        |kind: CanonicalKind| codebook.base_vector(&AstNodeFingerprint::leaf(kind));
+    let leaf_base = |kind: CanonicalKind| codebook.base_vector(&AstNodeFingerprint::leaf(kind));
 
     let parent_fp = AstNodeFingerprint::new(
         centroid_root_kind,
@@ -239,13 +235,13 @@ where
 mod tests {
     use super::*;
     use crate::codebook::AstCodebook;
-    use crate::encoder::{encode_fresh, EncoderNode};
+    use crate::encoder::{EncoderNode, encode_fresh};
     use crate::sheaf::HvCellComplex;
     use crate::test_util::{
         conn_with_schema_and_udfs as fresh_with_udfs, insert_combined_hv as insert_combined,
         insert_layer_hv as insert,
     };
-    use crate::util::{bucket_arity, expand_seed, ZERO_HV};
+    use crate::util::{ZERO_HV, bucket_arity, expand_seed};
 
     #[test]
     fn radius_search_returns_only_within_radius() {
@@ -331,7 +327,13 @@ mod tests {
             insert(&conn, &format!("clone_{i}"), LayerKind::Ast, &q, 1);
         }
         for i in 0..3 {
-            insert(&conn, &format!("distinct_{i}"), LayerKind::Ast, &expand_seed(100 + i), 1);
+            insert(
+                &conn,
+                &format!("distinct_{i}"),
+                LayerKind::Ast,
+                &expand_seed(100 + i),
+                1,
+            );
         }
         // Tight radius: only the 5 clones.
         let count = density_count(&conn, LayerKind::Ast, &q, 100).unwrap();
@@ -443,8 +445,16 @@ mod tests {
         }
         // Correctness pin (skeptic 4bace1): with sibling cancellation,
         // a single tree should recover positions exactly.
-        assert_eq!(recovered[0].1, CanonicalKind::Op, "position 0 must recover Op");
-        assert_eq!(recovered[1].1, CanonicalKind::Lit, "position 1 must recover Lit");
+        assert_eq!(
+            recovered[0].1,
+            CanonicalKind::Op,
+            "position 0 must recover Op"
+        );
+        assert_eq!(
+            recovered[1].1,
+            CanonicalKind::Lit,
+            "position 1 must recover Lit"
+        );
     }
 
     #[test]
@@ -490,7 +500,10 @@ mod tests {
         let centroids: Vec<Hypervector> = (0..10).map(|_| encode_fresh(&tree, &cb)).collect();
         // Bundle is trivially the input HV (identical inputs).
         let centroid = HvCellComplex::bundle_majority(&centroids);
-        assert_eq!(centroid, centroids[0], "homogeneous bundle must equal input");
+        assert_eq!(
+            centroid, centroids[0],
+            "homogeneous bundle must equal input"
+        );
 
         let candidate_kinds = CanonicalKind::ALL;
         let recovered = explain_cluster_centroid(
@@ -574,7 +587,11 @@ mod tests {
         let mut unique = centroids.clone();
         unique.sort_unstable();
         unique.dedup();
-        assert!(unique.len() >= 4, "need real heterogeneity, got {}", unique.len());
+        assert!(
+            unique.len() >= 4,
+            "need real heterogeneity, got {}",
+            unique.len()
+        );
 
         let centroid = HvCellComplex::bundle_majority(&centroids);
 
@@ -634,14 +651,8 @@ mod tests {
         let cb = AstCodebook::new();
         let candidate_kinds = [CanonicalKind::Lit, CanonicalKind::Op];
         let centroid = cb.base_vector(&AstNodeFingerprint::leaf(CanonicalKind::Lit));
-        let recovered = explain_cluster_centroid(
-            &centroid,
-            CanonicalKind::Lit,
-            0,
-            &[],
-            &cb,
-            &candidate_kinds,
-        );
+        let recovered =
+            explain_cluster_centroid(&centroid, CanonicalKind::Lit, 0, &[], &cb, &candidate_kinds);
         assert!(recovered.is_empty());
     }
 

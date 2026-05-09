@@ -106,13 +106,11 @@ impl CanonicalKindMap for RustCanonicalMap {
             | "raw_byte_string_literal" => CanonicalKind::Lit,
 
             // Operators / control-flow tags
-            "if" | "else" | "match" | "while" | "loop" | "for" | "in" | "break"
-            | "continue" | "return" | "yield" | "await" | "fn" | "let" | "const"
-            | "static" | "mut" | "ref" | "&" | "*" | "+" | "-" | "/" | "%" | "&&"
-            | "||" | "!" | "==" | "!=" | "<" | "<=" | ">" | ">=" | "=" | "+="
-            | "-=" | "*=" | "/=" | ".." | "..=" | "->" | "=>" | "::" | "?" => {
-                CanonicalKind::Op
-            }
+            "if" | "else" | "match" | "while" | "loop" | "for" | "in" | "break" | "continue"
+            | "return" | "yield" | "await" | "fn" | "let" | "const" | "static" | "mut" | "ref"
+            | "&" | "*" | "+" | "-" | "/" | "%" | "&&" | "||" | "!" | "==" | "!=" | "<" | "<="
+            | ">" | ">=" | "=" | "+=" | "-=" | "*=" | "/=" | ".." | "..=" | "->" | "=>" | "::"
+            | "?" => CanonicalKind::Op,
 
             _ => FALLBACK_KIND,
         }

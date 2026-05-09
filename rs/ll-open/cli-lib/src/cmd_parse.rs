@@ -380,11 +380,11 @@ pub fn parse_into_conn(
 
     conn.execute_batch("BEGIN")?;
 
-    // T8.3: capnp dual-write — open snapshot files alongside the SQL
-    // writes. Truncate-and-rewrite semantics: each parse run produces
-    // a fresh snapshot of `_ast` and `_source`. `:memory:` connections
-    // skip (no path to write next to). T8.5 will hash these segments
-    // into the Σ root.
+    // capnp dual-write (bead `ley-line-open-cdf098`) — open snapshot
+    // files alongside the SQL writes. Truncate-and-rewrite semantics:
+    // each parse run produces a fresh snapshot of `_ast` and `_source`.
+    // `:memory:` connections skip (no path to write next to). The
+    // segment-hashing → Σ root advance is bead `ley-line-open-ce55b1`.
     let (mut ast_writer, mut source_writer) = sibling_snapshot_writers(conn);
 
     // Prepare statements once — reuse for all rows (avoids SQL parse per INSERT).
@@ -419,8 +419,8 @@ pub fn parse_into_conn(
 
                 stmt_source.execute(rusqlite::params![&pf.rel, &pf.language, &pf.abs_path])?;
 
-                // T8.3 capnp dual-write: same fields as the SQL row,
-                // typed and content-addressable.
+                // capnp dual-write (`ley-line-open-cdf098`): same
+                // fields as the SQL row, typed and content-addressable.
                 if let Some(w) = source_writer.as_mut() {
                     write_source_file_record(
                         w,
@@ -551,12 +551,12 @@ pub fn parse_into_conn(
         );
     }
 
-    // T8.5: Σ root advance — hash the just-emitted segments and chain
-    // a new Head record. Best-effort: a head-write failure logs and
-    // doesn't fail the parse. `:memory:` connections are gated inside
-    // `write_head_after_parse` itself.
+    // Σ root advance (bead `ley-line-open-ce55b1`) — hash the
+    // just-emitted segments and chain a new Head record. Best-effort:
+    // a head-write failure logs and doesn't fail the parse.
+    // `:memory:` connections are gated inside `write_head_after_parse`.
     if let Err(e) = write_head_after_parse(conn) {
-        log::warn!("T8.5 head-write failed (parse otherwise OK): {e:#}");
+        log::warn!("Σ head-write failed (parse otherwise OK): {e:#}");
     }
 
     // Oversized files count as errors at the result level — they
@@ -607,15 +607,13 @@ fn hash_segment_files(db_path: &Path) -> Result<([u8; 32], u64)> {
         if !p.exists() {
             continue;
         }
-        let file_bytes = std::fs::read(&p)
-            .with_context(|| format!("read segment {}", p.display()))?;
+        let file_bytes =
+            std::fs::read(&p).with_context(|| format!("read segment {}", p.display()))?;
         let mut slice: &[u8] = &file_bytes;
         while !slice.is_empty() {
-            let msg = capnp::serialize::read_message(
-                &mut slice,
-                capnp::message::ReaderOptions::new(),
-            )
-            .with_context(|| format!("parse segment {}", p.display()))?;
+            let msg =
+                capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new())
+                    .with_context(|| format!("parse segment {}", p.display()))?;
             let canonical_words = msg
                 .canonicalize()
                 .with_context(|| format!("canonicalize segment {}", p.display()))?;
@@ -780,8 +778,7 @@ fn write_source_file_record(
     canonical
         .set_root_canonical(src.get_root_as_reader::<source_file::Reader>()?)
         .context("canonicalize SourceFile")?;
-    capnp::serialize::write_message(writer, &canonical)
-        .context("write SourceFile capnp record")?;
+    capnp::serialize::write_message(writer, &canonical).context("write SourceFile capnp record")?;
     Ok(())
 }
 
@@ -815,8 +812,7 @@ fn write_ast_node_record(writer: &mut std::fs::File, a: &AstEntry) -> Result<()>
     canonical
         .set_root_canonical(src.get_root_as_reader::<ast_node::Reader>()?)
         .context("canonicalize AstNode")?;
-    capnp::serialize::write_message(writer, &canonical)
-        .context("write AstNode capnp record")?;
+    capnp::serialize::write_message(writer, &canonical).context("write AstNode capnp record")?;
     Ok(())
 }
 
@@ -1489,14 +1485,16 @@ mod tests {
         let head_path = with_extension(&db_path, "head.capnp");
         let bytes = std::fs::read(&head_path).unwrap();
         let mut slice: &[u8] = &bytes;
-        let msg = capnp::serialize::read_message(
-            &mut slice,
-            capnp::message::ReaderOptions::new(),
-        )
-        .unwrap();
+        let msg = capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new())
+            .unwrap();
         let h: head::Reader = msg.get_root().unwrap();
-        let stored: [u8; 32] = h.get_root_hash().unwrap().get_bytes().unwrap()
-            .try_into().unwrap();
+        let stored: [u8; 32] = h
+            .get_root_hash()
+            .unwrap()
+            .get_bytes()
+            .unwrap()
+            .try_into()
+            .unwrap();
         assert_eq!(
             stored, h1,
             "Head.rootHash must equal independent canonical hash of segments",
@@ -1512,8 +1510,10 @@ mod tests {
                     .unwrap_or(0)
             })
             .sum();
-        assert!(total1 < raw_total,
-            "canonical bytes ({total1}) must be < raw bytes ({raw_total}) — segment table stripped");
+        assert!(
+            total1 < raw_total,
+            "canonical bytes ({total1}) must be < raw bytes ({raw_total}) — segment table stripped"
+        );
     }
 
     /// T8.3: `:memory:` connections must NOT attempt the capnp dual-

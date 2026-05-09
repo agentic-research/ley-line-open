@@ -121,7 +121,9 @@ fn migrate_lsp_schema(conn: &Connection) -> Result<()> {
         ensure_column(conn, "_lsp_defs", "def_token", "TEXT NOT NULL DEFAULT ''")?;
         // ALTER TABLE doesn't add CREATE INDEX clauses; ensure the
         // index exists separately.
-        conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_lsp_defs_token ON _lsp_defs(def_token);")?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_lsp_defs_token ON _lsp_defs(def_token);",
+        )?;
     }
 
     let lsp_refs_exists: bool = conn
@@ -404,8 +406,8 @@ pub fn project_references(
     source_lookup: &mut dyn FnMut(&str) -> Option<String>,
     binding_log: Option<&std::path::Path>,
 ) -> Result<usize> {
-    // T8.9: legacy `_lsp_refs` schema is created/migrated for
-    // *backwards compatibility* — old `.db` files written by pre-T8.9
+    // ley-line-open-6b332d: legacy `_lsp_refs` schema is created/migrated for
+    // *backwards compatibility* — old `.db` files written by pre-ley-line-open-6b332d
     // LLO have rows in this table, and consumers (mache + others) may
     // still read them as a legacy fallback. New writes go to the
     // BindingRecord capnp event log only. The DDL stays so SELECTs
@@ -413,7 +415,7 @@ pub fn project_references(
     conn.execute_batch(LSP_REFS_DDL)?;
     migrate_lsp_schema(conn)?;
 
-    // T8.2: open the binding event log for append. `None` skips the
+    // ley-line-open-cdcae2: open the binding event log for append. `None` skips the
     // dual-write (e.g. tests, :memory: connections without a path).
     let mut binding_writer = match binding_log {
         Some(p) => Some(
@@ -430,7 +432,7 @@ pub fn project_references(
     for loc in locations {
         let uri = loc.uri.as_str();
 
-        // T8.7: source bytes feed both ref_token AND qualifier; fetch
+        // ley-line-open-6af0b8: source bytes feed both ref_token AND qualifier; fetch
         // once per location (the upstream closure caches per-URI).
         let bytes_opt = source_lookup(uri);
 
@@ -441,7 +443,7 @@ pub fn project_references(
             .and_then(|b| extract_token_at_range(b, &loc.range))
             .unwrap_or_default();
 
-        // T8.7: extract qualifier from source bytes. Empty when the
+        // ley-line-open-6af0b8: extract qualifier from source bytes. Empty when the
         // ref is a bare-identifier call (no preceding `.`), when the
         // file isn't reachable, or when the byte before the ref site
         // isn't a dot.
@@ -450,13 +452,13 @@ pub fn project_references(
             .and_then(|b| extract_qualifier(b, &loc.range))
             .unwrap_or_default();
 
-        // T8.2: feed the BindingRecord's `refSiteNodeId` — smallest
+        // ley-line-open-cdcae2: feed the BindingRecord's `refSiteNodeId` — smallest
         // enclosing AST node at the ref site (typically a leaf
         // identifier). `None` when the file isn't in `_ast` (cross-
         // repo refs to dependencies, etc.).
         let referrer_node_id = lookup_referrer_node_id(conn, uri, &loc.range);
 
-        // T8.2: feed the BindingRecord's `constructNodeId` — smallest
+        // ley-line-open-cdcae2: feed the BindingRecord's `constructNodeId` — smallest
         // enclosing function/method/constructor. `find_callers` MCP and
         // `node_refs` shape want construct level, not leaf. This is the
         // disambiguation that Falsifiability B's 100% mismatch revealed
@@ -464,7 +466,7 @@ pub fn project_references(
         // 2026-05-08).
         let construct_node_id = lookup_construct_node_id(conn, uri, &loc.range);
 
-        // T8.9: the typed BindingRecord IS the contract. SQL
+        // ley-line-open-6b332d: the typed BindingRecord IS the contract. SQL
         // `_lsp_refs` writes have been retired — schema-as-protocol
         // failure modes (be6136-class) are now structurally precluded
         // because no SQL surface exists for producer/consumer to
@@ -487,7 +489,7 @@ pub fn project_references(
     Ok(count)
 }
 
-/// T8.7: extract the qualifier (LHS of a `selector_expression`) for a
+/// ley-line-open-6af0b8: extract the qualifier (LHS of a `selector_expression`) for a
 /// ref location, by scanning source bytes immediately before the ref
 /// site. Returns `Some("pkg")` for `pkg.Method`, `Some("obj")` for
 /// `obj.method`, `None` for bare-identifier calls.
@@ -560,7 +562,7 @@ const CONSTRUCT_KINDS: &[&str] = &[
     "constructor_declaration",
 ];
 
-/// T8.2: resolve the smallest enclosing function/method/constructor
+/// ley-line-open-cdcae2: resolve the smallest enclosing function/method/constructor
 /// node at the ref site. Mirrors `lookup_referrer_node_id` but filters
 /// by `node_kind IN CONSTRUCT_KINDS`. Returns `None` when the file
 /// isn't projected, when the ref sits outside any construct (top-level
@@ -602,22 +604,18 @@ fn lookup_construct_node_id(
          LIMIT 1"
     );
 
-    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![
-        Box::new(source_id),
-        Box::new(line),
-        Box::new(col),
-    ];
+    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
+        vec![Box::new(source_id), Box::new(line), Box::new(col)];
     for kind in CONSTRUCT_KINDS {
         params_vec.push(Box::new(*kind));
     }
-    let params_refs: Vec<&dyn rusqlite::ToSql> =
-        params_vec.iter().map(|b| b.as_ref()).collect();
+    let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
 
     conn.query_row(&sql, params_refs.as_slice(), |r| r.get::<_, String>(0))
         .ok()
 }
 
-/// T8.2: serialize a single BindingRecord and append it to the binding
+/// ley-line-open-cdcae2: serialize a single BindingRecord and append it to the binding
 /// event log. The log is plain capnp framed messages back-to-back —
 /// readers iterate via `capnp::serialize::read_message` until EOF.
 ///
@@ -650,9 +648,12 @@ fn write_binding_record(
         rec.set_construct_node_id(construct_node_id);
         rec.set_ref_site_node_id(ref_site_node_id);
         rec.set_ref_uri(ref_uri);
-        // parseGen left at 0 for now; T8.5 wires it to Σ generation.
+        // parseGen left at 0 for now; bead `ley-line-open-ce55b1`
+        // wires it to the Σ root advance. Note: capnp `parseGen` is
+        // a per-segment counter, distinct from the V1 substrate
+        // `generation` field that v0.2.0 removed from the public API.
         rec.set_parse_gen(0);
-        // T8.7: qualifier — empty string for bare-identifier calls.
+        // ley-line-open-6af0b8: qualifier — empty string for bare-identifier calls.
         rec.set_qualifier(qualifier);
         let mut r = rec.init_ref_range();
         {
@@ -742,7 +743,11 @@ fn extract_token_at_range(source: &str, range: &protocol::Range) -> Option<Strin
 /// where `path` is the absolute path. ADR-0013 Step 1's "byte-range
 /// join at write time" — done once here so consumers don't need to
 /// JOIN at query time.
-fn lookup_referrer_node_id(conn: &Connection, ref_uri: &str, range: &protocol::Range) -> Option<String> {
+fn lookup_referrer_node_id(
+    conn: &Connection,
+    ref_uri: &str,
+    range: &protocol::Range,
+) -> Option<String> {
     // Translate file:// URI to absolute path.
     let abs_path = ref_uri.strip_prefix("file://").unwrap_or(ref_uri);
 
@@ -1466,9 +1471,9 @@ mod tests {
         assert_eq!(token, "my_func", "def_token must equal the symbol name");
     }
 
-    /// T8.9: count returned by project_references reflects the number
+    /// ley-line-open-6b332d: count returned by project_references reflects the number
     /// of BindingRecords emitted (or *would have been emitted* if a
-    /// binding_log path were provided). With T8.9 retiring the SQL
+    /// binding_log path were provided). With ley-line-open-6b332d retiring the SQL
     /// writer, the SQL `_lsp_refs` count is no longer a meaningful
     /// proxy — the function's return value IS the contract.
     #[test]
@@ -1480,8 +1485,7 @@ mod tests {
             make_location("file:///c.py", 100, 2),
         ];
         let mut nop_lookup = |_uri: &str| -> Option<String> { None };
-        let count =
-            project_references(&conn, "my_var", &locs, &mut nop_lookup, None).unwrap();
+        let count = project_references(&conn, "my_var", &locs, &mut nop_lookup, None).unwrap();
         assert_eq!(count, 3, "one record per Location");
     }
 
@@ -1494,8 +1498,14 @@ mod tests {
         let src = "fn foo() {\n    bar(baz);\n}\n";
         // bar at line 1, col 4..7
         let range = Range {
-            start: Position { line: 1, character: 4 },
-            end: Position { line: 1, character: 7 },
+            start: Position {
+                line: 1,
+                character: 4,
+            },
+            end: Position {
+                line: 1,
+                character: 7,
+            },
         };
         assert_eq!(extract_token_at_range(src, &range).as_deref(), Some("bar"));
     }
@@ -1509,8 +1519,14 @@ mod tests {
         let src = "abc\ndef\nghi\n";
         // From line 0 col 1 to line 2 col 2 → "bc\ndef\ngh"
         let range = Range {
-            start: Position { line: 0, character: 1 },
-            end: Position { line: 2, character: 2 },
+            start: Position {
+                line: 0,
+                character: 1,
+            },
+            end: Position {
+                line: 2,
+                character: 2,
+            },
         };
         assert_eq!(
             extract_token_at_range(src, &range).as_deref(),
@@ -1526,14 +1542,26 @@ mod tests {
         use crate::protocol::{Position, Range};
         let src = "abc\n";
         let too_far = Range {
-            start: Position { line: 0, character: 0 },
-            end: Position { line: 99, character: 0 },
+            start: Position {
+                line: 0,
+                character: 0,
+            },
+            end: Position {
+                line: 99,
+                character: 0,
+            },
         };
         assert!(extract_token_at_range(src, &too_far).is_none());
 
         let off_end = Range {
-            start: Position { line: 0, character: 5 },
-            end: Position { line: 0, character: 6 },
+            start: Position {
+                line: 0,
+                character: 5,
+            },
+            end: Position {
+                line: 0,
+                character: 6,
+            },
         };
         assert!(extract_token_at_range(src, &off_end).is_none());
     }
@@ -1542,13 +1570,13 @@ mod tests {
     /// source_lookup populates `ref_token` from the bytes provided.
     /// Pin the round-trip: lookup returns bytes → extract token →
     /// stored in `ref_token` column.
-    /// ADR-0013 Step 1 + T8.9: ref_token is populated from source
+    /// ADR-0013 Step 1 + ley-line-open-6b332d: ref_token is populated from source
     /// bytes, surfaced in the BindingRecord capnp event log (the
-    /// post-T8.9 contract; SQL `_lsp_refs` writes are retired).
+    /// post-ley-line-open-6b332d contract; SQL `_lsp_refs` writes are retired).
     #[test]
     fn project_references_populates_ref_token() {
-        use std::collections::HashMap;
         use leyline_schema_capnp::binding_capnp::binding_record;
+        use std::collections::HashMap;
         let tmp = tempfile::tempdir().unwrap();
         let log_path = tmp.path().join("test.bindings.capnp");
         let conn = Connection::open_in_memory().unwrap();
@@ -1567,11 +1595,8 @@ mod tests {
 
         let bytes = std::fs::read(&log_path).unwrap();
         let mut slice: &[u8] = &bytes;
-        let msg = capnp::serialize::read_message(
-            &mut slice,
-            capnp::message::ReaderOptions::new(),
-        )
-        .unwrap();
+        let msg = capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new())
+            .unwrap();
         let rec: binding_record::Reader = msg.get_root().unwrap();
         assert_eq!(
             rec.get_ref_token().unwrap().to_str().unwrap(),
@@ -1580,14 +1605,14 @@ mod tests {
         );
     }
 
-    /// T8.2: when binding_log = Some(path), each location emits a
+    /// ley-line-open-cdcae2: when binding_log = Some(path), each location emits a
     /// capnp BindingRecord readable back. Pin the round-trip and
     /// the parity invariant: every SQL `_lsp_refs` row has a
     /// corresponding capnp record with the same target/refUri/range.
     #[test]
     fn project_references_dual_writes_capnp_binding_log() {
-        use std::collections::HashMap;
         use leyline_schema_capnp::binding_capnp::binding_record;
+        use std::collections::HashMap;
         let tmp = tempfile::tempdir().unwrap();
         let log_path = tmp.path().join("test.bindings.capnp");
         let conn = Connection::open_in_memory().unwrap();
@@ -1640,17 +1665,20 @@ mod tests {
             .unwrap();
         let rec: binding_record::Reader = msg.get_root().unwrap();
 
-        assert_eq!(rec.get_target_node_id().unwrap().to_str().unwrap(), "fn_bar");
+        assert_eq!(
+            rec.get_target_node_id().unwrap().to_str().unwrap(),
+            "fn_bar"
+        );
         assert_eq!(rec.get_ref_token().unwrap().to_str().unwrap(), "bar");
         assert_eq!(
             rec.get_construct_node_id().unwrap().to_str().unwrap(),
             "fn_outer",
-            "T8.2: constructNodeId resolves to function_declaration",
+            "ley-line-open-cdcae2: constructNodeId resolves to function_declaration",
         );
         assert_eq!(
             rec.get_ref_site_node_id().unwrap().to_str().unwrap(),
             "id_inner",
-            "T8.2: refSiteNodeId resolves to leaf identifier",
+            "ley-line-open-cdcae2: refSiteNodeId resolves to leaf identifier",
         );
         assert_eq!(
             rec.get_ref_uri().unwrap().to_str().unwrap(),
@@ -1663,22 +1691,22 @@ mod tests {
         assert_eq!(s.get_column(), 4);
         assert_eq!(e.get_column(), 7);
 
-        // T8.7: qualifier — bare-identifier call `bar(...)` has no
+        // ley-line-open-6af0b8: qualifier — bare-identifier call `bar(...)` has no
         // preceding `.`, so qualifier is empty.
         assert_eq!(
             rec.get_qualifier().unwrap().to_str().unwrap(),
             "",
-            "T8.7: bare-identifier call has empty qualifier",
+            "ley-line-open-6af0b8: bare-identifier call has empty qualifier",
         );
 
-        // T8.9: SQL `_lsp_refs` parity assertion has been retired
+        // ley-line-open-6b332d: SQL `_lsp_refs` parity assertion has been retired
         // along with the SQL writer. The capnp record IS the
         // contract. The previous parity check (SQL `referrer_node_id`
-        // == capnp `refSiteNodeId`) had no failure mode after T8.9 —
+        // == capnp `refSiteNodeId`) had no failure mode after ley-line-open-6b332d —
         // there's no second source of truth to disagree.
     }
 
-    /// T8.7: extract_qualifier picks up `pkg` from `pkg.Method` —
+    /// ley-line-open-6af0b8: extract_qualifier picks up `pkg` from `pkg.Method` —
     /// the simplest qualified-call shape Go/Rust/TS produce.
     #[test]
     fn extract_qualifier_basic() {
@@ -1689,7 +1717,7 @@ mod tests {
         assert_eq!(extract_qualifier(src, &range).as_deref(), Some("pkg"));
     }
 
-    /// T8.7: chained selector `a.b.c` — qualifier of `c` is `b`,
+    /// ley-line-open-6af0b8: chained selector `a.b.c` — qualifier of `c` is `b`,
     /// the *immediate* predecessor (matches selector_expression nesting).
     #[test]
     fn extract_qualifier_chained_returns_immediate() {
@@ -1700,7 +1728,7 @@ mod tests {
         assert_eq!(extract_qualifier(src, &range).as_deref(), Some("b"));
     }
 
-    /// T8.7: bare-identifier call `Foo()` has no preceding dot — None.
+    /// ley-line-open-6af0b8: bare-identifier call `Foo()` has no preceding dot — None.
     #[test]
     fn extract_qualifier_bare_call_returns_none() {
         let src = "Foo()\n";
@@ -1709,7 +1737,7 @@ mod tests {
         assert!(extract_qualifier(src, &range).is_none());
     }
 
-    /// T8.7: dot present but no identifier before it (e.g. mid-string,
+    /// ley-line-open-6af0b8: dot present but no identifier before it (e.g. mid-string,
     /// truncated source). Treat as no qualifier rather than crash.
     #[test]
     fn extract_qualifier_orphan_dot_returns_none() {
@@ -1719,7 +1747,7 @@ mod tests {
         assert!(extract_qualifier(src, &range).is_none());
     }
 
-    /// T8.7: out-of-range location (LSP gave a position past EOF) —
+    /// ley-line-open-6af0b8: out-of-range location (LSP gave a position past EOF) —
     /// safe-None, not panic. Defensive against producer/consumer drift.
     #[test]
     fn extract_qualifier_out_of_bounds_returns_none() {
@@ -1729,15 +1757,15 @@ mod tests {
         assert!(extract_qualifier(src, &range).is_none());
     }
 
-    /// T8.7: end-to-end — when source bytes are present and the call
+    /// ley-line-open-6af0b8: end-to-end — when source bytes are present and the call
     /// is qualified, the BindingRecord written to the capnp log
     /// carries the qualifier. mache-42118e closes structurally:
     /// `fan_out_skew` becomes a qualifier-aware structural metric
     /// without an internal AST rewalker.
     #[test]
     fn project_references_writes_qualifier_when_qualified() {
-        use std::collections::HashMap;
         use leyline_schema_capnp::binding_capnp::binding_record;
+        use std::collections::HashMap;
         let tmp = tempfile::tempdir().unwrap();
         let log_path = tmp.path().join("test.bindings.capnp");
         let conn = Connection::open_in_memory().unwrap();
@@ -1763,11 +1791,11 @@ mod tests {
         assert_eq!(
             rec.get_qualifier().unwrap().to_str().unwrap(),
             "pkg",
-            "T8.7: qualifier round-trips through capnp dual-write",
+            "ley-line-open-6af0b8: qualifier round-trips through capnp dual-write",
         );
     }
 
-    /// T8.2: lookup_construct_node_id finds the smallest enclosing
+    /// ley-line-open-cdcae2: lookup_construct_node_id finds the smallest enclosing
     /// function/method/constructor. Pin the per-language kind set
     /// (CONSTRUCT_KINDS) by exercising all of them.
     #[test]
@@ -1798,11 +1826,8 @@ mod tests {
                  );",
             )
             .unwrap();
-            conn.execute(
-                "INSERT INTO _source VALUES ('f', '?', '/x/f')",
-                [],
-            )
-            .unwrap();
+            conn.execute("INSERT INTO _source VALUES ('f', '?', '/x/f')", [])
+                .unwrap();
             conn.execute(
                 &format!(
                     "INSERT INTO _ast VALUES \
@@ -1822,15 +1847,15 @@ mod tests {
         }
     }
 
-    /// ADR-0013 Step 1 (be6136) + T8.9: when `_source` and `_ast`
+    /// ADR-0013 Step 1 (be6136) + ley-line-open-6b332d: when `_source` and `_ast`
     /// are populated and the LSP location's URI resolves to a known
     /// source path, the BindingRecord's `refSiteNodeId` is set to the
     /// smallest enclosing AST node (not empty). Pin the byte-range
-    /// join via the capnp output (the post-T8.9 contract).
+    /// join via the capnp output (the post-ley-line-open-6b332d contract).
     #[test]
     fn project_references_populates_referrer_node_id() {
-        use std::collections::HashMap;
         use leyline_schema_capnp::binding_capnp::binding_record;
+        use std::collections::HashMap;
         let tmp = tempfile::tempdir().unwrap();
         let log_path = tmp.path().join("test.bindings.capnp");
         let conn = Connection::open_in_memory().unwrap();
@@ -1879,11 +1904,8 @@ mod tests {
 
         let bytes = std::fs::read(&log_path).unwrap();
         let mut slice: &[u8] = &bytes;
-        let msg = capnp::serialize::read_message(
-            &mut slice,
-            capnp::message::ReaderOptions::new(),
-        )
-        .unwrap();
+        let msg = capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new())
+            .unwrap();
         let rec: binding_record::Reader = msg.get_root().unwrap();
         assert_eq!(
             rec.get_ref_site_node_id().unwrap().to_str().unwrap(),
@@ -1892,7 +1914,7 @@ mod tests {
         );
     }
 
-    /// be6136 + T8.9: lookup_referrer_node_id misses when
+    /// be6136 + ley-line-open-6b332d: lookup_referrer_node_id misses when
     /// `_source.path` disagrees with the file:// URI by even one byte
     /// (e.g. macOS `/tmp` vs `/private/tmp`). The capnp record's
     /// `refSiteNodeId` falls through to empty string when the lookup
@@ -1939,16 +1961,12 @@ mod tests {
         locs[0].range.end.character = 7;
 
         let mut nop_lookup = |_uri: &str| -> Option<String> { None };
-        project_references(&conn, "fn_foo", &locs, &mut nop_lookup, Some(&log_path))
-            .unwrap();
+        project_references(&conn, "fn_foo", &locs, &mut nop_lookup, Some(&log_path)).unwrap();
 
         let bytes = std::fs::read(&log_path).unwrap();
         let mut slice: &[u8] = &bytes;
-        let msg = capnp::serialize::read_message(
-            &mut slice,
-            capnp::message::ReaderOptions::new(),
-        )
-        .unwrap();
+        let msg = capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new())
+            .unwrap();
         let rec: binding_record::Reader = msg.get_root().unwrap();
         assert_eq!(
             rec.get_ref_site_node_id().unwrap().to_str().unwrap(),
@@ -1957,7 +1975,7 @@ mod tests {
         );
     }
 
-    /// ADR-0013 Step 1 + T8.9: when source_lookup returns None
+    /// ADR-0013 Step 1 + ley-line-open-6b332d: when source_lookup returns None
     /// (file unavailable, cross-repo URI), the BindingRecord's
     /// `refToken` defaults to empty string — NEVER null in the schema.
     /// Pin so consumer queries filtering on non-empty stay correct.
@@ -1974,11 +1992,8 @@ mod tests {
 
         let bytes = std::fs::read(&log_path).unwrap();
         let mut slice: &[u8] = &bytes;
-        let msg = capnp::serialize::read_message(
-            &mut slice,
-            capnp::message::ReaderOptions::new(),
-        )
-        .unwrap();
+        let msg = capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new())
+            .unwrap();
         let rec: binding_record::Reader = msg.get_root().unwrap();
         assert_eq!(
             rec.get_ref_token().unwrap().to_str().unwrap(),
@@ -2066,13 +2081,21 @@ mod tests {
 
         // Old data preserved.
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM _lsp_defs WHERE node_id = 'legacy_def'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM _lsp_defs WHERE node_id = 'legacy_def'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(count, 1, "legacy data must survive migration");
 
         // New column present + default empty for legacy row.
         let token: String = conn
-            .query_row("SELECT def_token FROM _lsp_defs WHERE node_id = 'legacy_def'", [], |r| r.get(0))
+            .query_row(
+                "SELECT def_token FROM _lsp_defs WHERE node_id = 'legacy_def'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(token, "", "legacy rows have empty def_token (DEFAULT '')");
     }

@@ -224,16 +224,13 @@ where
     f(&guard)
 }
 
-/// Open the controller and return its current generation. Centralizes the
-/// "open ctrl + read generation" pair that every op which mutates state
-/// needs to include in its JSON response. The `"open controller"` context
-/// string is part of the wire-error contract — clients see this when the
-/// controller path is broken.
 /// T2.4: read the substrate's `current_root` and return as a 64-char
-/// lowercase hex string for the wire format. Replaces the pre-T2.4
-/// `read_generation` helper. Wire-format key changed from
-/// `"generation": <number>` to `"current_root": "<hex>"`. Mache's
-/// client must update to match (mache `mache-36d961` epic).
+/// lowercase hex string for the wire format. Centralizes the
+/// "open ctrl + read root" pair that every state-changing op includes
+/// in its JSON response. The `"open controller"` context string is
+/// part of the wire-error contract — clients see this when the
+/// controller path is broken. Wire-format key is `"current_root":
+/// "<hex>"` (paired with mache `mache-36d961` epic).
 fn read_root_hex(ctrl_path: &Path) -> Result<String> {
     let ctrl = Controller::open_or_create(ctrl_path).context("open controller")?;
     let root = ctrl.current_root();

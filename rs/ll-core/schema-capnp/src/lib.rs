@@ -65,8 +65,7 @@ mod tests {
         let mut buf = Vec::new();
         serialize::write_message(&mut buf, &msg).unwrap();
 
-        let reader =
-            serialize::read_message(buf.as_slice(), ReaderOptions::new()).unwrap();
+        let reader = serialize::read_message(buf.as_slice(), ReaderOptions::new()).unwrap();
         let pos: position::Reader = reader.get_root().unwrap();
 
         assert_eq!(pos.get_line(), 42);
@@ -100,8 +99,7 @@ mod tests {
         let mut buf = Vec::new();
         serialize::write_message(&mut buf, &msg).unwrap();
 
-        let reader =
-            serialize::read_message(buf.as_slice(), ReaderOptions::new()).unwrap();
+        let reader = serialize::read_message(buf.as_slice(), ReaderOptions::new()).unwrap();
         let r: range::Reader = reader.get_root().unwrap();
 
         let s = r.get_start().unwrap();

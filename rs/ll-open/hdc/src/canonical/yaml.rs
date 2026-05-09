@@ -28,11 +28,7 @@ impl CanonicalKindMap for YamlCanonicalMap {
     fn lookup(&self, kind: &str) -> CanonicalKind {
         match kind {
             // Declarations: bind a name (or sequence position) to a value.
-            "block_mapping_pair"
-            | "flow_pair"
-            | "anchor"
-            | "yaml_directive"
-            | "tag_directive"
+            "block_mapping_pair" | "flow_pair" | "anchor" | "yaml_directive" | "tag_directive"
             | "reserved_directive" => CanonicalKind::Decl,
 
             // References: alias resolves back to a previously-declared anchor.
@@ -61,14 +57,8 @@ impl CanonicalKindMap for YamlCanonicalMap {
             | "escape_sequence" => CanonicalKind::Lit,
 
             // Containers.
-            "document"
-            | "stream"
-            | "block_node"
-            | "flow_node"
-            | "block_mapping"
-            | "flow_mapping"
-            | "block_sequence"
-            | "flow_sequence" => CanonicalKind::Block,
+            "document" | "stream" | "block_node" | "flow_node" | "block_mapping"
+            | "flow_mapping" | "block_sequence" | "flow_sequence" => CanonicalKind::Block,
 
             // Unknown / unmapped → forward-compat fallback.
             _ => FALLBACK_KIND,
@@ -83,9 +73,7 @@ impl CanonicalKindMap for YamlCanonicalMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canonical::{
-        assert_canonical_map_baseline, assert_kinds_match, CanonicalKind,
-    };
+    use crate::canonical::{CanonicalKind, assert_canonical_map_baseline, assert_kinds_match};
 
     #[test]
     fn baseline_invariants() {
@@ -94,46 +82,45 @@ mod tests {
 
     #[test]
     fn known_kinds_map_correctly() {
-        assert_kinds_match(&YamlCanonicalMap, &[
-            // Decl family.
-            ("block_mapping_pair", CanonicalKind::Decl),
-            ("flow_pair", CanonicalKind::Decl),
-            ("anchor", CanonicalKind::Decl),
-            ("yaml_directive", CanonicalKind::Decl),
-            ("tag_directive", CanonicalKind::Decl),
-            ("reserved_directive", CanonicalKind::Decl),
-
-            // Ref + Stmt.
-            ("alias", CanonicalKind::Ref),
-            ("block_sequence_item", CanonicalKind::Stmt),
-
-            // Op family.
-            ("tag", CanonicalKind::Op),
-            ("comment", CanonicalKind::Op),
-
-            // Lit family — every scalar shape.
-            ("plain_scalar", CanonicalKind::Lit),
-            ("string_scalar", CanonicalKind::Lit),
-            ("single_quote_scalar", CanonicalKind::Lit),
-            ("double_quote_scalar", CanonicalKind::Lit),
-            ("block_scalar", CanonicalKind::Lit),
-            ("integer_scalar", CanonicalKind::Lit),
-            ("float_scalar", CanonicalKind::Lit),
-            ("boolean_scalar", CanonicalKind::Lit),
-            ("null_scalar", CanonicalKind::Lit),
-            ("timestamp_scalar", CanonicalKind::Lit),
-            ("escape_sequence", CanonicalKind::Lit),
-
-            // Block family — containers.
-            ("document", CanonicalKind::Block),
-            ("stream", CanonicalKind::Block),
-            ("block_node", CanonicalKind::Block),
-            ("flow_node", CanonicalKind::Block),
-            ("block_mapping", CanonicalKind::Block),
-            ("flow_mapping", CanonicalKind::Block),
-            ("block_sequence", CanonicalKind::Block),
-            ("flow_sequence", CanonicalKind::Block),
-        ]);
+        assert_kinds_match(
+            &YamlCanonicalMap,
+            &[
+                // Decl family.
+                ("block_mapping_pair", CanonicalKind::Decl),
+                ("flow_pair", CanonicalKind::Decl),
+                ("anchor", CanonicalKind::Decl),
+                ("yaml_directive", CanonicalKind::Decl),
+                ("tag_directive", CanonicalKind::Decl),
+                ("reserved_directive", CanonicalKind::Decl),
+                // Ref + Stmt.
+                ("alias", CanonicalKind::Ref),
+                ("block_sequence_item", CanonicalKind::Stmt),
+                // Op family.
+                ("tag", CanonicalKind::Op),
+                ("comment", CanonicalKind::Op),
+                // Lit family — every scalar shape.
+                ("plain_scalar", CanonicalKind::Lit),
+                ("string_scalar", CanonicalKind::Lit),
+                ("single_quote_scalar", CanonicalKind::Lit),
+                ("double_quote_scalar", CanonicalKind::Lit),
+                ("block_scalar", CanonicalKind::Lit),
+                ("integer_scalar", CanonicalKind::Lit),
+                ("float_scalar", CanonicalKind::Lit),
+                ("boolean_scalar", CanonicalKind::Lit),
+                ("null_scalar", CanonicalKind::Lit),
+                ("timestamp_scalar", CanonicalKind::Lit),
+                ("escape_sequence", CanonicalKind::Lit),
+                // Block family — containers.
+                ("document", CanonicalKind::Block),
+                ("stream", CanonicalKind::Block),
+                ("block_node", CanonicalKind::Block),
+                ("flow_node", CanonicalKind::Block),
+                ("block_mapping", CanonicalKind::Block),
+                ("flow_mapping", CanonicalKind::Block),
+                ("block_sequence", CanonicalKind::Block),
+                ("flow_sequence", CanonicalKind::Block),
+            ],
+        );
     }
 
     #[test]

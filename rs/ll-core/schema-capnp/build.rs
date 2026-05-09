@@ -1,8 +1,9 @@
 // Generates Rust bindings for `schemas/*.capnp` into OUT_DIR.
 //
-// Requires the `capnp` tool on PATH (T8.6 ADR will document this dep
-// formally; for now: `brew install capnp` on macOS, package `capnproto`
-// on Debian/Ubuntu). Re-runs whenever any schema file changes.
+// Requires the `capnp` tool on PATH (documented formally in
+// `docs/adr/0014-capnp-as-protocol.md`, bead `ley-line-open-ce8fd1`;
+// for now: `brew install capnp` on macOS, package `capnproto` on
+// Debian/Ubuntu). Re-runs whenever any schema file changes.
 fn main() {
     let mut cmd = capnpc::CompilerCommand::new();
     cmd.src_prefix("schemas");
@@ -15,5 +16,6 @@ fn main() {
         }
     }
 
-    cmd.run().expect("capnp codegen failed (is `capnp` on PATH?)");
+    cmd.run()
+        .expect("capnp codegen failed (is `capnp` on PATH?)");
 }

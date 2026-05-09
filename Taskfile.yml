@@ -96,12 +96,48 @@ tasks:
     cmds:
       - cargo check --workspace
 
+  fmt:check:
+    desc: Verify formatting (CI gate; use `task fmt` locally to fix)
+    dir: rs
+    cmds:
+      - cargo fmt --all -- --check
+
+  fmt:
+    desc: Apply formatting in place
+    dir: rs
+    cmds:
+      - cargo fmt --all
+
+  # --------------------------------------------------------------------------
+  # FFI / staticlib
+  # --------------------------------------------------------------------------
+  build:fs-static:
+    desc: Build leyline-fs as a staticlib (consumed by smoke_ffi C tests)
+    dir: rs
+    cmds:
+      - cargo build -p leyline-fs --lib
+
+  # --------------------------------------------------------------------------
+  # Tier isolation — guard against cross-tier dep creep. ll-core (Tier 1
+  # OSS infrastructure) must build standalone with no transitive pull
+  # from ll-open (Tier 2). A failure here means a Tier 1 crate has
+  # gained a forbidden Tier 2 dep.
+  # --------------------------------------------------------------------------
+  tier:isolation:
+    desc: Verify ll-core crates build without ll-open
+    dir: rs
+    cmds:
+      - cargo build -p leyline-core -p leyline-schema -p leyline-public-schema
+
   # --------------------------------------------------------------------------
   # All-in-one
   # --------------------------------------------------------------------------
   ci:
-    desc: Full CI pipeline (check + clippy + test)
+    desc: Full CI pipeline (check + clippy + fmt + FFI staticlib + tier isolation + test)
     cmds:
       - task: check
       - task: clippy
+      - task: fmt:check
+      - task: build:fs-static
+      - task: tier:isolation
       - task: test

@@ -206,7 +206,7 @@ impl SqliteGraphAdapter {
     ///
     /// **T2.3 verification:** same content-addressed pin as
     /// `SqliteGraph::from_arena` — refuses to load on `current_root`
-    /// mismatch. Skipped on zero-root sentinel (legacy writers).
+    /// mismatch. Only `data_size == 0` (fresh arena) skips the hash.
     pub fn from_arena_writable(control_path: &Path) -> Result<Self> {
         let controller = Controller::open_or_create(control_path)?;
         let arena_path = controller.arena_path();
@@ -219,14 +219,15 @@ impl SqliteGraphAdapter {
 
         let file_size = mmap.len() as u64;
         let offset = header
-            .active_buffer_offset(file_size)
-            .context("invalid arena header")?;
+            .validate_header(file_size)
+            .context("arena header validation failed")?;
         let buf_size = ArenaHeader::buffer_size(file_size);
 
         let buf = &mmap[offset as usize..(offset + buf_size) as usize];
-        // T2.3: σ(buf[..data_size]) == ctrl.current_root before deserialize.
-        crate::verify_arena_root(&controller, header, buf)?;
-        let graph = SqliteGraph::from_bytes_writable(buf)?;
+        // T2.3: hash buf[..data_size] against current_root, deserialize
+        // exactly the verified slice (no padded-suffix asymmetry).
+        let verified = crate::verify_arena_root(&controller, header, buf)?;
+        let graph = SqliteGraph::from_bytes_writable(verified)?;
         let adapter = Self::new(graph);
         adapter.ensure_errors_table()?;
         Ok(adapter)
@@ -915,7 +916,7 @@ impl HotSwapGraph {
         self
     }
 
-    /// Build an adapter for the current generation.
+    /// Build an adapter for the current root.
     fn build_adapter(&self, control_path: &Path) -> Result<Arc<dyn Graph>> {
         if self.writable {
             #[allow(unused_mut)]

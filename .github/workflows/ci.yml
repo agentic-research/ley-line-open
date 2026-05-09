@@ -8,9 +8,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# CI is the same gate as local dev: every step delegates to a Taskfile
+# entry. If a check isn't reachable via `task <name>`, it doesn't belong
+# in CI either. Adding a new gate? Add it to Taskfile.yml first, then
+# add a step here that calls it.
 jobs:
-  check:
-    name: Check + Clippy + Test
+  ci:
+    name: Check + Clippy + Test (task ci)
     runs-on: ubuntu-latest
     steps:
       # SHA-pinned: actions/checkout@v4.3.1 (refs/tags/v4 head as of 2026-05)
@@ -21,36 +25,17 @@ jobs:
           toolchain: nightly
           components: clippy, rustfmt
 
-      - name: Check
-        working-directory: rs
-        run: cargo check --workspace
+      - name: Install system deps (libfuse for fuser, capnproto for schema build.rs)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libfuse-dev capnproto pkg-config
 
-      - name: Clippy
-        working-directory: rs
-        run: cargo clippy --workspace -- -D warnings
-
-      - name: Format
-        working-directory: rs
-        run: cargo fmt --all -- --check
-
-      - name: Build staticlib (for FFI test)
-        working-directory: rs
-        run: cargo build -p leyline-fs --lib
-
-      - name: Test
-        working-directory: rs
-        run: cargo test --workspace
-
-  tier-isolation:
-    name: Tier isolation — ll-core builds alone
-    runs-on: ubuntu-latest
-    steps:
-      # SHA-pinned: actions/checkout@v4.3.1 (refs/tags/v4 head as of 2026-05)
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+      # SHA-pinned: arduino/setup-task@v2 (Taskfile runner, the golden
+      # path; see Taskfile.yml at the repo root).
+      - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611
         with:
-          toolchain: nightly
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build only ll-core crates
-        working-directory: rs
-        run: cargo build -p leyline-core -p leyline-schema -p leyline-public-schema
+      - name: Run task ci (check + clippy + fmt + FFI staticlib + tier isolation + test)
+        run: task ci

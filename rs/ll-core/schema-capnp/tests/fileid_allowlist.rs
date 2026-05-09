@@ -34,12 +34,7 @@ fn schema_fileids_match_allowlist() {
     let entries: Vec<_> = std::fs::read_dir(&schemas_dir)
         .expect("read schemas/ dir")
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map(|x| x == "capnp")
-                .unwrap_or(false)
-        })
+        .filter(|e| e.path().extension().map(|x| x == "capnp").unwrap_or(false))
         .collect();
 
     // Every file in the allowlist must exist on disk.
@@ -78,11 +73,9 @@ fn schema_fileids_match_allowlist() {
     // capnp parser by scanning for the first `@0x...;` token.
     for (name, expected_id) in SCHEMA_FILEID_ALLOWLIST {
         let path = schemas_dir.join(name);
-        let body = std::fs::read_to_string(&path)
-            .unwrap_or_else(|_| panic!("read schemas/{name}"));
-        let actual = extract_file_id(&body).unwrap_or_else(|| {
-            panic!("F8.6.3: no `@0x...;` literal found in schemas/{name}")
-        });
+        let body = std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("read schemas/{name}"));
+        let actual = extract_file_id(&body)
+            .unwrap_or_else(|| panic!("F8.6.3: no `@0x...;` literal found in schemas/{name}"));
         assert_eq!(
             actual, *expected_id,
             "F8.6.3 fileId drift in schemas/{name}: \

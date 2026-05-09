@@ -8,13 +8,13 @@
 //! identical hypervectors — that's the structural-equivalence-class
 //! property the whole HDC stack rests on.
 
-use crate::codebook::{canonical_signature_bytes, AstNodeFingerprint, BaseCodebook};
+use crate::codebook::{AstNodeFingerprint, BaseCodebook, canonical_signature_bytes};
 
 #[cfg(test)]
 use crate::canonical::CanonicalKind;
 #[cfg(test)]
 use crate::util::assert_far_apart;
-use crate::util::{bytes_to_hv, Hypervector};
+use crate::util::{Hypervector, bytes_to_hv};
 
 /// Default AST codebook. Stateless — same input always produces same
 /// output, no per-instance state to ship between machines.
@@ -72,11 +72,7 @@ mod tests {
     /// Test convenience: like `AstNodeFingerprint::new` but takes
     /// `&[CanonicalKind]` instead of an owned Vec — the test bodies
     /// build inline arrays which `&[K]` is the natural type for.
-    fn fp(
-        kind: CanonicalKind,
-        arity: u8,
-        children: &[CanonicalKind],
-    ) -> AstNodeFingerprint {
+    fn fp(kind: CanonicalKind, arity: u8, children: &[CanonicalKind]) -> AstNodeFingerprint {
         AstNodeFingerprint::new(kind, arity, children.to_vec())
     }
 
@@ -86,8 +82,16 @@ mod tests {
         // produce identical hypervectors. Cross-machine reproducibility
         // depends on this.
         let cb = AstCodebook::new();
-        let f1 = fp(CanonicalKind::Stmt, 2, &[CanonicalKind::Op, CanonicalKind::Block]);
-        let f2 = fp(CanonicalKind::Stmt, 2, &[CanonicalKind::Op, CanonicalKind::Block]);
+        let f1 = fp(
+            CanonicalKind::Stmt,
+            2,
+            &[CanonicalKind::Op, CanonicalKind::Block],
+        );
+        let f2 = fp(
+            CanonicalKind::Stmt,
+            2,
+            &[CanonicalKind::Op, CanonicalKind::Block],
+        );
         assert_eq!(cb.base_vector(&f1), cb.base_vector(&f2));
     }
 
@@ -116,8 +120,16 @@ mod tests {
         // them to share the *base* vector (their structural template
         // is the same; only their role-binding differs).
         let cb = AstCodebook::new();
-        let f1 = fp(CanonicalKind::Stmt, 2, &[CanonicalKind::Op, CanonicalKind::Block]);
-        let f2 = fp(CanonicalKind::Stmt, 2, &[CanonicalKind::Block, CanonicalKind::Op]);
+        let f1 = fp(
+            CanonicalKind::Stmt,
+            2,
+            &[CanonicalKind::Op, CanonicalKind::Block],
+        );
+        let f2 = fp(
+            CanonicalKind::Stmt,
+            2,
+            &[CanonicalKind::Block, CanonicalKind::Op],
+        );
         assert_eq!(cb.base_vector(&f1), cb.base_vector(&f2));
     }
 
@@ -129,8 +141,16 @@ mod tests {
         // `if x { y } else { z }` would silently merge into the
         // same equivalence class.
         let cb = AstCodebook::new();
-        let f1 = fp(CanonicalKind::Stmt, 2, &[CanonicalKind::Op, CanonicalKind::Block]);
-        let f2 = fp(CanonicalKind::Stmt, 3, &[CanonicalKind::Op, CanonicalKind::Block]);
+        let f1 = fp(
+            CanonicalKind::Stmt,
+            2,
+            &[CanonicalKind::Op, CanonicalKind::Block],
+        );
+        let f2 = fp(
+            CanonicalKind::Stmt,
+            3,
+            &[CanonicalKind::Op, CanonicalKind::Block],
+        );
         assert_far_apart(
             &cb.base_vector(&f1),
             &cb.base_vector(&f2),
@@ -164,11 +184,22 @@ mod tests {
         let cb = AstCodebook::new();
         for fp in [
             fp(CanonicalKind::Decl, 0, &[]),
-            fp(CanonicalKind::Stmt, 2, &[CanonicalKind::Op, CanonicalKind::Lit]),
-            fp(CanonicalKind::Block, 5, &[
-                CanonicalKind::Decl, CanonicalKind::Stmt, CanonicalKind::Expr,
-                CanonicalKind::Ref, CanonicalKind::Lit,
-            ]),
+            fp(
+                CanonicalKind::Stmt,
+                2,
+                &[CanonicalKind::Op, CanonicalKind::Lit],
+            ),
+            fp(
+                CanonicalKind::Block,
+                5,
+                &[
+                    CanonicalKind::Decl,
+                    CanonicalKind::Stmt,
+                    CanonicalKind::Expr,
+                    CanonicalKind::Ref,
+                    CanonicalKind::Lit,
+                ],
+            ),
         ] {
             let hv = cb.base_vector(&fp);
             let ones: u32 = hv.iter().map(|b| b.count_ones()).sum();
@@ -232,7 +263,7 @@ mod tests {
         //   + kind_disc (1B) + arity (1B) + child_count_le (2B)
         //   + sorted_child_discs (NB).
         let f = fp(
-            CanonicalKind::Stmt,         // disc=2
+            CanonicalKind::Stmt, // disc=2
             3,
             &[CanonicalKind::Op, CanonicalKind::Block, CanonicalKind::Op], // discs 6, 3, 6 → sorted 3, 6, 6
         );

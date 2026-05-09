@@ -188,7 +188,10 @@ mod tests {
         assert_eq!(obj.get("jsonrpc").and_then(|v| v.as_str()), Some("2.0"));
         // id is u64 in our framing.
         assert_eq!(obj.get("id").and_then(|v| v.as_u64()), Some(7));
-        assert_eq!(obj.get("method").and_then(|v| v.as_str()), Some("initialize"));
+        assert_eq!(
+            obj.get("method").and_then(|v| v.as_str()),
+            Some("initialize")
+        );
         assert!(obj.get("params").is_some());
     }
 
@@ -204,6 +207,9 @@ mod tests {
         let obj = json.as_object().unwrap();
         assert_eq!(obj.get("jsonrpc").and_then(|v| v.as_str()), Some("2.0"));
         assert!(!obj.contains_key("id"), "Notification must NOT carry an id");
-        assert_eq!(obj.get("method").and_then(|v| v.as_str()), Some("textDocument/didOpen"));
+        assert_eq!(
+            obj.get("method").and_then(|v| v.as_str()),
+            Some("textDocument/didOpen")
+        );
     }
 }

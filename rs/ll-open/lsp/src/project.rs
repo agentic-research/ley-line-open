@@ -562,6 +562,12 @@ fn lookup_construct_node_id(
 /// T8.2: serialize a single BindingRecord and append it to the binding
 /// event log. The log is plain capnp framed messages back-to-back —
 /// readers iterate via `capnp::serialize::read_message` until EOF.
+///
+/// Per the post-RTFM canonical-encoding commitment in ADR-0014, the
+/// producer writes via `set_root_canonical` so the on-disk bytes are
+/// byte-stable across additive schema changes. This is what makes
+/// Σ root advance only when the *projection's actual content* changes,
+/// not when the schema gains a default-valued field.
 fn write_binding_record(
     writer: &mut std::fs::File,
     target_node_id: &str,
@@ -573,9 +579,9 @@ fn write_binding_record(
 ) -> Result<()> {
     use leyline_schema_capnp::binding_capnp::binding_record;
 
-    let mut msg = capnp::message::Builder::new_default();
+    let mut src = capnp::message::Builder::new_default();
     {
-        let mut rec: binding_record::Builder = msg.init_root();
+        let mut rec: binding_record::Builder = src.init_root();
         rec.set_target_node_id(target_node_id);
         rec.set_ref_token(ref_token);
         rec.set_construct_node_id(construct_node_id);
@@ -598,7 +604,11 @@ fn write_binding_record(
         }
     }
 
-    capnp::serialize::write_message(writer, &msg)
+    let mut canonical = capnp::message::Builder::new_default();
+    canonical
+        .set_root_canonical(src.get_root_as_reader::<binding_record::Reader>()?)
+        .context("canonicalize BindingRecord")?;
+    capnp::serialize::write_message(writer, &canonical)
         .context("write BindingRecord to event log")?;
     Ok(())
 }

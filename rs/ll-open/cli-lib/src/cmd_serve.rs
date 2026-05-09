@@ -55,11 +55,7 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
 ///
 /// Returns the controller path (resolved) so callers can build a graph.
 /// This is also the seam tested by integration tests that cannot mount.
-pub fn setup_arena(
-    arena: &Path,
-    arena_size: u64,
-    control: Option<&Path>,
-) -> Result<PathBuf> {
+pub fn setup_arena(arena: &Path, arena_size: u64, control: Option<&Path>) -> Result<PathBuf> {
     // Create the arena file.
     let _mmap = create_arena(arena, arena_size).context("create arena")?;
 
@@ -96,9 +92,8 @@ pub fn mount_nfs_cmd(port: u16, mountpoint: &Path) -> Result<()> {
         .canonicalize()
         .unwrap_or_else(|_| mountpoint.to_path_buf());
 
-    let nfs_opts = format!(
-        "nolocks,vers=3,tcp,rsize=131072,wsize=131072,port={port},mountport={port}"
-    );
+    let nfs_opts =
+        format!("nolocks,vers=3,tcp,rsize=131072,wsize=131072,port={port},mountport={port}");
     let mount_str = mount_path.to_string_lossy();
 
     let status = if cfg!(target_os = "macos") {
@@ -159,8 +154,7 @@ pub async fn cmd_serve(
     match backend {
         "nfs" => {
             let listen_addr = format!("0.0.0.0:{nfs_port}");
-            let (port, _handle) =
-                leyline_fs::nfs::serve_nfs(graph, &listen_addr).await?;
+            let (port, _handle) = leyline_fs::nfs::serve_nfs(graph, &listen_addr).await?;
             eprintln!("NFS server listening on port {port}");
 
             mount_nfs_cmd(port, mount)?;
@@ -296,7 +290,10 @@ mod tests {
         let explicit_ctrl = td.path().join("custom_name.weird");
         let returned = setup_arena(&arena_path, 4096, Some(&explicit_ctrl))
             .expect("setup_arena with explicit ctrl");
-        assert_eq!(returned, explicit_ctrl, "explicit ctrl path must be used verbatim");
+        assert_eq!(
+            returned, explicit_ctrl,
+            "explicit ctrl path must be used verbatim"
+        );
     }
 
     #[test]

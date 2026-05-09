@@ -2,11 +2,11 @@
 
 #[cfg(feature = "vec")]
 pub mod embed;
+pub mod enrichment;
+pub mod events;
+pub mod ext;
 #[cfg(feature = "hdc")]
 pub mod hdc_pass;
-pub mod enrichment;
-pub mod ext;
-pub mod events;
 #[cfg(feature = "lsp")]
 pub mod lsp_pass;
 pub mod mcp;
@@ -15,14 +15,14 @@ pub mod socket;
 #[cfg(feature = "vec")]
 pub mod vec_index;
 
-use std::collections::HashMap;
 #[cfg(feature = "vec")]
 use std::collections::BinaryHeap;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
-pub use ext::{DaemonExt, NoExt};
 pub use events::EventRouter;
+pub use ext::{DaemonExt, NoExt};
 
 /// Wall-clock millis since UNIX_EPOCH. Used by the daemon's `last_*_ms`
 /// state fields, embed-priority records, and pass-outcome timestamps —
@@ -242,4 +242,3 @@ mod tests {
         assert!(a <= b && b <= c, "now_ms went backwards: {a} {b} {c}");
     }
 }
-

@@ -26,8 +26,8 @@ use leyline_ts::languages::TsLanguage;
 pub const MAX_PARSE_FILE_SIZE: i64 = 8 * 1024 * 1024;
 use leyline_ts::refs::{ExtractedRef, extract_refs};
 use leyline_ts::schema::{
-    create_ast_schema, create_index_schema, create_refs_schema, delete_file_rows,
-    read_file_index, set_meta, sweep_orphaned_dirs,
+    create_ast_schema, create_index_schema, create_refs_schema, delete_file_rows, read_file_index,
+    set_meta, sweep_orphaned_dirs,
 };
 use rayon::prelude::*;
 use rusqlite::Connection;
@@ -99,8 +99,7 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
         bail!("{} is not a directory", source.display());
     }
 
-    let conn =
-        Connection::open(output).with_context(|| format!("open {}", output.display()))?;
+    let conn = Connection::open(output).with_context(|| format!("open {}", output.display()))?;
     // Perf pragmas for file-backed bulk insert.
     // DELETE journal (not WAL) — the .db is a portable snapshot. WAL requires
     // -shm/-wal sidecar files on the same filesystem, breaking portability.
@@ -114,7 +113,10 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
     let result = parse_into_conn(&conn, source, lang_filter, None)?;
     eprintln!(
         "{} parsed, {} unchanged, {} deleted, {} errors -> {}",
-        result.parsed, result.unchanged, result.deleted, result.errors,
+        result.parsed,
+        result.unchanged,
+        result.deleted,
+        result.errors,
         output.display()
     );
 
@@ -169,9 +171,7 @@ pub fn parse_into_conn(
     };
 
     // Check if tables already exist (incremental mode).
-    let incremental = conn
-        .prepare("SELECT 1 FROM _file_index LIMIT 1")
-        .is_ok();
+    let incremental = conn.prepare("SELECT 1 FROM _file_index LIMIT 1").is_ok();
 
     create_ast_schema(conn)?;
     create_refs_schema(conn)?;
@@ -229,8 +229,7 @@ pub fn parse_into_conn(
         let rel = path.strip_prefix(source).unwrap_or(path);
         let rel_str = rel.to_string_lossy().to_string();
 
-        let meta = std::fs::metadata(path)
-            .with_context(|| format!("stat {}", path.display()))?;
+        let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
         let file_mtime = meta
             .modified()
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
@@ -288,8 +287,7 @@ pub fn parse_into_conn(
     // For a full-tree pass, every path in old_index that isn't in `files` is
     // a deletion candidate. For a scoped pass, only paths in scope can be
     // deleted — paths outside scope are simply not visible to this pass.
-    let scope_set: Option<HashSet<&str>> =
-        scope.map(|s| s.iter().map(|p| p.as_str()).collect());
+    let scope_set: Option<HashSet<&str>> = scope.map(|s| s.iter().map(|p| p.as_str()).collect());
 
     for old_path in old_index.keys() {
         if let Some(set) = &scope_set
@@ -302,9 +300,7 @@ pub fn parse_into_conn(
         //   2. It exists on disk but was filtered out (in all_file_rels
         //      but not in current_rels — e.g. extension lost a tree-
         //      sitter mapping or --lang filter excluded it).
-        if !current_rels.contains(old_path.as_str())
-            && !all_file_rels.contains(old_path.as_str())
-        {
+        if !current_rels.contains(old_path.as_str()) && !all_file_rels.contains(old_path.as_str()) {
             delete_file_rows(conn, old_path)?;
             deleted += 1;
         }
@@ -329,8 +325,16 @@ pub fn parse_into_conn(
         eprintln!(
             "parsing {} files (skipped {unchanged} unchanged{}{})",
             to_parse.len(),
-            if oversized > 0 { format!(", {oversized} oversized") } else { String::new() },
-            if deleted > 0 { format!(", {deleted} deleted") } else { String::new() },
+            if oversized > 0 {
+                format!(", {oversized} oversized")
+            } else {
+                String::new()
+            },
+            if deleted > 0 {
+                format!(", {deleted} deleted")
+            } else {
+                String::new()
+            },
         );
     }
 
@@ -339,13 +343,16 @@ pub fn parse_into_conn(
     let parsed_files: Vec<Result<ParsedFile>> = to_parse
         .par_iter()
         .map(|(rel, abs_path, lang, file_mtime, file_size)| {
-            let content = std::fs::read(abs_path)
-                .with_context(|| format!("read {}", abs_path.display()))?;
+            let content =
+                std::fs::read(abs_path).with_context(|| format!("read {}", abs_path.display()))?;
 
             // Skip binary files (null byte in first 8KB — same heuristic as git).
             let check_len = content.len().min(8192);
             if content[..check_len].contains(&0) {
-                bail!("binary file (null byte in first 8KB): {}", abs_path.display());
+                bail!(
+                    "binary file (null byte in first 8KB): {}",
+                    abs_path.display()
+                );
             }
 
             // Canonicalize so `_source.path` matches the LSP-derived
@@ -356,9 +363,7 @@ pub fn parse_into_conn(
             // misses, every `_lsp_refs.referrer_node_id` is NULL
             // (be6136). Fall back to the original path if canonicalize
             // fails (e.g. broken symlink), preserving prior behavior.
-            let canon = abs_path
-                .canonicalize()
-                .unwrap_or_else(|_| abs_path.clone());
+            let canon = abs_path.canonicalize().unwrap_or_else(|_| abs_path.clone());
             let abs_str = canon.to_string_lossy().to_string();
             parse_file_pure(&content, *lang, rel, &abs_str, *file_mtime, *file_size)
         })
@@ -394,15 +399,12 @@ pub fn parse_into_conn(
     let mut stmt_source = conn.prepare_cached(
         "INSERT OR REPLACE INTO _source (id, language, path) VALUES (?1, ?2, ?3)",
     )?;
-    let mut stmt_ref = conn.prepare_cached(
-        "INSERT INTO node_refs (token, node_id, source_id) VALUES (?1, ?2, ?3)",
-    )?;
-    let mut stmt_def = conn.prepare_cached(
-        "INSERT INTO node_defs (token, node_id, source_id) VALUES (?1, ?2, ?3)",
-    )?;
-    let mut stmt_import = conn.prepare_cached(
-        "INSERT INTO _imports (alias, path, source_id) VALUES (?1, ?2, ?3)",
-    )?;
+    let mut stmt_ref = conn
+        .prepare_cached("INSERT INTO node_refs (token, node_id, source_id) VALUES (?1, ?2, ?3)")?;
+    let mut stmt_def = conn
+        .prepare_cached("INSERT INTO node_defs (token, node_id, source_id) VALUES (?1, ?2, ?3)")?;
+    let mut stmt_import =
+        conn.prepare_cached("INSERT INTO _imports (alias, path, source_id) VALUES (?1, ?2, ?3)")?;
     let mut stmt_file_idx = conn.prepare_cached(
         "INSERT OR REPLACE INTO _file_index (path, mtime, size) VALUES (?1, ?2, ?3)",
     )?;
@@ -432,15 +434,27 @@ pub fn parse_into_conn(
 
                 for n in &pf.nodes {
                     stmt_node.execute(rusqlite::params![
-                        &n.id, &n.parent_id, &n.name, n.kind, n.size, mtime, &n.record
+                        &n.id,
+                        &n.parent_id,
+                        &n.name,
+                        n.kind,
+                        n.size,
+                        mtime,
+                        &n.record
                     ])?;
                 }
 
                 for a in &pf.ast_entries {
                     stmt_ast.execute(rusqlite::params![
-                        &a.node_id, &a.source_id, &a.node_kind,
-                        a.start_byte, a.end_byte, a.start_row, a.start_col,
-                        a.end_row, a.end_col
+                        &a.node_id,
+                        &a.source_id,
+                        &a.node_kind,
+                        a.start_byte,
+                        a.end_byte,
+                        a.start_row,
+                        a.start_col,
+                        a.end_row,
+                        a.end_col
                     ])?;
 
                     // T8.3 capnp dual-write for the AstNode.
@@ -451,13 +465,25 @@ pub fn parse_into_conn(
 
                 for r in &pf.refs {
                     match r {
-                        ExtractedRef::Ref { token, node_id, source_id } => {
+                        ExtractedRef::Ref {
+                            token,
+                            node_id,
+                            source_id,
+                        } => {
                             stmt_ref.execute(rusqlite::params![token, node_id, source_id])?;
                         }
-                        ExtractedRef::Def { token, node_id, source_id } => {
+                        ExtractedRef::Def {
+                            token,
+                            node_id,
+                            source_id,
+                        } => {
                             stmt_def.execute(rusqlite::params![token, node_id, source_id])?;
                         }
-                        ExtractedRef::Import { alias, path, source_id } => {
+                        ExtractedRef::Import {
+                            alias,
+                            path,
+                            source_id,
+                        } => {
                             stmt_import.execute(rusqlite::params![alias, path, source_id])?;
                         }
                     }
@@ -501,7 +527,9 @@ pub fn parse_into_conn(
 
     // ---- Metadata ----
 
-    let source_abs = source.canonicalize().unwrap_or_else(|_| source.to_path_buf());
+    let source_abs = source
+        .canonicalize()
+        .unwrap_or_else(|_| source.to_path_buf());
     set_meta(conn, "source_root", &source_abs.to_string_lossy())?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -554,17 +582,23 @@ pub fn parse_into_conn(
 /// exist in this run are simply skipped (their absence contributes
 /// nothing to the hash) — keeps the chain meaningful when binding
 /// dual-write hasn't run yet (e.g. parse-only without enrichment).
-const SEGMENT_FILE_SUFFIXES: &[&str] = &[
-    "source.capnp",
-    "ast.capnp",
-    "bindings.capnp",
-];
+const SEGMENT_FILE_SUFFIXES: &[&str] = &["source.capnp", "ast.capnp", "bindings.capnp"];
 
-/// T8.5: hash the run's capnp segment files in canonical order.
-/// Returns `(rootHash, totalBytes)`. Empty input (no segment files
-/// exist yet — `:memory:` parse) returns the BLAKE3 of empty bytes,
-/// which is the same as the daemon's `Controller::current_root`
-/// sentinel for "no segment yet."
+/// T8.5+RTFM: hash the run's capnp segment files in canonical order
+/// over **canonical bytes** (segment-table prefix stripped per the
+/// canonical-encoding spec, bullet 2: *"the segment table shall not
+/// be included"*). Returns `(rootHash, totalCanonicalBytes)`.
+///
+/// Hashing canonical bytes (not raw on-disk bytes) gives Σ root
+/// **byte-stability across additive schema changes**: appending a
+/// field at `@N` with default value does not change the canonical
+/// encoding for instances that don't set it (encoding spec, bullet 3).
+/// IPLD/ATproto precedent: the CID is the version. Schema evolution
+/// is handled at the typed-reading level, not by versioning the wire.
+///
+/// Defensive on read: even if a producer wrote non-canonical bytes
+/// (legacy file, runtime bug), the message reader's `canonicalize()`
+/// re-normalizes before hashing — so the chain stays deterministic.
 fn hash_segment_files(db_path: &Path) -> Result<([u8; 32], u64)> {
     let mut hasher = blake3::Hasher::new();
     let mut total: u64 = 0;
@@ -573,10 +607,22 @@ fn hash_segment_files(db_path: &Path) -> Result<([u8; 32], u64)> {
         if !p.exists() {
             continue;
         }
-        let bytes = std::fs::read(&p)
+        let file_bytes = std::fs::read(&p)
             .with_context(|| format!("read segment {}", p.display()))?;
-        total = total.saturating_add(bytes.len() as u64);
-        hasher.update(&bytes);
+        let mut slice: &[u8] = &file_bytes;
+        while !slice.is_empty() {
+            let msg = capnp::serialize::read_message(
+                &mut slice,
+                capnp::message::ReaderOptions::new(),
+            )
+            .with_context(|| format!("parse segment {}", p.display()))?;
+            let canonical_words = msg
+                .canonicalize()
+                .with_context(|| format!("canonicalize segment {}", p.display()))?;
+            let canonical_bytes = capnp::Word::words_to_bytes(&canonical_words);
+            total = total.saturating_add(canonical_bytes.len() as u64);
+            hasher.update(canonical_bytes);
+        }
     }
     Ok((*hasher.finalize().as_bytes(), total))
 }
@@ -593,10 +639,8 @@ fn read_head_for_chain(head_path: &Path) -> ([u8; 32], u64) {
         Err(_) => return ([0u8; 32], 1),
     };
     let mut slice: &[u8] = &bytes;
-    let msg = match capnp::serialize::read_message(
-        &mut slice,
-        capnp::message::ReaderOptions::new(),
-    ) {
+    let msg = match capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new())
+    {
         Ok(m) => m,
         Err(_) => return ([0u8; 32], 1),
     };
@@ -636,22 +680,25 @@ fn write_head_after_parse(conn: &Connection) -> Result<()> {
     let (parent, generation) = read_head_for_chain(&head_path);
 
     use leyline_schema_capnp::head_capnp::head;
-    let mut msg = capnp::message::Builder::new_default();
+    let mut src = capnp::message::Builder::new_default();
     {
-        let mut h: head::Builder = msg.init_root();
+        let mut h: head::Builder = src.init_root();
         h.set_generation(generation);
         h.set_segment_bytes(segment_bytes);
         h.reborrow().init_root_hash().set_bytes(&root);
         h.reborrow().init_parent_hash().set_bytes(&parent);
     }
+    let mut canonical = capnp::message::Builder::new_default();
+    canonical
+        .set_root_canonical(src.get_root_as_reader::<head::Reader>()?)
+        .context("canonicalize Head")?;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .open(&head_path)
         .with_context(|| format!("open head {}", head_path.display()))?;
-    capnp::serialize::write_message(&mut f, &msg)
-        .context("write Head capnp record")?;
+    capnp::serialize::write_message(&mut f, &canonical).context("write Head capnp record")?;
     Ok(())
 }
 
@@ -665,9 +712,7 @@ fn write_head_after_parse(conn: &Connection) -> Result<()> {
 /// rewrites these files — they're snapshots of `_ast` and `_source`,
 /// not append-only event logs (the binding log in T8.2 is append-only
 /// because LSP enrichment calls accumulate; parse is a single pass).
-fn sibling_snapshot_writers(
-    conn: &Connection,
-) -> (Option<std::fs::File>, Option<std::fs::File>) {
+fn sibling_snapshot_writers(conn: &Connection) -> (Option<std::fs::File>, Option<std::fs::File>) {
     let row: rusqlite::Result<String> = conn.query_row(
         "SELECT file FROM pragma_database_list WHERE name = 'main' LIMIT 1",
         [],
@@ -703,7 +748,12 @@ fn with_extension(p: &Path, ext: &str) -> std::path::PathBuf {
 }
 
 /// T8.3: serialize a single `SourceFile` capnp message and append it
-/// to the source-snapshot file.
+/// to the source-snapshot file. Per the post-RTFM canonical-encoding
+/// commitment in ADR-0014, the producer writes via
+/// `set_root_canonical` so the on-disk bytes are byte-stable across
+/// additive schema changes (encoding spec bullet 3:
+/// *"adding a new field to a struct does not affect the canonical
+/// encoding of messages that do not set that field"*).
 fn write_source_file_record(
     writer: &mut std::fs::File,
     id: &str,
@@ -714,9 +764,9 @@ fn write_source_file_record(
 ) -> Result<()> {
     use leyline_schema_capnp::source_capnp::source_file;
 
-    let mut msg = capnp::message::Builder::new_default();
+    let mut src = capnp::message::Builder::new_default();
     {
-        let mut sf: source_file::Builder = msg.init_root();
+        let mut sf: source_file::Builder = src.init_root();
         sf.set_id(id);
         sf.set_language(language);
         sf.set_canonical_path(canonical_path);
@@ -725,18 +775,24 @@ fn write_source_file_record(
         // contentHash left empty for now — T8.5 wires BLAKE3.
         let _hash = sf.init_content_hash();
     }
-    capnp::serialize::write_message(writer, &msg)
+
+    let mut canonical = capnp::message::Builder::new_default();
+    canonical
+        .set_root_canonical(src.get_root_as_reader::<source_file::Reader>()?)
+        .context("canonicalize SourceFile")?;
+    capnp::serialize::write_message(writer, &canonical)
         .context("write SourceFile capnp record")?;
     Ok(())
 }
 
-/// T8.3: serialize a single `AstNode` capnp message.
+/// T8.3: serialize a single `AstNode` capnp message — canonical form
+/// per the ADR-0014 producer commitment (see write_source_file_record).
 fn write_ast_node_record(writer: &mut std::fs::File, a: &AstEntry) -> Result<()> {
     use leyline_schema_capnp::ast_capnp::ast_node;
 
-    let mut msg = capnp::message::Builder::new_default();
+    let mut src = capnp::message::Builder::new_default();
     {
-        let mut node: ast_node::Builder = msg.init_root();
+        let mut node: ast_node::Builder = src.init_root();
         node.set_node_id(&a.node_id);
         node.set_source_id(&a.source_id);
         node.set_node_kind(&a.node_kind);
@@ -754,7 +810,12 @@ fn write_ast_node_record(writer: &mut std::fs::File, a: &AstEntry) -> Result<()>
             e.set_byte(a.end_byte as u64);
         }
     }
-    capnp::serialize::write_message(writer, &msg)
+
+    let mut canonical = capnp::message::Builder::new_default();
+    canonical
+        .set_root_canonical(src.get_root_as_reader::<ast_node::Reader>()?)
+        .context("canonicalize AstNode")?;
+    capnp::serialize::write_message(writer, &canonical)
         .context("write AstNode capnp record")?;
     Ok(())
 }
@@ -825,8 +886,14 @@ fn parse_file_pure(
     // Walk AST.
     let mut cursor = root.walk();
     walk_children_pure(
-        content, &mut cursor, source_id, source_id, language,
-        &mut nodes, &mut ast_entries, &mut refs,
+        content,
+        &mut cursor,
+        source_id,
+        source_id,
+        language,
+        &mut nodes,
+        &mut ast_entries,
+        &mut refs,
     );
 
     Ok(ParsedFile {
@@ -933,8 +1000,14 @@ fn walk_children_pure(
             });
             let mut sub_cursor = child.walk();
             walk_children_pure(
-                content, &mut sub_cursor, &id, source_id, language,
-                nodes, ast_entries, refs,
+                content,
+                &mut sub_cursor,
+                &id,
+                source_id,
+                language,
+                nodes,
+                ast_entries,
+                refs,
             );
         } else {
             let text = child.utf8_text(content).unwrap_or("");
@@ -1018,8 +1091,7 @@ pub(crate) fn is_bloat_dir(name: &str) -> bool {
 /// `is_bloat_dir`. See `tests::collect_files_skips_known_bloat_dirs`
 /// for the skip-list pin.
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    let entries =
-        std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))?;
+    let entries = std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))?;
 
     for entry in entries {
         let entry = entry?;
@@ -1066,8 +1138,8 @@ mod tests {
         let bloat_names = [
             ".git",
             ".cache",
-            ".venv",        // dot-prefix
-            ".pytest_cache",// dot-prefix
+            ".venv",         // dot-prefix
+            ".pytest_cache", // dot-prefix
             "node_modules",
             "vendor",
             "target",
@@ -1110,14 +1182,14 @@ mod tests {
             "internal",
             "cmd",
             "tests",
-            "vendored_data", // contains "vendor"
-            "subtarget",     // contains "target"
-            "venvironment",  // contains "venv"
+            "vendored_data",       // contains "vendor"
+            "subtarget",           // contains "target"
+            "venvironment",        // contains "venv"
             "node_modules_helper", // contains "node_modules"
-            "__init__.py",   // begins with __ but is not __pycache__/__pypackages__
-            "_internal",     // begins with _ but not __
-            "build",         // intentionally NOT in skip-list (often source)
-            "dist",          // intentionally NOT in skip-list (often source)
+            "__init__.py",         // begins with __ but is not __pycache__/__pypackages__
+            "_internal",           // begins with _ but not __
+            "build",               // intentionally NOT in skip-list (often source)
+            "dist",                // intentionally NOT in skip-list (often source)
         ] {
             assert!(
                 !is_bloat_dir(name),
@@ -1221,7 +1293,10 @@ mod tests {
         let ast_log = with_extension(&db_path, "ast.capnp");
         let source_log = with_extension(&db_path, "source.capnp");
         assert!(ast_log.exists(), "T8.3: ast.capnp snapshot must exist");
-        assert!(source_log.exists(), "T8.3: source.capnp snapshot must exist");
+        assert!(
+            source_log.exists(),
+            "T8.3: source.capnp snapshot must exist"
+        );
 
         // Read SourceFile snapshot — should have one record matching
         // the fixture file. Iterate to EOF (capnp messages back-to-
@@ -1230,11 +1305,9 @@ mod tests {
         let mut sf_count = 0;
         let mut saw_main_go = false;
         while !bytes.is_empty() {
-            let msg = capnp::serialize::read_message(
-                &mut bytes,
-                capnp::message::ReaderOptions::new(),
-            )
-            .unwrap();
+            let msg =
+                capnp::serialize::read_message(&mut bytes, capnp::message::ReaderOptions::new())
+                    .unwrap();
             let sf: source_file::Reader = msg.get_root().unwrap();
             sf_count += 1;
             if sf.get_id().unwrap().to_str().unwrap() == "main.go" {
@@ -1267,11 +1340,9 @@ mod tests {
         let mut ast_count = 0;
         let mut saw_function_kind = false;
         while !bytes.is_empty() {
-            let msg = capnp::serialize::read_message(
-                &mut bytes,
-                capnp::message::ReaderOptions::new(),
-            )
-            .unwrap();
+            let msg =
+                capnp::serialize::read_message(&mut bytes, capnp::message::ReaderOptions::new())
+                    .unwrap();
             let node: ast_node::Reader = msg.get_root().unwrap();
             ast_count += 1;
             if node.get_node_kind().unwrap().to_str().unwrap() == "function_declaration" {
@@ -1312,17 +1383,27 @@ mod tests {
         }
         let bytes = std::fs::read(&head_path).unwrap();
         let mut slice: &[u8] = &bytes;
-        let msg = capnp::serialize::read_message(
-            &mut slice,
-            capnp::message::ReaderOptions::new(),
-        )
-        .unwrap();
+        let msg = capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new())
+            .unwrap();
         let h: head::Reader = msg.get_root().unwrap();
-        let run1_root: [u8; 32] = h.get_root_hash().unwrap().get_bytes().unwrap()
-            .try_into().unwrap();
-        let run1_parent: [u8; 32] = h.get_parent_hash().unwrap().get_bytes().unwrap()
-            .try_into().unwrap();
-        assert_eq!(run1_parent, [0u8; 32], "T8.5: first parse parent must be zero");
+        let run1_root: [u8; 32] = h
+            .get_root_hash()
+            .unwrap()
+            .get_bytes()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let run1_parent: [u8; 32] = h
+            .get_parent_hash()
+            .unwrap()
+            .get_bytes()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            run1_parent, [0u8; 32],
+            "T8.5: first parse parent must be zero"
+        );
         assert_eq!(h.get_generation(), 1, "T8.5: first parse gen == 1");
         assert_ne!(run1_root, [0u8; 32], "T8.5: rootHash must be non-zero");
 
@@ -1334,11 +1415,78 @@ mod tests {
         );
 
         // Run 2 — modify the file so the segment changes.
-        std::fs::write(src.join("a.go"), b"package m\n\nfunc Foo() {}\nfunc Bar() {}\n").unwrap();
+        std::fs::write(
+            src.join("a.go"),
+            b"package m\n\nfunc Foo() {}\nfunc Bar() {}\n",
+        )
+        .unwrap();
         {
             let conn = Connection::open(&db_path).unwrap();
             parse_into_conn(&conn, &src, None, None).unwrap();
         }
+        let bytes = std::fs::read(&head_path).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let msg = capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new())
+            .unwrap();
+        let h: head::Reader = msg.get_root().unwrap();
+        let run2_root: [u8; 32] = h
+            .get_root_hash()
+            .unwrap()
+            .get_bytes()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let run2_parent: [u8; 32] = h
+            .get_parent_hash()
+            .unwrap()
+            .get_bytes()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            run2_parent, run1_root,
+            "T8.5: run2 parentHash must == run1 rootHash (chain invariant)",
+        );
+        assert_eq!(h.get_generation(), 2, "T8.5: gen monotonically increments");
+        assert_ne!(
+            run2_root, run1_root,
+            "rootHash differs because segment changed"
+        );
+    }
+
+    /// T8 canonical-encoding (post-RTFM, ADR-0014): hashing the same
+    /// run's segment files must yield the same `rootHash` regardless
+    /// of whether the producer wrote canonical or non-canonical bytes,
+    /// because `hash_segment_files` re-canonicalizes on read. Also
+    /// pins the structural property: a fresh head.capnp's `rootHash`
+    /// equals an independent `hash_segment_files()` call against the
+    /// same db. Pin guards the byte-stability invariant the math-
+    /// friend's analysis and the RTFM dossier both flag as load-
+    /// bearing.
+    #[test]
+    fn segment_hash_is_canonical_byte_stable() {
+        let td = TempDir::new().unwrap();
+        let src = td.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("a.go"), b"package m\n\nfunc Foo() {}\n").unwrap();
+        let db_path = td.path().join("out.db");
+
+        let conn = Connection::open(&db_path).unwrap();
+        parse_into_conn(&conn, &src, None, None).unwrap();
+        drop(conn);
+
+        let (h1, total1) = hash_segment_files(&db_path).unwrap();
+        let (h2, total2) = hash_segment_files(&db_path).unwrap();
+        assert_eq!(h1, h2, "hash_segment_files must be deterministic");
+        assert_eq!(total1, total2, "canonical-byte total must be deterministic");
+        assert_ne!(h1, [0u8; 32], "non-zero rootHash with real data");
+
+        // Read the head.capnp written by parse_into_conn; assert it
+        // matches the independent hash. This is the consumer-verifiability
+        // property: a third party can validate Σ root by re-hashing the
+        // segments themselves, not by trusting the producer.
+        use leyline_schema_capnp::head_capnp::head;
+        let head_path = with_extension(&db_path, "head.capnp");
         let bytes = std::fs::read(&head_path).unwrap();
         let mut slice: &[u8] = &bytes;
         let msg = capnp::serialize::read_message(
@@ -1347,16 +1495,25 @@ mod tests {
         )
         .unwrap();
         let h: head::Reader = msg.get_root().unwrap();
-        let run2_root: [u8; 32] = h.get_root_hash().unwrap().get_bytes().unwrap()
-            .try_into().unwrap();
-        let run2_parent: [u8; 32] = h.get_parent_hash().unwrap().get_bytes().unwrap()
+        let stored: [u8; 32] = h.get_root_hash().unwrap().get_bytes().unwrap()
             .try_into().unwrap();
         assert_eq!(
-            run2_parent, run1_root,
-            "T8.5: run2 parentHash must == run1 rootHash (chain invariant)",
+            stored, h1,
+            "Head.rootHash must equal independent canonical hash of segments",
         );
-        assert_eq!(h.get_generation(), 2, "T8.5: gen monotonically increments");
-        assert_ne!(run2_root, run1_root, "rootHash differs because segment changed");
+
+        // Pin: total canonical bytes is non-zero AND strictly less than
+        // raw file bytes (canonical form strips segment-table prefixes).
+        let raw_total: u64 = SEGMENT_FILE_SUFFIXES
+            .iter()
+            .map(|s| {
+                std::fs::metadata(with_extension(&db_path, s))
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+            })
+            .sum();
+        assert!(total1 < raw_total,
+            "canonical bytes ({total1}) must be < raw bytes ({raw_total}) — segment table stripped");
     }
 
     /// T8.3: `:memory:` connections must NOT attempt the capnp dual-
@@ -1375,8 +1532,7 @@ mod tests {
 
         // No files should have been written into the cwd or temp dir.
         assert!(
-            !td.path().join(".ast.capnp").exists()
-                && !td.path().join(".source.capnp").exists(),
+            !td.path().join(".ast.capnp").exists() && !td.path().join(".source.capnp").exists(),
             "T8.3: :memory: parse must not produce capnp snapshots",
         );
     }

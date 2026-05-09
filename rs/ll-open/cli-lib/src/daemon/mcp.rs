@@ -24,14 +24,14 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::{
+    Router,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::post,
-    Router,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::DaemonContext;
 
@@ -237,14 +237,23 @@ struct JsonRpcError {
 
 impl JsonRpcResponse {
     fn ok(id: Option<Value>, result: Value) -> Self {
-        Self { jsonrpc: "2.0", id, result: Some(result), error: None }
+        Self {
+            jsonrpc: "2.0",
+            id,
+            result: Some(result),
+            error: None,
+        }
     }
     fn err(id: Option<Value>, code: i32, message: impl Into<String>) -> Self {
         Self {
             jsonrpc: "2.0",
             id,
             result: None,
-            error: Some(JsonRpcError { code, message: message.into(), data: None }),
+            error: Some(JsonRpcError {
+                code,
+                message: message.into(),
+                data: None,
+            }),
         }
     }
 }
@@ -261,13 +270,13 @@ pub fn spawn(ctx: Arc<DaemonContext>, port: u16) -> Result<tokio::task::JoinHand
         .with_state(ctx);
 
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse()?;
-    let std_listener = std::net::TcpListener::bind(addr)
-        .with_context(|| format!("bind MCP HTTP on {addr}"))?;
+    let std_listener =
+        std::net::TcpListener::bind(addr).with_context(|| format!("bind MCP HTTP on {addr}"))?;
     std_listener
         .set_nonblocking(true)
         .context("set TCP listener non-blocking")?;
-    let listener = tokio::net::TcpListener::from_std(std_listener)
-        .context("convert TCP listener")?;
+    let listener =
+        tokio::net::TcpListener::from_std(std_listener).context("convert TCP listener")?;
 
     eprintln!("MCP HTTP server listening on http://{addr}/mcp");
 
@@ -284,10 +293,7 @@ pub fn spawn(ctx: Arc<DaemonContext>, port: u16) -> Result<tokio::task::JoinHand
 // ---------------------------------------------------------------------------
 
 /// `POST /mcp` — JSON-RPC requests.
-async fn handle_post(
-    State(ctx): State<Arc<DaemonContext>>,
-    body: String,
-) -> Response {
+async fn handle_post(State(ctx): State<Arc<DaemonContext>>, body: String) -> Response {
     let request: JsonRpcRequest = match serde_json::from_str(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -358,7 +364,11 @@ fn handle_tools_list(id: Value) -> JsonRpcResponse {
 
 /// `tools/call` — translate `{ name, arguments }` into the daemon's existing
 /// op shape and dispatch through `handle_base_op`.
-fn handle_tools_call(ctx: &std::sync::Arc<DaemonContext>, id: Value, params: &Value) -> JsonRpcResponse {
+fn handle_tools_call(
+    ctx: &std::sync::Arc<DaemonContext>,
+    id: Value,
+    params: &Value,
+) -> JsonRpcResponse {
     let Some(name) = params.get("name").and_then(|v| v.as_str()) else {
         return JsonRpcResponse::err(Some(id), -32602, "missing `name` in params");
     };
@@ -380,11 +390,7 @@ fn handle_tools_call(ctx: &std::sync::Arc<DaemonContext>, id: Value, params: &Va
     }
 
     let Some(response) = super::ops::handle_base_op(ctx, name, &req) else {
-        return JsonRpcResponse::err(
-            Some(id),
-            -32601,
-            format!("unknown tool: {name}"),
-        );
+        return JsonRpcResponse::err(Some(id), -32601, format!("unknown tool: {name}"));
     };
 
     // `handle_base_op` returns an already-serialized JSON string. MCP tool
@@ -438,7 +444,10 @@ mod tests {
         assert!(ok_obj.contains_key("jsonrpc"));
         assert!(ok_obj.contains_key("id"));
         assert!(ok_obj.contains_key("result"));
-        assert!(!ok_obj.contains_key("error"), "ok response must not include error field");
+        assert!(
+            !ok_obj.contains_key("error"),
+            "ok response must not include error field"
+        );
 
         let err = JsonRpcResponse::err(Some(serde_json::json!(2)), -32601, "method not found");
         let err_json = serde_json::to_value(&err).unwrap();
@@ -446,13 +455,19 @@ mod tests {
         assert!(err_obj.contains_key("jsonrpc"));
         assert!(err_obj.contains_key("id"));
         assert!(err_obj.contains_key("error"));
-        assert!(!err_obj.contains_key("result"), "err response must not include result field");
+        assert!(
+            !err_obj.contains_key("result"),
+            "err response must not include result field"
+        );
 
         // JsonRpcError: data field skipped when None.
         let err_inner = err_obj.get("error").and_then(|v| v.as_object()).unwrap();
         assert!(err_inner.contains_key("code"));
         assert!(err_inner.contains_key("message"));
-        assert!(!err_inner.contains_key("data"), "data field must skip when None");
+        assert!(
+            !err_inner.contains_key("data"),
+            "data field must skip when None"
+        );
     }
 
     #[test]
@@ -482,7 +497,10 @@ mod tests {
     #[test]
     fn registry_is_non_empty_and_unique() {
         let tools = tool_registry();
-        assert!(!tools.is_empty(), "registry should expose at least one tool");
+        assert!(
+            !tools.is_empty(),
+            "registry should expose at least one tool"
+        );
         let mut seen = std::collections::HashSet::new();
         for t in &tools {
             assert!(
@@ -497,7 +515,13 @@ mod tests {
     fn registry_includes_lsp_ops() {
         let names: std::collections::HashSet<&str> =
             tool_registry().into_iter().map(|t| t.name).collect();
-        for op in ["lsp_hover", "lsp_defs", "lsp_refs", "lsp_symbols", "lsp_diagnostics"] {
+        for op in [
+            "lsp_hover",
+            "lsp_defs",
+            "lsp_refs",
+            "lsp_symbols",
+            "lsp_diagnostics",
+        ] {
             assert!(names.contains(op), "missing LSP tool: {op}");
         }
     }

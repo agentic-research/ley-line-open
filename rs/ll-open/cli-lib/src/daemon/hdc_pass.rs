@@ -10,8 +10,8 @@
 
 use tree_sitter::{Language, Node, Parser};
 
-use leyline_hdc::canonical::CanonicalKindMap;
 use leyline_hdc::EncoderNode;
+use leyline_hdc::canonical::CanonicalKindMap;
 
 /// Walk a tree-sitter Node, producing an `EncoderNode` tree. Only named
 /// children contribute (matching the Deckard production-signature
@@ -89,7 +89,7 @@ mod tests {
     use leyline_hdc::canonical::{CanonicalKind, GoCanonicalMap};
     use leyline_hdc::codebook::AstCodebook;
     use leyline_hdc::util::bucket_arity;
-    use leyline_hdc::{encode_fresh, popcount_distance, Hypervector, D_BYTES};
+    use leyline_hdc::{D_BYTES, Hypervector, encode_fresh, popcount_distance};
 
     fn parse_go(src: &str) -> EncoderNode {
         // tree-sitter-go is exposed via leyline-ts's TsLanguage::Go.
@@ -138,7 +138,10 @@ mod tests {
         let result = parse_and_encode_tree("", &lang, &GoCanonicalMap);
         let tree = result.expect("empty Go source must parse to Some");
         assert_eq!(tree.canonical_kind, CanonicalKind::Block);
-        assert!(tree.children.is_empty(), "empty source must yield no named children");
+        assert!(
+            tree.children.is_empty(),
+            "empty source must yield no named children"
+        );
     }
 
     #[test]
@@ -163,10 +166,7 @@ mod tests {
         let func = tree
             .children
             .iter()
-            .find(|c| {
-                c.canonical_kind == CanonicalKind::Decl
-                    && c.children.len() >= 2
-            })
+            .find(|c| c.canonical_kind == CanonicalKind::Decl && c.children.len() >= 2)
             .expect("expected a Decl with named children");
         // Just 2 named children: identifier (Ref) + parameter_list +
         // block. tree-sitter-go's parameter_list has no canonical map
@@ -305,11 +305,11 @@ mod tests {
         // The other validation-only items stay inline — they're not
         // used by sibling tests, so keeping them scoped to this
         // function communicates "validation gate's deps".
+        use leyline_hdc::LayerKind;
         use leyline_hdc::calibrate::{calibrate_and_persist, load_baseline};
         use leyline_hdc::query::{density_count, radius_search};
         use leyline_hdc::schema::create_hdc_schema;
         use leyline_hdc::sql_udf::register_hdc_udfs;
-        use leyline_hdc::LayerKind;
         use rusqlite::Connection;
 
         // Three clone classes that span the spectrum HDC is designed
@@ -412,8 +412,7 @@ mod tests {
         // at 0. Pin that the encoder has at least SOME structural
         // discrimination across the 3 families: the union of all 15
         // hypervectors must contain >= 3 distinct values.
-        let all_hvs: Vec<&Hypervector> =
-            hvs_by_group.values().flat_map(|v| v.iter()).collect();
+        let all_hvs: Vec<&Hypervector> = hvs_by_group.values().flat_map(|v| v.iter()).collect();
         let unique_total: std::collections::HashSet<&Hypervector> =
             all_hvs.iter().copied().collect();
         assert!(
@@ -523,7 +522,9 @@ mod tests {
             let probe_hv = encode_go(&group.sources[0], &cb);
             let matches = radius_search(&conn, LayerKind::Ast, &probe_hv, r, 100).unwrap();
             assert!(
-                matches.iter().any(|m| m.scope_id == probe_scope && m.distance == 0),
+                matches
+                    .iter()
+                    .any(|m| m.scope_id == probe_scope && m.distance == 0),
                 "group {}: probe must match itself at distance 0",
                 group.name,
             );
@@ -619,7 +620,8 @@ mod tests {
         let src_a_prime = "package m\n\nfunc Foo(y int) int { return y + 42 }\n";
 
         // B: different shape — conditional, multiple statements, no params.
-        let src_b = "package m\n\nfunc Run() { if true { println(\"a\") } else { println(\"b\") } }\n";
+        let src_b =
+            "package m\n\nfunc Run() { if true { println(\"a\") } else { println(\"b\") } }\n";
 
         // C: yet another shape — for loop.
         let src_c = "package m\n\nfunc Loop() { for i := 0; i < 10; i++ { println(i) } }\n";

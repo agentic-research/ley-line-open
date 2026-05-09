@@ -14,9 +14,7 @@ use anyhow::{Context, Result};
 use leyline_fs::graph::HotSwapGraph;
 
 use crate::cmd_serve;
-use crate::daemon::{
-    DaemonContext, DaemonExt, DaemonPhase, DaemonState, EventRouter, NoExt,
-};
+use crate::daemon::{DaemonContext, DaemonExt, DaemonPhase, DaemonState, EventRouter, NoExt};
 
 // ---------------------------------------------------------------------------
 // Tuning constants — extracted from the daemon orchestration so each magic
@@ -175,11 +173,11 @@ pub async fn run_daemon(
     // is provided by the extension (or defaults to ZeroEmbedder), and the
     // index is sized to match its dimensions.
     #[cfg(feature = "vec")]
-    let embedder: Arc<dyn crate::daemon::embed::Embedder> = ext
-        .embedder()
-        .unwrap_or_else(|| Arc::new(crate::daemon::embed::ZeroEmbedder {
+    let embedder: Arc<dyn crate::daemon::embed::Embedder> = ext.embedder().unwrap_or_else(|| {
+        Arc::new(crate::daemon::embed::ZeroEmbedder {
             dim: DEFAULT_EMBEDDING_DIM,
-        }));
+        })
+    });
     #[cfg(feature = "vec")]
     let vec_index = {
         crate::daemon::vec_index::register_vec();
@@ -202,9 +200,8 @@ pub async fn run_daemon(
         source_dir: source.map(|p| p.to_path_buf()),
         lang_filter: language.map(|s| s.to_string()),
         enrichment_passes: {
-            let mut passes: Vec<Box<dyn crate::daemon::enrichment::EnrichmentPass>> = vec![
-                Box::new(crate::daemon::enrichment::TreeSitterPass),
-            ];
+            let mut passes: Vec<Box<dyn crate::daemon::enrichment::EnrichmentPass>> =
+                vec![Box::new(crate::daemon::enrichment::TreeSitterPass)];
             #[cfg(feature = "lsp")]
             passes.push(Box::new(crate::daemon::lsp_pass::LspEnrichmentPass::new()));
             #[cfg(feature = "vec")]
@@ -305,7 +302,11 @@ pub async fn run_daemon(
     let mut mache_child: Option<Child> = None;
     if let Ok(mache_bin) = which::which("mache") {
         let ctrl_str = ctrl_path.to_string_lossy().to_string();
-        eprintln!("spawning mache: {} serve --control {}", mache_bin.display(), ctrl_str);
+        eprintln!(
+            "spawning mache: {} serve --control {}",
+            mache_bin.display(),
+            ctrl_str
+        );
         match std::process::Command::new(&mache_bin)
             .args(["serve", "--control", &ctrl_str])
             .stdin(std::process::Stdio::null())
@@ -407,8 +408,7 @@ fn init_living_db(
 
     // Cold start: fresh :memory: connection.
     eprintln!("cold start");
-    let conn = rusqlite::Connection::open_in_memory()
-        .context("open :memory: connection")?;
+    let conn = rusqlite::Connection::open_in_memory().context("open :memory: connection")?;
 
     if let Some(source_dir) = source {
         run_initial_parse(&conn, source_dir, language, "parsing")?;
@@ -576,9 +576,7 @@ pub fn try_snapshot_or_log(
             // retry once — better to take a single hit than wedge the
             // snapshot timer permanently. Same recovery strategy as the
             // embed drainer (294fd6b).
-            log::error!(
-                "{label}: live_db mutex poisoned; recovering inner state",
-            );
+            log::error!("{label}: live_db mutex poisoned; recovering inner state",);
             let guard = poisoned.into_inner();
             if let Err(e) = snapshot_to_arena(&guard, ctrl_path) {
                 log::error!("{label}: post-recovery snapshot failed: {e:#}");
@@ -618,15 +616,13 @@ pub fn try_snapshot_or_log(
 ///    callers (snapshot_or_log) move the daemon into Error phase so
 ///    operators see it. Silently continuing is the original bug
 ///    described in ley-line-open-609d6a.
-pub fn snapshot_to_arena(
-    conn: &rusqlite::Connection,
-    ctrl_path: &Path,
-) -> Result<()> {
-    let db_bytes = conn.serialize(rusqlite::DatabaseName::Main)
+pub fn snapshot_to_arena(conn: &rusqlite::Connection, ctrl_path: &Path) -> Result<()> {
+    let db_bytes = conn
+        .serialize(rusqlite::DatabaseName::Main)
         .context("serialize living db")?;
 
-    let mut ctrl = leyline_core::Controller::open_or_create(ctrl_path)
-        .context("open controller")?;
+    let mut ctrl =
+        leyline_core::Controller::open_or_create(ctrl_path).context("open controller")?;
     let arena_path = ctrl.arena_path();
     let arena_size = ctrl.arena_size();
 
@@ -647,8 +643,8 @@ pub fn snapshot_to_arena(
 
     // Step 1: grow the file (no-op if new_size == arena_size). Must
     // precede advertisement — see ordering invariant 1.
-    let mut mmap = leyline_core::create_arena(Path::new(&arena_path), new_size)
-        .context("open arena file")?;
+    let mut mmap =
+        leyline_core::create_arena(Path::new(&arena_path), new_size).context("open arena file")?;
 
     // Step 2: advertise new size to controller, but keep OLD generation.
     // Fresh-opening readers see (arena_size = new_size, gen = old_gen);
@@ -668,8 +664,7 @@ pub fn snapshot_to_arena(
 
     // Step 3: write into the inactive buffer. ArenaHeader.active_buffer
     // is unchanged; old buffer remains the readable one until step 4.
-    leyline_core::write_to_arena(&mut mmap, &db_bytes)
-        .context("write to arena")?;
+    leyline_core::write_to_arena(&mut mmap, &db_bytes).context("write to arena")?;
 
     // Step 4: atomic publish — bump generation. Polling readers see
     // gen change, refresh, observe (new_size, new_gen, new active_buffer).
@@ -677,7 +672,10 @@ pub fn snapshot_to_arena(
     ctrl.set_arena(&arena_path, new_size, new_gen)
         .context("bump generation (publish snapshot)")?;
 
-    eprintln!("snapshot to arena (generation {new_gen}, {} bytes)", db_bytes.len());
+    eprintln!(
+        "snapshot to arena (generation {new_gen}, {} bytes)",
+        db_bytes.len()
+    );
     Ok(())
 }
 
@@ -788,8 +786,11 @@ async fn git_watch_loop(
         ctx.state.write().unwrap().phase = DaemonPhase::Parsing;
         let lang = ctx.lang_filter.as_deref();
         let dirty_vec: Vec<String> = last_dirty.iter().cloned().collect();
-        let scope: Option<&[String]> =
-            if dirty_vec.is_empty() { None } else { Some(dirty_vec.as_slice()) };
+        let scope: Option<&[String]> = if dirty_vec.is_empty() {
+            None
+        } else {
+            Some(dirty_vec.as_slice())
+        };
         let guard = ctx.live_db.lock().unwrap();
         match crate::cmd_parse::parse_into_conn(&guard, source_dir, lang, scope) {
             Ok(result) => {
@@ -857,7 +858,10 @@ fn git_dirty_files(dir: &Path) -> Result<std::collections::HashSet<String>> {
         .context("run git status")?;
 
     if !output.status.success() {
-        anyhow::bail!("git status failed: {}", String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     // --porcelain -z: NUL-separated entries, each starts with 2-char
@@ -968,7 +972,10 @@ mod tests {
         let _ = join.join(); // expect panic; ignore result
 
         // Sanity: lock is poisoned.
-        assert!(live_db.lock().is_err(), "pre-condition: lock should be poisoned");
+        assert!(
+            live_db.lock().is_err(),
+            "pre-condition: lock should be poisoned"
+        );
 
         // try_snapshot_or_log MUST recover and attempt the snapshot.
         // The snapshot itself will fail (no arena registered in this
@@ -1041,14 +1048,21 @@ mod tests {
             .unwrap();
         std::fs::write(dir.path().join("old.go"), b"package m").unwrap();
         std::process::Command::new("git")
-            .args(["-c", "user.email=t@t", "-c", "user.name=t",
-                   "add", "old.go"])
+            .args(["-c", "user.email=t@t", "-c", "user.name=t", "add", "old.go"])
             .current_dir(dir.path())
             .status()
             .unwrap();
         std::process::Command::new("git")
-            .args(["-c", "user.email=t@t", "-c", "user.name=t",
-                   "commit", "-m", "init", "-q"])
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "init",
+                "-q",
+            ])
             .current_dir(dir.path())
             .status()
             .unwrap();
@@ -1060,7 +1074,10 @@ mod tests {
             .unwrap();
 
         let dirty = git_dirty_files(dir.path()).unwrap();
-        assert!(dirty.contains("new.go"), "new path must be in dirty set, got {dirty:?}");
+        assert!(
+            dirty.contains("new.go"),
+            "new path must be in dirty set, got {dirty:?}"
+        );
         // The old path's removal is handled by _file_index diff
         // during reparse; the dirty set should NOT carry it (and
         // certainly not the truncated ".go" phantom).
@@ -1088,22 +1105,42 @@ mod tests {
         std::fs::write(dir.path().join("untracked.txt"), b"hello").unwrap();
         std::fs::write(dir.path().join("tracked.txt"), b"v1").unwrap();
         std::process::Command::new("git")
-            .args(["-c", "user.email=t@t", "-c", "user.name=t",
-                   "add", "tracked.txt"])
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "add",
+                "tracked.txt",
+            ])
             .current_dir(dir.path())
             .status()
             .unwrap();
         std::process::Command::new("git")
-            .args(["-c", "user.email=t@t", "-c", "user.name=t",
-                   "commit", "-q", "-m", "init"])
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ])
             .current_dir(dir.path())
             .status()
             .unwrap();
         std::fs::write(dir.path().join("tracked.txt"), b"v2").unwrap();
 
         let dirty = git_dirty_files(dir.path()).unwrap();
-        assert!(dirty.contains("untracked.txt"), "untracked file must be in dirty set");
-        assert!(dirty.contains("tracked.txt"), "modified tracked file must be in dirty set");
+        assert!(
+            dirty.contains("untracked.txt"),
+            "untracked file must be in dirty set"
+        );
+        assert!(
+            dirty.contains("tracked.txt"),
+            "modified tracked file must be in dirty set"
+        );
         // No phantom paths.
         assert_eq!(dirty.len(), 2, "exactly 2 dirty paths, got {dirty:?}");
     }
@@ -1126,14 +1163,26 @@ mod tests {
             .status()
             .unwrap();
         std::process::Command::new("git")
-            .args(["-c", "user.email=t@t", "-c", "user.name=t",
-                   "commit", "--allow-empty", "-q", "-m", "init"])
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "init",
+            ])
             .current_dir(dir.path())
             .status()
             .unwrap();
 
         let dirty = git_dirty_files(dir.path()).expect("clean repo must succeed");
-        assert!(dirty.is_empty(), "clean repo dirty set must be empty, got {dirty:?}");
+        assert!(
+            dirty.is_empty(),
+            "clean repo dirty set must be empty, got {dirty:?}"
+        );
     }
 
     #[test]
@@ -1218,7 +1267,10 @@ mod tests {
     fn fixture_repo() -> TempDir {
         let dir = TempDir::new().unwrap();
         sh(dir.path(), &["git", "init", "-q"]);
-        sh(dir.path(), &["git", "config", "user.email", "test@example.com"]);
+        sh(
+            dir.path(),
+            &["git", "config", "user.email", "test@example.com"],
+        );
         sh(dir.path(), &["git", "config", "user.name", "test"]);
         sh(dir.path(), &["git", "config", "commit.gpgsign", "false"]);
         std::fs::write(dir.path().join("a.go"), "package m\n\nfunc A() {}\n").unwrap();
@@ -1228,16 +1280,9 @@ mod tests {
     }
 
     /// Build a DaemonContext suitable for git_watch_loop testing.
-    fn test_ctx(
-        ctrl_path: &Path,
-        ext: Arc<dyn DaemonExt>,
-        source: &Path,
-    ) -> Arc<DaemonContext> {
-        let _ = leyline_core::create_arena(
-            &ctrl_path.with_extension("arena"),
-            2 * 1024 * 1024,
-        )
-        .unwrap();
+    fn test_ctx(ctrl_path: &Path, ext: Arc<dyn DaemonExt>, source: &Path) -> Arc<DaemonContext> {
+        let _ = leyline_core::create_arena(&ctrl_path.with_extension("arena"), 2 * 1024 * 1024)
+            .unwrap();
         let mut ctrl = leyline_core::Controller::open_or_create(ctrl_path).unwrap();
         ctrl.set_arena(
             ctrl_path.with_extension("arena").to_string_lossy().as_ref(),
@@ -1329,7 +1374,14 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
 
-        WatcherTestBed { repo, _dir: dir, _ctx: ctx, ext, events_rx, task }
+        WatcherTestBed {
+            repo,
+            _dir: dir,
+            _ctx: ctx,
+            ext,
+            events_rx,
+            task,
+        }
     }
 
     /// Wait up to 5s for the next event from a watcher subscription.
@@ -1355,8 +1407,11 @@ mod tests {
         let mut tb = start_watcher_test("daemon.files.changed").await;
 
         // Make the file dirty after the baseline tick.
-        std::fs::write(tb.repo.path().join("a.go"), "package m\n\nfunc A() { /* edit */ }\n")
-            .unwrap();
+        std::fs::write(
+            tb.repo.path().join("a.go"),
+            "package m\n\nfunc A() { /* edit */ }\n",
+        )
+        .unwrap();
 
         let saw_files_event = recv_event_within_5s(&mut tb.events_rx).await;
         tb.task.abort();

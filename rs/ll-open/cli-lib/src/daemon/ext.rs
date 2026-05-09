@@ -6,10 +6,10 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use super::enrichment::EnrichmentPass;
-use super::events::{EventEmitter, EventRouter};
 #[cfg(feature = "vec")]
 use super::embed::Embedder;
+use super::enrichment::EnrichmentPass;
+use super::events::{EventEmitter, EventRouter};
 
 /// Extension point for private daemon ops and lifecycle hooks.
 ///

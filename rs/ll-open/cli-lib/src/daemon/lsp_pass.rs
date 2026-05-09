@@ -84,7 +84,9 @@ const PASS_FILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5)
 /// — typical session uses 1-3 languages, ~hundreds of MB each, total
 /// well under 1GB. The OS reclaims spawned servers on daemon exit.
 pub struct LspEnrichmentPass {
-    pool: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, leyline_lsp::client::LspClient>>>,
+    pool: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::HashMap<String, leyline_lsp::client::LspClient>>,
+    >,
 }
 
 impl Default for LspEnrichmentPass {
@@ -117,7 +119,13 @@ impl EnrichmentPass for LspEnrichmentPass {
     }
 
     fn writes(&self) -> &[&str] {
-        &["_lsp", "_lsp_defs", "_lsp_refs", "_lsp_hover", "_lsp_completions"]
+        &[
+            "_lsp",
+            "_lsp_defs",
+            "_lsp_refs",
+            "_lsp_hover",
+            "_lsp_completions",
+        ]
     }
 
     fn run(
@@ -162,7 +170,10 @@ impl EnrichmentPass for LspEnrichmentPass {
             let (server_cmd, server_args) = match language_server(lang) {
                 Some(s) => s,
                 None => {
-                    eprintln!("lsp: no server for language '{lang}', skipping {} file(s)", lang_files.len());
+                    eprintln!(
+                        "lsp: no server for language '{lang}', skipping {} file(s)",
+                        lang_files.len()
+                    );
                     continue;
                 }
             };
@@ -250,15 +261,15 @@ fn collect_enrichment_targets(
             let rows = stmt.query_map(params.as_slice(), |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
         }
 
         // Huge scope → full scan + in-memory filter. Rare; typical dirty
         // sets are 1-10 files. Above 999 we'd need to chunk the IN clause,
         // which buys nothing over a single full scan + HashSet at this size.
         Some(rels) => {
-            let scope: std::collections::HashSet<&str> =
-                rels.iter().map(String::as_str).collect();
+            let scope: std::collections::HashSet<&str> = rels.iter().map(String::as_str).collect();
             let mut stmt = conn.prepare("SELECT id, language FROM _source")?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -279,7 +290,8 @@ fn collect_enrichment_targets(
             let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
         }
     }
 }
@@ -296,7 +308,9 @@ fn collect_enrichment_targets(
 #[allow(clippy::too_many_arguments)]
 async fn enrich_files_pooled(
     conn: &Connection,
-    pool: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, leyline_lsp::client::LspClient>>>,
+    pool: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::HashMap<String, leyline_lsp::client::LspClient>>,
+    >,
     server_cmd: &str,
     server_args: &[&str],
     root_uri: &str,
@@ -310,11 +324,10 @@ async fn enrich_files_pooled(
     let client = match pool_guard.get_mut(lang) {
         Some(c) => c,
         None => {
-            let new_client = leyline_lsp::client::LspClient::start(
-                server_cmd, server_args, root_uri,
-            )
-            .await
-            .with_context(|| format!("start {server_cmd} (pool insert)"))?;
+            let new_client =
+                leyline_lsp::client::LspClient::start(server_cmd, server_args, root_uri)
+                    .await
+                    .with_context(|| format!("start {server_cmd} (pool insert)"))?;
             pool_guard.entry(lang.to_string()).or_insert(new_client)
         }
     };
@@ -349,7 +362,13 @@ async fn enrich_files_with_client(
             }
         };
 
-        let file_uri = format!("file://{}", abs_path.canonicalize().unwrap_or(abs_path.clone()).display());
+        let file_uri = format!(
+            "file://{}",
+            abs_path
+                .canonicalize()
+                .unwrap_or(abs_path.clone())
+                .display()
+        );
 
         // Infer language ID from extension.
         let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -361,7 +380,9 @@ async fn enrich_files_with_client(
         // to the next one — the LSP client itself stays alive so a
         // single bad file doesn't poison the whole batch.
         let per_file = async {
-            client.open_file(&file_uri, language_id, &source_text).await?;
+            client
+                .open_file(&file_uri, language_id, &source_text)
+                .await?;
 
             // Poll for symbols (servers may need indexing time).
             let mut symbols = Vec::new();
@@ -460,7 +481,8 @@ mod tests {
             PASS_FILE_TIMEOUT > soft_max,
             "PASS_FILE_TIMEOUT ({:?}) must exceed soft poll max ({:?}) — \
              otherwise cold-start indexing trips the timeout on every file",
-            PASS_FILE_TIMEOUT, soft_max,
+            PASS_FILE_TIMEOUT,
+            soft_max,
         );
         // Pin the actual value too. A refactor that bumped this to
         // 5 minutes (effectively unbounded for an interactive
@@ -485,7 +507,13 @@ mod tests {
             "lsp",
             &["tree-sitter"],
             &["_source", "_ast", "nodes"],
-            &["_lsp", "_lsp_defs", "_lsp_refs", "_lsp_hover", "_lsp_completions"],
+            &[
+                "_lsp",
+                "_lsp_defs",
+                "_lsp_refs",
+                "_lsp_hover",
+                "_lsp_completions",
+            ],
         );
     }
 
@@ -583,7 +611,9 @@ mod tests {
         // syntax error.
         let conn = fresh_source_conn();
         let got = collect_enrichment_targets(&conn, Some(&[])).unwrap();
-        assert!(got.is_empty(), "empty scope must produce empty result, got {got:?}");
+        assert!(
+            got.is_empty(),
+            "empty scope must produce empty result, got {got:?}"
+        );
     }
 }
-

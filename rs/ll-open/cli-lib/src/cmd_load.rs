@@ -50,8 +50,7 @@ pub fn load_into_arena(control: &Path, db_bytes: &[u8]) -> Result<()> {
         buf_capacity,
     );
 
-    let mut mmap = create_arena(Path::new(&arena_path), arena_size)
-        .context("open arena file")?;
+    let mut mmap = create_arena(Path::new(&arena_path), arena_size).context("open arena file")?;
 
     write_to_arena(&mut mmap, db_bytes).context("write to arena")?;
 
@@ -79,8 +78,7 @@ mod tests {
         let ctrl_path = td.path().join("test.ctrl");
         // Create the controller without setting the arena.
         let _ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-        let err = load_into_arena(&ctrl_path, &[0u8; 16])
-            .expect_err("must error on no-arena-path");
+        let err = load_into_arena(&ctrl_path, &[0u8; 16]).expect_err("must error on no-arena-path");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("arena path") || msg.contains("set_arena"),
@@ -102,11 +100,12 @@ mod tests {
         let arena_size = 4 * 1024; // 4 KB total → ~2 KB per buffer
         let _mmap = leyline_core::create_arena(&arena_path, arena_size).unwrap();
         let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-        ctrl.set_arena(&arena_path.to_string_lossy(), arena_size, 0).unwrap();
+        ctrl.set_arena(&arena_path.to_string_lossy(), arena_size, 0)
+            .unwrap();
         // Attempt to load 16 KB into ~2 KB buffer capacity.
         let too_big = vec![0u8; 16 * 1024];
-        let err = load_into_arena(&ctrl_path, &too_big)
-            .expect_err("must error on db exceeds capacity");
+        let err =
+            load_into_arena(&ctrl_path, &too_big).expect_err("must error on db exceeds capacity");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("exceeds arena buffer capacity"),

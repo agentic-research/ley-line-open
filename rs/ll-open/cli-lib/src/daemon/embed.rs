@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use rusqlite::Connection;
 
+use super::DaemonContext;
 use super::enrichment::{EnrichmentPass, EnrichmentStats};
 use super::vec_index::VectorIndex;
-use super::DaemonContext;
 
 /// An object that can produce a fixed-dimension embedding for text input.
 ///
@@ -144,9 +144,8 @@ impl EnrichmentPass for EmbeddingPass {
             // Full scan + optional in-memory scope filter (used when
             // scope is None OR scope is too large for IN clause).
             let mut stmt = conn.prepare(base)?;
-            let rows = stmt.query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?;
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             for row in rows {
                 let (id, content) = row?;
                 if let Some(set) = &scope_set
@@ -218,8 +217,7 @@ const EMBED_DRAIN_BATCH: usize = 32;
 /// strictly newest-first regardless of wall-clock skew. The counter is
 /// process-local; restarts reset to zero, which is fine because the
 /// queue itself doesn't survive restart.
-static EMBED_PRIORITY_COUNTER: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static EMBED_PRIORITY_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Allocate the next priority value. Strictly increasing across the
 /// process lifetime; safe to call from any thread.
@@ -293,7 +291,10 @@ pub fn start_drain(ctx: Arc<DaemonContext>) {
                             // Don't silently skip every task forever if the
                             // connection's broken — surface the error so
                             // operators can investigate.
-                            log::warn!("embed drain: failed to read record for {}: {e:#}", task.node_id);
+                            log::warn!(
+                                "embed drain: failed to read record for {}: {e:#}",
+                                task.node_id
+                            );
                             continue;
                         }
                     }
@@ -389,8 +390,14 @@ mod tests {
         let a = next_priority();
         let b = next_priority();
         let c = next_priority();
-        assert!(a < b, "next_priority must be strictly increasing: {a} < {b}");
-        assert!(b < c, "next_priority must be strictly increasing: {b} < {c}");
+        assert!(
+            a < b,
+            "next_priority must be strictly increasing: {a} < {b}"
+        );
+        assert!(
+            b < c,
+            "next_priority must be strictly increasing: {b} < {c}"
+        );
     }
 
     #[test]
@@ -427,8 +434,7 @@ mod tests {
             h.join().unwrap();
         }
         let q = queue.lock().unwrap();
-        let priorities: std::collections::HashSet<u64> =
-            q.iter().map(|t| t.priority).collect();
+        let priorities: std::collections::HashSet<u64> = q.iter().map(|t| t.priority).collect();
         assert_eq!(
             priorities.len(),
             q.len(),
@@ -466,12 +472,24 @@ mod tests {
         // BinaryHeap. Since promote() always allocates a fresh priority,
         // the tie-break path is only exercised by direct construction
         // (tests / edge cases).
-        let a = EmbedTask { priority: 5, node_id: "a".into() };
-        let b = EmbedTask { priority: 5, node_id: "b".into() };
+        let a = EmbedTask {
+            priority: 5,
+            node_id: "a".into(),
+        };
+        let b = EmbedTask {
+            priority: 5,
+            node_id: "b".into(),
+        };
         assert!(a < b, "tie-broken on node_id ascending");
 
-        let high = EmbedTask { priority: 10, node_id: "z".into() };
-        let low  = EmbedTask { priority: 1,  node_id: "a".into() };
+        let high = EmbedTask {
+            priority: 10,
+            node_id: "z".into(),
+        };
+        let low = EmbedTask {
+            priority: 1,
+            node_id: "a".into(),
+        };
         assert!(low < high, "lower priority compares less");
 
         let mut heap: BinaryHeap<EmbedTask> = BinaryHeap::new();
@@ -572,21 +590,24 @@ mod tests {
         for i in 0..100 {
             conn.execute(
                 "INSERT INTO nodes VALUES (?1, '', ?2, 0, 1, 1, ?3)",
-                rusqlite::params![format!("f{i}.go"), format!("f{i}.go"), format!("package f{i}")],
+                rusqlite::params![
+                    format!("f{i}.go"),
+                    format!("f{i}.go"),
+                    format!("package f{i}")
+                ],
             )?;
         }
 
         // Run a scoped embed pass — internal SQL goes through the IN
         // clause path. We can't introspect the internal SQL directly,
         // but EXPLAIN QUERY PLAN on the equivalent query does:
-        let plan: String = conn
-            .query_row(
-                "EXPLAIN QUERY PLAN SELECT id, record FROM nodes \
+        let plan: String = conn.query_row(
+            "EXPLAIN QUERY PLAN SELECT id, record FROM nodes \
                  WHERE kind = 0 AND record IS NOT NULL AND record <> '' \
                  AND id IN ('f1.go', 'f2.go')",
-                [],
-                |r| r.get::<_, String>(3),
-            )?;
+            [],
+            |r| r.get::<_, String>(3),
+        )?;
         assert!(
             plan.to_lowercase().contains("primary key")
                 || plan.contains("USING INTEGER PRIMARY KEY")

@@ -164,19 +164,13 @@ pub async fn cmd_lsp(
     // CLI path always knows where to land; daemon path defers to
     // pragma_database_list per lsp_pass.rs::sibling_capnp_log.
     let binding_log = output.with_extension("bindings.capnp");
-    let enrichment = project::enrich_symbols(
-        &mut client,
-        &conn,
-        &symbols,
-        &file_uri,
-        Some(&binding_log),
-    )
-    .await?;
+    let enrichment =
+        project::enrich_symbols(&mut client, &conn, &symbols, &file_uri, Some(&binding_log))
+            .await?;
     eprintln!("enrichment: {enrichment}");
 
     let data = conn.serialize(DatabaseName::Main)?;
-    std::fs::write(output, &*data)
-        .with_context(|| format!("write {}", output.display()))?;
+    std::fs::write(output, &*data).with_context(|| format!("write {}", output.display()))?;
 
     // Graceful shutdown.
     client.shutdown().await?;

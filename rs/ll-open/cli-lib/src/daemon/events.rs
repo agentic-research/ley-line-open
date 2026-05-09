@@ -444,10 +444,7 @@ pub(crate) fn json_string_array(req: &serde_json::Value, key: &str) -> Vec<Strin
 /// array; non-string members of an array are filtered (matching the
 /// non-opt variant). Use when callers need to differentiate "no scope
 /// supplied" from "scope is the empty list".
-pub(crate) fn json_string_array_opt(
-    req: &serde_json::Value,
-    key: &str,
-) -> Option<Vec<String>> {
+pub(crate) fn json_string_array_opt(req: &serde_json::Value, key: &str) -> Option<Vec<String>> {
     req.get(key).and_then(|v| v.as_array()).map(|a| {
         a.iter()
             .filter_map(|v| v.as_str().map(String::from))
@@ -511,7 +508,13 @@ impl ConnectionState {
 
         let (sub_id, event_rx, replay, gap) = self
             .router
-            .subscribe(&topics, identity, since, overflow, SUBSCRIBER_CHANNEL_BUFFER)
+            .subscribe(
+                &topics,
+                identity,
+                since,
+                overflow,
+                SUBSCRIBER_CHANNEL_BUFFER,
+            )
             .await;
 
         self.sub_id = Some(sub_id);
@@ -613,7 +616,10 @@ mod tests {
         let resp = super::error_response("bad request");
         let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
         let obj = parsed.as_object().unwrap();
-        assert_eq!(obj.get("error").and_then(|v| v.as_str()), Some("bad request"));
+        assert_eq!(
+            obj.get("error").and_then(|v| v.as_str()),
+            Some("bad request")
+        );
         assert_eq!(obj.len(), 1, "envelope must have exactly one key today");
     }
 
@@ -794,7 +800,10 @@ mod tests {
         let obj = json.as_object().expect("Event must serialize as object");
         assert_eq!(obj.get("event").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(obj.get("seq").and_then(|v| v.as_u64()), Some(42));
-        assert_eq!(obj.get("topic").and_then(|v| v.as_str()), Some("node.spliced"));
+        assert_eq!(
+            obj.get("topic").and_then(|v| v.as_str()),
+            Some("node.spliced")
+        );
         assert_eq!(obj.get("source").and_then(|v| v.as_str()), Some("leyline"));
         assert!(obj.get("data").is_some(), "data field must serialize");
         assert_eq!(obj.len(), 5, "exactly 5 fields expected, got {}", obj.len());
@@ -1012,11 +1021,7 @@ mod tests {
         //   (the upper bound on what could have been buffered).
         let n = EVENT_EMIT_CHANNEL_BUFFER * 2;
         for i in 0..n {
-            emitter.emit(
-                "node.burst",
-                "leyline",
-                serde_json::json!({"i": i}),
-            );
+            emitter.emit("node.burst", "leyline", serde_json::json!({"i": i}));
         }
 
         // Give the dispatcher time to drain.

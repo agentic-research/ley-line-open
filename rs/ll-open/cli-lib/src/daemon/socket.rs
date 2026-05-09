@@ -7,9 +7,9 @@ use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
+use crate::daemon::DaemonContext;
 use crate::daemon::events::ConnectionState;
 use crate::daemon::ops;
-use crate::daemon::DaemonContext;
 use crate::daemon::ops::is_state_changing;
 
 /// `rm -f` semantics: remove `path` if present, log a warning when
@@ -96,10 +96,7 @@ async fn handle_connection(ctx: Arc<DaemonContext>, stream: tokio::net::UnixStre
 
     /// Write a line back to the client, log::trace! on disconnect. Returns
     /// false if the write failed so the caller can break out of the loop.
-    async fn write_line(
-        writer: &mut tokio::net::unix::OwnedWriteHalf,
-        body: &str,
-    ) -> bool {
+    async fn write_line(writer: &mut tokio::net::unix::OwnedWriteHalf, body: &str) -> bool {
         if let Err(e) = writer.write_all(body.as_bytes()).await {
             log::trace!("UDS client gone (mid-body): {e}");
             return false;
@@ -121,7 +118,9 @@ async fn handle_connection(ctx: Arc<DaemonContext>, stream: tokio::net::UnixStre
             Ok(v) => v,
             Err(e) => {
                 let err = json!({"error": format!("invalid JSON: {e}")}).to_string();
-                if !write_line(&mut writer, &err).await { break; }
+                if !write_line(&mut writer, &err).await {
+                    break;
+                }
                 continue;
             }
         };
@@ -130,13 +129,17 @@ async fn handle_connection(ctx: Arc<DaemonContext>, stream: tokio::net::UnixStre
             Some(s) => s.to_string(),
             None => {
                 let err = json!({"error": "missing 'op' field"}).to_string();
-                if !write_line(&mut writer, &err).await { break; }
+                if !write_line(&mut writer, &err).await {
+                    break;
+                }
                 continue;
             }
         };
 
         let response = dispatch(&ctx, &mut conn_state, &op, &req).await;
-        if !write_line(&mut writer, &response).await { break; }
+        if !write_line(&mut writer, &response).await {
+            break;
+        }
     }
 
     // Clean up subscriptions on disconnect.
@@ -168,11 +171,7 @@ async fn dispatch(
         // Emit event for state-changing ops.
         if is_state_changing(op) {
             let emitter = conn_state.emitter();
-            emitter.emit(
-                &format!("daemon.{op}"),
-                "leyline",
-                json!({"op": op}),
-            );
+            emitter.emit(&format!("daemon.{op}"), "leyline", json!({"op": op}));
         }
         return response;
     }

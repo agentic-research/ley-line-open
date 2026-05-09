@@ -146,7 +146,6 @@ pub enum Commands {
         #[arg(long)]
         timeout: Option<String>,
     },
-
 }
 
 /// Dispatch a command to its implementation.
@@ -162,12 +161,7 @@ pub async fn run(cmd: Commands) -> Result<()> {
             arena,
             control_path,
             query,
-        } => cmd_inspect::cmd_inspect(
-            &id,
-            &arena,
-            control_path.as_deref(),
-            query.as_deref(),
-        ),
+        } => cmd_inspect::cmd_inspect(&id, &arena, control_path.as_deref(), query.as_deref()),
         Commands::Load { db, control } => cmd_load::cmd_load(&db, &control),
         Commands::Splice { db, node, text } => cmd_splice::cmd_splice(&db, &node, &text),
         #[cfg(feature = "lsp")]
@@ -215,7 +209,16 @@ pub async fn run(cmd: Commands) -> Result<()> {
             }
             #[cfg(not(feature = "mount"))]
             {
-                let _ = (arena, arena_size_mib, control, mount, backend, nfs_port, language, timeout);
+                let _ = (
+                    arena,
+                    arena_size_mib,
+                    control,
+                    mount,
+                    backend,
+                    nfs_port,
+                    language,
+                    timeout,
+                );
                 anyhow::bail!("serve requires the 'mount' feature (compile with --features mount)")
             }
         }

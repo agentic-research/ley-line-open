@@ -24,13 +24,7 @@ use super::{DaemonContext, DaemonPhase};
 ///
 /// Single source of truth — `daemon::socket` reads this via
 /// `is_state_changing()` rather than maintaining a parallel list.
-pub(crate) const STATE_CHANGING_OPS: &[&str] = &[
-    "load",
-    "reparse",
-    "flush",
-    "snapshot",
-    "enrich",
-];
+pub(crate) const STATE_CHANGING_OPS: &[&str] = &["load", "reparse", "flush", "snapshot", "enrich"];
 
 /// Whether an op name belongs to `STATE_CHANGING_OPS`. Used by the UDS
 /// dispatch loop to decide if the op deserves a follow-up event.
@@ -78,7 +72,11 @@ pub(crate) fn base_op_names() -> Vec<&'static str> {
 }
 
 /// Dispatch a base op. Returns `Some(json_string)` if handled, `None` if unrecognized.
-pub fn handle_base_op(ctx: &std::sync::Arc<DaemonContext>, op: &str, req: &serde_json::Value) -> Option<String> {
+pub fn handle_base_op(
+    ctx: &std::sync::Arc<DaemonContext>,
+    op: &str,
+    req: &serde_json::Value,
+) -> Option<String> {
     let result = match op {
         "status" => Some(op_status(ctx)),
         "flush" => Some(op_flush(&ctx.ctrl_path)),
@@ -252,10 +250,7 @@ fn read_generation(ctrl_path: &Path) -> Result<u64> {
 /// refactor, not something to assume here. Doc rewritten after iter-35
 /// adversarial review caught the previous false minimal-lock claim.
 fn snapshot_living_db(ctx: &DaemonContext) -> Result<()> {
-    crate::cmd_daemon::snapshot_to_arena(
-        &ctx.live_db.lock().unwrap(),
-        &ctx.ctrl_path,
-    )
+    crate::cmd_daemon::snapshot_to_arena(&ctx.live_db.lock().unwrap(), &ctx.ctrl_path)
 }
 
 // ---------------------------------------------------------------------------
@@ -365,48 +360,47 @@ fn op_reparse(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
     // hooks blindly forward `tool_input.file_path` without knowing the
     // project root.
     let source_path = Path::new(&source_arg);
-    let (source_dir, derived_scope): (PathBuf, Option<Vec<String>>) =
-        if source_path.is_dir() {
-            (source_path.to_path_buf(), None)
-        } else if source_path.is_file() {
-            // Fall back to ctx.source_dir as the project root if available
-            // (lets the relative path stay short); otherwise use the file's
-            // own parent directory.
-            let project_root = ctx
-                .source_dir
-                .as_ref()
-                .filter(|root| source_path.starts_with(root))
-                .cloned();
-            match project_root {
-                Some(root) => {
-                    let rel = source_path
-                        .strip_prefix(&root)
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_else(|_| {
-                            source_path
-                                .file_name()
-                                .map(|f| f.to_string_lossy().to_string())
-                                .unwrap_or_default()
-                        });
-                    (root, Some(vec![rel]))
-                }
-                None => {
-                    let parent = source_path
-                        .parent()
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or_else(|| PathBuf::from("."));
-                    let basename = source_path
-                        .file_name()
-                        .map(|f| f.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    (parent, Some(vec![basename]))
-                }
+    let (source_dir, derived_scope): (PathBuf, Option<Vec<String>>) = if source_path.is_dir() {
+        (source_path.to_path_buf(), None)
+    } else if source_path.is_file() {
+        // Fall back to ctx.source_dir as the project root if available
+        // (lets the relative path stay short); otherwise use the file's
+        // own parent directory.
+        let project_root = ctx
+            .source_dir
+            .as_ref()
+            .filter(|root| source_path.starts_with(root))
+            .cloned();
+        match project_root {
+            Some(root) => {
+                let rel = source_path
+                    .strip_prefix(&root)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| {
+                        source_path
+                            .file_name()
+                            .map(|f| f.to_string_lossy().to_string())
+                            .unwrap_or_default()
+                    });
+                (root, Some(vec![rel]))
             }
-        } else {
-            // Path doesn't exist — bubble up the error from parse_into_conn
-            // so the caller sees a helpful message.
-            (source_path.to_path_buf(), None)
-        };
+            None => {
+                let parent = source_path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("."));
+                let basename = source_path
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                (parent, Some(vec![basename]))
+            }
+        }
+    } else {
+        // Path doesn't exist — bubble up the error from parse_into_conn
+        // so the caller sees a helpful message.
+        (source_path.to_path_buf(), None)
+    };
 
     if explicit_files.is_none() {
         explicit_files = derived_scope;
@@ -420,8 +414,7 @@ fn op_reparse(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
         Ok(r) => r,
         Err(e) => {
             drop(guard);
-            ctx.state.write().unwrap().phase =
-                DaemonPhase::Error(format!("reparse failed: {e:#}"));
+            ctx.state.write().unwrap().phase = DaemonPhase::Error(format!("reparse failed: {e:#}"));
             return Err(e);
         }
     };
@@ -447,7 +440,6 @@ fn op_reparse(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
     })
     .to_string())
 }
-
 
 fn op_enrich(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
     let pass_name = required_str_field(req, "pass")?;
@@ -576,7 +568,10 @@ fn op_list_children(ctx: &DaemonContext, req: &serde_json::Value) -> Result<Stri
             })
             .collect();
         let touched: Vec<&str> = raw.iter().map(|(id, ..)| id.as_str()).collect();
-        Ok((json!({"ok": true, "children": rows}).to_string(), touched.into_iter().map(String::from).collect::<Vec<_>>()))
+        Ok((
+            json!({"ok": true, "children": rows}).to_string(),
+            touched.into_iter().map(String::from).collect::<Vec<_>>(),
+        ))
     })?;
     let touched_refs: Vec<&str> = response.1.iter().map(String::as_str).collect();
     promote_touched(ctx, &touched_refs);
@@ -659,7 +654,12 @@ fn op_get_node(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
 // ---------------------------------------------------------------------------
 
 /// Find the node_id at a given (file, line, col) position via the _ast table.
-fn find_node_at_position(conn: &Connection, file: &str, line: u32, col: u32) -> Result<Option<String>> {
+fn find_node_at_position(
+    conn: &Connection,
+    file: &str,
+    line: u32,
+    col: u32,
+) -> Result<Option<String>> {
     // Find the most specific (smallest range) AST node containing this position.
     query_row_opt(
         conn,
@@ -699,12 +699,7 @@ fn required_str_field<'a>(req: &'a serde_json::Value, field: &'static str) -> Re
 /// Run a `query_row`, mapping `QueryReturnedNoRows` to `Ok(None)`. Other
 /// errors propagate. Replaces the four-arm match (`Ok→Some / NoRows→None /
 /// Err→Err`) that several "id-or-position lookup" ops were carrying inline.
-fn query_row_opt<T, P, F>(
-    conn: &Connection,
-    sql: &str,
-    params: P,
-    mapper: F,
-) -> Result<Option<T>>
+fn query_row_opt<T, P, F>(conn: &Connection, sql: &str, params: P, mapper: F) -> Result<Option<T>>
 where
     P: rusqlite::Params,
     F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
@@ -751,10 +746,7 @@ fn parse_position(req: &serde_json::Value) -> Result<(String, u32, u32)> {
         .get("line")
         .and_then(|v| v.as_u64())
         .context("missing \"line\" field")? as u32;
-    let col = req
-        .get("col")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
+    let col = req.get("col").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
     Ok((file, line, col))
 }
@@ -1005,7 +997,12 @@ where
     Ok((result, queued))
 }
 
-fn lsp_hover_query(conn: &Connection, file: &str, line: u32, col: u32) -> Result<Option<(String, String)>> {
+fn lsp_hover_query(
+    conn: &Connection,
+    file: &str,
+    line: u32,
+    col: u32,
+) -> Result<Option<(String, String)>> {
     let node_id = match find_node_at_position(conn, file, line, col)? {
         Some(id) => id,
         None => return Ok(None),
@@ -1240,9 +1237,18 @@ mod tests {
     fn state_changing_ops_excludes_pure_reads() {
         // The query/observation ops must NOT trigger an event emission.
         for op in [
-            "status", "query", "list_children", "read_content",
-            "find_callers", "find_defs", "get_node",
-            "lsp_hover", "lsp_defs", "lsp_refs", "lsp_symbols", "lsp_diagnostics",
+            "status",
+            "query",
+            "list_children",
+            "read_content",
+            "find_callers",
+            "find_defs",
+            "get_node",
+            "lsp_hover",
+            "lsp_defs",
+            "lsp_refs",
+            "lsp_symbols",
+            "lsp_diagnostics",
         ] {
             assert!(
                 !is_state_changing(op),
@@ -1271,10 +1277,8 @@ mod tests {
         // test. handle_base_op routes find_callers → node_refs and
         // find_defs → node_defs.
         let (_dir, ctx) = setup();
-        let callers = handle_base_op(&ctx, "find_callers", &json!({"token": "x"}))
-            .unwrap();
-        let defs = handle_base_op(&ctx, "find_defs", &json!({"token": "x"}))
-            .unwrap();
+        let callers = handle_base_op(&ctx, "find_callers", &json!({"token": "x"})).unwrap();
+        let defs = handle_base_op(&ctx, "find_defs", &json!({"token": "x"})).unwrap();
         let callers_v: serde_json::Value = serde_json::from_str(&callers).unwrap();
         let defs_v: serde_json::Value = serde_json::from_str(&defs).unwrap();
         assert!(
@@ -1381,12 +1385,16 @@ mod tests {
         assert_eq!(rows[0]["start_line"], 5);
     }
 
-
     /// Test-helper: dispatch `op` with `req` and assert the response
     /// is a JSON object containing an `error` field. Used by the
     /// input-validation pin triplet (op_load, op_query, op_reparse)
     /// which all share the same expected error-shape contract.
-    fn assert_op_errors(ctx: &std::sync::Arc<DaemonContext>, op: &str, req: serde_json::Value, why: &str) {
+    fn assert_op_errors(
+        ctx: &std::sync::Arc<DaemonContext>,
+        op: &str,
+        req: serde_json::Value,
+        why: &str,
+    ) {
         let resp = handle_base_op(ctx, op, &req)
             .unwrap_or_else(|| panic!("op {op} returned None for {why}"));
         let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
@@ -1475,12 +1483,16 @@ mod tests {
             );
             let _ = tx.send(result);
         });
-        let outcome = rx.recv_timeout(std::time::Duration::from_secs(5))
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
             .expect("with_lazy_enrich_retry timed out — DEADLOCK regression");
         handle.join().unwrap();
 
         let (result, enriched) = outcome.unwrap();
-        assert_eq!(result, None, "no enrichment ran (no source_dir), result stays None");
+        assert_eq!(
+            result, None,
+            "no enrichment ran (no source_dir), result stays None"
+        );
         assert!(!enriched, "no enrichment ran, enriched flag must be false");
     }
 
@@ -1498,16 +1510,31 @@ mod tests {
         let (_dir, ctx) = setup();
 
         // First caller: insert "foo.go".
-        let first = ctx.enrich_inflight.lock().unwrap().insert("foo.go".to_string());
+        let first = ctx
+            .enrich_inflight
+            .lock()
+            .unwrap()
+            .insert("foo.go".to_string());
         assert!(first, "first caller must succeed in inserting");
 
         // Second caller (concurrent simulation): same file already in
         // set; insert returns false → caller skips enrichment.
-        let second = ctx.enrich_inflight.lock().unwrap().insert("foo.go".to_string());
-        assert!(!second, "second concurrent caller must observe inflight, return false");
+        let second = ctx
+            .enrich_inflight
+            .lock()
+            .unwrap()
+            .insert("foo.go".to_string());
+        assert!(
+            !second,
+            "second concurrent caller must observe inflight, return false"
+        );
 
         // Different file: still allowed.
-        let other = ctx.enrich_inflight.lock().unwrap().insert("bar.go".to_string());
+        let other = ctx
+            .enrich_inflight
+            .lock()
+            .unwrap()
+            .insert("bar.go".to_string());
         assert!(other, "different file must be allowed concurrently");
     }
 
@@ -1521,11 +1548,18 @@ mod tests {
         // Simulate work cycle: insert + remove (the InflightGuard's
         // Drop does this automatically in production try_enrich_file;
         // we exercise it manually here).
-        ctx.enrich_inflight.lock().unwrap().insert("foo.go".to_string());
+        ctx.enrich_inflight
+            .lock()
+            .unwrap()
+            .insert("foo.go".to_string());
         ctx.enrich_inflight.lock().unwrap().remove("foo.go");
 
         // Subsequent call: insert succeeds (set is clean).
-        let again = ctx.enrich_inflight.lock().unwrap().insert("foo.go".to_string());
+        let again = ctx
+            .enrich_inflight
+            .lock()
+            .unwrap()
+            .insert("foo.go".to_string());
         assert!(again, "after release, file is allowed back into set");
     }
 
@@ -1616,7 +1650,12 @@ mod tests {
         // actionable error. setup() builds ctx with source_dir: None
         // so this test exercises the missing-everything fallthrough.
         let (_dir, ctx) = setup();
-        assert_op_errors(&ctx, "reparse", json!({}), "missing source + no ctx fallback");
+        assert_op_errors(
+            &ctx,
+            "reparse",
+            json!({}),
+            "missing source + no ctx fallback",
+        );
     }
 
     #[tokio::test]
@@ -1775,7 +1814,12 @@ mod tests {
         let (_dir, ctx) = setup();
         assert_op_errors(&ctx, "load", json!({}), "missing db field");
         assert_op_errors(&ctx, "load", json!({"db": 42}), "non-string db");
-        assert_op_errors(&ctx, "load", json!({"db": "!@#not-base64$%^"}), "invalid base64");
+        assert_op_errors(
+            &ctx,
+            "load",
+            json!({"db": "!@#not-base64$%^"}),
+            "invalid base64",
+        );
     }
 
     #[tokio::test]
@@ -1794,7 +1838,14 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         let obj = parsed.as_object().expect("op_status returns an object");
 
-        for required_field in ["ok", "phase", "generation", "arena_path", "arena_size", "enrichment"] {
+        for required_field in [
+            "ok",
+            "phase",
+            "generation",
+            "arena_path",
+            "arena_size",
+            "enrichment",
+        ] {
             assert!(
                 obj.contains_key(required_field),
                 "op_status JSON must include `{required_field}`; got keys {:?}",
@@ -1842,14 +1893,19 @@ mod tests {
         );
 
         // The contract: op_status MUST succeed despite the poison.
-        let result = handle_base_op(&ctx, "status", &json!({}))
-            .expect("op_status must dispatch");
-        let parsed: serde_json::Value = serde_json::from_str(&result)
-            .expect("op_status must return valid JSON");
+        let result = handle_base_op(&ctx, "status", &json!({})).expect("op_status must dispatch");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result).expect("op_status must return valid JSON");
         assert_eq!(parsed["ok"], true, "op_status must report ok=true");
         // Required fields still present.
-        assert!(parsed.get("phase").is_some(), "phase field must survive poison recovery");
-        assert!(parsed.get("enrichment").is_some(), "enrichment field must survive poison recovery");
+        assert!(
+            parsed.get("phase").is_some(),
+            "phase field must survive poison recovery"
+        );
+        assert!(
+            parsed.get("enrichment").is_some(),
+            "enrichment field must survive poison recovery"
+        );
     }
 
     #[tokio::test]
@@ -1926,14 +1982,13 @@ mod tests {
         // get_node, find_node_at_position, lsp_hover_query) would all start
         // returning Err for legitimate "id not found" lookups.
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE t (id INTEGER, name TEXT);").unwrap();
-        let r: Option<String> = query_row_opt(
-            &conn,
-            "SELECT name FROM t WHERE id = ?1",
-            [42],
-            |row| row.get(0),
-        )
-        .unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER, name TEXT);")
+            .unwrap();
+        let r: Option<String> =
+            query_row_opt(&conn, "SELECT name FROM t WHERE id = ?1", [42], |row| {
+                row.get(0)
+            })
+            .unwrap();
         assert_eq!(r, None);
     }
 
@@ -1945,13 +2000,11 @@ mod tests {
              INSERT INTO t VALUES (1, 'alpha'), (2, 'beta');",
         )
         .unwrap();
-        let r: Option<String> = query_row_opt(
-            &conn,
-            "SELECT name FROM t WHERE id = ?1",
-            [2],
-            |row| row.get(0),
-        )
-        .unwrap();
+        let r: Option<String> =
+            query_row_opt(&conn, "SELECT name FROM t WHERE id = ?1", [2], |row| {
+                row.get(0)
+            })
+            .unwrap();
         assert_eq!(r.as_deref(), Some("beta"));
     }
 
@@ -1962,12 +2015,9 @@ mod tests {
         // at runtime. Only the QueryReturnedNoRows variant collapses
         // to None.
         let conn = Connection::open_in_memory().unwrap();
-        let r = query_row_opt(
-            &conn,
-            "SELECT * FROM definitely_not_a_table",
-            [],
-            |row| row.get::<_, String>(0),
-        );
+        let r = query_row_opt(&conn, "SELECT * FROM definitely_not_a_table", [], |row| {
+            row.get::<_, String>(0)
+        });
         assert!(r.is_err(), "expected error for missing table, got Ok");
     }
 
@@ -1988,12 +2038,10 @@ mod tests {
         // Mapper asks for column 1 as i32 but it's TEXT — runtime type
         // mismatch surfaces from inside query_row. Must not be swallowed
         // as None (that would silently hide real type bugs).
-        let r: Result<Option<i32>> = query_row_opt(
-            &conn,
-            "SELECT val FROM t WHERE id = ?1",
-            [1],
-            |row| row.get::<_, i32>(0),
-        );
+        let r: Result<Option<i32>> =
+            query_row_opt(&conn, "SELECT val FROM t WHERE id = ?1", [1], |row| {
+                row.get::<_, i32>(0)
+            });
         assert!(
             r.is_err(),
             "type-mismatch in mapper must propagate as Err, got: {r:?}",
@@ -2019,7 +2067,10 @@ mod tests {
         conn.execute("UPDATE nodes SET record = NULL WHERE id = 'n_null'", [])
             .unwrap();
 
-        assert_eq!(query_node_record(&conn, "n_with").unwrap(), Some("hello".to_string()));
+        assert_eq!(
+            query_node_record(&conn, "n_with").unwrap(),
+            Some("hello".to_string())
+        );
         assert_eq!(query_node_record(&conn, "n_null").unwrap(), None);
         assert_eq!(query_node_record(&conn, "n_missing").unwrap(), None);
     }
@@ -2131,7 +2182,11 @@ mod tests {
         // A non-string `file` (e.g. number, object) must hit the same
         // error path as a missing key — both are equally broken from
         // the caller's perspective.
-        for bad in [json!({"file": 42}), json!({"file": null}), json!({"file": []})] {
+        for bad in [
+            json!({"file": 42}),
+            json!({"file": null}),
+            json!({"file": []}),
+        ] {
             assert!(parse_file_arg(&bad).is_err(), "expected error for {bad}");
         }
     }
@@ -2297,10 +2352,7 @@ mod tests {
         for key in ["definitions", "references", "decls"] {
             let body = lsp_rows_response(key, vec![], false);
             let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-            assert!(
-                v.get(key).is_some(),
-                "expected key `{key}` in {body}",
-            );
+            assert!(v.get(key).is_some(), "expected key `{key}` in {body}",);
         }
     }
 
@@ -2309,8 +2361,7 @@ mod tests {
         // Mutating ops must be a subset of the canonical dispatch list.
         // Catches the case where someone retires an op from `handle_base_op`
         // but forgets to remove it from `STATE_CHANGING_OPS`.
-        let canonical: std::collections::HashSet<&str> =
-            base_op_names().into_iter().collect();
+        let canonical: std::collections::HashSet<&str> = base_op_names().into_iter().collect();
         for name in STATE_CHANGING_OPS {
             assert!(
                 canonical.contains(name),

@@ -37,8 +37,7 @@ fn open_arena_db(arena_path: &Path, control_path: Option<&Path>) -> Result<Conne
         .with_context(|| format!("open arena file: {}", resolved_arena_path.display()))?;
     let mmap = unsafe { Mmap::map(&file)? };
 
-    let header: &ArenaHeader =
-        bytemuck::from_bytes(&mmap[..std::mem::size_of::<ArenaHeader>()]);
+    let header: &ArenaHeader = bytemuck::from_bytes(&mmap[..std::mem::size_of::<ArenaHeader>()]);
 
     let file_size = mmap.len() as u64;
     let offset = header
@@ -76,9 +75,8 @@ pub fn cmd_inspect(
 
 /// Look up a node by ID and pretty-print its columns.
 fn lookup_node(conn: &Connection, id: &str) -> Result<()> {
-    let mut stmt = conn.prepare(
-        "SELECT id, parent_id, name, kind, size FROM nodes WHERE id = ?1",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT id, parent_id, name, kind, size FROM nodes WHERE id = ?1")?;
 
     let exists = stmt.query_row([id], |row| {
         let id: String = row.get(0)?;

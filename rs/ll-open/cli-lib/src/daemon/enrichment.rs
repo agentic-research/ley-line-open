@@ -135,10 +135,7 @@ pub fn run_pass(
     let mut stats = Vec::new();
 
     for pass_name in order {
-        let pass = passes
-            .iter()
-            .find(|p| p.name() == pass_name)
-            .unwrap();
+        let pass = passes.iter().find(|p| p.name() == pass_name).unwrap();
 
         let start = Instant::now();
         let result = execute_pass(pass.as_ref(), conn, source_dir, changed_files, state)?;
@@ -167,9 +164,9 @@ pub fn run_all(
     let mut remaining: Vec<&dyn EnrichmentPass> = passes.iter().map(|p| p.as_ref()).collect();
 
     while !remaining.is_empty() {
-        let next = remaining.iter().position(|p| {
-            p.depends_on().iter().all(|dep| completed.contains(dep))
-        });
+        let next = remaining
+            .iter()
+            .position(|p| p.depends_on().iter().all(|dep| completed.contains(dep)));
 
         match next {
             Some(idx) => {
@@ -212,7 +209,10 @@ fn record_pass_outcome(
             poisoned.into_inner()
         }
     };
-    let entry = s.enrichment.entry(name.to_string()).or_insert_with(PassStatus::default);
+    let entry = s
+        .enrichment
+        .entry(name.to_string())
+        .or_insert_with(PassStatus::default);
     entry.last_run_at_ms = Some(super::now_ms());
     match outcome {
         Ok(_) => {
@@ -231,10 +231,7 @@ fn record_pass_outcome(
 
 /// Resolve the dependency order for a target pass.
 /// Returns pass names in the order they should execute.
-fn resolve_order(
-    passes: &[Box<dyn EnrichmentPass>],
-    target: &str,
-) -> Result<Vec<String>> {
+fn resolve_order(passes: &[Box<dyn EnrichmentPass>], target: &str) -> Result<Vec<String>> {
     let mut order = Vec::new();
     let mut visited = std::collections::HashSet::new();
     resolve_recursive(passes, target, &mut order, &mut visited)?;
@@ -307,7 +304,15 @@ impl EnrichmentPass for TreeSitterPass {
     }
 
     fn writes(&self) -> &[&str] {
-        &["nodes", "_ast", "_source", "node_refs", "node_defs", "_imports", "_file_index"]
+        &[
+            "nodes",
+            "_ast",
+            "_source",
+            "node_refs",
+            "node_defs",
+            "_imports",
+            "_file_index",
+        ]
     }
 
     fn run(
@@ -347,11 +352,24 @@ mod tests {
     }
 
     impl EnrichmentPass for MockPass {
-        fn name(&self) -> &str { self.name }
-        fn depends_on(&self) -> &[&str] { self.deps }
-        fn reads(&self) -> &[&str] { self.reads }
-        fn writes(&self) -> &[&str] { self.writes }
-        fn run(&self, _conn: &Connection, _source: &Path, _changed: Option<&[String]>) -> Result<EnrichmentStats> {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn depends_on(&self) -> &[&str] {
+            self.deps
+        }
+        fn reads(&self) -> &[&str] {
+            self.reads
+        }
+        fn writes(&self) -> &[&str] {
+            self.writes
+        }
+        fn run(
+            &self,
+            _conn: &Connection,
+            _source: &Path,
+            _changed: Option<&[String]>,
+        ) -> Result<EnrichmentStats> {
             Ok(EnrichmentStats {
                 pass_name: self.name.to_string(),
                 files_processed: 0,
@@ -364,10 +382,21 @@ mod tests {
     /// Pass that always errors — for the failure-path test.
     struct FailingPass;
     impl EnrichmentPass for FailingPass {
-        fn name(&self) -> &str { "failing" }
-        fn reads(&self) -> &[&str] { &[] }
-        fn writes(&self) -> &[&str] { &[] }
-        fn run(&self, _conn: &Connection, _source: &Path, _changed: Option<&[String]>) -> Result<EnrichmentStats> {
+        fn name(&self) -> &str {
+            "failing"
+        }
+        fn reads(&self) -> &[&str] {
+            &[]
+        }
+        fn writes(&self) -> &[&str] {
+            &[]
+        }
+        fn run(
+            &self,
+            _conn: &Connection,
+            _source: &Path,
+            _changed: Option<&[String]>,
+        ) -> Result<EnrichmentStats> {
             anyhow::bail!("intentional pass failure");
         }
     }
@@ -376,7 +405,8 @@ mod tests {
     /// version bumps.
     fn meta_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT);").unwrap();
+        conn.execute_batch("CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT);")
+            .unwrap();
         conn
     }
 
@@ -390,7 +420,12 @@ mod tests {
         reads: &'static [&'static str],
         writes: &'static [&'static str],
     ) -> Box<dyn EnrichmentPass> {
-        Box::new(MockPass { name, deps, reads, writes })
+        Box::new(MockPass {
+            name,
+            deps,
+            reads,
+            writes,
+        })
     }
 
     #[test]
@@ -412,7 +447,12 @@ mod tests {
         assert_eq!(obj.get("items_added").and_then(|v| v.as_u64()), Some(17));
         assert_eq!(obj.get("duration_ms").and_then(|v| v.as_u64()), Some(250));
         // No surprise extra fields.
-        assert_eq!(obj.len(), 4, "exactly four fields expected, got {}", obj.len());
+        assert_eq!(
+            obj.len(),
+            4,
+            "exactly four fields expected, got {}",
+            obj.len()
+        );
     }
 
     #[test]
@@ -425,7 +465,15 @@ mod tests {
             "tree-sitter",
             &[],
             &[], // reads source files, not db tables
-            &["nodes", "_ast", "_source", "node_refs", "node_defs", "_imports", "_file_index"],
+            &[
+                "nodes",
+                "_ast",
+                "_source",
+                "node_refs",
+                "node_defs",
+                "_imports",
+                "_file_index",
+            ],
         );
     }
 
@@ -484,7 +532,11 @@ mod tests {
         let s = state.read().unwrap();
         let status = s.enrichment.get("beta").expect("beta status recorded");
         assert!(status.last_run_at_ms.is_some());
-        assert_eq!(status.basis, Some(5), "basis should snapshot tree-sitter_version");
+        assert_eq!(
+            status.basis,
+            Some(5),
+            "basis should snapshot tree-sitter_version"
+        );
         assert!(status.error.is_none());
     }
 
@@ -509,7 +561,10 @@ mod tests {
         assert!(result.is_err(), "failing pass must propagate Err");
 
         let s = state.read().unwrap();
-        let status = s.enrichment.get("failing").expect("failing status recorded");
+        let status = s
+            .enrichment
+            .get("failing")
+            .expect("failing status recorded");
         assert!(
             status.last_run_at_ms.is_some(),
             "last_run_at_ms must be set even on failure (so operators \
@@ -520,7 +575,10 @@ mod tests {
             "basis must NOT be set on failure (staleness detection \
              depends on basis lagging behind parse_version when broken)",
         );
-        let err_msg = status.error.as_ref().expect("error field must be populated");
+        let err_msg = status
+            .error
+            .as_ref()
+            .expect("error field must be populated");
         assert!(
             err_msg.contains("intentional pass failure"),
             "error message must include the pass's bail! string, got {err_msg:?}",
@@ -545,7 +603,10 @@ mod tests {
         let _ = execute_pass(&FailingPass, &conn, Path::new("/"), None, Some(&state));
         {
             let s = state.read().unwrap();
-            let status = s.enrichment.get("failing").expect("failing status recorded");
+            let status = s
+                .enrichment
+                .get("failing")
+                .expect("failing status recorded");
             assert!(status.error.is_some(), "fresh failure must record error");
         }
 
@@ -561,7 +622,10 @@ mod tests {
         execute_pass(&recovered, &conn, Path::new("/"), None, Some(&state)).unwrap();
 
         let s = state.read().unwrap();
-        let status = s.enrichment.get("failing").expect("failing status still recorded");
+        let status = s
+            .enrichment
+            .get("failing")
+            .expect("failing status still recorded");
         assert!(
             status.error.is_none(),
             "successful run after a failure MUST clear the error field; \
@@ -605,10 +669,7 @@ mod tests {
         // both names — undocumented but pinning the current behavior
         // means a refactor that switched to "error on cycle" (perhaps
         // the right call!) requires a deliberate test update.
-        let passes = vec![
-            mock("a", &["b"], &[], &[]),
-            mock("b", &["a"], &[], &[]),
-        ];
+        let passes = vec![mock("a", &["b"], &[], &[]), mock("b", &["a"], &[], &[])];
         let order = resolve_order(&passes, "a").expect("must terminate, not loop");
         // Both names present, in some order — invariants we DO pin:
         //   - termination (no infinite recursion)

@@ -1,5 +1,18 @@
 # Table Contract: Schema Partition for Enrichment Layers
 
+> **Post-T8 status (2026-05-08, ADR-0014):** the SQL tables described
+> here are *local projections*, not the cross-process contract. The
+> typed Cap'n Proto schemas in `rs/ll-core/schema-capnp/schemas/`
+> (`AstNode`, `SourceFile`, `BindingRecord`, `Head`) are the contract
+> consumed by mache, future workerd, and future control-room. SQL
+> tables are an optimization for in-process queries; column names are
+> not the protocol.
+>
+> `_lsp_refs` in particular is **read-only legacy** as of T8.9 (commit
+> `9d3a3b4`). New LLO writes go to `${db}.bindings.capnp` exclusively;
+> the table DDL is retained only so consumers reading pre-T8.9 `.db`
+> files can still SELECT against it.
+
 The living database is the union of tables owned by independent enrichment
 layers. Each layer owns a disjoint set of tables — no two layers write to
 the same table. This is the **Schema Partition Invariant**.
@@ -30,7 +43,7 @@ Depends on tree-sitter. Tables are optional — queries degrade gracefully.
 |-------|---------|
 | `_lsp` | Core symbol metadata (node_id, symbol_kind, detail, line ranges, diagnostics) |
 | `_lsp_defs` | Go-to-definition results (node_id → def_uri, line/col) |
-| `_lsp_refs` | Find-references results (node_id → ref_uri, line/col) |
+| `_lsp_refs` | **Legacy / read-only.** Find-references results (node_id → ref_uri, line/col). New writes retired at T8.9 (`9d3a3b4`); contract migrated to `BindingRecord` capnp event log at `${db}.bindings.capnp`. DDL retained for legacy `.db` read compatibility. |
 | `_lsp_hover` | Hover documentation (node_id → hover_text) |
 | `_lsp_completions` | Completion items (node_id → label, kind, detail) |
 
@@ -56,29 +69,40 @@ database** (not the living db) because `vec0` virtual tables cannot survive
 
 ## Composition Model
 
+```mermaid
+flowchart TD
+  subgraph LLO[ley-line-open]
+    direction TB
+    ts[TreeSitterPass<br/>owns: nodes, _ast, _source,<br/>node_refs, node_defs, _imports]
+    lsp[LspEnrichmentPass<br/>owns: _lsp, _lsp_defs,<br/>_lsp_hover, _lsp_completions<br/><i>+ BindingRecord capnp log</i>]
+  end
+  subgraph LL[ley-line · private]
+    direction TB
+    embed[EmbeddingPass<br/>owns: node_embeddings<br/>sidecar .vec.db]
+    sheaf[SheafPass<br/>owns: _sheaf*<br/>depends: tree-sitter]
+  end
+  ts --> living
+  lsp --> living
+  embed --> living
+  sheaf --> living
+  lsp --> capnp[(${db}.bindings.capnp<br/>BindingRecord log)]
+  ts --> capnp_ast[(${db}.ast.capnp<br/>${db}.source.capnp<br/>${db}.head.capnp)]
+  living[Living database<br/>:memory: SQLite + Mutex<br/>arena flip on snapshot] --> mache_sql[mache: generation poll<br/>SQL projection]
+  capnp --> mache_capnp[mache: BindingRecord<br/>cross-runtime contract]
+  capnp_ast --> mache_capnp
+  classDef llo fill:#0b3d2e,stroke:#1ed896,color:#e8f7ee;
+  classDef llp fill:#2a1245,stroke:#a06bff,color:#ede1ff;
+  classDef substrate fill:#1a2747,stroke:#5a8eed,color:#e3edff;
+  class ts,lsp llo;
+  class embed,sheaf llp;
+  class capnp,capnp_ast,mache_capnp substrate;
 ```
-ley-line-open (LLO)              ley-line (LL, private)
-┌──────────────────┐            ┌──────────────────────┐
-│ TreeSitterPass    │            │ LspEnrichmentPass    │
-│ owns: nodes, _ast│            │ owns: _lsp*          │
-│       _source,   │            ├──────────────────────┤
-│       node_refs, │            │ EmbeddingPass        │
-│       node_defs, │            │ owns: node_embeddings│
-│       _imports   │            │ (sidecar db)         │
-└────────┬─────────┘            ├──────────────────────┤
-         │                      │ SheafPass            │
-         │ depends_on: []       │ owns: _sheaf*        │
-         │                      └──────┬───────────────┘
-         │                             │ depends_on: ["tree-sitter"]
-         ▼                             ▼
-   ┌─────────────────────────────────────┐
-   │        Living Database              │
-   │  :memory: SQLite (Mutex)            │
-   │  ───────────────────────────        │
-   │  serialize() → arena (crash safe)   │
-   │  arena → mache (generation poll)    │
-   └─────────────────────────────────────┘
-```
+
+Pre-T8 the living database was the only cross-process surface, and SQL column
+names were the contract. Post-T8 (this commit thread, 2026-05-08), the living
+db remains for fast in-process queries, but the *cross-process contract*
+moved to canonical-encoded capnp segment files at `${db}.{bindings,ast,source,head}.capnp`.
+mache (and any future consumer) reads those directly.
 
 ## Rules
 

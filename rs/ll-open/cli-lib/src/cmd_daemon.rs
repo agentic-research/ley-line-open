@@ -608,12 +608,13 @@ pub fn try_snapshot_or_log(
 ///    `set_arena`. Reversing this order produces torn reads in
 ///    cross-process consumers (ADR-fixed bug ley-line-open-609d6a).
 ///
-/// 2. **Generation bump is the publish point.** Polling readers
-///    (HotSwapGraph) key on `generation`; they don't refresh until
-///    it bumps. The early `set_arena` keeps the OLD generation so
-///    polling readers stay on the old buffer until the data is
-///    fully written. The final `set_arena` flips generation, making
-///    the new buffer visible.
+/// 2. **`current_root` advance is the publish point (T2.4).** Polling
+///    readers (HotSwapGraph) compare `current_root`; they don't refresh
+///    until it changes. The early `set_arena` preserves `current_root`
+///    so readers stay on the old buffer until data is fully written.
+///    The final `set_arena_with_root` advances the root, making the
+///    new buffer visible. (Pre-T2.4 this rotated on `generation`; the
+///    sync counter is now a private fence atom only.)
 ///
 /// 3. **Advertisement errors abort the snapshot.** If the early
 ///    `set_arena` fails, a partially-grown file may be on disk with
@@ -651,11 +652,13 @@ pub fn snapshot_to_arena(conn: &rusqlite::Connection, ctrl_path: &Path) -> Resul
     let mut mmap =
         leyline_core::create_arena(Path::new(&arena_path), new_size).context("open arena file")?;
 
-    // Step 2: advertise new size to controller, but keep OLD generation.
-    // Fresh-opening readers see (arena_size = new_size, gen = old_gen);
-    // file is already at new_size from step 1 so the advertised size is
-    // safe to mmap. Polling readers don't refresh because gen hasn't
-    // bumped. Failure here MUST abort the snapshot — see invariant 3.
+    // Step 2: advertise new size to controller via set_arena (no root
+    // advance). Fresh-opening readers see arena_size = new_size; file
+    // is already at new_size from step 1 so the advertised size is
+    // safe to mmap. Polling readers don't refresh because current_root
+    // is preserved (set_arena bumps the sync atom but keeps the root
+    // bytes unchanged — readers compare roots, not the atom). Failure
+    // here MUST abort the snapshot — see invariant 3.
     if new_size != arena_size {
         eprintln!(
             "auto-sizing arena: {}MB → {}MB (db is {}MB)",

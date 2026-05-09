@@ -1,25 +1,26 @@
-//! Control block for multi-generation arena management.
+//! Control block for content-addressed Σ substrate identity (T2.4 V2).
 //!
-//! A 4096-byte memory-mapped file that tracks which arena is currently active.
-//! Readers atomically read the generation counter to determine the active arena.
-//! Writers fill a new arena, then atomically update the control block to point to it.
+//! A 4096-byte memory-mapped file naming the currently-active arena.
+//! Substrate identity is `current_root` — BLAKE3 over the live arena
+//! payload. Polling readers compare `current_root()` for change
+//! detection; an atomic Acquire-load on a private sync counter fences
+//! the byte reads against the writer's Release-store inside
+//! `set_arena*`.
 //!
-//! Layout (matches Go `control/control.go`):
+//! Layout (matches Go `internal/control/control.go` post-T2.4):
 //!   [0..4]     Magic: 0x4C455943 ('LEYC')
-//!   [4..8]     Version: u32
-//!   [8..16]    Generation: u64 (atomic)
+//!   [4..8]     Version: u32 (must be 2)
+//!   [8..16]    Sync atom: AtomicU64 (private — Acquire/Release fence;
+//!                                    formerly the V1 `generation` field)
 //!   [16..272]  ArenaPath: [u8; 256] (null-terminated)
 //!   [272..280] ArenaSize: u64
 //!   [280..320] Interrupt fields (feature = "interrupt"; reserved otherwise)
-//!   [320..352] CurrentRoot: [u8; 32]  — Σ root pointer (T2.1, ley-line-open-baa90a)
+//!   [320..352] CurrentRoot: [u8; 32]  — Σ root pointer
 //!   [352..4096] Padding
 //!
-//! T2.1 NOTE: `CurrentRoot` is additive. Reader logic still keys on
-//! `generation` for the current cutover (T2.2/T2.3 wire it into the
-//! verify-on-read path; T2.4 deprecates `generation` once verification
-//! is the canonical advancement signal). On existing control files
-//! the bytes at [320..352] are zero (sentinel `Hash::ZERO`), which
-//! callers interpret as "no current root yet".
+//! V1 (pre-T2.4) exposed `generation` as a public counter; V2 removes
+//! that surface entirely. Old binaries reading new files (or vice
+//! versa) hit the explicit VERSION-mismatch error in `open_or_create`.
 
 use std::fs::OpenOptions;
 use std::path::Path;
@@ -71,12 +72,20 @@ const OFF_PAYLOAD_OFFSET: usize = 304;
 #[cfg(feature = "interrupt")]
 const OFF_PAYLOAD_LEN: usize = 312;
 
-/// CurrentRoot: 32-byte content address of the current arena root (Σ).
-/// T2.1 (ley-line-open-baa90a) — additive; existing readers ignore this
-/// region and key on `generation`. T2.2 (`ley-line-open-babf6a`) wires
-/// the writer side; T2.3 (`ley-line-open-bad8f1`) wires verify-on-read.
+/// CurrentRoot: 32-byte BLAKE3 content address of the active arena
+/// payload. **Post-T2.4 this is the substrate's sole public identity.**
+/// Polling readers (HotSwapGraph) compare via `current_root()`.
 const OFF_CURRENT_ROOT: usize = 320;
 const CURRENT_ROOT_LEN: usize = 32;
+
+// Compile-time invariant: the sync atom slot must be 8-byte aligned for
+// the AtomicU64 cast in sync_counter_acquire / bump_sync_counter_release
+// to be sound. mmap is page-aligned, so any 8-byte-aligned offset within
+// it gives an 8-byte-aligned pointer. If a future field reorder violates
+// this, the cast becomes UB on architectures requiring naturally-aligned
+// atomics (e.g. aarch64 LSE) — fail compilation instead.
+const _: () = assert!(OFF_GENERATION.is_multiple_of(8), "sync atom must be 8-byte aligned");
+const _: () = assert!(OFF_ARENA_SIZE.is_multiple_of(8), "ArenaSize must be 8-byte aligned");
 
 /// Controller manages a memory-mapped control file.
 pub struct Controller {
@@ -174,9 +183,13 @@ impl Controller {
     ///
     /// Internally Acquire-loads the private sync counter, fencing
     /// the plain byte reads of `current_root` against the writer's
-    /// Release-store inside `set_arena*`. Readers see a consistent
-    /// snapshot of (path, size, root) when they call this method
-    /// followed by `arena_path` / `arena_size`.
+    /// Release-store inside `set_arena*`. **The Acquire is per-call:**
+    /// it pairs with the Release for the bytes read inside this
+    /// method only. Subsequent calls to `arena_path()` / `arena_size()`
+    /// are NOT fenced relative to a concurrent writer; under polling
+    /// the safe pattern is to dispatch on root change, then re-open a
+    /// fresh `Controller` (single mmap snapshot of the file). See
+    /// `HotSwapGraph::maybe_swap` for the reference impl.
     pub fn current_root(&self) -> [u8; 32] {
         // Acquire fence on the internal sync counter. Any prior
         // writer-Release-store happens-before the byte reads below.
@@ -186,18 +199,15 @@ impl Controller {
         out
     }
 
-    /// Set the current arena root.
-    ///
-    /// **T2.1 additive — do not call from the snapshot critical path
-    /// in production yet.** T2.2 (`ley-line-open-babf6a`) integrates
-    /// this with `set_arena` so the root and the generation cutover
-    /// happen under the same Release-ordering. Until then, this method
-    /// is a non-atomic byte write available for tests and the early
-    /// migration path.
-    ///
-    /// To clear the root (downgrade to the "no current root" sentinel),
-    /// pass `[0u8; 32]`.
-    pub fn set_current_root(&mut self, root: [u8; 32]) -> Result<()> {
+    /// **Test-only, unfenced root setter.** Lets tests seed or clobber
+    /// the root region directly without going through the publish
+    /// fence. Production callers must use [`Self::set_arena_with_root`],
+    /// which writes under the Release-store of the sync counter so
+    /// polling readers observe a consistent snapshot. Gated behind
+    /// `#[cfg(test)]` so production code can't reach the unfenced
+    /// path even by accident.
+    #[cfg(test)]
+    fn set_current_root(&mut self, root: [u8; 32]) -> Result<()> {
         self.mmap[OFF_CURRENT_ROOT..OFF_CURRENT_ROOT + CURRENT_ROOT_LEN]
             .copy_from_slice(&root);
         self.mmap.flush().context("flush control block")?;
@@ -235,8 +245,9 @@ impl Controller {
 
         // Bump the internal sync counter via Release-store. Readers
         // doing Acquire-load on the counter see all prior writes
-        // (path, size). current_root is *not* modified here.
-        std::sync::atomic::fence(Ordering::Release);
+        // (path, size). current_root is *not* modified here. The
+        // Release-store itself is the ordering — no separate fence
+        // needed.
         self.bump_sync_counter_release();
 
         // Flush to disk
@@ -261,30 +272,17 @@ impl Controller {
         }
     }
 
-    /// **T2.2: atomic publish of (arena, generation, current_root) under
-    /// a single Release-ordering.**
+    /// **T2.4: atomic publish of (path, size, current_root) under a
+    /// single Release-ordering.**
     ///
-    /// This is the content-addressed publish primitive. Writes path,
-    /// size, and `current_root` first (in any plain-store order), then
-    /// performs a Release-store of `generation`. The Release-store
-    /// ensures all prior plain stores are visible to any reader that
-    /// observes the new generation via Acquire load — so a reader doing
-    /// `generation()` then `current_root()` sees a consistent
-    /// (gen, root) pair.
+    /// This is the substrate's content-addressed advance primitive —
+    /// `current_root` IS the published state. Plain byte writes for
+    /// path, size, and root are followed by a Release-store of the
+    /// private sync counter. Polling readers do an Acquire-load on
+    /// the same counter inside `current_root()`, establishing the
+    /// happens-before edge that makes the byte writes visible.
     ///
     /// Use this in the snapshot critical path:
-    ///
-    /// ```ignore
-    /// let root = blake3::hash(&db_bytes).into();
-    /// ctrl.set_arena_with_root(&arena_path, new_size, new_gen, root)?;
-    /// ```
-    ///
-    /// Σ root semantics (decade `ley-line-open-9d30ac` §3.4):
-    /// `current_root = BLAKE3(arena_buffer)`. Locked to BLAKE3.
-    /// **T2.4: atomic publish of (path, size, current_root) under a
-    /// single Release-ordering.** This is the substrate's content-
-    /// addressed advance primitive — `current_root` IS the published
-    /// state. Use this in the snapshot critical path:
     ///
     /// ```ignore
     /// let root = blake3::hash(&db_bytes).into();
@@ -324,15 +322,11 @@ impl Controller {
         self.mmap[OFF_CURRENT_ROOT..OFF_CURRENT_ROOT + CURRENT_ROOT_LEN]
             .copy_from_slice(&current_root);
 
-        // T2.2: hardware fence prevents the optimizer from reordering
-        // the prior byte writes (path, size, current_root) past the
-        // atomic Release-store below.
-        std::sync::atomic::fence(Ordering::Release);
-
         // T2.4: bump the internal sync counter via Release-store.
-        // Readers Acquire-load it inside `current_root()` to fence
-        // their plain byte reads. Counter value itself is not
-        // exposed publicly; readers key on root for identity.
+        // The Release-store itself fences the prior plain byte writes
+        // (path, size, current_root) — readers doing the paired
+        // Acquire-load inside `current_root()` see them all. No
+        // separate hardware fence needed.
         self.bump_sync_counter_release();
 
         // Flush to disk

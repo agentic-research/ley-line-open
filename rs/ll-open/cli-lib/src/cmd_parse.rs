@@ -380,11 +380,11 @@ pub fn parse_into_conn(
 
     conn.execute_batch("BEGIN")?;
 
-    // T8.3: capnp dual-write — open snapshot files alongside the SQL
-    // writes. Truncate-and-rewrite semantics: each parse run produces
-    // a fresh snapshot of `_ast` and `_source`. `:memory:` connections
-    // skip (no path to write next to). T8.5 will hash these segments
-    // into the Σ root.
+    // capnp dual-write (bead `ley-line-open-cdf098`) — open snapshot
+    // files alongside the SQL writes. Truncate-and-rewrite semantics:
+    // each parse run produces a fresh snapshot of `_ast` and `_source`.
+    // `:memory:` connections skip (no path to write next to). The
+    // segment-hashing → Σ root advance is bead `ley-line-open-ce55b1`.
     let (mut ast_writer, mut source_writer) = sibling_snapshot_writers(conn);
 
     // Prepare statements once — reuse for all rows (avoids SQL parse per INSERT).
@@ -419,8 +419,8 @@ pub fn parse_into_conn(
 
                 stmt_source.execute(rusqlite::params![&pf.rel, &pf.language, &pf.abs_path])?;
 
-                // T8.3 capnp dual-write: same fields as the SQL row,
-                // typed and content-addressable.
+                // capnp dual-write (`ley-line-open-cdf098`): same
+                // fields as the SQL row, typed and content-addressable.
                 if let Some(w) = source_writer.as_mut() {
                     write_source_file_record(
                         w,

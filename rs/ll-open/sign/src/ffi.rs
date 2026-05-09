@@ -20,8 +20,10 @@ unsafe fn write_out(data: &[u8], out_buf: *mut u8, out_len: usize) -> i32 {
 /// Returns >= 0 (bytes written to out_buf) on success, -1 on error.
 ///
 /// # Safety
-/// All pointers must be valid for their stated lengths.
-/// `private_key_ptr` must point to exactly 64 bytes (Ed25519 keypair).
+/// All input pointers must be non-null and valid for their stated
+/// lengths. `private_key_ptr` must point to exactly 64 bytes (Ed25519
+/// keypair). `out_buf` must be non-null and writable for `out_len`
+/// bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn leyline_sign_data(
     data_ptr: *const u8,
@@ -32,6 +34,16 @@ pub unsafe extern "C" fn leyline_sign_data(
     out_buf: *mut u8,
     out_len: usize,
 ) -> i32 {
+    // Defensive null checks: slice::from_raw_parts requires non-null
+    // even when len == 0 (per Rust's safety contract). Mirror the
+    // pattern used in leyline-fs's FFI.
+    if data_ptr.is_null()
+        || cert_der_ptr.is_null()
+        || private_key_ptr.is_null()
+        || out_buf.is_null()
+    {
+        return -1;
+    }
     let data = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
     let cert_der = unsafe { std::slice::from_raw_parts(cert_der_ptr, cert_der_len) };
     let key_slice = unsafe { std::slice::from_raw_parts(private_key_ptr, 64) };
@@ -51,8 +63,10 @@ pub unsafe extern "C" fn leyline_sign_data(
 /// Returns >= 0 (bytes written to out_buf) on success, -1 on error.
 ///
 /// # Safety
-/// All pointers must be valid for their stated lengths.
-/// `private_key_ptr` must point to exactly 64 bytes (Ed25519 keypair).
+/// All input pointers must be non-null and valid for their stated
+/// lengths. `private_key_ptr` must point to exactly 64 bytes (Ed25519
+/// keypair). `out_buf` must be non-null and writable for `out_len`
+/// bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn leyline_sign_data_without_attributes(
     data_ptr: *const u8,
@@ -63,6 +77,13 @@ pub unsafe extern "C" fn leyline_sign_data_without_attributes(
     out_buf: *mut u8,
     out_len: usize,
 ) -> i32 {
+    if data_ptr.is_null()
+        || cert_der_ptr.is_null()
+        || private_key_ptr.is_null()
+        || out_buf.is_null()
+    {
+        return -1;
+    }
     let data = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
     let cert_der = unsafe { std::slice::from_raw_parts(cert_der_ptr, cert_der_len) };
     let key_slice = unsafe { std::slice::from_raw_parts(private_key_ptr, 64) };
@@ -83,7 +104,9 @@ pub unsafe extern "C" fn leyline_sign_data_without_attributes(
 /// the number of bytes written (>= 0). Returns -1 on verification failure.
 ///
 /// # Safety
-/// All pointers must be valid for their stated lengths.
+/// All input pointers must be non-null and valid for their stated
+/// lengths. `cert_out_buf` must be non-null and writable for
+/// `cert_out_len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn leyline_verify(
     cms_sig_ptr: *const u8,
@@ -93,6 +116,9 @@ pub unsafe extern "C" fn leyline_verify(
     cert_out_buf: *mut u8,
     cert_out_len: usize,
 ) -> i32 {
+    if cms_sig_ptr.is_null() || data_ptr.is_null() || cert_out_buf.is_null() {
+        return -1;
+    }
     let cms_sig = unsafe { std::slice::from_raw_parts(cms_sig_ptr, cms_sig_len) };
     let data = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
 

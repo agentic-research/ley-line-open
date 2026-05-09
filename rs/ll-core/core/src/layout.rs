@@ -37,19 +37,99 @@ impl ArenaHeader {
     pub const HEADER_SIZE: u64 = 4096;
 
     /// Calculate the byte offset of the active buffer within the arena file.
+    ///
+    /// Returns `None` for any malformed header (bad magic, VERSION
+    /// mismatch, bad active_buffer index, or truncated file).
+    /// Callers wanting a caller-readable diagnosis should use
+    /// [`Self::validate_header`] — it produces the typed reason
+    /// (bad magic vs VERSION mismatch vs truncated vs bad index).
     pub fn active_buffer_offset(&self, file_size: u64) -> Option<u64> {
-        if self.magic != Self::MAGIC || self.version != Self::VERSION || self.active_buffer > 1 {
+        if self.magic != Self::MAGIC
+            || self.version != Self::VERSION
+            || self.active_buffer > 1
+            || file_size < Self::HEADER_SIZE
+        {
             return None;
         }
         let buffer_size = Self::buffer_size(file_size);
         Some(Self::HEADER_SIZE + self.active_buffer as u64 * buffer_size)
     }
 
-    /// Calculate the size of each buffer half.
+    /// Validate the header against `file_size`, returning a typed
+    /// reason on failure so callers can surface VERSION mismatch
+    /// distinctly from "torn header" / "truncated file" / "bad magic".
+    /// Returns `Ok(active_buffer_offset)` when valid.
+    pub fn validate_header(&self, file_size: u64) -> Result<u64, ArenaHeaderError> {
+        if self.magic != Self::MAGIC {
+            return Err(ArenaHeaderError::BadMagic(self.magic));
+        }
+        if self.version != Self::VERSION {
+            return Err(ArenaHeaderError::VersionMismatch {
+                file: self.version,
+                expected: Self::VERSION,
+            });
+        }
+        if self.active_buffer > 1 {
+            return Err(ArenaHeaderError::BadActiveBuffer(self.active_buffer));
+        }
+        if file_size < Self::HEADER_SIZE {
+            return Err(ArenaHeaderError::TruncatedFile { file_size });
+        }
+        let buffer_size = Self::buffer_size(file_size);
+        Ok(Self::HEADER_SIZE + self.active_buffer as u64 * buffer_size)
+    }
+
+    /// Calculate the size of each buffer half. Saturates to 0 when
+    /// `file_size` is smaller than the header — guards against a
+    /// `u64` underflow that would otherwise produce a near-`u64::MAX`
+    /// value and panic on downstream slice indexing. Callers should
+    /// use [`Self::active_buffer_offset`] (which checks file_size
+    /// against HEADER_SIZE) or [`Self::validate_header`] before
+    /// trusting the result.
     pub fn buffer_size(file_size: u64) -> u64 {
-        (file_size - Self::HEADER_SIZE) / 2
+        file_size.saturating_sub(Self::HEADER_SIZE) / 2
     }
 }
+
+/// Typed reason an arena header failed to validate. Lets callers
+/// surface "VERSION mismatch — coordinate cutover" distinctly from
+/// "bad magic — disk corruption" or "truncated file" without parsing
+/// error strings.
+#[derive(Debug)]
+pub enum ArenaHeaderError {
+    BadMagic(u32),
+    VersionMismatch { file: u8, expected: u8 },
+    BadActiveBuffer(u8),
+    TruncatedFile { file_size: u64 },
+}
+
+impl std::fmt::Display for ArenaHeaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadMagic(m) => write!(
+                f,
+                "bad arena magic: 0x{m:08X} (expected 0x{:08X})",
+                ArenaHeader::MAGIC
+            ),
+            Self::VersionMismatch { file, expected } => write!(
+                f,
+                "ArenaHeader VERSION mismatch: file has v{file}, this binary expects v{expected}. \
+                 T2.4 (decade ley-line-open-9d30ac) bumped to v2; old binaries cannot read \
+                 new arenas and vice versa. Coordinate LLO + mache release cutover."
+            ),
+            Self::BadActiveBuffer(b) => {
+                write!(f, "invalid active_buffer: {b} (expected 0 or 1)")
+            }
+            Self::TruncatedFile { file_size } => write!(
+                f,
+                "arena file truncated: file_size = {file_size} bytes, smaller than header (4096). \
+                 File may have been partially written or corrupted."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ArenaHeaderError {}
 
 /// Write data to the inactive arena buffer and flip the header.
 ///

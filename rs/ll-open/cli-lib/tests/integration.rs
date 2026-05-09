@@ -1360,25 +1360,27 @@ fn t23_reader_refuses_arena_when_buffer_corrupted() {
     );
 }
 
-/// T2.3 legacy compatibility: a Controller with `current_root = 0`
-/// (legacy pre-T2.2 .ctrl, or a writer that uses the legacy
-/// `set_arena` API) makes the reader skip verification. Pin so a
-/// stricter check (e.g. "always require non-zero root") doesn't
-/// silently break old `.db` files or non-T2.2 producers.
+/// T2.4 hardening: post-cutover, a zero `current_root` paired with a
+/// **non-empty** payload (data_size > 0) is treated as a downgrade
+/// attempt and rejected. Pre-T2.4 the reader silently skipped
+/// verification on the zero sentinel — that left a hole where a
+/// process able to write 32 bytes could disable content verification
+/// while leaving arbitrary bytes for sqlite3_deserialize. The hard
+/// V2 cutover removes any legacy producer of "data + no root", so
+/// the skip is no longer needed and is gone.
 #[test]
-fn t23_reader_skips_verification_on_zero_root_sentinel() {
-    use leyline_core::{Controller, ArenaHeader, create_arena, layout::write_to_arena};
+fn t24_reader_rejects_zero_root_with_data() {
+    use leyline_core::{Controller, create_arena, layout::write_to_arena};
     use leyline_fs::SqliteGraph;
 
     let arena_dir = TempDir::new().unwrap();
-    let arena_path = arena_dir.path().join("t23-zero.arena");
-    let ctrl_path = arena_dir.path().join("t23-zero.ctrl");
+    let arena_path = arena_dir.path().join("t24-zero-with-data.arena");
+    let ctrl_path = arena_dir.path().join("t24-zero-with-data.ctrl");
 
     let arena_size = 4 * 1024 * 1024;
     let mut mmap = create_arena(&arena_path, arena_size).unwrap();
 
-    // Build a real SQLite db, get its bytes, write into arena via the
-    // legacy set_arena (no current_root publish).
+    // Real SQLite db in the buffer (data_size > 0 after write_to_arena).
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
         .unwrap();
@@ -1386,40 +1388,79 @@ fn t23_reader_skips_verification_on_zero_root_sentinel() {
     write_to_arena(&mut mmap, &db_bytes).unwrap();
 
     let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    // Legacy path: set_arena (no root) leaves current_root at zero sentinel.
+    // set_arena (no root) — leaves current_root at zero sentinel.
+    // Pre-T2.4 readers skipped verification here; T2.4 rejects.
     ctrl.set_arena(&arena_path.to_string_lossy(), arena_size)
         .unwrap();
     assert_eq!(
         ctrl.current_root(),
         [0u8; 32],
-        "legacy set_arena leaves current_root at zero sentinel",
+        "set_arena leaves current_root at zero sentinel",
     );
     drop(ctrl);
 
-    // Reader skips verification on zero sentinel and deserializes.
-    let graph = SqliteGraph::from_arena(&ctrl_path).expect(
-        "T2.3: zero-root sentinel must skip verification (legacy compat)",
+    let result = SqliteGraph::from_arena(&ctrl_path);
+    let err = match result {
+        Ok(_) => panic!(
+            "T2.4: reader must reject zero-root + non-empty data \
+             (downgrade hole closed)"
+        ),
+        Err(e) => e,
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("zero sentinel") || msg.contains("substrate identity"),
+        "T2.4 error must identify the missing-root downgrade case (got: {msg})",
     );
-    let _ = graph.conn();
-    // Sanity that the buffer was the right SQLite db.
-    let header_check: i64 = graph
-        .conn()
-        .query_row("SELECT x FROM t", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(header_check, 1);
-
-    // Sanity check that the active buffer offset is valid.
-    let _ = ArenaHeader::buffer_size(arena_size);
 }
 
-/// T2.3: when current_root is non-zero AND the buffer is not a valid
-/// SQLite v3 file, the reader returns a clear error rather than
-/// crashing or producing a misleading "hash mismatch." Catches
-/// substrate / non-substrate confusion (e.g., wrong arena file
-/// passed in).
+/// T2.4 fresh-arena path: a brand-new arena with no payload (data_size
+/// == 0) and zero current_root is still legal — there's nothing to
+/// verify and nothing to deserialize. The reader either accepts an
+/// empty SQLite buffer (sqlite3_deserialize errors with its own clear
+/// message) or returns a structural error from from_bytes; either way
+/// must NOT be the "downgrade" rejection from the prior test.
+#[test]
+fn t24_reader_accepts_zero_root_with_empty_data() {
+    use leyline_core::{Controller, create_arena};
+    use leyline_fs::SqliteGraph;
+
+    let arena_dir = TempDir::new().unwrap();
+    let arena_path = arena_dir.path().join("t24-fresh.arena");
+    let ctrl_path = arena_dir.path().join("t24-fresh.ctrl");
+
+    let arena_size = 4 * 1024 * 1024;
+    let _mmap = create_arena(&arena_path, arena_size).unwrap();
+
+    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size)
+        .unwrap();
+    drop(ctrl);
+
+    // Fresh arena: header.data_size == 0, current_root == [0;32].
+    // The verifier returns Ok(empty slice); SQLite then errors on
+    // empty bytes — that's a from_bytes-level failure, not the
+    // "downgrade" path tested above. Pin: any error here must NOT
+    // be the substrate-identity rejection.
+    let result = SqliteGraph::from_arena(&ctrl_path);
+    if let Err(e) = result {
+        let msg = format!("{e:#}");
+        assert!(
+            !(msg.contains("zero sentinel") || msg.contains("substrate identity")),
+            "T2.4: fresh empty arena must not trip the downgrade rejection \
+             (data_size == 0 is the legitimate empty case); got: {msg}",
+        );
+    }
+}
+
+/// T2.3: when current_root is non-zero AND the buffer's bytes don't
+/// hash to it, the reader returns a clear "arena root mismatch" error
+/// rather than crashing or running sqlite3_deserialize on corrupted
+/// data. Catches substrate / non-substrate confusion (e.g., wrong
+/// arena file passed in or post-publish tampering).
 #[test]
 fn t23_reader_errors_clearly_on_non_sqlite_buffer() {
-    use leyline_core::{Controller, ArenaHeader, create_arena};
+    use leyline_core::{Controller, ArenaHeader, create_arena, layout::write_to_arena};
     use leyline_fs::SqliteGraph;
 
     let arena_dir = TempDir::new().unwrap();
@@ -1427,9 +1468,19 @@ fn t23_reader_errors_clearly_on_non_sqlite_buffer() {
     let ctrl_path = arena_dir.path().join("t23-nonsqlite.ctrl");
 
     let arena_size = 4 * 1024 * 1024;
-    let _mmap = create_arena(&arena_path, arena_size).unwrap();
+    let mut mmap = create_arena(&arena_path, arena_size).unwrap();
+    // Write some valid SQLite bytes via write_to_arena so data_size > 0.
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
+        .unwrap();
+    let db_bytes = conn.serialize(rusqlite::DatabaseName::Main).unwrap();
+    write_to_arena(&mut mmap, &db_bytes).unwrap();
+    drop(mmap);
 
-    // Write garbage into the active buffer.
+    // Now corrupt the active buffer's prefix in-place, mimicking
+    // post-publish tampering. data_size is unchanged, so the verifier
+    // hashes data_size bytes (including the corruption) and the
+    // computed BLAKE3 will not match the published root.
     {
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -1442,14 +1493,13 @@ fn t23_reader_errors_clearly_on_non_sqlite_buffer() {
         let offset = header
             .active_buffer_offset(arena_size)
             .expect("valid header") as usize;
-        // Garbage bytes that do NOT start with "SQLite format 3\0".
         mmap[offset..offset + 16].copy_from_slice(b"NOT-A-SQLITE-DB!");
         mmap.flush().unwrap();
     }
 
     let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    // Set a non-zero root to force verification (otherwise we'd hit
-    // the zero-sentinel skip path and not exercise the verifier).
+    // Publish a non-zero root that does NOT match the (now-corrupt)
+    // buffer hash → verifier must reject.
     ctrl.set_arena_with_root(
         &arena_path.to_string_lossy(),
         arena_size,

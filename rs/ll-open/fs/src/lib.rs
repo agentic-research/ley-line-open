@@ -19,26 +19,29 @@ use std::path::Path;
 /// T2.3 + T2.4: verify the arena buffer's BLAKE3 hash matches the
 /// controller's `current_root`. Substrate's content-addressed
 /// correctness pin: any mutation of arena bytes after the producer's
-/// atomic publish (T2.2 `set_arena_with_root`) is detected here,
+/// atomic publish (T2.4 `set_arena_with_root`) is detected here,
 /// before `sqlite3_deserialize` runs on potentially-corrupted bytes.
 ///
-/// **T2.4 change**: data length comes from `ArenaHeader.data_size`
-/// (a new field on the header — see `layout.rs`). Pre-T2.4 the
-/// reader parsed the SQLite file header to recover length; that
-/// turned out to be unreliable (SQLite's in-header `page_count` can
-/// drift from the actual serialized byte count under some allocation
-/// patterns) AND coupled the substrate to SQLite's wire format.
-/// `data_size` makes the reader content-format-agnostic.
+/// Returns the verified data slice `buf[..data_size]` so callers
+/// pass exactly the verified bytes downstream — preventing the
+/// "verifier hashes a prefix, deserializer reads the full padded
+/// buffer" asymmetry that would silently corrupt non-SQLite
+/// backends if added later.
 ///
-/// Skips verification when `current_root` is the zero sentinel — this
-/// covers writers that use the legacy `set_arena` API (no root
-/// published). Verification is purely additive — it tightens the
-/// contract when both sides participate, never breaks the legacy path.
-fn verify_arena_root(ctrl: &Controller, header: &ArenaHeader, buf: &[u8]) -> Result<()> {
-    let expected = ctrl.current_root();
-    if expected == [0u8; 32] {
-        return Ok(());
-    }
+/// **Empty / fresh arena handling**: `data_size == 0` is the only
+/// case where verification is skipped — there's nothing to hash
+/// and nothing to deserialize. Callers must check for this and
+/// route to a fresh-arena path (e.g. serve an empty in-memory db).
+/// Outside this case, a zero-sentinel `current_root` is now treated
+/// as a configuration error and refused: with V2's hard cutover
+/// there's no legacy V2 writer that would publish data without a
+/// root, and silently bypassing verification on a non-empty buffer
+/// would be a downgrade hole an attacker could ride.
+fn verify_arena_root<'a>(
+    ctrl: &Controller,
+    header: &ArenaHeader,
+    buf: &'a [u8],
+) -> Result<&'a [u8]> {
     let data_size = header.data_size as usize;
     if data_size > buf.len() {
         bail!(
@@ -47,7 +50,26 @@ fn verify_arena_root(ctrl: &Controller, header: &ArenaHeader, buf: &[u8]) -> Res
             data_size, buf.len()
         );
     }
-    let actual: [u8; 32] = blake3::hash(&buf[..data_size]).into();
+    let data = &buf[..data_size];
+    let expected = ctrl.current_root();
+
+    // data_size == 0 is the only case where we accept the zero
+    // sentinel — fresh arena, no payload, no root to verify against.
+    if data_size == 0 {
+        return Ok(data);
+    }
+
+    if expected == [0u8; 32] {
+        bail!(
+            "T2.3/T2.4: arena has data (data_size = {}) but current_root \
+             is the zero sentinel. Substrate identity is missing — refusing \
+             to deserialize unverified bytes. Producer must publish via \
+             set_arena_with_root, not the legacy set_arena.",
+            data_size
+        );
+    }
+
+    let actual: [u8; 32] = blake3::hash(data).into();
     if actual != expected {
         bail!(
             "T2.3 arena root mismatch — substrate corruption detected. \
@@ -60,7 +82,7 @@ fn verify_arena_root(ctrl: &Controller, header: &ArenaHeader, buf: &[u8]) -> Res
             buf.len(),
         );
     }
-    Ok(())
+    Ok(data)
 }
 
 fn hex_short_8(bytes: &[u8; 32]) -> String {
@@ -85,10 +107,10 @@ impl SqliteGraph {
     /// Open the active buffer from a ley-line arena as a read-only SQLite DB.
     ///
     /// **T2.3 verification:** before `sqlite3_deserialize`, the buffer's
-    /// `BLAKE3(prefix)` is compared against `controller.current_root()`.
-    /// On mismatch, returns an error and refuses to load — substrate's
-    /// content-addressed correctness pin. Skipped when `current_root`
-    /// is the zero sentinel (legacy / non-T2.2 writers).
+    /// `BLAKE3(buf[..data_size])` is compared against
+    /// `controller.current_root()`. On mismatch, returns an error and
+    /// refuses to load — substrate's content-addressed correctness
+    /// pin. Only `data_size == 0` (fresh arena) skips the hash compare.
     pub fn from_arena(control_path: &Path) -> Result<Self> {
         let controller = Controller::open_or_create(control_path)?;
         let arena_path = controller.arena_path();
@@ -101,14 +123,16 @@ impl SqliteGraph {
 
         let file_size = mmap.len() as u64;
         let offset = header
-            .active_buffer_offset(file_size)
-            .context("invalid arena header")?;
+            .validate_header(file_size)
+            .context("arena header validation failed")?;
         let buf_size = ArenaHeader::buffer_size(file_size);
 
         let buf = &mmap[offset as usize..(offset + buf_size) as usize];
-        // T2.3: σ(buf[..data_size]) == ctrl.current_root before deserialize.
-        verify_arena_root(&controller, header, buf)?;
-        Self::from_bytes(buf)
+        // T2.3: hash buf[..data_size] against current_root, return the
+        // exact verified slice so we deserialize what we verified
+        // (no padded-suffix asymmetry).
+        let verified = verify_arena_root(&controller, header, buf)?;
+        Self::from_bytes(verified)
     }
 
     /// Deserialize an arbitrary byte slice as a read-only SQLite database.

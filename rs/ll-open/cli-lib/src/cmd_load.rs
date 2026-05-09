@@ -30,7 +30,9 @@ pub fn cmd_load(db: &Path, control: &Path) -> Result<()> {
 /// 3. Open the arena file via mmap.
 /// 4. Initialize the arena header if fresh (magic == 0).
 /// 5. Write to the inactive buffer and flip via [`write_to_arena`].
-/// 6. Bump the generation in the Controller.
+/// 6. Publish current_root via set_arena_with_root (atomic substrate
+///    advance — readers see the new buffer once the Release-store of
+///    the sync atom completes).
 pub fn load_into_arena(control: &Path, db_bytes: &[u8]) -> Result<()> {
     let mut ctrl = Controller::open_or_create(control).context("open controller")?;
 

@@ -170,6 +170,13 @@ impl Controller {
     ///
     /// Writes path and size first, then atomically stores the generation
     /// with Release ordering to ensure prior writes are visible.
+    ///
+    /// **Note on `current_root`** (T2.2 onward): this method preserves
+    /// the existing `current_root` unchanged. To advance the root
+    /// atomically with the generation, use [`Self::set_arena_with_root`]
+    /// — that method writes the root *before* the Release-store of
+    /// generation, so a reader observing the new generation is
+    /// guaranteed to also observe the new root.
     pub fn set_arena(&mut self, path: &str, size: u64, generation: u64) -> Result<()> {
         if path.len() >= ARENA_PATH_LEN {
             bail!(
@@ -187,6 +194,79 @@ impl Controller {
         self.mmap[OFF_ARENA_SIZE..OFF_ARENA_SIZE + 8].copy_from_slice(&size.to_ne_bytes());
 
         // Atomic generation update (release ordering ensures path+size visible first)
+        let ptr = self.mmap[OFF_GENERATION..].as_ptr() as *const AtomicU64;
+        // SAFETY: same alignment guarantees as generation()
+        unsafe { (*ptr).store(generation, Ordering::Release) };
+
+        // Flush to disk
+        self.mmap.flush().context("flush control block")?;
+
+        Ok(())
+    }
+
+    /// **T2.2: atomic publish of (arena, generation, current_root) under
+    /// a single Release-ordering.**
+    ///
+    /// This is the content-addressed publish primitive. Writes path,
+    /// size, and `current_root` first (in any plain-store order), then
+    /// performs a Release-store of `generation`. The Release-store
+    /// ensures all prior plain stores are visible to any reader that
+    /// observes the new generation via Acquire load — so a reader doing
+    /// `generation()` then `current_root()` sees a consistent
+    /// (gen, root) pair.
+    ///
+    /// Use this in the snapshot critical path:
+    ///
+    /// ```ignore
+    /// let root = blake3::hash(&db_bytes).into();
+    /// ctrl.set_arena_with_root(&arena_path, new_size, new_gen, root)?;
+    /// ```
+    ///
+    /// Σ root semantics (decade `ley-line-open-9d30ac` §3.4):
+    /// `current_root = BLAKE3(arena_buffer)`. Locked to BLAKE3.
+    pub fn set_arena_with_root(
+        &mut self,
+        path: &str,
+        size: u64,
+        generation: u64,
+        current_root: [u8; 32],
+    ) -> Result<()> {
+        if path.len() >= ARENA_PATH_LEN {
+            bail!(
+                "arena path too long (max {} bytes, got {})",
+                ARENA_PATH_LEN - 1,
+                path.len()
+            );
+        }
+
+        // Write path (null-terminated)
+        self.mmap[OFF_ARENA_PATH..OFF_ARENA_PATH + path.len()].copy_from_slice(path.as_bytes());
+        self.mmap[OFF_ARENA_PATH + path.len()] = 0;
+
+        // Write size
+        self.mmap[OFF_ARENA_SIZE..OFF_ARENA_SIZE + 8].copy_from_slice(&size.to_ne_bytes());
+
+        // T2.2: Write current_root BEFORE the Release-store of
+        // generation. Plain byte copy; the Release on generation
+        // publishes it.
+        self.mmap[OFF_CURRENT_ROOT..OFF_CURRENT_ROOT + CURRENT_ROOT_LEN]
+            .copy_from_slice(&current_root);
+
+        // T2.2: compiler fence prevents the optimizer from reordering
+        // the prior byte writes (path, size, current_root) past the
+        // atomic Release-store below. The Release on the AtomicU64
+        // provides the hardware ordering; the compiler_fence ensures
+        // program-order is also preserved at compile time. Without
+        // this, the optimizer could legally place the byte writes
+        // *after* the atomic store (different memory addresses,
+        // different access kinds — the compiler doesn't know they
+        // alias the same mmap), which would let a reader observe the
+        // new generation but stale path/size/root.
+        std::sync::atomic::fence(Ordering::Release);
+
+        // Atomic generation update with Release — publishes path, size,
+        // AND current_root atomically to readers using Acquire on
+        // generation().
         let ptr = self.mmap[OFF_GENERATION..].as_ptr() as *const AtomicU64;
         // SAFETY: same alignment guarantees as generation()
         unsafe { (*ptr).store(generation, Ordering::Release) };
@@ -573,5 +653,156 @@ mod tests {
             assert_eq!(offset, 4096);
             assert_eq!(len, 2048);
         }
+    }
+
+    /// T2.2: `set_arena_with_root` writes path, size, generation, and
+    /// current_root atomically. After the call, all four reflect the
+    /// new values. Pin the basic API contract.
+    #[test]
+    fn set_arena_with_root_writes_all_four_fields() {
+        let dir = tempdir().unwrap();
+        let ctrl_path = dir.path().join("t22-basic.ctrl");
+        let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+
+        let root: [u8; 32] = [0xAB; 32];
+        ctrl.set_arena_with_root("/some/arena", 4096, 7, root).unwrap();
+
+        assert_eq!(ctrl.arena_path(), "/some/arena");
+        assert_eq!(ctrl.arena_size(), 4096);
+        assert_eq!(ctrl.generation(), 7);
+        assert_eq!(ctrl.current_root(), root);
+    }
+
+    /// T2.2: legacy `set_arena` (no root parameter) preserves the
+    /// existing `current_root`. Pin so a future refactor that
+    /// "helpfully" zeroes the root in legacy callers doesn't silently
+    /// regress all 20+ existing callers (test fixtures, benches, etc.)
+    /// that pass through the legacy method.
+    #[test]
+    fn set_arena_preserves_current_root() {
+        let dir = tempdir().unwrap();
+        let ctrl_path = dir.path().join("t22-preserve.ctrl");
+        let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+
+        // Establish a non-zero root.
+        let root: [u8; 32] = [0xCD; 32];
+        ctrl.set_arena_with_root("/arena1", 1024, 1, root).unwrap();
+        assert_eq!(ctrl.current_root(), root);
+
+        // Re-advertise via legacy set_arena (the snapshot's step-2
+        // re-advertisement path uses this; it must not clobber the root).
+        ctrl.set_arena("/arena1", 2048, 1).unwrap();
+        assert_eq!(
+            ctrl.current_root(),
+            root,
+            "legacy set_arena must preserve current_root unchanged"
+        );
+        // Other fields updated as expected.
+        assert_eq!(ctrl.arena_size(), 2048);
+    }
+
+    /// T2.2: cross-Controller visibility — a fresh `Controller` opened
+    /// after the writer's `set_arena_with_root` returns sees the
+    /// committed (generation, current_root) pair. This is what the
+    /// daemon's HotSwapGraph reader path actually depends on: the
+    /// writer publishes via flush; subsequent readers (in the same or
+    /// different process) see consistent state.
+    ///
+    /// Note on what this test does NOT verify: the *concurrent*
+    /// case where a reader polls a long-lived Controller while the
+    /// writer races through many generations is not seqlock-safe by
+    /// design. Reader observing `gen=N` sees `current_root` for some
+    /// gen `≥ N` (writer-monotone advancement), not `=N` exactly. The
+    /// daemon's reader copes via the snapshot-based arena flip — when
+    /// gen bumps, it deserializes the arena bytes which carry their
+    /// own consistency. Stricter (gen, root) atomicity would require
+    /// extending the API with explicit seqlock counters, which is out
+    /// of scope for T2.2.
+    #[test]
+    fn set_arena_with_root_visible_across_controllers() {
+        let dir = tempdir().unwrap();
+        let ctrl_path = dir.path().join("t22-visible.ctrl");
+
+        // Writer: open Controller, publish, drop (flushes mmap).
+        {
+            let mut w = Controller::open_or_create(&ctrl_path).unwrap();
+            w.set_arena_with_root("/some/arena", 4096, 42, [0xCD; 32])
+                .unwrap();
+        }
+
+        // Reader: open separate Controller after writer dropped.
+        let r = Controller::open_or_create(&ctrl_path).unwrap();
+        assert_eq!(r.generation(), 42);
+        assert_eq!(r.current_root(), [0xCD; 32]);
+        assert_eq!(r.arena_path(), "/some/arena");
+        assert_eq!(r.arena_size(), 4096);
+    }
+
+    /// T2.2: under writer-monotone advancement, a long-lived reader
+    /// never sees a `current_root` that is *stale* relative to the
+    /// generation it observes. Specifically: if the reader observes
+    /// `gen=N`, then either (a) root corresponds to gen `N` exactly,
+    /// or (b) root corresponds to a *future* gen (writer raced
+    /// ahead during the reader's two reads). Stale (gen `<N`) is
+    /// the bug case — that would mean the Release-store of gen
+    /// happened before the prior writes to root, breaking the
+    /// happens-before relationship.
+    ///
+    /// This is the actual invariant the daemon relies on: the reader
+    /// will never see a torn pair where gen is advanced but root is
+    /// from a previous publish.
+    #[test]
+    fn set_arena_with_root_root_never_stale_under_writer_race() {
+        use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempdir().unwrap();
+        let ctrl_path = dir.path().join("t22-monotone.ctrl");
+
+        // Initialize at gen=0, root=0.
+        let mut writer = Controller::open_or_create(&ctrl_path).unwrap();
+        writer.set_arena_with_root("/x", 8, 0, [0u8; 32]).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_reader = stop.clone();
+        let path_for_reader = ctrl_path.clone();
+
+        let reader = thread::spawn(move || {
+            let r = Controller::open_or_create(&path_for_reader).unwrap();
+            let mut stale_violations = 0usize;
+            let mut samples = 0usize;
+            while !stop_reader.load(AOrd::Acquire) {
+                let g = r.generation();
+                let root = r.current_root();
+                samples += 1;
+                // Writer convention: at iteration N, writes root[0]=N (mod 256).
+                // Stale = observed gen N but root[0] < (N as u8) AFTER overflow handling.
+                // Since N goes 0..50, no wrap; stale means root[0] < g.
+                if g > 0 && (root[0] as u64) < g {
+                    stale_violations += 1;
+                }
+            }
+            (stale_violations, samples)
+        });
+
+        // Writer: 50 iterations with small sleeps for measurement noise.
+        for n in 1u64..=50 {
+            writer
+                .set_arena_with_root("/x", 8, n, [n as u8; 32])
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+        stop.store(true, AOrd::Release);
+
+        let (stale_violations, samples) = reader.join().unwrap();
+        assert!(samples > 0, "reader observed no samples — invalid test");
+        assert_eq!(
+            stale_violations, 0,
+            "T2.2 monotone invariant violated: reader observed `gen >= N` \
+             paired with stale `root[0] < N`. Means the writer's prior \
+             writes to current_root were *not* published before the \
+             Release-store of generation. {samples} samples taken.",
+        );
     }
 }

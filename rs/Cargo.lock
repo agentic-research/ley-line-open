@@ -1209,6 +1209,7 @@ name = "leyline-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "bytemuck",
  "memmap2",
  "serde",

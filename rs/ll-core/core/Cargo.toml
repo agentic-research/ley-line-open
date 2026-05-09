@@ -8,6 +8,9 @@ anyhow = "1.0"
 memmap2 = "0.9"
 bytemuck = { version = "1.14", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
+# T2.2: BLAKE3 for σ(arena buffer) computed at snapshot time. Locked
+# to BLAKE3 per Σ §3.4 (decade write-up 2026-merkle-cas-substrate.md).
+blake3 = "1"
 
 [features]
 default = []

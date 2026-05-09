@@ -666,17 +666,32 @@ pub fn snapshot_to_arena(conn: &rusqlite::Connection, ctrl_path: &Path) -> Resul
     // is unchanged; old buffer remains the readable one until step 4.
     leyline_core::write_to_arena(&mut mmap, &db_bytes).context("write to arena")?;
 
-    // Step 4: atomic publish — bump generation. Polling readers see
-    // gen change, refresh, observe (new_size, new_gen, new active_buffer).
+    // Step 4: atomic publish — bump generation AND write current_root
+    // under the same Release-ordering (T2.2). Polling readers see gen
+    // change, refresh, observe (new_size, new_gen, new active_buffer,
+    // new current_root). The current_root is BLAKE3 of the serialized
+    // db bytes — Σ §3.4 specifies BLAKE3 as the substrate hash.
     let new_gen = ctrl.generation() + 1;
-    ctrl.set_arena(&arena_path, new_size, new_gen)
-        .context("bump generation (publish snapshot)")?;
+    let current_root: [u8; 32] = blake3::hash(&db_bytes).into();
+    ctrl.set_arena_with_root(&arena_path, new_size, new_gen, current_root)
+        .context("bump generation + publish current_root")?;
 
     eprintln!(
-        "snapshot to arena (generation {new_gen}, {} bytes)",
-        db_bytes.len()
+        "snapshot to arena (generation {new_gen}, {} bytes, root {})",
+        db_bytes.len(),
+        hex_short(&current_root),
     );
     Ok(())
+}
+
+/// Compact hex prefix for log lines (first 8 hex chars of a 32-byte hash).
+fn hex_short(bytes: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(8);
+    for b in &bytes[..4] {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 // ---------------------------------------------------------------------------

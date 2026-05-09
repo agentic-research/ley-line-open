@@ -1116,6 +1116,138 @@ fn test_multiple_snapshot_cycles() {
 }
 
 // ---------------------------------------------------------------------------
+// T2.2 — current_root content-addressing tests
+// ---------------------------------------------------------------------------
+
+/// T2.2: snapshot writes `current_root = BLAKE3(serialized db bytes)`
+/// in the same atomic flip as generation. A fresh Controller opened
+/// after the snapshot returns sees the matching root.
+#[test]
+fn snapshot_populates_current_root_with_blake3_of_db_bytes() {
+    use leyline_core::{Controller, create_arena};
+    use leyline_cli_lib::cmd_parse::parse_into_conn;
+    use leyline_cli_lib::cmd_daemon::snapshot_to_arena;
+
+    let src = create_go_fixture();
+    let arena_dir = TempDir::new().unwrap();
+    let arena_path = arena_dir.path().join("t22.arena");
+    let ctrl_path = arena_dir.path().join("t22.ctrl");
+
+    let arena_size = 4 * 1024 * 1024;
+    let _mmap = create_arena(&arena_path, arena_size).unwrap();
+    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size, 0).unwrap();
+    drop(ctrl);
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
+
+    // Independently compute the expected root: BLAKE3 of the bytes
+    // snapshot_to_arena would serialize.
+    let expected_db_bytes = conn.serialize(rusqlite::DatabaseName::Main).unwrap();
+    let expected_root: [u8; 32] = blake3::hash(&expected_db_bytes).into();
+
+    // Snapshot.
+    snapshot_to_arena(&conn, &ctrl_path).unwrap();
+
+    // Re-open Controller and read current_root.
+    let r = Controller::open_or_create(&ctrl_path).unwrap();
+    assert_eq!(r.generation(), 1, "first snapshot bumps gen 0 → 1");
+    assert_eq!(
+        r.current_root(),
+        expected_root,
+        "T2.2: current_root must equal BLAKE3(serialized db bytes)",
+    );
+    assert_ne!(
+        r.current_root(),
+        [0u8; 32],
+        "T2.2: post-snapshot current_root must not be the zero sentinel",
+    );
+}
+
+/// T2.2: a snapshot of an unchanged db produces the *same* current_root.
+/// Pin idempotency — `current_root` is a pure function of the bytes.
+#[test]
+fn snapshot_idempotent_root_for_same_db_state() {
+    use leyline_core::{Controller, create_arena};
+    use leyline_cli_lib::cmd_parse::parse_into_conn;
+    use leyline_cli_lib::cmd_daemon::snapshot_to_arena;
+
+    let src = create_go_fixture();
+    let arena_dir = TempDir::new().unwrap();
+    let arena_path = arena_dir.path().join("t22-idem.arena");
+    let ctrl_path = arena_dir.path().join("t22-idem.ctrl");
+
+    let arena_size = 4 * 1024 * 1024;
+    let _mmap = create_arena(&arena_path, arena_size).unwrap();
+    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size, 0).unwrap();
+    drop(ctrl);
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
+
+    snapshot_to_arena(&conn, &ctrl_path).unwrap();
+    let root_after_first = Controller::open_or_create(&ctrl_path).unwrap().current_root();
+
+    // Snapshot again with no db changes. Generation bumps; root stays.
+    snapshot_to_arena(&conn, &ctrl_path).unwrap();
+    let r = Controller::open_or_create(&ctrl_path).unwrap();
+    let root_after_second = r.current_root();
+
+    assert_eq!(r.generation(), 2, "second snapshot bumps gen → 2");
+    assert_eq!(
+        root_after_second, root_after_first,
+        "T2.2: re-snapshotting unchanged db preserves current_root \
+         (pure function of bytes)",
+    );
+}
+
+/// T2.2: db state changes → current_root changes. Negative pin: if the
+/// hash were keyed on something other than db bytes (or computed at a
+/// different stage), this would fail.
+#[test]
+fn snapshot_root_advances_when_db_changes() {
+    use leyline_core::{Controller, create_arena};
+    use leyline_cli_lib::cmd_parse::parse_into_conn;
+    use leyline_cli_lib::cmd_daemon::snapshot_to_arena;
+
+    let src = create_go_fixture();
+    let arena_dir = TempDir::new().unwrap();
+    let arena_path = arena_dir.path().join("t22-advance.arena");
+    let ctrl_path = arena_dir.path().join("t22-advance.ctrl");
+
+    let arena_size = 4 * 1024 * 1024;
+    let _mmap = create_arena(&arena_path, arena_size).unwrap();
+    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size, 0).unwrap();
+    drop(ctrl);
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
+
+    snapshot_to_arena(&conn, &ctrl_path).unwrap();
+    let root_v1 = Controller::open_or_create(&ctrl_path).unwrap().current_root();
+
+    // Modify a file, reparse, snapshot again.
+    fs::write(
+        src.path().join("main.go"),
+        "package main\n\nfunc main() {\n\tprintln(\"changed\")\n}\n",
+    )
+    .unwrap();
+    parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
+    snapshot_to_arena(&conn, &ctrl_path).unwrap();
+
+    let root_v2 = Controller::open_or_create(&ctrl_path).unwrap().current_root();
+
+    assert_ne!(
+        root_v2, root_v1,
+        "T2.2: db change must produce different current_root",
+    );
+    assert_ne!(root_v2, [0u8; 32], "post-change root must not be zero sentinel");
+}
+
+// ---------------------------------------------------------------------------
 // Incremental reparse tests
 // ---------------------------------------------------------------------------
 

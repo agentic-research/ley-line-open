@@ -37,7 +37,7 @@ fn fresh_arena(dir: &Path) -> (PathBuf, PathBuf) {
     let ctrl_path = dir.join("test.ctrl");
     let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
     let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0)
+    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024)
         .unwrap();
     drop(ctrl);
     (arena_path, ctrl_path)
@@ -362,7 +362,6 @@ async fn test_load_into_arena() {
         ctrl.set_arena(
             arena_path.to_str().expect("arena path is utf-8"),
             arena_size,
-            0,
         )
         .expect("set arena in controller");
     }
@@ -374,12 +373,12 @@ async fn test_load_into_arena() {
     };
     leyline_cli_lib::run(cmd).await.expect("load should succeed");
 
-    // Step 5: Verify generation bumped to 1.
+    // Step 5: T2.4 — verify load advanced current_root from sentinel.
     let ctrl = Controller::open_or_create(&ctrl_path).expect("reopen controller");
-    assert_eq!(
-        ctrl.generation(),
-        1,
-        "generation should be 1 after first load"
+    assert_ne!(
+        ctrl.current_root(),
+        [0u8; 32],
+        "current_root should advance from zero sentinel after load"
     );
 
     // Step 6: Verify the arena contains the db bytes in the active buffer.
@@ -498,9 +497,15 @@ fn test_serve_creates_arena() {
     assert_eq!(returned_ctrl, ctrl_path, "returned ctrl path should match");
     assert!(ctrl_path.exists(), "controller file should exist");
 
-    // Verify controller state: generation 0 and arena path is set.
+    // T2.4: verify controller state — current_root at zero sentinel +
+    // arena path set. Pre-T2.4 used `generation() == 0` as the
+    // "fresh" check; current_root sentinel is the new equivalent.
     let ctrl = Controller::open_or_create(&ctrl_path).expect("open controller");
-    assert_eq!(ctrl.generation(), 0, "fresh controller should be gen 0");
+    assert_eq!(
+        ctrl.current_root(),
+        [0u8; 32],
+        "fresh controller should have zero-root sentinel"
+    );
     assert_eq!(
         ctrl.arena_size(),
         arena_bytes,
@@ -556,7 +561,8 @@ async fn test_daemon_socket_status_op() {
 
     let parsed = uds_round_trip(&sock_path, r#"{"op":"status"}"#).await;
     assert_eq!(parsed["ok"], true);
-    assert_eq!(parsed["generation"], 0);
+    // T2.4: status emits `current_root` (hex). Fresh ctrl → zero sentinel.
+    assert_eq!(parsed["current_root"], "0".repeat(64));
 }
 
 #[tokio::test]
@@ -878,16 +884,20 @@ fn test_warm_start_crash_recovery() {
     let arena_size = 4 * 1024 * 1024; // 4MB
     let _mmap = create_arena(&arena_path, arena_size).unwrap();
     let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size, 0)
+    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size)
         .unwrap();
 
     // Snapshot living db to arena.
     snapshot_to_arena(&conn, &ctrl_path).unwrap();
 
-    let gen_after_snapshot = Controller::open_or_create(&ctrl_path)
+    // T2.4: snapshot advances current_root from sentinel to BLAKE3.
+    let root_after_snapshot = Controller::open_or_create(&ctrl_path)
         .unwrap()
-        .generation();
-    assert_eq!(gen_after_snapshot, 1, "generation should be 1 after snapshot");
+        .current_root();
+    assert_ne!(
+        root_after_snapshot, [0u8; 32],
+        "current_root should advance from sentinel after snapshot"
+    );
 
     // --- Phase 2: Simulate crash — drop the connection ---
 
@@ -975,16 +985,16 @@ fn test_warm_start_crash_recovery() {
         "main.go should have at least 2 function_declarations after adding newFunc, got {func_count}"
     );
 
-    // --- Phase 5: Snapshot again and verify generation bumped ---
+    // --- Phase 5: T2.4 — Snapshot again, verify root advanced ---
 
     snapshot_to_arena(&recovered, &ctrl_path).unwrap();
 
-    let gen_after_reparse = Controller::open_or_create(&ctrl_path)
+    let root_after_reparse = Controller::open_or_create(&ctrl_path)
         .unwrap()
-        .generation();
-    assert_eq!(
-        gen_after_reparse, 2,
-        "generation should be 2 after second snapshot"
+        .current_root();
+    assert_ne!(
+        root_after_reparse, root_after_snapshot,
+        "T2.4: current_root must advance after second snapshot (db changed)"
     );
 }
 
@@ -1000,7 +1010,7 @@ fn test_warm_start_empty_arena_falls_through() {
     let arena_size = 2 * 1024 * 1024;
     let _mmap = leyline_core::create_arena(&arena_path, arena_size).unwrap();
     let mut ctrl = leyline_core::Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size, 0)
+    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size)
         .unwrap();
 
     // Read the empty arena — active buffer is all zeros.
@@ -1056,9 +1066,13 @@ fn test_multiple_snapshot_cycles() {
     let arena_size = 4 * 1024 * 1024;
     let _mmap = create_arena(&arena_path, arena_size).unwrap();
     let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size, 0).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size).unwrap();
 
     let conn = cold_parse_go(src.path());
+
+    // T2.4: track root advancement across cycles. Each modified-and-snapshot
+    // round must yield a strictly different root from the previous one.
+    let mut prev_root = [0u8; 32];
 
     // Run 5 snapshot cycles, modifying the file each time.
     for i in 0..5 {
@@ -1075,8 +1089,10 @@ fn test_multiple_snapshot_cycles() {
 
         snapshot_to_arena(&conn, &ctrl_path).unwrap();
 
-        let current_gen = Controller::open_or_create(&ctrl_path).unwrap().generation();
-        assert_eq!(current_gen, (i + 1) as u64, "cycle {i}: generation should match");
+        let cur_root = Controller::open_or_create(&ctrl_path).unwrap().current_root();
+        assert_ne!(cur_root, [0u8; 32], "cycle {i}: root must leave sentinel");
+        assert_ne!(cur_root, prev_root, "cycle {i}: root must advance from prior cycle");
+        prev_root = cur_root;
     }
 
     // Verify final state is consistent.
@@ -1136,7 +1152,7 @@ fn snapshot_populates_current_root_with_blake3_of_db_bytes() {
     let arena_size = 4 * 1024 * 1024;
     let _mmap = create_arena(&arena_path, arena_size).unwrap();
     let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size, 0).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size).unwrap();
     drop(ctrl);
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -1150,9 +1166,9 @@ fn snapshot_populates_current_root_with_blake3_of_db_bytes() {
     // Snapshot.
     snapshot_to_arena(&conn, &ctrl_path).unwrap();
 
-    // Re-open Controller and read current_root.
+    // Re-open Controller and read current_root. T2.4: generation removed
+    // from public API; current_root is the sole identity.
     let r = Controller::open_or_create(&ctrl_path).unwrap();
-    assert_eq!(r.generation(), 1, "first snapshot bumps gen 0 → 1");
     assert_eq!(
         r.current_root(),
         expected_root,
@@ -1181,7 +1197,7 @@ fn snapshot_idempotent_root_for_same_db_state() {
     let arena_size = 4 * 1024 * 1024;
     let _mmap = create_arena(&arena_path, arena_size).unwrap();
     let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size, 0).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size).unwrap();
     drop(ctrl);
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -1190,12 +1206,12 @@ fn snapshot_idempotent_root_for_same_db_state() {
     snapshot_to_arena(&conn, &ctrl_path).unwrap();
     let root_after_first = Controller::open_or_create(&ctrl_path).unwrap().current_root();
 
-    // Snapshot again with no db changes. Generation bumps; root stays.
+    // Snapshot again with no db changes. T2.4: root stays — purely
+    // a function of bytes; no generation surface to observe.
     snapshot_to_arena(&conn, &ctrl_path).unwrap();
     let r = Controller::open_or_create(&ctrl_path).unwrap();
     let root_after_second = r.current_root();
 
-    assert_eq!(r.generation(), 2, "second snapshot bumps gen → 2");
     assert_eq!(
         root_after_second, root_after_first,
         "T2.2: re-snapshotting unchanged db preserves current_root \
@@ -1220,7 +1236,7 @@ fn snapshot_root_advances_when_db_changes() {
     let arena_size = 4 * 1024 * 1024;
     let _mmap = create_arena(&arena_path, arena_size).unwrap();
     let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size, 0).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size).unwrap();
     drop(ctrl);
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -1271,7 +1287,7 @@ fn t23_reader_accepts_arena_when_root_matches() {
     let arena_size = 4 * 1024 * 1024;
     let _mmap = create_arena(&arena_path, arena_size).unwrap();
     let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size, 0).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size).unwrap();
     drop(ctrl);
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -1305,7 +1321,7 @@ fn t23_reader_refuses_arena_when_buffer_corrupted() {
     let arena_size = 4 * 1024 * 1024;
     let _mmap = create_arena(&arena_path, arena_size).unwrap();
     let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size, 0).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size).unwrap();
     drop(ctrl);
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -1371,7 +1387,7 @@ fn t23_reader_skips_verification_on_zero_root_sentinel() {
 
     let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
     // Legacy path: set_arena (no root) leaves current_root at zero sentinel.
-    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size, 1)
+    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size)
         .unwrap();
     assert_eq!(
         ctrl.current_root(),
@@ -1433,11 +1449,10 @@ fn t23_reader_errors_clearly_on_non_sqlite_buffer() {
 
     let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
     // Set a non-zero root to force verification (otherwise we'd hit
-    // the zero-sentinel skip path and not exercise sqlite_db_size).
+    // the zero-sentinel skip path and not exercise the verifier).
     ctrl.set_arena_with_root(
         &arena_path.to_string_lossy(),
         arena_size,
-        1,
         [0xAB; 32],
     )
     .unwrap();
@@ -1445,13 +1460,17 @@ fn t23_reader_errors_clearly_on_non_sqlite_buffer() {
 
     let result = SqliteGraph::from_arena(&ctrl_path);
     let err = match result {
-        Ok(_) => panic!("T2.3: must error on non-SQLite buffer"),
+        Ok(_) => panic!("T2.3/T2.4: must error on non-SQLite buffer"),
         Err(e) => e,
     };
     let msg = format!("{err:#}");
+    // T2.4: post-VERSION-bump the verifier hashes buf[..data_size]
+    // and compares against current_root before any SQLite parse.
+    // Garbage bytes hashed against a hand-set non-zero root produce
+    // a content-addressed mismatch, not an SQLite-format error.
     assert!(
-        msg.contains("not a valid SQLite v3 file"),
-        "T2.3 error must identify the non-SQLite buffer (got: {msg})",
+        msg.contains("arena root mismatch"),
+        "T2.4 error must identify content-addressed mismatch (got: {msg})",
     );
 }
 
@@ -2658,14 +2677,15 @@ async fn test_status_reports_error_phase() {
 /// Race `op_reparse` against `op_snapshot` and a periodic snapshot timer.
 /// Verifies the chain of guarantees that ley-line-open-5fea4e (mutex held
 /// across await) is meant to preserve:
-///   - generation is strictly monotonic across all responses
+///   - every response surfaces a well-formed `current_root` (T2.4)
+///   - at least one snapshot publishes a non-zero root (race made progress)
 ///   - no response panics or returns ok:false unexpectedly
 ///   - phase ends at "ready" — not stuck mid-reparse
 ///   - the live db lock never deadlocks (5s outer timeout catches it)
 ///
 /// Bead: ley-line-open-5f7100-12 (item #8 — reparse/snapshot race).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_op_reparse_snapshot_race_keeps_monotonic_generation() {
+async fn test_op_reparse_snapshot_race_publishes_well_formed_root() {
     use leyline_cli_lib::daemon::{DaemonContext, EventRouter};
     use leyline_core::{Controller, create_arena};
     use std::sync::{Arc, Mutex};
@@ -2686,7 +2706,7 @@ async fn test_op_reparse_snapshot_race_keeps_monotonic_generation() {
     let ctrl_path = dir.path().join("test.ctrl");
     let _mmap = create_arena(&arena_path, 4 * 1024 * 1024).unwrap();
     let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-    ctrl.set_arena(&arena_path.to_string_lossy(), 4 * 1024 * 1024, 0).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), 4 * 1024 * 1024).unwrap();
     drop(ctrl);
 
     // Cold-parse so _file_index is populated and reparse calls have
@@ -2747,29 +2767,31 @@ async fn test_op_reparse_snapshot_race_keeps_monotonic_generation() {
         assert_eq!(r["ok"], true, "task #{i} failed: {r}");
     }
 
-    // Collect all generation numbers from reparse + snapshot responses.
-    // (status responses report current generation too, but they may
-    // observe a value mid-bump from another task — we only need to
-    // assert that values across same-op responses are non-decreasing.)
-    let mut snapshot_gens: Vec<u64> = outcome
+    // T2.4: collect `current_root` hex strings from reparse + snapshot
+    // responses. Each response surfaces the controller's current root —
+    // a 64-char hex BLAKE3, or the zero sentinel if no snapshot has yet
+    // landed. With idempotent root semantics (same bytes → same root),
+    // unchanged dbs collapse to one root rather than 6 distinct ints.
+    // Race-safety assertion: every response is well-formed hex AND at
+    // least one snapshot completed and published a non-zero root.
+    let roots: Vec<String> = outcome
         .iter()
-        .filter_map(|r| {
-            // Reparse + snapshot return generation directly; status
-            // returns it under a different shape.
-            r.get("generation").and_then(|g| g.as_u64())
-        })
+        .filter_map(|r| r.get("current_root")
+            .and_then(|s| s.as_str()).map(str::to_string))
         .collect();
-    snapshot_gens.sort();
-    // Generation must be strictly increasing across snapshots — every
-    // successful snapshot bumps it. With 12 mutating ops we should see
-    // at least 6 distinct values (the snapshot ops). Loose lower bound.
-    let unique: std::collections::HashSet<u64> =
-        snapshot_gens.iter().copied().collect();
     assert!(
-        unique.len() >= 6,
-        "expected ≥6 distinct generations across {} mutators, got {} unique values: {snapshot_gens:?}",
-        12,
-        unique.len(),
+        roots.len() >= 12,
+        "expected ≥12 current_root values from 6 reparse + 6 snapshot, got {}: {roots:?}",
+        roots.len(),
+    );
+    let zero = "0".repeat(64);
+    for r in &roots {
+        assert_eq!(r.len(), 64, "current_root must be 64-char hex (got {r:?})");
+    }
+    assert!(
+        roots.iter().any(|r| r != &zero),
+        "race must publish at least one non-zero current_root \
+         (snapshots ran but never advanced state): {roots:?}",
     );
 
     // Final status check: phase must be Ready (not stuck at Parsing

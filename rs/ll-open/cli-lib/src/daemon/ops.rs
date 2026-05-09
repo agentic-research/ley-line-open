@@ -229,10 +229,20 @@ where
 /// needs to include in its JSON response. The `"open controller"` context
 /// string is part of the wire-error contract — clients see this when the
 /// controller path is broken.
-fn read_generation(ctrl_path: &Path) -> Result<u64> {
-    Controller::open_or_create(ctrl_path)
-        .context("open controller")
-        .map(|c| c.generation())
+/// T2.4: read the substrate's `current_root` and return as a 64-char
+/// lowercase hex string for the wire format. Replaces the pre-T2.4
+/// `read_generation` helper. Wire-format key changed from
+/// `"generation": <number>` to `"current_root": "<hex>"`. Mache's
+/// client must update to match (mache `mache-36d961` epic).
+fn read_root_hex(ctrl_path: &Path) -> Result<String> {
+    let ctrl = Controller::open_or_create(ctrl_path).context("open controller")?;
+    let root = ctrl.current_root();
+    let mut s = String::with_capacity(64);
+    use std::fmt::Write;
+    for b in &root {
+        let _ = write!(s, "{b:02x}");
+    }
+    Ok(s)
 }
 
 /// Acquire the living-db lock and snapshot to the arena. Used by every
@@ -283,10 +293,20 @@ fn op_status(ctx: &DaemonContext) -> Result<String> {
         enrichment.insert(name.clone(), serde_json::Value::Object(s));
     }
 
+    // T2.4 wire format: BLAKE3 of arena bytes as 64-char hex.
+    let current_root_hex = {
+        let root = ctrl.current_root();
+        let mut s = String::with_capacity(64);
+        use std::fmt::Write;
+        for b in &root {
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    };
     let mut out = json!({
         "ok": true,
         "phase": state.phase.as_str(),
-        "generation": ctrl.generation(),
+        "current_root": current_root_hex,
         "arena_path": ctrl.arena_path(),
         "arena_size": ctrl.arena_size(),
         "enrichment": enrichment,
@@ -308,7 +328,7 @@ fn op_status(ctx: &DaemonContext) -> Result<String> {
 fn op_flush(ctrl_path: &Path) -> Result<String> {
     Ok(json!({
         "ok": true,
-        "generation": read_generation(ctrl_path)?,
+        "current_root": read_root_hex(ctrl_path)?,
     })
     .to_string())
 }
@@ -323,7 +343,7 @@ fn op_load(ctrl_path: &Path, req: &serde_json::Value) -> Result<String> {
         .decode(b64)
         .context("invalid base64 in \"db\" field")?;
     crate::cmd_load::load_into_arena(ctrl_path, &db_bytes)?;
-    Ok(json!({"ok": true, "generation": read_generation(ctrl_path)?}).to_string())
+    Ok(json!({"ok": true, "current_root": read_root_hex(ctrl_path)?}).to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -431,7 +451,7 @@ fn op_reparse(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
 
     Ok(json!({
         "ok": true,
-        "generation": read_generation(&ctx.ctrl_path)?,
+        "current_root": read_root_hex(&ctx.ctrl_path)?,
         "parsed": result.parsed,
         "unchanged": result.unchanged,
         "deleted": result.deleted,
@@ -468,7 +488,7 @@ fn op_enrich(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
 
     Ok(json!({
         "ok": true,
-        "generation": read_generation(&ctx.ctrl_path)?,
+        "current_root": read_root_hex(&ctx.ctrl_path)?,
         "passes": stats,
     })
     .to_string())
@@ -476,7 +496,7 @@ fn op_enrich(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
 
 fn op_snapshot(ctx: &DaemonContext) -> Result<String> {
     snapshot_living_db(ctx)?;
-    Ok(json!({"ok": true, "generation": read_generation(&ctx.ctrl_path)?}).to_string())
+    Ok(json!({"ok": true, "current_root": read_root_hex(&ctx.ctrl_path)?}).to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1410,7 +1430,7 @@ mod tests {
         let ctrl_path = dir.path().join("test.ctrl");
         let _mmap = leyline_core::create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
         let mut ctrl = leyline_core::Controller::open_or_create(&ctrl_path).unwrap();
-        ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0)
+        ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024)
             .unwrap();
 
         // Create a living db with the nodes schema.
@@ -1634,13 +1654,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_op_status_returns_generation() {
+    async fn test_op_status_returns_zero_root_for_fresh_controller() {
+        // T2.4: op_status emits `current_root` (hex) — not `generation`.
+        // A fresh controller with no arena published yields the
+        // 64-char zero sentinel.
         let (_dir, ctx) = setup();
         let result = handle_base_op(&ctx, "status", &json!({}));
         assert!(result.is_some());
         let parsed: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
         assert_eq!(parsed["ok"], true);
-        assert_eq!(parsed["generation"], 0);
+        assert_eq!(parsed["current_root"], "0".repeat(64));
     }
 
     #[tokio::test]
@@ -1824,15 +1847,11 @@ mod tests {
 
     #[tokio::test]
     async fn op_status_wire_format_pins_required_fields() {
-        // Wire-format pin parallel to enrichment_stats_serialize_to_
-        // expected_json_shape and event_serialize_to_expected_json_
-        // shape. op_status response is consumed by mache + cli
-        // status checks; clients dispatch on every field name. The
-        // existing test_op_status_returns_generation only checks ok
-        // and generation. A refactor that renamed any required field
-        // (or dropped one) would silently break every status-check
-        // path. Pin all 6 always-emitted fields (ok, phase,
-        // generation, arena_path, arena_size, enrichment).
+        // T2.4: wire-format pin. op_status response is consumed by
+        // mache + cli status checks; clients dispatch on every field
+        // name. The breaking change for v0.2.0 is `generation` →
+        // `current_root` (64-char hex). Pin all 6 always-emitted
+        // fields so renames or drops fail loudly.
         let (_dir, ctx) = setup();
         let result = handle_base_op(&ctx, "status", &json!({})).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -1841,7 +1860,7 @@ mod tests {
         for required_field in [
             "ok",
             "phase",
-            "generation",
+            "current_root",
             "arena_path",
             "arena_size",
             "enrichment",
@@ -1852,6 +1871,19 @@ mod tests {
                 obj.keys().collect::<Vec<_>>(),
             );
         }
+        // T2.4: `generation` is gone from the wire format.
+        assert!(
+            !obj.contains_key("generation"),
+            "T2.4: op_status MUST NOT include legacy `generation` field; \
+             got keys {:?}",
+            obj.keys().collect::<Vec<_>>(),
+        );
+        // current_root is 64-char hex (zero sentinel for fresh setup).
+        let root = parsed["current_root"]
+            .as_str()
+            .expect("current_root is a string");
+        assert_eq!(root.len(), 64, "current_root is BLAKE3 hex (64 chars)");
+        assert_eq!(root, "0".repeat(64), "fresh controller emits zero sentinel");
         // phase from a fresh setup is "initializing".
         assert_eq!(parsed["phase"], "initializing");
         // enrichment is an object (possibly empty).
@@ -1939,35 +1971,28 @@ mod tests {
     }
 
     #[test]
-    fn read_generation_starts_at_zero_for_fresh_controller() {
-        // Wire-contract: a brand-new controller reports generation 0.
-        // This is what op_status / op_flush / op_load / op_reparse /
-        // op_enrich / op_snapshot all surface to clients in the
-        // `generation` field. If a future Controller bump changes the
-        // initial value silently, integration tests that pin
-        // `parsed["generation"] == 0` would fail mysteriously without
-        // this unit test.
+    fn read_root_hex_is_zero_sentinel_for_fresh_controller() {
+        // T2.4 wire-contract: a brand-new controller reports
+        // current_root as 64 zero hex chars. This is what op_status /
+        // op_flush / op_load / op_reparse / op_enrich / op_snapshot
+        // surface to clients in the `current_root` field after the
+        // breaking version bump.
         let dir = TempDir::new().unwrap();
         let arena_path = dir.path().join("g.arena");
         let ctrl_path = dir.path().join("g.ctrl");
         let _mmap = leyline_core::create_arena(&arena_path, 1024 * 1024).unwrap();
         let mut ctrl = leyline_core::Controller::open_or_create(&ctrl_path).unwrap();
-        ctrl.set_arena(&arena_path.to_string_lossy(), 1024 * 1024, 0)
+        ctrl.set_arena(&arena_path.to_string_lossy(), 1024 * 1024)
             .unwrap();
         drop(ctrl);
 
-        assert_eq!(read_generation(&ctrl_path).unwrap(), 0);
+        assert_eq!(read_root_hex(&ctrl_path).unwrap(), "0".repeat(64));
     }
 
     #[test]
-    fn read_generation_propagates_open_failure() {
-        // The "open controller" context string is part of the wire-error
-        // contract. Pin its presence by triggering a path-doesn't-resolve
-        // error. The test asserts the message reaches the caller through
-        // anyhow's chain — without it, debugging a broken controller path
-        // would be much harder.
+    fn read_root_hex_propagates_open_failure() {
         let bad_path = std::path::Path::new("/dev/null/definitely_not_a_directory/ctrl");
-        let err = read_generation(bad_path).unwrap_err();
+        let err = read_root_hex(bad_path).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("open controller"),

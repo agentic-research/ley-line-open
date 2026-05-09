@@ -520,8 +520,13 @@ fn try_warm_start(ctrl_path: &Path) -> Result<Option<rusqlite::Connection>> {
     )
     .context("warm start: sqlite3_deserialize failed")?;
 
-    let generation = ctrl.generation();
-    eprintln!("recovered from arena (generation {generation})");
+    // T2.4: log the new substrate identity (current_root prefix) on
+    // recovery. Generation is gone from the public API.
+    let root = ctrl.current_root();
+    eprintln!(
+        "recovered from arena (root {:02x}{:02x}{:02x}{:02x})",
+        root[0], root[1], root[2], root[3]
+    );
 
     Ok(Some(conn))
 }
@@ -658,7 +663,9 @@ pub fn snapshot_to_arena(conn: &rusqlite::Connection, ctrl_path: &Path) -> Resul
             new_size / (1024 * 1024),
             db_bytes.len() / (1024 * 1024),
         );
-        ctrl.set_arena(&arena_path, new_size, ctrl.generation())
+        // T2.4: re-advertise (size grow) preserves current_root.
+        // No publish here — readers don't see "change."
+        ctrl.set_arena(&arena_path, new_size)
             .context("advertise new arena size before write")?;
     }
 
@@ -666,18 +673,16 @@ pub fn snapshot_to_arena(conn: &rusqlite::Connection, ctrl_path: &Path) -> Resul
     // is unchanged; old buffer remains the readable one until step 4.
     leyline_core::write_to_arena(&mut mmap, &db_bytes).context("write to arena")?;
 
-    // Step 4: atomic publish — bump generation AND write current_root
-    // under the same Release-ordering (T2.2). Polling readers see gen
-    // change, refresh, observe (new_size, new_gen, new active_buffer,
-    // new current_root). The current_root is BLAKE3 of the serialized
-    // db bytes — Σ §3.4 specifies BLAKE3 as the substrate hash.
-    let new_gen = ctrl.generation() + 1;
+    // Step 4: atomic publish — write current_root under Release-ordering
+    // (T2.2 + T2.4). Polling readers see current_root change, refresh,
+    // observe (new_size, new active_buffer, new current_root).
+    // current_root = BLAKE3(serialized db bytes); Σ §3.4 locks BLAKE3.
     let current_root: [u8; 32] = blake3::hash(&db_bytes).into();
-    ctrl.set_arena_with_root(&arena_path, new_size, new_gen, current_root)
-        .context("bump generation + publish current_root")?;
+    ctrl.set_arena_with_root(&arena_path, new_size, current_root)
+        .context("publish current_root (snapshot advance)")?;
 
     eprintln!(
-        "snapshot to arena (generation {new_gen}, {} bytes, root {})",
+        "snapshot to arena ({} bytes, root {})",
         db_bytes.len(),
         hex_short(&current_root),
     );
@@ -1233,7 +1238,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let ctrl = dir.path().join("orphan.ctrl");
         let mut c = leyline_core::Controller::open_or_create(&ctrl).unwrap();
-        c.set_arena("/tmp/cloister-no-such-arena-xyzzy", 1024 * 1024, 0)
+        c.set_arena("/tmp/cloister-no-such-arena-xyzzy", 1024 * 1024)
             .unwrap();
         drop(c);
 
@@ -1302,7 +1307,6 @@ mod tests {
         ctrl.set_arena(
             ctrl_path.with_extension("arena").to_string_lossy().as_ref(),
             2 * 1024 * 1024,
-            0,
         )
         .unwrap();
         drop(ctrl);

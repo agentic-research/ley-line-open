@@ -34,8 +34,22 @@ pub const CONTROL_SIZE: usize = 4096;
 /// Magic number: 'LEYC' = 0x4C455943
 pub const MAGIC: u32 = 0x4C455943;
 
-/// Current version.
-pub const VERSION: u32 = 1;
+/// **T2.4 — Σ content-addressed substrate, breaking version 2.**
+///
+/// V1 (pre-T2.4) exposed `generation: u64` as the public substrate
+/// identity. V2 removes generation from the public API entirely;
+/// `current_root` (BLAKE3 of arena bytes) IS the substrate identity.
+/// The byte slot at `OFF_GENERATION` is preserved as a *private*
+/// monotone sync counter — readers Acquire-load it inside
+/// `current_root()` to fence the subsequent byte reads, and writers
+/// Release-store it inside `set_arena*` to publish prior plain stores.
+/// Callers cannot access this counter; all polling is by root.
+///
+/// Bumping VERSION 1 → 2 means old `.ctrl` files are rejected by new
+/// binaries and vice versa. This is a deliberate breakpoint pairing
+/// with mache's CGO-elimination cutover (decade `9d30ac` T2,
+/// epic `mache-36d961`). Coordinate releases.
+pub const VERSION: u32 = 2;
 
 // Field offsets (matching Go's #[repr(C)] layout)
 const OFF_MAGIC: usize = 0;
@@ -101,15 +115,36 @@ impl Controller {
             mmap[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&VERSION.to_ne_bytes());
         } else if existing_magic != MAGIC {
             bail!("invalid control block magic: 0x{:08X}", existing_magic);
+        } else {
+            // T2.4: VERSION mismatch is now a hard error. V1 controllers
+            // (pre-T2.4) had a public `generation` API; V2 removed it.
+            // Reading a V1 file as V2 (or vice versa) would silently
+            // misinterpret the sync atom — refuse explicitly.
+            let existing_version = u32::from_ne_bytes(
+                mmap[OFF_VERSION..OFF_VERSION + 4].try_into().unwrap(),
+            );
+            if existing_version != VERSION {
+                bail!(
+                    "control block VERSION mismatch: file has v{}, this binary expects v{}. \
+                     T2.4 dropped public `generation`; old binaries cannot read new files \
+                     and vice versa. Coordinate LLO + mache release cutover (decade 9d30ac).",
+                    existing_version, VERSION
+                );
+            }
         }
 
         Ok(Controller { mmap })
     }
 
-    /// Get the current generation atomically.
-    pub fn generation(&self) -> u64 {
+    /// **T2.4 internal sync atom — Acquire load.** Not exposed in the
+    /// public API. Pairs with the writer's Release-store inside
+    /// `set_arena*` to fence the plain byte reads of `current_root`,
+    /// `arena_path`, and `arena_size`. Public callers compare
+    /// `current_root()` for identity / change detection.
+    fn sync_counter_acquire(&self) -> u64 {
         let ptr = self.mmap[OFF_GENERATION..].as_ptr() as *const AtomicU64;
-        // SAFETY: mmap is page-aligned, offset 8 is 8-byte aligned, AtomicU64 is same layout as u64
+        // SAFETY: mmap is page-aligned, offset 8 is 8-byte aligned,
+        // AtomicU64 is same layout as u64.
         unsafe { (*ptr).load(Ordering::Acquire) }
     }
 
@@ -131,18 +166,21 @@ impl Controller {
 
     /// Read the current arena root (Σ root pointer).
     ///
-    /// Returns `[0u8; 32]` — equivalent to [`crate::substrate::Hash::ZERO`] —
-    /// when no root has been written yet (fresh control file or
-    /// pre-T2.1 control file). Callers MUST treat the zero hash as
-    /// the "no current root" sentinel and not as a valid root address.
+    /// **T2.4: this is the substrate's primary identity field.**
+    /// Returns `[0u8; 32]` — the zero sentinel — when no root has
+    /// been published yet (fresh control file). Callers comparing
+    /// roots for change detection (e.g. HotSwapGraph polling) treat
+    /// `current_root() != cached_root` as a publish event.
     ///
-    /// This read is a non-atomic byte copy. Atomicity of the
-    /// (`generation`, `current_root`) pair across writes is provided
-    /// by [`Self::set_arena`]'s ordering: writers update
-    /// `current_root` *before* the Release-store of `generation`.
-    /// Readers issuing `generation()` first then `current_root()` see
-    /// a consistent pair via the Acquire load of `generation`.
+    /// Internally Acquire-loads the private sync counter, fencing
+    /// the plain byte reads of `current_root` against the writer's
+    /// Release-store inside `set_arena*`. Readers see a consistent
+    /// snapshot of (path, size, root) when they call this method
+    /// followed by `arena_path` / `arena_size`.
     pub fn current_root(&self) -> [u8; 32] {
+        // Acquire fence on the internal sync counter. Any prior
+        // writer-Release-store happens-before the byte reads below.
+        let _ = self.sync_counter_acquire();
         let mut out = [0u8; 32];
         out.copy_from_slice(&self.mmap[OFF_CURRENT_ROOT..OFF_CURRENT_ROOT + CURRENT_ROOT_LEN]);
         out
@@ -166,18 +204,20 @@ impl Controller {
         Ok(())
     }
 
-    /// Atomically update the control block to point to a new arena.
+    /// **T2.4: re-advertise without publishing new content.** Writes
+    /// path and size to the control block, increments the internal
+    /// sync counter via Release-store, but **preserves the existing
+    /// `current_root` unchanged**. Used for the snapshot's step-2
+    /// re-advertisement (file grow without commit) and for test
+    /// fixtures that don't need a published root.
     ///
-    /// Writes path and size first, then atomically stores the generation
-    /// with Release ordering to ensure prior writes are visible.
+    /// Polling readers (HotSwapGraph) compare `current_root` to
+    /// detect change. Since this method preserves the root, the read
+    /// side sees no change → no swap.
     ///
-    /// **Note on `current_root`** (T2.2 onward): this method preserves
-    /// the existing `current_root` unchanged. To advance the root
-    /// atomically with the generation, use [`Self::set_arena_with_root`]
-    /// — that method writes the root *before* the Release-store of
-    /// generation, so a reader observing the new generation is
-    /// guaranteed to also observe the new root.
-    pub fn set_arena(&mut self, path: &str, size: u64, generation: u64) -> Result<()> {
+    /// To publish new content (advance the substrate), use
+    /// [`Self::set_arena_with_root`].
+    pub fn set_arena(&mut self, path: &str, size: u64) -> Result<()> {
         if path.len() >= ARENA_PATH_LEN {
             bail!(
                 "arena path too long (max {} bytes, got {})",
@@ -193,15 +233,32 @@ impl Controller {
         // Write size
         self.mmap[OFF_ARENA_SIZE..OFF_ARENA_SIZE + 8].copy_from_slice(&size.to_ne_bytes());
 
-        // Atomic generation update (release ordering ensures path+size visible first)
-        let ptr = self.mmap[OFF_GENERATION..].as_ptr() as *const AtomicU64;
-        // SAFETY: same alignment guarantees as generation()
-        unsafe { (*ptr).store(generation, Ordering::Release) };
+        // Bump the internal sync counter via Release-store. Readers
+        // doing Acquire-load on the counter see all prior writes
+        // (path, size). current_root is *not* modified here.
+        std::sync::atomic::fence(Ordering::Release);
+        self.bump_sync_counter_release();
 
         // Flush to disk
         self.mmap.flush().context("flush control block")?;
 
         Ok(())
+    }
+
+    /// Internal: increment the sync counter via Release-store.
+    /// Pairs with `sync_counter_acquire`. Public callers don't see
+    /// the counter; they observe published state via `current_root`.
+    fn bump_sync_counter_release(&mut self) {
+        let ptr = self.mmap[OFF_GENERATION..].as_ptr() as *const AtomicU64;
+        // SAFETY: mmap is page-aligned, offset 8 is 8-byte aligned.
+        // We use load + store rather than fetch_add because the slot
+        // may have been freshly initialized to 0; no concurrent
+        // writer (single-writer assumption — this is the substrate's
+        // CAS root advance, one publisher at a time).
+        unsafe {
+            let prev = (*ptr).load(Ordering::Relaxed);
+            (*ptr).store(prev.wrapping_add(1), Ordering::Release);
+        }
     }
 
     /// **T2.2: atomic publish of (arena, generation, current_root) under
@@ -224,11 +281,27 @@ impl Controller {
     ///
     /// Σ root semantics (decade `ley-line-open-9d30ac` §3.4):
     /// `current_root = BLAKE3(arena_buffer)`. Locked to BLAKE3.
+    /// **T2.4: atomic publish of (path, size, current_root) under a
+    /// single Release-ordering.** This is the substrate's content-
+    /// addressed advance primitive — `current_root` IS the published
+    /// state. Use this in the snapshot critical path:
+    ///
+    /// ```ignore
+    /// let root = blake3::hash(&db_bytes).into();
+    /// ctrl.set_arena_with_root(&arena_path, new_size, root)?;
+    /// ```
+    ///
+    /// Σ root semantics (decade `ley-line-open-9d30ac` §3.4):
+    /// `current_root = BLAKE3(arena_buffer)`. Locked to BLAKE3.
+    ///
+    /// Polling readers (HotSwapGraph) detect this advance by
+    /// comparing `current_root()` against their cached value.
+    /// Different root → swap. Same root → no swap (idempotent
+    /// re-publish or no-op snapshot).
     pub fn set_arena_with_root(
         &mut self,
         path: &str,
         size: u64,
-        generation: u64,
         current_root: [u8; 32],
     ) -> Result<()> {
         if path.len() >= ARENA_PATH_LEN {
@@ -247,29 +320,20 @@ impl Controller {
         self.mmap[OFF_ARENA_SIZE..OFF_ARENA_SIZE + 8].copy_from_slice(&size.to_ne_bytes());
 
         // T2.2: Write current_root BEFORE the Release-store of
-        // generation. Plain byte copy; the Release on generation
-        // publishes it.
+        // sync counter. Plain byte copy; the Release publishes it.
         self.mmap[OFF_CURRENT_ROOT..OFF_CURRENT_ROOT + CURRENT_ROOT_LEN]
             .copy_from_slice(&current_root);
 
-        // T2.2: compiler fence prevents the optimizer from reordering
+        // T2.2: hardware fence prevents the optimizer from reordering
         // the prior byte writes (path, size, current_root) past the
-        // atomic Release-store below. The Release on the AtomicU64
-        // provides the hardware ordering; the compiler_fence ensures
-        // program-order is also preserved at compile time. Without
-        // this, the optimizer could legally place the byte writes
-        // *after* the atomic store (different memory addresses,
-        // different access kinds — the compiler doesn't know they
-        // alias the same mmap), which would let a reader observe the
-        // new generation but stale path/size/root.
+        // atomic Release-store below.
         std::sync::atomic::fence(Ordering::Release);
 
-        // Atomic generation update with Release — publishes path, size,
-        // AND current_root atomically to readers using Acquire on
-        // generation().
-        let ptr = self.mmap[OFF_GENERATION..].as_ptr() as *const AtomicU64;
-        // SAFETY: same alignment guarantees as generation()
-        unsafe { (*ptr).store(generation, Ordering::Release) };
+        // T2.4: bump the internal sync counter via Release-store.
+        // Readers Acquire-load it inside `current_root()` to fence
+        // their plain byte reads. Counter value itself is not
+        // exposed publicly; readers key on root for identity.
+        self.bump_sync_counter_release();
 
         // Flush to disk
         self.mmap.flush().context("flush control block")?;
@@ -361,31 +425,36 @@ mod tests {
 
         {
             let mut ctrl = Controller::open_or_create(&path).unwrap();
-            ctrl.set_arena("/tmp/arena-1", 1024 * 1024, 1).unwrap();
+            ctrl.set_arena("/tmp/arena-1", 1024 * 1024).unwrap();
         }
 
-        // Reopen and verify
+        // Reopen and verify path/size persist. T2.4 removed `generation`
+        // from the public API; identity is `current_root`.
         let ctrl = Controller::open_or_create(&path).unwrap();
-        assert_eq!(ctrl.generation(), 1);
         assert_eq!(ctrl.arena_path(), "/tmp/arena-1");
         assert_eq!(ctrl.arena_size(), 1024 * 1024);
     }
 
+    /// T2.4: re-advertise via `set_arena` does NOT change `current_root`.
+    /// HotSwapGraph polling reads root, so identity is preserved.
     #[test]
-    fn test_atomic_generation_update() {
+    fn set_arena_re_advertise_preserves_root() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("gen.ctrl");
+        let path = dir.path().join("readv.ctrl");
 
         let mut ctrl = Controller::open_or_create(&path).unwrap();
-        assert_eq!(ctrl.generation(), 0);
+        let root: [u8; 32] = [0xEF; 32];
+        ctrl.set_arena_with_root("/tmp/a", 100, root).unwrap();
+        assert_eq!(ctrl.current_root(), root);
 
-        ctrl.set_arena("/tmp/arena-gen1", 100, 42).unwrap();
-        assert_eq!(ctrl.generation(), 42);
-        assert_eq!(ctrl.arena_path(), "/tmp/arena-gen1");
-
-        ctrl.set_arena("/tmp/arena-gen2", 200, 99).unwrap();
-        assert_eq!(ctrl.generation(), 99);
-        assert_eq!(ctrl.arena_path(), "/tmp/arena-gen2");
+        // Re-advertise (different size, same content). Root unchanged.
+        ctrl.set_arena("/tmp/a", 200).unwrap();
+        assert_eq!(ctrl.arena_size(), 200);
+        assert_eq!(
+            ctrl.current_root(),
+            root,
+            "T2.4: set_arena (re-advertise) must not change current_root"
+        );
     }
 
     #[test]
@@ -395,7 +464,7 @@ mod tests {
 
         let mut ctrl = Controller::open_or_create(&path).unwrap();
         let long_path = "x".repeat(256);
-        assert!(ctrl.set_arena(&long_path, 0, 0).is_err());
+        assert!(ctrl.set_arena(&long_path, 0).is_err());
     }
 
     #[test]
@@ -515,19 +584,20 @@ mod tests {
     #[test]
     fn current_root_does_not_collide_with_existing_fields() {
         // Drift guard: writing current_root must not corrupt any other
-        // field. Set arena + generation, then set current_root, then
-        // verify all earlier fields still read correctly.
+        // field. Set arena, then set current_root, then verify all
+        // earlier fields still read correctly. T2.4 removed
+        // generation; the OFF_GENERATION slot is now the private sync
+        // counter, no longer asserted on.
         let dir = tempdir().unwrap();
         let ctrl_path = dir.path().join("nocollide.ctrl");
         let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
 
-        ctrl.set_arena("/some/arena/path", 1024 * 1024, 42).unwrap();
+        ctrl.set_arena("/some/arena/path", 1024 * 1024).unwrap();
         let root: [u8; 32] = [0x55; 32];
         ctrl.set_current_root(root).unwrap();
 
         assert_eq!(ctrl.arena_path(), "/some/arena/path");
         assert_eq!(ctrl.arena_size(), 1024 * 1024);
-        assert_eq!(ctrl.generation(), 42);
         assert_eq!(ctrl.current_root(), root);
     }
 
@@ -544,7 +614,10 @@ mod tests {
         assert_eq!(MAGIC, 0x4C455943, "MAGIC must be ASCII 'LEYC'");
         let bytes = MAGIC.to_be_bytes();
         assert_eq!(bytes, *b"LEYC", "MAGIC bytes must spell 'LEYC'");
-        assert_eq!(VERSION, 1, "VERSION must be 1 until a deliberate migration");
+        assert_eq!(
+            VERSION, 2,
+            "T2.4: VERSION must be 2 (breaking — generation removed from public API)"
+        );
         // Distinct from the arena's MAGIC ("LEY0"). A tool reading
         // either header dispatches on the magic to pick the parser.
         assert_ne!(
@@ -655,102 +728,52 @@ mod tests {
         }
     }
 
-    /// T2.2: `set_arena_with_root` writes path, size, generation, and
-    /// current_root atomically. After the call, all four reflect the
+    /// T2.2/T2.4: `set_arena_with_root` writes path, size, and
+    /// current_root atomically. After the call, all three reflect the
     /// new values. Pin the basic API contract.
     #[test]
-    fn set_arena_with_root_writes_all_four_fields() {
+    fn set_arena_with_root_writes_all_fields() {
         let dir = tempdir().unwrap();
         let ctrl_path = dir.path().join("t22-basic.ctrl");
         let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
 
         let root: [u8; 32] = [0xAB; 32];
-        ctrl.set_arena_with_root("/some/arena", 4096, 7, root).unwrap();
+        ctrl.set_arena_with_root("/some/arena", 4096, root).unwrap();
 
         assert_eq!(ctrl.arena_path(), "/some/arena");
         assert_eq!(ctrl.arena_size(), 4096);
-        assert_eq!(ctrl.generation(), 7);
         assert_eq!(ctrl.current_root(), root);
     }
 
-    /// T2.2: legacy `set_arena` (no root parameter) preserves the
-    /// existing `current_root`. Pin so a future refactor that
-    /// "helpfully" zeroes the root in legacy callers doesn't silently
-    /// regress all 20+ existing callers (test fixtures, benches, etc.)
-    /// that pass through the legacy method.
-    #[test]
-    fn set_arena_preserves_current_root() {
-        let dir = tempdir().unwrap();
-        let ctrl_path = dir.path().join("t22-preserve.ctrl");
-        let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-
-        // Establish a non-zero root.
-        let root: [u8; 32] = [0xCD; 32];
-        ctrl.set_arena_with_root("/arena1", 1024, 1, root).unwrap();
-        assert_eq!(ctrl.current_root(), root);
-
-        // Re-advertise via legacy set_arena (the snapshot's step-2
-        // re-advertisement path uses this; it must not clobber the root).
-        ctrl.set_arena("/arena1", 2048, 1).unwrap();
-        assert_eq!(
-            ctrl.current_root(),
-            root,
-            "legacy set_arena must preserve current_root unchanged"
-        );
-        // Other fields updated as expected.
-        assert_eq!(ctrl.arena_size(), 2048);
-    }
-
-    /// T2.2: cross-Controller visibility — a fresh `Controller` opened
-    /// after the writer's `set_arena_with_root` returns sees the
-    /// committed (generation, current_root) pair. This is what the
-    /// daemon's HotSwapGraph reader path actually depends on: the
-    /// writer publishes via flush; subsequent readers (in the same or
-    /// different process) see consistent state.
-    ///
-    /// Note on what this test does NOT verify: the *concurrent*
-    /// case where a reader polls a long-lived Controller while the
-    /// writer races through many generations is not seqlock-safe by
-    /// design. Reader observing `gen=N` sees `current_root` for some
-    /// gen `≥ N` (writer-monotone advancement), not `=N` exactly. The
-    /// daemon's reader copes via the snapshot-based arena flip — when
-    /// gen bumps, it deserializes the arena bytes which carry their
-    /// own consistency. Stricter (gen, root) atomicity would require
-    /// extending the API with explicit seqlock counters, which is out
-    /// of scope for T2.2.
+    /// T2.2/T2.4: cross-Controller visibility — a fresh `Controller`
+    /// opened after the writer's `set_arena_with_root` returns sees
+    /// the committed (path, size, current_root). HotSwapGraph reader
+    /// path depends on this: writer publishes via flush; subsequent
+    /// readers see consistent state.
     #[test]
     fn set_arena_with_root_visible_across_controllers() {
         let dir = tempdir().unwrap();
         let ctrl_path = dir.path().join("t22-visible.ctrl");
 
-        // Writer: open Controller, publish, drop (flushes mmap).
+        // Writer.
         {
             let mut w = Controller::open_or_create(&ctrl_path).unwrap();
-            w.set_arena_with_root("/some/arena", 4096, 42, [0xCD; 32])
+            w.set_arena_with_root("/some/arena", 4096, [0xCD; 32])
                 .unwrap();
         }
 
-        // Reader: open separate Controller after writer dropped.
         let r = Controller::open_or_create(&ctrl_path).unwrap();
-        assert_eq!(r.generation(), 42);
         assert_eq!(r.current_root(), [0xCD; 32]);
         assert_eq!(r.arena_path(), "/some/arena");
         assert_eq!(r.arena_size(), 4096);
     }
 
-    /// T2.2: under writer-monotone advancement, a long-lived reader
-    /// never sees a `current_root` that is *stale* relative to the
-    /// generation it observes. Specifically: if the reader observes
-    /// `gen=N`, then either (a) root corresponds to gen `N` exactly,
-    /// or (b) root corresponds to a *future* gen (writer raced
-    /// ahead during the reader's two reads). Stale (gen `<N`) is
-    /// the bug case — that would mean the Release-store of gen
-    /// happened before the prior writes to root, breaking the
-    /// happens-before relationship.
-    ///
-    /// This is the actual invariant the daemon relies on: the reader
-    /// will never see a torn pair where gen is advanced but root is
-    /// from a previous publish.
+    /// T2.2/T2.4: writer-monotone advancement under concurrent writes.
+    /// If the reader observes `current_root` value V at iteration N,
+    /// then V is from iteration N or later (writer-races-ahead is OK).
+    /// V being from an *earlier* iteration is the bug case — the
+    /// Release-store of the sync counter would not be publishing the
+    /// prior writes to current_root.
     #[test]
     fn set_arena_with_root_root_never_stale_under_writer_race() {
         use std::sync::atomic::{AtomicBool, Ordering as AOrd};
@@ -758,11 +781,10 @@ mod tests {
         use std::thread;
 
         let dir = tempdir().unwrap();
-        let ctrl_path = dir.path().join("t22-monotone.ctrl");
+        let ctrl_path = dir.path().join("t24-monotone.ctrl");
 
-        // Initialize at gen=0, root=0.
         let mut writer = Controller::open_or_create(&ctrl_path).unwrap();
-        writer.set_arena_with_root("/x", 8, 0, [0u8; 32]).unwrap();
+        writer.set_arena_with_root("/x", 8, [0u8; 32]).unwrap();
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_reader = stop.clone();
@@ -770,39 +792,66 @@ mod tests {
 
         let reader = thread::spawn(move || {
             let r = Controller::open_or_create(&path_for_reader).unwrap();
-            let mut stale_violations = 0usize;
+            let mut last_seen_root_byte: u8 = 0;
+            let mut regressions = 0usize;
             let mut samples = 0usize;
             while !stop_reader.load(AOrd::Acquire) {
-                let g = r.generation();
                 let root = r.current_root();
                 samples += 1;
-                // Writer convention: at iteration N, writes root[0]=N (mod 256).
-                // Stale = observed gen N but root[0] < (N as u8) AFTER overflow handling.
-                // Since N goes 0..50, no wrap; stale means root[0] < g.
-                if g > 0 && (root[0] as u64) < g {
-                    stale_violations += 1;
+                // Writer monotone: writes root[0] = 1, 2, 3, …, 50 in order.
+                // Once reader has seen root[0] = K, subsequent reads must
+                // see root[0] >= K (writer never goes backward).
+                if root[0] > 0 && root[0] < last_seen_root_byte {
+                    regressions += 1;
+                }
+                if root[0] > last_seen_root_byte {
+                    last_seen_root_byte = root[0];
                 }
             }
-            (stale_violations, samples)
+            (regressions, samples)
         });
 
-        // Writer: 50 iterations with small sleeps for measurement noise.
-        for n in 1u64..=50 {
+        for n in 1u8..=50 {
             writer
-                .set_arena_with_root("/x", 8, n, [n as u8; 32])
+                .set_arena_with_root("/x", 8, [n; 32])
                 .unwrap();
             std::thread::sleep(std::time::Duration::from_micros(100));
         }
         stop.store(true, AOrd::Release);
 
-        let (stale_violations, samples) = reader.join().unwrap();
+        let (regressions, samples) = reader.join().unwrap();
         assert!(samples > 0, "reader observed no samples — invalid test");
         assert_eq!(
-            stale_violations, 0,
-            "T2.2 monotone invariant violated: reader observed `gen >= N` \
-             paired with stale `root[0] < N`. Means the writer's prior \
-             writes to current_root were *not* published before the \
-             Release-store of generation. {samples} samples taken.",
+            regressions, 0,
+            "T2.4 monotone invariant violated: reader observed root[0] \
+             go backward across {samples} samples. Means current_root \
+             writes are not properly fenced by the sync counter Release.",
+        );
+    }
+
+    /// T2.4: VERSION mismatch on existing .ctrl is a hard error. Old
+    /// V1 controllers (pre-T2.4) cannot be read by new V2 binaries —
+    /// the breaking-change discipline ADR-0014-style.
+    #[test]
+    fn open_rejects_mismatched_version() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v1-old.ctrl");
+
+        // Hand-write a fake V1 control block: correct MAGIC, version=1.
+        let mut buf = vec![0u8; CONTROL_SIZE];
+        buf[OFF_MAGIC..OFF_MAGIC + 4].copy_from_slice(&MAGIC.to_ne_bytes());
+        buf[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&1u32.to_ne_bytes());
+        std::fs::write(&path, &buf).unwrap();
+
+        let result = Controller::open_or_create(&path);
+        let err = match result {
+            Ok(_) => panic!("expected VERSION mismatch error"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("VERSION mismatch") && msg.contains("v1") && msg.contains("v2"),
+            "T2.4 error must clearly identify the V1→V2 breaking change (got: {msg})",
         );
     }
 }

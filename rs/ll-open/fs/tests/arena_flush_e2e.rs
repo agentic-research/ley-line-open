@@ -38,7 +38,10 @@ fn flush_round_trip() -> Result<()> {
     drop(mmap);
 
     let mut ctrl = Controller::open_or_create(&ctrl_path)?;
-    ctrl.set_arena(arena_path.to_str().unwrap(), arena_size, 1)?;
+    // T2.4: publish initial root so HotSwapGraph::new reads from arena
+    // (zero-root sentinel would serve an empty MemoryGraph instead).
+    let initial_root: [u8; 32] = blake3::hash(&db_bytes).into();
+    ctrl.set_arena_with_root(arena_path.to_str().unwrap(), arena_size, initial_root)?;
     drop(ctrl);
 
     // 2. Open HotSwapGraph in writable mode — deserializes from arena
@@ -57,9 +60,17 @@ fn flush_round_trip() -> Result<()> {
     // 4. Flush to arena
     graph.flush_to_arena()?;
 
-    // 5. Verify: control block generation was bumped
+    // 5. T2.4: verify current_root advanced — content changed → root changed.
     let ctrl = Controller::open_or_create(&ctrl_path)?;
-    assert_eq!(ctrl.generation(), 2, "generation should bump from 1 to 2");
+    let post_flush_root = ctrl.current_root();
+    assert_ne!(
+        post_flush_root, initial_root,
+        "T2.4: flush must advance current_root (content changed)"
+    );
+    assert_ne!(
+        post_flush_root, [0u8; 32],
+        "T2.4: post-flush root must not be the zero sentinel"
+    );
     drop(ctrl);
 
     // 6. Verify: fresh SqliteGraphAdapter from arena sees the writes
@@ -97,7 +108,7 @@ fn flush_round_trip() -> Result<()> {
 }
 
 #[test]
-fn double_flush_increments_generation() -> Result<()> {
+fn double_flush_advances_root() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let ctrl_path = dir.path().join("test.ctrl");
     let arena_path = dir.path().join("test.arena");
@@ -110,28 +121,28 @@ fn double_flush_increments_generation() -> Result<()> {
     drop(mmap);
 
     let mut ctrl = Controller::open_or_create(&ctrl_path)?;
-    ctrl.set_arena(arena_path.to_str().unwrap(), arena_size, 1)?;
+    let initial_root: [u8; 32] = blake3::hash(&db_bytes).into();
+    ctrl.set_arena_with_root(arena_path.to_str().unwrap(), arena_size, initial_root)?;
     drop(ctrl);
 
     let graph = HotSwapGraph::new(ctrl_path.clone())?.with_writable();
 
-    // First write + flush
+    // First write + flush — root advances away from initial.
     graph.truncate("docs/readme")?;
     graph.write_content("docs/readme", b"v2", 0)?;
     graph.flush_to_arena()?;
 
-    let ctrl = Controller::open_or_create(&ctrl_path)?;
-    assert_eq!(ctrl.generation(), 2);
-    drop(ctrl);
+    let root_v2 = Controller::open_or_create(&ctrl_path)?.current_root();
+    assert_ne!(root_v2, initial_root, "v2 root differs from initial");
 
-    // Second write + flush
+    // Second write + flush — root advances again.
     graph.truncate("docs/readme")?;
     graph.write_content("docs/readme", b"v3", 0)?;
     graph.flush_to_arena()?;
 
-    let ctrl = Controller::open_or_create(&ctrl_path)?;
-    assert_eq!(ctrl.generation(), 3);
-    drop(ctrl);
+    let root_v3 = Controller::open_or_create(&ctrl_path)?.current_root();
+    assert_ne!(root_v3, root_v2, "v3 root differs from v2");
+    assert_ne!(root_v3, initial_root, "v3 root differs from initial");
 
     // Fresh reader sees latest
     let fresh = SqliteGraphAdapter::from_arena(&ctrl_path)?;

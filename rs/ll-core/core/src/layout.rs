@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 pub struct ArenaHeader {
     /// Magic bytes "LEY0" (0x4C455930)
     pub magic: u32,
-    /// Schema version (Expect 1)
+    /// Schema version (Expect 2 after T2.4)
     pub version: u8,
     /// Index of the active double-buffer (0 or 1)
     pub active_buffer: u8,
@@ -16,11 +16,24 @@ pub struct ArenaHeader {
     pub padding: [u8; 2],
     /// Monotonically increasing sequence number
     pub sequence: u64,
+    /// **T2.4: actual data size of the active buffer in bytes.**
+    ///
+    /// Distinguishes "live data" from "trailing zero padding" inside
+    /// the active buffer slice. The reader hashes `buf[..data_size]`
+    /// to verify σ(arena) against `Controller.current_root` (T2.3).
+    /// Without this field, the reader would have to parse format-
+    /// specific headers (SQLite's page_count, etc.) to recover the
+    /// data length — fragile and format-coupled. With it, the reader
+    /// is content-format-agnostic.
+    pub data_size: u64,
 }
 
 impl ArenaHeader {
     pub const MAGIC: u32 = 0x4C455930;
-    pub const VERSION: u8 = 1;
+    /// T2.4 breaking bump 1 → 2 (paired with `control::VERSION`).
+    /// Removes `generation` from the public substrate API; identity
+    /// is `current_root` only. Old `.arena` files are rejected.
+    pub const VERSION: u8 = 2;
     pub const HEADER_SIZE: u64 = 4096;
 
     /// Calculate the byte offset of the active buffer within the arena file.
@@ -76,6 +89,10 @@ pub fn write_to_arena(mmap: &mut MmapMut, data: &[u8]) -> Result<()> {
         active_buffer: pending as u8,
         padding: [0; 2],
         sequence: header.sequence + 1,
+        // T2.4: record the actual data length so readers can hash
+        // exactly the data bytes (no trailing-zeros / no
+        // format-specific header parsing).
+        data_size: data.len() as u64,
     };
     let header_bytes = bytemuck::bytes_of(&new_header);
     mmap[..header_bytes.len()].copy_from_slice(header_bytes);
@@ -109,6 +126,7 @@ pub fn create_arena(path: &std::path::Path, arena_size: u64) -> Result<MmapMut> 
             active_buffer: 0,
             padding: [0; 2],
             sequence: 0,
+            data_size: 0,
         };
         let header_bytes = bytemuck::bytes_of(&header);
         mmap[..header_bytes.len()].copy_from_slice(header_bytes);
@@ -212,7 +230,10 @@ mod tests {
         // Sanity: those bytes are literally L, E, Y, 0 in big-endian.
         let bytes = ArenaHeader::MAGIC.to_be_bytes();
         assert_eq!(bytes, *b"LEY0", "MAGIC bytes must spell 'LEY0'");
-        assert_eq!(ArenaHeader::VERSION, 1, "VERSION must be 1 until a deliberate migration");
+        assert_eq!(
+            ArenaHeader::VERSION, 2,
+            "T2.4: ArenaHeader VERSION must be 2 (paired with control::VERSION=2)"
+        );
     }
 
     #[test]
@@ -231,6 +252,7 @@ mod tests {
             active_buffer: 0,
             padding: [0; 2],
             sequence: 5,
+            data_size: 0,
         };
         let file_size = 4096 + 4096 * 2;
         // Buffer 0 starts right after the header.
@@ -252,6 +274,7 @@ mod tests {
             active_buffer: 0,
             padding: [0; 2],
             sequence: 0,
+            data_size: 0,
         };
         let file_size = 4096 + 4096 * 2;
 

@@ -105,7 +105,7 @@ fn snapshot_baseline(
         + db_bytes.len() as u64 * ARENA_GROWTH_FACTOR
         + ARENA_HEADROOM_BYTES;
     let arena_size = if min_arena > arena_size {
-        let _ = ctrl.set_arena(&arena_path, min_arena, ctrl.generation());
+        let _ = ctrl.set_arena(&arena_path, min_arena);
         min_arena
     } else {
         arena_size
@@ -114,9 +114,9 @@ fn snapshot_baseline(
     let mut mmap =
         create_arena(Path::new(&arena_path), arena_size).expect("create_arena");
     write_to_arena(&mut mmap, &db_bytes).expect("write_to_arena");
-    let new_gen = ctrl.generation() + 1;
-    ctrl.set_arena(&arena_path, arena_size, new_gen)
-        .expect("set_arena");
+    let root: [u8; 32] = blake3::hash(&db_bytes).into();
+    ctrl.set_arena_with_root(&arena_path, arena_size, root)
+        .expect("set_arena_with_root");
 
     let n_bytes = db_bytes.len();
     let total = lock_acquired.elapsed();
@@ -163,7 +163,7 @@ fn snapshot_shortened(
         + db_bytes_owned.len() as u64 * ARENA_GROWTH_FACTOR
         + ARENA_HEADROOM_BYTES;
     let arena_size = if min_arena > arena_size {
-        let _ = ctrl.set_arena(&arena_path, min_arena, ctrl.generation());
+        let _ = ctrl.set_arena(&arena_path, min_arena);
         min_arena
     } else {
         arena_size
@@ -172,9 +172,9 @@ fn snapshot_shortened(
     let mut mmap =
         create_arena(Path::new(&arena_path), arena_size).expect("create_arena");
     write_to_arena(&mut mmap, &db_bytes_owned).expect("write_to_arena");
-    let new_gen = ctrl.generation() + 1;
-    ctrl.set_arena(&arena_path, arena_size, new_gen)
-        .expect("set_arena");
+    let root: [u8; 32] = blake3::hash(&db_bytes_owned).into();
+    ctrl.set_arena_with_root(&arena_path, arena_size, root)
+        .expect("set_arena_with_root");
 
     (lock_held, serialize_dur, db_bytes_owned.len())
 }
@@ -215,7 +215,7 @@ fn build_fixture(
     let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
     {
         let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-        ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024, 0)
+        ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024)
             .unwrap();
     }
 

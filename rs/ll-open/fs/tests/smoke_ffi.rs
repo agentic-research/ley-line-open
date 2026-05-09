@@ -35,6 +35,7 @@ fn create_test_arena(dir: &std::path::Path) -> Result<std::path::PathBuf> {
         active_buffer: 0,
         padding: [0; 2],
         sequence: 1,
+        data_size: db_bytes.len() as u64,
     };
     let header_bytes: &[u8] = bytemuck::bytes_of(&header);
     arena[..header_bytes.len()].copy_from_slice(header_bytes);
@@ -48,7 +49,11 @@ fn create_test_arena(dir: &std::path::Path) -> Result<std::path::PathBuf> {
     // Create control file pointing at the arena
     let ctrl_path = dir.join("test.ctrl");
     let mut ctrl = Controller::open_or_create(&ctrl_path)?;
-    ctrl.set_arena(arena_path.to_str().unwrap(), arena_size as u64, 1)?;
+    ctrl.set_arena_with_root(
+        arena_path.to_str().unwrap(),
+        arena_size as u64,
+        blake3::hash(db_bytes).into(),
+    )?;
 
     Ok(ctrl_path)
 }

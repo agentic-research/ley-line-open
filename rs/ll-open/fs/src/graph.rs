@@ -224,8 +224,8 @@ impl SqliteGraphAdapter {
         let buf_size = ArenaHeader::buffer_size(file_size);
 
         let buf = &mmap[offset as usize..(offset + buf_size) as usize];
-        // T2.3: σ(buf) == ctrl.current_root before deserialize.
-        crate::verify_arena_root(&controller, buf)?;
+        // T2.3: σ(buf[..data_size]) == ctrl.current_root before deserialize.
+        crate::verify_arena_root(&controller, header, buf)?;
         let graph = SqliteGraph::from_bytes_writable(buf)?;
         let adapter = Self::new(graph);
         adapter.ensure_errors_table()?;
@@ -849,12 +849,16 @@ fn now_nanos() -> i64 {
         .as_nanos() as i64
 }
 
-/// Thread-safe wrapper that re-opens the inner graph when the control block
-/// generation changes (hot-swap on arena update).
+/// Thread-safe wrapper that re-opens the inner graph when the control block's
+/// `current_root` changes (T2.4 — content-addressed hot-swap on arena update).
+///
+/// **T2.4 reader-side polling shape.** Pre-T2.4 keyed on `generation`; that
+/// public field is gone. Identity is `current_root` (BLAKE3 of arena bytes).
+/// Same root → no swap (idempotent re-publish). Different root → swap.
 pub struct HotSwapGraph {
     inner: RwLock<Arc<dyn Graph>>,
     control_path: PathBuf,
-    last_generation: AtomicU64,
+    last_root: Mutex<[u8; 32]>,
     writable: bool,
     /// Default tree-sitter language for extensionless files (e.g. `source`).
     #[cfg(feature = "validate")]
@@ -864,10 +868,10 @@ pub struct HotSwapGraph {
 impl HotSwapGraph {
     pub fn new(control_path: PathBuf) -> Result<Self> {
         let ctrl = Controller::open_or_create(&control_path)?;
-        let generation = ctrl.generation();
+        let root = ctrl.current_root();
 
-        // Gen 0 means no data loaded yet — serve an empty graph
-        let initial_graph: Arc<dyn Graph> = if generation == 0 {
+        // Zero-root sentinel = no data published yet → serve empty graph.
+        let initial_graph: Arc<dyn Graph> = if root == [0u8; 32] {
             Arc::new(MemoryGraph::new())
         } else {
             Arc::new(SqliteGraphAdapter::from_arena(&control_path)?)
@@ -876,7 +880,7 @@ impl HotSwapGraph {
         Ok(Self {
             inner: RwLock::new(initial_graph),
             control_path,
-            last_generation: AtomicU64::new(generation),
+            last_root: Mutex::new(root),
             writable: false,
             #[cfg(feature = "validate")]
             default_language: None,
@@ -889,8 +893,8 @@ impl HotSwapGraph {
     pub fn with_validation(mut self, default_language: Option<tree_sitter::Language>) -> Self {
         self.writable = true;
         self.default_language = default_language;
-        let current_gen = self.last_generation.load(Ordering::Acquire);
-        if current_gen > 0
+        let cached_root = *self.last_root.lock().unwrap();
+        if cached_root != [0u8; 32]
             && let Ok(new_graph) = self.build_adapter(&self.control_path)
         {
             *self.inner.write().unwrap() = new_graph;
@@ -902,8 +906,8 @@ impl HotSwapGraph {
     /// Re-opens the inner graph as writable if already loaded.
     pub fn with_writable(mut self) -> Self {
         self.writable = true;
-        let current_gen = self.last_generation.load(Ordering::Acquire);
-        if current_gen > 0
+        let cached_root = *self.last_root.lock().unwrap();
+        if cached_root != [0u8; 32]
             && let Ok(new_graph) = self.build_adapter(&self.control_path)
         {
             *self.inner.write().unwrap() = new_graph;
@@ -926,9 +930,11 @@ impl HotSwapGraph {
         }
     }
 
-    /// Serialize the in-memory SQLite, write to the inactive arena buffer,
-    /// flip the header, and bump the control block generation.
-    /// Updates `last_generation` without re-opening to avoid losing in-flight writes.
+    /// T2.4: serialize + publish via content-addressed root advance.
+    /// Computes BLAKE3 of the serialized bytes, writes them into the
+    /// inactive arena buffer, then atomic-publishes the new
+    /// `current_root` via `set_arena_with_root`. Polling readers
+    /// detect the change by comparing roots.
     pub fn flush_to_arena(&self) -> Result<()> {
         let inner = self.inner.read().unwrap().clone();
         let bytes = inner.serialize()?;
@@ -936,7 +942,6 @@ impl HotSwapGraph {
         let ctrl = Controller::open_or_create(&self.control_path)?;
         let arena_path = ctrl.arena_path();
         let arena_size = ctrl.arena_size();
-        let current_gen = ctrl.generation();
 
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -945,40 +950,54 @@ impl HotSwapGraph {
         let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
         leyline_core::layout::write_to_arena(&mut mmap, &bytes)?;
 
-        let new_gen = current_gen + 1;
+        let new_root: [u8; 32] = blake3::hash(&bytes).into();
         let mut ctrl = Controller::open_or_create(&self.control_path)?;
-        ctrl.set_arena(&arena_path, arena_size, new_gen)?;
+        ctrl.set_arena_with_root(&arena_path, arena_size, new_root)?;
 
-        // Acknowledge generation bump without re-opening
-        self.last_generation.store(new_gen, Ordering::Release);
+        // Acknowledge our own publish without re-opening.
+        *self.last_root.lock().unwrap() = new_root;
         log::info!(
-            "arena flush: gen {current_gen} -> {new_gen} ({} bytes)",
+            "arena flush: root advanced to {} ({} bytes)",
+            hex_short(&new_root),
             bytes.len()
         );
         Ok(())
     }
 
-    /// Check generation and swap the inner graph if stale.
+    /// T2.4: poll `current_root`; swap if it differs from cached.
+    /// Same root → no-op (idempotent re-publish, or no change since
+    /// last poll). Different root → reload via `from_arena` (which
+    /// internally verifies BLAKE3 — see T2.3).
     fn maybe_swap(&self) -> Result<Arc<dyn Graph>> {
         let ctrl = Controller::open_or_create(&self.control_path)?;
-        let current_gen = ctrl.generation();
-        let cached_gen = self.last_generation.load(Ordering::Acquire);
+        let current_root = ctrl.current_root();
+        let cached_root = *self.last_root.lock().unwrap();
 
-        if current_gen != cached_gen {
-            // Gen 0 means empty; any nonzero gen means real data in the arena
-            let new_graph: Arc<dyn Graph> = if current_gen == 0 {
+        if current_root != cached_root {
+            // Zero-root sentinel = no data; serve empty graph.
+            let new_graph: Arc<dyn Graph> = if current_root == [0u8; 32] {
                 Arc::new(MemoryGraph::new())
             } else {
                 self.build_adapter(&self.control_path)?
             };
             let mut w = self.inner.write().unwrap();
             *w = new_graph.clone();
-            self.last_generation.store(current_gen, Ordering::Release);
+            *self.last_root.lock().unwrap() = current_root;
             Ok(new_graph)
         } else {
             Ok(self.inner.read().unwrap().clone())
         }
     }
+}
+
+/// 8-character hex prefix for log lines.
+fn hex_short(bytes: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(8);
+    use std::fmt::Write;
+    for b in &bytes[..4] {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 impl Graph for HotSwapGraph {
@@ -1388,30 +1407,30 @@ mod tests {
         Ok(())
     }
 
+    /// T2.4: HotSwapGraph at zero-root sentinel serves empty graph;
+    /// after a publish (set_arena_with_root with non-zero root), next
+    /// query hot-swaps to the real arena data. Same test as before
+    /// the breaking version bump, just keyed on root not generation.
     #[test]
-    fn hotswap_generation_zero_serves_empty() -> Result<()> {
+    fn hotswap_zero_root_serves_empty_then_swaps_on_publish() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let ctrl_path = dir.path().join("test.ctrl");
         let arena_path = dir.path().join("test.arena");
 
-        // Create control block at gen 0 with arena path set
-        // Buffers need to hold a serialized SQLite DB (~12KB minimum)
+        // Create control block with arena path set, zero root sentinel
         let arena_size: u64 = 4096 + 32768 * 2;
         let mut ctrl = Controller::open_or_create(&ctrl_path)?;
-        ctrl.set_arena(arena_path.to_str().unwrap(), arena_size, 0)?;
-
-        // Create the arena file (needed for later, but gen 0 = empty graph)
+        ctrl.set_arena(arena_path.to_str().unwrap(), arena_size)?;
         let _mmap = leyline_core::layout::create_arena(&arena_path, arena_size)?;
 
-        // HotSwapGraph at gen 0 should serve empty root
+        // HotSwapGraph at zero-root sentinel should serve empty root
         let graph = HotSwapGraph::new(ctrl_path.clone())?;
         let root = graph.get_node("")?.unwrap();
         assert!(root.is_dir);
-        // No children at gen 0
         let children = graph.list_children("")?;
         assert!(children.is_empty());
 
-        // Now write real data to arena and bump generation
+        // Now publish real data
         let source = Connection::open_in_memory()?;
         create_schema(&source)?;
         source.execute_batch(
@@ -1420,13 +1439,14 @@ mod tests {
         )?;
         let db_bytes = source.serialize(DatabaseName::Main)?;
 
-        // Write db to arena via write_to_arena
+        // Write db to arena
         let mut mmap = leyline_core::layout::create_arena(&arena_path, arena_size)?;
         leyline_core::layout::write_to_arena(&mut mmap, db_bytes.as_ref())?;
 
-        // Bump control block to gen 1
+        // Publish via set_arena_with_root — root advances away from sentinel
         let mut ctrl = Controller::open_or_create(&ctrl_path)?;
-        ctrl.set_arena(arena_path.to_str().unwrap(), arena_size, 1)?;
+        let new_root: [u8; 32] = blake3::hash(db_bytes.as_ref()).into();
+        ctrl.set_arena_with_root(arena_path.to_str().unwrap(), arena_size, new_root)?;
 
         // Next query should hot-swap to real data
         let children = graph.list_children("")?;

@@ -4,6 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use blake3;
 use leyline_core::{ArenaHeader, Controller, create_arena, write_to_arena};
 
 /// CLI entry point: read the .db from disk, then delegate to [`load_into_arena`].
@@ -54,9 +55,12 @@ pub fn load_into_arena(control: &Path, db_bytes: &[u8]) -> Result<()> {
 
     write_to_arena(&mut mmap, db_bytes).context("write to arena")?;
 
-    let new_gen = ctrl.generation() + 1;
-    ctrl.set_arena(&arena_path, arena_size, new_gen)
-        .context("bump generation")?;
+    // T2.4: publish via current_root (BLAKE3 of db bytes). The CAS
+    // root advance IS the publish event; readers detect by comparing
+    // current_root, not generation.
+    let current_root: [u8; 32] = blake3::hash(db_bytes).into();
+    ctrl.set_arena_with_root(&arena_path, arena_size, current_root)
+        .context("publish current_root (load advance)")?;
 
     Ok(())
 }
@@ -100,7 +104,7 @@ mod tests {
         let arena_size = 4 * 1024; // 4 KB total → ~2 KB per buffer
         let _mmap = leyline_core::create_arena(&arena_path, arena_size).unwrap();
         let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
-        ctrl.set_arena(&arena_path.to_string_lossy(), arena_size, 0)
+        ctrl.set_arena(&arena_path.to_string_lossy(), arena_size)
             .unwrap();
         // Attempt to load 16 KB into ~2 KB buffer capacity.
         let too_big = vec![0u8; 16 * 1024];

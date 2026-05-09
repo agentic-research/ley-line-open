@@ -8,7 +8,11 @@ Each entry references the bead ID(s) tracking the work in
 [rsry](https://github.com/agentic-research/rosary) so the full design
 context, scoping notes, and review history are recoverable.
 
-## [Unreleased] — pending tag as v0.2.0
+## [Unreleased]
+
+Nothing yet — post-v0.2.0 changes land here.
+
+## [0.2.0] — pending tag
 
 Coordinated breaking release with [mache v0.8.0](https://github.com/agentic-research/mache/releases/tag/v0.8.0)
 (paired via mache PR #365 + #366). Cutover wave to a content-addressed
@@ -16,6 +20,10 @@ Coordinated breaking release with [mache v0.8.0](https://github.com/agentic-rese
 design.** A v0.1.x binary opening a v0.2.0 control or arena file (or
 vice versa) hits an explicit VERSION-mismatch error rather than
 silently misreading the byte layout.
+
+> **Tag status.** This section's date will be filled in when LLO
+> v0.2.0 is tagged. The diff is complete; only the tag/release-link
+> step remains.
 
 ### Added
 - **Σ substrate type surface** — bead `ley-line-open-9e3a5f`. New
@@ -175,6 +183,7 @@ release predates the structured changelog.
 Initial public release of ley-line-open as the OSS substrate for the
 ley-line stack. See `git log v0.1.0` for the initial-commit set.
 
-[Unreleased]: https://github.com/agentic-research/ley-line-open/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/agentic-research/ley-line-open/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/agentic-research/ley-line-open/compare/v0.1.1...HEAD
 [0.1.1]: https://github.com/agentic-research/ley-line-open/releases/tag/v0.1.1
 [0.1.0]: https://github.com/agentic-research/ley-line-open/releases/tag/v0.1.0

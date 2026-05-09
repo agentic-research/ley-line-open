@@ -29,14 +29,23 @@ use std::path::Path;
 /// backends if added later.
 ///
 /// **Empty / fresh arena handling**: `data_size == 0` is the only
-/// case where verification is skipped — there's nothing to hash
-/// and nothing to deserialize. Callers must check for this and
-/// route to a fresh-arena path (e.g. serve an empty in-memory db).
-/// Outside this case, a zero-sentinel `current_root` is now treated
-/// as a configuration error and refused: with V2's hard cutover
-/// there's no legacy V2 writer that would publish data without a
-/// root, and silently bypassing verification on a non-empty buffer
-/// would be a downgrade hole an attacker could ride.
+/// case where verification is skipped — there's nothing to hash.
+/// The verifier returns `&buf[..0]`; callers (`from_arena` /
+/// `from_arena_writable`) pass that through to
+/// `sqlite3_deserialize`, which errors with its own clear message
+/// since empty bytes are not a valid SQLite database. Test pin
+/// `t24_reader_accepts_zero_root_with_empty_data` confirms the
+/// failure surfaces as a SQLite-layer error, not the substrate-
+/// identity rejection. Callers wanting different fresh-arena
+/// behavior (e.g. serve an empty in-memory db) can branch on
+/// `data_size == 0` themselves before calling `from_arena`.
+///
+/// Outside the `data_size == 0` case, a zero-sentinel
+/// `current_root` is treated as a configuration error and refused:
+/// with V2's hard cutover there's no legacy V2 writer that would
+/// publish data without a root, and silently bypassing
+/// verification on a non-empty buffer would be a downgrade hole
+/// an attacker could ride.
 fn verify_arena_root<'a>(
     ctrl: &Controller,
     header: &ArenaHeader,

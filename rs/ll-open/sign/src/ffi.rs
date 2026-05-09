@@ -35,8 +35,11 @@ pub unsafe extern "C" fn leyline_sign_data(
     out_len: usize,
 ) -> i32 {
     // Defensive null checks: slice::from_raw_parts requires non-null
-    // even when len == 0 (per Rust's safety contract). Mirror the
-    // pattern used in leyline-fs's FFI.
+    // even when len == 0 (per Rust's safety contract). leyline-fs's
+    // FFI doesn't need this pattern because its inputs are
+    // null-terminated C strings consumed via CStr::from_ptr — the
+    // raw-buffer-pointer shape used here is unique to sign and
+    // requires its own guards.
     if data_ptr.is_null()
         || cert_der_ptr.is_null()
         || private_key_ptr.is_null()

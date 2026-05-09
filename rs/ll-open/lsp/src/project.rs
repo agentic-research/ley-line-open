@@ -424,10 +424,24 @@ pub fn project_references(
     for loc in locations {
         let uri = loc.uri.as_str();
 
+        // T8.7: source bytes feed both ref_token AND qualifier; fetch
+        // once per location (the upstream closure caches per-URI).
+        let bytes_opt = source_lookup(uri);
+
         // Extract ref_token from source bytes. Empty fallback if the
         // file is unreachable (cross-repo refs, file deleted mid-pass).
-        let ref_token = source_lookup(uri)
-            .and_then(|bytes| extract_token_at_range(&bytes, &loc.range))
+        let ref_token = bytes_opt
+            .as_ref()
+            .and_then(|b| extract_token_at_range(b, &loc.range))
+            .unwrap_or_default();
+
+        // T8.7: extract qualifier from source bytes. Empty when the
+        // ref is a bare-identifier call (no preceding `.`), when the
+        // file isn't reachable, or when the byte before the ref site
+        // isn't a dot.
+        let qualifier = bytes_opt
+            .as_ref()
+            .and_then(|b| extract_qualifier(b, &loc.range))
             .unwrap_or_default();
 
         // Resolve referrer_node_id via _ast. NULL when the file isn't
@@ -458,7 +472,7 @@ pub fn project_references(
             ],
         )?;
 
-        // T8.2: dual-write the typed BindingRecord. `_lsp_refs` row
+        // T8.2/T8.7: dual-write the typed BindingRecord. `_lsp_refs` row
         // stays the local SQL projection; the capnp record is the
         // cross-process contract per the L2/L3 reframe.
         if let Some(w) = binding_writer.as_mut() {
@@ -470,12 +484,62 @@ pub fn project_references(
                 referrer_node_id.as_deref().unwrap_or(""),
                 uri,
                 &loc.range,
+                &qualifier,
             )?;
         }
 
         count += 1;
     }
     Ok(count)
+}
+
+/// T8.7: extract the qualifier (LHS of a `selector_expression`) for a
+/// ref location, by scanning source bytes immediately before the ref
+/// site. Returns `Some("pkg")` for `pkg.Method`, `Some("obj")` for
+/// `obj.method`, `None` for bare-identifier calls.
+///
+/// Pure text scan — no AST or LSP query. This is correct for the
+/// structural distinction the consumer wants (qualified vs unqualified)
+/// and is intentionally agnostic to whether the qualifier names a
+/// package, an object, or a chained selector. Chained selectors
+/// `a.b.c` resolve qualifier to the immediate predecessor (`b`),
+/// matching how `selector_expression` nests in tree-sitter.
+fn extract_qualifier(source: &str, range: &protocol::Range) -> Option<String> {
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    let line_idx = range.start.line as usize;
+    if line_idx >= lines.len() {
+        return None;
+    }
+    let line_start_offset: usize = lines[..line_idx].iter().map(|l| l.len()).sum();
+    let col = range.start.character as usize;
+    let abs_offset = line_start_offset + col;
+
+    let bytes = source.as_bytes();
+    if abs_offset == 0 || abs_offset > bytes.len() {
+        return None;
+    }
+    // The byte immediately before the ref site must be a `.`.
+    if bytes[abs_offset - 1] != b'.' {
+        return None;
+    }
+
+    // Scan backwards through identifier chars to find the qualifier.
+    let dot_pos = abs_offset - 1;
+    let mut start = dot_pos;
+    while start > 0 {
+        let c = bytes[start - 1];
+        if c.is_ascii_alphanumeric() || c == b'_' {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    if start == dot_pos {
+        return None; // dot present but no identifier preceding
+    }
+    std::str::from_utf8(&bytes[start..dot_pos])
+        .ok()
+        .map(|s| s.to_string())
 }
 
 /// AST node kinds that count as a "callable construct" for
@@ -568,6 +632,10 @@ fn lookup_construct_node_id(
 /// byte-stable across additive schema changes. This is what makes
 /// Σ root advance only when the *projection's actual content* changes,
 /// not when the schema gains a default-valued field.
+#[allow(clippy::too_many_arguments)] // private helper; refactoring to a
+// struct would shuffle 8 single-use values for no payoff. Each parameter
+// is named at the call site (single caller in project_references) so the
+// readability is preserved.
 fn write_binding_record(
     writer: &mut std::fs::File,
     target_node_id: &str,
@@ -576,6 +644,7 @@ fn write_binding_record(
     ref_site_node_id: &str,
     ref_uri: &str,
     range: &protocol::Range,
+    qualifier: &str,
 ) -> Result<()> {
     use leyline_schema_capnp::binding_capnp::binding_record;
 
@@ -589,6 +658,8 @@ fn write_binding_record(
         rec.set_ref_uri(ref_uri);
         // parseGen left at 0 for now; T8.5 wires it to Σ generation.
         rec.set_parse_gen(0);
+        // T8.7: qualifier — empty string for bare-identifier calls.
+        rec.set_qualifier(qualifier);
         let mut r = rec.init_ref_range();
         {
             let mut s = r.reborrow().init_start();
@@ -1601,6 +1672,14 @@ mod tests {
         assert_eq!(s.get_column(), 4);
         assert_eq!(e.get_column(), 7);
 
+        // T8.7: qualifier — bare-identifier call `bar(...)` has no
+        // preceding `.`, so qualifier is empty.
+        assert_eq!(
+            rec.get_qualifier().unwrap().to_str().unwrap(),
+            "",
+            "T8.7: bare-identifier call has empty qualifier",
+        );
+
         // Parity: SQL row's referrer_node_id == capnp's refSiteNodeId
         // (both the leaf-identifier path). Eyeballs the dual-write
         // invariant the schema is supposed to enforce.
@@ -1612,6 +1691,95 @@ mod tests {
             )
             .unwrap();
         assert_eq!(sql_referrer, "id_inner");
+    }
+
+    /// T8.7: extract_qualifier picks up `pkg` from `pkg.Method` —
+    /// the simplest qualified-call shape Go/Rust/TS produce.
+    #[test]
+    fn extract_qualifier_basic() {
+        // "  pkg.Method(arg)" — Method starts at col 6
+        let src = "  pkg.Method(arg)\n";
+        let mut range = make_location("file:///x", 0, 6).range;
+        range.end.character = 12; // span "Method"
+        assert_eq!(extract_qualifier(src, &range).as_deref(), Some("pkg"));
+    }
+
+    /// T8.7: chained selector `a.b.c` — qualifier of `c` is `b`,
+    /// the *immediate* predecessor (matches selector_expression nesting).
+    #[test]
+    fn extract_qualifier_chained_returns_immediate() {
+        let src = "x = a.b.c()\n";
+        // c starts at col 8
+        let mut range = make_location("file:///x", 0, 8).range;
+        range.end.character = 9;
+        assert_eq!(extract_qualifier(src, &range).as_deref(), Some("b"));
+    }
+
+    /// T8.7: bare-identifier call `Foo()` has no preceding dot — None.
+    #[test]
+    fn extract_qualifier_bare_call_returns_none() {
+        let src = "Foo()\n";
+        let mut range = make_location("file:///x", 0, 0).range;
+        range.end.character = 3;
+        assert!(extract_qualifier(src, &range).is_none());
+    }
+
+    /// T8.7: dot present but no identifier before it (e.g. mid-string,
+    /// truncated source). Treat as no qualifier rather than crash.
+    #[test]
+    fn extract_qualifier_orphan_dot_returns_none() {
+        let src = ".Foo()\n";
+        let mut range = make_location("file:///x", 0, 1).range;
+        range.end.character = 4;
+        assert!(extract_qualifier(src, &range).is_none());
+    }
+
+    /// T8.7: out-of-range location (LSP gave a position past EOF) —
+    /// safe-None, not panic. Defensive against producer/consumer drift.
+    #[test]
+    fn extract_qualifier_out_of_bounds_returns_none() {
+        let src = "abc\n";
+        let mut range = make_location("file:///x", 5, 0).range;
+        range.end.character = 5;
+        assert!(extract_qualifier(src, &range).is_none());
+    }
+
+    /// T8.7: end-to-end — when source bytes are present and the call
+    /// is qualified, the BindingRecord written to the capnp log
+    /// carries the qualifier. mache-42118e closes structurally:
+    /// `fan_out_skew` becomes a qualifier-aware structural metric
+    /// without an internal AST rewalker.
+    #[test]
+    fn project_references_writes_qualifier_when_qualified() {
+        use std::collections::HashMap;
+        use leyline_schema_capnp::binding_capnp::binding_record;
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("test.bindings.capnp");
+        let conn = Connection::open_in_memory().unwrap();
+
+        let mut locs = vec![make_location("file:///canon/main.go", 0, 4)];
+        // Span the "Method" portion of "pkg.Method(arg)".
+        locs[0].range.start.character = 4;
+        locs[0].range.end.character = 10;
+
+        let bytes_by_uri: HashMap<String, String> = HashMap::from([(
+            "file:///canon/main.go".to_string(),
+            "pkg.Method(arg)\n".to_string(),
+        )]);
+        let mut lookup = |uri: &str| bytes_by_uri.get(uri).cloned();
+
+        project_references(&conn, "tgt", &locs, &mut lookup, Some(&log_path)).unwrap();
+
+        let mut bytes: &[u8] = &std::fs::read(&log_path).unwrap();
+        let msg = capnp::serialize::read_message(&mut bytes, capnp::message::ReaderOptions::new())
+            .unwrap();
+        let rec: binding_record::Reader = msg.get_root().unwrap();
+        assert_eq!(rec.get_ref_token().unwrap().to_str().unwrap(), "Method");
+        assert_eq!(
+            rec.get_qualifier().unwrap().to_str().unwrap(),
+            "pkg",
+            "T8.7: qualifier round-trips through capnp dual-write",
+        );
     }
 
     /// T8.2: lookup_construct_node_id finds the smallest enclosing

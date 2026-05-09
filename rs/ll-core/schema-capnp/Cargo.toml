@@ -5,7 +5,12 @@ edition = "2024"
 description = "Cap'n Proto schemas for Σ event log — typed producer/consumer contract (T8)"
 
 [dependencies]
-capnp = "0.20"
+# ADR-0014 §3 (Pin the toolchain triplet): exact-pin capnp/capnpc so a
+# silent semver bump can't change the bytes of canonical-encoded
+# messages out from under the cross-runtime fixture suite (F8.6.4).
+# Bumping requires explicit human review + cross-runtime byte-equality
+# check; the friction is intentional. See docs/adr/0014-capnp-as-protocol.md.
+capnp = "=0.20.0"
 
 [build-dependencies]
-capnpc = "0.20"
+capnpc = "=0.20.0"

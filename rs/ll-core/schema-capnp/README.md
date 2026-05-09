@@ -50,6 +50,29 @@ previous Head for the parent hash, and writes a new Head with chained
 parent + monotonic generation. The chain is the file-backed analogue of
 the daemon's `Controller::current_root` (T2.1). T8.5 ✅.
 
+## Cross-runtime fixtures (T8.10)
+
+`tests/fixtures/*.bin` files are **canonical-encoded gold-standard
+messages** committed to source control. The Rust assertion test
+(`tests/cross_runtime_fixtures.rs`) verifies the producer's bytes are
+byte-equal to the committed fixtures. The Mache Go test (paired
+mache-side bead) does the same against the same files. F8.6.4 from
+ADR-0014 — encode-in-Rust must round-trip byte-equal through the Go
+decoder.
+
+To regenerate after a deliberate schema change:
+
+```bash
+cargo test -p leyline-schema-capnp \
+    --features regen-fixtures \
+    --test cross_runtime_fixtures
+git diff tests/fixtures/  # review byte-level diff
+git add tests/fixtures/   # commit deliberately
+```
+
+Then mache must regenerate their consumer-side bindings + re-run their
+fixture assertion test.
+
 Readers iterate via `read_message` until EOF. Each message's root is
 the schema's top-level struct (`BindingRecord` for `*.bindings.capnp`).
 

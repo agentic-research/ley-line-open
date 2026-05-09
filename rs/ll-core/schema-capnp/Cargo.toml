@@ -14,3 +14,17 @@ capnp = "=0.20.0"
 
 [build-dependencies]
 capnpc = "=0.20.0"
+
+[features]
+# T8.10: regenerate cross-runtime fixtures. With this feature on, the
+# fixture tests overwrite the committed `.bin` files with fresh
+# canonical-encoded output instead of asserting against them. Use:
+#
+#     cargo test -p leyline-schema-capnp --features regen-fixtures \
+#         --test cross_runtime_fixtures
+#
+# Then commit the regenerated `.bin` files. Without this feature the
+# default test run asserts that the producer's canonical bytes are
+# byte-equal to the committed fixtures — the strongest CI invariant
+# in T8 (ADR-0014 §F8.6.4).
+regen-fixtures = []

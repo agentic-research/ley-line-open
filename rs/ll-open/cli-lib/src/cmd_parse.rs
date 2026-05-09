@@ -375,6 +375,13 @@ pub fn parse_into_conn(
 
     conn.execute_batch("BEGIN")?;
 
+    // T8.3: capnp dual-write — open snapshot files alongside the SQL
+    // writes. Truncate-and-rewrite semantics: each parse run produces
+    // a fresh snapshot of `_ast` and `_source`. `:memory:` connections
+    // skip (no path to write next to). T8.5 will hash these segments
+    // into the Σ root.
+    let (mut ast_writer, mut source_writer) = sibling_snapshot_writers(conn);
+
     // Prepare statements once — reuse for all rows (avoids SQL parse per INSERT).
     let mut stmt_node = conn.prepare_cached(
         "INSERT OR REPLACE INTO nodes (id, parent_id, name, kind, size, mtime, record) \
@@ -410,6 +417,19 @@ pub fn parse_into_conn(
 
                 stmt_source.execute(rusqlite::params![&pf.rel, &pf.language, &pf.abs_path])?;
 
+                // T8.3 capnp dual-write: same fields as the SQL row,
+                // typed and content-addressable.
+                if let Some(w) = source_writer.as_mut() {
+                    write_source_file_record(
+                        w,
+                        &pf.rel,
+                        &pf.language,
+                        &pf.abs_path,
+                        pf.file_mtime,
+                        pf.file_size,
+                    )?;
+                }
+
                 for n in &pf.nodes {
                     stmt_node.execute(rusqlite::params![
                         &n.id, &n.parent_id, &n.name, n.kind, n.size, mtime, &n.record
@@ -422,6 +442,11 @@ pub fn parse_into_conn(
                         a.start_byte, a.end_byte, a.start_row, a.start_col,
                         a.end_row, a.end_col
                     ])?;
+
+                    // T8.3 capnp dual-write for the AstNode.
+                    if let Some(w) = ast_writer.as_mut() {
+                        write_ast_node_record(w, a)?;
+                    }
                 }
 
                 for r in &pf.refs {
@@ -509,6 +534,110 @@ pub fn parse_into_conn(
         errors: errors + oversized,
         changed_files,
     })
+}
+
+// ---------------------------------------------------------------------------
+// T8.3 capnp dual-write helpers
+// ---------------------------------------------------------------------------
+
+/// T8.3: derive `(ast.capnp, source.capnp)` snapshot paths from a
+/// connection's backing file. `:memory:` returns `(None, None)` and
+/// the caller skips the dual-write. Each parse run truncates and
+/// rewrites these files — they're snapshots of `_ast` and `_source`,
+/// not append-only event logs (the binding log in T8.2 is append-only
+/// because LSP enrichment calls accumulate; parse is a single pass).
+fn sibling_snapshot_writers(
+    conn: &Connection,
+) -> (Option<std::fs::File>, Option<std::fs::File>) {
+    let row: rusqlite::Result<String> = conn.query_row(
+        "SELECT file FROM pragma_database_list WHERE name = 'main' LIMIT 1",
+        [],
+        |r| r.get(0),
+    );
+    let db_path = match row {
+        Ok(s) if !s.is_empty() => std::path::PathBuf::from(s),
+        _ => return (None, None),
+    };
+
+    let ast_path = with_extension(&db_path, "ast.capnp");
+    let source_path = with_extension(&db_path, "source.capnp");
+
+    let open = |p: &Path| -> Option<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(p)
+            .ok()
+    };
+
+    (open(&ast_path), open(&source_path))
+}
+
+/// `set_extension` replaces only the *last* dotted component, so
+/// `foo.bar.db` → `foo.bar.ast.capnp`. We want that exact behavior:
+/// the snapshot files sit beside the db file.
+fn with_extension(p: &Path, ext: &str) -> std::path::PathBuf {
+    let mut out = p.to_path_buf();
+    out.set_extension(ext);
+    out
+}
+
+/// T8.3: serialize a single `SourceFile` capnp message and append it
+/// to the source-snapshot file.
+fn write_source_file_record(
+    writer: &mut std::fs::File,
+    id: &str,
+    language: &str,
+    canonical_path: &str,
+    mtime: i64,
+    size: i64,
+) -> Result<()> {
+    use leyline_schema_capnp::source_capnp::source_file;
+
+    let mut msg = capnp::message::Builder::new_default();
+    {
+        let mut sf: source_file::Builder = msg.init_root();
+        sf.set_id(id);
+        sf.set_language(language);
+        sf.set_canonical_path(canonical_path);
+        sf.set_mtime(mtime as u64);
+        sf.set_size(size as u64);
+        // contentHash left empty for now — T8.5 wires BLAKE3.
+        let _hash = sf.init_content_hash();
+    }
+    capnp::serialize::write_message(writer, &msg)
+        .context("write SourceFile capnp record")?;
+    Ok(())
+}
+
+/// T8.3: serialize a single `AstNode` capnp message.
+fn write_ast_node_record(writer: &mut std::fs::File, a: &AstEntry) -> Result<()> {
+    use leyline_schema_capnp::ast_capnp::ast_node;
+
+    let mut msg = capnp::message::Builder::new_default();
+    {
+        let mut node: ast_node::Builder = msg.init_root();
+        node.set_node_id(&a.node_id);
+        node.set_source_id(&a.source_id);
+        node.set_node_kind(&a.node_kind);
+        let mut r = node.init_range();
+        {
+            let mut s = r.reborrow().init_start();
+            s.set_line(a.start_row as u32);
+            s.set_column(a.start_col as u32);
+            s.set_byte(a.start_byte as u64);
+        }
+        {
+            let mut e = r.reborrow().init_end();
+            e.set_line(a.end_row as u32);
+            e.set_column(a.end_col as u32);
+            e.set_byte(a.end_byte as u64);
+        }
+    }
+    capnp::serialize::write_message(writer, &msg)
+        .context("write AstNode capnp record")?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -950,5 +1079,118 @@ mod tests {
         collect_files(root, &mut found).unwrap();
         assert_eq!(found.len(), 1);
         assert!(found[0].ends_with("pkg/util/helper.go"));
+    }
+
+    /// T8.3: file-backed parse emits both `${db}.ast.capnp` and
+    /// `${db}.source.capnp` snapshots alongside the `.db`. The capnp
+    /// records' fields agree with the SQL rows. Pin: SQL-row count ==
+    /// capnp-message count for both tables.
+    #[test]
+    fn parse_into_conn_dual_writes_capnp_snapshots() {
+        use leyline_schema_capnp::ast_capnp::ast_node;
+        use leyline_schema_capnp::source_capnp::source_file;
+        let td = TempDir::new().unwrap();
+        let src = td.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("main.go"), b"package m\n\nfunc Foo() {}\n").unwrap();
+
+        let db_path = td.path().join("out.db");
+        let conn = Connection::open(&db_path).unwrap();
+        let r = parse_into_conn(&conn, &src, None, None).unwrap();
+        assert_eq!(r.parsed, 1, "fixture file must parse");
+
+        let ast_log = with_extension(&db_path, "ast.capnp");
+        let source_log = with_extension(&db_path, "source.capnp");
+        assert!(ast_log.exists(), "T8.3: ast.capnp snapshot must exist");
+        assert!(source_log.exists(), "T8.3: source.capnp snapshot must exist");
+
+        // Read SourceFile snapshot — should have one record matching
+        // the fixture file. Iterate to EOF (capnp messages back-to-
+        // back, same convention as binding.capnp).
+        let mut bytes: &[u8] = &std::fs::read(&source_log).unwrap();
+        let mut sf_count = 0;
+        let mut saw_main_go = false;
+        while !bytes.is_empty() {
+            let msg = capnp::serialize::read_message(
+                &mut bytes,
+                capnp::message::ReaderOptions::new(),
+            )
+            .unwrap();
+            let sf: source_file::Reader = msg.get_root().unwrap();
+            sf_count += 1;
+            if sf.get_id().unwrap().to_str().unwrap() == "main.go" {
+                saw_main_go = true;
+                assert_eq!(sf.get_language().unwrap().to_str().unwrap(), "go");
+                assert!(
+                    sf.get_canonical_path()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .ends_with("/main.go"),
+                    "canonicalPath must point to the actual file",
+                );
+            }
+        }
+        assert_eq!(sf_count, 1);
+        assert!(saw_main_go, "main.go SourceFile record must be present");
+
+        // Parity: SQL `_source` row count == capnp message count.
+        let sql_source_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _source", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            sql_source_count, sf_count,
+            "T8.3 parity: SQL _source rows == capnp SourceFile messages",
+        );
+
+        // AST snapshot: count messages, parity-check against SQL.
+        let mut bytes: &[u8] = &std::fs::read(&ast_log).unwrap();
+        let mut ast_count = 0;
+        let mut saw_function_kind = false;
+        while !bytes.is_empty() {
+            let msg = capnp::serialize::read_message(
+                &mut bytes,
+                capnp::message::ReaderOptions::new(),
+            )
+            .unwrap();
+            let node: ast_node::Reader = msg.get_root().unwrap();
+            ast_count += 1;
+            if node.get_node_kind().unwrap().to_str().unwrap() == "function_declaration" {
+                saw_function_kind = true;
+            }
+        }
+        let sql_ast_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _ast", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            sql_ast_count, ast_count,
+            "T8.3 parity: SQL _ast rows == capnp AstNode messages",
+        );
+        assert!(
+            saw_function_kind,
+            "fixture's `func Foo()` must show up as a function_declaration AstNode",
+        );
+    }
+
+    /// T8.3: `:memory:` connections must NOT attempt the capnp dual-
+    /// write (no path to write next to). Pin so a future refactor that
+    /// changes `sibling_snapshot_writers` doesn't accidentally write
+    /// to `cwd/.ast.capnp` or fail with a panic on the fallback path.
+    #[test]
+    fn parse_into_conn_memory_skips_capnp_snapshots() {
+        let td = TempDir::new().unwrap();
+        let src = td.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("main.go"), b"package m\n").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        parse_into_conn(&conn, &src, None, None).unwrap();
+
+        // No files should have been written into the cwd or temp dir.
+        assert!(
+            !td.path().join(".ast.capnp").exists()
+                && !td.path().join(".source.capnp").exists(),
+            "T8.3: :memory: parse must not produce capnp snapshots",
+        );
     }
 }

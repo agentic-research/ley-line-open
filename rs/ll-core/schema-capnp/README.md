@@ -19,8 +19,8 @@ generates its own bindings from the same `.capnp` files.
 |------|---------|--------|
 | `schemas/common.capnp` | `Position`, `Range`, `Hash` (BLAKE3-32), `NodeRef` | T8.1 ✅ |
 | `schemas/binding.capnp` | `BindingRecord` — LSP refs with both `constructNodeId` and `refSiteNodeId` | T8.2 ✅ |
-| `schemas/ast.capnp` | `AstNode` — tree-sitter projection | T8.3 (open) |
-| `schemas/source.capnp` | `SourceFile` — canonicalized path, content hash, mtime | T8.3 (open) |
+| `schemas/ast.capnp` | `AstNode` — tree-sitter projection | T8.3 ✅ |
+| `schemas/source.capnp` | `SourceFile` — canonicalized path, content hash, mtime | T8.3 ✅ |
 
 Schema-evolution rules: append fields at next `@N` ordinal with default;
 never rename, never repurpose, never re-use ordinals; remove only by
@@ -36,6 +36,12 @@ written via `capnp::serialize::write_message` (Rust) /
 |---|---|
 | `leyline lsp <input.db> -o <output.db>` | `<output>.bindings.capnp` |
 | daemon `enrich` pass on file-backed db | `<live.db>.bindings.capnp` (skip on `:memory:`) |
+| `leyline parse <src> -o <output.db>` | `<output>.ast.capnp` + `<output>.source.capnp` (skip on `:memory:`) |
+
+**Snapshot vs append-only.** `bindings.capnp` is append-only (per-call from
+LSP enrichment). `ast.capnp` and `source.capnp` are truncate-rewrite
+snapshots — each parse run produces a fresh full-tree projection. T8.5
+will hash these into Σ root segments.
 
 Readers iterate via `read_message` until EOF. Each message's root is
 the schema's top-level struct (`BindingRecord` for `*.bindings.capnp`).

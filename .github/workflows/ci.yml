@@ -13,8 +13,8 @@ jobs:
     name: Check + Clippy + Test
     runs-on: ubuntu-latest
     steps:
-      # SHA-pinned: actions/checkout@v4
-      - uses: actions/checkout@de0fac2550c1e8af18ae4eefe72ec16b25e8917e
+      # SHA-pinned: actions/checkout@v4.3.1 (refs/tags/v4 head as of 2026-05)
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       # SHA-pinned: dtolnay/rust-toolchain (latest nightly for edition 2024)
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
@@ -45,7 +45,8 @@ jobs:
     name: Tier isolation — ll-core builds alone
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2550c1e8af18ae4eefe72ec16b25e8917e
+      # SHA-pinned: actions/checkout@v4.3.1 (refs/tags/v4 head as of 2026-05)
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: nightly

@@ -404,6 +404,12 @@ pub fn project_references(
     source_lookup: &mut dyn FnMut(&str) -> Option<String>,
     binding_log: Option<&std::path::Path>,
 ) -> Result<usize> {
+    // T8.9: legacy `_lsp_refs` schema is created/migrated for
+    // *backwards compatibility* — old `.db` files written by pre-T8.9
+    // LLO have rows in this table, and consumers (mache + others) may
+    // still read them as a legacy fallback. New writes go to the
+    // BindingRecord capnp event log only. The DDL stays so SELECTs
+    // against the table don't error on a fresh `.db`.
     conn.execute_batch(LSP_REFS_DDL)?;
     migrate_lsp_schema(conn)?;
 
@@ -444,37 +450,25 @@ pub fn project_references(
             .and_then(|b| extract_qualifier(b, &loc.range))
             .unwrap_or_default();
 
-        // Resolve referrer_node_id via _ast. NULL when the file isn't
-        // in _ast (cross-repo refs to dependencies, etc.). The call
-        // takes the SAME conn that holds _ast — load-bearing.
+        // T8.2: feed the BindingRecord's `refSiteNodeId` — smallest
+        // enclosing AST node at the ref site (typically a leaf
+        // identifier). `None` when the file isn't in `_ast` (cross-
+        // repo refs to dependencies, etc.).
         let referrer_node_id = lookup_referrer_node_id(conn, uri, &loc.range);
 
-        // T8.2: also resolve the smallest enclosing function/method
-        // construct. `find_callers` MCP and `node_refs` shape want
-        // construct level, not leaf. This is the disambiguation that
-        // Falsifiability B's 100% mismatch revealed at the SQL boundary
-        // (cdcae2 alignment-options comment, 2026-05-08).
+        // T8.2: feed the BindingRecord's `constructNodeId` — smallest
+        // enclosing function/method/constructor. `find_callers` MCP and
+        // `node_refs` shape want construct level, not leaf. This is the
+        // disambiguation that Falsifiability B's 100% mismatch revealed
+        // at the SQL boundary (cdcae2 alignment-options comment,
+        // 2026-05-08).
         let construct_node_id = lookup_construct_node_id(conn, uri, &loc.range);
 
-        conn.execute(
-            "INSERT INTO _lsp_refs (node_id, referrer_node_id, ref_token, ref_uri, \
-             ref_start_line, ref_start_col, ref_end_line, ref_end_col) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                target_node_id,
-                referrer_node_id,
-                ref_token,
-                uri,
-                loc.range.start.line,
-                loc.range.start.character,
-                loc.range.end.line,
-                loc.range.end.character,
-            ],
-        )?;
-
-        // T8.2/T8.7: dual-write the typed BindingRecord. `_lsp_refs` row
-        // stays the local SQL projection; the capnp record is the
-        // cross-process contract per the L2/L3 reframe.
+        // T8.9: the typed BindingRecord IS the contract. SQL
+        // `_lsp_refs` writes have been retired — schema-as-protocol
+        // failure modes (be6136-class) are now structurally precluded
+        // because no SQL surface exists for producer/consumer to
+        // disagree on column-by-column.
         if let Some(w) = binding_writer.as_mut() {
             write_binding_record(
                 w,
@@ -1472,31 +1466,23 @@ mod tests {
         assert_eq!(token, "my_func", "def_token must equal the symbol name");
     }
 
+    /// T8.9: count returned by project_references reflects the number
+    /// of BindingRecords emitted (or *would have been emitted* if a
+    /// binding_log path were provided). With T8.9 retiring the SQL
+    /// writer, the SQL `_lsp_refs` count is no longer a meaningful
+    /// proxy — the function's return value IS the contract.
     #[test]
-    fn project_references_table() {
+    fn project_references_count_matches_locations() {
         let conn = Connection::open_in_memory().unwrap();
         let locs = vec![
             make_location("file:///a.py", 5, 0),
             make_location("file:///b.py", 15, 8),
             make_location("file:///c.py", 100, 2),
         ];
-
-        // No source bytes available (no real files); ref_token falls
-        // through to empty. Per ADR-0013 contract: ref_token defaults
-        // to '' on lookup failure, never NULL.
         let mut nop_lookup = |_uri: &str| -> Option<String> { None };
         let count =
             project_references(&conn, "my_var", &locs, &mut nop_lookup, None).unwrap();
-        assert_eq!(count, 3);
-
-        let rows: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM _lsp_refs WHERE node_id = 'my_var'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(rows, 3);
+        assert_eq!(count, 3, "one record per Location");
     }
 
     /// ADR-0013 Step 1 (ley-line-453f7e): `extract_token_at_range`
@@ -1556,15 +1542,18 @@ mod tests {
     /// source_lookup populates `ref_token` from the bytes provided.
     /// Pin the round-trip: lookup returns bytes → extract token →
     /// stored in `ref_token` column.
+    /// ADR-0013 Step 1 + T8.9: ref_token is populated from source
+    /// bytes, surfaced in the BindingRecord capnp event log (the
+    /// post-T8.9 contract; SQL `_lsp_refs` writes are retired).
     #[test]
     fn project_references_populates_ref_token() {
         use std::collections::HashMap;
+        use leyline_schema_capnp::binding_capnp::binding_record;
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("test.bindings.capnp");
         let conn = Connection::open_in_memory().unwrap();
 
-        // ref at line 1, col 4..7 of "fn foo() {\n    bar(baz);\n}\n"
-        // → token "bar"
         let locs = vec![make_location("file:///main.go", 1, 4)];
-        // Adjust the location's range to span "bar" (4..7).
         let mut locs = locs;
         locs[0].range.end.character = 7;
 
@@ -1574,18 +1563,20 @@ mod tests {
         )]);
         let mut lookup = |uri: &str| bytes_by_uri.get(uri).cloned();
 
-        project_references(&conn, "fn_foo", &locs, &mut lookup, None).unwrap();
+        project_references(&conn, "fn_foo", &locs, &mut lookup, Some(&log_path)).unwrap();
 
-        let token: String = conn
-            .query_row(
-                "SELECT ref_token FROM _lsp_refs WHERE node_id = 'fn_foo' LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
+        let bytes = std::fs::read(&log_path).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let msg = capnp::serialize::read_message(
+            &mut slice,
+            capnp::message::ReaderOptions::new(),
+        )
+        .unwrap();
+        let rec: binding_record::Reader = msg.get_root().unwrap();
         assert_eq!(
-            token, "bar",
-            "ADR-0013 Step 1: ref_token must be populated from source bytes",
+            rec.get_ref_token().unwrap().to_str().unwrap(),
+            "bar",
+            "ADR-0013 Step 1: ref_token populated from source bytes",
         );
     }
 
@@ -1680,17 +1671,11 @@ mod tests {
             "T8.7: bare-identifier call has empty qualifier",
         );
 
-        // Parity: SQL row's referrer_node_id == capnp's refSiteNodeId
-        // (both the leaf-identifier path). Eyeballs the dual-write
-        // invariant the schema is supposed to enforce.
-        let sql_referrer: String = conn
-            .query_row(
-                "SELECT referrer_node_id FROM _lsp_refs WHERE node_id = 'fn_bar' LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(sql_referrer, "id_inner");
+        // T8.9: SQL `_lsp_refs` parity assertion has been retired
+        // along with the SQL writer. The capnp record IS the
+        // contract. The previous parity check (SQL `referrer_node_id`
+        // == capnp `refSiteNodeId`) had no failure mode after T8.9 —
+        // there's no second source of truth to disagree.
     }
 
     /// T8.7: extract_qualifier picks up `pkg` from `pkg.Method` —
@@ -1837,18 +1822,19 @@ mod tests {
         }
     }
 
-    /// ADR-0013 Step 1 (be6136): when `_source` and `_ast` are
-    /// populated and the LSP location's URI resolves to a known source
-    /// path, `referrer_node_id` is set to the smallest enclosing AST
-    /// node (not NULL). Pin the byte-range join: this is the table that
-    /// mache's canonical views read.
+    /// ADR-0013 Step 1 (be6136) + T8.9: when `_source` and `_ast`
+    /// are populated and the LSP location's URI resolves to a known
+    /// source path, the BindingRecord's `refSiteNodeId` is set to the
+    /// smallest enclosing AST node (not empty). Pin the byte-range
+    /// join via the capnp output (the post-T8.9 contract).
     #[test]
     fn project_references_populates_referrer_node_id() {
         use std::collections::HashMap;
+        use leyline_schema_capnp::binding_capnp::binding_record;
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("test.bindings.capnp");
         let conn = Connection::open_in_memory().unwrap();
 
-        // _source: id is the rel path; .path is the absolute
-        // (canonicalized) path used as the file:// URI body.
         conn.execute_batch(
             "CREATE TABLE _source (id TEXT PRIMARY KEY, language TEXT, path TEXT);
              CREATE TABLE _ast (
@@ -1880,7 +1866,6 @@ mod tests {
         )
         .unwrap();
 
-        // ref at line 1, col 4 in /canonical/main.go.
         let mut locs = vec![make_location("file:///canonical/main.go", 1, 4)];
         locs[0].range.end.character = 7;
 
@@ -1890,31 +1875,35 @@ mod tests {
         )]);
         let mut lookup = |uri: &str| bytes_by_uri.get(uri).cloned();
 
-        project_references(&conn, "fn_foo", &locs, &mut lookup, None).unwrap();
+        project_references(&conn, "fn_foo", &locs, &mut lookup, Some(&log_path)).unwrap();
 
-        let referrer: Option<String> = conn
-            .query_row(
-                "SELECT referrer_node_id FROM _lsp_refs WHERE node_id = 'fn_foo' LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
+        let bytes = std::fs::read(&log_path).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let msg = capnp::serialize::read_message(
+            &mut slice,
+            capnp::message::ReaderOptions::new(),
+        )
+        .unwrap();
+        let rec: binding_record::Reader = msg.get_root().unwrap();
         assert_eq!(
-            referrer.as_deref(),
-            Some("block_inner"),
-            "referrer_node_id must resolve to the smallest enclosing AST node",
+            rec.get_ref_site_node_id().unwrap().to_str().unwrap(),
+            "block_inner",
+            "refSiteNodeId resolves to smallest enclosing AST node",
         );
     }
 
-    /// be6136: lookup_referrer_node_id misses when `_source.path`
-    /// disagrees with the file:// URI by even one byte (e.g. macOS
-    /// `/tmp` vs `/private/tmp`). This is the regression: when the
-    /// stored path is un-canonicalized but the URI is canonicalized,
-    /// every join misses and every row's referrer_node_id is NULL.
-    /// Pin the *negative* path so a future change that re-introduces
-    /// a normalization mismatch surfaces here.
+    /// be6136 + T8.9: lookup_referrer_node_id misses when
+    /// `_source.path` disagrees with the file:// URI by even one byte
+    /// (e.g. macOS `/tmp` vs `/private/tmp`). The capnp record's
+    /// `refSiteNodeId` falls through to empty string when the lookup
+    /// fails. Pin the *negative* path: a future change that
+    /// re-introduces a normalization mismatch silently surfaces here
+    /// as an empty refSiteNodeId.
     #[test]
     fn lookup_referrer_node_id_returns_none_on_path_mismatch() {
+        use leyline_schema_capnp::binding_capnp::binding_record;
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("test.bindings.capnp");
         let conn = Connection::open_in_memory().unwrap();
 
         conn.execute_batch(
@@ -1945,46 +1934,57 @@ mod tests {
         )
         .unwrap();
 
-        // URI is canonicalized.
+        // URI is canonicalized — mismatches `/tmp/main.go` in `_source.path`.
         let mut locs = vec![make_location("file:///private/tmp/main.go", 1, 4)];
         locs[0].range.end.character = 7;
 
         let mut nop_lookup = |_uri: &str| -> Option<String> { None };
-        project_references(&conn, "fn_foo", &locs, &mut nop_lookup, None).unwrap();
-
-        let referrer: Option<String> = conn
-            .query_row(
-                "SELECT referrer_node_id FROM _lsp_refs WHERE node_id = 'fn_foo' LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
+        project_references(&conn, "fn_foo", &locs, &mut nop_lookup, Some(&log_path))
             .unwrap();
-        assert!(
-            referrer.is_none(),
-            "path mismatch must produce NULL referrer_node_id (regression pin)",
+
+        let bytes = std::fs::read(&log_path).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let msg = capnp::serialize::read_message(
+            &mut slice,
+            capnp::message::ReaderOptions::new(),
+        )
+        .unwrap();
+        let rec: binding_record::Reader = msg.get_root().unwrap();
+        assert_eq!(
+            rec.get_ref_site_node_id().unwrap().to_str().unwrap(),
+            "",
+            "path mismatch must produce empty refSiteNodeId (regression pin)",
         );
     }
 
-    /// ADR-0013 Step 1: when source_lookup returns None (file
-    /// unavailable, cross-repo URI), ref_token defaults to empty
-    /// string — NEVER NULL. Pin so consumer queries on `ref_token != ''`
-    /// stay correct.
+    /// ADR-0013 Step 1 + T8.9: when source_lookup returns None
+    /// (file unavailable, cross-repo URI), the BindingRecord's
+    /// `refToken` defaults to empty string — NEVER null in the schema.
+    /// Pin so consumer queries filtering on non-empty stay correct.
     #[test]
     fn project_references_ref_token_defaults_empty_on_lookup_miss() {
+        use leyline_schema_capnp::binding_capnp::binding_record;
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("test.bindings.capnp");
         let conn = Connection::open_in_memory().unwrap();
         let locs = vec![make_location("file:///unreachable.rs", 0, 0)];
         let mut nop_lookup = |_uri: &str| -> Option<String> { None };
 
-        project_references(&conn, "n0", &locs, &mut nop_lookup, None).unwrap();
+        project_references(&conn, "n0", &locs, &mut nop_lookup, Some(&log_path)).unwrap();
 
-        let token: String = conn
-            .query_row(
-                "SELECT ref_token FROM _lsp_refs WHERE node_id = 'n0' LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(token, "", "ref_token must default to empty, not NULL");
+        let bytes = std::fs::read(&log_path).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let msg = capnp::serialize::read_message(
+            &mut slice,
+            capnp::message::ReaderOptions::new(),
+        )
+        .unwrap();
+        let rec: binding_record::Reader = msg.get_root().unwrap();
+        assert_eq!(
+            rec.get_ref_token().unwrap().to_str().unwrap(),
+            "",
+            "refToken defaults to empty, not null",
+        );
     }
 
     /// ADR-0013 Step 1: migrate_lsp_schema is idempotent — calling

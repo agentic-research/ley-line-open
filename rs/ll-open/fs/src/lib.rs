@@ -6,7 +6,7 @@ pub mod nfs;
 pub mod staging;
 pub mod validate;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use leyline_core::{ArenaHeader, Controller};
 use memmap2::Mmap;
 use rusqlite::{Connection, DatabaseName};
@@ -15,6 +15,96 @@ use std::ffi::CStr;
 use std::io::Cursor;
 use std::os::raw::c_char;
 use std::path::Path;
+
+/// T2.3: parse the SQLite db file header to extract the actual data
+/// length within an arena buffer (which is data + zero padding).
+/// Returns `None` if the buffer is not a recognized SQLite v3 file.
+///
+/// The arena buffer is `data ++ zeros` where `data` is the serialized
+/// SQLite db. The producer's BLAKE3 hash (T2.2 `current_root`) covers
+/// only the data prefix, not the padding. The reader needs the data
+/// length to hash the matching prefix; SQLite's file header carries
+/// it as `page_size * page_count` (bytes 16-17 + 28-31 big-endian).
+///
+/// Reference: <https://www.sqlite.org/fileformat.html> §1.3 (db header).
+fn sqlite_db_size(buf: &[u8]) -> Option<usize> {
+    if buf.len() < 32 {
+        return None;
+    }
+    if &buf[..16] != b"SQLite format 3\0" {
+        return None;
+    }
+    // Page size: u16 BE at offset 16. Special case: value 1 means 65536.
+    let page_size_raw = u16::from_be_bytes([buf[16], buf[17]]) as u64;
+    let page_size = if page_size_raw == 1 {
+        65536u64
+    } else {
+        page_size_raw
+    };
+    // Page count: u32 BE at offset 28.
+    let page_count = u32::from_be_bytes([buf[28], buf[29], buf[30], buf[31]]) as u64;
+    let total = page_size.checked_mul(page_count)?;
+    if total > buf.len() as u64 {
+        return None;
+    }
+    Some(total as usize)
+}
+
+/// T2.3: verify the arena buffer's BLAKE3 hash matches the controller's
+/// `current_root`. Substrate's content-addressed correctness pin: any
+/// mutation of arena bytes after the producer's atomic publish (T2.2
+/// `set_arena_with_root`) is detected here, before `sqlite3_deserialize`
+/// runs on potentially-corrupted bytes.
+///
+/// Skips verification when `current_root` is the zero sentinel — this
+/// covers two legitimate cases:
+/// 1. Pre-T2.2 controllers (legacy `.ctrl` files written before the
+///    root-publish primitive existed).
+/// 2. Writers that use the legacy `set_arena` API (e.g. `flush_to_arena`
+///    in graph.rs prior to T2.3 wiring) — they don't publish a root,
+///    so there's nothing to verify against.
+///
+/// In both cases, deserialize proceeds without integrity check (matches
+/// pre-T2 behavior). Verification is purely additive — it tightens the
+/// contract when both sides participate, never breaks the legacy path.
+fn verify_arena_root(ctrl: &Controller, buf: &[u8]) -> Result<()> {
+    let expected = ctrl.current_root();
+    if expected == [0u8; 32] {
+        // Zero sentinel — no root assigned. Skip verification.
+        return Ok(());
+    }
+    let db_size = sqlite_db_size(buf).ok_or_else(|| {
+        anyhow::anyhow!(
+            "T2.3: arena buffer is not a valid SQLite v3 file; cannot \
+             determine data length for hash verification (buffer is {} \
+             bytes; expected db header magic 'SQLite format 3')",
+            buf.len()
+        )
+    })?;
+    let actual: [u8; 32] = blake3::hash(&buf[..db_size]).into();
+    if actual != expected {
+        bail!(
+            "T2.3 arena root mismatch — substrate corruption detected. \
+             current_root expected BLAKE3 {} (first 8 hex), buffer hashed \
+             to {} (first 8 hex). Refusing to deserialize potentially \
+             corrupted bytes. db_size = {}, buf_size = {}.",
+            hex_short_8(&expected),
+            hex_short_8(&actual),
+            db_size,
+            buf.len(),
+        );
+    }
+    Ok(())
+}
+
+fn hex_short_8(bytes: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(8);
+    use std::fmt::Write;
+    for b in &bytes[..4] {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
 
 /// A read-only SQLite database deserialized from an arena buffer.
 ///
@@ -27,6 +117,12 @@ pub struct SqliteGraph {
 
 impl SqliteGraph {
     /// Open the active buffer from a ley-line arena as a read-only SQLite DB.
+    ///
+    /// **T2.3 verification:** before `sqlite3_deserialize`, the buffer's
+    /// `BLAKE3(prefix)` is compared against `controller.current_root()`.
+    /// On mismatch, returns an error and refuses to load — substrate's
+    /// content-addressed correctness pin. Skipped when `current_root`
+    /// is the zero sentinel (legacy / non-T2.2 writers).
     pub fn from_arena(control_path: &Path) -> Result<Self> {
         let controller = Controller::open_or_create(control_path)?;
         let arena_path = controller.arena_path();
@@ -44,6 +140,8 @@ impl SqliteGraph {
         let buf_size = ArenaHeader::buffer_size(file_size);
 
         let buf = &mmap[offset as usize..(offset + buf_size) as usize];
+        // T2.3: σ(buf) == ctrl.current_root before deserialize.
+        verify_arena_root(&controller, buf)?;
         Self::from_bytes(buf)
     }
 

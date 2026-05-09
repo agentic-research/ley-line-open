@@ -27,6 +27,9 @@ leyline-schema = { path = "../../ll-core/schema" }
 anyhow = "1.0"
 memmap2 = "0.9"
 bytemuck = { version = "1.14", features = ["derive"] }
+# T2.3: BLAKE3 to verify σ(arena buffer) == ctrl.current_root before
+# deserialize. Locked to BLAKE3 per Σ §3.4.
+blake3 = "1"
 fuser = { version = "0.15", optional = true }
 libc = { version = "0.2", optional = true }
 log = "0.4"

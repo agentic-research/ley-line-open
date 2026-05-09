@@ -203,6 +203,10 @@ impl SqliteGraphAdapter {
     }
 
     /// Create a writable adapter from an arena (for daemon with write-back).
+    ///
+    /// **T2.3 verification:** same content-addressed pin as
+    /// `SqliteGraph::from_arena` — refuses to load on `current_root`
+    /// mismatch. Skipped on zero-root sentinel (legacy writers).
     pub fn from_arena_writable(control_path: &Path) -> Result<Self> {
         let controller = Controller::open_or_create(control_path)?;
         let arena_path = controller.arena_path();
@@ -220,6 +224,8 @@ impl SqliteGraphAdapter {
         let buf_size = ArenaHeader::buffer_size(file_size);
 
         let buf = &mmap[offset as usize..(offset + buf_size) as usize];
+        // T2.3: σ(buf) == ctrl.current_root before deserialize.
+        crate::verify_arena_root(&controller, buf)?;
         let graph = SqliteGraph::from_bytes_writable(buf)?;
         let adapter = Self::new(graph);
         adapter.ensure_errors_table()?;

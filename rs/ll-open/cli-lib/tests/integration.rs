@@ -1248,6 +1248,214 @@ fn snapshot_root_advances_when_db_changes() {
 }
 
 // ---------------------------------------------------------------------------
+// T2.3 — reader-side hash verification tests
+// ---------------------------------------------------------------------------
+
+/// T2.3 happy path: post-T2.2 snapshot writes a non-zero current_root;
+/// reader's `SqliteGraph::from_arena` recomputes BLAKE3 of the active
+/// buffer, finds it matches, and proceeds to deserialize. End-to-end
+/// pin: producer publishes content-addressed bytes, consumer verifies
+/// before use, both sides agree.
+#[test]
+fn t23_reader_accepts_arena_when_root_matches() {
+    use leyline_core::{Controller, create_arena};
+    use leyline_cli_lib::cmd_parse::parse_into_conn;
+    use leyline_cli_lib::cmd_daemon::snapshot_to_arena;
+    use leyline_fs::SqliteGraph;
+
+    let src = create_go_fixture();
+    let arena_dir = TempDir::new().unwrap();
+    let arena_path = arena_dir.path().join("t23-ok.arena");
+    let ctrl_path = arena_dir.path().join("t23-ok.ctrl");
+
+    let arena_size = 4 * 1024 * 1024;
+    let _mmap = create_arena(&arena_path, arena_size).unwrap();
+    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size, 0).unwrap();
+    drop(ctrl);
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
+    snapshot_to_arena(&conn, &ctrl_path).unwrap();
+
+    // Reader path — should succeed because the writer published the
+    // matching root via set_arena_with_root.
+    let graph = SqliteGraph::from_arena(&ctrl_path).expect(
+        "T2.3: reader must accept arena when current_root matches BLAKE3(buffer)",
+    );
+    // Sanity: graph is usable.
+    let _ = graph.conn();
+}
+
+/// T2.3 failure path: corrupt the arena buffer between the writer's
+/// publish and the reader's load. Reader must refuse to deserialize
+/// — the substrate's content-addressed correctness pin in action.
+#[test]
+fn t23_reader_refuses_arena_when_buffer_corrupted() {
+    use leyline_core::{Controller, ArenaHeader, create_arena};
+    use leyline_cli_lib::cmd_parse::parse_into_conn;
+    use leyline_cli_lib::cmd_daemon::snapshot_to_arena;
+    use leyline_fs::SqliteGraph;
+
+    let src = create_go_fixture();
+    let arena_dir = TempDir::new().unwrap();
+    let arena_path = arena_dir.path().join("t23-corrupt.arena");
+    let ctrl_path = arena_dir.path().join("t23-corrupt.ctrl");
+
+    let arena_size = 4 * 1024 * 1024;
+    let _mmap = create_arena(&arena_path, arena_size).unwrap();
+    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size, 0).unwrap();
+    drop(ctrl);
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
+    snapshot_to_arena(&conn, &ctrl_path).unwrap();
+
+    // Corrupt one byte in the active buffer. Choose an offset deep
+    // inside the SQLite payload (past the file header, so the reader
+    // still recognizes it as SQLite — only the hash should fail).
+    {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&arena_path)
+            .unwrap();
+        let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file).unwrap() };
+        let header: ArenaHeader =
+            *bytemuck::from_bytes(&mmap[..std::mem::size_of::<ArenaHeader>()]);
+        let offset = header
+            .active_buffer_offset(arena_size)
+            .expect("valid header") as usize;
+        // Flip a byte deep inside the buffer (past SQLite header @ ~100B).
+        mmap[offset + 500] ^= 0xFF;
+        mmap.flush().unwrap();
+    }
+
+    let result = SqliteGraph::from_arena(&ctrl_path);
+    let err = match result {
+        Ok(_) => panic!("T2.3: reader must refuse arena when buffer hash != current_root"),
+        Err(e) => e,
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("arena root mismatch") || msg.contains("substrate corruption"),
+        "T2.3 error must clearly identify the substrate-corruption failure mode (got: {msg})",
+    );
+}
+
+/// T2.3 legacy compatibility: a Controller with `current_root = 0`
+/// (legacy pre-T2.2 .ctrl, or a writer that uses the legacy
+/// `set_arena` API) makes the reader skip verification. Pin so a
+/// stricter check (e.g. "always require non-zero root") doesn't
+/// silently break old `.db` files or non-T2.2 producers.
+#[test]
+fn t23_reader_skips_verification_on_zero_root_sentinel() {
+    use leyline_core::{Controller, ArenaHeader, create_arena, layout::write_to_arena};
+    use leyline_fs::SqliteGraph;
+
+    let arena_dir = TempDir::new().unwrap();
+    let arena_path = arena_dir.path().join("t23-zero.arena");
+    let ctrl_path = arena_dir.path().join("t23-zero.ctrl");
+
+    let arena_size = 4 * 1024 * 1024;
+    let mut mmap = create_arena(&arena_path, arena_size).unwrap();
+
+    // Build a real SQLite db, get its bytes, write into arena via the
+    // legacy set_arena (no current_root publish).
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
+        .unwrap();
+    let db_bytes = conn.serialize(rusqlite::DatabaseName::Main).unwrap();
+    write_to_arena(&mut mmap, &db_bytes).unwrap();
+
+    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+    // Legacy path: set_arena (no root) leaves current_root at zero sentinel.
+    ctrl.set_arena(&arena_path.to_string_lossy(), arena_size, 1)
+        .unwrap();
+    assert_eq!(
+        ctrl.current_root(),
+        [0u8; 32],
+        "legacy set_arena leaves current_root at zero sentinel",
+    );
+    drop(ctrl);
+
+    // Reader skips verification on zero sentinel and deserializes.
+    let graph = SqliteGraph::from_arena(&ctrl_path).expect(
+        "T2.3: zero-root sentinel must skip verification (legacy compat)",
+    );
+    let _ = graph.conn();
+    // Sanity that the buffer was the right SQLite db.
+    let header_check: i64 = graph
+        .conn()
+        .query_row("SELECT x FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(header_check, 1);
+
+    // Sanity check that the active buffer offset is valid.
+    let _ = ArenaHeader::buffer_size(arena_size);
+}
+
+/// T2.3: when current_root is non-zero AND the buffer is not a valid
+/// SQLite v3 file, the reader returns a clear error rather than
+/// crashing or producing a misleading "hash mismatch." Catches
+/// substrate / non-substrate confusion (e.g., wrong arena file
+/// passed in).
+#[test]
+fn t23_reader_errors_clearly_on_non_sqlite_buffer() {
+    use leyline_core::{Controller, ArenaHeader, create_arena};
+    use leyline_fs::SqliteGraph;
+
+    let arena_dir = TempDir::new().unwrap();
+    let arena_path = arena_dir.path().join("t23-nonsqlite.arena");
+    let ctrl_path = arena_dir.path().join("t23-nonsqlite.ctrl");
+
+    let arena_size = 4 * 1024 * 1024;
+    let _mmap = create_arena(&arena_path, arena_size).unwrap();
+
+    // Write garbage into the active buffer.
+    {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&arena_path)
+            .unwrap();
+        let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file).unwrap() };
+        let header: ArenaHeader =
+            *bytemuck::from_bytes(&mmap[..std::mem::size_of::<ArenaHeader>()]);
+        let offset = header
+            .active_buffer_offset(arena_size)
+            .expect("valid header") as usize;
+        // Garbage bytes that do NOT start with "SQLite format 3\0".
+        mmap[offset..offset + 16].copy_from_slice(b"NOT-A-SQLITE-DB!");
+        mmap.flush().unwrap();
+    }
+
+    let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
+    // Set a non-zero root to force verification (otherwise we'd hit
+    // the zero-sentinel skip path and not exercise sqlite_db_size).
+    ctrl.set_arena_with_root(
+        &arena_path.to_string_lossy(),
+        arena_size,
+        1,
+        [0xAB; 32],
+    )
+    .unwrap();
+    drop(ctrl);
+
+    let result = SqliteGraph::from_arena(&ctrl_path);
+    let err = match result {
+        Ok(_) => panic!("T2.3: must error on non-SQLite buffer"),
+        Err(e) => e,
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("not a valid SQLite v3 file"),
+        "T2.3 error must identify the non-SQLite buffer (got: {msg})",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Incremental reparse tests
 // ---------------------------------------------------------------------------
 

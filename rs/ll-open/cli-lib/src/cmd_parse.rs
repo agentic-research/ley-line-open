@@ -523,6 +523,14 @@ pub fn parse_into_conn(
         );
     }
 
+    // T8.5: Σ root advance — hash the just-emitted segments and chain
+    // a new Head record. Best-effort: a head-write failure logs and
+    // doesn't fail the parse. `:memory:` connections are gated inside
+    // `write_head_after_parse` itself.
+    if let Err(e) = write_head_after_parse(conn) {
+        log::warn!("T8.5 head-write failed (parse otherwise OK): {e:#}");
+    }
+
     // Oversized files count as errors at the result level — they
     // weren't parsed, so the caller's "did this run produce data for
     // every file" check stays honest. The dedicated summary field makes
@@ -534,6 +542,117 @@ pub fn parse_into_conn(
         errors: errors + oversized,
         changed_files,
     })
+}
+
+// ---------------------------------------------------------------------------
+// T8.5 Σ root advance (segment hash → Head chain)
+// ---------------------------------------------------------------------------
+
+/// T8.5: canonical order of capnp segment files for hashing. Matches
+/// the comment in `head.capnp`: `source.capnp || ast.capnp ||
+/// bindings.capnp`. Stable, lexicographic-by-suffix. Files that don't
+/// exist in this run are simply skipped (their absence contributes
+/// nothing to the hash) — keeps the chain meaningful when binding
+/// dual-write hasn't run yet (e.g. parse-only without enrichment).
+const SEGMENT_FILE_SUFFIXES: &[&str] = &[
+    "source.capnp",
+    "ast.capnp",
+    "bindings.capnp",
+];
+
+/// T8.5: hash the run's capnp segment files in canonical order.
+/// Returns `(rootHash, totalBytes)`. Empty input (no segment files
+/// exist yet — `:memory:` parse) returns the BLAKE3 of empty bytes,
+/// which is the same as the daemon's `Controller::current_root`
+/// sentinel for "no segment yet."
+fn hash_segment_files(db_path: &Path) -> Result<([u8; 32], u64)> {
+    let mut hasher = blake3::Hasher::new();
+    let mut total: u64 = 0;
+    for suffix in SEGMENT_FILE_SUFFIXES {
+        let p = with_extension(db_path, suffix);
+        if !p.exists() {
+            continue;
+        }
+        let bytes = std::fs::read(&p)
+            .with_context(|| format!("read segment {}", p.display()))?;
+        total = total.saturating_add(bytes.len() as u64);
+        hasher.update(&bytes);
+    }
+    Ok((*hasher.finalize().as_bytes(), total))
+}
+
+/// T8.5: read the existing `${db}.head.capnp`, returning the chain
+/// state. Returns `(parentHash, generation)` where parentHash is the
+/// previous root (zero if no Head exists yet) and generation is the
+/// next monotonic counter value (1 if no Head exists yet).
+fn read_head_for_chain(head_path: &Path) -> ([u8; 32], u64) {
+    use leyline_schema_capnp::head_capnp::head;
+
+    let bytes = match std::fs::read(head_path) {
+        Ok(b) => b,
+        Err(_) => return ([0u8; 32], 1),
+    };
+    let mut slice: &[u8] = &bytes;
+    let msg = match capnp::serialize::read_message(
+        &mut slice,
+        capnp::message::ReaderOptions::new(),
+    ) {
+        Ok(m) => m,
+        Err(_) => return ([0u8; 32], 1),
+    };
+    let h: head::Reader = match msg.get_root() {
+        Ok(h) => h,
+        Err(_) => return ([0u8; 32], 1),
+    };
+    let prev_root = match h.get_root_hash() {
+        Ok(rh) => rh
+            .get_bytes()
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            .unwrap_or([0u8; 32]),
+        Err(_) => [0u8; 32],
+    };
+    let prev_gen = h.get_generation();
+    (prev_root, prev_gen.saturating_add(1))
+}
+
+/// T8.5: compute the segment hash for this run, read the existing
+/// Head for the parent/gen chain, and write the new Head. Skips when
+/// the connection isn't file-backed (`:memory:`) — same gating as
+/// T8.3's snapshot writers.
+fn write_head_after_parse(conn: &Connection) -> Result<()> {
+    let row: rusqlite::Result<String> = conn.query_row(
+        "SELECT file FROM pragma_database_list WHERE name = 'main' LIMIT 1",
+        [],
+        |r| r.get(0),
+    );
+    let db_path = match row {
+        Ok(s) if !s.is_empty() => std::path::PathBuf::from(s),
+        _ => return Ok(()),
+    };
+
+    let (root, segment_bytes) = hash_segment_files(&db_path)?;
+    let head_path = with_extension(&db_path, "head.capnp");
+    let (parent, generation) = read_head_for_chain(&head_path);
+
+    use leyline_schema_capnp::head_capnp::head;
+    let mut msg = capnp::message::Builder::new_default();
+    {
+        let mut h: head::Builder = msg.init_root();
+        h.set_generation(generation);
+        h.set_segment_bytes(segment_bytes);
+        h.reborrow().init_root_hash().set_bytes(&root);
+        h.reborrow().init_parent_hash().set_bytes(&parent);
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&head_path)
+        .with_context(|| format!("open head {}", head_path.display()))?;
+    capnp::serialize::write_message(&mut f, &msg)
+        .context("write Head capnp record")?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1170,6 +1289,74 @@ mod tests {
             saw_function_kind,
             "fixture's `func Foo()` must show up as a function_declaration AstNode",
         );
+    }
+
+    /// T8.5: parse twice; head.capnp chains correctly:
+    /// - run 1: parentHash == [0;32] (sentinel), generation == 1, rootHash != 0
+    /// - run 2: parentHash == run1.rootHash, generation == 2
+    /// And rootHash equals BLAKE3 of the segment files in canonical order.
+    #[test]
+    fn parse_into_conn_chains_head_across_runs() {
+        use leyline_schema_capnp::head_capnp::head;
+        let td = TempDir::new().unwrap();
+        let src = td.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("a.go"), b"package m\n\nfunc Foo() {}\n").unwrap();
+        let db_path = td.path().join("out.db");
+        let head_path = with_extension(&db_path, "head.capnp");
+
+        // Run 1.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            parse_into_conn(&conn, &src, None, None).unwrap();
+        }
+        let bytes = std::fs::read(&head_path).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let msg = capnp::serialize::read_message(
+            &mut slice,
+            capnp::message::ReaderOptions::new(),
+        )
+        .unwrap();
+        let h: head::Reader = msg.get_root().unwrap();
+        let run1_root: [u8; 32] = h.get_root_hash().unwrap().get_bytes().unwrap()
+            .try_into().unwrap();
+        let run1_parent: [u8; 32] = h.get_parent_hash().unwrap().get_bytes().unwrap()
+            .try_into().unwrap();
+        assert_eq!(run1_parent, [0u8; 32], "T8.5: first parse parent must be zero");
+        assert_eq!(h.get_generation(), 1, "T8.5: first parse gen == 1");
+        assert_ne!(run1_root, [0u8; 32], "T8.5: rootHash must be non-zero");
+
+        // Independently re-hash to verify the rootHash is correct.
+        let (independent_hash, _) = hash_segment_files(&db_path).unwrap();
+        assert_eq!(
+            run1_root, independent_hash,
+            "T8.5: rootHash must equal BLAKE3 of segment files",
+        );
+
+        // Run 2 — modify the file so the segment changes.
+        std::fs::write(src.join("a.go"), b"package m\n\nfunc Foo() {}\nfunc Bar() {}\n").unwrap();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            parse_into_conn(&conn, &src, None, None).unwrap();
+        }
+        let bytes = std::fs::read(&head_path).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let msg = capnp::serialize::read_message(
+            &mut slice,
+            capnp::message::ReaderOptions::new(),
+        )
+        .unwrap();
+        let h: head::Reader = msg.get_root().unwrap();
+        let run2_root: [u8; 32] = h.get_root_hash().unwrap().get_bytes().unwrap()
+            .try_into().unwrap();
+        let run2_parent: [u8; 32] = h.get_parent_hash().unwrap().get_bytes().unwrap()
+            .try_into().unwrap();
+        assert_eq!(
+            run2_parent, run1_root,
+            "T8.5: run2 parentHash must == run1 rootHash (chain invariant)",
+        );
+        assert_eq!(h.get_generation(), 2, "T8.5: gen monotonically increments");
+        assert_ne!(run2_root, run1_root, "rootHash differs because segment changed");
     }
 
     /// T8.3: `:memory:` connections must NOT attempt the capnp dual-

@@ -1179,6 +1179,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64",
+ "blake3",
  "bytemuck",
  "capnp",
  "clap",

@@ -18,6 +18,7 @@ leyline-schema = { path = "../../ll-core/schema" }
 leyline-schema-capnp = { path = "../../ll-core/schema-capnp" }
 leyline-core = { path = "../../ll-core/core" }
 capnp = "0.20"
+blake3 = "1"
 leyline-fs = { path = "../fs", default-features = false }
 rusqlite = { version = "0.34", features = ["bundled", "serialize"] }
 sqlite-vec = { version = "0.1", optional = true }

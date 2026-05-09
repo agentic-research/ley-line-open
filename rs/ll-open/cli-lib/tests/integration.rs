@@ -1416,10 +1416,11 @@ fn t24_reader_rejects_zero_root_with_data() {
 
 /// T2.4 fresh-arena path: a brand-new arena with no payload (data_size
 /// == 0) and zero current_root is still legal — there's nothing to
-/// verify and nothing to deserialize. The reader either accepts an
-/// empty SQLite buffer (sqlite3_deserialize errors with its own clear
-/// message) or returns a structural error from from_bytes; either way
-/// must NOT be the "downgrade" rejection from the prior test.
+/// verify and nothing to deserialize. The reader passes verification
+/// (the `data_size == 0` carve-out in `verify_arena_root`) but then
+/// errors at `sqlite3_deserialize` because empty bytes aren't a
+/// valid SQLite database. The pin: must reach the SQLite layer with
+/// a non-substrate error message, NOT the downgrade rejection.
 #[test]
 fn t24_reader_accepts_zero_root_with_empty_data() {
     use leyline_core::{Controller, create_arena};
@@ -1440,17 +1441,31 @@ fn t24_reader_accepts_zero_root_with_empty_data() {
     // Fresh arena: header.data_size == 0, current_root == [0;32].
     // The verifier returns Ok(empty slice); SQLite then errors on
     // empty bytes — that's a from_bytes-level failure, not the
-    // "downgrade" path tested above. Pin: any error here must NOT
-    // be the substrate-identity rejection.
+    // "downgrade" path tested above. Three assertions:
+    //   1. The result MUST be an error (empty bytes ≠ valid SQLite).
+    //      A future change that made empty deserialize succeed would
+    //      slip past the prior "if let Err" check tautologically;
+    //      forcing Err here keeps the test honest.
+    //   2. The error MUST NOT be the substrate-identity rejection.
+    //   3. The error MUST be from the SQLite layer (recognizable
+    //      via the canonical `sqlite3_deserialize` context string).
     let result = SqliteGraph::from_arena(&ctrl_path);
-    if let Err(e) = result {
-        let msg = format!("{e:#}");
-        assert!(
-            !(msg.contains("zero sentinel") || msg.contains("substrate identity")),
-            "T2.4: fresh empty arena must not trip the downgrade rejection \
-             (data_size == 0 is the legitimate empty case); got: {msg}",
-        );
-    }
+    let err = result.err().expect(
+        "T2.4: fresh empty arena must error at sqlite3_deserialize \
+         (empty bytes are not a valid SQLite db); a future Ok here \
+         would mean the verifier silently accepted unverified data",
+    );
+    let msg = format!("{err:#}");
+    assert!(
+        !(msg.contains("zero sentinel") || msg.contains("substrate identity")),
+        "T2.4: fresh empty arena must not trip the downgrade rejection \
+         (data_size == 0 is the legitimate empty case); got: {msg}",
+    );
+    assert!(
+        msg.contains("sqlite3_deserialize"),
+        "T2.4: fresh-arena failure must come from the SQLite layer, \
+         not from the substrate verifier; got: {msg}",
+    );
 }
 
 /// T2.3: when current_root is non-zero AND the buffer's bytes don't

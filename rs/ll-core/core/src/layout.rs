@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 pub struct ArenaHeader {
     /// Magic bytes "LEY0" (0x4C455930)
     pub magic: u32,
-    /// Schema version (Expect 2 after T2.4)
+    /// Schema version (must be 2 — bead `ley-line-open-baee26`).
     pub version: u8,
     /// Index of the active double-buffer (0 or 1)
     pub active_buffer: u8,

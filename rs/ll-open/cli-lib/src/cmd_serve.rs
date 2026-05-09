@@ -68,10 +68,10 @@ pub fn setup_arena(arena: &Path, arena_size: u64, control: Option<&Path>) -> Res
     // Open/create the controller.
     let mut ctrl = Controller::open_or_create(&ctrl_path).context("open controller")?;
 
-    // T2.4: if no arena path is registered, register it. Detection
-    // uses arena_path emptiness (pre-T2.4 used `generation == 0`,
-    // which is no longer exposed). A fresh controller has an empty
-    // arena_path and zero-root sentinel.
+    // If no arena path is registered, register it. Detection uses
+    // arena_path emptiness — bead `ley-line-open-baee26` removed the
+    // V1 `generation == 0` check from the public API. A fresh
+    // controller has an empty arena_path and zero-root sentinel.
     if ctrl.arena_path().is_empty() {
         let arena_str = arena
             .canonicalize()

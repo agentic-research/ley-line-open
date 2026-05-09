@@ -57,9 +57,9 @@ pub fn load_into_arena(control: &Path, db_bytes: &[u8]) -> Result<()> {
 
     write_to_arena(&mut mmap, db_bytes).context("write to arena")?;
 
-    // T2.4: publish via current_root (BLAKE3 of db bytes). The CAS
-    // root advance IS the publish event; readers detect by comparing
-    // current_root, not generation.
+    // Publish via current_root (BLAKE3 of db bytes) — bead
+    // `ley-line-open-baee26`. The CAS root advance IS the publish
+    // event; readers detect by comparing current_root.
     let current_root: [u8; 32] = blake3::hash(db_bytes).into();
     ctrl.set_arena_with_root(&arena_path, arena_size, current_root)
         .context("publish current_root (load advance)")?;

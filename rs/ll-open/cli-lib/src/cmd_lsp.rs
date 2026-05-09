@@ -160,7 +160,8 @@ pub async fn cmd_lsp(
         conn
     };
 
-    // T8.2: dual-write the capnp binding event log next to `output`.
+    // dual-write the capnp binding event log next to `output`
+    // (bead `ley-line-open-cdcae2`).
     // CLI path always knows where to land; daemon path defers to
     // pragma_database_list per lsp_pass.rs::sibling_capnp_log.
     let binding_log = output.with_extension("bindings.capnp");

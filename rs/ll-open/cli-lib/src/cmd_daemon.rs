@@ -491,12 +491,17 @@ fn try_warm_start(ctrl_path: &Path) -> Result<Option<rusqlite::Connection>> {
         bytemuck::from_bytes(&mmap[..std::mem::size_of::<leyline_core::ArenaHeader>()]);
 
     let file_size = mmap.len() as u64;
-    let offset = match header.active_buffer_offset(file_size) {
-        Some(o) => o,
-        None => {
+    let offset = match header.validate_header(file_size) {
+        Ok(o) => o,
+        Err(e) => {
+            // Typed reason → operator can distinguish a stale-VERSION
+            // arena needing the cutover from on-disk corruption or a
+            // truncated file. Falls through to cold start in every
+            // case (warm restart is best-effort), but the log line
+            // is now actionable.
             log::warn!(
-                "warm start: arena {arena_path} header invalid (bad magic, version, \
-                 or active_buffer) — falling through to cold start",
+                "warm start: arena {arena_path} rejected — {e} \
+                 — falling through to cold start",
             );
             return Ok(None);
         }

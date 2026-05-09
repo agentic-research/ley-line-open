@@ -199,13 +199,13 @@ impl Controller {
         out
     }
 
-    /// **Test-only, unfenced root setter.** Lets tests seed or clobber
-    /// the root region directly without going through the publish
-    /// fence. Production callers must use [`Self::set_arena_with_root`],
-    /// which writes under the Release-store of the sync counter so
-    /// polling readers observe a consistent snapshot. Gated behind
-    /// `#[cfg(test)]` so production code can't reach the unfenced
-    /// path even by accident.
+    /// **Test-only, unfenced root setter** (gated `#[cfg(test)]`).
+    /// Production code uses [`Self::set_arena_with_root`], which
+    /// writes under the Release-store of the sync counter so polling
+    /// readers observe a consistent snapshot. The cfg-gate
+    /// structurally prevents production callers from reaching this
+    /// unfenced path; this method only exists for tests that need
+    /// to seed or clobber the root region directly.
     #[cfg(test)]
     fn set_current_root(&mut self, root: [u8; 32]) -> Result<()> {
         self.mmap[OFF_CURRENT_ROOT..OFF_CURRENT_ROOT + CURRENT_ROOT_LEN]
@@ -256,19 +256,25 @@ impl Controller {
         Ok(())
     }
 
-    /// Internal: increment the sync counter via Release-store.
-    /// Pairs with `sync_counter_acquire`. Public callers don't see
-    /// the counter; they observe published state via `current_root`.
+    /// Internal: atomically increment the sync counter and publish
+    /// via Release ordering. Pairs with `sync_counter_acquire`.
+    ///
+    /// Uses `fetch_add(1, Release)` rather than load-modify-store so
+    /// concurrent writers (cross-process publishers — exactly what
+    /// mmap-backed control blocks enable) cannot lose increments.
+    /// The substrate's intended invariant is single-writer per
+    /// `(path, size, root)` advance, but the underlying byte slot is
+    /// process-shared and we should not rely on the invariant for
+    /// soundness of the counter itself. Release ordering still gives
+    /// the happens-before pair with `sync_counter_acquire` for the
+    /// plain byte writes preceding this call.
     fn bump_sync_counter_release(&mut self) {
         let ptr = self.mmap[OFF_GENERATION..].as_ptr() as *const AtomicU64;
-        // SAFETY: mmap is page-aligned, offset 8 is 8-byte aligned.
-        // We use load + store rather than fetch_add because the slot
-        // may have been freshly initialized to 0; no concurrent
-        // writer (single-writer assumption — this is the substrate's
-        // CAS root advance, one publisher at a time).
+        // SAFETY: mmap is page-aligned, OFF_GENERATION is 8-byte
+        // aligned (compile-time asserted at the top of this module),
+        // AtomicU64 has the same layout as u64.
         unsafe {
-            let prev = (*ptr).load(Ordering::Relaxed);
-            (*ptr).store(prev.wrapping_add(1), Ordering::Release);
+            let _ = (*ptr).fetch_add(1, Ordering::Release);
         }
     }
 

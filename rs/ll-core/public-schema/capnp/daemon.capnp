@@ -60,10 +60,31 @@ struct QueryRow {
 # typed shape for each op.
 
 struct StatusResponse {
-  ok         @0 :Bool;
-  generation @1 :UInt64;
-  arenaPath  @2 :Text;
-  arenaSize  @3 :UInt64;
+  # JSON wire uses snake_case (`arena_path`, `current_root`, etc.) —
+  # consumer typed structs (Rust serde, hand-written Go) carry rename
+  # tags. The capnp schema preserves camelCase per convention.
+  #
+  # `generation` was the pre-T2.4 sequence counter; current_root supersedes
+  # it. The handler stopped emitting `generation` at the T2.4 cutover but
+  # the field stays in the schema (per ADR-0014 §2 "removing fields is
+  # never"). Decoders that see the field absent get the UInt64 default 0;
+  # decoders that already used `generation` see 0 forever rather than a
+  # stale counter.
+  ok                @0 :Bool;
+  generation        @1 :UInt64;
+  arenaPath         @2 :Text;
+  arenaSize         @3 :UInt64;
+  phase             @4 :Text;
+  currentRoot       @5 :Text;
+  enrichment        @6 :Text;
+  # JSON-encoded `{name → {last_run_at_ms?, basis?, error?}}`. Schema
+  # leaves it as opaque Text for now; a typed EnrichmentMap follow-up
+  # is tracked under a future bead. Consumers parse the inner JSON
+  # by hand today.
+  headSha           @7 :Text;
+  lastReparseAtMs   @8 :Int64;
+  # -1 sentinel for "not yet" (UInt64 default 0 is ambiguous with epoch).
+  error             @9 :Text;
 }
 
 struct ReparseRequest {
@@ -72,14 +93,30 @@ struct ReparseRequest {
 }
 
 struct ReparseResponse {
-  ok         @0 :Bool;
-  generation @1 :UInt64;
-  stats      @2 :ParseStats;
+  # Wire emits a flat shape; `stats` was the original nested form (kept
+  # per ADR-0014's "never remove" rule but no longer populated).
+  ok           @0 :Bool;
+  generation   @1 :UInt64;
+  stats        @2 :ParseStats;
+  currentRoot  @3 :Text;
+  parsed       @4 :UInt64;
+  unchanged    @5 :UInt64;
+  deleted      @6 :UInt64;
+  errors       @7 :UInt64;
+  changedFiles @8 :List(Text);
 }
 
 struct SnapshotResponse {
-  ok         @0 :Bool;
-  generation @1 :UInt64;
+  ok          @0 :Bool;
+  generation  @1 :UInt64;
+  currentRoot @2 :Text;
+}
+
+struct FlushRequest {}
+
+struct FlushResponse {
+  ok          @0 :Bool;
+  currentRoot @1 :Text;
 }
 
 struct EnrichRequest {
@@ -88,9 +125,10 @@ struct EnrichRequest {
 }
 
 struct EnrichResponse {
-  ok         @0 :Bool;
-  generation @1 :UInt64;
-  passes     @2 :List(EnrichmentStats);
+  ok          @0 :Bool;
+  generation  @1 :UInt64;
+  passes      @2 :List(EnrichmentStats);
+  currentRoot @3 :Text;
 }
 
 struct LoadRequest {
@@ -98,8 +136,9 @@ struct LoadRequest {
 }
 
 struct LoadResponse {
-  ok         @0 :Bool;
-  generation @1 :UInt64;
+  ok          @0 :Bool;
+  generation  @1 :UInt64;
+  currentRoot @2 :Text;
 }
 
 struct QueryRequest {

@@ -571,27 +571,44 @@ fn op_query(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
 }
 
 /// List children of a node (or roots if id="").
+///
+/// Emits FULL Node entries per child — id, parent_id, name, kind, size,
+/// record — matching the schema's `children: List(Node)` declaration in
+/// `daemon.capnp`. Mache's `ListChildStats` path can still ignore the
+/// `record` field per-call; this just means the wire carries the full
+/// shape so consumers that DO want record (e.g. typed Go bindings via
+/// mache-a5ad09) don't need a separate fetch.
 fn op_list_children(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
     let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("");
 
     let response = with_live_db(ctx, |conn| {
         let mut stmt = conn.prepare_cached(
-            "SELECT id, name, kind, size FROM nodes WHERE parent_id = ?1 ORDER BY name",
+            "SELECT id, parent_id, name, kind, size, record \
+             FROM nodes WHERE parent_id = ?1 ORDER BY name",
         )?;
-        let raw: Vec<(String, String, i32, i64)> = stmt
+        let raw: Vec<(String, String, String, i32, i64, Option<String>)> = stmt
             .query_map([id], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, i32>(2)?,
-                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i32>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             })?
             .collect::<Result<_, _>>()?;
         let rows: Vec<serde_json::Value> = raw
             .iter()
-            .map(|(id, name, kind, size)| {
-                json!({"id": id, "name": name, "kind": kind, "size": size})
+            .map(|(id, parent_id, name, kind, size, record)| {
+                json!({
+                    "id": id,
+                    "parent_id": parent_id,
+                    "name": name,
+                    "kind": kind,
+                    "size": size,
+                    "record": record.as_deref().unwrap_or(""),
+                })
             })
             .collect();
         let touched: Vec<&str> = raw.iter().map(|(id, ..)| id.as_str()).collect();

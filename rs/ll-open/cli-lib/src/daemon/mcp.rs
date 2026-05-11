@@ -278,7 +278,7 @@ pub fn spawn(
         .route("/mcp", post(handle_post).get(handle_get))
         .with_state(ctx);
 
-    let bind = bind.unwrap_or_else(|| std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let bind = bind.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
     let addr: SocketAddr = SocketAddr::new(bind, port);
     let std_listener =
         std::net::TcpListener::bind(addr).with_context(|| format!("bind MCP HTTP on {addr}"))?;

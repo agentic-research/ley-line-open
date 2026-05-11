@@ -149,6 +149,70 @@ struct FindDefsResponse {
   defs @1 :List(Ref);
 }
 
+struct FindCalleesRequest {
+  # The node whose forward references we want resolved to their definitions.
+  # Mirrors FindCallersRequest's input slot but takes a node_id instead of a
+  # token: `find_callers(token)` = "who refers to this?", `find_callees(id)`
+  # = "what does this node refer to?"
+  id @0 :Text;
+}
+
+struct FindCalleesResponse {
+  ok      @0 :Bool;
+  callees @1 :List(Ref);
+}
+
+struct TokenMapEntry {
+  # One token → many node_ids. Used by both refs map and defs map bulk
+  # responses. source_id is intentionally omitted — bulk consumers want
+  # graph topology; per-token find_callers/find_defs still expose it.
+  token   @0 :Text;
+  nodeIds @1 :List(Text);
+}
+
+struct GetRefsMapRequest {}
+
+struct GetRefsMapResponse {
+  ok      @0 :Bool;
+  entries @1 :List(TokenMapEntry);
+}
+
+struct GetDefsMapRequest {}
+
+struct GetDefsMapResponse {
+  ok      @0 :Bool;
+  entries @1 :List(TokenMapEntry);
+}
+
+struct SchemaTier {
+  # One tier in LLO's layer-ownership topology (ll-core / ll-open / future
+  # extension-defined names). See docs/TABLE_CONTRACT.md "Layer Ownership".
+  name   @0 :Text;
+  crates @1 :List(Text);
+}
+
+struct GetSchemaRequest {}
+
+struct GetSchemaResponse {
+  ok    @0 :Bool;
+  tiers @1 :List(SchemaTier);
+}
+
+struct GetDbPathRequest {}
+
+struct GetDbPathResponse {
+  # Filesystem paths the daemon owns. Used by mache for optional capnp
+  # readthrough fast-paths (serve_lsp, serve_find_smells). Strictly
+  # opt-in optimization — falling back to UDS query ops is always safe.
+  ok           @0 :Bool;
+  dbPath       @1 :Text;
+  ctrlPath     @2 :Text;
+  bindingsPath @3 :Text;
+  astPath      @4 :Text;
+  sourcePath   @5 :Text;
+  headPath     @6 :Text;
+}
+
 struct GetNodeRequest {
   id @0 :Text;
 }

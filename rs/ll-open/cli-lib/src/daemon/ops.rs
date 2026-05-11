@@ -58,8 +58,13 @@ pub(crate) fn base_op_names() -> Vec<&'static str> {
         "list_children",
         "read_content",
         "find_callers",
+        "find_callees",
         "find_defs",
         "get_node",
+        "get_refs_map",
+        "get_defs_map",
+        "get_schema",
+        "get_db_path",
         "lsp_hover",
         "lsp_defs",
         "lsp_refs",
@@ -90,7 +95,12 @@ pub fn handle_base_op(
         "list_children" => Some(op_list_children(ctx, req)),
         "read_content" => Some(op_read_content(ctx, req)),
         "find_callers" => Some(op_find_callers(ctx, req)),
+        "find_callees" => Some(op_find_callees(ctx, req)),
         "find_defs" => Some(op_find_defs(ctx, req)),
+        "get_refs_map" => Some(op_get_token_map(ctx, "node_refs", "entries")),
+        "get_defs_map" => Some(op_get_token_map(ctx, "node_defs", "entries")),
+        "get_schema" => Some(op_get_schema()),
+        "get_db_path" => Some(op_get_db_path(&ctx.ctrl_path)),
         "get_node" => Some(op_get_node(ctx, req)),
         // Position-based LSP queries — translate (file, line, col) to node lookups.
         "lsp_hover" => Some(op_lsp_hover(ctx, req)),
@@ -636,6 +646,166 @@ fn op_find_token(
         obj.insert(json_key.to_string(), json!(rows));
         Ok(serde_json::Value::Object(obj).to_string())
     })
+}
+
+/// Find callees of a node — the definitions of every token the node references.
+///
+/// Forward-direction sibling of `find_callers`/`find_defs`:
+/// `find_callers(token)` asks "who references this token?" → reads node_refs.
+/// `find_callees(id)`    asks "what does this node reference?" → JOINs
+/// node_refs (by node_id) against node_defs (by token) to get the defining
+/// nodes. Same `{ok, callees: [{node_id, source_id}]}` output shape as
+/// find_callers, so mache's `udsGraph.GetCallees(id)` can mirror its
+/// existing `GetCallers(token)` JSON parsing.
+///
+/// Read-only — does NOT belong in STATE_CHANGING_OPS.
+fn op_find_callees(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
+    let id = required_str_field(req, "id")?;
+    with_live_db(ctx, |conn| {
+        // DISTINCT — a node referencing the same token from multiple sites
+        // shouldn't produce duplicate callees. The output is the SET of
+        // definitions reachable from the input node, not the multiset of
+        // reference sites.
+        let sql = "\
+            SELECT DISTINCT d.node_id, d.source_id \
+            FROM node_refs r \
+            JOIN node_defs d ON r.token = d.token \
+            WHERE r.node_id = ?1";
+        let mut stmt = conn.prepare_cached(sql)?;
+        let rows: Vec<serde_json::Value> = stmt
+            .query_map([id], |row| {
+                Ok(json!({
+                    "node_id":   row.get::<_, String>(0)?,
+                    "source_id": row.get::<_, String>(1)?,
+                }))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(json!({"ok": true, "callees": rows}).to_string())
+    })
+}
+
+/// Bulk-export a `(token → [node_id])` index — the full contents of
+/// `node_refs` (refs map) or `node_defs` (defs map), grouped by token.
+///
+/// Used by mache's `RefsMap()` / `DefsMap()` for graph-wide analysis
+/// (Louvain community detection, impact-analysis BFS seeds, architecture
+/// diagrams). The per-token `find_callers` / `find_defs` ops are unsuited
+/// to bulk consumers because iterating them across every token would be
+/// thousands of round-trips.
+///
+/// `source_id` is intentionally NOT included in the response — bulk
+/// consumers want the (token → nodes) map for graph topology; the
+/// per-token lookups still expose source_id when needed. Keeps the
+/// response compact for large indexes.
+///
+/// Read-only — NOT in STATE_CHANGING_OPS.
+fn op_get_token_map(ctx: &DaemonContext, table: &str, json_key: &str) -> Result<String> {
+    with_live_db(ctx, |conn| {
+        // DISTINCT — `node_refs` / `node_defs` have no uniqueness constraint
+        // on (token, node_id), so the same node referencing/defining a token
+        // from multiple sites would emit duplicate node_ids without this.
+        // Downstream graph-wide consumers (community detection, architecture
+        // diagrams) expect each (token → node_id) edge once.
+        // TODO(perf): if a single response grows large on a registry-scale
+        // db, stream rows instead of materializing the full Vec into memory.
+        let sql = format!("SELECT DISTINCT token, node_id FROM {table} ORDER BY token, node_id");
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let pairs: Vec<(String, String)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        // Group by token in a single linear pass — the ORDER BY token
+        // above means same-token rows are contiguous, so we just track
+        // the current token and flush when it changes.
+        let mut entries: Vec<serde_json::Value> = Vec::new();
+        let mut current_token: Option<String> = None;
+        let mut current_node_ids: Vec<String> = Vec::new();
+        for (token, node_id) in pairs {
+            if Some(&token) != current_token.as_ref() {
+                if let Some(tok) = current_token.take() {
+                    entries.push(json!({
+                        "token": tok,
+                        "node_ids": current_node_ids,
+                    }));
+                    current_node_ids = Vec::new();
+                }
+                current_token = Some(token);
+            }
+            current_node_ids.push(node_id);
+        }
+        if let Some(tok) = current_token {
+            entries.push(json!({
+                "token": tok,
+                "node_ids": current_node_ids,
+            }));
+        }
+
+        let mut obj = serde_json::Map::new();
+        obj.insert("ok".to_string(), json!(true));
+        obj.insert(json_key.to_string(), json!(entries));
+        Ok(serde_json::Value::Object(obj).to_string())
+    })
+}
+
+/// Export LLO's tier topology — the schema layer ownership map mache's
+/// `serve_diagram.go` consumes for cross-tier dependency diagrams.
+///
+/// The tier→crate map is currently HARDCODED here. The real SSOT is the
+/// `rs/ll-core/` vs `rs/ll-open/` workspace layout (each subdirectory's
+/// member crates per `rs/Cargo.toml`). Keeping this hardcoded means a
+/// new crate added to either tier requires touching this function too.
+/// TODO: derive from `cargo metadata --no-deps --format-version 1` at
+/// daemon startup so workspace truth is the single source. Tracked
+/// implicitly under bead cc0305 follow-up.
+///
+/// `docs/TABLE_CONTRACT.md` describes table-ownership (which enrichment
+/// pass writes which table) — NOT crate→tier maps. Don't conflate the
+/// two.
+///
+/// If extension layers register additional tiers via `DaemonExt`,
+/// future work expands this; today only the LLO built-in tiers are
+/// exposed. Read-only — does NOT belong in STATE_CHANGING_OPS.
+fn op_get_schema() -> Result<String> {
+    Ok(json!({
+        "ok": true,
+        "tiers": [
+            {
+                "name": "ll-core",
+                "crates": ["leyline-core", "leyline-schema", "leyline-public-schema", "leyline-schema-capnp"],
+            },
+            {
+                "name": "ll-open",
+                "crates": ["leyline-fs", "leyline-ts", "leyline-lsp", "leyline-hdc", "leyline-cli-lib", "leyline-cli", "leyline-vcs", "leyline-sign"],
+            },
+        ],
+    })
+    .to_string())
+}
+
+/// Export the daemon's filesystem paths — the .db location + sibling
+/// capnp segment files. mache's `serve_lsp.go` / `serve_find_smells.go`
+/// use these for an optional capnp readthrough fast-path; without them
+/// they fall back to slower SQL queries. Strictly opt-in optimization;
+/// the daemon's normal ops are unaffected.
+fn op_get_db_path(ctrl_path: &Path) -> Result<String> {
+    let ctrl_str = ctrl_path.to_string_lossy().to_string();
+    // The .db path is the ctrl_path with .ctrl swapped for .db (mache's
+    // existing discovery convention). Segment-file siblings follow the
+    // same prefix.
+    let base = ctrl_path.with_extension("");
+    let base_str = base.to_string_lossy();
+    Ok(json!({
+        "ok": true,
+        "db_path": format!("{base_str}.db"),
+        "ctrl_path": ctrl_str,
+        "bindings_path": format!("{base_str}.bindings.capnp"),
+        "ast_path": format!("{base_str}.ast.capnp"),
+        "source_path": format!("{base_str}.source.capnp"),
+        "head_path": format!("{base_str}.head.capnp"),
+    })
+    .to_string())
 }
 
 /// Get a single node by ID.
@@ -1253,14 +1423,23 @@ mod tests {
     #[test]
     fn state_changing_ops_excludes_pure_reads() {
         // The query/observation ops must NOT trigger an event emission.
+        // When a new read-only op is added to `handle_base_op`, list it
+        // here so a future accidental promotion into STATE_CHANGING_OPS
+        // is caught by this guard.
         for op in [
             "status",
             "query",
             "list_children",
+            "list_roots",
             "read_content",
             "find_callers",
+            "find_callees",
             "find_defs",
             "get_node",
+            "get_refs_map",
+            "get_defs_map",
+            "get_schema",
+            "get_db_path",
             "lsp_hover",
             "lsp_defs",
             "lsp_refs",

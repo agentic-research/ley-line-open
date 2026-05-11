@@ -154,6 +154,46 @@ type findDefsResponse struct {
 	Defs []ref `json:"defs"`
 }
 
+type findCalleesResponse struct {
+	OK      *bool `json:"ok"`
+	Callees []ref `json:"callees"`
+}
+
+type tokenMapEntry struct {
+	Token   *string  `json:"token"`
+	NodeIDs []string `json:"nodeIds"`
+}
+
+type getRefsMapResponse struct {
+	OK      *bool           `json:"ok"`
+	Entries []tokenMapEntry `json:"entries"`
+}
+
+type getDefsMapResponse struct {
+	OK      *bool           `json:"ok"`
+	Entries []tokenMapEntry `json:"entries"`
+}
+
+type schemaTier struct {
+	Name   *string  `json:"name"`
+	Crates []string `json:"crates"`
+}
+
+type getSchemaResponse struct {
+	OK    *bool        `json:"ok"`
+	Tiers []schemaTier `json:"tiers"`
+}
+
+type getDbPathResponse struct {
+	OK           *bool   `json:"ok"`
+	DBPath       *string `json:"dbPath"`
+	CtrlPath     *string `json:"ctrlPath"`
+	BindingsPath *string `json:"bindingsPath"`
+	ASTPath      *string `json:"astPath"`
+	SourcePath   *string `json:"sourcePath"`
+	HeadPath     *string `json:"headPath"`
+}
+
 type queryResponse struct {
 	OK      *bool      `json:"ok"`
 	Columns []string   `json:"columns"`
@@ -179,6 +219,16 @@ func decoderFor(name string) func([]byte) error {
 		return func(b []byte) error { var v findCallersResponse; return strictUnmarshal(b, &v) }
 	case "FindDefsResponse":
 		return func(b []byte) error { var v findDefsResponse; return strictUnmarshal(b, &v) }
+	case "FindCalleesResponse":
+		return func(b []byte) error { var v findCalleesResponse; return strictUnmarshal(b, &v) }
+	case "GetRefsMapResponse":
+		return func(b []byte) error { var v getRefsMapResponse; return strictUnmarshal(b, &v) }
+	case "GetDefsMapResponse":
+		return func(b []byte) error { var v getDefsMapResponse; return strictUnmarshal(b, &v) }
+	case "GetSchemaResponse":
+		return func(b []byte) error { var v getSchemaResponse; return strictUnmarshal(b, &v) }
+	case "GetDbPathResponse":
+		return func(b []byte) error { var v getDbPathResponse; return strictUnmarshal(b, &v) }
 	case "QueryResponse":
 		return func(b []byte) error { var v queryResponse; return strictUnmarshal(b, &v) }
 	default:

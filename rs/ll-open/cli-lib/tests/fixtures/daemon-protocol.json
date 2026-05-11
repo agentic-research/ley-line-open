@@ -127,6 +127,81 @@
     "go_drift_skip": "b631c8: same snake_case vs camelCase drift as find_callers."
   },
 
+  "find_callees": {
+    "request": {"op": "find_callees", "id": "file1.rs#fn_caller"},
+    "response": {
+      "ok": true,
+      "callees": [
+        {"node_id": "file2.rs#fn_callee", "source_id": "file2.rs"}
+      ]
+    },
+    "response_required_keys": ["ok", "callees"],
+    "response_optional_keys": [],
+    "go_binding": "FindCalleesResponse",
+    "go_drift_skip": "b631c8: same snake_case vs camelCase drift as find_callers (node_id/source_id vs nodeId/sourceId). A-2 reconciles."
+  },
+
+  "get_refs_map": {
+    "request": {"op": "get_refs_map"},
+    "response": {
+      "ok": true,
+      "entries": [
+        {"token": "some_fn", "node_ids": ["file1.rs#caller"]},
+        {"token": "another_fn", "node_ids": ["file1.rs#caller2", "file2.rs#caller3"]}
+      ]
+    },
+    "response_required_keys": ["ok", "entries"],
+    "response_optional_keys": [],
+    "go_binding": "GetRefsMapResponse",
+    "go_drift_skip": "b631c8: schema declares TokenMapEntry.nodeIds (camelCase) but handler emits node_ids (snake_case). A-2 reconciles alongside find_callers/find_defs."
+  },
+
+  "get_defs_map": {
+    "request": {"op": "get_defs_map"},
+    "response": {
+      "ok": true,
+      "entries": [
+        {"token": "some_fn", "node_ids": ["file1.rs#some_fn"]}
+      ]
+    },
+    "response_required_keys": ["ok", "entries"],
+    "response_optional_keys": [],
+    "go_binding": "GetDefsMapResponse",
+    "go_drift_skip": "b631c8: same node_ids snake_case drift as get_refs_map."
+  },
+
+  "get_schema": {
+    "request": {"op": "get_schema"},
+    "response": {
+      "ok": true,
+      "tiers": [
+        {"name": "ll-core", "crates": ["leyline-core", "leyline-schema"]},
+        {"name": "ll-open", "crates": ["leyline-fs", "leyline-cli"]}
+      ]
+    },
+    "response_required_keys": ["ok", "tiers"],
+    "response_optional_keys": [],
+    "go_binding": "GetSchemaResponse",
+    "go_drift_skip": null
+  },
+
+  "get_db_path": {
+    "request": {"op": "get_db_path"},
+    "response": {
+      "ok": true,
+      "db_path": "/tmp/test/test.db",
+      "ctrl_path": "/tmp/test/test.ctrl",
+      "bindings_path": "/tmp/test/test.bindings.capnp",
+      "ast_path": "/tmp/test/test.ast.capnp",
+      "source_path": "/tmp/test/test.source.capnp",
+      "head_path": "/tmp/test/test.head.capnp"
+    },
+    "response_required_keys": ["ok", "db_path", "ctrl_path", "bindings_path", "ast_path", "source_path", "head_path"],
+    "response_optional_keys": [],
+    "go_binding": "GetDbPathResponse",
+    "go_drift_skip": "b631c8: handler emits snake_case (db_path, ctrl_path, etc) vs schema camelCase (dbPath, ctrlPath). A-2 reconciles alongside other snake/camel drifts."
+  },
+
   "query": {
     "request": {"op": "query", "sql": "SELECT 1 as one"},
     "response": {

@@ -104,6 +104,40 @@ db remains for fast in-process queries, but the *cross-process contract*
 moved to canonical-encoded capnp segment files at `${db}.{bindings,ast,source,head}.capnp`.
 mache (and any future consumer) reads those directly.
 
+## Cross-runtime drift gates
+
+Two distinct cross-process contracts run through this repo, each gated by a
+cross-runtime fixture suite in CI:
+
+| Surface | Encoding | Rust fixtures | Go gate | Bead |
+|---|---|---|---|---|
+| **Substrate** — capnp segment files (`bindings.capnp`, `ast.capnp`, `source.capnp`, `head.capnp`) | canonical capnp binary | `rs/ll-core/schema-capnp/tests/fixtures/*.bin` | `clients/go/leyline-schema/binding/binding_test.go` decodes via the typed capnp Go bindings | T8.10 / `6b7d43` |
+| **Daemon protocol** — UDS request/response JSON per `daemon.capnp` | JSON-as-carrier (per cloister `interlace-spec/0.1.0/README.md`) over UDS | `rs/ll-open/cli-lib/tests/fixtures/daemon-protocol.json` | `clients/go/leyline-schema/daemon/daemon_protocol_test.go` decodes via hand-written JSON-tagged structs that mirror `daemon.capnp` | A-1 / `b5a77b` |
+
+Both gates are wired into `.github/workflows/leyline-schema-go.yml`. The
+substrate gate asserts byte-equality on canonical encoding (T8.10's
+falsifiable claim F8.6.4 — direct: byte-equal decode in both runtimes).
+
+The daemon protocol gate is a **two-step chain** through the fixture file,
+because the JSON wire is built by handlers at runtime (not byte-equal):
+
+1. **Rust half (runtime):** spawns the daemon, sends each fixture's
+   request, asserts the live response contains every required key.
+   Pins **handler ↔ fixture**.
+2. **Go half (offline):** strict-unmarshals each fixture's `response`
+   payload into the matching typed Go binding. No daemon round-trip.
+   Pins **fixture ↔ schema**.
+
+Composing the two yields **handler ↔ schema** transitively. Either half
+failing means the chain broke. The fixture file is the deliberate
+intermediate artifact, not an artifact of the implementation.
+
+Ops with known schema↔reality drift (`get_node` snake_case, `status` missing
+fields, etc.) are SKIPPED in the Go half with the drift reason as the skip
+message; the Rust half still runs for them. Bead A-2 (`b631c8`) reconciles
+the schema additively; each `go_drift_skip` flipping to null converts a
+skip to a pass.
+
 ## Rules
 
 1. **Disjoint writes**: `A.writes() ∩ B.writes() = ∅` for any two passes A, B.

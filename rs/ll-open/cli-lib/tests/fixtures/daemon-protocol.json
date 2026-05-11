@@ -170,6 +170,38 @@
     "go_drift_skip": "b631c8: same node_ids snake_case drift as get_refs_map."
   },
 
+  "get_schema": {
+    "request": {"op": "get_schema"},
+    "response": {
+      "ok": true,
+      "tiers": [
+        {"name": "ll-core", "crates": ["leyline-core", "leyline-schema"]},
+        {"name": "ll-open", "crates": ["leyline-fs", "leyline-cli"]}
+      ]
+    },
+    "response_required_keys": ["ok", "tiers"],
+    "response_optional_keys": [],
+    "go_binding": "GetSchemaResponse",
+    "go_drift_skip": null
+  },
+
+  "get_db_path": {
+    "request": {"op": "get_db_path"},
+    "response": {
+      "ok": true,
+      "db_path": "/tmp/test/test.db",
+      "ctrl_path": "/tmp/test/test.ctrl",
+      "bindings_path": "/tmp/test/test.bindings.capnp",
+      "ast_path": "/tmp/test/test.ast.capnp",
+      "source_path": "/tmp/test/test.source.capnp",
+      "head_path": "/tmp/test/test.head.capnp"
+    },
+    "response_required_keys": ["ok", "db_path", "ctrl_path", "bindings_path", "ast_path", "source_path", "head_path"],
+    "response_optional_keys": [],
+    "go_binding": "GetDbPathResponse",
+    "go_drift_skip": "b631c8: handler emits snake_case (db_path, ctrl_path, etc) vs schema camelCase (dbPath, ctrlPath). A-2 reconciles alongside other snake/camel drifts."
+  },
+
   "query": {
     "request": {"op": "query", "sql": "SELECT 1 as one"},
     "response": {

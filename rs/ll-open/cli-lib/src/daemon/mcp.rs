@@ -149,6 +149,16 @@ fn tool_registry() -> Vec<McpTool> {
             schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
         },
         McpTool {
+            name: "get_schema",
+            description: "Export LLO's tier topology — the layer ownership map of ll-core/ll-open crates. Used by mache's diagram/architecture handlers.",
+            schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
+        },
+        McpTool {
+            name: "get_db_path",
+            description: "Export the daemon's filesystem paths (.db + sibling capnp segment files). Used by mache for optional capnp readthrough fast-paths; falling back to UDS query ops is always safe.",
+            schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
+        },
+        McpTool {
             name: "get_node",
             description: "Fetch a single node by id.",
             schema: json!({

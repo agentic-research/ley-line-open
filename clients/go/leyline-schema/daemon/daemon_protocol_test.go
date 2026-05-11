@@ -174,6 +174,26 @@ type getDefsMapResponse struct {
 	Entries []tokenMapEntry `json:"entries"`
 }
 
+type schemaTier struct {
+	Name   *string  `json:"name"`
+	Crates []string `json:"crates"`
+}
+
+type getSchemaResponse struct {
+	OK    *bool        `json:"ok"`
+	Tiers []schemaTier `json:"tiers"`
+}
+
+type getDbPathResponse struct {
+	OK           *bool   `json:"ok"`
+	DBPath       *string `json:"dbPath"`
+	CtrlPath     *string `json:"ctrlPath"`
+	BindingsPath *string `json:"bindingsPath"`
+	ASTPath      *string `json:"astPath"`
+	SourcePath   *string `json:"sourcePath"`
+	HeadPath     *string `json:"headPath"`
+}
+
 type queryResponse struct {
 	OK      *bool      `json:"ok"`
 	Columns []string   `json:"columns"`
@@ -205,6 +225,10 @@ func decoderFor(name string) func([]byte) error {
 		return func(b []byte) error { var v getRefsMapResponse; return strictUnmarshal(b, &v) }
 	case "GetDefsMapResponse":
 		return func(b []byte) error { var v getDefsMapResponse; return strictUnmarshal(b, &v) }
+	case "GetSchemaResponse":
+		return func(b []byte) error { var v getSchemaResponse; return strictUnmarshal(b, &v) }
+	case "GetDbPathResponse":
+		return func(b []byte) error { var v getDbPathResponse; return strictUnmarshal(b, &v) }
 	case "QueryResponse":
 		return func(b []byte) error { var v queryResponse; return strictUnmarshal(b, &v) }
 	default:

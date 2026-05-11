@@ -184,6 +184,35 @@ struct GetDefsMapResponse {
   entries @1 :List(TokenMapEntry);
 }
 
+struct SchemaTier {
+  # One tier in LLO's layer-ownership topology (ll-core / ll-open / future
+  # extension-defined names). See docs/TABLE_CONTRACT.md "Layer Ownership".
+  name   @0 :Text;
+  crates @1 :List(Text);
+}
+
+struct GetSchemaRequest {}
+
+struct GetSchemaResponse {
+  ok    @0 :Bool;
+  tiers @1 :List(SchemaTier);
+}
+
+struct GetDbPathRequest {}
+
+struct GetDbPathResponse {
+  # Filesystem paths the daemon owns. Used by mache for optional capnp
+  # readthrough fast-paths (serve_lsp, serve_find_smells). Strictly
+  # opt-in optimization — falling back to UDS query ops is always safe.
+  ok           @0 :Bool;
+  dbPath       @1 :Text;
+  ctrlPath     @2 :Text;
+  bindingsPath @3 :Text;
+  astPath      @4 :Text;
+  sourcePath   @5 :Text;
+  headPath     @6 :Text;
+}
+
 struct GetNodeRequest {
   id @0 :Text;
 }

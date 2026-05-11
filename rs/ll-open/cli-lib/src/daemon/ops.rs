@@ -63,6 +63,8 @@ pub(crate) fn base_op_names() -> Vec<&'static str> {
         "get_node",
         "get_refs_map",
         "get_defs_map",
+        "get_schema",
+        "get_db_path",
         "lsp_hover",
         "lsp_defs",
         "lsp_refs",
@@ -97,6 +99,8 @@ pub fn handle_base_op(
         "find_defs" => Some(op_find_defs(ctx, req)),
         "get_refs_map" => Some(op_get_token_map(ctx, "node_refs", "entries")),
         "get_defs_map" => Some(op_get_token_map(ctx, "node_defs", "entries")),
+        "get_schema" => Some(op_get_schema()),
+        "get_db_path" => Some(op_get_db_path(&ctx.ctrl_path)),
         "get_node" => Some(op_get_node(ctx, req)),
         // Position-based LSP queries — translate (file, line, col) to node lookups.
         "lsp_hover" => Some(op_lsp_hover(ctx, req)),
@@ -736,6 +740,55 @@ fn op_get_token_map(ctx: &DaemonContext, table: &str, json_key: &str) -> Result<
         obj.insert(json_key.to_string(), json!(entries));
         Ok(serde_json::Value::Object(obj).to_string())
     })
+}
+
+/// Export LLO's tier topology — the schema layer ownership map mache's
+/// `serve_diagram.go` consumes for cross-tier dependency diagrams.
+///
+/// This is parse-time-known and doesn't query the live db. The tier
+/// names + crate basenames are the SSOT pulled from `docs/TABLE_CONTRACT.md`
+/// "Layer Ownership" section. If extension layers register additional
+/// tiers via `DaemonExt`, future work expands this; today only the LLO
+/// built-in tiers are exposed.
+fn op_get_schema() -> Result<String> {
+    Ok(json!({
+        "ok": true,
+        "tiers": [
+            {
+                "name": "ll-core",
+                "crates": ["leyline-core", "leyline-schema", "leyline-public-schema", "leyline-schema-capnp"],
+            },
+            {
+                "name": "ll-open",
+                "crates": ["leyline-fs", "leyline-ts", "leyline-lsp", "leyline-hdc", "leyline-cli-lib", "leyline-cli", "leyline-vcs", "leyline-sign"],
+            },
+        ],
+    })
+    .to_string())
+}
+
+/// Export the daemon's filesystem paths — the .db location + sibling
+/// capnp segment files. mache's `serve_lsp.go` / `serve_find_smells.go`
+/// use these for an optional capnp readthrough fast-path; without them
+/// they fall back to slower SQL queries. Strictly opt-in optimization;
+/// the daemon's normal ops are unaffected.
+fn op_get_db_path(ctrl_path: &Path) -> Result<String> {
+    let ctrl_str = ctrl_path.to_string_lossy().to_string();
+    // The .db path is the ctrl_path with .ctrl swapped for .db (mache's
+    // existing discovery convention). Segment-file siblings follow the
+    // same prefix.
+    let base = ctrl_path.with_extension("");
+    let base_str = base.to_string_lossy();
+    Ok(json!({
+        "ok": true,
+        "db_path": format!("{base_str}.db"),
+        "ctrl_path": ctrl_str,
+        "bindings_path": format!("{base_str}.bindings.capnp"),
+        "ast_path": format!("{base_str}.ast.capnp"),
+        "source_path": format!("{base_str}.source.capnp"),
+        "head_path": format!("{base_str}.head.capnp"),
+    })
+    .to_string())
 }
 
 /// Get a single node by ID.

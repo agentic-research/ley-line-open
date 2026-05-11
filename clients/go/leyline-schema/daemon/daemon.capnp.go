@@ -2991,6 +2991,518 @@ func (f GetDefsMapResponse_Future) Struct() (GetDefsMapResponse, error) {
 	return GetDefsMapResponse(p.Struct()), err
 }
 
+type SchemaTier capnp.Struct
+
+// SchemaTier_TypeID is the unique identifier for the type SchemaTier.
+const SchemaTier_TypeID = 0xf941483cfa095856
+
+func NewSchemaTier(s *capnp.Segment) (SchemaTier, error) {
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 2})
+	return SchemaTier(st), err
+}
+
+func NewRootSchemaTier(s *capnp.Segment) (SchemaTier, error) {
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 2})
+	return SchemaTier(st), err
+}
+
+func ReadRootSchemaTier(msg *capnp.Message) (SchemaTier, error) {
+	root, err := msg.Root()
+	return SchemaTier(root.Struct()), err
+}
+
+func (s SchemaTier) String() string {
+	str, _ := text.Marshal(0xf941483cfa095856, capnp.Struct(s))
+	return str
+}
+
+func (s SchemaTier) EncodeAsPtr(seg *capnp.Segment) capnp.Ptr {
+	return capnp.Struct(s).EncodeAsPtr(seg)
+}
+
+func (SchemaTier) DecodeFromPtr(p capnp.Ptr) SchemaTier {
+	return SchemaTier(capnp.Struct{}.DecodeFromPtr(p))
+}
+
+func (s SchemaTier) ToPtr() capnp.Ptr {
+	return capnp.Struct(s).ToPtr()
+}
+func (s SchemaTier) IsValid() bool {
+	return capnp.Struct(s).IsValid()
+}
+
+func (s SchemaTier) Message() *capnp.Message {
+	return capnp.Struct(s).Message()
+}
+
+func (s SchemaTier) Segment() *capnp.Segment {
+	return capnp.Struct(s).Segment()
+}
+func (s SchemaTier) Name() (string, error) {
+	p, err := capnp.Struct(s).Ptr(0)
+	return p.Text(), err
+}
+
+func (s SchemaTier) HasName() bool {
+	return capnp.Struct(s).HasPtr(0)
+}
+
+func (s SchemaTier) NameBytes() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(0)
+	return p.TextBytes(), err
+}
+
+func (s SchemaTier) SetName(v string) error {
+	return capnp.Struct(s).SetText(0, v)
+}
+
+func (s SchemaTier) Crates() (capnp.TextList, error) {
+	p, err := capnp.Struct(s).Ptr(1)
+	return capnp.TextList(p.List()), err
+}
+
+func (s SchemaTier) HasCrates() bool {
+	return capnp.Struct(s).HasPtr(1)
+}
+
+func (s SchemaTier) SetCrates(v capnp.TextList) error {
+	return capnp.Struct(s).SetPtr(1, v.ToPtr())
+}
+
+// NewCrates sets the crates field to a newly
+// allocated capnp.TextList, preferring placement in s's segment.
+func (s SchemaTier) NewCrates(n int32) (capnp.TextList, error) {
+	l, err := capnp.NewTextList(capnp.Struct(s).Segment(), n)
+	if err != nil {
+		return capnp.TextList{}, err
+	}
+	err = capnp.Struct(s).SetPtr(1, l.ToPtr())
+	return l, err
+}
+
+// SchemaTier_List is a list of SchemaTier.
+type SchemaTier_List = capnp.StructList[SchemaTier]
+
+// NewSchemaTier creates a new list of SchemaTier.
+func NewSchemaTier_List(s *capnp.Segment, sz int32) (SchemaTier_List, error) {
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 0, PointerCount: 2}, sz)
+	return capnp.StructList[SchemaTier](l), err
+}
+
+// SchemaTier_Future is a wrapper for a SchemaTier promised by a client call.
+type SchemaTier_Future struct{ *capnp.Future }
+
+func (f SchemaTier_Future) Struct() (SchemaTier, error) {
+	p, err := f.Future.Ptr()
+	return SchemaTier(p.Struct()), err
+}
+
+type GetSchemaRequest capnp.Struct
+
+// GetSchemaRequest_TypeID is the unique identifier for the type GetSchemaRequest.
+const GetSchemaRequest_TypeID = 0x8cfd56513ec2e5dc
+
+func NewGetSchemaRequest(s *capnp.Segment) (GetSchemaRequest, error) {
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 0})
+	return GetSchemaRequest(st), err
+}
+
+func NewRootGetSchemaRequest(s *capnp.Segment) (GetSchemaRequest, error) {
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 0})
+	return GetSchemaRequest(st), err
+}
+
+func ReadRootGetSchemaRequest(msg *capnp.Message) (GetSchemaRequest, error) {
+	root, err := msg.Root()
+	return GetSchemaRequest(root.Struct()), err
+}
+
+func (s GetSchemaRequest) String() string {
+	str, _ := text.Marshal(0x8cfd56513ec2e5dc, capnp.Struct(s))
+	return str
+}
+
+func (s GetSchemaRequest) EncodeAsPtr(seg *capnp.Segment) capnp.Ptr {
+	return capnp.Struct(s).EncodeAsPtr(seg)
+}
+
+func (GetSchemaRequest) DecodeFromPtr(p capnp.Ptr) GetSchemaRequest {
+	return GetSchemaRequest(capnp.Struct{}.DecodeFromPtr(p))
+}
+
+func (s GetSchemaRequest) ToPtr() capnp.Ptr {
+	return capnp.Struct(s).ToPtr()
+}
+func (s GetSchemaRequest) IsValid() bool {
+	return capnp.Struct(s).IsValid()
+}
+
+func (s GetSchemaRequest) Message() *capnp.Message {
+	return capnp.Struct(s).Message()
+}
+
+func (s GetSchemaRequest) Segment() *capnp.Segment {
+	return capnp.Struct(s).Segment()
+}
+
+// GetSchemaRequest_List is a list of GetSchemaRequest.
+type GetSchemaRequest_List = capnp.StructList[GetSchemaRequest]
+
+// NewGetSchemaRequest creates a new list of GetSchemaRequest.
+func NewGetSchemaRequest_List(s *capnp.Segment, sz int32) (GetSchemaRequest_List, error) {
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 0, PointerCount: 0}, sz)
+	return capnp.StructList[GetSchemaRequest](l), err
+}
+
+// GetSchemaRequest_Future is a wrapper for a GetSchemaRequest promised by a client call.
+type GetSchemaRequest_Future struct{ *capnp.Future }
+
+func (f GetSchemaRequest_Future) Struct() (GetSchemaRequest, error) {
+	p, err := f.Future.Ptr()
+	return GetSchemaRequest(p.Struct()), err
+}
+
+type GetSchemaResponse capnp.Struct
+
+// GetSchemaResponse_TypeID is the unique identifier for the type GetSchemaResponse.
+const GetSchemaResponse_TypeID = 0xface7225b707b4e2
+
+func NewGetSchemaResponse(s *capnp.Segment) (GetSchemaResponse, error) {
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 8, PointerCount: 1})
+	return GetSchemaResponse(st), err
+}
+
+func NewRootGetSchemaResponse(s *capnp.Segment) (GetSchemaResponse, error) {
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 8, PointerCount: 1})
+	return GetSchemaResponse(st), err
+}
+
+func ReadRootGetSchemaResponse(msg *capnp.Message) (GetSchemaResponse, error) {
+	root, err := msg.Root()
+	return GetSchemaResponse(root.Struct()), err
+}
+
+func (s GetSchemaResponse) String() string {
+	str, _ := text.Marshal(0xface7225b707b4e2, capnp.Struct(s))
+	return str
+}
+
+func (s GetSchemaResponse) EncodeAsPtr(seg *capnp.Segment) capnp.Ptr {
+	return capnp.Struct(s).EncodeAsPtr(seg)
+}
+
+func (GetSchemaResponse) DecodeFromPtr(p capnp.Ptr) GetSchemaResponse {
+	return GetSchemaResponse(capnp.Struct{}.DecodeFromPtr(p))
+}
+
+func (s GetSchemaResponse) ToPtr() capnp.Ptr {
+	return capnp.Struct(s).ToPtr()
+}
+func (s GetSchemaResponse) IsValid() bool {
+	return capnp.Struct(s).IsValid()
+}
+
+func (s GetSchemaResponse) Message() *capnp.Message {
+	return capnp.Struct(s).Message()
+}
+
+func (s GetSchemaResponse) Segment() *capnp.Segment {
+	return capnp.Struct(s).Segment()
+}
+func (s GetSchemaResponse) Ok() bool {
+	return capnp.Struct(s).Bit(0)
+}
+
+func (s GetSchemaResponse) SetOk(v bool) {
+	capnp.Struct(s).SetBit(0, v)
+}
+
+func (s GetSchemaResponse) Tiers() (SchemaTier_List, error) {
+	p, err := capnp.Struct(s).Ptr(0)
+	return SchemaTier_List(p.List()), err
+}
+
+func (s GetSchemaResponse) HasTiers() bool {
+	return capnp.Struct(s).HasPtr(0)
+}
+
+func (s GetSchemaResponse) SetTiers(v SchemaTier_List) error {
+	return capnp.Struct(s).SetPtr(0, v.ToPtr())
+}
+
+// NewTiers sets the tiers field to a newly
+// allocated SchemaTier_List, preferring placement in s's segment.
+func (s GetSchemaResponse) NewTiers(n int32) (SchemaTier_List, error) {
+	l, err := NewSchemaTier_List(capnp.Struct(s).Segment(), n)
+	if err != nil {
+		return SchemaTier_List{}, err
+	}
+	err = capnp.Struct(s).SetPtr(0, l.ToPtr())
+	return l, err
+}
+
+// GetSchemaResponse_List is a list of GetSchemaResponse.
+type GetSchemaResponse_List = capnp.StructList[GetSchemaResponse]
+
+// NewGetSchemaResponse creates a new list of GetSchemaResponse.
+func NewGetSchemaResponse_List(s *capnp.Segment, sz int32) (GetSchemaResponse_List, error) {
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 8, PointerCount: 1}, sz)
+	return capnp.StructList[GetSchemaResponse](l), err
+}
+
+// GetSchemaResponse_Future is a wrapper for a GetSchemaResponse promised by a client call.
+type GetSchemaResponse_Future struct{ *capnp.Future }
+
+func (f GetSchemaResponse_Future) Struct() (GetSchemaResponse, error) {
+	p, err := f.Future.Ptr()
+	return GetSchemaResponse(p.Struct()), err
+}
+
+type GetDbPathRequest capnp.Struct
+
+// GetDbPathRequest_TypeID is the unique identifier for the type GetDbPathRequest.
+const GetDbPathRequest_TypeID = 0x828940848f3f3066
+
+func NewGetDbPathRequest(s *capnp.Segment) (GetDbPathRequest, error) {
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 0})
+	return GetDbPathRequest(st), err
+}
+
+func NewRootGetDbPathRequest(s *capnp.Segment) (GetDbPathRequest, error) {
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 0})
+	return GetDbPathRequest(st), err
+}
+
+func ReadRootGetDbPathRequest(msg *capnp.Message) (GetDbPathRequest, error) {
+	root, err := msg.Root()
+	return GetDbPathRequest(root.Struct()), err
+}
+
+func (s GetDbPathRequest) String() string {
+	str, _ := text.Marshal(0x828940848f3f3066, capnp.Struct(s))
+	return str
+}
+
+func (s GetDbPathRequest) EncodeAsPtr(seg *capnp.Segment) capnp.Ptr {
+	return capnp.Struct(s).EncodeAsPtr(seg)
+}
+
+func (GetDbPathRequest) DecodeFromPtr(p capnp.Ptr) GetDbPathRequest {
+	return GetDbPathRequest(capnp.Struct{}.DecodeFromPtr(p))
+}
+
+func (s GetDbPathRequest) ToPtr() capnp.Ptr {
+	return capnp.Struct(s).ToPtr()
+}
+func (s GetDbPathRequest) IsValid() bool {
+	return capnp.Struct(s).IsValid()
+}
+
+func (s GetDbPathRequest) Message() *capnp.Message {
+	return capnp.Struct(s).Message()
+}
+
+func (s GetDbPathRequest) Segment() *capnp.Segment {
+	return capnp.Struct(s).Segment()
+}
+
+// GetDbPathRequest_List is a list of GetDbPathRequest.
+type GetDbPathRequest_List = capnp.StructList[GetDbPathRequest]
+
+// NewGetDbPathRequest creates a new list of GetDbPathRequest.
+func NewGetDbPathRequest_List(s *capnp.Segment, sz int32) (GetDbPathRequest_List, error) {
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 0, PointerCount: 0}, sz)
+	return capnp.StructList[GetDbPathRequest](l), err
+}
+
+// GetDbPathRequest_Future is a wrapper for a GetDbPathRequest promised by a client call.
+type GetDbPathRequest_Future struct{ *capnp.Future }
+
+func (f GetDbPathRequest_Future) Struct() (GetDbPathRequest, error) {
+	p, err := f.Future.Ptr()
+	return GetDbPathRequest(p.Struct()), err
+}
+
+type GetDbPathResponse capnp.Struct
+
+// GetDbPathResponse_TypeID is the unique identifier for the type GetDbPathResponse.
+const GetDbPathResponse_TypeID = 0xc741f324d5833fa1
+
+func NewGetDbPathResponse(s *capnp.Segment) (GetDbPathResponse, error) {
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 8, PointerCount: 6})
+	return GetDbPathResponse(st), err
+}
+
+func NewRootGetDbPathResponse(s *capnp.Segment) (GetDbPathResponse, error) {
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 8, PointerCount: 6})
+	return GetDbPathResponse(st), err
+}
+
+func ReadRootGetDbPathResponse(msg *capnp.Message) (GetDbPathResponse, error) {
+	root, err := msg.Root()
+	return GetDbPathResponse(root.Struct()), err
+}
+
+func (s GetDbPathResponse) String() string {
+	str, _ := text.Marshal(0xc741f324d5833fa1, capnp.Struct(s))
+	return str
+}
+
+func (s GetDbPathResponse) EncodeAsPtr(seg *capnp.Segment) capnp.Ptr {
+	return capnp.Struct(s).EncodeAsPtr(seg)
+}
+
+func (GetDbPathResponse) DecodeFromPtr(p capnp.Ptr) GetDbPathResponse {
+	return GetDbPathResponse(capnp.Struct{}.DecodeFromPtr(p))
+}
+
+func (s GetDbPathResponse) ToPtr() capnp.Ptr {
+	return capnp.Struct(s).ToPtr()
+}
+func (s GetDbPathResponse) IsValid() bool {
+	return capnp.Struct(s).IsValid()
+}
+
+func (s GetDbPathResponse) Message() *capnp.Message {
+	return capnp.Struct(s).Message()
+}
+
+func (s GetDbPathResponse) Segment() *capnp.Segment {
+	return capnp.Struct(s).Segment()
+}
+func (s GetDbPathResponse) Ok() bool {
+	return capnp.Struct(s).Bit(0)
+}
+
+func (s GetDbPathResponse) SetOk(v bool) {
+	capnp.Struct(s).SetBit(0, v)
+}
+
+func (s GetDbPathResponse) DbPath() (string, error) {
+	p, err := capnp.Struct(s).Ptr(0)
+	return p.Text(), err
+}
+
+func (s GetDbPathResponse) HasDbPath() bool {
+	return capnp.Struct(s).HasPtr(0)
+}
+
+func (s GetDbPathResponse) DbPathBytes() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(0)
+	return p.TextBytes(), err
+}
+
+func (s GetDbPathResponse) SetDbPath(v string) error {
+	return capnp.Struct(s).SetText(0, v)
+}
+
+func (s GetDbPathResponse) CtrlPath() (string, error) {
+	p, err := capnp.Struct(s).Ptr(1)
+	return p.Text(), err
+}
+
+func (s GetDbPathResponse) HasCtrlPath() bool {
+	return capnp.Struct(s).HasPtr(1)
+}
+
+func (s GetDbPathResponse) CtrlPathBytes() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(1)
+	return p.TextBytes(), err
+}
+
+func (s GetDbPathResponse) SetCtrlPath(v string) error {
+	return capnp.Struct(s).SetText(1, v)
+}
+
+func (s GetDbPathResponse) BindingsPath() (string, error) {
+	p, err := capnp.Struct(s).Ptr(2)
+	return p.Text(), err
+}
+
+func (s GetDbPathResponse) HasBindingsPath() bool {
+	return capnp.Struct(s).HasPtr(2)
+}
+
+func (s GetDbPathResponse) BindingsPathBytes() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(2)
+	return p.TextBytes(), err
+}
+
+func (s GetDbPathResponse) SetBindingsPath(v string) error {
+	return capnp.Struct(s).SetText(2, v)
+}
+
+func (s GetDbPathResponse) AstPath() (string, error) {
+	p, err := capnp.Struct(s).Ptr(3)
+	return p.Text(), err
+}
+
+func (s GetDbPathResponse) HasAstPath() bool {
+	return capnp.Struct(s).HasPtr(3)
+}
+
+func (s GetDbPathResponse) AstPathBytes() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(3)
+	return p.TextBytes(), err
+}
+
+func (s GetDbPathResponse) SetAstPath(v string) error {
+	return capnp.Struct(s).SetText(3, v)
+}
+
+func (s GetDbPathResponse) SourcePath() (string, error) {
+	p, err := capnp.Struct(s).Ptr(4)
+	return p.Text(), err
+}
+
+func (s GetDbPathResponse) HasSourcePath() bool {
+	return capnp.Struct(s).HasPtr(4)
+}
+
+func (s GetDbPathResponse) SourcePathBytes() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(4)
+	return p.TextBytes(), err
+}
+
+func (s GetDbPathResponse) SetSourcePath(v string) error {
+	return capnp.Struct(s).SetText(4, v)
+}
+
+func (s GetDbPathResponse) HeadPath() (string, error) {
+	p, err := capnp.Struct(s).Ptr(5)
+	return p.Text(), err
+}
+
+func (s GetDbPathResponse) HasHeadPath() bool {
+	return capnp.Struct(s).HasPtr(5)
+}
+
+func (s GetDbPathResponse) HeadPathBytes() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(5)
+	return p.TextBytes(), err
+}
+
+func (s GetDbPathResponse) SetHeadPath(v string) error {
+	return capnp.Struct(s).SetText(5, v)
+}
+
+// GetDbPathResponse_List is a list of GetDbPathResponse.
+type GetDbPathResponse_List = capnp.StructList[GetDbPathResponse]
+
+// NewGetDbPathResponse creates a new list of GetDbPathResponse.
+func NewGetDbPathResponse_List(s *capnp.Segment, sz int32) (GetDbPathResponse_List, error) {
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 8, PointerCount: 6}, sz)
+	return capnp.StructList[GetDbPathResponse](l), err
+}
+
+// GetDbPathResponse_Future is a wrapper for a GetDbPathResponse promised by a client call.
+type GetDbPathResponse_Future struct{ *capnp.Future }
+
+func (f GetDbPathResponse_Future) Struct() (GetDbPathResponse, error) {
+	p, err := f.Future.Ptr()
+	return GetDbPathResponse(p.Struct()), err
+}
+
 type GetNodeRequest capnp.Struct
 
 // GetNodeRequest_TypeID is the unique identifier for the type GetNodeRequest.
@@ -3481,156 +3993,177 @@ func (f ErrorResponse_Future) Struct() (ErrorResponse, error) {
 	return ErrorResponse(p.Struct()), err
 }
 
-const schema_a1b2c3d4e5f60001 = "x\xda\xc4W\x7fpT\xd5\x15\xbe\xe7\xdd\x0d\x9b]v" +
-	"\xd9l\xee\x02JK382B\xa684\xa1\xb6\xcd" +
-	"\x1f]\x91\x84_%\x98\xb7\xa1\x05S\x18y\xec\xbb\x90" +
-	"'\x9b\xf76\xfb\xde\x0a\xa1u\x08V\x8aZ\x18\x81A" +
-	"[\xb4LAkKg\xa4\"S\x04\xfac\xaa\xd8\x8e" +
-	"\x86i:@\xcb\x08\x88Th\x19\x06\x0a\x15i\x11\xc1" +
-	"\xc1t\xce\xdd\xdd\xf7\xde\xee\xdb\x90\xd0:\xe3\x7f/w" +
-	"N\xce\xfd\xcew\xbe\xf3\xdd\xb3\x13\xbb\xfd\xf7\xfa\xbe\x14" +
-	"~3L$yk\xc5\x90\xbe\xaf\x9ci}\xab\xe1\xe0" +
-	"?\xbeO\xe40\xc0\x0d\xf8\xf0\xcc_\xdf\xd8\xb5\xadB" +
-	"\xf2\x13\xc2z\x86\\fG\x86\xe0\xd7\xa1!/\x13\xe8" +
-	"\xbb\xdas\xf0\xec\xa6\x9f=\xbe\x06C%;\xd4\x87\x01" +
-	"\x8f\xf87\xb2\xd5~?!\xf5\xab\xfcs\x81@\xdf\x98" +
-	"\xea\x9d\xbb.<\xf3\xd1\x1a\x12\x0d;YA\xe4\xaa<" +
-	"\xc0\xde\xad\xc4\xafc\x95q\xcc\xfaq\xe0\xc2\x87\xdfi" +
-	"|\xb2(R\xdc\x7f\xad\xf24\xab\x08\xe0\x17\x04\x96\x11" +
-	"\xe8{o\xb7\xf5\xe0\xd5\xe6\xee\xb5\xc5P1i\xfd\x82" +
-	"@5\xb0\x0e\x11\xab\x89\xd8G\xb3\xd7\xb4-\x0b\x1b7" +
-	"z\xee\xaf?\x16\x08\x02;'B\xcf\x04\x10\xc0\x0f\x03" +
-	"\xf7G\xfe\xf4\xf4\xe76\x97I[\x11\x94\x80E\x83\x18" +
-	"\x1b\x0eb\xda\x13\xdf8\x13y\xef\xee\xa7\x9es\xa7\x15" +
-	"\x04t\x05\xaf\xb3\xd5A?\xa1}\xbb\x9e\xb8\xf2\xf9\x8a" +
-	"\xa3\xd5[\xbc\xf5(\xc1'\x99&\x92q\x91\xac\xfb\x9f" +
-	"\x811\xaf\x1f\x1d\xbf\xc5{1\xfbc\xf02;$B" +
-	"{E\xe8\xb6\xdb\xf6\x8c\xf9\x8b\xf2\xd4O0\x94\x16]" +
-	"\xfc\xb5\xa1\xd7Y\xd3P\xfc\x9a<\xf4,\x81\xbe\x9f\xcf" +
-	"\xbd\xf8\xfb\xae\xfd\x87\xb7z\x10\x8e\x0e]g\xe3C\x88" +
-	"\xf0wmm\xdf\xfe\xd1\xab\x95\xdb\xca\xb4\xbc\"t\x9e" +
-	"EC\xa2\xde\x10\xb6\xbc}\xd2\xb4\xfa\xb1\xcf/\x7f\xa1" +
-	"\x0c7/\x86$`\xaf\x88\xd8\x1d!\xc48^\xb9\xff" +
-	"\xcaas\xff\xceby\x88rn\x0f\x9ffc\xc3\xf8" +
-	"5&\x8ci3\x97\xdeJ\xcfO\xbf\xbb\xc7\xab\x8e\xde" +
-	"\xf0qvLD\x1e\x09csnO\xb6\xd7\xbc3\xed" +
-	"\x85\xbd\xc5\x00(\x06\\\x09?\xcbn\x88\xd0ka\xac" +
-	"|\xc1\xb6\xdd\xe65\xads\x9f\x97\xf8\xdea\xc7\xd9\xb1" +
-	"a\"\xe90D\xbao\xd2\x8e\xeeK_x\xed5\xaf" +
-	"8&G$`\xcd\x11\x0c\x9d\x11\xc1\xfb\xff5\xe1\xae" +
-	"\x87\xe2\xdf\xfb\xd8\x1b\xca\xb4\xc8a\x96\x15\x91\x9d\"r" +
-	"\xed\x89\xff\x84\xe7\x7f\xd2\xbc\xbf\xa8E\xb9\xd0\x0d\x91\xd3" +
-	"l\x8b\x08\xdd\x1cA\xa4\xf7\x9c=\xfb\xe7\xcb\xadC\xdf" +
-	"(b*'\xa3\xaa\xc3lu\x15~\xad\xaa\x12H\x17" +
-	"\xae90\xf2\xea]=e8=Uu\x9e]\x14\xa1" +
-	"\xe7\xaa\x90\xd3\x03o\x8f\xe6\xd3\xdf\xf9z\x8f\x17\xe9\xea" +
-	"\xe8i\xb6!\x8a_\xeb\xa2\x88t}\xf0\xb7\xad\xef\x8f" +
-	"~\xbe\xd7[\xfe\x8e\xa8\x04l\x9f\x08\xdd-B?\xd8" +
-	"\xd0\xf8\xf7\x03\x9b\x0f\x1c,\xd3\xff#\xd1 \xb03\"" +
-	"\xf6T\x14\xb1\xbe\xf9\x83\xd0\xf6?\xa4\x8f\x1d\xf5\xf2\xdf" +
-	"\\}\x9c=P\x8d_\xdf\xac\xc6\xc8\xe5\xf7\xf4>\xf8" +
-	"Q\xd3\xa8\x13^\xa8\xafW\x9fg\xbd\"\xb2\xa7\x1a\xef" +
-	"\xbfp\xf6\xd5\xe6%{\xd3\xde\xc8\xfas\xd5\x12\xb0+" +
-	"\"\xf4\x03\x11\xfa\xe5\x8bc\x1e}\xfb[\x13O\x96\xe1" +
-	"?\xca\xce\xb3\xd1L\x08\x91!\xffU\x8b\x8c\x99\xd5\x9b" +
-	"\x9e=\xe9\xe5\xff\x06\xbb\xcc\x0211\x091D:\xf7" +
-	"\x999C\x8cu\xe3\xfeVfTx\xec8\xeb\x14\xa1" +
-	"\x1d1\xe4\x7f\xde\x9e\xa0\xd4\xf0K\xfd4\x86\xfa\x8a\xef" +
-	"\x1f;|?\x9b0\x1cQ\x8f\x1f^\x83\xeex\xe4\xe9" +
-	"\xa9|\xd9s\xbd\x17\xca\xd0*\x8f\x08\x02SF\xe0\xbf" +
-	"-\x18\x81\x106J\x97\xf6\x8f{\xff7\xff\xf6\x92\xd5" +
-	"3b\x17;$\"{G \x03\x9f\xd4\x9eT~}" +
-	"\xca\xb8\xe1\x05[\x7f\x03\xb3\x86Gbl`\xe4\xcbd" +
-	"B\x9f\xaa\xf0\x0eC\xbf;))i=\xdd\xd0\x9a]" +
-	"d&3\xda\"\x9e\xe05\x9dYnZ-\x00r\x88" +
-	"\xfa\x08\xf1\x01!\xd1\xa6\x06B\xe4{)\xc8\xf3%\x88" +
-	"\x02\xc4\x00\x0f\x1f\x98I\x88<\x8f\x82\xacJ\x00R\x0c" +
-	"$B\xa2J\x1d!\xf2|\x0ar\xbb\x04q\xcbHk" +
-	"I\x13\x86\x11h\xa1\x00!\"\xe1g\x9f\xa6r\xdd\xd2" +
-	"\xac.B\x888\x0b\x11\xa815=\xc9!@$\x08" +
-	"\x10\xb0\xa1\x81\x806\xdbP\x81#\x9c\xdbl8\x9bG" +
-	"\x11\"o\xa2 ou\xc1\xd9\x82p~LA\xde." +
-	"AT\xca\xe3y\xb1\x96\x10y+\x05\xf9%\x09\x80\xc6" +
-	"\x80\x12\x12\xfd\x05\x9e\xfd\x94\x82\xbcS\x82\xa8\x0fb\xe0" +
-	"#$\xba\x03\x0f\xb7S\x90\x7f%A\xb4\x82\xc6\xa0\x82" +
-	"\x90\xe8+X\xf6K\x14\xe4\xbd\x12PM-\xc0\xedK" +
-	"+\x19\xae[3TW\x09\x11]\xe9\xe0\xf6\x1fK5" +
-	"]\x05\x1f\x91\xc0G bj+8T\x10\x09*\x08" +
-	"\xc43<id\x9cL\xc5]\x98e(j\x82\x0b\xfe" +
-	"\x09\xc1\x92}v\xc9a,\xb9\x92\x82\x1c\x93\x80\xaa\x8b" +
-	" L$\x08{\x12$xZ\xc9\x98\x1cs\xf8\xf3M" +
-	"\xac\xb4S\x8c\xc7j\xee\xa4 Ot\xb16\x01\xeb\x1e" +
-	"GA\x9e$A\xdc4\xb2\x99\xa4SEJ\xd1\x97x" +
-	"\x90\xd2\x1cR\xcd\xb4\xa6\xb4k)5\xc3\xf5\x047\xd3" +
-	"\x86n\xe6\x9a\xe4\xban\x94s\x9d}\x1b\xf6\xe8\x8b\x14" +
-	"\xe4\xe9\x12Pc)\x00\x91\x00\xc7!\x99O\x85\x84\xe6" +
-	"\xe5R\xe5l\x1b\x04\x84pn\x86``\xce4\xb5\x9f" +
-	"R\xa6q+\xc1\x17\x9b\xcdJ:_\x08'\x83(\xe4" +
-	"\xbe<m\x8dE\x85\xac\xe4\xba\x95\xd1\xb8\xe9\x14a\xbf" +
-	"I%EH\x85\xbb\x1b\xf3w\xc7ya\xeeJ\xf4\x9f" +
-	"\xe0\x8b\x09\x19L'\x0b\xdc~U\x82\xb8n\xa8|\x86" +
-	"Sq\xae\xb1E\x82-A2U\xd3U\x84\x92\xe0f" +
-	"\x8d a\x10\x1c\xd4\x96\xe5 \xa2\xf2\xc5.\x02\xecm" +
-	"\xa8,\x01.\xdf\x89\x9b\xf6\xbdU\xf6\xbd\xca(\xc7O" +
-	"\xecJ9\x92\xbf\x90\x82\x9crM\xba\xb6\x88\x10\xb9\x9d" +
-	"\x82lI\x10\xa5\x90\x1b\xf5\xce\x04!r\x9a\x82\xfc\xdd" +
-	"\xe26\xb5sEm\xe5\x9d\xb6\xe3dx:\xa5tM" +
-	"1\x88?\xab[%\xa7\xd3\x14\x02i[\xa9\x9e\xfe%" +
-	"\xfa\xef\x9f\x1d3\xdbP9\x8a+R(\xd0\xe5\xac\xa3" +
-	"\xf2\xce:\xcb!v\x06\x12\xdbHAn\xc1\xfa W" +
-	"_3:\xebt\x0a\xf2\x9cb\xb6\xb1\xd3%\xc3RE" +
-	"\xa0\x86g2F\xa6\x7f\xc57~V\x8ao\xd23Z" +
-	"\xb2]\xdc\xeb\xbf)\x19v\xb7g\xb49\x85\x17\x9e\x19" +
-	"\x19\x07`VN\x16n\x1fY\xc2u\x9eQ,\x8dP" +
-	"C/\xb41\x9eVL\xd3\x0d\xd0\xde\x13\xca\x03D\xe2" +
-	"r\xbc\xd0\x1c>\x97\xa1\xd49\x86\xd2\x0f\xc3\xb9\x99m" +
-	"z\x98S\xdd*\x91\xf2\x1d\x8e\x94m%\xd7\xb9\x95\x9c" +
-	"\xef\xb4\x86\xc5\xa9\x14\xe44*Y\xca)\xb9\xa3\xd6\x91" +
-	"\xb7\xdft\xa4[#\x1e\xd9\x02\x8cR\x07W\x15K\xe9" +
-	"g\xe0\xe7\x18K\xb9\xde\xac\xa4\x9bt\x8bf\xbaJ\xfa" +
-	"_W\xce_\\\x02\xa8\xb1\xf0\xbf\x0b\x99W\xe6\xdc\xc6" +
-	"\xf3\xd2\x17\xab.\xc1\x15u\x8a\xa1[\\\xb7\x0a~}" +
-	"kv\x9d\xc3-gy\xa6+\x97\x00\xac\x92\x04w8" +
-	"\x09\xfcfg\xaa\x9f\x0c\xad\x96be\xcd\"\x09\x0ed" +
-	"8mNG\x0a\x12\xec@kIQ\x90\x97\xbb\xba\x94" +
-	"\xc5C\x8b\x82\xdc=\xb0.\xfbp\x89PZ\x14\x8b@" +
-	"\xbb\x8dT\x9c\xb5j+\x08x\xd7!\xf7\x8e0\xe0\x8b" +
-	"\xeb\xb4\xad\xcdy\x16\x06\x84\xd4\xcf61\xa0s\xdd|" +
-	"X\xeb\xf2\xc3:o`\x045\xa6\xa5X&T9\xcb" +
-	"t\xce\xcf\xfa\xf3Tg\xcf\xb9\xd5g\x1f\x1f\xbc)J" +
-	"*\xc5\xb9\xf9\xbf\xc9\xb1$M\xc6\xb4\xcd\xf4\xffp\xd3" +
-	"d.\xd5`\x9f\xcf\x82\x9bvf9\xf5\xac{\xb5\xe5" +
-	"\xd4P\xe7\xdc\x1bAc\xb4W\xf0\xc5Z\x8a\xf7;\xc1" +
-	"\xa5;Bg$\xeb\xa5\xddm\x8eE\xfep3\xca\xca" +
-	"2?p&w\xf9\x1d\\\xb7Z#\xa8\x9b\x92Q\x9e" +
-	"\xe9\x98k\xa1~m\x85kK(\x18ng\x9b\xb3%" +
-	"\xd8\xa3\xdc\x85\x87\xcb)\xc8\x8fI\xb8\xf0\x9b\xe6l\xa5" +
-	"\x83\xbb\xf7'AXK\xc6 \xf1$7M\xae\xdaC" +
-	"\xa4Y\xbc\xc3\x9c\xac\xaa\x84\xba\x0e\xd5,J\xdd\xd0\x09" +
-	"m6\xfb\x19\xb7V]I\x9b\xed\x865\x88\x15\xec\xd3" +
-	"\x98\xee\xbc\x91\xba\x1e\xba\x01\xb6\x92\xfb\xf2[\xc9B\x17" +
-	"u\x0bj\xf3\xbf\x01\xad\x12\x1d\x1b\xa9l\x87^\xaa\xa7" +
-	"H\xc6X\xe6\xd2\xb6\xfd\xc3\xb6\xac\xb6[\xd0{\xd0\xab" +
-	"M!\x8f\x98\x0d\xee\x91\x06\xa736\x11\xab\xd0y\xbb" +
-	")\xc8k];\xe1\x13\x08\xf91\x0a\xf2zll\xfe" +
-	"\xe7\xdf:\xfc\xf7\xc7)\xc8\x9b$\x00_\xee\xd7\xdf\x86" +
-	"\x87\x08\x91\xd7\xe7~&\xc6\x85\xe99\x9d\xcb\xea\xc9v" +
-	"E_\xc2\x09\xd8g+U\x9e\xe2\x96\x13\x13\x17\xbb\x80" +
-	"\xd3\xd7\xdc?\xa8SI\xe4fCU\xc6\x87>%\x03" +
-	"\xe1\x830\x10(\x88\xa0&\xd3\x950\x96\x95L`C" +
-	"~\x02\xef\x94 \xfe\xb0\x92\xca\xf2[y\xdc\xddU\x0c" +
-	"RS\x83\xd8tW&s\xf9m\xc7*Z\xc0\xfe\x1b" +
-	"\x00\x00\xff\xff\xea\xbe{V"
+const schema_a1b2c3d4e5f60001 = "x\xda\xc4X}p\x14\xe5\x19\x7f\x9f}\x13.\xb9\xe4" +
+	"\xb8\x1c\xef\x05H*\xcd\xe0\xe8\xa8L\xe3@\xa2\xb6f" +
+	"\xaa'\x92\x08\xb1F\xf3&T\x91\xc2\xc8\xe6\xf6\x85\xac" +
+	"^v/\xbb{Bl\x1d\xf0\xab~\x14\x07u\xc0\x16" +
+	"m\xa6FK+3Z\x81A1\xadL5\xca\x08L" +
+	"q\x90\xea\x88\x88\xd6R\x19f(T\x8d\xf5\x838\x9a" +
+	"\xce\xb3{\xb7\xbbw{!\xb1u\xa6\xffm\xde\xf9\xdd" +
+	"\xf3\xf9{\x7f\xcf\xf3f\xf6\x1de\x97\x95\xcc\x89\xac\x8e" +
+	"\x12\x89o/\x9d4\xba|vb\xdd\x9d\x97\xdd{;" +
+	"\x89E\xe0+\xf8\xec\xe8\x1b/o\x1b(\x09\x11\xc26" +
+	"\x85\x86\xd9\xd6P\x88\xd0\xd1\xef\x1f\xed\xdc\xdd\xb4\xff\x83" +
+	"\x9f\x13\x1e\x01\x17S*!\xe8\xfe\xd00\xdb\x18\xc2\xaf" +
+	"\x0d\xa1g\x08\x8c~\xbeg\xff\xb1\xf5\xbf\xbb\xe7n\x84" +
+	"J.\xd4\xb67\xb7\xec!\xd6Z\x16\"\xa4\xb1\xa5\xec" +
+	": 0:s\xca\x96m'\x1e\xfe\xe2n\xbf\xe7R" +
+	"\xb0m\x95\xefe\x03\xe5\xf8\xd5_\x9e@\xab_\x96\x9f" +
+	"\xf8\xec\xa7\xcd\xf7\xe5!m\xff;\xcb\x8f\xb0=6r" +
+	"W\xf9J\x02\xa3\xef?k\xdd\xf0y\xdb\x9a\xb5\xf9\xa1" +
+	"\xa2\xd1\xc6\x99\xe1)\xc0\xe6\x84\x11[\x1fF\xec\xe1\xa3" +
+	"C\x97\xf2k\xbfZ\x1b\xc8\xbc?<\xcc6\x871\xf3" +
+	"\xdb3\xa7\xd4\xfee\xcd\x0f\x05Bl\xbc+\x1c\x06\xb6" +
+	"\xc1\xb6\xf6`\x18c\xfce\xf95\xd1\xbfl\xf8\xce\xc6" +
+	"\"\x9e\xb7\x86%`;m\xec\xa0\xe3\xf9GG\xa3\xef" +
+	"\x9f\xbf\xee\xd1\x80\xe7\xb3+F\xd8\x9c\x0a\xf4\xbc\xed\xde" +
+	"O\xcf(=8\xa5?\x98r\xa4\xe2>V]\x81_" +
+	"\xb1\x0a4\xb6\xe6\x9f\xe53_:x^\x7f\xd01\xeb" +
+	"\xad\x18f\xb7\xda\xd0>\x1b:0}\xc7\xcc\xbf\xca\xeb" +
+	"~\x83P\x9a\xe7\xf8h\xc5\x08\xfb\xd8F\x9e\xac8F" +
+	"`\xf4\xf7\xd7\x9d\xfcs\xdf\xd0\x81\xc7\x02\x11\xee\xa9\x1c" +
+	"aoVb\x84;\x17/\xfe\xc9\xaf\x9e+\x1b(\xc2" +
+	"\x8a\xad\x95\xc7\xd9\xceJ;\xdfJdE\xf7\x05\xf3\x1b" +
+	"\xcf~|\xd5\x13Ej\xc3#\x12\xb0\xa5\x11\xc4^\x1f" +
+	"\xc1\x18\xcf\x93\xaf\xf9\xf4\x809\xb4%\x9fAv:\xbb" +
+	"\"G\xd8\xeb6t_\x04\xcd\x1a\x1f\xedN/I\xbf" +
+	"\xbb#H\xa0\xbe\xc9\x87\xd8]\x93\xf1\xeb\xb6\xc9\xd8\x9c" +
+	"\x9adw\xdd;\xf3\x9fx>?\x00\x8a\x80\x81\xc9\x8f" +
+	"\xb0\xcd6t\xd3d\xcc|\xe9\xc0\xb3\xe6)\xb5w0" +
+	"X\xf8\xbe\xe8!vW\xd46\x1a\xc5H\x07/xz" +
+	"\xcdG\xdf}\xf1\xc5 9NF%`\xa7l\xe8\xa7" +
+	"Q\xf4\xff\xaf\xfasnL\xdc\xf1e\x10\xca\xaa\xab\x0e" +
+	"\xb0\x99U\xf85\xa3\x0a\x91k\x0f\xff;\xb2\xe4\xeb\xb6" +
+	"\xa1\xbc\x169\xd0K\xaa\x8e\xb0V\x1b\xdaR\x85\x91^" +
+	"t\xec\xd8k\xc3\x9d\x15/\xe7U\xca\xa1Q\xec\x00\x9b" +
+	"\x13\xb3\x99\x1e\xb3\xfb\x9e\xb8\xe3\xcd\xb3>\x99\xfbj~" +
+	"\xfa\x93\xec\x0b\x1c\x1ba\x1b\x11\xda\xb8!\xb6\x0eo\xe5" +
+	"\xe0\xb2\xbb\xf7N\xfb\xfc\x9c=E\xea_\xcf\x8e\xb3\x8b" +
+	"\x19~]\xc8\xb0\xfe{\xdf\x9a!\x16\xbcs\xe9\x9e`" +
+	"V\xaf\xb3#\xec]\x1b\xf96\xc3\xac\x1e\x08\xbf\xd0\xf9" +
+	"\xe1\x8c\xc7\xf7\x05Ku\x8aI\xc0J\xe3\x08\x858B" +
+	"?~\xb0\xf9\x1f{7\xee\xdd_\xec\x06\xc7\xc3\xc0\xe6" +
+	"\xd8\xd8\xfa8\xe6\xf5\xea/*\x9f|%\xfd\xf6\xc1`" +
+	"\xaf6\xc6\x0f\xb1M6r\xc0F\xae\xbah\xdf\x0d_" +
+	"\xb4\xd4\x1e\x0e\x86\x1a\xa9>\xcej\xaa\xedVT\xa3\xff" +
+	"\x13\xc7\x9ek[\xf1|:\x88l\xbc\xb0Z\x026\xd7" +
+	"\x86^bC/<9\xf3\xf6\xb7\xae\x9d\xfd^\x91^" +
+	"-\xad>\xceT\x1b*\xaa\xb1WU]\xfa\x95S\xd6" +
+	"?\xf2^\xb0W\xadS\x87\xd9\x8f\xa7\xe2\x17\x9f\x8a\x91" +
+	"^\xf7\xf0\xc2I\xfa\xfd\xe7\xfe\xad\xd8\xb5\x9az\x88\xed" +
+	"\xb4\xa1\x83S\xb1\xfe\x8bv\x84\xa5\xa6?hG\x10Z" +
+	"Rp\xf3\xa7\x0d\xb1\xbei\x18ufZ\x1d\xb6\xf5\xcd" +
+	"\x0dW\x88\x95\x8f\xee;Q\xa4\xac\xfd\xd3\xc3\xc0\x9e\x9e" +
+	"\x8e?\xdb<\x1dCxH\xfah\xe8\xdc\x0f\xff\xf4I" +
+	"\x11\xb6\xd6lc3j\xf0\xab\xa6\x06+p\xed\xa2\xf2" +
+	"\x91\x1f.\x98{*\xd8\x80\xd6\x9a!\xc6md[\x0d" +
+	"\xda<\xb2=\xb4\xe3l\xe3\xb5\x91\"*5X3\xc2" +
+	"v\xd9\xd0\x97l\xe8\xd7\xb3\xde\x93\xff\xf8w\xfd\xab`" +
+	"\x05\x1a\xebk\xc3\xc0.\xa9E\xec\xc5\xb5\xcf\x90\xfaQ" +
+	"E\x16=\xbav~R\x92\xd3Z\xbai\xbe\xb0\x9a\xbb" +
+	"\xdae\xab\xbbC\xd4\xf5f\x84i\xb5\x03\x14@:3" +
+	"]f\xd2P\xbb\x84\x0f\xc2+i\x09!%@H\xac" +
+	"\xa5\x89\x10~\x19\x05\xbeD\x82\x18@\x1c\xf0\xf0\xfa+" +
+	"\x09\xe1\x8b(pE\x02\x90\xe2 \x11\x12\x93\x1b\x08\xe1" +
+	"K(\xf0n\x09\x12\x96\x9eV\x93&L&\xd0N\x01" +
+	"*\x89\x84\x9f\xa3\xaa\"4K\xb5\xfa\x08!\xf6Y%" +
+	"\x81:S\xd5\x92\x02\xca\x89\x04\xe5\xc4\x0b\x0d\xec\xd0\xae" +
+	"\xd6\x15\x10\x18\xcet7\x9c\x8d\xb5\x84\xf0\xf5\x14\xf8c" +
+	"\xbep\xfa1\x9c_S\xe0OJ\x10\x93\xb2\xf1l\x9a" +
+	"E\x08\x7f\x8c\x02\x7fJ\x02\xa0q\xa0\x84\xc46\xe3\xd9" +
+	"o)\xf0-\x12\xc4J \x0e%\x84\xc4\x9e\xc6\xc3'" +
+	")\xf0\xed\x12\xc4Ji\x1cJ\x09\x89m\xc5\xb4\x9f\xa2" +
+	"\xc0\x9f\x97\x80\xaaJ.\xdc\xd1\xb4l\x08\xcdjU|" +
+	")D5\xb9G\xb8\x7f\xdc\xa4j\x0a\x94\x10\x09J\x08" +
+	"DM\xf5\x16\x01\xa5D\x82R\x02\x09C$u\xc3\xb3" +
+	"\x94\xdf\x85\xabtY\xe9\x10v\xfd\x09\xc1\x94K\xdc\x94" +
+	"#\x98r\x19\x05\x1e\x97\x80*]\x10!\x12D\x02\x06" +
+	":DZ6L\x816B\xd9&\x96\xb9&\xce\xc3l" +
+	"\xce\xa2\xc0g\xfb\xaaV\x8fy\x9fK\x81_ A\xc2" +
+	"\xd43F\xd2\xcb\"%k+\x02\x91R'R\xd5\xb4" +
+	"\xe6u\xab)\xc5\x10Z\x870\xd3\xbaf:M\xf2\xb9" +
+	"\xab\xf5\xdc\xb9\xde\xb0G\xdf\xa3\xc0\x17H@\xf5\x9b\x00" +
+	"\x88\x04x\x0d\x93YSX\xd0,]\xaa\xbc\xa5\x89\x80" +
+	"M\x9c\x00\xa9;\x93\xdd\xa2G.F\xeabA\x8e_" +
+	"VU\x19#\xdb\xf9\xc2\xea\x10\xcb\xcd69\x9d\xcdU" +
+	"\x90\x09\xe4zy\xb6\xb2\xcdy\xb9\xae\x16\x9ae\xa8\xc2" +
+	"\xf4\xf2tG\xebXy6g}'D Q\xc8\xb6" +
+	"}9!\x13iv\xae\xfc?\x90 \xa1\xe9\x8ah\xf5" +
+	"2vz\x9f\xc7\xe9\x82H\xaeP5\x05C\xe9\x10f" +
+	"\x9d]\x84\x09\xd4`V\xd1\x1aD\x15\xb1\xdcW\x00w" +
+	"\xa9+Z\x00\x9f4%L\xd7o\x95\xebW\xae\xf5$" +
+	"\xc7\xcdT`\xf1\x97Q\xe0)\x9f\x18\xa8]\x84\xf0n" +
+	"\x0a\xdc\x92 F\xc1Q\x83\xde\x0eBx\x9a\x02\xffY" +
+	"~\x9b\xba\x85\xact\x8a^W\x94\x0c\x91N\xc9}\xf3" +
+	"t\x12\xcahV\xc1\xe9|\x99@\xda%s\xa0\x7f\x1d" +
+	"c\xf7\xcf\xc5\\\xad+\x02\xc9\x15\xcd%\xe8\x13\xdf\xda" +
+	"\xac\xf8^\xe5\x15\xb6\x15\x0b\xdbL\x81\xb7c~\xe0\xe4" +
+	"\xd7\x86\xe2\xbb\x80\x02_\x98_m\xect\xc1}\xaa\"" +
+	"P'\x0cC7\xc6f|\xf3\xff\x8b\xf1-\x9a\xa1&" +
+	"\xbbm\xbf\xa1\xd3\x16\xc3\xedv\xebb/\xf1\xdc$\xe2" +
+	"x\x01\xaerh\xe1\x97\x9a\x15B\x13\x86l\xa9\x84\xea" +
+	"Z\xae\x8d\x89\xb4l\x9a\xfe\x00\xdd\x15\xa6x\x80X8" +
+	"\xa7.\xd4\x89\xcf'(\x0d\x9e\xa0\x8cQa\xe7\xce\xb6" +
+	"\xdc,\xa8f\x15P\xf9L\x8f\xca.\x93\x1b\xfcL\xce" +
+	"vZ\xc5\xe4\x14\x0a<\x8dL\x96\x1c&\xf7\xcc\xf2\xe8" +
+	"\x1d2=\xea\xd6\xd9s8\x17F\xa1\xc8+\xb2%\x8f" +
+	"q\xe1\x17\xea7\x09\xadMN\xb7h\x165\xfa\x0a\xfa" +
+	"\xdfPL_|\x04\xa8\xb3\xf0\xd79\xcb\xab\x1d\xb5\x09" +
+	",\x03\xf9\xac\xeb\x10\xb22O\xd7,\xa1Y9\xbd\xfe" +
+	"fr\xed\xc4\xcd3\xc2\xe8s\x0c\x80U`\xe0L\xcf" +
+	"@\xc8\xecM\x8da\xa1\xd3\x92\xad\x8c\x99G\xc1\xf1\x04" +
+	"g\xb1\xd7\x91\x1c\x05{PZR\x14\xf8*_\x972" +
+	"xhQ\xe0k\xc6\xe7\xe5(\xee\x19r\xbbl\x11\xe8" +
+	"v#\xb5\xcf:\xd5[\x08\x047&\xff\x1a1\xeeP" +
+	"\xf6\xda\xb6\xd8\x1b\x0b\xe3\x864\xe6j\xe9\x13\xe73\\" +
+	"\x7f\xcf\xa2\xbf-\x14\xf8\x0b\x1e\xa3\x07\x91\xbc\xdb)\xf0" +
+	"\x17}\x8c\xde\x89\xa3\xe9\x05\x0a|\xb7\xafV\xbbn$" +
+	"\x84\xbfB\x81\xef\xc7M\x8d:\x9b\xda>$\xd9n\x0a" +
+	"\xfc\x0d\xdc\xd4J\x9cM\xeduLa?\x05~X\x82" +
+	"\xd8\xa4\xd28L\"$\xf66\xda<H\x81\x7f\x90\x97" +
+	"WB\xb1#v\x0b\x9a\xb4\x8c\x14\x1e\xf8'_\x97\xaa" +
+	")\xaa\xb6\xc2$Q?t\xb5lZy?u\xeeR" +
+	"\xbbL\xa8\xef\x10'G\xa1\xbd1\xd6\xb4q\xf5\xfe\xf4" +
+	"\x12\xd7\x90\x95\xb8E\xe3\xf7\xad\xce\xb4d\xcb\x84*\xef" +
+	"u\xe4L\x81\xb1&\x91\xb7@~\xd3e\x09\xd7\x84y" +
+	"r*%\x84\xf9\xdf]\xe2\x023\x86\xe9\x8e\xa0\xffa" +
+	"\x06%\x1dS\x13]:r3\xa87#h`\x8f\x9e" +
+	"U\xec\x0e5x~\xa38N\xdc\xb7\xcdr5%\xc6" +
+	"\xd4\xbd\xc2\xcd\xaa7\x9a\x09\x96\xdd?R\xf2T\xf5t" +
+	"%+Z\xf9\xf1-\xf9\xd3\xef\x11\x9a\xd5\x19E\xde\x14" +
+	"\x08\xe0\x95\xdeH\xca\xe5\xaf\xde\xe2\xdb\xadr\x97\xbaw" +
+	"\xb1\xb7[\xb9\x97\xba\x0f\x0fWQ\xe0wJ\xf8\x922" +
+	"\xcd\xab\xe5\x1e\xe1\xbf+v\xc1\xda\x0d\x9d$\x92\xc24" +
+	"\x85\xe2J\x8fj\x89\x1es\xae\xa2\x10\xea;T2H" +
+	"u]#\xb4\xcd\x1cC\xa4:59mv\xeb\xd6\x04" +
+	"\x16\xd7oC\x13\xb3\xe3\xc7\xb7\x1e\x8c\xb3\xcb]\x9e\xdd" +
+	"\xe5\x96\xf9J\xb7tV\xf6qm\x15\xf0XOez" +
+	"\xb4B>E\x0d}\xa5\x8f\xdb\xee\x7f*\x8ar\xbb\x1d" +
+	"\xb5\x07'\x9ci\xd3#\xee\x06wk\x93\xd7\x19\xb7\x10" +
+	"\xb7\xe1\xbcZC\x81\xaf\xf5m\xd2\xf7b\xc8wR\xe0" +
+	"\x0f`c\xb3\xef\xea\xfb\xf1\xe7\xf7P\xe0\xeb%\x80\x12" +
+	"G\xac\x1fD\x05\x7f\xc0y\x7f'l\xd1\xf3:\x97\xd1" +
+	"\x92\xdd\xb2\xb6B\x10p\xcfV+\"%,\x0f\x93\xb0" +
+	"7(\xaf\xaf\xce\x0f\x94+H\xf4t\x97\xaa\x88\x0e}" +
+	"K\x02\"&  \x90#A\x9d\xd1\xd7\xa1\xaf,\xb8" +
+	"\x81M\xd9\x1bx\x96\x04\x89\x9b\xe5Tf<ip\xde" +
+	"\xb8\x0bUa\x90\x89\xa8P\x93O\x85\xfc\xff\x91H$" +
+	"\x0d\xd9\x1a\xcf\x97\xefI\xed\x1b\xe6\xe3\x94\xab\xa1h\xb9" +
+	"\xea,5Om\xdd\xff\x88\x15\x14\xab\xc8\xde\xe7o\xd5" +
+	"\x04/\xce\x04\x1eA\xab\x93\x8e}W\x96\xf3v\xf3\xff" +
+	"\x04\x00\x00\xff\xff\xf6\xe5A\x8d"
 
 func RegisterSchema(reg *schemas.Registry) {
 	reg.Register(&schemas.Schema{
 		String: schema_a1b2c3d4e5f60001,
 		Nodes: []uint64{
+			0x828940848f3f3066,
 			0x86e4d03ac853e537,
 			0x8788a694e7d0c9f7,
 			0x87f896ecb2b01221,
 			0x8a447bf6ec09fbf7,
 			0x8c804df75f74b5e0,
+			0x8cfd56513ec2e5dc,
 			0x9244609d69f97582,
 			0x991b95cc0f4f0997,
 			0x9b8f2ee00fe54bdc,
@@ -3648,6 +4181,7 @@ func RegisterSchema(reg *schemas.Registry) {
 			0xc0fb833f6a272dee,
 			0xc24dfe5c0df4dc8c,
 			0xc30b53f2cee7e736,
+			0xc741f324d5833fa1,
 			0xc927f717ca8760b9,
 			0xc93edb48651dd7ca,
 			0xcda21def53bc0a90,
@@ -3661,6 +4195,8 @@ func RegisterSchema(reg *schemas.Registry) {
 			0xe26eae3a020ab758,
 			0xeccd9b77654695d5,
 			0xf3bbef28c2f00292,
+			0xf941483cfa095856,
+			0xface7225b707b4e2,
 			0xfd6fe1ba61de2afe,
 		},
 		Compressed: true,

@@ -139,6 +139,16 @@ fn tool_registry() -> Vec<McpTool> {
             }),
         },
         McpTool {
+            name: "get_refs_map",
+            description: "Bulk export the full (token → [node_id]) refs index from node_refs. For graph-wide consumers (community detection, architecture diagrams).",
+            schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
+        },
+        McpTool {
+            name: "get_defs_map",
+            description: "Bulk export the full (token → [node_id]) defs index from node_defs. For graph-wide consumers (impact analysis, find_definition).",
+            schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
+        },
+        McpTool {
             name: "get_node",
             description: "Fetch a single node by id.",
             schema: json!({

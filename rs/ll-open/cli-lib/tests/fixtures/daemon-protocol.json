@@ -141,6 +141,35 @@
     "go_drift_skip": "b631c8: same snake_case vs camelCase drift as find_callers (node_id/source_id vs nodeId/sourceId). A-2 reconciles."
   },
 
+  "get_refs_map": {
+    "request": {"op": "get_refs_map"},
+    "response": {
+      "ok": true,
+      "entries": [
+        {"token": "some_fn", "node_ids": ["file1.rs#caller"]},
+        {"token": "another_fn", "node_ids": ["file1.rs#caller2", "file2.rs#caller3"]}
+      ]
+    },
+    "response_required_keys": ["ok", "entries"],
+    "response_optional_keys": [],
+    "go_binding": "GetRefsMapResponse",
+    "go_drift_skip": "b631c8: schema declares TokenMapEntry.nodeIds (camelCase) but handler emits node_ids (snake_case). A-2 reconciles alongside find_callers/find_defs."
+  },
+
+  "get_defs_map": {
+    "request": {"op": "get_defs_map"},
+    "response": {
+      "ok": true,
+      "entries": [
+        {"token": "some_fn", "node_ids": ["file1.rs#some_fn"]}
+      ]
+    },
+    "response_required_keys": ["ok", "entries"],
+    "response_optional_keys": [],
+    "go_binding": "GetDefsMapResponse",
+    "go_drift_skip": "b631c8: same node_ids snake_case drift as get_refs_map."
+  },
+
   "query": {
     "request": {"op": "query", "sql": "SELECT 1 as one"},
     "response": {

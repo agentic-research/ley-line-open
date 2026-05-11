@@ -162,6 +162,28 @@ struct FindCalleesResponse {
   callees @1 :List(Ref);
 }
 
+struct TokenMapEntry {
+  # One token → many node_ids. Used by both refs map and defs map bulk
+  # responses. source_id is intentionally omitted — bulk consumers want
+  # graph topology; per-token find_callers/find_defs still expose it.
+  token   @0 :Text;
+  nodeIds @1 :List(Text);
+}
+
+struct GetRefsMapRequest {}
+
+struct GetRefsMapResponse {
+  ok      @0 :Bool;
+  entries @1 :List(TokenMapEntry);
+}
+
+struct GetDefsMapRequest {}
+
+struct GetDefsMapResponse {
+  ok      @0 :Bool;
+  entries @1 :List(TokenMapEntry);
+}
+
 struct GetNodeRequest {
   id @0 :Text;
 }

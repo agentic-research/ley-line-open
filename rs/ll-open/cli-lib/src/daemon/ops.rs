@@ -61,6 +61,8 @@ pub(crate) fn base_op_names() -> Vec<&'static str> {
         "find_callees",
         "find_defs",
         "get_node",
+        "get_refs_map",
+        "get_defs_map",
         "lsp_hover",
         "lsp_defs",
         "lsp_refs",
@@ -93,6 +95,8 @@ pub fn handle_base_op(
         "find_callers" => Some(op_find_callers(ctx, req)),
         "find_callees" => Some(op_find_callees(ctx, req)),
         "find_defs" => Some(op_find_defs(ctx, req)),
+        "get_refs_map" => Some(op_get_token_map(ctx, "node_refs", "entries")),
+        "get_defs_map" => Some(op_get_token_map(ctx, "node_defs", "entries")),
         "get_node" => Some(op_get_node(ctx, req)),
         // Position-based LSP queries — translate (file, line, col) to node lookups.
         "lsp_hover" => Some(op_lsp_hover(ctx, req)),
@@ -673,6 +677,64 @@ fn op_find_callees(ctx: &DaemonContext, req: &serde_json::Value) -> Result<Strin
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(json!({"ok": true, "callees": rows}).to_string())
+    })
+}
+
+/// Bulk-export a `(token → [node_id])` index — the full contents of
+/// `node_refs` (refs map) or `node_defs` (defs map), grouped by token.
+///
+/// Used by mache's `RefsMap()` / `DefsMap()` for graph-wide analysis
+/// (Louvain community detection, impact-analysis BFS seeds, architecture
+/// diagrams). The per-token `find_callers` / `find_defs` ops are unsuited
+/// to bulk consumers because iterating them across every token would be
+/// thousands of round-trips.
+///
+/// `source_id` is intentionally NOT included in the response — bulk
+/// consumers want the (token → nodes) map for graph topology; the
+/// per-token lookups still expose source_id when needed. Keeps the
+/// response compact for large indexes.
+///
+/// Read-only — NOT in STATE_CHANGING_OPS.
+fn op_get_token_map(ctx: &DaemonContext, table: &str, json_key: &str) -> Result<String> {
+    with_live_db(ctx, |conn| {
+        let sql = format!("SELECT token, node_id FROM {table} ORDER BY token, node_id");
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let pairs: Vec<(String, String)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        // Group by token in a single linear pass — the ORDER BY token
+        // above means same-token rows are contiguous, so we just track
+        // the current token and flush when it changes.
+        let mut entries: Vec<serde_json::Value> = Vec::new();
+        let mut current_token: Option<String> = None;
+        let mut current_node_ids: Vec<String> = Vec::new();
+        for (token, node_id) in pairs {
+            if Some(&token) != current_token.as_ref() {
+                if let Some(tok) = current_token.take() {
+                    entries.push(json!({
+                        "token": tok,
+                        "node_ids": current_node_ids,
+                    }));
+                    current_node_ids = Vec::new();
+                }
+                current_token = Some(token);
+            }
+            current_node_ids.push(node_id);
+        }
+        if let Some(tok) = current_token {
+            entries.push(json!({
+                "token": tok,
+                "node_ids": current_node_ids,
+            }));
+        }
+
+        let mut obj = serde_json::Map::new();
+        obj.insert("ok".to_string(), json!(true));
+        obj.insert(json_key.to_string(), json!(entries));
+        Ok(serde_json::Value::Object(obj).to_string())
     })
 }
 

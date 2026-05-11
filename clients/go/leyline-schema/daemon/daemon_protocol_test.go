@@ -159,6 +159,21 @@ type findCalleesResponse struct {
 	Callees []ref `json:"callees"`
 }
 
+type tokenMapEntry struct {
+	Token   *string  `json:"token"`
+	NodeIDs []string `json:"nodeIds"`
+}
+
+type getRefsMapResponse struct {
+	OK      *bool           `json:"ok"`
+	Entries []tokenMapEntry `json:"entries"`
+}
+
+type getDefsMapResponse struct {
+	OK      *bool           `json:"ok"`
+	Entries []tokenMapEntry `json:"entries"`
+}
+
 type queryResponse struct {
 	OK      *bool      `json:"ok"`
 	Columns []string   `json:"columns"`
@@ -186,6 +201,10 @@ func decoderFor(name string) func([]byte) error {
 		return func(b []byte) error { var v findDefsResponse; return strictUnmarshal(b, &v) }
 	case "FindCalleesResponse":
 		return func(b []byte) error { var v findCalleesResponse; return strictUnmarshal(b, &v) }
+	case "GetRefsMapResponse":
+		return func(b []byte) error { var v getRefsMapResponse; return strictUnmarshal(b, &v) }
+	case "GetDefsMapResponse":
+		return func(b []byte) error { var v getDefsMapResponse; return strictUnmarshal(b, &v) }
 	case "QueryResponse":
 		return func(b []byte) error { var v queryResponse; return strictUnmarshal(b, &v) }
 	default:

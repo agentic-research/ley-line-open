@@ -116,15 +116,27 @@ cross-runtime fixture suite in CI:
 
 Both gates are wired into `.github/workflows/leyline-schema-go.yml`. The
 substrate gate asserts byte-equality on canonical encoding (T8.10's
-falsifiable claim F8.6.4). The daemon protocol gate asserts the JSON wire
-shape matches the typed schema on both ends — Rust handler emits a response
-containing every `response_required_keys` entry, AND that response decodes
-into the matching Go binding without `UnmarshalTypeError`.
+falsifiable claim F8.6.4 — direct: byte-equal decode in both runtimes).
+
+The daemon protocol gate is a **two-step chain** through the fixture file,
+because the JSON wire is built by handlers at runtime (not byte-equal):
+
+1. **Rust half (runtime):** spawns the daemon, sends each fixture's
+   request, asserts the live response contains every required key.
+   Pins **handler ↔ fixture**.
+2. **Go half (offline):** strict-unmarshals each fixture's `response`
+   payload into the matching typed Go binding. No daemon round-trip.
+   Pins **fixture ↔ schema**.
+
+Composing the two yields **handler ↔ schema** transitively. Either half
+failing means the chain broke. The fixture file is the deliberate
+intermediate artifact, not an artifact of the implementation.
 
 Ops with known schema↔reality drift (`get_node` snake_case, `status` missing
-fields, etc.) are SKIPPED in the daemon protocol gate with the drift reason
-as the skip message. Bead A-2 (`b631c8`) reconciles the schema additively;
-each `go_drift_skip` flipping to null converts a skip to a pass.
+fields, etc.) are SKIPPED in the Go half with the drift reason as the skip
+message; the Rust half still runs for them. Bead A-2 (`b631c8`) reconciles
+the schema additively; each `go_drift_skip` flipping to null converts a
+skip to a pass.
 
 ## Rules
 

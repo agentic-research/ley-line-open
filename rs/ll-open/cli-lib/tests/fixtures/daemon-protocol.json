@@ -128,12 +128,12 @@
   },
 
   "query": {
-    "request": {"op": "query", "sql": "SELECT id, name FROM nodes LIMIT 1"},
+    "request": {"op": "query", "sql": "SELECT 1 as one"},
     "response": {
       "ok": true,
-      "columns": ["id", "name"],
+      "columns": ["one"],
       "rows": [
-        {"id": "file1.rs", "name": "file1.rs"}
+        {"one": "1"}
       ]
     },
     "response_required_keys": ["ok", "columns", "rows"],

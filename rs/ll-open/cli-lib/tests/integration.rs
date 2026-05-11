@@ -2992,19 +2992,27 @@ async fn test_op_reparse_snapshot_race_publishes_well_formed_root() {
 }
 
 // ---------------------------------------------------------------------------
-// Daemon protocol drift gate (bead ley-line-open-b5a77b / A-1)
+// Daemon protocol drift gate, Rust half (bead ley-line-open-b5a77b / A-1)
 //
-// Pins each base op's wire shape against `tests/fixtures/daemon-protocol.json`.
-// For every op listed in the fixture: spawn the daemon, send the fixture's
-// request, assert the response is a JSON object containing every required
-// key. Loose superset match — state-dependent values vary by test environment;
-// only the SHAPE is contractual.
+// THIS gate (Rust side): spawn the daemon, send each fixture's request,
+// assert the live response contains every required key. Pins handler ↔
+// fixture agreement. Loose superset match — state-dependent values vary
+// by test environment; only the SHAPE is contractual.
 //
-// The companion Go gate at `clients/go/leyline-schema/daemon/daemon_protocol_test.go`
-// asserts the same fixture responses decode into the matching typed Go
-// binding. Together they catch handler ↔ schema drift before merge. This
-// extends T8.10's cross-runtime fixture pattern (bead 6b7d43) from the
-// substrate (capnp segment files) to the daemon protocol (JSON wire).
+// The companion Go gate at
+// `clients/go/leyline-schema/daemon/daemon_protocol_test.go` validates a
+// DIFFERENT edge: it strict-unmarshals each fixture's `response` payload
+// into the matching typed Go binding (no daemon round-trip on the Go side).
+// That pins fixture ↔ schema agreement.
+//
+// Composing the two:
+//   handler ↔ fixture (Rust gate, this one) + fixture ↔ schema (Go gate)
+//   ⇒ handler ↔ schema (transitively)
+//
+// Either gate failing means the chain broke. Together they extend T8.10's
+// cross-runtime fixture pattern (bead 6b7d43) from the substrate (capnp
+// segment files; byte-equal direct decode) to the daemon protocol (JSON
+// wire; two-step chain through the fixture).
 //
 // See `docs/TABLE_CONTRACT.md` for the substrate-vs-daemon-protocol layering.
 // ---------------------------------------------------------------------------
@@ -3032,6 +3040,23 @@ async fn daemon_protocol_gate_handlers_emit_required_keys() {
     let dir = TempDir::new().unwrap();
     let (_arena, ctrl_path) = fresh_arena(dir.path());
     let ctx = Arc::new(default_test_ctx(ctrl_path));
+
+    // The gate exercises the SUCCESS paths of each op. Empty in-memory db
+    // means the relevant tables don't exist, which would cause queries to
+    // bubble `no such table` errors and the gate would catch them as
+    // unexpected ok=false. Pre-create the tables once (idempotent DDL) so
+    // ops can return empty success shapes instead of erroring.
+    {
+        let guard = ctx.live_db.lock().unwrap();
+        leyline_schema::create_schema(&guard).expect("nodes schema");
+        guard
+            .execute_batch(leyline_ts::schema::REFS_DDL)
+            .expect("node_refs schema");
+        guard
+            .execute_batch(leyline_ts::schema::DEFS_DDL)
+            .expect("node_defs schema");
+    }
+
     let sock_path = dir.path().join("test.sock");
     spawn_test_socket(ctx, sock_path.clone()).await;
 
@@ -3065,25 +3090,34 @@ async fn daemon_protocol_gate_handlers_emit_required_keys() {
             }
         };
 
-        // Required keys present? Ops that legitimately error on a fresh test
-        // daemon (e.g. read_content for a node that doesn't exist) may return
-        // {"ok": false, "error": "..."} instead of the success-path shape. The
-        // fixture's `response_required_keys` should include only keys present
-        // in BOTH branches — typically just "ok".
+        // Some ops legitimately return {"ok": false, "error": "..."} on a
+        // fresh empty test daemon (e.g. read_content for a missing node).
+        // Those fixtures OPT INTO this behavior by setting
+        // `response_required_keys: ["ok"]` exactly — the only required key
+        // in the error branch. For fixtures with a richer required-key set
+        // (like list_roots requiring "children"), an unexpected ok=false
+        // is a real failure: the handler should have returned the success
+        // shape and didn't. Don't paper over it.
+        let opt_in_error_branch = required_keys.len() == 1
+            && required_keys
+                .first()
+                .and_then(|k| k.as_str())
+                .map(|s| s == "ok")
+                .unwrap_or(false);
+        let is_error = obj.get("ok").and_then(|v| v.as_bool()) == Some(false);
+
+        if is_error && !opt_in_error_branch {
+            failures.push(format!(
+                "op={op_name}: response is ok=false but fixture requires {required_keys:?} \
+                 (handler should have returned the success shape): {response}"
+            ));
+            continue;
+        }
+
         for key in required_keys {
             let key_str = key
                 .as_str()
                 .unwrap_or_else(|| panic!("fixture {op_name} has non-string required key"));
-
-            // Allow "error" path for ops that return ok=false on empty state.
-            // The error branch sets `ok: false, error: "..."` and elides the
-            // success-only keys. The fixture's `response_required_keys` should
-            // include only the common ones — but we let the error branch off
-            // the hook for keys named in `response_required_keys` beyond "ok".
-            let is_error = obj.get("ok").and_then(|v| v.as_bool()) == Some(false);
-            if is_error && key_str != "ok" {
-                continue;
-            }
 
             if !obj.contains_key(key_str) {
                 failures.push(format!(

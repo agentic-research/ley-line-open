@@ -1,30 +1,36 @@
-// Cross-runtime drift gate for the daemon JSON wire protocol.
+// Daemon protocol drift gate, Go half (bead ley-line-open-b5a77b / A-1).
 //
-// Companion of the Rust gate at
-// rs/ll-open/cli-lib/tests/integration.rs::daemon_protocol_gate_*. The Rust
-// side asserts the daemon's UDS handlers emit responses containing every
-// `response_required_keys` from `rs/ll-open/cli-lib/tests/fixtures/
-// daemon-protocol.json`. This Go side asserts those same responses decode
-// into the typed Go bindings declared by `daemon.capnp` (additively
-// reconciled by bead ley-line-open-b631c8 / A-2).
+// THIS gate (Go side, no daemon round-trip): strict-unmarshals each
+// fixture's `response` payload from `rs/ll-open/cli-lib/tests/fixtures/
+// daemon-protocol.json` into the matching typed Go binding declared by
+// `daemon.capnp`. Pins FIXTURE ↔ SCHEMA agreement.
 //
-// Together the two halves catch handler ↔ schema drift before it ships.
-// Extends T8.10's cross-runtime fixture pattern (bead 6b7d43) from the
-// substrate (capnp segment files; see binding/binding_test.go) to the
-// daemon protocol (JSON wire).
+// The companion Rust gate at
+// rs/ll-open/cli-lib/tests/integration.rs::daemon_protocol_gate_* DOES
+// spawn the daemon and validates HANDLER ↔ FIXTURE agreement at runtime.
+//
+// Composing the two:
+//   handler ↔ fixture (Rust gate) + fixture ↔ schema (this gate)
+//   ⇒ handler ↔ schema (transitively)
+//
+// Either half failing means the chain broke. Together they extend T8.10's
+// cross-runtime fixture pattern (bead 6b7d43) from the substrate (capnp
+// segment files; see binding/binding_test.go) to the daemon protocol
+// (JSON wire).
 //
 // Fixtures with non-null `go_drift_skip` are skipped here with the drift
-// reason as the skip message — the Rust gate still runs for them. The
-// skip count is the diagnostic for A-2 to track schema reconciliation
-// progress: every skip removed is one op brought into alignment.
-//
-// Bead: ley-line-open-b5a77b (A-1, this gate).
+// reason as the skip message — the Rust runtime gate still runs for them.
+// The skip count is the diagnostic for A-2 (bead b631c8) to track schema
+// reconciliation progress: every skip removed is one op whose fixture
+// shape matches the typed Go binding.
 
 package daemon_test
 
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -56,13 +62,15 @@ type fixtureEntry struct {
 
 func loadFixtures(t *testing.T) map[string]fixtureEntry {
 	t.Helper()
-	bytes, err := os.ReadFile(fixturePath())
+	// `data`, not `bytes` — the `bytes` package is imported for
+	// bytes.NewReader and shadowing it makes the file harder to scan.
+	data, err := os.ReadFile(fixturePath())
 	if err != nil {
 		t.Fatalf("read daemon-protocol.json: %v", err)
 	}
 	// Decode permissively so the top-level `_doc` string is ignored.
 	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(bytes, &raw); err != nil {
+	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatalf("parse daemon-protocol.json: %v", err)
 	}
 	out := make(map[string]fixtureEntry, len(raw))
@@ -178,26 +186,47 @@ func decoderFor(name string) func([]byte) error {
 	}
 }
 
-// strictUnmarshal fails on unknown fields. The point of the drift gate is
-// to catch handler emitting fields the schema doesn't declare; without
-// DisallowUnknownFields, json.Unmarshal silently drops them.
+// strictUnmarshal fails on unknown fields AND on trailing non-whitespace.
+// The drift gate's job is to catch any divergence: schema declaring a field
+// the handler doesn't emit, handler emitting a field the schema doesn't
+// declare, OR a fixture accidentally containing multiple JSON values.
+// Without DisallowUnknownFields + the explicit EOF check, json.Decode would
+// silently drop unknown fields and ignore trailing junk.
 func strictUnmarshal(data []byte, v any) error {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
-	return dec.Decode(v)
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	// Refuse to silently accept trailing content. A second Token() call
+	// must return io.EOF; anything else means the fixture contained extra
+	// data the first Decode didn't consume.
+	if _, err := dec.Token(); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("trailing content after first JSON value")
+		}
+		return fmt.Errorf("trailing content: %v", err)
+	}
+	return nil
 }
 
-// TestDaemonProtocolGate_FixturesDecodeIntoTypedBindings is the structural
-// drift-prevention test. For every op fixture whose `go_drift_skip` is
-// null, attempt to decode the fixture's response JSON into the matching
-// hand-written Go binding. Failure means the schema (daemon.capnp) and
-// the handler-emitted JSON disagree on that op's shape — fix the schema
-// (A-2) or the handler (A-3), don't fix the test.
+// TestDaemonProtocolGate_FixturesDecodeIntoTypedBindings pins the
+// FIXTURE ↔ SCHEMA half of the drift chain. For every op fixture whose
+// `go_drift_skip` is null, attempt a strict-decode of the fixture's
+// `response` JSON payload (NOT a live daemon response — this test never
+// talks to the daemon; the Rust gate handles runtime handler validation)
+// into the matching hand-written Go binding that mirrors `daemon.capnp`.
 //
-// Fixtures with non-null `go_drift_skip` are skipped with the reason as
-// the diagnostic message. As bead b631c8 (A-2) reconciles schema fields,
+// A decode failure here means the FIXTURE shape disagrees with the
+// schema-mirroring Go binding. Fix the schema (A-2, bead b631c8) — and
+// the fixture entry's response payload — to reconcile. The Rust gate
+// then catches any HANDLER ↔ FIXTURE drift at runtime, completing the
+// handler ↔ schema chain transitively.
+//
+// Fixtures with non-null `go_drift_skip` are skipped with the drift
+// reason as the diagnostic message. As A-2 reconciles schema fields,
 // each `go_drift_skip` flips to null and the matching op starts running
-// here. The count of skipped ops is the visible progress metric.
+// here. The count of skipped ops is the visible progress metric for A-2.
 func TestDaemonProtocolGate_FixturesDecodeIntoTypedBindings(t *testing.T) {
 	fixtures := loadFixtures(t)
 	if len(fixtures) == 0 {

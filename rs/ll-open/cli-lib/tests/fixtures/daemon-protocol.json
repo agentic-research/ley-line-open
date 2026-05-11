@@ -58,8 +58,8 @@
     "response": {
       "ok": true,
       "children": [
-        {"id": "file1.rs", "parent_id": "", "name": "file1.rs", "kind": 0, "size": 100, "record": ""},
-        {"id": "src", "parent_id": "", "name": "src", "kind": 1, "size": 0, "record": ""}
+        {"id": "file1.rs", "parent_id": "", "name": "file1.rs", "kind": 0, "size": 100},
+        {"id": "src", "parent_id": "", "name": "src", "kind": 1, "size": 0}
       ]
     },
     "response_required_keys": ["ok", "children"],
@@ -78,7 +78,7 @@
         "name": "file1.rs",
         "kind": 0,
         "size": 100,
-        "record": ""
+        "record": "fn main() {}"
       }
     },
     "response_required_keys": ["ok"],

@@ -97,19 +97,30 @@ pub(crate) fn base_op_names() -> Vec<&'static str> {
 /// Forgetting any step is a compile error or test failure, not a silent
 /// drift.
 pub fn handle_base_op(ctx: &std::sync::Arc<DaemonContext>, wire_line: &str) -> Option<String> {
-    // Two-stage decode so we can distinguish "unknown op" (return None —
-    // caller falls through to extension dispatch) from "known op, bad
-    // args" (return Some(error) — wire contract says the client gets a
-    // structured error, not a silent miss). Stage 1: extract the `op`
-    // tag and check it against `base_op_names`. Stage 2: full typed
-    // decode against `BaseRequest`; any failure here is an args error
-    // that surfaces as an `ErrorResponse`.
     let parsed: serde_json::Value = serde_json::from_str(wire_line).ok()?;
-    let op = parsed.get("op").and_then(|v| v.as_str())?;
-    if !is_known_base_op(op) {
+    handle_base_op_value(ctx, parsed)
+}
+
+/// Value-accepting variant of `handle_base_op` for callers that have
+/// already parsed the wire line into a `serde_json::Value` (notably
+/// `socket.rs`, which extracts the `op` tag before this layer runs).
+/// Avoids the `value.to_string()` + `serde_json::from_str` round-trip
+/// flagged by Copilot on PR #8 — `serde_json::from_value` consumes the
+/// already-parsed tree directly.
+///
+/// Two-stage decode so we can distinguish "unknown op" (return None —
+/// caller falls through to extension dispatch) from "known op, bad
+/// args" (return Some(error) — wire contract says the client gets a
+/// structured error, not a silent miss).
+pub fn handle_base_op_value(
+    ctx: &std::sync::Arc<DaemonContext>,
+    parsed: serde_json::Value,
+) -> Option<String> {
+    let op = parsed.get("op").and_then(|v| v.as_str())?.to_string();
+    if !is_known_base_op(&op) {
         return None;
     }
-    let typed_result: std::result::Result<BaseRequest, _> = serde_json::from_str(wire_line);
+    let typed_result: std::result::Result<BaseRequest, _> = serde_json::from_value(parsed);
     Some(match typed_result {
         Ok(typed) => dispatch_typed(ctx, typed),
         Err(e) => to_wire(&ErrorResponse::new(format!("{op}: {e}"))),
@@ -630,19 +641,20 @@ fn op_query(ctx: &DaemonContext, sql: &str, limit: Option<usize>) -> Result<Stri
 
 /// List children of a node (or roots if id="").
 ///
-/// Emits FULL Node entries per child — id, parent_id, name, kind, size,
-/// record — matching the schema's `children: List(Node)` declaration in
-/// `daemon.capnp`. Mache's `ListChildStats` path can still ignore the
-/// `record` field per-call; this just means the wire carries the full
-/// shape so consumers that DO want record (e.g. typed Go bindings via
-/// mache-a5ad09) don't need a separate fetch.
+/// Deliberately omits the `record` column from the per-child Node
+/// payload — `nodes.record` can hold full file contents or large JSON
+/// blobs, and shipping that on every directory listing balloons the
+/// response (raised by Copilot on PR #8). Consumers that want a
+/// specific node's record call `op_get_node` or `op_read_content`.
+/// The wire still emits the typed Node shape; `record` is `Option<String>`
+/// with `skip_serializing_if`, so listings simply drop the key.
 fn op_list_children(ctx: &DaemonContext, id: &str) -> Result<String> {
     let response = with_live_db(ctx, |conn| {
         let mut stmt = conn.prepare_cached(
-            "SELECT id, parent_id, name, kind, size, record \
+            "SELECT id, parent_id, name, kind, size \
              FROM nodes WHERE parent_id = ?1 ORDER BY name",
         )?;
-        let raw: Vec<(String, String, String, i32, i64, Option<String>)> = stmt
+        let raw: Vec<(String, String, String, i32, i64)> = stmt
             .query_map([id], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -650,19 +662,18 @@ fn op_list_children(ctx: &DaemonContext, id: &str) -> Result<String> {
                     row.get::<_, String>(2)?,
                     row.get::<_, i32>(3)?,
                     row.get::<_, i64>(4)?,
-                    row.get::<_, Option<String>>(5)?,
                 ))
             })?
             .collect::<Result<_, _>>()?;
         let children: Vec<WireNode> = raw
             .iter()
-            .map(|(id, parent_id, name, kind, size, record)| WireNode {
+            .map(|(id, parent_id, name, kind, size)| WireNode {
                 id: id.clone(),
                 parent_id: parent_id.clone(),
                 name: name.clone(),
                 kind: *kind,
                 size: *size,
-                record: record.clone().unwrap_or_default(),
+                record: None,
             })
             .collect();
         let touched: Vec<&str> = raw.iter().map(|(id, ..)| id.as_str()).collect();
@@ -920,7 +931,7 @@ fn op_get_node(ctx: &DaemonContext, id: &str) -> Result<String> {
                     name: row.get::<_, String>(2)?,
                     kind: row.get::<_, i32>(3)?,
                     size: row.get::<_, i64>(4)?,
-                    record: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    record: row.get::<_, Option<String>>(5)?,
                 })
             },
         )?;

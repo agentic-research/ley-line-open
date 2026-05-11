@@ -134,7 +134,11 @@ type node struct {
 	Name     *string `json:"name"`
 	Kind     *int32  `json:"kind"`
 	Size     *int64  `json:"size"`
-	Record   *string `json:"record"`
+	// Record is omitted by list_children (directory listings stay small;
+	// see Copilot review on PR #8). get_node / read_content emit it
+	// when the SQL `record` column is non-null. `omitempty` here is
+	// load-bearing for json.Marshal round-trips in this test.
+	Record *string `json:"record,omitempty"`
 }
 
 type ref struct {

@@ -1,10 +1,21 @@
 //! Typed Rust serde mirrors of `rs/ll-core/public-schema/capnp/daemon.capnp`.
 //!
-//! Each struct corresponds 1:1 to a capnp message in the schema. The
-//! schema's camelCase field names are mapped to the snake_case JSON wire
-//! via `#[serde(rename = "...")]` per the JSON-as-carrier doctrine
-//! (cloister `interlace-spec/0.1.0/README.md` lines 92-133): the typed
-//! contract is the schema; the carrier-format naming is a per-side tag.
+//! Each struct models the corresponding capnp message in the schema and
+//! preserves wire-shape parity. Some fields intentionally diverge from
+//! a strict 1:1 type mapping where the JSON carrier needs flexibility
+//! the capnp typed surface can't express:
+//!
+//! - `StatusResponse.enrichment` and `EnrichResponse.passes` are
+//!   `serde_json::Value` rather than typed maps because the per-pass
+//!   key set is open-ended and pass payloads are pass-specific.
+//! - Cap'n Proto integer fields can't be "absent" (they default to 0);
+//!   on the JSON wire we use `Option<i64>` + `skip_serializing_if`
+//!   so clients can distinguish "not yet" from "really 0".
+//!
+//! Schema's camelCase field names map to snake_case JSON wire via
+//! `#[serde(rename = "...")]` per the JSON-as-carrier doctrine (cloister
+//! `interlace-spec/0.1.0/README.md` lines 92-133): the typed contract
+//! is the schema; the carrier-format naming is a per-side tag.
 //!
 //! `ops.rs` handlers build these structs and serialize via
 //! `serde_json::to_string(&typed_response)?` instead of hand-building
@@ -126,6 +137,14 @@ fn default_vec_k() -> u32 {
 /// Full node row. Matches `Node` in daemon.capnp (id, parentId, name,
 /// kind, size, record). Wire emits snake_case; struct field names follow
 /// Rust convention.
+///
+/// `record` is `Option<String>` to preserve the SQL-level distinction
+/// between "no record available" (NULL → `None`) and "empty record"
+/// (`Some(String::new())`). `#[serde(skip_serializing_if = "Option::is_none")]`
+/// means list_children (which deliberately omits record to keep
+/// directory listings small — see Copilot review on PR #8) emits Node
+/// entries without the `record` key, while get_node / read_content emit
+/// the field when the column is populated.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Node {
     pub id: String,
@@ -134,7 +153,8 @@ pub struct Node {
     pub name: String,
     pub kind: i32,
     pub size: i64,
-    pub record: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<String>,
 }
 
 /// A token reference, used by find_callers / find_defs / find_callees.
@@ -345,10 +365,19 @@ impl ErrorResponse {
 // JSON helpers — every op handler uses these instead of `json!({...})`.
 // ---------------------------------------------------------------------------
 
-/// Serialize a typed response into the JSON wire shape. Panics only on
-/// allocator failure (serde_json::to_string is infallible for the types
-/// in this module — all derive Serialize and have no recursive Cycle).
-pub fn to_wire<T: Serialize>(value: &T) -> String {
+/// Serialize a typed response into the JSON wire shape.
+///
+/// Visibility is `pub(crate)` (not `pub`) by design: the `.expect` below
+/// is only safe because every caller passes one of the response structs
+/// defined in this module. `serde_json::to_string` *can* fail in the
+/// general case (e.g. maps with non-string keys, custom Serialize impls
+/// that return errors), so widening this to `pub` would expose a panic
+/// surface to consumers outside our control. Adding a new response
+/// type? Make sure it's a plain `#[derive(Serialize)]` struct (or maps
+/// keyed by `String` — `serde_json::Value` is fine) and `to_wire` stays
+/// infallible. If you need a Result-returning variant, add a sibling
+/// `try_to_wire` rather than relaxing this one.
+pub(crate) fn to_wire<T: Serialize>(value: &T) -> String {
     serde_json::to_string(value).expect("typed wire serialization is infallible")
 }
 

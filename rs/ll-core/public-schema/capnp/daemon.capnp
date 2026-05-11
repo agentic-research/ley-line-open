@@ -83,7 +83,12 @@ struct StatusResponse {
   # by hand today.
   headSha           @7 :Text;
   lastReparseAtMs   @8 :Int64;
-  # -1 sentinel for "not yet" (UInt64 default 0 is ambiguous with epoch).
+  # On the Cap'n Proto side this field is always present (capnp ints
+  # can't be absent and default to 0). On the JSON wire we emit the
+  # field only when populated — `last_reparse_at_ms` is omitted before
+  # the first reparse, so clients distinguish "not yet" from epoch=0
+  # by key presence. Cap'n Proto consumers should treat 0 as "not yet"
+  # until a typed Optional follow-up lands.
   error             @9 :Text;
 }
 

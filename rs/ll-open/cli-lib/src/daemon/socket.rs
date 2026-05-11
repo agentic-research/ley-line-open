@@ -166,21 +166,23 @@ async fn dispatch(
         _ => {}
     }
 
-    // 2. Base ops — serialize the (op, req) pair back into canonical wire
-    // shape so the typed dispatcher can re-parse it. The dispatch chain
-    // splits the line into (op, args), but `handle_base_op` re-fuses them
-    // via serde_json::from_str against the BaseRequest enum, which is the
-    // single source of truth for accepted shapes after A-3 (b69606).
-    let wire = {
-        let mut combined = req.clone();
-        if let serde_json::Value::Object(ref mut m) = combined {
+    // 2. Base ops — re-fuse (op, req) into the canonical envelope shape
+    // expected by the typed `BaseRequest` decoder. The dispatch chain
+    // splits the incoming line into (op, args) for routing; we pass the
+    // already-parsed Value straight to `handle_base_op_value` so serde
+    // can `from_value` it without re-stringifying (a perf concern raised
+    // by Copilot on PR #8). The BaseRequest enum is the single source
+    // of truth for accepted shapes after A-3 (b69606).
+    let combined = {
+        let mut v = req.clone();
+        if let serde_json::Value::Object(ref mut m) = v {
             m.insert("op".into(), json!(op));
         } else {
-            combined = json!({"op": op});
+            v = json!({"op": op});
         }
-        combined.to_string()
+        v
     };
-    if let Some(response) = ops::handle_base_op(ctx, &wire) {
+    if let Some(response) = ops::handle_base_op_value(ctx, combined) {
         // Emit event for state-changing ops.
         if is_state_changing(op) {
             let emitter = conn_state.emitter();

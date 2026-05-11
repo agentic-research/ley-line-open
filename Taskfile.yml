@@ -146,11 +146,16 @@ tasks:
   # docker port-forwarding to reach the listener — the daemon defaults to
   # 127.0.0.1, which is loopback-only inside the container.
   image:
-    desc: Build ley-line-open:0.2.0 OCI image (krust musl binary + docker COPY)
+    desc: Build ley-line-open:0.2.1 OCI image (krust musl binary + docker COPY)
     vars:
       KRUST_REPO: '{{.KRUST_REPO | default "localhost/leyline"}}'
-      VERSION: '0.2.0'
-      PLATFORM: 'linux/arm64'
+      VERSION: '0.2.1'
+      PLATFORM: '{{.PLATFORM | default "linux/arm64"}}'
+      # Derive musl target triple from PLATFORM so cross-arch builds find
+      # the right binary. Image.Dockerfile's BIN_PATH default targets
+      # aarch64; for amd64 we override via --build-arg below.
+      RUST_ARCH:
+        sh: 'case "{{.PLATFORM}}" in linux/arm64) echo aarch64;; linux/amd64) echo x86_64;; *) echo "unsupported PLATFORM: {{.PLATFORM}}" >&2; exit 1;; esac'
     cmds:
       - |
         KRUST_REPO={{.KRUST_REPO}} krust build "$(pwd)/rs/ll-open/cli" \
@@ -158,11 +163,13 @@ tasks:
       - |
         docker build -f image.Dockerfile \
           -t ley-line-open:{{.VERSION}} \
-          --platform {{.PLATFORM}} .
+          --platform {{.PLATFORM}} \
+          --build-arg BIN_PATH=rs/ll-open/cli/target/krust/{{.RUST_ARCH}}-unknown-linux-musl/release/leyline \
+          .
       - |
         echo "Built ley-line-open:{{.VERSION}} ({{.PLATFORM}})."
-        echo "Smoke: docker run --rm -p 18384:8384 ley-line-open:{{.VERSION}} \\"
-        echo "         daemon --mcp-port 8384 --mcp-bind 0.0.0.0"
+        echo "Smoke: docker run --rm -p 18384:8384 ley-line-open:{{.VERSION}}"
+        echo "       (image CMD bakes in --mcp-bind 0.0.0.0 — port -p reaches it)"
         echo "       curl -s -X POST http://localhost:18384/mcp \\"
         echo "         -H 'Content-Type: application/json' \\"
         echo "         -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}'"
@@ -171,16 +178,17 @@ tasks:
     desc: Build image and run end-to-end smoke (start daemon, probe MCP tools/list)
     deps: [image]
     vars:
-      VERSION: '0.2.0'
+      VERSION: '0.2.1'
+      PLATFORM: '{{.PLATFORM | default "linux/arm64"}}'
       HOST_PORT: '18384'
     cmds:
       - docker rm -f llo-smoke 2>/dev/null || true
       - |
+        # Image CMD already includes --mcp-bind 0.0.0.0; no override needed.
         docker run -d --rm --name llo-smoke \
-          --platform linux/arm64 \
+          --platform {{.PLATFORM}} \
           -p {{.HOST_PORT}}:8384 \
-          ley-line-open:{{.VERSION}} \
-          daemon --mcp-port 8384 --mcp-bind 0.0.0.0
+          ley-line-open:{{.VERSION}}
       - |
         until curl -sf -m 1 -X POST http://localhost:{{.HOST_PORT}}/mcp \
             -H 'Content-Type: application/json' -d '{}' >/dev/null 2>&1 \

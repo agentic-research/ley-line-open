@@ -17,10 +17,16 @@ use std::path::Path;
 
 /// (file_basename, expected_fileId_hex_with_0x_prefix). One row per
 /// `schemas/*.capnp`. Update via deliberate edit + ADR review.
+///
+/// `go.capnp` is the vendored capnpc-go annotation file — not one of LLO's
+/// public schemas, but lives in `schemas/` because capnp's `using Go = import
+/// "/go.capnp"` resolution requires it on the include path. Listed so the
+/// allowlist gate catches accidental edits to the vendored copy.
 const SCHEMA_FILEID_ALLOWLIST: &[(&str, &str)] = &[
     ("ast.capnp", "0x9e1e4e1af2b578d9"),
     ("binding.capnp", "0x9c0c8cd3c5b1329a"),
     ("common.capnp", "0xb0c0debaadc0deb0"),
+    ("go.capnp", "0xd12a1c51fedd6c88"),
     ("head.capnp", "0xc7c7ada1403b9f78"),
     ("source.capnp", "0x9bd2953355bd438c"),
 ];

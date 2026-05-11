@@ -136,16 +136,18 @@ Capnp prereq (both): `brew install capnp` / `apt-get install capnproto` (require
 
 ## Building the image
 
-A distroless OCI image (`ley-line-open:0.2.0`, ~20 MB) is built via [`krust`](https://github.com/imjasonh/krust) (cargo-zigbuild → static musl binary) + a one-line `docker build` that COPYs the binary onto `cgr.dev/chainguard/static`. See `image.Dockerfile` and `Taskfile.yml`. The image runs `leyline daemon --mcp-port 8384 --mcp-bind 0.0.0.0` headless — no FUSE/NFS, just the MCP HTTP transport on `:8384` inside the container (consumed by cloister via `LLO_MCP_URL`, default `http://localhost:8384/mcp`).
+A distroless OCI image (`ley-line-open:0.2.1`, ~20 MB) is built via [`krust`](https://github.com/imjasonh/krust) (cargo-zigbuild → static musl binary) + a one-line `docker build` that COPYs the binary onto `cgr.dev/chainguard/static`. See `image.Dockerfile` and `Taskfile.yml`. The image's default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0` headless — no FUSE/NFS, just the MCP HTTP transport on `:8384` inside the container (consumed by cloister via `LLO_MCP_URL`, default `http://localhost:8384/mcp`).
 
 ```bash
 brew install zig                   # cargo-zigbuild backend
 cargo install cargo-zigbuild krust # one-time
-task image                         # → ley-line-open:0.2.0 in local docker
+task image                         # → ley-line-open:0.2.1 in local docker
 task image:smoke                   # build + start daemon + curl tools/list
 ```
 
-The `--mcp-bind 0.0.0.0` flag is required for docker port-forwarding to reach the listener — the daemon defaults to `127.0.0.1` (loopback-only inside the container, unreachable from the host).
+`--mcp-bind 0.0.0.0` is baked into the image's default CMD because docker port-forwarding can't reach a 127.0.0.1 (loopback-only) listener inside the container. The daemon binary still defaults to `127.0.0.1` for non-container use; only the image overrides.
+
+Cross-arch: `task image PLATFORM=linux/amd64` builds an amd64 image instead. The Taskfile derives the matching musl target triple and passes it to docker via `--build-arg BIN_PATH=…`.
 
 `apko.yaml` / `melange.yaml` are retained for reference but were abandoned on Apple Silicon — Docker Desktop's virtiofs makes melange's workspace bind-mount stall, and apko's multi-arch list fails when only the host arch APK exists. See `ley-line-open-2b255c` for the post-mortem.
 

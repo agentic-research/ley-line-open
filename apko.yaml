@@ -52,11 +52,19 @@ paths:
 entrypoint:
   command: /usr/bin/leyline
 
-# `daemon --mcp-port 8384` — the MCP HTTP transport listens on
-# 127.0.0.1:8384 inside the container; docker `-p 8384:8384` forwards
-# to that loopback. Cloister's LLO_MCP_URL default points at
+# `daemon --mcp-port 8384 --mcp-bind 0.0.0.0` — the MCP HTTP transport
+# must bind 0.0.0.0 inside the container so docker `-p 8384:8384` can
+# reach it. The daemon defaults to 127.0.0.1 (loopback-only inside the
+# container, unreachable from the host); --mcp-bind 0.0.0.0 is the
+# container override. Cloister's LLO_MCP_URL default points at
 # `http://localhost:8384/mcp`.
-cmd: daemon --mcp-port 8384
+#
+# NOTE: this apko config is RETAINED FOR REFERENCE only; the active
+# build path is krust + image.Dockerfile (see Taskfile.yml). Apko was
+# abandoned on Apple Silicon — Docker Desktop's virtiofs makes melange's
+# workspace bind-mount stall, and apko's multi-arch list fails when only
+# the host arch APK exists. See ley-line-open-2b255c.
+cmd: daemon --mcp-port 8384 --mcp-bind 0.0.0.0
 
 archs:
   - x86_64

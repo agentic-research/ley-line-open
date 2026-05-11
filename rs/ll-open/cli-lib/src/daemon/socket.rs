@@ -166,8 +166,23 @@ async fn dispatch(
         _ => {}
     }
 
-    // 2. Base ops
-    if let Some(response) = ops::handle_base_op(ctx, op, req) {
+    // 2. Base ops — re-fuse (op, req) into the canonical envelope shape
+    // expected by the typed `BaseRequest` decoder. The dispatch chain
+    // splits the incoming line into (op, args) for routing; we pass the
+    // already-parsed Value straight to `handle_base_op_value` so serde
+    // can `from_value` it without re-stringifying (a perf concern raised
+    // by Copilot on PR #8). The BaseRequest enum is the single source
+    // of truth for accepted shapes after A-3 (b69606).
+    let combined = {
+        let mut v = req.clone();
+        if let serde_json::Value::Object(ref mut m) = v {
+            m.insert("op".into(), json!(op));
+        } else {
+            v = json!({"op": op});
+        }
+        v
+    };
+    if let Some(response) = ops::handle_base_op_value(ctx, combined) {
         // Emit event for state-changing ops.
         if is_state_changing(op) {
             let emitter = conn_state.emitter();

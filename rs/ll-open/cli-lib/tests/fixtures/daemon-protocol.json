@@ -14,7 +14,7 @@
     "response_required_keys": ["ok", "phase", "current_root", "arena_path", "arena_size", "enrichment"],
     "response_optional_keys": ["head_sha", "last_reparse_at_ms", "error"],
     "go_binding": "StatusResponse",
-    "go_drift_skip": "b631c8: StatusResponse schema declares {ok, generation, arenaPath, arenaSize} but handler emits {ok, phase, current_root, arena_path, arena_size, enrichment, head_sha?, last_reparse_at_ms?, error?}. A-2 adds missing fields additively."
+    "go_drift_skip": null
   },
 
   "flush": {
@@ -25,8 +25,8 @@
     },
     "response_required_keys": ["ok", "current_root"],
     "response_optional_keys": [],
-    "go_binding": null,
-    "go_drift_skip": "b631c8: no FlushResponse declared in daemon.capnp. A-2 adds it (returns {ok, currentRoot})."
+    "go_binding": "FlushResponse",
+    "go_drift_skip": null
   },
 
   "snapshot": {
@@ -38,7 +38,7 @@
     "response_required_keys": ["ok", "current_root"],
     "response_optional_keys": [],
     "go_binding": "SnapshotResponse",
-    "go_drift_skip": "b631c8: SnapshotResponse declares {ok, generation} but handler emits {ok, current_root}. A-2 reconciles."
+    "go_drift_skip": null
   },
 
   "list_roots": {
@@ -50,7 +50,7 @@
     "response_required_keys": ["ok", "children"],
     "response_optional_keys": [],
     "go_binding": "ListChildrenResponse",
-    "go_drift_skip": "b631c8: ListChildrenResponse declares children:List(Node) with full Node fields (id, parentId, name, kind, size, record); handler emits per-child {id, name, kind, size} only. A-2 either expands handler to emit full Node OR introduces a NodeStat lite type."
+    "go_drift_skip": null
   },
 
   "list_children": {
@@ -58,14 +58,14 @@
     "response": {
       "ok": true,
       "children": [
-        {"id": "file1.rs", "name": "file1.rs", "kind": 0, "size": 100},
-        {"id": "src", "name": "src", "kind": 1, "size": 0}
+        {"id": "file1.rs", "parent_id": "", "name": "file1.rs", "kind": 0, "size": 100},
+        {"id": "src", "parent_id": "", "name": "src", "kind": 1, "size": 0}
       ]
     },
     "response_required_keys": ["ok", "children"],
     "response_optional_keys": [],
     "go_binding": "ListChildrenResponse",
-    "go_drift_skip": "b631c8: same drift as list_roots — child entries are stat-shaped, not full Node."
+    "go_drift_skip": null
   },
 
   "get_node": {
@@ -78,13 +78,13 @@
         "name": "file1.rs",
         "kind": 0,
         "size": 100,
-        "record": ""
+        "record": "fn main() {}"
       }
     },
     "response_required_keys": ["ok"],
     "response_optional_keys": ["node", "error"],
     "go_binding": "GetNodeResponse",
-    "go_drift_skip": "b631c8: GetNodeResponse.node declares camelCase Node (id, parentId, name, kind, size, record); handler emits snake_case (parent_id). A-2 picks: add JSON tags on Go side OR rename schema fields."
+    "go_drift_skip": null
   },
 
   "read_content": {
@@ -110,7 +110,7 @@
     "response_required_keys": ["ok", "callers"],
     "response_optional_keys": [],
     "go_binding": "FindCallersResponse",
-    "go_drift_skip": "b631c8: FindCallersResponse.callers declares List(Ref) with camelCase (nodeId, sourceId); handler emits snake_case (node_id, source_id). A-2 adds JSON tags or renames schema fields."
+    "go_drift_skip": null
   },
 
   "find_defs": {
@@ -124,7 +124,7 @@
     "response_required_keys": ["ok", "defs"],
     "response_optional_keys": [],
     "go_binding": "FindDefsResponse",
-    "go_drift_skip": "b631c8: same snake_case vs camelCase drift as find_callers."
+    "go_drift_skip": null
   },
 
   "find_callees": {
@@ -138,7 +138,7 @@
     "response_required_keys": ["ok", "callees"],
     "response_optional_keys": [],
     "go_binding": "FindCalleesResponse",
-    "go_drift_skip": "b631c8: same snake_case vs camelCase drift as find_callers (node_id/source_id vs nodeId/sourceId). A-2 reconciles."
+    "go_drift_skip": null
   },
 
   "get_refs_map": {
@@ -153,7 +153,7 @@
     "response_required_keys": ["ok", "entries"],
     "response_optional_keys": [],
     "go_binding": "GetRefsMapResponse",
-    "go_drift_skip": "b631c8: schema declares TokenMapEntry.nodeIds (camelCase) but handler emits node_ids (snake_case). A-2 reconciles alongside find_callers/find_defs."
+    "go_drift_skip": null
   },
 
   "get_defs_map": {
@@ -167,7 +167,7 @@
     "response_required_keys": ["ok", "entries"],
     "response_optional_keys": [],
     "go_binding": "GetDefsMapResponse",
-    "go_drift_skip": "b631c8: same node_ids snake_case drift as get_refs_map."
+    "go_drift_skip": null
   },
 
   "get_schema": {
@@ -199,7 +199,7 @@
     "response_required_keys": ["ok", "db_path", "ctrl_path", "bindings_path", "ast_path", "source_path", "head_path"],
     "response_optional_keys": [],
     "go_binding": "GetDbPathResponse",
-    "go_drift_skip": "b631c8: handler emits snake_case (db_path, ctrl_path, etc) vs schema camelCase (dbPath, ctrlPath). A-2 reconciles alongside other snake/camel drifts."
+    "go_drift_skip": null
   },
 
   "query": {
@@ -214,6 +214,6 @@
     "response_required_keys": ["ok", "columns", "rows"],
     "response_optional_keys": ["truncated", "limit"],
     "go_binding": "QueryResponse",
-    "go_drift_skip": "b631c8: QueryResponse declares rows:List(QueryRow) where QueryRow has values:List(Text) (positional). Handler emits rows as column-keyed objects. Structural mismatch; A-2 decides whether to ratify column-keyed shape (more JSON-idiomatic) or refactor handler."
+    "go_drift_skip": "Structural: schema declares rows:List(QueryRow) with positional values:List(Text); handler emits column-keyed maps. Can't be reconciled additively without changing the wire shape (would break debug consumers of `op_query`). Tracked as follow-up; this is the only op that genuinely needs a design call rather than a schema bump."
   }
 }

@@ -438,7 +438,11 @@ fn handle_tools_call(
         map.insert("op".into(), Value::String(name.to_string()));
     }
 
-    let Some(response) = super::ops::handle_base_op(ctx, name, &req) else {
+    // Serialize the combined `{"op": <name>, ...args}` shape to a wire
+    // line and dispatch via the typed entry point — same code path as
+    // the UDS socket.
+    let wire = req.to_string();
+    let Some(response) = super::ops::handle_base_op(ctx, &wire) else {
         return JsonRpcResponse::err(Some(id), -32601, format!("unknown tool: {name}"));
     };
 

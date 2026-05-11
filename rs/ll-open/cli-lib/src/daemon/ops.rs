@@ -10,7 +10,13 @@ use leyline_core::Controller;
 use rusqlite::Connection;
 use serde_json::json;
 
-use super::events::json_string_array_opt;
+use super::wire::{
+    BaseRequest, EnrichResponse, ErrorResponse, FindCalleesResponse, FindCallersResponse,
+    FindDefsResponse, FlushResponse, GetDbPathResponse, GetDefsMapResponse, GetNodeResponse,
+    GetRefsMapResponse, GetSchemaResponse, ListChildrenResponse, LoadResponse, LspFile,
+    LspPosition, Node as WireNode, ReadContentResponse, Ref as WireRef, ReparseResponse,
+    SchemaTier, SnapshotResponse, StatusResponse, TokenMapEntry, to_wire,
+};
 use super::{DaemonContext, DaemonPhase};
 
 // ---------------------------------------------------------------------------
@@ -76,46 +82,139 @@ pub(crate) fn base_op_names() -> Vec<&'static str> {
     v
 }
 
-/// Dispatch a base op. Returns `Some(json_string)` if handled, `None` if unrecognized.
-pub fn handle_base_op(
+/// Try to parse the incoming wire line as a typed `BaseRequest` and
+/// dispatch. Returns `Some(response)` if the op was recognized AND its
+/// args deserialized cleanly; `None` if the wire shape doesn't match any
+/// known variant (caller falls through to event / extension dispatch).
+///
+/// This is the load-bearing entry that `socket.rs` calls. Adding a new
+/// op is a 3-step process the compiler enforces:
+///   1. Add a `BaseRequest::Foo` variant in `wire.rs` (with typed args).
+///   2. Add a `BaseRequest::Foo { ... } => Some(op_foo(...))` arm in the
+///      `dispatch_typed` match below — compiler errors until you do.
+///   3. Add `"foo"` to `base_op_names()`.
+///
+/// Forgetting any step is a compile error or test failure, not a silent
+/// drift.
+pub fn handle_base_op(ctx: &std::sync::Arc<DaemonContext>, wire_line: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(wire_line).ok()?;
+    handle_base_op_value(ctx, parsed)
+}
+
+/// Value-accepting variant of `handle_base_op` for callers that have
+/// already parsed the wire line into a `serde_json::Value` (notably
+/// `socket.rs`, which extracts the `op` tag before this layer runs).
+/// Avoids the `value.to_string()` + `serde_json::from_str` round-trip
+/// flagged by Copilot on PR #8 — `serde_json::from_value` consumes the
+/// already-parsed tree directly.
+///
+/// Two-stage decode so we can distinguish "unknown op" (return None —
+/// caller falls through to extension dispatch) from "known op, bad
+/// args" (return Some(error) — wire contract says the client gets a
+/// structured error, not a silent miss).
+pub fn handle_base_op_value(
+    ctx: &std::sync::Arc<DaemonContext>,
+    parsed: serde_json::Value,
+) -> Option<String> {
+    let op = parsed.get("op").and_then(|v| v.as_str())?.to_string();
+    if !is_known_base_op(&op) {
+        return None;
+    }
+    let typed_result: std::result::Result<BaseRequest, _> = serde_json::from_value(parsed);
+    Some(match typed_result {
+        Ok(typed) => dispatch_typed(ctx, typed),
+        Err(e) => to_wire(&ErrorResponse::new(format!("{op}: {e}"))),
+    })
+}
+
+/// Whether `op` is one of the canonical base ops the daemon dispatches.
+/// Kept inline here (not delegating to `base_op_names()`, which is
+/// `#[cfg(test)]`) so the production dispatcher doesn't depend on test
+/// scaffolding.
+fn is_known_base_op(op: &str) -> bool {
+    matches!(
+        op,
+        "status"
+            | "flush"
+            | "load"
+            | "query"
+            | "reparse"
+            | "snapshot"
+            | "enrich"
+            | "list_roots"
+            | "list_children"
+            | "read_content"
+            | "find_callers"
+            | "find_callees"
+            | "find_defs"
+            | "get_node"
+            | "get_refs_map"
+            | "get_defs_map"
+            | "get_schema"
+            | "get_db_path"
+            | "lsp_hover"
+            | "lsp_defs"
+            | "lsp_refs"
+            | "lsp_symbols"
+            | "lsp_diagnostics"
+    ) || cfg!(feature = "vec") && op == "vec_search"
+}
+
+fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> String {
+    let result: Result<String> = match req {
+        BaseRequest::Status => op_status(ctx),
+        BaseRequest::Flush => op_flush(&ctx.ctrl_path),
+        BaseRequest::Load { db } => op_load(&ctx.ctrl_path, &db),
+        BaseRequest::Query { sql, limit } => op_query(ctx, &sql, limit),
+        BaseRequest::Reparse {
+            source,
+            lang,
+            files,
+        } => op_reparse(ctx, source.as_deref(), lang.as_deref(), files.as_deref()),
+        BaseRequest::Snapshot => op_snapshot(ctx),
+        BaseRequest::Enrich { pass, files } => op_enrich(ctx, &pass, files.as_deref()),
+        BaseRequest::ListRoots => op_list_children(ctx, ""),
+        BaseRequest::ListChildren { id } => op_list_children(ctx, id.as_deref().unwrap_or("")),
+        BaseRequest::ReadContent { id } => op_read_content(ctx, &id),
+        BaseRequest::FindCallers { token } => op_find_callers(ctx, &token),
+        BaseRequest::FindCallees { id } => op_find_callees(ctx, &id),
+        BaseRequest::FindDefs { token } => op_find_defs(ctx, &token),
+        BaseRequest::GetNode { id } => op_get_node(ctx, &id),
+        BaseRequest::GetRefsMap => op_get_token_map(ctx, "node_refs", TokenMapOp::Refs),
+        BaseRequest::GetDefsMap => op_get_token_map(ctx, "node_defs", TokenMapOp::Defs),
+        BaseRequest::GetSchema => op_get_schema(),
+        BaseRequest::GetDbPath => op_get_db_path(&ctx.ctrl_path),
+        BaseRequest::LspHover(p) => op_lsp_hover(ctx, &p),
+        BaseRequest::LspDefs(p) => op_lsp_defs(ctx, &p),
+        BaseRequest::LspRefs(p) => op_lsp_refs(ctx, &p),
+        BaseRequest::LspSymbols(f) => op_lsp_symbols(ctx, &f),
+        BaseRequest::LspDiagnostics(f) => op_lsp_diagnostics(ctx, &f),
+        #[cfg(feature = "vec")]
+        BaseRequest::VecSearch { query, k } => op_vec_search(ctx, &query, k),
+    };
+    result.unwrap_or_else(|e| to_wire(&ErrorResponse::new(format!("{e:#}"))))
+}
+
+/// Legacy compat wrapper for tests that constructed (op, args:Value) pairs
+/// directly. Combines them into the canonical wire shape `{"op": ..., ...args}`
+/// and dispatches via `handle_base_op`. New code paths (and `socket.rs`)
+/// should call `handle_base_op` with the raw wire line directly.
+#[cfg(test)]
+fn handle_base_op_legacy(
     ctx: &std::sync::Arc<DaemonContext>,
     op: &str,
     req: &serde_json::Value,
 ) -> Option<String> {
-    let result = match op {
-        "status" => Some(op_status(ctx)),
-        "flush" => Some(op_flush(&ctx.ctrl_path)),
-        "load" => Some(op_load(&ctx.ctrl_path, req)),
-        "query" => Some(op_query(ctx, req)),
-        "reparse" => Some(op_reparse(ctx, req)),
-        "snapshot" => Some(op_snapshot(ctx)),
-        "enrich" => Some(op_enrich(ctx, req)),
-        // Structured query ops — direct from living db.
-        "list_roots" => Some(op_list_children(ctx, &json!({"id": ""}))),
-        "list_children" => Some(op_list_children(ctx, req)),
-        "read_content" => Some(op_read_content(ctx, req)),
-        "find_callers" => Some(op_find_callers(ctx, req)),
-        "find_callees" => Some(op_find_callees(ctx, req)),
-        "find_defs" => Some(op_find_defs(ctx, req)),
-        "get_refs_map" => Some(op_get_token_map(ctx, "node_refs", "entries")),
-        "get_defs_map" => Some(op_get_token_map(ctx, "node_defs", "entries")),
-        "get_schema" => Some(op_get_schema()),
-        "get_db_path" => Some(op_get_db_path(&ctx.ctrl_path)),
-        "get_node" => Some(op_get_node(ctx, req)),
-        // Position-based LSP queries — translate (file, line, col) to node lookups.
-        "lsp_hover" => Some(op_lsp_hover(ctx, req)),
-        "lsp_defs" => Some(op_lsp_defs(ctx, req)),
-        "lsp_refs" => Some(op_lsp_refs(ctx, req)),
-        "lsp_symbols" => Some(op_lsp_symbols(ctx, req)),
-        "lsp_diagnostics" => Some(op_lsp_diagnostics(ctx, req)),
-        #[cfg(feature = "vec")]
-        "vec_search" => Some(op_vec_search(ctx, req)),
-        _ => None,
-    };
-    result.map(|r| match r {
-        Ok(v) => v,
-        Err(e) => json!({"ok": false, "error": format!("{e:#}")}).to_string(),
-    })
+    let mut combined = req.clone();
+    if let serde_json::Value::Object(ref mut m) = combined {
+        m.insert("op".into(), json!(op));
+    } else {
+        // Non-object request (e.g. null) — wrap into a synthetic object so
+        // the typed parse sees a valid envelope.
+        combined = json!({"op": op});
+    }
+    let wire = combined.to_string();
+    handle_base_op(ctx, &wire)
 }
 
 // ---------------------------------------------------------------------------
@@ -132,28 +231,6 @@ pub fn handle_base_op(
 /// Convention: node ids look like `"<file>/<ast-path>"`, so the LIKE prefix
 /// scopes a query to all nodes in a single file.
 const NODE_ID_FOR_FILE: &str = "node_id LIKE ?1 || '%'";
-
-/// Query a `(token) → (node_id, source_id)` table, used by find_callers
-/// (node_refs) and find_defs (node_defs). The two ops differ only in
-/// table name + the JSON output key, so this helper handles the SQL +
-/// row decoding once.
-fn query_token_in_table(
-    conn: &Connection,
-    token: &str,
-    table: &str,
-) -> Result<Vec<serde_json::Value>> {
-    let sql = format!("SELECT node_id, source_id FROM {table} WHERE token = ?1");
-    let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt
-        .query_map([token], |row| {
-            Ok(json!({
-                "node_id":   row.get::<_, String>(0)?,
-                "source_id": row.get::<_, String>(1)?,
-            }))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows)
-}
 
 /// Helper for `_lsp_defs` / `_lsp_refs` queries. Both share the
 /// `(uri, start_line, start_col, end_line, end_col)` shape with a
@@ -310,54 +387,52 @@ fn op_status(ctx: &DaemonContext) -> Result<String> {
         }
         s
     };
-    let mut out = json!({
-        "ok": true,
-        "phase": state.phase.as_str(),
-        "current_root": current_root_hex,
-        "arena_path": ctrl.arena_path(),
-        "arena_size": ctrl.arena_size(),
-        "enrichment": enrichment,
-    });
-    if let serde_json::Value::Object(ref mut map) = out {
-        if let Some(sha) = &state.head_sha {
-            map.insert("head_sha".into(), json!(sha));
-        }
-        if let Some(ts) = state.last_reparse_at_ms {
-            map.insert("last_reparse_at_ms".into(), json!(ts));
-        }
-        if let DaemonPhase::Error(msg) = &state.phase {
-            map.insert("error".into(), json!(msg));
-        }
-    }
-    Ok(out.to_string())
+    Ok(to_wire(&StatusResponse {
+        ok: true,
+        phase: state.phase.as_str().to_string(),
+        current_root: current_root_hex,
+        arena_path: ctrl.arena_path().to_string(),
+        arena_size: ctrl.arena_size(),
+        enrichment: serde_json::Value::Object(enrichment),
+        head_sha: state.head_sha.clone(),
+        last_reparse_at_ms: state.last_reparse_at_ms,
+        error: if let DaemonPhase::Error(msg) = &state.phase {
+            Some(msg.clone())
+        } else {
+            None
+        },
+    }))
 }
 
 fn op_flush(ctrl_path: &Path) -> Result<String> {
-    Ok(json!({
-        "ok": true,
-        "current_root": read_root_hex(ctrl_path)?,
-    })
-    .to_string())
+    Ok(to_wire(&FlushResponse {
+        ok: true,
+        current_root: read_root_hex(ctrl_path)?,
+    }))
 }
 
-fn op_load(ctrl_path: &Path, req: &serde_json::Value) -> Result<String> {
+fn op_load(ctrl_path: &Path, db_b64: &str) -> Result<String> {
     use base64::Engine;
-    let b64 = req
-        .get("db")
-        .and_then(|v| v.as_str())
-        .context("missing \"db\" field (base64-encoded .db)")?;
     let db_bytes = base64::engine::general_purpose::STANDARD
-        .decode(b64)
+        .decode(db_b64)
         .context("invalid base64 in \"db\" field")?;
     crate::cmd_load::load_into_arena(ctrl_path, &db_bytes)?;
-    Ok(json!({"ok": true, "current_root": read_root_hex(ctrl_path)?}).to_string())
+    Ok(to_wire(&LoadResponse {
+        ok: true,
+        current_root: read_root_hex(ctrl_path)?,
+    }))
 }
 
 // ---------------------------------------------------------------------------
 // Reparse + snapshot ops
 // ---------------------------------------------------------------------------
 
-fn op_reparse(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
+fn op_reparse(
+    ctx: &DaemonContext,
+    source: Option<&str>,
+    lang: Option<&str>,
+    files: Option<&[String]>,
+) -> Result<String> {
     // Inputs:
     //   `source` — directory or single file. If omitted, falls back to ctx.source_dir.
     //   `files`  — optional explicit scope (relative paths under source). When set,
@@ -368,19 +443,18 @@ fn op_reparse(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
     // `{source: "<file>"}`. We accept that and auto-rewrite to
     // `(parent, scope=[basename])` so existing hook callers don't need to
     // know about the directory invariant.
-    let source_arg = req
-        .get("source")
-        .and_then(|v| v.as_str())
-        .or_else(|| ctx.source_dir.as_ref().map(|p| p.to_str().unwrap_or("")))
-        .context("missing \"source\" field and no --source configured")?
-        .to_string();
-    let lang = req
-        .get("lang")
-        .and_then(|v| v.as_str())
-        .or(ctx.lang_filter.as_deref());
+    let source_arg = source
+        .map(|s| s.to_string())
+        .or_else(|| {
+            ctx.source_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+        })
+        .context("missing \"source\" field and no --source configured")?;
+    let lang = lang.or(ctx.lang_filter.as_deref());
 
     // Explicit `files: [...]` always takes precedence as the scope.
-    let mut explicit_files: Option<Vec<String>> = json_string_array_opt(req, "files");
+    let mut explicit_files: Option<Vec<String>> = files.map(|s| s.to_vec());
 
     // If the caller passed a single-file `source`, reinterpret as parent +
     // scope so we satisfy parse_into_conn's directory invariant. This lets
@@ -456,21 +530,19 @@ fn op_reparse(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
         s.last_reparse_at_ms = Some(super::now_ms());
     }
 
-    Ok(json!({
-        "ok": true,
-        "current_root": read_root_hex(&ctx.ctrl_path)?,
-        "parsed": result.parsed,
-        "unchanged": result.unchanged,
-        "deleted": result.deleted,
-        "errors": result.errors,
-        "changed_files": result.changed_files,
-    })
-    .to_string())
+    Ok(to_wire(&ReparseResponse {
+        ok: true,
+        current_root: read_root_hex(&ctx.ctrl_path)?,
+        parsed: result.parsed as u64,
+        unchanged: result.unchanged as u64,
+        deleted: result.deleted as u64,
+        errors: result.errors as u64,
+        changed_files: result.changed_files.clone(),
+    }))
 }
 
-fn op_enrich(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
-    let pass_name = required_str_field(req, "pass")?;
-    let files: Option<Vec<String>> = json_string_array_opt(req, "files");
+fn op_enrich(ctx: &DaemonContext, pass_name: &str, files: Option<&[String]>) -> Result<String> {
+    let files: Option<Vec<String>> = files.map(|s| s.to_vec());
 
     let source_dir = ctx
         .source_dir
@@ -493,17 +565,19 @@ fn op_enrich(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
     // Snapshot to arena after enrichment.
     snapshot_living_db(ctx)?;
 
-    Ok(json!({
-        "ok": true,
-        "current_root": read_root_hex(&ctx.ctrl_path)?,
-        "passes": stats,
-    })
-    .to_string())
+    Ok(to_wire(&EnrichResponse {
+        ok: true,
+        current_root: read_root_hex(&ctx.ctrl_path)?,
+        passes: serde_json::to_value(&stats)?,
+    }))
 }
 
 fn op_snapshot(ctx: &DaemonContext) -> Result<String> {
     snapshot_living_db(ctx)?;
-    Ok(json!({"ok": true, "current_root": read_root_hex(&ctx.ctrl_path)?}).to_string())
+    Ok(to_wire(&SnapshotResponse {
+        ok: true,
+        current_root: read_root_hex(&ctx.ctrl_path)?,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -524,13 +598,8 @@ pub(crate) const OP_QUERY_DEFAULT_ROW_LIMIT: usize = 1000;
 /// not provided). Sets `truncated: true` in the response when the cap is
 /// hit, so callers can paginate via `LIMIT/OFFSET` in the SQL itself if
 /// they need everything.
-fn op_query(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
-    let sql = required_str_field(req, "sql")?;
-    let limit = req
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or(OP_QUERY_DEFAULT_ROW_LIMIT);
+fn op_query(ctx: &DaemonContext, sql: &str, limit: Option<usize>) -> Result<String> {
+    let limit = limit.unwrap_or(OP_QUERY_DEFAULT_ROW_LIMIT);
 
     with_live_db(ctx, |conn| {
         let mut stmt = conn.prepare(sql).context("prepare SQL")?;
@@ -571,32 +640,45 @@ fn op_query(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
 }
 
 /// List children of a node (or roots if id="").
-fn op_list_children(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
-    let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("");
-
+///
+/// Deliberately omits the `record` column from the per-child Node
+/// payload — `nodes.record` can hold full file contents or large JSON
+/// blobs, and shipping that on every directory listing balloons the
+/// response (raised by Copilot on PR #8). Consumers that want a
+/// specific node's record call `op_get_node` or `op_read_content`.
+/// The wire still emits the typed Node shape; `record` is `Option<String>`
+/// with `skip_serializing_if`, so listings simply drop the key.
+fn op_list_children(ctx: &DaemonContext, id: &str) -> Result<String> {
     let response = with_live_db(ctx, |conn| {
         let mut stmt = conn.prepare_cached(
-            "SELECT id, name, kind, size FROM nodes WHERE parent_id = ?1 ORDER BY name",
+            "SELECT id, parent_id, name, kind, size \
+             FROM nodes WHERE parent_id = ?1 ORDER BY name",
         )?;
-        let raw: Vec<(String, String, i32, i64)> = stmt
+        let raw: Vec<(String, String, String, i32, i64)> = stmt
             .query_map([id], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, i32>(2)?,
-                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i32>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             })?
             .collect::<Result<_, _>>()?;
-        let rows: Vec<serde_json::Value> = raw
+        let children: Vec<WireNode> = raw
             .iter()
-            .map(|(id, name, kind, size)| {
-                json!({"id": id, "name": name, "kind": kind, "size": size})
+            .map(|(id, parent_id, name, kind, size)| WireNode {
+                id: id.clone(),
+                parent_id: parent_id.clone(),
+                name: name.clone(),
+                kind: *kind,
+                size: *size,
+                record: None,
             })
             .collect();
         let touched: Vec<&str> = raw.iter().map(|(id, ..)| id.as_str()).collect();
         Ok((
-            json!({"ok": true, "children": rows}).to_string(),
+            to_wire(&ListChildrenResponse { ok: true, children }),
             touched.into_iter().map(String::from).collect::<Vec<_>>(),
         ))
     })?;
@@ -609,43 +691,51 @@ fn op_list_children(ctx: &DaemonContext, req: &serde_json::Value) -> Result<Stri
 /// `node_not_found_response` for both "no such node" and "node exists but
 /// record is NULL" — the helper handles that distinction so all node-by-
 /// id lookups share a single semantics.
-fn op_read_content(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
-    let id = required_str_field(req, "id")?;
+fn op_read_content(ctx: &DaemonContext, id: &str) -> Result<String> {
     promote_touched(ctx, &[id]);
 
     with_live_db(ctx, |conn| match query_node_record(conn, id)? {
-        Some(c) => Ok(json!({"ok": true, "content": c}).to_string()),
+        Some(c) => Ok(to_wire(&ReadContentResponse {
+            ok: true,
+            content: Some(c),
+            error: None,
+        })),
         None => Ok(node_not_found_response(id)),
     })
 }
 
 /// Find callers of a token (queries node_refs).
-fn op_find_callers(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
-    op_find_token(ctx, req, "node_refs", "callers")
+fn op_find_callers(ctx: &DaemonContext, token: &str) -> Result<String> {
+    with_live_db(ctx, |conn| {
+        let callers = query_token_refs(conn, token, "node_refs")?;
+        Ok(to_wire(&FindCallersResponse { ok: true, callers }))
+    })
 }
 
 /// Find definitions of a token (queries node_defs).
-fn op_find_defs(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
-    op_find_token(ctx, req, "node_defs", "defs")
+fn op_find_defs(ctx: &DaemonContext, token: &str) -> Result<String> {
+    with_live_db(ctx, |conn| {
+        let defs = query_token_refs(conn, token, "node_defs")?;
+        Ok(to_wire(&FindDefsResponse { ok: true, defs }))
+    })
 }
 
-/// Shared body for `find_callers` and `find_defs`. Both ops differ only
-/// in which `(token → node_id)` table they consult and the JSON key
-/// under which results are returned.
-fn op_find_token(
-    ctx: &DaemonContext,
-    req: &serde_json::Value,
-    table: &str,
-    json_key: &str,
-) -> Result<String> {
-    let token = required_str_field(req, "token")?;
-    with_live_db(ctx, |conn| {
-        let rows = query_token_in_table(conn, token, table)?;
-        let mut obj = serde_json::Map::new();
-        obj.insert("ok".to_string(), json!(true));
-        obj.insert(json_key.to_string(), json!(rows));
-        Ok(serde_json::Value::Object(obj).to_string())
-    })
+/// Shared row-fetch helper for `find_callers` / `find_defs`. Returns
+/// typed `WireRef` rows so each caller can wrap them in its op-specific
+/// typed response. Same SQL shape as the legacy `query_token_in_table`
+/// helper, just returns `Vec<WireRef>` directly.
+fn query_token_refs(conn: &Connection, token: &str, table: &str) -> Result<Vec<WireRef>> {
+    let sql = format!("SELECT node_id, source_id FROM {table} WHERE token = ?1");
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt
+        .query_map([token], |row| {
+            Ok(WireRef {
+                node_id: row.get::<_, String>(0)?,
+                source_id: row.get::<_, String>(1)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// Find callees of a node — the definitions of every token the node references.
@@ -659,8 +749,7 @@ fn op_find_token(
 /// existing `GetCallers(token)` JSON parsing.
 ///
 /// Read-only — does NOT belong in STATE_CHANGING_OPS.
-fn op_find_callees(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
-    let id = required_str_field(req, "id")?;
+fn op_find_callees(ctx: &DaemonContext, id: &str) -> Result<String> {
     with_live_db(ctx, |conn| {
         // DISTINCT — a node referencing the same token from multiple sites
         // shouldn't produce duplicate callees. The output is the SET of
@@ -672,15 +761,15 @@ fn op_find_callees(ctx: &DaemonContext, req: &serde_json::Value) -> Result<Strin
             JOIN node_defs d ON r.token = d.token \
             WHERE r.node_id = ?1";
         let mut stmt = conn.prepare_cached(sql)?;
-        let rows: Vec<serde_json::Value> = stmt
+        let callees: Vec<WireRef> = stmt
             .query_map([id], |row| {
-                Ok(json!({
-                    "node_id":   row.get::<_, String>(0)?,
-                    "source_id": row.get::<_, String>(1)?,
-                }))
+                Ok(WireRef {
+                    node_id: row.get::<_, String>(0)?,
+                    source_id: row.get::<_, String>(1)?,
+                })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(json!({"ok": true, "callees": rows}).to_string())
+        Ok(to_wire(&FindCalleesResponse { ok: true, callees }))
     })
 }
 
@@ -699,7 +788,7 @@ fn op_find_callees(ctx: &DaemonContext, req: &serde_json::Value) -> Result<Strin
 /// response compact for large indexes.
 ///
 /// Read-only — NOT in STATE_CHANGING_OPS.
-fn op_get_token_map(ctx: &DaemonContext, table: &str, json_key: &str) -> Result<String> {
+fn op_get_token_map(ctx: &DaemonContext, table: &str, op: TokenMapOp) -> Result<String> {
     with_live_db(ctx, |conn| {
         // DISTINCT — `node_refs` / `node_defs` have no uniqueness constraint
         // on (token, node_id), so the same node referencing/defining a token
@@ -719,34 +808,40 @@ fn op_get_token_map(ctx: &DaemonContext, table: &str, json_key: &str) -> Result<
         // Group by token in a single linear pass — the ORDER BY token
         // above means same-token rows are contiguous, so we just track
         // the current token and flush when it changes.
-        let mut entries: Vec<serde_json::Value> = Vec::new();
+        let mut entries: Vec<TokenMapEntry> = Vec::new();
         let mut current_token: Option<String> = None;
         let mut current_node_ids: Vec<String> = Vec::new();
         for (token, node_id) in pairs {
             if Some(&token) != current_token.as_ref() {
                 if let Some(tok) = current_token.take() {
-                    entries.push(json!({
-                        "token": tok,
-                        "node_ids": current_node_ids,
-                    }));
-                    current_node_ids = Vec::new();
+                    entries.push(TokenMapEntry {
+                        token: tok,
+                        node_ids: std::mem::take(&mut current_node_ids),
+                    });
                 }
                 current_token = Some(token);
             }
             current_node_ids.push(node_id);
         }
         if let Some(tok) = current_token {
-            entries.push(json!({
-                "token": tok,
-                "node_ids": current_node_ids,
-            }));
+            entries.push(TokenMapEntry {
+                token: tok,
+                node_ids: current_node_ids,
+            });
         }
 
-        let mut obj = serde_json::Map::new();
-        obj.insert("ok".to_string(), json!(true));
-        obj.insert(json_key.to_string(), json!(entries));
-        Ok(serde_json::Value::Object(obj).to_string())
+        Ok(match op {
+            TokenMapOp::Refs => to_wire(&GetRefsMapResponse { ok: true, entries }),
+            TokenMapOp::Defs => to_wire(&GetDefsMapResponse { ok: true, entries }),
+        })
     })
+}
+
+/// Which bulk-export op we're serving — pinpoints the response variant.
+#[derive(Copy, Clone)]
+enum TokenMapOp {
+    Refs,
+    Defs,
 }
 
 /// Export LLO's tier topology — the schema layer ownership map mache's
@@ -768,20 +863,33 @@ fn op_get_token_map(ctx: &DaemonContext, table: &str, json_key: &str) -> Result<
 /// future work expands this; today only the LLO built-in tiers are
 /// exposed. Read-only — does NOT belong in STATE_CHANGING_OPS.
 fn op_get_schema() -> Result<String> {
-    Ok(json!({
-        "ok": true,
-        "tiers": [
-            {
-                "name": "ll-core",
-                "crates": ["leyline-core", "leyline-schema", "leyline-public-schema", "leyline-schema-capnp"],
+    Ok(to_wire(&GetSchemaResponse {
+        ok: true,
+        tiers: vec![
+            SchemaTier {
+                name: "ll-core".into(),
+                crates: vec![
+                    "leyline-core".into(),
+                    "leyline-schema".into(),
+                    "leyline-public-schema".into(),
+                    "leyline-schema-capnp".into(),
+                ],
             },
-            {
-                "name": "ll-open",
-                "crates": ["leyline-fs", "leyline-ts", "leyline-lsp", "leyline-hdc", "leyline-cli-lib", "leyline-cli", "leyline-vcs", "leyline-sign"],
+            SchemaTier {
+                name: "ll-open".into(),
+                crates: vec![
+                    "leyline-fs".into(),
+                    "leyline-ts".into(),
+                    "leyline-lsp".into(),
+                    "leyline-hdc".into(),
+                    "leyline-cli-lib".into(),
+                    "leyline-cli".into(),
+                    "leyline-vcs".into(),
+                    "leyline-sign".into(),
+                ],
             },
         ],
-    })
-    .to_string())
+    }))
 }
 
 /// Export the daemon's filesystem paths — the .db location + sibling
@@ -796,21 +904,19 @@ fn op_get_db_path(ctrl_path: &Path) -> Result<String> {
     // same prefix.
     let base = ctrl_path.with_extension("");
     let base_str = base.to_string_lossy();
-    Ok(json!({
-        "ok": true,
-        "db_path": format!("{base_str}.db"),
-        "ctrl_path": ctrl_str,
-        "bindings_path": format!("{base_str}.bindings.capnp"),
-        "ast_path": format!("{base_str}.ast.capnp"),
-        "source_path": format!("{base_str}.source.capnp"),
-        "head_path": format!("{base_str}.head.capnp"),
-    })
-    .to_string())
+    Ok(to_wire(&GetDbPathResponse {
+        ok: true,
+        db_path: format!("{base_str}.db"),
+        ctrl_path: ctrl_str,
+        bindings_path: format!("{base_str}.bindings.capnp"),
+        ast_path: format!("{base_str}.ast.capnp"),
+        source_path: format!("{base_str}.source.capnp"),
+        head_path: format!("{base_str}.head.capnp"),
+    }))
 }
 
 /// Get a single node by ID.
-fn op_get_node(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
-    let id = required_str_field(req, "id")?;
+fn op_get_node(ctx: &DaemonContext, id: &str) -> Result<String> {
     promote_touched(ctx, &[id]);
 
     with_live_db(ctx, |conn| {
@@ -819,18 +925,22 @@ fn op_get_node(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
             "SELECT id, parent_id, name, kind, size, record FROM nodes WHERE id = ?1",
             [id],
             |row| {
-                Ok(json!({
-                    "id": row.get::<_, String>(0)?,
-                    "parent_id": row.get::<_, String>(1)?,
-                    "name": row.get::<_, String>(2)?,
-                    "kind": row.get::<_, i32>(3)?,
-                    "size": row.get::<_, i64>(4)?,
-                    "record": row.get::<_, String>(5)?,
-                }))
+                Ok(WireNode {
+                    id: row.get::<_, String>(0)?,
+                    parent_id: row.get::<_, String>(1)?,
+                    name: row.get::<_, String>(2)?,
+                    kind: row.get::<_, i32>(3)?,
+                    size: row.get::<_, i64>(4)?,
+                    record: row.get::<_, Option<String>>(5)?,
+                })
             },
         )?;
         match node {
-            Some(n) => Ok(json!({"ok": true, "node": n}).to_string()),
+            Some(n) => Ok(to_wire(&GetNodeResponse {
+                ok: true,
+                node: Some(n),
+                error: None,
+            })),
             None => Ok(node_not_found_response(id)),
         }
     })
@@ -864,19 +974,24 @@ fn find_node_at_position(
 
 /// Extract the `file` field from a request, normalizing any leading
 /// `file://` prefix. Returns the borrowed slice on success so callers
-/// can decide whether to copy or pass through. Single source of truth
-/// for the "missing \"file\" field" error message — every op that takes
-/// a file argument routes through here.
+/// can decide whether to copy or pass through.
+///
+/// Production op handlers now take typed `LspFile`/`LspPosition` structs
+/// (A-3 / bead b69606) and never call this helper. Kept for the unit
+/// tests that pin the `file://` normalization rule — `normalize_file_uri`
+/// is the live SSOT but this helper documents the request-shape
+/// extraction step that used to bridge json → str.
+#[cfg(test)]
 fn parse_file_arg(req: &serde_json::Value) -> Result<&str> {
     let file = required_str_field(req, "file")?;
     Ok(normalize_file_uri(file))
 }
 
-/// Required-string-field extractor with a uniform error message shape.
-///
-/// Centralizes the "missing \"<field>\" field" wording — clients see this
-/// directly when they make a malformed request, so it's part of the wire
-/// contract. Drift would silently change error strings under callers.
+/// Required-string-field extractor used by `parse_file_arg` and the
+/// missing-field sweep test. Production handlers reject missing fields
+/// via serde decode against `BaseRequest`; this helper survives only
+/// to keep the unit tests around it meaningful.
+#[cfg(test)]
 fn required_str_field<'a>(req: &'a serde_json::Value, field: &'static str) -> Result<&'a str> {
     req.get(field)
         .and_then(|v| v.as_str())
@@ -903,7 +1018,7 @@ where
 /// and message so clients can detect "no such node" without brittle string
 /// matching.
 fn node_not_found_response(id: &str) -> String {
-    json!({"ok": false, "error": format!("node '{id}' not found")}).to_string()
+    to_wire(&ErrorResponse::new(format!("node '{id}' not found")))
 }
 
 /// Fetch the `record` column for a node id. Returns `Ok(None)` for both
@@ -923,19 +1038,6 @@ pub(crate) fn query_node_record(conn: &Connection, id: &str) -> Result<Option<St
         |row| row.get::<_, Option<String>>(0),
     )?;
     Ok(row.flatten())
-}
-
-/// Parse file + line + col from request. File can be a path or file:// URI.
-fn parse_position(req: &serde_json::Value) -> Result<(String, u32, u32)> {
-    let file = parse_file_arg(req)?.to_string();
-
-    let line = req
-        .get("line")
-        .and_then(|v| v.as_u64())
-        .context("missing \"line\" field")? as u32;
-    let col = req.get("col").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-
-    Ok((file, line, col))
 }
 
 /// Read-only check: does `file` need lazy LSP enrichment?
@@ -1103,8 +1205,10 @@ fn try_enrich_file(ctx: &std::sync::Arc<DaemonContext>, file: &str) -> bool {
 }
 
 /// Hover info at a position. Auto-enriches if no data exists.
-fn op_lsp_hover(ctx: &std::sync::Arc<DaemonContext>, req: &serde_json::Value) -> Result<String> {
-    let (file, line, col) = parse_position(req)?;
+fn op_lsp_hover(ctx: &std::sync::Arc<DaemonContext>, args: &LspPosition) -> Result<String> {
+    let file = normalize_file_uri(&args.file).to_string();
+    let line = args.line;
+    let col = args.col;
     let (result, enriched) = with_lazy_enrich_retry(
         ctx,
         &file,
@@ -1204,13 +1308,13 @@ fn lsp_hover_query(
 }
 
 /// Go-to-definition at a position. Auto-enriches if no data exists.
-fn op_lsp_defs(ctx: &std::sync::Arc<DaemonContext>, req: &serde_json::Value) -> Result<String> {
-    op_lsp_position(ctx, req, "_lsp_defs", "def", "definitions")
+fn op_lsp_defs(ctx: &std::sync::Arc<DaemonContext>, args: &LspPosition) -> Result<String> {
+    op_lsp_position(ctx, args, "_lsp_defs", "def", "definitions")
 }
 
 /// Find references at a position. Auto-enriches if no data exists.
-fn op_lsp_refs(ctx: &std::sync::Arc<DaemonContext>, req: &serde_json::Value) -> Result<String> {
-    op_lsp_position(ctx, req, "_lsp_refs", "ref", "references")
+fn op_lsp_refs(ctx: &std::sync::Arc<DaemonContext>, args: &LspPosition) -> Result<String> {
+    op_lsp_position(ctx, args, "_lsp_refs", "ref", "references")
 }
 
 /// Shared body for `lsp_defs` and `lsp_refs`. They differ only in the
@@ -1221,12 +1325,14 @@ fn op_lsp_refs(ctx: &std::sync::Arc<DaemonContext>, req: &serde_json::Value) -> 
 /// is empty.
 fn op_lsp_position(
     ctx: &std::sync::Arc<DaemonContext>,
-    req: &serde_json::Value,
+    args: &LspPosition,
     table: &str,
     col_prefix: &str,
     json_key: &str,
 ) -> Result<String> {
-    let (file, line, col) = parse_position(req)?;
+    let file = normalize_file_uri(&args.file).to_string();
+    let line = args.line;
+    let col = args.col;
     let (rows, enriched) = with_lazy_enrich_retry(
         ctx,
         &file,
@@ -1290,8 +1396,8 @@ where
 }
 
 /// Document symbols for a file.
-fn op_lsp_symbols(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
-    let file = parse_file_arg(req)?;
+fn op_lsp_symbols(ctx: &DaemonContext, args: &LspFile) -> Result<String> {
+    let file = normalize_file_uri(&args.file);
     let sql = format!(
         "SELECT node_id, symbol_kind, detail, start_line, start_col, end_line, end_col \
          FROM _lsp WHERE {NODE_ID_FOR_FILE}"
@@ -1313,8 +1419,8 @@ fn op_lsp_symbols(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String
 }
 
 /// Diagnostics for a file.
-fn op_lsp_diagnostics(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
-    let file = parse_file_arg(req)?;
+fn op_lsp_diagnostics(ctx: &DaemonContext, args: &LspFile) -> Result<String> {
+    let file = normalize_file_uri(&args.file);
     let sql = format!(
         "SELECT node_id, diagnostics, start_line, start_col, end_line, end_col \
          FROM _lsp WHERE {NODE_ID_FOR_FILE} \
@@ -1343,10 +1449,8 @@ fn op_lsp_diagnostics(ctx: &DaemonContext, req: &serde_json::Value) -> Result<St
 /// active embedder and KNN-search the sidecar VectorIndex. Returns
 /// `{ok, results: [{node_id, distance}]}`.
 #[cfg(feature = "vec")]
-fn op_vec_search(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
-    let query = required_str_field(req, "query")?;
-    let k = req.get("k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-
+fn op_vec_search(ctx: &DaemonContext, query: &str, k: u32) -> Result<String> {
+    let k = k as usize;
     let qvec = ctx.embedder.embed(query).context("embed query")?;
     let results = ctx.vec_index.search(&qvec, k).context("vec search")?;
     let rows: Vec<serde_json::Value> = results
@@ -1473,8 +1577,8 @@ mod tests {
         // test. handle_base_op routes find_callers → node_refs and
         // find_defs → node_defs.
         let (_dir, ctx) = setup();
-        let callers = handle_base_op(&ctx, "find_callers", &json!({"token": "x"})).unwrap();
-        let defs = handle_base_op(&ctx, "find_defs", &json!({"token": "x"})).unwrap();
+        let callers = handle_base_op_legacy(&ctx, "find_callers", &json!({"token": "x"})).unwrap();
+        let defs = handle_base_op_legacy(&ctx, "find_defs", &json!({"token": "x"})).unwrap();
         let callers_v: serde_json::Value = serde_json::from_str(&callers).unwrap();
         let defs_v: serde_json::Value = serde_json::from_str(&defs).unwrap();
         assert!(
@@ -1492,7 +1596,7 @@ mod tests {
     }
 
     #[test]
-    fn query_token_in_table_returns_matching_rows() {
+    fn query_token_refs_returns_matching_rows() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE node_refs (token TEXT, node_id TEXT, source_id TEXT);
@@ -1503,16 +1607,14 @@ mod tests {
         )
         .unwrap();
 
-        let rows = query_token_in_table(&conn, "foo", "node_refs").unwrap();
+        let rows = query_token_refs(&conn, "foo", "node_refs").unwrap();
         assert_eq!(rows.len(), 2);
-        let ids: std::collections::HashSet<&str> = rows
-            .iter()
-            .map(|r| r["node_id"].as_str().unwrap())
-            .collect();
+        let ids: std::collections::HashSet<&str> =
+            rows.iter().map(|r| r.node_id.as_str()).collect();
         assert!(ids.contains("a/x"));
         assert!(ids.contains("b/y"));
 
-        let none = query_token_in_table(&conn, "missing", "node_refs").unwrap();
+        let none = query_token_refs(&conn, "missing", "node_refs").unwrap();
         assert!(none.is_empty());
     }
 
@@ -1591,7 +1693,7 @@ mod tests {
         req: serde_json::Value,
         why: &str,
     ) {
-        let resp = handle_base_op(ctx, op, &req)
+        let resp = handle_base_op_legacy(ctx, op, &req)
             .unwrap_or_else(|| panic!("op {op} returned None for {why}"));
         let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
         assert!(
@@ -1835,7 +1937,7 @@ mod tests {
         // A fresh controller with no arena published yields the
         // 64-char zero sentinel.
         let (_dir, ctx) = setup();
-        let result = handle_base_op(&ctx, "status", &json!({}));
+        let result = handle_base_op_legacy(&ctx, "status", &json!({}));
         assert!(result.is_some());
         let parsed: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
         assert_eq!(parsed["ok"], true);
@@ -1906,7 +2008,7 @@ mod tests {
             conn.execute(&sql, []).unwrap();
         }
 
-        let result = handle_base_op(&ctx, "query", &json!({"sql": "SELECT id FROM probe"}))
+        let result = handle_base_op_legacy(&ctx, "query", &json!({"sql": "SELECT id FROM probe"}))
             .expect("op_query must dispatch");
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["ok"], true);
@@ -1938,7 +2040,7 @@ mod tests {
             }
         }
 
-        let result = handle_base_op(
+        let result = handle_base_op_legacy(
             &ctx,
             "query",
             &json!({"sql": "SELECT i FROM p", "limit": 10}),
@@ -1965,7 +2067,7 @@ mod tests {
             }
         }
 
-        let result = handle_base_op(&ctx, "query", &json!({"sql": "SELECT i FROM small"}))
+        let result = handle_base_op_legacy(&ctx, "query", &json!({"sql": "SELECT i FROM small"}))
             .expect("op_query must dispatch");
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["rows"].as_array().unwrap().len(), 5);
@@ -2029,7 +2131,7 @@ mod tests {
         // `current_root` (64-char hex). Pin all 6 always-emitted
         // fields so renames or drops fail loudly.
         let (_dir, ctx) = setup();
-        let result = handle_base_op(&ctx, "status", &json!({})).unwrap();
+        let result = handle_base_op_legacy(&ctx, "status", &json!({})).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         let obj = parsed.as_object().expect("op_status returns an object");
 
@@ -2101,7 +2203,8 @@ mod tests {
         );
 
         // The contract: op_status MUST succeed despite the poison.
-        let result = handle_base_op(&ctx, "status", &json!({})).expect("op_status must dispatch");
+        let result =
+            handle_base_op_legacy(&ctx, "status", &json!({})).expect("op_status must dispatch");
         let parsed: serde_json::Value =
             serde_json::from_str(&result).expect("op_status must return valid JSON");
         assert_eq!(parsed["ok"], true, "op_status must report ok=true");
@@ -2119,7 +2222,7 @@ mod tests {
     #[tokio::test]
     async fn test_op_flush_returns_ok() {
         let (_dir, ctx) = setup();
-        let result = handle_base_op(&ctx, "flush", &json!({}));
+        let result = handle_base_op_legacy(&ctx, "flush", &json!({}));
         assert!(result.is_some());
         let parsed: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
         assert_eq!(parsed["ok"], true);
@@ -2128,7 +2231,7 @@ mod tests {
     #[tokio::test]
     async fn test_unknown_op_returns_none() {
         let (_dir, ctx) = setup();
-        assert!(handle_base_op(&ctx, "nonexistent", &json!({})).is_none());
+        assert!(handle_base_op_legacy(&ctx, "nonexistent", &json!({})).is_none());
     }
 
     #[tokio::test]
@@ -2140,7 +2243,7 @@ mod tests {
         let (_dir, ctx) = setup();
         for name in base_op_names() {
             assert!(
-                handle_base_op(&ctx, name, &json!({})).is_some(),
+                handle_base_op_legacy(&ctx, name, &json!({})).is_some(),
                 "handle_base_op did not recognize canonical op `{name}`",
             );
         }

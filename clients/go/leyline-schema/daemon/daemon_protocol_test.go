@@ -87,40 +87,63 @@ func loadFixtures(t *testing.T) map[string]fixtureEntry {
 	return out
 }
 
-// Inline JSON-tagged mirrors of `daemon.capnp` message types. Hand-written
-// for A-1 because the capnpc-go generated bindings emit capnp-binary shapes,
-// not JSON-tagged structs. A-2 (bead b631c8) extends regen.sh to emit these
-// from the schema; at that point this file's inline definitions are
-// replaced with imports from the regen target.
+// Hand-written Go struct mirrors of `daemon.capnp` types, with explicit
+// JSON tags that map schema field names (camelCase per capnp convention)
+// to the snake_case wire format LLO's handlers emit. The mapping is the
+// "JSON-as-carrier" pattern from cloister `interlace-spec/0.1.0/README.md`:
+// the typed contract is the schema; the carrier-format naming is a
+// per-implementation tag.
 //
-// IMPORTANT: keep field names and JSON tags in sync with daemon.capnp until
-// A-2 lands. A drift between this file and the schema means the gate is
-// testing the wrong thing.
+// These mirror exactly the fields declared in
+// rs/ll-core/public-schema/capnp/daemon.capnp. When a new field is added
+// to the schema (additively per ADR-0014 §2), add it here too with a
+// matching `json:"snake_case"` tag.
+//
+// A future bead (mache-a5ad09 follow-up) may promote these into a shipped
+// `clients/go/leyline-schema/daemon/types.go` so mache (and other Go
+// consumers) can import them directly. For now they live in the test
+// file alongside the drift gate that validates them.
 
 type statusResponse struct {
-	OK         *bool   `json:"ok"`
-	Generation *uint64 `json:"generation"`
-	ArenaPath  *string `json:"arenaPath"`
-	ArenaSize  *uint64 `json:"arenaSize"`
+	OK              *bool   `json:"ok"`
+	Generation      *uint64 `json:"generation"`
+	ArenaPath       *string `json:"arena_path"`
+	ArenaSize       *uint64 `json:"arena_size"`
+	Phase           *string `json:"phase"`
+	CurrentRoot     *string `json:"current_root"`
+	Enrichment      json.RawMessage `json:"enrichment"`
+	HeadSHA         *string `json:"head_sha,omitempty"`
+	LastReparseAtMs *int64  `json:"last_reparse_at_ms,omitempty"`
+	Error           *string `json:"error,omitempty"`
+}
+
+type flushResponse struct {
+	OK          *bool   `json:"ok"`
+	CurrentRoot *string `json:"current_root"`
 }
 
 type snapshotResponse struct {
-	OK         *bool   `json:"ok"`
-	Generation *uint64 `json:"generation"`
+	OK          *bool   `json:"ok"`
+	Generation  *uint64 `json:"generation,omitempty"`
+	CurrentRoot *string `json:"current_root"`
 }
 
 type node struct {
 	ID       *string `json:"id"`
-	ParentID *string `json:"parentId"`
+	ParentID *string `json:"parent_id"`
 	Name     *string `json:"name"`
 	Kind     *int32  `json:"kind"`
 	Size     *int64  `json:"size"`
-	Record   *string `json:"record"`
+	// Record is omitted by list_children (directory listings stay small;
+	// see Copilot review on PR #8). get_node / read_content emit it
+	// when the SQL `record` column is non-null. `omitempty` here is
+	// load-bearing for json.Marshal round-trips in this test.
+	Record *string `json:"record,omitempty"`
 }
 
 type ref struct {
-	NodeID   *string `json:"nodeId"`
-	SourceID *string `json:"sourceId"`
+	NodeID   *string `json:"node_id"`
+	SourceID *string `json:"source_id"`
 }
 
 type queryRow struct {
@@ -129,8 +152,8 @@ type queryRow struct {
 
 type readContentResponse struct {
 	OK      *bool   `json:"ok"`
-	Content *string `json:"content"`
-	Error   *string `json:"error"`
+	Content *string `json:"content,omitempty"`
+	Error   *string `json:"error,omitempty"`
 }
 
 type listChildrenResponse struct {
@@ -140,8 +163,8 @@ type listChildrenResponse struct {
 
 type getNodeResponse struct {
 	OK    *bool   `json:"ok"`
-	Node  *node   `json:"node"`
-	Error *string `json:"error"`
+	Node  *node   `json:"node,omitempty"`
+	Error *string `json:"error,omitempty"`
 }
 
 type findCallersResponse struct {
@@ -161,7 +184,7 @@ type findCalleesResponse struct {
 
 type tokenMapEntry struct {
 	Token   *string  `json:"token"`
-	NodeIDs []string `json:"nodeIds"`
+	NodeIDs []string `json:"node_ids"`
 }
 
 type getRefsMapResponse struct {
@@ -186,12 +209,12 @@ type getSchemaResponse struct {
 
 type getDbPathResponse struct {
 	OK           *bool   `json:"ok"`
-	DBPath       *string `json:"dbPath"`
-	CtrlPath     *string `json:"ctrlPath"`
-	BindingsPath *string `json:"bindingsPath"`
-	ASTPath      *string `json:"astPath"`
-	SourcePath   *string `json:"sourcePath"`
-	HeadPath     *string `json:"headPath"`
+	DBPath       *string `json:"db_path"`
+	CtrlPath     *string `json:"ctrl_path"`
+	BindingsPath *string `json:"bindings_path"`
+	ASTPath      *string `json:"ast_path"`
+	SourcePath   *string `json:"source_path"`
+	HeadPath     *string `json:"head_path"`
 }
 
 type queryResponse struct {
@@ -207,6 +230,8 @@ func decoderFor(name string) func([]byte) error {
 	switch name {
 	case "StatusResponse":
 		return func(b []byte) error { var v statusResponse; return strictUnmarshal(b, &v) }
+	case "FlushResponse":
+		return func(b []byte) error { var v flushResponse; return strictUnmarshal(b, &v) }
 	case "SnapshotResponse":
 		return func(b []byte) error { var v snapshotResponse; return strictUnmarshal(b, &v) }
 	case "ReadContentResponse":

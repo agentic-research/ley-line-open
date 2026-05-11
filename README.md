@@ -88,10 +88,10 @@ flowchart TB
   subgraph parse_run[Parse run @ generation N]
     p1[serialize<br/>capnp segments]
     p2[BLAKE3 canonical bytes]
-    p3[Head_N: rootHash, parentHash=Head_{N-1}.rootHash]
+    p3["Head_N: rootHash, parentHash=Head_{N-1}.rootHash"]
   end
-  prev[Head_{N-1}] -. parentHash .-> p3
-  p3 --> next[Head_{N+1}<br/>future run]
+  prev["Head_{N-1}"] -. parentHash .-> p3
+  p3 --> next["Head_{N+1}<br/>future run"]
   classDef chain fill:#1a2747,stroke:#5a8eed,color:#e3edff;
   class prev,p3,next chain;
 ```

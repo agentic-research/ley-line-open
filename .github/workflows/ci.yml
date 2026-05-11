@@ -17,9 +17,10 @@ jobs:
     name: Check + Clippy + Test (task ci)
     runs-on: ubuntu-latest
     steps:
-      # SHA-pinned: actions/checkout@v4.3.1 (refs/tags/v4 head as of 2026-05)
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-      # SHA-pinned: dtolnay/rust-toolchain (latest nightly for edition 2024)
+      # SHA-pinned: actions/checkout@v6.0.2 (Node 24)
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      # SHA-pinned: dtolnay/rust-toolchain (composite action — Node version
+      # deprecation does not apply; latest commit on master as of 2026-03).
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: nightly
@@ -30,8 +31,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libfuse-dev capnproto pkg-config
 
-      # SHA-pinned: arduino/setup-task@v2 (Taskfile runner, the golden
+      # SHA-pinned: arduino/setup-task@v2.0.0 (Taskfile runner, the golden
       # path; see Taskfile.yml at the repo root).
+      # TODO: bump to a Node 24 release once arduino/setup-task#1359 ships
+      # (Node 20 is force-defaulted June 2 2026, removed Sept 16 2026).
       - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611
         with:
           version: 3.x

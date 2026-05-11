@@ -87,6 +87,7 @@ pub async fn cmd_daemon(
     timeout: Option<&str>,
     source: Option<&Path>,
     mcp_port: Option<u16>,
+    mcp_bind: Option<std::net::IpAddr>,
 ) -> Result<()> {
     let ext: Arc<dyn DaemonExt> = Arc::new(NoExt);
     run_daemon(
@@ -101,6 +102,7 @@ pub async fn cmd_daemon(
         ext,
         source,
         mcp_port,
+        mcp_bind,
     )
     .await
 }
@@ -131,6 +133,7 @@ pub async fn run_daemon(
     ext: Arc<dyn DaemonExt>,
     source: Option<&Path>,
     mcp_port: Option<u16>,
+    mcp_bind: Option<std::net::IpAddr>,
 ) -> Result<()> {
     // 1. Arena setup.
     let arena_bytes = arena_size_mib * 1024 * 1024;
@@ -245,7 +248,7 @@ pub async fn run_daemon(
     // Optional MCP HTTP transport — feeds cloister gateway / any MCP client.
     // Same dispatch table as the UDS socket; just an MCP-shaped wrapper.
     let mcp_handle = if let Some(port) = mcp_port {
-        match crate::daemon::mcp::spawn(ctx.clone(), port) {
+        match crate::daemon::mcp::spawn(ctx.clone(), mcp_bind, port) {
             Ok(h) => Some(h),
             Err(e) => {
                 log::error!("MCP HTTP server failed to start on port {port}: {e:#}");

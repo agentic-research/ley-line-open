@@ -1,4 +1,10 @@
 @0xc7c7ada1403b9f78;
+
+# Go codegen annotations (inert for capnpc-rust; consumed by capnpc-go).
+using Go = import "/go.capnp";
+$Go.package("head");
+$Go.import("github.com/agentic-research/ley-line-open/clients/go/leyline-schema/head");
+
 # Head — Σ root pointer for a file-backed db.
 #
 # T8.5 (decade ley-line-open-9d30ac, thread T8/capnp-as-protocol).

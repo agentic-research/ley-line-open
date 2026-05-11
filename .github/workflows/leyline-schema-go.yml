@@ -1,0 +1,68 @@
+name: leyline-schema-go
+# Gates the Go bindings module for the public capnp schemas.
+#
+# Two contracts enforced here:
+#  1. Generated files in clients/go/leyline-schema/ match `regen.sh`
+#     output exactly — `git diff --exit-code` fails on drift, so
+#     a schema change without a regen is a CI failure, not a runtime bug.
+#  2. The Go side of T8.10 (cross-runtime fixture decode) stays green —
+#     `go test ./...` decodes the .bin fixtures the Rust side produces.
+#
+# All `run:` blocks below execute repo-controlled scripts only; no
+# untrusted ${{ github.event.* }} input is interpolated.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "clients/go/leyline-schema/**"
+      - "rs/ll-core/schema-capnp/schemas/**"
+      - "rs/ll-core/public-schema/capnp/**"
+      - ".github/workflows/leyline-schema-go.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "clients/go/leyline-schema/**"
+      - "rs/ll-core/schema-capnp/schemas/**"
+      - "rs/ll-core/public-schema/capnp/**"
+      - ".github/workflows/leyline-schema-go.yml"
+
+jobs:
+  regen-and-test:
+    name: regen-diff + go test
+    runs-on: ubuntu-latest
+    steps:
+      # SHA-pinned: actions/checkout@v4.3.1 (matches ci.yml).
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      # SHA-pinned: actions/setup-go@v5 (refs/tags/v5 head as of 2026-05).
+      - uses: actions/setup-go@0aaccfd150d50ccaeb58ebd88d36e91967a5f35b
+        with:
+          go-version: "1.21"
+
+      - name: Install capnp (>=1.3.0)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends capnproto
+          capnp --version
+
+      - name: Install capnpc-go
+        # Pin matches go.mod's capnproto.org/go/capnp/v3 dependency, so
+        # the generator and runtime stay in lockstep across regens.
+        run: |
+          go install capnproto.org/go/capnp/v3/capnpc-go@v3.1.0-alpha.2
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Regenerate Go bindings
+        run: clients/go/leyline-schema/regen.sh
+
+      - name: Assert no drift between committed bindings and regen output
+        run: |
+          if ! git diff --exit-code clients/go/leyline-schema/; then
+            echo "::error::clients/go/leyline-schema/ has drift; run regen.sh and commit." >&2
+            exit 1
+          fi
+
+      - name: go test
+        working-directory: clients/go/leyline-schema
+        run: go test ./...

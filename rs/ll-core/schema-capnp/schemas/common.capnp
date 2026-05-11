@@ -1,4 +1,12 @@
 @0xb0c0debaadc0deb0;
+
+# Go codegen annotations (inert for capnpc-rust; consumed by capnpc-go to
+# produce clients/go/leyline-schema/common/common.capnp.go). See
+# clients/go/leyline-schema/README.md and docs/adr/0014-capnp-as-protocol.md.
+using Go = import "/go.capnp";
+$Go.package("common");
+$Go.import("github.com/agentic-research/ley-line-open/clients/go/leyline-schema/common");
+
 # Σ Merkle-CAS substrate — common primitives.
 #
 # T8 (decade ley-line-open-9d30ac, thread T8/capnp-as-protocol).

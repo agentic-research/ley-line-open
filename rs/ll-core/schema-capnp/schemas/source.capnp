@@ -1,4 +1,10 @@
 @0x9bd2953355bd438c;
+
+# Go codegen annotations (inert for capnpc-rust; consumed by capnpc-go).
+using Go = import "/go.capnp";
+$Go.package("source");
+$Go.import("github.com/agentic-research/ley-line-open/clients/go/leyline-schema/source");
+
 # SourceFile — projected file metadata.
 #
 # T8.3 (decade ley-line-open-9d30ac, thread T8/capnp-as-protocol).

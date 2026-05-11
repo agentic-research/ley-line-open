@@ -262,14 +262,34 @@ impl JsonRpcResponse {
 // Server entry point
 // ---------------------------------------------------------------------------
 
-/// Spawn the MCP HTTP server bound to `127.0.0.1:port`. Returns a join
+/// Spawn the MCP HTTP server bound to `bind:port`. Returns a join
 /// handle so the caller can keep it alive (or `.abort()` it on shutdown).
-pub fn spawn(ctx: Arc<DaemonContext>, port: u16) -> Result<tokio::task::JoinHandle<()>> {
+///
+/// `bind` defaults to `127.0.0.1` for callers passing `None`. Container
+/// deployments need `0.0.0.0` so docker port-forwarding can reach the
+/// listener — a host-side `-p host:8384` only proxies to the container's
+/// external interfaces, not to the container's loopback.
+///
+/// **Security:** the MCP wire has no auth (see the module docstring's
+/// "assumes localhost-only or already-attested" note). Bind addresses:
+///
+/// - `127.0.0.1` — safe default, only this machine's loopback
+/// - `0.0.0.0` inside a container netns — only this container's interfaces
+///   can reach it; pair with `docker run -p 127.0.0.1:host:8384` so the
+///   host-side publish stays loopback-only
+/// - `0.0.0.0` on the host (no container) — exposes MCP on the LAN. Don't.
+///   Put cloister or another attested gateway in front.
+pub fn spawn(
+    ctx: Arc<DaemonContext>,
+    bind: Option<std::net::IpAddr>,
+    port: u16,
+) -> Result<tokio::task::JoinHandle<()>> {
     let app = Router::new()
         .route("/mcp", post(handle_post).get(handle_get))
         .with_state(ctx);
 
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse()?;
+    let bind = bind.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let addr: SocketAddr = SocketAddr::new(bind, port);
     let std_listener =
         std::net::TcpListener::bind(addr).with_context(|| format!("bind MCP HTTP on {addr}"))?;
     std_listener

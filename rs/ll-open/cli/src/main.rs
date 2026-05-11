@@ -61,6 +61,21 @@ enum Cmd {
         /// `lsp_*` calls here.
         #[arg(long)]
         mcp_port: Option<u16>,
+
+        /// Bind address for the MCP HTTP transport. Defaults to 127.0.0.1.
+        ///
+        /// Container deployments need 0.0.0.0 so docker `-p host:8384`
+        /// port-forwarding can reach the listener (loopback-only binds
+        /// are unreachable from the host's docker proxy).
+        ///
+        /// SECURITY: passing 0.0.0.0 outside a container exposes MCP to
+        /// every interface on this machine. The MCP wire has no auth —
+        /// it's intended for cloister-mediated localhost or attested
+        /// peers only. In a container, 0.0.0.0 binds inside the container's
+        /// netns; combine with `docker run -p 127.0.0.1:host:8384` to
+        /// keep host-side exposure on loopback.
+        #[arg(long)]
+        mcp_bind: Option<std::net::IpAddr>,
     },
 }
 
@@ -99,6 +114,7 @@ async fn main() -> Result<()> {
             timeout,
             source,
             mcp_port,
+            mcp_bind,
         } => {
             // KNOWN scale limitation: arena_size_mib defaults to 64
             // (see Cmd::Daemon { arena_size_mib, default_value_t = 64 }).
@@ -126,6 +142,7 @@ async fn main() -> Result<()> {
                 Arc::new(leyline_cli_lib::daemon::NoExt),
                 source.as_deref(),
                 mcp_port,
+                mcp_bind,
             )
             .await
         }

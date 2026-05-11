@@ -127,6 +127,20 @@
     "go_drift_skip": "b631c8: same snake_case vs camelCase drift as find_callers."
   },
 
+  "find_callees": {
+    "request": {"op": "find_callees", "id": "file1.rs#fn_caller"},
+    "response": {
+      "ok": true,
+      "callees": [
+        {"node_id": "file2.rs#fn_callee", "source_id": "file2.rs"}
+      ]
+    },
+    "response_required_keys": ["ok", "callees"],
+    "response_optional_keys": [],
+    "go_binding": "FindCalleesResponse",
+    "go_drift_skip": "b631c8: same snake_case vs camelCase drift as find_callers (node_id/source_id vs nodeId/sourceId). A-2 reconciles."
+  },
+
   "query": {
     "request": {"op": "query", "sql": "SELECT 1 as one"},
     "response": {

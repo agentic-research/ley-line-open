@@ -149,6 +149,19 @@ struct FindDefsResponse {
   defs @1 :List(Ref);
 }
 
+struct FindCalleesRequest {
+  # The node whose forward references we want resolved to their definitions.
+  # Mirrors FindCallersRequest's input slot but takes a node_id instead of a
+  # token: `find_callers(token)` = "who refers to this?", `find_callees(id)`
+  # = "what does this node refer to?"
+  id @0 :Text;
+}
+
+struct FindCalleesResponse {
+  ok      @0 :Bool;
+  callees @1 :List(Ref);
+}
+
 struct GetNodeRequest {
   id @0 :Text;
 }

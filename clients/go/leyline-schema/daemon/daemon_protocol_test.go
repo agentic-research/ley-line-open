@@ -154,6 +154,11 @@ type findDefsResponse struct {
 	Defs []ref `json:"defs"`
 }
 
+type findCalleesResponse struct {
+	OK      *bool `json:"ok"`
+	Callees []ref `json:"callees"`
+}
+
 type queryResponse struct {
 	OK      *bool      `json:"ok"`
 	Columns []string   `json:"columns"`
@@ -179,6 +184,8 @@ func decoderFor(name string) func([]byte) error {
 		return func(b []byte) error { var v findCallersResponse; return strictUnmarshal(b, &v) }
 	case "FindDefsResponse":
 		return func(b []byte) error { var v findDefsResponse; return strictUnmarshal(b, &v) }
+	case "FindCalleesResponse":
+		return func(b []byte) error { var v findCalleesResponse; return strictUnmarshal(b, &v) }
 	case "QueryResponse":
 		return func(b []byte) error { var v queryResponse; return strictUnmarshal(b, &v) }
 	default:

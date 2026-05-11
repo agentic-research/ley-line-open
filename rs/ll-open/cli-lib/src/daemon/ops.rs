@@ -58,6 +58,7 @@ pub(crate) fn base_op_names() -> Vec<&'static str> {
         "list_children",
         "read_content",
         "find_callers",
+        "find_callees",
         "find_defs",
         "get_node",
         "lsp_hover",
@@ -90,6 +91,7 @@ pub fn handle_base_op(
         "list_children" => Some(op_list_children(ctx, req)),
         "read_content" => Some(op_read_content(ctx, req)),
         "find_callers" => Some(op_find_callers(ctx, req)),
+        "find_callees" => Some(op_find_callees(ctx, req)),
         "find_defs" => Some(op_find_defs(ctx, req)),
         "get_node" => Some(op_get_node(ctx, req)),
         // Position-based LSP queries — translate (file, line, col) to node lookups.
@@ -635,6 +637,42 @@ fn op_find_token(
         obj.insert("ok".to_string(), json!(true));
         obj.insert(json_key.to_string(), json!(rows));
         Ok(serde_json::Value::Object(obj).to_string())
+    })
+}
+
+/// Find callees of a node — the definitions of every token the node references.
+///
+/// Forward-direction sibling of `find_callers`/`find_defs`:
+/// `find_callers(token)` asks "who references this token?" → reads node_refs.
+/// `find_callees(id)`    asks "what does this node reference?" → JOINs
+/// node_refs (by node_id) against node_defs (by token) to get the defining
+/// nodes. Same `{ok, callees: [{node_id, source_id}]}` output shape as
+/// find_callers, so mache's `udsGraph.GetCallees(id)` can mirror its
+/// existing `GetCallers(token)` JSON parsing.
+///
+/// Read-only — does NOT belong in STATE_CHANGING_OPS.
+fn op_find_callees(ctx: &DaemonContext, req: &serde_json::Value) -> Result<String> {
+    let id = required_str_field(req, "id")?;
+    with_live_db(ctx, |conn| {
+        // DISTINCT — a node referencing the same token from multiple sites
+        // shouldn't produce duplicate callees. The output is the SET of
+        // definitions reachable from the input node, not the multiset of
+        // reference sites.
+        let sql = "\
+            SELECT DISTINCT d.node_id, d.source_id \
+            FROM node_refs r \
+            JOIN node_defs d ON r.token = d.token \
+            WHERE r.node_id = ?1";
+        let mut stmt = conn.prepare_cached(sql)?;
+        let rows: Vec<serde_json::Value> = stmt
+            .query_map([id], |row| {
+                Ok(json!({
+                    "node_id":   row.get::<_, String>(0)?,
+                    "source_id": row.get::<_, String>(1)?,
+                }))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(json!({"ok": true, "callees": rows}).to_string())
     })
 }
 

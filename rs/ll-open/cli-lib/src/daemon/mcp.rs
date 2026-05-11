@@ -130,6 +130,15 @@ fn tool_registry() -> Vec<McpTool> {
             }),
         },
         McpTool {
+            name: "find_callees",
+            description: "Find callees of a node — definitions of every token the node references (JOINs node_refs against node_defs).",
+            schema: json!({
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"]
+            }),
+        },
+        McpTool {
             name: "get_node",
             description: "Fetch a single node by id.",
             schema: json!({

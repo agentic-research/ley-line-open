@@ -701,7 +701,14 @@ fn op_find_callees(ctx: &DaemonContext, req: &serde_json::Value) -> Result<Strin
 /// Read-only — NOT in STATE_CHANGING_OPS.
 fn op_get_token_map(ctx: &DaemonContext, table: &str, json_key: &str) -> Result<String> {
     with_live_db(ctx, |conn| {
-        let sql = format!("SELECT token, node_id FROM {table} ORDER BY token, node_id");
+        // DISTINCT — `node_refs` / `node_defs` have no uniqueness constraint
+        // on (token, node_id), so the same node referencing/defining a token
+        // from multiple sites would emit duplicate node_ids without this.
+        // Downstream graph-wide consumers (community detection, architecture
+        // diagrams) expect each (token → node_id) edge once.
+        // TODO(perf): if a single response grows large on a registry-scale
+        // db, stream rows instead of materializing the full Vec into memory.
+        let sql = format!("SELECT DISTINCT token, node_id FROM {table} ORDER BY token, node_id");
         let mut stmt = conn.prepare_cached(&sql)?;
         let pairs: Vec<(String, String)> = stmt
             .query_map([], |row| {
@@ -745,11 +752,21 @@ fn op_get_token_map(ctx: &DaemonContext, table: &str, json_key: &str) -> Result<
 /// Export LLO's tier topology — the schema layer ownership map mache's
 /// `serve_diagram.go` consumes for cross-tier dependency diagrams.
 ///
-/// This is parse-time-known and doesn't query the live db. The tier
-/// names + crate basenames are the SSOT pulled from `docs/TABLE_CONTRACT.md`
-/// "Layer Ownership" section. If extension layers register additional
-/// tiers via `DaemonExt`, future work expands this; today only the LLO
-/// built-in tiers are exposed.
+/// The tier→crate map is currently HARDCODED here. The real SSOT is the
+/// `rs/ll-core/` vs `rs/ll-open/` workspace layout (each subdirectory's
+/// member crates per `rs/Cargo.toml`). Keeping this hardcoded means a
+/// new crate added to either tier requires touching this function too.
+/// TODO: derive from `cargo metadata --no-deps --format-version 1` at
+/// daemon startup so workspace truth is the single source. Tracked
+/// implicitly under bead cc0305 follow-up.
+///
+/// `docs/TABLE_CONTRACT.md` describes table-ownership (which enrichment
+/// pass writes which table) — NOT crate→tier maps. Don't conflate the
+/// two.
+///
+/// If extension layers register additional tiers via `DaemonExt`,
+/// future work expands this; today only the LLO built-in tiers are
+/// exposed. Read-only — does NOT belong in STATE_CHANGING_OPS.
 fn op_get_schema() -> Result<String> {
     Ok(json!({
         "ok": true,
@@ -1406,14 +1423,23 @@ mod tests {
     #[test]
     fn state_changing_ops_excludes_pure_reads() {
         // The query/observation ops must NOT trigger an event emission.
+        // When a new read-only op is added to `handle_base_op`, list it
+        // here so a future accidental promotion into STATE_CHANGING_OPS
+        // is caught by this guard.
         for op in [
             "status",
             "query",
             "list_children",
+            "list_roots",
             "read_content",
             "find_callers",
+            "find_callees",
             "find_defs",
             "get_node",
+            "get_refs_map",
+            "get_defs_map",
+            "get_schema",
+            "get_db_path",
             "lsp_hover",
             "lsp_defs",
             "lsp_refs",

@@ -269,6 +269,16 @@ impl JsonRpcResponse {
 /// deployments need `0.0.0.0` so docker port-forwarding can reach the
 /// listener — a host-side `-p host:8384` only proxies to the container's
 /// external interfaces, not to the container's loopback.
+///
+/// **Security:** the MCP wire has no auth (see the module docstring's
+/// "assumes localhost-only or already-attested" note). Bind addresses:
+///
+/// - `127.0.0.1` — safe default, only this machine's loopback
+/// - `0.0.0.0` inside a container netns — only this container's interfaces
+///   can reach it; pair with `docker run -p 127.0.0.1:host:8384` so the
+///   host-side publish stays loopback-only
+/// - `0.0.0.0` on the host (no container) — exposes MCP on the LAN. Don't.
+///   Put cloister or another attested gateway in front.
 pub fn spawn(
     ctx: Arc<DaemonContext>,
     bind: Option<std::net::IpAddr>,

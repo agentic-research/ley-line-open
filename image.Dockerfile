@@ -16,6 +16,23 @@
 # HTTP server. The daemon defaults bind to 127.0.0.1, which is loopback-only
 # inside the container — without this override, port publishing yields
 # connection-reset on every request from the host.
+#
+# Security: 0.0.0.0 here is the container's network namespace, NOT the host.
+# The container has its own netns; this only exposes :8384 to interfaces inside
+# that netns. Whether MCP is reachable from outside the host depends on HOW
+# you publish the port:
+#
+#   docker run -p 18384:8384 ...               ← exposes on host's 0.0.0.0:18384
+#                                                (visible on the LAN)
+#   docker run -p 127.0.0.1:18384:8384 ...     ← exposes on host's loopback only
+#                                                (recommended for local cloister)
+#
+# Cloister hits `http://localhost:8384/mcp`, so loopback-publishing is the
+# right shape for production: the container-side 0.0.0.0 is just plumbing
+# for docker's NAT to work, the host-side 127.0.0.1 keeps the surface narrow.
+# Per `daemon/mcp.rs`, the MCP server "assumes localhost-only or already-
+# attested" — there is no auth on the wire, so do not publish to a public
+# host IP without a reverse proxy / mTLS / cloister attestation in front.
 
 ARG BIN_PATH=rs/ll-open/cli/target/krust/aarch64-unknown-linux-musl/release/leyline
 

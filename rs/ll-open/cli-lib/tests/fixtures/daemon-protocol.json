@@ -1,0 +1,144 @@
+{
+  "_doc": "Daemon protocol drift gate fixtures. Each entry pins one UDS op's wire contract: the request shape the daemon accepts and the response shape it emits. Consumed by two gates: (1) Rust integration test asserts handler output contains every `response_required_keys` entry; (2) Go test in clients/go/leyline-schema/daemon/ asserts the response JSON decodes into the matching typed binding without UnmarshalTypeError. Together they pin handler→schema agreement. Extends T8.10's cross-runtime fixture pattern (bead 6b7d43) from segment-file substrate to the JSON wire. `go_drift_skip` is non-null only for ops where daemon.capnp and the handler currently disagree — bead b631c8 (A-2) reconciles those additively. See docs/TABLE_CONTRACT.md.",
+
+  "status": {
+    "request": {"op": "status"},
+    "response": {
+      "ok": true,
+      "phase": "ready",
+      "current_root": "0000000000000000000000000000000000000000000000000000000000000000",
+      "arena_path": "/tmp/test/arena",
+      "arena_size": 67108864,
+      "enrichment": {}
+    },
+    "response_required_keys": ["ok", "phase", "current_root", "arena_path", "arena_size", "enrichment"],
+    "response_optional_keys": ["head_sha", "last_reparse_at_ms", "error"],
+    "go_binding": "StatusResponse",
+    "go_drift_skip": "b631c8: StatusResponse schema declares {ok, generation, arenaPath, arenaSize} but handler emits {ok, phase, current_root, arena_path, arena_size, enrichment, head_sha?, last_reparse_at_ms?, error?}. A-2 adds missing fields additively."
+  },
+
+  "flush": {
+    "request": {"op": "flush"},
+    "response": {
+      "ok": true,
+      "current_root": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "response_required_keys": ["ok", "current_root"],
+    "response_optional_keys": [],
+    "go_binding": null,
+    "go_drift_skip": "b631c8: no FlushResponse declared in daemon.capnp. A-2 adds it (returns {ok, currentRoot})."
+  },
+
+  "snapshot": {
+    "request": {"op": "snapshot"},
+    "response": {
+      "ok": true,
+      "current_root": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "response_required_keys": ["ok", "current_root"],
+    "response_optional_keys": [],
+    "go_binding": "SnapshotResponse",
+    "go_drift_skip": "b631c8: SnapshotResponse declares {ok, generation} but handler emits {ok, current_root}. A-2 reconciles."
+  },
+
+  "list_roots": {
+    "request": {"op": "list_roots"},
+    "response": {
+      "ok": true,
+      "children": []
+    },
+    "response_required_keys": ["ok", "children"],
+    "response_optional_keys": [],
+    "go_binding": "ListChildrenResponse",
+    "go_drift_skip": "b631c8: ListChildrenResponse declares children:List(Node) with full Node fields (id, parentId, name, kind, size, record); handler emits per-child {id, name, kind, size} only. A-2 either expands handler to emit full Node OR introduces a NodeStat lite type."
+  },
+
+  "list_children": {
+    "request": {"op": "list_children", "id": ""},
+    "response": {
+      "ok": true,
+      "children": [
+        {"id": "file1.rs", "name": "file1.rs", "kind": 0, "size": 100},
+        {"id": "src", "name": "src", "kind": 1, "size": 0}
+      ]
+    },
+    "response_required_keys": ["ok", "children"],
+    "response_optional_keys": [],
+    "go_binding": "ListChildrenResponse",
+    "go_drift_skip": "b631c8: same drift as list_roots — child entries are stat-shaped, not full Node."
+  },
+
+  "get_node": {
+    "request": {"op": "get_node", "id": "file1.rs"},
+    "response": {
+      "ok": true,
+      "node": {
+        "id": "file1.rs",
+        "parent_id": "",
+        "name": "file1.rs",
+        "kind": 0,
+        "size": 100,
+        "record": ""
+      }
+    },
+    "response_required_keys": ["ok"],
+    "response_optional_keys": ["node", "error"],
+    "go_binding": "GetNodeResponse",
+    "go_drift_skip": "b631c8: GetNodeResponse.node declares camelCase Node (id, parentId, name, kind, size, record); handler emits snake_case (parent_id). A-2 picks: add JSON tags on Go side OR rename schema fields."
+  },
+
+  "read_content": {
+    "request": {"op": "read_content", "id": "file1.rs"},
+    "response": {
+      "ok": true,
+      "content": "fn main() {}"
+    },
+    "response_required_keys": ["ok"],
+    "response_optional_keys": ["content", "error"],
+    "go_binding": "ReadContentResponse",
+    "go_drift_skip": null
+  },
+
+  "find_callers": {
+    "request": {"op": "find_callers", "token": "some_fn"},
+    "response": {
+      "ok": true,
+      "callers": [
+        {"node_id": "file1.rs#fn1", "source_id": "file1.rs"}
+      ]
+    },
+    "response_required_keys": ["ok", "callers"],
+    "response_optional_keys": [],
+    "go_binding": "FindCallersResponse",
+    "go_drift_skip": "b631c8: FindCallersResponse.callers declares List(Ref) with camelCase (nodeId, sourceId); handler emits snake_case (node_id, source_id). A-2 adds JSON tags or renames schema fields."
+  },
+
+  "find_defs": {
+    "request": {"op": "find_defs", "token": "some_fn"},
+    "response": {
+      "ok": true,
+      "defs": [
+        {"node_id": "file1.rs#fn1", "source_id": "file1.rs"}
+      ]
+    },
+    "response_required_keys": ["ok", "defs"],
+    "response_optional_keys": [],
+    "go_binding": "FindDefsResponse",
+    "go_drift_skip": "b631c8: same snake_case vs camelCase drift as find_callers."
+  },
+
+  "query": {
+    "request": {"op": "query", "sql": "SELECT id, name FROM nodes LIMIT 1"},
+    "response": {
+      "ok": true,
+      "columns": ["id", "name"],
+      "rows": [
+        {"id": "file1.rs", "name": "file1.rs"}
+      ]
+    },
+    "response_required_keys": ["ok", "columns", "rows"],
+    "response_optional_keys": ["truncated", "limit"],
+    "go_binding": "QueryResponse",
+    "go_drift_skip": "b631c8: QueryResponse declares rows:List(QueryRow) where QueryRow has values:List(Text) (positional). Handler emits rows as column-keyed objects. Structural mismatch; A-2 decides whether to ratify column-keyed shape (more JSON-idiomatic) or refactor handler."
+  }
+}

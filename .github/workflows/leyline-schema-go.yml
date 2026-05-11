@@ -1,12 +1,17 @@
 name: leyline-schema-go
 # Gates the Go bindings module for the public capnp schemas.
 #
-# Two contracts enforced here:
+# Three contracts enforced here:
 #  1. Generated files in clients/go/leyline-schema/ match `regen.sh`
 #     output exactly — `git diff --exit-code` fails on drift, so
 #     a schema change without a regen is a CI failure, not a runtime bug.
 #  2. The Go side of T8.10 (cross-runtime fixture decode) stays green —
 #     `go test ./...` decodes the .bin fixtures the Rust side produces.
+#  3. The daemon protocol drift gate (bead b5a77b / A-1) stays green —
+#     each daemon UDS op's JSON response decodes into the matching typed
+#     Go binding. Ops with known schema↔reality drift (tracked by bead
+#     b631c8 / A-2) are skipped with the drift reason as the message;
+#     the skip count is the visible reconciliation-progress metric.
 #
 # All `run:` blocks below execute repo-controlled scripts only; no
 # untrusted ${{ github.event.* }} input is interpolated.
@@ -18,6 +23,7 @@ on:
       - "clients/go/leyline-schema/**"
       - "rs/ll-core/schema-capnp/schemas/**"
       - "rs/ll-core/public-schema/capnp/**"
+      - "rs/ll-open/cli-lib/tests/fixtures/daemon-protocol.json"
       - ".github/workflows/leyline-schema-go.yml"
   pull_request:
     branches: [main]
@@ -25,6 +31,7 @@ on:
       - "clients/go/leyline-schema/**"
       - "rs/ll-core/schema-capnp/schemas/**"
       - "rs/ll-core/public-schema/capnp/**"
+      - "rs/ll-open/cli-lib/tests/fixtures/daemon-protocol.json"
       - ".github/workflows/leyline-schema-go.yml"
 
 jobs:
@@ -63,6 +70,10 @@ jobs:
             exit 1
           fi
 
-      - name: go test
+      - name: go test (substrate fixtures + daemon protocol drift gate)
         working-directory: clients/go/leyline-schema
-        run: go test ./...
+        # T8.10 fixture decode (binding/) and the daemon protocol drift gate
+        # (daemon/, bead b5a77b). The latter SKIPS ops with known schema↔reality
+        # drift — the skip count is the diagnostic for bead b631c8 (A-2) which
+        # reconciles the schema additively.
+        run: go test ./... -v

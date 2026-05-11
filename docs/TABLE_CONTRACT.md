@@ -104,6 +104,28 @@ db remains for fast in-process queries, but the *cross-process contract*
 moved to canonical-encoded capnp segment files at `${db}.{bindings,ast,source,head}.capnp`.
 mache (and any future consumer) reads those directly.
 
+## Cross-runtime drift gates
+
+Two distinct cross-process contracts run through this repo, each gated by a
+cross-runtime fixture suite in CI:
+
+| Surface | Encoding | Rust fixtures | Go gate | Bead |
+|---|---|---|---|---|
+| **Substrate** — capnp segment files (`bindings.capnp`, `ast.capnp`, `source.capnp`, `head.capnp`) | canonical capnp binary | `rs/ll-core/schema-capnp/tests/fixtures/*.bin` | `clients/go/leyline-schema/binding/binding_test.go` decodes via the typed capnp Go bindings | T8.10 / `6b7d43` |
+| **Daemon protocol** — UDS request/response JSON per `daemon.capnp` | JSON-as-carrier (per cloister `interlace-spec/0.1.0/README.md`) over UDS | `rs/ll-open/cli-lib/tests/fixtures/daemon-protocol.json` | `clients/go/leyline-schema/daemon/daemon_protocol_test.go` decodes via hand-written JSON-tagged structs that mirror `daemon.capnp` | A-1 / `b5a77b` |
+
+Both gates are wired into `.github/workflows/leyline-schema-go.yml`. The
+substrate gate asserts byte-equality on canonical encoding (T8.10's
+falsifiable claim F8.6.4). The daemon protocol gate asserts the JSON wire
+shape matches the typed schema on both ends — Rust handler emits a response
+containing every `response_required_keys` entry, AND that response decodes
+into the matching Go binding without `UnmarshalTypeError`.
+
+Ops with known schema↔reality drift (`get_node` snake_case, `status` missing
+fields, etc.) are SKIPPED in the daemon protocol gate with the drift reason
+as the skip message. Bead A-2 (`b631c8`) reconciles the schema additively;
+each `go_drift_skip` flipping to null converts a skip to a pass.
+
 ## Rules
 
 1. **Disjoint writes**: `A.writes() ∩ B.writes() = ∅` for any two passes A, B.

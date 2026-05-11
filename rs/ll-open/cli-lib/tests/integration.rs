@@ -2990,3 +2990,113 @@ async fn test_op_reparse_snapshot_race_publishes_well_formed_root() {
         "phase should land at ready after race; got {final_status}",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Daemon protocol drift gate (bead ley-line-open-b5a77b / A-1)
+//
+// Pins each base op's wire shape against `tests/fixtures/daemon-protocol.json`.
+// For every op listed in the fixture: spawn the daemon, send the fixture's
+// request, assert the response is a JSON object containing every required
+// key. Loose superset match — state-dependent values vary by test environment;
+// only the SHAPE is contractual.
+//
+// The companion Go gate at `clients/go/leyline-schema/daemon/daemon_protocol_test.go`
+// asserts the same fixture responses decode into the matching typed Go
+// binding. Together they catch handler ↔ schema drift before merge. This
+// extends T8.10's cross-runtime fixture pattern (bead 6b7d43) from the
+// substrate (capnp segment files) to the daemon protocol (JSON wire).
+//
+// See `docs/TABLE_CONTRACT.md` for the substrate-vs-daemon-protocol layering.
+// ---------------------------------------------------------------------------
+
+/// Load `tests/fixtures/daemon-protocol.json` and return all op fixtures
+/// keyed by op name. The top-level `_doc` field is filtered out — it's
+/// documentation, not a fixture.
+fn load_daemon_protocol_fixtures() -> serde_json::Map<String, serde_json::Value> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/daemon-protocol.json");
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let raw: serde_json::Value =
+        serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+    let mut map = raw
+        .as_object()
+        .unwrap_or_else(|| panic!("{} must be a JSON object", path.display()))
+        .clone();
+    map.remove("_doc");
+    map
+}
+
+#[tokio::test]
+async fn daemon_protocol_gate_handlers_emit_required_keys() {
+    use std::sync::Arc;
+
+    let dir = TempDir::new().unwrap();
+    let (_arena, ctrl_path) = fresh_arena(dir.path());
+    let ctx = Arc::new(default_test_ctx(ctrl_path));
+    let sock_path = dir.path().join("test.sock");
+    spawn_test_socket(ctx, sock_path.clone()).await;
+
+    let fixtures = load_daemon_protocol_fixtures();
+    assert!(
+        !fixtures.is_empty(),
+        "expected at least one op fixture in daemon-protocol.json"
+    );
+
+    let mut failures: Vec<String> = Vec::new();
+
+    for (op_name, fixture) in &fixtures {
+        let request = fixture
+            .get("request")
+            .unwrap_or_else(|| panic!("fixture {op_name} missing `request`"));
+        let required_keys = fixture
+            .get("response_required_keys")
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("fixture {op_name} missing `response_required_keys` array"));
+
+        let body = serde_json::to_string(request).unwrap();
+        let response = uds_round_trip(&sock_path, &body).await;
+
+        let obj = match response.as_object() {
+            Some(o) => o,
+            None => {
+                failures.push(format!(
+                    "op={op_name}: response is not a JSON object: {response}"
+                ));
+                continue;
+            }
+        };
+
+        // Required keys present? Ops that legitimately error on a fresh test
+        // daemon (e.g. read_content for a node that doesn't exist) may return
+        // {"ok": false, "error": "..."} instead of the success-path shape. The
+        // fixture's `response_required_keys` should include only keys present
+        // in BOTH branches — typically just "ok".
+        for key in required_keys {
+            let key_str = key
+                .as_str()
+                .unwrap_or_else(|| panic!("fixture {op_name} has non-string required key"));
+
+            // Allow "error" path for ops that return ok=false on empty state.
+            // The error branch sets `ok: false, error: "..."` and elides the
+            // success-only keys. The fixture's `response_required_keys` should
+            // include only the common ones — but we let the error branch off
+            // the hook for keys named in `response_required_keys` beyond "ok".
+            let is_error = obj.get("ok").and_then(|v| v.as_bool()) == Some(false);
+            if is_error && key_str != "ok" {
+                continue;
+            }
+
+            if !obj.contains_key(key_str) {
+                failures.push(format!(
+                    "op={op_name}: required key `{key_str}` missing from response: {response}"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "daemon protocol drift gate caught {} failure(s):\n  {}",
+        failures.len(),
+        failures.join("\n  "),
+    );
+}

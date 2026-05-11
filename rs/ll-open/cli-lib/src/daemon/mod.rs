@@ -14,6 +14,7 @@ pub mod ops;
 pub mod socket;
 #[cfg(feature = "vec")]
 pub mod vec_index;
+pub mod wire;
 
 #[cfg(feature = "vec")]
 use std::collections::BinaryHeap;

@@ -166,8 +166,21 @@ async fn dispatch(
         _ => {}
     }
 
-    // 2. Base ops
-    if let Some(response) = ops::handle_base_op(ctx, op, req) {
+    // 2. Base ops — serialize the (op, req) pair back into canonical wire
+    // shape so the typed dispatcher can re-parse it. The dispatch chain
+    // splits the line into (op, args), but `handle_base_op` re-fuses them
+    // via serde_json::from_str against the BaseRequest enum, which is the
+    // single source of truth for accepted shapes after A-3 (b69606).
+    let wire = {
+        let mut combined = req.clone();
+        if let serde_json::Value::Object(ref mut m) = combined {
+            m.insert("op".into(), json!(op));
+        } else {
+            combined = json!({"op": op});
+        }
+        combined.to_string()
+    };
+    if let Some(response) = ops::handle_base_op(ctx, &wire) {
         // Emit event for state-changing ops.
         if is_state_changing(op) {
             let emitter = conn_state.emitter();

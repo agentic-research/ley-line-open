@@ -1,5 +1,10 @@
 @0xa1b2c3d4e5f60001;
 
+# Go codegen annotations (inert for capnpc-rust; consumed by capnpc-go).
+using Go = import "/go.capnp";
+$Go.package("daemon");
+$Go.import("github.com/agentic-research/ley-line-open/clients/go/leyline-schema/daemon");
+
 # Daemon protocol schema — the contract between ley-line daemon (Rust)
 # and mache (Go) over the UDS control socket.
 #

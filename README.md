@@ -134,6 +134,21 @@ macOS prereq: `brew install fuse-t` (no kernel extension needed).
 Linux prereq: `apt-get install libfuse3-dev`.
 Capnp prereq (both): `brew install capnp` / `apt-get install capnproto` (required for build.rs codegen; pinned to ≥1.3.0).
 
+## Building the image
+
+A distroless OCI image (`ley-line-open:0.2.0`, ~20 MB) is built via [`krust`](https://github.com/imjasonh/krust) (cargo-zigbuild → static musl binary) + a one-line `docker build` that COPYs the binary onto `cgr.dev/chainguard/static`. See `image.Dockerfile` and `Taskfile.yml`. The image runs `leyline daemon --mcp-port 8384 --mcp-bind 0.0.0.0` headless — no FUSE/NFS, just the MCP HTTP transport on `:8384` inside the container (consumed by cloister via `LLO_MCP_URL`, default `http://localhost:8384/mcp`).
+
+```bash
+brew install zig                   # cargo-zigbuild backend
+cargo install cargo-zigbuild krust # one-time
+task image                         # → ley-line-open:0.2.0 in local docker
+task image:smoke                   # build + start daemon + curl tools/list
+```
+
+The `--mcp-bind 0.0.0.0` flag is required for docker port-forwarding to reach the listener — the daemon defaults to `127.0.0.1` (loopback-only inside the container, unreachable from the host).
+
+`apko.yaml` / `melange.yaml` are retained for reference but were abandoned on Apple Silicon — Docker Desktop's virtiofs makes melange's workspace bind-mount stall, and apko's multi-arch list fails when only the host arch APK exists. See `ley-line-open-2b255c` for the post-mortem.
+
 ## C FFI
 
 `leyline-fs` builds as a staticlib (`libleyline_fs.a`) with a C header (`include/leyline_fs.h`):
@@ -144,6 +159,16 @@ cargo build -p leyline-fs --lib
 # Header: rs/ll-open/fs/include/leyline_fs.h
 # Library: rs/target/debug/libleyline_fs.a
 ```
+
+## Go bindings
+
+Generated Go bindings for every public capnp schema ship as a separate Go module under [`clients/go/leyline-schema/`](clients/go/leyline-schema/) (multi-module monorepo, kubernetes/api / stripe-go pattern). Downstream Go consumers (mache first) `go get` it directly — no forking the `.capnp` files:
+
+```go
+import "github.com/agentic-research/ley-line-open/clients/go/leyline-schema/binding"
+```
+
+One sub-package per schema (`ast`, `binding`, `common`, `daemon`, `head`, `source`). Regen via `clients/go/leyline-schema/regen.sh`; CI gates on `git diff --exit-code` plus `go test ./...` decoding the same `tests/fixtures/*.bin` the Rust suite asserts byte-equality against.
 
 ## Schema contracts
 

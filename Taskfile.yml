@@ -130,6 +130,73 @@ tasks:
       - cargo build -p leyline-core -p leyline-schema -p leyline-public-schema
 
   # --------------------------------------------------------------------------
+  # Image build (krust + docker → distroless OCI image)
+  # --------------------------------------------------------------------------
+  # Two-step: krust+cargo-zigbuild produce a static musl binary (no docker
+  # daemon involved in the compile); docker assembles a one-layer image by
+  # COPYing that binary onto cgr.dev/chainguard/static. See image.Dockerfile.
+  #
+  # Why not apko/melange? See ley-line-open-2b255c. tl;dr on Apple Silicon
+  # the melange-via-docker workspace bind-mount stalls on virtiofs and
+  # leaks ~30 GB tmpdirs per run; apko's `archs: [x86_64, aarch64]` also
+  # fails when only one arch APK is built. krust sidesteps both.
+  #
+  # The image runs `leyline daemon --mcp-port 8384 --mcp-bind 0.0.0.0`
+  # headless (no FUSE). The --mcp-bind 0.0.0.0 override is required for
+  # docker port-forwarding to reach the listener — the daemon defaults to
+  # 127.0.0.1, which is loopback-only inside the container.
+  image:
+    desc: Build ley-line-open:0.2.0 OCI image (krust musl binary + docker COPY)
+    vars:
+      KRUST_REPO: '{{.KRUST_REPO | default "localhost/leyline"}}'
+      VERSION: '0.2.0'
+      PLATFORM: 'linux/arm64'
+    cmds:
+      - |
+        KRUST_REPO={{.KRUST_REPO}} krust build "$(pwd)/rs/ll-open/cli" \
+          --no-push --platform {{.PLATFORM}} -- --bin leyline
+      - |
+        docker build -f image.Dockerfile \
+          -t ley-line-open:{{.VERSION}} \
+          --platform {{.PLATFORM}} .
+      - |
+        echo "Built ley-line-open:{{.VERSION}} ({{.PLATFORM}})."
+        echo "Smoke: docker run --rm -p 18384:8384 ley-line-open:{{.VERSION}} \\"
+        echo "         daemon --mcp-port 8384 --mcp-bind 0.0.0.0"
+        echo "       curl -s -X POST http://localhost:18384/mcp \\"
+        echo "         -H 'Content-Type: application/json' \\"
+        echo "         -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}'"
+
+  image:smoke:
+    desc: Build image and run end-to-end smoke (start daemon, probe MCP tools/list)
+    deps: [image]
+    vars:
+      VERSION: '0.2.0'
+      HOST_PORT: '18384'
+    cmds:
+      - docker rm -f llo-smoke 2>/dev/null || true
+      - |
+        docker run -d --rm --name llo-smoke \
+          --platform linux/arm64 \
+          -p {{.HOST_PORT}}:8384 \
+          ley-line-open:{{.VERSION}} \
+          daemon --mcp-port 8384 --mcp-bind 0.0.0.0
+      - |
+        until curl -sf -m 1 -X POST http://localhost:{{.HOST_PORT}}/mcp \
+            -H 'Content-Type: application/json' -d '{}' >/dev/null 2>&1 \
+          || ! docker ps -q --filter name=llo-smoke | grep -q .; do
+          sleep 0.3
+        done
+      - |
+        echo "== tools/list =="
+        curl -s -X POST http://localhost:{{.HOST_PORT}}/mcp \
+          -H 'Content-Type: application/json' \
+          -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | head -c 400
+        echo
+      - docker stop llo-smoke
+      - echo "smoke passed"
+
+  # --------------------------------------------------------------------------
   # All-in-one
   # --------------------------------------------------------------------------
   ci:

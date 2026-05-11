@@ -29,8 +29,21 @@
 !rs/pkgconfig/**
 !entitlements.plist
 
+# Image build — configs tracked, artifacts/keys local-only.
+# Active path: `task image` uses krust + image.Dockerfile (see Taskfile.yml).
+# apko.yaml / melange.yaml retained for reference but the path was abandoned
+# on Apple Silicon (see ley-line-open-2b255c).
+!apko.yaml
+!melange.yaml
+!image.Dockerfile
+
 # Documentation
 !docs/**
+
+# Go bindings module — clients/go/leyline-schema/ ships generated *.capnp.go
+# files; the regen-diff CI gate (.github/workflows/leyline-schema-go.yml)
+# requires them to be tracked, not gitignored.
+!clients/**
 
 # Re-deny build artifacts
 **/target/

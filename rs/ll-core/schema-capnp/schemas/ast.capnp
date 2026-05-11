@@ -1,4 +1,10 @@
 @0x9e1e4e1af2b578d9;
+
+# Go codegen annotations (inert for capnpc-rust; consumed by capnpc-go).
+using Go = import "/go.capnp";
+$Go.package("ast");
+$Go.import("github.com/agentic-research/ley-line-open/clients/go/leyline-schema/ast");
+
 # AstNode — tree-sitter AST node projection.
 #
 # T8.3 (decade ley-line-open-9d30ac, thread T8/capnp-as-protocol).

@@ -1,4 +1,10 @@
 @0x9c0c8cd3c5b1329a;
+
+# Go codegen annotations (inert for capnpc-rust; consumed by capnpc-go).
+using Go = import "/go.capnp";
+$Go.package("binding");
+$Go.import("github.com/agentic-research/ley-line-open/clients/go/leyline-schema/binding");
+
 # BindingRecord — a single LSP-derived reference projected into Σ.
 #
 # T8.2 (decade ley-line-open-9d30ac, thread T8/capnp-as-protocol).

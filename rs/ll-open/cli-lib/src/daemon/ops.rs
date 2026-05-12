@@ -118,8 +118,20 @@ pub fn handle_base_op_value(
     Some(match typed_result {
         Ok(typed) => dispatch_typed(ctx, typed),
         Err(e) => build_error_response(&format!("{op}: {e}"))
-            .unwrap_or_else(|enc| format!(r#"{{"ok":false,"error":"dispatch error: {enc}"}}"#)),
+            .unwrap_or_else(|enc| fallback_error_envelope(&format!("dispatch error: {enc}"))),
     })
+}
+
+/// Last-resort error envelope when capnp-json encoding itself fails.
+/// Serializes through serde_json so the error message gets correct
+/// JSON-string escaping even if it contains quotes, backslashes, or
+/// control characters. The double-failure path (capnp-json fails AND
+/// serde_json fails) emits a hand-rolled string with a generic message;
+/// at that point the daemon is in trouble but the wire stays valid.
+fn fallback_error_envelope(message: &str) -> String {
+    serde_json::to_string(&serde_json::json!({"ok": false, "error": message})).unwrap_or_else(
+        |_| String::from(r#"{"ok":false,"error":"capnp-json + serde_json both failed"}"#),
+    )
 }
 
 /// Whether `op` is one of the canonical base ops the daemon dispatches.
@@ -189,7 +201,7 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
     };
     result.unwrap_or_else(|e| {
         build_error_response(&format!("{e:#}"))
-            .unwrap_or_else(|enc| format!(r#"{{"ok":false,"error":"handler error: {enc}"}}"#))
+            .unwrap_or_else(|enc| fallback_error_envelope(&format!("handler error: {enc}")))
     })
 }
 
@@ -924,28 +936,42 @@ fn op_get_token_map(ctx: &DaemonContext, table: &str, op: TokenMapOp) -> Result<
             });
         }
 
-        let mut builder = capnp::message::Builder::new_default();
+        // Build + emit JSON inside the matching branch so the
+        // Builder/Reader types stay consistent. The two responses
+        // share a layout today, but reading back as one type and
+        // having built as the other is brittle — future schema
+        // divergence would silently mis-encode without surfacing
+        // a Rust type error. Per Copilot review on PR #12.
         match op {
             TokenMapOp::Refs => {
-                let mut root: leyline_public_schema::daemon_capnp::get_refs_map_response::Builder =
-                    builder.init_root();
-                root.set_ok(true);
-                set_token_map_entries(root.init_entries(entries.len() as u32), &entries);
+                let mut builder = capnp::message::Builder::new_default();
+                {
+                    let mut root:
+                        leyline_public_schema::daemon_capnp::get_refs_map_response::Builder =
+                        builder.init_root();
+                    root.set_ok(true);
+                    set_token_map_entries(root.init_entries(entries.len() as u32), &entries);
+                }
+                let reader = builder.get_root_as_reader::<
+                    leyline_public_schema::daemon_capnp::get_refs_map_response::Reader,
+                >()?;
+                Ok(capnp_json::to_json(reader)?)
             }
             TokenMapOp::Defs => {
-                let mut root: leyline_public_schema::daemon_capnp::get_defs_map_response::Builder =
-                    builder.init_root();
-                root.set_ok(true);
-                set_token_map_entries(root.init_entries(entries.len() as u32), &entries);
+                let mut builder = capnp::message::Builder::new_default();
+                {
+                    let mut root:
+                        leyline_public_schema::daemon_capnp::get_defs_map_response::Builder =
+                        builder.init_root();
+                    root.set_ok(true);
+                    set_token_map_entries(root.init_entries(entries.len() as u32), &entries);
+                }
+                let reader = builder.get_root_as_reader::<
+                    leyline_public_schema::daemon_capnp::get_defs_map_response::Reader,
+                >()?;
+                Ok(capnp_json::to_json(reader)?)
             }
         }
-        // GetRefsMapResponse / GetDefsMapResponse share the same field
-        // layout (ok + entries), so reading via either Reader is safe;
-        // we pick refs arbitrarily.
-        let reader = builder.get_root_as_reader::<
-            leyline_public_schema::daemon_capnp::get_refs_map_response::Reader,
-        >()?;
-        Ok(capnp_json::to_json(reader)?)
     })
 }
 
@@ -1182,7 +1208,7 @@ where
 /// matching.
 fn node_not_found_response(id: &str) -> String {
     build_error_response(&format!("node '{id}' not found"))
-        .unwrap_or_else(|e| format!(r#"{{"ok":false,"error":"node lookup failed: {e}"}}"#))
+        .unwrap_or_else(|e| fallback_error_envelope(&format!("node lookup failed: {e}")))
 }
 
 /// Build the canonical `{"ok": false, "error": "..."}` envelope via the

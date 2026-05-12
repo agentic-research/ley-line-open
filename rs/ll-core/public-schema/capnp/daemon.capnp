@@ -50,6 +50,31 @@ struct EnrichmentStats {
   durationMs     @3 :UInt64  $Json.name("duration_ms");
 }
 
+# Per-pass enrichment status — the *current* state of a registered
+# enrichment pass (distinct from EnrichmentStats which is *per-run*
+# stats). Populated from `DaemonState.enrichment` map values.
+struct PassStatus {
+  # Wall-clock millis when the pass last completed. capnp-json emits
+  # Int64 fields as JSON strings; "0" means "not yet" (the pass has
+  # never run on this daemon instance). Consumers ignore when "0".
+  lastRunAtMs @0 :Int64  $Json.name("last_run_at_ms");
+  # parse_version the pass last ran against (causal basis). Same "0
+  # means not yet" convention.
+  basis       @1 :UInt64;
+  # Last error message, cleared on next successful run. Text field —
+  # capnp-json omits when unset, so absence means "no error".
+  error       @2 :Text;
+}
+
+# One entry in the per-pass enrichment status map. Used inside
+# `StatusResponse.enrichmentTyped` to replace the legacy `enrichment
+# @6 :Text` JSON-encoded-string field. Typed end-to-end; no double
+# parse on consumers.
+struct EnrichmentEntry {
+  name   @0 :Text;
+  status @1 :PassStatus;
+}
+
 struct Event {
   seq    @0 :UInt64;
   topic  @1 :Text;
@@ -69,15 +94,15 @@ struct QueryRow {
 
 struct StatusResponse {
   # JSON wire uses snake_case (`arena_path`, `current_root`, etc.) —
-  # consumer typed structs (Rust serde, hand-written Go) carry rename
-  # tags. The capnp schema preserves camelCase per convention.
+  # the camelCase capnp field names map via `$Json.name(...)` annotations
+  # consumed by capnp-json's codec at runtime.
   #
-  # `generation` was the pre-T2.4 sequence counter; current_root supersedes
-  # it. The handler stopped emitting `generation` at the T2.4 cutover but
-  # the field stays in the schema (per ADR-0014 §2 "removing fields is
-  # never"). Decoders that see the field absent get the UInt64 default 0;
-  # decoders that already used `generation` see 0 forever rather than a
-  # stale counter.
+  # `generation` was the pre-T2.4 sequence counter; `current_root`
+  # supersedes it. Post-b0ea2e (capnp-json wire codec): the field is
+  # emitted on every status response as the UInt64 default `"0"` —
+  # capnp-json emits all primitive fields including defaults, and
+  # ADR-0014 §2 forbids removing the ordinal. Handlers never set it;
+  # consumers ignore it. Identity comes from `current_root`.
   ok                @0 :Bool;
   generation        @1 :UInt64;
   arenaPath         @2 :Text  $Json.name("arena_path");
@@ -85,19 +110,25 @@ struct StatusResponse {
   phase             @4 :Text;
   currentRoot       @5 :Text  $Json.name("current_root");
   enrichment        @6 :Text;
-  # JSON-encoded `{name → {last_run_at_ms?, basis?, error?}}`. Schema
-  # leaves it as opaque Text for now; a typed EnrichmentMap follow-up
-  # is tracked under a future bead. Consumers parse the inner JSON
-  # by hand today.
+  # **Legacy** — JSON-encoded `{name → {last_run_at_ms?, basis?,
+  # error?}}`. Pre-b0ea2e the canonical shape. Post-b0ea2e the daemon
+  # leaves this field unset (capnp-json omits unset Text on the wire),
+  # but the ordinal stays per ADR-0014 §2 in case any pinned
+  # consumer still reads it. **Use `enrichmentTyped @10` instead.**
   headSha           @7 :Text  $Json.name("head_sha");
   lastReparseAtMs   @8 :Int64  $Json.name("last_reparse_at_ms");
   # On the Cap'n Proto side this field is always present (capnp ints
-  # can't be absent and default to 0). On the JSON wire we emit the
-  # field only when populated — `last_reparse_at_ms` is omitted before
-  # the first reparse, so clients distinguish "not yet" from epoch=0
-  # by key presence. Cap'n Proto consumers should treat 0 as "not yet"
-  # until a typed Optional follow-up lands.
+  # can't be absent and default to 0). The JSON wire emits "0" pre-
+  # first-reparse since capnp-json has no skip-if-default annotation;
+  # consumers ignore the value when "0" — see ADR-0014's interim
+  # status section.
   error             @9 :Text;
+  # Typed per-pass enrichment status — replaces the legacy
+  # `enrichment @6 :Text` JSON-string field. List of `(name,
+  # PassStatus)` entries, fully typed end-to-end. No double parse
+  # on consumers. Added in b0ea2e (PR #12) after the Text field's
+  # double-parse design flaw was caught in review.
+  enrichmentTyped   @10 :List(EnrichmentEntry)  $Json.name("enrichment_typed");
 }
 
 struct ReparseRequest {
@@ -290,4 +321,10 @@ struct SubscribeResponse {
 
 struct ErrorResponse {
   error @0 :Text;
+  ok    @1 :Bool;
+  # On the JSON wire the error envelope emits `{"ok": false, "error": "..."}`.
+  # Bool defaults to false in capnp; handlers never explicitly set this,
+  # so the wire always reads `"ok": false` for error responses. Added
+  # additively per ADR-0014 §2; pre-b0ea2e the field was on every typed
+  # envelope via the hand-written wire.rs ErrorResponse struct.
 }

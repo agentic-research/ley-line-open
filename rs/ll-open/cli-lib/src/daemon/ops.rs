@@ -10,13 +10,7 @@ use leyline_core::Controller;
 use rusqlite::Connection;
 use serde_json::json;
 
-use super::wire::{
-    BaseRequest, EnrichResponse, ErrorResponse, FindCalleesResponse, FindCallersResponse,
-    FindDefsResponse, FlushResponse, GetDbPathResponse, GetDefsMapResponse, GetNodeResponse,
-    GetRefsMapResponse, GetSchemaResponse, ListChildrenResponse, LoadResponse, LspFile,
-    LspPosition, Node as WireNode, ReadContentResponse, Ref as WireRef, ReparseResponse,
-    SchemaTier, SnapshotResponse, StatusResponse, TokenMapEntry, to_wire,
-};
+use super::wire::{BaseRequest, LspFile, LspPosition, Ref as WireRef, TokenMapEntry};
 use super::{DaemonContext, DaemonPhase};
 
 // ---------------------------------------------------------------------------
@@ -123,8 +117,21 @@ pub fn handle_base_op_value(
     let typed_result: std::result::Result<BaseRequest, _> = serde_json::from_value(parsed);
     Some(match typed_result {
         Ok(typed) => dispatch_typed(ctx, typed),
-        Err(e) => to_wire(&ErrorResponse::new(format!("{op}: {e}"))),
+        Err(e) => build_error_response(&format!("{op}: {e}"))
+            .unwrap_or_else(|enc| fallback_error_envelope(&format!("dispatch error: {enc}"))),
     })
+}
+
+/// Last-resort error envelope when capnp-json encoding itself fails.
+/// Serializes through serde_json so the error message gets correct
+/// JSON-string escaping even if it contains quotes, backslashes, or
+/// control characters. The double-failure path (capnp-json fails AND
+/// serde_json fails) emits a hand-rolled string with a generic message;
+/// at that point the daemon is in trouble but the wire stays valid.
+fn fallback_error_envelope(message: &str) -> String {
+    serde_json::to_string(&serde_json::json!({"ok": false, "error": message})).unwrap_or_else(
+        |_| String::from(r#"{"ok":false,"error":"capnp-json + serde_json both failed"}"#),
+    )
 }
 
 /// Whether `op` is one of the canonical base ops the daemon dispatches.
@@ -192,7 +199,10 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
         #[cfg(feature = "vec")]
         BaseRequest::VecSearch { query, k } => op_vec_search(ctx, &query, k),
     };
-    result.unwrap_or_else(|e| to_wire(&ErrorResponse::new(format!("{e:#}"))))
+    result.unwrap_or_else(|e| {
+        build_error_response(&format!("{e:#}"))
+            .unwrap_or_else(|enc| fallback_error_envelope(&format!("handler error: {enc}")))
+    })
 }
 
 /// Legacy compat wrapper for tests that constructed (op, args:Value) pairs
@@ -362,20 +372,12 @@ fn op_status(ctx: &DaemonContext) -> Result<String> {
         poisoned.into_inner()
     });
 
-    let mut enrichment = serde_json::Map::new();
-    for (name, status) in &state.enrichment {
-        let mut s = serde_json::Map::new();
-        if let Some(t) = status.last_run_at_ms {
-            s.insert("last_run_at_ms".into(), json!(t));
-        }
-        if let Some(b) = status.basis {
-            s.insert("basis".into(), json!(b));
-        }
-        if let Some(e) = &status.error {
-            s.insert("error".into(), json!(e));
-        }
-        enrichment.insert(name.clone(), serde_json::Value::Object(s));
-    }
+    // Collect per-pass status into a Vec the typed-list builder can
+    // iterate (sorted by name so the wire is deterministic across
+    // HashMap iteration order). Each entry mirrors a `PassStatus`
+    // capnp struct.
+    let mut entries: Vec<(&String, &super::PassStatus)> = state.enrichment.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
 
     // T2.4 wire format: BLAKE3 of arena bytes as 64-char hex.
     let current_root_hex = {
@@ -387,28 +389,67 @@ fn op_status(ctx: &DaemonContext) -> Result<String> {
         }
         s
     };
-    Ok(to_wire(&StatusResponse {
-        ok: true,
-        phase: state.phase.as_str().to_string(),
-        current_root: current_root_hex,
-        arena_path: ctrl.arena_path().to_string(),
-        arena_size: ctrl.arena_size(),
-        enrichment: serde_json::Value::Object(enrichment),
-        head_sha: state.head_sha.clone(),
-        last_reparse_at_ms: state.last_reparse_at_ms,
-        error: if let DaemonPhase::Error(msg) = &state.phase {
-            Some(msg.clone())
-        } else {
-            None
-        },
-    }))
+
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root: leyline_public_schema::daemon_capnp::status_response::Builder =
+        builder.init_root();
+    root.set_ok(true);
+    root.set_phase(state.phase.as_str());
+    root.set_current_root(&current_root_hex);
+    root.set_arena_path(ctrl.arena_path());
+    root.set_arena_size(ctrl.arena_size());
+    // Legacy `enrichment @6 :Text` field deliberately left unset —
+    // capnp-json omits unset Text on the wire, so the field disappears
+    // from the JSON output entirely. The typed shape rides in
+    // `enrichmentTyped @10 :List(EnrichmentEntry)` below. Ordinal
+    // preserved per ADR-0014 §2 in case any pinned consumer reads it
+    // (they'll get the empty default and should migrate to the typed
+    // field).
+    if let Some(sha) = &state.head_sha {
+        root.set_head_sha(sha);
+    }
+    if let Some(t) = state.last_reparse_at_ms {
+        root.set_last_reparse_at_ms(t);
+    }
+    if let DaemonPhase::Error(msg) = &state.phase {
+        root.set_error(msg);
+    }
+    // Typed enrichment — typed end-to-end, no double parse on
+    // consumers. Each entry is `(name, PassStatus { last_run_at_ms,
+    // basis, error })`. Unset Text (error) is omitted on the wire;
+    // Int64 fields (last_run_at_ms, basis) emit "0" as the
+    // not-yet-set sentinel (capnp-json has no skip-if-default
+    // annotation).
+    let mut enrichment_b = root.init_enrichment_typed(entries.len() as u32);
+    for (i, (name, status)) in entries.iter().enumerate() {
+        let mut entry = enrichment_b.reborrow().get(i as u32);
+        entry.set_name(name);
+        let mut s = entry.init_status();
+        if let Some(t) = status.last_run_at_ms {
+            s.set_last_run_at_ms(t);
+        }
+        if let Some(b) = status.basis {
+            s.set_basis(b);
+        }
+        if let Some(e) = &status.error {
+            s.set_error(e);
+        }
+    }
+    let reader = builder
+        .get_root_as_reader::<leyline_public_schema::daemon_capnp::status_response::Reader>()?;
+    Ok(capnp_json::to_json(reader)?)
 }
 
 fn op_flush(ctrl_path: &Path) -> Result<String> {
-    Ok(to_wire(&FlushResponse {
-        ok: true,
-        current_root: read_root_hex(ctrl_path)?,
-    }))
+    let current_root = read_root_hex(ctrl_path)?;
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root: leyline_public_schema::daemon_capnp::flush_response::Builder =
+        builder.init_root();
+    root.set_ok(true);
+    root.set_current_root(&current_root);
+    let reader = builder
+        .get_root_as_reader::<leyline_public_schema::daemon_capnp::flush_response::Reader>()?;
+    Ok(capnp_json::to_json(reader)?)
 }
 
 fn op_load(ctrl_path: &Path, db_b64: &str) -> Result<String> {
@@ -417,10 +458,14 @@ fn op_load(ctrl_path: &Path, db_b64: &str) -> Result<String> {
         .decode(db_b64)
         .context("invalid base64 in \"db\" field")?;
     crate::cmd_load::load_into_arena(ctrl_path, &db_bytes)?;
-    Ok(to_wire(&LoadResponse {
-        ok: true,
-        current_root: read_root_hex(ctrl_path)?,
-    }))
+    let current_root = read_root_hex(ctrl_path)?;
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root: leyline_public_schema::daemon_capnp::load_response::Builder = builder.init_root();
+    root.set_ok(true);
+    root.set_current_root(&current_root);
+    let reader = builder
+        .get_root_as_reader::<leyline_public_schema::daemon_capnp::load_response::Reader>()?;
+    Ok(capnp_json::to_json(reader)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -530,15 +575,23 @@ fn op_reparse(
         s.last_reparse_at_ms = Some(super::now_ms());
     }
 
-    Ok(to_wire(&ReparseResponse {
-        ok: true,
-        current_root: read_root_hex(&ctx.ctrl_path)?,
-        parsed: result.parsed as u64,
-        unchanged: result.unchanged as u64,
-        deleted: result.deleted as u64,
-        errors: result.errors as u64,
-        changed_files: result.changed_files.clone(),
-    }))
+    let current_root = read_root_hex(&ctx.ctrl_path)?;
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root: leyline_public_schema::daemon_capnp::reparse_response::Builder =
+        builder.init_root();
+    root.set_ok(true);
+    root.set_current_root(&current_root);
+    root.set_parsed(result.parsed as u64);
+    root.set_unchanged(result.unchanged as u64);
+    root.set_deleted(result.deleted as u64);
+    root.set_errors(result.errors as u64);
+    let mut changed = root.init_changed_files(result.changed_files.len() as u32);
+    for (i, f) in result.changed_files.iter().enumerate() {
+        changed.set(i as u32, f);
+    }
+    let reader = builder
+        .get_root_as_reader::<leyline_public_schema::daemon_capnp::reparse_response::Reader>()?;
+    Ok(capnp_json::to_json(reader)?)
 }
 
 fn op_enrich(ctx: &DaemonContext, pass_name: &str, files: Option<&[String]>) -> Result<String> {
@@ -565,19 +618,36 @@ fn op_enrich(ctx: &DaemonContext, pass_name: &str, files: Option<&[String]>) -> 
     // Snapshot to arena after enrichment.
     snapshot_living_db(ctx)?;
 
-    Ok(to_wire(&EnrichResponse {
-        ok: true,
-        current_root: read_root_hex(&ctx.ctrl_path)?,
-        passes: serde_json::to_value(&stats)?,
-    }))
+    let current_root = read_root_hex(&ctx.ctrl_path)?;
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root: leyline_public_schema::daemon_capnp::enrich_response::Builder =
+        builder.init_root();
+    root.set_ok(true);
+    root.set_current_root(&current_root);
+    let mut passes_b = root.init_passes(stats.len() as u32);
+    for (i, s) in stats.iter().enumerate() {
+        let mut entry = passes_b.reborrow().get(i as u32);
+        entry.set_pass_name(&s.pass_name);
+        entry.set_files_processed(s.files_processed);
+        entry.set_items_added(s.items_added);
+        entry.set_duration_ms(s.duration_ms);
+    }
+    let reader = builder
+        .get_root_as_reader::<leyline_public_schema::daemon_capnp::enrich_response::Reader>()?;
+    Ok(capnp_json::to_json(reader)?)
 }
 
 fn op_snapshot(ctx: &DaemonContext) -> Result<String> {
     snapshot_living_db(ctx)?;
-    Ok(to_wire(&SnapshotResponse {
-        ok: true,
-        current_root: read_root_hex(&ctx.ctrl_path)?,
-    }))
+    let current_root = read_root_hex(&ctx.ctrl_path)?;
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root: leyline_public_schema::daemon_capnp::snapshot_response::Builder =
+        builder.init_root();
+    root.set_ok(true);
+    root.set_current_root(&current_root);
+    let reader = builder
+        .get_root_as_reader::<leyline_public_schema::daemon_capnp::snapshot_response::Reader>()?;
+    Ok(capnp_json::to_json(reader)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -665,20 +735,28 @@ fn op_list_children(ctx: &DaemonContext, id: &str) -> Result<String> {
                 ))
             })?
             .collect::<Result<_, _>>()?;
-        let children: Vec<WireNode> = raw
-            .iter()
-            .map(|(id, parent_id, name, kind, size)| WireNode {
-                id: id.clone(),
-                parent_id: parent_id.clone(),
-                name: name.clone(),
-                kind: *kind,
-                size: *size,
-                record: None,
-            })
-            .collect();
         let touched: Vec<&str> = raw.iter().map(|(id, ..)| id.as_str()).collect();
+        let mut builder = capnp::message::Builder::new_default();
+        let mut root: leyline_public_schema::daemon_capnp::list_children_response::Builder =
+            builder.init_root();
+        root.set_ok(true);
+        let mut children_b = root.init_children(raw.len() as u32);
+        for (i, (id, parent_id, name, kind, size)) in raw.iter().enumerate() {
+            let mut node = children_b.reborrow().get(i as u32);
+            node.set_id(id);
+            node.set_parent_id(parent_id);
+            node.set_name(name);
+            node.set_kind(*kind);
+            node.set_size(*size);
+            // `record` deliberately omitted on directory listings — keeps
+            // listings small. Consumers call get_node / read_content per
+            // file when they actually need the record blob.
+        }
+        let reader = builder.get_root_as_reader::<
+            leyline_public_schema::daemon_capnp::list_children_response::Reader,
+        >()?;
         Ok((
-            to_wire(&ListChildrenResponse { ok: true, children }),
+            capnp_json::to_json(reader)?,
             touched.into_iter().map(String::from).collect::<Vec<_>>(),
         ))
     })?;
@@ -695,11 +773,17 @@ fn op_read_content(ctx: &DaemonContext, id: &str) -> Result<String> {
     promote_touched(ctx, &[id]);
 
     with_live_db(ctx, |conn| match query_node_record(conn, id)? {
-        Some(c) => Ok(to_wire(&ReadContentResponse {
-            ok: true,
-            content: Some(c),
-            error: None,
-        })),
+        Some(c) => {
+            let mut builder = capnp::message::Builder::new_default();
+            let mut root: leyline_public_schema::daemon_capnp::read_content_response::Builder =
+                builder.init_root();
+            root.set_ok(true);
+            root.set_content(&c);
+            let reader = builder.get_root_as_reader::<
+                leyline_public_schema::daemon_capnp::read_content_response::Reader,
+            >()?;
+            Ok(capnp_json::to_json(reader)?)
+        }
         None => Ok(node_not_found_response(id)),
     })
 }
@@ -707,17 +791,46 @@ fn op_read_content(ctx: &DaemonContext, id: &str) -> Result<String> {
 /// Find callers of a token (queries node_refs).
 fn op_find_callers(ctx: &DaemonContext, token: &str) -> Result<String> {
     with_live_db(ctx, |conn| {
-        let callers = query_token_refs(conn, token, "node_refs")?;
-        Ok(to_wire(&FindCallersResponse { ok: true, callers }))
+        let rows = query_token_refs(conn, token, "node_refs")?;
+        let mut builder = capnp::message::Builder::new_default();
+        let mut root: leyline_public_schema::daemon_capnp::find_callers_response::Builder =
+            builder.init_root();
+        root.set_ok(true);
+        set_ref_list(root.init_callers(rows.len() as u32), &rows);
+        let reader = builder.get_root_as_reader::<
+            leyline_public_schema::daemon_capnp::find_callers_response::Reader,
+        >()?;
+        Ok(capnp_json::to_json(reader)?)
     })
 }
 
 /// Find definitions of a token (queries node_defs).
 fn op_find_defs(ctx: &DaemonContext, token: &str) -> Result<String> {
     with_live_db(ctx, |conn| {
-        let defs = query_token_refs(conn, token, "node_defs")?;
-        Ok(to_wire(&FindDefsResponse { ok: true, defs }))
+        let rows = query_token_refs(conn, token, "node_defs")?;
+        let mut builder = capnp::message::Builder::new_default();
+        let mut root: leyline_public_schema::daemon_capnp::find_defs_response::Builder =
+            builder.init_root();
+        root.set_ok(true);
+        set_ref_list(root.init_defs(rows.len() as u32), &rows);
+        let reader = builder
+            .get_root_as_reader::<leyline_public_schema::daemon_capnp::find_defs_response::Reader>(
+            )?;
+        Ok(capnp_json::to_json(reader)?)
     })
+}
+
+/// Populate a capnp `List(Ref)` from a slice of WireRef rows. Used by
+/// find_callers / find_defs / find_callees handlers.
+fn set_ref_list(
+    mut list: capnp::struct_list::Builder<'_, leyline_public_schema::daemon_capnp::ref_::Owned>,
+    rows: &[WireRef],
+) {
+    for (i, r) in rows.iter().enumerate() {
+        let mut entry = list.reborrow().get(i as u32);
+        entry.set_node_id(&r.node_id);
+        entry.set_source_id(&r.source_id);
+    }
 }
 
 /// Shared row-fetch helper for `find_callers` / `find_defs`. Returns
@@ -769,7 +882,15 @@ fn op_find_callees(ctx: &DaemonContext, id: &str) -> Result<String> {
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(to_wire(&FindCalleesResponse { ok: true, callees }))
+        let mut builder = capnp::message::Builder::new_default();
+        let mut root: leyline_public_schema::daemon_capnp::find_callees_response::Builder =
+            builder.init_root();
+        root.set_ok(true);
+        set_ref_list(root.init_callees(callees.len() as u32), &callees);
+        let reader = builder.get_root_as_reader::<
+            leyline_public_schema::daemon_capnp::find_callees_response::Reader,
+        >()?;
+        Ok(capnp_json::to_json(reader)?)
     })
 }
 
@@ -830,11 +951,62 @@ fn op_get_token_map(ctx: &DaemonContext, table: &str, op: TokenMapOp) -> Result<
             });
         }
 
-        Ok(match op {
-            TokenMapOp::Refs => to_wire(&GetRefsMapResponse { ok: true, entries }),
-            TokenMapOp::Defs => to_wire(&GetDefsMapResponse { ok: true, entries }),
-        })
+        // Build + emit JSON inside the matching branch so the
+        // Builder/Reader types stay consistent. The two responses
+        // share a layout today, but reading back as one type and
+        // having built as the other is brittle — future schema
+        // divergence would silently mis-encode without surfacing
+        // a Rust type error. Per Copilot review on PR #12.
+        match op {
+            TokenMapOp::Refs => {
+                let mut builder = capnp::message::Builder::new_default();
+                {
+                    let mut root:
+                        leyline_public_schema::daemon_capnp::get_refs_map_response::Builder =
+                        builder.init_root();
+                    root.set_ok(true);
+                    set_token_map_entries(root.init_entries(entries.len() as u32), &entries);
+                }
+                let reader = builder.get_root_as_reader::<
+                    leyline_public_schema::daemon_capnp::get_refs_map_response::Reader,
+                >()?;
+                Ok(capnp_json::to_json(reader)?)
+            }
+            TokenMapOp::Defs => {
+                let mut builder = capnp::message::Builder::new_default();
+                {
+                    let mut root:
+                        leyline_public_schema::daemon_capnp::get_defs_map_response::Builder =
+                        builder.init_root();
+                    root.set_ok(true);
+                    set_token_map_entries(root.init_entries(entries.len() as u32), &entries);
+                }
+                let reader = builder.get_root_as_reader::<
+                    leyline_public_schema::daemon_capnp::get_defs_map_response::Reader,
+                >()?;
+                Ok(capnp_json::to_json(reader)?)
+            }
+        }
     })
+}
+
+/// Populate a capnp `List(TokenMapEntry)` from a slice of TokenMapEntry rows.
+/// Shared by `op_get_token_map`'s Refs and Defs branches.
+fn set_token_map_entries(
+    mut list: capnp::struct_list::Builder<
+        '_,
+        leyline_public_schema::daemon_capnp::token_map_entry::Owned,
+    >,
+    entries: &[TokenMapEntry],
+) {
+    for (i, e) in entries.iter().enumerate() {
+        let mut entry = list.reborrow().get(i as u32);
+        entry.set_token(&e.token);
+        let mut ids = entry.init_node_ids(e.node_ids.len() as u32);
+        for (j, nid) in e.node_ids.iter().enumerate() {
+            ids.set(j as u32, nid);
+        }
+    }
 }
 
 /// Which bulk-export op we're serving — pinpoints the response variant.
@@ -863,33 +1035,46 @@ enum TokenMapOp {
 /// future work expands this; today only the LLO built-in tiers are
 /// exposed. Read-only — does NOT belong in STATE_CHANGING_OPS.
 fn op_get_schema() -> Result<String> {
-    Ok(to_wire(&GetSchemaResponse {
-        ok: true,
-        tiers: vec![
-            SchemaTier {
-                name: "ll-core".into(),
-                crates: vec![
-                    "leyline-core".into(),
-                    "leyline-schema".into(),
-                    "leyline-public-schema".into(),
-                    "leyline-schema-capnp".into(),
-                ],
-            },
-            SchemaTier {
-                name: "ll-open".into(),
-                crates: vec![
-                    "leyline-fs".into(),
-                    "leyline-ts".into(),
-                    "leyline-lsp".into(),
-                    "leyline-hdc".into(),
-                    "leyline-cli-lib".into(),
-                    "leyline-cli".into(),
-                    "leyline-vcs".into(),
-                    "leyline-sign".into(),
-                ],
-            },
-        ],
-    }))
+    let tiers: &[(&str, &[&str])] = &[
+        (
+            "ll-core",
+            &[
+                "leyline-core",
+                "leyline-schema",
+                "leyline-public-schema",
+                "leyline-schema-capnp",
+            ],
+        ),
+        (
+            "ll-open",
+            &[
+                "leyline-fs",
+                "leyline-ts",
+                "leyline-lsp",
+                "leyline-hdc",
+                "leyline-cli-lib",
+                "leyline-cli",
+                "leyline-vcs",
+                "leyline-sign",
+            ],
+        ),
+    ];
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root: leyline_public_schema::daemon_capnp::get_schema_response::Builder =
+        builder.init_root();
+    root.set_ok(true);
+    let mut tiers_b = root.init_tiers(tiers.len() as u32);
+    for (i, (name, crates)) in tiers.iter().enumerate() {
+        let mut tier = tiers_b.reborrow().get(i as u32);
+        tier.set_name(name);
+        let mut crates_b = tier.init_crates(crates.len() as u32);
+        for (j, c) in crates.iter().enumerate() {
+            crates_b.set(j as u32, c);
+        }
+    }
+    let reader = builder
+        .get_root_as_reader::<leyline_public_schema::daemon_capnp::get_schema_response::Reader>()?;
+    Ok(capnp_json::to_json(reader)?)
 }
 
 /// Export the daemon's filesystem paths — the .db location + sibling
@@ -904,15 +1089,20 @@ fn op_get_db_path(ctrl_path: &Path) -> Result<String> {
     // same prefix.
     let base = ctrl_path.with_extension("");
     let base_str = base.to_string_lossy();
-    Ok(to_wire(&GetDbPathResponse {
-        ok: true,
-        db_path: format!("{base_str}.db"),
-        ctrl_path: ctrl_str,
-        bindings_path: format!("{base_str}.bindings.capnp"),
-        ast_path: format!("{base_str}.ast.capnp"),
-        source_path: format!("{base_str}.source.capnp"),
-        head_path: format!("{base_str}.head.capnp"),
-    }))
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root: leyline_public_schema::daemon_capnp::get_db_path_response::Builder =
+        builder.init_root();
+    root.set_ok(true);
+    root.set_db_path(format!("{base_str}.db"));
+    root.set_ctrl_path(ctrl_str);
+    root.set_bindings_path(format!("{base_str}.bindings.capnp"));
+    root.set_ast_path(format!("{base_str}.ast.capnp"));
+    root.set_source_path(format!("{base_str}.source.capnp"));
+    root.set_head_path(format!("{base_str}.head.capnp"));
+    let reader = builder
+        .get_root_as_reader::<leyline_public_schema::daemon_capnp::get_db_path_response::Reader>(
+        )?;
+    Ok(capnp_json::to_json(reader)?)
 }
 
 /// Get a single node by ID.
@@ -920,27 +1110,41 @@ fn op_get_node(ctx: &DaemonContext, id: &str) -> Result<String> {
     promote_touched(ctx, &[id]);
 
     with_live_db(ctx, |conn| {
-        let node = query_row_opt(
+        let row: Option<(String, String, String, i32, i64, Option<String>)> = query_row_opt(
             conn,
             "SELECT id, parent_id, name, kind, size, record FROM nodes WHERE id = ?1",
             [id],
             |row| {
-                Ok(WireNode {
-                    id: row.get::<_, String>(0)?,
-                    parent_id: row.get::<_, String>(1)?,
-                    name: row.get::<_, String>(2)?,
-                    kind: row.get::<_, i32>(3)?,
-                    size: row.get::<_, i64>(4)?,
-                    record: row.get::<_, Option<String>>(5)?,
-                })
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i32>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
             },
         )?;
-        match node {
-            Some(n) => Ok(to_wire(&GetNodeResponse {
-                ok: true,
-                node: Some(n),
-                error: None,
-            })),
+        match row {
+            Some((rid, parent_id, name, kind, size, record)) => {
+                let mut builder = capnp::message::Builder::new_default();
+                let mut root: leyline_public_schema::daemon_capnp::get_node_response::Builder =
+                    builder.init_root();
+                root.set_ok(true);
+                let mut node = root.init_node();
+                node.set_id(&rid);
+                node.set_parent_id(&parent_id);
+                node.set_name(&name);
+                node.set_kind(kind);
+                node.set_size(size);
+                if let Some(r) = record {
+                    node.set_record(&r);
+                }
+                let reader = builder.get_root_as_reader::<
+                    leyline_public_schema::daemon_capnp::get_node_response::Reader,
+                >()?;
+                Ok(capnp_json::to_json(reader)?)
+            }
             None => Ok(node_not_found_response(id)),
         }
     })
@@ -1018,7 +1222,27 @@ where
 /// and message so clients can detect "no such node" without brittle string
 /// matching.
 fn node_not_found_response(id: &str) -> String {
-    to_wire(&ErrorResponse::new(format!("node '{id}' not found")))
+    build_error_response(&format!("node '{id}' not found"))
+        .unwrap_or_else(|e| fallback_error_envelope(&format!("node lookup failed: {e}")))
+}
+
+/// Build the canonical `{"ok": false, "error": "..."}` envelope via the
+/// capnp-json codec. Used by handler error paths, the dispatcher's
+/// catch-all, and `node_not_found_response`. Returns an `anyhow::Result`
+/// because capnp builder operations can theoretically fail; in practice
+/// the fallback string in callers makes the encoding-failure case visible
+/// to operators rather than silent.
+fn build_error_response(msg: &str) -> Result<String> {
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root: leyline_public_schema::daemon_capnp::error_response::Builder =
+        builder.init_root();
+    // `ok` defaults to `false` for capnp Bool — we deliberately don't set
+    // it. capnp-json emits the default, so the wire reads `"ok": false`
+    // for every error response.
+    root.set_error(msg);
+    let reader = builder
+        .get_root_as_reader::<leyline_public_schema::daemon_capnp::error_response::Reader>()?;
+    Ok(capnp_json::to_json(reader)?)
 }
 
 /// Fetch the `record` column for a node id. Returns `Ok(None)` for both
@@ -2125,11 +2349,19 @@ mod tests {
 
     #[tokio::test]
     async fn op_status_wire_format_pins_required_fields() {
-        // T2.4: wire-format pin. op_status response is consumed by
-        // mache + cli status checks; clients dispatch on every field
-        // name. The breaking change for v0.2.0 is `generation` →
-        // `current_root` (64-char hex). Pin all 6 always-emitted
-        // fields so renames or drops fail loudly.
+        // Wire-format pin. op_status response is consumed by mache +
+        // cli status checks; clients dispatch on every field name.
+        // Pin all 6 always-emitted fields so renames or drops fail
+        // loudly.
+        //
+        // Post-b0ea2e (capnp-json wire codec): `generation` reappears
+        // in the output as the string `"0"` — capnp-json emits every
+        // primitive field including defaults, and ADR-0014 §2 forbids
+        // removing the ordinal. T2.4's "generation gone from the
+        // wire" assertion is dropped; the field is now permanently
+        // present at default value, semantically meaningless, with
+        // current_root as the canonical identity. Mache + cloister
+        // consumers MUST ignore the field.
         let (_dir, ctx) = setup();
         let result = handle_base_op_legacy(&ctx, "status", &json!({})).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -2141,7 +2373,7 @@ mod tests {
             "current_root",
             "arena_path",
             "arena_size",
-            "enrichment",
+            "enrichment_typed",
         ] {
             assert!(
                 obj.contains_key(required_field),
@@ -2149,10 +2381,19 @@ mod tests {
                 obj.keys().collect::<Vec<_>>(),
             );
         }
-        // T2.4: `generation` is gone from the wire format.
+        // b0ea2e: `generation` is present (as `"0"`) but semantically dead.
+        // Pin its presence so downstream consumers know what to expect.
+        assert_eq!(
+            obj.get("generation").and_then(|v| v.as_str()),
+            Some("0"),
+            "post-b0ea2e: legacy `generation` field present as default \"0\""
+        );
+        // Legacy `enrichment :Text` field deliberately not emitted —
+        // handler leaves the capnp slot unset; capnp-json omits unset
+        // Text. The typed shape rides in `enrichment_typed`.
         assert!(
-            !obj.contains_key("generation"),
-            "T2.4: op_status MUST NOT include legacy `generation` field; \
+            !obj.contains_key("enrichment"),
+            "post-b0ea2e: legacy `enrichment` Text field must NOT be on the wire; \
              got keys {:?}",
             obj.keys().collect::<Vec<_>>(),
         );
@@ -2164,8 +2405,15 @@ mod tests {
         assert_eq!(root, "0".repeat(64), "fresh controller emits zero sentinel");
         // phase from a fresh setup is "initializing".
         assert_eq!(parsed["phase"], "initializing");
-        // enrichment is an object (possibly empty).
-        assert!(parsed["enrichment"].is_object());
+        // enrichment_typed is a typed JSON array — no double parse on
+        // consumers. Empty on fresh setup (no passes have run).
+        let enriched = parsed["enrichment_typed"]
+            .as_array()
+            .expect("enrichment_typed is a JSON array");
+        assert!(
+            enriched.is_empty(),
+            "fresh setup has no enrichment passes; got {enriched:?}"
+        );
     }
 
     #[tokio::test]
@@ -2214,8 +2462,8 @@ mod tests {
             "phase field must survive poison recovery"
         );
         assert!(
-            parsed.get("enrichment").is_some(),
-            "enrichment field must survive poison recovery"
+            parsed.get("enrichment_typed").is_some(),
+            "enrichment_typed field must survive poison recovery"
         );
     }
 

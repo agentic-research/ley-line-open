@@ -2282,13 +2282,21 @@ async fn test_status_reports_phase_and_enrichment() {
     assert_eq!(parsed["ok"], true);
     assert_eq!(parsed["phase"], "ready");
     assert_eq!(parsed["head_sha"], "abc1234");
-    assert_eq!(parsed["last_reparse_at_ms"], 1_700_000_000_000_i64);
-    assert!(parsed["enrichment"].is_object());
-    assert_eq!(parsed["enrichment"]["tree-sitter"]["basis"], 1);
-    assert_eq!(
-        parsed["enrichment"]["tree-sitter"]["last_run_at_ms"],
-        1_700_000_000_000_i64,
-    );
+    // Post-b0ea2e: capnp-json codec emits Int64 as JSON strings.
+    assert_eq!(parsed["last_reparse_at_ms"], "1700000000000");
+    // Post-b0ea2e (b0ea2e reshape): `enrichment_typed` is a typed JSON
+    // array of `{name, status: PassStatus}` entries. No double parse.
+    // The legacy `enrichment :Text` field is deliberately not emitted.
+    let typed = parsed["enrichment_typed"]
+        .as_array()
+        .expect("enrichment_typed is a JSON array");
+    let entry = typed
+        .iter()
+        .find(|e| e["name"] == "tree-sitter")
+        .expect("tree-sitter pass present");
+    // Int64 fields ride as JSON strings under capnp-json.
+    assert_eq!(entry["status"]["basis"], "1");
+    assert_eq!(entry["status"]["last_run_at_ms"], "1700000000000");
 }
 
 /// Verify scoped reparse only touches the files in `scope`.
@@ -2495,7 +2503,7 @@ async fn test_op_reparse_accepts_single_file_source() {
         parsed["ok"], true,
         "single-file reparse should succeed: {parsed}"
     );
-    assert_eq!(parsed["parsed"], 1, "only a.go should be reparsed");
+    assert_eq!(parsed["parsed"], "1", "only a.go should be reparsed");
     let changed = parsed["changed_files"]
         .as_array()
         .expect("changed_files array");
@@ -2560,7 +2568,7 @@ async fn test_op_reparse_accepts_files_scope_with_dir_source() {
     let parsed = uds_round_trip(&sock_path, &body.to_string()).await;
 
     assert_eq!(parsed["ok"], true);
-    assert_eq!(parsed["parsed"], 1);
+    assert_eq!(parsed["parsed"], "1");
     let changed: Vec<&str> = parsed["changed_files"]
         .as_array()
         .unwrap()

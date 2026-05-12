@@ -63,6 +63,28 @@ Highlights:
   and `go test ./binding/...` in this module decode against them; both
   must stay green.
 
+## Daemon protocol gate
+
+The daemon UDS + MCP wire is JSON-encoded but typed against
+`daemon.capnp` (`rs/ll-open/cli-lib/src/daemon/wire.rs` is the Rust
+serde mirror). Cross-runtime parity for that wire lives in:
+
+- `rs/ll-open/cli-lib/tests/fixtures/daemon-protocol.json` — single
+  fixture file pinning each op's request shape, response shape, and
+  required-key set.
+- `daemon/daemon_protocol_test.go` (this module) — for every entry,
+  decodes the fixture response into the matching typed Go struct and
+  asserts no `UnmarshalTypeError`. Runs in CI on every push to LLO.
+- `rs/ll-open/cli-lib/tests/integration.rs::daemon_protocol_gate_handlers_emit_required_keys`
+  — for every entry, calls the matching Rust handler and asserts the
+  output contains every `response_required_keys` entry.
+
+Adding a new op: extend the fixture, add the typed Rust response in
+`wire.rs`, run `regen.sh`, add the typed Go mirror struct +
+`decoderFor` case in `daemon_protocol_test.go`. The two gates make
+schema↔handler↔Go-binding drift a compile/test failure on the next
+push.
+
 ## Regenerating
 
 Whenever a schema changes:

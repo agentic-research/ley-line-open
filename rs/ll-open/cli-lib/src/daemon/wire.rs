@@ -1,48 +1,50 @@
-//! Typed Rust serde mirrors of `rs/ll-core/public-schema/capnp/daemon.capnp`.
+//! Request-side typed dispatch for the daemon UDS + MCP wire.
 //!
-//! Each struct models the corresponding capnp message in the schema and
-//! preserves wire-shape parity. Some fields intentionally diverge from
-//! a strict 1:1 type mapping where the JSON carrier needs flexibility
-//! the capnp typed surface can't express:
+//! Post-b0ea2e (the capnp-json adoption), the **response** side of the
+//! wire is generated entirely by `capnp_json::to_json` against the
+//! typed builders in `leyline_public_schema::daemon_capnp::*`. There is
+//! no hand-written response mirror anymore — the schema in
+//! `rs/ll-core/public-schema/capnp/daemon.capnp` is the load-bearing
+//! contract for response shape, enforced at compile time through the
+//! typed builder API.
 //!
-//! - `StatusResponse.enrichment` and `EnrichResponse.passes` are
-//!   `serde_json::Value` rather than typed maps because the per-pass
-//!   key set is open-ended and pass payloads are pass-specific.
-//! - Cap'n Proto integer fields can't be "absent" (they default to 0);
-//!   on the JSON wire we use `Option<i64>` + `skip_serializing_if`
-//!   so clients can distinguish "not yet" from "really 0".
+//! What stays in this module:
 //!
-//! Schema's camelCase field names map to snake_case JSON wire via
-//! `#[serde(rename = "...")]` per the JSON-as-carrier doctrine (cloister
-//! `interlace-spec/0.1.0/README.md` lines 92-133): the typed contract
-//! is the schema; the carrier-format naming is a per-side tag.
+//! - `BaseRequest`: the serde tagged enum that decodes incoming wire
+//!   lines into one of the 23 base ops. Lives here rather than going
+//!   through capnp-json on the request side because the dispatch enum
+//!   is cleaner as a serde-driven tagged union (`#[serde(tag = "op",
+//!   rename_all = "snake_case")]`) than as a capnp union — the request
+//!   shape is small, the args are heterogeneous per op, and serde's
+//!   `from_value` already handles missing-field and unknown-op errors
+//!   with structured messages.
+//! - `LspPosition` / `LspFile`: small typed-args structs the LSP ops
+//!   consume.
+//! - `Ref` / `TokenMapEntry`: intermediate data types used inside
+//!   `ops.rs` while building capnp List populations. Not serde-
+//!   serialized today (no `to_wire` callers); kept as plain data
+//!   structs.
 //!
-//! `ops.rs` handlers build these structs and serialize via
-//! `serde_json::to_string(&typed_response)?` instead of hand-building
-//! JSON via the `json!({...})` macro. That makes the schema genuinely
-//! load-bearing — adding a field to the schema requires touching this
-//! file (compile error), and forgetting to wire a handler to its typed
-//! struct can't silently emit drift.
-//!
-//! Bead: ley-line-open-b69606 (A-3).
+//! Bead: ley-line-open-b0ea2e (the wire.rs codegen / capnp-json
+//! adoption thread).
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
 // Request enum — typed dispatch surface for socket.rs.
 //
-// Each variant corresponds to one op in `base_op_names`. Args land in the
-// variant's named fields with serde's `tag = "op"` rename pulling the `op`
-// JSON field as the discriminator. `#[serde(default)]` on optional fields
-// keeps the request small for ops that don't use them.
+// Each variant corresponds to one op in `is_known_base_op`. Args land in
+// the variant's named fields with serde's `tag = "op"` rename pulling
+// the `op` JSON field as the discriminator. `#[serde(default)]` on
+// optional fields keeps the request small for ops that don't use them.
 //
-// socket.rs tries to deserialize the incoming line as `BaseRequest`. On
-// success → typed dispatch into `handle_base_op`. On failure → falls
-// through to event ops (subscribe/unsubscribe/emit) and extension
-// dispatch with the raw `serde_json::Value`. Adding a new op means:
+// ops::handle_base_op_value tries to deserialize the already-parsed
+// Value as `BaseRequest`. On success → typed dispatch into
+// `dispatch_typed`. On failure → returns an ErrorResponse on the wire.
+// Adding a new op means:
 //   1. New variant here.
-//   2. Match arm in `handle_base_op`.
-//   3. Match arm in `base_op_names` test list (compile error names it).
+//   2. Match arm in `dispatch_typed`.
+//   3. New name in `is_known_base_op`.
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize, Debug)]
@@ -110,7 +112,21 @@ pub enum BaseRequest {
     },
 }
 
-/// Position-based LSP request args (lsp_hover, lsp_defs, lsp_refs).
+#[cfg(feature = "vec")]
+fn default_vec_k() -> u32 {
+    10
+}
+
+// ---------------------------------------------------------------------------
+// Typed args for the LSP family of ops. The LSP ops emit their row
+// payloads via hand-built JSON (see `lsp_rows_response` in ops.rs)
+// because the row shape is method-specific (hover content vs symbol
+// metadata vs diagnostic ranges) and the daemon.capnp schema doesn't
+// model these row variants. The REQUEST side is uniform enough to type:
+// position-based ops (hover, defs, refs) take (file, line, col); file-
+// level ops (symbols, diagnostics) take just (file).
+// ---------------------------------------------------------------------------
+
 #[derive(Deserialize, Debug)]
 pub struct LspPosition {
     pub file: String,
@@ -119,325 +135,35 @@ pub struct LspPosition {
     pub col: u32,
 }
 
-/// File-scoped LSP request args (lsp_symbols, lsp_diagnostics).
 #[derive(Deserialize, Debug)]
 pub struct LspFile {
     pub file: String,
 }
 
-#[cfg(feature = "vec")]
-fn default_vec_k() -> u32 {
-    10
-}
-
 // ---------------------------------------------------------------------------
-// Shared payload types — used inside multiple response variants.
+// Intermediate data types used inside ops.rs while assembling capnp
+// List populations. These are NOT serde-serialized — the response wire
+// shape comes from capnp_json::to_json on the typed builder, not from
+// these structs. They survive so handler code stays readable
+// ("collect rows into Vec<WireRef>, then loop and set each capnp slot")
+// without polluting the public ops surface with capnp builder lifetimes.
 // ---------------------------------------------------------------------------
 
-/// Full node row. Matches `Node` in daemon.capnp (id, parentId, name,
-/// kind, size, record). Wire emits snake_case; struct field names follow
-/// Rust convention.
-///
-/// `record` is `Option<String>` to preserve the SQL-level distinction
-/// between "no record available" (NULL → `None`) and "empty record"
-/// (`Some(String::new())`). `#[serde(skip_serializing_if = "Option::is_none")]`
-/// means list_children (which deliberately omits record to keep
-/// directory listings small — see Copilot review on PR #8) emits Node
-/// entries without the `record` key, while get_node / read_content emit
-/// the field when the column is populated.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct Node {
-    pub id: String,
-    #[serde(rename = "parent_id")]
-    pub parent_id: String,
-    pub name: String,
-    pub kind: i32,
-    pub size: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub record: Option<String>,
-}
-
-/// A token reference, used by find_callers / find_defs / find_callees.
-/// Matches `Ref` in daemon.capnp.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+/// One reference: node_id (where the reference lives) + source_id (the
+/// file that contains it). Used by find_callers / find_defs /
+/// find_callees handlers as a Vec collected from SQL rows before the
+/// capnp List(Ref) population step.
+#[derive(Debug, Clone)]
 pub struct Ref {
-    #[serde(rename = "node_id")]
     pub node_id: String,
-    #[serde(rename = "source_id")]
     pub source_id: String,
 }
 
 /// Bulk token-map entry — one token plus the list of nodes it
-/// references (or defines, depending on which map). Matches
-/// `TokenMapEntry` in daemon.capnp. Used by get_refs_map / get_defs_map.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+/// references (or defines). Used by op_get_token_map's intermediate
+/// Vec before the capnp List(TokenMapEntry) population.
+#[derive(Debug, Clone)]
 pub struct TokenMapEntry {
     pub token: String,
-    #[serde(rename = "node_ids")]
     pub node_ids: Vec<String>,
-}
-
-/// One tier in LLO's layer-ownership topology. Matches `SchemaTier` in
-/// daemon.capnp.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct SchemaTier {
-    pub name: String,
-    pub crates: Vec<String>,
-}
-
-// ---------------------------------------------------------------------------
-// Per-op response shapes.
-//
-// Convention: `ok` is always first. Optional fields use `Option<T>` with
-// `#[serde(skip_serializing_if = "Option::is_none")]` so absent fields
-// don't bloat the wire. Each field has a `#[serde(rename = "...")]` if
-// the JSON wire name differs from the Rust field name.
-// ---------------------------------------------------------------------------
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct StatusResponse {
-    pub ok: bool,
-    pub phase: String,
-    #[serde(rename = "current_root")]
-    pub current_root: String,
-    #[serde(rename = "arena_path")]
-    pub arena_path: String,
-    #[serde(rename = "arena_size")]
-    pub arena_size: u64,
-    /// JSON-encoded per-pass enrichment status map. Schema declares
-    /// `enrichment: Text`; here we carry an opaque JSON Value so
-    /// callers can serialize a typed map into the field without
-    /// going through Text marshaling. Always present; empty object
-    /// when no passes have run.
-    pub enrichment: serde_json::Value,
-    #[serde(rename = "head_sha", skip_serializing_if = "Option::is_none")]
-    pub head_sha: Option<String>,
-    #[serde(rename = "last_reparse_at_ms", skip_serializing_if = "Option::is_none")]
-    pub last_reparse_at_ms: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct FlushResponse {
-    pub ok: bool,
-    #[serde(rename = "current_root")]
-    pub current_root: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct SnapshotResponse {
-    pub ok: bool,
-    #[serde(rename = "current_root")]
-    pub current_root: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct LoadResponse {
-    pub ok: bool,
-    #[serde(rename = "current_root")]
-    pub current_root: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ReparseResponse {
-    pub ok: bool,
-    #[serde(rename = "current_root")]
-    pub current_root: String,
-    pub parsed: u64,
-    pub unchanged: u64,
-    pub deleted: u64,
-    pub errors: u64,
-    #[serde(rename = "changed_files")]
-    pub changed_files: Vec<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct EnrichResponse {
-    pub ok: bool,
-    #[serde(rename = "current_root")]
-    pub current_root: String,
-    /// Schema declares `passes: List(EnrichmentStats)`; we carry it
-    /// as opaque JSON for now since the handler computes a Vec of
-    /// serde-friendly structs already and conversion to a typed
-    /// `EnrichmentStats` Vec is mechanical (deferred to a follow-up).
-    pub passes: serde_json::Value,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ListChildrenResponse {
-    pub ok: bool,
-    pub children: Vec<Node>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ReadContentResponse {
-    pub ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct GetNodeResponse {
-    pub ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub node: Option<Node>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct FindCallersResponse {
-    pub ok: bool,
-    pub callers: Vec<Ref>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct FindDefsResponse {
-    pub ok: bool,
-    pub defs: Vec<Ref>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct FindCalleesResponse {
-    pub ok: bool,
-    pub callees: Vec<Ref>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct GetRefsMapResponse {
-    pub ok: bool,
-    pub entries: Vec<TokenMapEntry>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct GetDefsMapResponse {
-    pub ok: bool,
-    pub entries: Vec<TokenMapEntry>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct GetSchemaResponse {
-    pub ok: bool,
-    pub tiers: Vec<SchemaTier>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct GetDbPathResponse {
-    pub ok: bool,
-    #[serde(rename = "db_path")]
-    pub db_path: String,
-    #[serde(rename = "ctrl_path")]
-    pub ctrl_path: String,
-    #[serde(rename = "bindings_path")]
-    pub bindings_path: String,
-    #[serde(rename = "ast_path")]
-    pub ast_path: String,
-    #[serde(rename = "source_path")]
-    pub source_path: String,
-    #[serde(rename = "head_path")]
-    pub head_path: String,
-}
-
-/// Common error envelope. Matches `ErrorResponse` in daemon.capnp.
-/// Used when an op returns `ok: false` and the only meaningful field
-/// is `error`. Distinct from per-op error variants (like
-/// `ReadContentResponse.error`) which still belong inside their
-/// op-specific struct.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ErrorResponse {
-    pub ok: bool,
-    pub error: String,
-}
-
-impl ErrorResponse {
-    pub fn new(error: impl Into<String>) -> Self {
-        Self {
-            ok: false,
-            error: error.into(),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// JSON helpers — every op handler uses these instead of `json!({...})`.
-// ---------------------------------------------------------------------------
-
-/// Serialize a typed response into the JSON wire shape.
-///
-/// Visibility is `pub(crate)` (not `pub`) by design: the `.expect` below
-/// is only safe because every caller passes one of the response structs
-/// defined in this module. `serde_json::to_string` *can* fail in the
-/// general case (e.g. maps with non-string keys, custom Serialize impls
-/// that return errors), so widening this to `pub` would expose a panic
-/// surface to consumers outside our control. Adding a new response
-/// type? Make sure it's a plain `#[derive(Serialize)]` struct (or maps
-/// keyed by `String` — `serde_json::Value` is fine) and `to_wire` stays
-/// infallible. If you need a Result-returning variant, add a sibling
-/// `try_to_wire` rather than relaxing this one.
-pub(crate) fn to_wire<T: Serialize>(value: &T) -> String {
-    serde_json::to_string(value).expect("typed wire serialization is infallible")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Sanity: status response round-trips through JSON with the
-    /// expected snake_case field names. This is the load-bearing
-    /// contract — if anyone renames a field's serde tag, this test
-    /// notices.
-    #[test]
-    fn status_response_wire_shape() {
-        let resp = StatusResponse {
-            ok: true,
-            phase: "ready".into(),
-            current_root: "0".repeat(64),
-            arena_path: "/tmp/test".into(),
-            arena_size: 1024,
-            enrichment: serde_json::json!({}),
-            head_sha: Some("abc123".into()),
-            last_reparse_at_ms: Some(42i64),
-            error: None,
-        };
-        let wire = to_wire(&resp);
-        // Required keys present, snake_case.
-        assert!(wire.contains("\"ok\":true"));
-        assert!(wire.contains("\"current_root\":"));
-        assert!(wire.contains("\"arena_path\":"));
-        assert!(wire.contains("\"arena_size\":1024"));
-        assert!(wire.contains("\"head_sha\":\"abc123\""));
-        assert!(wire.contains("\"last_reparse_at_ms\":42"));
-        // Optional unset field is elided.
-        assert!(!wire.contains("\"error\""));
-    }
-
-    #[test]
-    fn ref_wire_uses_snake_case() {
-        let r = Ref {
-            node_id: "n".into(),
-            source_id: "s".into(),
-        };
-        let wire = to_wire(&r);
-        assert_eq!(wire, r#"{"node_id":"n","source_id":"s"}"#);
-    }
-
-    #[test]
-    fn token_map_entry_wire_uses_node_ids_snake() {
-        let e = TokenMapEntry {
-            token: "t".into(),
-            node_ids: vec!["a".into(), "b".into()],
-        };
-        let wire = to_wire(&e);
-        assert_eq!(wire, r#"{"token":"t","node_ids":["a","b"]}"#);
-    }
-
-    #[test]
-    fn error_response_constructor() {
-        let e = ErrorResponse::new("not found");
-        let wire = to_wire(&e);
-        assert_eq!(wire, r#"{"ok":false,"error":"not found"}"#);
-    }
 }

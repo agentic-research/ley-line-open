@@ -290,4 +290,10 @@ struct SubscribeResponse {
 
 struct ErrorResponse {
   error @0 :Text;
+  ok    @1 :Bool;
+  # On the JSON wire the error envelope emits `{"ok": false, "error": "..."}`.
+  # Bool defaults to false in capnp; handlers never explicitly set this,
+  # so the wire always reads `"ok": false` for error responses. Added
+  # additively per ADR-0014 §2; pre-b0ea2e the field was on every typed
+  # envelope via the hand-written wire.rs ErrorResponse struct.
 }

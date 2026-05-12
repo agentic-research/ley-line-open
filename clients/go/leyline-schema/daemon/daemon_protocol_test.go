@@ -104,16 +104,24 @@ func loadFixtures(t *testing.T) map[string]fixtureEntry {
 // consumers) can import them directly. For now they live in the test
 // file alongside the drift gate that validates them.
 
+// All UInt64/Int64 fields carry `,string` because the capnp-json codec
+// (C++ JsonCodec compatible, adopted in b0ea2e) encodes 64-bit ints as
+// JSON strings to avoid JS Number precision loss. Go's json.Unmarshal
+// needs the `,string` tag to accept `"123"` into `*uint64` / `*int64`.
+
 type statusResponse struct {
 	OK              *bool   `json:"ok"`
-	Generation      *uint64 `json:"generation"`
+	Generation      *uint64 `json:"generation,string"`
 	ArenaPath       *string `json:"arena_path"`
-	ArenaSize       *uint64 `json:"arena_size"`
+	ArenaSize       *uint64 `json:"arena_size,string"`
 	Phase           *string `json:"phase"`
 	CurrentRoot     *string `json:"current_root"`
-	Enrichment      json.RawMessage `json:"enrichment"`
+	// b0ea2e: `enrichment` is a JSON-encoded Text field (schema is Text;
+	// the per-pass map rides as a JSON string inside it). Consumers
+	// parse twice — once for the envelope, once for the inner object.
+	Enrichment      *string `json:"enrichment"`
 	HeadSHA         *string `json:"head_sha,omitempty"`
-	LastReparseAtMs *int64  `json:"last_reparse_at_ms,omitempty"`
+	LastReparseAtMs *int64  `json:"last_reparse_at_ms,string"`
 	Error           *string `json:"error,omitempty"`
 }
 
@@ -124,7 +132,7 @@ type flushResponse struct {
 
 type snapshotResponse struct {
 	OK          *bool   `json:"ok"`
-	Generation  *uint64 `json:"generation,omitempty"`
+	Generation  *uint64 `json:"generation,string"`
 	CurrentRoot *string `json:"current_root"`
 }
 
@@ -133,7 +141,7 @@ type node struct {
 	ParentID *string `json:"parent_id"`
 	Name     *string `json:"name"`
 	Kind     *int32  `json:"kind"`
-	Size     *int64  `json:"size"`
+	Size     *int64  `json:"size,string"`
 	// Record is omitted by list_children (directory listings stay small;
 	// see Copilot review on PR #8). get_node / read_content emit it
 	// when the SQL `record` column is non-null. `omitempty` here is

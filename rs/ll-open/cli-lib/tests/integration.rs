@@ -2284,18 +2284,19 @@ async fn test_status_reports_phase_and_enrichment() {
     assert_eq!(parsed["head_sha"], "abc1234");
     // Post-b0ea2e: capnp-json codec emits Int64 as JSON strings.
     assert_eq!(parsed["last_reparse_at_ms"], "1700000000000");
-    // Post-b0ea2e: `enrichment` is a JSON-encoded Text field. The inner
-    // object is reachable by parsing that string a second time.
-    let enrich_str = parsed["enrichment"]
-        .as_str()
-        .expect("post-b0ea2e: enrichment is a JSON-string Text field");
-    let inner: serde_json::Value =
-        serde_json::from_str(enrich_str).expect("enrichment string parses as JSON");
-    assert_eq!(inner["tree-sitter"]["basis"], 1);
-    assert_eq!(
-        inner["tree-sitter"]["last_run_at_ms"],
-        1_700_000_000_000_i64
-    );
+    // Post-b0ea2e (b0ea2e reshape): `enrichment_typed` is a typed JSON
+    // array of `{name, status: PassStatus}` entries. No double parse.
+    // The legacy `enrichment :Text` field is deliberately not emitted.
+    let typed = parsed["enrichment_typed"]
+        .as_array()
+        .expect("enrichment_typed is a JSON array");
+    let entry = typed
+        .iter()
+        .find(|e| e["name"] == "tree-sitter")
+        .expect("tree-sitter pass present");
+    // Int64 fields ride as JSON strings under capnp-json.
+    assert_eq!(entry["status"]["basis"], "1");
+    assert_eq!(entry["status"]["last_run_at_ms"], "1700000000000");
 }
 
 /// Verify scoped reparse only touches the files in `scope`.

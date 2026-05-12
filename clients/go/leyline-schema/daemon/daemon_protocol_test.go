@@ -109,20 +109,33 @@ func loadFixtures(t *testing.T) map[string]fixtureEntry {
 // JSON strings to avoid JS Number precision loss. Go's json.Unmarshal
 // needs the `,string` tag to accept `"123"` into `*uint64` / `*int64`.
 
+type passStatus struct {
+	LastRunAtMs *int64  `json:"last_run_at_ms,string"`
+	Basis       *uint64 `json:"basis,string"`
+	Error       *string `json:"error,omitempty"`
+}
+
+type enrichmentEntry struct {
+	Name   *string     `json:"name"`
+	Status *passStatus `json:"status"`
+}
+
 type statusResponse struct {
-	OK              *bool   `json:"ok"`
-	Generation      *uint64 `json:"generation,string"`
-	ArenaPath       *string `json:"arena_path"`
-	ArenaSize       *uint64 `json:"arena_size,string"`
-	Phase           *string `json:"phase"`
-	CurrentRoot     *string `json:"current_root"`
-	// b0ea2e: `enrichment` is a JSON-encoded Text field (schema is Text;
-	// the per-pass map rides as a JSON string inside it). Consumers
-	// parse twice — once for the envelope, once for the inner object.
-	Enrichment      *string `json:"enrichment"`
-	HeadSHA         *string `json:"head_sha,omitempty"`
-	LastReparseAtMs *int64  `json:"last_reparse_at_ms,string"`
-	Error           *string `json:"error,omitempty"`
+	OK          *bool   `json:"ok"`
+	Generation  *uint64 `json:"generation,string"`
+	ArenaPath   *string `json:"arena_path"`
+	ArenaSize   *uint64 `json:"arena_size,string"`
+	Phase       *string `json:"phase"`
+	CurrentRoot *string `json:"current_root"`
+	// b0ea2e reshape: legacy `enrichment :Text` (JSON-encoded string)
+	// is no longer emitted by the daemon — the typed shape rides in
+	// `enrichment_typed` below. Field kept here as `omitempty` for
+	// back-compat with consumers that pinned the v0.2.x bindings.
+	Enrichment      *string           `json:"enrichment,omitempty"`
+	EnrichmentTyped []enrichmentEntry `json:"enrichment_typed"`
+	HeadSHA         *string           `json:"head_sha,omitempty"`
+	LastReparseAtMs *int64            `json:"last_reparse_at_ms,string"`
+	Error           *string           `json:"error,omitempty"`
 }
 
 type flushResponse struct {

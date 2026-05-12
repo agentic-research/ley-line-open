@@ -372,20 +372,12 @@ fn op_status(ctx: &DaemonContext) -> Result<String> {
         poisoned.into_inner()
     });
 
-    let mut enrichment = serde_json::Map::new();
-    for (name, status) in &state.enrichment {
-        let mut s = serde_json::Map::new();
-        if let Some(t) = status.last_run_at_ms {
-            s.insert("last_run_at_ms".into(), json!(t));
-        }
-        if let Some(b) = status.basis {
-            s.insert("basis".into(), json!(b));
-        }
-        if let Some(e) = &status.error {
-            s.insert("error".into(), json!(e));
-        }
-        enrichment.insert(name.clone(), serde_json::Value::Object(s));
-    }
+    // Collect per-pass status into a Vec the typed-list builder can
+    // iterate (sorted by name so the wire is deterministic across
+    // HashMap iteration order). Each entry mirrors a `PassStatus`
+    // capnp struct.
+    let mut entries: Vec<(&String, &super::PassStatus)> = state.enrichment.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
 
     // T2.4 wire format: BLAKE3 of arena bytes as 64-char hex.
     let current_root_hex = {
@@ -406,11 +398,13 @@ fn op_status(ctx: &DaemonContext) -> Result<String> {
     root.set_current_root(&current_root_hex);
     root.set_arena_path(ctrl.arena_path());
     root.set_arena_size(ctrl.arena_size());
-    // `enrichment` is :Text on the schema; serialize the per-pass map to
-    // a JSON string so it rides in the Text slot. Consumers parse it
-    // twice (once for the envelope, once for the inner object). A typed
-    // EnrichmentEntry follow-up is tracked separately.
-    root.set_enrichment(serde_json::Value::Object(enrichment).to_string());
+    // Legacy `enrichment @6 :Text` field deliberately left unset —
+    // capnp-json omits unset Text on the wire, so the field disappears
+    // from the JSON output entirely. The typed shape rides in
+    // `enrichmentTyped @10 :List(EnrichmentEntry)` below. Ordinal
+    // preserved per ADR-0014 §2 in case any pinned consumer reads it
+    // (they'll get the empty default and should migrate to the typed
+    // field).
     if let Some(sha) = &state.head_sha {
         root.set_head_sha(sha);
     }
@@ -419,6 +413,27 @@ fn op_status(ctx: &DaemonContext) -> Result<String> {
     }
     if let DaemonPhase::Error(msg) = &state.phase {
         root.set_error(msg);
+    }
+    // Typed enrichment — typed end-to-end, no double parse on
+    // consumers. Each entry is `(name, PassStatus { last_run_at_ms,
+    // basis, error })`. Unset Text (error) is omitted on the wire;
+    // Int64 fields (last_run_at_ms, basis) emit "0" as the
+    // not-yet-set sentinel (capnp-json has no skip-if-default
+    // annotation).
+    let mut enrichment_b = root.init_enrichment_typed(entries.len() as u32);
+    for (i, (name, status)) in entries.iter().enumerate() {
+        let mut entry = enrichment_b.reborrow().get(i as u32);
+        entry.set_name(name);
+        let mut s = entry.init_status();
+        if let Some(t) = status.last_run_at_ms {
+            s.set_last_run_at_ms(t);
+        }
+        if let Some(b) = status.basis {
+            s.set_basis(b);
+        }
+        if let Some(e) = &status.error {
+            s.set_error(e);
+        }
     }
     let reader = builder
         .get_root_as_reader::<leyline_public_schema::daemon_capnp::status_response::Reader>()?;
@@ -2358,7 +2373,7 @@ mod tests {
             "current_root",
             "arena_path",
             "arena_size",
-            "enrichment",
+            "enrichment_typed",
         ] {
             assert!(
                 obj.contains_key(required_field),
@@ -2373,6 +2388,15 @@ mod tests {
             Some("0"),
             "post-b0ea2e: legacy `generation` field present as default \"0\""
         );
+        // Legacy `enrichment :Text` field deliberately not emitted —
+        // handler leaves the capnp slot unset; capnp-json omits unset
+        // Text. The typed shape rides in `enrichment_typed`.
+        assert!(
+            !obj.contains_key("enrichment"),
+            "post-b0ea2e: legacy `enrichment` Text field must NOT be on the wire; \
+             got keys {:?}",
+            obj.keys().collect::<Vec<_>>(),
+        );
         // current_root is 64-char hex (zero sentinel for fresh setup).
         let root = parsed["current_root"]
             .as_str()
@@ -2381,14 +2405,15 @@ mod tests {
         assert_eq!(root, "0".repeat(64), "fresh controller emits zero sentinel");
         // phase from a fresh setup is "initializing".
         assert_eq!(parsed["phase"], "initializing");
-        // enrichment is a JSON-string wrapping an object (capnp-json
-        // codec; schema declares :Text and we encode the per-pass map
-        // as JSON inside that). Consumers parse twice.
-        let enrich = parsed["enrichment"]
-            .as_str()
-            .expect("enrichment is a JSON-string (capnp-json wire)");
-        let _: serde_json::Value =
-            serde_json::from_str(enrich).expect("enrichment string parses as JSON");
+        // enrichment_typed is a typed JSON array — no double parse on
+        // consumers. Empty on fresh setup (no passes have run).
+        let enriched = parsed["enrichment_typed"]
+            .as_array()
+            .expect("enrichment_typed is a JSON array");
+        assert!(
+            enriched.is_empty(),
+            "fresh setup has no enrichment passes; got {enriched:?}"
+        );
     }
 
     #[tokio::test]
@@ -2437,8 +2462,8 @@ mod tests {
             "phase field must survive poison recovery"
         );
         assert!(
-            parsed.get("enrichment").is_some(),
-            "enrichment field must survive poison recovery"
+            parsed.get("enrichment_typed").is_some(),
+            "enrichment_typed field must survive poison recovery"
         );
     }
 

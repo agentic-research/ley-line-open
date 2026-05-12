@@ -151,6 +151,23 @@ Cross-arch: `task image PLATFORM=linux/amd64` builds an amd64 image instead. The
 
 `apko.yaml` / `melange.yaml` are retained for reference but were abandoned on Apple Silicon — Docker Desktop's virtiofs makes melange's workspace bind-mount stall, and apko's multi-arch list fails when only the host arch APK exists. See `ley-line-open-2b255c` for the post-mortem.
 
+## Local integration cluster (LLO + mache)
+
+`compose.dev.yaml` at the repo root brings up the LLO daemon paired with mache for end-to-end testing — daemon-typed-wire validation against a real Go consumer of the typed `clients/go/leyline-schema` bindings.
+
+```bash
+task cluster:dev      # both services up, follow logs (Ctrl-C to stop)
+task cluster:up       # both services up, detached
+task cluster:smoke    # up + parse embedded fixture + exercise mache MCP + tear down
+task cluster:down     # tear down
+```
+
+Two containers behind one named volume (`leyline-uds`): the daemon writes `default.ctrl` / `default.arena` / `default.sock` into the shared mount; mache reads the same socket. LLO MCP HTTP listens on host `:18384`, mache MCP HTTP on `:18385`.
+
+Sample-repo fixture lives at `tests/fixtures/sample-repo/` — three small Go files with cross-file references exercising tree-sitter parse + `node_refs` / `find_callers` / `find_callees`. `task cluster:smoke` copies it into the daemon container, sends a `reparse` op, then hits mache's MCP to validate the consumer round-trip.
+
+Bead `ley-line-open-69072b` tracks this. Requires mache built with `clients/go/leyline-schema/v0.3.0` typed bindings (adoption via mache PR #372) — the smoke test is fully end-to-end once that lands; until then mache decodes Int64 fields as silent zeros via `map[string]any` (see bead `mache-a5ad09` for the empirical breakdown).
+
 ## C FFI
 
 `leyline-fs` builds as a staticlib (`libleyline_fs.a`) with a C header (`include/leyline_fs.h`):

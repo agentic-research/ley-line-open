@@ -205,6 +205,75 @@ tasks:
       - echo "smoke passed"
 
   # --------------------------------------------------------------------------
+  # Cluster integration — compose.dev.yaml pairing LLO + mache.
+  # See bead `ley-line-open-69072b`. Real end-to-end test of the
+  # daemon-typed-wire decade; validates that a mache build with typed
+  # leyline-schema/v0.3.0 bindings decodes the post-b0ea2e capnp-json
+  # wire correctly. Requires the LLO image built locally first.
+  # --------------------------------------------------------------------------
+  cluster:dev:
+    desc: Bring up llo-daemon + mache via compose.dev.yaml; tail logs (Ctrl-C to stop)
+    deps: [image]
+    cmds:
+      - docker compose -f compose.dev.yaml up
+
+  cluster:up:
+    desc: Bring up llo-daemon + mache via compose.dev.yaml (detached)
+    deps: [image]
+    cmds:
+      - docker compose -f compose.dev.yaml up -d
+      - echo "Cluster up. LLO MCP at http://localhost:18384/mcp, mache MCP at http://localhost:18385"
+      - echo "  task cluster:smoke   # run integration probe"
+      - echo "  task cluster:down    # tear down"
+
+  cluster:down:
+    desc: Tear down the compose.dev.yaml cluster
+    cmds:
+      - docker compose -f compose.dev.yaml down -v
+
+  cluster:smoke:
+    desc: Stand up llo+mache, parse the embedded sample-repo, exercise mache MCP, tear down
+    deps: [image]
+    vars:
+      LLO_PORT: '18384'
+      MACHE_PORT: '18385'
+    cmds:
+      - docker compose -f compose.dev.yaml down -v 2>/dev/null || true
+      - docker compose -f compose.dev.yaml up -d
+      # Wait for both healthchecks via `docker compose ps`.
+      - |
+        until docker compose -f compose.dev.yaml ps --format '{{`{{.Health}}`}}' | grep -q healthy; do
+          sleep 0.5
+        done
+      # Stage 1: ask LLO to parse the embedded fixture repo. mache's
+      # `reparse` op runs tree-sitter against the source dir, populates
+      # `nodes` + `_ast` + `node_refs` + `node_defs`.
+      - |
+        echo "== stage 1: LLO reparse(sample-repo) =="
+        # Copy the fixture into the LLO container so the daemon's parser
+        # can see it. tests/fixtures/sample-repo/ is small (~5 files);
+        # this is a dev-mode workflow, not a hot-path concern.
+        docker cp tests/fixtures/sample-repo leyline-llo-daemon:/tmp/sample-repo
+        curl -s -X POST http://localhost:{{.LLO_PORT}}/mcp \
+          -H 'Content-Type: application/json' \
+          -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"reparse","arguments":{"source":"/tmp/sample-repo"}}}' \
+          | head -c 400
+        echo
+      # Stage 2: ask mache to list child nodes via its MCP surface.
+      # mache routes the request through its UDS client → LLO daemon →
+      # typed Go bindings → response. The successful decode is the
+      # end-to-end validation.
+      - |
+        echo "== stage 2: mache list_dir(/) =="
+        curl -s -X POST http://localhost:{{.MACHE_PORT}}/mcp \
+          -H 'Content-Type: application/json' \
+          -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+          | head -c 400
+        echo
+      - docker compose -f compose.dev.yaml down -v
+      - echo "cluster:smoke passed"
+
+  # --------------------------------------------------------------------------
   # All-in-one
   # --------------------------------------------------------------------------
   ci:

@@ -29,6 +29,14 @@
 !rs/pkgconfig/**
 !entitlements.plist
 
+# Local integration cluster (bead 69072b) — compose.dev.yaml pairs
+# llo-daemon + mache for `task cluster:dev` / `cluster:smoke`.
+!compose.dev.yaml
+
+# Fixture data for the cluster smoke test + future integration tests.
+# Tracked so the smoke target works after a fresh clone.
+!tests/fixtures/**
+
 # Image build — configs tracked, artifacts/keys local-only.
 # Active path: `task image` uses krust + image.Dockerfile (see Taskfile.yml).
 # apko.yaml / melange.yaml retained for reference but the path was abandoned

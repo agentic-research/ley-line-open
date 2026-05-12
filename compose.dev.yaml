@@ -1,0 +1,95 @@
+# compose.dev.yaml — local integration recipe for LLO daemon + mache
+#
+# Two containers, one shared UDS volume. Run with:
+#
+#   task cluster:dev    # bring both up, follow logs
+#   task cluster:smoke  # bring up, run smoke against mache MCP, tear down
+#
+# Pinned versions are the known-good pair for the daemon's post-b0ea2e
+# JSON wire (capnp-json codec, Int64-as-string, typed enrichment_typed):
+#
+#   ley-line-open:0.3.0  — daemon + MCP HTTP transport
+#   mache:0.8.x          — typed Go bindings via leyline-schema/v0.3.0
+#                          (depends on agentic-research/mache#372 adoption
+#                           landing first; bumps to the release image
+#                           that ships those typed decoders)
+#
+# Bead: ley-line-open-69072b. Bead `mache-a5ad09` (mache PR #372) is the
+# upstream that unlocks the typed decode path; until that ships in a
+# tagged mache release, this compose still works but mache decodes
+# base-op responses as `map[string]any` with silent zeros on Int64
+# fields (see bead 69072b's empirical-evidence comment for details).
+
+name: leyline-cluster
+
+services:
+  llo-daemon:
+    # Built via `task image` at the repo root; default platform linux/arm64
+    # for Apple Silicon dev. Override PLATFORM=linux/amd64 for x86_64 hosts.
+    image: ley-line-open:0.3.0
+    pull_policy: never
+    container_name: leyline-llo-daemon
+    # The image's default CMD bakes in `--mcp-bind 0.0.0.0` so host port
+    # forwarding reaches the listener (127.0.0.1 inside the container is
+    # loopback-only from docker's perspective). Override the control path
+    # so it lands inside the shared volume — both containers see it as
+    # `/run/leyline/default.ctrl`.
+    command:
+      - daemon
+      - --control
+      - /run/leyline/default.ctrl
+      - --mcp-port
+      - "8384"
+      - --mcp-bind
+      - 0.0.0.0
+    ports:
+      - "18384:8384"
+    volumes:
+      # Shared UDS + ctrl + arena. The daemon writes `default.ctrl`,
+      # `default.arena`, and `default.sock` here; mache reads `default.sock`
+      # via the same path.
+      - leyline-uds:/run/leyline
+    healthcheck:
+      # Wait for the daemon to come up + MCP transport to bind. Uses
+      # tools/list because it's the lowest-friction MCP probe (no daemon
+      # state required).
+      test:
+        - CMD-SHELL
+        - "wget -qO- --post-data='{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}' --header='Content-Type: application/json' http://localhost:8384/mcp >/dev/null"
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  mache:
+    # Pin to the first mache release that adopts leyline-schema/v0.3.0
+    # typed bindings (mache PR #372). Until that release exists, pre-#372
+    # mache images will still mostly work against this LLO (decodes as
+    # map[string]any; Int64 fields silently zero — see bead mache-a5ad09).
+    # Bump this tag when mache ships the typed-bindings release.
+    image: mache:0.8.0
+    pull_policy: never
+    container_name: leyline-mache
+    # mache serves MCP over stdio by default. For cluster integration
+    # testing we want a port we can hit, so override to `serve --port`
+    # (mache's flag matches; check `mache serve --help` if you're on
+    # an older mache and the flag has a different name).
+    command:
+      - serve
+      - --control
+      - /run/leyline/default.ctrl
+      - --port
+      - "8385"
+    ports:
+      - "18385:8385"
+    volumes:
+      - leyline-uds:/run/leyline
+    depends_on:
+      llo-daemon:
+        condition: service_healthy
+
+volumes:
+  # Named volume so Docker handles permissions cleanly across the two
+  # containers. The daemon's image user owns the UDS + arena files;
+  # mache reads them. Using a bind mount instead would require both
+  # images to run as the same uid, which they don't by default.
+  leyline-uds:

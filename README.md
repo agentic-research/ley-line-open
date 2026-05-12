@@ -172,6 +172,16 @@ import "github.com/agentic-research/ley-line-open/clients/go/leyline-schema/bind
 
 One sub-package per schema (`ast`, `binding`, `common`, `daemon`, `head`, `source`). Regen via `clients/go/leyline-schema/regen.sh`; CI gates on `git diff --exit-code` plus `go test ./...` decoding the same `tests/fixtures/*.bin` the Rust suite asserts byte-equality against.
 
+Latest tag: [`clients/go/leyline-schema/v0.2.3`](https://github.com/agentic-research/ley-line-open/releases/tag/clients%2Fgo%2Fleyline-schema%2Fv0.2.3) — see [CHANGELOG.md](CHANGELOG.md) for what each `0.2.x` carries.
+
+## Daemon protocol
+
+`leyline-cli-lib` exposes the daemon over two transports — line-delimited JSON on a Unix-domain socket and JSON-RPC over MCP HTTP — sharing a single dispatch table (`base_op_names`) of 23 ops: lifecycle (`status`, `flush`, `load`, `snapshot`, `reparse`, `enrich`), navigation (`list_roots`, `list_children`, `get_node`, `read_content`), graph queries (`find_callers`, `find_callees`, `find_defs`, `get_refs_map`, `get_defs_map`), introspection (`get_schema`, `get_db_path`), LSP (`lsp_hover`, `lsp_defs`, `lsp_refs`, `lsp_symbols`, `lsp_diagnostics`), bulk SQL (`query`), and embedding search (`vec_search`, feature-gated).
+
+Every op's request and response is typed against `daemon.capnp` (see [`rs/ll-open/cli-lib/src/daemon/wire.rs`](rs/ll-open/cli-lib/src/daemon/wire.rs)). `BaseRequest` is a serde tagged enum (`#[serde(tag = "op", rename_all = "snake_case")]`) so unknown ops, malformed args, and missing fields all surface as structured errors rather than silent miss-and-coerce. The JSON encoding is the carrier today; the typed contract is the schema. See ADR-0014's *Out of scope (future ADRs) → Live RPC* section for the framing.
+
+Cross-runtime parity is gated by `rs/ll-open/cli-lib/tests/fixtures/daemon-protocol.json`: a Rust integration test asserts every handler emits the required keys, and `clients/go/leyline-schema/daemon/daemon_protocol_test.go` decodes each fixture response into the matching typed Go struct. The two gates together prove the schema is the load-bearing contract.
+
 ## Schema contracts
 
 Two layers of schema, intentionally distinct:

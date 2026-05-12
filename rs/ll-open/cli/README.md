@@ -19,7 +19,7 @@ The `leyline` binary — entry point for parse, daemon, serve, and inspect opera
 ## Used by
 
 - End users (CLI invocation)
-- Distroless OCI image (`ley-line-open:0.2.1`) — default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0`
+- Distroless OCI image (`ley-line-open:0.3.0`) — default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0`
 
 ## Build
 

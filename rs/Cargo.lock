@@ -360,6 +360,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "capnp-json"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "060205f529c58f927d1840e655768c06475ccda6c96dd6a9aea1880e0e021b94"
+dependencies = [
+ "capnp",
+ "capnpc",
+]
+
+[[package]]
 name = "capnpc"
 version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1676,6 +1686,7 @@ name = "leyline-public-schema"
 version = "0.1.0"
 dependencies = [
  "capnp",
+ "capnp-json",
  "capnpc",
 ]
 

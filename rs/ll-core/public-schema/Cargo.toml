@@ -5,6 +5,12 @@ edition = "2024"
 
 [dependencies]
 capnp = "0.25"
+# Runtime JSON codec for the daemon protocol — annotations in
+# `capnp/daemon.capnp` (`$Json.name(...)`) reference capnp-json's
+# annotation IDs at compile time; runtime `to_json` / `from_json`
+# calls live in `leyline-cli-lib::daemon`. See ADR-0014's interim
+# status section.
+capnp-json = "=0.1.0"
 
 [build-dependencies]
 capnpc = "0.25"

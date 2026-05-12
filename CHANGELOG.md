@@ -30,7 +30,7 @@ versioned independently — see the per-section notes.
   only). `task image` and `task image:smoke` wrap the build + probe.
   Replaces the apko/melange path that stalled on Apple Silicon with a
   30 GB workspace.
-- **Five new daemon ops mache needed** (#7, 2026-05-11): `find_callees`,
+- **Five new daemon ops that mache needed** (#7, 2026-05-11): `find_callees`,
   `get_refs_map`, `get_defs_map`, `get_schema`, `get_db_path`. All
   added to `daemon.capnp` additively (new requests + responses + a
   `SchemaTier`) and wired through `socket.rs` + `mcp.rs`. Tagged into
@@ -51,7 +51,7 @@ versioned independently — see the per-section notes.
   (@4-@9); `ReparseResponse` gained `currentRoot`, `parsed`,
   `unchanged`, `deleted`, `errors`, `changedFiles`;
   `SnapshotResponse`, `LoadResponse`, `EnrichResponse` each gained
-  `currentRoot`. New `FlushRequest`/`Response`. 13 of 14 fixture ops
+  `currentRoot`. New `FlushRequest`/`Response`. 14 of 15 fixture ops
   decode into typed Go bindings; `query` is a documented structural
   skip (column-keyed maps vs `List(Text)`) tracked as a follow-up.
 - **Typed JSON wire (`daemon/wire.rs`)** — bead `ley-line-open-b69606`

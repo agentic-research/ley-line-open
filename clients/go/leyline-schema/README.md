@@ -73,17 +73,21 @@ serde mirror). Cross-runtime parity for that wire lives in:
   fixture file pinning each op's request shape, response shape, and
   required-key set.
 - `daemon/daemon_protocol_test.go` (this module) — for every entry,
-  decodes the fixture response into the matching typed Go struct and
-  asserts no `UnmarshalTypeError`. Runs in CI on every push to LLO.
+  decodes the fixture response into the matching typed Go struct via
+  `json.Decoder` with `DisallowUnknownFields()` plus an explicit EOF
+  check, so the test fails on `UnmarshalTypeError`, on unknown fields,
+  *and* on trailing content. Runs in CI on every push to LLO.
 - `rs/ll-open/cli-lib/tests/integration.rs::daemon_protocol_gate_handlers_emit_required_keys`
   — for every entry, calls the matching Rust handler and asserts the
   output contains every `response_required_keys` entry.
 
 Adding a new op: extend the fixture, add the typed Rust response in
 `wire.rs`, run `regen.sh`, add the typed Go mirror struct +
-`decoderFor` case in `daemon_protocol_test.go`. The two gates make
-schema↔handler↔Go-binding drift a compile/test failure on the next
-push.
+`decoderFor` case in `daemon_protocol_test.go`. wire.rs is hand-written
+(not codegen'd from `daemon.capnp`) so schema↔wire parity is enforced
+by these tests rather than the Rust compiler — the typed `BaseRequest`
+enum + handler signatures catch the common drift class at compile
+time, the fixture gates catch the rest at test/CI time.
 
 ## Regenerating
 

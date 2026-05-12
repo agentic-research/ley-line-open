@@ -17,7 +17,7 @@ leyline-ts = { path = "../ts", features = ["html", "markdown", "json", "yaml", "
 leyline-schema = { path = "../../ll-core/schema" }
 leyline-schema-capnp = { path = "../../ll-core/schema-capnp" }
 leyline-core = { path = "../../ll-core/core" }
-capnp = "=0.20.0"  # ADR-0014 §3 — exact-pin (see schema-capnp/Cargo.toml)
+capnp = "=0.25.0"  # ADR-0014 §3 — exact-pin (see schema-capnp/Cargo.toml)
 blake3 = "1"
 leyline-fs = { path = "../fs", default-features = false }
 rusqlite = { version = "0.34", features = ["bundled", "serialize"] }

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-capnp = "0.20"
+capnp = "0.25"
 
 [build-dependencies]
-capnpc = "0.20"
+capnpc = "0.25"

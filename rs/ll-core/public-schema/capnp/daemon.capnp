@@ -69,15 +69,15 @@ struct QueryRow {
 
 struct StatusResponse {
   # JSON wire uses snake_case (`arena_path`, `current_root`, etc.) —
-  # consumer typed structs (Rust serde, hand-written Go) carry rename
-  # tags. The capnp schema preserves camelCase per convention.
+  # the camelCase capnp field names map via `$Json.name(...)` annotations
+  # consumed by capnp-json's codec at runtime.
   #
-  # `generation` was the pre-T2.4 sequence counter; current_root supersedes
-  # it. The handler stopped emitting `generation` at the T2.4 cutover but
-  # the field stays in the schema (per ADR-0014 §2 "removing fields is
-  # never"). Decoders that see the field absent get the UInt64 default 0;
-  # decoders that already used `generation` see 0 forever rather than a
-  # stale counter.
+  # `generation` was the pre-T2.4 sequence counter; `current_root`
+  # supersedes it. Post-b0ea2e (capnp-json wire codec): the field is
+  # emitted on every status response as the UInt64 default `"0"` —
+  # capnp-json emits all primitive fields including defaults, and
+  # ADR-0014 §2 forbids removing the ordinal. Handlers never set it;
+  # consumers ignore it. Identity comes from `current_root`.
   ok                @0 :Bool;
   generation        @1 :UInt64;
   arenaPath         @2 :Text  $Json.name("arena_path");

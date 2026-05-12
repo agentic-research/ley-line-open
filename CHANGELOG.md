@@ -10,86 +10,104 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
-Post-v0.2.0 work landed on `main` but the LLO daemon binary has not
-been re-tagged. The OCI image and the Go bindings module *have* been
-versioned independently — see the per-section notes.
+Nothing yet — post-v0.3.0 changes land here.
+
+## [0.3.0] — 2026-05-12
+
+Coordinated breaking release. The daemon UDS + MCP JSON wire migrated
+to the capnp-json codec (C++ JsonCodec compatible) via the
+`daemon-typed-wire` decade (beads `b5a77b` / `b631c8` / `b69606` /
+`b0ea2e`). `daemon.capnp` is now the load-bearing typed contract —
+every base-op response flows through capnp builders + `capnp_json::to_json`.
+
+Paired Go bindings tag: `clients/go/leyline-schema/v0.3.0`. mache
+adoption tracked under bead `mache-a5ad09`.
+
+**Crate versions bumped uniformly** from `0.1.0` → `0.3.0` across the
+workspace. The previous tags (`v0.1.0`, `v0.1.1`, `v0.2.0`) had drifted
+from the in-tree Cargo.toml; this release synchronizes them.
+
+### Breaking — wire-shape changes
+
+- **Int64 / UInt64 fields emit as JSON strings.** `"67108864"` not
+  `67108864`. C++ JsonCodec convention (avoids JS Number precision
+  loss). Inbound (consumer→LLO) still accepts both string and raw-
+  number forms; only the outbound direction breaks.
+- **Defaulted Int fields always emit `"0"`** because capnp Int defaults
+  to 0 and capnp-json has no skip-if-default annotation. `generation`
+  reappears as `"0"` on every base-op response (legacy ordinal kept per
+  ADR-0014 §2; semantically dead — `current_root` is the canonical
+  identity). `last_reparse_at_ms` appears as `"0"` pre-first-reparse.
+- **`StatusResponse.enrichment` legacy Text field no longer emitted.**
+  Reshaped into typed `enrichment_typed: List(EnrichmentEntry)` —
+  each entry is `{name, status: PassStatus { last_run_at_ms, basis,
+  error }}`. No double-parse on consumers. Legacy ordinal `@6 :Text`
+  stays in the schema per ADR-0014 §2 but the handler leaves it unset
+  (capnp-json omits unset Text on the wire).
+- **`ErrorResponse` gained `ok @1 :Bool`** (additive) so the canonical
+  `{"ok": false, "error": "..."}` envelope keeps shape end-to-end.
 
 ### Added
 
-- **`clients/go/leyline-schema` Go module** tagged at
-  `clients/go/leyline-schema/v0.2.1` (#3, 2026-05-10). Multi-module
-  monorepo: one versionable contract per Go-side consumer. Ships
-  generated `*.capnp.go` for `common`, `ast`, `binding`, `head`,
-  `source`, and `daemon`. CI gate `.github/workflows/leyline-schema-go.yml`
-  enforces regen-diff parity plus `go test ./...` on the bindings.
-- **Distroless OCI image `ley-line-open:0.2.1`** built via
-  [`krust`](https://github.com/imjasonh/krust) (#3, 2026-05-10).
-  cargo-zigbuild produces a static musl binary; `image.Dockerfile`
-  COPYs it onto `cgr.dev/chainguard/static`. ~20 MB. Default CMD is
-  `daemon --mcp-port 8384 --mcp-bind 0.0.0.0` (headless, MCP HTTP
-  only). `task image` and `task image:smoke` wrap the build + probe.
-  Replaces the apko/melange path that stalled on Apple Silicon with a
-  30 GB workspace.
-- **Five new daemon ops that mache needed** (#7, 2026-05-11): `find_callees`,
-  `get_refs_map`, `get_defs_map`, `get_schema`, `get_db_path`. All
-  added to `daemon.capnp` additively (new requests + responses + a
-  `SchemaTier`) and wired through `socket.rs` + `mcp.rs`. Tagged into
-  the Go module at `clients/go/leyline-schema/v0.2.2`.
-- **Cross-runtime fixture gate for the daemon JSON protocol** —
-  bead `ley-line-open-b5a77b` (A-1, PR #6, 2026-05-11). Single fixture
-  file `rs/ll-open/cli-lib/tests/fixtures/daemon-protocol.json` pins
-  each op's request shape, response shape, and required-key set. Two
-  gates consume it: a Rust integration test asserts the handler emits
-  every required key, and a Go test (`daemon_protocol_test.go`)
-  decodes each fixture into the typed Go binding without
-  `UnmarshalTypeError`. Extends the T8.10 segment-file fixture pattern
-  (`6b7d43`) to the JSON wire.
-- **Schema↔reality reconciliation** — bead `ley-line-open-b631c8`
-  (A-2, PR #8 first half, 2026-05-11). `daemon.capnp` extended
-  additively per ADR-0014 §2: `StatusResponse` gained `phase`,
-  `currentRoot`, `enrichment`, `headSha`, `lastReparseAtMs`, `error`
-  (@4-@9); `ReparseResponse` gained `currentRoot`, `parsed`,
-  `unchanged`, `deleted`, `errors`, `changedFiles`;
-  `SnapshotResponse`, `LoadResponse`, `EnrichResponse` each gained
-  `currentRoot`. New `FlushRequest`/`Response`. 14 of 15 fixture ops
-  decode into typed Go bindings; `query` is a documented structural
-  skip (column-keyed maps vs `List(Text)`) tracked as a follow-up.
-- **Typed JSON wire (`daemon/wire.rs`)** — bead `ley-line-open-b69606`
-  (A-3, PR #8 second half, 2026-05-11). New module of serde-derived
-  request/response structs mirroring `daemon.capnp` plus a tagged
-  `BaseRequest` enum (`#[serde(tag = "op", rename_all = "snake_case")]`)
-  covering all 23 base ops. `ops.rs::handle_base_op(ctx, wire_line)`
-  is the typed entrypoint; `handle_base_op_value(ctx, Value)` is the
-  Value-accepting sibling `socket.rs` uses to skip a stringify+reparse
-  round-trip. Every handler now takes typed args (e.g.
-  `op_lsp_symbols(ctx, args: &LspFile)`) and builds typed response
-  structs serialized via `wire::to_wire`. JSON-as-carrier doctrine
-  preserved: shell debuggability unchanged, MCP HTTP unchanged, the
-  schema is the load-bearing contract for shape. Tagged into the Go
-  module at `clients/go/leyline-schema/v0.2.3`.
+- **A-1 / `ley-line-open-b5a77b`** (#6, 2026-05-11): cross-runtime
+  fixture gate for the daemon JSON protocol. Single fixture file
+  `rs/ll-open/cli-lib/tests/fixtures/daemon-protocol.json` pins each
+  op's request shape, response shape, and required-key set. Consumed
+  by a Rust integration test (handler-output) and a Go test
+  (typed-decode under strict-unmarshal). Drift between schema,
+  handler, and wire is now a CI failure.
+- **A-2 / `ley-line-open-b631c8`** (#8 first half, 2026-05-11):
+  schema↔reality reconciliation. `daemon.capnp` extended additively
+  per ADR-0014 §2 with the fields the handlers were already emitting
+  (StatusResponse gained `phase`, `currentRoot`, `enrichment`,
+  `headSha`, `lastReparseAtMs`, `error`; ReparseResponse gained the
+  flat stats; SnapshotResponse / LoadResponse / EnrichResponse each
+  gained `currentRoot`; new FlushRequest/Response,
+  FindCalleesRequest/Response, TokenMapEntry, GetRefsMap/Response,
+  GetDefsMap/Response, SchemaTier, GetSchema/Response, GetDbPath/Response).
+- **A-3 / `ley-line-open-b69606`** (#8 second half, 2026-05-11): typed
+  serde response mirror (`daemon/wire.rs`) — `BaseRequest` tagged enum
+  + `dispatch_typed` exhaustive match — covering all 23 base ops.
+- **b0ea2e / capnp-json adoption** (#11 + #12, 2026-05-12): the
+  capnp-json codec is now the response-side encoder; `wire.rs` shrunk
+  from 444 → 178 lines (request enum stays; response structs deleted).
+  Schema is the load-bearing contract.
+- **Five new daemon ops** that mache needed (#7, 2026-05-11):
+  `find_callees`, `get_refs_map`, `get_defs_map`, `get_schema`,
+  `get_db_path`. Wired through both UDS and MCP HTTP transports.
+- **OCI image `ley-line-open:0.3.0`** — distroless, ~20 MB, built via
+  krust + cargo-zigbuild. Default CMD `daemon --mcp-port 8384
+  --mcp-bind 0.0.0.0`. Previous image label `0.2.1` is superseded.
+- **Five new per-crate READMEs** for the previously-undocumented crates
+  (`rs/`, `cli-lib`, `cli`, `public-schema`, `hdc`). Format matches the
+  existing 8: tagline + "What's here" bullets, no fluff.
 
 ### Changed
 
-- **`op_list_children` no longer SELECTs `nodes.record`** — A-3
-  Copilot review (PR #8). Directory listings could carry the full
-  file contents of every child (megabytes per row in some repos).
-  `record` is now `Option<String>` on `Node` with
-  `skip_serializing_if`, so listings simply omit the field. Consumers
-  needing a specific node's record call `op_get_node` or
-  `op_read_content`. SQL NULL is preserved end-to-end as `None`
-  rather than collapsed to `""`.
-- **CI action SHAs pinned to Node 24** — PR #5, 2026-05-10. README's
-  mermaid sequence diagram fixed (parse error caught upstream).
+- **`op_list_children` no longer SELECTs `nodes.record`** (Copilot
+  review on PR #8). Directory listings could carry full file contents
+  of every child (megabytes per row in some repos). `record` is now
+  `Option<String>` with `skip_serializing_if`; listings omit the field.
+  Consumers needing record call `op_get_node` or `op_read_content`.
+- **Workspace capnp toolchain bumped** to `=0.25.0` (exact-pin per
+  ADR-0014 §3) to enable the capnp-json runtime codec.
+- **Crate versions** in every `rs/ll-core/*/Cargo.toml` and
+  `rs/ll-open/*/Cargo.toml` bumped from `0.1.0` to `0.3.0` to match
+  the git tag. Synchronizes in-tree version metadata with the tag
+  history that had drifted since `v0.1.0`.
 
 ### Notes
 
-- LLO daemon binary tag remains `v0.2.0`. The image tag `ley-line-open:0.2.1`
-  and the three `clients/go/leyline-schema/*` tags above are
-  independent versioning surfaces — see ADR-0014 for the why (one
-  schema, one tag per consumer-language module).
-- Cloister-side `udsForward` integration is the forcing function for a
-  future RPC framing ADR (ADR-0014 line 105). Not triggered yet;
-  tracked under bead `ley-line-open-` follow-up.
+- LLO daemon binary tag is now `v0.3.0` — matching the workspace
+  Cargo.toml versions, the image label, and the Go bindings module
+  tag. One coherent SemVer line going forward.
+- mache + cloister + any other Go consumer needs to adopt
+  `clients/go/leyline-schema/v0.3.0` with `,string` json tags on
+  `*int64`/`*uint64` fields. See `mache-a5ad09` for the canonical
+  Go struct definitions.
+- Bead `40df83` (dual-codec binary capnp + JSON via magic-byte
+  dispatch) is the natural step 4 — when a consumer asks for typed
+  end-to-end on the wire (skipping JSON entirely), that's the path.
 
 ## [0.2.0] — 2026-05-09
 
@@ -258,10 +276,12 @@ release predates the structured changelog.
 Initial public release of ley-line-open as the OSS substrate for the
 ley-line stack. See `git log v0.1.0` for the initial-commit set.
 
-[Unreleased]: https://github.com/agentic-research/ley-line-open/compare/v0.2.0...HEAD
-[clients/go/leyline-schema/v0.2.1]: https://github.com/agentic-research/ley-line-open/releases/tag/clients%2Fgo%2Fleyline-schema%2Fv0.2.1
-[clients/go/leyline-schema/v0.2.2]: https://github.com/agentic-research/ley-line-open/releases/tag/clients%2Fgo%2Fleyline-schema%2Fv0.2.2
+[Unreleased]: https://github.com/agentic-research/ley-line-open/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/agentic-research/ley-line-open/releases/tag/v0.3.0
+[clients/go/leyline-schema/v0.3.0]: https://github.com/agentic-research/ley-line-open/releases/tag/clients%2Fgo%2Fleyline-schema%2Fv0.3.0
 [clients/go/leyline-schema/v0.2.3]: https://github.com/agentic-research/ley-line-open/releases/tag/clients%2Fgo%2Fleyline-schema%2Fv0.2.3
+[clients/go/leyline-schema/v0.2.2]: https://github.com/agentic-research/ley-line-open/releases/tag/clients%2Fgo%2Fleyline-schema%2Fv0.2.2
+[clients/go/leyline-schema/v0.2.1]: https://github.com/agentic-research/ley-line-open/releases/tag/clients%2Fgo%2Fleyline-schema%2Fv0.2.1
 [0.2.0]: https://github.com/agentic-research/ley-line-open/releases/tag/v0.2.0
 [0.1.1]: https://github.com/agentic-research/ley-line-open/releases/tag/v0.1.1
 [0.1.0]: https://github.com/agentic-research/ley-line-open/releases/tag/v0.1.0

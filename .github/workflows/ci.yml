@@ -26,10 +26,15 @@ jobs:
           toolchain: nightly
           components: clippy, rustfmt
 
-      - name: Install system deps (libfuse for fuser, capnproto for schema build.rs)
+      - name: Install system deps (libfuse for fuser, capnproto + libcapnp-dev for schema build.rs)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libfuse-dev capnproto pkg-config
+          sudo apt-get install -y --no-install-recommends libfuse-dev capnproto libcapnp-dev pkg-config
+          # libcapnp-dev ships /usr/include/capnp/c++.capnp and the other
+          # standard schema includes that the capnp compiler resolves
+          # `using Cxx = import "/capnp/c++.capnp";`-style imports against.
+          # Required by capnp-json's build script (b0ea2e) — the
+          # capnproto package alone ships only the binaries.
 
       # SHA-pinned: arduino/setup-task@v2.0.0 (Taskfile runner, the golden
       # path; see Taskfile.yml at the repo root).

@@ -5,6 +5,14 @@ using Go = import "/go.capnp";
 $Go.package("daemon");
 $Go.import("github.com/agentic-research/ley-line-open/clients/go/leyline-schema/daemon");
 
+# Json codec annotations (consumed by capnp-json at runtime). The
+# JSON wire uses snake_case; the schema preserves camelCase per
+# capnp convention. $Json.name maps each camelCase field to its
+# snake_case wire name. See `rs/ll-open/cli-lib/src/daemon/wire.rs`
+# for the integration point and ADR-0014's interim-status note for
+# why JSON-as-carrier is the current discipline.
+using Json = import "/capnp/compat/json.capnp";
+
 # Daemon protocol schema — the contract between ley-line daemon (Rust)
 # and mache (Go) over the UDS control socket.
 #
@@ -15,7 +23,7 @@ $Go.import("github.com/agentic-research/ley-line-open/clients/go/leyline-schema/
 
 struct Node {
   id       @0 :Text;
-  parentId @1 :Text;
+  parentId @1 :Text  $Json.name("parent_id");
   name     @2 :Text;
   kind     @3 :Int32;   # 0=file, 1=dir
   size     @4 :Int64;
@@ -23,8 +31,8 @@ struct Node {
 }
 
 struct Ref {
-  nodeId   @0 :Text;
-  sourceId @1 :Text;
+  nodeId   @0 :Text  $Json.name("node_id");
+  sourceId @1 :Text  $Json.name("source_id");
 }
 
 struct ParseStats {
@@ -32,14 +40,14 @@ struct ParseStats {
   unchanged    @1 :UInt64;
   deleted      @2 :UInt64;
   errors       @3 :UInt64;
-  changedFiles @4 :List(Text);
+  changedFiles @4 :List(Text)  $Json.name("changed_files");
 }
 
 struct EnrichmentStats {
-  passName       @0 :Text;
-  filesProcessed @1 :UInt64;
-  itemsAdded     @2 :UInt64;
-  durationMs     @3 :UInt64;
+  passName       @0 :Text  $Json.name("pass_name");
+  filesProcessed @1 :UInt64  $Json.name("files_processed");
+  itemsAdded     @2 :UInt64  $Json.name("items_added");
+  durationMs     @3 :UInt64  $Json.name("duration_ms");
 }
 
 struct Event {
@@ -72,17 +80,17 @@ struct StatusResponse {
   # stale counter.
   ok                @0 :Bool;
   generation        @1 :UInt64;
-  arenaPath         @2 :Text;
-  arenaSize         @3 :UInt64;
+  arenaPath         @2 :Text  $Json.name("arena_path");
+  arenaSize         @3 :UInt64  $Json.name("arena_size");
   phase             @4 :Text;
-  currentRoot       @5 :Text;
+  currentRoot       @5 :Text  $Json.name("current_root");
   enrichment        @6 :Text;
   # JSON-encoded `{name → {last_run_at_ms?, basis?, error?}}`. Schema
   # leaves it as opaque Text for now; a typed EnrichmentMap follow-up
   # is tracked under a future bead. Consumers parse the inner JSON
   # by hand today.
-  headSha           @7 :Text;
-  lastReparseAtMs   @8 :Int64;
+  headSha           @7 :Text  $Json.name("head_sha");
+  lastReparseAtMs   @8 :Int64  $Json.name("last_reparse_at_ms");
   # On the Cap'n Proto side this field is always present (capnp ints
   # can't be absent and default to 0). On the JSON wire we emit the
   # field only when populated — `last_reparse_at_ms` is omitted before
@@ -103,25 +111,25 @@ struct ReparseResponse {
   ok           @0 :Bool;
   generation   @1 :UInt64;
   stats        @2 :ParseStats;
-  currentRoot  @3 :Text;
+  currentRoot  @3 :Text  $Json.name("current_root");
   parsed       @4 :UInt64;
   unchanged    @5 :UInt64;
   deleted      @6 :UInt64;
   errors       @7 :UInt64;
-  changedFiles @8 :List(Text);
+  changedFiles @8 :List(Text)  $Json.name("changed_files");
 }
 
 struct SnapshotResponse {
   ok          @0 :Bool;
   generation  @1 :UInt64;
-  currentRoot @2 :Text;
+  currentRoot @2 :Text  $Json.name("current_root");
 }
 
 struct FlushRequest {}
 
 struct FlushResponse {
   ok          @0 :Bool;
-  currentRoot @1 :Text;
+  currentRoot @1 :Text  $Json.name("current_root");
 }
 
 struct EnrichRequest {
@@ -133,7 +141,7 @@ struct EnrichResponse {
   ok          @0 :Bool;
   generation  @1 :UInt64;
   passes      @2 :List(EnrichmentStats);
-  currentRoot @3 :Text;
+  currentRoot @3 :Text  $Json.name("current_root");
 }
 
 struct LoadRequest {
@@ -143,7 +151,7 @@ struct LoadRequest {
 struct LoadResponse {
   ok          @0 :Bool;
   generation  @1 :UInt64;
-  currentRoot @2 :Text;
+  currentRoot @2 :Text  $Json.name("current_root");
 }
 
 struct QueryRequest {
@@ -211,7 +219,7 @@ struct TokenMapEntry {
   # responses. source_id is intentionally omitted — bulk consumers want
   # graph topology; per-token find_callers/find_defs still expose it.
   token   @0 :Text;
-  nodeIds @1 :List(Text);
+  nodeIds @1 :List(Text)  $Json.name("node_ids");
 }
 
 struct GetRefsMapRequest {}
@@ -249,12 +257,12 @@ struct GetDbPathResponse {
   # readthrough fast-paths (serve_lsp, serve_find_smells). Strictly
   # opt-in optimization — falling back to UDS query ops is always safe.
   ok           @0 :Bool;
-  dbPath       @1 :Text;
-  ctrlPath     @2 :Text;
-  bindingsPath @3 :Text;
-  astPath      @4 :Text;
-  sourcePath   @5 :Text;
-  headPath     @6 :Text;
+  dbPath       @1 :Text  $Json.name("db_path");
+  ctrlPath     @2 :Text  $Json.name("ctrl_path");
+  bindingsPath @3 :Text  $Json.name("bindings_path");
+  astPath      @4 :Text  $Json.name("ast_path");
+  sourcePath   @5 :Text  $Json.name("source_path");
+  headPath     @6 :Text  $Json.name("head_path");
 }
 
 struct GetNodeRequest {
@@ -275,9 +283,9 @@ struct SubscribeRequest {
 
 struct SubscribeResponse {
   ok           @0 :Bool;
-  headSeq      @1 :UInt64;
-  replayCount  @2 :UInt64;
-  replayGap    @3 :Bool;
+  headSeq      @1 :UInt64  $Json.name("head_seq");
+  replayCount  @2 :UInt64  $Json.name("replay_count");
+  replayGap    @3 :Bool  $Json.name("replay_gap");
 }
 
 struct ErrorResponse {

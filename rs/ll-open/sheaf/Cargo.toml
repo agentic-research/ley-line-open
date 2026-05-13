@@ -1,0 +1,15 @@
+[package]
+name = "leyline-sheaf"
+version = "0.1.0"
+edition = "2024"
+description = "Čech cohomology engine: sheaf cache, coboundary operators, structural invalidation"
+
+[dependencies]
+nalgebra = "0.32"
+sha2 = "0.10"
+nalgebra-sparse = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+anyhow = "1.0"

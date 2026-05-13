@@ -19,6 +19,7 @@ The Rust workspace for ley-line-open. Two tiers: `ll-core/` (infrastructure) and
 | [`leyline-ts`](ll-open/ts/) | Tree-sitter AST projection + bidirectional splice |
 | [`leyline-lsp`](ll-open/lsp/) | LSP client — spawns language servers, projects symbols + diagnostics; emits `BindingRecord` capnp event log |
 | [`leyline-hdc`](ll-open/hdc/) | Hyperdimensional computing — per-scope hypervectors for structural code search (experimental) |
+| [`leyline-sheaf`](ll-open/sheaf/) | Čech cohomology engine — sheaf cache + coboundary operators + structural invalidation |
 | [`leyline-vcs`](ll-open/vcs/) | jj sidecar — automatic versioning of arena snapshots |
 | [`leyline-sign`](ll-open/sign/) | CMS signing primitives + gpgsm-compatible binary for jj commit signing |
 | [`leyline-cli-lib`](ll-open/cli-lib/) | Daemon: living SQLite db + arena flip + Σ root advance + MCP/UDS surfaces |

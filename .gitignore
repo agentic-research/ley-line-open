@@ -29,6 +29,11 @@
 !rs/pkgconfig/**
 !entitlements.plist
 
+# Cross-language fixture trees consumed by tree-sitter parse + future
+# integration tests. Small, parse-stable sources; tracked so smoke
+# tests work after a fresh clone.
+!tests/fixtures/**
+
 # Image build — configs tracked, artifacts/keys local-only.
 # Active path: `task image` uses krust + image.Dockerfile (see Taskfile.yml).
 # apko.yaml / melange.yaml retained for reference but the path was abandoned

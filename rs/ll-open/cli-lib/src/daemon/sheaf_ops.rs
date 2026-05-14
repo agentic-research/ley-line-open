@@ -80,6 +80,14 @@ impl SheafState {
         *self.emitter.lock().unwrap() = Some(emitter);
     }
 
+    /// Borrow the backing cache mutex. Exposed so the daemon's
+    /// reparse / enrich pipelines (and e2e integration tests) can
+    /// `put` cache entries directly; the `sheaf_*` UDS ops only
+    /// manage topology + invalidation, not entry population.
+    pub fn cache(&self) -> &Mutex<SheafCache<HashStalk, ()>> {
+        &self.cache
+    }
+
     fn emit(&self, topic: &str, data: serde_json::Value) {
         if let Some(ref emitter) = *self.emitter.lock().unwrap() {
             emitter.emit(topic, "leyline", data);

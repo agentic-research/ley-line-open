@@ -110,6 +110,22 @@ pub enum BaseRequest {
         #[serde(default = "default_vec_k")]
         k: u32,
     },
+    SheafSetTopology {
+        #[serde(default)]
+        regions: Vec<crate::daemon::sheaf_ops::SheafStalkInput>,
+        #[serde(default)]
+        restrictions: Vec<crate::daemon::sheaf_ops::SheafRestrictionInput>,
+    },
+    SheafInvalidate {
+        #[serde(default)]
+        regions: Vec<u32>,
+        #[serde(default)]
+        stalks: Vec<crate::daemon::sheaf_ops::SheafStalkInput>,
+    },
+    SheafDefect,
+    SheafStalks,
+    SheafStatus,
+    SheafLearnedWeights,
 }
 
 #[cfg(feature = "vec")]

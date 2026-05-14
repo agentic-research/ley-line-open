@@ -11,6 +11,7 @@ pub mod hdc_pass;
 pub mod lsp_pass;
 pub mod mcp;
 pub mod ops;
+pub mod sheaf_ops;
 pub mod socket;
 #[cfg(feature = "vec")]
 pub mod vec_index;
@@ -168,6 +169,13 @@ pub struct DaemonContext {
     /// VectorIndex.
     #[cfg(feature = "vec")]
     pub embed_queue: Arc<Mutex<BinaryHeap<embed::EmbedTask>>>,
+    /// Sheaf cache + co-change tracker for the `sheaf_*` ops. Topology
+    /// is pushed in via `sheaf_set_topology`; invalidations come through
+    /// `sheaf_invalidate`; defect / status / learned-weights are read-
+    /// only queries. The cache emits `sheaf.topology` and
+    /// `sheaf.invalidate` events on the bus once `EventRouter::emitter`
+    /// is wired in via `sheaf.set_emitter(...)`.
+    pub sheaf: Arc<sheaf_ops::SheafState>,
 }
 
 #[cfg(test)]

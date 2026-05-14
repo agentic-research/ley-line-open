@@ -1606,6 +1606,7 @@ dependencies = [
  "leyline-public-schema",
  "leyline-schema",
  "leyline-schema-capnp",
+ "leyline-sheaf",
  "leyline-ts",
  "log",
  "memmap2",

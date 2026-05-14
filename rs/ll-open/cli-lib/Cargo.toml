@@ -13,6 +13,7 @@ hdc = ["dep:leyline-hdc"]
 [dependencies]
 leyline-lsp = { path = "../lsp", optional = true }
 leyline-hdc = { path = "../hdc", optional = true }
+leyline-sheaf = { path = "../sheaf" }
 leyline-ts = { path = "../ts", features = ["html", "markdown", "json", "yaml", "go", "python", "elixir"] }
 leyline-schema = { path = "../../ll-core/schema" }
 leyline-schema-capnp = { path = "../../ll-core/schema-capnp" }

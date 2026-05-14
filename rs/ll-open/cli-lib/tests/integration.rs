@@ -80,6 +80,7 @@ fn default_test_ctx(ctrl_path: PathBuf) -> leyline_cli_lib::daemon::DaemonContex
         embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
         #[cfg(feature = "vec")]
         embed_queue: Arc::new(Mutex::new(std::collections::BinaryHeap::new())),
+        sheaf: Arc::new(leyline_cli_lib::daemon::sheaf_ops::SheafState::new()),
     }
 }
 
@@ -2154,6 +2155,7 @@ async fn test_embed_queue_drainer_refreshes_index() {
         vec_index: index.clone(),
         embedder,
         embed_queue: queue.clone(),
+        sheaf: Arc::new(leyline_cli_lib::daemon::sheaf_ops::SheafState::new()),
         ..default_test_ctx(ctrl_path)
     });
 
@@ -2216,6 +2218,7 @@ async fn test_op_vec_search_round_trip() {
         vec_index: index.clone(),
         embedder,
         embed_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
+        sheaf: Arc::new(leyline_cli_lib::daemon::sheaf_ops::SheafState::new()),
         ..default_test_ctx(ctrl_path)
     });
 
@@ -2742,6 +2745,7 @@ async fn test_op_vec_search_dim_mismatch_returns_clean_error() {
         vec_index: index,
         embedder,
         embed_queue: Arc::new(Mutex::new(std::collections::BinaryHeap::new())),
+        sheaf: Arc::new(leyline_cli_lib::daemon::sheaf_ops::SheafState::new()),
         ..default_test_ctx(ctrl_path)
     });
 

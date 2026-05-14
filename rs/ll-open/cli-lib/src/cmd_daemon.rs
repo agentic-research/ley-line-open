@@ -231,6 +231,13 @@ pub async fn run_daemon(
         embedder: embedder.clone(),
         #[cfg(feature = "vec")]
         embed_queue: embed_queue.clone(),
+        sheaf: {
+            let s = Arc::new(crate::daemon::sheaf_ops::SheafState::new());
+            // Wire the event bus so `sheaf_set_topology` / `sheaf_invalidate`
+            // emit `sheaf.topology` / `sheaf.invalidate` on subscribers.
+            s.set_emitter(router.emitter());
+            s
+        },
     });
 
     // Spawn the embed-queue drainer: query ops promote node_ids; this loop
@@ -1347,6 +1354,7 @@ mod tests {
             embedder,
             #[cfg(feature = "vec")]
             embed_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
+            sheaf: Arc::new(crate::daemon::sheaf_ops::SheafState::new()),
         })
     }
 

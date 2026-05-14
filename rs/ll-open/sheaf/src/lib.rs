@@ -7,16 +7,28 @@
 //!
 //! - [`CellComplex`]: Cochain complex with 0-cells (nodes), 1-cells (edges),
 //!   2-cells (faces), restriction maps, and coboundary operators δ⁰, δ¹.
-//! - [`SheafCache`]: Cache whose invalidation is driven by the coboundary
-//!   operator d⁰ — only structurally affected entries are evicted.
+//! - [`SheafCache`]: Structurally-aware cache. Invalidation today is driven
+//!   by an XOR-Merkle proxy plus a bounded restriction-graph BFS — a fast
+//!   heuristic shaped by the sheaf, not the literal δ⁰ output. The crate's
+//!   defect metric `Σ‖δ⁰‖²` (real sheaf invariant) drives cache *health*
+//!   monitoring; promoting the cache to real δ⁰-driven invalidation requires
+//!   wiring [`CellComplex::detect_violations`] into [`SheafCache::on_change`].
+//!   See [`cache`] module docs for the explicit contract.
 //!
 //! ## Mathematical foundation
 //!
 //! A **sheaf** assigns data (stalks) to topological regions and enforces
 //! consistency across boundaries via restriction maps. The coboundary
-//! operator δ⁰: C⁰ → C¹ measures disagreement between adjacent stalks.
-//! Entries in ker(δ⁰) — the zeroth cohomology group H⁰ — are globally
-//! consistent and remain cached. Everything outside H⁰ is invalidated.
+//! operator δ⁰: C⁰ → C¹ measures disagreement between adjacent stalks; the
+//! defect `‖δ⁰(stalks)‖²` is a real H⁰ distance metric and the load-bearing
+//! "sheaf-derived" quantity this crate exports. Entries in `ker(δ⁰)` — the
+//! zeroth cohomology group H⁰ — are globally consistent.
+//!
+//! For the dimension of H⁰ as an algebraic invariant (independent of the
+//! current section), use [`CellComplex::h0_dimension`]. The name
+//! `compute_h0` / [`CellComplex::consistency_analysis`] returns a
+//! section-dependent partition + defect — useful as a cache heuristic, not
+//! literal H⁰.
 //!
 //! ## Provenance
 //!

@@ -1,8 +1,36 @@
-//! Sheaf cache: structurally-aware cache invalidation via Čech cohomology.
+//! Sheaf cache: structurally-aware cache invalidation, heuristic proxy for δ⁰.
 //!
-//! Implements ADR-A: cache entries organized by topological regions, with
-//! invalidation driven by the coboundary operator d⁰. Only structurally
-//! affected entries are evicted — entries in H⁰ (ker d⁰) remain valid.
+//! ## What this cache actually does
+//!
+//! Invalidation is driven by **XOR of endpoint Merkle roots** compared against
+//! a stored boundary hash, plus a **bounded-depth restriction-graph BFS**. This
+//! is a fast structural proxy, NOT the Čech coboundary operator δ⁰. In
+//! particular:
+//!
+//! - The boundary check (see [`SheafCache::check_boundary_changed`]) flags an
+//!   edge as "changed" whenever `H(stalk_a) ⊕ H(stalk_b)` differs from the
+//!   stored hash. It does **not** apply the restriction map, so it cannot
+//!   distinguish content changes that fall outside the agreement subspace
+//!   from genuine sheaf disagreements.
+//! - The cascade depth is a configurable heuristic budget, not a sheaf-derived
+//!   reach. See [`SheafCache`] field documentation.
+//!
+//! For a real δ⁰-driven invalidation contract — "evict iff the new section
+//! sits outside ker(δ⁰)" — wire through [`crate::complex::CellComplex::detect_violations`]
+//! (which applies the restriction maps and operates on the f32 stalk values).
+//! The path forward is folding the `CellComplex` into the cache so `on_change`
+//! consults the actual coboundary instead of the hash proxy. Tracked by the
+//! daemon-wiring bead.
+//!
+//! ## Cache contract
+//!
+//! Structurally-aware BFS-bounded hash invalidation. Health monitoring uses
+//! the sheaf-derived defect metric `Σ‖δ⁰‖²` (see
+//! [`crate::complex::CellComplex::consistency_analysis`]); eviction uses the
+//! hash-comparison BFS cascade; co-change-learned edge weights weight the
+//! cascade frontier as a coupling prior. No code path here computes ker(δ⁰)
+//! — see "What this cache actually does" above for the proxy details and the
+//! daemon-wiring bead for the δ⁰-driven upgrade path.
 //!
 //! ## Restriction weight learning
 //!
@@ -10,6 +38,11 @@
 //! Derived from co-change history (not configured):
 //! - High co-change variance → low weight (dimensions that naturally differ)
 //! - Low co-change variance → high weight (dimensions that should agree)
+//!
+//! Co-change correlates with — but does not derive — sheaf-level coupling.
+//! Treat learned weights as a noisy prior, not as a first-principles
+//! restriction map. Pair with structural edge labels (`"import"`,
+//! `"shared_token"`) when available.
 //!
 
 use std::collections::HashMap;
@@ -158,15 +191,27 @@ impl<S: StalkHash, V> SheafCache<S, V> {
         invalidated
     }
 
-    /// Check if the boundary between two regions has changed by comparing
-    /// current stalk hashes against the stored boundary hash.
+    /// Heuristic boundary-change check: compares the XOR of endpoint Merkle
+    /// roots against the stored boundary hash.
+    ///
+    /// **This is a proxy, not a δ⁰ computation.** Returns `true` whenever either
+    /// endpoint's hash has shifted in a way that changes the XOR — including
+    /// content changes that the restriction map would project away. Over-evicts
+    /// on author churn that doesn't actually move the agreement subspace, and
+    /// could in principle false-negative if two simultaneous endpoint hash
+    /// changes XOR back to the stored boundary (vanishingly unlikely for
+    /// real Merkle hashes; guarded against deterministically by the cache's
+    /// `claim_2_unchanged_neighbors_with_matching_boundary_hash_remain_valid`
+    /// falsifiability gate).
+    ///
+    /// TODO: replace with real δ⁰ via [`crate::complex::CellComplex::detect_violations`]
+    /// once the cache stores the f32 stalk values alongside their hashes.
     fn check_boundary_changed(&self, a: RegionId, b: RegionId, edge: &RestrictionEdge) -> bool {
         let hash_a = self.stalks.get(&a).map(|s| s.merkle_root());
         let hash_b = self.stalks.get(&b).map(|s| s.merkle_root());
 
         match (hash_a, hash_b) {
             (Some(ha), Some(hb)) => {
-                // Simple XOR-based boundary hash for comparison
                 let mut boundary = [0u8; 32];
                 for i in 0..32 {
                     boundary[i] = ha[i] ^ hb[i];

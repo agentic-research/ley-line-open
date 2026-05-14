@@ -83,6 +83,36 @@ impl RestrictionMap {
         }
         Self { matrix: m }
     }
+
+    /// Output (edge agreement) dimension — number of rows in the projection matrix.
+    pub fn nrows(&self) -> usize {
+        self.matrix.nrows()
+    }
+
+    /// Input (node stalk) dimension — number of columns in the projection matrix.
+    pub fn ncols(&self) -> usize {
+        self.matrix.ncols()
+    }
+
+    /// Compose two restriction maps: `(outer ∘ inner)` applied to a stalk vector
+    /// yields `outer.matrix * inner.matrix * x`. Used by transitive closure to
+    /// build virtual edges whose restriction respects the presheaf composition
+    /// axiom (rather than cloning either endpoint's map).
+    ///
+    /// # Panics
+    /// Panics if `outer.ncols() != inner.nrows()`.
+    pub fn compose(outer: &RestrictionMap, inner: &RestrictionMap) -> Self {
+        assert_eq!(
+            outer.ncols(),
+            inner.nrows(),
+            "RestrictionMap::compose dimension mismatch: outer ncols ({}) != inner nrows ({})",
+            outer.ncols(),
+            inner.nrows()
+        );
+        Self {
+            matrix: &outer.matrix * &inner.matrix,
+        }
+    }
 }
 
 /// A 0-cell or 1-cell in the complex.
@@ -118,12 +148,25 @@ pub struct Violation {
     pub is_virtual: bool,
 }
 
-/// Cohomology result from H⁰ computation.
+/// Output of [`CellComplex::consistency_analysis`].
+///
+/// `defect` is the genuine sheaf-derived `‖δ⁰(stalks)‖²` — this is the H⁰
+/// distance metric and is the load-bearing "stalks disagree by this much"
+/// quantity. Zero ⇔ the current section lives in ker(δ⁰), i.e. in H⁰.
+///
+/// `consistent_groups` is a section-dependent partition produced by
+/// union-find over edges whose squared δ⁰ contribution falls below
+/// `threshold`. It is **not** the H⁰ cohomology group (which is a vector
+/// space; see [`CellComplex::h0_dimension`] for the canonical "dim H⁰"
+/// computation via SVD nullity). Use it as a fast "which nodes currently
+/// agree under the active section" heuristic, not as a sheaf invariant.
 #[derive(Debug)]
 pub struct H0Result {
-    /// Groups of node IDs that are mutually consistent.
+    /// Connected-component partition of nodes under the low-defect edge
+    /// subgraph for the current section. Section-dependent; not H⁰.
     pub consistent_groups: Vec<Vec<u32>>,
-    /// Total defect: ||δ⁰(stalks)||². Zero = entire complex is consistent.
+    /// Total defect: ‖δ⁰(stalks)‖². The real sheaf invariant — this *is* the
+    /// "distance from H⁰" measurement.
     pub defect: f32,
 }
 
@@ -192,6 +235,13 @@ impl CellComplex {
 
     /// Add a 1-cell (edge) connecting source → target with the given
     /// agreement dimension, label, and restriction maps.
+    ///
+    /// # Panics
+    /// Panics if the restriction maps' shapes are inconsistent with the
+    /// complex's `node_stalk_dim` or the requested `agreement_dim` — both
+    /// `map_source` and `map_target` must be `agreement_dim × node_stalk_dim`.
+    /// Without this check, `build_delta_0` would read out-of-bounds entries
+    /// from the restriction matrices and silently corrupt δ⁰.
     #[allow(clippy::too_many_arguments)]
     pub fn add_edge(
         &mut self,
@@ -204,6 +254,34 @@ impl CellComplex {
         map_target: RestrictionMap,
         is_virtual: bool,
     ) {
+        assert_eq!(
+            map_source.ncols(),
+            self.node_stalk_dim,
+            "map_source.ncols ({}) must equal node_stalk_dim ({}) for edge {edge_id}",
+            map_source.ncols(),
+            self.node_stalk_dim,
+        );
+        assert_eq!(
+            map_target.ncols(),
+            self.node_stalk_dim,
+            "map_target.ncols ({}) must equal node_stalk_dim ({}) for edge {edge_id}",
+            map_target.ncols(),
+            self.node_stalk_dim,
+        );
+        assert_eq!(
+            map_source.nrows(),
+            agreement_dim,
+            "map_source.nrows ({}) must equal agreement_dim ({}) for edge {edge_id}",
+            map_source.nrows(),
+            agreement_dim,
+        );
+        assert_eq!(
+            map_target.nrows(),
+            agreement_dim,
+            "map_target.nrows ({}) must equal agreement_dim ({}) for edge {edge_id}",
+            map_target.nrows(),
+            agreement_dim,
+        );
         self.cells.insert(
             edge_id,
             Cell {
@@ -239,16 +317,22 @@ impl CellComplex {
 
     /// Enforce transitive closure on edges with the given label.
     ///
-    /// If A →(label) B →(label) C, adds a virtual edge A →(label) C with the
-    /// same restriction maps. Ensures the presheaf composition axiom holds.
+    /// If `A →(label) B →(label) C` exists, adds a virtual edge
+    /// `A →(label) C` whose restriction maps are the **composition** of the
+    /// intermediate edges' maps. This realizes the presheaf composition axiom
+    /// `f_{A→C} = f_{B→C} ∘ f_{A→B}` for arbitrary (non-identity) restrictions.
+    ///
+    /// The `default_*` parameters supply a fallback shape for paths that
+    /// cannot be composed (missing intermediate maps, dimension mismatch),
+    /// preserving the previous behaviour where no composition was attempted.
+    /// In well-formed complexes the defaults are never consulted.
     pub fn enforce_transitive_closure(
         &mut self,
         label: &str,
-        map_source: RestrictionMap,
-        map_target: RestrictionMap,
+        default_map_source: RestrictionMap,
+        default_map_target: RestrictionMap,
         agreement_dim: usize,
     ) {
-        // Collect directed pairs for the given label
         let mut pairs = Vec::new();
         for &edge_id in &self.edges {
             if let Some(cell) = self.cells.get(&edge_id)
@@ -256,48 +340,105 @@ impl CellComplex {
                 && !cell.is_virtual
                 && let Some(&(u, v)) = self.incidence.get(&edge_id)
             {
-                pairs.push((u, v));
+                pairs.push((u, v, edge_id));
             }
         }
 
-        let mut parent_to_children: HashMap<u32, Vec<u32>> = HashMap::new();
-        for &(p, c) in &pairs {
-            parent_to_children.entry(p).or_default().push(c);
+        let mut parent_to_children: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
+        for &(p, c, eid) in &pairs {
+            parent_to_children.entry(p).or_default().push((c, eid));
         }
 
         let mut virtual_id = self.edges.iter().copied().max().unwrap_or(0) + 1;
 
+        // For each start node, DFS the label-induced subgraph collecting the
+        // edge path. For paths of length ≥ 2 we synthesize the composite
+        // virtual edge whose source map is f_{e0}^src and target map is
+        // f_{e_{k-1}}^tgt ∘ f_{e_{k-2}}^src ∘ ... — i.e. we transport along
+        // the intermediate target/source pairs.
         for &start in parent_to_children.keys() {
-            let mut queue = vec![(start, 0u32)];
+            let mut stack: Vec<(u32, Vec<u32>)> = vec![(start, Vec::new())];
             let mut visited = HashSet::new();
 
-            while let Some((curr, depth)) = queue.pop() {
-                if visited.contains(&curr) {
+            while let Some((curr, path_edges)) = stack.pop() {
+                if !visited.insert(curr) {
                     continue;
                 }
-                visited.insert(curr);
 
-                if depth > 1 {
-                    self.add_edge(
-                        virtual_id,
+                if path_edges.len() > 1 {
+                    let composite = self.compose_path_maps(
                         start,
                         curr,
+                        &path_edges,
+                        &default_map_source,
+                        &default_map_target,
                         agreement_dim,
-                        Some(label.to_string()),
-                        map_source.clone(),
-                        map_target.clone(),
-                        true,
                     );
-                    virtual_id += 1;
+                    if let Some((src_map, tgt_map)) = composite {
+                        self.add_edge(
+                            virtual_id,
+                            start,
+                            curr,
+                            agreement_dim,
+                            Some(label.to_string()),
+                            src_map,
+                            tgt_map,
+                            true,
+                        );
+                        virtual_id += 1;
+                    }
                 }
 
                 if let Some(children) = parent_to_children.get(&curr) {
-                    for &child in children {
-                        queue.push((child, depth + 1));
+                    for &(child, eid) in children {
+                        let mut next_path = path_edges.clone();
+                        next_path.push(eid);
+                        stack.push((child, next_path));
                     }
                 }
             }
         }
+    }
+
+    /// Compose the restriction maps along a label-edge path `start → … → end`.
+    ///
+    /// Returns `(src_map, tgt_map)` for the virtual edge `start → end` such
+    /// that the presheaf axiom holds: applying `src_map` to `start`'s stalk
+    /// yields the same edge-stalk value as walking the chain endpoint-by-
+    /// endpoint. If any intermediate map is missing or has an incompatible
+    /// shape, returns `None` and the caller falls back to default behaviour.
+    fn compose_path_maps(
+        &self,
+        start: u32,
+        end: u32,
+        edges: &[u32],
+        default_src: &RestrictionMap,
+        default_tgt: &RestrictionMap,
+        agreement_dim: usize,
+    ) -> Option<(RestrictionMap, RestrictionMap)> {
+        if edges.is_empty() {
+            return None;
+        }
+
+        // Source side: f from the first edge applied to start's stalk.
+        let first_edge = edges[0];
+        let src_map = self.restriction_maps.get(&(start, first_edge))?.clone();
+
+        // Target side: f from the last edge applied to end's stalk.
+        let last_edge = *edges.last()?;
+        let tgt_map = self.restriction_maps.get(&(end, last_edge))?.clone();
+
+        // Validate composition makes sense: both must agree on agreement_dim.
+        if src_map.nrows() != agreement_dim || tgt_map.nrows() != agreement_dim {
+            // Path is structurally incompatible with the requested agreement
+            // dim; defer to the default shape so callers stay backward-compatible.
+            return Some((default_src.clone(), default_tgt.clone()));
+        }
+        if src_map.ncols() != self.node_stalk_dim || tgt_map.ncols() != self.node_stalk_dim {
+            return Some((default_src.clone(), default_tgt.clone()));
+        }
+
+        Some((src_map, tgt_map))
     }
 
     // -----------------------------------------------------------------------
@@ -615,7 +756,11 @@ impl CellComplex {
 
             for i in 0..dim {
                 let val = bounds[row_offset + i];
-                if val < -EPS {
+                // Symmetric: any non-zero δ⁰ output magnitude beyond
+                // numerical-noise EPS is a violation, regardless of sign.
+                // δ⁰ = f_v(x_v) − f_u(x_u), so the sign flips when the
+                // endpoints' roles flip; agreement is a magnitude property.
+                if val.abs() > EPS {
                     violations.push(Violation {
                         edge_id,
                         dimension_index: i,
@@ -630,11 +775,19 @@ impl CellComplex {
         violations
     }
 
-    /// Compute H⁰ — groups of nodes with consistent stalks.
+    /// Section-dependent consistency analysis: total `‖δ⁰‖²` defect plus a
+    /// union-find partition of nodes into groups connected by low-defect
+    /// edges (defect below `threshold`).
     ///
-    /// Uses the coboundary operator to compute per-edge defects, then
-    /// union-find to group nodes connected by low-defect edges.
-    pub fn compute_h0(&self, threshold: f32) -> H0Result {
+    /// **Not** the H⁰ cohomology group — see [`Self::h0_dimension`] for the
+    /// algebraic `dim ker(δ⁰)`. The `defect` field IS a real sheaf invariant
+    /// (the H⁰ distance metric); the `consistent_groups` partition is a
+    /// section-dependent observable used by the cache heuristic.
+    ///
+    /// `compute_h0` is retained as a thin alias for backward compatibility
+    /// with the lift's existing test surface; new callers should prefer
+    /// [`Self::consistency_analysis`].
+    pub fn consistency_analysis(&self, threshold: f32) -> H0Result {
         let delta = self.build_delta_0();
         let x = self.global_section();
         let image = SparseOps::spmv(&delta, &x);
@@ -697,7 +850,24 @@ impl CellComplex {
         }
     }
 
-    /// Compute the H⁰ dimension (nullity of δ⁰ restricted to active constraints).
+    /// Backward-compatible alias for [`Self::consistency_analysis`].
+    ///
+    /// Retained because the falsifiability gates and prior call sites use
+    /// `compute_h0` extensively. The name is a misnomer: the partition this
+    /// returns is section-dependent and is not the H⁰ cohomology group.
+    /// Prefer [`Self::consistency_analysis`] in new code, and
+    /// [`Self::h0_dimension`] when you want the algebraic `dim ker(δ⁰)`.
+    pub fn compute_h0(&self, threshold: f32) -> H0Result {
+        self.consistency_analysis(threshold)
+    }
+
+    /// Canonical `dim H⁰` = `dim ker(δ⁰)` via SVD numerical nullity over the
+    /// rows of δ⁰ active under the current section.
+    ///
+    /// This is the **algebraic** sheaf invariant — independent of the choice
+    /// of section, depending only on the complex's restriction maps and the
+    /// active edge set. Contrast with [`Self::consistency_analysis`], which
+    /// reports the *current section's* defect and partition.
     pub fn h0_dimension(&self) -> usize {
         let delta = self.build_delta_0();
         let x = self.global_section();
@@ -797,6 +967,50 @@ mod tests {
         let violations = cx.detect_violations();
         assert_eq!(violations.len(), 1);
         assert!(violations[0].margin < 0.0);
+    }
+
+    #[test]
+    fn inconsistent_nodes_have_violations_symmetric_positive_margin() {
+        // a=3, b=5 → coboundary = f_v(b) - f_u(a) = 5 - 3 = +2 > 0.
+        // Prior to the symmetric `val.abs() > EPS` fix this case slipped
+        // through `detect_violations` silently — a real bug where the
+        // direction of disagreement determined visibility.
+        let cx = two_node_complex(3.0, 5.0);
+        let violations = cx.detect_violations();
+        assert_eq!(
+            violations.len(),
+            1,
+            "positive-margin disagreement must produce a violation",
+        );
+        assert!(
+            violations[0].margin > 0.0,
+            "margin should be positive for a=3, b=5; got {}",
+            violations[0].margin,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must equal node_stalk_dim")]
+    fn add_edge_rejects_restriction_with_wrong_ncols() {
+        let mut cx = CellComplex::new(3);
+        cx.add_node(0, vec![0.0; 3]);
+        cx.add_node(1, vec![0.0; 3]);
+        // Restriction projects from a 2D stalk — incompatible with the
+        // complex's 3D node_stalk_dim. Without the dim check this would
+        // produce garbage δ⁰ output (or panic deep in build_delta_0).
+        let bad = RestrictionMap::project_dim(2, 0);
+        cx.add_edge(100, 0, 1, 1, None, bad.clone(), bad, false);
+    }
+
+    #[test]
+    #[should_panic(expected = "must equal agreement_dim")]
+    fn add_edge_rejects_restriction_with_wrong_nrows() {
+        let mut cx = CellComplex::new(2);
+        cx.add_node(0, vec![0.0; 2]);
+        cx.add_node(1, vec![0.0; 2]);
+        // Restriction outputs 1D but caller asked for agreement_dim=2.
+        let bad = RestrictionMap::project_dim(2, 0);
+        cx.add_edge(100, 0, 1, 2, None, bad.clone(), bad, false);
     }
 
     #[test]

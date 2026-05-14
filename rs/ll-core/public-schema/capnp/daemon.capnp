@@ -328,3 +328,115 @@ struct ErrorResponse {
   # additively per ADR-0014 §2; pre-b0ea2e the field was on every typed
   # envelope via the hand-written wire.rs ErrorResponse struct.
 }
+
+# ── Sheaf cache UDS operations ─────────────────────────────────────
+# Surfaces the leyline-sheaf SheafCache + CoChangeTracker over the
+# daemon's UDS + MCP wire. Consumers (mache, cloister) push community
+# topology and query structural cache invalidation.
+#
+# Six ops; all structs additive per ADR-0014 §2.
+
+# Region stalk = content-hash summary for one cache region. The
+# `hash` field is hex-encoded over the wire so consumers don't have
+# to JSON-encode a 32-byte byte array.
+#
+# `data` is optional: when non-empty AND the request's `nodeStalkDim`
+# is > 0, the cache pushes it into the attached `CellComplex` via
+# `set_stalk_value` so `detect_violations` sees the latest section
+# and the δ⁰-driven invalidation path engages. When empty, the
+# region only feeds the XOR-Merkle heuristic.
+struct SheafStalk {
+  id   @0 :UInt32;
+  hash @1 :Text;
+  data @2 :List(Float32);
+}
+
+# Restriction edge between two cache regions. `boundaryHash` is the
+# XOR-pre-filter hash; `weights` carries per-dimension learned
+# coupling strengths (empty = `[1.0]` default in handler).
+#
+# `agreementDim` opts the edge into δ⁰-driven mode: the implicit
+# restriction map is "project the first `agreementDim` coordinates"
+# of each endpoint's stalk. When 0, only the XOR pre-filter governs
+# this edge's cascade.
+struct SheafRestriction {
+  a            @0 :UInt32;
+  b            @1 :UInt32;
+  boundaryHash @2 :Text     $Json.name("boundary_hash");
+  coChangeRate @3 :Float64  $Json.name("co_change_rate");
+  revertRate   @4 :Float64  $Json.name("revert_rate");
+  weights      @5 :List(Float64);
+  agreementDim @6 :UInt32   $Json.name("agreement_dim");
+}
+
+struct SheafSetTopologyRequest {
+  regions      @0 :List(SheafStalk);
+  restrictions @1 :List(SheafRestriction);
+  # Stalk dimension for δ⁰ mode. When > 0, every region's `data`
+  # field must be exactly this length and every restriction's
+  # `agreementDim` must be ≤ `nodeStalkDim`. The handler then
+  # builds a backing `CellComplex` and runs `refresh_baseline()`
+  # before returning so subsequent `sheaf_invalidate` calls land
+  # against a snapshot of the seed state.
+  nodeStalkDim @2 :UInt32  $Json.name("node_stalk_dim");
+}
+
+struct SheafSetTopologyResponse {
+  ok            @0 :Bool;
+  regions       @1 :UInt32;
+  restrictions  @2 :UInt32;
+  # Whether δ⁰-driven invalidation was activated (every stalk has
+  # `data` of length `nodeStalkDim`, every restriction has
+  # `agreementDim > 0`). False = the cache fell back to the XOR-
+  # only heuristic path for this topology.
+  deltaZeroMode @3 :Bool  $Json.name("delta_zero_mode");
+}
+
+struct SheafInvalidateRequest {
+  regions @0 :List(UInt32);
+  # Optional new stalks delivered alongside the invalidation hint.
+  # When present, the handler updates the cache's stored stalks
+  # before running on_change so the boundary check sees the new
+  # state.
+  stalks  @1 :List(SheafStalk);
+}
+
+struct SheafInvalidateResponse {
+  invalidated @0 :List(UInt32);
+  count       @1 :UInt32;
+  generation  @2 :UInt64;
+}
+
+struct SheafDefectResponse {
+  defect     @0 :Float64;
+  generation @1 :UInt64;
+  valid      @2 :UInt32;
+  total      @3 :UInt32;
+}
+
+struct SheafStalksResponse {
+  generation @0 :UInt64;
+  valid      @1 :UInt32;
+  total      @2 :UInt32;
+}
+
+struct SheafStatusResponse {
+  generation   @0 :UInt64;
+  valid        @1 :UInt32;
+  total        @2 :UInt32;
+  defect       @3 :Float64;
+  trackedEdges @4 :UInt32  $Json.name("tracked_edges");
+}
+
+struct SheafLearnedWeight {
+  a            @0 :UInt32;
+  b            @1 :UInt32;
+  coChangeRate @2 :Float64  $Json.name("co_change_rate");
+  observations @3 :UInt64;
+}
+
+struct SheafLearnedWeightsResponse {
+  ok        @0 :Bool;
+  weights   @1 :List(SheafLearnedWeight);
+  edgeCount @2 :UInt32  $Json.name("edge_count");
+}

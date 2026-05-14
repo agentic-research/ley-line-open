@@ -6,6 +6,7 @@ import (
 	capnp "capnproto.org/go/capnp/v3"
 	text "capnproto.org/go/capnp/v3/encoding/text"
 	schemas "capnproto.org/go/capnp/v3/schemas"
+	math "math"
 )
 
 type Node capnp.Struct
@@ -4612,234 +4613,1476 @@ func (f ErrorResponse_Future) Struct() (ErrorResponse, error) {
 	return ErrorResponse(p.Struct()), err
 }
 
-const schema_a1b2c3d4e5f60001 = "x\xda\xd4Y}p\x14\xe7y\x7f\x9f\xdd;N\x07R" +
-	"N\xcb\xab\x14[EZD\xa4\x04\x18\xe3\xc1|$E" +
-	"\x93\xe4,,\x19\xa3F\x8e\xf6\x0e\x7f)\xb8\xe7\xbd\xdb" +
-	"\x17\xee\xb0\xb4w\xda\xdd\x8b\x11M\x06LH\xfcQ<" +
-	"\x8e<(\x0d\xce0\xb5\xe2I\x1bw&\x8d\xc7\x13\xc7" +
-	"\xa6u&6\xb1'\x86\x86\x8cB\xa1\xc1\xc4qm\x12" +
-	"\x86\x96\x9a\x1a\x13\x88#%\xf2u\x9ew\xf7v\xf7>" +
-	"t\x92[f\xda\xfc\xb7\xf7\xeeo\x9f\xf7y~\xef\xf3" +
-	"\xf5>\xb7\xea\xc9\x057\x06nh\x88.$\x82r\"" +
-	"8\xaf\xb0uU\xf4\xd1\xbd7>\xb4\x87H\x0d0\x0d" +
-	"\xbf={\xe2G\xcf\x8c\x07B\x84\xd0`\xf8\x12\x95\xc2" +
-	"!\"\x16>q6\xfej\xe7\xc4\xaf\xbfB\x94\x06p" +
-	"1A\x01A\x17\xea.\xd1\xc9:|\xbaR\xf7]\x02" +
-	"\x85\xf7\x8eL\x9c\xdb\xff\xb7\x0f>\x80P\xc1\x85ry" +
-	"\xe3\xe1\xc7\xe8S\xe1\x10!k\xbe\x15\xbe\x03\x08\x14\xda" +
-	"\x16>\xfd\xcc\xdb_\xfb\xdd\x03\xfe\x9d\x83\x80\xd0\x96\x05" +
-	"G\xe9\xf2\x05\xf8\xd4\xb1 \x8aR\x7f\x1f~\xfb\xb7\x7f" +
-	"\xd9\xfdp\x09\x92\xef\xdf\xb3\xe0\x0cU8\xb2o\xc1}" +
-	"\x04\x0ao>k%\xde\xeb\xdb\xbd\xafTU\x14\xba\xe6" +
-	"\xa9\x05\x0b\x81\x1e\xe2\xd8g9\xf6\xf5\xb3\x87?\xad\xdc" +
-	">\xbd\xaf\xc2\xf2\x8e\xfaK\xf4\x86z\xb4|O~2" +
-	"s\xf0\x9e\xee\xc7*T\\\xd3P?\x1fhK=\xc2" +
-	"\xaf\xadG\x1d\xff:\xfc\xd9\xc8O\xc6\xfe\xf4@\x95\x9d" +
-	"\xd7\xd7\x0b@{8\xb6\xab\x9e\xef\xfc\xe7g#o^" +
-	"\xff\xe87*v\xfeN\xfd\x14=\xc4w~\xe6\xa1+" +
-	"\x8b\x83\xa7\x16\x1e\xac4y\xac\xfeaz\x90\x0b;\xc0" +
-	"\x85\xed\xfe\xcfp\xdbK\xa7\x96\x1f\xac\xdc\x98\xf64\\" +
-	"\xa2J\x03g\xa7\x01\xa1\xe3\xd7<\xd7\xf6/\xea\xa3\x7f" +
-	"\x83P\xb1d\xe3C\x0dS\xf4\x15\x8e|\xa9\xe1\x1c\x81" +
-	"\xc2\xdf\xddq\xe1\x87#\x87\x8f?Q\xa1\xe1\x87#S" +
-	"\xb4-\x82\x1a\xfe``\xe0s_\xff~\xddx\x15\xaf" +
-	"\x98\xfe\xd0y\x1a\x8ep'\x8a\xa0W\xa4\xd7n\\\xd3" +
-	"\xf1\xcd\x1dOV\xe1\xe6`D\x00\xfa\x14\xc7~+\x82" +
-	":.W?{\xe5\xb8y\xf8\xe9R\x0f\xe2b\xa5\xc6" +
-	"3\xb4\xa5\x91S\xde\x88J\x1a\x17_\xcdm\xc9\xfd\xf2" +
-	"\xb9*\x96\xaf\x94N\xd3\xf5\x12>\xad\x93P\xea\xb5\xa9" +
-	"\xb4\xfc\x8b\x8dO>_\x0a\x15\x110*=N\x0fp" +
-	"\xe8\x98\x84R\xef\x1e\x7f\xd6\x9c\xcc\x0c\x1f\xaad>\xb3" +
-	"\xf04\xcd/\xc4\xa7\xe1\x85(\xf4\xd0\xda\xef\xec\xbe\xd8" +
-	"\xfa\xe2\x8b\x95\xde\x11\xa4\x02P\x89\"\xb4\x81\xa2w\xfc" +
-	"\xd7\xca\x8fm\x8f~\xe9\xf7\x95P\xba\x92\x1e\xa7\xeb9" +
-	"r\x1dG\xee{\xfdr\xc3\x96\xf7\xfb\x0e\xa3\xa6\x01\x17" +
-	"\x1aB\xc0m\xf4\x0cU\x11\xba\xe6n\x9a\x15\x08\x14>" +
-	"~\xee\xdcO/\xc5\x17\xfc\xa8\x94+.v\xf2O\x8e" +
-	"\xd3\xe0\"|\x82Ex\x04\xe3\xd1/\x9dl\xffM\xd7" +
-	"\x8fK\x09\x98\x87\x80#\x8b\xa6\xe8I\x84\xae\xf9\xd9\xa2" +
-	"G10\x0f\xdd\xf3\xc0\xd1E\xef}\xec\x08b\xe7\x95" +
-	"\x92u[\xf3y\xaa6s\x15\x9a\x0b\x88=\xfa\xf3\x16" +
-	"v\xcb/>}\xa4\xd2\xb0c\x8b\xcf\xd0\xd7\x16\xe3\xd3" +
-	"\xc9\xc5h\x984\xf9\xf0[{\xdb\x96\xfcs%\xafW" +
-	"\x16\x9f\xa7\xd0\xc2\x1dg1\xf2\xfa\xd5\xf9/\xc4\xdfi" +
-	"\xf9\xe6\xb1J^\xefj\x11\x802\x0eU[P\xe8\xbb" +
-	"\xa3\xdd\xbf:z\xe0\xe8D\x15\xcf\xba\xbfe>\xd0Q" +
-	"\x8e}\xa4\x05\xc5\xfe\xf8\xaf\xea\xbf\xfdr\xee\xb5S\x95" +
-	"\x0aL\xb6\x9c\xa6\xc1VNV+\"w|\xfcX\xe2" +
-	"w=\xcd\xafW\x1a5\xd4z\x9e\x8epd\xbe\x15\xf7" +
-	"\x7f\xfb\xdc\xf7\xfb\xb6=\x9f\xabD\xae\x19k\x15\x80\x8e" +
-	"s\xe8A\x0e]w\xa1m\xcf\xcfo_\xf5FI\xf0" +
-	"\xd9R\x7f\xd0z\x9e\x1e\xe1\xd0WZ\xd1\x05\x1b\x93\xd9" +
-	"\xde\x85\xfb\x1f\x7f\xa3\xca\xb9nZr\x89\xde\xb6\x04\x9f" +
-	"\x94%x\xaew|m\xf3\xbc\xec#\xcb\xfe\xadJ\x14" +
-	"^\xdbv\x9av\xb4\xe1S[\x1bB\x7f\xb8\"\xfc\xc5" +
-	"\xbf\xdf2\xf4f\x15\xa9\xaf\xb5\x1d\xa6oq\xe8/9" +
-	"\xf4\xce\xe7\xe6\x0b\x9d\xff\xa0\x9f)uB\x0e\x1d_z" +
-	"\x98>\xb5\x94\xa7\xf1\xa52z\x80\xf6\xe2_\xd0\xaf$" +
-	"~u\xaeJ\x14^\xf9\xc8i\x0a\xed\xfc`?\x82\xbc" +
-	"\x9e\x1c\xbb\x99\xdd\xf7\x8dcoW9\xad/\xb7\xcf\x07" +
-	":\xc6\xb1\xa3\xed\x88\x9d\xf8\xc4c\x13\xad\x97\xd7\xbfS" +
-	"\x91\x81\xa6\xdb\x8f\xd3p\x07f\xa0\xc7\x84\x8b\x87\x97\xbd" +
-	"\xf3O\xbf\xa9<\xa6\xb3\xed\xcf\xd0\x0b\\\xd8\x7f\xb4#" +
-	"\xf7\xb7\xdf\x19\x9e\xfa\xe4-]\x93\x95G\x7fm\xc7a" +
-	"\xda\xd6\xc1\x8bN\x07n{\xe6{\xa1\xe7:\x8c\x9fN" +
-	"U\xb1\xe6\xa1\x8e):\xc6\xa1\xa3\x1c\xfa\xfe\x8a7\xd4" +
-	"\x7f|+;]I\xfd\x9a\xe9\x8e\xf9@\x1b>\x8a\xd8" +
-	"\xf0G\xbfK\xee*h*\x1b\xca\xea\xd7\xa7\x045\xa7" +
-	"\xe7:72\xab;\xd9\xafZ\xe9\x18\x93\x87\xf3\xcc\xb4" +
-	"\xfa\x01\xca \xf1|\xd2L\x19\x99$\xf3A\x94z1" +
-	"@H\x00\x08\x91z:\x09Qn\x14A\xd9\"\x80\x04" +
-	"\xd0\x04\xb8xW/!\xca\x9d\"(\x9a\x00 4\x81" +
-	"@\x88\xa4\xae&D\xd9\"\x82\x92\x16 jes\x99" +
-	"\x94\x09\x1f\"\xd0/\x02\xd4\x13\x01\x1f\x0b\x19\x8d\xe9V" +
-	"\xc6\x1a!\x84\xf0\xb5z\x02\xb2\x99\xd1S\x0c\xc2D\x80" +
-	"0\xf1T\x03\xae\xda\xadY\x0d\x18\xaas\x8d\xab\xce\x81" +
-	"fB\x94\xfd\"(O\xf8\xd49\xd8+\x8d\xcb\xca\xcb" +
-	"\"(\x13\x02H\x82\xa3\xd0\xb1\x15\x84(\xaf\x8a\xa0\x9c" +
-	"\x10\x00\xc4&\x10\x09\x91~\x86k?\x11A9%\x80" +
-	"\x14\x80&\x08\x10\"\x9d\xc4\xc5\x09\x11\x94\xd7\x05\x90\x82" +
-	"b\x13\x04\x09\x91^C\xbbO\x88\xa0\xbc)\x80\x98\xd1" +
-	"\x8a\xfa\x16r\xaa\xc1tk\x93F\x08Q\x02 \x14>" +
-	"\xf5\x85\xeb\x17\xff\xab\xfc\xb9)\xa2\x04\x04\xe8jBc" +
-	"\x89\x041\x07\x97\xc8\x10\xd0<k#\xba:\xc4\xdc\x1f" +
-	"\xf7ft\x0d\x02D\x80\x00\x81\x88\x99\xd9\xc9 H\x04" +
-	"\x08\x12\x88\x1a,\x955\xbc=K\x0f\xec3YU\x8b" +
-	"1~T\x84 ;\x01\x97\x9d\x06d\xa7N\x04\xa5I" +
-	"\x00QKB\x03\x11\xa0\xa1B@\x8c\xe5T\xc3d(" +
-	"#\xe4\x9cw\x9d+b9\xda\xdd.\x82\xb2\xcaG\xf0" +
-	"Jdh\x99\x08\xcaZ\x01\xa2f6o\xa4<+\x06" +
-	"U}[\x85\xa6\xa2\xadi\xc6\xb4nJg\x065\x83" +
-	"\xe91f\xe6\xb2\xbai\x9f\xa7o\xbbfo;w7" +
-	"\xf4\xae\xebDPn\x11@\xcc\xde\x0b@\x04\xc0\xf8O" +
-	"9\xa2\xd0}\x1c\xcfj\xf4\xfa@\x02\xdc\xc7*\xfc?" +
-	"\x9eJ\xb3!\xb5\x9a\xffWSrvZ3\xda\x0c\xd6" +
-	"ndV\x8cm5\xfb\xd4\x9cc+#s\xb0u\x83" +
-	"\xc3lw\x89\xad\xbb\x98n\x19\x19fzv\xba\xcd\xc2" +
-	"Lvv;{GY\x85\xa1\xe0\x1c\xfbVR\xaeQ" +
-	"\xa7\xb4\\Vn\x11A\xd9\xec;m\xa5W\xbaMV" +
-	"v\x88\xa0\xec\x15 \xaag5\xb6I\xab\xe2\xeb\x8d\x8e" +
-	"\xafo\xd8\x85\x90D\xc6\xe7\xe7\x05\xdbGf\x8f\x12\x1b" +
-	"W\x16%e\xb6\xdd\x9c\xd154.\xc6L\x99\xd3:" +
-	"\x07VWTe5\xa2\xb1\xad>J\xdd\xce\xb7*\xa5" +
-	"\xbe\xbc\x185\xdd}\x1b\xdd}\xd5f/\xdf\xb9\xd4\xb1" +
-	"\x0d\x12\x93\x95\x07EP\xf6\xfb2\xd1hR\x1a\x93\x95" +
-	"\xe7EP^\x16@\x12\xc1\xceE/\xc5\xa4Wd\xe5" +
-	"\xdfEP.\x97\x9e}\x9a\xa9Z\x9c\x0d\xd7 \xae\xb7" +
-	"\x80\x98\x84\xc9\x86Q\xf7b\xf24XnP\x1d\xb9)" +
-	"KBy\xdd\xaa\xf1\xf5v\x07\x99H\x91H6\xaf[" +
-	"\x84\x94\x89\xd8\xa8\x12\xc8\xd5\x100P\x14\xb0\x8d\x88j" +
-	"\x0eUp\"\xb4\xc2)c3;\xa5\x8b\xb95\xab1" +
-	"\x8c\x98H\x91c_\xf1iv\x8a\xcfg\xbc\xb3\xdd\x84" +
-	"g\xdb-\x82\xd2\x8f\x0c\x83\xcdp\x1f\x16\x1f\xc7\x8f\xfd" +
-	"\x07\x8e\x9eY\x96$\x1a\x09\xc8\xcc0\xb2\xc6\xcca\xdc" +
-	"\xfd\x7f\x15\xc6=\xba\x91I\xa5\xf9\xbe\xa19:\xdc\x00" +
-	"!\x8a&\x82\x92\xf3*\xf1\x10\xa6\xf0\xb4\x1d\xbe\xae\xb7" +
-	"\xdd\x9f\x94\xbe,+\xdf\x16A\xf9^iV\xdd\xc6t" +
-	"f\xa8V\x86\x88Y\xbd\xe8\x07\xd1\x9cj\x9a~\xb5\xdd" +
-	"\x96\xd2Q;\x957\xb0\xbc\xc5H(\x9b\xad\xedj\x0e" +
-	"2A\"F6k\xcd\x18\xe4=x\"6\xe1bE" +
-	"\x84\xaf\xaeBx\xb3W\x91J\x8f\xd3o[i\x02\xec" +
-	"\xf9<\x13u\xab\x8c\xd4\xa5\x1e\xa9.\xa7\xb8\xdf=\"" +
-	"(\x83>\x0f\xcbtzDK\xa2`\x93:\xb4\xc2a" +
-	"\xda\x12 d\xb2\xe1\"\x7f2\xef\x7f\x8a\x1a\x95WL" +
-	"M\xb5\xd4\x19h\xd8\x9c\xbd\x97\xe9}j\xaeG\xb7D" +
-	"cdf\x1a\xbc\xca\xbcAZ)+\xfd\xb6\xb2\xb2\x85" +
-	"\x9f\x17E\xef\xb23\xb7Y3\x8f8\xa9\xdbt\x0e\xd6" +
-	"\xdf\xad\x95\x86E\x8c\xa9\xdaMY\xdd\xc2Sw\xaa\xe4" +
-	"\x07+\x92\xb6\x81J\x9e\x19#\xb6\x00\xb0\xca\x04,\xf5" +
-	"\x04\x84\xcc\xe1\xc1\x19$\xc4-\xd5\xca\x9b%1r]" +
-	"Q\x06\xed\x80fB\xe2K@\x84\xf8u\xe0\xd1D\x97" +
-	"\xc3\x00!\xf1e\xb8\xbe\x16\xdcH\xa17@\x8c\xae\x03" +
-	"9~'\xbe\xd0\xc0;Y\xaaB\x8c2\x90\xe3\x0f\xe2" +
-	"\x9b\xfd\xe0u\x8bt\x14V\x13\x12\xdf\x87\xeb_\xc7\xf5" +
-	"\xa0\xc0\x1bF:\x06Iz\x00\xe4\xf8\x0b\xf8\xe6U|" +
-	"3Ol\x82yx\xd5\xe2\x9b\xbf\x8c\xeb\x13\xb8\x1e\x0a" +
-	"4\xd9\xf7V\xd8@\x8f\x81\x1c\xbf\x88o\xfe\x80o\xea" +
-	"\xc4&\xa8\xc3k\"\xec\xa1\xd3 \xc7\xdb\x05\x11\xe2\xab" +
-	"\x04\x01\xa4p\xb0\x09\xc2x\x89\x17p\xf7e\xb8\xbe\x16" +
-	"\xd7\xe7\xcfk\x82\xf9h\x89\xb0\x87\xae\x13\xe4\xf8\x16|" +
-	"\xb3C\x98=\xc4\x0b\xd8\x9f\xaa\xfd\xaaE ]3\xd5" +
-	"s\\\"\xa7\x12\xd1J\xfb\xc2\x97/\xc73;\x09\xb0" +
-	"9|nf\x88\xb8\x93y\x85F\xce\xa5U\xd3\x8d\x88" +
-	"\xab\x91N\x18O\x9dC\x8c\x88\xba\xe5F\x00\xaf\xa4i" +
-	"u\x0e\x954\xadb\x04\x14\x85\x0d\xaa\xa6\x85]2\x18" +
-	"&\xeb\xb2\xfa\xccjM\xcc5\x8e\x84\xc79:a\xb0" +
-	"\x1c`W\x9dP\xad\x848\x84\xf1\xe44\xf3e\xc5\xa6" +
-	"\xa8'\xe8\xd6\xe6\x91\x1c\xd3j\x89~\xd8\x8fNX\x1c" +
-	"\x0e^Rv\xe7\x1cUk\x89}M\xf05\xdd\xd5\xcb" +
-	"\xaa\x9bI6\x0dx%\xb4XI\x94\xa4\xaf\x13\x9c\xd5" +
-	"\xa3\xaezQ\xf0\xdd^}-\xd8b\xd7\x8eg\xd1\x8e" +
-	"\xa7EP^\xf0\x92\xf7\xa1N\xe9\x90\xac\x9c\x12A\xf9" +
-	"\xb5/{\xbf\xd5+\x9d\x95\xe3u\x18hM\xfe0\x97" +
-	"`;\xfd0\xc8\xf1?\xc37\xdd<\xccE;\xcc\xbb" +
-	"`\x03\xed\x029\xae\xe1\x9b\x1c\x0f\xf4\x80\x1d\xe8C0" +
-	"@\x87A\x8e\xef\xc77O\xf0@\x0f\xda\x81~\x10z" +
-	"\xe98\xc8^\xa8\xfb(\x8bj\xdc\x92\x9a}\xb4\x96L" +
-	"\xe4\xd4\x92(KY\xc6`?_\xaa\xddG#\x0e\xbf" +
-	"%\xe0\xff:\x99\xd1\xb5\x8c\xbe\xcd$\x91\x19\xb6.\x0a" +
-	"0<\xa8\\\xa6\xc2.\xd5\xb4f\xf9\xba\xb7\x80\x01\xe0" +
-	"|Vv\x05\xe8\xe7y\xa3\xc6\xc7\xc9\xe2\x1d GB" +
-	"\xa5\xb6c`\xce\xc5v\x1e\xc0\x15\xb6\xcfp\xe5\xf5\xb5" +
-	"\x99\xed\xae\x1f]@?r\x1aq7\x1e\xde\xc5x\xb8" +
-	"(\x82\xf2\x07/\x1e&\xb1\x04_\x16!\x06\xbe\xcej" +
-	":I\x01s5\x1e\xfa*\xeeB\x82\xedB+\xa1\xd3" +
-	"_t\x8a\xa3\x05\xac:\x84\xc4W\xe1\xfa'\xb9\xfb\x04" +
-	"l\xf7Y\x0f\x1b\x08\x89\xaf\xc5\xf5\x1by\x9d\x08\xdau" +
-	"\xe2S\\\x8e\xe7\xa2u\x82]%\xba`;\xed\x019" +
-	"\x9e\xc67{a\xf6\x08\x95MK\xb5Lh\xf4\xa6n" +
-	"v?|\x15\"7\xca\xf9\xd5\xdc\\\x90\xd7SiU" +
-	"\xdf\xc6\x08\xb8k\xbb46\xc8,\x0f\x13\xe5\x89\xd1\xf4" +
-	"\xd2\x07\xff@\xbb\x99D2\x83\xcc\xac\xe9\xad\x0e4A" +
-	"\xe4\xad\x88\xf5\xe6\x01\xe5\xbdK\xd9%\xc3\x1bx|\xd0" +
-	"\xbe\xa5\xc7I\xc4\xba\xd5\x13\xd1\xad\x8a\xd6lE\xb5\xd6" +
-	"\xac\xd3kQK\x06?Q\x93\xb70\xd0\xe8\x0dJ\x9d" +
-	"s(m\xb9\xf0\xe2{\x93:8\xc8\x98\xf9?k\xb9" +
-	"\xca\xc4\x18\xa6{\xa3\xf9_\\iR\xb6\xa8\xb9^\xa3" +
-	"\x8bW\x9a\xe1<\x13+fMUi[\xed\xed\x1b\xc1" +
-	"{\x88;*\xe4g]\xfb\xa4\xbdY\xc1p$_y" +
-	"\xd4\xab=\xbeJ{\xe5Z\x94Ue~vI\xe5~" +
-	"\x13\x8f`\xf0\x95\xdd>z}\xe3\x82\"\x01\xa3;\xfd" +
-	"\xd3\x82b\x05{i\xc07-p/ \xef\x0eHW" +
-	"\xe4\xf85\x98\x00\xdaA\x80\x02\xf2u\xab:\xc4f\x9f" +
-	"N\x9afBW\x87\x080_\xce\xe4\x04\xf7\x1bY\x12" +
-	"M1\xd3dZ\x0d\x11{lp\"g@\xd6\x06\x13" +
-	"\xdf\x18!c\xb1!\xb3K\xd3\x88XSH\xd2\x06&" +
-	"T\x8d\x844\x94\xe0\xcd\x81\xf3\x98\xbb\xb2:\x11\xfb\xcc" +
-	"\x9a\x02\\`(\xc1\x9b\xae\xf2A\xb2sg\xd0\xd5\x9c" +
-	"\x99\xceZ%#\xa4?\xbe~\xc8\xb9<\xf9.\xc9\xb3" +
-	"\x8cJ68\xa3\x92{|\x8et\xf7\x0agvo\x95" +
-	"\xc5uv0?\xa4\x97\xc7W\xc4\xc8\xde\xe7\x8bu\xf7" +
-	"\x8f\x90\xaa\xb1\xde\xaf\x9a\xa6}=#e\xca%\xa5M" +
-	"\xb22(\x82\xb2\xc3\xc7p\x1e\x83('\x82\xf2\x05\x8f" +
-	"\xe1\x11\\\xb3DPv\x0bN\x1b\x9e\xd7\xbbH\xc8\xaa" +
-	"\xe9\x06;\x9d\x16<\xaf\x93(\xf6\xdf%\xedwR5" +
-	"3n\x91\x99a\xf2ST\xdf0\x19\xeao\xab\xdf\xe4" +
-	"\xaa\xffE\xcc\xe4\xce\xa9\xbb\xda\xdf\x1f#D\xd9-\x82" +
-	"\xb2\xcf7\xe9{\x08\x19\xdf+\x82\xf2U\x0cR\xe7O" +
-	"\x87G\xf0\xf3b\x90\x07\xec\xff\x1cF\xb7\x17\x83\xfc\x84" +
-	"\xf0\xff\xbbx\xde<\x987\xd33Mf\xaa\xd5\x8d\xa4" +
-	"t\x83\xacl\xb6\xbd\xaed|\x7f\xf5\xc2\xa1J}\xbc" +
-	"J\x85\x8d\xcd\xb9\xb09\xbc\xb8\x93\x8c\xb2a\x93\x92g" +
-	"\xb21\x12\xcb\xdeWV8:\x9d\xc2\xd1.@\xf4\xf3" +
-	"\xea`~\xb6\x8af\xff}\xb19\xc3\x0c\xf2Az\x8e" +
-	"\xee\xf2\x9e#e\xa8\xd6l{\xf9\xfe-\xf1\xdd\xb7f" +
-	"asuU6e+S\xd2$\xb8\xff\x8b\x96qY" +
-	"e\xb8\xe4?\xc99\xe6\xb79\x8c\x82w\xa5l\xf9n" +
-	"7Q\x92\x09\xfe;\x00\x00\xff\xff\xd4\xbd\xd1g"
+type SheafStalk capnp.Struct
+
+// SheafStalk_TypeID is the unique identifier for the type SheafStalk.
+const SheafStalk_TypeID = 0x87492590f5d283fa
+
+func NewSheafStalk(s *capnp.Segment) (SheafStalk, error) {
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 8, PointerCount: 2})
+	return SheafStalk(st), err
+}
+
+func NewRootSheafStalk(s *capnp.Segment) (SheafStalk, error) {
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 8, PointerCount: 2})
+	return SheafStalk(st), err
+}
+
+func ReadRootSheafStalk(msg *capnp.Message) (SheafStalk, error) {
+	root, err := msg.Root()
+	return SheafStalk(root.Struct()), err
+}
+
+func (s SheafStalk) String() string {
+	str, _ := text.Marshal(0x87492590f5d283fa, capnp.Struct(s))
+	return str
+}
+
+func (s SheafStalk) EncodeAsPtr(seg *capnp.Segment) capnp.Ptr {
+	return capnp.Struct(s).EncodeAsPtr(seg)
+}
+
+func (SheafStalk) DecodeFromPtr(p capnp.Ptr) SheafStalk {
+	return SheafStalk(capnp.Struct{}.DecodeFromPtr(p))
+}
+
+func (s SheafStalk) ToPtr() capnp.Ptr {
+	return capnp.Struct(s).ToPtr()
+}
+func (s SheafStalk) IsValid() bool {
+	return capnp.Struct(s).IsValid()
+}
+
+func (s SheafStalk) Message() *capnp.Message {
+	return capnp.Struct(s).Message()
+}
+
+func (s SheafStalk) Segment() *capnp.Segment {
+	return capnp.Struct(s).Segment()
+}
+func (s SheafStalk) Id() uint32 {
+	return capnp.Struct(s).Uint32(0)
+}
+
+func (s SheafStalk) SetId(v uint32) {
+	capnp.Struct(s).SetUint32(0, v)
+}
+
+func (s SheafStalk) Hash() (string, error) {
+	p, err := capnp.Struct(s).Ptr(0)
+	return p.Text(), err
+}
+
+func (s SheafStalk) HasHash() bool {
+	return capnp.Struct(s).HasPtr(0)
+}
+
+func (s SheafStalk) HashBytes() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(0)
+	return p.TextBytes(), err
+}
+
+func (s SheafStalk) SetHash(v string) error {
+	return capnp.Struct(s).SetText(0, v)
+}
+
+func (s SheafStalk) Data() (capnp.Float32List, error) {
+	p, err := capnp.Struct(s).Ptr(1)
+	return capnp.Float32List(p.List()), err
+}
+
+func (s SheafStalk) HasData() bool {
+	return capnp.Struct(s).HasPtr(1)
+}
+
+func (s SheafStalk) SetData(v capnp.Float32List) error {
+	return capnp.Struct(s).SetPtr(1, v.ToPtr())
+}
+
+// NewData sets the data field to a newly
+// allocated capnp.Float32List, preferring placement in s's segment.
+func (s SheafStalk) NewData(n int32) (capnp.Float32List, error) {
+	l, err := capnp.NewFloat32List(capnp.Struct(s).Segment(), n)
+	if err != nil {
+		return capnp.Float32List{}, err
+	}
+	err = capnp.Struct(s).SetPtr(1, l.ToPtr())
+	return l, err
+}
+
+// SheafStalk_List is a list of SheafStalk.
+type SheafStalk_List = capnp.StructList[SheafStalk]
+
+// NewSheafStalk creates a new list of SheafStalk.
+func NewSheafStalk_List(s *capnp.Segment, sz int32) (SheafStalk_List, error) {
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 8, PointerCount: 2}, sz)
+	return capnp.StructList[SheafStalk](l), err
+}
+
+// SheafStalk_Future is a wrapper for a SheafStalk promised by a client call.
+type SheafStalk_Future struct{ *capnp.Future }
+
+func (f SheafStalk_Future) Struct() (SheafStalk, error) {
+	p, err := f.Future.Ptr()
+	return SheafStalk(p.Struct()), err
+}
+
+type SheafRestriction capnp.Struct
+
+// SheafRestriction_TypeID is the unique identifier for the type SheafRestriction.
+const SheafRestriction_TypeID = 0x85fd6ee93f58963f
+
+func NewSheafRestriction(s *capnp.Segment) (SheafRestriction, error) {
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 32, PointerCount: 2})
+	return SheafRestriction(st), err
+}
+
+func NewRootSheafRestriction(s *capnp.Segment) (SheafRestriction, error) {
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 32, PointerCount: 2})
+	return SheafRestriction(st), err
+}
+
+func ReadRootSheafRestriction(msg *capnp.Message) (SheafRestriction, error) {
+	root, err := msg.Root()
+	return SheafRestriction(root.Struct()), err
+}
+
+func (s SheafRestriction) String() string {
+	str, _ := text.Marshal(0x85fd6ee93f58963f, capnp.Struct(s))
+	return str
+}
+
+func (s SheafRestriction) EncodeAsPtr(seg *capnp.Segment) capnp.Ptr {
+	return capnp.Struct(s).EncodeAsPtr(seg)
+}
+
+func (SheafRestriction) DecodeFromPtr(p capnp.Ptr) SheafRestriction {
+	return SheafRestriction(capnp.Struct{}.DecodeFromPtr(p))
+}
+
+func (s SheafRestriction) ToPtr() capnp.Ptr {
+	return capnp.Struct(s).ToPtr()
+}
+func (s SheafRestriction) IsValid() bool {
+	return capnp.Struct(s).IsValid()
+}
+
+func (s SheafRestriction) Message() *capnp.Message {
+	return capnp.Struct(s).Message()
+}
+
+func (s SheafRestriction) Segment() *capnp.Segment {
+	return capnp.Struct(s).Segment()
+}
+func (s SheafRestriction) A() uint32 {
+	return capnp.Struct(s).Uint32(0)
+}
+
+func (s SheafRestriction) SetA(v uint32) {
+	capnp.Struct(s).SetUint32(0, v)
+}
+
+func (s SheafRestriction) B() uint32 {
+	return capnp.Struct(s).Uint32(4)
+}
+
+func (s SheafRestriction) SetB(v uint32) {
+	capnp.Struct(s).SetUint32(4, v)
+}
+
+func (s SheafRestriction) BoundaryHash() (string, error) {
+	p, err := capnp.Struct(s).Ptr(0)
+	return p.Text(), err
+}
+
+func (s SheafRestriction) HasBoundaryHash() bool {
+	return capnp.Struct(s).HasPtr(0)
+}
+
+func (s SheafRestriction) BoundaryHashBytes() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(0)
+	return p.TextBytes(), err
+}
+
+func (s SheafRestriction) SetBoundaryHash(v string) error {
+	return capnp.Struct(s).SetText(0, v)
+}
+
+func (s SheafRestriction) CoChangeRate() float64 {
+	return math.Float64frombits(capnp.Struct(s).Uint64(8))
+}
+
+func (s SheafRestriction) SetCoChangeRate(v float64) {
+	capnp.Struct(s).SetUint64(8, math.Float64bits(v))
+}
+
+func (s SheafRestriction) RevertRate() float64 {
+	return math.Float64frombits(capnp.Struct(s).Uint64(16))
+}
+
+func (s SheafRestriction) SetRevertRate(v float64) {
+	capnp.Struct(s).SetUint64(16, math.Float64bits(v))
+}
+
+func (s SheafRestriction) Weights() (capnp.Float64List, error) {
+	p, err := capnp.Struct(s).Ptr(1)
+	return capnp.Float64List(p.List()), err
+}
+
+func (s SheafRestriction) HasWeights() bool {
+	return capnp.Struct(s).HasPtr(1)
+}
+
+func (s SheafRestriction) SetWeights(v capnp.Float64List) error {
+	return capnp.Struct(s).SetPtr(1, v.ToPtr())
+}
+
+// NewWeights sets the weights field to a newly
+// allocated capnp.Float64List, preferring placement in s's segment.
+func (s SheafRestriction) NewWeights(n int32) (capnp.Float64List, error) {
+	l, err := capnp.NewFloat64List(capnp.Struct(s).Segment(), n)
+	if err != nil {
+		return capnp.Float64List{}, err
+	}
+	err = capnp.Struct(s).SetPtr(1, l.ToPtr())
+	return l, err
+}
+func (s SheafRestriction) AgreementDim() uint32 {
+	return capnp.Struct(s).Uint32(24)
+}
+
+func (s SheafRestriction) SetAgreementDim(v uint32) {
+	capnp.Struct(s).SetUint32(24, v)
+}
+
+// SheafRestriction_List is a list of SheafRestriction.
+type SheafRestriction_List = capnp.StructList[SheafRestriction]
+
+// NewSheafRestriction creates a new list of SheafRestriction.
+func NewSheafRestriction_List(s *capnp.Segment, sz int32) (SheafRestriction_List, error) {
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 32, PointerCount: 2}, sz)
+	return capnp.StructList[SheafRestriction](l), err
+}
+
+// SheafRestriction_Future is a wrapper for a SheafRestriction promised by a client call.
+type SheafRestriction_Future struct{ *capnp.Future }
+
+func (f SheafRestriction_Future) Struct() (SheafRestriction, error) {
+	p, err := f.Future.Ptr()
+	return SheafRestriction(p.Struct()), err
+}
+
+type SheafSetTopologyRequest capnp.Struct
+
+// SheafSetTopologyRequest_TypeID is the unique identifier for the type SheafSetTopologyRequest.
+const SheafSetTopologyRequest_TypeID = 0xa595e0c904d15c76
+
+func NewSheafSetTopologyRequest(s *capnp.Segment) (SheafSetTopologyRequest, error) {
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 8, PointerCount: 2})
+	return SheafSetTopologyRequest(st), err
+}
+
+func NewRootSheafSetTopologyRequest(s *capnp.Segment) (SheafSetTopologyRequest, error) {
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 8, PointerCount: 2})
+	return SheafSetTopologyRequest(st), err
+}
+
+func ReadRootSheafSetTopologyRequest(msg *capnp.Message) (SheafSetTopologyRequest, error) {
+	root, err := msg.Root()
+	return SheafSetTopologyRequest(root.Struct()), err
+}
+
+func (s SheafSetTopologyRequest) String() string {
+	str, _ := text.Marshal(0xa595e0c904d15c76, capnp.Struct(s))
+	return str
+}
+
+func (s SheafSetTopologyRequest) EncodeAsPtr(seg *capnp.Segment) capnp.Ptr {
+	return capnp.Struct(s).EncodeAsPtr(seg)
+}
+
+func (SheafSetTopologyRequest) DecodeFromPtr(p capnp.Ptr) SheafSetTopologyRequest {
+	return SheafSetTopologyRequest(capnp.Struct{}.DecodeFromPtr(p))
+}
+
+func (s SheafSetTopologyRequest) ToPtr() capnp.Ptr {
+	return capnp.Struct(s).ToPtr()
+}
+func (s SheafSetTopologyRequest) IsValid() bool {
+	return capnp.Struct(s).IsValid()
+}
+
+func (s SheafSetTopologyRequest) Message() *capnp.Message {
+	return capnp.Struct(s).Message()
+}
+
+func (s SheafSetTopologyRequest) Segment() *capnp.Segment {
+	return capnp.Struct(s).Segment()
+}
+func (s SheafSetTopologyRequest) Regions() (SheafStalk_List, error) {
+	p, err := capnp.Struct(s).Ptr(0)
+	return SheafStalk_List(p.List()), err
+}
+
+func (s SheafSetTopologyRequest) HasRegions() bool {
+	return capnp.Struct(s).HasPtr(0)
+}
+
+func (s SheafSetTopologyRequest) SetRegions(v SheafStalk_List) error {
+	return capnp.Struct(s).SetPtr(0, v.ToPtr())
+}
+
+// NewRegions sets the regions field to a newly
+// allocated SheafStalk_List, preferring placement in s's segment.
+func (s SheafSetTopologyRequest) NewRegions(n int32) (SheafStalk_List, error) {
+	l, err := NewSheafStalk_List(capnp.Struct(s).Segment(), n)
+	if err != nil {
+		return SheafStalk_List{}, err
+	}
+	err = capnp.Struct(s).SetPtr(0, l.ToPtr())
+	return l, err
+}
+func (s SheafSetTopologyRequest) Restrictions() (SheafRestriction_List, error) {
+	p, err := capnp.Struct(s).Ptr(1)
+	return SheafRestriction_List(p.List()), err
+}
+
+func (s SheafSetTopologyRequest) HasRestrictions() bool {
+	return capnp.Struct(s).HasPtr(1)
+}
+
+func (s SheafSetTopologyRequest) SetRestrictions(v SheafRestriction_List) error {
+	return capnp.Struct(s).SetPtr(1, v.ToPtr())
+}
+
+// NewRestrictions sets the restrictions field to a newly
+// allocated SheafRestriction_List, preferring placement in s's segment.
+func (s SheafSetTopologyRequest) NewRestrictions(n int32) (SheafRestriction_List, error) {
+	l, err := NewSheafRestriction_List(capnp.Struct(s).Segment(), n)
+	if err != nil {
+		return SheafRestriction_List{}, err
+	}
+	err = capnp.Struct(s).SetPtr(1, l.ToPtr())
+	return l, err
+}
+func (s SheafSetTopologyRequest) NodeStalkDim() uint32 {
+	return capnp.Struct(s).Uint32(0)
+}
+
+func (s SheafSetTopologyRequest) SetNodeStalkDim(v uint32) {
+	capnp.Struct(s).SetUint32(0, v)
+}
+
+// SheafSetTopologyRequest_List is a list of SheafSetTopologyRequest.
+type SheafSetTopologyRequest_List = capnp.StructList[SheafSetTopologyRequest]
+
+// NewSheafSetTopologyRequest creates a new list of SheafSetTopologyRequest.
+func NewSheafSetTopologyRequest_List(s *capnp.Segment, sz int32) (SheafSetTopologyRequest_List, error) {
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 8, PointerCount: 2}, sz)
+	return capnp.StructList[SheafSetTopologyRequest](l), err
+}
+
+// SheafSetTopologyRequest_Future is a wrapper for a SheafSetTopologyRequest promised by a client call.
+type SheafSetTopologyRequest_Future struct{ *capnp.Future }
+
+func (f SheafSetTopologyRequest_Future) Struct() (SheafSetTopologyRequest, error) {
+	p, err := f.Future.Ptr()
+	return SheafSetTopologyRequest(p.Struct()), err
+}
+
+type SheafSetTopologyResponse capnp.Struct
+
+// SheafSetTopologyResponse_TypeID is the unique identifier for the type SheafSetTopologyResponse.
+const SheafSetTopologyResponse_TypeID = 0xe9180c6432f76b1f
+
+func NewSheafSetTopologyResponse(s *capnp.Segment) (SheafSetTopologyResponse, error) {
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 16, PointerCount: 0})
+	return SheafSetTopologyResponse(st), err
+}
+
+func NewRootSheafSetTopologyResponse(s *capnp.Segment) (SheafSetTopologyResponse, error) {
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 16, PointerCount: 0})
+	return SheafSetTopologyResponse(st), err
+}
+
+func ReadRootSheafSetTopologyResponse(msg *capnp.Message) (SheafSetTopologyResponse, error) {
+	root, err := msg.Root()
+	return SheafSetTopologyResponse(root.Struct()), err
+}
+
+func (s SheafSetTopologyResponse) String() string {
+	str, _ := text.Marshal(0xe9180c6432f76b1f, capnp.Struct(s))
+	return str
+}
+
+func (s SheafSetTopologyResponse) EncodeAsPtr(seg *capnp.Segment) capnp.Ptr {
+	return capnp.Struct(s).EncodeAsPtr(seg)
+}
+
+func (SheafSetTopologyResponse) DecodeFromPtr(p capnp.Ptr) SheafSetTopologyResponse {
+	return SheafSetTopologyResponse(capnp.Struct{}.DecodeFromPtr(p))
+}
+
+func (s SheafSetTopologyResponse) ToPtr() capnp.Ptr {
+	return capnp.Struct(s).ToPtr()
+}
+func (s SheafSetTopologyResponse) IsValid() bool {
+	return capnp.Struct(s).IsValid()
+}
+
+func (s SheafSetTopologyResponse) Message() *capnp.Message {
+	return capnp.Struct(s).Message()
+}
+
+func (s SheafSetTopologyResponse) Segment() *capnp.Segment {
+	return capnp.Struct(s).Segment()
+}
+func (s SheafSetTopologyResponse) Ok() bool {
+	return capnp.Struct(s).Bit(0)
+}
+
+func (s SheafSetTopologyResponse) SetOk(v bool) {
+	capnp.Struct(s).SetBit(0, v)
+}
+
+func (s SheafSetTopologyResponse) Regions() uint32 {
+	return capnp.Struct(s).Uint32(4)
+}
+
+func (s SheafSetTopologyResponse) SetRegions(v uint32) {
+	capnp.Struct(s).SetUint32(4, v)
+}
+
+func (s SheafSetTopologyResponse) Restrictions() uint32 {
+	return capnp.Struct(s).Uint32(8)
+}
+
+func (s SheafSetTopologyResponse) SetRestrictions(v uint32) {
+	capnp.Struct(s).SetUint32(8, v)
+}
+
+func (s SheafSetTopologyResponse) DeltaZeroMode() bool {
+	return capnp.Struct(s).Bit(1)
+}
+
+func (s SheafSetTopologyResponse) SetDeltaZeroMode(v bool) {
+	capnp.Struct(s).SetBit(1, v)
+}
+
+// SheafSetTopologyResponse_List is a list of SheafSetTopologyResponse.
+type SheafSetTopologyResponse_List = capnp.StructList[SheafSetTopologyResponse]
+
+// NewSheafSetTopologyResponse creates a new list of SheafSetTopologyResponse.
+func NewSheafSetTopologyResponse_List(s *capnp.Segment, sz int32) (SheafSetTopologyResponse_List, error) {
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 16, PointerCount: 0}, sz)
+	return capnp.StructList[SheafSetTopologyResponse](l), err
+}
+
+// SheafSetTopologyResponse_Future is a wrapper for a SheafSetTopologyResponse promised by a client call.
+type SheafSetTopologyResponse_Future struct{ *capnp.Future }
+
+func (f SheafSetTopologyResponse_Future) Struct() (SheafSetTopologyResponse, error) {
+	p, err := f.Future.Ptr()
+	return SheafSetTopologyResponse(p.Struct()), err
+}
+
+type SheafInvalidateRequest capnp.Struct
+
+// SheafInvalidateRequest_TypeID is the unique identifier for the type SheafInvalidateRequest.
+const SheafInvalidateRequest_TypeID = 0x99164a8d87fc3494
+
+func NewSheafInvalidateRequest(s *capnp.Segment) (SheafInvalidateRequest, error) {
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 2})
+	return SheafInvalidateRequest(st), err
+}
+
+func NewRootSheafInvalidateRequest(s *capnp.Segment) (SheafInvalidateRequest, error) {
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 2})
+	return SheafInvalidateRequest(st), err
+}
+
+func ReadRootSheafInvalidateRequest(msg *capnp.Message) (SheafInvalidateRequest, error) {
+	root, err := msg.Root()
+	return SheafInvalidateRequest(root.Struct()), err
+}
+
+func (s SheafInvalidateRequest) String() string {
+	str, _ := text.Marshal(0x99164a8d87fc3494, capnp.Struct(s))
+	return str
+}
+
+func (s SheafInvalidateRequest) EncodeAsPtr(seg *capnp.Segment) capnp.Ptr {
+	return capnp.Struct(s).EncodeAsPtr(seg)
+}
+
+func (SheafInvalidateRequest) DecodeFromPtr(p capnp.Ptr) SheafInvalidateRequest {
+	return SheafInvalidateRequest(capnp.Struct{}.DecodeFromPtr(p))
+}
+
+func (s SheafInvalidateRequest) ToPtr() capnp.Ptr {
+	return capnp.Struct(s).ToPtr()
+}
+func (s SheafInvalidateRequest) IsValid() bool {
+	return capnp.Struct(s).IsValid()
+}
+
+func (s SheafInvalidateRequest) Message() *capnp.Message {
+	return capnp.Struct(s).Message()
+}
+
+func (s SheafInvalidateRequest) Segment() *capnp.Segment {
+	return capnp.Struct(s).Segment()
+}
+func (s SheafInvalidateRequest) Regions() (capnp.UInt32List, error) {
+	p, err := capnp.Struct(s).Ptr(0)
+	return capnp.UInt32List(p.List()), err
+}
+
+func (s SheafInvalidateRequest) HasRegions() bool {
+	return capnp.Struct(s).HasPtr(0)
+}
+
+func (s SheafInvalidateRequest) SetRegions(v capnp.UInt32List) error {
+	return capnp.Struct(s).SetPtr(0, v.ToPtr())
+}
+
+// NewRegions sets the regions field to a newly
+// allocated capnp.UInt32List, preferring placement in s's segment.
+func (s SheafInvalidateRequest) NewRegions(n int32) (capnp.UInt32List, error) {
+	l, err := capnp.NewUInt32List(capnp.Struct(s).Segment(), n)
+	if err != nil {
+		return capnp.UInt32List{}, err
+	}
+	err = capnp.Struct(s).SetPtr(0, l.ToPtr())
+	return l, err
+}
+func (s SheafInvalidateRequest) Stalks() (SheafStalk_List, error) {
+	p, err := capnp.Struct(s).Ptr(1)
+	return SheafStalk_List(p.List()), err
+}
+
+func (s SheafInvalidateRequest) HasStalks() bool {
+	return capnp.Struct(s).HasPtr(1)
+}
+
+func (s SheafInvalidateRequest) SetStalks(v SheafStalk_List) error {
+	return capnp.Struct(s).SetPtr(1, v.ToPtr())
+}
+
+// NewStalks sets the stalks field to a newly
+// allocated SheafStalk_List, preferring placement in s's segment.
+func (s SheafInvalidateRequest) NewStalks(n int32) (SheafStalk_List, error) {
+	l, err := NewSheafStalk_List(capnp.Struct(s).Segment(), n)
+	if err != nil {
+		return SheafStalk_List{}, err
+	}
+	err = capnp.Struct(s).SetPtr(1, l.ToPtr())
+	return l, err
+}
+
+// SheafInvalidateRequest_List is a list of SheafInvalidateRequest.
+type SheafInvalidateRequest_List = capnp.StructList[SheafInvalidateRequest]
+
+// NewSheafInvalidateRequest creates a new list of SheafInvalidateRequest.
+func NewSheafInvalidateRequest_List(s *capnp.Segment, sz int32) (SheafInvalidateRequest_List, error) {
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 0, PointerCount: 2}, sz)
+	return capnp.StructList[SheafInvalidateRequest](l), err
+}
+
+// SheafInvalidateRequest_Future is a wrapper for a SheafInvalidateRequest promised by a client call.
+type SheafInvalidateRequest_Future struct{ *capnp.Future }
+
+func (f SheafInvalidateRequest_Future) Struct() (SheafInvalidateRequest, error) {
+	p, err := f.Future.Ptr()
+	return SheafInvalidateRequest(p.Struct()), err
+}
+
+type SheafInvalidateResponse capnp.Struct
+
+// SheafInvalidateResponse_TypeID is the unique identifier for the type SheafInvalidateResponse.
+const SheafInvalidateResponse_TypeID = 0x8d48f66d26da6100
+
+func NewSheafInvalidateResponse(s *capnp.Segment) (SheafInvalidateResponse, error) {
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 16, PointerCount: 1})
+	return SheafInvalidateResponse(st), err
+}
+
+func NewRootSheafInvalidateResponse(s *capnp.Segment) (SheafInvalidateResponse, error) {
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 16, PointerCount: 1})
+	return SheafInvalidateResponse(st), err
+}
+
+func ReadRootSheafInvalidateResponse(msg *capnp.Message) (SheafInvalidateResponse, error) {
+	root, err := msg.Root()
+	return SheafInvalidateResponse(root.Struct()), err
+}
+
+func (s SheafInvalidateResponse) String() string {
+	str, _ := text.Marshal(0x8d48f66d26da6100, capnp.Struct(s))
+	return str
+}
+
+func (s SheafInvalidateResponse) EncodeAsPtr(seg *capnp.Segment) capnp.Ptr {
+	return capnp.Struct(s).EncodeAsPtr(seg)
+}
+
+func (SheafInvalidateResponse) DecodeFromPtr(p capnp.Ptr) SheafInvalidateResponse {
+	return SheafInvalidateResponse(capnp.Struct{}.DecodeFromPtr(p))
+}
+
+func (s SheafInvalidateResponse) ToPtr() capnp.Ptr {
+	return capnp.Struct(s).ToPtr()
+}
+func (s SheafInvalidateResponse) IsValid() bool {
+	return capnp.Struct(s).IsValid()
+}
+
+func (s SheafInvalidateResponse) Message() *capnp.Message {
+	return capnp.Struct(s).Message()
+}
+
+func (s SheafInvalidateResponse) Segment() *capnp.Segment {
+	return capnp.Struct(s).Segment()
+}
+func (s SheafInvalidateResponse) Invalidated() (capnp.UInt32List, error) {
+	p, err := capnp.Struct(s).Ptr(0)
+	return capnp.UInt32List(p.List()), err
+}
+
+func (s SheafInvalidateResponse) HasInvalidated() bool {
+	return capnp.Struct(s).HasPtr(0)
+}
+
+func (s SheafInvalidateResponse) SetInvalidated(v capnp.UInt32List) error {
+	return capnp.Struct(s).SetPtr(0, v.ToPtr())
+}
+
+// NewInvalidated sets the invalidated field to a newly
+// allocated capnp.UInt32List, preferring placement in s's segment.
+func (s SheafInvalidateResponse) NewInvalidated(n int32) (capnp.UInt32List, error) {
+	l, err := capnp.NewUInt32List(capnp.Struct(s).Segment(), n)
+	if err != nil {
+		return capnp.UInt32List{}, err
+	}
+	err = capnp.Struct(s).SetPtr(0, l.ToPtr())
+	return l, err
+}
+func (s SheafInvalidateResponse) Count() uint32 {
+	return capnp.Struct(s).Uint32(0)
+}
+
+func (s SheafInvalidateResponse) SetCount(v uint32) {
+	capnp.Struct(s).SetUint32(0, v)
+}
+
+func (s SheafInvalidateResponse) Generation() uint64 {
+	return capnp.Struct(s).Uint64(8)
+}
+
+func (s SheafInvalidateResponse) SetGeneration(v uint64) {
+	capnp.Struct(s).SetUint64(8, v)
+}
+
+// SheafInvalidateResponse_List is a list of SheafInvalidateResponse.
+type SheafInvalidateResponse_List = capnp.StructList[SheafInvalidateResponse]
+
+// NewSheafInvalidateResponse creates a new list of SheafInvalidateResponse.
+func NewSheafInvalidateResponse_List(s *capnp.Segment, sz int32) (SheafInvalidateResponse_List, error) {
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 16, PointerCount: 1}, sz)
+	return capnp.StructList[SheafInvalidateResponse](l), err
+}
+
+// SheafInvalidateResponse_Future is a wrapper for a SheafInvalidateResponse promised by a client call.
+type SheafInvalidateResponse_Future struct{ *capnp.Future }
+
+func (f SheafInvalidateResponse_Future) Struct() (SheafInvalidateResponse, error) {
+	p, err := f.Future.Ptr()
+	return SheafInvalidateResponse(p.Struct()), err
+}
+
+type SheafDefectResponse capnp.Struct
+
+// SheafDefectResponse_TypeID is the unique identifier for the type SheafDefectResponse.
+const SheafDefectResponse_TypeID = 0xf6dc427ee849c014
+
+func NewSheafDefectResponse(s *capnp.Segment) (SheafDefectResponse, error) {
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 24, PointerCount: 0})
+	return SheafDefectResponse(st), err
+}
+
+func NewRootSheafDefectResponse(s *capnp.Segment) (SheafDefectResponse, error) {
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 24, PointerCount: 0})
+	return SheafDefectResponse(st), err
+}
+
+func ReadRootSheafDefectResponse(msg *capnp.Message) (SheafDefectResponse, error) {
+	root, err := msg.Root()
+	return SheafDefectResponse(root.Struct()), err
+}
+
+func (s SheafDefectResponse) String() string {
+	str, _ := text.Marshal(0xf6dc427ee849c014, capnp.Struct(s))
+	return str
+}
+
+func (s SheafDefectResponse) EncodeAsPtr(seg *capnp.Segment) capnp.Ptr {
+	return capnp.Struct(s).EncodeAsPtr(seg)
+}
+
+func (SheafDefectResponse) DecodeFromPtr(p capnp.Ptr) SheafDefectResponse {
+	return SheafDefectResponse(capnp.Struct{}.DecodeFromPtr(p))
+}
+
+func (s SheafDefectResponse) ToPtr() capnp.Ptr {
+	return capnp.Struct(s).ToPtr()
+}
+func (s SheafDefectResponse) IsValid() bool {
+	return capnp.Struct(s).IsValid()
+}
+
+func (s SheafDefectResponse) Message() *capnp.Message {
+	return capnp.Struct(s).Message()
+}
+
+func (s SheafDefectResponse) Segment() *capnp.Segment {
+	return capnp.Struct(s).Segment()
+}
+func (s SheafDefectResponse) Defect() float64 {
+	return math.Float64frombits(capnp.Struct(s).Uint64(0))
+}
+
+func (s SheafDefectResponse) SetDefect(v float64) {
+	capnp.Struct(s).SetUint64(0, math.Float64bits(v))
+}
+
+func (s SheafDefectResponse) Generation() uint64 {
+	return capnp.Struct(s).Uint64(8)
+}
+
+func (s SheafDefectResponse) SetGeneration(v uint64) {
+	capnp.Struct(s).SetUint64(8, v)
+}
+
+func (s SheafDefectResponse) Valid() uint32 {
+	return capnp.Struct(s).Uint32(16)
+}
+
+func (s SheafDefectResponse) SetValid(v uint32) {
+	capnp.Struct(s).SetUint32(16, v)
+}
+
+func (s SheafDefectResponse) Total() uint32 {
+	return capnp.Struct(s).Uint32(20)
+}
+
+func (s SheafDefectResponse) SetTotal(v uint32) {
+	capnp.Struct(s).SetUint32(20, v)
+}
+
+// SheafDefectResponse_List is a list of SheafDefectResponse.
+type SheafDefectResponse_List = capnp.StructList[SheafDefectResponse]
+
+// NewSheafDefectResponse creates a new list of SheafDefectResponse.
+func NewSheafDefectResponse_List(s *capnp.Segment, sz int32) (SheafDefectResponse_List, error) {
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 24, PointerCount: 0}, sz)
+	return capnp.StructList[SheafDefectResponse](l), err
+}
+
+// SheafDefectResponse_Future is a wrapper for a SheafDefectResponse promised by a client call.
+type SheafDefectResponse_Future struct{ *capnp.Future }
+
+func (f SheafDefectResponse_Future) Struct() (SheafDefectResponse, error) {
+	p, err := f.Future.Ptr()
+	return SheafDefectResponse(p.Struct()), err
+}
+
+type SheafStalksResponse capnp.Struct
+
+// SheafStalksResponse_TypeID is the unique identifier for the type SheafStalksResponse.
+const SheafStalksResponse_TypeID = 0xc0641fe8922c8009
+
+func NewSheafStalksResponse(s *capnp.Segment) (SheafStalksResponse, error) {
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 16, PointerCount: 0})
+	return SheafStalksResponse(st), err
+}
+
+func NewRootSheafStalksResponse(s *capnp.Segment) (SheafStalksResponse, error) {
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 16, PointerCount: 0})
+	return SheafStalksResponse(st), err
+}
+
+func ReadRootSheafStalksResponse(msg *capnp.Message) (SheafStalksResponse, error) {
+	root, err := msg.Root()
+	return SheafStalksResponse(root.Struct()), err
+}
+
+func (s SheafStalksResponse) String() string {
+	str, _ := text.Marshal(0xc0641fe8922c8009, capnp.Struct(s))
+	return str
+}
+
+func (s SheafStalksResponse) EncodeAsPtr(seg *capnp.Segment) capnp.Ptr {
+	return capnp.Struct(s).EncodeAsPtr(seg)
+}
+
+func (SheafStalksResponse) DecodeFromPtr(p capnp.Ptr) SheafStalksResponse {
+	return SheafStalksResponse(capnp.Struct{}.DecodeFromPtr(p))
+}
+
+func (s SheafStalksResponse) ToPtr() capnp.Ptr {
+	return capnp.Struct(s).ToPtr()
+}
+func (s SheafStalksResponse) IsValid() bool {
+	return capnp.Struct(s).IsValid()
+}
+
+func (s SheafStalksResponse) Message() *capnp.Message {
+	return capnp.Struct(s).Message()
+}
+
+func (s SheafStalksResponse) Segment() *capnp.Segment {
+	return capnp.Struct(s).Segment()
+}
+func (s SheafStalksResponse) Generation() uint64 {
+	return capnp.Struct(s).Uint64(0)
+}
+
+func (s SheafStalksResponse) SetGeneration(v uint64) {
+	capnp.Struct(s).SetUint64(0, v)
+}
+
+func (s SheafStalksResponse) Valid() uint32 {
+	return capnp.Struct(s).Uint32(8)
+}
+
+func (s SheafStalksResponse) SetValid(v uint32) {
+	capnp.Struct(s).SetUint32(8, v)
+}
+
+func (s SheafStalksResponse) Total() uint32 {
+	return capnp.Struct(s).Uint32(12)
+}
+
+func (s SheafStalksResponse) SetTotal(v uint32) {
+	capnp.Struct(s).SetUint32(12, v)
+}
+
+// SheafStalksResponse_List is a list of SheafStalksResponse.
+type SheafStalksResponse_List = capnp.StructList[SheafStalksResponse]
+
+// NewSheafStalksResponse creates a new list of SheafStalksResponse.
+func NewSheafStalksResponse_List(s *capnp.Segment, sz int32) (SheafStalksResponse_List, error) {
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 16, PointerCount: 0}, sz)
+	return capnp.StructList[SheafStalksResponse](l), err
+}
+
+// SheafStalksResponse_Future is a wrapper for a SheafStalksResponse promised by a client call.
+type SheafStalksResponse_Future struct{ *capnp.Future }
+
+func (f SheafStalksResponse_Future) Struct() (SheafStalksResponse, error) {
+	p, err := f.Future.Ptr()
+	return SheafStalksResponse(p.Struct()), err
+}
+
+type SheafStatusResponse capnp.Struct
+
+// SheafStatusResponse_TypeID is the unique identifier for the type SheafStatusResponse.
+const SheafStatusResponse_TypeID = 0xbe613db3eba5d83a
+
+func NewSheafStatusResponse(s *capnp.Segment) (SheafStatusResponse, error) {
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 32, PointerCount: 0})
+	return SheafStatusResponse(st), err
+}
+
+func NewRootSheafStatusResponse(s *capnp.Segment) (SheafStatusResponse, error) {
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 32, PointerCount: 0})
+	return SheafStatusResponse(st), err
+}
+
+func ReadRootSheafStatusResponse(msg *capnp.Message) (SheafStatusResponse, error) {
+	root, err := msg.Root()
+	return SheafStatusResponse(root.Struct()), err
+}
+
+func (s SheafStatusResponse) String() string {
+	str, _ := text.Marshal(0xbe613db3eba5d83a, capnp.Struct(s))
+	return str
+}
+
+func (s SheafStatusResponse) EncodeAsPtr(seg *capnp.Segment) capnp.Ptr {
+	return capnp.Struct(s).EncodeAsPtr(seg)
+}
+
+func (SheafStatusResponse) DecodeFromPtr(p capnp.Ptr) SheafStatusResponse {
+	return SheafStatusResponse(capnp.Struct{}.DecodeFromPtr(p))
+}
+
+func (s SheafStatusResponse) ToPtr() capnp.Ptr {
+	return capnp.Struct(s).ToPtr()
+}
+func (s SheafStatusResponse) IsValid() bool {
+	return capnp.Struct(s).IsValid()
+}
+
+func (s SheafStatusResponse) Message() *capnp.Message {
+	return capnp.Struct(s).Message()
+}
+
+func (s SheafStatusResponse) Segment() *capnp.Segment {
+	return capnp.Struct(s).Segment()
+}
+func (s SheafStatusResponse) Generation() uint64 {
+	return capnp.Struct(s).Uint64(0)
+}
+
+func (s SheafStatusResponse) SetGeneration(v uint64) {
+	capnp.Struct(s).SetUint64(0, v)
+}
+
+func (s SheafStatusResponse) Valid() uint32 {
+	return capnp.Struct(s).Uint32(8)
+}
+
+func (s SheafStatusResponse) SetValid(v uint32) {
+	capnp.Struct(s).SetUint32(8, v)
+}
+
+func (s SheafStatusResponse) Total() uint32 {
+	return capnp.Struct(s).Uint32(12)
+}
+
+func (s SheafStatusResponse) SetTotal(v uint32) {
+	capnp.Struct(s).SetUint32(12, v)
+}
+
+func (s SheafStatusResponse) Defect() float64 {
+	return math.Float64frombits(capnp.Struct(s).Uint64(16))
+}
+
+func (s SheafStatusResponse) SetDefect(v float64) {
+	capnp.Struct(s).SetUint64(16, math.Float64bits(v))
+}
+
+func (s SheafStatusResponse) TrackedEdges() uint32 {
+	return capnp.Struct(s).Uint32(24)
+}
+
+func (s SheafStatusResponse) SetTrackedEdges(v uint32) {
+	capnp.Struct(s).SetUint32(24, v)
+}
+
+// SheafStatusResponse_List is a list of SheafStatusResponse.
+type SheafStatusResponse_List = capnp.StructList[SheafStatusResponse]
+
+// NewSheafStatusResponse creates a new list of SheafStatusResponse.
+func NewSheafStatusResponse_List(s *capnp.Segment, sz int32) (SheafStatusResponse_List, error) {
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 32, PointerCount: 0}, sz)
+	return capnp.StructList[SheafStatusResponse](l), err
+}
+
+// SheafStatusResponse_Future is a wrapper for a SheafStatusResponse promised by a client call.
+type SheafStatusResponse_Future struct{ *capnp.Future }
+
+func (f SheafStatusResponse_Future) Struct() (SheafStatusResponse, error) {
+	p, err := f.Future.Ptr()
+	return SheafStatusResponse(p.Struct()), err
+}
+
+type SheafLearnedWeight capnp.Struct
+
+// SheafLearnedWeight_TypeID is the unique identifier for the type SheafLearnedWeight.
+const SheafLearnedWeight_TypeID = 0xdc133fc98ccfc134
+
+func NewSheafLearnedWeight(s *capnp.Segment) (SheafLearnedWeight, error) {
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 24, PointerCount: 0})
+	return SheafLearnedWeight(st), err
+}
+
+func NewRootSheafLearnedWeight(s *capnp.Segment) (SheafLearnedWeight, error) {
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 24, PointerCount: 0})
+	return SheafLearnedWeight(st), err
+}
+
+func ReadRootSheafLearnedWeight(msg *capnp.Message) (SheafLearnedWeight, error) {
+	root, err := msg.Root()
+	return SheafLearnedWeight(root.Struct()), err
+}
+
+func (s SheafLearnedWeight) String() string {
+	str, _ := text.Marshal(0xdc133fc98ccfc134, capnp.Struct(s))
+	return str
+}
+
+func (s SheafLearnedWeight) EncodeAsPtr(seg *capnp.Segment) capnp.Ptr {
+	return capnp.Struct(s).EncodeAsPtr(seg)
+}
+
+func (SheafLearnedWeight) DecodeFromPtr(p capnp.Ptr) SheafLearnedWeight {
+	return SheafLearnedWeight(capnp.Struct{}.DecodeFromPtr(p))
+}
+
+func (s SheafLearnedWeight) ToPtr() capnp.Ptr {
+	return capnp.Struct(s).ToPtr()
+}
+func (s SheafLearnedWeight) IsValid() bool {
+	return capnp.Struct(s).IsValid()
+}
+
+func (s SheafLearnedWeight) Message() *capnp.Message {
+	return capnp.Struct(s).Message()
+}
+
+func (s SheafLearnedWeight) Segment() *capnp.Segment {
+	return capnp.Struct(s).Segment()
+}
+func (s SheafLearnedWeight) A() uint32 {
+	return capnp.Struct(s).Uint32(0)
+}
+
+func (s SheafLearnedWeight) SetA(v uint32) {
+	capnp.Struct(s).SetUint32(0, v)
+}
+
+func (s SheafLearnedWeight) B() uint32 {
+	return capnp.Struct(s).Uint32(4)
+}
+
+func (s SheafLearnedWeight) SetB(v uint32) {
+	capnp.Struct(s).SetUint32(4, v)
+}
+
+func (s SheafLearnedWeight) CoChangeRate() float64 {
+	return math.Float64frombits(capnp.Struct(s).Uint64(8))
+}
+
+func (s SheafLearnedWeight) SetCoChangeRate(v float64) {
+	capnp.Struct(s).SetUint64(8, math.Float64bits(v))
+}
+
+func (s SheafLearnedWeight) Observations() uint64 {
+	return capnp.Struct(s).Uint64(16)
+}
+
+func (s SheafLearnedWeight) SetObservations(v uint64) {
+	capnp.Struct(s).SetUint64(16, v)
+}
+
+// SheafLearnedWeight_List is a list of SheafLearnedWeight.
+type SheafLearnedWeight_List = capnp.StructList[SheafLearnedWeight]
+
+// NewSheafLearnedWeight creates a new list of SheafLearnedWeight.
+func NewSheafLearnedWeight_List(s *capnp.Segment, sz int32) (SheafLearnedWeight_List, error) {
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 24, PointerCount: 0}, sz)
+	return capnp.StructList[SheafLearnedWeight](l), err
+}
+
+// SheafLearnedWeight_Future is a wrapper for a SheafLearnedWeight promised by a client call.
+type SheafLearnedWeight_Future struct{ *capnp.Future }
+
+func (f SheafLearnedWeight_Future) Struct() (SheafLearnedWeight, error) {
+	p, err := f.Future.Ptr()
+	return SheafLearnedWeight(p.Struct()), err
+}
+
+type SheafLearnedWeightsResponse capnp.Struct
+
+// SheafLearnedWeightsResponse_TypeID is the unique identifier for the type SheafLearnedWeightsResponse.
+const SheafLearnedWeightsResponse_TypeID = 0xb55922268453cbd0
+
+func NewSheafLearnedWeightsResponse(s *capnp.Segment) (SheafLearnedWeightsResponse, error) {
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 8, PointerCount: 1})
+	return SheafLearnedWeightsResponse(st), err
+}
+
+func NewRootSheafLearnedWeightsResponse(s *capnp.Segment) (SheafLearnedWeightsResponse, error) {
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 8, PointerCount: 1})
+	return SheafLearnedWeightsResponse(st), err
+}
+
+func ReadRootSheafLearnedWeightsResponse(msg *capnp.Message) (SheafLearnedWeightsResponse, error) {
+	root, err := msg.Root()
+	return SheafLearnedWeightsResponse(root.Struct()), err
+}
+
+func (s SheafLearnedWeightsResponse) String() string {
+	str, _ := text.Marshal(0xb55922268453cbd0, capnp.Struct(s))
+	return str
+}
+
+func (s SheafLearnedWeightsResponse) EncodeAsPtr(seg *capnp.Segment) capnp.Ptr {
+	return capnp.Struct(s).EncodeAsPtr(seg)
+}
+
+func (SheafLearnedWeightsResponse) DecodeFromPtr(p capnp.Ptr) SheafLearnedWeightsResponse {
+	return SheafLearnedWeightsResponse(capnp.Struct{}.DecodeFromPtr(p))
+}
+
+func (s SheafLearnedWeightsResponse) ToPtr() capnp.Ptr {
+	return capnp.Struct(s).ToPtr()
+}
+func (s SheafLearnedWeightsResponse) IsValid() bool {
+	return capnp.Struct(s).IsValid()
+}
+
+func (s SheafLearnedWeightsResponse) Message() *capnp.Message {
+	return capnp.Struct(s).Message()
+}
+
+func (s SheafLearnedWeightsResponse) Segment() *capnp.Segment {
+	return capnp.Struct(s).Segment()
+}
+func (s SheafLearnedWeightsResponse) Ok() bool {
+	return capnp.Struct(s).Bit(0)
+}
+
+func (s SheafLearnedWeightsResponse) SetOk(v bool) {
+	capnp.Struct(s).SetBit(0, v)
+}
+
+func (s SheafLearnedWeightsResponse) Weights() (SheafLearnedWeight_List, error) {
+	p, err := capnp.Struct(s).Ptr(0)
+	return SheafLearnedWeight_List(p.List()), err
+}
+
+func (s SheafLearnedWeightsResponse) HasWeights() bool {
+	return capnp.Struct(s).HasPtr(0)
+}
+
+func (s SheafLearnedWeightsResponse) SetWeights(v SheafLearnedWeight_List) error {
+	return capnp.Struct(s).SetPtr(0, v.ToPtr())
+}
+
+// NewWeights sets the weights field to a newly
+// allocated SheafLearnedWeight_List, preferring placement in s's segment.
+func (s SheafLearnedWeightsResponse) NewWeights(n int32) (SheafLearnedWeight_List, error) {
+	l, err := NewSheafLearnedWeight_List(capnp.Struct(s).Segment(), n)
+	if err != nil {
+		return SheafLearnedWeight_List{}, err
+	}
+	err = capnp.Struct(s).SetPtr(0, l.ToPtr())
+	return l, err
+}
+func (s SheafLearnedWeightsResponse) EdgeCount() uint32 {
+	return capnp.Struct(s).Uint32(4)
+}
+
+func (s SheafLearnedWeightsResponse) SetEdgeCount(v uint32) {
+	capnp.Struct(s).SetUint32(4, v)
+}
+
+// SheafLearnedWeightsResponse_List is a list of SheafLearnedWeightsResponse.
+type SheafLearnedWeightsResponse_List = capnp.StructList[SheafLearnedWeightsResponse]
+
+// NewSheafLearnedWeightsResponse creates a new list of SheafLearnedWeightsResponse.
+func NewSheafLearnedWeightsResponse_List(s *capnp.Segment, sz int32) (SheafLearnedWeightsResponse_List, error) {
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 8, PointerCount: 1}, sz)
+	return capnp.StructList[SheafLearnedWeightsResponse](l), err
+}
+
+// SheafLearnedWeightsResponse_Future is a wrapper for a SheafLearnedWeightsResponse promised by a client call.
+type SheafLearnedWeightsResponse_Future struct{ *capnp.Future }
+
+func (f SheafLearnedWeightsResponse_Future) Struct() (SheafLearnedWeightsResponse, error) {
+	p, err := f.Future.Ptr()
+	return SheafLearnedWeightsResponse(p.Struct()), err
+}
+
+const schema_a1b2c3d4e5f60001 = "x\xda\xd4z\x7ft\x14U\x96\xff\xbbU\x09!\x91\xd8" +
+	"\xa9\xbc\xa0\x800E<\xfc\x0a\x12\x0c\x01f\xc6\x9cq" +
+	"ZB\xa2\x90\xafqR\xdd\xa8\x98\x81o[\xe9z\xa4" +
+	";$U\x9d\xaaj4\xac.?\xc4Q\\<\x8a\x07" +
+	"\\q\x96\xb32\xb3\xee\xce\xee9\xbb\xe3qu\x94]" +
+	"\xdd\x01F\xcf\x883\xcc\"+;\xc8\x80\xab\x8c\x1c\xc4" +
+	"\x91\x15\x18\xd1\x81\x11\xb3\xe7\xbe\xae\xae\xaa\xee\xaet\"" +
+	"\xcb\xd9\xb3\xfb_\xe5\xd5\xa7o\xddw\xdf\xe7\xfe|i" +
+	"X\x1a\xba\xa9dNe\xd9UD\x88@\xe9\xa8\xc1\x15" +
+	"\x0d\xe1\xc76\xdc\xb4q=\x91*\xe1\"|v\xfc\xed" +
+	"\x9f=\xbf\xa3\xa4\x8c\x10z\xb2\xe2,=WQF\xc4" +
+	"\xc1\xf0\x93K\xc3'\xf5\x8b\x0f\x12\xa5\x12J\xb2\x98R" +
+	"\x01AoU\x9c\xa5G+\xca\x08\x99\xfbN\xc5c@" +
+	"`\xf0\x1b\xc7\xa3o4\xed\xff\xe0{\x88\x85\\lm" +
+	"\xe5YZ_\x89Ou\x95?&0x\xe1\x81\x03\xe7" +
+	"\x1e\x9f\xba\xf8\xa1\x00\xe8\xc1\xca=\xf4(\x87\xbe\xc3\xa1" +
+	"\x9f\xef\xdd\x7fb\xcb_?\xcc\xa1\x82\x0b\xe5j\xae\xbb" +
+	"\xf2\x09\xba\xf1J\xd4\xe0\xc1+\xefD\x0dj\xab\x9f{" +
+	"\xfe\xe3'\xff\xf0\x90\x7fC\xa5\x80\xd0\x8b\xa17iy" +
+	"\x15>\x95V\x85Q\xea\x1f\xcb?\xfe\xecOZ\x1e\xc9" +
+	"A\xf2\xefO\xad:F\xe7pd}\xd5=\x04\x06\xdf" +
+	"{\xd1\x8e}\xde\xbevS\xae\xaa(t\xee\xc6\xaaj" +
+	"\xa0\xdb8v+\xc7\x1e9\xbe\xe7\xdb\xca\x1d\x177\x15" +
+	"\x18\xb4T:K%\xa9\x8c\x88_\xaa\x87\xa7\xf5}\xb6" +
+	"\xe8\xd1\x9c\xcdpa\xa7\xaaf\x02\xbd\xc8\x85\x9d\xaf\xc2" +
+	"\x8d\xafO\x9fOn\xbf\xbb\xe5\x89\x82\xcd\xcc\xfd[\xa9" +
+	"\x02\xe8N\x09\xa1/J\xb8\x9b-\xf3\xbex\xe8\xd1\xb6" +
+	"\xab\xb6\x15\xecf\xeeA\xe9Z\xa0\xc79\xf4}\x09U" +
+	"\xfc\xf3\xf2\xef\x84~\xb9\xf5\x9am\x01\xdbY^-\x00" +
+	"MV#\x96U\xf3\xed\xfc\xbf\xe3\xa1\xf7f?\xf6\xfd" +
+	"\x82\xed\xbcU}\x81\x1e\xadF~<\xbf\xf1\xdc\xc4\xd2" +
+	"C\xd5\xdb\x0b\xed\xb8\xb3\xfa\x11\xba\x9b\x0b{\x95\x0b[" +
+	"\xfb\xbb\xf2\xda\xdd\x87\xea\xb6\x17~\x98&\xe9Y\x9a\xa6" +
+	"\xf8\xd4O\x11\xbac\xdcK\xb5\xff\xa6>\xf6\x97\x08\x15" +
+	"s>|\x94^\xa0'9\xf28=A`\xf0o\xee" +
+	"<\xf5\xd3\x81=\x07\x9e)\xd0\xf0\x86\xb1\x17h\xebX" +
+	"\xd4\xf0\xd5\xce\xce\xef>\xf5\x93\xd1;\x82X9\xf6#" +
+	"Z?\x96\xb3r,Z<1\xef\x96\xb9S\x7fp\xef" +
+	"\x0f\x03l\xb3{\xac\x00t\x1f\xc7\xee\x1d\x8b:\xaeZ" +
+	"\xf6V\xc9\xde\xf7\xb6>[(v\xee\xfc\xabf\x02m" +
+	"\xbd\x0a\xb1\x0b\xaeB\xb9u\xeaw\xce\x1d\xb0\xf6<\x97" +
+	"Ka\xaeB\xdd\xd5\xc7\xe8\xfc\xab\xf1i\xce\xd5\xb8\xa1" +
+	"\xfd\xbf\x88n\x98v\xed]/\x06\xa8\xd0:\xae\x0d\xe8" +
+	"]\xe3\x10{\xfb8\x14k\x9e~#\xb5,u\xf4\xa5" +
+	"\x00\x8b\xd6\x8d?L\xe7\x8f\xe7b\xc7\xa3\xb6\xe3\xe3\x09" +
+	"\xf97\xb7\xfc\xf0\xe5\\\xa8\x88\x80G\xc7?M\xb7r" +
+	"\xe8\xe6\xf1\xa8\xc1\xf2\x1d/Z\xe7\x93\xfd;\x0bO\x94" +
+	"M8L\xfb'\xe0S\xdf\x04\x14\xdat\xe8\xd9\xdf\xfd" +
+	"\xe3\x8d\xea\xbf\xe4\xc4\x06\xb4\xfe\\\xb8\xa6\x02\xa8t\x0d" +
+	">V^#\xa3g\x96\xaf\x9d\xf5\xc4\x87\xb2\xb6+\xc7" +
+	"\x04\x1c\xdb>\xb1\x02\xe8\xf2\x89(\xf6\xae\x89\xb8\xad\x9d" +
+	"\xf3\xfe~\xed\xe9\xaf\xed\xdaU\xc8\xfbs\x13\x05\xa00" +
+	"\x89\xfb\xf3D\xe4\xfd\x7f\xd6O\xef\x09?\xf0\xc7B(" +
+	"\x9d4\xe9\x00\xad\xe3\xc8\xa9\x93\x10\xb9\xe9\xc8\xa7\x95\xcb" +
+	"\xbel\xdf\x93\x1b\xc7\xca\x10\xd0:\xe9\x18U&qU" +
+	"&\x19\x02\x81\xc1\xaf\x9f8\xf1\xab\xb3\xd1+~F\x0a" +
+	"\x9c\x94\x9e\x9c|\x80\x9e\x9b\x8cOg&\xa3\xae;\xc2" +
+	"\x0f\x1c\x9c\xf2\xfb\x05?\xcf\xb5\xeb(\xce\xff\xda\x0b\xf4" +
+	"\xf5Z\xce\x9dZ\x1e\x1ew\xde\xfd\xd0\x9bW\x7f>}" +
+	"/bG\xe5\x9eA\xeb\x94\x8f\xa82\x85\xab0e\x10" +
+	"\xb1o\xfez\x12[\xf4\x9bo\xef-\xdc\xd8\xab\xd3\x8e" +
+	"\xd1\xbd\xd3\xf0\xe9\xf5i\xb81\xe9\xfc#\xefo\xa8\x9d" +
+	"\xfc\x8b\xc2\xe3:>\xed#z\x86#OM\xc3\xe3z" +
+	"\xbc\xe2\x95\xe8'\x93~\xb0\xaf\xd0\xae\x8b\xa7\x0b@o" +
+	"\x9f\x8ePe:\x0a=\xb3\xb9\xe5\xb7on{s\x7f" +
+	"\x00\x0b\xfb\xa7W\x00]\xc7\xb1\xf7OG\xb1?\xff\xb3" +
+	"1?z-\xf5\xce\xa1B\x05NN?L\xcfq\xe4" +
+	"\x19\x8e\x9c\xb7\xfb_7\xed\x0d\xd3#\x05n=w\xf9" +
+	"\x0c\x8c<38\xc9f \x09\xef\xfd\xfa\xbe\xd8\x1fZ" +
+	"'\x1c)\xdc\x7f\xb2\xee#\x9a\xae\xe3\xb1\xa2\x0eU\xfd" +
+	"\xf8\xc4O\xda\xbb_N\x15\"\xe7n\xae\x13\x80n\xe7" +
+	"\xd0m\x1c:\xffT\xed\xfa_\xdf\xd1\xf0n\xce\xf73" +
+	"Rw\xd6}D_\xe7\xd0\xddu\xf8\xfd\xaa.\xa3\xad" +
+	"z\xcb\xd3\xef\x06P\xa0\xf5\xba\xb3T\xb9\x0e\x9f\xda\xaf" +
+	"C\x0a\xdc\xf9\xe4\x92Q\xc6\xa33\xfe# \xbe\x8c\x9d" +
+	"u\x98\xd6\xce\xe2t\x9c\x85\xd0\x9f\xce,\xbf\xff\xef\x96" +
+	"\xf5\xbd\x17 \xf5\xe0\xac=\xf4(\x87\xbe\xc3\xa1K_" +
+	"\xaa\x10\x9a\xfeA?\x96\xcbW\x0e\xdd^\xbf\x87>[" +
+	"\x8f;\xdcQ\xcf}K\xdb\xf5\xff\xe9\xf7b\xbf=\x11" +
+	"\x10\x07\xce\xcc>L/\xce\xe69e6\x1e\x81\xbc\xf2" +
+	"\xf3Fm\xcc\xb8\x93\x85n\xb8\xee\xfaF\xa0\x9b\xaf\xe7" +
+	"\x11\xe1z4\xc1\xc1\xad7\xb3{\xbe\xbf\xef\xe3\x00\x0e" +
+	"ln\xa8\x00\xba\xa3\x81+\xd3\x80b\xf7\x7f\xe3\x89\xfd" +
+	"_\xfb\xf4\x86O\x0a\xc2p\xf9\x9c\x03t\xec\x1c\x0c\xc3" +
+	"O\x08\xa7\xf7\xcc\xf8\xe4\x9f\x7f_x\xa2g\x1a\x9e\xa7" +
+	"\xe7\xb9\xb0s\x0dxL5\xbb\x16\x7f\xf8\xa7\xcdG>" +
+	"+\xa4\xc9\xd49\x15@\xe7\xcf\xe1am\x0e\xeax\xc7" +
+	"\xd2\xf2\x0b\xdfZ\xb4\xe0|!\xf7\xca\x1b\xf7P\xa9\x11" +
+	"\x9f*\x1bQ\xc3c/\x94\xbd4\xd5\xfc\xd5\x85\x00\x1b" +
+	"\x0d4^\xa0\x0fr\xe8:\x0e\xfdr\xe6\xbb\xea?\xbd" +
+	"o\\\x0c\x88\xec\xa7\x1a+\x80^\xe4\xd8\xf3\x8d?&" +
+	"w\x0dj*\xeb3\xf4\xd9qAM\xe9\xa9\xa6[\x98" +
+	"\xdd\xd2\xd5\xa1\xda\x89\x08\x93\xfb\xd3\xcc\xb2;\x00\xf2 " +
+	"\xd1\x04SWD\x98e\x9bI9n'\x0d\xbd\x03@" +
+	"\x99(\x96\x10R\x02\x84H/V\x13\xa2<'\x82\xf2" +
+	"\x8a\x00\x12@\x0d\xe0\xe2N\\|A\x04e\x97\x00 " +
+	"\xd4\x80@\x88\xf4j\x8f\xb4[V>\x10A9-\x80" +
+	"$B\x0d\x88\x84H\xa7z\xa43r\xb4\x06D\x88N" +
+	"\x06\x01\xa4\x12\xa1\x06J\x90~\xd0IkA\x8e\xb6\xe0" +
+	"\x9b\x0e|S\x0a5P\x8a\x1c\x86fB\xa2\x8bp]" +
+	"\xc3\xf5Q\xa3j`\x14!T\x85\x1e\xca@\x8e>\x8c" +
+	"o\xb6\x80\x00\xa0\xc2h\"\xc0h\x02\xd0\x95}\x1a\xec" +
+	"2\xd2\xba\xa6\x9a\x03$\xb4H\xb5\x12J\x09\x08\x837" +
+	"\xde7{\xe2\xbf\xcb\xdf\xbd@\x94\x12\x01\x16\xd4\x00\x8c" +
+	"!D\x02\xd3\x83\xca\xb1\x84j%\x08\x811D\x801" +
+	"\x04\x06\xe3\xc6\xc2\x84\xaaw3\x12\x8a\xa86+\"d" +
+	"\xf5`\xdc\x88\xc5\x11K\xc2,f\xaa6#\x04\xae " +
+	"\x02\\\x81\xc9\x90\xadb\xa6\x1dQ\x89XTF\x97\x03" +
+	"\x8c\x99\xa4,G\xc0\x9a{X\xb2;a[p%\x81" +
+	"\x0e\x11\xf8\xf2\x95\x04\x06\xd5n\x93\xb1>\xa6\x93\x90\xdd" +
+	"\x92\xec+\xbaE\x17*\xdb1-\xd9G\x88k\xa7<" +
+	"\x0e\xa4\xbb\xac\xb8\x99\xecb>\x9a(c\\\x0e\xb46" +
+	"\x11\xa2\xdc$\x82\xb2\xcc\xc7\x81\xbb\xda\x08Q\x96\x8a\xa0" +
+	"h\x1e\x07\xd4FB\x94e\"(\x09\x01\xc2\xb6\x91J" +
+	"\xc6]\xed\xc78\xda'5\xa6\xdbI{\x80x\xf6\x96" +
+	"\xad\xa4\x1egPN\x04('\x81\xf4\x8c\xdaj\xefJ" +
+	"\x92\xa7\xd4\x04G\xa9[\x05\xc8\xea\xb4x&!J\x8b" +
+	"\x08J\x87\x00\x92\x00\x19\xa5\xdaqqQFQ1\xa9" +
+	"eM\x10\xc2C\xcf\xaa\x10\xd2T[\xcd\xaaZ\xe1\xa8" +
+	"\x9aU\x04\xb8\"\xb7\x19\x1a0Ta\x9c\xab\xc26T" +
+	"a\x8b\x08\xca3>\xbblo\x93v\xc8\xcak\"(" +
+	"\xfbQ\x09\xc72\xfbP\x897DP\xde\x16\x00\xc4\x8c" +
+	"o\xbc\x85k\xbf\x14A9\x84\x8e\x01\xdc1\xa4\x83\xb8" +
+	"\xb8_\x04\xe5\x08\xfa\x84\xc8}Bz\x07\x0f\xe0m\x11" +
+	"\x94\xf72[\xc8\x125\xa5\x9aL\xb7\x17k\x84\x90\"" +
+	"<\x888\xb8X\x92\x80\xe6\x99=\xa4\xab}\xcc\xfdc" +
+	"eR\xd7\xa0\x84\x08PB d%W3(%\x02" +
+	"\x94\x12\x08\x9b,n\x98\xde7s\x8f\xe7VC\xd5\"" +
+	"\x8cs\x86\xf0\x03*q\xadS\x89\xd6\x19-\x82R#" +
+	"\x80\xa8uA%\x11\xa0\xb2@@\x84\xa5T\xd3b(" +
+	"\xa3\xcc!\xdehWD\x1d\xee{\x8a\x08J\x83\xcf\xc0" +
+	"\xf5h\xa1\x19\"(\xf3\x04\x08[F\xda\x8c{\xbb\xe8" +
+	"U\xf5\xee\x02M\xc5\x8c\xa6I\xcb^\x98H\xf6j&" +
+	"\xd3#\xccJ\x19\xba\x959O\xdf\xe7&x\x9fs\xbf" +
+	"\x864\x9f%\x82\xb2H\x00\xd1X\x09@\x04\xc0\x14\x17" +
+	"wD!\x8f\x1d\xdeTy\x9d!\x81\x1c\x06\xb9\xc18" +
+	"\x1aO\xb0>5(\x18\x8b\x1e\xdb\x17\xeb\xab\xd4\xde\xa4" +
+	"\xa6\xda\x0c\xf5\x0c\x19\xba\xc5\xf2\xa8\xdf\xe5\xd0\xfcnO" +
+	"\xcf\xe5\x8d\x9e;\xba\xd4W;\x09Q\xee\x16A\xe9\x15" +
+	"`0\xe9\x88%e6\xd3\xb2:\x8f\xcep]\x8e\x1b" +
+	"i\xddv\xa3C7\xd3\x99\xa9\xdaI\"\x1az\x81_" +
+	"\x06\x99sx\x02$\xb5!\xce\xa5`\xcb\x81Dhv" +
+	"N\xe6&\x1f\x11nDv|S\x04e\x89\x00kL" +
+	"\xd6\x9d\xc4#\xcd\xddW\xd8\xc2\xc8ay'\xe4\xb6\xf9" +
+	"y'$fO(\xc2VX\xedj\xcaa\x08##" +
+	"`H\xb3\xc3\xc7\x96\x1c\x86\xaca\xbam&\x99\xef\xdb" +
+	"n\x1f3\x14;Z\x9co\x87Y\x01=\xc0q\x96\x15" +
+	"$_\xa3&\xa9N\xe6\xe1m\x89\xcf4J\x9bt\xbb" +
+	"\xac\xdc+\x82\xb2A\x80\xb0nhl\xb1\x16\x10!\xaa" +
+	"\x9c\x08\xd1\xbc\x06!\xb1\xa4/:\x0cf<k\xf8\xd8" +
+	"\x92\xc1\xe5\xc5\x96\xbc\xbd\xdd\x9c\xd45\xdc\\\x84Yr" +
+	"*\xcb\xe7a\xac:3\xd0\xaa!\x8d\xad\xf0\x99\xd4m" +
+	"\xf6\x03M\xeaKka\xcb\xfdn\x95\xfb]u\x82\x97" +
+	"\xae\\\xd3\xb1f\x89\xc9\xca\xc3\"([|\xf1{s" +
+	"\x97\xb4UV^\x16Ay\xcdW\xdd\xec\x8eH\xaf\xcb" +
+	"\xca\x87\"(\x9f\xe6\x9e}\x82\xa9Z\x94\xf5\x171\\" +
+	"\xdb bb\x16\xebG\xdd\xb3>f\xb2T\xaf:\xb0" +
+	"\xd0 ei\xdd.\xf2\xeb\x1e\x07\x19\x8b\x93\x10z." +
+	"!y\"nQ\x09\xa4\x8a\x08\xe8\xcc\x0a\xe8&\xa2\x9a" +
+	"B\x15\x9c\xb8V@\xca\xc8\xd0\xa4t1\xb7\x19\xda\x90" +
+	"\xb1j\xc4i\xba\xd1I\xd3Kr\x0f\x1c\x99\x99\x17Z" +
+	"\xab\x08\xc8\xcc4\x0ds\x88\x90\xe2s\xa5\xffA7\xf6" +
+	"\x85\xb3(\xb3\x97\x18)\xa3\xd7\xe8\x1e\x88\xb0\xfeP@" +
+	"E\xd5\x1cTQ\xf58!\xdc\xf6*\xaa\xfe\x1e)-" +
+	"+O\x89\xa0\xfcUa\x90+\x0cg&\xaf\xe3\xe36" +
+	"\x09\xe5\xe2\xdc\xa1\xa9\x83C\xa3bQEB+\x8b\xd7" +
+	"\x90\xab94f\xd9*\x09\xf7\xae,ZD\xb6\xeaf" +
+	"2\x9e\xe0\x16/\x1b\xa1\xabaz\xd2DPR\xde\x86" +
+	"\xfb0\xa8'2\x81\xcb\xf5\xb3u]\xd2\x83\xb2\xf2#" +
+	"\x11\x94\x17r\xb3pP\xa2\x0a\xa7T\xcb\xf2\x1f\x98\xdb" +
+	"e;\x9b\x8f\xa7M,\x87\"\xa4\xcc0\x8a;\x99\x83" +
+	"\x8c\x91\x90i\x18v@x+\xf1\xce\xfcV\xa6\x9a:" +
+	"\xd3\xee\xcc\x14\xed.\xf1FR\xb56{\xe9\xdcu\x87" +
+	"\xe5\x11I\x95\x95\x0d\"(\x8f\xe7\xf21\xaf+\xa8\xf2" +
+	"\x86\x18\xce\xf6\x98\xd6\xcd\x16\x1ai\x9d\x80]4\x00 " +
+	".\x167\xd2D\xe4\xf1c\x88CE7\xcblF," +
+	"\x08\xdb\x8d\x01^4\xc1+\xcer}\xd4\x7fl\xb9Y" +
+	"\xadu\x15\x13u;\x8f/\xd7z|q\xe9\xd2\xe8U" +
+	"3\xae\x9d\x92M\x1e\x87$Q\xc8\xf0\xa5o\xa6C\"" +
+	"[\x802\x8b\xf5g\xa9!\xf3\x9e$\xabQ~\xf1\xc8" +
+	"{\x80\xe0\x04\xb6\xc4X\xc9\xf4v5\xd5\xaa\xdb\xa29" +
+	"0\xb4\x19\xbc\"\xb5Y\xaa\x97\x95\x8e\x8c\xb2\xb2\x8d?" +
+	"\xcf\x8a^\x93I\xc7V\xd1\xe4\xe0\xe4c\xcb9T\x7f" +
+	"\x07\x15\x14ol\xd5N\xe7q\xae\xc6U\xf0~t\xb3" +
+	"\xfbDP\x1eF\x05\x85\x8c\x82\x0f\xa2\xd6kEP6" +
+	"\xa11\xc5\x8c17\xe2\xa2\xc39\xd7\x98\x8f\xa2\x85\xb3" +
+	"\xf9\xb0dT\xa6M\xd9\xdc\xe3\xcb\x87\x81n(\xf3\x8a" +
+	".K+\xd96l\xb57\xfbWXc+X\xdcv" +
+	"[e\xdbT\xe3+\x99\xd6JBZ7\xb3\x8a\xb6\xb4" +
+	"\x0e4Fd\xe4\xaf\x15@\\1\xafo\x1c\xda\x17;" +
+	"}i(k\x17\x7f\x1ar\xed\xa2\xe0\xe2\xad\"(K" +
+	"/a\xb3y\x8aE\x98\xaa-4t\x1b#\x90S7" +
+	"\x7f\xb5\xb29\xc3H%\xcd\xcc\x81\x8c\x00\xb0\xf3\x04\\" +
+	"\xeb\x09(\xb3\xfa{\x87\x90\xe0#M6^\xcf\xca\xca" +
+	"\xa0Sa\x02!\xd1\xc9 Bt\x16x\xbc\xa6u\xd0" +
+	"IHt\x06\xae\xcf\x037j\xd39\x10\xa1\xf3A\x8e" +
+	".u\xc76\x0e{\xa8\x0a\x91\xdc\xb1M\xb6\xd3\xa5\x9b" +
+	"\xa1\x91\x90\xe8&\\\x7f\x8a\x0f\x80\x84\xcc\x00h+t" +
+	"\xd1m G_\xc17o\xf0\x11\x90\x98\x19\x01\xbd\xce" +
+	"?\xfe\x1a\xae\xef\xc7\xf5\xb2\x92\x1a>/\xdb\x07\xcdt" +
+	"\x1f\xc8\xd1\xd3\xf8\xe6\x0b|3Z\xac\x81\xd1\x84\xd0\xf3" +
+	"\xb0\x9e^\x049:E\x10!\xda \x08 \x95\x97\xd6" +
+	"@9!\xb4^\xc0\xaf\xcf\xc0\xf5y\xb8^1\xaa\x06" +
+	"*p'\xc2z:_\x90\xa3\xcb\xf0\xcd\xbd\xc2\xf0\xe9" +
+	"f\x10{k\xb5C\xb5\x09$\x8a\xc6[\x8e\x8b\xa5T" +
+	"\"\xda\xfea\x13_\x8e&W\x13`#\xf8\xb9\x95$" +
+	"\xe2j\xe6\x95{r*\xa1Z\xcc\x9b\\\xfd\xf7S\x1b" +
+	"\xe3i\xbc\x8faZpC\x16\xafg\x13\xea\x08\xea\xd9" +
+	"\x84\x8a!++\xacW\xb5l\xec\xf0\xc1\xb4\xd8\x02\xbb" +
+	"\xdd\x0aj%\xc69\x12\x9e\xe6\xe8\x98\xc9R\xa0\x9a\x16" +
+	"\x8b\xa9vL\xecC\x07w\x06\x11y%_VO\xd0" +
+	"\xed%\x03)\xa6\x15\x13\xfd\x88\x1f\x1d\xb39\x1c\xbc\x0c" +
+	"\xea\xdeX\x04v\x11\x99\x11\x87o`\x10\x9c\xcd\xdd\xd0" +
+	"\xbf\xb8\xd3\x8b \xd9\xaaF\xe9\xf2\xf5c\xc32\xea2" +
+	"\x16(\x05c`_#\xe4\x1b\xf2N\xf0\x86\xbc\xee\x8c" +
+	"\xb7I\xda)+\x87DP>\xf0\xa5\xdb\xf7\xdb\xa4\xe3" +
+	"rt4:Z\x8d\xdf\xcd%\xe8\xa1cA\x8e~\x13" +
+	"\xdf\xb4p7\x173n\xbe\x00\x9a\xe9\x02\x90\xa3\x1a\xbe" +
+	"IqG/\xc98z\x1ft\xd2~\x90\xa3[\xf0\xcd" +
+	"3\xdc\xd1K3\x8e\xbe\x1d\xda\xe8\x0e\x90=W\xf7\x99" +
+	",\xac\xf1\x9d\x14\xedf\xb5\xaeXJ\xcd\xf1\xb2\xb8m" +
+	"\xf6v\xf0\xa5\xe2\xdd,\xe2\xf0\xb7\x04\xfc\xbf\xeeJ\xea" +
+	"ZR\xef\xb6Hh\x88O\xfb\xa6\xcaY\xa8\x9c\xa7\xc2" +
+	"\x1a\xd5\xb2\x87\xf9u\xdb :\x80\xf3\xb3\xbcF\xbc\x83" +
+	"\xc7\x8d\xa2sd\xa7\x13O\x91\xb2\xdc\xbd\xa3c\x8ed" +
+	"\xef\xdc\x81\x0b\xf6>\xc4\xb8\xce\xd7\xecMqyt\x0a" +
+	"y\xe4\xb4\xc3\xae?\x9cA\x7f8-\x82\xf2\x85\xe7\x0f" +
+	"\xe71\xa1~*B\x04|U\xfe\xc5.\x0a\x18\xab\xf1" +
+	"\xd0\x1b\xfc\x97\x05\xf5\xd0\xe4O:\xd9\xb1(f\x1dB" +
+	"\xa2\x0d\xb8\xfe-N\x9f\x92\x0c}n\xe0W\x08\xf3p" +
+	"\xfd&\x9e'J3y\xe2F.\xc7\xa3\xe8h!\x93" +
+	"%\x16@\x0fm\x059\x9a\xc07\x1b`x\x0f\x95-" +
+	"[\xb5-\xa8\xf2.\xc52]\xe9e\xf0\xdc0\xb7\xaf" +
+	"\xe6\xc6\x82\xb4\x1e\xcf\xdcE\x80\xbb\xb6Fc\xbd\xcc\xf6" +
+	"0a\x1e\x18-/|\xf0\x1fh7\x93P\xb2w\x98" +
+	"j\xca\x81\xc6\x88\xbc\x02\xb1\xde,3\xbf\xd8\xcck\xf5" +
+	"\xbd\x19\xddW\xad[Z\x9d@\xac\xdb\xad!\xdd.\xa8" +
+	"\xa5g\x06\xd5\xd2M^O\x913\xb4\x0e[\xbc\x84\x81" +
+	"*\xef\x1e\xd39\x87\xdc\x92\xeb\xe6\xa4\xae-T{{" +
+	"\x19\xb3.\xad\xe4\xca\x13c\xe6\x95\x94\x976X\x88g" +
+	"D\x8dt\x98\x95m\xaf\xfb\xd3L,\x18\x8f\x06\x9a\xad" +
+	"\xd1\xfbn\x08{b\xf7\xbe\x85\x9f\xf5\x08\xda\x8a\x9c\x96" +
+	"\x96\xe45h\xd5A\x0d}uP\x87\xd6#\xf5\xc9\xca" +
+	"\xe3\"(\x7f\xe1\xeb*\xb6\xf5\x10\x92\x9dk\x04\xde\xe4" +
+	"]\x9eK8\xa3\xcbb\xe6*5;\x10\x09\xbec\xf2" +
+	"\xc6\x93\xde\xac\xc6G\x8eF\x8f\x1c\xb9\x9d\\1~\x04" +
+	"\xd2lxI\xf9N\x12\x0da\xa4\xc93}\x9boB" +
+	"\x995\xfd\xe6\xd5\xfe\x01e\xd6\xf6\xbb;}\x03J\xd7" +
+	"\xf6g:\xa5srt\x1cF\xbb) \xc0 \x92\xe3" +
+	"6\xb5\x8f\x0d\x7f\x8ddY1]\xed#\xc0|\x09\x82" +
+	"\xb3\xa9\xc34H8\xce,\x8biED\xac\xcf\x80c" +
+	")\x13\x8c\x0c\x98\xf8&\x97I\x9b\xf5Y\x0b4\x8d\x88" +
+	"E\x85te\x801U#e\x1aJ\xf0N5\x8d\x81" +
+	"\xda\xd0\x89\xd8n\x15\x15\xe0\x02\xcbb\xbc\xc2\x1c\xe2\xea" +
+	"QWSV\xc2\xb0s\xa6\xd6\xff\xf7\x8a?\xa7S\xf4" +
+	"\x8dp.e\x1c5\xd3\x9bM\xe6\x041\xa37\xdd\xa7" +
+	"\xe7\x07\x93\x90i\xdc\xe3\x0bl\xee\x7fZ\x04\x06\xb6\x0e" +
+	"\xd5\xb22\xbdh~\x7f\xde%-\x96\x95^\x11\x94{" +
+	"}\x16N\xa3\x13\xa5DP\xee\xf3,<\x80k\xb6\x08" +
+	"\xcaZ\xc1\xe99\xd2\xfa\x02Rf\x17\xa5\xc1j\xa7\xdf" +
+	"H\xeb$\x8c\xcdFN\xaf\xd1\xa5ZI7\\\x0c1" +
+	"l\xce\xaaoZ\x0c\xf5\xb7\xf2\xc7.\x98\xb6\x9cSw" +
+	"\xb5_\x17\xf1\x8f]\x1c\xf576\xfb\xc7.b\xe1\xd8" +
+	"\x05J\xf2\xa7.o\x0b\xff\xbb+\x85\x9b{\xd3Vb" +
+	"\xa8\xb9aP\x92\xec\x92\xe6\xc8\xca\x92\x0c\xebr\xeeY" +
+	"/\x9f;\x0c5\xa0\xf7y\xf7\xb0wC\xfe\xfc&d" +
+	"\xf3\x9b7ltk\xd9~\xd37\xb7\xf7;Lv\x84" +
+	"\x9fMsy\x13{wf\xc4zm\xb5\x93\x99D6" +
+	"\xda\x0d\x8d\x15\x8d\xa9\x1c\x1b[\xcd\xc04b}\x86\x86" +
+	"a\xbc`\xd2\x1aP\x08]\xa6\x0a\x86\x8d\xb8\x82q8" +
+	"\xe1\x8e\xac\xf2\xc6\xc0J\x9a\xc9\xe6@\xc4\xb8'/i" +
+	"69Is\x8a\x00\xe1UjozD\xa5K\x0b\x1f" +
+	"0\xe6n\xd2w\xb8M\xc3\xdcFHB\x89s\x1d\xd1" +
+	"\xe8?\xdcR\xe7pq\xd1\x89K\xf9\xa3\xccK\x9e\x0e" +
+	":9\x87\xff\x83\xc0\x92$3\xc9W\xa9\x8c[\xf2+" +
+	"\xe38\xd6A\xd6\xb0\xd5|\xf6\xff\x11|S\x81a\xa8" +
+	"\xd0\x18H\x05\xd9N\xe6\x94\xb2\xee\xbf\xc1\x05\xde\x91\xe5" +
+	"\x8c@/\xe1\x9ed\x04\xd7\x86k\xe2\x19\xf9n\xcd\x9b" +
+	"\x13\xc2\xff+\x00\x00\xff\xff\xac\x1f\xa2w"
 
 func RegisterSchema(reg *schemas.Registry) {
 	reg.Register(&schemas.Schema{
 		String: schema_a1b2c3d4e5f60001,
 		Nodes: []uint64{
 			0x828940848f3f3066,
+			0x85fd6ee93f58963f,
 			0x86e4d03ac853e537,
+			0x87492590f5d283fa,
 			0x8788a694e7d0c9f7,
 			0x87f896ecb2b01221,
 			0x8a447bf6ec09fbf7,
 			0x8c804df75f74b5e0,
 			0x8cfd56513ec2e5dc,
+			0x8d48f66d26da6100,
 			0x9244609d69f97582,
+			0x99164a8d87fc3494,
 			0x991b95cc0f4f0997,
 			0x9b8f2ee00fe54bdc,
 			0x9d12d8051cf589b2,
@@ -4848,10 +6091,14 @@ func RegisterSchema(reg *schemas.Registry) {
 			0xa0d2c279bfed57a7,
 			0xa108b6985b5a5abd,
 			0xa378a22533473468,
+			0xa595e0c904d15c76,
 			0xb0c273d2f54f6129,
+			0xb55922268453cbd0,
 			0xb7dd705c70c8f072,
 			0xb8a347db1f686319,
 			0xb97169f973b5a15d,
+			0xbe613db3eba5d83a,
+			0xc0641fe8922c8009,
 			0xc0c01ef080ad34b9,
 			0xc0fb833f6a272dee,
 			0xc24dfe5c0df4dc8c,
@@ -4863,6 +6110,7 @@ func RegisterSchema(reg *schemas.Registry) {
 			0xcda21def53bc0a90,
 			0xd0ca99cae34491f1,
 			0xd8d970c4a80c8bc7,
+			0xdc133fc98ccfc134,
 			0xdc1a45f85fcd3678,
 			0xdc70b8674db6e7ec,
 			0xde3056d78221ed35,
@@ -4871,9 +6119,11 @@ func RegisterSchema(reg *schemas.Registry) {
 			0xe06d5caa7d092abf,
 			0xe26eae3a020ab758,
 			0xe7e35f86135ec064,
+			0xe9180c6432f76b1f,
 			0xeccd9b77654695d5,
 			0xef39f41ed09237d0,
 			0xf3bbef28c2f00292,
+			0xf6dc427ee849c014,
 			0xf941483cfa095856,
 			0xface7225b707b4e2,
 			0xfd6fe1ba61de2afe,

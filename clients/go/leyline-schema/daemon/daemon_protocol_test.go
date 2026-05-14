@@ -244,6 +244,55 @@ type queryResponse struct {
 	Rows    []queryRow `json:"rows"`
 }
 
+// ── Sheaf ops (ae7a35) ─────────────────────────────────────────────
+
+type sheafSetTopologyResponse struct {
+	OK            *bool   `json:"ok"`
+	Regions       *uint32 `json:"regions"`
+	Restrictions  *uint32 `json:"restrictions"`
+	DeltaZeroMode *bool   `json:"delta_zero_mode"`
+}
+
+type sheafInvalidateResponse struct {
+	Invalidated []uint32 `json:"invalidated"`
+	Count       *uint32  `json:"count"`
+	Generation  *uint64  `json:"generation,string"`
+}
+
+type sheafDefectResponse struct {
+	Defect     *float64 `json:"defect"`
+	Generation *uint64  `json:"generation,string"`
+	Valid      *uint32  `json:"valid"`
+	Total      *uint32  `json:"total"`
+}
+
+type sheafStalksResponse struct {
+	Generation *uint64 `json:"generation,string"`
+	Valid      *uint32 `json:"valid"`
+	Total      *uint32 `json:"total"`
+}
+
+type sheafStatusResponse struct {
+	Generation   *uint64  `json:"generation,string"`
+	Valid        *uint32  `json:"valid"`
+	Total        *uint32  `json:"total"`
+	Defect       *float64 `json:"defect"`
+	TrackedEdges *uint32  `json:"tracked_edges"`
+}
+
+type sheafLearnedWeight struct {
+	A            *uint32  `json:"a"`
+	B            *uint32  `json:"b"`
+	CoChangeRate *float64 `json:"co_change_rate"`
+	Observations *uint64  `json:"observations,string"`
+}
+
+type sheafLearnedWeightsResponse struct {
+	OK        *bool                `json:"ok"`
+	Weights   []sheafLearnedWeight `json:"weights"`
+	EdgeCount *uint32              `json:"edge_count"`
+}
+
 // decoderFor returns a function that attempts to unmarshal a response into
 // the typed binding named by go_binding. Returns nil if the name is
 // unknown — the gate treats unknown names as a fixture authoring error.
@@ -277,6 +326,18 @@ func decoderFor(name string) func([]byte) error {
 		return func(b []byte) error { var v getDbPathResponse; return strictUnmarshal(b, &v) }
 	case "QueryResponse":
 		return func(b []byte) error { var v queryResponse; return strictUnmarshal(b, &v) }
+	case "SheafSetTopologyResponse":
+		return func(b []byte) error { var v sheafSetTopologyResponse; return strictUnmarshal(b, &v) }
+	case "SheafInvalidateResponse":
+		return func(b []byte) error { var v sheafInvalidateResponse; return strictUnmarshal(b, &v) }
+	case "SheafDefectResponse":
+		return func(b []byte) error { var v sheafDefectResponse; return strictUnmarshal(b, &v) }
+	case "SheafStalksResponse":
+		return func(b []byte) error { var v sheafStalksResponse; return strictUnmarshal(b, &v) }
+	case "SheafStatusResponse":
+		return func(b []byte) error { var v sheafStatusResponse; return strictUnmarshal(b, &v) }
+	case "SheafLearnedWeightsResponse":
+		return func(b []byte) error { var v sheafLearnedWeightsResponse; return strictUnmarshal(b, &v) }
 	default:
 		return nil
 	}

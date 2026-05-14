@@ -193,6 +193,87 @@ fn tool_registry() -> Vec<McpTool> {
             description: "Diagnostics for a file (enriched on demand if missing).",
             schema: file_schema(),
         },
+        McpTool {
+            name: "sheaf_set_topology",
+            description: "Set the sheaf cache's community structure: regions (content-hash stalks, optionally with f32 stalk vectors for δ⁰ mode) and restriction edges (boundary hash + co-change rate + per-dim weights, optionally with agreement_dim for δ⁰ mode). Pass `node_stalk_dim > 0` AND f32 `data` on every region AND `agreement_dim > 0` on every restriction to engage δ⁰-driven invalidation.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "regions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id":   {"type": "integer"},
+                                "hash": {"type": "string", "description": "Hex-encoded 32-byte content hash."},
+                                "data": {"type": "array", "items": {"type": "number"}, "description": "Optional f32 stalk vector for δ⁰ mode."}
+                            },
+                            "required": ["id"]
+                        }
+                    },
+                    "restrictions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "a": {"type": "integer"},
+                                "b": {"type": "integer"},
+                                "boundary_hash":  {"type": "string"},
+                                "co_change_rate": {"type": "number"},
+                                "revert_rate":    {"type": "number"},
+                                "weights":        {"type": "array", "items": {"type": "number"}},
+                                "agreement_dim":  {"type": "integer", "description": "Opt-in to δ⁰ mode: project first N coords. 0 = heuristic only."}
+                            },
+                            "required": ["a", "b"]
+                        }
+                    },
+                    "node_stalk_dim": {"type": "integer", "description": "Stalk dimension for δ⁰ mode. 0 = heuristic only."}
+                }
+            }),
+        },
+        McpTool {
+            name: "sheaf_invalidate",
+            description: "Report changed region ids (optionally with new stalk hashes + f32 stalk data); runs the bounded BFS cascade and returns the invalidated set + cache generation.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "regions": {"type": "array", "items": {"type": "integer"}},
+                    "stalks": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id":   {"type": "integer"},
+                                "hash": {"type": "string"},
+                                "data": {"type": "array", "items": {"type": "number"}}
+                            },
+                            "required": ["id"]
+                        }
+                    }
+                },
+                "required": ["regions"]
+            }),
+        },
+        McpTool {
+            name: "sheaf_defect",
+            description: "Total ‖δ⁰‖² boundary disagreement across the sheaf, plus cache generation / valid / total counts.",
+            schema: json!({"type": "object", "properties": {}}),
+        },
+        McpTool {
+            name: "sheaf_stalks",
+            description: "Cache validity counts (generation + valid + total).",
+            schema: json!({"type": "object", "properties": {}}),
+        },
+        McpTool {
+            name: "sheaf_status",
+            description: "Combined cache health snapshot: generation, valid, total, defect, tracked_edges (co-change tracker).",
+            schema: json!({"type": "object", "properties": {}}),
+        },
+        McpTool {
+            name: "sheaf_learned_weights",
+            description: "Co-change-derived per-edge coupling rates from the CoChangeTracker.",
+            schema: json!({"type": "object", "properties": {}}),
+        },
     ];
 
     #[cfg(feature = "vec")]

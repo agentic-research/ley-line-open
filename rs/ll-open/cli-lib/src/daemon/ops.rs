@@ -70,6 +70,12 @@ pub(crate) fn base_op_names() -> Vec<&'static str> {
         "lsp_refs",
         "lsp_symbols",
         "lsp_diagnostics",
+        "sheaf_set_topology",
+        "sheaf_invalidate",
+        "sheaf_defect",
+        "sheaf_stalks",
+        "sheaf_status",
+        "sheaf_learned_weights",
     ];
     #[cfg(feature = "vec")]
     v.push("vec_search");
@@ -164,6 +170,12 @@ fn is_known_base_op(op: &str) -> bool {
             | "lsp_refs"
             | "lsp_symbols"
             | "lsp_diagnostics"
+            | "sheaf_set_topology"
+            | "sheaf_invalidate"
+            | "sheaf_defect"
+            | "sheaf_stalks"
+            | "sheaf_status"
+            | "sheaf_learned_weights"
     ) || cfg!(feature = "vec") && op == "vec_search"
 }
 
@@ -198,6 +210,23 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
         BaseRequest::LspDiagnostics(f) => op_lsp_diagnostics(ctx, &f),
         #[cfg(feature = "vec")]
         BaseRequest::VecSearch { query, k } => op_vec_search(ctx, &query, k),
+        BaseRequest::SheafSetTopology {
+            regions,
+            restrictions,
+            node_stalk_dim,
+        } => super::sheaf_ops::op_sheaf_set_topology(
+            &ctx.sheaf,
+            &regions,
+            &restrictions,
+            node_stalk_dim,
+        ),
+        BaseRequest::SheafInvalidate { regions, stalks } => {
+            super::sheaf_ops::op_sheaf_invalidate(&ctx.sheaf, &regions, &stalks)
+        }
+        BaseRequest::SheafDefect => super::sheaf_ops::op_sheaf_defect(&ctx.sheaf),
+        BaseRequest::SheafStalks => super::sheaf_ops::op_sheaf_stalks(&ctx.sheaf),
+        BaseRequest::SheafStatus => super::sheaf_ops::op_sheaf_status(&ctx.sheaf),
+        BaseRequest::SheafLearnedWeights => super::sheaf_ops::op_sheaf_learned_weights(&ctx.sheaf),
     };
     result.unwrap_or_else(|e| {
         build_error_response(&format!("{e:#}"))
@@ -1964,6 +1993,7 @@ mod tests {
             embedder,
             #[cfg(feature = "vec")]
             embed_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
+            sheaf: Arc::new(crate::daemon::sheaf_ops::SheafState::new()),
         };
         (dir, std::sync::Arc::new(ctx))
     }

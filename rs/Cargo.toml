@@ -4,3 +4,14 @@ members = [
     "ll-open/*",
 ]
 resolver = "2"
+
+# Cross-crate inlining + single codegen unit so the sheaf hot paths
+# (per-edge δ⁰, sparse matvec, restriction-map composition) vectorize
+# end-to-end without being interrupted by the crate boundary. The
+# default release profile only inlines within a crate, which leaves the
+# autovectorizer guessing whenever DVector / DMatrix ops cross from
+# leyline-sheaf into nalgebra.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+

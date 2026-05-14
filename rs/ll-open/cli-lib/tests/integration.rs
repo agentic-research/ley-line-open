@@ -80,6 +80,7 @@ fn default_test_ctx(ctrl_path: PathBuf) -> leyline_cli_lib::daemon::DaemonContex
         embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
         #[cfg(feature = "vec")]
         embed_queue: Arc::new(Mutex::new(std::collections::BinaryHeap::new())),
+        sheaf: Arc::new(leyline_cli_lib::daemon::sheaf_ops::SheafState::new()),
     }
 }
 
@@ -2154,6 +2155,7 @@ async fn test_embed_queue_drainer_refreshes_index() {
         vec_index: index.clone(),
         embedder,
         embed_queue: queue.clone(),
+        sheaf: Arc::new(leyline_cli_lib::daemon::sheaf_ops::SheafState::new()),
         ..default_test_ctx(ctrl_path)
     });
 
@@ -2216,6 +2218,7 @@ async fn test_op_vec_search_round_trip() {
         vec_index: index.clone(),
         embedder,
         embed_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
+        sheaf: Arc::new(leyline_cli_lib::daemon::sheaf_ops::SheafState::new()),
         ..default_test_ctx(ctrl_path)
     });
 
@@ -2742,6 +2745,7 @@ async fn test_op_vec_search_dim_mismatch_returns_clean_error() {
         vec_index: index,
         embedder,
         embed_queue: Arc::new(Mutex::new(std::collections::BinaryHeap::new())),
+        sheaf: Arc::new(leyline_cli_lib::daemon::sheaf_ops::SheafState::new()),
         ..default_test_ctx(ctrl_path)
     });
 
@@ -3140,5 +3144,153 @@ async fn daemon_protocol_gate_handlers_emit_required_keys() {
         "daemon protocol drift gate caught {} failure(s):\n  {}",
         failures.len(),
         failures.join("\n  "),
+    );
+}
+
+// =====================================================================
+// E2E sheaf ops over real UDS daemon (ley-line-open-ae7a35)
+// =====================================================================
+
+/// Spin up a daemon UDS listener, send `sheaf_set_topology` with f32
+/// stalk data + agreement_dim, then send `sheaf_invalidate` with a
+/// projected-away change. Confirms the δ⁰-driven invalidation contract
+/// engages end-to-end — schema → handler → wire JSON → cache state →
+/// response — not just at the Rust API layer.
+///
+/// Pins gap #1 from the post-bench audit (`cb15ada` commit message):
+/// the daemon op surface must actually drive δ⁰ mode for a real UDS
+/// consumer, not just the in-process `SheafCache::with_complex` path.
+#[tokio::test]
+async fn e2e_sheaf_ops_drive_delta_zero_mode_over_real_uds() {
+    use std::sync::Arc;
+
+    let dir = TempDir::new().unwrap();
+    let (_arena, ctrl_path) = fresh_arena(dir.path());
+
+    let ctx = Arc::new(default_test_ctx(ctrl_path));
+    let sock_path = dir.path().join("sheaf-e2e.sock");
+    spawn_test_socket(ctx.clone(), sock_path.clone()).await;
+
+    // ── Step 1: sheaf_set_topology with f32 data → δ⁰ mode engages ──
+    //
+    // Two regions, one edge, agreement_dim=2. Both stalks share the
+    // first two coords [1.0, 0.5] — the agreement subspace — and
+    // differ only in private coords [2..4]. After set_topology, the
+    // cache should be in δ⁰ mode AND its baseline should reflect the
+    // (zero) initial defect on the shared subspace.
+    let topology_resp = uds_round_trip(
+        &sock_path,
+        r#"{"op":"sheaf_set_topology","node_stalk_dim":4,"regions":[{"id":0,"hash":"aa","data":[1.0,0.5,0.0,0.0]},{"id":1,"hash":"bb","data":[1.0,0.5,9.0,9.0]}],"restrictions":[{"a":0,"b":1,"boundary_hash":"11","co_change_rate":0.5,"weights":[1.0],"agreement_dim":2}]}"#,
+    )
+    .await;
+    assert_eq!(
+        topology_resp["ok"], true,
+        "sheaf_set_topology must succeed: {topology_resp}"
+    );
+    assert_eq!(
+        topology_resp["delta_zero_mode"], true,
+        "δ⁰ mode must engage when node_stalk_dim>0 + f32 data + agreement_dim>0: {topology_resp}"
+    );
+    assert_eq!(topology_resp["regions"], 2);
+    assert_eq!(topology_resp["restrictions"], 1);
+
+    // ── Step 2: pre-populate cache entries so on_change has work ──
+    //
+    // No daemon op for cache.put() — go through the ctx directly. In
+    // production this is what reparse / enrich would do via separate
+    // pipelines. Here we just need entries the BFS can mark.
+    {
+        let mut cache = ctx.sheaf.cache().lock().unwrap();
+        cache.put(0, ());
+        cache.put(1, ());
+    }
+
+    // ── Step 3: sheaf_invalidate with projected-away change ──
+    //
+    // Region 0's new stalk = [1.0, 0.5, 42.0, 7.0]. The agreement
+    // coords [0..2] are unchanged from baseline. δ⁰ stays zero → the
+    // cache must NOT cascade to region 1.
+    let invalidate_resp = uds_round_trip(
+        &sock_path,
+        r#"{"op":"sheaf_invalidate","regions":[0],"stalks":[{"id":0,"hash":"ff","data":[1.0,0.5,42.0,7.0]}]}"#,
+    )
+    .await;
+    let invalidated: Vec<u32> = invalidate_resp["invalidated"]
+        .as_array()
+        .expect("invalidated is an array")
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+    assert_eq!(
+        invalidated,
+        vec![0],
+        "δ⁰ mode must hold region 1 valid when agreement coords unchanged; got {invalidated:?} (full: {invalidate_resp})"
+    );
+
+    // ── Step 4: sheaf_invalidate with agreement-breaking change ──
+    //
+    // Region 0's stalk now flips coord [0] (in the agreement subspace).
+    // δ⁰ moves → cache must cascade to region 1.
+    {
+        let mut cache = ctx.sheaf.cache().lock().unwrap();
+        cache.put(1, ()); // re-mark valid before the next test
+    }
+    let invalidate_resp2 = uds_round_trip(
+        &sock_path,
+        r#"{"op":"sheaf_invalidate","regions":[0],"stalks":[{"id":0,"hash":"ee","data":[99.0,0.5,42.0,7.0]}]}"#,
+    )
+    .await;
+    let invalidated2: Vec<u32> = invalidate_resp2["invalidated"]
+        .as_array()
+        .expect("invalidated is an array")
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+    assert!(
+        invalidated2.contains(&1),
+        "δ⁰ mode must cascade when agreement coord moves; got {invalidated2:?} (full: {invalidate_resp2})"
+    );
+
+    // ── Step 5: sheaf_status surfaces the current cache state ──
+    let status_resp = uds_round_trip(&sock_path, r#"{"op":"sheaf_status"}"#).await;
+    assert!(
+        status_resp["generation"].as_str().is_some(),
+        "sheaf_status must return generation as Int64-as-string: {status_resp}"
+    );
+    let generation: u64 = status_resp["generation"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .expect("generation parses as u64");
+    assert!(
+        generation >= 2,
+        "generation must reflect both invalidate calls; got {generation}"
+    );
+}
+
+/// Heuristic-only path: no f32 data, no agreement_dim — the daemon op
+/// must still work AND report `delta_zero_mode: false` so callers know
+/// they're on the XOR-cascade path. Confirms backward-compat: any
+/// pre-cb15ada caller sending just {id, hash} per stalk still gets a
+/// well-formed response.
+#[tokio::test]
+async fn e2e_sheaf_set_topology_heuristic_only_keeps_working() {
+    use std::sync::Arc;
+
+    let dir = TempDir::new().unwrap();
+    let (_arena, ctrl_path) = fresh_arena(dir.path());
+    let ctx = Arc::new(default_test_ctx(ctrl_path));
+    let sock_path = dir.path().join("sheaf-heuristic.sock");
+    spawn_test_socket(ctx.clone(), sock_path.clone()).await;
+
+    let resp = uds_round_trip(
+        &sock_path,
+        r#"{"op":"sheaf_set_topology","regions":[{"id":0,"hash":"aa"},{"id":1,"hash":"bb"}],"restrictions":[{"a":0,"b":1,"boundary_hash":"11","co_change_rate":0.5,"weights":[1.0]}]}"#,
+    )
+    .await;
+    assert_eq!(resp["ok"], true);
+    assert_eq!(
+        resp["delta_zero_mode"], false,
+        "no node_stalk_dim → must report heuristic-only: {resp}"
     );
 }

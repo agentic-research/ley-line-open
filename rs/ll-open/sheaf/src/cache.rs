@@ -45,9 +45,14 @@
 //! `"shared_token"`) when available.
 //!
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crate::complex::CellComplex;
 use crate::topology::RegionId;
+
+/// Squared-norm threshold below which δ⁰ output is treated as zero.
+/// Matches `complex::EPS` for the unsquared coboundary check.
+const DELTA0_EPS_SQUARED: f32 = 1e-8;
 
 /// A content hash summarizing a region's current state.
 pub trait StalkHash {
@@ -78,25 +83,66 @@ pub struct CacheEntry<V> {
     pub valid: bool,
 }
 
-/// Sheaf cache: entries organized by topological regions with invalidation
-/// driven by the Čech coboundary operator.
+/// Sheaf cache: entries organized by topological regions.
+///
+/// Invalidation has two modes:
+/// - **Heuristic** (default): the XOR-of-Merkle-roots boundary check drives a
+///   bounded restriction-graph BFS. Fast, but over-evicts on content changes
+///   that the restriction map would project away.
+/// - **δ⁰-driven** (opt-in via [`Self::with_complex`]): the XOR check is a
+///   pre-filter; when it says "changed" the cache calls
+///   [`CellComplex::edge_violation_squared`] on the attached complex to
+///   confirm the disagreement is real before invalidating. Stalk f32 values
+///   are pushed into the complex via [`Self::set_stalk_value`].
 ///
 /// `S` is the stalk type (must produce a content hash).
 /// `V` is the cached value type.
 pub struct SheafCache<S: StalkHash, V> {
-    stalks: HashMap<RegionId, S>,
-    restrictions: HashMap<(RegionId, RegionId), RestrictionEdge>,
-    entries: HashMap<RegionId, CacheEntry<V>>,
+    stalks: BTreeMap<RegionId, S>,
+    restrictions: BTreeMap<(RegionId, RegionId), RestrictionEdge>,
+    entries: BTreeMap<RegionId, CacheEntry<V>>,
     generation: u64,
+    /// Optional δ⁰-driven invalidation backing. When `Some`,
+    /// `check_boundary_changed` uses it as the authoritative answer after
+    /// the XOR pre-filter. The cache pushes f32 stalk updates into the
+    /// complex via [`Self::set_stalk_value`].
+    complex: Option<CellComplex>,
 }
 
 impl<S: StalkHash, V> SheafCache<S, V> {
     pub fn new() -> Self {
         Self {
-            stalks: HashMap::new(),
-            restrictions: HashMap::new(),
-            entries: HashMap::new(),
+            stalks: BTreeMap::new(),
+            restrictions: BTreeMap::new(),
+            entries: BTreeMap::new(),
             generation: 0,
+            complex: None,
+        }
+    }
+
+    /// Attach a [`CellComplex`] for δ⁰-driven invalidation. Replaces any
+    /// previously attached complex. The cache pushes f32 stalk updates into
+    /// the complex via [`Self::set_stalk_value`]; the caller is responsible
+    /// for adding nodes + edges to the complex (with restriction maps) ahead
+    /// of time so the edge geometry matches the cache's restriction edges.
+    pub fn with_complex(mut self, complex: CellComplex) -> Self {
+        self.complex = Some(complex);
+        self
+    }
+
+    /// Borrow the attached [`CellComplex`], if any.
+    pub fn complex(&self) -> Option<&CellComplex> {
+        self.complex.as_ref()
+    }
+
+    /// Push the current f32 stalk for `region` into the attached complex so
+    /// the next `on_change` sees the updated section. No-op if no complex is
+    /// attached or `region` has not been added to the complex yet.
+    pub fn set_stalk_value(&mut self, region: RegionId, data: Vec<f32>) {
+        if let Some(cx) = self.complex.as_mut()
+            && cx.cells.contains_key(&region)
+        {
+            cx.set_node_stalk(region, data);
         }
     }
 
@@ -132,15 +178,15 @@ impl<S: StalkHash, V> SheafCache<S, V> {
             .map(|e| &e.value)
     }
 
-    /// Handle a change to one or more regions. Recomputes stalks and
-    /// propagates invalidation through restriction edges.
+    /// Handle a change to one or more regions. Propagates invalidation
+    /// breadth-first through restriction edges, bounded by `max_cascade_budget`
+    /// (heuristic depth, not a sheaf invariant — see module docs).
     ///
-    /// Returns the set of invalidated region IDs.
+    /// Returns the set of invalidated region IDs in BFS visitation order.
     pub fn on_change(&mut self, changed_regions: &[RegionId]) -> Vec<RegionId> {
         self.generation += 1;
         let mut invalidated = Vec::new();
 
-        // Mark changed regions as invalid
         for &region in changed_regions {
             if let Some(entry) = self.entries.get_mut(&region) {
                 entry.valid = false;
@@ -148,18 +194,19 @@ impl<S: StalkHash, V> SheafCache<S, V> {
             }
         }
 
-        // Walk restriction edges from changed regions (bounded cascade)
-        let max_depth = 3;
-        let mut frontier: Vec<(RegionId, u32)> = changed_regions.iter().map(|&r| (r, 0)).collect();
-        let mut visited: std::collections::HashSet<RegionId> =
-            changed_regions.iter().copied().collect();
+        let max_cascade_budget: u32 = 3;
+        // VecDeque + pop_front gives genuine BFS; the prior Vec::pop produced
+        // DFS, which still respects the depth bound but visits nodes in a
+        // hash-seed-dependent order.
+        let mut frontier: VecDeque<(RegionId, u32)> =
+            changed_regions.iter().map(|&r| (r, 0)).collect();
+        let mut visited: BTreeSet<RegionId> = changed_regions.iter().copied().collect();
 
-        while let Some((region, depth)) = frontier.pop() {
-            if depth >= max_depth {
+        while let Some((region, depth)) = frontier.pop_front() {
+            if depth >= max_cascade_budget {
                 continue;
             }
 
-            // Find neighbors via restriction edges
             let neighbors: Vec<RegionId> = self
                 .restrictions
                 .keys()
@@ -168,22 +215,18 @@ impl<S: StalkHash, V> SheafCache<S, V> {
                 .collect();
 
             for neighbor in neighbors {
-                if visited.contains(&neighbor) {
+                if !visited.insert(neighbor) {
                     continue;
                 }
-
-                // Check if the boundary changed
                 let edge_key = (region, neighbor);
-                if let Some(edge) = self.restrictions.get(&edge_key) {
-                    let boundary_changed = self.check_boundary_changed(region, neighbor, edge);
-                    if boundary_changed {
-                        if let Some(entry) = self.entries.get_mut(&neighbor) {
-                            entry.valid = false;
-                            invalidated.push(neighbor);
-                        }
-                        visited.insert(neighbor);
-                        frontier.push((neighbor, depth + 1));
+                if let Some(edge) = self.restrictions.get(&edge_key)
+                    && self.check_boundary_changed(region, neighbor, edge)
+                {
+                    if let Some(entry) = self.entries.get_mut(&neighbor) {
+                        entry.valid = false;
+                        invalidated.push(neighbor);
                     }
+                    frontier.push_back((neighbor, depth + 1));
                 }
             }
         }
@@ -191,26 +234,28 @@ impl<S: StalkHash, V> SheafCache<S, V> {
         invalidated
     }
 
-    /// Heuristic boundary-change check: compares the XOR of endpoint Merkle
-    /// roots against the stored boundary hash.
+    /// Two-stage boundary-change check.
     ///
-    /// **This is a proxy, not a δ⁰ computation.** Returns `true` whenever either
-    /// endpoint's hash has shifted in a way that changes the XOR — including
-    /// content changes that the restriction map would project away. Over-evicts
-    /// on author churn that doesn't actually move the agreement subspace, and
-    /// could in principle false-negative if two simultaneous endpoint hash
-    /// changes XOR back to the stored boundary (vanishingly unlikely for
-    /// real Merkle hashes; guarded against deterministically by the cache's
-    /// `claim_2_unchanged_neighbors_with_matching_boundary_hash_remain_valid`
-    /// falsifiability gate).
+    /// Stage 1 is the XOR-of-Merkle-roots pre-filter: if `H(stalk_a) ⊕ H(stalk_b)`
+    /// still matches `edge.boundary_hash` the cache short-circuits and reports
+    /// "unchanged" — no δ⁰ application needed.
     ///
-    /// TODO: replace with real δ⁰ via [`crate::complex::CellComplex::detect_violations`]
-    /// once the cache stores the f32 stalk values alongside their hashes.
+    /// Stage 2 fires only when the XOR pre-filter says "changed" AND a
+    /// [`CellComplex`] is attached. It calls
+    /// [`CellComplex::edge_violation_squared`] on the f32 stalks for the
+    /// (source, target) edge and reports "changed" iff the squared norm of
+    /// δ⁰ exceeds `DELTA0_EPS_SQUARED`. This is the authoritative sheaf
+    /// answer: content changes that the restriction map projects away
+    /// produce a zero δ⁰ output, so the entry stays valid.
+    ///
+    /// Without an attached complex, stage 2 is skipped and the XOR pre-filter
+    /// IS the answer (preserving prior heuristic behaviour for callers that
+    /// have not opted into δ⁰-driven mode).
     fn check_boundary_changed(&self, a: RegionId, b: RegionId, edge: &RestrictionEdge) -> bool {
         let hash_a = self.stalks.get(&a).map(|s| s.merkle_root());
         let hash_b = self.stalks.get(&b).map(|s| s.merkle_root());
 
-        match (hash_a, hash_b) {
+        let xor_changed = match (hash_a, hash_b) {
             (Some(ha), Some(hb)) => {
                 let mut boundary = [0u8; 32];
                 for i in 0..32 {
@@ -218,8 +263,23 @@ impl<S: StalkHash, V> SheafCache<S, V> {
                 }
                 boundary != edge.boundary_hash
             }
-            _ => true, // Missing stalk → assume changed
+            _ => true,
+        };
+        if !xor_changed {
+            return false;
         }
+
+        if let Some(cx) = self.complex.as_ref() {
+            // The complex's directed edge may be stored as (a, b) or (b, a);
+            // probe both since `restrictions` stores undirected edges.
+            let violation = cx
+                .edge_violation_squared(a, b)
+                .or_else(|| cx.edge_violation_squared(b, a));
+            if let Some(norm_sq) = violation {
+                return norm_sq > DELTA0_EPS_SQUARED;
+            }
+        }
+        true
     }
 
     /// Compute the total defect: sum of boundary disagreements across all

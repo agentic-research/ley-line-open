@@ -7,6 +7,7 @@
 //! Domain separation tags:
 //! - `0x00` — leaf node
 //! - `0x01` — internal node
+//! - `0x02` — empty tree marker
 
 use sha2::{Digest, Sha256};
 
@@ -15,12 +16,16 @@ use sha2::{Digest, Sha256};
 /// Uses SHA-256 with domain separation:
 /// - Leaf nodes: `H(0x00 || leaf_data)`
 /// - Internal nodes: `H(0x01 || left || right)`
+/// - Empty tree: `H(0x02 || "empty")` — never the all-zeros sentinel, so an
+///   accidental zero-hash leaf never collides with "I have no data."
 ///
 /// If the number of leaves is odd, the last leaf is promoted without hashing.
-/// An empty input returns all zeros.
 pub fn compute_merkle_root(leaf_hashes: &[[u8; 32]]) -> [u8; 32] {
     if leaf_hashes.is_empty() {
-        return [0u8; 32];
+        let mut hasher = Sha256::new();
+        hasher.update([0x02]);
+        hasher.update(b"empty");
+        return hasher.finalize().into();
     }
     if leaf_hashes.len() == 1 {
         return leaf_hashes[0];
@@ -65,8 +70,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn merkle_root_empty() {
-        assert_eq!(compute_merkle_root(&[]), [0u8; 32]);
+    fn merkle_root_empty_is_domain_separated_not_zeros() {
+        // Empty tree must produce a distinct, non-zero hash so accidental
+        // zero-hash data does not collide with "I have no leaves."
+        let empty = compute_merkle_root(&[]);
+        assert_ne!(empty, [0u8; 32], "empty tree hash must not be all zeros");
+        // Stable across calls.
+        assert_eq!(empty, compute_merkle_root(&[]));
+        // Distinct from a tree containing only the zero-hash leaf.
+        let zero_leaf = compute_merkle_root(&[[0u8; 32]]);
+        assert_ne!(
+            empty, zero_leaf,
+            "empty tree must hash differently than a tree with the zero leaf",
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@
 //! - H⁰ = ker(δ⁰) (globally consistent stalks — valid cache entries)
 //! - H¹ = ker(δ¹) / im(δ⁰) (independent cycles — fundamental invalidation paths)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use nalgebra::{DMatrix, DVector};
 use nalgebra_sparse::{CooMatrix, CscMatrix};
@@ -208,6 +208,58 @@ impl CellComplex {
         }
     }
 
+    /// Replace an existing node's stalk data without re-adding it.
+    ///
+    /// Used by [`crate::cache::SheafCache`] to push f32 stalk updates into
+    /// the backing complex so `detect_violations` sees the latest section.
+    /// Panics if the node hasn't been added yet or the dimension is wrong —
+    /// the cache must call `add_node` first.
+    pub fn set_node_stalk(&mut self, id: u32, data: Vec<f32>) {
+        assert_eq!(
+            data.len(),
+            self.node_stalk_dim,
+            "Node stalk must be {}D, got {}D",
+            self.node_stalk_dim,
+            data.len()
+        );
+        let cell = self.cells.get_mut(&id).unwrap_or_else(|| {
+            panic!("set_node_stalk: node {id} not in complex; call add_node first")
+        });
+        assert_eq!(
+            cell.dimension, 0,
+            "set_node_stalk: cell {id} is not a 0-cell (dimension={})",
+            cell.dimension,
+        );
+        cell.stalk = Stalk::new(data);
+    }
+
+    /// Squared ℓ² norm of the δ⁰ output on a single edge `(source → target)`.
+    ///
+    /// Returns `None` if no edge connects `source` to `target` (or its
+    /// restriction maps are missing). This is the per-edge defect contribution
+    /// — the cache uses it as the authoritative "did this edge actually
+    /// disagree?" check after the XOR-Merkle pre-filter says something
+    /// changed. Equivalent to one term of `Σ‖δ⁰‖²` from
+    /// [`Self::consistency_analysis`].
+    pub fn edge_violation_squared(&self, source: u32, target: u32) -> Option<f32> {
+        let edge_id = self
+            .incidence
+            .iter()
+            .find(|(_, (u, v))| *u == source && *v == target)
+            .map(|(&eid, _)| eid)?;
+        let f_src = self.restriction_maps.get(&(source, edge_id))?;
+        let f_tgt = self.restriction_maps.get(&(target, edge_id))?;
+        let x_src = &self.cells.get(&source)?.stalk.data;
+        let x_tgt = &self.cells.get(&target)?.stalk.data;
+        if x_src.len() != self.node_stalk_dim || x_tgt.len() != self.node_stalk_dim {
+            return None;
+        }
+        let x_src_vec = DVector::from_row_slice(x_src);
+        let x_tgt_vec = DVector::from_row_slice(x_tgt);
+        let image = &f_tgt.matrix * x_tgt_vec - &f_src.matrix * x_src_vec;
+        Some(image.iter().map(|v| v * v).sum())
+    }
+
     /// Add a 0-cell (node) with the given stalk data.
     ///
     /// # Panics
@@ -299,7 +351,59 @@ impl CellComplex {
     }
 
     /// Add a 2-cell (face) bounding a cycle of edges.
+    ///
+    /// `edges` is a list of `(edge_id, sign)` pairs. The `sign` records
+    /// whether the face traverses the edge in its natural source→target
+    /// direction (`+1.0`) or in reverse (`-1.0`); see
+    /// [`Self::generate_faces_from_cycles`].
+    ///
+    /// # Panics
+    /// Panics if the edge list is empty, has duplicate edges, references
+    /// an unknown edge id, or does not close a cycle when oriented per
+    /// the supplied signs. Without these checks the cochain-complex axiom
+    /// `δ¹∘δ⁰ = 0` is unprovable for the face: `build_delta_1` would happily
+    /// register garbage signs against edges that don't bound the face, and
+    /// `assert_cochain_complex` would silently pass on a non-cycle face.
     pub fn add_face(&mut self, face_id: u32, edges: &[(u32, f32)], dim: usize) {
+        assert!(!edges.is_empty(), "add_face: face {face_id} has no edges",);
+        let mut seen = HashSet::new();
+        for &(eid, sign) in edges {
+            assert!(
+                seen.insert(eid),
+                "add_face: face {face_id} references edge {eid} more than once",
+            );
+            assert!(
+                self.incidence.contains_key(&eid),
+                "add_face: face {face_id} references unknown edge {eid}",
+            );
+            assert!(
+                sign == 1.0 || sign == -1.0,
+                "add_face: face {face_id} edge {eid} sign must be ±1.0, got {sign}",
+            );
+        }
+        // Verify the edges form a closed cycle when oriented per their signs.
+        // Walking the path: starting at the first edge's oriented source, each
+        // step's oriented target must equal the next step's oriented source,
+        // and the final target must close back on the initial source.
+        let oriented = |eid: u32, sign: f32| -> (u32, u32) {
+            let &(s, t) = self.incidence.get(&eid).expect("incidence checked above");
+            if sign > 0.0 { (s, t) } else { (t, s) }
+        };
+        let (start, _) = oriented(edges[0].0, edges[0].1);
+        let mut cursor = start;
+        for &(eid, sign) in edges {
+            let (s, t) = oriented(eid, sign);
+            assert_eq!(
+                cursor, s,
+                "add_face: face {face_id} edges do not form a cycle — expected step starting at {cursor}, got edge {eid} starting at {s}",
+            );
+            cursor = t;
+        }
+        assert_eq!(
+            cursor, start,
+            "add_face: face {face_id} edges do not close back to start {start}; final cursor is {cursor}",
+        );
+
         self.face_cells.insert(
             face_id,
             Cell2 {
@@ -449,8 +553,18 @@ impl CellComplex {
     ///
     /// Finds triangles via neighbor-set intersection and longer cycles (4-8)
     /// via bounded DFS. Returns the number of faces created.
+    ///
+    /// Each face edge carries a sign that records whether the path traverses
+    /// the stored edge in its natural source→target direction (`+1.0`) or
+    /// in reverse (`-1.0`). The cochain-complex axiom `δ¹∘δ⁰ = 0` requires
+    /// the per-edge sign to reflect the face's induced orientation, not a
+    /// hardcoded `+1.0` — otherwise non-trivial cycles silently fail the
+    /// axiom check on any heterogeneous restriction map.
     pub fn generate_faces_from_cycles(&mut self, label: &str, max_cycles: usize) -> usize {
-        // Build (source, target) → edge_id map for the given label
+        // Build (source, target) → edge_id map for the given label. We also
+        // record the reverse direction so cycle traversal can pick up edges
+        // whose natural orientation runs opposite the traversal — those edges
+        // contribute with sign -1 in δ¹.
         let mut edge_map: HashMap<(u32, u32), u32> = HashMap::new();
         let mut dep_edges = Vec::new();
         for &edge_id in &self.edges {
@@ -467,13 +581,29 @@ impl CellComplex {
             return 0;
         }
 
+        // Lookup helper: for a path step (s → t), find the underlying edge
+        // and the sign relative to the traversal direction.
+        let signed_lookup = |s: u32, t: u32| -> Option<(u32, f32)> {
+            if let Some(&eid) = edge_map.get(&(s, t)) {
+                Some((eid, 1.0))
+            } else if let Some(&eid) = edge_map.get(&(t, s)) {
+                Some((eid, -1.0))
+            } else {
+                None
+            }
+        };
+
+        // Adjacency for cycle search must consider both directions — a face
+        // can include an edge traversed in reverse.
         let mut adjacency: HashMap<u32, Vec<u32>> = HashMap::new();
         let mut neighbor_set: HashMap<u32, HashSet<u32>> = HashMap::new();
         let mut all_nodes: HashSet<u32> = HashSet::new();
 
         for &(src, tgt) in &dep_edges {
             adjacency.entry(src).or_default().push(tgt);
+            adjacency.entry(tgt).or_default().push(src);
             neighbor_set.entry(src).or_default().insert(tgt);
+            neighbor_set.entry(tgt).or_default().insert(src);
             all_nodes.insert(src);
             all_nodes.insert(tgt);
         }
@@ -519,8 +649,8 @@ impl CellComplex {
 
                         let mut face_edges = Vec::new();
                         for &(s, t) in &[(a, b), (b, c), (c, a)] {
-                            if let Some(&eid) = edge_map.get(&(s, t)) {
-                                face_edges.push((eid, 1.0));
+                            if let Some((eid, sign)) = signed_lookup(s, t) {
+                                face_edges.push((eid, sign));
                             }
                         }
                         if face_edges.len() == 3 {
@@ -570,8 +700,8 @@ impl CellComplex {
                             for i in 0..path.len() {
                                 let src = path[i];
                                 let tgt = path[(i + 1) % path.len()];
-                                if let Some(&eid) = edge_map.get(&(src, tgt)) {
-                                    face_edges.push((eid, 1.0));
+                                if let Some((eid, sign)) = signed_lookup(src, tgt) {
+                                    face_edges.push((eid, sign));
                                 } else {
                                     all_found = false;
                                     break;
@@ -837,8 +967,11 @@ impl CellComplex {
             }
         }
 
-        // Collect groups
-        let mut groups: HashMap<u32, Vec<u32>> = HashMap::new();
+        // Collect groups keyed by union-find root. BTreeMap (not HashMap)
+        // so iteration order is deterministic across runs — consistent_groups
+        // is consumed by the cache layer, which expects stable orderings to
+        // avoid hash-seed-dependent test flakiness.
+        let mut groups: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
         for &n in &self.nodes {
             let root = find(&mut parent, n);
             groups.entry(root).or_default().push(n);

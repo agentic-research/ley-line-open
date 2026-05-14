@@ -107,6 +107,13 @@ pub struct SheafCache<S: StalkHash, V> {
     /// the XOR pre-filter. The cache pushes f32 stalk updates into the
     /// complex via [`Self::set_stalk_value`].
     complex: Option<CellComplex>,
+    /// Per-edge baseline `‖δ⁰‖²` snapshot. Captures the *previous*
+    /// agreement state of each edge so `check_boundary_changed` can flag
+    /// "the disagreement just moved" rather than "the disagreement is
+    /// currently non-zero in absolute terms". Keyed by canonical
+    /// `(min, max)` pair to dedupe the undirected edges stored in both
+    /// directions in `restrictions`.
+    delta_zero_baseline: BTreeMap<(RegionId, RegionId), f32>,
 }
 
 impl<S: StalkHash, V> SheafCache<S, V> {
@@ -117,6 +124,34 @@ impl<S: StalkHash, V> SheafCache<S, V> {
             entries: BTreeMap::new(),
             generation: 0,
             complex: None,
+            delta_zero_baseline: BTreeMap::new(),
+        }
+    }
+
+    /// Snapshot the current per-edge `‖δ⁰‖²` as the baseline. Subsequent
+    /// `on_change` calls treat "current squared norm matches baseline" as
+    /// "this edge's agreement is unchanged" — even when the absolute
+    /// norm is non-zero. Call this once after seeding the cache so the
+    /// initial section becomes the reference state.
+    ///
+    /// No-op when no `CellComplex` is attached (the heuristic cache has
+    /// no notion of per-edge δ⁰).
+    pub fn refresh_baseline(&mut self) {
+        let Some(cx) = self.complex.as_ref() else {
+            return;
+        };
+        let edge_pairs: Vec<(RegionId, RegionId)> = self
+            .restrictions
+            .keys()
+            .filter(|(a, b)| a <= b)
+            .copied()
+            .collect();
+        for (a, b) in edge_pairs {
+            let norm_sq = cx
+                .edge_violation_squared(a, b)
+                .or_else(|| cx.edge_violation_squared(b, a))
+                .unwrap_or(0.0);
+            self.delta_zero_baseline.insert((a, b), norm_sq);
         }
     }
 
@@ -241,16 +276,21 @@ impl<S: StalkHash, V> SheafCache<S, V> {
     /// "unchanged" — no δ⁰ application needed.
     ///
     /// Stage 2 fires only when the XOR pre-filter says "changed" AND a
-    /// [`CellComplex`] is attached. It calls
-    /// [`CellComplex::edge_violation_squared`] on the f32 stalks for the
-    /// (source, target) edge and reports "changed" iff the squared norm of
-    /// δ⁰ exceeds `DELTA0_EPS_SQUARED`. This is the authoritative sheaf
-    /// answer: content changes that the restriction map projects away
-    /// produce a zero δ⁰ output, so the entry stays valid.
+    /// [`CellComplex`] is attached. It compares the current
+    /// [`CellComplex::edge_violation_squared`] against the baseline snapshot
+    /// captured by [`Self::refresh_baseline`]. The edge is "changed" iff the
+    /// squared norm moved by more than `DELTA0_EPS_SQUARED` away from the
+    /// baseline — i.e. the agreement subspace projection of the section
+    /// actually shifted, not just that the absolute norm is non-zero.
+    /// Content changes the restriction map projects away leave the squared
+    /// norm at its baseline value, so the cache holds.
     ///
     /// Without an attached complex, stage 2 is skipped and the XOR pre-filter
     /// IS the answer (preserving prior heuristic behaviour for callers that
-    /// have not opted into δ⁰-driven mode).
+    /// have not opted into δ⁰-driven mode). Without a baseline (caller never
+    /// called `refresh_baseline`), the check falls back to the prior
+    /// behaviour — "current squared norm exceeds eps²" — which over-evicts
+    /// on initially-non-consistent sections.
     fn check_boundary_changed(&self, a: RegionId, b: RegionId, edge: &RestrictionEdge) -> bool {
         let hash_a = self.stalks.get(&a).map(|s| s.merkle_root());
         let hash_b = self.stalks.get(&b).map(|s| s.merkle_root());
@@ -270,13 +310,15 @@ impl<S: StalkHash, V> SheafCache<S, V> {
         }
 
         if let Some(cx) = self.complex.as_ref() {
-            // The complex's directed edge may be stored as (a, b) or (b, a);
-            // probe both since `restrictions` stores undirected edges.
-            let violation = cx
+            let current = cx
                 .edge_violation_squared(a, b)
                 .or_else(|| cx.edge_violation_squared(b, a));
-            if let Some(norm_sq) = violation {
-                return norm_sq > DELTA0_EPS_SQUARED;
+            if let Some(current_norm_sq) = current {
+                let key = (a.min(b), a.max(b));
+                if let Some(&baseline) = self.delta_zero_baseline.get(&key) {
+                    return (current_norm_sq - baseline).abs() > DELTA0_EPS_SQUARED;
+                }
+                return current_norm_sq > DELTA0_EPS_SQUARED;
             }
         }
         true

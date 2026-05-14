@@ -179,6 +179,7 @@ pub struct H0Result {
 /// Manages 0-cells (nodes with stalks), 1-cells (edges with restriction maps),
 /// and 2-cells (faces bounding cycles). Computes coboundary operators δ⁰ and δ¹,
 /// detects violations, and calculates cohomology groups H⁰ and H¹.
+#[derive(Clone)]
 pub struct CellComplex {
     pub nodes: Vec<u32>,
     pub edges: Vec<u32>,

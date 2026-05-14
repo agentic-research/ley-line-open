@@ -25,10 +25,9 @@
 //! zeroth cohomology group H⁰ — are globally consistent.
 //!
 //! For the dimension of H⁰ as an algebraic invariant (independent of the
-//! current section), use [`CellComplex::h0_dimension`]. The name
-//! `compute_h0` / [`CellComplex::consistency_analysis`] returns a
-//! section-dependent partition + defect — useful as a cache heuristic, not
-//! literal H⁰.
+//! current section), use [`CellComplex::h0_dimension`].
+//! [`CellComplex::consistency_analysis`] returns a section-dependent
+//! partition + defect — useful as a cache heuristic, not literal H⁰.
 //!
 //! ## Provenance
 //!

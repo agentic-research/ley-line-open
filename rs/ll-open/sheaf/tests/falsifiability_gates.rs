@@ -65,7 +65,7 @@ fn two_node_first_coord_complex(node0: f32, node1: f32) -> CellComplex {
 fn claim_1_defect_equals_squared_l2_of_delta_zero_consistent() {
     // Consistent stalks: a == b ⇒ δ⁰(stalks) = 0 ⇒ defect = 0.
     let cx = two_node_first_coord_complex(5.0, 5.0);
-    let h0 = cx.compute_h0(f32::INFINITY);
+    let h0 = cx.consistency_analysis(f32::INFINITY);
     assert!(
         h0.defect.abs() < 1e-6,
         "claim 1 (consistent): defect must be 0 when δ⁰(stalks) = 0; got {}",
@@ -78,7 +78,7 @@ fn claim_1_defect_equals_squared_l2_of_delta_zero_inconsistent() {
     // Inconsistent stalks: a=5, b=3 ⇒ δ⁰(stalks) = b - a = -2 at the
     // single edge ⇒ ‖δ⁰‖² = 4.
     let cx = two_node_first_coord_complex(5.0, 3.0);
-    let h0 = cx.compute_h0(f32::INFINITY);
+    let h0 = cx.consistency_analysis(f32::INFINITY);
     let expected = (3.0_f32 - 5.0_f32).powi(2);
     assert!(
         (h0.defect - expected).abs() < 1e-6,
@@ -92,10 +92,10 @@ fn claim_1_defect_scales_quadratically_with_disagreement() {
     // δ⁰ is linear; defect = ‖δ⁰‖² should be quadratic in the
     // disagreement magnitude. Double the gap ⇒ 4× the defect.
     let small = two_node_first_coord_complex(0.0, 1.0)
-        .compute_h0(f32::INFINITY)
+        .consistency_analysis(f32::INFINITY)
         .defect;
     let large = two_node_first_coord_complex(0.0, 2.0)
-        .compute_h0(f32::INFINITY)
+        .consistency_analysis(f32::INFINITY)
         .defect;
     let ratio = large / small;
     assert!(
@@ -137,7 +137,7 @@ fn claim_1_defect_sums_over_edges() {
         RestrictionMap::project_dim(2, 0),
         false,
     );
-    let h0 = cx.compute_h0(f32::INFINITY);
+    let h0 = cx.consistency_analysis(f32::INFINITY);
     let expected: f32 = 9.0 + 16.0;
     assert!(
         (h0.defect - expected).abs() < 1e-5,

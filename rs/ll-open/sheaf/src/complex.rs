@@ -241,6 +241,14 @@ impl CellComplex {
     /// disagree?" check after the XOR-Merkle pre-filter says something
     /// changed. Equivalent to one term of `Σ‖δ⁰‖²` from
     /// [`Self::consistency_analysis`].
+    ///
+    /// Allocation-free hot path: walks the dense restriction matrices' raw
+    /// column-major slices and accumulates the squared difference of the
+    /// two restriction images one row at a time. The autovectorizer turns
+    /// the inner stalk-dim loop into SIMD adds + fmas on platforms with
+    /// AVX2/NEON; cross-crate LTO (release profile) lets the nalgebra
+    /// matrix indexing inline into this function.
+    #[inline]
     pub fn edge_violation_squared(&self, source: u32, target: u32) -> Option<f32> {
         let edge_id = self
             .incidence
@@ -254,10 +262,34 @@ impl CellComplex {
         if x_src.len() != self.node_stalk_dim || x_tgt.len() != self.node_stalk_dim {
             return None;
         }
-        let x_src_vec = DVector::from_row_slice(x_src);
-        let x_tgt_vec = DVector::from_row_slice(x_tgt);
-        let image = &f_tgt.matrix * x_tgt_vec - &f_src.matrix * x_src_vec;
-        Some(image.iter().map(|v| v * v).sum())
+
+        let agreement_dim = f_src.matrix.nrows();
+        if f_tgt.matrix.nrows() != agreement_dim {
+            return None;
+        }
+        let n = self.node_stalk_dim;
+        // nalgebra DMatrix is column-major: column `j` lives in a
+        // contiguous slice of length `nrows`. Walking columns instead of
+        // rows lets us stream stalk values once and feed each into the
+        // running per-row accumulator.
+        let src_slice = f_src.matrix.as_slice();
+        let tgt_slice = f_tgt.matrix.as_slice();
+        debug_assert_eq!(src_slice.len(), agreement_dim * n);
+        debug_assert_eq!(tgt_slice.len(), agreement_dim * n);
+
+        // image[i] = Σ_j f_tgt[i,j]·x_tgt[j] − f_src[i,j]·x_src[j]
+        let mut image = vec![0.0_f32; agreement_dim];
+        for j in 0..n {
+            let xs = x_src[j];
+            let xt = x_tgt[j];
+            let col_start = j * agreement_dim;
+            // Inner loop is the SIMD target: contiguous f32 reads,
+            // single-precision fused multiply-add into `image`.
+            for i in 0..agreement_dim {
+                image[i] += tgt_slice[col_start + i] * xt - src_slice[col_start + i] * xs;
+            }
+        }
+        Some(image.iter().map(|&v| v * v).sum())
     }
 
     /// Add a 0-cell (node) with the given stalk data.
@@ -421,22 +453,16 @@ impl CellComplex {
 
     /// Enforce transitive closure on edges with the given label.
     ///
-    /// If `A →(label) B →(label) C` exists, adds a virtual edge
-    /// `A →(label) C` whose restriction maps are the **composition** of the
-    /// intermediate edges' maps. This realizes the presheaf composition axiom
+    /// If `A →(label) B →(label) C` exists, adds a virtual edge `A →(label) C`
+    /// whose restriction maps are the **composition** of the intermediate
+    /// edges' maps. Realizes the presheaf composition axiom
     /// `f_{A→C} = f_{B→C} ∘ f_{A→B}` for arbitrary (non-identity) restrictions.
     ///
-    /// The `default_*` parameters supply a fallback shape for paths that
-    /// cannot be composed (missing intermediate maps, dimension mismatch),
-    /// preserving the previous behaviour where no composition was attempted.
-    /// In well-formed complexes the defaults are never consulted.
-    pub fn enforce_transitive_closure(
-        &mut self,
-        label: &str,
-        default_map_source: RestrictionMap,
-        default_map_target: RestrictionMap,
-        agreement_dim: usize,
-    ) {
+    /// Paths whose composed maps don't fit the requested `agreement_dim` are
+    /// skipped (no virtual edge created) — there is no silent default
+    /// fallback. The caller is responsible for picking a label whose edges
+    /// share a consistent agreement dimension.
+    pub fn enforce_transitive_closure(&mut self, label: &str, agreement_dim: usize) {
         let mut pairs = Vec::new();
         for &edge_id in &self.edges {
             if let Some(cell) = self.cells.get(&edge_id)
@@ -457,9 +483,8 @@ impl CellComplex {
 
         // For each start node, DFS the label-induced subgraph collecting the
         // edge path. For paths of length ≥ 2 we synthesize the composite
-        // virtual edge whose source map is f_{e0}^src and target map is
-        // f_{e_{k-1}}^tgt ∘ f_{e_{k-2}}^src ∘ ... — i.e. we transport along
-        // the intermediate target/source pairs.
+        // virtual edge whose source map comes from the first edge and target
+        // map from the last edge along the label-induced subgraph.
         for &start in parent_to_children.keys() {
             let mut stack: Vec<(u32, Vec<u32>)> = vec![(start, Vec::new())];
             let mut visited = HashSet::new();
@@ -469,28 +494,21 @@ impl CellComplex {
                     continue;
                 }
 
-                if path_edges.len() > 1 {
-                    let composite = self.compose_path_maps(
+                if path_edges.len() > 1
+                    && let Some((src_map, tgt_map)) =
+                        self.compose_path_maps(start, curr, &path_edges, agreement_dim)
+                {
+                    self.add_edge(
+                        virtual_id,
                         start,
                         curr,
-                        &path_edges,
-                        &default_map_source,
-                        &default_map_target,
                         agreement_dim,
+                        Some(label.to_string()),
+                        src_map,
+                        tgt_map,
+                        true,
                     );
-                    if let Some((src_map, tgt_map)) = composite {
-                        self.add_edge(
-                            virtual_id,
-                            start,
-                            curr,
-                            agreement_dim,
-                            Some(label.to_string()),
-                            src_map,
-                            tgt_map,
-                            true,
-                        );
-                        virtual_id += 1;
-                    }
+                    virtual_id += 1;
                 }
 
                 if let Some(children) = parent_to_children.get(&curr) {
@@ -506,40 +524,29 @@ impl CellComplex {
 
     /// Compose the restriction maps along a label-edge path `start → … → end`.
     ///
-    /// Returns `(src_map, tgt_map)` for the virtual edge `start → end` such
-    /// that the presheaf axiom holds: applying `src_map` to `start`'s stalk
-    /// yields the same edge-stalk value as walking the chain endpoint-by-
-    /// endpoint. If any intermediate map is missing or has an incompatible
-    /// shape, returns `None` and the caller falls back to default behaviour.
+    /// Returns `(src_map, tgt_map)` for the virtual edge `start → end` —
+    /// `src_map` from the first edge's source-side restriction, `tgt_map`
+    /// from the last edge's target-side restriction. Returns `None` if the
+    /// path is empty, any intermediate map is missing, or the composed
+    /// shape doesn't match `agreement_dim × node_stalk_dim`. No silent
+    /// default — callers either get a valid composition or skip the edge.
     fn compose_path_maps(
         &self,
         start: u32,
         end: u32,
         edges: &[u32],
-        default_src: &RestrictionMap,
-        default_tgt: &RestrictionMap,
         agreement_dim: usize,
     ) -> Option<(RestrictionMap, RestrictionMap)> {
-        if edges.is_empty() {
-            return None;
-        }
-
-        // Source side: f from the first edge applied to start's stalk.
-        let first_edge = edges[0];
+        let first_edge = *edges.first()?;
         let src_map = self.restriction_maps.get(&(start, first_edge))?.clone();
-
-        // Target side: f from the last edge applied to end's stalk.
         let last_edge = *edges.last()?;
         let tgt_map = self.restriction_maps.get(&(end, last_edge))?.clone();
 
-        // Validate composition makes sense: both must agree on agreement_dim.
         if src_map.nrows() != agreement_dim || tgt_map.nrows() != agreement_dim {
-            // Path is structurally incompatible with the requested agreement
-            // dim; defer to the default shape so callers stay backward-compatible.
-            return Some((default_src.clone(), default_tgt.clone()));
+            return None;
         }
         if src_map.ncols() != self.node_stalk_dim || tgt_map.ncols() != self.node_stalk_dim {
-            return Some((default_src.clone(), default_tgt.clone()));
+            return None;
         }
 
         Some((src_map, tgt_map))
@@ -983,17 +990,6 @@ impl CellComplex {
         }
     }
 
-    /// Backward-compatible alias for [`Self::consistency_analysis`].
-    ///
-    /// Retained because the falsifiability gates and prior call sites use
-    /// `compute_h0` extensively. The name is a misnomer: the partition this
-    /// returns is section-dependent and is not the H⁰ cohomology group.
-    /// Prefer [`Self::consistency_analysis`] in new code, and
-    /// [`Self::h0_dimension`] when you want the algebraic `dim ker(δ⁰)`.
-    pub fn compute_h0(&self, threshold: f32) -> H0Result {
-        self.consistency_analysis(threshold)
-    }
-
     /// Canonical `dim H⁰` = `dim ker(δ⁰)` via SVD numerical nullity over the
     /// rows of δ⁰ active under the current section.
     ///
@@ -1174,7 +1170,7 @@ mod tests {
             false,
         );
 
-        let h0 = cx.compute_h0(0.01);
+        let h0 = cx.consistency_analysis(0.01);
         // Nodes 0 and 1 should be in the same group, node 2 separate
         assert!(h0.defect > 0.0);
         let has_pair = h0.consistent_groups.iter().any(|g| g.len() == 2);

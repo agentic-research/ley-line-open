@@ -10,7 +10,123 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
-Nothing yet — post-v0.3.0 changes land here.
+Nothing yet — post-v0.4.0 changes land here.
+
+## [0.4.0] — 2026-05-14
+
+Feature release: lifts the leyline-sheaf Čech cohomology engine from
+the private `ley-line` repo into LLO as a first-class OSS crate, wires
+it through the daemon's UDS + MCP surfaces (6 ops), and ships the
+δ⁰-driven cache invalidation contract as the load-bearing moat claim.
+Tracked by bead `ley-line-open-ae7a35`; merged via PR #16.
+
+Paired Go bindings tag: `clients/go/leyline-schema/v0.4.0`. mache
+adoption tracked under beads `mache-8e2e92` (typed bindings),
+`mache-8e59a5` (δ⁰ mode opt-in), `mache-8e7794` (cross-runtime test).
+
+### Added — new crate `leyline-sheaf`
+
+- `rs/ll-open/sheaf/` — 7 modules (`cache`, `complex`, `learn`,
+  `merkle`, `sparse`, `topology`, `lib`), ~2,300 LOC. Domain-
+  independent Čech cochain complex with δ⁰/δ¹ coboundary operators,
+  per-edge defect (`‖δ⁰‖²`) computation, restriction-map composition,
+  SHA-256 Merkle root, sparse matrix ops, and a `SheafCache<S, V>`
+  with bounded-BFS invalidation cascade.
+- `SheafCache::with_complex(cx)` / `set_complex(cx)` opt-in to
+  δ⁰-driven invalidation; `refresh_baseline()` snapshots the current
+  per-edge `‖δ⁰‖²` so subsequent `on_change` compares *change* in
+  defect, not absolute. Heuristic XOR-Merkle path remains the default.
+- `RestrictionMap::project_dim_range(stalk_dim, agreement_dim)` — the
+  canonical "shared contract subspace" selector used by both the
+  daemon wire-side `agreement_dim` shorthand and the real-repo bench.
+- 48 unit tests + 8 falsifiability gates (`tests/falsifiability_
+  gates.rs`) pin the math contract: `defect == ‖δ⁰‖²`, BFS
+  cascade contract, δ⁰ keeps neighbor valid when projection-image
+  unchanged.
+- Real-repo bench (`tests/real_repo_sheaf_bench.rs`) builds the sheaf
+  over this crate's own 7 source files (parser-derived `use crate::*`
+  import edges) and measures simulated parse-time. Result: δ⁰ saves
+  **66% parse time** on projected-away noise (3448 µs vs 10108 µs).
+
+### Added — daemon ops (UDS + MCP)
+
+Six new ops over the typed `BaseRequest` dispatch in
+`rs/ll-open/cli-lib/src/daemon/sheaf_ops.rs`:
+
+- `sheaf_set_topology` — push regions (with optional f32 stalk
+  `data`) + restriction edges (with optional `agreement_dim`) + the
+  request's `node_stalk_dim`. When the opt-in conditions are met,
+  the handler builds a backing `CellComplex` with implicit
+  `project_dim_range` restriction maps, runs `refresh_baseline()`,
+  and the response advertises `delta_zero_mode: true`.
+- `sheaf_invalidate` — report changed region ids (optionally with
+  new stalk hashes + f32 stalk data); runs the bounded BFS cascade
+  and returns the invalidated set + cache generation. f32 stalk
+  updates push into the complex via `set_stalk_value`.
+- `sheaf_defect` — total `Σ‖δ⁰‖²` + cache validity counts.
+- `sheaf_stalks` — `generation`, `valid`, `total`.
+- `sheaf_status` — combined health snapshot (+ `tracked_edges`).
+- `sheaf_learned_weights` — co-change-derived per-edge coupling rates
+  from the `CoChangeTracker`.
+
+`SheafState` lives on `DaemonContext` with cache + tracker + event-bus
+emitter. Topology + invalidation events emit on the ADR-010 bus
+(`sheaf.topology` / `sheaf.invalidate`).
+
+### Added — capnp schema (additive per ADR-0014 §2)
+
+`rs/ll-core/public-schema/capnp/daemon.capnp`:
+
+- `SheafStalk` (with optional `data :List(Float32)`)
+- `SheafRestriction` (with optional `agreementDim :UInt32`)
+- `SheafSetTopologyRequest` (with `nodeStalkDim`)
+- `SheafSetTopologyResponse` (with `deltaZeroMode`)
+- `SheafInvalidateRequest`, `SheafInvalidateResponse`
+- `SheafDefectResponse`, `SheafStalksResponse`, `SheafStatusResponse`
+- `SheafLearnedWeight`, `SheafLearnedWeightsResponse`
+
+Go bindings regenerated; cross-runtime drift gate
+(`clients/go/leyline-schema/daemon/daemon_protocol_test.go`) covers
+all 6 ops.
+
+### Performance
+
+- Workspace release profile bumped to `lto = "thin"` +
+  `codegen-units = 1` so per-edge δ⁰ inlines through nalgebra's
+  matrix indexing and the autovectorizer sees contiguous f32 ops
+  across the crate boundary.
+- `CellComplex::edge_violation_squared` rewritten as an alloc-free
+  column-major sweep over the raw restriction-matrix slices;
+  `#[inline]` so the cache hot path doesn't pay function-call cost.
+
+### Fixed — math correctness (from the math-friend audit on PR #16)
+
+- `detect_violations` asymmetric check (only flagged negative-margin
+  δ⁰): now symmetric on `|val| > EPS`.
+- `add_edge` accepting wrong-shape restriction maps: now asserts
+  `ncols == node_stalk_dim` and `nrows == agreement_dim`.
+- `enforce_transitive_closure` cloning unrelated defaults: now
+  composes the actual stored maps along the path via
+  `compose_path_maps`; paths whose composition doesn't fit the
+  requested agreement dim are skipped (no silent fallback).
+- δ¹ orientation hardcoded `+1.0`: now records ±1 signs via
+  `signed_lookup` so cycles traversing edges against their natural
+  direction contribute correctly. `add_face` panics on garbage
+  (empty edges, duplicates, unknown ids, non-cycle).
+- `compute_h0` was misnamed (returned a section-dependent partition
+  not the cohomology group): renamed to `consistency_analysis`;
+  `h0_dimension` documented as the canonical `dim ker(δ⁰)`.
+- `compute_merkle_root([])` returned all-zeros (collision risk): now
+  returns `H(0x02 || "empty")`, domain-separated.
+- HashMap → BTreeMap throughout the cache + complex iteration paths
+  for deterministic ordering. Cascade is now genuine BFS (VecDeque +
+  pop_front), not the DFS that `Vec::pop` produced.
+
+### Bumped — workspace crate versions
+
+All workspace crates: `0.3.0` → `0.4.0` (and `leyline-sheaf`:
+`0.1.0` → `0.4.0` for uniformity, matching the v0.3.0 sync). OCI
+image tag: `ley-line-open:0.3.0` → `ley-line-open:0.4.0`.
 
 ## [0.3.0] — 2026-05-12
 

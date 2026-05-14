@@ -433,7 +433,7 @@ impl CellComplex {
         }
         assert_eq!(
             cursor, start,
-            "add_face: face {face_id} edges do not close back to start {start}; final cursor is {cursor}",
+            "add_face: face {face_id} edges do not form a cycle — final cursor is {cursor}, expected to close back to start {start}",
         );
 
         self.face_cells.insert(
@@ -1262,5 +1262,190 @@ mod tests {
 
         cx.generate_faces_from_cycles("dep", 100);
         cx.assert_cochain_complex(); // Should not panic
+    }
+
+    // -----------------------------------------------------------------------
+    // δ¹ orientation: cycles that traverse an edge against its natural
+    // direction must record a -1 sign on that edge. Build a triangle whose
+    // third edge is stored as 0→2 (instead of 2→0); a natural traversal
+    // 0→1→2→0 must walk 0→2 in reverse and produce sign -1.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn generate_faces_from_cycles_records_negative_sign_on_reverse_edge() {
+        let mut cx = CellComplex::new(1);
+        cx.add_node(0, vec![1.0]);
+        cx.add_node(1, vec![1.0]);
+        cx.add_node(2, vec![1.0]);
+
+        let proj = RestrictionMap::identity(1);
+        // Natural directions: 0→1, 1→2, 0→2 (note the last is NOT 2→0).
+        cx.add_edge(
+            100,
+            0,
+            1,
+            1,
+            Some("dep".into()),
+            proj.clone(),
+            proj.clone(),
+            false,
+        );
+        cx.add_edge(
+            101,
+            1,
+            2,
+            1,
+            Some("dep".into()),
+            proj.clone(),
+            proj.clone(),
+            false,
+        );
+        cx.add_edge(
+            102,
+            0,
+            2,
+            1,
+            Some("dep".into()),
+            proj.clone(),
+            proj.clone(),
+            false,
+        );
+
+        let created = cx.generate_faces_from_cycles("dep", 10);
+        assert!(
+            created >= 1,
+            "expected at least one face for triangle 0→1→2→0; got {created}"
+        );
+
+        // At least one generated face must carry a -1 sign on edge 102 —
+        // the cycle traverses 2→0 (reverse of stored 0→2).
+        let face_with_reverse = cx.face_cells.values().find(|face| {
+            face.edges
+                .iter()
+                .any(|&(eid, sign)| eid == 102 && sign == -1.0)
+        });
+        assert!(
+            face_with_reverse.is_some(),
+            "no generated face carries sign -1 on edge 102; faces: {:?}",
+            cx.face_cells.values().map(|f| &f.edges).collect::<Vec<_>>(),
+        );
+
+        cx.assert_cochain_complex();
+    }
+
+    // -----------------------------------------------------------------------
+    // add_face panic tests — fire the new validation asserts on malformed
+    // input. Without these, garbage faces silently flowed into δ¹.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "has no edges")]
+    fn add_face_rejects_empty_edge_list() {
+        let mut cx = CellComplex::new(1);
+        cx.add_face(999, &[], 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than once")]
+    fn add_face_rejects_duplicate_edges() {
+        let mut cx = CellComplex::new(1);
+        cx.add_node(0, vec![1.0]);
+        cx.add_node(1, vec![1.0]);
+        let p = RestrictionMap::identity(1);
+        cx.add_edge(100, 0, 1, 1, None, p.clone(), p, false);
+        cx.add_face(999, &[(100, 1.0), (100, 1.0)], 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown edge")]
+    fn add_face_rejects_unknown_edge_id() {
+        let mut cx = CellComplex::new(1);
+        cx.add_face(999, &[(42, 1.0)], 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "do not form a cycle")]
+    fn add_face_rejects_non_cycle() {
+        let mut cx = CellComplex::new(1);
+        cx.add_node(0, vec![1.0]);
+        cx.add_node(1, vec![1.0]);
+        cx.add_node(2, vec![1.0]);
+        let p = RestrictionMap::identity(1);
+        cx.add_edge(100, 0, 1, 1, None, p.clone(), p.clone(), false);
+        cx.add_edge(101, 1, 2, 1, None, p.clone(), p, false);
+        // Path 0→1→2 doesn't close back to 0.
+        cx.add_face(999, &[(100, 1.0), (101, 1.0)], 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // enforce_transitive_closure: A→B→C path with non-identity restrictions
+    // must synthesize a virtual A→C edge whose source map is f_A^{AB} and
+    // target map is f_C^{BC}. Previously cloned unrelated defaults; now
+    // pulls the actual stored maps along the composed path.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn enforce_transitive_closure_uses_path_endpoint_maps_not_defaults() {
+        let mut cx = CellComplex::new(2);
+        cx.add_node(0, vec![1.0, 0.0]);
+        cx.add_node(1, vec![1.0, 0.0]);
+        cx.add_node(2, vec![1.0, 0.0]);
+
+        // Edge 0→1 uses project_dim(2, 0); edge 1→2 uses project_dim(2, 1).
+        // The natural composition for A→C should use 0→1's source map on A
+        // and 1→2's target map on C — distinct from each other.
+        let p0 = RestrictionMap::project_dim(2, 0);
+        let p1 = RestrictionMap::project_dim(2, 1);
+        cx.add_edge(
+            100,
+            0,
+            1,
+            1,
+            Some("dep".into()),
+            p0.clone(),
+            p0.clone(),
+            false,
+        );
+        cx.add_edge(
+            101,
+            1,
+            2,
+            1,
+            Some("dep".into()),
+            p1.clone(),
+            p1.clone(),
+            false,
+        );
+
+        let virtual_id_floor = *cx.edges.iter().max().unwrap() + 1;
+        cx.enforce_transitive_closure("dep", 1);
+
+        // A virtual edge 0→2 must exist after closure.
+        let virtual_edge_id = cx
+            .edges
+            .iter()
+            .find(|&&eid| eid >= virtual_id_floor && cx.incidence.get(&eid) == Some(&(0u32, 2u32)))
+            .copied()
+            .expect("enforce_transitive_closure must synthesize a virtual 0→2 edge");
+
+        let src_map = cx
+            .restriction_maps
+            .get(&(0, virtual_edge_id))
+            .expect("virtual edge needs source map on node 0");
+        let tgt_map = cx
+            .restriction_maps
+            .get(&(2, virtual_edge_id))
+            .expect("virtual edge needs target map on node 2");
+
+        // Source map mirrors p0 (from edge 100 stored as (0, 100)).
+        assert_eq!(
+            src_map.matrix, p0.matrix,
+            "virtual src_map must equal first-edge source map"
+        );
+        // Target map mirrors p1 (from edge 101 stored as (2, 101)).
+        assert_eq!(
+            tgt_map.matrix, p1.matrix,
+            "virtual tgt_map must equal last-edge target map"
+        );
     }
 }

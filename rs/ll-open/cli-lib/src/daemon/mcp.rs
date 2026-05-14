@@ -195,7 +195,7 @@ fn tool_registry() -> Vec<McpTool> {
         },
         McpTool {
             name: "sheaf_set_topology",
-            description: "Set the sheaf cache's community structure: regions (each with a content-hash stalk) and restriction edges (boundary hash + co-change rate + per-dim weights).",
+            description: "Set the sheaf cache's community structure: regions (content-hash stalks, optionally with f32 stalk vectors for δ⁰ mode) and restriction edges (boundary hash + co-change rate + per-dim weights, optionally with agreement_dim for δ⁰ mode). Pass `node_stalk_dim > 0` AND f32 `data` on every region AND `agreement_dim > 0` on every restriction to engage δ⁰-driven invalidation.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -205,7 +205,8 @@ fn tool_registry() -> Vec<McpTool> {
                             "type": "object",
                             "properties": {
                                 "id":   {"type": "integer"},
-                                "hash": {"type": "string", "description": "Hex-encoded 32-byte content hash."}
+                                "hash": {"type": "string", "description": "Hex-encoded 32-byte content hash."},
+                                "data": {"type": "array", "items": {"type": "number"}, "description": "Optional f32 stalk vector for δ⁰ mode."}
                             },
                             "required": ["id"]
                         }
@@ -220,17 +221,19 @@ fn tool_registry() -> Vec<McpTool> {
                                 "boundary_hash":  {"type": "string"},
                                 "co_change_rate": {"type": "number"},
                                 "revert_rate":    {"type": "number"},
-                                "weights":        {"type": "array", "items": {"type": "number"}}
+                                "weights":        {"type": "array", "items": {"type": "number"}},
+                                "agreement_dim":  {"type": "integer", "description": "Opt-in to δ⁰ mode: project first N coords. 0 = heuristic only."}
                             },
                             "required": ["a", "b"]
                         }
-                    }
+                    },
+                    "node_stalk_dim": {"type": "integer", "description": "Stalk dimension for δ⁰ mode. 0 = heuristic only."}
                 }
             }),
         },
         McpTool {
             name: "sheaf_invalidate",
-            description: "Report changed region ids (optionally with new stalk hashes); runs the bounded BFS cascade and returns the invalidated set + cache generation.",
+            description: "Report changed region ids (optionally with new stalk hashes + f32 stalk data); runs the bounded BFS cascade and returns the invalidated set + cache generation.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -241,7 +244,8 @@ fn tool_registry() -> Vec<McpTool> {
                             "type": "object",
                             "properties": {
                                 "id":   {"type": "integer"},
-                                "hash": {"type": "string"}
+                                "hash": {"type": "string"},
+                                "data": {"type": "array", "items": {"type": "number"}}
                             },
                             "required": ["id"]
                         }

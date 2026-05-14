@@ -213,7 +213,13 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
         BaseRequest::SheafSetTopology {
             regions,
             restrictions,
-        } => super::sheaf_ops::op_sheaf_set_topology(&ctx.sheaf, &regions, &restrictions),
+            node_stalk_dim,
+        } => super::sheaf_ops::op_sheaf_set_topology(
+            &ctx.sheaf,
+            &regions,
+            &restrictions,
+            node_stalk_dim,
+        ),
         BaseRequest::SheafInvalidate { regions, stalks } => {
             super::sheaf_ops::op_sheaf_invalidate(&ctx.sheaf, &regions, &stalks)
         }

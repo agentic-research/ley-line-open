@@ -247,9 +247,10 @@ type queryResponse struct {
 // ── Sheaf ops (ae7a35) ─────────────────────────────────────────────
 
 type sheafSetTopologyResponse struct {
-	OK           *bool   `json:"ok"`
-	Regions      *uint32 `json:"regions"`
-	Restrictions *uint32 `json:"restrictions"`
+	OK            *bool   `json:"ok"`
+	Regions       *uint32 `json:"regions"`
+	Restrictions  *uint32 `json:"restrictions"`
+	DeltaZeroMode *bool   `json:"delta_zero_mode"`
 }
 
 type sheafInvalidateResponse struct {

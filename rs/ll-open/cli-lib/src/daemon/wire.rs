@@ -115,6 +115,8 @@ pub enum BaseRequest {
         regions: Vec<crate::daemon::sheaf_ops::SheafStalkInput>,
         #[serde(default)]
         restrictions: Vec<crate::daemon::sheaf_ops::SheafRestrictionInput>,
+        #[serde(default)]
+        node_stalk_dim: u32,
     },
     SheafInvalidate {
         #[serde(default)]

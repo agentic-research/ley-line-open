@@ -1,49 +1,55 @@
 //! Real-repo sheaf bench: file-as-cell, identifier-set as agreement subspace.
 //!
 //! Points the sheaf machinery at the leyline-sheaf crate's own source files
-//! (a real-world Rust module graph: 7 files, 4 import edges) and measures
-//! how many cache regions a δ⁰-driven [`SheafCache`] invalidates versus
-//! the XOR-Merkle heuristic for a sequence of realistic edits.
+//! and measures eviction precision AND simulated parse-time savings of a
+//! δ⁰-driven [`SheafCache`] versus the XOR-Merkle heuristic across a
+//! sequence of realistic edits.
 //!
 //! ## Design
 //!
 //! - **0-cells** = source files (`.rs` files under `src/`)
 //! - **Stalk** = fixed-width f32 vector summarising the file:
-//!   - `[0]` line count
-//!   - `[1]` function count (`pub fn` + `fn`)
-//!   - `[2..STALK_DIM]` blake-derived hash bits of the exported-identifier
-//!     set — the "what does this file contract about?" projection
-//! - **1-cells** = `use crate::other_module::*` import edges. The
-//!   restriction map for both endpoints is a `(STALK_DIM-2) × STALK_DIM`
-//!   selector matrix: extracts dims `[2..]` only (the identifier hash
-//!   bits). Dims `[0]` and `[1]` (line / function counts) are the
-//!   "private" dimensions that don't propagate through the sheaf.
+//!   - `[0..AGREEMENT_DIM]` blake-derived hash bits of the exported-
+//!     identifier set — the "what does this file contract about?"
+//!     subspace that agreement-checks against
+//!   - `[AGREEMENT_DIM..STALK_DIM]` "private" dims: line count + fn
+//!     count + any local content fingerprint that doesn't affect what
+//!     downstream importers see
+//! - **1-cells** = `use crate::other_module*` import edges, derived by
+//!   actually parsing each file (no hard-coded edge list). The
+//!   restriction map for both endpoints is the canonical "project the
+//!   first AGREEMENT_DIM coords" — same shape the daemon's
+//!   `sheaf_set_topology` op uses when `agreement_dim` is supplied.
 //!
 //! ## Edit scenarios
 //!
-//! - **Real disagreement.** Change an identifier in a file that another
-//!   file imports — both the file's identifier-hash bits AND its line
-//!   count flip; the importer's cache entry must invalidate under both
-//!   modes. (Sanity: heuristic and δ⁰ agree here.)
-//! - **Projected-away noise.** Add 50 blank lines to a file — line count
+//! - **Real disagreement.** Add a `pub fn` to a file — identifier-hash
+//!   bits flip; importers cascade-invalidate under both modes.
+//! - **Projected-away noise.** Add blank lines to a file — line count
 //!   flips, identifier-hash bits unchanged. Heuristic invalidates every
 //!   importer (over-eviction); δ⁰ keeps them valid.
 //! - **Isolated node.** Edit a file with no incoming/outgoing import
 //!   edges. Both modes invalidate just that file.
 //!
-//! ## Output
+//! ## What gets measured
 //!
-//! Asserts the δ⁰-driven cache invalidates strictly fewer entries than
-//! the heuristic on the projected-away-noise scenario. The two are equal
-//! on real-disagreement and isolated edits. Prints a summary table.
+//! 1. **Eviction count** — strict inequality on projected-away noise.
+//! 2. **Simulated parse time** — each "parse" hashes every line of the
+//!    file content (real f32 work). Summed across the invalidated set.
+//!    δ⁰ mode strictly less total parse-time on projected-away noise.
+//!
+//! The simulated parse stands in for tree-sitter's actual reparse cost;
+//! pulling leyline-ts into this crate's dev deps just to time it isn't
+//! worth the dependency. The per-file workload is proportional to file
+//! size, so the precision win is real on a realistic-shape graph.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use leyline_sheaf::cache::{RestrictionEdge, SheafCache, StalkHash};
 use leyline_sheaf::complex::{CellComplex, RestrictionMap};
-use nalgebra::DMatrix;
 use sha2::{Digest, Sha256};
 
 const STALK_DIM: usize = 32;
@@ -63,16 +69,19 @@ impl StalkHash for FileStalk {
     }
 }
 
-/// Build a stalk vector from raw file content. `line_count` and
-/// `fn_count` are the "private" dimensions; the remaining 30 dims are
-/// derived from a SHA-256 of the file's exported-identifier set.
+/// Build a stalk vector from raw file content. Layout:
+///   `data[0..AGREEMENT_DIM]` = SHA-256 of the exported-identifier set
+///     (the "agreement subspace" downstream importers project to)
+///   `data[AGREEMENT_DIM..]` = "private" dims (line count, fn count,
+///     content-length bucket) — these don't propagate through the sheaf
+///
+/// Agreement-first ordering lets the daemon's `agreement_dim` shorthand
+/// ("project first N coords") apply directly — the same restriction
+/// shape the bench passes to `RestrictionMap::project_dim_range`.
 fn stalk_from_content(content: &str) -> FileStalk {
     let line_count = content.lines().count() as f32;
     let fn_count = content.matches("fn ").count() as f32;
 
-    // Extract identifiers from `pub fn`, `pub struct`, `pub enum`, `pub mod`
-    // declarations. Real-world projects use richer extractors; this is
-    // enough for the bench's "file's exported contract" notion.
     let mut idents: Vec<&str> = Vec::new();
     for kw in [
         "pub fn ",
@@ -98,14 +107,20 @@ fn stalk_from_content(content: &str) -> FileStalk {
     let id_hash: [u8; 32] = hasher.finalize().into();
 
     let mut data = Vec::with_capacity(STALK_DIM);
-    data.push(line_count);
-    data.push(fn_count);
-    for &byte in &id_hash[..(STALK_DIM - 2)] {
+    // Agreement subspace FIRST so `project_dim_range(STALK_DIM, AGREEMENT_DIM)`
+    // matches the daemon's wire-side `agreement_dim` shorthand.
+    for &byte in &id_hash[..AGREEMENT_DIM] {
         data.push(byte as f32);
     }
+    // Private dims after — line count, fn count, byte-length bucket.
+    data.push(line_count);
+    data.push(fn_count);
+    // (Only AGREEMENT_DIM + 2 dims; pad to STALK_DIM if the constants
+    // ever skew.)
+    while data.len() < STALK_DIM {
+        data.push(0.0);
+    }
 
-    // Full content hash drives the cache's XOR pre-filter — distinct
-    // from the identifier-projection that drives δ⁰.
     let mut content_hasher = Sha256::new();
     content_hasher.update(content.as_bytes());
     let content_hash: [u8; 32] = content_hasher.finalize().into();
@@ -113,13 +128,51 @@ fn stalk_from_content(content: &str) -> FileStalk {
     FileStalk { data, content_hash }
 }
 
-/// Selector matrix that projects `[0..STALK_DIM]` → `[2..STALK_DIM]`.
+/// Canonical "project the first AGREEMENT_DIM coords" restriction map.
 fn identifier_projection() -> RestrictionMap {
-    let mut m = DMatrix::zeros(AGREEMENT_DIM, STALK_DIM);
-    for i in 0..AGREEMENT_DIM {
-        m[(i, i + 2)] = 1.0;
+    RestrictionMap::project_dim_range(STALK_DIM, AGREEMENT_DIM)
+}
+
+/// Parse `use crate::...` lines and return the imported top-level module
+/// names. This is what closes gap #3 — the bench no longer hard-codes the
+/// edge graph. Tolerates `use crate::foo::bar`, `use crate::foo;`,
+/// `use crate::foo::{Bar, Baz}`, and `use crate::foo as Quux`.
+fn extract_crate_imports(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        let rest = match trimmed.strip_prefix("use crate::") {
+            Some(r) => r,
+            None => continue,
+        };
+        let end = rest
+            .find(|c: char| matches!(c, ':' | ';' | ' ' | '{' | ','))
+            .unwrap_or(rest.len());
+        let module = &rest[..end];
+        if !module.is_empty() {
+            out.push(module.to_string());
+        }
     }
-    RestrictionMap::new(m)
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Simulated parse cost: hashes every line of the file. Real work —
+/// not just `sleep` or counting — so the LLVM optimizer can't elide it.
+/// Returns elapsed micros (consumer summarises across invalidated set).
+fn simulated_parse_cost(content: &str) -> u128 {
+    let start = Instant::now();
+    let mut hasher = Sha256::new();
+    for line in content.lines() {
+        // Per-line hashing approximates the per-symbol cost a real
+        // tree-sitter pass pays. Run it twice so timing has signal even
+        // on tiny files.
+        hasher.update(line.as_bytes());
+        hasher.update(line.as_bytes());
+    }
+    let _digest: [u8; 32] = hasher.finalize().into();
+    start.elapsed().as_micros()
 }
 
 fn boundary_xor(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
@@ -173,19 +226,33 @@ fn seed_topology() -> (
         complex.add_node(*id, stalk.data.clone());
     }
 
-    // Hard-coded import graph reflecting the actual `use crate::...`
-    // declarations in this crate (verified by `grep -E "^use crate::"`):
-    //   cache.rs    -> complex, topology
-    //   complex.rs  -> sparse
-    //   learn.rs    -> topology
-    let edges: &[(u32, u32)] = &[
-        (1, 2), // cache -> complex
-        (1, 6), // cache -> topology
-        (2, 5), // complex -> sparse
-        (3, 6), // learn -> topology
-    ];
+    // Parser-derived import graph (gap #3): walk each source file's
+    // `use crate::*` lines, resolve each imported module to its region
+    // id by file basename. No more hard-coded edge list — `git mv
+    // learn.rs -> learning.rs` and the bench picks up the change.
+    let id_by_module: BTreeMap<&str, u32> = files
+        .iter()
+        .map(|(id, name, _)| (name.trim_end_matches(".rs"), *id))
+        .collect();
+    let mut edges: Vec<(u32, u32)> = Vec::new();
+    for (id, _name, path) in &files {
+        let content = fs::read_to_string(path).expect("source file readable");
+        for module in extract_crate_imports(&content) {
+            if let Some(&target) = id_by_module.get(module.as_str())
+                && target != *id
+            {
+                edges.push((*id, target));
+            }
+        }
+    }
+    edges.sort();
+    edges.dedup();
+    assert!(
+        !edges.is_empty(),
+        "parser must derive at least one import edge from this crate's sources"
+    );
     let mut edge_id_seq = 100u32;
-    for &(a, b) in edges {
+    for &(a, b) in &edges {
         complex.add_edge(
             edge_id_seq,
             a,
@@ -205,7 +272,7 @@ fn seed_topology() -> (
         cache.set_stalk_value(*id, stalk.data.clone());
         cache.put(*id, "parsed-ast");
     }
-    for &(a, b) in edges {
+    for &(a, b) in &edges {
         let stalk_a = &stalks.iter().find(|(id, _)| *id == a).unwrap().1;
         let stalk_b = &stalks.iter().find(|(id, _)| *id == b).unwrap().1;
         let edge = RestrictionEdge {
@@ -328,10 +395,32 @@ fn real_repo_bench_delta_zero_strictly_more_precise_on_projected_away_noise() {
             count: 50,
         },
     );
+    // Sum a simulated parse cost across each side's invalidated set so
+    // the bench output carries a parse-time signal, not just an eviction
+    // count. The cost is per-line SHA-256 work — real CPU time, not a
+    // sleep — proportional to file size.
+    let parse_us = |regions: &[u32]| -> u128 {
+        regions
+            .iter()
+            .map(|&r| {
+                let path = enumerate_source_files()
+                    .into_iter()
+                    .find(|(id, _, _)| *id == r)
+                    .map(|(_, _, p)| p)
+                    .expect("region in enumeration");
+                let content = fs::read_to_string(path).expect("readable");
+                simulated_parse_cost(&content)
+            })
+            .sum()
+    };
+    let delta_zero_us = parse_us(&delta_zero);
+    let heuristic_us = parse_us(&heuristic);
     eprintln!(
-        "[bench] AddBlankLines(cache.rs)  δ⁰ evictions={} heuristic evictions={} names_δ⁰={:?} names_heur={:?}",
+        "[bench] AddBlankLines(cache.rs)  δ⁰ evictions={} ({} µs) heuristic evictions={} ({} µs) names_δ⁰={:?} names_heur={:?}",
         delta_zero.len(),
+        delta_zero_us,
         heuristic.len(),
+        heuristic_us,
         delta_zero.iter().map(|r| name_by_id[r]).collect::<Vec<_>>(),
         heuristic.iter().map(|r| name_by_id[r]).collect::<Vec<_>>(),
     );
@@ -345,6 +434,11 @@ fn real_repo_bench_delta_zero_strictly_more_precise_on_projected_away_noise() {
     assert!(
         delta_zero.contains(&1),
         "the edited region must always be invalidated"
+    );
+    assert!(
+        delta_zero_us < heuristic_us,
+        "δ⁰ simulated parse-time must be strictly less than heuristic on projected-away noise; \
+         got δ⁰={delta_zero_us}µs heuristic={heuristic_us}µs",
     );
 
     // Scenario 2: AddExportedFn on complex.rs (region 2). complex.rs's

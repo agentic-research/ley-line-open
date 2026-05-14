@@ -165,6 +165,16 @@ impl<S: StalkHash, V> SheafCache<S, V> {
         self
     }
 
+    /// Mutable equivalent of [`Self::with_complex`] — attach (or replace) the
+    /// backing complex on an existing cache. Use when the cache is built
+    /// heuristic-only and δ⁰ mode is opted into at a later point (e.g. the
+    /// daemon's `sheaf_set_topology` op when the request carries f32 stalk
+    /// data).
+    pub fn set_complex(&mut self, complex: CellComplex) {
+        self.complex = Some(complex);
+        self.delta_zero_baseline.clear();
+    }
+
     /// Borrow the attached [`CellComplex`], if any.
     pub fn complex(&self) -> Option<&CellComplex> {
         self.complex.as_ref()

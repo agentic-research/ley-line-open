@@ -75,6 +75,24 @@ impl RestrictionMap {
         }
     }
 
+    /// Project the first `agreement_dim` coordinates of an `stalk_dim`-wide
+    /// stalk onto a same-shaped agreement subspace. Equivalent to selecting
+    /// rows of an identity matrix; cheap to build, cheap to evaluate, and
+    /// the natural restriction shape for the daemon's wire-side
+    /// `agreement_dim` field where the caller hasn't supplied a custom
+    /// matrix.
+    pub fn project_dim_range(stalk_dim: usize, agreement_dim: usize) -> Self {
+        assert!(
+            agreement_dim <= stalk_dim,
+            "agreement_dim ({agreement_dim}) cannot exceed stalk_dim ({stalk_dim})",
+        );
+        let mut m = DMatrix::zeros(agreement_dim, stalk_dim);
+        for i in 0..agreement_dim {
+            m[(i, i)] = 1.0;
+        }
+        Self { matrix: m }
+    }
+
     /// Create a weighted projection: extracts `coords` with `weights`.
     pub fn weighted(stalk_dim: usize, coords_weights: &[(usize, f32)]) -> Self {
         let mut m = DMatrix::zeros(1, stalk_dim);

@@ -1077,6 +1077,7 @@ fn hash_segment_files(db_path: &Path) -> Result<([u8; 32], u64)> {
 ///   - 4 bytes: `segment_count - 1` (== 0 for single-segment)
 ///   - 4 bytes: segment length in words
 ///   - segment_length * 8 bytes: segment data
+///
 /// No padding required since the header is already 8-byte aligned.
 fn hash_canonical_stream_fast(file_bytes: &[u8], hasher: &mut blake3::Hasher) -> Option<u64> {
     const WORD_BYTES: usize = 8;

@@ -264,6 +264,54 @@ fn claim_2_on_change_advances_generation_monotonically() {
 }
 
 #[test]
+fn claim_2c_changed_roots_are_returned_even_when_entries_are_empty() {
+    // Pin the on_change wire contract that the d03e7d fix established and
+    // PR #19 review surfaced as missing from the docstring: cascade roots
+    // appear in the returned list even when the local `entries` map is
+    // empty AND when their own boundary projection is unchanged. The
+    // caller's "this changed" is taken as input, not measured.
+    //
+    // Pre-d03e7d, this test would have returned `invalidated: []` because
+    // the push was gated on `entries.get_mut(...) == Some(_)`. Post-fix,
+    // the changed root appears unconditionally; only cascade NEIGHBORS
+    // are gated on the boundary check.
+    let mut cache: SheafCache<TestStalk, &'static str> = SheafCache::new();
+    let sa = make_stalk(1);
+    let sb = make_stalk(2);
+    cache.set_stalk(0, sa.clone());
+    cache.set_stalk(1, sb.clone());
+
+    // Boundary hash matches current XOR → boundary IS unchanged.
+    cache.set_restriction(
+        0,
+        1,
+        RestrictionEdge {
+            weights: vec![1.0],
+            co_change_rate: 0.0,
+            revert_rate: 0.0,
+            boundary_hash: boundary_xor(&sa.merkle_root(), &sb.merkle_root()),
+        },
+    );
+
+    // Deliberately NO cache.put — this mimics a UDS / MCP consumer that
+    // owns its own cache and never registers an entry on the daemon side.
+    // No stalk mutation either — boundary projection does not move.
+    let invalidated = cache.on_change(&[0]);
+
+    assert!(
+        invalidated.contains(&0),
+        "claim 2c: cascade root MUST appear in the returned list even when \
+         entries is empty AND boundary is unchanged (caller's assertion is \
+         taken as input, not measured); got {invalidated:?}"
+    );
+    assert!(
+        !invalidated.contains(&1),
+        "claim 2c: cascade NEIGHBOR must NOT appear when boundary projection \
+         is unchanged (only roots are unconditional); got {invalidated:?}"
+    );
+}
+
+#[test]
 fn claim_2_unchanged_neighbors_with_matching_boundary_hash_remain_valid() {
     // If a region's stalk is changed but its NEW state still matches
     // the cached boundary hash with a neighbor (vanishingly unlikely

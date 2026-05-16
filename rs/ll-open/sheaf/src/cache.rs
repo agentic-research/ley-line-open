@@ -34,13 +34,21 @@
 //!
 //! ## `on_change` return semantics
 //!
-//! [`SheafCache::on_change`] returns the list of regions whose boundary
-//! projection moved beyond `DELTA0_EPS_SQUARED` (or whose XOR pre-filter
-//! fired, in heuristic-only mode). This is a **structural answer about
-//! the sheaf section** — it is NOT "regions to evict from this cache". In
-//! particular, regions are reported even when this cache holds no entry
-//! for them, because UDS / MCP consumers own their own caches and need
-//! the full cascade list to evict on their side.
+//! [`SheafCache::on_change`] returns a list that always contains the
+//! `changed_regions` the caller passed in (the cascade roots), plus any
+//! BFS-reachable neighbors whose boundary projection moved beyond
+//! `DELTA0_EPS_SQUARED` (or whose XOR pre-filter fired, in heuristic-only
+//! mode). The cascade roots appear unconditionally — they are the
+//! caller's assertion about what changed, not a measurement — so the
+//! list is never empty for a non-empty `changed_regions` input.
+//!
+//! Neighbor entries reflect the boundary check on each (root, neighbor)
+//! edge; a root whose stalk did not move propagates no neighbors. This is
+//! a **structural answer about the sheaf section** — it is NOT "regions
+//! to evict from this cache". In particular, regions are reported even
+//! when this cache holds no entry for them, because UDS / MCP consumers
+//! own their own caches and need the full cascade list to evict on their
+//! side.
 //!
 //! The local `entries.valid = false` side-effect still happens for
 //! in-process callers that DO have entries — but it is a side-effect on
@@ -242,14 +250,18 @@ impl<S: StalkHash, V> SheafCache<S, V> {
     /// breadth-first through restriction edges, bounded by `max_cascade_budget`
     /// (heuristic depth, not a sheaf invariant — see module docs).
     ///
-    /// Returns the set of region IDs whose boundary projection moved beyond
-    /// `DELTA0_EPS_SQUARED` (or whose XOR pre-filter fired, in heuristic-only
-    /// mode). This is a structural answer about the sheaf section, not a
-    /// statement about the local `entries` map: regions are reported even
-    /// when the in-process cache has no entry for them. UDS / MCP consumers
-    /// own their own caches and need the full cascade list to evict on
-    /// their side; the local `entries.valid = false` side-effect still
-    /// happens for in-process callers that DO have entries.
+    /// Returns a list that always contains the `changed_regions` the caller
+    /// passed in (the cascade roots — they appear even when their own
+    /// boundary is unchanged, because the caller's assertion that the
+    /// region changed is taken as input), plus any BFS-reachable neighbors
+    /// whose boundary projection moved beyond `DELTA0_EPS_SQUARED` (or
+    /// whose XOR pre-filter fired, in heuristic-only mode). This is a
+    /// structural answer about the sheaf section, not a statement about
+    /// the local `entries` map: regions are reported even when the
+    /// in-process cache has no entry for them. UDS / MCP consumers own
+    /// their own caches and need the full cascade list to evict on their
+    /// side; the local `entries.valid = false` side-effect still happens
+    /// for in-process callers that DO have entries.
     pub fn on_change(&mut self, changed_regions: &[RegionId]) -> Vec<RegionId> {
         self.generation += 1;
         let mut invalidated = Vec::new();

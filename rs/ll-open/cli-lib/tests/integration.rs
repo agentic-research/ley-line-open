@@ -3160,6 +3160,14 @@ async fn daemon_protocol_gate_handlers_emit_required_keys() {
 /// Pins gap #1 from the post-bench audit (`cb15ada` commit message):
 /// the daemon op surface must actually drive δ⁰ mode for a real UDS
 /// consumer, not just the in-process `SheafCache::with_complex` path.
+///
+/// **Post-d03e7d:** this test no longer touches `ctx.sheaf` directly.
+/// The earlier version reached into the in-process cache to `put(id, ())`
+/// entries so the BFS cascade had something to mark — a back-door that
+/// masked the empty-`invalidated` bug for UDS consumers. With the
+/// cascade fix in place (cache returns regions whose boundary projection
+/// moved, not just regions with local entries), the same assertions hold
+/// using only daemon ops over the wire.
 #[tokio::test]
 async fn e2e_sheaf_ops_drive_delta_zero_mode_over_real_uds() {
     use std::sync::Arc;
@@ -3194,22 +3202,11 @@ async fn e2e_sheaf_ops_drive_delta_zero_mode_over_real_uds() {
     assert_eq!(topology_resp["regions"], 2);
     assert_eq!(topology_resp["restrictions"], 1);
 
-    // ── Step 2: pre-populate cache entries so on_change has work ──
-    //
-    // No daemon op for cache.put() — go through the ctx directly. In
-    // production this is what reparse / enrich would do via separate
-    // pipelines. Here we just need entries the BFS can mark.
-    {
-        let mut cache = ctx.sheaf.cache().lock().unwrap();
-        cache.put(0, ());
-        cache.put(1, ());
-    }
-
-    // ── Step 3: sheaf_invalidate with projected-away change ──
+    // ── Step 2: sheaf_invalidate with projected-away change ──
     //
     // Region 0's new stalk = [1.0, 0.5, 42.0, 7.0]. The agreement
     // coords [0..2] are unchanged from baseline. δ⁰ stays zero → the
-    // cache must NOT cascade to region 1.
+    // cascade must NOT include region 1, only the changed region 0.
     let invalidate_resp = uds_round_trip(
         &sock_path,
         r#"{"op":"sheaf_invalidate","regions":[0],"stalks":[{"id":0,"hash":"ff","data":[1.0,0.5,42.0,7.0]}]}"#,
@@ -3224,17 +3221,15 @@ async fn e2e_sheaf_ops_drive_delta_zero_mode_over_real_uds() {
     assert_eq!(
         invalidated,
         vec![0],
-        "δ⁰ mode must hold region 1 valid when agreement coords unchanged; got {invalidated:?} (full: {invalidate_resp})"
+        "δ⁰ mode must hold region 1 out of cascade when agreement coords unchanged; got {invalidated:?} (full: {invalidate_resp})"
     );
 
-    // ── Step 4: sheaf_invalidate with agreement-breaking change ──
+    // ── Step 3: sheaf_invalidate with agreement-breaking change ──
     //
     // Region 0's stalk now flips coord [0] (in the agreement subspace).
-    // δ⁰ moves → cache must cascade to region 1.
-    {
-        let mut cache = ctx.sheaf.cache().lock().unwrap();
-        cache.put(1, ()); // re-mark valid before the next test
-    }
+    // δ⁰ moves → cascade must reach region 1. With the d03e7d fix the
+    // wire response surfaces the cascade regardless of whether the
+    // in-process cache has entries for these regions.
     let invalidate_resp2 = uds_round_trip(
         &sock_path,
         r#"{"op":"sheaf_invalidate","regions":[0],"stalks":[{"id":0,"hash":"ee","data":[99.0,0.5,42.0,7.0]}]}"#,
@@ -3247,11 +3242,15 @@ async fn e2e_sheaf_ops_drive_delta_zero_mode_over_real_uds() {
         .map(|v| v.as_u64().unwrap() as u32)
         .collect();
     assert!(
+        invalidated2.contains(&0),
+        "changed region must appear in cascade; got {invalidated2:?} (full: {invalidate_resp2})"
+    );
+    assert!(
         invalidated2.contains(&1),
         "δ⁰ mode must cascade when agreement coord moves; got {invalidated2:?} (full: {invalidate_resp2})"
     );
 
-    // ── Step 5: sheaf_status surfaces the current cache state ──
+    // ── Step 4: sheaf_status surfaces the current cache state ──
     let status_resp = uds_round_trip(&sock_path, r#"{"op":"sheaf_status"}"#).await;
     assert!(
         status_resp["generation"].as_str().is_some(),

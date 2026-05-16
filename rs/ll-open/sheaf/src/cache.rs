@@ -227,7 +227,14 @@ impl<S: StalkHash, V> SheafCache<S, V> {
     /// breadth-first through restriction edges, bounded by `max_cascade_budget`
     /// (heuristic depth, not a sheaf invariant — see module docs).
     ///
-    /// Returns the set of invalidated region IDs in BFS visitation order.
+    /// Returns the set of region IDs whose boundary projection moved beyond
+    /// `DELTA0_EPS_SQUARED` (or whose XOR pre-filter fired, in heuristic-only
+    /// mode). This is a structural answer about the sheaf section, not a
+    /// statement about the local `entries` map: regions are reported even
+    /// when the in-process cache has no entry for them. UDS / MCP consumers
+    /// own their own caches and need the full cascade list to evict on
+    /// their side; the local `entries.valid = false` side-effect still
+    /// happens for in-process callers that DO have entries.
     pub fn on_change(&mut self, changed_regions: &[RegionId]) -> Vec<RegionId> {
         self.generation += 1;
         let mut invalidated = Vec::new();
@@ -235,8 +242,8 @@ impl<S: StalkHash, V> SheafCache<S, V> {
         for &region in changed_regions {
             if let Some(entry) = self.entries.get_mut(&region) {
                 entry.valid = false;
-                invalidated.push(region);
             }
+            invalidated.push(region);
         }
 
         let max_cascade_budget: u32 = 3;
@@ -269,8 +276,8 @@ impl<S: StalkHash, V> SheafCache<S, V> {
                 {
                     if let Some(entry) = self.entries.get_mut(&neighbor) {
                         entry.valid = false;
-                        invalidated.push(neighbor);
                     }
+                    invalidated.push(neighbor);
                     frontier.push_back((neighbor, depth + 1));
                 }
             }

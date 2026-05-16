@@ -547,6 +547,7 @@ pub fn parse_into_conn(
     // Skip orphaned-dir sweep on scoped passes: it would walk the full
     // _file_index tree and incorrectly drop dirs whose other (out-of-scope)
     // files weren't loaded into this run. Full-tree passes still run it.
+    let sweep_close_start = std::time::Instant::now();
     if scope.is_none() {
         let swept = sweep_orphaned_dirs(conn)?;
         if swept > 0 {
@@ -565,27 +566,45 @@ pub fn parse_into_conn(
         .unwrap_or_default()
         .as_secs();
     set_meta(conn, "parse_time", &now.to_string())?;
-
-    if oversized > 0 {
-        eprintln!(
-            "{parsed} parsed, {unchanged} unchanged, {deleted} deleted, \
-             {errors} errors, {oversized} skipped >{}MB \
-             (parse {parse_elapsed:.1?}, insert {insert_elapsed:.1?})",
-            MAX_PARSE_FILE_SIZE / (1024 * 1024),
-        );
-    } else {
-        eprintln!(
-            "{parsed} parsed, {unchanged} unchanged, {deleted} deleted, {errors} errors \
-             (parse {parse_elapsed:.1?}, insert {insert_elapsed:.1?})",
-        );
-    }
+    let sweep_close_elapsed = sweep_close_start.elapsed();
 
     // Σ root advance (bead `ley-line-open-ce55b1`) — hash the
     // just-emitted segments and chain a new Head record. Best-effort:
     // a head-write failure logs and doesn't fail the parse.
     // `:memory:` connections are gated inside `write_head_after_parse`.
+    let head_write_start = std::time::Instant::now();
     if let Err(e) = write_head_after_parse(conn) {
         log::warn!("Σ head-write failed (parse otherwise OK): {e:#}");
+    }
+    let head_write_elapsed = head_write_start.elapsed();
+
+    // Per-phase timing trace — single line, stderr, surfacing the
+    // wall-clock split so the next person debugging cold-parse can see
+    // where time goes without rebuilding with custom timing prints.
+    // See bead `ley-line-open-cbbedf` for the 1500ms gate this enables.
+    let wall_elapsed = parse_elapsed + insert_elapsed + sweep_close_elapsed + head_write_elapsed;
+    if oversized > 0 {
+        eprintln!(
+            "{parsed} parsed, {unchanged} unchanged, {deleted} deleted, \
+             {errors} errors, {oversized} skipped >{}MB \
+             parse={}ms insert={}ms head_write={}ms sweep_close={}ms wall={}ms",
+            MAX_PARSE_FILE_SIZE / (1024 * 1024),
+            parse_elapsed.as_millis(),
+            insert_elapsed.as_millis(),
+            head_write_elapsed.as_millis(),
+            sweep_close_elapsed.as_millis(),
+            wall_elapsed.as_millis(),
+        );
+    } else {
+        eprintln!(
+            "{parsed} parsed, {unchanged} unchanged, {deleted} deleted, {errors} errors \
+             parse={}ms insert={}ms head_write={}ms sweep_close={}ms wall={}ms",
+            parse_elapsed.as_millis(),
+            insert_elapsed.as_millis(),
+            head_write_elapsed.as_millis(),
+            sweep_close_elapsed.as_millis(),
+            wall_elapsed.as_millis(),
+        );
     }
 
     // Oversized files count as errors at the result level — they

@@ -282,6 +282,84 @@ fn gate1b_cost_ceiling_realistic_file_sizes() {
     );
 }
 
+/// Gate 1c — assign_regions scaling (Copilot finding 10).
+///
+/// Falsifiable proof that `assign_regions` does NOT walk every manifest
+/// for every file. Generates a JS-monorepo-shaped fixture (many shallow
+/// `package.json` manifests + many leaf files) and times the public
+/// `run()` call.
+///
+/// Under the old O(n_files × n_manifests) implementation this fixture
+/// runs in roughly 500-2000 ms (1000 files × 100 manifests = 100k
+/// PathBuf::starts_with calls, each ~5-20 µs on long paths). Under the
+/// O(depth) ancestor-walk implementation it should land under ~150 ms.
+///
+/// Budget is set permissively (250 ms) so it doesn't flake on CI but
+/// would still fail clearly under the old O(n*m) algorithm. Gated
+/// behind `LLO_PERF_GATES=1` for the same reason as gate1a/gate1b;
+/// timing always prints to stderr.
+#[test]
+fn gate1c_assign_regions_scales_better_than_n_files_times_n_manifests() {
+    let td = tempfile::tempdir().expect("tempdir");
+    let root = td.path();
+    // 500 manifests × 10 files each = 5000 files (n_files=5000,
+    // n_manifests=500). Old algorithm: 5000 × 500 = 2.5M path
+    // comparisons (PathBuf::starts_with on long temp-dir paths is
+    // ~200-500 ns); new algorithm: 5000 × ~3 (avg ancestor depth) = 15k.
+    // The signal-to-noise here clears CI variance reliably.
+    generate_js_monorepo_fixture(
+        root, /* n_manifests = */ 500, /* files_per_pkg = */ 10,
+    );
+
+    let files = topology_pass::collect_files(root).expect("walk js-monorepo fixture");
+    assert!(
+        files.len() >= 5000,
+        "Gate 1c fixture should produce ≥5000 files, got {}",
+        files.len()
+    );
+
+    // Warm-up so the page cache is hot.
+    let _warm = topology_pass::run(&files, root).expect("warm-up run");
+
+    let started = std::time::Instant::now();
+    let out = topology_pass::run(&files, root).expect("timed run");
+    let elapsed = started.elapsed();
+
+    eprintln!(
+        "[Gate 1c / assign_regions scaling] files={} manifests={} regions={} edges={} elapsed={:?}",
+        out.stats.n_files, out.stats.n_manifests, out.stats.n_regions, out.stats.n_edges, elapsed,
+    );
+
+    // Correctness sanity (independent of perf): every package's files
+    // must land in that package's region, not the root region. Catches
+    // a regression where the ancestor walk loses the deepest-manifest
+    // rule.
+    let root_files_in_root_region: usize =
+        out.file_regions.iter().filter(|fr| fr.region == 0).count();
+    assert_eq!(
+        root_files_in_root_region, 0,
+        "Gate 1c FAILED: {root_files_in_root_region} files landed in synthetic root region — \
+         deepest-ancestor manifest rule broken"
+    );
+    assert_eq!(
+        out.stats.n_manifests, 500,
+        "Gate 1c FAILED: expected 500 manifests, got {}",
+        out.stats.n_manifests
+    );
+    assert_eq!(
+        out.stats.n_regions, 500,
+        "Gate 1c FAILED: expected 500 regions, got {}",
+        out.stats.n_regions
+    );
+
+    perf_gate_assert(
+        elapsed.as_millis(),
+        400,
+        "Gate 1c / assign_regions scaling",
+        perf_gate_enabled(),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Gate 2 — recall on hand-crafted multi-language fixture.
 //
@@ -969,4 +1047,46 @@ fn write_bloat_dir_fixture(root: &Path) {
     )
     .expect("write package.json");
     fs::write(nm.join("vendored_index.ts"), "export const v = 1;\n").expect("write vendored index");
+}
+
+/// JS-monorepo-shaped fixture for the `assign_regions` scaling gate.
+///
+/// Lays out:
+///   root/
+///     packages/
+///       pkg-0/  package.json + n leaf files
+///       pkg-1/  package.json + n leaf files
+///       ...
+///       pkg-{n_manifests-1}/  package.json + n leaf files
+///
+/// The flat `packages/` layout matches the structural shape Copilot
+/// flagged ("large JS monorepos with lots of `package.json`"): many
+/// manifests at the same depth, files under each.
+fn generate_js_monorepo_fixture(root: &Path, n_manifests: usize, files_per_pkg: usize) {
+    use std::fs;
+
+    let packages = root.join("packages");
+    fs::create_dir_all(&packages).expect("mkdir packages");
+
+    for p in 0..n_manifests {
+        let pkg_dir = packages.join(format!("pkg-{p}"));
+        let src = pkg_dir.join("src");
+        fs::create_dir_all(&src).expect("mkdir pkg src");
+        // Manifest at the package root — anchors the region.
+        fs::write(
+            pkg_dir.join("package.json"),
+            format!(r#"{{"name":"pkg-{p}","version":"0.0.0"}}"#),
+        )
+        .expect("write package.json");
+        // Leaf files under packages/pkg-N/src/. Content is intentionally
+        // dull so the import sweep doesn't dominate the cost ceiling —
+        // this gate is about manifest assignment, not import scanning.
+        for i in 0..files_per_pkg {
+            fs::write(
+                src.join(format!("mod{i}.ts")),
+                format!("export const v{i} = {i};\n"),
+            )
+            .expect("write leaf ts");
+        }
+    }
 }

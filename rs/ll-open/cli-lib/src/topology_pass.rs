@@ -304,33 +304,42 @@ fn find_manifests(files: &[PathBuf]) -> Vec<Manifest> {
 ///
 /// Returns `(file_regions, n_regions)` where `n_regions` includes the
 /// root region iff at least one file landed there.
+///
+/// Algorithmic note (Copilot finding 10): the assignment walks up each
+/// file's ancestor directories looking for a hit in a `BTreeMap<PathBuf,
+/// RegionId>` keyed by manifest dir, rather than iterating every
+/// manifest for every file. Complexity is `O(n_files × avg_depth)`
+/// instead of `O(n_files × n_manifests)`. `BTreeMap` (not `HashMap`)
+/// matches the determinism discipline of the rest of this module.
 fn assign_regions(
     files: &[PathBuf],
     metas: &[FileMeta],
     manifests: &[Manifest],
     source: &Path,
 ) -> (Vec<FileRegion>, u64) {
-    // Region ids: `1..=manifests.len()` for manifests (1-indexed),
+    // Build a lookup table: manifest dir → region id.
+    // Manifests are already sorted + deduped by `find_manifests`; the
+    // region id is the 1-indexed position in that sorted vec, with
     // `0` reserved for the synthetic root.
+    let manifest_region: BTreeMap<&Path, RegionId> = manifests
+        .iter()
+        .enumerate()
+        .map(|(mi, m)| (m.dir.as_path(), (mi as u32) + 1))
+        .collect();
+
     let mut used_regions: BTreeSet<RegionId> = BTreeSet::new();
     let mut out: Vec<FileRegion> = Vec::with_capacity(files.len());
 
     for (idx, path) in files.iter().enumerate() {
-        let dir = path.parent().unwrap_or(source);
-        // Find the deepest manifest whose `dir` is an ancestor of `dir`.
-        let mut best: Option<(usize, usize)> = None; // (manifest_idx, depth)
-        for (mi, m) in manifests.iter().enumerate() {
-            if dir.starts_with(&m.dir) {
-                let depth = m.dir.components().count();
-                if best.map(|(_, d)| depth > d).unwrap_or(true) {
-                    best = Some((mi, depth));
-                }
-            }
-        }
-        let region: RegionId = match best {
-            Some((mi, _)) => (mi as u32) + 1, // 1-indexed; 0 is synthetic root
-            None => 0,
-        };
+        let start_dir = path.parent().unwrap_or(source);
+        // Walk ancestor directories from the file's parent up to the
+        // filesystem root. The FIRST hit is the deepest ancestor
+        // manifest, since we walk outward — no need to enumerate all
+        // manifests and pick the deepest.
+        let region: RegionId = start_dir
+            .ancestors()
+            .find_map(|ancestor| manifest_region.get(ancestor).copied())
+            .unwrap_or(0);
         used_regions.insert(region);
         out.push(FileRegion {
             file_index: idx,

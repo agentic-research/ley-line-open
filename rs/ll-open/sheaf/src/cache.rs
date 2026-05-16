@@ -32,6 +32,21 @@
 //! — see "What this cache actually does" above for the proxy details and the
 //! daemon-wiring bead for the δ⁰-driven upgrade path.
 //!
+//! ## `on_change` return semantics
+//!
+//! [`SheafCache::on_change`] returns the list of regions whose boundary
+//! projection moved beyond `DELTA0_EPS_SQUARED` (or whose XOR pre-filter
+//! fired, in heuristic-only mode). This is a **structural answer about
+//! the sheaf section** — it is NOT "regions to evict from this cache". In
+//! particular, regions are reported even when this cache holds no entry
+//! for them, because UDS / MCP consumers own their own caches and need
+//! the full cascade list to evict on their side.
+//!
+//! The local `entries.valid = false` side-effect still happens for
+//! in-process callers that DO have entries — but it is a side-effect on
+//! the local map, not a filter on the returned list. Consumers in
+//! process and consumers over the wire see the same answer.
+//!
 //! ## Restriction weight learning
 //!
 //! Weights on restriction edges encode coupling strength between regions.

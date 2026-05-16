@@ -15,6 +15,13 @@
 //!   wiring [`CellComplex::detect_violations`] into [`SheafCache::on_change`].
 //!   See [`cache`] module docs for the explicit contract.
 //!
+//!   The list returned by [`SheafCache::on_change`] reports **regions whose
+//!   boundary projection moved beyond `DELTA0_EPS_SQUARED`** (in δ⁰ mode) or
+//!   whose XOR pre-filter fired (heuristic-only). It is a structural answer
+//!   about the sheaf section, not a per-cache eviction list — UDS / MCP
+//!   consumers get the same answer in-process callers do and own their own
+//!   eviction policy on top of it.
+//!
 //! ## Mathematical foundation
 //!
 //! A **sheaf** assigns data (stalks) to topological regions and enforces

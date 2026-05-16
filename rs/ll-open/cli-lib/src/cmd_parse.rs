@@ -83,17 +83,20 @@ struct ParsedFile {
 // Batched-insert plumbing
 // ---------------------------------------------------------------------------
 
-/// Rows per multi-row VALUES batch. 2000 × 9 columns (`_ast`, the
-/// widest table) = 18 000 bound parameters per statement — well under
+/// Rows per multi-row VALUES batch. 3000 × 9 columns (`_ast`, the
+/// widest table) = 27 000 bound parameters per statement — under
 /// SQLite's 32K bound-param cap (`SQLITE_MAX_VARIABLE_NUMBER` default
-/// 32 766 since 3.32). Larger batches collapse more transaction edges
-/// per execute; on the mache 765-file bench going from 500 → 2000
-/// rows/batch shaves another ~10-15% off insert wall.
+/// 32 766 since 3.32) with ~5 700 params of headroom. Larger batches
+/// collapse more transaction edges per execute; on the mache
+/// 765-file bench going from 500 → 2000 → 3000 rows/batch shaves
+/// successive 10-15% chunks off insert wall.
 ///
-/// Capped at 2000 so the per-batch SQL string stays under ~50 KiB —
-/// the prepared-statement cache holds one entry per unique SQL string,
-/// and bloated strings hurt the cache hit rate for the trailing
-/// partial batch (a different SQL string per partial size).
+/// The per-batch SQL string at 3000×9 is ~60 KiB. The prepared-
+/// statement cache holds one entry per unique SQL string, so each
+/// table pays this cost once (the always-full batch) plus one
+/// per-table partial-batch string at flush time. Going past 3000
+/// requires a smaller per-row column count or a higher
+/// `SQLITE_MAX_VARIABLE_NUMBER` at SQLite build time.
 const BULK_BATCH_ROWS: usize = 3000;
 
 /// Build a multi-row VALUES placeholder string: `(?,?,?,...),(?,?,...),...`.
@@ -431,11 +434,15 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
     // was deleted at COMMIT). The kernel will close the FD when the
     // process exits.
     //
-    // We don't `process::exit` here because cmd_parse is also called
-    // from integration tests; the test runner would exit early. The
-    // caller (main) can choose to exit after this returns.
+    // The `libc::_exit` shortcut that bypasses the rest of the rust
+    // shutdown lives in `cli/src/main.rs` (gated to the parse subcommand
+    // success path only). It is not reachable from this function, from
+    // integration tests, or from the daemon path — those still go
+    // through normal Drop. This `mem::forget` is the local saving:
+    // ~65ms of SQLite FD-teardown that the kernel will reclaim on
+    // process exit anyway.
     //
-    // See bead `ley-line-open-cbbedf`.
+    // See bead `ley-line-open-cbbedf` Attack 3.
     std::mem::forget(conn);
 
     Ok(())
@@ -714,13 +721,13 @@ pub fn parse_into_conn(
     // by ~10×: SQLite parses one statement, executes it once, and the
     // B-tree maintenance amortizes across rows.
     //
-    // Batch size: BULK_BATCH_ROWS (== 500) rows per execute, well under
+    // Batch size: BULK_BATCH_ROWS (== 3000) rows per execute, under
     // SQLite's 32K bound-param cap even for the 9-column _ast table
-    // (4500 params). The "full batch" SQL string is the same every
-    // execute → prepare_cached hits the per-table key once and reuses.
-    // The trailing partial batch (< BULK_BATCH_ROWS rows) is flushed
-    // with a separately-sized statement; on a 765-file corpus this
-    // happens once per table at end of insert.
+    // (27 000 params, ~5 700 headroom). The "full batch" SQL string is
+    // the same every execute → prepare_cached hits the per-table key
+    // once and reuses. The trailing partial batch (< BULK_BATCH_ROWS
+    // rows) is flushed with a separately-sized statement; on a
+    // 765-file corpus this happens once per table at end of insert.
     //
     // See bead `ley-line-open-cbbedf`.
 
@@ -881,11 +888,8 @@ pub fn parse_into_conn(
             _ => None,
         }
     };
-    let head_handle = db_path_for_head.map(|p| {
-        std::thread::spawn(move || -> Result<()> {
-            write_head_for_path(&p)
-        })
-    });
+    let head_handle = db_path_for_head
+        .map(|p| std::thread::spawn(move || -> Result<()> { write_head_for_path(&p) }));
 
     // Build secondary indexes in one pass now that all rows are
     // landed. SQLite materializes each index by a single sorted scan
@@ -1088,8 +1092,12 @@ fn hash_canonical_stream_fast(file_bytes: &[u8], hasher: &mut blake3::Hasher) ->
         if i + HEADER_BYTES > file_bytes.len() {
             return None; // truncated header
         }
-        let seg_count_minus_1 =
-            u32::from_le_bytes([file_bytes[i], file_bytes[i + 1], file_bytes[i + 2], file_bytes[i + 3]]);
+        let seg_count_minus_1 = u32::from_le_bytes([
+            file_bytes[i],
+            file_bytes[i + 1],
+            file_bytes[i + 2],
+            file_bytes[i + 3],
+        ]);
         if seg_count_minus_1 != 0 {
             return None; // multi-segment — fall back to slow path
         }
@@ -1124,9 +1132,8 @@ fn hash_canonical_stream_slow(
     let mut total: u64 = 0;
     let mut slice: &[u8] = file_bytes;
     while !slice.is_empty() {
-        let msg =
-            capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new())
-                .with_context(|| format!("parse segment {}", p.display()))?;
+        let msg = capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new())
+            .with_context(|| format!("parse segment {}", p.display()))?;
         let canonical_words = msg
             .canonicalize()
             .with_context(|| format!("canonicalize segment {}", p.display()))?;
@@ -1596,12 +1603,7 @@ fn walk_children_pure(
 /// idempotent for matching primary keys. The `OR IGNORE` here was
 /// defensive against the per-file loop re-inserting the same dir; the
 /// set membership check accomplishes the same.
-fn collect_dirs(
-    rel: &Path,
-    created: &mut HashSet<String>,
-    nodes_buf: &mut NodeBatch,
-    mtime: i64,
-) {
+fn collect_dirs(rel: &Path, created: &mut HashSet<String>, nodes_buf: &mut NodeBatch, mtime: i64) {
     let mut accumulated = String::new();
     let components: Vec<_> = rel
         .parent()
@@ -1618,7 +1620,15 @@ fn collect_dirs(
             accumulated = format!("{accumulated}/{name}");
         }
         if created.insert(accumulated.clone()) {
-            nodes_buf.push(accumulated.clone(), parent, name, 1, 0, mtime, String::new());
+            nodes_buf.push(
+                accumulated.clone(),
+                parent,
+                name,
+                1,
+                0,
+                mtime,
+                String::new(),
+            );
         }
     }
 }
@@ -1817,6 +1827,144 @@ mod tests {
     }
 
     #[test]
+    fn sweep_orphaned_dirs_runs_when_files_are_deleted_between_parses() {
+        // Skeptic finding on bead `ley-line-open-cbbedf`: the sweep-skip
+        // optimization in `parse_into_conn` only fires when `deleted == 0`,
+        // which is the cold-parse path. The "deleted > 0" path was logically
+        // correct but had no test exercising it — meaning a future refactor
+        // could break the sweep-fires path and CI would stay green.
+        //
+        // This test pins the contract: parse a tree, delete one file's
+        // parent dir, reparse, assert the orphan dir is gone from `nodes`.
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        std::fs::create_dir_all(root.join("doomed")).unwrap();
+        std::fs::write(root.join("doomed/a.go"), b"package m\n").unwrap();
+        std::fs::write(root.join("keep.go"), b"package m\n").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        let _ = parse_into_conn(&conn, root, None, None).unwrap();
+
+        // Confirm the dir row exists after the cold parse.
+        let dir_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE id = 'doomed' AND kind = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dir_before, 1, "doomed/ dir row must exist after cold parse");
+
+        // Remove the file AND its parent dir from disk, then reparse.
+        std::fs::remove_file(root.join("doomed/a.go")).unwrap();
+        std::fs::remove_dir(root.join("doomed")).unwrap();
+        let r2 = parse_into_conn(&conn, root, None, None).unwrap();
+        assert!(r2.deleted >= 1, "incremental must observe ≥1 deletion");
+
+        // The sweep-runs path must fire and remove the now-orphaned dir.
+        let dir_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE id = 'doomed' AND kind = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dir_after, 0,
+            "sweep_orphaned_dirs must remove the orphaned dir row when its only \
+             child was deleted (deleted > 0 path of parse_into_conn)",
+        );
+
+        // Sanity: keep.go's file row survives.
+        let keep_present: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _file_index WHERE path = 'keep.go'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(keep_present, 1);
+    }
+
+    #[test]
+    fn batched_inserts_preserve_record_content_not_just_row_count() {
+        // Skeptic finding on bead `ley-line-open-cbbedf`: row-count parity
+        // (which `parse_into_conn_skips_oversized_files` and friends cover)
+        // is necessary but not sufficient — a chunk-boundary misalignment
+        // in the multi-row VALUES batch could shift bound params between
+        // rows, producing same-count-different-content output. This test
+        // spot-checks that `_source` AND `_ast` rows for distinct files
+        // survive the batched-insert path with their bound parameters
+        // correctly aligned (no row-to-row leakage).
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        // Two files so we exercise the multi-file batched path (single-row
+        // batches would have hidden a chunk-boundary bug too).
+        std::fs::write(root.join("a.go"), b"package alpha\n\nfunc Aaa() {}\n").unwrap();
+        std::fs::write(root.join("b.go"), b"package beta\n\nfunc Bbb() {}\n").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        parse_into_conn(&conn, root, None, None).unwrap();
+
+        // _source(id, language, path) — file-backed parse stores the
+        // canonicalized absolute path (not the relative one), so we
+        // query by filename suffix rather than equality. Pin: each
+        // file has exactly one row with language='go'.
+        let a_row: (String, String) = conn
+            .query_row(
+                "SELECT id, language FROM _source WHERE path LIKE '%/a.go'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let b_row: (String, String) = conn
+            .query_row(
+                "SELECT id, language FROM _source WHERE path LIKE '%/b.go'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let (a_source_id, a_lang) = a_row;
+        let (b_source_id, b_lang) = b_row;
+        assert_eq!(a_lang, "go", "_source.language for a.go must be 'go'");
+        assert_eq!(b_lang, "go", "_source.language for b.go must be 'go'");
+        assert_ne!(
+            a_source_id, b_source_id,
+            "distinct files must have distinct _source.id",
+        );
+
+        // _ast(node_id, source_id, node_kind, ...) — pin: exactly one
+        // function_declaration per file AND it joins to the correct
+        // _source.id. If batched VALUES misaligned source_id across
+        // rows, the count for one file would be 0 and the other would
+        // be doubled.
+        let a_fn_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _ast \
+                 WHERE node_kind = 'function_declaration' AND source_id = ?1",
+                [&a_source_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let b_fn_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _ast \
+                 WHERE node_kind = 'function_declaration' AND source_id = ?1",
+                [&b_source_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            a_fn_count, 1,
+            "a.go must contribute exactly 1 function_declaration via batched insert",
+        );
+        assert_eq!(
+            b_fn_count, 1,
+            "b.go must contribute exactly 1 function_declaration via batched insert",
+        );
+    }
+
+    #[test]
     fn collect_files_descends_into_normal_dirs() {
         // Sister pin: normal directories ARE descended. Pin so a
         // refactor over-aggressively pruning (e.g. skip every dir
@@ -1928,6 +2076,7 @@ mod tests {
     /// T8.5: parse twice; head.capnp chains correctly:
     /// - run 1: parentHash == [0;32] (sentinel), generation == 1, rootHash != 0
     /// - run 2: parentHash == run1.rootHash, generation == 2
+    ///
     /// And rootHash equals BLAKE3 of the segment files in canonical order.
     #[test]
     fn parse_into_conn_chains_head_across_runs() {

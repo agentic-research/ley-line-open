@@ -6,7 +6,8 @@
 use anyhow::Result;
 use rusqlite::{Connection, params};
 
-/// The `nodes` table DDL — the shared contract across ley-line and mache.
+/// The `nodes` table DDL (table only, no indexes) — the shared contract
+/// across ley-line and mache.
 ///
 /// ```sql
 /// CREATE TABLE IF NOT EXISTS nodes (
@@ -26,6 +27,37 @@ use rusqlite::{Connection, params};
 /// They are used by mache's SQLiteGraph for lazy content resolution and
 /// incremental re-ingestion tracking. Ley-line crates that don't need these
 /// features can ignore them — `insert_node()` leaves them NULL.
+pub const NODES_TABLE_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS nodes (
+    id TEXT PRIMARY KEY,
+    parent_id TEXT,
+    name TEXT NOT NULL,
+    kind INTEGER NOT NULL,
+    size INTEGER DEFAULT 0,
+    mtime INTEGER NOT NULL,
+    record_id TEXT,
+    record JSON,
+    source_file TEXT
+);";
+
+/// The `nodes` table indexes (no table) — deferred post-load to avoid
+/// paying B-tree maintenance per INSERT during bulk parse.
+///
+/// `idx_source_file` is partial: ley-line's parse paths leave `source_file`
+/// NULL (only mache's lazy-resolution flow populates it). A full index
+/// over a NULL-only column would add B-tree pages per row to every
+/// registry-repo db without ever serving a query. `WHERE source_file IS
+/// NOT NULL` skips those rows entirely; the index materializes only when
+/// mache (or any future caller) actually populates the column.
+pub const NODES_INDEXES_DDL: &str = "\
+CREATE INDEX IF NOT EXISTS idx_parent_name ON nodes(parent_id, name);
+CREATE INDEX IF NOT EXISTS idx_source_file ON nodes(source_file) WHERE source_file IS NOT NULL;";
+
+/// Combined `nodes` table + index DDL. Preserves the pre-split contract for
+/// callers that want the schema fully materialized in one batch.
+/// `cmd_parse` instead calls `NODES_TABLE_DDL` (insert phase) and
+/// `NODES_INDEXES_DDL` (post-COMMIT) separately — see bead
+/// `ley-line-open-9ccbc7`.
 pub const NODES_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS nodes (
     id TEXT PRIMARY KEY,
@@ -39,17 +71,31 @@ CREATE TABLE IF NOT EXISTS nodes (
     source_file TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_parent_name ON nodes(parent_id, name);
--- Partial index: ley-line's parse paths leave source_file NULL (only
--- mache's lazy-resolution flow populates it). A full index over a NULL-
--- only column adds B-tree pages per row to every registry-repo db
--- without ever serving a query. WHERE source_file IS NOT NULL skips
--- those rows entirely; the index materializes only when mache (or any
--- future caller) actually populates the column.
+-- Partial index: see `NODES_INDEXES_DDL` for rationale.
 CREATE INDEX IF NOT EXISTS idx_source_file ON nodes(source_file) WHERE source_file IS NOT NULL;";
 
-/// Create the `nodes` table and index (idempotent).
+/// Create the `nodes` table and indexes (idempotent).
+///
+/// For bulk-load callers (e.g. `cmd_parse`), prefer the split
+/// [`create_nodes_table`] + [`create_nodes_indexes`] pair so the
+/// indexes can be deferred until after `COMMIT`.
 pub fn create_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(NODES_DDL)?;
+    Ok(())
+}
+
+/// Create only the `nodes` table — no indexes. Pair with
+/// [`create_nodes_indexes`] (called post-`COMMIT`) for bulk-load paths
+/// where index maintenance during INSERT dominates the wall clock.
+pub fn create_nodes_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(NODES_TABLE_DDL)?;
+    Ok(())
+}
+
+/// Create only the `nodes` indexes — no table. Idempotent (`IF NOT
+/// EXISTS`), so safe to call on a connection that already has them.
+pub fn create_nodes_indexes(conn: &Connection) -> Result<()> {
+    conn.execute_batch(NODES_INDEXES_DDL)?;
     Ok(())
 }
 

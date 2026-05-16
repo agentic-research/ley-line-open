@@ -26,8 +26,8 @@ use leyline_ts::languages::TsLanguage;
 pub const MAX_PARSE_FILE_SIZE: i64 = 8 * 1024 * 1024;
 use leyline_ts::refs::{ExtractedRef, extract_refs};
 use leyline_ts::schema::{
-    create_ast_schema, create_index_schema, create_refs_schema, delete_file_rows, read_file_index,
-    set_meta, sweep_orphaned_dirs,
+    create_ast_tables, create_index_schema, create_post_load_indexes, create_refs_tables,
+    delete_file_rows, read_file_index, set_meta, sweep_orphaned_dirs,
 };
 use rayon::prelude::*;
 use rusqlite::Connection;
@@ -173,8 +173,14 @@ pub fn parse_into_conn(
     // Check if tables already exist (incremental mode).
     let incremental = conn.prepare("SELECT 1 FROM _file_index LIMIT 1").is_ok();
 
-    create_ast_schema(conn)?;
-    create_refs_schema(conn)?;
+    // Tables only (no secondary indexes). At registry-repo scale the
+    // bulk INSERT loop pays O(rows × indexes × log N) on B-tree
+    // maintenance — the mache benchmark (764 files, 534k _ast rows)
+    // attributes ~3s of the 4.1s insert phase to per-row index
+    // updates. Indexes get rebuilt in one shot after `COMMIT` via
+    // `create_post_load_indexes`. See bead `ley-line-open-9ccbc7`.
+    create_ast_tables(conn)?;
+    create_refs_tables(conn)?;
     create_index_schema(conn)?;
 
     let mtime = std::time::SystemTime::now()
@@ -510,6 +516,15 @@ pub fn parse_into_conn(
     drop(stmt_file_idx);
 
     conn.execute_batch("COMMIT")?;
+
+    // Build secondary indexes in one pass now that all rows are
+    // landed. SQLite materializes each index by a single sorted scan
+    // (~O(rows · log rows)) which is roughly an order of magnitude
+    // cheaper than incremental per-row B-tree maintenance during the
+    // INSERT loop. Idempotent (`IF NOT EXISTS`) so the incremental-
+    // reparse path (where indexes already exist from the prior run)
+    // is a no-op. See bead `ley-line-open-9ccbc7`.
+    create_post_load_indexes(conn)?;
 
     let insert_elapsed = insert_start.elapsed();
 

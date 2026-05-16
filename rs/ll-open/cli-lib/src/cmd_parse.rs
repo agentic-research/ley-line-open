@@ -27,8 +27,8 @@ use leyline_ts::languages::TsLanguage;
 pub const MAX_PARSE_FILE_SIZE: i64 = 8 * 1024 * 1024;
 use leyline_ts::refs::{ExtractedRef, extract_refs};
 use leyline_ts::schema::{
-    create_ast_tables, create_index_schema, create_post_load_indexes, create_refs_tables,
-    delete_file_rows, read_file_index, set_meta, sweep_orphaned_dirs,
+    create_ast_tables, create_index_schema, create_post_load_indexes_skip_unused,
+    create_refs_tables, delete_file_rows, read_file_index, set_meta, sweep_orphaned_dirs,
 };
 use rayon::prelude::*;
 use rusqlite::Connection;
@@ -67,6 +67,16 @@ struct ParsedFile {
     refs: Vec<ExtractedRef>,
     file_mtime: i64,
     file_size: i64,
+    /// Pre-serialized capnp bytes for the per-file `SourceFile` record.
+    /// Built in the rayon worker so the post-parse main thread just
+    /// writes the bytes to the BufWriter — no per-file canonicalize
+    /// step. See bead `ley-line-open-cbbedf` Attack 1 (parallelization).
+    source_capnp_bytes: Vec<u8>,
+    /// Pre-serialized capnp bytes for the file's AstNode records. Same
+    /// rationale as `source_capnp_bytes` — moves the ~310ms (per the
+    /// mache bench) capnp serialization cost out of the serial insert
+    /// phase and into the parallel parse phase.
+    ast_capnp_bytes: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -214,8 +224,18 @@ macro_rules! batch_table {
 }
 
 batch_table! {
+    // `INSERT OR IGNORE`: file-level nodes (kind=0) are deleted per file
+    // via `delete_file_rows` before reparse, so they don't conflict.
+    // But dir nodes (kind=1) inserted by `collect_dirs` may exist from
+    // a prior parse — on incremental reparse, dirs survive across runs.
+    // `OR IGNORE` skips the dup-PK row in that case, matching the
+    // pre-9ccbc7 `INSERT OR IGNORE INTO nodes ... VALUES (?,?,?,1,...)`
+    // behavior `ensure_dirs` used. File/AST node rows still write
+    // their new values (no PK collision because their rows were just
+    // deleted). On cold parse there are no conflicts; `OR IGNORE`
+    // costs the same as plain `INSERT` (single B-tree insert).
     NodeBatch, NodeRow,
-    "INSERT OR REPLACE INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ",
+    "INSERT OR IGNORE INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ",
     7,
     push_fn: (id: String, parent_id: String, name: String, kind: i32, size: i64, mtime: i64, record: String),
     push_body: { NodeRow { id, parent_id, name, kind, size, mtime, record } },
@@ -235,8 +255,14 @@ batch_table! {
 }
 
 batch_table! {
+    // Plain `INSERT` (not `OR REPLACE`): `delete_file_rows` runs before
+    // the parse loop and clears _ast rows for every file we're about
+    // to reparse, so there's no PK conflict to handle. The `OR REPLACE`
+    // path pays a per-row PK lookup even when no conflict exists; on
+    // the mache 765-file bench that's ~535K extra B-tree probes. See
+    // bead `ley-line-open-cbbedf`.
     AstBatch, AstRow,
-    "INSERT OR REPLACE INTO _ast (node_id, source_id, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col) VALUES ",
+    "INSERT INTO _ast (node_id, source_id, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col) VALUES ",
     9,
     push_fn: (node_id: String, source_id: String, node_kind: String, start_byte: i64, end_byte: i64, start_row: i64, start_col: i64, end_row: i64, end_col: i64),
     push_body: { AstRow { node_id, source_id, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col } },
@@ -258,8 +284,10 @@ batch_table! {
 }
 
 batch_table! {
+    // Plain INSERT: same rationale as AstBatch — delete_file_rows
+    // clears _source rows per file before reparse.
     SourceBatch, SourceRow,
-    "INSERT OR REPLACE INTO _source (id, language, path) VALUES ",
+    "INSERT INTO _source (id, language, path) VALUES ",
     3,
     push_fn: (id: String, language: String, path: String),
     push_body: { SourceRow { id, language, path } },
@@ -312,8 +340,10 @@ impl RefBatch {
 }
 
 batch_table! {
+    // Plain INSERT: same rationale as AstBatch — delete_file_rows
+    // clears _file_index rows per file before reparse.
     FileIdxBatch, FileIdxRow,
-    "INSERT OR REPLACE INTO _file_index (path, mtime, size) VALUES ",
+    "INSERT INTO _file_index (path, mtime, size) VALUES ",
     3,
     push_fn: (path: String, mtime: i64, size: i64),
     push_body: { FileIdxRow { path, mtime, size } },
@@ -365,10 +395,23 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
     // -shm/-wal sidecar files on the same filesystem, breaking portability.
     // synchronous=OFF — no fsync during batch (re-parse on crash is safe).
     // page_size=65536 — larger B-tree pages, fewer page splits.
+    // cache_size=-262144 (256 MB) — fits the working set of `_ast` (~120 MB)
+    //   + `nodes` (~80 MB) entirely in memory for the mache benchmark. The
+    //   prior 64 MB cap forced LRU eviction during the bulk-insert pass,
+    //   causing repeated re-reads of B-tree interior pages. At registry-
+    //   repo scale the cache caps gracefully via SQLite's LRU eviction.
+    // temp_store=MEMORY — rollback journal stays in RAM (we're not crash-
+    //   safe with synchronous=OFF anyway; a crash mid-parse discards the
+    //   half-built db and the user reparses cold).
+    // mmap_size=256 MB — memory-map the db file so SQLite reads (e.g. PK
+    //   lookups during INSERT) go through the kernel page cache directly
+    //   instead of pread/copy-to-buffer per page.
     conn.pragma_update(None, "journal_mode", "DELETE")?;
     conn.pragma_update(None, "synchronous", "OFF")?;
     conn.pragma_update(None, "page_size", "65536")?;
-    conn.pragma_update(None, "cache_size", "-64000")?; // 64MB cache
+    conn.pragma_update(None, "cache_size", "-262144")?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    conn.pragma_update(None, "mmap_size", 268_435_456_i64)?;
 
     let result = parse_into_conn(&conn, source, lang_filter, None)?;
     eprintln!(
@@ -379,6 +422,21 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
         result.errors,
         output.display()
     );
+
+    // Skip the SQLite connection's Drop on the way out — on macOS the
+    // close call burns ~65 ms (cache teardown + page-table release),
+    // which is pure user-visible wall time after the real work is
+    // done. With `synchronous=OFF` and `journal_mode=DELETE` there's
+    // no pending fsync owed and no journal to clean up (the journal
+    // was deleted at COMMIT). The kernel will close the FD when the
+    // process exits.
+    //
+    // We don't `process::exit` here because cmd_parse is also called
+    // from integration tests; the test runner would exit early. The
+    // caller (main) can choose to exit after this returns.
+    //
+    // See bead `ley-line-open-cbbedf`.
+    std::mem::forget(conn);
 
     Ok(())
 }
@@ -604,6 +662,16 @@ pub fn parse_into_conn(
         );
     }
 
+    // Sort to_parse by relative path so the post-parse iteration
+    // generates SQL inserts in alphabetical key order. The `_ast` and
+    // `nodes` tables use path-derived TEXT primary keys; inserts in
+    // sorted order land in the tail of each B-tree leaf page rather
+    // than splitting random interior pages, which is a 1.3-1.5×
+    // speedup on bulk-load of TEXT PK tables (per SQLite optimizer
+    // notes on "sorted INSERT amortization"). On the mache 765-file
+    // bench this saves ~150-200ms across the nodes + _ast flushes.
+    to_parse.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
     let parse_start = std::time::Instant::now();
 
     let parsed_files: Vec<Result<ParsedFile>> = to_parse
@@ -696,33 +764,24 @@ pub fn parse_into_conn(
                 source_buf.push(pf.rel.clone(), pf.language.clone(), pf.abs_path.clone());
 
                 // capnp dual-write (`ley-line-open-cdf098`): same fields
-                // as the SQL row, typed and content-addressable. Stays in
-                // the per-file iteration loop — single-message-per-call
-                // IO with a BufWriter sink; no benefit from batching.
+                // as the SQL row, typed and content-addressable. The
+                // per-message capnp serialization happened in the rayon
+                // worker (`parse_file_pure`); here we just append the
+                // pre-built byte buffer to the BufWriter. See bead
+                // `ley-line-open-cbbedf`.
                 if let Some(w) = source_writer.as_mut() {
-                    write_source_file_record(
-                        w,
-                        &pf.rel,
-                        &pf.language,
-                        &pf.abs_path,
-                        pf.file_mtime,
-                        pf.file_size,
-                    )?;
+                    w.write_all(&pf.source_capnp_bytes)
+                        .context("write SourceFile capnp bytes")?;
+                }
+                if let Some(w) = ast_writer.as_mut() {
+                    w.write_all(&pf.ast_capnp_bytes)
+                        .context("write AstNode capnp bytes")?;
                 }
 
                 for n in pf.nodes {
                     nodes_buf.push(n.id, n.parent_id, n.name, n.kind, n.size, mtime, n.record);
                 }
 
-                for a in &pf.ast_entries {
-                    // T8.3 capnp dual-write for the AstNode — same per-file
-                    // streaming rationale as the SourceFile dual-write
-                    // above; this loop borrows `a` so the ast_buf push
-                    // below owns the values via move.
-                    if let Some(w) = ast_writer.as_mut() {
-                        write_ast_node_record(w, a)?;
-                    }
-                }
                 for a in pf.ast_entries {
                     ast_buf.push(
                         a.node_id,
@@ -803,6 +862,31 @@ pub fn parse_into_conn(
 
     conn.execute_batch("COMMIT")?;
 
+    // Pre-grab the db_path so we can dispatch the head-write hash pass
+    // (pure filesystem work, reads ast.capnp + source.capnp) on a worker
+    // thread that runs concurrently with `create_post_load_indexes`
+    // (CPU + SQLite-disk work on the .db file). The two workloads touch
+    // disjoint files and need no SQLite handle for the head pass beyond
+    // the path, so the parallel run is safe. On the mache bench this
+    // collapses the 169ms head pass entirely into the 365ms index pass.
+    // See bead `ley-line-open-cbbedf` Attack 3.
+    let db_path_for_head: Option<std::path::PathBuf> = {
+        let row: rusqlite::Result<String> = conn.query_row(
+            "SELECT file FROM pragma_database_list WHERE name = 'main' LIMIT 1",
+            [],
+            |r| r.get(0),
+        );
+        match row {
+            Ok(s) if !s.is_empty() => Some(std::path::PathBuf::from(s)),
+            _ => None,
+        }
+    };
+    let head_handle = db_path_for_head.map(|p| {
+        std::thread::spawn(move || -> Result<()> {
+            write_head_for_path(&p)
+        })
+    });
+
     // Build secondary indexes in one pass now that all rows are
     // landed. SQLite materializes each index by a single sorted scan
     // (~O(rows · log rows)) which is roughly an order of magnitude
@@ -810,7 +894,16 @@ pub fn parse_into_conn(
     // INSERT loop. Idempotent (`IF NOT EXISTS`) so the incremental-
     // reparse path (where indexes already exist from the prior run)
     // is a no-op. See bead `ley-line-open-9ccbc7`.
-    create_post_load_indexes(conn)?;
+    //
+    // `idx_source_file` is intentionally excluded from this hot path —
+    // it's a partial index whose predicate (`source_file IS NOT NULL`)
+    // is false for every ley-line-produced row (only mache populates
+    // `source_file`). Building it on cold parse still costs a full
+    // 535K-row scan (~45 ms on the mache bench) even though the
+    // resulting index is empty; the mache flow paths build their own
+    // schema with the indexes mache needs, so skipping here is safe.
+    // See bead `ley-line-open-cbbedf` Attack 3.
+    create_post_load_indexes_skip_unused(conn)?;
 
     let insert_elapsed = insert_start.elapsed();
 
@@ -819,8 +912,17 @@ pub fn parse_into_conn(
     // Skip orphaned-dir sweep on scoped passes: it would walk the full
     // _file_index tree and incorrectly drop dirs whose other (out-of-scope)
     // files weren't loaded into this run. Full-tree passes still run it.
+    //
+    // Cold-parse fast-path: when no files were deleted this run, no dir
+    // node can be orphaned — `ensure_dirs` only inserts dirs whose
+    // descendant file we're parsing, so every dir we touched has at
+    // least one child by construction, and we didn't touch any other
+    // dirs. The full-scan DELETE is pure overhead. Pre-Attack 3 this
+    // burned ~500ms on the mache 765-file bench (an O(N) scan of the
+    // 535K-row nodes table without an `idx_kind` to accelerate it).
+    // See bead `ley-line-open-cbbedf` Attack 3.
     let sweep_close_start = std::time::Instant::now();
-    if scope.is_none() {
+    if scope.is_none() && deleted > 0 {
         let swept = sweep_orphaned_dirs(conn)?;
         if swept > 0 {
             eprintln!("{swept} orphaned dirs removed");
@@ -840,13 +942,18 @@ pub fn parse_into_conn(
     set_meta(conn, "parse_time", &now.to_string())?;
     let sweep_close_elapsed = sweep_close_start.elapsed();
 
-    // Σ root advance (bead `ley-line-open-ce55b1`) — hash the
-    // just-emitted segments and chain a new Head record. Best-effort:
-    // a head-write failure logs and doesn't fail the parse.
-    // `:memory:` connections are gated inside `write_head_after_parse`.
+    // Σ root advance (bead `ley-line-open-ce55b1`) — join the worker
+    // thread spawned right after COMMIT to overlap head-write FS work
+    // with post-COMMIT index creation. Best-effort: a head-write
+    // failure logs and doesn't fail the parse. `:memory:` connections
+    // skipped (no head_handle in that case).
     let head_write_start = std::time::Instant::now();
-    if let Err(e) = write_head_after_parse(conn) {
-        log::warn!("Σ head-write failed (parse otherwise OK): {e:#}");
+    if let Some(h) = head_handle {
+        match h.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => log::warn!("Σ head-write failed (parse otherwise OK): {e:#}"),
+            Err(_) => log::warn!("Σ head-write thread panicked (parse otherwise OK)"),
+        }
     }
     let head_write_elapsed = head_write_start.elapsed();
 
@@ -916,9 +1023,22 @@ const SEGMENT_FILE_SUFFIXES: &[&str] = &["source.capnp", "ast.capnp", "bindings.
 /// IPLD/ATproto precedent: the CID is the version. Schema evolution
 /// is handled at the typed-reading level, not by versioning the wire.
 ///
-/// Defensive on read: even if a producer wrote non-canonical bytes
-/// (legacy file, runtime bug), the message reader's `canonicalize()`
-/// re-normalizes before hashing — so the chain stays deterministic.
+/// **Fast path**: when every message in the file is single-segment
+/// (the case for all `set_root_canonical`-produced messages — which is
+/// what `write_source_file_record` and `write_ast_node_record` always
+/// emit), the on-disk format reduces to a stream of
+/// `[8-byte header][N*8 bytes canonical data]` records. We can hash
+/// the canonical bytes by walking the headers and feeding the data
+/// slices to BLAKE3 directly — no `capnp::serialize::read_message`
+/// parse, no `canonicalize()` rebuild. Empirically this is ~6× faster
+/// on the mache 163 MB ast.capnp bench. See bead `ley-line-open-cbbedf`.
+///
+/// **Defensive path**: if a record's segment count is anything other
+/// than 1 (legacy producer, future change), fall back to the
+/// `read_message` + `canonicalize()` route for that whole file. The
+/// fallback is opt-in for the single file with a non-canonical record,
+/// not the whole hash — so a single legacy file doesn't pay the slow
+/// path for the entire set.
 fn hash_segment_files(db_path: &Path) -> Result<([u8; 32], u64)> {
     let mut hasher = blake3::Hasher::new();
     let mut total: u64 = 0;
@@ -929,20 +1049,91 @@ fn hash_segment_files(db_path: &Path) -> Result<([u8; 32], u64)> {
         }
         let file_bytes =
             std::fs::read(&p).with_context(|| format!("read segment {}", p.display()))?;
-        let mut slice: &[u8] = &file_bytes;
-        while !slice.is_empty() {
-            let msg =
-                capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new())
-                    .with_context(|| format!("parse segment {}", p.display()))?;
-            let canonical_words = msg
-                .canonicalize()
-                .with_context(|| format!("canonicalize segment {}", p.display()))?;
-            let canonical_bytes = capnp::Word::words_to_bytes(&canonical_words);
-            total = total.saturating_add(canonical_bytes.len() as u64);
-            hasher.update(canonical_bytes);
-        }
+        let bytes_after = hash_canonical_stream_fast(&file_bytes, &mut hasher)
+            .or_else(|| {
+                // Legacy producer / multi-segment record / corruption —
+                // fall through to the read_message+canonicalize path so
+                // the contract is honored even when the fast path's
+                // assumptions don't hold.
+                hash_canonical_stream_slow(&file_bytes, &mut hasher, &p).ok()
+            })
+            .ok_or_else(|| anyhow::anyhow!("parse segment {}", p.display()))?;
+        total = total.saturating_add(bytes_after);
     }
     Ok((*hasher.finalize().as_bytes(), total))
+}
+
+/// Fast canonical-bytes hash: walks the on-disk capnp stream as
+/// `[8-byte header][segment]` records, feeding each segment's bytes
+/// (the canonical bytes per `set_root_canonical`) directly to the
+/// running BLAKE3 hasher. Returns `Some(total_canonical_bytes)` on
+/// success, `None` if any record is multi-segment (≠ canonical-form-
+/// from-producer) — the caller falls back to the slow path on `None`.
+///
+/// Invariant: the producer (`write_source_file_record`,
+/// `write_ast_node_record`) always writes single-segment messages via
+/// `set_root_canonical`. The Cap'n Proto framing format for a single
+/// segment message is exactly:
+///   - 4 bytes: `segment_count - 1` (== 0 for single-segment)
+///   - 4 bytes: segment length in words
+///   - segment_length * 8 bytes: segment data
+/// No padding required since the header is already 8-byte aligned.
+fn hash_canonical_stream_fast(file_bytes: &[u8], hasher: &mut blake3::Hasher) -> Option<u64> {
+    const WORD_BYTES: usize = 8;
+    const HEADER_BYTES: usize = 8;
+    let mut total: u64 = 0;
+    let mut i = 0;
+    while i < file_bytes.len() {
+        if i + HEADER_BYTES > file_bytes.len() {
+            return None; // truncated header
+        }
+        let seg_count_minus_1 =
+            u32::from_le_bytes([file_bytes[i], file_bytes[i + 1], file_bytes[i + 2], file_bytes[i + 3]]);
+        if seg_count_minus_1 != 0 {
+            return None; // multi-segment — fall back to slow path
+        }
+        let seg_words = u32::from_le_bytes([
+            file_bytes[i + 4],
+            file_bytes[i + 5],
+            file_bytes[i + 6],
+            file_bytes[i + 7],
+        ]) as usize;
+        i += HEADER_BYTES;
+        let seg_bytes = seg_words * WORD_BYTES;
+        if i + seg_bytes > file_bytes.len() {
+            return None; // truncated segment
+        }
+        let canonical = &file_bytes[i..i + seg_bytes];
+        hasher.update(canonical);
+        total = total.saturating_add(seg_bytes as u64);
+        i += seg_bytes;
+    }
+    Some(total)
+}
+
+/// Slow canonical-bytes hash via `read_message` + `canonicalize()`.
+/// Kept as the fallback when `hash_canonical_stream_fast` returns
+/// `None` (legacy producer or multi-segment record). The pre-9ccbc7
+/// implementation; preserved verbatim for the fallback contract.
+fn hash_canonical_stream_slow(
+    file_bytes: &[u8],
+    hasher: &mut blake3::Hasher,
+    p: &Path,
+) -> Result<u64> {
+    let mut total: u64 = 0;
+    let mut slice: &[u8] = file_bytes;
+    while !slice.is_empty() {
+        let msg =
+            capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new())
+                .with_context(|| format!("parse segment {}", p.display()))?;
+        let canonical_words = msg
+            .canonicalize()
+            .with_context(|| format!("canonicalize segment {}", p.display()))?;
+        let canonical_bytes = capnp::Word::words_to_bytes(&canonical_words);
+        total = total.saturating_add(canonical_bytes.len() as u64);
+        hasher.update(canonical_bytes);
+    }
+    Ok(total)
 }
 
 /// T8.5: read the existing `${db}.head.capnp`, returning the chain
@@ -978,23 +1169,15 @@ fn read_head_for_chain(head_path: &Path) -> ([u8; 32], u64) {
     (prev_root, prev_gen.saturating_add(1))
 }
 
-/// T8.5: compute the segment hash for this run, read the existing
-/// Head for the parent/gen chain, and write the new Head. Skips when
-/// the connection isn't file-backed (`:memory:`) — same gating as
-/// T8.3's snapshot writers.
-fn write_head_after_parse(conn: &Connection) -> Result<()> {
-    let row: rusqlite::Result<String> = conn.query_row(
-        "SELECT file FROM pragma_database_list WHERE name = 'main' LIMIT 1",
-        [],
-        |r| r.get(0),
-    );
-    let db_path = match row {
-        Ok(s) if !s.is_empty() => std::path::PathBuf::from(s),
-        _ => return Ok(()),
-    };
-
-    let (root, segment_bytes) = hash_segment_files(&db_path)?;
-    let head_path = with_extension(&db_path, "head.capnp");
+/// T8.5: compute the segment hash for this run (from `db_path`'s
+/// sibling ast/source segment files), read the existing Head for the
+/// parent/gen chain, and write the new Head. Pure filesystem work —
+/// no SQLite handle required, so a parent caller can dispatch this on
+/// a worker thread that runs concurrently with post-COMMIT SQLite work
+/// (e.g. `create_post_load_indexes`). See bead `ley-line-open-cbbedf`.
+fn write_head_for_path(db_path: &Path) -> Result<()> {
+    let (root, segment_bytes) = hash_segment_files(db_path)?;
+    let head_path = with_extension(db_path, "head.capnp");
     let (parent, generation) = read_head_for_chain(&head_path);
 
     use leyline_schema_capnp::head_capnp::head;
@@ -1018,6 +1201,25 @@ fn write_head_after_parse(conn: &Connection) -> Result<()> {
         .with_context(|| format!("open head {}", head_path.display()))?;
     capnp::serialize::write_message(&mut f, &canonical).context("write Head capnp record")?;
     Ok(())
+}
+
+/// T8.5: thin wrapper around `write_head_for_path` that pulls the
+/// db_path from a SQLite connection. Skips when the connection isn't
+/// file-backed (`:memory:`) — same gating as T8.3's snapshot writers.
+/// Kept for callers that don't have the path on hand and don't need
+/// the parallel-dispatch shape that `parse_into_conn` uses internally.
+#[allow(dead_code)]
+fn write_head_after_parse(conn: &Connection) -> Result<()> {
+    let row: rusqlite::Result<String> = conn.query_row(
+        "SELECT file FROM pragma_database_list WHERE name = 'main' LIMIT 1",
+        [],
+        |r| r.get(0),
+    );
+    let db_path = match row {
+        Ok(s) if !s.is_empty() => std::path::PathBuf::from(s),
+        _ => return Ok(()),
+    };
+    write_head_for_path(&db_path)
 }
 
 // ---------------------------------------------------------------------------
@@ -1075,15 +1277,20 @@ fn with_extension(p: &Path, ext: &str) -> std::path::PathBuf {
     out
 }
 
-/// T8.3: serialize a single `SourceFile` capnp message and append it
-/// to the source-snapshot file. Per the post-RTFM canonical-encoding
-/// commitment in ADR-0014, the producer writes via
-/// `set_root_canonical` so the on-disk bytes are byte-stable across
-/// additive schema changes (encoding spec bullet 3:
+/// T8.3: serialize a single `SourceFile` capnp message to a byte buffer.
+/// Per the post-RTFM canonical-encoding commitment in ADR-0014, the
+/// producer writes via `set_root_canonical` so the on-disk bytes are
+/// byte-stable across additive schema changes (encoding spec bullet 3:
 /// *"adding a new field to a struct does not affect the canonical
 /// encoding of messages that do not set that field"*).
-fn write_source_file_record(
-    writer: &mut CapnpWriter,
+///
+/// Writes into a `Vec<u8>` so the parallel parse phase can call this
+/// concurrently (the BufWriter path is single-threaded — one
+/// `&mut CapnpWriter` per main-thread iteration). Main thread later
+/// concatenates the per-file buffers into the BufWriter. See bead
+/// `ley-line-open-cbbedf`.
+fn serialize_source_file_record(
+    buf: &mut Vec<u8>,
     id: &str,
     language: &str,
     canonical_path: &str,
@@ -1108,13 +1315,14 @@ fn write_source_file_record(
     canonical
         .set_root_canonical(src.get_root_as_reader::<source_file::Reader>()?)
         .context("canonicalize SourceFile")?;
-    capnp::serialize::write_message(writer, &canonical).context("write SourceFile capnp record")?;
+    capnp::serialize::write_message(buf, &canonical).context("write SourceFile capnp record")?;
     Ok(())
 }
 
-/// T8.3: serialize a single `AstNode` capnp message — canonical form
-/// per the ADR-0014 producer commitment (see write_source_file_record).
-fn write_ast_node_record(writer: &mut CapnpWriter, a: &AstEntry) -> Result<()> {
+/// T8.3: serialize a single `AstNode` capnp message to a byte buffer —
+/// canonical form per the ADR-0014 producer commitment (see
+/// serialize_source_file_record).
+fn serialize_ast_node_record(buf: &mut Vec<u8>, a: &AstEntry) -> Result<()> {
     use leyline_schema_capnp::ast_capnp::ast_node;
 
     let mut src = capnp::message::Builder::new_default();
@@ -1142,7 +1350,7 @@ fn write_ast_node_record(writer: &mut CapnpWriter, a: &AstEntry) -> Result<()> {
     canonical
         .set_root_canonical(src.get_root_as_reader::<ast_node::Reader>()?)
         .context("canonicalize AstNode")?;
-    capnp::serialize::write_message(writer, &canonical).context("write AstNode capnp record")?;
+    capnp::serialize::write_message(buf, &canonical).context("write AstNode capnp record")?;
     Ok(())
 }
 
@@ -1222,6 +1430,26 @@ fn parse_file_pure(
         &mut refs,
     );
 
+    // Pre-serialize capnp records in the rayon worker so the post-
+    // parse main-thread loop just writes pre-built byte buffers to the
+    // BufWriter — moves the per-file canonicalize cost out of the
+    // serial insert phase. See bead `ley-line-open-cbbedf`.
+    let mut source_capnp_bytes = Vec::with_capacity(256);
+    serialize_source_file_record(
+        &mut source_capnp_bytes,
+        source_id,
+        language.name(),
+        abs_path,
+        file_mtime,
+        file_size,
+    )?;
+    // ~150 bytes per AstNode record (canonical: id + source_id + kind +
+    // Range); pre-size to avoid re-allocs during the per-node loop.
+    let mut ast_capnp_bytes = Vec::with_capacity(ast_entries.len() * 160);
+    for a in &ast_entries {
+        serialize_ast_node_record(&mut ast_capnp_bytes, a)?;
+    }
+
     Ok(ParsedFile {
         rel: source_id.to_string(),
         abs_path: abs_path.to_string(),
@@ -1231,6 +1459,8 @@ fn parse_file_pure(
         refs,
         file_mtime,
         file_size,
+        source_capnp_bytes,
+        ast_capnp_bytes,
     })
 }
 

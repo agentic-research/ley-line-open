@@ -102,7 +102,35 @@ async fn main() -> Result<()> {
     let cli = Cli::from_arg_matches(&matches)?;
 
     match cli.command {
-        Cmd::Shared(cmd) => leyline_cli_lib::run(cmd).await,
+        Cmd::Shared(cmd) => {
+            // Parse is a fire-and-forget terminal command: after
+            // cmd_parse returns Ok the work is on disk and the user
+            // is staring at the wall clock. Skipping the tokio runtime
+            // drop + SQLite Connection drop + libc atexit handlers
+            // recovers ~125 ms of pure post-work user-visible wall
+            // time on macOS. We use `libc::_exit` (not
+            // `std::process::exit`) because std's variant still runs
+            // libc cleanup; `_exit` is the immediate kill syscall.
+            // Safe: `synchronous=OFF` + DELETE-mode SQLite means no
+            // owed fsync, the segments + .db + head + indexes are on
+            // disk, and we've already flushed stderr via eprintln in
+            // cmd_parse. Other shared commands fall through to the
+            // normal return path. See bead `ley-line-open-cbbedf`.
+            let is_parse = matches!(cmd, leyline_cli_lib::Commands::Parse { .. });
+            let r = leyline_cli_lib::run(cmd).await;
+            if is_parse && r.is_ok() {
+                // Flush stdout/stderr explicitly before _exit since
+                // _exit doesn't flush stdio.
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                let _ = std::io::stderr().flush();
+                // SAFETY: libc::_exit is a syscall wrapper; it
+                // unconditionally exits the process with the given
+                // status. No invariants needed.
+                unsafe { libc::_exit(0) };
+            }
+            r
+        }
         Cmd::Daemon {
             arena,
             arena_size_mib,

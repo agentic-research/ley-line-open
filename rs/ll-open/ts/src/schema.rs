@@ -300,6 +300,29 @@ pub fn create_post_load_indexes(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Variant of [`create_post_load_indexes`] that omits `idx_source_file`.
+/// Ley-line's `cmd_parse` never populates the `nodes.source_file`
+/// column (that's mache's lazy-resolution flow), so the partial index
+/// `WHERE source_file IS NOT NULL` materializes to zero rows yet still
+/// pays a 535K-row scan on the mache 765-file bench (~45 ms) to
+/// evaluate the predicate against every row. Skipping here is safe
+/// because:
+///   - mache builds its own schema with the indexes mache needs
+///     (via mache's own DDL, not via `create_post_load_indexes_*`).
+///   - Any ley-line code path that needs `idx_source_file` will
+///     trigger its creation via `create_nodes_indexes` (still
+///     idempotent), so semantics are preserved.
+///
+/// See bead `ley-line-open-cbbedf` Attack 3.
+pub fn create_post_load_indexes_skip_unused(conn: &Connection) -> Result<()> {
+    // Just `idx_parent_name` from the nodes-indexes pair — the second
+    // (`idx_source_file`) is the unused one we're skipping.
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_parent_name ON nodes(parent_id, name);")?;
+    conn.execute_batch(AST_INDEXES_DDL)?;
+    create_refs_indexes(conn)?;
+    Ok(())
+}
+
 /// Insert or replace a file-index row.
 pub fn upsert_file_index(conn: &Connection, path: &str, mtime: i64, size: i64) -> Result<()> {
     conn.execute(

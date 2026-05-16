@@ -1583,6 +1583,7 @@ dependencies = [
  "dirs",
  "env_logger",
  "leyline-cli-lib",
+ "libc",
  "tokio",
 ]
 

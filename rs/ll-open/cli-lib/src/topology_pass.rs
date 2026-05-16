@@ -470,16 +470,31 @@ fn extract_specifiers(text: &str, lang: Lang) -> Vec<String> {
                 }
             }
             Lang::Ts => {
+                // Skip comment lines outright (Copilot finding 11). The
+                // earlier `line.contains("import(")` clause matched the
+                // commented-out specifier inside `// import('./x')` and
+                // `/* import('./x') */`. We also skip lines starting
+                // with `*` as a best-effort guard for block-comment
+                // continuations; tracking enter/exit of `/* ... */`
+                // blocks across lines is out of scope for this regex
+                // sweep.
+                if line.starts_with("//") || line.starts_with("/*") || line.starts_with('*') {
+                    continue;
+                }
                 // Static `import ...`, dynamic `import(...)`, top-level
                 // `import('./x')`, and `export { x } from './x'` all
                 // carry the module specifier in the first quoted region
-                // of the line.
+                // of the line. The dynamic-import branch enforces a
+                // word boundary in front of `import(` so identifiers
+                // ending in `import(` (e.g. `myimport(`) don't false-
+                // match — and so the commented forms ruled out above
+                // would also be ruled out even if the skip leaked.
                 let take_first_quoted = line.starts_with("import ")
                     || line.starts_with("import(")
                     // `export { x } from './x'` / `export * from './x'`
                     || (line.starts_with("export") && line.contains(" from "))
                     // `await import('./x')`, `const x = await import('./x')`
-                    || line.contains("import(");
+                    || has_dynamic_import(line);
                 if take_first_quoted {
                     if let Some(s) = extract_quoted(line) {
                         out.push(s);
@@ -513,6 +528,34 @@ fn extract_specifiers(text: &str, lang: Lang) -> Vec<String> {
         }
     }
     out
+}
+
+/// Detect a dynamic `import(...)` call in `line`. Requires a token
+/// boundary in front of `import` so identifiers ending in `import(`
+/// (e.g. `someimport(`) don't false-match (Copilot finding 11). The
+/// boundary check looks at the byte immediately preceding the match:
+/// any non-alphanumeric, non-`_`, non-`$` character qualifies (covers
+/// `await import(`, ` import(`, `=import(`, etc.), and a match at
+/// position 0 is also valid (handled by the upstream `starts_with`
+/// branch but treated as a boundary here too for completeness).
+fn has_dynamic_import(line: &str) -> bool {
+    let needle = "import(";
+    let bytes = line.as_bytes();
+    let mut start = 0;
+    while let Some(pos) = line[start..].find(needle) {
+        let abs = start + pos;
+        let boundary_ok = if abs == 0 {
+            true
+        } else {
+            let prev = bytes[abs - 1];
+            !prev.is_ascii_alphanumeric() && prev != b'_' && prev != b'$'
+        };
+        if boundary_ok {
+            return true;
+        }
+        start = abs + 1;
+    }
+    false
 }
 
 /// Pull out the first quoted string from `line`. Handles single, double,
@@ -920,6 +963,49 @@ import (
     fn extract_specifiers_ts_dynamic_import() {
         let specs = extract_specifiers("const x = await import('./bar');\n", Lang::Ts);
         assert_eq!(specs, vec!["./bar"]);
+    }
+
+    #[test]
+    fn extract_specifiers_ts_line_comment_does_not_match() {
+        // Copilot finding 11: commented-out dynamic imports must not leak.
+        let specs = extract_specifiers("// import('./should-not-match')\n", Lang::Ts);
+        assert!(
+            specs.is_empty(),
+            "line comment leaked specifiers: {specs:?}"
+        );
+    }
+
+    #[test]
+    fn extract_specifiers_ts_block_comment_does_not_match() {
+        let specs = extract_specifiers("/* import('./also-should-not-match') */\n", Lang::Ts);
+        assert!(
+            specs.is_empty(),
+            "block comment leaked specifiers: {specs:?}"
+        );
+    }
+
+    #[test]
+    fn extract_specifiers_ts_block_comment_continuation_does_not_match() {
+        let specs = extract_specifiers(" * import('./should-not-match')\n", Lang::Ts);
+        assert!(
+            specs.is_empty(),
+            "block comment continuation leaked specifiers: {specs:?}"
+        );
+    }
+
+    #[test]
+    fn has_dynamic_import_requires_token_boundary() {
+        // True positives.
+        assert!(has_dynamic_import("await import('./x')"));
+        assert!(has_dynamic_import("const r = await import('./x')"));
+        assert!(has_dynamic_import("foo = import('./x')"));
+        assert!(has_dynamic_import("import('./x')"));
+        // False positives ruled out by the boundary check.
+        assert!(!has_dynamic_import("myimport('./x')"));
+        assert!(!has_dynamic_import("someimport('./x')"));
+        assert!(!has_dynamic_import("0import('./x')")); // not really TS but covers digit boundary
+        assert!(!has_dynamic_import("_import('./x')"));
+        assert!(!has_dynamic_import("$import('./x')"));
     }
 
     #[test]

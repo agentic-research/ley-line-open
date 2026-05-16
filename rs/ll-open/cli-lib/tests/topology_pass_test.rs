@@ -440,6 +440,81 @@ fn gate2_recall_detects_all_four_language_imports() {
     assert_has_edge(&edge_view, Lang::Ts, "reexport.ts", "util.ts");
 }
 
+/// Gate 2b — TS comment-line `import(` false-positive guard (Copilot
+/// finding 11).
+///
+/// Fixture `ts/with-comments.ts` contains three import-shaped lines:
+///   1. `// import('./should-not-match')`       — line comment
+///   2. `/* import('./also-should-not-match') */` — block comment
+///   3. `const real = await import('./real-import');` — real dynamic import
+///
+/// Decoy files `should-not-match.ts` and `also-should-not-match.ts`
+/// exist on disk so the resolver WOULD pick them up if the parser
+/// leaked the commented specifiers. Real target `real-import.ts`
+/// exists too so the genuine import is verifiable.
+///
+/// Falsifiable proof: before the fix the line-by-line scan matched
+/// `// import('./should-not-match')` because the
+/// `line.contains("import(")` branch ignored the leading `//`. The
+/// fix must (a) skip line/block-comment lines and (b) tighten the
+/// dynamic-import predicate to a token-boundary check.
+#[test]
+fn gate2b_ts_comment_lines_dont_produce_phantom_edges() {
+    let files = handcrafted_files();
+    let root = handcrafted_root();
+    let out = topology_pass::run(&files, &root).expect("run handcrafted");
+
+    let edge_view: Vec<(Lang, String, String)> = out
+        .edge_estimates
+        .iter()
+        .map(|e| (e.language, basename(&files[e.from]), basename(&files[e.to])))
+        .collect();
+
+    let edges_from_with_comments: Vec<&(Lang, String, String)> = edge_view
+        .iter()
+        .filter(|(_, from, _)| from == "with-comments.ts")
+        .collect();
+
+    eprintln!(
+        "[Gate 2b / TS comment skip] {} edges from with-comments.ts:",
+        edges_from_with_comments.len()
+    );
+    for e in &edges_from_with_comments {
+        eprintln!("    {:?} {} -> {}", e.0, e.1, e.2);
+    }
+
+    // (a) The real import MUST be detected.
+    let has_real = edges_from_with_comments
+        .iter()
+        .any(|(lang, _, to)| *lang == Lang::Ts && to == "real-import.ts");
+    assert!(
+        has_real,
+        "Gate 2b FAILED: real dynamic import `await import('./real-import')` \
+         was not detected; edges from with-comments.ts: {edges_from_with_comments:?}"
+    );
+
+    // (b) Commented-out imports must NOT produce edges.
+    let line_comment_leaked = edges_from_with_comments
+        .iter()
+        .any(|(_, _, to)| to == "should-not-match.ts");
+    assert!(
+        !line_comment_leaked,
+        "Gate 2b FAILED: line comment `// import('./should-not-match')` \
+         leaked through as a real edge; edges from with-comments.ts: \
+         {edges_from_with_comments:?}"
+    );
+
+    let block_comment_leaked = edges_from_with_comments
+        .iter()
+        .any(|(_, _, to)| to == "also-should-not-match.ts");
+    assert!(
+        !block_comment_leaked,
+        "Gate 2b FAILED: block comment `/* import('./also-should-not-match') */` \
+         leaked through as a real edge; edges from with-comments.ts: \
+         {edges_from_with_comments:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Gate 3 — manifest detection.
 //

@@ -461,7 +461,17 @@ fn extract_specifiers(text: &str, lang: Lang) -> Vec<String> {
                 }
             }
             Lang::Ts => {
-                if line.starts_with("import ") || line.starts_with("import(") {
+                // Static `import ...`, dynamic `import(...)`, top-level
+                // `import('./x')`, and `export { x } from './x'` all
+                // carry the module specifier in the first quoted region
+                // of the line.
+                let take_first_quoted = line.starts_with("import ")
+                    || line.starts_with("import(")
+                    // `export { x } from './x'` / `export * from './x'`
+                    || (line.starts_with("export") && line.contains(" from "))
+                    // `await import('./x')`, `const x = await import('./x')`
+                    || line.contains("import(");
+                if take_first_quoted {
                     if let Some(s) = extract_quoted(line) {
                         out.push(s);
                     }
@@ -898,6 +908,31 @@ import (
         let specs =
             extract_specifiers(r#"const fs = require("./fs");"#, Lang::Ts);
         assert_eq!(specs, vec!["./fs"]);
+    }
+
+    #[test]
+    fn extract_specifiers_ts_export_from() {
+        let specs = extract_specifiers(
+            "export { x } from './foo';\n",
+            Lang::Ts,
+        );
+        assert_eq!(specs, vec!["./foo"]);
+    }
+
+    #[test]
+    fn extract_specifiers_ts_export_star_from() {
+        let specs =
+            extract_specifiers("export * from './bar';\n", Lang::Ts);
+        assert_eq!(specs, vec!["./bar"]);
+    }
+
+    #[test]
+    fn extract_specifiers_ts_dynamic_import() {
+        let specs = extract_specifiers(
+            "const x = await import('./bar');\n",
+            Lang::Ts,
+        );
+        assert_eq!(specs, vec!["./bar"]);
     }
 
     #[test]

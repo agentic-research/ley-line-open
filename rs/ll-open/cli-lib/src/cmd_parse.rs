@@ -94,7 +94,7 @@ struct ParsedFile {
 /// the prepared-statement cache holds one entry per unique SQL string,
 /// and bloated strings hurt the cache hit rate for the trailing
 /// partial batch (a different SQL string per partial size).
-const BULK_BATCH_ROWS: usize = 2000;
+const BULK_BATCH_ROWS: usize = 3000;
 
 /// Build a multi-row VALUES placeholder string: `(?,?,?,...),(?,?,...),...`.
 /// `rows` total tuples, each with `cols` placeholders.

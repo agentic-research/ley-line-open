@@ -155,10 +155,16 @@ pub fn run(files: &[PathBuf], source: &Path) -> Result<TopologyOutput> {
     let (file_regions, n_regions) = assign_regions(files, &metas, &manifests, source);
 
     // ---- P3: regex import sweep -----------------------------------------
-    let edge_estimates = sweep_imports(files);
+    // `n_files_scanned` is the number of files actually OPENED for import
+    // detection (i.e. files with a known language extension and a
+    // non-empty head), NOT the number that produced resolved edges. A
+    // file with `import "fmt"` where `fmt` doesn't resolve is still
+    // scanned — that's the semantic we want for the cost ceiling.
+    let (edge_estimates, n_files_scanned) = sweep_imports(files);
 
-    // Aggregate file-edges into region-edges (sum of confidences). Stored
-    // sorted by (a, b) for determinism (Gate 4).
+    // Aggregate file-edges into region-edges (mean confidence in [0, 1]
+    // per region pair — see `aggregate_region_edges`). Stored sorted by
+    // (a, b) for determinism (Gate 4).
     let region_edges = aggregate_region_edges(&edge_estimates, &file_regions);
 
     // Parse order: stable sort of `0..files.len()` by (region, depth,
@@ -172,11 +178,7 @@ pub fn run(files: &[PathBuf], source: &Path) -> Result<TopologyOutput> {
         n_regions,
         n_manifests,
         n_edges: edge_estimates.len() as u64,
-        n_files_scanned: edge_estimates
-            .iter()
-            .map(|e| e.from)
-            .collect::<BTreeSet<_>>()
-            .len() as u64,
+        n_files_scanned,
         elapsed_us,
     };
 
@@ -604,9 +606,17 @@ impl ResolverIndex {
     }
 }
 
-fn sweep_imports(files: &[PathBuf]) -> Vec<EdgeEstimate> {
+/// Sweep imports across `files`.
+///
+/// Returns `(edges, n_files_scanned)`. `n_files_scanned` counts every
+/// file that was opened for import detection — i.e. files with a
+/// recognized language extension and a non-empty head. Files that were
+/// scanned but produced zero resolved edges still count, which is what
+/// we want for the cost ceiling (Gate 1).
+fn sweep_imports(files: &[PathBuf]) -> (Vec<EdgeEstimate>, u64) {
     let index = ResolverIndex::build(files);
     let mut edges: Vec<EdgeEstimate> = Vec::new();
+    let mut n_files_scanned: u64 = 0;
 
     for (i, p) in files.iter().enumerate() {
         let ext = p
@@ -621,6 +631,9 @@ fn sweep_imports(files: &[PathBuf]) -> Vec<EdgeEstimate> {
         if head.is_empty() {
             continue;
         }
+        // A file with a recognized language and a non-empty head was
+        // scanned, regardless of whether any specifier resolves.
+        n_files_scanned += 1;
         let specs = extract_specifiers(&head, lang);
         for spec in specs {
             let (targets, base_conf) = index.resolve(&spec, lang);
@@ -659,7 +672,7 @@ fn sweep_imports(files: &[PathBuf]) -> Vec<EdgeEstimate> {
             .then(a.to.cmp(&b.to))
             .then((a.language as u32).cmp(&(b.language as u32)))
     });
-    edges
+    (edges, n_files_scanned)
 }
 
 // ---------------------------------------------------------------------------

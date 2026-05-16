@@ -155,9 +155,9 @@ async fn sheaf_invalidate_returns_non_empty_cascade_over_uds() {
         .unwrap_or_else(|| panic!("invalidated must be an array; full response: {invalidate}"))
         .iter()
         .map(|v| {
-            v.as_u64().unwrap_or_else(|| {
-                panic!("invalidated entries must be u64-coercible; got {v:?}")
-            }) as u32
+            v.as_u64()
+                .unwrap_or_else(|| panic!("invalidated entries must be u64-coercible; got {v:?}"))
+                as u32
         })
         .collect();
 

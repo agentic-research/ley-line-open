@@ -42,8 +42,7 @@ CREATE TABLE IF NOT EXISTS _ast (
 );";
 
 /// DDL for the `_ast` indexes — deferred post-COMMIT for bulk-load.
-pub const AST_INDEXES_DDL: &str =
-    "CREATE INDEX IF NOT EXISTS idx_ast_source ON _ast(source_id);";
+pub const AST_INDEXES_DDL: &str = "CREATE INDEX IF NOT EXISTS idx_ast_source ON _ast(source_id);";
 
 /// Combined `_ast` table + index DDL. Preserves the pre-split contract.
 pub const AST_DDL: &str = "\
@@ -170,8 +169,7 @@ CREATE TABLE IF NOT EXISTS node_defs (
 );";
 
 /// DDL for the `node_defs` indexes — deferred post-COMMIT.
-pub const DEFS_INDEXES_DDL: &str =
-    "CREATE INDEX IF NOT EXISTS idx_defs_token ON node_defs(token);";
+pub const DEFS_INDEXES_DDL: &str = "CREATE INDEX IF NOT EXISTS idx_defs_token ON node_defs(token);";
 
 /// Combined `node_defs` table + index DDL.
 pub const DEFS_DDL: &str = "\

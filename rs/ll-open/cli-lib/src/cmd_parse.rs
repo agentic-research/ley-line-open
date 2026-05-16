@@ -7,6 +7,7 @@
 //! - **Batched**: all inserts happen in a single SQLite transaction.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -515,6 +516,19 @@ pub fn parse_into_conn(
     drop(stmt_import);
     drop(stmt_file_idx);
 
+    // Flush the capnp dual-write `BufWriter`s before COMMIT and before
+    // `write_head_after_parse` reads the segments for hashing —
+    // otherwise the buffered tail would be invisible to the Σ root
+    // computation, yielding a hash that disagrees with the on-disk
+    // bytes once the writer is dropped. Drop after flush so the file
+    // handle is closed by the time the head pass runs.
+    if let Some(mut w) = ast_writer.take() {
+        w.flush().context("flush ast.capnp BufWriter")?;
+    }
+    if let Some(mut w) = source_writer.take() {
+        w.flush().context("flush source.capnp BufWriter")?;
+    }
+
     conn.execute_batch("COMMIT")?;
 
     // Build secondary indexes in one pass now that all rows are
@@ -725,7 +739,16 @@ fn write_head_after_parse(conn: &Connection) -> Result<()> {
 /// rewrites these files — they're snapshots of `_ast` and `_source`,
 /// not append-only event logs (the binding log in T8.2 is append-only
 /// because LSP enrichment calls accumulate; parse is a single pass).
-fn sibling_snapshot_writers(conn: &Connection) -> (Option<std::fs::File>, Option<std::fs::File>) {
+///
+/// Returns `BufWriter<File>` so each `capnp::serialize::write_message`
+/// call batches its (typically tiny) byte sequence in userspace
+/// instead of issuing a `write(2)` per message. On the mache benchmark
+/// (534k AstNode records) raw `File` writes burned ~3.5s in
+/// `write_message` alone; with default 8 KiB userspace buffering the
+/// system-call rate drops by ~30×. See bead `ley-line-open-9ccbc7`.
+type CapnpWriter = BufWriter<std::fs::File>;
+
+fn sibling_snapshot_writers(conn: &Connection) -> (Option<CapnpWriter>, Option<CapnpWriter>) {
     let row: rusqlite::Result<String> = conn.query_row(
         "SELECT file FROM pragma_database_list WHERE name = 'main' LIMIT 1",
         [],
@@ -739,13 +762,14 @@ fn sibling_snapshot_writers(conn: &Connection) -> (Option<std::fs::File>, Option
     let ast_path = with_extension(&db_path, "ast.capnp");
     let source_path = with_extension(&db_path, "source.capnp");
 
-    let open = |p: &Path| -> Option<std::fs::File> {
+    let open = |p: &Path| -> Option<CapnpWriter> {
         std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(p)
             .ok()
+            .map(BufWriter::new)
     };
 
     (open(&ast_path), open(&source_path))
@@ -768,7 +792,7 @@ fn with_extension(p: &Path, ext: &str) -> std::path::PathBuf {
 /// *"adding a new field to a struct does not affect the canonical
 /// encoding of messages that do not set that field"*).
 fn write_source_file_record(
-    writer: &mut std::fs::File,
+    writer: &mut CapnpWriter,
     id: &str,
     language: &str,
     canonical_path: &str,
@@ -799,7 +823,7 @@ fn write_source_file_record(
 
 /// T8.3: serialize a single `AstNode` capnp message — canonical form
 /// per the ADR-0014 producer commitment (see write_source_file_record).
-fn write_ast_node_record(writer: &mut std::fs::File, a: &AstEntry) -> Result<()> {
+fn write_ast_node_record(writer: &mut CapnpWriter, a: &AstEntry) -> Result<()> {
     use leyline_schema_capnp::ast_capnp::ast_node;
 
     let mut src = capnp::message::Builder::new_default();

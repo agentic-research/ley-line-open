@@ -70,6 +70,265 @@ struct ParsedFile {
 }
 
 // ---------------------------------------------------------------------------
+// Batched-insert plumbing
+// ---------------------------------------------------------------------------
+
+/// Rows per multi-row VALUES batch. 2000 × 9 columns (`_ast`, the
+/// widest table) = 18 000 bound parameters per statement — well under
+/// SQLite's 32K bound-param cap (`SQLITE_MAX_VARIABLE_NUMBER` default
+/// 32 766 since 3.32). Larger batches collapse more transaction edges
+/// per execute; on the mache 765-file bench going from 500 → 2000
+/// rows/batch shaves another ~10-15% off insert wall.
+///
+/// Capped at 2000 so the per-batch SQL string stays under ~50 KiB —
+/// the prepared-statement cache holds one entry per unique SQL string,
+/// and bloated strings hurt the cache hit rate for the trailing
+/// partial batch (a different SQL string per partial size).
+const BULK_BATCH_ROWS: usize = 2000;
+
+/// Build a multi-row VALUES placeholder string: `(?,?,?,...),(?,?,...),...`.
+/// `rows` total tuples, each with `cols` placeholders.
+fn build_values_clause(rows: usize, cols: usize) -> String {
+    let row_tuple = {
+        let mut s = String::with_capacity(2 * cols + 2);
+        s.push('(');
+        for i in 0..cols {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push('?');
+        }
+        s.push(')');
+        s
+    };
+    let mut out = String::with_capacity(row_tuple.len() * rows + rows);
+    for i in 0..rows {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&row_tuple);
+    }
+    out
+}
+
+/// Execute a multi-row INSERT against `conn`. `prefix` is the SQL up
+/// to and including `VALUES `; this helper appends the placeholder
+/// tuples and binds. `params` is borrowed `&dyn ToSql` references that
+/// must outlive the statement step.
+fn exec_batched(
+    conn: &Connection,
+    prefix: &str,
+    rows: usize,
+    cols: usize,
+    params: &[&dyn rusqlite::ToSql],
+) -> Result<()> {
+    if rows == 0 {
+        return Ok(());
+    }
+    let mut sql = String::with_capacity(prefix.len() + rows * (cols * 2 + 3));
+    sql.push_str(prefix);
+    sql.push_str(&build_values_clause(rows, cols));
+    let mut stmt = conn.prepare_cached(&sql)?;
+    stmt.execute(rusqlite::params_from_iter(params.iter().copied()))?;
+    Ok(())
+}
+
+/// Generic flush: drain `rows`-shaped data in BULK_BATCH_ROWS chunks
+/// plus a final partial-chunk. `prefix` is the SQL prefix ending in
+/// `VALUES `, `cols` is the per-row placeholder count, and `into_params`
+/// flattens a slice of rows into a `Vec<&dyn ToSql>` borrowing from
+/// the chunk (no per-row allocation). Borrow rules: the returned
+/// references live as long as the chunk slice, which is at least the
+/// statement-step scope.
+fn flush_in_batches<R, F>(
+    conn: &Connection,
+    rows: Vec<R>,
+    prefix: &str,
+    cols: usize,
+    mut into_params: F,
+) -> Result<()>
+where
+    F: for<'a> FnMut(&'a [R]) -> Vec<&'a dyn rusqlite::ToSql>,
+{
+    let total = rows.len();
+    if total == 0 {
+        return Ok(());
+    }
+    let mut i = 0;
+    while i + BULK_BATCH_ROWS <= total {
+        let chunk = &rows[i..i + BULK_BATCH_ROWS];
+        let params = into_params(chunk);
+        exec_batched(conn, prefix, BULK_BATCH_ROWS, cols, &params)?;
+        i += BULK_BATCH_ROWS;
+    }
+    if i < total {
+        let chunk = &rows[i..];
+        let n = chunk.len();
+        let params = into_params(chunk);
+        exec_batched(conn, prefix, n, cols, &params)?;
+    }
+    Ok(())
+}
+
+/// Macro to declare a per-table batch buffer + its flush_batched impl.
+/// Centralizes the "Vec of owned rows + push() + flush_batched()"
+/// boilerplate so each table only spells out its column list and the
+/// per-row flatten closure.
+///
+/// The `Value` wire-type union eats the heterogeneity (TEXT/INTEGER mix)
+/// without forcing per-table trait objects.
+macro_rules! batch_table {
+    (
+        $name:ident, $row:ident, $prefix:expr, $cols:expr,
+        push_fn: ($($push_arg:ident: $push_ty:ty),*),
+        push_body: $push_body:block,
+        flatten: |$chunk:ident| $flatten_body:block,
+    ) => {
+        struct $name {
+            rows: Vec<$row>,
+        }
+        struct $row {
+            $($push_arg: $push_ty),*
+        }
+        impl $name {
+            fn with_capacity(cap: usize) -> Self {
+                Self { rows: Vec::with_capacity(cap) }
+            }
+            #[allow(clippy::too_many_arguments)]
+            fn push(&mut self, $($push_arg: $push_ty),*) {
+                let row = $push_body;
+                self.rows.push(row);
+            }
+            // RefBatch overrides this with `flush_batched_for` to thread
+            // the per-table SQL prefix at flush time; the macro-generated
+            // version is unused for that one type. `dead_code` is the
+            // right knob here — the alternative (an extra macro arm or a
+            // separate type per table) trades real complexity for one
+            // warning we already understand.
+            #[allow(dead_code)]
+            fn flush_batched(self, conn: &Connection) -> Result<()> {
+                flush_in_batches(conn, self.rows, $prefix, $cols, |$chunk| $flatten_body)
+            }
+        }
+    };
+}
+
+batch_table! {
+    NodeBatch, NodeRow,
+    "INSERT OR REPLACE INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ",
+    7,
+    push_fn: (id: String, parent_id: String, name: String, kind: i32, size: i64, mtime: i64, record: String),
+    push_body: { NodeRow { id, parent_id, name, kind, size, mtime, record } },
+    flatten: |chunk| {
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 7);
+        for r in chunk {
+            out.push(&r.id);
+            out.push(&r.parent_id);
+            out.push(&r.name);
+            out.push(&r.kind);
+            out.push(&r.size);
+            out.push(&r.mtime);
+            out.push(&r.record);
+        }
+        out
+    },
+}
+
+batch_table! {
+    AstBatch, AstRow,
+    "INSERT OR REPLACE INTO _ast (node_id, source_id, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col) VALUES ",
+    9,
+    push_fn: (node_id: String, source_id: String, node_kind: String, start_byte: i64, end_byte: i64, start_row: i64, start_col: i64, end_row: i64, end_col: i64),
+    push_body: { AstRow { node_id, source_id, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col } },
+    flatten: |chunk| {
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 9);
+        for r in chunk {
+            out.push(&r.node_id);
+            out.push(&r.source_id);
+            out.push(&r.node_kind);
+            out.push(&r.start_byte);
+            out.push(&r.end_byte);
+            out.push(&r.start_row);
+            out.push(&r.start_col);
+            out.push(&r.end_row);
+            out.push(&r.end_col);
+        }
+        out
+    },
+}
+
+batch_table! {
+    SourceBatch, SourceRow,
+    "INSERT OR REPLACE INTO _source (id, language, path) VALUES ",
+    3,
+    push_fn: (id: String, language: String, path: String),
+    push_body: { SourceRow { id, language, path } },
+    flatten: |chunk| {
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 3);
+        for r in chunk {
+            out.push(&r.id);
+            out.push(&r.language);
+            out.push(&r.path);
+        }
+        out
+    },
+}
+
+batch_table! {
+    RefBatch, RefRow,
+    // NOTE: `prefix` is rebound at flush time below since refs/defs/imports
+    // share row shape but target different tables. See post-macro impl.
+    "",
+    3,
+    push_fn: (col0: String, col1: String, col2: String),
+    push_body: { RefRow { col0, col1, col2 } },
+    flatten: |chunk| {
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 3);
+        for r in chunk {
+            out.push(&r.col0);
+            out.push(&r.col1);
+            out.push(&r.col2);
+        }
+        out
+    },
+}
+
+// Override RefBatch::flush_batched to thread the per-table SQL prefix.
+// node_refs / node_defs / _imports share the (TEXT, TEXT, TEXT) shape
+// but live in different tables; rebinding `prefix` per call keeps the
+// macro-generated buffer reusable across all three.
+impl RefBatch {
+    fn flush_batched_for(self, conn: &Connection, prefix: &str) -> Result<()> {
+        flush_in_batches(conn, self.rows, prefix, 3, |chunk| {
+            let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 3);
+            for r in chunk {
+                out.push(&r.col0);
+                out.push(&r.col1);
+                out.push(&r.col2);
+            }
+            out
+        })
+    }
+}
+
+batch_table! {
+    FileIdxBatch, FileIdxRow,
+    "INSERT OR REPLACE INTO _file_index (path, mtime, size) VALUES ",
+    3,
+    push_fn: (path: String, mtime: i64, size: i64),
+    push_body: { FileIdxRow { path, mtime, size } },
+    flatten: |chunk| {
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 3);
+        for r in chunk {
+            out.push(&r.path);
+            out.push(&r.mtime);
+            out.push(&r.size);
+        }
+        out
+    },
+}
+
+// ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
@@ -378,10 +637,26 @@ pub fn parse_into_conn(
 
     let parse_elapsed = parse_start.elapsed();
 
-    // ---- Batch insert (prepared statements + single transaction) ----
+    // ---- Batch insert (multi-row VALUES + single transaction) ----
+    //
+    // The bulk-insert hot path: 534K nodes, 535K _ast rows on the mache
+    // benchmark. Single-row INSERTs via prepare_cached pay a transaction-
+    // edge cost per row (statement step, B-tree page split, locking
+    // arbitration). Multi-row `VALUES(...),(...)` batches collapse that
+    // by ~10×: SQLite parses one statement, executes it once, and the
+    // B-tree maintenance amortizes across rows.
+    //
+    // Batch size: BULK_BATCH_ROWS (== 500) rows per execute, well under
+    // SQLite's 32K bound-param cap even for the 9-column _ast table
+    // (4500 params). The "full batch" SQL string is the same every
+    // execute → prepare_cached hits the per-table key once and reuses.
+    // The trailing partial batch (< BULK_BATCH_ROWS rows) is flushed
+    // with a separately-sized statement; on a 765-file corpus this
+    // happens once per table at end of insert.
+    //
+    // See bead `ley-line-open-cbbedf`.
 
     let insert_start = std::time::Instant::now();
-    let mut dirs_created: HashSet<String> = HashSet::new();
     let mut parsed = 0u64;
     let mut errors = 0u64;
 
@@ -394,40 +669,36 @@ pub fn parse_into_conn(
     // segment-hashing → Σ root advance is bead `ley-line-open-ce55b1`.
     let (mut ast_writer, mut source_writer) = sibling_snapshot_writers(conn);
 
-    // Prepare statements once — reuse for all rows (avoids SQL parse per INSERT).
-    let mut stmt_node = conn.prepare_cached(
-        "INSERT OR REPLACE INTO nodes (id, parent_id, name, kind, size, mtime, record) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-    )?;
-    let mut stmt_ast = conn.prepare_cached(
-        "INSERT OR REPLACE INTO _ast (node_id, source_id, node_kind, start_byte, end_byte, \
-         start_row, start_col, end_row, end_col) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-    )?;
-    let mut stmt_source = conn.prepare_cached(
-        "INSERT OR REPLACE INTO _source (id, language, path) VALUES (?1, ?2, ?3)",
-    )?;
-    let mut stmt_ref = conn
-        .prepare_cached("INSERT INTO node_refs (token, node_id, source_id) VALUES (?1, ?2, ?3)")?;
-    let mut stmt_def = conn
-        .prepare_cached("INSERT INTO node_defs (token, node_id, source_id) VALUES (?1, ?2, ?3)")?;
-    let mut stmt_import =
-        conn.prepare_cached("INSERT INTO _imports (alias, path, source_id) VALUES (?1, ?2, ?3)")?;
-    let mut stmt_file_idx = conn.prepare_cached(
-        "INSERT OR REPLACE INTO _file_index (path, mtime, size) VALUES (?1, ?2, ?3)",
-    )?;
+    // Per-table row buffers. Owned strings/values so we can hand
+    // ToSql references to params_from_iter without lifetime gymnastics
+    // through the parsed_files Vec.
+    //
+    // Pre-allocate at the per-file estimate × file_count: ~700 nodes
+    // and ~700 ast entries per file on the mache benchmark, so 500K
+    // capacity each is the right ballpark to avoid mid-loop reallocs.
+    let mut nodes_buf: NodeBatch = NodeBatch::with_capacity(550_000);
+    let mut ast_buf: AstBatch = AstBatch::with_capacity(550_000);
+    let mut refs_buf: RefBatch = RefBatch::with_capacity(40_000);
+    let mut defs_buf: RefBatch = RefBatch::with_capacity(3_000);
+    let mut imports_buf: RefBatch = RefBatch::with_capacity(2_000);
+    let mut source_buf: SourceBatch = SourceBatch::with_capacity(to_parse.len());
+    let mut file_idx_buf: FileIdxBatch = FileIdxBatch::with_capacity(to_parse.len());
 
+    let mut dirs_created: HashSet<String> = HashSet::new();
     let mut changed_files: Vec<String> = Vec::new();
 
     for result in parsed_files {
         match result {
             Ok(pf) => {
                 let rel_path = Path::new(&pf.rel);
-                ensure_dirs(conn, rel_path, mtime, &mut dirs_created)?;
+                collect_dirs(rel_path, &mut dirs_created, &mut nodes_buf, mtime);
 
-                stmt_source.execute(rusqlite::params![&pf.rel, &pf.language, &pf.abs_path])?;
+                source_buf.push(pf.rel.clone(), pf.language.clone(), pf.abs_path.clone());
 
-                // capnp dual-write (`ley-line-open-cdf098`): same
-                // fields as the SQL row, typed and content-addressable.
+                // capnp dual-write (`ley-line-open-cdf098`): same fields
+                // as the SQL row, typed and content-addressable. Stays in
+                // the per-file iteration loop — single-message-per-call
+                // IO with a BufWriter sink; no benefit from batching.
                 if let Some(w) = source_writer.as_mut() {
                     write_source_file_record(
                         w,
@@ -439,65 +710,55 @@ pub fn parse_into_conn(
                     )?;
                 }
 
-                for n in &pf.nodes {
-                    stmt_node.execute(rusqlite::params![
-                        &n.id,
-                        &n.parent_id,
-                        &n.name,
-                        n.kind,
-                        n.size,
-                        mtime,
-                        &n.record
-                    ])?;
+                for n in pf.nodes {
+                    nodes_buf.push(n.id, n.parent_id, n.name, n.kind, n.size, mtime, n.record);
                 }
 
                 for a in &pf.ast_entries {
-                    stmt_ast.execute(rusqlite::params![
-                        &a.node_id,
-                        &a.source_id,
-                        &a.node_kind,
-                        a.start_byte,
-                        a.end_byte,
-                        a.start_row,
-                        a.start_col,
-                        a.end_row,
-                        a.end_col
-                    ])?;
-
-                    // T8.3 capnp dual-write for the AstNode.
+                    // T8.3 capnp dual-write for the AstNode — same per-file
+                    // streaming rationale as the SourceFile dual-write
+                    // above; this loop borrows `a` so the ast_buf push
+                    // below owns the values via move.
                     if let Some(w) = ast_writer.as_mut() {
                         write_ast_node_record(w, a)?;
                     }
                 }
+                for a in pf.ast_entries {
+                    ast_buf.push(
+                        a.node_id,
+                        a.source_id,
+                        a.node_kind,
+                        a.start_byte as i64,
+                        a.end_byte as i64,
+                        a.start_row as i64,
+                        a.start_col as i64,
+                        a.end_row as i64,
+                        a.end_col as i64,
+                    );
+                }
 
-                for r in &pf.refs {
+                for r in pf.refs {
                     match r {
                         ExtractedRef::Ref {
                             token,
                             node_id,
                             source_id,
-                        } => {
-                            stmt_ref.execute(rusqlite::params![token, node_id, source_id])?;
-                        }
+                        } => refs_buf.push(token, node_id, source_id),
                         ExtractedRef::Def {
                             token,
                             node_id,
                             source_id,
-                        } => {
-                            stmt_def.execute(rusqlite::params![token, node_id, source_id])?;
-                        }
+                        } => defs_buf.push(token, node_id, source_id),
                         ExtractedRef::Import {
                             alias,
                             path,
                             source_id,
-                        } => {
-                            stmt_import.execute(rusqlite::params![alias, path, source_id])?;
-                        }
+                        } => imports_buf.push(alias, path, source_id),
                     }
                 }
 
-                stmt_file_idx.execute(rusqlite::params![&pf.rel, pf.file_mtime, pf.file_size])?;
-                changed_files.push(pf.rel.clone());
+                file_idx_buf.push(pf.rel.clone(), pf.file_mtime, pf.file_size);
+                changed_files.push(pf.rel);
                 parsed += 1;
             }
             Err(e) => {
@@ -507,14 +768,25 @@ pub fn parse_into_conn(
         }
     }
 
-    // Drop prepared statements before COMMIT (releases borrow on conn).
-    drop(stmt_node);
-    drop(stmt_ast);
-    drop(stmt_source);
-    drop(stmt_ref);
-    drop(stmt_def);
-    drop(stmt_import);
-    drop(stmt_file_idx);
+    // Flush each table in BULK_BATCH_ROWS-sized chunks via multi-row
+    // VALUES inserts. Tail (last <BULK_BATCH_ROWS rows) flushed in one
+    // partial-size statement so we don't fall back to per-row execute.
+    nodes_buf.flush_batched(conn)?;
+    ast_buf.flush_batched(conn)?;
+    source_buf.flush_batched(conn)?;
+    refs_buf.flush_batched_for(
+        conn,
+        "INSERT INTO node_refs (token, node_id, source_id) VALUES ",
+    )?;
+    defs_buf.flush_batched_for(
+        conn,
+        "INSERT INTO node_defs (token, node_id, source_id) VALUES ",
+    )?;
+    imports_buf.flush_batched_for(
+        conn,
+        "INSERT INTO _imports (alias, path, source_id) VALUES ",
+    )?;
+    file_idx_buf.flush_batched(conn)?;
 
     // Flush the capnp dual-write `BufWriter`s before COMMIT and before
     // `write_head_after_parse` reads the segments for hashing —
@@ -1081,13 +1353,24 @@ fn walk_children_pure(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Create directory nodes for each component of a relative file path.
-fn ensure_dirs(
-    conn: &Connection,
+/// Append directory-node rows (one per path component) to the nodes
+/// batch buffer. Deduplicates via the `created` set so a 50k-file
+/// registry repo with deeply-shared dir hierarchies doesn't emit
+/// duplicate `<prefix>` rows. The dir rows use `kind = 1` and empty
+/// `record`, matching the legacy `ensure_dirs` behavior (which did the
+/// same insert through `INSERT OR IGNORE`).
+///
+/// Why no `INSERT OR IGNORE`: nodes_buf already de-dupes via the
+/// `created` set, and `INSERT OR REPLACE` (used by nodes_buf below) is
+/// idempotent for matching primary keys. The `OR IGNORE` here was
+/// defensive against the per-file loop re-inserting the same dir; the
+/// set membership check accomplishes the same.
+fn collect_dirs(
     rel: &Path,
-    mtime: i64,
     created: &mut HashSet<String>,
-) -> Result<()> {
+    nodes_buf: &mut NodeBatch,
+    mtime: i64,
+) {
     let mut accumulated = String::new();
     let components: Vec<_> = rel
         .parent()
@@ -1096,22 +1379,17 @@ fn ensure_dirs(
         .collect();
 
     for comp in components {
-        let name = comp.as_os_str().to_string_lossy();
+        let name = comp.as_os_str().to_string_lossy().into_owned();
         let parent = accumulated.clone();
         if accumulated.is_empty() {
-            accumulated = name.to_string();
+            accumulated = name.clone();
         } else {
             accumulated = format!("{accumulated}/{name}");
         }
         if created.insert(accumulated.clone()) {
-            conn.execute(
-                "INSERT OR IGNORE INTO nodes (id, parent_id, name, kind, size, mtime, record) \
-                 VALUES (?1, ?2, ?3, 1, 0, ?4, '')",
-                rusqlite::params![&accumulated, &parent, &*name, mtime],
-            )?;
+            nodes_buf.push(accumulated.clone(), parent, name, 1, 0, mtime, String::new());
         }
     }
-    Ok(())
 }
 
 /// True when the directory name should be excluded from the parse walk.

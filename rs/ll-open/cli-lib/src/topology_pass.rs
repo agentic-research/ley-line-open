@@ -408,7 +408,27 @@ fn extract_specifiers(text: &str, lang: Lang) -> Vec<String> {
                 }
             }
             Lang::Rust => {
-                if let Some(rest) = line.strip_prefix("use ") {
+                // Match `use ...;`, `pub use ...;`, and visibility-scoped
+                // re-exports like `pub(crate) use ...;`, `pub(super) use ...;`.
+                // We do NOT attempt to match attribute-prefixed forms
+                // (`#[allow(...)] pub use ...;`) — those land in the line
+                // *after* the attribute, and our line-by-line scan picks
+                // them up naturally so long as the `use` line itself
+                // starts with one of the prefixes below.
+                let use_body = if let Some(rest) = line.strip_prefix("use ") {
+                    Some(rest)
+                } else if let Some(rest) = line.strip_prefix("pub use ") {
+                    Some(rest)
+                } else if let Some(after_pub) = line.strip_prefix("pub(") {
+                    // pub(crate) use ... / pub(super) use ... / pub(in path) use ...
+                    after_pub
+                        .find(')')
+                        .and_then(|close| after_pub.get(close + 1..))
+                        .and_then(|tail| tail.trim_start().strip_prefix("use "))
+                } else {
+                    None
+                };
+                if let Some(rest) = use_body {
                     // `use foo::bar::baz;` → specifier "foo::bar::baz"
                     let end = rest.find(';').unwrap_or(rest.len());
                     let mut spec = rest[..end].trim().to_string();
@@ -831,6 +851,26 @@ import (
     #[test]
     fn extract_specifiers_rust_use() {
         let specs = extract_specifiers("use crate::baz::qux;\n", Lang::Rust);
+        assert_eq!(specs, vec!["baz::qux"]);
+    }
+
+    #[test]
+    fn extract_specifiers_rust_pub_use() {
+        let specs = extract_specifiers("pub use foo::bar;\n", Lang::Rust);
+        assert_eq!(specs, vec!["foo::bar"]);
+    }
+
+    #[test]
+    fn extract_specifiers_rust_pub_crate_use() {
+        let specs =
+            extract_specifiers("pub(crate) use foo::bar;\n", Lang::Rust);
+        assert_eq!(specs, vec!["foo::bar"]);
+    }
+
+    #[test]
+    fn extract_specifiers_rust_pub_super_use() {
+        let specs =
+            extract_specifiers("pub(super) use crate::baz::qux;\n", Lang::Rust);
         assert_eq!(specs, vec!["baz::qux"]);
     }
 

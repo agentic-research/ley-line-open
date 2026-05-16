@@ -1,0 +1,144 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+
+# Builds the `leyline` daemon binary for the 4 platforms mache's
+# auto-downloader probes (`internal/leyline/socket.go::downloadLeyline`
+# fetches `leyline-{GOOS}-{GOARCH}` from `/releases/latest/download/`),
+# then attaches them as assets on the tag's GitHub release.
+#
+# Matrix uses native runners per target — no cross-compile complexity
+# (krust is fine for the OCI image build because it produces musl
+# binaries for the runtime, but cross-compiling macOS from Linux is a
+# notarization-adjacent rabbit hole we don't need here).
+#
+# Default features only (`lsp`). The `mount` (FUSE) feature is gated
+# off so the release binary doesn't depend on libfuse at the consumer
+# end — mache uses the daemon for MCP/UDS, not for FUSE mounting.
+#
+# Security posture:
+# - No third-party actions for release management (built-in `gh` CLI)
+# - Per-job `permissions:` scoping (default workflow permissions stay
+#   read-only)
+# - `persist-credentials: false` on checkout so the build job can't
+#   accidentally push back
+# - All matrix values flow into `env:` blocks, never interpolated
+#   directly into `run:` shell
+
+# Workflow-level permissions stay at the read-only default. Each job
+# below escalates only the permissions it actually needs.
+permissions: {}
+
+# Serialize tag releases — two simultaneous tag pushes would race on
+# the same GitHub release object (asset uploads overwrite each other).
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  create-release:
+    name: Create GitHub release for ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to create the release object
+    steps:
+      - name: Create release (idempotent; auto-generate notes)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # gh release create fails if the release already exists; we
+          # `|| true` so re-runs (e.g. retried workflow on transient
+          # failure) don't poison the matrix builds below.
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --generate-notes \
+            || echo "release $TAG already exists; continuing"
+
+  build:
+    name: build ${{ matrix.asset }}
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write # to upload assets to the release object
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: leyline-linux-amd64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: leyline-linux-arm64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            asset: leyline-darwin-amd64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: leyline-darwin-arm64
+    steps:
+      # SHA-pinned: actions/checkout@v6.0.2 (matches ci.yml).
+      # `persist-credentials: false` so the GITHUB_TOKEN written by
+      # checkout into the local git config can't be used by later
+      # steps to push back — the upload step uses an explicit, scoped
+      # GH_TOKEN env var instead.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      # SHA-pinned: dtolnay/rust-toolchain (composite action — Node
+      # version deprecation does not apply).
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: nightly
+          targets: ${{ matrix.target }}
+
+      - name: Install system deps (capnproto + pkg-config; libcapnp-dev only on Linux)
+        run: |
+          case "$RUNNER_OS" in
+            Linux)
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends capnproto libcapnp-dev pkg-config
+              ;;
+            macOS)
+              # capnp ships /usr/local/include/capnp/c++.capnp and the
+              # standard schema includes that the capnp compiler
+              # resolves `using Cxx = import "/capnp/c++.capnp";`-style
+              # imports against — same role libcapnp-dev plays on Debian.
+              brew install capnp pkg-config
+              ;;
+          esac
+          capnp --version
+          pkg-config --version
+
+      - name: Build leyline (release, default features)
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: |
+          cargo build --release --manifest-path rs/Cargo.toml \
+            -p leyline-cli --target "$BUILD_TARGET"
+
+      - name: Stage release artifact
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+          ASSET_NAME: ${{ matrix.asset }}
+        run: |
+          cp "rs/target/$BUILD_TARGET/release/leyline" "$ASSET_NAME"
+          chmod +x "$ASSET_NAME"
+          file "$ASSET_NAME"
+          ls -lh "$ASSET_NAME"
+
+      - name: Upload to GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          ASSET_NAME: ${{ matrix.asset }}
+        run: |
+          # --clobber so re-running a job (e.g. transient build flake)
+          # replaces the prior upload of the same asset rather than
+          # erroring on conflict. Idempotent end-to-end.
+          gh release upload "$TAG" "$ASSET_NAME" --clobber

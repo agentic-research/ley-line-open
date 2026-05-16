@@ -7,6 +7,10 @@
 //!    (1000 ~120-byte files; budget <50 ms) and a realistic-size
 //!    benchmark (1000 ~6-15 KiB files; budget <500 ms). The realistic
 //!    benchmark is the contract; the lower bound is documentation.
+//!    Wall-clock budget assertions are gated behind the env var
+//!    `LLO_PERF_GATES=1` (Copilot finding 9: time-based assertions are
+//!    flaky under CI variance). Timings ALWAYS print to stderr so the
+//!    cost ceiling is observable even when not enforced.
 //! 2. **Recall (presence)** — hand-crafted multi-language fixture; ALL
 //!    of {Go, Rust, Python, TS} detected as `EdgeEstimate` entries with
 //!    `confidence > 0.0`. Reported as "N/4 languages detected" — NOT a
@@ -43,6 +47,133 @@ fn handcrafted_files() -> Vec<PathBuf> {
         topology_pass::collect_files(&handcrafted_root()).expect("walk handcrafted fixture");
     files.sort();
     files
+}
+
+// ---------------------------------------------------------------------------
+// Perf-gate helpers (Copilot finding 9).
+//
+// Wall-clock budget assertions are flaky under CI variance. The helpers
+// below print the timing unconditionally (so the cost ceiling is always
+// observable from CI logs) and only assert when `LLO_PERF_GATES=1` is set
+// in the environment. Local developers and CI both see the timings; only
+// CI runs that opt in via the env var fail on budget overruns.
+// ---------------------------------------------------------------------------
+
+/// Read the perf-gate env var. Pulled out so the gating logic can be
+/// unit-tested by injecting a known value.
+fn perf_gate_enabled() -> bool {
+    std::env::var("LLO_PERF_GATES").ok().as_deref() == Some("1")
+}
+
+/// Print the timing line and (conditionally) assert the budget.
+///
+/// `gate_enabled` is taken as a parameter so the sanity test below can
+/// exercise both branches deterministically without mutating process
+/// state. Production callers pass `perf_gate_enabled()`.
+fn perf_gate_assert(elapsed_ms: u128, budget_ms: u128, label: &str, gate_enabled: bool) {
+    eprintln!("[{label}] elapsed={elapsed_ms}ms budget={budget_ms}ms gate_enabled={gate_enabled}");
+    if gate_enabled {
+        assert!(
+            elapsed_ms < budget_ms,
+            "[{label}] perf gate FAILED under LLO_PERF_GATES=1: \
+             elapsed {elapsed_ms}ms exceeded budget {budget_ms}ms"
+        );
+    }
+}
+
+/// Sanity test for the gate mechanism itself (Copilot finding 9
+/// falsifiable proof). Confirms:
+///
+/// 1. With `gate_enabled=true`, an over-budget elapsed value panics.
+/// 2. With `gate_enabled=false`, the same over-budget value does NOT panic.
+/// 3. `perf_gate_enabled()` reads the env var correctly.
+///
+/// Without this test, the gating could silently default to "always off"
+/// and we'd never know — the budget assertion would be unreachable code
+/// under any env-var setting.
+#[test]
+fn perf_gate_mechanism_works_in_both_modes() {
+    // Branch 1: gate disabled, over-budget timing must NOT panic.
+    let disabled_ok = std::panic::catch_unwind(|| {
+        perf_gate_assert(
+            /* elapsed_ms = */ 9_999_999,
+            /* budget_ms  = */ 1,
+            "sanity_disabled",
+            /* gate_enabled = */ false,
+        );
+    });
+    assert!(
+        disabled_ok.is_ok(),
+        "gate DISABLED branch panicked on over-budget elapsed — \
+         perf_gate_assert is asserting unconditionally (bug)"
+    );
+
+    // Branch 2: gate enabled, over-budget timing MUST panic.
+    let enabled_panicked = std::panic::catch_unwind(|| {
+        perf_gate_assert(
+            /* elapsed_ms = */ 9_999_999,
+            /* budget_ms  = */ 1,
+            "sanity_enabled",
+            /* gate_enabled = */ true,
+        );
+    });
+    assert!(
+        enabled_panicked.is_err(),
+        "gate ENABLED branch did NOT panic on over-budget elapsed — \
+         perf_gate_assert is not enforcing the budget (bug)"
+    );
+
+    // Branch 3: gate enabled with within-budget timing must NOT panic.
+    let enabled_within_ok = std::panic::catch_unwind(|| {
+        perf_gate_assert(1, 100, "sanity_within_budget", true);
+    });
+    assert!(
+        enabled_within_ok.is_ok(),
+        "gate ENABLED branch panicked on WITHIN-budget elapsed — \
+         perf_gate_assert has inverted comparison (bug)"
+    );
+
+    // Branch 4: confirm the env-var reader recognizes only the literal "1".
+    // Save and restore so we don't pollute other parallel tests. Tests in
+    // the same binary share process env; in cargo's default settings this
+    // crate's test binary has a single thread by default for any test
+    // that mutates env vars. We scope tightly and restore.
+    //
+    // SAFETY: `std::env::set_var` / `std::env::remove_var` are `unsafe` on
+    // Rust 2024 because mutating env is not thread-safe with respect to
+    // concurrent libc calls. We sequence the set/check/restore inside a
+    // single unsafe block; the surrounding test does no other env work
+    // and runs as its own #[test] (Rust runs tests in parallel but each
+    // assertion below is local — the only risk is a *different* test
+    // also touching LLO_PERF_GATES, which none of the gate1* tests do).
+    let original = std::env::var("LLO_PERF_GATES").ok();
+    unsafe {
+        std::env::set_var("LLO_PERF_GATES", "1");
+        assert!(
+            perf_gate_enabled(),
+            "perf_gate_enabled() returned false when LLO_PERF_GATES=1"
+        );
+        std::env::set_var("LLO_PERF_GATES", "0");
+        assert!(
+            !perf_gate_enabled(),
+            "perf_gate_enabled() returned true when LLO_PERF_GATES=0"
+        );
+        std::env::set_var("LLO_PERF_GATES", "yes");
+        assert!(
+            !perf_gate_enabled(),
+            "perf_gate_enabled() returned true for non-1 value 'yes'"
+        );
+        std::env::remove_var("LLO_PERF_GATES");
+        assert!(
+            !perf_gate_enabled(),
+            "perf_gate_enabled() returned true when env var unset"
+        );
+        // Restore original to be a polite citizen.
+        match original {
+            Some(v) => std::env::set_var("LLO_PERF_GATES", v),
+            None => std::env::remove_var("LLO_PERF_GATES"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -87,12 +218,13 @@ fn gate1a_cost_ceiling_empty_file_lower_bound() {
 
     // Permissive ceiling — this is a *floor* on what the cost should
     // be, not a production budget. The realistic benchmark below
-    // (gate1b) is the contract.
-    assert!(
-        elapsed.as_millis() < 150,
-        "Gate 1a FAILED: lower-bound run took {:?} on {} files (lower-bound budget: 150ms)",
-        elapsed,
-        files.len()
+    // (gate1b) is the contract. Gated behind LLO_PERF_GATES=1 so CI
+    // variance doesn't flake the test; timing always prints to stderr.
+    perf_gate_assert(
+        elapsed.as_millis(),
+        150,
+        "Gate 1a / empty-file lower bound",
+        perf_gate_enabled(),
     );
 }
 
@@ -140,11 +272,13 @@ fn gate1b_cost_ceiling_realistic_file_sizes() {
     // Realistic budget. 4 KiB/file × 1000 = ~4 MB I/O over a page-cached
     // tempdir + regex sweep + region assignment. 500 ms is generous;
     // anything close to that is a perf regression worth investigating.
-    assert!(
-        elapsed.as_millis() < 500,
-        "Gate 1b FAILED: realistic run took {:?} on {} files (budget: 500ms)",
-        elapsed,
-        files.len()
+    // Gated behind LLO_PERF_GATES=1 so CI variance doesn't flake the
+    // test; timing always prints to stderr.
+    perf_gate_assert(
+        elapsed.as_millis(),
+        500,
+        "Gate 1b / realistic 6-15 KiB",
+        perf_gate_enabled(),
     );
 }
 

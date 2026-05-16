@@ -549,16 +549,10 @@ impl ResolverIndex {
         let mut by_stem: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, p) in files.iter().enumerate() {
             if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                by_basename
-                    .entry(name.to_string())
-                    .or_default()
-                    .push(i);
+                by_basename.entry(name.to_string()).or_default().push(i);
             }
             if let Some(stem) = p.file_stem().and_then(|n| n.to_str()) {
-                by_stem
-                    .entry(stem.to_string())
-                    .or_default()
-                    .push(i);
+                by_stem.entry(stem.to_string()).or_default().push(i);
             }
         }
         ResolverIndex {
@@ -591,10 +585,7 @@ impl ResolverIndex {
 
         // Split into components by ::, /, or .  — preserves
         // order so we can try last-first then walk backwards.
-        let parts: Vec<&str> = s
-            .split([':', '/', '.'])
-            .filter(|p| !p.is_empty())
-            .collect();
+        let parts: Vec<&str> = s.split([':', '/', '.']).filter(|p| !p.is_empty()).collect();
         if parts.is_empty() {
             return (Vec::new(), 0.0);
         }
@@ -797,8 +788,7 @@ pub fn collect_files(source: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn collect_files_inner(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    let entries =
-        fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))?;
+    let entries = fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))?;
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
@@ -842,8 +832,7 @@ mod tests {
 
     #[test]
     fn extract_specifiers_go_single() {
-        let specs =
-            extract_specifiers("package m\nimport \"github.com/foo/bar\"\n", Lang::Go);
+        let specs = extract_specifiers("package m\nimport \"github.com/foo/bar\"\n", Lang::Go);
         assert_eq!(specs, vec!["github.com/foo/bar"]);
     }
 
@@ -872,15 +861,13 @@ import (
 
     #[test]
     fn extract_specifiers_rust_pub_crate_use() {
-        let specs =
-            extract_specifiers("pub(crate) use foo::bar;\n", Lang::Rust);
+        let specs = extract_specifiers("pub(crate) use foo::bar;\n", Lang::Rust);
         assert_eq!(specs, vec!["foo::bar"]);
     }
 
     #[test]
     fn extract_specifiers_rust_pub_super_use() {
-        let specs =
-            extract_specifiers("pub(super) use crate::baz::qux;\n", Lang::Rust);
+        let specs = extract_specifiers("pub(super) use crate::baz::qux;\n", Lang::Rust);
         assert_eq!(specs, vec!["baz::qux"]);
     }
 
@@ -898,40 +885,31 @@ import (
 
     #[test]
     fn extract_specifiers_ts_import_from() {
-        let specs =
-            extract_specifiers("import { x } from './util';\n", Lang::Ts);
+        let specs = extract_specifiers("import { x } from './util';\n", Lang::Ts);
         assert_eq!(specs, vec!["./util"]);
     }
 
     #[test]
     fn extract_specifiers_ts_require() {
-        let specs =
-            extract_specifiers(r#"const fs = require("./fs");"#, Lang::Ts);
+        let specs = extract_specifiers(r#"const fs = require("./fs");"#, Lang::Ts);
         assert_eq!(specs, vec!["./fs"]);
     }
 
     #[test]
     fn extract_specifiers_ts_export_from() {
-        let specs = extract_specifiers(
-            "export { x } from './foo';\n",
-            Lang::Ts,
-        );
+        let specs = extract_specifiers("export { x } from './foo';\n", Lang::Ts);
         assert_eq!(specs, vec!["./foo"]);
     }
 
     #[test]
     fn extract_specifiers_ts_export_star_from() {
-        let specs =
-            extract_specifiers("export * from './bar';\n", Lang::Ts);
+        let specs = extract_specifiers("export * from './bar';\n", Lang::Ts);
         assert_eq!(specs, vec!["./bar"]);
     }
 
     #[test]
     fn extract_specifiers_ts_dynamic_import() {
-        let specs = extract_specifiers(
-            "const x = await import('./bar');\n",
-            Lang::Ts,
-        );
+        let specs = extract_specifiers("const x = await import('./bar');\n", Lang::Ts);
         assert_eq!(specs, vec!["./bar"]);
     }
 

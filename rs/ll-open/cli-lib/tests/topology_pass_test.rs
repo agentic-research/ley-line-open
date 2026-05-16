@@ -39,8 +39,8 @@ fn handcrafted_root() -> PathBuf {
 
 /// Collect files under the handcrafted fixture in deterministic order.
 fn handcrafted_files() -> Vec<PathBuf> {
-    let mut files = topology_pass::collect_files(&handcrafted_root())
-        .expect("walk handcrafted fixture");
+    let mut files =
+        topology_pass::collect_files(&handcrafted_root()).expect("walk handcrafted fixture");
     files.sort();
     files
 }
@@ -304,7 +304,8 @@ fn gate3a_manifest_detection_nested_root_and_subcrate() {
         let rel = files[fr.file_index].strip_prefix(&root).unwrap();
         if rel.starts_with("subcrate") {
             assert_eq!(
-                fr.region, subcrate_region,
+                fr.region,
+                subcrate_region,
                 "Gate 3a FAILED: subcrate file {} got region {} (expected {})",
                 rel.display(),
                 fr.region,
@@ -345,11 +346,7 @@ fn gate3b_manifest_detection_depth_3_nested() {
     let region_for = |suffix: &str| -> u32 {
         out.file_regions
             .iter()
-            .find(|fr| {
-                files[fr.file_index]
-                    .to_string_lossy()
-                    .ends_with(suffix)
-            })
+            .find(|fr| files[fr.file_index].to_string_lossy().ends_with(suffix))
             .unwrap_or_else(|| panic!("no fixture file ending in {suffix}"))
             .region
     };
@@ -387,8 +384,7 @@ fn gate3c_bloat_dir_manifests_excluded_from_regions() {
     write_bloat_dir_fixture(root);
 
     let files = topology_pass::collect_files(root).expect("walk");
-    let basenames: Vec<String> =
-        files.iter().map(|p| basename(p)).collect();
+    let basenames: Vec<String> = files.iter().map(|p| basename(p)).collect();
     eprintln!(
         "[Gate 3c / bloat dirs] walked {} files: {basenames:?}",
         files.len(),
@@ -410,9 +406,7 @@ fn gate3c_bloat_dir_manifests_excluded_from_regions() {
     let out = topology_pass::run(&files, root).expect("run");
     eprintln!(
         "[Gate 3c] manifests={} regions={} files_in_walk={}",
-        out.stats.n_manifests,
-        out.stats.n_regions,
-        out.stats.n_files,
+        out.stats.n_manifests, out.stats.n_regions, out.stats.n_files,
     );
 
     // Only the root Cargo.toml is visible to the walk. Vendored
@@ -482,9 +476,7 @@ fn determinism_serial(out: &TopologyOutput) -> Vec<u8> {
     let edge_estimates_bits: Vec<(usize, usize, u32, u32)> = out
         .edge_estimates
         .iter()
-        .map(|e: &EdgeEstimate| {
-            (e.from, e.to, e.confidence.to_bits(), e.language as u32)
-        })
+        .map(|e: &EdgeEstimate| (e.from, e.to, e.confidence.to_bits(), e.language as u32))
         .collect();
 
     // File regions: already pure POD.
@@ -533,10 +525,7 @@ fn gate5_region_edges_to_sheaf_restriction_translation_spot_checks() {
         })
         .collect();
 
-    eprintln!(
-        "[Gate 5] {} cross-region restrictions",
-        restrictions.len()
-    );
+    eprintln!("[Gate 5] {} cross-region restrictions", restrictions.len());
     for r in &restrictions {
         eprintln!(
             "    region {} <-> region {}  co_change_rate={:.4}  agreement_dim={}",
@@ -555,11 +544,8 @@ fn gate5_region_edges_to_sheaf_restriction_translation_spot_checks() {
 
     // Build the set of region ids actually produced by this run so we
     // can confirm each restriction's `a`/`b` map back to real regions.
-    let known_regions: std::collections::BTreeSet<u32> = topology
-        .file_regions
-        .iter()
-        .map(|fr| fr.region)
-        .collect();
+    let known_regions: std::collections::BTreeSet<u32> =
+        topology.file_regions.iter().map(|fr| fr.region).collect();
 
     for r in &restrictions {
         // Semantic contract: distinct endpoints (intra-region edges are
@@ -577,13 +563,16 @@ fn gate5_region_edges_to_sheaf_restriction_translation_spot_checks() {
         assert!(
             r.co_change_rate > 0.0 && r.co_change_rate <= 1.0,
             "Gate 5 FAILED: co_change_rate {} outside (0.0, 1.0] for ({}, {})",
-            r.co_change_rate, r.a, r.b,
+            r.co_change_rate,
+            r.a,
+            r.b,
         );
 
         assert!(
             r.agreement_dim > 0,
             "Gate 5 FAILED: agreement_dim must be > 0 for δ⁰ engagement; got 0 for ({}, {})",
-            r.a, r.b,
+            r.a,
+            r.b,
         );
 
         // Both endpoints must be known region ids produced by the
@@ -630,10 +619,7 @@ fn gate5_region_edges_to_sheaf_restriction_translation_spot_checks() {
         "Gate 5 FAILED: expected a restriction over the (root={root_region}, \
          subcrate={subcrate_region}) edge with canonical ordering \
          ({expected_a}, {expected_b}); got restrictions={:?}",
-        restrictions
-            .iter()
-            .map(|r| (r.a, r.b))
-            .collect::<Vec<_>>()
+        restrictions.iter().map(|r| (r.a, r.b)).collect::<Vec<_>>()
     );
 }
 
@@ -681,9 +667,7 @@ fn generate_synthetic_1000_small(root: &Path) {
         fs::create_dir_all(&crate_dir).expect("mkdir crate");
         fs::write(
             crate_dir.join("Cargo.toml"),
-            format!(
-                "[package]\nname = \"crate{c}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n"
-            ),
+            format!("[package]\nname = \"crate{c}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n"),
         )
         .expect("write manifest");
         let src = crate_dir.join("src");
@@ -718,9 +702,7 @@ fn synthetic_small_file(i: usize) -> (&'static str, String) {
         ),
         _ => (
             "ts",
-            format!(
-                "import {{ x }} from './m{prev}';\n\nexport const f{i} = x;\n"
-            ),
+            format!("import {{ x }} from './m{prev}';\n\nexport const f{i} = x;\n"),
         ),
     }
 }
@@ -739,9 +721,7 @@ fn generate_synthetic_1000_realistic(root: &Path) {
         fs::create_dir_all(&crate_dir).expect("mkdir crate");
         fs::write(
             crate_dir.join("Cargo.toml"),
-            format!(
-                "[package]\nname = \"crate{c}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n"
-            ),
+            format!("[package]\nname = \"crate{c}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n"),
         )
         .expect("write manifest");
         let src = crate_dir.join("src");
@@ -754,7 +734,9 @@ fn generate_synthetic_1000_realistic(root: &Path) {
             // every sampled file. Use the language-appropriate line
             // comment so the file still scans cleanly.
             let pad_line = match ext {
-                "rs" | "go" | "ts" => "// pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad",
+                "rs" | "go" | "ts" => {
+                    "// pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad"
+                }
                 "py" => "# pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad",
                 _ => "// pad",
             };
@@ -787,11 +769,7 @@ fn write_depth_3_fixture(root: &Path) {
     fs::write(root.join("Cargo.toml"), manifest("topology-depth3-root"))
         .expect("write root manifest");
     fs::create_dir_all(root.join("src")).expect("mkdir root/src");
-    fs::write(
-        root.join("src").join("root.rs"),
-        "pub fn root() {}\n",
-    )
-    .expect("write root.rs");
+    fs::write(root.join("src").join("root.rs"), "pub fn root() {}\n").expect("write root.rs");
 
     // Subcrate (depth 2).
     let sub = root.join("subcrate");
@@ -835,20 +813,13 @@ fn write_bloat_dir_fixture(root: &Path) {
     fs::write(root.join("Cargo.toml"), manifest("bloat-fixture-root"))
         .expect("write root manifest");
     fs::create_dir_all(root.join("src")).expect("mkdir root/src");
-    fs::write(
-        root.join("src").join("root.rs"),
-        "pub fn root() {}\n",
-    )
-    .expect("write root.rs");
+    fs::write(root.join("src").join("root.rs"), "pub fn root() {}\n").expect("write root.rs");
 
     // Vendored Rust crate — must be excluded.
     let vendor = root.join("vendor").join("some-crate");
     fs::create_dir_all(vendor.join("src")).expect("mkdir vendor/some-crate/src");
-    fs::write(
-        vendor.join("Cargo.toml"),
-        manifest("vendored-some-crate"),
-    )
-    .expect("write vendored manifest");
+    fs::write(vendor.join("Cargo.toml"), manifest("vendored-some-crate"))
+        .expect("write vendored manifest");
     fs::write(
         vendor.join("src").join("vendored_lib.rs"),
         "pub fn vendored() {}\n",
@@ -863,9 +834,5 @@ fn write_bloat_dir_fixture(root: &Path) {
         r#"{"name":"some-pkg","version":"0.0.0"}"#,
     )
     .expect("write package.json");
-    fs::write(
-        nm.join("vendored_index.ts"),
-        "export const v = 1;\n",
-    )
-    .expect("write vendored index");
+    fs::write(nm.join("vendored_index.ts"), "export const v = 1;\n").expect("write vendored index");
 }

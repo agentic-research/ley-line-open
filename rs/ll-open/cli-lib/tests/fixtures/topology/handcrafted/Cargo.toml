@@ -1,0 +1,4 @@
+[package]
+name = "topology-fixture-root"
+version = "0.0.0"
+edition = "2021"

@@ -666,11 +666,28 @@ fn sweep_imports(files: &[PathBuf]) -> Vec<EdgeEstimate> {
 // Region edge aggregation.
 // ---------------------------------------------------------------------------
 
+/// Aggregate per-file edges into per-region-pair edges.
+///
+/// Output `(RegionId, RegionId, f32)` triples carry the **mean confidence**
+/// of the contributing file-level edges, NOT their sum. This is the
+/// downstream `SheafRestrictionInput::co_change_rate` contract: that field
+/// is a probability-weight in `[0.0, 1.0]`, and `op_sheaf_set_topology`
+/// treats values outside that range as out-of-spec.
+///
+/// Concretely: if there are 10 file edges between region 1 and region 2
+/// with confidences `[0.85, 0.9, 0.75, ...]`, the emitted region edge
+/// carries `mean(confidences)`, NOT `sum(confidences)` (which would
+/// commonly land at ~8.0 — well outside [0, 1]).
+///
+/// Each per-file edge contributes at most 1.0 to the running mean (the
+/// sweep clamps per-edge confidence to `(0.0, 1.0]`), so the mean is
+/// guaranteed to lie in `(0.0, 1.0]`. A debug-mode assertion pins this.
 fn aggregate_region_edges(
     edges: &[EdgeEstimate],
     file_regions: &[FileRegion],
 ) -> Vec<(RegionId, RegionId, f32)> {
-    let mut agg: BTreeMap<(RegionId, RegionId), f32> = BTreeMap::new();
+    // Accumulate (sum, count) per region pair so we can emit the mean.
+    let mut agg: BTreeMap<(RegionId, RegionId), (f32, u32)> = BTreeMap::new();
     for e in edges {
         let ra = file_regions[e.from].region;
         let rb = file_regions[e.to].region;
@@ -680,10 +697,27 @@ fn aggregate_region_edges(
         // Canonicalize ordering so (a, b) and (b, a) merge — region
         // edges are undirected for the sheaf's restriction view.
         let key = if ra <= rb { (ra, rb) } else { (rb, ra) };
-        *agg.entry(key).or_insert(0.0) += e.confidence;
+        let slot = agg.entry(key).or_insert((0.0, 0));
+        slot.0 += e.confidence;
+        slot.1 += 1;
     }
-    // BTreeMap iteration is already sorted by key — emit in that order.
-    agg.into_iter().map(|((a, b), c)| (a, b, c)).collect()
+    // BTreeMap iteration is already sorted by key — emit in that order
+    // as the mean (sum / count). `count` is always > 0 inside the loop.
+    agg.into_iter()
+        .map(|((a, b), (sum, count))| {
+            let mean = sum / (count as f32);
+            // Defensive clamp: per-edge confidences are already in
+            // (0, 1] (see `sweep_imports`), so the mean must be too.
+            // The clamp catches future drift where the per-edge cap
+            // is relaxed.
+            debug_assert!(
+                (0.0..=1.0).contains(&mean),
+                "aggregate_region_edges: mean {mean} out of [0, 1] for ({a}, {b}) — \
+                 sum={sum} count={count}"
+            );
+            (a, b, mean.clamp(0.0, 1.0))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -820,5 +854,97 @@ import (
         assert!(is_manifest("package.json"));
         assert!(is_manifest("pyproject.toml"));
         assert!(!is_manifest("README.md"));
+    }
+
+    #[test]
+    fn aggregate_region_edges_bounds_co_change_rate_to_unit_interval() {
+        // 10 file-edges between region 1 and region 2, each with the
+        // per-file cap (1.0). The mean must be 1.0, NOT 10.0.
+        let edges: Vec<EdgeEstimate> = (0..10)
+            .map(|i| EdgeEstimate {
+                from: i,
+                to: 10 + i,
+                confidence: 1.0,
+                language: Lang::Rust,
+            })
+            .collect();
+        let mut file_regions: Vec<FileRegion> = Vec::with_capacity(20);
+        for i in 0..10 {
+            file_regions.push(FileRegion {
+                file_index: i,
+                region: 1,
+                depth: 1,
+                size: 0,
+            });
+        }
+        for i in 10..20 {
+            file_regions.push(FileRegion {
+                file_index: i,
+                region: 2,
+                depth: 1,
+                size: 0,
+            });
+        }
+
+        let region_edges = aggregate_region_edges(&edges, &file_regions);
+        assert_eq!(region_edges.len(), 1);
+        let (a, b, conf) = region_edges[0];
+        assert_eq!((a, b), (1, 2));
+        assert!(
+            (0.0..=1.0).contains(&conf),
+            "mean confidence {conf} escaped [0, 1] — co_change_rate contract broken"
+        );
+        // With every per-edge confidence at 1.0, the mean must also be 1.0.
+        assert!((conf - 1.0).abs() < 1e-6, "expected mean=1.0, got {conf}");
+    }
+
+    #[test]
+    fn aggregate_region_edges_averages_mixed_confidences() {
+        // Two file-edges in the same region pair with different
+        // confidences — emitted region edge must carry their mean.
+        let edges = vec![
+            EdgeEstimate {
+                from: 0,
+                to: 2,
+                confidence: 0.4,
+                language: Lang::Rust,
+            },
+            EdgeEstimate {
+                from: 1,
+                to: 3,
+                confidence: 0.8,
+                language: Lang::Rust,
+            },
+        ];
+        let file_regions = vec![
+            FileRegion {
+                file_index: 0,
+                region: 1,
+                depth: 1,
+                size: 0,
+            },
+            FileRegion {
+                file_index: 1,
+                region: 1,
+                depth: 1,
+                size: 0,
+            },
+            FileRegion {
+                file_index: 2,
+                region: 2,
+                depth: 1,
+                size: 0,
+            },
+            FileRegion {
+                file_index: 3,
+                region: 2,
+                depth: 1,
+                size: 0,
+            },
+        ];
+        let region_edges = aggregate_region_edges(&edges, &file_regions);
+        assert_eq!(region_edges.len(), 1);
+        let (_, _, conf) = region_edges[0];
+        assert!((conf - 0.6).abs() < 1e-6, "expected mean=0.6, got {conf}");
     }
 }

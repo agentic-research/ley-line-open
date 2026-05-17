@@ -81,6 +81,33 @@ tasks:
     cmds:
       - cargo test -p leyline-cli-lib
 
+  test:perf:
+    desc: Cold-parse perf regression gate (bead ley-line-open-a3f254).
+    # Release mode is non-negotiable — the optimisations under test only
+    # matter in --release. LLO_PERF_GATES=1 flips the assertion path on;
+    # without it, the test prints timings but skips the threshold check
+    # (Copilot finding 9 on PR #20 — wall-clock budgets flake under CI
+    # noise unless explicitly opted in).
+    #
+    # Topology gates (topology_pass_test) ALSO read LLO_PERF_GATES but
+    # have tighter budgets that flake under modest concurrent CPU load.
+    # Run them via `task test:perf:topology` when you want that signal;
+    # they're observable in the always-emitted stderr timings during
+    # plain `task test` regardless.
+    dir: rs
+    env:
+      LLO_PERF_GATES: "1"
+    cmds:
+      - cargo test --release -p leyline-cli-lib --test cold_parse_perf_regression
+
+  test:perf:topology:
+    desc: Topology pre-pass cost gates (opt-in; tighter budgets than test:perf).
+    dir: rs
+    env:
+      LLO_PERF_GATES: "1"
+    cmds:
+      - cargo test --release -p leyline-cli-lib --test topology_pass_test
+
   # --------------------------------------------------------------------------
   # Quality
   # --------------------------------------------------------------------------
@@ -208,7 +235,7 @@ tasks:
   # All-in-one
   # --------------------------------------------------------------------------
   ci:
-    desc: Full CI pipeline (check + clippy + fmt + FFI staticlib + tier isolation + test)
+    desc: Full CI pipeline (check + clippy + fmt + FFI staticlib + tier isolation + test + perf gates)
     cmds:
       - task: check
       - task: clippy
@@ -216,3 +243,4 @@ tasks:
       - task: build:fs-static
       - task: tier:isolation
       - task: test
+      - task: test:perf

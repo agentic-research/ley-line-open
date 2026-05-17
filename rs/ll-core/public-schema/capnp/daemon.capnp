@@ -402,9 +402,14 @@ struct SheafInvalidateRequest {
 }
 
 struct SheafInvalidateResponse {
-  invalidated @0 :List(UInt32);
-  count       @1 :UInt32;
-  generation  @2 :UInt64;
+  invalidated     @0 :List(UInt32);
+  count           @1 :UInt32;
+  generation      @2 :UInt64;
+  # Generation counter immediately BEFORE this invalidate bumped it.
+  # Consumers correlate sequence continuity: `their_last_seen ==
+  # response.prior_generation` ⇔ no events missed between then and now.
+  # On the first ever invalidate, equals 0 (the cache's initial gen).
+  priorGeneration @3 :UInt64  $Json.name("prior_generation");
 }
 
 struct SheafDefectResponse {
@@ -492,6 +497,10 @@ struct SheafUpdateTopologyResponse {
   # baseline is refreshed. Lets consumers track sheaf health across
   # incremental updates without a separate `sheaf_defect` round-trip.
   defectAfter     @3 :Float32       $Json.name("defect_after");
+  # Generation counter immediately BEFORE this update bumped it. Same
+  # continuity contract as SheafInvalidateResponse.priorGeneration —
+  # consumers can verify they didn't miss an event between gen N and now.
+  priorGeneration @4 :UInt64        $Json.name("prior_generation");
 }
 
 # Reaper request. Empty today; reserved struct so future scoping

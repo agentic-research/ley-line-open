@@ -64,7 +64,7 @@ enum Cmd {
 
         /// Bind address for the MCP HTTP transport. Defaults to 127.0.0.1.
         ///
-        /// Container deployments need 0.0.0.0 so docker `-p host:8384`
+        /// Container deployments need 0.0.0.0 so docker `-p HOST_PORT:8384`
         /// port-forwarding can reach the listener (loopback-only binds
         /// are unreachable from the host's docker proxy).
         ///
@@ -74,9 +74,9 @@ enum Cmd {
         /// localhost or attested peers only. The two-flag gate prevents
         /// fat-fingering `--mcp-bind 0.0.0.0` on a dev box and quietly
         /// exposing the daemon to every interface. In a container,
-        /// 0.0.0.0 binds inside the container's netns; combine with
-        /// `docker run -p 127.0.0.1:host:8384` to keep host-side
-        /// exposure on loopback.
+        /// 0.0.0.0 binds inside the container's netns; combine with a
+        /// loopback host publish such as `docker run -p
+        /// 127.0.0.1:18384:8384` to keep host-side exposure on loopback.
         #[arg(long)]
         mcp_bind: Option<std::net::IpAddr>,
 

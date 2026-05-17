@@ -1620,11 +1620,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_allow_public_without_mcp_port_is_inert() {
-        // The flag is meaningless when MCP isn't enabled at all. The
-        // gate only fires when mcp_port is Some — passing it on a
-        // daemon that doesn't expose MCP HTTP should be a no-op, not
-        // an error.
+    async fn mcp_public_bind_gate_only_fires_when_mcp_port_is_set() {
+        // The gate predicate is `mcp_port.is_some() && bind.is_public()
+        // && !allow_public`. Drop mcp_port and the rest of the
+        // condition shouldn't matter — pin that the daemon does NOT
+        // surface the public-bind error when MCP HTTP is disabled.
+        // We deliberately pass the most-likely-to-trip combination
+        // (public bind + no allow flag) so a future short-circuit
+        // bug that ignores mcp_port would be caught.
         let tmp = tempfile::tempdir().unwrap();
         let res = run_daemon(
             &tmp.path().join("arena"),
@@ -1637,7 +1640,7 @@ mod tests {
             Some("0s"),
             std::sync::Arc::new(NoExt),
             None,
-            None, // no mcp_port
+            None, // no mcp_port — the gate's first conjunct
             Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
             false,
         )

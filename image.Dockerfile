@@ -13,12 +13,13 @@
 # below matches the M-series dev path; CI / cross-arch builds override.
 #
 # CMD includes `--mcp-bind 0.0.0.0 --mcp-allow-public` so docker
-# `-p host:8384` reaches the MCP HTTP server. The daemon defaults bind to
-# 127.0.0.1, which is loopback-only inside the container — without
-# `--mcp-bind 0.0.0.0`, port publishing yields connection-reset on every
-# request from the host. `--mcp-allow-public` is the deliberate opt-in
-# required by bead `ley-line-open-b7dd03` — outside a container, the
-# combo would refuse to start without it; in here it's correct plumbing.
+# `-p HOST_PORT:8384` reaches the MCP HTTP server. The daemon defaults
+# bind to 127.0.0.1, which is loopback-only inside the container —
+# without `--mcp-bind 0.0.0.0`, port publishing yields connection-reset
+# on every request from the host. `--mcp-allow-public` is the deliberate
+# opt-in required by bead `ley-line-open-b7dd03` — outside a container,
+# the combo would refuse to start without it; in here it's correct
+# plumbing.
 #
 # Security: 0.0.0.0 here is the container's network namespace, NOT the host.
 # The container has its own netns; this only exposes :8384 to interfaces inside

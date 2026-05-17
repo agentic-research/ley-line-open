@@ -198,8 +198,10 @@ tasks:
           .
       - |
         echo "Built ley-line-open:{{.VERSION}} ({{.PLATFORM}})."
-        echo "Smoke: docker run --rm -p 18384:8384 ley-line-open:{{.VERSION}}"
-        echo "       (image CMD bakes in --mcp-bind 0.0.0.0 --mcp-allow-public — port -p reaches it)"
+        echo "Smoke: docker run --rm -p 127.0.0.1:18384:8384 ley-line-open:{{.VERSION}}"
+        echo "       (image CMD bakes in --mcp-bind 0.0.0.0 --mcp-allow-public — container-side"
+        echo "        public bind is legitimate plumbing for docker NAT; host-side loopback"
+        echo "        publish keeps the surface narrow — see image.Dockerfile security block)"
         echo "       curl -s -X POST http://localhost:18384/mcp \\"
         echo "         -H 'Content-Type: application/json' \\"
         echo "         -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}'"
@@ -214,10 +216,13 @@ tasks:
     cmds:
       - docker rm -f llo-smoke 2>/dev/null || true
       - |
-        # Image CMD already includes --mcp-bind 0.0.0.0; no override needed.
+        # Image CMD already includes --mcp-bind 0.0.0.0 --mcp-allow-public;
+        # no override needed. Host publish pinned to 127.0.0.1 so the
+        # unauthenticated MCP listener never reaches the LAN — matches the
+        # security block in image.Dockerfile.
         docker run -d --rm --name llo-smoke \
           --platform {{.PLATFORM}} \
-          -p {{.HOST_PORT}}:8384 \
+          -p 127.0.0.1:{{.HOST_PORT}}:8384 \
           ley-line-open:{{.VERSION}}
       - |
         until curl -sf -m 1 -X POST http://localhost:{{.HOST_PORT}}/mcp \

@@ -168,10 +168,13 @@ tasks:
   # leaks ~30 GB tmpdirs per run; apko's `archs: [x86_64, aarch64]` also
   # fails when only one arch APK is built. krust sidesteps both.
   #
-  # The image runs `leyline daemon --mcp-port 8384 --mcp-bind 0.0.0.0`
-  # headless (no FUSE). The --mcp-bind 0.0.0.0 override is required for
-  # docker port-forwarding to reach the listener — the daemon defaults to
-  # 127.0.0.1, which is loopback-only inside the container.
+  # The image runs `leyline daemon --mcp-port 8384 --mcp-bind 0.0.0.0
+  # --mcp-allow-public` headless (no FUSE). The --mcp-bind 0.0.0.0
+  # override is required for docker port-forwarding to reach the
+  # listener — the daemon defaults to 127.0.0.1, which is loopback-only
+  # inside the container. --mcp-allow-public is the deliberate opt-in
+  # added by bead `ley-line-open-b7dd03` — outside a container, the
+  # daemon refuses non-loopback binds without it.
   image:
     desc: Build ley-line-open:0.4.2 OCI image (krust musl binary + docker COPY)
     vars:
@@ -196,7 +199,7 @@ tasks:
       - |
         echo "Built ley-line-open:{{.VERSION}} ({{.PLATFORM}})."
         echo "Smoke: docker run --rm -p 18384:8384 ley-line-open:{{.VERSION}}"
-        echo "       (image CMD bakes in --mcp-bind 0.0.0.0 — port -p reaches it)"
+        echo "       (image CMD bakes in --mcp-bind 0.0.0.0 --mcp-allow-public — port -p reaches it)"
         echo "       curl -s -X POST http://localhost:18384/mcp \\"
         echo "         -H 'Content-Type: application/json' \\"
         echo "         -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}'"

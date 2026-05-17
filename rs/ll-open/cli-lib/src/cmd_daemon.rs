@@ -88,6 +88,7 @@ pub async fn cmd_daemon(
     source: Option<&Path>,
     mcp_port: Option<u16>,
     mcp_bind: Option<std::net::IpAddr>,
+    mcp_allow_public: bool,
 ) -> Result<()> {
     let ext: Arc<dyn DaemonExt> = Arc::new(NoExt);
     run_daemon(
@@ -103,6 +104,7 @@ pub async fn cmd_daemon(
         source,
         mcp_port,
         mcp_bind,
+        mcp_allow_public,
     )
     .await
 }
@@ -134,7 +136,32 @@ pub async fn run_daemon(
     source: Option<&Path>,
     mcp_port: Option<u16>,
     mcp_bind: Option<std::net::IpAddr>,
+    mcp_allow_public: bool,
 ) -> Result<()> {
+    // Bead `ley-line-open-b7dd03`: gate non-loopback `--mcp-bind` behind
+    // an explicit `--mcp-allow-public` flag. The MCP wire has no auth
+    // (tracked separately as bead `ley-line-open-b8395d`); making the
+    // public bind a deliberate two-flag opt-in prevents fat-fingered
+    // exposure on a dev box. Container deployments pass both flags in
+    // the image CMD; outside containers, only pass them when you
+    // control the firewall.
+    //
+    // We check BEFORE any arena/db work to fail fast — no point spinning
+    // the daemon up if it's about to be rejected.
+    if mcp_port.is_some()
+        && let Some(addr) = mcp_bind
+        && !addr.is_loopback()
+        && !mcp_allow_public
+    {
+        anyhow::bail!(
+            "refusing to bind MCP HTTP to non-loopback address {addr} without \
+             `--mcp-allow-public`. The MCP wire has no auth — binding off-loopback \
+             exposes the daemon to every interface on this machine. \
+             Pass `--mcp-allow-public` if you mean to do this (containers do; \
+             see image.Dockerfile)."
+        );
+    }
+
     // 1. Arena setup.
     let arena_bytes = arena_size_mib * 1024 * 1024;
     let ctrl_path = cmd_serve::setup_arena(arena, arena_bytes, control)?;
@@ -1488,5 +1515,139 @@ mod tests {
         assert!(!head_calls.is_empty(), "expected on_head_changed to fire");
         let (_old, new) = head_calls.last().unwrap();
         assert_eq!(new, &new_head, "hook should report the new HEAD sha");
+    }
+
+    // -----------------------------------------------------------------
+    // Bead `ley-line-open-b7dd03`: --mcp-bind public-address gate.
+    //
+    // The fail-fast check sits at the top of `run_daemon`, before any
+    // arena setup, so the tests below can pass throwaway paths and
+    // expect the bail to fire before anything is touched on disk.
+    // -----------------------------------------------------------------
+
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[tokio::test]
+    async fn mcp_public_bind_without_allow_flag_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let res = run_daemon(
+            &tmp.path().join("arena"),
+            64,
+            None,
+            None,
+            "sqlite",
+            12345,
+            None,
+            Some("0s"),
+            std::sync::Arc::new(NoExt),
+            None,
+            Some(8384),
+            Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            false,
+        )
+        .await;
+        let err = res.expect_err("non-loopback bind without --mcp-allow-public must bail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--mcp-allow-public"),
+            "error message must name the required flag; got: {msg}"
+        );
+        assert!(
+            msg.contains("0.0.0.0"),
+            "error message must echo the offending address; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_loopback_bind_without_allow_flag_proceeds_past_gate() {
+        // Loopback bind never trips the gate regardless of the flag.
+        // We expect the daemon to proceed past the gate and fail (or
+        // succeed) on something else — what matters is the error does
+        // NOT mention --mcp-allow-public.
+        let tmp = tempfile::tempdir().unwrap();
+        let res = run_daemon(
+            &tmp.path().join("arena"),
+            64,
+            None,
+            None,
+            "sqlite",
+            12346,
+            None,
+            Some("0s"),
+            std::sync::Arc::new(NoExt),
+            None,
+            Some(8384),
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            false,
+        )
+        .await;
+        if let Err(e) = res {
+            let msg = format!("{e:#}");
+            assert!(
+                !msg.contains("--mcp-allow-public"),
+                "loopback bind must not trip the public-bind gate; got: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_public_bind_with_allow_flag_proceeds_past_gate() {
+        // When the operator explicitly opts in, the gate must not fire.
+        let tmp = tempfile::tempdir().unwrap();
+        let res = run_daemon(
+            &tmp.path().join("arena"),
+            64,
+            None,
+            None,
+            "sqlite",
+            12347,
+            None,
+            Some("0s"),
+            std::sync::Arc::new(NoExt),
+            None,
+            Some(8384),
+            Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            true,
+        )
+        .await;
+        if let Err(e) = res {
+            let msg = format!("{e:#}");
+            assert!(
+                !msg.contains("--mcp-allow-public"),
+                "public bind WITH --mcp-allow-public must not trip the gate; got: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_allow_public_without_mcp_port_is_inert() {
+        // The flag is meaningless when MCP isn't enabled at all. The
+        // gate only fires when mcp_port is Some — passing it on a
+        // daemon that doesn't expose MCP HTTP should be a no-op, not
+        // an error.
+        let tmp = tempfile::tempdir().unwrap();
+        let res = run_daemon(
+            &tmp.path().join("arena"),
+            64,
+            None,
+            None,
+            "sqlite",
+            12348,
+            None,
+            Some("0s"),
+            std::sync::Arc::new(NoExt),
+            None,
+            None, // no mcp_port
+            Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            false,
+        )
+        .await;
+        if let Err(e) = res {
+            let msg = format!("{e:#}");
+            assert!(
+                !msg.contains("--mcp-allow-public"),
+                "gate must NOT fire when mcp_port is None; got: {msg}"
+            );
+        }
     }
 }

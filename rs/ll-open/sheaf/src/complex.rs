@@ -581,7 +581,7 @@ impl CellComplex {
         // forward from the current max edge ID so re-applies don't reuse
         // a still-live ID.
         const EDGE_ID_BASE: u32 = 1_000_000;
-        let mut next_edge_id = self
+        let next_edge_id = self
             .edges
             .iter()
             .copied()
@@ -589,9 +589,12 @@ impl CellComplex {
             .map(|m| m + 1)
             .unwrap_or(EDGE_ID_BASE)
             .max(EDGE_ID_BASE);
-        for spec in &delta.edges.added {
+        // Zip with the open-ended counter range instead of a manual `+= 1`
+        // — clippy's `explicit_counter_loop` lint flags the latter, and
+        // the zip form makes the parallel iteration explicit.
+        for (edge_id, spec) in (next_edge_id..).zip(&delta.edges.added) {
             self.add_edge(
-                next_edge_id,
+                edge_id,
                 spec.source,
                 spec.target,
                 spec.agreement_dim,
@@ -600,7 +603,6 @@ impl CellComplex {
                 spec.map_target.clone(),
                 false,
             );
-            next_edge_id += 1;
             touched.insert(spec.source);
             touched.insert(spec.target);
         }

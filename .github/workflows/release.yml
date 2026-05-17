@@ -73,7 +73,16 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             asset: leyline-linux-arm64
-          - os: macos-13
+          # darwin-amd64 cross-compiled from macos-latest (arm64) instead
+          # of macos-13. The macos-13 hosted runner pool is heavily
+          # oversubscribed — both v0.4.0 and v0.4.1 saw this job sit in
+          # `queued` indefinitely (never executed), leaving us with 3-of-4
+          # binaries per release. Apple's clang on arm64 macOS handles
+          # x86_64-apple-darwin cross-compilation natively; the existing
+          # `targets: ${{ matrix.target }}` line on the toolchain step
+          # already installs the cross target. Tracked by bead
+          # `ley-line-open-392bd7`.
+          - os: macos-latest
             target: x86_64-apple-darwin
             asset: leyline-darwin-amd64
           - os: macos-latest

@@ -173,10 +173,10 @@ tasks:
   # docker port-forwarding to reach the listener — the daemon defaults to
   # 127.0.0.1, which is loopback-only inside the container.
   image:
-    desc: Build ley-line-open:0.4.1 OCI image (krust musl binary + docker COPY)
+    desc: Build ley-line-open:0.4.2 OCI image (krust musl binary + docker COPY)
     vars:
       KRUST_REPO: '{{.KRUST_REPO | default "localhost/leyline"}}'
-      VERSION: '0.4.1'
+      VERSION: '0.4.2'
       PLATFORM: '{{.PLATFORM | default "linux/arm64"}}'
       # Derive musl target triple from PLATFORM so cross-arch builds find
       # the right binary. Image.Dockerfile's BIN_PATH default targets
@@ -205,7 +205,7 @@ tasks:
     desc: Build image and run end-to-end smoke (start daemon, probe MCP tools/list)
     deps: [image]
     vars:
-      VERSION: '0.4.1'
+      VERSION: '0.4.2'
       PLATFORM: '{{.PLATFORM | default "linux/arm64"}}'
       HOST_PORT: '18384'
     cmds:

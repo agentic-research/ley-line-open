@@ -10,7 +10,115 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
-Nothing yet — post-v0.4.1 changes land here.
+Nothing yet — post-v0.4.2 changes land here.
+
+## [0.4.2] — 2026-05-17
+
+Feature release shipping the sheaf-driven cache-coherence GC trilogy
+plus a CI-enforced cold-parse perf gate and a release-workflow fix.
+
+**For consumers** (mache, cloister, future LLO clients): with v0.4.2
+the sheaf surface is structurally complete — `set_topology` to seed,
+`update_topology` for incremental deltas, `invalidate` for asserted
+changes, `reap` for observational eviction, and `prior_generation`
+continuity tags so a consumer can detect missed events between two
+generations. The file-system-style "payload-blind GC where the trigger
+is structural, not content" idiom is operational.
+
+No public API change from v0.4.1 — all sheaf wire fields are purely
+additive (priorGeneration on two responses, new SheafReap{Request,
+Response}, new TopologyDelta + UpdateTopology{Request,Response}).
+Existing v0.4.1 consumers ignoring unknown fields keep working.
+
+This release should be the first to ship **4 binaries** (linux + macos
+× amd64 + arm64) — v0.4.0/v0.4.1 shipped 3-of-4 because the macos-13
+runner was perma-queued. PR #23 fixed the matrix to cross-compile
+darwin-amd64 from macos-latest.
+
+### Added — sheaf_update_topology (incremental delta op, GC item 2)
+
+- New `op_sheaf_update_topology` (`rs/ll-open/cli-lib/src/daemon/
+  sheaf_ops.rs`). Today's `sheaf_set_topology` replaces the whole
+  `CellComplex` atomically; this op applies a delta (added/removed
+  regions, edge changes, stalk updates) and preserves cached entries
+  for untouched regions. Returns `affected_regions` (touched ∪
+  radius-1 BFS neighbours) so consumers know exactly which keys to
+  evict — every region outside this set is byte-identical to its
+  pre-update value.
+- New `CellComplex::apply_delta`, `remove_node`, `remove_edge` in
+  `sheaf/src/complex.rs` plus `SheafCache::refresh_baseline_subset`,
+  `drop_region`, `drop_restriction`, `neighbours`, `complex_mut`,
+  `bump_generation` in `sheaf/src/cache.rs`.
+- Wire: `TopologyDelta`, `EdgeRef`, `StalkUpdate`,
+  `SheafUpdateTopologyRequest`, `SheafUpdateTopologyResponse` in
+  `daemon.capnp`. Go bindings regen'd.
+- 4 new falsifiability gates (`incremental_update_preserves_untouched_
+  cache_entries`, `affected_regions_includes_radius_1_neighbours`,
+  `add_region_baseline_matches_set_topology`, `concurrent_updates_
+  serialize_correctly`) + 1 black-box UDS gate (`update_topology_over_
+  uds_returns_affected_subset_not_whole_graph`). Tracked by bead
+  `ley-line-open-9d2302`; merged via PR #25.
+
+### Added — sheaf_reap (δ⁰-driven GC op, GC item 3)
+
+- New `op_sheaf_reap` (`sheaf_ops.rs`). Pure observational query:
+  "given today's stalks vs the last baseline, which cached region IDs
+  can the consumer safely evict?". Returns `reclaimable`, `count`,
+  `generation`, `reaped_at_defect`. Read-only — does NOT bump
+  generation so consumers can call repeatedly during one enrichment
+  pass without advancing their cursor.
+- New `SheafCache::reap` in `sheaf/src/cache.rs`. Walks restriction
+  edges, finds those whose ‖δ⁰‖² has moved beyond `DELTA0_EPS_SQUARED`
+  from baseline, BFS-expands to radius 3 (same depth as `on_change`).
+  Payload-blind by construction — never inspects the consumer's
+  cached `V`. NaN defect when no `CellComplex` attached.
+- Wire: `SheafReapRequest`, `SheafReapResponse` in `daemon.capnp`.
+- 4 new falsifiability gates (`reap_no_false_positives_on_unchanged_
+  stalks`, `reap_no_false_negatives_when_stalks_move`, `reap_payload_
+  blind_under_different_v_types`, `reap_returns_empty_and_nan_without_
+  complex`) + 1 black-box UDS gate (`sheaf_reap_observes_drift_over_
+  uds`). Tracked by bead `ley-line-open-9c867f`; merged via PR #26.
+
+### Added — prior_generation continuity tag (GC item 1)
+
+- New `priorGeneration` field on `SheafInvalidateResponse` and
+  `SheafUpdateTopologyResponse`. Carries the generation value
+  immediately before the op bumped it; consumers verify `their_last_
+  seen == response.prior_generation` to detect missed events between
+  two generations.
+- Intentionally NOT added to `SheafReapResponse` since reap doesn't
+  bump generation — `prior_generation == generation` would be useless
+  info. Scope trimmed from the bead after implementation insight.
+- 2 new black-box UDS gates (`sheaf_invalidate_prior_generation_
+  continuity_over_uds`, `sheaf_update_topology_prior_generation_
+  continuity_over_uds`). Pins monotonicity + first-call-prior-is-zero
+  + cross-op continuity (invalidate → update sequence). Tracked by
+  bead `ley-line-open-9d5d7d`; merged via PR #27.
+
+### Added — cold-parse perf regression gate
+
+- `rs/ll-open/cli-lib/tests/cold_parse_perf_regression.rs` —
+  synthesizes a deterministic 800-file Go corpus from committed
+  fixtures, runs `cmd_parse`, asserts `wall < 500ms` AND `per_row <
+  25us`. Per-row budget is the adaptive assertion — catches un-batched
+  insert regressions even when corpus shape drifts.
+- Gated behind `LLO_PERF_GATES=1` (same convention as `topology_pass_
+  test.rs`); `task ci` sets the env via a new `task test:perf` step.
+  Plain `cargo test` skips. Per user feedback ("CI is kinda ass in
+  GHA lol"), enforcement lives in `task ci` (local pre-push) not GHA.
+- Tracked by bead `ley-line-open-a3f254`; merged via PR #24.
+
+### Fixed — release workflow macos-13 perma-queue
+
+- `.github/workflows/release.yml` — `build leyline-darwin-amd64`
+  switched from `os: macos-13` to `os: macos-latest` (arm64) with
+  `target: x86_64-apple-darwin` cross-compile. The macos-13 hosted
+  runner pool was perma-oversubscribed; v0.4.0 and v0.4.1 both saw
+  this job sit in `status=queued` indefinitely (never executed),
+  shipping 3-of-4 binaries per release. Apple's clang on arm64 macOS
+  handles both archs natively. This is v0.4.2's first true 4-binary
+  release if the workflow holds. Tracked by bead `ley-line-open-
+  392bd7`; merged via PR #23.
 
 ## [0.4.1] — 2026-05-17
 

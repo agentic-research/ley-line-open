@@ -10,7 +10,102 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
-Nothing yet — post-v0.4.0 changes land here.
+Nothing yet — post-v0.4.1 changes land here.
+
+## [0.4.1] — 2026-05-17
+
+Patch release. Ships the P0 wire fix that unblocks mache δ⁰ adoption,
+a topology pre-pass module that materialises the inputs the future
+`sheaf_update_topology` op will consume, a cold-parse perf drill
+(5040ms → ~1475ms median wall on a 766-file mache-sized repo), and
+two ADRs (0015 lazy-on-access ingestion, 0016 AI-native query surface)
+that frame the v0.5 design space.
+
+No public API change relative to v0.4.0; wire shape is identical for
+all in-tree ops. Consumers on v0.4.0 should upgrade — the cascade fix
+is observable.
+
+### Fixed
+
+- **P0**: `sheaf_invalidate` over UDS now returns the changed roots
+  the caller passed in *plus* any δ⁰ / XOR-trigger neighbours, instead
+  of an empty array. Prior v0.4.0 release shipped with the cascade
+  gated on the daemon's local `SheafCache::entries` map being
+  populated — but no daemon op populates `entries`, so UDS / MCP
+  consumers (mache included) observed `invalidated: []` for every
+  call. Decouples cascade output from cache contents; in-process
+  callers see the same answer UDS consumers do. Black-box regression
+  test in `cli-lib/tests/sheaf_uds_blackbox_test.rs` (2 tests, both
+  modes) and falsifiability gate
+  `claim_2c_changed_roots_are_returned_even_when_entries_are_empty`
+  pin the contract. Tracked by bead `ley-line-open-d03e7d`; merged
+  via PR #19.
+
+### Added — `topology_pass` module
+
+- `rs/ll-open/cli-lib/src/topology_pass.rs` (~1100 LOC) — pre-parse
+  pass that walks the workspace, scans for `Cargo.toml` / `go.mod` /
+  `pyproject.toml` / `package.json` manifests, sweeps regex
+  imports across 4 languages (Rust `use`/`pub use`, Go single + grouped,
+  Python `import`/`from`, TypeScript `import`/`export-from` with
+  token-boundary `import()`-detection and comment-skip), clusters
+  regions by manifest ancestor (`BTreeMap` ancestor-walk, O(n log m)),
+  and emits a `TopologyOutput` with the `region_edges` that translate
+  into `SheafRestrictionInput` for the future
+  `sheaf_update_topology` op. 11 falsifiability gates
+  (`tests/topology_pass_test.rs`): empty-file cost lower bound,
+  realistic-size cost ceiling, scaling claim, 4-language presence,
+  root + subcrate / depth-3 / bloat-dir scenarios, determinism, and
+  region-edge → sheaf-input translation spot-check. Gated behind
+  `LLO_PERF_GATES` env var. Skeptic-cleared (5 important + 4 nit
+  findings addressed) and Copilot-cleared (3 findings addressed).
+  Tracked by bead `ley-line-open-9d3208`; merged via PR #20.
+
+### Performance — cold-parse wall
+
+- `rs/ll-open/cli-lib/src/cmd_parse.rs` — three-attack drill on
+  the 5040ms baseline for `leyline parse ~mache repo` (766 files,
+  535k AST nodes):
+  - **Insert phase**: batched VALUES inserts (`BULK_BATCH_ROWS = 3000`
+    × 9 columns = 27000 params, under the 32766 SQLite parameter
+    cap; ~60 KB per statement). `BufWriter` wraps the capnp dual-
+    write path to coalesce syscalls. Indexes deferred until after
+    `COMMIT`.
+  - **Head-write**: parallel head-write thread runs alongside insert
+    instead of after. Cold parse skips the sweep step entirely
+    (`sweep_orphaned_dirs` only runs when prior generation existed,
+    falsifiability gate
+    `sweep_orphaned_dirs_runs_when_files_are_deleted_between_parses`
+    pins this). On cold parse: `head_write=0ms sweep_close=0ms`.
+  - **Process exit**: `libc::_exit(0)` from `main()` (CLI-only, gated
+    on `is_parse && r.is_ok()`) plus `mem::forget(conn)` to avoid
+    sqlite's destructor flush — the OS reclaims pages faster than
+    the Drop chain. NOT in the daemon path.
+  - **Result**: median wall **1475ms** (3 release runs on
+    `~/github/art/mache`: 1531ms / 1474ms / 1475ms). 70% reduction.
+    Insert phase now dominates (~92% of wall); future drilling
+    targets prepared-statement batching or mmap'd staging.
+  - Falsifiability gate
+    `batched_inserts_preserve_record_content_not_just_row_count`
+    verifies the batch optimisation doesn't drop rows.
+  - Skeptic-cleared (5 findings addressed including doc accuracy,
+    test of the deferred sweep path, lint cleanup, fmt diff).
+  - Tracked by bead `ley-line-open-cbbedf`; merged via PR #21.
+
+### Added — ADRs
+
+- `docs/adr/0015-lazy-on-access-ingestion.md` (220 lines) — 7
+  decisions × ≥2 alternatives + falsifiability each. POSIX syscall
+  partition (read / mmap trigger; stat / access / readdir don't),
+  FSEvents vs kqueue, `SheafCache` as on-miss backing. Forwards
+  consumer-shape question to ADR-0016.
+- `docs/adr/0016-ai-native-query-surface.md` (410 lines) — 8
+  decisions × 3 alternatives + falsifiability each. Symbol-keyed,
+  bundled, structured, stateless protocol. Worked example: 1
+  round-trip / 4.3 KB vs LSP's 12 / 9.8 KB. LSP 3.17 coverage map:
+  41 methods placed (14 supported / 13 deferred / 14 unsupported).
+- Tracked by beads `ley-line-open-9db858` (0015) and
+  `ley-line-open-9f491f` (0016); merged via PR #18.
 
 ## [0.4.0] — 2026-05-14
 

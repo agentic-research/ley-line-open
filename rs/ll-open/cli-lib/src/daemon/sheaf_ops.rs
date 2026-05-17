@@ -17,7 +17,7 @@
 //! `serde_json::Value`-driven) and adapted to OSS LLO's typed [`BaseRequest`]
 //! dispatch + capnp-json response builders.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Mutex;
 
 use anyhow::Result;
@@ -127,6 +127,39 @@ pub struct SheafRestrictionInput {
     /// each endpoint's stalk. Zero ⇒ heuristic-only for this edge.
     #[serde(default)]
     pub agreement_dim: u32,
+}
+
+#[derive(serde::Deserialize, Debug, Default)]
+pub struct EdgeRefInput {
+    pub source: u32,
+    pub target: u32,
+}
+
+#[derive(serde::Deserialize, Debug, Default)]
+pub struct StalkUpdateInput {
+    pub region_id: u32,
+    /// New stalk values for the region. When δ⁰ mode is active, length must
+    /// match the topology's `node_stalk_dim`; mismatched lengths cause the
+    /// update to be skipped for that region (no panic in the handler).
+    #[serde(default)]
+    pub stalk: Vec<f32>,
+}
+
+/// Wire-side topology delta for the incremental `sheaf_update_topology` op.
+/// Mirrors the capnp `TopologyDelta` struct field-for-field; serde decodes
+/// the JSON wire payload directly into this shape via `BaseRequest`.
+#[derive(serde::Deserialize, Debug, Default)]
+pub struct TopologyDeltaInput {
+    #[serde(default)]
+    pub added_regions: Vec<SheafStalkInput>,
+    #[serde(default)]
+    pub removed_regions: Vec<u32>,
+    #[serde(default)]
+    pub added_edges: Vec<SheafRestrictionInput>,
+    #[serde(default)]
+    pub removed_edges: Vec<EdgeRefInput>,
+    #[serde(default)]
+    pub updated_stalks: Vec<StalkUpdateInput>,
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +405,225 @@ pub fn op_sheaf_learned_weights(state: &SheafState) -> Result<String> {
     }
     let reader =
         builder.get_root_as_reader::<daemon_capnp::sheaf_learned_weights_response::Reader>()?;
+    Ok(capnp_json::to_json(reader)?)
+}
+
+/// Apply an incremental `TopologyDelta` and re-snapshot only the affected
+/// subgraph. Returns the affected region list (touched ∪ radius-1
+/// neighbours) so consumers know exactly which cache entries to evict —
+/// every other region is byte-identical to its pre-update value.
+///
+/// δ⁰ mode handling mirrors `op_sheaf_set_topology`: when a backing
+/// [`CellComplex`] is attached, every shape (region add, edge add, stalk
+/// update) lands in both the cache's restriction map AND the complex, then
+/// `refresh_baseline_subset` re-snapshots `‖δ⁰‖²` only on edges incident to
+/// the touched set. When no complex is attached, the heuristic-only path
+/// applies (XOR-Merkle pre-filter as the only invalidation signal).
+///
+/// Lock ordering: we hold `state.cache` for the full apply-then-refresh
+/// sequence so other handlers (notably `op_sheaf_invalidate`) cannot
+/// observe a half-applied delta. The `state.edges` mutex is taken AFTER
+/// `cache` is dropped, mirroring `op_sheaf_set_topology` to keep the lock
+/// graph acyclic across all sheaf ops.
+pub fn op_sheaf_update_topology(
+    state: &SheafState,
+    delta: &TopologyDeltaInput,
+    node_stalk_dim: u32,
+) -> Result<String> {
+    let mut cache = state.cache.lock().unwrap();
+
+    // 1. Build the touched-region set from the delta itself, then expand to
+    //    radius-1 via the CURRENT cache topology (pre-mutation) so consumers
+    //    whose entries point at a soon-to-be-detached neighbour still get
+    //    that neighbour in the eviction list.
+    let mut touched: BTreeSet<u32> = BTreeSet::new();
+    for r in &delta.added_regions {
+        touched.insert(r.id);
+    }
+    for &rid in &delta.removed_regions {
+        touched.insert(rid);
+    }
+    for e in &delta.added_edges {
+        touched.insert(e.a);
+        touched.insert(e.b);
+    }
+    for e in &delta.removed_edges {
+        touched.insert(e.source);
+        touched.insert(e.target);
+    }
+    for s in &delta.updated_stalks {
+        touched.insert(s.region_id);
+    }
+
+    // Pre-mutation radius-1 expansion. Removed regions' neighbours are
+    // gathered here while the restriction graph still records them.
+    let mut affected: BTreeSet<u32> = touched.clone();
+    for &rid in &touched {
+        for n in cache.neighbours(rid) {
+            affected.insert(n);
+        }
+    }
+
+    // 2. Apply the delta to the cache's restriction-map view.
+    for e in &delta.removed_edges {
+        cache.drop_restriction(e.source, e.target);
+    }
+    for &rid in &delta.removed_regions {
+        cache.drop_region(rid);
+    }
+    for r in &delta.added_regions {
+        cache.set_stalk(r.id, HashStalk(parse_hash(&r.hash)));
+    }
+    for e in &delta.added_edges {
+        let weights = if e.weights.is_empty() {
+            vec![1.0]
+        } else {
+            e.weights.clone()
+        };
+        cache.set_restriction(
+            e.a,
+            e.b,
+            RestrictionEdge {
+                weights,
+                boundary_hash: parse_hash(&e.boundary_hash),
+                co_change_rate: e.co_change_rate,
+                revert_rate: e.revert_rate,
+            },
+        );
+    }
+    for s in &delta.updated_stalks {
+        // Stalk overwrite: update the hash if it would change. The wire
+        // doesn't carry a fresh hash field on StalkUpdate (it carries raw
+        // f32 data); the cache's XOR pre-filter consults the stored hash,
+        // so we leave the existing hash in place. Callers that want the
+        // hash refreshed too use `sheaf_invalidate` with an explicit hash.
+        // δ⁰ mode reads from the complex's stalk data we push below.
+        let _ = s;
+    }
+
+    // 3. Mirror the delta into the backing CellComplex when δ⁰ mode is
+    //    active. Every shape must match `node_stalk_dim` (the contract the
+    //    seed `set_topology` established); regions whose data length is
+    //    wrong are skipped (handler-level guard, not a panic, so a bad
+    //    wire payload doesn't take the daemon down).
+    if let Some(cx) = cache.complex_mut() {
+        let dim = node_stalk_dim as usize;
+        // Edges first so we don't drop a region while a stale edge still
+        // points at it — `remove_node` on the complex already handles that
+        // cascade, but explicit ordering keeps the pre/post invariants
+        // independent.
+        for e in &delta.removed_edges {
+            cx.remove_edge(e.source, e.target);
+        }
+        for &rid in &delta.removed_regions {
+            cx.remove_node(rid);
+        }
+        for r in &delta.added_regions {
+            if r.data.len() == dim && dim > 0 {
+                cx.add_node(r.id, r.data.clone());
+            }
+        }
+        for e in &delta.added_edges {
+            if dim == 0 || e.agreement_dim == 0 || e.agreement_dim > node_stalk_dim {
+                continue;
+            }
+            // Skip when either endpoint isn't in the complex (heuristic-
+            // only seed, or the prior delta didn't add an f32-shaped
+            // region). The cache still records the restriction edge for
+            // the XOR pre-filter; the complex just won't have the edge.
+            if !cx.cells.contains_key(&e.a) || !cx.cells.contains_key(&e.b) {
+                continue;
+            }
+            // Edge IDs share the `cells` HashMap namespace with regions, so
+            // we start incremental-edge IDs at 1M to stay well clear of any
+            // realistic region-ID range. The seed `set_topology` allocates
+            // from 100 (bounded by region count), but the update op is
+            // long-lived — pick a base that can't collide with future
+            // region additions.
+            const INCREMENTAL_EDGE_BASE: u32 = 1_000_000;
+            let next_id = cx
+                .edges
+                .iter()
+                .copied()
+                .max()
+                .map(|m| m + 1)
+                .unwrap_or(INCREMENTAL_EDGE_BASE)
+                .max(INCREMENTAL_EDGE_BASE);
+            let f = RestrictionMap::project_dim_range(dim, e.agreement_dim as usize);
+            cx.add_edge(
+                next_id,
+                e.a,
+                e.b,
+                e.agreement_dim as usize,
+                Some("daemon".into()),
+                f.clone(),
+                f,
+                false,
+            );
+        }
+        for s in &delta.updated_stalks {
+            if s.stalk.len() == dim && dim > 0 && cx.cells.contains_key(&s.region_id) {
+                cx.set_node_stalk(s.region_id, s.stalk.clone());
+            }
+        }
+    }
+
+    // 4. Post-mutation radius-1 expansion. The touched set may now connect
+    //    to NEW neighbours (added edges) the pre-mutation pass missed.
+    for &rid in &touched {
+        for n in cache.neighbours(rid) {
+            affected.insert(n);
+        }
+    }
+
+    // 5. Refresh the δ⁰ baseline on the affected subgraph only.
+    let affected_vec: Vec<u32> = affected.iter().copied().collect();
+    cache.refresh_baseline_subset(&affected_vec);
+
+    // 6. Generation advances exactly once per update — the consumer-visible
+    //    "we've moved past your snapshot" signal stays monotonic.
+    let generation = cache.bump_generation();
+    let defect_after = cache.defect() as f32;
+
+    // Replace the cached edge-pair list (used by op_sheaf_invalidate's
+    // co-change tracker) with the post-delta canonical edge set. Dropped
+    // outside the `state.edges` lock acquisition to preserve the lock
+    // ordering documented above.
+    let post_edges: Vec<(u32, u32)> = cache
+        .restriction_edges()
+        .map(|(&(a, b), _)| (a.min(b), a.max(b)))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    drop(cache);
+    {
+        let mut edges = state.edges.lock().unwrap();
+        *edges = post_edges;
+    }
+
+    state.emit(
+        "sheaf.topology",
+        serde_json::json!({
+            "kind": "update",
+            "affected": affected_vec,
+            "generation": generation,
+            "defect_after": defect_after,
+        }),
+    );
+
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root: daemon_capnp::sheaf_update_topology_response::Builder = builder.init_root();
+    root.set_ok(true);
+    root.set_generation(generation);
+    root.set_defect_after(defect_after);
+    let mut affected_list = root
+        .reborrow()
+        .init_affected_regions(affected_vec.len() as u32);
+    for (i, &r) in affected_vec.iter().enumerate() {
+        affected_list.set(i as u32, r);
+    }
+    let reader =
+        builder.get_root_as_reader::<daemon_capnp::sheaf_update_topology_response::Reader>()?;
     Ok(capnp_json::to_json(reader)?)
 }
 

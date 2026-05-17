@@ -241,3 +241,135 @@ async fn sheaf_invalidate_heuristic_mode_non_empty_cascade_over_uds() {
          got {invalidated:?} (full: {invalidate})"
     );
 }
+
+/// Bead ley-line-open-9d2302 falsifiability gate:
+/// `sheaf_update_topology` returns the touched ∪ radius-1 subset, NOT the
+/// whole graph. Pin this by seeding a 10-region star (center=0, leaves=1..9)
+/// and applying a 1-region delta that only touches the center. The
+/// affected list must contain center+leaves (radius-1 from center =
+/// every leaf), but the daemon must NOT report the test back as having
+/// re-emitted the entire complex's invalidation cascade — the response
+/// shape is "affected subset" not "everyone".
+///
+/// The strong check: invalidated.len() == 10 (center + 9 leaves) when
+/// the center moves; if the impl regresses to set_topology semantics the
+/// test still passes here (size matches), but if it regresses to
+/// "everyone" semantics on a complex with EXTRA disconnected regions the
+/// test catches it.
+#[tokio::test]
+async fn update_topology_over_uds_returns_affected_subset_not_whole_graph() {
+    let dir = TempDir::new().unwrap();
+    let ctx = build_blackbox_ctx(dir.path());
+    let sock_path = dir.path().join("sheaf-update.sock");
+    let sock = spawn_blackbox_socket(ctx, sock_path).await;
+
+    // Step 1: seed 12 regions. A 10-region star (center=0, leaves=1..9)
+    // is connected; regions 10 and 11 are intentionally isolated. After
+    // an update that touches only the center, the affected list must
+    // include center + every leaf (10 regions) but NOT 10 or 11.
+    //
+    // δ⁰ mode engaged: every stalk is 4D, every edge agreement_dim=2.
+    let mut regions = String::from("[");
+    for id in 0..12u32 {
+        if id > 0 {
+            regions.push(',');
+        }
+        regions.push_str(&format!(
+            r#"{{"id":{id},"hash":"{id:02x}","data":[1.0,0.5,{id}.0,0.0]}}"#
+        ));
+    }
+    regions.push(']');
+
+    let mut restrictions = String::from("[");
+    for leaf in 1..10u32 {
+        if leaf > 1 {
+            restrictions.push(',');
+        }
+        restrictions.push_str(&format!(
+            r#"{{"a":0,"b":{leaf},"boundary_hash":"{:02x}","co_change_rate":0.5,"weights":[1.0],"agreement_dim":2}}"#,
+            0u8 ^ (leaf as u8)
+        ));
+    }
+    restrictions.push(']');
+
+    let topology = uds_call(
+        &sock,
+        &format!(
+            r#"{{"op":"sheaf_set_topology","node_stalk_dim":4,"regions":{regions},"restrictions":{restrictions}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(topology["ok"], true, "seed must succeed: {topology}");
+    assert_eq!(
+        topology["delta_zero_mode"], true,
+        "δ⁰ mode must engage: {topology}"
+    );
+
+    // Step 2: incremental update that ONLY changes region 0's stalk.
+    // The affected set should be {0, 1, 2, ..., 9} — center plus every
+    // leaf neighbour. Regions 10 and 11 (disconnected) must NOT appear.
+    let update = uds_call(
+        &sock,
+        r#"{"op":"sheaf_update_topology","node_stalk_dim":4,"delta":{"updated_stalks":[{"region_id":0,"stalk":[99.0,0.5,0.0,0.0]}]}}"#,
+    )
+    .await;
+
+    assert_eq!(
+        update["ok"], true,
+        "sheaf_update_topology must succeed: {update}"
+    );
+
+    let affected: Vec<u32> = update["affected_regions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("affected_regions must be an array; full: {update}"))
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+
+    // The center (0) and its 9 leaves must all be in the affected set.
+    assert!(
+        affected.contains(&0),
+        "touched region 0 must appear in affected; got {affected:?}"
+    );
+    for leaf in 1..10u32 {
+        assert!(
+            affected.contains(&leaf),
+            "radius-1 neighbour {leaf} must appear in affected; got {affected:?}"
+        );
+    }
+
+    // The strong claim: the disconnected regions must NOT appear. If the
+    // op regresses to "rebuild everything" semantics it will return all
+    // 12 regions; this check catches that.
+    assert!(
+        !affected.contains(&10),
+        "disconnected region 10 must NOT appear in affected; got {affected:?} (full: {update})"
+    );
+    assert!(
+        !affected.contains(&11),
+        "disconnected region 11 must NOT appear in affected; got {affected:?} (full: {update})"
+    );
+    assert_eq!(
+        affected.len(),
+        10,
+        "affected set must be exactly {{center + 9 leaves}}; got {affected:?} (full: {update})"
+    );
+
+    // Step 3: generation must advance, defect_after must be finite.
+    let generation: u64 = update["generation"]
+        .as_str()
+        .unwrap_or_else(|| panic!("generation must be Int64-as-string; full: {update}"))
+        .parse()
+        .expect("generation parses as u64");
+    assert!(
+        generation >= 1,
+        "generation must advance after the update; got {generation}"
+    );
+    let defect_after = update["defect_after"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("defect_after must be numeric; full: {update}"));
+    assert!(
+        defect_after.is_finite() && defect_after >= 0.0,
+        "defect_after must be a finite non-negative number; got {defect_after}"
+    );
+}

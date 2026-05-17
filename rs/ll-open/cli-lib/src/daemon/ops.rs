@@ -71,6 +71,7 @@ pub(crate) fn base_op_names() -> Vec<&'static str> {
         "lsp_symbols",
         "lsp_diagnostics",
         "sheaf_set_topology",
+        "sheaf_update_topology",
         "sheaf_invalidate",
         "sheaf_defect",
         "sheaf_stalks",
@@ -171,6 +172,7 @@ fn is_known_base_op(op: &str) -> bool {
             | "lsp_symbols"
             | "lsp_diagnostics"
             | "sheaf_set_topology"
+            | "sheaf_update_topology"
             | "sheaf_invalidate"
             | "sheaf_defect"
             | "sheaf_stalks"
@@ -220,6 +222,10 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
             &restrictions,
             node_stalk_dim,
         ),
+        BaseRequest::SheafUpdateTopology {
+            delta,
+            node_stalk_dim,
+        } => super::sheaf_ops::op_sheaf_update_topology(&ctx.sheaf, &delta, node_stalk_dim),
         BaseRequest::SheafInvalidate { regions, stalks } => {
             super::sheaf_ops::op_sheaf_invalidate(&ctx.sheaf, &regions, &stalks)
         }

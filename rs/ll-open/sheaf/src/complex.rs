@@ -166,6 +166,61 @@ pub struct Violation {
     pub is_virtual: bool,
 }
 
+/// One node-side of a topology delta: either add a new region with a stalk,
+/// remove an existing region, or overwrite an existing region's stalk.
+///
+/// IDs are `RegionId` (u32) so this struct stays domain-agnostic; the
+/// daemon's UDS wire maps `SheafStalk.id` straight through.
+#[derive(Debug, Clone, Default)]
+pub struct RegionDelta {
+    pub added: Vec<(u32, Vec<f32>)>,
+    pub removed: Vec<u32>,
+    pub updated_stalks: Vec<(u32, Vec<f32>)>,
+}
+
+/// One edge-side of a topology delta. Each entry on `added` is the same
+/// shape `add_edge` already takes; `removed` is by `(source, target)` pair
+/// — the same shape `incidence` stores so lookup is O(edges) per remove
+/// without an extra index. Lookups are direction-insensitive: removing
+/// `(a, b)` removes any edge between a and b in either direction.
+#[derive(Debug, Clone, Default)]
+pub struct EdgeDelta {
+    pub added: Vec<EdgeSpec>,
+    pub removed: Vec<(u32, u32)>,
+}
+
+/// Add-edge payload for [`CellComplex::apply_delta`]. Matches the shape
+/// `add_edge` consumes today, packed into one struct so the delta can
+/// move many edges at once without a giant tuple.
+#[derive(Debug, Clone)]
+pub struct EdgeSpec {
+    pub source: u32,
+    pub target: u32,
+    pub agreement_dim: usize,
+    pub label: Option<String>,
+    pub map_source: RestrictionMap,
+    pub map_target: RestrictionMap,
+}
+
+/// A complete topology delta: every node-side and edge-side change applied
+/// atomically by [`CellComplex::apply_delta`]. Order of application
+/// (remove-edges → remove-regions → add-regions → add-edges → update-
+/// stalks) is the contract — see `apply_delta` for why.
+#[derive(Debug, Clone, Default)]
+pub struct TopologyDelta {
+    pub regions: RegionDelta,
+    pub edges: EdgeDelta,
+}
+
+impl TopologyDelta {
+    /// Empty delta — applying it is a no-op and `apply_delta` returns an
+    /// empty touched-set. Useful as a starting point the caller mutates
+    /// in place over multiple add/remove iterations.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// Output of [`CellComplex::consistency_analysis`].
 ///
 /// `defect` is the genuine sheaf-derived `‖δ⁰(stalks)‖²` — this is the H⁰
@@ -399,6 +454,167 @@ impl CellComplex {
         self.incidence.insert(edge_id, (source, target));
         self.restriction_maps.insert((source, edge_id), map_source);
         self.restriction_maps.insert((target, edge_id), map_target);
+    }
+
+    /// Remove a 0-cell (node) and every edge incident to it. Idempotent: if
+    /// the node isn't present this is a no-op. Returns the set of edge IDs
+    /// that were removed alongside the node so callers can keep their own
+    /// edge-derived state in sync (the cache uses this to drop matching
+    /// δ⁰-baseline entries).
+    ///
+    /// Edges are dropped via [`Self::remove_edge_by_id`] so restriction maps
+    /// and incidence go with them — no orphan restriction map can survive
+    /// a region removal.
+    pub fn remove_node(&mut self, id: u32) -> Vec<u32> {
+        if !self.cells.contains_key(&id) {
+            return Vec::new();
+        }
+        // Collect touching edges first so we don't invalidate iteration
+        // when remove_edge_by_id mutates self.edges / self.incidence.
+        let touching: Vec<u32> = self
+            .incidence
+            .iter()
+            .filter(|&(_, &(u, v))| u == id || v == id)
+            .map(|(&eid, _)| eid)
+            .collect();
+        for eid in &touching {
+            self.remove_edge_by_id(*eid);
+        }
+        self.cells.remove(&id);
+        self.nodes.retain(|&n| n != id);
+        touching
+    }
+
+    /// Remove the edge connecting `source ↔ target` regardless of stored
+    /// direction. Idempotent — returns `None` if no such edge exists,
+    /// otherwise the removed edge's id. Direction-insensitive so callers
+    /// over UDS don't have to track which way the daemon stored the edge.
+    pub fn remove_edge(&mut self, source: u32, target: u32) -> Option<u32> {
+        let edge_id = self
+            .incidence
+            .iter()
+            .find(|&(_, &(u, v))| (u == source && v == target) || (u == target && v == source))
+            .map(|(&eid, _)| eid)?;
+        self.remove_edge_by_id(edge_id);
+        Some(edge_id)
+    }
+
+    /// Remove an edge by its internal id and drop its restriction maps +
+    /// incidence + cell. Faces referencing the edge are dropped too so the
+    /// cochain-complex axiom `δ¹∘δ⁰ = 0` keeps holding without garbage face
+    /// rows pointing at a missing edge.
+    fn remove_edge_by_id(&mut self, edge_id: u32) {
+        let endpoints = self.incidence.remove(&edge_id);
+        if let Some((u, v)) = endpoints {
+            self.restriction_maps.remove(&(u, edge_id));
+            self.restriction_maps.remove(&(v, edge_id));
+        }
+        self.cells.remove(&edge_id);
+        self.edges.retain(|&e| e != edge_id);
+        // Drop faces that reference the removed edge.
+        let dead_faces: Vec<u32> = self
+            .face_cells
+            .iter()
+            .filter(|(_, face)| face.edges.iter().any(|&(eid, _)| eid == edge_id))
+            .map(|(&fid, _)| fid)
+            .collect();
+        for fid in dead_faces {
+            self.face_cells.remove(&fid);
+            self.faces.retain(|&f| f != fid);
+        }
+    }
+
+    /// Apply a [`TopologyDelta`] atomically and return the set of region IDs
+    /// the delta touched directly (added, removed, edge-touched, or stalk-
+    /// updated). The caller computes radius-1 neighbours separately — this
+    /// method intentionally stays "what changed, nothing more" so the cache
+    /// can layer its own neighbour expansion on top.
+    ///
+    /// Order matters: edges are removed before regions so removing a region
+    /// doesn't try to drop the same edge twice; regions are added before
+    /// edges so the new edge's endpoints exist when `add_edge` validates
+    /// restriction-map shapes; stalks are updated last so the f32 data is
+    /// applied against the new region set.
+    ///
+    /// Internal edge IDs are assigned sequentially starting from
+    /// `max(edges) + 1` (or the `1M` collision-avoidance floor) so they
+    /// don't collide with anything the seed `set_topology` installed.
+    pub fn apply_delta(&mut self, delta: &TopologyDelta) -> Vec<u32> {
+        let mut touched: HashSet<u32> = HashSet::new();
+
+        for &(src, tgt) in &delta.edges.removed {
+            if self.remove_edge(src, tgt).is_some() {
+                touched.insert(src);
+                touched.insert(tgt);
+            }
+        }
+
+        for &rid in &delta.regions.removed {
+            let dropped_edges = self.remove_node(rid);
+            // Mark the dropped-edge endpoints as touched too — a downstream
+            // baseline refresh needs to see them.
+            for eid in dropped_edges {
+                if let Some(&(u, v)) = self.incidence.get(&eid) {
+                    touched.insert(u);
+                    touched.insert(v);
+                }
+            }
+            touched.insert(rid);
+        }
+
+        for (rid, data) in &delta.regions.added {
+            // Skip re-adds of an already-present region; the stalk-update
+            // pass below handles overwrites cleanly.
+            if !self.cells.contains_key(rid) {
+                self.add_node(*rid, data.clone());
+            } else {
+                self.set_node_stalk(*rid, data.clone());
+            }
+            touched.insert(*rid);
+        }
+
+        // Edge IDs share the `cells` namespace with regions. Start from a
+        // high offset (1_000_000) to avoid collision with region IDs the
+        // daemon hands us — the seed `set_topology` uses `100` and is bounded
+        // by the OSS region count, but incremental updates can run forever
+        // and we don't want to depend on "region IDs stay under 100". Bump
+        // forward from the current max edge ID so re-applies don't reuse
+        // a still-live ID.
+        const EDGE_ID_BASE: u32 = 1_000_000;
+        let mut next_edge_id = self
+            .edges
+            .iter()
+            .copied()
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(EDGE_ID_BASE)
+            .max(EDGE_ID_BASE);
+        for spec in &delta.edges.added {
+            self.add_edge(
+                next_edge_id,
+                spec.source,
+                spec.target,
+                spec.agreement_dim,
+                spec.label.clone(),
+                spec.map_source.clone(),
+                spec.map_target.clone(),
+                false,
+            );
+            next_edge_id += 1;
+            touched.insert(spec.source);
+            touched.insert(spec.target);
+        }
+
+        for (rid, data) in &delta.regions.updated_stalks {
+            if self.cells.contains_key(rid) {
+                self.set_node_stalk(*rid, data.clone());
+                touched.insert(*rid);
+            }
+        }
+
+        let mut out: Vec<u32> = touched.into_iter().collect();
+        out.sort();
+        out
     }
 
     /// Add a 2-cell (face) bounding a cycle of edges.

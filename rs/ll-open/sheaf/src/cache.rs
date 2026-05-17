@@ -178,6 +178,118 @@ impl<S: StalkHash, V> SheafCache<S, V> {
         }
     }
 
+    /// Re-snapshot the per-edge `‖δ⁰‖²` baseline only for edges incident to
+    /// any region in `regions`. Mirrors [`Self::refresh_baseline`] but
+    /// touches the subset — every other baseline entry is left
+    /// byte-identical so consumers' cached values for untouched regions
+    /// survive the update.
+    ///
+    /// No-op when no `CellComplex` is attached (the heuristic cache has no
+    /// notion of per-edge δ⁰). Edges whose squared-norm can no longer be
+    /// computed (e.g. one endpoint was removed by an incremental delta)
+    /// have their stale baseline entry dropped — leaving it in place would
+    /// silently feed the next `on_change` a stale comparison.
+    pub fn refresh_baseline_subset(&mut self, regions: &[RegionId]) {
+        let Some(cx) = self.complex.as_ref() else {
+            return;
+        };
+        if regions.is_empty() {
+            return;
+        }
+        let touched: BTreeSet<RegionId> = regions.iter().copied().collect();
+        // Snapshot the keys first — re-using `self.restrictions.keys()` while
+        // we mutate `delta_zero_baseline` would otherwise still be sound
+        // (different fields), but materializing the list keeps the per-edge
+        // refresh loop independent of the borrow.
+        let edge_pairs: Vec<(RegionId, RegionId)> = self
+            .restrictions
+            .keys()
+            .filter(|(a, b)| a <= b && (touched.contains(a) || touched.contains(b)))
+            .copied()
+            .collect();
+        for (a, b) in edge_pairs {
+            match cx
+                .edge_violation_squared(a, b)
+                .or_else(|| cx.edge_violation_squared(b, a))
+            {
+                Some(norm_sq) => {
+                    self.delta_zero_baseline.insert((a, b), norm_sq);
+                }
+                None => {
+                    // Endpoint missing from the complex after a removal — drop
+                    // the stale baseline so the next on_change doesn't compare
+                    // current state against a ghost edge.
+                    self.delta_zero_baseline.remove(&(a, b));
+                }
+            }
+        }
+    }
+
+    /// Drop the stalk, every restriction it touches, and any cache entry
+    /// for the given region. Returns the set of *neighbours* the region
+    /// was connected to so the caller can fold them into the affected set.
+    ///
+    /// Pair with [`Self::refresh_baseline_subset`] after a batch of
+    /// `drop_region` / `set_restriction` calls so the δ⁰ baseline reflects
+    /// the new topology.
+    pub fn drop_region(&mut self, region: RegionId) -> Vec<RegionId> {
+        let neighbours: Vec<RegionId> = self
+            .restrictions
+            .keys()
+            .filter(|&&(a, _)| a == region)
+            .map(|&(_, b)| b)
+            .collect();
+        self.stalks.remove(&region);
+        self.entries.remove(&region);
+        self.restrictions
+            .retain(|&(a, b), _| a != region && b != region);
+        // Wipe baseline entries that referenced the removed region; mirror
+        // `refresh_baseline_subset`'s drop-on-missing-endpoint policy.
+        self.delta_zero_baseline
+            .retain(|&(a, b), _| a != region && b != region);
+        neighbours
+    }
+
+    /// Direction-insensitive lookup of a region's current neighbours via
+    /// the restriction map. Used by the daemon's `sheaf_update_topology`
+    /// op to build the affected set (touched ∪ radius-1).
+    pub fn neighbours(&self, region: RegionId) -> Vec<RegionId> {
+        self.restrictions
+            .keys()
+            .filter(|&&(a, _)| a == region)
+            .map(|&(_, b)| b)
+            .collect()
+    }
+
+    /// Drop a single restriction edge in both directions (since the cache
+    /// stores undirected edges as two map entries). Idempotent — returns
+    /// `true` iff an edge was actually removed.
+    pub fn drop_restriction(&mut self, a: RegionId, b: RegionId) -> bool {
+        let removed = self.restrictions.remove(&(a, b)).is_some()
+            | self.restrictions.remove(&(b, a)).is_some();
+        let key = (a.min(b), a.max(b));
+        self.delta_zero_baseline.remove(&key);
+        removed
+    }
+
+    /// Mutable access to the attached [`CellComplex`], if any. Used by the
+    /// daemon's incremental update handler so the same delta lands in both
+    /// the cache's restriction map and the backing complex without two
+    /// duplicated mutation surfaces.
+    pub fn complex_mut(&mut self) -> Option<&mut CellComplex> {
+        self.complex.as_mut()
+    }
+
+    /// Bump the generation counter without invalidating anything. The
+    /// incremental update op uses this to advertise a new snapshot of the
+    /// topology while preserving every cache entry for untouched regions.
+    /// `on_change` still increments on its own — this is the analogue for
+    /// topology mutations that don't go through `on_change`.
+    pub fn bump_generation(&mut self) -> u64 {
+        self.generation += 1;
+        self.generation
+    }
+
     /// Attach a [`CellComplex`] for δ⁰-driven invalidation. Replaces any
     /// previously attached complex. The cache pushes f32 stalk updates into
     /// the complex via [`Self::set_stalk_value`]; the caller is responsible

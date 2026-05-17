@@ -440,3 +440,56 @@ struct SheafLearnedWeightsResponse {
   weights   @1 :List(SheafLearnedWeight);
   edgeCount @2 :UInt32  $Json.name("edge_count");
 }
+
+# ── Incremental topology updates ───────────────────────────────────
+# `sheaf_update_topology` mirrors `sheaf_set_topology` but applies a
+# delta instead of replacing the complex wholesale. After applying the
+# delta the handler re-snapshots `‖δ⁰‖²` only for the touched subgraph
+# (touched regions + radius-1 neighbours) and returns that affected
+# region list — consumers use it as the eviction set, leaving cache
+# entries for untouched regions byte-identical.
+#
+# Region IDs stay `UInt32` to match `SheafStalk.id` and
+# `SheafRestriction.{a,b}`; introducing `Text` IDs here would split the
+# wire's region-naming convention across two ops.
+
+struct EdgeRef {
+  source @0 :UInt32;
+  target @1 :UInt32;
+}
+
+struct StalkUpdate {
+  regionId @0 :UInt32       $Json.name("region_id");
+  # New stalk values for the region. Must match the topology's
+  # `node_stalk_dim` when δ⁰ mode is active.
+  stalk    @1 :List(Float32);
+}
+
+struct TopologyDelta {
+  addedRegions   @0 :List(SheafStalk)         $Json.name("added_regions");
+  removedRegions @1 :List(UInt32)             $Json.name("removed_regions");
+  addedEdges     @2 :List(SheafRestriction)   $Json.name("added_edges");
+  removedEdges   @3 :List(EdgeRef)            $Json.name("removed_edges");
+  updatedStalks  @4 :List(StalkUpdate)        $Json.name("updated_stalks");
+}
+
+struct SheafUpdateTopologyRequest {
+  delta        @0 :TopologyDelta;
+  # Matches the `node_stalk_dim` of the prior `sheaf_set_topology` call
+  # when δ⁰ mode is active. Required for `addedRegions` whose `data`
+  # must be exactly this length.
+  nodeStalkDim @1 :UInt32  $Json.name("node_stalk_dim");
+}
+
+struct SheafUpdateTopologyResponse {
+  ok              @0 :Bool;
+  generation      @1 :UInt64;
+  # Touched regions ∪ their radius-1 BFS neighbours. The consumer's
+  # cache-eviction set — every region outside this list is guaranteed
+  # to be byte-identical to its pre-update entry.
+  affectedRegions @2 :List(UInt32)  $Json.name("affected_regions");
+  # `Σ‖δ⁰‖²` snapshot AFTER the delta applies and the affected subgraph
+  # baseline is refreshed. Lets consumers track sheaf health across
+  # incremental updates without a separate `sheaf_defect` round-trip.
+  defectAfter     @3 :Float32       $Json.name("defect_after");
+}

@@ -489,3 +489,151 @@ async fn sheaf_reap_observes_drift_over_uds() {
         "reaped_at_defect must be finite + non-negative when complex is attached; got {defect_after}"
     );
 }
+
+/// Helper: parse the capnp-json Int64-as-string form into u64. The
+/// generation field is `UInt64` which the capnp-json codec emits as a
+/// JSON string (JS Number can't carry 53+ bit precision losslessly).
+fn parse_u64_field(v: &serde_json::Value, label: &str, ctx: &serde_json::Value) -> u64 {
+    v.as_str()
+        .unwrap_or_else(|| panic!("{label} must be Int64-as-string; full: {ctx}"))
+        .parse::<u64>()
+        .unwrap_or_else(|_| panic!("{label} must parse as u64; full: {ctx}"))
+}
+
+/// Continuity contract for `prior_generation` on `sheaf_invalidate`
+/// (bead `ley-line-open-9d5d7d`, GC item 1).
+///
+/// Across N successive invalidate calls, the contract is:
+///
+///   response[i+1].prior_generation == response[i].generation
+///
+/// This is the cache-coherence signal: a consumer that saw generation
+/// K and observes generation M with prior_generation == K knows it
+/// did not miss any events. Without this field, a consumer can only
+/// detect "the gen advanced" — not "I'm in sync."
+///
+/// Also pins the initial value: prior_generation on the first ever
+/// invalidate equals 0 (the cache's seed generation).
+#[tokio::test]
+async fn sheaf_invalidate_prior_generation_continuity_over_uds() {
+    let dir = TempDir::new().unwrap();
+    let ctx = build_blackbox_ctx(dir.path());
+    let sock_path = dir.path().join("sheaf-prior-gen.sock");
+    let sock = spawn_blackbox_socket(ctx, sock_path).await;
+
+    // Push topology to seed the cache. set_topology doesn't bump
+    // generation in the cache (it's the seed call) — verified by
+    // observing that the first invalidate's prior_generation is 0.
+    let topology = uds_call(
+        &sock,
+        r#"{"op":"sheaf_set_topology","node_stalk_dim":4,"regions":[{"id":0,"hash":"aa","data":[1.0,0.5,0.0,0.0]},{"id":1,"hash":"bb","data":[1.0,0.5,9.0,9.0]}],"restrictions":[{"a":0,"b":1,"boundary_hash":"11","co_change_rate":0.5,"weights":[1.0],"agreement_dim":2}]}"#,
+    )
+    .await;
+    assert_eq!(
+        topology["ok"], true,
+        "set_topology must succeed: {topology}"
+    );
+
+    // Three successive invalidate calls. We don't care about cascade
+    // contents here — only the generation/prior_generation continuity.
+    let mut prev_gen: Option<u64> = None;
+    for i in 0..3 {
+        let body = format!(
+            r#"{{"op":"sheaf_invalidate","regions":[0],"stalks":[{{"id":0,"hash":"{i:02x}","data":[{},0.5,42.0,7.0]}}]}}"#,
+            (i + 1) as f32 * 10.0,
+        );
+        let resp = uds_call(&sock, &body).await;
+        // `gen` is a reserved keyword on edition 2024; using `g` for the
+        // generation snapshot and `prior` for prior_generation keeps the
+        // assertions readable without raw-identifier escaping.
+        let g = parse_u64_field(&resp["generation"], "generation", &resp);
+        let prior = parse_u64_field(&resp["prior_generation"], "prior_generation", &resp);
+
+        match prev_gen {
+            None => {
+                // First call: prior_generation must equal 0 (the
+                // seed generation, before any on_change ever fired).
+                assert_eq!(
+                    prior, 0,
+                    "first invalidate's prior_generation MUST be 0 (cache seed); \
+                     got prior={prior} gen={g}; full: {resp}"
+                );
+            }
+            Some(last) => {
+                // Continuity: the previous call's generation must
+                // EXACTLY equal this call's prior_generation. Any drift
+                // means a missed event or a non-monotonic bump.
+                assert_eq!(
+                    prior, last,
+                    "call {i}: prior_generation ({prior}) must equal previous call's generation ({last}); \
+                     full: {resp}"
+                );
+            }
+        }
+        assert!(
+            g > prior,
+            "generation ({g}) must strictly exceed prior_generation ({prior}) — \
+             on_change always bumps; full: {resp}"
+        );
+        prev_gen = Some(g);
+    }
+}
+
+/// Same continuity contract on `sheaf_update_topology`. Cross-op
+/// continuity (invalidate followed by update) is the consumer's actual
+/// usage pattern: they get an invalidate event, evict their cache,
+/// later see an update event — `update.prior_generation` must equal
+/// the prior `invalidate.generation` to prove no events were missed.
+#[tokio::test]
+async fn sheaf_update_topology_prior_generation_continuity_over_uds() {
+    let dir = TempDir::new().unwrap();
+    let ctx = build_blackbox_ctx(dir.path());
+    let sock_path = dir.path().join("sheaf-prior-gen-update.sock");
+    let sock = spawn_blackbox_socket(ctx, sock_path).await;
+
+    let topology = uds_call(
+        &sock,
+        r#"{"op":"sheaf_set_topology","node_stalk_dim":4,"regions":[{"id":0,"hash":"aa","data":[1.0,0.5,0.0,0.0]},{"id":1,"hash":"bb","data":[1.0,0.5,9.0,9.0]}],"restrictions":[{"a":0,"b":1,"boundary_hash":"11","co_change_rate":0.5,"weights":[1.0],"agreement_dim":2}]}"#,
+    )
+    .await;
+    assert_eq!(
+        topology["ok"], true,
+        "set_topology must succeed: {topology}"
+    );
+
+    // Step 1: invalidate. Snapshot its generation.
+    let inv = uds_call(
+        &sock,
+        r#"{"op":"sheaf_invalidate","regions":[0],"stalks":[{"id":0,"hash":"11","data":[2.0,0.5,42.0,7.0]}]}"#,
+    )
+    .await;
+    let after_invalidate_gen = parse_u64_field(&inv["generation"], "generation", &inv);
+    let after_invalidate_prior =
+        parse_u64_field(&inv["prior_generation"], "prior_generation", &inv);
+    assert_eq!(
+        after_invalidate_prior, 0,
+        "first invalidate's prior_generation must be 0; full: {inv}"
+    );
+    assert!(after_invalidate_gen > 0);
+
+    // Step 2: update_topology adding a new region. Must report
+    // prior_generation == after_invalidate_gen (continuity across ops).
+    let upd = uds_call(
+        &sock,
+        r#"{"op":"sheaf_update_topology","node_stalk_dim":4,"delta":{"added_regions":[{"id":2,"hash":"cc","data":[1.0,0.5,0.0,0.0]}],"removed_regions":[],"added_edges":[{"a":1,"b":2,"boundary_hash":"22","co_change_rate":0.5,"weights":[1.0],"agreement_dim":2}],"removed_edges":[],"updated_stalks":[]}}"#,
+    )
+    .await;
+    assert_eq!(upd["ok"], true, "update_topology must succeed: {upd}");
+    let after_update_gen = parse_u64_field(&upd["generation"], "generation", &upd);
+    let after_update_prior = parse_u64_field(&upd["prior_generation"], "prior_generation", &upd);
+
+    assert_eq!(
+        after_update_prior, after_invalidate_gen,
+        "cross-op continuity broken: update.prior_generation ({after_update_prior}) \
+         must equal previous invalidate.generation ({after_invalidate_gen}); full: {upd}"
+    );
+    assert!(
+        after_update_gen > after_update_prior,
+        "update generation ({after_update_gen}) must strictly exceed prior ({after_update_prior}); full: {upd}"
+    );
+}

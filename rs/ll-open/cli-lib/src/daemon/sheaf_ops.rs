@@ -312,6 +312,9 @@ pub fn op_sheaf_invalidate(
         }
     }
 
+    // Snapshot the generation BEFORE on_change bumps it so the response
+    // carries the continuity tag consumers need (bead 9d5d7d).
+    let prior_generation = cache.generation();
     let invalidated = cache.on_change(regions);
 
     // Feed the co-change tracker so learned weights converge over time.
@@ -329,6 +332,7 @@ pub fn op_sheaf_invalidate(
             "invalidated": invalidated,
             "count": invalidated.len(),
             "generation": generation,
+            "prior_generation": prior_generation,
         }),
     );
 
@@ -340,6 +344,7 @@ pub fn op_sheaf_invalidate(
     }
     root.set_count(invalidated.len() as u32);
     root.set_generation(generation);
+    root.set_prior_generation(prior_generation);
     let reader = builder.get_root_as_reader::<daemon_capnp::sheaf_invalidate_response::Reader>()?;
     Ok(capnp_json::to_json(reader)?)
 }
@@ -620,6 +625,9 @@ pub fn op_sheaf_update_topology(
 
     // 6. Generation advances exactly once per update — the consumer-visible
     //    "we've moved past your snapshot" signal stays monotonic.
+    //    Snapshot the prior value first so the response carries the
+    //    continuity tag (bead 9d5d7d).
+    let prior_generation = cache.generation();
     let generation = cache.bump_generation();
     let defect_after = cache.defect() as f32;
 
@@ -645,6 +653,7 @@ pub fn op_sheaf_update_topology(
             "kind": "update",
             "affected": affected_vec,
             "generation": generation,
+            "prior_generation": prior_generation,
             "defect_after": defect_after,
         }),
     );
@@ -653,6 +662,7 @@ pub fn op_sheaf_update_topology(
     let mut root: daemon_capnp::sheaf_update_topology_response::Builder = builder.init_root();
     root.set_ok(true);
     root.set_generation(generation);
+    root.set_prior_generation(prior_generation);
     root.set_defect_after(defect_after);
     let mut affected_list = root
         .reborrow()

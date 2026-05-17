@@ -64,18 +64,34 @@ enum Cmd {
 
         /// Bind address for the MCP HTTP transport. Defaults to 127.0.0.1.
         ///
-        /// Container deployments need 0.0.0.0 so docker `-p host:8384`
+        /// Container deployments need 0.0.0.0 so docker `-p HOST_PORT:8384`
         /// port-forwarding can reach the listener (loopback-only binds
         /// are unreachable from the host's docker proxy).
         ///
-        /// SECURITY: passing 0.0.0.0 outside a container exposes MCP to
-        /// every interface on this machine. The MCP wire has no auth —
-        /// it's intended for cloister-mediated localhost or attested
-        /// peers only. In a container, 0.0.0.0 binds inside the container's
-        /// netns; combine with `docker run -p 127.0.0.1:host:8384` to
-        /// keep host-side exposure on loopback.
+        /// SECURITY: passing 0.0.0.0 (or any non-loopback address)
+        /// requires `--mcp-allow-public` as a deliberate opt-in. The MCP
+        /// wire has no auth — it's intended for cloister-mediated
+        /// localhost or attested peers only. The two-flag gate prevents
+        /// fat-fingering `--mcp-bind 0.0.0.0` on a dev box and quietly
+        /// exposing the daemon to every interface. In a container,
+        /// 0.0.0.0 binds inside the container's netns; combine with a
+        /// loopback host publish such as `docker run -p
+        /// 127.0.0.1:18384:8384` to keep host-side exposure on loopback.
         #[arg(long)]
         mcp_bind: Option<std::net::IpAddr>,
+
+        /// Required when `--mcp-bind` is set to a non-loopback address.
+        /// Acts as a "yes I really mean to expose MCP off-loopback"
+        /// confirmation. See `--mcp-bind` for the security context.
+        ///
+        /// Container deployments pass this in the image CMD because the
+        /// container-side 0.0.0.0 is legitimate plumbing. Outside
+        /// containers, only pass this when you control the firewall and
+        /// understand the MCP wire has no auth (bead
+        /// `ley-line-open-b7dd03`; auth model itself tracked by bead
+        /// `ley-line-open-b8395d`).
+        #[arg(long, default_value_t = false)]
+        mcp_allow_public: bool,
     },
 }
 
@@ -143,6 +159,7 @@ async fn main() -> Result<()> {
             source,
             mcp_port,
             mcp_bind,
+            mcp_allow_public,
         } => {
             // KNOWN scale limitation: arena_size_mib defaults to 64
             // (see Cmd::Daemon { arena_size_mib, default_value_t = 64 }).
@@ -171,6 +188,7 @@ async fn main() -> Result<()> {
                 source.as_deref(),
                 mcp_port,
                 mcp_bind,
+                mcp_allow_public,
             )
             .await
         }

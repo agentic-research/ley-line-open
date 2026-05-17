@@ -134,6 +134,7 @@ pub enum BaseRequest {
     SheafStalks,
     SheafStatus,
     SheafLearnedWeights,
+    SheafReap,
 }
 
 #[cfg(feature = "vec")]

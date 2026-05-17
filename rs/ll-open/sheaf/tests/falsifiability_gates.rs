@@ -741,3 +741,200 @@ fn concurrent_updates_serialize_correctly() {
         "concurrent updates must leave defect finite; got {defect}"
     );
 }
+
+// ---------------------------------------------------------------------
+// Reaper gates (bead `ley-line-open-9c867f`, GC item 3).
+//
+// `SheafCache::reap()` is the read-only query that asks "given today's
+// stalks vs the last baseline, which regions can the consumer safely
+// evict?". These gates pin:
+//
+//   - **No false negatives**: a region whose own boundary moved must
+//     appear in the reap output. Consumers that miss the signal serve
+//     stale values.
+//   - **No false positives**: if nothing changed, reap returns empty.
+//     Spurious reaping defeats the purpose of cache coherence.
+//   - **Payload-blind**: the V type parameter must not affect the
+//     reclaim decision. Same topology + stalks → same reclaim set
+//     regardless of what's cached at each key.
+//   - **Heuristic-only mode**: when no `CellComplex` is attached,
+//     reap returns empty + NaN defect (the XOR pre-filter is a
+//     change detector, not a stale detector; reap must err on the
+//     side of "don't reap" without δ⁰ signal).
+//
+// All four gates depend on the `set_stalk_value` → `cx.set_node_stalk`
+// propagation in cache.rs (line 325) — mutating a stalk's f32 data
+// flows through to the attached complex so `edge_violation_squared`
+// sees the new value.
+// ---------------------------------------------------------------------
+
+/// Helper: build a 4-region linear chain (r0–r1–r2–r3) with a real
+/// CellComplex attached, stalks all zeroed, baseline refreshed.
+/// Stalk dim = 2, agreement dim = 1 (projects coord 0).
+fn build_reap_test_cache() -> SheafCache<TestStalk, &'static str> {
+    let mut cx = CellComplex::new(2);
+    cx.add_node(0, vec![0.0, 0.0]);
+    cx.add_node(1, vec![0.0, 0.0]);
+    cx.add_node(2, vec![0.0, 0.0]);
+    cx.add_node(3, vec![0.0, 0.0]);
+    let proj = RestrictionMap::project_dim(2, 0);
+    cx.add_edge(100, 0, 1, 1, None, proj.clone(), proj.clone(), false);
+    cx.add_edge(101, 1, 2, 1, None, proj.clone(), proj.clone(), false);
+    cx.add_edge(102, 2, 3, 1, None, proj.clone(), proj, false);
+
+    // Keep stalks in local vars — `cache.stalks` is a private field, so
+    // the test must compute boundary_xor from the same stalks it seeds
+    // into the cache rather than reading them back.
+    let stalks: Vec<TestStalk> = (0..4u32).map(|i| make_stalk(i as u8 + 1)).collect();
+    let mut cache: SheafCache<TestStalk, &'static str> = SheafCache::new();
+    for (i, s) in stalks.iter().enumerate() {
+        cache.set_stalk(i as u32, s.clone());
+    }
+    // Restriction edges keyed (a, b) AND (b, a) — `neighbours()`
+    // filters on `a == region` only, so the reaper needs both
+    // directions populated for BFS to walk past r0.
+    for &(a, b) in &[(0u32, 1u32), (1, 2), (2, 3)] {
+        let xor = boundary_xor(
+            &stalks[a as usize].merkle_root(),
+            &stalks[b as usize].merkle_root(),
+        );
+        cache.set_restriction(
+            a,
+            b,
+            RestrictionEdge {
+                weights: vec![1.0],
+                co_change_rate: 0.0,
+                revert_rate: 0.0,
+                boundary_hash: xor,
+            },
+        );
+        cache.set_restriction(
+            b,
+            a,
+            RestrictionEdge {
+                weights: vec![1.0],
+                co_change_rate: 0.0,
+                revert_rate: 0.0,
+                boundary_hash: xor,
+            },
+        );
+    }
+    cache.set_complex(cx);
+    cache.refresh_baseline();
+    cache
+}
+
+#[test]
+fn reap_no_false_positives_on_unchanged_stalks() {
+    // After refresh_baseline, calling reap() with no mutations must
+    // return an empty reclaim set. Spurious reclaim signals would
+    // defeat the cache-coherence contract.
+    let cache = build_reap_test_cache();
+    let (reclaim, defect) = cache.reap();
+
+    assert!(
+        reclaim.is_empty(),
+        "reap on stable section must return empty; got {reclaim:?}"
+    );
+    assert!(
+        defect.is_finite() && defect >= 0.0,
+        "defect snapshot must be finite + non-negative on stable section; got {defect}"
+    );
+}
+
+#[test]
+fn reap_no_false_negatives_when_stalks_move() {
+    // Mutate r1's stalk so the r0↔r1 and r1↔r2 boundaries both shift
+    // beyond DELTA0_EPS_SQUARED. r1 MUST appear in the reclaim set
+    // (it's the changed region itself). r0 and r2 SHOULD appear (their
+    // incident edges have moved). r3 may or may not appear depending
+    // on BFS depth, but it should NOT be excluded if it's within range.
+    let mut cache = build_reap_test_cache();
+
+    // Push r1's stalk to a wildly different value; the project_dim(2,0)
+    // restriction extracts coord 0, so this guarantees δ⁰ shifts.
+    cache.set_stalk_value(1, vec![100.0, 0.0]);
+
+    let (reclaim, _) = cache.reap();
+
+    assert!(
+        reclaim.contains(&1),
+        "reap MUST include the changed region r1; got {reclaim:?}"
+    );
+    assert!(
+        reclaim.contains(&0) && reclaim.contains(&2),
+        "reap MUST include r1's direct neighbours r0+r2 whose boundaries moved; got {reclaim:?}"
+    );
+}
+
+#[test]
+fn reap_payload_blind_under_different_v_types() {
+    // The reclaim decision depends ONLY on topology + stalks, never on
+    // the cached V type. Build two caches with identical topology +
+    // identical stalk mutations but DIFFERENT V types (&str vs u64),
+    // assert the reclaim sets match.
+
+    fn run<V: Clone>(seed: V) -> Vec<u32> {
+        let mut cx = CellComplex::new(2);
+        cx.add_node(0, vec![0.0, 0.0]);
+        cx.add_node(1, vec![0.0, 0.0]);
+        let proj = RestrictionMap::project_dim(2, 0);
+        cx.add_edge(100, 0, 1, 1, None, proj.clone(), proj, false);
+
+        let stalks = [make_stalk(1), make_stalk(2)];
+        let mut cache: SheafCache<TestStalk, V> = SheafCache::new();
+        cache.set_stalk(0, stalks[0].clone());
+        cache.set_stalk(1, stalks[1].clone());
+        let xor = boundary_xor(&stalks[0].merkle_root(), &stalks[1].merkle_root());
+        for &(a, b) in &[(0u32, 1u32), (1, 0)] {
+            cache.set_restriction(
+                a,
+                b,
+                RestrictionEdge {
+                    weights: vec![1.0],
+                    co_change_rate: 0.0,
+                    revert_rate: 0.0,
+                    boundary_hash: xor,
+                },
+            );
+        }
+        cache.set_complex(cx);
+        cache.refresh_baseline();
+        cache.put(0, seed.clone());
+        cache.put(1, seed);
+        cache.set_stalk_value(0, vec![50.0, 0.0]);
+        let (r, _) = cache.reap();
+        r
+    }
+
+    let with_str = run::<&'static str>("payload-a");
+    let with_u64 = run::<u64>(0xdeadbeef);
+
+    assert_eq!(
+        with_str, with_u64,
+        "payload-blind contract: reap must yield identical sets under different V; \
+         &str gave {with_str:?}, u64 gave {with_u64:?}"
+    );
+}
+
+#[test]
+fn reap_returns_empty_and_nan_without_complex() {
+    // Heuristic-only mode (no CellComplex attached). reap must NOT
+    // guess from the XOR pre-filter — that's a change detector, not
+    // a stale detector. Returns (empty, NaN) so consumers see "I
+    // can't tell you what's reclaimable" instead of false positives.
+    let mut cache: SheafCache<TestStalk, &'static str> = SheafCache::new();
+    cache.set_stalk(0, make_stalk(1));
+    cache.set_stalk(1, make_stalk(2));
+
+    let (reclaim, defect) = cache.reap();
+
+    assert!(
+        reclaim.is_empty(),
+        "heuristic-only mode: reap must return empty; got {reclaim:?}"
+    );
+    assert!(
+        defect.is_nan(),
+        "heuristic-only mode: defect must be NaN sentinel; got {defect}"
+    );
+}

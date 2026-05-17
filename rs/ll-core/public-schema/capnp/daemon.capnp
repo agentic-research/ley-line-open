@@ -493,3 +493,25 @@ struct SheafUpdateTopologyResponse {
   # incremental updates without a separate `sheaf_defect` round-trip.
   defectAfter     @3 :Float32       $Json.name("defect_after");
 }
+
+# Reaper request. Empty today; reserved struct so future scoping
+# (e.g. "reap only within this subgraph") doesn't require a wire bump.
+struct SheafReapRequest {
+}
+
+# Response from `sheaf_reap` — the GC op that asks "given today's stalks
+# vs the last baseline, which cached region IDs can the consumer
+# safely evict?". Structural, payload-blind: this daemon never sees the
+# consumer's cached values, only the topology.
+struct SheafReapResponse {
+  # Region IDs whose boundary signal has moved beyond DELTA0_EPS_SQUARED
+  # since the last baseline refresh, plus their bounded-radius BFS
+  # expansion (same depth bound as `on_change`'s cascade). Sorted
+  # ascending; deduplicated.
+  reclaimable     @0 :List(UInt32);
+  count           @1 :UInt32;
+  generation      @2 :UInt64;
+  # `Σ‖δ⁰‖²` evaluated against the current section at the moment of
+  # reap, for diagnostics. NaN when no CellComplex is attached.
+  reapedAtDefect  @3 :Float32  $Json.name("reaped_at_defect");
+}

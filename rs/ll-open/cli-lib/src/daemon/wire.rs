@@ -118,6 +118,12 @@ pub enum BaseRequest {
         #[serde(default)]
         node_stalk_dim: u32,
     },
+    SheafUpdateTopology {
+        #[serde(default)]
+        delta: crate::daemon::sheaf_ops::TopologyDeltaInput,
+        #[serde(default)]
+        node_stalk_dim: u32,
+    },
     SheafInvalidate {
         #[serde(default)]
         regions: Vec<u32>,

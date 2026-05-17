@@ -178,6 +178,7 @@ fn is_known_base_op(op: &str) -> bool {
             | "sheaf_stalks"
             | "sheaf_status"
             | "sheaf_learned_weights"
+            | "sheaf_reap"
     ) || cfg!(feature = "vec") && op == "vec_search"
 }
 
@@ -233,6 +234,7 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
         BaseRequest::SheafStalks => super::sheaf_ops::op_sheaf_stalks(&ctx.sheaf),
         BaseRequest::SheafStatus => super::sheaf_ops::op_sheaf_status(&ctx.sheaf),
         BaseRequest::SheafLearnedWeights => super::sheaf_ops::op_sheaf_learned_weights(&ctx.sheaf),
+        BaseRequest::SheafReap => super::sheaf_ops::op_sheaf_reap(&ctx.sheaf),
     };
     result.unwrap_or_else(|e| {
         build_error_response(&format!("{e:#}"))

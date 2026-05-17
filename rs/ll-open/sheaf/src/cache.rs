@@ -552,6 +552,101 @@ impl<S: StalkHash, V> SheafCache<S, V> {
     ) -> impl Iterator<Item = (&(RegionId, RegionId), &RestrictionEdge)> {
         self.restrictions.iter()
     }
+
+    /// Identify regions whose cached values are eligible for eviction —
+    /// the GC half of the sheaf-as-cache-coherence story (bead
+    /// `ley-line-open-9c867f`).
+    ///
+    /// Unlike [`Self::on_change`] which acts on caller-asserted changes,
+    /// `reap` is a pure observation of the current sheaf section: it
+    /// asks "given today's stalks vs the last baseline, which regions'
+    /// boundary signal has moved?" and returns that set plus its
+    /// bounded-radius BFS expansion through the restriction graph.
+    ///
+    /// Returns `(reclaimable, defect_snapshot)`:
+    /// - `reclaimable` — sorted list of region IDs whose downstream
+    ///   cached values the consumer should evict. Payload-blind: this
+    ///   crate never inspects the cached `V` values, only the
+    ///   structural signal.
+    /// - `defect_snapshot` — `Σ‖δ⁰‖²` evaluated against the current
+    ///   section at the moment of reap, for diagnostics. NaN if no
+    ///   `CellComplex` is attached (the heuristic-only cache can't
+    ///   compute the real metric).
+    ///
+    /// The reaper is `&self`. Generation bumping is the handler's job
+    /// — consumers may want to call reap multiple times during a long
+    /// query without each call advancing the generation cursor.
+    ///
+    /// No-op when no `CellComplex` is attached: heuristic-only mode
+    /// has no δ⁰ to measure, so we return `(empty, NaN)` rather than
+    /// guess from the XOR pre-filter (which is a CHANGE detector, not
+    /// a STALE detector — reap should only return things the consumer
+    /// can safely evict).
+    pub fn reap(&self) -> (Vec<RegionId>, f32) {
+        let Some(cx) = self.complex.as_ref() else {
+            return (Vec::new(), f32::NAN);
+        };
+
+        // Phase 1: seed set — every region incident to an edge whose
+        // current ‖δ⁰‖² has moved away from baseline by more than the
+        // tolerance. Iterating unordered pairs (a < b) once per edge.
+        let mut seeds: BTreeSet<RegionId> = BTreeSet::new();
+        let mut total_defect: f32 = 0.0;
+        for &(a, b) in self.restrictions.keys() {
+            if a >= b {
+                continue;
+            }
+            let current = cx
+                .edge_violation_squared(a, b)
+                .or_else(|| cx.edge_violation_squared(b, a));
+            if let Some(c) = current {
+                total_defect += c;
+                let key = (a, b);
+                let baseline = self.delta_zero_baseline.get(&key).copied().unwrap_or(0.0);
+                if (c - baseline).abs() > DELTA0_EPS_SQUARED {
+                    seeds.insert(a);
+                    seeds.insert(b);
+                }
+            }
+        }
+
+        // Phase 2: BFS expansion. Same depth bound as `on_change` so the
+        // two stay consistent — a region the cascade would evict on
+        // assertion is also a region the reaper would evict on
+        // observation, given matching topology + stalks.
+        let max_radius: u32 = 3;
+        let mut reclaim = seeds.clone();
+        let mut frontier: VecDeque<(RegionId, u32)> = seeds.iter().map(|&r| (r, 0)).collect();
+        let mut visited: BTreeSet<RegionId> = seeds.clone();
+
+        while let Some((region, depth)) = frontier.pop_front() {
+            if depth >= max_radius {
+                continue;
+            }
+            for n in self.neighbours(region) {
+                if !visited.insert(n) {
+                    continue;
+                }
+                // Same per-edge check as the seed phase — only expand
+                // to neighbours whose own boundary also moved. Without
+                // this gate, BFS would walk the entire graph from any
+                // single seed.
+                let current = cx
+                    .edge_violation_squared(region, n)
+                    .or_else(|| cx.edge_violation_squared(n, region));
+                if let Some(c) = current {
+                    let key = (region.min(n), region.max(n));
+                    let baseline = self.delta_zero_baseline.get(&key).copied().unwrap_or(0.0);
+                    if (c - baseline).abs() > DELTA0_EPS_SQUARED {
+                        reclaim.insert(n);
+                        frontier.push_back((n, depth + 1));
+                    }
+                }
+            }
+        }
+
+        (reclaim.into_iter().collect(), total_defect)
+    }
 }
 
 impl<S: StalkHash, V> Default for SheafCache<S, V> {

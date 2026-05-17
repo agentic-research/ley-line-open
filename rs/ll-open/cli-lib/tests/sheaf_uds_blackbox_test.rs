@@ -373,3 +373,119 @@ async fn update_topology_over_uds_returns_affected_subset_not_whole_graph() {
         "defect_after must be a finite non-negative number; got {defect_after}"
     );
 }
+
+/// Reaper end-to-end gate (bead `ley-line-open-9c867f`, GC item 3).
+///
+/// Asserts the wire contract for `sheaf_reap`: pure-observational query
+/// that returns the regions whose boundary signal moved since the last
+/// baseline refresh. Two-phase:
+///
+/// 1. Push topology + stalks that agree → call reap → expect empty
+///    (baseline matches current section).
+/// 2. Mutate a stalk via `sheaf_invalidate` (which refreshes baseline
+///    side-effectfully via `on_change`) — wait, no. `on_change` doesn't
+///    refresh baseline; it only marks `entries` invalid. To get the
+///    reaper to see drift, we need a stalk update WITHOUT a baseline
+///    refresh between then and the reap call. `set_topology` does
+///    refresh, so we can't use it. The closest "push new stalk without
+///    re-baselining" path is to push the topology with stalk S0, then
+///    push it AGAIN with stalk S1 — actually that re-baselines too.
+///
+///    Cleanest end-to-end: push topology with agreeing stalks (baseline
+///    captures zero defect), then send a NEW set_topology call with
+///    drifted stalks (baseline re-captures, so reap sees zero again),
+///    then... hmm. Actually a non-stalk-mutation invalidate sequence
+///    via `sheaf_invalidate` does NOT refresh baseline — it only
+///    updates the cache's stalk hashes and triggers on_change. The
+///    complex's stalk f32 data DOES get updated through the cache's
+///    `set_stalk_value`. So: drift the stalks via invalidate (with
+///    data), then call reap — the baseline is stale relative to the
+///    new complex data, so reap should see something.
+///
+/// This test pins exactly that: invalidate-then-reap shows the drift.
+#[tokio::test]
+async fn sheaf_reap_observes_drift_over_uds() {
+    let dir = TempDir::new().unwrap();
+    let ctx = build_blackbox_ctx(dir.path());
+    let sock_path = dir.path().join("sheaf-reap.sock");
+    let sock = spawn_blackbox_socket(ctx, sock_path).await;
+
+    // ── Step 1: push topology with agreeing stalks → baseline zero ──
+    //
+    // Same shape as the existing invalidate test: stalk_dim=4,
+    // agreement_dim=2, both regions share [1.0, 0.5] in the agreement
+    // subspace. set_topology refreshes baseline as part of its δ⁰
+    // engagement, so the baseline captures the current (consistent)
+    // section.
+    let topology = uds_call(
+        &sock,
+        r#"{"op":"sheaf_set_topology","node_stalk_dim":4,"regions":[{"id":0,"hash":"aa","data":[1.0,0.5,0.0,0.0]},{"id":1,"hash":"bb","data":[1.0,0.5,9.0,9.0]}],"restrictions":[{"a":0,"b":1,"boundary_hash":"11","co_change_rate":0.5,"weights":[1.0],"agreement_dim":2}]}"#,
+    )
+    .await;
+    assert_eq!(
+        topology["ok"], true,
+        "set_topology must succeed: {topology}"
+    );
+    assert_eq!(
+        topology["delta_zero_mode"], true,
+        "δ⁰ mode must engage: {topology}"
+    );
+
+    // ── Step 2: reap on the stable section → empty + finite defect ──
+    let reap_initial = uds_call(&sock, r#"{"op":"sheaf_reap"}"#).await;
+    let initial_reclaim: Vec<u32> = reap_initial["reclaimable"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!("reclaimable must be an array on the initial call; full: {reap_initial}")
+        })
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+    assert!(
+        initial_reclaim.is_empty(),
+        "reap on stable section must return empty over UDS; got {initial_reclaim:?} \
+         (full: {reap_initial})"
+    );
+
+    // ── Step 3: drift region 0's stalk via sheaf_invalidate ──────────
+    //
+    // sheaf_invalidate with `data` propagates through cache.set_stalk_
+    // value → cx.set_node_stalk, mutating the complex's internal stalk.
+    // It does NOT call refresh_baseline, so the cached baseline now
+    // refers to the OLD section — exactly the staleness reap is
+    // designed to detect.
+    let invalidate = uds_call(
+        &sock,
+        r#"{"op":"sheaf_invalidate","regions":[0],"stalks":[{"id":0,"hash":"ee","data":[99.0,0.5,42.0,7.0]}]}"#,
+    )
+    .await;
+    assert_eq!(
+        invalidate["count"].as_u64().unwrap_or(0) > 0,
+        true,
+        "invalidate must produce a cascade (validates the d03e7d fix is still live); full: {invalidate}"
+    );
+
+    // ── Step 4: reap after drift → non-empty, includes region 0 ──────
+    let reap_after = uds_call(&sock, r#"{"op":"sheaf_reap"}"#).await;
+    let after_reclaim: Vec<u32> = reap_after["reclaimable"]
+        .as_array()
+        .unwrap_or_else(|| panic!("reclaimable must be an array after drift; full: {reap_after}"))
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+    assert!(
+        !after_reclaim.is_empty(),
+        "reap after stalk drift must return non-empty; got {after_reclaim:?} (full: {reap_after})"
+    );
+    assert!(
+        after_reclaim.contains(&0),
+        "reap must include the drifted region 0; got {after_reclaim:?} (full: {reap_after})"
+    );
+    let defect_after = reap_after["reaped_at_defect"].as_f64().unwrap_or_else(|| {
+        panic!("reaped_at_defect must be numeric on δ⁰ path; full: {reap_after}")
+    });
+    assert!(
+        defect_after.is_finite() && defect_after >= 0.0,
+        "reaped_at_defect must be finite + non-negative when complex is attached; got {defect_after}"
+    );
+}

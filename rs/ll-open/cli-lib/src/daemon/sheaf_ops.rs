@@ -408,6 +408,44 @@ pub fn op_sheaf_learned_weights(state: &SheafState) -> Result<String> {
     Ok(capnp_json::to_json(reader)?)
 }
 
+/// δ⁰-driven reaper — bead `ley-line-open-9c867f`, GC item 3 of the
+/// sheaf-as-cache-coherence story.
+///
+/// Asks "given today's stalks vs the last `refresh_baseline` snapshot,
+/// which cached region IDs can the consumer safely evict?" Returns a
+/// structural list — this daemon never inspects the consumer's cached
+/// payload. The consumer (mache, cloister, anyone) evicts the returned
+/// keys and re-fetches as needed.
+///
+/// Companion to `sheaf_invalidate`: that op acts on caller-asserted
+/// changes; reap is a pure observation. Same depth bound (radius 3
+/// BFS), same per-edge `DELTA0_EPS_SQUARED` tolerance, so the two stay
+/// internally consistent — a region the cascade would evict on
+/// assertion is also a region the reaper would evict on observation,
+/// given matching topology + stalks.
+///
+/// Does NOT bump the cache generation: reap is a read-only query and
+/// consumers may call it multiple times during a long enrichment pass
+/// without each call advancing their generation cursor.
+pub fn op_sheaf_reap(state: &SheafState) -> Result<String> {
+    let cache = state.cache.lock().unwrap();
+    let (reclaimable, defect) = cache.reap();
+    let generation = cache.generation();
+    drop(cache);
+
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root: daemon_capnp::sheaf_reap_response::Builder = builder.init_root();
+    let mut rlist = root.reborrow().init_reclaimable(reclaimable.len() as u32);
+    for (i, &r) in reclaimable.iter().enumerate() {
+        rlist.set(i as u32, r);
+    }
+    root.set_count(reclaimable.len() as u32);
+    root.set_generation(generation);
+    root.set_reaped_at_defect(defect);
+    let reader = builder.get_root_as_reader::<daemon_capnp::sheaf_reap_response::Reader>()?;
+    Ok(capnp_json::to_json(reader)?)
+}
+
 /// Apply an incremental `TopologyDelta` and re-snapshot only the affected
 /// subgraph. Returns the affected region list (touched ∪ radius-1
 /// neighbours) so consumers know exactly which cache entries to evict —

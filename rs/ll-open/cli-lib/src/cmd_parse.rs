@@ -7,6 +7,7 @@
 //! - **Batched**: all inserts happen in a single SQLite transaction.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -26,8 +27,8 @@ use leyline_ts::languages::TsLanguage;
 pub const MAX_PARSE_FILE_SIZE: i64 = 8 * 1024 * 1024;
 use leyline_ts::refs::{ExtractedRef, extract_refs};
 use leyline_ts::schema::{
-    create_ast_schema, create_index_schema, create_refs_schema, delete_file_rows, read_file_index,
-    set_meta, sweep_orphaned_dirs,
+    create_ast_tables, create_index_schema, create_post_load_indexes_skip_unused,
+    create_refs_tables, delete_file_rows, read_file_index, set_meta, sweep_orphaned_dirs,
 };
 use rayon::prelude::*;
 use rusqlite::Connection;
@@ -66,6 +67,298 @@ struct ParsedFile {
     refs: Vec<ExtractedRef>,
     file_mtime: i64,
     file_size: i64,
+    /// Pre-serialized capnp bytes for the per-file `SourceFile` record.
+    /// Built in the rayon worker so the post-parse main thread just
+    /// writes the bytes to the BufWriter — no per-file canonicalize
+    /// step. See bead `ley-line-open-cbbedf` Attack 1 (parallelization).
+    source_capnp_bytes: Vec<u8>,
+    /// Pre-serialized capnp bytes for the file's AstNode records. Same
+    /// rationale as `source_capnp_bytes` — moves the ~310ms (per the
+    /// mache bench) capnp serialization cost out of the serial insert
+    /// phase and into the parallel parse phase.
+    ast_capnp_bytes: Vec<u8>,
+}
+
+// ---------------------------------------------------------------------------
+// Batched-insert plumbing
+// ---------------------------------------------------------------------------
+
+/// Rows per multi-row VALUES batch. 3000 × 9 columns (`_ast`, the
+/// widest table) = 27 000 bound parameters per statement — under
+/// SQLite's 32K bound-param cap (`SQLITE_MAX_VARIABLE_NUMBER` default
+/// 32 766 since 3.32) with ~5 700 params of headroom. Larger batches
+/// collapse more transaction edges per execute; on the mache
+/// 765-file bench going from 500 → 2000 → 3000 rows/batch shaves
+/// successive 10-15% chunks off insert wall.
+///
+/// The per-batch SQL string at 3000×9 is ~60 KiB. The prepared-
+/// statement cache holds one entry per unique SQL string, so each
+/// table pays this cost once (the always-full batch) plus one
+/// per-table partial-batch string at flush time. Going past 3000
+/// requires a smaller per-row column count or a higher
+/// `SQLITE_MAX_VARIABLE_NUMBER` at SQLite build time.
+const BULK_BATCH_ROWS: usize = 3000;
+
+/// Build a multi-row VALUES placeholder string: `(?,?,?,...),(?,?,...),...`.
+/// `rows` total tuples, each with `cols` placeholders.
+fn build_values_clause(rows: usize, cols: usize) -> String {
+    let row_tuple = {
+        let mut s = String::with_capacity(2 * cols + 2);
+        s.push('(');
+        for i in 0..cols {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push('?');
+        }
+        s.push(')');
+        s
+    };
+    let mut out = String::with_capacity(row_tuple.len() * rows + rows);
+    for i in 0..rows {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&row_tuple);
+    }
+    out
+}
+
+/// Execute a multi-row INSERT against `conn`. `prefix` is the SQL up
+/// to and including `VALUES `; this helper appends the placeholder
+/// tuples and binds. `params` is borrowed `&dyn ToSql` references that
+/// must outlive the statement step.
+fn exec_batched(
+    conn: &Connection,
+    prefix: &str,
+    rows: usize,
+    cols: usize,
+    params: &[&dyn rusqlite::ToSql],
+) -> Result<()> {
+    if rows == 0 {
+        return Ok(());
+    }
+    let mut sql = String::with_capacity(prefix.len() + rows * (cols * 2 + 3));
+    sql.push_str(prefix);
+    sql.push_str(&build_values_clause(rows, cols));
+    let mut stmt = conn.prepare_cached(&sql)?;
+    stmt.execute(rusqlite::params_from_iter(params.iter().copied()))?;
+    Ok(())
+}
+
+/// Generic flush: drain `rows`-shaped data in BULK_BATCH_ROWS chunks
+/// plus a final partial-chunk. `prefix` is the SQL prefix ending in
+/// `VALUES `, `cols` is the per-row placeholder count, and `into_params`
+/// flattens a slice of rows into a `Vec<&dyn ToSql>` borrowing from
+/// the chunk (no per-row allocation). Borrow rules: the returned
+/// references live as long as the chunk slice, which is at least the
+/// statement-step scope.
+fn flush_in_batches<R, F>(
+    conn: &Connection,
+    rows: Vec<R>,
+    prefix: &str,
+    cols: usize,
+    mut into_params: F,
+) -> Result<()>
+where
+    F: for<'a> FnMut(&'a [R]) -> Vec<&'a dyn rusqlite::ToSql>,
+{
+    let total = rows.len();
+    if total == 0 {
+        return Ok(());
+    }
+    let mut i = 0;
+    while i + BULK_BATCH_ROWS <= total {
+        let chunk = &rows[i..i + BULK_BATCH_ROWS];
+        let params = into_params(chunk);
+        exec_batched(conn, prefix, BULK_BATCH_ROWS, cols, &params)?;
+        i += BULK_BATCH_ROWS;
+    }
+    if i < total {
+        let chunk = &rows[i..];
+        let n = chunk.len();
+        let params = into_params(chunk);
+        exec_batched(conn, prefix, n, cols, &params)?;
+    }
+    Ok(())
+}
+
+/// Macro to declare a per-table batch buffer + its flush_batched impl.
+/// Centralizes the "Vec of owned rows + push() + flush_batched()"
+/// boilerplate so each table only spells out its column list and the
+/// per-row flatten closure.
+///
+/// The `Value` wire-type union eats the heterogeneity (TEXT/INTEGER mix)
+/// without forcing per-table trait objects.
+macro_rules! batch_table {
+    (
+        $name:ident, $row:ident, $prefix:expr, $cols:expr,
+        push_fn: ($($push_arg:ident: $push_ty:ty),*),
+        push_body: $push_body:block,
+        flatten: |$chunk:ident| $flatten_body:block,
+    ) => {
+        struct $name {
+            rows: Vec<$row>,
+        }
+        struct $row {
+            $($push_arg: $push_ty),*
+        }
+        impl $name {
+            fn with_capacity(cap: usize) -> Self {
+                Self { rows: Vec::with_capacity(cap) }
+            }
+            #[allow(clippy::too_many_arguments)]
+            fn push(&mut self, $($push_arg: $push_ty),*) {
+                let row = $push_body;
+                self.rows.push(row);
+            }
+            // RefBatch overrides this with `flush_batched_for` to thread
+            // the per-table SQL prefix at flush time; the macro-generated
+            // version is unused for that one type. `dead_code` is the
+            // right knob here — the alternative (an extra macro arm or a
+            // separate type per table) trades real complexity for one
+            // warning we already understand.
+            #[allow(dead_code)]
+            fn flush_batched(self, conn: &Connection) -> Result<()> {
+                flush_in_batches(conn, self.rows, $prefix, $cols, |$chunk| $flatten_body)
+            }
+        }
+    };
+}
+
+batch_table! {
+    // `INSERT OR IGNORE`: file-level nodes (kind=0) are deleted per file
+    // via `delete_file_rows` before reparse, so they don't conflict.
+    // But dir nodes (kind=1) inserted by `collect_dirs` may exist from
+    // a prior parse — on incremental reparse, dirs survive across runs.
+    // `OR IGNORE` skips the dup-PK row in that case, matching the
+    // pre-9ccbc7 `INSERT OR IGNORE INTO nodes ... VALUES (?,?,?,1,...)`
+    // behavior `ensure_dirs` used. File/AST node rows still write
+    // their new values (no PK collision because their rows were just
+    // deleted). On cold parse there are no conflicts; `OR IGNORE`
+    // costs the same as plain `INSERT` (single B-tree insert).
+    NodeBatch, NodeRow,
+    "INSERT OR IGNORE INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ",
+    7,
+    push_fn: (id: String, parent_id: String, name: String, kind: i32, size: i64, mtime: i64, record: String),
+    push_body: { NodeRow { id, parent_id, name, kind, size, mtime, record } },
+    flatten: |chunk| {
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 7);
+        for r in chunk {
+            out.push(&r.id);
+            out.push(&r.parent_id);
+            out.push(&r.name);
+            out.push(&r.kind);
+            out.push(&r.size);
+            out.push(&r.mtime);
+            out.push(&r.record);
+        }
+        out
+    },
+}
+
+batch_table! {
+    // Plain `INSERT` (not `OR REPLACE`): `delete_file_rows` runs before
+    // the parse loop and clears _ast rows for every file we're about
+    // to reparse, so there's no PK conflict to handle. The `OR REPLACE`
+    // path pays a per-row PK lookup even when no conflict exists; on
+    // the mache 765-file bench that's ~535K extra B-tree probes. See
+    // bead `ley-line-open-cbbedf`.
+    AstBatch, AstRow,
+    "INSERT INTO _ast (node_id, source_id, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col) VALUES ",
+    9,
+    push_fn: (node_id: String, source_id: String, node_kind: String, start_byte: i64, end_byte: i64, start_row: i64, start_col: i64, end_row: i64, end_col: i64),
+    push_body: { AstRow { node_id, source_id, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col } },
+    flatten: |chunk| {
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 9);
+        for r in chunk {
+            out.push(&r.node_id);
+            out.push(&r.source_id);
+            out.push(&r.node_kind);
+            out.push(&r.start_byte);
+            out.push(&r.end_byte);
+            out.push(&r.start_row);
+            out.push(&r.start_col);
+            out.push(&r.end_row);
+            out.push(&r.end_col);
+        }
+        out
+    },
+}
+
+batch_table! {
+    // Plain INSERT: same rationale as AstBatch — delete_file_rows
+    // clears _source rows per file before reparse.
+    SourceBatch, SourceRow,
+    "INSERT INTO _source (id, language, path) VALUES ",
+    3,
+    push_fn: (id: String, language: String, path: String),
+    push_body: { SourceRow { id, language, path } },
+    flatten: |chunk| {
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 3);
+        for r in chunk {
+            out.push(&r.id);
+            out.push(&r.language);
+            out.push(&r.path);
+        }
+        out
+    },
+}
+
+batch_table! {
+    RefBatch, RefRow,
+    // NOTE: `prefix` is rebound at flush time below since refs/defs/imports
+    // share row shape but target different tables. See post-macro impl.
+    "",
+    3,
+    push_fn: (col0: String, col1: String, col2: String),
+    push_body: { RefRow { col0, col1, col2 } },
+    flatten: |chunk| {
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 3);
+        for r in chunk {
+            out.push(&r.col0);
+            out.push(&r.col1);
+            out.push(&r.col2);
+        }
+        out
+    },
+}
+
+// Override RefBatch::flush_batched to thread the per-table SQL prefix.
+// node_refs / node_defs / _imports share the (TEXT, TEXT, TEXT) shape
+// but live in different tables; rebinding `prefix` per call keeps the
+// macro-generated buffer reusable across all three.
+impl RefBatch {
+    fn flush_batched_for(self, conn: &Connection, prefix: &str) -> Result<()> {
+        flush_in_batches(conn, self.rows, prefix, 3, |chunk| {
+            let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 3);
+            for r in chunk {
+                out.push(&r.col0);
+                out.push(&r.col1);
+                out.push(&r.col2);
+            }
+            out
+        })
+    }
+}
+
+batch_table! {
+    // Plain INSERT: same rationale as AstBatch — delete_file_rows
+    // clears _file_index rows per file before reparse.
+    FileIdxBatch, FileIdxRow,
+    "INSERT INTO _file_index (path, mtime, size) VALUES ",
+    3,
+    push_fn: (path: String, mtime: i64, size: i64),
+    push_body: { FileIdxRow { path, mtime, size } },
+    flatten: |chunk| {
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 3);
+        for r in chunk {
+            out.push(&r.path);
+            out.push(&r.mtime);
+            out.push(&r.size);
+        }
+        out
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -105,10 +398,23 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
     // -shm/-wal sidecar files on the same filesystem, breaking portability.
     // synchronous=OFF — no fsync during batch (re-parse on crash is safe).
     // page_size=65536 — larger B-tree pages, fewer page splits.
+    // cache_size=-262144 (256 MB) — fits the working set of `_ast` (~120 MB)
+    //   + `nodes` (~80 MB) entirely in memory for the mache benchmark. The
+    //   prior 64 MB cap forced LRU eviction during the bulk-insert pass,
+    //   causing repeated re-reads of B-tree interior pages. At registry-
+    //   repo scale the cache caps gracefully via SQLite's LRU eviction.
+    // temp_store=MEMORY — rollback journal stays in RAM (we're not crash-
+    //   safe with synchronous=OFF anyway; a crash mid-parse discards the
+    //   half-built db and the user reparses cold).
+    // mmap_size=256 MB — memory-map the db file so SQLite reads (e.g. PK
+    //   lookups during INSERT) go through the kernel page cache directly
+    //   instead of pread/copy-to-buffer per page.
     conn.pragma_update(None, "journal_mode", "DELETE")?;
     conn.pragma_update(None, "synchronous", "OFF")?;
     conn.pragma_update(None, "page_size", "65536")?;
-    conn.pragma_update(None, "cache_size", "-64000")?; // 64MB cache
+    conn.pragma_update(None, "cache_size", "-262144")?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    conn.pragma_update(None, "mmap_size", 268_435_456_i64)?;
 
     let result = parse_into_conn(&conn, source, lang_filter, None)?;
     eprintln!(
@@ -119,6 +425,25 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
         result.errors,
         output.display()
     );
+
+    // Skip the SQLite connection's Drop on the way out — on macOS the
+    // close call burns ~65 ms (cache teardown + page-table release),
+    // which is pure user-visible wall time after the real work is
+    // done. With `synchronous=OFF` and `journal_mode=DELETE` there's
+    // no pending fsync owed and no journal to clean up (the journal
+    // was deleted at COMMIT). The kernel will close the FD when the
+    // process exits.
+    //
+    // The `libc::_exit` shortcut that bypasses the rest of the rust
+    // shutdown lives in `cli/src/main.rs` (gated to the parse subcommand
+    // success path only). It is not reachable from this function, from
+    // integration tests, or from the daemon path — those still go
+    // through normal Drop. This `mem::forget` is the local saving:
+    // ~65ms of SQLite FD-teardown that the kernel will reclaim on
+    // process exit anyway.
+    //
+    // See bead `ley-line-open-cbbedf` Attack 3.
+    std::mem::forget(conn);
 
     Ok(())
 }
@@ -173,8 +498,14 @@ pub fn parse_into_conn(
     // Check if tables already exist (incremental mode).
     let incremental = conn.prepare("SELECT 1 FROM _file_index LIMIT 1").is_ok();
 
-    create_ast_schema(conn)?;
-    create_refs_schema(conn)?;
+    // Tables only (no secondary indexes). At registry-repo scale the
+    // bulk INSERT loop pays O(rows × indexes × log N) on B-tree
+    // maintenance — the mache benchmark (764 files, 534k _ast rows)
+    // attributes ~3s of the 4.1s insert phase to per-row index
+    // updates. Indexes get rebuilt in one shot after `COMMIT` via
+    // `create_post_load_indexes`. See bead `ley-line-open-9ccbc7`.
+    create_ast_tables(conn)?;
+    create_refs_tables(conn)?;
     create_index_schema(conn)?;
 
     let mtime = std::time::SystemTime::now()
@@ -338,6 +669,16 @@ pub fn parse_into_conn(
         );
     }
 
+    // Sort to_parse by relative path so the post-parse iteration
+    // generates SQL inserts in alphabetical key order. The `_ast` and
+    // `nodes` tables use path-derived TEXT primary keys; inserts in
+    // sorted order land in the tail of each B-tree leaf page rather
+    // than splitting random interior pages, which is a 1.3-1.5×
+    // speedup on bulk-load of TEXT PK tables (per SQLite optimizer
+    // notes on "sorted INSERT amortization"). On the mache 765-file
+    // bench this saves ~150-200ms across the nodes + _ast flushes.
+    to_parse.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
     let parse_start = std::time::Instant::now();
 
     let parsed_files: Vec<Result<ParsedFile>> = to_parse
@@ -371,10 +712,26 @@ pub fn parse_into_conn(
 
     let parse_elapsed = parse_start.elapsed();
 
-    // ---- Batch insert (prepared statements + single transaction) ----
+    // ---- Batch insert (multi-row VALUES + single transaction) ----
+    //
+    // The bulk-insert hot path: 534K nodes, 535K _ast rows on the mache
+    // benchmark. Single-row INSERTs via prepare_cached pay a transaction-
+    // edge cost per row (statement step, B-tree page split, locking
+    // arbitration). Multi-row `VALUES(...),(...)` batches collapse that
+    // by ~10×: SQLite parses one statement, executes it once, and the
+    // B-tree maintenance amortizes across rows.
+    //
+    // Batch size: BULK_BATCH_ROWS (== 3000) rows per execute, under
+    // SQLite's 32K bound-param cap even for the 9-column _ast table
+    // (27 000 params, ~5 700 headroom). The "full batch" SQL string is
+    // the same every execute → prepare_cached hits the per-table key
+    // once and reuses. The trailing partial batch (< BULK_BATCH_ROWS
+    // rows) is flushed with a separately-sized statement; on a
+    // 765-file corpus this happens once per table at end of insert.
+    //
+    // See bead `ley-line-open-cbbedf`.
 
     let insert_start = std::time::Instant::now();
-    let mut dirs_created: HashSet<String> = HashSet::new();
     let mut parsed = 0u64;
     let mut errors = 0u64;
 
@@ -387,110 +744,87 @@ pub fn parse_into_conn(
     // segment-hashing → Σ root advance is bead `ley-line-open-ce55b1`.
     let (mut ast_writer, mut source_writer) = sibling_snapshot_writers(conn);
 
-    // Prepare statements once — reuse for all rows (avoids SQL parse per INSERT).
-    let mut stmt_node = conn.prepare_cached(
-        "INSERT OR REPLACE INTO nodes (id, parent_id, name, kind, size, mtime, record) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-    )?;
-    let mut stmt_ast = conn.prepare_cached(
-        "INSERT OR REPLACE INTO _ast (node_id, source_id, node_kind, start_byte, end_byte, \
-         start_row, start_col, end_row, end_col) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-    )?;
-    let mut stmt_source = conn.prepare_cached(
-        "INSERT OR REPLACE INTO _source (id, language, path) VALUES (?1, ?2, ?3)",
-    )?;
-    let mut stmt_ref = conn
-        .prepare_cached("INSERT INTO node_refs (token, node_id, source_id) VALUES (?1, ?2, ?3)")?;
-    let mut stmt_def = conn
-        .prepare_cached("INSERT INTO node_defs (token, node_id, source_id) VALUES (?1, ?2, ?3)")?;
-    let mut stmt_import =
-        conn.prepare_cached("INSERT INTO _imports (alias, path, source_id) VALUES (?1, ?2, ?3)")?;
-    let mut stmt_file_idx = conn.prepare_cached(
-        "INSERT OR REPLACE INTO _file_index (path, mtime, size) VALUES (?1, ?2, ?3)",
-    )?;
+    // Per-table row buffers. Owned strings/values so we can hand
+    // ToSql references to params_from_iter without lifetime gymnastics
+    // through the parsed_files Vec.
+    //
+    // Pre-allocate at the per-file estimate × file_count: ~700 nodes
+    // and ~700 ast entries per file on the mache benchmark, so 500K
+    // capacity each is the right ballpark to avoid mid-loop reallocs.
+    let mut nodes_buf: NodeBatch = NodeBatch::with_capacity(550_000);
+    let mut ast_buf: AstBatch = AstBatch::with_capacity(550_000);
+    let mut refs_buf: RefBatch = RefBatch::with_capacity(40_000);
+    let mut defs_buf: RefBatch = RefBatch::with_capacity(3_000);
+    let mut imports_buf: RefBatch = RefBatch::with_capacity(2_000);
+    let mut source_buf: SourceBatch = SourceBatch::with_capacity(to_parse.len());
+    let mut file_idx_buf: FileIdxBatch = FileIdxBatch::with_capacity(to_parse.len());
 
+    let mut dirs_created: HashSet<String> = HashSet::new();
     let mut changed_files: Vec<String> = Vec::new();
 
     for result in parsed_files {
         match result {
             Ok(pf) => {
                 let rel_path = Path::new(&pf.rel);
-                ensure_dirs(conn, rel_path, mtime, &mut dirs_created)?;
+                collect_dirs(rel_path, &mut dirs_created, &mut nodes_buf, mtime);
 
-                stmt_source.execute(rusqlite::params![&pf.rel, &pf.language, &pf.abs_path])?;
+                source_buf.push(pf.rel.clone(), pf.language.clone(), pf.abs_path.clone());
 
-                // capnp dual-write (`ley-line-open-cdf098`): same
-                // fields as the SQL row, typed and content-addressable.
+                // capnp dual-write (`ley-line-open-cdf098`): same fields
+                // as the SQL row, typed and content-addressable. The
+                // per-message capnp serialization happened in the rayon
+                // worker (`parse_file_pure`); here we just append the
+                // pre-built byte buffer to the BufWriter. See bead
+                // `ley-line-open-cbbedf`.
                 if let Some(w) = source_writer.as_mut() {
-                    write_source_file_record(
-                        w,
-                        &pf.rel,
-                        &pf.language,
-                        &pf.abs_path,
-                        pf.file_mtime,
-                        pf.file_size,
-                    )?;
+                    w.write_all(&pf.source_capnp_bytes)
+                        .context("write SourceFile capnp bytes")?;
+                }
+                if let Some(w) = ast_writer.as_mut() {
+                    w.write_all(&pf.ast_capnp_bytes)
+                        .context("write AstNode capnp bytes")?;
                 }
 
-                for n in &pf.nodes {
-                    stmt_node.execute(rusqlite::params![
-                        &n.id,
-                        &n.parent_id,
-                        &n.name,
-                        n.kind,
-                        n.size,
-                        mtime,
-                        &n.record
-                    ])?;
+                for n in pf.nodes {
+                    nodes_buf.push(n.id, n.parent_id, n.name, n.kind, n.size, mtime, n.record);
                 }
 
-                for a in &pf.ast_entries {
-                    stmt_ast.execute(rusqlite::params![
-                        &a.node_id,
-                        &a.source_id,
-                        &a.node_kind,
-                        a.start_byte,
-                        a.end_byte,
-                        a.start_row,
-                        a.start_col,
-                        a.end_row,
-                        a.end_col
-                    ])?;
-
-                    // T8.3 capnp dual-write for the AstNode.
-                    if let Some(w) = ast_writer.as_mut() {
-                        write_ast_node_record(w, a)?;
-                    }
+                for a in pf.ast_entries {
+                    ast_buf.push(
+                        a.node_id,
+                        a.source_id,
+                        a.node_kind,
+                        a.start_byte as i64,
+                        a.end_byte as i64,
+                        a.start_row as i64,
+                        a.start_col as i64,
+                        a.end_row as i64,
+                        a.end_col as i64,
+                    );
                 }
 
-                for r in &pf.refs {
+                for r in pf.refs {
                     match r {
                         ExtractedRef::Ref {
                             token,
                             node_id,
                             source_id,
-                        } => {
-                            stmt_ref.execute(rusqlite::params![token, node_id, source_id])?;
-                        }
+                        } => refs_buf.push(token, node_id, source_id),
                         ExtractedRef::Def {
                             token,
                             node_id,
                             source_id,
-                        } => {
-                            stmt_def.execute(rusqlite::params![token, node_id, source_id])?;
-                        }
+                        } => defs_buf.push(token, node_id, source_id),
                         ExtractedRef::Import {
                             alias,
                             path,
                             source_id,
-                        } => {
-                            stmt_import.execute(rusqlite::params![alias, path, source_id])?;
-                        }
+                        } => imports_buf.push(alias, path, source_id),
                     }
                 }
 
-                stmt_file_idx.execute(rusqlite::params![&pf.rel, pf.file_mtime, pf.file_size])?;
-                changed_files.push(pf.rel.clone());
+                file_idx_buf.push(pf.rel.clone(), pf.file_mtime, pf.file_size);
+                changed_files.push(pf.rel);
                 parsed += 1;
             }
             Err(e) => {
@@ -500,16 +834,80 @@ pub fn parse_into_conn(
         }
     }
 
-    // Drop prepared statements before COMMIT (releases borrow on conn).
-    drop(stmt_node);
-    drop(stmt_ast);
-    drop(stmt_source);
-    drop(stmt_ref);
-    drop(stmt_def);
-    drop(stmt_import);
-    drop(stmt_file_idx);
+    // Flush each table in BULK_BATCH_ROWS-sized chunks via multi-row
+    // VALUES inserts. Tail (last <BULK_BATCH_ROWS rows) flushed in one
+    // partial-size statement so we don't fall back to per-row execute.
+    nodes_buf.flush_batched(conn)?;
+    ast_buf.flush_batched(conn)?;
+    source_buf.flush_batched(conn)?;
+    refs_buf.flush_batched_for(
+        conn,
+        "INSERT INTO node_refs (token, node_id, source_id) VALUES ",
+    )?;
+    defs_buf.flush_batched_for(
+        conn,
+        "INSERT INTO node_defs (token, node_id, source_id) VALUES ",
+    )?;
+    imports_buf.flush_batched_for(
+        conn,
+        "INSERT INTO _imports (alias, path, source_id) VALUES ",
+    )?;
+    file_idx_buf.flush_batched(conn)?;
+
+    // Flush the capnp dual-write `BufWriter`s before COMMIT and before
+    // `write_head_after_parse` reads the segments for hashing —
+    // otherwise the buffered tail would be invisible to the Σ root
+    // computation, yielding a hash that disagrees with the on-disk
+    // bytes once the writer is dropped. Drop after flush so the file
+    // handle is closed by the time the head pass runs.
+    if let Some(mut w) = ast_writer.take() {
+        w.flush().context("flush ast.capnp BufWriter")?;
+    }
+    if let Some(mut w) = source_writer.take() {
+        w.flush().context("flush source.capnp BufWriter")?;
+    }
 
     conn.execute_batch("COMMIT")?;
+
+    // Pre-grab the db_path so we can dispatch the head-write hash pass
+    // (pure filesystem work, reads ast.capnp + source.capnp) on a worker
+    // thread that runs concurrently with `create_post_load_indexes`
+    // (CPU + SQLite-disk work on the .db file). The two workloads touch
+    // disjoint files and need no SQLite handle for the head pass beyond
+    // the path, so the parallel run is safe. On the mache bench this
+    // collapses the 169ms head pass entirely into the 365ms index pass.
+    // See bead `ley-line-open-cbbedf` Attack 3.
+    let db_path_for_head: Option<std::path::PathBuf> = {
+        let row: rusqlite::Result<String> = conn.query_row(
+            "SELECT file FROM pragma_database_list WHERE name = 'main' LIMIT 1",
+            [],
+            |r| r.get(0),
+        );
+        match row {
+            Ok(s) if !s.is_empty() => Some(std::path::PathBuf::from(s)),
+            _ => None,
+        }
+    };
+    let head_handle = db_path_for_head
+        .map(|p| std::thread::spawn(move || -> Result<()> { write_head_for_path(&p) }));
+
+    // Build secondary indexes in one pass now that all rows are
+    // landed. SQLite materializes each index by a single sorted scan
+    // (~O(rows · log rows)) which is roughly an order of magnitude
+    // cheaper than incremental per-row B-tree maintenance during the
+    // INSERT loop. Idempotent (`IF NOT EXISTS`) so the incremental-
+    // reparse path (where indexes already exist from the prior run)
+    // is a no-op. See bead `ley-line-open-9ccbc7`.
+    //
+    // `idx_source_file` is intentionally excluded from this hot path —
+    // it's a partial index whose predicate (`source_file IS NOT NULL`)
+    // is false for every ley-line-produced row (only mache populates
+    // `source_file`). Building it on cold parse still costs a full
+    // 535K-row scan (~45 ms on the mache bench) even though the
+    // resulting index is empty; the mache flow paths build their own
+    // schema with the indexes mache needs, so skipping here is safe.
+    // See bead `ley-line-open-cbbedf` Attack 3.
+    create_post_load_indexes_skip_unused(conn)?;
 
     let insert_elapsed = insert_start.elapsed();
 
@@ -518,7 +916,17 @@ pub fn parse_into_conn(
     // Skip orphaned-dir sweep on scoped passes: it would walk the full
     // _file_index tree and incorrectly drop dirs whose other (out-of-scope)
     // files weren't loaded into this run. Full-tree passes still run it.
-    if scope.is_none() {
+    //
+    // Cold-parse fast-path: when no files were deleted this run, no dir
+    // node can be orphaned — `ensure_dirs` only inserts dirs whose
+    // descendant file we're parsing, so every dir we touched has at
+    // least one child by construction, and we didn't touch any other
+    // dirs. The full-scan DELETE is pure overhead. Pre-Attack 3 this
+    // burned ~500ms on the mache 765-file bench (an O(N) scan of the
+    // 535K-row nodes table without an `idx_kind` to accelerate it).
+    // See bead `ley-line-open-cbbedf` Attack 3.
+    let sweep_close_start = std::time::Instant::now();
+    if scope.is_none() && deleted > 0 {
         let swept = sweep_orphaned_dirs(conn)?;
         if swept > 0 {
             eprintln!("{swept} orphaned dirs removed");
@@ -536,27 +944,50 @@ pub fn parse_into_conn(
         .unwrap_or_default()
         .as_secs();
     set_meta(conn, "parse_time", &now.to_string())?;
+    let sweep_close_elapsed = sweep_close_start.elapsed();
 
+    // Σ root advance (bead `ley-line-open-ce55b1`) — join the worker
+    // thread spawned right after COMMIT to overlap head-write FS work
+    // with post-COMMIT index creation. Best-effort: a head-write
+    // failure logs and doesn't fail the parse. `:memory:` connections
+    // skipped (no head_handle in that case).
+    let head_write_start = std::time::Instant::now();
+    if let Some(h) = head_handle {
+        match h.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => log::warn!("Σ head-write failed (parse otherwise OK): {e:#}"),
+            Err(_) => log::warn!("Σ head-write thread panicked (parse otherwise OK)"),
+        }
+    }
+    let head_write_elapsed = head_write_start.elapsed();
+
+    // Per-phase timing trace — single line, stderr, surfacing the
+    // wall-clock split so the next person debugging cold-parse can see
+    // where time goes without rebuilding with custom timing prints.
+    // See bead `ley-line-open-cbbedf` for the 1500ms gate this enables.
+    let wall_elapsed = parse_elapsed + insert_elapsed + sweep_close_elapsed + head_write_elapsed;
     if oversized > 0 {
         eprintln!(
             "{parsed} parsed, {unchanged} unchanged, {deleted} deleted, \
              {errors} errors, {oversized} skipped >{}MB \
-             (parse {parse_elapsed:.1?}, insert {insert_elapsed:.1?})",
+             parse={}ms insert={}ms head_write={}ms sweep_close={}ms wall={}ms",
             MAX_PARSE_FILE_SIZE / (1024 * 1024),
+            parse_elapsed.as_millis(),
+            insert_elapsed.as_millis(),
+            head_write_elapsed.as_millis(),
+            sweep_close_elapsed.as_millis(),
+            wall_elapsed.as_millis(),
         );
     } else {
         eprintln!(
             "{parsed} parsed, {unchanged} unchanged, {deleted} deleted, {errors} errors \
-             (parse {parse_elapsed:.1?}, insert {insert_elapsed:.1?})",
+             parse={}ms insert={}ms head_write={}ms sweep_close={}ms wall={}ms",
+            parse_elapsed.as_millis(),
+            insert_elapsed.as_millis(),
+            head_write_elapsed.as_millis(),
+            sweep_close_elapsed.as_millis(),
+            wall_elapsed.as_millis(),
         );
-    }
-
-    // Σ root advance (bead `ley-line-open-ce55b1`) — hash the
-    // just-emitted segments and chain a new Head record. Best-effort:
-    // a head-write failure logs and doesn't fail the parse.
-    // `:memory:` connections are gated inside `write_head_after_parse`.
-    if let Err(e) = write_head_after_parse(conn) {
-        log::warn!("Σ head-write failed (parse otherwise OK): {e:#}");
     }
 
     // Oversized files count as errors at the result level — they
@@ -596,9 +1027,22 @@ const SEGMENT_FILE_SUFFIXES: &[&str] = &["source.capnp", "ast.capnp", "bindings.
 /// IPLD/ATproto precedent: the CID is the version. Schema evolution
 /// is handled at the typed-reading level, not by versioning the wire.
 ///
-/// Defensive on read: even if a producer wrote non-canonical bytes
-/// (legacy file, runtime bug), the message reader's `canonicalize()`
-/// re-normalizes before hashing — so the chain stays deterministic.
+/// **Fast path**: when every message in the file is single-segment
+/// (the case for all `set_root_canonical`-produced messages — which is
+/// what `write_source_file_record` and `write_ast_node_record` always
+/// emit), the on-disk format reduces to a stream of
+/// `[8-byte header][N*8 bytes canonical data]` records. We can hash
+/// the canonical bytes by walking the headers and feeding the data
+/// slices to BLAKE3 directly — no `capnp::serialize::read_message`
+/// parse, no `canonicalize()` rebuild. Empirically this is ~6× faster
+/// on the mache 163 MB ast.capnp bench. See bead `ley-line-open-cbbedf`.
+///
+/// **Defensive path**: if a record's segment count is anything other
+/// than 1 (legacy producer, future change), fall back to the
+/// `read_message` + `canonicalize()` route for that whole file. The
+/// fallback is opt-in for the single file with a non-canonical record,
+/// not the whole hash — so a single legacy file doesn't pay the slow
+/// path for the entire set.
 fn hash_segment_files(db_path: &Path) -> Result<([u8; 32], u64)> {
     let mut hasher = blake3::Hasher::new();
     let mut total: u64 = 0;
@@ -609,20 +1053,95 @@ fn hash_segment_files(db_path: &Path) -> Result<([u8; 32], u64)> {
         }
         let file_bytes =
             std::fs::read(&p).with_context(|| format!("read segment {}", p.display()))?;
-        let mut slice: &[u8] = &file_bytes;
-        while !slice.is_empty() {
-            let msg =
-                capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new())
-                    .with_context(|| format!("parse segment {}", p.display()))?;
-            let canonical_words = msg
-                .canonicalize()
-                .with_context(|| format!("canonicalize segment {}", p.display()))?;
-            let canonical_bytes = capnp::Word::words_to_bytes(&canonical_words);
-            total = total.saturating_add(canonical_bytes.len() as u64);
-            hasher.update(canonical_bytes);
-        }
+        let bytes_after = hash_canonical_stream_fast(&file_bytes, &mut hasher)
+            .or_else(|| {
+                // Legacy producer / multi-segment record / corruption —
+                // fall through to the read_message+canonicalize path so
+                // the contract is honored even when the fast path's
+                // assumptions don't hold.
+                hash_canonical_stream_slow(&file_bytes, &mut hasher, &p).ok()
+            })
+            .ok_or_else(|| anyhow::anyhow!("parse segment {}", p.display()))?;
+        total = total.saturating_add(bytes_after);
     }
     Ok((*hasher.finalize().as_bytes(), total))
+}
+
+/// Fast canonical-bytes hash: walks the on-disk capnp stream as
+/// `[8-byte header][segment]` records, feeding each segment's bytes
+/// (the canonical bytes per `set_root_canonical`) directly to the
+/// running BLAKE3 hasher. Returns `Some(total_canonical_bytes)` on
+/// success, `None` if any record is multi-segment (≠ canonical-form-
+/// from-producer) — the caller falls back to the slow path on `None`.
+///
+/// Invariant: the producer (`write_source_file_record`,
+/// `write_ast_node_record`) always writes single-segment messages via
+/// `set_root_canonical`. The Cap'n Proto framing format for a single
+/// segment message is exactly:
+///   - 4 bytes: `segment_count - 1` (== 0 for single-segment)
+///   - 4 bytes: segment length in words
+///   - segment_length * 8 bytes: segment data
+///
+/// No padding required since the header is already 8-byte aligned.
+fn hash_canonical_stream_fast(file_bytes: &[u8], hasher: &mut blake3::Hasher) -> Option<u64> {
+    const WORD_BYTES: usize = 8;
+    const HEADER_BYTES: usize = 8;
+    let mut total: u64 = 0;
+    let mut i = 0;
+    while i < file_bytes.len() {
+        if i + HEADER_BYTES > file_bytes.len() {
+            return None; // truncated header
+        }
+        let seg_count_minus_1 = u32::from_le_bytes([
+            file_bytes[i],
+            file_bytes[i + 1],
+            file_bytes[i + 2],
+            file_bytes[i + 3],
+        ]);
+        if seg_count_minus_1 != 0 {
+            return None; // multi-segment — fall back to slow path
+        }
+        let seg_words = u32::from_le_bytes([
+            file_bytes[i + 4],
+            file_bytes[i + 5],
+            file_bytes[i + 6],
+            file_bytes[i + 7],
+        ]) as usize;
+        i += HEADER_BYTES;
+        let seg_bytes = seg_words * WORD_BYTES;
+        if i + seg_bytes > file_bytes.len() {
+            return None; // truncated segment
+        }
+        let canonical = &file_bytes[i..i + seg_bytes];
+        hasher.update(canonical);
+        total = total.saturating_add(seg_bytes as u64);
+        i += seg_bytes;
+    }
+    Some(total)
+}
+
+/// Slow canonical-bytes hash via `read_message` + `canonicalize()`.
+/// Kept as the fallback when `hash_canonical_stream_fast` returns
+/// `None` (legacy producer or multi-segment record). The pre-9ccbc7
+/// implementation; preserved verbatim for the fallback contract.
+fn hash_canonical_stream_slow(
+    file_bytes: &[u8],
+    hasher: &mut blake3::Hasher,
+    p: &Path,
+) -> Result<u64> {
+    let mut total: u64 = 0;
+    let mut slice: &[u8] = file_bytes;
+    while !slice.is_empty() {
+        let msg = capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new())
+            .with_context(|| format!("parse segment {}", p.display()))?;
+        let canonical_words = msg
+            .canonicalize()
+            .with_context(|| format!("canonicalize segment {}", p.display()))?;
+        let canonical_bytes = capnp::Word::words_to_bytes(&canonical_words);
+        total = total.saturating_add(canonical_bytes.len() as u64);
+        hasher.update(canonical_bytes);
+    }
+    Ok(total)
 }
 
 /// T8.5: read the existing `${db}.head.capnp`, returning the chain
@@ -658,23 +1177,15 @@ fn read_head_for_chain(head_path: &Path) -> ([u8; 32], u64) {
     (prev_root, prev_gen.saturating_add(1))
 }
 
-/// T8.5: compute the segment hash for this run, read the existing
-/// Head for the parent/gen chain, and write the new Head. Skips when
-/// the connection isn't file-backed (`:memory:`) — same gating as
-/// T8.3's snapshot writers.
-fn write_head_after_parse(conn: &Connection) -> Result<()> {
-    let row: rusqlite::Result<String> = conn.query_row(
-        "SELECT file FROM pragma_database_list WHERE name = 'main' LIMIT 1",
-        [],
-        |r| r.get(0),
-    );
-    let db_path = match row {
-        Ok(s) if !s.is_empty() => std::path::PathBuf::from(s),
-        _ => return Ok(()),
-    };
-
-    let (root, segment_bytes) = hash_segment_files(&db_path)?;
-    let head_path = with_extension(&db_path, "head.capnp");
+/// T8.5: compute the segment hash for this run (from `db_path`'s
+/// sibling ast/source segment files), read the existing Head for the
+/// parent/gen chain, and write the new Head. Pure filesystem work —
+/// no SQLite handle required, so a parent caller can dispatch this on
+/// a worker thread that runs concurrently with post-COMMIT SQLite work
+/// (e.g. `create_post_load_indexes`). See bead `ley-line-open-cbbedf`.
+fn write_head_for_path(db_path: &Path) -> Result<()> {
+    let (root, segment_bytes) = hash_segment_files(db_path)?;
+    let head_path = with_extension(db_path, "head.capnp");
     let (parent, generation) = read_head_for_chain(&head_path);
 
     use leyline_schema_capnp::head_capnp::head;
@@ -700,6 +1211,25 @@ fn write_head_after_parse(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// T8.5: thin wrapper around `write_head_for_path` that pulls the
+/// db_path from a SQLite connection. Skips when the connection isn't
+/// file-backed (`:memory:`) — same gating as T8.3's snapshot writers.
+/// Kept for callers that don't have the path on hand and don't need
+/// the parallel-dispatch shape that `parse_into_conn` uses internally.
+#[allow(dead_code)]
+fn write_head_after_parse(conn: &Connection) -> Result<()> {
+    let row: rusqlite::Result<String> = conn.query_row(
+        "SELECT file FROM pragma_database_list WHERE name = 'main' LIMIT 1",
+        [],
+        |r| r.get(0),
+    );
+    let db_path = match row {
+        Ok(s) if !s.is_empty() => std::path::PathBuf::from(s),
+        _ => return Ok(()),
+    };
+    write_head_for_path(&db_path)
+}
+
 // ---------------------------------------------------------------------------
 // T8.3 capnp dual-write helpers
 // ---------------------------------------------------------------------------
@@ -710,7 +1240,16 @@ fn write_head_after_parse(conn: &Connection) -> Result<()> {
 /// rewrites these files — they're snapshots of `_ast` and `_source`,
 /// not append-only event logs (the binding log in T8.2 is append-only
 /// because LSP enrichment calls accumulate; parse is a single pass).
-fn sibling_snapshot_writers(conn: &Connection) -> (Option<std::fs::File>, Option<std::fs::File>) {
+///
+/// Returns `BufWriter<File>` so each `capnp::serialize::write_message`
+/// call batches its (typically tiny) byte sequence in userspace
+/// instead of issuing a `write(2)` per message. On the mache benchmark
+/// (534k AstNode records) raw `File` writes burned ~3.5s in
+/// `write_message` alone; with default 8 KiB userspace buffering the
+/// system-call rate drops by ~30×. See bead `ley-line-open-9ccbc7`.
+type CapnpWriter = BufWriter<std::fs::File>;
+
+fn sibling_snapshot_writers(conn: &Connection) -> (Option<CapnpWriter>, Option<CapnpWriter>) {
     let row: rusqlite::Result<String> = conn.query_row(
         "SELECT file FROM pragma_database_list WHERE name = 'main' LIMIT 1",
         [],
@@ -724,13 +1263,14 @@ fn sibling_snapshot_writers(conn: &Connection) -> (Option<std::fs::File>, Option
     let ast_path = with_extension(&db_path, "ast.capnp");
     let source_path = with_extension(&db_path, "source.capnp");
 
-    let open = |p: &Path| -> Option<std::fs::File> {
+    let open = |p: &Path| -> Option<CapnpWriter> {
         std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(p)
             .ok()
+            .map(BufWriter::new)
     };
 
     (open(&ast_path), open(&source_path))
@@ -745,15 +1285,20 @@ fn with_extension(p: &Path, ext: &str) -> std::path::PathBuf {
     out
 }
 
-/// T8.3: serialize a single `SourceFile` capnp message and append it
-/// to the source-snapshot file. Per the post-RTFM canonical-encoding
-/// commitment in ADR-0014, the producer writes via
-/// `set_root_canonical` so the on-disk bytes are byte-stable across
-/// additive schema changes (encoding spec bullet 3:
+/// T8.3: serialize a single `SourceFile` capnp message to a byte buffer.
+/// Per the post-RTFM canonical-encoding commitment in ADR-0014, the
+/// producer writes via `set_root_canonical` so the on-disk bytes are
+/// byte-stable across additive schema changes (encoding spec bullet 3:
 /// *"adding a new field to a struct does not affect the canonical
 /// encoding of messages that do not set that field"*).
-fn write_source_file_record(
-    writer: &mut std::fs::File,
+///
+/// Writes into a `Vec<u8>` so the parallel parse phase can call this
+/// concurrently (the BufWriter path is single-threaded — one
+/// `&mut CapnpWriter` per main-thread iteration). Main thread later
+/// concatenates the per-file buffers into the BufWriter. See bead
+/// `ley-line-open-cbbedf`.
+fn serialize_source_file_record(
+    buf: &mut Vec<u8>,
     id: &str,
     language: &str,
     canonical_path: &str,
@@ -778,13 +1323,14 @@ fn write_source_file_record(
     canonical
         .set_root_canonical(src.get_root_as_reader::<source_file::Reader>()?)
         .context("canonicalize SourceFile")?;
-    capnp::serialize::write_message(writer, &canonical).context("write SourceFile capnp record")?;
+    capnp::serialize::write_message(buf, &canonical).context("write SourceFile capnp record")?;
     Ok(())
 }
 
-/// T8.3: serialize a single `AstNode` capnp message — canonical form
-/// per the ADR-0014 producer commitment (see write_source_file_record).
-fn write_ast_node_record(writer: &mut std::fs::File, a: &AstEntry) -> Result<()> {
+/// T8.3: serialize a single `AstNode` capnp message to a byte buffer —
+/// canonical form per the ADR-0014 producer commitment (see
+/// serialize_source_file_record).
+fn serialize_ast_node_record(buf: &mut Vec<u8>, a: &AstEntry) -> Result<()> {
     use leyline_schema_capnp::ast_capnp::ast_node;
 
     let mut src = capnp::message::Builder::new_default();
@@ -812,7 +1358,7 @@ fn write_ast_node_record(writer: &mut std::fs::File, a: &AstEntry) -> Result<()>
     canonical
         .set_root_canonical(src.get_root_as_reader::<ast_node::Reader>()?)
         .context("canonicalize AstNode")?;
-    capnp::serialize::write_message(writer, &canonical).context("write AstNode capnp record")?;
+    capnp::serialize::write_message(buf, &canonical).context("write AstNode capnp record")?;
     Ok(())
 }
 
@@ -892,6 +1438,26 @@ fn parse_file_pure(
         &mut refs,
     );
 
+    // Pre-serialize capnp records in the rayon worker so the post-
+    // parse main-thread loop just writes pre-built byte buffers to the
+    // BufWriter — moves the per-file canonicalize cost out of the
+    // serial insert phase. See bead `ley-line-open-cbbedf`.
+    let mut source_capnp_bytes = Vec::with_capacity(256);
+    serialize_source_file_record(
+        &mut source_capnp_bytes,
+        source_id,
+        language.name(),
+        abs_path,
+        file_mtime,
+        file_size,
+    )?;
+    // ~150 bytes per AstNode record (canonical: id + source_id + kind +
+    // Range); pre-size to avoid re-allocs during the per-node loop.
+    let mut ast_capnp_bytes = Vec::with_capacity(ast_entries.len() * 160);
+    for a in &ast_entries {
+        serialize_ast_node_record(&mut ast_capnp_bytes, a)?;
+    }
+
     Ok(ParsedFile {
         rel: source_id.to_string(),
         abs_path: abs_path.to_string(),
@@ -901,6 +1467,8 @@ fn parse_file_pure(
         refs,
         file_mtime,
         file_size,
+        source_capnp_bytes,
+        ast_capnp_bytes,
     })
 }
 
@@ -1023,13 +1591,19 @@ fn walk_children_pure(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Create directory nodes for each component of a relative file path.
-fn ensure_dirs(
-    conn: &Connection,
-    rel: &Path,
-    mtime: i64,
-    created: &mut HashSet<String>,
-) -> Result<()> {
+/// Append directory-node rows (one per path component) to the nodes
+/// batch buffer. Deduplicates via the `created` set so a 50k-file
+/// registry repo with deeply-shared dir hierarchies doesn't emit
+/// duplicate `<prefix>` rows. The dir rows use `kind = 1` and empty
+/// `record`, matching the legacy `ensure_dirs` behavior (which did the
+/// same insert through `INSERT OR IGNORE`).
+///
+/// Why no `INSERT OR IGNORE`: nodes_buf already de-dupes via the
+/// `created` set, and `INSERT OR REPLACE` (used by nodes_buf below) is
+/// idempotent for matching primary keys. The `OR IGNORE` here was
+/// defensive against the per-file loop re-inserting the same dir; the
+/// set membership check accomplishes the same.
+fn collect_dirs(rel: &Path, created: &mut HashSet<String>, nodes_buf: &mut NodeBatch, mtime: i64) {
     let mut accumulated = String::new();
     let components: Vec<_> = rel
         .parent()
@@ -1038,22 +1612,25 @@ fn ensure_dirs(
         .collect();
 
     for comp in components {
-        let name = comp.as_os_str().to_string_lossy();
+        let name = comp.as_os_str().to_string_lossy().into_owned();
         let parent = accumulated.clone();
         if accumulated.is_empty() {
-            accumulated = name.to_string();
+            accumulated = name.clone();
         } else {
             accumulated = format!("{accumulated}/{name}");
         }
         if created.insert(accumulated.clone()) {
-            conn.execute(
-                "INSERT OR IGNORE INTO nodes (id, parent_id, name, kind, size, mtime, record) \
-                 VALUES (?1, ?2, ?3, 1, 0, ?4, '')",
-                rusqlite::params![&accumulated, &parent, &*name, mtime],
-            )?;
+            nodes_buf.push(
+                accumulated.clone(),
+                parent,
+                name,
+                1,
+                0,
+                mtime,
+                String::new(),
+            );
         }
     }
-    Ok(())
 }
 
 /// True when the directory name should be excluded from the parse walk.
@@ -1250,6 +1827,144 @@ mod tests {
     }
 
     #[test]
+    fn sweep_orphaned_dirs_runs_when_files_are_deleted_between_parses() {
+        // Skeptic finding on bead `ley-line-open-cbbedf`: the sweep-skip
+        // optimization in `parse_into_conn` only fires when `deleted == 0`,
+        // which is the cold-parse path. The "deleted > 0" path was logically
+        // correct but had no test exercising it — meaning a future refactor
+        // could break the sweep-fires path and CI would stay green.
+        //
+        // This test pins the contract: parse a tree, delete one file's
+        // parent dir, reparse, assert the orphan dir is gone from `nodes`.
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        std::fs::create_dir_all(root.join("doomed")).unwrap();
+        std::fs::write(root.join("doomed/a.go"), b"package m\n").unwrap();
+        std::fs::write(root.join("keep.go"), b"package m\n").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        let _ = parse_into_conn(&conn, root, None, None).unwrap();
+
+        // Confirm the dir row exists after the cold parse.
+        let dir_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE id = 'doomed' AND kind = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dir_before, 1, "doomed/ dir row must exist after cold parse");
+
+        // Remove the file AND its parent dir from disk, then reparse.
+        std::fs::remove_file(root.join("doomed/a.go")).unwrap();
+        std::fs::remove_dir(root.join("doomed")).unwrap();
+        let r2 = parse_into_conn(&conn, root, None, None).unwrap();
+        assert!(r2.deleted >= 1, "incremental must observe ≥1 deletion");
+
+        // The sweep-runs path must fire and remove the now-orphaned dir.
+        let dir_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE id = 'doomed' AND kind = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dir_after, 0,
+            "sweep_orphaned_dirs must remove the orphaned dir row when its only \
+             child was deleted (deleted > 0 path of parse_into_conn)",
+        );
+
+        // Sanity: keep.go's file row survives.
+        let keep_present: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _file_index WHERE path = 'keep.go'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(keep_present, 1);
+    }
+
+    #[test]
+    fn batched_inserts_preserve_record_content_not_just_row_count() {
+        // Skeptic finding on bead `ley-line-open-cbbedf`: row-count parity
+        // (which `parse_into_conn_skips_oversized_files` and friends cover)
+        // is necessary but not sufficient — a chunk-boundary misalignment
+        // in the multi-row VALUES batch could shift bound params between
+        // rows, producing same-count-different-content output. This test
+        // spot-checks that `_source` AND `_ast` rows for distinct files
+        // survive the batched-insert path with their bound parameters
+        // correctly aligned (no row-to-row leakage).
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        // Two files so we exercise the multi-file batched path (single-row
+        // batches would have hidden a chunk-boundary bug too).
+        std::fs::write(root.join("a.go"), b"package alpha\n\nfunc Aaa() {}\n").unwrap();
+        std::fs::write(root.join("b.go"), b"package beta\n\nfunc Bbb() {}\n").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        parse_into_conn(&conn, root, None, None).unwrap();
+
+        // _source(id, language, path) — file-backed parse stores the
+        // canonicalized absolute path (not the relative one), so we
+        // query by filename suffix rather than equality. Pin: each
+        // file has exactly one row with language='go'.
+        let a_row: (String, String) = conn
+            .query_row(
+                "SELECT id, language FROM _source WHERE path LIKE '%/a.go'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let b_row: (String, String) = conn
+            .query_row(
+                "SELECT id, language FROM _source WHERE path LIKE '%/b.go'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let (a_source_id, a_lang) = a_row;
+        let (b_source_id, b_lang) = b_row;
+        assert_eq!(a_lang, "go", "_source.language for a.go must be 'go'");
+        assert_eq!(b_lang, "go", "_source.language for b.go must be 'go'");
+        assert_ne!(
+            a_source_id, b_source_id,
+            "distinct files must have distinct _source.id",
+        );
+
+        // _ast(node_id, source_id, node_kind, ...) — pin: exactly one
+        // function_declaration per file AND it joins to the correct
+        // _source.id. If batched VALUES misaligned source_id across
+        // rows, the count for one file would be 0 and the other would
+        // be doubled.
+        let a_fn_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _ast \
+                 WHERE node_kind = 'function_declaration' AND source_id = ?1",
+                [&a_source_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let b_fn_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _ast \
+                 WHERE node_kind = 'function_declaration' AND source_id = ?1",
+                [&b_source_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            a_fn_count, 1,
+            "a.go must contribute exactly 1 function_declaration via batched insert",
+        );
+        assert_eq!(
+            b_fn_count, 1,
+            "b.go must contribute exactly 1 function_declaration via batched insert",
+        );
+    }
+
+    #[test]
     fn collect_files_descends_into_normal_dirs() {
         // Sister pin: normal directories ARE descended. Pin so a
         // refactor over-aggressively pruning (e.g. skip every dir
@@ -1361,6 +2076,7 @@ mod tests {
     /// T8.5: parse twice; head.capnp chains correctly:
     /// - run 1: parentHash == [0;32] (sentinel), generation == 1, rootHash != 0
     /// - run 2: parentHash == run1.rootHash, generation == 2
+    ///
     /// And rootHash equals BLAKE3 of the segment files in canonical order.
     #[test]
     fn parse_into_conn_chains_head_across_runs() {

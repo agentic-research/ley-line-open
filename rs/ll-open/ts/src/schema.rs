@@ -3,7 +3,10 @@
 //! Re-exports the shared `nodes` table from `leyline-schema` and adds
 //! AST-specific tables (`_source`, `_ast`) that enable bidirectional splicing.
 
-pub use leyline_schema::{NODES_DDL, create_schema, insert_node};
+pub use leyline_schema::{
+    NODES_DDL, NODES_INDEXES_DDL, NODES_TABLE_DDL, create_nodes_indexes, create_nodes_table,
+    create_schema, insert_node,
+};
 
 use anyhow::Result;
 use rusqlite::{Connection, params};
@@ -22,7 +25,26 @@ CREATE TABLE IF NOT EXISTS _source (
     path TEXT
 );";
 
-/// DDL for the `_ast` table — maps node IDs to byte ranges in the source.
+/// DDL for the `_ast` table — table only, no indexes. Pairs with
+/// [`AST_INDEXES_DDL`] for bulk-load callers (see bead
+/// `ley-line-open-9ccbc7`).
+pub const AST_TABLE_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS _ast (
+    node_id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    node_kind TEXT NOT NULL,
+    start_byte INTEGER NOT NULL,
+    end_byte INTEGER NOT NULL,
+    start_row INTEGER NOT NULL,
+    start_col INTEGER NOT NULL,
+    end_row INTEGER NOT NULL,
+    end_col INTEGER NOT NULL
+);";
+
+/// DDL for the `_ast` indexes — deferred post-COMMIT for bulk-load.
+pub const AST_INDEXES_DDL: &str = "CREATE INDEX IF NOT EXISTS idx_ast_source ON _ast(source_id);";
+
+/// Combined `_ast` table + index DDL. Preserves the pre-split contract.
 pub const AST_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS _ast (
     node_id TEXT PRIMARY KEY,
@@ -37,11 +59,32 @@ CREATE TABLE IF NOT EXISTS _ast (
 );
 CREATE INDEX IF NOT EXISTS idx_ast_source ON _ast(source_id);";
 
-/// Create `nodes`, `_source`, and `_ast` tables (idempotent).
+/// Create `nodes`, `_source`, and `_ast` tables + indexes (idempotent).
+///
+/// For bulk-load callers (e.g. `cmd_parse`), prefer the split
+/// [`create_ast_tables`] + [`create_ast_indexes`] pair so the indexes
+/// can be deferred until after `COMMIT`.
 pub fn create_ast_schema(conn: &Connection) -> Result<()> {
     create_schema(conn)?;
     conn.execute_batch(SOURCE_DDL)?;
     conn.execute_batch(AST_DDL)?;
+    Ok(())
+}
+
+/// Create `nodes`, `_source`, `_ast` tables only — no indexes. Pair
+/// with [`create_ast_indexes`] post-`COMMIT` for bulk-load paths.
+pub fn create_ast_tables(conn: &Connection) -> Result<()> {
+    create_nodes_table(conn)?;
+    conn.execute_batch(SOURCE_DDL)?;
+    conn.execute_batch(AST_TABLE_DDL)?;
+    Ok(())
+}
+
+/// Create `nodes` + `_ast` indexes (idempotent). `_source` has no
+/// secondary indexes — its PRIMARY KEY suffices.
+pub fn create_ast_indexes(conn: &Connection) -> Result<()> {
+    create_nodes_indexes(conn)?;
+    conn.execute_batch(AST_INDEXES_DDL)?;
     Ok(())
 }
 
@@ -94,7 +137,20 @@ pub fn insert_ast(
 // Refs / Defs / Imports tables
 // ---------------------------------------------------------------------------
 
-/// DDL for the `node_refs` table — stores identifier references.
+/// DDL for the `node_refs` table — table only, no indexes.
+pub const REFS_TABLE_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS node_refs (
+    token TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    source_id TEXT NOT NULL
+);";
+
+/// DDL for the `node_refs` indexes — deferred post-COMMIT.
+pub const REFS_INDEXES_DDL: &str = "\
+CREATE INDEX IF NOT EXISTS idx_refs_token ON node_refs(token);
+CREATE INDEX IF NOT EXISTS idx_refs_node ON node_refs(node_id);";
+
+/// Combined `node_refs` table + index DDL.
 pub const REFS_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS node_refs (
     token TEXT NOT NULL,
@@ -104,7 +160,18 @@ CREATE TABLE IF NOT EXISTS node_refs (
 CREATE INDEX IF NOT EXISTS idx_refs_token ON node_refs(token);
 CREATE INDEX IF NOT EXISTS idx_refs_node ON node_refs(node_id);";
 
-/// DDL for the `node_defs` table — stores identifier definitions.
+/// DDL for the `node_defs` table — table only, no indexes.
+pub const DEFS_TABLE_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS node_defs (
+    token TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    source_id TEXT NOT NULL
+);";
+
+/// DDL for the `node_defs` indexes — deferred post-COMMIT.
+pub const DEFS_INDEXES_DDL: &str = "CREATE INDEX IF NOT EXISTS idx_defs_token ON node_defs(token);";
+
+/// Combined `node_defs` table + index DDL.
 pub const DEFS_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS node_defs (
     token TEXT NOT NULL,
@@ -113,7 +180,19 @@ CREATE TABLE IF NOT EXISTS node_defs (
 );
 CREATE INDEX IF NOT EXISTS idx_defs_token ON node_defs(token);";
 
-/// DDL for the `_imports` table — stores import/require mappings.
+/// DDL for the `_imports` table — table only, no indexes.
+pub const IMPORTS_TABLE_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS _imports (
+    alias TEXT NOT NULL,
+    path TEXT NOT NULL,
+    source_id TEXT NOT NULL
+);";
+
+/// DDL for the `_imports` indexes — deferred post-COMMIT.
+pub const IMPORTS_INDEXES_DDL: &str =
+    "CREATE INDEX IF NOT EXISTS idx_imports_source ON _imports(source_id);";
+
+/// Combined `_imports` table + index DDL.
 pub const IMPORTS_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS _imports (
     alias TEXT NOT NULL,
@@ -122,11 +201,35 @@ CREATE TABLE IF NOT EXISTS _imports (
 );
 CREATE INDEX IF NOT EXISTS idx_imports_source ON _imports(source_id);";
 
-/// Create `node_refs`, `node_defs`, and `_imports` tables (idempotent).
+/// Create `node_refs`, `node_defs`, and `_imports` tables + indexes
+/// (idempotent).
+///
+/// For bulk-load callers (e.g. `cmd_parse`), prefer
+/// [`create_refs_tables`] + [`create_refs_indexes`] so the indexes can
+/// be deferred until after `COMMIT`.
 pub fn create_refs_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(REFS_DDL)?;
     conn.execute_batch(DEFS_DDL)?;
     conn.execute_batch(IMPORTS_DDL)?;
+    Ok(())
+}
+
+/// Create `node_refs`, `node_defs`, `_imports` tables only — no
+/// indexes. Pair with [`create_refs_indexes`] post-`COMMIT` for
+/// bulk-load paths.
+pub fn create_refs_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(REFS_TABLE_DDL)?;
+    conn.execute_batch(DEFS_TABLE_DDL)?;
+    conn.execute_batch(IMPORTS_TABLE_DDL)?;
+    Ok(())
+}
+
+/// Create indexes for `node_refs`, `node_defs`, and `_imports`
+/// (idempotent).
+pub fn create_refs_indexes(conn: &Connection) -> Result<()> {
+    conn.execute_batch(REFS_INDEXES_DDL)?;
+    conn.execute_batch(DEFS_INDEXES_DDL)?;
+    conn.execute_batch(IMPORTS_INDEXES_DDL)?;
     Ok(())
 }
 
@@ -176,10 +279,45 @@ CREATE TABLE IF NOT EXISTS _meta (
     value TEXT NOT NULL
 );";
 
-/// Create `_file_index` and `_meta` tables (idempotent).
+/// Create `_file_index` and `_meta` tables (idempotent). Neither table
+/// has secondary indexes — PRIMARY KEY suffices for both.
 pub fn create_index_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(FILE_INDEX_DDL)?;
     conn.execute_batch(META_DDL)?;
+    Ok(())
+}
+
+/// Create every secondary index across `nodes`, `_ast`, `node_refs`,
+/// `node_defs`, and `_imports`. Idempotent (`IF NOT EXISTS`), so it's
+/// safe to call on an already-indexed connection (used by `cmd_parse`
+/// after `COMMIT` to defer index maintenance out of the bulk-insert
+/// hot path — see bead `ley-line-open-9ccbc7`).
+pub fn create_post_load_indexes(conn: &Connection) -> Result<()> {
+    create_ast_indexes(conn)?;
+    create_refs_indexes(conn)?;
+    Ok(())
+}
+
+/// Variant of [`create_post_load_indexes`] that omits `idx_source_file`.
+/// Ley-line's `cmd_parse` never populates the `nodes.source_file`
+/// column (that's mache's lazy-resolution flow), so the partial index
+/// `WHERE source_file IS NOT NULL` materializes to zero rows yet still
+/// pays a 535K-row scan on the mache 765-file bench (~45 ms) to
+/// evaluate the predicate against every row. Skipping here is safe
+/// because:
+///   - mache builds its own schema with the indexes mache needs
+///     (via mache's own DDL, not via `create_post_load_indexes_*`).
+///   - Any ley-line code path that needs `idx_source_file` will
+///     trigger its creation via `create_nodes_indexes` (still
+///     idempotent), so semantics are preserved.
+///
+/// See bead `ley-line-open-cbbedf` Attack 3.
+pub fn create_post_load_indexes_skip_unused(conn: &Connection) -> Result<()> {
+    // Just `idx_parent_name` from the nodes-indexes pair — the second
+    // (`idx_source_file`) is the unused one we're skipping.
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_parent_name ON nodes(parent_id, name);")?;
+    conn.execute_batch(AST_INDEXES_DDL)?;
+    create_refs_indexes(conn)?;
     Ok(())
 }
 

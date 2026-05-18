@@ -19,7 +19,7 @@ leyline-schema = { path = "../../ll-core/schema" }
 leyline-schema-capnp = { path = "../../ll-core/schema-capnp" }
 leyline-public-schema = { path = "../../ll-core/public-schema" }
 leyline-core = { path = "../../ll-core/core" }
-capnp = "=0.25.4"  # ADR-0014 §3 — exact-pin (see schema-capnp/Cargo.toml)
+capnp = "=0.25.0"  # ADR-0014 §3 — exact-pin (see schema-capnp/Cargo.toml)
 capnp-json = "=0.1.0"  # daemon wire codec (see daemon/wire.rs and ADR-0014 interim status)
 blake3 = "1"
 leyline-fs = { path = "../fs", default-features = false }

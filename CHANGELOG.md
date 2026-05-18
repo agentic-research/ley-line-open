@@ -10,7 +10,71 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
-Nothing yet — post-v0.4.2 changes land here.
+Nothing yet — post-v0.4.3 changes land here.
+
+## [0.4.3] — 2026-05-18
+
+Patch release shipping the daemon UDS event-push fix and a workspace
+dep audit centered on `rusqlite 0.34 → 0.39` (Witchcraft unblock).
+
+**For consumers** (mache, cloister, future LLO clients): the daemon
+now actually forwards live pushed events to UDS subscribers. Pre-v0.4.3
+daemons returned `sheaf_invalidate` cascades in the op response but
+silently dropped the matching `sheaf.invalidate` event on the wire —
+subscribers only ever observed the replay batch appended to the
+subscribe response, which masked the bug. Mache's PR #384 e2e
+(`TestE2E_SheafSubscriber_AgainstLiveDaemon`) flips RED→GREEN against
+a v0.4.3 binary with no mache-side code change.
+
+### Fixed — sheaf.invalidate event push over UDS (ley-line-open-5caa59)
+
+- `rs/ll-open/cli-lib/src/daemon/socket.rs` — `handle_connection` was
+  a pure request/response loop that never drained
+  `ConnectionState.event_rx`. Live events emitted onto the bus after
+  subscribe were `try_send`'d into the per-subscriber `mpsc::Sender`
+  and accumulated with no consumer. The bug was masked by the
+  EventLog replay batch appended to the subscribe response.
+- Fix: per-connection writer task (sole owner of `OwnedWriteHalf`,
+  drains a bounded `mpsc<String>` so op responses and events serialise
+  without interleaving) plus a per-subscribe event-relay task
+  (forwards events from `event_rx` as JSON lines through the writer
+  channel). Resubscribe replaces the relay cleanly via the existing
+  `remove_subscriber` → `Subscriber.tx`-drop → `recv() = None` chain.
+- Regression guard:
+  `rs/ll-open/cli-lib/tests/event_push_blackbox_test.rs` — four
+  black-box tests over real UDS sockets pinning the core push path,
+  emit ordering, resubscribe replacement, and the bead's exact
+  `sheaf.invalidate` reproduction. All subscribe BEFORE any emit so
+  none rely on replay.
+- Verified end-to-end against mache's
+  `tools/sheaf-subscribe-probe/main.go`: `sheaf.invalidate event
+  received in 19.083µs`.
+
+### Changed — workspace dep audit (Witchcraft unblock)
+
+- `rusqlite 0.34 → 0.39` across 8 workspace `Cargo.toml`s. Migration:
+  `DatabaseName::Main` → `"main"` (new `Name` trait with blanket
+  `&str` impl); `usize`/`u64` SQLite binds and reads cast through
+  `i64` (the `ToSql`/`FromSql` blanket impls were dropped). Unblocks
+  the optional Witchcraft retrieval feature, which pins `rusqlite
+  ^0.39` (`libsqlite3-sys`'s `links = "sqlite3"` allows exactly one
+  version per dep graph).
+- `dirs 5 → 6` · `which 7 → 8` · `criterion 0.5 → 0.8` (dev) ·
+  `lsp-types 0.95 → 0.97` (`Url` → `Uri` newtype around
+  `fluent_uri::Uri<String>`). Picked up via `cargo update` (wildcard
+  pins): `tokio 1.50 → 1.52` · `clap 4.6.0 → 4.6.1` · `libc 0.2.183
+  → 0.2.186` · `sqlite-vec 0.1.7 → 0.1.9` · `tree-sitter 0.26.7 →
+  0.26.8`. `capnp =0.25.0` deliberately stays at the ADR-0014 §3
+  toolchain triplet — bumping requires the F8.6.4 cross-runtime
+  fixture regen, deferred to a dedicated PR.
+
+### Deferred to follow-up PRs
+
+`thiserror 1 → 2`, `nalgebra 0.32 → 0.34` (coupled to sheaf math),
+`sha2 0.10 → 0.11`, `der`/`spki`/`const-oid` (signing pipeline),
+`jj-lib 0.38 → 0.41`, `fuser 0.15 → 0.17`, `nfsserve 0.10 → 0.11`,
+`uv-* 0.0.29 → 0.0.47`, `toml 0.8 → 1.0` — each warrants its own
+migration + test review.
 
 ## [0.4.2] — 2026-05-17
 

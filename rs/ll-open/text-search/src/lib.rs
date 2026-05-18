@@ -36,9 +36,22 @@ pub mod null;
 pub mod witchcraft;
 
 /// One search hit. `node_id` is the caller-supplied identifier passed to
-/// [`TextSearchEngine::upsert`]; `score` is engine-defined — Witchcraft
-/// returns late-interaction similarity (higher is better), the NullEngine
-/// never returns hits at all.
+/// [`TextSearchEngine::upsert`].
+///
+/// **`score` is engine-defined and NOT normalized across engines.** The
+/// only contract is "higher is better within the same engine instance."
+/// Witchcraft returns late-interaction similarity (mixed with BM25 via
+/// RRF in hybrid mode); a future FTS5 backend would return BM25 raw
+/// scores; a future single-vector backend would return cosine in
+/// `[-1, 1]`. Consumers MUST treat **rank order** as the load-bearing
+/// signal — score-threshold filters tuned against today's Witchcraft
+/// hybrid will produce wildly different recall under a swapped backend.
+/// If a backend swap is in your future, gate on rank (e.g. top-k cutoff),
+/// not the raw score value.
+///
+/// The daemon wire surface (`op_text_search` response) exposes the raw
+/// score so consumers can sort or weight; the same caveat applies across
+/// the wire.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
     pub node_id: String,
@@ -92,7 +105,11 @@ pub trait TextSearchEngine: Send + Sync {
     /// freshly-created database.
     fn search(&self, query: &str, k: usize) -> Result<Vec<Hit>>;
 
-    /// Number of distinct `node_id`s currently in the index.
+    /// Number of distinct `node_id`s currently in the index. Must be
+    /// exact (no overcount on replace, no decrement on remove-of-absent)
+    /// — callers gate on `len() == 0` to decide whether to skip a
+    /// reindex pass, and on `len() > N` for batch-size policy, so a
+    /// best-effort counter can break either decision silently.
     fn len(&self) -> Result<usize>;
 
     /// `true` iff `len() == 0`.
@@ -103,8 +120,16 @@ pub trait TextSearchEngine: Send + Sync {
     /// Drop every upserted document and reset internal state.
     fn clear(&self) -> Result<()>;
 
-    /// Path on disk where the engine's storage lives, if any. The
-    /// substrate-non-leak gate uses this to assert the engine's storage
-    /// is outside the arena directory.
+    /// Path on disk where the engine's storage lives, if any.
+    ///
+    /// **Contract**: if the engine writes any state to disk, this MUST
+    /// return `Some(path)` pointing at that location. The
+    /// substrate-non-leak gate in `tests/substrate_non_leak.rs` asserts
+    /// that path lies outside the arena directory; an engine that
+    /// returns `None` despite having on-disk storage silently bypasses
+    /// the gate, and a future audit can no longer prove the substrate
+    /// invariant for that engine. Only engines that are fully in-memory
+    /// (or that delegate persistence to a caller-owned handle) may
+    /// return `None`.
     fn storage_path(&self) -> Option<&Path>;
 }

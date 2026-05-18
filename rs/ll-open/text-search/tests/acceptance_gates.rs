@@ -18,8 +18,32 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 /// NDCG@10 threshold the engine must clear on the labeled corpus to ship.
-/// Wired into the gated assertion below; bumped per the falsifiable plan
-/// once a real engine reports numbers.
+///
+/// **Provenance**: 0.40 is a placeholder, NOT a measured number against
+/// this corpus. Witchcraft's own README reports 0.31–0.33 NDCG@10 on
+/// NFCorpus (~3.6k queries, label-rich); the corpus below is a
+/// hand-picked 10-query seed against ley-line-open's own documentation
+/// where each query's labels were authored at the same time the query
+/// was, so a well-tuned engine should score considerably higher than
+/// the NFCorpus number — but the precise number is unknown until a real
+/// run is staged.
+///
+/// **Bump protocol** (do NOT raise this constant without doing all three):
+///   1. Stage `WITCHCRAFT_ASSETS_DIR` + run `cargo test -p
+///      leyline-text-search --features engine-witchcraft -- --nocapture
+///      ndcg_at_10_meets_baseline` and record the printed
+///      `NDCG@10 = X.YYY` line.
+///   2. Expand the corpus to ≥30 queries spanning ADRs, modules, and
+///      READMEs so the score is statistically meaningful — at 10 queries
+///      one swap moves the mean by 10%.
+///   3. Tighten the constant to roughly 80% of the measured number so a
+///      flicker on retraining doesn't trip the gate on a no-op change.
+///      Add an inline `// Measured: X.YYY on N queries, YYYY-MM-DD`
+///      comment next to the constant.
+///
+/// **Skipping the gate** (CI without assets) is structural: the test
+/// body checks for `WITCHCRAFT_ASSETS_DIR` and emits a `skipping ...`
+/// line; the constant exists so the gate compiles in either branch.
 #[allow(dead_code)]
 const NDCG_BASELINE: f32 = 0.40;
 

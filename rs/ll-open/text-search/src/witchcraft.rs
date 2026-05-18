@@ -43,6 +43,40 @@ const NODE_ID_NS: Uuid = Uuid::from_bytes([
 /// to 0 silently.
 const QUERY_CACHE_CAP: usize = 1024;
 
+/// Total distinct documents in the witchcraft `document` table.
+/// Issued via the DB's own connection (no parallel rusqlite open),
+/// so the count reads the same byte-state writes are landing in.
+fn count_documents(db: &DB) -> Result<usize> {
+    let mut stmt = db
+        .query("SELECT COUNT(*) FROM document")
+        .map_err(|e| anyhow::anyhow!("witchcraft count_documents prepare: {e}"))?;
+    // rusqlite 0.39 dropped `FromSql for u64`; read via `i64` then cast.
+    // `COUNT(*)` is non-negative so the cast is total.
+    let count: i64 = stmt
+        .query_row([], |row| row.get(0))
+        .map_err(|e| anyhow::anyhow!("witchcraft count_documents query: {e}"))?;
+    Ok(count.max(0) as usize)
+}
+
+/// Probe whether a given uuid is already in the `document` table.
+/// One indexed point-lookup; cheap relative to the embedding work
+/// `add_doc` triggers, so paying it on every upsert keeps `len()`
+/// exact across replace-by-id without changing the trait contract.
+///
+/// Uses `COUNT(*)` rather than `SELECT 1 ... LIMIT 1` so the result
+/// is always exactly one row (`0` or `1`) — no `OptionalExtension`
+/// needed on the rusqlite side, and the crate stays off our direct
+/// dep list (witchcraft pulls it transitively).
+fn document_contains(db: &DB, uuid: &Uuid) -> Result<bool> {
+    let mut stmt = db
+        .query("SELECT COUNT(*) FROM document WHERE uuid = ?1")
+        .map_err(|e| anyhow::anyhow!("witchcraft document_contains prepare: {e}"))?;
+    let count: i64 = stmt
+        .query_row([uuid.to_string()], |row| row.get(0))
+        .map_err(|e| anyhow::anyhow!("witchcraft document_contains query: {e}"))?;
+    Ok(count > 0)
+}
+
 struct Inner {
     db: DB,
     embedder: Embedder,
@@ -51,11 +85,12 @@ struct Inner {
     /// no-op rebuild when callers `finalize()` defensively after
     /// every batch.
     dirty: bool,
-    /// Mirrored count of distinct `node_id`s present in the DB.
-    /// Witchcraft's `DB` doesn't expose a count accessor, and we
-    /// avoid pulling rusqlite as a direct dep just to issue
-    /// `SELECT COUNT(*)`; tracking here in the engine is the
-    /// minimal-coupling alternative.
+    /// Cached count of distinct `node_id`s present in the `document`
+    /// table. Seeded at `open()` from `SELECT COUNT(*)` and kept in
+    /// sync by probing `document_contains` before each
+    /// upsert/remove so it stays exact across replace-by-id and
+    /// remove-of-absent. Avoids a `SELECT COUNT(*)` per `len()` call
+    /// (which would otherwise dominate the call's cost).
     count: usize,
 }
 
@@ -87,6 +122,12 @@ impl WitchcraftEngine {
         })?;
         let db = DB::new(db_path.clone())
             .map_err(|e| anyhow::anyhow!("witchcraft DB::new({}): {e}", db_path.display()))?;
+        // Seed the count cache from the existing table. A daemon
+        // restart opens against the same SQLite file; without this
+        // load, `len()` reports zero until the first upsert lands —
+        // which silently breaks any consumer that gates on it
+        // (e.g. "skip reindex if non-empty").
+        let count = count_documents(&db)?;
         let cache = EmbeddingsCache::new(QUERY_CACHE_CAP);
         Ok(Self {
             inner: Mutex::new(Inner {
@@ -94,7 +135,7 @@ impl WitchcraftEngine {
                 embedder,
                 cache,
                 dirty: false,
-                count: 0,
+                count,
             }),
             path: db_path,
         })
@@ -119,19 +160,13 @@ impl TextSearchEngine for WitchcraftEngine {
             .inner
             .lock()
             .map_err(|_| anyhow::anyhow!("witchcraft engine mutex poisoned"))?;
-        // `add_doc` does INSERT OR REPLACE-by-uuid, so repeated upserts
-        // of the same node_id correctly overwrite. We can't tell from
-        // its return whether it was insert vs replace, so count
-        // increments are best-effort — a future refactor that reads
-        // the row count from sqlite directly would tighten this up.
-        let was_present = inner.count > 0 && {
-            // Heuristic: we don't query the DB before insert (would
-            // double the per-upsert cost). Track upserts/removes as
-            // events; clear() resets to zero. The trait docstring
-            // for `len()` describes this as the count of distinct
-            // node_ids upserted, which matches the bookkeeping here.
-            false
-        };
+        // `add_doc` is INSERT OR REPLACE on the uuid PK, so repeated
+        // upserts of the same node_id correctly overwrite the row. To
+        // keep `len()` exact across replace-by-id we probe first and
+        // only increment when the row is genuinely new. One indexed
+        // point-lookup per upsert; cheap relative to the embedding
+        // work `add_doc` already triggers.
+        let was_present = document_contains(&inner.db, &uuid)?;
         inner
             .db
             .add_doc(&uuid, None, &metadata, content, None)
@@ -149,13 +184,19 @@ impl TextSearchEngine for WitchcraftEngine {
             .inner
             .lock()
             .map_err(|_| anyhow::anyhow!("witchcraft engine mutex poisoned"))?;
+        // Probe so we decrement only when there was an actual row to
+        // remove. Pre-fix `saturating_sub(1)` silently hid bugs where
+        // a caller emit'd a stray remove against a never-upserted id —
+        // the floor masked the underflow but `len()` would diverge
+        // from reality on the next `upsert`-then-remove cycle.
+        let was_present = document_contains(&inner.db, &uuid)?;
         inner
             .db
             .remove_doc(&uuid)
             .map_err(|e| anyhow::anyhow!("witchcraft remove_doc({node_id}): {e}"))?;
-        // Saturating_sub: a remove for an unknown id leaves count
-        // unchanged at floor 0 rather than wrapping.
-        inner.count = inner.count.saturating_sub(1);
+        if was_present {
+            inner.count -= 1;
+        }
         // Don't bump `dirty`: index_chunks is over chunks, and an
         // orphan chunk from a deleted doc stays in the index until a
         // full reindex anyway. Witchcraft's `search` filters by current
@@ -164,6 +205,17 @@ impl TextSearchEngine for WitchcraftEngine {
     }
 
     fn finalize(&self) -> Result<()> {
+        // Known constraint, not a TODO: this lock is held across
+        // `embed_chunks` (candle T5 forward pass) + `index_chunks`
+        // (centroid rebuild). Any concurrent `search` on this engine
+        // blocks behind it. Today's idiom is *batch* finalize after a
+        // reindex pass, where blocking is acceptable. If a future
+        // workload needs interleaved write+search at steady state,
+        // the fix is a reader-writer split — move `db` + `cache`
+        // behind `RwLock` and move write-side state behind a separate
+        // `Mutex`. Punting until measured is the right call (premature
+        // R/W split adds non-trivial dispatch complexity for no
+        // observed contention).
         let mut inner = self
             .inner
             .lock()
@@ -306,5 +358,87 @@ mod tests {
         // root); make sure it doesn't panic or alias.
         let empty = WitchcraftEngine::node_uuid("");
         assert_ne!(empty, a1);
+    }
+
+    // ── Count-contract tests ─────────────────────────────────────────
+    //
+    // These exercise `count_documents` / `document_contains` against a
+    // bare `witchcraft::DB` so they run in every CI invocation — no T5
+    // assets needed. The full `WitchcraftEngine` lifecycle requires an
+    // `Embedder` (assets-gated, only runs when `WITCHCRAFT_ASSETS_DIR`
+    // is staged); these tests cover the count bookkeeping that drives
+    // the `TextSearchEngine::len()` contract without that dependency.
+
+    /// `count_documents` against a freshly-created DB returns 0. Pins
+    /// the "empty DB doesn't mis-seed" invariant — pre-fix the engine
+    /// would also report 0 here, but for the wrong reason (no DB read).
+    #[test]
+    fn count_documents_on_empty_db_returns_zero() {
+        let tmp = TempDir::new().unwrap();
+        let db = witchcraft::DB::new(tmp.path().join("empty.db")).expect("DB::new");
+        let count = count_documents(&db).expect("count_documents");
+        assert_eq!(count, 0);
+    }
+
+    /// `count_documents` after add_doc returns the actual row count.
+    /// Pins the `open()`-seed contract: opening an engine against a
+    /// populated DB must reflect the existing row count, not 0.
+    #[test]
+    fn count_documents_reflects_actual_rows() {
+        let tmp = TempDir::new().unwrap();
+        let mut db = witchcraft::DB::new(tmp.path().join("seeded.db")).expect("DB::new");
+        let uuid_a = WitchcraftEngine::node_uuid("a");
+        let uuid_b = WitchcraftEngine::node_uuid("b");
+        db.add_doc(&uuid_a, None, "{}", "body a", None)
+            .expect("add_doc a");
+        db.add_doc(&uuid_b, None, "{}", "body b", None)
+            .expect("add_doc b");
+        assert_eq!(count_documents(&db).expect("count"), 2);
+
+        // INSERT-OR-REPLACE on the same uuid must not inflate the count.
+        // This is the load-bearing invariant for `upsert` — without the
+        // `document_contains` probe, the engine's mirrored count would
+        // diverge from this answer.
+        db.add_doc(&uuid_a, None, "{}", "body a v2", None)
+            .expect("add_doc replace");
+        assert_eq!(
+            count_documents(&db).expect("count after replace"),
+            2,
+            "INSERT OR REPLACE must keep distinct uuid count steady",
+        );
+    }
+
+    /// `document_contains` matches the actual presence of a uuid.
+    /// Pins the probe used by `upsert`/`remove` so a future refactor
+    /// of the SQL doesn't silently start returning false-negatives
+    /// (which would re-introduce the inflated-count bug).
+    #[test]
+    fn document_contains_matches_actual_presence() {
+        let tmp = TempDir::new().unwrap();
+        let mut db = witchcraft::DB::new(tmp.path().join("probe.db")).expect("DB::new");
+        let uuid = WitchcraftEngine::node_uuid("known");
+        let absent = WitchcraftEngine::node_uuid("absent");
+
+        assert!(
+            !document_contains(&db, &uuid).expect("probe before insert"),
+            "fresh DB must report no presence for any uuid",
+        );
+
+        db.add_doc(&uuid, None, "{}", "body", None)
+            .expect("add_doc");
+        assert!(
+            document_contains(&db, &uuid).expect("probe after insert"),
+            "inserted uuid must surface as present",
+        );
+        assert!(
+            !document_contains(&db, &absent).expect("probe absent"),
+            "an unrelated uuid must NOT surface as present",
+        );
+
+        db.remove_doc(&uuid).expect("remove_doc");
+        assert!(
+            !document_contains(&db, &uuid).expect("probe after remove"),
+            "removed uuid must report not-present",
+        );
     }
 }

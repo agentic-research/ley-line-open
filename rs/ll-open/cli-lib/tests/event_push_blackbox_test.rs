@@ -431,9 +431,9 @@ async fn sheaf_invalidate_event_reaches_uds_subscriber() {
         if topic == "sheaf.invalidate" {
             // Tag the cascade payload so a future shape change is
             // caught here, not in a downstream consumer.
-            let invalidated = v
-                .get("data")
-                .and_then(|d| d.get("invalidated"))
+            let data = v.get("data").expect("event payload missing `data`");
+            let invalidated = data
+                .get("invalidated")
                 .and_then(|i| i.as_array())
                 .map(|a| a.len())
                 .unwrap_or(0);
@@ -442,6 +442,29 @@ async fn sheaf_invalidate_event_reaches_uds_subscriber() {
                 "sheaf.invalidate event carried empty `invalidated` array \
                  — payload regression (compare to ley-line-open-d03e7d)",
             );
+
+            // u64 fields render as JSON *strings* on the wire to match
+            // capnp_json's op-response encoding (JS Number safe-integer
+            // ceiling). A regression that emits these as raw numbers
+            // forces consumers to handle two encodings for the same
+            // field across response + event surfaces.
+            let generation = data
+                .get("generation")
+                .expect("event payload missing `generation`");
+            assert!(
+                generation.is_string(),
+                "sheaf.invalidate `generation` must be a JSON string \
+                 (capnp_json u64 convention); got {generation:?}",
+            );
+            let prior_generation = data
+                .get("prior_generation")
+                .expect("event payload missing `prior_generation`");
+            assert!(
+                prior_generation.is_string(),
+                "sheaf.invalidate `prior_generation` must be a JSON string \
+                 (capnp_json u64 convention); got {prior_generation:?}",
+            );
+
             found_topic = Some(topic.to_string());
             break;
         }

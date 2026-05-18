@@ -50,6 +50,22 @@ a v0.4.3 binary with no mache-side code change.
   `tools/sheaf-subscribe-probe/main.go`: `sheaf.invalidate event
   received in 19.083µs`.
 
+### Fixed — event payload u64 encoding (surfaced during 5caa59 validation)
+
+- Event payloads emitted u64 fields as raw JSON numbers
+  (`"generation": 1`) while the matching capnp op responses emitted
+  them as quoted strings (`"generation": "1"` — capnp_json's
+  convention to dodge JS Number's 2^53 safe-integer ceiling). Consumers
+  reading both surfaces (mache's `SheafSubscriber`, cloister's event
+  consumers) had to handle two encodings for the same field.
+- Fix: stringify u64 fields at the emit site to match capnp_json. Three
+  events touched — `sheaf.invalidate` (`generation`,
+  `prior_generation`), `sheaf.topology` from `sheaf_update_topology`
+  (same), `daemon.reparse.complete` (`parsed`, `deleted`).
+- Pinned in `tests/event_push_blackbox_test.rs::sheaf_invalidate_event_reaches_uds_subscriber`
+  — asserts both u64 fields are `is_string()` on the wire so a future
+  regression to raw numbers fails the gate.
+
 ### Changed — workspace dep audit (Witchcraft unblock)
 
 - `rusqlite 0.34 → 0.39` across 8 workspace `Cargo.toml`s. Migration:

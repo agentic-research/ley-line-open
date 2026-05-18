@@ -190,7 +190,7 @@ pub fn project_lsp(
 ) -> Result<Vec<u8>> {
     let conn = Connection::open_in_memory()?;
     project_lsp_into(symbols, diagnostics, source_uri, &conn)?;
-    let data = conn.serialize(rusqlite::DatabaseName::Main)?;
+    let data = conn.serialize("main")?;
     Ok(data.to_vec())
 }
 
@@ -1160,8 +1160,10 @@ fn merge_symbol(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Position, Range, SymbolKind, Url};
-    use rusqlite::DatabaseName;
+    use std::str::FromStr;
+
+    use crate::protocol::{Position, Range, SymbolKind, Uri};
+
     use std::io::Cursor;
 
     #[test]
@@ -1253,7 +1255,7 @@ mod tests {
 
     fn make_location(uri: &str, line: u32, col: u32) -> Location {
         Location {
-            uri: Url::parse(uri).unwrap(),
+            uri: Uri::from_str(uri).unwrap(),
             range: Range {
                 start: Position {
                     line,
@@ -1291,7 +1293,7 @@ mod tests {
         assert!(!bytes.is_empty());
 
         let mut conn = Connection::open_in_memory().unwrap();
-        conn.deserialize_read_exact(DatabaseName::Main, Cursor::new(&bytes), bytes.len(), true)
+        conn.deserialize_read_exact("main", Cursor::new(&bytes), bytes.len(), true)
             .unwrap();
 
         // Check symbol hierarchy
@@ -1346,7 +1348,7 @@ mod tests {
 
         let bytes = project_lsp(&symbols, &[], "test.py").unwrap();
         let mut conn = Connection::open_in_memory().unwrap();
-        conn.deserialize_read_exact(DatabaseName::Main, Cursor::new(&bytes), bytes.len(), true)
+        conn.deserialize_read_exact("main", Cursor::new(&bytes), bytes.len(), true)
             .unwrap();
 
         let (kind, start, end): (String, i64, i64) = conn

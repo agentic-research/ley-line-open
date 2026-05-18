@@ -9,7 +9,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use leyline_core::{ArenaHeader, Controller};
 use memmap2::Mmap;
-use rusqlite::{Connection, DatabaseName};
+use rusqlite::Connection;
 
 /// Open the arena's active buffer as a read-only in-memory SQLite connection.
 ///
@@ -48,7 +48,7 @@ fn open_arena_db(arena_path: &Path, control_path: Option<&Path>) -> Result<Conne
     let buf = &mmap[offset as usize..(offset + buf_size) as usize];
 
     let mut conn = Connection::open_in_memory()?;
-    conn.deserialize_read_exact(DatabaseName::Main, Cursor::new(buf), buf.len(), true)
+    conn.deserialize_read_exact("main", Cursor::new(buf), buf.len(), true)
         .context("sqlite3_deserialize failed")?;
 
     Ok(conn)

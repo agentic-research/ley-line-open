@@ -108,10 +108,12 @@ fn build_corpus(target: &Path, copies: usize) -> std::io::Result<PathBuf> {
 /// node-emission strategy evolves (e.g. if we ever start storing
 /// additional per-token rows).
 fn count_rows(db_path: &Path) -> rusqlite::Result<u64> {
+    // rusqlite 0.39 dropped `FromSql for u64`; read via `i64` then cast.
+    // `COUNT(*)` is non-negative so the cast is total.
     let conn = rusqlite::Connection::open(db_path)?;
-    let nodes: u64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
-    let ast: u64 = conn.query_row("SELECT COUNT(*) FROM _ast", [], |r| r.get(0))?;
-    Ok(nodes + ast)
+    let nodes: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
+    let ast: i64 = conn.query_row("SELECT COUNT(*) FROM _ast", [], |r| r.get(0))?;
+    Ok((nodes + ast) as u64)
 }
 
 #[tokio::test]

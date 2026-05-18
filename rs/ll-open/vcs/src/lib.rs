@@ -1308,7 +1308,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     /// Create a writable SqliteGraphAdapter with an empty schema.
     fn writable_graph() -> SqliteGraphAdapter {
-        use rusqlite::{Connection, DatabaseName};
+        use rusqlite::Connection;
         let source = Connection::open_in_memory().unwrap();
         source
             .execute_batch(
@@ -1324,7 +1324,7 @@ mod tests {
                 CREATE INDEX idx_parent_name ON nodes(parent_id, name);",
             )
             .unwrap();
-        let data = source.serialize(DatabaseName::Main).unwrap();
+        let data = source.serialize("main").unwrap();
         SqliteGraphAdapter::new_writable(data.as_ref()).unwrap()
     }
 

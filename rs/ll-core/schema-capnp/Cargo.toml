@@ -10,7 +10,7 @@ description = "Cap'n Proto schemas for Σ event log — typed producer/consumer 
 # messages out from under the cross-runtime fixture suite (F8.6.4).
 # Bumping requires explicit human review + cross-runtime byte-equality
 # check; the friction is intentional. See docs/adr/0014-capnp-as-protocol.md.
-capnp = "=0.25.0"
+capnp = "=0.25.4"
 
 [build-dependencies]
 capnpc = "=0.25.0"

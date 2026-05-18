@@ -41,7 +41,7 @@ fn parse_dep(raw: &str) -> Result<Dep> {
 pub fn project_pyproject(content: &str) -> Result<Vec<u8>> {
     let conn = Connection::open_in_memory()?;
     project_pyproject_into(content, &conn)?;
-    let data = conn.serialize(rusqlite::DatabaseName::Main)?;
+    let data = conn.serialize("main")?;
     Ok(data.to_vec())
 }
 
@@ -201,7 +201,7 @@ use std::str::FromStr;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::DatabaseName;
+
     use std::io::Cursor;
 
     const GEM_PYPROJECT: &str = r#"
@@ -231,7 +231,7 @@ dev = [
     fn project_metadata() {
         let bytes = project_pyproject(GEM_PYPROJECT).unwrap();
         let mut conn = Connection::open_in_memory().unwrap();
-        conn.deserialize_read_exact(DatabaseName::Main, Cursor::new(&bytes), bytes.len(), true)
+        conn.deserialize_read_exact("main", Cursor::new(&bytes), bytes.len(), true)
             .unwrap();
 
         let name: String = conn
@@ -266,7 +266,7 @@ dev = [
     fn dependencies_normalized() {
         let bytes = project_pyproject(GEM_PYPROJECT).unwrap();
         let mut conn = Connection::open_in_memory().unwrap();
-        conn.deserialize_read_exact(DatabaseName::Main, Cursor::new(&bytes), bytes.len(), true)
+        conn.deserialize_read_exact("main", Cursor::new(&bytes), bytes.len(), true)
             .unwrap();
 
         // pyyaml → normalized name
@@ -304,7 +304,7 @@ dev = [
     fn dev_dependencies() {
         let bytes = project_pyproject(GEM_PYPROJECT).unwrap();
         let mut conn = Connection::open_in_memory().unwrap();
-        conn.deserialize_read_exact(DatabaseName::Main, Cursor::new(&bytes), bytes.len(), true)
+        conn.deserialize_read_exact("main", Cursor::new(&bytes), bytes.len(), true)
             .unwrap();
 
         let spec: String = conn
@@ -330,7 +330,7 @@ security = ["cryptography>=3.0", "pyopenssl>=21.0"]
 "#;
         let bytes = project_pyproject(toml).unwrap();
         let mut conn = Connection::open_in_memory().unwrap();
-        conn.deserialize_read_exact(DatabaseName::Main, Cursor::new(&bytes), bytes.len(), true)
+        conn.deserialize_read_exact("main", Cursor::new(&bytes), bytes.len(), true)
             .unwrap();
 
         let count: i64 = conn

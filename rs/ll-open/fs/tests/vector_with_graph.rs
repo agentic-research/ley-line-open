@@ -9,7 +9,7 @@ use anyhow::Result;
 use leyline_fs::SqliteGraph;
 use leyline_fs::graph::{Graph, SqliteGraphAdapter};
 use leyline_schema::create_schema;
-use rusqlite::{Connection, DatabaseName};
+use rusqlite::Connection;
 
 /// Verify `all_file_contents` returns exactly the file nodes with non-empty
 /// content via the optimized single-query path in SqliteGraphAdapter.
@@ -25,7 +25,7 @@ fn all_file_contents_bulk_query() -> Result<()> {
          INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('a/b/e', 'a/b', 'e', 0, 0, 4000, '');
          INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('a/f', 'a', 'f', 0, 11, 5000, 'world hello');",
     )?;
-    let data = source.serialize(DatabaseName::Main)?;
+    let data = source.serialize("main")?;
     let graph = SqliteGraph::from_bytes(data.as_ref())?;
     let adapter = SqliteGraphAdapter::new(graph);
 

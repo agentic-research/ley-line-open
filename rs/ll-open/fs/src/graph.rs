@@ -1159,7 +1159,7 @@ impl Graph for MemoryGraph {
 mod tests {
     use super::*;
     use leyline_schema::create_schema;
-    use rusqlite::{Connection, DatabaseName};
+    use rusqlite::Connection;
 
     #[test]
     fn memory_graph_round_trip() {
@@ -1237,7 +1237,7 @@ mod tests {
             INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('vulns/CVE-2024-0001/source', 'vulns/CVE-2024-0001', 'source', 0, 42, 3000, '{\"severity\":\"critical\"}');",
         )?;
 
-        let data = source.serialize(DatabaseName::Main)?;
+        let data = source.serialize("main")?;
         let graph = SqliteGraph::from_bytes(data.as_ref())?;
         let adapter = SqliteGraphAdapter::new(graph);
 
@@ -1284,7 +1284,7 @@ mod tests {
             "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs', '', 'docs', 1, 0, 1000, NULL);
             INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs/readme', 'docs', 'readme', 0, 5, 2000, 'hello');",
         )?;
-        let data = source.serialize(DatabaseName::Main)?;
+        let data = source.serialize("main")?;
         SqliteGraphAdapter::new_writable(data.as_ref())
     }
 
@@ -1438,7 +1438,7 @@ mod tests {
             "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs', '', 'docs', 1, 0, 1000, NULL);
             INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs/readme', 'docs', 'readme', 0, 5, 2000, 'hello');",
         )?;
-        let db_bytes = source.serialize(DatabaseName::Main)?;
+        let db_bytes = source.serialize("main")?;
 
         // Write db to arena
         let mut mmap = leyline_core::layout::create_arena(&arena_path, arena_size)?;
@@ -1473,7 +1473,7 @@ mod tests {
             INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record, source_file) VALUES ('funcs/Validate/source', 'funcs/Validate', 'source', 0, 18, 3000, 'func Validate(){}', 'validate.go');",
         )?;
 
-        let data = source.serialize(DatabaseName::Main)?;
+        let data = source.serialize("main")?;
         let graph = SqliteGraph::from_bytes(data.as_ref())?;
         let adapter = SqliteGraphAdapter::new(graph);
 
@@ -1507,7 +1507,7 @@ mod tests {
             "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('f', '', 'f', 0, 0, {go_mtime}, NULL);"
         ))?;
 
-        let data = source.serialize(DatabaseName::Main)?;
+        let data = source.serialize("main")?;
         let graph = SqliteGraph::from_bytes(data.as_ref())?;
         let adapter = SqliteGraphAdapter::new(graph);
 
@@ -1554,7 +1554,7 @@ mod tests {
             INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('src', '', 'src', 1, 0, 1000, NULL);
             INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('src/main.go', 'src', 'main.go', 0, 37, 3000, 'package main\n\nfunc main() {\n}\n');",
         )?;
-        let data = source.serialize(DatabaseName::Main)?;
+        let data = source.serialize("main")?;
         let mut adapter = SqliteGraphAdapter::new_writable(data.as_ref())?;
         let go_lang: tree_sitter::Language = tree_sitter_go::LANGUAGE.into();
         adapter.set_default_language(go_lang);

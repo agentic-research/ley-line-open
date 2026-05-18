@@ -4,7 +4,7 @@ version = "0.4.2"
 edition = "2024"
 
 [dependencies]
-capnp = "=0.25.0"  # ADR-0014 §3 — exact-pin (matches schema-capnp, cli-lib, lsp)
+capnp = "=0.25.4"  # ADR-0014 §3 — exact-pin (matches schema-capnp, cli-lib, lsp)
 # Runtime JSON codec for the daemon protocol — annotations in
 # `capnp/daemon.capnp` (`$Json.name(...)`) reference capnp-json's
 # annotation IDs at compile time; runtime `to_json` / `from_json`

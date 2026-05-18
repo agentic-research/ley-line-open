@@ -203,17 +203,16 @@ pub fn reproject_source(conn: &Connection, source_id: &str, new_source: &[u8]) -
 /// Takes raw SQLite bytes (as produced by `parse`/`parse_with_source`),
 /// performs the splice + reproject, and returns new serialized bytes.
 pub fn splice_db_bytes(db_bytes: &[u8], node_id: &str, new_text: &str) -> Result<Vec<u8>> {
-    use rusqlite::DatabaseName;
     use std::io::Cursor;
 
     let mut conn = Connection::open_in_memory()?;
     let cursor = Cursor::new(db_bytes);
-    conn.deserialize_read_exact(DatabaseName::Main, cursor, db_bytes.len(), true)
+    conn.deserialize_read_exact("main", cursor, db_bytes.len(), true)
         .context("failed to deserialize .db bytes")?;
 
     splice_and_reproject(&conn, node_id, new_text)?;
 
-    let data = conn.serialize(DatabaseName::Main)?;
+    let data = conn.serialize("main")?;
     Ok(data.to_vec())
 }
 

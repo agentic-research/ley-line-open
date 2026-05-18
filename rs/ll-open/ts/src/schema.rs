@@ -121,13 +121,24 @@ pub fn insert_ast(
     end_row: usize,
     end_col: usize,
 ) -> Result<()> {
+    // rusqlite 0.39 dropped the blanket `ToSql for usize` — bind through
+    // `i64` instead. Tree-sitter byte/row/col indices fit comfortably in
+    // `i64` (well under 2^63 even for pathological source files), so the
+    // cast is lossless.
     conn.execute(
         "INSERT OR REPLACE INTO _ast (node_id, source_id, node_kind, start_byte, end_byte, \
          start_row, start_col, end_row, end_col) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
-            node_id, source_id, node_kind, start_byte, end_byte, start_row, start_col, end_row,
-            end_col
+            node_id,
+            source_id,
+            node_kind,
+            start_byte as i64,
+            end_byte as i64,
+            start_row as i64,
+            start_col as i64,
+            end_row as i64,
+            end_col as i64,
         ],
     )?;
     Ok(())

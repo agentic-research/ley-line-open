@@ -19,11 +19,11 @@ leyline-schema = { path = "../../ll-core/schema" }
 leyline-schema-capnp = { path = "../../ll-core/schema-capnp" }
 leyline-public-schema = { path = "../../ll-core/public-schema" }
 leyline-core = { path = "../../ll-core/core" }
-capnp = "=0.25.0"  # ADR-0014 §3 — exact-pin (see schema-capnp/Cargo.toml)
+capnp = "=0.25.4"  # ADR-0014 §3 — exact-pin (see schema-capnp/Cargo.toml)
 capnp-json = "=0.1.0"  # daemon wire codec (see daemon/wire.rs and ADR-0014 interim status)
 blake3 = "1"
 leyline-fs = { path = "../fs", default-features = false }
-rusqlite = { version = "0.34", features = ["bundled", "serialize"] }
+rusqlite = { version = "0.39", features = ["bundled", "serialize"] }
 sqlite-vec = { version = "0.1", optional = true }
 tree-sitter = "0.26"
 clap = { version = "4", features = ["derive"] }
@@ -36,15 +36,15 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 base64 = "0.22"
-dirs = "5"
-which = "7"
+dirs = "6"
+which = "8"
 rayon = "1"
 tempfile = "3"
 
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
-rusqlite = { version = "0.34", features = ["bundled", "serialize"] }
+rusqlite = { version = "0.39", features = ["bundled", "serialize"] }
 leyline-core = { path = "../../ll-core/core" }
 bytemuck = { version = "1.14", features = ["derive"] }
 

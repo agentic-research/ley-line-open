@@ -428,7 +428,6 @@ async fn test_load_into_arena() {
 fn test_inspect_node_lookup() {
     use leyline_core::{ArenaHeader, create_arena, write_to_arena};
     use leyline_schema::create_schema;
-    use rusqlite::DatabaseName;
 
     let out_dir = TempDir::new().expect("create output dir");
 
@@ -448,9 +447,7 @@ fn test_inspect_node_lookup() {
         )
         .expect("insert file node");
 
-    let serialized = source_conn
-        .serialize(DatabaseName::Main)
-        .expect("serialize db");
+    let serialized = source_conn.serialize("main").expect("serialize db");
     let db_bytes = serialized.to_vec();
     drop(source_conn);
 
@@ -950,7 +947,7 @@ fn test_warm_start_crash_recovery() {
     let mut recovered = rusqlite::Connection::open_in_memory().unwrap();
     recovered
         .deserialize_read_exact(
-            rusqlite::DatabaseName::Main,
+            "main",
             std::io::Cursor::new(buf),
             buf.len(),
             false, // writable
@@ -1056,12 +1053,7 @@ fn test_warm_start_empty_arena_falls_through() {
 
     // All zeros — deserialize should fail or produce empty db.
     let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-    let result = conn.deserialize_read_exact(
-        rusqlite::DatabaseName::Main,
-        std::io::Cursor::new(buf),
-        buf.len(),
-        false,
-    );
+    let result = conn.deserialize_read_exact("main", std::io::Cursor::new(buf), buf.len(), false);
 
     // sqlite3_deserialize accepts any buffer (even zeros), but querying
     // will fail because it's not a valid SQLite database.
@@ -1148,12 +1140,7 @@ fn test_multiple_snapshot_cycles() {
 
     let mut recovered = rusqlite::Connection::open_in_memory().unwrap();
     recovered
-        .deserialize_read_exact(
-            rusqlite::DatabaseName::Main,
-            std::io::Cursor::new(buf),
-            buf.len(),
-            false,
-        )
+        .deserialize_read_exact("main", std::io::Cursor::new(buf), buf.len(), false)
         .unwrap();
 
     let recovered_nodes: i64 = recovered
@@ -1195,7 +1182,7 @@ fn snapshot_populates_current_root_with_blake3_of_db_bytes() {
 
     // Independently compute the expected root: BLAKE3 of the bytes
     // snapshot_to_arena would serialize.
-    let expected_db_bytes = conn.serialize(rusqlite::DatabaseName::Main).unwrap();
+    let expected_db_bytes = conn.serialize("main").unwrap();
     let expected_root: [u8; 32] = blake3::hash(&expected_db_bytes).into();
 
     // Snapshot.
@@ -1431,7 +1418,7 @@ fn t24_reader_rejects_zero_root_with_data() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
         .unwrap();
-    let db_bytes = conn.serialize(rusqlite::DatabaseName::Main).unwrap();
+    let db_bytes = conn.serialize("main").unwrap();
     write_to_arena(&mut mmap, &db_bytes).unwrap();
 
     let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
@@ -1535,7 +1522,7 @@ fn t23_reader_errors_clearly_on_non_sqlite_buffer() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
         .unwrap();
-    let db_bytes = conn.serialize(rusqlite::DatabaseName::Main).unwrap();
+    let db_bytes = conn.serialize("main").unwrap();
     write_to_arena(&mut mmap, &db_bytes).unwrap();
     drop(mmap);
 

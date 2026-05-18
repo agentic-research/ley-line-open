@@ -555,7 +555,7 @@ fn try_warm_start(ctrl_path: &Path) -> Result<Option<rusqlite::Connection>> {
     // Deserialize as writable :memory: connection.
     let mut conn = rusqlite::Connection::open_in_memory()?;
     conn.deserialize_read_exact(
-        rusqlite::DatabaseName::Main,
+        "main",
         Cursor::new(buf),
         buf.len(),
         false, // writable
@@ -665,9 +665,7 @@ pub fn try_snapshot_or_log(
 ///    operators see it. Silently continuing is the original bug
 ///    described in ley-line-open-609d6a.
 pub fn snapshot_to_arena(conn: &rusqlite::Connection, ctrl_path: &Path) -> Result<()> {
-    let db_bytes = conn
-        .serialize(rusqlite::DatabaseName::Main)
-        .context("serialize living db")?;
+    let db_bytes = conn.serialize("main").context("serialize living db")?;
 
     let mut ctrl =
         leyline_core::Controller::open_or_create(ctrl_path).context("open controller")?;

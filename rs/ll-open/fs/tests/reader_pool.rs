@@ -9,7 +9,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use anyhow::Result;
-use rusqlite::{Connection, DatabaseName};
+use rusqlite::Connection;
 
 use leyline_fs::SqliteGraph;
 use leyline_fs::graph::{Graph, SqliteGraphAdapter};
@@ -26,7 +26,7 @@ fn test_adapter() -> SqliteGraphAdapter {
     let source = Connection::open_in_memory().unwrap();
     create_schema(&source).unwrap();
     source.execute_batch(SEED_DATA).unwrap();
-    let data = source.serialize(DatabaseName::Main).unwrap();
+    let data = source.serialize("main").unwrap();
     SqliteGraphAdapter::new_writable(data.as_ref()).unwrap()
 }
 
@@ -35,7 +35,7 @@ fn test_adapter_with_pool(pool_size: usize) -> SqliteGraphAdapter {
     let source = Connection::open_in_memory().unwrap();
     create_schema(&source).unwrap();
     source.execute_batch(SEED_DATA).unwrap();
-    let data = source.serialize(DatabaseName::Main).unwrap();
+    let data = source.serialize("main").unwrap();
     let graph = SqliteGraph::from_bytes(data.as_ref()).unwrap();
     SqliteGraphAdapter::new_with_pool_size(graph, pool_size)
 }

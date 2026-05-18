@@ -43,7 +43,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use leyline_core::{ArenaHeader, Controller, create_arena, write_to_arena};
-use rusqlite::{Connection, DatabaseName};
+use rusqlite::Connection;
 use tempfile::TempDir;
 
 const ARENA_GROWTH_FACTOR: u64 = 2;
@@ -89,7 +89,7 @@ fn snapshot_baseline(live_db: &Mutex<Connection>, ctrl_path: &Path) -> (Duration
     let guard = live_db.lock().unwrap();
 
     let serialize_start = Instant::now();
-    let db_bytes = guard.serialize(DatabaseName::Main).expect("serialize");
+    let db_bytes = guard.serialize("main").expect("serialize");
     let serialize_dur = serialize_start.elapsed();
 
     let mut ctrl = Controller::open_or_create(ctrl_path).expect("ctrl");
@@ -139,7 +139,7 @@ fn snapshot_shortened(
 
     let serialize_start = Instant::now();
     let db_bytes_owned: Vec<u8> = {
-        let data = guard.serialize(DatabaseName::Main).expect("serialize");
+        let data = guard.serialize("main").expect("serialize");
         data.to_vec()
     };
     let serialize_dur = serialize_start.elapsed();

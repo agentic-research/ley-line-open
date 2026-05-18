@@ -4,7 +4,7 @@
 //! without requiring an NFS mount (no root needed in CI).
 
 use anyhow::Result;
-use rusqlite::{Connection, DatabaseName};
+use rusqlite::Connection;
 
 use leyline_core::{Controller, layout};
 use leyline_fs::graph::{Graph, HotSwapGraph, SqliteGraphAdapter};
@@ -19,7 +19,7 @@ fn seed_db() -> Vec<u8> {
         INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs/readme', 'docs', 'readme', 0, 5, 2000, 'hello');",
     )
     .unwrap();
-    conn.serialize(DatabaseName::Main).unwrap().to_vec()
+    conn.serialize("main").unwrap().to_vec()
 }
 
 #[test]

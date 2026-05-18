@@ -15,7 +15,7 @@ pub mod schema;
 pub mod splice;
 
 use anyhow::Result;
-use rusqlite::{Connection, DatabaseName};
+use rusqlite::Connection;
 
 use crate::languages::TsLanguage;
 use crate::project::{project_ast, project_ast_with_source};
@@ -34,7 +34,7 @@ pub fn parse_with_source(content: &[u8], language: TsLanguage, source_id: &str) 
         source_id,
         language_name,
     )?;
-    let data = conn.serialize(DatabaseName::Main)?;
+    let data = conn.serialize("main")?;
     Ok(data.to_vec())
 }
 
@@ -45,7 +45,7 @@ pub fn parse_with_source(content: &[u8], language: TsLanguage, source_id: &str) 
 pub fn parse(content: &[u8], language: TsLanguage) -> Result<Vec<u8>> {
     let conn = Connection::open_in_memory()?;
     project_ast(content, language.ts_language(), &conn)?;
-    let data = conn.serialize(DatabaseName::Main)?;
+    let data = conn.serialize("main")?;
     Ok(data.to_vec())
 }
 
@@ -127,7 +127,7 @@ mod tests {
         // Verify the bytes are loadable via sqlite3_deserialize
         let mut conn = Connection::open_in_memory().unwrap();
         let cursor = Cursor::new(&bytes);
-        conn.deserialize_read_exact(DatabaseName::Main, cursor, bytes.len(), true)
+        conn.deserialize_read_exact("main", cursor, bytes.len(), true)
             .unwrap();
 
         let count: i64 = conn
@@ -143,7 +143,7 @@ mod tests {
 
         let mut conn = Connection::open_in_memory().unwrap();
         let cursor = Cursor::new(&bytes);
-        conn.deserialize_read_exact(DatabaseName::Main, cursor, bytes.len(), true)
+        conn.deserialize_read_exact("main", cursor, bytes.len(), true)
             .unwrap();
 
         // Verify all expected columns exist by querying them
@@ -177,7 +177,7 @@ mod tests {
 
         let mut conn = Connection::open_in_memory().unwrap();
         let cursor = Cursor::new(&bytes);
-        conn.deserialize_read_exact(DatabaseName::Main, cursor, bytes.len(), true)
+        conn.deserialize_read_exact("main", cursor, bytes.len(), true)
             .unwrap();
 
         // _source table populated
@@ -204,7 +204,7 @@ mod tests {
 
         let mut conn = Connection::open_in_memory().unwrap();
         let cursor = Cursor::new(&bytes);
-        conn.deserialize_read_exact(DatabaseName::Main, cursor, bytes.len(), true)
+        conn.deserialize_read_exact("main", cursor, bytes.len(), true)
             .unwrap();
 
         let count: i64 = conn
@@ -221,7 +221,7 @@ mod tests {
 
         let mut conn = Connection::open_in_memory().unwrap();
         let cursor = Cursor::new(&bytes);
-        conn.deserialize_read_exact(DatabaseName::Main, cursor, bytes.len(), true)
+        conn.deserialize_read_exact("main", cursor, bytes.len(), true)
             .unwrap();
 
         let count: i64 = conn
@@ -238,7 +238,7 @@ mod tests {
 
         let mut conn = Connection::open_in_memory().unwrap();
         let cursor = Cursor::new(&bytes);
-        conn.deserialize_read_exact(DatabaseName::Main, cursor, bytes.len(), true)
+        conn.deserialize_read_exact("main", cursor, bytes.len(), true)
             .unwrap();
 
         let count: i64 = conn
@@ -255,7 +255,7 @@ mod tests {
 
         let mut conn = Connection::open_in_memory().unwrap();
         let cursor = Cursor::new(&bytes);
-        conn.deserialize_read_exact(DatabaseName::Main, cursor, bytes.len(), true)
+        conn.deserialize_read_exact("main", cursor, bytes.len(), true)
             .unwrap();
 
         let count: i64 = conn
@@ -293,7 +293,7 @@ if __name__ == "__main__":
 
         let mut conn = Connection::open_in_memory().unwrap();
         let cursor = Cursor::new(&bytes);
-        conn.deserialize_read_exact(DatabaseName::Main, cursor, bytes.len(), true)
+        conn.deserialize_read_exact("main", cursor, bytes.len(), true)
             .unwrap();
 
         let count: i64 = conn
@@ -317,7 +317,7 @@ end
 
         let mut conn = Connection::open_in_memory().unwrap();
         let cursor = Cursor::new(&bytes);
-        conn.deserialize_read_exact(DatabaseName::Main, cursor, bytes.len(), true)
+        conn.deserialize_read_exact("main", cursor, bytes.len(), true)
             .unwrap();
 
         let count: i64 = conn
@@ -334,7 +334,7 @@ end
 
         let mut conn = Connection::open_in_memory().unwrap();
         let cursor = Cursor::new(&bytes);
-        conn.deserialize_read_exact(DatabaseName::Main, cursor, bytes.len(), true)
+        conn.deserialize_read_exact("main", cursor, bytes.len(), true)
             .unwrap();
 
         let (src_id, lang): (String, String) = conn

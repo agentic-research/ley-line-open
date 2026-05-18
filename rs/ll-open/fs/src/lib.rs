@@ -9,7 +9,7 @@ pub mod validate;
 use anyhow::{Context, Result, bail};
 use leyline_core::{ArenaHeader, Controller};
 use memmap2::Mmap;
-use rusqlite::{Connection, DatabaseName};
+use rusqlite::Connection;
 use serde::Serialize;
 use std::ffi::CStr;
 use std::io::Cursor;
@@ -159,7 +159,7 @@ impl SqliteGraph {
     fn deserialize(data: &[u8], readonly: bool) -> Result<Self> {
         let mut conn = Connection::open_in_memory()?;
         let cursor = Cursor::new(data);
-        conn.deserialize_read_exact(DatabaseName::Main, cursor, data.len(), readonly)
+        conn.deserialize_read_exact("main", cursor, data.len(), readonly)
             .context("sqlite3_deserialize failed")?;
         Ok(SqliteGraph { conn })
     }
@@ -171,7 +171,7 @@ impl SqliteGraph {
 
     /// Serialize the in-memory database to bytes (for flushing back to arena).
     pub fn serialize(&self) -> Result<Vec<u8>> {
-        let data = self.conn.serialize(DatabaseName::Main)?;
+        let data = self.conn.serialize("main")?;
         Ok(data.to_vec())
     }
 
@@ -193,9 +193,11 @@ impl SqliteGraph {
         if !table.chars().all(|c| c.is_alphanumeric() || c == '_') {
             anyhow::bail!("invalid table name: {}", table);
         }
+        // rusqlite 0.39 dropped `FromSql for u64`; read through `i64`.
+        // `COUNT(*)` is always non-negative so the cast is total.
         let sql = format!("SELECT COUNT(*) FROM \"{}\"", table);
-        let count: u64 = self.conn.query_row(&sql, [], |row| row.get(0))?;
-        Ok(count)
+        let count: i64 = self.conn.query_row(&sql, [], |row| row.get(0))?;
+        Ok(count as u64)
     }
 
     /// Query a row as JSON by id from the results table.
@@ -484,7 +486,7 @@ mod tests {
              INSERT INTO results VALUES ('CVE-2024-0002', 'Another', 'high');",
         )?;
 
-        let data = source.serialize(DatabaseName::Main)?;
+        let data = source.serialize("main")?;
         let bytes = data.as_ref();
         assert!(!bytes.is_empty(), "serialized DB should not be empty");
 
@@ -514,7 +516,7 @@ mod tests {
              INSERT INTO results VALUES ('node-1', 'Alpha', '42');",
         )?;
 
-        let data = source.serialize(DatabaseName::Main)?;
+        let data = source.serialize("main")?;
         let graph = SqliteGraph::from_bytes(data.as_ref())?;
 
         let json = graph.get_node_json("node-1")?;
@@ -553,7 +555,7 @@ mod tests {
             "CREATE TABLE results (id TEXT PRIMARY KEY, data TEXT);
              INSERT INTO results VALUES ('node-1', 'hello from buffer 1');",
         )?;
-        let serialized = source.serialize(DatabaseName::Main)?;
+        let serialized = source.serialize("main")?;
         let db_bytes = serialized.as_ref();
 
         // Build a fake arena: 4096-byte header + two equal buffers
@@ -609,7 +611,7 @@ mod tests {
             )
             .unwrap();
 
-        let data = source.serialize(DatabaseName::Main).unwrap();
+        let data = source.serialize("main").unwrap();
         let graph = SqliteGraph::from_bytes(data.as_ref()).unwrap();
         let adapter = graph::SqliteGraphAdapter::new(graph);
         let ctx = Box::into_raw(Box::new(LeylineCtx { adapter }));
@@ -742,7 +744,7 @@ mod tests {
             )
             .unwrap();
 
-        let data = source.serialize(DatabaseName::Main).unwrap();
+        let data = source.serialize("main").unwrap();
         let graph = SqliteGraph::from_bytes(data.as_ref()).unwrap();
         let adapter = graph::SqliteGraphAdapter::new(graph);
         let ctx = Box::into_raw(Box::new(LeylineCtx { adapter }));

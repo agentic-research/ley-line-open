@@ -7,10 +7,12 @@
 use serde::{Deserialize, Serialize};
 
 // Re-export the types we use from lsp-types so consumers can import from one place.
+// `Uri` replaced `Url` in lsp-types 0.97 — newtype around `fluent_uri::Uri<String>`,
+// aligns the crate with the LSP spec wording (URI, not URL).
 pub use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionResponse, Diagnostic, DiagnosticSeverity,
     DocumentSymbol, GotoDefinitionResponse, Hover, HoverContents, Location, MarkedString,
-    MarkupContent, MarkupKind, Position, Range, SymbolKind, Url,
+    MarkupContent, MarkupKind, Position, Range, SymbolKind, Uri,
 };
 
 // ── JSON-RPC framing ────────────────────────────────────────────

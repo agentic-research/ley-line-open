@@ -5,7 +5,7 @@ use std::io::Cursor;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, DatabaseName};
+use rusqlite::Connection;
 
 use leyline_lsp::client::LspClient;
 use leyline_lsp::project;
@@ -143,13 +143,8 @@ pub async fn cmd_lsp(
             std::fs::read(db_path).with_context(|| format!("read {}", db_path.display()))?;
 
         let mut conn = Connection::open_in_memory()?;
-        conn.deserialize_read_exact(
-            DatabaseName::Main,
-            Cursor::new(&db_bytes),
-            db_bytes.len(),
-            false,
-        )
-        .context("deserialize existing database")?;
+        conn.deserialize_read_exact("main", Cursor::new(&db_bytes), db_bytes.len(), false)
+            .context("deserialize existing database")?;
 
         let matched = project::merge_lsp_into_ast(&symbols, &diagnostics, &conn)?;
         eprintln!("{matched} symbols matched to AST nodes");
@@ -170,7 +165,7 @@ pub async fn cmd_lsp(
             .await?;
     eprintln!("enrichment: {enrichment}");
 
-    let data = conn.serialize(DatabaseName::Main)?;
+    let data = conn.serialize("main")?;
     std::fs::write(output, &*data).with_context(|| format!("write {}", output.display()))?;
 
     // Graceful shutdown.

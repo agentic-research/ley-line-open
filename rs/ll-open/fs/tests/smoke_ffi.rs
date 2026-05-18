@@ -7,7 +7,7 @@
 use anyhow::Result;
 use leyline_core::{ArenaHeader, Controller};
 use leyline_schema::create_schema;
-use rusqlite::{Connection, DatabaseName};
+use rusqlite::Connection;
 use std::process::Command;
 use tempfile::TempDir;
 
@@ -21,7 +21,7 @@ fn create_test_arena(dir: &std::path::Path) -> Result<std::path::PathBuf> {
         INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('vulns/CVE-1', 'vulns', 'CVE-1', 0, 23, 2000, '{\"severity\":\"critical\"}');
         INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('vulns/CVE-2', 'vulns', 'CVE-2', 0, 10, 3000, '{\"severity\":\"high\"}');",
     )?;
-    let serialized = source.serialize(DatabaseName::Main)?;
+    let serialized = source.serialize("main")?;
     let db_bytes = serialized.as_ref();
 
     let buf_size = db_bytes.len().max(4096);

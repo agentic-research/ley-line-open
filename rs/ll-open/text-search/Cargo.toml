@@ -1,0 +1,40 @@
+[package]
+name = "leyline-text-search"
+version = "0.4.2"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Unstructured-text semantic search backend abstraction for ley-line-open. Default NullEngine for the wire surface; optional Witchcraft (XTR-WARP) engine pending rusqlite-skew resolution (see crate root docs)."
+
+[features]
+default = []
+# Witchcraft engine is currently a documented stub — see src/witchcraft.rs.
+# The real git dep is commented out below pending a workspace rusqlite
+# upgrade (0.34 → 0.39+). Enabling the feature today swaps NullEngine for
+# WitchcraftStub, which returns Error::NotImplemented with the blocker docs
+# baked into the message so callers see the situation rather than a
+# silent fallback.
+engine-witchcraft = []
+
+# Reserved for the real wiring once the workspace rusqlite version skew
+# (see docs in src/witchcraft.rs) is resolved. Pre-flighted with
+# `cargo check -p leyline-text-search --features engine-witchcraft` — the
+# `libsqlite3-sys` `links = "sqlite3"` constraint fails resolution today.
+#
+# [dependencies.witchcraft]
+# git = "https://github.com/dropbox/witchcraft"
+# optional = true
+#
+# [dependencies.uuid]
+# version = "1"
+# features = ["v5"]
+# optional = true
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+
+[dev-dependencies]
+anyhow = "1"
+tempfile = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

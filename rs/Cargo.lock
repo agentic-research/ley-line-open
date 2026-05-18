@@ -2407,6 +2407,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "leyline-text-search"
+version = "0.4.2"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "leyline-ts"
 version = "0.4.3"
 dependencies = [

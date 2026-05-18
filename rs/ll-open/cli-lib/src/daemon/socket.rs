@@ -88,27 +88,64 @@ pub fn spawn(ctx: Arc<DaemonContext>, sock_path: PathBuf) -> PathBuf {
     path
 }
 
+/// Bound on the writer-task's outbound queue. Op responses and pushed
+/// events both serialise through this channel so wire bytes never
+/// interleave (one `recv` ⇒ one `write_all` + newline). 64 absorbs a
+/// typical subscribe-then-burst pattern; if the client falls behind,
+/// the per-subscriber router channel (`SUBSCRIBER_CHANNEL_BUFFER`)
+/// fills first and the bus's overflow policy decides drop vs disconnect.
+const CONNECTION_WRITE_BUFFER: usize = 64;
+
 /// Handle a single UDS connection: read line-delimited JSON, dispatch, respond.
+///
+/// Two background tasks back this loop:
+///
+///   * **Writer task** — sole owner of the `OwnedWriteHalf`. Drains a
+///     bounded `mpsc::channel<String>` and writes one line per `recv`.
+///     Routing every outbound line through a single task is what keeps
+///     op responses and pushed events from interleaving mid-byte.
+///
+///   * **Event relay task** — spawned after a successful `subscribe` op.
+///     Pulls events from the per-subscriber `mpsc::Receiver` stashed on
+///     `ConnectionState`, serialises each as a single JSON line, and
+///     forwards it through the writer task's channel. A resubscribe
+///     drops the prior `Subscriber.tx` in the router (see
+///     `handle_subscribe`'s `remove_subscriber` path), which closes the
+///     old relay's `recv` and lets the relay exit before the new one
+///     starts pumping.
+///
+/// Without the relay, pushed events accumulated in the per-subscriber
+/// channel and never reached the wire — see ley-line-open-5caa59 and
+/// `tests/event_push_blackbox_test.rs` for the regression guard.
 async fn handle_connection(ctx: Arc<DaemonContext>, stream: tokio::net::UnixStream) {
-    let (reader, mut writer) = stream.into_split();
+    let (reader, writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
     let mut conn_state = ConnectionState::new(ctx.router.clone());
 
-    /// Write a line back to the client, log::trace! on disconnect. Returns
-    /// false if the write failed so the caller can break out of the loop.
-    async fn write_line(writer: &mut tokio::net::unix::OwnedWriteHalf, body: &str) -> bool {
-        if let Err(e) = writer.write_all(body.as_bytes()).await {
-            log::trace!("UDS client gone (mid-body): {e}");
-            return false;
+    let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<String>(CONNECTION_WRITE_BUFFER);
+
+    let writer_task = tokio::spawn(async move {
+        let mut writer = writer;
+        while let Some(body) = write_rx.recv().await {
+            if let Err(e) = writer.write_all(body.as_bytes()).await {
+                log::trace!("UDS client gone (mid-body): {e}");
+                break;
+            }
+            if let Err(e) = writer.write_all(b"\n").await {
+                log::trace!("UDS client gone (newline): {e}");
+                break;
+            }
         }
-        if let Err(e) = writer.write_all(b"\n").await {
-            log::trace!("UDS client gone (newline): {e}");
-            return false;
-        }
-        true
+    });
+
+    // `send` failures here only happen if the writer task has already
+    // exited (client gone). Surface that to the caller so the read loop
+    // can break instead of looping while the channel back-pressures.
+    async fn enqueue(tx: &tokio::sync::mpsc::Sender<String>, body: String) -> bool {
+        tx.send(body).await.is_ok()
     }
 
-    while let Ok(Some(line)) = lines.next_line().await {
+    'read: while let Ok(Some(line)) = lines.next_line().await {
         let line = line.trim().to_string();
         if line.is_empty() {
             continue;
@@ -118,8 +155,8 @@ async fn handle_connection(ctx: Arc<DaemonContext>, stream: tokio::net::UnixStre
             Ok(v) => v,
             Err(e) => {
                 let err = json!({"error": format!("invalid JSON: {e}")}).to_string();
-                if !write_line(&mut writer, &err).await {
-                    break;
+                if !enqueue(&write_tx, err).await {
+                    break 'read;
                 }
                 continue;
             }
@@ -129,21 +166,52 @@ async fn handle_connection(ctx: Arc<DaemonContext>, stream: tokio::net::UnixStre
             Some(s) => s.to_string(),
             None => {
                 let err = json!({"error": "missing 'op' field"}).to_string();
-                if !write_line(&mut writer, &err).await {
-                    break;
+                if !enqueue(&write_tx, err).await {
+                    break 'read;
                 }
                 continue;
             }
         };
 
         let response = dispatch(&ctx, &mut conn_state, &op, &req).await;
-        if !write_line(&mut writer, &response).await {
-            break;
+        if !enqueue(&write_tx, response).await {
+            break 'read;
+        }
+
+        // A successful `subscribe` stashes a fresh `event_rx` on
+        // `conn_state`. Move it into a dedicated relay task so live
+        // pushed events make it through the writer task. Spawning AFTER
+        // the response is enqueued preserves "subscribe-ack before
+        // first event" ordering — though the underlying mpsc is FIFO so
+        // the contract holds either way.
+        if let Some(mut event_rx) = conn_state.take_event_rx() {
+            let relay_tx = write_tx.clone();
+            tokio::spawn(async move {
+                while let Some(event) = event_rx.recv().await {
+                    let body = match serde_json::to_string(&event) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log::warn!("event serialize failed (dropped): {e}");
+                            continue;
+                        }
+                    };
+                    if relay_tx.send(body).await.is_err() {
+                        // Writer task is gone (client disconnected).
+                        // Stop draining — the subscriber will be cleaned
+                        // up by `conn_state.cleanup` on the read side.
+                        return;
+                    }
+                }
+            });
         }
     }
 
-    // Clean up subscriptions on disconnect.
+    // Read side hit EOF or fatal error. Unregister the subscriber so
+    // the router stops queueing events into a dead channel, then drop
+    // our `write_tx` clone and wait for the writer task to drain.
     conn_state.cleanup().await;
+    drop(write_tx);
+    let _ = writer_task.await;
 }
 
 /// Dispatch an op through the chain:

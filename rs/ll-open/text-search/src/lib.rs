@@ -23,10 +23,10 @@
 //! - [`null::NullEngine`] — default. Every op returns [`Error::NotImplemented`].
 //!   Used so the daemon op surface compiles and clients see a structured
 //!   error instead of an "unknown op" 404 when no real engine is wired in.
-//! - [`witchcraft::WitchcraftStub`] — feature-gated under `engine-witchcraft`.
-//!   Currently a documented stub — see [`witchcraft`] module docs for the
-//!   rusqlite version-skew blocker that's keeping the real engine from
-//!   shipping in-tree, and the three unblock paths.
+//! - [`witchcraft::WitchcraftEngine`] — feature-gated under `engine-witchcraft`.
+//!   XTR-WARP late-interaction retrieval via the upstream `witchcraft` crate.
+//!   Constructor needs a T5 assets directory; see the module docstring for
+//!   the deployment-time knob.
 
 use std::path::Path;
 

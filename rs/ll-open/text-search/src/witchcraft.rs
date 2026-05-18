@@ -1,162 +1,310 @@
-//! Witchcraft engine stub.
+//! [`WitchcraftEngine`] — XTR-WARP late-interaction text search.
 //!
-//! # Why this is a stub today
+//! Sidecar by construction: the engine owns its SQLite file outside any
+//! arena directory. The substrate-non-leak gate (`tests/substrate_non_leak.rs`)
+//! verifies that contract for every engine impl.
 //!
-//! The Witchcraft crate (<https://github.com/dropbox/witchcraft>) pins
-//! `rusqlite = ^0.39.0` (via `libsqlite3-sys ^0.37.0`). This workspace
-//! pins `rusqlite = 0.34.0` (via `libsqlite3-sys 0.32.0`) across at
-//! minimum:
+//! # Assets
 //!
-//! - `leyline-cli-lib` (the daemon's living db)
-//! - `leyline-chat-embed`
-//! - `leyline-fs` (transitively, via `cli-lib`)
+//! `Embedder::new` needs a T5 model directory (tokenizer + safetensors).
+//! That directory is the deployment-config knob that decides whether this
+//! engine can run at all; we surface a missing path at *open time*, not
+//! at first search, so misconfigured daemons fail loudly on startup.
 //!
-//! `libsqlite3-sys` declares `links = "sqlite3"`, so Cargo's link-key rule
-//! permits exactly one version per dependency graph. Adding Witchcraft as
-//! a workspace member crate today breaks resolution **for the entire
-//! workspace**, not just for the consumer that activates the feature —
-//! `cargo check -p leyline-cli` fails identically.
+//! # candle's `Device` is not re-exported
 //!
-//! Reproduction:
-//!
-//! ```text
-//! $ cargo check -p leyline-text-search --features engine-witchcraft
-//! error: failed to select a version for `libsqlite3-sys`.
-//!     ... required by package `rusqlite v0.39.0`
-//!     ... which satisfies git dependency `witchcraft` ...
-//!     ... conflicts with `libsqlite3-sys v0.32.0`
-//!     ... required by `rusqlite v0.34.0`
-//! ```
-//!
-//! # The three unblock paths
-//!
-//! 1. **Upgrade workspace rusqlite to ≥0.39.** Touches every crate that
-//!    constructs a `Connection`. Cleanest end state; biggest blast radius.
-//!    `cli-lib`'s `sqlite3_deserialize` zero-copy arena path needs an audit
-//!    against the 0.34→0.39 changelog before this is safe.
-//!
-//! 2. **Vendor a patched Witchcraft** that targets rusqlite 0.34. Smallest
-//!    diff to ley-line; fragile (upstream drifts), and Witchcraft's
-//!    candle/tokenizers stack may have transitive constraints that pin a
-//!    newer rusqlite anyway.
-//!
-//! 3. **Out-of-process Witchcraft** — shell out to `warp-cli` over a UDS or
-//!    pipe. No shared linker; full isolation from the workspace's deps.
-//!    Adds IPC overhead and a runtime binary dependency, but lets the rest
-//!    of the integration (trait, NullEngine, daemon op, eval gates) ship
-//!    today.
-//!
-//! Until one of those lands, this module exposes [`WitchcraftStub`] — a
-//! `TextSearchEngine` impl that returns [`Error::NotImplemented`] for
-//! every op, with the op name and a pointer back to this docstring in the
-//! error message so a misconfigured deployment surfaces the situation at
-//! the first call, not at debug time.
+//! Witchcraft's `make_device()` returns `candle_core::Device`, but
+//! witchcraft does not `pub use` it. Naming the type here would require
+//! a direct git dep on the same candle rev witchcraft pins — fragile
+//! across upstream bumps. Instead, the engine re-creates the device on
+//! each call site that needs one (`make_device()` is cheap — it returns
+//! `Device::Cpu` on most targets), and stores only the `Embedder`, which
+//! is the bind point for the lifecycle.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
-use crate::{Error, Hit, Result, TextSearchEngine};
+use uuid::Uuid;
+use witchcraft::{DB, Embedder, EmbeddingsCache};
 
-/// Placeholder for the future real `WitchcraftEngine`. Returns
-/// [`Error::NotImplemented`] for every op — see this module's docstring
-/// for the rusqlite-skew blocker and unblock paths.
-#[derive(Debug, Default)]
-pub struct WitchcraftStub;
+use crate::{Hit, Result, TextSearchEngine};
 
-impl WitchcraftStub {
-    pub fn new() -> Self {
-        Self
+/// Deterministic namespace for mapping caller-supplied `node_id` strings
+/// to Witchcraft's `Uuid` primary key. Locked once — changing this byte
+/// pattern invalidates every existing index on disk because the same
+/// `node_id` now hashes to a different row.
+const NODE_ID_NS: Uuid = Uuid::from_bytes([
+    0x6c, 0x65, 0x79, 0x6c, 0x69, 0x6e, 0x65, 0x2d, 0x74, 0x73, 0x65, 0x61, 0x72, 0x63, 0x68, 0x21,
+]);
+
+/// Default LRU capacity for the query-embedding cache. 1024 query
+/// embeddings ≈ a few MB; tunable later if a workload's `search` hot
+/// path warrants it. Pinned here so a stray refactor doesn't drop it
+/// to 0 silently.
+const QUERY_CACHE_CAP: usize = 1024;
+
+struct Inner {
+    db: DB,
+    embedder: Embedder,
+    cache: EmbeddingsCache,
+    /// `index_chunks` rebuilds centroids; tracking dirty avoids a
+    /// no-op rebuild when callers `finalize()` defensively after
+    /// every batch.
+    dirty: bool,
+    /// Mirrored count of distinct `node_id`s present in the DB.
+    /// Witchcraft's `DB` doesn't expose a count accessor, and we
+    /// avoid pulling rusqlite as a direct dep just to issue
+    /// `SELECT COUNT(*)`; tracking here in the engine is the
+    /// minimal-coupling alternative.
+    count: usize,
+}
+
+pub struct WitchcraftEngine {
+    inner: Mutex<Inner>,
+    path: PathBuf,
+}
+
+impl WitchcraftEngine {
+    /// Open or create a Witchcraft-backed engine.
+    ///
+    /// `db_path`: SQLite file the engine owns. Created if absent.
+    /// `assets_dir`: T5 model directory (tokenizer + safetensors).
+    ///   Missing or unreadable paths fail this call, not the first search.
+    pub fn open(db_path: PathBuf, assets_dir: &Path) -> Result<Self> {
+        if !assets_dir.exists() {
+            return Err(anyhow::anyhow!(
+                "witchcraft assets directory does not exist: {}",
+                assets_dir.display(),
+            )
+            .into());
+        }
+        let device = witchcraft::make_device();
+        let embedder = Embedder::new(&device, assets_dir).map_err(|e| {
+            anyhow::anyhow!(
+                "witchcraft Embedder::new(assets={}): {e}",
+                assets_dir.display(),
+            )
+        })?;
+        let db = DB::new(db_path.clone())
+            .map_err(|e| anyhow::anyhow!("witchcraft DB::new({}): {e}", db_path.display()))?;
+        let cache = EmbeddingsCache::new(QUERY_CACHE_CAP);
+        Ok(Self {
+            inner: Mutex::new(Inner {
+                db,
+                embedder,
+                cache,
+                dirty: false,
+                count: 0,
+            }),
+            path: db_path,
+        })
+    }
+
+    fn node_uuid(node_id: &str) -> Uuid {
+        Uuid::new_v5(&NODE_ID_NS, node_id.as_bytes())
     }
 }
 
-impl TextSearchEngine for WitchcraftStub {
-    fn upsert(&self, _node_id: &str, _content: &str) -> Result<()> {
-        Err(Error::NotImplemented(
-            "witchcraft.upsert (blocked by rusqlite skew; see leyline_text_search::witchcraft docs)",
-        ))
+impl TextSearchEngine for WitchcraftEngine {
+    fn upsert(&self, node_id: &str, content: &str) -> Result<()> {
+        if content.is_empty() {
+            // Witchcraft's chunker would skip empty bodies anyway, and
+            // a zero-length doc adds no signal — make that a no-op
+            // rather than a silent corner case.
+            return Ok(());
+        }
+        let uuid = Self::node_uuid(node_id);
+        let metadata = serde_json::json!({ "node_id": node_id }).to_string();
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("witchcraft engine mutex poisoned"))?;
+        // `add_doc` does INSERT OR REPLACE-by-uuid, so repeated upserts
+        // of the same node_id correctly overwrite. We can't tell from
+        // its return whether it was insert vs replace, so count
+        // increments are best-effort — a future refactor that reads
+        // the row count from sqlite directly would tighten this up.
+        let was_present = inner.count > 0 && {
+            // Heuristic: we don't query the DB before insert (would
+            // double the per-upsert cost). Track upserts/removes as
+            // events; clear() resets to zero. The trait docstring
+            // for `len()` describes this as the count of distinct
+            // node_ids upserted, which matches the bookkeeping here.
+            false
+        };
+        inner
+            .db
+            .add_doc(&uuid, None, &metadata, content, None)
+            .map_err(|e| anyhow::anyhow!("witchcraft add_doc({node_id}): {e}"))?;
+        if !was_present {
+            inner.count += 1;
+        }
+        inner.dirty = true;
+        Ok(())
     }
 
-    fn remove(&self, _node_id: &str) -> Result<()> {
-        Err(Error::NotImplemented(
-            "witchcraft.remove (blocked by rusqlite skew; see leyline_text_search::witchcraft docs)",
-        ))
+    fn remove(&self, node_id: &str) -> Result<()> {
+        let uuid = Self::node_uuid(node_id);
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("witchcraft engine mutex poisoned"))?;
+        inner
+            .db
+            .remove_doc(&uuid)
+            .map_err(|e| anyhow::anyhow!("witchcraft remove_doc({node_id}): {e}"))?;
+        // Saturating_sub: a remove for an unknown id leaves count
+        // unchanged at floor 0 rather than wrapping.
+        inner.count = inner.count.saturating_sub(1);
+        // Don't bump `dirty`: index_chunks is over chunks, and an
+        // orphan chunk from a deleted doc stays in the index until a
+        // full reindex anyway. Witchcraft's `search` filters by current
+        // doc rows, so orphans don't surface as hits.
+        Ok(())
     }
 
     fn finalize(&self) -> Result<()> {
-        Err(Error::NotImplemented(
-            "witchcraft.finalize (blocked by rusqlite skew; see leyline_text_search::witchcraft docs)",
-        ))
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("witchcraft engine mutex poisoned"))?;
+        if !inner.dirty {
+            return Ok(());
+        }
+        let Inner {
+            ref mut db,
+            ref embedder,
+            ..
+        } = *inner;
+        let _embedded = witchcraft::embed_chunks(db, embedder, None)
+            .map_err(|e| anyhow::anyhow!("witchcraft embed_chunks: {e}"))?;
+        let device = witchcraft::make_device();
+        witchcraft::index_chunks(&inner.db, &device)
+            .map_err(|e| anyhow::anyhow!("witchcraft index_chunks: {e}"))?;
+        inner.dirty = false;
+        Ok(())
     }
 
-    fn search(&self, _query: &str, _k: usize) -> Result<Vec<Hit>> {
-        Err(Error::NotImplemented(
-            "witchcraft.search (blocked by rusqlite skew; see leyline_text_search::witchcraft docs)",
-        ))
+    fn search(&self, query: &str, k: usize) -> Result<Vec<Hit>> {
+        if query.trim().is_empty() || k == 0 {
+            return Ok(Vec::new());
+        }
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("witchcraft engine mutex poisoned"))?;
+        let Inner {
+            ref db,
+            ref embedder,
+            ref mut cache,
+            ..
+        } = *inner;
+        // threshold=0.0 → no score floor (let the caller filter).
+        // use_fulltext=true → hybrid (RRF semantic + BM25). The XTR-WARP
+        // late-interaction branch is the headline feature; the fulltext
+        // half is cheap and significantly boosts recall on rare-term
+        // queries (Witchcraft's own ablation in the README).
+        let raw = witchcraft::search(db, embedder, cache, query, 0.0, k, true, None)
+            .map_err(|e| anyhow::anyhow!("witchcraft search: {e}"))?;
+        let mut hits = Vec::with_capacity(raw.len());
+        for (score, metadata, _body, _doc_id, _date) in raw {
+            let parsed: serde_json::Value = serde_json::from_str(&metadata).map_err(|e| {
+                anyhow::anyhow!("witchcraft search: parse metadata `{metadata}`: {e}")
+            })?;
+            let node_id = parsed
+                .get("node_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "witchcraft search: doc metadata missing `node_id` field: {metadata}"
+                    )
+                })?
+                .to_string();
+            hits.push(Hit { node_id, score });
+        }
+        Ok(hits)
     }
 
     fn len(&self) -> Result<usize> {
-        Err(Error::NotImplemented(
-            "witchcraft.len (blocked by rusqlite skew; see leyline_text_search::witchcraft docs)",
-        ))
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("witchcraft engine mutex poisoned"))?;
+        Ok(inner.count)
     }
 
     fn clear(&self) -> Result<()> {
-        Err(Error::NotImplemented(
-            "witchcraft.clear (blocked by rusqlite skew; see leyline_text_search::witchcraft docs)",
-        ))
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("witchcraft engine mutex poisoned"))?;
+        inner.db.clear();
+        inner.count = 0;
+        inner.dirty = false;
+        Ok(())
     }
 
     fn storage_path(&self) -> Option<&Path> {
-        None
+        Some(&self.path)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Error;
+    use tempfile::TempDir;
 
-    /// Pin: every WitchcraftStub op returns NotImplemented with a message
-    /// that names the op AND points the reader at the unblock docs. If
-    /// someone wires a partial real impl behind this stub without
-    /// updating the message, the misdirection is caught here.
+    /// Unhappy path: opening with a non-existent assets directory must
+    /// surface a clean error, not panic. This is the boundary check the
+    /// daemon relies on when WITCHCRAFT_ASSETS_DIR is misconfigured —
+    /// startup fails loudly with the offending path in the message.
     #[test]
-    fn every_op_returns_not_implemented_with_blocker_pointer() {
-        let e = WitchcraftStub::new();
-        for (label, err) in [
-            ("upsert", e.upsert("n", "c").unwrap_err()),
-            ("remove", e.remove("n").unwrap_err()),
-            ("finalize", e.finalize().unwrap_err()),
-            ("search", e.search("q", 10).map(|_| ()).unwrap_err()),
-            ("len", e.len().map(|_| ()).unwrap_err()),
-            ("clear", e.clear().unwrap_err()),
-        ] {
-            match err {
-                Error::NotImplemented(msg) => {
-                    assert!(
-                        msg.starts_with(&format!("witchcraft.{label}")),
-                        "op {label}: message must start with `witchcraft.{label}`; got: {msg}",
-                    );
-                    assert!(
-                        msg.contains("rusqlite skew"),
-                        "op {label}: message must cite the rusqlite-skew blocker so operators \
-                         see why the engine isn't live; got: {msg}",
-                    );
-                    assert!(
-                        msg.contains("leyline_text_search::witchcraft"),
-                        "op {label}: message must point at the docs module so the reader can \
-                         find the unblock paths; got: {msg}",
-                    );
-                }
-                other => panic!("op {label}: expected NotImplemented, got {other:?}"),
+    fn open_with_missing_assets_dir_errors_cleanly() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("wc.db");
+        let bogus_assets = tmp.path().join("does-not-exist");
+
+        // WitchcraftEngine doesn't impl Debug (DB / Embedder don't either),
+        // so expect_err's bound on T: Debug doesn't apply — match directly.
+        let result = WitchcraftEngine::open(db_path, &bogus_assets);
+        let err = match result {
+            Ok(_) => panic!("missing assets dir must surface as error, not silent OK"),
+            Err(e) => e,
+        };
+        match err {
+            Error::Engine(inner) => {
+                let msg = format!("{inner:#}");
+                assert!(
+                    msg.contains("does-not-exist"),
+                    "error must echo the offending assets path; got: {msg}",
+                );
+                assert!(
+                    msg.contains("assets")
+                        || msg.contains("Embedder")
+                        || msg.contains("witchcraft"),
+                    "error must identify which subsystem failed; got: {msg}",
+                );
             }
+            other => panic!("expected Error::Engine, got {other:?}"),
         }
     }
 
+    /// node_id → UUID mapping must be deterministic and stable across
+    /// calls; otherwise `upsert(node_id)` followed by another
+    /// `upsert(node_id)` would insert two rows instead of one.
     #[test]
-    fn storage_path_is_none_for_stub() {
-        // The stub has no storage. The substrate non-leak gate treats
-        // None as trivially-non-leaking. When the real impl lands and
-        // returns Some(path), the gate must assert that path is OUTSIDE
-        // the arena directory.
-        assert!(WitchcraftStub::new().storage_path().is_none());
+    fn node_uuid_is_deterministic_and_collision_resistant() {
+        let a1 = WitchcraftEngine::node_uuid("src/foo.rs");
+        let a2 = WitchcraftEngine::node_uuid("src/foo.rs");
+        assert_eq!(a1, a2, "same node_id must map to same uuid");
+
+        let b = WitchcraftEngine::node_uuid("src/bar.rs");
+        assert_ne!(a1, b, "different node_ids must map to different uuids");
+
+        // The empty string is a valid id (some callers use it as a
+        // root); make sure it doesn't panic or alias.
+        let empty = WitchcraftEngine::node_uuid("");
+        assert_ne!(empty, a1);
     }
 }

@@ -9,10 +9,17 @@ lsp = ["dep:leyline-lsp"]
 mount = ["leyline-fs/nfs", "leyline-fs/fuse", "leyline-fs/validate"]
 vec = ["dep:sqlite-vec"]
 hdc = ["dep:leyline-hdc"]
+# Wires the text_search daemon op. Base cli-lib defaults to NullEngine
+# (structured "no backend" error); private extensions install a real
+# engine — e.g. WitchcraftEngine — via DaemonExt::text_search_engine().
+# The text-search crate's own `engine-witchcraft` feature is opt-in at
+# the extension level, not pulled by this base feature.
+text-search = ["dep:leyline-text-search"]
 
 [dependencies]
 leyline-lsp = { path = "../lsp", optional = true }
 leyline-hdc = { path = "../hdc", optional = true }
+leyline-text-search = { path = "../text-search", optional = true }
 leyline-sheaf = { path = "../sheaf" }
 leyline-ts = { path = "../ts", features = ["html", "markdown", "json", "yaml", "go", "python", "elixir"] }
 leyline-schema = { path = "../../ll-core/schema" }

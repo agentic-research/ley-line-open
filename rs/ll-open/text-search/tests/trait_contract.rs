@@ -7,36 +7,22 @@
 use leyline_text_search::null::NullEngine;
 use leyline_text_search::{Error, TextSearchEngine};
 
-#[cfg(feature = "engine-witchcraft")]
-use leyline_text_search::witchcraft::WitchcraftStub;
-
-fn engines() -> Vec<(&'static str, Box<dyn TextSearchEngine>)> {
-    let mut v: Vec<(&'static str, Box<dyn TextSearchEngine>)> =
-        vec![("null", Box::new(NullEngine::new()))];
-
-    #[cfg(feature = "engine-witchcraft")]
-    v.push(("witchcraft-stub", Box::new(WitchcraftStub::new())));
-
-    v
-}
-
 #[test]
 fn dyn_dispatch_preserves_not_implemented_variant() {
     // When the daemon calls into the trait via `Arc<dyn TextSearchEngine>`,
     // the NotImplemented variant must still match — i.e. the trait is
     // object-safe AND the error type round-trips through dispatch
-    // unchanged. A refactor that wrapped the trait return in `anyhow::Error`
-    // would lose the variant and make the daemon's structured error path
-    // collapse to a string.
-    for (label, engine) in engines() {
-        let err = engine
-            .search("hello", 5)
-            .expect_err("every shipped engine today is a no-backend stub — search MUST error");
-        assert!(
-            matches!(err, Error::NotImplemented(_)),
-            "engine {label}: expected Error::NotImplemented, got {err:?}",
-        );
-    }
+    // unchanged. A refactor that wrapped the trait return in
+    // `anyhow::Error` would lose the variant and make the daemon's
+    // structured error path collapse to a string.
+    let engine: Box<dyn TextSearchEngine> = Box::new(NullEngine::new());
+    let err = engine
+        .search("hello", 5)
+        .expect_err("NullEngine.search MUST error");
+    assert!(
+        matches!(err, Error::NotImplemented(_)),
+        "expected Error::NotImplemented, got {err:?}",
+    );
 }
 
 #[test]

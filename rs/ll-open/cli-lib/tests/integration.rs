@@ -80,6 +80,8 @@ fn default_test_ctx(ctrl_path: PathBuf) -> leyline_cli_lib::daemon::DaemonContex
         embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
         #[cfg(feature = "vec")]
         embed_queue: Arc::new(Mutex::new(std::collections::BinaryHeap::new())),
+        #[cfg(feature = "text-search")]
+        text_search: std::sync::Arc::new(leyline_text_search::null::NullEngine::new()),
         sheaf: Arc::new(leyline_cli_lib::daemon::sheaf_ops::SheafState::new()),
     }
 }
@@ -2142,6 +2144,8 @@ async fn test_embed_queue_drainer_refreshes_index() {
         vec_index: index.clone(),
         embedder,
         embed_queue: queue.clone(),
+        #[cfg(feature = "text-search")]
+        text_search: std::sync::Arc::new(leyline_text_search::null::NullEngine::new()),
         sheaf: Arc::new(leyline_cli_lib::daemon::sheaf_ops::SheafState::new()),
         ..default_test_ctx(ctrl_path)
     });
@@ -2205,6 +2209,8 @@ async fn test_op_vec_search_round_trip() {
         vec_index: index.clone(),
         embedder,
         embed_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
+        #[cfg(feature = "text-search")]
+        text_search: std::sync::Arc::new(leyline_text_search::null::NullEngine::new()),
         sheaf: Arc::new(leyline_cli_lib::daemon::sheaf_ops::SheafState::new()),
         ..default_test_ctx(ctrl_path)
     });
@@ -2732,6 +2738,8 @@ async fn test_op_vec_search_dim_mismatch_returns_clean_error() {
         vec_index: index,
         embedder,
         embed_queue: Arc::new(Mutex::new(std::collections::BinaryHeap::new())),
+        #[cfg(feature = "text-search")]
+        text_search: std::sync::Arc::new(leyline_text_search::null::NullEngine::new()),
         sheaf: Arc::new(leyline_cli_lib::daemon::sheaf_ops::SheafState::new()),
         ..default_test_ctx(ctrl_path)
     });
@@ -2749,6 +2757,82 @@ async fn test_op_vec_search_dim_mismatch_returns_clean_error() {
     assert!(
         err.contains("dim") || err.contains("expected") || err.contains("4"),
         "error should describe the dim mismatch; got: {err:?}",
+    );
+}
+
+/// `text_search` op surfaces the engine's structured error when no real
+/// backend is installed. The base daemon ships `NullEngine` as the default
+/// (extensions install Witchcraft via `DaemonExt::text_search_engine`); this
+/// test pins the contract that an un-extended daemon answers `text_search`
+/// with `ok: false` and an error mentioning the op name, not `unknown op`.
+///
+/// Mirrors `test_op_vec_search_round_trip` in structure but exercises the
+/// complementary text-search wire path.
+#[cfg(feature = "text-search")]
+#[tokio::test]
+async fn test_op_text_search_null_engine_returns_structured_error() {
+    use leyline_cli_lib::daemon::DaemonContext;
+    use std::sync::Arc;
+
+    let dir = TempDir::new().unwrap();
+    let (_arena, ctrl_path) = fresh_arena(dir.path());
+
+    let ctx = Arc::new(DaemonContext {
+        ..default_test_ctx(ctrl_path)
+    });
+
+    let sock_path = dir.path().join("text_search_null.sock");
+    spawn_test_socket(ctx, sock_path.clone()).await;
+
+    let parsed = uds_round_trip(&sock_path, r#"{"op":"text_search","query":"hello","k":5}"#).await;
+
+    // Critical: the wire response is "structured error", not "unknown op".
+    // The op is known; the backend just isn't wired. Clients can distinguish.
+    assert_eq!(
+        parsed["ok"], false,
+        "NullEngine search must surface as ok:false, not panic: {parsed}",
+    );
+    let err = parsed["error"].as_str().unwrap_or("");
+    assert!(
+        !err.contains("unknown op"),
+        "must not collapse into the unknown-op error path; got: {err:?}",
+    );
+    assert!(
+        err.contains("text_search") || err.contains("search"),
+        "error must identify the failing op; got: {err:?}",
+    );
+    assert!(
+        err.contains("not implemented") || err.contains("no backend"),
+        "error must surface the NullEngine reason (NotImplemented variant); got: {err:?}",
+    );
+}
+
+/// `text_search` with `k = 0` returns an empty results array without errors —
+/// trait contract says an empty/zero query is a no-op, not a panic. Pinned
+/// on the wire so a future engine that silently returns *something* for
+/// k=0 (or crashes) gets caught at the daemon boundary.
+#[cfg(feature = "text-search")]
+#[tokio::test]
+async fn test_op_text_search_rejects_unknown_args_cleanly() {
+    use leyline_cli_lib::daemon::DaemonContext;
+    use std::sync::Arc;
+
+    let dir = TempDir::new().unwrap();
+    let (_arena, ctrl_path) = fresh_arena(dir.path());
+
+    let ctx = Arc::new(DaemonContext {
+        ..default_test_ctx(ctrl_path)
+    });
+
+    let sock_path = dir.path().join("text_search_bad.sock");
+    spawn_test_socket(ctx, sock_path.clone()).await;
+
+    // Missing `query` field: serde rejects the typed parse; daemon
+    // surfaces a wire error, not a panic.
+    let parsed = uds_round_trip(&sock_path, r#"{"op":"text_search","k":5}"#).await;
+    assert!(
+        parsed.get("error").is_some(),
+        "missing-required-field request must surface as error: {parsed}",
     );
 }
 

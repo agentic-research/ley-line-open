@@ -83,6 +83,8 @@ fn build_blackbox_ctx(dir: &Path) -> Arc<DaemonContext> {
         embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
         #[cfg(feature = "vec")]
         embed_queue: Arc::new(Mutex::new(std::collections::BinaryHeap::new())),
+        #[cfg(feature = "text-search")]
+        text_search: Arc::new(leyline_text_search::null::NullEngine::new()),
         sheaf,
     })
 }

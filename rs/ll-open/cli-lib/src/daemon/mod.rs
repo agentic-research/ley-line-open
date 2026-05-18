@@ -160,6 +160,14 @@ pub struct DaemonContext {
     /// `vec` feature is enabled.
     #[cfg(feature = "vec")]
     pub vec_index: Arc<vec_index::VectorIndex>,
+    /// Unstructured-text search engine used by `op_text_search`. Defaults
+    /// to `NullEngine` (returns `Error::NotImplemented` so clients see a
+    /// structured error, not "unknown op"); private extensions install a
+    /// real engine via [`DaemonExt::text_search_engine`]. Independent
+    /// from the single-vector `vec_search` path — the two are
+    /// complementary retrieval surfaces.
+    #[cfg(feature = "text-search")]
+    pub text_search: Arc<dyn leyline_text_search::TextSearchEngine>,
     /// Embedder used to vectorize text (queries + node content). Defaults to
     /// `ZeroEmbedder`; private extensions override via `DaemonExt::embedder`.
     #[cfg(feature = "vec")]

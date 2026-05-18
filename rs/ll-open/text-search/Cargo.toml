@@ -3,35 +3,36 @@ name = "leyline-text-search"
 version = "0.4.2"
 edition = "2024"
 license = "AGPL-3.0-or-later"
-description = "Unstructured-text semantic search backend abstraction for ley-line-open. Default NullEngine for the wire surface; optional Witchcraft (XTR-WARP) engine pending rusqlite-skew resolution (see crate root docs)."
+description = "Unstructured-text semantic search backend abstraction for ley-line-open. Default NullEngine for the wire surface; Witchcraft (XTR-WARP) engine behind the `engine-witchcraft` feature."
 
 [features]
 default = []
-# Witchcraft engine is currently a documented stub — see src/witchcraft.rs.
-# The real git dep is commented out below pending a workspace rusqlite
-# upgrade (0.34 → 0.39+). Enabling the feature today swaps NullEngine for
-# WitchcraftStub, which returns Error::NotImplemented with the blocker docs
-# baked into the message so callers see the situation rather than a
-# silent fallback.
-engine-witchcraft = []
-
-# Reserved for the real wiring once the workspace rusqlite version skew
-# (see docs in src/witchcraft.rs) is resolved. Pre-flighted with
-# `cargo check -p leyline-text-search --features engine-witchcraft` — the
-# `libsqlite3-sys` `links = "sqlite3"` constraint fails resolution today.
-#
-# [dependencies.witchcraft]
-# git = "https://github.com/dropbox/witchcraft"
-# optional = true
-#
-# [dependencies.uuid]
-# version = "1"
-# features = ["v5"]
-# optional = true
+# Pulls candle, tokenizers, safetensors via the witchcraft crate. Off by
+# default so workspace-wide `cargo check` stays light; the daemon turns it
+# on via the same-named feature in `leyline-cli-lib` when text-search is
+# enabled at compile time.
+engine-witchcraft = ["dep:witchcraft", "dep:uuid", "dep:serde_json"]
 
 [dependencies]
 anyhow = "1"
 thiserror = "2"
+
+# Witchcraft is git-only (not on crates.io). Two non-obvious config bits:
+#
+#   1. No default features. The `t5_encoder` alias inside `src/embedder.rs`
+#      is only created under either `t5-quantized` or `t5-openvino`, so
+#      compiling the crate at all requires one of them. We pick
+#      `t5-quantized` (pure-Rust path; openvino needs system C++ libs).
+#
+#   2. Rev pin omitted intentionally: master gets candle pin bumps that
+#      keep upstream compiling against current `candle-core`. Pinning a
+#      stale rev (we tried `02788a46`) drifts off the candle bump and
+#      builds fail with `the ? operator can only be applied to values
+#      that implement Try` on `Tensor` arithmetic. Cargo.lock pins the
+#      effective rev for reproducibility; bump on intentional sync.
+witchcraft = { git = "https://github.com/dropbox/witchcraft", features = ["t5-quantized"], default-features = false, optional = true }
+uuid = { version = "1", features = ["v5"], optional = true }
+serde_json = { version = "1", optional = true }
 
 [dev-dependencies]
 anyhow = "1"

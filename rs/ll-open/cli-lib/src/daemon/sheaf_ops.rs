@@ -326,13 +326,19 @@ pub fn op_sheaf_invalidate(
 
     let generation = cache.generation();
     drop(cache);
+    // u64 fields render as JSON *strings* on the wire — matches capnp_json's
+    // convention for op responses (capnp UInt64 → quoted in JSON to dodge JS
+    // Number's 2^53 safe-integer ceiling). Pre-fix the event payload used raw
+    // numbers while the response used strings, forcing consumers to handle
+    // two encodings for the same field. Standardising on strings keeps a
+    // single parse path across response + event surfaces.
     state.emit(
         "sheaf.invalidate",
         serde_json::json!({
             "invalidated": invalidated,
             "count": invalidated.len(),
-            "generation": generation,
-            "prior_generation": prior_generation,
+            "generation": generation.to_string(),
+            "prior_generation": prior_generation.to_string(),
         }),
     );
 
@@ -647,13 +653,15 @@ pub fn op_sheaf_update_topology(
         *edges = post_edges;
     }
 
+    // See `op_sheaf_invalidate` above for the u64-as-string convention —
+    // generation and prior_generation match capnp_json's response encoding.
     state.emit(
         "sheaf.topology",
         serde_json::json!({
             "kind": "update",
             "affected": affected_vec,
-            "generation": generation,
-            "prior_generation": prior_generation,
+            "generation": generation.to_string(),
+            "prior_generation": prior_generation.to_string(),
             "defect_after": defect_after,
         }),
     );

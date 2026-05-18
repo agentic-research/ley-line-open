@@ -873,12 +873,15 @@ async fn git_watch_loop(
                         s.last_reparse_at_ms = Some(crate::daemon::now_ms());
                         s.phase = DaemonPhase::Ready;
                     }
+                    // u64 fields render as JSON strings to match capnp_json's
+                    // op-response convention — see `op_sheaf_invalidate` in
+                    // daemon/sheaf_ops.rs for the rationale.
                     emitter.emit(
                         "daemon.reparse.complete",
                         "leyline",
                         serde_json::json!({
-                            "parsed": result.parsed,
-                            "deleted": result.deleted,
+                            "parsed": result.parsed.to_string(),
+                            "deleted": result.deleted.to_string(),
                             "changed_files": result.changed_files,
                         }),
                     );

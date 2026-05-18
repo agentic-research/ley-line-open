@@ -290,6 +290,24 @@ fn tool_registry() -> Vec<McpTool> {
         }),
     });
 
+    // The text-search registration mirrors the UDS dispatcher in
+    // `ops.rs::base_op_names()`; the drift test in this module's
+    // `tests` cross-checks the two lists so a future addition to one
+    // side that forgets the other fails CI.
+    #[cfg(feature = "text-search")]
+    tools.push(McpTool {
+        name: "text_search",
+        description: "Unstructured-text retrieval over the engine installed by `DaemonExt::text_search_engine()`. Complementary to `vec_search` — late-interaction / hybrid retrieval rather than single-vector KNN.",
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "k":     {"type": "integer", "default": 10}
+            },
+            "required": ["query"]
+        }),
+    });
+
     tools
 }
 

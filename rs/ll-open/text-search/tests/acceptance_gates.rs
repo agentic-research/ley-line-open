@@ -1,11 +1,18 @@
-//! Acceptance-gate scaffolding for text-search engines against
-//! ley-line-open at HEAD.
+//! Acceptance gates for text-search engines against ley-line-open at HEAD.
 //!
-//! Today these tests assert only structural well-formedness — the corpus
-//! parses, every expected path exists on disk, every query is non-empty,
-//! every expected list is non-empty. The retrieval-quality threshold
-//! (`NDCG@10 ≥ baseline`) is a compile-time const here so wiring it up
-//! once a real engine lands is one line of code, not a refactor.
+//! Three tests:
+//!
+//! 1. `corpus_is_well_formed` — structural: queries non-empty, no dupes,
+//!    every labeled list non-empty. Always runs.
+//! 2. `corpus_expected_paths_exist_on_disk` — doc-drift gate in miniature:
+//!    every `expected_node_id` resolves to a real file at repo HEAD.
+//!    Always runs. (Same shape as a generic "validator over paths cited
+//!    in markdown" gate would have.)
+//! 3. `ndcg_at_10_meets_baseline` — retrieval-quality gate; live behind
+//!    `engine-witchcraft` + `WITCHCRAFT_ASSETS_DIR`. Ingests the labeled
+//!    corpus, finalizes, searches, computes NDCG@10 (binary relevance),
+//!    asserts `>= NDCG_BASELINE`. Skips with a stderr line when assets
+//!    aren't staged (e.g. default CI without the T5 bundle).
 //!
 //! Latency-gate scaffolding (p95 ≤ 50ms) is sibling territory — a future
 //! `benches/` criterion harness, not a `tests/`. Out of scope for this PR.

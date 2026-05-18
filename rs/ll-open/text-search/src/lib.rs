@@ -15,8 +15,14 @@
 //! 2. The engine never writes a `*.bindings.capnp` segment.
 //! 3. Re-indexing a corpus never advances `current_root`.
 //!
-//! `tests/substrate_non_leak.rs` asserts (1) and (3) directly; (2) is
-//! structurally guaranteed by the engine not having a capnp dependency.
+//! `tests/substrate_non_leak.rs` asserts (1) directly via the trait's
+//! `storage_path()` accessor — every engine impl reports a path and the
+//! gate refuses any path under the arena. (2) is structurally guaranteed
+//! by the crate not depending on capnp at all. (3) is a daemon-level
+//! property — the gate that asserts root non-advance under `op_text_search`
+//! belongs next to a real `DaemonContext` in `leyline-cli-lib`'s
+//! integration tests; not landed in this PR (the trait surface alone
+//! can't prove it). Tracked as follow-up.
 //!
 //! ## Engines shipped
 //!

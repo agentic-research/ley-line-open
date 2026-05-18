@@ -7,9 +7,13 @@
 //! crate ships.
 //!
 //! The second half (root non-advance under indexing) is a daemon-level
-//! invariant — that gate lives in `leyline-cli-lib` next to the
-//! `op_text_search` round-trip test where a real `DaemonContext` is
-//! in scope.
+//! invariant that wants a real `DaemonContext` in scope. The gate for
+//! that property is **not landed in this PR** — the trait surface
+//! alone can't prove it. Sketched as follow-up: a `leyline-cli-lib`
+//! integration test that drives `op_text_search` against a context
+//! wired with `WitchcraftEngine`, captures `current_root` before/after
+//! a sequence of upsert+search calls, and asserts equality. Lives
+//! next to the existing `op_text_search` round-trip tests when added.
 
 use std::path::Path;
 

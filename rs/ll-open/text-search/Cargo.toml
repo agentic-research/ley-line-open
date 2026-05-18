@@ -8,9 +8,20 @@ description = "Unstructured-text semantic search backend abstraction for ley-lin
 [features]
 default = []
 # Pulls candle, tokenizers, safetensors via the witchcraft crate. Off by
-# default so workspace-wide `cargo check` stays light; the daemon turns it
-# on via the same-named feature in `leyline-cli-lib` when text-search is
-# enabled at compile time.
+# default so workspace-wide `cargo check` stays light.
+#
+# Activation path (intentional split):
+#   * `leyline-cli-lib --features text-search` wires the trait surface
+#     (`BaseRequest::TextSearch`, `DaemonContext.text_search`) and
+#     defaults to `NullEngine`. It does NOT chain `engine-witchcraft`
+#     on — that would force candle into the closure of every default
+#     build.
+#   * Private extensions install the real engine: they depend on
+#     `leyline-text-search` with `features = ["engine-witchcraft"]`,
+#     construct a `WitchcraftEngine`, and return it from
+#     `DaemonExt::text_search_engine()` at daemon init. The public
+#     workspace stays in the NullEngine default; only deployments
+#     wiring a private extension pay the candle build cost.
 engine-witchcraft = ["dep:witchcraft", "dep:uuid", "dep:serde_json"]
 
 [dependencies]
@@ -24,12 +35,16 @@ thiserror = "2"
 #      compiling the crate at all requires one of them. We pick
 #      `t5-quantized` (pure-Rust path; openvino needs system C++ libs).
 #
-#   2. Rev pin omitted intentionally: master gets candle pin bumps that
-#      keep upstream compiling against current `candle-core`. Pinning a
-#      stale rev (we tried `02788a46`) drifts off the candle bump and
-#      builds fail with `the ? operator can only be applied to values
-#      that implement Try` on `Tensor` arithmetic. Cargo.lock pins the
-#      effective rev for reproducibility; bump on intentional sync.
+#   2. Rev pin omitted from Cargo.toml: `cargo update -p witchcraft`
+#      advances to whatever HEAD-of-master is current. Cargo.lock
+#      captures the effective rev for reproducibility — at lockfile
+#      generation time that was `02788a46b1562f889e5d0ca0cbc60a8aa2203b84`,
+#      which builds cleanly against this workspace (verified by CI).
+#      Upstream master receives periodic candle pin bumps; if the
+#      Cargo.lock rev drifts off candle's API, `cargo update -p
+#      witchcraft` brings it forward. Pinning an explicit rev here
+#      would invert that — lock the workspace to one upstream commit
+#      and require a manual bump every candle-API churn cycle.
 witchcraft = { git = "https://github.com/dropbox/witchcraft", features = ["t5-quantized"], default-features = false, optional = true }
 uuid = { version = "1", features = ["v5"], optional = true }
 serde_json = { version = "1", optional = true }

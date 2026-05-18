@@ -2807,13 +2807,21 @@ async fn test_op_text_search_null_engine_returns_structured_error() {
     );
 }
 
-/// `text_search` with `k = 0` returns an empty results array without errors —
-/// trait contract says an empty/zero query is a no-op, not a panic. Pinned
-/// on the wire so a future engine that silently returns *something* for
-/// k=0 (or crashes) gets caught at the daemon boundary.
+/// `text_search` with the required `query` field missing surfaces a wire
+/// error instead of a panic. Today the typed `BaseRequest::TextSearch`
+/// variant rejects the parse at the serde layer (the field has no
+/// `#[serde(default)]`), so the daemon's error envelope fires before any
+/// engine code runs. Pinned at the wire boundary so a future refactor
+/// that loosens the variant (e.g. wraps `query` in `Option`) gets caught
+/// here, not by a downstream consumer seeing a panic-derived 5xx.
+///
+/// (Note: we do NOT pin unknown-extra-field rejection. `BaseRequest`
+/// doesn't use `#[serde(deny_unknown_fields)]`, so extra args are
+/// silently ignored today. If that contract tightens, add a sibling
+/// test alongside this one.)
 #[cfg(feature = "text-search")]
 #[tokio::test]
-async fn test_op_text_search_rejects_unknown_args_cleanly() {
+async fn test_op_text_search_missing_required_field_surfaces_wire_error() {
     use leyline_cli_lib::daemon::DaemonContext;
     use std::sync::Arc;
 
@@ -2833,6 +2841,97 @@ async fn test_op_text_search_rejects_unknown_args_cleanly() {
     assert!(
         parsed.get("error").is_some(),
         "missing-required-field request must surface as error: {parsed}",
+    );
+}
+
+/// Stub engine that returns a hard-coded hit. Lets the success-path
+/// test cover `op_text_search`'s `engine_hits → JSON response`
+/// translation without staging T5 model assets — the real
+/// WitchcraftEngine is exercised by the assets-gated acceptance
+/// test in `leyline-text-search`.
+#[cfg(feature = "text-search")]
+#[derive(Default)]
+struct StubHitEngine;
+
+#[cfg(feature = "text-search")]
+impl leyline_text_search::TextSearchEngine for StubHitEngine {
+    fn upsert(&self, _: &str, _: &str) -> leyline_text_search::Result<()> {
+        Ok(())
+    }
+    fn remove(&self, _: &str) -> leyline_text_search::Result<()> {
+        Ok(())
+    }
+    fn finalize(&self) -> leyline_text_search::Result<()> {
+        Ok(())
+    }
+    fn search(
+        &self,
+        _query: &str,
+        _k: usize,
+    ) -> leyline_text_search::Result<Vec<leyline_text_search::Hit>> {
+        Ok(vec![leyline_text_search::Hit {
+            node_id: "docs/adr/0014-capnp-as-protocol.md".to_string(),
+            score: 0.875,
+        }])
+    }
+    fn len(&self) -> leyline_text_search::Result<usize> {
+        Ok(1)
+    }
+    fn clear(&self) -> leyline_text_search::Result<()> {
+        Ok(())
+    }
+    fn storage_path(&self) -> Option<&std::path::Path> {
+        None
+    }
+}
+
+/// `text_search` happy path: with an engine installed that returns a
+/// hit, the daemon must serialise `{node_id, score}` rows into the
+/// `results` array and report `ok: true`. Pins the shape of the
+/// response that consumers (mache, cloister, rosary) actually parse —
+/// a refactor that drops a field or wraps the array in a sub-object
+/// breaks all of them and surfaces here at the wire.
+#[cfg(feature = "text-search")]
+#[tokio::test]
+async fn test_op_text_search_success_path_returns_hits() {
+    use leyline_cli_lib::daemon::DaemonContext;
+    use std::sync::Arc;
+
+    let dir = TempDir::new().unwrap();
+    let (_arena, ctrl_path) = fresh_arena(dir.path());
+
+    let ctx = Arc::new(DaemonContext {
+        text_search: Arc::new(StubHitEngine),
+        ..default_test_ctx(ctrl_path)
+    });
+
+    let sock_path = dir.path().join("text_search_ok.sock");
+    spawn_test_socket(ctx, sock_path.clone()).await;
+
+    let parsed = uds_round_trip(&sock_path, r#"{"op":"text_search","query":"capnp","k":3}"#).await;
+
+    assert_eq!(
+        parsed["ok"], true,
+        "happy path must report ok:true; got: {parsed}",
+    );
+    let results = parsed["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("results must be an array; got: {parsed}"));
+    assert_eq!(
+        results.len(),
+        1,
+        "stub returns exactly one hit; got: {parsed}",
+    );
+    assert_eq!(
+        results[0]["node_id"], "docs/adr/0014-capnp-as-protocol.md",
+        "node_id must round-trip through the response builder; got: {parsed}",
+    );
+    let score = results[0]["score"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("score must be a JSON number; got: {parsed}"));
+    assert!(
+        (score - 0.875).abs() < 1e-6,
+        "score must round-trip through the response builder; got: {score}",
     );
 }
 

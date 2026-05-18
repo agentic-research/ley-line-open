@@ -26,21 +26,26 @@ fn dyn_dispatch_preserves_not_implemented_variant() {
 }
 
 #[test]
-fn is_empty_uses_default_impl_via_len() {
-    // is_empty has a default impl in the trait. Make sure dyn dispatch
-    // routes through it (not a hidden override) by asserting the error
-    // it returns is exactly len's error — the NotImplemented payload
-    // for `len`, not for `is_empty`. If a future override is added,
-    // update this test to assert the new variant.
+fn is_empty_uses_default_impl_via_dyn_dispatch() {
+    // `is_empty` has a default impl in the trait. The daemon holds
+    // `Arc<dyn TextSearchEngine>`, so what we actually need to pin is
+    // that the default impl is reachable through the trait-object
+    // vtable AND that it routes to `len` (rather than being
+    // accidentally overridden somewhere). Calling on `&dyn ...`
+    // exercises the same dispatch path the daemon uses; calling on a
+    // concrete `NullEngine` would prove the function compiles but not
+    // that the vtable wiring is intact.
     let null = NullEngine::new();
-    let err = null
+    let engine: &dyn TextSearchEngine = &null;
+    let err = engine
         .is_empty()
         .expect_err("null::len errors → is_empty errors");
     if let Error::NotImplemented(op) = err {
         assert_eq!(
             op, "len",
-            "is_empty must delegate to len; getting a different op name here \
-             means someone added an is_empty override without updating this gate",
+            "is_empty must delegate to len via the trait's default impl; \
+             a different op name here means someone added an is_empty \
+             override without updating this gate",
         );
     } else {
         panic!("expected NotImplemented");

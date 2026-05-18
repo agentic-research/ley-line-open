@@ -80,6 +80,8 @@ pub(crate) fn base_op_names() -> Vec<&'static str> {
     ];
     #[cfg(feature = "vec")]
     v.push("vec_search");
+    #[cfg(feature = "text-search")]
+    v.push("text_search");
     v
 }
 

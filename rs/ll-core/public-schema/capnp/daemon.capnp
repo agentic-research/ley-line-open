@@ -163,6 +163,49 @@ struct FlushResponse {
   currentRoot @1 :Text  $Json.name("current_root");
 }
 
+# `leyline_version` op response (bead ley-line-open-cb8960).
+#
+# Returned synchronously to any client that calls `{"op":"leyline_version"}`
+# before any other op. Lets a consumer verify wire-format compatibility at
+# connect time instead of discovering drift via parseUint64 returning 0 or
+# a subscribe-but-no-events timeout (the failure modes ley-line-open-5caa59
+# and ley-line-open-cb12fa exhibited).
+#
+# Fields are all populated from daemon build-time constants — see
+# `rs/ll-open/cli-lib/src/daemon/version.rs`. There is no Request struct
+# because the op takes no arguments; the daemon dispatches on `op` alone.
+struct LeylineVersionResponse {
+  ok               @0 :Bool;
+
+  # CARGO_PKG_VERSION of the daemon binary. e.g. "0.4.4".
+  binaryVersion    @1 :Text   $Json.name("binary_version");
+
+  # Schema-client version this daemon ships against. Tracks the
+  # `clients/go/leyline-schema/` Go module's published tag. Today the
+  # daemon and schema-client release in lockstep so this equals
+  # `binary_version`; reserved as a separate field so the two can
+  # diverge later without a wire shape change.
+  schemaVersion    @2 :Text   $Json.name("schema_version");
+
+  # Major version of the JSON wire envelope shape. Bumps every time
+  # the wire shape changes incompatibly (e.g. the `data: {...}` nesting
+  # the v0.4.2→v0.4.3 transition introduced). Inside the same major
+  # additions are non-breaking. v0.4.4 ships major 1.
+  wireFormatMajor  @3 :UInt32 $Json.name("wire_format_major");
+
+  # Earliest schema-client version this daemon binary is compatible
+  # with. Clients call `leyline_version` at connect, compare their
+  # schema-client version against `compat_min`, fail-fast on mismatch
+  # with a clear error rather than silent parseUint64-returns-0 drift.
+  compatMin        @4 :Text   $Json.name("compat_min");
+
+  # ISO-8601 date of the daemon build. Populated from $LLO_BUILD_DATE
+  # at compile time; "unspecified" when the env var is absent (local
+  # dev builds). Useful for support when versions match but behavior
+  # disagrees.
+  buildDate        @5 :Text   $Json.name("build_date");
+}
+
 struct EnrichRequest {
   pass  @0 :Text;
   files @1 :List(Text);

@@ -77,6 +77,7 @@ pub(crate) fn base_op_names() -> Vec<&'static str> {
         "sheaf_stalks",
         "sheaf_status",
         "sheaf_learned_weights",
+        "leyline_version",
     ];
     #[cfg(feature = "vec")]
     v.push("vec_search");
@@ -181,6 +182,7 @@ fn is_known_base_op(op: &str) -> bool {
             | "sheaf_status"
             | "sheaf_learned_weights"
             | "sheaf_reap"
+            | "leyline_version"
     ) || cfg!(feature = "vec") && op == "vec_search"
         || cfg!(feature = "text-search") && op == "text_search"
 }
@@ -240,6 +242,7 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
         BaseRequest::SheafStatus => super::sheaf_ops::op_sheaf_status(&ctx.sheaf),
         BaseRequest::SheafLearnedWeights => super::sheaf_ops::op_sheaf_learned_weights(&ctx.sheaf),
         BaseRequest::SheafReap => super::sheaf_ops::op_sheaf_reap(&ctx.sheaf),
+        BaseRequest::LeylineVersion => op_leyline_version(),
     };
     result.unwrap_or_else(|e| {
         build_error_response(&format!("{e:#}"))
@@ -1748,6 +1751,36 @@ fn op_text_search(ctx: &DaemonContext, query: &str, k: u32) -> Result<String> {
         .map(|h| json!({"node_id": h.node_id, "score": h.score}))
         .collect();
     Ok(json!({"ok": true, "results": rows}).to_string())
+}
+
+// ---------------------------------------------------------------------------
+// leyline_version — wire-compat handshake (bead ley-line-open-cb8960)
+// ---------------------------------------------------------------------------
+
+/// `{"op":"leyline_version"}` — returns the daemon's runtime version
+/// and wire-format identity from the constants in
+/// [`crate::daemon::version`]. Takes no arguments. Read-only — NOT in
+/// `STATE_CHANGING_OPS`. Idempotent.
+///
+/// Builds the response through capnp + capnp_json so the wire shape
+/// matches the rest of the op surface (`$Json.name(...)` annotations
+/// drive snake_case field names; UInt32 stays a JSON number,
+/// matching the existing pattern in `SnapshotResponse` etc.).
+fn op_leyline_version() -> Result<String> {
+    use crate::daemon::version;
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root: leyline_public_schema::daemon_capnp::leyline_version_response::Builder =
+        builder.init_root();
+    root.set_ok(true);
+    root.set_binary_version(version::BINARY_VERSION);
+    root.set_schema_version(version::SCHEMA_VERSION);
+    root.set_wire_format_major(version::WIRE_FORMAT_MAJOR);
+    root.set_compat_min(version::COMPAT_MIN_SCHEMA_VERSION);
+    root.set_build_date(version::BUILD_DATE);
+    let reader = builder
+        .get_root_as_reader::<leyline_public_schema::daemon_capnp::leyline_version_response::Reader>(
+        )?;
+    Ok(capnp_json::to_json(reader)?)
 }
 
 // ---------------------------------------------------------------------------

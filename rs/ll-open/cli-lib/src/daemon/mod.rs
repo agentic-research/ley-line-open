@@ -15,6 +15,7 @@ pub mod sheaf_ops;
 pub mod socket;
 #[cfg(feature = "vec")]
 pub mod vec_index;
+pub mod version;
 pub mod wire;
 
 #[cfg(feature = "vec")]

@@ -12,6 +12,10 @@ yaml = ["dep:tree-sitter-yaml"]
 go = ["dep:tree-sitter-go"]
 python = ["dep:tree-sitter-python"]
 elixir = ["dep:tree-sitter-elixir"]
+# HCL grammar covers both vanilla HCL (.hcl) and Terraform (.tf / .tfvars).
+# Maintained at tree-sitter-grammars/tree-sitter-hcl. Mache uses this for
+# infra-as-code scans alongside the existing language set.
+hcl = ["dep:tree-sitter-hcl"]
 pyproject = ["dep:uv-pep508", "dep:uv-pep440", "dep:uv-normalize", "dep:toml"]
 
 [dependencies]
@@ -23,6 +27,7 @@ tree-sitter-yaml = { version = "0.7", optional = true }
 tree-sitter-go = { version = "0.25", optional = true }
 tree-sitter-python = { version = "0.25", optional = true }
 tree-sitter-elixir = { version = "0.3.5", optional = true }
+tree-sitter-hcl = { version = "1", optional = true }
 leyline-schema = { path = "../../ll-core/schema" }
 rusqlite = { version = "0.39", features = ["bundled", "serialize"] }
 serde_json = "1"

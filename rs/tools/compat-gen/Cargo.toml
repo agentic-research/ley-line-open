@@ -1,0 +1,19 @@
+[package]
+name = "compat-gen"
+version = "0.4.4"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Generate compatibility.json from leyline-cli-lib::daemon::version constants. Self-maintaining compat surface per bead ley-line-open-cbea02."
+
+[[bin]]
+name = "compat-gen"
+path = "src/main.rs"
+
+[dependencies]
+# Imports the daemon's version constants module — this is the single
+# source of truth. compat-gen has no opinion of its own; it's a
+# printer over leyline-cli-lib's version module.
+leyline-cli-lib = { path = "../../ll-open/cli-lib" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"

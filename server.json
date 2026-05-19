@@ -6,5 +6,37 @@
   "repository": {
     "url": "https://github.com/agentic-research/ley-line-open.git",
     "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/agentic-research/ley-line-open:0.4.5",
+      "transport": {
+        "type": "streamable-http",
+        "url": "http://localhost:8384/mcp"
+      },
+      "environmentVariables": []
+    }
+  ],
+  "_meta": {
+    "art.cloister/v1": {
+      "groups": [
+        {
+          "name": "lsp",
+          "advertisedPrefix": "lsp_",
+          "upstreamNames": ["lsp_hover", "lsp_defs", "lsp_refs", "lsp_symbols", "lsp_diagnostics"]
+        },
+        {
+          "name": "lifecycle",
+          "advertisedPrefix": "",
+          "upstreamNames": ["status", "enrich", "reparse"]
+        },
+        {
+          "name": "sheaf",
+          "advertisedPrefix": "sheaf_",
+          "upstreamNames": ["sheaf_set_topology"]
+        }
+      ]
+    }
   }
 }

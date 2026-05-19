@@ -10,21 +10,87 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
-Nothing yet — post-v0.4.3 changes land here.
+Nothing yet — post-v0.4.4 changes land here.
 
-## [0.4.3] — 2026-05-18
+## [0.4.4] — 2026-05-19
 
-Patch release shipping the daemon UDS event-push fix and a workspace
-dep audit centered on `rusqlite 0.34 → 0.39` (Witchcraft unblock).
+First tagged release since v0.4.2. Rolls up the event-bus correctness
+work (5caa59 live-push, cb12fa replay-filter, u64 encoding), the
+workspace dep audit (rusqlite + others), the unstructured-text
+retrieval surface (text_search trait + WitchcraftEngine, opt-in
+feature), and the observation-lattice ADR.
+
+> **Note**: a paper v0.4.3 cut shipped in CHANGELOG + workspace
+> `Cargo.toml` via PR #34 (`74a1ec5`) but was never tagged in git.
+> v0.4.4 supersedes it; the rolled-up entry below preserves the v0.4.3
+> content and adds the post-v0.4.3 changes.
 
 **For consumers** (mache, cloister, future LLO clients): the daemon
-now actually forwards live pushed events to UDS subscribers. Pre-v0.4.3
-daemons returned `sheaf_invalidate` cascades in the op response but
-silently dropped the matching `sheaf.invalidate` event on the wire —
-subscribers only ever observed the replay batch appended to the
-subscribe response, which masked the bug. Mache's PR #384 e2e
+now actually forwards live pushed events to UDS subscribers AND
+filters the replay batch by topic. Pre-v0.4.4 daemons leaked unrelated
+events to topic-scoped subscribers via the replay path (cb12fa);
+pre-v0.4.3 daemons silently dropped all live-pushed events because
+`event_rx` was never drained (5caa59). Mache's PR #384 e2e
 (`TestE2E_SheafSubscriber_AgainstLiveDaemon`) flips RED→GREEN against
-a v0.4.3 binary with no mache-side code change.
+a v0.4.4 binary with no mache-side code change.
+
+### Fixed — EventLog replay topic-filter leak (ley-line-open-cb12fa)
+
+- `rs/ll-open/cli-lib/src/daemon/events.rs` — `EventRouter::subscribe`
+  returned the EventLog slice (`log.since(since)`) as the replay batch
+  attached to the subscribe response, without ever applying the new
+  subscriber's topic-pattern filter. The live-dispatch path correctly
+  invokes `Subscriber::matches()` per event in `assign_and_dispatch`;
+  the replay path skipped that filter entirely.
+- Symptom: a subscriber on `topics: ["sheaf.invalidate"]` received
+  `daemon.snapshot` and any other pre-subscribe event sitting in the
+  log — the replay batch was a topic-blind firehose. Surfaced by the
+  mache evolve-coverage-trunk campaign + the sheaf-subscribe probe.
+- Fix: new helper `EventLog::since_matching(since, predicate)` runs
+  the topic-pattern filter inside the iterator (so only matching
+  events are cloned out of the log); `EventRouter::subscribe` calls
+  it with `|ev| sub.matches(&ev.topic, &ev.source)`. Behaviour now
+  symmetric between replay and live-push.
+- Regression guard:
+  `event_push_blackbox_test.rs::subscribe_filters_events_by_topic_for_replay_and_live_push`
+  asserts both replay and live-push only deliver subscribed topics —
+  pre-fix the test fails at `replay_count == 1`; post-fix all five
+  blackbox tests pass.
+
+### Added — TextSearchEngine trait + Witchcraft engine + op_text_search (PR #31)
+
+- New crate `leyline-text-search` (`rs/ll-open/text-search/`)
+  introducing the `TextSearchEngine` trait — an unstructured-text
+  retrieval surface alongside the existing single-vector `vec_search`.
+- Default `NullEngine` returns `NotImplemented` from every op so the
+  daemon op surface compiles and clients see a structured error
+  rather than "unknown op" when no real backend is wired.
+- `WitchcraftEngine` (feature `engine-witchcraft`, opt-in) wraps the
+  upstream `witchcraft` crate's XTR-WARP late-interaction + BM25
+  hybrid retrieval. Off by default; private extensions install the
+  engine via `DaemonExt::text_search_engine()`.
+- New wire op `BaseRequest::TextSearch { query, k }` + `op_text_search`
+  handler + registration in both `base_op_names()` and the MCP tool
+  registry, with a drift test cross-checking the two lists.
+- Black-box gates: four `event_push_blackbox_test.rs` tests landed
+  alongside; substrate-non-leak gate over `storage_path()` for every
+  engine impl; count-contract tests pinning `len()` exactness across
+  open-from-existing-DB, repeated upsert, remove-of-absent.
+
+### Added — ADR-0020 observation flow over a learned CellComplex (PR #35)
+
+- `docs/adr/0020-entity-observation-lattice.md` proposes the
+  substrate model for LLO's master-DB direction: one `observation`
+  table whose rows reference observer-emitted mention tokens, with a
+  periodic `ComplexBuildPass` building a `CellComplex` from mention
+  co-occurrence and `CoChangeTracker` learning edge weights from the
+  temporal flow. Three query primitives (`neighborhood`, `agreement`,
+  `co_changed_with`) replace the prescriptive lens APIs an earlier
+  draft proposed.
+- Math layer is load-bearing: Gate 2 fails the build if the code
+  path doesn't mechanically invoke `leyline-sheaf::CellComplex` —
+  proves the substrate honors its math citation rather than dressing
+  up the schema with vocabulary.
 
 ### Fixed — sheaf.invalidate event push over UDS (ley-line-open-5caa59)
 
@@ -49,6 +115,7 @@ a v0.4.3 binary with no mache-side code change.
 - Verified end-to-end against mache's
   `tools/sheaf-subscribe-probe/main.go`: `sheaf.invalidate event
   received in 19.083µs`.
+- Originally shipped as PR #32, included in the paper v0.4.3 cut.
 
 ### Fixed — event payload u64 encoding (surfaced during 5caa59 validation)
 

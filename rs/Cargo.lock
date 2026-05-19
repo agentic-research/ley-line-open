@@ -2868,7 +2868,7 @@ checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
 
 [[package]]
 name = "leyline-chat-embed"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -2881,7 +2881,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-cli"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -2894,7 +2894,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-cli-lib"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -2930,7 +2930,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-core"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2942,7 +2942,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-fs"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2973,7 +2973,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-hdc"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2985,7 +2985,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-lsp"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "capnp",
@@ -3002,7 +3002,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-public-schema"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "capnp",
  "capnp-json",
@@ -3011,7 +3011,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-schema"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "rusqlite",
@@ -3019,7 +3019,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-schema-capnp"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "capnp",
  "capnpc",
@@ -3027,7 +3027,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-sheaf"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "nalgebra",
@@ -3039,7 +3039,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-sign"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "cms",
  "const-oid 0.9.6",
@@ -3057,7 +3057,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-text-search"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "serde",
@@ -3070,7 +3070,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-ts"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "leyline-schema",
@@ -3092,7 +3092,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-vcs"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "hex",

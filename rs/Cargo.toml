@@ -2,6 +2,7 @@
 members = [
     "ll-core/*",
     "ll-open/*",
+    "tools/*",
 ]
 resolver = "2"
 

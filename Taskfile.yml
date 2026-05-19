@@ -242,8 +242,36 @@ tasks:
   # --------------------------------------------------------------------------
   # All-in-one
   # --------------------------------------------------------------------------
+  compat:gen:
+    desc: |
+      Regenerate compatibility.json from leyline-cli-lib::daemon::version
+      constants. Self-maintaining compat surface (bead ley-line-open-cbea02).
+      Run before committing any change to rs/ll-open/cli-lib/src/daemon/version.rs.
+    dir: rs
+    cmds:
+      - cargo run -p compat-gen --quiet > ../compatibility.json
+      - echo "regenerated compatibility.json"
+
+  compat:check:
+    desc: |
+      Verify the committed compatibility.json matches what compat-gen
+      would emit today. CI invariant — fails the build on drift. Same
+      discipline `clients/go/leyline-schema/regen.sh` uses for Go bindings.
+    dir: rs
+    cmds:
+      - |
+        EXPECTED="$(cargo run -p compat-gen --quiet)"
+        ACTUAL="$(cat ../compatibility.json)"
+        if [ "$EXPECTED" != "$ACTUAL" ]; then
+          echo "compatibility.json is stale — run 'task compat:gen' and commit"
+          echo "--- diff ---"
+          diff <(echo "$EXPECTED") <(echo "$ACTUAL") || true
+          exit 1
+        fi
+        echo "compatibility.json is up to date"
+
   ci:
-    desc: Full CI pipeline (check + clippy + fmt + FFI staticlib + tier isolation + test + perf gates)
+    desc: Full CI pipeline (check + clippy + fmt + FFI staticlib + tier isolation + test + perf gates + compat)
     cmds:
       - task: check
       - task: clippy
@@ -252,3 +280,4 @@ tasks:
       - task: tier:isolation
       - task: test
       - task: test:perf
+      - task: compat:check

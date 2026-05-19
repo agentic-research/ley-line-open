@@ -141,6 +141,9 @@ pub enum BaseRequest {
     SheafStatus,
     SheafLearnedWeights,
     SheafReap,
+    /// Wire-compat handshake. Takes no args; returns the daemon's
+    /// version + wire-format identity (bead ley-line-open-cb8960).
+    LeylineVersion,
 }
 
 #[cfg(feature = "vec")]

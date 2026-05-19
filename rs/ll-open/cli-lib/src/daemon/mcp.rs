@@ -308,6 +308,19 @@ fn tool_registry() -> Vec<McpTool> {
         }),
     });
 
+    // Wire-compat handshake (bead ley-line-open-cb8960). Clients call
+    // this immediately after connecting to verify version compatibility
+    // BEFORE any other op. No arguments.
+    tools.push(McpTool {
+        name: "leyline_version",
+        description: "Return the daemon's binary version + schema version + wire-format major + compat floor + build date. Call once at connect time to detect version drift before it surfaces as silent parser-returns-zero behaviour. Idempotent, read-only, takes no arguments.",
+        schema: json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+    });
+
     tools
 }
 

@@ -176,17 +176,33 @@ impl EventLog {
         self.events.push_back(event);
     }
 
-    /// Return events with seq > since.
-    fn since(&self, since: u64) -> (Vec<Event>, bool) {
+    /// Return events with `seq > since` whose `(topic, source)` pass
+    /// `predicate`. Filter runs inside the iterator so only matching
+    /// events are cloned — for a large log + narrow subscriber the
+    /// clone cost is proportional to the *kept* events, not the
+    /// scanned ones.
+    fn since_matching<F: FnMut(&Event) -> bool>(
+        &self,
+        since: u64,
+        mut predicate: F,
+    ) -> (Vec<Event>, bool) {
         let first_seq = self.events.front().map(|e| e.seq).unwrap_or(0);
         let gap = since > 0 && since < first_seq;
         let events: Vec<Event> = self
             .events
             .iter()
-            .filter(|e| e.seq > since)
+            .filter(|e| e.seq > since && predicate(e))
             .cloned()
             .collect();
         (events, gap)
+    }
+
+    /// Convenience: unfiltered slice. Equivalent to `since_matching`
+    /// with a permissive predicate. Kept for callers (and tests) that
+    /// genuinely want the whole post-`since` log.
+    #[cfg(test)]
+    fn since(&self, since: u64) -> (Vec<Event>, bool) {
+        self.since_matching(since, |_| true)
     }
 
     fn head_seq(&self) -> u64 {
@@ -260,14 +276,12 @@ impl EventRouter {
         // uses — without this, the replay batch is a topic-blind firehose
         // of everything currently in the EventLog, leaking unrelated
         // events to topic-scoped subscribers (ley-line-open-cb12fa).
-        let (raw_replay, gap) = {
+        // The predicate runs inside `since_matching`'s iterator so only
+        // matching events are cloned out of the log.
+        let (replay, gap) = {
             let log = self.log.read().await;
-            log.since(since)
+            log.since_matching(since, |ev| sub.matches(&ev.topic, &ev.source))
         };
-        let replay: Vec<Event> = raw_replay
-            .into_iter()
-            .filter(|ev| sub.matches(&ev.topic, &ev.source))
-            .collect();
 
         self.subscribers.write().await.push(sub);
 

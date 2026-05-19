@@ -572,12 +572,21 @@ async fn subscribe_filters_events_by_topic_for_replay_and_live_push() {
         .expect("target emit ack");
 
     // ── Drain subscriber up to 2s. Collect every event seen.
+    //
+    // `UdsConn::read_line` returns `None` on both timeout AND socket
+    // EOF/error, so a daemon crash mid-test would otherwise busy-spin
+    // until the deadline. A tiny sleep on `None` keeps the loop honest
+    // without distinguishing timeout vs EOF (which would mean
+    // restructuring `UdsConn::read_line` for a single test).
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     let mut received_topics: Vec<String> = Vec::new();
     while std::time::Instant::now() < deadline {
         let line = match sub.read_line(Duration::from_millis(400)).await {
             Some(l) => l,
-            None => continue,
+            None => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
         };
         let v: serde_json::Value = match serde_json::from_str(&line) {
             Ok(v) => v,

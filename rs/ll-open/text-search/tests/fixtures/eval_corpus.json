@@ -1,0 +1,70 @@
+{
+  "_doc": "Acceptance-gate eval corpus for text-search engines, scoped to ley-line-open at HEAD. Each entry maps one natural-language `query` to a non-empty set of `expected_node_ids` (paths relative to repo root). Consumed by `tests/acceptance_gates.rs`, which computes NDCG@10 (binary relevance) against the WitchcraftEngine when `engine-witchcraft` and `WITCHCRAFT_ASSETS_DIR` are both set, and asserts `mean >= NDCG_BASELINE`. The constant default (0.40) is a placeholder — see the doc-comment on `NDCG_BASELINE` for the bump protocol. Expansion to ≥30 queries is a TODO required before tightening the threshold; the 10 below are the seed set, hand-picked to span ADRs, code modules, and README content.",
+
+  "queries": [
+    {
+      "query": "how are cap'n proto schemas versioned and what is the file id allowlist",
+      "expected_node_ids": [
+        "docs/adr/0014-capnp-as-protocol.md",
+        "rs/ll-core/schema-capnp/README.md"
+      ]
+    },
+    {
+      "query": "what is the merkle CAS substrate and how does BLAKE3 root chaining work",
+      "expected_node_ids": [
+        "docs/decades/2026-merkle-cas-substrate.md",
+        "README.md"
+      ]
+    },
+    {
+      "query": "sidecar vector index that does not survive sqlite3 serialize",
+      "expected_node_ids": [
+        "rs/ll-open/cli-lib/src/daemon/vec_index.rs"
+      ]
+    },
+    {
+      "query": "embedding pass enrichment that fills the vector sidecar from nodes",
+      "expected_node_ids": [
+        "rs/ll-open/cli-lib/src/daemon/embed.rs"
+      ]
+    },
+    {
+      "query": "daemon protocol fixture drift gate JSON",
+      "expected_node_ids": [
+        "rs/ll-open/cli-lib/tests/fixtures/daemon-protocol.json"
+      ]
+    },
+    {
+      "query": "tree-sitter AST projection and bidirectional splice",
+      "expected_node_ids": [
+        "README.md"
+      ]
+    },
+    {
+      "query": "hyperdimensional computing sheaf stalks heyting algebra",
+      "expected_node_ids": [
+        "README.md"
+      ]
+    },
+    {
+      "query": "LSP enrichment pass binding records",
+      "expected_node_ids": [
+        "README.md"
+      ]
+    },
+    {
+      "query": "chat embed semantic search over claude code sessions",
+      "expected_node_ids": [
+        "rs/ll-open/chat-embed/Cargo.toml",
+        "rs/ll-open/chat-embed/src/main.rs"
+      ]
+    },
+    {
+      "query": "distroless OCI image build with krust and chainguard static",
+      "expected_node_ids": [
+        "image.Dockerfile",
+        "README.md"
+      ]
+    }
+  ]
+}

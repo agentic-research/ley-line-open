@@ -80,6 +80,8 @@ pub(crate) fn base_op_names() -> Vec<&'static str> {
     ];
     #[cfg(feature = "vec")]
     v.push("vec_search");
+    #[cfg(feature = "text-search")]
+    v.push("text_search");
     v
 }
 
@@ -180,6 +182,7 @@ fn is_known_base_op(op: &str) -> bool {
             | "sheaf_learned_weights"
             | "sheaf_reap"
     ) || cfg!(feature = "vec") && op == "vec_search"
+        || cfg!(feature = "text-search") && op == "text_search"
 }
 
 fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> String {
@@ -213,6 +216,8 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
         BaseRequest::LspDiagnostics(f) => op_lsp_diagnostics(ctx, &f),
         #[cfg(feature = "vec")]
         BaseRequest::VecSearch { query, k } => op_vec_search(ctx, &query, k),
+        #[cfg(feature = "text-search")]
+        BaseRequest::TextSearch { query, k } => op_text_search(ctx, &query, k),
         BaseRequest::SheafSetTopology {
             regions,
             restrictions,
@@ -1722,6 +1727,30 @@ fn op_vec_search(ctx: &DaemonContext, query: &str, k: u32) -> Result<String> {
 }
 
 // ---------------------------------------------------------------------------
+// text_search — XTR-WARP-class retrieval via leyline-text-search
+// ---------------------------------------------------------------------------
+
+/// `{"op":"text_search", "query":"text", "k":10}` — unstructured-text search
+/// over the engine installed by `DaemonExt::text_search_engine()` (default
+/// `NullEngine` returns a structured "no backend" error). Returns
+/// `{ok, results: [{node_id, score}]}`. Complementary to `vec_search` —
+/// the engines model different access patterns (single-vector KNN vs
+/// late-interaction / hybrid).
+#[cfg(feature = "text-search")]
+fn op_text_search(ctx: &DaemonContext, query: &str, k: u32) -> Result<String> {
+    let k = k as usize;
+    let hits = ctx
+        .text_search
+        .search(query, k)
+        .map_err(|e| anyhow::anyhow!("text_search: {e}"))?;
+    let rows: Vec<serde_json::Value> = hits
+        .into_iter()
+        .map(|h| json!({"node_id": h.node_id, "score": h.score}))
+        .collect();
+    Ok(json!({"ok": true, "results": rows}).to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2001,6 +2030,8 @@ mod tests {
             embedder,
             #[cfg(feature = "vec")]
             embed_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
+            #[cfg(feature = "text-search")]
+            text_search: Arc::new(leyline_text_search::null::NullEngine::new()),
             sheaf: Arc::new(crate::daemon::sheaf_ops::SheafState::new()),
         };
         (dir, std::sync::Arc::new(ctx))

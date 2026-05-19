@@ -110,6 +110,12 @@ pub enum BaseRequest {
         #[serde(default = "default_vec_k")]
         k: u32,
     },
+    #[cfg(feature = "text-search")]
+    TextSearch {
+        query: String,
+        #[serde(default = "default_text_search_k")]
+        k: u32,
+    },
     SheafSetTopology {
         #[serde(default)]
         regions: Vec<crate::daemon::sheaf_ops::SheafStalkInput>,
@@ -139,6 +145,11 @@ pub enum BaseRequest {
 
 #[cfg(feature = "vec")]
 fn default_vec_k() -> u32 {
+    10
+}
+
+#[cfg(feature = "text-search")]
+fn default_text_search_k() -> u32 {
     10
 }
 

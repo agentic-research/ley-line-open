@@ -83,6 +83,19 @@ pub trait DaemonExt: Send + Sync {
     fn embedder(&self) -> Option<std::sync::Arc<dyn Embedder>> {
         None
     }
+
+    /// Provide a real text-search engine for the `op_text_search` daemon
+    /// op. Default `None` falls back to `NullEngine` — every search
+    /// returns a structured "no backend" error. Private extensions
+    /// install a real engine (e.g. `WitchcraftEngine` from
+    /// `leyline-text-search` with `engine-witchcraft`) by returning
+    /// `Some(Arc::new(...))` here.
+    #[cfg(feature = "text-search")]
+    fn text_search_engine(
+        &self,
+    ) -> Option<std::sync::Arc<dyn leyline_text_search::TextSearchEngine>> {
+        None
+    }
 }
 
 /// No-op extension that rejects all ops. Used when no private extension is registered.

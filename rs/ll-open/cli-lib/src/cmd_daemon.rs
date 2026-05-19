@@ -220,6 +220,15 @@ pub async fn run_daemon(
     let embed_queue: crate::daemon::embed::EmbedQueue =
         Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new()));
 
+    // Text-search engine: extension provides one (real Witchcraft engine,
+    // etc.), or fall back to NullEngine — the daemon op surface is wired
+    // either way; clients get a structured "no backend" error when no
+    // engine is installed, never "unknown op".
+    #[cfg(feature = "text-search")]
+    let text_search: Arc<dyn leyline_text_search::TextSearchEngine> = ext
+        .text_search_engine()
+        .unwrap_or_else(|| Arc::new(leyline_text_search::null::NullEngine::new()));
+
     // 6. Build context + spawn UDS socket.
     let ctx = Arc::new(DaemonContext {
         ctrl_path: ctrl_path.clone(),
@@ -258,6 +267,8 @@ pub async fn run_daemon(
         embedder: embedder.clone(),
         #[cfg(feature = "vec")]
         embed_queue: embed_queue.clone(),
+        #[cfg(feature = "text-search")]
+        text_search,
         sheaf: {
             let s = Arc::new(crate::daemon::sheaf_ops::SheafState::new());
             // Wire the event bus so `sheaf_set_topology` / `sheaf_invalidate`
@@ -1382,6 +1393,8 @@ mod tests {
             embedder,
             #[cfg(feature = "vec")]
             embed_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
+            #[cfg(feature = "text-search")]
+            text_search: Arc::new(leyline_text_search::null::NullEngine::new()),
             sheaf: Arc::new(crate::daemon::sheaf_ops::SheafState::new()),
         })
     }

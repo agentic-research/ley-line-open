@@ -80,6 +80,8 @@ fn default_test_ctx(ctrl_path: PathBuf) -> leyline_cli_lib::daemon::DaemonContex
         embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
         #[cfg(feature = "vec")]
         embed_queue: Arc::new(Mutex::new(std::collections::BinaryHeap::new())),
+        #[cfg(feature = "text-search")]
+        text_search: std::sync::Arc::new(leyline_text_search::null::NullEngine::new()),
         sheaf: Arc::new(leyline_cli_lib::daemon::sheaf_ops::SheafState::new()),
     }
 }
@@ -2142,6 +2144,8 @@ async fn test_embed_queue_drainer_refreshes_index() {
         vec_index: index.clone(),
         embedder,
         embed_queue: queue.clone(),
+        #[cfg(feature = "text-search")]
+        text_search: std::sync::Arc::new(leyline_text_search::null::NullEngine::new()),
         sheaf: Arc::new(leyline_cli_lib::daemon::sheaf_ops::SheafState::new()),
         ..default_test_ctx(ctrl_path)
     });
@@ -2205,6 +2209,8 @@ async fn test_op_vec_search_round_trip() {
         vec_index: index.clone(),
         embedder,
         embed_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
+        #[cfg(feature = "text-search")]
+        text_search: std::sync::Arc::new(leyline_text_search::null::NullEngine::new()),
         sheaf: Arc::new(leyline_cli_lib::daemon::sheaf_ops::SheafState::new()),
         ..default_test_ctx(ctrl_path)
     });
@@ -2732,6 +2738,8 @@ async fn test_op_vec_search_dim_mismatch_returns_clean_error() {
         vec_index: index,
         embedder,
         embed_queue: Arc::new(Mutex::new(std::collections::BinaryHeap::new())),
+        #[cfg(feature = "text-search")]
+        text_search: std::sync::Arc::new(leyline_text_search::null::NullEngine::new()),
         sheaf: Arc::new(leyline_cli_lib::daemon::sheaf_ops::SheafState::new()),
         ..default_test_ctx(ctrl_path)
     });
@@ -2749,6 +2757,181 @@ async fn test_op_vec_search_dim_mismatch_returns_clean_error() {
     assert!(
         err.contains("dim") || err.contains("expected") || err.contains("4"),
         "error should describe the dim mismatch; got: {err:?}",
+    );
+}
+
+/// `text_search` op surfaces the engine's structured error when no real
+/// backend is installed. The base daemon ships `NullEngine` as the default
+/// (extensions install Witchcraft via `DaemonExt::text_search_engine`); this
+/// test pins the contract that an un-extended daemon answers `text_search`
+/// with `ok: false` and an error mentioning the op name, not `unknown op`.
+///
+/// Mirrors `test_op_vec_search_round_trip` in structure but exercises the
+/// complementary text-search wire path.
+#[cfg(feature = "text-search")]
+#[tokio::test]
+async fn test_op_text_search_null_engine_returns_structured_error() {
+    use leyline_cli_lib::daemon::DaemonContext;
+    use std::sync::Arc;
+
+    let dir = TempDir::new().unwrap();
+    let (_arena, ctrl_path) = fresh_arena(dir.path());
+
+    let ctx = Arc::new(DaemonContext {
+        ..default_test_ctx(ctrl_path)
+    });
+
+    let sock_path = dir.path().join("text_search_null.sock");
+    spawn_test_socket(ctx, sock_path.clone()).await;
+
+    let parsed = uds_round_trip(&sock_path, r#"{"op":"text_search","query":"hello","k":5}"#).await;
+
+    // Critical: the wire response is "structured error", not "unknown op".
+    // The op is known; the backend just isn't wired. Clients can distinguish.
+    assert_eq!(
+        parsed["ok"], false,
+        "NullEngine search must surface as ok:false, not panic: {parsed}",
+    );
+    let err = parsed["error"].as_str().unwrap_or("");
+    assert!(
+        !err.contains("unknown op"),
+        "must not collapse into the unknown-op error path; got: {err:?}",
+    );
+    assert!(
+        err.contains("text_search") || err.contains("search"),
+        "error must identify the failing op; got: {err:?}",
+    );
+    assert!(
+        err.contains("not implemented") || err.contains("no backend"),
+        "error must surface the NullEngine reason (NotImplemented variant); got: {err:?}",
+    );
+}
+
+/// `text_search` with the required `query` field missing surfaces a wire
+/// error instead of a panic. Today the typed `BaseRequest::TextSearch`
+/// variant rejects the parse at the serde layer (the field has no
+/// `#[serde(default)]`), so the daemon's error envelope fires before any
+/// engine code runs. Pinned at the wire boundary so a future refactor
+/// that loosens the variant (e.g. wraps `query` in `Option`) gets caught
+/// here, not by a downstream consumer seeing a panic-derived 5xx.
+///
+/// (Note: we do NOT pin unknown-extra-field rejection. `BaseRequest`
+/// doesn't use `#[serde(deny_unknown_fields)]`, so extra args are
+/// silently ignored today. If that contract tightens, add a sibling
+/// test alongside this one.)
+#[cfg(feature = "text-search")]
+#[tokio::test]
+async fn test_op_text_search_missing_required_field_surfaces_wire_error() {
+    use leyline_cli_lib::daemon::DaemonContext;
+    use std::sync::Arc;
+
+    let dir = TempDir::new().unwrap();
+    let (_arena, ctrl_path) = fresh_arena(dir.path());
+
+    let ctx = Arc::new(DaemonContext {
+        ..default_test_ctx(ctrl_path)
+    });
+
+    let sock_path = dir.path().join("text_search_bad.sock");
+    spawn_test_socket(ctx, sock_path.clone()).await;
+
+    // Missing `query` field: serde rejects the typed parse; daemon
+    // surfaces a wire error, not a panic.
+    let parsed = uds_round_trip(&sock_path, r#"{"op":"text_search","k":5}"#).await;
+    assert!(
+        parsed.get("error").is_some(),
+        "missing-required-field request must surface as error: {parsed}",
+    );
+}
+
+/// Stub engine that returns a hard-coded hit. Lets the success-path
+/// test cover `op_text_search`'s `engine_hits → JSON response`
+/// translation without staging T5 model assets — the real
+/// WitchcraftEngine is exercised by the assets-gated acceptance
+/// test in `leyline-text-search`.
+#[cfg(feature = "text-search")]
+#[derive(Default)]
+struct StubHitEngine;
+
+#[cfg(feature = "text-search")]
+impl leyline_text_search::TextSearchEngine for StubHitEngine {
+    fn upsert(&self, _: &str, _: &str) -> leyline_text_search::Result<()> {
+        Ok(())
+    }
+    fn remove(&self, _: &str) -> leyline_text_search::Result<()> {
+        Ok(())
+    }
+    fn finalize(&self) -> leyline_text_search::Result<()> {
+        Ok(())
+    }
+    fn search(
+        &self,
+        _query: &str,
+        _k: usize,
+    ) -> leyline_text_search::Result<Vec<leyline_text_search::Hit>> {
+        Ok(vec![leyline_text_search::Hit {
+            node_id: "docs/adr/0014-capnp-as-protocol.md".to_string(),
+            score: 0.875,
+        }])
+    }
+    fn len(&self) -> leyline_text_search::Result<usize> {
+        Ok(1)
+    }
+    fn clear(&self) -> leyline_text_search::Result<()> {
+        Ok(())
+    }
+    fn storage_path(&self) -> Option<&std::path::Path> {
+        None
+    }
+}
+
+/// `text_search` happy path: with an engine installed that returns a
+/// hit, the daemon must serialise `{node_id, score}` rows into the
+/// `results` array and report `ok: true`. Pins the shape of the
+/// response that consumers (mache, cloister, rosary) actually parse —
+/// a refactor that drops a field or wraps the array in a sub-object
+/// breaks all of them and surfaces here at the wire.
+#[cfg(feature = "text-search")]
+#[tokio::test]
+async fn test_op_text_search_success_path_returns_hits() {
+    use leyline_cli_lib::daemon::DaemonContext;
+    use std::sync::Arc;
+
+    let dir = TempDir::new().unwrap();
+    let (_arena, ctrl_path) = fresh_arena(dir.path());
+
+    let ctx = Arc::new(DaemonContext {
+        text_search: Arc::new(StubHitEngine),
+        ..default_test_ctx(ctrl_path)
+    });
+
+    let sock_path = dir.path().join("text_search_ok.sock");
+    spawn_test_socket(ctx, sock_path.clone()).await;
+
+    let parsed = uds_round_trip(&sock_path, r#"{"op":"text_search","query":"capnp","k":3}"#).await;
+
+    assert_eq!(
+        parsed["ok"], true,
+        "happy path must report ok:true; got: {parsed}",
+    );
+    let results = parsed["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("results must be an array; got: {parsed}"));
+    assert_eq!(
+        results.len(),
+        1,
+        "stub returns exactly one hit; got: {parsed}",
+    );
+    assert_eq!(
+        results[0]["node_id"], "docs/adr/0014-capnp-as-protocol.md",
+        "node_id must round-trip through the response builder; got: {parsed}",
+    );
+    let score = results[0]["score"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("score must be a JSON number; got: {parsed}"));
+    assert!(
+        (score - 0.875).abs() < 1e-6,
+        "score must round-trip through the response builder; got: {score}",
     );
 }
 

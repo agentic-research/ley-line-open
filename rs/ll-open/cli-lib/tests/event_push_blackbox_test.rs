@@ -478,3 +478,137 @@ async fn sheaf_invalidate_event_reaches_uds_subscriber() {
          sheaf.invalidate even though the daemon ran the cascade",
     );
 }
+
+/// Pin the daemon-side topic-filter contract: a subscriber with a
+/// SPECIFIC topic pattern (no wildcards) must receive events on that
+/// topic and NOTHING ELSE — neither in the replay batch attached to
+/// the subscribe response NOR via live push thereafter.
+///
+/// Surfaced by `ley-line-open-cb12fa`: mache's evolve-coverage-trunk
+/// campaign + `tools/sheaf-subscribe-probe/main.go` observed the daemon
+/// emitting all events to every subscriber regardless of topic pattern.
+///
+/// Two failure paths exercised here:
+///
+///   1. **Replay leak.** Events emitted BEFORE the subscriber registers
+///      land in the EventLog. The subscribe response's `replay_count`
+///      counts them. If `EventLog::since()` returns the log slice without
+///      filtering by the subscriber's `topic` patterns, an unrelated
+///      pre-subscribe event leaks into the replay batch.
+///   2. **Live-push leak.** Events emitted AFTER subscribe must be
+///      dispatched only to subscribers whose patterns match. If the
+///      dispatch path's `Subscriber::matches()` call is bypassed by the
+///      writer-task / event-relay wiring from `ley-line-open-5caa59`,
+///      unrelated events leak through.
+///
+/// Both leaks have the same observable shape (subscriber sees topics it
+/// didn't request); the regression message names the path that failed.
+#[tokio::test]
+async fn subscribe_filters_events_by_topic_for_replay_and_live_push() {
+    let dir = TempDir::new().unwrap();
+    let ctx = build_blackbox_ctx(dir.path());
+    let sock = spawn_blackbox_socket(ctx, dir.path().join("topic-filter.sock")).await;
+
+    // ── Pre-subscribe noise: emit on a topic the subscriber will NOT
+    //    register. Pre-fix this lands in the EventLog and leaks into
+    //    the subscribe response's replay batch.
+    let mut pubc = UdsConn::connect(&sock).await;
+    pubc.send(
+        r#"{"op":"emit","topic":"noise.pre","source":"test","data":{"phase":"pre-subscribe"}}"#,
+    )
+    .await;
+    pubc.read_line(Duration::from_secs(2))
+        .await
+        .expect("pre-subscribe emit ack");
+
+    // ── Subscribe to a NARROW, LITERAL topic — no wildcards. The only
+    //    events the subscriber should ever see are exactly `target.event`.
+    let mut sub = UdsConn::connect(&sock).await;
+    sub.send(r#"{"op":"subscribe","topics":["target.event"]}"#)
+        .await;
+    let sub_resp_raw = sub
+        .read_line(Duration::from_secs(2))
+        .await
+        .expect("subscribe response");
+    let sub_resp: serde_json::Value =
+        serde_json::from_str(&sub_resp_raw).expect("subscribe response is JSON");
+    assert_eq!(sub_resp.get("ok"), Some(&serde_json::json!(true)));
+
+    // ── Replay-leak assertion. If `EventLog::since()` returned the
+    //    pre-subscribe `noise.pre` event, the response's replay_count is
+    //    non-zero. The contract: replay is filtered against the
+    //    subscriber's topic patterns same as live dispatch.
+    let replay_count = sub_resp
+        .get("replay_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    assert_eq!(
+        replay_count, 0,
+        "ley-line-open-cb12fa regression (replay path): topic-scoped \
+         subscribe must NOT replay events of unrelated topics. \
+         Subscribe response carried {replay_count} replay event(s) for \
+         `topics: [\"target.event\"]` after a `noise.pre` emit. Either \
+         `EventLog::since()` is not filtering by subscriber pattern, or \
+         `handle_subscribe` is appending the log slice without applying \
+         `Subscriber::matches()` to each replay entry."
+    );
+
+    // ── Post-subscribe noise: same idea, but exercises the LIVE path.
+    pubc.send(
+        r#"{"op":"emit","topic":"noise.post","source":"test","data":{"phase":"post-subscribe"}}"#,
+    )
+    .await;
+    pubc.read_line(Duration::from_secs(2))
+        .await
+        .expect("post-subscribe noise emit ack");
+
+    // ── Post-subscribe target: the ONE event the subscriber should see.
+    pubc.send(
+        r#"{"op":"emit","topic":"target.event","source":"test","data":{"phase":"on-topic"}}"#,
+    )
+    .await;
+    pubc.read_line(Duration::from_secs(2))
+        .await
+        .expect("target emit ack");
+
+    // ── Drain subscriber up to 2s. Collect every event seen.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut received_topics: Vec<String> = Vec::new();
+    while std::time::Instant::now() < deadline {
+        let line = match sub.read_line(Duration::from_millis(400)).await {
+            Some(l) => l,
+            None => continue,
+        };
+        let v: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v.get("event") != Some(&serde_json::json!(true)) {
+            continue;
+        }
+        let topic = v
+            .get("topic")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+        received_topics.push(topic);
+    }
+
+    // ── Live-push completeness: the subscribed event must arrive.
+    assert!(
+        received_topics.iter().any(|t| t == "target.event"),
+        "subscribed topic `target.event` must arrive on the live-push path; \
+         observed topics: {received_topics:?}",
+    );
+
+    // ── Live-push isolation: nothing OTHER than the subscribed topic.
+    for topic in &received_topics {
+        assert_eq!(
+            topic, "target.event",
+            "ley-line-open-cb12fa regression (live-push path): subscriber on \
+             `topics: [\"target.event\"]` received event on topic `{topic}` — \
+             dispatcher's `Subscriber::matches()` filter was bypassed somewhere \
+             in the live-push wiring. Full topic list received: {received_topics:?}",
+        );
+    }
+}

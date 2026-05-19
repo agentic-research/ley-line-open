@@ -254,11 +254,20 @@ impl EventRouter {
             overflow,
         };
 
-        // Replay from log before registering (so we don't double-deliver)
-        let (replay, gap) = {
+        // Replay from log before registering (so we don't double-deliver).
+        // Filter the slice against this subscriber's patterns + identity
+        // using the same `matches()` predicate the live-dispatch path
+        // uses — without this, the replay batch is a topic-blind firehose
+        // of everything currently in the EventLog, leaking unrelated
+        // events to topic-scoped subscribers (ley-line-open-cb12fa).
+        let (raw_replay, gap) = {
             let log = self.log.read().await;
             log.since(since)
         };
+        let replay: Vec<Event> = raw_replay
+            .into_iter()
+            .filter(|ev| sub.matches(&ev.topic, &ev.source))
+            .collect();
 
         self.subscribers.write().await.push(sub);
 

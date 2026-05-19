@@ -10,7 +10,76 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
-Nothing yet — post-v0.4.4 changes land here.
+Nothing yet — post-v0.4.5 changes land here.
+
+## [0.4.5] — 2026-05-19
+
+Patch release shipping the mache-bead campaign: typed event payloads,
+wire-format handshake, self-maintaining compatibility artifact, and
+HCL/Terraform parse support. All four work together — the handshake
+op surfaces the same constants the compatibility artifact derives from;
+the typed event-payload structs replace mache's hand-rolled
+`parseUint64` (which was one of the bugs the handshake exists to
+detect at connect time).
+
+### Added — `leyline_version` handshake op (ley-line-open-cb8960)
+
+- New op: `{"op":"leyline_version"}` returns binary_version,
+  schema_version, wire_format_major, compat_min, build_date.
+- Clients call once at connect to detect version drift up front
+  instead of suffering silent `parseUint64`-returns-0 behaviour
+  downstream.
+- Constants live in `rs/ll-open/cli-lib/src/daemon/version.rs` —
+  single source of truth for the substrate's version identity.
+- Capnp: new `LeylineVersionResponse` struct in `daemon.capnp`;
+  Go bindings regenerated.
+- Tests in `version_handshake_blackbox_test.rs`: shape contract,
+  idempotency, works-before-other-ops.
+
+### Added — self-maintaining `compatibility.json` (ley-line-open-cbea02)
+
+- New tool `rs/tools/compat-gen/` reads the `version.rs` constants
+  and emits `compatibility.json` to stdout. Committed at the repo
+  root; `task compat:check` is the CI gate that fails on drift.
+- No hand-maintained version matrix. Updating any compat fact is
+  exactly one edit in `version.rs`; the live `leyline_version` op
+  AND the committed compat artifact both follow automatically.
+- Doc `$schema_version: 1` field gates the artifact's own shape
+  so future consumers parsing it can detect doc-version drift.
+
+### Added — typed JSON event payload structs (ley-line-open-503971)
+
+- New Go sub-package `clients/go/leyline-schema/daemon/wire/`
+  with typed op-response structs (promoted from the previously
+  test-internal types in `daemon_protocol_test.go`) and per-topic
+  event-payload types: `Event` envelope plus
+  `SheafInvalidatePayload`, `SheafTopologyPayload` (covers both
+  set-topology and update-topology variants via the `Kind`
+  discriminator), `DaemonSnapshotPayload`, `DaemonHeadChanged`,
+  `DaemonFilesChanged`, `DaemonReparseComplete`, `DaemonOp`.
+- `DecodeEvent(b []byte) (Event, any, error)` — one call to
+  dispatch + decode; returns `json.RawMessage` for unknown topics
+  so forward-compat is structural.
+- Closes the silent-coercion bug class mache hit with hand-rolled
+  `parseUint64`. With typed `json.Unmarshal` + `,string` tags,
+  malformed input is a typed error the caller sees.
+- Schema-client release tag `clients/go/leyline-schema/v0.4.5`
+  follows this binary release.
+
+### Added — HCL / Terraform parse support
+
+- `leyline-ts` adds an `hcl` feature gating `tree-sitter-hcl = "1"`.
+- `TsLanguage::Hcl` variant + aliases on every dispatch path:
+  `from_name` accepts `hcl` / `terraform` / `tf` / `tfvars`
+  (case-insensitive); `from_extension` accepts `.tf` / `.tfvars`
+  / `.hcl` (case-insensitive).
+- Daemon picks up the new language via cli-lib's feature pull —
+  no per-consumer enablement needed.
+- One grammar covers HCL + Terraform + Nomad + Vault + Packer +
+  Consul Template per upstream's coverage.
+- Tests: alias-set pins on extension + name paths, plus an
+  end-to-end parse of a real Terraform fragment (terraform block
+  + variable + resource).
 
 ## [0.4.4] — 2026-05-19
 

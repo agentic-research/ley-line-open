@@ -20,6 +20,11 @@ pub enum TsLanguage {
     Python,
     #[cfg(feature = "elixir")]
     Elixir,
+    /// HashiCorp Configuration Language. Same grammar covers Terraform
+    /// (.tf / .tfvars / .hcl) — there is no separate Terraform grammar;
+    /// the `tree-sitter-hcl` crate handles both.
+    #[cfg(feature = "hcl")]
+    Hcl,
 }
 
 impl TsLanguage {
@@ -40,6 +45,8 @@ impl TsLanguage {
             TsLanguage::Python => tree_sitter_python::LANGUAGE.into(),
             #[cfg(feature = "elixir")]
             TsLanguage::Elixir => tree_sitter_elixir::LANGUAGE.into(),
+            #[cfg(feature = "hcl")]
+            TsLanguage::Hcl => tree_sitter_hcl::LANGUAGE.into(),
         }
     }
 
@@ -60,6 +67,13 @@ impl TsLanguage {
             TsLanguage::Python => "python",
             #[cfg(feature = "elixir")]
             TsLanguage::Elixir => "elixir",
+            #[cfg(feature = "hcl")]
+            // Canonical name is "hcl" — the grammar covers Terraform too,
+            // but consumers spell it "hcl" in the language tag because one
+            // grammar can't sensibly answer to two names without picking
+            // one as canonical. Terraform spellings are aliased in
+            // `from_name` + `from_extension` below.
+            TsLanguage::Hcl => "hcl",
         }
     }
 
@@ -80,6 +94,8 @@ impl TsLanguage {
             "python" | "py" => Ok(TsLanguage::Python),
             #[cfg(feature = "elixir")]
             "elixir" | "ex" | "exs" => Ok(TsLanguage::Elixir),
+            #[cfg(feature = "hcl")]
+            "hcl" | "terraform" | "tf" | "tfvars" => Ok(TsLanguage::Hcl),
             _ => bail!("unsupported language: {name}"),
         }
     }
@@ -118,6 +134,12 @@ impl TsLanguage {
             "py" | "pyi" => Some(TsLanguage::Python),
             #[cfg(feature = "elixir")]
             "ex" | "exs" => Some(TsLanguage::Elixir),
+            // .tf is the dominant Terraform spelling; .tfvars is the
+            // variables-only file; .hcl is the vanilla HCL extension
+            // (Nomad, Vault, Packer, Consul Template). One grammar
+            // covers all three.
+            #[cfg(feature = "hcl")]
+            "tf" | "tfvars" | "hcl" => Some(TsLanguage::Hcl),
             _ => None,
         }
     }
@@ -170,9 +192,87 @@ mod tests {
             assert_eq!(TsLanguage::from_extension("ex"), Some(TsLanguage::Elixir));
             assert_eq!(TsLanguage::from_extension("exs"), Some(TsLanguage::Elixir));
         }
+        #[cfg(feature = "hcl")]
+        {
+            assert_eq!(TsLanguage::from_extension("tf"), Some(TsLanguage::Hcl));
+            assert_eq!(TsLanguage::from_extension("tfvars"), Some(TsLanguage::Hcl));
+            assert_eq!(TsLanguage::from_extension("hcl"), Some(TsLanguage::Hcl));
+            // Case-insensitive: Terraform configs occasionally appear as
+            // .TF on case-preserving file systems (Windows shares,
+            // mismatched git config).
+            assert_eq!(TsLanguage::from_extension("TF"), Some(TsLanguage::Hcl));
+        }
 
         // Unknown extension → None, never default to one language.
         assert_eq!(TsLanguage::from_extension("unknown_lang_ext"), None);
         assert_eq!(TsLanguage::from_extension(""), None);
+    }
+
+    /// Pin Terraform-spelling aliases on the `from_name` path. Mache and
+    /// other consumers pass the language tag explicitly (`--lang
+    /// terraform`); the grammar covers all four spellings, so all four
+    /// must round-trip to the same TsLanguage variant.
+    #[cfg(feature = "hcl")]
+    #[test]
+    fn hcl_aliases_all_resolve_to_one_language() {
+        for spelling in ["hcl", "terraform", "tf", "tfvars", "HCL", "Terraform"] {
+            let lang = TsLanguage::from_name(spelling)
+                .unwrap_or_else(|e| panic!("from_name({spelling:?}): {e}"));
+            assert_eq!(
+                lang,
+                TsLanguage::Hcl,
+                "spelling {spelling:?} must resolve to TsLanguage::Hcl",
+            );
+        }
+    }
+
+    /// Parses a tiny Terraform fragment end-to-end to verify the grammar
+    /// is actually wired through `ts_language()`. The fragment uses the
+    /// resource / variable / provider primitives that any real .tf file
+    /// has; if the grammar is broken or mis-wired, this fails at the
+    /// `parse()` call.
+    #[cfg(feature = "hcl")]
+    #[test]
+    fn hcl_parses_minimal_terraform_fragment() {
+        use tree_sitter::Parser;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&TsLanguage::Hcl.ts_language())
+            .expect("set_language hcl");
+        let src = r#"
+terraform {
+  required_version = ">= 1.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+variable "region" {
+  type    = string
+  default = "us-west-2"
+}
+
+resource "aws_s3_bucket" "logs" {
+  bucket = "example-logs"
+  tags = {
+    Environment = "prod"
+  }
+}
+"#;
+        let tree = parser
+            .parse(src, None)
+            .expect("parse() must return a tree for valid Terraform");
+        let root = tree.root_node();
+        assert!(
+            !root.has_error(),
+            "valid Terraform fragment must parse without errors; root: {root:?}",
+        );
+        assert!(
+            root.named_child_count() > 0,
+            "root must have named children (block / variable / resource); got 0",
+        );
     }
 }

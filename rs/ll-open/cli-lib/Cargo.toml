@@ -21,7 +21,7 @@ leyline-lsp = { path = "../lsp", optional = true }
 leyline-hdc = { path = "../hdc", optional = true }
 leyline-text-search = { path = "../text-search", optional = true }
 leyline-sheaf = { path = "../sheaf" }
-leyline-ts = { path = "../ts", features = ["html", "markdown", "json", "yaml", "go", "python", "elixir"] }
+leyline-ts = { path = "../ts", features = ["html", "markdown", "json", "yaml", "go", "python", "elixir", "hcl"] }
 leyline-schema = { path = "../../ll-core/schema" }
 leyline-schema-capnp = { path = "../../ll-core/schema-capnp" }
 leyline-public-schema = { path = "../../ll-core/public-schema" }

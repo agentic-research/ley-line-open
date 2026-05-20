@@ -126,6 +126,28 @@ pub trait ContentAddressed {
     fn hash(&self) -> Hash;
 }
 
+/// Canonical `σ` impl for raw bytes — BLAKE3 of the buffer.
+///
+/// Algorithm-locked per Σ §3.4 (substrate decade write-up). `Vec<u8>`,
+/// `[u8; N]`, and `&[u8]` all reach this impl through deref / unsizing
+/// coercion, so callers can write `bytes.hash()` without ceremony.
+///
+/// This impl fulfills the trait-doc promise on `ContentAddressed`
+/// ("default impl for `[u8]` and `Vec<u8>` hashes the raw bytes via
+/// BLAKE3") and is the σ entry point for substrate-aware call sites
+/// (replacing inline `blake3::hash(...)` per bead
+/// `ley-line-open-082202`).
+///
+/// Empty input: `(&[]).hash()` returns the canonical BLAKE3-of-empty
+/// hash (`af1349b9…`), **not** `Hash::ZERO`. Call sites that branch on
+/// the zero sentinel for "no root yet" semantics must keep that check
+/// — it's a substrate convention, not a hash-of-empty equality.
+impl ContentAddressed for [u8] {
+    fn hash(&self) -> Hash {
+        Hash(*blake3::hash(self).as_bytes())
+    }
+}
+
 /// `ρ : 𝓒 → 𝓥 ∪ {⊥}` — content-addressed retrieval, plus immutable
 /// insertion.
 ///
@@ -279,5 +301,98 @@ mod tests {
         let s = format!("{h:?}");
         assert!(s.starts_with("abababab"));
         assert!(s.ends_with('…'));
+    }
+
+    // ---------------------------------------------------------------
+    // `impl ContentAddressed for [u8]` conformance tests
+    // (bead ley-line-open-082202).
+    //
+    // These tests are the executable specification for the σ function.
+    // Any future re-implementation (different chunking strategy, different
+    // algorithm in a Σ' decade, etc.) must keep them passing — they
+    // are the load-bearing contract that downstream call-site retrofits
+    // (Phase 3) depend on.
+    // ---------------------------------------------------------------
+
+    /// The σ-via-method-call result must equal the inline
+    /// `blake3::hash(bytes).into()` result byte-for-byte. This is the
+    /// load-bearing pin for Phase 3 migration: every retrofit replaces
+    /// `blake3::hash(bytes).into()` with `bytes.hash()` and depends on
+    /// this equality holding.
+    #[test]
+    fn content_addressed_matches_inline_blake3_byte_for_byte() {
+        let payloads: &[&[u8]] = &[
+            b"",
+            b"a",
+            b"the substrate's content vocabulary V is raw bytes",
+            &[0u8; 1024],
+            &[0xffu8; 65_537],
+        ];
+        for &bytes in payloads {
+            let via_trait: Hash = bytes.hash();
+            let via_inline: [u8; 32] = blake3::hash(bytes).into();
+            assert_eq!(
+                via_trait.as_bytes(),
+                &via_inline,
+                "ContentAddressed::hash MUST equal blake3::hash byte-for-byte; \
+                 input.len() = {}",
+                bytes.len(),
+            );
+        }
+    }
+
+    /// (DET) Determinism axiom: two calls on the same bytes return the
+    /// same `Hash`. Cheap to pin; surfaces an impl that accidentally
+    /// included a salt, nonce, or instance-id.
+    #[test]
+    fn content_addressed_is_deterministic_across_calls() {
+        let bytes = b"determinism is a substrate axiom";
+        let a = bytes.hash();
+        let b = bytes.hash();
+        assert_eq!(a, b);
+    }
+
+    /// `Vec<u8>` and `&[u8]` reach the impl via deref / unsizing
+    /// coercion. A future refactor that boxed or wrapped the impl
+    /// could break this ergonomic; pin it.
+    #[test]
+    fn content_addressed_works_through_vec_and_array_deref() {
+        let bytes: Vec<u8> = b"deref into [u8]".to_vec();
+        let slice: &[u8] = &bytes;
+        let array: [u8; 16] = *b"deref into [u8] ";
+        let array_slice: &[u8] = &array[..15]; // trim padding
+
+        // Same bytes → same hash, regardless of source container.
+        assert_eq!(bytes.hash(), slice.hash());
+        assert_eq!(slice.hash(), array_slice.hash());
+    }
+
+    /// Empty input must NOT collapse to `Hash::ZERO`. `Hash::ZERO` is
+    /// the substrate's "no current root" sentinel (see Hash::ZERO
+    /// docstring); confusing it with `hash(&[])` would silently break
+    /// the `RootPointer` semantics that compare against the sentinel.
+    ///
+    /// BLAKE3-of-empty starts with the bytes `af1349b9 f5f9a1a6 …`. Pin
+    /// the first byte rather than the full hash so this test doesn't
+    /// have to be edited if BLAKE3's empty-input bytes ever change
+    /// (they will not, but the pin form is forward-shaped anyway).
+    #[test]
+    fn content_addressed_empty_input_is_not_zero_sentinel() {
+        let h = (&[] as &[u8]).hash();
+        assert_ne!(h, Hash::ZERO, "hash(&[]) MUST NOT equal Hash::ZERO");
+        // BLAKE3 of the empty string is fixed at af1349b9f5f9a1a6a0404dea36dcc949 …
+        // Pin the first byte to catch an accidental algorithm swap.
+        assert_eq!(h.as_bytes()[0], 0xaf);
+    }
+
+    /// Round-trip: hashing bytes, taking `as_bytes`, reconstructing via
+    /// `Hash::from_bytes` produces an equal `Hash`. Pins that the
+    /// impl populates the newtype consistently with the byte API.
+    #[test]
+    fn content_addressed_round_trips_through_from_bytes() {
+        let bytes = b"round-trip the substrate's identity";
+        let original = bytes.hash();
+        let reconstructed = Hash::from_bytes(*original.as_bytes());
+        assert_eq!(original, reconstructed);
     }
 }

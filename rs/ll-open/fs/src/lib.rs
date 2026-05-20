@@ -7,7 +7,7 @@ pub mod staging;
 pub mod validate;
 
 use anyhow::{Context, Result, bail};
-use leyline_core::{ArenaHeader, Controller};
+use leyline_core::{ArenaHeader, ContentAddressed, Controller};
 use memmap2::Mmap;
 use rusqlite::Connection;
 use serde::Serialize;
@@ -79,7 +79,10 @@ fn verify_arena_root<'a>(
         );
     }
 
-    let actual: [u8; 32] = blake3::hash(data).into();
+    // σ via the substrate's ContentAddressed impl (Σ §3.4 locks BLAKE3).
+    // Retrofitted from inline `blake3::hash` per bead
+    // `ley-line-open-32201a`.
+    let actual: [u8; 32] = *data.hash().as_bytes();
     if actual != expected {
         bail!(
             "T2.3 arena root mismatch — substrate corruption detected. \

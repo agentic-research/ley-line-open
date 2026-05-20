@@ -4,8 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use blake3;
-use leyline_core::{ArenaHeader, Controller, create_arena, write_to_arena};
+use leyline_core::{ArenaHeader, ContentAddressed, Controller, create_arena, write_to_arena};
 
 /// CLI entry point: read the .db from disk, then delegate to [`load_into_arena`].
 pub fn cmd_load(db: &Path, control: &Path) -> Result<()> {
@@ -57,10 +56,12 @@ pub fn load_into_arena(control: &Path, db_bytes: &[u8]) -> Result<()> {
 
     write_to_arena(&mut mmap, db_bytes).context("write to arena")?;
 
-    // Publish via current_root (BLAKE3 of db bytes) — bead
-    // `ley-line-open-baee26`. The CAS root advance IS the publish
-    // event; readers detect by comparing current_root.
-    let current_root: [u8; 32] = blake3::hash(db_bytes).into();
+    // Publish via current_root (Σ σ — BLAKE3 of db bytes via the
+    // substrate's ContentAddressed impl) — bead `ley-line-open-baee26`.
+    // The CAS root advance IS the publish event; readers detect by
+    // comparing current_root. Retrofitted from inline `blake3::hash`
+    // per bead `ley-line-open-32201a`.
+    let current_root: [u8; 32] = *db_bytes.hash().as_bytes();
     ctrl.set_arena_with_root(&arena_path, arena_size, current_root)
         .context("publish current_root (load advance)")?;
 

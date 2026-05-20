@@ -60,6 +60,9 @@
 # pattern other repos in the workspace use (rosary/, mache/, signet/).
 # Binary SQLite diff is acceptable for an N≈100 bead corpus.
 !.beads/**
+# SQLite WAL/shared-memory sidecars are transient — never commit.
+.beads/*.db-wal
+.beads/*.db-shm
 
 # Go bindings module — clients/go/leyline-schema/ ships generated *.capnp.go
 # files; the regen-diff CI gate (.github/workflows/leyline-schema-go.yml)

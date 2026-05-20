@@ -10,6 +10,7 @@ use std::process::Child;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use leyline_core::ContentAddressed;
 #[cfg(feature = "mount")]
 use leyline_fs::graph::HotSwapGraph;
 
@@ -730,8 +731,10 @@ pub fn snapshot_to_arena(conn: &rusqlite::Connection, ctrl_path: &Path) -> Resul
     // Step 4: atomic publish — write current_root under Release-ordering
     // (T2.2 + T2.4). Polling readers see current_root change, refresh,
     // observe (new_size, new active_buffer, new current_root).
-    // current_root = BLAKE3(serialized db bytes); Σ §3.4 locks BLAKE3.
-    let current_root: [u8; 32] = blake3::hash(&db_bytes).into();
+    // current_root = σ(serialized db bytes) via the substrate's
+    // ContentAddressed impl; Σ §3.4 locks BLAKE3. Retrofitted from
+    // inline `blake3::hash` per bead `ley-line-open-32201a`.
+    let current_root: [u8; 32] = *db_bytes.as_ref().hash().as_bytes();
     ctrl.set_arena_with_root(&arena_path, new_size, current_root)
         .context("publish current_root (snapshot advance)")?;
 

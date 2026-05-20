@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use leyline_core::{ArenaHeader, Controller};
+use leyline_core::{ArenaHeader, ContentAddressed, Controller};
 
 use crate::SqliteGraph;
 
@@ -951,7 +951,11 @@ impl HotSwapGraph {
         let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
         leyline_core::layout::write_to_arena(&mut mmap, &bytes)?;
 
-        let new_root: [u8; 32] = blake3::hash(&bytes).into();
+        // σ via the substrate's ContentAddressed impl (Σ §3.4 locks BLAKE3).
+        // Retrofitted from inline `blake3::hash` per bead
+        // `ley-line-open-32201a`. graph.rs:1449's blake3::hash call stays
+        // inline — that's a #[test] oracle, not a production bypass.
+        let new_root: [u8; 32] = *bytes.as_slice().hash().as_bytes();
         let mut ctrl = Controller::open_or_create(&self.control_path)?;
         ctrl.set_arena_with_root(&arena_path, arena_size, new_root)?;
 

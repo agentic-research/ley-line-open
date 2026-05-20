@@ -270,8 +270,37 @@ tasks:
         fi
         echo "compatibility.json is up to date"
 
+  gen:server-json:
+    desc: |
+      Regenerate server.json from leyline-cli-lib::daemon::mcp
+      (tool_registry + cloister_groups). Self-maintaining MCP Registry
+      surface (bead ley-line-open-f10abb). Run before committing any
+      change to the MCP tool surface or cloister group partitioning.
+    dir: rs
+    cmds:
+      - cargo run -p server-json-gen --quiet > ../server.json
+      - echo "regenerated server.json"
+
+  gen:server-json:check:
+    desc: |
+      Verify the committed server.json matches what server-json-gen
+      would emit today. CI invariant — fails the build on drift. Mirrors
+      the discipline `compat:check` uses for compatibility.json.
+    dir: rs
+    cmds:
+      - |
+        EXPECTED="$(cargo run -p server-json-gen --quiet)"
+        ACTUAL="$(cat ../server.json)"
+        if [ "$EXPECTED" != "$ACTUAL" ]; then
+          echo "server.json is stale — run 'task gen:server-json' and commit"
+          echo "--- diff ---"
+          diff <(echo "$EXPECTED") <(echo "$ACTUAL") || true
+          exit 1
+        fi
+        echo "server.json is up to date"
+
   ci:
-    desc: Full CI pipeline (check + clippy + fmt + FFI staticlib + tier isolation + test + perf gates + compat)
+    desc: Full CI pipeline (check + clippy + fmt + FFI staticlib + tier isolation + test + perf gates + compat + server.json drift)
     cmds:
       - task: check
       - task: clippy
@@ -281,3 +310,4 @@ tasks:
       - task: test
       - task: test:perf
       - task: compat:check
+      - task: gen:server-json:check

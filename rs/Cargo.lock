@@ -4978,6 +4978,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "server-json-gen"
+version = "0.4.5"
+dependencies = [
+ "anyhow",
+ "leyline-cli-lib",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "sha1_smol"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

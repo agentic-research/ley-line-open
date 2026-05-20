@@ -24,17 +24,59 @@
         {
           "name": "lsp",
           "advertisedPrefix": "lsp_",
-          "upstreamNames": ["lsp_hover", "lsp_defs", "lsp_refs", "lsp_symbols", "lsp_diagnostics"]
+          "upstreamNames": [
+            "lsp_hover",
+            "lsp_defs",
+            "lsp_refs",
+            "lsp_symbols",
+            "lsp_diagnostics"
+          ]
         },
         {
           "name": "lifecycle",
           "advertisedPrefix": "",
-          "upstreamNames": ["status", "enrich", "reparse"]
+          "upstreamNames": [
+            "status",
+            "snapshot",
+            "reparse",
+            "enrich"
+          ]
         },
         {
           "name": "sheaf",
           "advertisedPrefix": "sheaf_",
-          "upstreamNames": ["sheaf_set_topology"]
+          "upstreamNames": [
+            "sheaf_set_topology",
+            "sheaf_invalidate",
+            "sheaf_defect",
+            "sheaf_stalks",
+            "sheaf_status",
+            "sheaf_learned_weights"
+          ]
+        },
+        {
+          "name": "query",
+          "advertisedPrefix": "",
+          "upstreamNames": [
+            "query",
+            "list_children",
+            "read_content",
+            "find_callers",
+            "find_defs",
+            "find_callees",
+            "get_refs_map",
+            "get_defs_map",
+            "get_schema",
+            "get_db_path",
+            "get_node"
+          ]
+        },
+        {
+          "name": "wire",
+          "advertisedPrefix": "",
+          "upstreamNames": [
+            "leyline_version"
+          ]
         }
       ]
     }

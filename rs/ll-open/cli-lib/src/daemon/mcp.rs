@@ -41,13 +41,24 @@ use super::DaemonContext;
 
 /// One entry in `tools/list`. Names must match the `op` field that
 /// `ops::handle_base_op` already dispatches on.
-struct McpTool {
-    name: &'static str,
-    description: &'static str,
-    schema: Value,
+///
+/// `pub` so out-of-tree generators (e.g. `tools/server-json-gen`) can
+/// emit MCP Registry artifacts derived from the live registry. The
+/// `tool_registry()` function is the canonical source of truth for the
+/// MCP tool surface; downstream consumers MUST NOT hand-maintain a
+/// parallel list (bead `ley-line-open-f10abb`).
+pub struct McpTool {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub schema: Value,
 }
 
-fn tool_registry() -> Vec<McpTool> {
+/// Build the canonical tool registry. The MCP `tools/list` response,
+/// the generated `server.json` (`tools/server-json-gen`), and the
+/// `cloister_groups()` partitioning all derive from this single list.
+/// Feature-gated entries (`vec_search`, `text_search`) appear only when
+/// the corresponding cargo features are enabled.
+pub fn tool_registry() -> Vec<McpTool> {
     #[allow(unused_mut)]
     let mut tools = vec![
         McpTool {
@@ -322,6 +333,116 @@ fn tool_registry() -> Vec<McpTool> {
     });
 
     tools
+}
+
+// ---------------------------------------------------------------------------
+// Cloister `_meta.art.cloister/v1.groups[]` partitioning.
+// ---------------------------------------------------------------------------
+//
+// Co-located with `tool_registry()` so the partitioning of LLO's tool
+// surface into cloister-resolver backends stays in code, not in a
+// hand-maintained JSON artifact at the repo root. See
+// `cloister/cloister-spec/mcp-tool/v1/wire/meta-groups.md` for the wire
+// contract; the matching cargo bin (`tools/server-json-gen`) reads
+// these declarations to emit `server.json` at the LLO repo root with a
+// CI drift gate (`task gen:server-json:check`).
+//
+// Coverage policy: every tool returned by `tool_registry()` MUST appear
+// in exactly one group's `upstream_names`. `server-json-gen` enforces
+// this at generation time and fails the build on partial coverage.
+
+/// One entry in the `_meta.art.cloister/v1.groups[]` block emitted into
+/// `server.json`. Mirrors the wire shape described in
+/// `cloister/cloister-spec/mcp-tool/v1/wire/meta-groups.md`.
+pub struct CloisterGroupDecl {
+    pub name: &'static str,
+    pub advertised_prefix: &'static str,
+    pub upstream_names: Vec<&'static str>,
+}
+
+/// Partition the canonical tool registry into the operator-facing
+/// cloister backend groups. Feature-gated tools (`vec_search`,
+/// `text_search`) land in their own single-tool groups so they only
+/// appear in the generated `server.json` when those features ship.
+pub fn cloister_groups() -> Vec<CloisterGroupDecl> {
+    #[allow(unused_mut)]
+    let mut groups = vec![
+        // LSP — every tool already carries the `lsp_` prefix; the
+        // advertised name matches verbatim per the spec's
+        // don't-double-prefix rule.
+        CloisterGroupDecl {
+            name: "lsp",
+            advertised_prefix: "lsp_",
+            upstream_names: vec![
+                "lsp_hover",
+                "lsp_defs",
+                "lsp_refs",
+                "lsp_symbols",
+                "lsp_diagnostics",
+            ],
+        },
+        // Lifecycle — daemon control ops. Bare-name advertisement.
+        CloisterGroupDecl {
+            name: "lifecycle",
+            advertised_prefix: "",
+            upstream_names: vec!["status", "snapshot", "reparse", "enrich"],
+        },
+        // Sheaf cache — every tool carries the `sheaf_` prefix.
+        CloisterGroupDecl {
+            name: "sheaf",
+            advertised_prefix: "sheaf_",
+            upstream_names: vec![
+                "sheaf_set_topology",
+                "sheaf_invalidate",
+                "sheaf_defect",
+                "sheaf_stalks",
+                "sheaf_status",
+                "sheaf_learned_weights",
+            ],
+        },
+        // Query / graph navigation — bare-name advertisement; these
+        // are the read-side ops over the projected db.
+        CloisterGroupDecl {
+            name: "query",
+            advertised_prefix: "",
+            upstream_names: vec![
+                "query",
+                "list_children",
+                "read_content",
+                "find_callers",
+                "find_defs",
+                "find_callees",
+                "get_refs_map",
+                "get_defs_map",
+                "get_schema",
+                "get_db_path",
+                "get_node",
+            ],
+        },
+        // Wire-compat handshake. Single-tool group so the version
+        // probe stays an explicit, separately-routable backend.
+        CloisterGroupDecl {
+            name: "wire",
+            advertised_prefix: "",
+            upstream_names: vec!["leyline_version"],
+        },
+    ];
+
+    #[cfg(feature = "vec")]
+    groups.push(CloisterGroupDecl {
+        name: "vec",
+        advertised_prefix: "",
+        upstream_names: vec!["vec_search"],
+    });
+
+    #[cfg(feature = "text-search")]
+    groups.push(CloisterGroupDecl {
+        name: "text-search",
+        advertised_prefix: "",
+        upstream_names: vec!["text_search"],
+    });
+
+    groups
 }
 
 fn position_schema() -> Value {
@@ -688,6 +809,65 @@ mod tests {
             "lsp_diagnostics",
         ] {
             assert!(names.contains(op), "missing LSP tool: {op}");
+        }
+    }
+
+    #[test]
+    fn cloister_groups_cover_every_registered_tool_exactly_once() {
+        // Coverage policy from bead `ley-line-open-f10abb`: every tool
+        // returned by `tool_registry()` MUST appear in exactly one
+        // group's `upstream_names`. Adding a tool without claiming it
+        // in `cloister_groups()` fails CI here (and in the
+        // `server-json-gen` drift gate); removing a tool without
+        // pruning its group entry fails here too.
+        let registry: std::collections::HashSet<&str> =
+            tool_registry().into_iter().map(|t| t.name).collect();
+        let groups = cloister_groups();
+
+        // Build a name -> group-count map across all groups.
+        let mut owner: std::collections::HashMap<&str, Vec<&str>> = Default::default();
+        for g in &groups {
+            assert!(!g.name.is_empty(), "group `name` must be non-empty");
+            assert!(
+                !g.upstream_names.is_empty(),
+                "group `{}` has empty upstream_names — spec violation",
+                g.name,
+            );
+            for tool in &g.upstream_names {
+                owner.entry(tool).or_default().push(g.name);
+            }
+        }
+
+        // Every registered tool is claimed.
+        for tool in &registry {
+            assert!(
+                owner.contains_key(tool),
+                "tool `{tool}` is in tool_registry() but no cloister group claims it",
+            );
+        }
+
+        // Every claim points to a real tool, and no tool is claimed by
+        // more than one group.
+        for (tool, names) in &owner {
+            assert!(
+                registry.contains(tool),
+                "group claim `{tool}` is not in tool_registry()",
+            );
+            assert_eq!(
+                names.len(),
+                1,
+                "tool `{tool}` claimed by multiple groups: {names:?}",
+            );
+        }
+
+        // Group names must be unique within the array.
+        let mut seen = std::collections::HashSet::new();
+        for g in &groups {
+            assert!(
+                seen.insert(g.name),
+                "duplicate cloister group name: {}",
+                g.name,
+            );
         }
     }
 

@@ -1,0 +1,19 @@
+[package]
+name = "server-json-gen"
+version = "0.4.5"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Generate server.json from leyline-cli-lib::daemon::mcp (tool_registry + cloister_groups). MCP Registry schema 2025-12-11 with the cloister _meta.art.cloister/v1 block. Per bead ley-line-open-f10abb."
+
+[[bin]]
+name = "server-json-gen"
+path = "src/main.rs"
+
+[dependencies]
+# Imports the daemon's MCP tool registry + cloister group declarations
+# — this is the single source of truth. server-json-gen has no opinion
+# of its own; it's a printer over leyline-cli-lib's mcp module.
+leyline-cli-lib = { path = "../../ll-open/cli-lib" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"

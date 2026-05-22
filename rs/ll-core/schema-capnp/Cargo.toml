@@ -12,8 +12,28 @@ description = "Cap'n Proto schemas for Σ event log — typed producer/consumer 
 # check; the friction is intentional. See docs/adr/0014-capnp-as-protocol.md.
 capnp = "=0.25.0"
 
+[dev-dependencies]
+# Used by the gen_build_cache_vectors example (writes cloister-spec/build-cache/v1
+# conformance vectors). Pinned to substrate's BLAKE3 dep (leyline-core also pins
+# blake3 = "1").
+blake3 = "1"
+# Used to author the OCI manifest JSON in the vector generator. Serde is the
+# repository default JSON shape (already a transitive dep via several crates).
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1"
+# Hex encoding for digest strings.
+hex = "0.4"
+
 [build-dependencies]
 capnpc = "=0.25.0"
+
+[[example]]
+name = "gen_build_cache_vectors"
+# Regenerates cloister-spec/build-cache/v1/vectors/* deterministically.
+# Usage:
+#   cargo run -p leyline-schema-capnp --example gen_build_cache_vectors -- \
+#       ../../cloister/cloister-spec/build-cache/v1/vectors
+path = "examples/gen_build_cache_vectors.rs"
 
 [features]
 # T8.10: regenerate cross-runtime fixtures. With this feature on, the

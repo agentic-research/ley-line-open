@@ -138,6 +138,133 @@ impl FsBlobStore {
     pub fn root(&self) -> &Path {
         &self.root
     }
+
+    /// Sweep stale `.tmp-*` files left behind by crashed writers, or
+    /// by the race-recovery path where two concurrent putters both
+    /// successfully wrote a temp file but only one's rename onto the
+    /// final path won.
+    ///
+    /// "Stale" = modified more than `threshold` ago. A safe default is
+    /// 1 hour: long enough that no in-flight write should still hold
+    /// the temp file, short enough that storage doesn't accumulate
+    /// indefinitely.
+    ///
+    /// Best-effort: individual `remove_file` failures are logged via
+    /// the return value's `errors` field but do NOT bubble up. The
+    /// caller decides whether to alert on non-empty errors.
+    ///
+    /// Returns a [`SweepReport`] with the count of swept files, the
+    /// paths swept (for diagnostic logging), and any per-file errors.
+    ///
+    /// Bead `ley-line-open-bb0316` follow-up: this addresses the
+    /// orphaned-temp-file leak that the race-fix in commit `1fffd67`
+    /// noted as out-of-scope. Callers that want sweeping invoke it
+    /// explicitly (mache push startup, periodic maintenance);
+    /// `open()` does NOT auto-sweep so the fast path stays fast.
+    pub fn sweep_stale_temps(&self, threshold: std::time::Duration) -> SweepReport {
+        let mut report = SweepReport::default();
+        let now = std::time::SystemTime::now();
+
+        let bucket_iter = match fs::read_dir(&self.root) {
+            Ok(it) => it,
+            Err(_) => return report, // root missing → nothing to sweep
+        };
+
+        for bucket_entry in bucket_iter.flatten() {
+            let bucket_path = bucket_entry.path();
+            if !bucket_path.is_dir() {
+                continue;
+            }
+            // Only sweep the 2-hex-char bucket dirs that put() creates.
+            // Skip anything else (e.g. a stray file at root level, or
+            // a non-2-char directory from an external tool).
+            let bucket_name = match bucket_path.file_name().and_then(|n| n.to_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            if bucket_name.len() != 2
+                || !bucket_name.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                continue;
+            }
+
+            let inner_iter = match fs::read_dir(&bucket_path) {
+                Ok(it) => it,
+                Err(_) => continue,
+            };
+            for entry in inner_iter.flatten() {
+                let name = entry.file_name();
+                let name_str = match name.to_str() {
+                    Some(s) => s,
+                    None => continue,
+                };
+                if !name_str.starts_with(".tmp-") {
+                    continue;
+                }
+                // Determine age. If the system clock has moved backward
+                // (mtime > now), treat the file as fresh (don't sweep) —
+                // we'd rather leak a temp than delete a possibly-active
+                // one based on a clock-skew bug.
+                let path = entry.path();
+                let metadata = match entry.metadata() {
+                    Ok(m) => m,
+                    Err(e) => {
+                        report.errors.push((path.clone(), e.to_string()));
+                        continue;
+                    }
+                };
+                let mtime = match metadata.modified() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        report.errors.push((path.clone(), e.to_string()));
+                        continue;
+                    }
+                };
+                let age = match now.duration_since(mtime) {
+                    Ok(d) => d,
+                    Err(_) => std::time::Duration::ZERO, // mtime in future → treat as fresh
+                };
+                if age < threshold {
+                    continue;
+                }
+
+                match fs::remove_file(&path) {
+                    Ok(()) => {
+                        report.removed_paths.push(path);
+                    }
+                    Err(e) => {
+                        report.errors.push((path, e.to_string()));
+                    }
+                }
+            }
+        }
+
+        report
+    }
+}
+
+/// Outcome of [`FsBlobStore::sweep_stale_temps`].
+///
+/// Total files removed = `removed_paths.len()`. Files that hit an
+/// error during scan or remove land in `errors` with the OS message.
+/// A successful sweep with 0 stale temps yields an empty report
+/// (both vecs empty).
+#[derive(Debug, Default)]
+pub struct SweepReport {
+    pub removed_paths: Vec<PathBuf>,
+    pub errors: Vec<(PathBuf, String)>,
+}
+
+impl SweepReport {
+    /// Convenience: count of swept files.
+    pub fn removed(&self) -> usize {
+        self.removed_paths.len()
+    }
+
+    /// True iff the sweep removed nothing AND hit no errors.
+    pub fn is_clean(&self) -> bool {
+        self.removed_paths.is_empty() && self.errors.is_empty()
+    }
 }
 
 impl BlobStore for FsBlobStore {
@@ -817,6 +944,172 @@ mod tests {
                 "test invariant: brute-force produced duplicate hashes"
             );
         }
+    }
+
+    // ── sweep stale temps ─────────────────────────────────────────────
+
+    #[test]
+    fn fs_sweep_on_empty_store_returns_clean() {
+        let (s, _td) = fs_store();
+        let report = s.sweep_stale_temps(std::time::Duration::from_secs(60));
+        assert!(report.is_clean(), "empty store sweep: {report:?}");
+        assert_eq!(report.removed(), 0);
+    }
+
+    #[test]
+    fn fs_sweep_with_no_temp_files_returns_clean() {
+        let (mut s, _td) = fs_store();
+        // Populate with a real blob; no .tmp-* should be left behind
+        // (the rename in put() consumes it).
+        s.put(b"a real blob").expect("put");
+        let report = s.sweep_stale_temps(std::time::Duration::from_secs(60));
+        assert!(report.is_clean(), "sweep after real put: {report:?}");
+    }
+
+    #[test]
+    fn fs_sweep_preserves_recent_temp_files() {
+        let (s, _td) = fs_store();
+        // Plant a fresh .tmp-* file by hand in a bucket dir.
+        let bucket = s.root().join("ab");
+        fs::create_dir_all(&bucket).unwrap();
+        let tmp_path = bucket.join(".tmp-999999-0-deadbeef");
+        fs::write(&tmp_path, b"fresh temp content").unwrap();
+
+        // Sweep with a long threshold: should NOT remove the fresh file.
+        let report = s.sweep_stale_temps(std::time::Duration::from_secs(3600));
+        assert!(report.is_clean(), "fresh temp swept incorrectly: {report:?}");
+        assert!(tmp_path.exists(), "fresh temp file removed by sweep");
+    }
+
+    #[test]
+    fn fs_sweep_removes_old_temp_files() {
+        let (s, _td) = fs_store();
+        let bucket = s.root().join("ab");
+        fs::create_dir_all(&bucket).unwrap();
+        let tmp_path = bucket.join(".tmp-999999-0-deadbeef");
+        fs::write(&tmp_path, b"stale temp content").unwrap();
+
+        // Sweep with a 0-second threshold: every existing temp file is
+        // "older than 0 seconds" so it should be removed.
+        let report = s.sweep_stale_temps(std::time::Duration::ZERO);
+        assert_eq!(report.removed(), 1, "expected 1 removed: {report:?}");
+        assert_eq!(report.removed_paths[0], tmp_path);
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        assert!(!tmp_path.exists(), "stale temp not actually removed");
+    }
+
+    #[test]
+    fn fs_sweep_does_not_touch_real_blobs() {
+        let (mut s, _td) = fs_store();
+        let h = s.put(b"a real blob").expect("put");
+        let blob_path = s.path_for(&h);
+        assert!(blob_path.exists());
+
+        // Sweep with 0-second threshold (so EVERYTHING is "old"); the
+        // real blob must survive — it doesn't start with .tmp-.
+        let report = s.sweep_stale_temps(std::time::Duration::ZERO);
+        assert!(report.is_clean(), "real blob wrongly swept: {report:?}");
+        assert!(blob_path.exists(), "real blob removed");
+        // get() still works (substrate integrity intact).
+        assert_eq!(s.get(h).expect("get").expect("present"), b"a real blob");
+    }
+
+    #[test]
+    fn fs_sweep_across_multiple_buckets() {
+        let (s, _td) = fs_store();
+        // Plant stale temps in two different bucket dirs.
+        for prefix in &["ab", "cd"] {
+            let bucket = s.root().join(prefix);
+            fs::create_dir_all(&bucket).unwrap();
+            fs::write(
+                bucket.join(format!(".tmp-{prefix}-0-deadbeef")),
+                b"stale",
+            )
+            .unwrap();
+        }
+        let report = s.sweep_stale_temps(std::time::Duration::ZERO);
+        assert_eq!(report.removed(), 2, "want 2 removed: {report:?}");
+        assert!(report.errors.is_empty());
+    }
+
+    #[test]
+    fn fs_sweep_skips_non_bucket_dirs() {
+        let (s, _td) = fs_store();
+        // Plant a .tmp-* file in a directory that is NOT a 2-hex-char
+        // bucket name — sweep must NOT descend into it (could be an
+        // external tool's working dir; tampering would be a foot-gun).
+        let stray = s.root().join("not-a-bucket");
+        fs::create_dir_all(&stray).unwrap();
+        let tmp_in_stray = stray.join(".tmp-1-0-cafebabe");
+        fs::write(&tmp_in_stray, b"in stray dir").unwrap();
+
+        // Also plant one IN a valid bucket so we can confirm the sweep
+        // does walk legitimate buckets.
+        let bucket = s.root().join("ee");
+        fs::create_dir_all(&bucket).unwrap();
+        let tmp_in_bucket = bucket.join(".tmp-1-0-feedface");
+        fs::write(&tmp_in_bucket, b"in bucket").unwrap();
+
+        let report = s.sweep_stale_temps(std::time::Duration::ZERO);
+        assert_eq!(report.removed(), 1, "should only remove the bucket one");
+        assert!(tmp_in_stray.exists(), "stray dir's .tmp-* should be untouched");
+        assert!(!tmp_in_bucket.exists(), "bucket .tmp-* should be removed");
+    }
+
+    /// End-to-end: race producing orphans + sweep clearing them.
+    /// Simulates the path noted in commit 1fffd67 — when 16 concurrent
+    /// putters all wrote temp files but only one's rename won, the
+    /// others get orphaned. Verifies the sweep cleans them up.
+    #[test]
+    fn fs_sweep_clears_race_orphans() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let td = TempDir::new().expect("tempdir");
+        let root = td.path().join("objects");
+        fs::create_dir_all(&root).unwrap();
+        let root = Arc::new(root);
+        let bytes: Arc<Vec<u8>> = Arc::new(b"race orphan target".to_vec());
+
+        // 16 concurrent puts of the same content.
+        let mut handles = Vec::with_capacity(16);
+        for _ in 0..16 {
+            let root = Arc::clone(&root);
+            let bytes = Arc::clone(&bytes);
+            handles.push(thread::spawn(move || {
+                let mut s = FsBlobStore::new(&*root).expect("open");
+                s.put(&bytes).expect("put")
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // After the race, the final file exists once; orphan temps MAY
+        // be present (impl-dependent — current impl renames the first
+        // successful temp, leaving the others). Sweep should reach a
+        // clean state.
+        let s = FsBlobStore::new(&*root).unwrap();
+        let report = s.sweep_stale_temps(std::time::Duration::ZERO);
+        assert!(
+            report.errors.is_empty(),
+            "sweep had errors: {:?}",
+            report.errors
+        );
+        // 0 or more removed — depending on whether the impl already
+        // cleaned up. Either way, after sweep no .tmp-* survives.
+        let expected = bytes.as_slice().hash();
+        let bucket = s.path_for(&expected).parent().unwrap().to_path_buf();
+        let leftover = fs::read_dir(&bucket)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp-"))
+            .count();
+        assert_eq!(leftover, 0, "sweep left .tmp-* survivors in {}", bucket.display());
+
+        // The real blob still works.
+        let got = s.get(expected).expect("get").expect("present");
+        assert_eq!(&got, bytes.as_ref());
     }
 
     /// Concurrent put + get: while threads write, other threads read.

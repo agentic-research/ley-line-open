@@ -16,6 +16,8 @@ package cache_test
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"testing"
 
 	capnp "capnproto.org/go/capnp/v3"
@@ -319,6 +321,222 @@ func TestCacheLockfile_FullRoundTrip(t *testing.T) {
 	rootBytes := readHashBytes(t, rtRoot)
 	if rootBytes[0] != 0xFF || rootBytes[31] != 0xFF {
 		t.Errorf("root drift: want [0]=0xFF, [31]=0xFF; got [0]=0x%02x, [31]=0x%02x", rootBytes[0], rootBytes[31])
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Cross-runtime fixture decode (Go side of T8.10, ADR-0014 §F8.6.4)
+// ─────────────────────────────────────────────────────────────────────
+//
+// The Rust producer at rs/ll-core/schema-capnp/tests/cross_runtime_fixtures.rs
+// commits canonical-encoded bytes for two CacheLockfile shapes (minimal
+// + realistic) under rs/ll-core/schema-capnp/tests/fixtures/. This test
+// reads those *same* files and decodes them with the Go binding. When
+// both the Rust byte-equal test AND this Go field-equal test pass,
+// F8.6.4 is mechanized for the cache schema.
+//
+// Bead: ley-line-open-ae89aa.
+
+// fixturePath joins the repo-root-relative path to a cross-runtime
+// fixture. Path resolution mirrors binding/binding_test.go — one source
+// of truth in the Rust crate, both runtimes assert against it.
+func fixturePath(name string) string {
+	return filepath.Join(
+		"..", "..", "..", "..",
+		"rs", "ll-core", "schema-capnp", "tests", "fixtures",
+		name,
+	)
+}
+
+func readFixture(t *testing.T, name string) *capnp.Message {
+	t.Helper()
+	b, err := os.ReadFile(fixturePath(name))
+	if err != nil {
+		t.Fatalf("read fixture %s: %v\n(If missing, regenerate via: cd rs && cargo test -p leyline-schema-capnp --features regen-fixtures --test cross_runtime_fixtures)", name, err)
+	}
+	msg, err := capnp.Unmarshal(b)
+	if err != nil {
+		t.Fatalf("unmarshal fixture %s: %v", name, err)
+	}
+	return msg
+}
+
+// TestCacheLockfileMinimal_DecodesFromFixture pins that the Rust
+// producer's MINIMAL canonical bytes are decodable by the Go binding,
+// and that every field reads back as its type-zero. Canonical encoding
+// truncates trailing defaults, so this test also implicitly verifies
+// the Go binding handles truncated layouts correctly.
+func TestCacheLockfileMinimal_DecodesFromFixture(t *testing.T) {
+	msg := readFixture(t, "cache-lockfile-minimal.bin")
+	lf, err := cache.ReadRootCacheLockfile(msg)
+	if err != nil {
+		t.Fatalf("ReadRootCacheLockfile: %v", err)
+	}
+
+	m, err := lf.Meta()
+	if err != nil {
+		t.Fatalf("read meta: %v", err)
+	}
+	producer, _ := m.Producer()
+	if producer != "mache" {
+		t.Errorf("Meta.Producer: want mache, got %q", producer)
+	}
+	schemaVer, _ := m.SchemaVersion()
+	if schemaVer != "0.1.0" {
+		t.Errorf("Meta.SchemaVersion: want 0.1.0, got %q", schemaVer)
+	}
+	if got := m.GeneratedAtMs(); got != 0 {
+		t.Errorf("Meta.GeneratedAtMs: want default 0, got %d", got)
+	}
+	procs, _ := m.InputProcessors()
+	if procs.Len() != 0 {
+		t.Errorf("Meta.InputProcessors: want empty, got %d", procs.Len())
+	}
+
+	srcs, _ := lf.Sources()
+	if srcs.Len() != 0 {
+		t.Errorf("Sources: want empty, got %d", srcs.Len())
+	}
+	edges, _ := lf.Topology()
+	if edges.Len() != 0 {
+		t.Errorf("Topology: want empty, got %d", edges.Len())
+	}
+	root, _ := lf.Root()
+	rootBytes, _ := root.Bytes()
+	if len(rootBytes) != 0 {
+		t.Errorf("Root: want default empty Hash, got %d bytes", len(rootBytes))
+	}
+}
+
+// TestCacheLockfileRealistic_DecodesAndFieldsMatch is the strong gate:
+// every field set by the Rust producer must surface byte-equal through
+// the Go binding. Field values are hard-coded constants here — mirror
+// of build_cache_lockfile_realistic() in the Rust crate. If either side
+// drifts, this test or its Rust counterpart fails.
+func TestCacheLockfileRealistic_DecodesAndFieldsMatch(t *testing.T) {
+	msg := readFixture(t, "cache-lockfile-realistic.bin")
+	lf, err := cache.ReadRootCacheLockfile(msg)
+	if err != nil {
+		t.Fatalf("ReadRootCacheLockfile: %v", err)
+	}
+
+	// Meta
+	m, err := lf.Meta()
+	if err != nil {
+		t.Fatalf("read meta: %v", err)
+	}
+	if got, _ := m.Producer(); got != "mache" {
+		t.Errorf("Meta.Producer: want mache, got %q", got)
+	}
+	if got, _ := m.ProducerVersion(); got != "0.7.1" {
+		t.Errorf("Meta.ProducerVersion: want 0.7.1, got %q", got)
+	}
+	if got, _ := m.SchemaVersion(); got != "0.1.0" {
+		t.Errorf("Meta.SchemaVersion: want 0.1.0, got %q", got)
+	}
+	if got := m.GeneratedAtMs(); got != 1_748_345_600_000 {
+		t.Errorf("Meta.GeneratedAtMs: want 1748345600000, got %d", got)
+	}
+
+	procs, err := m.InputProcessors()
+	if err != nil {
+		t.Fatalf("read processors: %v", err)
+	}
+	if procs.Len() != 1 {
+		t.Fatalf("Meta.InputProcessors: want 1, got %d", procs.Len())
+	}
+	if got, _ := procs.At(0).Kind(); got != "tree-sitter-go" {
+		t.Errorf("Processor[0].Kind: want tree-sitter-go, got %q", got)
+	}
+	if got, _ := procs.At(0).Version(); got != "0.21.0" {
+		t.Errorf("Processor[0].Version: want 0.21.0, got %q", got)
+	}
+
+	// Sources — mirror of the patterns in
+	// build_cache_lockfile_realistic():
+	//   src/main.go : inputHash[i]   = i+1     ; chunkHash[i]   = 0xA0+i
+	//   src/auth.go : inputHash[i]   = 0x40+i  ; chunkHash[i]   = 0xC0+i
+	srcs, err := lf.Sources()
+	if err != nil {
+		t.Fatalf("read sources: %v", err)
+	}
+	if srcs.Len() != 2 {
+		t.Fatalf("Sources: want 2, got %d", srcs.Len())
+	}
+
+	s0 := srcs.At(0)
+	if got, _ := s0.Path(); got != "src/main.go" {
+		t.Errorf("Source[0].Path: want src/main.go, got %q", got)
+	}
+	if got, _ := s0.Kind(); got != "go-source" {
+		t.Errorf("Source[0].Kind: want go-source, got %q", got)
+	}
+	ih0, _ := s0.InputHash()
+	ih0Bytes, _ := ih0.Bytes()
+	if len(ih0Bytes) != 32 {
+		t.Errorf("Source[0].InputHash len: want 32, got %d", len(ih0Bytes))
+	} else {
+		if ih0Bytes[0] != 1 {
+			t.Errorf("Source[0].InputHash[0]: want 1, got %d", ih0Bytes[0])
+		}
+		if ih0Bytes[31] != 32 {
+			t.Errorf("Source[0].InputHash[31]: want 32, got %d", ih0Bytes[31])
+		}
+	}
+	ch0, _ := s0.ChunkHash()
+	ch0Bytes, _ := ch0.Bytes()
+	if len(ch0Bytes) != 32 {
+		t.Errorf("Source[0].ChunkHash len: want 32, got %d", len(ch0Bytes))
+	} else {
+		if ch0Bytes[0] != 0xA0 {
+			t.Errorf("Source[0].ChunkHash[0]: want 0xA0, got 0x%02x", ch0Bytes[0])
+		}
+		if ch0Bytes[31] != 0xA0+31 {
+			t.Errorf("Source[0].ChunkHash[31]: want 0x%02x, got 0x%02x", uint8(0xA0+31), ch0Bytes[31])
+		}
+	}
+
+	s1 := srcs.At(1)
+	if got, _ := s1.Path(); got != "src/auth.go" {
+		t.Errorf("Source[1].Path: want src/auth.go, got %q", got)
+	}
+	ih1, _ := s1.InputHash()
+	ih1Bytes, _ := ih1.Bytes()
+	if len(ih1Bytes) != 32 || ih1Bytes[0] != 0x40 || ih1Bytes[31] != 0x40+31 {
+		t.Errorf("Source[1].InputHash drift: len=%d, [0]=0x%02x, [31]=0x%02x", len(ih1Bytes), ih1Bytes[0], ih1Bytes[31])
+	}
+	ch1, _ := s1.ChunkHash()
+	ch1Bytes, _ := ch1.Bytes()
+	if len(ch1Bytes) != 32 || ch1Bytes[0] != 0xC0 || ch1Bytes[31] != 0xC0+31 {
+		t.Errorf("Source[1].ChunkHash drift: len=%d, [0]=0x%02x, [31]=0x%02x", len(ch1Bytes), ch1Bytes[0], ch1Bytes[31])
+	}
+
+	// Topology
+	edges, err := lf.Topology()
+	if err != nil {
+		t.Fatalf("read topology: %v", err)
+	}
+	if edges.Len() != 1 {
+		t.Fatalf("Topology: want 1 edge, got %d", edges.Len())
+	}
+	from, _ := edges.At(0).From()
+	to, _ := edges.At(0).ToSource()
+	if from != "src/main.go" || to != "src/auth.go" {
+		t.Errorf("Edge[0]: want (src/main.go → src/auth.go), got (%s → %s)", from, to)
+	}
+
+	// Root — pattern is 0xF0 XOR i.
+	root, _ := lf.Root()
+	rootBytes, _ := root.Bytes()
+	if len(rootBytes) != 32 {
+		t.Errorf("Root: want 32 bytes, got %d", len(rootBytes))
+	} else {
+		for i, want := range []uint8{0xF0, 0xF0 ^ 1, 0xF0 ^ 31} {
+			idx := []int{0, 1, 31}[i]
+			if rootBytes[idx] != want {
+				t.Errorf("Root[%d]: want 0x%02x, got 0x%02x", idx, want, rootBytes[idx])
+			}
+		}
 	}
 }
 

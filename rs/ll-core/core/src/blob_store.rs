@@ -54,10 +54,18 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 
 use crate::substrate::{BlobStore, ContentAddressed, Hash};
+
+/// Process-wide monotonic counter for temp-file naming. Combined with
+/// PID + hash, gives a unique temp filename per put() call even when
+/// two threads in the same process race on the same content. Without
+/// it, two threads computing the same (pid, hash) would collide on
+/// the temp path and one would fail `create_new(true)` with EEXIST.
+static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
 // ─────────────────────────────────────────────────────────────────────
 // FsBlobStore — filesystem-backed, production impl
@@ -160,9 +168,14 @@ impl BlobStore for FsBlobStore {
 
         // Atomic write: temp file in the SAME directory (so rename is
         // atomic on POSIX), then rename onto the final path. Temp name
-        // includes the hash + PID to keep concurrent putters from
-        // stomping each other's temp file.
-        let tmp_name = format!(".tmp-{}-{}", std::process::id(), hash);
+        // includes PID + process-wide nonce + hash. The PID isolates
+        // across processes; the nonce isolates across threads within a
+        // process (two threads racing on the same hash would otherwise
+        // collide on `.tmp-<pid>-<hash>` and one would fail
+        // create_new(true) with EEXIST — caught by
+        // fs_concurrent_put_same_content_is_safe).
+        let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        let tmp_name = format!(".tmp-{}-{}-{}", std::process::id(), nonce, hash);
         let tmp_path = parent.join(tmp_name);
 
         // Scope the file handle so it closes before the rename — on
@@ -644,5 +657,251 @@ mod tests {
         assert!(!s.contains(h).unwrap(), "before put: absent");
         s.put(bytes).unwrap();
         assert!(s.contains(h).unwrap(), "after put: present");
+    }
+
+    // ── concurrency / stress ──────────────────────────────────────────
+    //
+    // FsBlobStore's atomic-rename + create_new(true) design SHOULD be
+    // safe under concurrent putters racing on the same content. The
+    // tests below pin that property:
+    //
+    //   - N threads put() the same bytes simultaneously → all return
+    //     the same hash, the final file is intact, no torn writes
+    //     happen, and the .tmp-<pid>-<hash> intermediate file is
+    //     gone (cleanup or rename consumed it).
+    //
+    //   - N threads put() *different* bytes that fall in the same
+    //     prefix bucket → the bucket dir's create_dir_all races
+    //     resolve safely (no "exists already" cascading failure),
+    //     and every chunk is independently readable.
+    //
+    // These are stress tests, not unit tests — the failure mode is
+    // racy and may appear only under load. They run in CI as part
+    // of `cargo test` but loop a small constant number of iterations
+    // so the wall-clock cost stays bounded.
+
+    /// 16 threads all push the same content. (IM) axiom says all return
+    /// the same hash; verify-on-read says the resulting file decodes
+    /// cleanly. Test asserts both.
+    #[test]
+    fn fs_concurrent_put_same_content_is_safe() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let td = TempDir::new().expect("tempdir");
+        let root = td.path().join("objects");
+        // Pre-create the root so all threads see it.
+        fs::create_dir_all(&root).unwrap();
+        let root = Arc::new(root);
+        let bytes: Arc<Vec<u8>> = Arc::new(b"concurrent put target - same content".to_vec());
+
+        let num_threads = 16;
+        let mut handles = Vec::with_capacity(num_threads);
+        for _ in 0..num_threads {
+            let root = Arc::clone(&root);
+            let bytes = Arc::clone(&bytes);
+            handles.push(thread::spawn(move || {
+                let mut s = FsBlobStore::new(&*root).expect("open per-thread");
+                s.put(&bytes).expect("put")
+            }));
+        }
+        let hashes: Vec<Hash> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // (IM): every thread gets the same hash.
+        let expected = bytes.as_slice().hash();
+        for h in &hashes {
+            assert_eq!(*h, expected, "concurrent put: hash drift");
+        }
+
+        // The single file at the expected path must exist and decode.
+        let s = FsBlobStore::new(&*root).unwrap();
+        let got = s.get(expected).expect("get").expect("present");
+        assert_eq!(&got, bytes.as_ref(), "concurrent put: content drift");
+
+        // The bucket dir should NOT have any leftover .tmp-* files.
+        // Failure here means a worker died mid-write and we leaked
+        // a temp file; the production impl should clean up but
+        // we're checking the test path didn't tickle a leak.
+        let bucket = s.path_for(&expected).parent().unwrap().to_path_buf();
+        let leftover_tmp = fs::read_dir(&bucket)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".tmp-")
+            })
+            .count();
+        assert_eq!(
+            leftover_tmp, 0,
+            "concurrent put left .tmp-* files in {}",
+            bucket.display()
+        );
+    }
+
+    /// N threads each push DIFFERENT content whose hashes all fall in
+    /// the same prefix bucket. The bucket dir's create_dir_all races
+    /// must resolve safely; every chunk must be independently
+    /// retrievable.
+    #[test]
+    fn fs_concurrent_put_distinct_content_same_bucket() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let td = TempDir::new().expect("tempdir");
+        let root = td.path().join("objects");
+        fs::create_dir_all(&root).unwrap();
+        let root = Arc::new(root);
+
+        // Find N contents whose hashes share the same first byte.
+        // Brute-force search up to 100k seeds; for a uniform hash
+        // function the expected number of seeds-to-find-N-collisions
+        // for a fixed first byte is ~256*N, so 100k is plenty for
+        // small N.
+        let target_count = 8;
+        let mut contents_in_bucket: Vec<Vec<u8>> = Vec::new();
+        let mut target_byte: Option<u8> = None;
+        for i in 0u32..100_000 {
+            let v = i.to_le_bytes().to_vec();
+            let h = v.as_slice().hash();
+            let byte0 = h.as_bytes()[0];
+            match target_byte {
+                None => {
+                    target_byte = Some(byte0);
+                    contents_in_bucket.push(v);
+                }
+                Some(b) if b == byte0 => {
+                    contents_in_bucket.push(v);
+                    if contents_in_bucket.len() >= target_count {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            contents_in_bucket.len() >= target_count,
+            "test invariant: brute-force found {} same-bucket contents (wanted {})",
+            contents_in_bucket.len(),
+            target_count
+        );
+
+        // Spawn one thread per content; each puts independently.
+        let contents = Arc::new(contents_in_bucket);
+        let mut handles = Vec::with_capacity(contents.len());
+        for i in 0..contents.len() {
+            let root = Arc::clone(&root);
+            let contents = Arc::clone(&contents);
+            handles.push(thread::spawn(move || {
+                let mut s = FsBlobStore::new(&*root).expect("open per-thread");
+                s.put(&contents[i]).expect("put")
+            }));
+        }
+        let hashes: Vec<Hash> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // Every chunk must round-trip.
+        let s = FsBlobStore::new(&*root).unwrap();
+        for (i, h) in hashes.iter().enumerate() {
+            let got = s.get(*h).expect("get").expect("present");
+            assert_eq!(
+                got, contents[i],
+                "concurrent put: chunk {i} corrupted after race"
+            );
+        }
+
+        // Sanity: all hashes are distinct (no accidental dedup).
+        let mut unique: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+        for h in &hashes {
+            assert!(
+                unique.insert(*h),
+                "test invariant: brute-force produced duplicate hashes"
+            );
+        }
+    }
+
+    /// Concurrent put + get: while threads write, other threads read.
+    /// No reader should ever see a torn file (verify-on-read catches
+    /// that anyway, but the test pins that contains() / get() during
+    /// an active write don't expose intermediate state).
+    #[test]
+    fn fs_concurrent_put_get_interleaved() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
+
+        let td = TempDir::new().expect("tempdir");
+        let root = td.path().join("objects");
+        fs::create_dir_all(&root).unwrap();
+        let root = Arc::new(root);
+
+        // Pre-populate one blob so readers have something to find.
+        let bytes_a = b"reader target".to_vec();
+        let hash_a = {
+            let mut s = FsBlobStore::new(&*root).unwrap();
+            s.put(&bytes_a).expect("seed put")
+        };
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let bytes_a = Arc::new(bytes_a);
+
+        // Writers: each puts distinct content in a loop.
+        let mut writer_handles = Vec::new();
+        for tid in 0u32..4 {
+            let root = Arc::clone(&root);
+            let stop = Arc::clone(&stop);
+            writer_handles.push(thread::spawn(move || {
+                let mut s = FsBlobStore::new(&*root).expect("open writer");
+                let mut i: u32 = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    let payload = format!("writer-{tid}-iter-{i}").into_bytes();
+                    s.put(&payload).expect("put in loop");
+                    i += 1;
+                    if i > 200 {
+                        break;
+                    }
+                }
+                i
+            }));
+        }
+
+        // Readers: each get()s the pre-seeded blob repeatedly. None
+        // may see corruption.
+        let mut reader_handles = Vec::new();
+        for _ in 0..4 {
+            let root = Arc::clone(&root);
+            let stop = Arc::clone(&stop);
+            let bytes_a = Arc::clone(&bytes_a);
+            reader_handles.push(thread::spawn(move || {
+                let s = FsBlobStore::new(&*root).expect("open reader");
+                let mut reads = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    let got = s.get(hash_a).expect("get").expect("seeded blob present");
+                    assert_eq!(&got, bytes_a.as_ref(), "torn read mid-write");
+                    reads += 1;
+                    if reads > 500 {
+                        break;
+                    }
+                }
+                reads
+            }));
+        }
+
+        // Let them run briefly, then signal stop.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        stop.store(true, Ordering::Relaxed);
+
+        let mut total_writes = 0u32;
+        for h in writer_handles {
+            total_writes += h.join().unwrap();
+        }
+        let mut total_reads = 0u32;
+        for h in reader_handles {
+            total_reads += h.join().unwrap();
+        }
+
+        // Sanity: each side did SOMETHING. Not testing throughput
+        // (machine-dependent), just that the loops weren't no-ops.
+        assert!(total_writes > 0, "writer loops produced 0 writes");
+        assert!(total_reads > 0, "reader loops produced 0 reads");
     }
 }

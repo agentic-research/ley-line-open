@@ -1,12 +1,12 @@
-# Cache substrate — status checkpoint (2026-05-22)
+# Cache substrate — status checkpoint (2026-05-22, updated after Phase 3)
 
-Branch: `feat/cache-schema-ae89aa`
-Trigger: `/loop 5m /evolve` ran 8 iterations under user thoroughness
-directive ("don't do the minimum; do the opposite"). The substrate
-side of the mache portable-cache chain is feature-complete and
-hardened. The consumer side (`mache-aeb262` Phase 1–3) is blocked on
-the mache repo running parallel work on a different branch
-(`infra/elixir-parser-out-of-lfs`).
+Branch: `feat/cache-schema-ae89aa` (LLO) + `feat/portable-cache-aeb262` (mache, via worktree)
+Trigger: `/loop 5m /evolve` ran 12 iterations under user thoroughness
+directive ("don't do the minimum; do the opposite"). The mache
+portable-cache feature is now **Phases 1+2+3 complete**. The mache
+checkout was unblocked via a `git worktree` at
+`~/.rsry/worktrees/mache/portable-cache-aeb262/` so the parallel
+work on `infra/elixir-parser-out-of-lfs` could continue unaffected.
 
 This doc is the resume-after-context-loss artifact. If you arrive
 here on a different machine, after compaction, or weeks later, the
@@ -19,9 +19,11 @@ what's left.
 ✅ ley-line-open-ae89aa   schema + bindings + cross-runtime fixtures + cross-repo gate
 ✅ ley-line-open-bb0316   FsBlobStore + MemBlobStore + race-fix + sweep API
 ✅ cloister-bb168f         build-cache/v1 spec + conformance vectors + producer
-⏭ mache-aeb262 Phase 1    consumer-side `mache push` (emit lockfile)         [blocked]
-⏭ mache-aeb262 Phase 2    consumer-side `mache pull` (local-CAS restore)     [blocked]
-⏭ mache-aeb262 Phase 3    remote build-cache transport impl                  [blocked]
+✅ mache-aeb262 Phase 1    `mache cache push` (emit lockfile + chunks)
+✅ mache-aeb262 Phase 2    `mache cache pull --verify` (local-CAS restore)
+✅ mache-aeb262 Phase 3    `--remote` push/pull via OCI build-cache/v1
+✅ mache-aeb262 Phase 5    cache-roundtrip CI workflow + task entries
+⏭ mache-aeb262 Phase 4    chunks-as-parse-outputs (sheaf-driven incremental)
 ```
 
 ## Commits on `feat/cache-schema-ae89aa` (oldest first)

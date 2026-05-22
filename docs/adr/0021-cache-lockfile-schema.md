@@ -25,27 +25,64 @@ Mache ADR-0020 (sibling repo) originally landed the schema in mache. User correc
 
 ## Decision
 
-**Ship `cache.capnp` alongside `daemon.capnp` in `rs/ll-core/public-schema/capnp/` as the canonical lockfile schema. Capnp is source-of-truth; TOML is the on-disk hand-readable serialization via cloister's bidi pipeline (ADR-0025); JSON-on-OCI is the wire form when chunks are pushed to a `build-cache/v1` provider.**
+**Ship `cache.capnp` alongside `common.capnp` in `rs/ll-core/schema-capnp/schemas/` as the canonical lockfile schema. Capnp is source-of-truth; TOML is the on-disk hand-readable serialization via cloister's bidi pipeline (ADR-0025); JSON-on-OCI is the wire form when chunks are pushed to a `build-cache/v1` provider.**
+
+### Where (corrected 2026-05-22)
+
+Initial draft placed `cache.capnp` in `rs/ll-core/public-schema/capnp/` alongside `daemon.capnp`. **Wrong.** Inspection revealed:
+
+- `public-schema/capnp/` is for **protocol** schemas (daemon RPC). One file: `daemon.capnp`. Imports `/capnp/compat/json.capnp` for JSON-wire annotations.
+- `schema-capnp/schemas/` is for **structural substrate** schemas (parse output, refs, defs). Six files: `ast.capnp`, `binding.capnp`, `common.capnp`, `head.capnp`, `source.capnp`, `go.capnp` (the vendored annotations file). All cross-import via `common.capnp`.
+
+Cache lockfile is data-shape (a manifest, not RPC) and reuses `common.Hash` — it belongs with the structural substrate. Building it on top of `common.capnp` also matches the `binding.capnp → common`, `ast.capnp → common`, `source.capnp → common` import discipline already in the substrate.
+
+### Hash type (corrected 2026-05-22)
+
+`common.Hash` already exists:
+
+```capnp
+struct Hash {
+  bytes @0 :Data;  # MUST be exactly 32 bytes
+}
+```
+
+It is **BLAKE3-locked per Σ §3.4** (decade write-up `2026-merkle-cas-substrate.md`). The substrate's stance is "not a placeholder for arbitrary digest." Original ADR draft proposed a `Hash { algo, bytes }` shape for future-proofing against SHA-256/512 — that contradicts the substrate decision. **Use `common.Hash` directly via capnp import.**
 
 ### Schema (capnp source)
 
 ```capnp
-@0xf00d…;
-using Hash = import "/common.capnp".Hash;
+@0xca7eca7eca7eca7e;
 
+# Go codegen annotations (inert for capnpc-rust; consumed by capnpc-go
+# to produce clients/go/leyline-schema/cache/cache.capnp.go). Mirrors
+# common.capnp / binding.capnp pattern.
+using Go = import "/go.capnp";
+$Go.package("cache");
+$Go.import("github.com/agentic-research/ley-line-open/clients/go/leyline-schema/cache");
+
+# common.Hash (32-byte BLAKE3, Σ §3.4) is the canonical hash primitive.
+using Common = import "common.capnp";
+
+# Cache lockfile — content-addressed manifest pointing into the BlobStore
+# substrate. Producer-agnostic; consumed by mache (portable code-intel db),
+# me-bundle (portable identity-rooted state), agent-corpus (observation
+# chunks).
+#
+# Ordinal discipline: append at next ordinal with default. Never rename,
+# never remove — leave a hole. ADR-0014 §3 schema-evolution contract.
 struct CacheLockfile {
   meta @0 :Meta;
   sources @1 :List(SourceEntry);
   topology @2 :List(TopologyEdge);
-  root @3 :Hash;            # the assembled-output hash; chains to the chunk graph
+  root @3 :Common.Hash;     # the assembled-output hash; chains to the chunk graph
 }
 
 struct Meta {
-  producer @0 :Text;        # "mache@0.x" / "me-bundle@0.x" / consumer identifier
+  producer @0 :Text;            # "mache" / "me-bundle" / etc.
   producerVersion @1 :Text;
-  schemaVersion @2 :Text;   # capnp triplet pin per ADR-0014
+  schemaVersion @2 :Text;       # capnp triplet pin per ADR-0014
   inputProcessors @3 :List(ProcessorVersion);  # e.g. tree-sitter-go@0.21.0
-  generatedAt @4 :UInt64;
+  generatedAtMs @4 :UInt64;     # ms-precision UTC epoch
 }
 
 struct ProcessorVersion {
@@ -55,19 +92,14 @@ struct ProcessorVersion {
 
 struct SourceEntry {
   path @0 :Text;            # repo-relative or producer-relative
-  inputHash @1 :Hash;       # BLAKE3 of the input bytes
-  chunkHash @2 :Hash;       # CAS hash of the derived chunk
+  inputHash @1 :Common.Hash;    # BLAKE3 of the input bytes
+  chunkHash @2 :Common.Hash;    # CAS hash of the derived chunk
   kind @3 :Text;            # producer-defined: "go-source", "transcript-turn", …
 }
 
 struct TopologyEdge {
   from @0 :Text;            # path/key in sources
   toSource @1 :Text;        # depends on this entry's chunk
-}
-
-struct Hash {
-  algo @0 :Text;            # "blake3" v1; reserves room for sha-256/512 later
-  bytes @1 :Data;           # 32 bytes for BLAKE3
 }
 ```
 
@@ -167,11 +199,13 @@ Consumer-side decisions are NOT part of this ADR. They live in consumer-side ADR
 - **Topology semantics per consumer.** This ADR lets each consumer populate `topology` however its substrate dictates (sheaf edges vs flat list vs DAG); semantics are consumer-defined.
 - **Multi-arch.** v1 assumes one lockfile per `(input set, processor versions)`; cross-arch composition is v2.
 
-## Open questions
+## Open questions (resolved during impl 2026-05-22)
 
-1. **`common.capnp` Hash type — does it exist yet?** If not, this ADR introduces it. If yes, reference the existing type. Verify against `rs/ll-core/public-schema/capnp/` before implementation.
-2. **`producer` namespacing convention.** Reverse-DNS (`org.example.tool`) or short-name (`mache`)? Lean: short-name in v1; promote to reverse-DNS if collisions appear.
-3. **Should `kind` be an enum at the schema level?** Lean: free-form `Text` in v1 — consumers define their own vocabulary. Promote to per-consumer enum if multiple consumers want to interop on `kind` strings.
+1. **`common.capnp` Hash type — does it exist yet?** ✅ Resolved: yes, lives at `rs/ll-core/schema-capnp/schemas/common.capnp` with shape `struct Hash { bytes @0 :Data; }` (32-byte BLAKE3-only per Σ §3.4). cache.capnp imports it via `using Common = import "common.capnp";`.
+
+2. **`producer` namespacing convention.** Decision: short-name in v1 (`"mache"`, `"me-bundle"`). Reverse-DNS reserved for v2 if collisions appear. Documented in each consumer's adoption ADR (mache ADR-0020 for mache's adoption).
+
+3. **Should `kind` be an enum at the schema level?** Decision: free-form `Text` in v1. Consumers define their own vocabulary (mache: `"go-source"`, `"rust-source"`, etc.). Promote to per-consumer enum or registry if multiple consumers want to interop on `kind` strings.
 
 ## Out of scope
 

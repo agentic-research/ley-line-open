@@ -419,8 +419,14 @@ fn cache_lockfile_realistic_round_trips_via_decoder() {
 
     let procs = m.get_input_processors().unwrap();
     assert_eq!(procs.len(), 1);
-    assert_eq!(procs.get(0).get_kind().unwrap().to_str().unwrap(), "tree-sitter-go");
-    assert_eq!(procs.get(0).get_version().unwrap().to_str().unwrap(), "0.21.0");
+    assert_eq!(
+        procs.get(0).get_kind().unwrap().to_str().unwrap(),
+        "tree-sitter-go"
+    );
+    assert_eq!(
+        procs.get(0).get_version().unwrap().to_str().unwrap(),
+        "0.21.0"
+    );
 
     // Sources
     let srcs = lf.get_sources().unwrap();
@@ -490,7 +496,11 @@ fn cache_lockfile_minimal_round_trips_via_decoder() {
     let m = lf.get_meta().unwrap();
     assert_eq!(m.get_producer().unwrap().to_str().unwrap(), "mache");
     assert_eq!(m.get_schema_version().unwrap().to_str().unwrap(), "0.1.0");
-    assert_eq!(m.get_generated_at_ms(), 0, "default UInt64 must round-trip as 0");
+    assert_eq!(
+        m.get_generated_at_ms(),
+        0,
+        "default UInt64 must round-trip as 0"
+    );
     assert_eq!(m.get_input_processors().unwrap().len(), 0);
 
     assert_eq!(lf.get_sources().unwrap().len(), 0);

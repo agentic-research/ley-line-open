@@ -235,17 +235,23 @@ fn build_manifest_json(
     s.push_str("  \"mediaType\": \"application/vnd.oci.image.manifest.v1+json\",\n");
     s.push_str("  \"config\": {\n");
     s.push_str("    \"mediaType\": \"application/vnd.cloister.build-cache.v1.config+json\",\n");
-    let _ = write!(s, "    \"digest\": \"sha256:{}\",\n", hex::encode(config_hash));
+    let _ = write!(
+        s,
+        "    \"digest\": \"sha256:{}\",\n",
+        hex::encode(config_hash)
+    );
     let _ = write!(s, "    \"size\": {}\n", config_size);
     s.push_str("  },\n");
     s.push_str("  \"layers\": [\n");
     for (i, r) in records.iter().enumerate() {
         let trailing = if i + 1 < records.len() { "," } else { "" };
         s.push_str("    {\n");
-        s.push_str(
-            "      \"mediaType\": \"application/vnd.cloister.build-cache.v1.chunk\",\n",
+        s.push_str("      \"mediaType\": \"application/vnd.cloister.build-cache.v1.chunk\",\n");
+        let _ = write!(
+            s,
+            "      \"digest\": \"sha256:{}\",\n",
+            hex::encode(r.chunk_hash)
         );
-        let _ = write!(s, "      \"digest\": \"sha256:{}\",\n", hex::encode(r.chunk_hash));
         let _ = write!(s, "      \"size\": {},\n", r.size);
         s.push_str("      \"annotations\": {\n");
         let _ = write!(
@@ -283,7 +289,11 @@ fn build_digests_json(
     s.push_str("  \"$comment\": \"cloister/build-cache/v1 conformance vector digests. blake3_hex matches the on-the-wire sha256:<hex> per the v1 digest-encoding decision; sha256_hex is the real SHA-256 for ecosystem-tools sidechannel (commit gates, git LFS, etc.). Both are over the file's bytes verbatim.\",\n");
     s.push_str("  \"version\": \"cloister/build-cache/v1\",\n");
     s.push_str("  \"manifest\": {\n");
-    let _ = write!(s, "    \"blake3_hex\": \"{}\",\n", hex::encode(manifest_hash));
+    let _ = write!(
+        s,
+        "    \"blake3_hex\": \"{}\",\n",
+        hex::encode(manifest_hash)
+    );
     let _ = write!(
         s,
         "    \"sha256_hex\": \"{}\",\n",
@@ -292,7 +302,11 @@ fn build_digests_json(
     let _ = write!(s, "    \"size\": {}\n", manifest_json.len());
     s.push_str("  },\n");
     s.push_str("  \"lockfile_config\": {\n");
-    let _ = write!(s, "    \"blake3_hex\": \"{}\",\n", hex::encode(lockfile_hash));
+    let _ = write!(
+        s,
+        "    \"blake3_hex\": \"{}\",\n",
+        hex::encode(lockfile_hash)
+    );
     let _ = write!(
         s,
         "    \"sha256_hex\": \"{}\",\n",

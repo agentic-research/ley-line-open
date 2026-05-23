@@ -49,7 +49,9 @@ pub mod cache_capnp {
 
 #[cfg(test)]
 mod tests {
-    use super::cache_capnp::{cache_lockfile, meta, processor_version, source_entry, topology_edge};
+    use super::cache_capnp::{
+        cache_lockfile, meta, processor_version, source_entry, topology_edge,
+    };
     use super::common_capnp::{hash, position, range};
     use capnp::message::{Builder, ReaderOptions};
     use capnp::serialize;
@@ -151,8 +153,14 @@ mod tests {
 
         assert_eq!(se.get_path().unwrap().to_str().unwrap(), "src/auth.go");
         assert_eq!(se.get_kind().unwrap().to_str().unwrap(), "go-source");
-        assert_eq!(se.get_input_hash().unwrap().get_bytes().unwrap(), &input_bytes);
-        assert_eq!(se.get_chunk_hash().unwrap().get_bytes().unwrap(), &chunk_bytes);
+        assert_eq!(
+            se.get_input_hash().unwrap().get_bytes().unwrap(),
+            &input_bytes
+        );
+        assert_eq!(
+            se.get_chunk_hash().unwrap().get_bytes().unwrap(),
+            &chunk_bytes
+        );
     }
 
     /// Pin the Meta shape including the inputProcessors list. Catches
@@ -193,10 +201,19 @@ mod tests {
 
         let procs = m.get_input_processors().unwrap();
         assert_eq!(procs.len(), 2);
-        assert_eq!(procs.get(0).get_kind().unwrap().to_str().unwrap(), "tree-sitter-go");
-        assert_eq!(procs.get(0).get_version().unwrap().to_str().unwrap(), "0.21.0");
+        assert_eq!(
+            procs.get(0).get_kind().unwrap().to_str().unwrap(),
+            "tree-sitter-go"
+        );
+        assert_eq!(
+            procs.get(0).get_version().unwrap().to_str().unwrap(),
+            "0.21.0"
+        );
         assert_eq!(procs.get(1).get_kind().unwrap().to_str().unwrap(), "blake3");
-        assert_eq!(procs.get(1).get_version().unwrap().to_str().unwrap(), "1.5.0");
+        assert_eq!(
+            procs.get(1).get_version().unwrap().to_str().unwrap(),
+            "1.5.0"
+        );
     }
 
     /// Pin the full CacheLockfile assembly: meta + N sources + N edges +
@@ -251,10 +268,27 @@ mod tests {
         let reader = serialize::read_message(buf.as_slice(), ReaderOptions::new()).unwrap();
         let lf: cache_lockfile::Reader = reader.get_root().unwrap();
 
-        assert_eq!(lf.get_meta().unwrap().get_producer().unwrap().to_str().unwrap(), "mache");
+        assert_eq!(
+            lf.get_meta()
+                .unwrap()
+                .get_producer()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "mache"
+        );
         assert_eq!(lf.get_sources().unwrap().len(), 2);
         assert_eq!(lf.get_topology().unwrap().len(), 1);
-        assert_eq!(lf.get_topology().unwrap().get(0).get_from().unwrap().to_str().unwrap(), "src/main.go");
+        assert_eq!(
+            lf.get_topology()
+                .unwrap()
+                .get(0)
+                .get_from()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "src/main.go"
+        );
         assert_eq!(lf.get_root().unwrap().get_bytes().unwrap(), &root_bytes);
     }
 
@@ -326,6 +360,9 @@ mod tests {
         let e: topology_edge::Reader = reader.get_root().unwrap();
 
         assert_eq!(e.get_from().unwrap().to_str().unwrap(), "src/lib.rs");
-        assert_eq!(e.get_to_source().unwrap().to_str().unwrap(), "src/internal/auth.rs");
+        assert_eq!(
+            e.get_to_source().unwrap().to_str().unwrap(),
+            "src/internal/auth.rs"
+        );
     }
 }

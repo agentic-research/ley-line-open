@@ -182,9 +182,7 @@ impl FsBlobStore {
                 Some(s) => s.to_string(),
                 None => continue,
             };
-            if bucket_name.len() != 2
-                || !bucket_name.chars().all(|c| c.is_ascii_hexdigit())
-            {
+            if bucket_name.len() != 2 || !bucket_name.chars().all(|c| c.is_ascii_hexdigit()) {
                 continue;
             }
 
@@ -344,8 +342,7 @@ impl BlobStore for FsBlobStore {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("open blob file {}", path.display()));
+                return Err(e).with_context(|| format!("open blob file {}", path.display()));
             }
         };
 
@@ -405,7 +402,10 @@ impl MemBlobStore {
     /// Current number of stored entries. Useful for tests verifying
     /// idempotency (insert same content twice ⇒ count stays 1).
     pub fn len(&self) -> usize {
-        self.inner.lock().expect("MemBlobStore mutex poisoned").len()
+        self.inner
+            .lock()
+            .expect("MemBlobStore mutex poisoned")
+            .len()
     }
 
     /// True iff no blobs are stored. Mirrors `Vec::is_empty` for parity.
@@ -639,7 +639,11 @@ mod tests {
         let dir_name = components[0].as_os_str().to_str().unwrap();
         let file_name = components[1].as_os_str().to_str().unwrap();
         assert_eq!(dir_name.len(), 2, "prefix dir is 2 hex chars");
-        assert_eq!(file_name.len(), 62, "remainder file is 62 hex chars (31 bytes)");
+        assert_eq!(
+            file_name.len(),
+            62,
+            "remainder file is 62 hex chars (31 bytes)"
+        );
         assert!(
             dir_name.chars().all(|c| c.is_ascii_hexdigit()),
             "prefix is hex"
@@ -653,10 +657,7 @@ mod tests {
         // exact equality — pins the prefix byte AND the order.
         let bytes_h = h.as_bytes();
         let expected_dir = format!("{:02x}", bytes_h[0]);
-        let expected_file: String = bytes_h[1..]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let expected_file: String = bytes_h[1..].iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(dir_name, expected_dir);
         assert_eq!(file_name, expected_file);
     }
@@ -853,14 +854,11 @@ mod tests {
         let leftover_tmp = fs::read_dir(&bucket)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with(".tmp-")
-            })
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp-"))
             .count();
         assert_eq!(
-            leftover_tmp, 0,
+            leftover_tmp,
+            0,
             "concurrent put left .tmp-* files in {}",
             bucket.display()
         );
@@ -977,7 +975,10 @@ mod tests {
 
         // Sweep with a long threshold: should NOT remove the fresh file.
         let report = s.sweep_stale_temps(std::time::Duration::from_secs(3600));
-        assert!(report.is_clean(), "fresh temp swept incorrectly: {report:?}");
+        assert!(
+            report.is_clean(),
+            "fresh temp swept incorrectly: {report:?}"
+        );
         assert!(tmp_path.exists(), "fresh temp file removed by sweep");
     }
 
@@ -1021,11 +1022,7 @@ mod tests {
         for prefix in &["ab", "cd"] {
             let bucket = s.root().join(prefix);
             fs::create_dir_all(&bucket).unwrap();
-            fs::write(
-                bucket.join(format!(".tmp-{prefix}-0-deadbeef")),
-                b"stale",
-            )
-            .unwrap();
+            fs::write(bucket.join(format!(".tmp-{prefix}-0-deadbeef")), b"stale").unwrap();
         }
         let report = s.sweep_stale_temps(std::time::Duration::ZERO);
         assert_eq!(report.removed(), 2, "want 2 removed: {report:?}");
@@ -1052,7 +1049,10 @@ mod tests {
 
         let report = s.sweep_stale_temps(std::time::Duration::ZERO);
         assert_eq!(report.removed(), 1, "should only remove the bucket one");
-        assert!(tmp_in_stray.exists(), "stray dir's .tmp-* should be untouched");
+        assert!(
+            tmp_in_stray.exists(),
+            "stray dir's .tmp-* should be untouched"
+        );
         assert!(!tmp_in_bucket.exists(), "bucket .tmp-* should be removed");
     }
 
@@ -1105,7 +1105,12 @@ mod tests {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp-"))
             .count();
-        assert_eq!(leftover, 0, "sweep left .tmp-* survivors in {}", bucket.display());
+        assert_eq!(
+            leftover,
+            0,
+            "sweep left .tmp-* survivors in {}",
+            bucket.display()
+        );
 
         // The real blob still works.
         let got = s.get(expected).expect("get").expect("present");

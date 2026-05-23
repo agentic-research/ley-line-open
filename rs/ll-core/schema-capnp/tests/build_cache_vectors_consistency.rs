@@ -68,8 +68,8 @@ fn cloister_vectors_internally_consistent() {
     };
 
     // Read lockfile and decode.
-    let lockfile_bytes = std::fs::read(vectors.join("lockfile-config.bin"))
-        .expect("read lockfile-config.bin");
+    let lockfile_bytes =
+        std::fs::read(vectors.join("lockfile-config.bin")).expect("read lockfile-config.bin");
     let mut slice: &[u8] = &lockfile_bytes;
     let msg = capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new())
         .expect("decode lockfile-config.bin as capnp message");
@@ -119,8 +119,8 @@ fn cloister_vectors_internally_consistent() {
         assert_eq!(kind, "go-source", "source[{i}] kind drift");
 
         let chunk_path = vectors.join(expected_files[i]);
-        let chunk_bytes = std::fs::read(&chunk_path)
-            .unwrap_or_else(|_| panic!("read {}", chunk_path.display()));
+        let chunk_bytes =
+            std::fs::read(&chunk_path).unwrap_or_else(|_| panic!("read {}", chunk_path.display()));
         let chunk_blake3: [u8; 32] = *blake3::hash(&chunk_bytes).as_bytes();
 
         let claimed = s.get_chunk_hash().unwrap().get_bytes().unwrap();
@@ -191,10 +191,8 @@ fn cloister_vectors_manifest_layer_digests_match_chunks() {
         digests.len()
     );
 
-    let config_blake3: [u8; 32] = *blake3::hash(
-        &std::fs::read(vectors.join("lockfile-config.bin")).unwrap(),
-    )
-    .as_bytes();
+    let config_blake3: [u8; 32] =
+        *blake3::hash(&std::fs::read(vectors.join("lockfile-config.bin")).unwrap()).as_bytes();
     assert_eq!(
         digests[0],
         hex_encode(&config_blake3),
@@ -262,14 +260,11 @@ fn cloister_vectors_digests_json_matches_actual() {
     // file. Re-verify the BLAKE3 ones (the on-the-wire ones) match
     // the actual file contents. We don't re-verify SHA-256 because
     // VECTORS.sha256 is already that gate.
-    let digests = std::fs::read_to_string(vectors.join("digests.json"))
-        .expect("read digests.json");
+    let digests = std::fs::read_to_string(vectors.join("digests.json")).expect("read digests.json");
 
     // Sanity check the lockfile-config blake3 field appears.
-    let lockfile_blake3: [u8; 32] = *blake3::hash(
-        &std::fs::read(vectors.join("lockfile-config.bin")).unwrap(),
-    )
-    .as_bytes();
+    let lockfile_blake3: [u8; 32] =
+        *blake3::hash(&std::fs::read(vectors.join("lockfile-config.bin")).unwrap()).as_bytes();
     let lockfile_hex = hex_encode(&lockfile_blake3);
     assert!(
         digests.contains(&lockfile_hex),

@@ -25,6 +25,11 @@ use std::path::Path;
 const SCHEMA_FILEID_ALLOWLIST: &[(&str, &str)] = &[
     ("ast.capnp", "0x9e1e4e1af2b578d9"),
     ("binding.capnp", "0x9c0c8cd3c5b1329a"),
+    // ADR-0021 / ley-line-open-ae89aa — CacheLockfile substrate primitive.
+    // The fileId is deliberately the leetspeak literal `cafe` repeated;
+    // ADR-0014 §2 says fileId is identity, so a memorable mnemonic is
+    // *more* auditable than a random literal — drift is visually obvious.
+    ("cache.capnp", "0xca7eca7eca7eca7e"),
     ("common.capnp", "0xb0c0debaadc0deb0"),
     ("go.capnp", "0xd12a1c51fedd6c88"),
     ("head.capnp", "0xc7c7ada1403b9f78"),

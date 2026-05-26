@@ -66,14 +66,8 @@ mod tests {
 
     fn hash_via_ffi(input: &[u8]) -> [u8; 32] {
         let mut out = [0u8; 32];
-        let rc = unsafe {
-            leyline_hash_bytes(
-                input.as_ptr(),
-                input.len(),
-                out.as_mut_ptr(),
-                out.len(),
-            )
-        };
+        let rc =
+            unsafe { leyline_hash_bytes(input.as_ptr(), input.len(), out.as_mut_ptr(), out.len()) };
         assert_eq!(rc, 32, "leyline_hash_bytes returned {rc}, expected 32");
         out
     }
@@ -114,18 +108,15 @@ mod tests {
     #[test]
     fn ffi_rejects_null_input_pointer() {
         let mut out = [0u8; 32];
-        let rc = unsafe {
-            leyline_hash_bytes(std::ptr::null(), 0, out.as_mut_ptr(), out.len())
-        };
+        let rc = unsafe { leyline_hash_bytes(std::ptr::null(), 0, out.as_mut_ptr(), out.len()) };
         assert_eq!(rc, -1);
     }
 
     #[test]
     fn ffi_rejects_null_output_pointer() {
         let input = b"x";
-        let rc = unsafe {
-            leyline_hash_bytes(input.as_ptr(), input.len(), std::ptr::null_mut(), 32)
-        };
+        let rc =
+            unsafe { leyline_hash_bytes(input.as_ptr(), input.len(), std::ptr::null_mut(), 32) };
         assert_eq!(rc, -1);
     }
 
@@ -133,9 +124,8 @@ mod tests {
     fn ffi_rejects_undersized_output_buffer() {
         let input = b"x";
         let mut out = [0u8; 31]; // one byte short
-        let rc = unsafe {
-            leyline_hash_bytes(input.as_ptr(), input.len(), out.as_mut_ptr(), out.len())
-        };
+        let rc =
+            unsafe { leyline_hash_bytes(input.as_ptr(), input.len(), out.as_mut_ptr(), out.len()) };
         assert_eq!(rc, -1);
     }
 
@@ -143,9 +133,8 @@ mod tests {
     fn ffi_accepts_oversized_output_buffer_and_writes_exactly_32() {
         let input = b"y";
         let mut out = [0xFFu8; 64];
-        let rc = unsafe {
-            leyline_hash_bytes(input.as_ptr(), input.len(), out.as_mut_ptr(), out.len())
-        };
+        let rc =
+            unsafe { leyline_hash_bytes(input.as_ptr(), input.len(), out.as_mut_ptr(), out.len()) };
         assert_eq!(rc, 32);
         // The first 32 bytes equal the hash; the rest are untouched.
         assert_eq!(&out[..32], input.hash().as_bytes());
@@ -159,9 +148,7 @@ mod tests {
         // (empty layers).
         let mut out = [0u8; 32];
         let dummy = [0u8; 1]; // dummy non-null pointer for empty slice
-        let rc = unsafe {
-            leyline_hash_bytes(dummy.as_ptr(), 0, out.as_mut_ptr(), out.len())
-        };
+        let rc = unsafe { leyline_hash_bytes(dummy.as_ptr(), 0, out.as_mut_ptr(), out.len()) };
         assert_eq!(rc, 32);
         assert_eq!(&out[..], blake3::hash(&[]).as_bytes());
     }

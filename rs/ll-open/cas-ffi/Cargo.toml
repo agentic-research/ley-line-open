@@ -1,0 +1,24 @@
+[package]
+name = "leyline-cas-ffi"
+version = "0.4.5"
+edition = "2024"
+description = "Wasm32-callable C FFI for ll-core CAS primitives (BLAKE3-of-bytes) — bead ley-line-open-0c8c0b"
+
+[lib]
+# Same crate-type triple as leyline-sign (rs/ll-open/sign/Cargo.toml):
+# - cdylib   for wasm32 + dlopen-from-TS consumers (cloister, future Swift)
+# - staticlib for static-link consumers (cli tools, embedded use)
+# - rlib     for in-workspace Rust consumers (lets `cargo test` link this
+#            crate's tests against the rest of the workspace)
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+# The substrate. ll-core owns the BLAKE3 lock (Σ §3.4) and the
+# ContentAddressed trait that defines σ. This crate is a thin FFI
+# adapter over those primitives — no algorithm choices live here.
+leyline-core = { path = "../../ll-core/core" }
+
+[dev-dependencies]
+# Used by the FFI round-trip test to cross-check the FFI surface
+# against direct `<&[u8] as ContentAddressed>::hash()` calls.
+blake3 = "1"

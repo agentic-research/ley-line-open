@@ -90,6 +90,7 @@ pub async fn cmd_daemon(
     mcp_port: Option<u16>,
     mcp_bind: Option<std::net::IpAddr>,
     mcp_allow_public: bool,
+    mcp_no_auth: bool,
 ) -> Result<()> {
     let ext: Arc<dyn DaemonExt> = Arc::new(NoExt);
     run_daemon(
@@ -106,6 +107,7 @@ pub async fn cmd_daemon(
         mcp_port,
         mcp_bind,
         mcp_allow_public,
+        mcp_no_auth,
     )
     .await
 }
@@ -138,12 +140,14 @@ pub async fn run_daemon(
     mcp_port: Option<u16>,
     mcp_bind: Option<std::net::IpAddr>,
     mcp_allow_public: bool,
+    mcp_no_auth: bool,
 ) -> Result<()> {
     // Bead `ley-line-open-b7dd03`: gate non-loopback `--mcp-bind` behind
-    // an explicit `--mcp-allow-public` flag. The MCP wire has no auth
-    // (tracked separately as bead `ley-line-open-b8395d`); making the
-    // public bind a deliberate two-flag opt-in prevents fat-fingered
-    // exposure on a dev box. Container deployments pass both flags in
+    // an explicit `--mcp-allow-public` flag. The MCP wire now has a
+    // shared-secret token gate (ADR-0022 / bead `ley-line-open-b885d1`);
+    // making the public bind a deliberate two-flag opt-in still applies
+    // because the token alone doesn't defend against off-LAN attackers
+    // hammering the listener. Container deployments pass both flags in
     // the image CMD; outside containers, only pass them when you
     // control the firewall.
     //
@@ -293,12 +297,65 @@ pub async fn run_daemon(
 
     // Optional MCP HTTP transport — feeds cloister gateway / any MCP client.
     // Same dispatch table as the UDS socket; just an MCP-shaped wrapper.
+    //
+    // ADR-0022 / bead `ley-line-open-b885d1`: gate /mcp behind a
+    // shared-secret token. Token is auto-generated at the platform's
+    // data dir (Linux: `~/.local/share/leyline/daemon.token`; macOS:
+    // `~/Library/Application Support/leyline/daemon.token`) on first
+    // boot. `--mcp-no-auth` skips the gate entirely — required for
+    // pre-provisioned containers where the token file isn't present at
+    // startup, and logged as a warning.
+    //
+    // Token-load failure is fail-CLOSED: we skip the spawn rather than
+    // start an unauthenticated listener. The previous draft logged
+    // "refusing to serve /mcp" but still called spawn with `token=None`,
+    // which silently opened the gate (Copilot finding on PR #66).
     let mcp_handle = if let Some(port) = mcp_port {
-        match crate::daemon::mcp::spawn(ctx.clone(), mcp_bind, port) {
-            Ok(h) => Some(h),
-            Err(e) => {
-                log::error!("MCP HTTP server failed to start on port {port}: {e:#}");
-                None
+        enum TokenDecision {
+            Gated(Arc<String>),
+            NoAuth,
+            Bail,
+        }
+
+        let decision = if mcp_no_auth {
+            let exposure_hint = match mcp_bind {
+                Some(addr) if !addr.is_loopback() => "off-loopback / potentially network-reachable",
+                _ => "any local caller on this machine",
+            };
+            log::warn!("MCP HTTP auth disabled by --mcp-no-auth — /mcp is open to {exposure_hint}",);
+            TokenDecision::NoAuth
+        } else {
+            match crate::daemon::auth::default_token_path()
+                .and_then(|p| crate::daemon::auth::load_or_generate(&p).map(|t| (p, t)))
+            {
+                Ok((path, tok)) => {
+                    eprintln!("MCP HTTP token at {}", path.display());
+                    TokenDecision::Gated(Arc::new(tok))
+                }
+                Err(e) => {
+                    log::error!(
+                        "failed to load/generate MCP token: {e:#}; refusing to serve /mcp \
+                         (pass --mcp-no-auth to opt out of the token gate)",
+                    );
+                    TokenDecision::Bail
+                }
+            }
+        };
+
+        match decision {
+            TokenDecision::Bail => None,
+            TokenDecision::Gated(_) | TokenDecision::NoAuth => {
+                let token = match &decision {
+                    TokenDecision::Gated(t) => Some(t.clone()),
+                    _ => None,
+                };
+                match crate::daemon::mcp::spawn(ctx.clone(), mcp_bind, port, token) {
+                    Ok(h) => Some(h),
+                    Err(e) => {
+                        log::error!("MCP HTTP server failed to start on port {port}: {e:#}");
+                        None
+                    }
+                }
             }
         }
     } else {
@@ -1561,6 +1618,7 @@ mod tests {
             Some(8384),
             Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
             false,
+            true, // mcp_no_auth — skip token gate; test exits on public-bind gate first
         )
         .await;
         let err = res.expect_err("non-loopback bind without --mcp-allow-public must bail");
@@ -1596,6 +1654,7 @@ mod tests {
             Some(8384),
             Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             false,
+            true, // mcp_no_auth
         )
         .await;
         if let Err(e) = res {
@@ -1625,6 +1684,7 @@ mod tests {
             Some(8384),
             Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
             true,
+            true, // mcp_no_auth
         )
         .await;
         if let Err(e) = res {
@@ -1660,6 +1720,7 @@ mod tests {
             None, // no mcp_port — the gate's first conjunct
             Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
             false,
+            true, // mcp_no_auth
         )
         .await;
         if let Err(e) = res {

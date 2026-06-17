@@ -87,11 +87,26 @@ enum Cmd {
         /// Container deployments pass this in the image CMD because the
         /// container-side 0.0.0.0 is legitimate plumbing. Outside
         /// containers, only pass this when you control the firewall and
-        /// understand the MCP wire has no auth (bead
-        /// `ley-line-open-b7dd03`; auth model itself tracked by bead
-        /// `ley-line-open-b8395d`).
+        /// understand the LAN exposure surface. The shared-secret token
+        /// gate (ADR-0022) closes the same-machine surface but does not
+        /// substitute for network-level controls when binding to a
+        /// public address. Bead `ley-line-open-b7dd03`.
         #[arg(long, default_value_t = false)]
         mcp_allow_public: bool,
+
+        /// Disable the shared-secret token gate on `/mcp` (ADR-0022,
+        /// bead `ley-line-open-b885d1`). Default behavior: the daemon
+        /// auto-generates a 32-byte token at the platform data dir
+        /// (XDG `$XDG_DATA_HOME/leyline/daemon.token` on Linux —
+        /// typically `~/.local/share/leyline/daemon.token`; or
+        /// `~/Library/Application Support/leyline/daemon.token` on
+        /// macOS), mode `0600`, and rejects requests without
+        /// `x-leyline-token: <hex>`. Pass this flag only for
+        /// pre-provisioned containers / CI smokes where no token file
+        /// is mounted and the perimeter is enforced elsewhere. Logged
+        /// as a warning at startup.
+        #[arg(long, default_value_t = false)]
+        mcp_no_auth: bool,
     },
 }
 
@@ -160,6 +175,7 @@ async fn main() -> Result<()> {
             mcp_port,
             mcp_bind,
             mcp_allow_public,
+            mcp_no_auth,
         } => {
             // KNOWN scale limitation: arena_size_mib defaults to 64
             // (see Cmd::Daemon { arena_size_mib, default_value_t = 64 }).
@@ -189,6 +205,7 @@ async fn main() -> Result<()> {
                 mcp_port,
                 mcp_bind,
                 mcp_allow_public,
+                mcp_no_auth,
             )
             .await
         }

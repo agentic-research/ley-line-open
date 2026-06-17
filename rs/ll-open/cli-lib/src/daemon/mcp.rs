@@ -554,8 +554,10 @@ pub fn spawn(
         .with_state(ctx);
 
     // ADR-0022: gate /mcp behind the shared-secret token when one was
-    // generated. The token is None only when --mcp-no-auth was passed —
-    // logged earlier in cmd_daemon as a security-relevant opt-out.
+    // generated. In the daemon CLI wiring, `None` means `--mcp-no-auth`
+    // was passed (and logged as a warning). Direct in-process callers
+    // (tests, embedders) can also pass `None`; this function's job is
+    // wire-the-router, not enforce the policy decision.
     let app = if let Some(tok) = token {
         mcp_routes.layer(middleware::from_fn_with_state(tok, auth::require_token))
     } else {

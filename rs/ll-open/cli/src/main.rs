@@ -96,12 +96,15 @@ enum Cmd {
 
         /// Disable the shared-secret token gate on `/mcp` (ADR-0022,
         /// bead `ley-line-open-b885d1`). Default behavior: the daemon
-        /// auto-generates a 32-byte token at
-        /// `~/.local/share/leyline/daemon.token` (0600) and rejects
-        /// requests without `x-leyline-token: <hex>`. Pass this flag
-        /// only for pre-provisioned containers / CI smokes where no
-        /// token file is mounted and the perimeter is enforced
-        /// elsewhere. Logged as a warning at startup.
+        /// auto-generates a 32-byte token at the platform data dir
+        /// (XDG `$XDG_DATA_HOME/leyline/daemon.token` on Linux —
+        /// typically `~/.local/share/leyline/daemon.token`; or
+        /// `~/Library/Application Support/leyline/daemon.token` on
+        /// macOS), mode `0600`, and rejects requests without
+        /// `x-leyline-token: <hex>`. Pass this flag only for
+        /// pre-provisioned containers / CI smokes where no token file
+        /// is mounted and the perimeter is enforced elsewhere. Logged
+        /// as a warning at startup.
         #[arg(long, default_value_t = false)]
         mcp_no_auth: bool,
     },

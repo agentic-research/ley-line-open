@@ -2,15 +2,24 @@
 //! `ley-line-open-b885d1`).
 //!
 //! Adopts lectio's `auth.rs` pattern: a 32-byte random token hex-encoded
-//! at `~/.local/share/leyline/daemon.token` (mode `0600`). Every
+//! at the platform data dir (`~/.local/share/leyline/daemon.token` on
+//! Linux, `~/Library/Application Support/leyline/daemon.token` on
+//! macOS; see [`default_token_path`]). File mode `0600` on unix. Every
 //! `/mcp` request must include `x-leyline-token: <hex>`; comparison is
 //! constant-time via `subtle::ConstantTimeEq`.
 //!
-//! Threat closed: DNS-rebinding probes against `127.0.0.1` and same-user
-//! local processes that can't read the token file. The UDS path is NOT
-//! gated here — the socket's parent directory is `0600` already, so any
-//! process that can `connect(2)` to the socket is a process that can
-//! read the token file.
+//! Threat closed: DNS-rebinding probes against `127.0.0.1` and unrelated
+//! same-user local processes that can't read the token file (the token
+//! lives at a known path with `0600` perms; reading it requires either
+//! the daemon's own user or a privilege-escalation route that's already
+//! game-over).
+//!
+//! The UDS dispatch path is NOT gated by this token. The daemon's UDS
+//! socket lives next to the arena's controller file (default
+//! `~/.mache/default.ctrl.sock`); a process that can `connect(2)` to
+//! the socket is one that can already reach the daemon directly. UDS
+//! peer-credential checks (SO_PEERCRED / getpeereid) are a follow-up
+//! beyond this ADR.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,7 +32,8 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
-use rand::RngCore;
+use rand::TryRngCore;
+use rand::rngs::OsRng;
 use serde_json::json;
 use subtle::ConstantTimeEq;
 
@@ -53,8 +63,14 @@ pub fn load_or_generate(path: &Path) -> Result<String> {
         // File exists but is empty — fall through to generation.
     }
 
+    // Explicit OS-backed CSPRNG so the substrate's secret-material
+    // posture is unambiguous (Copilot finding on PR #66). Matches the
+    // ed25519 keygen pattern elsewhere in the repo; never `rand::rng()`
+    // for secret bytes.
     let mut bytes = [0u8; 32];
-    rand::rng().fill_bytes(&mut bytes);
+    OsRng
+        .try_fill_bytes(&mut bytes)
+        .context("OsRng failed to fill token bytes")?;
     let token = hex::encode(bytes);
 
     if let Some(parent) = path.parent() {

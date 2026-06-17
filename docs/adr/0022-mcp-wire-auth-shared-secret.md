@@ -32,9 +32,9 @@ Adopt lectio's `auth.rs` pattern, ported to LLO's axum stack:
 1. **Token location.** `~/.local/share/leyline/daemon.token` — 32 random bytes hex-encoded. File mode `0600` (user-only read/write).
 2. **Token lifecycle.** Auto-generated at daemon startup if the file doesn't exist; reused otherwise. Rotation is out of scope for v1 (delete the file + restart the daemon to rotate).
 3. **Wire format.** Every request to `POST /mcp` MUST include `x-leyline-token: <hex>`. Missing or non-matching → HTTP `401` with `{"error": "unauthorized"}` JSON.
-4. **Comparison.** Constant-time via `subtle::ConstantTimeEq`. Length mismatch also returns 401 (no length-leak via timing).
+4. **Comparison.** Constant-time via `subtle::ConstantTimeEq` *when lengths match*. A provided token whose length differs from the expected token short-circuits to 401 without invoking the constant-time path — `ct_eq` requires equal-length slices. The expected length is a public constant of this ADR (64-char hex), so leaking length via this branch is intentional and not a finding.
 5. **Middleware placement.** Axum `middleware::from_fn_with_state` wrapping the `/mcp` route. The `GET /mcp` SSE path (currently stub `405`) inherits the gate when it lands.
-6. **UDS dispatch is NOT gated.** The UDS socket at `~/.leyline/daemon.sock` is filesystem-perm-gated already (`0600` parent directory); a process that can `connect(2)` is a process that can read the token file.
+6. **UDS dispatch is NOT gated by this token.** The daemon's UDS socket is created next to the arena controller file — default `~/.mache/default.ctrl.sock` (the `--control` flag overrides). A process that can `connect(2)` to that socket already shares the daemon's user; gating the same caller again at the wire level adds no security. UDS peer-credential checks (`SO_PEERCRED` / `getpeereid`) are an explicit follow-up beyond this ADR if the threat model later admits mixed-user same-machine scenarios.
 7. **Local-only by construction.** Token gate is wired only when `--mcp-port` is set. Pure-UDS daemons skip token bootstrap.
 
 ### Mode B (future ADR): cloister-proxied for remote access
@@ -79,11 +79,13 @@ A future ADR-0023 will spec the cloister↔LLO trust handshake when that work pi
 
 ## Implementation notes (for bead `ley-line-open-b885d1`)
 
-- New module `rs/ll-open/cli-lib/src/daemon/auth.rs` — `Token`, `load_or_generate(path)`, `require_token` middleware.
-- Add `subtle = "2"` to `cli-lib/Cargo.toml` (currently transitive only).
-- `DaemonContext` gets a `mcp_token: Option<Arc<String>>` field — `None` when MCP HTTP isn't running or `--mcp-no-auth` is set.
+- New module `rs/ll-open/cli-lib/src/daemon/auth.rs` — `default_token_path()`, `load_or_generate(path)`, `require_token` middleware.
+- Add `subtle = "2"`, `rand = "0.9"`, `hex = "0.4"` to `cli-lib/Cargo.toml` as direct deps (previously transitive only).
+- Token is plumbed as an explicit `Option<Arc<String>>` parameter to `daemon::mcp::spawn`. The decision of "is the token present?" lives in `cmd_daemon::run_daemon` (the CLI wiring); `DaemonContext` does NOT carry a token field — the request-side middleware closes over the token via axum's `from_fn_with_state`, not the per-request `DaemonContext` extractor.
+- Fail-CLOSED on token load: if `load_or_generate` fails, `cmd_daemon` skips the MCP spawn entirely. Operators who deliberately want an unauthenticated listener pass `--mcp-no-auth`.
 - `daemon::mcp::spawn` wires `middleware::from_fn_with_state` ahead of the `/mcp` route when a token is present.
-- Tests cover: correct token → 200; missing header → 401; wrong token → 401; length mismatch → 401; UDS path unaffected.
+- Random bytes come from `rand::rngs::OsRng` explicitly — the OS CSPRNG, not the version-defaulted `rand::rng()` helper. Matches the substrate's existing secret-material posture (ed25519 keygen).
+- Tests cover: correct token → 200; missing header → 401; wrong token → 401; length mismatch → 401; empty header → 401; 401 body is `{"error": "unauthorized"}`. UDS path unaffected (no test needed — the middleware only attaches to the HTTP router).
 
 ## References
 

@@ -61,12 +61,23 @@ Workerd (Cloudflare's open-source Workers runtime) and Sandstorm (capnp's birthp
 Three artifact tiers must be version-anchored for reproducible cross-runtime byte equality:
 
 1. **Compiler binary.** The `capnp` C++ tool generates schema metadata consumed by every language generator. Required: `capnp >= 1.0`, tested against `1.3.0`. Document via `tools/install-capnp.sh` and the schema-capnp `build.rs` should fail-fast on too-old versions. Workerd's Bazel-pin pattern is the strongest precedent; we adapt to a script-based pin since this repo doesn't use Bazel.
-2. **Per-language generators.** Rust: `capnpc = "=0.20.0"` exact (currently `"0.20"` semver-range — TIGHTEN). Go (mache side): `capnp.org/go/capnp/v3/capnpc-go@v3.0.X` exact tag, NOT `@latest` (the Copilot review of mache PR-1 caught `@latest` as non-reproducible). Generated bindings are committed to source control to eliminate dev-machine drift.
-3. **Per-language runtimes.** Rust: `capnp = "=0.20.0"` exact. Go: `require capnproto.org/go/capnp/v3 v3.0.X` exact. Same exact-pin discipline as generators.
+2. **Per-language generators.** Rust: `capnpc = "=0.25.0"` exact across `schema-capnp`, `public-schema`, and any other capnpc consumer. Go (mache side): `capnp.org/go/capnp/v3/capnpc-go@v3.X` exact tag, NOT `@latest` (the Copilot review of mache PR-1 caught `@latest` as non-reproducible). Generated bindings are committed to source control to eliminate dev-machine drift.
+3. **Per-language runtimes.** Rust: `capnp = "=0.25.0"` exact across all consumer crates (`schema-capnp`, `public-schema`, `cli-lib`, `lsp`). Go: `require capnproto.org/go/capnp/v3 vX.Y.Z` exact (currently `v3.1.0-alpha.2` — see §3.1 below). Same exact-pin discipline as generators.
 
 **Rule.** Tooling versions are part of the contract. A version mismatch is a CI failure, not a runtime mystery.
 
-**Cross-runtime fixture suite** (novel — community doesn't ship one). `rs/ll-core/schema-capnp/tests/fixtures/*.bin` files committed as gold-standard canonical-encoded messages, with sibling `*.expected.json` files describing their decoded content. Both LLO Rust CI and mache Go CI run the suite — encoding in one language and decoding in the other must produce field-equal results. This is the F8.6.4 test from the math-friend's analysis; it becomes the strongest invariant of T8 once it ships. (Tracked as a follow-up; not blocking ADR acceptance.)
+**Cross-runtime fixture suite** (novel — community doesn't ship one). `rs/ll-core/schema-capnp/tests/fixtures/*.bin` files committed as gold-standard canonical-encoded messages, with sibling `*.expected.json` files describing their decoded content. Both LLO Rust CI and mache Go CI run the suite — encoding in one language and decoding in the other must produce field-equal results. This is the F8.6.4 test from the math-friend's analysis; it became the strongest invariant of T8 once it shipped. (Shipped 2026-02 via `cross_runtime_fixtures.rs`; extended to `cache.capnp` in PR #53 / `build_cache_vectors_consistency.rs`.)
+
+#### 3.1 Pin history + Go alpha-runtime caveat
+
+The original ADR (2026-05-08) declared the triplet at `=0.20.0`. The workspace has since advanced to `=0.25.0` consistently — verified by the coupling audit on 2026-06-17 (`docs/audits/2026-06-17-coupling-audit.md` F4) across `schema-capnp`, `public-schema`, `cli-lib`, and `lsp`. The auxiliary `capnp-json` runtime is pinned at `=0.1.0`. The bump from 0.20 to 0.25 landed incrementally as the substrate matured; the pin language above now reflects the current state.
+
+**Go runtime caveat.** `clients/go/leyline-schema/go.mod` and `mache`'s consumer `go.mod` both pull `capnproto.org/go/capnp/v3 v3.1.0-alpha.2` — an *alpha* version. This is the carrier that the existing cross-runtime fixture suite (F8.6.4) passes against. Two reads of this state:
+
+- *Deliberate carrier*: Go capnp's stable `v3.0.x` line predates the Rust `0.25` runtime; the alpha tag is what's compatible with the Rust 0.25 wire-byte conventions that the LLO substrate emits. The fixture suite IS the falsifier; if alpha drift breaks byte-equality, F8.6.4 fails CI and we know.
+- *Deferred bump*: a stable `v3.X.Y` (matched to `capnp = "=0.25.4"` or whatever 0.25.x triplet is current) is the long-term target. Tracked as part of the deferred capnp 0.25.4 triplet bump (referenced in handoff bead `ley-line-open-5f92fa`).
+
+For now, the alpha pin is intentional and falsifier-backed. A future ADR addendum (or §3 minor revision) records the move to a stable Go tag when the 0.25.4 triplet work lands.
 
 ---
 
@@ -110,17 +121,18 @@ Each rule above maps to at least one CI test that fails when the rule is violate
 
 ---
 
-## Implementation status (snapshot 2026-05-08)
+## Implementation status (snapshot 2026-06-17)
 
 | Commitment | Status | Reference |
 |---|---|---|
-| Producer canonicalizes (4 call sites) | ✅ Shipped | this commit, cmd_parse.rs / project.rs |
+| Producer canonicalizes (4 call sites) | ✅ Shipped | cmd_parse.rs / project.rs |
 | `hash_segment_files` canonicalizes on read | ✅ Shipped | cmd_parse.rs::hash_segment_files |
 | Regression test `segment_hash_is_canonical_byte_stable` | ✅ Shipped | cmd_parse.rs::tests |
 | Append-only-additive evolution rule | ✅ Documented; CI gate is followup | this ADR |
-| `(filename, fileId)` allowlist CI gate | ⏳ Followup | tracked in T8.6 close comment |
-| Toolchain triplet pin | 🟡 Partial — capnpc semver-range, generators unpinned | upgrade in followup |
-| Cross-runtime fixture suite | ⏳ Followup (F8.6.4) | major investment; not blocking |
+| `(filename, fileId)` allowlist CI gate | ✅ Shipped | `schema-capnp/tests/fileid_allowlist.rs` |
+| Toolchain triplet pin (Rust) | ✅ Exact at `=0.25.0` across `schema-capnp`/`public-schema`/`cli-lib`/`lsp` | verified by coupling audit 2026-06-17 |
+| Toolchain triplet pin (Go runtime) | 🟡 Pinned exact at `v3.1.0-alpha.2`; alpha-runtime caveat documented above (§3.1) | `clients/go/leyline-schema/go.mod` |
+| Cross-runtime fixture suite | ✅ Shipped (F8.6.4) + extended to `cache.capnp` in PR #53 | `schema-capnp/tests/cross_runtime_fixtures.rs`, `build_cache_vectors_consistency.rs` |
 | Annotation-driven versioning (workerd-style) | ⏳ Future ADR | deferred |
 
 ---

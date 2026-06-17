@@ -26,10 +26,10 @@ jobs:
           toolchain: nightly
           components: clippy, rustfmt
 
-      - name: Install system deps (libfuse for fuser, capnproto + libcapnp-dev for schema build.rs)
+      - name: Install system deps (libfuse for fuser, capnproto + libcapnp-dev for schema build.rs, ripgrep for blake3 lint)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libfuse-dev capnproto libcapnp-dev pkg-config
+          sudo apt-get install -y --no-install-recommends libfuse-dev capnproto libcapnp-dev pkg-config ripgrep
           # libcapnp-dev ships /usr/include/capnp/c++.capnp and the other
           # standard schema includes that the capnp compiler resolves
           # `using Cxx = import "/capnp/c++.capnp";`-style imports against.

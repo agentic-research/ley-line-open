@@ -10,7 +10,9 @@ use leyline_core::Controller;
 use rusqlite::Connection;
 use serde_json::json;
 
-use super::wire::{BaseRequest, LspFile, LspPosition, Ref as WireRef, TokenMapEntry};
+use super::wire::{
+    BASE_OP_NAMES, BaseRequest, LspFile, LspPosition, Ref as WireRef, TokenMapEntry,
+};
 use super::{DaemonContext, DaemonPhase};
 
 // ---------------------------------------------------------------------------
@@ -32,58 +34,17 @@ pub(crate) fn is_state_changing(op: &str) -> bool {
     STATE_CHANGING_OPS.contains(&op)
 }
 
-/// Canonical list of op names that `handle_base_op` dispatches.
+/// Test-only thin wrapper over [`BASE_OP_NAMES`]. Existing drift tests
+/// iterate `base_op_names()` against `STATE_CHANGING_OPS` and
+/// `mcp::tool_registry`; they continue to work unchanged after
+/// b632ee's SoT collapse — they now read from `BASE_OP_NAMES` via this
+/// alias.
 ///
-/// Single source of truth shared with `daemon::mcp::tool_registry` — every
-/// MCP tool name must be in this list. A drift test in `mcp::tests`
-/// catches mismatches; another in this module's tests verifies that
-/// `handle_base_op` recognizes every name here.
-///
-/// If you add a new op:
-///   1. Add a match arm in `handle_base_op`.
-///   2. Add the name here (and in `STATE_CHANGING_OPS` if mutating).
-///   3. Optionally expose it via `tool_registry()` in `daemon::mcp`.
+/// If you add a new op, see the checklist on `BASE_OP_NAMES` in
+/// `wire.rs` — this function does NOT need updating.
 #[cfg(test)]
 pub(crate) fn base_op_names() -> Vec<&'static str> {
-    #[cfg_attr(not(feature = "vec"), allow(unused_mut))]
-    let mut v = vec![
-        "status",
-        "flush",
-        "load",
-        "query",
-        "reparse",
-        "snapshot",
-        "enrich",
-        "list_roots",
-        "list_children",
-        "read_content",
-        "find_callers",
-        "find_callees",
-        "find_defs",
-        "get_node",
-        "get_refs_map",
-        "get_defs_map",
-        "get_schema",
-        "get_db_path",
-        "lsp_hover",
-        "lsp_defs",
-        "lsp_refs",
-        "lsp_symbols",
-        "lsp_diagnostics",
-        "sheaf_set_topology",
-        "sheaf_update_topology",
-        "sheaf_invalidate",
-        "sheaf_defect",
-        "sheaf_stalks",
-        "sheaf_status",
-        "sheaf_learned_weights",
-        "leyline_version",
-    ];
-    #[cfg(feature = "vec")]
-    v.push("vec_search");
-    #[cfg(feature = "text-search")]
-    v.push("text_search");
-    v
+    BASE_OP_NAMES.to_vec()
 }
 
 /// Try to parse the incoming wire line as a typed `BaseRequest` and
@@ -91,15 +52,11 @@ pub(crate) fn base_op_names() -> Vec<&'static str> {
 /// args deserialized cleanly; `None` if the wire shape doesn't match any
 /// known variant (caller falls through to event / extension dispatch).
 ///
-/// This is the load-bearing entry that `socket.rs` calls. Adding a new
-/// op is a 3-step process the compiler enforces:
-///   1. Add a `BaseRequest::Foo` variant in `wire.rs` (with typed args).
-///   2. Add a `BaseRequest::Foo { ... } => Some(op_foo(...))` arm in the
-///      `dispatch_typed` match below — compiler errors until you do.
-///   3. Add `"foo"` to `base_op_names()`.
-///
-/// Forgetting any step is a compile error or test failure, not a silent
-/// drift.
+/// This is the load-bearing entry that `socket.rs` calls. See the
+/// checklist on `BASE_OP_NAMES` in `wire.rs` for the steps to add a new
+/// op. Drift tests + the compiler's exhaustive-match check on
+/// `dispatch_typed` jointly enforce that all required edits land
+/// together.
 pub fn handle_base_op(ctx: &std::sync::Arc<DaemonContext>, wire_line: &str) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(wire_line).ok()?;
     handle_base_op_value(ctx, parsed)
@@ -145,46 +102,13 @@ fn fallback_error_envelope(message: &str) -> String {
 }
 
 /// Whether `op` is one of the canonical base ops the daemon dispatches.
-/// Kept inline here (not delegating to `base_op_names()`, which is
-/// `#[cfg(test)]`) so the production dispatcher doesn't depend on test
-/// scaffolding.
+/// Derived from [`BASE_OP_NAMES`] (`wire.rs`) — the single source of
+/// truth post-b632ee. Was previously a hand-maintained `matches!`
+/// pattern that duplicated `base_op_names()`; the collapse removed the
+/// duplication and a silent existing drift (`sheaf_reap` was in this
+/// matcher but missing from `base_op_names()`).
 fn is_known_base_op(op: &str) -> bool {
-    matches!(
-        op,
-        "status"
-            | "flush"
-            | "load"
-            | "query"
-            | "reparse"
-            | "snapshot"
-            | "enrich"
-            | "list_roots"
-            | "list_children"
-            | "read_content"
-            | "find_callers"
-            | "find_callees"
-            | "find_defs"
-            | "get_node"
-            | "get_refs_map"
-            | "get_defs_map"
-            | "get_schema"
-            | "get_db_path"
-            | "lsp_hover"
-            | "lsp_defs"
-            | "lsp_refs"
-            | "lsp_symbols"
-            | "lsp_diagnostics"
-            | "sheaf_set_topology"
-            | "sheaf_update_topology"
-            | "sheaf_invalidate"
-            | "sheaf_defect"
-            | "sheaf_stalks"
-            | "sheaf_status"
-            | "sheaf_learned_weights"
-            | "sheaf_reap"
-            | "leyline_version"
-    ) || cfg!(feature = "vec") && op == "vec_search"
-        || cfg!(feature = "text-search") && op == "text_search"
+    BASE_OP_NAMES.contains(&op)
 }
 
 fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> String {
@@ -3020,6 +2944,59 @@ mod tests {
             assert!(
                 canonical.contains(name),
                 "STATE_CHANGING_OPS contains `{name}` but base_op_names() does not",
+            );
+        }
+    }
+
+    #[test]
+    fn every_canonical_name_resolves_as_base_request_tag() {
+        // Drift guard (b632ee): every entry in BASE_OP_NAMES must
+        // correspond to a `BaseRequest` enum variant. Catches the
+        // case where a name is added to BASE_OP_NAMES but the matching
+        // `BaseRequest::Foo` variant is missing — the `is_known_base_op`
+        // gate would accept the wire, then serde would fail with
+        // "unknown variant", and the client would see a confusing error
+        // instead of a structured "missing field" / "invalid args".
+        //
+        // We probe by attempting to deserialize `{"op": name}` with no
+        // args. Variants with required fields will fail with "missing
+        // field" — that's fine; what we reject is "unknown variant".
+        use super::BaseRequest;
+        use serde_json::json;
+
+        for name in BASE_OP_NAMES {
+            let payload = json!({"op": name});
+            let result: std::result::Result<BaseRequest, _> = serde_json::from_value(payload);
+            if let Err(e) = result {
+                let msg = e.to_string();
+                assert!(
+                    !msg.starts_with("unknown variant"),
+                    "BASE_OP_NAMES contains `{name}` but BaseRequest has no matching variant: {msg}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn is_known_base_op_agrees_with_base_op_names() {
+        // Drift guard (b632ee): post-collapse, is_known_base_op and
+        // base_op_names() both derive from BASE_OP_NAMES — this test
+        // pins that derivation invariant. If a future refactor
+        // accidentally reintroduces a divergent matcher (the original
+        // hand-maintained matches! pattern that this work eliminated),
+        // the test breaks immediately.
+        for name in base_op_names() {
+            assert!(
+                is_known_base_op(name),
+                "base_op_names() contains `{name}` but is_known_base_op rejects it",
+            );
+        }
+        // Spot-check a few clearly-not-canonical names. These must
+        // never be accepted regardless of how BASE_OP_NAMES evolves.
+        for bogus in ["", "nonexistent", "STATUS", "status_v2", "sheaf"] {
+            assert!(
+                !is_known_base_op(bogus),
+                "is_known_base_op must reject bogus name `{bogus}`",
             );
         }
     }

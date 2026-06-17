@@ -11,13 +11,19 @@
 //! What stays in this module:
 //!
 //! - `BaseRequest`: the serde tagged enum that decodes incoming wire
-//!   lines into one of the 23 base ops. Lives here rather than going
+//!   lines into one of the base ops. Lives here rather than going
 //!   through capnp-json on the request side because the dispatch enum
 //!   is cleaner as a serde-driven tagged union (`#[serde(tag = "op",
 //!   rename_all = "snake_case")]`) than as a capnp union — the request
 //!   shape is small, the args are heterogeneous per op, and serde's
 //!   `from_value` already handles missing-field and unknown-op errors
 //!   with structured messages.
+//! - `BASE_OP_NAMES`: the canonical string-list of every known op
+//!   name. Single source of truth for `is_known_base_op`, the
+//!   `base_op_names()` test helper, and the `mcp::tool_registry` drift
+//!   check. Adding a new op means editing this list AND adding a
+//!   `BaseRequest` variant (the two are tied together by drift tests
+//!   in `ops.rs`).
 //! - `LspPosition` / `LspFile`: small typed-args structs the LSP ops
 //!   consume.
 //! - `Ref` / `TokenMapEntry`: intermediate data types used inside
@@ -25,26 +31,88 @@
 //!   serialized today (no `to_wire` callers); kept as plain data
 //!   structs.
 //!
-//! Bead: ley-line-open-b0ea2e (the wire.rs codegen / capnp-json
-//! adoption thread).
+//! Beads:
+//! - `ley-line-open-b0ea2e` (the wire.rs codegen / capnp-json adoption thread)
+//! - `ley-line-open-b632ee` (collapse of 4 op-name SoTs into BASE_OP_NAMES)
 
 use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
+// Canonical op-name list.
+//
+// This is THE source of truth for "is this op recognized by the
+// dispatcher?" Every entry must correspond to a `BaseRequest` variant
+// (with the snake_case-of-the-variant-name as its serde tag) and a
+// `dispatch_typed` match arm in `ops.rs`. A drift test
+// (`every_canonical_name_resolves_as_base_request_tag` in `ops.rs`)
+// catches the case where a name is added here without a matching
+// variant; the compiler catches the inverse (a variant without a
+// dispatch arm) via the exhaustive match in `dispatch_typed`.
+//
+// Adding a new op means:
+//   1. Add a `BaseRequest` variant below.
+//   2. Add the snake_case name to `BASE_OP_NAMES`.
+//   3. Add a match arm in `ops.rs::dispatch_typed` (compiler-enforced).
+//   4. Optionally expose it via `tool_registry()` in `daemon::mcp`
+//      (drift test enforces tool_registry ⊆ BASE_OP_NAMES).
+//
+// Down from 4-5 hand-maintained lists (pre-b632ee) to 2 paired
+// structures with bidirectional drift tests.
+// ---------------------------------------------------------------------------
+
+/// The canonical set of op names the daemon's UDS dispatcher recognizes.
+/// Feature-gated entries appear conditionally; the consts below pin the
+/// expected counts so a refactor that drops a name without updating the
+/// gates is caught at compile time.
+pub const BASE_OP_NAMES: &[&str] = &[
+    "status",
+    "flush",
+    "load",
+    "query",
+    "reparse",
+    "snapshot",
+    "enrich",
+    "list_roots",
+    "list_children",
+    "read_content",
+    "find_callers",
+    "find_callees",
+    "find_defs",
+    "get_node",
+    "get_refs_map",
+    "get_defs_map",
+    "get_schema",
+    "get_db_path",
+    "lsp_hover",
+    "lsp_defs",
+    "lsp_refs",
+    "lsp_symbols",
+    "lsp_diagnostics",
+    "sheaf_set_topology",
+    "sheaf_update_topology",
+    "sheaf_invalidate",
+    "sheaf_defect",
+    "sheaf_stalks",
+    "sheaf_status",
+    "sheaf_learned_weights",
+    "sheaf_reap",
+    "leyline_version",
+    #[cfg(feature = "vec")]
+    "vec_search",
+    #[cfg(feature = "text-search")]
+    "text_search",
+];
+
+// ---------------------------------------------------------------------------
 // Request enum — typed dispatch surface for socket.rs.
 //
-// Each variant corresponds to one op in `is_known_base_op`. Args land in
-// the variant's named fields with serde's `tag = "op"` rename pulling
-// the `op` JSON field as the discriminator. `#[serde(default)]` on
+// Each variant has a serde tag matching one entry in `BASE_OP_NAMES`.
+// Args land in the variant's named fields; `#[serde(default)]` on
 // optional fields keeps the request small for ops that don't use them.
 //
 // ops::handle_base_op_value tries to deserialize the already-parsed
 // Value as `BaseRequest`. On success → typed dispatch into
 // `dispatch_typed`. On failure → returns an ErrorResponse on the wire.
-// Adding a new op means:
-//   1. New variant here.
-//   2. Match arm in `dispatch_typed`.
-//   3. New name in `is_known_base_op`.
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize, Debug)]

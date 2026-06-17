@@ -25,13 +25,11 @@ if [[ ! -f "$ALLOWLIST" ]]; then
     exit 2
 fi
 
-if ! command -v rg >/dev/null 2>&1; then
-    echo "lint_blake3: ripgrep (rg) is required" >&2
-    exit 2
-fi
-
 # Pull every direct call. Comment lines are filtered downstream.
-matches=$(rg --type rust -n 'blake3::hash' rs/ll-open/ 2>/dev/null || true)
+# Use `grep -rn --include='*.rs'` to avoid taking on a ripgrep dep on
+# CI runners (ubuntu-latest doesn't preinstall ripgrep despite the
+# runner-image docs claiming so; grep is in every POSIX environment).
+matches=$(grep -rn --include='*.rs' 'blake3::hash' rs/ll-open/ 2>/dev/null || true)
 
 # Build the allowlist set: keep only "file:line" prefix (tab-separated columns).
 allowed=$(grep -v '^#' "$ALLOWLIST" | grep -v '^$' | awk '{print $1}' | sort -u)
@@ -51,7 +49,7 @@ cfg_cutoff_for_file() {
         return
     fi
     local cutoff
-    cutoff=$(rg --type rust -n '^[[:space:]]*#\[cfg\(test\)\]' "$file" 2>/dev/null | head -1 | cut -d: -f1)
+    cutoff=$(grep -n '^[[:space:]]*#\[cfg(test)\]' "$file" 2>/dev/null | head -1 | cut -d: -f1)
     if [[ -z "$cutoff" ]]; then
         cutoff="999999999"
     fi

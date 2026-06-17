@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use futures::io::AsyncReadExt as _;
 use jj_lib::backend::{CopyId, TreeValue};
 use jj_lib::config::StackedConfig;
 use jj_lib::merged_tree::MergedTree;
@@ -24,7 +25,6 @@ use jj_lib::tree_builder::TreeBuilder;
 use jj_lib::workspace::{Workspace, default_working_copy_factories};
 use leyline_core::Controller;
 use pollster::FutureExt as _;
-use tokio::io::AsyncReadExt as _;
 use tokio::sync::mpsc;
 
 use leyline_fs::graph::{Graph, Node};
@@ -133,6 +133,7 @@ impl JjIntegration {
         let settings = Self::make_settings()?;
 
         Workspace::init_simple(&settings, jj_dir)
+            .block_on()
             .map_err(|e| anyhow::anyhow!("jj init failed: {e}"))?;
 
         log::info!("initialized jj repo at {}", jj_dir.display());
@@ -187,6 +188,7 @@ impl JjIntegration {
 
         let tree_id = tree_builder
             .write_tree()
+            .block_on()
             .map_err(|e| anyhow::anyhow!("write tree: {e}"))?;
 
         // Wrap TreeId into MergedTree for new_commit
@@ -216,10 +218,12 @@ impl JjIntegration {
             .new_commit(parent_ids, merged_tree)
             .set_description(message.to_string())
             .write()
+            .block_on()
             .map_err(|e| anyhow::anyhow!("write commit: {e}"))?;
 
         let commit_id_hex = commit.id().hex();
         tx.commit(message)
+            .block_on()
             .map_err(|e| anyhow::anyhow!("tx commit: {e}"))?;
 
         log::info!("jj snapshot: {} ({})", &commit_id_hex[..12], message);
@@ -450,6 +454,7 @@ impl JjIntegration {
         workspace
             .repo_loader()
             .load_at_head()
+            .block_on()
             .map_err(|e| anyhow::anyhow!("load repo: {e}"))
     }
 

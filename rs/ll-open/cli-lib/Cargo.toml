@@ -29,6 +29,11 @@ leyline-core = { path = "../../ll-core/core" }
 capnp = "=0.25.0"  # ADR-0014 §3 — exact-pin (see schema-capnp/Cargo.toml)
 capnp-json = "=0.1.0"  # daemon wire codec (see daemon/wire.rs and ADR-0014 interim status)
 blake3 = "1"
+# MCP wire auth (ADR-0022 / bead ley-line-open-b885d1). Constant-time
+# token comparison + random token generation + hex encoding.
+subtle = "2"
+rand = "0.9"
+hex = "0.4"
 leyline-fs = { path = "../fs", default-features = false }
 rusqlite = { version = "0.39", features = ["bundled", "serialize"] }
 sqlite-vec = { version = "0.1", optional = true }
@@ -54,6 +59,11 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 rusqlite = { version = "0.39", features = ["bundled", "serialize"] }
 leyline-core = { path = "../../ll-core/core" }
 bytemuck = { version = "1.14", features = ["derive"] }
+# `tower::ServiceExt::oneshot` for the MCP auth middleware end-to-end
+# tests (daemon::auth::tests). Production uses tower transitively
+# through axum's middleware stack; this dev-dep exposes the trait
+# directly for synchronous service-call testing.
+tower = "0.5"
 
 [[bench]]
 name = "wal_snapshot_experiment"

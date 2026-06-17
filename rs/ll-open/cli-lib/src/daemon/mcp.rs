@@ -27,6 +27,7 @@ use axum::{
     Router,
     extract::State,
     http::StatusCode,
+    middleware,
     response::{IntoResponse, Response},
     routing::post,
 };
@@ -34,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::DaemonContext;
+use super::auth;
 
 // ---------------------------------------------------------------------------
 // Tool registry — static descriptions of every op exposed over MCP.
@@ -545,10 +547,20 @@ pub fn spawn(
     ctx: Arc<DaemonContext>,
     bind: Option<std::net::IpAddr>,
     port: u16,
+    token: Option<Arc<String>>,
 ) -> Result<tokio::task::JoinHandle<()>> {
-    let app = Router::new()
+    let mcp_routes = Router::new()
         .route("/mcp", post(handle_post).get(handle_get))
         .with_state(ctx);
+
+    // ADR-0022: gate /mcp behind the shared-secret token when one was
+    // generated. The token is None only when --mcp-no-auth was passed —
+    // logged earlier in cmd_daemon as a security-relevant opt-out.
+    let app = if let Some(tok) = token {
+        mcp_routes.layer(middleware::from_fn_with_state(tok, auth::require_token))
+    } else {
+        mcp_routes
+    };
 
     let bind = bind.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
     let addr: SocketAddr = SocketAddr::new(bind, port);

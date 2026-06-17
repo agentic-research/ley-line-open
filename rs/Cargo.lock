@@ -1303,7 +1303,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2924,7 +2924,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8cfc352a66ba903c23239ef51e809508b6fc2b0f90e3476ac7a9ff47e863ae95"
 dependencies = [
  "scopeguard",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2992,6 +2992,7 @@ dependencies = [
  "capnp-json",
  "clap",
  "dirs",
+ "hex",
  "leyline-core",
  "leyline-fs",
  "leyline-hdc",
@@ -3004,13 +3005,16 @@ dependencies = [
  "leyline-ts",
  "log",
  "memmap2",
+ "rand 0.9.4",
  "rayon",
  "rusqlite",
  "serde",
  "serde_json",
  "sqlite-vec",
+ "subtle",
  "tempfile",
  "tokio",
+ "tower",
  "tree-sitter",
  "which",
 ]

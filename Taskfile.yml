@@ -135,6 +135,17 @@ tasks:
     cmds:
       - cargo fmt --all
 
+  lint:blake3:
+    desc: |
+      Σ Phase 4 lint gate (ley-line-open-32201a follow-up). Forbids
+      direct `blake3::hash` calls in `rs/ll-open/` outside the explicit
+      allowlist in `tools/blake3-allowlist.txt`. Auto-allows tests/,
+      benches/, in-file `#[cfg(test)]` blocks, and comment-only lines.
+      Closes the Σ retrofit ladder so substrate.rs's documented
+      invariants stay load-bearing.
+    cmds:
+      - tools/lint_blake3.sh
+
   # --------------------------------------------------------------------------
   # FFI / staticlib
   # --------------------------------------------------------------------------
@@ -300,11 +311,12 @@ tasks:
         echo "server.json is up to date"
 
   ci:
-    desc: Full CI pipeline (check + clippy + fmt + FFI staticlib + tier isolation + test + perf gates + compat + server.json drift)
+    desc: Full CI pipeline (check + clippy + fmt + Σ-blake3 lint + FFI staticlib + tier isolation + test + perf gates + compat + server.json drift)
     cmds:
       - task: check
       - task: clippy
       - task: fmt:check
+      - task: lint:blake3
       - task: build:fs-static
       - task: tier:isolation
       - task: test

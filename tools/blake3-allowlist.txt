@@ -1,0 +1,31 @@
+# Σ Phase 4 — direct `blake3::hash` allowlist
+#
+# Bead: ley-line-open-32201a (Phase 3 — Group A migration via BlobStore)
+# Audit: docs/audits/2026-05-blake3-retrofit-audit.md (§2 classification)
+#
+# Every direct `blake3::hash` call site in `rs/ll-open/` MUST appear
+# below OR live under `tests/` / `benches/` paths. Anything else is
+# rejected by `tools/lint_blake3.sh` (wired into `task ci`).
+#
+# Format: file:line<TAB>group<TAB>reason
+#   group  ∈ {B, C, ffi}
+#   B      Čech-cohomology merkle node hash (hdc/src/sheaf.rs) — internal
+#          merkle nodes are not blob storage; BlobStore::put's axioms don't
+#          fit (no "content identity for stored bytes"; just a fold over a
+#          tree of [u8; 32] leaves). Stay inline.
+#   C      HDC seed derivation (hdc/src/util.rs) — truncates BLAKE3 to
+#          u64 for PRNG seeding. Different return type, different purpose;
+#          not a BlobStore candidate.
+#   ffi    cas-ffi cross-check — verifies the FFI staticlib's hash function
+#          matches `blake3::hash` byte-for-byte. Algorithm IS the contract
+#          here; abstracting through ContentAddressed would defeat the test.
+#
+# To add a new entry: append below with a one-line reason. Removing an
+# entry without removing the call is a CI fail (correctly).
+
+rs/ll-open/hdc/src/sheaf.rs:484	B	merkle leaf per-layer roots fold
+rs/ll-open/hdc/src/sheaf.rs:552	B	merkle empty-leaves arm
+rs/ll-open/hdc/src/sheaf.rs:566	B	merkle internal-node hash
+rs/ll-open/hdc/src/util.rs:158	C	HDC seed derivation (truncated to u64)
+rs/ll-open/cas-ffi/src/ffi.rs:104	ffi	substrate cross-check vs FFI hash
+rs/ll-open/cas-ffi/src/lib.rs:44	ffi	cas-ffi cross-check

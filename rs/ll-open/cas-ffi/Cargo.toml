@@ -3,6 +3,7 @@ name = "leyline-cas-ffi"
 version = "0.4.5"
 edition = "2024"
 description = "Wasm32-callable C FFI for ll-core CAS primitives (BLAKE3-of-bytes) — bead ley-line-open-0c8c0b"
+license = "AGPL-3.0-or-later"
 
 [lib]
 # Same crate-type triple as leyline-sign (rs/ll-open/sign/Cargo.toml):

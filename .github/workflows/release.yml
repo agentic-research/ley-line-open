@@ -182,6 +182,13 @@ jobs:
         env:
           BUILD_TARGET: ${{ matrix.target }}
         run: |
+          # macOS: the `fuse` feature pulls in `fuser`, whose build.rs probes
+          # pkg-config for `fuse`/`osxfuse`. fuse-t ships no such .pc, so point
+          # pkg-config at the bundled wrapper (same as the Taskfile does for
+          # task builds). Linux finds fuse.pc via system libfuse3-dev.
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            export PKG_CONFIG_PATH="$PWD/rs/pkgconfig"
+          fi
           cargo build --release --lib -p leyline-fs \
             --manifest-path rs/Cargo.toml --target "$BUILD_TARGET"
 

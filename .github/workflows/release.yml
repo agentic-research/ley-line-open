@@ -70,9 +70,16 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             asset: leyline-linux-amd64
+            # lib_asset present → this job also builds + uploads the
+            # libleyline_fs FFI staticlib that mache's release links.
+            lib_asset: libleyline_fs-linux-amd64.a
+            # Upload the C header from exactly one job (avoids 3-way
+            # --clobber races on the same asset).
+            include_header: true
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             asset: leyline-linux-arm64
+            lib_asset: libleyline_fs-linux-arm64.a
           # darwin-amd64 cross-compiled from macos-latest (arm64) instead
           # of macos-13. The macos-13 hosted runner pool is heavily
           # oversubscribed — both v0.4.0 and v0.4.1 saw this job sit in
@@ -88,6 +95,7 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             asset: leyline-darwin-arm64
+            lib_asset: libleyline_fs-darwin-arm64.a
     steps:
       # SHA-pinned: actions/checkout@v6.0.2 (matches ci.yml).
       # `persist-credentials: false` so the GITHUB_TOKEN written by
@@ -151,3 +159,50 @@ jobs:
           # replaces the prior upload of the same asset rather than
           # erroring on conflict. Idempotent end-to-end.
           gh release upload "$TAG" "$ASSET_NAME" --clobber
+
+      # ---- FFI staticlib (consumed by mache's release build) ----
+      # mache links `libleyline_fs-<os>-<arch>.a` + `leyline_fs.h` to build
+      # its NFS-backed binaries (mache-55d3e1 / ley-line-open-c33b9a). Built
+      # with leyline-fs default features (validate, fuse, nfs) to match what
+      # mache's cgo expects — mirrors private ley-line's `rs:release-lib`
+      # (`cargo build --release --lib -p leyline-fs`). Only the 3 platforms in
+      # mache's release matrix carry `lib_asset`; darwin-amd64 is skipped.
+      - name: Install FUSE deps (staticlib only)
+        if: matrix.lib_asset
+        run: |
+          # capnproto/pkg-config already installed above; add only the fuse
+          # headers the `fuse` feature links against. apt-get update already ran.
+          case "$RUNNER_OS" in
+            Linux) sudo apt-get install -y --no-install-recommends libfuse3-dev ;;
+            macOS) brew install --cask fuse-t ;;
+          esac
+
+      - name: Build leyline-fs staticlib
+        if: matrix.lib_asset
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: |
+          cargo build --release --lib -p leyline-fs \
+            --manifest-path rs/Cargo.toml --target "$BUILD_TARGET"
+
+      - name: Upload staticlib
+        if: matrix.lib_asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          BUILD_TARGET: ${{ matrix.target }}
+          LIB_ASSET: ${{ matrix.lib_asset }}
+        run: |
+          cp "rs/target/$BUILD_TARGET/release/libleyline_fs.a" "$LIB_ASSET"
+          ls -lh "$LIB_ASSET"
+          gh release upload "$TAG" "$LIB_ASSET" --clobber
+
+      - name: Upload FFI header (once)
+        if: matrix.include_header
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release upload "$TAG" rs/ll-open/fs/include/leyline_fs.h --clobber

@@ -4,8 +4,13 @@ version = "0.4.5"
 edition = "2024"
 
 [features]
-default = ["lsp"]
+default = ["lsp", "validate"]
 lsp = ["dep:leyline-lsp"]
+# Tree-sitter syntactic validation surface exposed as a daemon op for
+# mache's writeback path (ley-line-open-fa8638). Pulls leyline-fs's
+# `validate` feature only; does not pull `fuse`/`nfs`. Default-on so
+# the op is always available; turn off for ultra-slim builds.
+validate = ["leyline-fs/validate"]
 mount = ["leyline-fs/nfs", "leyline-fs/fuse", "leyline-fs/validate"]
 vec = ["dep:sqlite-vec"]
 hdc = ["dep:leyline-hdc"]

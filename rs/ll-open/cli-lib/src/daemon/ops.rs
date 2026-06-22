@@ -10,6 +10,8 @@ use leyline_core::Controller;
 use rusqlite::Connection;
 use serde_json::json;
 
+#[cfg(feature = "validate")]
+use super::wire::ValidateRequest;
 use super::wire::{
     BASE_OP_NAMES, BaseRequest, LspFile, LspPosition, Ref as WireRef, TokenMapEntry,
 };
@@ -167,6 +169,8 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
         BaseRequest::SheafLearnedWeights => super::sheaf_ops::op_sheaf_learned_weights(&ctx.sheaf),
         BaseRequest::SheafReap => super::sheaf_ops::op_sheaf_reap(&ctx.sheaf),
         BaseRequest::LeylineVersion => op_leyline_version(),
+        #[cfg(feature = "validate")]
+        BaseRequest::Validate(v) => op_validate(&v),
     };
     result.unwrap_or_else(|e| {
         build_error_response(&format!("{e:#}"))
@@ -1708,6 +1712,52 @@ fn op_leyline_version() -> Result<String> {
 }
 
 // ---------------------------------------------------------------------------
+// validate — tree-sitter syntactic validation (bead ley-line-open-fa8638)
+// ---------------------------------------------------------------------------
+
+/// `{"op":"validate", "content":"...", "language":"go"}` — runs the
+/// `leyline-fs::validate` tree-sitter validator on caller-supplied
+/// content. Returns `{ ok: bool, diagnostics: [{line, col, message}] }`.
+/// Read-only — NOT in `STATE_CHANGING_OPS`.
+///
+/// Either `language` (extension key per `language_for_extension`) or
+/// `path` (extension extracted) must be supplied; if both are present,
+/// `language` wins. `content` is UTF-8 source text on the wire.
+///
+/// Mirrors mache's `writeback/validate.go` so mache can drop the
+/// CGO tree-sitter link (mache-36d961 item A5).
+#[cfg(feature = "validate")]
+fn op_validate(req: &ValidateRequest) -> Result<String> {
+    use leyline_fs::validate::{language_for_extension, language_for_node, validate};
+
+    let lang = match (req.language.as_deref(), req.path.as_deref()) {
+        (Some(l), _) => language_for_extension(l)
+            .ok_or_else(|| anyhow::anyhow!("unknown language id: `{l}`"))?,
+        (None, Some(p)) => language_for_node(p, None).ok_or_else(|| {
+            anyhow::anyhow!("cannot determine language from path `{p}` (no recognized extension)")
+        })?,
+        (None, None) => {
+            return Err(anyhow::anyhow!(
+                "validate requires either `language` or `path`"
+            ));
+        }
+    };
+
+    match validate(req.content.as_bytes(), &lang) {
+        Ok(()) => Ok(json!({"ok": true, "diagnostics": []}).to_string()),
+        Err(err) => Ok(json!({
+            "ok": false,
+            "diagnostics": [{
+                "line": err.line,
+                "col": err.column,
+                "message": err.message,
+            }]
+        })
+        .to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1796,6 +1846,8 @@ mod tests {
             "lsp_refs",
             "lsp_symbols",
             "lsp_diagnostics",
+            #[cfg(feature = "validate")]
+            "validate",
         ] {
             assert!(
                 !is_state_changing(op),
@@ -2999,5 +3051,127 @@ mod tests {
                 "is_known_base_op must reject bogus name `{bogus}`",
             );
         }
+    }
+
+    // ── validate op (bead ley-line-open-fa8638) ────────────────────────
+
+    /// `validate` with valid Go source returns `{ok: true, diagnostics: []}`.
+    /// Pins the success-path response shape mache writeback depends on
+    /// (so mache can drop the CGO tree-sitter link).
+    /// `#[tokio::test]` because `handle_base_op` emits events through
+    /// tokio's broadcast channel — same as the `op_find_token_*` pin.
+    #[cfg(feature = "validate")]
+    #[tokio::test]
+    async fn validate_op_valid_go_returns_ok_true() {
+        let (_dir, ctx) = setup();
+        let response = handle_base_op_legacy(
+            &ctx,
+            "validate",
+            &json!({
+                "content": "package main\n\nfunc main() {\n\tprintln(\"hello\")\n}\n",
+                "language": "go",
+            }),
+        )
+        .expect("validate op should be dispatched");
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            v["ok"],
+            json!(true),
+            "valid Go should return ok=true; got {v}"
+        );
+        assert_eq!(
+            v["diagnostics"],
+            json!([]),
+            "valid Go should return empty diagnostics; got {v}",
+        );
+    }
+
+    /// `validate` with invalid Go source returns `{ok: false, diagnostics: [{line, col, message}]}`.
+    /// Pins the diagnostic shape mache surfaces to writeback callers.
+    #[cfg(feature = "validate")]
+    #[tokio::test]
+    async fn validate_op_invalid_go_returns_diagnostic() {
+        let (_dir, ctx) = setup();
+        let response = handle_base_op_legacy(
+            &ctx,
+            "validate",
+            &json!({
+                "content": "package main\n\nfunc {{{ bad\n",
+                "language": "go",
+            }),
+        )
+        .expect("validate op should be dispatched");
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            v["ok"],
+            json!(false),
+            "invalid Go should return ok=false; got {v}"
+        );
+        let diags = v["diagnostics"]
+            .as_array()
+            .expect("diagnostics must be an array");
+        assert_eq!(
+            diags.len(),
+            1,
+            "exactly one diagnostic on first error; got {diags:?}"
+        );
+        let d = &diags[0];
+        assert!(
+            d["line"].as_u64().is_some(),
+            "diagnostic must carry `line`; got {d}",
+        );
+        assert!(
+            d["col"].as_u64().is_some(),
+            "diagnostic must carry `col`; got {d}",
+        );
+        assert_eq!(
+            d["message"],
+            json!("syntax error"),
+            "diagnostic message must be `syntax error`; got {d}",
+        );
+    }
+
+    /// `validate` accepts `path` as an alternative to `language`, deriving
+    /// the language from the file extension. Mache writeback knows the
+    /// path of the file being edited, so this is the cleaner caller shape.
+    #[cfg(feature = "validate")]
+    #[tokio::test]
+    async fn validate_op_path_resolves_language() {
+        let (_dir, ctx) = setup();
+        let response = handle_base_op_legacy(
+            &ctx,
+            "validate",
+            &json!({
+                "content": "fn main() {\n    println!(\"hello\");\n}\n",
+                "path": "src/main.rs",
+            }),
+        )
+        .expect("validate op should be dispatched");
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            v["ok"],
+            json!(true),
+            "valid Rust via path should return ok=true; got {v}"
+        );
+    }
+
+    /// `validate` requires either `language` or `path`; missing both is
+    /// a structured error, not a panic or wire-shape regression.
+    #[cfg(feature = "validate")]
+    #[tokio::test]
+    async fn validate_op_missing_language_and_path_errors() {
+        let (_dir, ctx) = setup();
+        let response =
+            handle_base_op_legacy(&ctx, "validate", &json!({"content": "package main\n"}))
+                .expect("validate op should be dispatched (error path is still a response)");
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        // Error responses go through build_error_response → ErrorResponse
+        // envelope; the exact shape is `{ok: false, error: "..."}` per the
+        // daemon's error contract.
+        assert_eq!(
+            v["ok"],
+            json!(false),
+            "missing language+path should error; got {v}"
+        );
     }
 }

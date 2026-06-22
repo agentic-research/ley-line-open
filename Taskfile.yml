@@ -311,7 +311,7 @@ tasks:
         echo "server.json is up to date"
 
   ci:
-    desc: Full CI pipeline (check + clippy + fmt + Σ-blake3 lint + FFI staticlib + tier isolation + test + perf gates + compat + server.json drift)
+    desc: Common CI gate — runs on every PR. Excludes `test:perf` (release-profile rebuild adds ~90-120s; main-push-only via ci.yml's conditional `test:perf` step). For the full main-push gate locally, run `task ci:full`.
     cmds:
       - task: check
       - task: clippy
@@ -320,6 +320,11 @@ tasks:
       - task: build:fs-static
       - task: tier:isolation
       - task: test
-      - task: test:perf
       - task: compat:check
       - task: gen:server-json:check
+
+  ci:full:
+    desc: Full CI pipeline including the release-profile perf regression gate. Runs on main pushes via ci.yml's conditional step; available locally via `task ci:full` for pre-push validation.
+    cmds:
+      - task: ci
+      - task: test:perf

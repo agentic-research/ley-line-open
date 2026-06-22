@@ -91,6 +91,14 @@ pub fn parse_elixir(content: &[u8]) -> Result<Vec<u8>> {
     parse(content, TsLanguage::Elixir)
 }
 
+/// Convenience: parse HCL/Terraform content → serialized SQLite bytes.
+/// Same grammar for `.hcl` / `.tf` / `.tfvars` — `tree-sitter-hcl` handles
+/// all three. Pairs with `mache-d5e158` (consumer-side HCL ASTWalker parity).
+#[cfg(feature = "hcl")]
+pub fn parse_hcl(content: &[u8]) -> Result<Vec<u8>> {
+    parse(content, TsLanguage::Hcl)
+}
+
 /// Lower-level: write AST nodes into an existing rusqlite Connection.
 pub fn project_into(content: &[u8], language: TsLanguage, conn: &Connection) -> Result<()> {
     project_ast(content, language.ts_language(), conn)
@@ -349,5 +357,98 @@ end
             .query_row("SELECT COUNT(*) FROM _ast", [], |r| r.get(0))
             .unwrap();
         assert!(ast_count > 0, "python _ast should have rows");
+    }
+
+    /// HCL/Terraform round-trip via the convenience `parse_hcl` (bead
+    /// `ley-line-open-fa9ec3`). Pins:
+    ///   1. `parse_hcl` is reachable and returns non-empty serialized bytes
+    ///   2. `_ast` rows are emitted for a representative `.tf` source
+    ///   3. HCL-grammar productions (`block`, `attribute`) appear in node_kind
+    /// Together these prove mache-d5e158 can consume LLO's HCL `_ast` rows
+    /// the same way it consumes Go rows today.
+    #[cfg(feature = "hcl")]
+    #[test]
+    fn hcl_terraform_round_trip_emits_ast() {
+        let src = br#"resource "aws_instance" "web" {
+  ami           = "ami-12345"
+  instance_type = "t3.micro"
+}
+
+variable "region" {
+  default = "us-east-1"
+}
+"#;
+        let bytes = parse_hcl(src).unwrap();
+        assert!(
+            !bytes.is_empty(),
+            "parse_hcl should produce serialized bytes"
+        );
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        let cursor = Cursor::new(&bytes);
+        conn.deserialize_read_exact("main", cursor, bytes.len(), true)
+            .unwrap();
+
+        let ast_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _ast", [], |r| r.get(0))
+            .unwrap();
+        assert!(ast_count > 0, "hcl _ast should have rows");
+
+        // HCL grammar emits `block` for `resource "..." "..." { ... }`
+        // and `attribute` for the `key = value` rows. Pin both so a
+        // future grammar bump that renames them surfaces here, not in
+        // the consumer (mache).
+        let block_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _ast WHERE node_kind = 'block'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            block_count >= 2,
+            "expected ≥2 HCL blocks (resource + variable); got {block_count}"
+        );
+
+        let attr_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _ast WHERE node_kind = 'attribute'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            attr_count >= 3,
+            "expected ≥3 HCL attributes (ami, instance_type, default); got {attr_count}"
+        );
+    }
+
+    /// HCL `.tfvars` (variable-assignment-only) round-trip via the
+    /// generic `parse` entry point. Pins that the same grammar handles
+    /// the three file shapes mache encounters in real Terraform repos.
+    #[cfg(feature = "hcl")]
+    #[test]
+    fn hcl_tfvars_round_trip_emits_ast() {
+        let src = b"region = \"us-west-2\"\ninstances = 3\n";
+        let bytes = parse_with_source(src, TsLanguage::Hcl, "terraform.tfvars").unwrap();
+        assert!(!bytes.is_empty());
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        let cursor = Cursor::new(&bytes);
+        conn.deserialize_read_exact("main", cursor, bytes.len(), true)
+            .unwrap();
+
+        let (src_id, lang): (String, String) = conn
+            .query_row("SELECT id, language FROM _source LIMIT 1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(src_id, "terraform.tfvars");
+        assert_eq!(lang, "hcl");
+
+        let ast_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _ast", [], |r| r.get(0))
+            .unwrap();
+        assert!(ast_count > 0, ".tfvars _ast should have rows");
     }
 }

@@ -206,6 +206,20 @@ pub fn tool_registry() -> Vec<McpTool> {
             description: "Diagnostics for a file (enriched on demand if missing).",
             schema: file_schema(),
         },
+        #[cfg(feature = "validate")]
+        McpTool {
+            name: "validate",
+            description: "Tree-sitter syntactic validation of source content. Takes `content` (UTF-8 source) plus either `language` (extension key: go|py|js|ts|tsx|rs|ex|exs) or `path` (extension extracted). Returns `{ok, diagnostics: [{line, col, message}]}`. Read-only; the daemon does not touch the projected db. Mirrors mache's `writeback/validate.go` so consumers can drop the CGO tree-sitter link.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "content":  {"type": "string", "description": "UTF-8 source text to validate."},
+                    "language": {"type": "string", "description": "Extension key (go|py|js|ts|tsx|rs|ex|exs). Mutually exclusive with `path`; takes precedence if both supplied."},
+                    "path":     {"type": "string", "description": "Path whose file extension determines the language. Used when the caller has a path but not an explicit language id."}
+                },
+                "required": ["content"]
+            }),
+        },
         McpTool {
             name: "sheaf_set_topology",
             description: "Set the sheaf cache's community structure: regions (content-hash stalks, optionally with f32 stalk vectors for δ⁰ mode) and restriction edges (boundary hash + co-change rate + per-dim weights, optionally with agreement_dim for δ⁰ mode). Pass `node_stalk_dim > 0` AND f32 `data` on every region AND `agreement_dim > 0` on every restriction to engage δ⁰-driven invalidation.",
@@ -442,6 +456,15 @@ pub fn cloister_groups() -> Vec<CloisterGroupDecl> {
         name: "text-search",
         advertised_prefix: "",
         upstream_names: vec!["text_search"],
+    });
+
+    // Validate — tree-sitter syntactic check exposed for mache's
+    // CGO-removal path. Single-tool group, bare-name advertisement.
+    #[cfg(feature = "validate")]
+    groups.push(CloisterGroupDecl {
+        name: "validate",
+        advertised_prefix: "",
+        upstream_names: vec!["validate"],
     });
 
     groups

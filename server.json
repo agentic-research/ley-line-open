@@ -77,6 +77,13 @@
           "upstreamNames": [
             "leyline_version"
           ]
+        },
+        {
+          "name": "validate",
+          "advertisedPrefix": "",
+          "upstreamNames": [
+            "validate"
+          ]
         }
       ]
     }

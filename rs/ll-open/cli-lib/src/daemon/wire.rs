@@ -101,6 +101,8 @@ pub const BASE_OP_NAMES: &[&str] = &[
     "vec_search",
     #[cfg(feature = "text-search")]
     "text_search",
+    #[cfg(feature = "validate")]
+    "validate",
 ];
 
 // ---------------------------------------------------------------------------
@@ -212,6 +214,11 @@ pub enum BaseRequest {
     /// Wire-compat handshake. Takes no args; returns the daemon's
     /// version + wire-format identity (bead ley-line-open-cb8960).
     LeylineVersion,
+    /// Tree-sitter syntactic validation (ley-line-open-fa8638).
+    /// Mirrors mache's `writeback/validate.go` over the UDS so mache can
+    /// drop its CGO tree-sitter link. Read-only (NOT in STATE_CHANGING_OPS).
+    #[cfg(feature = "validate")]
+    Validate(ValidateRequest),
 }
 
 #[cfg(feature = "vec")]
@@ -245,6 +252,30 @@ pub struct LspPosition {
 #[derive(Deserialize, Debug)]
 pub struct LspFile {
     pub file: String,
+}
+
+// ---------------------------------------------------------------------------
+// Validate request. Either `language` (one of the extension keys
+// validate.rs recognizes: "go" | "py" | "js" | "ts" | "tsx" | "rs" |
+// "ex" | "exs") or `path` (the daemon extracts the extension) is
+// required. `content` is UTF-8 source text; callers passing binary
+// content should base64-encode then base64-decode upstream — the wire
+// uses JSON strings, not raw bytes.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "validate")]
+#[derive(Deserialize, Debug)]
+pub struct ValidateRequest {
+    /// UTF-8 source text to validate.
+    pub content: String,
+    /// Language extension key (e.g. "go", "py"). Mutually exclusive with `path`
+    /// in practice; if both are supplied, `language` wins.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Path the daemon infers the language from via the file extension.
+    /// Used when the caller has a path but not an explicit language id.
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

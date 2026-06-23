@@ -1988,12 +1988,27 @@ fn op_inspect_symbol(
             .unwrap_or(0);
 
         // Build the response. The `include` filter, if non-empty,
-        // omits expensive sub-fields. `symbol_id`, `ok`, and `kind`
-        // are always included.
+        // omits expensive sub-fields. `symbol_id`, `ok`, `kind`,
+        // `provenance`, and `certainty` are always included
+        // (provenance + certainty per bead ley-line-open-c3555f / L7).
         let mut response = serde_json::Map::new();
         response.insert("ok".to_string(), json!(true));
         response.insert("symbol_id".to_string(), json!(req.symbol_id));
         response.insert("kind".to_string(), json!(kind));
+
+        // Top-level provenance: "composed" because the bundle merges
+        // tree-sitter rows (definitions/references) with optional LSP
+        // hover. Top-level certainty: "full" if hover_typed is
+        // available, "partial" when missing — caller can tell at a
+        // glance whether the LSP enrichment pass has reached this
+        // symbol.
+        let top_certainty = if hover_typed.is_some() {
+            "full"
+        } else {
+            "partial"
+        };
+        response.insert("provenance".to_string(), json!("composed"));
+        response.insert("certainty".to_string(), json!(top_certainty));
 
         if include_filter.has("definitions") {
             let defs_json: Vec<serde_json::Value> = defs
@@ -2009,6 +2024,11 @@ fn op_inspect_symbol(
                         "end_col":    d.end_col,
                         "start_byte": d.start_byte,
                         "end_byte":   d.end_byte,
+                        // L7: definitions are structural truth from
+                        // tree-sitter (node_defs ⋈ _ast). Always full
+                        // — if a def exists the location is canonical.
+                        "provenance": "tree-sitter",
+                        "certainty":  "full",
                     })
                 })
                 .collect();
@@ -2016,16 +2036,33 @@ fn op_inspect_symbol(
         }
 
         if include_filter.has("hover_typed") {
-            response.insert(
-                "hover_typed".to_string(),
-                hover_typed.unwrap_or(serde_json::Value::Null),
-            );
+            // L7: when hover is populated, the row came from the
+            // _lsp table (LSP enrichment pass writes it). Inject
+            // provenance + certainty INTO the hover object so
+            // downstream consumers see a uniform per-result shape.
+            let hover_with_provenance = match hover_typed {
+                Some(serde_json::Value::Object(mut m)) => {
+                    m.insert("provenance".to_string(), json!("lsp"));
+                    m.insert("certainty".to_string(), json!("full"));
+                    serde_json::Value::Object(m)
+                }
+                other => other.unwrap_or(serde_json::Value::Null),
+            };
+            response.insert("hover_typed".to_string(), hover_with_provenance);
         }
 
         if include_filter.has("references") {
             let refs_json: Vec<serde_json::Value> = references
                 .iter()
-                .map(|r| json!({"node_id": r.node_id, "source_id": r.source_id}))
+                .map(|r| {
+                    json!({
+                        "node_id":    r.node_id,
+                        "source_id":  r.source_id,
+                        // L7: references are tree-sitter structural facts.
+                        "provenance": "tree-sitter",
+                        "certainty":  "full",
+                    })
+                })
                 .collect();
             response.insert("references".to_string(), json!(refs_json));
         }
@@ -2038,7 +2075,12 @@ fn op_inspect_symbol(
             let mut callers_json: Vec<serde_json::Value> = Vec::new();
             for r in &references {
                 if seen.insert(r.node_id.clone()) {
-                    callers_json.push(json!({"node_id": r.node_id, "source_id": r.source_id}));
+                    callers_json.push(json!({
+                        "node_id":    r.node_id,
+                        "source_id":  r.source_id,
+                        "provenance": "tree-sitter",
+                        "certainty":  "full",
+                    }));
                 }
             }
             response.insert("callers".to_string(), json!(callers_json));
@@ -2047,7 +2089,14 @@ fn op_inspect_symbol(
         if include_filter.has("callees") {
             let callees_json: Vec<serde_json::Value> = callees
                 .iter()
-                .map(|r| json!({"node_id": r.node_id, "source_id": r.source_id}))
+                .map(|r| {
+                    json!({
+                        "node_id":    r.node_id,
+                        "source_id":  r.source_id,
+                        "provenance": "tree-sitter",
+                        "certainty":  "full",
+                    })
+                })
                 .collect();
             response.insert("callees".to_string(), json!(callees_json));
         }
@@ -4061,6 +4110,65 @@ mod tests {
             json!("Helper"),
             "smallest-enclosing should pick Helper; got {v}",
         );
+    }
+
+    /// L7 schema gate: provenance + certainty must appear at the top
+    /// level AND in every sub-array row, on every inspect_symbol
+    /// response path. Test seeds a populated fixture so every sub-
+    /// array has at least one row; the assertion walks the response
+    /// and confirms the field set is uniform.
+    ///
+    /// Bead ley-line-open-c3555f. Catches the regression where a new
+    /// sub-field is added without provenance/certainty — exactly the
+    /// silent-degradation case L7 exists to prevent.
+    #[tokio::test]
+    async fn inspect_symbol_carries_provenance_and_certainty_everywhere() {
+        let (_dir, ctx) = setup();
+        {
+            let live = ctx.live_db.lock().unwrap();
+            // Definition + reference + callee chain so every sub-
+            // array gets at least one row.
+            live.execute_batch(
+                "INSERT INTO node_defs (token, node_id, source_id) VALUES \
+                   ('Foo', 'pkg/Foo', 'pkg.go'),
+                   ('Bar', 'pkg/Bar', 'bar.go');
+                 INSERT INTO _ast (node_id, source_id, node_kind, \
+                                   start_byte, end_byte, start_row, start_col, \
+                                   end_row, end_col) VALUES \
+                   ('pkg/Foo', 'pkg.go', 'function_declaration', \
+                    0, 100, 1, 0, 10, 1);
+                 INSERT INTO node_refs (token, node_id, source_id) VALUES \
+                   ('Foo', 'caller/site', 'caller.go'),
+                   ('Bar', 'pkg/Foo', 'pkg.go');",
+            )
+            .expect("seed test data");
+        }
+
+        let response =
+            handle_base_op_legacy(&ctx, "inspect_symbol", &json!({"symbol_id": "Foo"})).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        // Top-level fields.
+        assert!(v["provenance"].is_string(), "top-level provenance; got {v}");
+        assert!(v["certainty"].is_string(), "top-level certainty; got {v}");
+
+        // Every sub-array row must carry both fields.
+        for field in ["definitions", "references", "callers", "callees"] {
+            let arr = v[field]
+                .as_array()
+                .unwrap_or_else(|| panic!("{field} array"));
+            assert!(!arr.is_empty(), "{field} should have rows for this fixture");
+            for (i, row) in arr.iter().enumerate() {
+                assert!(
+                    row["provenance"].is_string(),
+                    "{field}[{i}] missing provenance: {row}",
+                );
+                assert!(
+                    row["certainty"].is_string(),
+                    "{field}[{i}] missing certainty: {row}",
+                );
+            }
+        }
     }
 
     /// at_position → inspect_symbol composition: the symbol_id

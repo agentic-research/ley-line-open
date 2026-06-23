@@ -3180,6 +3180,7 @@ dependencies = [
  "tree-sitter-json",
  "tree-sitter-md",
  "tree-sitter-python",
+ "tree-sitter-rust",
  "tree-sitter-yaml",
  "uv-normalize",
  "uv-pep440",

@@ -15,6 +15,8 @@ use super::wire::ValidateRequest;
 use super::wire::{
     BASE_OP_NAMES, BaseRequest, LspFile, LspPosition, Ref as WireRef, TokenMapEntry,
 };
+#[cfg(feature = "hdc")]
+use super::wire::{HdcCalibrateRequest, HdcDensityRequest, HdcSearchRequest};
 use super::{DaemonContext, DaemonPhase};
 
 // ---------------------------------------------------------------------------
@@ -171,6 +173,12 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
         BaseRequest::LeylineVersion => op_leyline_version(),
         #[cfg(feature = "validate")]
         BaseRequest::Validate(v) => op_validate(&v),
+        #[cfg(feature = "hdc")]
+        BaseRequest::HdcSearch(r) => op_hdc_search(ctx, &r),
+        #[cfg(feature = "hdc")]
+        BaseRequest::HdcCalibrate(r) => op_hdc_calibrate(ctx, &r),
+        #[cfg(feature = "hdc")]
+        BaseRequest::HdcDensity(r) => op_hdc_density(ctx, &r),
     };
     result.unwrap_or_else(|e| {
         build_error_response(&format!("{e:#}"))
@@ -1758,6 +1766,131 @@ fn op_validate(req: &ValidateRequest) -> Result<String> {
 }
 
 // ---------------------------------------------------------------------------
+// HDC daemon ops (bead ley-line-open-c32596) — wires the leyline-hdc
+// query surface for structural-similarity search. The substrate (the
+// `_hdc` table population pass) is a separate enrichment-pass concern;
+// these ops query the table. All read-only.
+// ---------------------------------------------------------------------------
+
+/// Shared bootstrap for every HDC op: ensure schema + UDFs are
+/// registered on the connection. Both leyline-hdc primitives are
+/// documented as idempotent — `create_hdc_schema` uses `CREATE TABLE
+/// IF NOT EXISTS`; `register_hdc_udfs` re-registration replaces. Cheap
+/// to call on every request.
+#[cfg(feature = "hdc")]
+fn ensure_hdc_ready(conn: &rusqlite::Connection) -> Result<()> {
+    leyline_hdc::schema::create_hdc_schema(conn)
+        .context("create HDC schema (_hdc, _hdc_combined, _hdc_baseline, _hdc_subtree_cache)")?;
+    leyline_hdc::sql_udf::register_hdc_udfs(conn)
+        .context("register HDC SQL UDFs (popcount_xor, BUNDLE, BUNDLE_MAJORITY)")?;
+    Ok(())
+}
+
+/// Encode caller-supplied content into a hypervector via the tree-
+/// sitter + canonical-kind-map bridge. Supported language ids are the
+/// intersection of leyline-hdc's `CanonicalKindMap` impls and leyline-
+/// ts's `TsLanguage` variants — today `go`, `rust`, `json`, `yaml`.
+#[cfg(feature = "hdc")]
+fn encode_query_hv(content: &str, language: &str) -> Result<leyline_hdc::Hypervector> {
+    use leyline_hdc::canonical::CanonicalKindMap;
+    use leyline_hdc::codebook::AstCodebook;
+    use leyline_hdc::encode_fresh;
+
+    let ts_lang = leyline_ts::languages::TsLanguage::from_name(language)
+        .with_context(|| format!("HDC: unknown language `{language}`"))?;
+
+    let kind_map: Box<dyn CanonicalKindMap> = match language.to_lowercase().as_str() {
+        "go" | "golang" => Box::new(leyline_hdc::canonical::GoCanonicalMap),
+        "rust" | "rs" => Box::new(leyline_hdc::canonical::RustCanonicalMap),
+        "json" => Box::new(leyline_hdc::canonical::JsonCanonicalMap),
+        "yaml" | "yml" => Box::new(leyline_hdc::canonical::YamlCanonicalMap),
+        other => {
+            return Err(anyhow::anyhow!(
+                "HDC: no CanonicalKindMap for `{other}`; supported: go, rust, json, yaml"
+            ));
+        }
+    };
+
+    let encoder_node =
+        super::hdc_pass::parse_and_encode_tree(content, &ts_lang.ts_language(), &*kind_map)
+            .ok_or_else(|| {
+                anyhow::anyhow!("HDC: tree-sitter parse returned no tree for the given content")
+            })?;
+
+    let codebook = AstCodebook;
+    Ok(encode_fresh(&encoder_node, &codebook))
+}
+
+/// `{"op":"hdc_search", "content":"...", "language":"go", "max_distance":100, "k":10}` —
+/// parses + encodes the query content, then runs `radius_search` on the
+/// AST layer of `_hdc`. Returns `{ok, results: [{scope_id, distance}]}`.
+/// Read-only. If `_hdc` hasn't been populated yet, returns empty results.
+#[cfg(feature = "hdc")]
+fn op_hdc_search(ctx: &std::sync::Arc<DaemonContext>, req: &HdcSearchRequest) -> Result<String> {
+    let hv = encode_query_hv(&req.content, &req.language)?;
+    let max_distance = req.max_distance;
+    let k = req.k as usize;
+    with_live_db(ctx, |conn| {
+        ensure_hdc_ready(conn)?;
+        let matches = leyline_hdc::query::radius_search(
+            conn,
+            leyline_hdc::LayerKind::Ast,
+            &hv,
+            max_distance,
+            k,
+        )
+        .context("HDC radius_search")?;
+        let rows: Vec<serde_json::Value> = matches
+            .into_iter()
+            .map(|m| json!({"scope_id": m.scope_id, "distance": m.distance}))
+            .collect();
+        Ok(json!({"ok": true, "results": rows}).to_string())
+    })
+}
+
+/// `{"op":"hdc_calibrate", "sample_size":1000}` — recomputes median +
+/// MAD over `_hdc` row distances per layer; writes to `_hdc_baseline`.
+/// Returns `{ok, layers_calibrated: N}`. Read-only with respect to the
+/// projected db — only touches HDC sidecar tables, so NOT in
+/// `STATE_CHANGING_OPS`.
+#[cfg(feature = "hdc")]
+fn op_hdc_calibrate(
+    ctx: &std::sync::Arc<DaemonContext>,
+    req: &HdcCalibrateRequest,
+) -> Result<String> {
+    let sample_size = req.sample_size;
+    with_live_db(ctx, |conn| {
+        ensure_hdc_ready(conn)?;
+        // `now_ms` is computed inside the closure rather than at request
+        // entry to match the time the rows are actually written; for
+        // tests this is a wall-clock value, not a deterministic constant.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let count = leyline_hdc::calibrate::calibrate_and_persist(conn, sample_size, now_ms)
+            .context("HDC calibrate_and_persist")?;
+        Ok(json!({"ok": true, "layers_calibrated": count}).to_string())
+    })
+}
+
+/// `{"op":"hdc_density", "content":"...", "language":"go", "max_distance":100}` —
+/// counts scopes within `max_distance` of the encoded query HV on the
+/// AST layer. Returns `{ok, count: N}`. Read-only.
+#[cfg(feature = "hdc")]
+fn op_hdc_density(ctx: &std::sync::Arc<DaemonContext>, req: &HdcDensityRequest) -> Result<String> {
+    let hv = encode_query_hv(&req.content, &req.language)?;
+    let max_distance = req.max_distance;
+    with_live_db(ctx, |conn| {
+        ensure_hdc_ready(conn)?;
+        let count =
+            leyline_hdc::query::density_count(conn, leyline_hdc::LayerKind::Ast, &hv, max_distance)
+                .context("HDC density_count")?;
+        Ok(json!({"ok": true, "count": count}).to_string())
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1848,6 +1981,12 @@ mod tests {
             "lsp_diagnostics",
             #[cfg(feature = "validate")]
             "validate",
+            #[cfg(feature = "hdc")]
+            "hdc_search",
+            #[cfg(feature = "hdc")]
+            "hdc_calibrate",
+            #[cfg(feature = "hdc")]
+            "hdc_density",
         ] {
             assert!(
                 !is_state_changing(op),
@@ -3172,6 +3311,162 @@ mod tests {
             v["ok"],
             json!(false),
             "missing language+path should error; got {v}"
+        );
+    }
+
+    // ── hdc ops (bead ley-line-open-c32596) ────────────────────────────
+
+    /// `hdc_search` returns empty results when `_hdc` is empty (the
+    /// substrate hasn't been populated yet). Pins the empty-table
+    /// contract — consumers should see `{ok: true, results: []}`, NOT
+    /// an error. `ensure_hdc_ready` creates the table lazily on first
+    /// call; before that, the query just returns zero rows.
+    #[cfg(feature = "hdc")]
+    #[tokio::test]
+    async fn hdc_search_empty_table_returns_ok_empty() {
+        let (_dir, ctx) = setup();
+        let response = handle_base_op_legacy(
+            &ctx,
+            "hdc_search",
+            &json!({
+                "content": "package main\n\nfunc main() {\n\tprintln(\"hello\")\n}\n",
+                "language": "go",
+                "max_distance": 100,
+                "k": 10,
+            }),
+        )
+        .expect("hdc_search op should be dispatched");
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["ok"], json!(true), "empty table → ok:true; got {v}");
+        assert_eq!(v["results"], json!([]), "no rows → empty results; got {v}");
+    }
+
+    /// `hdc_density` returns count=0 on empty `_hdc`. Same contract as
+    /// hdc_search — empty table is not an error.
+    #[cfg(feature = "hdc")]
+    #[tokio::test]
+    async fn hdc_density_empty_table_returns_zero() {
+        let (_dir, ctx) = setup();
+        let response = handle_base_op_legacy(
+            &ctx,
+            "hdc_density",
+            &json!({
+                "content": "fn main() { println!(\"hello\"); }",
+                "language": "rust",
+            }),
+        )
+        .expect("hdc_density op should be dispatched");
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["ok"], json!(true), "ok:true on empty table; got {v}");
+        assert_eq!(v["count"], json!(0), "count=0 on empty table; got {v}");
+    }
+
+    /// `hdc_calibrate` returns layers_calibrated=0 on empty `_hdc` —
+    /// every layer has <2 rows, so `calibrate_layer` returns None and
+    /// nothing is persisted.
+    #[cfg(feature = "hdc")]
+    #[tokio::test]
+    async fn hdc_calibrate_empty_table_calibrates_zero_layers() {
+        let (_dir, ctx) = setup();
+        let response = handle_base_op_legacy(&ctx, "hdc_calibrate", &json!({}))
+            .expect("hdc_calibrate op should be dispatched");
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["ok"], json!(true), "ok:true; got {v}");
+        assert_eq!(
+            v["layers_calibrated"],
+            json!(0),
+            "no rows → zero layers; got {v}"
+        );
+    }
+
+    /// `hdc_search` errors cleanly on unsupported language ids. Pins
+    /// the error contract — `python` is parseable by leyline-ts but
+    /// HDC has no `CanonicalKindMap` for it, so the op returns an
+    /// error envelope rather than silently degrading.
+    #[cfg(feature = "hdc")]
+    #[tokio::test]
+    async fn hdc_search_unsupported_language_errors() {
+        let (_dir, ctx) = setup();
+        let response = handle_base_op_legacy(
+            &ctx,
+            "hdc_search",
+            &json!({
+                "content": "print('hello')\n",
+                "language": "python",
+            }),
+        )
+        .expect("hdc_search op should be dispatched (error path is still a response)");
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            v["ok"],
+            json!(false),
+            "unsupported lang must error; got {v}",
+        );
+    }
+
+    /// End-to-end: pre-populate `_hdc` with two rows (one matches the
+    /// query content, one doesn't), then assert `hdc_search` returns
+    /// the matching row with distance 0 (or near it). Exercises the
+    /// full pipeline: encode → SQL UDF → row map. This is the strongest
+    /// test — without it, the previous three pass trivially on an empty
+    /// table.
+    #[cfg(feature = "hdc")]
+    #[tokio::test]
+    async fn hdc_search_finds_pre_populated_match() {
+        let (_dir, ctx) = setup();
+
+        // First, fire any op so ensure_hdc_ready creates the schema.
+        // (hdc_search on empty also creates it.)
+        let _ = handle_base_op_legacy(
+            &ctx,
+            "hdc_density",
+            &json!({"content": "fn main() {}", "language": "rust"}),
+        )
+        .unwrap();
+
+        // Now encode a known Rust function and INSERT into _hdc by
+        // hand. The scope_id is opaque; what matters is that the same
+        // content encodes to the same HV bytes, so searching for the
+        // same content finds the row with distance 0.
+        let go_src = "package main\n\nfunc main() {\n\tprintln(\"x\")\n}\n";
+        let hv = encode_query_hv(go_src, "go").expect("encode_query_hv");
+        let hv_bytes = hv.to_vec();
+
+        {
+            let live = ctx.live_db.lock().unwrap();
+            live.execute(
+                "INSERT INTO _hdc (scope_id, layer_kind, hv, basis) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params!["test:main", "ast", hv_bytes, 0i64],
+            )
+            .expect("INSERT into _hdc");
+        }
+
+        let response = handle_base_op_legacy(
+            &ctx,
+            "hdc_search",
+            &json!({
+                "content": go_src,
+                "language": "go",
+                "max_distance": 100,
+                "k": 5,
+            }),
+        )
+        .expect("hdc_search op should be dispatched");
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["ok"], json!(true), "ok:true; got {v}");
+        let results = v["results"].as_array().expect("results array");
+        assert_eq!(results.len(), 1, "expected one match; got {results:?}");
+        assert_eq!(
+            results[0]["scope_id"],
+            json!("test:main"),
+            "matched row has scope_id 'test:main'; got {:?}",
+            results[0],
+        );
+        assert_eq!(
+            results[0]["distance"],
+            json!(0),
+            "exact-content match has distance 0; got {:?}",
+            results[0],
         );
     }
 }

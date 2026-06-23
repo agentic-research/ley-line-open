@@ -220,6 +220,46 @@ pub fn tool_registry() -> Vec<McpTool> {
                 "required": ["content"]
             }),
         },
+        #[cfg(feature = "hdc")]
+        McpTool {
+            name: "hdc_search",
+            description: "HDC structural-similarity search. Parses + encodes `content` into a hypervector, then runs radius_search on the AST layer of _hdc. Returns `{ok, results: [{scope_id, distance}]}`. Supported languages: go|rust|json|yaml. Read-only; empty results when _hdc isn't populated yet.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "content":      {"type": "string", "description": "UTF-8 source content to encode and search."},
+                    "language":     {"type": "string", "description": "Language id (go|rust|json|yaml). Other languages return a structured error."},
+                    "max_distance": {"type": "integer", "description": "Hamming-distance ceiling (D_BITS=8192). Default 100."},
+                    "k":            {"type": "integer", "description": "Max result count. Default 10."}
+                },
+                "required": ["content", "language"]
+            }),
+        },
+        #[cfg(feature = "hdc")]
+        McpTool {
+            name: "hdc_calibrate",
+            description: "Recompute per-layer baseline (median + MAD) over _hdc rows; persist to _hdc_baseline. Returns `{ok, layers_calibrated: N}`. Layers with <2 rows are skipped. Read-only with respect to the projected db (only touches HDC sidecar tables).",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "sample_size": {"type": "integer", "description": "Sample size per layer. Default 1000."}
+                }
+            }),
+        },
+        #[cfg(feature = "hdc")]
+        McpTool {
+            name: "hdc_density",
+            description: "HDC cluster-density count. Parses + encodes `content`, then counts scopes within `max_distance` of the query HV on the AST layer. Returns `{ok, count: N}`. Same language coverage as hdc_search. Read-only.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "content":      {"type": "string"},
+                    "language":     {"type": "string", "description": "Language id (go|rust|json|yaml)."},
+                    "max_distance": {"type": "integer", "description": "Hamming-distance ceiling. Default 100."}
+                },
+                "required": ["content", "language"]
+            }),
+        },
         McpTool {
             name: "sheaf_set_topology",
             description: "Set the sheaf cache's community structure: regions (content-hash stalks, optionally with f32 stalk vectors for δ⁰ mode) and restriction edges (boundary hash + co-change rate + per-dim weights, optionally with agreement_dim for δ⁰ mode). Pass `node_stalk_dim > 0` AND f32 `data` on every region AND `agreement_dim > 0` on every restriction to engage δ⁰-driven invalidation.",
@@ -465,6 +505,15 @@ pub fn cloister_groups() -> Vec<CloisterGroupDecl> {
         name: "validate",
         advertised_prefix: "",
         upstream_names: vec!["validate"],
+    });
+
+    // HDC — structural-similarity / cluster-density / baseline-calibrate
+    // ops, all `hdc_` prefixed. Single group, advertise the prefix.
+    #[cfg(feature = "hdc")]
+    groups.push(CloisterGroupDecl {
+        name: "hdc",
+        advertised_prefix: "hdc_",
+        upstream_names: vec!["hdc_search", "hdc_calibrate", "hdc_density"],
     });
 
     groups

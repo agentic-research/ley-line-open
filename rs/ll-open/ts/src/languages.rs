@@ -25,6 +25,8 @@ pub enum TsLanguage {
     /// the `tree-sitter-hcl` crate handles both.
     #[cfg(feature = "hcl")]
     Hcl,
+    #[cfg(feature = "rust")]
+    Rust,
 }
 
 impl TsLanguage {
@@ -47,6 +49,8 @@ impl TsLanguage {
             TsLanguage::Elixir => tree_sitter_elixir::LANGUAGE.into(),
             #[cfg(feature = "hcl")]
             TsLanguage::Hcl => tree_sitter_hcl::LANGUAGE.into(),
+            #[cfg(feature = "rust")]
+            TsLanguage::Rust => tree_sitter_rust::LANGUAGE.into(),
         }
     }
 
@@ -74,6 +78,8 @@ impl TsLanguage {
             // one as canonical. Terraform spellings are aliased in
             // `from_name` + `from_extension` below.
             TsLanguage::Hcl => "hcl",
+            #[cfg(feature = "rust")]
+            TsLanguage::Rust => "rust",
         }
     }
 
@@ -96,6 +102,8 @@ impl TsLanguage {
             "elixir" | "ex" | "exs" => Ok(TsLanguage::Elixir),
             #[cfg(feature = "hcl")]
             "hcl" | "terraform" | "tf" | "tfvars" => Ok(TsLanguage::Hcl),
+            #[cfg(feature = "rust")]
+            "rust" | "rs" => Ok(TsLanguage::Rust),
             _ => bail!("unsupported language: {name}"),
         }
     }
@@ -140,6 +148,8 @@ impl TsLanguage {
             // covers all three.
             #[cfg(feature = "hcl")]
             "tf" | "tfvars" | "hcl" => Some(TsLanguage::Hcl),
+            #[cfg(feature = "rust")]
+            "rs" => Some(TsLanguage::Rust),
             _ => None,
         }
     }

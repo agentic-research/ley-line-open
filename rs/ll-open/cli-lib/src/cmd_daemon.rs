@@ -255,12 +255,15 @@ pub async fn run_daemon(
             )));
             #[cfg(feature = "hdc")]
             passes.push(Box::new(crate::daemon::hdc_enrich::HdcEnrichmentPass));
-            // Session observation pass — ADR-0020 §1 Gate 1.
-            // Unconditional (no feature gate): agent-session ingestion
-            // is core to the substrate, not optional like lsp/hdc/vec.
-            // Bead `ley-line-open-c7c79a`.
+            // Session observation pass — ADR-0020 §1 Gate 1. Writes `observation` rows.
             passes.push(Box::new(
                 crate::daemon::session_observation_pass::SessionObservationPass::new(),
+            ));
+            // ADR-0020 Gate 2: ComplexBuildPass reads `observation` rows
+            // (written by SessionObservationPass) and builds a CellComplex
+            // + drives CoChangeTracker.
+            passes.push(Box::new(
+                crate::daemon::complex_build_pass::ComplexBuildPass,
             ));
             // Extension passes go last; if any have the same name as a
             // base pass, they replace it (extensions win).

@@ -13,7 +13,8 @@ use serde_json::json;
 #[cfg(feature = "validate")]
 use super::wire::ValidateRequest;
 use super::wire::{
-    BASE_OP_NAMES, BaseRequest, LspFile, LspPosition, Ref as WireRef, TokenMapEntry,
+    BASE_OP_NAMES, BaseRequest, InspectSymbolRequest, LspFile, LspPosition, Ref as WireRef,
+    TokenMapEntry,
 };
 #[cfg(feature = "hdc")]
 use super::wire::{HdcCalibrateRequest, HdcDensityRequest, HdcSearchRequest};
@@ -179,6 +180,7 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
         BaseRequest::HdcCalibrate(r) => op_hdc_calibrate(ctx, &r),
         #[cfg(feature = "hdc")]
         BaseRequest::HdcDensity(r) => op_hdc_density(ctx, &r),
+        BaseRequest::InspectSymbol(r) => op_inspect_symbol(ctx, &r),
     };
     result.unwrap_or_else(|e| {
         build_error_response(&format!("{e:#}"))
@@ -1891,6 +1893,309 @@ fn op_hdc_density(ctx: &std::sync::Arc<DaemonContext>, req: &HdcDensityRequest) 
 }
 
 // ---------------------------------------------------------------------------
+// inspect_symbol — bundled symbol inspection (bead ley-line-open-c2c4d9,
+// L1 of the agent-first surface decomp; ADR-0016 §2).
+//
+// Composes find_defs / find_callers / find_callees / lsp_hover into one
+// response so agents pay one round-trip instead of N. The existing
+// primitives stay as-is; this op delegates to the same SQL paths and
+// joins the results into the bundle shape ADR-0016 §2 commits to.
+//
+// Read-only — NOT in STATE_CHANGING_OPS.
+// ---------------------------------------------------------------------------
+
+/// One definition row in the bundle. Carries enough location info
+/// (file, byte range, line range) for the caller to fetch source
+/// directly without a follow-up `get_node` / `read_content` call.
+#[derive(Debug)]
+struct DefRow {
+    node_id: String,
+    source_id: String,
+    node_kind: String,
+    start_line: i32,
+    start_col: i32,
+    end_line: i32,
+    end_col: i32,
+    start_byte: i64,
+    end_byte: i64,
+}
+
+/// `{"op":"inspect_symbol", "symbol_id":"...", "include":[...]?}` —
+/// the spine of the agent-first surface. Returns the bundle ADR-0016 §2
+/// specifies: definitions + hover + references + callers + callees +
+/// freshness, in one round-trip. Read-only.
+fn op_inspect_symbol(
+    ctx: &std::sync::Arc<DaemonContext>,
+    req: &InspectSymbolRequest,
+) -> Result<String> {
+    let include_filter = build_include_filter(&req.include);
+
+    with_live_db(ctx, |conn| {
+        // Definitions: query node_defs WHERE token = symbol_id,
+        // JOINed against _ast for full location info. This is the
+        // anchor — empty defs means the symbol is unknown.
+        let defs = query_definitions(conn, &req.symbol_id)?;
+
+        // `kind` is derived from the FIRST def's _ast.node_kind,
+        // mapped to a broad category. Multiple defs is allowed
+        // (overloads, methods with the same name across types);
+        // the caller can inspect `definitions` directly.
+        let kind = defs
+            .first()
+            .map(|d| classify_node_kind(&d.node_kind))
+            .unwrap_or("unknown");
+
+        // References: every row in node_refs for this token. ADR-0016
+        // §2 distinguishes `references` (raw call sites) from
+        // `callers` (deduped containing functions). v1: both come
+        // from node_refs; `callers` is the DISTINCT-by-node_id
+        // projection. Refining `callers` to walk up _ast for the
+        // enclosing function is a follow-up.
+        let references = query_token_refs(conn, &req.symbol_id, "node_refs")?;
+
+        // Callees: definitions of every token the FIRST definition's
+        // node references. Same SQL as op_find_callees, applied to
+        // the primary def's node_id.
+        let callees = if let Some(primary) = defs.first() {
+            query_callees(conn, &primary.node_id)?
+        } else {
+            Vec::new()
+        };
+
+        // Hover: best-effort lookup in _lsp for the primary def's
+        // node_id. Returns None if no _lsp row exists (the
+        // enrichment pass hasn't run, or this symbol has no
+        // language-server data).
+        let hover_typed = if let Some(primary) = defs.first() {
+            query_hover_typed(conn, &primary.node_id)?
+        } else {
+            None
+        };
+
+        // Freshness: parse_version from `_meta` (matches the
+        // enrichment-pass basis-tracking discipline) + the current
+        // wall-clock as `parsed_at_ms`. Future revisions can layer
+        // source_mtime_ms / stalk_hash per ADR-0016 §7.
+        let generation: u64 = leyline_ts::schema::get_meta(conn, "parse_version")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let parsed_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+
+        // Build the response. The `include` filter, if non-empty,
+        // omits expensive sub-fields. `symbol_id`, `ok`, and `kind`
+        // are always included.
+        let mut response = serde_json::Map::new();
+        response.insert("ok".to_string(), json!(true));
+        response.insert("symbol_id".to_string(), json!(req.symbol_id));
+        response.insert("kind".to_string(), json!(kind));
+
+        if include_filter.has("definitions") {
+            let defs_json: Vec<serde_json::Value> = defs
+                .iter()
+                .map(|d| {
+                    json!({
+                        "node_id":    d.node_id,
+                        "source_id":  d.source_id,
+                        "node_kind":  d.node_kind,
+                        "start_line": d.start_line,
+                        "start_col":  d.start_col,
+                        "end_line":   d.end_line,
+                        "end_col":    d.end_col,
+                        "start_byte": d.start_byte,
+                        "end_byte":   d.end_byte,
+                    })
+                })
+                .collect();
+            response.insert("definitions".to_string(), json!(defs_json));
+        }
+
+        if include_filter.has("hover_typed") {
+            response.insert(
+                "hover_typed".to_string(),
+                hover_typed.unwrap_or(serde_json::Value::Null),
+            );
+        }
+
+        if include_filter.has("references") {
+            let refs_json: Vec<serde_json::Value> = references
+                .iter()
+                .map(|r| json!({"node_id": r.node_id, "source_id": r.source_id}))
+                .collect();
+            response.insert("references".to_string(), json!(refs_json));
+        }
+
+        if include_filter.has("callers") {
+            // v1: callers ≈ references DISTINCT by node_id. Refining
+            // to "the enclosing function of each reference" is a
+            // follow-up bead.
+            let mut seen = std::collections::HashSet::new();
+            let mut callers_json: Vec<serde_json::Value> = Vec::new();
+            for r in &references {
+                if seen.insert(r.node_id.clone()) {
+                    callers_json.push(json!({"node_id": r.node_id, "source_id": r.source_id}));
+                }
+            }
+            response.insert("callers".to_string(), json!(callers_json));
+        }
+
+        if include_filter.has("callees") {
+            let callees_json: Vec<serde_json::Value> = callees
+                .iter()
+                .map(|r| json!({"node_id": r.node_id, "source_id": r.source_id}))
+                .collect();
+            response.insert("callees".to_string(), json!(callees_json));
+        }
+
+        if include_filter.has("freshness") {
+            response.insert(
+                "freshness".to_string(),
+                json!({"generation": generation, "parsed_at_ms": parsed_at_ms}),
+            );
+        }
+
+        Ok(serde_json::Value::Object(response).to_string())
+    })
+}
+
+/// SQL: node_defs ⋈ _ast for definition rows with full location info.
+fn query_definitions(conn: &Connection, token: &str) -> Result<Vec<DefRow>> {
+    let sql = "\
+        SELECT d.node_id, d.source_id, a.node_kind, \
+               a.start_row, a.start_col, a.end_row, a.end_col, \
+               a.start_byte, a.end_byte \
+        FROM node_defs d \
+        LEFT JOIN _ast a ON a.node_id = d.node_id AND a.source_id = d.source_id \
+        WHERE d.token = ?1";
+    let mut stmt = conn.prepare_cached(sql)?;
+    let rows: Vec<DefRow> = stmt
+        .query_map([token], |row| {
+            Ok(DefRow {
+                node_id: row.get::<_, String>(0)?,
+                source_id: row.get::<_, String>(1)?,
+                node_kind: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                start_line: row.get::<_, Option<i32>>(3)?.unwrap_or(0),
+                start_col: row.get::<_, Option<i32>>(4)?.unwrap_or(0),
+                end_line: row.get::<_, Option<i32>>(5)?.unwrap_or(0),
+                end_col: row.get::<_, Option<i32>>(6)?.unwrap_or(0),
+                start_byte: row.get::<_, Option<i64>>(7)?.unwrap_or(0),
+                end_byte: row.get::<_, Option<i64>>(8)?.unwrap_or(0),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Same SQL as `op_find_callees` — DISTINCT (d.node_id, d.source_id)
+/// rows from `node_refs ⋈ node_defs` on token.
+fn query_callees(conn: &Connection, node_id: &str) -> Result<Vec<WireRef>> {
+    let sql = "\
+        SELECT DISTINCT d.node_id, d.source_id \
+        FROM node_refs r \
+        JOIN node_defs d ON r.token = d.token \
+        WHERE r.node_id = ?1";
+    let mut stmt = conn.prepare_cached(sql)?;
+    let rows: Vec<WireRef> = stmt
+        .query_map([node_id], |row| {
+            Ok(WireRef {
+                node_id: row.get::<_, String>(0)?,
+                source_id: row.get::<_, String>(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Best-effort hover lookup via `_lsp` table. Returns None if no row
+/// exists for this node_id (enrichment hasn't run, or LSP returned
+/// nothing for this symbol).
+fn query_hover_typed(conn: &Connection, node_id: &str) -> Result<Option<serde_json::Value>> {
+    // The `_lsp` table is the LSP enrichment pass's output (see
+    // op_lsp_hover for the canonical shape). v1 uses the simplest
+    // available columns: detail / symbol_kind. Future revisions can
+    // parse `detail` into params / returns / receiver_type per
+    // ADR-0016 §2's hover_typed shape.
+    //
+    // `_lsp` is created lazily by the LSP enrichment pass; if the
+    // table doesn't exist, return None gracefully.
+    let has_lsp: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='_lsp'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if !has_lsp {
+        return Ok(None);
+    }
+    let row: Option<(Option<String>, Option<String>)> = query_row_opt(
+        conn,
+        "SELECT detail, symbol_kind FROM _lsp WHERE node_id = ?1 LIMIT 1",
+        [node_id],
+        |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+            ))
+        },
+    )?;
+    let Some((detail, symbol_kind)) = row else {
+        return Ok(None);
+    };
+    Ok(Some(json!({
+        "signature": detail.unwrap_or_default(),
+        "kind":      symbol_kind.unwrap_or_default(),
+    })))
+}
+
+/// Lightweight set-style filter for the `include` field. Empty input
+/// = include everything; non-empty input = include only the listed
+/// fields (case-insensitive). Always-on fields (`ok`, `symbol_id`,
+/// `kind`) are appended outside this filter.
+struct IncludeFilter {
+    set: Option<std::collections::HashSet<String>>,
+}
+
+impl IncludeFilter {
+    fn has(&self, field: &str) -> bool {
+        match &self.set {
+            None => true,
+            Some(s) => s.contains(field),
+        }
+    }
+}
+
+fn build_include_filter(include: &[String]) -> IncludeFilter {
+    if include.is_empty() {
+        IncludeFilter { set: None }
+    } else {
+        IncludeFilter {
+            set: Some(include.iter().map(|s| s.to_lowercase()).collect()),
+        }
+    }
+}
+
+/// Coarse mapping from tree-sitter `node_kind` to the ADR-0016 §2
+/// `kind` enum (function | method | type | variable | constant |
+/// unknown). The raw `node_kind` stays in each definition row for
+/// callers that need finer detail.
+fn classify_node_kind(node_kind: &str) -> &'static str {
+    match node_kind {
+        "function_declaration" | "function_item" | "function_definition" => "function",
+        "method_declaration" | "method_item" => "method",
+        "type_declaration" | "struct_item" | "enum_item" | "trait_item" | "type_spec" => "type",
+        "var_declaration" | "let_declaration" | "short_var_declaration" => "variable",
+        "const_declaration" | "const_spec" | "const_item" => "constant",
+        _ => "unknown",
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1987,6 +2292,7 @@ mod tests {
             "hdc_calibrate",
             #[cfg(feature = "hdc")]
             "hdc_density",
+            "inspect_symbol",
         ] {
             assert!(
                 !is_state_changing(op),
@@ -3468,5 +3774,154 @@ mod tests {
             "exact-content match has distance 0; got {:?}",
             results[0],
         );
+    }
+
+    // ── inspect_symbol (bead ley-line-open-c2c4d9 / L1) ─────────────────
+
+    /// Empty tables → ok=true with empty arrays. The op should NOT
+    /// error on an unknown symbol; an agent might call inspect_symbol
+    /// speculatively and the empty bundle is the well-defined "not
+    /// found" shape.
+    #[tokio::test]
+    async fn inspect_symbol_unknown_returns_empty_bundle() {
+        let (_dir, ctx) = setup();
+        let response =
+            handle_base_op_legacy(&ctx, "inspect_symbol", &json!({"symbol_id": "Nonexistent"}))
+                .expect("inspect_symbol op should be dispatched");
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["symbol_id"], json!("Nonexistent"));
+        assert_eq!(v["kind"], json!("unknown"));
+        assert_eq!(v["definitions"], json!([]));
+        assert_eq!(v["references"], json!([]));
+        assert_eq!(v["callers"], json!([]));
+        assert_eq!(v["callees"], json!([]));
+        assert_eq!(v["hover_typed"], json!(null));
+        // freshness still present even when empty — generation may be 0.
+        assert!(v["freshness"].is_object(), "freshness must be present");
+    }
+
+    /// Populated tables → full bundle. Inserts a definition into
+    /// node_defs + matching _ast row, two references into node_refs,
+    /// and one callee path (node_refs → node_defs join). Asserts the
+    /// bundle composes correctly.
+    #[tokio::test]
+    async fn inspect_symbol_populated_returns_full_bundle() {
+        let (_dir, ctx) = setup();
+
+        {
+            let live = ctx.live_db.lock().unwrap();
+            // Define `SendOp` at node_id `pkg/SendOp` in `pkg.go`.
+            live.execute_batch(
+                "INSERT INTO node_defs (token, node_id, source_id) VALUES \
+                   ('SendOp', 'pkg/SendOp', 'pkg.go');
+                 INSERT INTO _ast (node_id, source_id, node_kind, \
+                                   start_byte, end_byte, start_row, start_col, \
+                                   end_row, end_col) VALUES \
+                   ('pkg/SendOp', 'pkg.go', 'function_declaration', \
+                    100, 250, 5, 0, 15, 1);
+                 INSERT INTO node_refs (token, node_id, source_id) VALUES \
+                   ('SendOp', 'pkg/A', 'a.go'),
+                   ('SendOp', 'pkg/B', 'b.go');
+                 -- SendOp references some inner token 'Helper' that's
+                 -- defined elsewhere; SendOp's callees should pick up
+                 -- 'Helper's definition.
+                 INSERT INTO node_refs (token, node_id, source_id) VALUES \
+                   ('Helper', 'pkg/SendOp', 'pkg.go');
+                 INSERT INTO node_defs (token, node_id, source_id) VALUES \
+                   ('Helper', 'pkg/Helper', 'helper.go');",
+            )
+            .expect("seed test data");
+        }
+
+        let response =
+            handle_base_op_legacy(&ctx, "inspect_symbol", &json!({"symbol_id": "SendOp"}))
+                .expect("inspect_symbol op should be dispatched");
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(v["ok"], json!(true), "got: {v}");
+        assert_eq!(v["symbol_id"], json!("SendOp"));
+        // function_declaration → "function" per classify_node_kind.
+        assert_eq!(v["kind"], json!("function"));
+
+        let defs = v["definitions"].as_array().expect("definitions array");
+        assert_eq!(defs.len(), 1, "exactly one definition; got {defs:?}");
+        assert_eq!(defs[0]["node_id"], json!("pkg/SendOp"));
+        assert_eq!(defs[0]["source_id"], json!("pkg.go"));
+        assert_eq!(defs[0]["node_kind"], json!("function_declaration"));
+        assert_eq!(defs[0]["start_line"], json!(5));
+        assert_eq!(defs[0]["start_byte"], json!(100));
+        assert_eq!(defs[0]["end_byte"], json!(250));
+
+        let refs = v["references"].as_array().expect("references array");
+        assert_eq!(refs.len(), 2, "two refs of SendOp; got {refs:?}");
+
+        // Callees: SendOp's node_id `pkg/SendOp` references 'Helper'
+        // (we inserted that node_refs row); 'Helper' is defined at
+        // `pkg/Helper`. So callees should include the Helper def.
+        let callees = v["callees"].as_array().expect("callees array");
+        assert_eq!(callees.len(), 1, "one callee (Helper); got {callees:?}");
+        assert_eq!(callees[0]["node_id"], json!("pkg/Helper"));
+        assert_eq!(callees[0]["source_id"], json!("helper.go"));
+
+        assert!(
+            v["freshness"].is_object(),
+            "freshness must be present; got {v}"
+        );
+    }
+
+    /// `include` filter (non-empty) opts INTO specific sub-fields;
+    /// other fields are absent from the response. `symbol_id`, `ok`,
+    /// `kind` are always present regardless.
+    #[tokio::test]
+    async fn inspect_symbol_include_filter_restricts_fields() {
+        let (_dir, ctx) = setup();
+        let response = handle_base_op_legacy(
+            &ctx,
+            "inspect_symbol",
+            &json!({"symbol_id": "X", "include": ["definitions", "callers"]}),
+        )
+        .expect("inspect_symbol op should be dispatched");
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        // Always-on fields.
+        assert!(v["ok"].as_bool().unwrap());
+        assert_eq!(v["symbol_id"], json!("X"));
+        assert!(v["kind"].is_string());
+        // Included by filter.
+        assert!(v.get("definitions").is_some(), "definitions included");
+        assert!(v.get("callers").is_some(), "callers included");
+        // NOT included.
+        assert!(
+            v.get("references").is_none(),
+            "references NOT in include list; got {v}",
+        );
+        assert!(
+            v.get("callees").is_none(),
+            "callees NOT in include list; got {v}",
+        );
+        assert!(
+            v.get("hover_typed").is_none(),
+            "hover_typed NOT in include list; got {v}",
+        );
+        assert!(
+            v.get("freshness").is_none(),
+            "freshness NOT in include list; got {v}",
+        );
+    }
+
+    /// classify_node_kind pin — make a refactor that renames a
+    /// canonical node_kind (or the broad-category mapping) surface
+    /// here rather than in production code that quietly returns
+    /// "unknown" everywhere.
+    #[test]
+    fn classify_node_kind_maps_canonical_kinds() {
+        assert_eq!(classify_node_kind("function_declaration"), "function");
+        assert_eq!(classify_node_kind("function_item"), "function");
+        assert_eq!(classify_node_kind("method_declaration"), "method");
+        assert_eq!(classify_node_kind("struct_item"), "type");
+        assert_eq!(classify_node_kind("type_declaration"), "type");
+        assert_eq!(classify_node_kind("const_declaration"), "constant");
+        assert_eq!(classify_node_kind("not_a_real_kind"), "unknown");
+        assert_eq!(classify_node_kind(""), "unknown");
     }
 }

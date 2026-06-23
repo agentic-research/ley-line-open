@@ -109,6 +109,7 @@ pub const BASE_OP_NAMES: &[&str] = &[
     "hdc_calibrate",
     #[cfg(feature = "hdc")]
     "hdc_density",
+    "inspect_symbol",
 ];
 
 // ---------------------------------------------------------------------------
@@ -241,6 +242,11 @@ pub enum BaseRequest {
     /// Read-only.
     #[cfg(feature = "hdc")]
     HdcDensity(HdcDensityRequest),
+    /// Bundled symbol-inspection query (ley-line-open-c2c4d9, L1 of
+    /// the agent-first surface decomp). Composes find_defs +
+    /// find_callers + find_callees + lsp_hover into one response so
+    /// agents pay one round-trip instead of N. Read-only. ADR-0016 §2.
+    InspectSymbol(InspectSymbolRequest),
 }
 
 #[cfg(feature = "vec")]
@@ -367,6 +373,32 @@ fn default_hdc_k() -> u32 {
 #[cfg(feature = "hdc")]
 fn default_hdc_calibrate_sample() -> usize {
     1000
+}
+
+// ---------------------------------------------------------------------------
+// Bundled symbol-inspection request (ADR-0016 §2). `symbol_id` is the
+// canonical surface: agents come with a name (function, type, etc.)
+// rather than a cursor position. For position-keyed callers, the
+// `at_position` op (L2) translates (file, line, col) → symbol_id
+// first, then this op runs the bundled query.
+//
+// `include` opts OUT of expensive sub-fields per ADR-0016 §2(b).
+// Empty list = include everything (the default agent path); a
+// non-empty list restricts the response to only the named fields.
+// Valid field names: "definitions" | "hover_typed" | "references" |
+// "callers" | "callees" | "freshness". Unknown names are ignored.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Debug)]
+pub struct InspectSymbolRequest {
+    /// Symbol identifier — typically a token name (`"SendOp"`) or a
+    /// qualified path-like string. The handler tries the token-based
+    /// `find_defs` first; the longest dotted/colon-separated tail is
+    /// retried if the full string yields no defs.
+    pub symbol_id: String,
+    /// Optional field filter. Empty / missing = full bundle.
+    #[serde(default)]
+    pub include: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------

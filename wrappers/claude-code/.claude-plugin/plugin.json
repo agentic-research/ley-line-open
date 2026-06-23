@@ -1,0 +1,13 @@
+{
+  "name": "leyline-stale-sync",
+  "version": "0.1.0",
+  "description": "Auto-invalidate ley-line-open's parse + LSP cache when Claude Code edits a file. Keeps lsp_hover/defs/refs/diagnostics fresh inside long sessions.",
+  "author": {
+    "name": "Agentic Research",
+    "url": "https://github.com/agentic-research"
+  },
+  "homepage": "https://github.com/agentic-research/ley-line-open",
+  "repository": "https://github.com/agentic-research/ley-line-open",
+  "license": "AGPL-3.0-or-later",
+  "keywords": ["mcp", "lsp", "rust-analyzer", "ley-line", "ley-line-open", "stale-cache", "claude-code"]
+}

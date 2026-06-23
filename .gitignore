@@ -60,6 +60,11 @@
 # Documentation
 !docs/**
 
+# Claude Code plugin wrappers — see wrappers/claude-code/ for the
+# leyline-stale-sync plugin (cloister-acbf27). These are plugin
+# sources tracked in the repo, not user-side .claude/ config.
+!wrappers/**
+
 # Rosary bead store (tracked across all repos in the workspace so beads
 # survive machine moves / fresh clones / cross-agent handoff). Same
 # pattern other repos in the workspace use (rosary/, mache/, signet/).

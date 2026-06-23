@@ -1,0 +1,9 @@
+{
+  "leyline": {
+    "type": "http",
+    "url": "http://localhost:8384/mcp",
+    "headers": {
+      "x-leyline-token": "${LEYLINE_TOKEN}"
+    }
+  }
+}

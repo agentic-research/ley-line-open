@@ -68,7 +68,8 @@
             "get_defs_map",
             "get_schema",
             "get_db_path",
-            "get_node"
+            "get_node",
+            "inspect_symbol"
           ]
         },
         {

@@ -261,6 +261,18 @@ pub fn tool_registry() -> Vec<McpTool> {
             }),
         },
         McpTool {
+            name: "inspect_symbol",
+            description: "Bundled symbol inspection (ADR-0016 §2). Returns definitions + hover + references + callers + callees + freshness in one round-trip. `symbol_id` is the token name (e.g. `SocketClient.SendOp`). Optional `include` field opts INTO specific sub-fields (`definitions`, `hover_typed`, `references`, `callers`, `callees`, `freshness`); empty/missing = full bundle. Read-only.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "symbol_id": {"type": "string", "description": "Token name to inspect."},
+                    "include":   {"type": "array", "items": {"type": "string"}, "description": "Optional opt-in field list. Empty = full bundle."}
+                },
+                "required": ["symbol_id"]
+            }),
+        },
+        McpTool {
             name: "sheaf_set_topology",
             description: "Set the sheaf cache's community structure: regions (content-hash stalks, optionally with f32 stalk vectors for δ⁰ mode) and restriction edges (boundary hash + co-change rate + per-dim weights, optionally with agreement_dim for δ⁰ mode). Pass `node_stalk_dim > 0` AND f32 `data` on every region AND `agreement_dim > 0` on every restriction to engage δ⁰-driven invalidation.",
             schema: json!({
@@ -473,6 +485,7 @@ pub fn cloister_groups() -> Vec<CloisterGroupDecl> {
                 "get_schema",
                 "get_db_path",
                 "get_node",
+                "inspect_symbol",
             ],
         },
         // Wire-compat handshake. Single-tool group so the version

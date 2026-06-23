@@ -110,6 +110,7 @@ pub const BASE_OP_NAMES: &[&str] = &[
     #[cfg(feature = "hdc")]
     "hdc_density",
     "inspect_symbol",
+    "at_position",
 ];
 
 // ---------------------------------------------------------------------------
@@ -247,6 +248,12 @@ pub enum BaseRequest {
     /// find_callers + find_callees + lsp_hover into one response so
     /// agents pay one round-trip instead of N. Read-only. ADR-0016 §2.
     InspectSymbol(InspectSymbolRequest),
+    /// Position-keyed → symbol_id translation (ley-line-open-c2e602,
+    /// L2 of the agent-first surface decomp; ADR-0016 §1). For
+    /// editor consumers that have a cursor but need a `symbol_id`
+    /// to call `inspect_symbol`. Reuses `LspPosition` because the
+    /// request shape is identical: file + line + col. Read-only.
+    AtPosition(LspPosition),
 }
 
 #[cfg(feature = "vec")]

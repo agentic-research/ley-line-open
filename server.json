@@ -69,7 +69,8 @@
             "get_schema",
             "get_db_path",
             "get_node",
-            "inspect_symbol"
+            "inspect_symbol",
+            "at_position"
           ]
         },
         {

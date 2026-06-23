@@ -112,6 +112,7 @@ pub const BASE_OP_NAMES: &[&str] = &[
     "inspect_symbol",
     "at_position",
     "inspect_neighborhood",
+    "search_symbols",
 ];
 
 // ---------------------------------------------------------------------------
@@ -260,6 +261,13 @@ pub enum BaseRequest {
     /// truncated bundles for every symbol within `depth` hops via
     /// the callers/callees relation. Read-only.
     InspectNeighborhood(InspectNeighborhoodRequest),
+    /// Glob-pattern symbol search (ley-line-open-c79953, L4;
+    /// ADR-0016 §6). Returns NDJSON — one JSON object per line —
+    /// for every `node_defs.token` matching the GLOB `pattern`,
+    /// optionally filtered by `kind` and capped at `limit`. Each
+    /// line carries `{symbol_id, node_id, source_id, kind,
+    /// provenance, certainty}`. Read-only.
+    SearchSymbols(SearchSymbolsRequest),
 }
 
 #[cfg(feature = "vec")]
@@ -441,6 +449,44 @@ fn default_neighborhood_depth() -> u32 {
 
 fn default_neighborhood_max_per_hop() -> u32 {
     20
+}
+
+// ---------------------------------------------------------------------------
+// Glob-pattern symbol search request (ADR-0016 §6, bead L4 / c79953).
+//
+// `pattern` is a SQL GLOB string — `*` matches any run of characters,
+// `?` matches a single character, `[abc]` matches one of the listed
+// characters. Empty pattern matches nothing (returns zero NDJSON lines).
+// `limit` caps the number of returned rows (default 100). `kind`
+// optionally filters by the broad classify_node_kind category
+// (`"function"`, `"method"`, `"type"`, `"variable"`, `"constant"`).
+//
+// v1 simplification: the response buffers all NDJSON lines into a
+// single String and returns from dispatch_typed like every other op.
+// True chunked streaming (per ADR-0016 §6 "first result within 100ms
+// even if total takes 5s") is a follow-up bead — the on-wire byte
+// sequence is identical because NDJSON consumers parse line-by-line
+// either way.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Debug)]
+pub struct SearchSymbolsRequest {
+    /// SQL GLOB pattern matched against `node_defs.token`.
+    /// Examples: `"Send*"`, `"*Foo*"`, `"do_[abc]*"`.
+    pub pattern: String,
+    /// Max number of matched rows to emit. Default 100.
+    #[serde(default = "default_search_limit")]
+    pub limit: u32,
+    /// Optional `classify_node_kind` filter: one of `"function"` |
+    /// `"method"` | `"type"` | `"variable"` | `"constant"`. Unknown
+    /// values match nothing (silent empty rather than error — the
+    /// agent can re-call with a different filter).
+    #[serde(default)]
+    pub kind: Option<String>,
+}
+
+fn default_search_limit() -> u32 {
+    100
 }
 
 // ---------------------------------------------------------------------------

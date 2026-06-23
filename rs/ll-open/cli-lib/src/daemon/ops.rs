@@ -14,7 +14,7 @@ use serde_json::json;
 use super::wire::ValidateRequest;
 use super::wire::{
     BASE_OP_NAMES, BaseRequest, InspectNeighborhoodRequest, InspectSymbolRequest, LspFile,
-    LspPosition, Ref as WireRef, TokenMapEntry,
+    LspPosition, Ref as WireRef, SearchSymbolsRequest, TokenMapEntry,
 };
 #[cfg(feature = "hdc")]
 use super::wire::{HdcCalibrateRequest, HdcDensityRequest, HdcSearchRequest};
@@ -183,6 +183,7 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
         BaseRequest::InspectSymbol(r) => op_inspect_symbol(ctx, &r),
         BaseRequest::AtPosition(p) => op_at_position(ctx, &p),
         BaseRequest::InspectNeighborhood(r) => op_inspect_neighborhood(ctx, &r),
+        BaseRequest::SearchSymbols(r) => op_search_symbols(ctx, &r),
     };
     result.unwrap_or_else(|e| {
         build_error_response(&format!("{e:#}"))
@@ -2509,6 +2510,92 @@ fn query_caller_tokens(conn: &Connection, focal_token: &str) -> Result<Vec<Strin
 }
 
 // ---------------------------------------------------------------------------
+// search_symbols — GLOB-pattern symbol search streamed as NDJSON
+// (bead ley-line-open-c79953, L4 of the agent-first surface decomp;
+// ADR-0016 §6).
+//
+// Returns one JSON object per matched token, each terminated by `\n`.
+// The whole response is the concatenation of N lines into one String —
+// path (a) per the scout's design report. NDJSON consumers parse
+// line-by-line either way, so the on-wire byte sequence is identical
+// to a true chunked-streaming implementation (which is a follow-up
+// bead: dispatch_typed → Stream<Item=String> through axum and the UDS
+// framer). v1 satisfies the §6 line-delimited shape; it does NOT
+// satisfy §6's "first result within 100ms even if total takes 5s"
+// gate, which requires true streaming.
+//
+// Read-only — NOT in STATE_CHANGING_OPS.
+// ---------------------------------------------------------------------------
+
+/// `{"op":"search_symbols", "pattern":"Send*", "limit":100, "kind":"function"?}`
+/// → NDJSON. Each matched row emits one line of the form
+/// `{"symbol_id","node_id","source_id","kind","provenance":"tree-sitter","certainty":"full"}\n`.
+/// Zero matches → empty string (NOT `"\n"`, NOT `"[]"`).
+fn op_search_symbols(
+    ctx: &std::sync::Arc<DaemonContext>,
+    req: &SearchSymbolsRequest,
+) -> Result<String> {
+    // Empty pattern → zero matches by definition. Short-circuit
+    // before touching the db so we don't ship a "GLOB ''" query.
+    if req.pattern.is_empty() {
+        return Ok(String::new());
+    }
+    let limit = req.limit.max(1) as i64;
+    let kind_filter = req.kind.as_deref().map(|s| s.to_string());
+
+    with_live_db(ctx, |conn| {
+        // node_defs ⋈ _ast on (node_id, source_id). LEFT JOIN matches
+        // query_definitions's shape so a token without an _ast row
+        // still surfaces (node_kind falls back to ""). DISTINCT
+        // collapses duplicate (token, node_id, source_id) tuples
+        // that can arise from re-indexing.
+        let sql = "\
+            SELECT DISTINCT d.token, d.node_id, d.source_id, a.node_kind \
+            FROM node_defs d \
+            LEFT JOIN _ast a ON a.node_id = d.node_id AND a.source_id = d.source_id \
+            WHERE d.token GLOB ?1 \
+            ORDER BY d.token \
+            LIMIT ?2";
+        let mut stmt = conn.prepare_cached(sql)?;
+        let rows = stmt.query_map(rusqlite::params![&req.pattern, limit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            ))
+        })?;
+
+        // Buffer one NDJSON line per matched row. The kind filter
+        // is applied row-side (cheaper than another SQL predicate
+        // against the raw `node_kind` variants — classify_node_kind
+        // collapses N raw kinds into ~5 categories).
+        let mut out = String::new();
+        for row in rows {
+            let (token, node_id, source_id, node_kind) = row?;
+            let kind = classify_node_kind(&node_kind);
+            if let Some(want) = kind_filter.as_deref()
+                && kind != want
+            {
+                continue;
+            }
+            let line = json!({
+                "symbol_id":  token,
+                "node_id":    node_id,
+                "source_id":  source_id,
+                "kind":       kind,
+                "provenance": "tree-sitter",
+                "certainty":  "full",
+            })
+            .to_string();
+            out.push_str(&line);
+            out.push('\n');
+        }
+        Ok(out)
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2608,6 +2695,7 @@ mod tests {
             "inspect_symbol",
             "at_position",
             "inspect_neighborhood",
+            "search_symbols",
         ] {
             assert!(
                 !is_state_changing(op),
@@ -4518,5 +4606,156 @@ mod tests {
         let defs = v["definitions"].as_array().unwrap();
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0]["node_id"], json!("pkg/Foo"));
+    }
+
+    // ── search_symbols (bead ley-line-open-c79953 / L4) ───────────────
+
+    /// Helper: parse an NDJSON response string into a Vec of JSON
+    /// values, one per non-empty line. Pins the line-delimited shape:
+    /// each line must independently parse as a JSON object.
+    fn parse_ndjson(s: &str) -> Vec<serde_json::Value> {
+        s.split('\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).expect("each NDJSON line parses as JSON"))
+            .collect()
+    }
+
+    /// Empty pattern → empty string (zero lines), NOT `"\n"`, NOT
+    /// `"[]"`. Pins the NDJSON zero-result shape ADR-0016 §6 commits
+    /// to: a missing trailing newline at zero rows is the unambiguous
+    /// "no matches" signal.
+    #[tokio::test]
+    async fn search_symbols_empty_pattern_returns_empty_string() {
+        let (_dir, ctx) = setup();
+        let response =
+            handle_base_op_legacy(&ctx, "search_symbols", &json!({"pattern": ""})).unwrap();
+        assert_eq!(
+            response, "",
+            "empty pattern → empty string; got {response:?}"
+        );
+    }
+
+    /// GLOB `Send*` against seeded `SendOp` / `SendBatch` / `Receive`
+    /// returns exactly 2 lines, each independently parseable as JSON.
+    /// Pins both the GLOB semantics AND the line-delimited contract.
+    #[tokio::test]
+    async fn search_symbols_glob_pattern_matches_prefix() {
+        let (_dir, ctx) = setup();
+        {
+            let live = ctx.live_db.lock().unwrap();
+            live.execute_batch(
+                "INSERT INTO node_defs (token, node_id, source_id) VALUES \
+                   ('SendOp',    'pkg/SendOp',    'pkg.go'),
+                   ('SendBatch', 'pkg/SendBatch', 'pkg.go'),
+                   ('Receive',   'pkg/Receive',   'pkg.go');
+                 INSERT INTO _ast (node_id, source_id, node_kind, \
+                                   start_byte, end_byte, start_row, start_col, \
+                                   end_row, end_col) VALUES \
+                   ('pkg/SendOp',    'pkg.go', 'function_declaration', 0, 50, 1, 0, 5, 0),
+                   ('pkg/SendBatch', 'pkg.go', 'function_declaration', 50, 100, 6, 0, 10, 0),
+                   ('pkg/Receive',   'pkg.go', 'function_declaration', 100, 150, 11, 0, 15, 0);",
+            )
+            .expect("seed test data");
+        }
+
+        let response =
+            handle_base_op_legacy(&ctx, "search_symbols", &json!({"pattern": "Send*"})).unwrap();
+        let lines = parse_ndjson(&response);
+        assert_eq!(lines.len(), 2, "Send* should match 2 rows; got {response}");
+
+        let symbols: std::collections::HashSet<String> = lines
+            .iter()
+            .map(|l| l["symbol_id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(symbols.contains("SendOp"), "expected SendOp in {symbols:?}");
+        assert!(
+            symbols.contains("SendBatch"),
+            "expected SendBatch in {symbols:?}",
+        );
+        assert!(
+            !symbols.contains("Receive"),
+            "Receive must NOT match Send*; got {symbols:?}",
+        );
+
+        // Per-row shape pin: every line carries the L7 provenance +
+        // certainty fields plus the canonical row shape.
+        for line in &lines {
+            assert!(line["symbol_id"].is_string(), "symbol_id; got {line}");
+            assert!(line["node_id"].is_string(), "node_id; got {line}");
+            assert!(line["source_id"].is_string(), "source_id; got {line}");
+            assert_eq!(line["kind"], json!("function"));
+            assert_eq!(line["provenance"], json!("tree-sitter"));
+            assert_eq!(line["certainty"], json!("full"));
+        }
+    }
+
+    /// `limit` caps the number of returned rows.
+    #[tokio::test]
+    async fn search_symbols_limit_is_respected() {
+        let (_dir, ctx) = setup();
+        {
+            let live = ctx.live_db.lock().unwrap();
+            live.execute_batch(
+                "INSERT INTO node_defs (token, node_id, source_id) VALUES \
+                   ('Match1', 'pkg/Match1', 'pkg.go'),
+                   ('Match2', 'pkg/Match2', 'pkg.go'),
+                   ('Match3', 'pkg/Match3', 'pkg.go'),
+                   ('Match4', 'pkg/Match4', 'pkg.go'),
+                   ('Match5', 'pkg/Match5', 'pkg.go');",
+            )
+            .expect("seed test data");
+        }
+
+        let response = handle_base_op_legacy(
+            &ctx,
+            "search_symbols",
+            &json!({"pattern": "Match*", "limit": 2}),
+        )
+        .unwrap();
+        let lines = parse_ndjson(&response);
+        assert_eq!(
+            lines.len(),
+            2,
+            "limit=2 should cap to 2 rows; got {} lines: {response}",
+            lines.len(),
+        );
+    }
+
+    /// `kind="function"` filter excludes non-function rows. Pins the
+    /// row-side classify_node_kind filtering path.
+    #[tokio::test]
+    async fn search_symbols_kind_filter_excludes_non_matching() {
+        let (_dir, ctx) = setup();
+        {
+            let live = ctx.live_db.lock().unwrap();
+            live.execute_batch(
+                "INSERT INTO node_defs (token, node_id, source_id) VALUES \
+                   ('FooFn',     'pkg/FooFn',     'pkg.go'),
+                   ('FooStruct', 'pkg/FooStruct', 'pkg.go'),
+                   ('FooConst',  'pkg/FooConst',  'pkg.go');
+                 INSERT INTO _ast (node_id, source_id, node_kind, \
+                                   start_byte, end_byte, start_row, start_col, \
+                                   end_row, end_col) VALUES \
+                   ('pkg/FooFn',     'pkg.go', 'function_declaration', 0, 50, 1, 0, 5, 0),
+                   ('pkg/FooStruct', 'pkg.go', 'struct_item',          50, 100, 6, 0, 10, 0),
+                   ('pkg/FooConst',  'pkg.go', 'const_declaration',    100, 150, 11, 0, 15, 0);",
+            )
+            .expect("seed test data");
+        }
+
+        let response = handle_base_op_legacy(
+            &ctx,
+            "search_symbols",
+            &json!({"pattern": "Foo*", "kind": "function"}),
+        )
+        .unwrap();
+        let lines = parse_ndjson(&response);
+        assert_eq!(
+            lines.len(),
+            1,
+            "kind=function should match only FooFn; got {response}",
+        );
+        assert_eq!(lines[0]["symbol_id"], json!("FooFn"));
+        assert_eq!(lines[0]["kind"], json!("function"));
     }
 }

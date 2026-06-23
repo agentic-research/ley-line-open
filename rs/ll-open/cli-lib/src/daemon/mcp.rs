@@ -304,6 +304,18 @@ pub fn tool_registry() -> Vec<McpTool> {
             }),
         },
         McpTool {
+            name: "agreement",
+            description: "Cross-source observation agreement (ADR-0020 §3). Loads each source's latest observation for `(token, payload_kind)` from the `observation` table, builds a degenerate 2-node `CellComplex` with identity restriction maps, runs `detect_violations`, and returns `{ok, token, payload_kind, source_count, coherence_defect, defects, provenance, certainty}`. `coherence_defect` is `Σ margin²` across all violations. Empty / one-source result returns no defects (no disagreement possible). Read-only.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "token":        {"type": "string", "description": "Observer-emitted stable token (ADR-0020 §1)."},
+                    "payload_kind": {"type": "string", "description": "Typed-payload registry key (ADR-0020 §1)."}
+                },
+                "required": ["token", "payload_kind"]
+            }),
+        },
+        McpTool {
             name: "sheaf_set_topology",
             description: "Set the sheaf cache's community structure: regions (content-hash stalks, optionally with f32 stalk vectors for δ⁰ mode) and restriction edges (boundary hash + co-change rate + per-dim weights, optionally with agreement_dim for δ⁰ mode). Pass `node_stalk_dim > 0` AND f32 `data` on every region AND `agreement_dim > 0` on every restriction to engage δ⁰-driven invalidation.",
             schema: json!({
@@ -520,6 +532,7 @@ pub fn cloister_groups() -> Vec<CloisterGroupDecl> {
                 "at_position",
                 "inspect_neighborhood",
                 "search_symbols",
+                "agreement",
             ],
         },
         // Wire-compat handshake. Single-tool group so the version

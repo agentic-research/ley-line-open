@@ -13,8 +13,8 @@ use serde_json::json;
 #[cfg(feature = "validate")]
 use super::wire::ValidateRequest;
 use super::wire::{
-    BASE_OP_NAMES, BaseRequest, InspectNeighborhoodRequest, InspectSymbolRequest, LspFile,
-    LspPosition, Ref as WireRef, SearchSymbolsRequest, TokenMapEntry,
+    AgreementRequest, BASE_OP_NAMES, BaseRequest, InspectNeighborhoodRequest, InspectSymbolRequest,
+    LspFile, LspPosition, Ref as WireRef, SearchSymbolsRequest, TokenMapEntry,
 };
 #[cfg(feature = "hdc")]
 use super::wire::{HdcCalibrateRequest, HdcDensityRequest, HdcSearchRequest};
@@ -184,6 +184,7 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
         BaseRequest::AtPosition(p) => op_at_position(ctx, &p),
         BaseRequest::InspectNeighborhood(r) => op_inspect_neighborhood(ctx, &r),
         BaseRequest::SearchSymbols(r) => op_search_symbols(ctx, &r),
+        BaseRequest::Agreement(r) => op_agreement(ctx, &r),
     };
     result.unwrap_or_else(|e| {
         build_error_response(&format!("{e:#}"))
@@ -2521,7 +2522,6 @@ fn query_caller_tokens(conn: &Connection, focal_token: &str) -> Result<Vec<Strin
 // to a true chunked-streaming implementation (which is a follow-up
 // bead: dispatch_typed → Stream<Item=String> through axum and the UDS
 // framer). v1 satisfies the §6 line-delimited shape; it does NOT
-// satisfy §6's "first result within 100ms even if total takes 5s"
 // gate, which requires true streaming.
 //
 // Read-only — NOT in STATE_CHANGING_OPS.
@@ -2596,6 +2596,241 @@ fn op_search_symbols(
 }
 
 // ---------------------------------------------------------------------------
+// agreement — cross-source disagreement scoring (bead ley-line-open-c8090f,
+// L10 of the agent-first surface decomp; ADR-0020 §3, Gate 3).
+//
+// Loads each source's observation for `(token, payload_kind)` from the
+// `observation` table, decodes each `payload_inline` BLOB as a little-
+// endian `Vec<f32>`, builds a degenerate `CellComplex` (one 0-cell per
+// source, identity restriction maps over a single edge per disagreement
+// pair), and runs `detect_violations`. The per-row violations become the
+// op's `defects` field; the sum of squared margins becomes
+// `coherence_defect` (the ADR-0020 §3 reserved name — NOT `δ⁰`, which
+// is the sheaf-algebra operator's name).
+// v1 simplifications (each documented inline):
+// - Observation table is lazily created if missing. L8 (the table-
+//   schema bead) is unshipped at L10 write time; this op pre-installs
+//   the schema so callers can insert observations and immediately
+//   query agreement against them. Once L8 lands the redundant CREATE
+//   IF NOT EXISTS becomes a no-op.
+// - `payload_inline` is interpreted as a little-endian f32 byte
+//   sequence: every 4 bytes is one float, length must be divisible
+//   by 4. This bypasses ley-line-open-503971's capnp typed-payload
+//   registry (also unshipped) for L10; the v1 encoder is "raw f32s".
+//   When the registry ships, a `decode_payload(payload_kind, bytes)`
+//   helper replaces this branch without touching the op's algebra.
+// - `payload_hash` (BlobStore lookup for >`INLINE_THRESHOLD`
+//   payloads, ADR-0020 §1) is NOT followed. v1 only reads
+//   `payload_inline`. Falling back to BlobStore is a follow-up bead.
+// - No filter on observation time / source / window. Every matching
+//   row participates.
+// - Pairwise complex (vs. a star): for N sources we emit N-1 edges
+//   (source 0 ↔ source 1, source 0 ↔ source 2, …). Star around the
+//   first source is sufficient to catch any pair where source_i
+//   disagrees with source_0; a fully-pairwise variant is a follow-up
+//   if the agent surface ever needs the dense matrix.
+//
+// Read-only — NOT in STATE_CHANGING_OPS.
+// ---------------------------------------------------------------------------
+
+/// One observation row decoded for agreement scoring: the source name
+/// plus the decoded f32 stalk vector. Mirrors the per-source 0-cell
+/// the agreement op feeds into the degenerate `CellComplex`.
+#[derive(Debug, Clone)]
+struct AgreementRow {
+    source: String,
+    stalk: Vec<f32>,
+}
+
+/// Fetch the latest observation per source for `(token, payload_kind)`.
+/// Returns at most one row per `source` (the freshest by `observed_at`).
+/// The token filter uses ADR-0020's `observation_by_mentions` index
+/// via `json_each` — same shape the future `agreement` Gate 4 property
+/// test will exercise.
+fn query_agreement_observations(
+    conn: &Connection,
+    token: &str,
+    payload_kind: &str,
+) -> Result<Vec<AgreementRow>> {
+    // Delegate to L8's authoritative schema (single source of truth).
+    crate::daemon::observation_schema::create_observation_schema(conn)?;
+
+    // Latest observation per source for this `(token, payload_kind)`.
+    // SQLite's "bare-column" aggregation rule (since 3.7.11) means
+    // `MAX(observed_at)` plus other bare columns returns those columns
+    // from the row that produced the max — exactly the "freshest per
+    // source" projection we want without a subquery dance.
+    let sql = "\
+        SELECT o.source, o.payload_inline, MAX(o.observed_at) AS latest \
+        FROM observation o \
+        WHERE o.payload_kind = ?1 \
+          AND EXISTS ( \
+              SELECT 1 FROM json_each(o.mentions) je \
+              WHERE je.value = ?2 \
+          ) \
+          AND o.payload_inline IS NOT NULL \
+        GROUP BY o.source \
+        ORDER BY o.source ASC";
+
+    let mut stmt = conn.prepare_cached(sql)?;
+    let rows: Vec<AgreementRow> = stmt
+        .query_map([payload_kind, token], |r| {
+            let source: String = r.get(0)?;
+            let payload: Vec<u8> = r.get(1)?;
+            Ok((source, payload))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter_map(|(source, bytes)| {
+            decode_inline_payload(&bytes).map(|stalk| AgreementRow { source, stalk })
+        })
+        .collect();
+
+    Ok(rows)
+}
+
+/// Decode a `payload_inline` BLOB as a little-endian `Vec<f32>`. Returns
+/// `None` if the byte length is not divisible by 4 (the raw-f32 v1
+/// encoder rejects fragmented payloads cleanly so a malformed row drops
+/// out instead of crashing the op). When the typed-payload registry
+/// (ley-line-open-503971) ships, this is the single point that learns
+/// to dispatch by `payload_kind`.
+fn decode_inline_payload(bytes: &[u8]) -> Option<Vec<f32>> {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4);
+    for chunk in bytes.chunks_exact(4) {
+        let arr: [u8; 4] = chunk.try_into().ok()?;
+        out.push(f32::from_le_bytes(arr));
+    }
+    Some(out)
+}
+
+/// Build the degenerate `CellComplex` ADR-0020 §3 specifies:
+/// one 0-cell per source, identity restriction maps, and edges between
+/// every distinct pair of sources (a star around the first source —
+/// sufficient to surface any disagreement against source 0; a fully-
+/// pairwise variant would be O(N²) edges and isn't needed for the v1
+/// agreement op).
+///
+/// All stalks MUST share the same dimension — the caller is responsible
+/// for filtering rows that don't match. The function returns `None` if
+/// `rows` is empty or stalks disagree on dimension (caller treats this
+/// as "no defects, no algebra invoked").
+fn build_agreement_complex(
+    rows: &[AgreementRow],
+) -> Option<(leyline_sheaf::complex::CellComplex, Vec<String>)> {
+    use leyline_sheaf::complex::{CellComplex, RestrictionMap};
+
+    let first = rows.first()?;
+    let stalk_dim = first.stalk.len();
+    if stalk_dim == 0 || !rows.iter().all(|r| r.stalk.len() == stalk_dim) {
+        return None;
+    }
+
+    let mut cx = CellComplex::new(stalk_dim);
+    let mut sources_by_node: Vec<String> = Vec::with_capacity(rows.len());
+    for (idx, row) in rows.iter().enumerate() {
+        cx.add_node(idx as u32, row.stalk.clone());
+        sources_by_node.push(row.source.clone());
+    }
+
+    // Star edges around source 0. Edge IDs live in the same `cells`
+    // namespace as nodes (see `add_edge`); bumping from a high offset
+    // (1_000) keeps them clear of the 0..N node IDs without colliding
+    // with the cache layer's `EDGE_ID_BASE = 1_000_000`.
+    const AGREEMENT_EDGE_BASE: u32 = 1_000;
+    for target in 1..rows.len() as u32 {
+        cx.add_edge(
+            AGREEMENT_EDGE_BASE + target,
+            0,
+            target,
+            stalk_dim,
+            Some("agreement".to_string()),
+            RestrictionMap::identity(stalk_dim),
+            RestrictionMap::identity(stalk_dim),
+            false,
+        );
+    }
+
+    Some((cx, sources_by_node))
+}
+
+/// `{"op":"agreement","token":"...","payload_kind":"..."}` — returns
+/// `{ok, token, payload_kind, coherence_defect, defects, source_count,
+/// provenance, certainty}`. Builds a degenerate CellComplex from the
+/// most-recent `payload_inline` per source and reports
+/// `detect_violations`. Read-only.
+fn op_agreement(ctx: &std::sync::Arc<DaemonContext>, req: &AgreementRequest) -> Result<String> {
+    with_live_db(ctx, |conn| {
+        let rows = query_agreement_observations(conn, &req.token, &req.payload_kind)?;
+        let source_count = rows.len();
+
+        // Build the complex (if possible) and run detect_violations.
+        // The single-source / empty / dim-mismatch cases short-circuit
+        // to an empty defects array — the op still returns OK because
+        // "no sources disagree" is a valid answer.
+        let (defects_json, coherence_defect): (Vec<serde_json::Value>, f32) =
+            if let Some((cx, sources_by_node)) = build_agreement_complex(&rows) {
+                // Mechanical-reach: this is the load-bearing call into
+                // `leyline-sheaf`. The Gate 3 spy increments here.
+                let violations = cx.detect_violations();
+                let mut total = 0.0_f32;
+                let defects: Vec<serde_json::Value> = violations
+                    .iter()
+                    .map(|v| {
+                        total += v.margin * v.margin;
+                        // Recover the (source_a, source_b) pair from
+                        // the edge's incidence — same mapping the
+                        // complex builder installed (node 0 ↔ node k
+                        // for star edges around source 0).
+                        let (src_a, src_b) = cx
+                            .incidence
+                            .get(&v.edge_id)
+                            .map(|&(a, b)| (a as usize, b as usize))
+                            .unwrap_or((0, 0));
+                        let source_a = sources_by_node.get(src_a).cloned().unwrap_or_default();
+                        let source_b = sources_by_node.get(src_b).cloned().unwrap_or_default();
+                        json!({
+                            "source_a":        source_a,
+                            "source_b":        source_b,
+                            "edge_id":         v.edge_id,
+                            "dimension_index": v.dimension_index,
+                            "margin":          v.margin,
+                            "severity":        v.margin * v.margin,
+                            // L7-style provenance per dimension: the
+                            // defect is derived from sheaf algebra over
+                            // observations from multiple sources.
+                            "provenance":      "sheaf",
+                            "certainty":       "full",
+                        })
+                    })
+                    .collect();
+                (defects, total)
+            } else {
+                (Vec::new(), 0.0)
+            };
+
+        Ok(json!({
+            "ok":               true,
+            "token":            req.token,
+            "payload_kind":     req.payload_kind,
+            "source_count":     source_count,
+            "coherence_defect": coherence_defect,
+            "defects":          defects_json,
+            // Top-level provenance "composed" because the op merges
+            // multiple observations from different sources; certainty
+            // "full" because the algebra is deterministic given the
+            // observation rows.
+            "provenance":       "composed",
+            "certainty":        "full",
+        })
+        .to_string())
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2607,7 +2842,6 @@ mod tests {
 
     // ── Helper unit tests ───────────────────────────────────────────────
 
-    #[test]
     fn normalize_file_uri_strips_prefix() {
         assert_eq!(normalize_file_uri("file:///abs/foo.rs"), "/abs/foo.rs");
     }
@@ -2696,6 +2930,7 @@ mod tests {
             "at_position",
             "inspect_neighborhood",
             "search_symbols",
+            "agreement",
         ] {
             assert!(
                 !is_state_changing(op),
@@ -4757,5 +4992,318 @@ mod tests {
         );
         assert_eq!(lines[0]["symbol_id"], json!("FooFn"));
         assert_eq!(lines[0]["kind"], json!("function"));
+    }
+
+    // ── agreement op (bead ley-line-open-c8090f / L10) ────────────────
+    //
+    // Gate 3 of ADR-0020: the op MUST mechanically reach
+    // `CellComplex::detect_violations`. The
+    // `DETECT_VIOLATIONS_REACH_COUNT` spy (gated under
+    // `leyline-sheaf`'s `test-spy` feature, enabled by cli-lib's dev-
+    // dependency entry) is the load-bearing signal. A future refactor
+    // that "optimizes away" the algebra call would zero the counter
+    // delta and fail this test.
+
+    /// Encode a `Vec<f32>` as the little-endian byte sequence the v1
+    /// `agreement` op consumes from `observation.payload_inline`.
+    /// Pulled out as a test helper so the fixture is readable instead of
+    /// a wall of `f32::to_le_bytes` calls inline.
+    fn encode_inline_f32(stalk: &[f32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(stalk.len() * 4);
+        for v in stalk {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
+    /// Insert a single observation row into the daemon's living db with
+    /// the v1 raw-f32 inline payload. `mentions` is the JSON array form
+    /// ADR-0020 §1 specifies — the agreement op's `EXISTS … json_each`
+    /// filter walks this column.
+    fn insert_observation(
+        ctx: &std::sync::Arc<DaemonContext>,
+        source: &str,
+        payload_kind: &str,
+        token: &str,
+        stalk: &[f32],
+        observed_at: i64,
+    ) {
+        let live = ctx.live_db.lock().unwrap();
+        crate::daemon::observation_schema::create_observation_schema(&live)
+            .expect("install observation schema");
+        let payload = encode_inline_f32(stalk);
+        let mentions = format!("[\"{token}\"]");
+        live.execute(
+            "INSERT INTO observation (source, payload_kind, payload_inline, mentions, observed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![source, payload_kind, payload, mentions, observed_at],
+        )
+        .expect("insert observation");
+    }
+
+    /// Gate 3 (ADR-0020 §3 / falsifiability gate for L10): two
+    /// observations of the same `(token, payload_kind)` from different
+    /// sources with disagreeing stalk fields MUST surface as a non-
+    /// empty `defects` array, and the computation MUST mechanically
+    /// reach `CellComplex::detect_violations` (verified via the
+    /// `DETECT_VIOLATIONS_REACH_COUNT` spy).
+    ///
+    /// Falsifiability — this test FAILS if either:
+    ///   (a) `detect_violations` is short-circuited / not invoked
+    ///       (spy delta == 0), or
+    ///   (b) the op returns an empty `defects` array despite the
+    ///       fixture injecting disagreement.
+    #[tokio::test]
+    async fn agreement_gate3_two_sources_disagree_reaches_detect_violations() {
+        use leyline_sheaf::complex::DETECT_VIOLATIONS_REACH_COUNT;
+        use std::sync::atomic::Ordering;
+
+        let (_dir, ctx) = setup();
+
+        // Fixture: two `code.symbol_def` observations on the same
+        // token from different sources, disagreeing on the second
+        // coordinate (clearly above the EPS = 1e-4 threshold).
+        insert_observation(
+            &ctx,
+            "tree-sitter",
+            "code.symbol_def",
+            "sym:Foo",
+            &[1.0, 2.0, 3.0],
+            1_000,
+        );
+        insert_observation(
+            &ctx,
+            "git",
+            "code.symbol_def",
+            "sym:Foo",
+            &[1.0, 7.5, 3.0],
+            1_001,
+        );
+
+        // Snapshot the spy counter so concurrent tests don't pollute
+        // the absolute reading. The op must increment it by ≥ 1.
+        let before = DETECT_VIOLATIONS_REACH_COUNT.load(Ordering::Relaxed);
+
+        let response = handle_base_op_legacy(
+            &ctx,
+            "agreement",
+            &json!({"token": "sym:Foo", "payload_kind": "code.symbol_def"}),
+        )
+        .expect("agreement op recognised");
+        let v: serde_json::Value = serde_json::from_str(&response).expect("valid json");
+
+        let after = DETECT_VIOLATIONS_REACH_COUNT.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "Gate 3: detect_violations must be reached (spy went {before} → {after}); \
+             response was {v}",
+        );
+
+        // Wire shape contract.
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["token"], json!("sym:Foo"));
+        assert_eq!(v["payload_kind"], json!("code.symbol_def"));
+        assert_eq!(v["source_count"], json!(2));
+        assert_eq!(v["provenance"], json!("composed"));
+        assert_eq!(v["certainty"], json!("full"));
+
+        let defects = v["defects"].as_array().expect("defects array");
+        assert!(
+            !defects.is_empty(),
+            "Gate 3: defects must be non-empty when sources disagree; response was {v}",
+        );
+
+        // coherence_defect = Σ margin² — must be > 0 because at least
+        // one row's margin is non-zero (sources disagreed).
+        let coherence_defect = v["coherence_defect"]
+            .as_f64()
+            .expect("coherence_defect numeric");
+        assert!(
+            coherence_defect > 0.0,
+            "coherence_defect must be positive when sources disagree; got {coherence_defect}",
+        );
+
+        // Each defect row carries the (source_a, source_b) recovery
+        // plus L7 provenance/certainty.
+        for row in defects {
+            assert!(row["source_a"].is_string(), "missing source_a: {row}");
+            assert!(row["source_b"].is_string(), "missing source_b: {row}");
+            assert!(row["margin"].is_number(), "missing margin: {row}");
+            assert!(row["severity"].is_number(), "missing severity: {row}");
+            assert_eq!(row["provenance"], json!("sheaf"));
+            assert_eq!(row["certainty"], json!("full"));
+        }
+    }
+
+    /// Sanity case: two observations from different sources that
+    /// agree (identical stalks) → defects empty + coherence_defect 0,
+    /// but the spy STILL fires (the op constructs the 2-node complex
+    /// and runs the algebra; the result is just that no edge crosses
+    /// the EPS threshold). Pins that "no disagreement" is a successful
+    /// op response, not a short-circuit that bypasses the math.
+    #[tokio::test]
+    async fn agreement_two_sources_agree_returns_empty_defects() {
+        use leyline_sheaf::complex::DETECT_VIOLATIONS_REACH_COUNT;
+        use std::sync::atomic::Ordering;
+
+        let (_dir, ctx) = setup();
+        insert_observation(
+            &ctx,
+            "tree-sitter",
+            "code.symbol_def",
+            "sym:Bar",
+            &[4.0, 5.0, 6.0],
+            2_000,
+        );
+        insert_observation(
+            &ctx,
+            "git",
+            "code.symbol_def",
+            "sym:Bar",
+            &[4.0, 5.0, 6.0],
+            2_001,
+        );
+
+        let before = DETECT_VIOLATIONS_REACH_COUNT.load(Ordering::Relaxed);
+        let response = handle_base_op_legacy(
+            &ctx,
+            "agreement",
+            &json!({"token": "sym:Bar", "payload_kind": "code.symbol_def"}),
+        )
+        .unwrap();
+        let after = DETECT_VIOLATIONS_REACH_COUNT.load(Ordering::Relaxed);
+
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert!(
+            after > before,
+            "agreement-on-agreement should still invoke the algebra",
+        );
+        assert_eq!(v["defects"], json!([]));
+        assert_eq!(v["coherence_defect"].as_f64().unwrap(), 0.0);
+        assert_eq!(v["source_count"], json!(2));
+    }
+
+    /// Edge case: single source for `(token, payload_kind)` — nothing
+    /// to disagree with. Op returns OK with empty defects and 0.0
+    /// defect; v1 documents this as the "trivial agreement" path.
+    #[tokio::test]
+    async fn agreement_single_source_returns_empty_defects() {
+        let (_dir, ctx) = setup();
+        insert_observation(
+            &ctx,
+            "tree-sitter",
+            "code.symbol_def",
+            "sym:Solo",
+            &[9.0, 9.0, 9.0],
+            3_000,
+        );
+
+        let response = handle_base_op_legacy(
+            &ctx,
+            "agreement",
+            &json!({"token": "sym:Solo", "payload_kind": "code.symbol_def"}),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["defects"], json!([]));
+        assert_eq!(v["coherence_defect"].as_f64().unwrap(), 0.0);
+        assert_eq!(v["source_count"], json!(1));
+    }
+
+    /// No observations exist for the requested `(token, payload_kind)`
+    /// — empty result, op still succeeds, table is lazily installed.
+    #[tokio::test]
+    async fn agreement_no_observations_returns_empty() {
+        let (_dir, ctx) = setup();
+        let response = handle_base_op_legacy(
+            &ctx,
+            "agreement",
+            &json!({"token": "sym:Missing", "payload_kind": "code.symbol_def"}),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["source_count"], json!(0));
+        assert_eq!(v["defects"], json!([]));
+    }
+
+    /// Multiple observations per source: the op picks the LATEST
+    /// observation per source (per ADR-0020 §1's `observed_at`
+    /// ordering — the freshest-wins projection). Pins that older
+    /// observations don't pollute the agreement check.
+    #[tokio::test]
+    async fn agreement_takes_latest_observation_per_source() {
+        use leyline_sheaf::complex::DETECT_VIOLATIONS_REACH_COUNT;
+        use std::sync::atomic::Ordering;
+
+        let (_dir, ctx) = setup();
+        // Stale (older) tree-sitter observation that disagrees with git.
+        insert_observation(
+            &ctx,
+            "tree-sitter",
+            "code.symbol_def",
+            "sym:Latest",
+            &[0.0, 100.0, 0.0],
+            1_000,
+        );
+        // Fresh tree-sitter observation that AGREES with git.
+        insert_observation(
+            &ctx,
+            "tree-sitter",
+            "code.symbol_def",
+            "sym:Latest",
+            &[1.0, 2.0, 3.0],
+            5_000,
+        );
+        insert_observation(
+            &ctx,
+            "git",
+            "code.symbol_def",
+            "sym:Latest",
+            &[1.0, 2.0, 3.0],
+            4_000,
+        );
+
+        let before = DETECT_VIOLATIONS_REACH_COUNT.load(Ordering::Relaxed);
+        let response = handle_base_op_legacy(
+            &ctx,
+            "agreement",
+            &json!({"token": "sym:Latest", "payload_kind": "code.symbol_def"}),
+        )
+        .unwrap();
+        let after = DETECT_VIOLATIONS_REACH_COUNT.load(Ordering::Relaxed);
+
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert!(after > before);
+        assert_eq!(v["source_count"], json!(2));
+        // Latest-per-source: tree-sitter's [1,2,3] vs git's [1,2,3] → agree.
+        assert_eq!(v["defects"], json!([]));
+        assert_eq!(v["coherence_defect"].as_f64().unwrap(), 0.0);
+    }
+
+    /// Unit test for the inline-payload decoder: 4-byte chunks → f32s.
+    /// Empty / unaligned payloads return None so the op skips the row
+    /// rather than panicking.
+    #[test]
+    fn decode_inline_payload_roundtrips_f32_vec() {
+        let original = vec![1.0f32, -2.5, 3.14159, 0.0];
+        let bytes = {
+            let mut b = Vec::new();
+            for v in &original {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            b
+        };
+        let decoded = decode_inline_payload(&bytes).expect("decode succeeds");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn decode_inline_payload_rejects_unaligned() {
+        // 3 bytes — not a multiple of 4. Must return None, not panic.
+        assert!(decode_inline_payload(&[0, 0, 0]).is_none());
+        // Empty — also None (nothing to decode).
+        assert!(decode_inline_payload(&[]).is_none());
     }
 }

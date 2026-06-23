@@ -10,11 +10,35 @@
 //! - H¹ = ker(δ¹) / im(δ⁰) (independent cycles — fundamental invalidation paths)
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(any(test, feature = "test-spy"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use nalgebra::{DMatrix, DVector};
 use nalgebra_sparse::{CooMatrix, CscMatrix};
 
 use crate::sparse::SparseOps;
+
+// ---------------------------------------------------------------------------
+// Mechanical-reach spy for L10's Gate 3 (ADR-0020 §3 / bead ley-line-open-c8090f).
+//
+// ADR-0020 falsifiability Gate 3 requires that the `agreement` daemon op
+// MECHANICALLY reach `detect_violations` — not just "this typechecks".
+// The L10 Gate 3 fixture test reads this counter to prove the call path
+// actually went through the sheaf algebra rather than a degenerate
+// short-circuit.
+//
+// Gated under `cfg(any(test, feature = "test-spy"))` so the atomic
+// add is not paid in release builds without the feature. The same
+// shape can be reused by L9's `ComplexBuildPass` Gate 2 spy (separate
+// counter would be added there).
+// ---------------------------------------------------------------------------
+
+/// Test-only counter incremented on every entry into
+/// [`CellComplex::detect_violations`]. The integration test for the L10
+/// `agreement` op reads this to assert mechanical reach (the load-bearing
+/// half of ADR-0020 Gate 3: "verify the path went through `detect_violations`").
+#[cfg(any(test, feature = "test-spy"))]
+pub static DETECT_VIOLATIONS_REACH_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Numerical tolerance for zero comparisons.
 const EPS: f32 = 1e-4;
@@ -1108,6 +1132,14 @@ impl CellComplex {
     /// Returns edges where the coboundary margin is negative (constraint
     /// violated). Margin magnitude indicates severity.
     pub fn detect_violations(&self) -> Vec<Violation> {
+        // Mechanical-reach spy for ADR-0020 §3 Gate 3 (bead
+        // ley-line-open-c8090f). The L10 `agreement` op's integration
+        // test asserts this counter increments — if a future refactor
+        // moves the math out of this function, the L10 test will fail
+        // and the spec violation gets caught at CI time.
+        #[cfg(any(test, feature = "test-spy"))]
+        DETECT_VIOLATIONS_REACH_COUNT.fetch_add(1, Ordering::Relaxed);
+
         let delta = self.build_delta_0();
         let x = self.global_section();
 

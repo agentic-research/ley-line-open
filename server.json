@@ -72,7 +72,8 @@
             "inspect_symbol",
             "at_position",
             "inspect_neighborhood",
-            "search_symbols"
+            "search_symbols",
+            "agreement"
           ]
         },
         {

@@ -1,6 +1,7 @@
 //! Open daemon: UDS socket + event router + extensible ops.
 
 pub mod auth;
+pub mod complex_build_pass;
 #[cfg(feature = "vec")]
 pub mod embed;
 pub mod enrichment;

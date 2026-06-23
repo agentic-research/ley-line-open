@@ -111,6 +111,7 @@ pub const BASE_OP_NAMES: &[&str] = &[
     "hdc_density",
     "inspect_symbol",
     "at_position",
+    "inspect_neighborhood",
 ];
 
 // ---------------------------------------------------------------------------
@@ -254,6 +255,11 @@ pub enum BaseRequest {
     /// to call `inspect_symbol`. Reuses `LspPosition` because the
     /// request shape is identical: file + line + col. Read-only.
     AtPosition(LspPosition),
+    /// N-hop neighborhood expansion (ley-line-open-c77690, L3;
+    /// ADR-0016 §5). Returns the focal symbol's bundle plus
+    /// truncated bundles for every symbol within `depth` hops via
+    /// the callers/callees relation. Read-only.
+    InspectNeighborhood(InspectNeighborhoodRequest),
 }
 
 #[cfg(feature = "vec")]
@@ -406,6 +412,35 @@ pub struct InspectSymbolRequest {
     /// Optional field filter. Empty / missing = full bundle.
     #[serde(default)]
     pub include: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Neighborhood expansion request (ADR-0016 §5, bead L3).
+//
+// `depth` bounds the BFS radius. Default 1, max 4 — the bounds match
+// ADR-0016 §5's spec. `max_neighbors_per_hop` caps the fan-out at each
+// hop so a high-fanout symbol (e.g. a popular utility function) doesn't
+// blow up the response. v1 omits `max_bytes` and `edge_kinds` from the
+// ADR spec — those add response-shape complexity that's deferrable.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Debug)]
+pub struct InspectNeighborhoodRequest {
+    pub symbol_id: String,
+    /// BFS depth (default 1, max 4). 0 → focal only.
+    #[serde(default = "default_neighborhood_depth")]
+    pub depth: u32,
+    /// Max neighbors retained per hop. Default 20.
+    #[serde(default = "default_neighborhood_max_per_hop")]
+    pub max_neighbors_per_hop: u32,
+}
+
+fn default_neighborhood_depth() -> u32 {
+    1
+}
+
+fn default_neighborhood_max_per_hop() -> u32 {
+    20
 }
 
 // ---------------------------------------------------------------------------

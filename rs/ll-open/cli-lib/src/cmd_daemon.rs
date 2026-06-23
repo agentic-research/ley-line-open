@@ -253,6 +253,8 @@ pub async fn run_daemon(
                 vec_index.clone(),
                 embedder.clone(),
             )));
+            #[cfg(feature = "hdc")]
+            passes.push(Box::new(crate::daemon::hdc_enrich::HdcEnrichmentPass));
             // Extension passes go last; if any have the same name as a
             // base pass, they replace it (extensions win).
             for ext_pass in ext.enrichment_passes() {

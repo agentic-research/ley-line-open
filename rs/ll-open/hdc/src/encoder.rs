@@ -62,15 +62,43 @@ impl EncoderNode {
     /// content hash, so structurally-identical subtrees collapse to
     /// the same hash regardless of where they appear in a tree.
     pub fn content_hash(&self) -> [u8; 32] {
+        // Length-prefixed blocks match the discipline in
+        // `codebook::canonical_signature_bytes` (codebook.rs:159).
+        // Without the prefixes, a child blake3 starting with valid
+        // CanonicalKind discriminant bytes (values 0..6, p=7/256 per
+        // byte) could in principle alias the boundary between the
+        // kinds block and the children-hashes block — making two
+        // distinct EncoderNode trees collide.
+        //
+        // Probability is ~2^-50 for natural code and irrelevant
+        // cryptographically; the fix exists to keep `content_hash` a
+        // strict structural witness so the SubtreeCache contract
+        // ("same tree → same key") holds without "natural-code"
+        // qualifiers. Fix surfaced by math-friend review on bead
+        // `ley-line-open-641809` (Q4).
+        //
+        // Safe to land at any time: this is a cache-key hash, not a
+        // codebook output. Changing it invalidates in-process
+        // `SubtreeCache` entries (they self-heal on the next encode),
+        // but does NOT invalidate persisted `_hdc` rows — those store
+        // codebook outputs computed deterministically from the same
+        // EncoderNode regardless of which key was used to cache them.
         let mut hasher = blake3::Hasher::new();
         hasher.update(&[self.canonical_kind.discriminant()]);
         hasher.update(&[bucket_arity(self.children.len())]);
+
+        let kinds_len = self.child_canonical_kinds_sorted.len() as u16;
+        hasher.update(&kinds_len.to_le_bytes());
         for k in &self.child_canonical_kinds_sorted {
             hasher.update(&[k.discriminant()]);
         }
+
+        let children_len = self.children.len() as u16;
+        hasher.update(&children_len.to_le_bytes());
         for child in &self.children {
             hasher.update(&child.content_hash());
         }
+
         *hasher.finalize().as_bytes()
     }
 }

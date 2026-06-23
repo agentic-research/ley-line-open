@@ -7,6 +7,8 @@ pub mod enrichment;
 pub mod events;
 pub mod ext;
 #[cfg(feature = "hdc")]
+pub mod hdc_enrich;
+#[cfg(feature = "hdc")]
 pub mod hdc_pass;
 #[cfg(feature = "lsp")]
 pub mod lsp_pass;

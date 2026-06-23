@@ -278,6 +278,19 @@ pub fn tool_registry() -> Vec<McpTool> {
             schema: position_schema(),
         },
         McpTool {
+            name: "inspect_neighborhood",
+            description: "N-hop neighborhood expansion (ADR-0016 §5). Returns `{ok, focal, neighbors, depth}` where neighbors are reachable from focal via the callers/callees relation within `depth` hops. Each neighbor is a truncated bundle (symbol_id + kind + definitions + hop distance). `depth` default 1, max 4. `max_neighbors_per_hop` caps fan-out (default 20). Read-only.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "symbol_id":             {"type": "string", "description": "Focal symbol's token."},
+                    "depth":                 {"type": "integer", "description": "BFS depth (default 1, max 4). 0 = focal only."},
+                    "max_neighbors_per_hop": {"type": "integer", "description": "Per-hop fan-out cap. Default 20."}
+                },
+                "required": ["symbol_id"]
+            }),
+        },
+        McpTool {
             name: "sheaf_set_topology",
             description: "Set the sheaf cache's community structure: regions (content-hash stalks, optionally with f32 stalk vectors for δ⁰ mode) and restriction edges (boundary hash + co-change rate + per-dim weights, optionally with agreement_dim for δ⁰ mode). Pass `node_stalk_dim > 0` AND f32 `data` on every region AND `agreement_dim > 0` on every restriction to engage δ⁰-driven invalidation.",
             schema: json!({
@@ -492,6 +505,7 @@ pub fn cloister_groups() -> Vec<CloisterGroupDecl> {
                 "get_node",
                 "inspect_symbol",
                 "at_position",
+                "inspect_neighborhood",
             ],
         },
         // Wire-compat handshake. Single-tool group so the version

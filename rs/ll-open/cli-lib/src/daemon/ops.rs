@@ -13,8 +13,8 @@ use serde_json::json;
 #[cfg(feature = "validate")]
 use super::wire::ValidateRequest;
 use super::wire::{
-    BASE_OP_NAMES, BaseRequest, InspectSymbolRequest, LspFile, LspPosition, Ref as WireRef,
-    TokenMapEntry,
+    BASE_OP_NAMES, BaseRequest, InspectNeighborhoodRequest, InspectSymbolRequest, LspFile,
+    LspPosition, Ref as WireRef, TokenMapEntry,
 };
 #[cfg(feature = "hdc")]
 use super::wire::{HdcCalibrateRequest, HdcDensityRequest, HdcSearchRequest};
@@ -182,6 +182,7 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
         BaseRequest::HdcDensity(r) => op_hdc_density(ctx, &r),
         BaseRequest::InspectSymbol(r) => op_inspect_symbol(ctx, &r),
         BaseRequest::AtPosition(p) => op_at_position(ctx, &p),
+        BaseRequest::InspectNeighborhood(r) => op_inspect_neighborhood(ctx, &r),
     };
     result.unwrap_or_else(|e| {
         build_error_response(&format!("{e:#}"))
@@ -2308,6 +2309,206 @@ fn op_at_position(ctx: &std::sync::Arc<DaemonContext>, p: &LspPosition) -> Resul
 }
 
 // ---------------------------------------------------------------------------
+// inspect_neighborhood — N-hop expansion (bead ley-line-open-c77690,
+// L3 of the agent-first surface decomp; ADR-0016 §5).
+//
+// Returns the focal symbol's bundle plus truncated bundles for every
+// symbol within `depth` hops via the callers/callees relation. The
+// truncated shape includes `symbol_id`, `kind`, `definitions`, and
+// `hop` (distance from focal); reachable downstream consumers can
+// recurse via inspect_symbol if they need full bundles for any
+// neighbor.
+//
+// v1 simplifications (each documented inline):
+// - No `max_bytes` byte-cap — byte-counting + JSON-truncation is
+//   complex and ADR-0016 §5's "per-distance truncation" maps cleanly
+//   to the existing `kind`-only shape at deeper hops. Bounded fan-
+//   out via `max_neighbors_per_hop` is enough for v1.
+// - No `edge_kinds` filter — always traverses both callers AND
+//   callees. Filtering one direction or specific edge types is a
+//   follow-up bead.
+// - Single round-trip (ADR-0016 §5 falsifiability `writes_for_
+//   neighborhood_query == 1`): the entire neighborhood is built
+//   inside one `with_live_db` closure and serialized once.
+//
+// Read-only — NOT in STATE_CHANGING_OPS.
+// ---------------------------------------------------------------------------
+
+/// Cap on `depth` regardless of caller input — ADR-0016 §5 says max 4.
+const NEIGHBORHOOD_MAX_DEPTH: u32 = 4;
+
+/// `{"op":"inspect_neighborhood","symbol_id":"...",...}` — focal
+/// symbol + N-hop neighborhood. Returns `{ok, focal, neighbors}`.
+fn op_inspect_neighborhood(
+    ctx: &std::sync::Arc<DaemonContext>,
+    req: &InspectNeighborhoodRequest,
+) -> Result<String> {
+    let depth = req.depth.min(NEIGHBORHOOD_MAX_DEPTH);
+    let per_hop = req.max_neighbors_per_hop as usize;
+
+    with_live_db(ctx, |conn| {
+        // Focal: full definitions for the requested symbol_id.
+        let focal_defs = query_definitions(conn, &req.symbol_id)?;
+        let focal_kind = focal_defs
+            .first()
+            .map(|d| classify_node_kind(&d.node_kind))
+            .unwrap_or("unknown");
+
+        // BFS over the callers/callees relation. `visited` tracks
+        // symbol_ids we've already emitted so a high-degree symbol
+        // doesn't appear at multiple hops; the FIRST hop at which a
+        // neighbor is reached is the one recorded.
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        visited.insert(req.symbol_id.clone());
+
+        let mut neighbors_out: Vec<serde_json::Value> = Vec::new();
+        let mut current_frontier: Vec<String> = vec![req.symbol_id.clone()];
+
+        for hop in 1..=depth {
+            let mut next_frontier: Vec<String> = Vec::new();
+
+            for focal in &current_frontier {
+                // Callees of the focal: definitions of every token
+                // the focal references. Re-uses op_find_callees's SQL.
+                let callee_defs = query_callees_with_token(conn, focal)?;
+                // Callers of the focal: every site that references
+                // the focal's token. Joins back to node_defs to get
+                // the calling FUNCTION's token (caller-side aggregation).
+                let caller_tokens = query_caller_tokens(conn, focal)?;
+
+                for token in callee_defs
+                    .into_iter()
+                    .chain(caller_tokens)
+                    .take(per_hop * 2)
+                {
+                    if !visited.insert(token.clone()) {
+                        continue;
+                    }
+                    next_frontier.push(token.clone());
+
+                    // Truncated bundle for this neighbor: just defs
+                    // and kind, with provenance/certainty per L7.
+                    let defs = query_definitions(conn, &token)?;
+                    let kind = defs
+                        .first()
+                        .map(|d| classify_node_kind(&d.node_kind))
+                        .unwrap_or("unknown");
+                    let defs_json: Vec<serde_json::Value> = defs
+                        .iter()
+                        .map(|d| {
+                            json!({
+                                "node_id":    d.node_id,
+                                "source_id":  d.source_id,
+                                "node_kind":  d.node_kind,
+                                "provenance": "tree-sitter",
+                                "certainty":  "full",
+                            })
+                        })
+                        .collect();
+
+                    neighbors_out.push(json!({
+                        "symbol_id":   token,
+                        "kind":        kind,
+                        "hop":         hop,
+                        "definitions": defs_json,
+                        "provenance":  "tree-sitter",
+                        "certainty":   "full",
+                    }));
+
+                    if neighbors_out.len() >= per_hop * hop as usize {
+                        // Soft cap per hop. The fan-out can be
+                        // tighter than the request asked if many
+                        // neighbors share dedup hits.
+                        break;
+                    }
+                }
+            }
+
+            current_frontier = next_frontier;
+            if current_frontier.is_empty() {
+                break; // No more nodes to expand.
+            }
+        }
+
+        // Focal block: same shape as inspect_symbol minus the full
+        // bundle. Consumers wanting hover/refs on the focal call
+        // inspect_symbol directly with the same symbol_id.
+        let focal_defs_json: Vec<serde_json::Value> = focal_defs
+            .iter()
+            .map(|d| {
+                json!({
+                    "node_id":    d.node_id,
+                    "source_id":  d.source_id,
+                    "node_kind":  d.node_kind,
+                    "start_line": d.start_line,
+                    "start_col":  d.start_col,
+                    "end_line":   d.end_line,
+                    "end_col":    d.end_col,
+                    "start_byte": d.start_byte,
+                    "end_byte":   d.end_byte,
+                    "provenance": "tree-sitter",
+                    "certainty":  "full",
+                })
+            })
+            .collect();
+
+        Ok(json!({
+            "ok":         true,
+            "symbol_id":  req.symbol_id,
+            "depth":      depth,
+            "focal": {
+                "symbol_id":   req.symbol_id,
+                "kind":        focal_kind,
+                "definitions": focal_defs_json,
+                "provenance":  "tree-sitter",
+                "certainty":   "full",
+            },
+            "neighbors":  neighbors_out,
+            "provenance": "composed",
+            "certainty":  "full",
+        })
+        .to_string())
+    })
+}
+
+/// Variant of `query_callees` that returns the TOKENS of callees,
+/// not the (node_id, source_id) pairs. Tokens are the symbol_ids the
+/// neighborhood expansion uses as the next frontier.
+fn query_callees_with_token(conn: &Connection, focal_token: &str) -> Result<Vec<String>> {
+    // Two-step join: focal token → focal node_id (from node_defs) →
+    // tokens this node references (from node_refs).
+    let sql = "\
+        SELECT DISTINCT r.token \
+        FROM node_defs d \
+        JOIN node_refs r ON r.node_id = d.node_id AND r.source_id = d.source_id \
+        WHERE d.token = ?1 \
+          AND r.token != ?1";
+    let mut stmt = conn.prepare_cached(sql)?;
+    let rows: Vec<String> = stmt
+        .query_map([focal_token], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Tokens of functions that REFERENCE the focal symbol. Looks up
+/// `node_refs` for the focal token to find the calling nodes, then
+/// joins back to `node_defs` to get those nodes' defining tokens
+/// (i.e. the enclosing functions' names).
+fn query_caller_tokens(conn: &Connection, focal_token: &str) -> Result<Vec<String>> {
+    let sql = "\
+        SELECT DISTINCT d.token \
+        FROM node_refs r \
+        JOIN node_defs d ON d.node_id = r.node_id AND d.source_id = r.source_id \
+        WHERE r.token = ?1 \
+          AND d.token != ?1";
+    let mut stmt = conn.prepare_cached(sql)?;
+    let rows: Vec<String> = stmt
+        .query_map([focal_token], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2406,6 +2607,7 @@ mod tests {
             "hdc_density",
             "inspect_symbol",
             "at_position",
+            "inspect_neighborhood",
         ] {
             assert!(
                 !is_state_changing(op),
@@ -4169,6 +4371,109 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── inspect_neighborhood (bead ley-line-open-c77690 / L3) ─────────
+
+    /// Empty db: focal has no defs, no neighbors.
+    #[tokio::test]
+    async fn inspect_neighborhood_empty_db_returns_empty_neighbors() {
+        let (_dir, ctx) = setup();
+        let response =
+            handle_base_op_legacy(&ctx, "inspect_neighborhood", &json!({"symbol_id": "X"}))
+                .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["symbol_id"], json!("X"));
+        assert_eq!(v["depth"], json!(1));
+        assert_eq!(v["focal"]["kind"], json!("unknown"));
+        assert_eq!(v["focal"]["definitions"], json!([]));
+        assert_eq!(v["neighbors"], json!([]));
+    }
+
+    /// Depth-1 hop: focal A calls B and is called by C → neighbors
+    /// should contain both B (callee) and C (caller).
+    #[tokio::test]
+    async fn inspect_neighborhood_depth_1_returns_callers_and_callees() {
+        let (_dir, ctx) = setup();
+        {
+            let live = ctx.live_db.lock().unwrap();
+            // A defined at pkg/A, references B (B is its callee).
+            // C is defined at pkg/C, references A (C is A's caller).
+            live.execute_batch(
+                "INSERT INTO node_defs (token, node_id, source_id) VALUES \
+                   ('A', 'pkg/A', 'pkg.go'),
+                   ('B', 'pkg/B', 'pkg.go'),
+                   ('C', 'pkg/C', 'pkg.go');
+                 INSERT INTO _ast (node_id, source_id, node_kind, \
+                                   start_byte, end_byte, start_row, start_col, \
+                                   end_row, end_col) VALUES \
+                   ('pkg/A', 'pkg.go', 'function_declaration', \
+                    0, 100, 1, 0, 5, 1),
+                   ('pkg/B', 'pkg.go', 'function_declaration', \
+                    100, 200, 6, 0, 10, 1),
+                   ('pkg/C', 'pkg.go', 'function_declaration', \
+                    200, 300, 11, 0, 15, 1);
+                 -- A references B (so B is callee of A).
+                 INSERT INTO node_refs (token, node_id, source_id) VALUES \
+                   ('B', 'pkg/A', 'pkg.go');
+                 -- C references A (so C is caller of A).
+                 INSERT INTO node_refs (token, node_id, source_id) VALUES \
+                   ('A', 'pkg/C', 'pkg.go');",
+            )
+            .expect("seed test data");
+        }
+
+        let response = handle_base_op_legacy(
+            &ctx,
+            "inspect_neighborhood",
+            &json!({"symbol_id": "A", "depth": 1}),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["focal"]["kind"], json!("function"));
+
+        let neighbors = v["neighbors"].as_array().expect("neighbors array");
+        let neighbor_tokens: std::collections::HashSet<String> = neighbors
+            .iter()
+            .map(|n| n["symbol_id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            neighbor_tokens.contains("B"),
+            "neighbors should include callee B; got {neighbor_tokens:?}",
+        );
+        assert!(
+            neighbor_tokens.contains("C"),
+            "neighbors should include caller C; got {neighbor_tokens:?}",
+        );
+        // All hop=1 at depth=1.
+        for n in neighbors {
+            assert_eq!(n["hop"], json!(1));
+            // L7 contract — every row carries provenance/certainty.
+            assert!(n["provenance"].is_string());
+            assert!(n["certainty"].is_string());
+        }
+    }
+
+    /// `depth` is clamped to `NEIGHBORHOOD_MAX_DEPTH` (4) even when
+    /// caller asks for more. Pins the ADR-0016 §5 ceiling.
+    #[tokio::test]
+    async fn inspect_neighborhood_depth_is_capped_at_max() {
+        let (_dir, ctx) = setup();
+        let response = handle_base_op_legacy(
+            &ctx,
+            "inspect_neighborhood",
+            &json!({"symbol_id": "X", "depth": 999}),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            v["depth"],
+            json!(NEIGHBORHOOD_MAX_DEPTH),
+            "depth must clamp to {NEIGHBORHOOD_MAX_DEPTH}; got {v}",
+        );
     }
 
     /// at_position → inspect_symbol composition: the symbol_id

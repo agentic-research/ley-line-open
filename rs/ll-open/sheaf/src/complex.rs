@@ -1132,14 +1132,6 @@ impl CellComplex {
     /// Returns edges where the coboundary margin is negative (constraint
     /// violated). Margin magnitude indicates severity.
     pub fn detect_violations(&self) -> Vec<Violation> {
-        // Mechanical-reach spy for ADR-0020 §3 Gate 3 (bead
-        // ley-line-open-c8090f). The L10 `agreement` op's integration
-        // test asserts this counter increments — if a future refactor
-        // moves the math out of this function, the L10 test will fail
-        // and the spec violation gets caught at CI time.
-        #[cfg(any(test, feature = "test-spy"))]
-        DETECT_VIOLATIONS_REACH_COUNT.fetch_add(1, Ordering::Relaxed);
-
         let delta = self.build_delta_0();
         let x = self.global_section();
 
@@ -1177,6 +1169,15 @@ impl CellComplex {
             }
             row_offset += dim;
         }
+
+        // Mechanical-reach spy for ADR-0020 §3 Gate 3 (bead
+        // ley-line-open-c8090f). Placed AFTER `build_delta_0` + spmv
+        // + the violation-collection loop so the counter only fires
+        // when the math actually executed end-to-end. A regression
+        // that early-returns before the algebra still fails the L10
+        // gate, per math-friend bead `ley-line-open-65d0bf`.
+        #[cfg(any(test, feature = "test-spy"))]
+        DETECT_VIOLATIONS_REACH_COUNT.fetch_add(1, Ordering::Relaxed);
 
         violations
     }

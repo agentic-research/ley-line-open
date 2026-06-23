@@ -13,7 +13,9 @@ pub mod hdc_pass;
 #[cfg(feature = "lsp")]
 pub mod lsp_pass;
 pub mod mcp;
+pub mod observation_schema;
 pub mod ops;
+pub mod session_observation_pass;
 pub mod sheaf_ops;
 pub mod socket;
 #[cfg(feature = "vec")]

@@ -280,6 +280,24 @@ fn gate_2_complex_build_pass_mechanically_reaches_cell_complex() {
          (else tracker.rates can't update); got {nonempty_changed}",
     );
 
+    // (i) Math-friend bead `ley-line-open-66095f` (LOW): δ⁰ structural
+    // nnz alone is satisfied by restriction-map ±1 coefficients regardless
+    // of stalk values — a regression that fed `vec![0.0]` to every node
+    // would still pass (d). Tighten with `detect_violations()`: requires
+    // the section actually carry the per-node activity counts the pass
+    // computes, then runs full δ⁰ × x + magnitude filter. With our fixture
+    // activities (alpha=3, beta=2, gamma=2, delta=2), three edges produce
+    // non-zero margins: (alpha,beta), (alpha,gamma), (alpha,delta).
+    let violations = cx.detect_violations();
+    assert!(
+        !violations.is_empty(),
+        "detect_violations must produce >=1 violation on the fixture — \
+         catches vacuous-stalk regressions that nnz(δ⁰) alone misses. \
+         Got 0 violations from cx.nodes={} cx.edges={}",
+        cx.nodes.len(),
+        cx.edges.len(),
+    );
+
     // (h) Outcome counters match the structural counts.
     assert_eq!(
         outcome,

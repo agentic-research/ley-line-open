@@ -2715,9 +2715,13 @@ fn decode_inline_payload(bytes: &[u8]) -> Option<Vec<f32>> {
 /// agreement op).
 ///
 /// All stalks MUST share the same dimension — the caller is responsible
-/// for filtering rows that don't match. The function returns `None` if
-/// `rows` is empty or stalks disagree on dimension (caller treats this
-/// as "no defects, no algebra invoked").
+/// for filtering rows that don't match. The function returns `None` only
+/// when there are zero rows or every row has an empty stalk — i.e.
+/// nothing left to compute over. Dimension mismatches MUST be caught
+/// by the caller via [`classify_agreement_dims`] BEFORE this is invoked;
+/// see bead `ley-line-open-659a39` (math-friend HIGH): silently returning
+/// `None` on mismatched dims yielded a `{cd=0, defects=[]}` response
+/// indistinguishable from "all sources agree."
 fn build_agreement_complex(
     rows: &[AgreementRow],
 ) -> Option<(leyline_sheaf::complex::CellComplex, Vec<String>)> {
@@ -2725,9 +2729,14 @@ fn build_agreement_complex(
 
     let first = rows.first()?;
     let stalk_dim = first.stalk.len();
-    if stalk_dim == 0 || !rows.iter().all(|r| r.stalk.len() == stalk_dim) {
+    if stalk_dim == 0 {
         return None;
     }
+    debug_assert!(
+        rows.iter().all(|r| r.stalk.len() == stalk_dim),
+        "build_agreement_complex called with mixed stalk dims; caller must \
+         classify_agreement_dims first (bead ley-line-open-659a39)",
+    );
 
     let mut cx = CellComplex::new(stalk_dim);
     let mut sources_by_node: Vec<String> = Vec::with_capacity(rows.len());
@@ -2757,6 +2766,35 @@ fn build_agreement_complex(
     Some((cx, sources_by_node))
 }
 
+/// Classify the stalk-dimensionality of a row set. Returns
+/// `Ok(Some(common_dim))` when every row shares the same non-zero dim,
+/// `Ok(None)` when there are no rows / every stalk is empty (no algebra
+/// possible — empty defects is a truthful answer), or
+/// `Err((source, dim, other_source, other_dim))` when two sources
+/// disagree on stalk dim — the load-bearing case ADR-0020 §3 is built
+/// for, per math-friend bead `ley-line-open-659a39`. The op surfaces
+/// the mismatch as an explicit error envelope rather than coercing to
+/// an empty-defects success.
+fn classify_agreement_dims(
+    rows: &[AgreementRow],
+) -> std::result::Result<Option<usize>, (String, usize, String, usize)> {
+    let mut anchor: Option<(&str, usize)> = None;
+    for row in rows {
+        let dim = row.stalk.len();
+        if dim == 0 {
+            continue;
+        }
+        match anchor {
+            None => anchor = Some((row.source.as_str(), dim)),
+            Some((src, expected)) if expected != dim => {
+                return Err((src.to_string(), expected, row.source.clone(), dim));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(anchor.map(|(_, d)| d))
+}
+
 /// `{"op":"agreement","token":"...","payload_kind":"..."}` — returns
 /// `{ok, token, payload_kind, coherence_defect, defects, source_count,
 /// provenance, certainty}`. Builds a degenerate CellComplex from the
@@ -2767,10 +2805,33 @@ fn op_agreement(ctx: &std::sync::Arc<DaemonContext>, req: &AgreementRequest) -> 
         let rows = query_agreement_observations(conn, &req.token, &req.payload_kind)?;
         let source_count = rows.len();
 
+        // Pre-classify stalk dims. Mismatch → explicit error envelope
+        // (bead `ley-line-open-659a39`): silently returning empty defects
+        // is wire-indistinguishable from "sources agree" and exactly
+        // wrong for ADR-0020 §3's heterogeneous-observer case.
+        let common_dim = match classify_agreement_dims(&rows) {
+            Ok(d) => d,
+            Err((src_a, dim_a, src_b, dim_b)) => {
+                return Ok(json!({
+                    "ok":             false,
+                    "error":          "incompatible_stalk_dims",
+                    "token":          req.token,
+                    "payload_kind":   req.payload_kind,
+                    "source_count":   source_count,
+                    "detail": format!(
+                        "source {src_a} stalk has dim {dim_a}; source {src_b} stalk has dim {dim_b}. \
+                         Agreement requires homogeneous stalk dims under V1 identity restrictions."
+                    ),
+                })
+                .to_string());
+            }
+        };
+
         // Build the complex (if possible) and run detect_violations.
-        // The single-source / empty / dim-mismatch cases short-circuit
-        // to an empty defects array — the op still returns OK because
-        // "no sources disagree" is a valid answer.
+        // The single-source / empty cases short-circuit to an empty
+        // defects array — the op still returns OK because "no sources
+        // disagree" is a valid answer.
+        let _ = common_dim;
         let (defects_json, coherence_defect): (Vec<serde_json::Value>, f32) =
             if let Some((cx, sources_by_node)) = build_agreement_complex(&rows) {
                 // Mechanical-reach: this is the load-bearing call into
@@ -5305,5 +5366,95 @@ mod tests {
         assert!(decode_inline_payload(&[0, 0, 0]).is_none());
         // Empty — also None (nothing to decode).
         assert!(decode_inline_payload(&[]).is_none());
+    }
+
+    /// Math-friend bead `ley-line-open-659a39` (HIGH). Two sources
+    /// emit stalks of different dims for the same `(token, payload_kind)`.
+    /// Pre-fix: op silently returned `{ok:true, source_count:2, defects:[],
+    /// coherence_defect:0}` — wire-indistinguishable from "sources agree."
+    /// Post-fix: op returns `{ok:false, error:"incompatible_stalk_dims", detail:...}`.
+    #[tokio::test]
+    async fn agreement_dim_mismatch_returns_explicit_error() {
+        let (_dir, ctx) = setup();
+        insert_observation(
+            &ctx,
+            "tree-sitter",
+            "code.symbol_def",
+            "sym:Foo",
+            &[1.0, 2.0, 3.0],
+            1_000,
+        );
+        insert_observation(
+            &ctx,
+            "git",
+            "code.symbol_def",
+            "sym:Foo",
+            &[1.0, 2.0, 3.0, 4.0],
+            1_001,
+        );
+
+        let response = handle_base_op_legacy(
+            &ctx,
+            "agreement",
+            &json!({"token": "sym:Foo", "payload_kind": "code.symbol_def"}),
+        )
+        .expect("op recognized");
+        let v: serde_json::Value = serde_json::from_str(&response).expect("valid json");
+
+        assert_eq!(v["ok"], json!(false), "must NOT coerce to ok=true; got {v}");
+        assert_eq!(v["error"], json!("incompatible_stalk_dims"));
+        assert_eq!(v["source_count"], json!(2));
+        let detail = v["detail"].as_str().expect("detail string");
+        assert!(
+            detail.contains("dim 3"),
+            "detail must cite first dim: {detail}"
+        );
+        assert!(
+            detail.contains("dim 4"),
+            "detail must cite second dim: {detail}"
+        );
+    }
+
+    #[test]
+    fn classify_agreement_dims_handles_empty_single_and_mixed() {
+        // Empty → Ok(None) (no rows, no algebra)
+        assert!(matches!(classify_agreement_dims(&[]), Ok(None)));
+
+        // Single row → Ok(Some(dim))
+        let single = vec![AgreementRow {
+            source: "a".into(),
+            stalk: vec![1.0, 2.0, 3.0],
+        }];
+        assert!(matches!(classify_agreement_dims(&single), Ok(Some(3))));
+
+        // Multi same dim → Ok(Some(dim))
+        let homo = vec![
+            AgreementRow {
+                source: "a".into(),
+                stalk: vec![1.0, 2.0],
+            },
+            AgreementRow {
+                source: "b".into(),
+                stalk: vec![3.0, 4.0],
+            },
+        ];
+        assert!(matches!(classify_agreement_dims(&homo), Ok(Some(2))));
+
+        // Multi mismatched → Err
+        let mixed = vec![
+            AgreementRow {
+                source: "a".into(),
+                stalk: vec![1.0, 2.0],
+            },
+            AgreementRow {
+                source: "b".into(),
+                stalk: vec![1.0, 2.0, 3.0],
+            },
+        ];
+        let err = classify_agreement_dims(&mixed).unwrap_err();
+        assert_eq!(err.0, "a");
+        assert_eq!(err.1, 2);
+        assert_eq!(err.2, "b");
+        assert_eq!(err.3, 3);
     }
 }

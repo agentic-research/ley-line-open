@@ -4,6 +4,15 @@ version = "0.4.5"
 edition = "2024"
 description = "Čech cohomology engine: sheaf cache, coboundary operators, structural invalidation"
 
+[features]
+# Test-only mechanical-reach spies for ADR-0020 falsifiability gates.
+# Adds an atomic counter inside `CellComplex::detect_violations` so
+# downstream tests (notably the L10 `agreement` op Gate 3 test in
+# `leyline-cli-lib`) can assert the op actually invoked the sheaf
+# algebra rather than short-circuiting. Off by default — release
+# builds pay nothing.
+test-spy = []
+
 [dependencies]
 nalgebra = "0.35"
 sha2 = "0.11"

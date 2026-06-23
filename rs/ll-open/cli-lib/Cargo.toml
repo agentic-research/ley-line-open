@@ -69,6 +69,11 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 rusqlite = { version = "0.39", features = ["bundled", "serialize"] }
 leyline-core = { path = "../../ll-core/core" }
 bytemuck = { version = "1.14", features = ["derive"] }
+# Mechanical-reach spy for the L10 `agreement` op (ADR-0020 §3 Gate 3).
+# Re-enables `leyline-sheaf` with its `test-spy` feature so the dev
+# build sees `DETECT_VIOLATIONS_REACH_COUNT`. The production cdylib
+# does NOT pull this feature (release builds stay zero-cost).
+leyline-sheaf = { path = "../sheaf", features = ["test-spy"] }
 # `tower::ServiceExt::oneshot` for the MCP auth middleware end-to-end
 # tests (daemon::auth::tests). Production uses tower transitively
 # through axum's middleware stack; this dev-dep exposes the trait

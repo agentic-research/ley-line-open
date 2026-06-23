@@ -113,6 +113,7 @@ pub const BASE_OP_NAMES: &[&str] = &[
     "at_position",
     "inspect_neighborhood",
     "search_symbols",
+    "agreement",
 ];
 
 // ---------------------------------------------------------------------------
@@ -268,6 +269,13 @@ pub enum BaseRequest {
     /// line carries `{symbol_id, node_id, source_id, kind,
     /// provenance, certainty}`. Read-only.
     SearchSymbols(SearchSymbolsRequest),
+    /// Cross-source observation agreement (ley-line-open-c8090f,
+    /// L10; ADR-0020 §3 Gate 3). For a given `(token, payload_kind)`,
+    /// loads each source's observation, builds a degenerate 2-node
+    /// `CellComplex` with identity restrictions, runs
+    /// `detect_violations`, and returns `coherence_defect` + per-pair
+    /// `defects`. Read-only.
+    Agreement(AgreementRequest),
 }
 
 #[cfg(feature = "vec")]
@@ -487,6 +495,34 @@ pub struct SearchSymbolsRequest {
 
 fn default_search_limit() -> u32 {
     100
+}
+
+// ---------------------------------------------------------------------------
+// Cross-source agreement request (ADR-0020 §3 / bead ley-line-open-c8090f).
+//
+// `token` is the mention-string the observation cited (per ADR-0020 §1
+// the `observation` table's `mentions` JSON column carries observer-
+// emitted stable tokens).
+//
+// `payload_kind` is the registry key from ley-line-open-503971's typed-
+// payload registry — for L10 this is opaque (the registry isn't shipped
+// yet); the op handler treats it purely as a SQL filter.
+//
+// v1 simplifications:
+// - No `window_ms` / time filter — every observation matching
+//   `(token, payload_kind)` participates regardless of age.
+// - No filter on `source` — caller gets every source the observation
+//   table has for this `(token, payload_kind)`.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Debug)]
+pub struct AgreementRequest {
+    /// Observer-emitted stable token (per ADR-0020 §1). Looked up
+    /// against the `observation.mentions` JSON array via `json_each`.
+    pub token: String,
+    /// Typed-payload registry key (per ADR-0020 §1, ley-line-open-503971).
+    /// SQL-level equality filter on `observation.payload_kind`.
+    pub payload_kind: String,
 }
 
 // ---------------------------------------------------------------------------

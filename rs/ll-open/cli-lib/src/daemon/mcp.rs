@@ -273,6 +273,11 @@ pub fn tool_registry() -> Vec<McpTool> {
             }),
         },
         McpTool {
+            name: "at_position",
+            description: "Position → symbol_id translation (ADR-0016 §1). Returns `{ok, symbol_id, kind, node_kind}` for the smallest enclosing definition at `(file, line, col)`, or `{ok, symbol_id: null, kind: \"unknown\"}` when the position lies inside no definition. Editor consumers feed the returned `symbol_id` into `inspect_symbol` to get the full bundle. Read-only.",
+            schema: position_schema(),
+        },
+        McpTool {
             name: "sheaf_set_topology",
             description: "Set the sheaf cache's community structure: regions (content-hash stalks, optionally with f32 stalk vectors for δ⁰ mode) and restriction edges (boundary hash + co-change rate + per-dim weights, optionally with agreement_dim for δ⁰ mode). Pass `node_stalk_dim > 0` AND f32 `data` on every region AND `agreement_dim > 0` on every restriction to engage δ⁰-driven invalidation.",
             schema: json!({
@@ -486,6 +491,7 @@ pub fn cloister_groups() -> Vec<CloisterGroupDecl> {
                 "get_db_path",
                 "get_node",
                 "inspect_symbol",
+                "at_position",
             ],
         },
         // Wire-compat handshake. Single-tool group so the version

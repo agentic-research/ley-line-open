@@ -181,6 +181,7 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
         #[cfg(feature = "hdc")]
         BaseRequest::HdcDensity(r) => op_hdc_density(ctx, &r),
         BaseRequest::InspectSymbol(r) => op_inspect_symbol(ctx, &r),
+        BaseRequest::AtPosition(p) => op_at_position(ctx, &p),
     };
     result.unwrap_or_else(|e| {
         build_error_response(&format!("{e:#}"))
@@ -2196,6 +2197,68 @@ fn classify_node_kind(node_kind: &str) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// at_position — position → symbol_id translation (bead ley-line-open-c2e602,
+// L2 of the agent-first surface decomp; ADR-0016 §1).
+//
+// Editor consumers have a cursor; agents have a name. ADR-0016 §1 picks
+// symbol-keyed as the default and makes position-keyed an explicit
+// translation hop. This op is that hop: (file, line, col) → smallest
+// enclosing definition's token → (symbol_id, kind). The caller can
+// then feed `symbol_id` into `inspect_symbol` and get the full bundle.
+//
+// Read-only — NOT in STATE_CHANGING_OPS.
+// ---------------------------------------------------------------------------
+
+/// `{"op":"at_position", "file":"...", "line":N, "col":N}` —
+/// returns `{ ok, symbol_id, kind }` for the smallest enclosing
+/// definition at the given position, or
+/// `{ ok: true, symbol_id: null, kind: "unknown" }` when the
+/// position lies inside no recognized definition. The null-symbol
+/// shape is intentional: a position without a definition is a
+/// legitimate query result, not an error.
+fn op_at_position(ctx: &std::sync::Arc<DaemonContext>, p: &LspPosition) -> Result<String> {
+    let file = normalize_file_uri(&p.file).to_string();
+    let line = p.line;
+    let col = p.col;
+    with_live_db(ctx, |conn| {
+        // Smallest enclosing definition at the position. Joining
+        // node_defs against _ast pulls the symbol's token directly,
+        // skipping the intermediate node_id resolution step that
+        // `find_node_at_position` (the LSP-hover internal helper)
+        // would otherwise force.
+        let sql = "\
+            SELECT d.token, a.node_kind \
+            FROM node_defs d \
+            JOIN _ast a ON a.node_id = d.node_id AND a.source_id = d.source_id \
+            WHERE a.source_id = ?1 \
+              AND a.start_row <= ?2 AND a.end_row >= ?2 \
+              AND (a.start_row < ?2 OR a.start_col <= ?3) \
+              AND (a.end_row > ?2 OR a.end_col >= ?3) \
+            ORDER BY (a.end_byte - a.start_byte) ASC \
+            LIMIT 1";
+        let row: Option<(String, String)> =
+            query_row_opt(conn, sql, rusqlite::params![file, line, col], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+        match row {
+            Some((token, node_kind)) => Ok(json!({
+                "ok": true,
+                "symbol_id": token,
+                "kind": classify_node_kind(&node_kind),
+                "node_kind": node_kind,
+            })
+            .to_string()),
+            None => Ok(json!({
+                "ok": true,
+                "symbol_id": serde_json::Value::Null,
+                "kind": "unknown",
+            })
+            .to_string()),
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2293,6 +2356,7 @@ mod tests {
             #[cfg(feature = "hdc")]
             "hdc_density",
             "inspect_symbol",
+            "at_position",
         ] {
             assert!(
                 !is_state_changing(op),
@@ -3923,5 +3987,123 @@ mod tests {
         assert_eq!(classify_node_kind("const_declaration"), "constant");
         assert_eq!(classify_node_kind("not_a_real_kind"), "unknown");
         assert_eq!(classify_node_kind(""), "unknown");
+    }
+
+    // ── at_position (bead ley-line-open-c2e602 / L2) ───────────────────
+
+    /// Position with NO enclosing definition → ok=true with
+    /// `symbol_id: null`. Pins the "no symbol here is not an error"
+    /// contract — editors hover blank areas all the time.
+    #[tokio::test]
+    async fn at_position_empty_db_returns_null_symbol() {
+        let (_dir, ctx) = setup();
+        let response = handle_base_op_legacy(
+            &ctx,
+            "at_position",
+            &json!({"file": "anything.go", "line": 1, "col": 1}),
+        )
+        .expect("at_position op should be dispatched");
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["symbol_id"], json!(null));
+        assert_eq!(v["kind"], json!("unknown"));
+    }
+
+    /// Position INSIDE a definition's byte range → returns the
+    /// definition's token + classified kind. Smallest-enclosing
+    /// preference is enforced when nested definitions overlap.
+    #[tokio::test]
+    async fn at_position_inside_definition_returns_token() {
+        let (_dir, ctx) = setup();
+        {
+            let live = ctx.live_db.lock().unwrap();
+            // SendOp covers rows 5–15; an inner Helper definition
+            // covers rows 7–9 (smaller — should win at row 8).
+            live.execute_batch(
+                "INSERT INTO node_defs (token, node_id, source_id) VALUES \
+                   ('SendOp', 'pkg/SendOp', 'pkg.go'),
+                   ('Helper', 'pkg/Helper', 'pkg.go');
+                 INSERT INTO _ast (node_id, source_id, node_kind, \
+                                   start_byte, end_byte, start_row, start_col, \
+                                   end_row, end_col) VALUES \
+                   ('pkg/SendOp', 'pkg.go', 'function_declaration', \
+                    100, 500, 5, 0, 15, 1),
+                   ('pkg/Helper', 'pkg.go', 'function_declaration', \
+                    150, 250, 7, 0, 9, 1);",
+            )
+            .expect("seed test data");
+        }
+
+        // Row 12 is outside Helper but inside SendOp → SendOp wins.
+        let response = handle_base_op_legacy(
+            &ctx,
+            "at_position",
+            &json!({"file": "pkg.go", "line": 12, "col": 5}),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["symbol_id"], json!("SendOp"));
+        assert_eq!(v["kind"], json!("function"));
+        assert_eq!(v["node_kind"], json!("function_declaration"));
+
+        // Row 8 is inside Helper (smaller range than SendOp).
+        // Smallest-enclosing pick should return Helper.
+        let response = handle_base_op_legacy(
+            &ctx,
+            "at_position",
+            &json!({"file": "pkg.go", "line": 8, "col": 2}),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            v["symbol_id"],
+            json!("Helper"),
+            "smallest-enclosing should pick Helper; got {v}",
+        );
+    }
+
+    /// at_position → inspect_symbol composition: the symbol_id
+    /// returned by at_position is exactly the input inspect_symbol
+    /// expects. Pins that the two ops compose (otherwise the
+    /// translation hop ADR-0016 §1 commits to doesn't actually work).
+    #[tokio::test]
+    async fn at_position_output_is_inspect_symbol_input() {
+        let (_dir, ctx) = setup();
+        {
+            let live = ctx.live_db.lock().unwrap();
+            live.execute_batch(
+                "INSERT INTO node_defs (token, node_id, source_id) VALUES \
+                   ('Foo', 'pkg/Foo', 'pkg.go');
+                 INSERT INTO _ast (node_id, source_id, node_kind, \
+                                   start_byte, end_byte, start_row, start_col, \
+                                   end_row, end_col) VALUES \
+                   ('pkg/Foo', 'pkg.go', 'function_declaration', \
+                    0, 100, 1, 0, 10, 1);",
+            )
+            .expect("seed test data");
+        }
+
+        // Step 1: at_position → symbol_id
+        let response = handle_base_op_legacy(
+            &ctx,
+            "at_position",
+            &json!({"file": "pkg.go", "line": 5, "col": 5}),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let symbol_id = v["symbol_id"].as_str().expect("symbol_id present");
+
+        // Step 2: inspect_symbol → bundle
+        let response =
+            handle_base_op_legacy(&ctx, "inspect_symbol", &json!({"symbol_id": symbol_id}))
+                .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["symbol_id"], json!("Foo"));
+        // Bundle should resolve back to the same definition.
+        let defs = v["definitions"].as_array().unwrap();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0]["node_id"], json!("pkg/Foo"));
     }
 }

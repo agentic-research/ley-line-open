@@ -71,7 +71,8 @@
             "get_node",
             "inspect_symbol",
             "at_position",
-            "inspect_neighborhood"
+            "inspect_neighborhood",
+            "search_symbols"
           ]
         },
         {

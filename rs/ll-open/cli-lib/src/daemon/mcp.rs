@@ -291,6 +291,19 @@ pub fn tool_registry() -> Vec<McpTool> {
             }),
         },
         McpTool {
+            name: "search_symbols",
+            description: "GLOB-pattern symbol search streamed as NDJSON (ADR-0016 §6). Returns one JSON object per matched `node_defs.token` line — `{symbol_id, node_id, source_id, kind, provenance, certainty}` — terminated by `\\n`. Zero matches → empty body (NOT `\"\\n\"`, NOT `\"[]\"`). `pattern` is a SQL GLOB (`*` runs, `?` single char, `[abc]` class). `limit` default 100. Optional `kind` filters by classify category (`function` | `method` | `type` | `variable` | `constant`). v1 buffers all lines in one response; true chunked streaming is a follow-up. Read-only.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "SQL GLOB matched against node_defs.token."},
+                    "limit":   {"type": "integer", "description": "Max matched rows. Default 100."},
+                    "kind":    {"type": "string",  "description": "Optional classify_node_kind filter."}
+                },
+                "required": ["pattern"]
+            }),
+        },
+        McpTool {
             name: "sheaf_set_topology",
             description: "Set the sheaf cache's community structure: regions (content-hash stalks, optionally with f32 stalk vectors for δ⁰ mode) and restriction edges (boundary hash + co-change rate + per-dim weights, optionally with agreement_dim for δ⁰ mode). Pass `node_stalk_dim > 0` AND f32 `data` on every region AND `agreement_dim > 0` on every restriction to engage δ⁰-driven invalidation.",
             schema: json!({
@@ -506,6 +519,7 @@ pub fn cloister_groups() -> Vec<CloisterGroupDecl> {
                 "inspect_symbol",
                 "at_position",
                 "inspect_neighborhood",
+                "search_symbols",
             ],
         },
         // Wire-compat handshake. Single-tool group so the version

@@ -103,6 +103,12 @@ pub const BASE_OP_NAMES: &[&str] = &[
     "text_search",
     #[cfg(feature = "validate")]
     "validate",
+    #[cfg(feature = "hdc")]
+    "hdc_search",
+    #[cfg(feature = "hdc")]
+    "hdc_calibrate",
+    #[cfg(feature = "hdc")]
+    "hdc_density",
 ];
 
 // ---------------------------------------------------------------------------
@@ -219,6 +225,22 @@ pub enum BaseRequest {
     /// drop its CGO tree-sitter link. Read-only (NOT in STATE_CHANGING_OPS).
     #[cfg(feature = "validate")]
     Validate(ValidateRequest),
+    /// HDC structural-similarity search (ley-line-open-c32596).
+    /// Parses + encodes the query content into a hypervector and runs
+    /// `radius_search` against the `_hdc` table. Read-only.
+    #[cfg(feature = "hdc")]
+    HdcSearch(HdcSearchRequest),
+    /// HDC radius baseline calibration (ley-line-open-c32596).
+    /// Computes median + MAD over `_hdc` row distances per layer; writes
+    /// to `_hdc_baseline`. Read-only with respect to the projected db
+    /// (only touches HDC sidecar tables).
+    #[cfg(feature = "hdc")]
+    HdcCalibrate(HdcCalibrateRequest),
+    /// HDC density count (ley-line-open-c32596). `radius_search` without
+    /// pulling row data — just the count of scopes within Hamming radius.
+    /// Read-only.
+    #[cfg(feature = "hdc")]
+    HdcDensity(HdcDensityRequest),
 }
 
 #[cfg(feature = "vec")]
@@ -276,6 +298,75 @@ pub struct ValidateRequest {
     /// Used when the caller has a path but not an explicit language id.
     #[serde(default)]
     pub path: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// HDC request shapes. Three ops:
+//
+//   hdc_search    — parse + encode `content`, return scopes within
+//                   Hamming radius of the query HV. Read-only.
+//   hdc_calibrate — recompute per-layer baseline (median + MAD) over
+//                   the existing _hdc rows. Read-only wrt projected db.
+//   hdc_density   — count of scopes within radius, no row data. Read-only.
+//
+// Supported `language` ids are the intersection of leyline-hdc's
+// CanonicalKindMap impls and leyline-ts's TsLanguage variants: today
+// `go`, `rust`, `json`, `yaml`. Unsupported languages return a
+// structured error. The encoder uses tree-sitter via leyline-ts to
+// parse, then leyline-hdc's canonical-kind alphabet to encode.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "hdc")]
+#[derive(Deserialize, Debug)]
+pub struct HdcSearchRequest {
+    /// UTF-8 source content to encode and search.
+    pub content: String,
+    /// Language id: one of "go" | "rust" | "json" | "yaml". Other
+    /// languages return a structured "unsupported HDC language" error
+    /// — adding support means adding both a leyline-ts `TsLanguage`
+    /// variant and a leyline-hdc `CanonicalKindMap` impl.
+    pub language: String,
+    /// Maximum Hamming distance (bit-flip count) to include. Default 100
+    /// is a small fraction of D_BITS=8192; tighten for stricter matches,
+    /// loosen for fuzzier nearest-neighbour browsing.
+    #[serde(default = "default_hdc_max_distance")]
+    pub max_distance: u32,
+    /// Max number of results. Default 10.
+    #[serde(default = "default_hdc_k")]
+    pub k: u32,
+}
+
+#[cfg(feature = "hdc")]
+#[derive(Deserialize, Debug, Default)]
+pub struct HdcCalibrateRequest {
+    /// Sample size per layer for baseline calibration. Default 1000.
+    /// Layers with fewer than 2 rows are skipped.
+    #[serde(default = "default_hdc_calibrate_sample")]
+    pub sample_size: usize,
+}
+
+#[cfg(feature = "hdc")]
+#[derive(Deserialize, Debug)]
+pub struct HdcDensityRequest {
+    pub content: String,
+    pub language: String,
+    #[serde(default = "default_hdc_max_distance")]
+    pub max_distance: u32,
+}
+
+#[cfg(feature = "hdc")]
+fn default_hdc_max_distance() -> u32 {
+    100
+}
+
+#[cfg(feature = "hdc")]
+fn default_hdc_k() -> u32 {
+    10
+}
+
+#[cfg(feature = "hdc")]
+fn default_hdc_calibrate_sample() -> usize {
+    1000
 }
 
 // ---------------------------------------------------------------------------

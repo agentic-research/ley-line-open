@@ -4,7 +4,7 @@ version = "0.4.5"
 edition = "2024"
 
 [features]
-default = ["lsp", "validate"]
+default = ["lsp", "validate", "hdc"]
 lsp = ["dep:leyline-lsp"]
 # Tree-sitter syntactic validation surface exposed as a daemon op for
 # mache's writeback path (ley-line-open-fa8638). Pulls leyline-fs's
@@ -13,7 +13,12 @@ lsp = ["dep:leyline-lsp"]
 validate = ["leyline-fs/validate"]
 mount = ["leyline-fs/nfs", "leyline-fs/fuse", "leyline-fs/validate"]
 vec = ["dep:sqlite-vec"]
-hdc = ["dep:leyline-hdc"]
+# HDC structural-equivalence surface exposed as daemon ops
+# (ley-line-open-c32596). Pulls leyline-hdc + leyline-ts's `rust`
+# feature (HDC's RustCanonicalMap pairs with tree-sitter-rust). Default-
+# on so the ops are always reachable when querying; the substrate side
+# (populating _hdc rows) is a separate enrichment-pass concern.
+hdc = ["dep:leyline-hdc", "leyline-ts/rust"]
 # Wires the text_search daemon op. Base cli-lib defaults to NullEngine
 # (structured "no backend" error); private extensions install a real
 # engine — e.g. WitchcraftEngine — via DaemonExt::text_search_engine().
@@ -26,7 +31,7 @@ leyline-lsp = { path = "../lsp", optional = true }
 leyline-hdc = { path = "../hdc", optional = true }
 leyline-text-search = { path = "../text-search", optional = true }
 leyline-sheaf = { path = "../sheaf" }
-leyline-ts = { path = "../ts", features = ["html", "markdown", "json", "yaml", "go", "python", "elixir", "hcl"] }
+leyline-ts = { path = "../ts", features = ["html", "markdown", "json", "yaml", "go", "python", "elixir", "hcl", "rust"] }
 leyline-schema = { path = "../../ll-core/schema" }
 leyline-schema-capnp = { path = "../../ll-core/schema-capnp" }
 leyline-public-schema = { path = "../../ll-core/public-schema" }

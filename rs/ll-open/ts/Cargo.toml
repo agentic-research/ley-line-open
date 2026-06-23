@@ -16,6 +16,10 @@ elixir = ["dep:tree-sitter-elixir"]
 # Maintained at tree-sitter-grammars/tree-sitter-hcl. Mache uses this for
 # infra-as-code scans alongside the existing language set.
 hcl = ["dep:tree-sitter-hcl"]
+# Rust grammar — added 2026-06-22 alongside HDC daemon op wiring
+# (ley-line-open-c32596). leyline-hdc ships a RustCanonicalMap; HDC
+# search ops need tree-sitter-rust to encode Rust query inputs.
+rust = ["dep:tree-sitter-rust"]
 pyproject = ["dep:uv-pep508", "dep:uv-pep440", "dep:uv-normalize", "dep:toml"]
 
 [dependencies]
@@ -28,6 +32,7 @@ tree-sitter-go = { version = "0.25", optional = true }
 tree-sitter-python = { version = "0.25", optional = true }
 tree-sitter-elixir = { version = "0.3.5", optional = true }
 tree-sitter-hcl = { version = "1", optional = true }
+tree-sitter-rust = { version = "0.24", optional = true }
 leyline-schema = { path = "../../ll-core/schema" }
 rusqlite = { version = "0.39", features = ["bundled", "serialize"] }
 serde_json = "1"

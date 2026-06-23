@@ -84,6 +84,15 @@
           "upstreamNames": [
             "validate"
           ]
+        },
+        {
+          "name": "hdc",
+          "advertisedPrefix": "hdc_",
+          "upstreamNames": [
+            "hdc_search",
+            "hdc_calibrate",
+            "hdc_density"
+          ]
         }
       ]
     }

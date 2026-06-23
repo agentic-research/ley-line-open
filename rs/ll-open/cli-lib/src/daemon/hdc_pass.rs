@@ -6,7 +6,10 @@
 //! is what turns "tree-sitter named children" into "canonical-kind tree
 //! with sorted child kinds."
 //!
-//! Feature-gated behind `hdc`.
+//! Consumed by `daemon::ops::op_hdc_search` / `op_hdc_density` (bead
+//! `ley-line-open-c32596`). The bridge is reachable when cli-lib is
+//! built with its default `hdc` feature — the `leyline-hdc` types
+//! transitively flow in through that feature.
 
 use tree_sitter::{Language, Node, Parser};
 

@@ -10,7 +10,183 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
-Nothing yet — post-v0.4.5 changes land here.
+Nothing yet — post-v0.5.0 changes land here.
+
+## [0.5.0] — 2026-06-24
+
+Minor bump: HDC encoder underwent a full substrate-identity rewrite
+across four interdependent pieces, and the agent-first semantic
+surface (ADR-0016 + ADR-0020) decomposition shipped end-to-end. **All
+persisted `_hdc` rows from prior versions are invalid** — encoder
+output changed; re-encode on first run. **Wire shape for
+`hdc_search` / `hdc_density` changed** — results carry `{score,
+matched_stmts, min_distance}` per row plus top-level
+`total_query_stmts`, replacing the old `{distance}` shape.
+
+### Substrate-identity rewrite — HDC at function granularity is now graded
+
+Headline: PRs #94 + #98 + #99 + #100 (beads `ley-line-open-7b5086`
+and `ley-line-open-98ac42`). Phase 1 retrieval went from "binary
+equality oracle, near-similar pairs saturate at D/2" to graded
+structural+lexical similarity at function granularity.
+
+Four pieces, all interdependent:
+
+- **Bundle composition** (#98) — replaces XOR-bind composition with
+  majority-bundle. XOR-bind was similarity-perfect-transmitting;
+  bundle dampens per-level PRG randomness so structural edit distance
+  shows up as Hamming distance.
+- **Drop `content_role`** (#98) — second fresh-PRG draw per node;
+  hurt the same way fingerprint-keyed `base_vector` switching did.
+  Retired together with the unbind algebra.
+- **fp-quantize `base_vector`** (#99) — drops `child_count +
+  sorted_child_discs` from the signature bytes; 35 distinct base
+  vectors total. Child-kind info enters via the bundle composition
+  over children. `ModuleCodebook` keeps child-kind bytes inline
+  because module-level encoding doesn't recurse into bodies.
+- **Seeded leaves** (#100) — token-bearing leaves
+  (identifiers/literals/primitive types) carry their byte text in
+  `EncoderNode::leaf_content`. Encoder produces char-trigram bundle
+  HVs at those leaves. `Ref("getName")` measurably closer to
+  `Ref("getEmail")` than to `Ref("xyzqqq")`.
+
+Substrate trade-off documented in `phase_1_hdc_retrieval.rs`: the new
+encoder blends structural + lexical similarity. Two functions with
+shared identifiers can rank closer than two with shared structure but
+disjoint identifiers. Real-world blend correctness is the open
+Phase 0B question (recall@K vs hand-built ground truth).
+
+#### Retired with the rewrite
+
+- `query::unbind_child_at_position` — no exact-recovery unbind under
+  majority bundle without an explicit cleanup-memory codebook.
+- `query::explain_cluster_centroid` — depended on unbind algebra.
+- Math-friend's Merkle-reversibility property from PR #94 — bundle
+  isn't invertible.
+
+#### Math gates re-shaped, not relaxed
+
+`gate_discriminability_near_clones_collapse`: threshold
+`median/4 → median × 0.7`. The property is now "near-clones cluster
+measurably below random pairs," not "near-clones collapse to identical
+HV." Substrate-identity shift, not moved goalpost — the old threshold
+was correct for kind-only encoding, not for token-aware encoding.
+
+`validation_gate_full_stack_on_real_go`: identifier-renamed Type-2
+clones cluster at d ~885 instead of collapsing to identical HVs. Test
+checks the cluster property (d < 2000) rather than exact identity.
+
+### Falsifiability infrastructure — Phase 0 / 0B / 0C / 1 / 1C
+
+Five characterization tests under `rs/ll-open/cli-lib/tests/`, all
+`#[ignore]`-gated. Reproduce per each test's docstring.
+
+- **Phase 0** (#91) — synthetic HDC popcount vs vec cosine sim
+  throughput. HDC popcount **9.16× faster per pair than naive vec
+  cosine** in release at N=10,000 (Apple Silicon).
+- **Phase 0B** (#92, re-measured post-rewrite) — Jaccard@K agreement
+  on real corpus. **Mean Jaccard@9 went from 0.037 (≈ random under
+  old XOR-bind encoder) → 0.234 (partial overlap under the new
+  substrate).** The substrate-identity rewrite turned HDC from
+  "binary equality oracle that happened to be orthogonal-to-vec
+  because both were measuring different unrelated things" to "graded
+  similarity that overlaps with vec's lexical signal because seeded
+  leaves brought lexical signal into HDC."
+- **Phase 0C** (#94, re-measured post-rewrite) — mutual information
+  on full rank vectors with closed-form null distribution. **Observed
+  MI went from 0.049 nats / 1.2σ above null (degenerate) → 0.072 nats
+  / 4.35σ above null (statistically significant signal).** Fraction
+  of theoretical max only 3.13% — the agreement is meaningful but
+  loose. Neither redundant nor orthogonal: backends order the corpus
+  correlatedly but not identically. Whether this means HDC is adding
+  value over vec or just being a noisier proxy of it requires ground
+  truth (Phase 0B-real, recall@K vs hand-built answers).
+- **Phase 1** (#95, updated #100) — load-bearing characterization.
+  Originally documented saturation (SUM_A↔SUM_B at d=4115).
+  Post-rewrite, assertions inverted: now passes with `SUM_A → top-3
+  includes SUM_B at d=6`, `MATCH_A → top-5 includes MATCH_B`.
+- **Phase 1C** (#96, obsolete #100) — statement-level set-overlap
+  workaround. Bundle composition fixed the underlying problem at the
+  encoder level, making the workaround unnecessary.
+
+### Agent-first semantic surface — ADR-0016 + ADR-0020 (L1–L10)
+
+Ten beads shipped end-to-end (#82–#89), closing
+`docs/problems/agent-first-semantic-surface.md`.
+
+- **L1 (#82, `c2c4d9`)**: `inspect_symbol(symbol_id) → Bundle` —
+  ADR-0016 §2 spine op. Definitions + hover + refs + callers +
+  callees + freshness in one round-trip.
+- **L2 (#83, `c2e602`)**: `at_position(file, line, col) → {symbol_id, kind}`
+  — ADR-0016 §1 editor bridge.
+- **L3 (#85, `c77690`)**: `inspect_neighborhood(id, depth,
+  edge_kinds, max_bytes)` — ADR-0016 §5. Focal bundle + N-hop
+  neighborhood with depth + byte-budget bounds.
+- **L4 (#86, `c79953`)**: `search_symbols(pattern, limit, kind?)`
+  NDJSON op — ADR-0016 §6 streaming search over `node_defs.token`.
+- **L7 (#84, `c3555f`)**: provenance + certainty on inspect_symbol
+  bundles — consumers can filter by source-trust.
+- **L8 (#87, `c7c79a`)**: `observation` SQL table + SessionObservation
+  Pass — ADR-0020 §1 Gate 1. Populates from Claude Code session JSONL.
+- **L9 (#88, `c7eae2`)**: ComplexBuildPass — ADR-0020 §2 Gate 2.
+  Builds `CellComplex` + drives `CoChangeTracker` over `observation`
+  rows. Spy-verified mechanical reach.
+- **L10 (#89, `c8090f`)**: `agreement` op via `detect_violations` —
+  ADR-0020 §3 Gate 3. Returns `coherence_defect` + per-pair `defects`.
+
+Plus post-merge math-friend hardening (#90, bead `659a39`):
+- HIGH: silent dim-mismatch in agreement op — fixed via explicit
+  `{ok:false, error:"incompatible_stalk_dims"}` envelope.
+- MED: Gate 3 spy counter placement — moved past the algebra so it
+  proves math ran, not just function called.
+- LOW: Gate 2 vacuous-pass via `nnz(δ⁰) > 0` — tightened with
+  `detect_violations().is_empty() == false`.
+
+### Rust defs / refs / imports — extract_rust
+
+**#93 (bead `ley-line-open-117693`)** — closes the gap where
+`node_defs` stayed empty for Rust files because `extract_refs` was
+Go-only. Mache and other consumers can now treat Rust corpora the same
+way they treat Go.
+
+Coverage: `function_item`, `function_signature_item`, `struct_item`,
+`enum_item`, `union_item`, `trait_item`, `type_item`, `mod_item`,
+`const_item`, `static_item`. Call refs (bare / method / scoped —
+scoped emits both qualified and bare). Macro invocations. `use_declaration`
+(bare/scoped/aliased/list/nested-list). Wildcards intentionally skipped.
+
+### HDC ops wired + populate pass
+
+- **`hdc_search` / `hdc_density` / `hdc_calibrate` daemon ops** (#79,
+  bead `c32596`) — math-friend-reviewed wiring of the HDC retrieval
+  surface.
+- **`HdcEnrichmentPass`** (#81, bead `641809`) — function-level
+  populate pass with math-gate test coverage.
+
+### FastEmbedder for the `vec` backend
+
+**#91** — `fastembed = "5"` (BGESmallENV15 / MiniLM-L6, 384-dim) as a
+real `Embedder` impl. Replaces `ZeroEmbedder` for callers opting into
+vec retrieval. Three contract tests gated `#[ignore]` (the ONNX model
+is a 22MB download).
+
+### Claude Code plugin wrapper
+
+**#78 (bead `cloister-acbf27`)** — Claude Code plugin under
+`wrappers/claude-code/` that watches session JSONL transcripts and
+emits stale-sync events to the daemon.
+
+### CI optimization
+
+**#74** — Swatinem rust-cache + main-only `test:perf` gate. PR CI
+~6.5 min → ~1-2 min on cache hits.
+
+### Version sync fix
+
+All Cargo.toml versions bumped `0.4.5 → 0.5.0`. The version was
+drifting in-tree across v0.4.6/v0.4.7/v0.4.8 tags; this release fixes
+the drift so `BINARY_VERSION` (read from `CARGO_PKG_VERSION` at build
+time) matches the tag.
 
 ## [0.4.5] — 2026-05-19
 

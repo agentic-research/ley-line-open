@@ -236,8 +236,10 @@ fn phase_1_hdc_characterization() {
     // ── 2. STRUCTURAL DISTINCTION (what works) ───────────────────────
     //
     // A trivial leaf function and a complex multi-block function
-    // should be far apart. They are. Not really a test of HDC's
-    // discrimination — random would also separate them.
+    // should be far apart in distance ranking — farther than any
+    // near-similar pair. Under bundle composition (bead 7b5086) the
+    // absolute distance is smaller than D/2 (bundle dampens) but the
+    // RELATIVE ORDER holds.
 
     println!("─── Test 2: structural distinction (large size delta) ───");
     let d_tri_complex = dist(&trivial, &complex);
@@ -245,47 +247,59 @@ fn phase_1_hdc_characterization() {
     println!("  d(TRIVIAL, COMPLEX) = {d_tri_complex}");
     println!("  d(TRIVIAL, PARSE_A) = {d_tri_parse_a}");
     assert!(
-        d_tri_complex > 3500,
-        "TRIVIAL and COMPLEX must be structurally far apart"
+        d_tri_complex > 500,
+        "TRIVIAL and COMPLEX must be measurably distant under bundle composition; got {d_tri_complex}"
     );
-    println!("  ✓ trivial-vs-complex: distance near random baseline (D/2 = 4096)\n");
+    println!(
+        "  ✓ trivial-vs-complex: graded distance ~{d_tri_complex} (bundle-dampened, not D/2)\n"
+    );
 
-    // ── 3. NEAR-SIMILAR PAIRS (what DOES NOT work) ───────────────────
+    // ── 3. NEAR-SIMILAR PAIRS — INVERTED post bead 7b5086 ────────────
     //
-    // The critical retrieval case: two functions with near-identical
-    // structure that differ by one AST node. HDC at function
-    // granularity puts these at ~D/2 — indistinguishable from random
-    // pairs. This is the bundle-saturation regime; characterization-
-    // asserted here so a future encoder improvement will fail this
-    // test and we'll notice.
+    // Pre-bundle (XOR-bind composition): near-similar pairs sat at
+    // saturation (D/2 ≈ 4115). Math-friend + third-party LLM diagnosed
+    // this as fp-induced base_vector + content_role per-level PRG
+    // draws being faithfully XOR-transmitted to the root.
     //
-    // SUM_A vs SUM_B: `t += x` vs `s += *x` — one extra Unary node
-    // for the deref.
-    // MATCH_A vs MATCH_B: wildcard arms `_ => 0` vs `_ => -1` — one
-    // extra Unary node for the negation.
+    // Post-bundle (this commit): the same pairs are now in the
+    // measurably-close band. Bundle dampens upstream randomization at
+    // each level — a one-leaf change that's D/2 at the leaf becomes
+    // ~D/(F^depth) at the root for fan-out F. The substrate is now
+    // GRADED at function granularity.
+    //
+    // Assertions inverted: near-similar pairs MUST be in [0, 500].
+    // Three thresholds, increasing strictness:
+    //   - SUM_A vs SUM_B: distance <= 500 (one deref node off)
+    //   - MATCH_A vs MATCH_B: distance <= 500 (one Unary node off in
+    //     wildcard arm) — was the load-bearing single-statement
+    //     failure under XOR-bind
+    //   - near-similar pairs measurably closer than unrelated pairs
 
-    println!("─── Test 3: near-similar pairs (the critical retrieval case) ───");
+    println!("─── Test 3: near-similar pairs (the substrate-property gate) ───");
     let d_sa_sb = dist(&sum_a, &sum_b);
     let d_ma_mb = dist(&match_a, &match_b);
     println!("  d(SUM_A, SUM_B)     = {d_sa_sb}   (differ by ONE deref node)");
-    println!("  d(MATCH_A, MATCH_B) = {d_ma_mb}   (differ by ONE Unary node in wildcard arm)");
-    println!();
-    println!("  Both sit in the saturation band [3900, 4200] — random-pair-distance.");
-    println!("  HDC at function granularity cannot distinguish 'one-AST-node-different'");
-    println!("  from 'completely unrelated'. This is the substrate's load-bearing");
-    println!("  failure mode for real retrieval — captured here so a future encoder");
-    println!("  improvement (smaller granularity, different bind algebra, banded LSH)");
-    println!("  will fail these characterization assertions and we'll notice.");
+    println!("  d(MATCH_A, MATCH_B) = {d_ma_mb}   (differ by ONE Unary node)");
     println!();
     assert!(
-        d_sa_sb > 3500,
-        "characterization: SUM_A vs SUM_B currently at saturation (D/2). If this drops below 3500, the encoder improved and we should know."
+        d_sa_sb <= 500,
+        "PROPERTY: under bundle composition SUM_A vs SUM_B must be measurably close; got {d_sa_sb}"
     );
     assert!(
-        d_ma_mb > 3500,
-        "characterization: MATCH_A vs MATCH_B currently at saturation. Same characterization assertion."
+        d_ma_mb <= 500,
+        "PROPERTY: single-statement near-similar (MATCH_A vs MATCH_B) must be measurably close; got {d_ma_mb}. Was 4122 under XOR-bind — this is the load-bearing substrate gate."
     );
-    println!("  ✗ FAILS the retrieval claim: near-similar look random.\n");
+    // Relative gate: near-similar measurably closer than unrelated.
+    assert!(
+        d_sa_sb < d_tri_complex,
+        "near-similar must be closer than unrelated: d(SUM_A,SUM_B)={d_sa_sb} should be < d(TRIVIAL,COMPLEX)={d_tri_complex}"
+    );
+    assert!(
+        d_ma_mb < d_tri_complex,
+        "near-similar must be closer than unrelated: d(MATCH_A,MATCH_B)={d_ma_mb} should be < d(TRIVIAL,COMPLEX)={d_tri_complex}"
+    );
+    println!("  ✓ PASSES the substrate-property gate: near-similar < unrelated.");
+    println!("    Single-statement case (MATCH_A vs MATCH_B) is no longer a special case.\n");
 
     // ── 4. TOP-K RETRIEVAL — what would happen on a query ────────────
     //
@@ -317,10 +331,10 @@ fn phase_1_hdc_characterization() {
     let in_top3 = |label: &str| top3_sum_a.iter().any(|(l, _)| *l == label);
     let sum_b_in_top3 = in_top3("SUM_B");
     println!("    SUM_B (one node off from SUM_A) in top-3: {sum_b_in_top3}");
-    if !sum_b_in_top3 {
-        println!("    → MISS. SUM_B is the most-similar non-identical function but HDC ranks");
-        println!("      it equal to random pairs. This is the load-bearing limitation.");
-    }
+    assert!(
+        sum_b_in_top3,
+        "SUBSTRATE GATE: SUM_B (one node off) must be in top-3. Under XOR-bind it was MISSED — bundle composition is what fixes this."
+    );
     println!();
 
     let top3_match_a = top_k(&match_a, 3);
@@ -330,20 +344,25 @@ fn phase_1_hdc_characterization() {
     }
     let match_b_in_top3 = top3_match_a.iter().any(|(l, _)| *l == "MATCH_B");
     println!("    MATCH_B (the only other match function) in top-3: {match_b_in_top3}");
-    if !match_b_in_top3 {
-        println!("    → MISS. Same failure mode.");
-    }
+    assert!(
+        match_b_in_top3,
+        "SUBSTRATE GATE: MATCH_B must be in top-3. The single-statement-function case Phase 1C documented as a limitation is FIXED under bundle composition."
+    );
     println!();
 
     // ── Final verdict ────────────────────────────────────────────────
     println!("─── Verdict ───");
-    println!("HDC at function granularity on real Rust code:");
-    println!("  ✓ canonicalizes type/literal variations (PARSE_A ≡ PARSE_B ≡ PARSE_C)");
-    println!("  ✗ saturates on single-AST-node variations (SUM_A vs SUM_B at D/2)");
-    println!("  ✗ retrieval misses near-similar functions in top-K");
+    println!("HDC at function granularity on real Rust code (bundle composition):");
+    println!("  ✓ canonicalizes type/literal variations (PARSE_A ≡ PARSE_B ≡ PARSE_C → 0)");
+    println!("  ✓ graded distance on one-AST-node variations (~6-16 vs ~1000-1400 unrelated)");
+    println!("  ✓ retrieval finds near-similar functions in top-K");
+    println!(
+        "  ✓ single-statement case (MATCH_A vs MATCH_B) works WITHOUT statement-level set-overlap"
+    );
     println!();
-    println!("The substrate's 'find structurally similar code' claim does NOT hold at");
-    println!("this granularity. Smaller granularity (statement / expression) or a");
-    println!("different bind algebra is needed. Filing follow-up for math friend.");
+    println!("The substrate's 'find structurally similar code' claim now holds at function");
+    println!("granularity. Bead ley-line-open-7b5086 was the load-bearing change: XOR-bind");
+    println!("composition (similarity-perfect-transmitting + per-level PRG) replaced with");
+    println!("majority-bundle composition (similarity-dampening). content_role dropped.");
     println!();
 }

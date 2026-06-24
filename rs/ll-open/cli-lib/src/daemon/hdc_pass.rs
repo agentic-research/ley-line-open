@@ -121,11 +121,16 @@ mod tests {
     /// regime and the noise floor.
     const CLONE_DISTANCE_UPPER: f64 = 0.20;
 
-    /// Lower bound for "distinct family" pair distance: structurally
-    /// different functions should land at d/D strictly above this
-    /// value. Margin ≈ 0.15 between this and `CLONE_DISTANCE_UPPER`
-    /// is what makes the binary clone-vs-distinct verdict reliable.
-    const DISTINCT_DISTANCE_LOWER: f64 = 0.35;
+    /// Lower bound for "distinct family" pair distance.
+    ///
+    /// Bead `ley-line-open-7b5086`: bundle composition is similarity-
+    /// dampening, so distinct-family pairs no longer sit near D/2.
+    /// On real Go code, distinct functions can land at d/D ~0.01-0.15.
+    /// Threshold set to "any non-zero" to keep the test gating on a
+    /// meaningful property (not collapsed to identical) without picking
+    /// a specific numeric magnitude — graded distance is what the
+    /// substrate now provides; absolute numbers depend on tree shape.
+    const DISTINCT_DISTANCE_LOWER: f64 = 0.0;
 
     #[test]
     fn parse_and_encode_tree_handles_empty_source() {
@@ -497,21 +502,24 @@ mod tests {
         eprintln!("d(A, B)  = {d_ab}  -- Type-3 (extra stmt), expect ~D/2 (sensitive)");
         eprintln!("d(A, C)  = {d_ac}  -- different family, expect ~D/2");
 
-        // The honest characterization of AstCodebook: it's a BINARY
-        // same-shape detector. Identical-shape pairs collapse to d=0;
-        // any structural change (one extra statement, different
-        // control flow) drifts to ~D/2. The relative ordering of
-        // "Type-3 with extra stmt" vs "different family" is dominated
-        // by noise, not signal. So we don't assert strict ordering;
-        // we assert the binary fact: d=0 for clones, >>0 for any drift.
+        // The new characterization of AstCodebook (post bead 7b5086):
+        // GRADED similarity detector under bundle composition. Identical-
+        // shape pairs collapse to d=0; any structural change shows up as
+        // measurable distance growth, and the relative ordering of
+        // changes IS meaningful signal now.
+        //
+        // Old XOR-bind: same-shape=0, anything-else≈D/2 (binary).
+        // New bundle: same-shape=0, near-similar~100s, family-different~1000s.
         assert_eq!(d_aa, 0, "Type-2 clones must collapse to identical HV");
         assert!(
-            d_ab > 3500,
-            "Type-3 (extra statement): must drift substantially (got {d_ab}, expected > 3500)",
+            d_ab > 0,
+            "Type-3 (extra statement) must produce measurable drift (got {d_ab})",
         );
+        // Relative gate: different-family must be farther than same-family
+        // with one extra statement (the substrate's graded-distance property).
         assert!(
-            d_ac > 3500,
-            "Different family: must land at ~D/2 (got {d_ac}, expected > 3500)",
+            d_ac > d_ab,
+            "Different family ({d_ac}) must be farther than same-family-plus-stmt ({d_ab})",
         );
 
         // ── Assertion 2: probe-against-self always matches. ───────────
@@ -654,15 +662,15 @@ mod tests {
         // Distinct pairs land far.
         assert!(
             d_a_b > DISTINCT_DISTANCE_LOWER,
-            "A vs B too close: d/D = {d_a_b:.4} (expected > {DISTINCT_DISTANCE_LOWER})",
+            "A vs B too close: d/D = {d_a_b:.4} (expected > {DISTINCT_DISTANCE_LOWER}, post bundle composition)",
         );
         assert!(
             d_a_c > DISTINCT_DISTANCE_LOWER,
-            "A vs C too close: d/D = {d_a_c:.4} (expected > {DISTINCT_DISTANCE_LOWER})",
+            "A vs C too close: d/D = {d_a_c:.4} (expected > {DISTINCT_DISTANCE_LOWER}, post bundle composition)",
         );
         assert!(
             d_b_c > DISTINCT_DISTANCE_LOWER,
-            "B vs C too close: d/D = {d_b_c:.4} (expected > {DISTINCT_DISTANCE_LOWER})",
+            "B vs C too close: d/D = {d_b_c:.4} (expected > {DISTINCT_DISTANCE_LOWER}, post bundle composition)",
         );
 
         // Margin: clones MUST be closer to each other than to any distinct.

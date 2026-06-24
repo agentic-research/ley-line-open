@@ -10,36 +10,62 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use crate::D_BITS;
 use crate::canonical::CanonicalKind;
 use crate::codebook::{AstNodeFingerprint, BaseCodebook};
-use crate::util::{Hypervector, bucket_arity, bytes_to_hv, rotate_left, xor_into};
+use crate::util::{Hypervector, ZERO_HV, bucket_arity, bytes_to_hv, rotate_left};
 
-/// Content-keyed role vector for a child subtree.
+/// Majority bundle of N hypervectors with a deterministic tiebreaker for
+/// even-N — implements the HDC-canonical "similarity-preserving bundle."
 ///
-/// Math-friend review (2026-06-24): the encoder's bind step was previously
-/// `rotate_left(child_hv, i)` — positional rotation alone. That gave order
-/// sensitivity (rotate is non-commutative across positions) but the unbind
-/// step `rotate_right(•, i)` would recover *any* candidate child HV with the
-/// matching structural shape, not only the actual child. The "Merkle
-/// reversibility" claim — "you can prove which subtree is present" —
-/// wasn't load-bearing.
+/// Bead `ley-line-open-7b5086` (substrate rewrite). Replaces the prior
+/// XOR-bind composition in `encode_tree` because XOR-bind is similarity-
+/// destroying once per-level PRG draws (fingerprint-keyed `base_vector`,
+/// content_hash-keyed `content_role`) are introduced — every interior node
+/// adds a fresh random vector and XOR faithfully transmits the randomness
+/// to the root. Bundle dampens that randomization (~1/F per level for
+/// fan-out F) so structural edit distance shows up as Hamming distance.
 ///
-/// `content_role` mixes the child's blake3 content_hash into the bind via XOR
-/// (the same hash that keys the SubtreeCache). The new bind is
-/// `rotate_left(child_hv ⊕ content_role(child.content_hash()), i)`. Order is
-/// still preserved by the rotation; content-addressability is now layered on
-/// top — `unbind_rejects_wrong_content_hash` (test below) pins that
-/// recovering a child against the wrong content_hash falls back to noise,
-/// not the codebook's base_vector.
-///
-/// Domain-separated via the `hdc-merkle-role/` tag so a `tagged_seed_vector`
-/// call with a colliding short tag can't accidentally produce the same HV.
-#[inline]
-fn content_role(hash: &[u8; 32]) -> Hypervector {
-    let mut buf = Vec::with_capacity(b"hdc-merkle-role/".len() + 32);
-    buf.extend_from_slice(b"hdc-merkle-role/");
-    buf.extend_from_slice(hash);
-    bytes_to_hv(&buf)
+/// Implementation detail: `HvCellComplex::bundle_majority` (sheaf.rs:379)
+/// uses strict majority (`count > N/2`), which yields **intersection**
+/// semantics on N=2 (loses similarity to both inputs). For the encoder we
+/// need an HDC-style majority where a tie on a bit is broken by a per-call
+/// deterministic vector — that gives output equally close to all inputs.
+/// We pad with `tagged_seed_vector("hdc-bundle-tiebreak", 0)` when N is
+/// even, then delegate to the strict-majority primitive.
+fn majority_bundle_with_tiebreak(inputs: &[Hypervector]) -> Hypervector {
+    if inputs.is_empty() {
+        return ZERO_HV;
+    }
+    // Inline the strict-majority loop here (the version in sheaf.rs is on
+    // `HvCellComplex` and pulling it in would add an unnecessary
+    // dependency edge from encoder.rs to sheaf.rs).
+    let strict_majority = |stalks: &[Hypervector]| -> Hypervector {
+        let mut out = ZERO_HV;
+        let half = stalks.len() as u32 / 2;
+        for bit in 0..D_BITS {
+            let byte_idx = bit / 8;
+            let bit_off = bit % 8;
+            let mut count: u32 = 0;
+            for s in stalks {
+                count += ((s[byte_idx] >> bit_off) & 1) as u32;
+            }
+            if count > half {
+                out[byte_idx] |= 1 << bit_off;
+            }
+        }
+        out
+    };
+    if inputs.len() % 2 == 1 {
+        return strict_majority(inputs);
+    }
+    // Even N → pad with a deterministic tiebreaker so ties resolve to a
+    // fixed pseudo-random direction rather than collapsing to 0.
+    let tiebreak = bytes_to_hv(b"hdc-bundle-tiebreak/0");
+    let mut padded = Vec::with_capacity(inputs.len() + 1);
+    padded.extend_from_slice(inputs);
+    padded.push(tiebreak);
+    strict_majority(&padded)
 }
 
 /// One node in a tree to encode. Owns its children so the encoder can
@@ -210,32 +236,39 @@ where
     }
 
     let fp = node.fingerprint();
-    let mut hv = codebook.base_vector(&fp);
+    let base = codebook.base_vector(&fp);
 
+    // Bundle composition (bead ley-line-open-7b5086, math-friend session-3 +
+    // third-party HDC review). Replaces the prior XOR-bind composition.
+    //
+    // Old composition: `hv = base ⊕ ⊕_i rotate_left(child ⊕ content_role, i)`.
+    // XOR-bind faithfully transmits any per-level randomness (the
+    // fingerprint-keyed base_vector switch + the content_role term added in
+    // PR #94) to the root, so one-leaf-different trees become orthogonal.
+    //
+    // New composition: `hv = majority_bundle({base} ∪ {rotate_left(child_i, i)})`.
+    // Bundle is similarity-DAMPENING: bundle({A, B}) sits at ≈D/4 from both
+    // A and B (vs D/2 for XOR). Per math-friend session-3, a one-leaf
+    // perturbation that's D/2 at the leaf becomes ≈ D/(F^depth) at the root
+    // for fan-out F — measurable signal at typical AST shapes (depth 5-7,
+    // fan-out 2-5).
+    //
+    // Position is still encoded via `rotate_left(child_hv, i)` — bundle is
+    // commutative so order must come from the inputs being permuted.
+    //
+    // `content_role` is intentionally DROPPED. Math-friend session-3: under
+    // bundle composition it's just a second fresh-PRG draw per node, hurting
+    // the same way base_vector switching did. The Merkle-reversibility claim
+    // (PR #94 substrate property) doesn't survive bundle composition since
+    // bundle isn't invertible; that property is retired together with the
+    // unbind algebra and its tests.
+    let mut bundle_inputs: Vec<Hypervector> = Vec::with_capacity(node.children.len() + 1);
+    bundle_inputs.push(base);
     for (i, child) in node.children.iter().enumerate() {
         let child_hv = encode_tree(child, codebook, cache);
-        // Position encoding via circular bit-rotation (order-sensitive),
-        // composed with Merkle-role binding via XOR (content-addressable).
-        //
-        // Before this composition (encoder pre-2026-06-24): bind was
-        // `rotate_left(child_hv, i)`. That preserved order but `unbind` would
-        // recover any candidate hypervector of the matching structural shape,
-        // not necessarily the actual child — the "Merkle reversibility"
-        // claim wasn't load-bearing.
-        //
-        // After: bind is `rotate_left(child_hv ⊕ content_role(child.content_hash()), i)`.
-        // Order is still preserved by the rotation (XOR alone would lose it
-        // since XOR is commutative). Content-addressability is layered:
-        // recovering child_i from the parent now requires XOR-ing the
-        // candidate's content_role; an attacker who doesn't possess the
-        // child's content_hash cannot synthesize a hypervector that unbinds
-        // to the codebook's base_vector. See `unbind_rejects_wrong_content_hash`.
-        let role = content_role(&child.content_hash());
-        let mut bound = child_hv;
-        xor_into(&mut bound, &role);
-        let permuted = rotate_left(&bound, i);
-        xor_into(&mut hv, &permuted);
+        bundle_inputs.push(rotate_left(&child_hv, i));
     }
+    let hv = majority_bundle_with_tiebreak(&bundle_inputs);
 
     cache.put(key, hv);
     hv
@@ -255,7 +288,7 @@ where
 mod tests {
     use super::*;
     use crate::codebook::{AstCodebook, ModuleCodebook};
-    use crate::util::{assert_far_apart, rotate_right};
+    use crate::util::assert_far_apart;
 
     // Test convenience aliases — `leaf` and `node` are short stand-ins
     // for `EncoderNode::leaf` / `EncoderNode::new` to keep the test
@@ -411,12 +444,22 @@ mod tests {
 
     #[test]
     fn child_order_changes_hypervector() {
-        // Order *must* matter at the encoder level (even though the
-        // codebook is order-invariant). The role-permutation step
-        // (role_vector(i)) is what restores order-sensitivity. Two
-        // trees with the same children in different positions must
-        // produce different hypervectors — otherwise we'd lose the
-        // ability to distinguish e.g. an `if` from a `do-while`.
+        // Order *must* matter at the encoder level. The positional
+        // `rotate_left(child, i)` inputs to majority-bundle are what
+        // restore order-sensitivity (bundle is otherwise commutative).
+        //
+        // Threshold update for bead `ley-line-open-7b5086`: under bundle
+        // composition the encoded HVs are similarity-dampened — order-
+        // flipped trees are at ~D/2 - 1000 instead of D/2 (random
+        // baseline). The `assert_far_apart` threshold of 3500 was
+        // calibrated for XOR-bind where any structural change went to
+        // D/2. The PROPERTY (order matters) still holds; the magnitude
+        // shrank by design (bundle dampens upstream randomization).
+        //
+        // We use a relative gate: distance(A, B) must exceed
+        // `D_BITS / 8` = 1024 bits (the noise floor at bundle's
+        // dampening regime for fan-out 2 at depth 2). On real encoders
+        // this is ~2000-3000 bits.
         let cb = AstCodebook::new();
         let tree_a = node(
             CanonicalKind::Stmt,
@@ -426,10 +469,13 @@ mod tests {
             CanonicalKind::Stmt,
             vec![leaf(CanonicalKind::Block), leaf(CanonicalKind::Op)],
         );
-        assert_far_apart(
-            &encode_fresh(&tree_a, &cb),
-            &encode_fresh(&tree_b, &cb),
-            "child order must affect HV",
+        let hv_a = encode_fresh(&tree_a, &cb);
+        let hv_b = encode_fresh(&tree_b, &cb);
+        let d = crate::util::popcount_distance(&hv_a, &hv_b);
+        assert!(
+            d > 1024,
+            "child order must affect HV measurably under bundle composition; \
+             got distance {d} (threshold 1024 bits; XOR baseline was 3500)"
         );
     }
 
@@ -775,157 +821,38 @@ mod tests {
     #[test]
     fn role_binding_actually_bound() {
         // Sanity: encoding a 1-child tree must depend on the child's
-        // hypervector, not just the parent's. If role-binding silently
-        // dropped, two trees with the same parent but different
+        // hypervector, not just the parent's. If the composition silently
+        // dropped the child, two trees with the same parent but different
         // children would produce the same vector.
+        //
+        // Bead `ley-line-open-7b5086`: under bundle composition, two
+        // different child kinds bring different inputs into the bundle,
+        // so the result HV differs measurably from the parent-only HV.
+        // Magnitude is smaller than under XOR-bind (bundle dampens), so
+        // the threshold is relaxed from 3500 to 1024 bits.
         let cb = AstCodebook::new();
         let parent_a = node(CanonicalKind::Stmt, vec![leaf(CanonicalKind::Op)]);
         let parent_b = node(CanonicalKind::Stmt, vec![leaf(CanonicalKind::Lit)]);
-        assert_far_apart(
+        let d = crate::util::popcount_distance(
             &encode_fresh(&parent_a, &cb),
             &encode_fresh(&parent_b, &cb),
-            "different child kinds must produce different parent HVs",
+        );
+        assert!(
+            d > 1024,
+            "different child kinds must produce measurably different parent HVs; \
+             got distance {d} (threshold 1024 bits under bundle composition)"
         );
     }
 
-    #[test]
-    fn unbind_recovers_child_from_position_zero() {
-        // Bidi property: encode parent + 1 child at position 0, strip
-        // the parent's base AND the child's content_role, and we get
-        // back the child's HV directly (rotate_left by 0 is identity).
-        //
-        // Algebra after the Merkle-role rebind:
-        //   parent = base ⊕ rotate_left(child ⊕ content_role(c_hash), 0)
-        //          = base ⊕ child ⊕ content_role(c_hash)
-        //   → child = parent ⊕ base ⊕ content_role(c_hash)
-        //
-        // This is the cleanup-memory primitive `op_hdc_unbind` uses; the
-        // content_role term is what makes the unbind content-addressable
-        // (an attacker without the child's content_hash can't reproduce
-        // this XOR; their guess decodes to noise — see
-        // `unbind_rejects_wrong_content_hash`).
-        let cb = AstCodebook::new();
-        let child_kind = CanonicalKind::Op;
-        let child_node = leaf(child_kind);
-        let tree = node(CanonicalKind::Stmt, vec![child_node.clone()]);
-        let parent_hv = encode_fresh(&tree, &cb);
-        let child_hv_direct = encode_fresh(&child_node, &cb);
-
-        let parent_base = cb.base_vector(&tree.fingerprint());
-        let c_role = super::content_role(&child_node.content_hash());
-
-        let mut recovered = parent_hv;
-        xor_into(&mut recovered, &parent_base);
-        xor_into(&mut recovered, &c_role);
-        assert_eq!(
-            recovered, child_hv_direct,
-            "unbind must recover the child's exact HV when given the right content_role",
-        );
-    }
-
-    #[test]
-    fn unbind_recovers_child_from_position_one() {
-        // Same bidi property but for a child at position 1 — needs
-        // rotate_right(•, 1) after stripping the position-0 contribution
-        // and the parent's base, then XOR off child1's content_role.
-        let cb = AstCodebook::new();
-        let kind0 = CanonicalKind::Op;
-        let kind1 = CanonicalKind::Lit;
-        let c0 = leaf(kind0);
-        let c1 = leaf(kind1);
-        let tree = node(CanonicalKind::Stmt, vec![c0.clone(), c1.clone()]);
-        let parent_hv = encode_fresh(&tree, &cb);
-        let child0_hv = encode_fresh(&c0, &cb);
-        let child1_hv = encode_fresh(&c1, &cb);
-
-        let parent_base = cb.base_vector(&tree.fingerprint());
-        let role0 = super::content_role(&c0.content_hash());
-        let role1 = super::content_role(&c1.content_hash());
-
-        // parent = base ⊕ rotate_left(child0 ⊕ role0, 0)
-        //                ⊕ rotate_left(child1 ⊕ role1, 1)
-        //        = base ⊕ child0 ⊕ role0
-        //                ⊕ rotate_left(child1 ⊕ role1, 1)
-        // Strip base + (child0 ⊕ role0): leaves rotate_left(child1 ⊕ role1, 1).
-        // rotate_right(•, 1) → child1 ⊕ role1. XOR role1 → child1.
-        let mut residual = parent_hv;
-        xor_into(&mut residual, &parent_base);
-        xor_into(&mut residual, &child0_hv);
-        xor_into(&mut residual, &role0);
-        let mut recovered = rotate_right(&residual, 1);
-        xor_into(&mut recovered, &role1);
-        assert_eq!(
-            recovered, child1_hv,
-            "rotate_right + XOR role1 must recover child at position 1",
-        );
-    }
-
-    #[test]
-    fn child_order_still_changes_hv_after_merkle_rebind() {
-        // Preservation: `child_order_changes_hypervector` already pins
-        // order-sensitivity. Math-friend's earlier reversibility proposal
-        // *silently dropped* order (XOR is commutative). The composed
-        // bind (positional rotation + content_role XOR) restores order.
-        // This test pins that the rebind didn't regress that property.
-        let cb = AstCodebook::new();
-        let tree_a = node(
-            CanonicalKind::Stmt,
-            vec![leaf(CanonicalKind::Op), leaf(CanonicalKind::Block)],
-        );
-        let tree_b = node(
-            CanonicalKind::Stmt,
-            vec![leaf(CanonicalKind::Block), leaf(CanonicalKind::Op)],
-        );
-        crate::util::assert_far_apart(
-            &encode_fresh(&tree_a, &cb),
-            &encode_fresh(&tree_b, &cb),
-            "child order must still affect HV after Merkle-role rebind",
-        );
-    }
-
-    #[test]
-    fn unbind_rejects_wrong_content_hash() {
-        // The substrate property the Merkle-role rebind purchases: an
-        // unbind attempt using the WRONG content_role does NOT recover
-        // the parent's base. Today's encoder (pre-rebind) would let
-        // any candidate of the right structural shape unbind cleanly;
-        // post-rebind, only the actual child's content_hash works.
-        //
-        // We don't have op_hdc_unbind in this crate yet, so the test
-        // exercises the same primitive ops the unbind cleanup memory
-        // would use: XOR off base + role_candidate, check whether the
-        // result matches the direct encoding of the candidate child.
-        let cb = AstCodebook::new();
-        let real_child = leaf(CanonicalKind::Op);
-        let wrong_child = leaf(CanonicalKind::Lit);
-        let tree = node(CanonicalKind::Stmt, vec![real_child.clone()]);
-        let parent_hv = encode_fresh(&tree, &cb);
-        let parent_base = cb.base_vector(&tree.fingerprint());
-
-        // Strip base + the CORRECT content_role → recovers real_child HV exactly.
-        let correct_role = super::content_role(&real_child.content_hash());
-        let mut correct = parent_hv;
-        xor_into(&mut correct, &parent_base);
-        xor_into(&mut correct, &correct_role);
-        let real_child_direct = encode_fresh(&real_child, &cb);
-        assert_eq!(
-            correct, real_child_direct,
-            "correct content_role must unbind to the real child's HV",
-        );
-
-        // Strip base + the WRONG content_role → must NOT recover anything
-        // close to real_child's HV. Hamming distance to real_child_direct
-        // should be near-random (D/2 = 4096); we accept any distance > 3500
-        // (~4σ from random, the standard "far apart" gate in this crate).
-        let wrong_role = super::content_role(&wrong_child.content_hash());
-        let mut wrong = parent_hv;
-        xor_into(&mut wrong, &parent_base);
-        xor_into(&mut wrong, &wrong_role);
-        crate::util::assert_far_apart(
-            &wrong,
-            &real_child_direct,
-            "wrong content_role must NOT unbind to the real child's HV — \
-             this is the Merkle-reversibility claim made load-bearing",
-        );
-    }
+    // Unbind tests removed: bead `ley-line-open-7b5086` swapped XOR-bind
+    // composition for majority-bundle composition. Majority bundle is not
+    // invertible (no `unbind` operation exists for it without an explicit
+    // cleanup-memory codebook of all candidate children), so the prior
+    // tests — `unbind_recovers_child_from_position_zero/one`,
+    // `unbind_rejects_wrong_content_hash`, and the related
+    // `child_order_still_changes_hv_after_merkle_rebind` — assert algebra
+    // the new encoder no longer supports. Their substrate-property claim
+    // (Merkle-reversibility from PR #94) is retired together with
+    // `content_role`. Order-sensitivity is still tested by
+    // `child_order_changes_hypervector` above.
 }

@@ -181,7 +181,7 @@ fn statement_set_similarity(query: &FnStmts, candidate: &FnStmts) -> (f64, usize
 }
 
 #[test]
-#[ignore = "Phase 1C — statement-level granularity empirical test. Run with --ignored --nocapture"]
+#[ignore = "OBSOLETE post bead ley-line-open-7b5086. Statement-level set-overlap was a workaround for XOR-bind's binary-equality failure at function granularity. Bundle composition (the encoder rewrite) fixes the underlying problem at function level — Phase 1 retrieval now works on the same corpus without needing statement-level aggregation. Phase 1C's NEAR_MATCH_RADIUS threshold is calibrated for XOR-bind D/2 distances; under bundle even unrelated statements are well within radius, so the test's match-counting saturates at 1.00 for everything. Kept for historical reference."]
 fn phase_1c_statement_level_unblocks_near_similar_retrieval() {
     println!("\n=== Phase 1C — does statement-level granularity fix the saturation? ===\n");
 

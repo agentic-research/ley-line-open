@@ -217,24 +217,45 @@ impl EnrichmentPass for HdcEnrichmentPass {
                 let start_byte = func_node.start_byte();
                 let end_byte = func_node.end_byte();
 
-                let encoder_node =
-                    super::hdc_pass::tree_to_encoder_node(func_node, &*setup.kind_map);
-                let hv = leyline_hdc::encoder::encode_tree(&encoder_node, &codebook, &cache);
-                let hv_bytes = hv.to_vec();
-
-                // URI-formatted scope_id (math-friend Q3): future
-                // file-level / module-level rows can use distinct
-                // schemes (`file://`, `module://`) without breaking
-                // downstream parsers.
-                let scope_id = format!("func://{path}::{name}@{start_byte}-{end_byte}");
-
-                insert_stmt.execute(rusqlite::params![
-                    scope_id,
-                    leyline_hdc::LayerKind::Ast.as_str(),
-                    hv_bytes,
-                    basis,
-                ])?;
-                items_added += 1;
+                // Statement-level granularity per math-friend session-2 (bead
+                // ley-line-open-3983bf) and Phase 1C empirical validation.
+                //
+                // Encoding the WHOLE function as one HV failed retrieval on
+                // near-similar code: fingerprint-induced base_vector switching
+                // cascades up the tree, so one-leaf-different functions sit at
+                // D/2 (random pair distance). Indistinguishable from unrelated.
+                //
+                // Statement granularity: each named child of the function's
+                // body block becomes its own _hdc row. Statements that
+                // canonicalize identically across two functions collide at
+                // distance 0; functions with N-of-M shared statements get a
+                // graded N/M retrieval score via aggregation at query time.
+                //
+                // scope_id convention: `func://path::name@s-e#stmt:N`. The
+                // `#stmt:N` fragment is the statement's named-child index
+                // within the body block. The function-level prefix
+                // `func://path::name@s-e` is recoverable by stripping at `#`.
+                let body = match func_node.child_by_field_name("body") {
+                    Some(b) => b,
+                    None => continue,
+                };
+                let mut body_cursor = body.walk();
+                for (stmt_idx, stmt_node) in body.named_children(&mut body_cursor).enumerate() {
+                    let stmt_encoder_node =
+                        super::hdc_pass::tree_to_encoder_node(stmt_node, &*setup.kind_map);
+                    let hv =
+                        leyline_hdc::encoder::encode_tree(&stmt_encoder_node, &codebook, &cache);
+                    let hv_bytes = hv.to_vec();
+                    let scope_id =
+                        format!("func://{path}::{name}@{start_byte}-{end_byte}#stmt:{stmt_idx}");
+                    insert_stmt.execute(rusqlite::params![
+                        scope_id,
+                        leyline_hdc::LayerKind::Ast.as_str(),
+                        hv_bytes,
+                        basis,
+                    ])?;
+                    items_added += 1;
+                }
             }
         }
 
@@ -341,7 +362,7 @@ fn is_rust_function(node: &tree_sitter::Node) -> bool {
 /// are typically encoded as part of the parent function's
 /// hypervector. If they need to be addressable separately, a follow-
 /// up bead can switch this to a full walk.
-fn collect_function_nodes<'a>(
+pub(super) fn collect_function_nodes<'a>(
     node: tree_sitter::Node<'a>,
     is_function: fn(&tree_sitter::Node) -> bool,
     out: &mut Vec<tree_sitter::Node<'a>>,

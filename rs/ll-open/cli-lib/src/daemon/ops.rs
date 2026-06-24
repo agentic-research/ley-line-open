@@ -1796,7 +1796,16 @@ fn ensure_hdc_ready(conn: &rusqlite::Connection) -> Result<()> {
 /// sitter + canonical-kind-map bridge. Supported language ids are the
 /// intersection of leyline-hdc's `CanonicalKindMap` impls and leyline-
 /// ts's `TsLanguage` variants — today `go`, `rust`, `json`, `yaml`.
+///
+/// **Whole-content encoding** — for callers that want one HV for the
+/// entire content tree (e.g., a sub-expression query, or any path that
+/// pre-dates statement-level granularity). The substrate's main
+/// retrieval path uses [`encode_query_stmt_hvs`] instead — per
+/// math-friend session-2 (bead `ley-line-open-3983bf`), function-level
+/// HVs saturate to D/2 on near-similar code, so retrieval needs
+/// statement-level aggregation.
 #[cfg(feature = "hdc")]
+#[allow(dead_code)]
 fn encode_query_hv(content: &str, language: &str) -> Result<leyline_hdc::Hypervector> {
     use leyline_hdc::canonical::CanonicalKindMap;
     use leyline_hdc::codebook::AstCodebook;
@@ -1827,30 +1836,224 @@ fn encode_query_hv(content: &str, language: &str) -> Result<leyline_hdc::Hyperve
     Ok(encode_fresh(&encoder_node, &codebook))
 }
 
+/// Encode caller-supplied content into a list of per-statement HVs.
+///
+/// This is the production retrieval path. Math-friend session-2 (bead
+/// `ley-line-open-3983bf`) showed that function-level HVs saturate to
+/// D/2 on near-similar code because fingerprint-induced base_vector
+/// switching cascades to root. Statement-level encoding gives each
+/// statement its own shallow HV; retrieval aggregates matches by
+/// function so a query that shares N-of-M statements with a candidate
+/// gets a graded N/M score.
+///
+/// Strategy:
+/// - Parse the content via tree-sitter.
+/// - If the content contains `function_item` / `function_declaration` /
+///   `method_declaration` nodes, extract the named children of each
+///   function's body block as statements.
+/// - Otherwise (caller passed a bare statement or expression), encode
+///   each named child of the root as a "statement," with a fallback
+///   single-encoding of the root if it has no named children.
+///
+/// Each statement is encoded via the same `tree_to_encoder_node` +
+/// `encode_fresh` path the enrichment pass uses.
+#[cfg(feature = "hdc")]
+fn encode_query_stmt_hvs(content: &str, language: &str) -> Result<Vec<leyline_hdc::Hypervector>> {
+    use leyline_hdc::canonical::CanonicalKindMap;
+    use leyline_hdc::codebook::AstCodebook;
+    use leyline_hdc::encode_fresh;
+
+    let ts_lang = leyline_ts::languages::TsLanguage::from_name(language)
+        .with_context(|| format!("HDC: unknown language `{language}`"))?;
+    let lang = ts_lang.ts_language();
+
+    type FnPredicate = fn(&tree_sitter::Node) -> bool;
+    let (kind_map, is_function): (Box<dyn CanonicalKindMap>, FnPredicate) =
+        match language.to_lowercase().as_str() {
+            "go" | "golang" => (
+                Box::new(leyline_hdc::canonical::GoCanonicalMap),
+                is_go_function as fn(&tree_sitter::Node) -> bool,
+            ),
+            "rust" | "rs" => (
+                Box::new(leyline_hdc::canonical::RustCanonicalMap),
+                is_rust_function as fn(&tree_sitter::Node) -> bool,
+            ),
+            "json" => (Box::new(leyline_hdc::canonical::JsonCanonicalMap), |_| {
+                false
+            }),
+            "yaml" | "yml" => (Box::new(leyline_hdc::canonical::YamlCanonicalMap), |_| {
+                false
+            }),
+            other => {
+                return Err(anyhow::anyhow!(
+                    "HDC: no CanonicalKindMap for `{other}`; supported: go, rust, json, yaml"
+                ));
+            }
+        };
+
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&lang)
+        .with_context(|| format!("HDC: failed to set tree-sitter language `{language}`"))?;
+    let tree = parser
+        .parse(content, None)
+        .ok_or_else(|| anyhow::anyhow!("HDC: tree-sitter parse returned no tree"))?;
+    let root = tree.root_node();
+    let codebook = AstCodebook;
+
+    // Collect function nodes anywhere in the tree. Empty for json/yaml
+    // (no functions) — falls through to root-child encoding below.
+    let mut funcs: Vec<tree_sitter::Node> = Vec::new();
+    super::hdc_enrich::collect_function_nodes(root, is_function, &mut funcs);
+
+    let mut stmt_hvs: Vec<leyline_hdc::Hypervector> = Vec::new();
+    let source = content.as_bytes();
+    if !funcs.is_empty() {
+        for func in funcs {
+            let Some(body) = func.child_by_field_name("body") else {
+                continue;
+            };
+            let mut cursor = body.walk();
+            for stmt in body.named_children(&mut cursor) {
+                let encoder_node = super::hdc_pass::tree_to_encoder_node(stmt, &*kind_map);
+                stmt_hvs.push(encode_fresh(&encoder_node, &codebook));
+            }
+        }
+    }
+    if stmt_hvs.is_empty() {
+        // No functions found (caller passed bare statements or non-Rust/Go
+        // content). Fall back: encode each named child of the root as a
+        // "statement". If even that's empty, encode the root itself.
+        let mut cursor = root.walk();
+        let named: Vec<tree_sitter::Node> = root.named_children(&mut cursor).collect();
+        if named.is_empty() {
+            let encoder_node = super::hdc_pass::tree_to_encoder_node(root, &*kind_map);
+            stmt_hvs.push(encode_fresh(&encoder_node, &codebook));
+        } else {
+            for stmt in named {
+                let encoder_node = super::hdc_pass::tree_to_encoder_node(stmt, &*kind_map);
+                stmt_hvs.push(encode_fresh(&encoder_node, &codebook));
+            }
+        }
+    }
+    // Silence unused-variable warning in the codepath where `funcs` is empty.
+    let _ = source;
+    Ok(stmt_hvs)
+}
+
+#[cfg(feature = "hdc")]
+fn is_go_function(node: &tree_sitter::Node) -> bool {
+    matches!(node.kind(), "function_declaration" | "method_declaration")
+}
+
+#[cfg(feature = "hdc")]
+fn is_rust_function(node: &tree_sitter::Node) -> bool {
+    node.kind() == "function_item"
+}
+
+/// Strip the `#stmt:N` fragment from a statement-level scope_id, returning
+/// the function-level scope. `func://path::name@s-e#stmt:7` → `func://path::name@s-e`.
+/// Idempotent on scope_ids that don't have the fragment (returns input).
+#[cfg(feature = "hdc")]
+fn function_scope_of(stmt_scope_id: &str) -> &str {
+    stmt_scope_id.split('#').next().unwrap_or(stmt_scope_id)
+}
+
 /// `{"op":"hdc_search", "content":"...", "language":"go", "max_distance":100, "k":10}` —
-/// parses + encodes the query content, then runs `radius_search` on the
-/// AST layer of `_hdc`. Returns `{ok, results: [{scope_id, distance}]}`.
-/// Read-only. If `_hdc` hasn't been populated yet, returns empty results.
+/// parses the query content into per-statement HVs, runs `radius_search`
+/// for each statement against the AST layer of `_hdc`, then aggregates
+/// matches by function scope. Returns `{ok, results: [{scope_id, score,
+/// matched_stmts, total_query_stmts}, ...]}` sorted by score descending.
+///
+/// Why aggregation: post bead `ley-line-open-3983bf`, `_hdc` rows are
+/// per-statement (scope_id `func://...#stmt:N`). A query of M statements
+/// is "is this function similar?" answered by counting how many of those
+/// M statements have a near-match somewhere in the candidate function.
+/// Score = matched_stmts / total_query_stmts ∈ [0, 1].
+///
+/// Read-only. Returns empty results if `_hdc` hasn't been populated.
 #[cfg(feature = "hdc")]
 fn op_hdc_search(ctx: &std::sync::Arc<DaemonContext>, req: &HdcSearchRequest) -> Result<String> {
-    let hv = encode_query_hv(&req.content, &req.language)?;
+    let stmt_hvs = encode_query_stmt_hvs(&req.content, &req.language)?;
+    let total_query_stmts = stmt_hvs.len();
     let max_distance = req.max_distance;
     let k = req.k as usize;
+    if total_query_stmts == 0 {
+        return Ok(json!({
+            "ok": true,
+            "results": [],
+            "total_query_stmts": 0,
+        })
+        .to_string());
+    }
+    // Per-statement radius_search cap. Wider than the requested top-K
+    // because we're collecting candidates to aggregate; the function-
+    // level top-K filter happens at the end. 256 is the substrate's
+    // "plenty of candidates per stmt without scanning the world" knob.
+    const PER_STMT_CANDIDATE_LIMIT: usize = 256;
     with_live_db(ctx, |conn| {
         ensure_hdc_ready(conn)?;
-        let matches = leyline_hdc::query::radius_search(
-            conn,
-            leyline_hdc::LayerKind::Ast,
-            &hv,
-            max_distance,
-            k,
-        )
-        .context("HDC radius_search")?;
-        let rows: Vec<serde_json::Value> = matches
+        use std::collections::{HashMap, HashSet};
+        // function_scope → count of query-statements that hit it at least once.
+        let mut match_counts: HashMap<String, usize> = HashMap::new();
+        // function_scope → minimum per-stmt match distance seen (for tie-break).
+        let mut min_distances: HashMap<String, u32> = HashMap::new();
+        for q_hv in &stmt_hvs {
+            let matches = leyline_hdc::query::radius_search(
+                conn,
+                leyline_hdc::LayerKind::Ast,
+                q_hv,
+                max_distance,
+                PER_STMT_CANDIDATE_LIMIT,
+            )
+            .context("HDC radius_search")?;
+            // De-dup per query-statement: a function with 5 matching
+            // statement-rows for THIS query stmt only counts as one
+            // toward the function's match count.
+            let mut seen_this_stmt: HashSet<String> = HashSet::new();
+            for m in matches {
+                let func_scope = function_scope_of(&m.scope_id).to_string();
+                if seen_this_stmt.insert(func_scope.clone()) {
+                    *match_counts.entry(func_scope.clone()).or_insert(0) += 1;
+                }
+                min_distances
+                    .entry(func_scope)
+                    .and_modify(|d| {
+                        if m.distance < *d {
+                            *d = m.distance;
+                        }
+                    })
+                    .or_insert(m.distance);
+            }
+        }
+        let mut scored: Vec<(String, usize, u32)> = match_counts
             .into_iter()
-            .map(|m| json!({"scope_id": m.scope_id, "distance": m.distance}))
+            .map(|(scope, count)| {
+                let min_d = min_distances.get(&scope).copied().unwrap_or(u32::MAX);
+                (scope, count, min_d)
+            })
             .collect();
-        Ok(json!({"ok": true, "results": rows}).to_string())
+        // Sort by match_count DESC, then min_distance ASC as tiebreaker.
+        scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
+        scored.truncate(k);
+        let rows: Vec<serde_json::Value> = scored
+            .into_iter()
+            .map(|(scope, matched, min_d)| {
+                let score = matched as f64 / total_query_stmts as f64;
+                json!({
+                    "scope_id": scope,
+                    "score": score,
+                    "matched_stmts": matched,
+                    "min_distance": min_d,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "ok": true,
+            "results": rows,
+            "total_query_stmts": total_query_stmts,
+        })
+        .to_string())
     })
 }
 
@@ -1881,18 +2084,41 @@ fn op_hdc_calibrate(
 }
 
 /// `{"op":"hdc_density", "content":"...", "language":"go", "max_distance":100}` —
-/// counts scopes within `max_distance` of the encoded query HV on the
-/// AST layer. Returns `{ok, count: N}`. Read-only.
+/// counts `_hdc` statement-rows within `max_distance` of any statement
+/// extracted from the query content. Returns `{ok, count: N,
+/// total_query_stmts: M}`. Read-only.
+///
+/// Post bead `ley-line-open-3983bf`: `_hdc` rows are per-statement.
+/// "Density" now means total statement-level matches across the query
+/// statements — useful as a "is the corpus relevant to this query at
+/// all?" signal (high count → query overlaps with many indexed
+/// statements; low count → query is foreign to the corpus).
+///
+/// One row may be counted more than once if multiple query statements
+/// match it (intentional — captures the multi-statement-match signal).
 #[cfg(feature = "hdc")]
 fn op_hdc_density(ctx: &std::sync::Arc<DaemonContext>, req: &HdcDensityRequest) -> Result<String> {
-    let hv = encode_query_hv(&req.content, &req.language)?;
+    let stmt_hvs = encode_query_stmt_hvs(&req.content, &req.language)?;
+    let total_query_stmts = stmt_hvs.len();
     let max_distance = req.max_distance;
     with_live_db(ctx, |conn| {
         ensure_hdc_ready(conn)?;
-        let count =
-            leyline_hdc::query::density_count(conn, leyline_hdc::LayerKind::Ast, &hv, max_distance)
-                .context("HDC density_count")?;
-        Ok(json!({"ok": true, "count": count}).to_string())
+        let mut total: i64 = 0;
+        for q_hv in &stmt_hvs {
+            total += leyline_hdc::query::density_count(
+                conn,
+                leyline_hdc::LayerKind::Ast,
+                q_hv,
+                max_distance,
+            )
+            .context("HDC density_count")?;
+        }
+        Ok(json!({
+            "ok": true,
+            "count": total,
+            "total_query_stmts": total_query_stmts,
+        })
+        .to_string())
     })
 }
 
@@ -4429,19 +4655,32 @@ mod tests {
         )
         .unwrap();
 
-        // Now encode a known Rust function and INSERT into _hdc by
-        // hand. The scope_id is opaque; what matters is that the same
-        // content encodes to the same HV bytes, so searching for the
-        // same content finds the row with distance 0.
+        // Post bead ley-line-open-3983bf: HDC indexes per-statement, not
+        // per-function. The query path extracts statements from the
+        // content and aggregates matches by function scope. We mirror
+        // that here: pre-populate _hdc with the same per-statement HVs
+        // the enrichment pass would produce, then verify hdc_search
+        // returns the function scope with a full-coverage score.
+        //
+        // The Go source has ONE statement in main's body: `println("x")`.
+        // We extract that statement, encode it, and INSERT it under a
+        // function-scoped statement scope_id matching the production
+        // convention (`func://...#stmt:0`).
         let go_src = "package main\n\nfunc main() {\n\tprintln(\"x\")\n}\n";
-        let hv = encode_query_hv(go_src, "go").expect("encode_query_hv");
-        let hv_bytes = hv.to_vec();
+        let stmt_hvs = encode_query_stmt_hvs(go_src, "go").expect("encode_query_stmt_hvs");
+        assert_eq!(
+            stmt_hvs.len(),
+            1,
+            "Go main() has exactly one body statement; got {}",
+            stmt_hvs.len()
+        );
+        let hv_bytes = stmt_hvs[0].to_vec();
 
         {
             let live = ctx.live_db.lock().unwrap();
             live.execute(
                 "INSERT INTO _hdc (scope_id, layer_kind, hv, basis) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params!["test:main", "ast", hv_bytes, 0i64],
+                rusqlite::params!["func://test.go::main@0-100#stmt:0", "ast", hv_bytes, 0i64],
             )
             .expect("INSERT into _hdc");
         }
@@ -4459,18 +4698,38 @@ mod tests {
         .expect("hdc_search op should be dispatched");
         let v: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(v["ok"], json!(true), "ok:true; got {v}");
+        assert_eq!(
+            v["total_query_stmts"],
+            json!(1),
+            "single-statement function; got {v}"
+        );
         let results = v["results"].as_array().expect("results array");
         assert_eq!(results.len(), 1, "expected one match; got {results:?}");
+        // Aggregation strips the #stmt:N fragment — result is at function scope.
         assert_eq!(
             results[0]["scope_id"],
-            json!("test:main"),
-            "matched row has scope_id 'test:main'; got {:?}",
+            json!("func://test.go::main@0-100"),
+            "matched row aggregates to function scope; got {:?}",
+            results[0],
+        );
+        // Full coverage: 1 of 1 query statements matched.
+        assert_eq!(
+            results[0]["matched_stmts"],
+            json!(1),
+            "all query stmts matched; got {:?}",
             results[0],
         );
         assert_eq!(
-            results[0]["distance"],
+            results[0]["score"],
+            json!(1.0),
+            "score = matched / total = 1.0; got {:?}",
+            results[0],
+        );
+        // Exact-content match → distance 0 on the best-matching stmt.
+        assert_eq!(
+            results[0]["min_distance"],
             json!(0),
-            "exact-content match has distance 0; got {:?}",
+            "exact-content match has min_distance 0; got {:?}",
             results[0],
         );
     }

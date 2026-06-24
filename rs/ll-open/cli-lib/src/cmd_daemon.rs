@@ -205,13 +205,34 @@ pub async fn run_daemon(
     ext.on_init(router.emitter());
 
     // Resolve the embedder and sidecar vector index up front: the embedder
-    // is provided by the extension (or defaults to ZeroEmbedder), and the
-    // index is sized to match its dimensions.
+    // is provided by the extension (or defaults to FastEmbedder under
+    // `vec`). Set `LLO_EMBEDDER=zero` to force the deterministic
+    // ZeroEmbedder for tests / offline use — FastEmbedder downloads a
+    // ~22MB ONNX model on first init.
     #[cfg(feature = "vec")]
     let embedder: Arc<dyn crate::daemon::embed::Embedder> = ext.embedder().unwrap_or_else(|| {
-        Arc::new(crate::daemon::embed::ZeroEmbedder {
-            dim: DEFAULT_EMBEDDING_DIM,
-        })
+        use crate::daemon::embed::{FastEmbedModel, FastEmbedder, ZeroEmbedder};
+        let force_zero = std::env::var("LLO_EMBEDDER")
+            .map(|v| v.eq_ignore_ascii_case("zero"))
+            .unwrap_or(false);
+        if force_zero {
+            log::info!("LLO_EMBEDDER=zero — using ZeroEmbedder (deterministic, no model download)");
+            return Arc::new(ZeroEmbedder {
+                dim: DEFAULT_EMBEDDING_DIM,
+            });
+        }
+        match FastEmbedder::new(FastEmbedModel::default()) {
+            Ok(fe) => Arc::new(fe),
+            Err(e) => {
+                log::warn!(
+                    "FastEmbedder init failed ({e}); falling back to ZeroEmbedder. \
+                     Set LLO_EMBEDDER=zero to silence this and skip the model probe."
+                );
+                Arc::new(ZeroEmbedder {
+                    dim: DEFAULT_EMBEDDING_DIM,
+                })
+            }
+        }
     });
     #[cfg(feature = "vec")]
     let vec_index = {

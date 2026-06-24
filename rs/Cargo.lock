@@ -2992,6 +2992,7 @@ dependencies = [
  "capnp-json",
  "clap",
  "dirs",
+ "fastembed",
  "hex",
  "leyline-core",
  "leyline-fs",

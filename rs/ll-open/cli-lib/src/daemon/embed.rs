@@ -49,6 +49,106 @@ impl Embedder for ZeroEmbedder {
     }
 }
 
+// ---------------------------------------------------------------------------
+// FastEmbedder — ONNX-Runtime / fastembed-backed real embedder
+// ---------------------------------------------------------------------------
+
+/// Supported fastembed models. Kept narrow on purpose — the daemon only
+/// needs the MiniLM-class small models for code search. Adding more is a
+/// constructor-only change (no trait surface impact).
+#[derive(Debug, Clone, Copy, Default)]
+pub enum FastEmbedModel {
+    /// AllMiniLM-L6-v2 quantized — 384 dimensions, ~22 MB download.
+    /// Default because it's the smallest viable model and the daemon's
+    /// hot path (per-file embed) benefits from quantization more than
+    /// it suffers from the quality loss vs full-precision MiniLM.
+    #[default]
+    AllMiniLmL6V2Q,
+    /// AllMiniLM-L6-v2 full precision — 384 dimensions, ~90 MB.
+    AllMiniLmL6V2,
+}
+
+impl FastEmbedModel {
+    /// Embedding dimensionality. The `VectorIndex` is sized to match
+    /// this; mismatch means insert errors at runtime, so the daemon must
+    /// build the index with the same dim returned here.
+    pub fn dimensions(self) -> usize {
+        match self {
+            Self::AllMiniLmL6V2Q | Self::AllMiniLmL6V2 => 384,
+        }
+    }
+
+    fn to_fastembed(self) -> fastembed::EmbeddingModel {
+        match self {
+            Self::AllMiniLmL6V2Q => fastembed::EmbeddingModel::AllMiniLML6V2Q,
+            Self::AllMiniLmL6V2 => fastembed::EmbeddingModel::AllMiniLML6V2,
+        }
+    }
+}
+
+/// Real fastembed-backed [`Embedder`]. Downloads the model on first
+/// construction (cached under fastembed's default cache dir or the path
+/// passed to [`FastEmbedder::with_cache_dir`]); subsequent constructions
+/// reuse the cache.
+///
+/// `fastembed::TextEmbedding::embed` takes `&mut self` so we wrap it in
+/// a `Mutex`. The wrapping `Embedder` trait method takes `&self`, which
+/// matches the daemon's `Arc<dyn Embedder>` shape. Throughput is
+/// serialized across embed calls — this matches how the enrichment pass
+/// uses the embedder (one file at a time inside `process_row`). If we
+/// later batch, the batching belongs at the caller, not here.
+pub struct FastEmbedder {
+    inner: Mutex<fastembed::TextEmbedding>,
+    model: FastEmbedModel,
+}
+
+impl FastEmbedder {
+    /// Initialize the model using fastembed's default cache directory.
+    /// Downloads model weights on first construction.
+    pub fn new(model: FastEmbedModel) -> Result<Self> {
+        Self::init(model, None)
+    }
+
+    /// Initialize the model, overriding fastembed's cache directory.
+    /// Used by tests to keep model downloads under a controlled path.
+    pub fn with_cache_dir(model: FastEmbedModel, cache_dir: std::path::PathBuf) -> Result<Self> {
+        Self::init(model, Some(cache_dir))
+    }
+
+    fn init(model: FastEmbedModel, cache_dir: Option<std::path::PathBuf>) -> Result<Self> {
+        let mut opts =
+            fastembed::InitOptions::new(model.to_fastembed()).with_show_download_progress(false);
+        if let Some(dir) = cache_dir {
+            opts = opts.with_cache_dir(dir);
+        }
+        let embedding = fastembed::TextEmbedding::try_new(opts)
+            .map_err(|e| anyhow::anyhow!("failed to initialize fastembed: {e}"))?;
+        Ok(Self {
+            inner: Mutex::new(embedding),
+            model,
+        })
+    }
+}
+
+impl Embedder for FastEmbedder {
+    fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| anyhow::anyhow!("FastEmbedder mutex poisoned: {e}"))?;
+        let mut results = guard
+            .embed(vec![text], None)
+            .map_err(|e| anyhow::anyhow!("fastembed embed failed: {e}"))?;
+        results
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("fastembed returned no vectors"))
+    }
+
+    fn dimensions(&self) -> usize {
+        self.model.dimensions()
+    }
+}
+
 /// Enrichment pass that materializes file embeddings into the sidecar
 /// [`VectorIndex`].
 ///
@@ -575,6 +675,106 @@ mod tests {
         assert!(index.get("a.go")?.is_some());
         assert!(index.get("c.go")?.is_some());
         assert!(index.get("b.go")?.is_none());
+        Ok(())
+    }
+
+    // ── FastEmbedder contract tests ────────────────────────────────────
+    //
+    // These are #[ignore] by default because the constructor downloads
+    // ~22 MB of model weights on first run. CI environments without
+    // network or a pre-warmed fastembed cache would otherwise stall the
+    // workspace test gate. Run locally with:
+    //     cargo test -p leyline-cli-lib --features vec fastembed_ \
+    //         -- --ignored --nocapture
+    //
+    // The three tests pin FastEmbedder's contract:
+    //   1. dim matches the model's advertised dim (so VectorIndex sizing
+    //      stays in sync with whatever model is loaded);
+    //   2. distinct inputs → distinct outputs (the entire point — if
+    //      this fails, FastEmbedder is silently degenerate);
+    //   3. identical inputs → identical outputs (deterministic so the
+    //      sidecar VectorIndex doesn't churn on re-embedding the same
+    //      content).
+
+    /// Lazy cache dir for tests: every fastembed test in this module
+    /// shares one cache so we only pay the download cost once per
+    /// process. Uses a tempdir under the OS tmp dir, NOT the user's
+    /// real fastembed cache — keeps the tests hermetic.
+    fn fastembed_test_cache() -> std::path::PathBuf {
+        use std::sync::OnceLock;
+        static CACHE: OnceLock<std::path::PathBuf> = OnceLock::new();
+        CACHE
+            .get_or_init(|| {
+                let dir = std::env::temp_dir().join("llo-fastembed-test-cache");
+                std::fs::create_dir_all(&dir).expect("create fastembed test cache dir");
+                dir
+            })
+            .clone()
+    }
+
+    /// Cosine similarity between two equal-length f32 vectors. Returns
+    /// 1.0 for parallel, 0.0 for orthogonal, -1.0 for anti-parallel.
+    fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len(), "cosine_sim requires equal-length vecs");
+        let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if na == 0.0 || nb == 0.0 {
+            return 0.0;
+        }
+        dot / (na * nb)
+    }
+
+    #[test]
+    #[ignore = "downloads ~22MB model weights on first run; run with --ignored"]
+    fn fastembed_dim_matches_model() -> Result<()> {
+        let e = FastEmbedder::with_cache_dir(FastEmbedModel::default(), fastembed_test_cache())?;
+        let v = e.embed("hello world")?;
+        assert_eq!(
+            v.len(),
+            e.dimensions(),
+            "embed length must match dimensions(); got {}, expected {}",
+            v.len(),
+            e.dimensions(),
+        );
+        assert_eq!(
+            v.len(),
+            384,
+            "MiniLM-L6 family is 384-dim; if this changes, update FastEmbedModel::dimensions",
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "downloads ~22MB model weights on first run; run with --ignored"]
+    fn fastembed_distinct_inputs_distinct_outputs() -> Result<()> {
+        let e = FastEmbedder::with_cache_dir(FastEmbedModel::default(), fastembed_test_cache())?;
+        // Two clearly-different texts — if FastEmbedder is silently
+        // degenerate (e.g. returning zeros, or normalizing to a constant),
+        // cosine sim will be 1.0 or NaN and this fires.
+        let a = e.embed("a quick brown fox jumps over the lazy dog")?;
+        let b = e.embed("sqlite vec0 index sidecar for embedding storage")?;
+        let sim = cosine_sim(&a, &b);
+        assert!(
+            sim < 0.99,
+            "distinct inputs should produce distinct embeddings; cosine_sim={sim}",
+        );
+        // Negative sanity: also confirm the vectors aren't bitwise equal.
+        assert_ne!(a, b, "distinct inputs must not produce identical vectors");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "downloads ~22MB model weights on first run; run with --ignored"]
+    fn fastembed_same_input_idempotent() -> Result<()> {
+        let e = FastEmbedder::with_cache_dir(FastEmbedModel::default(), fastembed_test_cache())?;
+        let s = "the quick brown fox jumps over the lazy dog";
+        let v1 = e.embed(s)?;
+        let v2 = e.embed(s)?;
+        assert_eq!(
+            v1, v2,
+            "FastEmbedder must be deterministic; same input twice must produce bit-identical vectors",
+        );
         Ok(())
     }
 

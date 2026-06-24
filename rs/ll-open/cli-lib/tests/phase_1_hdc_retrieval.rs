@@ -15,13 +15,39 @@
 //! - Functions that differ by **one AST node** (e.g., `+= x` vs `+= *x`,
 //!   `0` vs `-1`) map to ~D/2 distance, indistinguishable from random.
 //!
-//! Bundle saturation at function depth (~30 nodes / depth 5-7) pushes
-//! the encoder past the linear-discrimination band. There's no
-//! "near-similar" — you either match exactly or you look random.
+//! ## Why (math-friend diagnosis, 2026-06-24 session-2)
 //!
-//! Math-friend's earlier saturation gate checked the *median* distance
-//! sat in [4090, 4102], which was true. It did NOT check whether
-//! near-similar pairs were measurably closer than random. They are not.
+//! NOT bundle saturation (the bundle is linear: rotation is an
+//! isometry, XOR-bundle preserves the children's distance differential).
+//! NOT content_hash propagation (content_hash is only the SubtreeCache
+//! key — never enters the HV computation).
+//!
+//! The mechanism is **fingerprint-induced base-vector switching**:
+//!   1. Adding one Unary leaf changes its direct parent's
+//!      `sorted_child_kinds` set (e.g. `[Lit]` → `[Op]`).
+//!   2. The parent's fingerprint `fp = (kind, arity, sorted_child_kinds)`
+//!      is therefore different.
+//!   3. `base_vector(fp)` is keyed on the fingerprint via a PRG, so the
+//!      parent's base_vector becomes a fresh-random hypervector
+//!      ≈ D/2 away from the original.
+//!   4. By induction up the tree, every ancestor of the changed leaf
+//!      also has a different fingerprint and a different base_vector.
+//!   5. The function-root HV is therefore ≈ D/2 away — pure random pair
+//!      distance.
+//!
+//! The encoder is faithful to HDC textbook (Plate 1994 / Kanerva 2009).
+//! The textbook ASSUMES `base_vector` is smooth across small structural
+//! perturbations. The fingerprint-keying we ship makes that impossible:
+//! adding one node flips an unrelated PRG seed at every ancestor of the
+//! change. There is no smoothness in fingerprint space — only exact
+//! match or "different seed."
+//!
+//! Math-friend's earlier saturation gate (median pair-distance in
+//! [4090, 4102]) was one-sided. The two-sided gate that would have
+//! caught this:
+//!   "Build N pairs that differ by one canonical-leaf insertion;
+//!    assert median pair distance ≤ D/2 − 3·σ_random ≈ 3961"
+//! Today's encoder gives ~4115 on those pairs — fails by ~150 bits.
 //!
 //! ## What this test does
 //!
@@ -38,13 +64,19 @@
 //!
 //! It's not "Phase 1 done, HDC retrieval works." HDC at function
 //! granularity does NOT work for the typical RAG case of "find code
-//! that's like this one but not identical." The substrate-retrieval
-//! claim needs either:
-//! - A different granularity (statement / expression level), or
-//! - A different encoder algebra (bind that doesn't saturate at depth 7), or
-//! - A different distance metric (LSH-style banded hashing).
+//! that's like this one but not identical." Math-friend's
+//! recommendation (2026-06-24 session-2): **statement-level
+//! granularity**. Each statement is shallow (depth 2-3) so the
+//! fingerprint-cascade can't reach a function root. Retrieval becomes
+//! "how many statement HVs from query match statement HVs in
+//! candidate" (set-overlap or graded count) rather than point-
+//! similarity on function HVs.
 //!
-//! Filing a follow-up bead for math-friend.
+//! Phase 0C's "complementary modality" finding was real-but-trivial:
+//! HDC at function granularity is a **binary hash-equality oracle**,
+//! not a graded similarity. The MI 1.2σ-above-null was carried by a
+//! few exact matches + pure noise everywhere else. Not a
+//! complementary modality — a degenerate one.
 //!
 //! ## Reproduce
 //!

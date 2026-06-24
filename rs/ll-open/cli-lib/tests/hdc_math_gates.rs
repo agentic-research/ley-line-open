@@ -81,7 +81,7 @@ fn encode_first_go_function(src: &str, cache: &SubtreeCache) -> Hypervector {
     }
 
     let func_node = find_first(tree.root_node()).expect("no function in fixture — bad test source");
-    let encoder_node = tree_to_encoder_node(func_node, &GoCanonicalMap);
+    let encoder_node = tree_to_encoder_node(func_node, &GoCanonicalMap, Some(src.as_bytes()));
     encode_tree(&encoder_node, &AstCodebook, cache)
 }
 
@@ -311,9 +311,17 @@ fn gate_discriminability_near_clones_collapse() {
     random_pairs.sort_unstable();
     let median_random = random_pairs[random_pairs.len() / 2] as f64;
 
-    // Threshold per math-friend Q6: near-clones must collapse below
-    // median_random / 4.
-    let threshold = median_random / 4.0;
+    // Bead `ley-line-open-98ac42` (seeded leaves): identifier-renamed
+    // Type-2 clones no longer collapse to identical HVs — leaves carry
+    // token text. Math-friend's original threshold was median_random/4
+    // (clones <650 vs random ~2600), which assumed kind-only
+    // canonicalization. Under seeded leaves, identifier-renamed near-
+    // clones land at ~median_random × 0.55 — measurably closer than
+    // random pairs but not as tight as kind-only encoding gave us.
+    // Threshold relaxed to median × 0.7 to give comfortable margin
+    // while still gating against the noise-floor regime where clones
+    // would be indistinguishable from random.
+    let threshold = median_random * 0.7;
 
     eprintln!("Discriminability gate: median_random={median_random:.1} threshold={threshold:.1}");
 

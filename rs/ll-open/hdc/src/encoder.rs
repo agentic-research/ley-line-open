@@ -15,6 +15,56 @@ use crate::canonical::CanonicalKind;
 use crate::codebook::{AstNodeFingerprint, BaseCodebook};
 use crate::util::{Hypervector, ZERO_HV, bucket_arity, bytes_to_hv, rotate_left};
 
+/// Char-trigram bundle for a token-bearing leaf. Bead `ley-line-open-98ac42`.
+///
+/// Builds a per-trigram HV via `bytes_to_hv` with a kind+trigram tag, then
+/// majority-bundles them. Two tokens sharing N trigrams produce bundles
+/// whose distance is roughly D/4 · (1 − N/total_trigrams).
+///
+/// Edge cases:
+/// - **Empty content**: returns `bytes_to_hv` of the kind tag alone — a
+///   stable identity for that kind. (Callers should avoid setting
+///   `leaf_content: Some(empty)` — `leaf_with_content` filters this.)
+/// - **Content shorter than 3 bytes**: pad with a sentinel byte 0x00 to
+///   produce one trigram. A 1- or 2-char token has minimal but
+///   well-defined identity.
+/// - **Kind tag**: included so `Ref("foo")` and `Lit("foo")` produce
+///   different HVs (same content, different role).
+fn leaf_content_hv(kind: CanonicalKind, content: &[u8]) -> Hypervector {
+    // Kind tag prefix is hashed into every trigram HV via the
+    // `tagged_seed_vector`-style format `"hdc-leaf-{kind_disc}/{trigram_bytes}"`.
+    // Without it, two leaves with the same text but different kinds
+    // would produce identical hypervectors.
+    let kind_byte = kind.discriminant();
+
+    let mut buf = [0u8; 3];
+    let mut trigram_hvs: Vec<Hypervector> = Vec::with_capacity(content.len() + 2);
+
+    // Pad short content to at least 3 bytes via 0x00. Then we always have
+    // at least one trigram regardless of content length.
+    let padded = if content.len() < 3 {
+        let mut p = content.to_vec();
+        p.resize(3, 0u8);
+        p
+    } else {
+        content.to_vec()
+    };
+
+    // Slide a 3-byte window across the padded content; each trigram HV is
+    // seeded by [kind, trigram_bytes...]. The "hdc-leaf-trigram/" tag
+    // prefix domain-separates from other `bytes_to_hv` callers.
+    for window in padded.windows(3) {
+        buf.copy_from_slice(window);
+        let mut tag = Vec::with_capacity(b"hdc-leaf-trigram/".len() + 4);
+        tag.extend_from_slice(b"hdc-leaf-trigram/");
+        tag.push(kind_byte);
+        tag.extend_from_slice(&buf);
+        trigram_hvs.push(bytes_to_hv(&tag));
+    }
+
+    majority_bundle_with_tiebreak(&trigram_hvs)
+}
+
 /// Majority bundle of N hypervectors with a deterministic tiebreaker for
 /// even-N — implements the HDC-canonical "similarity-preserving bundle."
 ///
@@ -78,13 +128,24 @@ pub struct EncoderNode {
     /// expects in `AstNodeFingerprint`. Order-invariant at the codebook
     /// level; child position re-encoded via role-binding in the encoder.
     pub child_canonical_kinds_sorted: Vec<CanonicalKind>,
-    /// Children in their original (parser-given) order. Encoder XOR-binds
-    /// each child's hypervector with `role_vector(i)` to encode position.
+    /// Children in their original (parser-given) order. Encoder
+    /// rotates each child by position before bundle composition.
     pub children: Vec<EncoderNode>,
+    /// Optional leaf token content — the raw byte text of an identifier,
+    /// literal, or other token-bearing leaf. Bead `ley-line-open-98ac42`
+    /// (seeded leaves): when present, the encoder produces a leaf HV via
+    /// character-trigram bundle composition over the bytes instead of the
+    /// kind-only `base_vector(fp)`. Two leaves sharing many trigrams get
+    /// graded-close HVs (`Ref("getName")` and `Ref("getEmail")` share
+    /// "get" → measurably closer than two random refs). Interior nodes
+    /// keep this as `None` — only token-bearing leaves use it.
+    pub leaf_content: Option<Vec<u8>>,
 }
 
 impl EncoderNode {
-    /// Convenience constructor.
+    /// Convenience constructor for interior nodes (with children). Leaves
+    /// the `leaf_content` field as `None` — interior nodes never carry
+    /// token text.
     pub fn new(kind: CanonicalKind, children: Vec<EncoderNode>) -> Self {
         let mut sorted: Vec<CanonicalKind> = children.iter().map(|c| c.canonical_kind).collect();
         sorted.sort_unstable_by_key(|k| k.discriminant());
@@ -92,14 +153,29 @@ impl EncoderNode {
             canonical_kind: kind,
             child_canonical_kinds_sorted: sorted,
             children,
+            leaf_content: None,
         }
     }
 
-    /// Convenience constructor for a leaf node (no children).
-    /// Equivalent to `EncoderNode::new(kind, vec![])`. Eliminates
-    /// the `leaf(kind)` helper that several test modules duplicated.
+    /// Convenience constructor for a kind-only leaf node (no children,
+    /// no token content). Encoder uses `base_vector(fp)` at this leaf.
     pub fn leaf(kind: CanonicalKind) -> Self {
         Self::new(kind, vec![])
+    }
+
+    /// Convenience constructor for a content-bearing leaf node.
+    /// Used for `Ref`/`Lit`-style leaves where the token bytes carry
+    /// load-bearing semantic content. Encoder produces a graded-similar
+    /// HV via character-trigram bundle composition over `content`.
+    ///
+    /// Empty `content` is allowed (degenerates to `leaf(kind)`'s
+    /// behavior — content-less leaf).
+    pub fn leaf_with_content(kind: CanonicalKind, content: Vec<u8>) -> Self {
+        let mut node = Self::leaf(kind);
+        if !content.is_empty() {
+            node.leaf_content = Some(content);
+        }
+        node
     }
 
     /// Build the codebook fingerprint for this node.
@@ -151,6 +227,23 @@ impl EncoderNode {
         hasher.update(&children_len.to_le_bytes());
         for child in &self.children {
             hasher.update(&child.content_hash());
+        }
+
+        // Bead `ley-line-open-98ac42`: leaf_content discriminates two
+        // leaves of the same kind with different token bytes. Without
+        // this hashed in, the cache would return the same HV for
+        // `Ref("getName")` and `Ref("getEmail")` despite the encoder
+        // producing different HVs at the leaf step. Length-prefixed
+        // for the same anti-aliasing reason as `child_canonical_kinds`.
+        match &self.leaf_content {
+            Some(c) => {
+                let len = c.len() as u32;
+                hasher.update(&len.to_le_bytes());
+                hasher.update(c);
+            }
+            None => {
+                hasher.update(&0u32.to_le_bytes());
+            }
         }
 
         *hasher.finalize().as_bytes()
@@ -237,6 +330,37 @@ where
 
     let fp = node.fingerprint();
     let base = codebook.base_vector(&fp);
+
+    // Seeded leaves (bead ley-line-open-98ac42). A content-bearing leaf
+    // (Ref/Lit token with text) gets encoded via char-trigram bundle so
+    // two leaves sharing many substrings produce graded-close HVs.
+    //
+    // Why this matters: without seeded leaves, `Ref("getName")` and
+    // `Ref("getEmail")` are bitwise-identical (kind=Ref, arity=0, no
+    // children → same fingerprint → same base_vector). The bundle
+    // composition can't help if the leaves it composes are atomic
+    // hashes with no metric. Third-party HDC review made this point
+    // directly: "if your leaf tokens are random/orthogonal, you only
+    // get credit for exactly shared tokens."
+    //
+    // Char-trigram bundle is the classic HDC text-encoding pattern
+    // (Kanerva 2009 sequence encoding). For each 3-char window of the
+    // token bytes, derive an HV via `tagged_seed_vector("hdc-trigram", ...)`
+    // and majority-bundle them all. Two tokens sharing N trigrams produce
+    // bundles whose Hamming distance is roughly inversely proportional
+    // to N — graded similarity in the substrate's natural metric.
+    //
+    // Leaves with no content (`leaf_content: None`) keep the existing
+    // `base_vector(fp)` behavior — unchanged for non-token-bearing
+    // leaves like Block-shaped scopes.
+    if node.children.is_empty()
+        && let Some(content) = node.leaf_content.as_ref()
+        && !content.is_empty()
+    {
+        let hv = leaf_content_hv(node.canonical_kind, content);
+        cache.put(key, hv);
+        return hv;
+    }
 
     // Bundle composition (bead ley-line-open-7b5086, math-friend session-3 +
     // third-party HDC review). Replaces the prior XOR-bind composition.
@@ -842,6 +966,77 @@ mod tests {
             "different child kinds must produce measurably different parent HVs; \
              got distance {d} (threshold 1024 bits under bundle composition)"
         );
+    }
+
+    #[test]
+    fn seeded_leaves_grade_similar_tokens() {
+        // Bead `ley-line-open-98ac42`: token-bearing leaves carry text via
+        // `leaf_content`. The encoder produces char-trigram bundle HVs at
+        // those leaves so two leaves sharing substrings get measurably-
+        // close HVs while unrelated tokens stay far.
+        let cb = AstCodebook::new();
+
+        // Same kind, shared prefix "get" → trigrams "get","etN","tNa",...
+        // overlap with "get","etE","tEm",... at the leading trigram.
+        let get_name = EncoderNode::leaf_with_content(CanonicalKind::Ref, b"getName".to_vec());
+        let get_email = EncoderNode::leaf_with_content(CanonicalKind::Ref, b"getEmail".to_vec());
+        // Same kind, no shared substrings — should be far.
+        let unrelated = EncoderNode::leaf_with_content(CanonicalKind::Ref, b"xyzqqq".to_vec());
+        // Same text, different kind — should be far (kind tag domain-
+        // separates the trigram seeds).
+        let lit_get_name = EncoderNode::leaf_with_content(CanonicalKind::Lit, b"getName".to_vec());
+
+        let h_get_name = encode_fresh(&get_name, &cb);
+        let h_get_email = encode_fresh(&get_email, &cb);
+        let h_unrelated = encode_fresh(&unrelated, &cb);
+        let h_lit_get_name = encode_fresh(&lit_get_name, &cb);
+
+        let d_shared = crate::util::popcount_distance(&h_get_name, &h_get_email);
+        let d_unrelated = crate::util::popcount_distance(&h_get_name, &h_unrelated);
+        let d_diff_kind = crate::util::popcount_distance(&h_get_name, &h_lit_get_name);
+
+        println!(
+            "d(Ref'getName', Ref'getEmail') = {d_shared}, \
+             d(Ref'getName', Ref'xyzqqq') = {d_unrelated}, \
+             d(Ref'getName', Lit'getName') = {d_diff_kind}"
+        );
+
+        // Shared-prefix MUST be closer than unrelated.
+        assert!(
+            d_shared < d_unrelated,
+            "shared-prefix leaves must be closer than unrelated leaves; \
+             got d_shared={d_shared}, d_unrelated={d_unrelated}"
+        );
+        // Different-kind same-content MUST be far (kind tag prevents collision).
+        assert!(
+            d_diff_kind > 1024,
+            "leaves of different canonical kinds must be far even with same content; \
+             got d_diff_kind={d_diff_kind}"
+        );
+    }
+
+    #[test]
+    fn seeded_leaf_with_same_content_is_deterministic() {
+        // Bead `ley-line-open-98ac42`: same content + same kind must
+        // produce bit-identical HV across two encodings. Pinned so the
+        // SubtreeCache contract holds (cache returns the same HV that
+        // a fresh encode would).
+        let cb = AstCodebook::new();
+        let a = EncoderNode::leaf_with_content(CanonicalKind::Ref, b"foo".to_vec());
+        let b = EncoderNode::leaf_with_content(CanonicalKind::Ref, b"foo".to_vec());
+        assert_eq!(encode_fresh(&a, &cb), encode_fresh(&b, &cb));
+    }
+
+    #[test]
+    fn seeded_leaf_with_empty_content_falls_back_to_base_vector() {
+        // `leaf_with_content(kind, vec![])` filters empty content,
+        // leaving `leaf_content: None`. The encoder then uses
+        // `base_vector(fp)` — equivalent to the kind-only `leaf(kind)`
+        // path. Pin that backward-compat behavior.
+        let cb = AstCodebook::new();
+        let empty = EncoderNode::leaf_with_content(CanonicalKind::Ref, vec![]);
+        let kind_only = EncoderNode::leaf(CanonicalKind::Ref);
+        assert_eq!(encode_fresh(&empty, &cb), encode_fresh(&kind_only, &cb));
     }
 
     // Unbind tests removed: bead `ley-line-open-7b5086` swapped XOR-bind

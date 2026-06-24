@@ -187,9 +187,33 @@ pub fn explain_cluster_centroid<C>(
 where
     C: BaseCodebook<Item = AstNodeFingerprint>,
 {
-    use crate::util::{ZERO_HV, popcount_distance};
+    use crate::encoder::EncoderNode;
+    use crate::util::{ZERO_HV, bytes_to_hv, popcount_distance};
 
     let leaf_base = |kind: CanonicalKind| codebook.base_vector(&AstNodeFingerprint::leaf(kind));
+
+    // Mirror encoder.rs's `content_role`: bind child by content_hash.
+    // The encoder mixes `content_role(child.content_hash())` into each
+    // child's HV before the positional rotation, so reconstructing the
+    // siblings_acc / cleanup-memory targets must mix the same role in.
+    // Math-friend rebind (2026-06-24).
+    let content_role = |hash: &[u8; 32]| -> Hypervector {
+        let mut buf = Vec::with_capacity(b"hdc-merkle-role/".len() + 32);
+        buf.extend_from_slice(b"hdc-merkle-role/");
+        buf.extend_from_slice(hash);
+        bytes_to_hv(&buf)
+    };
+    let leaf_role = |kind: CanonicalKind| content_role(&EncoderNode::leaf(kind).content_hash());
+    // The cleanup-memory target for "this position's child" is
+    // `leaf_base(kind) ⊕ content_role(leaf(kind))`. This is what the
+    // unbind residual recovers (before XOR'ing the role back out at
+    // the caller — but here it's cleaner to compare against the
+    // content-rolled HV directly).
+    let leaf_target = |kind: CanonicalKind| {
+        let mut hv = leaf_base(kind);
+        xor_into(&mut hv, &leaf_role(kind));
+        hv
+    };
 
     let parent_fp = AstNodeFingerprint::new(
         centroid_root_kind,
@@ -198,13 +222,15 @@ where
     );
     let parent_base = codebook.base_vector(&parent_fp);
 
-    // Build the sum of all positional rotated leaf bases — what the
-    // encoder XOR'd into parent_base for the immediate children.
+    // Build the sum of all positional rotated content-bound leaf bases —
+    // what the encoder XOR'd into parent_base for the immediate
+    // children. Post-rebind each term is `rotate_left(leaf_base ⊕
+    // content_role, i)` (not just `rotate_left(leaf_base, i)`).
     let mut all_siblings_acc = ZERO_HV;
     let mut per_position_terms: Vec<Hypervector> =
         Vec::with_capacity(centroid_child_kinds_positional.len());
     for (i, &kind) in centroid_child_kinds_positional.iter().enumerate() {
-        let term = rotate_left(&leaf_base(kind), i);
+        let term = rotate_left(&leaf_target(kind), i);
         per_position_terms.push(term);
         xor_into(&mut all_siblings_acc, &term);
     }
@@ -217,12 +243,14 @@ where
 
         let unbound = unbind_child_at_position(centroid, &parent_base, &siblings_at_i, i);
 
-        // Cleanup memory: find the candidate kind whose leaf-base
-        // hypervector is closest to the unbound residual. min_by_key
-        // collapses the imperative track-best loop.
+        // Cleanup memory: find the candidate kind whose
+        // `leaf_target = leaf_base ⊕ content_role(leaf)` is closest to
+        // the unbound residual. Post-rebind, leaf_base alone is the
+        // wrong target — the encoder mixed content_role in, so the
+        // cleanup memory must too.
         if let Some((kind, d)) = candidate_child_kinds
             .iter()
-            .map(|&kind| (kind, popcount_distance(&unbound, &leaf_base(kind))))
+            .map(|&kind| (kind, popcount_distance(&unbound, &leaf_target(kind))))
             .min_by_key(|(_, d)| *d)
         {
             recovered.push((i, kind, d));

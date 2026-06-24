@@ -275,7 +275,7 @@ fn phase_0c_hdc_vs_vec_rank_mutual_information() {
             if fn_src.len() < 40 {
                 continue;
             }
-            let encoder_node = tree_to_encoder_node(fn_node, &kind_map);
+            let encoder_node = tree_to_encoder_node(fn_node, &kind_map, Some(source.as_bytes()));
             let hv = encode_fresh(&encoder_node, &codebook);
             corpus.push(FunctionRecord {
                 label: format!(

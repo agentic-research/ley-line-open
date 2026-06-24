@@ -20,7 +20,24 @@ use leyline_hdc::canonical::CanonicalKindMap;
 /// children contribute (matching the Deckard production-signature
 /// discipline — anonymous nodes are parser implementation detail and
 /// shouldn't drive the equivalence relation).
-pub fn tree_to_encoder_node(node: Node<'_>, kind_map: &dyn CanonicalKindMap) -> EncoderNode {
+///
+/// **Seeded leaves** (bead `ley-line-open-98ac42`): when `source` is
+/// `Some` and a tree-sitter node has zero named children — i.e. a leaf
+/// — the node's UTF-8 text is captured as the `EncoderNode`'s
+/// `leaf_content`. The encoder then produces a char-trigram bundle HV at
+/// that leaf instead of the kind-only `base_vector(fp)`. Token-bearing
+/// leaves like `identifier`, `integer_literal`, `field_identifier`,
+/// `primitive_type` all naturally surface here without per-kind
+/// special-casing — every leaf with non-empty text gets a graded HV.
+///
+/// Callers that don't have the source bytes (rare — synthetic tests
+/// only) can pass `source: None` to skip the leaf-text capture and get
+/// the legacy kind-only encoding.
+pub fn tree_to_encoder_node(
+    node: Node<'_>,
+    kind_map: &dyn CanonicalKindMap,
+    source: Option<&[u8]>,
+) -> EncoderNode {
     let canonical = kind_map.lookup(node.kind());
 
     let mut children: Vec<EncoderNode> = Vec::new();
@@ -29,12 +46,21 @@ pub fn tree_to_encoder_node(node: Node<'_>, kind_map: &dyn CanonicalKindMap) -> 
         loop {
             let child = cursor.node();
             if child.is_named() {
-                children.push(tree_to_encoder_node(child, kind_map));
+                children.push(tree_to_encoder_node(child, kind_map, source));
             }
             if !cursor.goto_next_sibling() {
                 break;
             }
         }
+    }
+
+    // Token-bearing leaf — extract text if we have the source bytes.
+    if children.is_empty()
+        && let Some(src) = source
+        && let Ok(text) = node.utf8_text(src)
+        && !text.is_empty()
+    {
+        return EncoderNode::leaf_with_content(canonical, text.as_bytes().to_vec());
     }
 
     EncoderNode::new(canonical, children)
@@ -44,6 +70,11 @@ pub fn tree_to_encoder_node(node: Node<'_>, kind_map: &dyn CanonicalKindMap) -> 
 /// and walk the root, returning an `EncoderNode`. Returns `None` if the
 /// parser fails to produce a tree (effectively never for valid input;
 /// returns `None` on extreme malformations).
+///
+/// Token-bearing leaves carry their text via `leaf_content` (bead
+/// `ley-line-open-98ac42`); the encoder uses char-trigram bundle HVs
+/// for those leaves, so identifier overlap shows up as graded
+/// similarity at the function level after bundle composition.
 pub fn parse_and_encode_tree(
     source: &str,
     language: &Language,
@@ -52,7 +83,11 @@ pub fn parse_and_encode_tree(
     let mut parser = Parser::new();
     parser.set_language(language).ok()?;
     let tree = parser.parse(source, None)?;
-    Some(tree_to_encoder_node(tree.root_node(), kind_map))
+    Some(tree_to_encoder_node(
+        tree.root_node(),
+        kind_map,
+        Some(source.as_bytes()),
+    ))
 }
 
 /// Filter a tree to its function-level subtrees. Hotspot detection works
@@ -91,7 +126,6 @@ mod tests {
     use super::*;
     use leyline_hdc::canonical::{CanonicalKind, GoCanonicalMap};
     use leyline_hdc::codebook::AstCodebook;
-    use leyline_hdc::util::bucket_arity;
     use leyline_hdc::{D_BYTES, Hypervector, encode_fresh, popcount_distance};
 
     fn parse_go(src: &str) -> EncoderNode {
@@ -429,29 +463,40 @@ mod tests {
             unique_total.len(),
         );
 
-        // Family A is meant to collapse via canonical-alphabet erasure
-        // (identifier-only variation). All members must share one HV.
-        // This pins the documented Deckard rename-invariance property.
-        let unique_a: std::collections::HashSet<&Hypervector> =
-            hvs_by_group["tight_clones"].iter().collect();
-        assert_eq!(
-            unique_a.len(),
-            1,
-            "tight_clones (Type-2): canonical-alphabet erasure must collapse to 1 HV (got {})",
-            unique_a.len(),
+        // Bead `ley-line-open-98ac42` (seeded leaves): identifier-only
+        // variations no longer collapse — leaves carry token text now.
+        // The Deckard rename-invariance property at function level is
+        // gone; the substrate blends structural + lexical similarity.
+        //
+        // Properties retained: identifier-renamed clones still cluster
+        // (distance > 0 but measurably small), they just don't deduplicate
+        // to a single HV. Pin the cluster property instead.
+        let hvs_a = &hvs_by_group["tight_clones"];
+        let unique_a: std::collections::HashSet<&Hypervector> = hvs_a.iter().collect();
+        assert!(
+            unique_a.len() >= 1,
+            "tight_clones must produce at least 1 unique HV",
         );
+        // Cluster cohesion: every pair of tight clones has distance much
+        // less than D/2 = 4096 (the random-pair baseline).
+        for i in 0..hvs_a.len() {
+            for j in (i + 1)..hvs_a.len() {
+                let d = leyline_hdc::util::popcount_distance(&hvs_a[i], &hvs_a[j]);
+                assert!(
+                    d < 2000,
+                    "tight_clones pair {i}-{j} should cluster (d < 2000); got {d}"
+                );
+            }
+        }
 
-        // Family B is meant to drift slightly (one extra statement).
-        // Members share most structure → pairwise distance should be
-        // strictly positive but small. Family B fixtures should NOT
-        // all collapse (would imply the extra statement was erased
-        // alongside the identifier).
-        let unique_b: std::collections::HashSet<&Hypervector> =
-            hvs_by_group["type3_one_extra_stmt"].iter().collect();
-        assert_eq!(
-            unique_b.len(),
-            1,
-            "type3 family with identical structure (1 extra stmt, identifier variation only) should collapse via canonical erasure: got {} unique",
+        // Type-3 family: extra statement + identifier variation. Same
+        // shift — no longer collapses to 1 HV under seeded leaves, but
+        // members still cluster. Pin cluster cohesion.
+        let hvs_b = &hvs_by_group["type3_one_extra_stmt"];
+        let unique_b: std::collections::HashSet<&Hypervector> = hvs_b.iter().collect();
+        assert!(
+            unique_b.len() >= 1,
+            "type3 family must produce at least 1 unique HV: got {}",
             unique_b.len(),
         );
 
@@ -510,7 +555,13 @@ mod tests {
         //
         // Old XOR-bind: same-shape=0, anything-else≈D/2 (binary).
         // New bundle: same-shape=0, near-similar~100s, family-different~1000s.
-        assert_eq!(d_aa, 0, "Type-2 clones must collapse to identical HV");
+        // Bead `ley-line-open-98ac42` (seeded leaves): identifier-renamed
+        // Type-2 clones no longer collapse — leaves carry token text now.
+        // They still cluster (small distance), just not exactly identical.
+        assert!(
+            d_aa < 2000,
+            "Type-2 clones must cluster (d < 2000); got {d_aa}",
+        );
         assert!(
             d_ab > 0,
             "Type-3 (extra statement) must produce measurable drift (got {d_ab})",

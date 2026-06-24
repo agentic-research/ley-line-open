@@ -144,7 +144,7 @@ fn encode_fn(label: &'static str, src: &str, parser: &mut Parser) -> FnStmts {
     let stmt_hvs: Vec<Hypervector> = stmts
         .into_iter()
         .map(|stmt| {
-            let encoder_node = tree_to_encoder_node(stmt, &kind_map);
+            let encoder_node = tree_to_encoder_node(stmt, &kind_map, Some(src.as_bytes()));
             encode_fresh(&encoder_node, &codebook)
         })
         .collect();

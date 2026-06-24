@@ -217,8 +217,11 @@ impl EnrichmentPass for HdcEnrichmentPass {
                 let start_byte = func_node.start_byte();
                 let end_byte = func_node.end_byte();
 
-                let encoder_node =
-                    super::hdc_pass::tree_to_encoder_node(func_node, &*setup.kind_map);
+                let encoder_node = super::hdc_pass::tree_to_encoder_node(
+                    func_node,
+                    &*setup.kind_map,
+                    Some(content.as_bytes()),
+                );
                 let hv = leyline_hdc::encoder::encode_tree(&encoder_node, &codebook, &cache);
                 let hv_bytes = hv.to_vec();
 

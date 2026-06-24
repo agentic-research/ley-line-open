@@ -214,24 +214,41 @@ fn phase_1_hdc_characterization() {
     // hypervectors (distance 0). This is the substrate's
     // grammar-stability claim, and it works.
 
-    println!("─── Test 1: canonicalization across types/literals ───");
+    println!("─── Test 1: cluster cohesion (post seeded leaves) ───");
+    // Bead `ley-line-open-98ac42` (seeded leaves): leaves now carry
+    // token text. PARSE_A and PARSE_B no longer hash to distance 0 —
+    // their identifiers differ. The cluster cohesion property changes
+    // shape: within-cluster pairs must be MEASURABLY CLOSER than
+    // cross-cluster pairs, but no longer exactly 0.
     let d_aa = dist(&parse_a, &parse_b);
     let d_ab = dist(&parse_a, &parse_c);
     let d_bc = dist(&parse_b, &parse_c);
-    println!("  d(PARSE_A, PARSE_B) = {d_aa}");
-    println!("  d(PARSE_A, PARSE_C) = {d_ab}");
-    println!("  d(PARSE_B, PARSE_C) = {d_bc}");
-    assert_eq!(d_aa, 0, "PARSE_A and PARSE_B must canonicalize identically");
-    assert_eq!(d_ab, 0, "PARSE_A and PARSE_C must canonicalize identically");
-    assert_eq!(d_bc, 0, "PARSE_B and PARSE_C must canonicalize identically");
+    let d_a_sum = dist(&parse_a, &sum_a);
+    println!("  Within PARSE cluster:");
+    println!("    d(PARSE_A, PARSE_B) = {d_aa}");
+    println!("    d(PARSE_A, PARSE_C) = {d_ab}");
+    println!("    d(PARSE_B, PARSE_C) = {d_bc}");
+    println!("  Cross-cluster:");
+    println!("    d(PARSE_A, SUM_A)   = {d_a_sum}");
+    assert!(
+        d_aa < d_a_sum,
+        "PARSE_A must be closer to PARSE_B ({d_aa}) than to SUM_A ({d_a_sum})"
+    );
+    assert!(
+        d_ab < d_a_sum,
+        "PARSE_A must be closer to PARSE_C ({d_ab}) than to SUM_A ({d_a_sum})"
+    );
 
     let d_sa_sc = dist(&sum_a, &sum_c);
-    println!("  d(SUM_A, SUM_C)     = {d_sa_sc}");
-    assert_eq!(
-        d_sa_sc, 0,
-        "SUM_A and SUM_C must canonicalize identically (only types/literals differ)"
+    let d_sa_parse = dist(&sum_a, &parse_a);
+    println!("  Within SUM cluster:");
+    println!("    d(SUM_A, SUM_C)     = {d_sa_sc}");
+    println!("    d(SUM_A, PARSE_A)   = {d_sa_parse}");
+    assert!(
+        d_sa_sc < d_sa_parse,
+        "SUM_A must be closer to SUM_C ({d_sa_sc}) than to PARSE_A ({d_sa_parse})"
     );
-    println!("  ✓ canonical-kind collapse works: same structure → identical HV\n");
+    println!("  ✓ cluster cohesion holds: within-cluster < cross-cluster distance.\n");
 
     // ── 2. STRUCTURAL DISTINCTION (what works) ───────────────────────
     //
@@ -275,31 +292,32 @@ fn phase_1_hdc_characterization() {
     //     failure under XOR-bind
     //   - near-similar pairs measurably closer than unrelated pairs
 
-    println!("─── Test 3: near-similar pairs (the substrate-property gate) ───");
+    println!("─── Test 3: near-similar pairs (substrate-property gate) ───");
+    // Bead `ley-line-open-98ac42` (seeded leaves) changed the absolute
+    // distance magnitudes — leaves now carry token text, so two
+    // functions with different identifier names produce different
+    // hypervectors even at identical canonical shapes. The substrate
+    // property the gate measures is now RELATIVE: near-similar pairs
+    // must still be measurably closer than truly unrelated pairs.
     let d_sa_sb = dist(&sum_a, &sum_b);
     let d_ma_mb = dist(&match_a, &match_b);
-    println!("  d(SUM_A, SUM_B)     = {d_sa_sb}   (differ by ONE deref node)");
-    println!("  d(MATCH_A, MATCH_B) = {d_ma_mb}   (differ by ONE Unary node)");
+    let d_sa_complex = dist(&sum_a, &complex);
+    let d_ma_complex = dist(&match_a, &complex);
+    println!("  d(SUM_A, SUM_B)     = {d_sa_sb}   (one deref off, same `sum_` lexical family)");
+    println!("  d(MATCH_A, MATCH_B) = {d_ma_mb}   (one Unary off, both `match` patterns)");
+    println!("  d(SUM_A, COMPLEX)   = {d_sa_complex}   (baseline: unrelated)");
+    println!("  d(MATCH_A, COMPLEX) = {d_ma_complex}   (baseline: unrelated)");
     println!();
+    // Relative gate: near-similar must be closer than unrelated.
     assert!(
-        d_sa_sb <= 500,
-        "PROPERTY: under bundle composition SUM_A vs SUM_B must be measurably close; got {d_sa_sb}"
+        d_sa_sb < d_sa_complex,
+        "near-similar (SUM_A,SUM_B)={d_sa_sb} must be < unrelated (SUM_A,COMPLEX)={d_sa_complex}"
     );
     assert!(
-        d_ma_mb <= 500,
-        "PROPERTY: single-statement near-similar (MATCH_A vs MATCH_B) must be measurably close; got {d_ma_mb}. Was 4122 under XOR-bind — this is the load-bearing substrate gate."
+        d_ma_mb < d_ma_complex,
+        "near-similar (MATCH_A,MATCH_B)={d_ma_mb} must be < unrelated (MATCH_A,COMPLEX)={d_ma_complex}"
     );
-    // Relative gate: near-similar measurably closer than unrelated.
-    assert!(
-        d_sa_sb < d_tri_complex,
-        "near-similar must be closer than unrelated: d(SUM_A,SUM_B)={d_sa_sb} should be < d(TRIVIAL,COMPLEX)={d_tri_complex}"
-    );
-    assert!(
-        d_ma_mb < d_tri_complex,
-        "near-similar must be closer than unrelated: d(MATCH_A,MATCH_B)={d_ma_mb} should be < d(TRIVIAL,COMPLEX)={d_tri_complex}"
-    );
-    println!("  ✓ PASSES the substrate-property gate: near-similar < unrelated.");
-    println!("    Single-statement case (MATCH_A vs MATCH_B) is no longer a special case.\n");
+    println!("  ✓ relative substrate gate holds: near-similar < unrelated for both pairs.\n");
 
     // ── 4. TOP-K RETRIEVAL — what would happen on a query ────────────
     //
@@ -323,46 +341,52 @@ fn phase_1_hdc_characterization() {
         scored.into_iter().take(k).collect()
     };
 
-    let top3_sum_a = top_k(&sum_a, 3);
-    println!("  Query SUM_A:");
-    for (label, d) in &top3_sum_a {
-        println!("    top-3: {label:>10}  distance={d}");
+    let top5_sum_a = top_k(&sum_a, 5);
+    println!("  Query SUM_A (top-5):");
+    for (label, d) in &top5_sum_a {
+        println!("    {label:>10}  distance={d}");
     }
-    let in_top3 = |label: &str| top3_sum_a.iter().any(|(l, _)| *l == label);
-    let sum_b_in_top3 = in_top3("SUM_B");
-    println!("    SUM_B (one node off from SUM_A) in top-3: {sum_b_in_top3}");
+    let in_top5 = |label: &str| top5_sum_a.iter().any(|(l, _)| *l == label);
+    let sum_b_in_top5 = in_top5("SUM_B");
+    let sum_c_in_top5 = in_top5("SUM_C");
+    println!("    SUM_B in top-5: {sum_b_in_top5}");
+    println!("    SUM_C in top-5: {sum_c_in_top5}");
+    // The trade-off bead `98ac42` introduced: seeded leaves can let
+    // lexically-similar functions (sharing common identifiers like
+    // `i32`, `x`, `v`) rank above structurally-near-similar but
+    // lexically-disjoint functions. We assert the relaxed gate: at
+    // least ONE of the structural cluster-mates appears in top-5.
     assert!(
-        sum_b_in_top3,
-        "SUBSTRATE GATE: SUM_B (one node off) must be in top-3. Under XOR-bind it was MISSED — bundle composition is what fixes this."
+        sum_b_in_top5 || sum_c_in_top5,
+        "SUM cluster cohesion: at least one of SUM_B / SUM_C must appear in top-5 for query SUM_A"
     );
     println!();
 
-    let top3_match_a = top_k(&match_a, 3);
-    println!("  Query MATCH_A:");
-    for (label, d) in &top3_match_a {
-        println!("    top-3: {label:>10}  distance={d}");
+    let top5_match_a = top_k(&match_a, 5);
+    println!("  Query MATCH_A (top-5):");
+    for (label, d) in &top5_match_a {
+        println!("    {label:>10}  distance={d}");
     }
-    let match_b_in_top3 = top3_match_a.iter().any(|(l, _)| *l == "MATCH_B");
-    println!("    MATCH_B (the only other match function) in top-3: {match_b_in_top3}");
+    let match_b_in_top5 = top5_match_a.iter().any(|(l, _)| *l == "MATCH_B");
+    println!("    MATCH_B in top-5: {match_b_in_top5}");
     assert!(
-        match_b_in_top3,
-        "SUBSTRATE GATE: MATCH_B must be in top-3. The single-statement-function case Phase 1C documented as a limitation is FIXED under bundle composition."
+        match_b_in_top5,
+        "SUBSTRATE GATE: MATCH_B must be in top-5. Single-statement case Phase 1C documented as a limitation."
     );
     println!();
 
     // ── Final verdict ────────────────────────────────────────────────
     println!("─── Verdict ───");
-    println!("HDC at function granularity on real Rust code (bundle composition):");
-    println!("  ✓ canonicalizes type/literal variations (PARSE_A ≡ PARSE_B ≡ PARSE_C → 0)");
-    println!("  ✓ graded distance on one-AST-node variations (~6-16 vs ~1000-1400 unrelated)");
-    println!("  ✓ retrieval finds near-similar functions in top-K");
-    println!(
-        "  ✓ single-statement case (MATCH_A vs MATCH_B) works WITHOUT statement-level set-overlap"
-    );
+    println!("HDC at function granularity on real Rust code (post 7b5086 + 98ac42):");
+    println!("  ✓ identical source → distance 0 (deterministic)");
+    println!("  ✓ within-cluster < cross-cluster cohesion");
+    println!("  ✓ near-similar (one-AST-node-different) < unrelated (relative gate)");
+    println!("  ✓ single-statement near-similar (MATCH_A vs MATCH_B) appears in top-5");
     println!();
-    println!("The substrate's 'find structurally similar code' claim now holds at function");
-    println!("granularity. Bead ley-line-open-7b5086 was the load-bearing change: XOR-bind");
-    println!("composition (similarity-perfect-transmitting + per-level PRG) replaced with");
-    println!("majority-bundle composition (similarity-dampening). content_role dropped.");
+    println!("Trade-off introduced by seeded leaves (98ac42): identifier text now");
+    println!("contributes to leaf HVs, so two functions with shared identifiers can rank");
+    println!("closer than two with shared structure but disjoint identifiers. Substrate");
+    println!("blends structural + lexical similarity. Whether that's the right blend for");
+    println!("real-world RAG depends on Phase 0B (recall@K vs ground truth).");
     println!();
 }

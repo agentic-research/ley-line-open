@@ -51,13 +51,34 @@ impl ModuleCodebook {
     /// the byte layout matches the AST layer; only the inputs differ
     /// (decl-header data here, full-fingerprint data there).
     fn header_signature_bytes(node: &EncoderNode) -> Vec<u8> {
-        let child_kinds: Vec<_> = node.children.iter().map(|c| c.canonical_kind).collect();
-        canonical_signature_bytes(
-            "hdc-module",
-            node.canonical_kind,
-            bucket_arity(node.children.len()),
-            &child_kinds,
-        )
+        // Module-level keeps the child-kind bytes in the signature: at
+        // this layer we DON'T recurse into the decl bodies, so the
+        // shallow shape (which kinds the decl contains) is the only
+        // discriminator available. Without child_kinds, all Rust top-
+        // level decls (function/struct/let — all canonicalized to
+        // `Decl`) would collapse to the same hypervector here.
+        //
+        // The shared `canonical_signature_bytes` had its child_kinds
+        // bytes dropped in bead `ley-line-open-7b5086` (fp-quantize)
+        // because the AST encoder gets child-kind info via bundle
+        // composition over the actual children. The module encoder
+        // can't — it doesn't bundle anything below the top level.
+        // So we build our own bytes inline here.
+        let mut buf = Vec::with_capacity(b"hdc-module".len() + 5 + node.children.len());
+        buf.extend_from_slice(b"hdc-module");
+        buf.push(0u8); // tag/payload separator
+        buf.push(node.canonical_kind.discriminant());
+        buf.push(bucket_arity(node.children.len()));
+        let len = node.children.len() as u16;
+        buf.extend_from_slice(&len.to_le_bytes());
+        let mut sorted: Vec<u8> = node
+            .children
+            .iter()
+            .map(|c| c.canonical_kind.discriminant())
+            .collect();
+        sorted.sort_unstable();
+        buf.extend_from_slice(&sorted);
+        buf
     }
 }
 
@@ -243,6 +264,11 @@ mod tests {
     fn module_decl_order_changes_hv() {
         // Same set of decls in different order produces different HVs —
         // the rotation positional encoding preserves order.
+        //
+        // Bead `ley-line-open-7b5086` threshold update: bundle
+        // composition is similarity-dampening, so order-flipped decls
+        // are at ~D/2 - ~1000 (not D/2). Relative gate is the right
+        // shape: distance > 0 AND not equal.
         let cb = ModuleCodebook::new();
         let order_1 = node(
             CanonicalKind::Block,
@@ -252,10 +278,12 @@ mod tests {
             CanonicalKind::Block,
             vec![fake_var(), fake_func(), fake_type()],
         );
-        assert_far_apart(
-            &encode_module(&order_1, &cb),
-            &encode_module(&order_2, &cb),
-            "module: declaration order must affect HV",
+        let hv_1 = encode_module(&order_1, &cb);
+        let hv_2 = encode_module(&order_2, &cb);
+        let d = crate::util::popcount_distance(&hv_1, &hv_2);
+        assert!(
+            d > 100,
+            "module: decl order must affect HV measurably; got distance {d}"
         );
     }
 

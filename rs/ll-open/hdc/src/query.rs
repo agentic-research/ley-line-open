@@ -21,9 +21,7 @@
 use rusqlite::Connection;
 
 use crate::LayerKind;
-use crate::canonical::CanonicalKind;
-use crate::codebook::{AstNodeFingerprint, BaseCodebook};
-use crate::util::{Hypervector, rotate_left, rotate_right, xor_into};
+use crate::util::Hypervector;
 
 /// One row of a radius-search result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,166 +108,40 @@ pub fn combined_prefilter(
     rows.collect()
 }
 
-/// Unbind a child hypervector from its parent's encoded form at a
-/// known position. Inverse of the encoder's `rotate_left + xor` step:
-///
-///   parent = base ⊕ rotate_left(child_0, 0) ⊕ rotate_left(child_1, 1) ⊕ ...
-///   recover_child_at_i = rotate_right(parent ⊕ base ⊕ other_children, i)
-///
-/// Caller passes the parent HV, the parent's base vector (from the
-/// codebook), the position to unbind, and the *other* children's HVs
-/// already rotated and XOR'd into a "siblings_acc". This API is the
-/// mathematical primitive; higher-level cluster-explanation builds
-/// on it by walking the codebook to identify which child came back.
-pub fn unbind_child_at_position(
-    parent: &Hypervector,
-    parent_base: &Hypervector,
-    siblings_xor_acc: &Hypervector,
-    position: usize,
-) -> Hypervector {
-    let mut residual = *parent;
-    xor_into(&mut residual, parent_base);
-    xor_into(&mut residual, siblings_xor_acc);
-    rotate_right(&residual, position)
-}
-
-/// Cluster explanation: given the centroid of a cluster of scopes and
-/// a hypothesis about the parent's positional child-kind sequence,
-/// recover the canonical kind at each role position via sibling-
-/// cancellation unbind + cleanup-memory.
-///
-/// This is the load-bearing distinguishing feature of HDC vs plain LSH
-/// (per math-friend review G). LSH gives "these N items are similar";
-/// unbind tells you *what they share* — recovered structural skeleton.
-///
-/// ## Algorithm
-///
-/// 1. Reconstruct `parent_base` from `(root_kind, arity, child_kinds)`.
-///    The codebook's signature sorts children internally, so the order
-///    of `centroid_child_kinds_positional` doesn't affect parent_base
-///    — it affects step 3.
-/// 2. Build `all_siblings_acc = XOR over i of rotate_left(leaf_base(
-///    centroid_child_kinds_positional[i]), i)` — the parent encoder's
-///    contribution from all immediate-children (treated as leaves).
-/// 3. For each position i, subtract that position's term out of
-///    all_siblings_acc to get the per-position sibling accumulator,
-///    then call [`unbind_child_at_position`] (the canonical HDC unbind
-///    primitive). Cleanup-memory picks the candidate kind whose
-///    `base_vector` is closest to the recovered HV.
-///
-/// ## Skeptic 4bace1: prior implementation skipped step 2
-///
-/// The previous version subtracted only `parent_base`, leaving the
-/// residual contaminated with all N rotated children's contributions.
-/// Probing at position i then saw `(N−1)` D/2-amplitude noise terms
-/// alongside the target signal — recovery accuracy was at chance level
-/// even for homogeneous clusters. Sibling cancellation closes that gap
-/// and brings recovery to ≥80% on real cluster centroids (math
-/// friend's target), pinned by the new tests in this module.
-///
-/// ## Inputs
-///
-/// - `centroid_child_kinds_positional`: the ORDER MATTERS. Pass the
-///   kinds in their actual encoder positions (not sorted). This is
-///   the caller's hypothesis about the cluster's structural template;
-///   the function returns the closest-matching kind per position so
-///   the caller can verify the hypothesis.
-/// - `candidate_child_kinds`: kinds the cleanup-memory considers at
-///   each position. Typically the union of all canonical kinds.
-pub fn explain_cluster_centroid<C>(
-    centroid: &Hypervector,
-    centroid_root_kind: CanonicalKind,
-    centroid_arity: u8,
-    centroid_child_kinds_positional: &[CanonicalKind],
-    codebook: &C,
-    candidate_child_kinds: &[CanonicalKind],
-) -> Vec<(usize, CanonicalKind, u32)>
-where
-    C: BaseCodebook<Item = AstNodeFingerprint>,
-{
-    use crate::encoder::EncoderNode;
-    use crate::util::{ZERO_HV, bytes_to_hv, popcount_distance};
-
-    let leaf_base = |kind: CanonicalKind| codebook.base_vector(&AstNodeFingerprint::leaf(kind));
-
-    // Mirror encoder.rs's `content_role`: bind child by content_hash.
-    // The encoder mixes `content_role(child.content_hash())` into each
-    // child's HV before the positional rotation, so reconstructing the
-    // siblings_acc / cleanup-memory targets must mix the same role in.
-    // Math-friend rebind (2026-06-24).
-    let content_role = |hash: &[u8; 32]| -> Hypervector {
-        let mut buf = Vec::with_capacity(b"hdc-merkle-role/".len() + 32);
-        buf.extend_from_slice(b"hdc-merkle-role/");
-        buf.extend_from_slice(hash);
-        bytes_to_hv(&buf)
-    };
-    let leaf_role = |kind: CanonicalKind| content_role(&EncoderNode::leaf(kind).content_hash());
-    // The cleanup-memory target for "this position's child" is
-    // `leaf_base(kind) ⊕ content_role(leaf(kind))`. This is what the
-    // unbind residual recovers (before XOR'ing the role back out at
-    // the caller — but here it's cleaner to compare against the
-    // content-rolled HV directly).
-    let leaf_target = |kind: CanonicalKind| {
-        let mut hv = leaf_base(kind);
-        xor_into(&mut hv, &leaf_role(kind));
-        hv
-    };
-
-    let parent_fp = AstNodeFingerprint::new(
-        centroid_root_kind,
-        centroid_arity,
-        centroid_child_kinds_positional.to_vec(),
-    );
-    let parent_base = codebook.base_vector(&parent_fp);
-
-    // Build the sum of all positional rotated content-bound leaf bases —
-    // what the encoder XOR'd into parent_base for the immediate
-    // children. Post-rebind each term is `rotate_left(leaf_base ⊕
-    // content_role, i)` (not just `rotate_left(leaf_base, i)`).
-    let mut all_siblings_acc = ZERO_HV;
-    let mut per_position_terms: Vec<Hypervector> =
-        Vec::with_capacity(centroid_child_kinds_positional.len());
-    for (i, &kind) in centroid_child_kinds_positional.iter().enumerate() {
-        let term = rotate_left(&leaf_target(kind), i);
-        per_position_terms.push(term);
-        xor_into(&mut all_siblings_acc, &term);
-    }
-
-    let mut recovered = Vec::with_capacity(per_position_terms.len());
-    for (i, term) in per_position_terms.iter().enumerate() {
-        // Sibling-acc for position i = all − this position's term.
-        let mut siblings_at_i = all_siblings_acc;
-        xor_into(&mut siblings_at_i, term);
-
-        let unbound = unbind_child_at_position(centroid, &parent_base, &siblings_at_i, i);
-
-        // Cleanup memory: find the candidate kind whose
-        // `leaf_target = leaf_base ⊕ content_role(leaf)` is closest to
-        // the unbound residual. Post-rebind, leaf_base alone is the
-        // wrong target — the encoder mixed content_role in, so the
-        // cleanup memory must too.
-        if let Some((kind, d)) = candidate_child_kinds
-            .iter()
-            .map(|&kind| (kind, popcount_distance(&unbound, &leaf_target(kind))))
-            .min_by_key(|(_, d)| *d)
-        {
-            recovered.push((i, kind, d));
-        }
-    }
-    recovered
-}
+// `unbind_child_at_position` and `explain_cluster_centroid` were retired
+// in bead `ley-line-open-7b5086` (bundle composition encoder rewrite).
+// Both depended on the XOR-bind encoder algebra (`parent = base ⊕ ⊕_i
+// rotate_left(child_i, i)`) which made unbind algebraically clean:
+// strip base + siblings via XOR, rotate_right by position, recover child.
+//
+// Under majority-bundle composition there is no exact-recovery unbind
+// — bundle is similarity-dampening, not invertible. A future
+// `explain_cluster_centroid` redesign would walk an explicit cleanup-
+// memory codebook (the set of candidate child HVs) and pick the
+// closest match by popcount distance, rather than reconstruct child
+// HVs from the parent's algebra.
+//
+// Removed:
+// - `pub fn unbind_child_at_position`
+// - `pub fn explain_cluster_centroid<C>`
+// - tests: `unbind_recovers_child_at_position_zero/one`,
+//   `explain_cluster_centroid_returns_one_tuple_per_arity`,
+//   `explain_cluster_centroid_recovers_kinds_on_homogeneous_cluster`,
+//   `explain_cluster_centroid_recovers_constant_positions_on_heterogeneous_cluster`,
+//   `explain_cluster_centroid_handles_zero_arity`
+//
+// The other three query primitives (`radius_search`, `density_count`,
+// `combined_prefilter`) are unchanged and remain the substrate's
+// load-bearing retrieval surface.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codebook::AstCodebook;
-    use crate::encoder::{EncoderNode, encode_fresh};
-    use crate::sheaf::HvCellComplex;
     use crate::test_util::{
         conn_with_schema_and_udfs as fresh_with_udfs, insert_combined_hv as insert_combined,
         insert_layer_hv as insert,
     };
-    use crate::util::{ZERO_HV, bucket_arity, expand_seed};
+    use crate::util::expand_seed;
 
     #[test]
     fn radius_search_returns_only_within_radius() {
@@ -389,302 +261,6 @@ mod tests {
         assert_eq!(topk[0].scope_id, "close_0");
         assert_eq!(topk[0].distance, 0);
         assert_eq!(topk[1].scope_id, "close_1");
-    }
-
-    #[test]
-    fn unbind_recovers_child_at_position_zero() {
-        // For a 1-child tree at position 0:
-        //   parent = base ⊕ rotate_left(child, 0) = base ⊕ child
-        // Unbind: residual = parent ⊕ base ⊕ siblings(empty) = child.
-        // rotate_right(child, 0) = child.
-        let parent = expand_seed(1);
-        let base = expand_seed(2);
-        let siblings = ZERO_HV;
-        let recovered = unbind_child_at_position(&parent, &base, &siblings, 0);
-        // Compute expected: parent ⊕ base
-        let mut expected = parent;
-        xor_into(&mut expected, &base);
-        assert_eq!(recovered, expected);
-    }
-
-    #[test]
-    fn unbind_recovers_child_at_position_one() {
-        // For a 2-child tree:
-        //   parent = base ⊕ rotate_left(child0, 0) ⊕ rotate_left(child1, 1)
-        // To recover child1 at position 1:
-        //   residual = parent ⊕ base ⊕ rotate_left(child0, 0)
-        //            = rotate_left(child1, 1)
-        //   rotate_right(residual, 1) = child1
-        let cb = AstCodebook::new();
-        let parent_base = expand_seed(0xBA5E);
-        let child0 = cb.base_vector(&AstNodeFingerprint::leaf(CanonicalKind::Op));
-        let child1 = cb.base_vector(&AstNodeFingerprint::leaf(CanonicalKind::Lit));
-
-        // Build parent the way the encoder would.
-        let mut parent = parent_base;
-        let p0 = rotate_left(&child0, 0);
-        xor_into(&mut parent, &p0);
-        let p1 = rotate_left(&child1, 1);
-        xor_into(&mut parent, &p1);
-
-        // Strip child0 from siblings_acc (already rotated as it sits in parent).
-        let recovered = unbind_child_at_position(&parent, &parent_base, &p0, 1);
-        assert_eq!(recovered, child1);
-    }
-
-    #[test]
-    #[ignore = "ley-line-open-7b5086: unbind algebra retired under bundle composition; explain_cluster_centroid needs redesign around explicit cleanup-memory codebook walk"]
-    fn explain_cluster_centroid_returns_one_tuple_per_arity() {
-        // API shape: explain returns exactly arity tuples, each with
-        // a recovered canonical kind from the candidate set and a
-        // distance metric. With sibling cancellation now implemented
-        // (skeptic 4bace1) recovery on a single tree should ALSO
-        // succeed — pin both shape AND correctness here.
-
-        let cb = AstCodebook::new();
-        let tree = EncoderNode::new(
-            CanonicalKind::Block,
-            vec![
-                EncoderNode::leaf(CanonicalKind::Op),
-                EncoderNode::leaf(CanonicalKind::Lit),
-            ],
-        );
-        let centroid = encode_fresh(&tree, &cb);
-
-        let candidate_kinds = CanonicalKind::ALL;
-
-        let recovered = explain_cluster_centroid(
-            &centroid,
-            CanonicalKind::Block,
-            bucket_arity(2),
-            // Positional (order matches the encoded tree):
-            &[CanonicalKind::Op, CanonicalKind::Lit],
-            &cb,
-            &candidate_kinds,
-        );
-
-        // API shape: exactly arity tuples, each with valid index range.
-        assert_eq!(recovered.len(), 2);
-        for (i, (idx, kind, _d)) in recovered.iter().enumerate() {
-            assert_eq!(*idx, i, "tuple at position {i} reports index {idx}");
-            assert!(
-                candidate_kinds.contains(kind),
-                "recovered kind {kind:?} must be from candidate set",
-            );
-        }
-        // Correctness pin (skeptic 4bace1): with sibling cancellation,
-        // a single tree should recover positions exactly.
-        assert_eq!(
-            recovered[0].1,
-            CanonicalKind::Op,
-            "position 0 must recover Op"
-        );
-        assert_eq!(
-            recovered[1].1,
-            CanonicalKind::Lit,
-            "position 1 must recover Lit"
-        );
-    }
-
-    #[test]
-    #[ignore = "ley-line-open-7b5086: unbind algebra retired under bundle composition"]
-    fn explain_cluster_centroid_recovers_kinds_on_homogeneous_cluster() {
-        // Skeptic 4bace1: prior tests only validated API shape. This
-        // pins the recovery-accuracy claim in the regime where the
-        // function CAN deliver: a homogeneous cluster (10 trees with
-        // identical fingerprints at every level — bundle_majority of
-        // identical HVs IS that HV, so the centroid is exactly one
-        // tree's encoding).
-        //
-        // For this case, `explain_cluster_centroid` should recover
-        // each position correctly because the "sibling noise" terms,
-        // while present, are weighted against a clean signal — the
-        // residual at position i is rot_left(child_i_base, i) XOR
-        // (rot_left of N-1 other children). The probe via
-        // rotate_right(_, i) lines up child_i correctly; the other
-        // siblings appear as rotated noise that's structured but
-        // independent enough that the cleanup-memory's nearest-kind
-        // search still picks the correct kind for low-arity parents.
-        //
-        // Math-friend ≥80% recovery target: 3/3 = 100% here on a
-        // 3-arity homogeneous cluster.
-        //
-        // Note on heterogeneous clusters (where bodies vary across
-        // members): see the docstring on `explain_cluster_centroid`
-        // for why this function alone can't deliver clean recovery
-        // on those — sibling cancellation is needed, which is the
-        // job of `unbind_child_at_position`. The next test
-        // (`real_cluster_via_unbind_recovers_each_position`) pins
-        // that path on a real heterogeneous cluster.
-
-        let cb = AstCodebook::new();
-        let tree = EncoderNode::new(
-            CanonicalKind::Decl,
-            vec![
-                EncoderNode::leaf(CanonicalKind::Ref),
-                EncoderNode::leaf(CanonicalKind::Block),
-                EncoderNode::leaf(CanonicalKind::Op),
-            ],
-        );
-        // 10 identical encodings — homogeneous cluster.
-        let centroids: Vec<Hypervector> = (0..10).map(|_| encode_fresh(&tree, &cb)).collect();
-        // Bundle is trivially the input HV (identical inputs).
-        let centroid = HvCellComplex::bundle_majority(&centroids);
-        assert_eq!(
-            centroid, centroids[0],
-            "homogeneous bundle must equal input"
-        );
-
-        let candidate_kinds = CanonicalKind::ALL;
-        let recovered = explain_cluster_centroid(
-            &centroid,
-            CanonicalKind::Decl,
-            bucket_arity(3),
-            &[CanonicalKind::Ref, CanonicalKind::Block, CanonicalKind::Op],
-            &cb,
-            &candidate_kinds,
-        );
-        assert_eq!(recovered.len(), 3);
-        let correct: u32 = [
-            (recovered[0].1 == CanonicalKind::Ref) as u32,
-            (recovered[1].1 == CanonicalKind::Block) as u32,
-            (recovered[2].1 == CanonicalKind::Op) as u32,
-        ]
-        .iter()
-        .sum();
-        assert!(
-            correct as f64 / 3.0 >= 0.80,
-            "math-friend recovery target ≥80% violated: got {}/3 (recovered={:?})",
-            correct,
-            recovered
-        );
-    }
-
-    #[test]
-    #[ignore = "ley-line-open-7b5086: unbind algebra retired under bundle composition"]
-    fn explain_cluster_centroid_recovers_constant_positions_on_heterogeneous_cluster() {
-        // Skeptic 4bace1 (companion test): heterogeneous cluster
-        // where positions 0 and 2 are CONSTANT leaf kinds across all
-        // 10 trees, position 1 cycles through varying leaf kinds.
-        //
-        // Setup: 10 trees Decl[Ref, varying-kind, Op]. The cleanup-
-        // memory only probes against LEAF base_vectors (arity 0,
-        // no children) — so all parent-level positions must be
-        // leaves for the function to deliver real recovery.
-        //
-        // Bundle behavior:
-        // - Position 0 (Ref) is constant → rot_left(Ref_leaf, 0)
-        //   survives in bundle → recovers Ref exactly.
-        // - Position 2 (Op) is constant → rot_left(Op_leaf, 2)
-        //   survives → recovers Op exactly.
-        // - Position 1 cycles {Stmt, Expr, Block, Lit, Stmt, Expr,
-        //   Block, Lit, Stmt, Expr} — bundle of 10 different leaves
-        //   denoises position 1 toward majority/tied bits. Recovery
-        //   here is bounded by sample variance; we DON'T pin it
-        //   beyond "kind comes from candidate set."
-        //
-        // Math-friend ≥80% target: 2/2 constant positions = 100%
-        // expected. Plus position 1 is plausible.
-
-        let cb = AstCodebook::new();
-        let varying_kinds = [
-            CanonicalKind::Stmt,
-            CanonicalKind::Expr,
-            CanonicalKind::Block,
-            CanonicalKind::Lit,
-            CanonicalKind::Stmt,
-            CanonicalKind::Expr,
-            CanonicalKind::Block,
-            CanonicalKind::Lit,
-            CanonicalKind::Stmt,
-            CanonicalKind::Expr,
-        ];
-        let mut centroids = Vec::with_capacity(10);
-        for &mid_kind in &varying_kinds {
-            let tree = EncoderNode::new(
-                CanonicalKind::Decl,
-                vec![
-                    EncoderNode::leaf(CanonicalKind::Ref),
-                    EncoderNode::leaf(mid_kind),
-                    EncoderNode::leaf(CanonicalKind::Op),
-                ],
-            );
-            centroids.push(encode_fresh(&tree, &cb));
-        }
-        // Sanity: ≥4 distinct top-level HVs (heterogeneity check —
-        // 4 distinct kinds at position 1 → 4 distinct parent_fps,
-        // but parent_base depends on sorted kinds which vary, so
-        // each kind variant produces a distinct parent HV).
-        let mut unique = centroids.clone();
-        unique.sort_unstable();
-        unique.dedup();
-        assert!(
-            unique.len() >= 4,
-            "need real heterogeneity, got {}",
-            unique.len()
-        );
-
-        let centroid = HvCellComplex::bundle_majority(&centroids);
-
-        let candidate_kinds = CanonicalKind::ALL;
-        // The function takes the parent's positional kind sequence as
-        // the caller's hypothesis. We hypothesize the modal kind at
-        // position 1 (Stmt appears 3× — most frequent in the cycle).
-        // Note: heterogeneous bundle means parent_base for the
-        // hypothesized fp won't match any single tree's parent_base
-        // exactly — recovery accuracy degrades correspondingly. The
-        // pin here: positions 0 and 2 must still recover correctly
-        // (they're constant signal even when bundle is mixed).
-        let recovered = explain_cluster_centroid(
-            &centroid,
-            CanonicalKind::Decl,
-            bucket_arity(3),
-            &[CanonicalKind::Ref, CanonicalKind::Stmt, CanonicalKind::Op],
-            &cb,
-            &candidate_kinds,
-        );
-        assert_eq!(recovered.len(), 3);
-
-        // The two constant positions: pin exact recovery. With
-        // varying parent_fp across cluster members, parent_base
-        // hypothesis is approximate, so the residual at constant
-        // positions has additional contamination — but the constant
-        // signal still dominates the cleanup-memory verdict.
-        assert_eq!(
-            recovered[0].1,
-            CanonicalKind::Ref,
-            "position 0 must recover Ref (constant); got {:?} at Hamming {}",
-            recovered[0].1,
-            recovered[0].2
-        );
-        assert_eq!(
-            recovered[2].1,
-            CanonicalKind::Op,
-            "position 2 must recover Op (constant); got {:?} at Hamming {}",
-            recovered[2].1,
-            recovered[2].2
-        );
-
-        // Math-friend ≥80% recovery target on the 2 constant positions:
-        let correct: u32 = (recovered[0].1 == CanonicalKind::Ref) as u32
-            + (recovered[2].1 == CanonicalKind::Op) as u32;
-        assert!(
-            correct as f64 / 2.0 >= 0.80,
-            "constant-position recovery rate {}/2 < 80%",
-            correct
-        );
-    }
-
-    #[test]
-    fn explain_cluster_centroid_handles_zero_arity() {
-        // Edge case: leaf node (no children). Should return an empty
-        // vec, not panic.
-        let cb = AstCodebook::new();
-        let candidate_kinds = [CanonicalKind::Lit, CanonicalKind::Op];
-        let centroid = cb.base_vector(&AstNodeFingerprint::leaf(CanonicalKind::Lit));
-        let recovered =
-            explain_cluster_centroid(&centroid, CanonicalKind::Lit, 0, &[], &cb, &candidate_kinds);
-        assert!(recovered.is_empty());
     }
 
     #[test]

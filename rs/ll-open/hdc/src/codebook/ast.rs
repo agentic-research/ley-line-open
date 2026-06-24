@@ -257,20 +257,18 @@ mod tests {
 
     #[test]
     fn signature_byte_format_pin() {
-        // Pin the signature byte layout — changing it breaks every
-        // existing encoded vector. Format:
-        //   tag_bytes ("hdc-ast") + 0x00 separator
-        //   + kind_disc (1B) + arity (1B) + child_count_le (2B)
-        //   + sorted_child_discs (NB).
+        // Pin the signature byte layout — post bead `ley-line-open-7b5086`:
+        //   tag_bytes ("hdc-ast") + 0x00 separator + kind_disc(1B) + arity(1B).
+        // The trailing child_count + sorted_child_discs is gone (fp-quantize).
         let f = fp(
             CanonicalKind::Stmt, // disc=2
             3,
-            &[CanonicalKind::Op, CanonicalKind::Block, CanonicalKind::Op], // discs 6, 3, 6 → sorted 3, 6, 6
+            &[CanonicalKind::Op, CanonicalKind::Block, CanonicalKind::Op],
         );
         let bytes = AstCodebook::signature_bytes(&f);
         let mut expected: Vec<u8> = b"hdc-ast".to_vec();
         expected.push(0); // tag/payload separator
-        expected.extend_from_slice(&[2u8, 3, 3, 0, 3, 6, 6]);
+        expected.extend_from_slice(&[2u8, 3]);
         assert_eq!(bytes, expected);
     }
 }

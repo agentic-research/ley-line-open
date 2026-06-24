@@ -567,58 +567,14 @@ mod tests {
             );
         }
 
-        // ── Assertion 3: cluster centroid recovery returns API-shaped output.
-        // For each group, BUNDLE_MAJORITY the group's hypervectors,
-        // run explain. The test asserts API correctness (right number
-        // of tuples, valid kinds) — the ≥80% recovery accuracy target
-        // is a production-corpus measurement, not synthetic.
-        use leyline_hdc::query::explain_cluster_centroid;
-
-        for group in &groups {
-            let centroid_blob: Vec<u8> = conn
-                .query_row(
-                    "SELECT BUNDLE_MAJORITY(hv) FROM _hdc \
-                     WHERE layer_kind = 'ast' AND scope_id LIKE ?1",
-                    [format!("{}/%", group.name)],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            let centroid: Hypervector = centroid_blob.try_into().unwrap();
-
-            // The centroid's "root kind" + arity is approximately what
-            // we'd find in the parsed source: a Block (file root) with
-            // ~1 child (the func decl).
-            let candidate_kinds = CanonicalKind::ALL;
-
-            let recovered = explain_cluster_centroid(
-                &centroid,
-                CanonicalKind::Block,
-                bucket_arity(2),
-                &[CanonicalKind::Decl, CanonicalKind::Decl],
-                &cb,
-                &candidate_kinds,
-            );
-
-            assert_eq!(
-                recovered.len(),
-                2,
-                "group {}: explain must return arity-many tuples",
-                group.name,
-            );
-            for (i, (idx, kind, _d)) in recovered.iter().enumerate() {
-                assert_eq!(*idx, i);
-                assert!(
-                    candidate_kinds.contains(kind),
-                    "group {}: recovered kind at pos {i} must be from candidate set, got {kind:?}",
-                    group.name,
-                );
-            }
-            eprintln!(
-                "group {}: centroid recovery = {:?}",
-                group.name,
-                recovered.iter().map(|(_, k, d)| (k, d)).collect::<Vec<_>>(),
-            );
-        }
+        // Cluster-centroid-recovery (`explain_cluster_centroid`) assertion
+        // was removed in bead `ley-line-open-7b5086`. It depended on the
+        // unbind algebra that no longer exists under bundle composition.
+        // Assertions 1 + 2 above (clones cluster, probe-against-self always
+        // matches) remain — they exercise the substrate's load-bearing
+        // properties (radius_search, popcount_xor UDF) without requiring
+        // unbind. A future redesign of `explain_cluster_centroid` around
+        // explicit cleanup-memory codebook walk could restore this.
     }
 
     #[test]

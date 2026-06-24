@@ -127,40 +127,44 @@ impl AstNodeFingerprint {
     }
 }
 
-/// Canonical byte layout for a node's structural signature, used by
-/// every codebook that hashes "(kind, arity bucket, sorted child kinds)"
-/// — currently AstCodebook and ModuleCodebook. Format:
+/// Canonical byte layout for a node's structural signature.
 ///
-///   `[codebook_tag, 0x00, kind_disc(1), arity_bucket(1), child_count_le(2), sorted_child_discs(N)]`
+/// **Bead `ley-line-open-7b5086` fp-quantize** (math-friend session-3):
+/// the signature was previously `[tag, 0x00, kind, arity_bucket,
+/// child_count_le(2), sorted_child_discs(N)]`. Dropping the trailing
+/// `child_count + sorted_child_discs` collapses similar-shape parents
+/// to the same `base_vector` instead of giving every distinct child-
+/// kind set a fresh PRG draw. Child-kind information enters via the
+/// encoder's majority-bundle composition over the children themselves
+/// (whose HVs the bundle now incorporates directly).
 ///
-/// The codebook tag prefix is what makes ModuleCodebook's base_vector
-/// distinct from AstCodebook's for the same fingerprint — without it,
-/// both codebooks produce IDENTICAL hypervectors per fingerprint (per
-/// skeptic-review bead 4bb8a0; same fix as the cache_key issue).
+/// New format: `[codebook_tag, 0x00, kind_disc(1), arity_bucket(1)]`
 ///
-/// The length prefix prevents `(k, [])` from colliding with `(k, [k])`
-/// (both would otherwise hash to the same bytes if a sub-pattern crosses
-/// the boundary). Sorted children → order-invariant at the codebook
-/// level; encoder restores positional order via rotation.
+/// The `child_kinds` parameter is RETAINED in the function signature
+/// for API stability (callers don't need to be edited) but is
+/// IGNORED in the byte layout. The struct field
+/// `AstNodeFingerprint::child_canonical_kinds` is similarly retained
+/// but no longer load-bearing for `base_vector`. Removing it would be
+/// a future cleanup.
 ///
-/// CHANGING THIS BREAKS EVERY ENCODED HYPERVECTOR. Bump a layer's seed
-/// tag if you need to migrate, don't silently rewrite the format.
+/// CHANGING THIS BREAKS EVERY ENCODED HYPERVECTOR. The bundle-encoder
+/// rewrite already breaks all `_hdc` rows; this further change rides
+/// in the same migration.
 pub fn canonical_signature_bytes(
     codebook_tag: &str,
     kind: CanonicalKind,
     arity_bucket: u8,
     child_kinds: &[CanonicalKind],
 ) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(codebook_tag.len() + 5 + child_kinds.len());
+    // Discard `child_kinds`: post bead `7b5086` it's intentionally
+    // not part of the fingerprint. Suppress the unused-variable warning
+    // without changing the API.
+    let _ = child_kinds;
+    let mut buf = Vec::with_capacity(codebook_tag.len() + 3);
     buf.extend_from_slice(codebook_tag.as_bytes());
     buf.push(0u8); // separator between tag and structural payload
     buf.push(kind.discriminant());
     buf.push(arity_bucket);
-    let len = child_kinds.len() as u16;
-    buf.extend_from_slice(&len.to_le_bytes());
-    let mut sorted: Vec<u8> = child_kinds.iter().map(|k| k.discriminant()).collect();
-    sorted.sort_unstable();
-    buf.extend_from_slice(&sorted);
     buf
 }
 
@@ -222,25 +226,23 @@ mod tests {
     #[test]
     fn canonical_signature_bytes_format_pin() {
         // Pin the canonical byte layout shared by AstCodebook,
-        // ModuleCodebook, and any future codebook that hashes
-        // (kind, arity_bucket, sorted_child_kinds). Format:
-        //   tag_bytes + 0x00 separator
-        //   + kind_disc(1B) + arity(1B) + child_count_le(2B)
-        //   + sorted_child_discs(N B).
+        // ModuleCodebook, and any future codebook.
         //
-        // Sister test to ast.rs::signature_byte_format_pin which
-        // pins the same format with the "hdc-ast" tag. This one
-        // uses an arbitrary tag to verify the format is
-        // tag-agnostic.
+        // Bead `ley-line-open-7b5086` fp-quantize: format dropped the
+        // trailing `child_count + sorted_child_discs`. Layout is now:
+        //   tag_bytes + 0x00 separator + kind_disc(1B) + arity(1B).
+        //
+        // The `child_kinds` parameter is still accepted for API
+        // compatibility but contributes nothing to the bytes.
         let bytes = canonical_signature_bytes(
             "test-tag",
             CanonicalKind::Stmt, // disc=2
             3,
-            &[CanonicalKind::Op, CanonicalKind::Block, CanonicalKind::Op], // discs 6, 3, 6 → sorted 3, 6, 6
+            &[CanonicalKind::Op, CanonicalKind::Block, CanonicalKind::Op],
         );
         let mut expected: Vec<u8> = b"test-tag".to_vec();
         expected.push(0); // tag/payload separator
-        expected.extend_from_slice(&[2u8, 3, 3, 0, 3, 6, 6]);
+        expected.extend_from_slice(&[2u8, 3]);
         assert_eq!(bytes, expected);
     }
 

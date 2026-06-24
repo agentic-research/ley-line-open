@@ -12,7 +12,7 @@ lsp = ["dep:leyline-lsp"]
 # the op is always available; turn off for ultra-slim builds.
 validate = ["leyline-fs/validate"]
 mount = ["leyline-fs/nfs", "leyline-fs/fuse", "leyline-fs/validate"]
-vec = ["dep:sqlite-vec"]
+vec = ["dep:sqlite-vec", "dep:fastembed"]
 # HDC structural-equivalence surface exposed as daemon ops
 # (ley-line-open-c32596). Pulls leyline-hdc + leyline-ts's `rust`
 # feature (HDC's RustCanonicalMap pairs with tree-sitter-rust). Default-
@@ -47,6 +47,11 @@ hex = "0.4"
 leyline-fs = { path = "../fs", default-features = false }
 rusqlite = { version = "0.39", features = ["bundled", "serialize"] }
 sqlite-vec = { version = "0.1", optional = true }
+# Real embedder backend for the `vec` feature. Mirrors LL's `leyline-embed`
+# (closed sister repo) — fastembed wraps ONNX-Runtime to run small
+# MiniLM-class models locally. Gated under `vec` so the default headless
+# build stays slim; ZeroEmbedder is the fallback when this feature is off.
+fastembed = { version = "5", optional = true }
 tree-sitter = "0.26"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"

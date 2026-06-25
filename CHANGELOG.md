@@ -10,7 +10,31 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
-Nothing yet — post-v0.5.0 changes land here.
+Nothing yet — post-v0.5.1 changes land here.
+
+## [0.5.1] — 2026-06-25
+
+Patch bump. Adds protobuf (`.proto`) tree-sitter language support so the LLO daemon parses `.proto` files into the standard `_ast` / `_source` / `nodes` tables. Downstream consumers (mache, anyone querying the projected SQLite) can now register smell rules + run structural queries over proto sources instead of falling back to regex/shell. Plus the documentation + ADR backlog that built up post-v0.5.0.
+
+### Added
+
+- **Protobuf tree-sitter language** (#106). New `proto` feature on `leyline-ts`; `TsLanguage::Proto` variant with `proto` / `protobuf` aliases; canonical extension `.proto`. `tree-sitter-proto = "0.4"` (coder3101/tree-sitter-proto, proto2 + proto3, MIT). `leyline-cli-lib`'s feature list forces `proto` so the daemon registers it out of the box. End-to-end smoke verified against the Sigstore Fulcio `.proto` corpus (20 protos → `_source.language='proto'` + real proto `_ast` node kinds `service` / `rpc` / `message` / etc.).
+- **`docs/ARCHITECTURE.md`** (#105). Canonical three-layer overview (infrastructure / projection engine / consumer surface) + Σ snapshot-loop runtime model + cross-runtime consumer pattern + load-bearing ADR table.
+- **4 missing crate READMEs** (#105): `cas-ffi`, `chat-embed`, `sheaf`, `text-search`. Filled coverage gap surfaced by the workspace audit.
+- **`task readme:version-check`** (#102). CI gate that catches README OCI-tag drift against `rs/ll-open/cli/Cargo.toml`. Wired into `task ci`.
+- **ADR-0023 — Agent-first language facts** (#103). Proposes analyzer-as-library ingestion (Go via `go/packages`, Terraform via `hcl/v2`, Rust via `ra_ap_ide`, TypeScript via Compiler API) layered over the existing tree-sitter floor.
+- **ADR-0024 — HDC substrate-identity rewrite** (#103). Retrospective for v0.5.0 — documents the four-piece rewrite + Phase 0B-real empirical numbers (score-fusion α=0.20 → +7.3%; kernel-RBF α=0.40 → +7.7% vs vec-alone).
+- **ADR-0025 — HDC compositional-vs-distance use modes** (#104). Pre-registers the next research arc: dual-channel encoder (Phase α), archetype codebook (β), sequence-via-permute (γ), compositional query MCP (δ), then Phase ε decision pre-committed to keep / de-feature / remove against the empirical record.
+- **Phase 0B-real validation test** (#103). `rs/ll-open/cli-lib/tests/phase_0b_real_ground_truth.rs`. Asserts the substrate value-prop gate: best fusion-sweep recall@10 clears vec-alone by ≥ 0.02. Currently green at +7.7%.
+
+### Changed
+
+- **README HDC blurb + OCI image tags** (#102, #105). Updated to v0.5.0/v0.5.1 + accurate v0.5.0 HDC description (bundle composition + seeded leaves + popcount-Hamming + ADR cross-links).
+- **`rs/ll-open/hdc/README.md`** (#105). Full rewrite — old version described pre-v0.5.0 multi-layer codebook architecture; now covers v0.5.0 substrate identity + Phase 0B-real numbers + ADR-0025 forward-link + cost-vs-vec comparison.
+
+### No wire breakage
+
+The proto language addition is purely additive. Existing consumers querying `_ast` / `_source` / `nodes` see new rows where `language='proto'` and node_kinds from the tree-sitter-proto grammar; nothing about existing language ingestion changed. No schema migration needed; HDC encoding is byte-identical (the proto grammar is parse-only — HDC has no proto canonical map yet, so proto nodes flow into HDC as generic AST shapes without language-specific canonicalization. That can land as a separate follow-up if proto-aware HDC search becomes a need).
 
 ## [0.5.0] — 2026-06-24
 

@@ -9,6 +9,7 @@
 !.gitignore
 !LICENSE
 !README.md
+!GETTING-STARTED.md
 !CHANGELOG.md
 !server.json
 

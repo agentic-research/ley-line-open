@@ -45,7 +45,7 @@ anyhow = "1"
 uv-pep508 = { version = "0.0.29", optional = true }
 uv-pep440 = { version = "0.0.29", optional = true }
 uv-normalize = { version = "0.0.29", optional = true }
-toml = { version = "0.8", optional = true }
+toml = { version = "1", optional = true }
 
 [dev-dependencies]
 rusqlite = { version = "0.39", features = ["bundled", "serialize"] }

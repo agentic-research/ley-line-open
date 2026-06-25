@@ -158,10 +158,17 @@ pub async fn run_daemon(
         && !addr.is_loopback()
         && !mcp_allow_public
     {
+        let auth_note = if mcp_no_auth {
+            "With `--mcp-no-auth` the listener is unauthenticated — off-loopback bind \
+             is immediately exploitable."
+        } else {
+            "Even with the token gate (ADR-0022) active, off-loopback bind makes the \
+             daemon discoverable to every interface on this machine — any probe on \
+             LAN/Internet reaches the listener."
+        };
         anyhow::bail!(
             "refusing to bind MCP HTTP to non-loopback address {addr} without \
-             `--mcp-allow-public`. The MCP wire has no auth — binding off-loopback \
-             exposes the daemon to every interface on this machine. \
+             `--mcp-allow-public`. {auth_note} \
              Pass `--mcp-allow-public` if you mean to do this (containers do; \
              see image.Dockerfile)."
         );

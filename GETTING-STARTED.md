@@ -40,7 +40,8 @@ task install
 This produces `~/.local/bin/leyline` (or your `task install` target). The binary is statically linked (SQLite, tree-sitter, embedded fastembed model staging) — runtime deps are minimal:
 
 - **None** for the `leyline parse` + `leyline daemon` happy path (default MCP HTTP transport on `127.0.0.1:8384`, control socket on UDS).
-- **fuse-t** (macOS) or **libfuse3** (Linux) ONLY for `--features mount` builds — the FUSE/NFS presentation layer is opt-in.
+- **None** for the default mount path on macOS — `leyline daemon --mount /path` uses the kernel's native NFS client (`leyline serve --backend nfs` is the macOS default; `--backend fuse` is opt-in and requires `fuse-t`).
+- **libfuse3** on Linux for `--features mount` builds — Linux's default backend is FUSE (`--backend fuse`); NFS is opt-in.
 - **A fastembed model cache** at `~/.cache/fastembed/` (~100 MB, downloaded on first `vec_search` use). Skip if you don't use `vec_search`.
 
 ### Parse a corpus
@@ -81,11 +82,11 @@ You're here if you want to send PRs back.
 ```bash
 brew install capnp go-task        # capnp ≥1.3.0 (build.rs codegen); go-task is the build entry point
 rustup install stable             # current toolchain
-brew install fuse-t               # ONLY if building with --features mount
+brew install fuse-t               # OPTIONAL — only if you want --backend fuse on macOS (default is --backend nfs, needs nothing extra)
 brew install sccache              # Optional; Taskfile auto-detects + uses as RUSTC_WRAPPER for faster rebuilds (bead 488440)
 ```
 
-Linux equivalents: `apt-get install capnproto libfuse3-dev` + `cargo install task` (or whatever your distro packages).
+Linux equivalents: `apt-get install capnproto libfuse3-dev` + `cargo install task` (or whatever your distro packages). FUSE is the Linux default backend, so libfuse3 is the load-bearing mount-time dep there.
 
 ### Build + test
 

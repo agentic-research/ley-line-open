@@ -310,6 +310,32 @@ tasks:
         fi
         echo "server.json is up to date"
 
+  readme:version-check:
+    desc: |
+      Fail if README.md pins a version that doesn't match the leyline-cli
+      crate version. Catches the drift pattern where a release bumps
+      Cargo.toml + CHANGELOG but leaves `ley-line-open:<old>` strings in
+      the README untouched. Single source of truth: rs/ll-open/cli/Cargo.toml.
+      (Upstream solution is mache's `drift_doc_outdated_count` smell rule,
+      currently a v1 placeholder — bead mache-e1b6c8. Replace this task
+      with `mache find_smells --rule drift_doc_outdated_count` when that
+      lands.)
+    cmds:
+      - |
+        VERSION="$(grep -m1 '^version = ' rs/ll-open/cli/Cargo.toml | cut -d'"' -f2)"
+        if [ -z "$VERSION" ]; then
+          echo "could not read version from rs/ll-open/cli/Cargo.toml"
+          exit 1
+        fi
+        STALE="$(grep -E 'ley-line-open:[0-9]+\.[0-9]+\.[0-9]+' README.md | grep -v "ley-line-open:$VERSION" || true)"
+        if [ -n "$STALE" ]; then
+          echo "README.md pins a version string that doesn't match $VERSION:"
+          echo "$STALE"
+          echo "→ bump the strings or update rs/ll-open/cli/Cargo.toml"
+          exit 1
+        fi
+        echo "README.md version pins match $VERSION"
+
   ci:
     desc: Common CI gate — runs on every PR. Excludes `test:perf` (release-profile rebuild adds ~90-120s; main-push-only via ci.yml's conditional `test:perf` step). For the full main-push gate locally, run `task ci:full`.
     cmds:
@@ -322,6 +348,7 @@ tasks:
       - task: test
       - task: compat:check
       - task: gen:server-json:check
+      - task: readme:version-check
 
   ci:full:
     desc: Full CI pipeline including the release-profile perf regression gate. Runs on main pushes via ci.yml's conditional step; available locally via `task ci:full` for pre-push validation.

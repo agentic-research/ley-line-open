@@ -49,7 +49,11 @@ pub fn project_pyproject(content: &str) -> Result<Vec<u8>> {
 pub fn project_pyproject_into(content: &str, conn: &Connection) -> Result<()> {
     create_schema(conn)?;
 
-    let doc: toml::Value = content.parse().context("invalid TOML")?;
+    // toml 1.x's `Value::FromStr` is stricter about leading content
+    // than 0.8 — use the explicit deserializer entry point which is
+    // forgiving about leading whitespace + the canonical way to
+    // produce a `Value` per the toml crate's 1.x API.
+    let doc: toml::Value = toml::from_str(content).context("invalid TOML")?;
     let mtime = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

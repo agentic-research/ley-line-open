@@ -14,10 +14,19 @@
 //!
 //! Mirrors the pattern in `rosary/src/serve/mod.rs::run_http`.
 //!
-//! Per-tool authorization, mTLS termination, and identity scoping are
-//! intentionally out of scope here — those live in the cloister gateway and
-//! notme-proxy. This module assumes localhost-only or already-attested
-//! traffic.
+//! Wire-level authorization is now handled in-tree by the token gate
+//! (ADR-0022). `auth::require_token` middleware (see `spawn`) gates
+//! every `/mcp` route against `~/.local/share/leyline/daemon.token`;
+//! constant-time comparison via `subtle::ConstantTimeEq`. The token is
+//! auto-generated at first daemon startup; same-user processes that
+//! can read the file see the gated routes. The previous "out of scope,
+//! lives in cloister" framing for wire-level auth no longer applies —
+//! the token gate is the local same-machine boundary.
+//!
+//! Out of scope here, by design (lives in cloister / notme-proxy):
+//! - Per-tool authorization (cloister vault slice grants, ADR-0013)
+//! - mTLS termination + cross-machine identity scoping
+//! - OIDC / Cloudflare Access (the remote-access path; ADR-0022 Mode B)
 
 use std::net::SocketAddr;
 use std::sync::Arc;

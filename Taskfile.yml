@@ -10,6 +10,14 @@ vars:
 
 env:
   PKG_CONFIG_PATH: '{{.FUSE_PKG_CONFIG_PATH}}'
+  # Conditional sccache acceleration — the `sh:` block resolves to
+  # the sccache binary path when it's installed (e.g. `brew install
+  # sccache`), otherwise an empty string. Empty RUSTC_WRAPPER is a
+  # no-op for cargo, so contributors without sccache see no change;
+  # contributors with it get cross-invocation caching of byte-stable
+  # dep compilation (bead ley-line-open-488440).
+  RUSTC_WRAPPER:
+    sh: command -v sccache 2>/dev/null || true
 
 tasks:
   default:

@@ -135,6 +135,8 @@ macOS prereq: `brew install fuse-t` (no kernel extension needed).
 Linux prereq: `apt-get install libfuse3-dev`.
 Capnp prereq (both): `brew install capnp` / `apt-get install capnproto` (required for build.rs codegen; pinned to ≥1.3.0).
 
+Optional: `brew install sccache` (or `cargo install sccache`) accelerates `task release` / `task install` by caching byte-stable rustc work across invocations. The Taskfile auto-detects the binary at startup and sets `RUSTC_WRAPPER` only when present; no config needed.
+
 ## Building the image
 
 A distroless OCI image (`ley-line-open:0.5.1`, ~20 MB) is built via [`krust`](https://github.com/imjasonh/krust) (cargo-zigbuild → static musl binary) + a one-line `docker build` that COPYs the binary onto `cgr.dev/chainguard/static`. See `image.Dockerfile` and `Taskfile.yml`. The image's default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0` headless — no FUSE/NFS, just the MCP HTTP transport on `:8384` inside the container (consumed by cloister via `LLO_MCP_URL`, default `http://localhost:8384/mcp`).

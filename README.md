@@ -73,7 +73,7 @@ This is enforced — see [`docs/adr/0014-capnp-as-protocol.md`](docs/adr/0014-ca
 | `leyline-fs` | SqliteGraph (zero-copy `sqlite3_deserialize`), Graph trait, reader pool, NFS/FUSE mount (feature-gated), C FFI bridge |
 | `leyline-ts` | Tree-sitter AST projection + bidirectional splice |
 | `leyline-lsp` | LSP client — spawns language servers, projects symbols + diagnostics into nodes; emits `BindingRecord` capnp event log |
-| `leyline-hdc` | Hyperdimensional computing — `HvCell` sheaf-stalks-over-hypervectors (Heyting algebra; bit-level Hamming agreement) |
+| `leyline-hdc` | Hyperdimensional computing — D=8192 hypervectors via bundle composition + seeded leaves; popcount-Hamming distance; `HvCell` sheaf-stalks for `leyline-sheaf` (ADR-0024, ADR-0025) |
 | `leyline-sheaf` | Čech cohomology engine — cochain complex (δ⁰, δ¹), sheaf cache with H⁰-based invalidation, restriction-weight learning |
 | `leyline-cli-lib` | Daemon: living SQLite db + arena flip + Σ root advance + MCP/UDS surfaces |
 | `leyline-cli` | `leyline` binary — `parse`, `lsp`, `daemon`, `serve`, `inspect` subcommands |

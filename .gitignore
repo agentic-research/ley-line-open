@@ -51,10 +51,8 @@
 
 # Image build — configs tracked, artifacts/keys local-only.
 # Active path: `task image` uses krust + image.Dockerfile (see Taskfile.yml).
-# apko.yaml / melange.yaml retained for reference but the path was abandoned
-# on Apple Silicon (see ley-line-open-2b255c).
-!apko.yaml
-!melange.yaml
+# apko/melange path was abandoned on Apple Silicon — see bead
+# `ley-line-open-2b255c` for the post-mortem.
 !image.Dockerfile
 
 # Documentation

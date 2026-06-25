@@ -7,8 +7,20 @@ use crate::oid;
 
 /// Sign data using CMS/PKCS#7 with Ed25519 and signed attributes (RFC 5652 + RFC 8419).
 ///
-/// Produces a detached CMS signature with contentType, messageDigest, and signingTime
-/// signed attributes. The signature is over the DER-encoded SET OF attributes.
+/// Produces a detached CMS signature with contentType and messageDigest signed
+/// attributes. The signature is over the DER-encoded SET OF attributes.
+///
+/// `signingTime` is **omitted by design**. RFC 5652 §5.3 lists signingTime as
+/// a useful-but-unauthenticated attribute, so omission is spec-legal. The
+/// reason: this crate compiles to wasm32 (cloister adoption). A wasm32 build
+/// needs a time source that varies per host (`js_sys::Date` in V8,
+/// `wasi:clocks` in WASI, `SystemTime::now()` native), and a fixed-time
+/// placeholder shipping across hosts would silently collapse the
+/// temporal-binding property of any verifier that trusts signingTime. Until a
+/// per-host time-source contract lands, the safer choice is to leave it out
+/// and bind temporal context via `cert.not_before` / `not_after` (which the
+/// master signs at mint time) and any attestation row's server-timestamped
+/// `created_at`.
 ///
 /// Returns DER-encoded ContentInfo wrapping SignedData.
 pub fn sign_data(
@@ -26,13 +38,13 @@ pub fn sign_data(
     // SHA-512 digest of content
     let digest = Sha512::digest(data);
 
-    // Build signed attributes
+    // Build signed attributes (contentType, messageDigest — see fn doc for why
+    // signingTime is omitted).
     let content_type_attr = build_attribute(&oid::ID_CONTENT_TYPE, &encode_oid(&oid::ID_DATA));
     let message_digest_attr =
         build_attribute(&oid::ID_MESSAGE_DIGEST, &encode_octet_string(&digest));
-    let signing_time_attr = build_attribute(&oid::ID_SIGNING_TIME, &encode_utc_time_now());
 
-    let mut attrs = vec![content_type_attr, message_digest_attr, signing_time_attr];
+    let mut attrs = vec![content_type_attr, message_digest_attr];
     // DER canonical ordering: sort by encoded bytes
     attrs.sort();
 
@@ -253,13 +265,9 @@ fn encode_set(contents: &[u8]) -> Vec<u8> {
     encode_tlv(0x31, contents)
 }
 
-fn encode_utc_time_now() -> Vec<u8> {
-    // Fixed time for deterministic output in tests; real usage could use current time.
-    // UTCTime format: YYMMDDHHMMSSZ
-    // Use 250101000000Z (2025-01-01T00:00:00Z) as a reasonable fixed time.
-    let time_str = b"250101000000Z";
-    encode_tlv(0x17, time_str)
-}
+// `encode_utc_time_now()` removed — signingTime attribute is no longer emitted
+// per the comment on `sign_data`. Reintroduce only with a per-host time-source
+// contract (js-sys::Date in V8, wasi:clocks in WASI, SystemTime native).
 
 /// Build a CMS Attribute: SEQUENCE { OID, SET { value } }
 fn build_attribute(oid: &const_oid::ObjectIdentifier, value_der: &[u8]) -> Vec<u8> {
@@ -843,6 +851,36 @@ pub(crate) mod tests {
 
         // Rest of bytes should be identical
         assert_eq!(raw[1..], set_form[1..]);
+    }
+
+    #[test]
+    fn signed_attributes_omits_signing_time() {
+        // signingTime is intentionally omitted (see fn doc on sign_data).
+        // SignedAttributes must contain exactly contentType + messageDigest,
+        // with no signingTime attribute, so the wasm32 build doesn't ship a
+        // fixed-time placeholder that lies about temporal binding.
+        let (cert_der, key) = generate_test_cert_and_key();
+        let cms_sig = sign_data(b"omits-signing-time", &cert_der, &key).unwrap();
+
+        let (_oid, sd_bytes) = parse_content_info(&cms_sig).unwrap();
+        let sd = parse_signed_data(&sd_bytes).unwrap();
+        let si = &sd.signer_infos[0];
+
+        assert_eq!(
+            si.signed_attributes_parsed.len(),
+            2,
+            "SignedAttributes must contain exactly 2 attributes (contentType, messageDigest)",
+        );
+
+        let signing_time_oid = oid_to_bytes(&oid::ID_SIGNING_TIME);
+        let has_signing_time = si
+            .signed_attributes_parsed
+            .iter()
+            .any(|(oid_bytes, _)| oid_bytes == &signing_time_oid);
+        assert!(
+            !has_signing_time,
+            "signingTime attribute must not be present (see fn doc on sign_data)",
+        );
     }
 
     #[test]

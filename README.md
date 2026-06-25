@@ -2,6 +2,8 @@
 
 Open-source data plane primitives for agentic systems. Extracted from [ley-line](https://github.com/agentic-research/ley-line).
 
+**New here?** [`GETTING-STARTED.md`](GETTING-STARTED.md) covers the user paths — mache auto-spawns leyline, so most users never run `leyline parse` themselves. Direct-use + working-on-LLO sections behind clear headers. Skip the rest of this README on first read.
+
 ## Architecture
 
 ```mermaid

@@ -27,6 +27,10 @@ pub enum TsLanguage {
     Hcl,
     #[cfg(feature = "rust")]
     Rust,
+    /// Protobuf (.proto). The `tree-sitter-proto` grammar handles
+    /// both proto2 and proto3 syntax.
+    #[cfg(feature = "proto")]
+    Proto,
 }
 
 impl TsLanguage {
@@ -51,6 +55,8 @@ impl TsLanguage {
             TsLanguage::Hcl => tree_sitter_hcl::LANGUAGE.into(),
             #[cfg(feature = "rust")]
             TsLanguage::Rust => tree_sitter_rust::LANGUAGE.into(),
+            #[cfg(feature = "proto")]
+            TsLanguage::Proto => tree_sitter_proto::LANGUAGE.into(),
         }
     }
 
@@ -80,6 +86,8 @@ impl TsLanguage {
             TsLanguage::Hcl => "hcl",
             #[cfg(feature = "rust")]
             TsLanguage::Rust => "rust",
+            #[cfg(feature = "proto")]
+            TsLanguage::Proto => "proto",
         }
     }
 
@@ -104,6 +112,8 @@ impl TsLanguage {
             "hcl" | "terraform" | "tf" | "tfvars" => Ok(TsLanguage::Hcl),
             #[cfg(feature = "rust")]
             "rust" | "rs" => Ok(TsLanguage::Rust),
+            #[cfg(feature = "proto")]
+            "proto" | "protobuf" => Ok(TsLanguage::Proto),
             _ => bail!("unsupported language: {name}"),
         }
     }
@@ -150,6 +160,8 @@ impl TsLanguage {
             "tf" | "tfvars" | "hcl" => Some(TsLanguage::Hcl),
             #[cfg(feature = "rust")]
             "rs" => Some(TsLanguage::Rust),
+            #[cfg(feature = "proto")]
+            "proto" => Some(TsLanguage::Proto),
             _ => None,
         }
     }
@@ -212,10 +224,81 @@ mod tests {
             // mismatched git config).
             assert_eq!(TsLanguage::from_extension("TF"), Some(TsLanguage::Hcl));
         }
+        #[cfg(feature = "proto")]
+        {
+            assert_eq!(TsLanguage::from_extension("proto"), Some(TsLanguage::Proto));
+            // Case-insensitive: Windows-generated .proto files occasionally
+            // land as .PROTO on case-preserving filesystems.
+            assert_eq!(TsLanguage::from_extension("PROTO"), Some(TsLanguage::Proto));
+        }
 
         // Unknown extension → None, never default to one language.
         assert_eq!(TsLanguage::from_extension("unknown_lang_ext"), None);
         assert_eq!(TsLanguage::from_extension(""), None);
+    }
+
+    /// Parses a tiny proto3 fragment end-to-end to verify the
+    /// `tree-sitter-proto` grammar is actually wired through
+    /// `ts_language()`. Fragment uses message / field / enum / service —
+    /// the primitives any real `.proto` has. If the grammar is broken
+    /// or mis-wired, this fails at the `parse()` call.
+    #[cfg(feature = "proto")]
+    #[test]
+    fn proto_parses_minimal_proto3_fragment() {
+        use tree_sitter::Parser;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&TsLanguage::Proto.ts_language())
+            .expect("set_language proto");
+        let src = r#"
+syntax = "proto3";
+
+package example.v1;
+
+message Region {
+  string name = 1;
+  int32 zone_count = 2;
+  repeated string availability_zones = 3;
+}
+
+enum Tier {
+  TIER_UNSPECIFIED = 0;
+  TIER_FREE = 1;
+  TIER_PRO = 2;
+}
+
+service Regions {
+  rpc Get (Region) returns (Region);
+}
+"#;
+        let tree = parser
+            .parse(src, None)
+            .expect("parse() must return a tree for valid proto3");
+        let root = tree.root_node();
+        assert!(
+            !root.has_error(),
+            "valid proto3 fragment must parse without errors; root: {root:?}",
+        );
+        assert!(
+            root.named_child_count() > 0,
+            "root must have named children (syntax / package / message / enum / service); got 0",
+        );
+    }
+
+    /// Pin the `proto` / `protobuf` from_name aliases — mache and other
+    /// consumers may pass either spelling depending on convention.
+    #[cfg(feature = "proto")]
+    #[test]
+    fn proto_aliases_all_resolve_to_one_language() {
+        for spelling in ["proto", "protobuf", "Proto", "PROTOBUF"] {
+            let lang = TsLanguage::from_name(spelling)
+                .unwrap_or_else(|e| panic!("from_name({spelling:?}): {e}"));
+            assert_eq!(
+                lang,
+                TsLanguage::Proto,
+                "spelling {spelling:?} must resolve to TsLanguage::Proto",
+            );
+        }
     }
 
     /// Pin Terraform-spelling aliases on the `from_name` path. Mache and

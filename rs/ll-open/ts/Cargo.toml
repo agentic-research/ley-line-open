@@ -20,6 +20,10 @@ hcl = ["dep:tree-sitter-hcl"]
 # (ley-line-open-c32596). leyline-hdc ships a RustCanonicalMap; HDC
 # search ops need tree-sitter-rust to encode Rust query inputs.
 rust = ["dep:tree-sitter-rust"]
+# Protobuf grammar (proto2 + proto3). Added so mache smell rules can
+# query a real `_ast` over `.proto` files instead of regex/shell
+# fallback. Grammar maintained at coder3101/tree-sitter-proto.
+proto = ["dep:tree-sitter-proto"]
 pyproject = ["dep:uv-pep508", "dep:uv-pep440", "dep:uv-normalize", "dep:toml"]
 
 [dependencies]
@@ -33,6 +37,7 @@ tree-sitter-python = { version = "0.25", optional = true }
 tree-sitter-elixir = { version = "0.3.5", optional = true }
 tree-sitter-hcl = { version = "1", optional = true }
 tree-sitter-rust = { version = "0.24", optional = true }
+tree-sitter-proto = { version = "0.4", optional = true }
 leyline-schema = { path = "../../ll-core/schema" }
 rusqlite = { version = "0.39", features = ["bundled", "serialize"] }
 serde_json = "1"

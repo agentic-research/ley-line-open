@@ -150,7 +150,7 @@ task image:smoke                   # build + start daemon + curl tools/list
 
 Cross-arch: `task image PLATFORM=linux/amd64` builds an amd64 image instead. The Taskfile derives the matching musl target triple and passes it to docker via `--build-arg BIN_PATH=…`.
 
-`apko.yaml` / `melange.yaml` are retained for reference but were abandoned on Apple Silicon — Docker Desktop's virtiofs makes melange's workspace bind-mount stall, and apko's multi-arch list fails when only the host arch APK exists. See `ley-line-open-2b255c` for the post-mortem.
+The apko/melange path was evaluated and abandoned on Apple Silicon (Docker Desktop's virtiofs stalls melange's workspace bind-mount; apko's multi-arch list fails when only the host arch APK exists). See bead `ley-line-open-2b255c` for the post-mortem.
 
 ## C FFI
 

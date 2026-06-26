@@ -10,7 +10,33 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
-Nothing yet — post-v0.5.5 changes land here.
+Nothing yet — post-v0.5.6 changes land here.
+
+## [0.5.6] — 2026-06-26
+
+Patch bump. Closes the gopls cold-start gap mache surfaced after v0.5.5: rust-analyzer worked end-to-end at ~8s with the active-probe path, but **gopls hung the full 50s per-file budget returning 0 hovers and got skipped**. Diagnosed as workspace-init mis-configuration rather than an indexer race: gopls prefers `workspaceFolders` over `rootUri` for Go module detection, and needs `build.expandWorkspaceToModule: true` to analyze the whole module from a subdirectory-rooted workspace.
+
+### Added
+
+- **`workspaceFolders` in initialize handshake** (`rs/ll-open/lsp/src/client.rs`). LSP servers in general prefer this over the deprecated single-folder `rootUri`; gopls treats it as load-bearing for module discovery. Sent alongside `rootUri` so older servers that only consume `rootUri` aren't broken.
+- **`workspace.workspaceFolders: true` + `workspace.configuration: true` capabilities** declared in initialize so the server knows we'll handle workspace-change notifications. gopls in particular checks these.
+- **`LspClient::start_with_options(cmd, args, root_uri, init_options)`** — new entry point that accepts optional per-server `initializationOptions`. `LspClient::start` is now a wrapper that passes `None`, preserving the existing call shape for callers that don't need per-server tuning.
+- **`initialization_options_for_language(lang)`** in `lsp_pass.rs` — per-language init-options table. gopls gets `{build: {expandWorkspaceToModule: true}, ui.completion.usePlaceholders: false, analyses: {}}`. rust-analyzer + other servers return `None` (no tuning needed; workspace-folders alone is enough).
+- **3 new test pins** in `lsp_pass::tests`:
+  - `gopls_init_options_includes_expand_workspace` — defends against a refactor that drops the load-bearing option
+  - `rust_python_no_init_options` — pin the "no tuning needed" expectation for servers that work with just `workspaceFolders`
+
+### Wire effect
+
+gopls's initialize response is unchanged from the client's perspective (same `result` shape), but server-side behavior is now:
+- Workspace expansion via `build.expandWorkspaceToModule` → whole module loaded, not just the immediate folder
+- `workspaceFolders` array → gopls treats the root as a proper workspace folder for package indexing
+- Subsequent `documentSymbol` and `hover` requests resolve against the loaded module, not the empty workspace
+
+### Notes
+
+- v0.5.5's active-probe loop + readiness wait remain unchanged. They're orthogonal — the probe verifies cache-warmness, the workspaceFolders fix ensures there's actually a cache to warm. gopls would never have populated the cache pre-v0.5.6 even with infinite probe retries.
+- `LspClient::start` is kept as a thin wrapper for backward compat. All in-tree callers go through `start_with_options` post-v0.5.6; external consumers (if any) keep working unchanged.
 
 ## [0.5.5] — 2026-06-26
 

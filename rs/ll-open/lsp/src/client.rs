@@ -44,8 +44,34 @@ pub struct LspClient {
 }
 
 impl LspClient {
-    /// Spawn a language server and perform the LSP handshake.
+    /// Spawn a language server and perform the LSP handshake. Sends no
+    /// per-server `initializationOptions`. Equivalent to
+    /// `start_with_options(command, args, root_uri, None)`.
+    ///
+    /// Callers that need server-specific init options (e.g. gopls's
+    /// build configuration, pyright's analysis settings) should use
+    /// `start_with_options` directly.
     pub async fn start(command: &str, args: &[&str], root_uri: &str) -> Result<Self> {
+        Self::start_with_options(command, args, root_uri, None).await
+    }
+
+    /// Spawn a language server and perform the LSP handshake with
+    /// optional per-server `initializationOptions`.
+    ///
+    /// Bead `ley-line-open-661727` / mache-6584a0 (gopls cold-start):
+    /// some servers need both `workspaceFolders` AND
+    /// `initializationOptions` to load the workspace properly.
+    /// rust-analyzer infers from `rootUri`; gopls strongly prefers
+    /// `workspaceFolders` (without it, gopls loads files but doesn't
+    /// analyze the module — hover returns empty even after the
+    /// server's progress signals fire). Sending both is harmless for
+    /// servers that only care about one.
+    pub async fn start_with_options(
+        command: &str,
+        args: &[&str],
+        root_uri: &str,
+        initialization_options: Option<serde_json::Value>,
+    ) -> Result<Self> {
         let mut child = Command::new(command)
             .args(args)
             .stdin(std::process::Stdio::piped())
@@ -103,15 +129,35 @@ impl LspClient {
         // the server is done indexing + analysis. Cheaper than waiting
         // for `$/progress` (which we'd have to parse the title of to
         // distinguish "Indexing" from "Discovering tests" etc.).
-        let init_params = serde_json::json!({
+        // Derive a workspace folder from rootUri. gopls (and many other
+        // modern LSP servers) prefer `workspaceFolders` for module /
+        // package detection — `rootUri` is the deprecated single-folder
+        // signal and gopls treats it as a fallback. The folder's name is
+        // the basename of the root path; servers display it in
+        // workspace-aware UI but otherwise ignore it.
+        let workspace_name = root_uri
+            .rsplit('/')
+            .find(|s| !s.is_empty())
+            .unwrap_or("workspace")
+            .to_string();
+
+        let mut init_params = serde_json::json!({
             "processId": std::process::id(),
             "rootUri": root_uri,
+            "workspaceFolders": [{
+                "uri": root_uri,
+                "name": workspace_name,
+            }],
             "capabilities": {
                 "window": {
                     "workDoneProgress": true
                 },
                 "experimental": {
                     "serverStatusNotification": true
+                },
+                "workspace": {
+                    "workspaceFolders": true,
+                    "configuration": true
                 },
                 "textDocument": {
                     "synchronization": { "didSave": true },
@@ -130,6 +176,17 @@ impl LspClient {
                 }
             }
         });
+
+        // Stitch in per-server initialization options if provided.
+        // gopls cares about `build.expandWorkspaceToModule`,
+        // `directoryFilters`; pyright cares about `python.analysis.*`;
+        // rust-analyzer cares about `cargo.*` + `procMacro.enable`.
+        // The map is owned by `LspEnrichmentPass::run` in the daemon's
+        // lsp_pass.rs so each server's tuning lives next to its
+        // language-server invocation.
+        if let Some(opts) = initialization_options {
+            init_params["initializationOptions"] = opts;
+        }
 
         let _init_result = client.request("initialize", init_params).await?;
         client.notify("initialized", serde_json::json!({})).await?;

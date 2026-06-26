@@ -146,6 +146,52 @@ async fn verify_ready_via_probe(
     false
 }
 
+/// Per-language `initializationOptions` for the LSP handshake. Returns
+/// `None` for servers that load workspaces correctly with just
+/// `workspaceFolders` (rust-analyzer, pyright, clangd, jdtls).
+///
+/// gopls specifically needs:
+///   - `build.expandWorkspaceToModule: true` (default-on for gopls 0.13+
+///     but explicit here so older bundled gopls behaves consistently) —
+///     when the workspace root is a subdirectory of a Go module, expand
+///     up to the module root so the whole module loads. Without this
+///     gopls only sees the literal `workspaceFolders` entry and treats
+///     packages outside it as un-analyzable.
+///   - `usePlaceholders: false` — irrelevant to hover/def/refs but
+///     prevents gopls from generating placeholder text in completions
+///     we don't use anyway.
+///   - `analyses: {}` — empty map = use gopls defaults. Listed here so
+///     a future tuning pass can disable expensive analyses (we only
+///     want hover/def/refs, not e.g. `unusedvariable`).
+///
+/// Bead `ley-line-open-661727` / mache-6584a0: without these, gopls
+/// would load workspace files but return empty hovers for the entire
+/// per-file budget. The symptom mirrored rust-analyzer's cold-start
+/// race, but the cause was workspace-init mis-configuration, not an
+/// indexer timing race. v0.5.6 ships both `workspaceFolders` (in
+/// `LspClient::start_with_options`) and these initializationOptions.
+fn initialization_options_for_language(lang: &str) -> Option<serde_json::Value> {
+    match lang {
+        "go" => Some(serde_json::json!({
+            "build": {
+                "expandWorkspaceToModule": true
+            },
+            "ui": {
+                "completion": {
+                    "usePlaceholders": false
+                }
+            },
+            "analyses": {}
+        })),
+        // rust-analyzer infers cargo workspace from rootUri / Cargo.toml;
+        // no init options needed for hover/def/refs. Future tuning could
+        // add `cargo.allTargets: false` to speed cold-start, but the
+        // workspace-folders signal alone is enough for v0.5.6.
+        "rust" => None,
+        _ => None,
+    }
+}
+
 /// Per-symbol budget for the hover/def/refs loop AFTER readiness has
 /// been verified. Bounds the misbehaving-server case where individual
 /// LSP requests hang indefinitely. 30s lets a 50-symbol file finish at
@@ -478,10 +524,21 @@ async fn enrich_files_pooled(
     let client = match pool_guard.get_mut(lang) {
         Some(c) => c,
         None => {
-            let new_client =
-                leyline_lsp::client::LspClient::start(server_cmd, server_args, root_uri)
-                    .await
-                    .with_context(|| format!("start {server_cmd} (pool insert)"))?;
+            // Bead `ley-line-open-661727` / mache-6584a0: per-language
+            // initializationOptions. gopls needs `build.expand
+            // WorkspaceToModule` + sensible defaults; without these (and
+            // without `workspaceFolders` in initialize — both shipped
+            // together in v0.5.6) gopls returns empty hovers for the
+            // entire per-file budget.
+            let init_options = initialization_options_for_language(lang);
+            let new_client = leyline_lsp::client::LspClient::start_with_options(
+                server_cmd,
+                server_args,
+                root_uri,
+                init_options,
+            )
+            .await
+            .with_context(|| format!("start {server_cmd} (pool insert)"))?;
             pool_guard.entry(lang.to_string()).or_insert(new_client)
         }
     };
@@ -727,6 +784,37 @@ mod tests {
     fn probe_config_pinned() {
         assert_eq!(PROBE_MAX_ATTEMPTS, 5);
         assert_eq!(PROBE_BACKOFF, std::time::Duration::from_secs(1));
+    }
+
+    /// gopls init options pin (bead `ley-line-open-661727` /
+    /// mache-6584a0). Without `build.expandWorkspaceToModule: true`
+    /// gopls returns empty hovers for the entire per-file budget on
+    /// subdirectory-rooted workspaces. A refactor that drops this
+    /// option would silently regress Go hover support — pin it here.
+    #[test]
+    fn gopls_init_options_includes_expand_workspace() {
+        let opts = initialization_options_for_language("go")
+            .expect("gopls must have initialization options");
+        let expand = opts
+            .pointer("/build/expandWorkspaceToModule")
+            .and_then(|v| v.as_bool());
+        assert_eq!(
+            expand,
+            Some(true),
+            "gopls initializationOptions must set build.expandWorkspaceToModule: true; got: {opts}"
+        );
+    }
+
+    /// Languages without bundled-server-specific tuning return None
+    /// (no initializationOptions). Pin so a future refactor that
+    /// inadvertently returns Some(empty-object) for these would
+    /// surface here — gopls's fix is real; other servers work fine
+    /// with workspaceFolders alone.
+    #[test]
+    fn rust_python_no_init_options() {
+        assert!(initialization_options_for_language("rust").is_none());
+        assert!(initialization_options_for_language("python").is_none());
+        assert!(initialization_options_for_language("typescript").is_none());
     }
 
     #[test]

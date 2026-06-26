@@ -48,6 +48,14 @@ struct EnrichmentStats {
   filesProcessed @1 :UInt64  $Json.name("files_processed");
   itemsAdded     @2 :UInt64  $Json.name("items_added");
   durationMs     @3 :UInt64  $Json.name("duration_ms");
+  # Per-language / per-file skip reasons surfaced by passes that
+  # otherwise would silently no-op (e.g. LspEnrichmentPass when a
+  # language has no bundled server, when the server isn't on PATH,
+  # or when caller-supplied changed_files match no _source.id rows).
+  # Empty list = nothing skipped; consumers (mache et al.) display
+  # the strings verbatim for debugging "why didn't this enrich
+  # write the expected rows?" Bead `ley-line-open-661727`.
+  skipped        @4 :List(Text)  $Json.name("skipped");
 }
 
 # Per-pass enrichment status — the *current* state of a registered

@@ -1,6 +1,6 @@
 [package]
 name = "server-json-gen"
-version = "0.5.4"
+version = "0.5.5"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "Generate server.json from leyline-cli-lib::daemon::mcp (tool_registry + cloister_groups). MCP Registry schema 2025-12-11 with the cloister _meta.art.cloister/v1 block. Per bead ley-line-open-f10abb."

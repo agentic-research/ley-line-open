@@ -268,6 +268,7 @@ impl EnrichmentPass for HdcEnrichmentPass {
             files_processed,
             items_added,
             duration_ms: start.elapsed().as_millis() as u64,
+            skipped: Vec::new(),
         })
     }
 }

@@ -284,6 +284,7 @@ impl EnrichmentPass for ComplexBuildPass {
             files_processed: outcome.observations_processed,
             items_added: outcome.nodes_added + outcome.edges_added,
             duration_ms: start.elapsed().as_millis() as u64,
+            skipped: Vec::new(),
         })
     }
 }

@@ -10,7 +10,38 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
-Nothing yet — post-v0.5.4 changes land here.
+Nothing yet — post-v0.5.5 changes land here.
+
+## [0.5.5] — 2026-06-26
+
+Patch bump. Fixes two cold-start issues caught after v0.5.4 shipped:
+
+### Bug 1: per-file timeout silently killed the readiness wait
+
+v0.5.4 introduced `await_ready` with rust-analyzer's budget at 30s, but the existing `PASS_FILE_TIMEOUT = 5s` static ceiling wrapped the entire per-file flow. The outer timeout always tripped first; rust-analyzer hover/def/refs never had a chance to answer even after my v0.5.4 fix. This was a latent bug shipped in v0.5.4 — `task ci` passed because no test exercised the rust-analyzer cold-start path end-to-end.
+
+Fix: replace the static constant with `pass_file_timeout_for_language(lang)` — sum of readiness wait + probe budget + per-symbol loop. rust-analyzer's per-file ceiling is now 95s (60 + 5 + 30); gopls 50s; smaller for other languages.
+
+### Bug 2: `quiescent: true` can lie
+
+rust-analyzer's `experimental/serverStatus quiescent: true` notification means "initial analysis cycle finished" — NOT "hover at arbitrary positions returns content." The on-demand query cache for a specific file may still be cold even after quiescence. The symptom on cold-start was the same `25 symbols, 0 hovers/defs/refs` the readiness-wait fix was supposed to solve.
+
+Fix: active-probe verification. After `await_ready` returns true, issue a real hover request at the first DocumentSymbol's selection range; if the response is `Some(content)` the server actually IS ready for semantic queries on this file. If `None`, back off 1s and retry up to 5 times (5s max additional wait). On exhaustion, log + proceed (degrades to v0.5.4 behavior — symbol-loop runs regardless, individual hovers may return empty).
+
+### Added
+
+- `verify_ready_via_probe` (`rs/ll-open/cli-lib/src/daemon/lsp_pass.rs`) — issues a real hover at a known position, retries with 1s back-off up to 5 times. Adds 0-5s on cold-start, costs nothing on warm-pool reuse.
+- `pass_file_timeout_for_language(lang)` — replaces the static `PASS_FILE_TIMEOUT` constant. Dynamic sum of readiness + probe + per-symbol budgets.
+- `PROBE_MAX_ATTEMPTS = 5`, `PROBE_BACKOFF = 1s`, `PER_SYMBOL_LOOP_BUDGET = 30s` constants. Test pins prevent silent drift.
+
+### Changed
+
+- `ready_timeout_for_language("rust")` bumped 30s → 60s. Empirical from 50-crate cold cargo workspaces on warm-disk Mac. Bump higher only after real-world pressure surfaces — the probe loop is the real safety net.
+- Other languages bumped proportionally (gopls 10→15, java 20→30, etc.) to give cold-starts more headroom.
+
+### Removed
+
+- `PASS_FILE_TIMEOUT` static constant. The per-language `pass_file_timeout_for_language` replaces it.
 
 ## [0.5.4] — 2026-06-26
 

@@ -66,36 +66,121 @@ const PASS_SYMBOL_POLL_DELAY: std::time::Duration = std::time::Duration::from_mi
 fn ready_timeout_for_language(lang: &str) -> std::time::Duration {
     use std::time::Duration;
     match lang {
-        "rust" => Duration::from_secs(30),
-        "go" => Duration::from_secs(10),
+        // 60s is empirically generous — covers cold cargo workspaces
+        // up to ~50 crates on a warm-disk Mac. Larger monorepos
+        // routinely exceed even this; the pass falls back to "warn +
+        // continue" on timeout (intermittent zero-hover on first
+        // touch; subsequent calls hit the warm pooled client and
+        // succeed). Bump per real-world pressure rather than guessing
+        // higher — the active-probe loop below is what actually
+        // verifies semantic readiness, not this number.
+        "rust" => Duration::from_secs(60),
+        "go" => Duration::from_secs(15),
         "typescript" | "typescriptreact" | "javascript" | "javascriptreact" => {
-            Duration::from_secs(8)
+            Duration::from_secs(10)
         }
-        "python" => Duration::from_secs(8),
-        "c" | "cpp" => Duration::from_secs(10),
-        "java" => Duration::from_secs(20),
-        "zig" => Duration::from_secs(5),
+        "python" => Duration::from_secs(10),
+        "c" | "cpp" => Duration::from_secs(15),
+        "java" => Duration::from_secs(30),
+        "zig" => Duration::from_secs(10),
         // No-server languages are filtered out earlier; this is the
         // fallback for any bundled language not enumerated above.
-        _ => Duration::from_secs(5),
+        _ => Duration::from_secs(10),
     }
 }
 
-/// Hard ceiling on total time spent enriching a single file (60f75d).
+/// Active-probe configuration for verifying semantic readiness AFTER
+/// the passive `await_ready` notification path has reported success.
 ///
-/// The poll loop above is a soft 5×200ms = 1s wait for symbol
-/// availability. This wraps the entire per-file work (open_file →
-/// poll → drain → merge) in a `tokio::time::timeout` so a
-/// misbehaving language server (one that returns `Ok(empty)`
-/// indefinitely on `documentSymbol`, or hangs on `didOpen`) can't
-/// stall the enrichment loop forever.
+/// Bead `ley-line-open-661727` (and the post-v0.5.4 cold-start
+/// caveat): rust-analyzer's `experimental/serverStatus quiescent:
+/// true` is a self-report. The server is allowed to claim quiescence
+/// while hover responses still return None (initial-analysis cycle
+/// finished but the on-demand query cache hasn't been primed for the
+/// requesting file yet). The cold-start race manifests as `25
+/// symbols, 0 hovers/defs/refs` even after `await_ready` returned
+/// true.
 ///
-/// Set to 5 seconds — generous enough for cold-start indexing on
-/// large files (rust-analyzer first-touch can be slow), tight enough
-/// that 50 files × 5s = 4 minutes is the worst-case batch instead of
-/// indefinite. Per-file timeout failure logs at warn and the batch
-/// proceeds to the next file.
-const PASS_FILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Active probe: issue a real `hover` request at a known-symbol
+/// position from the documentSymbol response. If hover returns
+/// `Some(content)` the server IS ready for semantic queries on this
+/// file — no self-report needed. If hover returns `None`, wait
+/// `PROBE_BACKOFF` and retry up to `PROBE_MAX_ATTEMPTS` times.
+///
+/// 5 attempts × 1s back-off = 5s extra wait worst case. Adds onto
+/// `ready_timeout_for_language` only when the server claimed ready
+/// but the probe still misses — i.e. only on cold-start, never on
+/// warm-pool reuse.
+const PROBE_MAX_ATTEMPTS: usize = 5;
+const PROBE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Issue a hover request at the first DocumentSymbol's selection
+/// range to verify the server can actually answer semantic queries.
+/// Returns `true` if hover returned content within `PROBE_MAX_ATTEMPTS`
+/// retries, `false` after exhausting attempts.
+///
+/// Symbols MUST be non-empty — caller already early-returned on empty
+/// in the enclosing per-file flow.
+async fn verify_ready_via_probe(
+    client: &mut leyline_lsp::client::LspClient,
+    file_uri: &str,
+    symbols: &[leyline_lsp::protocol::DocumentSymbol],
+) -> bool {
+    let first = &symbols[0];
+    let line = first.selection_range.start.line;
+    let character = first.selection_range.start.character;
+
+    for attempt in 0..PROBE_MAX_ATTEMPTS {
+        match client.hover(file_uri, line, character).await {
+            Ok(Some(_)) => return true,
+            // None or Err → server hasn't loaded this file's analysis
+            // cache yet. Back off + retry. Err on the probe is not
+            // fatal — the real per-symbol loop is what we're guarding,
+            // and it has its own per-call error handling.
+            _ if attempt + 1 < PROBE_MAX_ATTEMPTS => {
+                tokio::time::sleep(PROBE_BACKOFF).await;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Per-symbol budget for the hover/def/refs loop AFTER readiness has
+/// been verified. Bounds the misbehaving-server case where individual
+/// LSP requests hang indefinitely. 30s lets a 50-symbol file finish at
+/// ~0.6s/symbol — enough headroom for a slow but not pathological
+/// rust-analyzer or gopls. Per-call hangs inside this window are the
+/// language server's per-method timeout's job to catch.
+const PER_SYMBOL_LOOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Hard ceiling on total time spent enriching a single file (60f75d
+/// + bead `ley-line-open-661727`).
+///
+/// Computed per-language as the sum of three budgets:
+///   1. `ready_timeout_for_language(lang)` — passive readiness wait
+///      (rust-analyzer 60s, gopls 15s, etc.)
+///   2. `PROBE_MAX_ATTEMPTS * PROBE_BACKOFF` — active hover-probe
+///      verification (5s)
+///   3. `PER_SYMBOL_LOOP_BUDGET` — the actual hover/def/refs loop
+///      after readiness is confirmed (30s)
+///
+/// Pre-v0.5.5 used a static 5s ceiling, which silently tripped before
+/// rust-analyzer's 30s `await_ready` (added in v0.5.4) could even
+/// finish — the per-file timeout always won, and rust-analyzer
+/// hover/def/refs never had a chance. v0.5.5 makes the outer ceiling
+/// dynamic so it accommodates the per-language readiness wait.
+///
+/// Worst-case batch: 50 files × 95s/file (rust) = ~80 min. Real
+/// batches are MUCH shorter because the pooled LspClient stays warm
+/// after the first file — only the cold-start file pays the full
+/// budget; subsequent files in the same batch hit the warm `quiescent`
+/// signal in <100ms.
+fn pass_file_timeout_for_language(lang: &str) -> std::time::Duration {
+    ready_timeout_for_language(lang)
+        + PROBE_BACKOFF * PROBE_MAX_ATTEMPTS as u32
+        + PER_SYMBOL_LOOP_BUDGET
+}
 
 /// LSP enrichment pass.
 ///
@@ -495,6 +580,32 @@ async fn enrich_files_with_client(
                          for {rel}; issuing hover/defs/refs anyway (may return empty)"
                     );
                 }
+
+                // Active-probe verification — the server's self-report
+                // can lie. rust-analyzer's `quiescent: true` means
+                // "initial analysis cycle finished," not "hover at
+                // arbitrary positions returns content." On cold-start
+                // the on-demand query cache for THIS file isn't primed
+                // yet even after quiescence; the symptom is `25
+                // symbols, 0 hovers/defs/refs` despite await_ready
+                // returning true.
+                //
+                // verify_ready_via_probe issues a real hover at the
+                // first symbol's selection range and retries with
+                // back-off until it returns Some(content) or the
+                // probe budget exhausts. Adds 0-5s on cold-start,
+                // costs nothing on the warm-pool path.
+                if was_ready {
+                    let probe_ok = verify_ready_via_probe(client, &file_uri, &symbols).await;
+                    if !probe_ok {
+                        log::warn!(
+                            "lsp: {lang} server signalled ready for {rel} but probe \
+                             hover returned None after {PROBE_MAX_ATTEMPTS} attempts; \
+                             issuing the per-symbol loop anyway (cache may still warm \
+                             during the loop)"
+                        );
+                    }
+                }
             }
 
             // Drain diagnostics.
@@ -535,7 +646,8 @@ async fn enrich_files_with_client(
             Ok((matched as u64, enriched))
         };
 
-        match tokio::time::timeout(PASS_FILE_TIMEOUT, per_file).await {
+        let per_file_timeout = pass_file_timeout_for_language(lang);
+        match tokio::time::timeout(per_file_timeout, per_file).await {
             Ok(Ok((symbols, enriched))) => {
                 total_symbols += symbols;
                 total_enriched += enriched;
@@ -547,7 +659,7 @@ async fn enrich_files_with_client(
                 log::warn!(
                     "lsp: per-file timeout ({:?}) exceeded for {rel}; skipping. \
                      Server may be misbehaving on this file.",
-                    PASS_FILE_TIMEOUT,
+                    per_file_timeout,
                 );
             }
         }
@@ -564,31 +676,57 @@ async fn enrich_files_with_client(
 mod tests {
     use super::*;
 
-    /// 60f75d: the per-file timeout caps worst-case batch duration.
-    /// Pin both the value (5s) and the relation to the soft poll
-    /// timeout (PASS_SYMBOL_POLL_MAX_ATTEMPTS * PASS_SYMBOL_POLL_DELAY
-    /// = 1s) — the hard timeout MUST exceed the soft poll's max wait,
-    /// otherwise normal cold-start indexing trips the timeout.
+    /// 60f75d + bead `ley-line-open-661727`: the per-file timeout
+    /// must accommodate readiness wait + active probe + per-symbol
+    /// loop. Pre-v0.5.5 used a static 5s ceiling that silently tripped
+    /// before rust-analyzer's 30s `await_ready` could finish — the
+    /// outer timeout always won and rust-analyzer never got the chance
+    /// to answer hover/def/refs.
+    ///
+    /// Pin the per-language composition for the three load-bearing
+    /// languages (rust, go, python) so a refactor that drops the
+    /// dynamic computation surfaces here.
     #[test]
-    fn pass_file_timeout_exceeds_symbol_poll_max() {
-        let soft_max = PASS_SYMBOL_POLL_DELAY * PASS_SYMBOL_POLL_MAX_ATTEMPTS as u32;
-        assert!(
-            PASS_FILE_TIMEOUT > soft_max,
-            "PASS_FILE_TIMEOUT ({:?}) must exceed soft poll max ({:?}) — \
-             otherwise cold-start indexing trips the timeout on every file",
-            PASS_FILE_TIMEOUT,
-            soft_max,
-        );
-        // Pin the actual value too. A refactor that bumped this to
-        // 5 minutes (effectively unbounded for an interactive
-        // workflow) would surface here. If the value legitimately
-        // needs to change, update the doc on PASS_FILE_TIMEOUT and
-        // this assertion together.
+    fn pass_file_timeout_exceeds_readiness_wait_per_language() {
+        for lang in ["rust", "go", "python", "typescript", "java", "zig"] {
+            let total = pass_file_timeout_for_language(lang);
+            let ready = ready_timeout_for_language(lang);
+            assert!(
+                total > ready,
+                "per-file timeout for {lang} ({total:?}) must exceed its readiness wait \
+                 ({ready:?}) — otherwise the wrapping timeout trips before await_ready \
+                 can finish, silently killing semantic queries"
+            );
+            let probe_budget = PROBE_BACKOFF * PROBE_MAX_ATTEMPTS as u32;
+            assert!(
+                total >= ready + probe_budget + PER_SYMBOL_LOOP_BUDGET,
+                "per-file timeout for {lang} ({total:?}) must include readiness ({ready:?}) \
+                 + probe budget ({probe_budget:?}) + per-symbol loop ({PER_SYMBOL_LOOP_BUDGET:?})"
+            );
+        }
+    }
+
+    /// Pin the rust-analyzer cold-start budget. If this value moves,
+    /// it's a deliberate signal — update the comment on
+    /// `ready_timeout_for_language` and re-verify against real cold
+    /// cargo workspaces.
+    #[test]
+    fn rust_analyzer_ready_timeout_pinned() {
         assert_eq!(
-            PASS_FILE_TIMEOUT,
-            std::time::Duration::from_secs(5),
-            "PASS_FILE_TIMEOUT pinned at 5s — see doc comment for rationale",
+            ready_timeout_for_language("rust"),
+            std::time::Duration::from_secs(60),
+            "rust-analyzer cold-start budget pinned at 60s; bump if real-world cold \
+             cargo workspaces routinely exceed it"
         );
+    }
+
+    /// Pin the active-probe configuration. The probe is the substantive
+    /// safety net against `quiescent: true` lying — its parameters
+    /// shouldn't drift without a deliberate doc-update commit.
+    #[test]
+    fn probe_config_pinned() {
+        assert_eq!(PROBE_MAX_ATTEMPTS, 5);
+        assert_eq!(PROBE_BACKOFF, std::time::Duration::from_secs(1));
     }
 
     #[test]

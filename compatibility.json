@@ -1,7 +1,7 @@
 {
   "$schema_version": 1,
-  "binary_version": "0.5.1",
-  "schema_version": "0.5.1",
+  "binary_version": "0.5.2",
+  "schema_version": "0.5.2",
   "wire_format_major": 1,
   "compat_min_schema_version": "0.4.1",
   "build_date": "unspecified"

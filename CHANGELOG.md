@@ -10,7 +10,35 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
-Nothing yet — post-v0.5.1 changes land here.
+Nothing yet — post-v0.5.2 changes land here.
+
+## [0.5.2] — 2026-06-25
+
+Patch bump. Absorbs three cloister-side primitives into LLO so cloister can de-vendor its `leyline-sign` fork (boundary principle from bead `5e05e6`), surfaces enrichment-pass skip reasons in the daemon's JSON response so consumers can debug what was skipped and why (unblocks mache-303036), and tightens docs + daemon error strings to reflect post-v0.5.0 substrate reality.
+
+### Added
+
+- **`leyline_sign::cert_chain`** (#115, bead `4a9e5a`). Ed25519 cert-chain verifier + claims parsing for ephemeral Signet certs. Supports the Interlace custom-OID arc (`1.3.6.1.4.1.99999.1.{4,5,6}`) for epoch / peer_fp / scope extensions; missing extensions return `None` rather than error. Generic over input cert bytes — works for any Signet-aware CA. Ported from cloister's vendored fork.
+- **`leyline_sign::ffi::lsign_alloc` + `lsign_free`** (#115, bead `4ad9da`). wasm32 linear-memory exports for byte-buffer marshalling. Same calling convention as native cdylib (cbindgen); pointers become 32-bit indices into wasm linear memory for workerd / browsers / WASI hosts.
+- **`EnrichmentStats.skipped: Vec<String>`** (#117, bead `661727`). Per-language / per-file skip reasons surfaced in the daemon's JSON enrich response. `LspEnrichmentPass` populates four cases that were previously stderr-only: no bundled server for language, server not on PATH, per-language enrich failure, scope-matched-nothing. Field is `#[serde(skip_serializing_if = "Vec::is_empty")]` so the wire shape stays empty when nothing was skipped (backward-compat).
+
+### Changed
+
+- **`leyline_sign::cms::sign_data` omits `signingTime`** (#116, bead-tracked at PR description). RFC 5652 §5.3 lists signingTime as useful-but-unauthenticated, so omission is spec-legal. Previous behavior emitted a hardcoded `250101000000Z` (literal 2025-01-01) — a "fixed time for deterministic output in tests; real usage could use current time" hack that signed a lie. Removing the hack unblocks wasm32 (no per-host time source contract) and matches cloister's vendored fork. Temporal binding moves to `cert.not_before` / `not_after` (signed by the master at mint time) and application-layer attestation rows' server-timestamped `created_at`.
+- **`cmd_daemon` off-loopback bind error** (#114, bead `b8c6f2`). Error string now branches on `mcp_no_auth` and reflects ADR-0022 token-gate reality: default mode says "even with the token gate active, off-loopback bind makes the daemon discoverable to every interface"; `--mcp-no-auth` says "with `--mcp-no-auth` the listener is unauthenticated — off-loopback bind is immediately exploitable." Previous string contradicted the code comment 18 lines above ("The MCP wire has no auth" — stale post-ADR-0022).
+- **`GETTING-STARTED.md` runtime-deps clarified** (#113, bead `dc6fbf`). macOS default mount is NFS (uses kernel's native NFS client, needs no extra deps); `brew install fuse-t` is OPTIONAL ("only if you want `--backend fuse` on macOS instead of NFS"). Surfaced when verifying `default_backend()` returns NFS on macOS / FUSE on Linux per `cli-lib/src/cmd_serve.rs:17-23`.
+
+### Removed
+
+- **`leyline_sign::cms::encode_utc_time_now`** (#116). Hardcoded-time helper for the now-removed `signingTime` attribute. Re-introduce only with a per-host time-source contract (`js_sys::Date` in V8, `wasi:clocks` in WASI, `SystemTime::now()` native).
+
+### Wire-format break
+
+- CMS signatures produced by `leyline_sign::cms::sign_data` no longer carry the `signingTime` signed attribute. Verifiers that hard-required it will reject these signatures. RFC 5652 §5.3 spec-compliant verifiers treat it as optional and continue to verify. Cloister already emits this shape; signet and mache don't consume LLO's CMS signer directly. Pre-1.0 LLO per `[[feedback_remove_not_deprecate]]` — version is the signal.
+
+### Bead audit (this cycle)
+
+7 LLO beads closed-with-evidence in addition to the work above (`caf9bf`, `d584f1`, `bbb231`, `bc8256`, `5f7100`, `bb0316`, `6263b9`, `9d70b3`, `b93871`, `61d546`, `2f0289`, `4bb8a0`, `b07a79`). Documented via per-bead comments; the LLO open-bead queue is meaningfully smaller post-cycle.
 
 ## [0.5.1] — 2026-06-25
 

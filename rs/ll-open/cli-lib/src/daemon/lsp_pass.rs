@@ -45,6 +45,42 @@ fn sibling_capnp_log(conn: &Connection) -> Option<std::path::PathBuf> {
 const PASS_SYMBOL_POLL_MAX_ATTEMPTS: usize = 5;
 const PASS_SYMBOL_POLL_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// Per-language ready-timeout. Returns `Duration::ZERO` to skip the
+/// readiness wait entirely (servers that don't emit indexing signals).
+///
+/// rust-analyzer needs the longest wait — cargo metadata + initial
+/// cargo check on a cold workspace can take 10-30s. gopls is faster
+/// (~2-5s for typical workspaces). Other servers we bundle finish
+/// quickly enough that the syntactic-only path (documentSymbol)
+/// returns useful data even before the readiness signal would arrive,
+/// so we skip the wait and accept that hover/def/refs may return
+/// empty on the first call (the lazy-enrich retry pattern in
+/// `op_lsp_hover` re-runs the pass on the next request anyway).
+///
+/// Bead `ley-line-open-661727`: pre-fix the pass had no timeout at
+/// all because it never waited — it just fired queries against an
+/// un-indexed server and accepted the empty results. Per-language
+/// numbers chosen empirically from rust-analyzer / gopls observed
+/// cold-start latencies; bump per-language as needed when a specific
+/// server's behaviour surfaces a tighter or looser fit.
+fn ready_timeout_for_language(lang: &str) -> std::time::Duration {
+    use std::time::Duration;
+    match lang {
+        "rust" => Duration::from_secs(30),
+        "go" => Duration::from_secs(10),
+        "typescript" | "typescriptreact" | "javascript" | "javascriptreact" => {
+            Duration::from_secs(8)
+        }
+        "python" => Duration::from_secs(8),
+        "c" | "cpp" => Duration::from_secs(10),
+        "java" => Duration::from_secs(20),
+        "zig" => Duration::from_secs(5),
+        // No-server languages are filtered out earlier; this is the
+        // fallback for any bundled language not enumerated above.
+        _ => Duration::from_secs(5),
+    }
+}
+
 /// Hard ceiling on total time spent enriching a single file (60f75d).
 ///
 /// The poll loop above is a soft 5×200ms = 1s wait for symbol
@@ -434,6 +470,31 @@ async fn enrich_files_with_client(
 
             if symbols.is_empty() {
                 return Ok::<(u64, u64), anyhow::Error>((0, 0));
+            }
+
+            // Bead `ley-line-open-661727` — readiness gate before
+            // semantic queries. `documentSymbol` above is syntactic and
+            // returns immediately; hover/definition/references need the
+            // server's project model loaded (cargo metadata + cargo
+            // check for rust-analyzer; module-graph for gopls; etc.).
+            // Pre-fix the pass would race the indexer and write 25
+            // skeleton _lsp rows with 0 hovers/defs/refs.
+            //
+            // `await_ready` polls for `experimental/serverStatus
+            // quiescent: true` (rust-analyzer extension) or `$/progress`
+            // end for an indexing token. Servers that don't emit either
+            // hit the timeout — those calls were going to return empty
+            // anyway; the timeout caps the wait at the per-language
+            // cost. The handler skips the wait entirely when timeout = 0.
+            let ready_timeout = ready_timeout_for_language(lang);
+            if !ready_timeout.is_zero() {
+                let was_ready = client.await_ready(ready_timeout).await;
+                if !was_ready {
+                    log::warn!(
+                        "lsp: {lang} server didn't signal ready within {ready_timeout:?} \
+                         for {rel}; issuing hover/defs/refs anyway (may return empty)"
+                    );
+                }
             }
 
             // Drain diagnostics.

@@ -10,7 +10,32 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
-Nothing yet — post-v0.5.3 changes land here.
+Nothing yet — post-v0.5.4 changes land here.
+
+## [0.5.4] — 2026-06-26
+
+Patch bump. Fixes the **rust-analyzer readiness race** that v0.5.3 surfaced via the `skipped: []` reporting — mache observed `lsp: lib.rs — 25 symbols, 0 defs, 0 hovers, 0 refs` and the pass finished in 639ms. That 639ms is the tell: `documentSymbol` is syntactic and returns immediately, but hover/definition/references need the cargo project model loaded. The pre-fix pass fired all three before rust-analyzer finished indexing.
+
+Holistic redesign rather than per-symbol retry: declare the LSP capabilities that opt-in to indexing-progress notifications, parse them as they arrive, and gate the semantic-query loop on a per-language readiness wait.
+
+### Added
+
+- **`window.workDoneProgress: true`** capability declared in `LspClient::start` (`rs/ll-open/lsp/src/client.rs:110-112`). Without this opt-in rust-analyzer (and most servers) don't emit the `$/progress` begin/report/end lifecycle that signals indexing completion.
+- **`experimental.serverStatusNotification: true`** capability declared in the same init handshake. rust-analyzer's `experimental/serverStatus` notification signals `quiescent: true` when the server has finished its current analysis sweep — strictly cheaper to consume than parsing `$/progress` titles.
+- **`LspClient::await_ready(timeout)`** (`rs/ll-open/lsp/src/client.rs`). Polls the new `server_ready` flag (flipped by either `experimental/serverStatus quiescent: true` or `$/progress` end for an indexing-titled token). Returns `true` on ready signal, `false` on timeout. Callers continue on either — timeout falls back to "issue queries anyway, accept the empty results if the server didn't finish."
+- **`is_readiness_token`** helper — recognizes `$/progress` titles whose case-insensitive match contains `indexing`, `loading`, `workspace`, or `ready`. Covers rust-analyzer (`"rust-analyzer/Indexing"`), gopls (`"Setting up workspace"`), pyright (`"Pyright: Indexing"`), and generic fallbacks.
+- **`ready_timeout_for_language`** (`rs/ll-open/cli-lib/src/daemon/lsp_pass.rs`) — per-language readiness timeout. rust-analyzer: 30s (cold cargo workspace can take 10-30s); gopls: 10s; pyright/clangd: 8-10s; zls: 5s; fallback: 5s. Returns `Duration::ZERO` to skip the wait entirely for servers without indexing signals (none today; reserved for future bundled servers).
+- **`LspEnrichmentPass` readiness gate** — after `documentSymbol` succeeds, the pass now calls `client.await_ready(ready_timeout_for_language(lang))` BEFORE the hover/def/refs loop. Logs a warning when the wait times out so the operator knows the server didn't quiesce in the budget. Bead `ley-line-open-661727`.
+- **`handle_notification` covers `$/progress` and `experimental/serverStatus`** in addition to the prior `textDocument/publishDiagnostics` (`rs/ll-open/lsp/src/client.rs`). 6 new unit tests pin: known-title recognition, non-title rejection, `await_ready` returns true on `quiescent: true`, returns true on `$/progress` end-for-indexing, returns false on timeout-without-signals, returns false on `quiescent: false`.
+
+### Behavior change
+
+Cold rust-analyzer enrichment now waits for the indexer to quiesce before issuing hover/def/refs queries. The single-file enrichment-pass latency budget grows from ~600ms (immediate queries against un-indexed server, all empty) to whatever the indexer needs (typically 5-30s on cold cargo workspaces). The trade is correctness — semantic queries actually return real data instead of zero rows. Subsequent enrichments on the same daemon instance reuse the pooled `LspClient` per language and skip the cold-start wait.
+
+### Notes
+
+- The 30s rust-analyzer ceiling is empirical; bump if real-world cargo workspaces routinely exceed it. The pass logs a warning + continues on timeout, so an over-tight ceiling degrades to v0.5.3 behavior rather than blocking.
+- No wire-format change. `EnrichmentStats.skipped` (v0.5.3) is still the surface for any per-language enrich skip; v0.5.4 just makes those skip reasons rarer on rust-analyzer because the pass now actually waits for the indexer.
 
 ## [0.5.3] — 2026-06-25
 

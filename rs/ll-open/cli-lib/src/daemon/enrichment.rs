@@ -19,12 +19,24 @@ use super::{DaemonState, PassStatus};
 // ---------------------------------------------------------------------------
 
 /// Statistics from a single enrichment pass.
-#[derive(Debug, Clone, Serialize)]
+///
+/// `skipped` carries human-readable per-language / per-file reasons that
+/// portions of the requested scope did not produce writes. The previous
+/// shape silently `eprintln!`-ed skip reasons; consumers (mache, tests,
+/// any future MCP introspection) had no way to distinguish "0 items
+/// because nothing matched the scope" from "0 items because the LSP
+/// server wasn't on PATH" from "5 items because rust-analyzer ran but
+/// markdown was skipped." The field is `Vec<String>` rather than a typed
+/// enum because reasons are surface-only — consumers display them, they
+/// don't branch on them. Bead `ley-line-open-661727`.
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct EnrichmentStats {
     pub pass_name: String,
     pub files_processed: u64,
     pub items_added: u64,
     pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<String>,
 }
 
 /// An enrichment pass that reads from the living database and writes
@@ -332,6 +344,7 @@ impl EnrichmentPass for TreeSitterPass {
             files_processed: result.parsed,
             items_added: result.parsed, // each file produces nodes
             duration_ms: start.elapsed().as_millis() as u64,
+            skipped: Vec::new(),
         })
     }
 }
@@ -375,6 +388,7 @@ mod tests {
                 files_processed: 0,
                 items_added: 0,
                 duration_ms: 0,
+                skipped: Vec::new(),
             })
         }
     }
@@ -439,6 +453,7 @@ mod tests {
             files_processed: 4,
             items_added: 17,
             duration_ms: 250,
+            skipped: Vec::new(),
         };
         let json = serde_json::to_value(&stats).unwrap();
         let obj = json.as_object().expect("must serialize as object");

@@ -143,11 +143,26 @@ impl EnrichmentPass for LspEnrichmentPass {
         let files = collect_enrichment_targets(conn, changed_files)?;
 
         if files.is_empty() {
+            // Scope didn't match any rows in `_source`. The common cause
+            // (per bead `ley-line-open-661727`) is a path-shape mismatch
+            // between caller-supplied `changed_files` and what the
+            // tree-sitter pass stored as `_source.id`. Surface this in
+            // the response so callers don't see `items_added: 0` and
+            // misread it as "no work to do."
+            let mut skipped = Vec::new();
+            if let Some(req) = changed_files {
+                skipped.push(format!(
+                    "scope matched no _source.id rows; requested {} file(s): {:?}",
+                    req.len(),
+                    req,
+                ));
+            }
             return Ok(EnrichmentStats {
                 pass_name: "lsp".to_string(),
                 files_processed: 0,
                 items_added: 0,
                 duration_ms: 0,
+                skipped,
             });
         }
 
@@ -166,22 +181,35 @@ impl EnrichmentPass for LspEnrichmentPass {
         let start = Instant::now();
         let mut total_symbols = 0u64;
         let mut total_enriched = 0u64;
+        // Per-language skip reasons surfaced in the response. Each entry
+        // names the language, the file count it covers, and the reason.
+        // Bead `ley-line-open-661727` — silent stderr-only skips meant
+        // callers couldn't tell "no work needed" from "server missing"
+        // from "no bundled server for this language."
+        let mut skipped: Vec<String> = Vec::new();
 
         for (lang, lang_files) in &by_lang {
             let (server_cmd, server_args) = match language_server(lang) {
                 Some(s) => s,
                 None => {
-                    eprintln!(
-                        "lsp: no server for language '{lang}', skipping {} file(s)",
+                    let reason = format!(
+                        "no bundled LSP server for language '{lang}' ({} file(s) skipped)",
                         lang_files.len()
                     );
+                    eprintln!("lsp: {reason}");
+                    skipped.push(reason);
                     continue;
                 }
             };
 
             // Check if the server is available.
             if which::which(server_cmd).is_err() {
-                eprintln!("lsp: {server_cmd} not on PATH, skipping {lang}");
+                let reason = format!(
+                    "language server '{server_cmd}' not on PATH for language '{lang}' ({} file(s) skipped)",
+                    lang_files.len()
+                );
+                eprintln!("lsp: {reason}");
+                skipped.push(reason);
                 continue;
             }
 
@@ -216,7 +244,10 @@ impl EnrichmentPass for LspEnrichmentPass {
                     total_enriched += enriched;
                 }
                 Err(e) => {
-                    eprintln!("lsp: {server_cmd} failed for {lang}: {e:#}");
+                    let reason =
+                        format!("language server '{server_cmd}' failed for '{lang}': {e:#}");
+                    eprintln!("lsp: {reason}");
+                    skipped.push(reason);
                 }
             }
         }
@@ -226,6 +257,7 @@ impl EnrichmentPass for LspEnrichmentPass {
             files_processed: files.len() as u64,
             items_added: total_symbols + total_enriched,
             duration_ms: start.elapsed().as_millis() as u64,
+            skipped,
         })
     }
 }

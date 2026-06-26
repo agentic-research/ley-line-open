@@ -341,6 +341,7 @@ impl EnrichmentPass for SessionObservationPass {
                     files_processed: 0,
                     items_added: 0,
                     duration_ms: start.elapsed().as_millis() as u64,
+                    skipped: vec!["LEYLINE_SESSION_CORPUS env var unset; no work".to_string()],
                 });
             }
         };
@@ -363,6 +364,7 @@ impl EnrichmentPass for SessionObservationPass {
                 files_processed: 0,
                 items_added: 0,
                 duration_ms: start.elapsed().as_millis() as u64,
+                skipped: Vec::new(),
             });
         }
 
@@ -471,6 +473,7 @@ impl EnrichmentPass for SessionObservationPass {
             files_processed,
             items_added,
             duration_ms: start.elapsed().as_millis() as u64,
+            skipped: Vec::new(),
         })
     }
 }

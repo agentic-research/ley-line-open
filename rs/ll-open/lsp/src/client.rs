@@ -206,7 +206,14 @@ impl LspClient {
         let req = Request::new(id, method, params);
         self.send(&serde_json::to_string(&req)?).await?;
 
-        // Read messages until we get our response (collecting notifications along the way)
+        // Read messages until we get our response, dispatching everything
+        // else along the way: notifications (handle), and — crucially —
+        // server→CLIENT requests, which we MUST answer or the server
+        // blocks. gopls sends `workspace/configuration` and
+        // `window/workDoneProgress/create` requests early; without our
+        // reply it never resolves config or emits progress, so hover/def/
+        // ref stay empty and the per-file budget is wasted (mache-6584a0).
+        // rust-analyzer doesn't depend on these, which is why only gopls hung.
         loop {
             let msg = self
                 .rx
@@ -214,20 +221,40 @@ impl LspClient {
                 .await
                 .context("LSP server closed connection")?;
 
-            // Server notification (e.g. publishDiagnostics)
-            if msg.id.is_none() {
-                self.handle_notification(&msg);
-                continue;
-            }
-
-            if msg.id == Some(id) {
-                if let Some(err) = msg.error {
-                    bail!("LSP error {}: {}", err.code, err.message);
+            match (msg.id, msg.method.as_deref()) {
+                // Server→client REQUEST (has both id and method): answer it.
+                (Some(req_id), Some(method)) => {
+                    let method = method.to_string();
+                    self.answer_server_request(req_id, &method, msg.params.as_ref())
+                        .await?;
                 }
-                return Ok(msg.result.unwrap_or(serde_json::Value::Null));
+                // Notification (method, no id): handle (diagnostics, progress, status).
+                (None, Some(_)) => self.handle_notification(&msg),
+                // Response to one of OUR requests.
+                (Some(resp_id), None) if resp_id == id => {
+                    if let Some(err) = msg.error {
+                        bail!("LSP error {}: {}", err.code, err.message);
+                    }
+                    return Ok(msg.result.unwrap_or(serde_json::Value::Null));
+                }
+                // Stale response for a different id, or malformed — skip.
+                _ => {}
             }
-            // Response for a different ID — skip (shouldn't happen in serial usage)
         }
+    }
+
+    /// Answer a server→client request with a minimal "use defaults" / "ack"
+    /// response. Without this the server (gopls especially) blocks waiting
+    /// for the reply and never finishes loading the workspace (mache-6584a0).
+    async fn answer_server_request(
+        &mut self,
+        id: u64,
+        method: &str,
+        params: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        let result = server_request_result(method, params);
+        let resp = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
+        self.send(&serde_json::to_string(&resp)?).await
     }
 
     /// Send a notification (no response expected).
@@ -385,8 +412,15 @@ impl LspClient {
         // Give the server a moment to send notifications
         tokio::time::sleep(DIAGNOSTIC_DRAIN_DELAY).await;
         while let Ok(msg) = self.rx.try_recv() {
-            if msg.id.is_none() {
-                self.handle_notification(&msg);
+            match (msg.id, msg.method.as_deref()) {
+                (Some(req_id), Some(method)) => {
+                    let method = method.to_string();
+                    let _ = self
+                        .answer_server_request(req_id, &method, msg.params.as_ref())
+                        .await;
+                }
+                (None, Some(_)) => self.handle_notification(&msg),
+                _ => {}
             }
         }
     }
@@ -497,12 +531,22 @@ impl LspClient {
         let deadline = tokio::time::Instant::now() + timeout;
         let poll_interval = std::time::Duration::from_millis(50);
         loop {
-            // Drain any pending notifications first (no waiting); each
-            // tick may flip server_ready via $/progress or
-            // experimental/serverStatus.
+            // Drain pending messages (no waiting). Each tick may flip
+            // server_ready via $/progress or experimental/serverStatus —
+            // but only if we ANSWER the server's requests: gopls won't emit
+            // progress until its `window/workDoneProgress/create` request is
+            // acked, so answering server→client requests here is what lets
+            // the readiness signal arrive at all (mache-6584a0).
             while let Ok(msg) = self.rx.try_recv() {
-                if msg.id.is_none() {
-                    self.handle_notification(&msg);
+                match (msg.id, msg.method.as_deref()) {
+                    (Some(req_id), Some(method)) => {
+                        let method = method.to_string();
+                        let _ = self
+                            .answer_server_request(req_id, &method, msg.params.as_ref())
+                            .await;
+                    }
+                    (None, Some(_)) => self.handle_notification(&msg),
+                    _ => {}
                 }
             }
             if self.server_ready {
@@ -536,6 +580,33 @@ fn is_readiness_token(title: &str) -> bool {
         || t.contains("loading")
         || t.contains("workspace")
         || t.contains("ready")
+}
+
+/// Build the `result` payload for a server→client request we must answer.
+/// The server blocks until these are answered (mache-6584a0); the replies
+/// are deliberately minimal:
+///   - `workspace/configuration` → one `null` per requested item, i.e.
+///     "no override, use your defaults". gopls requests config for each
+///     workspace folder/scope right after `initialized`; an unanswered
+///     request stalls its workspace load.
+///   - everything else (`window/workDoneProgress/create`,
+///     `client/registerCapability`, `client/unregisterCapability`, …) →
+///     `null`, a bare ack so the server proceeds. In particular gopls will
+///     not emit `$/progress` until its `window/workDoneProgress/create`
+///     request is acked, so without this `await_ready` waits the full
+///     per-file budget and the file is skipped with zero hovers.
+fn server_request_result(method: &str, params: Option<&serde_json::Value>) -> serde_json::Value {
+    match method {
+        "workspace/configuration" => {
+            let n = params
+                .and_then(|p| p.get("items"))
+                .and_then(|i| i.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            serde_json::Value::Array(vec![serde_json::Value::Null; n])
+        }
+        _ => serde_json::Value::Null,
+    }
 }
 
 impl LspClient {
@@ -601,6 +672,39 @@ mod tests {
         assert!(!is_readiness_token("Run cargo test"));
         assert!(!is_readiness_token("Diagnostics published"));
         assert!(!is_readiness_token(""));
+    }
+
+    #[test]
+    fn workspace_configuration_response_has_one_null_per_item() {
+        // gopls requests config per workspace scope; the LSP spec requires
+        // the response array length to match the requested `items` length.
+        // Replying [null, null] = "no override, use defaults" (mache-6584a0).
+        let params = serde_json::json!({
+            "items": [{"section": "gopls"}, {"section": "gopls"}, {}]
+        });
+        assert_eq!(
+            server_request_result("workspace/configuration", Some(&params)),
+            serde_json::json!([null, null, null])
+        );
+        // No items / missing → empty array, still a valid response.
+        assert_eq!(
+            server_request_result("workspace/configuration", None),
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn other_server_requests_ack_with_null() {
+        // window/workDoneProgress/create MUST be acked or gopls never emits
+        // $/progress → await_ready waits the full budget → 0 hovers.
+        for m in [
+            "window/workDoneProgress/create",
+            "client/registerCapability",
+            "client/unregisterCapability",
+            "some/unknownServerRequest",
+        ] {
+            assert_eq!(server_request_result(m, None), serde_json::Value::Null);
+        }
     }
 
     /// Construct a `LspClient` from a fake child process for tests.

@@ -618,6 +618,15 @@ fn op_enrich(ctx: &DaemonContext, pass_name: &str, files: Option<&[String]>) -> 
         entry.set_files_processed(s.files_processed);
         entry.set_items_added(s.items_added);
         entry.set_duration_ms(s.duration_ms);
+        // Per-pass skip reasons (bead `ley-line-open-661727`). Without
+        // this wiring the field was populated on the Rust struct but
+        // dropped at the capnp boundary — consumers reading the daemon
+        // response (mache et al.) never saw the reasons. JSON-only test
+        // round-trip passed; production wire shape was incomplete.
+        let mut skipped_b = entry.reborrow().init_skipped(s.skipped.len() as u32);
+        for (j, reason) in s.skipped.iter().enumerate() {
+            skipped_b.set(j as u32, reason.as_str());
+        }
     }
     let reader = builder
         .get_root_as_reader::<leyline_public_schema::daemon_capnp::enrich_response::Reader>()?;

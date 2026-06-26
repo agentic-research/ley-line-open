@@ -1,9 +1,9 @@
 # leyline-sign — wasm32 convergence with cloister's vendored fork
 
-**Status:** Open · three concrete PR tasks below
+**Status:** ✅ **Shipped 2026-06-25 in v0.5.2** — PRs #115 (`cert_chain` + `lsign_alloc`/`free`), #116 (signingTime omission). Cloister can now de-vendor; see bead `5a06e9` close-comment for the cloister-side path.
 **Filed:** 2026-06-25
 **Filed-from:** `~/remotes/art/cloister/` audit `cloister-59c60e` (2026-06-24); see also `cloister/docs/adr/0035-cloister-llo-boundary.md`
-**Bead:** TBD — `.beads/embeddeddolt/` is uninitialized + bd 1.0.0 errors on `init schema: no database selected` against the present `beads.db`. Convert this doc to a bead when bd state is reconciled.
+**Beads:** `ley-line-open-4a9e5a` (cert_chain, closed), `ley-line-open-4ad9da` (wasm32 FFI, closed), `ley-line-open-5a06e9` (host-feature evaluation, closed as recommend-against — host/* stays cloister-side as `cloister-sign-host`).
 
 ## Context
 

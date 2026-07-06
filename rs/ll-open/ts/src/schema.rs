@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS _source (
     id TEXT PRIMARY KEY,
     language TEXT NOT NULL,
     content BLOB,
-    path TEXT
+    path TEXT,
+    content_hash BLOB
 );";
 
 /// DDL for the `_ast` table — table only, no indexes. Pairs with

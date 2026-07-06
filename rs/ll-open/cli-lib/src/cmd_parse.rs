@@ -67,6 +67,12 @@ struct ParsedFile {
     refs: Vec<ExtractedRef>,
     file_mtime: i64,
     file_size: i64,
+    /// BLAKE3-32 of the file bytes. Computed in the rayon worker from the
+    /// same `content` slice tree-sitter parsed, so it costs one extra hash
+    /// pass over already-in-cache bytes. Populates `_source.contentHash`
+    /// (closing the T8.5 TODO) and is the first component of every
+    /// `symbol_id` (ADR-0026 / mache ADR-0023).
+    content_hash: [u8; 32],
     /// Pre-serialized capnp bytes for the per-file `SourceFile` record.
     /// Built in the rayon worker so the post-parse main thread just
     /// writes the bytes to the BufWriter — no per-file canonicalize
@@ -290,16 +296,17 @@ batch_table! {
     // Plain INSERT: same rationale as AstBatch — delete_file_rows
     // clears _source rows per file before reparse.
     SourceBatch, SourceRow,
-    "INSERT INTO _source (id, language, path) VALUES ",
-    3,
-    push_fn: (id: String, language: String, path: String),
-    push_body: { SourceRow { id, language, path } },
+    "INSERT INTO _source (id, language, path, content_hash) VALUES ",
+    4,
+    push_fn: (id: String, language: String, path: String, content_hash: Vec<u8>),
+    push_body: { SourceRow { id, language, path, content_hash } },
     flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 3);
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 4);
         for r in chunk {
             out.push(&r.id);
             out.push(&r.language);
             out.push(&r.path);
+            out.push(&r.content_hash);
         }
         out
     },
@@ -768,7 +775,12 @@ pub fn parse_into_conn(
                 let rel_path = Path::new(&pf.rel);
                 collect_dirs(rel_path, &mut dirs_created, &mut nodes_buf, mtime);
 
-                source_buf.push(pf.rel.clone(), pf.language.clone(), pf.abs_path.clone());
+                source_buf.push(
+                    pf.rel.clone(),
+                    pf.language.clone(),
+                    pf.abs_path.clone(),
+                    pf.content_hash.to_vec(),
+                );
 
                 // capnp dual-write (`ley-line-open-cdf098`): same fields
                 // as the SQL row, typed and content-addressable. The
@@ -1304,6 +1316,7 @@ fn serialize_source_file_record(
     canonical_path: &str,
     mtime: i64,
     size: i64,
+    content_hash: &[u8; 32],
 ) -> Result<()> {
     use leyline_schema_capnp::source_capnp::source_file;
 
@@ -1315,8 +1328,10 @@ fn serialize_source_file_record(
         sf.set_canonical_path(canonical_path);
         sf.set_mtime(mtime as u64);
         sf.set_size(size as u64);
-        // contentHash left empty for now — T8.5 wires BLAKE3.
-        let _hash = sf.init_content_hash();
+        // BLAKE3-32 of the file bytes (T8.5 wired in ADR-0026). Feeds the
+        // Σ segment hash and — projected into `_source.contentHash` — the
+        // `symbol_id` content address consumers join on.
+        sf.init_content_hash().set_bytes(content_hash);
     }
 
     let mut canonical = capnp::message::Builder::new_default();
@@ -1384,6 +1399,12 @@ fn parse_file_pure(
         .parse(content, None)
         .context("tree-sitter parse returned None")?;
 
+    // BLAKE3 of the file bytes — the content address feeding both
+    // `_source.contentHash` (T8.5) and every `symbol_id` (ADR-0026).
+    // Hashed here, in the worker, over the bytes already resident for
+    // parsing.
+    let content_hash: [u8; 32] = *blake3::hash(content).as_bytes();
+
     let root = tree.root_node();
 
     let parent_id = source_id
@@ -1450,6 +1471,7 @@ fn parse_file_pure(
         abs_path,
         file_mtime,
         file_size,
+        &content_hash,
     )?;
     // ~150 bytes per AstNode record (canonical: id + source_id + kind +
     // Range); pre-size to avoid re-allocs during the per-node loop.
@@ -1467,6 +1489,7 @@ fn parse_file_pure(
         refs,
         file_mtime,
         file_size,
+        content_hash,
         source_capnp_bytes,
         ast_capnp_bytes,
     })

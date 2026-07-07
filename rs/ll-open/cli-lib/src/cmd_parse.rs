@@ -1052,20 +1052,20 @@ pub fn parse_into_conn(
     // skipped, which is correct. Both endpoints always resolve, so this
     // arm never contributes an unbound fact.
     for (node_id, child_sym) in &node_to_sym {
-        if let Some((parent_id, _)) = node_id.rsplit_once('/') {
-            if let Some(parent_sym) = node_to_sym.get(parent_id) {
-                edges_buf.push(
-                    parent_sym.to_vec(),
-                    Some(child_sym.to_vec()),
-                    "contains".to_string(),
-                    "mention".to_string(),
-                    ir_gen,
-                    None,
-                    None,
-                    None,
-                    None,
-                );
-            }
+        if let Some((parent_id, _)) = node_id.rsplit_once('/')
+            && let Some(parent_sym) = node_to_sym.get(parent_id)
+        {
+            edges_buf.push(
+                parent_sym.to_vec(),
+                Some(child_sym.to_vec()),
+                "contains".to_string(),
+                "mention".to_string(),
+                ir_gen,
+                None,
+                None,
+                None,
+                None,
+            );
         }
     }
     // `references`: reference-site symbol → resolved definition symbol, or

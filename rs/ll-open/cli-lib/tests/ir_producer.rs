@@ -322,3 +322,112 @@ fn head_records_unbound_facts_count() {
         "head.capnp unboundFacts must equal the db's NULL-dst reference count"
     );
 }
+
+// ── 4. cross-language coverage (Rust) ─────────────────────────────────────
+//
+// The edge pass (contains/defines/references) is language-agnostic — it runs
+// over whatever ExtractedRef stream the per-language extractor produces. Go is
+// covered above; this pins that Rust's function_item / call_expression /
+// macro_invocation extraction flows through the same edge machinery, including
+// cross-file binding and an unbound builtin. (Languages without a ref
+// extractor — e.g. Python today — get contains-only edges, which mirrors their
+// empty node_defs/node_refs; not asserted here.)
+
+/// Parse a Rust source dir into a fresh in-memory db.
+fn cold_parse_rust(src_dir: &Path) -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    leyline_cli_lib::cmd_parse::parse_into_conn(&conn, src_dir, Some("rust"), None)
+        .expect("cold parse Rust fixture");
+    conn
+}
+
+#[test]
+fn fact_edges_rust_defines_references_and_binds_cross_file() {
+    let dir = TempDir::new().unwrap();
+    // `add` defined in lib.rs, called from main.rs → cross-file bound ref.
+    // `println!` is a macro with no def row → an unbound reference.
+    fs::write(
+        dir.path().join("lib.rs"),
+        b"pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+    )
+    .unwrap();
+    // Direct calls (not inside a macro): tree-sitter-rust represents macro
+    // args as an unparsed token_tree, so a call nested in println! is not a
+    // call_expression and yields no reference. `add` binds cross-file; the
+    // undefined `missing` is the unbound reference.
+    fs::write(
+        dir.path().join("main.rs"),
+        b"fn main() {\n    let _ = add(1, 2);\n    let _ = missing();\n}\n",
+    )
+    .unwrap();
+    let conn = cold_parse_rust(dir.path());
+
+    // κ collapses Rust's function_item → function; raw_kind is retained.
+    let (kind, raw_kind): (String, String) = conn
+        .query_row(
+            "SELECT kind, raw_kind FROM symbols \
+             WHERE source_id = 'lib.rs' AND name = 'add' AND raw_kind = 'function_item'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("lib.rs must contribute an `add` function symbol");
+    assert_eq!(kind, "function", "κ collapses function_item → function");
+    assert_eq!(raw_kind, "function_item");
+
+    // contains edges are produced for Rust too.
+    let contains: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM fact_edges WHERE kind = 'contains'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(contains > 0, "Rust must produce containment edges");
+
+    // defines: `add` recorded.
+    let defines_add: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM fact_edges \
+             WHERE kind = 'defines' AND token = 'add' AND dst IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(defines_add, 1, "one `defines add` edge from lib.rs");
+
+    // references: the `add` call in main.rs binds cross-file to lib.rs's add.
+    let add_def_sym: Vec<u8> = conn
+        .query_row(
+            "SELECT symbol_id FROM symbols \
+             WHERE source_id = 'lib.rs' AND name = 'add' AND kind = 'function'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let ref_add_dst: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT dst FROM fact_edges WHERE kind = 'references' AND token = 'add'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        ref_add_dst.as_deref(),
+        Some(add_def_sym.as_slice()),
+        "the Rust `add` call must bind to lib.rs's add definition symbol"
+    );
+
+    // references: the undefined `missing` call has no def → unbound (NULL dst).
+    let missing_unbound: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM fact_edges \
+             WHERE kind = 'references' AND token = 'missing' AND dst IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        missing_unbound, 1,
+        "the undefined `missing` call is unresolvable → one unbound reference edge"
+    );
+}

@@ -670,12 +670,10 @@ fn write_binding_record(
         }
     }
 
-    let mut canonical = capnp::message::Builder::new_default();
-    canonical
-        .set_root_canonical(src.get_root_as_reader::<binding_record::Reader>()?)
-        .context("canonicalize BindingRecord")?;
-    capnp::serialize::write_message(writer, &canonical)
-        .context("write BindingRecord to event log")?;
+    leyline_schema_capnp::canonical::write_canonical_message::<binding_record::Owned, _>(
+        &src, writer,
+    )
+    .context("write BindingRecord to event log")?;
     Ok(())
 }
 

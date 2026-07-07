@@ -1197,17 +1197,14 @@ fn write_head_for_path(db_path: &Path) -> Result<()> {
         h.reborrow().init_root_hash().set_bytes(&root);
         h.reborrow().init_parent_hash().set_bytes(&parent);
     }
-    let mut canonical = capnp::message::Builder::new_default();
-    canonical
-        .set_root_canonical(src.get_root_as_reader::<head::Reader>()?)
-        .context("canonicalize Head")?;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .open(&head_path)
         .with_context(|| format!("open head {}", head_path.display()))?;
-    capnp::serialize::write_message(&mut f, &canonical).context("write Head capnp record")?;
+    leyline_schema_capnp::canonical::write_canonical_message::<head::Owned, _>(&src, &mut f)
+        .context("write Head capnp record")?;
     Ok(())
 }
 
@@ -1319,11 +1316,8 @@ fn serialize_source_file_record(
         let _hash = sf.init_content_hash();
     }
 
-    let mut canonical = capnp::message::Builder::new_default();
-    canonical
-        .set_root_canonical(src.get_root_as_reader::<source_file::Reader>()?)
-        .context("canonicalize SourceFile")?;
-    capnp::serialize::write_message(buf, &canonical).context("write SourceFile capnp record")?;
+    leyline_schema_capnp::canonical::write_canonical_message::<source_file::Owned, _>(&src, buf)
+        .context("write SourceFile capnp record")?;
     Ok(())
 }
 
@@ -1354,11 +1348,8 @@ fn serialize_ast_node_record(buf: &mut Vec<u8>, a: &AstEntry) -> Result<()> {
         }
     }
 
-    let mut canonical = capnp::message::Builder::new_default();
-    canonical
-        .set_root_canonical(src.get_root_as_reader::<ast_node::Reader>()?)
-        .context("canonicalize AstNode")?;
-    capnp::serialize::write_message(buf, &canonical).context("write AstNode capnp record")?;
+    leyline_schema_capnp::canonical::write_canonical_message::<ast_node::Owned, _>(&src, buf)
+        .context("write AstNode capnp record")?;
     Ok(())
 }
 

@@ -52,13 +52,14 @@ pub fn register_hdc_udfs(conn: &Connection) -> Result<()> {
             }
             let mut acc: u32 = 0;
             // Process 8 bytes at a time as u64 popcount when possible.
-            let chunks_a = a.chunks_exact(8);
-            let chunks_b = b.chunks_exact(8);
-            let rem_a = chunks_a.remainder();
-            let rem_b = chunks_b.remainder();
-            for (ca, cb) in chunks_a.zip(chunks_b) {
-                let xa = u64::from_le_bytes(ca.try_into().unwrap());
-                let xb = u64::from_le_bytes(cb.try_into().unwrap());
+            // as_chunks::<8>() (stable in 1.88+) gives (&[[u8;8]], &[u8])
+            // — the fixed-size arrays skip the per-chunk try_into that
+            // chunks_exact required.
+            let (chunks_a, rem_a) = a.as_chunks::<8>();
+            let (chunks_b, rem_b) = b.as_chunks::<8>();
+            for (ca, cb) in chunks_a.iter().zip(chunks_b.iter()) {
+                let xa = u64::from_le_bytes(*ca);
+                let xb = u64::from_le_bytes(*cb);
                 acc += (xa ^ xb).count_ones();
             }
             for (&ba, &bb) in rem_a.iter().zip(rem_b) {

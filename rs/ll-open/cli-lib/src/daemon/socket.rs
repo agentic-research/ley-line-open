@@ -96,6 +96,15 @@ pub fn spawn(ctx: Arc<DaemonContext>, sock_path: PathBuf) -> PathBuf {
 /// fills first and the bus's overflow policy decides drop vs disconnect.
 const CONNECTION_WRITE_BUFFER: usize = 64;
 
+/// Heartbeat interval for pushed keepalive events on subscribed UDS
+/// connections. Mache's Subscribe goroutine sets a 60s read deadline
+/// to detect a SIGKILLed daemon (see
+/// `mache/internal/leyline/socket.go::runSubscribeLoop`). An idle
+/// daemon that never emits real events was tripping that deadline and
+/// mache treated the connection as dead. 30s gives 2× headroom against
+/// the 60s deadline. Emit shape: `{"type":"keepalive","ts":<ms>}`.
+const SUBSCRIBE_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Handle a single UDS connection: read line-delimited JSON, dispatch, respond.
 ///
 /// Two background tasks back this loop:
@@ -184,22 +193,56 @@ async fn handle_connection(ctx: Arc<DaemonContext>, stream: tokio::net::UnixStre
         // the response is enqueued preserves "subscribe-ack before
         // first event" ordering — though the underlying mpsc is FIFO so
         // the contract holds either way.
+        //
+        // The relay also emits a small `{"type":"keepalive","ts":<ms>}`
+        // event every `SUBSCRIBE_KEEPALIVE_INTERVAL` when no real event
+        // is pending. Bead surfaced by a mache log: mache's Subscribe
+        // goroutine sets a 60s read deadline on the UDS connection to
+        // detect a SIGKILLed daemon; an idle daemon that never emits
+        // real events was tripping that deadline and mache treated the
+        // connection as dead. 30s heartbeat gives 2× headroom against
+        // the 60s deadline. Consumers that don't want keepalive events
+        // filter by `type == "keepalive"` — mache does this in
+        // `runSubscribeLoop` post-v0.5.7.
         if let Some(mut event_rx) = conn_state.take_event_rx() {
             let relay_tx = write_tx.clone();
             tokio::spawn(async move {
-                while let Some(event) = event_rx.recv().await {
-                    let body = match serde_json::to_string(&event) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            log::warn!("event serialize failed (dropped): {e}");
-                            continue;
+                let mut keepalive = tokio::time::interval(SUBSCRIBE_KEEPALIVE_INTERVAL);
+                // Skip the initial immediate tick — `tick()` fires
+                // once on first call before the interval elapses. We
+                // want the first keepalive at t+30s, not t+0s.
+                keepalive.tick().await;
+                loop {
+                    tokio::select! {
+                        maybe_event = event_rx.recv() => {
+                            let Some(event) = maybe_event else {
+                                // Sender dropped (resubscribe or router
+                                // shutdown) — relay exits.
+                                return;
+                            };
+                            let body = match serde_json::to_string(&event) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    log::warn!("event serialize failed (dropped): {e}");
+                                    continue;
+                                }
+                            };
+                            if relay_tx.send(body).await.is_err() {
+                                return;
+                            }
                         }
-                    };
-                    if relay_tx.send(body).await.is_err() {
-                        // Writer task is gone (client disconnected).
-                        // Stop draining — the subscriber will be cleaned
-                        // up by `conn_state.cleanup` on the read side.
-                        return;
+                        _ = keepalive.tick() => {
+                            let ts = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            let body = format!(
+                                r#"{{"type":"keepalive","ts":{ts}}}"#,
+                            );
+                            if relay_tx.send(body).await.is_err() {
+                                return;
+                            }
+                        }
                     }
                 }
             });

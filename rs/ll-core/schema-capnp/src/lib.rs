@@ -23,6 +23,8 @@
 
 #![allow(clippy::all)]
 
+pub mod canonical;
+
 pub mod common_capnp {
     include!(concat!(env!("OUT_DIR"), "/common_capnp.rs"));
 }

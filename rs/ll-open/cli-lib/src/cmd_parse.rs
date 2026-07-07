@@ -834,6 +834,15 @@ pub fn parse_into_conn(
         }
     }
 
+    // Insert-phase sub-timing (gated on LEYLINE_PROFILE=1) — measures
+    // where the insert budget goes: main-thread row-buffer loop (which
+    // includes the capnp BufWriter writes at :779-786), bulk INSERT
+    // flushes, capnp-flush-before-COMMIT, COMMIT itself, and the
+    // post-load index build. Immune to background I/O contention
+    // because it's measuring wall-time deltas in-process, not sampling.
+    let profile_insert = std::env::var("LEYLINE_PROFILE").ok().as_deref() == Some("1");
+    let sub_buffer_end = std::time::Instant::now();
+
     // Flush each table in BULK_BATCH_ROWS-sized chunks via multi-row
     // VALUES inserts. Tail (last <BULK_BATCH_ROWS rows) flushed in one
     // partial-size statement so we don't fall back to per-row execute.
@@ -853,6 +862,7 @@ pub fn parse_into_conn(
         "INSERT INTO _imports (alias, path, source_id) VALUES ",
     )?;
     file_idx_buf.flush_batched(conn)?;
+    let sub_flush_end = std::time::Instant::now();
 
     // Flush the capnp dual-write `BufWriter`s before COMMIT and before
     // `write_head_after_parse` reads the segments for hashing —
@@ -866,8 +876,10 @@ pub fn parse_into_conn(
     if let Some(mut w) = source_writer.take() {
         w.flush().context("flush source.capnp BufWriter")?;
     }
+    let sub_capnp_flush_end = std::time::Instant::now();
 
     conn.execute_batch("COMMIT")?;
+    let sub_commit_end = std::time::Instant::now();
 
     // Pre-grab the db_path so we can dispatch the head-write hash pass
     // (pure filesystem work, reads ast.capnp + source.capnp) on a worker
@@ -908,8 +920,26 @@ pub fn parse_into_conn(
     // schema with the indexes mache needs, so skipping here is safe.
     // See bead `ley-line-open-cbbedf` Attack 3.
     create_post_load_indexes_skip_unused(conn)?;
+    let sub_index_end = std::time::Instant::now();
 
     let insert_elapsed = insert_start.elapsed();
+
+    if profile_insert {
+        let buf_ms = sub_buffer_end.duration_since(insert_start).as_millis();
+        let flush_ms = sub_flush_end.duration_since(sub_buffer_end).as_millis();
+        let capnp_ms = sub_capnp_flush_end
+            .duration_since(sub_flush_end)
+            .as_millis();
+        let commit_ms = sub_commit_end
+            .duration_since(sub_capnp_flush_end)
+            .as_millis();
+        let index_ms = sub_index_end.duration_since(sub_commit_end).as_millis();
+        eprintln!(
+            "  insert-detail: buffer+capnp_write={buf_ms}ms \
+             sql_flush={flush_ms}ms capnp_flush={capnp_ms}ms \
+             commit={commit_ms}ms index_build={index_ms}ms"
+        );
+    }
 
     // ---- Post-sweep ----
     //

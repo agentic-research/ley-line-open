@@ -10,7 +10,48 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
-Nothing yet — post-v0.5.6 changes land here.
+Nothing yet — post-v0.5.7 changes land here.
+
+## [0.5.7] — 2026-06-26
+
+Two ops-quality fixes surfaced from real-world use post-v0.5.6:
+
+### Bug: mache's Subscribe treated idle connections as dead
+
+Mache's Subscribe goroutine sets a 60s read deadline on the UDS connection to detect a SIGKILLed daemon (`mache/internal/leyline/socket.go:730`). An idle daemon that never emits real events was tripping that deadline and mache logged `"subscribe: read deadline exceeded, treating connection as dead"` — false-positive; the daemon was alive, just quiet.
+
+Fix: **30s keepalive heartbeat** pushed by the daemon's per-connection event-relay task. Emit shape `{"type":"keepalive","ts":<ms>}` — mache filters by `type == "keepalive"` in `runSubscribeLoop` post-v0.5.7. 30s gives 2× headroom against the 60s deadline. Zero cost when real events are flowing (the `tokio::select!` prefers the event branch).
+
+### New: `leyline doctor` command
+
+LLO skips gracefully at runtime when a language server isn't on PATH (v0.5.2+ surfaces the reason via `EnrichmentStats.skipped`), but that's a runtime-only signal — operators + install scripts (mache, cloister) discover the gap only after a query returns empty. `leyline doctor` reports the pre-flight state.
+
+```
+$ leyline doctor
+Bundled LSP servers (found):
+  ✅ rust-analyzer          /Users/j/.cargo/bin/rust-analyzer  (rust)
+  ✅ gopls                  /opt/homebrew/bin/gopls            (go)
+
+Bundled LSP servers (missing — tree-sitter-only fallback):
+  ❌ pyright-langserver     not on PATH                        (python)
+     → npm install -g pyright
+```
+
+- `leyline doctor --json` — machine-readable output for install scripts (cloister etc.)
+- `leyline doctor --allow-missing` — exit 0 even with gaps (for CI / cloister install scripts that want to WARN)
+- Exit code 1 if any bundled server is missing (unless `--allow-missing`)
+- Feature-gated behind `lsp` (same feature as the pass itself; default-on)
+
+### Added
+
+- `SUBSCRIBE_KEEPALIVE_INTERVAL = 30s` in `rs/ll-open/cli-lib/src/daemon/socket.rs`. Documented against the concrete mache read-deadline site.
+- Per-connection event-relay task now uses `tokio::select!` to emit keepalive events on interval when no real event is pending.
+- New `cmd_doctor` module + `Commands::Doctor { json, allow_missing }` subcommand.
+- `install_hint_for(server_cmd)` — install commands per bundled server (`rustup component add rust-analyzer`, `go install golang.org/x/tools/gopls@latest`, `npm install -g pyright`, etc.). Test pin defends against a new bundled language being added without a corresponding hint.
+
+### Consumer note
+
+Post-v0.5.7 daemons emit keepalive events on subscribed connections. Consumers (mache, any future subscriber) should filter by `type == "keepalive"` before forwarding to their own subscribers. Mache's follow-up PR bumps the pin + adds the filter; keepalive events without the filter would surface as spurious `{"type":"keepalive"}` map entries in downstream event channels.
 
 ## [0.5.6] — 2026-06-26
 

@@ -5,6 +5,8 @@
 //! that adds `daemon`, `embed`, `send`, etc.).
 
 pub mod cmd_daemon;
+#[cfg(feature = "lsp")]
+pub mod cmd_doctor;
 pub mod cmd_inspect;
 pub mod cmd_load;
 #[cfg(feature = "lsp")]
@@ -147,6 +149,24 @@ pub enum Commands {
         #[arg(long)]
         timeout: Option<String>,
     },
+
+    /// Check environment: which bundled LSP language servers are on
+    /// PATH and which languages will fall back to tree-sitter-only.
+    /// Exit code 0 if every bundled language has its server; nonzero if
+    /// any are missing (unless `--allow-missing` is passed).
+    #[cfg(feature = "lsp")]
+    Doctor {
+        /// Emit machine-readable JSON instead of the human table.
+        /// Useful for cloister / mache install scripts that want to
+        /// check + warn without parsing text.
+        #[arg(long)]
+        json: bool,
+
+        /// Exit 0 even when some servers are missing (for CI / cloister
+        /// install scripts that want to WARN rather than fail).
+        #[arg(long)]
+        allow_missing: bool,
+    },
 }
 
 /// Dispatch a command to its implementation.
@@ -223,5 +243,10 @@ pub async fn run(cmd: Commands) -> Result<()> {
                 anyhow::bail!("serve requires the 'mount' feature (compile with --features mount)")
             }
         }
+        #[cfg(feature = "lsp")]
+        Commands::Doctor {
+            json,
+            allow_missing,
+        } => cmd_doctor::run_doctor(json, allow_missing),
     }
 }

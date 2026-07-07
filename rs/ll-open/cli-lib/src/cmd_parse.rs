@@ -11,6 +11,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use leyline_core::ContentAddressed;
 use leyline_ts::languages::TsLanguage;
 
 /// Maximum file size that the parse pass will read into memory. Files
@@ -1767,7 +1768,11 @@ fn parse_file_pure(
     // `_source.contentHash` (T8.5) and every `symbol_id` (ADR-0026).
     // Hashed here, in the worker, over the bytes already resident for
     // parsing.
-    let content_hash: [u8; 32] = *blake3::hash(content).as_bytes();
+    // σ via the one content-address surface (ContentAddressed), not inline
+    // blake3 — byte-identical (substrate.rs locks the algorithm) and keeps
+    // symbol_id / _source.contentHash on the same σ path as the rest of the
+    // Σ substrate. Enforced by the `lint:blake3` gate.
+    let content_hash: [u8; 32] = *content.hash().as_bytes();
 
     let root = tree.root_node();
 

@@ -396,8 +396,8 @@ fn blob_to_vec(b: &[u8]) -> Option<Vec<f32>> {
         return None;
     }
     let mut out = Vec::with_capacity(MODEL_DIMS);
-    for chunk in b.chunks_exact(4) {
-        out.push(f32::from_le_bytes(chunk.try_into().ok()?));
+    for chunk in b.as_chunks::<4>().0 {
+        out.push(f32::from_le_bytes(*chunk));
     }
     Some(out)
 }

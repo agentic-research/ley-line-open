@@ -2709,9 +2709,8 @@ fn decode_inline_payload(bytes: &[u8]) -> Option<Vec<f32>> {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 4);
-    for chunk in bytes.chunks_exact(4) {
-        let arr: [u8; 4] = chunk.try_into().ok()?;
-        out.push(f32::from_le_bytes(arr));
+    for chunk in bytes.as_chunks::<4>().0 {
+        out.push(f32::from_le_bytes(*chunk));
     }
     Some(out)
 }

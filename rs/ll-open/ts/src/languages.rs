@@ -91,6 +91,83 @@ impl TsLanguage {
         }
     }
 
+    /// κ — cross-language kind collapse (ADR-0026 / mache ADR-0023).
+    ///
+    /// Maps a raw tree-sitter node kind to a *canonical, language-agnostic*
+    /// base kind so a consumer can query "all functions" once, without
+    /// special-casing `function_declaration` (Go) vs `function_item`
+    /// (Rust) vs `function_definition` (Python).
+    ///
+    /// The base-kind set is closed: `function`, `method`, `type`, `field`,
+    /// `variable`, `constant`, `module`, `import`, `parameter`. Anything
+    /// unmapped falls through to the raw kind (open-world escape hatch) —
+    /// `raw_kind` is retained alongside `kind` in the `symbols` table, so
+    /// language-specific rules can still discriminate on the raw grammar
+    /// kind. This is the same single-source-of-truth discipline mache's
+    /// `internal/lang` uses; new grammars extend the match arms here.
+    ///
+    /// Coverage is deliberately partial in this slice — the actively-used
+    /// grammars (Go, Rust, Python) get the base collapse; other languages
+    /// pass through raw until reviewed per-language.
+    ///
+    /// Returns `Some(canonical)` when the raw kind maps to a base kind, or
+    /// `None` when it does not — the caller stores `raw_kind` as `kind` in
+    /// that case (the open-world escape). Returning `Option` keeps the
+    /// canonical set a closed `&'static` enum of literals without having to
+    /// launder the borrowed `raw_kind` into a `'static` lifetime.
+    pub fn canonical_kind(self, raw_kind: &str) -> Option<&'static str> {
+        // Shared across languages: parameters read the same wherever the
+        // grammar names them so.
+        match raw_kind {
+            "parameter" | "parameters" | "parameter_declaration" | "typed_parameter" => {
+                return Some("parameter");
+            }
+            _ => {}
+        }
+
+        match self {
+            #[cfg(feature = "go")]
+            TsLanguage::Go => match raw_kind {
+                "function_declaration" => Some("function"),
+                "method_declaration" => Some("method"),
+                "type_declaration" | "type_spec" | "struct_type" | "interface_type" => Some("type"),
+                "field_declaration" => Some("field"),
+                "const_declaration" | "const_spec" => Some("constant"),
+                "var_declaration" | "var_spec" | "short_var_declaration" => Some("variable"),
+                "import_declaration" | "import_spec" => Some("import"),
+                "source_file" => Some("module"),
+                _ => None,
+            },
+            #[cfg(feature = "rust")]
+            TsLanguage::Rust => match raw_kind {
+                "function_item" => Some("function"),
+                // Rust methods are function_items inside an impl block; the
+                // grammar doesn't distinguish at the node level, so a bare
+                // function_item is "function". impl-context promotion to
+                // "method" is a follow-up (needs parent context).
+                "struct_item" | "enum_item" | "trait_item" | "type_item" | "union_item" => {
+                    Some("type")
+                }
+                "field_declaration" => Some("field"),
+                "const_item" | "static_item" => Some("constant"),
+                "let_declaration" => Some("variable"),
+                "use_declaration" => Some("import"),
+                "mod_item" | "source_file" => Some("module"),
+                _ => None,
+            },
+            #[cfg(feature = "python")]
+            TsLanguage::Python => match raw_kind {
+                "function_definition" => Some("function"),
+                "class_definition" => Some("type"),
+                "import_statement" | "import_from_statement" => Some("import"),
+                "module" => Some("module"),
+                _ => None,
+            },
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
     /// Parse a language name string (case-insensitive).
     pub fn from_name(name: &str) -> Result<Self> {
         match name.to_lowercase().as_str() {
@@ -170,6 +247,60 @@ impl TsLanguage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_kind_collapses_function_across_languages() {
+        // The load-bearing κ property: three different grammar kinds for
+        // "a function" collapse to the one canonical base kind.
+        #[cfg(feature = "go")]
+        assert_eq!(
+            TsLanguage::Go.canonical_kind("function_declaration"),
+            Some("function")
+        );
+        #[cfg(feature = "rust")]
+        assert_eq!(
+            TsLanguage::Rust.canonical_kind("function_item"),
+            Some("function")
+        );
+        #[cfg(feature = "python")]
+        assert_eq!(
+            TsLanguage::Python.canonical_kind("function_definition"),
+            Some("function")
+        );
+    }
+
+    #[test]
+    fn canonical_kind_maps_other_base_kinds() {
+        #[cfg(feature = "go")]
+        {
+            assert_eq!(
+                TsLanguage::Go.canonical_kind("method_declaration"),
+                Some("method")
+            );
+            assert_eq!(
+                TsLanguage::Go.canonical_kind("import_declaration"),
+                Some("import")
+            );
+            assert_eq!(
+                TsLanguage::Go.canonical_kind("const_declaration"),
+                Some("constant")
+            );
+        }
+        #[cfg(feature = "rust")]
+        assert_eq!(TsLanguage::Rust.canonical_kind("struct_item"), Some("type"));
+    }
+
+    #[test]
+    fn canonical_kind_returns_none_for_unmapped_open_world() {
+        // Unmapped kinds fall through to None so the caller keeps the raw
+        // kind — the open-world escape hatch, not a panic or a lossy map.
+        #[cfg(feature = "go")]
+        {
+            assert_eq!(TsLanguage::Go.canonical_kind("identifier"), None);
+            assert_eq!(TsLanguage::Go.canonical_kind("block"), None);
+            assert_eq!(TsLanguage::Go.canonical_kind("not_a_real_kind"), None);
+        }
+    }
 
     #[test]
     fn from_extension_pins_alias_sets() {

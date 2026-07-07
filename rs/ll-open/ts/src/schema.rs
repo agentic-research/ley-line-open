@@ -213,6 +213,102 @@ CREATE TABLE IF NOT EXISTS _imports (
 );
 CREATE INDEX IF NOT EXISTS idx_imports_source ON _imports(source_id);";
 
+// ---------------------------------------------------------------------------
+// Unified code-fact IR (ADR-0026 / mache ADR-0023)
+// ---------------------------------------------------------------------------
+
+/// DDL for the `symbols` table — one row per AST node, keyed on the
+/// content-addressed `symbol_id` (ADR-0026). `symbol_id` is
+/// `BLAKE3(contentHash ‖ span_start_le ‖ span_end_le ‖ kind ‖ name)` —
+/// the path is deliberately **absent** so the be6136 class of silent
+/// path-JOIN miss cannot recur, and unchanged files yield identical ids
+/// across parse runs. `node_id` is retained as a parse-run locator into
+/// `_ast`, never a cross-fact join key. `kind` is the canonical κ kind;
+/// `raw_kind` is the tree-sitter kind (retained so language-specific
+/// rules can still discriminate).
+pub const SYMBOLS_TABLE_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS symbols (
+    symbol_id  BLOB    NOT NULL,
+    gen        INTEGER NOT NULL,
+    source_id  TEXT    NOT NULL,
+    node_id    TEXT    NOT NULL,
+    kind       TEXT    NOT NULL,
+    raw_kind   TEXT    NOT NULL,
+    lang       TEXT    NOT NULL,
+    name       TEXT,
+    span_start INTEGER NOT NULL,
+    span_end   INTEGER NOT NULL,
+    PRIMARY KEY (symbol_id, gen)
+);";
+
+/// DDL for the `symbols` indexes — deferred post-COMMIT. `node_id` lookup
+/// powers the parse-run-local `node_id → symbol_id` resolution consumers
+/// use to bridge `_ast`/`node_refs` locators onto the content key.
+pub const SYMBOLS_INDEXES_DDL: &str = "\
+CREATE INDEX IF NOT EXISTS idx_symbols_node ON symbols(source_id, node_id);
+CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);";
+
+/// DDL for the `fact_edges` table — one generic typed-edge relation over
+/// `symbols`. `src`/`dst` are `REFERENCES symbols(symbol_id)`; with
+/// `PRAGMA foreign_keys = ON` at write time a dangling edge is an insert
+/// error in the producer, not a silently-zeroed row downstream (the
+/// be6136 fix, made loud). `dst` NULL = an unresolved ref, counted into
+/// `head.capnp`'s `unboundFacts`.
+///
+/// FK note: SQLite only enforces a FOREIGN KEY when the parent column is
+/// the target of the reference; a composite PK `(symbol_id, gen)` means a
+/// bare `REFERENCES symbols(symbol_id)` needs `symbol_id` to be unique on
+/// its own. We therefore add a UNIQUE index on `symbol_id` (below) so the
+/// FK resolves to it — within a single generation `symbol_id` is unique
+/// by construction (content address), and cross-gen rows are written in
+/// separate passes.
+pub const FACT_EDGES_TABLE_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS fact_edges (
+    src        BLOB    NOT NULL REFERENCES symbols(symbol_id),
+    dst        BLOB             REFERENCES symbols(symbol_id),
+    kind       TEXT    NOT NULL,
+    fidelity   TEXT    NOT NULL,
+    gen        INTEGER NOT NULL,
+    token      TEXT,
+    qualifier  TEXT,
+    span_start INTEGER,
+    span_end   INTEGER
+);";
+
+/// DDL for `fact_edges` traversal indexes — deferred post-COMMIT.
+/// `(src, kind, gen)` makes each caller/callee/containment hop an index
+/// seek for the recursive-CTE traversal ADR-0023 §4 describes.
+pub const FACT_EDGES_INDEXES_DDL: &str = "\
+CREATE INDEX IF NOT EXISTS idx_edges_src ON fact_edges(src, kind, gen);
+CREATE INDEX IF NOT EXISTS idx_edges_dst ON fact_edges(dst, kind, gen);";
+
+/// UNIQUE index that both enforces the content-address invariant
+/// (`symbol_id` unique per row) and provides the single-column target the
+/// `fact_edges` FKs resolve against. Created *before* rows are inserted so
+/// FK enforcement is live during the parse transaction.
+pub const SYMBOLS_UNIQUE_ID_DDL: &str =
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_symbols_id ON symbols(symbol_id);";
+
+/// Create the IR tables (`symbols`, `fact_edges`) — table + the UNIQUE
+/// `symbol_id` index the FK targets. The UNIQUE index must exist before
+/// inserts so `PRAGMA foreign_keys = ON` can enforce edge endpoints at
+/// write time; the remaining traversal indexes are deferred to
+/// [`create_ir_indexes`] post-`COMMIT`.
+pub fn create_ir_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(SYMBOLS_TABLE_DDL)?;
+    conn.execute_batch(SYMBOLS_UNIQUE_ID_DDL)?;
+    conn.execute_batch(FACT_EDGES_TABLE_DDL)?;
+    Ok(())
+}
+
+/// Create the deferred IR traversal indexes (idempotent). Called
+/// post-`COMMIT` alongside the other bulk-load index passes.
+pub fn create_ir_indexes(conn: &Connection) -> Result<()> {
+    conn.execute_batch(SYMBOLS_INDEXES_DDL)?;
+    conn.execute_batch(FACT_EDGES_INDEXES_DDL)?;
+    Ok(())
+}
+
 /// Create `node_refs`, `node_defs`, and `_imports` tables + indexes
 /// (idempotent).
 ///

@@ -27,8 +27,9 @@ use leyline_ts::languages::TsLanguage;
 pub const MAX_PARSE_FILE_SIZE: i64 = 8 * 1024 * 1024;
 use leyline_ts::refs::{ExtractedRef, extract_refs};
 use leyline_ts::schema::{
-    create_ast_tables, create_index_schema, create_post_load_indexes_skip_unused,
-    create_refs_tables, delete_file_rows, read_file_index, set_meta, sweep_orphaned_dirs,
+    create_ast_tables, create_index_schema, create_ir_indexes, create_ir_tables,
+    create_post_load_indexes_skip_unused, create_refs_tables, delete_file_rows, read_file_index,
+    set_meta, sweep_orphaned_dirs,
 };
 use rayon::prelude::*;
 use rusqlite::Connection;
@@ -56,6 +57,18 @@ struct AstEntry {
     start_col: usize,
     end_row: usize,
     end_col: usize,
+    /// Canonical κ kind for this node (`node_kind` collapsed via the
+    /// language registry), or `node_kind` itself when κ has no mapping
+    /// (open-world escape). Stored on `symbols.kind`.
+    canonical_kind: String,
+    /// The node's identifier name where the grammar exposes a `name`
+    /// field, else empty. A component of `symbol_id` and stored on
+    /// `symbols.name`.
+    name: String,
+    /// Content-addressed identity (ADR-0026):
+    /// `BLAKE3(contentHash ‖ span_start_le ‖ span_end_le ‖ canonical_kind ‖ name)`.
+    /// The path is deliberately absent (the be6136 fix).
+    symbol_id: [u8; 32],
 }
 
 struct ParsedFile {
@@ -313,6 +326,92 @@ batch_table! {
 }
 
 batch_table! {
+    // Unified code-fact IR `symbols` rows (ADR-0026). One per AST node.
+    // `symbol_id` is the content address; `gen` is filled at insert time
+    // from the head chain.
+    //
+    // `INSERT OR IGNORE`: `symbol_id` is `BLAKE3(contentHash ‖ span ‖ kind
+    // ‖ name)`, so two byte-identical files (empty `__init__.py`, a
+    // vendored copy) produce identical ids for corresponding nodes. The
+    // UNIQUE index on `symbol_id` (the fact_edges FK target) would reject
+    // the second insert; `OR IGNORE` makes that the *correct* content-
+    // addressed dedup (same content = same symbol, stored once) rather
+    // than a transaction abort.
+    //
+    // Cold-parse only for now: this run writes the whole IR. Incremental
+    // reparse leaves prior `symbols`/`fact_edges` rows in place (unchanged
+    // symbols re-IGNORE cleanly; no FK violation since symbols are never
+    // deleted), so a changed file accumulates stale rows. Per-file IR
+    // invalidation is a follow-up — it is non-trivial because a cross-file
+    // `references` edge (src in file A, dst in file B) makes deleting B's
+    // symbols an FK hazard for A's edges. Tracked separately from this slice.
+    SymbolBatch, SymbolRow,
+    "INSERT OR IGNORE INTO symbols (symbol_id, gen, source_id, node_id, kind, raw_kind, lang, name, span_start, span_end) VALUES ",
+    10,
+    // `generation`, not `gen`: `gen` is a reserved keyword in Rust 2024.
+    // The SQL column stays `gen`; only the Rust field is renamed.
+    push_fn: (
+        symbol_id: Vec<u8>, generation: i64, source_id: String, node_id: String,
+        kind: String, raw_kind: String, lang: String, name: String,
+        span_start: i64, span_end: i64
+    ),
+    push_body: {
+        SymbolRow { symbol_id, generation, source_id, node_id, kind, raw_kind, lang, name, span_start, span_end }
+    },
+    flatten: |chunk| {
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 10);
+        for r in chunk {
+            out.push(&r.symbol_id);
+            out.push(&r.generation);
+            out.push(&r.source_id);
+            out.push(&r.node_id);
+            out.push(&r.kind);
+            out.push(&r.raw_kind);
+            out.push(&r.lang);
+            out.push(&r.name);
+            out.push(&r.span_start);
+            out.push(&r.span_end);
+        }
+        out
+    },
+}
+
+batch_table! {
+    // Unified code-fact IR `fact_edges` rows (ADR-0026). `dst` is NULL for
+    // an unresolved reference (counted into head.capnp unboundFacts). FK
+    // enforcement (PRAGMA foreign_keys=ON) makes a dangling non-NULL
+    // endpoint an insert error.
+    EdgeBatch, EdgeRow,
+    "INSERT INTO fact_edges (src, dst, kind, fidelity, gen, token, qualifier, span_start, span_end) VALUES ",
+    9,
+    // `generation`, not `gen`: `gen` is a reserved keyword in Rust 2024.
+    // The SQL column stays `gen`; only the Rust field is renamed.
+    push_fn: (
+        src: Vec<u8>, dst: Option<Vec<u8>>, kind: String, fidelity: String,
+        generation: i64, token: Option<String>, qualifier: Option<String>,
+        span_start: Option<i64>, span_end: Option<i64>
+    ),
+    push_body: {
+        EdgeRow { src, dst, kind, fidelity, generation, token, qualifier, span_start, span_end }
+    },
+    flatten: |chunk| {
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 9);
+        for r in chunk {
+            out.push(&r.src);
+            out.push(&r.dst);
+            out.push(&r.kind);
+            out.push(&r.fidelity);
+            out.push(&r.generation);
+            out.push(&r.token);
+            out.push(&r.qualifier);
+            out.push(&r.span_start);
+            out.push(&r.span_end);
+        }
+        out
+    },
+}
+
+batch_table! {
     RefBatch, RefRow,
     // NOTE: `prefix` is rebound at flush time below since refs/defs/imports
     // share row shape but target different tables. See post-macro impl.
@@ -513,6 +612,11 @@ pub fn parse_into_conn(
     // `create_post_load_indexes`. See bead `ley-line-open-9ccbc7`.
     create_ast_tables(conn)?;
     create_refs_tables(conn)?;
+    // Unified code-fact IR tables (ADR-0026). The UNIQUE symbol_id index
+    // is created inside create_ir_tables (not deferred) so the fact_edges
+    // FKs have a live single-column target when PRAGMA foreign_keys=ON
+    // enforces edge endpoints during the insert transaction below.
+    create_ir_tables(conn)?;
     create_index_schema(conn)?;
 
     let mtime = std::time::SystemTime::now()
@@ -742,6 +846,16 @@ pub fn parse_into_conn(
     let mut parsed = 0u64;
     let mut errors = 0u64;
 
+    // Unified code-fact IR (ADR-0026): enforce `fact_edges` FK endpoints at
+    // write time so a dangling edge is a loud insert error, not a silently-
+    // zeroed downstream JOIN (the be6136 lesson). `foreign_keys` is a
+    // per-connection, no-op-inside-a-transaction pragma, so it must be set
+    // before BEGIN. Set here in `parse_into_conn` (not `cmd_parse`) so the
+    // in-memory test path gets it too. Only `fact_edges` has FKs; the other
+    // tables predate this and are unaffected, including the delete_file_rows
+    // sweep above (it touches no FK relationship).
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+
     conn.execute_batch("BEGIN")?;
 
     // capnp dual-write (bead `ley-line-open-cdf098`) — open snapshot
@@ -766,6 +880,24 @@ pub fn parse_into_conn(
     let mut source_buf: SourceBatch = SourceBatch::with_capacity(to_parse.len());
     let mut file_idx_buf: FileIdxBatch = FileIdxBatch::with_capacity(to_parse.len());
 
+    // Unified code-fact IR (ADR-0026). Symbols land in the same loop as
+    // `_ast`; edges are emitted in a second pass once `node_to_sym` and
+    // `def_map` span every file (a `references` in file A resolves to a
+    // `defines` in file B). `gen` stamps both tables and must equal the
+    // generation the Head records — computed once, before any insert.
+    let ir_gen = next_generation_for_conn(conn) as i64;
+    let mut symbols_buf: SymbolBatch = SymbolBatch::with_capacity(550_000);
+    let mut edges_buf: EdgeBatch = EdgeBatch::with_capacity(80_000);
+    // node_id → content-addressed symbol_id, global across files. Bridges
+    // the `_ast`/`node_refs` parse-run locators onto the content key so
+    // edges can be keyed on `symbol_id`. [u8; 32] is Copy — cheap to store.
+    let mut node_to_sym: HashMap<String, [u8; 32]> = HashMap::with_capacity(550_000);
+    // Definition and reference sites collected during the insert loop, keyed
+    // by (token, node_id). Resolved to edges after the loop when node_to_sym
+    // is complete. token = the identifier name; node_id = the enclosing node.
+    let mut def_sites: Vec<(String, String)> = Vec::with_capacity(3_000);
+    let mut ref_sites: Vec<(String, String)> = Vec::with_capacity(40_000);
+
     let mut dirs_created: HashSet<String> = HashSet::new();
     let mut changed_files: Vec<String> = Vec::new();
 
@@ -773,6 +905,8 @@ pub fn parse_into_conn(
         match result {
             Ok(pf) => {
                 let rel_path = Path::new(&pf.rel);
+                // Every IR symbol in this file shares the file's language.
+                let lang = pf.language.clone();
                 collect_dirs(rel_path, &mut dirs_created, &mut nodes_buf, mtime);
 
                 source_buf.push(
@@ -802,6 +936,25 @@ pub fn parse_into_conn(
                 }
 
                 for a in pf.ast_entries {
+                    // IR symbol row (ADR-0026): one per AST node, keyed on the
+                    // content-addressed `symbol_id` computed in the worker.
+                    // `kind` is the κ canonical kind; `raw_kind` keeps the
+                    // tree-sitter kind for language-specific discrimination.
+                    // Record node_id → symbol_id so the edge pass can resolve
+                    // parents/refs/defs onto the content key.
+                    node_to_sym.insert(a.node_id.clone(), a.symbol_id);
+                    symbols_buf.push(
+                        a.symbol_id.to_vec(),
+                        ir_gen,
+                        a.source_id.clone(),
+                        a.node_id.clone(),
+                        a.canonical_kind,
+                        a.node_kind.clone(),
+                        lang.clone(),
+                        a.name,
+                        a.start_byte as i64,
+                        a.end_byte as i64,
+                    );
                     ast_buf.push(
                         a.node_id,
                         a.source_id,
@@ -821,12 +974,22 @@ pub fn parse_into_conn(
                             token,
                             node_id,
                             source_id,
-                        } => refs_buf.push(token, node_id, source_id),
+                        } => {
+                            // IR (ADR-0026): resolved to a `references` edge in
+                            // the second pass once every file's defs are known.
+                            ref_sites.push((token.clone(), node_id.clone()));
+                            refs_buf.push(token, node_id, source_id);
+                        }
                         ExtractedRef::Def {
                             token,
                             node_id,
                             source_id,
-                        } => defs_buf.push(token, node_id, source_id),
+                        } => {
+                            // Feeds both the token → symbol_id def map (edge
+                            // resolution) and a `defines` edge for the site.
+                            def_sites.push((token.clone(), node_id.clone()));
+                            defs_buf.push(token, node_id, source_id);
+                        }
                         ExtractedRef::Import {
                             alias,
                             path,
@@ -846,9 +1009,97 @@ pub fn parse_into_conn(
         }
     }
 
+    // ---- Unified code-fact IR edge pass (ADR-0026) ----
+    //
+    // `node_to_sym` now spans every file, so cross-file resolution is a
+    // plain map lookup. Three edge arms, all at `mention` fidelity except
+    // `defines` (`binding`) — no scope-aware binding yet (a later thread
+    // lifts resolved refs to `binding`). Edges are buffered here and
+    // flushed after `symbols` so the immediate FK finds every endpoint.
+    //
+    // def map: token → definition symbol_id. Last write wins on a
+    // duplicate name — acceptable at mention fidelity (the discriminator
+    // exists precisely so a consumer knows these are name matches, not
+    // scope-resolved bindings).
+    let mut def_map: HashMap<String, [u8; 32]> = HashMap::with_capacity(def_sites.len());
+    for (token, node_id) in &def_sites {
+        if let Some(sym) = node_to_sym.get(node_id) {
+            def_map.insert(token.clone(), *sym);
+        }
+    }
+    // `defines`: definition-site symbol → NULL, tagged with the token.
+    // Deliberately single-ended (the def *is* the symbol; there is no
+    // second entity to point at), so its NULL `dst` is NOT an unbound
+    // fact — only NULL-dst `references`/`calls` are counted below.
+    for (token, node_id) in &def_sites {
+        if let Some(src) = node_to_sym.get(node_id) {
+            edges_buf.push(
+                src.to_vec(),
+                None,
+                "defines".to_string(),
+                "binding".to_string(),
+                ir_gen,
+                Some(token.clone()),
+                None,
+                None,
+                None,
+            );
+        }
+    }
+    // `contains`: parent symbol → child symbol. node_id is `{parent}/{name}`,
+    // so the parent's node_id is everything before the last '/'. The file
+    // root's parent is a directory (no symbol) → absent from the map →
+    // skipped, which is correct. Both endpoints always resolve, so this
+    // arm never contributes an unbound fact.
+    for (node_id, child_sym) in &node_to_sym {
+        if let Some((parent_id, _)) = node_id.rsplit_once('/') {
+            if let Some(parent_sym) = node_to_sym.get(parent_id) {
+                edges_buf.push(
+                    parent_sym.to_vec(),
+                    Some(child_sym.to_vec()),
+                    "contains".to_string(),
+                    "mention".to_string(),
+                    ir_gen,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+            }
+        }
+    }
+    // `references`: reference-site symbol → resolved definition symbol, or
+    // NULL when the token has no def in this db (a builtin, an external
+    // dependency, or a not-yet-parsed file). The NULL-dst rows are the
+    // `unbound_facts` the Head records — counted from the db post-COMMIT
+    // (below) so the count reflects the whole graph, not just this run.
+    for (token, node_id) in &ref_sites {
+        if let Some(src) = node_to_sym.get(node_id) {
+            let dst = def_map.get(token).map(|s| s.to_vec());
+            edges_buf.push(
+                src.to_vec(),
+                dst,
+                "references".to_string(),
+                "mention".to_string(),
+                ir_gen,
+                Some(token.clone()),
+                None,
+                None,
+                None,
+            );
+        }
+    }
+
     // Flush each table in BULK_BATCH_ROWS-sized chunks via multi-row
     // VALUES inserts. Tail (last <BULK_BATCH_ROWS rows) flushed in one
     // partial-size statement so we don't fall back to per-row execute.
+    //
+    // IR ordering (ADR-0026): `symbols` must land before `fact_edges` —
+    // with `foreign_keys = ON` the FK is checked immediately per row, so
+    // every edge endpoint has to already exist in `symbols` (uncommitted
+    // rows in the same transaction satisfy it). `edges` is therefore
+    // flushed last, after all other tables.
+    symbols_buf.flush_batched(conn)?;
     nodes_buf.flush_batched(conn)?;
     ast_buf.flush_batched(conn)?;
     source_buf.flush_batched(conn)?;
@@ -865,6 +1116,8 @@ pub fn parse_into_conn(
         "INSERT INTO _imports (alias, path, source_id) VALUES ",
     )?;
     file_idx_buf.flush_batched(conn)?;
+    // IR edges last — every `symbols` endpoint is now in the table.
+    edges_buf.flush_batched(conn)?;
 
     // Flush the capnp dual-write `BufWriter`s before COMMIT and before
     // `write_head_after_parse` reads the segments for hashing —
@@ -880,6 +1133,24 @@ pub fn parse_into_conn(
     }
 
     conn.execute_batch("COMMIT")?;
+
+    // Unified code-fact IR (ADR-0026): count the NULL-dst reference/call
+    // edges — the tokens this db could not bind to a definition symbol.
+    // Recorded in the Head as a binding-fidelity ratchet (W5 asserts it
+    // stays <= baseline). Queried on the main thread here — after COMMIT
+    // but before the head thread is spawned and before
+    // `create_post_load_indexes` runs — so no second connection contends
+    // for the db lock. `defines` edges are single-ended (intentional NULL
+    // dst) and excluded by the `kind` filter. Whole-db count, so it stays
+    // correct if a later run reparses only part of the tree.
+    let unbound_facts: u64 = conn
+        .query_row(
+            "SELECT count(*) FROM fact_edges WHERE dst IS NULL AND kind IN ('references','calls')",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n as u64)
+        .unwrap_or(0);
 
     // Pre-grab the db_path so we can dispatch the head-write hash pass
     // (pure filesystem work, reads ast.capnp + source.capnp) on a worker
@@ -900,8 +1171,9 @@ pub fn parse_into_conn(
             _ => None,
         }
     };
-    let head_handle = db_path_for_head
-        .map(|p| std::thread::spawn(move || -> Result<()> { write_head_for_path(&p) }));
+    let head_handle = db_path_for_head.map(|p| {
+        std::thread::spawn(move || -> Result<()> { write_head_for_path(&p, unbound_facts) })
+    });
 
     // Build secondary indexes in one pass now that all rows are
     // landed. SQLite materializes each index by a single sorted scan
@@ -920,6 +1192,13 @@ pub fn parse_into_conn(
     // schema with the indexes mache needs, so skipping here is safe.
     // See bead `ley-line-open-cbbedf` Attack 3.
     create_post_load_indexes_skip_unused(conn)?;
+    // Unified code-fact IR (ADR-0026): the `symbols`/`fact_edges` traversal
+    // indexes (idx_symbols_node/kind, idx_edges_src/dst) are deferred to here
+    // — same rationale as the other post-load indexes: one sorted scan per
+    // index is cheaper than incremental B-tree maintenance during the insert.
+    // The UNIQUE symbol_id index the FK targets was built earlier (pre-insert)
+    // by create_ir_tables and is not rebuilt here.
+    create_ir_indexes(conn)?;
 
     let insert_elapsed = insert_start.elapsed();
 
@@ -1195,7 +1474,7 @@ fn read_head_for_chain(head_path: &Path) -> ([u8; 32], u64) {
 /// no SQLite handle required, so a parent caller can dispatch this on
 /// a worker thread that runs concurrently with post-COMMIT SQLite work
 /// (e.g. `create_post_load_indexes`). See bead `ley-line-open-cbbedf`.
-fn write_head_for_path(db_path: &Path) -> Result<()> {
+fn write_head_for_path(db_path: &Path, unbound_facts: u64) -> Result<()> {
     let (root, segment_bytes) = hash_segment_files(db_path)?;
     let head_path = with_extension(db_path, "head.capnp");
     let (parent, generation) = read_head_for_chain(&head_path);
@@ -1206,6 +1485,9 @@ fn write_head_for_path(db_path: &Path) -> Result<()> {
         let mut h: head::Builder = src.init_root();
         h.set_generation(generation);
         h.set_segment_bytes(segment_bytes);
+        // Unified code-fact IR ratchet (ADR-0026): NULL-dst reference/call
+        // edge count, threaded from the caller's post-COMMIT db query.
+        h.set_unbound_facts(unbound_facts);
         h.reborrow().init_root_hash().set_bytes(&root);
         h.reborrow().init_parent_hash().set_bytes(&parent);
     }
@@ -1221,6 +1503,30 @@ fn write_head_for_path(db_path: &Path) -> Result<()> {
         .with_context(|| format!("open head {}", head_path.display()))?;
     capnp::serialize::write_message(&mut f, &canonical).context("write Head capnp record")?;
     Ok(())
+}
+
+/// Compute the generation number *this* parse run will write, before the
+/// insert loop, so `symbols`/`fact_edges` rows are stamped with the same
+/// `gen` the Head will record (ADR-0026 keys the IR on `(symbol_id, gen)`;
+/// the two must agree). Mirrors `read_head_for_chain`'s gen arithmetic:
+/// next = prev_generation + 1, or 1 when no Head exists yet (fresh db, or
+/// a `:memory:` connection with no sibling head file). Best-effort — any
+/// read failure falls back to gen 1, matching `read_head_for_chain`.
+fn next_generation_for_conn(conn: &Connection) -> u64 {
+    let row: rusqlite::Result<String> = conn.query_row(
+        "SELECT file FROM pragma_database_list WHERE name = 'main' LIMIT 1",
+        [],
+        |r| r.get(0),
+    );
+    match row {
+        Ok(s) if !s.is_empty() => {
+            let head_path = with_extension(Path::new(&s), "head.capnp");
+            let (_parent, generation) = read_head_for_chain(&head_path);
+            generation
+        }
+        // :memory: or no path — first (and only) generation.
+        _ => 1,
+    }
 }
 
 /// T8.5: thin wrapper around `write_head_for_path` that pulls the
@@ -1239,7 +1545,16 @@ fn write_head_after_parse(conn: &Connection) -> Result<()> {
         Ok(s) if !s.is_empty() => std::path::PathBuf::from(s),
         _ => return Ok(()),
     };
-    write_head_for_path(&db_path)
+    // Mirror parse_into_conn: derive the IR unbound-fact count from the db.
+    let unbound_facts: u64 = conn
+        .query_row(
+            "SELECT count(*) FROM fact_edges WHERE dst IS NULL AND kind IN ('references','calls')",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n as u64)
+        .unwrap_or(0);
+    write_head_for_path(&db_path, unbound_facts)
 }
 
 // ---------------------------------------------------------------------------
@@ -1378,6 +1693,55 @@ fn serialize_ast_node_record(buf: &mut Vec<u8>, a: &AstEntry) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Unified code-fact IR (ADR-0026) — symbol identity
+// ---------------------------------------------------------------------------
+
+/// Compute the content-addressed `symbol_id` for an AST node.
+///
+/// `symbol_id = BLAKE3(contentHash ‖ span_start_le ‖ span_end_le ‖ kind ‖ name)`.
+///
+/// The file path is **deliberately not an input** — this is the be6136
+/// fix stated as an invariant: the fragile, mutable, path-shaped join key
+/// that silently zeroed every `_lsp_refs × _ast` JOIN cannot enter the
+/// content address, so that failure class cannot recur. Byte offsets are
+/// content-relative, so an unchanged file yields byte-identical
+/// `symbol_id`s across parse runs (parse-run invariance → diffable IR).
+///
+/// Delimiters: `contentHash` is fixed-width (32 bytes) and the spans are
+/// fixed-width LE `u64`, so only the two variable-width tail fields
+/// (`kind`, `name`) need separating — a single `0x00` byte between them,
+/// which cannot appear inside a tree-sitter kind or a source identifier,
+/// keeps `("ab","c")` distinct from `("a","bc")`.
+fn compute_symbol_id(
+    content_hash: &[u8; 32],
+    span_start: usize,
+    span_end: usize,
+    kind: &str,
+    name: &str,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(content_hash);
+    hasher.update(&(span_start as u64).to_le_bytes());
+    hasher.update(&(span_end as u64).to_le_bytes());
+    hasher.update(kind.as_bytes());
+    hasher.update(&[0u8]);
+    hasher.update(name.as_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+/// Best-effort identifier name for a node: the text of its `name` field
+/// child where the grammar exposes one (function/type/method
+/// declarations across Go/Rust/Python all name their `name` field). Empty
+/// when there is no such field — anonymous nodes contribute an empty name
+/// component to `symbol_id`, which is fine: (contentHash, span, kind)
+/// already uniquely identifies a node within a file.
+fn node_name<'a>(node: &tree_sitter::Node, content: &'a [u8]) -> &'a str {
+    node.child_by_field_name("name")
+        .and_then(|n| n.utf8_text(content).ok())
+        .unwrap_or("")
+}
+
+// ---------------------------------------------------------------------------
 // Pure file parser (no Connection — safe for rayon)
 // ---------------------------------------------------------------------------
 
@@ -1434,16 +1798,31 @@ fn parse_file_pure(
     });
 
     // Root AST entry.
+    let root_kind = root.kind();
+    let root_canonical = language
+        .canonical_kind(root_kind)
+        .unwrap_or(root_kind)
+        .to_string();
+    let root_name = node_name(&root, content).to_string();
     ast_entries.push(AstEntry {
         node_id: source_id.to_string(),
         source_id: source_id.to_string(),
-        node_kind: root.kind().to_string(),
+        node_kind: root_kind.to_string(),
         start_byte: root.start_byte(),
         end_byte: root.end_byte(),
         start_row: root.start_position().row,
         start_col: root.start_position().column,
         end_row: root.end_position().row,
         end_col: root.end_position().column,
+        symbol_id: compute_symbol_id(
+            &content_hash,
+            root.start_byte(),
+            root.end_byte(),
+            &root_canonical,
+            &root_name,
+        ),
+        canonical_kind: root_canonical,
+        name: root_name,
     });
 
     // Walk AST.
@@ -1454,6 +1833,7 @@ fn parse_file_pure(
         source_id,
         source_id,
         language,
+        &content_hash,
         &mut nodes,
         &mut ast_entries,
         &mut refs,
@@ -1503,6 +1883,7 @@ fn walk_children_pure(
     parent_id: &str,
     source_id: &str,
     language: TsLanguage,
+    content_hash: &[u8; 32],
     nodes: &mut Vec<ParsedNode>,
     ast_entries: &mut Vec<AstEntry>,
     refs: &mut Vec<ExtractedRef>,
@@ -1543,6 +1924,8 @@ fn walk_children_pure(
 
         let id = format!("{parent_id}/{name}");
 
+        let canonical = language.canonical_kind(kind).unwrap_or(kind).to_string();
+        let sym_name = node_name(child, content).to_string();
         ast_entries.push(AstEntry {
             node_id: id.clone(),
             source_id: source_id.to_string(),
@@ -1553,6 +1936,15 @@ fn walk_children_pure(
             start_col: child.start_position().column,
             end_row: child.end_position().row,
             end_col: child.end_position().column,
+            symbol_id: compute_symbol_id(
+                content_hash,
+                child.start_byte(),
+                child.end_byte(),
+                &canonical,
+                &sym_name,
+            ),
+            canonical_kind: canonical,
+            name: sym_name,
         });
 
         // Extract refs via the language-dispatched factory.
@@ -1592,6 +1984,7 @@ fn walk_children_pure(
                 &id,
                 source_id,
                 language,
+                content_hash,
                 nodes,
                 ast_entries,
                 refs,

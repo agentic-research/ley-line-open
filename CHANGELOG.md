@@ -10,7 +10,11 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
-Nothing yet — post-v0.5.7 changes land here.
+Nothing yet — post-v0.5.8 changes land here.
+
+## [0.5.8] — 2026-07-07
+
+Version bump. v0.5.7's tag was cut before the keepalive + doctor work landed; this bump republishes the same feature set under a fresh tag so consumers pin to `v0.5.8` and get the working code. Same content as the v0.5.7 changelog entry below (kept for the version-pin trail); no new work in v0.5.8 beyond re-tagging.
 
 ## [0.5.7] — 2026-06-26
 

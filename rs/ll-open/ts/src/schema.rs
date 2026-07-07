@@ -214,98 +214,103 @@ CREATE TABLE IF NOT EXISTS _imports (
 CREATE INDEX IF NOT EXISTS idx_imports_source ON _imports(source_id);";
 
 // ---------------------------------------------------------------------------
-// Unified code-fact IR (ADR-0026 / mache ADR-0023)
+// Merkle-AST content-addressed IR (ADR-0026 / mache ADR-0023)
 // ---------------------------------------------------------------------------
+//
+// Replaces the location-keyed `symbol_id` + eager `symbols`/`fact_edges`
+// tables with a bottom-up merkle-AST `node_hash`. Net change is mostly
+// deletion + one deduped content table (`node_content`), the git-tree
+// object (`node_child`), and a `node_hash` column stamped onto the
+// occurrence tables that already exist (`_ast`, `node_defs`, `node_refs`).
+//
+// `node_hash` is intrinsic (a function of κ kind + terminal token +
+// ordered child hashes — spans/paths/parse-run node_ids are OUT), so a
+// unique subtree is stored once. Two byte-identical functions in different
+// files share a `node_hash`; a `a+b` vs `a-b` edit does not (the fold
+// includes anonymous operator tokens). The one-to-many invariant: a
+// reference's resolved target is a def OCCURRENCE (node_id), NEVER a
+// `node_hash` — keying resolution on `node_hash` would silently collapse
+// two distinct callees with identical bodies.
 
-/// DDL for the `symbols` table — one row per AST node, keyed on the
-/// content-addressed `symbol_id` (ADR-0026). `symbol_id` is
-/// `BLAKE3(contentHash ‖ span_start_le ‖ span_end_le ‖ kind ‖ name)` —
-/// the path is deliberately **absent** so the be6136 class of silent
-/// path-JOIN miss cannot recur, and unchanged files yield identical ids
-/// across parse runs. `node_id` is retained as a parse-run locator into
-/// `_ast`, never a cross-fact join key. `kind` is the canonical κ kind;
-/// `raw_kind` is the tree-sitter kind (retained so language-specific
-/// rules can still discriminate).
-pub const SYMBOLS_TABLE_DDL: &str = "\
-CREATE TABLE IF NOT EXISTS symbols (
-    symbol_id  BLOB    NOT NULL,
-    gen        INTEGER NOT NULL,
-    source_id  TEXT    NOT NULL,
-    node_id    TEXT    NOT NULL,
-    kind       TEXT    NOT NULL,
-    raw_kind   TEXT    NOT NULL,
-    lang       TEXT    NOT NULL,
-    name       TEXT,
-    span_start INTEGER NOT NULL,
-    span_end   INTEGER NOT NULL,
-    PRIMARY KEY (symbol_id, gen)
+/// DDL for `node_content` — one row per UNIQUE subtree, keyed on the
+/// merkle-AST `node_hash` (a real single-column PRIMARY KEY). `INSERT OR
+/// IGNORE` on the PK == intrinsic dedup: the second occurrence of an
+/// identical subtree is silently ignored. `kind` is the hashed canonical
+/// κ kind; `raw_kind` is the grammar kind (a content column, NOT hashed).
+/// `token` is the terminal UTF-8 text for leaves (NULL for internal
+/// nodes); `arity` is the child count.
+pub const NODE_CONTENT_TABLE_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS node_content (
+    node_hash BLOB PRIMARY KEY,
+    node_tag  INTEGER NOT NULL,
+    kind      TEXT    NOT NULL,
+    raw_kind  TEXT    NOT NULL,
+    lang      TEXT    NOT NULL,
+    token     TEXT,
+    arity     INTEGER NOT NULL
 );";
 
-/// DDL for the `symbols` indexes — deferred post-COMMIT. `node_id` lookup
-/// powers the parse-run-local `node_id → symbol_id` resolution consumers
-/// use to bridge `_ast`/`node_refs` locators onto the content key.
-pub const SYMBOLS_INDEXES_DDL: &str = "\
-CREATE INDEX IF NOT EXISTS idx_symbols_node ON symbols(source_id, node_id);
-CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);";
+/// DDL for `node_child` — the git-tree object. One row per (unique parent,
+/// ordinal) edge, deduped per unique parent subtree. `field` is the
+/// tree-sitter field name ("name","body",…) or NULL when the child has no
+/// field. Both endpoints `REFERENCES node_content(node_hash)`; the
+/// post-order fold emits children before parents so FK enforcement holds
+/// under `PRAGMA foreign_keys = ON`.
+pub const NODE_CHILD_TABLE_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS node_child (
+    parent_hash BLOB    NOT NULL REFERENCES node_content(node_hash),
+    ordinal     INTEGER NOT NULL,
+    child_hash  BLOB    NOT NULL REFERENCES node_content(node_hash),
+    field       TEXT,
+    PRIMARY KEY (parent_hash, ordinal)
+);";
 
-/// DDL for the `fact_edges` table — one generic typed-edge relation over
-/// `symbols`. `src`/`dst` are `REFERENCES symbols(symbol_id)`; with
-/// `PRAGMA foreign_keys = ON` at write time a dangling edge is an insert
-/// error in the producer, not a silently-zeroed row downstream (the
-/// be6136 fix, made loud). `dst` NULL = an unresolved ref, counted into
-/// `head.capnp`'s `unboundFacts`.
+/// Index over `_ast.node_hash` — "every location of this exact subtree".
+pub const AST_NODE_HASH_INDEX_DDL: &str =
+    "CREATE INDEX IF NOT EXISTS idx_ast_node_hash ON _ast(node_hash);";
+
+/// True when `table` already has a `node_hash` column. SQLite has no
+/// `ADD COLUMN IF NOT EXISTS`, so the merkle-AST migration probes
+/// `pragma_table_info` and only ALTERs when the column is absent — makes
+/// the additive migration idempotent across incremental reparses.
+fn has_node_hash_column(conn: &Connection, table: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = 'node_hash'",
+        [table],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Create the merkle-AST IR tables (`node_content`, `node_child`) and
+/// additively stamp a `node_hash` column onto the occurrence tables
+/// (`_ast`, `node_defs`, `node_refs`) that already exist. Idempotent: the
+/// `node_hash` ALTERs are gated on [`has_node_hash_column`].
 ///
-/// FK note: SQLite only enforces a FOREIGN KEY when the parent column is
-/// the target of the reference; a composite PK `(symbol_id, gen)` means a
-/// bare `REFERENCES symbols(symbol_id)` needs `symbol_id` to be unique on
-/// its own. We therefore add a UNIQUE index on `symbol_id` (below) so the
-/// FK resolves to it — within a single generation `symbol_id` is unique
-/// by construction (content address), and cross-gen rows are written in
-/// separate passes.
-pub const FACT_EDGES_TABLE_DDL: &str = "\
-CREATE TABLE IF NOT EXISTS fact_edges (
-    src        BLOB    NOT NULL REFERENCES symbols(symbol_id),
-    dst        BLOB             REFERENCES symbols(symbol_id),
-    kind       TEXT    NOT NULL,
-    fidelity   TEXT    NOT NULL,
-    gen        INTEGER NOT NULL,
-    token      TEXT,
-    qualifier  TEXT,
-    span_start INTEGER,
-    span_end   INTEGER
-);";
-
-/// DDL for `fact_edges` traversal indexes — deferred post-COMMIT.
-/// `(src, kind, gen)` makes each caller/callee/containment hop an index
-/// seek for the recursive-CTE traversal ADR-0023 §4 describes.
-pub const FACT_EDGES_INDEXES_DDL: &str = "\
-CREATE INDEX IF NOT EXISTS idx_edges_src ON fact_edges(src, kind, gen);
-CREATE INDEX IF NOT EXISTS idx_edges_dst ON fact_edges(dst, kind, gen);";
-
-/// UNIQUE index that both enforces the content-address invariant
-/// (`symbol_id` unique per row) and provides the single-column target the
-/// `fact_edges` FKs resolve against. Created *before* rows are inserted so
-/// FK enforcement is live during the parse transaction.
-pub const SYMBOLS_UNIQUE_ID_DDL: &str =
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_symbols_id ON symbols(symbol_id);";
-
-/// Create the IR tables (`symbols`, `fact_edges`) — table + the UNIQUE
-/// `symbol_id` index the FK targets. The UNIQUE index must exist before
-/// inserts so `PRAGMA foreign_keys = ON` can enforce edge endpoints at
-/// write time; the remaining traversal indexes are deferred to
-/// [`create_ir_indexes`] post-`COMMIT`.
+/// Must be called AFTER `create_ast_tables` + `create_refs_tables` (the
+/// ALTER targets must exist) and BEFORE the insert transaction. The
+/// `node_hash` columns carry a `REFERENCES node_content(node_hash)` FK, so
+/// with `PRAGMA foreign_keys = ON` at write time a `node_hash` pointer that
+/// doesn't resolve to a real content row is a loud insert error.
 pub fn create_ir_tables(conn: &Connection) -> Result<()> {
-    conn.execute_batch(SYMBOLS_TABLE_DDL)?;
-    conn.execute_batch(SYMBOLS_UNIQUE_ID_DDL)?;
-    conn.execute_batch(FACT_EDGES_TABLE_DDL)?;
+    conn.execute_batch(NODE_CONTENT_TABLE_DDL)?;
+    conn.execute_batch(NODE_CHILD_TABLE_DDL)?;
+    for table in ["_ast", "node_defs", "node_refs"] {
+        if !has_node_hash_column(conn, table)? {
+            conn.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN node_hash BLOB REFERENCES node_content(node_hash);"
+            ))?;
+        }
+    }
     Ok(())
 }
 
-/// Create the deferred IR traversal indexes (idempotent). Called
-/// post-`COMMIT` alongside the other bulk-load index passes.
+/// Create the deferred merkle-AST IR index (idempotent). Called
+/// post-`COMMIT` alongside the other bulk-load index passes. `node_content`
+/// and `node_child` are covered by their PRIMARY KEYs; the only extra
+/// traversal index is `idx_ast_node_hash`.
 pub fn create_ir_indexes(conn: &Connection) -> Result<()> {
-    conn.execute_batch(SYMBOLS_INDEXES_DDL)?;
-    conn.execute_batch(FACT_EDGES_INDEXES_DDL)?;
+    conn.execute_batch(AST_NODE_HASH_INDEX_DDL)?;
     Ok(())
 }
 

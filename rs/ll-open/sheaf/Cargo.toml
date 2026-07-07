@@ -1,6 +1,6 @@
 [package]
 name = "leyline-sheaf"
-version = "0.5.8"
+version = "0.5.9"
 edition = "2024"
 description = "Čech cohomology engine: sheaf cache, coboundary operators, structural invalidation"
 

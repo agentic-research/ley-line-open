@@ -10,7 +10,32 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
-Nothing yet — post-v0.5.8 changes land here.
+Nothing yet — post-v0.5.9 changes land here.
+
+## [0.5.9] — 2026-07-07
+
+Patch bump. Real monorepo bug: LLO's parse path panicked at `capnp-0.25.x/src/message.rs:565` when a single `AstNode` / `SourceFile` / `Head` / `BindingRecord` canonical form exceeded the default 8 KiB first-segment budget.
+
+### The failure mode
+
+`capnp::message::Builder::set_root_canonical` requires the output builder to be single-segment (asserted at message.rs:565). The default `HeapAllocator` uses `SUGGESTED_FIRST_SEGMENT_WORDS = 1024` (8 KiB). Source messages > 8 KiB force multi-segment allocation and the assertion panics.
+
+Trigger: **generated Go files in monorepos** — `*.pb.go` protobuf stubs, gRPC generated code, wire/mockgen output. LLO's node_id scheme is path-shaped (`pkg/foo.pb.go/function_declaration/block/statement_list/...`) so a 100-deep nested composite literal produces node_id strings >7 KiB, pushing the AstNode canonical form past 8 KiB. `--lang go` filter works correctly; the panic is downstream at per-record serialization.
+
+### Added
+
+- `leyline_schema_capnp::canonical::write_canonical_message<T, W>` — two-pass canonical serialization helper. Measures the source builder's word count and pre-sizes the canonical builder's first segment via `HeapAllocator::first_segment_words(1.5 × source_words + 16)`. `set_root_canonical`'s single-segment assertion now holds for records of any realistic size.
+- 3 test pins: 64 KiB regression test (would panic pre-fix), small-message no-regression check, slack-formula pin.
+
+### Changed
+
+- `cmd_parse.rs` Head / SourceFile / AstNode canonical writes now go through the shared helper.
+- `lsp/project.rs` BindingRecord canonical write similarly updated.
+
+### Notes
+
+- Two layers stay cleanly separated: CDC chunking (downstream, arena bytes) is unaffected; this fix is upstream at the per-record serialization boundary.
+- Follow-up work deferred (own bead cluster): `--include-generated` opt-in policy + max-AST-depth truncation for `_pb.go`/`_gen.go` files. Generated code produces most of the extreme depths + adds little semantic value per node.
 
 ## [0.5.8] — 2026-07-07
 

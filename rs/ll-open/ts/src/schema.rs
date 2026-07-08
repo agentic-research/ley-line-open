@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS _source (
     id TEXT PRIMARY KEY,
     language TEXT NOT NULL,
     content BLOB,
-    path TEXT
+    path TEXT,
+    content_hash BLOB
 );";
 
 /// DDL for the `_ast` table — table only, no indexes. Pairs with
@@ -211,6 +212,107 @@ CREATE TABLE IF NOT EXISTS _imports (
     source_id TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_imports_source ON _imports(source_id);";
+
+// ---------------------------------------------------------------------------
+// Merkle-AST content-addressed IR (ADR-0027 / mache ADR-0023)
+// ---------------------------------------------------------------------------
+//
+// Replaces the location-keyed `symbol_id` + eager `symbols`/`fact_edges`
+// tables with a bottom-up merkle-AST `node_hash`. Net change is mostly
+// deletion + one deduped content table (`node_content`), the git-tree
+// object (`node_child`), and a `node_hash` column stamped onto the
+// occurrence tables that already exist (`_ast`, `node_defs`, `node_refs`).
+//
+// `node_hash` is intrinsic (a function of κ kind + terminal token +
+// ordered child hashes — spans/paths/parse-run node_ids are OUT), so a
+// unique subtree is stored once. Two byte-identical functions in different
+// files share a `node_hash`; a `a+b` vs `a-b` edit does not (the fold
+// includes anonymous operator tokens). The one-to-many invariant: a
+// reference's resolved target is a def OCCURRENCE (node_id), NEVER a
+// `node_hash` — keying resolution on `node_hash` would silently collapse
+// two distinct callees with identical bodies.
+
+/// DDL for `node_content` — one row per UNIQUE subtree, keyed on the
+/// merkle-AST `node_hash` (a real single-column PRIMARY KEY). `INSERT OR
+/// IGNORE` on the PK == intrinsic dedup: the second occurrence of an
+/// identical subtree is silently ignored. `kind` is the hashed canonical
+/// κ kind; `raw_kind` is the grammar kind (a content column, NOT hashed).
+/// `token` is the terminal UTF-8 text for leaves (NULL for internal
+/// nodes); `arity` is the child count.
+pub const NODE_CONTENT_TABLE_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS node_content (
+    node_hash BLOB PRIMARY KEY,
+    node_tag  INTEGER NOT NULL,
+    kind      TEXT    NOT NULL,
+    raw_kind  TEXT    NOT NULL,
+    lang      TEXT    NOT NULL,
+    token     TEXT,
+    arity     INTEGER NOT NULL
+);";
+
+/// DDL for `node_child` — the git-tree object. One row per (unique parent,
+/// ordinal) edge, deduped per unique parent subtree. `field` is the
+/// tree-sitter field name ("name","body",…) or NULL when the child has no
+/// field. Both endpoints `REFERENCES node_content(node_hash)`; the
+/// post-order fold emits children before parents so FK enforcement holds
+/// under `PRAGMA foreign_keys = ON`.
+pub const NODE_CHILD_TABLE_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS node_child (
+    parent_hash BLOB    NOT NULL REFERENCES node_content(node_hash),
+    ordinal     INTEGER NOT NULL,
+    child_hash  BLOB    NOT NULL REFERENCES node_content(node_hash),
+    field       TEXT,
+    PRIMARY KEY (parent_hash, ordinal)
+);";
+
+/// Index over `_ast.node_hash` — "every location of this exact subtree".
+pub const AST_NODE_HASH_INDEX_DDL: &str =
+    "CREATE INDEX IF NOT EXISTS idx_ast_node_hash ON _ast(node_hash);";
+
+/// True when `table` already has a `node_hash` column. SQLite has no
+/// `ADD COLUMN IF NOT EXISTS`, so the merkle-AST migration probes
+/// `pragma_table_info` and only ALTERs when the column is absent — makes
+/// the additive migration idempotent across incremental reparses.
+fn has_node_hash_column(conn: &Connection, table: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = 'node_hash'",
+        [table],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Create the merkle-AST IR tables (`node_content`, `node_child`) and
+/// additively stamp a `node_hash` column onto the occurrence tables
+/// (`_ast`, `node_defs`, `node_refs`) that already exist. Idempotent: the
+/// `node_hash` ALTERs are gated on [`has_node_hash_column`].
+///
+/// Must be called AFTER `create_ast_tables` + `create_refs_tables` (the
+/// ALTER targets must exist) and BEFORE the insert transaction. The
+/// `node_hash` columns carry a `REFERENCES node_content(node_hash)` FK, so
+/// with `PRAGMA foreign_keys = ON` at write time a `node_hash` pointer that
+/// doesn't resolve to a real content row is a loud insert error.
+pub fn create_ir_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(NODE_CONTENT_TABLE_DDL)?;
+    conn.execute_batch(NODE_CHILD_TABLE_DDL)?;
+    for table in ["_ast", "node_defs", "node_refs"] {
+        if !has_node_hash_column(conn, table)? {
+            conn.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN node_hash BLOB REFERENCES node_content(node_hash);"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+/// Create the deferred merkle-AST IR index (idempotent). Called
+/// post-`COMMIT` alongside the other bulk-load index passes. `node_content`
+/// and `node_child` are covered by their PRIMARY KEYs; the only extra
+/// traversal index is `idx_ast_node_hash`.
+pub fn create_ir_indexes(conn: &Connection) -> Result<()> {
+    conn.execute_batch(AST_NODE_HASH_INDEX_DDL)?;
+    Ok(())
+}
 
 /// Create `node_refs`, `node_defs`, and `_imports` tables + indexes
 /// (idempotent).

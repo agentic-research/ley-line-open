@@ -11,6 +11,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use leyline_core::ContentAddressed;
 use leyline_ts::languages::TsLanguage;
 
 /// Maximum file size that the parse pass will read into memory. Files
@@ -27,8 +28,9 @@ use leyline_ts::languages::TsLanguage;
 pub const MAX_PARSE_FILE_SIZE: i64 = 8 * 1024 * 1024;
 use leyline_ts::refs::{ExtractedRef, extract_refs};
 use leyline_ts::schema::{
-    create_ast_tables, create_index_schema, create_post_load_indexes_skip_unused,
-    create_refs_tables, delete_file_rows, read_file_index, set_meta, sweep_orphaned_dirs,
+    create_ast_tables, create_index_schema, create_ir_indexes, create_ir_tables,
+    create_post_load_indexes_skip_unused, create_refs_tables, delete_file_rows, read_file_index,
+    set_meta, sweep_orphaned_dirs,
 };
 use rayon::prelude::*;
 use rusqlite::Connection;
@@ -56,6 +58,30 @@ struct AstEntry {
     start_col: usize,
     end_row: usize,
     end_col: usize,
+    /// Merkle-AST content address (ADR-0027): the intrinsic `node_hash`
+    /// of this node's subtree (κ kind + terminal token + ordered child
+    /// hashes; spans/paths/node_ids are OUT). Stamped onto the `_ast`
+    /// occurrence row and pointing at the deduped `node_content` row.
+    node_hash: [u8; 32],
+}
+
+/// A `node_content` row — one per UNIQUE subtree (deduped by `node_hash`).
+struct ContentRow {
+    node_hash: [u8; 32],
+    node_tag: u8,
+    kind: String,
+    raw_kind: String,
+    lang: String,
+    token: Option<String>,
+    arity: usize,
+}
+
+/// A `node_child` row — the git-tree edge parent→child at `ordinal`.
+struct ChildRow {
+    parent_hash: [u8; 32],
+    ordinal: usize,
+    child_hash: [u8; 32],
+    field: Option<String>,
 }
 
 struct ParsedFile {
@@ -65,8 +91,20 @@ struct ParsedFile {
     nodes: Vec<ParsedNode>,
     ast_entries: Vec<AstEntry>,
     refs: Vec<ExtractedRef>,
+    /// Deduped `node_content` rows for this file's subtrees (post-order,
+    /// children before parents). Cross-file dedup happens at SQL insert
+    /// time via `INSERT OR IGNORE` on the `node_hash` PK.
+    node_contents: Vec<ContentRow>,
+    /// `node_child` rows for this file's unique internal nodes.
+    node_children: Vec<ChildRow>,
     file_mtime: i64,
     file_size: i64,
+    /// BLAKE3-32 of the file bytes. Computed in the rayon worker from the
+    /// same `content` slice tree-sitter parsed, so it costs one extra hash
+    /// pass over already-in-cache bytes. Populates `_source.contentHash`
+    /// (closing the T8.5 TODO) and is the first component of every
+    /// `symbol_id` (ADR-0027 / mache ADR-0023).
+    content_hash: [u8; 32],
     /// Pre-serialized capnp bytes for the per-file `SourceFile` record.
     /// Built in the rayon worker so the post-parse main thread just
     /// writes the bytes to the BufWriter — no per-file canonicalize
@@ -265,12 +303,12 @@ batch_table! {
     // the mache 765-file bench that's ~535K extra B-tree probes. See
     // bead `ley-line-open-cbbedf`.
     AstBatch, AstRow,
-    "INSERT INTO _ast (node_id, source_id, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col) VALUES ",
-    9,
-    push_fn: (node_id: String, source_id: String, node_kind: String, start_byte: i64, end_byte: i64, start_row: i64, start_col: i64, end_row: i64, end_col: i64),
-    push_body: { AstRow { node_id, source_id, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col } },
+    "INSERT INTO _ast (node_id, source_id, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col, node_hash) VALUES ",
+    10,
+    push_fn: (node_id: String, source_id: String, node_kind: String, start_byte: i64, end_byte: i64, start_row: i64, start_col: i64, end_row: i64, end_col: i64, node_hash: Vec<u8>),
+    push_body: { AstRow { node_id, source_id, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col, node_hash } },
     flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 9);
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 10);
         for r in chunk {
             out.push(&r.node_id);
             out.push(&r.source_id);
@@ -281,6 +319,7 @@ batch_table! {
             out.push(&r.start_col);
             out.push(&r.end_row);
             out.push(&r.end_col);
+            out.push(&r.node_hash);
         }
         out
     },
@@ -290,56 +329,134 @@ batch_table! {
     // Plain INSERT: same rationale as AstBatch — delete_file_rows
     // clears _source rows per file before reparse.
     SourceBatch, SourceRow,
-    "INSERT INTO _source (id, language, path) VALUES ",
-    3,
-    push_fn: (id: String, language: String, path: String),
-    push_body: { SourceRow { id, language, path } },
+    "INSERT INTO _source (id, language, path, content_hash) VALUES ",
+    4,
+    push_fn: (id: String, language: String, path: String, content_hash: Vec<u8>),
+    push_body: { SourceRow { id, language, path, content_hash } },
     flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 3);
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 4);
         for r in chunk {
             out.push(&r.id);
             out.push(&r.language);
             out.push(&r.path);
+            out.push(&r.content_hash);
         }
         out
     },
 }
 
 batch_table! {
-    RefBatch, RefRow,
-    // NOTE: `prefix` is rebound at flush time below since refs/defs/imports
-    // share row shape but target different tables. See post-macro impl.
-    "",
-    3,
-    push_fn: (col0: String, col1: String, col2: String),
-    push_body: { RefRow { col0, col1, col2 } },
+    // Merkle-AST `node_content` rows (ADR-0027). One per UNIQUE subtree.
+    // `INSERT OR IGNORE` on the `node_hash` PRIMARY KEY == intrinsic dedup:
+    // the second occurrence of an identical subtree (a vendored copy, an
+    // empty `__init__.py`, a shared operator leaf) is silently ignored. No
+    // `gen` column — content identity is parse-run-invariant by
+    // construction, so re-emitting an existing subtree is a clean no-op.
+    NodeContentBatch, NodeContentRow,
+    "INSERT OR IGNORE INTO node_content (node_hash, node_tag, kind, raw_kind, lang, token, arity) VALUES ",
+    7,
+    push_fn: (
+        node_hash: Vec<u8>, node_tag: i64, kind: String, raw_kind: String,
+        lang: String, token: Option<String>, arity: i64
+    ),
+    push_body: { NodeContentRow { node_hash, node_tag, kind, raw_kind, lang, token, arity } },
     flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 3);
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 7);
         for r in chunk {
-            out.push(&r.col0);
-            out.push(&r.col1);
-            out.push(&r.col2);
+            out.push(&r.node_hash);
+            out.push(&r.node_tag);
+            out.push(&r.kind);
+            out.push(&r.raw_kind);
+            out.push(&r.lang);
+            out.push(&r.token);
+            out.push(&r.arity);
+        }
+        out
+    },
+}
+
+batch_table! {
+    // Merkle-AST `node_child` rows (ADR-0027) — the git-tree object.
+    // `INSERT OR IGNORE` on the (parent_hash, ordinal) PK dedups the child
+    // edges of an already-seen parent subtree. FK endpoints resolve because
+    // `node_content` is flushed first.
+    NodeChildBatch, NodeChildRow,
+    "INSERT OR IGNORE INTO node_child (parent_hash, ordinal, child_hash, field) VALUES ",
+    4,
+    push_fn: (parent_hash: Vec<u8>, ordinal: i64, child_hash: Vec<u8>, field: Option<String>),
+    push_body: { NodeChildRow { parent_hash, ordinal, child_hash, field } },
+    flatten: |chunk| {
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 4);
+        for r in chunk {
+            out.push(&r.parent_hash);
+            out.push(&r.ordinal);
+            out.push(&r.child_hash);
+            out.push(&r.field);
+        }
+        out
+    },
+}
+
+batch_table! {
+    // node_refs / node_defs occurrence rows (ADR-0027). Both share the
+    // (token, node_id, source_id, node_hash) shape — the additive
+    // `node_hash` pointer carries the merkle-AST identity of the occurrence
+    // node. Keyed by token+node_id+source_id, NEVER by node_hash (the
+    // one-to-many invariant). `prefix` is rebound at flush time below since
+    // refs/defs target different tables.
+    RefBatch, RefRow,
+    "",
+    4,
+    push_fn: (token: String, node_id: String, source_id: String, node_hash: Option<Vec<u8>>),
+    push_body: { RefRow { token, node_id, source_id, node_hash } },
+    flatten: |chunk| {
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 4);
+        for r in chunk {
+            out.push(&r.token);
+            out.push(&r.node_id);
+            out.push(&r.source_id);
+            out.push(&r.node_hash);
         }
         out
     },
 }
 
 // Override RefBatch::flush_batched to thread the per-table SQL prefix.
-// node_refs / node_defs / _imports share the (TEXT, TEXT, TEXT) shape
-// but live in different tables; rebinding `prefix` per call keeps the
-// macro-generated buffer reusable across all three.
+// node_refs / node_defs share the (token, node_id, source_id, node_hash)
+// shape but live in different tables; rebinding `prefix` per call keeps the
+// macro-generated buffer reusable across both.
 impl RefBatch {
     fn flush_batched_for(self, conn: &Connection, prefix: &str) -> Result<()> {
-        flush_in_batches(conn, self.rows, prefix, 3, |chunk| {
-            let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 3);
+        flush_in_batches(conn, self.rows, prefix, 4, |chunk| {
+            let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 4);
             for r in chunk {
-                out.push(&r.col0);
-                out.push(&r.col1);
-                out.push(&r.col2);
+                out.push(&r.token);
+                out.push(&r.node_id);
+                out.push(&r.source_id);
+                out.push(&r.node_hash);
             }
             out
         })
     }
+}
+
+batch_table! {
+    // `_imports` rows (alias, path, source_id). No `node_hash` — imports are
+    // a flat alias→path projection, not an AST occurrence.
+    ImportBatch, ImportRow,
+    "INSERT INTO _imports (alias, path, source_id) VALUES ",
+    3,
+    push_fn: (alias: String, path: String, source_id: String),
+    push_body: { ImportRow { alias, path, source_id } },
+    flatten: |chunk| {
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 3);
+        for r in chunk {
+            out.push(&r.alias);
+            out.push(&r.path);
+            out.push(&r.source_id);
+        }
+        out
+    },
 }
 
 batch_table! {
@@ -506,6 +623,12 @@ pub fn parse_into_conn(
     // `create_post_load_indexes`. See bead `ley-line-open-9ccbc7`.
     create_ast_tables(conn)?;
     create_refs_tables(conn)?;
+    // Merkle-AST IR (ADR-0027): create node_content/node_child and stamp the
+    // additive node_hash column onto _ast/node_defs/node_refs. Must run after
+    // the occurrence tables exist (the ALTER targets) and before the insert
+    // transaction, so the node_hash FK → node_content is live when
+    // PRAGMA foreign_keys=ON enforces it below.
+    create_ir_tables(conn)?;
     create_index_schema(conn)?;
 
     let mtime = std::time::SystemTime::now()
@@ -735,7 +858,27 @@ pub fn parse_into_conn(
     let mut parsed = 0u64;
     let mut errors = 0u64;
 
+    // Unified code-fact IR (ADR-0027): enforce `fact_edges` FK endpoints at
+    // write time so a dangling edge is a loud insert error, not a silently-
+    // zeroed downstream JOIN (the be6136 lesson). `foreign_keys` is a
+    // per-connection, no-op-inside-a-transaction pragma, so it must be set
+    // before BEGIN. Set here in `parse_into_conn` (not `cmd_parse`) so the
+    // in-memory test path gets it too. Only `fact_edges` has FKs; the other
+    // tables predate this and are unaffected, including the delete_file_rows
+    // sweep above (it touches no FK relationship).
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+
     conn.execute_batch("BEGIN")?;
+
+    // Defer FK enforcement to COMMIT: with immediate FKs, every node_child /
+    // _ast.node_hash insert probes node_content's BLOB PK synchronously (~880k
+    // per-row probes into a large index → cache thrash). `defer_foreign_keys`
+    // batches all checks into a single validation pass at COMMIT — still
+    // fail-loud (a dangling edge aborts the COMMIT), but no per-row probe. It
+    // is a per-transaction pragma, so it is set after BEGIN and resets on
+    // COMMIT. Insert order (node_content before its referrers) still holds, so
+    // the deferred check passes on well-formed input.
+    conn.pragma_update(None, "defer_foreign_keys", "ON")?;
 
     // capnp dual-write (bead `ley-line-open-cdf098`) — open snapshot
     // files alongside the SQL writes. Truncate-and-rewrite semantics:
@@ -755,9 +898,28 @@ pub fn parse_into_conn(
     let mut ast_buf: AstBatch = AstBatch::with_capacity(550_000);
     let mut refs_buf: RefBatch = RefBatch::with_capacity(40_000);
     let mut defs_buf: RefBatch = RefBatch::with_capacity(3_000);
-    let mut imports_buf: RefBatch = RefBatch::with_capacity(2_000);
+    let mut imports_buf: ImportBatch = ImportBatch::with_capacity(2_000);
     let mut source_buf: SourceBatch = SourceBatch::with_capacity(to_parse.len());
     let mut file_idx_buf: FileIdxBatch = FileIdxBatch::with_capacity(to_parse.len());
+
+    // Merkle-AST IR (ADR-0027). `node_content`/`node_child` are the deduped
+    // content layer (`INSERT OR IGNORE` collapses identical subtrees across
+    // files); `_ast`/`node_defs`/`node_refs` carry the additive `node_hash`
+    // pointer. No `gen`/edge machinery: contains is intrinsic (node_child),
+    // and defines/references stay as occurrence rows keyed by token+node_id.
+    let mut content_buf: NodeContentBatch = NodeContentBatch::with_capacity(550_000);
+    let mut child_buf: NodeChildBatch = NodeChildBatch::with_capacity(550_000);
+    // Cross-file dedup in memory, NOT via `INSERT OR IGNORE`. The per-file
+    // fold already dedups within a file, but identical subtrees recur across
+    // files (~2M fold rows collapse to ~150k unique). Letting SQL dedup means
+    // ~2M probes into a growing BLOB primary-key B-tree during the insert —
+    // the classic "maintain a UNIQUE index during a bulk load" anti-pattern,
+    // and the measured cold-parse hot spot. A HashSet lookup is ~2 orders of
+    // magnitude cheaper than a BLOB index probe that misses to disk once the
+    // index outgrows the page cache. `node_content` is a content-addressed
+    // blob store; dedup belongs at the write, not in a per-row index probe.
+    let mut seen_content: HashSet<[u8; 32]> = HashSet::with_capacity(200_000);
+    let mut seen_edge: HashSet<([u8; 32], i64)> = HashSet::with_capacity(450_000);
 
     let mut dirs_created: HashSet<String> = HashSet::new();
     let mut changed_files: Vec<String> = Vec::new();
@@ -768,7 +930,12 @@ pub fn parse_into_conn(
                 let rel_path = Path::new(&pf.rel);
                 collect_dirs(rel_path, &mut dirs_created, &mut nodes_buf, mtime);
 
-                source_buf.push(pf.rel.clone(), pf.language.clone(), pf.abs_path.clone());
+                source_buf.push(
+                    pf.rel.clone(),
+                    pf.language.clone(),
+                    pf.abs_path.clone(),
+                    pf.content_hash.to_vec(),
+                );
 
                 // capnp dual-write (`ley-line-open-cdf098`): same fields
                 // as the SQL row, typed and content-addressable. The
@@ -789,17 +956,57 @@ pub fn parse_into_conn(
                     nodes_buf.push(n.id, n.parent_id, n.name, n.kind, n.size, mtime, n.record);
                 }
 
-                for a in pf.ast_entries {
+                // Merkle-AST content layer (post-order, children before
+                // parents). Cross-file dedup happens here in memory: only the
+                // FIRST occurrence of a content hash / (parent,ordinal) edge is
+                // buffered, so the SQL insert sees ~150k unique rows, not ~2M.
+                // The `INSERT OR IGNORE` prefix stays as a byte-identical-file
+                // backstop, but the probe storm is gone.
+                for c in pf.node_contents {
+                    if seen_content.insert(c.node_hash) {
+                        content_buf.push(
+                            c.node_hash.to_vec(),
+                            c.node_tag as i64,
+                            c.kind,
+                            c.raw_kind,
+                            c.lang,
+                            c.token,
+                            c.arity as i64,
+                        );
+                    }
+                }
+                for c in pf.node_children {
+                    if seen_edge.insert((c.parent_hash, c.ordinal as i64)) {
+                        child_buf.push(
+                            c.parent_hash.to_vec(),
+                            c.ordinal as i64,
+                            c.child_hash.to_vec(),
+                            c.field,
+                        );
+                    }
+                }
+
+                // node_id → node_hash for this file, so the additive
+                // node_hash pointer on node_defs/node_refs can be attached
+                // by the ref locator (which is always an `_ast` node_id).
+                let mut hash_by_id: HashMap<&str, [u8; 32]> =
+                    HashMap::with_capacity(pf.ast_entries.len());
+                for a in &pf.ast_entries {
+                    hash_by_id.insert(a.node_id.as_str(), a.node_hash);
+                }
+
+                for a in &pf.ast_entries {
                     ast_buf.push(
-                        a.node_id,
-                        a.source_id,
-                        a.node_kind,
+                        a.node_id.clone(),
+                        a.source_id.clone(),
+                        a.node_kind.clone(),
                         a.start_byte as i64,
                         a.end_byte as i64,
                         a.start_row as i64,
                         a.start_col as i64,
                         a.end_row as i64,
                         a.end_col as i64,
+                        a.node_hash.to_vec(),
                     );
                 }
 
@@ -809,12 +1016,18 @@ pub fn parse_into_conn(
                             token,
                             node_id,
                             source_id,
-                        } => refs_buf.push(token, node_id, source_id),
+                        } => {
+                            let nh = hash_by_id.get(node_id.as_str()).map(|h| h.to_vec());
+                            refs_buf.push(token, node_id, source_id, nh);
+                        }
                         ExtractedRef::Def {
                             token,
                             node_id,
                             source_id,
-                        } => defs_buf.push(token, node_id, source_id),
+                        } => {
+                            let nh = hash_by_id.get(node_id.as_str()).map(|h| h.to_vec());
+                            defs_buf.push(token, node_id, source_id, nh);
+                        }
                         ExtractedRef::Import {
                             alias,
                             path,
@@ -846,21 +1059,28 @@ pub fn parse_into_conn(
     // Flush each table in BULK_BATCH_ROWS-sized chunks via multi-row
     // VALUES inserts. Tail (last <BULK_BATCH_ROWS rows) flushed in one
     // partial-size statement so we don't fall back to per-row execute.
+    //
+    // FK ordering (ADR-0027): with `foreign_keys = ON` the node_hash FKs
+    // (_ast/node_defs/node_refs → node_content, node_child → node_content)
+    // are checked immediately per row. `node_content` must therefore land
+    // FIRST so every referencing row finds its content target (uncommitted
+    // rows in the same transaction satisfy the FK). The post-order fold
+    // already emitted content children-before-parents, but the cross-table
+    // ordering here is what makes the referencing rows safe.
+    content_buf.flush_batched(conn)?;
+    child_buf.flush_batched(conn)?;
     nodes_buf.flush_batched(conn)?;
     ast_buf.flush_batched(conn)?;
     source_buf.flush_batched(conn)?;
     refs_buf.flush_batched_for(
         conn,
-        "INSERT INTO node_refs (token, node_id, source_id) VALUES ",
+        "INSERT INTO node_refs (token, node_id, source_id, node_hash) VALUES ",
     )?;
     defs_buf.flush_batched_for(
         conn,
-        "INSERT INTO node_defs (token, node_id, source_id) VALUES ",
+        "INSERT INTO node_defs (token, node_id, source_id, node_hash) VALUES ",
     )?;
-    imports_buf.flush_batched_for(
-        conn,
-        "INSERT INTO _imports (alias, path, source_id) VALUES ",
-    )?;
+    imports_buf.flush_batched(conn)?;
     file_idx_buf.flush_batched(conn)?;
     let sub_flush_end = std::time::Instant::now();
 
@@ -881,6 +1101,27 @@ pub fn parse_into_conn(
     conn.execute_batch("COMMIT")?;
     let sub_commit_end = std::time::Instant::now();
 
+    // Merkle-AST IR (ADR-0027): count the UNRESOLVED reference targets —
+    // node_refs rows whose token matches no node_defs token (a builtin, an
+    // external dependency, or a not-yet-parsed file). This is the exact
+    // parity image of the old `fact_edges WHERE dst IS NULL AND kind IN
+    // ('references','calls')` count: every ref locator is an `_ast` node so
+    // it always resolved to a `src`, and the producer never emitted `calls`,
+    // so the old count reduced to "references with no matching def token".
+    // Recorded in the Head as a binding-fidelity ratchet (W5 asserts it
+    // stays <= baseline). Queried on the main thread here — after COMMIT but
+    // before the head thread is spawned and before `create_post_load_indexes`
+    // runs — so no second connection contends for the db lock. Whole-db
+    // count, so it stays correct if a later run reparses only part of the tree.
+    let unbound_facts: u64 = conn
+        .query_row(
+            "SELECT count(*) FROM node_refs WHERE token NOT IN (SELECT token FROM node_defs)",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n as u64)
+        .unwrap_or(0);
+
     // Pre-grab the db_path so we can dispatch the head-write hash pass
     // (pure filesystem work, reads ast.capnp + source.capnp) on a worker
     // thread that runs concurrently with `create_post_load_indexes`
@@ -900,8 +1141,9 @@ pub fn parse_into_conn(
             _ => None,
         }
     };
-    let head_handle = db_path_for_head
-        .map(|p| std::thread::spawn(move || -> Result<()> { write_head_for_path(&p) }));
+    let head_handle = db_path_for_head.map(|p| {
+        std::thread::spawn(move || -> Result<()> { write_head_for_path(&p, unbound_facts) })
+    });
 
     // Build secondary indexes in one pass now that all rows are
     // landed. SQLite materializes each index by a single sorted scan
@@ -920,6 +1162,13 @@ pub fn parse_into_conn(
     // schema with the indexes mache needs, so skipping here is safe.
     // See bead `ley-line-open-cbbedf` Attack 3.
     create_post_load_indexes_skip_unused(conn)?;
+    // Unified code-fact IR (ADR-0027): the `symbols`/`fact_edges` traversal
+    // indexes (idx_symbols_node/kind, idx_edges_src/dst) are deferred to here
+    // — same rationale as the other post-load indexes: one sorted scan per
+    // index is cheaper than incremental B-tree maintenance during the insert.
+    // The UNIQUE symbol_id index the FK targets was built earlier (pre-insert)
+    // by create_ir_tables and is not rebuilt here.
+    create_ir_indexes(conn)?;
     let sub_index_end = std::time::Instant::now();
 
     let insert_elapsed = insert_start.elapsed();
@@ -974,6 +1223,12 @@ pub fn parse_into_conn(
         .unwrap_or_default()
         .as_secs();
     set_meta(conn, "parse_time", &now.to_string())?;
+    // Merkle-AST IR generation lineage (ADR-0027): the head.capnp root shape
+    // changed (span left symbol identity), so this is a new schema
+    // generation. Bump the meta marker so consumers can tell the merkle-AST
+    // shape (node_content/node_child/_ast.node_hash) from the retired
+    // symbols/fact_edges shape.
+    set_meta(conn, "ir_schema_version", "merkle-ast-v1")?;
     let sweep_close_elapsed = sweep_close_start.elapsed();
 
     // Σ root advance (bead `ley-line-open-ce55b1`) — join the worker
@@ -1213,7 +1468,7 @@ fn read_head_for_chain(head_path: &Path) -> ([u8; 32], u64) {
 /// no SQLite handle required, so a parent caller can dispatch this on
 /// a worker thread that runs concurrently with post-COMMIT SQLite work
 /// (e.g. `create_post_load_indexes`). See bead `ley-line-open-cbbedf`.
-fn write_head_for_path(db_path: &Path) -> Result<()> {
+fn write_head_for_path(db_path: &Path, unbound_facts: u64) -> Result<()> {
     let (root, segment_bytes) = hash_segment_files(db_path)?;
     let head_path = with_extension(db_path, "head.capnp");
     let (parent, generation) = read_head_for_chain(&head_path);
@@ -1224,6 +1479,9 @@ fn write_head_for_path(db_path: &Path) -> Result<()> {
         let mut h: head::Builder = src.init_root();
         h.set_generation(generation);
         h.set_segment_bytes(segment_bytes);
+        // Unified code-fact IR ratchet (ADR-0027): NULL-dst reference/call
+        // edge count, threaded from the caller's post-COMMIT db query.
+        h.set_unbound_facts(unbound_facts);
         h.reborrow().init_root_hash().set_bytes(&root);
         h.reborrow().init_parent_hash().set_bytes(&parent);
     }
@@ -1254,7 +1512,17 @@ fn write_head_after_parse(conn: &Connection) -> Result<()> {
         Ok(s) if !s.is_empty() => std::path::PathBuf::from(s),
         _ => return Ok(()),
     };
-    write_head_for_path(&db_path)
+    // Mirror parse_into_conn: derive the IR unbound-fact count from the db —
+    // node_refs whose token matches no node_defs token (ADR-0027).
+    let unbound_facts: u64 = conn
+        .query_row(
+            "SELECT count(*) FROM node_refs WHERE token NOT IN (SELECT token FROM node_defs)",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n as u64)
+        .unwrap_or(0);
+    write_head_for_path(&db_path, unbound_facts)
 }
 
 // ---------------------------------------------------------------------------
@@ -1331,6 +1599,7 @@ fn serialize_source_file_record(
     canonical_path: &str,
     mtime: i64,
     size: i64,
+    content_hash: &[u8; 32],
 ) -> Result<()> {
     use leyline_schema_capnp::source_capnp::source_file;
 
@@ -1342,8 +1611,10 @@ fn serialize_source_file_record(
         sf.set_canonical_path(canonical_path);
         sf.set_mtime(mtime as u64);
         sf.set_size(size as u64);
-        // contentHash left empty for now — T8.5 wires BLAKE3.
-        let _hash = sf.init_content_hash();
+        // BLAKE3-32 of the file bytes (T8.5 wired in ADR-0027). Feeds the
+        // Σ segment hash and — projected into `_source.contentHash` — the
+        // `symbol_id` content address consumers join on.
+        sf.init_content_hash().set_bytes(content_hash);
     }
 
     leyline_schema_capnp::canonical::write_canonical_message::<source_file::Owned, _>(&src, buf)
@@ -1384,6 +1655,78 @@ fn serialize_ast_node_record(buf: &mut Vec<u8>, a: &AstEntry) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Merkle-AST content address (ADR-0027) — node_hash
+// ---------------------------------------------------------------------------
+//
+// A bottom-up (POST-ORDER) fold: a node's `node_hash` is a function of its
+// canonical κ kind, its terminal token text (leaves), and the ordered
+// hashes of its non-`extra` children (internal nodes). Spans, paths, and
+// parse-run node_ids are OUT of the preimage, so a unique subtree hashes to
+// one value regardless of where it appears — two byte-identical functions
+// in different files share a `node_hash`. Anonymous children (operators
+// like `+`/`-`, keywords, punctuation) ARE folded, which is what
+// distinguishes `a+b` from `a-b`; comments/`extra` nodes are excluded, so a
+// comment-only edit leaves every enclosing hash unchanged.
+
+/// Domain/version tag for the merkle-AST preimage (git-object style).
+const NODE_HASH_DOMAIN: &[u8] = b"llo/ast/v1";
+/// Node-tag byte: leaf (terminal) node.
+const NODE_TAG_LEAF: u8 = 0x00;
+/// Node-tag byte: internal (n-ary) node.
+const NODE_TAG_INTERNAL: u8 = 0x01;
+
+/// Append `v` as an unsigned LEB128 varint. Length-prefixing (NOT a 0x00
+/// delimiter) is what keeps token text unambiguous once string/char
+/// literals — which can contain NUL — enter σ.
+fn write_uvarint(buf: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let mut byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 {
+            byte |= 0x80;
+        }
+        buf.push(byte);
+        if v == 0 {
+            break;
+        }
+    }
+}
+
+/// Merkle-AST hash of a terminal node: `domain ‖ 0x00 ‖ leaf_tag ‖
+/// uvarint(len(kind)) ‖ kind ‖ uvarint(len(token)) ‖ token`. Hashed via the
+/// locked σ surface (`ContentAddressed::hash`), never `blake3::hash`
+/// directly (the `lint:blake3` gate).
+fn hash_leaf(kind: &str, token: &str) -> [u8; 32] {
+    let mut p = Vec::with_capacity(NODE_HASH_DOMAIN.len() + 6 + kind.len() + token.len());
+    p.extend_from_slice(NODE_HASH_DOMAIN);
+    p.push(0x00);
+    p.push(NODE_TAG_LEAF);
+    write_uvarint(&mut p, kind.len() as u64);
+    p.extend_from_slice(kind.as_bytes());
+    write_uvarint(&mut p, token.len() as u64);
+    p.extend_from_slice(token.as_bytes());
+    *p.hash().as_bytes()
+}
+
+/// Merkle-AST hash of an internal node: `domain ‖ 0x00 ‖ internal_tag ‖
+/// uvarint(len(kind)) ‖ kind ‖ uvarint(child_count) ‖ child_hash[0..n]`
+/// (32 bytes each, SOURCE ORDER). Same σ surface as [`hash_leaf`].
+fn hash_internal(kind: &str, child_hashes: &[[u8; 32]]) -> [u8; 32] {
+    let mut p =
+        Vec::with_capacity(NODE_HASH_DOMAIN.len() + 6 + kind.len() + child_hashes.len() * 32);
+    p.extend_from_slice(NODE_HASH_DOMAIN);
+    p.push(0x00);
+    p.push(NODE_TAG_INTERNAL);
+    write_uvarint(&mut p, kind.len() as u64);
+    p.extend_from_slice(kind.as_bytes());
+    write_uvarint(&mut p, child_hashes.len() as u64);
+    for h in child_hashes {
+        p.extend_from_slice(h);
+    }
+    *p.hash().as_bytes()
+}
+
+// ---------------------------------------------------------------------------
 // Pure file parser (no Connection — safe for rayon)
 // ---------------------------------------------------------------------------
 
@@ -1405,7 +1748,17 @@ fn parse_file_pure(
         .parse(content, None)
         .context("tree-sitter parse returned None")?;
 
+    // BLAKE3 of the file bytes — the byte-level content address feeding
+    // `_source.contentHash` (retained, e251083). Complementary to the
+    // merkle-AST node_hash (which is structure-level, whitespace-invariant).
+    // σ via the one content-address surface (ContentAddressed), not inline
+    // blake3 — byte-identical (substrate.rs locks the algorithm) and keeps
+    // _source.contentHash on the same σ path as the rest of the Σ substrate.
+    // Enforced by the `lint:blake3` gate.
+    let content_hash: [u8; 32] = *content.hash().as_bytes();
+
     let root = tree.root_node();
+    let lang_name = language.name();
 
     let parent_id = source_id
         .rsplit_once('/')
@@ -1422,6 +1775,11 @@ fn parse_file_pure(
     let mut nodes = Vec::new();
     let mut ast_entries = Vec::new();
     let mut refs = Vec::new();
+    let mut node_contents: Vec<ContentRow> = Vec::new();
+    let mut node_children: Vec<ChildRow> = Vec::new();
+    // Per-file dedup: emit a subtree's content/child rows only on first
+    // sight. Cross-file dedup is handled by `INSERT OR IGNORE` at flush time.
+    let mut seen: HashSet<[u8; 32]> = HashSet::new();
 
     // File node.
     nodes.push(ParsedNode {
@@ -1433,31 +1791,41 @@ fn parse_file_pure(
         record: String::new(),
     });
 
-    // Root AST entry.
+    // Root AST entry — pushed pre-order with a placeholder node_hash that is
+    // patched once the fold returns the root's content address.
+    let root_kind = root.kind();
+    let root_idx = ast_entries.len();
     ast_entries.push(AstEntry {
         node_id: source_id.to_string(),
         source_id: source_id.to_string(),
-        node_kind: root.kind().to_string(),
+        node_kind: root_kind.to_string(),
         start_byte: root.start_byte(),
         end_byte: root.end_byte(),
         start_row: root.start_position().row,
         start_col: root.start_position().column,
         end_row: root.end_position().row,
         end_col: root.end_position().column,
+        node_hash: [0u8; 32],
     });
 
-    // Walk AST.
-    let mut cursor = root.walk();
-    walk_children_pure(
+    // Fold the whole tree bottom-up. Creates the `_ast`/`nodes`/refs rows
+    // for every NAMED descendant (parent-creates-child, pre-order) and the
+    // deduped `node_content`/`node_child` rows for every unique subtree.
+    let root_hash = fold_children(
         content,
-        &mut cursor,
+        root,
         source_id,
         source_id,
         language,
+        lang_name,
+        &mut seen,
         &mut nodes,
         &mut ast_entries,
         &mut refs,
+        &mut node_contents,
+        &mut node_children,
     );
+    ast_entries[root_idx].node_hash = root_hash;
 
     // Pre-serialize capnp records in the rayon worker so the post-
     // parse main-thread loop just writes pre-built byte buffers to the
@@ -1471,6 +1839,7 @@ fn parse_file_pure(
         abs_path,
         file_mtime,
         file_size,
+        &content_hash,
     )?;
     // ~150 bytes per AstNode record (canonical: id + source_id + kind +
     // Range); pre-size to avoid re-allocs during the per-node loop.
@@ -1486,125 +1855,226 @@ fn parse_file_pure(
         nodes,
         ast_entries,
         refs,
+        node_contents,
+        node_children,
         file_mtime,
         file_size,
+        content_hash,
         source_capnp_bytes,
         ast_capnp_bytes,
     })
 }
 
-/// Recursively walk named AST children, collecting into vectors.
+/// Bottom-up (post-order) fold of `node`'s subtree.
+///
+/// Returns `node`'s merkle-AST `node_hash`. As a side effect it:
+/// - creates an `_ast` occurrence row, a `nodes` row, and any extracted
+///   refs for every NAMED child (pre-order, so `_ast`/`nodes` insertion
+///   stays in sorted node_id order — the B-tree bulk-load fast path);
+/// - stamps each named child's `node_hash` onto its `_ast` row after the
+///   child's subtree is folded;
+/// - emits one deduped `node_content` row per unique subtree and the
+///   `node_child` edges of every unique internal node.
+///
+/// ALL non-`extra` children (named AND anonymous) are folded into the
+/// parent's hash in source order. Anonymous children are terminal tokens
+/// (operators/keywords/punctuation) with no children, so they never
+/// produce `_ast`/`nodes` rows — they only contribute their leaf hash.
 #[allow(clippy::too_many_arguments)]
-fn walk_children_pure(
+fn fold_children(
     content: &[u8],
-    cursor: &mut tree_sitter::TreeCursor,
-    parent_id: &str,
+    node: tree_sitter::Node,
+    node_id: &str,
     source_id: &str,
     language: TsLanguage,
+    lang_name: &str,
+    seen: &mut HashSet<[u8; 32]>,
     nodes: &mut Vec<ParsedNode>,
     ast_entries: &mut Vec<AstEntry>,
     refs: &mut Vec<ExtractedRef>,
-) {
-    let node = cursor.node();
-
+    node_contents: &mut Vec<ContentRow>,
+    node_children: &mut Vec<ChildRow>,
+) -> [u8; 32] {
+    // Gather non-extra children in source order, with tree-sitter field
+    // names, and count named children per kind (for the node_id suffix).
     let mut children: Vec<tree_sitter::Node> = Vec::new();
-    let mut kind_counts = HashMap::<&str, usize>::new();
-
-    let mut child_cursor = node.walk();
-    if child_cursor.goto_first_child() {
-        loop {
-            let child = child_cursor.node();
-            if child.is_named() {
-                *kind_counts.entry(child.kind()).or_insert(0) += 1;
-                children.push(child);
-            }
-            if !child_cursor.goto_next_sibling() {
-                break;
+    let mut fields: Vec<Option<&'static str>> = Vec::new();
+    let mut named_kind_counts = HashMap::<&str, usize>::new();
+    {
+        let mut cur = node.walk();
+        if cur.goto_first_child() {
+            loop {
+                let ch = cur.node();
+                if !ch.is_extra() {
+                    if ch.is_named() {
+                        *named_kind_counts.entry(ch.kind()).or_insert(0) += 1;
+                    }
+                    fields.push(cur.field_name());
+                    children.push(ch);
+                }
+                if !cur.goto_next_sibling() {
+                    break;
+                }
             }
         }
     }
 
+    let mut child_hashes: Vec<[u8; 32]> = Vec::with_capacity(children.len());
     let mut kind_indices = HashMap::<&str, usize>::new();
 
     for child in &children {
-        let kind = child.kind();
-        let needs_suffix = kind_counts[kind] > 1;
+        if child.is_named() {
+            let kind = child.kind();
+            let needs_suffix = named_kind_counts[kind] > 1;
+            let name = if needs_suffix {
+                let idx = kind_indices.entry(kind).or_insert(0);
+                let n = format!("{kind}_{idx}");
+                *idx += 1;
+                n
+            } else {
+                kind.to_string()
+            };
+            let id = format!("{node_id}/{name}");
 
-        let name = if needs_suffix {
-            let idx = kind_indices.entry(kind).or_insert(0);
-            let n = format!("{kind}_{idx}");
-            *idx += 1;
-            n
-        } else {
-            kind.to_string()
-        };
+            // _ast occurrence row (pre-order; node_hash patched post-fold).
+            let entry_idx = ast_entries.len();
+            ast_entries.push(AstEntry {
+                node_id: id.clone(),
+                source_id: source_id.to_string(),
+                node_kind: kind.to_string(),
+                start_byte: child.start_byte(),
+                end_byte: child.end_byte(),
+                start_row: child.start_position().row,
+                start_col: child.start_position().column,
+                end_row: child.end_position().row,
+                end_col: child.end_position().column,
+                node_hash: [0u8; 32],
+            });
 
-        let id = format!("{parent_id}/{name}");
+            // Refs via the language-dispatched factory.
+            refs.extend(extract_refs(child, content, &id, source_id, language));
 
-        ast_entries.push(AstEntry {
-            node_id: id.clone(),
-            source_id: source_id.to_string(),
-            node_kind: kind.to_string(),
-            start_byte: child.start_byte(),
-            end_byte: child.end_byte(),
-            start_row: child.start_position().row,
-            start_col: child.start_position().column,
-            end_row: child.end_position().row,
-            end_col: child.end_position().column,
-        });
-
-        // Extract refs via the language-dispatched factory.
-        let extracted = extract_refs(child, content, &id, source_id, language);
-        refs.extend(extracted);
-
-        let has_named_children = {
-            let mut c = child.walk();
-            let mut found = false;
-            if c.goto_first_child() {
-                loop {
-                    if c.node().is_named() {
-                        found = true;
-                        break;
-                    }
-                    if !c.goto_next_sibling() {
-                        break;
+            // Structural `nodes` row: kind 1 (dir-like) when the child has
+            // named children, else kind 0 (leaf) carrying its text.
+            let has_named_children = {
+                let mut c = child.walk();
+                let mut found = false;
+                if c.goto_first_child() {
+                    loop {
+                        if c.node().is_named() {
+                            found = true;
+                            break;
+                        }
+                        if !c.goto_next_sibling() {
+                            break;
+                        }
                     }
                 }
+                found
+            };
+            if has_named_children {
+                nodes.push(ParsedNode {
+                    id: id.clone(),
+                    parent_id: node_id.to_string(),
+                    name,
+                    kind: 1,
+                    size: 0,
+                    record: String::new(),
+                });
+            } else {
+                let text = child.utf8_text(content).unwrap_or("");
+                nodes.push(ParsedNode {
+                    id: id.clone(),
+                    parent_id: node_id.to_string(),
+                    name,
+                    kind: 0,
+                    size: text.len() as i64,
+                    record: text.to_string(),
+                });
             }
-            found
-        };
 
-        if has_named_children {
-            nodes.push(ParsedNode {
-                id: id.clone(),
-                parent_id: parent_id.to_string(),
-                name: name.clone(),
-                kind: 1,
-                size: 0,
-                record: String::new(),
-            });
-            let mut sub_cursor = child.walk();
-            walk_children_pure(
+            // Fold the child's subtree (all non-extra grandchildren — even
+            // when it has no NAMED children, its anonymous tokens still shape
+            // its hash), then stamp the resulting address onto the occurrence.
+            let child_hash = fold_children(
                 content,
-                &mut sub_cursor,
+                *child,
                 &id,
                 source_id,
                 language,
+                lang_name,
+                seen,
                 nodes,
                 ast_entries,
                 refs,
+                node_contents,
+                node_children,
             );
+            ast_entries[entry_idx].node_hash = child_hash;
+            child_hashes.push(child_hash);
         } else {
-            let text = child.utf8_text(content).unwrap_or("");
-            nodes.push(ParsedNode {
-                id: id.clone(),
-                parent_id: parent_id.to_string(),
-                name,
-                kind: 0,
-                size: text.len() as i64,
-                record: text.to_string(),
+            // Anonymous child: a terminal token. No _ast/nodes row — it only
+            // contributes its leaf hash to this node's fold. `node_id` is
+            // unused for anonymous nodes (terminals have no named children).
+            let child_hash = fold_children(
+                content,
+                *child,
+                "",
+                source_id,
+                language,
+                lang_name,
+                seen,
+                nodes,
+                ast_entries,
+                refs,
+                node_contents,
+                node_children,
+            );
+            child_hashes.push(child_hash);
+        }
+    }
+
+    // Compute this node's content address and emit its deduped content rows.
+    let raw_kind = node.kind();
+    let canonical = language.canonical_kind(raw_kind).unwrap_or(raw_kind);
+    if children.is_empty() {
+        // Leaf: hash the terminal token verbatim (length-prefixed, NUL-safe).
+        let token = node.utf8_text(content).unwrap_or("");
+        let h = hash_leaf(canonical, token);
+        if seen.insert(h) {
+            node_contents.push(ContentRow {
+                node_hash: h,
+                node_tag: NODE_TAG_LEAF,
+                kind: canonical.to_string(),
+                raw_kind: raw_kind.to_string(),
+                lang: lang_name.to_string(),
+                token: Some(token.to_string()),
+                arity: 0,
             });
         }
+        h
+    } else {
+        let h = hash_internal(canonical, &child_hashes);
+        if seen.insert(h) {
+            node_contents.push(ContentRow {
+                node_hash: h,
+                node_tag: NODE_TAG_INTERNAL,
+                kind: canonical.to_string(),
+                raw_kind: raw_kind.to_string(),
+                lang: lang_name.to_string(),
+                token: None,
+                arity: child_hashes.len(),
+            });
+            for (ord, (ch, field)) in child_hashes.iter().zip(&fields).enumerate() {
+                node_children.push(ChildRow {
+                    parent_hash: h,
+                    ordinal: ord,
+                    child_hash: *ch,
+                    field: field.map(|f| f.to_string()),
+                });
+            }
+        }
+        h
     }
 }
 

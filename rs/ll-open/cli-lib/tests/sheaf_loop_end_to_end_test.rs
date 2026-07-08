@@ -400,7 +400,7 @@ async fn file_change_drives_sheaf_invalidate_with_full_coarse_v1_payload() {
     //    means the emit surfaces every known region ID regardless of
     //    which files actually changed.
     let region_ids_arr = payload
-        .get("region_ids")
+        .get("invalidated")
         .expect("payload must include `region_ids`")
         .as_array()
         .expect("`region_ids` must be a JSON array");

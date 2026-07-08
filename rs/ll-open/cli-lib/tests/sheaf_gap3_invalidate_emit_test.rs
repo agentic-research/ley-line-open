@@ -286,7 +286,7 @@ async fn watcher_emits_sheaf_invalidate_with_region_payload() {
     // `Vec<u32>` populated in insertion order — the assertion sorts
     // both sides to avoid coupling to insertion order.
     let mut got_regions: Vec<u32> = payload
-        .get("region_ids")
+        .get("invalidated")
         .expect("payload must include `region_ids`")
         .as_array()
         .expect("`region_ids` must be a JSON array")
@@ -441,7 +441,7 @@ async fn watcher_emits_sheaf_invalidate_even_with_empty_topology() {
 
     let regions = evt
         .data
-        .get("region_ids")
+        .get("invalidated")
         .expect("payload must include `region_ids` even when empty")
         .as_array()
         .expect("`region_ids` must be an array");

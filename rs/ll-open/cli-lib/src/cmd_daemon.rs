@@ -206,10 +206,18 @@ pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result
 
     // 2. Initialize the living database.
     //
-    // Warm start: if the arena has a valid snapshot, deserialize it into a
-    // writable :memory: connection. This recovers state across crashes.
-    // Cold start: fresh :memory: connection + parse from --source.
-    let live_conn = match init_living_db(&ctrl_path, source, language) {
+    // Bead `ley-line-open-98fb67` (WAL adoption 15a): the living db is
+    // now file-backed at `<ctrl>.live.db` with `PRAGMA journal_mode=WAL`.
+    // Warm start: `.live.db` file already exists → reopen (WAL replay is
+    // automatic). Cold start: fresh file-backed connection + parse from
+    // `--source`; any stale `.live.db` from a prior run is unlinked when
+    // the controller shows no prior snapshot state (root == 0 sentinel).
+    //
+    // The arena remains the cross-host Σ substrate publication surface;
+    // `snapshot_to_arena` still flips it after every write burst. Only
+    // the underlying live storage swaps from `:memory:` to WAL'd file.
+    let live_db_path = live_db_path_for(&ctrl_path);
+    let live_conn = match init_living_db(&ctrl_path, &live_db_path, source, language) {
         Ok(conn) => conn,
         Err(e) => {
             state.write().unwrap().phase = DaemonPhase::Error(format!("init failed: {e:#}"));
@@ -593,28 +601,155 @@ pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result
 // Living database helpers
 // ---------------------------------------------------------------------------
 
-/// Initialize the living database.
+/// Derive the file-backed live-db path from a controller path.
 ///
-/// **Warm start**: if the arena has a valid snapshot, deserialize it into a
-/// writable `:memory:` connection, then incrementally reparse if `--source`.
-/// **Cold start**: fresh `:memory:` connection + full parse from `--source`.
+/// `foo.ctrl` → `foo.live.db`. Sibling of `<ctrl>.arena`,
+/// `<ctrl>.sock`, `<ctrl>.arena.lock`. Same naming convention
+/// as `sock_path` at line ~366 (`ctrl_path.with_extension("sock")`).
+///
+/// Bead `ley-line-open-98fb67` (WAL adoption 15a).
+pub fn live_db_path_for(ctrl_path: &Path) -> std::path::PathBuf {
+    ctrl_path.with_extension("live.db")
+}
+
+/// Configure WAL journal mode + companion pragmas on a live-db connection.
+///
+/// Load-bearing: WAL is the whole point of the 15a migration
+/// (bead `ley-line-open-98fb67`; empirical report at
+/// `docs/research/2026-05-08-workerd-wal-sqlite-experiment.md`).
+/// `journal_mode = WAL` must stick — a non-file-backed db silently
+/// returns "memory" and the migration is a no-op. Bail loudly if
+/// the return value is not `"wal"`.
+///
+/// - `journal_mode = WAL` — the win. Readers and one writer make
+///   progress concurrently; DELETE-journal serializes both.
+/// - `synchronous = NORMAL` — standard WAL pairing. `FULL` is
+///   overkill for WAL durability semantics; `OFF` would trade
+///   crash safety for throughput we already have.
+/// - `wal_autocheckpoint = 1000` — checkpoint every ~1000 pages
+///   (~4 MiB at default 4KB page size). Keeps the WAL from
+///   growing unbounded on a write-heavy daemon; ensures the
+///   main db file stays close to snapshot-consumable size for
+///   the arena publish path.
+fn configure_wal(conn: &rusqlite::Connection) -> Result<()> {
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
+        .context("set PRAGMA journal_mode=WAL")?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        anyhow::bail!(
+            "PRAGMA journal_mode=WAL did not stick — got {mode:?}. \
+             The live db must be file-backed for WAL to activate; \
+             `:memory:` connections silently ignore the pragma."
+        );
+    }
+    conn.pragma_update(None, "synchronous", "NORMAL")
+        .context("set PRAGMA synchronous=NORMAL")?;
+    conn.pragma_update(None, "wal_autocheckpoint", 1000i64)
+        .context("set PRAGMA wal_autocheckpoint=1000")?;
+    Ok(())
+}
+
+/// Best-effort unlink of `<live_db>`, `<live_db>-wal`, and `<live_db>-shm`.
+///
+/// SQLite's WAL mode maintains two sidecar files (`-wal` for the
+/// write-ahead log itself, `-shm` for the shared-memory index).
+/// Leaving them behind after unlinking the main db file makes the
+/// next open pick up corrupt state — SQLite happily replays a WAL
+/// against a fresh db file if the sidecar names match. Cleaning
+/// all three atomically is the safe reset for the cold-start branch.
+fn unlink_live_db(live_db_path: &Path) {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut candidate = live_db_path.as_os_str().to_owned();
+        candidate.push(suffix);
+        let path = std::path::PathBuf::from(candidate);
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Return `true` if the controller has no prior snapshot state — the
+/// `current_root` field is the zero sentinel `[0u8; 32]`. Any earlier
+/// `.live.db` at the derived path is orphaned from a prior experiment
+/// and must be unlinked before the cold-start parse writes to a fresh
+/// file-backed connection.
+///
+/// A controller that can't be opened (fresh disk / corrupt file) is
+/// treated as fresh — cold-start is the safe fallback in every case.
+fn controller_is_fresh(ctrl_path: &Path) -> bool {
+    match leyline_core::Controller::open_or_create(ctrl_path) {
+        Ok(c) => c.current_root() == [0u8; 32],
+        Err(_) => true,
+    }
+}
+
+/// Initialize the living database (file-backed WAL — bead
+/// `ley-line-open-98fb67` sub-bead 15a).
+///
+/// **Warm start**: `<ctrl>.live.db` exists → open it. SQLite replays
+/// any outstanding WAL on open, so state committed before the
+/// previous crash is recovered without going through the arena
+/// deserialize path. `--source` triggers an incremental reparse.
+///
+/// **Cold start**: the controller shows no prior snapshot
+/// (`current_root == 0`). Any stale `.live.db`/`-wal`/`-shm` from an
+/// earlier experiment is unlinked, then a fresh file-backed WAL
+/// connection is created. `--source` triggers a full parse.
+///
+/// The arena-deserialize warm path (`try_warm_start`) is retained
+/// as a fallback for the rare case where the controller has state
+/// but the `.live.db` file is missing (external delete, disk
+/// reprovision, etc.). It hydrates the WAL db from the arena's
+/// active buffer, giving 15a a path back to a good state in exactly
+/// the same failure modes the pre-15a implementation handled.
 fn init_living_db(
     ctrl_path: &Path,
+    live_db_path: &Path,
     source: Option<&Path>,
     language: Option<&str>,
 ) -> Result<rusqlite::Connection> {
-    // Try warm start from arena.
-    if let Some(conn) = try_warm_start(ctrl_path)? {
-        eprintln!("warm start from arena");
+    // Truly fresh controller → discard any orphan `.live.db` before
+    // opening. Skipping this leaves stale rows from a prior daemon
+    // lifecycle in the freshly-parsed db.
+    if controller_is_fresh(ctrl_path) && live_db_path.exists() {
+        eprintln!(
+            "cold start: unlinking stale live db at {} (controller has no prior snapshot)",
+            live_db_path.display(),
+        );
+        unlink_live_db(live_db_path);
+    }
+
+    if live_db_path.exists() {
+        // Warm start: reopen the file-backed WAL db. SQLite replays
+        // any outstanding WAL on first open; no arena deserialize.
+        let conn = rusqlite::Connection::open(live_db_path)
+            .with_context(|| format!("open live db {}", live_db_path.display()))?;
+        configure_wal(&conn)?;
+        eprintln!("warm start from {}", live_db_path.display());
         if let Some(source_dir) = source {
             run_initial_parse(&conn, source_dir, language, "incremental reparse")?;
         }
         return Ok(conn);
     }
 
-    // Cold start: fresh :memory: connection.
-    eprintln!("cold start");
-    let conn = rusqlite::Connection::open_in_memory().context("open :memory: connection")?;
+    // `.live.db` is missing. Two possibilities:
+    //   (a) Controller has arena state (`current_root != 0`) — the
+    //       file was deleted out from under us. Fall back to the
+    //       pre-15a arena-deserialize warm path, but hydrate into a
+    //       fresh file-backed WAL connection so subsequent snapshots
+    //       and reads stay on the 15a substrate.
+    //   (b) Controller is fresh — cold start.
+    if let Some(conn) = try_warm_start_from_arena(ctrl_path, live_db_path)? {
+        eprintln!("warm start from arena → {}", live_db_path.display());
+        if let Some(source_dir) = source {
+            run_initial_parse(&conn, source_dir, language, "incremental reparse")?;
+        }
+        return Ok(conn);
+    }
+
+    // Cold start: fresh file-backed WAL connection.
+    eprintln!("cold start at {}", live_db_path.display());
+    let conn = rusqlite::Connection::open(live_db_path)
+        .with_context(|| format!("open live db {}", live_db_path.display()))?;
+    configure_wal(&conn)?;
 
     if let Some(source_dir) = source {
         run_initial_parse(&conn, source_dir, language, "parsing")?;
@@ -643,11 +778,25 @@ fn run_initial_parse(
     Ok(())
 }
 
-/// Try to restore the living db from the arena's active buffer.
-/// Returns `None` if the arena doesn't exist or has no valid data.
-fn try_warm_start(ctrl_path: &Path) -> Result<Option<rusqlite::Connection>> {
-    use std::io::Cursor;
-
+/// Try to restore the living db from the arena's active buffer into a
+/// **file-backed WAL connection** at `live_db_path`.
+///
+/// Returns `None` if the arena doesn't exist or has no valid data. In
+/// the WAL adoption (bead `ley-line-open-98fb67`), this path is a
+/// fallback for the rare case where the controller has state but
+/// `.live.db` is missing (external delete, disk reprovision, etc.).
+/// The common warm-start hits the `.live.db` file directly and never
+/// reaches this function.
+///
+/// Hydration approach: an arena buffer IS a full SQLite file image
+/// (produced by `sqlite3_serialize`). Copy the bytes into a temp file
+/// alongside `live_db_path`, rename atomically, then open with WAL
+/// pragma. This avoids the `sqlite3_deserialize`-into-memory pattern
+/// that would leave a `:memory:` connection (defeating 15a's purpose).
+fn try_warm_start_from_arena(
+    ctrl_path: &Path,
+    live_db_path: &Path,
+) -> Result<Option<rusqlite::Connection>> {
     // Two classes of "fall through to cold start":
     //   - FRESH state (no warm data exists yet): return Ok(None) silently.
     //     These are normal first-launch / fresh-ctrl conditions.
@@ -721,15 +870,28 @@ fn try_warm_start(ctrl_path: &Path) -> Result<Option<rusqlite::Connection>> {
         return Ok(None);
     }
 
-    // Deserialize as writable :memory: connection.
-    let mut conn = rusqlite::Connection::open_in_memory()?;
-    conn.deserialize_read_exact(
-        "main",
-        Cursor::new(buf),
-        buf.len(),
-        false, // writable
-    )
-    .context("warm start: sqlite3_deserialize failed")?;
+    // Hydrate `.live.db` from the arena bytes. Write to a `.tmp` sibling
+    // and rename to make the swap atomic — a crash mid-write leaves the
+    // next daemon boot with a coherent state (either the old file or no
+    // file at all, never a torn write).
+    let mut tmp_os = live_db_path.as_os_str().to_owned();
+    tmp_os.push(".hydrate.tmp");
+    let tmp_path = std::path::PathBuf::from(tmp_os);
+    // Clean up any leftover from a prior failed hydrate.
+    let _ = std::fs::remove_file(&tmp_path);
+    std::fs::write(&tmp_path, buf)
+        .with_context(|| format!("write hydrated live db to {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, live_db_path).with_context(|| {
+        format!(
+            "rename hydrated live db {} → {}",
+            tmp_path.display(),
+            live_db_path.display(),
+        )
+    })?;
+
+    let conn = rusqlite::Connection::open(live_db_path)
+        .with_context(|| format!("open hydrated live db {}", live_db_path.display()))?;
+    configure_wal(&conn)?;
 
     // T2.4: log the new substrate identity (current_root prefix) on
     // recovery. Generation is gone from the public API.
@@ -1566,23 +1728,26 @@ mod tests {
     fn warm_start_returns_none_on_missing_ctrl() {
         let dir = TempDir::new().unwrap();
         let ctrl = dir.path().join("nonexistent.ctrl");
+        let live_db = live_db_path_for(&ctrl);
         // No file exists yet — Controller::open_or_create will create one,
         // but it'll be empty (no arena_path). Should fall through cleanly.
-        let result = try_warm_start(&ctrl).unwrap();
+        let result = try_warm_start_from_arena(&ctrl, &live_db).unwrap();
         assert!(result.is_none(), "missing-ctrl path should return None");
     }
 
     #[test]
     fn warm_start_returns_none_on_corrupted_ctrl() {
-        // Garbage ctrl: try_warm_start MUST NOT panic and MUST return
-        // None so cold start remains a safe fallback. The fix (5f7100-6)
-        // logs a warn alongside the None — captured behavior is unchanged
-        // from the caller's perspective; the new visibility is in the log.
+        // Garbage ctrl: try_warm_start_from_arena MUST NOT panic and
+        // MUST return None so cold start remains a safe fallback. The
+        // fix (5f7100-6) logs a warn alongside the None — captured
+        // behavior is unchanged from the caller's perspective; the new
+        // visibility is in the log.
         let dir = TempDir::new().unwrap();
         let ctrl = dir.path().join("corrupt.ctrl");
+        let live_db = live_db_path_for(&ctrl);
         std::fs::write(&ctrl, b"\x00\x01\x02 not a valid controller \xff\xfe").unwrap();
 
-        let result = try_warm_start(&ctrl);
+        let result = try_warm_start_from_arena(&ctrl, &live_db);
         match result {
             Ok(None) => {}
             Ok(Some(_)) => panic!("garbage ctrl should not produce a usable connection"),
@@ -1790,13 +1955,261 @@ mod tests {
         // silently — pin for 5f7100-6).
         let dir = TempDir::new().unwrap();
         let ctrl = dir.path().join("orphan.ctrl");
+        let live_db = live_db_path_for(&ctrl);
         let mut c = leyline_core::Controller::open_or_create(&ctrl).unwrap();
         c.set_arena("/tmp/cloister-no-such-arena-xyzzy", 1024 * 1024)
             .unwrap();
         drop(c);
 
-        let result = try_warm_start(&ctrl).unwrap();
+        let result = try_warm_start_from_arena(&ctrl, &live_db).unwrap();
         assert!(result.is_none(), "missing-arena path should return None");
+    }
+
+    // ── 15a: file-backed WAL live_db invariants ─────────────────────────
+    //
+    // Bead `ley-line-open-98fb67` sub-bead 15a: the daemon's living db
+    // must be file-backed with WAL journaling. These tests pin the
+    // load-bearing invariants at the helper level; the integration
+    // suite (tests/wal_live_db.rs) exercises them via a full daemon
+    // spawn.
+
+    #[test]
+    fn live_db_path_derives_from_ctrl_path() {
+        // Sibling-of-ctrl naming keeps arena / ctrl / sock / lock /
+        // live.db co-located so `--arena` alone locates every artifact.
+        let path = Path::new("/tmp/foo.ctrl");
+        assert_eq!(
+            live_db_path_for(path),
+            std::path::PathBuf::from("/tmp/foo.live.db"),
+        );
+    }
+
+    #[test]
+    fn configure_wal_activates_wal_on_file_backed_connection() {
+        // The 15a load-bearing check: PRAGMA journal_mode=WAL must
+        // return "wal" on a file-backed connection. A regression here
+        // (`:memory:` sneaking back in, forgotten pragma, etc.) is
+        // exactly the failure mode the empirical report warned about.
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("wal_test.live.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        configure_wal(&conn).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal", "journal_mode must stick as WAL");
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        // synchronous=NORMAL is the numeric value 1.
+        assert_eq!(synchronous, 1, "synchronous must be NORMAL (=1)");
+        let autocheckpoint: i64 = conn
+            .query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(autocheckpoint, 1000, "wal_autocheckpoint must be 1000");
+    }
+
+    #[test]
+    fn configure_wal_bails_on_in_memory_connection() {
+        // `:memory:` silently ignores journal_mode=WAL (returns "memory").
+        // The empirical report documented this footgun at length; the
+        // helper MUST refuse to proceed rather than silently no-op.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let err = configure_wal(&conn).expect_err(":memory: must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("did not stick"),
+            "error must name the failure mode; got: {msg}",
+        );
+    }
+
+    #[test]
+    fn unlink_live_db_removes_sidecars() {
+        // WAL leaves `-wal` and `-shm` sidecars next to the main db.
+        // The cold-start reset must clear all three; leaving `-wal`
+        // behind lets SQLite replay a stale write-ahead log against
+        // the next fresh db file at the same path.
+        let dir = TempDir::new().unwrap();
+        let live_db = dir.path().join("cleanup.live.db");
+        // Seed all three files.
+        std::fs::write(&live_db, b"stub main db").unwrap();
+        std::fs::write(dir.path().join("cleanup.live.db-wal"), b"stub wal").unwrap();
+        std::fs::write(dir.path().join("cleanup.live.db-shm"), b"stub shm").unwrap();
+
+        unlink_live_db(&live_db);
+
+        assert!(!live_db.exists(), "main db must be gone");
+        assert!(
+            !dir.path().join("cleanup.live.db-wal").exists(),
+            "-wal sidecar must be gone (stale WAL replay = corruption)",
+        );
+        assert!(
+            !dir.path().join("cleanup.live.db-shm").exists(),
+            "-shm sidecar must be gone",
+        );
+    }
+
+    #[test]
+    fn init_living_db_cold_start_creates_wal_file() {
+        // Pure cold start: no ctrl file, no live.db, no source. Should
+        // create the live.db and activate WAL.
+        let dir = TempDir::new().unwrap();
+        let ctrl = dir.path().join("cold.ctrl");
+        let live_db = live_db_path_for(&ctrl);
+        assert!(!live_db.exists(), "pre-condition: live.db must not exist");
+
+        let conn = init_living_db(&ctrl, &live_db, None, None).unwrap();
+        assert!(live_db.exists(), "cold start must create live.db");
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            mode.to_lowercase(),
+            "wal",
+            "cold-start connection must be in WAL mode",
+        );
+    }
+
+    #[test]
+    fn init_living_db_cold_start_unlinks_stale_live_db_when_ctrl_is_fresh() {
+        // Fresh controller + stale live.db (from a prior experiment):
+        // the file must be unlinked so cold-start writes to a clean db.
+        let dir = TempDir::new().unwrap();
+        let ctrl = dir.path().join("stale.ctrl");
+        let live_db = live_db_path_for(&ctrl);
+        // Seed a stale file with sentinel content.
+        std::fs::write(&live_db, b"stale content from an earlier run").unwrap();
+        let stale_len_before = std::fs::metadata(&live_db).unwrap().len();
+
+        let _conn = init_living_db(&ctrl, &live_db, None, None).unwrap();
+        let fresh_len = std::fs::metadata(&live_db).unwrap().len();
+        assert_ne!(
+            fresh_len, stale_len_before,
+            "stale file must be replaced (bytes should differ from the stub)",
+        );
+        // The new file must be a valid SQLite db — sqlite header magic
+        // string starts with "SQLite format 3\0".
+        let bytes = std::fs::read(&live_db).unwrap();
+        assert!(
+            bytes.starts_with(b"SQLite format 3\0"),
+            "cold-start live.db must be a valid SQLite database file",
+        );
+    }
+
+    #[test]
+    fn init_living_db_warm_start_reopens_existing_live_db() {
+        // Set up: cold-start the daemon once, insert a sentinel row,
+        // close. Then re-init — must NOT unlink (controller is fresh
+        // when there's no snapshot, so we simulate the "warm" path by
+        // running with a controller that has a non-zero root, per the
+        // controller_is_fresh check). Approximation: skip snapshot,
+        // just verify the reopen preserves state under the fresh
+        // controller check-and-unlink path. This test uses the actual
+        // conditional: if the file exists AND controller is not fresh,
+        // reopen; otherwise unlink first.
+        //
+        // To simulate a non-fresh controller, we set an arena_root
+        // via test-only Controller helper. If none exists (they do —
+        // set_arena_with_root), we skip. The whole flow is exercised
+        // end-to-end in the integration test.
+        let dir = TempDir::new().unwrap();
+        let ctrl_path = dir.path().join("warm.ctrl");
+        let live_db = live_db_path_for(&ctrl_path);
+
+        // Cold start creates live.db with WAL.
+        {
+            let conn = init_living_db(&ctrl_path, &live_db, None, None).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sentinel (id INTEGER PRIMARY KEY);
+                 INSERT INTO sentinel VALUES (42);",
+            )
+            .unwrap();
+            drop(conn);
+        }
+
+        // Fake "warm restart" by publishing a non-zero root into ctrl,
+        // then re-init. The published root makes controller_is_fresh()
+        // return false, so the stale-file unlink is skipped and the
+        // existing live.db is reopened.
+        {
+            let mut c = leyline_core::Controller::open_or_create(&ctrl_path).unwrap();
+            // Register a dummy arena path so set_arena_with_root has a
+            // valid target; then advance the root off zero.
+            let fake_arena = dir.path().join("warm.arena");
+            let _ = leyline_core::create_arena(&fake_arena, 64 * 1024).unwrap();
+            let mut root = [0u8; 32];
+            root[0] = 0xAB;
+            c.set_arena_with_root(&fake_arena.to_string_lossy(), 64 * 1024, root)
+                .unwrap();
+            drop(c);
+        }
+
+        let conn = init_living_db(&ctrl_path, &live_db, None, None).unwrap();
+        let sentinel: i64 = conn
+            .query_row("SELECT id FROM sentinel", [], |r| r.get(0))
+            .expect("warm start must preserve sentinel row");
+        assert_eq!(sentinel, 42, "warm start must reopen existing live.db");
+    }
+
+    #[test]
+    fn snapshot_to_arena_works_with_wal_backed_connection() {
+        // Load-bearing 15a invariant (per bead ley-line-open-98fb67):
+        // `snapshot_to_arena` calls `conn.serialize("main")` on the
+        // live db. The empirical report warned that `serialize()` may
+        // require an exclusive write txn — if WAL breaks that,
+        // snapshots break, and the whole substrate publish path
+        // silently regresses.
+        //
+        // Verify: create a WAL-mode file-backed connection, insert
+        // rows, snapshot to arena, verify the arena current_root
+        // advances to a non-zero fingerprint of the serialized bytes.
+        let dir = TempDir::new().unwrap();
+        let arena_path = dir.path().join("snap.arena");
+        let ctrl_path = dir.path().join("snap.ctrl");
+        let live_db_path = live_db_path_for(&ctrl_path);
+
+        // Fresh arena + controller registration (mirrors setup_arena).
+        let _mmap = leyline_core::create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
+        {
+            let mut c = leyline_core::Controller::open_or_create(&ctrl_path).unwrap();
+            c.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024)
+                .unwrap();
+        }
+
+        // File-backed WAL live db + rows to make the snapshot non-trivial.
+        let conn = init_living_db(&ctrl_path, &live_db_path, None, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE snap_rows (id INTEGER PRIMARY KEY, payload TEXT);
+             INSERT INTO snap_rows (payload) VALUES ('one'), ('two'), ('three');",
+        )
+        .unwrap();
+
+        // Pre: current_root is the zero sentinel.
+        let root_before = {
+            let c = leyline_core::Controller::open_or_create(&ctrl_path).unwrap();
+            c.current_root()
+        };
+        assert_eq!(root_before, [0u8; 32], "pre-snapshot root must be zero");
+
+        // The load-bearing call — this is what would blow up if
+        // serialize() + WAL didn't compose.
+        snapshot_to_arena(&conn, &ctrl_path).expect("snapshot_to_arena on WAL'd db");
+
+        // Post: current_root must have advanced off zero.
+        let root_after = {
+            let c = leyline_core::Controller::open_or_create(&ctrl_path).unwrap();
+            c.current_root()
+        };
+        assert_ne!(
+            root_after, [0u8; 32],
+            "snapshot must publish a non-zero root"
+        );
+
+        // And the live db is still queryable — snapshot didn't close/poison it.
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM snap_rows", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3, "live db must remain queryable after snapshot");
     }
 
     /// DaemonExt that records every VCS hook invocation.

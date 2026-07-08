@@ -145,10 +145,19 @@ Same caveat as link 6: this is reachable only when mache (or another consumer) d
 
 ### Gap 4: `on_files_changed` / `on_head_changed` are no-op stubs (adjacent to link 3)
 
-- **Current state:** `DaemonExt::on_files_changed` (`daemon/ext.rs:73`) and `on_head_changed` (`:67`) are empty defaults. The private repo can override, but OSS LLO has no override.
-- **What's missing:** Either (a) delete the hooks (the file-changed event already covers the same signal and can be subscribed to from any extension), or (b) wire the OSS default to call into enrichment / sheaf-invalidate so the OSS repo has the same loop the private repo does.
-- **Effort:** S. This is really a subset of Gap 1 — the hook is the seam Gap 1 would fill.
-- **Recommended follow-up bead scope:** Roll into Gap 1's follow-up. No separate bead needed.
+- **Current state (audit):** `DaemonExt::on_files_changed` (`daemon/ext.rs:73`) and `on_head_changed` (`:67`) are empty defaults. The private repo can override, but OSS LLO has no override.
+- **What's missing (audit):** Either (a) delete the hooks (the file-changed event already covers the same signal and can be subscribed to from any extension), or (b) wire the OSS default to call into enrichment / sheaf-invalidate so the OSS repo has the same loop the private repo does.
+
+**Resolution (2026-07-08, post-gap-1)** — Path (c): the hooks stay as extension seams for private-repo-specific side-effects; OSS's invalidation loop is wired DIRECTLY in `git_watch_loop` (gap 1 landed via PR #138) rather than routing through the hook.
+
+Docstring updated 2026-07-08 to make the extension-seam vs OSS-loop distinction explicit. See `rs/ll-open/cli-lib/src/daemon/ext.rs` line 61+ — both hooks now carry a "Relationship to the OSS sheaf-invalidation loop" section clarifying that:
+
+- OSS invalidation is direct — watcher → enrichment → sheaf.invalidate emit
+- These hooks fire ALONGSIDE the OSS loop, not through it
+- Private-repo extensions may use them for their own side-effects
+- Default no-op reflects the correct OSS behavior (OSS has no work to do here)
+
+No code change beyond docstrings. Marketing claim ("moat is closed inside LLO") is now defensible without asterisk on this gap.
 
 ## Marketing implication
 

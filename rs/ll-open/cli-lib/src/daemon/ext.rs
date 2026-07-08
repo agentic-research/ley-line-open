@@ -58,18 +58,41 @@ pub trait DaemonExt: Send + Sync {
         vec![]
     }
 
-    /// Called when the source repo's HEAD commit changes (e.g. branch switch,
-    /// new commit). Use to invalidate VCS-keyed caches in the extension.
+    /// **Extension seam** — called when the source repo's HEAD commit
+    /// changes (e.g. branch switch, new commit). Use to invalidate
+    /// VCS-keyed caches in the extension.
     ///
-    /// `old_sha` may be empty on first transition. The same information is
-    /// also emitted as a `daemon.head.changed` event — extensions can use
-    /// either pattern.
+    /// `old_sha` may be empty on first transition. The same information
+    /// is also emitted as a `daemon.head.changed` event — extensions
+    /// can use either pattern.
+    ///
+    /// ## Relationship to the OSS sheaf-invalidation loop
+    ///
+    /// This hook is NOT part of the OSS invalidation loop (bead
+    /// `ley-line-open-a3f764` audit + gaps 1-3). The OSS watcher wires
+    /// enrichment + `daemon.sheaf.invalidate` directly inside
+    /// `git_watch_loop`; it does not route through this hook. That's
+    /// deliberate — the OSS loop must be observable end-to-end from
+    /// the OSS codebase alone.
+    ///
+    /// Private-repo extensions may use this hook for extension-
+    /// specific side-effects (e.g., private telemetry, subscribing
+    /// external services). It fires ALONGSIDE the OSS loop, not
+    /// through it. Default is a no-op because OSS has no work to do
+    /// here beyond what the watcher already does inline.
     fn on_head_changed(&self, _old_sha: &str, _new_sha: &str) {}
 
-    /// Called when the source repo's dirty file set changes (file edits,
-    /// adds, removes). `paths` is the new dirty set in full — not a delta.
+    /// **Extension seam** — called when the source repo's dirty file
+    /// set changes (file edits, adds, removes). `paths` is the new
+    /// dirty set in full — not a delta.
     ///
     /// Mirrors the `daemon.files.changed` event payload.
+    ///
+    /// See `on_head_changed` for the OSS-loop-vs-extension-seam
+    /// distinction (both hooks share the same design). OSS's
+    /// invalidation loop is wired directly in `git_watch_loop`, not
+    /// through this hook; private extensions may use it for their own
+    /// side-effects. Default is a no-op.
     fn on_files_changed(&self, _paths: &[String]) {}
 
     /// Provide a custom text embedder. The returned embedder is used both

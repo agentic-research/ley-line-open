@@ -17,7 +17,7 @@
 //! `serde_json::Value`-driven) and adapted to OSS LLO's typed [`BaseRequest`]
 //! dispatch + capnp-json response builders.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -57,6 +57,21 @@ pub struct SheafState {
     /// `sheaf.topology` / `sheaf.invalidate` events flow through the
     /// ADR-010 event bus. `None` while the daemon is still wiring up.
     emitter: Mutex<Option<EventEmitter>>,
+    /// Region ID → token label mapping, produced by
+    /// [`crate::daemon::complex_build_pass::ComplexBuildPass`] alongside
+    /// its `CellComplex` build. Load-bearing for sheaf gap 3 follow-up
+    /// (bead `ley-line-open-e40566`): the watcher's fine-grained
+    /// `daemon.sheaf.invalidate` diff maps `changed_files` to a subset
+    /// of `region_ids` by matching labels of shape `<path>` or
+    /// `<path>:sym:<NAME>` against the changed file set. Empty when no
+    /// enrichment pass has produced labels yet — that's the coarse-v1
+    /// fallback signal (`scope: "all-known"`).
+    ///
+    /// Held under its own mutex (not the cache mutex) because the
+    /// watcher-driven emit reads it AFTER releasing the cache lock to
+    /// keep the sheaf critical section tight. See
+    /// [`SheafState::regions_touching_files`] for the read path.
+    region_labels: Mutex<HashMap<u32, String>>,
 }
 
 impl Default for SheafState {
@@ -72,6 +87,7 @@ impl SheafState {
             tracker: Mutex::new(CoChangeTracker::default()),
             edges: Mutex::new(Vec::new()),
             emitter: Mutex::new(None),
+            region_labels: Mutex::new(HashMap::new()),
         }
     }
 
@@ -121,6 +137,128 @@ impl SheafState {
             let mut t = self.tracker.lock().expect("tracker mutex poisoned");
             *t = tracker;
         }
+        // Reset any stale region → label mapping. A caller that has
+        // labels for the freshly-installed complex must call
+        // [`install_region_labels`] separately after this. Clearing
+        // here is defensive — a mache-pushed topology (via
+        // `op_sheaf_set_topology`) never carries labels, so if a
+        // prior daemon-built complex had labels installed and mache
+        // then pushed its own, the fine-grained diff would otherwise
+        // map old labels to node IDs that mean something entirely
+        // different in the new topology.
+        {
+            let mut labels = self
+                .region_labels
+                .lock()
+                .expect("region_labels mutex poisoned");
+            labels.clear();
+        }
+    }
+
+    /// Install a `region_id → token label` map for the currently-
+    /// installed complex. Load-bearing for sheaf gap 3 follow-up (bead
+    /// `ley-line-open-e40566`): with labels installed, the watcher-
+    /// driven `daemon.sheaf.invalidate` payload becomes a fine-grained
+    /// diff — `region_ids` names only the regions whose labels match
+    /// the `changed_files` (either as an exact path or as
+    /// `<path>:sym:<NAME>`). Without labels the emit falls back to the
+    /// coarse-v1 `scope: "all-known"` shape (bead
+    /// `ley-line-open-3b3476`).
+    ///
+    /// Called by [`crate::daemon::complex_build_pass::ComplexBuildPass`]
+    /// after [`install_complex`] with the observation-pass token→id
+    /// map inverted to id→token — the daemon owns this mapping because
+    /// it already owns the observation table that produces the
+    /// labelled tokens. Consumer-pushed topologies (mache) don't touch
+    /// this map; they get the fallback path by construction, matching
+    /// the ADR-0026 "daemon-owned mapping" (Path A) contract.
+    ///
+    /// Idempotent — replaces any prior labels wholesale so a re-run of
+    /// `ComplexBuildPass` never leaks a stale token that vanished from
+    /// the observation table between passes.
+    pub fn install_region_labels(&self, labels: HashMap<u32, String>) {
+        let mut slot = self
+            .region_labels
+            .lock()
+            .expect("region_labels mutex poisoned");
+        *slot = labels;
+    }
+
+    /// Compute the fine-grained region diff for a set of `changed_files`.
+    ///
+    /// Returns `Some(region_ids)` when the daemon has installed labels
+    /// (via [`install_region_labels`]) — the vec contains every region
+    /// whose token label either equals one of `changed_files` (bare
+    /// path token) or begins with `<file>:sym:` (a `path:sym:<NAME>`
+    /// citation). Returns an empty vec when labels are present but no
+    /// region touches the changed set — that's still a legitimate diff
+    /// outcome ("nothing structural moved") and the watcher emit uses
+    /// it to fire `scope: "changed-only"` with empty `region_ids` so
+    /// consumers see the generation bump without over-evicting.
+    ///
+    /// Returns `None` when no labels are installed. That's the signal
+    /// the watcher emit uses to fall back to coarse-v1 semantics
+    /// (`scope: "all-known"`), matching the pre-e40566 behaviour so
+    /// mache-pushed topologies and fresh-startup daemons remain
+    /// backward-compatible.
+    ///
+    /// Cross-checks the label set against the currently-installed
+    /// [`CellComplex`]: only regions whose IDs are present in the
+    /// complex's `nodes` are returned. Filters out labels that
+    /// survived from an earlier install if the caller forgot to
+    /// clear them — belt-and-braces, since [`install_complex`]
+    /// clears labels explicitly.
+    ///
+    /// Lock ordering: acquires `region_labels`, then `cache`
+    /// sequentially, dropping each guard before the next. Callers
+    /// (`emit_watcher_sheaf_invalidate`) must not be holding either
+    /// mutex when they invoke this.
+    pub fn regions_touching_files(&self, changed_files: &[String]) -> Option<Vec<u32>> {
+        let labels = self
+            .region_labels
+            .lock()
+            .expect("region_labels mutex poisoned");
+        if labels.is_empty() {
+            // No labels installed → caller falls back to `"all-known"`.
+            return None;
+        }
+        // Filter to the current complex's node set so stale labels
+        // can't leak into the payload.
+        //
+        // `cache.complex()?` treats "no complex installed" as "no
+        // diff computable" so the caller falls back to `"all-known"`
+        // with an empty region set. Labels-without-complex is a
+        // degenerate state (prior complex cleared without also
+        // clearing labels — shouldn't happen but the emit shouldn't
+        // hallucinate region IDs from thin air).
+        let live_nodes: HashSet<u32> = {
+            let cache = self.cache.lock().expect("cache mutex poisoned");
+            let cx = cache.complex()?;
+            cx.nodes.iter().copied().collect()
+        };
+        // Build a `<file>:sym:` prefix set once so the O(regions ×
+        // files) scan can bail on prefix match without re-allocating
+        // per-region. `changed_files` empty is a valid diff — the
+        // watcher fires for a topology-only change with no file scope
+        // (e.g. HEAD-only movement), and every region will fail both
+        // predicates so the result is an empty vec, matching the
+        // "changed-only with nothing touched" contract.
+        let prefixes: Vec<String> = changed_files.iter().map(|f| format!("{f}:sym:")).collect();
+
+        let mut out: Vec<u32> = labels
+            .iter()
+            .filter(|(rid, _)| live_nodes.contains(rid))
+            .filter_map(|(&rid, label)| {
+                let matches = changed_files.iter().any(|f| f == label)
+                    || prefixes.iter().any(|p| label.starts_with(p));
+                if matches { Some(rid) } else { None }
+            })
+            .collect();
+        // Sort for deterministic wire output — consumers can
+        // pattern-match on ordering without depending on HashMap
+        // iteration order (which changes across runs).
+        out.sort_unstable();
+        Some(out)
     }
 
     fn emit(&self, topic: &str, data: serde_json::Value) {
@@ -347,6 +485,20 @@ pub fn op_sheaf_set_topology(
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
+    }
+
+    // Wipe region labels — a consumer-pushed topology (mache Louvain
+    // regions) has region IDs that mean something entirely different
+    // from any prior daemon-owned observation-derived labels. Leaving
+    // stale labels would let the watcher-driven fine-grained diff
+    // (bead `ley-line-open-e40566`) map old tokens to unrelated
+    // consumer-region IDs and emit garbage. The intended behaviour
+    // for a mache-pushed topology is coarse-v1 fallback
+    // (`scope: "all-known"`), which is what happens when the labels
+    // map is empty.
+    {
+        let mut labels = state.region_labels.lock().unwrap();
+        labels.clear();
     }
 
     drop(cache);
@@ -986,6 +1138,193 @@ mod tests {
             .expect("δ⁰ mode must attach a backing CellComplex");
         assert_eq!(cx.nodes.len(), 2);
         assert_eq!(cx.edges.len(), 1);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Sheaf gap 3 follow-up (bead `ley-line-open-e40566`): unit
+    // coverage for the fine-grained-diff accessor + its interaction
+    // with topology-swap paths. The end-to-end wire is pinned by
+    // tests/sheaf_gap3_invalidate_emit_test.rs; this section pins
+    // the state-machine transitions themselves.
+    // ─────────────────────────────────────────────────────────────
+
+    fn seed_complex_with_ids(state: &SheafState, ids: &[u32]) {
+        let mut cx = CellComplex::new(1);
+        for &rid in ids {
+            cx.add_node(rid, vec![0.0]);
+        }
+        state.install_complex(cx, CoChangeTracker::default());
+    }
+
+    #[test]
+    fn regions_touching_files_returns_none_when_no_labels_installed() {
+        // Coarse-v1 fallback signal: without labels the diff cannot
+        // be computed; `emit_watcher_sheaf_invalidate` reads this
+        // `None` as "fall back to all-known". Even installing a
+        // complex must NOT satisfy the accessor — labels are the
+        // load-bearing signal, not the complex.
+        let state = SheafState::new();
+        seed_complex_with_ids(&state, &[1, 2, 3]);
+        let out = state.regions_touching_files(&["src/foo.rs".to_string()]);
+        assert!(
+            out.is_none(),
+            "no labels installed → must return None; got {out:?}",
+        );
+    }
+
+    #[test]
+    fn regions_touching_files_matches_bare_path_and_sym_prefix() {
+        // Load-bearing predicates: (1) label == changed_file
+        // matches, (2) label starts with `changed_file:sym:`
+        // matches. Regions with either shape land in the diff;
+        // labels for a different file do not.
+        let state = SheafState::new();
+        seed_complex_with_ids(&state, &[10, 20, 30]);
+        let mut labels: HashMap<u32, String> = HashMap::new();
+        labels.insert(10, "src/foo.rs".to_string());
+        labels.insert(20, "src/foo.rs:sym:frobnicate".to_string());
+        labels.insert(30, "src/bar.rs".to_string());
+        state.install_region_labels(labels);
+
+        let mut got = state
+            .regions_touching_files(&["src/foo.rs".to_string()])
+            .expect("labels installed → must return Some");
+        got.sort();
+        assert_eq!(
+            got,
+            vec![10, 20],
+            "bare path AND `<file>:sym:` prefix must both match; got {got:?}",
+        );
+    }
+
+    #[test]
+    fn regions_touching_files_returns_empty_vec_for_untouched_file() {
+        // Labels installed, changed file matches nothing → Some(empty).
+        // The emit path uses this to fire `scope: "changed-only"`
+        // with an empty region set, honestly reporting "nothing
+        // structural moved" instead of over-evicting.
+        let state = SheafState::new();
+        seed_complex_with_ids(&state, &[10]);
+        let mut labels: HashMap<u32, String> = HashMap::new();
+        labels.insert(10, "src/foo.rs".to_string());
+        state.install_region_labels(labels);
+
+        let got = state
+            .regions_touching_files(&["docs/README.md".to_string()])
+            .expect("labels installed → must return Some even on empty diff");
+        assert!(
+            got.is_empty(),
+            "no label matches → empty diff, not None; got {got:?}",
+        );
+    }
+
+    #[test]
+    fn regions_touching_files_filters_stale_labels_against_current_complex() {
+        // Belt-and-braces defence: if labels somehow reference IDs
+        // not in the current complex (a broken install path, a race
+        // between complex swap and label re-install), the accessor
+        // must NOT hallucinate those IDs into the diff. Only region
+        // IDs present in the complex's `nodes` are returned.
+        let state = SheafState::new();
+        seed_complex_with_ids(&state, &[10]); // complex only knows 10
+        let mut labels: HashMap<u32, String> = HashMap::new();
+        labels.insert(10, "src/foo.rs".to_string());
+        labels.insert(999, "src/foo.rs".to_string()); // stale — not in complex
+        state.install_region_labels(labels);
+
+        let got = state
+            .regions_touching_files(&["src/foo.rs".to_string()])
+            .expect("labels installed → must return Some");
+        assert_eq!(
+            got,
+            vec![10],
+            "stale label for region 999 must be filtered out; got {got:?}",
+        );
+    }
+
+    #[test]
+    fn install_complex_clears_prior_region_labels() {
+        // A fresh complex swap MUST clear the label map — otherwise
+        // mache pushing its own topology via `op_sheaf_set_topology`
+        // would leak stale daemon-side labels into a consumer-side
+        // region-ID space, and the fine-grained diff would emit
+        // garbage IDs the consumer doesn't recognize.
+        let state = SheafState::new();
+        seed_complex_with_ids(&state, &[10]);
+        let mut labels: HashMap<u32, String> = HashMap::new();
+        labels.insert(10, "src/foo.rs".to_string());
+        state.install_region_labels(labels);
+        // First check: labels ARE live.
+        assert!(
+            state
+                .regions_touching_files(&["src/foo.rs".to_string()])
+                .is_some()
+        );
+
+        // Now swap the complex — this must reset labels to empty.
+        seed_complex_with_ids(&state, &[42]);
+        assert!(
+            state
+                .regions_touching_files(&["src/foo.rs".to_string()])
+                .is_none(),
+            "install_complex must clear region_labels — otherwise stale \
+             labels leak into the next topology's diff"
+        );
+    }
+
+    #[test]
+    fn set_topology_op_clears_prior_region_labels() {
+        // Same clear invariant as `install_complex`, but for the
+        // consumer-driven path. Mache's `op_sheaf_set_topology`
+        // NEVER installs labels (it's the coarse fallback path by
+        // design), so any residual daemon-owned labels must be
+        // wiped when a consumer pushes its own topology.
+        let state = SheafState::new();
+        seed_complex_with_ids(&state, &[10]);
+        let mut labels: HashMap<u32, String> = HashMap::new();
+        labels.insert(10, "src/foo.rs".to_string());
+        state.install_region_labels(labels);
+        assert!(
+            state
+                .regions_touching_files(&["src/foo.rs".to_string()])
+                .is_some()
+        );
+
+        // Push a consumer-shaped topology through the op handler.
+        // Two regions, one edge; heuristic-only (no f32 data).
+        let regions = vec![
+            SheafStalkInput {
+                id: 100,
+                hash: "aa".into(),
+                data: vec![],
+            },
+            SheafStalkInput {
+                id: 200,
+                hash: "bb".into(),
+                data: vec![],
+            },
+        ];
+        let restrictions = vec![SheafRestrictionInput {
+            a: 100,
+            b: 200,
+            boundary_hash: "cc".into(),
+            co_change_rate: 0.5,
+            revert_rate: 0.0,
+            weights: vec![1.0],
+            agreement_dim: 0,
+        }];
+        op_sheaf_set_topology(&state, &regions, &restrictions, 0).unwrap();
+
+        // Post-condition: labels are wiped, so the accessor falls
+        // back to None — the coarse `all-known` path is engaged for
+        // this consumer-pushed topology.
+        assert!(
+            state
+                .regions_touching_files(&["src/foo.rs".to_string()])
+                .is_none(),
+            "op_sheaf_set_topology must clear region_labels — \
+             consumer-pushed topology cannot inherit daemon-owned labels"
+        );
     }
 
     #[test]

@@ -303,10 +303,8 @@ fn child_perform_pre_crash_setup(
 
     // Block. Parent's SIGKILL terminates. If pause() returns
     // unexpectedly, exit with the sentinel so waitpid diagnoses.
-    loop {
-        unsafe { libc::pause() };
-        return CHILD_UNEXPECTED_EXIT_CODE;
-    }
+    unsafe { libc::pause() };
+    CHILD_UNEXPECTED_EXIT_CODE
 }
 
 /// Reader-side verification at the ORIGINAL (INIT_ARENA_SIZE) file

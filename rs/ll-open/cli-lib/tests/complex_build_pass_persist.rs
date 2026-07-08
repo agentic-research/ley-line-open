@@ -128,6 +128,29 @@ fn complex_build_pass_installs_complex_into_sheaf_state() {
          drift here proves install_complex dropped the tracker on \
          the floor. Got status={status}",
     );
+
+    // Post-condition: the region label map was installed too. Sheaf
+    // gap 3 follow-up (bead `ley-line-open-e40566`): with labels
+    // installed, the watcher-driven `daemon.sheaf.invalidate` emit
+    // computes a fine-grained diff from `changed_files` instead of
+    // falling back to `scope: "all-known"`. Falsifiability: probe
+    // `regions_touching_files` — must return `Some(_)` because
+    // labels are installed. The exact vec depends on how the token
+    // fixture ("alpha", "beta", ...) is treated as a "file path",
+    // which it isn't — bare-token labels don't match any path
+    // shape, so `regions_touching_files(&["alpha".into()])` returns
+    // `Some(vec![])` (not `None`). The returned `Some` — not `None`
+    // — is the load-bearing pin: it distinguishes "labels installed
+    // and diff computed" from "no labels, falling back to
+    // all-known".
+    let touched = sheaf.regions_touching_files(&["alpha".to_string()]);
+    assert!(
+        touched.is_some(),
+        "regions_touching_files must return Some(_) once labels are \
+         installed; None means ComplexBuildPass dropped the label \
+         install_region_labels call and the watcher-driven \
+         invalidate falls back to the coarse-v1 `all-known` scope"
+    );
 }
 
 #[test]

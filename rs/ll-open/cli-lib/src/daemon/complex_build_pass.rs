@@ -58,7 +58,7 @@
 //! cycles. A future pass that wants long-horizon co-change weighting
 //! should persist tracker state into a dedicated table.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -327,19 +327,33 @@ impl EnrichmentPass for ComplexBuildPass {
         // `ley-line-open-3af437` (Gap 2 from the sheaf-invalidation
         // audit `docs/audits/sheaf-invalidation-trace.md`).
         //
+        // Also install the region_id → token label map so the
+        // watcher-driven `daemon.sheaf.invalidate` emit can compute a
+        // fine-grained diff from `changed_files` (sheaf gap 3
+        // follow-up, bead `ley-line-open-e40566`). Order matters: the
+        // label install must land AFTER `install_complex` because
+        // `install_complex` clears any pre-existing labels as part of
+        // the fresh-topology contract.
+        //
         // Test-only construction via `Default` produces
         // `self.sheaf = None`, preserving the "build + drop" shape the
         // gate test in `complex_build_pass_gate.rs` exercises via
         // `build_complex` directly.
+        // Snapshot the numeric fields BEFORE moving `region_labels`
+        // out of `outcome` into the sheaf install call, so the trailing
+        // `EnrichmentStats` build below stays legible.
+        let observations_processed = outcome.observations_processed;
+        let items_added = outcome.nodes_added + outcome.edges_added;
         if let Some(sheaf) = self.sheaf.as_ref() {
             let tracker_taken = tracker.take_tracker().unwrap_or_default();
             sheaf.install_complex(cx, tracker_taken);
+            sheaf.install_region_labels(outcome.region_labels);
         }
 
         Ok(EnrichmentStats {
             pass_name: "complex-build".to_string(),
-            files_processed: outcome.observations_processed,
-            items_added: outcome.nodes_added + outcome.edges_added,
+            files_processed: observations_processed,
+            items_added,
             duration_ms: start.elapsed().as_millis() as u64,
             skipped: Vec::new(),
         })
@@ -353,6 +367,15 @@ pub struct BuildOutcome {
     pub nodes_added: u64,
     pub edges_added: u64,
     pub observations_processed: u64,
+    /// Region ID → token label mapping produced during the build. The
+    /// pass hands this to [`SheafState::install_region_labels`] so the
+    /// watcher-driven `daemon.sheaf.invalidate` emit can turn a
+    /// `changed_files` set into a fine-grained region diff (sheaf gap
+    /// 3 follow-up, bead `ley-line-open-e40566`). Consumers that don't
+    /// need the diff can ignore this field — it's an owned side
+    /// channel, not a change to the falsifiability gate's post-
+    /// conditions on `nodes_added` / `edges_added`.
+    pub region_labels: HashMap<u32, String>,
 }
 
 /// Build a `CellComplex` from observation rows: every unique mention
@@ -449,10 +472,22 @@ pub fn build_complex(
         tracker.observe(obs_tokens, &all_edges);
     }
 
+    // Invert the token → id map into an id → token map. Sheaf gap 3
+    // follow-up (bead `ley-line-open-e40566`): this side channel is
+    // what turns a `changed_files` set into a fine-grained region diff
+    // downstream. Cheap — one entry per unique token, same size as
+    // `token_ids` — and computed here because `build_complex` is the
+    // only place that owns the token→id assignment.
+    let region_labels: HashMap<u32, String> = token_ids
+        .into_iter()
+        .map(|(token, id)| (id, token))
+        .collect();
+
     BuildOutcome {
         nodes_added,
         edges_added,
         observations_processed: observations.len() as u64,
+        region_labels,
     }
 }
 

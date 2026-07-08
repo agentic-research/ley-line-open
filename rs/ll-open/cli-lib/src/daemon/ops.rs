@@ -164,7 +164,7 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
             node_stalk_dim,
         } => super::sheaf_ops::op_sheaf_update_topology(&ctx.sheaf, &delta, node_stalk_dim),
         BaseRequest::SheafInvalidate { regions, stalks } => {
-            super::sheaf_ops::op_sheaf_invalidate(&ctx.sheaf, &regions, &stalks)
+            super::sheaf_ops::op_sheaf_invalidate(&ctx.sheaf, &ctx.ctrl_path, &regions, &stalks)
         }
         BaseRequest::SheafDefect => super::sheaf_ops::op_sheaf_defect(&ctx.sheaf),
         BaseRequest::SheafStalks => super::sheaf_ops::op_sheaf_stalks(&ctx.sheaf),

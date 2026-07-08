@@ -1457,11 +1457,18 @@ pub fn run_watcher_enrichment(
 pub fn emit_watcher_sheaf_invalidate(
     ctx: &Arc<crate::daemon::DaemonContext>,
     changed_files: &[String],
-    emitter: &crate::daemon::events::EventEmitter,
+    _emitter: &crate::daemon::events::EventEmitter,
 ) {
-    let (region_ids, prior_generation, generation) = {
+    // Bead `ley-line-open-1104f2`: route watcher-driven emit through
+    // the shared `SheafState::emit_invalidate` helper so watcher and
+    // consumer paths share ONE payload contract. The `_emitter`
+    // parameter is retained for API compatibility (integration tests
+    // may want to observe emits without a live SheafState); the
+    // actual emit goes through `state.emit` which uses the emitter
+    // installed via `SheafState::set_emitter`.
+    let (invalidated, prior_generation, generation) = {
         let mut cache = ctx.sheaf.cache().lock().unwrap();
-        let region_ids: Vec<u32> = cache
+        let invalidated: Vec<u32> = cache
             .complex()
             .map(|cx| cx.nodes.clone())
             .unwrap_or_default();
@@ -1469,7 +1476,7 @@ pub fn emit_watcher_sheaf_invalidate(
         // `gen` is a reserved keyword in Rust 2024 edition — use a
         // spelled-out binding to avoid the r#gen escape hatch.
         let bumped = cache.bump_generation();
-        (region_ids, prior, bumped)
+        (invalidated, prior, bumped)
     };
 
     let current_root = match crate::daemon::ops::read_root_hex(&ctx.ctrl_path) {
@@ -1480,19 +1487,16 @@ pub fn emit_watcher_sheaf_invalidate(
         }
     };
 
-    emitter.emit(
-        "daemon.sheaf.invalidate",
-        "leyline",
-        serde_json::json!({
-            "region_ids": region_ids,
-            "count": region_ids.len() as u32,
-            "scope": "all-known",
-            "changed_files": changed_files,
-            "current_root": current_root,
-            "generation": generation.to_string(),
-            "prior_generation": prior_generation.to_string(),
-            "timestamp_ms": crate::daemon::now_ms().to_string(),
-        }),
+    // scope="all-known" per the audit's coarse-v1 convention. Fine-grained
+    // diff (bead ley-line-open-e40566, PR #146 in flight) upgrades this
+    // to scope="changed-only" once the file→region map is in place.
+    ctx.sheaf.emit_invalidate(
+        invalidated,
+        "all-known",
+        changed_files,
+        current_root,
+        generation,
+        prior_generation,
     );
 }
 

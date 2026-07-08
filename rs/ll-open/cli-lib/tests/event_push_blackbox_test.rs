@@ -430,7 +430,7 @@ async fn sheaf_invalidate_event_reaches_uds_subscriber() {
             continue;
         }
         let topic = v.get("topic").and_then(|t| t.as_str()).unwrap_or("");
-        if topic == "sheaf.invalidate" {
+        if topic == "daemon.sheaf.invalidate" {
             // Tag the cascade payload so a future shape change is
             // caught here, not in a downstream consumer.
             let data = v.get("data").expect("event payload missing `data`");
@@ -473,9 +473,11 @@ async fn sheaf_invalidate_event_reaches_uds_subscriber() {
     }
     assert_eq!(
         found_topic.as_deref(),
-        Some("sheaf.invalidate"),
+        Some("daemon.sheaf.invalidate"),
         "ley-line-open-5caa59 regression: subscriber never received \
-         sheaf.invalidate even though the daemon ran the cascade",
+         daemon.sheaf.invalidate even though the daemon ran the cascade. \
+         Bead 1104f2 unified this topic under the daemon.* namespace \
+         2026-07-08.",
     );
 }
 

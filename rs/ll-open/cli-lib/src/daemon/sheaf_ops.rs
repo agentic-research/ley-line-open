@@ -18,6 +18,7 @@
 //! dispatch + capnp-json response builders.
 
 use std::collections::{BTreeSet, HashSet};
+use std::path::Path;
 use std::sync::Mutex;
 
 use anyhow::Result;
@@ -126,6 +127,52 @@ impl SheafState {
         if let Some(ref emitter) = *self.emitter.lock().unwrap() {
             emitter.emit(topic, "leyline", data);
         }
+    }
+
+    /// Emit `daemon.sheaf.invalidate` — the single canonical emit
+    /// path for BOTH consumer-driven (`op_sheaf_invalidate`) and
+    /// watcher-driven (`emit_watcher_sheaf_invalidate`) cases. Bead
+    /// `ley-line-open-1104f2`.
+    ///
+    /// **Payload contract** (v0.6+ unified shape):
+    /// - `invalidated`: `Vec<u32>` — region IDs the cascade touched
+    /// - `count`: `u32` — length of `invalidated`
+    /// - `scope`: `&str` — `"changed-only"` (invalidate ONLY listed regions)
+    ///   or `"all-known"` (evict everything; the payload is a snapshot)
+    /// - `changed_files`: `&[String]` — file scope that drove the invalidation
+    ///   (empty for consumer-driven; populated for watcher-driven)
+    /// - `current_root`: `String` — Σ root hex at emit time
+    /// - `generation` / `prior_generation`: `u64` as JSON strings (capnp_json
+    ///   convention; JS Number safe-integer ceiling)
+    /// - `timestamp_ms`: `i64` as JSON string
+    ///
+    /// **Why `invalidated` and not `region_ids`**: matches the pre-v0.6
+    /// consumer-driven emit shape and mache's `SheafInvalidateEvent.Invalidated`
+    /// Go field. Renaming would break the mache wire contract without
+    /// changing semantics.
+    pub fn emit_invalidate(
+        &self,
+        invalidated: Vec<u32>,
+        scope: &str,
+        changed_files: &[String],
+        current_root: String,
+        generation: u64,
+        prior_generation: u64,
+    ) {
+        let count = invalidated.len() as u32;
+        self.emit(
+            "daemon.sheaf.invalidate",
+            serde_json::json!({
+                "invalidated": invalidated,
+                "count": count,
+                "scope": scope,
+                "changed_files": changed_files,
+                "current_root": current_root,
+                "generation": generation.to_string(),
+                "prior_generation": prior_generation.to_string(),
+                "timestamp_ms": super::now_ms().to_string(),
+            }),
+        );
     }
 }
 
@@ -334,6 +381,7 @@ pub fn op_sheaf_set_topology(
 /// but won't move the δ⁰ baseline.
 pub fn op_sheaf_invalidate(
     state: &SheafState,
+    ctrl_path: &Path,
     regions: &[u32],
     stalks: &[SheafStalkInput],
 ) -> Result<String> {
@@ -360,20 +408,32 @@ pub fn op_sheaf_invalidate(
 
     let generation = cache.generation();
     drop(cache);
-    // u64 fields render as JSON *strings* on the wire — matches capnp_json's
-    // convention for op responses (capnp UInt64 → quoted in JSON to dodge JS
-    // Number's 2^53 safe-integer ceiling). Pre-fix the event payload used raw
-    // numbers while the response used strings, forcing consumers to handle
-    // two encodings for the same field. Standardising on strings keeps a
-    // single parse path across response + event surfaces.
-    state.emit(
-        "sheaf.invalidate",
-        serde_json::json!({
-            "invalidated": invalidated,
-            "count": invalidated.len(),
-            "generation": generation.to_string(),
-            "prior_generation": prior_generation.to_string(),
-        }),
+
+    // Bead `ley-line-open-1104f2`: route the consumer-driven emit
+    // through the shared `SheafState::emit_invalidate` helper so the
+    // watcher-driven path (cmd_daemon::emit_watcher_sheaf_invalidate)
+    // and this consumer path emit byte-identical event shapes on the
+    // same `daemon.sheaf.invalidate` topic. Payload contract lives in
+    // one place; refactor drift is impossible by construction.
+    //
+    // Consumer-driven characteristics:
+    // - `scope`: `"changed-only"` — consumer explicitly names which
+    //   regions to invalidate; not a full cache snapshot.
+    // - `changed_files`: empty — this op isn't tied to filesystem
+    //   changes; a consumer decided which regions to invalidate on
+    //   its own reasoning.
+    // - `current_root`: whatever the substrate root is at emit time.
+    let current_root = super::ops::read_root_hex(ctrl_path).unwrap_or_else(|e| {
+        log::warn!("op_sheaf_invalidate: read_root_hex failed: {e:#}");
+        String::new()
+    });
+    state.emit_invalidate(
+        invalidated.clone(),
+        "changed-only",
+        &[],
+        current_root,
+        generation,
+        prior_generation,
     );
 
     let mut builder = capnp::message::Builder::new_default();
@@ -814,7 +874,13 @@ mod tests {
             hash: "ff".into(),
             data: vec![],
         }];
-        let resp = op_sheaf_invalidate(&state, &[0], &new_stalks).unwrap();
+        let resp = op_sheaf_invalidate(
+            &state,
+            std::path::Path::new("/tmp/nonexistent-ctrl-for-unit-test"),
+            &[0],
+            &new_stalks,
+        )
+        .unwrap();
         let j = parse_response(&resp);
         // generation advanced
         let generation: u64 = j["generation"].as_str().unwrap().parse().unwrap();
@@ -963,7 +1029,13 @@ mod tests {
             hash: "ff".into(),
             data: vec![1.0, 0.5, 42.0, 0.0],
         }];
-        let resp = op_sheaf_invalidate(&state, &[0], &new_stalks).unwrap();
+        let resp = op_sheaf_invalidate(
+            &state,
+            std::path::Path::new("/tmp/nonexistent-ctrl-for-unit-test"),
+            &[0],
+            &new_stalks,
+        )
+        .unwrap();
         let j = parse_response(&resp);
         let invalidated: Vec<u32> = j["invalidated"]
             .as_array()
@@ -988,7 +1060,13 @@ mod tests {
             let mut cache = state.cache.lock().unwrap();
             cache.put(1, ());
         }
-        let resp2 = op_sheaf_invalidate(&state, &[0], &new_stalks_real).unwrap();
+        let resp2 = op_sheaf_invalidate(
+            &state,
+            std::path::Path::new("/tmp/nonexistent-ctrl-for-unit-test"),
+            &[0],
+            &new_stalks_real,
+        )
+        .unwrap();
         let j2 = parse_response(&resp2);
         let invalidated2: Vec<u32> = j2["invalidated"]
             .as_array()

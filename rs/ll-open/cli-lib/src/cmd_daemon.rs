@@ -271,6 +271,21 @@ pub async fn run_daemon(
         .unwrap_or_else(|| Arc::new(leyline_text_search::null::NullEngine::new()));
 
     // 6. Build context + spawn UDS socket.
+    //
+    // Hoist SheafState creation before the enrichment_passes list so
+    // ComplexBuildPass can hold an `Arc<SheafState>` and install its
+    // built CellComplex + CoChangeTracker into the shared cache at end
+    // of run. Closes bead `ley-line-open-3af437` (sheaf gap 2):
+    // previously the pass dropped the derived complex on return,
+    // forcing every `op_sheaf_*` consumer query to trigger a rebuild.
+    let sheaf = {
+        let s = Arc::new(crate::daemon::sheaf_ops::SheafState::new());
+        // Wire the event bus so `sheaf_set_topology` / `sheaf_invalidate`
+        // emit `sheaf.topology` / `sheaf.invalidate` on subscribers.
+        s.set_emitter(router.emitter());
+        s
+    };
+
     let ctx = Arc::new(DaemonContext {
         ctrl_path: ctrl_path.clone(),
         ext: ext.clone(),
@@ -297,9 +312,10 @@ pub async fn run_daemon(
             ));
             // ADR-0020 Gate 2: ComplexBuildPass reads `observation` rows
             // (written by SessionObservationPass) and builds a CellComplex
-            // + drives CoChangeTracker.
+            // + drives CoChangeTracker. Installs the built complex +
+            // tracker into `sheaf.cache` at end of run (bead `3af437`).
             passes.push(Box::new(
-                crate::daemon::complex_build_pass::ComplexBuildPass,
+                crate::daemon::complex_build_pass::ComplexBuildPass::new(sheaf.clone()),
             ));
             // Extension passes go last; if any have the same name as a
             // base pass, they replace it (extensions win).
@@ -322,13 +338,7 @@ pub async fn run_daemon(
         embed_queue: embed_queue.clone(),
         #[cfg(feature = "text-search")]
         text_search,
-        sheaf: {
-            let s = Arc::new(crate::daemon::sheaf_ops::SheafState::new());
-            // Wire the event bus so `sheaf_set_topology` / `sheaf_invalidate`
-            // emit `sheaf.topology` / `sheaf.invalidate` on subscribers.
-            s.set_emitter(router.emitter());
-            s
-        },
+        sheaf,
     });
 
     // Spawn the embed-queue drainer: query ops promote node_ids; this loop

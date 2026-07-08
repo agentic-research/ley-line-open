@@ -217,6 +217,131 @@ async fn daemon_snapshot_publishes_root_after_wal_adoption() {
     );
 }
 
+/// Adversarial coverage per bead `ley-line-open-fd07d8` (adversarial
+/// testing sweep for storage-layer changes).
+///
+/// **Claim:** if `.live.db-wal` is corrupted between daemon runs, the
+/// next boot either recovers cleanly OR fails loud — it never returns
+/// silently with a torn view of the DB.
+///
+/// **Why this matters:** WAL is a separate on-disk file with its own
+/// format. A power-loss, filesystem bug, or errant `truncate` could
+/// leave the WAL in a valid-header-but-invalid-body state. SQLite has
+/// robust WAL recovery, but the test pins that we don't accidentally
+/// paper over failures with a `let _ = ` on the reopen path.
+///
+/// **Method:** seed a sentinel row, cleanly shut down the daemon,
+/// deliberately corrupt the WAL sidecar (write garbage bytes after
+/// the WAL header at offset 32 — past the magic + format-version
+/// bytes at 0..8, past the checksum salts at 12..24), then boot a
+/// fresh daemon and observe what happens.
+///
+/// **Pass criteria (either is acceptable):**
+/// - Clean recovery: daemon boots, `journal_mode = wal`, sentinel
+///   row is EITHER the pre-corruption value OR missing (recovery
+///   dropped incomplete WAL frames — the correct behavior).
+/// - Clean failure: daemon returns an Err with a message about
+///   corrupt/malformed database — never a silent success.
+///
+/// **What must NEVER happen:** daemon boots OK with a torn sentinel
+/// value (e.g., row exists but with garbage data). That would mean
+/// WAL recovery silently accepted corrupted frames.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_survives_or_fails_loud_on_wal_corruption() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let dir = TempDir::new().unwrap();
+    let (arena, _ctrl, live_db) = arena_paths(dir.path());
+    let wal_path = live_db.with_extension("db-wal");
+
+    // 1. First boot: seed a sentinel row + clean shutdown.
+    {
+        let config = wal_test_config(&arena, None, 1);
+        let ext: Arc<dyn leyline_cli_lib::daemon::DaemonExt> = Arc::new(NoExt);
+        run_daemon(config, ext).await.expect("first daemon boot");
+
+        // Seed a sentinel via a fresh WAL-configured connection so
+        // the write goes through the same code path the daemon uses.
+        let conn = rusqlite::Connection::open(&live_db).expect("open live_db");
+        conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sentinel(id INTEGER PRIMARY KEY);
+             INSERT INTO sentinel(id) VALUES(1729);",
+        )
+        .expect("seed sentinel");
+        drop(conn);
+    }
+
+    // 2. Confirm the sentinel was written and a WAL file exists.
+    let (mode_before, sentinel_before) = probe_live_db(&live_db);
+    assert_eq!(mode_before, "wal", "sanity: pre-corrupt WAL mode");
+    assert_eq!(sentinel_before, 1729, "sanity: sentinel row seeded");
+
+    // 3. Corrupt the WAL sidecar. If there's no WAL file, the seed
+    //    write got checkpointed already — that's fine; corrupt the
+    //    main db file's page tail instead. Either way the substrate
+    //    has to be able to detect+react to storage-layer garbage.
+    let target = if wal_path.exists() {
+        wal_path.clone()
+    } else {
+        // No WAL file means the transaction was checkpointed to the
+        // main db during shutdown. Corrupt the main db's tail.
+        live_db.clone()
+    };
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .expect("open target for corruption");
+        // Write 128 bytes of garbage at offset 32 — past any header
+        // magic in either WAL or SQLite file format.
+        f.seek(SeekFrom::Start(32)).unwrap();
+        f.write_all(&[0xAB; 128]).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    // 4. Second boot against the corrupted store. Either clean
+    //    recovery or clean failure is acceptable; silent torn state
+    //    is NOT.
+    let config = wal_test_config(&arena, None, 1);
+    let ext: Arc<dyn leyline_cli_lib::daemon::DaemonExt> = Arc::new(NoExt);
+    let result = run_daemon(config, ext).await;
+
+    match result {
+        Ok(()) => {
+            // Clean recovery path. WAL recovery may have dropped
+            // uncheckpointed frames — that's fine per the substrate
+            // contract. Check: the sentinel is either the pre-corrupt
+            // value or absent, but NOT a garbage value.
+            let (mode_after, sentinel_after) = probe_live_db(&live_db);
+            assert_eq!(mode_after, "wal", "post-recovery must still be WAL");
+            assert!(
+                sentinel_after == 1729 || sentinel_after == -1,
+                "sentinel after recovery must be either preserved (1729) \
+                 or absent (-1 sentinel from probe_live_db); got {sentinel_after}. \
+                 A torn value would mean WAL recovery accepted corrupted frames.",
+            );
+        }
+        Err(e) => {
+            // Clean failure path. The error message should name a
+            // corruption/malformed condition — anything vaguely
+            // "database" is acceptable. What's NOT acceptable is
+            // silence, which is what Ok(()) would mask if we didn't
+            // check the sentinel above.
+            let msg = format!("{e:#}");
+            assert!(
+                msg.to_lowercase().contains("corrupt")
+                    || msg.to_lowercase().contains("malformed")
+                    || msg.to_lowercase().contains("database")
+                    || msg.to_lowercase().contains("disk")
+                    || msg.to_lowercase().contains("io")
+                    || msg.to_lowercase().contains("wal"),
+                "corruption error should name the failure mode; got: {msg}",
+            );
+        }
+    }
+}
+
 // Silence unused-import warnings when the compiler can't tell we use
 // DaemonPhase behind cfg-gated paths in a future extension.
 #[allow(dead_code)]

@@ -154,26 +154,119 @@ func (p AstNode_Future) Range() common.Range_Future {
 	return common.Range_Future{Future: p.Future.Field(3, nil)}
 }
 
-const schema_9e1e4e1af2b578d9 = "x\xdaL\xca\xb1J\xc3P\x14\xc6\xf1\xef;'U\x90" +
-	"\x16rippP\x9f@\xd01\x8b:\xa6\xc5\xe0\xd9" +
-	"\x1d\x0c\xbd\x17\x154\x09M\x0b\x1d|\x0aq\x16|\x05" +
-	"!\x08\xba\xb9\xf8\x0c\x0e\xce\xee\xee\x12\xc9\"n\x7f~" +
-	"\xfc\xe3\xc7\xa3h\x7f\xf4.\x10\xdb\x1d\xacu\x9f\xd5\xe6" +
-	"\xf9[:}\x82\xdb`\xf7\xb1j\xbf\xb7\xf2\xed\x07\x0c" +
-	"\xa2u`\x9c\xf1nl\xec\xeb\x84_\xc8\xbb\xa2Y\xec" +
-	"\xcd\x8a\xbad\x9d\x1e7\x8b\xbc\xf2\x0c\xa7\xa4\xc5\x1a\x01" +
-	"\x11\x01W\xa4\x80\x9d)\xedR\xe8\xc8\x84=\x86\x09`" +
-	"^i\xb5\xd0\x89$\x14\xc0\xdd\xf4x\xad\xb4\x95\xd0\xa9" +
-	"&T\xc0-\x0f\x00\xab\x95v+<,+\x1f2\xcf" +
-	"!\x84C\xb0k\xaa\xe5|\x162\x0f\xe0\xcf\xfaez" +
-	"U\xfe\xb7\x9dyQ^\x04\xc6?\x93\x97\xd7\xf6~\xf4" +
-	"\x0c2\x06\x7f\x03\x00\x00\xff\xff\xd3\xc33\x83"
+type AstNodeList capnp.Struct
+
+// AstNodeList_TypeID is the unique identifier for the type AstNodeList.
+const AstNodeList_TypeID = 0xb7832918133c2c31
+
+func NewAstNodeList(s *capnp.Segment) (AstNodeList, error) {
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 1})
+	return AstNodeList(st), err
+}
+
+func NewRootAstNodeList(s *capnp.Segment) (AstNodeList, error) {
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 0, PointerCount: 1})
+	return AstNodeList(st), err
+}
+
+func ReadRootAstNodeList(msg *capnp.Message) (AstNodeList, error) {
+	root, err := msg.Root()
+	return AstNodeList(root.Struct()), err
+}
+
+func (s AstNodeList) String() string {
+	str, _ := text.Marshal(0xb7832918133c2c31, capnp.Struct(s))
+	return str
+}
+
+func (s AstNodeList) EncodeAsPtr(seg *capnp.Segment) capnp.Ptr {
+	return capnp.Struct(s).EncodeAsPtr(seg)
+}
+
+func (AstNodeList) DecodeFromPtr(p capnp.Ptr) AstNodeList {
+	return AstNodeList(capnp.Struct{}.DecodeFromPtr(p))
+}
+
+func (s AstNodeList) ToPtr() capnp.Ptr {
+	return capnp.Struct(s).ToPtr()
+}
+func (s AstNodeList) IsValid() bool {
+	return capnp.Struct(s).IsValid()
+}
+
+func (s AstNodeList) Message() *capnp.Message {
+	return capnp.Struct(s).Message()
+}
+
+func (s AstNodeList) Segment() *capnp.Segment {
+	return capnp.Struct(s).Segment()
+}
+func (s AstNodeList) Nodes() (AstNode_List, error) {
+	p, err := capnp.Struct(s).Ptr(0)
+	return AstNode_List(p.List()), err
+}
+
+func (s AstNodeList) HasNodes() bool {
+	return capnp.Struct(s).HasPtr(0)
+}
+
+func (s AstNodeList) SetNodes(v AstNode_List) error {
+	return capnp.Struct(s).SetPtr(0, v.ToPtr())
+}
+
+// NewNodes sets the nodes field to a newly
+// allocated AstNode_List, preferring placement in s's segment.
+func (s AstNodeList) NewNodes(n int32) (AstNode_List, error) {
+	l, err := NewAstNode_List(capnp.Struct(s).Segment(), n)
+	if err != nil {
+		return AstNode_List{}, err
+	}
+	err = capnp.Struct(s).SetPtr(0, l.ToPtr())
+	return l, err
+}
+
+// AstNodeList_List is a list of AstNodeList.
+type AstNodeList_List = capnp.StructList[AstNodeList]
+
+// NewAstNodeList creates a new list of AstNodeList.
+func NewAstNodeList_List(s *capnp.Segment, sz int32) (AstNodeList_List, error) {
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 0, PointerCount: 1}, sz)
+	return capnp.StructList[AstNodeList](l), err
+}
+
+// AstNodeList_Future is a wrapper for a AstNodeList promised by a client call.
+type AstNodeList_Future struct{ *capnp.Future }
+
+func (f AstNodeList_Future) Struct() (AstNodeList, error) {
+	p, err := f.Future.Ptr()
+	return AstNodeList(p.Struct()), err
+}
+
+const schema_9e1e4e1af2b578d9 = "x\xdad\x901K\xc3@\x18\x86\xdf\xf7\xbbTEZ" +
+	"\xc9\x91\"\xe2`\x96.\x82\x08u,Bul+\xa5" +
+	"78\x08\x0a\x86&hA\x93\xd04PA'\xff\x81" +
+	"8\xfb#\x0a\xa5\xa0\x9b\xf8'\x1c\x9c\xdd\xdd%r\x0e" +
+	"Ut{yx\xb8{\xf8\xdc\x97=\xa7^\xf1\x15\xc4" +
+	"\xd4J\x0b\xc5[\xb2z\xfa\xdc\xe8L\xa0\x97Y\xbc\x8e" +
+	"\xa7\x1f\xeb\xdd\x8d\x07\x94\x9cE\xc0\xcby\xe7\xdd\xd0\xae" +
+	"+\xbe\x83E}k\xd7[\xdb\xbc\x9d\xfdq\xbf\x8dC" +
+	"\x99x'b\xd7\x914\xd1-\x82l\xb4\xdd\x0f\xd2\x98" +
+	"ic?\x1bu\x93\x90Q\x8f4\xaer\x00\x87\x80\x0e" +
+	"\x1a\x809V4\xe7BMVia\xd4\x06L\xa8h" +
+	"R\xa1\x16\xa9R\x00}i\xe1\x85\xa2\x19\x0b\xb5RU" +
+	"*@\xe7;\x80I\x15\xcd\xb5\xb0\x19'a\xd4\x0aY" +
+	"\x86\xb0\x0c\x16Y\x92\x0f\xfbQ+\x040gV\xe9\x0c" +
+	"\xe2\xdf\xcc\x1f\x06\xf1YD\xf7\xb3\xfd\xf84\xbd\xaf\xcc" +
+	"@\xba\xe0\xffr?:\x18d#[\xef\xcc\xeb+\xf6" +
+	"\xfb%ES\x13\xfa\xf6\xed\x8c+`O\x91\xee\xcfI" +
+	"A\x0b\xbf\x02\x00\x00\xff\xffQYP\xaf"
 
 func RegisterSchema(reg *schemas.Registry) {
 	reg.Register(&schemas.Schema{
 		String: schema_9e1e4e1af2b578d9,
 		Nodes: []uint64{
 			0xb24b3ac260166fdd,
+			0xb7832918133c2c31,
 		},
 		Compressed: true,
 	})

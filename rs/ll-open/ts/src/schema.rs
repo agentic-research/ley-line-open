@@ -374,6 +374,49 @@ pub fn insert_import(conn: &Connection, alias: &str, path: &str, source_id: &str
 }
 
 // ---------------------------------------------------------------------------
+// ADR-0026 pointer store — Phase 1 dual-write (bead ley-line-open-3e87ad)
+// ---------------------------------------------------------------------------
+//
+// Content-addressed pointer store: SQL projection becomes a lightweight index
+// (`_ast_pointer`) into content-addressed capnp blobs (`capnp_blobs`) held in
+// Σ. The row-projected `_ast` schema stays populated in Phase 1 for
+// backward-compat + F1 round-trip integrity; Phase 2 migrates consumer reads.
+//
+// Blob unit: **per-file** (ADR-0026 §2.2 fallback — safer default; per-
+// semantic-unit refinement is Phase 2).
+
+/// DDL for `capnp_blobs` — content-addressed blob store. One row per unique
+/// per-file blob keyed on BLAKE3(canonical(AstNodeList)).
+pub const CAPNP_BLOBS_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS capnp_blobs (
+    blob_hash BLOB PRIMARY KEY,
+    blob_bytes BLOB NOT NULL
+);";
+
+/// DDL for `_ast_pointer` — lightweight index into `capnp_blobs`. One row
+/// per AstNode, mirroring the `_ast` row set 1-to-1 in Phase 1 dual-write.
+/// `offset_in_blob` indexes into the blob's `AstNodeList.nodes` list.
+/// `kind` is the semantic-kind tag per ADR-0026 §2.1 (INTEGER for query
+/// filter — populated by `semantic_kind_tag` in the producer; the Phase 2
+/// allowlist refines the enum).
+pub const AST_POINTER_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS _ast_pointer (
+    node_id TEXT PRIMARY KEY,
+    blob_hash BLOB NOT NULL,
+    offset_in_blob INTEGER NOT NULL,
+    kind INTEGER NOT NULL,
+    source_id TEXT NOT NULL
+);";
+
+/// Create the pointer-store tables (idempotent). Must run alongside the
+/// existing row-projected schema; Phase 1 is dual-write.
+pub fn create_pointer_store_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(CAPNP_BLOBS_DDL)?;
+    conn.execute_batch(AST_POINTER_DDL)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // File-index & meta tables (incremental reparse)
 // ---------------------------------------------------------------------------
 
@@ -506,8 +549,33 @@ pub fn delete_file_rows(conn: &Connection, path: &str) -> Result<()> {
     conn.execute("DELETE FROM node_defs WHERE source_id = ?1", [path])?;
     conn.execute("DELETE FROM _imports WHERE source_id = ?1", [path])?;
     conn.execute("DELETE FROM _file_index WHERE path = ?1", [path])?;
+    // ADR-0026 pointer store (Phase 1 dual-write, bead `ley-line-open-3e87ad`).
+    // Skip cleanly when the tables don't exist — the pointer store is additive
+    // and older databases may predate its creation.
+    if pointer_store_present(conn) {
+        conn.execute("DELETE FROM _ast_pointer WHERE source_id = ?1", [path])?;
+        // capnp_blobs is keyed on blob_hash (content-addressed), not source_id.
+        // Orphaned blobs are ignored here — a Phase 2/3 GC sweep collects blobs
+        // no `_ast_pointer` row references. Phase 1 dual-write recreates the
+        // blob row on reparse via `INSERT OR IGNORE`, so nothing accumulates
+        // per file (blobs dedup on identical file content).
+    }
     delete_lsp_rows_for_path(conn, path)?;
     Ok(())
+}
+
+/// True when the pointer-store tables (`_ast_pointer`) exist on this
+/// connection. Additive-schema guard for `delete_file_rows`: older
+/// databases predate the pointer store, and legacy paths that call
+/// `delete_file_rows` without first running `create_pointer_store_tables`
+/// must not error on the missing table.
+fn pointer_store_present(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='_ast_pointer'",
+        [],
+        |r| r.get::<_, bool>(0),
+    )
+    .unwrap_or(false)
 }
 
 /// Delete `_lsp*` rows whose `node_id` is in the deleted file's path

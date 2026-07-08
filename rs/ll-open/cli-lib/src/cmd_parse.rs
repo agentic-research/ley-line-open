@@ -29,8 +29,8 @@ pub const MAX_PARSE_FILE_SIZE: i64 = 8 * 1024 * 1024;
 use leyline_ts::refs::{ExtractedRef, extract_refs};
 use leyline_ts::schema::{
     create_ast_tables, create_index_schema, create_ir_indexes, create_ir_tables,
-    create_post_load_indexes_skip_unused, create_refs_tables, delete_file_rows, read_file_index,
-    set_meta, sweep_orphaned_dirs,
+    create_pointer_store_tables, create_post_load_indexes_skip_unused, create_refs_tables,
+    delete_file_rows, read_file_index, set_meta, sweep_orphaned_dirs,
 };
 use rayon::prelude::*;
 use rusqlite::Connection;
@@ -115,6 +115,17 @@ struct ParsedFile {
     /// mache bench) capnp serialization cost out of the serial insert
     /// phase and into the parallel parse phase.
     ast_capnp_bytes: Vec<u8>,
+    /// ADR-0026 pointer-store blob (bead `ley-line-open-3e87ad`, Phase 1):
+    /// canonical bytes of a single `AstNodeList` message containing every
+    /// AstEntry for this file. Written to `capnp_blobs.blob_bytes`; the
+    /// per-node offsets in `ast_entries.iter().enumerate()` land in
+    /// `_ast_pointer.offset_in_blob`. Built in the rayon worker so the
+    /// serial insert loop does no capnp work.
+    pointer_blob_bytes: Vec<u8>,
+    /// BLAKE3-32 of `pointer_blob_bytes`. Populates
+    /// `capnp_blobs.blob_hash` (PK) and every `_ast_pointer.blob_hash` FK
+    /// for this file's rows.
+    pointer_blob_hash: [u8; 32],
 }
 
 // ---------------------------------------------------------------------------
@@ -478,6 +489,49 @@ batch_table! {
     },
 }
 
+batch_table! {
+    // ADR-0026 pointer-store blob rows (bead `ley-line-open-3e87ad`).
+    // `INSERT OR IGNORE` on the `blob_hash` PK == intrinsic dedup: two
+    // files with byte-identical AstNodeList canonical bytes share one blob.
+    // Phase 1 is per-file granularity; Phase 2 refines toward per-semantic-
+    // unit (ADR-0026 §2.2).
+    CapnpBlobBatch, CapnpBlobRow,
+    "INSERT OR IGNORE INTO capnp_blobs (blob_hash, blob_bytes) VALUES ",
+    2,
+    push_fn: (blob_hash: Vec<u8>, blob_bytes: Vec<u8>),
+    push_body: { CapnpBlobRow { blob_hash, blob_bytes } },
+    flatten: |chunk| {
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 2);
+        for r in chunk {
+            out.push(&r.blob_hash);
+            out.push(&r.blob_bytes);
+        }
+        out
+    },
+}
+
+batch_table! {
+    // ADR-0026 pointer rows — one per `_ast` entry, dual-write for Phase 1
+    // (bead `ley-line-open-3e87ad`). `delete_file_rows` clears prior rows
+    // per file, so plain `INSERT` doesn't conflict.
+    AstPointerBatch, AstPointerRow,
+    "INSERT INTO _ast_pointer (node_id, blob_hash, offset_in_blob, kind, source_id) VALUES ",
+    5,
+    push_fn: (node_id: String, blob_hash: Vec<u8>, offset_in_blob: i64, kind: i64, source_id: String),
+    push_body: { AstPointerRow { node_id, blob_hash, offset_in_blob, kind, source_id } },
+    flatten: |chunk| {
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 5);
+        for r in chunk {
+            out.push(&r.node_id);
+            out.push(&r.blob_hash);
+            out.push(&r.offset_in_blob);
+            out.push(&r.kind);
+            out.push(&r.source_id);
+        }
+        out
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -629,6 +683,10 @@ pub fn parse_into_conn(
     // transaction, so the node_hash FK → node_content is live when
     // PRAGMA foreign_keys=ON enforces it below.
     create_ir_tables(conn)?;
+    // ADR-0026 Phase 1 dual-write (bead `ley-line-open-3e87ad`): the pointer-
+    // store tables land alongside the row-projected schema. Both populated on
+    // every parse; F1 (round-trip integrity) asserts continuous agreement.
+    create_pointer_store_tables(conn)?;
     create_index_schema(conn)?;
 
     let mtime = std::time::SystemTime::now()
@@ -902,6 +960,13 @@ pub fn parse_into_conn(
     let mut source_buf: SourceBatch = SourceBatch::with_capacity(to_parse.len());
     let mut file_idx_buf: FileIdxBatch = FileIdxBatch::with_capacity(to_parse.len());
 
+    // ADR-0026 pointer store (Phase 1 dual-write, bead `ley-line-open-3e87ad`).
+    // One `capnp_blobs` row per file; one `_ast_pointer` row per AstEntry
+    // (mirrors the `_ast` row count 1-to-1). Pre-sized like `ast_buf` since
+    // pointer rows and _ast rows are in 1-to-1 correspondence.
+    let mut blob_buf: CapnpBlobBatch = CapnpBlobBatch::with_capacity(to_parse.len());
+    let mut pointer_buf: AstPointerBatch = AstPointerBatch::with_capacity(550_000);
+
     // Merkle-AST IR (ADR-0027). `node_content`/`node_child` are the deduped
     // content layer (`INSERT OR IGNORE` collapses identical subtrees across
     // files); `_ast`/`node_defs`/`node_refs` carry the additive `node_hash`
@@ -1010,6 +1075,25 @@ pub fn parse_into_conn(
                     );
                 }
 
+                // ADR-0026 dual-write (Phase 1, bead `ley-line-open-3e87ad`).
+                // One `capnp_blobs` row per file (the per-file AstNodeList
+                // canonical bytes, content-addressed by BLAKE3); one
+                // `_ast_pointer` row per AstEntry, mirroring the `_ast` row
+                // set. `offset_in_blob` is the list index — the same
+                // enumerate() order `serialize_ast_node_list_record` used, so
+                // decoding the blob at `offset` byte-identically reproduces
+                // this entry's fields (asserted by the F1 integration test).
+                blob_buf.push(pf.pointer_blob_hash.to_vec(), pf.pointer_blob_bytes.clone());
+                for (offset, a) in pf.ast_entries.iter().enumerate() {
+                    pointer_buf.push(
+                        a.node_id.clone(),
+                        pf.pointer_blob_hash.to_vec(),
+                        offset as i64,
+                        semantic_kind_tag(&a.node_kind),
+                        a.source_id.clone(),
+                    );
+                }
+
                 for r in pf.refs {
                     match r {
                         ExtractedRef::Ref {
@@ -1082,6 +1166,14 @@ pub fn parse_into_conn(
     )?;
     imports_buf.flush_batched(conn)?;
     file_idx_buf.flush_batched(conn)?;
+    // ADR-0026 pointer-store dual-write (bead `ley-line-open-3e87ad`). Flush
+    // blobs BEFORE the pointer rows so an implementation that later adds a FK
+    // on `_ast_pointer.blob_hash → capnp_blobs.blob_hash` finds every referent
+    // present. Phase 1 doesn't declare the FK (dual-write is additive; the
+    // FK becomes load-bearing when Phase 2 flips consumers to reads), but
+    // ordering the writes correctly means the promotion is a one-line edit.
+    blob_buf.flush_batched(conn)?;
+    pointer_buf.flush_batched(conn)?;
     let sub_flush_end = std::time::Instant::now();
 
     // Flush the capnp dual-write `BufWriter`s before COMMIT and before
@@ -1655,6 +1747,121 @@ fn serialize_ast_node_record(buf: &mut Vec<u8>, a: &AstEntry) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// ADR-0026 pointer store — Phase 1 dual-write (bead `ley-line-open-3e87ad`)
+// ---------------------------------------------------------------------------
+//
+// Producer helpers for the content-addressed pointer store:
+//
+// - `serialize_ast_node_list_record` — canonicalize a per-file
+//   `AstNodeList` capnp message. Blob content per ADR-0026 §2.1.
+// - `semantic_kind_tag` — Phase 1 tag encoding for `_ast_pointer.kind`.
+//   The ADR (§2.1) calls out "function, method, type, import" as the
+//   semantic surface; Phase 1 encodes the common tree-sitter kinds behind
+//   those categories so consumers can pre-filter without decoding the
+//   blob. The allowlist is intentionally small — Phase 2 refines against
+//   measured mache query patterns (ADR-0026 §2.2).
+
+/// Semantic-kind tag for `_ast_pointer.kind`. Load-bearing surface is
+/// small and deliberately conservative — Phase 1's contract is "if you
+/// want to filter by semantic surface without decoding the blob, these
+/// codes are stable across parse runs." Unknown / non-semantic kinds
+/// (identifiers, literals, statements, blocks, punctuation) collapse to
+/// `SEMANTIC_KIND_OTHER` and consumers fall back to blob decode.
+///
+/// Encoding kept as small integer constants (not an enum) so the wire
+/// story is dead-simple: `_ast_pointer.kind` is an `INTEGER`, values are
+/// documented here, Phase 2 extends by adding new tags at the tail.
+pub const SEMANTIC_KIND_OTHER: i64 = 0;
+/// Function-like: `function_declaration`, `function_definition`,
+/// `function_item`, `method_declaration`.
+pub const SEMANTIC_KIND_FUNCTION: i64 = 1;
+/// Method-like: `method_definition`, `method_signature_item`.
+pub const SEMANTIC_KIND_METHOD: i64 = 2;
+/// Type-like: struct/class/interface/type-alias/enum declarations.
+pub const SEMANTIC_KIND_TYPE: i64 = 3;
+/// Import-like: `import_declaration`, `import_statement`,
+/// `use_declaration`, `import_spec`.
+pub const SEMANTIC_KIND_IMPORT: i64 = 4;
+
+/// Map a tree-sitter node kind string to its semantic-kind tag. Phase 1
+/// covers the categories the ADR calls out (§2.1); Phase 2 refines the
+/// allowlist per measured mache query patterns (§2.2).
+fn semantic_kind_tag(node_kind: &str) -> i64 {
+    match node_kind {
+        // Function-like across Go / Rust / Python / JS / TS.
+        "function_declaration" | "function_definition" | "function_item" => SEMANTIC_KIND_FUNCTION,
+        // Method-like.
+        "method_declaration" | "method_definition" | "method_signature_item" => {
+            SEMANTIC_KIND_METHOD
+        }
+        // Type-like: struct / class / interface / enum / type alias.
+        "struct_item"
+        | "type_declaration"
+        | "type_alias"
+        | "type_alias_declaration"
+        | "type_alias_statement"
+        | "class_declaration"
+        | "class_definition"
+        | "interface_declaration"
+        | "enum_declaration"
+        | "enum_item"
+        | "trait_item"
+        | "impl_item" => SEMANTIC_KIND_TYPE,
+        // Import-like.
+        "import_declaration"
+        | "import_statement"
+        | "import_spec"
+        | "import_from_statement"
+        | "use_declaration" => SEMANTIC_KIND_IMPORT,
+        _ => SEMANTIC_KIND_OTHER,
+    }
+}
+
+/// ADR-0026 §2.1 — serialize the per-file `AstNodeList` capnp message
+/// (canonical form) into `buf`. Emits ONE root message per file whose
+/// `nodes` list contains an `AstNode` for every `AstEntry`, in the same
+/// order the entries were folded. The offset of each node in the list is
+/// its index in `entries`, which populates `_ast_pointer.offset_in_blob`.
+///
+/// The canonical bytes are hashed with BLAKE3 to produce `blob_hash`. The
+/// bytes then land verbatim in `capnp_blobs.blob_bytes` (no re-
+/// canonicalization at read time — the on-disk bytes ARE the blob).
+fn serialize_ast_node_list_record(buf: &mut Vec<u8>, entries: &[AstEntry]) -> Result<()> {
+    use leyline_schema_capnp::ast_capnp::ast_node_list;
+
+    let mut src = capnp::message::Builder::new_default();
+    {
+        let list_root: ast_node_list::Builder = src.init_root();
+        let n = u32::try_from(entries.len())
+            .context("AstNodeList: entries count exceeds u32 (capnp list bound)")?;
+        let mut list = list_root.init_nodes(n);
+        for (i, a) in entries.iter().enumerate() {
+            let mut node = list.reborrow().get(i as u32);
+            node.set_node_id(&a.node_id);
+            node.set_source_id(&a.source_id);
+            node.set_node_kind(&a.node_kind);
+            let mut r = node.init_range();
+            {
+                let mut s = r.reborrow().init_start();
+                s.set_line(a.start_row as u32);
+                s.set_column(a.start_col as u32);
+                s.set_byte(a.start_byte as u64);
+            }
+            {
+                let mut e = r.reborrow().init_end();
+                e.set_line(a.end_row as u32);
+                e.set_column(a.end_col as u32);
+                e.set_byte(a.end_byte as u64);
+            }
+        }
+    }
+
+    leyline_schema_capnp::canonical::write_canonical_message::<ast_node_list::Owned, _>(&src, buf)
+        .context("write AstNodeList capnp record")?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Merkle-AST content address (ADR-0027) — node_hash
 // ---------------------------------------------------------------------------
 //
@@ -1848,6 +2055,18 @@ fn parse_file_pure(
         serialize_ast_node_record(&mut ast_capnp_bytes, a)?;
     }
 
+    // ADR-0026 pointer store (Phase 1 dual-write, bead `ley-line-open-3e87ad`):
+    // build the per-file `AstNodeList` canonical capnp blob AND its BLAKE3
+    // address in the rayon worker. The main-thread insert loop just moves the
+    // byte buffer + hash into the DB, doing no capnp work.
+    //
+    // Blob size ~= sizeof(ast_capnp_bytes); a single canonical `AstNodeList`
+    // message is denser than N concatenated `AstNode` messages (one framing
+    // header, one segment table), so this over-allocates safely.
+    let mut pointer_blob_bytes = Vec::with_capacity(ast_capnp_bytes.len());
+    serialize_ast_node_list_record(&mut pointer_blob_bytes, &ast_entries)?;
+    let pointer_blob_hash: [u8; 32] = *pointer_blob_bytes.as_slice().hash().as_bytes();
+
     Ok(ParsedFile {
         rel: source_id.to_string(),
         abs_path: abs_path.to_string(),
@@ -1862,6 +2081,8 @@ fn parse_file_pure(
         content_hash,
         source_capnp_bytes,
         ast_capnp_bytes,
+        pointer_blob_bytes,
+        pointer_blob_hash,
     })
 }
 

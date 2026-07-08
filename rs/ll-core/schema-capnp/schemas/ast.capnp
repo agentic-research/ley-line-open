@@ -37,3 +37,16 @@ struct AstNode {
   # query-friendly.
   range @3 :Common.Range;
 }
+
+# AstNodeList — per-file aggregation of AstNode records.
+#
+# ADR-0026 Phase 1 (bead ley-line-open-3e87ad): the pointer-store blob unit
+# is per-file. A single AstNodeList message contains every AstNode for one
+# source file; the canonical bytes of that message are hashed with BLAKE3 to
+# yield `capnp_blobs.blob_hash`, and each `_ast_pointer.offset_in_blob`
+# indexes into the `nodes` list. The wrapper struct exists so the ADR's
+# literal spec — `blob_hash = BLAKE3(canonical(List(AstNode)))` — has a
+# concrete capnp root (canonical form requires a single-root message).
+struct AstNodeList {
+  nodes @0 :List(AstNode);
+}

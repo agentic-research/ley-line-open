@@ -134,6 +134,24 @@ fn build_ctx(
     passes: Vec<Box<dyn EnrichmentPass>>,
     seed_regions: &[u32],
 ) -> (Arc<DaemonContext>, Arc<EventRouter>) {
+    build_ctx_with_labels(dir, source_dir, passes, seed_regions, None)
+}
+
+/// Same as [`build_ctx`] but also installs a `region_id → token label`
+/// map into the SheafState. Load-bearing for the fine-grained-diff
+/// tests (sheaf gap 3 follow-up, bead `ley-line-open-e40566`): with
+/// labels installed, `emit_watcher_sheaf_invalidate` computes
+/// `region_ids` as the subset touched by `changed_files` and emits
+/// `scope: "changed-only"` instead of the coarse `"all-known"`
+/// fallback. Passing `None` for labels reproduces the original
+/// `build_ctx` shape.
+fn build_ctx_with_labels(
+    dir: &Path,
+    source_dir: PathBuf,
+    passes: Vec<Box<dyn EnrichmentPass>>,
+    seed_regions: &[u32],
+    seed_labels: Option<std::collections::HashMap<u32, String>>,
+) -> (Arc<DaemonContext>, Arc<EventRouter>) {
     use std::sync::{Mutex, RwLock};
 
     let ctrl_path = fresh_arena(dir);
@@ -155,6 +173,12 @@ fn build_ctx(
         }
         let tracker = leyline_sheaf::CoChangeTracker::default();
         sheaf.install_complex(cx, tracker);
+    }
+    // Labels install must land AFTER `install_complex` because that
+    // call clears any prior labels as part of the fresh-topology
+    // contract (see SheafState::install_complex docs).
+    if let Some(labels) = seed_labels {
+        sheaf.install_region_labels(labels);
     }
 
     let live_db = Connection::open_in_memory().unwrap();
@@ -313,17 +337,24 @@ async fn watcher_emits_sheaf_invalidate_with_region_payload() {
         "`count` must mirror region_ids length"
     );
 
-    // Pin `scope` sentinel — V1 emits `"all-known"` because the
-    // daemon lacks a file→region map. A refactor that flips to
-    // `"diff"` MUST also implement the diff — this catches an
-    // accidental mode-string change without behavior.
+    // Pin `scope` sentinel — this fixture installs a complex but NOT
+    // a region-label map, so `emit_watcher_sheaf_invalidate` falls
+    // back to the coarse-v1 `"all-known"` path per
+    // `SheafState::regions_touching_files` returning `None`. Sheaf
+    // gap 3 follow-up (bead `ley-line-open-e40566`) pins this
+    // fallback: when a mache-pushed topology (which never carries
+    // labels) is active, or when the daemon hasn't yet run an
+    // enrichment pass that installs labels, the emit MUST NOT lie
+    // and claim to have computed a diff. A refactor that flipped
+    // this path to `"changed-only"` without also computing the
+    // subset would silently regress consumers.
     assert_eq!(
         payload
             .get("scope")
             .and_then(|v| v.as_str())
             .expect("`scope` must be a string"),
         "all-known",
-        "V1 scope sentinel must be \"all-known\""
+        "no-labels fixture must fall back to \"all-known\""
     );
 
     // Pin `changed_files` echoes the scope the caller passed in.
@@ -547,4 +578,317 @@ async fn watcher_does_not_emit_sheaf_invalidate_on_enrichment_failure() {
             );
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Sheaf gap 3 follow-up (bead `ley-line-open-e40566`): fine-grained
+// region diff. The three tests below prove the `scope: "changed-only"`
+// path — when the daemon has labels installed, the payload's
+// `region_ids` MUST contain only the regions actually touched by
+// `changed_files`, NOT the full topology.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Fine-grained happy path: three-region topology, one file changes,
+/// and the emit surfaces only the region whose label points at that
+/// file. Load-bearing regression pin for bead `ley-line-open-e40566`:
+/// a refactor that dropped the label install, or one that emitted
+/// every-known-region without consulting the labels, would fail this
+/// assertion.
+#[tokio::test]
+async fn watcher_emits_fine_grained_region_ids_when_labels_are_installed() {
+    let dir = TempDir::new().unwrap();
+    let source_dir = dir.path().join("src");
+    std::fs::create_dir_all(&source_dir).unwrap();
+
+    // Three regions in the topology (IDs 10, 20, 30). Labels tie:
+    //   region 10 ⇢ "src/foo.rs"
+    //   region 20 ⇢ "src/foo.rs:sym:frobnicate"  (path:sym:NAME token)
+    //   region 30 ⇢ "src/bar.rs"
+    // Changing only `src/foo.rs` MUST invalidate {10, 20} — the
+    // path-prefixed sym token and the bare path token both share the
+    // file prefix. Region 30 lives in a different file and stays out
+    // of the diff.
+    let seed_regions = vec![10u32, 20u32, 30u32];
+    let mut labels: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    labels.insert(10, "src/foo.rs".to_string());
+    labels.insert(20, "src/foo.rs:sym:frobnicate".to_string());
+    labels.insert(30, "src/bar.rs".to_string());
+
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let pass = Box::new(CountingPass {
+        name: "counting",
+        invocations,
+    });
+
+    let (ctx, router) = build_ctx_with_labels(
+        dir.path(),
+        source_dir.clone(),
+        vec![pass],
+        &seed_regions,
+        Some(labels),
+    );
+
+    let (_sub_id, mut rx, _replay, _gap) = router
+        .subscribe(
+            &["daemon.sheaf.*".to_string()],
+            None,
+            0,
+            OverflowPolicy::DropOldest,
+            16,
+        )
+        .await;
+
+    let emitter = router.emitter();
+    let changed = vec!["src/foo.rs".to_string()];
+
+    leyline_cli_lib::cmd_daemon::run_watcher_enrichment(&ctx, &source_dir, &changed, &emitter);
+
+    let evt = recv_event(
+        &mut rx,
+        Duration::from_secs(5),
+        "daemon.sheaf.invalidate (fine-grained)",
+    )
+    .await;
+    assert_eq!(evt.topic, "daemon.sheaf.invalidate");
+    let payload = &evt.data;
+
+    // Load-bearing assertion #1: `scope` must be `"changed-only"` —
+    // this is the wire signal that consumers use to trust the
+    // subsetting. A refactor that computed the diff but forgot to
+    // flip the scope tag would leave mache treating the payload
+    // like an `all-known` (safe over-eviction) even though the
+    // daemon shipped a precise diff.
+    assert_eq!(
+        payload
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .expect("`scope` must be a string"),
+        "changed-only",
+        "labels installed + touched-file diff computed → scope must be `changed-only`"
+    );
+
+    // Load-bearing assertion #2: `region_ids` must be exactly the
+    // subset the labels resolved — NOT the full seed set. This is
+    // the payload's raison d'être. If the emit fell back to
+    // `cx.nodes.clone()` (all-known) it would carry {10, 20, 30};
+    // the labels resolver correctly restricts to {10, 20}.
+    let mut got: Vec<u32> = payload
+        .get("invalidated")
+        .expect("payload must include `region_ids`")
+        .as_array()
+        .expect("`region_ids` must be a JSON array")
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![10u32, 20u32],
+        "`region_ids` must be the fine-grained diff (regions labelled \
+         with `src/foo.rs` or `src/foo.rs:sym:*`), NOT the full \
+         seeded topology {{10, 20, 30}}"
+    );
+
+    // Count mirrors region_ids.len() — invariant across both scope modes.
+    assert_eq!(
+        payload.get("count").and_then(|v| v.as_u64()),
+        Some(2),
+        "count must mirror region_ids.len()=2"
+    );
+
+    // Generation still advances even in fine-grained mode —
+    // consumers' monotonic-freshness cursors depend on this.
+    let prior: u64 = payload["prior_generation"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let generation: u64 = payload["generation"].as_str().unwrap().parse().unwrap();
+    assert!(
+        generation > prior,
+        "fine-grained emit must still bump generation ({prior} → {generation})"
+    );
+}
+
+/// Fine-grained empty-diff path: labels installed, but the changed
+/// file matches no region label. The emit MUST fire with `scope:
+/// "changed-only"` and empty `region_ids` — that's the honest
+/// "nothing structural touched" signal, and it's what keeps mache
+/// from over-evicting on a doc/README edit that doesn't touch any
+/// projected region.
+///
+/// Falsifiability: a refactor that decided "empty diff = fall back to
+/// all-known" would break the "daemon reports what it knows" contract
+/// this test pins.
+#[tokio::test]
+async fn watcher_emits_changed_only_with_empty_region_ids_when_no_labels_match() {
+    let dir = TempDir::new().unwrap();
+    let source_dir = dir.path().join("src");
+    std::fs::create_dir_all(&source_dir).unwrap();
+
+    let seed_regions = vec![10u32, 20u32];
+    let mut labels: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    labels.insert(10, "src/foo.rs".to_string());
+    labels.insert(20, "src/bar.rs".to_string());
+
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let pass = Box::new(CountingPass {
+        name: "counting",
+        invocations,
+    });
+
+    let (ctx, router) = build_ctx_with_labels(
+        dir.path(),
+        source_dir.clone(),
+        vec![pass],
+        &seed_regions,
+        Some(labels),
+    );
+
+    let (_sub_id, mut rx, _replay, _gap) = router
+        .subscribe(
+            &["daemon.sheaf.*".to_string()],
+            None,
+            0,
+            OverflowPolicy::DropOldest,
+            16,
+        )
+        .await;
+
+    let emitter = router.emitter();
+    // A file that no label references — the diff should be empty.
+    let changed = vec!["docs/README.md".to_string()];
+
+    leyline_cli_lib::cmd_daemon::run_watcher_enrichment(&ctx, &source_dir, &changed, &emitter);
+
+    let evt = recv_event(
+        &mut rx,
+        Duration::from_secs(5),
+        "daemon.sheaf.invalidate (empty-diff)",
+    )
+    .await;
+    assert_eq!(evt.topic, "daemon.sheaf.invalidate");
+    let payload = &evt.data;
+
+    // Scope stays `changed-only` — labels ARE installed, we just
+    // computed an empty subset. Consumers get the accurate
+    // "nothing to evict" signal.
+    assert_eq!(
+        payload
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .expect("`scope` must be a string"),
+        "changed-only",
+        "empty diff with labels installed must NOT fall back to all-known"
+    );
+    let regions = payload
+        .get("invalidated")
+        .expect("payload must include `region_ids`")
+        .as_array()
+        .expect("`region_ids` must be a JSON array");
+    assert!(
+        regions.is_empty(),
+        "empty diff must emit empty region_ids; got {regions:?}"
+    );
+
+    // Generation still bumps even when nothing was touched — the
+    // event's contract is "state advanced by one tick" regardless
+    // of whether any region moved.
+    let prior: u64 = payload["prior_generation"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let generation: u64 = payload["generation"].as_str().unwrap().parse().unwrap();
+    assert!(
+        generation > prior,
+        "empty-diff emit must still bump generation ({prior} → {generation})"
+    );
+}
+
+/// Backward-compat pin: when a complex is installed but NO labels are
+/// (e.g. mache pushed the topology via `op_sheaf_set_topology`, or the
+/// daemon just started and `ComplexBuildPass` hasn't run yet), the
+/// emit MUST fall back to the coarse-v1 `scope: "all-known"` shape
+/// with every known region ID.
+///
+/// This is the guarantee that keeps consumers whose region-ID space is
+/// consumer-owned (mache Louvain) working during the transition — they
+/// can't be broken by an accidental fine-grained mode that would try
+/// to match daemon-owned labels against consumer-side region IDs.
+#[tokio::test]
+async fn watcher_falls_back_to_all_known_when_labels_not_installed() {
+    let dir = TempDir::new().unwrap();
+    let source_dir = dir.path().join("src");
+    std::fs::create_dir_all(&source_dir).unwrap();
+
+    // Complex installed, but no labels — matches the mache-pushed
+    // topology case.
+    let seed_regions = vec![10u32, 20u32, 30u32];
+
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let pass = Box::new(CountingPass {
+        name: "counting",
+        invocations,
+    });
+
+    let (ctx, router) = build_ctx_with_labels(
+        dir.path(),
+        source_dir.clone(),
+        vec![pass],
+        &seed_regions,
+        None, // no labels — forces the fallback path
+    );
+
+    let (_sub_id, mut rx, _replay, _gap) = router
+        .subscribe(
+            &["daemon.sheaf.*".to_string()],
+            None,
+            0,
+            OverflowPolicy::DropOldest,
+            16,
+        )
+        .await;
+
+    let emitter = router.emitter();
+    // Even naming a "real" changed file doesn't help — without
+    // labels, the daemon can't diff, so it emits the coarse cascade.
+    let changed = vec!["src/foo.rs".to_string()];
+
+    leyline_cli_lib::cmd_daemon::run_watcher_enrichment(&ctx, &source_dir, &changed, &emitter);
+
+    let evt = recv_event(
+        &mut rx,
+        Duration::from_secs(5),
+        "daemon.sheaf.invalidate (fallback)",
+    )
+    .await;
+    let payload = &evt.data;
+
+    // Scope tag: coarse fallback.
+    assert_eq!(
+        payload
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .expect("`scope` must be a string"),
+        "all-known",
+        "no labels installed → must fall back to coarse `all-known`"
+    );
+    // Region set: EVERY seeded region, because the daemon can't
+    // diff and safety demands over-eviction.
+    let mut got: Vec<u32> = payload
+        .get("invalidated")
+        .expect("payload must include `region_ids`")
+        .as_array()
+        .expect("`region_ids` must be a JSON array")
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+    got.sort();
+    let mut want = seed_regions.clone();
+    want.sort();
+    assert_eq!(
+        got, want,
+        "coarse fallback must surface every known region ID"
+    );
 }

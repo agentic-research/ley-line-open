@@ -298,15 +298,75 @@ fn gate_2_complex_build_pass_mechanically_reaches_cell_complex() {
         cx.edges.len(),
     );
 
-    // (h) Outcome counters match the structural counts.
+    // (h) Outcome counters match the structural counts. `region_labels`
+    // carries the token→id inverse produced during the build (sheaf
+    // gap 3 follow-up, bead `ley-line-open-e40566`) — pinned here so
+    // a refactor that drops the mapping breaks the falsifiability gate
+    // alongside its own dedicated `install_region_labels` regression
+    // pin. The map is validated separately below to keep this
+    // assertion diff-legible.
+    let region_labels = outcome.region_labels.clone();
     assert_eq!(
         outcome,
         BuildOutcome {
             nodes_added: expected_unique_tokens as u64,
             edges_added: expected_edges as u64,
             observations_processed: observations.len() as u64,
+            region_labels,
         },
         "BuildOutcome counters drifted from sink-recorded counts",
+    );
+}
+
+/// Sheaf gap 3 follow-up (bead `ley-line-open-e40566`): the token → id
+/// assignment produced during `build_complex` MUST round-trip via
+/// `BuildOutcome.region_labels`. Falsifiability: a refactor that
+/// dropped the label collection would leak an empty (or wrong) map
+/// here, which would in turn make the watcher-driven fine-grained
+/// diff silently degenerate to the coarse `all-known` fallback.
+///
+/// Kept as a separate test from the mechanical-reach gate above so
+/// the gate's assertion diff stays legible — this test owns the
+/// label-map invariant end to end.
+#[test]
+fn gate_2_build_outcome_carries_id_to_token_labels() {
+    let observations = fixture_observations();
+
+    let mut sink = Box::new(RecordingSink::new());
+    let mut tracker = Box::new(RecordingTracker::new());
+    let outcome = build_complex(&observations, sink.as_mut(), tracker.as_mut());
+
+    let expected_unique_tokens = 4usize;
+    // Snapshot the recorded region IDs before `finalize` consumes the
+    // sink. `sink.node_calls` is owned inside the box; taking the vec
+    // out first keeps both the id set and the finalize call in scope.
+    let recorded_ids: Vec<u32> = sink.node_calls.iter().map(|(rid, _)| *rid).collect();
+    // Consume the sink to keep parity with other tests (side-effect
+    // reach: proves the labels test path also exercises finalize).
+    let _cx = sink.finalize();
+
+    assert_eq!(
+        outcome.region_labels.len(),
+        expected_unique_tokens,
+        "region_labels must have one entry per unique token; got {:?}",
+        outcome.region_labels,
+    );
+    for rid in &recorded_ids {
+        assert!(
+            outcome.region_labels.contains_key(rid),
+            "region_labels missing region id {rid}; entries={:?}",
+            outcome.region_labels,
+        );
+    }
+    let want_tokens: std::collections::BTreeSet<String> = ["alpha", "beta", "gamma", "delta"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let got_tokens: std::collections::BTreeSet<String> =
+        outcome.region_labels.values().cloned().collect();
+    assert_eq!(
+        got_tokens, want_tokens,
+        "region_labels values must be the fixture's token set",
     );
 }
 

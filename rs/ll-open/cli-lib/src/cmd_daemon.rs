@@ -1363,8 +1363,9 @@ pub fn run_watcher_enrichment(
                 }),
             );
 
-            // Sheaf gap 3 (bead `ley-line-open-3b3476`): after the
-            // enrichment cycle succeeds, emit the watcher-driven
+            // Sheaf gap 3 (bead `ley-line-open-3b3476`) + follow-up
+            // (bead `ley-line-open-e40566`): after the enrichment
+            // cycle succeeds, emit the watcher-driven
             // `daemon.sheaf.invalidate` so consumers (mache's
             // `SheafSubscriber`) can evict stale region entries
             // without having to observe file changes themselves. Prior
@@ -1377,6 +1378,12 @@ pub fn run_watcher_enrichment(
             // both topics see enrichment finish before the cache
             // invalidate lands — matches the state-consistency
             // invariant "invalidate signals a fresh writable state".
+            //
+            // Payload mode: `scope: "changed-only"` when the daemon's
+            // ComplexBuildPass has installed a region-label map (the
+            // production path), otherwise `scope: "all-known"` — see
+            // `emit_watcher_sheaf_invalidate` docs for the full
+            // fallback contract.
             emit_watcher_sheaf_invalidate(ctx, changed_files, emitter);
         }
         Err(e) => {
@@ -1400,37 +1407,52 @@ pub fn run_watcher_enrichment(
 
 /// Emit `daemon.sheaf.invalidate` from the watcher path after a
 /// successful enrichment cycle. Closes sheaf gap 3
-/// (bead `ley-line-open-3b3476`): the daemon now drives region-precise
+/// (bead `ley-line-open-3b3476`): the daemon drives region-precise
 /// cache invalidation off its own file-change observations instead of
 /// requiring the consumer to poll and call `op_sheaf_invalidate`.
 ///
-/// **Region-set strategy — coarse V1.** With the current daemon-owned
-/// topology there is no file→region map: consumers (mache) compute
-/// regions from Louvain community detection over the projected graph
-/// and push topology via `sheaf_set_topology`. Without a consumer-
-/// registered file→region contract the daemon cannot compute
-/// "regions touched by these files" precisely, so V1 emits every
-/// currently-known region ID (from the persisted [`CellComplex`]
-/// installed by [`crate::daemon::complex_build_pass::ComplexBuildPass`]
-/// — sheaf gap 2) with a `scope: "all-known"` sentinel on the
-/// payload. Consumers treat it as "reparse touched something
-/// structural; play it safe and invalidate all cached region entries."
-/// Fine-grained diff (`scope: "diff"` mode) is tracked as a follow-up
-/// bead — see the sheaf-invalidation audit's Gap 3 recommended
-/// follow-up scope.
+/// # Region-set strategy — two modes
 ///
-/// **Payload shape** (JSON):
-/// - `region_ids`: array of currently-known region IDs (u32). Empty
-///   when no complex has been installed yet (fresh daemon, no
-///   enrichment run) — the event still fires as a "state advanced"
-///   continuity signal.
+/// The `scope` field on the emitted payload tells the consumer which
+/// mode this emit ran in:
+///
+/// **`scope: "changed-only"` — fine-grained diff.** When
+/// [`crate::daemon::complex_build_pass::ComplexBuildPass`] has installed
+/// a `region_id → token label` map on
+/// [`crate::daemon::sheaf_ops::SheafState`], the emit computes the
+/// subset of region IDs whose labels match `changed_files` — either as
+/// a bare path token (`foo/bar.rs`) or as a `<path>:sym:<NAME>`
+/// citation. Sheaf gap 3 follow-up (bead `ley-line-open-e40566`):
+/// this replaces the coarse "invalidate every known region" fanout
+/// with a diff that only names regions actually touched by the reparse.
+/// The label map is derived from the daemon's own `observation` table
+/// (see the pass's `build_complex` — token → id assignment) so no
+/// consumer-side registration protocol is required (ADR-0026 Path A).
+///
+/// **`scope: "all-known"` — coarse-v1 fallback.** When no label map is
+/// installed the daemon cannot compute a file→region diff, and emits
+/// every currently-known region ID (from the persisted [`CellComplex`]).
+/// Consumers treat this as "reparse touched something structural; play
+/// it safe and invalidate all cached region entries." This is the
+/// path when the daemon is fresh (no enrichment run yet) or when a
+/// consumer pushed its own topology via `op_sheaf_set_topology` — mache
+/// computes Louvain regions from Go-side signals the daemon can't
+/// label, so the daemon can't diff them.
+///
+/// # Payload shape (JSON)
+///
+/// - `region_ids`: array of region IDs (u32). In `changed-only` mode:
+///   only those regions whose labels match `changed_files`. In
+///   `all-known` mode: every region ID in the current complex. Empty
+///   when no complex has been installed yet — the event still fires
+///   as a "state advanced" continuity signal.
 /// - `count`: `region_ids.len()` — mirrors the existing consumer-
-///   driven `sheaf.invalidate` payload's `count` field so
-///   subscribers can use the same parse path.
-/// - `scope`: `"all-known"` sentinel for V1. Future fine-grained
-///   mode emits `"diff"`.
-/// - `changed_files`: files whose reparse + enrichment triggered
-///   this invalidate.
+///   driven `sheaf.invalidate` payload's `count` field so subscribers
+///   can use the same parse path.
+/// - `scope`: `"changed-only"` (fine-grained diff computed) or
+///   `"all-known"` (coarse fallback). See above.
+/// - `changed_files`: files whose reparse + enrichment triggered this
+///   invalidate.
 /// - `current_root`: 64-char hex root from the substrate controller
 ///   (matches the wire format of every state-changing op response,
 ///   paired with mache's `mache-36d961` epic). Empty string if the
@@ -1438,19 +1460,26 @@ pub fn run_watcher_enrichment(
 /// - `generation`: quoted u64 — the cache generation after the emit.
 ///   Bumped via [`leyline_sheaf::SheafCache::bump_generation`] so
 ///   consumers see strict monotonicity across watcher-driven +
-///   consumer-driven invalidates.
+///   consumer-driven invalidates. Bumps ALWAYS fire, regardless of
+///   scope — an empty region set in `changed-only` mode still moves
+///   the counter forward so mache's freshness cursor stays monotonic.
 /// - `prior_generation`: quoted u64 — the generation before the bump.
 /// - `timestamp_ms`: quoted i64, `now_ms()` at emit time.
 ///
-/// **Locking.** Takes `ctx.sheaf.cache()` briefly to snapshot region
-/// IDs and bump generation; drops the guard before opening the
-/// controller so slow disk I/O on the ctrl path doesn't hold the
-/// sheaf lock.
+/// # Locking
 ///
-/// **Best-effort.** Any failure inside this helper (currently only
-/// `read_root_hex` can fail) logs at warn and degrades the payload
-/// field rather than aborting the emit. The consumer still gets the
-/// region set + generation advance.
+/// Takes `ctx.sheaf.cache()` briefly to snapshot region IDs and bump
+/// generation, plus (in `changed-only` mode) `ctx.sheaf` label state
+/// via [`crate::daemon::sheaf_ops::SheafState::regions_touching_files`].
+/// Both guards are dropped before opening the controller so slow disk
+/// I/O on the ctrl path doesn't hold sheaf-side locks.
+///
+/// # Best-effort
+///
+/// Any failure inside this helper (currently only `read_root_hex` can
+/// fail) logs at warn and degrades the payload field rather than
+/// aborting the emit. The consumer still gets the region set +
+/// generation advance.
 ///
 /// Exposed to integration tests so the wire has a direct entry point
 /// that doesn't require spinning up the full git-poll loop.
@@ -1459,24 +1488,42 @@ pub fn emit_watcher_sheaf_invalidate(
     changed_files: &[String],
     _emitter: &crate::daemon::events::EventEmitter,
 ) {
-    // Bead `ley-line-open-1104f2`: route watcher-driven emit through
+    // Bead `ley-line-open-2191e1`: route watcher-driven emit through
     // the shared `SheafState::emit_invalidate` helper so watcher and
     // consumer paths share ONE payload contract. The `_emitter`
     // parameter is retained for API compatibility (integration tests
     // may want to observe emits without a live SheafState); the
     // actual emit goes through `state.emit` which uses the emitter
     // installed via `SheafState::set_emitter`.
-    let (invalidated, prior_generation, generation) = {
+    //
+    // Step 1: try the fine-grained diff. Reads the label map first
+    // (no cache lock held) so the cache critical section stays short.
+    // Returns `Some(_)` when labels are installed and a complex is
+    // present; `None` in either the coarse-fallback case (no labels)
+    // or the degenerate "labels but no complex" case.
+    let fine_grained: Option<Vec<u32>> = ctx.sheaf.regions_touching_files(changed_files);
+
+    let (invalidated, scope, prior_generation, generation) = {
         let mut cache = ctx.sheaf.cache().lock().unwrap();
-        let invalidated: Vec<u32> = cache
-            .complex()
-            .map(|cx| cx.nodes.clone())
-            .unwrap_or_default();
+        let (regions, scope_tag) = match fine_grained {
+            Some(diff) => (diff, "changed-only"),
+            None => {
+                // Coarse-v1 fallback: emit every currently-known region ID
+                // from the installed complex. Empty when no complex has been
+                // installed yet (fresh daemon) — the event still fires as a
+                // "state advanced" continuity signal.
+                let all = cache
+                    .complex()
+                    .map(|cx| cx.nodes.clone())
+                    .unwrap_or_default();
+                (all, "all-known")
+            }
+        };
         let prior = cache.generation();
         // `gen` is a reserved keyword in Rust 2024 edition — use a
         // spelled-out binding to avoid the r#gen escape hatch.
         let bumped = cache.bump_generation();
-        (invalidated, prior, bumped)
+        (regions, scope_tag, prior, bumped)
     };
 
     let current_root = match crate::daemon::ops::read_root_hex(&ctx.ctrl_path) {
@@ -1487,12 +1534,12 @@ pub fn emit_watcher_sheaf_invalidate(
         }
     };
 
-    // scope="all-known" per the audit's coarse-v1 convention. Fine-grained
-    // diff (bead ley-line-open-e40566, PR #146 in flight) upgrades this
-    // to scope="changed-only" once the file→region map is in place.
+    // Route through the shared `SheafState::emit_invalidate` helper
+    // (bead ley-line-open-2191e1) — consumer + watcher paths share
+    // ONE payload contract; drift is impossible by construction.
     ctx.sheaf.emit_invalidate(
         invalidated,
-        "all-known",
+        scope,
         changed_files,
         current_root,
         generation,

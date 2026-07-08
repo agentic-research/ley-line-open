@@ -5369,7 +5369,10 @@ mod tests {
     /// rather than panicking.
     #[test]
     fn decode_inline_payload_roundtrips_f32_vec() {
-        let original = vec![1.0f32, -2.5, 3.14159, 0.0];
+        // Non-pi test fixture (was 3.14159 — flagged by clippy as an
+        // approximate PI literal, which suggested std::f32::consts::PI
+        // and confuses future readers).
+        let original = vec![1.0f32, -2.5, 3.14195, 0.0];
         let bytes = {
             let mut b = Vec::new();
             for v in &original {

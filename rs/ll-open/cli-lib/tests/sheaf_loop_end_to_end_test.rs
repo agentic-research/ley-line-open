@@ -111,23 +111,26 @@ fn fresh_arena(dir: &Path) -> PathBuf {
     ctrl_path
 }
 
-/// Seed 5 observation rows across 4 distinct tokens so
+/// Seed 5 observation rows across 4 distinct path-shaped tokens so
 /// `ComplexBuildPass::run` installs a non-empty `CellComplex` — 4
-/// nodes (`alpha`, `beta`, `gamma`, `delta`) and 4 co-occurrence
-/// edges. Mirrors the seed set in
-/// `complex_build_pass_persist.rs::seed_observations` so the region
-/// count on the wire below (`4`) reads identically to the gap 2
-/// regression test.
+/// nodes (`foo.rs`, `foo.rs:sym:foo`, `bar.rs`, `bar.rs:sym:bar`) and
+/// 4 co-occurrence edges. Path-shaped tokens match the shape
+/// `SessionObservationPass::extract_mentions` produces in production
+/// (bare path token + `<path>:sym:<NAME>` citation), so the sheaf
+/// gap 3 follow-up's fine-grained region diff (bead
+/// `ley-line-open-e40566`) can resolve the labels back to touched
+/// files. When `foo.rs` changes, the two `foo.rs*` regions become
+/// the fine-grained `region_ids`; the two `bar.rs*` regions stay out.
 ///
 /// The `observation` table must exist before this runs — the caller
 /// creates the schema via `create_observation_schema` first.
 fn seed_observations(conn: &Connection) {
     let rows: [&str; 5] = [
-        r#"["alpha","beta"]"#,
-        r#"["alpha","gamma"]"#,
-        r#"["beta","gamma"]"#,
-        r#"["delta"]"#,
-        r#"["alpha","delta"]"#,
+        r#"["foo.rs","foo.rs:sym:foo"]"#,
+        r#"["foo.rs","bar.rs"]"#,
+        r#"["foo.rs:sym:foo","bar.rs:sym:bar"]"#,
+        r#"["bar.rs:sym:bar"]"#,
+        r#"["foo.rs","bar.rs:sym:bar"]"#,
     ];
     for (i, mentions) in rows.iter().enumerate() {
         conn.execute(
@@ -235,13 +238,17 @@ const LOOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The load-bearing pin. A real file change drives a real reparse, real
 /// enrichment, and produces a single `daemon.sheaf.invalidate` event on
-/// the bus with the coarse-v1 payload contract intact.
+/// the bus with the full payload contract intact.
 ///
-/// If this test breaks after any of gaps 1/2/3 is refactored, the sheaf
-/// loop is severed and every downstream "region-precise invalidation
-/// inside the daemon" claim is again paper.
+/// Post sheaf gap 3 follow-up (bead `ley-line-open-e40566`): the emit
+/// is fine-grained by default — `scope: "changed-only"` with
+/// `region_ids` restricted to the subset whose token labels match
+/// `changed_files`. If this test breaks after any of gaps 1/2/3 or
+/// e40566 is refactored, the sheaf loop is severed and every
+/// downstream "region-precise invalidation inside the daemon" claim
+/// is again paper.
 #[tokio::test]
-async fn file_change_drives_sheaf_invalidate_with_full_coarse_v1_payload() {
+async fn file_change_drives_fine_grained_sheaf_invalidate_end_to_end() {
     let dir = TempDir::new().expect("tempdir");
     let source_dir = dir.path().join("src");
     std::fs::create_dir_all(&source_dir).expect("mkdir src");
@@ -390,15 +397,23 @@ async fn file_change_drives_sheaf_invalidate_with_full_coarse_v1_payload() {
     let payload = &evt.data;
 
     // ------------------------------------------------------------------
-    // Coarse-v1 payload contract (see `emit_watcher_sheaf_invalidate`
-    // docstring at cmd_daemon.rs:1260-1281). Eight fields; each is
-    // load-bearing for at least one subscriber. Assert every one.
+    // Payload contract. Eight fields; each is load-bearing for at
+    // least one subscriber. Assert every one. Sheaf gap 3 follow-up
+    // (bead `ley-line-open-e40566`) upgraded the region set from
+    // coarse-v1 (`all-known` — every region ID in the topology) to
+    // fine-grained (`changed-only` — the subset of regions whose
+    // labels match `changed_files`). See the `emit_watcher_sheaf_invalidate`
+    // docstring for the full two-mode contract.
     // ------------------------------------------------------------------
 
-    // 1. `region_ids` — u32 array. Must be non-empty because the
-    //    priming enrichment installed a 4-node complex; scope="all-known"
-    //    means the emit surfaces every known region ID regardless of
-    //    which files actually changed.
+    // 1. `region_ids` — u32 array. Fine-grained mode: the emit
+    //    subsets to regions whose labels match `changed_files`. The
+    //    seed fixture has 4 nodes with labels
+    //    {`foo.rs`, `foo.rs:sym:foo`, `bar.rs`, `bar.rs:sym:bar`} and
+    //    the changed file is `foo.rs`, so the diff picks up the two
+    //    foo.rs-labelled regions and drops the two bar.rs-labelled
+    //    ones. If region_ids came back with 4 IDs (the full topology)
+    //    the fine-grained resolver silently regressed to coarse-v1.
     let region_ids_arr = payload
         .get("invalidated")
         .expect("payload must include `region_ids`")
@@ -406,11 +421,13 @@ async fn file_change_drives_sheaf_invalidate_with_full_coarse_v1_payload() {
         .expect("`region_ids` must be a JSON array");
     assert_eq!(
         region_ids_arr.len(),
-        4,
-        "region_ids must equal the installed CellComplex's node count \
-         (4 nodes: alpha/beta/gamma/delta from the seed set); got {}. \
-         Empty here means gap 2 (persistence) is broken — ComplexBuildPass \
-         built the complex but never installed it in SheafState.cache.",
+        2,
+        "fine-grained region_ids must contain exactly the two \
+         foo.rs-labelled regions (foo.rs and foo.rs:sym:foo); got \
+         {} region(s). A count of 4 means the emit fell back to \
+         coarse-v1 (all-known); a count of 0 means the label install \
+         path (ComplexBuildPass::install_region_labels or \
+         SheafState::install_region_labels) is broken.",
         region_ids_arr.len(),
     );
     for v in region_ids_arr {
@@ -433,17 +450,23 @@ async fn file_change_drives_sheaf_invalidate_with_full_coarse_v1_payload() {
         region_ids_arr.len(),
     );
 
-    // 3. `scope` — coarse-v1 sentinel "all-known". A refactor that
-    //    ships a fine-grained diff mode must swap this string; catching
-    //    the flip here forces the ADR/CHANGELOG update rather than
-    //    silently breaking mache's response parser.
+    // 3. `scope` — sheaf gap 3 follow-up sentinel `"changed-only"`.
+    //    With `ComplexBuildPass` in the pipeline the label map is
+    //    installed and the emit computes a fine-grained diff. Coarse
+    //    fallback `"all-known"` here would mean the label install
+    //    path regressed silently — the daemon lost its file→region
+    //    mapping and the payload no longer conveys "region-precise
+    //    invalidation" that the "sheaves as the moat" pitch relies on.
     let scope = payload
         .get("scope")
         .and_then(|v| v.as_str())
         .expect("`scope` must be a string");
     assert_eq!(
-        scope, "all-known",
-        "coarse-v1 scope sentinel must be \"all-known\"; got {scope:?}",
+        scope, "changed-only",
+        "labels installed via ComplexBuildPass → scope must be \
+         \"changed-only\" (fine-grained diff); got {scope:?}. A value \
+         of \"all-known\" here means the label install path regressed \
+         and the daemon fell back to the coarse-v1 fanout."
     );
 
     // 4. `changed_files` — array of the files the watcher observed.

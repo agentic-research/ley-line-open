@@ -10,7 +10,25 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
-Nothing yet — post-v0.5.9 changes land here.
+### Changed
+
+- `daemon.sheaf.invalidate` payload from the watcher path is now
+  fine-grained by default. When [`ComplexBuildPass`] has installed a
+  `region_id → token label` map (production path since v0.5.9), the
+  emit computes a per-file diff — `region_ids` contains only the
+  regions whose labels either equal one of `changed_files` or start
+  with `<file>:sym:`. The payload's new `scope` value is
+  `"changed-only"` in this mode. When no labels are installed (fresh
+  daemon before first enrichment, mache-pushed topology via
+  `op_sheaf_set_topology`, or any consumer whose region-ID space is
+  externally owned), the emit falls back to the coarse-v1 shape:
+  `scope: "all-known"` with every currently-known region ID. Bead
+  `ley-line-open-e40566` (sheaf gap 3 follow-up); "Path A" from the
+  sheaf-invalidation audit (daemon-owned mapping — the token → id map
+  is derivable from the daemon's own `observation` table, so no
+  consumer registration protocol is required). Payload field names
+  are unchanged; consumers that read `region_ids` + `count` continue
+  to work without code changes and get precise invalidation for free.
 
 ## [0.5.9] — 2026-07-07
 

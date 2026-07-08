@@ -1200,6 +1200,22 @@ pub fn run_watcher_enrichment(
                     "duration_ms": duration_ms.to_string(),
                 }),
             );
+
+            // Sheaf gap 3 (bead `ley-line-open-3b3476`): after the
+            // enrichment cycle succeeds, emit the watcher-driven
+            // `daemon.sheaf.invalidate` so consumers (mache's
+            // `SheafSubscriber`) can evict stale region entries
+            // without having to observe file changes themselves. Prior
+            // to this wire the loop from source edit → region-precise
+            // cascade was closed only from the consumer side
+            // (`op_sheaf_invalidate` self-called). See
+            // `docs/audits/sheaf-invalidation-trace.md` § Gap 3.
+            //
+            // Ordering: emitted AFTER `.complete` so subscribers to
+            // both topics see enrichment finish before the cache
+            // invalidate lands — matches the state-consistency
+            // invariant "invalidate signals a fresh writable state".
+            emit_watcher_sheaf_invalidate(ctx, changed_files, emitter);
         }
         Err(e) => {
             log::warn!("watcher-driven enrichment failed: {e:#}");
@@ -1211,8 +1227,111 @@ pub fn run_watcher_enrichment(
                     "error": format!("{e:#}"),
                 }),
             );
+            // Deliberately do NOT emit `daemon.sheaf.invalidate` on
+            // the failure path — the sheaf cache state is unchanged
+            // from the pre-enrichment view, so telling consumers to
+            // evict would be a false signal. Next successful tick
+            // will fire the invalidate.
         }
     }
+}
+
+/// Emit `daemon.sheaf.invalidate` from the watcher path after a
+/// successful enrichment cycle. Closes sheaf gap 3
+/// (bead `ley-line-open-3b3476`): the daemon now drives region-precise
+/// cache invalidation off its own file-change observations instead of
+/// requiring the consumer to poll and call `op_sheaf_invalidate`.
+///
+/// **Region-set strategy — coarse V1.** With the current daemon-owned
+/// topology there is no file→region map: consumers (mache) compute
+/// regions from Louvain community detection over the projected graph
+/// and push topology via `sheaf_set_topology`. Without a consumer-
+/// registered file→region contract the daemon cannot compute
+/// "regions touched by these files" precisely, so V1 emits every
+/// currently-known region ID (from the persisted [`CellComplex`]
+/// installed by [`crate::daemon::complex_build_pass::ComplexBuildPass`]
+/// — sheaf gap 2) with a `scope: "all-known"` sentinel on the
+/// payload. Consumers treat it as "reparse touched something
+/// structural; play it safe and invalidate all cached region entries."
+/// Fine-grained diff (`scope: "diff"` mode) is tracked as a follow-up
+/// bead — see the sheaf-invalidation audit's Gap 3 recommended
+/// follow-up scope.
+///
+/// **Payload shape** (JSON):
+/// - `region_ids`: array of currently-known region IDs (u32). Empty
+///   when no complex has been installed yet (fresh daemon, no
+///   enrichment run) — the event still fires as a "state advanced"
+///   continuity signal.
+/// - `count`: `region_ids.len()` — mirrors the existing consumer-
+///   driven `sheaf.invalidate` payload's `count` field so
+///   subscribers can use the same parse path.
+/// - `scope`: `"all-known"` sentinel for V1. Future fine-grained
+///   mode emits `"diff"`.
+/// - `changed_files`: files whose reparse + enrichment triggered
+///   this invalidate.
+/// - `current_root`: 64-char hex root from the substrate controller
+///   (matches the wire format of every state-changing op response,
+///   paired with mache's `mache-36d961` epic). Empty string if the
+///   controller read fails — best-effort, degrades honestly.
+/// - `generation`: quoted u64 — the cache generation after the emit.
+///   Bumped via [`leyline_sheaf::SheafCache::bump_generation`] so
+///   consumers see strict monotonicity across watcher-driven +
+///   consumer-driven invalidates.
+/// - `prior_generation`: quoted u64 — the generation before the bump.
+/// - `timestamp_ms`: quoted i64, `now_ms()` at emit time.
+///
+/// **Locking.** Takes `ctx.sheaf.cache()` briefly to snapshot region
+/// IDs and bump generation; drops the guard before opening the
+/// controller so slow disk I/O on the ctrl path doesn't hold the
+/// sheaf lock.
+///
+/// **Best-effort.** Any failure inside this helper (currently only
+/// `read_root_hex` can fail) logs at warn and degrades the payload
+/// field rather than aborting the emit. The consumer still gets the
+/// region set + generation advance.
+///
+/// Exposed to integration tests so the wire has a direct entry point
+/// that doesn't require spinning up the full git-poll loop.
+pub fn emit_watcher_sheaf_invalidate(
+    ctx: &Arc<crate::daemon::DaemonContext>,
+    changed_files: &[String],
+    emitter: &crate::daemon::events::EventEmitter,
+) {
+    let (region_ids, prior_generation, generation) = {
+        let mut cache = ctx.sheaf.cache().lock().unwrap();
+        let region_ids: Vec<u32> = cache
+            .complex()
+            .map(|cx| cx.nodes.clone())
+            .unwrap_or_default();
+        let prior = cache.generation();
+        // `gen` is a reserved keyword in Rust 2024 edition — use a
+        // spelled-out binding to avoid the r#gen escape hatch.
+        let bumped = cache.bump_generation();
+        (region_ids, prior, bumped)
+    };
+
+    let current_root = match crate::daemon::ops::read_root_hex(&ctx.ctrl_path) {
+        Ok(hex) => hex,
+        Err(e) => {
+            log::warn!("emit_watcher_sheaf_invalidate: read_root_hex failed: {e:#}");
+            String::new()
+        }
+    };
+
+    emitter.emit(
+        "daemon.sheaf.invalidate",
+        "leyline",
+        serde_json::json!({
+            "region_ids": region_ids,
+            "count": region_ids.len() as u32,
+            "scope": "all-known",
+            "changed_files": changed_files,
+            "current_root": current_root,
+            "generation": generation.to_string(),
+            "prior_generation": prior_generation.to_string(),
+            "timestamp_ms": crate::daemon::now_ms().to_string(),
+        }),
+    );
 }
 
 /// Get the current HEAD commit hash.

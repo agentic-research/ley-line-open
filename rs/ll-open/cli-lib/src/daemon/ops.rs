@@ -315,7 +315,12 @@ fn promote_touched(ctx: &DaemonContext, ids: &[&str]) {
 /// part of the wire-error contract — clients see this when the
 /// controller path is broken. Wire-format key is `"current_root":
 /// "<hex>"` (paired with mache `mache-36d961` epic).
-fn read_root_hex(ctrl_path: &Path) -> Result<String> {
+///
+/// `pub(crate)` since sheaf gap 3 (bead `ley-line-open-3b3476`): the
+/// watcher-driven `daemon.sheaf.invalidate` emit in `cmd_daemon.rs`
+/// needs the current root as a cache-invalidation key on its payload.
+/// Every other caller stays inside `ops.rs`.
+pub(crate) fn read_root_hex(ctrl_path: &Path) -> Result<String> {
     let ctrl = Controller::open_or_create(ctrl_path).context("open controller")?;
     let root = ctrl.current_root();
     let mut s = String::with_capacity(64);

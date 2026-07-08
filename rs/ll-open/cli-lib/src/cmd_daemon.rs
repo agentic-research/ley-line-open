@@ -491,6 +491,21 @@ pub async fn run_daemon(
     }
 
     // 10. Periodic snapshot timer — debounce-flush living db to arena.
+    //
+    // Idle-CPU fix (bead ley-line-open-1a0a2a): skip the snapshot when
+    // the living db hasn't changed since the previous successful snapshot.
+    // `sqlite3_total_changes()` is O(1) and covers all INSERT/UPDATE/DELETE
+    // rows. Fresh daemons idle near zero CPU because the msync-a-big-arena
+    // path only fires when writes actually happened. Under load the timer
+    // still fires every SNAPSHOT_INTERVAL because writes advance the
+    // counter each tick. Long-idle daemons (mache-scale DBs sitting idle
+    // for minutes/hours) now stay quiet instead of spending CPU on
+    // no-op serialize+msync cycles.
+    //
+    // The initial snapshot at line 207 (mache/remote-consumer visibility)
+    // already fired before the timer loop starts, so a fresh daemon has
+    // exactly one snapshot in the arena regardless of whether the timer
+    // ever fires.
     {
         let snap_ctx = ctx.clone();
         let snap_ctrl = ctrl_path.clone();
@@ -498,12 +513,25 @@ pub async fn run_daemon(
         tokio::spawn(async move {
             use tokio::time::interval;
             let mut tick = interval(SNAPSHOT_INTERVAL);
+            let mut last_snapshot_changes: u64 = read_total_changes(&snap_ctx.live_db).unwrap_or(0);
             loop {
                 tick.tick().await;
+                // Cheap dirty-check: read `total_changes()` under a
+                // brief try_lock. If the counter hasn't advanced since
+                // the last successful snapshot, skip the whole
+                // serialize/msync path — nothing to persist.
+                let current_changes = match read_total_changes(&snap_ctx.live_db) {
+                    Some(n) => n,
+                    None => continue, // contended; try again next tick
+                };
+                if current_changes == last_snapshot_changes {
+                    continue; // db is clean; no work to do
+                }
                 // Non-blocking: skip this tick if op_reparse / op_enrich
                 // is mid-flight rather than queuing snapshots behind it.
                 // 5fea4e — block-the-tokio-worker prevention.
                 if try_snapshot_or_log(&snap_ctx.live_db, &snap_ctrl, "periodic snapshot failed") {
+                    last_snapshot_changes = current_changes;
                     emitter.emit("daemon.snapshot", "leyline", serde_json::json!({}));
                 }
             }
@@ -718,6 +746,35 @@ pub fn snapshot_or_log(
 /// and any concurrent UDS query (which only borrows the db read-only)
 /// blocks behind the burst. `WouldBlock` and `Poisoned` are both
 /// recoverable — the next tick retries the lock.
+/// Best-effort read of `sqlite3_total_changes()` under a brief try_lock.
+///
+/// Returns `None` if the mutex is contended (some other task is holding
+/// the live db) or poisoned. Callers should treat contention as
+/// "unknown, try again next tick" rather than "clean" — snapshotting
+/// slightly more often is safer than skipping a real write.
+///
+/// Used by the periodic snapshot timer (bead `ley-line-open-1a0a2a`) as
+/// the dirty-check: if the counter hasn't advanced since the last
+/// successful snapshot, the timer skips the whole
+/// serialize-and-msync path. Idle daemons with mache-scale DBs used to
+/// pay the O(DB_size) msync cost every 500ms even when no writes
+/// happened; now they stay near zero CPU.
+///
+/// `total_changes()` is O(1) — SQLite maintains it as an internal
+/// counter that increments on INSERT/UPDATE/DELETE row events. It does
+/// NOT increment on schema-only changes (CREATE TABLE, CREATE INDEX,
+/// etc.) which is fine for our case: the daemon initializes schema at
+/// startup then serves data writes; we snapshot after the initial
+/// setup (line 207).
+pub fn read_total_changes(live_db: &std::sync::Mutex<rusqlite::Connection>) -> Option<u64> {
+    use std::sync::TryLockError;
+    match live_db.try_lock() {
+        Ok(guard) => Some(guard.total_changes()),
+        Err(TryLockError::WouldBlock) => None,
+        Err(TryLockError::Poisoned(_)) => None,
+    }
+}
+
 pub fn try_snapshot_or_log(
     live_db: &std::sync::Mutex<rusqlite::Connection>,
     ctrl_path: &Path,
@@ -1105,6 +1162,78 @@ mod tests {
     // The tests below assert Ok(None) is returned in both cases (cold
     // start always remains the safe fallback) and exercise both fresh
     // and error code paths.
+
+    // ── read_total_changes: idle-CPU dirty-check pins ─────────────────
+    //
+    // The periodic snapshot timer (line 500-550) uses `read_total_changes`
+    // to skip serialize+msync when nothing has been written since the
+    // last snapshot. Pin the semantics so a refactor that broke the
+    // dirty-check would surface here (regressing bead
+    // `ley-line-open-1a0a2a`).
+
+    #[test]
+    fn read_total_changes_returns_zero_on_fresh_connection_with_only_schema() {
+        // Schema DDL doesn't advance total_changes — only row events
+        // (INSERT/UPDATE/DELETE) do. A fresh in-memory connection with
+        // only CREATE TABLE run against it should read as zero, so the
+        // snapshot timer skips ticks on daemons that never received a
+        // write.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (x INTEGER)").unwrap();
+        let live = StdMutex::new(conn);
+        assert_eq!(read_total_changes(&live), Some(0));
+    }
+
+    #[test]
+    fn read_total_changes_advances_on_row_writes() {
+        // total_changes() must increment on real writes so the timer
+        // fires a snapshot when it should.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (x INTEGER)").unwrap();
+        let live = StdMutex::new(conn);
+        let before = read_total_changes(&live).unwrap();
+        live.lock()
+            .unwrap()
+            .execute("INSERT INTO t VALUES (1)", [])
+            .unwrap();
+        let after = read_total_changes(&live).unwrap();
+        assert!(
+            after > before,
+            "total_changes must advance after INSERT — got before={before}, after={after}",
+        );
+    }
+
+    #[test]
+    fn read_total_changes_returns_none_when_contended() {
+        // If another holder has the lock (e.g. op_reparse is running),
+        // the dirty-check returns None. Timer treats None as "try
+        // again next tick" — skipping is safer than snapshotting on
+        // stale data, and safer than blocking the tokio worker.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let live = StdMutex::new(conn);
+        let _held_guard = live.lock().unwrap();
+        assert_eq!(read_total_changes(&live), None);
+    }
+
+    #[test]
+    fn read_total_changes_returns_none_when_poisoned() {
+        // Poison recovery is deliberately NOT auto-attempted here.
+        // Poisoned mutex means some earlier writer panicked; the
+        // regular try_snapshot_or_log path already has recovery
+        // logic (line 738-748). The dirty-check just returns None so
+        // the timer treats it as "unknown" — will retry next tick,
+        // and if the snapshot itself is attempted it'll go through
+        // the poisoning recovery path.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let live = std::sync::Arc::new(StdMutex::new(conn));
+        let live_thread = live.clone();
+        let handle = std::thread::spawn(move || {
+            let _guard = live_thread.lock().unwrap();
+            panic!("intentionally poison the lock");
+        });
+        let _ = handle.join();
+        assert_eq!(read_total_changes(&live), None);
+    }
 
     #[test]
     fn try_snapshot_or_log_skips_when_lock_contended() {

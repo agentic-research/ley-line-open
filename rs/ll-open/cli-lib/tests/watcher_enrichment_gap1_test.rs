@@ -143,16 +143,25 @@ fn build_ctx(
     // ourselves. Without this the CountingPass's Ok(...) still causes
     // `run_all` to bail with "no such table: _meta", masquerading the
     // success path as a failure.
-    let live_db = Connection::open_in_memory().unwrap();
-    live_db
+    //
+    // File-backed WAL live db — pool needs a real file (bead
+    // `ley-line-open-f0239d`).
+    let live_db_path = ctrl_path.with_extension("live.db");
+    let writer = Connection::open(&live_db_path).unwrap();
+    let mode: String = writer
+        .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode.to_lowercase(), "wal");
+    writer
         .execute_batch("CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT);")
         .unwrap();
+    let live_db = leyline_cli_lib::daemon::db_pool::LiveDb::new(writer, &live_db_path, 4).unwrap();
 
     let ctx = Arc::new(DaemonContext {
         ctrl_path,
         ext: Arc::new(NoExt),
         router: router.clone(),
-        live_db: Mutex::new(live_db),
+        live_db,
         enrich_inflight: Arc::new(Mutex::new(std::collections::HashSet::new())),
         source_dir: Some(source_dir),
         lang_filter: None,

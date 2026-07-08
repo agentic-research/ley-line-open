@@ -46,6 +46,12 @@ rand = "0.9"
 hex = "0.4"
 leyline-fs = { path = "../fs", default-features = false }
 rusqlite = { version = "0.39", features = ["bundled", "serialize"] }
+# WAL adoption 15b (bead ley-line-open-f0239d): connection pool for
+# concurrent-reader win. r2d2_sqlite 0.34 pairs with rusqlite 0.39;
+# newer versions require rusqlite 0.40 and would fan out a workspace
+# bump we don't want here.
+r2d2 = "0.8"
+r2d2_sqlite = "0.34"
 sqlite-vec = { version = "0.1", optional = true }
 # Real embedder backend for the `vec` feature. Mirrors LL's `leyline-embed`
 # (closed sister repo) — fastembed wraps ONNX-Runtime to run small

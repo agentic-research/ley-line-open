@@ -41,11 +41,16 @@ fn build_blackbox_ctx(dir: &Path) -> Arc<DaemonContext> {
         .expect("set arena");
     drop(ctrl);
 
+    // File-backed WAL LiveDb — pool needs a real file (bead
+    // `ley-line-open-f0239d`).
+    let live_db_path = ctrl_path.with_extension("live.db");
+    let live_db = leyline_cli_lib::daemon::db_pool::LiveDb::open_fresh_for_test(&live_db_path);
+
     Arc::new(DaemonContext {
         ctrl_path,
         ext: Arc::new(NoExt),
         router: EventRouter::new(16),
-        live_db: Mutex::new(rusqlite::Connection::open_in_memory().unwrap()),
+        live_db,
         enrich_inflight: Arc::new(Mutex::new(std::collections::HashSet::new())),
         source_dir: None,
         lang_filter: None,

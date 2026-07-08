@@ -164,12 +164,21 @@ fn build_full_ctx(dir: &Path, source_dir: PathBuf) -> (Arc<DaemonContext>, Arc<E
     // own emitter), but mirrors production wiring exactly.
     sheaf.set_emitter(router.emitter());
 
-    let live_db = Connection::open_in_memory().expect("open in-memory sqlite");
+    // File-backed WAL live db — pool needs a real file (bead
+    // `ley-line-open-f0239d`).
+    let live_db_path = ctrl_path.with_extension("live.db");
+    let writer = Connection::open(&live_db_path).expect("open live db");
+    let mode: String = writer
+        .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
+        .expect("set journal_mode=WAL");
+    assert_eq!(mode.to_lowercase(), "wal");
     // Ensure the `observation` schema exists so `seed_observations`
     // can INSERT before the pipeline runs. `ComplexBuildPass::run`
     // itself calls `ensure_observation_table`; creating it explicitly
     // here decouples the seeding step from pipeline execution order.
-    create_observation_schema(&live_db).expect("create observation schema");
+    create_observation_schema(&writer).expect("create observation schema");
+    let live_db = leyline_cli_lib::daemon::db_pool::LiveDb::new(writer, &live_db_path, 4)
+        .expect("build live db");
 
     // Production pass list (minimum viable to close the sheaf loop):
     //   TreeSitterPass  — real parse pass; writes to nodes/_ast/etc.
@@ -187,7 +196,7 @@ fn build_full_ctx(dir: &Path, source_dir: PathBuf) -> (Arc<DaemonContext>, Arc<E
         ctrl_path,
         ext: Arc::new(NoExt),
         router: router.clone(),
-        live_db: Mutex::new(live_db),
+        live_db,
         enrich_inflight: Arc::new(Mutex::new(std::collections::HashSet::new())),
         source_dir: Some(source_dir),
         // `TreeSitterPass::run` calls `parse_into_conn(conn, source, None, ...)`
@@ -269,7 +278,7 @@ async fn file_change_drives_fine_grained_sheaf_invalidate_end_to_end() {
     // Mirrors the daemon's cold-start parse before `git_watch_loop`
     // takes over at `cmd_daemon.rs:513`.
     {
-        let guard = ctx.live_db.lock().expect("live_db lock");
+        let guard = ctx.live_db.writer.lock().expect("live_db lock");
         leyline_cli_lib::cmd_parse::parse_into_conn(&guard, &source_dir, None, None)
             .expect("initial parse");
     }
@@ -282,7 +291,7 @@ async fn file_change_drives_fine_grained_sheaf_invalidate_end_to_end() {
     // This test targets the non-empty case so the `region_ids` shape
     // is exercised end-to-end, not just structurally-present.
     {
-        let guard = ctx.live_db.lock().expect("live_db lock");
+        let guard = ctx.live_db.writer.lock().expect("live_db lock");
         seed_observations(&guard);
     }
 
@@ -340,7 +349,7 @@ async fn file_change_drives_fine_grained_sheaf_invalidate_end_to_end() {
     // `read_root_hex` from the controller path that arena creation
     // already populated).
     let reparse = {
-        let guard = ctx.live_db.lock().expect("live_db lock");
+        let guard = ctx.live_db.writer.lock().expect("live_db lock");
         leyline_cli_lib::cmd_parse::parse_into_conn(
             &guard,
             &source_dir,
@@ -586,7 +595,7 @@ async fn identical_content_rewrite_still_emits_invalidate_with_empty_changed_fil
     // Initial parse establishes the mtime + content-hash baseline for
     // the incremental reparse to compare against.
     {
-        let guard = ctx.live_db.lock().expect("live_db lock");
+        let guard = ctx.live_db.writer.lock().expect("live_db lock");
         leyline_cli_lib::cmd_parse::parse_into_conn(&guard, &source_dir, None, None)
             .expect("initial parse");
     }
@@ -609,7 +618,7 @@ async fn identical_content_rewrite_still_emits_invalidate_with_empty_changed_fil
     // structurally change and skips the tree-sitter walk.
     std::fs::write(&foo_path, foo_content).expect("re-write foo.rs with identical content");
     let reparse = {
-        let guard = ctx.live_db.lock().expect("live_db lock");
+        let guard = ctx.live_db.writer.lock().expect("live_db lock");
         leyline_cli_lib::cmd_parse::parse_into_conn(
             &guard,
             &source_dir,

@@ -379,18 +379,18 @@ pub fn start_drain(ctx: Arc<DaemonContext>) {
             let mut count = 0u64;
             for task in batch {
                 let content = {
-                    let conn = match ctx.live_db.lock() {
-                        Ok(g) => g,
-                        Err(poisoned) => {
-                            log::error!("live_db mutex poisoned in embed drain, recovering");
-                            poisoned.into_inner()
-                        }
-                    };
-                    match crate::daemon::ops::query_node_record(&conn, &task.node_id) {
+                    // WAL 15b (bead `ley-line-open-f0239d`): read via the
+                    // pool, not the writer. `query_node_record` is a
+                    // SELECT-only shape, so a pooled reader is the right
+                    // connection — the writer stays available for
+                    // reparse/enrich while the embed drain scans records.
+                    match ctx.with_read(|conn| {
+                        crate::daemon::ops::query_node_record(conn, &task.node_id)
+                    }) {
                         Ok(opt) => opt,
                         Err(e) => {
                             // Don't silently skip every task forever if the
-                            // connection's broken — surface the error so
+                            // pool's broken — surface the error so
                             // operators can investigate.
                             log::warn!(
                                 "embed drain: failed to read record for {}: {e:#}",

@@ -680,7 +680,16 @@ pub(crate) const OP_QUERY_DEFAULT_ROW_LIMIT: usize = 1000;
 fn op_query(ctx: &DaemonContext, sql: &str, limit: Option<usize>) -> Result<String> {
     let limit = limit.unwrap_or(OP_QUERY_DEFAULT_ROW_LIMIT);
 
-    ctx.with_read(|conn| {
+    // Bead `ley-line-open-f0239d`: `op_query` accepts arbitrary SQL and
+    // can't statically distinguish reads from writes (`DROP TABLE` looks
+    // like a query to the wire). Use the writer connection so every
+    // shape of SQL still works — the pre-15b `with_read` classification
+    // was a misclass hidden by the shared `Mutex<Connection>`. The
+    // destructive-SQL foot-gun documented at
+    // `test_op_query_destructive_runs_today_pin_for_6213d4` continues
+    // to work (that's the whole point of the pin — 6213d4 will lock
+    // this down as an *intentional* change).
+    ctx.with_write(|conn| {
         let mut stmt = conn.prepare(sql).context("prepare SQL")?;
         let col_count = stmt.column_count();
         let headers: Vec<String> = (0..col_count)
@@ -1405,10 +1414,10 @@ fn try_enrich_file(ctx: &std::sync::Arc<DaemonContext>, file: &str) -> bool {
 
         eprintln!("lazy enrich (bg): triggering LSP for {file_owned}");
 
-        let guard = match ctx_owned.live_db.lock() {
+        let guard = match ctx_owned.live_db.writer.lock() {
             Ok(g) => g,
             Err(p) => {
-                log::error!("lazy enrich: live_db poisoned, recovering");
+                log::error!("lazy enrich: live_db writer poisoned, recovering");
                 p.into_inner()
             }
         };
@@ -2674,8 +2683,11 @@ fn query_agreement_observations(
     token: &str,
     payload_kind: &str,
 ) -> Result<Vec<AgreementRow>> {
-    // Delegate to L8's authoritative schema (single source of truth).
-    crate::daemon::observation_schema::create_observation_schema(conn)?;
+    // Caller must ensure the schema exists via `create_observation_schema`
+    // before calling this function — see `op_agreement`'s two-phase
+    // pattern (bead `ley-line-open-f0239d`). The read pool's
+    // `query_only=ON` pragma rejects the CREATE TABLE inline; the
+    // installer must run through `with_write`.
 
     // Latest observation per source for this `(token, payload_kind)`.
     // SQLite's "bare-column" aggregation rule (since 3.7.11) means
@@ -2822,6 +2834,15 @@ fn classify_agreement_dims(
 /// most-recent `payload_inline` per source and reports
 /// `detect_violations`. Read-only.
 fn op_agreement(ctx: &std::sync::Arc<DaemonContext>, req: &AgreementRequest) -> Result<String> {
+    // Lazy schema install for edge-case callers (test fixtures / fresh
+    // daemons) — production ensures the schema via
+    // `session_observation_pass`. Uses `with_write` because the schema
+    // install is DDL; the read pool's `query_only=ON` pragma would
+    // reject the CREATE TABLE otherwise (bead
+    // `ley-line-open-f0239d`). If the schema already exists,
+    // `create_observation_schema` is a no-op — writer mutex is held
+    // for a nanosecond.
+    ctx.with_write(crate::daemon::observation_schema::create_observation_schema)?;
     ctx.with_read(|conn| {
         let rows = query_agreement_observations(conn, &req.token, &req.payload_kind)?;
         let source_count = rows.len();
@@ -2919,7 +2940,7 @@ fn op_agreement(ctx: &std::sync::Arc<DaemonContext>, req: &AgreementRequest) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex, RwLock};
+    use std::sync::{Arc, RwLock};
     use tempfile::TempDir;
 
     // ── Helper unit tests ───────────────────────────────────────────────
@@ -3175,10 +3196,20 @@ mod tests {
         ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024)
             .unwrap();
 
-        // Create a living db with the nodes schema.
-        let conn = Connection::open_in_memory().unwrap();
+        // Create a file-backed WAL living db with the nodes schema. The
+        // pool needs a real file to attach to (bead
+        // `ley-line-open-f0239d`); `:memory:` connections can't be
+        // shared across the pool.
+        let live_db_path = ctrl_path.with_extension("live.db");
+        let conn = Connection::open(&live_db_path).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
+        conn.pragma_update(None, "synchronous", "NORMAL").unwrap();
         leyline_ts::schema::create_ast_schema(&conn).unwrap();
         leyline_ts::schema::create_refs_schema(&conn).unwrap();
+        let live_db = crate::daemon::db_pool::LiveDb::new(conn, &live_db_path, 4).unwrap();
 
         #[cfg(feature = "vec")]
         let vec_index = {
@@ -3192,7 +3223,7 @@ mod tests {
             ctrl_path,
             ext: Arc::new(crate::daemon::NoExt),
             router: crate::daemon::EventRouter::new(16),
-            live_db: Mutex::new(conn),
+            live_db,
             enrich_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             source_dir: None,
             lang_filter: None,
@@ -3457,7 +3488,7 @@ mod tests {
         //   - limit field reports the cap that was applied
         let (_dir, ctx) = setup();
         {
-            let conn = ctx.live_db.lock().unwrap();
+            let conn = ctx.live_db.writer.lock().unwrap();
             conn.execute(
                 "CREATE TABLE probe (id INTEGER PRIMARY KEY, payload TEXT)",
                 [],
@@ -3500,7 +3531,7 @@ mod tests {
         // unwrap_or fallback) surfaces here.
         let (_dir, ctx) = setup();
         {
-            let conn = ctx.live_db.lock().unwrap();
+            let conn = ctx.live_db.writer.lock().unwrap();
             conn.execute("CREATE TABLE p (i INTEGER)", []).unwrap();
             for i in 0..50 {
                 conn.execute("INSERT INTO p VALUES (?1)", [i]).unwrap();
@@ -3527,7 +3558,7 @@ mod tests {
         // cause unnecessary follow-up queries.
         let (_dir, ctx) = setup();
         {
-            let conn = ctx.live_db.lock().unwrap();
+            let conn = ctx.live_db.writer.lock().unwrap();
             conn.execute("CREATE TABLE small (i INTEGER)", []).unwrap();
             for i in 0..5 {
                 conn.execute("INSERT INTO small VALUES (?1)", [i]).unwrap();
@@ -4459,7 +4490,7 @@ mod tests {
         let hv_bytes = hv.to_vec();
 
         {
-            let live = ctx.live_db.lock().unwrap();
+            let live = ctx.live_db.writer.lock().unwrap();
             live.execute(
                 "INSERT INTO _hdc (scope_id, layer_kind, hv, basis) VALUES (?1, ?2, ?3, ?4)",
                 rusqlite::params!["test:main", "ast", hv_bytes, 0i64],
@@ -4530,7 +4561,7 @@ mod tests {
         let (_dir, ctx) = setup();
 
         {
-            let live = ctx.live_db.lock().unwrap();
+            let live = ctx.live_db.writer.lock().unwrap();
             // Define `SendOp` at node_id `pkg/SendOp` in `pkg.go`.
             live.execute_batch(
                 "INSERT INTO node_defs (token, node_id, source_id) VALUES \
@@ -4672,7 +4703,7 @@ mod tests {
     async fn at_position_inside_definition_returns_token() {
         let (_dir, ctx) = setup();
         {
-            let live = ctx.live_db.lock().unwrap();
+            let live = ctx.live_db.writer.lock().unwrap();
             // SendOp covers rows 5–15; an inner Helper definition
             // covers rows 7–9 (smaller — should win at row 8).
             live.execute_batch(
@@ -4732,7 +4763,7 @@ mod tests {
     async fn inspect_symbol_carries_provenance_and_certainty_everywhere() {
         let (_dir, ctx) = setup();
         {
-            let live = ctx.live_db.lock().unwrap();
+            let live = ctx.live_db.writer.lock().unwrap();
             // Definition + reference + callee chain so every sub-
             // array gets at least one row.
             live.execute_batch(
@@ -4802,7 +4833,7 @@ mod tests {
     async fn inspect_neighborhood_depth_1_returns_callers_and_callees() {
         let (_dir, ctx) = setup();
         {
-            let live = ctx.live_db.lock().unwrap();
+            let live = ctx.live_db.writer.lock().unwrap();
             // A defined at pkg/A, references B (B is its callee).
             // C is defined at pkg/C, references A (C is A's caller).
             live.execute_batch(
@@ -4889,7 +4920,7 @@ mod tests {
     async fn at_position_output_is_inspect_symbol_input() {
         let (_dir, ctx) = setup();
         {
-            let live = ctx.live_db.lock().unwrap();
+            let live = ctx.live_db.writer.lock().unwrap();
             live.execute_batch(
                 "INSERT INTO node_defs (token, node_id, source_id) VALUES \
                    ('Foo', 'pkg/Foo', 'pkg.go');
@@ -4959,7 +4990,7 @@ mod tests {
     async fn search_symbols_glob_pattern_matches_prefix() {
         let (_dir, ctx) = setup();
         {
-            let live = ctx.live_db.lock().unwrap();
+            let live = ctx.live_db.writer.lock().unwrap();
             live.execute_batch(
                 "INSERT INTO node_defs (token, node_id, source_id) VALUES \
                    ('SendOp',    'pkg/SendOp',    'pkg.go'),
@@ -5011,7 +5042,7 @@ mod tests {
     async fn search_symbols_limit_is_respected() {
         let (_dir, ctx) = setup();
         {
-            let live = ctx.live_db.lock().unwrap();
+            let live = ctx.live_db.writer.lock().unwrap();
             live.execute_batch(
                 "INSERT INTO node_defs (token, node_id, source_id) VALUES \
                    ('Match1', 'pkg/Match1', 'pkg.go'),
@@ -5044,7 +5075,7 @@ mod tests {
     async fn search_symbols_kind_filter_excludes_non_matching() {
         let (_dir, ctx) = setup();
         {
-            let live = ctx.live_db.lock().unwrap();
+            let live = ctx.live_db.writer.lock().unwrap();
             live.execute_batch(
                 "INSERT INTO node_defs (token, node_id, source_id) VALUES \
                    ('FooFn',     'pkg/FooFn',     'pkg.go'),
@@ -5110,7 +5141,7 @@ mod tests {
         stalk: &[f32],
         observed_at: i64,
     ) {
-        let live = ctx.live_db.lock().unwrap();
+        let live = ctx.live_db.writer.lock().unwrap();
         crate::daemon::observation_schema::create_observation_schema(&live)
             .expect("install observation schema");
         let payload = encode_inline_f32(stalk);

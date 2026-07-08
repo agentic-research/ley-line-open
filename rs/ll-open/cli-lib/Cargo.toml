@@ -101,3 +101,36 @@ harness = false
 name = "wal_concurrent_readers"
 path = "benches/wal_concurrent_readers.rs"
 harness = false
+
+# ─────────────────────────────────────────────────────────────────────
+# Σ falsification suite F1–F5 (bead ley-line-open-9e7a9d / T1.3).
+#
+# Each F-gate is a standalone integration test that fails CI if the
+# named substrate axiom / requirement is broken. Files live under
+# `tests/substrate/` per the bead's file-path spec; each is registered
+# here so Cargo compiles it as an integration test binary (Cargo does
+# not auto-discover subdirectories under `tests/`).
+#
+# F6 is a TLA+/Apalache canonicality search — out of scope for this
+# integration-test suite (tracked separately as bead T7.6).
+# ─────────────────────────────────────────────────────────────────────
+
+[[test]]
+name = "f1_crash_mid_write"
+path = "tests/substrate/f1_crash_mid_write.rs"
+
+[[test]]
+name = "f2_concurrent_writers_throughput"
+path = "tests/substrate/f2_concurrent_writers_throughput.rs"
+
+[[test]]
+name = "f3_mitm_gossip_integrity"
+path = "tests/substrate/f3_mitm_gossip_integrity.rs"
+
+[[test]]
+name = "f4_diff_complexity"
+path = "tests/substrate/f4_diff_complexity.rs"
+
+[[test]]
+name = "f5_composition_seams"
+path = "tests/substrate/f5_composition_seams.rs"

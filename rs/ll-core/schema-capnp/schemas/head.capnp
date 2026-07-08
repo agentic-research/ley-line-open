@@ -41,4 +41,14 @@ struct Head {
   # consumers detect a torn-write or partial-segment scenario without
   # re-hashing.
   segmentBytes @3 :UInt64;
+
+  # Unified code-fact IR (ADR-0027 / mache ADR-0023): count of
+  # `fact_edges` rows whose `dst` is NULL because a reference/call token
+  # did not resolve to a definition symbol in this db. A binding-fidelity
+  # ratchet: the W5 gate asserts this stays <= baseline, so a producer
+  # change that silently drops resolution shows up as a rising count
+  # rather than a silently-zeroed downstream JOIN (the be6136 lesson).
+  # Zero for a db with no IR tables. Counted over the whole db post-
+  # COMMIT, so it reflects the full graph, not just this run's delta.
+  unboundFacts @4 :UInt64;
 }

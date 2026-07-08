@@ -31,6 +31,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
+use anyhow::Result;
+
 pub use events::EventRouter;
 pub use ext::{DaemonExt, NoExt};
 
@@ -192,6 +194,45 @@ pub struct DaemonContext {
     /// `sheaf.invalidate` events on the bus once `EventRouter::emitter`
     /// is wired in via `sheaf.set_emitter(...)`.
     pub sheaf: Arc<sheaf_ops::SheafState>,
+}
+
+impl DaemonContext {
+    /// Acquire a read-scoped connection.
+    ///
+    /// Under today's `Mutex<Connection>` impl, `with_read` and
+    /// `with_write` are structurally identical — both take the mutex
+    /// and hand back a `&Connection` to the closure. **The distinction
+    /// is intent-marking for the pool migration** (bead
+    /// `ley-line-open-98fb67` sub-bead 15b): when reads move to a
+    /// checkout-from-pool pattern and writes stay on a dedicated
+    /// writer connection, `with_read` becomes "checkout a reader"
+    /// while `with_write` stays "grab the exclusive writer." Call
+    /// sites don't change — only the internal impl swaps.
+    ///
+    /// Use `with_read` for pure SELECT queries. Use `with_write` for
+    /// anything that mutates (INSERT/UPDATE/DELETE/BEGIN/COMMIT/DDL).
+    ///
+    /// **Locking discipline (5fea4e)**: the returned `Connection` is
+    /// held under a `!Send` guard for the closure's lifetime — do NOT
+    /// `.await` inside the closure. If the work needs to await, drop
+    /// the guard first, do the await, then reacquire.
+    pub fn with_read<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&rusqlite::Connection) -> Result<T>,
+    {
+        let guard = self.live_db.lock().unwrap();
+        f(&guard)
+    }
+
+    /// Acquire a write-scoped connection. See `with_read` docstring
+    /// for the read/write intent-marking rationale.
+    pub fn with_write<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&rusqlite::Connection) -> Result<T>,
+    {
+        let guard = self.live_db.lock().unwrap();
+        f(&guard)
+    }
 }
 
 #[cfg(test)]

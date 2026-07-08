@@ -299,14 +299,14 @@ fn promote_touched(ctx: &DaemonContext, ids: &[&str]) {
     }
 }
 
-/// Execute a closure with the living database connection.
-fn with_live_db<F, T>(ctx: &DaemonContext, f: F) -> Result<T>
-where
-    F: FnOnce(&Connection) -> Result<T>,
-{
-    let guard = ctx.live_db.lock().unwrap();
-    f(&guard)
-}
+// `with_live_db` (removed 2026-07-08, bead `ley-line-open-ba8294` Phase 2)
+// was replaced by `DaemonContext::with_read` / `with_write` methods on
+// the context itself. See `daemon/mod.rs` for the new API. Historical
+// note: the free function pattern couldn't distinguish read vs write
+// intent, which blocked the WAL bead 98fb67 sub-bead 15b's read-pool
+// migration. The methods carry the same "hold the mutex for the
+// closure" semantics today; the intent-marking becomes structural once
+// reads move to a checkout-from-pool path.
 
 /// T2.4: read the substrate's `current_root` and return as a 64-char
 /// lowercase hex string for the wire format. Centralizes the
@@ -341,7 +341,11 @@ fn read_root_hex(ctrl_path: &Path) -> Result<String> {
 /// refactor, not something to assume here. Doc rewritten after iter-35
 /// adversarial review caught the previous false minimal-lock claim.
 fn snapshot_living_db(ctx: &DaemonContext) -> Result<()> {
-    crate::cmd_daemon::snapshot_to_arena(&ctx.live_db.lock().unwrap(), &ctx.ctrl_path)
+    // Snapshot classified as `with_write`: `conn.serialize("main")` needs
+    // exclusive access to the DB (SQLite serialize takes an internal
+    // schema-write lock). Bead `ley-line-open-ba8294` Phase 2 intent-
+    // marking; behavior identical under today's Mutex.
+    ctx.with_write(|conn| crate::cmd_daemon::snapshot_to_arena(conn, &ctx.ctrl_path))
 }
 
 // ---------------------------------------------------------------------------
@@ -540,18 +544,19 @@ fn op_reparse(
     }
     let scope: Option<&[String]> = explicit_files.as_deref();
 
-    // Parse directly into the living db.
+    // Parse directly into the living db. Classified as `with_write` —
+    // `parse_into_conn` runs INSERT/UPDATE/COMMIT under the guard.
+    // Bead `ley-line-open-ba8294` Phase 2 intent-marking.
     ctx.state.write().unwrap().phase = DaemonPhase::Parsing;
-    let guard = ctx.live_db.lock().unwrap();
-    let result = match crate::cmd_parse::parse_into_conn(&guard, &source_dir, lang, scope) {
+    let result = match ctx
+        .with_write(|conn| crate::cmd_parse::parse_into_conn(conn, &source_dir, lang, scope))
+    {
         Ok(r) => r,
         Err(e) => {
-            drop(guard);
             ctx.state.write().unwrap().phase = DaemonPhase::Error(format!("reparse failed: {e:#}"));
             return Err(e);
         }
     };
-    drop(guard);
 
     // Snapshot to arena for mache/remote consumers.
     snapshot_living_db(ctx)?;
@@ -589,17 +594,20 @@ fn op_enrich(ctx: &DaemonContext, pass_name: &str, files: Option<&[String]>) -> 
         .as_deref()
         .context("no --source configured; cannot run enrichment")?;
 
+    // Enrichment classified as `with_write` — passes INSERT/UPDATE
+    // enrichment rows under the guard (LSP bindings, HDC codebooks,
+    // embeddings, etc.). Bead `ley-line-open-ba8294` Phase 2.
     ctx.state.write().unwrap().phase = DaemonPhase::Enriching;
-    let guard = ctx.live_db.lock().unwrap();
-    let stats = crate::daemon::enrichment::run_pass(
-        &ctx.enrichment_passes,
-        pass_name,
-        &guard,
-        source_dir,
-        files.as_deref(),
-        Some(&ctx.state),
-    )?;
-    drop(guard);
+    let stats = ctx.with_write(|conn| {
+        crate::daemon::enrichment::run_pass(
+            &ctx.enrichment_passes,
+            pass_name,
+            conn,
+            source_dir,
+            files.as_deref(),
+            Some(&ctx.state),
+        )
+    })?;
     ctx.state.write().unwrap().phase = DaemonPhase::Ready;
 
     // Snapshot to arena after enrichment.
@@ -667,7 +675,7 @@ pub(crate) const OP_QUERY_DEFAULT_ROW_LIMIT: usize = 1000;
 fn op_query(ctx: &DaemonContext, sql: &str, limit: Option<usize>) -> Result<String> {
     let limit = limit.unwrap_or(OP_QUERY_DEFAULT_ROW_LIMIT);
 
-    with_live_db(ctx, |conn| {
+    ctx.with_read(|conn| {
         let mut stmt = conn.prepare(sql).context("prepare SQL")?;
         let col_count = stmt.column_count();
         let headers: Vec<String> = (0..col_count)
@@ -715,7 +723,7 @@ fn op_query(ctx: &DaemonContext, sql: &str, limit: Option<usize>) -> Result<Stri
 /// The wire still emits the typed Node shape; `record` is `Option<String>`
 /// with `skip_serializing_if`, so listings simply drop the key.
 fn op_list_children(ctx: &DaemonContext, id: &str) -> Result<String> {
-    let response = with_live_db(ctx, |conn| {
+    let response = ctx.with_read(|conn| {
         let mut stmt = conn.prepare_cached(
             "SELECT id, parent_id, name, kind, size \
              FROM nodes WHERE parent_id = ?1 ORDER BY name",
@@ -768,7 +776,7 @@ fn op_list_children(ctx: &DaemonContext, id: &str) -> Result<String> {
 fn op_read_content(ctx: &DaemonContext, id: &str) -> Result<String> {
     promote_touched(ctx, &[id]);
 
-    with_live_db(ctx, |conn| match query_node_record(conn, id)? {
+    ctx.with_read(|conn| match query_node_record(conn, id)? {
         Some(c) => {
             let mut builder = capnp::message::Builder::new_default();
             let mut root: leyline_public_schema::daemon_capnp::read_content_response::Builder =
@@ -786,7 +794,7 @@ fn op_read_content(ctx: &DaemonContext, id: &str) -> Result<String> {
 
 /// Find callers of a token (queries node_refs).
 fn op_find_callers(ctx: &DaemonContext, token: &str) -> Result<String> {
-    with_live_db(ctx, |conn| {
+    ctx.with_read(|conn| {
         let rows = query_token_refs(conn, token, "node_refs")?;
         let mut builder = capnp::message::Builder::new_default();
         let mut root: leyline_public_schema::daemon_capnp::find_callers_response::Builder =
@@ -802,7 +810,7 @@ fn op_find_callers(ctx: &DaemonContext, token: &str) -> Result<String> {
 
 /// Find definitions of a token (queries node_defs).
 fn op_find_defs(ctx: &DaemonContext, token: &str) -> Result<String> {
-    with_live_db(ctx, |conn| {
+    ctx.with_read(|conn| {
         let rows = query_token_refs(conn, token, "node_defs")?;
         let mut builder = capnp::message::Builder::new_default();
         let mut root: leyline_public_schema::daemon_capnp::find_defs_response::Builder =
@@ -859,7 +867,7 @@ fn query_token_refs(conn: &Connection, token: &str, table: &str) -> Result<Vec<W
 ///
 /// Read-only — does NOT belong in STATE_CHANGING_OPS.
 fn op_find_callees(ctx: &DaemonContext, id: &str) -> Result<String> {
-    with_live_db(ctx, |conn| {
+    ctx.with_read(|conn| {
         // DISTINCT — a node referencing the same token from multiple sites
         // shouldn't produce duplicate callees. The output is the SET of
         // definitions reachable from the input node, not the multiset of
@@ -906,7 +914,7 @@ fn op_find_callees(ctx: &DaemonContext, id: &str) -> Result<String> {
 ///
 /// Read-only — NOT in STATE_CHANGING_OPS.
 fn op_get_token_map(ctx: &DaemonContext, table: &str, op: TokenMapOp) -> Result<String> {
-    with_live_db(ctx, |conn| {
+    ctx.with_read(|conn| {
         // DISTINCT — `node_refs` / `node_defs` have no uniqueness constraint
         // on (token, node_id), so the same node referencing/defining a token
         // from multiple sites would emit duplicate node_ids without this.
@@ -1105,7 +1113,7 @@ fn op_get_db_path(ctrl_path: &Path) -> Result<String> {
 fn op_get_node(ctx: &DaemonContext, id: &str) -> Result<String> {
     promote_touched(ctx, &[id]);
 
-    with_live_db(ctx, |conn| {
+    ctx.with_read(|conn| {
         let row: Option<(String, String, String, i32, i64, Option<String>)> = query_row_opt(
             conn,
             "SELECT id, parent_id, name, kind, size, record FROM nodes WHERE id = ?1",
@@ -1479,14 +1487,14 @@ where
     Query: FnMut(&Connection) -> Result<T>,
     IsEmpty: Fn(&T) -> bool,
 {
-    let result = with_live_db(ctx, |conn| query(conn))?;
+    let result = ctx.with_write(|conn| query(conn))?;
     if !is_empty(&result) {
         return Ok((result, false));
     }
 
     // Step 1: read-only check whether enrichment is needed. Lock held only
     // for the check, not for the enrichment work.
-    let needs = with_live_db(ctx, |conn| Ok(needs_enrich(conn, file)))?;
+    let needs = ctx.with_read(|conn| Ok(needs_enrich(conn, file)))?;
     if !needs {
         // _lsp data exists for this file; the empty-result is real, not
         // a missing-enrichment artifact. Return as-is.
@@ -1622,7 +1630,7 @@ fn op_lsp_symbols(ctx: &DaemonContext, args: &LspFile) -> Result<String> {
         "SELECT node_id, symbol_kind, detail, start_line, start_col, end_line, end_col \
          FROM _lsp WHERE {NODE_ID_FOR_FILE}"
     );
-    with_live_db(ctx, |conn| {
+    ctx.with_read(|conn| {
         let rows = query_lsp_rows_for_file(conn, file, "_lsp", &sql, |row| {
             Ok(json!({
                 "node_id": row.get::<_, String>(0)?,
@@ -1646,7 +1654,7 @@ fn op_lsp_diagnostics(ctx: &DaemonContext, args: &LspFile) -> Result<String> {
          FROM _lsp WHERE {NODE_ID_FOR_FILE} \
          AND diagnostics IS NOT NULL AND diagnostics != ''"
     );
-    with_live_db(ctx, |conn| {
+    ctx.with_read(|conn| {
         let rows = query_lsp_rows_for_file(conn, file, "_lsp", &sql, |row| {
             Ok(json!({
                 "node_id": row.get::<_, String>(0)?,
@@ -1845,7 +1853,7 @@ fn op_hdc_search(ctx: &std::sync::Arc<DaemonContext>, req: &HdcSearchRequest) ->
     let hv = encode_query_hv(&req.content, &req.language)?;
     let max_distance = req.max_distance;
     let k = req.k as usize;
-    with_live_db(ctx, |conn| {
+    ctx.with_write(|conn| {
         ensure_hdc_ready(conn)?;
         let matches = leyline_hdc::query::radius_search(
             conn,
@@ -1874,7 +1882,7 @@ fn op_hdc_calibrate(
     req: &HdcCalibrateRequest,
 ) -> Result<String> {
     let sample_size = req.sample_size;
-    with_live_db(ctx, |conn| {
+    ctx.with_write(|conn| {
         ensure_hdc_ready(conn)?;
         // `now_ms` is computed inside the closure rather than at request
         // entry to match the time the rows are actually written; for
@@ -1896,7 +1904,7 @@ fn op_hdc_calibrate(
 fn op_hdc_density(ctx: &std::sync::Arc<DaemonContext>, req: &HdcDensityRequest) -> Result<String> {
     let hv = encode_query_hv(&req.content, &req.language)?;
     let max_distance = req.max_distance;
-    with_live_db(ctx, |conn| {
+    ctx.with_write(|conn| {
         ensure_hdc_ready(conn)?;
         let count =
             leyline_hdc::query::density_count(conn, leyline_hdc::LayerKind::Ast, &hv, max_distance)
@@ -1943,7 +1951,7 @@ fn op_inspect_symbol(
 ) -> Result<String> {
     let include_filter = build_include_filter(&req.include);
 
-    with_live_db(ctx, |conn| {
+    ctx.with_read(|conn| {
         // Definitions: query node_defs WHERE token = symbol_id,
         // JOINed against _ast for full location info. This is the
         // anchor — empty defs means the symbol is unknown.
@@ -2281,7 +2289,7 @@ fn op_at_position(ctx: &std::sync::Arc<DaemonContext>, p: &LspPosition) -> Resul
     let file = normalize_file_uri(&p.file).to_string();
     let line = p.line;
     let col = p.col;
-    with_live_db(ctx, |conn| {
+    ctx.with_read(|conn| {
         // Smallest enclosing definition at the position. Joining
         // node_defs against _ast pulls the symbol's token directly,
         // skipping the intermediate node_id resolution step that
@@ -2357,7 +2365,7 @@ fn op_inspect_neighborhood(
     let depth = req.depth.min(NEIGHBORHOOD_MAX_DEPTH);
     let per_hop = req.max_neighbors_per_hop as usize;
 
-    with_live_db(ctx, |conn| {
+    ctx.with_read(|conn| {
         // Focal: full definitions for the requested symbol_id.
         let focal_defs = query_definitions(conn, &req.symbol_id)?;
         let focal_kind = focal_defs
@@ -2552,7 +2560,7 @@ fn op_search_symbols(
     let limit = req.limit.max(1) as i64;
     let kind_filter = req.kind.as_deref().map(|s| s.to_string());
 
-    with_live_db(ctx, |conn| {
+    ctx.with_read(|conn| {
         // node_defs ⋈ _ast on (node_id, source_id). LEFT JOIN matches
         // query_definitions's shape so a token without an _ast row
         // still surfaces (node_kind falls back to ""). DISTINCT
@@ -2809,7 +2817,7 @@ fn classify_agreement_dims(
 /// most-recent `payload_inline` per source and reports
 /// `detect_violations`. Read-only.
 fn op_agreement(ctx: &std::sync::Arc<DaemonContext>, req: &AgreementRequest) -> Result<String> {
-    with_live_db(ctx, |conn| {
+    ctx.with_read(|conn| {
         let rows = query_agreement_observations(conn, &req.token, &req.payload_kind)?;
         let source_count = rows.len();
 

@@ -88,6 +88,40 @@ impl SheafState {
         &self.cache
     }
 
+    /// Install a freshly-built [`CellComplex`] and [`CoChangeTracker`]
+    /// into the shared cache. Called by [`crate::daemon::complex_build_pass::ComplexBuildPass`]
+    /// at the end of its `run` so consumer queries see the derived
+    /// complex without re-scanning `observation` rows on every hit.
+    ///
+    /// Closes the sheaf-invalidation Gap 2 (bead `ley-line-open-3af437`):
+    /// previously the pass built the complex, called `build_delta_0`
+    /// as a mechanical-reach witness, then dropped the complex on
+    /// return. This method persists it in process memory as the
+    /// module doc promises ("V1 stores the derived complex + tracker
+    /// in process memory").
+    ///
+    /// Lock ordering: acquires `cache` and `tracker` sequentially and
+    /// briefly. The cache lock is held across `refresh_baseline` so
+    /// no other sheaf op observes the complex before its per-edge δ⁰
+    /// baseline is captured — `refresh_baseline` is O(edges) and
+    /// cheap. The tracker lock is taken after `cache` is dropped, so
+    /// the two mutexes are never held simultaneously.
+    pub fn install_complex(&self, complex: CellComplex, tracker: CoChangeTracker) {
+        {
+            let mut cache = self.cache.lock().expect("cache mutex poisoned");
+            cache.set_complex(complex);
+            // Snapshot the freshly-installed complex's per-edge δ⁰
+            // norms as the "unchanged" reference. Without this the
+            // next `on_change` would compare current state against an
+            // empty baseline map and over-cascade.
+            cache.refresh_baseline();
+        }
+        {
+            let mut t = self.tracker.lock().expect("tracker mutex poisoned");
+            *t = tracker;
+        }
+    }
+
     fn emit(&self, topic: &str, data: serde_json::Value) {
         if let Some(ref emitter) = *self.emitter.lock().unwrap() {
             emitter.emit(topic, "leyline", data);

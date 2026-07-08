@@ -60,7 +60,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -70,6 +70,7 @@ use leyline_sheaf::topology::RegionId;
 use rusqlite::Connection;
 
 use super::enrichment::{EnrichmentPass, EnrichmentStats};
+use super::sheaf_ops::SheafState;
 
 // ---------------------------------------------------------------------------
 // ComplexSink — math-friend's spy seam.
@@ -169,6 +170,15 @@ impl ComplexSink for RealSink {
 /// invoked with the expected `(changed, all_edges)` shape.
 pub trait TrackerSink: Send {
     fn observe(&mut self, changed: &[RegionId], all_edges: &[(RegionId, RegionId)]);
+
+    /// Extract the underlying [`CoChangeTracker`] if this sink owns
+    /// one. Returns `None` for spy sinks that don't (or don't want to
+    /// surrender ownership of) a real tracker. The production
+    /// [`RealTracker`] returns `Some`; the pass uses that to install
+    /// the freshly-driven tracker into [`SheafState`] at end of run.
+    fn take_tracker(&mut self) -> Option<CoChangeTracker> {
+        None
+    }
 }
 
 /// Production tracker sink: holds a real `CoChangeTracker` behind a
@@ -198,6 +208,15 @@ impl TrackerSink for RealTracker {
             .expect("tracker mutex poisoned")
             .observe(changed, all_edges);
     }
+
+    fn take_tracker(&mut self) -> Option<CoChangeTracker> {
+        // Swap out the interior tracker with a fresh default so this
+        // sink stays in a usable state after extraction. Callers only
+        // invoke `take_tracker` once at end-of-run, so leaving a
+        // defaulted tracker behind is fine.
+        let inner = self.tracker.get_mut().expect("tracker mutex poisoned");
+        Some(std::mem::take(inner))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -218,7 +237,30 @@ const NODE_STALK_DIM: usize = 1;
 ///
 /// Registered in `cmd_daemon` after `TreeSitterPass` so it sees the
 /// observation rows produced by L8's session pass when that lands.
-pub struct ComplexBuildPass;
+///
+/// When constructed via [`ComplexBuildPass::new`] with an
+/// `Arc<SheafState>`, the pass installs the freshly-built complex +
+/// tracker into the shared cache at end of `run` via
+/// [`SheafState::install_complex`] — this closes the sheaf-
+/// invalidation Gap 2 (bead `ley-line-open-3af437`). Constructed via
+/// `Default` (no sheaf state), the pass runs the build for
+/// falsifiability side effects only and drops the complex on return
+/// — kept for unit tests that don't need the persistence side channel.
+#[derive(Default)]
+pub struct ComplexBuildPass {
+    sheaf: Option<Arc<SheafState>>,
+}
+
+impl ComplexBuildPass {
+    /// Construct a pass that installs its built complex + tracker
+    /// into the shared [`SheafState`] at end of `run`. This is the
+    /// production wiring — the daemon builds one of these when it
+    /// registers the pass in `cmd_daemon.rs` so consumer queries
+    /// (`op_sheaf_*` handlers) see the derived complex.
+    pub fn new(sheaf: Arc<SheafState>) -> Self {
+        Self { sheaf: Some(sheaf) }
+    }
+}
 
 impl EnrichmentPass for ComplexBuildPass {
     fn name(&self) -> &str {
@@ -278,6 +320,21 @@ impl EnrichmentPass for ComplexBuildPass {
             delta_nnz,
             outcome.observations_processed,
         );
+
+        // Persist the built complex + tracker into the shared
+        // SheafState so consumer `op_sheaf_*` queries hit the cache
+        // instead of dropping the derived state on the floor. Bead
+        // `ley-line-open-3af437` (Gap 2 from the sheaf-invalidation
+        // audit `docs/audits/sheaf-invalidation-trace.md`).
+        //
+        // Test-only construction via `Default` produces
+        // `self.sheaf = None`, preserving the "build + drop" shape the
+        // gate test in `complex_build_pass_gate.rs` exercises via
+        // `build_complex` directly.
+        if let Some(sheaf) = self.sheaf.as_ref() {
+            let tracker_taken = tracker.take_tracker().unwrap_or_default();
+            sheaf.install_complex(cx, tracker_taken);
+        }
 
         Ok(EnrichmentStats {
             pass_name: "complex-build".to_string(),
@@ -471,7 +528,7 @@ mod tests {
 
     #[test]
     fn complex_build_pass_metadata_pinned() {
-        let pass = ComplexBuildPass;
+        let pass = ComplexBuildPass::default();
         assert_pass_metadata(&pass, "complex-build", &[], &["observation"], &[]);
     }
 
@@ -596,7 +653,7 @@ mod tests {
         // §4 silent-failure guard — `tracker.observe` with no edges
         // touches nothing, no panic.
         let conn = Connection::open_in_memory().unwrap();
-        let pass = ComplexBuildPass;
+        let pass = ComplexBuildPass::default();
         let stats = pass.run(&conn, Path::new("/"), None).unwrap();
         assert_eq!(stats.pass_name, "complex-build");
         assert_eq!(stats.items_added, 0);

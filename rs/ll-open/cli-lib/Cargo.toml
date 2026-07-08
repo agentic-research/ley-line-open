@@ -68,6 +68,13 @@ which = "8"
 rayon = "1"
 tempfile = "3"
 
+# Unix-only: flock(2) for daemon arena admission control
+# (bead ley-line-open-0cba88). Kept as a direct dep so the fcntl call
+# path is auditable; alternatives (fs2/fs4/rustix/nix) either drag more
+# API surface than we need or aren't already transitive deps.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

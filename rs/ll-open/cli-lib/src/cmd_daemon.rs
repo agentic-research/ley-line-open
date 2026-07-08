@@ -174,6 +174,14 @@ pub async fn run_daemon(
         );
     }
 
+    // 0. Admission control — refuse to start if another daemon already
+    // holds this arena. flock-backed advisory lockfile at `<arena>.lock`;
+    // OS releases the lock automatically on process exit even if we
+    // crash without running Drop. Bind to a local so the lock persists
+    // for the daemon's entire runtime. Bead `ley-line-open-0cba88`.
+    let _arena_lock = crate::daemon::arena_lock::ArenaLock::try_acquire(arena)
+        .context("arena admission control")?;
+
     // 1. Arena setup.
     let arena_bytes = arena_size_mib * 1024 * 1024;
     let ctrl_path = cmd_serve::setup_arena(arena, arena_bytes, control)?;

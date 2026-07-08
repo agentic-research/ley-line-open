@@ -870,6 +870,16 @@ pub fn parse_into_conn(
 
     conn.execute_batch("BEGIN")?;
 
+    // Defer FK enforcement to COMMIT: with immediate FKs, every node_child /
+    // _ast.node_hash insert probes node_content's BLOB PK synchronously (~880k
+    // per-row probes into a large index → cache thrash). `defer_foreign_keys`
+    // batches all checks into a single validation pass at COMMIT — still
+    // fail-loud (a dangling edge aborts the COMMIT), but no per-row probe. It
+    // is a per-transaction pragma, so it is set after BEGIN and resets on
+    // COMMIT. Insert order (node_content before its referrers) still holds, so
+    // the deferred check passes on well-formed input.
+    conn.pragma_update(None, "defer_foreign_keys", "ON")?;
+
     // capnp dual-write (bead `ley-line-open-cdf098`) — open snapshot
     // files alongside the SQL writes. Truncate-and-rewrite semantics:
     // each parse run produces a fresh snapshot of `_ast` and `_source`.
@@ -899,6 +909,17 @@ pub fn parse_into_conn(
     // and defines/references stay as occurrence rows keyed by token+node_id.
     let mut content_buf: NodeContentBatch = NodeContentBatch::with_capacity(550_000);
     let mut child_buf: NodeChildBatch = NodeChildBatch::with_capacity(550_000);
+    // Cross-file dedup in memory, NOT via `INSERT OR IGNORE`. The per-file
+    // fold already dedups within a file, but identical subtrees recur across
+    // files (~2M fold rows collapse to ~150k unique). Letting SQL dedup means
+    // ~2M probes into a growing BLOB primary-key B-tree during the insert —
+    // the classic "maintain a UNIQUE index during a bulk load" anti-pattern,
+    // and the measured cold-parse hot spot. A HashSet lookup is ~2 orders of
+    // magnitude cheaper than a BLOB index probe that misses to disk once the
+    // index outgrows the page cache. `node_content` is a content-addressed
+    // blob store; dedup belongs at the write, not in a per-row index probe.
+    let mut seen_content: HashSet<[u8; 32]> = HashSet::with_capacity(200_000);
+    let mut seen_edge: HashSet<([u8; 32], i64)> = HashSet::with_capacity(450_000);
 
     let mut dirs_created: HashSet<String> = HashSet::new();
     let mut changed_files: Vec<String> = Vec::new();
@@ -936,26 +957,33 @@ pub fn parse_into_conn(
                 }
 
                 // Merkle-AST content layer (post-order, children before
-                // parents). `INSERT OR IGNORE` on the PKs dedups both within
-                // and across files.
+                // parents). Cross-file dedup happens here in memory: only the
+                // FIRST occurrence of a content hash / (parent,ordinal) edge is
+                // buffered, so the SQL insert sees ~150k unique rows, not ~2M.
+                // The `INSERT OR IGNORE` prefix stays as a byte-identical-file
+                // backstop, but the probe storm is gone.
                 for c in pf.node_contents {
-                    content_buf.push(
-                        c.node_hash.to_vec(),
-                        c.node_tag as i64,
-                        c.kind,
-                        c.raw_kind,
-                        c.lang,
-                        c.token,
-                        c.arity as i64,
-                    );
+                    if seen_content.insert(c.node_hash) {
+                        content_buf.push(
+                            c.node_hash.to_vec(),
+                            c.node_tag as i64,
+                            c.kind,
+                            c.raw_kind,
+                            c.lang,
+                            c.token,
+                            c.arity as i64,
+                        );
+                    }
                 }
                 for c in pf.node_children {
-                    child_buf.push(
-                        c.parent_hash.to_vec(),
-                        c.ordinal as i64,
-                        c.child_hash.to_vec(),
-                        c.field,
-                    );
+                    if seen_edge.insert((c.parent_hash, c.ordinal as i64)) {
+                        child_buf.push(
+                            c.parent_hash.to_vec(),
+                            c.ordinal as i64,
+                            c.child_hash.to_vec(),
+                            c.field,
+                        );
+                    }
                 }
 
                 // node_id → node_hash for this file, so the additive

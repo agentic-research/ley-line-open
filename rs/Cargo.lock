@@ -3004,6 +3004,7 @@ dependencies = [
  "leyline-sheaf",
  "leyline-text-search",
  "leyline-ts",
+ "libc",
  "log",
  "memmap2",
  "rand 0.9.4",

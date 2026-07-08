@@ -1,5 +1,6 @@
 //! Open daemon: UDS socket + event router + extensible ops.
 
+pub mod arena_lock;
 pub mod auth;
 pub mod complex_build_pass;
 #[cfg(feature = "vec")]

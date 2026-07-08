@@ -61,11 +61,17 @@ fn default_test_ctx(ctrl_path: PathBuf) -> leyline_cli_lib::daemon::DaemonContex
     use leyline_cli_lib::daemon::{DaemonContext, DaemonState, EventRouter, NoExt};
     use std::sync::{Arc, Mutex, RwLock};
 
+    // File-backed WAL live db — pool needs a real file (bead
+    // `ley-line-open-f0239d`). Test uses the ctrl path to derive the
+    // live db path so temp cleanup covers both.
+    let live_db_path = ctrl_path.with_extension("live.db");
+    let live_db = leyline_cli_lib::daemon::db_pool::LiveDb::open_fresh_for_test(&live_db_path);
+
     DaemonContext {
         ctrl_path,
         ext: Arc::new(NoExt),
         router: EventRouter::new(16),
-        live_db: Mutex::new(rusqlite::Connection::open_in_memory().unwrap()),
+        live_db,
         enrich_inflight: Arc::new(Mutex::new(std::collections::HashSet::new())),
         source_dir: None,
         lang_filter: None,
@@ -176,16 +182,38 @@ fn file_index_snapshot(
 }
 
 /// Cold-parse a Go source directory into a fresh `:memory:` Connection.
-/// The dominant test setup for "cold-parse, then assert" — 4+ sites
-/// previously inlined this exact pair. Returns just the connection
-/// because that's all most tests need; sites that want the
-/// `ParseResult` keep calling `parse_into_conn` directly.
+/// Used by tests that only need to inspect the live db without wiring
+/// it into a full `DaemonContext` (which needs a file-backed `LiveDb`
+/// under bead `ley-line-open-f0239d`). Tests that want the daemon
+/// context should use `cold_parse_go_live_db`.
 #[allow(dead_code)]
 fn cold_parse_go(src_dir: &Path) -> rusqlite::Connection {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     leyline_cli_lib::cmd_parse::parse_into_conn(&conn, src_dir, Some("go"), None)
         .expect("cold parse Go fixture");
     conn
+}
+
+/// Cold-parse a Go source directory into a fresh file-backed WAL
+/// `LiveDb` at `live_db_path`. Mirrors `cold_parse_go` but returns
+/// the `LiveDb` container the daemon expects post bead
+/// `ley-line-open-f0239d`. Callers that want to inspect the parsed
+/// state directly should do so via `live_db.writer.lock()`.
+#[allow(dead_code)]
+fn cold_parse_go_live_db(
+    live_db_path: &Path,
+    src_dir: &Path,
+) -> leyline_cli_lib::daemon::db_pool::LiveDb {
+    let writer = rusqlite::Connection::open(live_db_path).unwrap();
+    let mode: String = writer
+        .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode.to_lowercase(), "wal");
+    writer.pragma_update(None, "synchronous", "NORMAL").unwrap();
+    leyline_cli_lib::cmd_parse::parse_into_conn(&writer, src_dir, Some("go"), None)
+        .expect("cold parse Go fixture");
+    leyline_cli_lib::daemon::db_pool::LiveDb::new(writer, live_db_path, 4)
+        .expect("build cold-parse LiveDb")
 }
 
 /// Create a temporary directory containing two small `.go` files for testing.
@@ -2126,9 +2154,14 @@ async fn test_embed_queue_drainer_refreshes_index() {
     let index = Arc::new(VectorIndex::new(dim, None).unwrap());
     let embedder: Arc<dyn Embedder> = Arc::new(ZeroEmbedder { dim });
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    conn.execute_batch(
-        "CREATE TABLE nodes (
+    let live_db_path = ctrl_path.with_extension("live.db");
+    let live_db = leyline_cli_lib::daemon::db_pool::LiveDb::open_fresh_for_test(&live_db_path);
+    live_db
+        .writer
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE nodes (
             id TEXT PRIMARY KEY,
             parent_id TEXT,
             name TEXT,
@@ -2138,13 +2171,13 @@ async fn test_embed_queue_drainer_refreshes_index() {
             record TEXT
         );
         INSERT INTO nodes VALUES ('a.go', '', 'a.go', 0, 9, 1, 'package a');",
-    )
-    .unwrap();
+        )
+        .unwrap();
 
     let queue: embed::EmbedQueue = Arc::new(Mutex::new(std::collections::BinaryHeap::new()));
 
     let ctx = Arc::new(DaemonContext {
-        live_db: std::sync::Mutex::new(conn),
+        live_db,
         vec_index: index.clone(),
         embedder,
         embed_queue: queue.clone(),
@@ -2464,9 +2497,17 @@ async fn test_op_reparse_accepts_single_file_source() {
     write_empty_go_func(src.path(), "a.go", "m", "A");
     write_empty_go_func(src.path(), "b.go", "m", "B");
 
-    // Cold-parse so _file_index is populated.
-    let conn = cold_parse_go(src.path());
-    let snapshot = file_index_snapshot(&conn);
+    let dir = TempDir::new().unwrap();
+    let (_arena, ctrl_path) = fresh_arena(dir.path());
+    let live_db_path = ctrl_path.with_extension("live.db");
+
+    // Cold-parse so _file_index is populated, into a LiveDb (pool +
+    // writer) so the daemon context can consume it.
+    let live_db = cold_parse_go_live_db(&live_db_path, src.path());
+    let snapshot = {
+        let guard = live_db.writer.lock().unwrap();
+        file_index_snapshot(&guard)
+    };
     assert_eq!(snapshot.len(), 2);
 
     // Modify a.go and let the daemon serve.
@@ -2477,11 +2518,8 @@ async fn test_op_reparse_accepts_single_file_source() {
     )
     .unwrap();
 
-    let dir = TempDir::new().unwrap();
-    let (_arena, ctrl_path) = fresh_arena(dir.path());
-
     let ctx = Arc::new(DaemonContext {
-        live_db: Mutex::new(conn),
+        live_db,
         source_dir: Some(src.path().to_path_buf()),
         lang_filter: Some("go".to_string()),
         ..default_test_ctx(ctrl_path)
@@ -2511,7 +2549,7 @@ async fn test_op_reparse_accepts_single_file_source() {
     assert_eq!(names, vec!["a.go"], "scope should be exactly [a.go]");
 
     // Verify b.go was NOT touched (its mtime/size in _file_index is unchanged).
-    let after = file_index_snapshot(&ctx.live_db.lock().unwrap());
+    let after = file_index_snapshot(&ctx.live_db.writer.lock().unwrap());
     assert_eq!(
         after.get("b.go"),
         snapshot.get("b.go"),
@@ -2530,14 +2568,17 @@ async fn test_op_reparse_accepts_single_file_source() {
 #[tokio::test]
 async fn test_op_reparse_accepts_files_scope_with_dir_source() {
     use leyline_cli_lib::daemon::DaemonContext;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     let src = TempDir::new().unwrap();
     write_empty_go_func(src.path(), "a.go", "m", "A");
     write_empty_go_func(src.path(), "b.go", "m", "B");
     write_empty_go_func(src.path(), "c.go", "m", "C");
 
-    let conn = cold_parse_go(src.path());
+    let dir = TempDir::new().unwrap();
+    let (_arena, ctrl_path) = fresh_arena(dir.path());
+    let live_db_path = ctrl_path.with_extension("live.db");
+    let live_db = cold_parse_go_live_db(&live_db_path, src.path());
 
     std::thread::sleep(std::time::Duration::from_millis(50));
     fs::write(
@@ -2546,11 +2587,8 @@ async fn test_op_reparse_accepts_files_scope_with_dir_source() {
     )
     .unwrap();
 
-    let dir = TempDir::new().unwrap();
-    let (_arena, ctrl_path) = fresh_arena(dir.path());
-
     let ctx = Arc::new(DaemonContext {
-        live_db: Mutex::new(conn),
+        live_db,
         source_dir: Some(src.path().to_path_buf()),
         lang_filter: Some("go".to_string()),
         ..default_test_ctx(ctrl_path)
@@ -2671,19 +2709,24 @@ async fn test_op_reparse_nonexistent_source_sets_error_phase_and_recovers() {
 #[tokio::test]
 async fn test_op_query_destructive_runs_today_pin_for_6213d4() {
     use leyline_cli_lib::daemon::DaemonContext;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     let dir = TempDir::new().unwrap();
     let (_arena, ctrl_path) = fresh_arena(dir.path());
+    let live_db_path = ctrl_path.with_extension("live.db");
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    conn.execute_batch(
-        "CREATE TABLE doomed (id INTEGER PRIMARY KEY); INSERT INTO doomed VALUES (1);",
-    )
-    .unwrap();
+    let live_db = leyline_cli_lib::daemon::db_pool::LiveDb::open_fresh_for_test(&live_db_path);
+    {
+        let guard = live_db.writer.lock().unwrap();
+        guard
+            .execute_batch(
+                "CREATE TABLE doomed (id INTEGER PRIMARY KEY); INSERT INTO doomed VALUES (1);",
+            )
+            .unwrap();
+    }
 
     let ctx = Arc::new(DaemonContext {
-        live_db: Mutex::new(conn),
+        live_db,
         ..default_test_ctx(ctrl_path)
     });
 
@@ -2702,6 +2745,7 @@ async fn test_op_query_destructive_runs_today_pin_for_6213d4() {
 
     let table_gone: bool = ctx
         .live_db
+        .writer
         .lock()
         .unwrap()
         .query_row(
@@ -2954,22 +2998,27 @@ async fn test_op_text_search_success_path_returns_hits() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_concurrent_uds_load_completes_bounded() {
     use leyline_cli_lib::daemon::{DaemonContext, EventRouter};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     let dir = TempDir::new().unwrap();
     let (_arena, ctrl_path) = fresh_arena(dir.path());
+    let live_db_path = ctrl_path.with_extension("live.db");
 
     // Pre-populate a tiny living db so query ops have something to hit.
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    conn.execute_batch(
-        "CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT);
+    let live_db = leyline_cli_lib::daemon::db_pool::LiveDb::open_fresh_for_test(&live_db_path);
+    live_db
+        .writer
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT);
          INSERT INTO _meta VALUES ('parse_version', '1');",
-    )
-    .unwrap();
+        )
+        .unwrap();
 
     let ctx = Arc::new(DaemonContext {
         router: EventRouter::new(64),
-        live_db: Mutex::new(conn),
+        live_db,
         ..default_test_ctx(ctrl_path)
     });
 
@@ -3060,7 +3109,7 @@ async fn test_status_reports_error_phase() {
 async fn test_op_reparse_snapshot_race_publishes_well_formed_root() {
     use leyline_cli_lib::daemon::{DaemonContext, EventRouter};
     use leyline_core::{Controller, create_arena};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     // Source: 4 files. Reparse will rebuild the whole tree each time
     // (no scope), so two concurrent reparses both touch every row.
@@ -3076,6 +3125,7 @@ async fn test_op_reparse_snapshot_race_publishes_well_formed_root() {
     let dir = TempDir::new().unwrap();
     let arena_path = dir.path().join("test.arena");
     let ctrl_path = dir.path().join("test.ctrl");
+    let live_db_path = ctrl_path.with_extension("live.db");
     let _mmap = create_arena(&arena_path, 4 * 1024 * 1024).unwrap();
     let mut ctrl = Controller::open_or_create(&ctrl_path).unwrap();
     ctrl.set_arena(&arena_path.to_string_lossy(), 4 * 1024 * 1024)
@@ -3084,12 +3134,12 @@ async fn test_op_reparse_snapshot_race_publishes_well_formed_root() {
 
     // Cold-parse so _file_index is populated and reparse calls have
     // something to diff against.
-    let conn = cold_parse_go(src.path());
+    let live_db = cold_parse_go_live_db(&live_db_path, src.path());
 
     let ctx = Arc::new(DaemonContext {
         ctrl_path: ctrl_path.clone(),
         router: EventRouter::new(64),
-        live_db: Mutex::new(conn),
+        live_db,
         source_dir: Some(src.path().to_path_buf()),
         lang_filter: Some("go".to_string()),
         ..default_test_ctx(ctrl_path)
@@ -3233,7 +3283,7 @@ async fn daemon_protocol_gate_handlers_emit_required_keys() {
     // unexpected ok=false. Pre-create the tables once (idempotent DDL) so
     // ops can return empty success shapes instead of erroring.
     {
-        let guard = ctx.live_db.lock().unwrap();
+        let guard = ctx.live_db.writer.lock().unwrap();
         leyline_schema::create_schema(&guard).expect("nodes schema");
         guard
             .execute_batch(leyline_ts::schema::REFS_DDL)

@@ -3,6 +3,7 @@
 pub mod arena_lock;
 pub mod auth;
 pub mod complex_build_pass;
+pub mod db_pool;
 #[cfg(feature = "vec")]
 pub mod embed;
 pub mod enrichment;
@@ -29,7 +30,9 @@ pub mod wire;
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+#[cfg(feature = "vec")]
+use std::sync::Mutex;
+use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 
@@ -120,7 +123,11 @@ pub struct DaemonContext {
     pub ext: Arc<dyn DaemonExt>,
     pub router: Arc<EventRouter>,
     /// The living database — owned for the daemon's lifetime.
-    /// All queries go through this. `:memory:` SQLite, crash-recovered from arena.
+    /// File-backed WAL sqlite (bead `ley-line-open-98fb67` sub-bead 15a);
+    /// reader pool + dedicated writer (bead `ley-line-open-f0239d` sub-
+    /// bead 15b). All queries go through this via `with_read` (checks
+    /// out a reader connection from the pool) or `with_write` (locks
+    /// the exclusive writer). See `daemon::db_pool::LiveDb`.
     ///
     /// **Why `std::sync::Mutex`, not `tokio::sync::Mutex`** (5fea4e):
     /// `rusqlite::Connection` is `!Send` (it holds a raw `*mut sqlite3`
@@ -139,7 +146,7 @@ pub struct DaemonContext {
     /// - Future op_reparse refactor: wrap the lock+work in
     ///   `tokio::task::spawn_blocking` to move the blocking work to the
     ///   blocking pool. Tracked as a follow-up under 5fea4e.
-    pub live_db: Mutex<rusqlite::Connection>,
+    pub live_db: db_pool::LiveDb,
     /// Per-file in-flight set for lazy LSP enrichment dedup (606e64).
     /// When `try_enrich_file(ctx, file)` is called and `file` is already
     /// in this set, the caller skips enrichment (the in-flight call will
@@ -197,17 +204,15 @@ pub struct DaemonContext {
 }
 
 impl DaemonContext {
-    /// Acquire a read-scoped connection.
+    /// Acquire a read-scoped connection from the reader pool.
     ///
-    /// Under today's `Mutex<Connection>` impl, `with_read` and
-    /// `with_write` are structurally identical — both take the mutex
-    /// and hand back a `&Connection` to the closure. **The distinction
-    /// is intent-marking for the pool migration** (bead
-    /// `ley-line-open-98fb67` sub-bead 15b): when reads move to a
-    /// checkout-from-pool pattern and writes stay on a dedicated
-    /// writer connection, `with_read` becomes "checkout a reader"
-    /// while `with_write` stays "grab the exclusive writer." Call
-    /// sites don't change — only the internal impl swaps.
+    /// Bead `ley-line-open-f0239d` sub-bead 15b: reads check out a
+    /// connection from the r2d2 pool with `query_only=ON`. Writes on
+    /// the returned connection fail-loud with `SQLITE_READONLY`. The
+    /// pool holds N shared reader connections (default `min(10,
+    /// available_parallelism())`); concurrent readers make progress
+    /// without serializing at the Rust level — that's what unlocks the
+    /// ~600× p99 read improvement from the WAL experiment report.
     ///
     /// Use `with_read` for pure SELECT queries. Use `with_write` for
     /// anything that mutates (INSERT/UPDATE/DELETE/BEGIN/COMMIT/DDL).
@@ -220,17 +225,37 @@ impl DaemonContext {
     where
         F: FnOnce(&rusqlite::Connection) -> Result<T>,
     {
-        let guard = self.live_db.lock().unwrap();
-        f(&guard)
+        // Pool checkout blocks up to r2d2's default `connection_timeout`
+        // (30s) if all readers are in-flight. That's structurally
+        // impossible in practice (pool size ≥ 2, connections return on
+        // Drop at closure exit), but `?` surfaces the timeout cleanly
+        // if it ever hits — better than a silent hang.
+        let conn = self
+            .live_db
+            .reader_pool
+            .get()
+            .map_err(|e| anyhow::anyhow!("reader pool checkout failed: {e}"))?;
+        f(&conn)
     }
 
-    /// Acquire a write-scoped connection. See `with_read` docstring
-    /// for the read/write intent-marking rationale.
+    /// Acquire the exclusive writer connection.
+    ///
+    /// Bead `ley-line-open-f0239d` sub-bead 15b: writes hold the single
+    /// `Mutex<Connection>` on the writer. SQLite WAL serializes writers
+    /// at the file level; this `Mutex` mirrors that constraint at the
+    /// Rust level. Concurrent `with_write` callers queue on the mutex,
+    /// matching what SQLite would do at the file lock. See `with_read`
+    /// for the read path.
+    ///
+    /// **Locking discipline (5fea4e)**: the returned `Connection` is
+    /// held under a `!Send` guard for the closure's lifetime — do NOT
+    /// `.await` inside the closure. If the work needs to await, drop
+    /// the guard first, do the await, then reacquire.
     pub fn with_write<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<T>,
     {
-        let guard = self.live_db.lock().unwrap();
+        let guard = self.live_db.writer.lock().unwrap();
         f(&guard)
     }
 }

@@ -207,15 +207,23 @@ pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result
     // 2. Initialize the living database.
     //
     // Bead `ley-line-open-98fb67` (WAL adoption 15a): the living db is
-    // now file-backed at `<ctrl>.live.db` with `PRAGMA journal_mode=WAL`.
+    // file-backed at `<ctrl>.live.db` with `PRAGMA journal_mode=WAL`.
     // Warm start: `.live.db` file already exists → reopen (WAL replay is
     // automatic). Cold start: fresh file-backed connection + parse from
     // `--source`; any stale `.live.db` from a prior run is unlinked when
     // the controller shows no prior snapshot state (root == 0 sentinel).
     //
+    // Bead `ley-line-open-f0239d` (WAL adoption 15b): after 15a builds
+    // the writer connection, we wrap it in a `LiveDb` container that
+    // also owns an N-connection reader pool attached to the same file.
+    // `with_read` closures check out a pooled reader (`query_only=ON`,
+    // `busy_timeout=5000`); `with_write` closures hold the writer
+    // mutex. See `daemon::db_pool` for the container semantics.
+    //
     // The arena remains the cross-host Σ substrate publication surface;
     // `snapshot_to_arena` still flips it after every write burst. Only
-    // the underlying live storage swaps from `:memory:` to WAL'd file.
+    // the underlying live storage swaps from a single mutex-wrapped
+    // connection to pool+writer.
     let live_db_path = live_db_path_for(&ctrl_path);
     let live_conn = match init_living_db(&ctrl_path, &live_db_path, source, language) {
         Ok(conn) => conn,
@@ -225,8 +233,28 @@ pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result
         }
     };
 
-    // 3. Snapshot living db into arena (initial snapshot for mache/remote consumers).
+    // 3. Snapshot living db into arena (initial snapshot for mache/remote
+    // consumers). Runs before pool build so the reader connections
+    // observe a coherent post-snapshot file.
     snapshot_to_arena(&live_conn, &ctrl_path)?;
+
+    // Build the LiveDb container (writer + reader pool). The writer
+    // connection produced the file and applied WAL; the pool attaches
+    // to the same `.live.db` path with per-connection `query_only=ON` +
+    // `busy_timeout=5000` pragmas — see `LiveDb::new`. Bead
+    // `ley-line-open-f0239d`.
+    let live_db = match crate::daemon::db_pool::LiveDb::new(
+        live_conn,
+        &live_db_path,
+        crate::daemon::db_pool::default_pool_size(),
+    ) {
+        Ok(db) => db,
+        Err(e) => {
+            state.write().unwrap().phase =
+                DaemonPhase::Error(format!("reader pool init failed: {e:#}"));
+            return Err(e);
+        }
+    };
 
     // Capture initial HEAD if --source is set.
     if let Some(src) = source
@@ -312,7 +340,7 @@ pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result
         ctrl_path: ctrl_path.clone(),
         ext: ext.clone(),
         router: router.clone(),
-        live_db: std::sync::Mutex::new(live_conn),
+        live_db,
         enrich_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         source_dir: source.map(|p| p.to_path_buf()),
         lang_filter: language.map(|s| s.to_string()),
@@ -545,14 +573,15 @@ pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result
         tokio::spawn(async move {
             use tokio::time::interval;
             let mut tick = interval(SNAPSHOT_INTERVAL);
-            let mut last_snapshot_changes: u64 = read_total_changes(&snap_ctx.live_db).unwrap_or(0);
+            let mut last_snapshot_changes: u64 =
+                read_total_changes(&snap_ctx.live_db.writer).unwrap_or(0);
             loop {
                 tick.tick().await;
                 // Cheap dirty-check: read `total_changes()` under a
                 // brief try_lock. If the counter hasn't advanced since
                 // the last successful snapshot, skip the whole
                 // serialize/msync path — nothing to persist.
-                let current_changes = match read_total_changes(&snap_ctx.live_db) {
+                let current_changes = match read_total_changes(&snap_ctx.live_db.writer) {
                     Some(n) => n,
                     None => continue, // contended; try again next tick
                 };
@@ -562,7 +591,11 @@ pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result
                 // Non-blocking: skip this tick if op_reparse / op_enrich
                 // is mid-flight rather than queuing snapshots behind it.
                 // 5fea4e — block-the-tokio-worker prevention.
-                if try_snapshot_or_log(&snap_ctx.live_db, &snap_ctrl, "periodic snapshot failed") {
+                if try_snapshot_or_log(
+                    &snap_ctx.live_db.writer,
+                    &snap_ctrl,
+                    "periodic snapshot failed",
+                ) {
                     last_snapshot_changes = current_changes;
                     emitter.emit("daemon.snapshot", "leyline", serde_json::json!({}));
                 }
@@ -577,7 +610,7 @@ pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result
 
     // 12. Graceful shutdown: final snapshot + cleanup.
     {
-        let guard = ctx.live_db.lock().unwrap();
+        let guard = ctx.live_db.writer.lock().unwrap();
         if let Err(e) = snapshot_to_arena(&guard, &ctrl_path) {
             eprintln!("warn: final snapshot failed: {e:#}");
         } else {
@@ -1216,7 +1249,7 @@ async fn git_watch_loop(
         } else {
             Some(dirty_vec.as_slice())
         };
-        let guard = ctx.live_db.lock().unwrap();
+        let guard = ctx.live_db.writer.lock().unwrap();
         match crate::cmd_parse::parse_into_conn(&guard, source_dir, lang, scope) {
             Ok(result) => {
                 if result.parsed > 0 || result.deleted > 0 {
@@ -1227,7 +1260,7 @@ async fn git_watch_loop(
                     drop(guard);
 
                     // 4. Snapshot to arena.
-                    snapshot_or_log(&ctx.live_db, &ctx.ctrl_path, "watch snapshot failed");
+                    snapshot_or_log(&ctx.live_db.writer, &ctx.ctrl_path, "watch snapshot failed");
 
                     // 5. Update state + emit events.
                     {
@@ -1327,7 +1360,7 @@ pub fn run_watcher_enrichment(
     };
 
     let started_ms = crate::daemon::now_ms();
-    let guard = ctx.live_db.lock().unwrap();
+    let guard = ctx.live_db.writer.lock().unwrap();
     let outcome = crate::daemon::enrichment::run_all(
         &ctx.enrichment_passes,
         &guard,
@@ -2328,7 +2361,14 @@ mod tests {
         .unwrap();
         drop(ctrl);
 
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        // Test fixture uses a file-backed live db so the reader pool
+        // can attach to it (bead `ley-line-open-f0239d`). `:memory:`
+        // would work for the writer alone but can't be shared with
+        // pool-owned reader connections.
+        let live_db_path = live_db_path_for(ctrl_path);
+        let writer = rusqlite::Connection::open(&live_db_path).unwrap();
+        configure_wal(&writer).unwrap();
+        let live_db = crate::daemon::db_pool::LiveDb::new(writer, &live_db_path, 4).unwrap();
         #[cfg(feature = "vec")]
         let vec_index = {
             crate::daemon::vec_index::register_vec();
@@ -2341,7 +2381,7 @@ mod tests {
             ctrl_path: ctrl_path.to_path_buf(),
             ext,
             router: crate::daemon::EventRouter::new(64),
-            live_db: std::sync::Mutex::new(conn),
+            live_db,
             enrich_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             source_dir: Some(source.to_path_buf()),
             lang_filter: Some("go".to_string()),

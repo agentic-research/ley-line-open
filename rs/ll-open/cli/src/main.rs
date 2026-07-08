@@ -191,21 +191,24 @@ async fn main() -> Result<()> {
             let _ = std::fs::create_dir_all(&mache_dir);
             let arena = arena.unwrap_or_else(|| mache_dir.join("default.arena"));
 
-            leyline_cli_lib::cmd_daemon::run_daemon(
-                &arena,
+            let config = leyline_cli_lib::cmd_daemon::DaemonConfig {
+                arena,
                 arena_size_mib,
-                control.as_deref(),
-                mount.as_deref(),
-                &backend,
+                control,
+                mount,
+                backend,
                 nfs_port,
-                language.as_deref(),
-                timeout.as_deref(),
-                Arc::new(leyline_cli_lib::daemon::NoExt),
-                source.as_deref(),
+                language,
+                timeout,
+                source,
                 mcp_port,
                 mcp_bind,
                 mcp_allow_public,
                 mcp_no_auth,
+            };
+            leyline_cli_lib::cmd_daemon::run_daemon(
+                config,
+                Arc::new(leyline_cli_lib::daemon::NoExt),
             )
             .await
         }

@@ -77,39 +77,47 @@ const _: () = assert!(
 
 /// Open edition entry point — runs the daemon with no private extensions.
 #[allow(clippy::too_many_arguments)]
-pub async fn cmd_daemon(
-    arena: &Path,
-    arena_size_mib: u64,
-    control: Option<&Path>,
-    mount: Option<&Path>,
-    backend: &str,
-    nfs_port: u16,
-    language: Option<&str>,
-    timeout: Option<&str>,
-    source: Option<&Path>,
-    mcp_port: Option<u16>,
-    mcp_bind: Option<std::net::IpAddr>,
-    mcp_allow_public: bool,
-    mcp_no_auth: bool,
-) -> Result<()> {
+/// Configuration for the daemon lifecycle. Replaces the 14-argument
+/// `run_daemon` signature (bead `ley-line-open-ba8294`). All fields are
+/// owned so the struct is `'static`-friendly and can be passed through
+/// async boundaries without lifetime gymnastics.
+///
+/// Construct via `DaemonConfig::builder()` or direct struct literal.
+#[derive(Debug, Clone)]
+pub struct DaemonConfig {
+    /// Path to the arena file (backing store for the substrate).
+    pub arena: std::path::PathBuf,
+    /// Arena size hint in MiB. Grown auto per `ARENA_GROWTH_FACTOR`.
+    pub arena_size_mib: u64,
+    /// Optional control socket path. Auto-derived from arena if `None`.
+    pub control: Option<std::path::PathBuf>,
+    /// Optional mount point for FUSE/NFS. `None` = headless mode.
+    pub mount: Option<std::path::PathBuf>,
+    /// Mount backend name (e.g. "fuse", "nfs"). Ignored when `mount = None`.
+    pub backend: String,
+    /// TCP port for the NFS backend. Ignored when `mount = None` or `backend != "nfs"`.
+    pub nfs_port: u16,
+    /// Optional language filter for parse (`Some("go")`, `Some("rust")`, etc.).
+    pub language: Option<String>,
+    /// Optional shutdown timeout (`Some("30s")`, `Some("1h")`, etc.).
+    pub timeout: Option<String>,
+    /// Optional source directory to parse on startup.
+    pub source: Option<std::path::PathBuf>,
+    /// Optional MCP HTTP port. `None` disables MCP HTTP.
+    pub mcp_port: Option<u16>,
+    /// Optional MCP HTTP bind address. Defaults to loopback if `None`.
+    pub mcp_bind: Option<std::net::IpAddr>,
+    /// Explicit opt-in for non-loopback MCP binding. See bead
+    /// `ley-line-open-b7dd03` — required alongside a non-loopback
+    /// `mcp_bind` or startup refuses.
+    pub mcp_allow_public: bool,
+    /// Disables MCP wire authentication. See ADR-0022.
+    pub mcp_no_auth: bool,
+}
+
+pub async fn cmd_daemon(config: DaemonConfig) -> Result<()> {
     let ext: Arc<dyn DaemonExt> = Arc::new(NoExt);
-    run_daemon(
-        arena,
-        arena_size_mib,
-        control,
-        mount,
-        backend,
-        nfs_port,
-        language,
-        timeout,
-        ext,
-        source,
-        mcp_port,
-        mcp_bind,
-        mcp_allow_public,
-        mcp_no_auth,
-    )
-    .await
+    run_daemon(config, ext).await
 }
 
 /// Generic daemon entry point — ley-line (private) calls this with its own extension.
@@ -125,23 +133,29 @@ pub async fn cmd_daemon(
 /// 8. If mache on PATH: spawn `mache serve --control <ctrl>` as child
 /// 9. Wait for shutdown (Ctrl+C or timeout)
 /// 10. Cleanup (kill mache child, remove socket file)
-#[allow(clippy::too_many_arguments)]
-pub async fn run_daemon(
-    arena: &Path,
-    arena_size_mib: u64,
-    control: Option<&Path>,
-    mount: Option<&Path>,
-    backend: &str,
-    nfs_port: u16,
-    language: Option<&str>,
-    timeout: Option<&str>,
-    ext: Arc<dyn DaemonExt>,
-    source: Option<&Path>,
-    mcp_port: Option<u16>,
-    mcp_bind: Option<std::net::IpAddr>,
-    mcp_allow_public: bool,
-    mcp_no_auth: bool,
-) -> Result<()> {
+pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result<()> {
+    let DaemonConfig {
+        arena,
+        arena_size_mib,
+        control,
+        mount,
+        backend,
+        nfs_port,
+        language,
+        timeout,
+        source,
+        mcp_port,
+        mcp_bind,
+        mcp_allow_public,
+        mcp_no_auth,
+    } = config;
+    let arena = arena.as_path();
+    let control = control.as_deref();
+    let mount = mount.as_deref();
+    let source = source.as_deref();
+    let backend = backend.as_str();
+    let language = language.as_deref();
+    let timeout = timeout.as_deref();
     // Bead `ley-line-open-b7dd03`: gate non-loopback `--mcp-bind` behind
     // an explicit `--mcp-allow-public` flag. The MCP wire now has a
     // shared-secret token gate (ADR-0022 / bead `ley-line-open-b885d1`);
@@ -1778,26 +1792,36 @@ mod tests {
 
     use std::net::{IpAddr, Ipv4Addr};
 
+    /// Helper: minimal DaemonConfig for MCP-gate tests. Sets a
+    /// throwaway arena path and immediate timeout so tests exit before
+    /// any real setup. Callers override the MCP fields relevant to
+    /// their specific assertion.
+    fn test_mcp_gate_config(arena: &Path, nfs_port: u16) -> DaemonConfig {
+        DaemonConfig {
+            arena: arena.to_path_buf(),
+            arena_size_mib: 64,
+            control: None,
+            mount: None,
+            backend: "sqlite".to_string(),
+            nfs_port,
+            language: None,
+            timeout: Some("0s".to_string()),
+            source: None,
+            mcp_port: None,
+            mcp_bind: None,
+            mcp_allow_public: false,
+            mcp_no_auth: false,
+        }
+    }
+
     #[tokio::test]
     async fn mcp_public_bind_without_allow_flag_is_rejected() {
         let tmp = tempfile::tempdir().unwrap();
-        let res = run_daemon(
-            &tmp.path().join("arena"),
-            64,
-            None,
-            None,
-            "sqlite",
-            12345,
-            None,
-            Some("0s"),
-            std::sync::Arc::new(NoExt),
-            None,
-            Some(8384),
-            Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
-            false,
-            true, // mcp_no_auth — skip token gate; test exits on public-bind gate first
-        )
-        .await;
+        let mut config = test_mcp_gate_config(&tmp.path().join("arena"), 12345);
+        config.mcp_port = Some(8384);
+        config.mcp_bind = Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        config.mcp_no_auth = true; // skip token gate; test exits on public-bind gate first
+        let res = run_daemon(config, std::sync::Arc::new(NoExt)).await;
         let err = res.expect_err("non-loopback bind without --mcp-allow-public must bail");
         let msg = format!("{err:#}");
         assert!(
@@ -1817,23 +1841,11 @@ mod tests {
         // succeed) on something else — what matters is the error does
         // NOT mention --mcp-allow-public.
         let tmp = tempfile::tempdir().unwrap();
-        let res = run_daemon(
-            &tmp.path().join("arena"),
-            64,
-            None,
-            None,
-            "sqlite",
-            12346,
-            None,
-            Some("0s"),
-            std::sync::Arc::new(NoExt),
-            None,
-            Some(8384),
-            Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-            false,
-            true, // mcp_no_auth
-        )
-        .await;
+        let mut config = test_mcp_gate_config(&tmp.path().join("arena"), 12346);
+        config.mcp_port = Some(8384);
+        config.mcp_bind = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        config.mcp_no_auth = true;
+        let res = run_daemon(config, std::sync::Arc::new(NoExt)).await;
         if let Err(e) = res {
             let msg = format!("{e:#}");
             assert!(
@@ -1847,23 +1859,12 @@ mod tests {
     async fn mcp_public_bind_with_allow_flag_proceeds_past_gate() {
         // When the operator explicitly opts in, the gate must not fire.
         let tmp = tempfile::tempdir().unwrap();
-        let res = run_daemon(
-            &tmp.path().join("arena"),
-            64,
-            None,
-            None,
-            "sqlite",
-            12347,
-            None,
-            Some("0s"),
-            std::sync::Arc::new(NoExt),
-            None,
-            Some(8384),
-            Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
-            true,
-            true, // mcp_no_auth
-        )
-        .await;
+        let mut config = test_mcp_gate_config(&tmp.path().join("arena"), 12347);
+        config.mcp_port = Some(8384);
+        config.mcp_bind = Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        config.mcp_allow_public = true;
+        config.mcp_no_auth = true;
+        let res = run_daemon(config, std::sync::Arc::new(NoExt)).await;
         if let Err(e) = res {
             let msg = format!("{e:#}");
             assert!(
@@ -1883,23 +1884,11 @@ mod tests {
         // (public bind + no allow flag) so a future short-circuit
         // bug that ignores mcp_port would be caught.
         let tmp = tempfile::tempdir().unwrap();
-        let res = run_daemon(
-            &tmp.path().join("arena"),
-            64,
-            None,
-            None,
-            "sqlite",
-            12348,
-            None,
-            Some("0s"),
-            std::sync::Arc::new(NoExt),
-            None,
-            None, // no mcp_port — the gate's first conjunct
-            Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
-            false,
-            true, // mcp_no_auth
-        )
-        .await;
+        let mut config = test_mcp_gate_config(&tmp.path().join("arena"), 12348);
+        // no mcp_port — the gate's first conjunct
+        config.mcp_bind = Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        config.mcp_no_auth = true;
+        let res = run_daemon(config, std::sync::Arc::new(NoExt)).await;
         if let Err(e) = res {
             let msg = format!("{e:#}");
             assert!(

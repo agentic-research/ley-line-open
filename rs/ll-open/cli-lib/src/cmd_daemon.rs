@@ -1072,9 +1072,33 @@ async fn git_watch_loop(
                         serde_json::json!({
                             "parsed": result.parsed.to_string(),
                             "deleted": result.deleted.to_string(),
-                            "changed_files": result.changed_files,
+                            "changed_files": result.changed_files.clone(),
                         }),
                     );
+
+                    // Sheaf gap 1 (bead ley-line-open-3ab7db): drive
+                    // enrichment from the watcher path so a source edit
+                    // triggers HDC re-encode + complex-build + LSP
+                    // scoped to the just-parsed files. Prior to this
+                    // wiring, `git_watch_loop` stopped after emitting
+                    // `daemon.reparse.complete`; enrichment only ran
+                    // when a consumer explicitly called `op_enrich`,
+                    // which left the "sheaf-driven region-precise
+                    // invalidation" moat claim only reachable via
+                    // consumer-driven polls. See
+                    // `docs/audits/sheaf-invalidation-trace.md` § Gap 1.
+                    //
+                    // Contract: enrichment is best-effort. Reparse
+                    // already succeeded and its writes are in the
+                    // living db + arena. If a pass errors we log +
+                    // emit `daemon.enrichment.failed` and continue —
+                    // NEVER crash the watcher on an enrichment fault.
+                    //
+                    // Scope: use `result.changed_files` (files that
+                    // actually parsed) rather than the raw git-dirty
+                    // set — untracked files ignored by mtime or
+                    // language filter shouldn't drag enrichment work.
+                    run_watcher_enrichment(&ctx, source_dir, &result.changed_files, &emitter);
                 } else {
                     drop(guard);
                     ctx.state.write().unwrap().phase = DaemonPhase::Ready;
@@ -1085,6 +1109,98 @@ async fn git_watch_loop(
                 ctx.state.write().unwrap().phase =
                     DaemonPhase::Error(format!("watch reparse failed: {e:#}"));
             }
+        }
+    }
+}
+
+/// Run the enrichment pipeline scoped to `changed_files` and emit
+/// `daemon.enrichment.complete` / `daemon.enrichment.failed` for the
+/// watcher-driven cascade.
+///
+/// Bead `ley-line-open-3ab7db` (sheaf gap 1). This closes the wire from
+/// scoped reparse → HDC re-encode + complex-build inside the daemon
+/// itself; without it, enrichment only ran on consumer-invoked
+/// `op_enrich`, which meant the sheaf-driven cascade was consumer-driven,
+/// not source-change-driven. Region-precise `sheaf.invalidate` emit
+/// (Gap 3, bead `ley-line-open-3b3476`) hangs off the completion event
+/// this function emits.
+///
+/// Contract: best-effort. Reparse writes are already durable in the
+/// living db + arena by the time we enter here. If a pass errors we
+/// log and emit `daemon.enrichment.failed`, then continue; the next
+/// tick will try again on whatever the next dirty set turns out to be.
+/// The watcher task NEVER dies on an enrichment fault.
+///
+/// Locking: takes `ctx.live_db` for the pipeline duration. Callers MUST
+/// have dropped any prior guard before invoking (matches the call site
+/// in `git_watch_loop` where the reparse guard is dropped at line 1055
+/// before this helper runs).
+///
+/// Exposed to integration tests so the watcher→enrichment wire has a
+/// direct entry point that doesn't require spinning up a full git-poll
+/// loop. Production code path is `git_watch_loop` calling this after a
+/// successful scoped reparse.
+pub fn run_watcher_enrichment(
+    ctx: &Arc<crate::daemon::DaemonContext>,
+    source_dir: &Path,
+    changed_files: &[String],
+    emitter: &crate::daemon::events::EventEmitter,
+) {
+    ctx.state.write().unwrap().phase = DaemonPhase::Enriching;
+
+    let scope: Option<&[String]> = if changed_files.is_empty() {
+        None
+    } else {
+        Some(changed_files)
+    };
+
+    let started_ms = crate::daemon::now_ms();
+    let guard = ctx.live_db.lock().unwrap();
+    let outcome = crate::daemon::enrichment::run_all(
+        &ctx.enrichment_passes,
+        &guard,
+        source_dir,
+        scope,
+        Some(&ctx.state),
+    );
+    drop(guard);
+
+    ctx.state.write().unwrap().phase = DaemonPhase::Ready;
+
+    match outcome {
+        Ok(stats) => {
+            let duration_ms = crate::daemon::now_ms().saturating_sub(started_ms);
+            let passes_json: Vec<serde_json::Value> = stats
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "pass_name": s.pass_name,
+                        "files_processed": s.files_processed.to_string(),
+                        "items_added": s.items_added.to_string(),
+                        "duration_ms": s.duration_ms.to_string(),
+                    })
+                })
+                .collect();
+            emitter.emit(
+                "daemon.enrichment.complete",
+                "leyline",
+                serde_json::json!({
+                    "changed_files": changed_files,
+                    "passes": passes_json,
+                    "duration_ms": duration_ms.to_string(),
+                }),
+            );
+        }
+        Err(e) => {
+            log::warn!("watcher-driven enrichment failed: {e:#}");
+            emitter.emit(
+                "daemon.enrichment.failed",
+                "leyline",
+                serde_json::json!({
+                    "changed_files": changed_files,
+                    "error": format!("{e:#}"),
+                }),
+            );
         }
     }
 }

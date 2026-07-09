@@ -180,12 +180,10 @@ pub unsafe extern "C" fn leyline_verify(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::SigningKey;
-    use rand::rngs::OsRng;
 
     /// Reuse the test cert builder from cms module.
     fn generate_test_cert_and_key() -> (Vec<u8>, [u8; 64]) {
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let signing_key = crate::cms::tests::random_signing_key();
         let cert_der = crate::cms::tests::build_self_signed_cert(&signing_key);
         let keypair_bytes = signing_key.to_keypair_bytes();
         (cert_der, keypair_bytes)

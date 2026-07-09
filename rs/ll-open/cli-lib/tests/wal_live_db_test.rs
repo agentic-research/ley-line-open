@@ -348,3 +348,141 @@ async fn daemon_survives_or_fails_loud_on_wal_corruption() {
 fn _unused_phase() -> DaemonPhase {
     DaemonPhase::Ready
 }
+
+// ── Adversarial coverage (bead `ley-line-open-0cdf2d`) ──────────────
+//
+// Two failure-mode tests deferred from the WAL 15a adversarial gate
+// (bead `fd07d8`, closed 2026-07-08). Split off because they need
+// test-only infrastructure (RLIMIT_FSIZE for ENOSPC + a WAL-bloat
+// scenario that would slow the standard suite).
+
+// **NOTE on ENOSPC coverage (deferred half of bead `0cdf2d`)**
+//
+// The bead named two adversarial cases: (1) ENOSPC / RLIMIT_FSIZE and
+// (2) WAL bloat. Only (2) ships in this file. (1) requires subprocess
+// isolation — `RLIMIT_FSIZE` is process-scoped, so an in-process test
+// that caps the limit corrupts sibling tests that boot the daemon
+// concurrently under tokio's multi-thread test runtime. Doing it
+// correctly means forking or spawning a helper binary, either of
+// which is a chunk of infrastructure that isn't justified for a
+// single adversarial case. Filing as its own bead below.
+
+/// **Adversarial #2**: WAL recovers cleanly after growing large + crash.
+///
+/// **Claim**: if the WAL sidecar grows to non-trivial size and the
+/// process is killed without a checkpoint, the next daemon boot
+/// still recovers via WAL replay.
+///
+/// **Method**: after 15a's file-backed live_db is created, we open a
+/// direct rusqlite connection to `.live.db`, disable auto-checkpoint,
+/// insert enough rows to grow the WAL to >1 MiB, then drop the
+/// connection WITHOUT explicit checkpoint (simulates crash from a
+/// WAL-replay perspective — the writer never got to flush the WAL
+/// into the main db). Restart the daemon and verify:
+///   - the daemon boots
+///   - `journal_mode` returns `"wal"` (recovery preserved WAL mode)
+///   - a sentinel row inserted before the "crash" is queryable
+///     (proves WAL replay recovered committed transactions)
+///
+/// **Why 1 MiB, not 50 MB from the bead**: 1 MiB is enough to prove
+/// the WAL replay actually did work (empty WAL trivially recovers).
+/// 50 MB would slow the test suite. If a future regression shows
+/// large-WAL replay diverging from small-WAL replay, bump the size.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_recovers_from_bloated_wal_after_crash() {
+    let dir = TempDir::new().unwrap();
+    let (arena, _ctrl, live_db) = arena_paths(dir.path());
+
+    // First: normal boot so the .live.db file exists in WAL mode.
+    {
+        let config = wal_test_config(&arena, None, 1);
+        let ext: Arc<dyn leyline_cli_lib::daemon::DaemonExt> = Arc::new(NoExt);
+        run_daemon(config, ext).await.expect("first boot");
+    }
+    assert!(live_db.exists(), "15a must have created the live_db file");
+
+    // Direct rusqlite access — disable auto-checkpoint, seed a
+    // sentinel, then grow the WAL until it's > 1 MiB. Dropping the
+    // connection without an explicit checkpoint leaves the writes
+    // ONLY in the WAL sidecar; the main db file doesn't have them.
+    let wal_path = live_db.with_extension("db-wal");
+    {
+        let conn = rusqlite::Connection::open(&live_db).expect("open live_db");
+        // Reassert WAL mode + disable autocheckpoint for THIS
+        // connection. Deliberately do NOT restore autocheckpoint —
+        // the goal is to leave a bloated WAL.
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             PRAGMA synchronous=NORMAL;
+             CREATE TABLE IF NOT EXISTS sentinel(id INTEGER PRIMARY KEY, blob BLOB);",
+        )
+        .expect("configure connection");
+
+        // Seed the sentinel — this is the row we assert is
+        // recoverable post-restart.
+        conn.execute(
+            "INSERT OR REPLACE INTO sentinel(id, blob) VALUES(?1, ?2)",
+            rusqlite::params![1729i64, vec![0xABu8; 64]],
+        )
+        .expect("seed sentinel");
+
+        // Grow the WAL by inserting rows in separate small
+        // transactions so each commit appends WAL frames without
+        // triggering a checkpoint (autocheckpoint=0).
+        for i in 2..=200 {
+            conn.execute(
+                "INSERT OR REPLACE INTO sentinel(id, blob) VALUES(?1, ?2)",
+                rusqlite::params![i as i64, vec![i as u8; 8192]],
+            )
+            .expect("grow wal");
+        }
+        // Explicit sync so the WAL is actually on disk before
+        // "crash" (dropping the connection without checkpoint).
+        conn.execute_batch("PRAGMA synchronous=FULL")
+            .expect("bump sync");
+        drop(conn);
+    }
+    // Assert WAL actually bloated (test would be meaningless if not).
+    let wal_len = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+    assert!(
+        wal_len > 512 * 1024,
+        "WAL didn't bloat to >512 KiB (got {wal_len} bytes) — \
+         autocheckpoint may not be disabled correctly, test is not \
+         actually exercising the bloat path",
+    );
+
+    // Second boot against the bloated WAL. Must recover cleanly.
+    {
+        let config = wal_test_config(&arena, None, 1);
+        let ext: Arc<dyn leyline_cli_lib::daemon::DaemonExt> = Arc::new(NoExt);
+        run_daemon(config, ext).await.expect(
+            "daemon must boot cleanly against a bloated WAL — \
+             recovery invariant broken",
+        );
+    }
+
+    // Verify recovery: journal_mode still WAL + sentinel row queryable.
+    let conn =
+        rusqlite::Connection::open_with_flags(&live_db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("post-recovery open");
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .expect("post-recovery journal_mode");
+    assert_eq!(
+        mode, "wal",
+        "post-recovery journal_mode must remain WAL; got {mode:?}",
+    );
+    let sentinel_blob_len: i64 = conn
+        .query_row("SELECT length(blob) FROM sentinel WHERE id=1729", [], |r| {
+            r.get(0)
+        })
+        .expect(
+            "sentinel row must survive WAL replay; if this errors, \
+             recovery dropped committed transactions",
+        );
+    assert_eq!(
+        sentinel_blob_len, 64,
+        "sentinel blob length lost after WAL replay — recovery corrupted committed data",
+    );
+}

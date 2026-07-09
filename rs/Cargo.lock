@@ -3441,6 +3441,7 @@ dependencies = [
  "tree-sitter-proto",
  "tree-sitter-python",
  "tree-sitter-rust",
+ "tree-sitter-typescript",
  "tree-sitter-yaml",
  "uv-normalize",
  "uv-pep440",

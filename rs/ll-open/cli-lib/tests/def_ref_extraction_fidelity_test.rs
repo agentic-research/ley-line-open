@@ -166,6 +166,91 @@ fn javascript_files_produce_def_ref_rows() {
     }
 }
 
+// ── Bug 1c: TypeScript def/ref rows ─────────────────────────────────────
+
+#[test]
+fn typescript_files_produce_def_ref_rows() {
+    // Same bug class as Python + JS — TS files parse via leyline-fs's
+    // validate pass but LLO's producer had no TypeScript arm, so every
+    // `.ts` / `.tsx` file wrote zero def/ref rows. Fixture uses the
+    // TS-specific constructs (`interface`, `type` alias) plus the
+    // JS-shared ones (function, class, method, call, import) so the
+    // extraction path exercises both the ported-from-JS arms and the
+    // new TS-only arms.
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("mod.ts"),
+        b"import { helper } from \"./util\";\n\
+          interface Shape { area(): number; }\n\
+          type Point = { x: number; y: number };\n\
+          function foo(): number { return 1; }\n\
+          function bar(): number { return foo() + helper(); }\n\
+          class C {\n\
+            method(): number { return 2; }\n\
+          }\n",
+    )
+    .unwrap();
+
+    let conn = cold_parse(dir.path(), Some("typescript"));
+
+    let ast_rows = count_rows(
+        &conn,
+        "SELECT COUNT(*) FROM _ast WHERE source_id = 'mod.ts'",
+    );
+    assert!(
+        ast_rows > 0,
+        "TS file must produce _ast rows (parse pipeline sanity); got {ast_rows}"
+    );
+
+    let def_rows = count_rows(
+        &conn,
+        "SELECT COUNT(*) FROM node_defs WHERE source_id = 'mod.ts'",
+    );
+    assert!(
+        def_rows > 0,
+        "TS file must produce node_defs rows (foo, bar, C, method, Shape, Point); got {def_rows}. \
+         Symptom: extract_refs dispatcher has no TypeScript arm."
+    );
+
+    let ref_rows = count_rows(
+        &conn,
+        "SELECT COUNT(*) FROM node_refs WHERE source_id = 'mod.ts'",
+    );
+    assert!(
+        ref_rows > 0,
+        "TS file must produce node_refs rows (foo() and helper() calls); got {ref_rows}"
+    );
+
+    let defs = defs_tokens(&conn);
+    // JS-shared: function + class defs.
+    for want in ["foo", "bar", "C"] {
+        assert!(
+            defs.contains(&want.to_string()),
+            "missing TS def token {want:?} in {defs:?}"
+        );
+    }
+    // TS-specific: interface + type alias defs.
+    for want in ["Shape", "Point"] {
+        assert!(
+            defs.contains(&want.to_string()),
+            "missing TS-only def token {want:?} in {defs:?} — \
+             interface / type_alias arm not wired"
+        );
+    }
+    // Qualified method form: same discipline as Python / JS / Rust —
+    // methods emit both `Class.method` and bare `method` so mache's
+    // cross-language rules can disambiguate methods on different
+    // classes.
+    assert!(
+        defs.contains(&"C.method".to_string()),
+        "TS method def token must be qualified as `C.method`; got {defs:?}"
+    );
+    assert!(
+        defs.contains(&"method".to_string()),
+        "bare TS method name must remain in defs for call-side compatibility; got {defs:?}"
+    );
+}
+
 // ── Bug 2: qualified method tokens ──────────────────────────────────────
 
 #[test]

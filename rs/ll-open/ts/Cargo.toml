@@ -30,6 +30,16 @@ proto = ["dep:tree-sitter-proto"]
 # at all. Grammar version tracks the tree-sitter-javascript 0.25.x line
 # already vendored transitively through leyline-fs's validate feature.
 javascript = ["dep:tree-sitter-javascript"]
+# TypeScript grammar. Wired 2026-07-09 as part of the same bead
+# (`ley-line-open-caf423`) — same bug class as the JS gap: a `.ts` or
+# `.tsx` file parses via leyline-fs's validate pass but LLO's producer
+# had no TypeScript arm, so every TS file produced zero symbols. The
+# `tree-sitter-typescript` crate ships two grammars: LANGUAGE_TYPESCRIPT
+# (plain .ts) and LANGUAGE_TSX (TypeScript + JSX). We pick LANGUAGE_TSX
+# for the single `TypeScript` variant because it's a strict superset —
+# one grammar covers both .ts and .tsx uniformly, matching how the
+# `javascript` variant covers .js/.jsx/.mjs/.cjs.
+typescript = ["dep:tree-sitter-typescript"]
 pyproject = ["dep:uv-pep508", "dep:uv-pep440", "dep:uv-normalize", "dep:toml"]
 
 [dependencies]
@@ -45,6 +55,11 @@ tree-sitter-hcl = { version = "1", optional = true }
 tree-sitter-rust = { version = "0.24", optional = true }
 tree-sitter-proto = { version = "0.4", optional = true }
 tree-sitter-javascript = { version = "0.25", optional = true }
+# tree-sitter-typescript 0.23 is the crates.io line that ships alongside
+# tree-sitter 0.25 — the crate is on a slower cadence than JS but the
+# grammar tracks the same `tree-sitter-language` ABI, so it links cleanly
+# against the workspace tree-sitter.
+tree-sitter-typescript = { version = "0.23", optional = true }
 leyline-schema = { path = "../../ll-core/schema" }
 rusqlite = { workspace = true, features = ["bundled", "serialize"] }
 serde_json = { workspace = true }

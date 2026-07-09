@@ -91,6 +91,10 @@ pub fn extract_refs(
         crate::languages::TsLanguage::JavaScript => {
             extract_javascript(node, source, node_id, source_id)
         }
+        #[cfg(feature = "typescript")]
+        crate::languages::TsLanguage::TypeScript => {
+            extract_typescript(node, source, node_id, source_id)
+        }
         _ => Vec::new(),
     }
 }
@@ -1119,6 +1123,270 @@ fn walk_js_import_specifiers(
             // Recurse into `import_clause` / `named_imports` wrappers.
             _ => {
                 walk_js_import_specifiers(child, source, path, source_id, out);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TypeScript extractor
+// ---------------------------------------------------------------------------
+
+/// Extract TypeScript definitions, call references, and imports from a
+/// single AST node. Pure data — no DB access.
+///
+/// Bead `ley-line-open-caf423`: same bug class as the JS gap that
+/// shipped alongside — TS files parse via leyline-fs's validate pass
+/// but LLO's producer had no `TsLanguage::TypeScript` arm, so every
+/// `.ts` / `.tsx` file wrote zero rows to `node_defs` / `node_refs`
+/// and mache's cross-language rules joined against an empty projection.
+///
+/// tree-sitter-typescript's TSX grammar is a strict superset of the JS
+/// grammar's node kinds — `function_declaration`, `class_declaration`,
+/// `method_definition`, `call_expression`, `import_statement` all have
+/// the same shape, so the JS arms port over unchanged. What's added:
+///
+/// - `interface_declaration` → Def (uses `name` field). Interfaces are
+///   pure type definitions and don't exist at runtime, but mache's
+///   cross-language rules still resolve callers who depend on their
+///   shape (implementer classes, generics constraints).
+/// - `type_alias_declaration` → Def (uses `name` field). Same
+///   reasoning: type aliases are stable identifiers other code names.
+/// - `enum_declaration` → Def (uses `name` field). TS enums also emit
+///   a runtime object, so they're both a value and a type binding.
+/// - `abstract_class_declaration` → Def (uses `name` field). Same
+///   shape as `class_declaration` but for abstract classes.
+#[cfg(feature = "typescript")]
+pub fn extract_typescript(
+    node: &Node,
+    source: &[u8],
+    node_id: &str,
+    source_id: &str,
+) -> Vec<ExtractedRef> {
+    let mut out = Vec::new();
+
+    match node.kind() {
+        "function_declaration" | "generator_function_declaration" => {
+            if let Some(name_node) = node.child_by_field_name("name")
+                && let Ok(token) = name_node.utf8_text(source)
+                && !token.is_empty()
+            {
+                out.push(ExtractedRef::Def {
+                    token: token.to_string(),
+                    node_id: node_id.to_string(),
+                    source_id: source_id.to_string(),
+                });
+            }
+        }
+        // `class` extends `class_declaration`; `abstract_class_declaration`
+        // is the TypeScript-specific abstract form. Both carry the same
+        // `name` field. `interface_declaration`, `type_alias_declaration`,
+        // and `enum_declaration` are pure TS constructs — no JS analog —
+        // but they follow the same name-field convention.
+        "class_declaration"
+        | "abstract_class_declaration"
+        | "interface_declaration"
+        | "type_alias_declaration"
+        | "enum_declaration" => {
+            if let Some(name_node) = node.child_by_field_name("name")
+                && let Ok(token) = name_node.utf8_text(source)
+                && !token.is_empty()
+            {
+                out.push(ExtractedRef::Def {
+                    token: token.to_string(),
+                    node_id: node_id.to_string(),
+                    source_id: source_id.to_string(),
+                });
+            }
+        }
+        "method_definition" => {
+            let Some(name_node) = node.child_by_field_name("name") else {
+                return out;
+            };
+            let Ok(name) = name_node.utf8_text(source) else {
+                return out;
+            };
+            if name.is_empty() {
+                return out;
+            }
+            // Qualified `Class.method` form when the method sits inside
+            // a class or abstract class. Bead `ley-line-open-caf423` —
+            // same pattern as Python / JS / Rust: methods emit both the
+            // qualified form (for cross-language disambiguation) and
+            // the bare form (for unqualified call-site resolution).
+            if let Some(cls) = ts_enclosing_class(node, source) {
+                out.push(ExtractedRef::Def {
+                    token: format!("{cls}.{name}"),
+                    node_id: node_id.to_string(),
+                    source_id: source_id.to_string(),
+                });
+            }
+            out.push(ExtractedRef::Def {
+                token: name.to_string(),
+                node_id: node_id.to_string(),
+                source_id: source_id.to_string(),
+            });
+        }
+        "call_expression" => {
+            if let Some(func_node) = node.child_by_field_name("function") {
+                match func_node.kind() {
+                    "identifier" => {
+                        if let Ok(token) = func_node.utf8_text(source)
+                            && !token.is_empty()
+                        {
+                            out.push(ExtractedRef::Ref {
+                                token: token.to_string(),
+                                node_id: node_id.to_string(),
+                                source_id: source_id.to_string(),
+                            });
+                        }
+                    }
+                    "member_expression" => {
+                        let obj = func_node
+                            .child_by_field_name("object")
+                            .and_then(|n| n.utf8_text(source).ok())
+                            .unwrap_or("");
+                        let prop = func_node
+                            .child_by_field_name("property")
+                            .and_then(|n| n.utf8_text(source).ok())
+                            .unwrap_or("");
+                        if !prop.is_empty() {
+                            if !obj.is_empty() {
+                                out.push(ExtractedRef::Ref {
+                                    token: format!("{obj}.{prop}"),
+                                    node_id: node_id.to_string(),
+                                    source_id: source_id.to_string(),
+                                });
+                            }
+                            out.push(ExtractedRef::Ref {
+                                token: prop.to_string(),
+                                node_id: node_id.to_string(),
+                                source_id: source_id.to_string(),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        "import_statement" => {
+            // Same shape as JS: `source` field carries the module string,
+            // `import_clause` / `named_imports` wrap the specifiers. TSX
+            // grammar uses the same node kinds — the JS specifier walker
+            // ports over unchanged.
+            let src_node = node.child_by_field_name("source");
+            let path = src_node
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("")
+                .trim_matches(|c| c == '"' || c == '\'');
+            if path.is_empty() {
+                return out;
+            }
+            walk_ts_import_specifiers(*node, source, path, source_id, &mut out);
+        }
+        _ => {}
+    }
+
+    out
+}
+
+/// Return the enclosing `class_declaration` / `abstract_class_declaration`
+/// name when `method_node` is a `method_definition` inside one. Returns
+/// `None` for method_definitions inside interface_declaration bodies or
+/// object literals (both carry `method_definition` in some grammar
+/// versions). Bead `ley-line-open-caf423`.
+#[cfg(feature = "typescript")]
+fn ts_enclosing_class(method_node: &Node, source: &[u8]) -> Option<String> {
+    // method_definition → class_body → class_declaration | abstract_class_declaration
+    let body = method_node.parent()?;
+    if body.kind() != "class_body" {
+        return None;
+    }
+    let cls = body.parent()?;
+    if cls.kind() != "class_declaration" && cls.kind() != "abstract_class_declaration" {
+        return None;
+    }
+    let name = cls.child_by_field_name("name")?.utf8_text(source).ok()?;
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Walk `import_statement` / `import_clause` / `named_imports` for
+/// import specifiers and emit each as `ExtractedRef::Import`. Mirrors
+/// `walk_js_import_specifiers` — TSX grammar uses the same node kinds
+/// for these constructs.
+///
+/// TypeScript-specific: `import type { … } from "m"` is still an
+/// `import_statement` with the `type` keyword as an anonymous child;
+/// the specifier walk treats it identically.
+#[cfg(feature = "typescript")]
+fn walk_ts_import_specifiers(
+    node: Node<'_>,
+    source: &[u8],
+    path: &str,
+    source_id: &str,
+    out: &mut Vec<ExtractedRef>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            // Default import: `import d from "m";` — the identifier
+            // child of the import_clause is the alias.
+            "identifier" if node.kind() == "import_clause" => {
+                if let Ok(name) = child.utf8_text(source)
+                    && !name.is_empty()
+                {
+                    out.push(ExtractedRef::Import {
+                        alias: name.to_string(),
+                        path: path.to_string(),
+                        source_id: source_id.to_string(),
+                    });
+                }
+            }
+            // Namespace import: `import * as ns from "m";`.
+            "namespace_import" => {
+                let mut c2 = child.walk();
+                for gc in child.named_children(&mut c2) {
+                    if gc.kind() == "identifier"
+                        && let Ok(name) = gc.utf8_text(source)
+                        && !name.is_empty()
+                    {
+                        out.push(ExtractedRef::Import {
+                            alias: name.to_string(),
+                            path: path.to_string(),
+                            source_id: source_id.to_string(),
+                        });
+                    }
+                }
+            }
+            // Named import specifier: `a` or `a as b`. `name` field is
+            // the imported name; `alias` field is the local alias
+            // (present only when `as` was used). `import type { … }`
+            // uses the same specifier shape.
+            "import_specifier" => {
+                let name = child
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or("");
+                let alias = child
+                    .child_by_field_name("alias")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or("");
+                let display_alias = if alias.is_empty() { name } else { alias };
+                if !name.is_empty() {
+                    out.push(ExtractedRef::Import {
+                        alias: display_alias.to_string(),
+                        path: path.to_string(),
+                        source_id: source_id.to_string(),
+                    });
+                }
+            }
+            // Recurse into `import_clause` / `named_imports` wrappers.
+            _ => {
+                walk_ts_import_specifiers(child, source, path, source_id, out);
             }
         }
     }

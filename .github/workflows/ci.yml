@@ -41,7 +41,7 @@ jobs:
       - name: Install system deps (libfuse for fuser, capnproto + libcapnp-dev for schema build.rs)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libfuse-dev capnproto libcapnp-dev pkg-config
+          sudo apt-get install -y --no-install-recommends capnproto libcapnp-dev libdbus-1-dev libfuse-dev pkg-config
           # libcapnp-dev ships /usr/include/capnp/c++.capnp and the other
           # standard schema includes that the capnp compiler resolves
           # `using Cxx = import "/capnp/c++.capnp";`-style imports against.

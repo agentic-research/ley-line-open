@@ -1,0 +1,16 @@
+diff --git a/src.rs b/src.rs
+index 4055f58..729cc09 100644
+--- a/src.rs
++++ b/src.rs
+@@ -1,8 +1,8 @@
+-// LEGACY: rename me
+-fn foo() {
++fn bar() {
+     let x = 41;
+ }
+ 
+ fn main() {
+-    foo();
++    bar();
++    bar();
+ }

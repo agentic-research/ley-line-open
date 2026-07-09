@@ -116,6 +116,24 @@ tasks:
     cmds:
       - cargo test --release -p leyline-cli-lib --test topology_pass_test
 
+  adr-0029:baseline:
+    desc: |
+      Run the ADR-0029 F-test baseline harness — captures worktree-flow
+      wall-time / storage / isolation / sub-file / commit-fidelity
+      numbers and writes them to docs/research/adr-0029-baselines.json
+      + docs/research/adr-0029-f5w-baseline.diff.
+
+      SLOW: synths a 100MB git repo and runs 30 `git worktree add`
+      iterations for F1w, plus 4 more for F2w. Not on the every-PR
+      CI path — run when Phase 1 mount driver work needs a refreshed
+      reference number (bead ley-line-open-5f9829).
+
+      Fast F-tests (F3w isolation, F4w sub-file, F5w commit fidelity)
+      run in `task ci` — no `--ignored` needed for those.
+    dir: rs
+    cmds:
+      - cargo test -p leyline-cli-lib --test adr_0029_baseline_test --release -- --ignored --nocapture
+
   # `leyline-sign` `host` feature (ADR-0019 helper daemon, absorbed from
   # cloister under bead ley-line-open-7226e3). Kept out of the workspace
   # default so `cargo test --workspace` doesn't pull the axum/tokio/keyring

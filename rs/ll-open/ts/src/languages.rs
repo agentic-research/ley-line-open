@@ -31,6 +31,20 @@ pub enum TsLanguage {
     /// both proto2 and proto3 syntax.
     #[cfg(feature = "proto")]
     Proto,
+    /// JavaScript (.js / .mjs / .cjs / .jsx). Wired for def/ref
+    /// extraction so mache's cross-language rules see JS symbols
+    /// (bead `ley-line-open-caf423`).
+    #[cfg(feature = "javascript")]
+    JavaScript,
+    /// TypeScript (.ts / .tsx). Uses tree-sitter-typescript's TSX
+    /// grammar — a strict superset that handles both plain TypeScript
+    /// and TSX (TypeScript + JSX) uniformly, so one variant covers
+    /// both extensions. Same bead as JavaScript (`ley-line-open-caf423`)
+    /// — TS files parsed via leyline-fs's validate pass but LLO's
+    /// producer had no TS arm, so every `.ts`/`.tsx` file wrote zero
+    /// symbols to `node_defs` / `node_refs`.
+    #[cfg(feature = "typescript")]
+    TypeScript,
 }
 
 impl TsLanguage {
@@ -57,6 +71,15 @@ impl TsLanguage {
             TsLanguage::Rust => tree_sitter_rust::LANGUAGE.into(),
             #[cfg(feature = "proto")]
             TsLanguage::Proto => tree_sitter_proto::LANGUAGE.into(),
+            #[cfg(feature = "javascript")]
+            TsLanguage::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+            #[cfg(feature = "typescript")]
+            // TSX grammar covers both `.ts` and `.tsx` — one grammar,
+            // one variant, mirrors how the JavaScript variant covers
+            // .js/.jsx/.mjs/.cjs. LANGUAGE_TYPESCRIPT is the JSX-less
+            // sibling; we don't wire a separate variant for it because
+            // the TSX grammar parses plain TypeScript cleanly.
+            TsLanguage::TypeScript => tree_sitter_typescript::LANGUAGE_TSX.into(),
         }
     }
 
@@ -88,6 +111,10 @@ impl TsLanguage {
             TsLanguage::Rust => "rust",
             #[cfg(feature = "proto")]
             TsLanguage::Proto => "proto",
+            #[cfg(feature = "javascript")]
+            TsLanguage::JavaScript => "javascript",
+            #[cfg(feature = "typescript")]
+            TsLanguage::TypeScript => "typescript",
         }
     }
 
@@ -163,6 +190,39 @@ impl TsLanguage {
                 "module" => Some("module"),
                 _ => None,
             },
+            #[cfg(feature = "javascript")]
+            TsLanguage::JavaScript => match raw_kind {
+                "function_declaration" | "function_expression" | "arrow_function" => {
+                    Some("function")
+                }
+                "method_definition" => Some("method"),
+                "class_declaration" | "class" => Some("type"),
+                "import_statement" => Some("import"),
+                "program" => Some("module"),
+                _ => None,
+            },
+            #[cfg(feature = "typescript")]
+            // TypeScript extends JavaScript with type-level constructs
+            // (`interface_declaration`, `type_alias_declaration`,
+            // `enum_declaration`, `abstract_class_declaration`); the
+            // shared JS kinds collapse the same way (function decls,
+            // method_definition, class_declaration, import_statement).
+            TsLanguage::TypeScript => match raw_kind {
+                "function_declaration"
+                | "function_expression"
+                | "arrow_function"
+                | "function_signature" => Some("function"),
+                "method_definition" | "method_signature" => Some("method"),
+                "class_declaration"
+                | "abstract_class_declaration"
+                | "class"
+                | "interface_declaration"
+                | "type_alias_declaration"
+                | "enum_declaration" => Some("type"),
+                "import_statement" => Some("import"),
+                "program" => Some("module"),
+                _ => None,
+            },
             #[allow(unreachable_patterns)]
             _ => None,
         }
@@ -191,6 +251,10 @@ impl TsLanguage {
             "rust" | "rs" => Ok(TsLanguage::Rust),
             #[cfg(feature = "proto")]
             "proto" | "protobuf" => Ok(TsLanguage::Proto),
+            #[cfg(feature = "javascript")]
+            "javascript" | "js" | "jsx" | "mjs" | "cjs" => Ok(TsLanguage::JavaScript),
+            #[cfg(feature = "typescript")]
+            "typescript" | "ts" | "tsx" => Ok(TsLanguage::TypeScript),
             _ => bail!("unsupported language: {name}"),
         }
     }
@@ -239,6 +303,13 @@ impl TsLanguage {
             "rs" => Some(TsLanguage::Rust),
             #[cfg(feature = "proto")]
             "proto" => Some(TsLanguage::Proto),
+            #[cfg(feature = "javascript")]
+            "js" | "mjs" | "cjs" | "jsx" => Some(TsLanguage::JavaScript),
+            // TSX grammar handles both .ts and .tsx uniformly (see
+            // `ts_language`); mts/cts are ESM/CJS variants that carry
+            // TypeScript syntax and parse identically.
+            #[cfg(feature = "typescript")]
+            "ts" | "tsx" | "mts" | "cts" => Some(TsLanguage::TypeScript),
             _ => None,
         }
     }

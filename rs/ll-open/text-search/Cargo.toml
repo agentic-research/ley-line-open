@@ -25,8 +25,8 @@ default = []
 engine-witchcraft = ["dep:witchcraft", "dep:uuid", "dep:serde_json"]
 
 [dependencies]
-anyhow = "1"
-thiserror = "2"
+anyhow = { workspace = true }
+thiserror = { workspace = true }
 
 # Witchcraft is git-only (not on crates.io). Two non-obvious config bits:
 #
@@ -47,10 +47,10 @@ thiserror = "2"
 #      and require a manual bump every candle-API churn cycle.
 witchcraft = { git = "https://github.com/dropbox/witchcraft", features = ["t5-quantized"], default-features = false, optional = true }
 uuid = { version = "1", features = ["v5"], optional = true }
-serde_json = { version = "1", optional = true }
+serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
-anyhow = "1"
-tempfile = "3"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+anyhow = { workspace = true }
+tempfile = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }

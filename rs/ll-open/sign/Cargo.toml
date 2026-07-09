@@ -14,10 +14,20 @@ spki = { version = "0.7", features = ["alloc"] }
 const-oid = { version = "0.9", features = ["db"] }
 ed25519-dalek = "3"
 sha2 = "0.11"
-thiserror = "2"
-log = "0.4"
-libc = "0.2"
+thiserror = { workspace = true }
+log = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
+# Phase 2 exception (bead ley-line-open-3b2f55): rand stays at the
+# literal 0.8 pin because the workspace declaration is 0.9, and
+# rand 0.9's `OsRng` no longer implements `RngCore::fill_bytes` — it
+# implements `TryRngCore` only, so the seed-then-`from_bytes` shape
+# in `cms::tests::random_signing_key` + `cert_chain::tests::random_signing_key`
+# fails to compile against the workspace version. Adapting the test
+# to `OsRng.try_fill_bytes` (or `getrandom` directly) is a source
+# change and out of scope for Phase 2 (manifest-only). Track under
+# a follow-up bead once the workspace either lands 0.9 alongside a
+# `rand-core 0.9` shim, or the sign tests migrate to `getrandom`.
 rand = "0.8"
-hex = "0.4"
+hex = { workspace = true }

@@ -27,7 +27,7 @@ proto = ["dep:tree-sitter-proto"]
 pyproject = ["dep:uv-pep508", "dep:uv-pep440", "dep:uv-normalize", "dep:toml"]
 
 [dependencies]
-tree-sitter = "0.26"
+tree-sitter = { workspace = true }
 tree-sitter-html = { version = "0.23", optional = true }
 tree-sitter-md = { version = "0.5", optional = true }
 tree-sitter-json = { version = "0.24", optional = true }
@@ -39,13 +39,13 @@ tree-sitter-hcl = { version = "1", optional = true }
 tree-sitter-rust = { version = "0.24", optional = true }
 tree-sitter-proto = { version = "0.4", optional = true }
 leyline-schema = { path = "../../ll-core/schema" }
-rusqlite = { version = "0.39", features = ["bundled", "serialize"] }
-serde_json = "1"
-anyhow = "1"
+rusqlite = { workspace = true, features = ["bundled", "serialize"] }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
 uv-pep508 = { version = "0.0.29", optional = true }
 uv-pep440 = { version = "0.0.29", optional = true }
 uv-normalize = { version = "0.0.29", optional = true }
 toml = { version = "1", optional = true }
 
 [dev-dependencies]
-rusqlite = { version = "0.39", features = ["bundled", "serialize"] }
+rusqlite = { workspace = true, features = ["bundled", "serialize"] }

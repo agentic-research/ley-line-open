@@ -7,20 +7,20 @@ edition = "2024"
 leyline-core = { path = "../../ll-core/core" }
 leyline-fs = { path = "../fs", default-features = false }
 jj-lib = { version = "0.42", default-features = false }
-anyhow = "1"
-hex = "0.4"
+anyhow = { workspace = true }
+hex = { workspace = true }
 # `futures::io::AsyncReadExt` — provides `read()` on the `futures_io::AsyncRead`
 # stream returned by jj-lib 0.42's async `store.read_file()`. tokio's
 # `AsyncReadExt` doesn't apply (different trait family); jj-lib uses
 # the futures-crate async stack post-0.40.
 futures = "0.3"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-log = "0.4"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+log = { workspace = true }
 pollster = "0.4"
-tempfile = "3"
-tokio = { version = "1", features = ["sync", "time", "macros"] }
-rusqlite = { version = "0.39", features = ["bundled", "serialize"], optional = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "macros"] }
+rusqlite = { workspace = true, features = ["bundled", "serialize"], optional = true }
 
 [features]
 default = []

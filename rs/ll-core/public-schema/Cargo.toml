@@ -2,6 +2,7 @@
 name = "leyline-public-schema"
 version = "0.6.0"
 edition = "2024"
+license = "AGPL-3.0-or-later"
 
 [dependencies]
 # ADR-0014 §3 — exact-pin declared in workspace (matches schema-capnp, cli-lib, lsp).

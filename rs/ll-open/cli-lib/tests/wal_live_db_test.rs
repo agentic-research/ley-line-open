@@ -356,16 +356,151 @@ fn _unused_phase() -> DaemonPhase {
 // test-only infrastructure (RLIMIT_FSIZE for ENOSPC + a WAL-bloat
 // scenario that would slow the standard suite).
 
-// **NOTE on ENOSPC coverage (deferred half of bead `0cdf2d`)**
+// ── ENOSPC coverage (bead `ley-line-open-fb3f49`) ──────────────────
 //
-// The bead named two adversarial cases: (1) ENOSPC / RLIMIT_FSIZE and
-// (2) WAL bloat. Only (2) ships in this file. (1) requires subprocess
-// isolation — `RLIMIT_FSIZE` is process-scoped, so an in-process test
-// that caps the limit corrupts sibling tests that boot the daemon
-// concurrently under tokio's multi-thread test runtime. Doing it
-// correctly means forking or spawning a helper binary, either of
-// which is a chunk of infrastructure that isn't justified for a
-// single adversarial case. Filing as its own bead below.
+// Subprocess-isolated ENOSPC / RLIMIT_FSIZE test. RLIMIT_FSIZE is
+// process-scoped; an in-process cap leaks to sibling tokio-test tasks
+// that boot daemons concurrently under the multi-thread runtime. We
+// side-step that by making the test spawn a fresh copy of THIS test
+// binary running only the `enospc_child` helper (marked `#[ignore]`
+// so it never fires in the normal suite). The child caps its own
+// RLIMIT_FSIZE — the cap can't leak because the child exits after
+// the assertion runs.
+//
+// Wire protocol:
+//   ENV VAR `LEYLINE_ENOSPC_CHILD_DIR` = temp dir for the child's
+//       arena. Presence signals "you are the child; don't spawn."
+//   Exit code 42 = child saw the expected Err (test passes).
+//   Exit code 43 = child saw Ok (test fails — daemon didn't fail loud).
+//   Any other code / signal = test fails (child panicked / crashed).
+
+/// Parent: spawn the ENOSPC child helper via `cargo test --exact ...`
+/// and assert exit code == 42 (child observed the required Err).
+#[cfg(target_family = "unix")]
+#[test]
+fn daemon_fails_loud_under_fsize_quota() {
+    use std::process::Command;
+
+    // Guard: if the parent env already has LEYLINE_ENOSPC_CHILD_DIR
+    // set, we ARE the child and shouldn't recurse. Should never
+    // happen (this test isn't marked #[ignore] so it wouldn't be
+    // selected by the child's cargo invocation), but belt-and-braces.
+    if std::env::var("LEYLINE_ENOSPC_CHILD_DIR").is_ok() {
+        return;
+    }
+
+    let dir = TempDir::new().expect("parent temp dir");
+    let child_arena_dir = dir.path().to_str().expect("child arena dir utf-8");
+
+    // env::current_exe() returns the test binary path itself; running
+    // it with `--test enospc_child --nocapture --ignored` invokes just
+    // the child test below.
+    let test_binary = std::env::current_exe().expect("test binary path");
+
+    let status = Command::new(&test_binary)
+        .env("LEYLINE_ENOSPC_CHILD_DIR", child_arena_dir)
+        // `--exact enospc_child` = run only the child test.
+        // `--ignored` = required because the child test is #[ignore].
+        // `--nocapture` = surface child panics if the assertion trips.
+        .args([
+            "--exact",
+            "enospc_child",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .status()
+        .expect("spawn child test binary");
+
+    // Exit code map:
+    //   42 = expected Err path fired (test passes)
+    //   43 = daemon returned Ok under quota (invariant broken)
+    //   * anything else (including signal death, panic, timeout) = fail
+    let code = status.code().unwrap_or(-1);
+    assert_eq!(
+        code, 42,
+        "child ENOSPC test exit code {code} — expected 42 (child saw \
+         daemon return Err under RLIMIT_FSIZE cap). Exit 43 means the \
+         daemon returned Ok despite the quota (invariant broken); any \
+         other code means the child panicked/crashed.",
+    );
+}
+
+/// **Child helper** — never runs in the normal suite (`#[ignore]`),
+/// only invoked by the parent test above.
+///
+/// Caps its own RLIMIT_FSIZE and attempts a daemon boot. Exits with
+/// 42 if the boot returned Err (expected), 43 if it returned Ok
+/// (invariant broken). Any panic in this function propagates out and
+/// the parent sees a non-42/43 exit code.
+#[cfg(target_family = "unix")]
+#[test]
+#[ignore = "subprocess helper — parent spawns via LEYLINE_ENOSPC_CHILD_DIR env var"]
+fn enospc_child() {
+    // Refuse to run in a non-subprocess context.
+    let arena_dir = match std::env::var("LEYLINE_ENOSPC_CHILD_DIR") {
+        Ok(d) => d,
+        Err(_) => {
+            // Not invoked by the parent — silently no-op so
+            // running `cargo test --ignored` accidentally doesn't
+            // cap RLIMIT_FSIZE on the developer's shell.
+            eprintln!(
+                "enospc_child: no LEYLINE_ENOSPC_CHILD_DIR set; \
+                 this helper only runs under the parent's spawn."
+            );
+            return;
+        }
+    };
+
+    // Also block SIGXFSZ so a size-limit hit returns EFBIG rather
+    // than killing the child.
+    unsafe {
+        libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+    }
+
+    // Cap RLIMIT_FSIZE at 4 KiB — way below any daemon startup file.
+    // No RAII Drop guard needed: the child exits after this test.
+    let mut current = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `current` points to valid rlimit storage.
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &mut current) };
+    assert_eq!(rc, 0, "child getrlimit failed");
+    let new = libc::rlimit {
+        rlim_cur: 4096,
+        rlim_max: current.rlim_max,
+    };
+    // SAFETY: `new` is a valid rlimit; rlim_cur ≤ rlim_max.
+    let rc = unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &new) };
+    assert_eq!(rc, 0, "child setrlimit failed");
+
+    // Attempt daemon boot under cap.
+    let arena_path = std::path::Path::new(&arena_dir).join("wal.arena");
+    let config = wal_test_config(&arena_path, None, 1);
+    let ext: Arc<dyn leyline_cli_lib::daemon::DaemonExt> = Arc::new(NoExt);
+
+    // Build a minimal runtime for the async run_daemon. Can't use
+    // #[tokio::test] because we need to exit with a specific code.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("child tokio runtime");
+
+    let result = rt.block_on(async move { run_daemon(config, ext).await });
+
+    // Exit code protocol.
+    if result.is_err() {
+        // Expected: daemon reported failure rather than silently
+        // ignoring the quota.
+        std::process::exit(42);
+    } else {
+        // Invariant broken: substrate write path succeeded even
+        // though the quota should have blocked file creation.
+        std::process::exit(43);
+    }
+}
 
 /// **Adversarial #2**: WAL recovers cleanly after growing large + crash.
 ///

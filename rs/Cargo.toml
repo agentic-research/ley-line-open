@@ -6,6 +6,50 @@ members = [
 ]
 resolver = "2"
 
+# ADR-0026 / bead 3b2f55 Phase 1 — canonical dep versions for the workspace.
+#
+# These entries are the *declaration* only. Per-crate manifests still
+# carry inline versions and will be migrated to `workspace = true` in
+# Phase 2. Nothing here changes resolved versions yet.
+#
+# Transitive-drift note: cargo tree may still show multiple versions of
+# `rand` (uuid pulls 0.10 via r2d2_sqlite → cli-lib; jj-lib pulls 0.9 via
+# leyline-vcs). Workspace.dependencies only unifies *direct* deps we
+# declare, not transitives — that's an upstream-crate problem.
+[workspace.dependencies]
+# Core (used by 8+ crates)
+anyhow = "1.0.86"
+serde = "1.0.219"
+serde_json = "1.0.140"
+rusqlite = "0.39.0"
+
+# Substrate / substrate-adjacent (ADR-0014 §3 exact-pins)
+blake3 = "1.8.5"
+capnp = "=0.25.0"
+capnp-json = "=0.1.0"
+capnpc = "=0.25.0"
+
+# Async / IO
+tokio = "1.47"
+libc = "0.2.175"
+memmap2 = "0.9.9"
+
+# Utilities
+log = "0.4.28"
+tempfile = "3.20.0"
+hex = "0.4.3"
+bytemuck = "1.24"
+thiserror = "2.0.18"
+# `sign` production code is decoupled from rand post-#155
+# (ed25519-dalek 3.x + SigningKey::from_bytes). `sign` still uses
+# rand 0.8 as a *dev-dep* for keygen in tests; that's not covered
+# by this declaration and will migrate in Phase 2.
+rand = "0.9"
+
+# Domain / parsing
+tree-sitter = "0.26.0"
+clap = "4.5"
+
 # Cross-crate inlining + single codegen unit so the sheaf hot paths
 # (per-edge δ⁰, sparse matvec, restriction-map composition) vectorize
 # end-to-end without being interrupted by the crate boundary. The

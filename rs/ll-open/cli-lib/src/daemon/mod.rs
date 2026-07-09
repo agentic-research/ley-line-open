@@ -9,6 +9,7 @@ pub mod embed;
 pub mod enrichment;
 pub mod events;
 pub mod ext;
+pub mod granularity_router;
 #[cfg(feature = "hdc")]
 pub mod hdc_enrich;
 #[cfg(feature = "hdc")]

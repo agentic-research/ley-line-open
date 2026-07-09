@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "counts": [
+    {
+      "rule_id": "workspace_deps_drift",
+      "source_id": "rs/ll-open/sign/Cargo.toml",
+      "count": 1
+    }
+  ]
+}

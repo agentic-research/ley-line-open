@@ -762,6 +762,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cargo-toml-projector"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "toml_edit",
+ "walkdir",
+]
+
+[[package]]
 name = "cast"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,12 @@
+{
+  "captured_at": "2026-07-09",
+  "hardware": "Darwin 25.5.0 arm64",
+  "leyline_version": "0.6.0",
+  "read_path": "row-projected (_ast)",
+  "measurements": {
+    "get_overview": { "p50_us": 5, "p99_us": 9, "iterations": 10000 },
+    "find_definition": { "p50_us": 4, "p99_us": 8, "iterations": 10000 },
+    "find_callers": { "p50_us": 4, "p99_us": 7, "iterations": 10000 },
+    "search": { "p50_us": 83, "p99_us": 112, "iterations": 10000 }
+  }
+}

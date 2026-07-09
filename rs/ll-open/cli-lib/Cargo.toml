@@ -108,6 +108,17 @@ name = "wal_concurrent_readers"
 path = "benches/wal_concurrent_readers.rs"
 harness = false
 
+# ADR-0026 Phase 2.0 — F2 read-side measurement infrastructure
+# (bead ley-line-open-335d34). Captures the row-projected p50/p99
+# baseline the Phase 2 pointer-store consumer migration has to beat
+# by ≥2× per §9.2.4. Same `harness = false` + `Instant::now()` shape
+# as the WAL benches — no criterion dev-dep needed for the p50/p99
+# artifact this ships.
+[[bench]]
+name = "read_wall_time"
+path = "benches/read_wall_time.rs"
+harness = false
+
 # ─────────────────────────────────────────────────────────────────────
 # Σ falsification suite F1–F5 (bead ley-line-open-9e7a9d / T1.3).
 #

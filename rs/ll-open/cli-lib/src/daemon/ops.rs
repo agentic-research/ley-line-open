@@ -671,6 +671,53 @@ fn op_snapshot(ctx: &DaemonContext) -> Result<String> {
 /// (with the understanding that they're opting into the cost).
 pub(crate) const OP_QUERY_DEFAULT_ROW_LIMIT: usize = 1000;
 
+/// ADR-0026 Phase 2.0 — read-side wall-time profiling scope
+/// (bead `ley-line-open-335d34`).
+///
+/// Mirrors the `LEYLINE_PROFILE=1` sub-phase timing pattern used by
+/// `cmd_parse` for the insert path. When the env var is set, emits
+/// `[profile] op_query/<query_type>: <n>µs` to stderr on drop. When
+/// unset, this is a zero-cost `Instant::now` per op (the drop path
+/// short-circuits before formatting).
+///
+/// Instrumented at the op-dispatch layer (`op_query`, `op_list_children`,
+/// `op_find_callers`, `op_find_defs`) so the numbers cover the whole
+/// read path — SQL prepare, rows iter, capnp encode, capnp_json serialize.
+/// That's the wall-time the F2 gate (§9.2.4) has to beat by ≥2× once
+/// the pointer-store consumer lands in Phase 2.1.
+///
+/// Phase 2.0 measurement infrastructure only — no consumer migration, no
+/// wire-side event emission, no behavior change when the env var is unset.
+struct ReadProfileTimer {
+    query_type: &'static str,
+    start: std::time::Instant,
+    enabled: bool,
+}
+
+impl ReadProfileTimer {
+    fn new(query_type: &'static str) -> Self {
+        // Read the env var once per op — the same shape `cmd_parse`
+        // uses. Cheap enough (a hash-map lookup on macOS/Linux) that
+        // per-op reads don't measurably move the read wall-time we're
+        // trying to characterize.
+        let enabled = std::env::var("LEYLINE_PROFILE").ok().as_deref() == Some("1");
+        Self {
+            query_type,
+            start: std::time::Instant::now(),
+            enabled,
+        }
+    }
+}
+
+impl Drop for ReadProfileTimer {
+    fn drop(&mut self) {
+        if self.enabled {
+            let us = self.start.elapsed().as_micros();
+            eprintln!("[profile] op_query/{}: {us}µs", self.query_type);
+        }
+    }
+}
+
 /// Raw SQL query — for ad-hoc inspection.
 ///
 /// Caps row output at `req["limit"]` (or `OP_QUERY_DEFAULT_ROW_LIMIT` if
@@ -679,6 +726,11 @@ pub(crate) const OP_QUERY_DEFAULT_ROW_LIMIT: usize = 1000;
 /// they need everything.
 fn op_query(ctx: &DaemonContext, sql: &str, limit: Option<usize>) -> Result<String> {
     let limit = limit.unwrap_or(OP_QUERY_DEFAULT_ROW_LIMIT);
+    // ADR-0026 Phase 2.0 (bead `ley-line-open-335d34`): profile the
+    // whole op path when `LEYLINE_PROFILE=1`. Zero-cost when unset.
+    // Drops at function return so the timer covers SQL prepare +
+    // rows iter + JSON serialize.
+    let _prof = ReadProfileTimer::new("query");
 
     // Bead `ley-line-open-f0239d`: `op_query` accepts arbitrary SQL and
     // can't statically distinguish reads from writes (`DROP TABLE` looks
@@ -737,6 +789,12 @@ fn op_query(ctx: &DaemonContext, sql: &str, limit: Option<usize>) -> Result<Stri
 /// The wire still emits the typed Node shape; `record` is `Option<String>`
 /// with `skip_serializing_if`, so listings simply drop the key.
 fn op_list_children(ctx: &DaemonContext, id: &str) -> Result<String> {
+    // ADR-0026 Phase 2.0 (bead `ley-line-open-335d34`) — read-path
+    // profile timer. This op backs mache's "get_overview" surface
+    // (`list_roots` when id="", `list_children` otherwise); wrapping
+    // it captures the whole row-projected read time that Phase 2.x
+    // must beat by ≥2× per §9.2.4.
+    let _prof = ReadProfileTimer::new("list_children");
     let response = ctx.with_read(|conn| {
         let mut stmt = conn.prepare_cached(
             "SELECT id, parent_id, name, kind, size \
@@ -808,6 +866,10 @@ fn op_read_content(ctx: &DaemonContext, id: &str) -> Result<String> {
 
 /// Find callers of a token (queries node_refs).
 fn op_find_callers(ctx: &DaemonContext, token: &str) -> Result<String> {
+    // ADR-0026 Phase 2.0 (bead `ley-line-open-335d34`) — mache-side
+    // "find_callers" analog. Profile timer emits the row-projected
+    // baseline the Phase 2 pointer-store gate has to beat.
+    let _prof = ReadProfileTimer::new("find_callers");
     ctx.with_read(|conn| {
         let rows = query_token_refs(conn, token, "node_refs")?;
         let mut builder = capnp::message::Builder::new_default();
@@ -824,6 +886,10 @@ fn op_find_callers(ctx: &DaemonContext, token: &str) -> Result<String> {
 
 /// Find definitions of a token (queries node_defs).
 fn op_find_defs(ctx: &DaemonContext, token: &str) -> Result<String> {
+    // ADR-0026 Phase 2.0 (bead `ley-line-open-335d34`) — mache-side
+    // "find_definition" analog. Same profile-timer discipline as
+    // find_callers / list_children / query.
+    let _prof = ReadProfileTimer::new("find_defs");
     ctx.with_read(|conn| {
         let rows = query_token_refs(conn, token, "node_defs")?;
         let mut builder = capnp::message::Builder::new_default();
@@ -2947,6 +3013,58 @@ mod tests {
 
     fn normalize_file_uri_strips_prefix() {
         assert_eq!(normalize_file_uri("file:///abs/foo.rs"), "/abs/foo.rs");
+    }
+
+    /// ADR-0026 Phase 2.0 (bead `ley-line-open-335d34`): pin the
+    /// `LEYLINE_PROFILE=1` gate behavior. When the env var is unset
+    /// the timer's `enabled` flag must be false — otherwise every
+    /// `op_query` / `list_children` / `find_callers` / `find_defs`
+    /// call would emit a stderr line in production. This is a
+    /// zero-tolerance regression pin: a refactor that flipped the
+    /// default would spam every daemon's stderr.
+    #[test]
+    fn read_profile_timer_defaults_to_disabled() {
+        // Guard the env-var probe against test-order noise:
+        // remove_var is what daemon-under-test does when unset, and
+        // matches the production shell where LEYLINE_PROFILE isn't
+        // exported.
+        // SAFETY: single-threaded test with no crossing threads
+        // touching the env; set_var/remove_var are `unsafe` in Rust
+        // 1.83+ under the same rules.
+        // We restore the prior value on drop so parallel tests aren't
+        // affected.
+        struct EnvGuard {
+            key: &'static str,
+            prev: Option<String>,
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                // SAFETY: same-thread scope.
+                unsafe {
+                    match self.prev.take() {
+                        Some(v) => std::env::set_var(self.key, v),
+                        None => std::env::remove_var(self.key),
+                    }
+                }
+            }
+        }
+        let prev = std::env::var("LEYLINE_PROFILE").ok();
+        // SAFETY: same-thread scope; guard restores on drop.
+        unsafe {
+            std::env::remove_var("LEYLINE_PROFILE");
+        }
+        let _g = EnvGuard {
+            key: "LEYLINE_PROFILE",
+            prev,
+        };
+        let t = ReadProfileTimer::new("test_shape");
+        assert!(
+            !t.enabled,
+            "ReadProfileTimer MUST default to disabled when LEYLINE_PROFILE is unset",
+        );
+        // Explicit drop — verifies the disabled-path Drop doesn't
+        // panic (it short-circuits the format).
+        drop(t);
     }
 
     #[test]

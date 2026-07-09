@@ -69,13 +69,19 @@ tasks:
       - echo "installed $(~/.local/bin/leyline --version)"
 
   release:full:
-    desc: Release build with the `all` meta-feature — everything the CLI exposes (mount + vec + validate + hdc + text-search + lsp). Requires libfuse-t (macOS) / libfuse (Linux) system deps for `mount`.
+    desc: Release build with `--features all` — everything the CLI can expose EXCEPT mount. Portable (no libfuse-t / libfuse runtime dep). Includes lsp + vec + validate + hdc + text-search.
     dir: rs
     cmds:
       - cargo build --release -p leyline-cli --features all
 
+  release:full+mount:
+    desc: Release build with `--features full` — includes mount. Requires libfuse-t (macOS `brew install fuse-t`) or libfuse (Linux `apt install libfuse-dev`) at BUILD and RUNTIME. Binary won't launch without the dylib.
+    dir: rs
+    cmds:
+      - cargo build --release -p leyline-cli --features full
+
   install:full:
-    desc: Build with `--features all`, codesign (macOS), and install to ~/.local/bin. Use this when you want the full daemon-op surface (mache install flow).
+    desc: Build with `--features all` (everything except mount), codesign (macOS), and install to ~/.local/bin. Portable — no system-dep prerequisites. This is the recommended full install for mache + downstream daemon consumers.
     deps: [release:full]
     cmds:
       - mkdir -p ~/.local/bin
@@ -85,6 +91,16 @@ tasks:
       - cmd: codesign -s - --force --deep --entitlements entitlements.plist ~/.local/bin/leyline
         platforms: [darwin]
       - echo "installed (full) $(~/.local/bin/leyline --version)"
+
+  "install:full+mount":
+    desc: Build with `--features full` INCLUDING mount, codesign (macOS), and install. ONLY use this if libfuse-t (macOS) / libfuse (Linux) is installed at runtime — otherwise the binary won't launch, even for non-mount ops.
+    deps: [release:full+mount]
+    cmds:
+      - mkdir -p ~/.local/bin
+      - cp rs/target/release/leyline ~/.local/bin/leyline
+      - cmd: codesign -s - --force --deep --entitlements entitlements.plist ~/.local/bin/leyline
+        platforms: [darwin]
+      - echo "installed (full+mount) $(~/.local/bin/leyline --version)"
 
   # --------------------------------------------------------------------------
   # Test

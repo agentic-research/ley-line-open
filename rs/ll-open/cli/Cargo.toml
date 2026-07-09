@@ -20,11 +20,20 @@ vec = ["leyline-cli-lib/vec"]
 validate = ["leyline-cli-lib/validate"]
 hdc = ["leyline-cli-lib/hdc"]
 text-search = ["leyline-cli-lib/text-search"]
-# Meta-feature — everything the CLI can expose. Use for `task install:full`
-# or `cargo build -p leyline-cli --features all` when you want the full
-# daemon-op surface. Note `all` includes `mount`, which requires libfuse
-# system deps at build time.
-all = ["lsp", "mount", "vec", "validate", "hdc", "text-search"]
+# Meta-feature — everything the CLI can expose EXCEPT mount. Use for
+# `task install:full` or `cargo build -p leyline-cli --features all`
+# when you want the full daemon-op surface WITHOUT the libfuse-t / libfuse
+# system-dep requirement (mount links to fuser, which needs libfuse-t
+# at *runtime* on macOS — the binary won't launch at all if it's missing,
+# even for non-mount ops).
+#
+# For a build that includes mount, use `full` explicitly:
+#   cargo build -p leyline-cli --features full
+# or `task install:full+mount` — but you MUST have libfuse-t (macOS
+# `brew install fuse-t`) or libfuse-dev (Linux) available at runtime.
+all = ["lsp", "vec", "validate", "hdc", "text-search"]
+# Everything, including mount. Runtime-requires libfuse-t / libfuse.
+full = ["lsp", "mount", "vec", "validate", "hdc", "text-search"]
 
 [dependencies]
 leyline-cli-lib = { path = "../cli-lib", default-features = false }

@@ -417,6 +417,40 @@ pub fn create_pointer_store_tables(conn: &Connection) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// ADR-0028 source_blobs — Phase 1 dual-store (bead ley-line-open-9e4416)
+// ---------------------------------------------------------------------------
+//
+// Content-addressed source storage: `_source` gains a byte-identical companion
+// (`source_blobs`) keyed on BLAKE3(bytes). `_source.content_hash` (populated
+// already for the Σ head chain) becomes the FK-shaped pointer into
+// `source_blobs`. Phase 1 is dual-store — `_source` still populated as before,
+// `source_blobs` populated additively; consumer migration is Phase 2, drop of
+// `_source.source` is Phase 3.
+//
+// Blob unit: per-file (ADR-0028 §2.2). Sub-file dedup via CDC (ley-line
+// ADR-014) is a downstream refinement.
+
+/// DDL for `source_blobs` — content-addressed source byte store. One row per
+/// UNIQUE byte content keyed on BLAKE3(blob_bytes). `byte_len` is a stored
+/// generated column so consumers can filter by size without materializing the
+/// blob (index scan + covering `byte_len` predicate). Populated by
+/// `INSERT OR IGNORE`, so byte-identical source content across files/repos
+/// deduplicates at insert time.
+pub const SOURCE_BLOBS_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS source_blobs (
+    blob_hash BLOB PRIMARY KEY,
+    blob_bytes BLOB NOT NULL,
+    byte_len INTEGER GENERATED ALWAYS AS (length(blob_bytes)) STORED
+);";
+
+/// Create the ADR-0028 source-blobs table (idempotent). Runs alongside the
+/// existing `_source` schema; Phase 1 is dual-store.
+pub fn create_source_blobs_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(SOURCE_BLOBS_DDL)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // File-index & meta tables (incremental reparse)
 // ---------------------------------------------------------------------------
 
@@ -560,6 +594,11 @@ pub fn delete_file_rows(conn: &Connection, path: &str) -> Result<()> {
         // blob row on reparse via `INSERT OR IGNORE`, so nothing accumulates
         // per file (blobs dedup on identical file content).
     }
+    // ADR-0028 source_blobs (Phase 1 dual-store, bead `ley-line-open-9e4416`).
+    // Content-addressed, not source_id-keyed — same orphan discipline as
+    // capnp_blobs. `_source` is deleted above; source_blobs rows the deleted
+    // `_source.content_hash` pointed at may become orphaned but are cheap to
+    // leave (INSERT OR IGNORE dedups on reparse). Phase 2/3 GC collects orphans.
     delete_lsp_rows_for_path(conn, path)?;
     Ok(())
 }

@@ -30,7 +30,7 @@ use leyline_ts::refs::{ExtractedRef, extract_refs};
 use leyline_ts::schema::{
     create_ast_tables, create_index_schema, create_ir_indexes, create_ir_tables,
     create_pointer_store_tables, create_post_load_indexes_skip_unused, create_refs_tables,
-    delete_file_rows, read_file_index, set_meta, sweep_orphaned_dirs,
+    create_source_blobs_table, delete_file_rows, read_file_index, set_meta, sweep_orphaned_dirs,
 };
 use rayon::prelude::*;
 use rusqlite::Connection;
@@ -126,6 +126,12 @@ struct ParsedFile {
     /// `capnp_blobs.blob_hash` (PK) and every `_ast_pointer.blob_hash` FK
     /// for this file's rows.
     pointer_blob_hash: [u8; 32],
+    /// ADR-0028 source-blob bytes (bead `ley-line-open-9e4416`, Phase 1):
+    /// verbatim file bytes as read from disk by the rayon worker, moved into
+    /// `source_blobs.blob_bytes` on the main-thread insert loop. Byte-identical
+    /// to the input `content` slice (F1s asserts this). One `Vec<u8>` clone per
+    /// file — the same allocation the existing `content_hash` already reads.
+    source_blob_bytes: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -511,6 +517,27 @@ batch_table! {
 }
 
 batch_table! {
+    // ADR-0028 source-blob rows (bead `ley-line-open-9e4416`, Phase 1 dual-
+    // store). `INSERT OR IGNORE` on the `blob_hash` PK == intrinsic dedup:
+    // two files with byte-identical source content share one blob (F5s).
+    // Phase 1 blob unit is per-file; sub-file (CDC) refinement composes with
+    // ley-line ADR-014 downstream.
+    SourceBlobBatch, SourceBlobRow,
+    "INSERT OR IGNORE INTO source_blobs (blob_hash, blob_bytes) VALUES ",
+    2,
+    push_fn: (blob_hash: Vec<u8>, blob_bytes: Vec<u8>),
+    push_body: { SourceBlobRow { blob_hash, blob_bytes } },
+    flatten: |chunk| {
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 2);
+        for r in chunk {
+            out.push(&r.blob_hash);
+            out.push(&r.blob_bytes);
+        }
+        out
+    },
+}
+
+batch_table! {
     // ADR-0026 pointer rows — one per `_ast` entry, dual-write for Phase 1
     // (bead `ley-line-open-3e87ad`). `delete_file_rows` clears prior rows
     // per file, so plain `INSERT` doesn't conflict.
@@ -687,6 +714,12 @@ pub fn parse_into_conn(
     // store tables land alongside the row-projected schema. Both populated on
     // every parse; F1 (round-trip integrity) asserts continuous agreement.
     create_pointer_store_tables(conn)?;
+    // ADR-0028 Phase 1 dual-store (bead `ley-line-open-9e4416`): source_blobs
+    // lands alongside `_source`. `_source.content_hash` (already populated for
+    // the Σ head chain) becomes the FK-shaped pointer into source_blobs. F1s
+    // (round-trip integrity), F4s (cross-gen dedup), F5s (cross-file dedup),
+    // F-rename, and F-git assert continuous agreement.
+    create_source_blobs_table(conn)?;
     create_index_schema(conn)?;
 
     let mtime = std::time::SystemTime::now()
@@ -967,6 +1000,12 @@ pub fn parse_into_conn(
     let mut blob_buf: CapnpBlobBatch = CapnpBlobBatch::with_capacity(to_parse.len());
     let mut pointer_buf: AstPointerBatch = AstPointerBatch::with_capacity(550_000);
 
+    // ADR-0028 source blobs (Phase 1 dual-store, bead `ley-line-open-9e4416`).
+    // One `source_blobs` row per file *before* `INSERT OR IGNORE` dedup; unique
+    // source content collapses at flush time. Pre-sized at `to_parse.len()` —
+    // the pre-dedup upper bound.
+    let mut source_blob_buf: SourceBlobBatch = SourceBlobBatch::with_capacity(to_parse.len());
+
     // Merkle-AST IR (ADR-0027). `node_content`/`node_child` are the deduped
     // content layer (`INSERT OR IGNORE` collapses identical subtrees across
     // files); `_ast`/`node_defs`/`node_refs` carry the additive `node_hash`
@@ -1001,6 +1040,13 @@ pub fn parse_into_conn(
                     pf.abs_path.clone(),
                     pf.content_hash.to_vec(),
                 );
+
+                // ADR-0028 dual-store (Phase 1, bead `ley-line-open-9e4416`).
+                // One `source_blobs` row per file, byte-verbatim; `INSERT OR
+                // IGNORE` on the `blob_hash` PK collapses byte-identical files
+                // to one row (F5s). `_source.content_hash` (pushed above) is
+                // the FK-shaped pointer at this blob (F1s asserts round-trip).
+                source_blob_buf.push(pf.content_hash.to_vec(), pf.source_blob_bytes.clone());
 
                 // capnp dual-write (`ley-line-open-cdf098`): same fields
                 // as the SQL row, typed and content-addressable. The
@@ -1155,6 +1201,14 @@ pub fn parse_into_conn(
     child_buf.flush_batched(conn)?;
     nodes_buf.flush_batched(conn)?;
     ast_buf.flush_batched(conn)?;
+    // ADR-0028 source-blob dual-store (bead `ley-line-open-9e4416`). Flush
+    // source_blobs BEFORE `_source` so the FK-shaped pointer (`_source.
+    // content_hash → source_blobs.blob_hash`) always finds its referent —
+    // matches the capnp_blobs→_ast_pointer ordering below. Phase 1 doesn't
+    // declare the FK (dual-store is additive; the FK becomes load-bearing
+    // when Phase 2 flips consumers to reads), but ordering the writes
+    // correctly means the promotion is a one-line edit.
+    source_blob_buf.flush_batched(conn)?;
     source_buf.flush_batched(conn)?;
     refs_buf.flush_batched_for(
         conn,
@@ -2067,6 +2121,14 @@ fn parse_file_pure(
     serialize_ast_node_list_record(&mut pointer_blob_bytes, &ast_entries)?;
     let pointer_blob_hash: [u8; 32] = *pointer_blob_bytes.as_slice().hash().as_bytes();
 
+    // ADR-0028 source-blob bytes (bead `ley-line-open-9e4416`, Phase 1 dual-
+    // store). Owning clone of the input source bytes so the main-thread insert
+    // loop can move them into `source_blobs.blob_bytes` without re-reading from
+    // disk. `content_hash` above is already BLAKE3 of this exact slice, so
+    // (blob_hash, blob_bytes) is content-consistent by construction (F1s pins
+    // this in-DB; F-git pins hash-compatibility with `git cat-file blob`).
+    let source_blob_bytes = content.to_vec();
+
     Ok(ParsedFile {
         rel: source_id.to_string(),
         abs_path: abs_path.to_string(),
@@ -2083,6 +2145,7 @@ fn parse_file_pure(
         ast_capnp_bytes,
         pointer_blob_bytes,
         pointer_blob_hash,
+        source_blob_bytes,
     })
 }
 

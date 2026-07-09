@@ -9,10 +9,22 @@ name = "leyline"
 path = "src/main.rs"
 
 [features]
-default = ["lsp"]
+# Match cli-lib's baseline defaults — lsp + validate + hdc are pure-Rust
+# with no system-dep cost, and cli-lib treats them as always-available.
+# `mount` (libfuse-t/libfuse system dep) and `vec` (fastembed + ONNX
+# download at first use) stay opt-in to keep the default build portable.
+default = ["lsp", "validate", "hdc"]
 lsp = ["leyline-cli-lib/lsp"]
 mount = ["leyline-cli-lib/mount"]
 vec = ["leyline-cli-lib/vec"]
+validate = ["leyline-cli-lib/validate"]
+hdc = ["leyline-cli-lib/hdc"]
+text-search = ["leyline-cli-lib/text-search"]
+# Meta-feature — everything the CLI can expose. Use for `task install:full`
+# or `cargo build -p leyline-cli --features all` when you want the full
+# daemon-op surface. Note `all` includes `mount`, which requires libfuse
+# system deps at build time.
+all = ["lsp", "mount", "vec", "validate", "hdc", "text-search"]
 
 [dependencies]
 leyline-cli-lib = { path = "../cli-lib", default-features = false }

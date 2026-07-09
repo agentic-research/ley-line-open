@@ -576,6 +576,7 @@ pub mod tests_helpers {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+    use rand::RngCore;
     use rand::rngs::OsRng;
 
     use super::tests_helpers::mint_test_cert;
@@ -587,10 +588,22 @@ mod tests {
             .as_secs() as i64
     }
 
+    /// ed25519-dalek 3.x removed `SigningKey::generate` — 3.x requires an
+    /// `rand_core 0.10`-compatible `CryptoRng`, and the sign crate keeps
+    /// `rand = "0.8"` (rand_core 0.6) as a dev-dep until the workspace-wide
+    /// rand bump lands (bead 3b2f55). We sidestep the trait-version mismatch
+    /// entirely by seeding a `[u8; 32]` from rand 0.8's `OsRng` and handing
+    /// raw bytes to `SigningKey::from_bytes`, which is infallible in 3.x.
+    fn random_signing_key() -> SigningKey {
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        SigningKey::from_bytes(&seed)
+    }
+
     #[test]
     fn happy_path_minimum_cert() {
-        let master = SigningKey::generate(&mut OsRng);
-        let ephemeral = SigningKey::generate(&mut OsRng);
+        let master = random_signing_key();
+        let ephemeral = random_signing_key();
         let nb = now();
         let na = nb + 300;
         let cert_der = mint_test_cert(&master, &ephemeral, nb, na, None, None, None);
@@ -610,8 +623,8 @@ mod tests {
 
     #[test]
     fn happy_path_with_interlace_extensions() {
-        let master = SigningKey::generate(&mut OsRng);
-        let ephemeral = SigningKey::generate(&mut OsRng);
+        let master = random_signing_key();
+        let ephemeral = random_signing_key();
         let nb = now();
         let na = nb + 300;
         let cert_der = mint_test_cert(
@@ -633,9 +646,9 @@ mod tests {
 
     #[test]
     fn wrong_master_pubkey_rejects() {
-        let master = SigningKey::generate(&mut OsRng);
-        let other_master = SigningKey::generate(&mut OsRng);
-        let ephemeral = SigningKey::generate(&mut OsRng);
+        let master = random_signing_key();
+        let other_master = random_signing_key();
+        let ephemeral = random_signing_key();
         let nb = now();
         let cert_der = mint_test_cert(&master, &ephemeral, nb, nb + 300, None, None, None);
 
@@ -645,8 +658,8 @@ mod tests {
 
     #[test]
     fn truncated_cert_rejects() {
-        let master = SigningKey::generate(&mut OsRng);
-        let ephemeral = SigningKey::generate(&mut OsRng);
+        let master = random_signing_key();
+        let ephemeral = random_signing_key();
         let cert_der = mint_test_cert(&master, &ephemeral, now(), now() + 300, None, None, None);
 
         let result = verify_cert_chain(
@@ -658,8 +671,8 @@ mod tests {
 
     #[test]
     fn wrong_master_key_length_rejects() {
-        let master = SigningKey::generate(&mut OsRng);
-        let ephemeral = SigningKey::generate(&mut OsRng);
+        let master = random_signing_key();
+        let ephemeral = random_signing_key();
         let cert_der = mint_test_cert(&master, &ephemeral, now(), now() + 300, None, None, None);
 
         let result = verify_cert_chain(&cert_der, &[0u8; 31]);
@@ -728,8 +741,8 @@ mod tests {
 
     #[test]
     fn rejects_critical_unknown_extension() {
-        let master = SigningKey::generate(&mut OsRng);
-        let ephemeral = SigningKey::generate(&mut OsRng);
+        let master = random_signing_key();
+        let ephemeral = random_signing_key();
         let nb = now() - 60;
         let na = now() + 600;
 
@@ -755,8 +768,8 @@ mod tests {
 
     #[test]
     fn accepts_non_critical_unknown_extension() {
-        let master = SigningKey::generate(&mut OsRng);
-        let ephemeral = SigningKey::generate(&mut OsRng);
+        let master = random_signing_key();
+        let ephemeral = random_signing_key();
         let nb = now() - 60;
         let na = now() + 600;
 
@@ -782,8 +795,8 @@ mod tests {
         // Sanity: the verifier doesn't reject Interlace extensions even
         // if a future minter flags them critical. Our known-OID list is
         // the EPOCH/PEER_FP/SCOPE arc; critical flag on those is fine.
-        let master = SigningKey::generate(&mut OsRng);
-        let ephemeral = SigningKey::generate(&mut OsRng);
+        let master = random_signing_key();
+        let ephemeral = random_signing_key();
         let nb = now() - 60;
         let na = now() + 600;
 
@@ -801,5 +814,88 @@ mod tests {
         let claims = verify_cert_chain(&cert, master.verifying_key().as_bytes())
             .expect("standard interlace cert should verify");
         assert_eq!(claims.epoch, Some(7));
+    }
+
+    // ── Wire-format preservation gates (ed25519-dalek 3.x bump, bead 474c0a) ──
+
+    /// Fixed-seed round-trip: same seed → same key bytes → same signature.
+    /// Guards against a keygen semantics change slipping in with future
+    /// ed25519-dalek bumps. If this test breaks, `SigningKey::from_bytes`
+    /// no longer treats its 32-byte input as the seed defined by RFC 8032.
+    #[test]
+    fn fixed_seed_produces_stable_key_bytes() {
+        // Deterministic 32-byte seed — hand-picked so a regression in
+        // `from_bytes` (e.g. reinterpretation as scalar rather than seed)
+        // would flip both derived pubkey and signature outputs.
+        let seed: [u8; 32] = [
+            0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec,
+            0x2c, 0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03,
+            0x1c, 0xae, 0x7f, 0x60,
+        ];
+        // Expected pubkey is the RFC 8032 §7.1 test-vector pair for this
+        // seed: SHA-512(seed) → clamp → scalar → * G. Any keygen change
+        // that broke wire-format compatibility with 2.x would flip these.
+        let expected_pubkey: [u8; 32] = [
+            0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64,
+            0x07, 0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68,
+            0xf7, 0x07, 0x51, 0x1a,
+        ];
+        let key = SigningKey::from_bytes(&seed);
+        assert_eq!(
+            key.verifying_key().as_bytes(),
+            &expected_pubkey,
+            "keygen from RFC 8032 §7.1 test seed produced unexpected pubkey — \
+             wire format may have shifted",
+        );
+
+        // Signing the RFC 8032 §7.1 empty-message test vector gives the
+        // exact signature bytes below. Any ed25519 wire-format change
+        // would flip these.
+        use ed25519_dalek::Signer;
+        let sig = key.sign(b"");
+        let expected_sig: [u8; 64] = [
+            0xe5, 0x56, 0x43, 0x00, 0xc3, 0x60, 0xac, 0x72, 0x90, 0x86, 0xe2, 0xcc, 0x80, 0x6e,
+            0x82, 0x8a, 0x84, 0x87, 0x7f, 0x1e, 0xb8, 0xe5, 0xd9, 0x74, 0xd8, 0x73, 0xe0, 0x65,
+            0x22, 0x49, 0x01, 0x55, 0x5f, 0xb8, 0x82, 0x15, 0x90, 0xa3, 0x3b, 0xac, 0xc6, 0x1e,
+            0x39, 0x70, 0x1c, 0xf9, 0xb4, 0x6b, 0xd2, 0x5b, 0xf5, 0xf0, 0x59, 0x5b, 0xbe, 0x24,
+            0x65, 0x51, 0x41, 0x43, 0x8e, 0x7a, 0x10, 0x0b,
+        ];
+        assert_eq!(
+            sig.to_bytes(),
+            expected_sig,
+            "RFC 8032 §7.1 test-vector signature mismatch — wire format \
+             changed under the bump",
+        );
+
+        // Verify round-trip closes.
+        key.verifying_key()
+            .verify(b"", &sig)
+            .expect("self-signature should verify");
+    }
+
+    /// A signature produced under one instance must verify under a
+    /// separately-constructed VerifyingKey with the same pubkey bytes.
+    /// Guards against a "verifying key is opaque, not deterministic from
+    /// bytes" regression.
+    #[test]
+    fn cross_instance_verify_round_trip() {
+        let signer = random_signing_key();
+        let msg = b"leyline-sign round-trip gate";
+        use ed25519_dalek::Signer;
+        let sig = signer.sign(msg);
+
+        // Rebuild the verifying key from raw bytes on the "verifier" side.
+        let pubkey_bytes = *signer.verifying_key().as_bytes();
+        let verifier = VerifyingKey::from_bytes(&pubkey_bytes)
+            .expect("VerifyingKey::from_bytes on valid pubkey");
+        verifier
+            .verify(msg, &sig)
+            .expect("cross-instance verify must succeed");
+
+        // And a wrong message must fail.
+        assert!(
+            verifier.verify(b"tampered", &sig).is_err(),
+            "wrong-message verify must fail",
+        );
     }
 }

@@ -681,11 +681,24 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 pub(crate) mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+    use rand::RngCore;
     use rand::rngs::OsRng;
+
+    /// ed25519-dalek 3.x removed `SigningKey::generate` — 3.x requires an
+    /// `rand_core 0.10`-compatible `CryptoRng`, and this crate keeps
+    /// `rand = "0.8"` (rand_core 0.6) as a dev-dep until the workspace-wide
+    /// rand bump lands (bead 3b2f55). We sidestep the trait-version
+    /// mismatch by seeding a `[u8; 32]` from rand 0.8's `OsRng` and handing
+    /// raw bytes to `SigningKey::from_bytes`, which is infallible in 3.x.
+    pub(crate) fn random_signing_key() -> SigningKey {
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        SigningKey::from_bytes(&seed)
+    }
 
     /// Generate a self-signed Ed25519 certificate for testing.
     pub(crate) fn generate_test_cert_and_key() -> (Vec<u8>, [u8; 64]) {
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let signing_key = random_signing_key();
         let cert_der = build_self_signed_cert(&signing_key);
         let keypair_bytes = signing_key.to_keypair_bytes();
         (cert_der, keypair_bytes)
@@ -796,7 +809,7 @@ pub(crate) mod tests {
     #[test]
     fn key_cert_mismatch_rejected() {
         let (cert_der, _key) = generate_test_cert_and_key();
-        let wrong_key = SigningKey::generate(&mut OsRng);
+        let wrong_key = random_signing_key();
         let wrong_keypair = wrong_key.to_keypair_bytes();
 
         let result = sign_data(b"test", &cert_der, &wrong_keypair);

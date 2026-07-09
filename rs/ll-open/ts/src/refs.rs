@@ -618,32 +618,38 @@ fn collect_use_list_child(
 }
 
 /// When `func_node` (a `function_item` / `function_signature_item`) is
-/// nested inside an `impl_item`, return the impl's receiver type text.
-/// Returns `None` when the parent chain doesn't match the
-/// `function_item → declaration_list → impl_item` shape (bare top-level
-/// function, function nested inside another function, etc.).
+/// nested inside an `impl_item` or `trait_item`, return the receiver's
+/// text. Returns `None` when the parent chain doesn't match the
+/// `function_item → declaration_list → impl_item|trait_item` shape (bare
+/// top-level function, function nested inside another function, etc.).
 ///
 /// Bead `ley-line-open-caf423`. tree-sitter-rust's `impl_item` node has
 /// a `type` field carrying the impl'd type (e.g. `S` in `impl S {…}` or
-/// `Vec<u8>` in `impl Vec<u8> {…}`). We take the raw text — a
-/// generics-bearing type qualifies as `Vec<u8>::foo`, which is the
-/// least-surprising round-trip.
+/// `Vec<u8>` in `impl Vec<u8> {…}`). `trait_item` carries a `name` field
+/// with the trait's identifier (e.g. `Greet` in `trait Greet {…}`). For
+/// impl blocks we take the raw type text — a generics-bearing type
+/// qualifies as `Vec<u8>::foo`, which is the least-surprising round-trip.
+/// For trait blocks the receiver is the trait name itself so a default
+/// method `hello` inside `trait Greet` qualifies as `Greet::hello`,
+/// mirroring the docstring claim on `extract_rust`.
 #[cfg(feature = "rust")]
 fn rust_impl_receiver(func_node: &Node, source: &[u8]) -> Option<String> {
     let list = func_node.parent()?;
     if list.kind() != "declaration_list" {
         return None;
     }
-    let impl_node = list.parent()?;
-    if impl_node.kind() != "impl_item" {
-        return None;
-    }
-    let ty_node = impl_node.child_by_field_name("type")?;
-    let ty = ty_node.utf8_text(source).ok()?;
-    if ty.is_empty() {
+    let container = list.parent()?;
+    let field = match container.kind() {
+        "impl_item" => "type",
+        "trait_item" => "name",
+        _ => return None,
+    };
+    let recv_node = container.child_by_field_name(field)?;
+    let recv = recv_node.utf8_text(source).ok()?;
+    if recv.is_empty() {
         None
     } else {
-        Some(ty.to_string())
+        Some(recv.to_string())
     }
 }
 
@@ -972,6 +978,20 @@ pub fn extract_javascript(
                 source_id: source_id.to_string(),
             });
         }
+        // `const foo = () => 1;` / `let bar = function () {};` /
+        // `var baz = async () => x;`. Bead `ley-line-open-caf423`: without
+        // this arm, modern JS silently drops every arrow / function
+        // expression bound to a variable — despite the docstring above
+        // claiming these produce Defs. Walk the declaration's
+        // `variable_declarator` children; when the initializer is an
+        // arrow_function or function_expression, emit a Def whose token
+        // is the bound identifier. Destructuring patterns (`const { x } =
+        // …`) are skipped — the `name` field is only an identifier for
+        // the plain-binding case, so tree-sitter's own field lookup does
+        // the filtering for us.
+        "lexical_declaration" | "variable_declaration" => {
+            js_extract_var_bindings(node, source, node_id, source_id, &mut out);
+        }
         "call_expression" => {
             if let Some(func_node) = node.child_by_field_name("function") {
                 match func_node.kind() {
@@ -1033,6 +1053,58 @@ pub fn extract_javascript(
     }
 
     out
+}
+
+/// Walk a `lexical_declaration` / `variable_declaration` for
+/// `variable_declarator` children whose initializer is an arrow or
+/// function expression. Emit a Def with the bound identifier as the
+/// token. Shared between JS and TS extractors (TS uses the same node
+/// kinds — verified via tree-sitter-typescript's grammar). Destructuring
+/// patterns (`object_pattern` / `array_pattern` as `name`) are skipped:
+/// binding an arrow to a destructure is exotic and the emitted token
+/// wouldn't be a single callable identifier.
+///
+/// Bead `ley-line-open-caf423`.
+#[cfg(any(feature = "javascript", feature = "typescript"))]
+fn js_extract_var_bindings(
+    decl_node: &Node,
+    source: &[u8],
+    node_id: &str,
+    source_id: &str,
+    out: &mut Vec<ExtractedRef>,
+) {
+    let mut cursor = decl_node.walk();
+    for child in decl_node.named_children(&mut cursor) {
+        if child.kind() != "variable_declarator" {
+            continue;
+        }
+        let Some(name_node) = child.child_by_field_name("name") else {
+            continue;
+        };
+        // Only bind for plain identifier names; skip destructuring.
+        if name_node.kind() != "identifier" {
+            continue;
+        }
+        let Ok(name) = name_node.utf8_text(source) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let Some(value_node) = child.child_by_field_name("value") else {
+            continue;
+        };
+        match value_node.kind() {
+            "arrow_function" | "function_expression" => {
+                out.push(ExtractedRef::Def {
+                    token: name.to_string(),
+                    node_id: node_id.to_string(),
+                    source_id: source_id.to_string(),
+                });
+            }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(feature = "javascript")]
@@ -1156,6 +1228,10 @@ fn walk_js_import_specifiers(
 ///   a runtime object, so they're both a value and a type binding.
 /// - `abstract_class_declaration` → Def (uses `name` field). Same
 ///   shape as `class_declaration` but for abstract classes.
+/// - `lexical_declaration` / `variable_declaration` bindings to
+///   `function_expression` / `arrow_function` → Def (name of the binding).
+///   Shares the JS `js_extract_var_bindings` helper because TSX's grammar
+///   uses the same node kinds.
 #[cfg(feature = "typescript")]
 pub fn extract_typescript(
     node: &Node,
@@ -1226,6 +1302,15 @@ pub fn extract_typescript(
                 node_id: node_id.to_string(),
                 source_id: source_id.to_string(),
             });
+        }
+        // `const foo = () => 1;` / `let bar = function () {};` — same
+        // shape as JS. Bead `ley-line-open-caf423`: reuses the shared JS
+        // helper because tree-sitter-typescript's TSX grammar shares the
+        // `lexical_declaration` / `variable_declaration` /
+        // `variable_declarator` / `arrow_function` /
+        // `function_expression` node kinds unchanged.
+        "lexical_declaration" | "variable_declaration" => {
+            js_extract_var_bindings(node, source, node_id, source_id, &mut out);
         }
         "call_expression" => {
             if let Some(func_node) = node.child_by_field_name("function") {

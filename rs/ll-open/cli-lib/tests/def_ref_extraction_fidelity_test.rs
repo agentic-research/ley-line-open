@@ -366,3 +366,108 @@ fn nodes_source_file_is_populated() {
         "file node's source_file must equal its own path"
     );
 }
+
+// ── Post-PR-165 follow-up: two silent-empty gaps the reviewer flagged ───
+//
+// PR #165 closed the "supported but silent-empty" bug class for Python/JS/TS
+// extraction and for qualified impl-method tokens. Two more instances of
+// the same class survived because they weren't in the original repro set:
+//
+// 1. Rust trait default methods (`trait T { fn m(&self) {} }`) did NOT
+//    emit the qualified `T::m` form even though the `extract_rust`
+//    docstring explicitly promised they would. `rust_impl_receiver`
+//    hard-failed unless the parent was `impl_item`, so `trait_item` fell
+//    through and only the bare `m` shipped.
+//
+// 2. JS/TS variable bindings to arrow / function expressions
+//    (`const foo = () => 1;`) produced ZERO defs even though the
+//    `extract_javascript` docstring promised they'd emit a Def. The
+//    match had no `lexical_declaration` / `variable_declaration` arm —
+//    huge modern JS/TS surface silently dropped.
+//
+// Both are pinned below with the same fixture-first + explicit-token
+// discipline as the pre-existing tests.
+
+#[test]
+fn rust_trait_default_methods_are_qualified() {
+    // `trait Greet { fn hello(&self) {} }` — pre-fix emits only bare
+    // `hello` because `rust_impl_receiver` refused to walk anything but
+    // `impl_item`. Fix accepts `trait_item` too and reads the trait's
+    // `name` field. Post-fix defs include `Greet::hello` alongside the
+    // bare `hello`, matching the `extract_rust` docstring's claim.
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("lib.rs"),
+        b"pub trait Greet {\n    fn hello(&self) {}\n}\n",
+    )
+    .unwrap();
+
+    let conn = cold_parse(dir.path(), Some("rust"));
+
+    let defs = defs_tokens(&conn);
+    assert!(
+        defs.contains(&"Greet::hello".to_string()),
+        "Rust trait default method must qualify as `Greet::hello`; got {defs:?}"
+    );
+    assert!(
+        defs.contains(&"hello".to_string()),
+        "bare trait method name must remain in defs for call-side compatibility; got {defs:?}"
+    );
+    // The trait itself is also a def.
+    assert!(
+        defs.contains(&"Greet".to_string()),
+        "trait def token must be present; got {defs:?}"
+    );
+}
+
+#[test]
+fn javascript_arrow_and_function_expression_bindings_extract_as_defs() {
+    // `const foo = () => 1; const bar = function () {};` — pre-fix emits
+    // zero defs because `extract_javascript` had no
+    // `lexical_declaration` / `variable_declaration` arm. Fix walks each
+    // `variable_declarator` and emits a Def when the initializer is an
+    // `arrow_function` or `function_expression`.
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("mod.js"),
+        b"const foo = () => 1;\nconst bar = function () { return 2; };\nlet baz = async () => 3;\nvar qux = function named() {};\n",
+    )
+    .unwrap();
+
+    let conn = cold_parse(dir.path(), Some("javascript"));
+
+    let defs = defs_tokens(&conn);
+    for want in ["foo", "bar", "baz", "qux"] {
+        assert!(
+            defs.contains(&want.to_string()),
+            "JS arrow/function-expression var binding {want:?} must emit a Def; \
+             got {defs:?}. Symptom: extract_javascript lacked a \
+             lexical_declaration / variable_declaration arm."
+        );
+    }
+}
+
+#[test]
+fn typescript_arrow_and_function_expression_bindings_extract_as_defs() {
+    // Same shape as the JS test; TypeScript grammar shares the node
+    // kinds so the shared helper covers both. Fixture uses typed
+    // annotations that pre-fix would still drop entirely.
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("mod.ts"),
+        b"const foo = (): number => 1;\nconst bar = function (): number { return 2; };\nlet baz: () => Promise<number> = async () => 3;\n",
+    )
+    .unwrap();
+
+    let conn = cold_parse(dir.path(), Some("typescript"));
+
+    let defs = defs_tokens(&conn);
+    for want in ["foo", "bar", "baz"] {
+        assert!(
+            defs.contains(&want.to_string()),
+            "TS arrow/function-expression var binding {want:?} must emit a Def; \
+             got {defs:?}. Symptom: extract_typescript lacked a \
+             lexical_declaration / variable_declaration arm."
+        );
+    }
+}

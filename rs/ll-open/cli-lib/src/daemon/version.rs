@@ -56,13 +56,12 @@ pub const WIRE_FORMAT_MAJOR: u32 = 1;
 /// Consumers compare their embedded schema-client version against this
 /// at handshake time and fail loudly if older.
 ///
-/// Today: "0.4.1" — the schema-client release that introduced the δ⁰
-/// sheaf input shape (`SheafStalkInput.data`). Older clients can still
-/// drive non-sheaf ops but can't send δ⁰-mode topology; we treat
-/// "missing field" as still-compatible-but-degraded and let the
-/// handler decide. Raise this floor when removing a field a client
-/// depends on.
-pub const COMPAT_MIN_SCHEMA_VERSION: &str = "0.4.1";
+/// Today: "0.6.0" — bumped from "0.4.1" at the v0.7.0 cut. Clients
+/// below v0.6.0 don't know the source_blobs table, the capnp_blobs +
+/// _ast_pointer pointer store, or the unified `daemon.sheaf.invalidate`
+/// topic + `invalidated` payload key (was `region_ids` on watcher path
+/// pre-0.7). Raise this floor when removing a field a client depends on.
+pub const COMPAT_MIN_SCHEMA_VERSION: &str = "0.6.0";
 
 /// ISO-8601 date of this daemon build. Populated from `$LLO_BUILD_DATE`
 /// at compile time if present (CI sets it on release builds), else

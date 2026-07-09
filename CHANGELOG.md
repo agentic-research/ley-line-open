@@ -10,48 +10,71 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-07-09
+
+**Substrate consolidation + workspace-deps discipline + measurable moat.**
+
+This release closes the "one canonical home for substrate crates" story: `leyline-sign`, `leyline-schema-spec`, and `leyline-cas-ffi` now live in LLO alone; cloister + signet dropped their forks + depend on LLO. The workspace-deps track (`ley-line-open-3b2f55`) landed in three phases with a mache-native drift gate preventing regression. ADR-0028 shipped source_blobs Phase 1 with F-git compat proof independently verified. The sheaf loop got a granularity-dispatcher router (advisory during the ADR-0026 Phase 2 measurement window). Def/ref extraction gained Python, JavaScript, TypeScript symbol production + qualified method tokens + populated `nodes.source_file`.
+
+### Breaking
+
+- `daemon.sheaf.invalidate` payload key rename: `region_ids` → `invalidated`. Consumers that parsed `region_ids` need to update. Mache PR #500 shipped compat by parsing both; other consumers should migrate. Bead `ley-line-open-1104f2` (re-filed as `2191e1`); PR #147.
+- `compat_min_schema_version` bumped from `0.4.1` → `0.6.0`. Clients below v0.6.0 don't know the new tables or the unified topic. Semver-honest floor for the wire changes since v0.6.0.
+
 ### Added
 
-- **Workspace-deps drift gate — Phase 3 of `ley-line-open-3b2f55`**
-  (`chore/workspace-deps-phase-3-mache-native-drift-gate`). Mirrors
-  mache's `find-smells` pattern (rule + baseline shape + Taskfile
-  targets) so LLO's workspace-deps consolidation cannot regress in
-  silence. `rs/tools/cargo-toml-projector` walks all `rs/**/Cargo.toml`,
-  projects `[workspace.dependencies]` + per-crate deps into a SQLite
-  schema (`workspace_deps` + `crate_deps`), then runs
-  `smell-rules/workspace_deps_drift.json` — a single rule that fires
-  when a crate declares a literal version for a dep already in
-  `[workspace.dependencies]`. Findings are diffed against
-  `docs/smell-baseline.json`; any NEW finding fails `task smells`.
-  Wired into `task ci` and a dedicated `find_smells` GitHub workflow
-  (path-filtered to `rs/**/Cargo.toml`, `smell-rules/`, and the
-  projector source). Task targets: `task smells`, `task smells:baseline`,
-  `task smells:dogfood`. Same-shape as mache's rule + baseline JSON, so
-  the engine is drop-in replaceable by mache proper later. `sign`'s
-  host-feature deps (tokio, serde, serde_json, clap) migrated to
-  `workspace = true`; `sign`'s dev-dep `rand = "0.8"` is the one
-  baselined entry (documented on that line and in
-  `docs/smell-baseline.json`).
+- **`daemon.sheaf.invalidate` fine-grained region diff** (default when `ComplexBuildPass` has installed a `region_id → token label` map; production path). Payload `scope: "changed-only"` — `region_ids`/`invalidated` contains only regions whose labels match `changed_files` or start with `<file>:sym:`. Coarse-v1 (`scope: "all-known"`) fallback preserved for pre-topology / consumer-pushed cases. Bead `ley-line-open-e40566`; PR #146.
+
+- **ADR-0028 Phase 1 source_blobs dual-store** — `source_blobs(blob_hash BLAKE3, blob_bytes BLOB)` + `_source.content_hash` REFERENCES FK. Additive; existing `_source.source` behavior unchanged. 5 F-gates (F1s round-trip integrity, F4s cross-generation dedup, F5s cross-file dedup, F-rename, **F-git compat proof** — LLO's BLAKE3 of source bytes matches BLAKE3 of `git cat-file blob <sha>`) + 3 adversarial cases (transaction atomicity, large blob, malformed bytes). Bead `ley-line-open-9e4416`; PR #153. F-git independently verified by adversarial agent across 8 edge cases including the wire-format-prefix check that would silently break unified-CAS composition. Bead `ley-line-open-4b19f2`; PR #156.
+
+- **ADR-0029 CAS-backed workspace design doc** — replaces `git worktree add` as the agent-dispatch primitive with a CAS-backed manifest mount. Third leg of the unified-CAS composition (LLO substrate + rosary + cloister). 5 falsifiability gates (F1w startup, F2w storage, F3w isolation, F4w sub-file, F5w commit fidelity). Design-only; implementation phased. Bead `ley-line-open-4b19f2`; PR #154.
+
+- **ADR-0029 F-test measurement harness** — 5 F-tests capturing worktree-flow baselines for future mount-flow comparison. Bead `ley-line-open-5f9829`; PR #163.
+
+- **Workspace-deps discipline in three phases**:
+  - Phase 1 (`ley-line-open-3b2f55`, PR #157): `[workspace.dependencies]` block declared with 19 unified entries.
+  - Phase 2 (PR #158): 18 crate manifests migrated to `dep = { workspace = true }`.
+  - Phase 3 (PR #161): mache-native drift gate. `rs/tools/cargo-toml-projector` walks `rs/**/Cargo.toml`, projects into SQLite (`workspace_deps` + `crate_deps`), and `smell-rules/workspace_deps_drift.json` fires when a crate declares a literal version for a dep already in `[workspace.dependencies]`. Findings diffed against `docs/smell-baseline.json`. Wired into `task ci` + dedicated `find_smells` GitHub workflow (path-filtered).
+
+- **Substrate consolidation from cloister**:
+  - `leyline-sign` — cloister's `rs/crates/sign/` fork absorbed as `host` feature + `leyline-sign-helper` bin (ADR-0019). Cloister depends on LLO's canonical crate via git dep. Bead `ley-line-open-7226e3`; PR #160. Cloister-side deletion: cloister PR #119.
+  - `leyline-schema-spec` — new crate at `rs/ll-core/schema-spec/` at 0.1.0. cloister's `cloister-spec/` (48 files) moved byte-identically; `verify_vectors_sha256` unit test enforces SHA-256 digest pins. Bead `ley-line-open-729a7e`; PR #159. Cloister-side deletion: cloister PR #120.
+
+- **Substrate consolidation from signet**: signet's stale `rs/crates/sign/` fork retired entirely (whole `rs/` tree deleted); signet is now pure-Go with references pointing at LLO for any future Rust needs. Signet PR #133.
+
+- **`ed25519-dalek` 2 → 3 bump** in leyline-sign. `SigningKey::from_bytes(seed)` replaces `SigningKey::generate(&mut rng)` — decouples `sign` from `rand_core` version drift. All 24 existing signature/verify tests pass unchanged (wire format preserved — RFC 8032 fixed-seed gate). Bead `ley-line-open-474c0a`; PR #155.
+
+- **Def/ref extraction fidelity** — Python, JavaScript, TypeScript now produce non-empty `node_defs` / `node_refs` rows (previously silent-empty despite parsing succeeding). Method tokens emit both qualified (`Type::method`, `Class.method`) and bare (`method`) forms. Rust trait default methods qualified via `trait_item` walker. JS/TS variable bindings to arrow_function / function_expression extract as defs. `nodes.source_file` populated for every AST-derived row. 9 adversarial fidelity tests; all verified failing pre-fix. Bead `ley-line-open-caf423`; PR #165.
+
+- **Sheaf granularity dispatcher router** — pure `route_query(&SheafState, &[u32]) -> GranularityRecommendation` that recommends per-node vs per-file storage based on δ⁰ distribution. Advisory-only during the measurement window; wired via `LEYLINE_PROFILE=1` logging + `ROUTED_PER_NODE`/`ROUTED_PER_FILE` atomics. Consumer wiring waits for ADR-0026 Phase 2 dual-read. Bead `ley-line-open-5b58ff`; PR #162.
+
+- **ADR-0026 Phase 2.0 F2 read-side measurement infrastructure** — `LEYLINE_PROFILE=1` timing wrappers on `op_query` + downstream helpers + criterion bench + baseline JSON. Bead `ley-line-open-335d34`; PR #152.
+
+- **WAL 15b connection pool** — `DaemonContext::live_db` now uses an r2d2 reader pool (default N=`min(10, available_parallelism())`) + dedicated `Mutex<Connection>` writer. 54× throughput improvement, p99=306µs (matches empirical bench target 290-375µs). Caught 2 pre-existing op-misclassification bugs (`op_query`, `op_agreement` were writes disguised as reads — reader pragma's `query_only=ON` fail-loud found them). Bead `ley-line-open-f0239d`; PR #148.
+
+- **WAL 15a file-backed live_db + WAL pragma** — daemon's live db is file-backed at `<ctrl>.live.db` with `journal_mode=WAL`, `synchronous=NORMAL`, `wal_autocheckpoint=1000`. `snapshot_to_arena` composition with WAL verified. Bead `ley-line-open-98fb67`; PR #143.
+
+- **WAL adversarial coverage**: corruption recovery (PR #144), bloat/crash recovery (PR #149), ENOSPC subprocess-isolated fsize quota (PR #150). All three prove daemon fails loud OR recovers cleanly; no silent torn state.
+
+- **ADR-0026 Phase 1 pointer store** — dual-write to `capnp_blobs` (per-file blob) + `_ast_pointer` alongside row-projected `_ast`. F1 round-trip integrity test (~200+ rows byte-identical). Bead `ley-line-open-3e87ad`; PR #145.
+
+- **Sheaf audit gaps 1–4 fully resolved** — watcher enrichment wiring (PR #138), CellComplex persistence (PR #139), coarse-v1 invalidate emit (PR #140), extension seam design docstrings (PR #141), E2E composition test (PR #142). Sheaf loop proven end-to-end + measurably fast.
+
+- **Unified sheaf-invalidate emit** — single `SheafState::emit_invalidate` helper serves both consumer-driven (`op_sheaf_invalidate`) and watcher-driven paths under one canonical topic `daemon.sheaf.invalidate` with one payload contract. Payload drift impossible by construction. Bead `ley-line-open-1104f2` (re-filed as `2191e1`); PR #147.
+
+- **`license = "AGPL-3.0-or-later"`** field added to 12 crate manifests missing the declaration (matches repo LICENSE). Bead `ley-line-open-b04021`; PR #164.
 
 ### Changed
 
-- `daemon.sheaf.invalidate` payload from the watcher path is now
-  fine-grained by default. When [`ComplexBuildPass`] has installed a
-  `region_id → token label` map (production path since v0.5.9), the
-  emit computes a per-file diff — `region_ids` contains only the
-  regions whose labels either equal one of `changed_files` or start
-  with `<file>:sym:`. The payload's new `scope` value is
-  `"changed-only"` in this mode. When no labels are installed (fresh
-  daemon before first enrichment, mache-pushed topology via
-  `op_sheaf_set_topology`, or any consumer whose region-ID space is
-  externally owned), the emit falls back to the coarse-v1 shape:
-  `scope: "all-known"` with every currently-known region ID. Bead
-  `ley-line-open-e40566` (sheaf gap 3 follow-up); "Path A" from the
-  sheaf-invalidation audit (daemon-owned mapping — the token → id map
-  is derivable from the daemon's own `observation` table, so no
-  consumer registration protocol is required). Payload field names
-  are unchanged; consumers that read `region_ids` + `count` continue
-  to work without code changes and get precise invalidation for free.
+- `daemon.sheaf.invalidate` payload from the watcher path is now fine-grained by default (see Added / Breaking above).
+
+### Deprecated
+
+- `region_ids` payload key on `daemon.sheaf.invalidate` — parsers should read `invalidated` going forward. Removed in this release; consumers on <0.7.0 should upgrade.
+
+## [0.6.0] — 2026-07-08
+
+Tagged (`v0.6.0` git tag exists) but never separately documented in CHANGELOG. The 0.7.0 section above supersedes it — 0.7.0 includes all substrate work from 0.6.0 forward.
 
 ## [0.5.9] — 2026-07-07
 

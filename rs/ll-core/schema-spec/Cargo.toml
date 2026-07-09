@@ -1,0 +1,29 @@
+[package]
+name = "leyline-schema-spec"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Vendor-neutral substrate capability specs (moved from cloister/cloister-spec/ per bead ley-line-open-729a7e)"
+
+# The crate ships as a spec-artifact holder: `_traits.capnp`, per-capability
+# `<cap>/v<n>/` directories (README + wire docs + test vectors + VECTORS.sha256),
+# and one non-optional invariant — the SHA-256 pins in every VECTORS.sha256 file
+# match the vector bytes on disk. That invariant is enforced by the crate's unit
+# test, so any drift between the spec's pinned digests and the committed vectors
+# fails `cargo test`.
+#
+# Consumers currently reach the vectors via file paths under the source tree
+# (e.g. leyline-schema-capnp's `build_cache_vectors_consistency` test walks
+# `<workspace>/../cloister/cloister-spec/build-cache/v1/vectors/`). The
+# cloister-side follow-up (deleting cloister's copy + depending on this crate)
+# will redirect those paths to `<workspace>/ll-core/schema-spec/...`. Until then
+# the two trees co-exist byte-for-byte; the byte-identity was verified with `cmp
+# -s` at move time.
+
+[dependencies]
+
+[dev-dependencies]
+# Used by the VECTORS.sha256 verification test only. Version matches the two
+# existing workspace consumers (leyline-sheaf, leyline-sign) so cargo resolves
+# a single copy across the workspace.
+sha2 = "0.11"

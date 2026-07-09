@@ -1,0 +1,14 @@
+{
+  "schema": "llo-adr-0029-baselines/v1",
+  "captured_at": "2026-07-09",
+  "captured_at_sha": "6d13126cea6aabf027053ead3bbd01265cd32a99",
+  "hardware": "Darwin 25.5.0 arm64",
+  "leyline_version": "0.6.0",
+  "measurements": {
+    "f1w_worktree_startup": { "p50_ms": 133, "p99_ms": 961, "iterations": 30, "repo_size_mb": 100 },
+    "f2w_worktree_storage_per_agent_mb": 100.00,
+    "f3w_worktree_out_of_scope_readable": true,
+    "f4w_worktree_bytes_loaded_per_3_subtree_bead": 30096,
+    "f5w_worktree_diff_blake3": "0dc99b00b937e9de319db241a576da33f582f5ffeae47351558b90d4dfe775ad"
+  }
+}

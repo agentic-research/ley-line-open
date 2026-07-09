@@ -22,4 +22,4 @@ leyline-core = { path = "../../ll-core/core" }
 [dev-dependencies]
 # Used by the FFI round-trip test to cross-check the FFI surface
 # against direct `<&[u8] as ContentAddressed>::hash()` calls.
-blake3 = "1"
+blake3 = { workspace = true }

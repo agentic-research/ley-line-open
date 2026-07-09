@@ -5,17 +5,17 @@ edition = "2024"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
-anyhow = "1.0"
-memmap2 = "0.9"
-bytemuck = { version = "1.14", features = ["derive"] }
-serde = { version = "1.0", features = ["derive"] }
+anyhow = { workspace = true }
+memmap2 = { workspace = true }
+bytemuck = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
 # T2.2: BLAKE3 for σ(arena buffer) computed at snapshot time. Locked
 # to BLAKE3 per Σ §3.4 (decade write-up 2026-merkle-cas-substrate.md).
-blake3 = "1"
+blake3 = { workspace = true }
 
 [features]
 default = []
 interrupt = []
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }

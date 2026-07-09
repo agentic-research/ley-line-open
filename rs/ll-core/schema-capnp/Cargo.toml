@@ -10,22 +10,23 @@ description = "Cap'n Proto schemas for Σ event log — typed producer/consumer 
 # messages out from under the cross-runtime fixture suite (F8.6.4).
 # Bumping requires explicit human review + cross-runtime byte-equality
 # check; the friction is intentional. See docs/adr/0014-capnp-as-protocol.md.
-capnp = "=0.25.0"
+# Exact-pin declared in workspace (see rs/Cargo.toml [workspace.dependencies]).
+capnp = { workspace = true }
 
 [dev-dependencies]
 # Used by the gen_build_cache_vectors example (writes cloister-spec/build-cache/v1
 # conformance vectors). Pinned to substrate's BLAKE3 dep (leyline-core also pins
 # blake3 = "1").
-blake3 = "1"
+blake3 = { workspace = true }
 # Used to author the OCI manifest JSON in the vector generator. Serde is the
 # repository default JSON shape (already a transitive dep via several crates).
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 # Hex encoding for digest strings.
-hex = "0.4"
+hex = { workspace = true }
 
 [build-dependencies]
-capnpc = "=0.25.0"
+capnpc = { workspace = true }
 
 [[example]]
 name = "gen_build_cache_vectors"

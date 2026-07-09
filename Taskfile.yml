@@ -68,6 +68,24 @@ tasks:
         platforms: [darwin]
       - echo "installed $(~/.local/bin/leyline --version)"
 
+  release:full:
+    desc: Release build with the `all` meta-feature — everything the CLI exposes (mount + vec + validate + hdc + text-search + lsp). Requires libfuse-t (macOS) / libfuse (Linux) system deps for `mount`.
+    dir: rs
+    cmds:
+      - cargo build --release -p leyline-cli --features all
+
+  install:full:
+    desc: Build with `--features all`, codesign (macOS), and install to ~/.local/bin. Use this when you want the full daemon-op surface (mache install flow).
+    deps: [release:full]
+    cmds:
+      - mkdir -p ~/.local/bin
+      - cp rs/target/release/leyline ~/.local/bin/leyline
+      # Same ad-hoc codesign flow as `task install`. See the comment
+      # on that task for the SIGKILL-on-network rationale.
+      - cmd: codesign -s - --force --deep --entitlements entitlements.plist ~/.local/bin/leyline
+        platforms: [darwin]
+      - echo "installed (full) $(~/.local/bin/leyline --version)"
+
   # --------------------------------------------------------------------------
   # Test
   # --------------------------------------------------------------------------

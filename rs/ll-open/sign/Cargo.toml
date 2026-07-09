@@ -92,13 +92,13 @@ zeroize             = { version = "1", optional = true, features = ["alloc"] }
 # in cloister's 2026-05-13 §17.1 is the cost of opting in.
 nono                = { version = "0.54", optional = true, default-features = false, features = ["system-keyring"] }
 axum                = { version = "0.7", optional = true, default-features = false, features = ["http1", "tokio", "macros", "json", "query"] }
-tokio               = { version = "1", optional = true, features = ["rt-multi-thread", "macros", "signal", "time", "net", "sync"] }
+tokio               = { workspace = true, optional = true, features = ["rt-multi-thread", "macros", "signal", "time", "net", "sync"] }
 tower               = { version = "0.5", optional = true, default-features = false, features = ["util"] }
 tower-http          = { version = "0.6", optional = true, default-features = false, features = ["limit", "timeout"] }
-serde               = { version = "1", optional = true, features = ["derive"] }
-serde_json          = { version = "1", optional = true }
+serde               = { workspace = true, optional = true, features = ["derive"] }
+serde_json          = { workspace = true, optional = true }
 base64ct            = { version = "1", optional = true, features = ["alloc"] }
-clap                = { version = "4", optional = true, features = ["derive"] }
+clap                = { workspace = true, optional = true, features = ["derive"] }
 tracing             = { version = "0.1", optional = true }
 tracing-subscriber  = { version = "0.3", optional = true, features = ["env-filter", "fmt"] }
 
@@ -112,22 +112,24 @@ keyring = { version = "3", features = ["apple-native"], optional = true }
 keyring = { version = "3", features = ["sync-secret-service"], optional = true }
 
 [dev-dependencies]
-# Phase 2 exception (bead ley-line-open-3b2f55): rand stays at the
+# Phase 2/3 exception (bead ley-line-open-3b2f55): rand stays at the
 # literal 0.8 pin because the workspace declaration is 0.9, and
 # rand 0.9's `OsRng` no longer implements `RngCore::fill_bytes` — it
 # implements `TryRngCore` only, so the seed-then-`from_bytes` shape
 # in `cms::tests::random_signing_key` + `cert_chain::tests::random_signing_key`
 # fails to compile against the workspace version. Adapting the test
 # to `OsRng.try_fill_bytes` (or `getrandom` directly) is a source
-# change and out of scope for Phase 2 (manifest-only). Track under
-# a follow-up bead once the workspace either lands 0.9 alongside a
-# `rand-core 0.9` shim, or the sign tests migrate to `getrandom`.
+# change and out of scope for Phase 2/3 (manifest-only). This is the
+# ONE baselined entry in `docs/smell-baseline.json` — see the
+# workspace_deps_drift row for `rs/ll-open/sign/Cargo.toml`. Track
+# under a follow-up bead once the workspace either lands 0.9 alongside
+# a `rand-core 0.9` shim, or the sign tests migrate to `getrandom`.
 rand = "0.8"
 hex = { workspace = true }
 base64 = "0.22"
 # Host-side tests use reqwest + tokio; cfg-gated so wasm build doesn't drag them.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "net", "sync"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "net", "sync"] }
 tempfile = { workspace = true }
 # Serialize process-env mutations across parallel cargo-test workers
 # (cloister-da0f35). `#[serial("env_LEYLINE_SIGN_RESOLVE_TTL_MS")]` makes

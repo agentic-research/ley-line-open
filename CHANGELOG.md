@@ -10,6 +10,29 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Added
+
+- **Workspace-deps drift gate — Phase 3 of `ley-line-open-3b2f55`**
+  (`chore/workspace-deps-phase-3-mache-native-drift-gate`). Mirrors
+  mache's `find-smells` pattern (rule + baseline shape + Taskfile
+  targets) so LLO's workspace-deps consolidation cannot regress in
+  silence. `rs/tools/cargo-toml-projector` walks all `rs/**/Cargo.toml`,
+  projects `[workspace.dependencies]` + per-crate deps into a SQLite
+  schema (`workspace_deps` + `crate_deps`), then runs
+  `smell-rules/workspace_deps_drift.json` — a single rule that fires
+  when a crate declares a literal version for a dep already in
+  `[workspace.dependencies]`. Findings are diffed against
+  `docs/smell-baseline.json`; any NEW finding fails `task smells`.
+  Wired into `task ci` and a dedicated `find_smells` GitHub workflow
+  (path-filtered to `rs/**/Cargo.toml`, `smell-rules/`, and the
+  projector source). Task targets: `task smells`, `task smells:baseline`,
+  `task smells:dogfood`. Same-shape as mache's rule + baseline JSON, so
+  the engine is drop-in replaceable by mache proper later. `sign`'s
+  host-feature deps (tokio, serde, serde_json, clap) migrated to
+  `workspace = true`; `sign`'s dev-dep `rand = "0.8"` is the one
+  baselined entry (documented on that line and in
+  `docs/smell-baseline.json`).
+
 ### Changed
 
 - `daemon.sheaf.invalidate` payload from the watcher path is now

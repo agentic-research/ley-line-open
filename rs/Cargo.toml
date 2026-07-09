@@ -6,11 +6,12 @@ members = [
 ]
 resolver = "2"
 
-# ADR-0026 / bead 3b2f55 Phase 1 — canonical dep versions for the workspace.
-#
-# These entries are the *declaration* only. Per-crate manifests still
-# carry inline versions and will be migrated to `workspace = true` in
-# Phase 2. Nothing here changes resolved versions yet.
+# ADR-0026 / bead 3b2f55 — canonical dep versions for the workspace.
+# Phase 1 (PR #157) declared the block; Phase 2 (PR #158) migrated
+# per-crate manifests to `{ workspace = true }`. Phase 3 (this branch)
+# ships the `workspace_deps_drift` smell gate: `task smells` fails on
+# any crate that re-pins a workspace-declared dep literally. See
+# `smell-rules/workspace_deps_drift.json` and `docs/smell-baseline.json`.
 #
 # Transitive-drift note: cargo tree may still show multiple versions of
 # `rand` (uuid pulls 0.10 via r2d2_sqlite → cli-lib; jj-lib pulls 0.9 via
@@ -42,8 +43,10 @@ bytemuck = "1.24"
 thiserror = "2.0.18"
 # `sign` production code is decoupled from rand post-#155
 # (ed25519-dalek 3.x + SigningKey::from_bytes). `sign` still uses
-# rand 0.8 as a *dev-dep* for keygen in tests; that's not covered
-# by this declaration and will migrate in Phase 2.
+# rand 0.8 as a *dev-dep* for keygen in tests — baselined in
+# `docs/smell-baseline.json` under Phase 3 (see the workspace_deps_drift
+# entry). Migration path is documented on the rand line in
+# rs/ll-open/sign/Cargo.toml.
 rand = "0.9"
 
 # Domain / parsing

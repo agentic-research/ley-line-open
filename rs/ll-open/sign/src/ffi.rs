@@ -177,6 +177,56 @@ pub unsafe extern "C" fn leyline_verify(
     }
 }
 
+// ── Cert-chain verify FFI export ─────────────────────────────────────────
+//
+// Used by consumers (originally cloister's lease middleware,
+// cloister-bd7770) via the wasm32 build of this crate. See cert_chain.rs
+// for verify + claims-extraction logic; this file just exposes the C-FFI
+// shim.
+//
+// Output format: hand-rolled JSON string (see cert_chain::claims_to_json)
+// — claims are small (~200 bytes), and adding serde_json to the wasm
+// build adds substantial size for a flat struct.
+
+/// Verify cert is signed by master_pubkey + write parsed claims as JSON
+/// into `claims_out_buf`. Returns claims byte length on success, -1 on
+/// failure.
+///
+/// JSON shape (compact, no whitespace):
+///   {"epk":"<base64url>","nb":<unix-secs>,"na":<unix-secs>,
+///    "ep":<u32>,"pf":"<utf8>","sc":"<utf8>"}
+///
+/// `ep`, `pf`, `sc` are optional (omitted when the cert lacks the
+/// corresponding Interlace extension).
+///
+/// # Safety
+/// All input pointers must be non-null and valid for their stated
+/// lengths. `claims_out_buf` must be non-null and writable for
+/// `claims_out_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn leyline_verify_cert_chain(
+    cert_der_ptr: *const u8,
+    cert_der_len: usize,
+    master_pubkey_ptr: *const u8,
+    master_pubkey_len: usize,
+    claims_out_buf: *mut u8,
+    claims_out_len: usize,
+) -> i32 {
+    if cert_der_ptr.is_null() || master_pubkey_ptr.is_null() || claims_out_buf.is_null() {
+        return -1;
+    }
+    let cert_der = unsafe { std::slice::from_raw_parts(cert_der_ptr, cert_der_len) };
+    let master_pubkey = unsafe { std::slice::from_raw_parts(master_pubkey_ptr, master_pubkey_len) };
+
+    match crate::cert_chain::verify_cert_chain(cert_der, master_pubkey) {
+        Ok(claims) => {
+            let json = crate::cert_chain::claims_to_json(&claims);
+            unsafe { write_out(json.as_bytes(), claims_out_buf, claims_out_len) }
+        }
+        Err(_) => -1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

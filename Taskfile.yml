@@ -116,6 +116,35 @@ tasks:
     cmds:
       - cargo test --release -p leyline-cli-lib --test topology_pass_test
 
+  # `leyline-sign` `host` feature (ADR-0019 helper daemon, absorbed from
+  # cloister under bead ley-line-open-7226e3). Kept out of the workspace
+  # default so `cargo test --workspace` doesn't pull the axum/tokio/keyring
+  # closure; wired into `ci` explicitly below.
+  #
+  # `host-extras` (op:// + apple-password:// schemes via nono 0.54) is
+  # NOT built here — nono requires rustc 1.95 and this workspace pins
+  # 1.94. When the workspace toolchain bumps, add
+  # `cargo build -p leyline-sign --features host,host-extras` under the
+  # `sign:host:build:extras` target below and wire it into ci.
+  sign:host:build:
+    desc: Build the leyline-sign helper daemon under `--features host`.
+    dir: rs
+    cmds:
+      - cargo build -p leyline-sign --features host
+      - cargo build -p leyline-sign --features host --bin leyline-sign-helper
+
+  sign:host:build:extras:
+    desc: Build leyline-sign under `--features host,host-extras` (requires rustc >= 1.95 for nono 0.54).
+    dir: rs
+    cmds:
+      - cargo build -p leyline-sign --features host,host-extras
+
+  sign:host:test:
+    desc: Run the leyline-sign host-feature tests (integration + adversarial + wire-compat).
+    dir: rs
+    cmds:
+      - cargo test -p leyline-sign --features host
+
   # --------------------------------------------------------------------------
   # Quality
   # --------------------------------------------------------------------------
@@ -354,6 +383,8 @@ tasks:
       - task: build:fs-static
       - task: tier:isolation
       - task: test
+      - task: sign:host:build
+      - task: sign:host:test
       - task: compat:check
       - task: gen:server-json:check
       - task: readme:version-check

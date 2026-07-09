@@ -3435,6 +3435,7 @@ dependencies = [
  "tree-sitter-go",
  "tree-sitter-hcl",
  "tree-sitter-html",
+ "tree-sitter-javascript",
  "tree-sitter-json",
  "tree-sitter-md",
  "tree-sitter-proto",

@@ -31,6 +31,11 @@ pub enum TsLanguage {
     /// both proto2 and proto3 syntax.
     #[cfg(feature = "proto")]
     Proto,
+    /// JavaScript (.js / .mjs / .cjs / .jsx). Wired for def/ref
+    /// extraction so mache's cross-language rules see JS symbols
+    /// (bead `ley-line-open-caf423`).
+    #[cfg(feature = "javascript")]
+    JavaScript,
 }
 
 impl TsLanguage {
@@ -57,6 +62,8 @@ impl TsLanguage {
             TsLanguage::Rust => tree_sitter_rust::LANGUAGE.into(),
             #[cfg(feature = "proto")]
             TsLanguage::Proto => tree_sitter_proto::LANGUAGE.into(),
+            #[cfg(feature = "javascript")]
+            TsLanguage::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
         }
     }
 
@@ -88,6 +95,8 @@ impl TsLanguage {
             TsLanguage::Rust => "rust",
             #[cfg(feature = "proto")]
             TsLanguage::Proto => "proto",
+            #[cfg(feature = "javascript")]
+            TsLanguage::JavaScript => "javascript",
         }
     }
 
@@ -163,6 +172,17 @@ impl TsLanguage {
                 "module" => Some("module"),
                 _ => None,
             },
+            #[cfg(feature = "javascript")]
+            TsLanguage::JavaScript => match raw_kind {
+                "function_declaration" | "function_expression" | "arrow_function" => {
+                    Some("function")
+                }
+                "method_definition" => Some("method"),
+                "class_declaration" | "class" => Some("type"),
+                "import_statement" => Some("import"),
+                "program" => Some("module"),
+                _ => None,
+            },
             #[allow(unreachable_patterns)]
             _ => None,
         }
@@ -191,6 +211,8 @@ impl TsLanguage {
             "rust" | "rs" => Ok(TsLanguage::Rust),
             #[cfg(feature = "proto")]
             "proto" | "protobuf" => Ok(TsLanguage::Proto),
+            #[cfg(feature = "javascript")]
+            "javascript" | "js" | "jsx" | "mjs" | "cjs" => Ok(TsLanguage::JavaScript),
             _ => bail!("unsupported language: {name}"),
         }
     }
@@ -239,6 +261,8 @@ impl TsLanguage {
             "rs" => Some(TsLanguage::Rust),
             #[cfg(feature = "proto")]
             "proto" => Some(TsLanguage::Proto),
+            #[cfg(feature = "javascript")]
+            "js" | "mjs" | "cjs" | "jsx" => Some(TsLanguage::JavaScript),
             _ => None,
         }
     }

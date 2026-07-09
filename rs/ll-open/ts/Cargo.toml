@@ -24,6 +24,12 @@ rust = ["dep:tree-sitter-rust"]
 # query a real `_ast` over `.proto` files instead of regex/shell
 # fallback. Grammar maintained at coder3101/tree-sitter-proto.
 proto = ["dep:tree-sitter-proto"]
+# JavaScript grammar. Wired 2026-07-09 alongside the def/ref extraction
+# fidelity fix (bead `ley-line-open-caf423`) — mache surfaced that JS
+# files parsed but produced zero symbols because LLO had no JS pipeline
+# at all. Grammar version tracks the tree-sitter-javascript 0.25.x line
+# already vendored transitively through leyline-fs's validate feature.
+javascript = ["dep:tree-sitter-javascript"]
 pyproject = ["dep:uv-pep508", "dep:uv-pep440", "dep:uv-normalize", "dep:toml"]
 
 [dependencies]
@@ -38,6 +44,7 @@ tree-sitter-elixir = { version = "0.3.5", optional = true }
 tree-sitter-hcl = { version = "1", optional = true }
 tree-sitter-rust = { version = "0.24", optional = true }
 tree-sitter-proto = { version = "0.4", optional = true }
+tree-sitter-javascript = { version = "0.25", optional = true }
 leyline-schema = { path = "../../ll-core/schema" }
 rusqlite = { workspace = true, features = ["bundled", "serialize"] }
 serde_json = { workspace = true }

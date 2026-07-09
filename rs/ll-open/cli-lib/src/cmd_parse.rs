@@ -292,13 +292,21 @@ batch_table! {
     // their new values (no PK collision because their rows were just
     // deleted). On cold parse there are no conflicts; `OR IGNORE`
     // costs the same as plain `INSERT` (single B-tree insert).
+    //
+    // `source_file` (bead `ley-line-open-caf423`): the shared
+    // `nodes.source_file` column carries the originating source file's
+    // path for every AST-derived row. Directory nodes (from
+    // `collect_dirs`) and the root '' node have no source file and pass
+    // `None`. Mache's cross-language rules JOIN on this column; pre-fix
+    // it was always NULL and the rules silently reduced to false
+    // positives.
     NodeBatch, NodeRow,
-    "INSERT OR IGNORE INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ",
-    7,
-    push_fn: (id: String, parent_id: String, name: String, kind: i32, size: i64, mtime: i64, record: String),
-    push_body: { NodeRow { id, parent_id, name, kind, size, mtime, record } },
+    "INSERT OR IGNORE INTO nodes (id, parent_id, name, kind, size, mtime, record, source_file) VALUES ",
+    8,
+    push_fn: (id: String, parent_id: String, name: String, kind: i32, size: i64, mtime: i64, record: String, source_file: Option<String>),
+    push_body: { NodeRow { id, parent_id, name, kind, size, mtime, record, source_file } },
     flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 7);
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 8);
         for r in chunk {
             out.push(&r.id);
             out.push(&r.parent_id);
@@ -307,6 +315,7 @@ batch_table! {
             out.push(&r.size);
             out.push(&r.mtime);
             out.push(&r.record);
+            out.push(&r.source_file);
         }
         out
     },
@@ -1063,8 +1072,24 @@ pub fn parse_into_conn(
                         .context("write AstNode capnp bytes")?;
                 }
 
+                // Bead `ley-line-open-caf423`: every AST-derived node
+                // carries its source file's `_source.id` as
+                // `source_file`. The file's own row + every descendant
+                // AST node share the same `source_file` (the
+                // relative path). Directory nodes (created via
+                // `collect_dirs`) intentionally leave `source_file` as
+                // `None` — they don't belong to a single file.
                 for n in pf.nodes {
-                    nodes_buf.push(n.id, n.parent_id, n.name, n.kind, n.size, mtime, n.record);
+                    nodes_buf.push(
+                        n.id,
+                        n.parent_id,
+                        n.name,
+                        n.kind,
+                        n.size,
+                        mtime,
+                        n.record,
+                        Some(pf.rel.clone()),
+                    );
                 }
 
                 // Merkle-AST content layer (post-order, children before
@@ -2395,6 +2420,8 @@ fn collect_dirs(rel: &Path, created: &mut HashSet<String>, nodes_buf: &mut NodeB
             accumulated = format!("{accumulated}/{name}");
         }
         if created.insert(accumulated.clone()) {
+            // Directory-only rows: `source_file` stays `None`. Only
+            // file nodes + their AST descendants carry the path.
             nodes_buf.push(
                 accumulated.clone(),
                 parent,
@@ -2403,6 +2430,7 @@ fn collect_dirs(rel: &Path, created: &mut HashSet<String>, nodes_buf: &mut NodeB
                 0,
                 mtime,
                 String::new(),
+                None,
             );
         }
     }

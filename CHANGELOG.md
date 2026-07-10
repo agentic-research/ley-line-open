@@ -10,6 +10,10 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Breaking
+
+- `CellComplex::h0_dimension` now returns `Option<usize>` instead of `usize`. `None` means the active system exceeded `MAX_DENSE_ELEMENTS` and the exact SVD was refused — previously this case returned `0`, which reads as "no globally consistent section exists" (a semantic wrong answer, not a resource condition). Also fixes a sign bug: the active-row filter is now the symmetric `|δ⁰ᵢ| ≤ EPS` (matching `detect_violations`), so `dim H⁰` is invariant under edge-endpoint orientation. Bead `ley-line-open-4e8a8f` (math-friend audit P2).
+
 ## [0.7.0] — 2026-07-09
 
 **Substrate consolidation + workspace-deps discipline + measurable moat.**

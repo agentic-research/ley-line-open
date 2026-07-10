@@ -401,7 +401,8 @@ pub fn build_complex(
 
     // First pass: collect unique tokens, assign ids, collect co-
     // occurrence pairs (per-observation), and an activity counter per
-    // token for the V1 stalk value.
+    // token — normalized to a rate (÷ observation count) below when the
+    // V1 stalk value is written.
     let mut activity: BTreeMap<RegionId, u32> = BTreeMap::new();
     let mut edge_pairs: BTreeSet<(RegionId, RegionId)> = BTreeSet::new();
     let mut per_obs_token_sets: Vec<Vec<RegionId>> = Vec::with_capacity(observations.len());
@@ -439,9 +440,17 @@ pub fn build_complex(
     // Iterate `token_ids` rather than `activity` so node insertion is
     // deterministic in token-name lexicographic order — matches the id
     // assignment order and keeps test expectations stable.
+    //
+    // Stalk = token-activity RATE (mentions ÷ observations), per the
+    // `NODE_STALK_DIM` spec. Raw counts would make every downstream
+    // absolute threshold (complex::EPS, the cache's DELTA0 tolerance,
+    // the router's LOW_DELTA0_THRESHOLD) regime-dependent on corpus
+    // size — the units would set the behavior, not the math. Bead
+    // `ley-line-open-4e30d5` (math-friend audit P1).
+    let total_obs = observations.len().max(1) as f32;
     for &id in token_ids.values() {
         let act = *activity.get(&id).unwrap_or(&0) as f32;
-        sink.add_node(id, vec![act]);
+        sink.add_node(id, vec![act / total_obs]);
         nodes_added += 1;
     }
 
@@ -656,6 +665,101 @@ mod tests {
         let outcome = build_complex(&obs, sink.as_mut(), tracker.as_mut());
         assert_eq!(outcome.nodes_added, 2);
         assert_eq!(outcome.edges_added, 1, "self-loop must not be created");
+    }
+
+    /// F1 (bead ley-line-open-4e30d5): the spec (`NODE_STALK_DIM` doc)
+    /// says stalks are scalar token-activity RATES. Raw counts put every
+    /// downstream absolute threshold (EPS = 1e-4, LOW_DELTA0_THRESHOLD =
+    /// 0.1, DELTA0_EPS in the cache) in an undefined regime — the input's
+    /// units set the behavior, not the math. Rates are counts normalized
+    /// by the observation-corpus size, so magnitudes live in a defined
+    /// range and the thresholds mean the same thing on every corpus.
+    #[test]
+    fn stalks_are_rates_not_counts() {
+        // "a" appears in 4/4 observations, "b" in 3/4.
+        let obs: Vec<ObservationRow> = (0..4)
+            .map(|i| ObservationRow {
+                mentions: if i < 3 {
+                    vec!["a".into(), "b".into()]
+                } else {
+                    vec!["a".into()]
+                },
+            })
+            .collect();
+
+        let mut sink = Box::new(RealSink::default());
+        let mut tracker = Box::new(RealTracker::new(TRACKER_ALPHA));
+        build_complex(&obs, sink.as_mut(), tracker.as_mut());
+        let cx = sink.finalize();
+
+        // Lex-sorted id assignment: "a" → 0, "b" → 1.
+        let stalk_a = cx.cells.get(&0).unwrap().stalk.data[0];
+        let stalk_b = cx.cells.get(&1).unwrap().stalk.data[0];
+        assert!(
+            (stalk_a - 1.0).abs() < 1e-6,
+            "stalk(a) must be the rate 4/4 = 1.0, got {stalk_a} \
+             (a raw count would be 4.0)",
+        );
+        assert!(
+            (stalk_b - 0.75).abs() < 1e-6,
+            "stalk(b) must be the rate 3/4 = 0.75, got {stalk_b} \
+             (a raw count would be 3.0)",
+        );
+    }
+
+    /// F1 companion (bead ley-line-open-4e30d5): stalks must encode
+    /// STRUCTURE, not corpus size. Duplicating every observation 10×
+    /// changes no relative activity — the sheaf section (and therefore
+    /// every δ⁰ magnitude a threshold sees) must be identical. Raw
+    /// counts scale 10× under duplication, which is exactly how the
+    /// audit's fixture-A/fixture-B pair flipped the router's regime
+    /// with zero structural change.
+    #[test]
+    fn stalks_scale_invariant_under_corpus_duplication() {
+        let base: Vec<ObservationRow> = vec![
+            ObservationRow {
+                mentions: vec!["a".into(), "b".into()],
+            },
+            ObservationRow {
+                mentions: vec!["a".into()],
+            },
+        ];
+        let duplicated: Vec<ObservationRow> = base
+            .iter()
+            .cloned()
+            .cycle()
+            .take(base.len() * 10)
+            .collect();
+
+        let build = |obs: &[ObservationRow]| {
+            let mut sink = Box::new(RealSink::default());
+            let mut tracker = Box::new(RealTracker::new(TRACKER_ALPHA));
+            build_complex(obs, sink.as_mut(), tracker.as_mut());
+            sink.finalize()
+        };
+
+        let cx_base = build(&base);
+        let cx_dup = build(&duplicated);
+
+        for id in 0..2u32 {
+            let s_base = cx_base.cells.get(&id).unwrap().stalk.data[0];
+            let s_dup = cx_dup.cells.get(&id).unwrap().stalk.data[0];
+            assert!(
+                (s_base - s_dup).abs() < 1e-6,
+                "stalk({id}) must be corpus-size invariant: base {s_base} \
+                 vs 10× duplicated {s_dup} — differing values mean the \
+                 stalks encode units, not structure",
+            );
+        }
+
+        // The per-edge δ⁰ magnitude every threshold consumes must also
+        // be identical across the two corpora.
+        let v_base = cx_base.edge_violation_squared(0, 1).unwrap();
+        let v_dup = cx_dup.edge_violation_squared(0, 1).unwrap();
+        assert!(
+            (v_base - v_dup).abs() < 1e-6,
+            "edge δ⁰ must be corpus-size invariant: {v_base} vs {v_dup}",
+        );
     }
 
     #[test]

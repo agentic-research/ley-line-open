@@ -16,6 +16,7 @@ pub mod cmd_serve;
 pub mod cmd_splice;
 pub mod daemon;
 pub mod topology_pass;
+pub mod walk;
 
 use std::path::PathBuf;
 

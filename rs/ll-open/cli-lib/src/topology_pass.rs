@@ -27,7 +27,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 pub use leyline_sheaf::topology::RegionId;
 
@@ -824,38 +824,15 @@ fn compute_parse_order(file_regions: &[FileRegion], files: &[PathBuf]) -> Vec<us
 
 // ---------------------------------------------------------------------------
 // Convenience: walk a source tree the same way `cmd_parse::collect_files`
-// does, applying `cmd_parse::is_bloat_dir` as the skip predicate. Provided
-// as a helper so callers (tests, benches, the eventual sibling-bead
-// integration) don't have to duplicate the walk.
+// does. Delegates to `crate::walk` so gitignore + bloat-dir policy lives
+// in exactly one place (bead ley-line-open-25685d).
 // ---------------------------------------------------------------------------
 
-/// Walk `source` recursively, returning every file path while skipping
-/// well-known bloat directories. Mirrors the predicate used by
-/// `cmd_parse::collect_files` — see [`crate::cmd_parse::is_bloat_dir`].
+/// Walk `source` recursively, returning every file path. Honors
+/// `.gitignore` / `.ignore` / `.git/info/exclude` / global git excludes
+/// and skips well-known bloat directories.
 pub fn collect_files(source: &Path) -> Result<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    collect_files_inner(source, &mut out)?;
-    out.sort();
-    Ok(out)
-}
-
-fn collect_files_inner(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    let entries = fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))?;
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        if let Some(name) = path.file_name().and_then(|n| n.to_str())
-            && crate::cmd_parse::is_bloat_dir(name)
-        {
-            continue;
-        }
-        if path.is_dir() {
-            collect_files_inner(&path, out)?;
-        } else {
-            out.push(path);
-        }
-    }
-    Ok(())
+    crate::walk::walk_source_tree(source)
 }
 
 // ---------------------------------------------------------------------------

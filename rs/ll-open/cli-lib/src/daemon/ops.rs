@@ -2821,10 +2821,29 @@ fn decode_inline_payload(bytes: &[u8]) -> Option<Vec<f32>> {
 /// see bead `ley-line-open-659a39` (math-friend HIGH): silently returning
 /// `None` on mismatched dims yielded a `{cd=0, defects=[]}` response
 /// indistinguishable from "all sources agree."
+/// Floor of the star-edge id space in the agreement complex's shared
+/// `cells` keyspace. Node ids are `0..rows.len()` (one per source), edge
+/// ids are `AGREEMENT_EDGE_BASE + target` — so the partition holds only
+/// while `rows.len() <= AGREEMENT_EDGE_BASE`. `op_agreement` enforces the
+/// bound with an explicit error envelope BEFORE building (silently
+/// corrupted incidence is wire-indistinguishable from a valid answer);
+/// `build_agreement_complex` asserts it as a backstop. Bead
+/// `ley-line-open-4fece1`.
+const AGREEMENT_EDGE_BASE: u32 = 1_000;
+
 fn build_agreement_complex(
     rows: &[AgreementRow],
 ) -> Option<(leyline_sheaf::complex::CellComplex, Vec<String>)> {
     use leyline_sheaf::complex::{CellComplex, RestrictionMap};
+
+    assert!(
+        rows.len() <= AGREEMENT_EDGE_BASE as usize,
+        "build_agreement_complex: {} sources would collide node ids with \
+         the star-edge id space (AGREEMENT_EDGE_BASE = {}); the caller must \
+         reject oversized source sets first (bead ley-line-open-4fece1)",
+        rows.len(),
+        AGREEMENT_EDGE_BASE,
+    );
 
     let first = rows.first()?;
     let stalk_dim = first.stalk.len();
@@ -2845,10 +2864,9 @@ fn build_agreement_complex(
     }
 
     // Star edges around source 0. Edge IDs live in the same `cells`
-    // namespace as nodes (see `add_edge`); bumping from a high offset
-    // (1_000) keeps them clear of the 0..N node IDs without colliding
-    // with the cache layer's `EDGE_ID_BASE = 1_000_000`.
-    const AGREEMENT_EDGE_BASE: u32 = 1_000;
+    // namespace as nodes (see `add_edge`); the AGREEMENT_EDGE_BASE offset
+    // keeps them clear of the 0..N node IDs (bound asserted above)
+    // without colliding with the cache layer's `EDGE_ID_BASE = 1_000_000`.
     for target in 1..rows.len() as u32 {
         cx.add_edge(
             AGREEMENT_EDGE_BASE + target,
@@ -2912,6 +2930,28 @@ fn op_agreement(ctx: &std::sync::Arc<DaemonContext>, req: &AgreementRequest) -> 
     ctx.with_read(|conn| {
         let rows = query_agreement_observations(conn, &req.token, &req.payload_kind)?;
         let source_count = rows.len();
+
+        // Guard the node/edge id-space partition of the agreement complex
+        // (bead ley-line-open-4fece1): ≥ AGREEMENT_EDGE_BASE distinct
+        // sources for one (token, payload_kind) would silently collide
+        // node ids with star-edge ids. Explicit error envelope, same
+        // policy as the dim-mismatch case below — user data must not
+        // reach the library-level assert.
+        if source_count > AGREEMENT_EDGE_BASE as usize {
+            return Ok(json!({
+                "ok":           false,
+                "error":        "too_many_sources",
+                "token":        req.token,
+                "payload_kind": req.payload_kind,
+                "source_count": source_count,
+                "detail": format!(
+                    "{source_count} sources exceeds the agreement complex's \
+                     id-space bound ({AGREEMENT_EDGE_BASE}); narrow the \
+                     observation set for this (token, payload_kind)."
+                ),
+            })
+            .to_string());
+        }
 
         // Pre-classify stalk dims. Mismatch → explicit error envelope
         // (bead `ley-line-open-659a39`): silently returning empty defects

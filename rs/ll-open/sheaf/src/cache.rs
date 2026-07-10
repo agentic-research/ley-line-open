@@ -385,10 +385,14 @@ impl<S: StalkHash, V> SheafCache<S, V> {
 
     /// Push the current f32 stalk for `region` into the attached complex so
     /// the next `on_change` sees the updated section. No-op if no complex is
-    /// attached or `region` has not been added to the complex yet.
+    /// attached, `region` has not been added to the complex yet, or the id
+    /// resolves to a non-node cell (nodes and edges share the complex's
+    /// `cells` keyspace — a caller-supplied id matching an internal edge id
+    /// must not reach `set_node_stalk`'s dimension panic; bead
+    /// `ley-line-open-4fece1`).
     pub fn set_stalk_value(&mut self, region: RegionId, data: Vec<f32>) {
         if let Some(cx) = self.complex.as_mut()
-            && cx.cells.contains_key(&region)
+            && cx.cells.get(&region).is_some_and(|c| c.dimension == 0)
         {
             cx.set_node_stalk(region, data);
         }

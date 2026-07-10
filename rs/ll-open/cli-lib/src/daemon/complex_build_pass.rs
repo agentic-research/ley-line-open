@@ -232,6 +232,30 @@ const TRACKER_ALPHA: f64 = 0.1;
 /// are forward-compat slot.
 const NODE_STALK_DIM: usize = 1;
 
+/// Floor of the edge-id space in the complex's shared `cells` keyspace.
+/// Node ids are assigned sequentially from 0 (one per unique token), so
+/// the id-space partition — nodes below, edges at/above — holds only
+/// while the token count stays under this. See
+/// [`assert_node_edge_partition`] and the keyspace-invariant section of
+/// `leyline_sheaf::complex`'s module doc. Matches `CellComplex::
+/// apply_delta`'s convention. Bead `ley-line-open-4fece1`.
+const EDGE_ID_BASE: u32 = 1_000_000;
+
+/// Panic (programmer/capacity error on the build path) when the unique-
+/// token count would let a sequentially-assigned node id reach
+/// [`EDGE_ID_BASE`] and collide with the first edge id in the shared
+/// `cells` map. Extracted as a function so the boundary is unit-testable
+/// without materializing a million-token corpus.
+fn assert_node_edge_partition(token_count: usize) {
+    assert!(
+        token_count < EDGE_ID_BASE as usize,
+        "build_complex: {token_count} unique tokens would collide with the \
+         edge id space (EDGE_ID_BASE = {EDGE_ID_BASE}) in the shared \
+         `cells` keyspace — silent map-key overwrite. Bead \
+         ley-line-open-4fece1.",
+    );
+}
+
 /// Enrichment pass that builds a `CellComplex` from `observation` rows
 /// and feeds the per-event token set to `CoChangeTracker::observe`.
 ///
@@ -455,10 +479,13 @@ pub fn build_complex(
     }
 
     let mut edges_added = 0u64;
-    // Internal edge id space: 1_000_000 floor matches `CellComplex::
-    // apply_delta`'s EDGE_ID_BASE convention so a future migration to
-    // shared id space doesn't collide.
-    for (next_edge_id, (a, b)) in (1_000_000_u32..).zip(edge_pairs.iter()) {
+    // Internal edge id space: EDGE_ID_BASE floor matches `CellComplex::
+    // apply_delta`'s convention so a future migration to shared id space
+    // doesn't collide. The partition is asserted, not assumed: node ids
+    // were assigned sequentially above, so a ≥ 1M-token vocabulary would
+    // silently collide with the first edge id (bead ley-line-open-4fece1).
+    assert_node_edge_partition(token_ids.len());
+    for (next_edge_id, (a, b)) in (EDGE_ID_BASE..).zip(edge_pairs.iter()) {
         sink.add_edge(
             next_edge_id,
             *a,
@@ -756,6 +783,24 @@ mod tests {
             (v_base - v_dup).abs() < 1e-6,
             "edge δ⁰ must be corpus-size invariant: {v_base} vs {v_dup}",
         );
+    }
+
+    /// Bead ley-line-open-4fece1: node ids are sequential from 0 in the
+    /// same `cells` keyspace whose edge ids start at `EDGE_ID_BASE`. The
+    /// partition guard must accept exactly up to 999,999 unique tokens
+    /// and fail LOUD at 1,000,000 — a silent overwrite was the failure
+    /// mode. Boundary tested on the extracted guard so no million-token
+    /// corpus is materialized.
+    #[test]
+    fn node_edge_partition_guard_accepts_up_to_boundary() {
+        assert_node_edge_partition(0);
+        assert_node_edge_partition(999_999);
+    }
+
+    #[test]
+    #[should_panic(expected = "would collide with the edge id space")]
+    fn node_edge_partition_guard_rejects_at_boundary() {
+        assert_node_edge_partition(1_000_000);
     }
 
     #[test]

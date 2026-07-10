@@ -33,10 +33,16 @@
 //! Structurally-aware BFS-bounded hash invalidation. Health monitoring uses
 //! the sheaf-derived defect metric `Σ‖δ⁰‖²` (see
 //! [`crate::complex::CellComplex::consistency_analysis`]); eviction uses the
-//! hash-comparison BFS cascade; co-change-learned edge weights weight the
-//! cascade frontier as a coupling prior. No code path here computes ker(δ⁰)
-//! — see "What this cache actually does" above for the proxy details and the
-//! daemon-wiring bead for the δ⁰-driven upgrade path.
+//! hash-comparison BFS cascade. Co-change-learned edge weights are NOT used
+//! to weight the cascade frontier: `on_change` / `check_boundary_changed`
+//! never read `RestrictionEdge::weights`, `co_change_rate`, or
+//! `revert_rate`. The learned rates feed [`SheafCache::defect`] (in-crate)
+//! and are exported over the wire by the daemon for external consumers;
+//! wiring them into the cascade as a coupling prior is a separate design
+//! decision, not current behavior (bead `ley-line-open-4f9553`). No code
+//! path here computes ker(δ⁰) — see "What this cache actually does" above
+//! for the proxy details and the daemon-wiring bead for the δ⁰-driven
+//! upgrade path.
 //!
 //! ## `on_change` return semantics
 //!
@@ -379,10 +385,14 @@ impl<S: StalkHash, V> SheafCache<S, V> {
 
     /// Push the current f32 stalk for `region` into the attached complex so
     /// the next `on_change` sees the updated section. No-op if no complex is
-    /// attached or `region` has not been added to the complex yet.
+    /// attached, `region` has not been added to the complex yet, or the id
+    /// resolves to a non-node cell (nodes and edges share the complex's
+    /// `cells` keyspace — a caller-supplied id matching an internal edge id
+    /// must not reach `set_node_stalk`'s dimension panic; bead
+    /// `ley-line-open-4fece1`).
     pub fn set_stalk_value(&mut self, region: RegionId, data: Vec<f32>) {
         if let Some(cx) = self.complex.as_mut()
-            && cx.cells.contains_key(&region)
+            && cx.cells.get(&region).is_some_and(|c| c.dimension == 0)
         {
             cx.set_node_stalk(region, data);
         }

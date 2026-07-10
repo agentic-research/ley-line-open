@@ -29,6 +29,17 @@ use leyline_sheaf::complex::{CellComplex, RestrictionMap};
 
 use super::events::EventEmitter;
 
+/// Floor of the edge-id space in the backing complex's shared `cells`
+/// keyspace: wire-supplied region ids stay below, internally-allocated
+/// edge ids at/above. One constant for BOTH the seed `set_topology`
+/// allocation and the incremental update op — the seed previously
+/// allocated edge ids from 100, which collided with any wire region id
+/// ≥ 100. Region inputs that violate the bound are excluded from the
+/// backing complex with a warn (the heuristic hash cache still tracks
+/// them); see the keyspace-invariant section of `leyline_sheaf::complex`.
+/// Bead `ley-line-open-4fece1`.
+const EDGE_ID_BASE: u32 = 1_000_000;
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -408,7 +419,22 @@ pub fn op_sheaf_set_topology(
     // Try to engage δ⁰ mode: every region must carry f32 data of the
     // declared dimension and every restriction must have a non-zero
     // agreement_dim. Otherwise fall back to heuristic-only.
+    // Region ids at/above EDGE_ID_BASE would collide with the edge ids
+    // this handler allocates in the complex's shared `cells` keyspace
+    // (bead ley-line-open-4fece1). Such inputs forfeit δ⁰ mode: the
+    // heuristic hash cache still tracks every region, but no complex is
+    // attached. Logged so the degradation is observable, and the
+    // response's `delta_zero_mode: false` carries the signal on the wire.
+    let region_ids_partition_ok = regions.iter().all(|r| r.id < EDGE_ID_BASE);
+    if !region_ids_partition_ok {
+        log::warn!(
+            "op_sheaf_set_topology: region id ≥ EDGE_ID_BASE ({EDGE_ID_BASE}) \
+             collides with the complex's edge id space; δ⁰ mode disabled for \
+             this topology (heuristic XOR invalidation still active)",
+        );
+    }
     let try_delta_zero = node_stalk_dim > 0
+        && region_ids_partition_ok
         && !regions.is_empty()
         && regions
             .iter()
@@ -434,7 +460,10 @@ pub fn op_sheaf_set_topology(
     }
 
     let mut edge_count = 0u32;
-    let mut edge_id_seq = 100u32;
+    // Edge ids share the `cells` keyspace with region ids; allocate from
+    // EDGE_ID_BASE so no wire region id below the partition floor can
+    // collide (the prior base of 100 collided with region ids ≥ 100).
+    let mut edge_id_seq = EDGE_ID_BASE;
     for r in restrictions {
         let weights = if r.weights.is_empty() {
             vec![1.0]
@@ -815,6 +844,20 @@ pub fn op_sheaf_update_topology(
             cx.remove_node(rid);
         }
         for r in &delta.added_regions {
+            if r.id >= EDGE_ID_BASE {
+                // Would collide with the edge id space in the shared
+                // `cells` keyspace (the complex-side add_node asserts
+                // on actual collision; this guard keeps hostile wire
+                // input from reaching the panic). The heuristic cache
+                // still tracks the region.
+                log::warn!(
+                    "sheaf update: region id {} ≥ EDGE_ID_BASE ({}) — \
+                     excluded from the δ⁰ complex (bead ley-line-open-4fece1)",
+                    r.id,
+                    EDGE_ID_BASE,
+                );
+                continue;
+            }
             if r.data.len() == dim && dim > 0 {
                 cx.add_node(r.id, r.data.clone());
             }
@@ -830,21 +873,18 @@ pub fn op_sheaf_update_topology(
             if !cx.cells.contains_key(&e.a) || !cx.cells.contains_key(&e.b) {
                 continue;
             }
-            // Edge IDs share the `cells` HashMap namespace with regions, so
-            // we start incremental-edge IDs at 1M to stay well clear of any
-            // realistic region-ID range. The seed `set_topology` allocates
-            // from 100 (bounded by region count), but the update op is
-            // long-lived — pick a base that can't collide with future
-            // region additions.
-            const INCREMENTAL_EDGE_BASE: u32 = 1_000_000;
+            // Edge IDs share the `cells` HashMap namespace with regions;
+            // allocate at/above the module-level EDGE_ID_BASE partition
+            // floor (same convention as the seed `set_topology`) so no
+            // admitted region id can collide.
             let next_id = cx
                 .edges
                 .iter()
                 .copied()
                 .max()
                 .map(|m| m + 1)
-                .unwrap_or(INCREMENTAL_EDGE_BASE)
-                .max(INCREMENTAL_EDGE_BASE);
+                .unwrap_or(EDGE_ID_BASE)
+                .max(EDGE_ID_BASE);
             let f = RestrictionMap::project_dim_range(dim, e.agreement_dim as usize);
             cx.add_edge(
                 next_id,
@@ -858,7 +898,14 @@ pub fn op_sheaf_update_topology(
             );
         }
         for s in &delta.updated_stalks {
-            if s.stalk.len() == dim && dim > 0 && cx.cells.contains_key(&s.region_id) {
+            // `region_id < EDGE_ID_BASE` keeps a wire region id that
+            // matches an internal edge id from reaching set_node_stalk's
+            // dimension assert (edge cells share the keyspace).
+            if s.stalk.len() == dim
+                && dim > 0
+                && s.region_id < EDGE_ID_BASE
+                && cx.cells.contains_key(&s.region_id)
+            {
                 cx.set_node_stalk(s.region_id, s.stalk.clone());
             }
         }
@@ -1139,6 +1186,50 @@ mod tests {
             .expect("δ⁰ mode must attach a backing CellComplex");
         assert_eq!(cx.nodes.len(), 2);
         assert_eq!(cx.edges.len(), 1);
+    }
+
+    /// Bead ley-line-open-4fece1: a wire region id at/above EDGE_ID_BASE
+    /// would collide with the edge ids this handler allocates in the
+    /// complex's shared `cells` keyspace. The op must NOT panic and must
+    /// NOT engage δ⁰ mode with a corrupted complex — it degrades to
+    /// heuristic invalidation and says so via `delta_zero_mode: false`.
+    #[test]
+    fn set_topology_region_id_in_edge_space_degrades_to_heuristic() {
+        let state = SheafState::new();
+        let regions = vec![
+            SheafStalkInput {
+                id: 0,
+                hash: "aa".into(),
+                data: vec![1.0],
+            },
+            SheafStalkInput {
+                // Collides with the edge id space (≥ EDGE_ID_BASE).
+                id: EDGE_ID_BASE + 7,
+                hash: "bb".into(),
+                data: vec![2.0],
+            },
+        ];
+        let restrictions = vec![SheafRestrictionInput {
+            a: 0,
+            b: EDGE_ID_BASE + 7,
+            boundary_hash: format!("{:02x}", 0xaa ^ 0xbb),
+            co_change_rate: 0.5,
+            revert_rate: 0.0,
+            weights: vec![1.0],
+            agreement_dim: 1,
+        }];
+        let resp = op_sheaf_set_topology(&state, &regions, &restrictions, 1).unwrap();
+        let j = parse_response(&resp);
+        assert_eq!(j["ok"], true, "op must succeed in heuristic mode");
+        assert_eq!(
+            j["delta_zero_mode"], false,
+            "partition-violating region ids must forfeit δ⁰ mode",
+        );
+        let cache = state.cache.lock().unwrap();
+        assert!(
+            cache.complex().is_none(),
+            "no complex may be attached when the id partition is violated",
+        );
     }
 
     // ─────────────────────────────────────────────────────────────

@@ -42,6 +42,39 @@ Falsification bar (from the bead): ≥ 80% average would falsify the moat claim
 threshold: ≤ 30%. **Observed: 1.1%, well below the load-bearing threshold with
 100.0% of events in the tightest histogram bucket (0-10%).**
 
+## What the 91× does — and does not — validate
+
+Math-friend audit `a9d5e5a2` (2026-07-10, bead `ley-line-open-50c21d`)
+traced the measured code path and corrected the framing:
+
+**The measurement runs on the label-prefix path, not the cascade/threshold
+path.** `emit_watcher_sheaf_invalidate` computes its region set via
+`SheafState::regions_touching_files` — label-prefix matching of
+`changed_files` against installed region labels (`sheaf_ops.rs`), confirmed
+at the `cmd_daemon` call site (fine-grained diff or all-known fallback, then
+`bump_generation`). This path:
+
+- never calls `on_change`
+- never runs the BFS cascade
+- never evaluates a single δ⁰ threshold
+
+**The 91× therefore validates the LABELING SCHEME** (2 labels/file): for a
+labeled sheaf topology, region-precise invalidation touches ~1.1% of what
+naive invalidation would.
+
+**The 91× does NOT validate** any cascade termination policy, δ⁰ threshold,
+or router cutoff — those live downstream of `on_change`, which this study
+never triggered. The number is real and load-bearing for what it actually
+proves; citing it as evidence for the sheaf *constants* would be a category
+error.
+
+The constants themselves were audited separately and fixed under the P1-P7
+beads: `4e30d5` (stalks as rates — root cause), `4e8a8f` (h0_dimension),
+`4eef8d` (cascade fixed point), `4f3f6e` (δ⁰ tolerance shape), `4f9553`
+(learned-weight doc drift), `4fece1` (id-space partition), `504341` (guard
+quantities). Router-constant measurement is tracked by bead `5b58ff`
+(Phase-2-dependent wall-time correlation study).
+
 ## Method
 
 ### Falsifiable claim (from bead)

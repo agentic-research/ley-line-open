@@ -2436,6 +2436,15 @@ fn op_at_position(ctx: &std::sync::Arc<DaemonContext>, p: &LspPosition) -> Resul
 /// Cap on `depth` regardless of caller input — ADR-0016 §5 says max 4.
 const NEIGHBORHOOD_MAX_DEPTH: u32 = 4;
 
+/// Cap on the TOTAL number of neighbor cells emitted per request. Depth
+/// alone does not bound response size on co-occurrence-shaped graphs:
+/// one observation with k mentions creates a k-clique, so a radius-1
+/// ball can already be O(V). The response carries `truncated: true`
+/// when this cap (or the per-hop soft cap) cut the expansion short, so
+/// consumers can distinguish "small neighborhood" from "clipped
+/// neighborhood". Bead `ley-line-open-504341` (P7b).
+const NEIGHBORHOOD_MAX_CELLS: usize = 1_000;
+
 /// `{"op":"inspect_neighborhood","symbol_id":"...",...}` — focal
 /// symbol + N-hop neighborhood. Returns `{ok, focal, neighbors}`.
 fn op_inspect_neighborhood(
@@ -2462,8 +2471,12 @@ fn op_inspect_neighborhood(
 
         let mut neighbors_out: Vec<serde_json::Value> = Vec::new();
         let mut current_frontier: Vec<String> = vec![req.symbol_id.clone()];
+        // Set when either cap (total cells, per-hop soft cap) cut the
+        // expansion short — surfaced in the response so consumers can
+        // tell a small neighborhood from a clipped one.
+        let mut truncated = false;
 
-        for hop in 1..=depth {
+        'hops: for hop in 1..=depth {
             let mut next_frontier: Vec<String> = Vec::new();
 
             for focal in &current_frontier {
@@ -2482,6 +2495,13 @@ fn op_inspect_neighborhood(
                 {
                     if !visited.insert(token.clone()) {
                         continue;
+                    }
+                    // Hard cap on emitted cells: hop-depth does not bound
+                    // response size on clique-shaped co-occurrence graphs
+                    // (bead ley-line-open-504341 P7b).
+                    if neighbors_out.len() >= NEIGHBORHOOD_MAX_CELLS {
+                        truncated = true;
+                        break 'hops;
                     }
                     next_frontier.push(token.clone());
 
@@ -2518,6 +2538,7 @@ fn op_inspect_neighborhood(
                         // Soft cap per hop. The fan-out can be
                         // tighter than the request asked if many
                         // neighbors share dedup hits.
+                        truncated = true;
                         break;
                     }
                 }
@@ -2563,6 +2584,10 @@ fn op_inspect_neighborhood(
                 "certainty":   "full",
             },
             "neighbors":  neighbors_out,
+            // True when a cap (total-cell or per-hop) clipped the
+            // expansion — a small `neighbors` list with truncated=false
+            // really is the whole neighborhood.
+            "truncated":  truncated,
             "provenance": "composed",
             "certainty":  "full",
         })
@@ -2821,10 +2846,29 @@ fn decode_inline_payload(bytes: &[u8]) -> Option<Vec<f32>> {
 /// see bead `ley-line-open-659a39` (math-friend HIGH): silently returning
 /// `None` on mismatched dims yielded a `{cd=0, defects=[]}` response
 /// indistinguishable from "all sources agree."
+/// Floor of the star-edge id space in the agreement complex's shared
+/// `cells` keyspace. Node ids are `0..rows.len()` (one per source), edge
+/// ids are `AGREEMENT_EDGE_BASE + target` — so the partition holds only
+/// while `rows.len() <= AGREEMENT_EDGE_BASE`. `op_agreement` enforces the
+/// bound with an explicit error envelope BEFORE building (silently
+/// corrupted incidence is wire-indistinguishable from a valid answer);
+/// `build_agreement_complex` asserts it as a backstop. Bead
+/// `ley-line-open-4fece1`.
+const AGREEMENT_EDGE_BASE: u32 = 1_000;
+
 fn build_agreement_complex(
     rows: &[AgreementRow],
 ) -> Option<(leyline_sheaf::complex::CellComplex, Vec<String>)> {
     use leyline_sheaf::complex::{CellComplex, RestrictionMap};
+
+    assert!(
+        rows.len() <= AGREEMENT_EDGE_BASE as usize,
+        "build_agreement_complex: {} sources would collide node ids with \
+         the star-edge id space (AGREEMENT_EDGE_BASE = {}); the caller must \
+         reject oversized source sets first (bead ley-line-open-4fece1)",
+        rows.len(),
+        AGREEMENT_EDGE_BASE,
+    );
 
     let first = rows.first()?;
     let stalk_dim = first.stalk.len();
@@ -2845,10 +2889,9 @@ fn build_agreement_complex(
     }
 
     // Star edges around source 0. Edge IDs live in the same `cells`
-    // namespace as nodes (see `add_edge`); bumping from a high offset
-    // (1_000) keeps them clear of the 0..N node IDs without colliding
-    // with the cache layer's `EDGE_ID_BASE = 1_000_000`.
-    const AGREEMENT_EDGE_BASE: u32 = 1_000;
+    // namespace as nodes (see `add_edge`); the AGREEMENT_EDGE_BASE offset
+    // keeps them clear of the 0..N node IDs (bound asserted above)
+    // without colliding with the cache layer's `EDGE_ID_BASE = 1_000_000`.
     for target in 1..rows.len() as u32 {
         cx.add_edge(
             AGREEMENT_EDGE_BASE + target,
@@ -2912,6 +2955,28 @@ fn op_agreement(ctx: &std::sync::Arc<DaemonContext>, req: &AgreementRequest) -> 
     ctx.with_read(|conn| {
         let rows = query_agreement_observations(conn, &req.token, &req.payload_kind)?;
         let source_count = rows.len();
+
+        // Guard the node/edge id-space partition of the agreement complex
+        // (bead ley-line-open-4fece1): ≥ AGREEMENT_EDGE_BASE distinct
+        // sources for one (token, payload_kind) would silently collide
+        // node ids with star-edge ids. Explicit error envelope, same
+        // policy as the dim-mismatch case below — user data must not
+        // reach the library-level assert.
+        if source_count > AGREEMENT_EDGE_BASE as usize {
+            return Ok(json!({
+                "ok":           false,
+                "error":        "too_many_sources",
+                "token":        req.token,
+                "payload_kind": req.payload_kind,
+                "source_count": source_count,
+                "detail": format!(
+                    "{source_count} sources exceeds the agreement complex's \
+                     id-space bound ({AGREEMENT_EDGE_BASE}); narrow the \
+                     observation set for this (token, payload_kind)."
+                ),
+            })
+            .to_string());
+        }
 
         // Pre-classify stalk dims. Mismatch → explicit error envelope
         // (bead `ley-line-open-659a39`): silently returning empty defects

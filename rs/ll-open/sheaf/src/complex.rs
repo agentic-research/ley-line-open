@@ -8,6 +8,21 @@
 //! - δ¹: C¹ → C² (cycle detection — checks face consistency)
 //! - H⁰ = ker(δ⁰) (globally consistent stalks — valid cache entries)
 //! - H¹ = ker(δ¹) / im(δ⁰) (independent cycles — fundamental invalidation paths)
+//!
+//! ## Shared `cells` keyspace invariant
+//!
+//! 0-cells (nodes) and 1-cells (edges) live in ONE `cells: HashMap<u32,
+//! Cell>` — an id used for a node can never be reused for an edge or vice
+//! versa, or the later insert silently overwrites the earlier cell and
+//! corrupts the incidence structure. [`Self::add_node`] and
+//! [`Self::add_edge`] assert this (bead `ley-line-open-4fece1`).
+//!
+//! Producers keep the spaces apart by convention: node/region ids are
+//! assigned from 0 upward and edge ids from `EDGE_ID_BASE = 1_000_000`
+//! upward (see [`Self::apply_delta`], the daemon's `sheaf_ops`, and
+//! `ComplexBuildPass`). The convention caps the node universe at 1M ids —
+//! every producer must ASSERT or guard that bound rather than assume it,
+//! because the collision is silent without the cell-level asserts here.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(any(test, feature = "test-spy"))]
@@ -393,7 +408,11 @@ impl CellComplex {
     /// Add a 0-cell (node) with the given stalk data.
     ///
     /// # Panics
-    /// Panics if `data.len() != self.node_stalk_dim`.
+    /// Panics if `data.len() != self.node_stalk_dim`, or if `id` is already
+    /// occupied by a 1-cell — nodes and edges share the `cells` keyspace,
+    /// and a collision would silently overwrite the edge and corrupt the
+    /// incidence structure (see the module doc's keyspace invariant; bead
+    /// `ley-line-open-4fece1`).
     pub fn add_node(&mut self, id: u32, data: Vec<f32>) {
         assert_eq!(
             data.len(),
@@ -402,6 +421,15 @@ impl CellComplex {
             self.node_stalk_dim,
             data.len()
         );
+        if let Some(existing) = self.cells.get(&id) {
+            assert_eq!(
+                existing.dimension, 0,
+                "add_node: id {id} is already a {}-cell — node/edge id-space \
+                 partition violated (shared `cells` keyspace, bead \
+                 ley-line-open-4fece1)",
+                existing.dimension,
+            );
+        }
         self.cells.insert(
             id,
             Cell {
@@ -424,6 +452,11 @@ impl CellComplex {
     /// `map_source` and `map_target` must be `agreement_dim × node_stalk_dim`.
     /// Without this check, `build_delta_0` would read out-of-bounds entries
     /// from the restriction matrices and silently corrupt δ⁰.
+    ///
+    /// Also panics if `edge_id` is already occupied by a 0-cell — nodes and
+    /// edges share the `cells` keyspace, and a collision would silently
+    /// overwrite the node and corrupt the incidence structure (see the
+    /// module doc's keyspace invariant; bead `ley-line-open-4fece1`).
     #[allow(clippy::too_many_arguments)]
     pub fn add_edge(
         &mut self,
@@ -464,6 +497,15 @@ impl CellComplex {
             map_target.nrows(),
             agreement_dim,
         );
+        if let Some(existing) = self.cells.get(&edge_id) {
+            assert_eq!(
+                existing.dimension, 1,
+                "add_edge: id {edge_id} is already a {}-cell — node/edge \
+                 id-space partition violated (shared `cells` keyspace, bead \
+                 ley-line-open-4fece1)",
+                existing.dimension,
+            );
+        }
         self.cells.insert(
             edge_id,
             Cell {
@@ -1091,6 +1133,13 @@ impl CellComplex {
     ///
     /// # Panics
     /// Panics if the condition is violated (max entry > 1e-4).
+    ///
+    /// # Resource cap
+    /// Above `MAX_DENSE_ELEMENTS` the dense product is not formed and the
+    /// axiom is NOT verified for this complex. That skip is logged at
+    /// `warn` — silent verification disappearance is worse than a size
+    /// limit, because callers read "no panic" as "axiom held" (bead
+    /// `ley-line-open-504341`, P7a).
     pub fn assert_cochain_complex(&self) {
         if self.faces.is_empty() || self.edges.is_empty() {
             return;
@@ -1100,6 +1149,16 @@ impl CellComplex {
 
         let product_elements = d1.nrows() * d0.ncols();
         if product_elements > MAX_DENSE_ELEMENTS {
+            log::warn!(
+                "assert_cochain_complex: SKIPPED — δ¹∘δ⁰ = 0 axiom NOT \
+                 verified for this complex ({} × {} product = {} elements \
+                 > MAX_DENSE_ELEMENTS = {}). Absence of a panic here is \
+                 not evidence the axiom holds.",
+                d1.nrows(),
+                d0.ncols(),
+                product_elements,
+                MAX_DENSE_ELEMENTS,
+            );
             return;
         }
 
@@ -1428,6 +1487,35 @@ mod tests {
         // Restriction outputs 1D but caller asked for agreement_dim=2.
         let bad = RestrictionMap::project_dim(2, 0);
         cx.add_edge(100, 0, 1, 2, None, bad.clone(), bad, false);
+    }
+
+    /// Bead ley-line-open-4fece1: nodes and edges share the `cells`
+    /// keyspace. Before the partition assert, an edge id reused as a node
+    /// id silently overwrote the edge cell — corrupted incidence with no
+    /// signal. Now it panics loud.
+    #[test]
+    #[should_panic(expected = "id-space partition violated")]
+    fn add_node_rejects_id_already_used_by_edge() {
+        let mut cx = CellComplex::new(1);
+        cx.add_node(0, vec![0.0]);
+        cx.add_node(1, vec![0.0]);
+        let p = RestrictionMap::identity(1);
+        cx.add_edge(100, 0, 1, 1, None, p.clone(), p, false);
+        // Node id 100 collides with edge cell 100.
+        cx.add_node(100, vec![0.0]);
+    }
+
+    /// Companion: an edge id reused from a node id panics too.
+    #[test]
+    #[should_panic(expected = "id-space partition violated")]
+    fn add_edge_rejects_id_already_used_by_node() {
+        let mut cx = CellComplex::new(1);
+        cx.add_node(0, vec![0.0]);
+        cx.add_node(1, vec![0.0]);
+        cx.add_node(2, vec![0.0]);
+        let p = RestrictionMap::identity(1);
+        // Edge id 2 collides with node cell 2.
+        cx.add_edge(2, 0, 1, 1, None, p.clone(), p, false);
     }
 
     #[test]

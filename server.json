@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.agentic-research/ley-line-open",
   "description": "Open-source data plane primitives — tree-sitter parse, LSP, sheaf cache, observation lattice.",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "repository": {
     "url": "https://github.com/agentic-research/ley-line-open.git",
     "source": "github"
@@ -10,7 +10,7 @@
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/agentic-research/ley-line-open:0.7.0",
+      "identifier": "ghcr.io/agentic-research/ley-line-open:0.7.1",
       "transport": {
         "type": "streamable-http",
         "url": "http://localhost:8384/mcp"

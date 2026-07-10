@@ -18,7 +18,7 @@
 //!   The list returned by [`SheafCache::on_change`] always contains the
 //!   `changed_regions` the caller passed in (the cascade roots), plus any
 //!   BFS-reachable neighbors whose boundary projection moved beyond
-//!   `DELTA0_EPS_SQUARED` (in δ⁰ mode) or whose XOR pre-filter fired
+//!   `DELTA0_EPS` in norm space (δ⁰ mode) or whose XOR pre-filter fired
 //!   (heuristic-only). The cascade roots appear in the list even when their
 //!   own boundary is unchanged — they are an input fact the caller
 //!   asserted, not a measurement. It is a structural answer about the

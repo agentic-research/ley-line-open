@@ -13,7 +13,7 @@
 The list returned by `SheafCache::on_change` always contains:
 
 1. The `changed_regions` the caller passed in (cascade roots — an input fact, not a measurement).
-2. BFS-reachable neighbors whose boundary projection moved beyond `DELTA0_EPS_SQUARED` (in δ⁰ mode) OR whose XOR pre-filter fired (heuristic-only mode).
+2. BFS-reachable neighbors whose boundary projection moved beyond `DELTA0_EPS` in norm space (δ⁰ mode) OR whose XOR pre-filter fired (heuristic-only mode).
 
 It is a structural answer about the sheaf section, not a per-cache eviction list. UDS / MCP consumers get the same answer in-process callers do and own their own eviction policy on top of it.
 

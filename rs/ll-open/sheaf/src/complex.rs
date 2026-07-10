@@ -1267,21 +1267,39 @@ impl CellComplex {
     /// of section, depending only on the complex's restriction maps and the
     /// active edge set. Contrast with [`Self::consistency_analysis`], which
     /// reports the *current section's* defect and partition.
-    pub fn h0_dimension(&self) -> usize {
+    ///
+    /// "Active" rows are the SATISFIED constraints — `|δ⁰ᵢ| ≤ EPS`,
+    /// symmetric in sign like [`Self::detect_violations`]. δ⁰ flips sign
+    /// under endpoint-orientation swap, so a signed comparison would make
+    /// the reported dimension orientation-dependent (bead
+    /// `ley-line-open-4e8a8f`).
+    ///
+    /// Returns `None` when the active system exceeds `MAX_DENSE_ELEMENTS`
+    /// and the exact SVD is refused. `None` means "unanswerable at this
+    /// size", NOT "dim H⁰ = 0" — a `0` would claim no globally consistent
+    /// section exists, which is a semantic wrong answer, not a resource
+    /// condition. Callers must surface the `None`, not default it.
+    pub fn h0_dimension(&self) -> Option<usize> {
         let delta = self.build_delta_0();
         let x = self.global_section();
         let bounds = SparseOps::spmv(&delta, &x);
 
-        let active_rows: Vec<usize> = (0..bounds.len()).filter(|&i| bounds[i] <= EPS).collect();
+        // Symmetric |·| ≤ EPS: satisfied rows only, regardless of the
+        // sign convention induced by edge-endpoint order. Mirrors the
+        // detect_violations fix (`val.abs() > EPS`).
+        let active_rows: Vec<usize> = (0..bounds.len())
+            .filter(|&i| bounds[i].abs() <= EPS)
+            .collect();
 
         if active_rows.is_empty() {
-            return self.nodes.len() * self.node_stalk_dim;
+            return Some(self.nodes.len() * self.node_stalk_dim);
         }
 
         let ncols = delta.ncols();
         let active_elements = active_rows.len() * ncols;
         if active_elements > MAX_DENSE_ELEMENTS {
-            return 0;
+            // Refuse rather than fabricate: see doc comment.
+            return None;
         }
 
         let mut row_map: HashMap<usize, usize> = HashMap::with_capacity(active_rows.len());
@@ -1301,7 +1319,7 @@ impl CellComplex {
 
         let svd = delta_active.svd(true, true);
         let rank = SparseOps::numerical_rank(&svd);
-        ncols - rank
+        Some(ncols - rank)
     }
 
     /// Compute the H¹ Betti number: dim(ker(δ¹) / im(δ⁰)).
@@ -1445,6 +1463,97 @@ mod tests {
         assert!(h0.defect > 0.0);
         let has_pair = h0.consistent_groups.iter().any(|g| g.len() == 2);
         assert!(has_pair);
+    }
+
+    /// F2 (bead ley-line-open-4e8a8f): `dim H⁰` is an algebraic invariant
+    /// of the complex — it must not depend on the ORDER in which an edge's
+    /// endpoints were supplied. δ⁰ = f_v(x_v) − f_u(x_u) flips sign when
+    /// the endpoints' roles flip, so a signed `bounds[i] <= EPS` row filter
+    /// admits a violated row in one orientation and rejects it in the
+    /// other, producing two different "dimensions" for the same complex.
+    #[test]
+    fn h0_dimension_is_orientation_invariant() {
+        let build = |src: u32, tgt: u32| {
+            let mut cx = CellComplex::new(1);
+            cx.add_node(0, vec![0.0]);
+            cx.add_node(1, vec![5.0]);
+            cx.add_edge(
+                100,
+                src,
+                tgt,
+                1,
+                Some("test".into()),
+                RestrictionMap::identity(1),
+                RestrictionMap::identity(1),
+                false,
+            );
+            cx
+        };
+
+        let forward = build(0, 1).h0_dimension();
+        let reversed = build(1, 0).h0_dimension();
+        assert_eq!(
+            forward, reversed,
+            "dim H⁰ must be invariant under edge-endpoint orientation \
+             (forward {forward:?} vs reversed {reversed:?})",
+        );
+    }
+
+    /// Satisfied 2-node complex: the single agreement constraint is active,
+    /// so `dim H⁰ = dim ker(δ⁰)` = 1 (one connected component, 1-D stalks).
+    #[test]
+    fn h0_dimension_consistent_pair_is_one() {
+        let mut cx = CellComplex::new(1);
+        cx.add_node(0, vec![5.0]);
+        cx.add_node(1, vec![5.0]);
+        cx.add_edge(
+            100,
+            0,
+            1,
+            1,
+            Some("test".into()),
+            RestrictionMap::identity(1),
+            RestrictionMap::identity(1),
+            false,
+        );
+        assert_eq!(cx.h0_dimension(), Some(1));
+    }
+
+    /// F2 companion (bead ley-line-open-4e8a8f): when the active system
+    /// exceeds `MAX_DENSE_ELEMENTS`, `h0_dimension` must refuse to answer
+    /// (`None`) rather than return `0`. `0` means "no globally consistent
+    /// section exists" — semantically a WRONG ANSWER for this complex,
+    /// whose all-equal stalks trivially form a consistent section.
+    #[test]
+    fn h0_dimension_resource_cap_is_none_not_zero() {
+        // Chain of N all-equal 1-D stalks: every row of δ⁰ is active
+        // (satisfied), so active_rows × ncols = (N−1) × N. Pick N so the
+        // product just exceeds MAX_DENSE_ELEMENTS = 1e7.
+        let n: u32 = 3_200; // 3_199 × 3_200 = 10_236_800 > 1e7
+        let mut cx = CellComplex::new(1);
+        for i in 0..n {
+            cx.add_node(i, vec![1.0]);
+        }
+        for i in 0..(n - 1) {
+            cx.add_edge(
+                1_000_000 + i,
+                i,
+                i + 1,
+                1,
+                Some("test".into()),
+                RestrictionMap::identity(1),
+                RestrictionMap::identity(1),
+                false,
+            );
+        }
+
+        assert_eq!(
+            cx.h0_dimension(),
+            None,
+            "resource-capped h0_dimension must be None, not a \
+             valid-looking 0 (\"no consistent section\") — a trivially \
+             consistent section exists here",
+        );
     }
 
     #[test]

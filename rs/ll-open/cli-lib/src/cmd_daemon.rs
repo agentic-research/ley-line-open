@@ -1536,8 +1536,19 @@ pub fn emit_watcher_sheaf_invalidate(
     // or the degenerate "labels but no complex" case.
     let fine_grained: Option<Vec<u32>> = ctx.sheaf.regions_touching_files(changed_files);
 
-    let (invalidated, scope, prior_generation, generation) = {
+    // Snapshot the full currently-known region set alongside the
+    // fine-grained diff so ablation logging (bead `ley-line-open-2775a3`)
+    // can compare `sheaf_count` vs `naive_count` for the sheaf value
+    // study. `all_known` is what a naive "invalidate everything on any
+    // file change" baseline would emit; we compute it under the same
+    // cache lock so both sides are consistent to the moment the payload
+    // is decided. Never sent on the wire — measurement only.
+    let (invalidated, scope, prior_generation, generation, all_known) = {
         let mut cache = ctx.sheaf.cache().lock().unwrap();
+        let all_known: Vec<u32> = cache
+            .complex()
+            .map(|cx| cx.nodes.clone())
+            .unwrap_or_default();
         let (regions, scope_tag) = match fine_grained {
             Some(diff) => (diff, "changed-only"),
             None => {
@@ -1545,19 +1556,20 @@ pub fn emit_watcher_sheaf_invalidate(
                 // from the installed complex. Empty when no complex has been
                 // installed yet (fresh daemon) — the event still fires as a
                 // "state advanced" continuity signal.
-                let all = cache
-                    .complex()
-                    .map(|cx| cx.nodes.clone())
-                    .unwrap_or_default();
-                (all, "all-known")
+                (all_known.clone(), "all-known")
             }
         };
         let prior = cache.generation();
         // `gen` is a reserved keyword in Rust 2024 edition — use a
         // spelled-out binding to avoid the r#gen escape hatch.
         let bumped = cache.bump_generation();
-        (regions, scope_tag, prior, bumped)
+        (regions, scope_tag, prior, bumped, all_known)
     };
+
+    // Ablation instrumentation (opt-in via `LEYLINE_SHEAF_ABLATION_LOG`).
+    // Zero-cost when the env var is unset. See
+    // `daemon::sheaf_ablation` for the wire format + rationale.
+    crate::daemon::sheaf_ablation::log_event(&invalidated, &all_known, changed_files, scope);
 
     let current_root = match crate::daemon::ops::read_root_hex(&ctx.ctrl_path) {
         Ok(hex) => hex,

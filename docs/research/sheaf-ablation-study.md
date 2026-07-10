@@ -1,7 +1,7 @@
 # Sheaf value ablation study — precision delta vs naive baseline
 
 **Bead**: `ley-line-open-2775a3`
-**Corpus**: LLO-self checkout at commit `a39b95b3e61cea5e6b8127419b321102818066f7` (v0.7.0 branch tip)
+**Corpus**: LLO-self checkout at commit `a39b95b3e61cea5e6b8127419b321102818066f7` (originally v0.7.0 branch tip; ratio re-verified against v0.7.1 post P1 stalks-as-rates fix — 91.02× ≈ 91.01× original, empirically confirming the reframing that the label-prefix path never touches a stalk)
 **Study date**: 2026-07-10
 **Harness**: `rs/ll-open/cli-lib/tests/sheaf_ablation_test.rs`
 **Instrumentation**: `rs/ll-open/cli-lib/src/daemon/sheaf_ablation.rs`

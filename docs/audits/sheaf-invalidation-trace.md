@@ -5,7 +5,13 @@
 **Auditor:** Claude
 **Base commit:** `621d901` (main)
 
-## TL;DR
+## STATUS (2026-07-10): RESOLVED — this audit is historical
+
+> **All 4 gaps this audit named are closed inside LLO as of v0.6.0.** Gap 1 (watcher → enrichment) shipped in PR #138; Gap 2 (CellComplex persistence) in #139; Gap 3 (region-precise `daemon.sheaf.invalidate` emit) in #140 (coarse-v1) + #146 (fine-grained diff); Gap 4 (extension seam design) in #141. End-to-end composition test at PR #142. Unified emit path at PR #147. Empirical validation: ablation study (PR #169) shows 91× precision win vs naive baseline — validates the labeling scheme; math-friend audit (v0.7.1, PRs #170–#175) fixed constants + cascade correctness bugs found in the substrate.
+>
+> This audit doc is preserved for historical provenance. **The loop is now fully closed inside LLO.**
+
+## TL;DR (historical, at audit time)
 
 The math primitives + UDS ops are live and tested, but the loop from a
 source-file edit to a region-precise `sheaf.invalidate` event is **not**

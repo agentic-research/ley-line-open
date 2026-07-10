@@ -33,10 +33,16 @@
 //! Structurally-aware BFS-bounded hash invalidation. Health monitoring uses
 //! the sheaf-derived defect metric `Σ‖δ⁰‖²` (see
 //! [`crate::complex::CellComplex::consistency_analysis`]); eviction uses the
-//! hash-comparison BFS cascade; co-change-learned edge weights weight the
-//! cascade frontier as a coupling prior. No code path here computes ker(δ⁰)
-//! — see "What this cache actually does" above for the proxy details and the
-//! daemon-wiring bead for the δ⁰-driven upgrade path.
+//! hash-comparison BFS cascade. Co-change-learned edge weights are NOT used
+//! to weight the cascade frontier: `on_change` / `check_boundary_changed`
+//! never read `RestrictionEdge::weights`, `co_change_rate`, or
+//! `revert_rate`. The learned rates feed [`SheafCache::defect`] (in-crate)
+//! and are exported over the wire by the daemon for external consumers;
+//! wiring them into the cascade as a coupling prior is a separate design
+//! decision, not current behavior (bead `ley-line-open-4f9553`). No code
+//! path here computes ker(δ⁰) — see "What this cache actually does" above
+//! for the proxy details and the daemon-wiring bead for the δ⁰-driven
+//! upgrade path.
 //!
 //! ## `on_change` return semantics
 //!

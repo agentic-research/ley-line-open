@@ -8,7 +8,9 @@
 //!
 //! For a pair of regions (a, b) that co-change with probability p:
 //!   - After N observations, the EMA estimate converges to p with error
-//!     O(α^N) where α is the decay factor (default 0.1).
+//!     O((1 − α)^N) where α is the decay factor (default 0.1) — each
+//!     observation's residual decays by the retention factor 1 − α, not
+//!     by α. The N-bound below is the same statement solved for N.
 //!   - The learned weight w(a,b) = co_change_rate(a,b) satisfies:
 //!     |w - p| < ε after N > log(ε) / log(1 - α) observations.
 //!

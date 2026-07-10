@@ -20,6 +20,7 @@ pub mod mcp;
 pub mod observation_schema;
 pub mod ops;
 pub mod session_observation_pass;
+pub mod sheaf_ablation;
 pub mod sheaf_ops;
 pub mod socket;
 #[cfg(feature = "vec")]

@@ -8,6 +8,26 @@
 **Raw logs**: two independent runs of the same harness, byte-identical across the
   135 events each (adversarial re-run gate = 0.00% delta)
 
+## Re-run after the stalks-as-rates fix (bead `ley-line-open-4e30d5`)
+
+**Re-run date**: 2026-07-10, on the P1 fix branch (stalks normalized from raw
+activity counts to rates at `complex_build_pass.rs`).
+
+**Result: 91.02× aggregate over-invalidation ratio, avg sheaf/naive ratio
+1.1%, 0 failures, 0.00% adversarial re-run delta** — statistically identical
+to the original 91.01×. The 0.01× movement and the 134-vs-135 event count come
+from corpus drift (the harness's `git log -30` window slid past new commits on
+main), not from the stalk change.
+
+This invariance is expected, and it is itself informative: the measured emit
+path (`emit_watcher_sheaf_invalidate` → `SheafState::regions_touching_files`)
+computes its region set by **label-prefix matching** against `changed_files`.
+It never reads a stalk value, so no stalk-unit fix can move this number. The
+91× figure validates the labeling scheme's precision; the sheaf *constants*
+(cascade termination, δ⁰ thresholds, router cutoffs) are exercised on the
+`on_change` path, which this study never triggers — see the framing section
+tracked by bead `ley-line-open-50c21d`.
+
 ## Verdict — **LOAD-BEARING**
 
 Sheaf-driven `daemon.sheaf.invalidate` (with the fine-grained diff from PR #146

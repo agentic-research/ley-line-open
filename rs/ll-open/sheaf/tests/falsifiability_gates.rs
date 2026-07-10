@@ -845,7 +845,7 @@ fn reap_no_false_positives_on_unchanged_stalks() {
 #[test]
 fn reap_no_false_negatives_when_stalks_move() {
     // Mutate r1's stalk so the r0↔r1 and r1↔r2 boundaries both shift
-    // beyond DELTA0_EPS_SQUARED. r1 MUST appear in the reclaim set
+    // beyond DELTA0_EPS (norm space). r1 MUST appear in the reclaim set
     // (it's the changed region itself). r0 and r2 SHOULD appear (their
     // incident edges have moved). r3 may or may not appear depending
     // on BFS depth, but it should NOT be excluded if it's within range.

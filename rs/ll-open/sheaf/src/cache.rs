@@ -37,8 +37,8 @@
 //! [`SheafCache::on_change`] returns a list that always contains the
 //! `changed_regions` the caller passed in (the cascade roots), plus any
 //! BFS-reachable neighbors whose boundary projection moved beyond
-//! `DELTA0_EPS_SQUARED` (or whose XOR pre-filter fired, in heuristic-only
-//! mode). The cascade roots appear unconditionally — they are the
+//! `DELTA0_EPS` in norm space (or whose XOR pre-filter fired, in
+//! heuristic-only mode). The cascade roots appear unconditionally — they are the
 //! caller's assertion about what changed, not a measurement — so the
 //! list is never empty for a non-empty `changed_regions` input.
 //!
@@ -73,9 +73,18 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use crate::complex::CellComplex;
 use crate::topology::RegionId;
 
-/// Squared-norm threshold below which δ⁰ output is treated as zero.
-/// Matches `complex::EPS` for the unsquared coboundary check.
-const DELTA0_EPS_SQUARED: f32 = 1e-8;
+/// Norm-space threshold below which δ⁰ movement is treated as zero.
+/// Matches `complex::EPS` (1e-4); the stage-2 check compares
+/// `|√current − √baseline|` against this, one `sqrt` per edge.
+///
+/// The comparison is deliberately in NORM space, not squared-norm space:
+/// `|a² − b²| = |a − b|·(a + b)`, so a squared threshold ε² makes the
+/// effective norm sensitivity `ε²/(2·baseline)` — scale-dependent, and at
+/// O(1) baselines below the f32 ulp (every representable change fires,
+/// i.e. no noise rejection at all). Norm-space comparison keeps the
+/// sensitivity uniform across baseline magnitudes. Bead
+/// `ley-line-open-4f3f6e` (math-friend audit P4).
+const DELTA0_EPS: f32 = 1e-4;
 
 /// A content hash summarizing a region's current state.
 pub trait StalkHash {
@@ -366,8 +375,8 @@ impl<S: StalkHash, V> SheafCache<S, V> {
     /// passed in (the cascade roots — they appear even when their own
     /// boundary is unchanged, because the caller's assertion that the
     /// region changed is taken as input), plus any BFS-reachable neighbors
-    /// whose boundary projection moved beyond `DELTA0_EPS_SQUARED` (or
-    /// whose XOR pre-filter fired, in heuristic-only mode). This is a
+    /// whose boundary projection moved beyond `DELTA0_EPS` in norm space
+    /// (or whose XOR pre-filter fired, in heuristic-only mode). This is a
     /// structural answer about the sheaf section, not a statement about
     /// the local `entries` map: regions are reported even when the
     /// in-process cache has no entry for them. UDS / MCP consumers own
@@ -435,18 +444,20 @@ impl<S: StalkHash, V> SheafCache<S, V> {
     /// [`CellComplex`] is attached. It compares the current
     /// [`CellComplex::edge_violation_squared`] against the baseline snapshot
     /// captured by [`Self::refresh_baseline`]. The edge is "changed" iff the
-    /// squared norm moved by more than `DELTA0_EPS_SQUARED` away from the
-    /// baseline — i.e. the agreement subspace projection of the section
-    /// actually shifted, not just that the absolute norm is non-zero.
-    /// Content changes the restriction map projects away leave the squared
-    /// norm at its baseline value, so the cache holds.
+    /// norm moved by more than `DELTA0_EPS` away from the baseline —
+    /// `|√current − √baseline| > DELTA0_EPS` — i.e. the agreement subspace
+    /// projection of the section actually shifted, not just that the
+    /// absolute norm is non-zero. The comparison is in norm space so the
+    /// tolerance is scale-uniform (see `DELTA0_EPS`). Content changes the
+    /// restriction map projects away leave the norm at its baseline value,
+    /// so the cache holds.
     ///
     /// Without an attached complex, stage 2 is skipped and the XOR pre-filter
     /// IS the answer (preserving prior heuristic behaviour for callers that
     /// have not opted into δ⁰-driven mode). Without a baseline (caller never
     /// called `refresh_baseline`), the check falls back to the prior
-    /// behaviour — "current squared norm exceeds eps²" — which over-evicts
-    /// on initially-non-consistent sections.
+    /// behaviour — "current norm exceeds eps" — which over-evicts on
+    /// initially-non-consistent sections.
     fn check_boundary_changed(&self, a: RegionId, b: RegionId, edge: &RestrictionEdge) -> bool {
         let hash_a = self.stalks.get(&a).map(|s| s.merkle_root());
         let hash_b = self.stalks.get(&b).map(|s| s.merkle_root());
@@ -472,9 +483,9 @@ impl<S: StalkHash, V> SheafCache<S, V> {
             if let Some(current_norm_sq) = current {
                 let key = (a.min(b), a.max(b));
                 if let Some(&baseline) = self.delta_zero_baseline.get(&key) {
-                    return (current_norm_sq - baseline).abs() > DELTA0_EPS_SQUARED;
+                    return (current_norm_sq.sqrt() - baseline.sqrt()).abs() > DELTA0_EPS;
                 }
-                return current_norm_sq > DELTA0_EPS_SQUARED;
+                return current_norm_sq.sqrt() > DELTA0_EPS;
             }
         }
         true
@@ -603,7 +614,7 @@ impl<S: StalkHash, V> SheafCache<S, V> {
                 total_defect += c;
                 let key = (a, b);
                 let baseline = self.delta_zero_baseline.get(&key).copied().unwrap_or(0.0);
-                if (c - baseline).abs() > DELTA0_EPS_SQUARED {
+                if (c.sqrt() - baseline.sqrt()).abs() > DELTA0_EPS {
                     seeds.insert(a);
                     seeds.insert(b);
                 }
@@ -637,7 +648,7 @@ impl<S: StalkHash, V> SheafCache<S, V> {
                 if let Some(c) = current {
                     let key = (region.min(n), region.max(n));
                     let baseline = self.delta_zero_baseline.get(&key).copied().unwrap_or(0.0);
-                    if (c - baseline).abs() > DELTA0_EPS_SQUARED {
+                    if (c.sqrt() - baseline.sqrt()).abs() > DELTA0_EPS {
                         reclaim.insert(n);
                         frontier.push_back((n, depth + 1));
                     }
@@ -746,6 +757,97 @@ mod tests {
         assert!((weights[0] - 1.0).abs() < 1e-6);
         // Dimension 1: high variance → weight << 1.0
         assert!(weights[1] < 0.1);
+    }
+
+    // -----------------------------------------------------------------------
+    // δ⁰ stage-2 tolerance shape (bead ley-line-open-4f3f6e)
+    // -----------------------------------------------------------------------
+
+    /// Build a two-region δ⁰-mode cache with 1-D stalks `[0.0]` / `[1.0]`,
+    /// identity restrictions, and a refreshed baseline (‖δ⁰‖² = 1.0 on the
+    /// single edge).
+    fn order_one_baseline_cache() -> SheafCache<TestStalk, String> {
+        use crate::complex::{CellComplex, RestrictionMap};
+
+        let mut cx = CellComplex::new(1);
+        cx.add_node(0, vec![0.0]);
+        cx.add_node(1, vec![1.0]);
+        cx.add_edge(
+            100,
+            0,
+            1,
+            1,
+            Some("t".into()),
+            RestrictionMap::identity(1),
+            RestrictionMap::identity(1),
+            false,
+        );
+
+        let mut cache: SheafCache<TestStalk, String> = SheafCache::new().with_complex(cx);
+        cache.set_stalk(0, TestStalk(hash_from_byte(1)));
+        cache.set_stalk(1, TestStalk(hash_from_byte(2)));
+        cache.set_restriction(
+            0,
+            1,
+            RestrictionEdge {
+                weights: vec![1.0],
+                boundary_hash: hash_from_byte(1 ^ 2),
+                co_change_rate: 0.5,
+                revert_rate: 0.0,
+            },
+        );
+        cache.put(0, "a".into());
+        cache.put(1, "b".into());
+        cache.refresh_baseline();
+        cache
+    }
+
+    /// P4 falsification (bead ley-line-open-4f3f6e): the stage-2 tolerance
+    /// must be scale-uniform in NORM space. |a² − b²| = |a − b|·(a + b), so
+    /// comparing the squared norms against a squared epsilon makes the
+    /// effective norm sensitivity ε²/(2·baseline) — at an O(1) baseline
+    /// that is below the f32 ulp and EVERY representable wiggle fires,
+    /// i.e. no noise rejection at all.
+    ///
+    /// Here: Δ‖δ⁰‖ = 1e-5, well under the norm-space EPS = 1e-4, so the
+    /// edge must be treated as unchanged. The old squared check saw
+    /// Δ(‖δ⁰‖²) ≈ 2e-5 > 1e-8 and invalidated.
+    #[test]
+    fn delta0_noise_at_order_one_baseline_does_not_invalidate() {
+        let mut cache = order_one_baseline_cache();
+
+        // Norm-space noise: 1.0 → 1.00001 (Δnorm = 1e-5 < 1e-4).
+        cache.set_stalk_value(1, vec![1.00001]);
+        // Content hash moved, so the XOR pre-filter fires and stage 2
+        // is the deciding check.
+        cache.set_stalk(1, TestStalk(hash_from_byte(99)));
+
+        let invalidated = cache.on_change(&[1]);
+        assert!(
+            !invalidated.contains(&0),
+            "sub-EPS norm movement (1e-5 < 1e-4) must not cascade; got {invalidated:?}",
+        );
+        assert!(
+            cache.get(&0).is_some(),
+            "region 0's entry must survive a sub-tolerance wiggle on the shared edge",
+        );
+    }
+
+    /// Companion sanity: a genuine shift (Δ‖δ⁰‖ = 1e-2 > EPS) at the same
+    /// O(1) baseline still cascades. Holds before and after the shape fix.
+    #[test]
+    fn delta0_genuine_shift_at_order_one_baseline_invalidates() {
+        let mut cache = order_one_baseline_cache();
+
+        cache.set_stalk_value(1, vec![1.01]);
+        cache.set_stalk(1, TestStalk(hash_from_byte(99)));
+
+        let invalidated = cache.on_change(&[1]);
+        assert!(
+            invalidated.contains(&0),
+            "super-EPS norm movement (1e-2 > 1e-4) must cascade; got {invalidated:?}",
+        );
+        assert!(cache.get(&0).is_none());
     }
 
     // -----------------------------------------------------------------------

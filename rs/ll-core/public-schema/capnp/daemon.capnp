@@ -564,7 +564,7 @@ struct SheafReapRequest {
 # safely evict?". Structural, payload-blind: this daemon never sees the
 # consumer's cached values, only the topology.
 struct SheafReapResponse {
-  # Region IDs whose boundary signal has moved beyond DELTA0_EPS_SQUARED
+  # Region IDs whose boundary signal has moved beyond DELTA0_EPS (norm space)
   # since the last baseline refresh, plus their bounded-radius BFS
   # expansion (same depth bound as `on_change`'s cascade). Sorted
   # ascending; deduplicated.

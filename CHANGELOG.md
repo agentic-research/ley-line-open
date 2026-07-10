@@ -10,9 +10,34 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
-### Breaking
+## [0.7.1] — 2026-07-10
 
-- `CellComplex::h0_dimension` now returns `Option<usize>` instead of `usize`. `None` means the active system exceeded `MAX_DENSE_ELEMENTS` and the exact SVD was refused — previously this case returned `0`, which reads as "no globally consistent section exists" (a semantic wrong answer, not a resource condition). Also fixes a sign bug: the active-row filter is now the symmetric `|δ⁰ᵢ| ≤ EPS` (matching `detect_violations`), so `dim H⁰` is invariant under edge-endpoint orientation. Bead `ley-line-open-4e8a8f` (math-friend audit P2).
+**Sheaf correctness — math-friend audit fixes + 91× reframing.**
+
+Patch release for correctness bugs surfaced by a theoretical-foundations audit of the sheaf machinery. Three real bugs shipped fixes (orientation-variant H⁰, silent-stale-serve at cascade diameter > 3, δ⁰-threshold unit error), plus rate-normalization root-cause, doc drift cleanup, id-space partition assertions, and guard-quantity corrections. All fixes come with adversarial regression tests that were verified failing pre-fix.
+
+Wire format unchanged — patch bump. Consumers get more accurate invalidation sets and orientation-invariant H⁰ dimension without any client-side changes required.
+
+### Breaking (internal Rust API)
+
+- **`CellComplex::h0_dimension` now returns `Option<usize>` instead of `usize`.** `None` means the active system exceeded `MAX_DENSE_ELEMENTS` and the exact SVD was refused — previously this case returned `0`, which reads as "no globally consistent section exists" (a semantic wrong answer, not a resource condition). Also fixes a sign bug: the active-row filter is now the symmetric `|δ⁰ᵢ| ≤ EPS` (matching `detect_violations`), so `dim H⁰` is invariant under edge-endpoint orientation. Bead `ley-line-open-4e8a8f` (P2); PR #170. External Rust consumers of `leyline-sheaf::complex::CellComplex::h0_dimension` must handle the `Option` — the only known consumer is ley-line (private) which pins by SHA.
+
+### Changed
+
+- **δ⁰-mode cascade runs to per-edge fixed point** (was hardcoded depth-3 cap). Under-invalidation for region graphs of diameter > 3 fixed; mache's Louvain topologies with hundreds of regions now propagate correctly. Instrumented safety-valve budget (default `usize::MAX`, counter fires on truncation). Bead `ley-line-open-4eef8d` (P3); PR #172.
+- **δ⁰ threshold moved to norm space** — was comparing `|δ⁰²_current − δ⁰²_baseline|` to `1e-8`, which is not the squared version of `|δ⁰| > ε` (`|a²−b²| = |a−b|·(a+b)`, scale-dependent). Now compares `|√current − √baseline| > 1e-4` — scale-uniform. Bead `ley-line-open-4f3f6e` (P4); PR #171.
+- **Sheaf stalks store token-activity rates, not raw counts** — `complex_build_pass.rs::build_complex` now normalizes activity by observation count so stalks are in `[0,1]` per spec. Absolute thresholds now have a defined regime instead of degenerating to zero/nonzero tests under integer-count inputs. Bead `ley-line-open-4e30d5` (P1); PR #173.
+
+### Fixed
+
+- **Id-space partition asserted** — `EDGE_ID_BASE = 1_000_000` was unasserted; silent map-key collision at ≥1M unique tokens. `add_node` / `add_edge` now panic on out-of-range ids. `set_topology` (wire op) was allocating edge ids from `100` against arbitrary wire region ids — worse-than-audited case caught during fixes — unified on `EDGE_ID_BASE`. Similar `AGREEMENT_EDGE_BASE = 1_000` partition guarded in `ops.rs`. Bead `ley-line-open-4fece1` (P6); PR #175.
+- **`assert_cochain_complex` silent-skip replaced with warn** — was silently `return`ing above `MAX_DENSE_ELEMENTS = 1e7`, so the δ¹∘δ⁰ = 0 axiom stopped being checked for large complexes. Now logs at warn when skipping. Bead `ley-line-open-504341` (P7a); PR #175.
+- **`NEIGHBORHOOD_MAX_DEPTH` guard replaced** — hop cap doesn't bound response size on co-occurrence graphs (radius-1 balls can be O(V) because a k-mention observation creates a k-clique). Replaced with `NEIGHBORHOOD_MAX_CELLS = 1_000` bounding visited-cell count + `truncated` response field. Bead `ley-line-open-504341` (P7b); PR #175.
+
+### Documentation
+
+- **91× ablation reframing** — `docs/research/sheaf-ablation-study.md` clarifies that the 91× over-invalidation ratio validates the **labeling scheme** (label-prefix path in `regions_touching_files`), NOT the sheaf constants under the cascade / δ⁰ threshold path. The measurement path never invokes `on_change`, never evaluates a δ⁰ threshold. Ablation re-run post P1 (rate normalization): 91.02× ≈ 91.01× original — empirically confirms the reframing (path never reads a stalk). Bead `ley-line-open-50c21d`; PR #175.
+- **`cache.rs` learned-weight doc drift corrected** — was claiming co-change-learned edge weights weight the cascade frontier; actual behavior is that weights are exported over the wire for external consumers but NOT used in cascade. Doc updated to match code. Also `learn.rs` typo: `O(α^N)` → `O((1−α)^N)`. Bead `ley-line-open-4f9553` (P5); PR #175.
 
 ## [0.7.0] — 2026-07-09
 

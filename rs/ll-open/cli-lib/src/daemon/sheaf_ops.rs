@@ -675,8 +675,9 @@ pub fn op_sheaf_learned_weights(state: &SheafState) -> Result<String> {
 /// keys and re-fetches as needed.
 ///
 /// Companion to `sheaf_invalidate`: that op acts on caller-asserted
-/// changes; reap is a pure observation. Same depth bound (radius 3
-/// BFS), same per-edge norm-space `DELTA0_EPS` tolerance, so the two stay
+/// changes; reap is a pure observation. Same termination policy (BFS
+/// to the per-edge convergence gate's fixed point — no depth cap in δ⁰
+/// mode), same per-edge norm-space `DELTA0_EPS` tolerance, so the two stay
 /// internally consistent — a region the cascade would evict on
 /// assertion is also a region the reaper would evict on observation,
 /// given matching topology + stalks.

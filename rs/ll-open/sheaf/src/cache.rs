@@ -3,7 +3,8 @@
 //! ## What this cache actually does
 //!
 //! Invalidation is driven by **XOR of endpoint Merkle roots** compared against
-//! a stored boundary hash, plus a **bounded-depth restriction-graph BFS**. This
+//! a stored boundary hash, plus a **restriction-graph BFS** (depth-bounded in
+//! heuristic mode; gate-terminated in δ⁰ mode). This
 //! is a fast structural proxy, NOT the Čech coboundary operator δ⁰. In
 //! particular:
 //!
@@ -12,8 +13,13 @@
 //!   stored hash. It does **not** apply the restriction map, so it cannot
 //!   distinguish content changes that fall outside the agreement subspace
 //!   from genuine sheaf disagreements.
-//! - The cascade depth is a configurable heuristic budget, not a sheaf-derived
-//!   reach. See [`SheafCache`] field documentation.
+//! - In heuristic mode the cascade is bounded by the hardcoded
+//!   `HEURISTIC_CASCADE_DEPTH` (3 hops) — a blast-radius heuristic, not a
+//!   sheaf-derived reach. In δ⁰ mode (complex attached) the cascade runs to
+//!   the per-edge convergence gate's fixed point with no depth cap; a
+//!   configurable safety-valve budget ([`SheafCache::set_cascade_budget`],
+//!   default unbounded) can truncate it, and every truncation with pending
+//!   work is counted in [`SheafCache::cascade_truncations`].
 //!
 //! For a real δ⁰-driven invalidation contract — "evict iff the new section
 //! sits outside ker(δ⁰)" — wire through [`crate::complex::CellComplex::detect_violations`]
@@ -69,9 +75,24 @@
 //!
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::complex::CellComplex;
 use crate::topology::RegionId;
+
+/// Heuristic-mode (no attached complex) cascade depth bound.
+///
+/// A blast-radius heuristic, NOT a sheaf invariant — no sheaf quantity
+/// names 3. The XOR gate cannot distinguish projected-away content
+/// changes from genuine disagreements, so heuristic mode trades cascade
+/// completeness for bounded work.
+///
+/// δ⁰ mode does NOT use this: there the per-edge convergence gate is the
+/// mathematically correct termination criterion, and the BFS runs to its
+/// fixed point (see [`SheafCache::on_change`]). One constant serves both
+/// former copies (`on_change` + `reap`) so they cannot silently drift
+/// (bead `ley-line-open-4eef8d`).
+const HEURISTIC_CASCADE_DEPTH: u32 = 3;
 
 /// Norm-space threshold below which δ⁰ movement is treated as zero.
 /// Matches `complex::EPS` (1e-4); the stage-2 check compares
@@ -146,6 +167,20 @@ pub struct SheafCache<S: StalkHash, V> {
     /// `(min, max)` pair to dedupe the undirected edges stored in both
     /// directions in `restrictions`.
     delta_zero_baseline: BTreeMap<(RegionId, RegionId), f32>,
+    /// Safety-valve budget for the δ⁰-mode cascade BFS, counted in node
+    /// expansions. NOT a correctness mechanism: δ⁰-mode termination comes
+    /// from the per-edge convergence gate plus the `visited` set (worst
+    /// case O(V+E)). Default `usize::MAX` — effectively unbounded. Lower
+    /// it only as an emergency brake, and watch
+    /// [`Self::cascade_truncations`] for the falsifiable signal that the
+    /// budget ever bound. Configurable via [`Self::set_cascade_budget`].
+    cascade_budget: usize,
+    /// Number of cascades (`on_change` or `reap`) truncated by
+    /// `cascade_budget` while the frontier was still non-empty. Any
+    /// non-zero value means an invalidation answer was incomplete —
+    /// stale entries may be served as valid. Atomic so the `&self`
+    /// reaper can record truncations too.
+    cascade_truncations: AtomicU64,
 }
 
 impl<S: StalkHash, V> SheafCache<S, V> {
@@ -157,7 +192,25 @@ impl<S: StalkHash, V> SheafCache<S, V> {
             generation: 0,
             complex: None,
             delta_zero_baseline: BTreeMap::new(),
+            cascade_budget: usize::MAX,
+            cascade_truncations: AtomicU64::new(0),
         }
+    }
+
+    /// Configure the δ⁰-mode cascade safety-valve budget (node expansions
+    /// per cascade). See the field doc: this is an emergency brake, not a
+    /// correctness bound — the δ⁰ cascade's termination criterion is the
+    /// per-edge convergence gate's fixed point. Heuristic mode ignores
+    /// this (it uses [`HEURISTIC_CASCADE_DEPTH`]).
+    pub fn set_cascade_budget(&mut self, budget: usize) {
+        self.cascade_budget = budget;
+    }
+
+    /// Number of cascades truncated by [`Self::set_cascade_budget`] while
+    /// work remained. Non-zero means at least one invalidation answer was
+    /// incomplete; alert on this before trusting cache validity.
+    pub fn cascade_truncations(&self) -> u64 {
+        self.cascade_truncations.load(Ordering::Relaxed)
     }
 
     /// Snapshot the current per-edge `‖δ⁰‖²` as the baseline. Subsequent
@@ -368,8 +421,23 @@ impl<S: StalkHash, V> SheafCache<S, V> {
     }
 
     /// Handle a change to one or more regions. Propagates invalidation
-    /// breadth-first through restriction edges, bounded by `max_cascade_budget`
-    /// (heuristic depth, not a sheaf invariant — see module docs).
+    /// breadth-first through restriction edges.
+    ///
+    /// Termination:
+    /// - **δ⁰ mode** (complex attached): the BFS runs to the fixed point of
+    ///   the per-edge convergence gate — an edge that moved keeps the
+    ///   cascade going; an edge at its baseline stops it. This IS the
+    ///   mathematically correct criterion; no depth cap applies
+    ///   (bead `ley-line-open-4eef8d`). Termination is guaranteed by the
+    ///   `visited` set — worst case O(V+E). A configurable safety-valve
+    ///   budget ([`Self::set_cascade_budget`], default unbounded) can
+    ///   truncate a runaway cascade; truncations are counted in
+    ///   [`Self::cascade_truncations`] because a truncated answer is
+    ///   incomplete.
+    /// - **Heuristic mode** (no complex): bounded by
+    ///   [`HEURISTIC_CASCADE_DEPTH`] hops. The XOR gate over-fires on
+    ///   projected-away content changes, so the depth bound trades
+    ///   completeness for bounded work. A heuristic, not a sheaf invariant.
     ///
     /// Returns a list that always contains the `changed_regions` the caller
     /// passed in (the cascade roots — they appear even when their own
@@ -394,16 +462,27 @@ impl<S: StalkHash, V> SheafCache<S, V> {
             invalidated.push(region);
         }
 
-        let max_cascade_budget: u32 = 3;
+        let delta_zero_mode = self.complex.is_some();
         // VecDeque + pop_front gives genuine BFS; the prior Vec::pop produced
         // DFS, which still respects the depth bound but visits nodes in a
         // hash-seed-dependent order.
         let mut frontier: VecDeque<(RegionId, u32)> =
             changed_regions.iter().map(|&r| (r, 0)).collect();
         let mut visited: BTreeSet<RegionId> = changed_regions.iter().copied().collect();
+        let mut expansions: usize = 0;
 
         while let Some((region, depth)) = frontier.pop_front() {
-            if depth >= max_cascade_budget {
+            if delta_zero_mode {
+                // δ⁰ mode: no depth cap — run to the per-edge gate's fixed
+                // point. The safety-valve budget is the only bound, and
+                // hitting it with pending work is an incomplete answer:
+                // record it so the truncation is observable, never silent.
+                if expansions >= self.cascade_budget {
+                    self.cascade_truncations.fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+                expansions += 1;
+            } else if depth >= HEURISTIC_CASCADE_DEPTH {
                 continue;
             }
 
@@ -572,7 +651,8 @@ impl<S: StalkHash, V> SheafCache<S, V> {
     /// `reap` is a pure observation of the current sheaf section: it
     /// asks "given today's stalks vs the last baseline, which regions'
     /// boundary signal has moved?" and returns that set plus its
-    /// bounded-radius BFS expansion through the restriction graph.
+    /// gate-terminated BFS expansion through the restriction graph
+    /// (same fixed-point policy as `on_change` in δ⁰ mode).
     ///
     /// Returns `(reclaimable, defect_snapshot)`:
     /// - `reclaimable` — sorted list of region IDs whose downstream
@@ -621,19 +701,26 @@ impl<S: StalkHash, V> SheafCache<S, V> {
             }
         }
 
-        // Phase 2: BFS expansion. Same depth bound as `on_change` so the
-        // two stay consistent — a region the cascade would evict on
+        // Phase 2: BFS expansion. Same termination policy as `on_change`
+        // in δ⁰ mode (reap only runs in δ⁰ mode): the per-edge gate's
+        // fixed point, no depth cap, shared safety-valve budget — so the
+        // two stay consistent. A region the cascade would evict on
         // assertion is also a region the reaper would evict on
-        // observation, given matching topology + stalks.
-        let max_radius: u32 = 3;
+        // observation, given matching topology + stalks (bead
+        // `ley-line-open-4eef8d`).
         let mut reclaim = seeds.clone();
-        let mut frontier: VecDeque<(RegionId, u32)> = seeds.iter().map(|&r| (r, 0)).collect();
+        let mut frontier: VecDeque<RegionId> = seeds.iter().copied().collect();
         let mut visited: BTreeSet<RegionId> = seeds.clone();
+        let mut expansions: usize = 0;
 
-        while let Some((region, depth)) = frontier.pop_front() {
-            if depth >= max_radius {
-                continue;
+        while let Some(region) = frontier.pop_front() {
+            if expansions >= self.cascade_budget {
+                // Non-empty frontier at truncation: incomplete answer,
+                // recorded so the budget's bite is observable.
+                self.cascade_truncations.fetch_add(1, Ordering::Relaxed);
+                break;
             }
+            expansions += 1;
             for n in self.neighbours(region) {
                 if !visited.insert(n) {
                     continue;
@@ -650,7 +737,7 @@ impl<S: StalkHash, V> SheafCache<S, V> {
                     let baseline = self.delta_zero_baseline.get(&key).copied().unwrap_or(0.0);
                     if (c.sqrt() - baseline.sqrt()).abs() > DELTA0_EPS {
                         reclaim.insert(n);
-                        frontier.push_back((n, depth + 1));
+                        frontier.push_back(n);
                     }
                 }
             }
@@ -851,6 +938,100 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // δ⁰-mode cascade fixed point (bead ley-line-open-4eef8d)
+    // -----------------------------------------------------------------------
+
+    /// Build an n-node chain 0–1–…–(n−1) in δ⁰ mode: 1-D stalks all `[0.0]`,
+    /// identity restrictions, every region cached, baseline refreshed.
+    fn delta_zero_chain_cache(n: u32) -> SheafCache<TestStalk, String> {
+        use crate::complex::{CellComplex, RestrictionMap};
+
+        let mut cx = CellComplex::new(1);
+        for i in 0..n {
+            cx.add_node(i, vec![0.0]);
+        }
+        for i in 0..(n - 1) {
+            cx.add_edge(
+                1_000_000 + i,
+                i,
+                i + 1,
+                1,
+                Some("t".into()),
+                RestrictionMap::identity(1),
+                RestrictionMap::identity(1),
+                false,
+            );
+        }
+
+        let mut cache: SheafCache<TestStalk, String> = SheafCache::new().with_complex(cx);
+        for i in 0..n {
+            cache.set_stalk(i, TestStalk(hash_from_byte(i as u8)));
+            cache.put(i, format!("v{i}"));
+        }
+        for i in 0..(n - 1) {
+            let mut boundary = [0u8; 32];
+            let (ha, hb) = (hash_from_byte(i as u8), hash_from_byte((i + 1) as u8));
+            for k in 0..32 {
+                boundary[k] = ha[k] ^ hb[k];
+            }
+            cache.set_restriction(
+                i,
+                i + 1,
+                RestrictionEdge {
+                    weights: vec![1.0],
+                    boundary_hash: boundary,
+                    co_change_rate: 0.5,
+                    revert_rate: 0.0,
+                },
+            );
+        }
+        cache.refresh_baseline();
+        cache
+    }
+
+    /// Move every stalk in the chain: fresh f32 values (all edge
+    /// baselines shift far beyond tolerance) and fresh content hashes
+    /// (the XOR pre-filter fires on every edge). Hash bytes are `i² + 5`
+    /// rather than `i + shift`: a common additive shift cancels in the
+    /// pairwise XOR (both endpoints move identically), leaving the
+    /// pre-filter blind; the quadratic spacing makes every adjacent XOR
+    /// differ from the seeded `i ⊕ (i+1)` boundary.
+    fn move_every_stalk(cache: &mut SheafCache<TestStalk, String>, n: u32) {
+        for i in 0..n {
+            cache.set_stalk_value(i, vec![(i as f32 + 1.0) * 10.0]);
+            cache.set_stalk(i, TestStalk(hash_from_byte((i * i + 5) as u8)));
+        }
+    }
+
+    /// F3 falsification (bead ley-line-open-4eef8d): in δ⁰ mode the
+    /// per-edge convergence gate IS the termination criterion; truncating
+    /// the BFS at a fixed depth under-invalidates whenever a genuinely
+    /// moved defect chain sits more than that many hops from the cascade
+    /// root. Chain 0–…–6, every edge's agreement provably moved,
+    /// `on_change(&[0])`: sheaf semantics demands invalidation of all of
+    /// 1..=6. A depth-3 cap stops at region 3 and then SERVES REGION 5'S
+    /// STALE ENTRY AS VALID.
+    #[test]
+    fn delta_zero_cascade_runs_to_fixed_point_beyond_depth_three() {
+        let mut cache = delta_zero_chain_cache(7);
+        move_every_stalk(&mut cache, 7);
+
+        let invalidated = cache.on_change(&[0]);
+        for r in 1..7u32 {
+            assert!(
+                invalidated.contains(&r),
+                "δ⁰-mode cascade must reach the per-edge gate's fixed point; \
+                 region {r} (graph distance {r} from root) missing from {invalidated:?}",
+            );
+        }
+        assert!(
+            cache.get(&5).is_none(),
+            "stale-serve smoking gun: region 5's entry is backed by a stalk \
+             whose agreement provably moved, yet it is served as valid",
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Integration: RestrictionGraph drives SheafCache invalidation
     // -----------------------------------------------------------------------
 
@@ -906,20 +1087,70 @@ mod tests {
         assert!(invalidated.len() >= 3);
     }
 
-    /// Verify that SheafCache BFS depth matches RestrictionGraph BFS depth
-    /// for the same linear topology.
+    /// Heuristic-mode chain, single root moved: the XOR gate is the
+    /// PRIMARY limiter, not the depth cap. Only region 0's stalk changed,
+    /// so edge (0,1) fires but (1,2) does not — the cascade stops at
+    /// region 1 well before any depth bound is consulted.
+    ///
+    /// This replaces `cache_cascade_depth_matches_graph_bfs`, whose intent
+    /// (depth-3 truncation as a correctness property) was wrong: in δ⁰
+    /// mode the correct termination is the per-edge gate's fixed point
+    /// (see `delta_zero_cascade_runs_to_fixed_point_beyond_depth_three`),
+    /// and even in heuristic mode the original fixture never exercised
+    /// the cap — the gate stopped the walk at depth 1.
     #[test]
-    fn cache_cascade_depth_matches_graph_bfs() {
+    fn heuristic_cascade_gate_self_limits_on_chain() {
+        // Linear chain: 0 -- 1 -- 2 -- 3 -- 4, heuristic mode (no complex).
+        let mut cache: SheafCache<TestStalk, String> = SheafCache::new();
+        for i in 0..5u32 {
+            cache.set_stalk(i, TestStalk(hash_from_byte(i as u8)));
+            cache.put(i, format!("v{i}"));
+        }
+        for i in 0..4u32 {
+            let boundary = hash_from_byte(i as u8 ^ (i + 1) as u8);
+            cache.set_restriction(
+                i,
+                i + 1,
+                RestrictionEdge {
+                    weights: vec![1.0],
+                    boundary_hash: boundary,
+                    co_change_rate: 0.5,
+                    revert_rate: 0.0,
+                },
+            );
+        }
+
+        cache.set_stalk(0, TestStalk(hash_from_byte(0xFF)));
+        let invalidated = cache.on_change(&[0]);
+        assert!(invalidated.contains(&0));
+        assert!(
+            invalidated.contains(&1),
+            "edge (0,1)'s boundary moved — region 1 must be invalidated",
+        );
+        assert!(
+            !invalidated.contains(&2),
+            "edge (1,2)'s boundary is unchanged — the gate must stop the \
+             cascade at region 1; got {invalidated:?}",
+        );
+    }
+
+    /// Heuristic-mode blast-radius bound: when EVERY edge's boundary
+    /// moved (worst case for the XOR gate), the hardcoded
+    /// `HEURISTIC_CASCADE_DEPTH = 3` bounds the walk. This is a
+    /// bounded-work heuristic, not a sheaf invariant — the same scenario
+    /// in δ⁰ mode runs to the gate's fixed point instead.
+    #[test]
+    fn heuristic_cascade_depth_bounds_blast_radius() {
         use crate::topology::RestrictionGraph;
 
-        // Linear chain: 0 -- 1 -- 2 -- 3 -- 4
+        // Linear chain 0 -- … -- 6, heuristic mode.
         let mut graph = RestrictionGraph::new();
-        for i in 0..4u32 {
+        for i in 0..6u32 {
             graph.add_edge(i, i + 1, None);
         }
 
         let mut cache: SheafCache<TestStalk, String> = SheafCache::new();
-        for i in 0..5u32 {
+        for i in 0..7u32 {
             cache.set_stalk(i, TestStalk(hash_from_byte(i as u8)));
             cache.put(i, format!("v{i}"));
         }
@@ -937,21 +1168,54 @@ mod tests {
             );
         }
 
-        // Graph BFS from 0, depth 3: should reach 0,1,2,3 (not 4)
-        let bfs_reached = graph.bfs(0, 3);
-        assert!(bfs_reached.contains(&0));
-        assert!(bfs_reached.contains(&3));
-        assert!(!bfs_reached.contains(&4));
+        // Move every stalk hash (quadratic spacing so no pairwise XOR
+        // accidentally matches its seeded boundary) — every edge fires.
+        for i in 0..7u32 {
+            cache.set_stalk(i, TestStalk(hash_from_byte((i * i + 5) as u8)));
+        }
 
-        // Cache on_change from 0: bounded cascade depth is 3 (hardcoded),
-        // so it should NOT reach region 4 (which is 4 hops away)
-        cache.set_stalk(0, TestStalk(hash_from_byte(0xFF)));
         let invalidated = cache.on_change(&[0]);
-        assert!(invalidated.contains(&0));
-        // Region 4 should NOT be invalidated (beyond cascade depth)
+        let graph_reach = graph.bfs(0, 3);
+        for r in 0..7u32 {
+            assert_eq!(
+                invalidated.contains(&r),
+                graph_reach.contains(&r),
+                "heuristic cascade must match a depth-3 graph BFS when \
+                 every edge fires; disagreement at region {r} \
+                 (cache: {invalidated:?}, graph: {graph_reach:?})",
+            );
+        }
+    }
+
+    /// The δ⁰-mode safety-valve budget must be INSTRUMENTED: truncating
+    /// with a non-empty frontier is an incomplete answer, and
+    /// `cascade_truncations` is the falsifiable signal that the budget
+    /// ever bound. Silent truncation is exactly the bug class the
+    /// fixed-point fix removed.
+    #[test]
+    fn cascade_budget_truncation_is_counted() {
+        let mut cache = delta_zero_chain_cache(7);
+        cache.set_cascade_budget(2);
+        move_every_stalk(&mut cache, 7);
+
+        assert_eq!(cache.cascade_truncations(), 0);
+        let invalidated = cache.on_change(&[0]);
         assert!(
-            !invalidated.contains(&4),
-            "region 4 should be beyond cascade depth 3"
+            cache.cascade_truncations() >= 1,
+            "budget-bound cascade with pending frontier must be counted",
         );
+        assert!(
+            !invalidated.contains(&6),
+            "budget 2 cannot have reached region 6 — if it did, the \
+             truncation accounting is measuring the wrong thing",
+        );
+
+        // Unbounded default: same scenario reaches the fixed point and
+        // records no truncation.
+        let mut cache = delta_zero_chain_cache(7);
+        move_every_stalk(&mut cache, 7);
+        let invalidated = cache.on_change(&[0]);
+        assert!(invalidated.contains(&6));
+        assert_eq!(cache.cascade_truncations(), 0);
     }
 }

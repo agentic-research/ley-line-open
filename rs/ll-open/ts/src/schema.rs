@@ -451,6 +451,136 @@ pub fn create_source_blobs_table(conn: &Connection) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Analysis-substrate: _cfg + _cfg_edge (decade `dataflow-substrate` T1.b2)
+// bead `ley-line-open-46d46b`
+// ---------------------------------------------------------------------------
+//
+// Intra-procedural control-flow-graph tables the CFG builder (T1.b3) emits.
+// Additive to the existing schema — no consumer read yet in this bead; that
+// lands with the builder in T1.b3.
+//
+// Keying discipline: `_cfg.node_hash` REFERENCES `node_content(node_hash)`
+// (ADR-0027 merkle-AST IR), so a CFG row without a corresponding subtree in
+// the content-addressed store is a loud FK error under
+// `PRAGMA foreign_keys = ON`. `_cfg_edge` carries a composite FK to
+// `_cfg(node_hash, block_id)` for the same reason: an edge to a
+// non-existent block is caught at insert time, not at query.
+//
+// `block_kind` is a κ-canonical CFG kind — one of the 10 entries in
+// `crate::languages::CFG_CANONICAL_KINDS` (T1.b1, bead `46aef2`). The DDL
+// doesn't enforce membership via CHECK (SQLite CHECK constraints would need
+// listing all 10 literals inline, which drifts from the Rust-side const);
+// the builder (T1.b3) is the invariant-holder here, and a pin test in T1.b3
+// asserts every emitted `block_kind` lives in the const array.
+//
+// `complexity` is stamped by T1.b4 (McCabe cyclomatic complexity as a
+// materialized `_cfg.complexity` column). Nullable so T1.b3 can land the
+// builder before T1.b4 wires the computation.
+
+/// DDL for `_cfg` — table only, no indexes. One row per basic block in the
+/// intra-procedural CFG of a function-body subtree, keyed on
+/// `(node_hash, block_id)`. `node_hash` is the function-body subtree's
+/// merkle address (ADR-0027); `block_id` is a walk-local index. Two
+/// byte-identical function bodies share ALL their `_cfg` rows — dedupes
+/// cross-file for the same reason `node_content` does. `source_id` is
+/// denormalized alongside for cheap "CFG blocks in this file" queries
+/// (see `idx_cfg_source`).
+pub const CFG_TABLE_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS _cfg (
+    node_hash BLOB NOT NULL REFERENCES node_content(node_hash),
+    source_id TEXT NOT NULL,
+    block_id INTEGER NOT NULL,
+    block_kind TEXT NOT NULL,
+    entry_offset INTEGER NOT NULL,
+    exit_offset INTEGER NOT NULL,
+    complexity INTEGER,
+    PRIMARY KEY (node_hash, block_id)
+);";
+
+/// DDL for `_cfg_edge` — table only, no indexes. One row per directed edge
+/// between two basic blocks. FK is composite (endpoints of the edge each
+/// point at a `_cfg(node_hash, block_id)` row). `edge_kind` is a free-form
+/// tag the builder stamps (e.g. `fallthrough`, `taken`, `not_taken`,
+/// `back`, `throw`) — not κ-canonical in this bead; the builder decides
+/// the closed set once it lands (T1.b3).
+pub const CFG_EDGE_TABLE_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS _cfg_edge (
+    from_node_hash BLOB NOT NULL,
+    from_block_id INTEGER NOT NULL,
+    to_node_hash BLOB NOT NULL,
+    to_block_id INTEGER NOT NULL,
+    edge_kind TEXT NOT NULL,
+    FOREIGN KEY (from_node_hash, from_block_id) REFERENCES _cfg(node_hash, block_id),
+    FOREIGN KEY (to_node_hash, to_block_id) REFERENCES _cfg(node_hash, block_id)
+);";
+
+/// DDL for the `_cfg` + `_cfg_edge` indexes — deferred post-COMMIT for
+/// bulk-load, matching the existing schema pattern. Successor lookup
+/// (`(from_node_hash, from_block_id)`) is the load-bearing traversal for
+/// T3 taint fixpoint (`iterate` over successors); predecessor lookup
+/// (`(to_node_hash, to_block_id)`) is needed for T2 dominance/phi
+/// placement. `_cfg.source_id` for "give me all CFG blocks in this file"
+/// smell-rule queries.
+pub const CFG_INDEXES_DDL: &str = "\
+CREATE INDEX IF NOT EXISTS idx_cfg_source ON _cfg(source_id);
+CREATE INDEX IF NOT EXISTS idx_cfg_edge_from ON _cfg_edge(from_node_hash, from_block_id);
+CREATE INDEX IF NOT EXISTS idx_cfg_edge_to ON _cfg_edge(to_node_hash, to_block_id);";
+
+/// Combined `_cfg` + `_cfg_edge` table + index DDL. Preserves the
+/// pre-split contract offered by the sibling `AST_DDL`, `REFS_DDL`, etc.
+pub const CFG_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS _cfg (
+    node_hash BLOB NOT NULL REFERENCES node_content(node_hash),
+    source_id TEXT NOT NULL,
+    block_id INTEGER NOT NULL,
+    block_kind TEXT NOT NULL,
+    entry_offset INTEGER NOT NULL,
+    exit_offset INTEGER NOT NULL,
+    complexity INTEGER,
+    PRIMARY KEY (node_hash, block_id)
+);
+CREATE TABLE IF NOT EXISTS _cfg_edge (
+    from_node_hash BLOB NOT NULL,
+    from_block_id INTEGER NOT NULL,
+    to_node_hash BLOB NOT NULL,
+    to_block_id INTEGER NOT NULL,
+    edge_kind TEXT NOT NULL,
+    FOREIGN KEY (from_node_hash, from_block_id) REFERENCES _cfg(node_hash, block_id),
+    FOREIGN KEY (to_node_hash, to_block_id) REFERENCES _cfg(node_hash, block_id)
+);
+CREATE INDEX IF NOT EXISTS idx_cfg_source ON _cfg(source_id);
+CREATE INDEX IF NOT EXISTS idx_cfg_edge_from ON _cfg_edge(from_node_hash, from_block_id);
+CREATE INDEX IF NOT EXISTS idx_cfg_edge_to ON _cfg_edge(to_node_hash, to_block_id);";
+
+/// Create the `_cfg` + `_cfg_edge` tables (idempotent), no indexes.
+/// Pair with [`create_cfg_indexes`] post-`COMMIT` on bulk-load paths.
+///
+/// Depends on `node_content` (ADR-0027 merkle-AST IR) existing on the
+/// same connection — the FK `_cfg.node_hash REFERENCES node_content` errors
+/// at CREATE TABLE time if the target is missing. Call after
+/// [`create_ir_tables`].
+pub fn create_cfg_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(CFG_TABLE_DDL)?;
+    conn.execute_batch(CFG_EDGE_TABLE_DDL)?;
+    Ok(())
+}
+
+/// Create `_cfg` + `_cfg_edge` indexes (idempotent). Deferred
+/// post-COMMIT for bulk-load per the existing pattern
+/// ([`create_ast_indexes`], [`create_refs_indexes`]).
+pub fn create_cfg_indexes(conn: &Connection) -> Result<()> {
+    conn.execute_batch(CFG_INDEXES_DDL)?;
+    Ok(())
+}
+
+/// Create `_cfg`, `_cfg_edge`, and their indexes (idempotent). For
+/// callers that don't need the deferred-index split.
+pub fn create_cfg_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(CFG_DDL)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // File-index & meta tables (incremental reparse)
 // ---------------------------------------------------------------------------
 
@@ -1141,6 +1271,247 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
             .unwrap();
         assert_eq!(remaining, 1, "only root node should remain");
+    }
+
+    // ---------------------------------------------------------------------
+    // T1.b2 — _cfg + _cfg_edge schema DDL (bead `ley-line-open-46d46b`)
+    // ---------------------------------------------------------------------
+
+    /// Insert a `node_content` row for a synthetic subtree so the
+    /// `_cfg.node_hash` FK has a real target to point at. The tests
+    /// here don't care about the content-addressing semantics — just
+    /// that the FK resolves.
+    fn insert_test_node_content(conn: &Connection, node_hash: &[u8]) {
+        conn.execute(
+            "INSERT OR IGNORE INTO node_content (node_hash, node_tag, kind, raw_kind, lang, token, arity) \
+             VALUES (?1, 1, 'function', 'function_declaration', 'go', NULL, 0)",
+            rusqlite::params![node_hash],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn schema_cfg_ddl_creates_tables() {
+        // Bead ley-line-open-46d46b. Pin the additive DDL — `_cfg` and
+        // `_cfg_edge` exist after create_cfg_schema, indexes registered,
+        // idempotent on repeat call.
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_schema(&conn).unwrap();
+        create_refs_schema(&conn).unwrap();
+        create_ir_tables(&conn).unwrap();
+        create_cfg_schema(&conn).unwrap();
+
+        for table in ["_cfg", "_cfg_edge"] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(exists, "table missing: {table}");
+        }
+        for index_name in ["idx_cfg_source", "idx_cfg_edge_from", "idx_cfg_edge_to"] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND name=?1",
+                    [index_name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(exists, "index missing: {index_name}");
+        }
+
+        // Idempotent — second call must succeed (uses IF NOT EXISTS).
+        create_cfg_schema(&conn).unwrap();
+    }
+
+    #[test]
+    fn schema_cfg_ddl_enforces_foreign_keys() {
+        // Bead ley-line-open-46d46b. FK-enforcement is the whole point
+        // of the additive schema — a `_cfg` row with `node_hash` that
+        // has no `node_content` target MUST error at insert, not
+        // silently corrupt the analysis substrate.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        create_ast_schema(&conn).unwrap();
+        create_refs_schema(&conn).unwrap();
+        create_ir_tables(&conn).unwrap();
+        create_cfg_schema(&conn).unwrap();
+
+        let orphan_hash = &[0xFFu8; 32][..];
+        let insert_result = conn.execute(
+            "INSERT INTO _cfg (node_hash, source_id, block_id, block_kind, entry_offset, exit_offset) \
+             VALUES (?1, 'a.go', 0, 'branch', 0, 42)",
+            rusqlite::params![orphan_hash],
+        );
+        assert!(
+            insert_result.is_err(),
+            "orphan _cfg.node_hash MUST error under PRAGMA foreign_keys=ON, got Ok",
+        );
+
+        // Companion positive case: with a real node_content row, the
+        // insert succeeds.
+        let real_hash = &[0x11u8; 32][..];
+        insert_test_node_content(&conn, real_hash);
+        conn.execute(
+            "INSERT INTO _cfg (node_hash, source_id, block_id, block_kind, entry_offset, exit_offset) \
+             VALUES (?1, 'a.go', 0, 'branch', 0, 42)",
+            rusqlite::params![real_hash],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn schema_cfg_ddl_edge_fks_enforce_endpoints() {
+        // Bead ley-line-open-46d46b. Companion of the previous test for
+        // the composite FK on `_cfg_edge`. An edge to a block_id that
+        // doesn't exist in `_cfg` MUST error.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        create_ast_schema(&conn).unwrap();
+        create_refs_schema(&conn).unwrap();
+        create_ir_tables(&conn).unwrap();
+        create_cfg_schema(&conn).unwrap();
+
+        let hash = &[0x22u8; 32][..];
+        insert_test_node_content(&conn, hash);
+
+        // Insert one real block; edges to block_id=999 must error.
+        conn.execute(
+            "INSERT INTO _cfg (node_hash, source_id, block_id, block_kind, entry_offset, exit_offset) \
+             VALUES (?1, 'a.go', 0, 'branch', 0, 42)",
+            rusqlite::params![hash],
+        )
+        .unwrap();
+
+        let bad_edge = conn.execute(
+            "INSERT INTO _cfg_edge (from_node_hash, from_block_id, to_node_hash, to_block_id, edge_kind) \
+             VALUES (?1, 0, ?1, 999, 'fallthrough')",
+            rusqlite::params![hash],
+        );
+        assert!(
+            bad_edge.is_err(),
+            "_cfg_edge.to_block_id=999 with no matching _cfg row MUST error, got Ok",
+        );
+    }
+
+    #[test]
+    fn schema_cfg_ddl_complexity_column_is_nullable() {
+        // Bead ley-line-open-46d46b. T1.b3 (CFG builder) lands the
+        // schema BEFORE T1.b4 (cyclomatic complexity) wires the
+        // computation. `_cfg.complexity` MUST accept NULL so T1.b3 can
+        // ship without stamping the column, and T1.b4's UPDATE fills
+        // it in later. Pin the nullable contract so a future refactor
+        // adding NOT NULL breaks the phasing loudly.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        create_ast_schema(&conn).unwrap();
+        create_refs_schema(&conn).unwrap();
+        create_ir_tables(&conn).unwrap();
+        create_cfg_schema(&conn).unwrap();
+
+        let hash = &[0x33u8; 32][..];
+        insert_test_node_content(&conn, hash);
+
+        // Insert with NULL complexity — must succeed.
+        conn.execute(
+            "INSERT INTO _cfg (node_hash, source_id, block_id, block_kind, entry_offset, exit_offset, complexity) \
+             VALUES (?1, 'a.go', 0, 'branch', 0, 42, NULL)",
+            rusqlite::params![hash],
+        )
+        .unwrap();
+
+        // Read back NULL as Option<i64>::None.
+        let stored: Option<i64> = conn
+            .query_row(
+                "SELECT complexity FROM _cfg WHERE node_hash = ?1 AND block_id = 0",
+                rusqlite::params![hash],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, None, "complexity must round-trip as NULL");
+
+        // Update with a real complexity — must succeed and be visible
+        // to a subsequent read.
+        conn.execute(
+            "UPDATE _cfg SET complexity = ?1 WHERE node_hash = ?2 AND block_id = 0",
+            rusqlite::params![7i64, hash],
+        )
+        .unwrap();
+        let updated: Option<i64> = conn
+            .query_row(
+                "SELECT complexity FROM _cfg WHERE node_hash = ?1 AND block_id = 0",
+                rusqlite::params![hash],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(updated, Some(7));
+    }
+
+    #[test]
+    fn schema_cfg_ddl_primary_key_dedupes_identical_blocks() {
+        // Bead ley-line-open-46d46b. Two byte-identical function
+        // bodies produce the same `node_hash` (ADR-0027 merkle-AST
+        // dedup); the CFG built for that body is a pure function of
+        // the hash, so both should collapse to ONE `_cfg` row set —
+        // not two separately-keyed copies. The `(node_hash, block_id)`
+        // PRIMARY KEY is the enforcer: `INSERT OR IGNORE` on the second
+        // parse of the same body is a no-op.
+        //
+        // This is the dedup story that the whole differential-dataflow
+        // arrangement in T3 hinges on — pin loudly.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        create_ast_schema(&conn).unwrap();
+        create_refs_schema(&conn).unwrap();
+        create_ir_tables(&conn).unwrap();
+        create_cfg_schema(&conn).unwrap();
+
+        let hash = &[0x44u8; 32][..];
+        insert_test_node_content(&conn, hash);
+
+        // First parse.
+        conn.execute(
+            "INSERT INTO _cfg (node_hash, source_id, block_id, block_kind, entry_offset, exit_offset) \
+             VALUES (?1, 'a.go', 0, 'branch', 0, 42)",
+            rusqlite::params![hash],
+        )
+        .unwrap();
+
+        // Second parse — same body, different file. INSERT OR IGNORE
+        // must silently keep the first row.
+        conn.execute(
+            "INSERT OR IGNORE INTO _cfg (node_hash, source_id, block_id, block_kind, entry_offset, exit_offset) \
+             VALUES (?1, 'b.go', 0, 'branch', 0, 42)",
+            rusqlite::params![hash],
+        )
+        .unwrap();
+
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _cfg WHERE node_hash = ?1",
+                rusqlite::params![hash],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            row_count, 1,
+            "PRIMARY KEY (node_hash, block_id) must collapse identical bodies to one row"
+        );
+
+        // The first-writer's source_id wins under INSERT OR IGNORE.
+        let source_id: String = conn
+            .query_row(
+                "SELECT source_id FROM _cfg WHERE node_hash = ?1 AND block_id = 0",
+                rusqlite::params![hash],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            source_id, "a.go",
+            "first-writer's source_id must win under INSERT OR IGNORE",
+        );
     }
 
     #[test]

@@ -15,6 +15,7 @@ description = "Čech cohomology engine: sheaf cache, coboundary operators, struc
 test-spy = []
 
 [dependencies]
+log = { workspace = true }
 nalgebra = "0.35"
 sha2 = "0.11"
 nalgebra-sparse = "0.12"

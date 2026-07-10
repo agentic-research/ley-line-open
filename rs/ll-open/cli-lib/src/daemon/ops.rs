@@ -2436,6 +2436,15 @@ fn op_at_position(ctx: &std::sync::Arc<DaemonContext>, p: &LspPosition) -> Resul
 /// Cap on `depth` regardless of caller input — ADR-0016 §5 says max 4.
 const NEIGHBORHOOD_MAX_DEPTH: u32 = 4;
 
+/// Cap on the TOTAL number of neighbor cells emitted per request. Depth
+/// alone does not bound response size on co-occurrence-shaped graphs:
+/// one observation with k mentions creates a k-clique, so a radius-1
+/// ball can already be O(V). The response carries `truncated: true`
+/// when this cap (or the per-hop soft cap) cut the expansion short, so
+/// consumers can distinguish "small neighborhood" from "clipped
+/// neighborhood". Bead `ley-line-open-504341` (P7b).
+const NEIGHBORHOOD_MAX_CELLS: usize = 1_000;
+
 /// `{"op":"inspect_neighborhood","symbol_id":"...",...}` — focal
 /// symbol + N-hop neighborhood. Returns `{ok, focal, neighbors}`.
 fn op_inspect_neighborhood(
@@ -2462,8 +2471,12 @@ fn op_inspect_neighborhood(
 
         let mut neighbors_out: Vec<serde_json::Value> = Vec::new();
         let mut current_frontier: Vec<String> = vec![req.symbol_id.clone()];
+        // Set when either cap (total cells, per-hop soft cap) cut the
+        // expansion short — surfaced in the response so consumers can
+        // tell a small neighborhood from a clipped one.
+        let mut truncated = false;
 
-        for hop in 1..=depth {
+        'hops: for hop in 1..=depth {
             let mut next_frontier: Vec<String> = Vec::new();
 
             for focal in &current_frontier {
@@ -2482,6 +2495,13 @@ fn op_inspect_neighborhood(
                 {
                     if !visited.insert(token.clone()) {
                         continue;
+                    }
+                    // Hard cap on emitted cells: hop-depth does not bound
+                    // response size on clique-shaped co-occurrence graphs
+                    // (bead ley-line-open-504341 P7b).
+                    if neighbors_out.len() >= NEIGHBORHOOD_MAX_CELLS {
+                        truncated = true;
+                        break 'hops;
                     }
                     next_frontier.push(token.clone());
 
@@ -2518,6 +2538,7 @@ fn op_inspect_neighborhood(
                         // Soft cap per hop. The fan-out can be
                         // tighter than the request asked if many
                         // neighbors share dedup hits.
+                        truncated = true;
                         break;
                     }
                 }
@@ -2563,6 +2584,10 @@ fn op_inspect_neighborhood(
                 "certainty":   "full",
             },
             "neighbors":  neighbors_out,
+            // True when a cap (total-cell or per-hop) clipped the
+            // expansion — a small `neighbors` list with truncated=false
+            // really is the whole neighborhood.
+            "truncated":  truncated,
             "provenance": "composed",
             "certainty":  "full",
         })

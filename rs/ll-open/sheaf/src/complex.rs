@@ -1133,6 +1133,13 @@ impl CellComplex {
     ///
     /// # Panics
     /// Panics if the condition is violated (max entry > 1e-4).
+    ///
+    /// # Resource cap
+    /// Above `MAX_DENSE_ELEMENTS` the dense product is not formed and the
+    /// axiom is NOT verified for this complex. That skip is logged at
+    /// `warn` — silent verification disappearance is worse than a size
+    /// limit, because callers read "no panic" as "axiom held" (bead
+    /// `ley-line-open-504341`, P7a).
     pub fn assert_cochain_complex(&self) {
         if self.faces.is_empty() || self.edges.is_empty() {
             return;
@@ -1142,6 +1149,16 @@ impl CellComplex {
 
         let product_elements = d1.nrows() * d0.ncols();
         if product_elements > MAX_DENSE_ELEMENTS {
+            log::warn!(
+                "assert_cochain_complex: SKIPPED — δ¹∘δ⁰ = 0 axiom NOT \
+                 verified for this complex ({} × {} product = {} elements \
+                 > MAX_DENSE_ELEMENTS = {}). Absence of a panic here is \
+                 not evidence the axiom holds.",
+                d1.nrows(),
+                d0.ncols(),
+                product_elements,
+                MAX_DENSE_ELEMENTS,
+            );
             return;
         }
 

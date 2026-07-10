@@ -3366,6 +3366,7 @@ name = "leyline-sheaf"
 version = "0.7.0"
 dependencies = [
  "anyhow",
+ "log",
  "nalgebra",
  "nalgebra-sparse",
  "serde",

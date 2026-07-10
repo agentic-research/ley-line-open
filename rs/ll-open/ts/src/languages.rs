@@ -3,6 +3,35 @@
 use anyhow::{Result, bail};
 use tree_sitter::Language;
 
+/// Closed set of κ-canonical control-flow node kinds (bead
+/// `ley-line-open-46aef2`, decade `dataflow-substrate`, thread
+/// `cfg-emission`). The vocabulary the CFG builder (T1.b3) emits
+/// into `_cfg.block_kind`; new grammars extend `canonical_cfg_kind`
+/// to map their raw CF kinds into this set.
+///
+/// Six of these ten (`loop_back`, `call`, `throw`, `try_enter`,
+/// `try_exit`, `case`) are **builder-emitted** kinds — no raw
+/// grammar node maps directly at the κ level (they are synthesized
+/// from lower-level structure by the CFG builder). Named here so the
+/// closed-set discipline (ADR-0027 §6) is enforced by pin:
+/// `canonical_cfg_kind` results MUST be members of this array, and
+/// the array MUST cover every kind T1.b3's builder emits.
+///
+/// Order is stable — consumers may index into it, and pin tests
+/// (`kappa_cfg_closed_set`) rely on the exact contents.
+pub const CFG_CANONICAL_KINDS: [&str; 10] = [
+    "branch",
+    "loop_head",
+    "loop_back",
+    "call",
+    "return",
+    "throw",
+    "try_enter",
+    "try_exit",
+    "switch",
+    "case",
+];
+
 /// Supported tree-sitter languages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TsLanguage {
@@ -228,6 +257,73 @@ impl TsLanguage {
         }
     }
 
+    /// κ — control-flow node kind collapse for the CFG builder.
+    ///
+    /// Sibling of `canonical_kind` for the CFG domain (bead
+    /// `ley-line-open-46aef2`, decade `dataflow-substrate` T1.b1).
+    /// Maps a raw tree-sitter node kind that participates in
+    /// intra-procedural control flow to a canonical, language-agnostic
+    /// name from `CFG_CANONICAL_KINDS`. Returns `None` for kinds that
+    /// carry no control-flow semantics — the caller (T1.b3 CFG builder)
+    /// skips those.
+    ///
+    /// Coverage in this slice is Go + Rust only, matching the T1.b3
+    /// scope. Python + JS/TS are gated on `ley-line-open-e76959`
+    /// (producer/consumer contract test discipline) so we don't build
+    /// higher-order analysis on shaky extraction — see T1.b5.
+    ///
+    /// The returned kind names identify a raw grammar node's CF role
+    /// AT THE AST LEVEL. Synthetic kinds (`loop_back`, `call`, `throw`,
+    /// `try_enter`, `try_exit`, `case`) are emitted by the CFG builder
+    /// from lower-level structure; no raw kind lands them here directly.
+    /// Consumers wanting "all kinds the builder may emit" read
+    /// `CFG_CANONICAL_KINDS`, not the codomain of this function.
+    pub fn canonical_cfg_kind(self, raw_kind: &str) -> Option<&'static str> {
+        match self {
+            #[cfg(feature = "go")]
+            TsLanguage::Go => match raw_kind {
+                "if_statement" => Some("branch"),
+                "for_statement" => Some("loop_head"),
+                // Go has three switch-shaped nodes: `switch_statement`
+                // (expression switch), `type_switch_statement`
+                // (type switch), `select_statement` (channel select).
+                // All three canonicalize as `switch` — the builder
+                // decomposes the cases inside.
+                "switch_statement" | "type_switch_statement" | "select_statement" => Some("switch"),
+                // Case-clause vocabulary: `expression_case` +
+                // `default_case` for expression/type switches;
+                // `communication_case` for `select`. Type switches
+                // don't have their own named case kind — they share
+                // `expression_case` with expression switches.
+                "expression_case" | "default_case" | "communication_case" => Some("case"),
+                "return_statement" => Some("return"),
+                // `defer f()` schedules a call at function-return time;
+                // `go f()` starts a goroutine. Both are call-shaped
+                // control-flow nodes from the CFG's perspective — the
+                // builder emits a `call` block that the intra-procedural
+                // walk doesn't descend into, matching how normal
+                // `call_expression` sites are handled.
+                "defer_statement" | "go_statement" => Some("call"),
+                _ => None,
+            },
+            #[cfg(feature = "rust")]
+            TsLanguage::Rust => match raw_kind {
+                "if_expression" => Some("branch"),
+                // All three loop shapes canonicalize as loop_head:
+                // - `while_expression` (condition-driven)
+                // - `for_expression` (iterator-driven)
+                // - `loop_expression` (unconditional)
+                "while_expression" | "for_expression" | "loop_expression" => Some("loop_head"),
+                "match_expression" => Some("switch"),
+                "match_arm" => Some("case"),
+                "return_expression" => Some("return"),
+                _ => None,
+            },
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
     /// Parse a language name string (case-insensitive).
     pub fn from_name(name: &str) -> Result<Self> {
         match name.to_lowercase().as_str() {
@@ -359,6 +455,200 @@ mod tests {
         }
         #[cfg(feature = "rust")]
         assert_eq!(TsLanguage::Rust.canonical_kind("struct_item"), Some("type"));
+    }
+
+    #[test]
+    fn kappa_cfg_closed_set_is_stable() {
+        // Bead ley-line-open-46aef2. `CFG_CANONICAL_KINDS` is a
+        // documented closed set — its contents (and their order,
+        // since consumers may index) are part of the CFG contract.
+        // Pin every entry so a future refactor can't silently drop
+        // one or reorder them.
+        assert_eq!(
+            CFG_CANONICAL_KINDS,
+            [
+                "branch",
+                "loop_head",
+                "loop_back",
+                "call",
+                "return",
+                "throw",
+                "try_enter",
+                "try_exit",
+                "switch",
+                "case",
+            ],
+        );
+    }
+
+    #[cfg(feature = "go")]
+    #[test]
+    fn kappa_cfg_go_maps_control_flow_kinds() {
+        // Bead ley-line-open-46aef2. Every Go control-flow raw kind
+        // the CFG builder (T1.b3) walks past must land on a canonical
+        // CF kind before the builder ever sees it — otherwise T1.b3
+        // has to special-case grammar names, breaking κ discipline.
+        assert_eq!(
+            TsLanguage::Go.canonical_cfg_kind("if_statement"),
+            Some("branch"),
+        );
+        assert_eq!(
+            TsLanguage::Go.canonical_cfg_kind("for_statement"),
+            Some("loop_head"),
+        );
+        assert_eq!(
+            TsLanguage::Go.canonical_cfg_kind("switch_statement"),
+            Some("switch"),
+        );
+        assert_eq!(
+            TsLanguage::Go.canonical_cfg_kind("type_switch_statement"),
+            Some("switch"),
+        );
+        assert_eq!(
+            TsLanguage::Go.canonical_cfg_kind("select_statement"),
+            Some("switch"),
+        );
+        assert_eq!(
+            TsLanguage::Go.canonical_cfg_kind("expression_case"),
+            Some("case"),
+        );
+        assert_eq!(
+            TsLanguage::Go.canonical_cfg_kind("default_case"),
+            Some("case"),
+        );
+        assert_eq!(
+            TsLanguage::Go.canonical_cfg_kind("communication_case"),
+            Some("case"),
+        );
+        assert_eq!(
+            TsLanguage::Go.canonical_cfg_kind("return_statement"),
+            Some("return"),
+        );
+        assert_eq!(
+            TsLanguage::Go.canonical_cfg_kind("defer_statement"),
+            Some("call"),
+        );
+        assert_eq!(
+            TsLanguage::Go.canonical_cfg_kind("go_statement"),
+            Some("call"),
+        );
+    }
+
+    #[cfg(feature = "rust")]
+    #[test]
+    fn kappa_cfg_rust_maps_control_flow_kinds() {
+        // Bead ley-line-open-46aef2. Same discipline as Go — Rust's
+        // three loop shapes (`while`, `for`, `loop`) all canonicalize
+        // to `loop_head` so T1.b3 doesn't have to distinguish them at
+        // the raw grammar level.
+        assert_eq!(
+            TsLanguage::Rust.canonical_cfg_kind("if_expression"),
+            Some("branch"),
+        );
+        assert_eq!(
+            TsLanguage::Rust.canonical_cfg_kind("while_expression"),
+            Some("loop_head"),
+        );
+        assert_eq!(
+            TsLanguage::Rust.canonical_cfg_kind("for_expression"),
+            Some("loop_head"),
+        );
+        assert_eq!(
+            TsLanguage::Rust.canonical_cfg_kind("loop_expression"),
+            Some("loop_head"),
+        );
+        assert_eq!(
+            TsLanguage::Rust.canonical_cfg_kind("match_expression"),
+            Some("switch"),
+        );
+        assert_eq!(
+            TsLanguage::Rust.canonical_cfg_kind("match_arm"),
+            Some("case"),
+        );
+        assert_eq!(
+            TsLanguage::Rust.canonical_cfg_kind("return_expression"),
+            Some("return"),
+        );
+    }
+
+    #[test]
+    fn kappa_cfg_unmapped_returns_none() {
+        // Bead ley-line-open-46aef2. Non-CF grammar nodes MUST return
+        // None so T1.b3's CFG builder walks past them without emitting
+        // a spurious basic block. `identifier`, `block`, and function
+        // bodies are the load-bearing negative cases.
+        #[cfg(feature = "go")]
+        {
+            assert_eq!(TsLanguage::Go.canonical_cfg_kind("identifier"), None);
+            assert_eq!(TsLanguage::Go.canonical_cfg_kind("block"), None);
+            assert_eq!(
+                TsLanguage::Go.canonical_cfg_kind("function_declaration"),
+                None,
+            );
+        }
+        #[cfg(feature = "rust")]
+        {
+            assert_eq!(TsLanguage::Rust.canonical_cfg_kind("identifier"), None);
+            assert_eq!(TsLanguage::Rust.canonical_cfg_kind("block"), None);
+            assert_eq!(TsLanguage::Rust.canonical_cfg_kind("function_item"), None);
+        }
+    }
+
+    #[test]
+    fn kappa_cfg_results_are_members_of_the_closed_set() {
+        // Bead ley-line-open-46aef2. Load-bearing invariant:
+        // canonical_cfg_kind MUST NEVER return a name outside
+        // CFG_CANONICAL_KINDS. If a match arm ever returns e.g.
+        // Some("loopHead") (typo) or Some("if") (wrong-domain),
+        // ADR-0027 §6 discipline breaks. Exercise the Go + Rust
+        // arms across every raw kind we map and pin each result
+        // as a member.
+        #[cfg(feature = "go")]
+        {
+            let go_kinds = [
+                "if_statement",
+                "for_statement",
+                "switch_statement",
+                "type_switch_statement",
+                "select_statement",
+                "expression_case",
+                "default_case",
+                "communication_case",
+                "return_statement",
+                "defer_statement",
+                "go_statement",
+            ];
+            for raw in go_kinds {
+                let canonical = TsLanguage::Go
+                    .canonical_cfg_kind(raw)
+                    .unwrap_or_else(|| panic!("Go: {raw} must map"));
+                assert!(
+                    CFG_CANONICAL_KINDS.contains(&canonical),
+                    "Go: {raw} → {canonical:?} not in CFG_CANONICAL_KINDS",
+                );
+            }
+        }
+        #[cfg(feature = "rust")]
+        {
+            let rust_kinds = [
+                "if_expression",
+                "while_expression",
+                "for_expression",
+                "loop_expression",
+                "match_expression",
+                "match_arm",
+                "return_expression",
+            ];
+            for raw in rust_kinds {
+                let canonical = TsLanguage::Rust
+                    .canonical_cfg_kind(raw)
+                    .unwrap_or_else(|| panic!("Rust: {raw} must map"));
+                assert!(
+                    CFG_CANONICAL_KINDS.contains(&canonical),
+                    "Rust: {raw} → {canonical:?} not in CFG_CANONICAL_KINDS",
+                );
+            }
+        }
     }
 
     #[test]

@@ -2463,29 +2463,13 @@ pub(crate) fn is_bloat_dir(name: &str) -> bool {
     )
 }
 
-/// Recursively collect files, skipping bloat directories per
+/// Recursively collect files. Skips gitignored entries (via the
+/// `ignore` crate — see `crate::walk`) AND directories matched by
 /// `is_bloat_dir`. See `tests::collect_files_skips_known_bloat_dirs`
-/// for the skip-list pin.
+/// for the skip-list pin and `tests::collect_files_respects_gitignore`
+/// for the gitignore pin.
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    let entries = std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))?;
-
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-
-        if let Some(name) = path.file_name().and_then(|n| n.to_str())
-            && is_bloat_dir(name)
-        {
-            continue;
-        }
-
-        if path.is_dir() {
-            collect_files(&path, out)?;
-        } else {
-            out.push(path);
-        }
-    }
-    Ok(())
+    crate::walk::walk_into(dir, out)
 }
 
 #[cfg(test)]
@@ -2784,6 +2768,75 @@ mod tests {
         collect_files(root, &mut found).unwrap();
         assert_eq!(found.len(), 1);
         assert!(found[0].ends_with("pkg/util/helper.go"));
+    }
+
+    #[test]
+    fn collect_files_respects_gitignore() {
+        // Bead ley-line-open-25685d: a `.gitignore` at the tree root
+        // must exclude matching paths from the ingest walk. Without
+        // this, users with big ignored `data/` / model-checkpoint dirs
+        // get them indexed (blows up DB size + adds smell-rule noise)
+        // and downstream consumers (mache) have to git-archive the
+        // tracked tree before feeding it to LLO.
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+
+        std::fs::write(root.join("source.go"), b"package m").unwrap();
+        std::fs::write(root.join(".gitignore"), b"data/\nbig.bin\n").unwrap();
+
+        let data = root.join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::write(data.join("checkpoint.bin"), b"\x00\x01\x02").unwrap();
+        std::fs::write(root.join("big.bin"), b"\x00").unwrap();
+
+        let mut found = Vec::new();
+        collect_files(root, &mut found).unwrap();
+
+        let names: Vec<String> = found
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|s| s.to_str().map(str::to_owned)))
+            .collect();
+        assert!(
+            names.contains(&"source.go".to_string()),
+            "source.go must be collected: {names:?}",
+        );
+        assert!(
+            !names.contains(&"checkpoint.bin".to_string()),
+            "data/checkpoint.bin is gitignored; must NOT be collected: {names:?}",
+        );
+        assert!(
+            !names.contains(&"big.bin".to_string()),
+            "big.bin is gitignored; must NOT be collected: {names:?}",
+        );
+    }
+
+    #[test]
+    fn collect_files_gitignore_works_without_a_git_repo() {
+        // The walker uses `require_git(false)` so a `.gitignore` in a
+        // plain directory (test fixture, extracted tarball) is honored
+        // even without a `.git` directory present. Pin so a future
+        // refactor that flips this back to `require_git(true)` fails
+        // loudly instead of silently regressing consumers.
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        assert!(
+            !root.join(".git").exists(),
+            "test precondition: temp dir is not a git repo",
+        );
+
+        std::fs::write(root.join("keep.go"), b"package k").unwrap();
+        std::fs::write(root.join(".gitignore"), b"skip.go\n").unwrap();
+        std::fs::write(root.join("skip.go"), b"package s").unwrap();
+
+        let mut found = Vec::new();
+        collect_files(root, &mut found).unwrap();
+
+        let names: Vec<String> = found
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|s| s.to_str().map(str::to_owned)))
+            .collect();
+        assert!(names.contains(&"keep.go".to_string()), "{names:?}");
+        assert!(!names.contains(&"skip.go".to_string()), "{names:?}");
     }
 
     /// T8.3: file-backed parse emits both `${db}.ast.capnp` and

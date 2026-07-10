@@ -1115,7 +1115,13 @@ pub fn snapshot_to_arena(conn: &rusqlite::Connection, ctrl_path: &Path) -> Resul
     // current_root = σ(serialized db bytes) via the substrate's
     // ContentAddressed impl; Σ §3.4 locks BLAKE3. Retrofitted from
     // inline `blake3::hash` per bead `ley-line-open-32201a`.
-    let current_root: [u8; 32] = *db_bytes.as_ref().hash().as_bytes();
+    //
+    // Explicit `&[u8]` annotation on `as_ref` — rusqlite's
+    // `SerializedData` has multiple `AsRef<T>` impls now that the
+    // walker dep tree pulled `ignore`/`regex` in (bead
+    // ley-line-open-25685d), so inference needs a hint.
+    let db_slice: &[u8] = db_bytes.as_ref();
+    let current_root: [u8; 32] = *db_slice.hash().as_bytes();
     ctrl.set_arena_with_root(&arena_path, new_size, current_root)
         .context("publish current_root (snapshot advance)")?;
 

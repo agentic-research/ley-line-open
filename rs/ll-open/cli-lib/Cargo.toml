@@ -76,6 +76,14 @@ dirs = "6"
 which = "8"
 rayon = "1"
 tempfile = { workspace = true }
+# `ignore` crate — ripgrep's + mache's source-tree walker. Bead
+# ley-line-open-25685d: `collect_files` now honors `.gitignore`,
+# `.ignore`, `.git/info/exclude`, and global git excludes so LLO
+# stops indexing user-ignored `data/`, model checkpoints, etc.
+# `is_bloat_dir` is layered on top via `filter_entry` so
+# `node_modules`/`target`/`vendor`/etc still get skipped even
+# without a matching gitignore entry.
+ignore = "0.4"
 
 # Unix-only: flock(2) for daemon arena admission control
 # (bead ley-line-open-0cba88). Kept as a direct dep so the fcntl call

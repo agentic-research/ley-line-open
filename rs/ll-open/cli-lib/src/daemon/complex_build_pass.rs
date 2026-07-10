@@ -724,12 +724,8 @@ mod tests {
                 mentions: vec!["a".into()],
             },
         ];
-        let duplicated: Vec<ObservationRow> = base
-            .iter()
-            .cloned()
-            .cycle()
-            .take(base.len() * 10)
-            .collect();
+        let duplicated: Vec<ObservationRow> =
+            base.iter().cloned().cycle().take(base.len() * 10).collect();
 
         let build = |obs: &[ObservationRow]| {
             let mut sink = Box::new(RealSink::default());

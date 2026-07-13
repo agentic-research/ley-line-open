@@ -27,3 +27,8 @@ description = "Vendor-neutral substrate capability specs (moved from cloister/cl
 # existing workspace consumers (leyline-sheaf, leyline-sign) so cargo resolves
 # a single copy across the workspace.
 sha2 = "0.11"
+# Bead ley-line-open-f47f43: `version_bump_on_vector_change` parses every
+# `<name>/v<n>/test-vectors/*.json` and asserts its top-level `"version"`
+# field matches the containing spec-version directory. serde_json is a
+# workspace-declared dep (see rs/Cargo.toml), so this dev-dep just opts in.
+serde_json = { workspace = true }

@@ -123,6 +123,23 @@ tasks:
     cmds:
       - cargo test -p leyline-cli-lib
 
+  conformance:py:
+    desc: |
+      Python conformance suite for cloister/credential-isolation/v1
+      (bead ley-line-open-f47f43). Runs the reference Python
+      implementation against the pinned test vectors under
+      rs/ll-core/schema-spec/credential-isolation/v1/. Requires
+      python3 on PATH; skips gracefully with a clear message if
+      absent so the target is invocable in any dev environment.
+    dir: rs/ll-core/schema-spec/credential-isolation/v1/ref-impl-py
+    cmds:
+      - |
+        if ! command -v python3 >/dev/null 2>&1; then
+          echo "conformance:py — python3 not on PATH; skipping (this is a Python-only conformance suite)."
+          exit 0
+        fi
+        python3 conformance/run.py
+
   test:perf:
     desc: Cold-parse perf regression gate (bead ley-line-open-a3f254).
     # Release mode is non-negotiable — the optimisations under test only

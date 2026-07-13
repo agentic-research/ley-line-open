@@ -83,6 +83,38 @@ Beads sequence CFG → DFG → taint → incremental engine (per-thread, not per
 
 All-green ⇒ substrate-thesis not refuted. Any red ⇒ ADR-0024's producer-side claim falsified and we regroup.
 
+## 4.1. Decade-level open question — staging layer for reflow-accurate offsets
+
+**Raised during T1.b3 F1 authoring (2026-07-13).** Bead
+`ley-line-open-c25128` tracks the decision.
+
+`_cfg.node_hash` IS reflow-invariant (ADR-0027 merkle-AST content
+address). But `_cfg.entry_offset` / `_cfg.exit_offset` are body-*source*-
+relative — they measure position in the raw text of the body, so
+interior whitespace shifts them under reflow. F1's invariant had to be
+narrowed from "byte-identical row content" to "byte-identical row
+COUNT + node_hash + block_kinds", with offsets deliberately excluded.
+
+**The right fix.** Offsets should be positions INTO A CANONICAL STAGED
+FORM of the body, not into raw source. This is exactly what ADR-0026
+Phase 2 (`ley-line-open-ddfc1c`) points at with per-semantic-unit
+pointer blobs. If `_cfg.entry_offset` were an offset into the body's
+staged AstNodeList blob, reflow would be fully byte-identical — offsets
+included — AND sub-file parsing fits by direct extension (staging IS
+the sub-file unit).
+
+**When to decide.** Before T3.b3 (Bootstrap-mode taint,
+`ley-line-open-485113`). T3's differential-dataflow arrangement
+compounds on content-addressed keys; locking the offset semantics after
+consumers depend on source-relative behavior climbs the migration cost.
+
+**Impact on already-shipped work.** Schema shape doesn't change
+(`entry_offset INTEGER, exit_offset INTEGER` still fits); only
+semantics flip. v0.7.x rows can be tagged "legacy source-relative"
+without a migration. T1.b4 (cyclomatic complexity), T2 (dfg-ssa), and
+T3.b1-b2 are all offset-agnostic and safe to land ahead of the
+decision.
+
 ## 5. Non-goals / deferrals
 
 1. **Interprocedural taint via full CFL-reachability.** T3 ships regular reachability (intra-procedural). Balanced-parens call/return matching is a Tn thread.

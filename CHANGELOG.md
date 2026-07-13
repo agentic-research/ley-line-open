@@ -10,6 +10,48 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.7.2] — 2026-07-13
+
+**Cloister enablement + gitignore fix + analysis-substrate decade scaffold.**
+
+Patch release covering three coherent workstreams. All wire-compatible with v0.7.1 (wire_format_major = 1 unchanged); `compat_min_schema_version` stays at 0.6.0, so v0.6.x databases open cleanly under a v0.7.2 binary. New schema tables (`_cfg`, `_cfg_edge`) are additive with `CREATE TABLE IF NOT EXISTS`; older binaries reading a v0.7.2 database ignore the unknown tables.
+
+### Added
+
+- **Kernel-confinement IDL: `cloister/confinement/v1`** — vendor-neutral wire contract for the kernel-confinement manifest a substrate runner enforces at bundle-start time. Four dimensions (`fs.allow`, `network.allowHosts`, `port.bind`, `credentialSource`), each fail-closed by default. Canonical serialization + BLAKE3-256 digest committed to lane-2 workload identity. Sibling to `credential-isolation/v1`. Cloister's harness gains a wire contract for its nono `CapabilityManifest`. Bead `ley-line-open-a2f94f`; PR #185.
+- **`_cfg` + `_cfg_edge` fact tables** — intra-procedural control-flow-graph schema. `node_hash`-keyed (ADR-0027 merkle-AST content address) with FK to `node_content`, PRIMARY KEY `(node_hash, block_id)`. Additive; not yet populated by `cmd_parse` (T1.b3-followup `ley-line-open-a0fadd` ships the rayon-worker wiring). Bead `ley-line-open-46d46b`; PR #182.
+- **CFG builder (`leyline_ts::cfg`)** — post-order walker over function-body subtrees emitting basic blocks + edges. `emit_cfg_for_source` convenience entry point tested against the F1_cfg_reflow_stable gate. Bead `ley-line-open-46f7d1`; PR #183.
+- **κ-canonical control-flow kinds** — 10-entry closed set `CFG_CANONICAL_KINDS` in `leyline_ts::languages` (branch, loop_head, loop_back, call, return, throw, try_enter, try_exit, switch, case). `TsLanguage::canonical_cfg_kind` maps raw Go + Rust grammar kinds through κ. Python + JS/TS deferred to T1.b5 gated on `ley-line-open-e76959`. Bead `ley-line-open-46aef2`; PR #181.
+- **Three restored schema-spec enforcements** — cloister PR #120 removed these three test disciplines without a companion restore in LLO; this bump restores them:
+  - `version_bump_on_vector_change` cargo test — every `<name>/v<n>/test-vectors/*.json` MUST carry a `"version"` field matching the containing spec-version directory.
+  - `capability_mapping_coverage` cargo test — every filesystem spec-version dir MUST have a corresponding row in `_capability-mapping.md`'s §4 crosswalk.
+  - `conformance:py` Taskfile target — runs the Python reference impl against the pinned credential-isolation/v1 test vectors (34 cases).
+  
+  Bead `ley-line-open-f47f43`; PR #186.
+
+### Changed
+
+- **Ingest walker honors `.gitignore`** — `cmd_parse::collect_files` and `topology_pass::collect_files` now use `ignore::WalkBuilder` (same primitive `rg` + mache use), honoring `.gitignore`, `.ignore`, `.git/info/exclude`, and global git excludes. `is_bloat_dir` skiplist layered on top via `filter_entry`. `require_git(false)` so `.gitignore` works in plain trees (test fixtures, extracted tarballs). **Behavior change**: users with `.gitignore`d `data/`, `.venv/`, model-checkpoint dirs no longer get them indexed. Downstream: mache can retire its git-archive tracked-tree workaround; rosary substrate ingest works on real repos without a bespoke gitignore layer. Bead `ley-line-open-25685d`; PR #178.
+
+### Fixed
+
+- **`daemon::sheaf_ablation` test flake** — two tests in the same module mutated `LEYLINE_SHEAF_ABLATION_LOG` and raced under Ubuntu-CI's test parallelism, occasionally producing 1 JSON line instead of 2. Decorated both with `#[serial(env_LEYLINE_SHEAF_ABLATION_LOG)]` — same `serial_test` pattern `leyline-sign` uses under cloister-da0f35. Verified 100/100 pass under stress-parallelism. Bead `ley-line-open-d71cf6`; PR #187.
+
+### Documentation
+
+- **`docs/decades/analysis-substrate.md`** — new decade doc scoping the LLO-side producer of `_cfg`/`_dfg`/`_taint` via differential-dataflow driven by the sheaf. Full existing-art survey (differential-dataflow, Datafrog, Soufflé elastic, SCCP, CFL-reachability, CodeQL rule DSL, salsa) with adopt/reject verdicts. Substrate-fit table mapping our primitives to dd's needs. 4 threads (cfg-emission → dfg-ssa → taint-fixpoint → sheaf-cascade-integration) with 20 beads across them. 5 F-gates for falsifiability (F1_cfg_reflow_stable now shipping; F4_edit_locality is the decade-level check). Scoped by theoretical-foundations-analyst (Fable). Bead `ley-line-open-c25128` also names the sub-file staging layer as a decade-level open question to resolve before T3.b3. PRs #180 and #184.
+
+### Removed
+
+- Nothing.
+
+### Non-breaking API additions (Rust)
+
+- `leyline_ts::cfg` module (`build_cfg`, `emit_cfg_for_source`, `CfgBlock`, `CfgEdge`, `CfgOutput`)
+- `leyline_ts::languages::{CFG_CANONICAL_KINDS, TsLanguage::canonical_cfg_kind}`
+- `leyline_ts::schema::{create_cfg_tables, create_cfg_indexes, create_cfg_schema, CFG_TABLE_DDL, CFG_EDGE_TABLE_DDL, CFG_INDEXES_DDL, CFG_DDL}`
+- `leyline_schema_spec` (unchanged crate version at 0.1.0 — vendor-neutral IDL crate ships new content, not new APIs)
+
 ## [0.7.1] — 2026-07-10
 
 **Sheaf correctness — math-friend audit fixes + 91× reframing.**

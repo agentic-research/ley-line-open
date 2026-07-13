@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::Child;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use leyline_core::ContentAddressed;
 #[cfg(feature = "mount")]
 use leyline_fs::graph::HotSwapGraph;
@@ -113,6 +113,13 @@ pub struct DaemonConfig {
     pub mcp_allow_public: bool,
     /// Disables MCP wire authentication. See ADR-0022.
     pub mcp_no_auth: bool,
+    /// Bead `ley-line-open-c7d00f`: when `true`, drop any existing
+    /// live-db + zero the controller before starting so a cold parse
+    /// runs against `--source` regardless of prior arena state.
+    /// Required opt-in when the user WANTS to reuse an arena that
+    /// previously served a different `--source` (otherwise startup
+    /// refuses with the source-root-mismatch error).
+    pub reset_arena: bool,
 }
 
 pub async fn cmd_daemon(config: DaemonConfig) -> Result<()> {
@@ -148,6 +155,7 @@ pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result
         mcp_bind,
         mcp_allow_public,
         mcp_no_auth,
+        reset_arena,
     } = config;
     let arena = arena.as_path();
     let control = control.as_deref();
@@ -188,13 +196,30 @@ pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result
         );
     }
 
-    // 0. Admission control — refuse to start if another daemon already
-    // holds this arena. flock-backed advisory lockfile at `<arena>.lock`;
-    // OS releases the lock automatically on process exit even if we
-    // crash without running Drop. Bind to a local so the lock persists
-    // for the daemon's entire runtime. Bead `ley-line-open-0cba88`.
+    // 0. Admission control — two gates run in sequence, belt+suspenders.
+    //
+    // (a) `flock(2)`-backed advisory lockfile at `<arena>.lock` (bead
+    //     `ley-line-open-0cba88`). Fast path: OS auto-releases on process
+    //     exit (including SIGKILL). Catches every daemon that runs code
+    //     from PR #130 forward.
+    //
+    // (b) `<arena>.owner` JSON sentinel (bead `ley-line-open-c7d00f`).
+    //     Correctness path for pre-0cba88 daemons that hold no flock —
+    //     the sentinel records the owner PID + source_root + version, and
+    //     new daemons check `kill(pid, 0)` for liveness. Names the
+    //     specific stale daemon in the error so operators can
+    //     `kill -9 <pid>` and retry.
+    //
+    // Both bind to locals so their guards persist for the daemon's
+    // entire runtime; Drop on either releases its resource independently.
     let _arena_lock = crate::daemon::arena_lock::ArenaLock::try_acquire(arena)
-        .context("arena admission control")?;
+        .context("arena admission control (flock)")?;
+    let source_root_str = source
+        .and_then(|p| p.canonicalize().ok())
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let _arena_owner = crate::daemon::arena_owner::try_acquire(arena, &source_root_str)
+        .context("arena admission control (owner sentinel)")?;
 
     // 1. Arena setup.
     let arena_bytes = arena_size_mib * 1024 * 1024;
@@ -225,7 +250,7 @@ pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result
     // the underlying live storage swaps from a single mutex-wrapped
     // connection to pool+writer.
     let live_db_path = live_db_path_for(&ctrl_path);
-    let live_conn = match init_living_db(&ctrl_path, &live_db_path, source, language) {
+    let live_conn = match init_living_db(&ctrl_path, &live_db_path, source, language, reset_arena) {
         Ok(conn) => conn,
         Err(e) => {
             state.write().unwrap().phase = DaemonPhase::Error(format!("init failed: {e:#}"));
@@ -738,7 +763,33 @@ fn init_living_db(
     live_db_path: &Path,
     source: Option<&Path>,
     language: Option<&str>,
+    // Bead `ley-line-open-c7d00f`: when `true`, drop the live-db + zero
+    // the controller before any warm-start so the daemon guarantees a
+    // cold parse against `--source`. Opt-in only — the default flow
+    // preserves warm-start's fast path.
+    reset_arena: bool,
 ) -> Result<rusqlite::Connection> {
+    // Bead `ley-line-open-c7d00f`: honor the explicit reset. Runs
+    // BEFORE the controller-freshness / live-db-exists branches so a
+    // reset-requested startup NEVER warm-starts, regardless of what
+    // the prior daemon left behind.
+    if reset_arena {
+        eprintln!(
+            "cold start (--reset-arena): unlinking any live db at {} + zeroing controller",
+            live_db_path.display(),
+        );
+        unlink_live_db(live_db_path);
+        // Zero the controller so `controller_is_fresh` reads true and
+        // downstream `try_warm_start_from_arena` returns None.
+        // `set_arena_with_root` takes the arena path as &str; the
+        // controller stores it verbatim, so we pass the empty string
+        // (arena path not published in this reset step; a real value
+        // gets stamped by `setup_arena`'s follow-on flow if needed).
+        if let Ok(mut c) = leyline_core::Controller::open_or_create(ctrl_path) {
+            let _ = c.set_arena_with_root("", 0, [0u8; 32]);
+        }
+    }
+
     // Truly fresh controller → discard any orphan `.live.db` before
     // opening. Skipping this leaves stale rows from a prior daemon
     // lifecycle in the freshly-parsed db.
@@ -756,6 +807,14 @@ fn init_living_db(
         let conn = rusqlite::Connection::open(live_db_path)
             .with_context(|| format!("open live db {}", live_db_path.display()))?;
         configure_wal(&conn)?;
+        // Bead `ley-line-open-c7d00f`: refuse to serve if the arena's
+        // prior source_root disagrees with the current `--source`.
+        // Prevents cross-repo cached-parse pollution when a shared
+        // arena (e.g. `~/.mache/default.arena`) gets reused across
+        // repos without an explicit reset.
+        if let Some(source_dir) = source {
+            verify_source_root_matches(&conn, source_dir).context("warm start (live-db)")?;
+        }
         eprintln!("warm start from {}", live_db_path.display());
         if let Some(source_dir) = source {
             run_initial_parse(&conn, source_dir, language, "incremental reparse")?;
@@ -771,6 +830,14 @@ fn init_living_db(
     //       and reads stay on the 15a substrate.
     //   (b) Controller is fresh — cold start.
     if let Some(conn) = try_warm_start_from_arena(ctrl_path, live_db_path)? {
+        // Same source-root guard as the live-db warm-start branch
+        // above. The arena might have been snapshotted by daemon A
+        // against repo R1; if daemon B started against repo R2 with
+        // `--source /repos/R2`, we refuse rather than layer R2's
+        // parse over R1's cached rows.
+        if let Some(source_dir) = source {
+            verify_source_root_matches(&conn, source_dir).context("warm start (arena)")?;
+        }
         eprintln!("warm start from arena → {}", live_db_path.display());
         if let Some(source_dir) = source {
             run_initial_parse(&conn, source_dir, language, "incremental reparse")?;
@@ -789,6 +856,53 @@ fn init_living_db(
     }
 
     Ok(conn)
+}
+
+/// Bead `ley-line-open-c7d00f`: refuse warm-start when the arena's
+/// prior `_meta.source_root` disagrees with the current `--source`.
+///
+/// The check reads `_meta.source_root` (populated by
+/// `cmd_parse::parse_into_conn` at the end of every parse pass) and
+/// canonicalizes both sides before comparing so relative-vs-absolute
+/// path noise doesn't cause spurious refusals.
+///
+/// Returns `Ok(())` when either:
+/// - no prior `source_root` is recorded (fresh arena, or `_meta`
+///   table missing → pre-cbbedf DB), or
+/// - the recorded root matches the current `--source`.
+///
+/// Returns `Err` with an operator-actionable message naming both
+/// paths + the `--reset-arena` opt-out when they disagree.
+fn verify_source_root_matches(conn: &rusqlite::Connection, current_source: &Path) -> Result<()> {
+    // `get_meta` propagates SQL errors (missing table etc.) as Err,
+    // but for source_root the absence of the row is "no prior parse
+    // ran," which is fine — we're the first. Use `.ok().flatten()`
+    // to treat both "table missing" and "row missing" as "no prior."
+    let prior = leyline_ts::schema::get_meta(conn, "source_root")
+        .ok()
+        .flatten();
+    let Some(prior) = prior else {
+        return Ok(());
+    };
+    if prior.is_empty() {
+        return Ok(());
+    }
+    let prior_path = std::path::PathBuf::from(&prior);
+    let prior_canon = prior_path.canonicalize().unwrap_or(prior_path);
+    let current_canon = current_source
+        .canonicalize()
+        .unwrap_or_else(|_| current_source.to_path_buf());
+    if prior_canon == current_canon {
+        return Ok(());
+    }
+    bail!(
+        "arena source_root={} disagrees with --source={}. Refusing to warm-start; \
+         the prior daemon's cached parses would silently pollute this run. See bead \
+         ley-line-open-c7d00f. Pass `--reset-arena` to invalidate and cold-start, or \
+         use a different `--arena` path per project.",
+        prior_canon.display(),
+        current_canon.display(),
+    );
 }
 
 /// Run a full-tree parse + log the standard `N parsed, N unchanged, N
@@ -2160,7 +2274,7 @@ mod tests {
         let live_db = live_db_path_for(&ctrl);
         assert!(!live_db.exists(), "pre-condition: live.db must not exist");
 
-        let conn = init_living_db(&ctrl, &live_db, None, None).unwrap();
+        let conn = init_living_db(&ctrl, &live_db, None, None, false).unwrap();
         assert!(live_db.exists(), "cold start must create live.db");
         let mode: String = conn
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
@@ -2183,7 +2297,7 @@ mod tests {
         std::fs::write(&live_db, b"stale content from an earlier run").unwrap();
         let stale_len_before = std::fs::metadata(&live_db).unwrap().len();
 
-        let _conn = init_living_db(&ctrl, &live_db, None, None).unwrap();
+        let _conn = init_living_db(&ctrl, &live_db, None, None, false).unwrap();
         let fresh_len = std::fs::metadata(&live_db).unwrap().len();
         assert_ne!(
             fresh_len, stale_len_before,
@@ -2220,7 +2334,7 @@ mod tests {
 
         // Cold start creates live.db with WAL.
         {
-            let conn = init_living_db(&ctrl_path, &live_db, None, None).unwrap();
+            let conn = init_living_db(&ctrl_path, &live_db, None, None, false).unwrap();
             conn.execute_batch(
                 "CREATE TABLE sentinel (id INTEGER PRIMARY KEY);
                  INSERT INTO sentinel VALUES (42);",
@@ -2246,7 +2360,7 @@ mod tests {
             drop(c);
         }
 
-        let conn = init_living_db(&ctrl_path, &live_db, None, None).unwrap();
+        let conn = init_living_db(&ctrl_path, &live_db, None, None, false).unwrap();
         let sentinel: i64 = conn
             .query_row("SELECT id FROM sentinel", [], |r| r.get(0))
             .expect("warm start must preserve sentinel row");
@@ -2279,7 +2393,7 @@ mod tests {
         }
 
         // File-backed WAL live db + rows to make the snapshot non-trivial.
-        let conn = init_living_db(&ctrl_path, &live_db_path, None, None).unwrap();
+        let conn = init_living_db(&ctrl_path, &live_db_path, None, None, false).unwrap();
         conn.execute_batch(
             "CREATE TABLE snap_rows (id INTEGER PRIMARY KEY, payload TEXT);
              INSERT INTO snap_rows (payload) VALUES ('one'), ('two'), ('three');",
@@ -2578,6 +2692,7 @@ mod tests {
             mcp_bind: None,
             mcp_allow_public: false,
             mcp_no_auth: false,
+            reset_arena: false,
         }
     }
 

@@ -143,16 +143,27 @@ pub fn reset_handle_for_tests() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     /// Env var unset → no I/O, no panic. The load-bearing zero-cost
     /// invariant: production daemons that never opt in pay nothing.
+    ///
+    /// Serialized against every other test that mutates
+    /// `LEYLINE_SHEAF_ABLATION_LOG` via
+    /// `#[serial("env_LEYLINE_SHEAF_ABLATION_LOG")]` — bead
+    /// `ley-line-open-d71cf6`. Without this, the sister test's
+    /// `set_var → set_handle → log_event × 2 → read_file` sequence
+    /// races with this test's `remove_var` and appended 1 line instead
+    /// of 2 under Ubuntu CI (observed 2026-07-13 on PR #184 run
+    /// 29271365230).
     #[test]
+    #[serial(env_LEYLINE_SHEAF_ABLATION_LOG)]
     fn log_event_is_noop_when_env_var_unset() {
-        // SAFETY: env access is process-global. This test intentionally
-        // clears the var; if another test in this crate sets it in
-        // parallel we'd interfere. Test suite runs single-threaded per
-        // integration binary; unit tests here are within one binary but
-        // no other test in this module touches the var.
+        // SAFETY: env access is process-global. `#[serial(...)]`
+        // above serializes this test against every other test in the
+        // crate that mutates the same env var; the SAFETY invariant
+        // is now compile-checked-by-label instead of a hand-waved
+        // comment.
         unsafe {
             std::env::remove_var(ABLATION_LOG_ENV);
         }
@@ -166,11 +177,19 @@ mod tests {
     }
 
     /// Env var pointing at a writable path → one JSON line per call.
+    ///
+    /// Serialized against `log_event_is_noop_when_env_var_unset` via
+    /// `#[serial("env_LEYLINE_SHEAF_ABLATION_LOG")]` — bead
+    /// `ley-line-open-d71cf6`. See the sister test for the
+    /// observed-flake context.
     #[test]
+    #[serial(env_LEYLINE_SHEAF_ABLATION_LOG)]
     fn log_event_appends_json_line_when_env_var_set() {
         let dir = tempfile::TempDir::new().unwrap();
         let log_path = dir.path().join("ablation.jsonl");
-        // SAFETY: see note above; parallel test risk documented.
+        // SAFETY: env access is process-global. `#[serial(...)]`
+        // above serializes this test against every other test in the
+        // crate that mutates the same env var.
         unsafe {
             std::env::set_var(ABLATION_LOG_ENV, &log_path);
         }

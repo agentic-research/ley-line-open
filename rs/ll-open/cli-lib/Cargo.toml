@@ -108,6 +108,12 @@ leyline-sheaf = { path = "../sheaf", features = ["test-spy"] }
 # through axum's middleware stack; this dev-dep exposes the trait
 # directly for synchronous service-call testing.
 tower = "0.5"
+# Serialize process-env mutations across parallel cargo-test workers
+# (bead ley-line-open-d71cf6). `#[serial("env_LEYLINE_SHEAF_ABLATION_LOG")]`
+# makes the "I mutate this env var" property compile-checked-by-label
+# across the test suite, not just an inline SAFETY comment. Same
+# pattern the `leyline-sign` dev-deps introduced under cloister-da0f35.
+serial_test = "3"
 
 [[bench]]
 name = "wal_snapshot_experiment"

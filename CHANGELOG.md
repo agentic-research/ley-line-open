@@ -10,6 +10,29 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.7.3] — 2026-07-13
+
+**confinement/v1 BLAKE3-256 identity digest + docs consolidation.**
+
+Patch release. Fixes a spec correctness bug cloister filed against v0.7.2's confinement/v1 IDL, plus a full non-design MD audit. Wire-compatible with v0.7.2 (`wire_format_major = 1` unchanged); `compat_min_schema_version` stays at 0.6.0. No SQLite schema changes — `schema_version` bumps in parity with `binary_version` per project convention.
+
+### Fixed
+
+- **confinement/v1: BLAKE3-256 `confinementDigest` now pinned separately from SHA-256 integrity.** The v0.7.2 ship conflated two distinct digests: SHA-256 (content integrity, `VECTORS.sha256`, cross-cutting spec-tree convention) with BLAKE3-256 (identity commitment, README §7, substrate Σ hash). §6 and §8 both said the BLAKE3-256 digest was "pinned in VECTORS.sha256" — but that file holds SHA-256. Cloister filed the finding with the correct value computed via `leyline-cas-ffi`.
+  - New `CONFINEMENT_DIGESTS.blake3` pin file paralleling `VECTORS.sha256`'s line shape.
+  - New `verify_confinement_digest` cargo test that recomputes BLAKE3-256 via the `blake3` crate directly, asserts match on every workspace test run.
+  - README Document map, §6, and §8 rewritten to distinguish integrity from identity. §8 conformance criteria split: (2) BLAKE3-256 identity match, (3) SHA-256 integrity match — both required, distinct concerns.
+  - Cross-impl conformance proven: cloister's `leyline-cas-ffi` and LLO's direct `blake3` crate compute byte-identical `d9b5b7270bb6e5ec068aec92798dd76b0f71d1fe2640b3a09833b7742d51c617` for `manifest-canonical.json`. Substrate-Σ = direct-blake3 for canonical manifest bytes, as required by §7's identity-commitment claim.
+  - Bead `ley-line-open-193170`; PR #189.
+
+### Documentation
+
+- **Non-design MD audit + consolidation.** README §Build now names all three install paths (`install` / `install:full` / `install:full+mount`) with the correct runtime-dep matrix — `libfuse-t` prereq is now scoped to `install:full+mount` only (was previously a blanket claim, which was misleading for the two non-mount paths). GETTING-STARTED.md updated to recommend `install:full` as the default. `docs/ARCHITECTURE.md` bumped from v0.5.0 status to v0.7.3, ADRs 0026-0029 added to the load-bearing table, analysis-substrate decade + `_cfg`/`_cfg_edge` contract addition surfaced, and `leyline-schema-spec` crate now listed in Layer 1. `docs/TABLE_CONTRACT.md` extended with the merkle-AST IR tables (`node_content`, `node_child`; ADR-0027), pointer store (`_ast_pointer`, `capnp_blobs`; ADR-0026), source blobs (`source_blobs`; ADR-0028), and analysis-substrate tables (`_cfg`, `_cfg_edge`; v0.7.2). `rs/README.md` extended with the four crates missing from prior versions (`leyline-schema-spec`, `leyline-cas-ffi`, `leyline-text-search`, `leyline-chat-embed`).
+
+### Not shipped this release
+
+- **Analysis-substrate decade in-flight** — T1.b3-followup (`ley-line-open-a0fadd`), T1.b4, T2, T3, T4, F5 all still open. Next feature-shipping release will bundle at least one of those.
+
 ## [0.7.2] — 2026-07-13
 
 **Cloister enablement + gitignore fix + analysis-substrate decade scaffold.**

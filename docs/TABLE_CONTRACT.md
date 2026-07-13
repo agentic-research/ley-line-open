@@ -28,11 +28,40 @@ Produced by `parse_into_conn`. Always present.
 | `nodes` | Hierarchical node tree (id, parent_id, name, kind, size, record) |
 | `_ast` | AST positions (node_id → source_id, node_kind, byte/row/col ranges) |
 | `_source` | Source file metadata (id → language, abs path) |
-| `node_refs` | Token references (token → node_id, source_id) |
-| `node_defs` | Token definitions (token → node_id, source_id) |
+| `node_refs` | Token references (token → node_id, source_id, node_hash) |
+| `node_defs` | Token definitions (token → node_id, source_id, node_hash) |
 | `_imports` | Import statements (alias, path, source_id) |
 | `_file_index` | Incremental parse index (path → mtime, size) |
 | `_meta` | Key-value metadata (source_root, parse_time, version vectors) |
+
+**Merkle-AST IR** (added v0.6.0 per ADR-0027):
+
+| Table | Purpose |
+|-------|---------|
+| `node_content` | One row per UNIQUE subtree, keyed on `node_hash BLOB PRIMARY KEY` (κ kind + terminal + child hashes). `INSERT OR IGNORE` dedups byte-identical subtrees cross-file. |
+| `node_child` | Git-tree object: (parent_hash, ordinal) → child_hash edges. Both endpoints REFERENCE `node_content(node_hash)` (FK-enforced). |
+
+**Pointer store** (added v0.6.0 per ADR-0026 Phase 1 dual-write):
+
+| Table | Purpose |
+|-------|---------|
+| `capnp_blobs` | Content-addressed blob store — `blob_hash BLOB PRIMARY KEY`, `blob_bytes BLOB`. |
+| `_ast_pointer` | Row-per-AstNode index into `capnp_blobs.blob_bytes[offset_in_blob]`. `kind INTEGER` = semantic tag per ADR-0026 §2.1. |
+
+**Source blobs** (added v0.6.0 per ADR-0028 Phase 1 dual-store):
+
+| Table | Purpose |
+|-------|---------|
+| `source_blobs` | Content-addressed byte store — `blob_hash BLOB PRIMARY KEY`, `blob_bytes BLOB`, `byte_len INTEGER` (stored generated column). F-git compat with `git cat-file blob`. |
+
+**Analysis substrate** (added v0.7.2 per `docs/decades/analysis-substrate.md`):
+
+| Table | Purpose |
+|-------|---------|
+| `_cfg` | Intra-procedural CFG basic blocks — `(node_hash, block_id) PRIMARY KEY`, `block_kind TEXT` (one of `CFG_CANONICAL_KINDS`), `complexity INTEGER` nullable. Node_hash FK to `node_content`. Reflow-invariant identity via merkle-AST. |
+| `_cfg_edge` | Directed edges between CFG blocks. Composite FK on both endpoints referencing `_cfg(node_hash, block_id)`. `edge_kind TEXT` (free-form in v0.7.2; T3 taint will canonicalize). |
+
+Population TODO (bead `ley-line-open-a0fadd`): T1.b3-followup wires `cfg::emit_cfg_for_source` into `cmd_parse`'s rayon-worker + batched-insert plumbing so `_cfg` populates on parse. Until then, schema is present but empty on parse output; `_cfg` is only populated by consumers calling `leyline_ts::cfg::emit_cfg_for_source` directly.
 
 ### LSP enrichment (extension layer)
 
@@ -66,6 +95,12 @@ database** (not the living db) because `vec0` virtual tables cannot survive
 | `_vec*` | embedding layer |
 | `_sheaf*` | sheaf cache (ley-line private) |
 | `_errors` | validation layer (leyline-fs write path) |
+| `_cfg*` | analysis-substrate CFG layer (leyline-ts; T1 of `dataflow-substrate` decade) |
+| `_dfg*` | analysis-substrate DFG layer (T2 of `dataflow-substrate` decade; not yet shipped) |
+| `_taint*` | analysis-substrate taint fixpoint (T3 of `dataflow-substrate` decade; not yet shipped) |
+| `node_content` / `node_child` | ADR-0027 merkle-AST IR (base; no prefix) |
+| `_ast_pointer` / `capnp_blobs` | ADR-0026 pointer store (base; no prefix on blobs) |
+| `source_blobs` | ADR-0028 content-addressed source (base; no prefix) |
 
 ## Composition Model
 

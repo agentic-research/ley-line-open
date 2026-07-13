@@ -34,15 +34,21 @@ Until LLO ships pre-built binaries via a release-channel users actually use (hom
 ```bash
 git clone https://github.com/agentic-research/ley-line-open
 cd ley-line-open
-task install
+task install:full   # ← recommended: everything except mount, no system-dep prereqs
 ```
 
-This produces `~/.local/bin/leyline` (or your `task install` target). The binary is statically linked (SQLite, tree-sitter, embedded fastembed model staging) — runtime deps are minimal:
+Three install shapes to choose from (see [README §Install](README.md#install) for the full matrix):
+
+- **`task install`** — default features (`lsp` + `validate` + `hdc`), structural-analysis core only. Portable.
+- **`task install:full`** — everything portable (`--features all`, no mount). **Recommended default** for consumers.
+- **`task install:full+mount`** — everything including FUSE/NFS mount. Requires `libfuse-t` (macOS) or `libfuse` (Linux) at runtime.
+
+All three produce `~/.local/bin/leyline` (codesigned on macOS). The binary is statically linked (SQLite, tree-sitter, embedded fastembed model staging under `install:full`) — runtime deps are minimal:
 
 - **None** for the `leyline parse` + `leyline daemon` happy path (default MCP HTTP transport on `127.0.0.1:8384`, control socket on UDS).
-- **None** for the default mount path on macOS — `leyline daemon --mount /path` uses the kernel's native NFS client (`leyline serve --backend nfs` is the macOS default; `--backend fuse` is opt-in and requires `fuse-t`).
-- **libfuse3** on Linux for `--features mount` builds — Linux's default backend is FUSE (`--backend fuse`); NFS is opt-in.
-- **A fastembed model cache** at `~/.cache/fastembed/` (~100 MB, downloaded on first `vec_search` use). Skip if you don't use `vec_search`.
+- **None** for the default mount path on macOS under `install:full+mount` — `leyline daemon --mount /path` uses the kernel's native NFS client (`leyline serve --backend nfs` is the macOS default; `--backend fuse` is opt-in and requires `fuse-t`).
+- **libfuse3** on Linux for `install:full+mount` builds — Linux's default backend is FUSE (`--backend fuse`); NFS is opt-in.
+- **A fastembed model cache** at `~/.cache/fastembed/` (~100 MB, downloaded on first `vec_search` use, only present under `install:full` and up). Skip if you don't use `vec_search`.
 
 ### Parse a corpus
 
@@ -139,8 +145,8 @@ Where to read next:
 Neither LLO nor mache currently has a pre-built binary distribution channel users actually use:
 
 - **Homebrew**: legacy `homebrew-tap/Formula/leyline.rb` exists but points at the pre-LLO-extraction private repo (v0.2.0, private URLs, `license :cannot_represent`). Not actively maintained. The tap source (`kiln`) has been archived. **Don't `brew install`** today; install from source.
-- **GitHub releases**: cut on every tag — see [v0.5.1](https://github.com/agentic-research/ley-line-open/releases/tag/v0.5.1) for the current artifact matrix (`leyline-{darwin,linux}-{amd64,arm64}` + `libleyline_fs` staticlibs + `leyline_fs.h`). Useful for ad-hoc download but no auto-install path.
-- **Distroless OCI image**: `ley-line-open:0.5.1` (~20 MB, headless MCP daemon). See README "Building the image" section. Useful for container deploys.
+- **GitHub releases**: cut on every tag — see [v0.7.3](https://github.com/agentic-research/ley-line-open/releases/tag/v0.7.3) for the current artifact matrix (`leyline-{darwin,linux}-{amd64,arm64}` + `libleyline_fs` staticlibs + `leyline_fs.h`). Useful for ad-hoc download but no auto-install path.
+- **Distroless OCI image**: `ley-line-open:0.7.3` (~20 MB, headless MCP daemon). See README "Building the image" section. Useful for container deploys.
 
 Pre-built distribution (homebrew formula update OR an alternate channel) is open work — pick this up if you want LLO to install in one command without cloning.
 

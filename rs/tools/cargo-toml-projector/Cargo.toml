@@ -1,6 +1,6 @@
 [package]
 name = "cargo-toml-projector"
-version = "0.7.2"
+version = "0.7.3"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "Project rs/**/Cargo.toml into a SQLite schema (workspace_deps + crate_deps) and run mache-shaped smell rules against the projection. Bead ley-line-open-3b2f55 Phase 3 workspace-deps drift gate."

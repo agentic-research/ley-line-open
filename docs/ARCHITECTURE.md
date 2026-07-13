@@ -8,11 +8,11 @@ Canonical architecture overview for ley-line-open (LLO). Companion to the [root 
 
 | Field | Value |
 |---|---|
-| LLO version | v0.5.0 |
-| Last verified | 2026-06-25 |
-| Source of truth files | `rs/ll-core/`, `rs/ll-open/`, `rs/ll-open/cli-lib/src/daemon/`, `docs/adr/*.md`, `CHANGELOG.md` |
+| LLO version | v0.7.3 |
+| Last verified | 2026-07-13 |
+| Source of truth files | `rs/ll-core/`, `rs/ll-open/`, `rs/ll-open/cli-lib/src/daemon/`, `docs/adr/*.md`, `docs/decades/*.md`, `CHANGELOG.md` |
 
-This file is canonical for the architectural shape. Per-crate detail lives in each crate's `README.md`. Per-decision detail lives in `docs/adr/`. Per-table contract lives in [`TABLE_CONTRACT.md`](TABLE_CONTRACT.md).
+This file is canonical for the architectural shape. Per-crate detail lives in each crate's `README.md`. Per-decision detail lives in `docs/adr/`. Per-table contract lives in [`TABLE_CONTRACT.md`](TABLE_CONTRACT.md). Per-decade design lives in [`docs/decades/`](decades/).
 
 ---
 
@@ -45,12 +45,13 @@ The Σ substrate — content-addressed storage primitives every other crate is b
 
 | Crate | Purpose | Key types |
 |---|---|---|
-| `leyline-core` | Arena primitives. mmap'd files + control block + generation counter for hot-reload | `ArenaHeader`, `Controller`, `ContentAddressed` |
+| `leyline-core` | Arena primitives. mmap'd files + control block + generation counter for hot-reload. `ContentAddressed` trait = the σ substrate entry point (BLAKE3-locked per Σ §3.4) | `ArenaHeader`, `Controller`, `ContentAddressed`, `Hash` |
 | `leyline-schema` | Shared SQLite schema for the `nodes` table + indexes | `create_schema`, `insert_node` |
 | `leyline-public-schema` | Capnp wire schema for the daemon UDS + MCP transport. Source of truth for every base op's request/response shape with `$Json.name` annotations for camel↔snake | `capnp/daemon.capnp` |
-| `leyline-schema-capnp` | Capnp schemas for the Σ event log (T8, decade `ley-line-open-9d30ac`) | Generated Rust bindings |
+| `leyline-schema-capnp` | Capnp schemas for the Σ event log (`AstNode`, `SourceFile`, `BindingRecord`, `Head`, `AstNodeList`). Decade `ley-line-open-9d30ac` | Generated Rust bindings |
+| `leyline-schema-spec` | Vendor-neutral IDL crate. Ships per-capability specs (`credential-isolation/v1`, `confinement/v1`, `build-cache/v1`, `mcp-tool/v1`) with canonical test vectors + integrity/identity pins. Verified by `verify_vectors_sha256` (SHA-256 integrity) + `verify_confinement_digest` (BLAKE3-256 identity) + `capability_mapping_coverage` + `version_bump_on_vector_change` cargo tests | Non-code artifact — spec dirs + pin files |
 
-**Contract:** Σ substrate is **BLAKE3-locked**. Every content-addressed primitive uses BLAKE3 (`leyline-core::substrate::ContentAddressed for [u8]`). SHA-256 is deliberately not a substrate commitment — it appears only at the OCI ecosystem boundary.
+**Contract:** Σ substrate is **BLAKE3-locked**. Every content-addressed primitive uses BLAKE3 (`leyline-core::substrate::ContentAddressed for [u8]`). SHA-256 appears in exactly two places: (a) the OCI ecosystem boundary, and (b) `VECTORS.sha256` content-integrity pins under `schema-spec/*/v*/` (distinct concern from BLAKE3-256 identity digests pinned in `CONFINEMENT_DIGESTS.blake3` — see bead `ley-line-open-193170`).
 
 ### Layer 2: Projection engine (`rs/ll-open/`)
 
@@ -71,7 +72,9 @@ Where source becomes structure. Parses, enriches, signs, presents.
 | `leyline-cli-lib` | The daemon. Owns the living db + UDS control socket + MCP HTTP transport; hosts all enrichment passes | `cmd_daemon`, `daemon::ops` |
 | `leyline-cli` | The `leyline` binary. Thin wrapper around `leyline-cli-lib` | `parse`, `daemon`, `serve`, `inspect` |
 
-**Contract:** Every enrichment pass writes into a sidecar (`_lsp*`, `_hdc*`, etc.) — the `nodes` + `_ast` + `_source` core tables are the canonical substrate; sidecars are derived. Text-search engines are sidecar by construction (storage path lives OUTSIDE the arena; no capnp segments emitted; re-indexing never advances `current_root`).
+**Contract:** Every enrichment pass writes into a sidecar (`_lsp*`, `_hdc*`, `_cfg`/`_cfg_edge`, etc.) — the `nodes` + `_ast` + `_source` + `node_content` core tables are the canonical substrate; sidecars are derived. Text-search engines are sidecar by construction (storage path lives OUTSIDE the arena; no capnp segments emitted; re-indexing never advances `current_root`).
+
+**In-flight (analysis-substrate decade, `docs/decades/analysis-substrate.md`):** The `_cfg` / `_dfg` / `_taint` fact tables — three projections of one differential-dataflow computation over the existing `_ast` / `node_content` / `node_defs` / `node_refs` EDB, driven by `daemon.sheaf.invalidate` as the epoch tracker. v0.7.2 shipped T1's schema + κ CFG-kind vocabulary + reflow-invariant CFG builder + F1_cfg_reflow_stable gate. T1.b3-followup (bead `a0fadd`) wires `_cfg` population into `cmd_parse`; T2 / T3 / T4 still open. `docs/decades/analysis-substrate.md` §4.1 names the sub-file staging layer as a decade-level open question to resolve before T3.b3 (bead `c25128`).
 
 ### Layer 3: Consumer surface
 
@@ -148,8 +151,12 @@ Architectural decisions that shape the substrate today:
 | [ADR-0023](adr/0023-agent-first-language-facts.md) | Agent-first language facts (analyzer-as-library, not LSP-wire) | Proposed |
 | [ADR-0024](adr/0024-hdc-substrate-identity-rewrite.md) | HDC substrate-identity rewrite (bundle composition, seeded leaves, fp-quantize) | Accepted (shipped v0.5.0) |
 | [ADR-0025](adr/0025-hdc-compositional-validation.md) | HDC compositional-vs-distance use modes (validate or remove) | Proposed |
+| [ADR-0026](adr/0026-content-addressed-pointer-store.md) | Content-addressed pointer store (`_ast_pointer` + `capnp_blobs`; Phase 1 dual-write) | Accepted (Phase 1 shipped) |
+| [ADR-0027](adr/0027-unified-code-fact-ir-producer.md) | Unified code-fact IR: merkle-AST `node_hash` (κ kind + terminal + child hashes) + `node_content` / `node_child` git-tree object | Accepted (shipped v0.6.0) |
+| [ADR-0028](adr/0028-content-addressed-source-blobs.md) | Content-addressed source blobs (`source_blobs`; F-git compat with `git cat-file blob`) | Accepted (Phase 1 shipped) |
+| [ADR-0029](adr/0029-cas-backed-workspace.md) | CAS-backed workspace (mount driver + manifest; alternative to git-worktree flow) | Proposed (Phase 1 mount driver bead `de3f81`) |
 
-ADRs 0017-0019 are cloister-side and live in `~/remotes/art/cloister/docs/adr/`.
+ADRs 0017-0019 are cloister-side and live in `~/remotes/art/cloister/docs/adr/`. Mache's ADR-0024 (`incremental-dataflow-taint-as-substrate-queries`) is a separate document in the mache repo whose producer-side lives in LLO's `dataflow-substrate` decade — see the decade doc for the mapping.
 
 ---
 
@@ -157,12 +164,14 @@ ADRs 0017-0019 are cloister-side and live in `~/remotes/art/cloister/docs/adr/`.
 
 | Surface | Built via |
 |---|---|
-| `leyline` binary | `task build` (debug, headless) / `task release` (release, headless) / `task release:mount` (release with FUSE) |
-| Distroless OCI image | `task image` — produces `ley-line-open:0.5.0` (~20 MB) via krust + cargo-zigbuild static musl; image default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0` |
+| `leyline` binary (default features) | `task build` (debug, headless) / `task release` (release, headless) / `task install` (release + codesign + install to `~/.local/bin`). Default features are `lsp` + `validate` + `hdc` — the structural-analysis core |
+| `leyline` binary (recommended for downstream consumers) | `task install:full` — `--features all` (adds `vec` + `text-search`). Portable — no libfuse-t/libfuse runtime dep |
+| `leyline` binary (everything including mount) | `task install:full+mount` — `--features full`. Requires libfuse-t (macOS `brew install fuse-t`) or libfuse (Linux `apt install libfuse-dev`) at runtime |
+| Distroless OCI image | `task image` — produces `ley-line-open:0.7.3` (~20 MB) via krust + cargo-zigbuild static musl; image default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0` |
 | FFI staticlibs + header | `task release:fs-static` / `task release:cas-ffi` — published as GitHub release artifacts (linux + darwin × amd64+arm64; macOS amd64 staticlib currently absent) |
 | Go schema client | `clients/go/leyline-schema` — nested Go module, tag-published as `clients/go/leyline-schema/v<version>` alongside the root release tag |
 
-Release flow is on-tag-push: `task readme:version-check` gates README version-pin drift in CI (mirroring the `compat:check` + `gen:server-json:check` pattern).
+Release flow is on-tag-push: `task readme:version-check` gates README version-pin drift in CI (mirroring the `compat:check` + `gen:server-json:check` pattern). See [README.md § Build](../README.md#build) for the recommended install path per user type.
 
 ---
 

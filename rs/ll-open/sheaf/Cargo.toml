@@ -1,6 +1,6 @@
 [package]
 name = "leyline-sheaf"
-version = "0.7.3"
+version = "0.7.4"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "Čech cohomology engine: sheaf cache, coboundary operators, structural invalidation"

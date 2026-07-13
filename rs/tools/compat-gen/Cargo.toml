@@ -1,6 +1,6 @@
 [package]
 name = "compat-gen"
-version = "0.7.3"
+version = "0.7.4"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "Generate compatibility.json from leyline-cli-lib::daemon::version constants. Self-maintaining compat surface per bead ley-line-open-cbea02."

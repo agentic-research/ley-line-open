@@ -19,11 +19,22 @@ use tree_sitter::Node;
 #[derive(Debug, Clone)]
 pub enum ExtractedRef {
     /// A function/method/type definition.
+    ///
+    /// `canonical_kind` is the κ canonical kind of the definition
+    /// (`function` / `method` / `type` / `constant` / `variable` /
+    /// `field` / `module` / `import` / `parameter`), per
+    /// `TsLanguage::canonical_kind`. `None` when the raw grammar kind
+    /// has no κ mapping (open-world escape). Cross-repo follow-up to
+    /// bead `ley-line-open-6e798d` — mache's `dead_code` and
+    /// `god_file` rules filter by symbol-scope κ kind, and having the
+    /// column on `node_defs` avoids a JOIN through
+    /// `node_content.kind` per rule.
     Def {
         token: String,
         node_id: String,
         source_id: String,
         container_node_id: Option<String>,
+        canonical_kind: Option<&'static str>,
     },
     /// A call-site reference.
     Ref {
@@ -56,12 +67,14 @@ pub fn insert_extracted_refs(
                 node_id,
                 source_id,
                 container_node_id,
+                canonical_kind,
             } => crate::schema::insert_def(
                 conn,
                 token,
                 node_id,
                 source_id,
                 container_node_id.as_deref(),
+                *canonical_kind,
             )?,
             ExtractedRef::Ref {
                 token,
@@ -163,6 +176,7 @@ pub fn extract_go(
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
                     container_node_id: container_node_id.map(str::to_string),
+                    canonical_kind: crate::languages::TsLanguage::Go.canonical_kind(node.kind()),
                 });
             }
         }
@@ -185,6 +199,8 @@ pub fn extract_go(
                         node_id: node_id.to_string(),
                         source_id: source_id.to_string(),
                         container_node_id: container_node_id.map(str::to_string),
+                        canonical_kind: crate::languages::TsLanguage::Go
+                            .canonical_kind(node.kind()),
                     });
                 }
                 out.push(ExtractedRef::Def {
@@ -192,6 +208,7 @@ pub fn extract_go(
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
                     container_node_id: container_node_id.map(str::to_string),
+                    canonical_kind: crate::languages::TsLanguage::Go.canonical_kind(node.kind()),
                 });
             }
         }
@@ -205,6 +222,7 @@ pub fn extract_go(
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
                     container_node_id: container_node_id.map(str::to_string),
+                    canonical_kind: crate::languages::TsLanguage::Go.canonical_kind(node.kind()),
                 });
             }
         }
@@ -379,6 +397,8 @@ pub fn extract_rust(
                         node_id: node_id.to_string(),
                         source_id: source_id.to_string(),
                         container_node_id: container_node_id.map(str::to_string),
+                        canonical_kind: crate::languages::TsLanguage::Rust
+                            .canonical_kind(node.kind()),
                     });
                 }
                 out.push(ExtractedRef::Def {
@@ -386,6 +406,7 @@ pub fn extract_rust(
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
                     container_node_id: container_node_id.map(str::to_string),
+                    canonical_kind: crate::languages::TsLanguage::Rust.canonical_kind(node.kind()),
                 });
             }
         }
@@ -400,6 +421,7 @@ pub fn extract_rust(
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
                     container_node_id: container_node_id.map(str::to_string),
+                    canonical_kind: crate::languages::TsLanguage::Rust.canonical_kind(node.kind()),
                 });
             }
         }
@@ -763,6 +785,8 @@ pub fn extract_python(
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
                     container_node_id: container_node_id.map(str::to_string),
+                    canonical_kind: crate::languages::TsLanguage::Python
+                        .canonical_kind(node.kind()),
                 });
             }
             out.push(ExtractedRef::Def {
@@ -770,6 +794,7 @@ pub fn extract_python(
                 node_id: node_id.to_string(),
                 source_id: source_id.to_string(),
                 container_node_id: container_node_id.map(str::to_string),
+                canonical_kind: crate::languages::TsLanguage::Python.canonical_kind(node.kind()),
             });
         }
         "class_definition" => {
@@ -782,6 +807,8 @@ pub fn extract_python(
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
                     container_node_id: container_node_id.map(str::to_string),
+                    canonical_kind: crate::languages::TsLanguage::Python
+                        .canonical_kind(node.kind()),
                 });
             }
         }
@@ -1000,6 +1027,8 @@ pub fn extract_javascript(
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
                     container_node_id: container_node_id.map(str::to_string),
+                    canonical_kind: crate::languages::TsLanguage::JavaScript
+                        .canonical_kind(node.kind()),
                 });
             }
         }
@@ -1013,6 +1042,8 @@ pub fn extract_javascript(
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
                     container_node_id: container_node_id.map(str::to_string),
+                    canonical_kind: crate::languages::TsLanguage::JavaScript
+                        .canonical_kind(node.kind()),
                 });
             }
         }
@@ -1035,6 +1066,8 @@ pub fn extract_javascript(
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
                     container_node_id: container_node_id.map(str::to_string),
+                    canonical_kind: crate::languages::TsLanguage::JavaScript
+                        .canonical_kind(node.kind()),
                 });
             }
             out.push(ExtractedRef::Def {
@@ -1042,6 +1075,8 @@ pub fn extract_javascript(
                 node_id: node_id.to_string(),
                 source_id: source_id.to_string(),
                 container_node_id: container_node_id.map(str::to_string),
+                canonical_kind: crate::languages::TsLanguage::JavaScript
+                    .canonical_kind(node.kind()),
             });
         }
         // `const foo = () => 1;` / `let bar = function () {};` /
@@ -1178,6 +1213,11 @@ fn js_extract_var_bindings(
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
                     container_node_id: container_node_id.map(str::to_string),
+                    // Bound-to-variable functions get κ = "function"
+                    // directly — the enclosing var declarator itself
+                    // maps to "variable" but the DEFINITION being
+                    // recorded here is the function it binds.
+                    canonical_kind: Some("function"),
                 });
             }
             _ => {}
@@ -1331,6 +1371,8 @@ pub fn extract_typescript(
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
                     container_node_id: container_node_id.map(str::to_string),
+                    canonical_kind: crate::languages::TsLanguage::TypeScript
+                        .canonical_kind(node.kind()),
                 });
             }
         }
@@ -1353,6 +1395,8 @@ pub fn extract_typescript(
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
                     container_node_id: container_node_id.map(str::to_string),
+                    canonical_kind: crate::languages::TsLanguage::TypeScript
+                        .canonical_kind(node.kind()),
                 });
             }
         }
@@ -1377,6 +1421,8 @@ pub fn extract_typescript(
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
                     container_node_id: container_node_id.map(str::to_string),
+                    canonical_kind: crate::languages::TsLanguage::TypeScript
+                        .canonical_kind(node.kind()),
                 });
             }
             out.push(ExtractedRef::Def {
@@ -1384,6 +1430,8 @@ pub fn extract_typescript(
                 node_id: node_id.to_string(),
                 source_id: source_id.to_string(),
                 container_node_id: container_node_id.map(str::to_string),
+                canonical_kind: crate::languages::TsLanguage::TypeScript
+                    .canonical_kind(node.kind()),
             });
         }
         // `const foo = () => 1;` / `let bar = function () {};` — same

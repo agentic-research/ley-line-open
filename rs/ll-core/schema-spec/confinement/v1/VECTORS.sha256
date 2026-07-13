@@ -1,0 +1,5 @@
+# SHA-256 pins for cloister/confinement/v1 conformance vectors.
+# Verified by the `verify_vectors_sha256` cargo test in the schema-spec crate.
+# See ../README.md §5-§8 for what these vectors document.
+
+899f4f1449aa970c7c20f4bc2ddd7eb6905f1ad2c3c4985d8aa1dcc495f8169e  test-vectors/manifest-canonical.json

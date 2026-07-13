@@ -1,0 +1,23 @@
+{
+  "credentialSource": "keychain://bundle-X-credentials",
+  "fs": {
+    "allow": [
+      "/etc/hosts",
+      {
+        "mode": "rw",
+        "path": "/var/lib/bundle-X/"
+      }
+    ]
+  },
+  "network": {
+    "allowHosts": [
+      "*.telemetry.example.com",
+      "api.example.com"
+    ]
+  },
+  "port": {
+    "address": "127.0.0.1",
+    "bind": 8443
+  },
+  "version": "cloister/confinement/v1"
+}

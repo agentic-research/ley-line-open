@@ -28,6 +28,11 @@ use std::path::{Path, PathBuf};
 const VECTORS_FILES: &[&str] = &[
     "credential-isolation/v1/VECTORS.sha256",
     "build-cache/v1/vectors/VECTORS.sha256",
+    // Bead ley-line-open-a2f94f: kernel-confinement IDL, sibling to
+    // credential-isolation/v1. Ships a canonical `ConfinementManifest`
+    // JSON vector so two independent implementations reach the same
+    // BLAKE3-256 digest under §6's canonical serialization rules.
+    "confinement/v1/VECTORS.sha256",
 ];
 
 #[test]

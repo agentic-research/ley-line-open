@@ -190,21 +190,38 @@ CREATE INDEX IF NOT EXISTS idx_refs_container ON node_refs(container_node_id) WH
 
 /// DDL for the `node_defs` table — table only, no indexes.
 ///
-/// See `REFS_TABLE_DDL` for `container_node_id` semantics — same shape,
-/// same load-bearing role for consumers that want "definitions inside
-/// this function" queries without a recursive `nodes.parent_id` walk.
+/// See `REFS_TABLE_DDL` for `container_node_id` semantics.
+///
+/// `canonical_kind` (bead follow-up to `ley-line-open-6e798d`, cross-repo
+/// signal from mache 2026-07-13) is the κ canonical kind of the
+/// definition — one of `function`, `method`, `type`, `constant`,
+/// `variable`, `field`, `module`, `import`, `parameter` per
+/// `TsLanguage::canonical_kind`. Nullable so pre-migration DBs read as
+/// NULL (open-world escape). Load-bearing for consumers that filter
+/// dead-code / god-file rules by symbol-scope κ kind — mache's
+/// `dead_code` rule on the LLO projection over-reports 321 vs
+/// tree-sitter's 5 because it treats every `node_defs` row as a
+/// dead-code candidate; adding `WHERE canonical_kind IN ('function',
+/// 'method', 'type')` collapses the count without a JOIN through
+/// `node_content` (which requires `node_hash` populated on every row).
 pub const DEFS_TABLE_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS node_defs (
     token TEXT NOT NULL,
     node_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
-    container_node_id TEXT
+    container_node_id TEXT,
+    canonical_kind TEXT
 );";
 
 /// DDL for the `node_defs` indexes — deferred post-COMMIT.
+///
+/// `idx_defs_canonical_kind` accelerates the mache-shaped `SELECT ...
+/// FROM node_defs WHERE canonical_kind IN (...)` filter — the load-
+/// bearing dead-code/god-file query on the LLO projection.
 pub const DEFS_INDEXES_DDL: &str = "\
 CREATE INDEX IF NOT EXISTS idx_defs_token ON node_defs(token);
-CREATE INDEX IF NOT EXISTS idx_defs_container ON node_defs(container_node_id) WHERE container_node_id IS NOT NULL;";
+CREATE INDEX IF NOT EXISTS idx_defs_container ON node_defs(container_node_id) WHERE container_node_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_defs_canonical_kind ON node_defs(canonical_kind) WHERE canonical_kind IS NOT NULL;";
 
 /// Combined `node_defs` table + index DDL.
 pub const DEFS_DDL: &str = "\
@@ -212,10 +229,12 @@ CREATE TABLE IF NOT EXISTS node_defs (
     token TEXT NOT NULL,
     node_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
-    container_node_id TEXT
+    container_node_id TEXT,
+    canonical_kind TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_defs_token ON node_defs(token);
-CREATE INDEX IF NOT EXISTS idx_defs_container ON node_defs(container_node_id) WHERE container_node_id IS NOT NULL;";
+CREATE INDEX IF NOT EXISTS idx_defs_container ON node_defs(container_node_id) WHERE container_node_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_defs_canonical_kind ON node_defs(canonical_kind) WHERE canonical_kind IS NOT NULL;";
 
 /// DDL for the `_imports` table — table only, no indexes.
 pub const IMPORTS_TABLE_DDL: &str = "\
@@ -395,16 +414,24 @@ pub fn insert_ref(
 /// `container_node_id` = node_id of the nearest enclosing function/method
 /// ancestor (per κ canonical kind); `None` for top-level defs. Bead
 /// `ley-line-open-6e798d`.
+///
+/// `canonical_kind` = κ canonical kind of the def itself
+/// (`function`/`method`/`type`/`constant`/`variable`/`field`/etc.).
+/// `None` when the extractor emitted a raw kind that has no κ mapping.
+/// Enables consumers (mache's `dead_code` / `god_file` rules) to
+/// filter by symbol-scope κ kind without a JOIN through
+/// `node_content.kind`.
 pub fn insert_def(
     conn: &Connection,
     token: &str,
     node_id: &str,
     source_id: &str,
     container_node_id: Option<&str>,
+    canonical_kind: Option<&str>,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO node_defs (token, node_id, source_id, container_node_id) VALUES (?1, ?2, ?3, ?4)",
-        params![token, node_id, source_id, container_node_id],
+        "INSERT INTO node_defs (token, node_id, source_id, container_node_id, canonical_kind) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![token, node_id, source_id, container_node_id, canonical_kind],
     )?;
     Ok(())
 }
@@ -420,6 +447,29 @@ fn has_container_node_id_column(conn: &Connection, table: &str) -> Result<bool> 
         |r| r.get(0),
     )?;
     Ok(n > 0)
+}
+
+/// True when `table` has a `canonical_kind` column. Same additive-
+/// migration pattern as `has_container_node_id_column` — cross-repo
+/// mache-parity follow-up to `ley-line-open-6e798d`.
+fn has_canonical_kind_column(conn: &Connection, table: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = 'canonical_kind'",
+        [table],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Additively stamp a `canonical_kind TEXT` column onto `node_defs`
+/// when it's absent — idempotent. Fresh DBs created via `DEFS_DDL`
+/// already have the column; this migration only fires on legacy
+/// pre-canonical-kind shapes.
+pub fn create_canonical_kind_column(conn: &Connection) -> Result<()> {
+    if !has_canonical_kind_column(conn, "node_defs")? {
+        conn.execute_batch("ALTER TABLE node_defs ADD COLUMN canonical_kind TEXT;")?;
+    }
+    Ok(())
 }
 
 /// Additively stamp a `container_node_id TEXT` column onto `node_refs`
@@ -897,6 +947,7 @@ mod tests {
             "main.go/function_declaration",
             "main.go",
             None,
+            None,
         )
         .unwrap();
         insert_import(&conn, "fmt", "fmt", "main.go").unwrap();
@@ -1038,8 +1089,8 @@ mod tests {
         insert_source(&conn, "b.go", "go", b"package b").unwrap();
         insert_ref(&conn, "Foo", "a.go/call", "a.go", None).unwrap();
         insert_ref(&conn, "Bar", "b.go/call", "b.go", None).unwrap();
-        insert_def(&conn, "Foo", "a.go/func", "a.go", None).unwrap();
-        insert_def(&conn, "Bar", "b.go/func", "b.go", None).unwrap();
+        insert_def(&conn, "Foo", "a.go/func", "a.go", None, None).unwrap();
+        insert_def(&conn, "Bar", "b.go/func", "b.go", None, None).unwrap();
         upsert_file_index(&conn, "a.go", 100, 50).unwrap();
         upsert_file_index(&conn, "b.go", 200, 60).unwrap();
 

@@ -424,15 +424,20 @@ batch_table! {
 }
 
 batch_table! {
-    // node_refs / node_defs occurrence rows (ADR-0027). Both share the
-    // (token, node_id, source_id, node_hash, container_node_id) shape —
-    // node_hash carries the merkle-AST identity of the occurrence node
+    // `node_refs` occurrence rows (ADR-0027). Shape:
+    // (token, node_id, source_id, node_hash, container_node_id).
+    // node_hash carries the merkle-AST identity of the occurrence
     // (ADR-0027); container_node_id (bead ley-line-open-6e798d) carries
     // the enclosing κ function/method's node_id for per-caller
     // aggregation without a recursive _ast walk. Keyed by
     // token+node_id+source_id, NEVER by node_hash (the one-to-many
-    // invariant). `prefix` is rebound at flush time below since
-    // refs/defs target different tables.
+    // invariant).
+    //
+    // Split from the old shared RefBatch when node_defs gained the
+    // `canonical_kind` column (mache-parity follow-up to 6e798d) —
+    // refs don't get canonical_kind because a ref site's κ kind is
+    // `call_expression` etc., not a symbol kind, so the column would
+    // always be NULL. Refs stay at 5 cols; defs are wider.
     RefBatch, RefRow,
     "",
     5,
@@ -451,10 +456,6 @@ batch_table! {
     },
 }
 
-// Override RefBatch::flush_batched to thread the per-table SQL prefix.
-// node_refs / node_defs share the wide-tuple shape but live in different
-// tables; rebinding `prefix` per call keeps the macro-generated buffer
-// reusable across both.
 impl RefBatch {
     fn flush_batched_for(self, conn: &Connection, prefix: &str) -> Result<()> {
         flush_in_batches(conn, self.rows, prefix, 5, |chunk| {
@@ -465,6 +466,56 @@ impl RefBatch {
                 out.push(&r.source_id);
                 out.push(&r.node_hash);
                 out.push(&r.container_node_id);
+            }
+            out
+        })
+    }
+}
+
+batch_table! {
+    // `node_defs` occurrence rows. Wider than RefBatch by one column:
+    // `canonical_kind` (mache-parity follow-up to bead
+    // `ley-line-open-6e798d`, cross-repo signal 2026-07-13). κ kind of
+    // the def itself so consumers filter by symbol-scope κ kind without
+    // JOINing node_content. Same (token, node_id, source_id, node_hash,
+    // container_node_id) shape as refs, plus `canonical_kind`.
+    DefBatch, DefRow,
+    "",
+    6,
+    push_fn: (
+        token: String,
+        node_id: String,
+        source_id: String,
+        node_hash: Option<Vec<u8>>,
+        container_node_id: Option<String>,
+        canonical_kind: Option<&'static str>
+    ),
+    push_body: { DefRow { token, node_id, source_id, node_hash, container_node_id, canonical_kind } },
+    flatten: |chunk| {
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 6);
+        for r in chunk {
+            out.push(&r.token);
+            out.push(&r.node_id);
+            out.push(&r.source_id);
+            out.push(&r.node_hash);
+            out.push(&r.container_node_id);
+            out.push(&r.canonical_kind);
+        }
+        out
+    },
+}
+
+impl DefBatch {
+    fn flush_batched_for(self, conn: &Connection, prefix: &str) -> Result<()> {
+        flush_in_batches(conn, self.rows, prefix, 6, |chunk| {
+            let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 6);
+            for r in chunk {
+                out.push(&r.token);
+                out.push(&r.node_id);
+                out.push(&r.source_id);
+                out.push(&r.node_hash);
+                out.push(&r.container_node_id);
+                out.push(&r.canonical_kind);
             }
             out
         })
@@ -1002,7 +1053,7 @@ pub fn parse_into_conn(
     let mut nodes_buf: NodeBatch = NodeBatch::with_capacity(550_000);
     let mut ast_buf: AstBatch = AstBatch::with_capacity(550_000);
     let mut refs_buf: RefBatch = RefBatch::with_capacity(40_000);
-    let mut defs_buf: RefBatch = RefBatch::with_capacity(3_000);
+    let mut defs_buf: DefBatch = DefBatch::with_capacity(3_000);
     let mut imports_buf: ImportBatch = ImportBatch::with_capacity(2_000);
     let mut source_buf: SourceBatch = SourceBatch::with_capacity(to_parse.len());
     let mut file_idx_buf: FileIdxBatch = FileIdxBatch::with_capacity(to_parse.len());
@@ -1186,9 +1237,17 @@ pub fn parse_into_conn(
                             node_id,
                             source_id,
                             container_node_id,
+                            canonical_kind,
                         } => {
                             let nh = hash_by_id.get(node_id.as_str()).map(|h| h.to_vec());
-                            defs_buf.push(token, node_id, source_id, nh, container_node_id);
+                            defs_buf.push(
+                                token,
+                                node_id,
+                                source_id,
+                                nh,
+                                container_node_id,
+                                canonical_kind,
+                            );
                         }
                         ExtractedRef::Import {
                             alias,
@@ -1248,7 +1307,7 @@ pub fn parse_into_conn(
     )?;
     defs_buf.flush_batched_for(
         conn,
-        "INSERT INTO node_defs (token, node_id, source_id, node_hash, container_node_id) VALUES ",
+        "INSERT INTO node_defs (token, node_id, source_id, node_hash, container_node_id, canonical_kind) VALUES ",
     )?;
     imports_buf.flush_batched(conn)?;
     file_idx_buf.flush_batched(conn)?;

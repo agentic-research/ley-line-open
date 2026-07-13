@@ -10,6 +10,40 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.7.5] — 2026-07-13
+
+**Arena-owner sentinel + node_defs.canonical_kind — closes two mache-observed correctness gaps.**
+
+Patch release bundling two independent fixes filed against mache's 2026-07-13 report of non-deterministic parse state on a shared arena AND rule-quality mismatch on the LLO projection. Wire-compatible with v0.7.4 (`wire_format_major = 1` unchanged); `compat_min_schema_version` stays at 0.6.0.
+
+### Added
+
+- **Arena-owner sentinel with source-root warm-start guard** — `daemon/arena_owner.rs` writes a JSON sentinel (`<arena>.owner`) at startup with `{pid, leyline_version, source_root, started_at_secs}`; new daemons check `kill(pid, 0)` for liveness and refuse when a live peer owns the arena (naming the peer PID + source_root + version in the error). Belt+suspenders with the existing `arena_lock` flock — the sentinel catches pre-0cba88 daemon holdovers that hold no flock (the actual failure mode mache observed). Warm-start now reads `_meta.source_root` and refuses when the arena's prior source disagrees with `--source`, closing the cross-repo cached-parse pollution class. New `--reset-arena` CLI flag as the explicit opt-in for reusing an arena across sources. Four F-gates + 10 pin tests. Bead `ley-line-open-c7d00f`; PR #193.
+
+- **`node_defs.canonical_kind TEXT` column** — populated at parse time with the κ canonical kind of the definition (`function`/`method`/`type`/`constant`/`variable`/`field`/`module`/`import`/`parameter`) per `TsLanguage::canonical_kind`. Closes mache's `dead_code = 321 vs 5` parity gap: LLO's `node_defs` emits defs for every module-level named binding, and mache's rule needs to filter by symbol-scope κ kind. With this column, mache's rule adds `WHERE canonical_kind IN ('function', 'method', 'type')` — one-column indexed filter instead of a JOIN through `node_content.kind`. Partial index `idx_defs_canonical_kind` for O(log n). `RefBatch` (5 cols) split from new `DefBatch` (6 cols); `node_refs` doesn't get the column because a ref-site's raw kind isn't a symbol kind. 3 pin tests including the exact mache-shaped filter query. Bead `ley-line-open-f0a939`; PR #194.
+
+### Non-goals (deferred)
+
+- **Cross-machine arena isolation** — NFS flock semantics are advisory; scoping is per-machine only.
+- **Windows admission** — `arena_lock.rs` stubs; sentinel falls back to "assume alive".
+- **`canonical_kind` on `node_refs`** — semantically unclear (ref-site κ kind is `call_expression`, not a symbol kind). Skipped.
+- **Auto-recovery from cross-source arena pollution** — v1 refuses with `--reset-arena` opt-in.
+- **Backfill for legacy DBs** — additive columns; older DBs read as NULL, re-parse populates.
+
+### Compat matrix
+
+| Field | v0.7.4 | v0.7.5 | Note |
+|-------|--------|--------|------|
+| `binary_version` | 0.7.4 | 0.7.5 | Bump |
+| `schema_version` | 0.7.4 | 0.7.5 | Parity bump (additive `node_defs.canonical_kind`) |
+| `wire_format_major` | 1 | 1 | Unchanged |
+| `compat_min_schema_version` | 0.6.0 | 0.6.0 | Unchanged (both new columns are additive) |
+
+### Not shipped this release
+
+- **Analysis-substrate decade in-flight** — T1.b3-followup (`ley-line-open-a0fadd`), T1.b4, T2, T3, T4, F5 all still open.
+- **`ley-line-open-d5abc2`** — leyline-sign `confinementDigest` cert extension (cloister ask). Filed for a follow-up release.
+
 ## [0.7.4] — 2026-07-13
 
 **`container_node_id` on `node_refs` + `node_defs` — closes mache smell-rule parity.**

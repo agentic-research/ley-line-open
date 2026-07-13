@@ -72,9 +72,19 @@ This v1 **DEFINES** (new content not in either upstream spec):
 
 - `README.md` (this file) — the spec proper.
 - `test-vectors/manifest-canonical.json` — a canonical example
-  manifest with the BLAKE3 digest pinned in `VECTORS.sha256`.
-- `VECTORS.sha256` — SHA-256 pins for the test vectors (verified by
-  the `verify_vectors_sha256` cargo test in the schema-spec crate).
+  manifest.
+- `VECTORS.sha256` — **SHA-256 CONTENT-INTEGRITY pins** for the test
+  vectors ("the bytes on disk haven't drifted"). Verified by
+  `verify_vectors_sha256` (schema-spec crate). This is a
+  cross-cutting concern of the whole spec tree, NOT the
+  identity digest §7 names.
+- `CONFINEMENT_DIGESTS.blake3` — **BLAKE3-256 IDENTITY pins** for the
+  test vectors — the `confinementDigest` per §7. Verified by
+  `verify_confinement_digest` (schema-spec crate). Bead
+  `ley-line-open-193170`: distinct from the SHA-256 integrity pin
+  above because §7's semantics require the substrate's Σ hash
+  (BLAKE3-256), and pinning it separately lets us prove cross-impl
+  conformance on every workspace test run.
 
 ## §1 Four dimensions
 
@@ -189,8 +199,11 @@ by following these rules:
    `null`-valued field is omitted, not emitted as `"field": null`.
 
 The reference example that conforming implementations MUST reach the
-same BLAKE3 digest on is `test-vectors/manifest-canonical.json`, and
-its BLAKE3-256 digest is pinned in `VECTORS.sha256`.
+same BLAKE3-256 digest on is `test-vectors/manifest-canonical.json`.
+Its BLAKE3-256 `confinementDigest` is pinned in
+`CONFINEMENT_DIGESTS.blake3` (not `VECTORS.sha256`, which is a
+SHA-256 content-integrity pin — a distinct concern; see the
+Document map for the split).
 
 ## §7 Committing the manifest to identity
 
@@ -217,9 +230,20 @@ A second implementation is conformant when:
 
 1. It parses `test-vectors/manifest-canonical.json` without error.
 2. Its canonical serialization of the parsed manifest reaches the
-   BLAKE3-256 digest pinned in `VECTORS.sha256` for that vector.
-3. Its enforcement engine implements the four dimensions with
+   BLAKE3-256 `confinementDigest` pinned in
+   `CONFINEMENT_DIGESTS.blake3` for that vector.
+3. Independently, its stored bytes match the SHA-256 content-integrity
+   pin in `VECTORS.sha256` (a cross-cutting spec-tree convention;
+   distinct concern from §7's identity digest).
+4. Its enforcement engine implements the four dimensions with
    fail-closed defaults matching §1's DENY-by-default rule.
-4. Its identity-commit check (§7) refuses to start a bundle whose
+5. Its identity-commit check (§7) refuses to start a bundle whose
    identity claim commits to a `confinementDigest` different from
    the runner's computed one.
+
+Cross-impl conformance already proven: cloister computed
+`d9b5b7270bb6e5ec068aec92798dd76b0f71d1fe2640b3a09833b7742d51c617`
+for `manifest-canonical.json` via `leyline-cas-ffi` (Σ substrate
+hash). LLO's `verify_confinement_digest` test computes the same
+value via the `blake3` crate directly. Byte-identical results prove
+substrate-Σ = direct-blake3 for canonical manifest bytes.

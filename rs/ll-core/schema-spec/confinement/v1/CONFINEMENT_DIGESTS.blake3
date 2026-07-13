@@ -1,0 +1,20 @@
+# BLAKE3-256 pins for cloister/confinement/v1 canonical manifests.
+#
+# Distinct from VECTORS.sha256 (which is a SHA-256 CONTENT INTEGRITY pin
+# via the sha256sum convention). This file pins the BLAKE3-256
+# `confinementDigest` per README §7 — the identity-committed digest a
+# substrate runner computes at bundle-start time and cross-checks against
+# the workload identity's cert extension.
+#
+# The line shape mirrors `sha256sum` (`<64-hex>  <path>`) so the same
+# parser handles both files. Verified by
+# `tests/verify_confinement_digest.rs` (bead ley-line-open-193170).
+#
+# Cross-impl conformance history:
+# - cloister computed this value via leyline-cas-ffi (Σ substrate hash)
+# - LLO computes it via the `blake3` crate directly in this test
+# Byte-identical result → the ContentAddressed impl on `[u8]`
+# (`Hash(*blake3::hash(self).as_bytes())` in leyline-core/substrate.rs)
+# and the direct blake3 crate compute the same digest for the same bytes.
+
+d9b5b7270bb6e5ec068aec92798dd76b0f71d1fe2640b3a09833b7742d51c617  test-vectors/manifest-canonical.json

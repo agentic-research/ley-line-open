@@ -10,6 +10,38 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.7.4] — 2026-07-13
+
+**`container_node_id` on `node_refs` + `node_defs` — closes mache smell-rule parity.**
+
+Patch release. Single-PR delta: adds an additive column materializing the enclosing κ `function`/`method` at parse time, so downstream consumers can `GROUP BY container_node_id` for per-caller aggregation without a recursive `_ast.parent_id` walk. Wire-compatible with v0.7.3 (`wire_format_major = 1` unchanged); `compat_min_schema_version` stays at 0.6.0.
+
+### Added
+
+- **`container_node_id TEXT` column on `node_refs` and `node_defs`** — populated at parse time with the node_id of the nearest enclosing κ `function`/`method` ancestor (per `TsLanguage::canonical_kind`), `NULL` for top-level refs/defs. Closes the mache smell-rule parity gap: mache's `fan_out_skew`, `untested_function`, `dead_code`, and `god_file` rules assume `referrer_node_id` = ID of the CONTAINING function; LLO's `node_refs.node_id` is the AST-native path to the CALL SITE. Same column name, different semantic → `GROUP BY referrer_node_id` collapsed to n=1 per group → `fan_out_skew` filter `n >= 5` killed all rows (33 findings → 0 pre-fix). Now mache's `v_refs` view can `SELECT COALESCE(container_node_id, node_id) AS referrer_node_id` and the rules recover their tree-sitter counts. Additive column via `create_container_id_columns` migration helper (same pattern as `has_node_hash_column` under ADR-0027); legacy DBs read as NULL. Bead `ley-line-open-6e798d`; PR #191.
+  - **`_ast_refs_container` + `_ast_defs_container` partial indexes** for O(log n) `GROUP BY container_node_id` on populated rows.
+  - **4 pin tests** (`container_node_id_test.rs`): same-function refs share container, top-level refs are NULL, `method_declaration` counts as κ container, package-level defs carry NULL.
+  - **No SQL triggers** — inline emission via `fold_children`'s existing ancestor walk is O(1) per node; a trigger would need recursive `_ast.parent_id` lookup on every insert (exactly the O(depth) cost this column eliminates).
+
+### Non-goals (deferred)
+
+- **Qualifier surfacing** — mache noted their `COALESCE(NULLIF(qualifier, ''), token)` fallback handles empty qualifier gracefully. Follow-up would surface `qualifier` (LHS of `selector_expression`, from `BindingRecord.qualifier` T8.7) as a separate `node_refs.qualifier` column and split compound tokens (`format!("{recv}.{name}")`) into `(token, qualifier)`. Not blocking mache's rule rewrite; can layer on later.
+- **Backfill for legacy DBs** — additive column; older DBs read as NULL. Re-parse populates.
+- **Nested closure attribution** — `container_node_id` reflects the nearest lexical function/method ancestor, not the enclosing lambda's lexical parent.
+
+### Compat matrix
+
+| Field | v0.7.3 | v0.7.4 | Note |
+|-------|--------|--------|------|
+| `binary_version` | 0.7.3 | 0.7.4 | Bump |
+| `schema_version` | 0.7.3 | 0.7.4 | Parity bump (new additive column) |
+| `wire_format_major` | 1 | 1 | Unchanged |
+| `compat_min_schema_version` | 0.6.0 | 0.6.0 | Unchanged (additive column; older DBs open cleanly under new binary; older binaries read new DBs but ignore the new column) |
+
+### Not shipped this release
+
+- **Analysis-substrate decade in-flight** — T1.b3-followup (`ley-line-open-a0fadd`), T1.b4, T2, T3, T4, F5 all still open.
+
 ## [0.7.3] — 2026-07-13
 
 **confinement/v1 BLAKE3-256 identity digest + docs consolidation.**

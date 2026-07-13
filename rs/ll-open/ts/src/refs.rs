@@ -9,6 +9,13 @@ use tree_sitter::Node;
 ///
 /// Universal across languages — Go, Python, JS, etc. all produce these.
 /// The extraction function is language-specific; the data type is not.
+///
+/// `container_node_id` (bead `ley-line-open-6e798d`) is the node_id of
+/// the nearest enclosing κ function/method ancestor. `None` for
+/// top-level refs/defs (file-scope declarations, imports). Consumers
+/// use this to `GROUP BY container_node_id` for per-caller aggregation
+/// without a recursive `nodes.parent_id` walk — the primary consumer
+/// today is mache's smell rules (fan_out_skew, untested_function).
 #[derive(Debug, Clone)]
 pub enum ExtractedRef {
     /// A function/method/type definition.
@@ -16,14 +23,18 @@ pub enum ExtractedRef {
         token: String,
         node_id: String,
         source_id: String,
+        container_node_id: Option<String>,
     },
     /// A call-site reference.
     Ref {
         token: String,
         node_id: String,
         source_id: String,
+        container_node_id: Option<String>,
     },
-    /// An import alias→path mapping.
+    /// An import alias→path mapping. No `container_node_id` — imports
+    /// are file-scope by construction; a "container" is not
+    /// well-defined for them.
     Import {
         alias: String,
         path: String,
@@ -44,12 +55,26 @@ pub fn insert_extracted_refs(
                 token,
                 node_id,
                 source_id,
-            } => crate::schema::insert_def(conn, token, node_id, source_id)?,
+                container_node_id,
+            } => crate::schema::insert_def(
+                conn,
+                token,
+                node_id,
+                source_id,
+                container_node_id.as_deref(),
+            )?,
             ExtractedRef::Ref {
                 token,
                 node_id,
                 source_id,
-            } => crate::schema::insert_ref(conn, token, node_id, source_id)?,
+                container_node_id,
+            } => crate::schema::insert_ref(
+                conn,
+                token,
+                node_id,
+                source_id,
+                container_node_id.as_deref(),
+            )?,
             ExtractedRef::Import {
                 alias,
                 path,
@@ -79,21 +104,28 @@ pub fn extract_refs(
     node_id: &str,
     source_id: &str,
     language: crate::languages::TsLanguage,
+    container_node_id: Option<&str>,
 ) -> Vec<ExtractedRef> {
     match language {
         #[cfg(feature = "go")]
-        crate::languages::TsLanguage::Go => extract_go(node, source, node_id, source_id),
+        crate::languages::TsLanguage::Go => {
+            extract_go(node, source, node_id, source_id, container_node_id)
+        }
         #[cfg(feature = "rust")]
-        crate::languages::TsLanguage::Rust => extract_rust(node, source, node_id, source_id),
+        crate::languages::TsLanguage::Rust => {
+            extract_rust(node, source, node_id, source_id, container_node_id)
+        }
         #[cfg(feature = "python")]
-        crate::languages::TsLanguage::Python => extract_python(node, source, node_id, source_id),
+        crate::languages::TsLanguage::Python => {
+            extract_python(node, source, node_id, source_id, container_node_id)
+        }
         #[cfg(feature = "javascript")]
         crate::languages::TsLanguage::JavaScript => {
-            extract_javascript(node, source, node_id, source_id)
+            extract_javascript(node, source, node_id, source_id, container_node_id)
         }
         #[cfg(feature = "typescript")]
         crate::languages::TsLanguage::TypeScript => {
-            extract_typescript(node, source, node_id, source_id)
+            extract_typescript(node, source, node_id, source_id, container_node_id)
         }
         _ => Vec::new(),
     }
@@ -111,7 +143,13 @@ pub fn extract_refs(
 /// - `function_declaration`, `method_declaration`, `type_spec` → Def
 /// - `call_expression` → Ref (simple) or Ref (qualified: "pkg.Func")
 /// - `import_spec` → Import
-pub fn extract_go(node: &Node, source: &[u8], node_id: &str, source_id: &str) -> Vec<ExtractedRef> {
+pub fn extract_go(
+    node: &Node,
+    source: &[u8],
+    node_id: &str,
+    source_id: &str,
+    container_node_id: Option<&str>,
+) -> Vec<ExtractedRef> {
     let mut out = Vec::new();
 
     match node.kind() {
@@ -124,6 +162,7 @@ pub fn extract_go(node: &Node, source: &[u8], node_id: &str, source_id: &str) ->
                     token: token.to_string(),
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
+                    container_node_id: container_node_id.map(str::to_string),
                 });
             }
         }
@@ -145,12 +184,14 @@ pub fn extract_go(node: &Node, source: &[u8], node_id: &str, source_id: &str) ->
                         token: format!("{recv}.{name}"),
                         node_id: node_id.to_string(),
                         source_id: source_id.to_string(),
+                        container_node_id: container_node_id.map(str::to_string),
                     });
                 }
                 out.push(ExtractedRef::Def {
                     token: name.to_string(),
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
+                    container_node_id: container_node_id.map(str::to_string),
                 });
             }
         }
@@ -163,6 +204,7 @@ pub fn extract_go(node: &Node, source: &[u8], node_id: &str, source_id: &str) ->
                     token: token.to_string(),
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
+                    container_node_id: container_node_id.map(str::to_string),
                 });
             }
         }
@@ -177,6 +219,7 @@ pub fn extract_go(node: &Node, source: &[u8], node_id: &str, source_id: &str) ->
                                 token: token.to_string(),
                                 node_id: node_id.to_string(),
                                 source_id: source_id.to_string(),
+                                container_node_id: container_node_id.map(str::to_string),
                             });
                         }
                     }
@@ -195,12 +238,14 @@ pub fn extract_go(node: &Node, source: &[u8], node_id: &str, source_id: &str) ->
                                     token: format!("{pkg}.{func}"),
                                     node_id: node_id.to_string(),
                                     source_id: source_id.to_string(),
+                                    container_node_id: container_node_id.map(str::to_string),
                                 });
                             }
                             out.push(ExtractedRef::Ref {
                                 token: func.to_string(),
                                 node_id: node_id.to_string(),
                                 source_id: source_id.to_string(),
+                                container_node_id: container_node_id.map(str::to_string),
                             });
                         }
                     }
@@ -305,6 +350,7 @@ pub fn extract_rust(
     source: &[u8],
     node_id: &str,
     source_id: &str,
+    container_node_id: Option<&str>,
 ) -> Vec<ExtractedRef> {
     let mut out = Vec::new();
 
@@ -332,12 +378,14 @@ pub fn extract_rust(
                         token: format!("{recv}::{name}"),
                         node_id: node_id.to_string(),
                         source_id: source_id.to_string(),
+                        container_node_id: container_node_id.map(str::to_string),
                     });
                 }
                 out.push(ExtractedRef::Def {
                     token: name.to_string(),
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
+                    container_node_id: container_node_id.map(str::to_string),
                 });
             }
         }
@@ -351,6 +399,7 @@ pub fn extract_rust(
                     token: token.to_string(),
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
+                    container_node_id: container_node_id.map(str::to_string),
                 });
             }
         }
@@ -369,6 +418,7 @@ pub fn extract_rust(
                                 token: token.to_string(),
                                 node_id: node_id.to_string(),
                                 source_id: source_id.to_string(),
+                                container_node_id: container_node_id.map(str::to_string),
                             });
                         }
                     }
@@ -383,6 +433,7 @@ pub fn extract_rust(
                                 token: token.to_string(),
                                 node_id: node_id.to_string(),
                                 source_id: source_id.to_string(),
+                                container_node_id: container_node_id.map(str::to_string),
                             });
                         }
                     }
@@ -401,12 +452,14 @@ pub fn extract_rust(
                                     token: qualified.to_string(),
                                     node_id: node_id.to_string(),
                                     source_id: source_id.to_string(),
+                                    container_node_id: container_node_id.map(str::to_string),
                                 });
                             }
                             out.push(ExtractedRef::Ref {
                                 token: bare.to_string(),
                                 node_id: node_id.to_string(),
                                 source_id: source_id.to_string(),
+                                container_node_id: container_node_id.map(str::to_string),
                             });
                         }
                     }
@@ -431,6 +484,7 @@ pub fn extract_rust(
                         token: token.to_string(),
                         node_id: node_id.to_string(),
                         source_id: source_id.to_string(),
+                        container_node_id: container_node_id.map(str::to_string),
                     });
                 }
             }
@@ -684,6 +738,7 @@ pub fn extract_python(
     source: &[u8],
     node_id: &str,
     source_id: &str,
+    container_node_id: Option<&str>,
 ) -> Vec<ExtractedRef> {
     let mut out = Vec::new();
 
@@ -707,12 +762,14 @@ pub fn extract_python(
                     token: format!("{cls}.{name}"),
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
+                    container_node_id: container_node_id.map(str::to_string),
                 });
             }
             out.push(ExtractedRef::Def {
                 token: name.to_string(),
                 node_id: node_id.to_string(),
                 source_id: source_id.to_string(),
+                container_node_id: container_node_id.map(str::to_string),
             });
         }
         "class_definition" => {
@@ -724,6 +781,7 @@ pub fn extract_python(
                     token: token.to_string(),
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
+                    container_node_id: container_node_id.map(str::to_string),
                 });
             }
         }
@@ -738,6 +796,7 @@ pub fn extract_python(
                                 token: token.to_string(),
                                 node_id: node_id.to_string(),
                                 source_id: source_id.to_string(),
+                                container_node_id: container_node_id.map(str::to_string),
                             });
                         }
                     }
@@ -756,12 +815,14 @@ pub fn extract_python(
                                     token: format!("{obj}.{attr}"),
                                     node_id: node_id.to_string(),
                                     source_id: source_id.to_string(),
+                                    container_node_id: container_node_id.map(str::to_string),
                                 });
                             }
                             out.push(ExtractedRef::Ref {
                                 token: attr.to_string(),
                                 node_id: node_id.to_string(),
                                 source_id: source_id.to_string(),
+                                container_node_id: container_node_id.map(str::to_string),
                             });
                         }
                     }
@@ -924,6 +985,7 @@ pub fn extract_javascript(
     source: &[u8],
     node_id: &str,
     source_id: &str,
+    container_node_id: Option<&str>,
 ) -> Vec<ExtractedRef> {
     let mut out = Vec::new();
 
@@ -937,6 +999,7 @@ pub fn extract_javascript(
                     token: token.to_string(),
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
+                    container_node_id: container_node_id.map(str::to_string),
                 });
             }
         }
@@ -949,6 +1012,7 @@ pub fn extract_javascript(
                     token: token.to_string(),
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
+                    container_node_id: container_node_id.map(str::to_string),
                 });
             }
         }
@@ -970,12 +1034,14 @@ pub fn extract_javascript(
                     token: format!("{cls}.{name}"),
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
+                    container_node_id: container_node_id.map(str::to_string),
                 });
             }
             out.push(ExtractedRef::Def {
                 token: name.to_string(),
                 node_id: node_id.to_string(),
                 source_id: source_id.to_string(),
+                container_node_id: container_node_id.map(str::to_string),
             });
         }
         // `const foo = () => 1;` / `let bar = function () {};` /
@@ -990,7 +1056,14 @@ pub fn extract_javascript(
         // the plain-binding case, so tree-sitter's own field lookup does
         // the filtering for us.
         "lexical_declaration" | "variable_declaration" => {
-            js_extract_var_bindings(node, source, node_id, source_id, &mut out);
+            js_extract_var_bindings(
+                node,
+                source,
+                node_id,
+                source_id,
+                container_node_id,
+                &mut out,
+            );
         }
         "call_expression" => {
             if let Some(func_node) = node.child_by_field_name("function") {
@@ -1003,6 +1076,7 @@ pub fn extract_javascript(
                                 token: token.to_string(),
                                 node_id: node_id.to_string(),
                                 source_id: source_id.to_string(),
+                                container_node_id: container_node_id.map(str::to_string),
                             });
                         }
                     }
@@ -1021,12 +1095,14 @@ pub fn extract_javascript(
                                     token: format!("{obj}.{prop}"),
                                     node_id: node_id.to_string(),
                                     source_id: source_id.to_string(),
+                                    container_node_id: container_node_id.map(str::to_string),
                                 });
                             }
                             out.push(ExtractedRef::Ref {
                                 token: prop.to_string(),
                                 node_id: node_id.to_string(),
                                 source_id: source_id.to_string(),
+                                container_node_id: container_node_id.map(str::to_string),
                             });
                         }
                     }
@@ -1071,6 +1147,7 @@ fn js_extract_var_bindings(
     source: &[u8],
     node_id: &str,
     source_id: &str,
+    container_node_id: Option<&str>,
     out: &mut Vec<ExtractedRef>,
 ) {
     let mut cursor = decl_node.walk();
@@ -1100,6 +1177,7 @@ fn js_extract_var_bindings(
                     token: name.to_string(),
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
+                    container_node_id: container_node_id.map(str::to_string),
                 });
             }
             _ => {}
@@ -1238,6 +1316,7 @@ pub fn extract_typescript(
     source: &[u8],
     node_id: &str,
     source_id: &str,
+    container_node_id: Option<&str>,
 ) -> Vec<ExtractedRef> {
     let mut out = Vec::new();
 
@@ -1251,6 +1330,7 @@ pub fn extract_typescript(
                     token: token.to_string(),
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
+                    container_node_id: container_node_id.map(str::to_string),
                 });
             }
         }
@@ -1272,6 +1352,7 @@ pub fn extract_typescript(
                     token: token.to_string(),
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
+                    container_node_id: container_node_id.map(str::to_string),
                 });
             }
         }
@@ -1295,12 +1376,14 @@ pub fn extract_typescript(
                     token: format!("{cls}.{name}"),
                     node_id: node_id.to_string(),
                     source_id: source_id.to_string(),
+                    container_node_id: container_node_id.map(str::to_string),
                 });
             }
             out.push(ExtractedRef::Def {
                 token: name.to_string(),
                 node_id: node_id.to_string(),
                 source_id: source_id.to_string(),
+                container_node_id: container_node_id.map(str::to_string),
             });
         }
         // `const foo = () => 1;` / `let bar = function () {};` — same
@@ -1310,7 +1393,14 @@ pub fn extract_typescript(
         // `variable_declarator` / `arrow_function` /
         // `function_expression` node kinds unchanged.
         "lexical_declaration" | "variable_declaration" => {
-            js_extract_var_bindings(node, source, node_id, source_id, &mut out);
+            js_extract_var_bindings(
+                node,
+                source,
+                node_id,
+                source_id,
+                container_node_id,
+                &mut out,
+            );
         }
         "call_expression" => {
             if let Some(func_node) = node.child_by_field_name("function") {
@@ -1323,6 +1413,7 @@ pub fn extract_typescript(
                                 token: token.to_string(),
                                 node_id: node_id.to_string(),
                                 source_id: source_id.to_string(),
+                                container_node_id: container_node_id.map(str::to_string),
                             });
                         }
                     }
@@ -1341,12 +1432,14 @@ pub fn extract_typescript(
                                     token: format!("{obj}.{prop}"),
                                     node_id: node_id.to_string(),
                                     source_id: source_id.to_string(),
+                                    container_node_id: container_node_id.map(str::to_string),
                                 });
                             }
                             out.push(ExtractedRef::Ref {
                                 token: prop.to_string(),
                                 node_id: node_id.to_string(),
                                 source_id: source_id.to_string(),
+                                container_node_id: container_node_id.map(str::to_string),
                             });
                         }
                     }
@@ -1507,7 +1600,7 @@ mod tests {
                 let child = cursor.node();
                 if child.is_named() {
                     let id = format!("{prefix}/{}", child.kind());
-                    let refs = extract_go(&child, src, &id, "test.go");
+                    let refs = extract_go(&child, src, &id, "test.go", None);
                     insert_extracted_refs(conn, &refs).unwrap();
                     walk_and_insert(child, src, conn, &id);
                 }
@@ -1618,7 +1711,7 @@ mod rust_tests {
                 let child = cursor.node();
                 if child.is_named() {
                     let id = format!("{prefix}/{}", child.kind());
-                    let refs = extract_rust(&child, src, &id, "test.rs");
+                    let refs = extract_rust(&child, src, &id, "test.rs", None);
                     insert_extracted_refs(conn, &refs).unwrap();
                     walk_and_insert(child, src, conn, &id);
                 }

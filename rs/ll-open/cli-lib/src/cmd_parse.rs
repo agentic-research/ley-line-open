@@ -425,41 +425,46 @@ batch_table! {
 
 batch_table! {
     // node_refs / node_defs occurrence rows (ADR-0027). Both share the
-    // (token, node_id, source_id, node_hash) shape — the additive
-    // `node_hash` pointer carries the merkle-AST identity of the occurrence
-    // node. Keyed by token+node_id+source_id, NEVER by node_hash (the
-    // one-to-many invariant). `prefix` is rebound at flush time below since
+    // (token, node_id, source_id, node_hash, container_node_id) shape —
+    // node_hash carries the merkle-AST identity of the occurrence node
+    // (ADR-0027); container_node_id (bead ley-line-open-6e798d) carries
+    // the enclosing κ function/method's node_id for per-caller
+    // aggregation without a recursive _ast walk. Keyed by
+    // token+node_id+source_id, NEVER by node_hash (the one-to-many
+    // invariant). `prefix` is rebound at flush time below since
     // refs/defs target different tables.
     RefBatch, RefRow,
     "",
-    4,
-    push_fn: (token: String, node_id: String, source_id: String, node_hash: Option<Vec<u8>>),
-    push_body: { RefRow { token, node_id, source_id, node_hash } },
+    5,
+    push_fn: (token: String, node_id: String, source_id: String, node_hash: Option<Vec<u8>>, container_node_id: Option<String>),
+    push_body: { RefRow { token, node_id, source_id, node_hash, container_node_id } },
     flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 4);
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 5);
         for r in chunk {
             out.push(&r.token);
             out.push(&r.node_id);
             out.push(&r.source_id);
             out.push(&r.node_hash);
+            out.push(&r.container_node_id);
         }
         out
     },
 }
 
 // Override RefBatch::flush_batched to thread the per-table SQL prefix.
-// node_refs / node_defs share the (token, node_id, source_id, node_hash)
-// shape but live in different tables; rebinding `prefix` per call keeps the
-// macro-generated buffer reusable across both.
+// node_refs / node_defs share the wide-tuple shape but live in different
+// tables; rebinding `prefix` per call keeps the macro-generated buffer
+// reusable across both.
 impl RefBatch {
     fn flush_batched_for(self, conn: &Connection, prefix: &str) -> Result<()> {
-        flush_in_batches(conn, self.rows, prefix, 4, |chunk| {
-            let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 4);
+        flush_in_batches(conn, self.rows, prefix, 5, |chunk| {
+            let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 5);
             for r in chunk {
                 out.push(&r.token);
                 out.push(&r.node_id);
                 out.push(&r.source_id);
                 out.push(&r.node_hash);
+                out.push(&r.container_node_id);
             }
             out
         })
@@ -1171,17 +1176,19 @@ pub fn parse_into_conn(
                             token,
                             node_id,
                             source_id,
+                            container_node_id,
                         } => {
                             let nh = hash_by_id.get(node_id.as_str()).map(|h| h.to_vec());
-                            refs_buf.push(token, node_id, source_id, nh);
+                            refs_buf.push(token, node_id, source_id, nh, container_node_id);
                         }
                         ExtractedRef::Def {
                             token,
                             node_id,
                             source_id,
+                            container_node_id,
                         } => {
                             let nh = hash_by_id.get(node_id.as_str()).map(|h| h.to_vec());
-                            defs_buf.push(token, node_id, source_id, nh);
+                            defs_buf.push(token, node_id, source_id, nh, container_node_id);
                         }
                         ExtractedRef::Import {
                             alias,
@@ -1237,11 +1244,11 @@ pub fn parse_into_conn(
     source_buf.flush_batched(conn)?;
     refs_buf.flush_batched_for(
         conn,
-        "INSERT INTO node_refs (token, node_id, source_id, node_hash) VALUES ",
+        "INSERT INTO node_refs (token, node_id, source_id, node_hash, container_node_id) VALUES ",
     )?;
     defs_buf.flush_batched_for(
         conn,
-        "INSERT INTO node_defs (token, node_id, source_id, node_hash) VALUES ",
+        "INSERT INTO node_defs (token, node_id, source_id, node_hash, container_node_id) VALUES ",
     )?;
     imports_buf.flush_batched(conn)?;
     file_idx_buf.flush_batched(conn)?;
@@ -2104,6 +2111,8 @@ fn parse_file_pure(
         source_id,
         language,
         lang_name,
+        // Bead ley-line-open-6e798d: root has no enclosing function/method.
+        None,
         &mut seen,
         &mut nodes,
         &mut ast_entries,
@@ -2197,6 +2206,11 @@ fn fold_children(
     source_id: &str,
     language: TsLanguage,
     lang_name: &str,
+    // Bead `ley-line-open-6e798d`: node_id of the nearest enclosing κ
+    // `function`/`method` ancestor. `None` at top level. When we descend
+    // into a child whose κ canonical kind is `function`/`method`, we
+    // pass its own `id` as the new container for its subtree.
+    container_node_id: Option<&str>,
     seen: &mut HashSet<[u8; 32]>,
     nodes: &mut Vec<ParsedNode>,
     ast_entries: &mut Vec<AstEntry>,
@@ -2261,7 +2275,17 @@ fn fold_children(
             });
 
             // Refs via the language-dispatched factory.
-            refs.extend(extract_refs(child, content, &id, source_id, language));
+            // Bead ley-line-open-6e798d: pass the current container so
+            // every ExtractedRef::{Def, Ref} the language extractor
+            // emits carries the enclosing κ function/method's node_id.
+            refs.extend(extract_refs(
+                child,
+                content,
+                &id,
+                source_id,
+                language,
+                container_node_id,
+            ));
 
             // Structural `nodes` row: kind 1 (dir-like) when the child has
             // named children, else kind 0 (leaf) carrying its text.
@@ -2305,6 +2329,20 @@ fn fold_children(
             // Fold the child's subtree (all non-extra grandchildren — even
             // when it has no NAMED children, its anonymous tokens still shape
             // its hash), then stamp the resulting address onto the occurrence.
+            //
+            // Bead ley-line-open-6e798d: if THIS child is itself a
+            // function/method (per κ), its subtree's container becomes
+            // its own id — every ref/def inside it will carry that
+            // container. Otherwise the enclosing container passes through
+            // unchanged.
+            let child_container_owned;
+            let child_container = match language.canonical_kind(child.kind()) {
+                Some("function") | Some("method") => {
+                    child_container_owned = id.clone();
+                    Some(child_container_owned.as_str())
+                }
+                _ => container_node_id,
+            };
             let child_hash = fold_children(
                 content,
                 *child,
@@ -2312,6 +2350,7 @@ fn fold_children(
                 source_id,
                 language,
                 lang_name,
+                child_container,
                 seen,
                 nodes,
                 ast_entries,
@@ -2325,6 +2364,8 @@ fn fold_children(
             // Anonymous child: a terminal token. No _ast/nodes row — it only
             // contributes its leaf hash to this node's fold. `node_id` is
             // unused for anonymous nodes (terminals have no named children).
+            // Container passes through — anonymous tokens can't introduce
+            // a new function scope.
             let child_hash = fold_children(
                 content,
                 *child,
@@ -2332,6 +2373,7 @@ fn fold_children(
                 source_id,
                 language,
                 lang_name,
+                container_node_id,
                 seen,
                 nodes,
                 ast_entries,

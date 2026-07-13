@@ -150,47 +150,72 @@ pub fn insert_ast(
 // ---------------------------------------------------------------------------
 
 /// DDL for the `node_refs` table — table only, no indexes.
+///
+/// `container_node_id` is the node_id of the nearest ancestor whose κ
+/// canonical kind is `function` or `method` — i.e. "which function/method
+/// does this ref live inside?" NULL for top-level refs (file-scope
+/// declarations, imports at the top of a Go file, etc.). Bead
+/// `ley-line-open-6e798d` — the load-bearing signal mache's
+/// `fan_out_skew` + `untested_function` rules `GROUP BY` on to get
+/// per-caller aggregation. Additive column: legacy DBs read it as NULL
+/// via `create_container_id_columns`'s idempotent ALTER path.
 pub const REFS_TABLE_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS node_refs (
     token TEXT NOT NULL,
     node_id TEXT NOT NULL,
-    source_id TEXT NOT NULL
+    source_id TEXT NOT NULL,
+    container_node_id TEXT
 );";
 
 /// DDL for the `node_refs` indexes — deferred post-COMMIT.
+///
+/// `idx_refs_container` accelerates `GROUP BY container_node_id` —
+/// mache's fan_out_skew query is a per-container aggregate over v_refs.
 pub const REFS_INDEXES_DDL: &str = "\
 CREATE INDEX IF NOT EXISTS idx_refs_token ON node_refs(token);
-CREATE INDEX IF NOT EXISTS idx_refs_node ON node_refs(node_id);";
+CREATE INDEX IF NOT EXISTS idx_refs_node ON node_refs(node_id);
+CREATE INDEX IF NOT EXISTS idx_refs_container ON node_refs(container_node_id) WHERE container_node_id IS NOT NULL;";
 
 /// Combined `node_refs` table + index DDL.
 pub const REFS_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS node_refs (
     token TEXT NOT NULL,
     node_id TEXT NOT NULL,
-    source_id TEXT NOT NULL
+    source_id TEXT NOT NULL,
+    container_node_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_refs_token ON node_refs(token);
-CREATE INDEX IF NOT EXISTS idx_refs_node ON node_refs(node_id);";
+CREATE INDEX IF NOT EXISTS idx_refs_node ON node_refs(node_id);
+CREATE INDEX IF NOT EXISTS idx_refs_container ON node_refs(container_node_id) WHERE container_node_id IS NOT NULL;";
 
 /// DDL for the `node_defs` table — table only, no indexes.
+///
+/// See `REFS_TABLE_DDL` for `container_node_id` semantics — same shape,
+/// same load-bearing role for consumers that want "definitions inside
+/// this function" queries without a recursive `nodes.parent_id` walk.
 pub const DEFS_TABLE_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS node_defs (
     token TEXT NOT NULL,
     node_id TEXT NOT NULL,
-    source_id TEXT NOT NULL
+    source_id TEXT NOT NULL,
+    container_node_id TEXT
 );";
 
 /// DDL for the `node_defs` indexes — deferred post-COMMIT.
-pub const DEFS_INDEXES_DDL: &str = "CREATE INDEX IF NOT EXISTS idx_defs_token ON node_defs(token);";
+pub const DEFS_INDEXES_DDL: &str = "\
+CREATE INDEX IF NOT EXISTS idx_defs_token ON node_defs(token);
+CREATE INDEX IF NOT EXISTS idx_defs_container ON node_defs(container_node_id) WHERE container_node_id IS NOT NULL;";
 
 /// Combined `node_defs` table + index DDL.
 pub const DEFS_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS node_defs (
     token TEXT NOT NULL,
     node_id TEXT NOT NULL,
-    source_id TEXT NOT NULL
+    source_id TEXT NOT NULL,
+    container_node_id TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_defs_token ON node_defs(token);";
+CREATE INDEX IF NOT EXISTS idx_defs_token ON node_defs(token);
+CREATE INDEX IF NOT EXISTS idx_defs_container ON node_defs(container_node_id) WHERE container_node_id IS NOT NULL;";
 
 /// DDL for the `_imports` table — table only, no indexes.
 pub const IMPORTS_TABLE_DDL: &str = "\
@@ -347,20 +372,72 @@ pub fn create_refs_indexes(conn: &Connection) -> Result<()> {
 }
 
 /// Insert a reference row.
-pub fn insert_ref(conn: &Connection, token: &str, node_id: &str, source_id: &str) -> Result<()> {
+///
+/// `container_node_id` = node_id of the nearest enclosing function/method
+/// ancestor (per κ canonical kind); `None` for top-level refs. Bead
+/// `ley-line-open-6e798d`.
+pub fn insert_ref(
+    conn: &Connection,
+    token: &str,
+    node_id: &str,
+    source_id: &str,
+    container_node_id: Option<&str>,
+) -> Result<()> {
     conn.execute(
-        "INSERT INTO node_refs (token, node_id, source_id) VALUES (?1, ?2, ?3)",
-        params![token, node_id, source_id],
+        "INSERT INTO node_refs (token, node_id, source_id, container_node_id) VALUES (?1, ?2, ?3, ?4)",
+        params![token, node_id, source_id, container_node_id],
     )?;
     Ok(())
 }
 
 /// Insert a definition row.
-pub fn insert_def(conn: &Connection, token: &str, node_id: &str, source_id: &str) -> Result<()> {
+///
+/// `container_node_id` = node_id of the nearest enclosing function/method
+/// ancestor (per κ canonical kind); `None` for top-level defs. Bead
+/// `ley-line-open-6e798d`.
+pub fn insert_def(
+    conn: &Connection,
+    token: &str,
+    node_id: &str,
+    source_id: &str,
+    container_node_id: Option<&str>,
+) -> Result<()> {
     conn.execute(
-        "INSERT INTO node_defs (token, node_id, source_id) VALUES (?1, ?2, ?3)",
-        params![token, node_id, source_id],
+        "INSERT INTO node_defs (token, node_id, source_id, container_node_id) VALUES (?1, ?2, ?3, ?4)",
+        params![token, node_id, source_id, container_node_id],
     )?;
+    Ok(())
+}
+
+/// True when `table` has a `container_node_id` column. Same pattern as
+/// `has_node_hash_column` — SQLite has no `ADD COLUMN IF NOT EXISTS`,
+/// so the additive migration probes `pragma_table_info` and only ALTERs
+/// when the column is absent. Bead `ley-line-open-6e798d`.
+fn has_container_node_id_column(conn: &Connection, table: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = 'container_node_id'",
+        [table],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Additively stamp a `container_node_id TEXT` column onto `node_refs`
+/// and `node_defs` when it's absent — idempotent, safe on repeat call
+/// against a v0.7.4+ DB (bead `ley-line-open-6e798d`) and safe on a
+/// legacy pre-6e798d DB (adds the column with NULLs on existing rows).
+///
+/// Must be called AFTER `create_refs_tables` (the ALTER targets must
+/// exist). Fresh DBs created via `REFS_DDL` / `DEFS_DDL` already have
+/// the column; this migration only fires on legacy shapes.
+pub fn create_container_id_columns(conn: &Connection) -> Result<()> {
+    for table in ["node_refs", "node_defs"] {
+        if !has_container_node_id_column(conn, table)? {
+            conn.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN container_node_id TEXT;"
+            ))?;
+        }
+    }
     Ok(())
 }
 
@@ -813,8 +890,15 @@ mod tests {
         create_ast_schema(&conn).unwrap();
         create_refs_schema(&conn).unwrap();
 
-        insert_ref(&conn, "Println", "main.go/call_expression", "main.go").unwrap();
-        insert_def(&conn, "Add", "main.go/function_declaration", "main.go").unwrap();
+        insert_ref(&conn, "Println", "main.go/call_expression", "main.go", None).unwrap();
+        insert_def(
+            &conn,
+            "Add",
+            "main.go/function_declaration",
+            "main.go",
+            None,
+        )
+        .unwrap();
         insert_import(&conn, "fmt", "fmt", "main.go").unwrap();
 
         let ref_count: i64 = conn
@@ -952,10 +1036,10 @@ mod tests {
         insert_node(&conn, "b.go/func", "b.go", "func", 0, 10, 0, "body").unwrap();
         insert_source(&conn, "a.go", "go", b"package a").unwrap();
         insert_source(&conn, "b.go", "go", b"package b").unwrap();
-        insert_ref(&conn, "Foo", "a.go/call", "a.go").unwrap();
-        insert_ref(&conn, "Bar", "b.go/call", "b.go").unwrap();
-        insert_def(&conn, "Foo", "a.go/func", "a.go").unwrap();
-        insert_def(&conn, "Bar", "b.go/func", "b.go").unwrap();
+        insert_ref(&conn, "Foo", "a.go/call", "a.go", None).unwrap();
+        insert_ref(&conn, "Bar", "b.go/call", "b.go", None).unwrap();
+        insert_def(&conn, "Foo", "a.go/func", "a.go", None).unwrap();
+        insert_def(&conn, "Bar", "b.go/func", "b.go", None).unwrap();
         upsert_file_index(&conn, "a.go", 100, 50).unwrap();
         upsert_file_index(&conn, "b.go", 200, 60).unwrap();
 

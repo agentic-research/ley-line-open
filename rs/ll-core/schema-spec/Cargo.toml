@@ -32,3 +32,9 @@ sha2 = "0.11"
 # field matches the containing spec-version directory. serde_json is a
 # workspace-declared dep (see rs/Cargo.toml), so this dev-dep just opts in.
 serde_json = { workspace = true }
+# Bead ley-line-open-193170: `verify_confinement_digest` computes the
+# BLAKE3-256 `confinementDigest` per confinement/v1 README §7 and asserts
+# it matches the pin in `CONFINEMENT_DIGESTS.blake3`. Distinct from the
+# SHA-256 content-integrity pin — this is the substrate's Σ hash used for
+# identity commitment. Workspace-declared dep.
+blake3 = { workspace = true }

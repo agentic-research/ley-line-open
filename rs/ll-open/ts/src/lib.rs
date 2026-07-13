@@ -6,6 +6,7 @@
 //! Standalone crate — depends on `rusqlite` + `tree-sitter` + `leyline-schema`.
 //! Free of fuser/nfsserve/tokio dependencies.
 
+pub mod cfg;
 pub mod languages;
 pub mod project;
 #[cfg(feature = "pyproject")]

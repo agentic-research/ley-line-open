@@ -3428,6 +3428,7 @@ name = "leyline-ts"
 version = "0.7.1"
 dependencies = [
  "anyhow",
+ "leyline-core",
  "leyline-schema",
  "rusqlite",
  "serde_json",

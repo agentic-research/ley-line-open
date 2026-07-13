@@ -62,6 +62,13 @@ tree-sitter-javascript = { version = "0.25", optional = true }
 # against the workspace tree-sitter.
 tree-sitter-typescript = { version = "0.23", optional = true }
 leyline-schema = { path = "../../ll-core/schema" }
+# Bead ley-line-open-46f7d1 (T1.b3): the CFG builder computes a
+# content-addressed hash for function-body subtrees via the Σ substrate's
+# `ContentAddressed` impl — matches the `blake3::hash` path enforced by
+# the `lint:blake3` gate. Adding leyline-core as a direct dep here keeps
+# leyline-ts on the σ substrate discipline without a new sanctioned
+# exception.
+leyline-core = { path = "../../ll-core/core" }
 rusqlite = { workspace = true, features = ["bundled", "serialize"] }
 serde_json = { workspace = true }
 anyhow = { workspace = true }

@@ -107,6 +107,17 @@ enum Cmd {
         /// as a warning at startup.
         #[arg(long, default_value_t = false)]
         mcp_no_auth: bool,
+
+        /// Drop any existing live-db + zero the controller so this
+        /// daemon starts with a cold parse against `--source`,
+        /// regardless of what the arena's prior owner left behind.
+        ///
+        /// Required opt-in when reusing an arena that previously
+        /// served a different `--source` (otherwise startup refuses
+        /// with a source-root-mismatch error). Bead
+        /// `ley-line-open-c7d00f`.
+        #[arg(long, default_value_t = false)]
+        reset_arena: bool,
     },
 }
 
@@ -176,6 +187,7 @@ async fn main() -> Result<()> {
             mcp_bind,
             mcp_allow_public,
             mcp_no_auth,
+            reset_arena,
         } => {
             // KNOWN scale limitation: arena_size_mib defaults to 64
             // (see Cmd::Daemon { arena_size_mib, default_value_t = 64 }).
@@ -205,6 +217,7 @@ async fn main() -> Result<()> {
                 mcp_bind,
                 mcp_allow_public,
                 mcp_no_auth,
+                reset_arena,
             };
             leyline_cli_lib::cmd_daemon::run_daemon(
                 config,

@@ -130,23 +130,42 @@ Or via Taskfile (preferred — wraps pkg-config for macFUSE-less hosts via the v
 
 ```bash
 task ci      # check + clippy + test (workspace 285+ tests)
-task install # build release + codesign with entitlements + install to ~/.local/bin
 ```
 
-macOS prereq: `brew install fuse-t` (no kernel extension needed).
-Linux prereq: `apt-get install libfuse3-dev`.
-Capnp prereq (both): `brew install capnp` / `apt-get install capnproto` (required for build.rs codegen; pinned to ≥1.3.0).
+### Install
 
-Optional: `brew install sccache` (or `cargo install sccache`) accelerates `task release` / `task install` by caching byte-stable rustc work across invocations. The Taskfile auto-detects the binary at startup and sets `RUSTC_WRAPPER` only when present; no config needed.
+Three install paths, matching the three feature-graph shapes on `leyline-cli`:
+
+| Command | Features | When to use |
+|---------|----------|-------------|
+| `task install` | `lsp` + `validate` + `hdc` (default) | Structural-analysis core only. Portable, no system deps. Small binary. |
+| **`task install:full`** | `--features all` = adds `vec` (fastembed) + `text-search` (WitchcraftEngine). NO mount | **Recommended for downstream consumers** (mache / cloister / notme / rosary). Portable — no libfuse-t/libfuse runtime dep. |
+| `task install:full+mount` | `--features full` = adds `mount` (FUSE/NFS backend) | Only if you're going to mount an arena as a filesystem. **Requires libfuse-t (macOS) or libfuse (Linux) at runtime** or the binary won't launch. |
+
+All three codesign on macOS (ad-hoc + entitlements) and drop the binary at `~/.local/bin/leyline`.
+
+### Prereqs
+
+**Build-time (all install paths):**
+- `brew install capnp` (macOS) / `apt-get install capnproto libcapnp-dev` (Linux) — required for `build.rs` codegen; pinned to ≥1.3.0.
+
+**Runtime (only for `install:full+mount`):**
+- macOS: `brew install fuse-t` (no kernel extension needed).
+- Linux: `apt-get install libfuse3-dev`.
+
+`install` and `install:full` have NO runtime system-dep prereq.
+
+**Optional acceleration:**
+- `brew install sccache` (or `cargo install sccache`) — Taskfile auto-detects and sets `RUSTC_WRAPPER` for cross-invocation caching of byte-stable rustc work. No config needed.
 
 ## Building the image
 
-A distroless OCI image (`ley-line-open:0.7.2`, ~20 MB) is built via [`krust`](https://github.com/imjasonh/krust) (cargo-zigbuild → static musl binary) + a one-line `docker build` that COPYs the binary onto `cgr.dev/chainguard/static`. See `image.Dockerfile` and `Taskfile.yml`. The image's default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0` headless — no FUSE/NFS, just the MCP HTTP transport on `:8384` inside the container (consumed by cloister via `LLO_MCP_URL`, default `http://localhost:8384/mcp`).
+A distroless OCI image (`ley-line-open:0.7.3`, ~20 MB) is built via [`krust`](https://github.com/imjasonh/krust) (cargo-zigbuild → static musl binary) + a one-line `docker build` that COPYs the binary onto `cgr.dev/chainguard/static`. See `image.Dockerfile` and `Taskfile.yml`. The image's default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0` headless — no FUSE/NFS, just the MCP HTTP transport on `:8384` inside the container (consumed by cloister via `LLO_MCP_URL`, default `http://localhost:8384/mcp`).
 
 ```bash
 brew install zig                   # cargo-zigbuild backend
 cargo install cargo-zigbuild krust # one-time
-task image                         # → ley-line-open:0.7.2 in local docker
+task image                         # → ley-line-open:0.7.3 in local docker
 task image:smoke                   # build + start daemon + curl tools/list
 ```
 

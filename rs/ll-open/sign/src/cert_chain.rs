@@ -380,11 +380,12 @@ fn base64_url_encode_no_pad(bytes: &[u8]) -> String {
     out
 }
 
-/// Test helpers — minting fixtures for cert-chain verification. Public so
-/// `examples/gen-fixture.rs` can produce stable test fixtures for the
-/// TS-side wasm wrapper. Don't use in production code paths; the helpers
-/// are intentionally permissive (no input validation, panics on bad
-/// inputs) for ergonomic test code.
+/// Test helpers — minting fixtures for cert-chain verification. `pub`
+/// because integration tests (`tests/*.rs`) link the crate as a
+/// normal dep and don't inherit `#[cfg(test)]`. Intentionally
+/// permissive (no input validation, panics on bad inputs) for
+/// ergonomic test code — every `.expect()` documents the
+/// test-fixture invariant that must hold.
 pub mod tests_helpers {
     use super::oid_interlace;
     use crate::oid::ID_ED25519;
@@ -448,7 +449,7 @@ pub mod tests_helpers {
         let spki = SubjectPublicKeyInfo {
             algorithm: alg_ed25519.clone(),
             subject_public_key: BitString::from_bytes(ephemeral.verifying_key().as_bytes())
-                .unwrap(),
+                .expect("Ed25519 verifying key is 32 bytes — valid BIT STRING"),
         };
 
         let issuer: Name = RdnSequence::default();
@@ -459,13 +460,13 @@ pub mod tests_helpers {
                 der::asn1::UtcTime::from_unix_duration(std::time::Duration::from_secs(
                     not_before as u64,
                 ))
-                .unwrap(),
+                .expect("test fixture: not_before within UtcTime range"),
             ),
             not_after: Time::UtcTime(
                 der::asn1::UtcTime::from_unix_duration(std::time::Duration::from_secs(
                     not_after as u64,
                 ))
-                .unwrap(),
+                .expect("test fixture: not_after within UtcTime range"),
             ),
         };
 
@@ -475,40 +476,54 @@ pub mod tests_helpers {
             extensions.push(Extension {
                 extn_id: oid_interlace::EPOCH,
                 critical: false,
-                extn_value: OctetString::new(int_der).unwrap(),
+                extn_value: OctetString::new(int_der)
+                    .expect("test fixture: encode_u32_as_der_int emits valid DER"),
             });
         }
         if let Some(pf) = peer_fp {
-            let s_der = Utf8StringRef::new(pf).unwrap().to_der().unwrap();
+            let s_der = Utf8StringRef::new(pf)
+                .expect("test fixture: peer_fp is valid UTF-8")
+                .to_der()
+                .expect("test fixture: Utf8String → DER");
             extensions.push(Extension {
                 extn_id: oid_interlace::PEER_FP,
                 critical: false,
-                extn_value: OctetString::new(s_der).unwrap(),
+                extn_value: OctetString::new(s_der)
+                    .expect("test fixture: DER bytes form a valid OctetString"),
             });
         }
         if let Some(sc) = scope {
-            let s_der = Utf8StringRef::new(sc).unwrap().to_der().unwrap();
+            let s_der = Utf8StringRef::new(sc)
+                .expect("test fixture: scope is valid UTF-8")
+                .to_der()
+                .expect("test fixture: Utf8String → DER");
             extensions.push(Extension {
                 extn_id: oid_interlace::SCOPE,
                 critical: false,
-                extn_value: OctetString::new(s_der).unwrap(),
+                extn_value: OctetString::new(s_der)
+                    .expect("test fixture: DER bytes form a valid OctetString"),
             });
         }
         if let Some(cd) = confinement_digest {
             // Wrap the 32-byte digest in a DER OctetString so the outer
             // extn_value carries `OCTET STRING { OCTET STRING { .. } }`,
             // matching the epoch/peer_fp/scope shape and the §7 spec.
-            let inner_der = OctetString::new(cd.to_vec()).unwrap().to_der().unwrap();
+            let inner_der = OctetString::new(cd.to_vec())
+                .expect("test fixture: 32-byte digest is a valid OctetString")
+                .to_der()
+                .expect("test fixture: OctetString → DER");
             extensions.push(Extension {
                 extn_id: oid_interlace::CONFINEMENT_DIGEST,
                 critical: false,
-                extn_value: OctetString::new(inner_der).unwrap(),
+                extn_value: OctetString::new(inner_der)
+                    .expect("test fixture: inner DER wraps into an OctetString"),
             });
         }
 
         let tbs = TbsCertificate {
             version: x509_cert::Version::V3,
-            serial_number: SerialNumber::new(&[1]).unwrap(),
+            serial_number: SerialNumber::new(&[1])
+                .expect("test fixture: single-byte serial is valid"),
             signature: alg_ed25519.clone(),
             issuer,
             validity,
@@ -519,20 +534,27 @@ pub mod tests_helpers {
             extensions: if extensions.is_empty() {
                 None
             } else {
-                Some(Extensions::try_from(extensions).unwrap())
+                Some(
+                    Extensions::try_from(extensions)
+                        .expect("test fixture: extension list is well-formed"),
+                )
             },
         };
 
-        let tbs_der = tbs.to_der().unwrap();
+        let tbs_der = tbs
+            .to_der()
+            .expect("test fixture: TbsCertificate encodes to DER");
         let sig = master.sign(&tbs_der);
 
         let cert = Certificate {
             tbs_certificate: tbs,
             signature_algorithm: alg_ed25519,
-            signature: BitString::from_bytes(&sig.to_bytes()).unwrap(),
+            signature: BitString::from_bytes(&sig.to_bytes())
+                .expect("test fixture: Ed25519 signature is 64 bytes"),
         };
 
-        cert.to_der().unwrap()
+        cert.to_der()
+            .expect("test fixture: Certificate encodes to DER")
     }
 
     /// Mint a self-signed-by-master cert with one extra extension on top
@@ -569,7 +591,7 @@ pub mod tests_helpers {
         let spki = SubjectPublicKeyInfo {
             algorithm: alg_ed25519.clone(),
             subject_public_key: BitString::from_bytes(ephemeral.verifying_key().as_bytes())
-                .unwrap(),
+                .expect("Ed25519 verifying key is 32 bytes — valid BIT STRING"),
         };
         let issuer: Name = RdnSequence::default();
         let subject = issuer.clone();
@@ -578,13 +600,13 @@ pub mod tests_helpers {
                 der::asn1::UtcTime::from_unix_duration(std::time::Duration::from_secs(
                     not_before as u64,
                 ))
-                .unwrap(),
+                .expect("test fixture: not_before within UtcTime range"),
             ),
             not_after: Time::UtcTime(
                 der::asn1::UtcTime::from_unix_duration(std::time::Duration::from_secs(
                     not_after as u64,
                 ))
-                .unwrap(),
+                .expect("test fixture: not_after within UtcTime range"),
             ),
         };
 
@@ -594,29 +616,40 @@ pub mod tests_helpers {
         extensions.push(Extension {
             extn_id: oid_interlace::EPOCH,
             critical: false,
-            extn_value: OctetString::new(int_der).unwrap(),
+            extn_value: OctetString::new(int_der)
+                .expect("test fixture: encode_u32_as_der_int emits valid DER"),
         });
-        let s_der = Utf8StringRef::new("sha256:test").unwrap().to_der().unwrap();
+        let s_der = Utf8StringRef::new("sha256:test")
+            .expect("test fixture: literal is valid UTF-8")
+            .to_der()
+            .expect("test fixture: Utf8String → DER");
         extensions.push(Extension {
             extn_id: oid_interlace::PEER_FP,
             critical: false,
-            extn_value: OctetString::new(s_der).unwrap(),
+            extn_value: OctetString::new(s_der)
+                .expect("test fixture: DER bytes form a valid OctetString"),
         });
-        let s_der = Utf8StringRef::new("test:scope").unwrap().to_der().unwrap();
+        let s_der = Utf8StringRef::new("test:scope")
+            .expect("test fixture: literal is valid UTF-8")
+            .to_der()
+            .expect("test fixture: Utf8String → DER");
         extensions.push(Extension {
             extn_id: oid_interlace::SCOPE,
             critical: false,
-            extn_value: OctetString::new(s_der).unwrap(),
+            extn_value: OctetString::new(s_der)
+                .expect("test fixture: DER bytes form a valid OctetString"),
         });
         extensions.push(Extension {
             extn_id: extra_oid,
             critical: extra_critical,
-            extn_value: OctetString::new(extra_value_der).unwrap(),
+            extn_value: OctetString::new(extra_value_der)
+                .expect("test fixture: caller-supplied DER bytes wrap into an OctetString"),
         });
 
         let tbs = TbsCertificate {
             version: x509_cert::Version::V3,
-            serial_number: SerialNumber::new(&[1]).unwrap(),
+            serial_number: SerialNumber::new(&[1])
+                .expect("test fixture: single-byte serial is valid"),
             signature: alg_ed25519.clone(),
             issuer,
             validity,
@@ -624,17 +657,24 @@ pub mod tests_helpers {
             subject_public_key_info: spki,
             issuer_unique_id: None,
             subject_unique_id: None,
-            extensions: Some(Extensions::try_from(extensions).unwrap()),
+            extensions: Some(
+                Extensions::try_from(extensions)
+                    .expect("test fixture: extension list is well-formed"),
+            ),
         };
 
-        let tbs_der = tbs.to_der().unwrap();
+        let tbs_der = tbs
+            .to_der()
+            .expect("test fixture: TbsCertificate encodes to DER");
         let sig = master.sign(&tbs_der);
         let cert = Certificate {
             tbs_certificate: tbs,
             signature_algorithm: alg_ed25519,
-            signature: BitString::from_bytes(&sig.to_bytes()).unwrap(),
+            signature: BitString::from_bytes(&sig.to_bytes())
+                .expect("test fixture: Ed25519 signature is 64 bytes"),
         };
-        cert.to_der().unwrap()
+        cert.to_der()
+            .expect("test fixture: Certificate encodes to DER")
     }
 }
 

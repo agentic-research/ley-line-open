@@ -31,22 +31,25 @@ impl LeylineNfs {
     }
 
     fn ensure_ino(&self, id: &str) -> u64 {
-        let mut id_map = self.id_to_ino.lock().unwrap();
+        let mut id_map = self.id_to_ino.lock().expect("mutex poisoned");
         if let Some(&ino) = id_map.get(id) {
             return ino;
         }
-        let mut next = self.next_ino.lock().unwrap();
+        let mut next = self.next_ino.lock().expect("mutex poisoned");
         let ino = *next;
         *next += 1;
         id_map.insert(id.to_string(), ino);
-        self.ino_to_id.lock().unwrap().insert(ino, id.to_string());
+        self.ino_to_id
+            .lock()
+            .expect("mutex poisoned")
+            .insert(ino, id.to_string());
         ino
     }
 
     fn resolve_id(&self, ino: fileid3) -> Result<String, nfsstat3> {
         self.ino_to_id
             .lock()
-            .unwrap()
+            .expect("mutex poisoned")
             .get(&ino)
             .cloned()
             .ok_or(nfsstat3::NFS3ERR_STALE)
@@ -303,9 +306,9 @@ impl NFSFileSystem for LeylineNfs {
             .map_err(|_| nfsstat3::NFS3ERR_ROFS)?;
 
         // Clean up inode maps
-        let mut id_map = self.id_to_ino.lock().unwrap();
+        let mut id_map = self.id_to_ino.lock().expect("mutex poisoned");
         if let Some(ino) = id_map.remove(&node.id) {
-            self.ino_to_id.lock().unwrap().remove(&ino);
+            self.ino_to_id.lock().expect("mutex poisoned").remove(&ino);
         }
         Ok(())
     }
@@ -339,10 +342,13 @@ impl NFSFileSystem for LeylineNfs {
         } else {
             format!("{to_parent}/{to_name}")
         };
-        let mut id_map = self.id_to_ino.lock().unwrap();
+        let mut id_map = self.id_to_ino.lock().expect("mutex poisoned");
         if let Some(ino) = id_map.remove(&old_id) {
             id_map.insert(new_id.clone(), ino);
-            self.ino_to_id.lock().unwrap().insert(ino, new_id);
+            self.ino_to_id
+                .lock()
+                .expect("mutex poisoned")
+                .insert(ino, new_id);
         }
         Ok(())
     }

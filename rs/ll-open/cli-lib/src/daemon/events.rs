@@ -565,12 +565,16 @@ impl ConnectionState {
         // (they'll be sent as pushed events after the response)
         // We send them through the event_rx channel by pushing them
         // back -- but that's complex. Instead, just return them.
-        let mut result = serde_json::to_string(&resp).unwrap();
+        let mut result =
+            serde_json::to_string(&resp).expect("resp is a json::Value; serialization is total");
 
         // Append replay events as separate lines
         for event in &replay {
             result.push('\n');
-            result.push_str(&serde_json::to_string(event).unwrap());
+            result.push_str(
+                &serde_json::to_string(event)
+                    .expect("Event serializes via derived Serialize; total for our types"),
+            );
         }
 
         result
@@ -584,7 +588,7 @@ impl ConnectionState {
             self.router.unsubscribe_topics(sub_id, &topics).await;
         }
 
-        serde_json::to_string(&serde_json::json!({"ok": true})).unwrap()
+        serde_json::to_string(&serde_json::json!({"ok": true})).expect("literal Value serializes")
     }
 
     /// Handle an emit command (external client publishing an event).
@@ -601,7 +605,8 @@ impl ConnectionState {
         let data = req.get("data").cloned().unwrap_or(serde_json::json!({}));
 
         let seq = self.router.emit_external(topic, source, data).await;
-        serde_json::to_string(&serde_json::json!({"ok": true, "seq": seq})).unwrap()
+        serde_json::to_string(&serde_json::json!({"ok": true, "seq": seq}))
+            .expect("literal Value serializes")
     }
 
     /// Take the event receiver (used by the connection loop).

@@ -105,7 +105,7 @@ impl SheafState {
     /// Wire the event-bus emitter in once the daemon's `EventRouter` is
     /// up. Idempotent — replaces any prior emitter.
     pub fn set_emitter(&self, emitter: EventEmitter) {
-        *self.emitter.lock().unwrap() = Some(emitter);
+        *self.emitter.lock().expect("mutex poisoned") = Some(emitter);
     }
 
     /// Borrow the backing cache mutex. Exposed so the daemon's
@@ -273,7 +273,7 @@ impl SheafState {
     }
 
     fn emit(&self, topic: &str, data: serde_json::Value) {
-        if let Some(ref emitter) = *self.emitter.lock().unwrap() {
+        if let Some(ref emitter) = *self.emitter.lock().expect("mutex poisoned") {
             emitter.emit(topic, "leyline", data);
         }
     }
@@ -414,7 +414,7 @@ pub fn op_sheaf_set_topology(
     restrictions: &[SheafRestrictionInput],
     node_stalk_dim: u32,
 ) -> Result<String> {
-    let mut cache = state.cache.lock().unwrap();
+    let mut cache = state.cache.lock().expect("mutex poisoned");
 
     // Try to engage δ⁰ mode: every region must carry f32 data of the
     // declared dimension and every restriction must have a non-zero
@@ -507,7 +507,7 @@ pub fn op_sheaf_set_topology(
     }
 
     {
-        let mut edges = state.edges.lock().unwrap();
+        let mut edges = state.edges.lock().expect("mutex poisoned");
         *edges = cache
             .restriction_edges()
             .map(|(&(a, b), _)| (a.min(b), a.max(b)))
@@ -526,7 +526,7 @@ pub fn op_sheaf_set_topology(
     // (`scope: "all-known"`), which is what happens when the labels
     // map is empty.
     {
-        let mut labels = state.region_labels.lock().unwrap();
+        let mut labels = state.region_labels.lock().expect("mutex poisoned");
         labels.clear();
     }
 
@@ -566,7 +566,7 @@ pub fn op_sheaf_invalidate(
     regions: &[u32],
     stalks: &[SheafStalkInput],
 ) -> Result<String> {
-    let mut cache = state.cache.lock().unwrap();
+    let mut cache = state.cache.lock().expect("mutex poisoned");
 
     for s in stalks {
         cache.set_stalk(s.id, HashStalk(parse_hash(&s.hash)));
@@ -582,8 +582,8 @@ pub fn op_sheaf_invalidate(
 
     // Feed the co-change tracker so learned weights converge over time.
     {
-        let edges = state.edges.lock().unwrap();
-        let mut tracker = state.tracker.lock().unwrap();
+        let edges = state.edges.lock().expect("mutex poisoned");
+        let mut tracker = state.tracker.lock().expect("mutex poisoned");
         tracker.observe(&invalidated, &edges);
     }
 
@@ -632,7 +632,7 @@ pub fn op_sheaf_invalidate(
 
 /// Total boundary disagreement summed over all restriction edges.
 pub fn op_sheaf_defect(state: &SheafState) -> Result<String> {
-    let cache = state.cache.lock().unwrap();
+    let cache = state.cache.lock().expect("mutex poisoned");
     let mut builder = capnp::message::Builder::new_default();
     let mut root: daemon_capnp::sheaf_defect_response::Builder = builder.init_root();
     root.set_defect(cache.defect());
@@ -646,7 +646,7 @@ pub fn op_sheaf_defect(state: &SheafState) -> Result<String> {
 /// Per-region cache validity counts (does not enumerate every region
 /// hash — that's intentionally bounded to keep response size predictable).
 pub fn op_sheaf_stalks(state: &SheafState) -> Result<String> {
-    let cache = state.cache.lock().unwrap();
+    let cache = state.cache.lock().expect("mutex poisoned");
     let mut builder = capnp::message::Builder::new_default();
     let mut root: daemon_capnp::sheaf_stalks_response::Builder = builder.init_root();
     root.set_generation(cache.generation());
@@ -659,8 +659,8 @@ pub fn op_sheaf_stalks(state: &SheafState) -> Result<String> {
 /// Combined cache health snapshot — defect, generation, validity, and
 /// tracked-edge count for the co-change weight learner.
 pub fn op_sheaf_status(state: &SheafState) -> Result<String> {
-    let cache = state.cache.lock().unwrap();
-    let tracker = state.tracker.lock().unwrap();
+    let cache = state.cache.lock().expect("mutex poisoned");
+    let tracker = state.tracker.lock().expect("mutex poisoned");
     let mut builder = capnp::message::Builder::new_default();
     let mut root: daemon_capnp::sheaf_status_response::Builder = builder.init_root();
     root.set_generation(cache.generation());
@@ -675,7 +675,7 @@ pub fn op_sheaf_status(state: &SheafState) -> Result<String> {
 /// Co-change-derived per-edge coupling rates. Empty list while no
 /// invalidations have been observed.
 pub fn op_sheaf_learned_weights(state: &SheafState) -> Result<String> {
-    let tracker = state.tracker.lock().unwrap();
+    let tracker = state.tracker.lock().expect("mutex poisoned");
     let weights = tracker.learned_weights();
     let mut builder = capnp::message::Builder::new_default();
     let mut root: daemon_capnp::sheaf_learned_weights_response::Builder = builder.init_root();
@@ -715,7 +715,7 @@ pub fn op_sheaf_learned_weights(state: &SheafState) -> Result<String> {
 /// consumers may call it multiple times during a long enrichment pass
 /// without each call advancing their generation cursor.
 pub fn op_sheaf_reap(state: &SheafState) -> Result<String> {
-    let cache = state.cache.lock().unwrap();
+    let cache = state.cache.lock().expect("mutex poisoned");
     let (reclaimable, defect) = cache.reap();
     let generation = cache.generation();
     drop(cache);
@@ -755,7 +755,7 @@ pub fn op_sheaf_update_topology(
     delta: &TopologyDeltaInput,
     node_stalk_dim: u32,
 ) -> Result<String> {
-    let mut cache = state.cache.lock().unwrap();
+    let mut cache = state.cache.lock().expect("mutex poisoned");
 
     // 1. Build the touched-region set from the delta itself, then expand to
     //    radius-1 via the CURRENT cache topology (pre-mutation) so consumers
@@ -943,7 +943,7 @@ pub fn op_sheaf_update_topology(
         .collect();
     drop(cache);
     {
-        let mut edges = state.edges.lock().unwrap();
+        let mut edges = state.edges.lock().expect("mutex poisoned");
         *edges = post_edges;
     }
 

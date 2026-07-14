@@ -81,8 +81,14 @@ impl LspClient {
             .spawn()
             .with_context(|| format!("spawn {command}"))?;
 
-        let stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
+        let stdin = child
+            .stdin
+            .take()
+            .expect("stdin piped in Command builder above");
+        let stdout = child
+            .stdout
+            .take()
+            .expect("stdout piped in Command builder above");
 
         // Reader task: parse LSP messages from stdout, forward to channel
         let (tx, rx) = mpsc::channel::<Response>(RESPONSE_CHANNEL_BUFFER);

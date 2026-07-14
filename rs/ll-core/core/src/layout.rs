@@ -199,7 +199,7 @@ pub fn create_arena(path: &std::path::Path, arena_size: u64) -> Result<MmapMut> 
     let mut mmap = crate::mmap::mmap_write(&file)?;
 
     // Initialize header if fresh (magic == 0)
-    let existing_magic = u32::from_ne_bytes(mmap[..4].try_into().unwrap());
+    let existing_magic = u32::from_ne_bytes(mmap[..4].try_into().expect("4-byte slice ⇒ [u8; 4]"));
     if existing_magic == 0 {
         let header = ArenaHeader {
             magic: ArenaHeader::MAGIC,

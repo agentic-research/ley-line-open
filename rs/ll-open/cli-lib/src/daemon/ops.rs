@@ -552,13 +552,14 @@ fn op_reparse(
     // Parse directly into the living db. Classified as `with_write` —
     // `parse_into_conn` runs INSERT/UPDATE/COMMIT under the guard.
     // Bead `ley-line-open-ba8294` Phase 2 intent-marking.
-    ctx.state.write().unwrap().phase = DaemonPhase::Parsing;
+    ctx.state.write().expect("rwlock write-poisoned").phase = DaemonPhase::Parsing;
     let result = match ctx
         .with_write(|conn| crate::cmd_parse::parse_into_conn(conn, &source_dir, lang, scope))
     {
         Ok(r) => r,
         Err(e) => {
-            ctx.state.write().unwrap().phase = DaemonPhase::Error(format!("reparse failed: {e:#}"));
+            ctx.state.write().expect("rwlock write-poisoned").phase =
+                DaemonPhase::Error(format!("reparse failed: {e:#}"));
             return Err(e);
         }
     };
@@ -567,7 +568,7 @@ fn op_reparse(
     snapshot_living_db(ctx)?;
 
     {
-        let mut s = ctx.state.write().unwrap();
+        let mut s = ctx.state.write().expect("rwlock write-poisoned");
         s.phase = DaemonPhase::Ready;
         s.last_reparse_at_ms = Some(super::now_ms());
     }
@@ -602,7 +603,7 @@ fn op_enrich(ctx: &DaemonContext, pass_name: &str, files: Option<&[String]>) -> 
     // Enrichment classified as `with_write` — passes INSERT/UPDATE
     // enrichment rows under the guard (LSP bindings, HDC codebooks,
     // embeddings, etc.). Bead `ley-line-open-ba8294` Phase 2.
-    ctx.state.write().unwrap().phase = DaemonPhase::Enriching;
+    ctx.state.write().expect("rwlock write-poisoned").phase = DaemonPhase::Enriching;
     let stats = ctx.with_write(|conn| {
         crate::daemon::enrichment::run_pass(
             &ctx.enrichment_passes,
@@ -613,7 +614,7 @@ fn op_enrich(ctx: &DaemonContext, pass_name: &str, files: Option<&[String]>) -> 
             Some(&ctx.state),
         )
     })?;
-    ctx.state.write().unwrap().phase = DaemonPhase::Ready;
+    ctx.state.write().expect("rwlock write-poisoned").phase = DaemonPhase::Ready;
 
     // Snapshot to arena after enrichment.
     snapshot_living_db(ctx)?;

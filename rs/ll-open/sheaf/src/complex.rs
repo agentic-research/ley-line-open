@@ -1050,7 +1050,12 @@ impl CellComplex {
         let mut edge_row_offsets = HashMap::new();
         for &edge_id in &self.edges {
             edge_row_offsets.insert(edge_id, c1_dim);
-            c1_dim += self.cells.get(&edge_id).unwrap().stalk.dim();
+            c1_dim += self
+                .cells
+                .get(&edge_id)
+                .expect("cell/incidence populated by build loop")
+                .stalk
+                .dim();
         }
 
         let mut node_col_offsets = HashMap::new();
@@ -1061,13 +1066,30 @@ impl CellComplex {
         let mut coo = CooMatrix::new(c1_dim, c0_dim);
 
         for &edge_id in &self.edges {
-            let (u_id, v_id) = self.incidence.get(&edge_id).unwrap();
-            let row_start = *edge_row_offsets.get(&edge_id).unwrap();
-            let u_col_start = *node_col_offsets.get(u_id).unwrap();
-            let v_col_start = *node_col_offsets.get(v_id).unwrap();
+            let (u_id, v_id) = self
+                .incidence
+                .get(&edge_id)
+                .expect("cell/incidence populated by build loop");
+            let row_start = *edge_row_offsets
+                .get(&edge_id)
+                .expect("cell/incidence populated by build loop");
+            let u_col_start = *node_col_offsets
+                .get(u_id)
+                .expect("cell/incidence populated by build loop");
+            let v_col_start = *node_col_offsets
+                .get(v_id)
+                .expect("cell/incidence populated by build loop");
 
-            let f_u = &self.restriction_maps.get(&(*u_id, edge_id)).unwrap().matrix;
-            let f_v = &self.restriction_maps.get(&(*v_id, edge_id)).unwrap().matrix;
+            let f_u = &self
+                .restriction_maps
+                .get(&(*u_id, edge_id))
+                .expect("restriction map populated by build loop")
+                .matrix;
+            let f_v = &self
+                .restriction_maps
+                .get(&(*v_id, edge_id))
+                .expect("restriction map populated by build loop")
+                .matrix;
 
             // -f_u contribution
             for r in 0..f_u.nrows() {
@@ -1098,25 +1120,46 @@ impl CellComplex {
         let mut edge_row_offsets = HashMap::new();
         for &edge_id in &self.edges {
             edge_row_offsets.insert(edge_id, c1_dim);
-            c1_dim += self.cells.get(&edge_id).unwrap().stalk.dim();
+            c1_dim += self
+                .cells
+                .get(&edge_id)
+                .expect("cell/incidence populated by build loop")
+                .stalk
+                .dim();
         }
 
         let mut c2_dim = 0;
         let mut face_row_offsets = HashMap::new();
         for &face_id in &self.faces {
             face_row_offsets.insert(face_id, c2_dim);
-            c2_dim += self.face_cells.get(&face_id).unwrap().dimension;
+            c2_dim += self
+                .face_cells
+                .get(&face_id)
+                .expect("cell/incidence populated by build loop")
+                .dimension;
         }
 
         let mut coo = CooMatrix::new(c2_dim, c1_dim);
 
         for &face_id in &self.faces {
-            let face = self.face_cells.get(&face_id).unwrap();
-            let f_row = *face_row_offsets.get(&face_id).unwrap();
+            let face = self
+                .face_cells
+                .get(&face_id)
+                .expect("cell/incidence populated by build loop");
+            let f_row = *face_row_offsets
+                .get(&face_id)
+                .expect("cell/incidence populated by build loop");
 
             for &(edge_id, sign) in &face.edges {
-                let e_col = *edge_row_offsets.get(&edge_id).unwrap();
-                let e_dim = self.cells.get(&edge_id).unwrap().stalk.dim();
+                let e_col = *edge_row_offsets
+                    .get(&edge_id)
+                    .expect("cell/incidence populated by build loop");
+                let e_dim = self
+                    .cells
+                    .get(&edge_id)
+                    .expect("cell/incidence populated by build loop")
+                    .stalk
+                    .dim();
 
                 for i in 0..face.dimension.min(e_dim) {
                     if sign.abs() > SPARSE_EPS {
@@ -1181,7 +1224,14 @@ impl CellComplex {
     pub fn global_section(&self) -> DVector<f32> {
         let mut x = Vec::with_capacity(self.nodes.len() * self.node_stalk_dim);
         for node_id in &self.nodes {
-            x.extend_from_slice(&self.cells.get(node_id).unwrap().stalk.data);
+            x.extend_from_slice(
+                &self
+                    .cells
+                    .get(node_id)
+                    .expect("cell/incidence populated by build loop")
+                    .stalk
+                    .data,
+            );
         }
         DVector::from_vec(x)
     }
@@ -1208,7 +1258,10 @@ impl CellComplex {
         let mut row_offset = 0;
 
         for &edge_id in &self.edges {
-            let cell = self.cells.get(&edge_id).unwrap();
+            let cell = self
+                .cells
+                .get(&edge_id)
+                .expect("cell/incidence populated by build loop");
             let dim = cell.stalk.dim();
 
             for i in 0..dim {
@@ -1262,7 +1315,12 @@ impl CellComplex {
         let mut edge_defects: HashMap<u32, f32> = HashMap::new();
         let mut row_offset = 0;
         for &edge_id in &self.edges {
-            let dim = self.cells.get(&edge_id).unwrap().stalk.dim();
+            let dim = self
+                .cells
+                .get(&edge_id)
+                .expect("cell/incidence populated by build loop")
+                .stalk
+                .dim();
             let mut norm_sq = 0.0f32;
             for i in 0..dim {
                 let v = image[row_offset + i];
@@ -1884,7 +1942,12 @@ mod tests {
             false,
         );
 
-        let virtual_id_floor = *cx.edges.iter().max().unwrap() + 1;
+        let virtual_id_floor = *cx
+            .edges
+            .iter()
+            .max()
+            .expect("edges non-empty when computing virtual id floor")
+            + 1;
         cx.enforce_transitive_closure("dep", 1);
 
         // A virtual edge 0→2 must exist after closure.

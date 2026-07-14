@@ -227,7 +227,8 @@ impl EnrichmentPass for EmbeddingPass {
         };
 
         if scope_in_sql {
-            let changed = changed_files.unwrap();
+            let changed =
+                changed_files.expect("scope_in_sql ⇒ changed_files is Some by construction");
             let placeholders: Vec<&str> = changed.iter().map(|_| "?").collect();
             let sql = format!("{base} AND id IN ({})", placeholders.join(","));
             let mut stmt = conn.prepare(&sql)?;

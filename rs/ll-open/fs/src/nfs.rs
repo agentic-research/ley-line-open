@@ -83,7 +83,10 @@ impl LeylineNfs {
             ftype,
             mode,
             nlink: if node.is_dir { 2 } else { 1 },
+            // SAFETY: POSIX-defined thread-safe syscall wrappers; never fail,
+            // never mutate, no aliasing concerns. Same shape as `fs::fuse`.
             uid: unsafe { libc::getuid() },
+            // SAFETY: see `libc::getuid` above.
             gid: unsafe { libc::getgid() },
             size,
             used: size,
@@ -113,7 +116,9 @@ impl LeylineNfs {
             ftype,
             mode,
             nlink: if is_dir { 2 } else { 1 },
+            // SAFETY: POSIX-defined thread-safe syscall wrapper; see above.
             uid: unsafe { libc::getuid() },
+            // SAFETY: POSIX-defined thread-safe syscall wrapper; see above.
             gid: unsafe { libc::getgid() },
             size,
             used: size,

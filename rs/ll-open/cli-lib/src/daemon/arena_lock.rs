@@ -81,6 +81,9 @@ impl ArenaLock {
 
         // LOCK_EX | LOCK_NB: exclusive, non-blocking. Returns -1 with
         // errno=EWOULDBLOCK if another process holds the lock.
+        // SAFETY: `flock(2)` takes an owned raw fd and two int flags; no
+        // pointers, no aliasing. `file.as_raw_fd()` is valid for the
+        // duration of the `File` binding, which outlives this call.
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
             let holding_pid = read_holding_pid(&lock_path);

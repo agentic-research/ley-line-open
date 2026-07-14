@@ -17,6 +17,10 @@ use std::sync::Mutex;
 pub fn register_vec() {
     use rusqlite::ffi::sqlite3_auto_extension;
     use sqlite_vec::sqlite3_vec_init;
+    // SAFETY: documented sqlite-vec + rusqlite FFI pattern — transmute
+    // coerces the `void (*)(void)` C-callback signature into rusqlite's
+    // typed wrapper; both are ABI-compatible on every sqlite-vec target.
+    // Idempotent per libsqlite3 docs; no threading concerns at registration.
     unsafe {
         sqlite3_auto_extension(Some(std::mem::transmute::<
             *const (),

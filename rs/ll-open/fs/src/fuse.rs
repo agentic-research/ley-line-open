@@ -69,7 +69,11 @@ impl LeylineFuse {
             kind: ftype,
             perm,
             nlink: if node.is_dir { 2 } else { 1 },
+            // SAFETY: `libc::getuid`/`getgid` are POSIX-defined thread-safe
+            // wrappers around the `getuid(2)`/`getgid(2)` syscalls. Never
+            // fail, never mutate, no aliasing concerns.
             uid: unsafe { libc::getuid() },
+            // SAFETY: see `libc::getuid` above.
             gid: unsafe { libc::getgid() },
             rdev: 0,
             blksize: BLOCK_SIZE,

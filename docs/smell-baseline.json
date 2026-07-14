@@ -28,21 +28,6 @@
     },
     {
       "rule_id": "unsafe_without_safety",
-      "source_id": "rs/ll-open/cli-lib/src/daemon/arena_lock.rs",
-      "count": 1
-    },
-    {
-      "rule_id": "unsafe_without_safety",
-      "source_id": "rs/ll-open/cli-lib/src/daemon/vec_index.rs",
-      "count": 2
-    },
-    {
-      "rule_id": "unsafe_without_safety",
-      "source_id": "rs/ll-open/fs/src/fuse.rs",
-      "count": 2
-    },
-    {
-      "rule_id": "unsafe_without_safety",
       "source_id": "rs/ll-open/fs/src/graph.rs",
       "count": 2
     },
@@ -50,11 +35,6 @@
       "rule_id": "unsafe_without_safety",
       "source_id": "rs/ll-open/fs/src/lib.rs",
       "count": 19
-    },
-    {
-      "rule_id": "unsafe_without_safety",
-      "source_id": "rs/ll-open/fs/src/nfs.rs",
-      "count": 4
     },
     {
       "rule_id": "unsafe_without_safety",

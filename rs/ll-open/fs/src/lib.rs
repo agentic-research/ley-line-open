@@ -7,9 +7,9 @@ pub mod staging;
 pub mod validate;
 
 use anyhow::{Context, Result, bail};
+use leyline_core::mmap::mmap_read;
 use leyline_core::{ArenaHeader, ContentAddressed, Controller};
 use leyline_ffi_helpers::{c_cstr, c_output, c_ref};
-use memmap2::Mmap;
 use rusqlite::Connection;
 use serde::Serialize;
 use std::io::Cursor;
@@ -129,7 +129,7 @@ impl SqliteGraph {
         let arena_path = controller.arena_path();
 
         let file = std::fs::File::open(&arena_path).context("open arena file")?;
-        let mmap = unsafe { Mmap::map(&file)? };
+        let mmap = mmap_read(&file)?;
 
         let header_slice = &mmap[..std::mem::size_of::<ArenaHeader>()];
         let header: &ArenaHeader = bytemuck::from_bytes(header_slice);

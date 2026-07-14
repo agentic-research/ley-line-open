@@ -979,7 +979,7 @@ fn try_warm_start_from_arena(
         }
     };
 
-    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    let mmap = leyline_core::mmap::mmap_read(&file)?;
     if mmap.len() < std::mem::size_of::<leyline_core::ArenaHeader>() {
         log::warn!(
             "warm start: arena {arena_path} too small ({} bytes) for header — \

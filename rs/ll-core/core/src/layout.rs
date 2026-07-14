@@ -196,7 +196,7 @@ pub fn create_arena(path: &std::path::Path, arena_size: u64) -> Result<MmapMut> 
         .open(path)
         .context("open arena file")?;
     file.set_len(arena_size).context("set arena file length")?;
-    let mut mmap = unsafe { MmapMut::map_mut(&file)? };
+    let mut mmap = crate::mmap::mmap_write(&file)?;
 
     // Initialize header if fresh (magic == 0)
     let existing_magic = u32::from_ne_bytes(mmap[..4].try_into().unwrap());

@@ -672,6 +672,14 @@ fn project_unsafe_sites(workspace_root: &Path, repo_root: &Path) -> Result<Vec<U
             if trimmed.starts_with("//") || trimmed.starts_with("*") {
                 continue;
             }
+            // Type-level unsafe in a fn-pointer type: `unsafe extern "C" fn(`
+            // or `unsafe fn(` with NO name between `fn` and `(`. These are
+            // type-signature keywords, not runtime unsafe uses, and don't
+            // need a SAFETY comment on their own — the containing unsafe
+            // block (transmute call site) carries the invariant.
+            if is_type_level_unsafe_fn(line) {
+                continue;
+            }
 
             // Preceding-5-lines SAFETY check.
             let start_ctx = idx.saturating_sub(5);
@@ -751,6 +759,45 @@ fn contains_unsafe_keyword(line: &str) -> bool {
 
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// True iff the line's `unsafe` appears in a fn-pointer TYPE position:
+///   `unsafe extern "C" fn(...)`  — nameless fn type (e.g. in `transmute::<...>`)
+///   `unsafe fn(...)`             — nameless fn type
+/// Real fn DECLARATIONS always have an ident between `fn` and `(`
+///   `unsafe fn foo()`, `unsafe extern "C" fn bar(...)`.
+/// Type-position occurrences don't need their own SAFETY comment; the
+/// surrounding `unsafe { }` block (transmute call site) carries it.
+///
+/// Works at any position in the line (e.g. `type Cb = unsafe extern ...`).
+fn is_type_level_unsafe_fn(line: &str) -> bool {
+    // Locate the `unsafe` keyword; then walk forward.
+    let idx = match line.find("unsafe") {
+        Some(i) => i,
+        None => return false,
+    };
+    let rest = &line[idx + "unsafe".len()..];
+    let rest = rest.trim_start();
+    // Optional `extern "..."` prefix.
+    let after_extern = if let Some(after_kw) = rest.strip_prefix("extern") {
+        let after = after_kw.trim_start();
+        match after.strip_prefix('"') {
+            Some(inside) => match inside.find('"') {
+                Some(end) => inside[end + 1..].trim_start(),
+                None => return false,
+            },
+            None => return false,
+        }
+    } else {
+        rest
+    };
+    // Expect `fn(` (nameless — type-level) OR `fn <ident>(` (decl).
+    if let Some(after_fn) = after_extern.strip_prefix("fn") {
+        let after_fn = after_fn.trim_start_matches(|c: char| c.is_whitespace());
+        after_fn.starts_with('(')
+    } else {
+        false
+    }
 }
 
 /// True iff `line` contains a rustdoc `# Safety` section header (or
@@ -1119,5 +1166,38 @@ mod tests {
     fn rejects_prose_containing_the_word_safety() {
         assert!(!contains_safety_heading("/// Some safety concerns exist"));
         assert!(!contains_safety_heading("/// SAFETY: real invariant"));
+    }
+
+    // ── is_type_level_unsafe_fn ───────────────────────────────────────
+
+    #[test]
+    fn detects_type_level_unsafe_extern_fn() {
+        // sqlite3_auto_extension transmute pattern (vec_index.rs).
+        assert!(is_type_level_unsafe_fn(
+            "            unsafe extern \"C\" fn("
+        ));
+        assert!(is_type_level_unsafe_fn(
+            "type Cb = unsafe extern \"C\" fn(u32) -> i32;"
+        ));
+    }
+
+    #[test]
+    fn detects_type_level_unsafe_fn_without_extern() {
+        assert!(is_type_level_unsafe_fn("        unsafe fn(u32) -> i32"));
+    }
+
+    #[test]
+    fn rejects_real_unsafe_fn_declarations() {
+        // Real fn decls have a name between `fn` and `(`.
+        assert!(!is_type_level_unsafe_fn(
+            "pub unsafe extern \"C\" fn leyline_open(path: *const c_char) {}"
+        ));
+        assert!(!is_type_level_unsafe_fn("unsafe fn write_out() {}"));
+    }
+
+    #[test]
+    fn rejects_non_fn_unsafe_uses() {
+        assert!(!is_type_level_unsafe_fn("unsafe { libc::getuid() }"));
+        assert!(!is_type_level_unsafe_fn("unsafe impl Send for X {}"));
     }
 }

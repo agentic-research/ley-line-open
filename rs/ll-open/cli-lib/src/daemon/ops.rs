@@ -1823,23 +1823,39 @@ fn op_leyline_version() -> Result<String> {
 }
 
 // ---------------------------------------------------------------------------
-// validate — tree-sitter syntactic validation (bead ley-line-open-fa8638)
+// validate — tree-sitter syntactic validation (beads ley-line-open-fa8638,
+// ley-line-open-736800)
 // ---------------------------------------------------------------------------
 
 /// `{"op":"validate", "content":"...", "language":"go"}` — runs the
 /// `leyline-fs::validate` tree-sitter validator on caller-supplied
-/// content. Returns `{ ok: bool, diagnostics: [{line, col, message}] }`.
-/// Read-only — NOT in `STATE_CHANGING_OPS`.
+/// content without persisting anything. Read-only — NOT in
+/// `STATE_CHANGING_OPS`.
+///
+/// Returns `{ ok: bool, errors: [{row, col, byte_start, byte_end,
+/// message}], diagnostics: [{line, col, message}] }`:
+///
+/// - `errors` (bead ley-line-open-736800) — EVERY ERROR/MISSING node
+///   from the parse, in document order, using the same tree-sitter
+///   grammars the `_ast` producer uses. `row`/`col` are 0-based;
+///   `byte_start`/`byte_end` delimit the node in the source buffer
+///   (equal for zero-width MISSING nodes). mache renders these into
+///   `_diagnostics/ast-errors` for draft-mode UX.
+/// - `diagnostics` — legacy first-error-only shape from bead
+///   ley-line-open-fa8638, kept for wire compat: `[]` when ok, else
+///   exactly one `{line, col, message: "syntax error"}` entry.
 ///
 /// Either `language` (extension key per `language_for_extension`) or
 /// `path` (extension extracted) must be supplied; if both are present,
-/// `language` wins. `content` is UTF-8 source text on the wire.
+/// `language` wins. Unknown/unsupported languages return the daemon's
+/// structured error envelope (`{ok: false, error: "..."}`), never a
+/// panic. `content` is UTF-8 source text on the wire.
 ///
 /// Mirrors mache's `writeback/validate.go` so mache can drop the
-/// CGO tree-sitter link (mache-36d961 item A5).
+/// CGO tree-sitter link (mache-36d961 item A5 / mache-37ae8b).
 #[cfg(feature = "validate")]
 fn op_validate(req: &ValidateRequest) -> Result<String> {
-    use leyline_fs::validate::{language_for_extension, language_for_node, validate};
+    use leyline_fs::validate::{collect_syntax_errors, language_for_extension, language_for_node};
 
     let lang = match (req.language.as_deref(), req.path.as_deref()) {
         (Some(l), _) => language_for_extension(l)
@@ -1854,18 +1870,41 @@ fn op_validate(req: &ValidateRequest) -> Result<String> {
         }
     };
 
-    match validate(req.content.as_bytes(), &lang) {
-        Ok(()) => Ok(json!({"ok": true, "diagnostics": []}).to_string()),
-        Err(err) => Ok(json!({
-            "ok": false,
-            "diagnostics": [{
-                "line": err.line,
-                "col": err.column,
-                "message": err.message,
-            }]
+    let errors = collect_syntax_errors(req.content.as_bytes(), &lang)
+        .map_err(|e| anyhow::anyhow!("validate: {e}"))?;
+
+    let error_objs: Vec<serde_json::Value> = errors
+        .iter()
+        .map(|e| {
+            json!({
+                "row": e.row,
+                "col": e.col,
+                "byte_start": e.byte_start,
+                "byte_end": e.byte_end,
+                "message": e.message,
+            })
         })
-        .to_string()),
-    }
+        .collect();
+
+    // Legacy fa8638 shape: at most one entry, fixed "syntax error"
+    // message, positioned at the first error.
+    let diagnostics: Vec<serde_json::Value> = errors
+        .first()
+        .map(|first| {
+            vec![json!({
+                "line": first.row,
+                "col": first.col,
+                "message": "syntax error",
+            })]
+        })
+        .unwrap_or_default();
+
+    Ok(json!({
+        "ok": errors.is_empty(),
+        "errors": error_objs,
+        "diagnostics": diagnostics,
+    })
+    .to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -4432,11 +4471,11 @@ mod tests {
         }
     }
 
-    // ── validate op (bead ley-line-open-fa8638) ────────────────────────
+    // ── validate op (beads ley-line-open-fa8638, ley-line-open-736800) ──
 
-    /// `validate` with valid Go source returns `{ok: true, diagnostics: []}`.
-    /// Pins the success-path response shape mache writeback depends on
-    /// (so mache can drop the CGO tree-sitter link).
+    /// `validate` with valid Go source returns `{ok: true, errors: [],
+    /// diagnostics: []}`. Pins the success-path response shape mache
+    /// writeback depends on (so mache can drop the CGO tree-sitter link).
     /// `#[tokio::test]` because `handle_base_op` emits events through
     /// tokio's broadcast channel — same as the `op_find_token_*` pin.
     #[cfg(feature = "validate")]
@@ -4459,23 +4498,32 @@ mod tests {
             "valid Go should return ok=true; got {v}"
         );
         assert_eq!(
+            v["errors"],
+            json!([]),
+            "valid Go should return empty errors; got {v}",
+        );
+        assert_eq!(
             v["diagnostics"],
             json!([]),
             "valid Go should return empty diagnostics; got {v}",
         );
     }
 
-    /// `validate` with invalid Go source returns `{ok: false, diagnostics: [{line, col, message}]}`.
-    /// Pins the diagnostic shape mache surfaces to writeback callers.
+    /// `validate` with invalid Go source returns `{ok: false, errors:
+    /// [{row, col, byte_start, byte_end, message}], diagnostics:
+    /// [{line, col, message}]}`. Pins BOTH shapes: `errors` is the
+    /// ley-line-open-736800 contract mache codes against; `diagnostics`
+    /// is the legacy fa8638 first-error shape.
     #[cfg(feature = "validate")]
     #[tokio::test]
     async fn validate_op_invalid_go_returns_diagnostic() {
         let (_dir, ctx) = setup();
+        let content = "package main\n\nfunc {{{ bad\n";
         let response = handle_base_op_legacy(
             &ctx,
             "validate",
             &json!({
-                "content": "package main\n\nfunc {{{ bad\n",
+                "content": content,
                 "language": "go",
             }),
         )
@@ -4486,6 +4534,39 @@ mod tests {
             json!(false),
             "invalid Go should return ok=false; got {v}"
         );
+
+        // 736800 contract: every ERROR/MISSING node, positioned.
+        let errors = v["errors"].as_array().expect("errors must be an array");
+        assert!(
+            !errors.is_empty(),
+            "invalid Go must yield at least one positioned error; got {v}"
+        );
+        for e in errors {
+            let row = e["row"].as_u64().expect("error must carry `row`");
+            let byte_start = e["byte_start"]
+                .as_u64()
+                .expect("error must carry `byte_start`");
+            let byte_end = e["byte_end"].as_u64().expect("error must carry `byte_end`");
+            assert!(
+                e["col"].as_u64().is_some(),
+                "error must carry `col`; got {e}"
+            );
+            assert!(
+                e["message"].as_str().is_some_and(|m| !m.is_empty()),
+                "error must carry a non-empty `message`; got {e}"
+            );
+            assert!(
+                byte_start <= byte_end && byte_end <= content.len() as u64,
+                "byte range must lie within the buffer (start {byte_start}, end {byte_end}, len {})",
+                content.len()
+            );
+            assert!(
+                row >= 2,
+                "the broken func lives on row 2 (0-based); got row {row} in {e}"
+            );
+        }
+
+        // Legacy fa8638 shape: exactly one entry, fixed message.
         let diags = v["diagnostics"]
             .as_array()
             .expect("diagnostics must be an array");
@@ -4507,6 +4588,114 @@ mod tests {
             d["message"],
             json!("syntax error"),
             "diagnostic message must be `syntax error`; got {d}",
+        );
+        // The legacy entry is the first `errors` entry re-shaped.
+        assert_eq!(
+            d["line"], errors[0]["row"],
+            "diagnostics[0].line must equal errors[0].row; got {v}"
+        );
+        assert_eq!(
+            d["col"], errors[0]["col"],
+            "diagnostics[0].col must equal errors[0].col; got {v}"
+        );
+    }
+
+    /// `validate` enumerates EVERY ERROR/MISSING node, not just the
+    /// first (bead ley-line-open-736800 — mache renders the full list
+    /// into `_diagnostics/ast-errors` for draft-mode UX). Two broken
+    /// functions on different rows must yield errors on both rows.
+    #[cfg(feature = "validate")]
+    #[tokio::test]
+    async fn validate_op_enumerates_all_errors() {
+        let (_dir, ctx) = setup();
+        let content = "package main\n\nfunc a( {\n}\n\nfunc b( {\n}\n";
+        let response = handle_base_op_legacy(
+            &ctx,
+            "validate",
+            &json!({
+                "content": content,
+                "language": "go",
+            }),
+        )
+        .expect("validate op should be dispatched");
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["ok"], json!(false), "broken Go → ok=false; got {v}");
+
+        let errors = v["errors"].as_array().expect("errors must be an array");
+        assert!(
+            errors.len() >= 2,
+            "two broken funcs must yield >= 2 errors, got {}: {v}",
+            errors.len()
+        );
+        let rows: std::collections::BTreeSet<u64> =
+            errors.iter().filter_map(|e| e["row"].as_u64()).collect();
+        assert!(
+            rows.len() >= 2,
+            "errors must land on at least two distinct rows, got {rows:?}: {v}"
+        );
+        // Document order: byte_start must be non-decreasing.
+        let starts: Vec<u64> = errors
+            .iter()
+            .filter_map(|e| e["byte_start"].as_u64())
+            .collect();
+        assert!(
+            starts.windows(2).all(|w| w[0] <= w[1]),
+            "errors must be in document order by byte_start; got {starts:?}"
+        );
+    }
+
+    /// `validate` with an unknown/unsupported language returns the
+    /// daemon's structured error envelope — not a panic, and NOT
+    /// `ok: true` (bead ley-line-open-736800).
+    #[cfg(feature = "validate")]
+    #[tokio::test]
+    async fn validate_op_unknown_language_structured_error() {
+        let (_dir, ctx) = setup();
+        let response = handle_base_op_legacy(
+            &ctx,
+            "validate",
+            &json!({
+                "content": "package main\n",
+                "language": "brainfuck",
+            }),
+        )
+        .expect("validate op should be dispatched (error path is still a response)");
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            v["ok"],
+            json!(false),
+            "unknown language must not be ok:true; got {v}"
+        );
+        assert!(
+            v["error"].as_str().is_some_and(|e| e.contains("brainfuck")),
+            "error envelope must name the rejected language; got {v}"
+        );
+    }
+
+    /// `path`-based inference with an unrecognized extension is also a
+    /// structured error, not a false ok (bead ley-line-open-736800).
+    #[cfg(feature = "validate")]
+    #[tokio::test]
+    async fn validate_op_unknown_path_extension_structured_error() {
+        let (_dir, ctx) = setup();
+        let response = handle_base_op_legacy(
+            &ctx,
+            "validate",
+            &json!({
+                "content": "key = value\n",
+                "path": "config/settings.toml",
+            }),
+        )
+        .expect("validate op should be dispatched (error path is still a response)");
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            v["ok"],
+            json!(false),
+            "unrecognized extension must not be ok:true; got {v}"
+        );
+        assert!(
+            v["error"].as_str().is_some(),
+            "error envelope must carry `error`; got {v}"
         );
     }
 

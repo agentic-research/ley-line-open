@@ -225,7 +225,8 @@ pub enum BaseRequest {
     /// Wire-compat handshake. Takes no args; returns the daemon's
     /// version + wire-format identity (bead ley-line-open-cb8960).
     LeylineVersion,
-    /// Tree-sitter syntactic validation (ley-line-open-fa8638).
+    /// Tree-sitter syntactic validation (ley-line-open-fa8638; full
+    /// ERROR/MISSING enumeration per ley-line-open-736800).
     /// Mirrors mache's `writeback/validate.go` over the UDS so mache can
     /// drop its CGO tree-sitter link. Read-only (NOT in STATE_CHANGING_OPS).
     #[cfg(feature = "validate")]

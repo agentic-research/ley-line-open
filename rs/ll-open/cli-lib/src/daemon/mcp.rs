@@ -218,7 +218,7 @@ pub fn tool_registry() -> Vec<McpTool> {
         #[cfg(feature = "validate")]
         McpTool {
             name: "validate",
-            description: "Tree-sitter syntactic validation of source content. Takes `content` (UTF-8 source) plus either `language` (extension key: go|py|js|ts|tsx|rs|ex|exs) or `path` (extension extracted). Returns `{ok, diagnostics: [{line, col, message}]}`. Read-only; the daemon does not touch the projected db. Mirrors mache's `writeback/validate.go` so consumers can drop the CGO tree-sitter link.",
+            description: "Tree-sitter syntactic validation of source content — nothing is persisted. Takes `content` (UTF-8 source) plus either `language` (extension key: go|py|js|ts|tsx|rs|ex|exs) or `path` (extension extracted). Returns `{ok, errors: [{row, col, byte_start, byte_end, message}], diagnostics: [{line, col, message}]}` — `errors` lists EVERY ERROR/MISSING node (0-based row/col, byte range into the buffer); `diagnostics` is the legacy first-error-only shape. Read-only; the daemon does not touch the projected db. Mirrors mache's `writeback/validate.go` so consumers can drop the CGO tree-sitter link.",
             schema: json!({
                 "type": "object",
                 "properties": {

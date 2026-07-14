@@ -10,6 +10,34 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.7.6] — 2026-07-13
+
+**`confinementDigest` Interlace cert extension — cloister/confinement/v1 §7 identity commit.**
+
+Patch release. Single-PR delta: adds the fourth Interlace cert extension at OID `1.3.6.1.4.1.99999.1.7`, wire-transporting a 32-byte BLAKE3-256 digest of the §6-canonical `ConfinementManifest` inside `tbs_certificate`. Cert-level, wire-additive; `wire_format_major = 1` unchanged; `compat_min_schema_version` stays at 0.6.0.
+
+### Added
+
+- **`confinementDigest` Interlace cert extension** — `OID 1.3.6.1.4.1.99999.1.7`, DER `OctetString` containing exactly 32 bytes (BLAKE3-256 of the §6-canonical `ConfinementManifest`). Parsed on the verifier path into `CertClaims.confinement_digest: Option<[u8; 32]>` — `None` on legacy certs, `Some` when the workload commits to a manifest. Any length ≠ 32 is a hard-reject rather than silent truncation, so a mis-encoded cert cannot pass identity-commit checks downstream. The digest lives inside the signed span, so a byte-flip attack breaks the Ed25519 signature over `tbs_certificate` (proved by a tampering test). JSON emission via `claims_to_json` uses `"cd":"<base64url-nopad>"`. 4 new integration tests in `sign/tests/confinement_digest_extension_test.rs`: roundtrip-preserves-32-bytes, absent-stays-None, present-alone-without-siblings, tampered-signature-rejects. Unblocks cloister-side §7 verification: a substrate runner enforcing a `ConfinementManifest` whose digest disagrees with this claim MUST refuse to start the bundle. Bead `ley-line-open-c79ea8`; PR #196.
+
+### Non-goals (deferred)
+
+- **Notme minter update** — LLO ships the verifier + test-only minter; production minting lives in notme (`cert-authority.ts`). notme still emits certs without the extension; consumers reading them will surface `confinement_digest = None`, which is the legacy path.
+- **Manifest canonicalization spec** — §6 canonical form is owned by cloister; LLO only carries the resulting 32-byte digest opaquely.
+
+### Compat matrix
+
+| Field | v0.7.5 | v0.7.6 | Note |
+|-------|--------|--------|------|
+| `binary_version` | 0.7.5 | 0.7.6 | Bump |
+| `schema_version` | 0.7.5 | 0.7.6 | Parity bump (no DB schema change; cert-level additive) |
+| `wire_format_major` | 1 | 1 | Unchanged |
+| `compat_min_schema_version` | 0.6.0 | 0.6.0 | Unchanged (extension is additive on the cert wire; older verifiers ignore unknown non-critical extensions per RFC 5280) |
+
+### Not shipped this release
+
+- **Analysis-substrate decade in-flight** — T1.b3-followup (`ley-line-open-a0fadd`), T1.b4, T2, T3, T4, F5 all still open.
+
 ## [0.7.5] — 2026-07-13
 
 **Arena-owner sentinel + node_defs.canonical_kind — closes two mache-observed correctness gaps.**
@@ -42,7 +70,7 @@ Patch release bundling two independent fixes filed against mache's 2026-07-13 re
 ### Not shipped this release
 
 - **Analysis-substrate decade in-flight** — T1.b3-followup (`ley-line-open-a0fadd`), T1.b4, T2, T3, T4, F5 all still open.
-- **`ley-line-open-d5abc2`** — leyline-sign `confinementDigest` cert extension (cloister ask). Filed for a follow-up release.
+- **`ley-line-open-c79ea8`** — leyline-sign `confinementDigest` cert extension (cloister ask). Filed for a follow-up release. **→ shipped in 0.7.6.**
 
 ## [0.7.4] — 2026-07-13
 

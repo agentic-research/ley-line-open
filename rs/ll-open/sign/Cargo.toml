@@ -65,6 +65,9 @@ host-extras = [
 ]
 
 [dependencies]
+# Shared C-boundary helpers (bead `ley-line-open-85fb1f` PR 2). Zero-dep
+# crate so wasm32 target stays clean.
+leyline-ffi-helpers = { path = "../../ll-core/ffi-helpers" }
 cms = { version = "0.2", default-features = false }
 der = { version = "0.7", features = ["derive", "oid", "alloc"] }
 x509-cert = { version = "0.2", default-features = false }

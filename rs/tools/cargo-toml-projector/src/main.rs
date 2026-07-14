@@ -681,11 +681,20 @@ fn project_unsafe_sites(workspace_root: &Path, repo_root: &Path) -> Result<Vec<U
                 continue;
             }
 
-            // Preceding-5-lines SAFETY check.
+            // SAFETY check with two contexts:
+            //   1. `// SAFETY:` on any of the preceding 5 lines
+            //      (canonical convention for `unsafe { }` blocks).
+            //   2. `# Safety` heading in the consecutive `///`/`//!`
+            //      doc-comment block immediately above (rustdoc
+            //      convention for `unsafe fn` / `unsafe impl` — the
+            //      block can be arbitrarily long, so a fixed-lines
+            //      window misses it).
             let start_ctx = idx.saturating_sub(5);
-            let has_safety = lines[start_ctx..idx]
+            let inline_safety = lines[start_ctx..idx].iter().any(|l| l.contains("SAFETY:"));
+            let doc_safety = doc_block_ending_at(&lines, idx)
                 .iter()
-                .any(|l| l.contains("SAFETY:") || contains_safety_heading(l));
+                .any(|l| contains_safety_heading(l));
+            let has_safety = inline_safety || doc_safety;
 
             let col = line.find("unsafe").unwrap_or(0);
             let src_id = path
@@ -805,6 +814,50 @@ fn is_type_level_unsafe_fn(line: &str) -> bool {
 fn contains_safety_heading(line: &str) -> bool {
     let t = line.trim_start_matches(|c: char| c == '/' || c == '!' || c.is_whitespace());
     t.starts_with("# Safety") || t.starts_with("## Safety") || t.starts_with("### Safety")
+}
+
+/// Return the slice of `lines` that forms the consecutive
+/// doc-comment block ending immediately before `idx` (exclusive).
+/// A "doc-comment line" is one whose first non-whitespace chars are
+/// `///` (outer doc) or `//!` (inner doc). Skips at most one blank
+/// line between the doc block and the target line so patterns like:
+///
+/// ```text
+/// /// # Safety
+/// /// ...docs...
+/// #[unsafe(no_mangle)]        // annotated item; blank not needed
+/// pub unsafe extern "C" fn ...
+/// ```
+///
+/// still bind the docstring to the item declaration line.
+fn doc_block_ending_at<'a>(lines: &'a [&'a str], idx: usize) -> &'a [&'a str] {
+    if idx == 0 {
+        return &[];
+    }
+    // Walk backward from idx-1, allowing attribute lines (`#[...]`)
+    // and up to one blank between the doc block and the target.
+    let mut cursor = idx;
+    while cursor > 0 {
+        let l = lines[cursor - 1].trim_start();
+        if l.starts_with("///") || l.starts_with("//!") {
+            break;
+        }
+        if l.is_empty() || l.starts_with("#[") || l.starts_with("#![") {
+            cursor -= 1;
+            continue;
+        }
+        return &[];
+    }
+    let end = cursor;
+    while cursor > 0 {
+        let l = lines[cursor - 1].trim_start();
+        if l.starts_with("///") || l.starts_with("//!") {
+            cursor -= 1;
+        } else {
+            break;
+        }
+    }
+    &lines[cursor..end]
 }
 
 fn insert_unsafe_sites(conn: &Connection, rows: &[UnsafeRow]) -> Result<()> {
@@ -1199,5 +1252,48 @@ mod tests {
     fn rejects_non_fn_unsafe_uses() {
         assert!(!is_type_level_unsafe_fn("unsafe { libc::getuid() }"));
         assert!(!is_type_level_unsafe_fn("unsafe impl Send for X {}"));
+    }
+
+    // ── doc_block_ending_at ───────────────────────────────────────────
+
+    #[test]
+    fn doc_block_walks_consecutive_slash_slash_slash_lines() {
+        let lines: Vec<&str> = vec![
+            "/// Some func.",      // 0
+            "///",                 // 1
+            "/// # Safety",        // 2
+            "/// All input ptrs.", // 3
+            "pub unsafe fn foo()", // 4  <- idx
+        ];
+        let block = doc_block_ending_at(&lines, 4);
+        assert_eq!(block.len(), 4);
+        assert!(block.iter().any(|l| contains_safety_heading(l)));
+    }
+
+    #[test]
+    fn doc_block_walks_through_attribute_lines_between_doc_and_item() {
+        // Rustdoc convention: `#[unsafe(no_mangle)]` sits between the
+        // doc-block and the `pub unsafe fn` line; the doc-block still
+        // binds to the fn.
+        let lines: Vec<&str> = vec![
+            "/// # Safety",                   // 0
+            "/// Caller must ensure X.",      // 1
+            "#[unsafe(no_mangle)]",           // 2
+            "pub unsafe extern \"C\" fn f()", // 3  <- idx
+        ];
+        let block = doc_block_ending_at(&lines, 3);
+        assert!(block.iter().any(|l| contains_safety_heading(l)));
+    }
+
+    #[test]
+    fn doc_block_empty_when_target_has_no_docs() {
+        let lines: Vec<&str> = vec!["let x = 1;", "let y = 2;", "unsafe { }"];
+        assert_eq!(doc_block_ending_at(&lines, 2).len(), 0);
+    }
+
+    #[test]
+    fn doc_block_at_start_of_file_returns_empty() {
+        let lines: Vec<&str> = vec!["pub unsafe fn f()"];
+        assert_eq!(doc_block_ending_at(&lines, 0).len(), 0);
     }
 }

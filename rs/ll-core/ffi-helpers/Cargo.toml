@@ -1,0 +1,15 @@
+[package]
+name = "leyline-ffi-helpers"
+version = "0.7.6"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Typed helpers for the C-boundary raw-pointer pattern used by every LLO extern \"C\" fn."
+
+[lib]
+
+# Deliberately zero deps. This crate exists so `leyline-sign`,
+# `leyline-cas-ffi`, and `leyline-fs` — all wasm-targeted crates with
+# thin dep trees — can share `c_input` / `c_output` without pulling in
+# `leyline-core`'s memmap2 / blake3 / capnp closure. Bead
+# `ley-line-open-85fb1f` PR 2.
+[dependencies]

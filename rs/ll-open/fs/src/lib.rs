@@ -8,10 +8,10 @@ pub mod validate;
 
 use anyhow::{Context, Result, bail};
 use leyline_core::{ArenaHeader, ContentAddressed, Controller};
+use leyline_ffi_helpers::{c_cstr, c_output, c_ref};
 use memmap2::Mmap;
 use rusqlite::Connection;
 use serde::Serialize;
-use std::ffi::CStr;
 use std::io::Cursor;
 use std::os::raw::c_char;
 use std::path::Path;
@@ -282,12 +282,12 @@ pub struct LeylineCtx {
 /// `path` must be a valid null-terminated C string pointing to the control file.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn leyline_open(path: *const c_char) -> *mut LeylineCtx {
-    let c_path = unsafe { CStr::from_ptr(path) };
-    let r_path = match c_path.to_str() {
-        Ok(s) => Path::new(s),
-        Err(_) => return std::ptr::null_mut(),
+    // SAFETY: `path` is a valid NUL-terminated C string per outer fn's
+    // # Safety docstring; delegated to `c_cstr`.
+    let Some(r_path_str) = (unsafe { c_cstr(path) }) else {
+        return std::ptr::null_mut();
     };
-
+    let r_path = Path::new(r_path_str);
     match SqliteGraphAdapter::from_arena(r_path) {
         Ok(adapter) => Box::into_raw(Box::new(LeylineCtx { adapter })),
         Err(_) => std::ptr::null_mut(),
@@ -301,23 +301,11 @@ pub unsafe extern "C" fn leyline_open(path: *const c_char) -> *mut LeylineCtx {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn leyline_close(ctx: *mut LeylineCtx) {
     if !ctx.is_null() {
+        // SAFETY: `ctx` originates from `leyline_open`'s `Box::into_raw`
+        // per outer fn's # Safety docstring, so reconstructing the Box
+        // reclaims the alloc.
         drop(unsafe { Box::from_raw(ctx) });
     }
-}
-
-/// Helper: extract a Rust str from a C string pointer, returning -1 on failure.
-unsafe fn cstr_to_str<'a>(ptr: *const c_char) -> Result<&'a str, i32> {
-    let c = unsafe { CStr::from_ptr(ptr) };
-    c.to_str().map_err(|_| -1)
-}
-
-/// Helper: write bytes into an output buffer, returning byte count or -1 if too large.
-unsafe fn write_out(data: &[u8], out_buf: *mut u8, len: usize) -> i32 {
-    if data.len() > len {
-        return -1;
-    }
-    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), out_buf, data.len()) };
-    data.len() as i32
 }
 
 /// Get a node by ID. Writes JSON `{"id":"...","name":"...","kind":0|1,"size":N,"mtime":N}`.
@@ -331,13 +319,15 @@ pub unsafe extern "C" fn leyline_get_node(
     out_buf: *mut u8,
     len: usize,
 ) -> i32 {
-    let ctx = match unsafe { ctx.as_ref() } {
-        Some(c) => c,
-        None => return -2,
+    // SAFETY: `ctx` valid per outer fn's # Safety docstring. `-2` is
+    // the documented return code for null context (see the FFI shape
+    // comment ~line 240).
+    let Some(ctx) = (unsafe { c_ref(ctx) }) else {
+        return -2;
     };
-    let id_str = match unsafe { cstr_to_str(id) } {
-        Ok(s) => s,
-        Err(e) => return e,
+    // SAFETY: `id` NUL-terminated per outer fn's # Safety docstring.
+    let Some(id_str) = (unsafe { c_cstr(id) }) else {
+        return -1;
     };
 
     use graph::Graph;
@@ -347,7 +337,9 @@ pub unsafe extern "C" fn leyline_get_node(
                 Ok(j) => j,
                 Err(_) => return -1,
             };
-            unsafe { write_out(json.as_bytes(), out_buf, len) }
+            // SAFETY: `out_buf` writable for `len` bytes per outer
+            // fn's # Safety docstring; delegated to `c_output`.
+            unsafe { c_output(json.as_bytes(), out_buf, len) }
         }
         Ok(None) => -1,
         Err(_) => -1,
@@ -365,13 +357,14 @@ pub unsafe extern "C" fn leyline_list_children(
     out_buf: *mut u8,
     len: usize,
 ) -> i32 {
-    let ctx = match unsafe { ctx.as_ref() } {
-        Some(c) => c,
-        None => return -2,
+    // SAFETY: `ctx` valid per outer fn's # Safety docstring; `-2` is
+    // the documented return code for null context.
+    let Some(ctx) = (unsafe { c_ref(ctx) }) else {
+        return -2;
     };
-    let pid = match unsafe { cstr_to_str(parent_id) } {
-        Ok(s) => s,
-        Err(e) => return e,
+    // SAFETY: `parent_id` NUL-terminated per outer fn's # Safety docstring.
+    let Some(pid) = (unsafe { c_cstr(parent_id) }) else {
+        return -1;
     };
 
     use graph::Graph;
@@ -382,7 +375,9 @@ pub unsafe extern "C" fn leyline_list_children(
                 Ok(j) => j,
                 Err(_) => return -1,
             };
-            unsafe { write_out(json.as_bytes(), out_buf, len) }
+            // SAFETY: `out_buf` writable for `len` bytes per outer
+            // fn's # Safety docstring; delegated to `c_output`.
+            unsafe { c_output(json.as_bytes(), out_buf, len) }
         }
         Err(_) => -1,
     }
@@ -400,17 +395,14 @@ pub unsafe extern "C" fn leyline_lookup_child(
     out_buf: *mut u8,
     len: usize,
 ) -> i32 {
-    let ctx = match unsafe { ctx.as_ref() } {
-        Some(c) => c,
-        None => return -2,
+    // SAFETY: `ctx` valid per outer fn's # Safety docstring; `-2` is
+    // the documented return code for null context.
+    let Some(ctx) = (unsafe { c_ref(ctx) }) else {
+        return -2;
     };
-    let pid = match unsafe { cstr_to_str(parent_id) } {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-    let name_str = match unsafe { cstr_to_str(name) } {
-        Ok(s) => s,
-        Err(e) => return e,
+    // SAFETY: `parent_id` and `name` NUL-terminated per outer fn's # Safety docstring.
+    let (Some(pid), Some(name_str)) = (unsafe { (c_cstr(parent_id), c_cstr(name)) }) else {
+        return -1;
     };
 
     use graph::Graph;
@@ -420,7 +412,9 @@ pub unsafe extern "C" fn leyline_lookup_child(
                 Ok(j) => j,
                 Err(_) => return -1,
             };
-            unsafe { write_out(json.as_bytes(), out_buf, len) }
+            // SAFETY: `out_buf` writable for `len` bytes per outer
+            // fn's # Safety docstring; delegated to `c_output`.
+            unsafe { c_output(json.as_bytes(), out_buf, len) }
         }
         Ok(None) => -1,
         Err(_) => -1,
@@ -439,22 +433,24 @@ pub unsafe extern "C" fn leyline_read_content(
     len: usize,
     offset: u64,
 ) -> i32 {
-    let ctx = match unsafe { ctx.as_ref() } {
-        Some(c) => c,
-        None => return -2,
+    // SAFETY: `ctx` valid per outer fn's # Safety docstring; `-2` is
+    // the documented return code for null context.
+    let Some(ctx) = (unsafe { c_ref(ctx) }) else {
+        return -2;
     };
-    let id_str = match unsafe { cstr_to_str(id) } {
-        Ok(s) => s,
-        Err(e) => return e,
+    // SAFETY: `id` NUL-terminated per outer fn's # Safety docstring.
+    let Some(id_str) = (unsafe { c_cstr(id) }) else {
+        return -1;
     };
 
     use graph::Graph;
     let mut buf = vec![0u8; len];
     match ctx.adapter.read_content(id_str, &mut buf, offset) {
-        Ok(n) => {
-            unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), out_buf, n) };
-            n as i32
-        }
+        // SAFETY: `out_buf` writable for `len` bytes per outer fn's
+        // # Safety docstring. `n` is bounded by `buf.len() == len` per
+        // `Graph::read_content`'s contract; delegated to `c_output`
+        // (which double-checks bounds).
+        Ok(n) => unsafe { c_output(&buf[..n], out_buf, len) },
         Err(_) => -1,
     }
 }
@@ -470,6 +466,8 @@ pub unsafe extern "C" fn leyline_query(
     out_buf: *mut u8,
     len: usize,
 ) -> i32 {
+    // SAFETY: all four pointers delegated to `leyline_get_node`, which
+    // shares the same # Safety contract (see docstring above).
     unsafe { leyline_get_node(ctx, id, out_buf, len) }
 }
 

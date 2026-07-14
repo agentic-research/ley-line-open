@@ -164,6 +164,24 @@ fn schema() -> &'static str {
             has_safety   INTEGER NOT NULL,
             PRIMARY KEY (source_id, start_row, start_col)
         );
+
+        -- Per-file bare `.unwrap()` sites in `rs/*/src/**/*.rs`. Only the
+        -- panic-on-None/Err form (`x.unwrap()`) counts — the fallback
+        -- variants (`unwrap_or`, `unwrap_or_else`, `unwrap_or_default`,
+        -- `unwrap_err`) are safe and skipped. tests/, benches/,
+        -- comment-only lines, `.unwrap()` inside string literals, and
+        -- `#[cfg(test)]` module subtrees are filtered at projection
+        -- time. `.expect("msg")` is Rust's canonical annotation for a
+        -- panicking accessor and is NOT flagged. Bead 85fb1f follow-up.
+        CREATE TABLE unwrap_sites (
+            source_id    TEXT NOT NULL,
+            node_id      TEXT NOT NULL,
+            start_row    INTEGER NOT NULL,
+            start_col    INTEGER NOT NULL,
+            end_row      INTEGER NOT NULL,
+            end_col      INTEGER NOT NULL,
+            PRIMARY KEY (source_id, start_row, start_col)
+        );
     "#
 }
 
@@ -923,6 +941,130 @@ fn insert_unsafe_sites(conn: &Connection, rows: &[UnsafeRow]) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Projection: unwrap_sites (rs/*/src/**/*.rs) — bead ley-line-open-85fb1f
+// follow-up (unwrap density audit).
+// ---------------------------------------------------------------------------
+
+struct UnwrapRow {
+    source_id: String,
+    node_id: String,
+    start_row: u32,
+    start_col: u32,
+    end_row: u32,
+    end_col: u32,
+}
+
+/// Walk `rs/*/src/**/*.rs` and emit one row per literal `.unwrap()`
+/// call that is NOT under `tests/`, `benches/`, an `#[cfg(test)]`
+/// module subtree, or a comment/string literal. Rejects the
+/// non-panicking fallback variants:
+///   `.unwrap_or(...)`, `.unwrap_or_else(...)`, `.unwrap_or_default()`,
+/// and `.unwrap_err()` (which is the Result-inverse used in tests).
+///
+/// `.expect("<msg>")` is Rust's canonical annotation for a panicking
+/// accessor and is intentionally NOT flagged — it plays the same role
+/// as `// SAFETY:` does for `unsafe`. Legacy `.unwrap()` sites should
+/// be converted to `.expect("<invariant>")` or `?`-propagated.
+fn project_unwrap_sites(workspace_root: &Path, repo_root: &Path) -> Result<Vec<UnwrapRow>> {
+    let mut rows = Vec::new();
+    for entry in WalkDir::new(workspace_root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+            continue;
+        }
+        let s = path.to_string_lossy();
+        if !s.contains("/src/") {
+            continue;
+        }
+        if s.contains("/target/") || s.contains("/tests/") || s.contains("/benches/") {
+            continue;
+        }
+
+        let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let lines: Vec<&str> = text.lines().collect();
+        let cfg_test_cutoff = find_test_module_line(&lines).unwrap_or(usize::MAX);
+
+        for (idx, line) in lines.iter().enumerate() {
+            let line_no = idx + 1;
+            if line_no >= cfg_test_cutoff {
+                break;
+            }
+
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("*") {
+                continue;
+            }
+
+            for col in unwrap_positions(line) {
+                let src_id = path
+                    .strip_prefix(repo_root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .to_string();
+                rows.push(UnwrapRow {
+                    node_id: format!("{}:{}:{}", src_id, line_no, col),
+                    source_id: src_id,
+                    start_row: line_no as u32,
+                    start_col: col as u32,
+                    end_row: line_no as u32,
+                    end_col: (col + ".unwrap()".len()) as u32,
+                });
+            }
+        }
+    }
+    Ok(rows)
+}
+
+/// Return byte-column positions where `.unwrap()` appears as a bare
+/// method call — panicking accessor, not one of the fallback variants.
+/// Skips matches inside string literals (basic `"..."` handling).
+fn unwrap_positions(line: &str) -> Vec<usize> {
+    let bytes = line.as_bytes();
+    let needle = b".unwrap()";
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut in_string = false;
+    while i + needle.len() <= bytes.len() {
+        let b = bytes[i];
+        if !in_string && b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            break;
+        }
+        if b == b'"' && (i == 0 || bytes[i - 1] != b'\\') {
+            in_string = !in_string;
+        }
+        if !in_string && &bytes[i..i + needle.len()] == needle {
+            out.push(i);
+            i += needle.len();
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+fn insert_unwrap_sites(conn: &Connection, rows: &[UnwrapRow]) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "INSERT OR REPLACE INTO unwrap_sites (
+            source_id, node_id, start_row, start_col, end_row, end_col
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    for r in rows {
+        stmt.execute(params![
+            r.source_id,
+            r.node_id,
+            r.start_row,
+            r.start_col,
+            r.end_row,
+            r.end_col,
+        ])?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Rule loading + execution
 // ---------------------------------------------------------------------------
 
@@ -1091,6 +1233,12 @@ fn main() -> Result<()> {
     // gate on `WHERE has_safety = 0`.
     let unsafe_rows = project_unsafe_sites(&workspace_root, &repo_root)?;
     insert_unsafe_sites(&conn, &unsafe_rows)?;
+
+    // Unwrap density audit (85fb1f follow-up): project every bare
+    // `.unwrap()` call in production code into `unwrap_sites` so the
+    // JSON rule can gate on the baseline count.
+    let unwrap_rows = project_unwrap_sites(&workspace_root, &repo_root)?;
+    insert_unwrap_sites(&conn, &unwrap_rows)?;
 
     let rules = load_rules(&rules_dir)?;
     if rules.is_empty() {
@@ -1382,6 +1530,58 @@ mod tests {
             "}",
         ];
         assert_eq!(find_test_module_line(&lines), None);
+    }
+
+    // ── unwrap_positions ──────────────────────────────────────────────
+
+    #[test]
+    fn detects_bare_unwrap_call() {
+        assert_eq!(unwrap_positions("    x.unwrap()"), vec![5]);
+        assert_eq!(
+            unwrap_positions("let n: u32 = s.parse().unwrap();"),
+            vec![22]
+        );
+    }
+
+    #[test]
+    fn detects_multiple_unwraps_on_one_line() {
+        // Columns are 0-indexed byte offsets of the `.` prefix.
+        assert_eq!(unwrap_positions("(a.unwrap(), b.unwrap())"), vec![2, 14]);
+    }
+
+    #[test]
+    fn rejects_fallback_variants() {
+        // The non-panicking `unwrap_*` family — never a bug, don't
+        // flag.
+        assert!(unwrap_positions("x.unwrap_or(0)").is_empty());
+        assert!(unwrap_positions("x.unwrap_or_default()").is_empty());
+        assert!(unwrap_positions("x.unwrap_or_else(|| 0)").is_empty());
+        assert!(unwrap_positions("x.unwrap_err()").is_empty());
+    }
+
+    #[test]
+    fn rejects_expect_with_message() {
+        // `.expect("...")` IS the annotation convention; not a match.
+        assert!(unwrap_positions("x.expect(\"non-empty invariant\")").is_empty());
+    }
+
+    #[test]
+    fn rejects_unwrap_inside_string_literal() {
+        assert!(unwrap_positions("let s = \".unwrap()\";").is_empty());
+    }
+
+    #[test]
+    fn rejects_unwrap_in_line_comment() {
+        // Anywhere after `//` on the same line is prose, not code.
+        assert!(unwrap_positions("let x = 1; // .unwrap() elsewhere").is_empty());
+    }
+
+    #[test]
+    fn detects_unwrap_before_trailing_line_comment() {
+        assert_eq!(
+            unwrap_positions("let x = y.unwrap(); // TODO expect(...)"),
+            vec![9]
+        );
     }
 
     #[test]

@@ -23,7 +23,12 @@ jobs:
       # deprecation does not apply; latest commit on master as of 2026-03).
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
-          toolchain: nightly
+          # Pinned per bead `ley-line-open-75444d`. Nightly daf2e5e18
+          # (2026-07-13) ICEs on `#[test]` + `#[serial(<key>)]`
+          # combination — hard-fails every PR + main. Unpin when
+          # upstream rolls a fix; last known-good was 77cf889bc
+          # (2026-07-12). Verify with a rebuild before unpinning.
+          toolchain: nightly-2026-07-12
           components: clippy, rustfmt
 
       # Cargo registry + rs/target cache. Median ~40-60s saved per run

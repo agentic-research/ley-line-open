@@ -50,7 +50,10 @@ jobs:
       # SHA-pinned: dtolnay/rust-toolchain (matches ci.yml).
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
-          toolchain: nightly
+          # Pinned per bead `ley-line-open-75444d` — keep in sync with
+          # ci.yml / release.yml. Unpin when the rustc ICE on
+          # `#[serial(<key>)]` (daf2e5e18 2026-07-13) rolls out.
+          toolchain: nightly-2026-07-12
 
       # SHA-pinned: Swatinem/rust-cache@v2.7.7 (matches ci.yml).
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0

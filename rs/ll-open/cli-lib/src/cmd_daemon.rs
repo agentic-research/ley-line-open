@@ -253,7 +253,8 @@ pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result
     let live_conn = match init_living_db(&ctrl_path, &live_db_path, source, language, reset_arena) {
         Ok(conn) => conn,
         Err(e) => {
-            state.write().unwrap().phase = DaemonPhase::Error(format!("init failed: {e:#}"));
+            state.write().expect("rwlock write-poisoned").phase =
+                DaemonPhase::Error(format!("init failed: {e:#}"));
             return Err(e);
         }
     };
@@ -275,7 +276,7 @@ pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result
     ) {
         Ok(db) => db,
         Err(e) => {
-            state.write().unwrap().phase =
+            state.write().expect("rwlock write-poisoned").phase =
                 DaemonPhase::Error(format!("reader pool init failed: {e:#}"));
             return Err(e);
         }
@@ -285,7 +286,7 @@ pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result
     if let Some(src) = source
         && let Some(sha) = git_head(src)
     {
-        state.write().unwrap().head_sha = Some(sha);
+        state.write().expect("rwlock write-poisoned").head_sha = Some(sha);
     }
 
     // 4. Event router.
@@ -422,7 +423,7 @@ pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result
     crate::daemon::embed::start_drain(ctx.clone());
 
     // Initial parse (during init_living_db) is done — daemon is ready to serve.
-    state.write().unwrap().phase = DaemonPhase::Ready;
+    state.write().expect("rwlock write-poisoned").phase = DaemonPhase::Ready;
 
     let sock_path = ctrl_path.with_extension("sock");
     crate::daemon::socket::spawn(ctx.clone(), sock_path.clone());
@@ -635,7 +636,7 @@ pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result
 
     // 12. Graceful shutdown: final snapshot + cleanup.
     {
-        let guard = ctx.live_db.writer.lock().unwrap();
+        let guard = ctx.live_db.writer.lock().expect("mutex poisoned");
         if let Err(e) = snapshot_to_arena(&guard, &ctrl_path) {
             eprintln!("warn: final snapshot failed: {e:#}");
         } else {
@@ -1062,7 +1063,7 @@ pub fn snapshot_or_log(
     ctrl_path: &Path,
     label: &str,
 ) {
-    let guard = live_db.lock().unwrap();
+    let guard = live_db.lock().expect("mutex poisoned");
     if let Err(e) = snapshot_to_arena(&guard, ctrl_path) {
         log::error!("{label}: {e:#}");
     }
@@ -1331,7 +1332,7 @@ async fn git_watch_loop(
                 &last_head[..7.min(last_head.len())],
                 &current_head[..7.min(current_head.len())],
             );
-            ctx.state.write().unwrap().head_sha = Some(current_head.clone());
+            ctx.state.write().expect("rwlock write-poisoned").head_sha = Some(current_head.clone());
             emitter.emit(
                 "daemon.head.changed",
                 "leyline",
@@ -1361,7 +1362,7 @@ async fn git_watch_loop(
 
         // 3. Incremental reparse, scoped to the dirty set so we don't re-stat
         //    the entire source tree on every tick.
-        ctx.state.write().unwrap().phase = DaemonPhase::Parsing;
+        ctx.state.write().expect("rwlock write-poisoned").phase = DaemonPhase::Parsing;
         let lang = ctx.lang_filter.as_deref();
         let dirty_vec: Vec<String> = last_dirty.iter().cloned().collect();
         let scope: Option<&[String]> = if dirty_vec.is_empty() {
@@ -1369,7 +1370,7 @@ async fn git_watch_loop(
         } else {
             Some(dirty_vec.as_slice())
         };
-        let guard = ctx.live_db.writer.lock().unwrap();
+        let guard = ctx.live_db.writer.lock().expect("mutex poisoned");
         match crate::cmd_parse::parse_into_conn(&guard, source_dir, lang, scope) {
             Ok(result) => {
                 if result.parsed > 0 || result.deleted > 0 {
@@ -1384,7 +1385,7 @@ async fn git_watch_loop(
 
                     // 5. Update state + emit events.
                     {
-                        let mut s = ctx.state.write().unwrap();
+                        let mut s = ctx.state.write().expect("rwlock write-poisoned");
                         s.last_reparse_at_ms = Some(crate::daemon::now_ms());
                         s.phase = DaemonPhase::Ready;
                     }
@@ -1426,12 +1427,12 @@ async fn git_watch_loop(
                     run_watcher_enrichment(&ctx, source_dir, &result.changed_files, &emitter);
                 } else {
                     drop(guard);
-                    ctx.state.write().unwrap().phase = DaemonPhase::Ready;
+                    ctx.state.write().expect("rwlock write-poisoned").phase = DaemonPhase::Ready;
                 }
             }
             Err(e) => {
                 log::error!("watch reparse failed: {e:#}");
-                ctx.state.write().unwrap().phase =
+                ctx.state.write().expect("rwlock write-poisoned").phase =
                     DaemonPhase::Error(format!("watch reparse failed: {e:#}"));
             }
         }
@@ -1471,7 +1472,7 @@ pub fn run_watcher_enrichment(
     changed_files: &[String],
     emitter: &crate::daemon::events::EventEmitter,
 ) {
-    ctx.state.write().unwrap().phase = DaemonPhase::Enriching;
+    ctx.state.write().expect("rwlock write-poisoned").phase = DaemonPhase::Enriching;
 
     let scope: Option<&[String]> = if changed_files.is_empty() {
         None
@@ -1480,7 +1481,7 @@ pub fn run_watcher_enrichment(
     };
 
     let started_ms = crate::daemon::now_ms();
-    let guard = ctx.live_db.writer.lock().unwrap();
+    let guard = ctx.live_db.writer.lock().expect("mutex poisoned");
     let outcome = crate::daemon::enrichment::run_all(
         &ctx.enrichment_passes,
         &guard,
@@ -1490,7 +1491,7 @@ pub fn run_watcher_enrichment(
     );
     drop(guard);
 
-    ctx.state.write().unwrap().phase = DaemonPhase::Ready;
+    ctx.state.write().expect("rwlock write-poisoned").phase = DaemonPhase::Ready;
 
     match outcome {
         Ok(stats) => {
@@ -1664,7 +1665,7 @@ pub fn emit_watcher_sheaf_invalidate(
     // cache lock so both sides are consistent to the moment the payload
     // is decided. Never sent on the wire — measurement only.
     let (invalidated, scope, prior_generation, generation, all_known) = {
-        let mut cache = ctx.sheaf.cache().lock().unwrap();
+        let mut cache = ctx.sheaf.cache().lock().expect("mutex poisoned");
         let all_known: Vec<u32> = cache
             .complex()
             .map(|cx| cx.nodes.clone())

@@ -280,15 +280,15 @@ impl SubtreeCache {
     }
 
     pub fn get(&self, key: &[u8; 32]) -> Option<Hypervector> {
-        self.map.lock().unwrap().get(key).copied()
+        self.map.lock().expect("mutex poisoned").get(key).copied()
     }
 
     pub fn put(&self, key: [u8; 32], hv: Hypervector) {
-        self.map.lock().unwrap().insert(key, hv);
+        self.map.lock().expect("mutex poisoned").insert(key, hv);
     }
 
     pub fn len(&self) -> usize {
-        self.map.lock().unwrap().len()
+        self.map.lock().expect("mutex poisoned").len()
     }
 
     pub fn is_empty(&self) -> bool {

@@ -662,6 +662,11 @@ fn project_unsafe_sites(workspace_root: &Path, repo_root: &Path) -> Result<Vec<U
         if s.contains("/target/") || s.contains("/tests/") || s.contains("/benches/") {
             continue;
         }
+        // Skip files that the parent module gates behind `#[cfg(test)]
+        // mod <basename>;` — the whole file is test-only.
+        if is_file_cfg_test_gated(path) {
+            continue;
+        }
 
         let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         let lines: Vec<&str> = text.lines().collect();
@@ -792,19 +797,25 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// Return the 1-indexed line number where a MODULE-LEVEL
-/// `#[cfg(test)]` gates a `mod <name> { ... }` block — the earliest
-/// such line, if any. Everything at-or-below is treated as test code
-/// by the unsafe/SAFETY projector.
+/// Return the 1-indexed line number where a MODULE-LEVEL cfg-test
+/// predicate gates a `mod <name> { ... }` block — the earliest such
+/// line, if any. Everything at-or-below is treated as test code by
+/// the unsafe/SAFETY + unwrap projectors.
 ///
-/// A per-fn `#[cfg(test)]` (typically indented, followed by `fn ...`
+/// Recognizes:
+///   - `#[cfg(test)]`
+///   - `#[cfg(all(test, ...))]`
+///   - `#[cfg(any(test, ...))]`
+///   - `#[cfg(...anything...test...)]` in general (substring match on
+///     `test` after `cfg(` — safe because Rust cfg predicates don't
+///     nest `test` in string literals).
+///
+/// A per-fn cfg-test attribute (typically indented, followed by `fn ...`
 /// not `mod ...`) is NOT a cutoff — it gates a single item, not a
-/// whole tail of the file, so unsafe blocks after it are still
-/// production code.
+/// whole tail of the file, so items after it are still production.
 fn find_test_module_line(lines: &[&str]) -> Option<usize> {
     for (i, l) in lines.iter().enumerate() {
-        let trimmed = l.trim_start();
-        if !trimmed.starts_with("#[cfg(test)]") {
+        if !is_cfg_test_attr(l) {
             continue;
         }
         // Walk forward through blank / attribute lines to find the
@@ -821,13 +832,110 @@ fn find_test_module_line(lines: &[&str]) -> Option<usize> {
             if starts_mod {
                 return Some(i + 1);
             }
-            // Any other item → this `#[cfg(test)]` gates a single fn/
-            // const/etc; NOT a cutoff. Keep scanning for a later
+            // Any other item → this cfg-test attribute gates a single
+            // fn/const/etc; NOT a cutoff. Keep scanning for a later
             // module-level one.
             break;
         }
     }
     None
+}
+
+/// True iff `line` is a `#[cfg(...)]` attribute whose predicate
+/// references the `test` cfg — matching `#[cfg(test)]`,
+/// `#[cfg(all(test, ...))]`, `#[cfg(any(test, ...))]`, and other
+/// nested combinations.
+fn is_cfg_test_attr(line: &str) -> bool {
+    let t = line.trim_start();
+    let Some(rest) = t.strip_prefix("#[cfg(") else {
+        return false;
+    };
+    // Reject the closing `)]` if it's the immediate follow (empty pred).
+    // Predicate substring ends at the matching `)]`.
+    let Some(end) = rest.rfind(")]") else {
+        return false;
+    };
+    let pred = &rest[..end];
+    // Match `test` as a bare identifier (avoid matching `test_foo`).
+    let bytes = pred.as_bytes();
+    let needle = b"test";
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if &bytes[i..i + needle.len()] == needle {
+            let before_ok = i == 0 || !is_ident_byte(bytes[i - 1]);
+            let after = bytes.get(i + needle.len()).copied().unwrap_or(b' ');
+            let after_ok = !is_ident_byte(after);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// True iff this file (`file_path`) is `#[cfg(test)]`-gated in its
+/// parent module — i.e., the parent `lib.rs` or `mod.rs` contains
+/// `#[cfg(test)]\n[pub ]?mod <basename>;`. Files gated this way are
+/// entirely test-only; every unwrap/unsafe in them should be
+/// excluded from the projections.
+///
+/// Best-effort text scan: reads the parent module file and checks
+/// for the pattern. Returns `false` if the parent can't be resolved.
+fn is_file_cfg_test_gated(file_path: &Path) -> bool {
+    let Some(parent_dir) = file_path.parent() else {
+        return false;
+    };
+    let Some(stem) = file_path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    // If this IS a lib.rs / mod.rs / main.rs, no parent to check.
+    if stem == "lib" || stem == "mod" || stem == "main" {
+        return false;
+    }
+    let parent_candidates = [
+        parent_dir.join("mod.rs"),
+        parent_dir.join("lib.rs"),
+        parent_dir.join("main.rs"),
+    ];
+    for parent in &parent_candidates {
+        let Ok(text) = fs::read_to_string(parent) else {
+            continue;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, l) in lines.iter().enumerate() {
+            if !is_cfg_test_attr(l) {
+                continue;
+            }
+            // Look at the next non-blank / non-attr line.
+            for candidate in lines.iter().skip(i + 1) {
+                let t = candidate.trim_start();
+                if t.is_empty() || t.starts_with("//") || t.starts_with("#[") {
+                    continue;
+                }
+                // Match `[pub[(...)]* ]mod <stem>;`
+                let after_pub = t
+                    .strip_prefix("pub(crate) ")
+                    .or_else(|| t.strip_prefix("pub(super) "))
+                    .or_else(|| t.strip_prefix("pub "))
+                    .unwrap_or(t);
+                let Some(after_mod) = after_pub.strip_prefix("mod ") else {
+                    break;
+                };
+                let name = after_mod
+                    .trim_end_matches(';')
+                    .trim_end()
+                    .trim_end_matches('{')
+                    .trim();
+                if name == stem {
+                    return true;
+                }
+                break;
+            }
+        }
+        return false;
+    }
+    false
 }
 
 /// True iff the line's `unsafe` appears in a fn-pointer TYPE position:
@@ -982,15 +1090,28 @@ fn project_unwrap_sites(workspace_root: &Path, repo_root: &Path) -> Result<Vec<U
         if s.contains("/target/") || s.contains("/tests/") || s.contains("/benches/") {
             continue;
         }
+        // Skip files that the parent module gates behind `#[cfg(test)]
+        // mod <basename>;` — the whole file is test-only.
+        if is_file_cfg_test_gated(path) {
+            continue;
+        }
 
         let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         let lines: Vec<&str> = text.lines().collect();
         let cfg_test_cutoff = find_test_module_line(&lines).unwrap_or(usize::MAX);
+        let inside_raw_string = raw_string_line_mask(&text);
 
         for (idx, line) in lines.iter().enumerate() {
             let line_no = idx + 1;
             if line_no >= cfg_test_cutoff {
                 break;
+            }
+            if inside_raw_string.get(idx).copied().unwrap_or(false) {
+                // Every byte on this line is inside a multi-line raw
+                // string literal — skip entirely so prose containing
+                // `.unwrap()` in a SQL comment or doc block doesn't
+                // fire.
+                continue;
             }
 
             let trimmed = line.trim_start();
@@ -1018,19 +1139,141 @@ fn project_unwrap_sites(workspace_root: &Path, repo_root: &Path) -> Result<Vec<U
     Ok(rows)
 }
 
+/// Return a bitmask over `text`'s lines: `mask[i] == true` iff line
+/// `i` is entirely (or predominantly) inside a Rust raw string
+/// literal (`r"..."`, `r#"..."#`, `r##"..."##`, ...) that opened on
+/// an earlier line and hasn't yet closed. Coarse: any line whose
+/// FIRST character is inside a raw string is masked, so the
+/// `.unwrap()` in a SQL comment inside `r#" ... "#` won't fire.
+///
+/// Doesn't handle plain (non-raw) `"..."` multi-line strings — those
+/// are rare in Rust source (require explicit `\` continuations) and
+/// the per-line tokenizer already handles their common single-line
+/// form.
+fn raw_string_line_mask(text: &str) -> Vec<bool> {
+    // Precompute the line index for each byte, then walk the bytes
+    // tracking raw-string state. When a raw string closes, mark
+    // every line STRICTLY between its opening line and its closing
+    // line as interior — the opening + closing lines carry real
+    // code and are handled by the per-line tokenizer.
+    let n_lines = text.lines().count().max(1);
+    let mut mask = vec![false; n_lines];
+    let bytes = text.as_bytes();
+    let mut cur_line = 0usize;
+    let mut i = 0usize;
+    let mut raw_hashes: usize = 0; // 0 = outside; else # closing hashes needed
+    let mut raw_open_line: usize = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\n' {
+            cur_line += 1;
+            i += 1;
+            continue;
+        }
+        if raw_hashes == 0 {
+            if b == b'r' && (i == 0 || !is_ident_byte(bytes[i - 1])) {
+                let mut hashes = 0usize;
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j] == b'#' {
+                    hashes += 1;
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b'"' {
+                    raw_hashes = hashes + 1;
+                    raw_open_line = cur_line;
+                    i = j + 1;
+                    continue;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        // Inside a raw string.
+        if b == b'"' {
+            let need = raw_hashes - 1;
+            let mut all_hash = true;
+            for k in 0..need {
+                if bytes.get(i + 1 + k) != Some(&b'#') {
+                    all_hash = false;
+                    break;
+                }
+            }
+            if all_hash {
+                // Mark interior lines (strictly between open + close).
+                let close_line = cur_line;
+                let start_mark = raw_open_line + 1;
+                for ln in start_mark..close_line {
+                    if ln < mask.len() {
+                        mask[ln] = true;
+                    }
+                }
+                i += 1 + need;
+                raw_hashes = 0;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    mask
+}
+
 /// Return byte-column positions where `.unwrap()` appears as a bare
 /// method call — panicking accessor, not one of the fallback variants.
-/// Skips matches inside string literals (basic `"..."` handling).
+/// Skips matches inside line comments, plain double-quoted string
+/// literals, and Rust raw strings (`r"..."`, `r#"..."#`, `r##"..."##`).
 fn unwrap_positions(line: &str) -> Vec<usize> {
     let bytes = line.as_bytes();
     let needle = b".unwrap()";
     let mut out = Vec::new();
     let mut i = 0;
     let mut in_string = false;
+    // For raw strings: number of `#` before the opening `"`. We're
+    // inside a raw string until we see `"` followed by the same
+    // number of `#`s. `raw_hashes == 0` when we're either not in a
+    // string, or in a plain double-quoted string (uses the
+    // `in_string` toggle above).
+    let mut raw_hashes: usize = 0;
     while i + needle.len() <= bytes.len() {
         let b = bytes[i];
-        if !in_string && b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+        if !in_string && raw_hashes == 0 && b == b'/' && bytes.get(i + 1) == Some(&b'/') {
             break;
+        }
+        // Detect start of a raw string: `r"` or `r#..#"`. Requires
+        // that `r` is at a token boundary (not part of an identifier
+        // like `str_r"..."` — unrealistic but safe).
+        if !in_string && raw_hashes == 0 && b == b'r' && (i == 0 || !is_ident_byte(bytes[i - 1])) {
+            let mut hashes = 0usize;
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] == b'#' {
+                hashes += 1;
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'"' {
+                // Entered a raw string; remember how many `#`s close it.
+                raw_hashes = hashes + 1; // +1 sentinel: 0 means "not in raw"
+                i = j + 1;
+                continue;
+            }
+        }
+        if raw_hashes > 0 {
+            // Look for the closing `"` followed by (raw_hashes - 1) `#`s.
+            if b == b'"' {
+                let need = raw_hashes - 1;
+                let mut all_hash = true;
+                for k in 0..need {
+                    if bytes.get(i + 1 + k) != Some(&b'#') {
+                        all_hash = false;
+                        break;
+                    }
+                }
+                if all_hash {
+                    i += 1 + need;
+                    raw_hashes = 0;
+                    continue;
+                }
+            }
+            i += 1;
+            continue;
         }
         if b == b'"' && (i == 0 || bytes[i - 1] != b'\\') {
             in_string = !in_string;
@@ -1582,6 +1825,81 @@ mod tests {
             unwrap_positions("let x = y.unwrap(); // TODO expect(...)"),
             vec![9]
         );
+    }
+
+    // ── is_cfg_test_attr ──────────────────────────────────────────────
+
+    // ── raw_string_line_mask ──────────────────────────────────────────
+
+    #[test]
+    fn raw_string_mask_marks_interior_lines() {
+        // Raw string opens on line 0, closes on line 2 — line 1 is
+        // fully interior and must be masked.
+        let text = "let sql = r#\"\n    -- x.unwrap() prose\n\"#;\n";
+        let mask = raw_string_line_mask(text);
+        // Line 0: opens after `r#\"` — code before it, don't mask
+        // Line 1: pure interior — mask
+        // Line 2: closes at start — don't mask (byte 0 is `\"`, closer)
+        assert!(mask.len() >= 3);
+        assert!(!mask[0], "opening line has code before r#\", not masked");
+        assert!(mask[1], "interior line must be masked");
+    }
+
+    #[test]
+    fn raw_string_mask_does_not_mask_when_no_raw_string() {
+        let text = "let x = 1;\nlet y = 2;\n";
+        let mask = raw_string_line_mask(text);
+        for (i, m) in mask.iter().enumerate() {
+            assert!(
+                !m,
+                "line {i} must not be masked in code without raw strings"
+            );
+        }
+    }
+
+    #[test]
+    fn cfg_test_attr_matches_bare_cfg_test() {
+        assert!(is_cfg_test_attr("#[cfg(test)]"));
+        assert!(is_cfg_test_attr("    #[cfg(test)]"));
+    }
+
+    #[test]
+    fn cfg_test_attr_matches_all_and_any_wrappers() {
+        // fs/src/validate.rs shape: `#[cfg(all(test, feature = "validate"))]`
+        assert!(is_cfg_test_attr(
+            "#[cfg(all(test, feature = \"validate\"))]"
+        ));
+        assert!(is_cfg_test_attr(
+            "#[cfg(any(test, feature = \"validate\"))]"
+        ));
+        assert!(is_cfg_test_attr("#[cfg(all(unix, test))]"));
+    }
+
+    #[test]
+    fn cfg_test_attr_rejects_test_as_ident_prefix_or_suffix() {
+        assert!(!is_cfg_test_attr("#[cfg(feature = \"test_foo\")]"));
+        assert!(!is_cfg_test_attr("#[cfg(feature = \"foo_test\")]"));
+        assert!(!is_cfg_test_attr("#[cfg(not(target_os = \"testable\"))]"));
+    }
+
+    #[test]
+    fn cfg_test_attr_rejects_non_cfg_attributes() {
+        assert!(!is_cfg_test_attr("#[test]"));
+        assert!(!is_cfg_test_attr("#[allow(dead_code)]"));
+        assert!(!is_cfg_test_attr("let x = 1;"));
+    }
+
+    #[test]
+    fn test_module_line_matches_cfg_all_test_wrapping() {
+        // fs/src/validate.rs's real shape: `#[cfg(all(test, feature="validate"))] mod tests`.
+        let lines: Vec<&str> = vec![
+            "fn prod() {}",                              // 0
+            "#[cfg(all(test, feature = \"validate\"))]", // 1
+            "mod tests {",                               // 2
+            "    fn t() {}",                             // 3
+            "}",                                         // 4
+        ];
+        assert_eq!(find_test_module_line(&lines), Some(2));
     }
 
     #[test]

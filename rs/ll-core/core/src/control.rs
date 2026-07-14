@@ -124,7 +124,11 @@ impl Controller {
         let mut mmap = mmap_write(&file)?;
 
         // Initialize if new (magic == 0)
-        let existing_magic = u32::from_ne_bytes(mmap[OFF_MAGIC..OFF_MAGIC + 4].try_into().unwrap());
+        let existing_magic = u32::from_ne_bytes(
+            mmap[OFF_MAGIC..OFF_MAGIC + 4]
+                .try_into()
+                .expect("4-byte slice ⇒ [u8; 4]"),
+        );
 
         if existing_magic == 0 {
             mmap[OFF_MAGIC..OFF_MAGIC + 4].copy_from_slice(&MAGIC.to_ne_bytes());
@@ -136,8 +140,11 @@ impl Controller {
             // exposed a public `generation` API that v0.2.0 removed;
             // reading a V1 file as V2 (or vice versa) would silently
             // misinterpret the sync atom slot — refuse explicitly.
-            let existing_version =
-                u32::from_ne_bytes(mmap[OFF_VERSION..OFF_VERSION + 4].try_into().unwrap());
+            let existing_version = u32::from_ne_bytes(
+                mmap[OFF_VERSION..OFF_VERSION + 4]
+                    .try_into()
+                    .expect("4-byte slice ⇒ [u8; 4]"),
+            );
             if existing_version != VERSION {
                 bail!(
                     "control block VERSION mismatch: file has v{}, this binary expects v{}. \
@@ -219,7 +226,7 @@ impl Controller {
         u64::from_ne_bytes(
             self.mmap[OFF_ARENA_SIZE..OFF_ARENA_SIZE + 8]
                 .try_into()
-                .unwrap(),
+                .expect("8-byte slice ⇒ [u8; 8]"),
         )
     }
 

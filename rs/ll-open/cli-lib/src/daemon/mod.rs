@@ -258,7 +258,7 @@ impl DaemonContext {
     where
         F: FnOnce(&rusqlite::Connection) -> Result<T>,
     {
-        let guard = self.live_db.writer.lock().unwrap();
+        let guard = self.live_db.writer.lock().expect("mutex poisoned");
         f(&guard)
     }
 }

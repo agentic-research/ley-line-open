@@ -382,7 +382,7 @@ impl ResolveCache {
     /// asserting bounded growth.
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.inner.lock().unwrap().cells.len()
+        self.inner.lock().expect("mutex poisoned").cells.len()
     }
 }
 

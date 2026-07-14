@@ -74,7 +74,9 @@ impl DexStore {
             created_at: now_nanos() / 1_000_000_000, // seconds
             completed_at: None,
         });
-        self.tasks.last().unwrap()
+        self.tasks
+            .last()
+            .expect("just pushed above; last() must be Some")
     }
 
     fn find_mut(&mut self, id: &str) -> Option<&mut DexTask> {
@@ -522,7 +524,7 @@ pub enum WriteEvent {
 fn now_nanos() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .expect("system clock never before UNIX_EPOCH")
         .as_nanos() as i64
 }
 
@@ -650,9 +652,9 @@ impl VersionedGraph {
 
     fn read_dex(&self, name: &str, buf: &mut [u8], offset: u64) -> Result<usize> {
         let content = match name {
-            "tasks" => self.dex.lock().unwrap().to_jsonl(),
+            "tasks" => self.dex.lock().expect("mutex poisoned").to_jsonl(),
             "current" => {
-                let store = self.dex.lock().unwrap();
+                let store = self.dex.lock().expect("mutex poisoned");
                 match store.current() {
                     Some(task) => {
                         let mut obj = serde_json::to_value(task)?;
@@ -692,14 +694,14 @@ impl VersionedGraph {
                 if content.is_empty() {
                     anyhow::bail!("task description cannot be empty");
                 }
-                let mut store = self.dex.lock().unwrap();
+                let mut store = self.dex.lock().expect("mutex poisoned");
                 let task = store.create(content);
                 log::info!("dex: created task {} — {}", task.id, task.description);
                 Ok(data.len())
             }
             "current" => {
                 // Write a task ID to set it as in_progress
-                let mut store = self.dex.lock().unwrap();
+                let mut store = self.dex.lock().expect("mutex poisoned");
                 if let Some(task) = store.find_mut(content) {
                     task.status = "in_progress".into();
                     // Snapshot current dirty nodes into the task
@@ -716,7 +718,7 @@ impl VersionedGraph {
 
                 // Snapshot dirty nodes into the task before committing
                 {
-                    let mut store = self.dex.lock().unwrap();
+                    let mut store = self.dex.lock().expect("mutex poisoned");
                     if let Some(task) = store.find_mut(&task_id) {
                         task.staged = self.staging.dirty_nodes().unwrap_or_default();
                     } else {
@@ -732,7 +734,7 @@ impl VersionedGraph {
 
                 // Mark task completed
                 {
-                    let mut store = self.dex.lock().unwrap();
+                    let mut store = self.dex.lock().expect("mutex poisoned");
                     if let Some(task) = store.find_mut(&task_id) {
                         task.status = "completed".into();
                         task.completed_at = Some(now_nanos() / 1_000_000_000);
@@ -750,7 +752,7 @@ impl VersionedGraph {
         let content = match id {
             ".leyline/status" => "{\"status\":\"ok\"}\n".to_string(),
             ".leyline/log" => {
-                let jj = self.jj.lock().unwrap();
+                let jj = self.jj.lock().expect("mutex poisoned");
                 jj.log_json(20)?
             }
             _ => return Ok(0),
@@ -775,7 +777,7 @@ impl VersionedGraph {
         match id {
             ".leyline/revert" => {
                 log::info!("revert requested: {content}");
-                let jj = self.jj.lock().unwrap();
+                let jj = self.jj.lock().expect("mutex poisoned");
                 jj.revert_to_commit(content, self.inner.as_ref())?;
                 Ok(data.len())
             }
@@ -1231,7 +1233,7 @@ pub async fn jj_commit_loop(
                 let message = format_commit_message(&batch);
                 batch.clear();
 
-                match jj.lock().unwrap().commit_snapshot(graph.as_ref(), &message) {
+                match jj.lock().expect("mutex poisoned").commit_snapshot(graph.as_ref(), &message) {
                     Ok(id) => {
                         log::debug!("committed snapshot {}", &id[..12]);
                         if let Err(e) = graph.flush_to_arena() {
@@ -1248,7 +1250,9 @@ pub async fn jj_commit_loop(
                 }
             }
             _ = poll_interval.tick(), if control_path.is_some() => {
-                let ctrl_path = control_path.as_ref().unwrap();
+                let ctrl_path = control_path
+                    .as_ref()
+                    .expect("select arm guard `control_path.is_some()` above");
                 let current_root = match Controller::open_or_create(ctrl_path) {
                     Ok(c) => c.current_root(),
                     Err(_) => continue,
@@ -1257,7 +1261,7 @@ pub async fn jj_commit_loop(
                 if current_root != last_root && current_root != [0u8; 32] {
                     last_root = current_root;
                     log::info!("Σ root change detected ({}…), snapshotting", hex::encode(&current_root[..6]));
-                    match jj.lock().unwrap().commit_snapshot(graph.as_ref(), "root change") {
+                    match jj.lock().expect("mutex poisoned").commit_snapshot(graph.as_ref(), "root change") {
                         Ok(id) => log::info!("root-change snapshot {}", &id[..id.len().min(12)]),
                         Err(e) => log::warn!("root-change snapshot failed: {e}"),
                     }

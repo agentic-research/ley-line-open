@@ -147,7 +147,10 @@ pub fn run_pass(
     let mut stats = Vec::new();
 
     for pass_name in order {
-        let pass = passes.iter().find(|p| p.name() == pass_name).unwrap();
+        let pass = passes
+            .iter()
+            .find(|p| p.name() == pass_name)
+            .expect("resolve_order returns only names present in `passes`");
 
         let start = Instant::now();
         let result = execute_pass(pass.as_ref(), conn, source_dir, changed_files, state)?;

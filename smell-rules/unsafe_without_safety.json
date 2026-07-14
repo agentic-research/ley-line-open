@@ -1,0 +1,7 @@
+{
+  "ID": "unsafe_without_safety",
+  "Description": "Any `unsafe` use in `rs/*/src/**/*.rs` that lacks a preceding `// SAFETY:` comment or `/// # Safety` docstring within the previous 5 lines. Tests/, benches/, comment-only lines, and `#[cfg(test)]` subtrees are filtered out at projection time. Bead `ley-line-open-85fb1f` — draws down the existing sprawl via three PRs (FUSE per-site annotation, FFI helpers refactor, mmap helper + misc). Baseline in `docs/smell-baseline.json` grandfathers the current 59 sites; the gate fails on any NEW unannotated `unsafe` on top of the baseline. When PRs 1–3 land, the baseline count for this rule reaches zero and the gate becomes 'every unsafe MUST be annotated, full stop'.",
+  "Requires": ["unsafe_sites"],
+  "ScopeColumn": "u.source_id",
+  "Query": "SELECT u.source_id, u.node_id, u.start_row, u.start_col, u.end_row, u.end_col, 1 AS metric FROM unsafe_sites u WHERE u.has_safety = 0 %s ORDER BY u.source_id, u.start_row"
+}

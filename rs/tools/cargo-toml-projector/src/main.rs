@@ -147,6 +147,23 @@ fn schema() -> &'static str {
             end_col          INTEGER NOT NULL,
             PRIMARY KEY (crate, section, dep_name)
         );
+
+        -- Per-file `unsafe` sites in `rs/*/src/**/*.rs`. `has_safety = 1`
+        -- when a `// SAFETY:` comment or `# Safety` docstring appears in
+        -- the preceding 5 lines; else 0. tests/, benches/, comment-only
+        -- lines, and `#[cfg(test)]` subtrees are filtered out at
+        -- projection time so the query is a pure `WHERE has_safety = 0`.
+        -- Bead `ley-line-open-85fb1f`.
+        CREATE TABLE unsafe_sites (
+            source_id    TEXT NOT NULL,
+            node_id      TEXT NOT NULL,
+            start_row    INTEGER NOT NULL,
+            start_col    INTEGER NOT NULL,
+            end_row      INTEGER NOT NULL,
+            end_col      INTEGER NOT NULL,
+            has_safety   INTEGER NOT NULL,
+            PRIMARY KEY (source_id, start_row, start_col)
+        );
     "#
 }
 
@@ -586,6 +603,184 @@ fn insert_crate_deps(conn: &Connection, rows: &[DepRow]) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Projection: unsafe_sites (rs/*/src/**/*.rs) — bead ley-line-open-85fb1f
+// ---------------------------------------------------------------------------
+
+struct UnsafeRow {
+    source_id: String,
+    node_id: String,
+    start_row: u32,
+    start_col: u32,
+    end_row: u32,
+    end_col: u32,
+    has_safety: bool,
+}
+
+/// Walk `rs/*/src/**/*.rs` and emit one row per `unsafe` occurrence
+/// that is NOT under `tests/`, `benches/`, an `#[cfg(test)]` subtree,
+/// or a comment line. The `has_safety` flag is true when either
+///   - `// SAFETY:` or `SAFETY:` appears in the preceding 5 lines, OR
+///   - `# Safety` (rustdoc section header) appears in the preceding
+///     5 lines (for `unsafe fn`/`unsafe impl` docstrings).
+///
+/// Rustdoc convention: `# Safety` is the canonical H1 for documenting
+/// the invariant of an unsafe function; `// SAFETY:` is the canonical
+/// inline comment for justifying an `unsafe { }` block. Either counts.
+fn project_unsafe_sites(workspace_root: &Path, repo_root: &Path) -> Result<Vec<UnsafeRow>> {
+    let mut rows = Vec::new();
+    for entry in WalkDir::new(workspace_root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+            continue;
+        }
+        let s = path.to_string_lossy();
+        // Only `src/` — skip tests/, benches/, target/, examples/.
+        if !s.contains("/src/") {
+            continue;
+        }
+        if s.contains("/target/") || s.contains("/tests/") || s.contains("/benches/") {
+            continue;
+        }
+
+        let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let lines: Vec<&str> = text.lines().collect();
+
+        // Per-file cutoff: first line that begins with `#[cfg(test)]`.
+        // Anything at or below this line is considered test code.
+        let cfg_test_cutoff = lines
+            .iter()
+            .enumerate()
+            .find(|(_, l)| l.trim_start().starts_with("#[cfg(test)]"))
+            .map(|(i, _)| i + 1)
+            .unwrap_or(usize::MAX);
+
+        for (idx, line) in lines.iter().enumerate() {
+            let line_no = idx + 1;
+            if line_no >= cfg_test_cutoff {
+                break;
+            }
+
+            // `\bunsafe\b` — presence check. Skip comment-only lines
+            // (leading `//`, `///`, `//!`, `*`).
+            if !contains_unsafe_keyword(line) {
+                continue;
+            }
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("*") {
+                continue;
+            }
+
+            // Preceding-5-lines SAFETY check.
+            let start_ctx = idx.saturating_sub(5);
+            let has_safety = lines[start_ctx..idx]
+                .iter()
+                .any(|l| l.contains("SAFETY:") || contains_safety_heading(l));
+
+            let col = line.find("unsafe").unwrap_or(0);
+            let src_id = path
+                .strip_prefix(repo_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string();
+            rows.push(UnsafeRow {
+                node_id: format!("{}:{}:{}", src_id, line_no, col),
+                source_id: src_id,
+                start_row: line_no as u32,
+                start_col: col as u32,
+                end_row: line_no as u32,
+                end_col: (col + "unsafe".len()) as u32,
+                has_safety,
+            });
+        }
+    }
+    Ok(rows)
+}
+
+/// True iff `line` contains the `unsafe` keyword as a real token
+/// outside any string literal or line comment. Reject false positives:
+///   - `_unsafe`, `unsafe_foo`      — ident boundary
+///   - `"unsafe"`, `b"unsafe"`      — double-quoted string
+///   - `` `unsafe` ``               — markdown-in-comment backtick
+///   - `// unsafe {...}`            — anywhere after `//`
+///
+/// Doesn't handle raw strings (`r#"..."#`) perfectly, but the byte
+/// literal + basic double-quote handling covers every false positive
+/// observed in this workspace.
+fn contains_unsafe_keyword(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let needle = b"unsafe";
+    let mut i = 0;
+    let mut in_string = false;
+    while i + needle.len() <= bytes.len() {
+        let b = bytes[i];
+        // Stop at line comment start.
+        if !in_string && b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            return false;
+        }
+        // Toggle string state on unescaped `"`. Also treats backtick
+        // (used in `//` doc-comment markdown to quote `unsafe`) as a
+        // string boundary — those lines are already filtered by the
+        // caller's leading-`//` check, but backtick still helps for
+        // block-comment lines that don't start with `//`.
+        if b == b'"' && (i == 0 || bytes[i - 1] != b'\\') {
+            in_string = !in_string;
+        }
+        if b == b'`' && !in_string {
+            // Any `unsafe` between backticks on this line is prose.
+            // Skip past the next backtick.
+            if let Some(off) = bytes[i + 1..].iter().position(|&c| c == b'`') {
+                i += off + 2;
+                continue;
+            }
+        }
+        if !in_string && &bytes[i..i + needle.len()] == needle {
+            let before_ok = i == 0 || !is_ident_byte(bytes[i - 1]);
+            let after = bytes.get(i + needle.len()).copied().unwrap_or(b' ');
+            let after_ok = !is_ident_byte(after);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// True iff `line` contains a rustdoc `# Safety` section header (or
+/// `## Safety` etc.).
+fn contains_safety_heading(line: &str) -> bool {
+    let t = line.trim_start_matches(|c: char| c == '/' || c == '!' || c.is_whitespace());
+    t.starts_with("# Safety") || t.starts_with("## Safety") || t.starts_with("### Safety")
+}
+
+fn insert_unsafe_sites(conn: &Connection, rows: &[UnsafeRow]) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "INSERT OR REPLACE INTO unsafe_sites (
+            source_id, node_id, start_row, start_col, end_row, end_col, has_safety
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+    for r in rows {
+        stmt.execute(params![
+            r.source_id,
+            r.node_id,
+            r.start_row,
+            r.start_col,
+            r.end_row,
+            r.end_col,
+            r.has_safety as i64,
+        ])?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Rule loading + execution
 // ---------------------------------------------------------------------------
 
@@ -749,6 +944,12 @@ fn main() -> Result<()> {
         insert_crate_deps(&conn, &rows)?;
     }
 
+    // Bead `ley-line-open-85fb1f`: project every `unsafe` site in
+    // `rs/*/src/**/*.rs` into `unsafe_sites` so the JSON rule can
+    // gate on `WHERE has_safety = 0`.
+    let unsafe_rows = project_unsafe_sites(&workspace_root, &repo_root)?;
+    insert_unsafe_sites(&conn, &unsafe_rows)?;
+
     let rules = load_rules(&rules_dir)?;
     if rules.is_empty() {
         eprintln!(
@@ -835,4 +1036,88 @@ fn main() -> Result<()> {
         baseline_path.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Load-bearing tests for the `unsafe_without_safety` projection
+    //! (bead `ley-line-open-85fb1f`). Every real-world false-positive
+    //! shape observed while bootstrapping the gate is pinned here so
+    //! future edits to `contains_unsafe_keyword` can't silently
+    //! re-introduce them.
+    use super::*;
+
+    // ── contains_unsafe_keyword tokenizer ─────────────────────────────
+
+    #[test]
+    fn detects_bare_unsafe_block() {
+        assert!(contains_unsafe_keyword("    unsafe { }"));
+        assert!(contains_unsafe_keyword("unsafe fn foo() {}"));
+        assert!(contains_unsafe_keyword("unsafe impl Send for Foo {}"));
+        assert!(contains_unsafe_keyword("pub unsafe extern \"C\" fn f() {}"));
+    }
+
+    #[test]
+    fn rejects_unsafe_as_identifier_prefix_or_suffix() {
+        // `_unsafe`, `unsafe_foo` — not the keyword.
+        assert!(!contains_unsafe_keyword("fn contains_unsafe_keyword() {}"));
+        assert!(!contains_unsafe_keyword("let _unsafe = 1;"));
+        assert!(!contains_unsafe_keyword("foo.unsafely_do(x);"));
+    }
+
+    #[test]
+    fn rejects_unsafe_inside_double_quoted_string() {
+        // False positive #1 from initial rollout — `end_col: (col + "unsafe".len())`.
+        assert!(!contains_unsafe_keyword(
+            "                end_col: (col + \"unsafe\".len()) as u32,"
+        ));
+    }
+
+    #[test]
+    fn rejects_unsafe_inside_byte_string_literal() {
+        // False positive #2 — `let needle = b"unsafe";`.
+        assert!(!contains_unsafe_keyword("    let needle = b\"unsafe\";"));
+    }
+
+    #[test]
+    fn rejects_unsafe_inside_backticks_on_prose_line() {
+        // False positive #3 — SQL-comment prose inside a raw string:
+        // `-- Per-file \`unsafe\` sites ...`
+        assert!(!contains_unsafe_keyword(
+            "        -- Per-file `unsafe` sites in `rs/*/src/**/*.rs`."
+        ));
+    }
+
+    #[test]
+    fn rejects_unsafe_after_line_comment_marker() {
+        // Prose after `//` is not real code.
+        assert!(!contains_unsafe_keyword(
+            "    let x = 1; // TODO wrap in unsafe { }"
+        ));
+    }
+
+    #[test]
+    fn detects_unsafe_before_line_comment_marker() {
+        // Real unsafe + trailing comment on same line — must still fire.
+        assert!(contains_unsafe_keyword(
+            "    unsafe { ptr::read(p) } // read raw"
+        ));
+    }
+
+    // ── contains_safety_heading ───────────────────────────────────────
+
+    #[test]
+    fn detects_rustdoc_safety_headings() {
+        assert!(contains_safety_heading("/// # Safety"));
+        assert!(contains_safety_heading("///  # Safety"));
+        assert!(contains_safety_heading("//! # Safety"));
+        assert!(contains_safety_heading("/// ## Safety"));
+        assert!(contains_safety_heading("/// ### Safety"));
+    }
+
+    #[test]
+    fn rejects_prose_containing_the_word_safety() {
+        assert!(!contains_safety_heading("/// Some safety concerns exist"));
+        assert!(!contains_safety_heading("/// SAFETY: real invariant"));
+    }
 }

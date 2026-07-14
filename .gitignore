@@ -59,6 +59,10 @@
 # Documentation
 !docs/**
 
+# Smell-rule JSON definitions consumed by `cargo-toml-projector`
+# (bead `ley-line-open-3b2f55` Phase 3 + `ley-line-open-85fb1f`).
+!smell-rules/**
+
 # Claude Code plugin wrappers — see wrappers/claude-code/ for the
 # leyline-stale-sync plugin (cloister-acbf27). These are plugin
 # sources tracked in the repo, not user-side .claude/ config.

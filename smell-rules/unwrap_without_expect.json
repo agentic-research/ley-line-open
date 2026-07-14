@@ -1,0 +1,7 @@
+{
+  "ID": "unwrap_without_expect",
+  "Description": "Bare `.unwrap()` in production code (`rs/*/src/**/*.rs`, excluding `#[cfg(test)] mod tests`, comments, string literals, benches/, and tests/). `.expect(\"<msg>\")` is Rust's canonical annotation for a panicking accessor — the invariant is right there at the call site — and is NOT flagged. Fallback variants (`unwrap_or`, `unwrap_or_else`, `unwrap_or_default`, `unwrap_err`) are safe and NOT flagged. Bead `ley-line-open-85fb1f` follow-up (unwrap density audit). Baseline in `docs/smell-baseline.json` grandfathers the current sprawl; the gate fires on any NEW `.unwrap()` on top of the baseline. Drawdown discipline: convert `.unwrap()` on a truly-infallible pattern to `.expect(\"<invariant>\")` documenting WHY it can't fail; convert `.unwrap()` on a genuinely-fallible pattern to `?`-propagation or a real error return. When the baseline reaches zero, the gate becomes 'every `.unwrap()` in prod MUST be an `.expect(msg)` or `?`, full stop'.",
+  "Requires": ["unwrap_sites"],
+  "ScopeColumn": "u.source_id",
+  "Query": "SELECT u.source_id, u.node_id, u.start_row, u.start_col, u.end_row, u.end_col, 1 AS metric FROM unwrap_sites u %s ORDER BY u.source_id, u.start_row"
+}

@@ -21,6 +21,13 @@
 //!     - `1.3.6.1.4.1.99999.1.4` — interlace-epoch, encoded as DER INTEGER.
 //!     - `1.3.6.1.4.1.99999.1.5` — interlace-peer, encoded as DER UTF8String.
 //!     - `1.3.6.1.4.1.99999.1.6` — interlace-scope, encoded as DER UTF8String.
+//!     - `1.3.6.1.4.1.99999.1.7` — confinementDigest, encoded as DER
+//!       OctetString containing exactly 32 bytes (BLAKE3-256 of the
+//!       cloister/confinement/v1 §6-canonical `ConfinementManifest`).
+//!       Lane-2 identity commit for confinement/v1 §7: a substrate
+//!       runner enforcing a `ConfinementManifest` whose digest differs
+//!       from this claim MUST refuse to start the bundle. Bead
+//!       `ley-line-open-c79ea8`.
 //!
 //! These are documented at notme/worker/src/cert-authority.ts:57-63 (the
 //! custom-OID arc is shared with the existing GHA bridge cert minting).
@@ -49,6 +56,14 @@ pub struct CertClaims {
     pub epoch: Option<u32>,
     pub peer_fp: Option<String>,
     pub scope: Option<String>,
+    /// Bead `ley-line-open-c79ea8`: BLAKE3-256 of the §6-canonical
+    /// `ConfinementManifest` (cloister/confinement/v1). `None` when
+    /// the cert was minted before this extension existed, or when
+    /// the workload doesn't commit to a confinement manifest. When
+    /// `Some`, a substrate runner MUST verify at bundle-start that
+    /// the manifest it's about to enforce hashes to this digest —
+    /// mismatch is a fail-closed identity check.
+    pub confinement_digest: Option<[u8; 32]>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -81,6 +96,11 @@ mod oid_interlace {
     pub const PEER_FP: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.1.5");
     /// interlace-scope — DER UTF8String.
     pub const SCOPE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.1.6");
+    /// confinementDigest — DER OctetString containing exactly 32 bytes
+    /// (BLAKE3-256 of the §6-canonical confinement/v1 manifest). Bead
+    /// `ley-line-open-c79ea8`.
+    pub const CONFINEMENT_DIGEST: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.1.7");
 }
 
 /// Verify the cert is signed by `master_pubkey` and extract its claims.
@@ -150,7 +170,7 @@ pub fn verify_cert_chain(cert_der: &[u8], master_pubkey: &[u8]) -> Result<CertCl
     let not_after = time_to_unix(&cert.tbs_certificate.validity.not_after);
 
     // Interlace extensions (optional).
-    let (epoch, peer_fp, scope) = extract_interlace_extensions(&cert)?;
+    let (epoch, peer_fp, scope, confinement_digest) = extract_interlace_extensions(&cert)?;
 
     Ok(CertClaims {
         ephemeral_pubkey,
@@ -159,6 +179,7 @@ pub fn verify_cert_chain(cert_der: &[u8], master_pubkey: &[u8]) -> Result<CertCl
         epoch,
         peer_fp,
         scope,
+        confinement_digest,
     })
 }
 
@@ -173,21 +194,27 @@ fn time_to_unix(t: &x509_cert::time::Time) -> i64 {
 }
 
 /// Interlace extension fields extracted from a cert's optional
-/// custom-OID extensions. All three are `Option` because the verifier
+/// custom-OID extensions. All four are `Option` because the verifier
 /// returns the validity window + ephemeral pubkey as required claims
 /// even when none of the Interlace extensions are present.
-type InterlaceExtensions = (Option<u32>, Option<String>, Option<String>);
+type InterlaceExtensions = (
+    Option<u32>,
+    Option<String>,
+    Option<String>,
+    Option<[u8; 32]>,
+);
 
-/// Walk cert.tbs_certificate.extensions; pull the three Interlace OIDs
+/// Walk cert.tbs_certificate.extensions; pull the four Interlace OIDs
 /// if present. Order-independent. Each extension's value is DER-decoded
 /// per its expected type.
 fn extract_interlace_extensions(cert: &Certificate) -> Result<InterlaceExtensions, ChainError> {
     let mut epoch: Option<u32> = None;
     let mut peer_fp: Option<String> = None;
     let mut scope: Option<String> = None;
+    let mut confinement_digest: Option<[u8; 32]> = None;
 
     let Some(extensions) = &cert.tbs_certificate.extensions else {
-        return Ok((None, None, None));
+        return Ok((None, None, None, None));
     };
 
     for ext in extensions {
@@ -223,6 +250,25 @@ fn extract_interlace_extensions(cert: &Certificate) -> Result<InterlaceExtension
             let s = der::asn1::Utf8StringRef::from_der(value_bytes)
                 .map_err(|_| ChainError::BadExtension("scope is not DER UTF8String"))?;
             scope = Some(s.as_str().to_string());
+        } else if ext.extn_id == oid_interlace::CONFINEMENT_DIGEST {
+            // Bead `ley-line-open-c79ea8` / cloister/confinement/v1 §7:
+            // extension value is a DER OctetString wrapping exactly 32
+            // bytes (BLAKE3-256 of the §6-canonical manifest). Any other
+            // length is a spec violation — reject rather than truncate
+            // or pad so a mis-encoded cert can't silently satisfy
+            // identity-commit checks downstream.
+            let octets = der::asn1::OctetStringRef::from_der(value_bytes).map_err(|_| {
+                ChainError::BadExtension("confinementDigest is not DER OctetString")
+            })?;
+            let bytes = octets.as_bytes();
+            if bytes.len() != 32 {
+                return Err(ChainError::BadExtension(
+                    "confinementDigest must be exactly 32 bytes (BLAKE3-256)",
+                ));
+            }
+            let mut digest = [0u8; 32];
+            digest.copy_from_slice(bytes);
+            confinement_digest = Some(digest);
         } else if ext.critical {
             // Per RFC 5280 §4.2 + threat-model §6.1.6 (cloister-c71977):
             // a verifier MUST reject any cert it does not recognize when
@@ -239,18 +285,19 @@ fn extract_interlace_extensions(cert: &Certificate) -> Result<InterlaceExtension
         // Non-critical unknown extensions are ignored per RFC 5280.
     }
 
-    Ok((epoch, peer_fp, scope))
+    Ok((epoch, peer_fp, scope, confinement_digest))
 }
 
 /// Hand-rolled JSON encoding of CertClaims. Used by the FFI export in
 /// ffi.rs to write claims into a caller-allocated output buffer.
 ///
 /// Format is stable + minimal:
-///   {"epk":"<base64>","nb":1234,"na":5678,"ep":7,"pf":"...","sc":"..."}
+///   {"epk":"<base64>","nb":1234,"na":5678,"ep":7,"pf":"...","sc":"...","cd":"<base64>"}
 ///
-/// Optional fields (`ep`, `pf`, `sc`) are emitted only when present.
+/// Optional fields (`ep`, `pf`, `sc`, `cd`) are emitted only when present.
 /// Strings are escaped per RFC 8259 §7. Caller writes consumed bytes and
-/// can parse with `JSON.parse` on the JS side.
+/// can parse with `JSON.parse` on the JS side. `cd` is base64url-nopad of
+/// the 32-byte confinementDigest (bead `ley-line-open-c79ea8`).
 pub fn claims_to_json(claims: &CertClaims) -> String {
     let mut out = String::with_capacity(256);
     out.push('{');
@@ -278,6 +325,12 @@ pub fn claims_to_json(claims: &CertClaims) -> String {
     if let Some(ref sc) = claims.scope {
         out.push_str(",\"sc\":\"");
         json_escape_into(sc, &mut out);
+        out.push('"');
+    }
+
+    if let Some(ref cd) = claims.confinement_digest {
+        out.push_str(",\"cd\":\"");
+        out.push_str(&base64_url_encode_no_pad(cd));
         out.push('"');
     }
 
@@ -362,6 +415,7 @@ pub mod tests_helpers {
     /// Mint a self-signed-by-master ephemeral cert with the given key
     /// material + Interlace extensions. Returns DER bytes. Test-quality
     /// only — issuer/subject are empty Names, no KeyUsage / EKU, etc.
+    #[allow(clippy::too_many_arguments)]
     pub fn mint_test_cert(
         master: &SigningKey,
         ephemeral: &SigningKey,
@@ -370,6 +424,7 @@ pub mod tests_helpers {
         epoch: Option<u32>,
         peer_fp: Option<&str>,
         scope: Option<&str>,
+        confinement_digest: Option<[u8; 32]>,
     ) -> Vec<u8> {
         use der::{
             Encode,
@@ -437,6 +492,17 @@ pub mod tests_helpers {
                 extn_id: oid_interlace::SCOPE,
                 critical: false,
                 extn_value: OctetString::new(s_der).unwrap(),
+            });
+        }
+        if let Some(cd) = confinement_digest {
+            // Wrap the 32-byte digest in a DER OctetString so the outer
+            // extn_value carries `OCTET STRING { OCTET STRING { .. } }`,
+            // matching the epoch/peer_fp/scope shape and the §7 spec.
+            let inner_der = OctetString::new(cd.to_vec()).unwrap().to_der().unwrap();
+            extensions.push(Extension {
+                extn_id: oid_interlace::CONFINEMENT_DIGEST,
+                critical: false,
+                extn_value: OctetString::new(inner_der).unwrap(),
             });
         }
 
@@ -606,7 +672,7 @@ mod tests {
         let ephemeral = random_signing_key();
         let nb = now();
         let na = nb + 300;
-        let cert_der = mint_test_cert(&master, &ephemeral, nb, na, None, None, None);
+        let cert_der = mint_test_cert(&master, &ephemeral, nb, na, None, None, None, None);
 
         let claims = verify_cert_chain(&cert_der, master.verifying_key().as_bytes()).unwrap();
 
@@ -635,6 +701,7 @@ mod tests {
             Some(7),
             Some("sha256:abc123"),
             Some("bead_create:/repos/foo"),
+            None,
         );
 
         let claims = verify_cert_chain(&cert_der, master.verifying_key().as_bytes()).unwrap();
@@ -650,7 +717,7 @@ mod tests {
         let other_master = random_signing_key();
         let ephemeral = random_signing_key();
         let nb = now();
-        let cert_der = mint_test_cert(&master, &ephemeral, nb, nb + 300, None, None, None);
+        let cert_der = mint_test_cert(&master, &ephemeral, nb, nb + 300, None, None, None, None);
 
         let result = verify_cert_chain(&cert_der, other_master.verifying_key().as_bytes());
         assert!(matches!(result, Err(ChainError::BadSignature)));
@@ -660,7 +727,16 @@ mod tests {
     fn truncated_cert_rejects() {
         let master = random_signing_key();
         let ephemeral = random_signing_key();
-        let cert_der = mint_test_cert(&master, &ephemeral, now(), now() + 300, None, None, None);
+        let cert_der = mint_test_cert(
+            &master,
+            &ephemeral,
+            now(),
+            now() + 300,
+            None,
+            None,
+            None,
+            None,
+        );
 
         let result = verify_cert_chain(
             &cert_der[..cert_der.len() / 2],
@@ -673,7 +749,16 @@ mod tests {
     fn wrong_master_key_length_rejects() {
         let master = random_signing_key();
         let ephemeral = random_signing_key();
-        let cert_der = mint_test_cert(&master, &ephemeral, now(), now() + 300, None, None, None);
+        let cert_der = mint_test_cert(
+            &master,
+            &ephemeral,
+            now(),
+            now() + 300,
+            None,
+            None,
+            None,
+            None,
+        );
 
         let result = verify_cert_chain(&cert_der, &[0u8; 31]);
         assert!(matches!(result, Err(ChainError::BadMasterKey)));
@@ -688,6 +773,7 @@ mod tests {
             epoch: None,
             peer_fp: None,
             scope: None,
+            confinement_digest: None,
         };
         let j = claims_to_json(&claims);
         assert!(j.contains("\"epk\":\"q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s\""));
@@ -707,6 +793,7 @@ mod tests {
             epoch: Some(7),
             peer_fp: Some("sha256:abc".to_string()),
             scope: Some("bead_create:*".to_string()),
+            confinement_digest: None,
         };
         let j = claims_to_json(&claims);
         assert!(j.contains("\"ep\":7"));
@@ -723,6 +810,7 @@ mod tests {
             epoch: None,
             peer_fp: Some("a\"b\\c\n".to_string()),
             scope: None,
+            confinement_digest: None,
         };
         let j = claims_to_json(&claims);
         // Embedded quote, backslash, newline must be escaped.
@@ -809,6 +897,7 @@ mod tests {
             Some(7),
             Some("sha256:abc"),
             Some("bead_create:/r/foo"),
+            None,
         );
 
         let claims = verify_cert_chain(&cert, master.verifying_key().as_bytes())

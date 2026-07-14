@@ -648,14 +648,18 @@ fn project_unsafe_sites(workspace_root: &Path, repo_root: &Path) -> Result<Vec<U
         let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         let lines: Vec<&str> = text.lines().collect();
 
-        // Per-file cutoff: first line that begins with `#[cfg(test)]`.
-        // Anything at or below this line is considered test code.
-        let cfg_test_cutoff = lines
-            .iter()
-            .enumerate()
-            .find(|(_, l)| l.trim_start().starts_with("#[cfg(test)]"))
-            .map(|(i, _)| i + 1)
-            .unwrap_or(usize::MAX);
+        // Per-file cutoff: first line where a MODULE-LEVEL
+        // `#[cfg(test)]` gates a `mod tests { ... }` block. Everything
+        // at or below is test code.
+        //
+        // Per-fn `#[cfg(test)]` attributes (indented, gate a single
+        // fn, not a module) MUST NOT trigger the cutoff — otherwise
+        // every unsafe below a test-only helper would be silently
+        // exempted from the gate. Bug caught by external review of
+        // `control.rs` where line 217's `#[cfg(test)]` on a per-fn
+        // helper hid 8 feature-gated interrupt-accessor unsafe blocks
+        // at lines 357–416 from the projection.
+        let cfg_test_cutoff = find_test_module_line(&lines).unwrap_or(usize::MAX);
 
         for (idx, line) in lines.iter().enumerate() {
             let line_no = idx + 1;
@@ -768,6 +772,44 @@ fn contains_unsafe_keyword(line: &str) -> bool {
 
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Return the 1-indexed line number where a MODULE-LEVEL
+/// `#[cfg(test)]` gates a `mod <name> { ... }` block — the earliest
+/// such line, if any. Everything at-or-below is treated as test code
+/// by the unsafe/SAFETY projector.
+///
+/// A per-fn `#[cfg(test)]` (typically indented, followed by `fn ...`
+/// not `mod ...`) is NOT a cutoff — it gates a single item, not a
+/// whole tail of the file, so unsafe blocks after it are still
+/// production code.
+fn find_test_module_line(lines: &[&str]) -> Option<usize> {
+    for (i, l) in lines.iter().enumerate() {
+        let trimmed = l.trim_start();
+        if !trimmed.starts_with("#[cfg(test)]") {
+            continue;
+        }
+        // Walk forward through blank / attribute lines to find the
+        // next item declaration. Cutoff fires only if it's `mod`.
+        for candidate in lines.iter().skip(i + 1) {
+            let t = candidate.trim_start();
+            if t.is_empty() || t.starts_with("//") || t.starts_with("#[") {
+                continue;
+            }
+            let starts_mod = t.starts_with("mod ")
+                || t.starts_with("pub mod ")
+                || t.starts_with("pub(crate) mod ")
+                || t.starts_with("pub(super) mod ");
+            if starts_mod {
+                return Some(i + 1);
+            }
+            // Any other item → this `#[cfg(test)]` gates a single fn/
+            // const/etc; NOT a cutoff. Keep scanning for a later
+            // module-level one.
+            break;
+        }
+    }
+    None
 }
 
 /// True iff the line's `unsafe` appears in a fn-pointer TYPE position:
@@ -1295,5 +1337,63 @@ mod tests {
     fn doc_block_at_start_of_file_returns_empty() {
         let lines: Vec<&str> = vec!["pub unsafe fn f()"];
         assert_eq!(doc_block_ending_at(&lines, 0).len(), 0);
+    }
+
+    // ── find_test_module_line ─────────────────────────────────────────
+
+    #[test]
+    fn test_module_line_finds_unindented_mod_tests() {
+        let lines: Vec<&str> = vec![
+            "pub fn a() {}", // 0
+            "#[cfg(test)]",  // 1
+            "mod tests {",   // 2
+            "    fn t() {}", // 3
+            "}",             // 4
+        ];
+        assert_eq!(find_test_module_line(&lines), Some(2));
+    }
+
+    #[test]
+    fn test_module_line_ignores_per_fn_cfg_test() {
+        // Regression pin: control.rs:217 has `    #[cfg(test)]` on a
+        // per-fn helper (`set_current_root_unfenced_test_only`). Line
+        // 423 has the real module cutoff. Only 423 should fire.
+        let lines: Vec<&str> = vec![
+            "impl X {",                                                // 0
+            "    #[cfg(test)]",                                        // 1  <- per-fn, ignore
+            "    pub fn set_root_unfenced(&mut self, r: [u8; 32]) {}", // 2
+            "    #[cfg(feature = \"interrupt\")]",                     // 3
+            "    fn interrupt_flags(&self) -> u64 { unsafe { 0 } }",   // 4
+            "}",                                                       // 5
+            "#[cfg(test)]",                                            // 6  <- real cutoff
+            "mod tests {",                                             // 7
+            "    fn t() {}",                                           // 8
+            "}",                                                       // 9
+        ];
+        assert_eq!(find_test_module_line(&lines), Some(7));
+    }
+
+    #[test]
+    fn test_module_line_returns_none_if_no_module_cfg_test() {
+        let lines: Vec<&str> = vec![
+            "impl X {",
+            "    #[cfg(test)]",
+            "    pub fn helper() {}",
+            "}",
+        ];
+        assert_eq!(find_test_module_line(&lines), None);
+    }
+
+    #[test]
+    fn test_module_line_walks_through_blank_and_attrs_before_mod() {
+        let lines: Vec<&str> = vec![
+            "#[cfg(test)]",          // 0
+            "",                      // 1 blank
+            "#[cfg(feature=\"x\")]", // 2 another attr
+            "// a comment",          // 3
+            "pub mod tests {",       // 4
+            "}",                     // 5
+        ];
+        assert_eq!(find_test_module_line(&lines), Some(1));
     }
 }

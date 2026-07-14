@@ -153,16 +153,58 @@ impl Controller {
         Ok(Controller { mmap })
     }
 
+    /// Reference the `AtomicU64` embedded in the mapped control block
+    /// at `offset`. Callers use it as a safe atomic — the single
+    /// unsafe block here carries the invariant for every atomic slot
+    /// in the control layout (sync counter, interrupt flags/epoch/ack,
+    /// payload offset/len).
+    ///
+    /// # Safety contract (delegated from the raw pointer cast)
+    ///
+    /// The invariant that lets this be a SAFE function:
+    ///
+    /// - `mmap` is page-aligned by `memmap2` construction, and every
+    ///   `OFF_*` constant referenced in this module is compile-time
+    ///   asserted to be 8-byte aligned (see the `assert!` calls near
+    ///   the top of the module). So `offset` is 8-byte aligned within
+    ///   a page-aligned base — the pointer is naturally aligned for
+    ///   `AtomicU64`.
+    /// - `AtomicU64` and `u64` have identical layout (Rust guarantees
+    ///   this per `std::sync::atomic` docs); constructing an
+    ///   `&AtomicU64` from a `*const u64` reinterpret is sound.
+    /// - The returned reference is tied to `&self`, so it cannot
+    ///   outlive the mapping.
+    ///
+    /// Debug-asserts alignment so a future OFF_* addition that isn't
+    /// 8-byte aligned fails loud in tests instead of silently going
+    /// UB on aarch64 LSE. Bounds-check the offset the same way.
+    fn atomic_at(&self, offset: usize) -> &AtomicU64 {
+        debug_assert_eq!(
+            offset % 8,
+            0,
+            "atomic_at: offset {offset} must be 8-byte aligned"
+        );
+        debug_assert!(
+            offset + 8 <= self.mmap.len(),
+            "atomic_at: offset {offset} + 8 exceeds mmap len {}",
+            self.mmap.len(),
+        );
+        let ptr = self.mmap[offset..].as_ptr() as *const AtomicU64;
+        // SAFETY: `mmap` is page-aligned; every OFF_* constant used
+        // via this helper is 8-byte aligned by compile-time assertion;
+        // AtomicU64 and u64 share layout per the Rust atomic-types
+        // guarantee; `&self` bounds the returned reference to the
+        // mapping's lifetime.
+        unsafe { &*ptr }
+    }
+
     /// **T2.4 internal sync atom — Acquire load.** Not exposed in the
     /// public API. Pairs with the writer's Release-store inside
     /// `set_arena*` to fence the plain byte reads of `current_root`,
     /// `arena_path`, and `arena_size`. Public callers compare
     /// `current_root()` for identity / change detection.
     fn sync_counter_acquire(&self) -> u64 {
-        let ptr = self.mmap[OFF_GENERATION..].as_ptr() as *const AtomicU64;
-        // SAFETY: mmap is page-aligned, offset 8 is 8-byte aligned,
-        // AtomicU64 is same layout as u64.
-        unsafe { (*ptr).load(Ordering::Acquire) }
+        self.atomic_at(OFF_GENERATION).load(Ordering::Acquire)
     }
 
     /// Get the path to the currently active arena.
@@ -276,13 +318,9 @@ impl Controller {
     /// the happens-before pair with `sync_counter_acquire` for the
     /// plain byte writes preceding this call.
     fn bump_sync_counter_release(&mut self) {
-        let ptr = self.mmap[OFF_GENERATION..].as_ptr() as *const AtomicU64;
-        // SAFETY: mmap is page-aligned, OFF_GENERATION is 8-byte
-        // aligned (compile-time asserted at the top of this module),
-        // AtomicU64 has the same layout as u64.
-        unsafe {
-            let _ = (*ptr).fetch_add(1, Ordering::Release);
-        }
+        let _ = self
+            .atomic_at(OFF_GENERATION)
+            .fetch_add(1, Ordering::Release);
     }
 
     /// **T2.4: atomic publish of (path, size, current_root) under a
@@ -353,70 +391,59 @@ impl Controller {
     /// Read the current interrupt flags atomically.
     #[cfg(feature = "interrupt")]
     pub fn interrupt_flags(&self) -> u64 {
-        let ptr = self.mmap[OFF_INTERRUPT_FLAGS..].as_ptr() as *const AtomicU64;
-        unsafe { (*ptr).load(Ordering::Acquire) }
+        self.atomic_at(OFF_INTERRUPT_FLAGS).load(Ordering::Acquire)
     }
 
     /// Set interrupt bits (OR into existing flags) and bump the epoch.
     #[cfg(feature = "interrupt")]
     pub fn set_interrupt(&self, bits: u64) {
-        let flags_ptr = self.mmap[OFF_INTERRUPT_FLAGS..].as_ptr() as *const AtomicU64;
-        let epoch_ptr = self.mmap[OFF_INTERRUPT_EPOCH..].as_ptr() as *const AtomicU64;
-        unsafe {
-            (*flags_ptr).fetch_or(bits, Ordering::Release);
-            (*epoch_ptr).fetch_add(1, Ordering::Release);
-        }
+        self.atomic_at(OFF_INTERRUPT_FLAGS)
+            .fetch_or(bits, Ordering::Release);
+        self.atomic_at(OFF_INTERRUPT_EPOCH)
+            .fetch_add(1, Ordering::Release);
     }
 
     /// Clear specific interrupt bits after handling.
     #[cfg(feature = "interrupt")]
     pub fn clear_interrupt(&self, bits: u64) {
-        let ptr = self.mmap[OFF_INTERRUPT_FLAGS..].as_ptr() as *const AtomicU64;
-        unsafe { (*ptr).fetch_and(!bits, Ordering::Release) };
+        self.atomic_at(OFF_INTERRUPT_FLAGS)
+            .fetch_and(!bits, Ordering::Release);
     }
 
     /// Read the interrupt epoch (monotonically increasing signal counter).
     #[cfg(feature = "interrupt")]
     pub fn interrupt_epoch(&self) -> u64 {
-        let ptr = self.mmap[OFF_INTERRUPT_EPOCH..].as_ptr() as *const AtomicU64;
-        unsafe { (*ptr).load(Ordering::Acquire) }
+        self.atomic_at(OFF_INTERRUPT_EPOCH).load(Ordering::Acquire)
     }
 
     /// Acknowledge processing up to the given epoch.
     #[cfg(feature = "interrupt")]
     pub fn ack_interrupt(&self, epoch: u64) {
-        let ptr = self.mmap[OFF_INTERRUPT_ACK..].as_ptr() as *const AtomicU64;
-        unsafe { (*ptr).store(epoch, Ordering::Release) };
+        self.atomic_at(OFF_INTERRUPT_ACK)
+            .store(epoch, Ordering::Release);
     }
 
     /// Read the last acknowledged epoch.
     #[cfg(feature = "interrupt")]
     pub fn interrupt_ack(&self) -> u64 {
-        let ptr = self.mmap[OFF_INTERRUPT_ACK..].as_ptr() as *const AtomicU64;
-        unsafe { (*ptr).load(Ordering::Acquire) }
+        self.atomic_at(OFF_INTERRUPT_ACK).load(Ordering::Acquire)
     }
 
     /// Get the sidecar payload location (offset, length).
     #[cfg(feature = "interrupt")]
     pub fn payload_location(&self) -> (u64, u64) {
-        let off_ptr = self.mmap[OFF_PAYLOAD_OFFSET..].as_ptr() as *const AtomicU64;
-        let len_ptr = self.mmap[OFF_PAYLOAD_LEN..].as_ptr() as *const AtomicU64;
-        unsafe {
-            let offset = (*off_ptr).load(Ordering::Acquire);
-            let len = (*len_ptr).load(Ordering::Acquire);
-            (offset, len)
-        }
+        let offset = self.atomic_at(OFF_PAYLOAD_OFFSET).load(Ordering::Acquire);
+        let len = self.atomic_at(OFF_PAYLOAD_LEN).load(Ordering::Acquire);
+        (offset, len)
     }
 
     /// Set the sidecar payload location. Call before setting interrupt flags.
     #[cfg(feature = "interrupt")]
     pub fn set_payload_location(&self, offset: u64, len: u64) {
-        let off_ptr = self.mmap[OFF_PAYLOAD_OFFSET..].as_ptr() as *const AtomicU64;
-        let len_ptr = self.mmap[OFF_PAYLOAD_LEN..].as_ptr() as *const AtomicU64;
-        unsafe {
-            (*off_ptr).store(offset, Ordering::Release);
-            (*len_ptr).store(len, Ordering::Release);
-        }
+        self.atomic_at(OFF_PAYLOAD_OFFSET)
+            .store(offset, Ordering::Release);
+        self.atomic_at(OFF_PAYLOAD_LEN)
+            .store(len, Ordering::Release);
     }
 }
 

@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 
 use leyline_cli_lib::daemon::db_pool::LiveDb;
 use rusqlite::Connection;
+use serial_test::serial;
 use tempfile::TempDir;
 
 // ── Fixture ─────────────────────────────────────────────────────────
@@ -237,7 +238,16 @@ fn measure_pool_shape(
 /// over the observed number, and the 3× throughput floor is well
 /// below the ~10× the pool typically delivers. The bead documents an
 /// escape hatch to 5× → 2× if these prove flaky in CI.
+///
+/// `#[serial]` (bead `ley-line-open-14b7a2`): under `task ci`
+/// workspace-parallel scheduling, the mutex-baseline reader phase
+/// picked up co-tenant CPU noise that made its throughput swing 40k
+/// → 90k reads/1.5s while the pool phase stayed steady at ~124k. The
+/// ratio-against-a-wobbly-baseline flipped pass/fail on scheduling
+/// noise, not on any real pool regression. Serial execution restores
+/// the invariant this perf test actually measures.
 #[test]
+#[serial]
 fn concurrent_readers_beat_pre_15b_mutex_shape() {
     const N_ROWS: usize = 10_000;
     const N_READERS: usize = 10;
@@ -328,6 +338,20 @@ fn concurrent_readers_beat_pre_15b_mutex_shape() {
          of the pre-15b Mutex<Connection> baseline. Got scale={scale:.2}× \
          (mutex={mutex_reads}, pool={pool_reads}). Regression: readers may \
          be serializing on a hidden shared lock.",
+    );
+
+    // Assertion 3 (belt-and-suspenders per bead `ley-line-open-14b7a2`):
+    // absolute pool floor. If the pool shape regresses to serialized
+    // behavior, aggregate collapses toward the mutex baseline (~40–60k
+    // reads/1.5s). 50k is above that failure mode but well below the
+    // stable ~124k the pool delivers — a real regression fails here
+    // even if the ratio-vs-mutex assertion happens to survive a lucky
+    // co-tenant scheduling window.
+    assert!(
+        pool_reads >= 50_000,
+        "pool aggregate throughput collapsed to serialized levels: got \
+         {pool_reads} reads in {DURATION:?}, floor is 50000. This is a \
+         hard regression indicator independent of the mutex baseline.",
     );
 }
 

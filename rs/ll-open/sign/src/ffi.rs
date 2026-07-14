@@ -14,6 +14,7 @@
 //! indices into wasm linear memory.
 
 use crate::cms;
+use leyline_ffi_helpers::{c_input, c_output};
 
 // ── wasm32 memory management exports ────────────────────────────────────
 //
@@ -48,17 +49,12 @@ pub extern "C" fn lsign_alloc(size: usize) -> *mut u8 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lsign_free(ptr: *mut u8, size: usize) {
     if !ptr.is_null() && size > 0 {
+        // SAFETY: caller contract per this fn's # Safety docstring —
+        // `ptr` originated from `lsign_alloc(size)` which built a
+        // `Vec<u8>` of capacity `size` and `mem::forget`-ed it.
+        // Reconstructing with `(ptr, 0, size)` reclaims the alloc.
         unsafe { drop(Vec::from_raw_parts(ptr, 0, size)) };
     }
-}
-
-/// Helper: write bytes into an output buffer, returning byte count or -1 if too large.
-unsafe fn write_out(data: &[u8], out_buf: *mut u8, out_len: usize) -> i32 {
-    if data.len() > out_len {
-        return -1;
-    }
-    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), out_buf, data.len()) };
-    data.len() as i32
 }
 
 /// Sign data with CMS/PKCS#7 using Ed25519 and signed attributes.
@@ -80,29 +76,26 @@ pub unsafe extern "C" fn leyline_sign_data(
     out_buf: *mut u8,
     out_len: usize,
 ) -> i32 {
-    // Defensive null checks: slice::from_raw_parts requires non-null
-    // even when len == 0 (per Rust's safety contract). leyline-fs's
-    // FFI doesn't need this pattern because its inputs are
-    // null-terminated C strings consumed via CStr::from_ptr — the
-    // raw-buffer-pointer shape used here is unique to sign and
-    // requires its own guards.
-    if data_ptr.is_null()
-        || cert_der_ptr.is_null()
-        || private_key_ptr.is_null()
-        || out_buf.is_null()
-    {
+    // SAFETY: all input pointers valid for their stated lengths per
+    // the outer fn's # Safety docstring; delegated to `c_input`.
+    let (Some(data), Some(cert_der), Some(key_slice)) = (unsafe {
+        (
+            c_input(data_ptr, data_len),
+            c_input(cert_der_ptr, cert_der_len),
+            c_input(private_key_ptr, 64),
+        )
+    }) else {
         return -1;
-    }
-    let data = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
-    let cert_der = unsafe { std::slice::from_raw_parts(cert_der_ptr, cert_der_len) };
-    let key_slice = unsafe { std::slice::from_raw_parts(private_key_ptr, 64) };
+    };
     let key: [u8; 64] = match key_slice.try_into() {
         Ok(k) => k,
         Err(_) => return -1,
     };
 
     match cms::sign_data(data, cert_der, &key) {
-        Ok(sig) => unsafe { write_out(&sig, out_buf, out_len) },
+        // SAFETY: out_buf writable for out_len bytes per outer fn's
+        // # Safety docstring; delegated to `c_output`.
+        Ok(sig) => unsafe { c_output(&sig, out_buf, out_len) },
         Err(_) => -1,
     }
 }
@@ -126,23 +119,26 @@ pub unsafe extern "C" fn leyline_sign_data_without_attributes(
     out_buf: *mut u8,
     out_len: usize,
 ) -> i32 {
-    if data_ptr.is_null()
-        || cert_der_ptr.is_null()
-        || private_key_ptr.is_null()
-        || out_buf.is_null()
-    {
+    // SAFETY: all input pointers valid for their stated lengths per
+    // the outer fn's # Safety docstring; delegated to `c_input`.
+    let (Some(data), Some(cert_der), Some(key_slice)) = (unsafe {
+        (
+            c_input(data_ptr, data_len),
+            c_input(cert_der_ptr, cert_der_len),
+            c_input(private_key_ptr, 64),
+        )
+    }) else {
         return -1;
-    }
-    let data = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
-    let cert_der = unsafe { std::slice::from_raw_parts(cert_der_ptr, cert_der_len) };
-    let key_slice = unsafe { std::slice::from_raw_parts(private_key_ptr, 64) };
+    };
     let key: [u8; 64] = match key_slice.try_into() {
         Ok(k) => k,
         Err(_) => return -1,
     };
 
     match cms::sign_data_without_attributes(data, cert_der, &key) {
-        Ok(sig) => unsafe { write_out(&sig, out_buf, out_len) },
+        // SAFETY: out_buf writable for out_len bytes per outer fn's
+        // # Safety docstring; delegated to `c_output`.
+        Ok(sig) => unsafe { c_output(&sig, out_buf, out_len) },
         Err(_) => -1,
     }
 }
@@ -165,14 +161,21 @@ pub unsafe extern "C" fn leyline_verify(
     cert_out_buf: *mut u8,
     cert_out_len: usize,
 ) -> i32 {
-    if cms_sig_ptr.is_null() || data_ptr.is_null() || cert_out_buf.is_null() {
+    // SAFETY: all input pointers valid for their stated lengths per
+    // the outer fn's # Safety docstring; delegated to `c_input`.
+    let (Some(cms_sig), Some(data)) = (unsafe {
+        (
+            c_input(cms_sig_ptr, cms_sig_len),
+            c_input(data_ptr, data_len),
+        )
+    }) else {
         return -1;
-    }
-    let cms_sig = unsafe { std::slice::from_raw_parts(cms_sig_ptr, cms_sig_len) };
-    let data = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
+    };
 
     match cms::verify(cms_sig, data, &cms::VerifyOptions::default()) {
-        Ok(cert_der) => unsafe { write_out(&cert_der, cert_out_buf, cert_out_len) },
+        // SAFETY: cert_out_buf writable for cert_out_len bytes per
+        // outer fn's # Safety docstring; delegated to `c_output`.
+        Ok(cert_der) => unsafe { c_output(&cert_der, cert_out_buf, cert_out_len) },
         Err(_) => -1,
     }
 }
@@ -212,16 +215,23 @@ pub unsafe extern "C" fn leyline_verify_cert_chain(
     claims_out_buf: *mut u8,
     claims_out_len: usize,
 ) -> i32 {
-    if cert_der_ptr.is_null() || master_pubkey_ptr.is_null() || claims_out_buf.is_null() {
+    // SAFETY: all input pointers valid for their stated lengths per
+    // the outer fn's # Safety docstring; delegated to `c_input`.
+    let (Some(cert_der), Some(master_pubkey)) = (unsafe {
+        (
+            c_input(cert_der_ptr, cert_der_len),
+            c_input(master_pubkey_ptr, master_pubkey_len),
+        )
+    }) else {
         return -1;
-    }
-    let cert_der = unsafe { std::slice::from_raw_parts(cert_der_ptr, cert_der_len) };
-    let master_pubkey = unsafe { std::slice::from_raw_parts(master_pubkey_ptr, master_pubkey_len) };
+    };
 
     match crate::cert_chain::verify_cert_chain(cert_der, master_pubkey) {
         Ok(claims) => {
             let json = crate::cert_chain::claims_to_json(&claims);
-            unsafe { write_out(json.as_bytes(), claims_out_buf, claims_out_len) }
+            // SAFETY: claims_out_buf writable for claims_out_len bytes
+            // per outer fn's # Safety docstring; delegated to `c_output`.
+            unsafe { c_output(json.as_bytes(), claims_out_buf, claims_out_len) }
         }
         Err(_) => -1,
     }

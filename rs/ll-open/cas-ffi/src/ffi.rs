@@ -6,18 +6,7 @@
 //! - `-1`:  error (null pointer, output buffer too small)
 
 use leyline_core::substrate::ContentAddressed;
-
-/// Helper — write fixed-size bytes into a caller-provided output buffer.
-/// Returns byte count on success, -1 if the buffer is too small.
-/// Lifted from rs/ll-open/sign/src/ffi.rs:write_out so the convention
-/// stays uniform across LLO's FFI crates.
-unsafe fn write_out(data: &[u8], out_buf: *mut u8, out_len: usize) -> i32 {
-    if data.len() > out_len {
-        return -1;
-    }
-    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), out_buf, data.len()) };
-    data.len() as i32
-}
+use leyline_ffi_helpers::{c_input, c_output};
 
 /// Compute the substrate hash (BLAKE3-256) of `in_ptr..in_ptr+in_len`
 /// and write the 32-byte digest into `out_buf`.
@@ -48,12 +37,15 @@ pub unsafe extern "C" fn leyline_hash_bytes(
     out_buf: *mut u8,
     out_len: usize,
 ) -> i32 {
-    if in_ptr.is_null() || out_buf.is_null() {
+    // SAFETY: input pointer valid for in_len bytes per outer fn's
+    // # Safety docstring; delegated to `c_input`.
+    let Some(input) = (unsafe { c_input(in_ptr, in_len) }) else {
         return -1;
-    }
-    let input = unsafe { std::slice::from_raw_parts(in_ptr, in_len) };
+    };
     let h = input.hash();
-    unsafe { write_out(h.as_bytes(), out_buf, out_len) }
+    // SAFETY: out_buf writable for out_len bytes per outer fn's # Safety
+    // docstring; delegated to `c_output`.
+    unsafe { c_output(h.as_bytes(), out_buf, out_len) }
 }
 
 #[cfg(test)]

@@ -13,11 +13,6 @@
     },
     {
       "rule_id": "unsafe_without_safety",
-      "source_id": "rs/ll-open/cas-ffi/src/ffi.rs",
-      "count": 6
-    },
-    {
-      "rule_id": "unsafe_without_safety",
       "source_id": "rs/ll-open/cli-lib/src/cmd_daemon.rs",
       "count": 1
     },
@@ -34,12 +29,7 @@
     {
       "rule_id": "unsafe_without_safety",
       "source_id": "rs/ll-open/fs/src/lib.rs",
-      "count": 19
-    },
-    {
-      "rule_id": "unsafe_without_safety",
-      "source_id": "rs/ll-open/sign/src/ffi.rs",
-      "count": 19
+      "count": 1
     }
   ]
 }

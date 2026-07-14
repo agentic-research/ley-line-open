@@ -18,6 +18,8 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 # ContentAddressed trait that defines σ. This crate is a thin FFI
 # adapter over those primitives — no algorithm choices live here.
 leyline-core = { path = "../../ll-core/core" }
+# Shared C-boundary helpers (bead `ley-line-open-85fb1f` PR 2).
+leyline-ffi-helpers = { path = "../../ll-core/ffi-helpers" }
 
 [dev-dependencies]
 # Used by the FFI round-trip test to cross-check the FFI surface

@@ -1,6 +1,6 @@
 [package]
 name = "leyline-text-search"
-version = "0.7.5"
+version = "0.7.6"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "Unstructured-text semantic search backend abstraction for ley-line-open. Default NullEngine for the wire surface; Witchcraft (XTR-WARP) engine behind the `engine-witchcraft` feature."

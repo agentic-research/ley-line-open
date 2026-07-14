@@ -3,6 +3,7 @@ pub mod control;
 #[cfg(feature = "interrupt")]
 pub mod interrupt;
 pub mod layout;
+pub mod mmap;
 pub mod substrate;
 
 pub use blob_store::{FsBlobStore, MemBlobStore};

@@ -7,8 +7,8 @@ use std::io::Cursor;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use leyline_core::mmap::mmap_read;
 use leyline_core::{ArenaHeader, Controller};
-use memmap2::Mmap;
 use rusqlite::Connection;
 
 /// Open the arena's active buffer as a read-only in-memory SQLite connection.
@@ -35,7 +35,7 @@ fn open_arena_db(arena_path: &Path, control_path: Option<&Path>) -> Result<Conne
 
     let file = std::fs::File::open(&resolved_arena_path)
         .with_context(|| format!("open arena file: {}", resolved_arena_path.display()))?;
-    let mmap = unsafe { Mmap::map(&file)? };
+    let mmap = mmap_read(&file)?;
 
     let header: &ArenaHeader = bytemuck::from_bytes(&mmap[..std::mem::size_of::<ArenaHeader>()]);
 

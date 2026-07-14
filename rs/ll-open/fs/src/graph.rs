@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use leyline_core::mmap::{mmap_read, mmap_write};
 use leyline_core::{ArenaHeader, ContentAddressed, Controller};
 
 use crate::SqliteGraph;
@@ -212,7 +213,7 @@ impl SqliteGraphAdapter {
         let arena_path = controller.arena_path();
 
         let file = std::fs::File::open(&arena_path)?;
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        let mmap = mmap_read(&file)?;
 
         let header_slice = &mmap[..std::mem::size_of::<ArenaHeader>()];
         let header: &ArenaHeader = bytemuck::from_bytes(header_slice);
@@ -948,7 +949,7 @@ impl HotSwapGraph {
             .read(true)
             .write(true)
             .open(&arena_path)?;
-        let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
+        let mut mmap = mmap_write(&file)?;
         leyline_core::layout::write_to_arena(&mut mmap, &bytes)?;
 
         // σ via the substrate's ContentAddressed impl (Σ §3.4 locks BLAKE3).

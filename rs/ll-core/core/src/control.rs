@@ -26,6 +26,7 @@ use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::mmap::mmap_write;
 use anyhow::{Context, Result, bail};
 use memmap2::MmapMut;
 
@@ -120,7 +121,7 @@ impl Controller {
                 .context("truncate control file")?;
         }
 
-        let mut mmap = unsafe { MmapMut::map_mut(&file)? };
+        let mut mmap = mmap_write(&file)?;
 
         // Initialize if new (magic == 0)
         let existing_magic = u32::from_ne_bytes(mmap[OFF_MAGIC..OFF_MAGIC + 4].try_into().unwrap());

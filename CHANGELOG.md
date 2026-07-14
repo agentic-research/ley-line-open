@@ -10,6 +10,29 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.7.7] — 2026-07-14
+
+**`validate` daemon op enumerates every ERROR/MISSING node with byte ranges — unblocks mache draft-mode UX.**
+
+Patch release. Wire-additive on the `validate` op JSON response: new `errors: [{row, col, byte_start, byte_end, message}]` array beside the existing `diagnostics` first-error-only shape. Wire-compat with v0.7.6 (`wire_format_major = 1` unchanged; `compat_min_schema_version` stays at 0.6.0).
+
+### Added
+
+- **`validate` op returns EVERY ERROR/MISSING node** (previously first-error-only per bead `ley-line-open-fa8638`). New `errors: [...]` array in document (pre-order DFS) order with 0-based `row`/`col` + `byte_start`/`byte_end` byte range into the buffer + `message` (`"syntax error"` for ERROR nodes; `"missing <kind>"` for MISSING nodes with zero-width byte range). Legacy `diagnostics: [{line, col, message}]` shape preserved verbatim for wire-compat — callers pinning on `diagnostics[0].message == "syntax error"` still work. New public `leyline_fs::validate::collect_syntax_errors()` fn factored out for direct-library consumers. Unblocks mache write-back draft-mode UX (renders the full list into `_diagnostics/ast-errors`). MCP tool schema description updated. 3 new tests: clean-parse-empty, invalid-single-error-pins-both-shapes, enumerate-all-errors-across-multiple-rows. Bead `ley-line-open-736800` (mache-side ask `mache-36d961` A5 / `mache-37ae8b`); PR #204.
+
+### Compat matrix
+
+| Field | v0.7.6 | v0.7.7 | Note |
+|-------|--------|--------|------|
+| `binary_version` | 0.7.6 | 0.7.7 | Bump |
+| `schema_version` | 0.7.6 | 0.7.7 | Parity bump (no DB schema change; op-level JSON additive) |
+| `wire_format_major` | 1 | 1 | Unchanged |
+| `compat_min_schema_version` | 0.6.0 | 0.6.0 | Unchanged (additive `errors` field; older clients ignore it, still read the legacy `diagnostics` shape) |
+
+### Not shipped this release
+
+- **Analysis-substrate decade in-flight** — T1.b3-followup (`ley-line-open-a0fadd`), T1.b4, T2, T3, T4, F5 all still open.
+
 ## [0.7.6] — 2026-07-13
 
 **`confinementDigest` Interlace cert extension — cloister/confinement/v1 §7 identity commit.**

@@ -7,9 +7,9 @@
 //! `vec_search` op reads here.
 
 use anyhow::{Result, ensure};
+use parking_lot::Mutex;
 use rusqlite::Connection;
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 /// Register the sqlite-vec extension for all future connections.
 /// Must be called once before any `Connection` is opened.
@@ -86,7 +86,7 @@ impl VectorIndex {
             embedding.len()
         );
         let bytes: &[u8] = bytemuck::cast_slice(embedding);
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.conn.lock();
         conn.execute(
             "DELETE FROM node_embeddings WHERE node_id = ?1",
             rusqlite::params![node_id],
@@ -100,7 +100,7 @@ impl VectorIndex {
 
     /// Retrieve an embedding for a specific node by ID.
     pub fn get(&self, node_id: &str) -> Result<Option<Vec<f32>>> {
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT embedding FROM node_embeddings WHERE node_id = ?1")?;
         let mut rows = stmt.query(rusqlite::params![node_id])?;
 
@@ -123,7 +123,7 @@ impl VectorIndex {
             query.len()
         );
         let bytes: &[u8] = bytemuck::cast_slice(query);
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT node_id, distance FROM node_embeddings \
              WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2",
@@ -137,14 +137,14 @@ impl VectorIndex {
 
     /// Drop all embeddings (e.g., on generation change).
     pub fn clear(&self) -> Result<()> {
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.conn.lock();
         conn.execute("DELETE FROM node_embeddings", [])?;
         Ok(())
     }
 
     /// Number of stored embeddings.
     pub fn len(&self) -> Result<usize> {
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.conn.lock();
         let count: i64 =
             conn.query_row("SELECT COUNT(*) FROM node_embeddings", [], |r| r.get(0))?;
         Ok(count as usize)

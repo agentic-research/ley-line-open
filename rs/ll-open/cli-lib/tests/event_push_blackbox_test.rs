@@ -50,7 +50,7 @@ use tokio::net::UnixStream;
 /// source dir. Same shape as sheaf_uds_blackbox_test.rs's helper so a
 /// regression in shared bring-up surfaces in both files at once.
 fn build_blackbox_ctx(dir: &Path) -> Arc<DaemonContext> {
-    use std::sync::{Mutex, RwLock};
+    use parking_lot::{Mutex, RwLock};
 
     let arena_path = dir.join("blackbox.arena");
     let ctrl_path = dir.join("blackbox.ctrl");

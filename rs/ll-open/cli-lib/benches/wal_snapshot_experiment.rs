@@ -38,8 +38,9 @@
 //!     cargo run --release --bin wal_snapshot_experiment \
 //!         --features bench-bin -p leyline-cli-lib
 
+use parking_lot::Mutex;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use leyline_core::{ArenaHeader, Controller, create_arena, write_to_arena};
@@ -86,7 +87,7 @@ fn build_source_tree(root: &Path, n_files: usize, bytes_per_file: usize) {
 /// lock MUST be held while `db_bytes` is in scope.
 fn snapshot_baseline(live_db: &Mutex<Connection>, ctrl_path: &Path) -> (Duration, Duration, usize) {
     let lock_acquired = Instant::now();
-    let guard = live_db.lock().unwrap();
+    let guard = live_db.lock();
 
     let serialize_start = Instant::now();
     let db_bytes = guard.serialize("main").expect("serialize");
@@ -135,7 +136,7 @@ fn snapshot_shortened(
     ctrl_path: &Path,
 ) -> (Duration, Duration, usize) {
     let lock_acquired = Instant::now();
-    let guard = live_db.lock().unwrap();
+    let guard = live_db.lock();
 
     let serialize_start = Instant::now();
     let db_bytes_owned: Vec<u8> = {
@@ -322,7 +323,7 @@ fn phase2_contention(
     // We use a no-op UPDATE to simulate the "edit happened" flag, plus
     // a small INSERT into a scratch table to make the writer non-trivial.
     {
-        let conn = live_db.lock().unwrap();
+        let conn = live_db.lock();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS bench_writes (i INTEGER PRIMARY KEY AUTOINCREMENT, payload BLOB)"
         ).unwrap();
@@ -347,7 +348,7 @@ fn phase2_contention(
             let payload = vec![0xABu8; 256];
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 let wait_start = Instant::now();
-                let conn = live_db.lock().unwrap();
+                let conn = live_db.lock();
                 let wait = wait_start.elapsed();
                 local_waits.push(wait);
                 conn.execute(
@@ -362,8 +363,8 @@ fn phase2_contention(
                     std::hint::spin_loop();
                 }
             }
-            writer_stats.lock().unwrap()[w] = local_waits;
-            writer_counts.lock().unwrap()[w] = local_count;
+            writer_stats.lock()[w] = local_waits;
+            writer_counts.lock()[w] = local_count;
         }));
     }
 
@@ -389,7 +390,7 @@ fn phase2_contention(
                 "shortened" => snapshot_shortened(&snap_db, &snap_ctrl),
                 _ => unreachable!(),
             };
-            snap_lock_holds_t.lock().unwrap().push(held);
+            snap_lock_holds_t.lock().push(held);
             next = Instant::now() + snapshot_period;
         }
     });
@@ -403,12 +404,11 @@ fn phase2_contention(
 
     let mut all_waits: Vec<Duration> = writer_stats
         .lock()
-        .unwrap()
         .iter()
         .flat_map(|v| v.iter().copied())
         .collect();
-    let total_writes: u64 = writer_counts.lock().unwrap().iter().sum();
-    let snapshots = snap_lock_holds.lock().unwrap();
+    let total_writes: u64 = writer_counts.lock().iter().sum();
+    let snapshots = snap_lock_holds.lock();
     let mut snap_holds: Vec<Duration> = snapshots.iter().copied().collect();
 
     ContentionResult {

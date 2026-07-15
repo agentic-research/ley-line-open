@@ -5,6 +5,7 @@ edition = "2024"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
+parking_lot = { workspace = true }
 rusqlite = { workspace = true, features = ["bundled", "functions"] }
 anyhow = { workspace = true }
 blake3 = { workspace = true }

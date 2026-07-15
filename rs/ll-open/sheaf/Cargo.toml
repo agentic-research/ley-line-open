@@ -25,3 +25,7 @@ thiserror = { workspace = true }
 [dev-dependencies]
 anyhow = { workspace = true }
 sha2 = "0.11"
+# Only tests wrap `Arc<Mutex<...>>` around CellComplex — production
+# ships single-threaded. Kept as a dev-dep so leyline-sheaf's
+# published API stays parking_lot-independent.
+parking_lot = { workspace = true }

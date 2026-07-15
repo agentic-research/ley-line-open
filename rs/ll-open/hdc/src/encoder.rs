@@ -7,8 +7,8 @@
 //! trees; this crate doesn't depend on tree-sitter directly. Same
 //! encoder works for any structural tree.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 use crate::D_BITS;
 use crate::canonical::CanonicalKind;
@@ -280,15 +280,15 @@ impl SubtreeCache {
     }
 
     pub fn get(&self, key: &[u8; 32]) -> Option<Hypervector> {
-        self.map.lock().expect("mutex poisoned").get(key).copied()
+        self.map.lock().get(key).copied()
     }
 
     pub fn put(&self, key: [u8; 32], hv: Hypervector) {
-        self.map.lock().expect("mutex poisoned").insert(key, hv);
+        self.map.lock().insert(key, hv);
     }
 
     pub fn len(&self) -> usize {
-        self.map.lock().expect("mutex poisoned").len()
+        self.map.lock().len()
     }
 
     pub fn is_empty(&self) -> bool {

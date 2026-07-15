@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
 use crossbeam_queue::ArrayQueue;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 #[cfg(feature = "splice")]
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use leyline_core::mmap::{mmap_read, mmap_write};
@@ -236,7 +237,7 @@ impl SqliteGraphAdapter {
 
     /// Ensure the `_errors` table exists for storing validation errors.
     fn ensure_errors_table(&self) -> Result<()> {
-        let guard = self.writer.lock().expect("mutex poisoned");
+        let guard = self.writer.lock();
         guard.conn().execute_batch(
             "CREATE TABLE IF NOT EXISTS _errors (
                 node_id   TEXT PRIMARY KEY,
@@ -251,7 +252,7 @@ impl SqliteGraphAdapter {
 
     /// Serialize the current in-memory DB for arena flush.
     pub fn serialize(&self) -> Result<Vec<u8>> {
-        let guard = self.writer.lock().expect("mutex poisoned");
+        let guard = self.writer.lock();
         guard.serialize()
     }
 
@@ -267,7 +268,7 @@ impl SqliteGraphAdapter {
                 Some((r, g)) if g == current_gen => break (r, current_gen),
                 Some(_) => continue, // discard stale reader
                 None => {
-                    let bytes = self.reader_bytes.lock().expect("mutex poisoned");
+                    let bytes = self.reader_bytes.lock();
                     break (SqliteGraph::from_bytes(&bytes)?, current_gen);
                 }
             }
@@ -283,12 +284,12 @@ impl SqliteGraphAdapter {
     /// After a write, bump generation and update cached bytes so new readers
     /// see the mutation. Stale readers are discarded lazily by `with_reader`.
     fn refresh_readers(&self) -> Result<()> {
-        let writer = self.writer.lock().expect("mutex poisoned");
+        let writer = self.writer.lock();
         let bytes = writer.serialize()?;
         self.reader_gen.fetch_add(1, Ordering::Release);
         // Drain is best-effort; stale stragglers are caught by generation check
         while self.readers.pop().is_some() {}
-        *self.reader_bytes.lock().expect("mutex poisoned") = bytes;
+        *self.reader_bytes.lock() = bytes;
         Ok(())
     }
 
@@ -406,7 +407,7 @@ impl Graph for SqliteGraphAdapter {
 
     fn write_content(&self, id: &str, data: &[u8], offset: u64) -> Result<usize> {
         {
-            let guard = self.writer.lock().expect("mutex poisoned");
+            let guard = self.writer.lock();
             let now = now_nanos();
 
             // Read existing content, patch in the new data
@@ -452,7 +453,7 @@ impl Graph for SqliteGraphAdapter {
                         ).ok();
 
                         // Restore shadow copy if truncate wiped content before this write
-                        if let Some(old) = self.shadow.lock().expect("mutex poisoned").remove(id) {
+                        if let Some(old) = self.shadow.lock().remove(id) {
                             guard
                                 .conn()
                                 .execute(
@@ -472,7 +473,7 @@ impl Graph for SqliteGraphAdapter {
                     }
 
                     // Validation passed — clear shadow (no longer needed)
-                    self.shadow.lock().expect("mutex poisoned").remove(id);
+                    self.shadow.lock().remove(id);
                 }
             }
 
@@ -491,10 +492,7 @@ impl Graph for SqliteGraphAdapter {
                     .query_row("SELECT 1 FROM _ast WHERE node_id = ?1", [id], |_| Ok(true))
                     .unwrap_or(false);
                 if is_ast {
-                    self.pending_splice
-                        .lock()
-                        .expect("mutex poisoned")
-                        .insert(id.to_string());
+                    self.pending_splice.lock().insert(id.to_string());
                 }
             }
         }
@@ -504,7 +502,7 @@ impl Graph for SqliteGraphAdapter {
 
     fn create_node(&self, parent_id: &str, name: &str, is_dir: bool) -> Result<String> {
         let id = {
-            let guard = self.writer.lock().expect("mutex poisoned");
+            let guard = self.writer.lock();
             let now = now_nanos();
 
             let id = if parent_id.is_empty() {
@@ -526,7 +524,7 @@ impl Graph for SqliteGraphAdapter {
 
     fn remove_node(&self, id: &str) -> Result<()> {
         {
-            let guard = self.writer.lock().expect("mutex poisoned");
+            let guard = self.writer.lock();
             // Delete the node and all descendants (cascading by prefix)
             guard.conn().execute(
                 "DELETE FROM nodes WHERE id = ?1 OR id LIKE ?2",
@@ -539,7 +537,7 @@ impl Graph for SqliteGraphAdapter {
 
     fn truncate(&self, id: &str) -> Result<()> {
         {
-            let guard = self.writer.lock().expect("mutex poisoned");
+            let guard = self.writer.lock();
             let now = now_nanos();
 
             // Save shadow copy before truncating (for validation rollback)
@@ -555,10 +553,7 @@ impl Graph for SqliteGraphAdapter {
                         .ok()
                         .flatten();
                     if let Some(content) = old_content {
-                        self.shadow
-                            .lock()
-                            .expect("mutex poisoned")
-                            .insert(id.to_string(), content);
+                        self.shadow.lock().insert(id.to_string(), content);
                     }
                 }
             }
@@ -575,15 +570,10 @@ impl Graph for SqliteGraphAdapter {
     fn flush_node(&self, id: &str) -> Result<()> {
         #[cfg(feature = "splice")]
         {
-            if !self
-                .pending_splice
-                .lock()
-                .expect("mutex poisoned")
-                .contains(id)
-            {
+            if !self.pending_splice.lock().contains(id) {
                 return Ok(());
             }
-            let guard = self.writer.lock().expect("mutex poisoned");
+            let guard = self.writer.lock();
             let record: Option<String> = guard
                 .conn()
                 .query_row("SELECT record FROM nodes WHERE id = ?1", [id], |r| r.get(0))
@@ -594,13 +584,10 @@ impl Graph for SqliteGraphAdapter {
             };
             leyline_ts::splice::splice_and_reproject(guard.conn(), id, &text)?;
             // Only remove from pending on success — failed attempts retry on next flush
-            self.pending_splice
-                .lock()
-                .expect("mutex poisoned")
-                .remove(id);
+            self.pending_splice.lock().remove(id);
             // Reproject replaced all nodes — shadows are stale
             #[cfg(feature = "validate")]
-            self.shadow.lock().expect("mutex poisoned").clear();
+            self.shadow.lock().clear();
             drop(guard);
             self.refresh_readers()?;
         }
@@ -614,7 +601,7 @@ impl Graph for SqliteGraphAdapter {
             return Ok(());
         }
 
-        let guard = self.writer.lock().expect("mutex poisoned");
+        let guard = self.writer.lock();
         let conn = guard.conn();
         let now = now_nanos();
 
@@ -769,9 +756,9 @@ impl Graph for SqliteGraphAdapter {
         }
 
         // Clear pending splice set
-        self.pending_splice.lock().expect("mutex poisoned").clear();
+        self.pending_splice.lock().clear();
         #[cfg(feature = "validate")]
-        self.shadow.lock().expect("mutex poisoned").clear();
+        self.shadow.lock().clear();
 
         drop(guard);
         self.refresh_readers()?;
@@ -784,7 +771,7 @@ impl Graph for SqliteGraphAdapter {
 
     fn rename_node(&self, id: &str, new_parent_id: &str, new_name: &str) -> Result<()> {
         {
-            let guard = self.writer.lock().expect("mutex poisoned");
+            let guard = self.writer.lock();
             let new_id = if new_parent_id.is_empty() {
                 new_name.to_string()
             } else {
@@ -909,11 +896,11 @@ impl HotSwapGraph {
     pub fn with_validation(mut self, default_language: Option<tree_sitter::Language>) -> Self {
         self.writable = true;
         self.default_language = default_language;
-        let cached_root = *self.last_root.lock().expect("mutex poisoned");
+        let cached_root = *self.last_root.lock();
         if cached_root != [0u8; 32]
             && let Ok(new_graph) = self.build_adapter(&self.control_path)
         {
-            *self.inner.write().expect("rwlock write-poisoned") = new_graph;
+            *self.inner.write() = new_graph;
         }
         self
     }
@@ -922,11 +909,11 @@ impl HotSwapGraph {
     /// Re-opens the inner graph as writable if already loaded.
     pub fn with_writable(mut self) -> Self {
         self.writable = true;
-        let cached_root = *self.last_root.lock().expect("mutex poisoned");
+        let cached_root = *self.last_root.lock();
         if cached_root != [0u8; 32]
             && let Ok(new_graph) = self.build_adapter(&self.control_path)
         {
-            *self.inner.write().expect("rwlock write-poisoned") = new_graph;
+            *self.inner.write() = new_graph;
         }
         self
     }
@@ -952,7 +939,7 @@ impl HotSwapGraph {
     /// `current_root` via `set_arena_with_root`. Polling readers
     /// detect the change by comparing roots.
     pub fn flush_to_arena(&self) -> Result<()> {
-        let inner = self.inner.read().expect("rwlock read-poisoned").clone();
+        let inner = self.inner.read().clone();
         let bytes = inner.serialize()?;
 
         let ctrl = Controller::open_or_create(&self.control_path)?;
@@ -975,7 +962,7 @@ impl HotSwapGraph {
         ctrl.set_arena_with_root(&arena_path, arena_size, new_root)?;
 
         // Acknowledge our own publish without re-opening.
-        *self.last_root.lock().expect("mutex poisoned") = new_root;
+        *self.last_root.lock() = new_root;
         log::info!(
             "arena flush: root advanced to {} ({} bytes)",
             hex_short(&new_root),
@@ -991,7 +978,7 @@ impl HotSwapGraph {
     fn maybe_swap(&self) -> Result<Arc<dyn Graph>> {
         let ctrl = Controller::open_or_create(&self.control_path)?;
         let current_root = ctrl.current_root();
-        let cached_root = *self.last_root.lock().expect("mutex poisoned");
+        let cached_root = *self.last_root.lock();
 
         if current_root != cached_root {
             // Zero-root sentinel = no data; serve empty graph.
@@ -1000,12 +987,12 @@ impl HotSwapGraph {
             } else {
                 self.build_adapter(&self.control_path)?
             };
-            let mut w = self.inner.write().expect("rwlock write-poisoned");
+            let mut w = self.inner.write();
             *w = new_graph.clone();
-            *self.last_root.lock().expect("mutex poisoned") = current_root;
+            *self.last_root.lock() = current_root;
             Ok(new_graph)
         } else {
-            Ok(self.inner.read().expect("rwlock read-poisoned").clone())
+            Ok(self.inner.read().clone())
         }
     }
 }
@@ -1066,7 +1053,7 @@ impl Graph for HotSwapGraph {
     }
 
     fn serialize(&self) -> Result<Vec<u8>> {
-        self.inner.read().expect("rwlock read-poisoned").serialize()
+        self.inner.read().serialize()
     }
 
     fn flush_to_arena(&self) -> Result<()> {
@@ -1121,10 +1108,7 @@ impl MemoryGraph {
                 .push(id.clone());
         }
         if let Some(data) = content {
-            self.content
-                .lock()
-                .expect("mutex poisoned")
-                .insert(id, data);
+            self.content.lock().insert(id, data);
         }
     }
 }
@@ -1162,7 +1146,7 @@ impl Graph for MemoryGraph {
     }
 
     fn read_content(&self, id: &str, buf: &mut [u8], offset: u64) -> Result<usize> {
-        let guard = self.content.lock().expect("mutex poisoned");
+        let guard = self.content.lock();
         let Some(data) = guard.get(id) else {
             return Ok(0);
         };
@@ -1598,7 +1582,7 @@ mod tests {
         assert_eq!(&buf[..n], valid.as_slice());
 
         // Verify no error stored
-        let guard = adapter.writer.lock().expect("mutex poisoned");
+        let guard = adapter.writer.lock();
         let count: i64 = guard.conn().query_row(
             "SELECT COUNT(*) FROM _errors WHERE node_id = ?1",
             ["functions/main/source"],
@@ -1629,7 +1613,7 @@ mod tests {
         );
 
         // Verify structured error stored in _errors table
-        let guard = adapter.writer.lock().expect("mutex poisoned");
+        let guard = adapter.writer.lock();
         let (line, _col, message): (i64, i64, String) = guard.conn().query_row(
             "SELECT line, col, message FROM _errors WHERE node_id = ?1",
             ["functions/main/source"],
@@ -1643,7 +1627,7 @@ mod tests {
         let valid = b"package main\n\nfunc main() {\n}\n";
         adapter.write_content("functions/main/source", valid, 0)?;
 
-        let guard = adapter.writer.lock().expect("mutex poisoned");
+        let guard = adapter.writer.lock();
         let count: i64 = guard.conn().query_row(
             "SELECT COUNT(*) FROM _errors WHERE node_id = ?1",
             ["functions/main/source"],
@@ -1828,11 +1812,7 @@ mod tests {
 
         // Verify pending splice was marked
         assert!(
-            adapter
-                .pending_splice
-                .lock()
-                .expect("mutex poisoned")
-                .contains(node_id),
+            adapter.pending_splice.lock().contains(node_id),
             "node should be marked for pending splice"
         );
 
@@ -1841,16 +1821,12 @@ mod tests {
 
         // Pending splice should be cleared
         assert!(
-            !adapter
-                .pending_splice
-                .lock()
-                .expect("mutex poisoned")
-                .contains(node_id),
+            !adapter.pending_splice.lock().contains(node_id),
             "pending splice should be cleared after successful flush"
         );
 
         // Source should be updated
-        let guard = adapter.writer.lock().expect("mutex poisoned");
+        let guard = adapter.writer.lock();
         let source: Vec<u8> = guard.conn().query_row(
             "SELECT content FROM _source WHERE id = 'test.html'",
             [],
@@ -1877,11 +1853,7 @@ mod tests {
 
         // Should not be pending
         assert!(
-            !adapter
-                .pending_splice
-                .lock()
-                .expect("mutex poisoned")
-                .contains("plain.txt"),
+            !adapter.pending_splice.lock().contains("plain.txt"),
             "non-AST node should not be marked for splice"
         );
 
@@ -1914,11 +1886,7 @@ mod tests {
         if result.is_err() {
             // Node should still be pending for retry
             assert!(
-                adapter
-                    .pending_splice
-                    .lock()
-                    .expect("mutex poisoned")
-                    .contains(node_id),
+                adapter.pending_splice.lock().contains(node_id),
                 "failed flush should keep node pending"
             );
         }
@@ -1932,16 +1900,12 @@ mod tests {
         adapter.flush_node(node_id)?;
 
         assert!(
-            !adapter
-                .pending_splice
-                .lock()
-                .expect("mutex poisoned")
-                .contains(node_id),
+            !adapter.pending_splice.lock().contains(node_id),
             "successful flush should clear pending"
         );
 
         // Verify source updated
-        let guard = adapter.writer.lock().expect("mutex poisoned");
+        let guard = adapter.writer.lock();
         let source: Vec<u8> = guard.conn().query_row(
             "SELECT content FROM _source WHERE id = 'test.html'",
             [],

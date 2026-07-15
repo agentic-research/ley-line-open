@@ -25,6 +25,7 @@ default = []
 engine-witchcraft = ["dep:witchcraft", "dep:uuid", "dep:serde_json"]
 
 [dependencies]
+parking_lot = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 

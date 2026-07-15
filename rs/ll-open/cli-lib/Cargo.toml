@@ -28,6 +28,7 @@ hdc = ["dep:leyline-hdc", "leyline-ts/rust"]
 text-search = ["dep:leyline-text-search"]
 
 [dependencies]
+parking_lot = { workspace = true }
 leyline-lsp = { path = "../lsp", optional = true }
 leyline-hdc = { path = "../hdc", optional = true }
 leyline-text-search = { path = "../text-search", optional = true }

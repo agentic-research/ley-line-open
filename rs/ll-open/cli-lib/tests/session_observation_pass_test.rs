@@ -17,8 +17,8 @@
 //! 6. A second `run()` over the same corpus is a no-op (watermark
 //!    short-circuits all turns).
 
+use parking_lot::Mutex;
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use leyline_cli_lib::daemon::enrichment::EnrichmentPass;
 use leyline_cli_lib::daemon::session_observation_pass::SessionObservationPass;
@@ -66,7 +66,7 @@ fn meta_conn() -> Connection {
 
 #[test]
 fn gate_1_ingests_five_turns_and_extracts_mentions() {
-    let _env_guard = corpus_env_lock().lock().unwrap();
+    let _env_guard = corpus_env_lock().lock();
     let td = TempDir::new().unwrap();
     let corpus = stage_corpus(&td);
     // SAFETY: tests serialize through corpus_env_lock; no other
@@ -187,7 +187,7 @@ fn gate_1_second_run_is_idempotent() {
     // watermark short-circuits every turn at-or-below the previous
     // max observed_at. Without this, every daemon reparse would
     // double the observation row count.
-    let _env_guard = corpus_env_lock().lock().unwrap();
+    let _env_guard = corpus_env_lock().lock();
     let td = TempDir::new().unwrap();
     let corpus = stage_corpus(&td);
     // SAFETY: serialized through corpus_env_lock.
@@ -224,7 +224,7 @@ fn no_corpus_env_var_is_a_noop() {
     // return zero work, not error. Pin so a refactor that demanded
     // the env var would break the open-edition daemon's default
     // boot path.
-    let _env_guard = corpus_env_lock().lock().unwrap();
+    let _env_guard = corpus_env_lock().lock();
     let td = TempDir::new().unwrap();
     // SAFETY: serialized through corpus_env_lock.
     unsafe {

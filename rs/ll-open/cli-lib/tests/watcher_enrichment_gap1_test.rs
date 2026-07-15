@@ -47,7 +47,7 @@ use tempfile::TempDir;
 struct CountingPass {
     name: &'static str,
     invocations: Arc<AtomicUsize>,
-    last_scope: Arc<std::sync::Mutex<Option<Vec<String>>>>,
+    last_scope: Arc<parking_lot::Mutex<Option<Vec<String>>>>,
 }
 
 impl EnrichmentPass for CountingPass {
@@ -70,7 +70,7 @@ impl EnrichmentPass for CountingPass {
         changed_files: Option<&[String]>,
     ) -> Result<EnrichmentStats> {
         self.invocations.fetch_add(1, Ordering::SeqCst);
-        *self.last_scope.lock().unwrap() = changed_files.map(|s| s.to_vec());
+        *self.last_scope.lock() = changed_files.map(|s| s.to_vec());
         Ok(EnrichmentStats {
             pass_name: self.name.to_string(),
             files_processed: changed_files.map(|s| s.len() as u64).unwrap_or(0),
@@ -129,7 +129,7 @@ fn build_ctx(
     source_dir: PathBuf,
     passes: Vec<Box<dyn EnrichmentPass>>,
 ) -> (Arc<DaemonContext>, Arc<EventRouter>) {
-    use std::sync::{Mutex, RwLock};
+    use parking_lot::{Mutex, RwLock};
 
     let ctrl_path = fresh_arena(dir);
     let router = EventRouter::new(64);
@@ -214,8 +214,8 @@ async fn watcher_enrichment_fires_pass_and_emits_complete_event() {
     std::fs::write(source_dir.join("foo.rs"), b"fn main() {}\n").unwrap();
 
     let invocations = Arc::new(AtomicUsize::new(0));
-    let last_scope: Arc<std::sync::Mutex<Option<Vec<String>>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    let last_scope: Arc<parking_lot::Mutex<Option<Vec<String>>>> =
+        Arc::new(parking_lot::Mutex::new(None));
     let pass = Box::new(CountingPass {
         name: "counting",
         invocations: invocations.clone(),
@@ -251,7 +251,7 @@ async fn watcher_enrichment_fires_pass_and_emits_complete_event() {
 
     // Pin 2: it was invoked with the scoped changed_files, not None.
     // Regression against a refactor that accidentally drops the scope.
-    let scope_seen = last_scope.lock().unwrap().clone();
+    let scope_seen = last_scope.lock().clone();
     assert_eq!(
         scope_seen,
         Some(vec!["foo.rs".to_string()]),
@@ -379,8 +379,10 @@ async fn watcher_enrichment_with_empty_scope_falls_back_to_full_run() {
     std::fs::create_dir_all(&source_dir).unwrap();
 
     let invocations = Arc::new(AtomicUsize::new(0));
-    let last_scope: Arc<std::sync::Mutex<Option<Vec<String>>>> =
-        Arc::new(std::sync::Mutex::new(Some(vec!["placeholder".to_string()])));
+    let last_scope: Arc<parking_lot::Mutex<Option<Vec<String>>>> =
+        Arc::new(parking_lot::Mutex::new(Some(vec![
+            "placeholder".to_string(),
+        ])));
     let pass = Box::new(CountingPass {
         name: "counting",
         invocations: invocations.clone(),
@@ -399,7 +401,7 @@ async fn watcher_enrichment_with_empty_scope_falls_back_to_full_run() {
          to full-repo enrichment via a None scope)"
     );
     assert_eq!(
-        *last_scope.lock().unwrap(),
+        *last_scope.lock(),
         None,
         "empty changed_files must map to a None scope inside the pass \
          (not Some(&[])) — otherwise passes that key on Some vs None \

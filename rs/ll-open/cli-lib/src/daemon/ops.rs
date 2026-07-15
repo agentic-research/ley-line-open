@@ -359,14 +359,7 @@ fn snapshot_living_db(ctx: &DaemonContext) -> Result<()> {
 
 fn op_status(ctx: &DaemonContext) -> Result<String> {
     let ctrl = Controller::open_or_create(&ctx.ctrl_path).context("open controller")?;
-    // Recover from a poisoned lock instead of propagating panic — a
-    // status query MUST succeed even if a previous writer panicked, so
-    // operators can see the failed state. Same pattern as
-    // record_pass_outcome and the embed drain loop.
-    let state = ctx.state.read().unwrap_or_else(|poisoned| {
-        log::error!("daemon state RwLock poisoned in op_status, recovering");
-        poisoned.into_inner()
-    });
+    let state = ctx.state.read();
 
     // Collect per-pass status into a Vec the typed-list builder can
     // iterate (sorted by name so the wire is deterministic across
@@ -552,14 +545,13 @@ fn op_reparse(
     // Parse directly into the living db. Classified as `with_write` —
     // `parse_into_conn` runs INSERT/UPDATE/COMMIT under the guard.
     // Bead `ley-line-open-ba8294` Phase 2 intent-marking.
-    ctx.state.write().expect("rwlock write-poisoned").phase = DaemonPhase::Parsing;
+    ctx.state.write().phase = DaemonPhase::Parsing;
     let result = match ctx
         .with_write(|conn| crate::cmd_parse::parse_into_conn(conn, &source_dir, lang, scope))
     {
         Ok(r) => r,
         Err(e) => {
-            ctx.state.write().expect("rwlock write-poisoned").phase =
-                DaemonPhase::Error(format!("reparse failed: {e:#}"));
+            ctx.state.write().phase = DaemonPhase::Error(format!("reparse failed: {e:#}"));
             return Err(e);
         }
     };
@@ -568,7 +560,7 @@ fn op_reparse(
     snapshot_living_db(ctx)?;
 
     {
-        let mut s = ctx.state.write().expect("rwlock write-poisoned");
+        let mut s = ctx.state.write();
         s.phase = DaemonPhase::Ready;
         s.last_reparse_at_ms = Some(super::now_ms());
     }
@@ -603,7 +595,7 @@ fn op_enrich(ctx: &DaemonContext, pass_name: &str, files: Option<&[String]>) -> 
     // Enrichment classified as `with_write` — passes INSERT/UPDATE
     // enrichment rows under the guard (LSP bindings, HDC codebooks,
     // embeddings, etc.). Bead `ley-line-open-ba8294` Phase 2.
-    ctx.state.write().expect("rwlock write-poisoned").phase = DaemonPhase::Enriching;
+    ctx.state.write().phase = DaemonPhase::Enriching;
     let stats = ctx.with_write(|conn| {
         crate::daemon::enrichment::run_pass(
             &ctx.enrichment_passes,
@@ -614,7 +606,7 @@ fn op_enrich(ctx: &DaemonContext, pass_name: &str, files: Option<&[String]>) -> 
             Some(&ctx.state),
         )
     })?;
-    ctx.state.write().expect("rwlock write-poisoned").phase = DaemonPhase::Ready;
+    ctx.state.write().phase = DaemonPhase::Ready;
 
     // Snapshot to arena after enrichment.
     snapshot_living_db(ctx)?;
@@ -1356,7 +1348,7 @@ pub(crate) fn query_node_record(conn: &Connection, id: &str) -> Result<Option<St
 /// must invoke `try_enrich_file` separately, AFTER dropping the
 /// connection lock (606e64). The pre-fix `maybe_enrich` called
 /// `try_enrich_file` from within a `with_live_db` closure, causing a
-/// self-deadlock on `std::sync::Mutex<Connection>` (which doesn't
+/// self-deadlock on `parking_lot::Mutex<Connection>` (which doesn't
 /// support reentrant locking).
 fn needs_enrich(conn: &Connection, file: &str) -> bool {
     // _lsp table absent ⟹ definitely needs enrich.
@@ -1420,13 +1412,7 @@ fn try_enrich_file(ctx: &std::sync::Arc<DaemonContext>, file: &str) -> bool {
     // ("if you got past me, you own the work") is uniform regardless
     // of whether the work itself short-circuits below.
     {
-        let mut inflight = match ctx.enrich_inflight.lock() {
-            Ok(g) => g,
-            Err(poisoned) => {
-                log::error!("enrich_inflight mutex poisoned, recovering");
-                poisoned.into_inner()
-            }
-        };
+        let mut inflight = ctx.enrich_inflight.lock();
         if !inflight.insert(file.to_string()) {
             // Another caller is already enriching this file. Skip.
             return false;
@@ -1438,11 +1424,7 @@ fn try_enrich_file(ctx: &std::sync::Arc<DaemonContext>, file: &str) -> bool {
     // if there's nothing to enrich.
     if ctx.source_dir.is_none() {
         // Pop the gate entry — there's no spawned task to release it via Drop.
-        let mut g = match ctx.enrich_inflight.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        g.remove(file);
+        ctx.enrich_inflight.lock().remove(file);
         return false;
     }
 
@@ -1457,16 +1439,12 @@ fn try_enrich_file(ctx: &std::sync::Arc<DaemonContext>, file: &str) -> bool {
         // error path would leak the file into the in-flight set
         // forever, blocking all future enrichment attempts.
         struct InflightGuard {
-            set: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+            set: std::sync::Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
             file: String,
         }
         impl Drop for InflightGuard {
             fn drop(&mut self) {
-                let mut g = match self.set.lock() {
-                    Ok(g) => g,
-                    Err(p) => p.into_inner(),
-                };
-                g.remove(&self.file);
+                self.set.lock().remove(&self.file);
             }
         }
         let _guard = InflightGuard {
@@ -1481,13 +1459,7 @@ fn try_enrich_file(ctx: &std::sync::Arc<DaemonContext>, file: &str) -> bool {
 
         eprintln!("lazy enrich (bg): triggering LSP for {file_owned}");
 
-        let guard = match ctx_owned.live_db.writer.lock() {
-            Ok(g) => g,
-            Err(p) => {
-                log::error!("lazy enrich: live_db writer poisoned, recovering");
-                p.into_inner()
-            }
-        };
+        let guard = ctx_owned.live_db.writer.lock();
         let result = crate::daemon::enrichment::run_pass(
             &ctx_owned.enrichment_passes,
             "lsp",
@@ -3111,7 +3083,8 @@ fn op_agreement(ctx: &std::sync::Arc<DaemonContext>, req: &AgreementRequest) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, RwLock};
+    use parking_lot::RwLock;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     // ── Helper unit tests ───────────────────────────────────────────────
@@ -3447,7 +3420,7 @@ mod tests {
             ext: Arc::new(crate::daemon::NoExt),
             router: crate::daemon::EventRouter::new(16),
             live_db,
-            enrich_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            enrich_inflight: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             source_dir: None,
             lang_filter: None,
             enrichment_passes: vec![],
@@ -3457,7 +3430,7 @@ mod tests {
             #[cfg(feature = "vec")]
             embedder,
             #[cfg(feature = "vec")]
-            embed_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
+            embed_queue: Arc::new(parking_lot::Mutex::new(std::collections::BinaryHeap::new())),
             #[cfg(feature = "text-search")]
             text_search: Arc::new(leyline_text_search::null::NullEngine::new()),
             sheaf: Arc::new(crate::daemon::sheaf_ops::SheafState::new()),
@@ -3468,7 +3441,7 @@ mod tests {
     /// 5f7100-4 / 606e64: regression pin for the self-deadlock fix.
     ///
     /// Pre-fix, `with_lazy_enrich_retry` called `maybe_enrich` from
-    /// inside `with_live_db`, which held the std::sync::Mutex while
+    /// inside `with_live_db`, which held the parking_lot::Mutex while
     /// `try_enrich_file` tried to re-acquire it — same-thread
     /// deadlock on a non-reentrant Mutex. Without the fix, this test
     /// would hang forever.
@@ -3529,31 +3502,19 @@ mod tests {
         let (_dir, ctx) = setup();
 
         // First caller: insert "foo.go".
-        let first = ctx
-            .enrich_inflight
-            .lock()
-            .unwrap()
-            .insert("foo.go".to_string());
+        let first = ctx.enrich_inflight.lock().insert("foo.go".to_string());
         assert!(first, "first caller must succeed in inserting");
 
         // Second caller (concurrent simulation): same file already in
         // set; insert returns false → caller skips enrichment.
-        let second = ctx
-            .enrich_inflight
-            .lock()
-            .unwrap()
-            .insert("foo.go".to_string());
+        let second = ctx.enrich_inflight.lock().insert("foo.go".to_string());
         assert!(
             !second,
             "second concurrent caller must observe inflight, return false"
         );
 
         // Different file: still allowed.
-        let other = ctx
-            .enrich_inflight
-            .lock()
-            .unwrap()
-            .insert("bar.go".to_string());
+        let other = ctx.enrich_inflight.lock().insert("bar.go".to_string());
         assert!(other, "different file must be allowed concurrently");
     }
 
@@ -3567,18 +3528,11 @@ mod tests {
         // Simulate work cycle: insert + remove (the InflightGuard's
         // Drop does this automatically in production try_enrich_file;
         // we exercise it manually here).
-        ctx.enrich_inflight
-            .lock()
-            .unwrap()
-            .insert("foo.go".to_string());
-        ctx.enrich_inflight.lock().unwrap().remove("foo.go");
+        ctx.enrich_inflight.lock().insert("foo.go".to_string());
+        ctx.enrich_inflight.lock().remove("foo.go");
 
         // Subsequent call: insert succeeds (set is clean).
-        let again = ctx
-            .enrich_inflight
-            .lock()
-            .unwrap()
-            .insert("foo.go".to_string());
+        let again = ctx.enrich_inflight.lock().insert("foo.go".to_string());
         assert!(again, "after release, file is allowed back into set");
     }
 
@@ -3599,7 +3553,7 @@ mod tests {
 
         // Pre-condition: set is empty.
         assert_eq!(
-            ctx.enrich_inflight.lock().unwrap().len(),
+            ctx.enrich_inflight.lock().len(),
             0,
             "fresh inflight set should be empty",
         );
@@ -3611,7 +3565,7 @@ mod tests {
         assert!(!result, "no source_dir → try_enrich_file returns false");
 
         assert_eq!(
-            ctx.enrich_inflight.lock().unwrap().len(),
+            ctx.enrich_inflight.lock().len(),
             0,
             "inflight set must be empty after try_enrich_file returns; \
              RAII guard cleans up even on early-return paths",
@@ -3711,7 +3665,7 @@ mod tests {
         //   - limit field reports the cap that was applied
         let (_dir, ctx) = setup();
         {
-            let conn = ctx.live_db.writer.lock().unwrap();
+            let conn = ctx.live_db.writer.lock();
             conn.execute(
                 "CREATE TABLE probe (id INTEGER PRIMARY KEY, payload TEXT)",
                 [],
@@ -3754,7 +3708,7 @@ mod tests {
         // unwrap_or fallback) surfaces here.
         let (_dir, ctx) = setup();
         {
-            let conn = ctx.live_db.writer.lock().unwrap();
+            let conn = ctx.live_db.writer.lock();
             conn.execute("CREATE TABLE p (i INTEGER)", []).unwrap();
             for i in 0..50 {
                 conn.execute("INSERT INTO p VALUES (?1)", [i]).unwrap();
@@ -3781,7 +3735,7 @@ mod tests {
         // cause unnecessary follow-up queries.
         let (_dir, ctx) = setup();
         {
-            let conn = ctx.live_db.writer.lock().unwrap();
+            let conn = ctx.live_db.writer.lock();
             conn.execute("CREATE TABLE small (i INTEGER)", []).unwrap();
             for i in 0..5 {
                 conn.execute("INSERT INTO small VALUES (?1)", [i]).unwrap();
@@ -3913,56 +3867,15 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn op_status_recovers_from_poisoned_state_lock() {
-        // op_status is the operator's diagnostic endpoint — when
-        // something has gone wrong elsewhere in the daemon, this MUST
-        // still respond. RwLock poisoning happens when a writer panics
-        // while holding the lock; before this fix, every subsequent
-        // op_status call panicked with the same poison error, making
-        // the daemon opaque exactly when introspection was needed.
-        //
-        // Deliberately poison ctx.state by panicking inside a write
-        // guard, then call op_status and assert it returns a valid
-        // JSON status response.
-        let (_dir, ctx) = setup();
-        let state = ctx.state.clone();
-
-        // Spawn a thread that takes the write lock and panics.
-        // std::panic::catch_unwind requires UnwindSafe; the simplest
-        // approach is std::thread which catches the panic in the
-        // JoinHandle.
-        let join = std::thread::spawn(move || {
-            let _guard = state.write().unwrap();
-            panic!("deliberate panic to poison the lock");
-        });
-        // The thread panicked — join returns Err but the lock is now
-        // poisoned for everyone else.
-        assert!(join.join().is_err(), "spawned thread should have panicked");
-
-        // Sanity: confirm the lock IS poisoned. Direct read().unwrap()
-        // would panic now.
-        assert!(
-            ctx.state.read().is_err(),
-            "state lock must be poisoned after writer panic",
-        );
-
-        // The contract: op_status MUST succeed despite the poison.
-        let result =
-            handle_base_op_legacy(&ctx, "status", &json!({})).expect("op_status must dispatch");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&result).expect("op_status must return valid JSON");
-        assert_eq!(parsed["ok"], true, "op_status must report ok=true");
-        // Required fields still present.
-        assert!(
-            parsed.get("phase").is_some(),
-            "phase field must survive poison recovery"
-        );
-        assert!(
-            parsed.get("enrichment_typed").is_some(),
-            "enrichment_typed field must survive poison recovery"
-        );
-    }
+    // The pre-parking_lot poison-recovery test lived here — deleted
+    // when `ctx.state` swapped `std::sync::RwLock` → `parking_lot::RwLock`.
+    // parking_lot never poisons; a panic-during-write leaves the next
+    // reader with a plain `RwLockReadGuard`, so `op_status` staying
+    // available is now a compile-time property (the read never
+    // returned a Result to unwrap). No test can express "must
+    // recover from poison" for a lock that has no poison state.
+    // The op_status happy-path is covered by other tests in this
+    // block.
 
     #[tokio::test]
     async fn test_op_flush_returns_ok() {
@@ -4863,7 +4776,7 @@ mod tests {
         let hv_bytes = hv.to_vec();
 
         {
-            let live = ctx.live_db.writer.lock().unwrap();
+            let live = ctx.live_db.writer.lock();
             live.execute(
                 "INSERT INTO _hdc (scope_id, layer_kind, hv, basis) VALUES (?1, ?2, ?3, ?4)",
                 rusqlite::params!["test:main", "ast", hv_bytes, 0i64],
@@ -4934,7 +4847,7 @@ mod tests {
         let (_dir, ctx) = setup();
 
         {
-            let live = ctx.live_db.writer.lock().unwrap();
+            let live = ctx.live_db.writer.lock();
             // Define `SendOp` at node_id `pkg/SendOp` in `pkg.go`.
             live.execute_batch(
                 "INSERT INTO node_defs (token, node_id, source_id) VALUES \
@@ -5076,7 +4989,7 @@ mod tests {
     async fn at_position_inside_definition_returns_token() {
         let (_dir, ctx) = setup();
         {
-            let live = ctx.live_db.writer.lock().unwrap();
+            let live = ctx.live_db.writer.lock();
             // SendOp covers rows 5–15; an inner Helper definition
             // covers rows 7–9 (smaller — should win at row 8).
             live.execute_batch(
@@ -5136,7 +5049,7 @@ mod tests {
     async fn inspect_symbol_carries_provenance_and_certainty_everywhere() {
         let (_dir, ctx) = setup();
         {
-            let live = ctx.live_db.writer.lock().unwrap();
+            let live = ctx.live_db.writer.lock();
             // Definition + reference + callee chain so every sub-
             // array gets at least one row.
             live.execute_batch(
@@ -5206,7 +5119,7 @@ mod tests {
     async fn inspect_neighborhood_depth_1_returns_callers_and_callees() {
         let (_dir, ctx) = setup();
         {
-            let live = ctx.live_db.writer.lock().unwrap();
+            let live = ctx.live_db.writer.lock();
             // A defined at pkg/A, references B (B is its callee).
             // C is defined at pkg/C, references A (C is A's caller).
             live.execute_batch(
@@ -5293,7 +5206,7 @@ mod tests {
     async fn at_position_output_is_inspect_symbol_input() {
         let (_dir, ctx) = setup();
         {
-            let live = ctx.live_db.writer.lock().unwrap();
+            let live = ctx.live_db.writer.lock();
             live.execute_batch(
                 "INSERT INTO node_defs (token, node_id, source_id) VALUES \
                    ('Foo', 'pkg/Foo', 'pkg.go');
@@ -5363,7 +5276,7 @@ mod tests {
     async fn search_symbols_glob_pattern_matches_prefix() {
         let (_dir, ctx) = setup();
         {
-            let live = ctx.live_db.writer.lock().unwrap();
+            let live = ctx.live_db.writer.lock();
             live.execute_batch(
                 "INSERT INTO node_defs (token, node_id, source_id) VALUES \
                    ('SendOp',    'pkg/SendOp',    'pkg.go'),
@@ -5415,7 +5328,7 @@ mod tests {
     async fn search_symbols_limit_is_respected() {
         let (_dir, ctx) = setup();
         {
-            let live = ctx.live_db.writer.lock().unwrap();
+            let live = ctx.live_db.writer.lock();
             live.execute_batch(
                 "INSERT INTO node_defs (token, node_id, source_id) VALUES \
                    ('Match1', 'pkg/Match1', 'pkg.go'),
@@ -5448,7 +5361,7 @@ mod tests {
     async fn search_symbols_kind_filter_excludes_non_matching() {
         let (_dir, ctx) = setup();
         {
-            let live = ctx.live_db.writer.lock().unwrap();
+            let live = ctx.live_db.writer.lock();
             live.execute_batch(
                 "INSERT INTO node_defs (token, node_id, source_id) VALUES \
                    ('FooFn',     'pkg/FooFn',     'pkg.go'),
@@ -5514,7 +5427,7 @@ mod tests {
         stalk: &[f32],
         observed_at: i64,
     ) {
-        let live = ctx.live_db.writer.lock().unwrap();
+        let live = ctx.live_db.writer.lock();
         crate::daemon::observation_schema::create_observation_schema(&live)
             .expect("install observation schema");
         let payload = encode_inline_f32(stalk);

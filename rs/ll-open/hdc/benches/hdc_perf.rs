@@ -9,8 +9,8 @@
 //! 2. `encode_tree` — cold vs warm cache, depth 5/7/9 trees.
 //! 3. `bundle_majority` — both Rust impl and SQL UDF, increasing N.
 
+use parking_lot::Mutex;
 use std::hint::black_box;
-use std::sync::Mutex;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
@@ -103,7 +103,7 @@ fn bench_bundle_majority(c: &mut Criterion) {
         let conn = Mutex::new(conn);
         g.bench_with_input(BenchmarkId::new("sql", n), &n, |bencher, _| {
             bencher.iter(|| {
-                let c = conn.lock().unwrap();
+                let c = conn.lock();
                 let bytes: Vec<u8> = c
                     .query_row("SELECT BUNDLE_MAJORITY(hv) FROM hvs", [], |r| r.get(0))
                     .unwrap();

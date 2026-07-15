@@ -6,9 +6,10 @@
 //! changes are batch-spliced into the live graph atomically.
 
 use anyhow::Result;
+use parking_lot::Mutex;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::graph::{Graph, Node};
@@ -47,7 +48,7 @@ impl StagingGraph {
 
     /// List IDs of all dirty (modified, non-tombstone) nodes in staging.
     pub fn dirty_nodes(&self) -> Result<Vec<String>> {
-        let conn = self.shadow.lock().expect("mutex poisoned");
+        let conn = self.shadow.lock();
         let mut stmt = conn.prepare("SELECT id FROM shadow_nodes WHERE tombstone = 0")?;
         let rows = stmt.query_map([], |r| r.get(0))?;
         rows.collect::<std::result::Result<_, _>>()
@@ -56,7 +57,7 @@ impl StagingGraph {
 
     /// List IDs of all tombstoned (deleted) nodes in staging.
     pub fn tombstone_nodes(&self) -> Result<Vec<String>> {
-        let conn = self.shadow.lock().expect("mutex poisoned");
+        let conn = self.shadow.lock();
         let mut stmt = conn.prepare("SELECT id FROM shadow_nodes WHERE tombstone = 1")?;
         let rows = stmt.query_map([], |r| r.get(0))?;
         rows.collect::<std::result::Result<_, _>>()
@@ -65,7 +66,7 @@ impl StagingGraph {
 
     /// Read the staged record for a dirty node (used by batch splice).
     pub fn staged_record(&self, id: &str) -> Result<Option<String>> {
-        let conn = self.shadow.lock().expect("mutex poisoned");
+        let conn = self.shadow.lock();
         let result = conn.query_row(
             "SELECT record FROM shadow_nodes WHERE id = ?1 AND tombstone = 0",
             [id],
@@ -80,7 +81,7 @@ impl StagingGraph {
 
     /// Check if a node is tombstoned (deleted in staging).
     pub fn is_tombstone(&self, id: &str) -> bool {
-        let conn = self.shadow.lock().expect("mutex poisoned");
+        let conn = self.shadow.lock();
         conn.query_row(
             "SELECT tombstone FROM shadow_nodes WHERE id = ?1",
             [id],
@@ -91,7 +92,7 @@ impl StagingGraph {
 
     /// Clear all staged changes (dirty nodes and tombstones).
     pub fn discard(&self) -> Result<()> {
-        let conn = self.shadow.lock().expect("mutex poisoned");
+        let conn = self.shadow.lock();
         conn.execute("DELETE FROM shadow_nodes", [])?;
         Ok(())
     }
@@ -114,7 +115,7 @@ impl StagingGraph {
     pub fn commit(&self) -> Result<()> {
         let mut edits: Vec<(String, Option<String>)> = Vec::new();
 
-        let conn = self.shadow.lock().expect("mutex poisoned");
+        let conn = self.shadow.lock();
 
         // Collect dirty nodes (modified, non-tombstone)
         {
@@ -165,7 +166,7 @@ impl StagingGraph {
     /// Returns true if the node now exists in shadow, false if not found in live.
     fn cow_into_shadow(&self, id: &str) -> Result<bool> {
         {
-            let conn = self.shadow.lock().expect("mutex poisoned");
+            let conn = self.shadow.lock();
             let exists: bool = conn
                 .query_row("SELECT 1 FROM shadow_nodes WHERE id = ?1", [id], |_| {
                     Ok(true)
@@ -197,7 +198,7 @@ impl StagingGraph {
             None
         };
 
-        let conn = self.shadow.lock().expect("mutex poisoned");
+        let conn = self.shadow.lock();
         conn.execute(
             "INSERT OR IGNORE INTO shadow_nodes \
              (id, parent_id, name, kind, size, mtime, record, tombstone) \
@@ -235,7 +236,7 @@ impl Graph for StagingGraph {
             }));
         }
 
-        let conn = self.shadow.lock().expect("mutex poisoned");
+        let conn = self.shadow.lock();
         let result = conn.query_row(
             "SELECT id, name, kind, size, mtime, tombstone FROM shadow_nodes WHERE id = ?1",
             [id],
@@ -264,7 +265,7 @@ impl Graph for StagingGraph {
     }
 
     fn lookup_child(&self, parent_id: &str, name: &str) -> Result<Option<Node>> {
-        let conn = self.shadow.lock().expect("mutex poisoned");
+        let conn = self.shadow.lock();
         let result = conn.query_row(
             "SELECT id, name, kind, size, mtime, tombstone FROM shadow_nodes \
              WHERE parent_id = ?1 AND name = ?2",
@@ -307,7 +308,7 @@ impl Graph for StagingGraph {
         // Collect shadow entries for this parent
         let shadow_map: HashMap<String, Option<Node>>;
         {
-            let conn = self.shadow.lock().expect("mutex poisoned");
+            let conn = self.shadow.lock();
             let mut stmt = conn.prepare(
                 "SELECT id, name, kind, size, mtime, tombstone \
                  FROM shadow_nodes WHERE parent_id = ?1",
@@ -363,7 +364,7 @@ impl Graph for StagingGraph {
     }
 
     fn read_content(&self, id: &str, buf: &mut [u8], offset: u64) -> Result<usize> {
-        let conn = self.shadow.lock().expect("mutex poisoned");
+        let conn = self.shadow.lock();
         let result = conn.query_row(
             "SELECT record, tombstone FROM shadow_nodes WHERE id = ?1",
             [id],
@@ -399,7 +400,7 @@ impl Graph for StagingGraph {
     fn write_content(&self, id: &str, data: &[u8], offset: u64) -> Result<usize> {
         self.cow_into_shadow(id)?;
 
-        let conn = self.shadow.lock().expect("mutex poisoned");
+        let conn = self.shadow.lock();
         let now = now_nanos();
 
         // Read existing shadow content, patch in the new data
@@ -435,7 +436,7 @@ impl Graph for StagingGraph {
             format!("{parent_id}/{name}")
         };
 
-        let conn = self.shadow.lock().expect("mutex poisoned");
+        let conn = self.shadow.lock();
         let now = now_nanos();
         let kind: i64 = if is_dir { 1 } else { 0 };
 
@@ -473,7 +474,7 @@ impl Graph for StagingGraph {
         }
 
         // Insert/update tombstones in shadow
-        let conn = self.shadow.lock().expect("mutex poisoned");
+        let conn = self.shadow.lock();
         for (nid, parent, name, kind, size) in &to_tombstone {
             conn.execute(
                 "INSERT INTO shadow_nodes \
@@ -498,7 +499,7 @@ impl Graph for StagingGraph {
     fn truncate(&self, id: &str) -> Result<()> {
         self.cow_into_shadow(id)?;
 
-        let conn = self.shadow.lock().expect("mutex poisoned");
+        let conn = self.shadow.lock();
         let now = now_nanos();
         conn.execute(
             "UPDATE shadow_nodes SET record = NULL, size = 0, mtime = ?1 WHERE id = ?2",
@@ -568,7 +569,7 @@ mod tests {
         // the shadow connection.
         let live = test_live();
         let staging = StagingGraph::new(live)?;
-        let conn = staging.shadow.lock().unwrap();
+        let conn = staging.shadow.lock();
         let exists: bool = conn
             .query_row(
                 "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND name=?1",
@@ -855,7 +856,7 @@ mod tests {
 
         // Recreate at same path (INSERT OR REPLACE semantics)
         // The shadow still has the tombstone — we need to un-tombstone it
-        let conn = staging.shadow.lock().unwrap();
+        let conn = staging.shadow.lock();
         conn.execute(
             "UPDATE shadow_nodes SET tombstone = 0, record = NULL, size = 0, mtime = ?1 \
              WHERE id = 'docs/readme'",

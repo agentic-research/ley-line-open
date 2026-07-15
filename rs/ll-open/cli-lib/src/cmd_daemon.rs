@@ -227,7 +227,7 @@ pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result
 
     // Lifecycle state — starts as Initializing, transitions through Parsing /
     // Enriching / Ready / Error. Shared with op_status and background tasks.
-    let state = Arc::new(std::sync::RwLock::new(DaemonState::initializing()));
+    let state = Arc::new(parking_lot::RwLock::new(DaemonState::initializing()));
 
     // 2. Initialize the living database.
     //
@@ -253,8 +253,7 @@ pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result
     let live_conn = match init_living_db(&ctrl_path, &live_db_path, source, language, reset_arena) {
         Ok(conn) => conn,
         Err(e) => {
-            state.write().expect("rwlock write-poisoned").phase =
-                DaemonPhase::Error(format!("init failed: {e:#}"));
+            state.write().phase = DaemonPhase::Error(format!("init failed: {e:#}"));
             return Err(e);
         }
     };
@@ -276,8 +275,7 @@ pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result
     ) {
         Ok(db) => db,
         Err(e) => {
-            state.write().expect("rwlock write-poisoned").phase =
-                DaemonPhase::Error(format!("reader pool init failed: {e:#}"));
+            state.write().phase = DaemonPhase::Error(format!("reader pool init failed: {e:#}"));
             return Err(e);
         }
     };
@@ -286,7 +284,7 @@ pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result
     if let Some(src) = source
         && let Some(sha) = git_head(src)
     {
-        state.write().expect("rwlock write-poisoned").head_sha = Some(sha);
+        state.write().head_sha = Some(sha);
     }
 
     // 4. Event router.
@@ -335,7 +333,7 @@ pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result
     };
     #[cfg(feature = "vec")]
     let embed_queue: crate::daemon::embed::EmbedQueue =
-        Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new()));
+        Arc::new(parking_lot::Mutex::new(std::collections::BinaryHeap::new()));
 
     // Text-search engine: extension provides one (real Witchcraft engine,
     // etc.), or fall back to NullEngine — the daemon op surface is wired
@@ -367,7 +365,7 @@ pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result
         ext: ext.clone(),
         router: router.clone(),
         live_db,
-        enrich_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        enrich_inflight: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
         source_dir: source.map(|p| p.to_path_buf()),
         lang_filter: language.map(|s| s.to_string()),
         enrichment_passes: {
@@ -423,7 +421,7 @@ pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result
     crate::daemon::embed::start_drain(ctx.clone());
 
     // Initial parse (during init_living_db) is done — daemon is ready to serve.
-    state.write().expect("rwlock write-poisoned").phase = DaemonPhase::Ready;
+    state.write().phase = DaemonPhase::Ready;
 
     let sock_path = ctrl_path.with_extension("sock");
     crate::daemon::socket::spawn(ctx.clone(), sock_path.clone());
@@ -636,7 +634,7 @@ pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result
 
     // 12. Graceful shutdown: final snapshot + cleanup.
     {
-        let guard = ctx.live_db.writer.lock().expect("mutex poisoned");
+        let guard = ctx.live_db.writer.lock();
         if let Err(e) = snapshot_to_arena(&guard, &ctrl_path) {
             eprintln!("warn: final snapshot failed: {e:#}");
         } else {
@@ -1059,11 +1057,11 @@ fn try_warm_start_from_arena(
 /// path uses `eprintln!` directly because it has a distinct success
 /// message; this helper is for the fire-and-forget periodic shape.
 pub fn snapshot_or_log(
-    live_db: &std::sync::Mutex<rusqlite::Connection>,
+    live_db: &parking_lot::Mutex<rusqlite::Connection>,
     ctrl_path: &Path,
     label: &str,
 ) {
-    let guard = live_db.lock().expect("mutex poisoned");
+    let guard = live_db.lock();
     if let Err(e) = snapshot_to_arena(&guard, ctrl_path) {
         log::error!("{label}: {e:#}");
     }
@@ -1100,43 +1098,25 @@ pub fn snapshot_or_log(
 /// etc.) which is fine for our case: the daemon initializes schema at
 /// startup then serves data writes; we snapshot after the initial
 /// setup (line 207).
-pub fn read_total_changes(live_db: &std::sync::Mutex<rusqlite::Connection>) -> Option<u64> {
-    use std::sync::TryLockError;
-    match live_db.try_lock() {
-        Ok(guard) => Some(guard.total_changes()),
-        Err(TryLockError::WouldBlock) => None,
-        Err(TryLockError::Poisoned(_)) => None,
-    }
+pub fn read_total_changes(live_db: &parking_lot::Mutex<rusqlite::Connection>) -> Option<u64> {
+    live_db.try_lock().map(|g| g.total_changes())
 }
 
 pub fn try_snapshot_or_log(
-    live_db: &std::sync::Mutex<rusqlite::Connection>,
+    live_db: &parking_lot::Mutex<rusqlite::Connection>,
     ctrl_path: &Path,
     label: &str,
 ) -> bool {
-    use std::sync::TryLockError;
     match live_db.try_lock() {
-        Ok(guard) => {
+        Some(guard) => {
             if let Err(e) = snapshot_to_arena(&guard, ctrl_path) {
                 log::error!("{label}: {e:#}");
             }
             true
         }
-        Err(TryLockError::WouldBlock) => {
+        None => {
             log::debug!("{label}: live_db contended, skipping this tick");
             false
-        }
-        Err(TryLockError::Poisoned(poisoned)) => {
-            // A previous writer panicked. Recover the inner state and
-            // retry once — better to take a single hit than wedge the
-            // snapshot timer permanently. Same recovery strategy as the
-            // embed drainer (294fd6b).
-            log::error!("{label}: live_db mutex poisoned; recovering inner state",);
-            let guard = poisoned.into_inner();
-            if let Err(e) = snapshot_to_arena(&guard, ctrl_path) {
-                log::error!("{label}: post-recovery snapshot failed: {e:#}");
-            }
-            true
         }
     }
 }
@@ -1332,7 +1312,7 @@ async fn git_watch_loop(
                 &last_head[..7.min(last_head.len())],
                 &current_head[..7.min(current_head.len())],
             );
-            ctx.state.write().expect("rwlock write-poisoned").head_sha = Some(current_head.clone());
+            ctx.state.write().head_sha = Some(current_head.clone());
             emitter.emit(
                 "daemon.head.changed",
                 "leyline",
@@ -1362,7 +1342,7 @@ async fn git_watch_loop(
 
         // 3. Incremental reparse, scoped to the dirty set so we don't re-stat
         //    the entire source tree on every tick.
-        ctx.state.write().expect("rwlock write-poisoned").phase = DaemonPhase::Parsing;
+        ctx.state.write().phase = DaemonPhase::Parsing;
         let lang = ctx.lang_filter.as_deref();
         let dirty_vec: Vec<String> = last_dirty.iter().cloned().collect();
         let scope: Option<&[String]> = if dirty_vec.is_empty() {
@@ -1370,7 +1350,7 @@ async fn git_watch_loop(
         } else {
             Some(dirty_vec.as_slice())
         };
-        let guard = ctx.live_db.writer.lock().expect("mutex poisoned");
+        let guard = ctx.live_db.writer.lock();
         match crate::cmd_parse::parse_into_conn(&guard, source_dir, lang, scope) {
             Ok(result) => {
                 if result.parsed > 0 || result.deleted > 0 {
@@ -1385,7 +1365,7 @@ async fn git_watch_loop(
 
                     // 5. Update state + emit events.
                     {
-                        let mut s = ctx.state.write().expect("rwlock write-poisoned");
+                        let mut s = ctx.state.write();
                         s.last_reparse_at_ms = Some(crate::daemon::now_ms());
                         s.phase = DaemonPhase::Ready;
                     }
@@ -1427,12 +1407,12 @@ async fn git_watch_loop(
                     run_watcher_enrichment(&ctx, source_dir, &result.changed_files, &emitter);
                 } else {
                     drop(guard);
-                    ctx.state.write().expect("rwlock write-poisoned").phase = DaemonPhase::Ready;
+                    ctx.state.write().phase = DaemonPhase::Ready;
                 }
             }
             Err(e) => {
                 log::error!("watch reparse failed: {e:#}");
-                ctx.state.write().expect("rwlock write-poisoned").phase =
+                ctx.state.write().phase =
                     DaemonPhase::Error(format!("watch reparse failed: {e:#}"));
             }
         }
@@ -1472,7 +1452,7 @@ pub fn run_watcher_enrichment(
     changed_files: &[String],
     emitter: &crate::daemon::events::EventEmitter,
 ) {
-    ctx.state.write().expect("rwlock write-poisoned").phase = DaemonPhase::Enriching;
+    ctx.state.write().phase = DaemonPhase::Enriching;
 
     let scope: Option<&[String]> = if changed_files.is_empty() {
         None
@@ -1481,7 +1461,7 @@ pub fn run_watcher_enrichment(
     };
 
     let started_ms = crate::daemon::now_ms();
-    let guard = ctx.live_db.writer.lock().expect("mutex poisoned");
+    let guard = ctx.live_db.writer.lock();
     let outcome = crate::daemon::enrichment::run_all(
         &ctx.enrichment_passes,
         &guard,
@@ -1491,7 +1471,7 @@ pub fn run_watcher_enrichment(
     );
     drop(guard);
 
-    ctx.state.write().expect("rwlock write-poisoned").phase = DaemonPhase::Ready;
+    ctx.state.write().phase = DaemonPhase::Ready;
 
     match outcome {
         Ok(stats) => {
@@ -1665,7 +1645,7 @@ pub fn emit_watcher_sheaf_invalidate(
     // cache lock so both sides are consistent to the moment the payload
     // is decided. Never sent on the wire — measurement only.
     let (invalidated, scope, prior_generation, generation, all_known) = {
-        let mut cache = ctx.sheaf.cache().lock().expect("mutex poisoned");
+        let mut cache = ctx.sheaf.cache().lock();
         let all_known: Vec<u32> = cache
             .complex()
             .map(|cx| cx.nodes.clone())
@@ -1784,7 +1764,7 @@ fn git_dirty_files(dir: &Path) -> Result<std::collections::HashSet<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex as StdMutex;
+    use parking_lot::Mutex as StdMutex;
     use tempfile::TempDir;
 
     // ── try_warm_start: error-handling pins ────────────────────────────
@@ -1830,10 +1810,7 @@ mod tests {
         conn.execute_batch("CREATE TABLE t (x INTEGER)").unwrap();
         let live = StdMutex::new(conn);
         let before = read_total_changes(&live).unwrap();
-        live.lock()
-            .unwrap()
-            .execute("INSERT INTO t VALUES (1)", [])
-            .unwrap();
+        live.lock().execute("INSERT INTO t VALUES (1)", []).unwrap();
         let after = read_total_changes(&live).unwrap();
         assert!(
             after > before,
@@ -1849,29 +1826,17 @@ mod tests {
         // stale data, and safer than blocking the tokio worker.
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         let live = StdMutex::new(conn);
-        let _held_guard = live.lock().unwrap();
+        let _held_guard = live.lock();
         assert_eq!(read_total_changes(&live), None);
     }
 
-    #[test]
-    fn read_total_changes_returns_none_when_poisoned() {
-        // Poison recovery is deliberately NOT auto-attempted here.
-        // Poisoned mutex means some earlier writer panicked; the
-        // regular try_snapshot_or_log path already has recovery
-        // logic (line 738-748). The dirty-check just returns None so
-        // the timer treats it as "unknown" — will retry next tick,
-        // and if the snapshot itself is attempted it'll go through
-        // the poisoning recovery path.
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        let live = std::sync::Arc::new(StdMutex::new(conn));
-        let live_thread = live.clone();
-        let handle = std::thread::spawn(move || {
-            let _guard = live_thread.lock().unwrap();
-            panic!("intentionally poison the lock");
-        });
-        let _ = handle.join();
-        assert_eq!(read_total_changes(&live), None);
-    }
+    // The pre-parking_lot poison-return test lived here — deleted
+    // when `live_db` swapped `std::sync::Mutex` → `parking_lot::Mutex`.
+    // parking_lot doesn't poison, so `read_total_changes` returning
+    // None specifically on poison is not expressible. The remaining
+    // contract — `read_total_changes` returns None when the lock is
+    // contended (uncontended → Some(counter)) — is covered by the
+    // `try_snapshot_or_log_*` tests below.
 
     #[test]
     fn try_snapshot_or_log_skips_when_lock_contended() {
@@ -1890,7 +1855,7 @@ mod tests {
         let live_db = StdMutex::new(conn);
 
         // Hold the lock from this thread.
-        let _held_guard = live_db.lock().unwrap();
+        let _held_guard = live_db.lock();
 
         // Now invoke try_snapshot_or_log — it must observe WouldBlock
         // and return false WITHOUT trying to take the lock again
@@ -1902,44 +1867,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn try_snapshot_or_log_recovers_from_poisoned_lock() {
-        // Sister contract: when the lock is poisoned (a previous
-        // writer panicked), the timer recovers via into_inner() and
-        // attempts the snapshot anyway. Same recovery strategy as
-        // the embed drainer (294fd6b). Without recovery, one panic
-        // would wedge the snapshot timer permanently — silent
-        // freshness regression.
-        let dir = TempDir::new().unwrap();
-        let ctrl_path = dir.path().join("poisoned.ctrl");
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        let live_db = std::sync::Arc::new(StdMutex::new(conn));
-
-        // Poison the lock by panicking inside a write guard.
-        let live_db_p = live_db.clone();
-        let join = std::thread::spawn(move || {
-            let _guard = live_db_p.lock().unwrap();
-            panic!("deliberate panic to poison the lock");
-        });
-        let _ = join.join(); // expect panic; ignore result
-
-        // Sanity: lock is poisoned.
-        assert!(
-            live_db.lock().is_err(),
-            "pre-condition: lock should be poisoned"
-        );
-
-        // try_snapshot_or_log MUST recover and attempt the snapshot.
-        // The snapshot itself will fail (no arena registered in this
-        // test), but `try_snapshot_or_log` returns true to indicate
-        // the lock was acquired (via into_inner) and the snapshot was
-        // attempted (and logged as a recoverable failure).
-        let attempted = try_snapshot_or_log(&live_db, &ctrl_path, "poison-recovery test");
-        assert!(
-            attempted,
-            "try_snapshot_or_log must recover from poisoned lock and report attempt",
-        );
-    }
+    // The pre-parking_lot poison-recovery test lived here — deleted
+    // when the daemon swapped `std::sync::Mutex` → `parking_lot::Mutex`
+    // (which never poisons by design). The recovery contract it was
+    // pinning is no longer expressible: `parking_lot::Mutex::lock()`
+    // returns `MutexGuard` directly, so a panic-during-lock leaves no
+    // Err state to recover from — the next lock just proceeds. The
+    // "acquire when uncontended, skip when contended" contract that
+    // matters is still pinned by `try_snapshot_or_log_returns_false_when_lock_held`
+    // above.
 
     #[test]
     fn warm_start_returns_none_on_missing_ctrl() {
@@ -2448,11 +2384,10 @@ mod tests {
         fn on_head_changed(&self, old_sha: &str, new_sha: &str) {
             self.head_changes
                 .lock()
-                .unwrap()
                 .push((old_sha.to_string(), new_sha.to_string()));
         }
         fn on_files_changed(&self, paths: &[String]) {
-            self.file_changes.lock().unwrap().push(paths.to_vec());
+            self.file_changes.lock().push(paths.to_vec());
         }
     }
 
@@ -2515,17 +2450,17 @@ mod tests {
             ext,
             router: crate::daemon::EventRouter::new(64),
             live_db,
-            enrich_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            enrich_inflight: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             source_dir: Some(source.to_path_buf()),
             lang_filter: Some("go".to_string()),
             enrichment_passes: vec![Box::new(crate::daemon::enrichment::TreeSitterPass)],
-            state: Arc::new(std::sync::RwLock::new(DaemonState::initializing())),
+            state: Arc::new(parking_lot::RwLock::new(DaemonState::initializing())),
             #[cfg(feature = "vec")]
             vec_index,
             #[cfg(feature = "vec")]
             embedder,
             #[cfg(feature = "vec")]
-            embed_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
+            embed_queue: Arc::new(parking_lot::Mutex::new(std::collections::BinaryHeap::new())),
             #[cfg(feature = "text-search")]
             text_search: Arc::new(leyline_text_search::null::NullEngine::new()),
             sheaf: Arc::new(crate::daemon::sheaf_ops::SheafState::new()),
@@ -2629,7 +2564,7 @@ mod tests {
         tb.task.abort();
 
         assert!(saw_files_event, "expected daemon.files.changed event");
-        let recorded = tb.ext.file_changes.lock().unwrap();
+        let recorded = tb.ext.file_changes.lock();
         assert!(
             !recorded.is_empty(),
             "expected on_files_changed to be invoked at least once",
@@ -2658,7 +2593,7 @@ mod tests {
         tb.task.abort();
 
         assert!(saw_head_event, "expected daemon.head.changed event");
-        let head_calls = tb.ext.head_changes.lock().unwrap();
+        let head_calls = tb.ext.head_changes.lock();
         assert!(!head_calls.is_empty(), "expected on_head_changed to fire");
         let (_old, new) = head_calls.last().unwrap();
         assert_eq!(new, &new_head, "hook should report the new HEAD sha");

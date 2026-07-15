@@ -65,6 +65,7 @@ host-extras = [
 ]
 
 [dependencies]
+parking_lot = { workspace = true }
 # Shared C-boundary helpers (bead `ley-line-open-85fb1f` PR 2). Zero-dep
 # crate so wasm32 target stays clean.
 leyline-ffi-helpers = { path = "../../ll-core/ffi-helpers" }

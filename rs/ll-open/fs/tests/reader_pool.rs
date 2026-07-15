@@ -5,7 +5,8 @@
 //! through a single writer Mutex. After each write, cached bytes
 //! are refreshed so subsequent readers see mutations.
 
-use std::sync::{Arc, Barrier};
+use std::sync::Arc;
+use std::sync::Barrier;
 use std::thread;
 
 use anyhow::Result;

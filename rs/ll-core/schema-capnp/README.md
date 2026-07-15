@@ -22,6 +22,8 @@ generates its own bindings from the same `.capnp` files.
 | `schemas/ast.capnp` | `AstNode` — tree-sitter projection | T8.3 ✅ |
 | `schemas/source.capnp` | `SourceFile` — canonicalized path, content hash, mtime | T8.3 ✅ |
 | `schemas/head.capnp` | `Head` — Σ root pointer (rootHash, parentHash, generation, segmentBytes) | T8.5 ✅ |
+| `schemas/cache.capnp` | `CacheLockfile` — content-addressed build-cache manifest (ADR-0021) | ✅ |
+| `schemas/net.capnp` | leyline-net generic wire frames: `Manifest`, `ToolCall`, `ToolResult` — canonical home; cloister + rosary vendor from here. Vectors: `schema-spec/leyline-net/v1/` | ley-line-open-083344 ✅ |
 
 Schema-evolution rules: append fields at next `@N` ordinal with default;
 never rename, never repurpose, never re-use ordinals; remove only by

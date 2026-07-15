@@ -33,6 +33,14 @@ const SCHEMA_FILEID_ALLOWLIST: &[(&str, &str)] = &[
     ("common.capnp", "0xb0c0debaadc0deb0"),
     ("go.capnp", "0xd12a1c51fedd6c88"),
     ("head.capnp", "0xc7c7ada1403b9f78"),
+    // Bead ley-line-open-083344 — leyline-net generic wire frames
+    // (Manifest/ToolCall/ToolResult), canonicalized from cloister's
+    // wire/cloister.capnp (@0xa1c0157e2a1e0001). Fresh ID by necessity:
+    // cloister will import this file downstream and two files in one
+    // import graph cannot share an ID. Struct wire bytes are unchanged
+    // (fileId never reaches the wire) — pinned by the leyline-net/v1
+    // vectors + tests/leyline_net_vectors.rs.
+    ("net.capnp", "0xa25bb2a310446125"),
     ("source.capnp", "0x9bd2953355bd438c"),
 ];
 

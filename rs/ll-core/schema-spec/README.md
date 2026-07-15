@@ -26,15 +26,23 @@ that any second implementation can conform to.
   5-file vector bundle under `vectors/`.
 - **`mcp-tool/v1/`** — MCP tool meta-groups wire contract with two
   example vectors.
+- **`leyline-net/v1/`** — the leyline-net generic wire frames
+  (`Manifest` / `ToolCall` / `ToolResult`; schema at
+  `../schema-capnp/schemas/net.capnp`, canonicalized from cloister's
+  `wire/cloister.capnp` — bead `ley-line-open-083344`). Ships 12
+  digest-pinned frame vectors in two byte-forms (reference + strict
+  canonical) under `test-vectors/`.
 
 ## Conformance vectors and `VECTORS.sha256`
 
-Two spec dirs pin their vector bundles with a `VECTORS.sha256` file:
+These spec dirs pin their vector bundles with a `VECTORS.sha256` file:
 
 - `credential-isolation/v1/VECTORS.sha256` — 10 vectors under `test-vectors/`
 - `build-cache/v1/vectors/VECTORS.sha256` — 5 vectors alongside it
+- `confinement/v1/VECTORS.sha256` — canonical `ConfinementManifest` vector
+- `leyline-net/v1/test-vectors/VECTORS.sha256` — 24 frame vectors + digests.json + fixtures.capnp
 
-The crate's `verify_vectors_sha256` test walks both files and re-hashes
+The crate's `verify_vectors_sha256` test walks every listed file and re-hashes
 every listed vector, asserting SHA-256 equality. Any drift between the
 pinned digests and the committed bytes fails `cargo test -p
 leyline-schema-spec`.

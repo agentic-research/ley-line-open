@@ -46,6 +46,7 @@ SCHEMAS=(
     "$REPO_ROOT/rs/ll-core/schema-capnp/schemas/binding.capnp:binding:$REPO_ROOT/rs/ll-core/schema-capnp/schemas"
     "$REPO_ROOT/rs/ll-core/schema-capnp/schemas/cache.capnp:cache:$REPO_ROOT/rs/ll-core/schema-capnp/schemas"
     "$REPO_ROOT/rs/ll-core/schema-capnp/schemas/head.capnp:head:$REPO_ROOT/rs/ll-core/schema-capnp/schemas"
+    "$REPO_ROOT/rs/ll-core/schema-capnp/schemas/net.capnp:net:$REPO_ROOT/rs/ll-core/schema-capnp/schemas"
     "$REPO_ROOT/rs/ll-core/schema-capnp/schemas/source.capnp:source:$REPO_ROOT/rs/ll-core/schema-capnp/schemas"
     "$REPO_ROOT/rs/ll-core/public-schema/capnp/daemon.capnp:daemon:$REPO_ROOT/rs/ll-core/public-schema/capnp"
 )

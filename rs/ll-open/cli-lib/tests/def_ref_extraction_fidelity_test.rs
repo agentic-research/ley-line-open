@@ -665,3 +665,130 @@ fn typescript_arrow_and_function_expression_bindings_extract_as_defs() {
         );
     }
 }
+
+// ── Tier 3 partial algebra: sql + bash (bead ley-line-open-780821) ──────
+//
+// Neither language has a COMPLETE def/ref algebra (upstream ships no
+// tags.scm for either — structural, not incidental), but the partial
+// algebra assessed on bead ley-line-open-e5addb is well-posed: sql DDL
+// names are defs and relation/invocation positions are their use-sites;
+// bash function definitions are defs, statically-named commands are
+// refs, and static `source` paths are imports. Same "supported but
+// silent-empty" gate discipline as the java/c/cpp block above.
+
+#[test]
+fn sql_files_produce_def_ref_rows() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("schema.sql"),
+        b"CREATE TABLE users (id INT PRIMARY KEY, name TEXT);\n\
+          CREATE VIEW active AS SELECT * FROM users;\n\
+          CREATE FUNCTION add_one(x INT) RETURNS INT AS $$ SELECT x + 1 $$ LANGUAGE sql;\n\
+          SELECT add_one(id) FROM users;\n\
+          INSERT INTO users (id, name) VALUES (1, 'a');\n",
+    )
+    .unwrap();
+
+    let conn = cold_parse(dir.path(), Some("sql"));
+
+    let ast_rows = count_rows(
+        &conn,
+        "SELECT COUNT(*) FROM _ast WHERE source_id = 'schema.sql'",
+    );
+    assert!(
+        ast_rows > 0,
+        "SQL file must produce _ast rows (parse pipeline sanity); got {ast_rows}"
+    );
+
+    let def_rows = count_rows(
+        &conn,
+        "SELECT COUNT(*) FROM node_defs WHERE source_id = 'schema.sql'",
+    );
+    assert!(
+        def_rows > 0,
+        "SQL file must produce node_defs rows (users, active, add_one); got {def_rows}. \
+         Symptom: extract_refs dispatcher has no Sql arm."
+    );
+
+    let ref_rows = count_rows(
+        &conn,
+        "SELECT COUNT(*) FROM node_refs WHERE source_id = 'schema.sql'",
+    );
+    assert!(
+        ref_rows > 0,
+        "SQL file must produce node_refs rows (FROM users, INSERT INTO users, add_one call); \
+         got {ref_rows}"
+    );
+
+    let defs = defs_tokens(&conn);
+    for want in ["users", "active", "add_one"] {
+        assert!(
+            defs.contains(&want.to_string()),
+            "missing SQL def token {want:?} in {defs:?}"
+        );
+    }
+}
+
+#[test]
+fn bash_files_produce_def_ref_rows() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("deploy.sh"),
+        b"#!/usr/bin/env bash\n\
+          source ./lib/common.sh\n\
+          build() {\n  make all\n}\n\
+          deploy() {\n  build\n}\n\
+          deploy\n",
+    )
+    .unwrap();
+
+    let conn = cold_parse(dir.path(), Some("bash"));
+
+    let ast_rows = count_rows(
+        &conn,
+        "SELECT COUNT(*) FROM _ast WHERE source_id = 'deploy.sh'",
+    );
+    assert!(
+        ast_rows > 0,
+        "bash file must produce _ast rows (parse pipeline sanity); got {ast_rows}"
+    );
+
+    let def_rows = count_rows(
+        &conn,
+        "SELECT COUNT(*) FROM node_defs WHERE source_id = 'deploy.sh'",
+    );
+    assert!(
+        def_rows > 0,
+        "bash file must produce node_defs rows (build, deploy); got {def_rows}. \
+         Symptom: extract_refs dispatcher has no Bash arm."
+    );
+
+    let ref_rows = count_rows(
+        &conn,
+        "SELECT COUNT(*) FROM node_refs WHERE source_id = 'deploy.sh'",
+    );
+    assert!(
+        ref_rows > 0,
+        "bash file must produce node_refs rows (build + deploy call sites, make); got {ref_rows}"
+    );
+
+    let defs = defs_tokens(&conn);
+    for want in ["build", "deploy"] {
+        assert!(
+            defs.contains(&want.to_string()),
+            "missing bash def token {want:?} in {defs:?}"
+        );
+    }
+
+    let imports: Vec<(String, String)> = conn
+        .prepare("SELECT alias, path FROM _imports ORDER BY path")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert!(
+        imports.contains(&("common.sh".to_string(), "./lib/common.sh".to_string())),
+        "bash static source must land in _imports as (common.sh, ./lib/common.sh); got {imports:?}"
+    );
+}

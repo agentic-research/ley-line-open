@@ -19,7 +19,7 @@ validate = [
     "dep:tree-sitter-elixir",
 ]
 fuse = ["dep:fuser", "dep:libc"]
-nfs = ["dep:nfsserve"]
+nfs = ["dep:nfsserve", "dep:libc"]
 splice = ["dep:leyline-ts"]
 
 [dependencies]

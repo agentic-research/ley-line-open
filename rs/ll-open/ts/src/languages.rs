@@ -74,6 +74,78 @@ pub enum TsLanguage {
     /// symbols to `node_defs` / `node_refs`.
     #[cfg(feature = "typescript")]
     TypeScript,
+    // ── Tier 1+2 grammar bulk (bead ley-line-open-46ae48, parent
+    // e5addb) — the 16 mache-registry languages LLO lacked at mache's
+    // CGO removal. Coverage per language: Tier 1 (parse → `_ast`) +
+    // Tier 2 (validate: ERROR/MISSING enumeration via the daemon
+    // `validate` op). Tier 3 (def/ref extraction) is separate work —
+    // .scm query data over the generic engine — so `canonical_kind`
+    // and `canonical_cfg_kind` return `None` for all of these (the
+    // open-world escape: callers keep the raw grammar kind). ──
+    /// SQL (.sql). DerekStride/tree-sitter-sql (crate
+    /// `tree-sitter-sequel`) — the same grammar mache vendored through
+    /// smacker/go-tree-sitter before its CGO removal, so `_ast` node
+    /// kinds match what mache's sql preset schema was built against.
+    #[cfg(feature = "sql")]
+    Sql,
+    /// Bash / POSIX shell (.sh / .bash).
+    #[cfg(feature = "bash")]
+    Bash,
+    /// Java (.java).
+    #[cfg(feature = "java")]
+    Java,
+    /// C (.c / .h). `.h` maps here, mirroring mache's registry row;
+    /// C++-spelled headers (.hpp/.hxx/.hh) map to `Cpp`.
+    #[cfg(feature = "c")]
+    C,
+    /// C++ (.cpp / .cc / .cxx / .hpp / .hxx / .hh).
+    #[cfg(feature = "cpp")]
+    Cpp,
+    /// TOML (.toml). Config/data language: no def/ref algebra —
+    /// parse/validate only BY DESIGN.
+    #[cfg(feature = "toml")]
+    Toml,
+    /// Dockerfile / Containerfile (.dockerfile + the extensionless
+    /// `Dockerfile` / `Containerfile` filenames via `from_filename`).
+    /// Grammar: wharflab/tree-sitter-containerfile — covers both
+    /// spellings; camdencheek's dockerfile crate is stuck on the
+    /// pre-LanguageFn ABI. Config/data language: no def/ref algebra —
+    /// parse/validate only BY DESIGN.
+    #[cfg(feature = "dockerfile")]
+    Dockerfile,
+    /// Ruby (.rb).
+    #[cfg(feature = "ruby")]
+    Ruby,
+    /// PHP (.php). Uses `LANGUAGE_PHP` — the full grammar with
+    /// `<?php` tags and interleaved HTML, matching how PHP files
+    /// exist on disk. `LANGUAGE_PHP_ONLY` (tagless) is not wired.
+    #[cfg(feature = "php")]
+    Php,
+    /// Kotlin (.kt / .kts). Grammar: tree-sitter-grammars fork
+    /// (crate `tree-sitter-kotlin-ng`); fwcd's original crate is on
+    /// the pre-LanguageFn ABI.
+    #[cfg(feature = "kotlin")]
+    Kotlin,
+    /// Swift (.swift). Grammar: alex-pinkus/tree-sitter-swift.
+    #[cfg(feature = "swift")]
+    Swift,
+    /// Scala (.scala / .sc).
+    #[cfg(feature = "scala")]
+    Scala,
+    /// C# (.cs). Crate `tree-sitter-c-sharp`; canonical name "csharp".
+    #[cfg(feature = "csharp")]
+    CSharp,
+    /// CSS (.css). Stylesheet: no def/ref algebra — parse/validate
+    /// only BY DESIGN.
+    #[cfg(feature = "css")]
+    Css,
+    /// Groovy (.groovy + the extensionless `Jenkinsfile` filename via
+    /// `from_filename`, mirroring mache's sentinel).
+    #[cfg(feature = "groovy")]
+    Groovy,
+    /// Lua (.lua). Grammar: tree-sitter-grammars/tree-sitter-lua.
+    #[cfg(feature = "lua")]
+    Lua,
 }
 
 impl TsLanguage {
@@ -109,6 +181,40 @@ impl TsLanguage {
             // sibling; we don't wire a separate variant for it because
             // the TSX grammar parses plain TypeScript cleanly.
             TsLanguage::TypeScript => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            #[cfg(feature = "sql")]
+            TsLanguage::Sql => tree_sitter_sequel::LANGUAGE.into(),
+            #[cfg(feature = "bash")]
+            TsLanguage::Bash => tree_sitter_bash::LANGUAGE.into(),
+            #[cfg(feature = "java")]
+            TsLanguage::Java => tree_sitter_java::LANGUAGE.into(),
+            #[cfg(feature = "c")]
+            TsLanguage::C => tree_sitter_c::LANGUAGE.into(),
+            #[cfg(feature = "cpp")]
+            TsLanguage::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+            #[cfg(feature = "toml")]
+            TsLanguage::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
+            #[cfg(feature = "dockerfile")]
+            TsLanguage::Dockerfile => tree_sitter_containerfile::LANGUAGE.into(),
+            #[cfg(feature = "ruby")]
+            TsLanguage::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+            #[cfg(feature = "php")]
+            // LANGUAGE_PHP = full PHP with <?php tags + interleaved
+            // HTML; LANGUAGE_PHP_ONLY is the tagless embedded variant.
+            TsLanguage::Php => tree_sitter_php::LANGUAGE_PHP.into(),
+            #[cfg(feature = "kotlin")]
+            TsLanguage::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
+            #[cfg(feature = "swift")]
+            TsLanguage::Swift => tree_sitter_swift::LANGUAGE.into(),
+            #[cfg(feature = "scala")]
+            TsLanguage::Scala => tree_sitter_scala::LANGUAGE.into(),
+            #[cfg(feature = "csharp")]
+            TsLanguage::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+            #[cfg(feature = "css")]
+            TsLanguage::Css => tree_sitter_css::LANGUAGE.into(),
+            #[cfg(feature = "groovy")]
+            TsLanguage::Groovy => tree_sitter_groovy::LANGUAGE.into(),
+            #[cfg(feature = "lua")]
+            TsLanguage::Lua => tree_sitter_lua::LANGUAGE.into(),
         }
     }
 
@@ -144,6 +250,40 @@ impl TsLanguage {
             TsLanguage::JavaScript => "javascript",
             #[cfg(feature = "typescript")]
             TsLanguage::TypeScript => "typescript",
+            #[cfg(feature = "sql")]
+            TsLanguage::Sql => "sql",
+            #[cfg(feature = "bash")]
+            TsLanguage::Bash => "bash",
+            #[cfg(feature = "java")]
+            TsLanguage::Java => "java",
+            #[cfg(feature = "c")]
+            TsLanguage::C => "c",
+            #[cfg(feature = "cpp")]
+            TsLanguage::Cpp => "cpp",
+            #[cfg(feature = "toml")]
+            TsLanguage::Toml => "toml",
+            #[cfg(feature = "dockerfile")]
+            // Canonical name is "dockerfile" (mache's registry row);
+            // "containerfile" is aliased in `from_name`.
+            TsLanguage::Dockerfile => "dockerfile",
+            #[cfg(feature = "ruby")]
+            TsLanguage::Ruby => "ruby",
+            #[cfg(feature = "php")]
+            TsLanguage::Php => "php",
+            #[cfg(feature = "kotlin")]
+            TsLanguage::Kotlin => "kotlin",
+            #[cfg(feature = "swift")]
+            TsLanguage::Swift => "swift",
+            #[cfg(feature = "scala")]
+            TsLanguage::Scala => "scala",
+            #[cfg(feature = "csharp")]
+            TsLanguage::CSharp => "csharp",
+            #[cfg(feature = "css")]
+            TsLanguage::Css => "css",
+            #[cfg(feature = "groovy")]
+            TsLanguage::Groovy => "groovy",
+            #[cfg(feature = "lua")]
+            TsLanguage::Lua => "lua",
         }
     }
 
@@ -351,6 +491,38 @@ impl TsLanguage {
             "javascript" | "js" | "jsx" | "mjs" | "cjs" => Ok(TsLanguage::JavaScript),
             #[cfg(feature = "typescript")]
             "typescript" | "ts" | "tsx" => Ok(TsLanguage::TypeScript),
+            #[cfg(feature = "sql")]
+            "sql" => Ok(TsLanguage::Sql),
+            #[cfg(feature = "bash")]
+            "bash" | "sh" | "shell" => Ok(TsLanguage::Bash),
+            #[cfg(feature = "java")]
+            "java" => Ok(TsLanguage::Java),
+            #[cfg(feature = "c")]
+            "c" | "h" => Ok(TsLanguage::C),
+            #[cfg(feature = "cpp")]
+            "cpp" | "c++" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => Ok(TsLanguage::Cpp),
+            #[cfg(feature = "toml")]
+            "toml" => Ok(TsLanguage::Toml),
+            #[cfg(feature = "dockerfile")]
+            "dockerfile" | "containerfile" | "docker" => Ok(TsLanguage::Dockerfile),
+            #[cfg(feature = "ruby")]
+            "ruby" | "rb" => Ok(TsLanguage::Ruby),
+            #[cfg(feature = "php")]
+            "php" => Ok(TsLanguage::Php),
+            #[cfg(feature = "kotlin")]
+            "kotlin" | "kt" | "kts" => Ok(TsLanguage::Kotlin),
+            #[cfg(feature = "swift")]
+            "swift" => Ok(TsLanguage::Swift),
+            #[cfg(feature = "scala")]
+            "scala" | "sc" => Ok(TsLanguage::Scala),
+            #[cfg(feature = "csharp")]
+            "csharp" | "c#" | "cs" | "c-sharp" | "c_sharp" => Ok(TsLanguage::CSharp),
+            #[cfg(feature = "css")]
+            "css" => Ok(TsLanguage::Css),
+            #[cfg(feature = "groovy")]
+            "groovy" => Ok(TsLanguage::Groovy),
+            #[cfg(feature = "lua")]
+            "lua" => Ok(TsLanguage::Lua),
             _ => bail!("unsupported language: {name}"),
         }
     }
@@ -368,6 +540,16 @@ impl TsLanguage {
             "README" | "CHANGELOG" | "CONTRIBUTING" | "LICENSE.md" => Some(TsLanguage::Markdown),
             #[cfg(feature = "python")]
             "Pipfile" => Some(TsLanguage::Python),
+            // Extensionless container build files (bead
+            // ley-line-open-46ae48). `Dockerfile` is mache's sentinel
+            // for its dockerfile registry row; `Containerfile` is the
+            // OCI spelling — one grammar covers both.
+            #[cfg(feature = "dockerfile")]
+            "Dockerfile" | "Containerfile" => Some(TsLanguage::Dockerfile),
+            // `Jenkinsfile` is a Groovy DSL — mache's sentinel for its
+            // groovy registry row.
+            #[cfg(feature = "groovy")]
+            "Jenkinsfile" => Some(TsLanguage::Groovy),
             _ => None,
         }
     }
@@ -406,6 +588,42 @@ impl TsLanguage {
             // TypeScript syntax and parse identically.
             #[cfg(feature = "typescript")]
             "ts" | "tsx" | "mts" | "cts" => Some(TsLanguage::TypeScript),
+            #[cfg(feature = "sql")]
+            "sql" => Some(TsLanguage::Sql),
+            #[cfg(feature = "bash")]
+            "sh" | "bash" => Some(TsLanguage::Bash),
+            #[cfg(feature = "java")]
+            "java" => Some(TsLanguage::Java),
+            // `.h` maps to C, mirroring mache's registry row; C++
+            // headers spelled .hpp/.hxx/.hh land on Cpp below.
+            #[cfg(feature = "c")]
+            "c" | "h" => Some(TsLanguage::C),
+            #[cfg(feature = "cpp")]
+            "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => Some(TsLanguage::Cpp),
+            #[cfg(feature = "toml")]
+            "toml" => Some(TsLanguage::Toml),
+            // Extension spelling (app.dockerfile); the extensionless
+            // `Dockerfile` / `Containerfile` names go via `from_filename`.
+            #[cfg(feature = "dockerfile")]
+            "dockerfile" => Some(TsLanguage::Dockerfile),
+            #[cfg(feature = "ruby")]
+            "rb" => Some(TsLanguage::Ruby),
+            #[cfg(feature = "php")]
+            "php" => Some(TsLanguage::Php),
+            #[cfg(feature = "kotlin")]
+            "kt" | "kts" => Some(TsLanguage::Kotlin),
+            #[cfg(feature = "swift")]
+            "swift" => Some(TsLanguage::Swift),
+            #[cfg(feature = "scala")]
+            "scala" | "sc" => Some(TsLanguage::Scala),
+            #[cfg(feature = "csharp")]
+            "cs" => Some(TsLanguage::CSharp),
+            #[cfg(feature = "css")]
+            "css" => Some(TsLanguage::Css),
+            #[cfg(feature = "groovy")]
+            "groovy" => Some(TsLanguage::Groovy),
+            #[cfg(feature = "lua")]
+            "lua" => Some(TsLanguage::Lua),
             _ => None,
         }
     }
@@ -727,6 +945,196 @@ mod tests {
         // Unknown extension → None, never default to one language.
         assert_eq!(TsLanguage::from_extension("unknown_lang_ext"), None);
         assert_eq!(TsLanguage::from_extension(""), None);
+    }
+
+    /// Tier 1+2 grammar bulk (bead ley-line-open-46ae48): pin the
+    /// extension alias sets for the 16 languages registered at mache's
+    /// CGO removal. Extension sets mirror mache's `internal/lang`
+    /// Registry rows — dropping one silently skips files at parse time.
+    #[test]
+    fn from_extension_pins_tier12_alias_sets() {
+        #[cfg(feature = "sql")]
+        assert_eq!(TsLanguage::from_extension("sql"), Some(TsLanguage::Sql));
+        #[cfg(feature = "bash")]
+        {
+            assert_eq!(TsLanguage::from_extension("sh"), Some(TsLanguage::Bash));
+            assert_eq!(TsLanguage::from_extension("bash"), Some(TsLanguage::Bash));
+        }
+        #[cfg(feature = "java")]
+        assert_eq!(TsLanguage::from_extension("java"), Some(TsLanguage::Java));
+        #[cfg(feature = "c")]
+        {
+            assert_eq!(TsLanguage::from_extension("c"), Some(TsLanguage::C));
+            // .h maps to C, matching mache's registry row. C++ headers
+            // spelled .hpp/.hxx/.hh land on Cpp below.
+            assert_eq!(TsLanguage::from_extension("h"), Some(TsLanguage::C));
+        }
+        #[cfg(feature = "cpp")]
+        {
+            for ext in ["cpp", "cc", "cxx", "hpp", "hxx", "hh"] {
+                assert_eq!(
+                    TsLanguage::from_extension(ext),
+                    Some(TsLanguage::Cpp),
+                    "extension {ext:?} must resolve to Cpp"
+                );
+            }
+        }
+        #[cfg(feature = "toml")]
+        assert_eq!(TsLanguage::from_extension("toml"), Some(TsLanguage::Toml));
+        #[cfg(feature = "dockerfile")]
+        assert_eq!(
+            TsLanguage::from_extension("dockerfile"),
+            Some(TsLanguage::Dockerfile)
+        );
+        #[cfg(feature = "ruby")]
+        assert_eq!(TsLanguage::from_extension("rb"), Some(TsLanguage::Ruby));
+        #[cfg(feature = "php")]
+        assert_eq!(TsLanguage::from_extension("php"), Some(TsLanguage::Php));
+        #[cfg(feature = "kotlin")]
+        {
+            assert_eq!(TsLanguage::from_extension("kt"), Some(TsLanguage::Kotlin));
+            assert_eq!(TsLanguage::from_extension("kts"), Some(TsLanguage::Kotlin));
+        }
+        #[cfg(feature = "swift")]
+        assert_eq!(TsLanguage::from_extension("swift"), Some(TsLanguage::Swift));
+        #[cfg(feature = "scala")]
+        {
+            assert_eq!(TsLanguage::from_extension("scala"), Some(TsLanguage::Scala));
+            assert_eq!(TsLanguage::from_extension("sc"), Some(TsLanguage::Scala));
+        }
+        #[cfg(feature = "csharp")]
+        assert_eq!(TsLanguage::from_extension("cs"), Some(TsLanguage::CSharp));
+        #[cfg(feature = "css")]
+        assert_eq!(TsLanguage::from_extension("css"), Some(TsLanguage::Css));
+        #[cfg(feature = "groovy")]
+        assert_eq!(
+            TsLanguage::from_extension("groovy"),
+            Some(TsLanguage::Groovy)
+        );
+        #[cfg(feature = "lua")]
+        assert_eq!(TsLanguage::from_extension("lua"), Some(TsLanguage::Lua));
+
+        // Case-insensitivity holds for the new sets too.
+        #[cfg(feature = "sql")]
+        assert_eq!(TsLanguage::from_extension("SQL"), Some(TsLanguage::Sql));
+        #[cfg(feature = "java")]
+        assert_eq!(TsLanguage::from_extension("JAVA"), Some(TsLanguage::Java));
+    }
+
+    /// Tier 1+2 grammar bulk (bead ley-line-open-46ae48): pin the
+    /// `from_name` alias sets. Consumers (mache, daemon callers) pass
+    /// the language tag explicitly; every documented spelling must
+    /// round-trip to the one canonical variant.
+    #[test]
+    fn from_name_pins_tier12_alias_sets() {
+        #[allow(unused)]
+        fn pin(spellings: &[&str], want: TsLanguage) {
+            for s in spellings {
+                let got =
+                    TsLanguage::from_name(s).unwrap_or_else(|e| panic!("from_name({s:?}): {e}"));
+                assert_eq!(got, want, "spelling {s:?} must resolve to {want:?}");
+            }
+        }
+        #[cfg(feature = "sql")]
+        pin(&["sql", "SQL"], TsLanguage::Sql);
+        #[cfg(feature = "bash")]
+        pin(&["bash", "sh", "shell", "Bash"], TsLanguage::Bash);
+        #[cfg(feature = "java")]
+        pin(&["java", "Java"], TsLanguage::Java);
+        #[cfg(feature = "c")]
+        pin(&["c", "C", "h"], TsLanguage::C);
+        #[cfg(feature = "cpp")]
+        pin(
+            &["cpp", "c++", "cc", "cxx", "hpp", "hxx", "hh", "CPP"],
+            TsLanguage::Cpp,
+        );
+        #[cfg(feature = "toml")]
+        pin(&["toml", "TOML"], TsLanguage::Toml);
+        #[cfg(feature = "dockerfile")]
+        pin(
+            &["dockerfile", "containerfile", "docker", "Dockerfile"],
+            TsLanguage::Dockerfile,
+        );
+        #[cfg(feature = "ruby")]
+        pin(&["ruby", "rb", "Ruby"], TsLanguage::Ruby);
+        #[cfg(feature = "php")]
+        pin(&["php", "PHP"], TsLanguage::Php);
+        #[cfg(feature = "kotlin")]
+        pin(&["kotlin", "kt", "kts", "Kotlin"], TsLanguage::Kotlin);
+        #[cfg(feature = "swift")]
+        pin(&["swift", "Swift"], TsLanguage::Swift);
+        #[cfg(feature = "scala")]
+        pin(&["scala", "sc", "Scala"], TsLanguage::Scala);
+        #[cfg(feature = "csharp")]
+        pin(
+            &["csharp", "c#", "cs", "c-sharp", "c_sharp", "CSharp"],
+            TsLanguage::CSharp,
+        );
+        #[cfg(feature = "css")]
+        pin(&["css", "CSS"], TsLanguage::Css);
+        #[cfg(feature = "groovy")]
+        pin(&["groovy", "Groovy"], TsLanguage::Groovy);
+        #[cfg(feature = "lua")]
+        pin(&["lua", "Lua"], TsLanguage::Lua);
+    }
+
+    /// Extensionless well-known filenames (bead ley-line-open-46ae48):
+    /// `Dockerfile` / `Containerfile` (mache sentinel for the dockerfile
+    /// row) and `Jenkinsfile` (mache sentinel for groovy) resolve via
+    /// `from_filename`, since neither carries an extension.
+    #[test]
+    fn from_filename_pins_tier12_well_known_names() {
+        #[cfg(feature = "dockerfile")]
+        {
+            assert_eq!(
+                TsLanguage::from_filename("Dockerfile"),
+                Some(TsLanguage::Dockerfile)
+            );
+            assert_eq!(
+                TsLanguage::from_filename("Containerfile"),
+                Some(TsLanguage::Dockerfile)
+            );
+        }
+        #[cfg(feature = "groovy")]
+        assert_eq!(
+            TsLanguage::from_filename("Jenkinsfile"),
+            Some(TsLanguage::Groovy)
+        );
+    }
+
+    /// Tier 1+2 languages carry no def/ref algebra yet — `canonical_kind`
+    /// returns `None` for every raw kind (the open-world escape), so the
+    /// caller stores raw kinds untouched. For the config/data languages
+    /// (toml, dockerfile, css) this is BY DESIGN — parse/validate only.
+    /// For the code languages (sql, bash, java, c, cpp, ruby, php,
+    /// kotlin, swift, scala, csharp, groovy, lua) Tier 3 lands as .scm
+    /// query data over the generic engine — separate work, never match
+    /// arms here.
+    #[test]
+    fn tier12_languages_have_no_canonical_kind_mapping() {
+        #[allow(unused)]
+        let probe = |lang: TsLanguage| {
+            for raw in ["function_definition", "class_declaration", "block", "table"] {
+                assert_eq!(
+                    lang.canonical_kind(raw),
+                    None,
+                    "{lang:?}: Tier 1+2 languages must not map {raw:?} (no extractor algebra)"
+                );
+            }
+            assert_eq!(lang.canonical_cfg_kind("if_statement"), None);
+        };
+        #[cfg(feature = "sql")]
+        probe(TsLanguage::Sql);
+        #[cfg(feature = "toml")]
+        probe(TsLanguage::Toml);
+        #[cfg(feature = "dockerfile")]
+        probe(TsLanguage::Dockerfile);
+        #[cfg(feature = "css")]
+        probe(TsLanguage::Css);
+        #[cfg(feature = "java")]
+        probe(TsLanguage::Java);
+        #[cfg(feature = "lua")]
+        probe(TsLanguage::Lua);
     }
 
     /// Parses a tiny proto3 fragment end-to-end to verify the

@@ -453,4 +453,430 @@ variable "region" {
             .unwrap();
         assert!(ast_count > 0, ".tfvars _ast should have rows");
     }
+
+    // ── Tier 1+2 grammar bulk (bead ley-line-open-46ae48) ──────────────
+    //
+    // Per-language golden-parse + broken-snippet fixtures for the 16
+    // grammars registered at mache's CGO removal. Tier 1 contract: a
+    // canonical snippet produces `_ast` rows with ZERO `ERROR` nodes.
+    // Tier 2 contract: a broken snippet surfaces `ERROR` nodes in the
+    // parse tree — the same nodes `leyline_fs::validate::
+    // collect_syntax_errors` enumerates and the daemon `validate` op
+    // serializes. ERROR nodes are named, so they land in `_ast` as
+    // `node_kind = 'ERROR'` rows; asserting on `_ast` pins both the
+    // grammar wiring and the projection in one pass.
+
+    /// Golden parse: `src` must produce `_ast` rows and no `ERROR` rows.
+    #[allow(dead_code)] // used only by feature-gated tests below
+    fn assert_golden_parse(lang: TsLanguage, src: &[u8], source_id: &str) {
+        let bytes = parse_with_source(src, lang, source_id).unwrap();
+        assert!(!bytes.is_empty(), "{source_id}: serialized bytes empty");
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        let cursor = Cursor::new(&bytes);
+        conn.deserialize_read_exact("main", cursor, bytes.len(), true)
+            .unwrap();
+
+        let (src_id, db_lang): (String, String) = conn
+            .query_row("SELECT id, language FROM _source LIMIT 1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(src_id, source_id);
+        assert_eq!(db_lang, lang.name());
+
+        let ast_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _ast", [], |r| r.get(0))
+            .unwrap();
+        assert!(ast_count > 0, "{source_id}: _ast should have rows");
+
+        let error_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _ast WHERE node_kind = 'ERROR'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            error_count, 0,
+            "{source_id}: canonical snippet must parse clean (no ERROR nodes)"
+        );
+    }
+
+    /// Broken snippet: the parse must enumerate `ERROR` nodes — the
+    /// substrate the validate op's ERROR/MISSING listing walks.
+    #[allow(dead_code)] // used only by feature-gated tests below
+    fn assert_broken_snippet_enumerates_errors(lang: TsLanguage, src: &[u8], source_id: &str) {
+        let bytes = parse_with_source(src, lang, source_id).unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        let cursor = Cursor::new(&bytes);
+        conn.deserialize_read_exact("main", cursor, bytes.len(), true)
+            .unwrap();
+
+        let error_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _ast WHERE node_kind = 'ERROR'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            error_count > 0,
+            "{source_id}: broken snippet must surface ERROR nodes in _ast"
+        );
+    }
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn round_trip_sql() {
+        assert_golden_parse(
+            TsLanguage::Sql,
+            b"CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);\n\
+              SELECT id, name FROM users WHERE id = 1 ORDER BY name;\n\
+              INSERT INTO users (id, name) VALUES (2, 'ada');\n",
+            "schema.sql",
+        );
+    }
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn sql_broken_snippet_enumerates_errors() {
+        assert_broken_snippet_enumerates_errors(
+            TsLanguage::Sql,
+            b"SELECT FROM WHERE ((;\nINSERT users INTO;\n",
+            "broken.sql",
+        );
+    }
+
+    #[cfg(feature = "bash")]
+    #[test]
+    fn round_trip_bash() {
+        assert_golden_parse(
+            TsLanguage::Bash,
+            b"#!/bin/sh\nset -eu\nfor f in *.txt; do\n  echo \"$f\"\ndone\n\
+              greet() {\n  local name=\"$1\"\n  printf 'hi %s\\n' \"$name\"\n}\n",
+            "script.sh",
+        );
+    }
+
+    #[cfg(feature = "bash")]
+    #[test]
+    fn bash_broken_snippet_enumerates_errors() {
+        assert_broken_snippet_enumerates_errors(
+            TsLanguage::Bash,
+            b"if [ -f x ]; then\ncase esac do done\n",
+            "broken.sh",
+        );
+    }
+
+    #[cfg(feature = "java")]
+    #[test]
+    fn round_trip_java() {
+        assert_golden_parse(
+            TsLanguage::Java,
+            b"package example;\n\npublic class Greeter {\n\
+              \tprivate final String name;\n\
+              \tpublic Greeter(String name) { this.name = name; }\n\
+              \tpublic String hello() { return \"Hello, \" + name; }\n}\n",
+            "Greeter.java",
+        );
+    }
+
+    #[cfg(feature = "java")]
+    #[test]
+    fn java_broken_snippet_enumerates_errors() {
+        assert_broken_snippet_enumerates_errors(
+            TsLanguage::Java,
+            b"public class { void ??? (((\n",
+            "Broken.java",
+        );
+    }
+
+    #[cfg(feature = "c")]
+    #[test]
+    fn round_trip_c() {
+        assert_golden_parse(
+            TsLanguage::C,
+            b"#include <stdio.h>\n\nint add(int a, int b) { return a + b; }\n\n\
+              int main(void) {\n\tprintf(\"%d\\n\", add(1, 2));\n\treturn 0;\n}\n",
+            "main.c",
+        );
+    }
+
+    #[cfg(feature = "c")]
+    #[test]
+    fn c_broken_snippet_enumerates_errors() {
+        assert_broken_snippet_enumerates_errors(
+            TsLanguage::C,
+            b"int main( { return 0; }}}\n",
+            "broken.c",
+        );
+    }
+
+    #[cfg(feature = "cpp")]
+    #[test]
+    fn round_trip_cpp() {
+        assert_golden_parse(
+            TsLanguage::Cpp,
+            b"#include <string>\n\nnamespace example {\n\
+              class Greeter {\n public:\n\
+              \texplicit Greeter(std::string name) : name_(std::move(name)) {}\n\
+              \tstd::string hello() const { return \"Hello, \" + name_; }\n\
+              private:\n\tstd::string name_;\n};\n}  // namespace example\n",
+            "greeter.cpp",
+        );
+    }
+
+    #[cfg(feature = "cpp")]
+    #[test]
+    fn cpp_broken_snippet_enumerates_errors() {
+        assert_broken_snippet_enumerates_errors(
+            TsLanguage::Cpp,
+            b"class { void ??? (((\n",
+            "broken.cpp",
+        );
+    }
+
+    #[cfg(feature = "toml")]
+    #[test]
+    fn round_trip_toml() {
+        assert_golden_parse(
+            TsLanguage::Toml,
+            b"[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n\
+              [dependencies]\nserde = { version = \"1\", features = [\"derive\"] }\n",
+            "Cargo.toml",
+        );
+    }
+
+    #[cfg(feature = "toml")]
+    #[test]
+    fn toml_broken_snippet_enumerates_errors() {
+        assert_broken_snippet_enumerates_errors(
+            TsLanguage::Toml,
+            b"key = = value\n[[[\n= no_key\n",
+            "broken.toml",
+        );
+    }
+
+    #[cfg(feature = "dockerfile")]
+    #[test]
+    fn round_trip_dockerfile() {
+        assert_golden_parse(
+            TsLanguage::Dockerfile,
+            b"FROM alpine:3.20 AS build\nRUN apk add --no-cache curl\n\
+              COPY . /app\nWORKDIR /app\nENV MODE=release\n\
+              CMD [\"/app/run\"]\n",
+            "app.dockerfile",
+        );
+    }
+
+    #[cfg(feature = "dockerfile")]
+    #[test]
+    fn dockerfile_broken_snippet_enumerates_errors() {
+        assert_broken_snippet_enumerates_errors(
+            TsLanguage::Dockerfile,
+            b"FROM\nCOPY\n<<<???\n",
+            "broken.dockerfile",
+        );
+    }
+
+    #[cfg(feature = "ruby")]
+    #[test]
+    fn round_trip_ruby() {
+        assert_golden_parse(
+            TsLanguage::Ruby,
+            b"class Greeter\n  def initialize(name)\n    @name = name\n  end\n\n  \
+              def hello\n    \"Hello, #{@name}!\"\n  end\nend\n",
+            "greeter.rb",
+        );
+    }
+
+    #[cfg(feature = "ruby")]
+    #[test]
+    fn ruby_broken_snippet_enumerates_errors() {
+        assert_broken_snippet_enumerates_errors(
+            TsLanguage::Ruby,
+            b"def end (((\nclass 42\n",
+            "broken.rb",
+        );
+    }
+
+    #[cfg(feature = "php")]
+    #[test]
+    fn round_trip_php() {
+        assert_golden_parse(
+            TsLanguage::Php,
+            b"<?php\n\nfunction greet(string $name): string {\n\
+              \treturn \"Hello, {$name}!\";\n}\n\necho greet(\"ada\");\n",
+            "greet.php",
+        );
+    }
+
+    #[cfg(feature = "php")]
+    #[test]
+    fn php_broken_snippet_enumerates_errors() {
+        assert_broken_snippet_enumerates_errors(
+            TsLanguage::Php,
+            b"<?php function ( { }\n",
+            "broken.php",
+        );
+    }
+
+    #[cfg(feature = "kotlin")]
+    #[test]
+    fn round_trip_kotlin() {
+        assert_golden_parse(
+            TsLanguage::Kotlin,
+            b"package example\n\ndata class Greeter(val name: String) {\n\
+              \tfun hello(): String = \"Hello, $name!\"\n}\n\n\
+              fun main() {\n\tprintln(Greeter(\"ada\").hello())\n}\n",
+            "Greeter.kt",
+        );
+    }
+
+    #[cfg(feature = "kotlin")]
+    #[test]
+    fn kotlin_broken_snippet_enumerates_errors() {
+        assert_broken_snippet_enumerates_errors(
+            TsLanguage::Kotlin,
+            b"fun ( { val = }\n",
+            "Broken.kt",
+        );
+    }
+
+    #[cfg(feature = "swift")]
+    #[test]
+    fn round_trip_swift() {
+        assert_golden_parse(
+            TsLanguage::Swift,
+            b"struct Greeter {\n\tlet name: String\n\n\
+              \tfunc hello() -> String {\n\t\treturn \"Hello, \\(name)!\"\n\t}\n}\n\n\
+              let g = Greeter(name: \"ada\")\nprint(g.hello())\n",
+            "greeter.swift",
+        );
+    }
+
+    #[cfg(feature = "swift")]
+    #[test]
+    fn swift_broken_snippet_enumerates_errors() {
+        assert_broken_snippet_enumerates_errors(
+            TsLanguage::Swift,
+            b"func { let = ) }\n",
+            "broken.swift",
+        );
+    }
+
+    #[cfg(feature = "scala")]
+    #[test]
+    fn round_trip_scala() {
+        assert_golden_parse(
+            TsLanguage::Scala,
+            b"package example\n\ncase class Greeter(name: String) {\n\
+              \tdef hello: String = s\"Hello, $name!\"\n}\n\n\
+              object Main extends App {\n\tprintln(Greeter(\"ada\").hello)\n}\n",
+            "Greeter.scala",
+        );
+    }
+
+    #[cfg(feature = "scala")]
+    #[test]
+    fn scala_broken_snippet_enumerates_errors() {
+        assert_broken_snippet_enumerates_errors(
+            TsLanguage::Scala,
+            b"class { def = )\n",
+            "Broken.scala",
+        );
+    }
+
+    #[cfg(feature = "csharp")]
+    #[test]
+    fn round_trip_csharp() {
+        assert_golden_parse(
+            TsLanguage::CSharp,
+            b"namespace Example;\n\npublic class Greeter\n{\n\
+              \tprivate readonly string _name;\n\
+              \tpublic Greeter(string name) => _name = name;\n\
+              \tpublic string Hello() => $\"Hello, {_name}!\";\n}\n",
+            "Greeter.cs",
+        );
+    }
+
+    #[cfg(feature = "csharp")]
+    #[test]
+    fn csharp_broken_snippet_enumerates_errors() {
+        assert_broken_snippet_enumerates_errors(
+            TsLanguage::CSharp,
+            b"public class { void ??? (((\n",
+            "Broken.cs",
+        );
+    }
+
+    #[cfg(feature = "css")]
+    #[test]
+    fn round_trip_css() {
+        assert_golden_parse(
+            TsLanguage::Css,
+            b".greeter {\n\tcolor: #333;\n\tmargin: 0 auto;\n}\n\n\
+              @media (max-width: 600px) {\n\t.greeter { display: none; }\n}\n",
+            "style.css",
+        );
+    }
+
+    #[cfg(feature = "css")]
+    #[test]
+    fn css_broken_snippet_enumerates_errors() {
+        assert_broken_snippet_enumerates_errors(
+            TsLanguage::Css,
+            b"a { color: ; } } }\n@media {{{\n",
+            "broken.css",
+        );
+    }
+
+    #[cfg(feature = "groovy")]
+    #[test]
+    fn round_trip_groovy() {
+        assert_golden_parse(
+            TsLanguage::Groovy,
+            // Plain constructor call: murtaza64/tree-sitter-groovy 0.1
+            // does not parse Groovy's named-argument constructor sugar
+            // (`new Greeter(name: 'ada')` yields an ERROR node).
+            b"class Greeter {\n\tString name\n\n\
+              \tString hello() {\n\t\treturn \"Hello, ${name}!\"\n\t}\n}\n\n\
+              def g = new Greeter()\nprintln(g.hello())\n",
+            "Greeter.groovy",
+        );
+    }
+
+    #[cfg(feature = "groovy")]
+    #[test]
+    fn groovy_broken_snippet_enumerates_errors() {
+        assert_broken_snippet_enumerates_errors(
+            TsLanguage::Groovy,
+            b"def ( {{{ )))\n",
+            "Broken.groovy",
+        );
+    }
+
+    #[cfg(feature = "lua")]
+    #[test]
+    fn round_trip_lua() {
+        assert_golden_parse(
+            TsLanguage::Lua,
+            b"local Greeter = {}\nGreeter.__index = Greeter\n\n\
+              function Greeter.new(name)\n\tlocal self = setmetatable({}, Greeter)\n\
+              \tself.name = name\n\treturn self\nend\n\n\
+              function Greeter:hello()\n\treturn \"Hello, \" .. self.name\nend\n",
+            "greeter.lua",
+        );
+    }
+
+    #[cfg(feature = "lua")]
+    #[test]
+    fn lua_broken_snippet_enumerates_errors() {
+        assert_broken_snippet_enumerates_errors(
+            TsLanguage::Lua,
+            b"function end (((\n",
+            "broken.lua",
+        );
+    }
 }

@@ -1818,22 +1818,25 @@ fn op_leyline_version() -> Result<String> {
 ///   ley-line-open-fa8638, kept for wire compat: `[]` when ok, else
 ///   exactly one `{line, col, message: "syntax error"}` entry.
 ///
-/// Either `language` (extension key per `language_for_extension`) or
-/// `path` (extension extracted) must be supplied; if both are present,
-/// `language` wins. Unknown/unsupported languages return the daemon's
-/// structured error envelope (`{ok: false, error: "..."}`), never a
-/// panic. `content` is UTF-8 source text on the wire.
+/// Either `language` (a `language_for_extension` key or any
+/// `TsLanguage::from_name` spelling — see `validate_language_by_name`)
+/// or `path` (extension extracted; extensionless well-known names like
+/// `Dockerfile` resolve via `TsLanguage::from_filename`) must be
+/// supplied; if both are present, `language` wins. Unknown/unsupported
+/// languages return the daemon's structured error envelope
+/// (`{ok: false, error: "..."}`), never a panic. `content` is UTF-8
+/// source text on the wire.
 ///
 /// Mirrors mache's `writeback/validate.go` so mache can drop the
 /// CGO tree-sitter link (mache-36d961 item A5 / mache-37ae8b).
 #[cfg(feature = "validate")]
 fn op_validate(req: &ValidateRequest) -> Result<String> {
-    use leyline_fs::validate::{collect_syntax_errors, language_for_extension, language_for_node};
+    use leyline_fs::validate::collect_syntax_errors;
 
     let lang = match (req.language.as_deref(), req.path.as_deref()) {
-        (Some(l), _) => language_for_extension(l)
+        (Some(l), _) => validate_language_by_name(l)
             .ok_or_else(|| anyhow::anyhow!("unknown language id: `{l}`"))?,
-        (None, Some(p)) => language_for_node(p, None).ok_or_else(|| {
+        (None, Some(p)) => validate_language_by_path(p).ok_or_else(|| {
             anyhow::anyhow!("cannot determine language from path `{p}` (no recognized extension)")
         })?,
         (None, None) => {
@@ -1922,6 +1925,41 @@ fn op_validate(req: &ValidateRequest) -> Result<String> {
         response["ast"] = ast_payload;
     }
     Ok(response.to_string())
+}
+
+/// Resolve a `validate` grammar from an explicit language tag (bead
+/// ley-line-open-46ae48). `leyline_fs::validate::language_for_extension`
+/// answers first — it preserves the pre-existing grammar choices for
+/// the built-in six (notably `LANGUAGE_TYPESCRIPT` for plain `.ts`,
+/// where `TsLanguage` wires the TSX superset). Everything else falls
+/// back to `TsLanguage::from_name`, so every Tier-1 grammar leyline-ts
+/// registers validates through the daemon with no per-language
+/// duplication in leyline-fs.
+#[cfg(feature = "validate")]
+fn validate_language_by_name(l: &str) -> Option<tree_sitter::Language> {
+    leyline_fs::validate::language_for_extension(l).or_else(|| {
+        leyline_ts::languages::TsLanguage::from_name(l)
+            .ok()
+            .map(|t| t.ts_language())
+    })
+}
+
+/// Resolve a `validate` grammar from a node path (bead
+/// ley-line-open-46ae48). Same two-stage scheme as
+/// `validate_language_by_name`: leyline-fs's `language_for_node`
+/// first, then `TsLanguage::from_extension` for extensions the fs set
+/// lacks, then `TsLanguage::from_filename` for extensionless
+/// well-known names (`Dockerfile`, `Jenkinsfile`).
+#[cfg(feature = "validate")]
+fn validate_language_by_path(p: &str) -> Option<tree_sitter::Language> {
+    leyline_fs::validate::language_for_node(p, None).or_else(|| {
+        let name = p.rsplit('/').next().unwrap_or(p);
+        let ts_lang = match name.rfind('.') {
+            Some(dot) => leyline_ts::languages::TsLanguage::from_extension(&name[dot + 1..]),
+            None => leyline_ts::languages::TsLanguage::from_filename(name),
+        };
+        ts_lang.map(|t| t.ts_language())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -4632,6 +4670,8 @@ mod tests {
 
     /// `path`-based inference with an unrecognized extension is also a
     /// structured error, not a false ok (bead ley-line-open-736800).
+    /// (`.txt` here — `.toml`, the original example, became a supported
+    /// language in the Tier 1+2 grammar bulk, bead ley-line-open-46ae48.)
     #[cfg(feature = "validate")]
     #[tokio::test]
     async fn validate_op_unknown_path_extension_structured_error() {
@@ -4640,8 +4680,8 @@ mod tests {
             &ctx,
             "validate",
             &json!({
-                "content": "key = value\n",
-                "path": "config/settings.toml",
+                "content": "free-form prose\n",
+                "path": "notes/readme.txt",
             }),
         )
         .expect("validate op should be dispatched (error path is still a response)");
@@ -4679,6 +4719,78 @@ mod tests {
             json!(true),
             "valid Rust via path should return ok=true; got {v}"
         );
+    }
+
+    /// Tier 1+2 grammar bulk (bead ley-line-open-46ae48): the daemon
+    /// `validate` op resolves languages beyond leyline-fs's built-in
+    /// six by falling back to `TsLanguage` — proven here for sql, the
+    /// top-priority language of the bulk. Valid SQL via the `language`
+    /// tag returns the same `{ok, errors, diagnostics}` contract mache
+    /// writeback codes against.
+    #[cfg(feature = "validate")]
+    #[tokio::test]
+    async fn validate_op_sql_valid_returns_ok_true() {
+        let (_dir, ctx) = setup();
+        let response = handle_base_op_legacy(
+            &ctx,
+            "validate",
+            &json!({
+                "content": "SELECT id, name FROM users WHERE id = 1;\n",
+                "language": "sql",
+            }),
+        )
+        .expect("validate op should be dispatched");
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["ok"], json!(true), "valid SQL should be ok=true; got {v}");
+        assert_eq!(v["errors"], json!([]), "valid SQL: empty errors; got {v}");
+        assert_eq!(
+            v["diagnostics"],
+            json!([]),
+            "valid SQL: empty diagnostics; got {v}"
+        );
+    }
+
+    /// Same bulk (bead ley-line-open-46ae48): broken SQL through the
+    /// daemon path enumerates positioned ERROR/MISSING nodes — the
+    /// Tier 2 contract — and resolves via `path` extension, the shape
+    /// mache writeback actually sends.
+    #[cfg(feature = "validate")]
+    #[tokio::test]
+    async fn validate_op_sql_path_enumerates_errors() {
+        let (_dir, ctx) = setup();
+        let content = "SELECT FROM WHERE ((;\n";
+        let response = handle_base_op_legacy(
+            &ctx,
+            "validate",
+            &json!({
+                "content": content,
+                "path": "migrations/001_init.sql",
+            }),
+        )
+        .expect("validate op should be dispatched");
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            v["ok"],
+            json!(false),
+            "broken SQL should be ok=false; got {v}"
+        );
+        let errors = v["errors"].as_array().expect("errors must be an array");
+        assert!(
+            !errors.is_empty(),
+            "broken SQL must enumerate ERROR/MISSING nodes; got {v}"
+        );
+        for e in errors {
+            let byte_start = e["byte_start"].as_u64().expect("`byte_start` required");
+            let byte_end = e["byte_end"].as_u64().expect("`byte_end` required");
+            assert!(
+                byte_start <= byte_end && byte_end <= content.len() as u64,
+                "byte range must lie within the buffer; got {e}"
+            );
+            assert!(
+                e["message"].as_str().is_some_and(|m| !m.is_empty()),
+                "error must carry a non-empty message; got {e}"
+            );
+        }
     }
 
     /// `validate` requires either `language` or `path`; missing both is

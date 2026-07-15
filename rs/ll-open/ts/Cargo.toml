@@ -41,6 +41,44 @@ javascript = ["dep:tree-sitter-javascript"]
 # one grammar covers both .ts and .tsx uniformly, matching how the
 # `javascript` variant covers .js/.jsx/.mjs/.cjs.
 typescript = ["dep:tree-sitter-typescript"]
+# ── Tier 1+2 grammar bulk (bead ley-line-open-46ae48, parent e5addb) ──
+# 16 of the 17 mache-registry languages LLO lacked at mache's CGO
+# removal. Tier 1 = parse → _ast; Tier 2 = validate (ERROR/MISSING
+# enumeration via the daemon validate op). Tier 3 (.scm def/ref
+# queries) is separate work — no extractors here. cue is SKIPPED:
+# the only crates.io crate (tree-sitter-cue 0.0.1) pins pre-LanguageFn
+# tree-sitter ~0.20.3 and no maintained alternative exists.
+#
+# SQL uses DerekStride/tree-sitter-sql (crate name `tree-sitter-sequel`)
+# — the same grammar mache vendored through smacker/go-tree-sitter
+# pre-CGO-removal (parser.c fingerprints: keyword_* token vocabulary).
+sql = ["dep:tree-sitter-sequel"]
+bash = ["dep:tree-sitter-bash"]
+java = ["dep:tree-sitter-java"]
+c = ["dep:tree-sitter-c"]
+cpp = ["dep:tree-sitter-cpp"]
+# Feature `toml` gates the tree-sitter TOML grammar
+# (tree-sitter-grammars/tree-sitter-toml, crate `tree-sitter-toml-ng`).
+# Distinct from the optional `toml` crate below (a serde TOML parser),
+# which only the `pyproject` feature pulls via `dep:toml`.
+toml = ["dep:tree-sitter-toml-ng"]
+# Dockerfile grammar: wharflab/tree-sitter-containerfile (Containerfile
+# is the OCI spelling; the grammar covers Dockerfiles identically).
+# camdencheek's `tree-sitter-dockerfile` crate is 0.2.0 on the
+# pre-LanguageFn ABI (tree-sitter ^0.20 as a normal dep) — unusable
+# against workspace tree-sitter 0.26.
+dockerfile = ["dep:tree-sitter-containerfile"]
+ruby = ["dep:tree-sitter-ruby"]
+php = ["dep:tree-sitter-php"]
+# Kotlin: tree-sitter-grammars fork (crate `tree-sitter-kotlin-ng`);
+# fwcd's original `tree-sitter-kotlin` crate is on the old ABI.
+kotlin = ["dep:tree-sitter-kotlin-ng"]
+swift = ["dep:tree-sitter-swift"]
+scala = ["dep:tree-sitter-scala"]
+csharp = ["dep:tree-sitter-c-sharp"]
+css = ["dep:tree-sitter-css"]
+groovy = ["dep:tree-sitter-groovy"]
+lua = ["dep:tree-sitter-lua"]
 pyproject = ["dep:uv-pep508", "dep:uv-pep440", "dep:uv-normalize", "dep:toml"]
 
 [dependencies]
@@ -61,6 +99,25 @@ tree-sitter-javascript = { version = "0.25", optional = true }
 # grammar tracks the same `tree-sitter-language` ABI, so it links cleanly
 # against the workspace tree-sitter.
 tree-sitter-typescript = { version = "0.23", optional = true }
+# Tier 1+2 grammar bulk (bead ley-line-open-46ae48) — pinned to the
+# minor line verified against tree-sitter 0.26 (all expose LanguageFn
+# via tree-sitter-language ^0.1).
+tree-sitter-sequel = { version = "0.3", optional = true }
+tree-sitter-bash = { version = "0.25", optional = true }
+tree-sitter-java = { version = "0.23", optional = true }
+tree-sitter-c = { version = "0.24", optional = true }
+tree-sitter-cpp = { version = "0.23", optional = true }
+tree-sitter-toml-ng = { version = "0.7", optional = true }
+tree-sitter-containerfile = { version = "0.9", optional = true }
+tree-sitter-ruby = { version = "0.23", optional = true }
+tree-sitter-php = { version = "0.24", optional = true }
+tree-sitter-kotlin-ng = { version = "1.1", optional = true }
+tree-sitter-swift = { version = "0.7", optional = true }
+tree-sitter-scala = { version = "0.26", optional = true }
+tree-sitter-c-sharp = { version = "0.23", optional = true }
+tree-sitter-css = { version = "0.25", optional = true }
+tree-sitter-groovy = { version = "0.1", optional = true }
+tree-sitter-lua = { version = "0.5", optional = true }
 leyline-schema = { path = "../../ll-core/schema" }
 # Bead ley-line-open-46f7d1 (T1.b3): the CFG builder computes a
 # content-addressed hash for function-body subtrees via the Σ substrate's

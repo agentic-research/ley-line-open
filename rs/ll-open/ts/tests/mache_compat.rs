@@ -1,6 +1,10 @@
 //! Integration test: produce a .db that mache can consume.
 //! Validates the ley-line → mache contract: nodes + _ast + _source tables.
 
+// The fixture is Go source; without the `go` feature there is no
+// `TsLanguage::Go` variant to compile against.
+#![cfg(feature = "go")]
+
 use rusqlite::Connection;
 
 #[test]

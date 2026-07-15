@@ -792,3 +792,99 @@ fn bash_files_produce_def_ref_rows() {
         "bash static source must land in _imports as (common.sh, ./lib/common.sh); got {imports:?}"
     );
 }
+
+// ── Structural qualifier on node_refs (bead ley-line-open-4dde42) ───────
+
+/// `(token, qualifier)` pairs for one source file — the structural-
+/// qualifier probe. Bare-token rows of qualified calls carry the
+/// receiver/selector text; qualified-token rows and genuinely bare
+/// calls carry NULL.
+fn refs_with_qualifier(conn: &Connection, source_id: &str) -> Vec<(String, Option<String>)> {
+    conn.prepare("SELECT token, qualifier FROM node_refs WHERE source_id = ?1 ORDER BY token")
+        .unwrap()
+        .query_map([source_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+}
+
+#[test]
+fn python_refs_carry_structural_qualifier() {
+    // `obj.method()` dual-emits `obj.method` + `method`; the bare row
+    // must carry qualifier 'obj' so package-scoped rules resolve the
+    // receiver through _imports without string-splitting tokens.
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("q.py"),
+        b"def f(obj):\n    obj.method()\n    plain()\n",
+    )
+    .unwrap();
+
+    let conn = cold_parse(dir.path(), Some("python"));
+    let refs = refs_with_qualifier(&conn, "q.py");
+    assert!(
+        refs.contains(&("method".to_string(), Some("obj".to_string()))),
+        "bare row of obj.method() must carry qualifier 'obj'; got {refs:?}"
+    );
+    assert!(
+        refs.contains(&("obj.method".to_string(), None)),
+        "qualified row must carry NULL qualifier; got {refs:?}"
+    );
+    assert!(
+        refs.contains(&("plain".to_string(), None)),
+        "bare call must carry NULL qualifier; got {refs:?}"
+    );
+}
+
+#[test]
+fn javascript_refs_carry_structural_qualifier() {
+    // Member calls: `a.b.c()` dual-emits `a.b.c` + `c`; the bare row
+    // carries the FULL object expression 'a.b'.
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("q.js"),
+        b"function f(a) {\n  a.b.c();\n  plain();\n}\n",
+    )
+    .unwrap();
+
+    let conn = cold_parse(dir.path(), Some("javascript"));
+    let refs = refs_with_qualifier(&conn, "q.js");
+    assert!(
+        refs.contains(&("c".to_string(), Some("a.b".to_string()))),
+        "bare row of a.b.c() must carry qualifier 'a.b'; got {refs:?}"
+    );
+    assert!(
+        refs.contains(&("a.b.c".to_string(), None)),
+        "qualified row must carry NULL qualifier; got {refs:?}"
+    );
+    assert!(
+        refs.contains(&("plain".to_string(), None)),
+        "bare call must carry NULL qualifier; got {refs:?}"
+    );
+}
+
+#[test]
+fn typescript_refs_carry_structural_qualifier() {
+    // Same member-call algebra as JS, through the TSX grammar.
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("q.ts"),
+        b"function f(logger: Logger) {\n  logger.warn('x');\n  plain();\n}\n",
+    )
+    .unwrap();
+
+    let conn = cold_parse(dir.path(), Some("typescript"));
+    let refs = refs_with_qualifier(&conn, "q.ts");
+    assert!(
+        refs.contains(&("warn".to_string(), Some("logger".to_string()))),
+        "bare row of logger.warn() must carry qualifier 'logger'; got {refs:?}"
+    );
+    assert!(
+        refs.contains(&("logger.warn".to_string(), None)),
+        "qualified row must carry NULL qualifier; got {refs:?}"
+    );
+    assert!(
+        refs.contains(&("plain".to_string(), None)),
+        "bare call must carry NULL qualifier; got {refs:?}"
+    );
+}

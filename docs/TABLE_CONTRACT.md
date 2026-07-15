@@ -28,8 +28,8 @@ Produced by `parse_into_conn`. Always present.
 | `nodes` | Hierarchical node tree (id, parent_id, name, kind, size, record) |
 | `_ast` | AST positions (node_id → source_id, node_kind, byte/row/col ranges) |
 | `_source` | Source file metadata (id → language, abs path) |
-| `node_refs` | Token references (token → node_id, source_id, node_hash) |
-| `node_defs` | Token definitions (token → node_id, source_id, node_hash) |
+| `node_refs` | Token references (token → node_id, source_id, node_hash, container_node_id, qualifier). `qualifier` (v0.7.9, bead `ley-line-open-4dde42`) = receiver/selector text on the BARE-token row of a qualified call's dual-emit pair (`fmt.Println(..)` → the `Println` row carries `'fmt'`); NULL on the qualified-token row and on bare calls — one row per qualified call site carries the structural (name, qualifier) pair. |
+| `node_defs` | Token definitions (token → node_id, source_id, node_hash, container_node_id, canonical_kind). No `qualifier` column — qualified defs stay token-only dual-emits (`Server.Validate` + `Validate`). |
 | `_imports` | Import statements (alias, path, source_id) |
 | `_file_index` | Incremental parse index (path → mtime, size) |
 | `_meta` | Key-value metadata (source_root, parse_time, version vectors) |

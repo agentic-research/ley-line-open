@@ -38,7 +38,13 @@ use tree_sitter::Node;
 ///   both languages previously emitted nothing, and the bump forces
 ///   existing arenas to re-derive so .sql/.sh files gain their
 ///   def/ref/import rows on binary upgrade.
-pub const EXTRACTION_EPOCH: u64 = 3;
+/// - 4: structural `qualifier` on node_refs (bead
+///   `ley-line-open-4dde42`). The bare-token row of a qualified call's
+///   dual-emit pair now carries the receiver/selector text in a new
+///   nullable `node_refs.qualifier` column. Emission change with
+///   byte-identical sources — without the bump, an upgraded arena keeps
+///   serving all-NULL qualifiers forever.
+pub const EXTRACTION_EPOCH: u64 = 4;
 
 /// Effective extraction epoch: `LLO_EXTRACTION_EPOCH` overrides the
 /// compile-time constant so one test binary can act as two releases
@@ -83,11 +89,22 @@ pub enum ExtractedRef {
         canonical_kind: Option<&'static str>,
     },
     /// A call-site reference.
+    ///
+    /// `qualifier` (bead `ley-line-open-4dde42`) is the syntactic
+    /// receiver/selector text of a qualified call site, carried on the
+    /// BARE-token row of the engine's dual-emit pair (`fmt.Println(..)`
+    /// → the `Println` row carries `Some("fmt")`). The qualified-token
+    /// row (`fmt.Println`) and genuinely bare calls carry `None` —
+    /// exactly one row per qualified call site holds the structural
+    /// (name, qualifier) pair, so consumers (mache's `fatal_call`
+    /// qualifier JOIN `_imports.alias`, `fan_out_skew`'s mention arm)
+    /// can GROUP BY/filter without string-splitting tokens.
     Ref {
         token: String,
         node_id: String,
         source_id: String,
         container_node_id: Option<String>,
+        qualifier: Option<String>,
     },
     /// An import alias→path mapping. No `container_node_id` — imports
     /// are file-scope by construction; a "container" is not
@@ -127,12 +144,14 @@ pub fn insert_extracted_refs(
                 node_id,
                 source_id,
                 container_node_id,
+                qualifier,
             } => crate::schema::insert_ref(
                 conn,
                 token,
                 node_id,
                 source_id,
                 container_node_id.as_deref(),
+                qualifier.as_deref(),
             )?,
             ExtractedRef::Import {
                 alias,
@@ -1156,6 +1175,23 @@ pub fn extract_bash(
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Shared fixture probe (bead `ley-line-open-4dde42`): every `(token,
+/// qualifier)` pair in `node_refs`. Each language test module pulls
+/// this in via `use super::*;` to pin the structural-qualifier shape —
+/// bare-token row carries the qualifier text, qualified-token row and
+/// genuinely bare calls carry NULL.
+#[cfg(test)]
+#[allow(dead_code)]
+fn refs_with_qualifier(conn: &rusqlite::Connection) -> Vec<(String, Option<String>)> {
+    let mut stmt = conn
+        .prepare("SELECT token, qualifier FROM node_refs ORDER BY token")
+        .expect("node_refs must have the qualifier column (bead ley-line-open-4dde42)");
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .expect("query node_refs (token, qualifier)")
+        .map(|r| r.expect("row decode"))
+        .collect()
+}
+
 #[cfg(test)]
 #[cfg(feature = "go")]
 mod tests {
@@ -1355,6 +1391,50 @@ var _ = New(middleware)
             );
         }
     }
+
+    // ── Structural qualifier column (bead ley-line-open-4dde42) ────────
+
+    /// The BARE-token row of a qualified call's dual-emit pair carries
+    /// the receiver/selector text in `node_refs.qualifier`; the
+    /// QUALIFIED-token row and genuinely bare calls carry NULL. Exactly
+    /// one row per qualified call site holds the structural
+    /// (name, qualifier) pair, so package-scoped consumer rules
+    /// (mache's fatal_call qualifier JOIN _imports.alias) can GROUP
+    /// BY/filter without string-splitting tokens.
+    #[test]
+    fn qualifier_column_bare_row_of_dual_emit() {
+        let src =
+            b"package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"hello\")\n\tAdd()\n}\n";
+        let (conn, tree) = parse_go(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let refs = refs_with_qualifier(&conn);
+        assert!(
+            refs.contains(&("Println".to_string(), Some("fmt".to_string()))),
+            "bare row of fmt.Println must carry qualifier 'fmt'; got {refs:?}"
+        );
+        assert!(
+            refs.contains(&("fmt.Println".to_string(), None)),
+            "qualified row must carry NULL qualifier (its token embeds it); got {refs:?}"
+        );
+        assert!(
+            refs.contains(&("Add".to_string(), None)),
+            "bare call must carry NULL qualifier; got {refs:?}"
+        );
+    }
+
+    /// Chained selectors: the qualifier is the FULL operand text, same
+    /// text the dual-emit joins into the qualified token.
+    #[test]
+    fn qualifier_column_chained_selector_operand() {
+        let src = b"package main\n\nfunc f(a A) {\n\ta.b.Func()\n}\n";
+        let (conn, tree) = parse_go(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let refs = refs_with_qualifier(&conn);
+        assert!(
+            refs.contains(&("Func".to_string(), Some("a.b".to_string()))),
+            "chained selector must carry the full operand 'a.b'; got {refs:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1528,6 +1608,29 @@ mod java_tests {
             imports.len(),
             3,
             "wildcard import must not emit: {imports:?}"
+        );
+    }
+
+    /// Structural qualifier column (bead `ley-line-open-4dde42`): the
+    /// bare-token row of a receiver invocation carries the receiver
+    /// text; the qualified row and receiverless calls carry NULL.
+    #[test]
+    fn qualifier_column_on_receiver_invocations() {
+        let src = b"class A { void f(Helper h) { h.work(); go(); } }";
+        let (conn, tree) = parse_java(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let refs = refs_with_qualifier(&conn);
+        assert!(
+            refs.contains(&("work".to_string(), Some("h".to_string()))),
+            "bare row of h.work() must carry qualifier 'h'; got {refs:?}"
+        );
+        assert!(
+            refs.contains(&("h.work".to_string(), None)),
+            "qualified row must carry NULL qualifier; got {refs:?}"
+        );
+        assert!(
+            refs.contains(&("go".to_string(), None)),
+            "receiverless call must carry NULL qualifier; got {refs:?}"
         );
     }
 }
@@ -1852,6 +1955,29 @@ mod cpp_tests {
             "missing quoted include: {imports:?}"
         );
     }
+
+    /// Structural qualifier column (bead `ley-line-open-4dde42`) on the
+    /// `::` separator: the bare-token row of `geo::sync()` carries
+    /// qualifier 'geo'; the qualified row and bare calls carry NULL.
+    #[test]
+    fn qualifier_column_on_namespace_qualified_calls() {
+        let src = b"void f() { geo::sync(); render(); }";
+        let (conn, tree) = parse_cpp(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let refs = refs_with_qualifier(&conn);
+        assert!(
+            refs.contains(&("sync".to_string(), Some("geo".to_string()))),
+            "bare row of geo::sync() must carry qualifier 'geo'; got {refs:?}"
+        );
+        assert!(
+            refs.contains(&("geo::sync".to_string(), None)),
+            "qualified row must carry NULL qualifier; got {refs:?}"
+        );
+        assert!(
+            refs.contains(&("render".to_string(), None)),
+            "bare call must carry NULL qualifier; got {refs:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2052,6 +2178,30 @@ mod rust_tests {
         assert!(
             imports.is_empty(),
             "wildcard must not produce import: {imports:?}"
+        );
+    }
+
+    /// Structural qualifier column (bead `ley-line-open-4dde42`) on the
+    /// `::` separator: the bare-token row of a scoped call carries the
+    /// FULL path text ('std::process' for std::process::exit); the
+    /// qualified row and bare calls carry NULL.
+    #[test]
+    fn qualifier_column_on_scoped_calls() {
+        let src = b"fn main() { std::process::exit(0); helper(); }\n";
+        let (conn, tree) = parse_rust(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let refs = refs_with_qualifier(&conn);
+        assert!(
+            refs.contains(&("exit".to_string(), Some("std::process".to_string()))),
+            "bare row of std::process::exit() must carry qualifier 'std::process'; got {refs:?}"
+        );
+        assert!(
+            refs.contains(&("std::process::exit".to_string(), None)),
+            "qualified row must carry NULL qualifier; got {refs:?}"
+        );
+        assert!(
+            refs.contains(&("helper".to_string(), None)),
+            "bare call must carry NULL qualifier; got {refs:?}"
         );
     }
 }
@@ -2314,6 +2464,30 @@ mod sql_tests {
         walk_and_insert(tree.root_node(), src, &conn, "");
         let imports = all_imports(&conn);
         assert!(imports.is_empty(), "sql must emit no imports: {imports:?}");
+    }
+
+    /// Structural qualifier column (bead `ley-line-open-4dde42`) on the
+    /// schema-dot separator: the bare-token row of a schema-qualified
+    /// relation ref carries the schema name; the qualified row and
+    /// unqualified relations carry NULL.
+    #[test]
+    fn qualifier_column_on_schema_qualified_relations() {
+        let src = b"SELECT id FROM analytics.events;\nSELECT id FROM users;\n";
+        let (conn, tree) = parse_sql(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let refs = refs_with_qualifier(&conn);
+        assert!(
+            refs.contains(&("events".to_string(), Some("analytics".to_string()))),
+            "bare row of analytics.events must carry qualifier 'analytics'; got {refs:?}"
+        );
+        assert!(
+            refs.contains(&("analytics.events".to_string(), None)),
+            "qualified row must carry NULL qualifier; got {refs:?}"
+        );
+        assert!(
+            refs.contains(&("users".to_string(), None)),
+            "unqualified relation must carry NULL qualifier; got {refs:?}"
+        );
     }
 }
 

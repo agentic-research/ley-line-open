@@ -229,6 +229,54 @@ pub fn extract_refs(
     }
 }
 
+/// Effective per-language extraction for the content-addressing fold:
+/// an arena-resident TRUSTED override engine when `queries` carries one
+/// for `language`, else the compiled-in default (via [`extract_refs`]).
+/// Bead `ley-line-open-e72629`.
+///
+/// An override REPLACES the compiled `.scm`-driven emission; the
+/// query-inexpressible imperative arms above (`extract_rust` use-lists,
+/// `extract_python` from-imports, qualified `Class.method` defs, JS/TS κ
+/// fixups) do NOT re-run under an override — an operator shipping an
+/// override owns the complete emission for that language. Lossless for
+/// the pure-delegate languages (Go / C / SQL / Bash); see the module
+/// header of [`crate::query_engine`].
+///
+/// When an override engine trips its resource bounds on `node`, `bounds`
+/// is set and an empty vec is returned — the caller drops this file's
+/// facts (no facts for this file), never hangs, never emits partial rows.
+#[allow(clippy::too_many_arguments)]
+pub fn extract_refs_resolved(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    node_id: &str,
+    source_id: &str,
+    language: crate::languages::TsLanguage,
+    container_node_id: Option<&str>,
+    queries: &crate::query_engine::QuerySet,
+    bounds: &std::cell::Cell<bool>,
+) -> Vec<ExtractedRef> {
+    match queries.override_engine(language) {
+        Some(engine) => {
+            match engine.extract_bounded(node, source, node_id, source_id, container_node_id) {
+                Ok(v) => v,
+                Err(_) => {
+                    bounds.set(true);
+                    Vec::new()
+                }
+            }
+        }
+        None => extract_refs(
+            node,
+            source,
+            node_id,
+            source_id,
+            language,
+            container_node_id,
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Go extractor
 // ---------------------------------------------------------------------------

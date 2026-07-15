@@ -10,6 +10,10 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Extraction-rules changes now invalidate derived facts**. `node_defs` / `node_refs` / `_imports` are keyed on `node_hash` — a fold over source bytes only — so upgrading to a binary with different `extract_*` emission (v0.7.8's keyed_element/argument_list refs did exactly this) left existing arenas serving stale rows until source bytes happened to change; the sheaf saw no change to invalidate. `parse_into_conn` now stamps the extraction epoch that produced the current facts (`_meta.extraction_epoch`; new `EXTRACTION_EPOCH` constant in `leyline-ts::refs`, superseded by the query_set_hash when queries-as-data lands under bead `ley-line-open-206d53`) and disables the mtime+size unchanged-skip for the whole pass when the stored epoch disagrees — including pre-epoch arenas with no row. One full-tree pass re-derives everything; same-epoch incremental skip is unchanged, and the epoch is deliberately not folded into `node_hash` (parse identity stays decoupled from extraction version). New F6 gate `f6_extraction_epoch_invalidation.rs`. No change to the tables mache reads. Bead `ley-line-open-20988a`.
+
 ## [0.7.9] — 2026-07-15
 
 **Fix the `nfs`-only feature build + guard it with a CI regression.**

@@ -24,7 +24,16 @@ use tree_sitter::Node;
 /// Deliberately NOT folded into `node_hash` itself — that would couple
 /// parse identity to extraction version and kill content dedup across
 /// versions.
-pub const EXTRACTION_EPOCH: u64 = 1;
+///
+/// History:
+/// - 1: initial epoch (bead `ley-line-open-20988a`).
+/// - 2: Tier 3 queries for java/c/cpp (bead `ley-line-open-5e21c2`).
+///   These languages previously emitted NOTHING, so no existing rows
+///   are wrong — but the epoch gate is what forces the re-derivation
+///   pass that picks the new java/c/cpp facts up on binary upgrade;
+///   without the bump, an existing arena keeps serving zero symbols
+///   for those files forever.
+pub const EXTRACTION_EPOCH: u64 = 2;
 
 /// Effective extraction epoch: `LLO_EXTRACTION_EPOCH` overrides the
 /// compile-time constant so one test binary can act as two releases
@@ -171,6 +180,18 @@ pub fn extract_refs(
         #[cfg(feature = "typescript")]
         crate::languages::TsLanguage::TypeScript => {
             extract_typescript(node, source, node_id, source_id, container_node_id)
+        }
+        #[cfg(feature = "java")]
+        crate::languages::TsLanguage::Java => {
+            extract_java(node, source, node_id, source_id, container_node_id)
+        }
+        #[cfg(feature = "c")]
+        crate::languages::TsLanguage::C => {
+            extract_c(node, source, node_id, source_id, container_node_id)
+        }
+        #[cfg(feature = "cpp")]
+        crate::languages::TsLanguage::Cpp => {
+            extract_cpp(node, source, node_id, source_id, container_node_id)
         }
         _ => Vec::new(),
     }
@@ -783,6 +804,261 @@ pub fn extract_typescript(
 }
 
 // ---------------------------------------------------------------------------
+// Java extractor
+// ---------------------------------------------------------------------------
+
+/// Extract Java definitions, call references, and imports from a single
+/// AST node. Pure data — no DB access, safe for parallel use.
+///
+/// First query-native language (bead `ley-line-open-5e21c2`): the
+/// per-language knowledge lives in `queries/java/tags.scm` with no
+/// preceding imperative extractor — the `.scm` is the extractor,
+/// compiled once and interpreted by the generic
+/// [`QueryEngine`](crate::query_engine::QueryEngine). One arm is
+/// outside the anchored-query vocabulary and stays imperative:
+/// qualified `Type.method` defs read the type name from an ANCESTOR
+/// class/interface/enum/record body, and tree-sitter patterns match
+/// downward only — same leak as `rust_impl_receiver` /
+/// `python_enclosing_class` / `js_ts_context_fixups`. Emission behavior
+/// is pinned by the `java_tests` fixtures below and cli-lib's
+/// `def_ref_extraction_fidelity_test` — edit the `.scm`, keep the
+/// fixtures green.
+#[cfg(feature = "java")]
+pub fn extract_java(
+    node: &Node,
+    source: &[u8],
+    node_id: &str,
+    source_id: &str,
+    container_node_id: Option<&str>,
+) -> Vec<ExtractedRef> {
+    use std::sync::OnceLock;
+    static ENGINE: OnceLock<crate::query_engine::QueryEngine> = OnceLock::new();
+    let mut out = Vec::new();
+
+    // Upward-context arm: the qualified def precedes the bare def the
+    // `.scm` emits — qualified-first ordering, same as the engine's
+    // own dual-emit.
+    if node.kind() == "method_declaration"
+        && let Some(name_node) = node.child_by_field_name("name")
+        && let Ok(name) = name_node.utf8_text(source)
+        && !name.is_empty()
+        && let Some(ty) = java_enclosing_type(node, source)
+    {
+        out.push(ExtractedRef::Def {
+            token: format!("{ty}.{name}"),
+            node_id: node_id.to_string(),
+            source_id: source_id.to_string(),
+            container_node_id: container_node_id.map(str::to_string),
+            canonical_kind: crate::languages::TsLanguage::Java.canonical_kind(node.kind()),
+        });
+    }
+
+    out.extend(
+        ENGINE
+            .get_or_init(|| {
+                crate::query_engine::QueryEngine::new(
+                    crate::languages::TsLanguage::Java,
+                    include_str!("../queries/java/tags.scm"),
+                )
+                .expect("compiled-in queries/java/tags.scm must compile against tree-sitter-java")
+            })
+            .extract(node, source, node_id, source_id, container_node_id),
+    );
+    out
+}
+
+/// Return the enclosing type declaration's name when `method_node` (a
+/// `method_declaration`) is a member. Two parent-chain shapes cover
+/// every body that can hold a method_declaration:
+///
+/// - `method_declaration → class_body|interface_body →
+///   class|interface|record_declaration` (a record's body is a
+///   `class_body`)
+/// - `method_declaration → enum_body_declarations → enum_body →
+///   enum_declaration`
+///
+/// Returns `None` when the chain doesn't match (anonymous-class bodies
+/// hang off `object_creation_expression`, which has no `name` field —
+/// those methods emit bare only). Bead `ley-line-open-5e21c2`.
+#[cfg(feature = "java")]
+fn java_enclosing_type(method_node: &Node, source: &[u8]) -> Option<String> {
+    let body = method_node.parent()?;
+    let decl = match body.kind() {
+        "class_body" | "interface_body" => body.parent()?,
+        "enum_body_declarations" => {
+            let enum_body = body.parent()?;
+            if enum_body.kind() != "enum_body" {
+                return None;
+            }
+            enum_body.parent()?
+        }
+        _ => return None,
+    };
+    if !matches!(
+        decl.kind(),
+        "class_declaration" | "interface_declaration" | "enum_declaration" | "record_declaration"
+    ) {
+        return None;
+    }
+    let name = decl.child_by_field_name("name")?.utf8_text(source).ok()?;
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C extractor
+// ---------------------------------------------------------------------------
+
+/// Extract C definitions, call references, and `#include` imports from
+/// a single AST node. Pure data — no DB access, safe for parallel use.
+///
+/// Query-native language (bead `ley-line-open-5e21c2`): the
+/// per-language knowledge lives in `queries/c/tags.scm` — this is a
+/// pure engine delegate with no imperative arm. Extraction reads the
+/// tree-sitter parse at face value: macro-produced defs are invisible,
+/// inactive-`#ifdef` defs still emit (limitation documented in the
+/// `.scm` header). Emission behavior is pinned by the `c_tests`
+/// fixtures below and cli-lib's `def_ref_extraction_fidelity_test` —
+/// edit the `.scm`, keep the fixtures green.
+#[cfg(feature = "c")]
+pub fn extract_c(
+    node: &Node,
+    source: &[u8],
+    node_id: &str,
+    source_id: &str,
+    container_node_id: Option<&str>,
+) -> Vec<ExtractedRef> {
+    use std::sync::OnceLock;
+    static ENGINE: OnceLock<crate::query_engine::QueryEngine> = OnceLock::new();
+    ENGINE
+        .get_or_init(|| {
+            crate::query_engine::QueryEngine::new(
+                crate::languages::TsLanguage::C,
+                include_str!("../queries/c/tags.scm"),
+            )
+            .expect("compiled-in queries/c/tags.scm must compile against tree-sitter-c")
+        })
+        .extract(node, source, node_id, source_id, container_node_id)
+}
+
+// ---------------------------------------------------------------------------
+// C++ extractor
+// ---------------------------------------------------------------------------
+
+/// Extract C++ definitions, call references, and `#include` imports
+/// from a single AST node. Pure data — no DB access, safe for parallel
+/// use.
+///
+/// Query-native language (bead `ley-line-open-5e21c2`): the
+/// per-language knowledge lives in `queries/cpp/tags.scm` (the C query
+/// plus class/namespace/`::` patterns), compiled once and interpreted
+/// by the generic [`QueryEngine`](crate::query_engine::QueryEngine).
+/// One arm is outside the anchored-query vocabulary and stays
+/// imperative: qualified `Class::method` defs for IN-CLASS members
+/// (declaration or inline definition) read the class name from an
+/// ANCESTOR class/struct body, and tree-sitter patterns match downward
+/// only — same leak as `rust_impl_receiver` / `python_enclosing_class`
+/// / `js_ts_context_fixups`. Out-of-line `Class::method` definitions
+/// need no fixup: the qualified_identifier is a CHILD of the
+/// declarator, so the `.scm` dual-emits them directly. Preprocessor
+/// limitation as in C (documented in the `.scm` header). Emission
+/// behavior is pinned by the `cpp_tests` fixtures below and cli-lib's
+/// `def_ref_extraction_fidelity_test` — edit the `.scm`, keep the
+/// fixtures green.
+#[cfg(feature = "cpp")]
+pub fn extract_cpp(
+    node: &Node,
+    source: &[u8],
+    node_id: &str,
+    source_id: &str,
+    container_node_id: Option<&str>,
+) -> Vec<ExtractedRef> {
+    use std::sync::OnceLock;
+    static ENGINE: OnceLock<crate::query_engine::QueryEngine> = OnceLock::new();
+    let mut out = ENGINE
+        .get_or_init(|| {
+            crate::query_engine::QueryEngine::new(
+                crate::languages::TsLanguage::Cpp,
+                include_str!("../queries/cpp/tags.scm"),
+            )
+            .expect("compiled-in queries/cpp/tags.scm must compile against tree-sitter-cpp")
+        })
+        .extract(node, source, node_id, source_id, container_node_id);
+
+    // Upward-context arm: in-class members name themselves with a
+    // field_identifier; the `.scm`'s field_identifier pattern emits
+    // exactly one bare-name def, and this prepends the qualified form
+    // (qualified first, bare second — same dual-emit order as the
+    // engine's own `@qualifier` rule). Out-of-line qualified defs
+    // never enter: their declarator is a qualified_identifier, not a
+    // field_identifier.
+    if node.kind() == "function_declarator"
+        && node
+            .child_by_field_name("declarator")
+            .is_some_and(|d| d.kind() == "field_identifier")
+        && let Some(cls) = cpp_enclosing_class(node, source)
+        && let Some(ExtractedRef::Def {
+            token,
+            node_id,
+            source_id,
+            container_node_id,
+            canonical_kind,
+        }) = out.first()
+    {
+        let qualified = ExtractedRef::Def {
+            token: format!("{cls}::{token}"),
+            node_id: node_id.clone(),
+            source_id: source_id.clone(),
+            container_node_id: container_node_id.clone(),
+            canonical_kind: *canonical_kind,
+        };
+        out.insert(0, qualified);
+    }
+    out
+}
+
+/// Return the enclosing class/struct/union name when `decl_node` (a
+/// `function_declarator` naming a field_identifier) is an in-class
+/// member. Two parent-chain shapes:
+///
+/// - inline definition: `function_declarator → function_definition →
+///   field_declaration_list → class_specifier|struct_specifier|…`
+/// - declaration only: `function_declarator → field_declaration →
+///   field_declaration_list → …`
+///
+/// Returns `None` when the chain doesn't match (anonymous classes have
+/// no `name` field; lambdas and function pointers never reach here —
+/// their declarators aren't field_identifiers). Bead
+/// `ley-line-open-5e21c2`.
+#[cfg(feature = "cpp")]
+fn cpp_enclosing_class(decl_node: &Node, source: &[u8]) -> Option<String> {
+    let member = decl_node.parent()?;
+    if !matches!(member.kind(), "function_definition" | "field_declaration") {
+        return None;
+    }
+    let body = member.parent()?;
+    if body.kind() != "field_declaration_list" {
+        return None;
+    }
+    let cls = body.parent()?;
+    if !matches!(
+        cls.kind(),
+        "class_specifier" | "struct_specifier" | "union_specifier"
+    ) {
+        return None;
+    }
+    let name = cls.child_by_field_name("name")?.utf8_text(source).ok()?;
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -984,6 +1260,503 @@ var _ = New(middleware)
                 "expected ref `{expected}` missing; got {refs:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "java")]
+mod java_tests {
+    use super::*;
+    use crate::schema::{create_ast_schema, create_refs_schema};
+    use rusqlite::Connection;
+    use tree_sitter::Parser;
+
+    fn parse_java(src: &[u8]) -> (Connection, tree_sitter::Tree) {
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_schema(&conn).unwrap();
+        create_refs_schema(&conn).unwrap();
+        let mut parser = Parser::new();
+        let lang: tree_sitter::Language = tree_sitter_java::LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        (conn, tree)
+    }
+
+    // Dispatches through `extract_refs` (not a direct extractor call) so
+    // the test also gates the factory arm — a query-native language with
+    // no dispatch arm silently extracts nothing.
+    fn walk_and_insert(node: tree_sitter::Node, src: &[u8], conn: &Connection, prefix: &str) {
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                let child = cursor.node();
+                if child.is_named() {
+                    let id = format!("{prefix}/{}", child.kind());
+                    let refs = extract_refs(
+                        &child,
+                        src,
+                        &id,
+                        "Test.java",
+                        crate::languages::TsLanguage::Java,
+                        None,
+                    );
+                    insert_extracted_refs(conn, &refs).unwrap();
+                    walk_and_insert(child, src, conn, &id);
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn all_defs(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT token FROM node_defs ORDER BY token")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn all_refs(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT token FROM node_refs ORDER BY token")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn all_imports(conn: &Connection) -> Vec<(String, String)> {
+        let mut stmt = conn
+            .prepare("SELECT alias, path FROM _imports ORDER BY path")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn extract_type_defs() {
+        // All four Java type-declaration shapes emit defs.
+        let src = b"class Server {}\ninterface Handler {}\nenum Color { RED }\nrecord Point(int x, int y) {}\n";
+        let (conn, tree) = parse_java(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let defs = all_defs(&conn);
+        for want in ["Server", "Handler", "Color", "Point"] {
+            assert!(
+                defs.contains(&want.to_string()),
+                "missing type def {want:?}: {defs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_method_defs_are_qualified() {
+        // Methods dual-emit `Type.method` + `method` across all the
+        // bodies that can hold a method_declaration: class_body,
+        // interface_body, and enum_body_declarations.
+        let src = b"class Server { void validate() {} }\ninterface Handler { void handle(); }\nenum Color { RED; void paint() {} }\n";
+        let (conn, tree) = parse_java(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let defs = all_defs(&conn);
+        for want in [
+            "Server.validate",
+            "validate",
+            "Handler.handle",
+            "handle",
+            "Color.paint",
+            "paint",
+        ] {
+            assert!(
+                defs.contains(&want.to_string()),
+                "missing method def {want:?}: {defs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_call_refs_dual_emit_receiver() {
+        // Bare invocation emits the bare name; receiver invocations
+        // dual-emit `receiver.method` + `method` — the receiver is the
+        // `object` field of ANY kind, so `this.cfg.batch()` emits
+        // `this.cfg.batch` + `batch`. Constructor calls (`new Point`)
+        // are the call-sites for classes; mache's dead_code rule needs
+        // the ref.
+        let src =
+            b"class A { void m() { helper(); obj.run(); this.cfg.batch(); new Point(1, 2); } }";
+        let (conn, tree) = parse_java(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let refs = all_refs(&conn);
+        for want in [
+            "helper",
+            "run",
+            "obj.run",
+            "batch",
+            "this.cfg.batch",
+            "Point",
+        ] {
+            assert!(
+                refs.contains(&want.to_string()),
+                "missing call ref {want:?}: {refs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_imports_skip_wildcards() {
+        // Scoped imports alias to the last `.` segment; static imports
+        // ride the same scoped_identifier shape; a bare `import foo;`
+        // is its own alias. `import java.util.*;` matches nothing —
+        // a wildcard has no addressable alias (same rule as Rust's
+        // `use foo::*`).
+        let src = b"import java.util.List;\nimport static java.lang.Math.max;\nimport foo;\nimport java.util.*;\nclass A {}\n";
+        let (conn, tree) = parse_java(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let imports = all_imports(&conn);
+        assert!(
+            imports.contains(&("List".to_string(), "java.util.List".to_string())),
+            "missing scoped import: {imports:?}"
+        );
+        assert!(
+            imports.contains(&("max".to_string(), "java.lang.Math.max".to_string())),
+            "missing static import: {imports:?}"
+        );
+        assert!(
+            imports.contains(&("foo".to_string(), "foo".to_string())),
+            "missing bare import: {imports:?}"
+        );
+        assert_eq!(
+            imports.len(),
+            3,
+            "wildcard import must not emit: {imports:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "c")]
+mod c_tests {
+    use super::*;
+    use crate::schema::{create_ast_schema, create_refs_schema};
+    use rusqlite::Connection;
+    use tree_sitter::Parser;
+
+    fn parse_c(src: &[u8]) -> (Connection, tree_sitter::Tree) {
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_schema(&conn).unwrap();
+        create_refs_schema(&conn).unwrap();
+        let mut parser = Parser::new();
+        let lang: tree_sitter::Language = tree_sitter_c::LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        (conn, tree)
+    }
+
+    // Dispatches through `extract_refs` — see java_tests::walk_and_insert.
+    fn walk_and_insert(node: tree_sitter::Node, src: &[u8], conn: &Connection, prefix: &str) {
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                let child = cursor.node();
+                if child.is_named() {
+                    let id = format!("{prefix}/{}", child.kind());
+                    let refs = extract_refs(
+                        &child,
+                        src,
+                        &id,
+                        "test.c",
+                        crate::languages::TsLanguage::C,
+                        None,
+                    );
+                    insert_extracted_refs(conn, &refs).unwrap();
+                    walk_and_insert(child, src, conn, &id);
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn all_defs(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT token FROM node_defs ORDER BY token")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn all_refs(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT token FROM node_refs ORDER BY token")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn all_imports(conn: &Connection) -> Vec<(String, String)> {
+        let mut stmt = conn
+            .prepare("SELECT alias, path FROM _imports ORDER BY path")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn extract_function_defs_and_prototypes() {
+        // Anchoring at `function_declarator` covers definitions AND
+        // prototypes (declaration-only), and a pointer-returning
+        // definition whose function_declarator nests inside a
+        // pointer_declarator.
+        let src =
+            b"int add(int a, int b);\nint add(int a, int b) { return a + b; }\nint *alloc(void) { return 0; }\n";
+        let (conn, tree) = parse_c(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let defs = all_defs(&conn);
+        assert!(defs.contains(&"add".to_string()), "missing add: {defs:?}");
+        assert!(
+            defs.contains(&"alloc".to_string()),
+            "missing pointer-return alloc: {defs:?}"
+        );
+    }
+
+    #[test]
+    fn extract_type_defs() {
+        // struct/union/enum specifiers with a BODY are defs; a bodyless
+        // `struct Node` usage inside the typedef emits only through the
+        // type_definition anchor.
+        let src = b"struct Node { int v; };\nunion U { int i; };\nenum Color { RED };\ntypedef struct Node Node;\ntypedef unsigned long size_type;\n";
+        let (conn, tree) = parse_c(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let defs = all_defs(&conn);
+        for want in ["Node", "U", "Color", "size_type"] {
+            assert!(
+                defs.contains(&want.to_string()),
+                "missing type def {want:?}: {defs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_call_refs() {
+        // Bare calls emit the identifier; function-pointer calls through
+        // `.` / `->` emit the bare field name (the receiver is a value,
+        // not a ref — same rule as Rust method calls).
+        let src = b"void f(void) { g(); s.handle(); p->cb(1); }";
+        let (conn, tree) = parse_c(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let refs = all_refs(&conn);
+        for want in ["g", "handle", "cb"] {
+            assert!(
+                refs.contains(&want.to_string()),
+                "missing call ref {want:?}: {refs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_includes_strip_quotes_and_angle_brackets() {
+        // System includes carry `<...>` in the node text; local includes
+        // carry `"..."`. Both delimiters strip; the alias defaults to
+        // the path's last `/` segment (engine rule), so `<sys/types.h>`
+        // aliases as `types.h`.
+        let src = b"#include <stdio.h>\n#include <sys/types.h>\n#include \"local.h\"\n";
+        let (conn, tree) = parse_c(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let imports = all_imports(&conn);
+        assert!(
+            imports.contains(&("stdio.h".to_string(), "stdio.h".to_string())),
+            "missing system include: {imports:?}"
+        );
+        assert!(
+            imports.contains(&("types.h".to_string(), "sys/types.h".to_string())),
+            "missing nested system include: {imports:?}"
+        );
+        assert!(
+            imports.contains(&("local.h".to_string(), "local.h".to_string())),
+            "missing quoted include: {imports:?}"
+        );
+        assert_eq!(imports.len(), 3, "unexpected extra imports: {imports:?}");
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "cpp")]
+mod cpp_tests {
+    use super::*;
+    use crate::schema::{create_ast_schema, create_refs_schema};
+    use rusqlite::Connection;
+    use tree_sitter::Parser;
+
+    fn parse_cpp(src: &[u8]) -> (Connection, tree_sitter::Tree) {
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_schema(&conn).unwrap();
+        create_refs_schema(&conn).unwrap();
+        let mut parser = Parser::new();
+        let lang: tree_sitter::Language = tree_sitter_cpp::LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        (conn, tree)
+    }
+
+    // Dispatches through `extract_refs` — see java_tests::walk_and_insert.
+    fn walk_and_insert(node: tree_sitter::Node, src: &[u8], conn: &Connection, prefix: &str) {
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                let child = cursor.node();
+                if child.is_named() {
+                    let id = format!("{prefix}/{}", child.kind());
+                    let refs = extract_refs(
+                        &child,
+                        src,
+                        &id,
+                        "test.cpp",
+                        crate::languages::TsLanguage::Cpp,
+                        None,
+                    );
+                    insert_extracted_refs(conn, &refs).unwrap();
+                    walk_and_insert(child, src, conn, &id);
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn all_defs(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT token FROM node_defs ORDER BY token")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn all_refs(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT token FROM node_refs ORDER BY token")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn all_imports(conn: &Connection) -> Vec<(String, String)> {
+        let mut stmt = conn
+            .prepare("SELECT alias, path FROM _imports ORDER BY path")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn extract_class_namespace_and_inclass_method_defs() {
+        // Class + struct + namespace defs, and in-class methods
+        // (declaration `area();` AND inline definition `draw() {}`)
+        // dual-emit `Class::method` + `method`.
+        let src = b"namespace geo {\nclass Shape { public: double area(); void draw() {} };\nstruct Box { int v; };\n}\n";
+        let (conn, tree) = parse_cpp(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let defs = all_defs(&conn);
+        for want in [
+            "geo",
+            "Shape",
+            "Box",
+            "Shape::area",
+            "area",
+            "Shape::draw",
+            "draw",
+        ] {
+            assert!(
+                defs.contains(&want.to_string()),
+                "missing def {want:?}: {defs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_out_of_line_method_defs_qualified() {
+        // `double Shape::area() {}` — the qualified_identifier is a
+        // DOWNWARD child of the function_declarator, so the dual-emit
+        // (`Shape::area` + `area`, separator `::`) is pure query data.
+        let src = b"class Shape { public: double area(); };\ndouble Shape::area() { return 0; }\n";
+        let (conn, tree) = parse_cpp(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let defs = all_defs(&conn);
+        assert!(
+            defs.contains(&"Shape::area".to_string()),
+            "missing qualified out-of-line def: {defs:?}"
+        );
+        assert!(
+            defs.contains(&"area".to_string()),
+            "missing bare out-of-line def: {defs:?}"
+        );
+    }
+
+    #[test]
+    fn extract_template_function_defs() {
+        // A template function's function_declarator parses identically
+        // to a plain function's — the template_declaration wrapper is
+        // transparent to the anchored pattern.
+        let src = b"template <typename T> T maxi(T a, T b) { return a; }\n";
+        let (conn, tree) = parse_cpp(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let defs = all_defs(&conn);
+        assert!(
+            defs.contains(&"maxi".to_string()),
+            "missing template function def: {defs:?}"
+        );
+    }
+
+    #[test]
+    fn extract_call_refs_bare_method_and_qualified() {
+        // Bare calls, method calls via `.` / `->` (bare field name),
+        // and namespace-qualified calls dual-emitting `geo::sync` +
+        // `sync` on the `::` separator.
+        let src = b"void f() { render(); obj.draw(); ptr->flush(); geo::sync(); }";
+        let (conn, tree) = parse_cpp(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let refs = all_refs(&conn);
+        for want in ["render", "draw", "flush", "geo::sync", "sync"] {
+            assert!(
+                refs.contains(&want.to_string()),
+                "missing call ref {want:?}: {refs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_includes_strip_quotes_and_angle_brackets() {
+        // Same include algebra as C — one preproc_include pattern.
+        let src = b"#include <vector>\n#include \"widget.hpp\"\n";
+        let (conn, tree) = parse_cpp(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let imports = all_imports(&conn);
+        assert!(
+            imports.contains(&("vector".to_string(), "vector".to_string())),
+            "missing system include: {imports:?}"
+        );
+        assert!(
+            imports.contains(&("widget.hpp".to_string(), "widget.hpp".to_string())),
+            "missing quoted include: {imports:?}"
+        );
     }
 }
 

@@ -33,7 +33,12 @@ use tree_sitter::Node;
 ///   pass that picks the new java/c/cpp facts up on binary upgrade;
 ///   without the bump, an existing arena keeps serving zero symbols
 ///   for those files forever.
-pub const EXTRACTION_EPOCH: u64 = 2;
+/// - 3: Tier 3 partial algebra for sql/bash (bead
+///   `ley-line-open-780821`). Same silent-empty shape as epoch 2:
+///   both languages previously emitted nothing, and the bump forces
+///   existing arenas to re-derive so .sql/.sh files gain their
+///   def/ref/import rows on binary upgrade.
+pub const EXTRACTION_EPOCH: u64 = 3;
 
 /// Effective extraction epoch: `LLO_EXTRACTION_EPOCH` overrides the
 /// compile-time constant so one test binary can act as two releases
@@ -192,6 +197,14 @@ pub fn extract_refs(
         #[cfg(feature = "cpp")]
         crate::languages::TsLanguage::Cpp => {
             extract_cpp(node, source, node_id, source_id, container_node_id)
+        }
+        #[cfg(feature = "sql")]
+        crate::languages::TsLanguage::Sql => {
+            extract_sql(node, source, node_id, source_id, container_node_id)
+        }
+        #[cfg(feature = "bash")]
+        crate::languages::TsLanguage::Bash => {
+            extract_bash(node, source, node_id, source_id, container_node_id)
         }
         _ => Vec::new(),
     }
@@ -1056,6 +1069,87 @@ fn cpp_enclosing_class(decl_node: &Node, source: &[u8]) -> Option<String> {
     } else {
         Some(name.to_string())
     }
+}
+
+// ---------------------------------------------------------------------------
+// SQL extractor
+// ---------------------------------------------------------------------------
+
+/// Extract SQL DDL definitions and relation/invocation references from
+/// a single AST node. Pure data — no DB access, safe for parallel use.
+///
+/// Query-native language with a PARTIAL algebra BY DESIGN (bead
+/// `ley-line-open-780821`): the per-language knowledge lives in
+/// `queries/sql/tags.scm` — this is a pure engine delegate. DDL names
+/// (table/view/materialized view/function/schema) are defs;
+/// FROM/JOIN/UPDATE/INSERT/DELETE targets, function invocations, and
+/// trigger edges are refs; there are no imports (SQL has no
+/// in-language import construct). Rejected emissions — index/trigger
+/// names, columns, DROP/ALTER targets, CTEs — are documented with
+/// reasons in the `.scm` header. Emission behavior is pinned by the
+/// `sql_tests` fixtures below and cli-lib's
+/// `def_ref_extraction_fidelity_test` — edit the `.scm`, keep the
+/// fixtures green.
+#[cfg(feature = "sql")]
+pub fn extract_sql(
+    node: &Node,
+    source: &[u8],
+    node_id: &str,
+    source_id: &str,
+    container_node_id: Option<&str>,
+) -> Vec<ExtractedRef> {
+    use std::sync::OnceLock;
+    static ENGINE: OnceLock<crate::query_engine::QueryEngine> = OnceLock::new();
+    ENGINE
+        .get_or_init(|| {
+            crate::query_engine::QueryEngine::new(
+                crate::languages::TsLanguage::Sql,
+                include_str!("../queries/sql/tags.scm"),
+            )
+            .expect("compiled-in queries/sql/tags.scm must compile against tree-sitter-sequel")
+        })
+        .extract(node, source, node_id, source_id, container_node_id)
+}
+
+// ---------------------------------------------------------------------------
+// Bash extractor
+// ---------------------------------------------------------------------------
+
+/// Extract shell function definitions, command references, and static
+/// `source` imports from a single AST node. Pure data — no DB access,
+/// safe for parallel use.
+///
+/// Query-native language with a PARTIAL algebra BY DESIGN (bead
+/// `ley-line-open-780821`): the per-language knowledge lives in
+/// `queries/bash/tags.scm` — this is a pure engine delegate. Function
+/// definitions are defs; statically-named command invocations are
+/// refs; `source`/`.` with a static path is an import. Variables,
+/// expansions, dynamic paths, and aliases are rejected with reasons in
+/// the `.scm` header. The `.scm` uses `#any-of?`/`#not-any-of?` text
+/// predicates — evaluated natively by the Rust binding's
+/// `QueryCursor::matches`, so they are per-pattern query data, not
+/// engine code. Emission behavior is pinned by the `bash_tests`
+/// fixtures below and cli-lib's `def_ref_extraction_fidelity_test` —
+/// edit the `.scm`, keep the fixtures green.
+#[cfg(feature = "bash")]
+pub fn extract_bash(
+    node: &Node,
+    source: &[u8],
+    node_id: &str,
+    source_id: &str,
+    container_node_id: Option<&str>,
+) -> Vec<ExtractedRef> {
+    use std::sync::OnceLock;
+    static ENGINE: OnceLock<crate::query_engine::QueryEngine> = OnceLock::new();
+    ENGINE
+        .get_or_init(|| {
+            crate::query_engine::QueryEngine::new(
+                crate::languages::TsLanguage::Bash,
+                include_str!("../queries/bash/tags.scm"),
+            )
+            .expect("compiled-in queries/bash/tags.scm must compile against tree-sitter-bash")
+        })
+        .extract(node, source, node_id, source_id, container_node_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -1958,6 +2052,457 @@ mod rust_tests {
         assert!(
             imports.is_empty(),
             "wildcard must not produce import: {imports:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "sql")]
+mod sql_tests {
+    use super::*;
+    use crate::schema::{create_ast_schema, create_refs_schema};
+    use rusqlite::Connection;
+    use tree_sitter::Parser;
+
+    fn parse_sql(src: &[u8]) -> (Connection, tree_sitter::Tree) {
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_schema(&conn).unwrap();
+        create_refs_schema(&conn).unwrap();
+        let mut parser = Parser::new();
+        let lang: tree_sitter::Language = tree_sitter_sequel::LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        (conn, tree)
+    }
+
+    // Dispatches through `extract_refs` — see java_tests::walk_and_insert.
+    fn walk_and_insert(node: tree_sitter::Node, src: &[u8], conn: &Connection, prefix: &str) {
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                let child = cursor.node();
+                if child.is_named() {
+                    let id = format!("{prefix}/{}", child.kind());
+                    let refs = extract_refs(
+                        &child,
+                        src,
+                        &id,
+                        "schema.sql",
+                        crate::languages::TsLanguage::Sql,
+                        None,
+                    );
+                    insert_extracted_refs(conn, &refs).unwrap();
+                    walk_and_insert(child, src, conn, &id);
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn all_defs(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT token FROM node_defs ORDER BY token")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn all_refs(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT token FROM node_refs ORDER BY token")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn all_imports(conn: &Connection) -> Vec<(String, String)> {
+        let mut stmt = conn
+            .prepare("SELECT alias, path FROM _imports ORDER BY path")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn extract_ddl_name_defs() {
+        // The five def-bearing DDL shapes: table (incl. TEMPORARY),
+        // view, materialized view, function (incl. OR REPLACE), schema.
+        let src = b"CREATE TABLE users (id INT);\n\
+            CREATE TEMPORARY TABLE tmp1 (x INT);\n\
+            CREATE VIEW active AS SELECT * FROM users;\n\
+            CREATE MATERIALIZED VIEW mv AS SELECT * FROM users;\n\
+            CREATE OR REPLACE FUNCTION add_one(x INT) RETURNS INT AS $$ SELECT x + 1 $$ LANGUAGE sql;\n\
+            CREATE SCHEMA analytics;\n";
+        let (conn, tree) = parse_sql(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let defs = all_defs(&conn);
+        for want in ["users", "tmp1", "active", "mv", "add_one", "analytics"] {
+            assert!(
+                defs.contains(&want.to_string()),
+                "missing DDL def {want:?}: {defs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_schema_qualified_defs_dual_emit() {
+        // `CREATE TABLE analytics.events` — object_reference carries a
+        // schema field; the engine dual-emits `analytics.events` +
+        // `events` (qualified first).
+        let src = b"CREATE TABLE analytics.events (id INT);\n";
+        let (conn, tree) = parse_sql(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let defs = all_defs(&conn);
+        assert!(
+            defs.contains(&"analytics.events".to_string()),
+            "missing qualified def: {defs:?}"
+        );
+        assert!(
+            defs.contains(&"events".to_string()),
+            "missing bare def: {defs:?}"
+        );
+    }
+
+    #[test]
+    fn extract_relation_refs_from_join_update_insert_delete() {
+        // Every use-site shape joins back to a CREATE TABLE def token:
+        // FROM + JOIN (relation), UPDATE (relation), INSERT INTO
+        // (object_reference directly under insert), DELETE FROM (from
+        // holds object_reference directly — no relation wrapper).
+        let src = b"SELECT u.name FROM users u JOIN orders o ON o.user_id = u.id;\n\
+            UPDATE accounts SET v = 1;\n\
+            INSERT INTO events (id) VALUES (1);\n\
+            DELETE FROM sessions WHERE id = 2;\n";
+        let (conn, tree) = parse_sql(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let refs = all_refs(&conn);
+        for want in ["users", "orders", "accounts", "events", "sessions"] {
+            assert!(
+                refs.contains(&want.to_string()),
+                "missing relation ref {want:?}: {refs:?}"
+            );
+        }
+        // Column tokens must NOT emit — bare column names collide across
+        // tables (schema resolution is out of the token algebra).
+        for junk in ["name", "user_id", "v"] {
+            assert!(
+                !refs.contains(&junk.to_string()),
+                "column token {junk:?} must not emit as a ref: {refs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_schema_qualified_relation_refs_dual_emit() {
+        let src = b"SELECT * FROM analytics.events;\n";
+        let (conn, tree) = parse_sql(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let refs = all_refs(&conn);
+        assert!(
+            refs.contains(&"analytics.events".to_string()),
+            "missing qualified relation ref: {refs:?}"
+        );
+        assert!(
+            refs.contains(&"events".to_string()),
+            "missing bare relation ref: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn extract_invocation_refs() {
+        // Function call sites are the join partners of CREATE FUNCTION
+        // defs. Builtins (count) emit as unresolved refs — same class
+        // as printf in C.
+        let src = b"SELECT add_one(2), count(*) FROM users;\n";
+        let (conn, tree) = parse_sql(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let refs = all_refs(&conn);
+        assert!(
+            refs.contains(&"add_one".to_string()),
+            "missing invocation ref: {refs:?}"
+        );
+        assert!(
+            refs.contains(&"count".to_string()),
+            "missing builtin invocation ref: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn extract_trigger_edges_not_trigger_name() {
+        // A trigger's NAME is never referenceable (only DROP TRIGGER) —
+        // no def. Its body edges ARE use-sites: the ON table and the
+        // EXECUTE FUNCTION target both emit refs, so a function used
+        // only by a trigger is not dead.
+        let src =
+            b"CREATE TRIGGER trg AFTER INSERT ON users FOR EACH ROW EXECUTE FUNCTION add_one();\n";
+        let (conn, tree) = parse_sql(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let refs = all_refs(&conn);
+        assert!(
+            refs.contains(&"users".to_string()),
+            "missing trigger ON-table ref: {refs:?}"
+        );
+        assert!(
+            refs.contains(&"add_one".to_string()),
+            "missing trigger EXECUTE FUNCTION ref: {refs:?}"
+        );
+        assert!(
+            !refs.contains(&"trg".to_string()),
+            "trigger name must not emit as a ref: {refs:?}"
+        );
+        let defs = all_defs(&conn);
+        assert!(
+            !defs.contains(&"trg".to_string()),
+            "trigger name must not emit as a def (no use-site exists): {defs:?}"
+        );
+    }
+
+    #[test]
+    fn rejected_emissions_stay_silent() {
+        // Index defs (no use-site in the language), DROP/ALTER targets
+        // (lifecycle, not use), and CTE names (query-scoped) must not
+        // emit. `legacy` appears ONLY in DROP/ALTER position; `recent`
+        // only as a CTE name; the CTE's FROM ref (`orders`) still
+        // emits via the relation pattern.
+        let src = b"CREATE INDEX idx_users_name ON users (name);\n\
+            DROP TABLE legacy;\n\
+            ALTER TABLE legacy ADD COLUMN email TEXT;\n\
+            WITH recent AS (SELECT * FROM orders) SELECT * FROM recent;\n";
+        let (conn, tree) = parse_sql(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let defs = all_defs(&conn);
+        assert!(
+            !defs.contains(&"idx_users_name".to_string()),
+            "index name must not emit as a def: {defs:?}"
+        );
+        assert!(
+            !defs.contains(&"recent".to_string()),
+            "CTE name must not emit as a def: {defs:?}"
+        );
+        let refs = all_refs(&conn);
+        assert!(
+            !refs.contains(&"legacy".to_string()),
+            "DROP/ALTER targets must not emit as refs: {refs:?}"
+        );
+        // CREATE INDEX's ON-table object_reference is also lifecycle
+        // metadata, not use — `users` here appears only in the index
+        // statement, so it must not ref.
+        assert!(
+            !refs.contains(&"users".to_string()),
+            "CREATE INDEX ON-table must not emit as a ref: {refs:?}"
+        );
+        assert!(
+            refs.contains(&"orders".to_string()),
+            "CTE body FROM ref must still emit: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn sql_has_no_import_algebra() {
+        // SQL has no in-language import construct (\i and \include are
+        // psql metacommands outside the grammar) — _imports stays empty.
+        let src = b"CREATE TABLE users (id INT);\nSELECT * FROM users;\n";
+        let (conn, tree) = parse_sql(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let imports = all_imports(&conn);
+        assert!(imports.is_empty(), "sql must emit no imports: {imports:?}");
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "bash")]
+mod bash_tests {
+    use super::*;
+    use crate::schema::{create_ast_schema, create_refs_schema};
+    use rusqlite::Connection;
+    use tree_sitter::Parser;
+
+    fn parse_bash(src: &[u8]) -> (Connection, tree_sitter::Tree) {
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_schema(&conn).unwrap();
+        create_refs_schema(&conn).unwrap();
+        let mut parser = Parser::new();
+        let lang: tree_sitter::Language = tree_sitter_bash::LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        (conn, tree)
+    }
+
+    // Dispatches through `extract_refs` — see java_tests::walk_and_insert.
+    fn walk_and_insert(node: tree_sitter::Node, src: &[u8], conn: &Connection, prefix: &str) {
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                let child = cursor.node();
+                if child.is_named() {
+                    let id = format!("{prefix}/{}", child.kind());
+                    let refs = extract_refs(
+                        &child,
+                        src,
+                        &id,
+                        "script.sh",
+                        crate::languages::TsLanguage::Bash,
+                        None,
+                    );
+                    insert_extracted_refs(conn, &refs).unwrap();
+                    walk_and_insert(child, src, conn, &id);
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn all_defs(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT token FROM node_defs ORDER BY token")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn all_refs(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT token FROM node_refs ORDER BY token")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn all_imports(conn: &Connection) -> Vec<(String, String)> {
+        let mut stmt = conn
+            .prepare("SELECT alias, path FROM _imports ORDER BY path")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn extract_function_defs_both_spellings() {
+        // POSIX `f() {}` and bash `function f {}` are both
+        // function_definition nodes with a `word` name field.
+        let src = b"my_func() {\n  echo hi\n}\nfunction other_func {\n  my_func\n}\n";
+        let (conn, tree) = parse_bash(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let defs = all_defs(&conn);
+        for want in ["my_func", "other_func"] {
+            assert!(
+                defs.contains(&want.to_string()),
+                "missing function def {want:?}: {defs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_command_refs_static_names_only() {
+        // Statically-named commands ref (joins to shell-function defs;
+        // externals like grep emit unresolved — same class as printf in
+        // C). Commands invoked through an expansion have no stable
+        // token and must not emit. Command substitution bodies are real
+        // command nodes — `$(my_func)` refs.
+        let src = b"my_func() { :; }\nmy_func\ngrep -r foo .\nresult=$(my_func)\n\"$CMD\" --flag\n";
+        let (conn, tree) = parse_bash(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let refs = all_refs(&conn);
+        for want in ["my_func", "grep"] {
+            assert!(
+                refs.contains(&want.to_string()),
+                "missing command ref {want:?}: {refs:?}"
+            );
+        }
+        assert!(
+            !refs.iter().any(|r| r.contains("CMD")),
+            "expansion-invoked command must not emit a ref: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn extract_source_imports_static_paths() {
+        // `source` and `.` with a static word path import; a static
+        // double-quoted string path imports quote-stripped; the alias
+        // defaults to the path's last `/` segment (engine rule).
+        let src = b"source ./lib/common.sh\n. /etc/profile.d/vars.sh\nsource \"config/local.sh\"\n";
+        let (conn, tree) = parse_bash(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let imports = all_imports(&conn);
+        assert!(
+            imports.contains(&("common.sh".to_string(), "./lib/common.sh".to_string())),
+            "missing word-path source import: {imports:?}"
+        );
+        assert!(
+            imports.contains(&("vars.sh".to_string(), "/etc/profile.d/vars.sh".to_string())),
+            "missing dot-command import: {imports:?}"
+        );
+        assert!(
+            imports.contains(&("local.sh".to_string(), "config/local.sh".to_string())),
+            "missing string-path source import: {imports:?}"
+        );
+        assert_eq!(imports.len(), 3, "exactly three imports: {imports:?}");
+        // One node, one fact: a source command emits its Import, never
+        // a `source` / `.` command ref alongside.
+        let refs = all_refs(&conn);
+        assert!(
+            !refs.contains(&"source".to_string()) && !refs.contains(&".".to_string()),
+            "source/. must not double-emit as command refs: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_source_paths_do_not_import() {
+        // An expansion-carrying path is not statically resolvable — the
+        // sole-named-child string anchor excludes it, and the bare-word
+        // pattern never matches a `string` argument.
+        let src = b"source \"$HOME/.config/thing.sh\"\nsource $DYNAMIC\n";
+        let (conn, tree) = parse_bash(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let imports = all_imports(&conn);
+        assert!(
+            imports.is_empty(),
+            "dynamic source paths must not import: {imports:?}"
+        );
+    }
+
+    #[test]
+    fn variables_and_expansions_stay_silent() {
+        // Variable assignments are not defs and expansions are not refs
+        // BY DESIGN: dynamic scoping + export/env crossing file
+        // boundaries makes the def↔ref join unsound, and expansion refs
+        // are the noisiest emission shell has.
+        let src =
+            b"VAR=value\nexport PATH=\"$PATH:/usr/local/bin\"\nlocal x=1\necho \"$VAR\" $PATH\n";
+        let (conn, tree) = parse_bash(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let defs = all_defs(&conn);
+        assert!(
+            defs.is_empty(),
+            "variable assignments must not emit defs: {defs:?}"
+        );
+        let refs = all_refs(&conn);
+        for junk in ["VAR", "PATH", "x"] {
+            assert!(
+                !refs.contains(&junk.to_string()),
+                "variable expansion {junk:?} must not emit a ref: {refs:?}"
+            );
+        }
+        // The echo command itself still refs (it is a command).
+        assert!(
+            refs.contains(&"echo".to_string()),
+            "echo command ref must emit: {refs:?}"
         );
     }
 }

@@ -80,7 +80,9 @@ pub enum TsLanguage {
     // Tier 2 (validate: ERROR/MISSING enumeration via the daemon
     // `validate` op). Tier 3 (def/ref extraction) is .scm query data
     // over the generic engine: java/c/cpp have it (bead
-    // ley-line-open-5e21c2, `queries/<lang>/tags.scm` + κ arms below);
+    // ley-line-open-5e21c2), sql/bash carry a PARTIAL algebra (bead
+    // ley-line-open-780821 — DDL/function-def + use-site subset; the
+    // rejected emissions are documented in `queries/<lang>/tags.scm`);
     // the rest return `None` from `canonical_kind` /
     // `canonical_cfg_kind` (the open-world escape: callers keep the
     // raw grammar kind) until their queries are authored. ──
@@ -436,6 +438,34 @@ impl TsLanguage {
                 "preproc_include" => Some("import"),
                 "namespace_definition" => Some("module"),
                 "translation_unit" => Some("module"),
+                _ => None,
+            },
+            #[cfg(feature = "sql")]
+            // PARTIAL Tier 3 (bead ley-line-open-780821): κ covers
+            // exactly the def anchor kinds queries/sql/tags.scm emits.
+            // The closed κ set has no "table"; a table or view is a
+            // named data shape, and "type" is the nearest base kind —
+            // the same collapse a struct gets. create_index /
+            // create_trigger stay unmapped: their names emit no def
+            // rows (no use-site exists in the language — see the .scm
+            // header).
+            TsLanguage::Sql => match raw_kind {
+                "create_table" | "create_view" | "create_materialized_view" => Some("type"),
+                "create_function" => Some("function"),
+                // A schema is a namespace — module.
+                "create_schema" => Some("module"),
+                "program" => Some("module"),
+                _ => None,
+            },
+            #[cfg(feature = "bash")]
+            // PARTIAL Tier 3 (bead ley-line-open-780821): shell
+            // functions are the only def kind. `command` — the Import
+            // ANCHOR kind — stays unmapped: mapping it to "import"
+            // would collapse every command node in the symbols path,
+            // not just `source` lines.
+            TsLanguage::Bash => match raw_kind {
+                "function_definition" => Some("function"),
+                "program" => Some("module"),
                 _ => None,
             },
             #[allow(unreachable_patterns)]
@@ -1152,11 +1182,12 @@ mod tests {
     /// returns `None` for every raw kind (the open-world escape), so the
     /// caller stores raw kinds untouched. For the config/data languages
     /// (toml, dockerfile, css) this is BY DESIGN — parse/validate only.
-    /// For the remaining code languages (sql, bash, ruby, php, kotlin,
-    /// swift, scala, csharp, groovy, lua) Tier 3 lands as .scm query
-    /// data over the generic engine — separate work, never match arms
-    /// here. java/c/cpp graduated to Tier 3 (bead ley-line-open-5e21c2)
-    /// and are pinned positively in
+    /// For the remaining code languages (ruby, php, kotlin, swift,
+    /// scala, csharp, groovy, lua) Tier 3 lands as .scm query data over
+    /// the generic engine — separate work, never match arms here.
+    /// java/c/cpp graduated to Tier 3 (bead ley-line-open-5e21c2),
+    /// sql/bash to a PARTIAL Tier 3 (bead ley-line-open-780821); both
+    /// sets are pinned positively in
     /// `tier3_query_native_languages_map_emitted_def_kinds`.
     #[test]
     fn tier12_languages_have_no_canonical_kind_mapping() {
@@ -1171,8 +1202,6 @@ mod tests {
             }
             assert_eq!(lang.canonical_cfg_kind("if_statement"), None);
         };
-        #[cfg(feature = "sql")]
-        probe(TsLanguage::Sql);
         #[cfg(feature = "toml")]
         probe(TsLanguage::Toml);
         #[cfg(feature = "dockerfile")]
@@ -1268,6 +1297,45 @@ mod tests {
                 TsLanguage::Cpp.canonical_kind("preproc_include"),
                 Some("import")
             );
+        }
+        // sql/bash: PARTIAL Tier 3 (bead ley-line-open-780821). κ
+        // covers exactly the def anchor kinds queries/<lang>/tags.scm
+        // emits; everything else stays None (open-world escape).
+        #[cfg(feature = "sql")]
+        {
+            for raw in ["create_table", "create_view", "create_materialized_view"] {
+                assert_eq!(
+                    TsLanguage::Sql.canonical_kind(raw),
+                    Some("type"),
+                    "SQL: {raw} must collapse to type"
+                );
+            }
+            assert_eq!(
+                TsLanguage::Sql.canonical_kind("create_function"),
+                Some("function")
+            );
+            assert_eq!(
+                TsLanguage::Sql.canonical_kind("create_schema"),
+                Some("module")
+            );
+            assert_eq!(TsLanguage::Sql.canonical_kind("program"), Some("module"));
+            // Rejected anchor kinds stay unmapped — no def rows exist
+            // for them, so a mapping would be dead vocabulary.
+            assert_eq!(TsLanguage::Sql.canonical_kind("create_index"), None);
+            assert_eq!(TsLanguage::Sql.canonical_kind("create_trigger"), None);
+        }
+        #[cfg(feature = "bash")]
+        {
+            assert_eq!(
+                TsLanguage::Bash.canonical_kind("function_definition"),
+                Some("function")
+            );
+            assert_eq!(TsLanguage::Bash.canonical_kind("program"), Some("module"));
+            // `command` is the Import ANCHOR kind, not a def kind —
+            // mapping it to "import" would collapse every command node
+            // in the symbols path. It must stay None.
+            assert_eq!(TsLanguage::Bash.canonical_kind("command"), None);
+            assert_eq!(TsLanguage::Bash.canonical_kind("variable_assignment"), None);
         }
     }
 

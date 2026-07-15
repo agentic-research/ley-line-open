@@ -133,6 +133,15 @@ pub(crate) struct ParsedFile {
     /// to the input `content` slice (F1s asserts this). One `Vec<u8>` clone per
     /// file — the same allocation the existing `content_hash` already reads.
     source_blob_bytes: Vec<u8>,
+    /// Injections (bead `ley-line-open-c822a6`): (node_id → merkle
+    /// node_hash) for every named node of every INJECTED subtree in
+    /// this file. Injected nodes have no `_ast` occurrence rows — the
+    /// host occurrence layer is untouched by design, so host structural
+    /// identity stays independent of the injected grammar's version —
+    /// but their fact rows still need the `node_hash` pointer at their
+    /// own content-addressed subtree. Merged into `hash_by_id` in the
+    /// insert loop, next to the `_ast`-derived entries.
+    injected_hashes: Vec<(String, [u8; 32])>,
 }
 
 // ---------------------------------------------------------------------------
@@ -832,12 +841,24 @@ pub fn parse_into_conn(
     // change is inherently global: one-shot invalidation here, and the
     // sheaf repopulates from the reparse like any other change.
     let extraction_epoch = current_extraction_epoch().to_string();
+    // Composite injection epoch (bead `ley-line-open-c822a6`): injected
+    // facts depend on inputs the scalar epoch does not see — the host's
+    // injections.scm, the injected language's tags.scm, and both
+    // grammars. Same staleness shape as above, so the same gate: ANY
+    // disagreement (including the missing row every pre-injection arena
+    // has) disables the unchanged-skip. The missing-row case is also
+    // what delivers injected facts to existing arenas on upgrade — no
+    // EXTRACTION_EPOCH bump accompanies the injections feature.
+    let injection_epoch = leyline_ts::injections::current_injection_epoch();
     let epoch_current = incremental
         && get_meta(conn, "extraction_epoch").ok().flatten().as_deref()
-            == Some(extraction_epoch.as_str());
+            == Some(extraction_epoch.as_str())
+        && get_meta(conn, "injection_epoch").ok().flatten().as_deref()
+            == Some(injection_epoch.as_str());
     if incremental && !epoch_current {
         eprintln!(
-            "extraction epoch changed (binary epoch {extraction_epoch}); \
+            "extraction epoch changed (binary epoch {extraction_epoch}, \
+             injection composite {injection_epoch}); \
              re-deriving facts for all files",
         );
     }
@@ -1219,9 +1240,16 @@ pub fn parse_into_conn(
                 // node_hash pointer on node_defs/node_refs can be attached
                 // by the ref locator (which is always an `_ast` node_id).
                 let mut hash_by_id: HashMap<&str, [u8; 32]> =
-                    HashMap::with_capacity(pf.ast_entries.len());
+                    HashMap::with_capacity(pf.ast_entries.len() + pf.injected_hashes.len());
                 for a in &pf.ast_entries {
                     hash_by_id.insert(a.node_id.as_str(), a.node_hash);
+                }
+                // Injections (bead `ley-line-open-c822a6`): injected
+                // nodes have no `_ast` rows; their (node_id →
+                // node_hash) pairs ride ParsedFile so injected fact
+                // rows resolve to their own content-addressed subtrees.
+                for (id, h) in &pf.injected_hashes {
+                    hash_by_id.insert(id.as_str(), *h);
                 }
 
                 for a in &pf.ast_entries {
@@ -1518,6 +1546,9 @@ pub fn parse_into_conn(
     // so adoption of an arena by a new binary always lands here.
     if scope.is_none() {
         set_meta(conn, "extraction_epoch", &extraction_epoch)?;
+        // Composite injection epoch — same full-tree-only rationale as
+        // extraction_epoch above (bead `ley-line-open-c822a6`).
+        set_meta(conn, "injection_epoch", &injection_epoch)?;
     }
     let sweep_close_elapsed = sweep_close_start.elapsed();
 
@@ -2185,6 +2216,12 @@ pub(crate) fn parse_file_pure(
     // Per-file dedup: emit a subtree's content/child rows only on first
     // sight. Cross-file dedup is handled by `INSERT OR IGNORE` at flush time.
     let mut seen: HashSet<[u8; 32]> = HashSet::new();
+    // Injections (bead `ley-line-open-c822a6`): (node_id → node_hash)
+    // for injected-subtree nodes, which have no `_ast` rows. The
+    // env-var off-switch is the falsification seam for the host-hash-
+    // independence gate, read once per file (rayon workers only read).
+    let mut injected_hashes: Vec<(String, [u8; 32])> = Vec::new();
+    let injections_on = !leyline_ts::injections::injections_disabled();
 
     // File node.
     nodes.push(ParsedNode {
@@ -2225,12 +2262,14 @@ pub(crate) fn parse_file_pure(
         lang_name,
         // Bead ley-line-open-6e798d: root has no enclosing function/method.
         None,
+        injections_on,
         &mut seen,
         &mut nodes,
         &mut ast_entries,
         &mut refs,
         &mut node_contents,
         &mut node_children,
+        &mut injected_hashes,
     );
     ast_entries[root_idx].node_hash = root_hash;
 
@@ -2292,6 +2331,7 @@ pub(crate) fn parse_file_pure(
         pointer_blob_bytes,
         pointer_blob_hash,
         source_blob_bytes,
+        injected_hashes,
     })
 }
 
@@ -2452,12 +2492,16 @@ fn fold_children(
     // into a child whose κ canonical kind is `function`/`method`, we
     // pass its own `id` as the new container for its subtree.
     container_node_id: Option<&str>,
+    // Injections (bead `ley-line-open-c822a6`): false only under the
+    // `LLO_DISABLE_INJECTIONS=1` falsification seam.
+    injections_on: bool,
     seen: &mut HashSet<[u8; 32]>,
     nodes: &mut Vec<ParsedNode>,
     ast_entries: &mut Vec<AstEntry>,
     refs: &mut Vec<ExtractedRef>,
     node_contents: &mut Vec<ContentRow>,
     node_children: &mut Vec<ChildRow>,
+    injected_hashes: &mut Vec<(String, [u8; 32])>,
 ) -> [u8; 32] {
     // Gather non-extra children in source order, with tree-sitter field
     // names, and count named children per kind (for the node_id suffix).
@@ -2528,6 +2572,34 @@ fn fold_children(
                 container_node_id,
             ));
 
+            // Injections (bead `ley-line-open-c822a6`): probe this node
+            // against the host language's injections.scm, anchored the
+            // same way extract_refs is. A hit reparses the captured
+            // byte range under the target grammar and folds the
+            // injected subtree into fact + content rows rooted at
+            // `{id}#inj{k}` — its OWN content-addressed space; nothing
+            // it produces enters this fold's hashes or occurrence rows.
+            // The container is the literal's enclosing function: a
+            // string literal is never itself a κ container.
+            if injections_on
+                && let Some(engine) = leyline_ts::injections::injection_engine(language)
+            {
+                for (k, site) in engine.sites(child, content).into_iter().enumerate() {
+                    fold_injected(
+                        content,
+                        &site,
+                        &format!("{id}#inj{k}"),
+                        source_id,
+                        container_node_id,
+                        seen,
+                        refs,
+                        node_contents,
+                        node_children,
+                        injected_hashes,
+                    );
+                }
+            }
+
             // Structural `nodes` row: kind 1 (dir-like) when the child has
             // named children, else kind 0 (leaf) carrying its text.
             let has_named_children = {
@@ -2592,12 +2664,14 @@ fn fold_children(
                 language,
                 lang_name,
                 child_container,
+                injections_on,
                 seen,
                 nodes,
                 ast_entries,
                 refs,
                 node_contents,
                 node_children,
+                injected_hashes,
             );
             ast_entries[entry_idx].node_hash = child_hash;
             child_hashes.push(child_hash);
@@ -2615,12 +2689,14 @@ fn fold_children(
                 language,
                 lang_name,
                 container_node_id,
+                injections_on,
                 seen,
                 nodes,
                 ast_entries,
                 refs,
                 node_contents,
                 node_children,
+                injected_hashes,
             );
             child_hashes.push(child_hash);
         }
@@ -2631,6 +2707,234 @@ fn fold_children(
     let canonical = language.canonical_kind(raw_kind).unwrap_or(raw_kind);
     if children.is_empty() {
         // Leaf: hash the terminal token verbatim (length-prefixed, NUL-safe).
+        let token = node.utf8_text(content).unwrap_or("");
+        let h = hash_leaf(canonical, token);
+        if seen.insert(h) {
+            node_contents.push(ContentRow {
+                node_hash: h,
+                node_tag: NODE_TAG_LEAF,
+                kind: canonical.to_string(),
+                raw_kind: raw_kind.to_string(),
+                lang: lang_name.to_string(),
+                token: Some(token.to_string()),
+                arity: 0,
+            });
+        }
+        h
+    } else {
+        let h = hash_internal(canonical, &child_hashes);
+        if seen.insert(h) {
+            node_contents.push(ContentRow {
+                node_hash: h,
+                node_tag: NODE_TAG_INTERNAL,
+                kind: canonical.to_string(),
+                raw_kind: raw_kind.to_string(),
+                lang: lang_name.to_string(),
+                token: None,
+                arity: child_hashes.len(),
+            });
+            for (ord, (ch, field)) in child_hashes.iter().zip(&fields).enumerate() {
+                node_children.push(ChildRow {
+                    parent_hash: h,
+                    ordinal: ord,
+                    child_hash: *ch,
+                    field: field.map(|f| f.to_string()),
+                });
+            }
+        }
+        h
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Injections (bead ley-line-open-c822a6)
+// ---------------------------------------------------------------------------
+
+/// Reparse one injection site under its target grammar and fold the
+/// injected subtree into fact + content rows.
+///
+/// The injected subtree gets its OWN content-addressed root: its
+/// hashes are computed by the same [`hash_leaf`]/[`hash_internal`]
+/// fold — over the INJECTED grammar's kinds — and land as
+/// `node_content`/`node_child` rows (`lang` = the injected language),
+/// so a standalone file with the same statement bytes dedups to the
+/// same rows. Nothing here touches the HOST fold's preimages,
+/// `_ast`/`nodes` occurrence rows, or the pointer/capnp stores — host
+/// structural identity is independent of the injected grammar's
+/// version by construction (pinned by
+/// `inj_host_node_hashes_independent_of_injection_pass`).
+///
+/// Node identity: the injected root is `root_id` =
+/// `{host_node_id}#inj{k}` (built by the caller); descendants follow
+/// the host fold's `{parent}/{kind}[_{idx}]` naming. `#` cannot occur
+/// in host node_ids (path + grammar-kind derived), so the scheme
+/// cannot collide. Facts carry the HOST file as `source_id` and the
+/// host's enclosing function as the initial container.
+///
+/// Failure shape: an unloadable grammar, rejected range, or failed
+/// parse degrades to zero facts — never an error for the host parse
+/// (same contract as `extract_refs` on unsupported languages).
+#[allow(clippy::too_many_arguments)]
+fn fold_injected(
+    content: &[u8],
+    site: &leyline_ts::injections::InjectionSite,
+    root_id: &str,
+    source_id: &str,
+    container_node_id: Option<&str>,
+    seen: &mut HashSet<[u8; 32]>,
+    refs: &mut Vec<ExtractedRef>,
+    node_contents: &mut Vec<ContentRow>,
+    node_children: &mut Vec<ChildRow>,
+    injected_hashes: &mut Vec<(String, [u8; 32])>,
+) {
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&site.language.ts_language()).is_err() {
+        return;
+    }
+    if parser.set_included_ranges(&[site.range]).is_err() {
+        return;
+    }
+    let Some(tree) = parser.parse(content, None) else {
+        return;
+    };
+    let root = tree.root_node();
+    let root_hash = fold_injected_node(
+        content,
+        root,
+        root_id,
+        source_id,
+        site.language,
+        container_node_id,
+        seen,
+        refs,
+        node_contents,
+        node_children,
+        injected_hashes,
+    );
+    injected_hashes.push((root_id.to_string(), root_hash));
+}
+
+/// Bottom-up fold of an INJECTED subtree — [`fold_children`] minus the
+/// occurrence layer. Same traversal (non-`extra` children in source
+/// order), same node_id naming, same κ container threading, same
+/// [`hash_leaf`]/[`hash_internal`] content addressing with deduped
+/// `node_content`/`node_child` emission; but no `nodes`/`_ast` rows —
+/// injected nodes record their (node_id → node_hash) pairs in
+/// `injected_hashes` instead, which is how their fact rows get the
+/// `node_hash` pointer the `node_defs`/`node_refs` FK requires.
+///
+/// Kept as its own function rather than a mode flag on
+/// [`fold_children`]: the shared behavior is pinned externally — the
+/// node_id scheme by `inj_injected_node_id_scheme_pinned`, the hash
+/// fold by `inj_own_ca_root_dedups_with_standalone_sql` (injected vs
+/// standalone hash equality fails loudly if the folds drift).
+#[allow(clippy::too_many_arguments)]
+fn fold_injected_node(
+    content: &[u8],
+    node: tree_sitter::Node,
+    node_id: &str,
+    source_id: &str,
+    language: TsLanguage,
+    container_node_id: Option<&str>,
+    seen: &mut HashSet<[u8; 32]>,
+    refs: &mut Vec<ExtractedRef>,
+    node_contents: &mut Vec<ContentRow>,
+    node_children: &mut Vec<ChildRow>,
+    injected_hashes: &mut Vec<(String, [u8; 32])>,
+) -> [u8; 32] {
+    let mut children: Vec<tree_sitter::Node> = Vec::new();
+    let mut fields: Vec<Option<&'static str>> = Vec::new();
+    let mut named_kind_counts = HashMap::<&str, usize>::new();
+    {
+        let mut cur = node.walk();
+        if cur.goto_first_child() {
+            loop {
+                let ch = cur.node();
+                if !ch.is_extra() {
+                    if ch.is_named() {
+                        *named_kind_counts.entry(ch.kind()).or_insert(0) += 1;
+                    }
+                    fields.push(cur.field_name());
+                    children.push(ch);
+                }
+                if !cur.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut child_hashes: Vec<[u8; 32]> = Vec::with_capacity(children.len());
+    let mut kind_indices = HashMap::<&str, usize>::new();
+
+    for child in &children {
+        if child.is_named() {
+            let kind = child.kind();
+            let needs_suffix = named_kind_counts[kind] > 1;
+            let name = if needs_suffix {
+                let idx = kind_indices.entry(kind).or_insert(0);
+                let n = format!("{kind}_{idx}");
+                *idx += 1;
+                n
+            } else {
+                kind.to_string()
+            };
+            let id = format!("{node_id}/{name}");
+
+            refs.extend(extract_refs(
+                child,
+                content,
+                &id,
+                source_id,
+                language,
+                container_node_id,
+            ));
+
+            let child_container_owned;
+            let child_container = match language.canonical_kind(child.kind()) {
+                Some("function") | Some("method") => {
+                    child_container_owned = id.clone();
+                    Some(child_container_owned.as_str())
+                }
+                _ => container_node_id,
+            };
+            let child_hash = fold_injected_node(
+                content,
+                *child,
+                &id,
+                source_id,
+                language,
+                child_container,
+                seen,
+                refs,
+                node_contents,
+                node_children,
+                injected_hashes,
+            );
+            injected_hashes.push((id, child_hash));
+            child_hashes.push(child_hash);
+        } else {
+            let child_hash = fold_injected_node(
+                content,
+                *child,
+                "",
+                source_id,
+                language,
+                container_node_id,
+                seen,
+                refs,
+                node_contents,
+                node_children,
+                injected_hashes,
+            );
+            child_hashes.push(child_hash);
+        }
+    }
+
+    let raw_kind = node.kind();
+    let canonical = language.canonical_kind(raw_kind).unwrap_or(raw_kind);
+    let lang_name = language.name();
+    if children.is_empty() {
         let token = node.utf8_text(content).unwrap_or("");
         let h = hash_leaf(canonical, token);
         if seen.insert(h) {

@@ -7,6 +7,7 @@
 //! Free of fuser/nfsserve/tokio dependencies.
 
 pub mod cfg;
+pub mod injections;
 pub mod languages;
 pub mod project;
 #[cfg(feature = "pyproject")]

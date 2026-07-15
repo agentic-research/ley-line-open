@@ -1,6 +1,6 @@
 [package]
 name = "leyline-cas-ffi"
-version = "0.7.7"
+version = "0.7.8"
 edition = "2024"
 description = "Wasm32-callable C FFI for ll-core CAS primitives (BLAKE3-of-bytes) — bead ley-line-open-0c8c0b"
 license = "AGPL-3.0-or-later"

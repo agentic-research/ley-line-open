@@ -84,7 +84,7 @@ struct ChildRow {
     field: Option<String>,
 }
 
-struct ParsedFile {
+pub(crate) struct ParsedFile {
     rel: String,
     abs_path: String,
     language: String,
@@ -2083,7 +2083,7 @@ fn hash_internal(kind: &str, child_hashes: &[[u8; 32]]) -> [u8; 32] {
 // ---------------------------------------------------------------------------
 
 /// Parse a single file into a `ParsedFile`. No database access.
-fn parse_file_pure(
+pub(crate) fn parse_file_pure(
     content: &[u8],
     language: TsLanguage,
     source_id: &str,
@@ -2240,6 +2240,133 @@ fn parse_file_pure(
         pointer_blob_hash,
         source_blob_bytes,
     })
+}
+
+/// Parse `content` under `language` and serialize the resulting AST +
+/// extracted refs as JSON matching the shipped `_ast` / `node_defs` /
+/// `node_refs` / `_imports` schema. Bead `ley-line-open-851f24`
+/// follow-up: powers the daemon's `{"emit_ast": true}` extension on
+/// the `validate` op, so mache's writeback linter can fold ONE parse
+/// into both syntax validation AND SQL-shaped AST rows — killing the
+/// interim `go/parser` and unblocking CGO removal on the mache side.
+///
+/// Response shape:
+///
+/// ```json
+/// {
+///   "source_id": "<source_id>",
+///   "language": "<name>",
+///   "content_hash": "<hex-32>",
+///   "ast": [
+///     {"node_id": "...", "source_id": "...", "node_kind": "...",
+///      "start_byte": N, "end_byte": N, "start_row": N, "start_col": N,
+///      "end_row": N, "end_col": N, "node_hash": "<hex-32>"}
+///   ],
+///   "defs": [
+///     {"token": "...", "node_id": "...", "source_id": "...",
+///      "container_node_id": "..."|null, "canonical_kind": "..."|null}
+///   ],
+///   "refs": [
+///     {"token": "...", "node_id": "...", "source_id": "...",
+///      "container_node_id": "..."|null}
+///   ],
+///   "imports": [{"alias": "...", "path": "...", "source_id": "..."}]
+/// }
+/// ```
+///
+/// The `source_id` on every row is exactly the `source_id` argument
+/// passed in — caller controls the identity (typically the file's
+/// path-relative-to-repo or a stable synthetic id). Content hash is
+/// BLAKE3-32 of `content`; node hashes are the merkle-AST addresses
+/// from ADR-0027 (byte-identical to what `parse_into_conn` produces
+/// so a folded row inserts cleanly into an existing `_ast` snapshot).
+pub(crate) fn parse_to_ast_json(
+    content: &[u8],
+    language: leyline_ts::languages::TsLanguage,
+    source_id: &str,
+) -> Result<serde_json::Value> {
+    // file_mtime + file_size default to 0 for in-memory buffers —
+    // they're metadata for the file-index row, which callers of
+    // parse_to_ast_json don't populate (no `_file_index` in the
+    // JSON response shape).
+    let parsed = parse_file_pure(
+        content,
+        language,
+        source_id,
+        source_id,
+        0,
+        content.len() as i64,
+    )?;
+
+    let ast: Vec<serde_json::Value> = parsed
+        .ast_entries
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "node_id": a.node_id,
+                "source_id": a.source_id,
+                "node_kind": a.node_kind,
+                "start_byte": a.start_byte,
+                "end_byte": a.end_byte,
+                "start_row": a.start_row,
+                "start_col": a.start_col,
+                "end_row": a.end_row,
+                "end_col": a.end_col,
+                "node_hash": hex::encode(a.node_hash),
+            })
+        })
+        .collect();
+
+    let mut defs = Vec::new();
+    let mut refs = Vec::new();
+    let mut imports = Vec::new();
+    for r in &parsed.refs {
+        match r {
+            leyline_ts::refs::ExtractedRef::Def {
+                token,
+                node_id,
+                source_id,
+                container_node_id,
+                canonical_kind,
+            } => defs.push(serde_json::json!({
+                "token": token,
+                "node_id": node_id,
+                "source_id": source_id,
+                "container_node_id": container_node_id,
+                "canonical_kind": canonical_kind,
+            })),
+            leyline_ts::refs::ExtractedRef::Ref {
+                token,
+                node_id,
+                source_id,
+                container_node_id,
+            } => refs.push(serde_json::json!({
+                "token": token,
+                "node_id": node_id,
+                "source_id": source_id,
+                "container_node_id": container_node_id,
+            })),
+            leyline_ts::refs::ExtractedRef::Import {
+                alias,
+                path,
+                source_id,
+            } => imports.push(serde_json::json!({
+                "alias": alias,
+                "path": path,
+                "source_id": source_id,
+            })),
+        }
+    }
+
+    Ok(serde_json::json!({
+        "source_id": source_id,
+        "language": parsed.language,
+        "content_hash": hex::encode(parsed.content_hash),
+        "ast": ast,
+        "defs": defs,
+        "refs": refs,
+        "imports": imports,
+    }))
 }
 
 /// Bottom-up (post-order) fold of `node`'s subtree.

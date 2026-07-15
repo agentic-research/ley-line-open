@@ -44,7 +44,19 @@ docstring for full semantics.
 | `$Since(version)` | field, struct | version string (`v1` or `0.1.0`) | New fields added in a minor bump |
 | `$Deprecated(replacement)` | field, struct | replacement pointer or `""` | Fields/structs scheduled for removal |
 | `$Unstable` | field, struct | (no value — flag only) | Provisional shapes that may change |
-| `$Op(input, output, errors)` | struct, interface | operation triple | Tool calls, vault-proxy calls, sign-helper RPCs |
+| `$Doc(text)` | field, struct, enum, enumerant | documentation text | Descriptions that must survive into a generated schema (capnp drops `#` comments); MCP tool/property descriptions |
+| `$Optional` | field | (no value — flag only) | Curated required-subsets — the field drops out of JSON Schema `required` |
+| `$Default(json)` | field | JSON-encoded default value (`2`, `false`, `"task"`, `""`) | JSON Schema `default`; MCP tool argument defaults |
+| `$Op(name, input, output, errors)` | struct, interface | operation name + triple | Tool calls, vault-proxy calls, sign-helper RPCs |
+
+`$Doc` / `$Optional` / `$Default` are lowered by the schema-bridge
+JSON-Schema (`jsonschema`) and tool-definitions (`tooldefs`) emitters —
+`$Doc`→`description`, `$Optional`→dropped-from-`required`,
+`$Default`→`default`. zod/Go do NOT express them today (explicit no-op).
+The `tooldefs` emitter turns each `$Op` struct into an MCP `tools/list`
+entry `{name, description, inputSchema}`, using `$Op.name` as the tool
+name and the struct's `$Doc` as the tool description
+(ley-line-open-beb8bb).
 
 ## §3 Worked examples
 

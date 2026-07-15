@@ -19,6 +19,7 @@ use capnp::private::layout::{PointerBuilder, StructBuilder, StructSize};
 use capnp::schema_capnp;
 use capnp::traits::FromPointerBuilder;
 use indoc::indoc;
+use serde_json::json;
 
 use leyline_schema_bridge::error::SchemaBridgeError;
 use leyline_schema_bridge::{OutputFormat, emit, inputs, outputs};
@@ -2639,9 +2640,23 @@ fn assert_cross_emitter_agreement(schema: &leyline_schema_bridge::Schema) {
                     .iter()
                     .map(|v| v.as_str().expect("string"))
                     .collect();
-                // capnp has no optional fields — all three emitters
-                // treat every base field as required.
-                assert_eq!(required, field_names, "jsonschema required drifted:\n{js}");
+                // jsonschema honors `$Optional`: `required` is the
+                // non-optional field subset, in declaration order.
+                // zod/go do NOT express optionality (they'd emit
+                // `.optional()` / a pointer field) — EXEMPTED here; the
+                // per-field name checks above already prove neither
+                // emitter DROPPED the field, which is what this gate
+                // guards. Un-annotated fixtures keep all fields required.
+                let expected_required: Vec<&str> = s
+                    .fields
+                    .iter()
+                    .filter(|f| !f.optional)
+                    .map(|f| f.name.as_str())
+                    .collect();
+                assert_eq!(
+                    required, expected_required,
+                    "jsonschema required drifted:\n{js}"
+                );
             }
             Some(u) if u.discriminant_name.is_none() => {
                 let branches = def["oneOf"]
@@ -2709,6 +2724,678 @@ fn cross_emitter_agreement_identity_proof() {
 fn cross_emitter_agreement_backend_named_union() {
     // Enum + base fields + named-group union in one fixture.
     let message = build_backend_fixture();
+    let schema = parse(&message).expect("parse");
+    assert_cross_emitter_agreement(&schema);
+}
+
+// ══ Annotation vocabulary + tool-definitions (ley-line-open-beb8bb) ══
+//
+// `_traits.capnp` annotation ids the emitters LOWER. MUST match the
+// ordinals declared in `_traits.capnp`.
+const ANN_TRAITS_OP: u64 = 0xd3b652fd6a4debed;
+const ANN_TRAITS_DOC: u64 = 0xd3b652fd6a4debee;
+const ANN_TRAITS_OPTIONAL: u64 = 0xd3b652fd6a4debef;
+const ANN_TRAITS_DEFAULT: u64 = 0xd3b652fd6a4debf0;
+
+// Builder-side poke for the `$Op(OpInfo)` annotation value. OpInfo is an
+// all-pointer struct (`input @0`, `output @1`, `errors @2`, `name @3`),
+// so 0 data words + 4 pointer slots — pointer-slot index == ordinal,
+// which is exactly what `decode_op_info` reads back.
+struct OpInfoPoke<'a>(StructBuilder<'a>);
+impl<'a> FromPointerBuilder<'a> for OpInfoPoke<'a> {
+    fn init_pointer(builder: PointerBuilder<'a>, _len: u32) -> Self {
+        OpInfoPoke(builder.init_struct(StructSize {
+            data: 0,
+            pointers: 4,
+        }))
+    }
+    fn get_from_pointer(
+        builder: PointerBuilder<'a>,
+        _default: Option<&'a [Word]>,
+    ) -> capnp::Result<Self> {
+        Ok(OpInfoPoke(builder.get_struct(
+            StructSize {
+                data: 0,
+                pointers: 4,
+            },
+            None,
+        )?))
+    }
+}
+
+// Write a Text field into pointer slot `ptr` of an OpInfo poke.
+fn poke_op_text(b: &mut StructBuilder<'_>, ptr: u32, s: &str) {
+    b.reborrow()
+        .get_pointer_field(ptr as usize)
+        .init_text(s.len() as u32)
+        .push_str(s);
+}
+
+// Apply the field vocabulary ($Doc/$Optional/$Default) to a field. The
+// field remains usable afterwards (its slot is set by the caller).
+fn set_field_annotations(
+    field: &mut schema_capnp::field::Builder<'_>,
+    doc: Option<&str>,
+    optional: bool,
+    default: Option<&str>,
+) {
+    let count = doc.is_some() as u32 + u32::from(optional) + default.is_some() as u32;
+    if count == 0 {
+        return;
+    }
+    let mut anns = field.reborrow().init_annotations(count);
+    let mut idx = 0u32;
+    if let Some(d) = doc {
+        let mut a = anns.reborrow().get(idx);
+        a.set_id(ANN_TRAITS_DOC);
+        let mut v = a.init_value();
+        v.set_text(d);
+        idx += 1;
+    }
+    if optional {
+        let mut a = anns.reborrow().get(idx);
+        a.set_id(ANN_TRAITS_OPTIONAL);
+        let mut v = a.init_value();
+        v.set_void(());
+        idx += 1;
+    }
+    if let Some(dv) = default {
+        let mut a = anns.reborrow().get(idx);
+        a.set_id(ANN_TRAITS_DEFAULT);
+        let mut v = a.init_value();
+        v.set_text(dv);
+    }
+}
+
+// A field's shape in a hand-built tool-input fixture.
+struct FieldSpec {
+    name: &'static str,
+    // "string" | "integer" | "boolean" | "array" (array = List(Text)).
+    ty: &'static str,
+    doc: &'static str,
+    optional: bool,
+    // JSON-encoded default (`2`, `false`, `"task"`, `""`) or None.
+    default: Option<&'static str>,
+}
+
+// Set a field's slot type from a FieldSpec ty tag.
+fn set_slot_type(field: &mut schema_capnp::field::Builder<'_>, ty: &str) {
+    let mut t = field.reborrow().init_slot().init_type();
+    match ty {
+        "string" => t.set_text(()),
+        "integer" => t.set_int32(()),
+        "boolean" => t.set_bool(()),
+        "array" => {
+            let list = t.init_list();
+            list.init_element_type().set_text(());
+        }
+        other => panic!("unknown FieldSpec ty {other}"),
+    }
+}
+
+// Build a CodeGeneratorRequest for one `$Op`-annotated struct whose
+// fields carry the annotation vocabulary — the shape rosary's MCP tool
+// registry produces. `tool_name`/`tool_doc` populate the `$Op.name` and
+// struct `$Doc`; each FieldSpec populates a field + its annotations.
+fn build_tool_fixture(
+    struct_name: &str,
+    tool_name: &str,
+    tool_doc: &str,
+    fields_spec: &[FieldSpec],
+) -> Builder<HeapAllocator> {
+    let mut message = Builder::new_default();
+    {
+        let request = message.init_root::<schema_capnp::code_generator_request::Builder>();
+        let mut nodes = request.init_nodes(2);
+        fill_file_node(nodes.reborrow().get(0), 0xFFFE, "tools.capnp");
+
+        let mut node = nodes.reborrow().get(1);
+        node.set_id(0xA11CE);
+        node.set_display_name(&format!("tools.capnp:{struct_name}"));
+        node.set_display_name_prefix_length("tools.capnp:".len() as u32);
+
+        // Struct-node annotations: $Doc (tool description) + $Op (name).
+        {
+            let mut anns = node.reborrow().init_annotations(2);
+            {
+                let mut a = anns.reborrow().get(0);
+                a.set_id(ANN_TRAITS_DOC);
+                let mut v = a.init_value();
+                v.set_text(tool_doc);
+            }
+            {
+                let mut a = anns.reborrow().get(1);
+                a.set_id(ANN_TRAITS_OP);
+                let OpInfoPoke(mut b) = a.init_value().init_struct().init_as::<OpInfoPoke>();
+                // input @0 = self; name @3 = the MCP tool name.
+                poke_op_text(&mut b, 0, struct_name);
+                poke_op_text(&mut b, 3, tool_name);
+            }
+        }
+
+        let mut s = node.init_struct();
+        s.set_discriminant_count(0);
+        let mut fields = s.init_fields(fields_spec.len() as u32);
+        for (i, spec) in fields_spec.iter().enumerate() {
+            let mut field = fields.reborrow().get(i as u32);
+            field.set_name(spec.name);
+            field.set_code_order(i as u16);
+            set_field_annotations(&mut field, Some(spec.doc), spec.optional, spec.default);
+            set_slot_type(&mut field, spec.ty);
+        }
+    }
+    message
+}
+
+// Independent (serde_json-built) expectation for one field's property
+// object — mirrors the emitter's mapping without sharing its string
+// emission, so agreement is a real two-implementation check.
+fn expected_property(spec: &FieldSpec) -> serde_json::Value {
+    let mut p = serde_json::Map::new();
+    match spec.ty {
+        "string" => {
+            p.insert("type".into(), json!("string"));
+        }
+        "integer" => {
+            p.insert("type".into(), json!("integer"));
+        }
+        "boolean" => {
+            p.insert("type".into(), json!("boolean"));
+        }
+        "array" => {
+            p.insert("type".into(), json!("array"));
+            p.insert("items".into(), json!({ "type": "string" }));
+        }
+        other => panic!("unknown ty {other}"),
+    }
+    p.insert("description".into(), json!(spec.doc));
+    if let Some(d) = spec.default {
+        p.insert(
+            "default".into(),
+            serde_json::from_str(d).expect("default must be valid JSON"),
+        );
+    }
+    serde_json::Value::Object(p)
+}
+
+// ── Format plumbing ───────────────────────────────────────────────
+
+#[test]
+fn tooldefs_format_parses() {
+    assert_eq!(
+        OutputFormat::parse("tooldefs").expect("parse tooldefs"),
+        OutputFormat::ToolDefs
+    );
+}
+
+#[test]
+fn tooldefs_format_suffix_is_tools_json() {
+    assert_eq!(OutputFormat::ToolDefs.file_suffix(), "tools.json");
+}
+
+#[test]
+fn tooldefs_format_parses_from_binary_name() {
+    assert_eq!(
+        OutputFormat::from_binary_name("capnpc-schema-bridge-tooldefs").expect("parse"),
+        OutputFormat::ToolDefs
+    );
+}
+
+#[test]
+fn tooldefs_dispatch_routes_to_tool_defs_emitter() {
+    let spec = [FieldSpec {
+        name: "id",
+        ty: "string",
+        doc: "Bead ID",
+        optional: false,
+        default: None,
+    }];
+    let message = build_tool_fixture("Ping", "rsry_ping", "Ping a bead.", &spec);
+    let schema = parse(&message).expect("parse");
+    let muxed = emit(&schema, OutputFormat::ToolDefs, "tools").expect("mux emit");
+    let direct = outputs::tool_defs::emit(&schema).expect("direct emit");
+    assert_eq!(
+        muxed, direct,
+        "ToolDefs dispatcher must be a pure passthrough"
+    );
+}
+
+// ── Field vocabulary → jsonschema ($defs) ─────────────────────────
+
+#[test]
+fn field_annotations_lower_to_jsonschema() {
+    // A plain struct (no $Op) with annotated fields: description on each,
+    // optional fields drop from `required`, defaults surface.
+    let spec = [
+        FieldSpec {
+            name: "title",
+            ty: "string",
+            doc: "Bead title",
+            optional: false,
+            default: None,
+        },
+        FieldSpec {
+            name: "priority",
+            ty: "integer",
+            doc: "Priority 0-3 (0=P0 highest)",
+            optional: true,
+            default: Some("2"),
+        },
+    ];
+    // Reuse the tool fixture builder but read it via the $defs emitter.
+    let message = build_tool_fixture("BeadThing", "rsry_thing", "A thing.", &spec);
+    let schema = parse(&message).expect("parse");
+    let js = outputs::json_schema::emit(&schema, "tools").expect("emit");
+    let doc: serde_json::Value = serde_json::from_str(&js).expect("valid JSON");
+    let def = &doc["$defs"]["BeadThing"];
+
+    assert_eq!(
+        def["properties"]["title"]["description"],
+        json!("Bead title")
+    );
+    assert_eq!(
+        def["properties"]["priority"]["description"],
+        json!("Priority 0-3 (0=P0 highest)")
+    );
+    assert_eq!(def["properties"]["priority"]["default"], json!(2));
+    // Only the non-optional field is required.
+    assert_eq!(def["required"], json!(["title"]));
+    // $defs mode still closes the object.
+    assert_eq!(def["additionalProperties"], json!(false));
+}
+
+#[test]
+fn struct_and_enum_doc_lower_to_description() {
+    // Struct $Doc → struct-level description; enum $Doc → enum
+    // description. Build a struct with a $Doc + an enum field, plus a
+    // $Doc'd enum node.
+    let mut message = Builder::new_default();
+    let enum_id: u64 = 0xE0E0;
+    {
+        let request = message.init_root::<schema_capnp::code_generator_request::Builder>();
+        let mut nodes = request.init_nodes(3);
+        fill_file_node(nodes.reborrow().get(0), 0xFFFE, "test.capnp");
+
+        // enum Tier $Doc("the deployment tier") { hypervisor; cluster; }
+        {
+            let mut n = nodes.reborrow().get(1);
+            n.set_id(enum_id);
+            n.set_display_name("test.capnp:Tier");
+            n.set_display_name_prefix_length("test.capnp:".len() as u32);
+            {
+                let mut anns = n.reborrow().init_annotations(1);
+                let mut a = anns.reborrow().get(0);
+                a.set_id(ANN_TRAITS_DOC);
+                let mut v = a.init_value();
+                v.set_text("the deployment tier");
+            }
+            let e = n.init_enum();
+            let mut enumerants = e.init_enumerants(2);
+            enumerants.reborrow().get(0).set_name("hypervisor");
+            enumerants.reborrow().get(1).set_name("cluster");
+        }
+        // struct Bundle $Doc("a deployable bundle") { tier :Tier; }
+        {
+            let mut n = nodes.reborrow().get(2);
+            n.set_id(0xAAAA);
+            n.set_display_name("test.capnp:Bundle");
+            n.set_display_name_prefix_length("test.capnp:".len() as u32);
+            {
+                let mut anns = n.reborrow().init_annotations(1);
+                let mut a = anns.reborrow().get(0);
+                a.set_id(ANN_TRAITS_DOC);
+                let mut v = a.init_value();
+                v.set_text("a deployable bundle");
+            }
+            let mut s = n.init_struct();
+            s.set_discriminant_count(0);
+            let mut fields = s.init_fields(1);
+            let mut field = fields.reborrow().get(0);
+            field.set_name("tier");
+            field.set_code_order(0);
+            field
+                .init_slot()
+                .init_type()
+                .init_enum()
+                .set_type_id(enum_id);
+        }
+    }
+
+    let schema = parse(&message).expect("parse");
+    let js = outputs::json_schema::emit(&schema, "test").expect("emit");
+    let doc: serde_json::Value = serde_json::from_str(&js).expect("valid JSON");
+    assert_eq!(
+        doc["$defs"]["Bundle"]["description"],
+        json!("a deployable bundle")
+    );
+    assert_eq!(
+        doc["$defs"]["Tier"]["description"],
+        json!("the deployment tier")
+    );
+    // Enum values still present.
+    assert_eq!(
+        doc["$defs"]["Tier"]["enum"],
+        json!(["hypervisor", "cluster"])
+    );
+}
+
+#[test]
+fn enumerant_doc_is_accepted_but_not_lowered() {
+    // $Doc on an enumerant is valid per the vocabulary — the parser must
+    // NOT reject it (it just isn't lowered: JSON Schema has no per-value
+    // description slot). A DIFFERENT annotation on an enumerant still
+    // fails loud (covered by unknown_annotation tests).
+    let mut message = Builder::new_default();
+    {
+        let request = message.init_root::<schema_capnp::code_generator_request::Builder>();
+        let mut nodes = request.init_nodes(2);
+        fill_file_node(nodes.reborrow().get(0), 0xFFFE, "test.capnp");
+
+        let mut n = nodes.reborrow().get(1);
+        n.set_id(0xCCCC);
+        n.set_display_name("test.capnp:Tier");
+        n.set_display_name_prefix_length("test.capnp:".len() as u32);
+        let e = n.init_enum();
+        let mut enumerants = e.init_enumerants(1);
+        let mut en = enumerants.reborrow().get(0);
+        en.set_name("hypervisor");
+        let mut anns = en.reborrow().init_annotations(1);
+        let mut a = anns.reborrow().get(0);
+        a.set_id(ANN_TRAITS_DOC);
+        let mut v = a.init_value();
+        v.set_text("bare-metal tier");
+    }
+
+    let schema = parse(&message).expect("parse must accept enumerant $Doc");
+    assert_eq!(schema.enums.len(), 1);
+    assert_eq!(schema.enums[0].variants, vec!["hypervisor".to_owned()]);
+}
+
+// ── Tool-definitions output shape ─────────────────────────────────
+
+#[test]
+fn tooldefs_emits_tools_array_without_additional_properties() {
+    let spec = [
+        FieldSpec {
+            name: "id",
+            ty: "string",
+            doc: "Bead ID",
+            optional: false,
+            default: None,
+        },
+        FieldSpec {
+            name: "force",
+            ty: "boolean",
+            doc: "Skip the gate.",
+            optional: true,
+            default: Some("false"),
+        },
+    ];
+    let message = build_tool_fixture("BeadClose", "rsry_bead_close", "Close a bead.", &spec);
+    let schema = parse(&message).expect("parse");
+    let out = outputs::tool_defs::emit(&schema).expect("emit");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("tooldefs must be valid JSON");
+
+    // Top level is a bare array of tool objects.
+    let tools = v.as_array().expect("tooldefs output must be a JSON array");
+    assert_eq!(tools.len(), 1, "one $Op struct → one tool");
+    let tool = &tools[0];
+    assert_eq!(tool["name"], json!("rsry_bead_close"));
+    assert_eq!(tool["description"], json!("Close a bead."));
+    let input = &tool["inputSchema"];
+    assert_eq!(input["type"], json!("object"));
+    assert_eq!(input["required"], json!(["id"]));
+    assert_eq!(input["properties"]["force"]["default"], json!(false));
+    assert_eq!(input["properties"]["id"]["description"], json!("Bead ID"));
+    // MCP inputSchemas are open — the tooldefs mode must NOT emit
+    // additionalProperties (the live rosary registry omits it).
+    assert!(
+        input.get("additionalProperties").is_none(),
+        "tooldefs inputSchema must omit additionalProperties:\n{out}"
+    );
+}
+
+#[test]
+fn tooldefs_empty_when_no_op_structs() {
+    // A plain struct with no $Op → empty tools array.
+    let spec = [FieldSpec {
+        name: "x",
+        ty: "string",
+        doc: "x",
+        optional: false,
+        default: None,
+    }];
+    // build a plain (non-$Op) struct by reusing the scalar fixture path.
+    let mut message = Builder::new_default();
+    {
+        let request = message.init_root::<schema_capnp::code_generator_request::Builder>();
+        let mut nodes = request.init_nodes(2);
+        fill_file_node(nodes.reborrow().get(0), 0xFFFE, "test.capnp");
+        let mut node = nodes.reborrow().get(1);
+        node.set_id(0xAAAA);
+        node.set_display_name("test.capnp:Plain");
+        node.set_display_name_prefix_length("test.capnp:".len() as u32);
+        let mut s = node.init_struct();
+        s.set_discriminant_count(0);
+        let mut fields = s.init_fields(1);
+        let mut field = fields.reborrow().get(0);
+        field.set_name(spec[0].name);
+        field.set_code_order(0);
+        field.init_slot().init_type().set_text(());
+    }
+    let schema = parse(&message).expect("parse");
+    let out = outputs::tool_defs::emit(&schema).expect("emit");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+    assert_eq!(v, json!([]), "no $Op structs → empty array");
+}
+
+// ── Acceptance: bead_create tooldefs ≈ live rosary tools.rs entry ──
+//
+// The consumer-contract proof (ley-line-open-beb8bb / rosary-08a278): a
+// schema-bridge tooldefs run over a `BeadCreateInput` registry struct
+// must reproduce the exact MCP `tools/list` entry rosary hand-writes in
+// `src/serve/tools.rs` for `rsry_bead_create` — 13 props, only `title`
+// required, defaults + enum-values-in-descriptions. Structural equality
+// (parsed serde_json::Value) proves rosary's generated-vs-committed
+// drift gate CAN pass. Strings are copied verbatim from tools.rs.
+
+fn bead_create_fields() -> Vec<FieldSpec> {
+    vec![
+        FieldSpec {
+            name: "scope",
+            ty: "string",
+            doc: "Canonical scope: 'repo:<name>' (bare names like 'rosary' also parse). Takes priority over repo_path.",
+            optional: true,
+            default: None,
+        },
+        FieldSpec {
+            name: "repo_path",
+            ty: "string",
+            doc: "Legacy: path to repo with .beads/ directory",
+            optional: true,
+            default: None,
+        },
+        FieldSpec {
+            name: "title",
+            ty: "string",
+            doc: "Bead title",
+            optional: false,
+            default: None,
+        },
+        FieldSpec {
+            name: "description",
+            ty: "string",
+            doc: "Bead description",
+            optional: true,
+            default: Some(r#""""#),
+        },
+        FieldSpec {
+            name: "priority",
+            ty: "integer",
+            doc: "Priority 0-3 (0=P0 highest)",
+            optional: true,
+            default: Some("2"),
+        },
+        FieldSpec {
+            name: "issue_type",
+            ty: "string",
+            doc: "Issue type: bug, feature, task, chore, review, epic, design, research",
+            optional: true,
+            default: Some(r#""task""#),
+        },
+        FieldSpec {
+            name: "work_mode",
+            ty: "string",
+            doc: "Optional secondary intent axis. Valid values: implementation, procedural, investigation, discovery, synthesis, adversarial, audit, validation, architecture, policy, cleanup, coordination. Used only to choose a canonical issue_type default when issue_type is omitted.",
+            optional: true,
+            default: None,
+        },
+        FieldSpec {
+            name: "owner",
+            ty: "string",
+            doc: "Agent owner (dev-agent, staging-agent, etc.). Auto-assigned from issue_type if omitted.",
+            optional: true,
+            default: None,
+        },
+        FieldSpec {
+            name: "files",
+            ty: "array",
+            doc: "Source files this bead touches. CRITICAL: these scope parallel dispatch — has_file_overlap() (epic.rs:386-393) blocks concurrent beads sharing files, and reconcile.rs:372-380 enforces it at dispatch time. Set scopes ONLY after reading the code; guessed scopes cause false-negative overlap and agent collisions. Include both files being modified AND files needing wiring changes (imports, call sites). New files are safe — no overlap possible.",
+            optional: true,
+            default: None,
+        },
+        FieldSpec {
+            name: "test_files",
+            ty: "array",
+            doc: "Test files to validate the change. Also checked for overlap — two beads sharing a test file will be serialized, not parallelized.",
+            optional: true,
+            default: None,
+        },
+        FieldSpec {
+            name: "depends_on",
+            ty: "array",
+            doc: "Bead IDs this bead depends on (blocked until they complete). Creates entries in the dependencies table.",
+            optional: true,
+            default: None,
+        },
+        FieldSpec {
+            name: "acceptance_criteria",
+            ty: "string",
+            doc: "Structured close condition — how 'done' is verified (a runnable command or a resolution statement). The gate checks THIS field's presence, not the description prose, so it can't be fooled by a negation. Preferred over baking the condition into the description.",
+            optional: true,
+            default: None,
+        },
+        FieldSpec {
+            name: "force",
+            ty: "boolean",
+            doc: "Skip the close-condition check (for planning/legacy beads). Mirrors `rsry bead create --force`. Default false.",
+            optional: true,
+            default: Some("false"),
+        },
+    ]
+}
+
+const BEAD_CREATE_DESC: &str = "Create a new bead (work item) in a repo's Dolt database. Use when you've identified a discrete, actionable issue. Set file scopes accurately — they determine parallel dispatch safety via has_file_overlap(). IMPLEMENTATION beads (bug/feature/task/chore) MUST declare a close condition — a runnable test/build command in `description` (e.g. `cargo test -p <crate>`) or `test_files` — or the create fails loud (ADR-0010: a bead with no defined 'done' can never be closed by an observation). Pass either `scope: 'repo:<name>'` (canonical) or `repo_path: '/path/to/repo'` (legacy).";
+
+#[test]
+fn bead_create_tooldefs_matches_live_tools_rs() {
+    let fields = bead_create_fields();
+    let message = build_tool_fixture(
+        "BeadCreateInput",
+        "rsry_bead_create",
+        BEAD_CREATE_DESC,
+        &fields,
+    );
+    let schema = parse(&message).expect("parse");
+    let out = outputs::tool_defs::emit(&schema).expect("emit");
+    let tools: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+    let tool = &tools.as_array().expect("array")[0];
+
+    // Build the expected entry INDEPENDENTLY via serde_json from the same
+    // field table — two implementations (string-emit vs Value-build)
+    // meeting in the middle.
+    let mut props = serde_json::Map::new();
+    for f in &fields {
+        props.insert(f.name.to_owned(), expected_property(f));
+    }
+    let required: Vec<&str> = fields
+        .iter()
+        .filter(|f| !f.optional)
+        .map(|f| f.name)
+        .collect();
+    let expected = json!({
+        "name": "rsry_bead_create",
+        "description": BEAD_CREATE_DESC,
+        "inputSchema": {
+            "type": "object",
+            "properties": serde_json::Value::Object(props),
+            "required": required,
+        }
+    });
+    assert_eq!(
+        tool, &expected,
+        "tooldefs entry drifted from tools.rs shape"
+    );
+
+    // Concrete spot-checks copied from live tools.rs (defends the
+    // structural match against the registry the drift gate targets).
+    assert_eq!(tool["name"], json!("rsry_bead_create"));
+    assert_eq!(tool["inputSchema"]["required"], json!(["title"]));
+    assert_eq!(
+        tool["inputSchema"]["properties"].as_object().unwrap().len(),
+        13
+    );
+    assert_eq!(
+        tool["inputSchema"]["properties"]["description"]["default"],
+        json!("")
+    );
+    assert_eq!(
+        tool["inputSchema"]["properties"]["priority"]["default"],
+        json!(2)
+    );
+    assert_eq!(
+        tool["inputSchema"]["properties"]["issue_type"]["default"],
+        json!("task")
+    );
+    assert_eq!(
+        tool["inputSchema"]["properties"]["force"]["default"],
+        json!(false)
+    );
+    // enum-values-in-description convention (no JSON `enum` array).
+    assert!(
+        tool["inputSchema"]["properties"]["issue_type"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("bug, feature, task"),
+        "issue_type choices must live in the description prose"
+    );
+    assert!(
+        tool["inputSchema"]["properties"]["issue_type"]
+            .get("enum")
+            .is_none(),
+        "no JSON enum array — choices are prose (matches tools.rs)"
+    );
+    // No additionalProperties anywhere in the inputSchema.
+    assert!(
+        tool["inputSchema"].get("additionalProperties").is_none(),
+        "must omit additionalProperties"
+    );
+}
+
+// ── Cross-emitter agreement: annotated fixture ────────────────────
+
+#[test]
+fn cross_emitter_agreement_annotated_tool() {
+    // The annotation-bearing struct still keeps zod/go/jsonschema
+    // structurally aligned: every field name surfaces in all three, and
+    // jsonschema's `required` honors $Optional (zod/go exempted).
+    let fields = bead_create_fields();
+    let message = build_tool_fixture(
+        "BeadCreateInput",
+        "rsry_bead_create",
+        BEAD_CREATE_DESC,
+        &fields,
+    );
     let schema = parse(&message).expect("parse");
     assert_cross_emitter_agreement(&schema);
 }

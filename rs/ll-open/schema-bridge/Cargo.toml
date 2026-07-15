@@ -24,6 +24,10 @@ path = "src/main.rs"
 name = "capnpc-schema-bridge-jsonschema"
 path = "src/main.rs"
 
+[[bin]]
+name = "capnpc-schema-bridge-tooldefs"
+path = "src/main.rs"
+
 [dependencies]
 capnp = { workspace = true }
 thiserror = { workspace = true }

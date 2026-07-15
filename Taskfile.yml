@@ -492,10 +492,15 @@ tasks:
   ci:
     desc: Common CI gate — runs on every PR. Excludes `test:perf` (release-profile rebuild adds ~90-120s; main-push-only via ci.yml's conditional `test:perf` step). For the full main-push gate locally, run `task ci:full`.
     cmds:
-      - task: check
-      - task: clippy
+      # Compile-free gates first (sub-second): a formatting slip or lint
+      # hit fails here instead of after minutes of check+clippy — 3 of 6
+      # worktree agents on 2026-07-15 paid a full compile before reaching
+      # fmt:check at its old position (bead ley-line-open-9ca974).
       - task: fmt:check
       - task: lint:blake3
+      - task: readme:version-check
+      - task: check
+      - task: clippy
       - task: smells
       - task: build:fs-static
       - task: build:fs-nfs-isolated
@@ -505,7 +510,6 @@ tasks:
       - task: sign:host:test
       - task: compat:check
       - task: gen:server-json:check
-      - task: readme:version-check
 
   ci:full:
     desc: Full CI pipeline including the release-profile perf regression gate. Runs on main pushes via ci.yml's conditional step; available locally via `task ci:full` for pre-push validation.

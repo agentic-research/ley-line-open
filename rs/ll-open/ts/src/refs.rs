@@ -605,26 +605,21 @@ fn rust_impl_receiver(func_node: &Node, source: &[u8]) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Extract Python definitions, call references, and imports from a
-/// single AST node. Pure data — no DB access.
+/// single AST node.
 ///
-/// Bead `ley-line-open-caf423`: Python was recognized by the parse
-/// pipeline (had a `TsLanguage::Python` variant, a `.py` extension
-/// mapping, and produced `_ast` rows) but the language dispatcher's
-/// match had no Python arm, so every Python file wrote zero rows to
-/// `node_defs` / `node_refs`. Mache's cross-language rules join on
-/// those tables, so the emptiness surfaced as false-positive smells.
+/// Pure data — no database access, safe for parallel use.
 ///
-/// Node kinds handled (tree-sitter-python grammar):
-/// - `function_definition` → Def (uses `name` field). When nested inside
-///   a `class_definition`, we also emit the qualified `Class.method`
-///   form so consumers can distinguish methods on different classes.
-/// - `class_definition` → Def (name field).
-/// - `call` → Ref:
-///     - `function: identifier`   → bare `func` token
-///     - `function: attribute`    → qualified `obj.attr` + bare `attr`
-/// - `import_statement` → Import (each dotted_name / aliased_import).
-/// - `import_from_statement` → Import (each imported name, path is the
-///   `module` field).
+/// The per-language knowledge lives in `queries/python/tags.scm`; this
+/// function compiles it once and delegates to the generic
+/// [`QueryEngine`](crate::query_engine::QueryEngine) interpreter (bead
+/// `ley-line-open-426dfd`, following the Go port in bead
+/// `ley-line-open-206d53`). Two arms the engine's vocabulary cannot
+/// express stay imperative in the match below — qualified
+/// `Class.method` defs (ancestor qualifier) and `import_from_statement`
+/// (joined path); each carries its own leak note. Emission behavior
+/// (bead `ley-line-open-caf423`) is pinned by cli-lib's
+/// `def_ref_extraction_fidelity_test` — edit the `.scm`, keep the
+/// fixtures green.
 #[cfg(feature = "python")]
 pub fn extract_python(
     node: &Node,
@@ -633,24 +628,32 @@ pub fn extract_python(
     source_id: &str,
     container_node_id: Option<&str>,
 ) -> Vec<ExtractedRef> {
-    let mut out = Vec::new();
+    use std::sync::OnceLock;
+    static ENGINE: OnceLock<crate::query_engine::QueryEngine> = OnceLock::new();
+    let engine = ENGINE.get_or_init(|| {
+        crate::query_engine::QueryEngine::new(
+            crate::languages::TsLanguage::Python,
+            include_str!("../queries/python/tags.scm"),
+        )
+        .expect("compiled-in queries/python/tags.scm must compile against tree-sitter-python")
+    });
 
+    let mut out = Vec::new();
     match node.kind() {
+        // Query-inexpressible leak 1: the qualified `Class.method` def.
+        // The qualifier is an ANCESTOR of the anchored node
+        // (function_definition → block → class_definition) and
+        // tree-sitter queries match downward only. A pattern rooted at
+        // the class instead would emit under the CLASS's node_id and
+        // canonical_kind, not the method's. The engine emits the bare
+        // `method` def; this arm prepends the qualified form —
+        // qualified-first ordering, same as the engine's own dual-emit.
         "function_definition" => {
-            let Some(name_node) = node.child_by_field_name("name") else {
-                return out;
-            };
-            let Ok(name) = name_node.utf8_text(source) else {
-                return out;
-            };
-            if name.is_empty() {
-                return out;
-            }
-            // Method disambiguation: function_definition inside
-            // class_definition.body (`block`) is a method. Emit the
-            // qualified `Class.method` form so mache's cross-language
-            // rules can distinguish methods on different classes.
-            if let Some(cls) = python_enclosing_class(node, source) {
+            if let Some(name_node) = node.child_by_field_name("name")
+                && let Ok(name) = name_node.utf8_text(source)
+                && !name.is_empty()
+                && let Some(cls) = python_enclosing_class(node, source)
+            {
                 out.push(ExtractedRef::Def {
                     token: format!("{cls}.{name}"),
                     node_id: node_id.to_string(),
@@ -660,115 +663,14 @@ pub fn extract_python(
                         .canonical_kind(node.kind()),
                 });
             }
-            out.push(ExtractedRef::Def {
-                token: name.to_string(),
-                node_id: node_id.to_string(),
-                source_id: source_id.to_string(),
-                container_node_id: container_node_id.map(str::to_string),
-                canonical_kind: crate::languages::TsLanguage::Python.canonical_kind(node.kind()),
-            });
         }
-        "class_definition" => {
-            if let Some(name_node) = node.child_by_field_name("name")
-                && let Ok(token) = name_node.utf8_text(source)
-                && !token.is_empty()
-            {
-                out.push(ExtractedRef::Def {
-                    token: token.to_string(),
-                    node_id: node_id.to_string(),
-                    source_id: source_id.to_string(),
-                    container_node_id: container_node_id.map(str::to_string),
-                    canonical_kind: crate::languages::TsLanguage::Python
-                        .canonical_kind(node.kind()),
-                });
-            }
-        }
-        "call" => {
-            if let Some(func_node) = node.child_by_field_name("function") {
-                match func_node.kind() {
-                    "identifier" => {
-                        if let Ok(token) = func_node.utf8_text(source)
-                            && !token.is_empty()
-                        {
-                            out.push(ExtractedRef::Ref {
-                                token: token.to_string(),
-                                node_id: node_id.to_string(),
-                                source_id: source_id.to_string(),
-                                container_node_id: container_node_id.map(str::to_string),
-                            });
-                        }
-                    }
-                    "attribute" => {
-                        let attr = func_node
-                            .child_by_field_name("attribute")
-                            .and_then(|n| n.utf8_text(source).ok())
-                            .unwrap_or("");
-                        let obj = func_node
-                            .child_by_field_name("object")
-                            .and_then(|n| n.utf8_text(source).ok())
-                            .unwrap_or("");
-                        if !attr.is_empty() {
-                            if !obj.is_empty() {
-                                out.push(ExtractedRef::Ref {
-                                    token: format!("{obj}.{attr}"),
-                                    node_id: node_id.to_string(),
-                                    source_id: source_id.to_string(),
-                                    container_node_id: container_node_id.map(str::to_string),
-                                });
-                            }
-                            out.push(ExtractedRef::Ref {
-                                token: attr.to_string(),
-                                node_id: node_id.to_string(),
-                                source_id: source_id.to_string(),
-                                container_node_id: container_node_id.map(str::to_string),
-                            });
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        "import_statement" => {
-            // `import a, b as c, x.y` — each name is a child (`dotted_name`
-            // or `aliased_import`). Alias = last segment when unaliased.
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                match child.kind() {
-                    "dotted_name" => {
-                        let path = child.utf8_text(source).unwrap_or("");
-                        if !path.is_empty() {
-                            let alias = path.rsplit('.').next().unwrap_or(path);
-                            out.push(ExtractedRef::Import {
-                                alias: alias.to_string(),
-                                path: path.to_string(),
-                                source_id: source_id.to_string(),
-                            });
-                        }
-                    }
-                    "aliased_import" => {
-                        let path = child
-                            .child_by_field_name("name")
-                            .and_then(|n| n.utf8_text(source).ok())
-                            .unwrap_or("");
-                        let alias = child
-                            .child_by_field_name("alias")
-                            .and_then(|n| n.utf8_text(source).ok())
-                            .unwrap_or("");
-                        if !path.is_empty() && !alias.is_empty() {
-                            out.push(ExtractedRef::Import {
-                                alias: alias.to_string(),
-                                path: path.to_string(),
-                                source_id: source_id.to_string(),
-                            });
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
+        // Query-inexpressible leak 2: from-imports. The emitted path is
+        // a `{module}.{name}` JOIN of two captures; the engine's import
+        // vocabulary carries exactly one @path (quote-trim +
+        // `/`-segment alias defaulting) and has no join. `from mod
+        // import a, b as c` — the `module_name` field carries the path
+        // prefix; every non-module child is an import target.
         "import_from_statement" => {
-            // `from mod import a, b as c`. `module_name` field carries the
-            // path prefix; every non-module child is an import target.
             let prefix = node
                 .child_by_field_name("module_name")
                 .and_then(|n| n.utf8_text(source).ok())
@@ -776,8 +678,8 @@ pub fn extract_python(
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 if child.kind() == "dotted_name" {
-                    // The module_name itself is a `dotted_name`; skip it
-                    // — we handle only the *imported* names here.
+                    // The module_name itself is a `dotted_name`; only
+                    // the *imported* names emit here.
                     if child.utf8_text(source).unwrap_or("") == prefix {
                         continue;
                     }
@@ -822,7 +724,7 @@ pub fn extract_python(
         }
         _ => {}
     }
-
+    out.extend(engine.extract(node, source, node_id, source_id, container_node_id));
     out
 }
 

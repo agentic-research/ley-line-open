@@ -296,6 +296,18 @@ tasks:
     cmds:
       - cargo build -p leyline-fs --lib
 
+  build:fs-nfs-isolated:
+    desc: |
+      Regression (ley-line-open-95cd90): build leyline-fs with `--features nfs`
+      in ISOLATION — no default features, so `fuse` is NOT pulled. An nfs-only
+      consumer (cloister's mediator; macOS, kext-free) must compile without the
+      fuse feature dragging in libc. The #214 bug was a libc dep declared only
+      under `fuse`; the default build (fuse+nfs) masked it. Pure Rust (nfsserve),
+      no system deps — safe in CI. Guards the nfs-only feature surface directly.
+    dir: rs
+    cmds:
+      - cargo build -p leyline-fs --no-default-features --features nfs
+
   # --------------------------------------------------------------------------
   # Tier isolation — guard against cross-tier dep creep. ll-core (Tier 1
   # OSS infrastructure) must build standalone with no transitive pull
@@ -486,6 +498,7 @@ tasks:
       - task: lint:blake3
       - task: smells
       - task: build:fs-static
+      - task: build:fs-nfs-isolated
       - task: tier:isolation
       - task: test
       - task: sign:host:build

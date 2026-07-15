@@ -12,7 +12,7 @@ pub mod outputs;
 
 pub use error::SchemaBridgeError;
 pub use ir::{
-    Const, ConstValue, Enum, FieldType, ScalarType, Schema, Struct, StructField, Union,
+    Const, ConstValue, Enum, FieldType, OpInfo, ScalarType, Schema, Struct, StructField, Union,
     UnionVariant,
 };
 
@@ -29,6 +29,11 @@ pub enum OutputFormat {
     Zod,
     Go,
     JsonSchema,
+    // MCP `tools/list` array of `{name, description, inputSchema}` — one
+    // entry per `$Op`-annotated struct. Distinct from `JsonSchema` (a
+    // `$defs` bag of type schemas): this is the pluckable tool-registry
+    // shape rosary's MCP surface consumes. Per ley-line-open-beb8bb.
+    ToolDefs,
 }
 
 impl OutputFormat {
@@ -45,6 +50,7 @@ impl OutputFormat {
         ("zod", OutputFormat::Zod),
         ("go", OutputFormat::Go),
         ("jsonschema", OutputFormat::JsonSchema),
+        ("tooldefs", OutputFormat::ToolDefs),
     ];
 
     pub fn parse(s: &str) -> Result<Self> {
@@ -97,6 +103,10 @@ impl OutputFormat {
             // `tools.capnp` → `tools.schema.json` — the conventional
             // basename shape editors resolve for `$schema` pointers.
             Self::JsonSchema => "schema.json",
+            // `tools.capnp` → `tools.tools.json` — a bare MCP
+            // `tools/list` array, distinct from the `.schema.json`
+            // `$defs` document.
+            Self::ToolDefs => "tools.json",
         }
     }
 }
@@ -123,5 +133,11 @@ pub fn emit(schema: &Schema, format: OutputFormat, schema_basename: &str) -> Res
         // JSON Schema uses the basename for the document's `$id`
         // (`<basename>.schema.json`).
         OutputFormat::JsonSchema => outputs::json_schema::emit(schema, schema_basename),
+        // Tool-definitions ignores the basename — the output is a bare
+        // MCP `tools/list` array with no `$id`/document envelope.
+        OutputFormat::ToolDefs => {
+            let _ = schema_basename;
+            outputs::tool_defs::emit(schema)
+        }
     }
 }

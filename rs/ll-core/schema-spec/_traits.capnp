@@ -111,6 +111,44 @@ annotation deprecated @0xd3b652fd6a4debeb (field, struct) :Text;
 # unstable means "may change shape but is not going away."
 annotation unstable @0xd3b652fd6a4debec (field, struct) :Void;
 
+# `$Doc(text)` — human-facing documentation for a field, struct, enum,
+# or enumerant. Capnp discards `#` comments at parse, so a spec that
+# needs its documentation to survive into a generated schema carries it
+# here. Targets that emit documentation-bearing schemas consume it:
+#   - JSON Schema (schema-bridge jsonschema/tooldefs): `description`
+#     keyword on the field's property object (and the tool-level
+#     `description` for a `$Op`-annotated struct).
+#   - zod/Go: NOT lowered today (zod could use `.describe(...)`, Go a
+#     `//` line) — explicitly a no-op for those targets per §Naming 4.
+#
+# `text` is the raw description. For fields whose value is drawn from a
+# fixed set, encode the choices in prose here (e.g. "Issue type: bug,
+# feature, task, ...") — the same convention rosary's MCP tool registry
+# uses (0 JSON `enum` arrays; choices live in the description).
+annotation doc @0xd3b652fd6a4debee (field, struct, enum, enumerant) :Text;
+
+# `$Optional` — field MAY be omitted by the producer. Capnp has no
+# optional fields (a field always has a value on the wire), so a spec
+# that models a curated required-subset — e.g. an MCP tool input where
+# only `title` is mandatory — marks the omittable fields with this
+# annotation. Targets that emit a required-set honor it:
+#   - JSON Schema (schema-bridge): the field is DROPPED from the
+#     `required` array. Un-annotated fields stay required.
+#   - zod/Go: NOT lowered today (would be `.optional()` / a pointer
+#     field) — explicitly a no-op for those targets per §Naming 4.
+annotation optional @0xd3b652fd6a4debef (field) :Void;
+
+# `$Default(json)` — field's default value, encoded as a JSON literal in
+# `json` (the annotation text is injected verbatim as a JSON value, so
+# it MUST be valid JSON: `2`, `false`, `"task"`, `""`, `[]`). Capnp's
+# own `= value` field defaults are typed capnp literals the JSON-schema
+# world can't consume directly, so the JSON form is carried explicitly.
+# Targets that emit defaults honor it:
+#   - JSON Schema (schema-bridge): the `default` keyword on the field's
+#     property object, value = the annotation text verbatim.
+#   - zod/Go: NOT lowered today — a no-op for those targets per §Naming 4.
+annotation default @0xd3b652fd6a4debf0 (field) :Text;
+
 # ── §Struct-level annotations ─────────────────────────────────────────────
 
 # `$Op(input, output, errors)` — declares a struct represents an
@@ -126,6 +164,14 @@ struct OpInfo {
   input   @0 :Text;        # struct name of input shape
   output  @1 :Text;        # struct name of output shape
   errors  @2 :List(Text);  # struct/enum names of typed error variants
+  # `name` is the operation's externally-visible identifier — for an MCP
+  # tool this is the exact `tools/list` name (e.g. "rsry_bead_create"),
+  # which the schema-bridge tool-definitions emitter uses verbatim so the
+  # generated `{name, description, inputSchema}` entry matches the
+  # hand-written registry without a fragile CamelCase→snake heuristic.
+  # Append-only (ordinal 3, a pointer field like the others) per the
+  # SCHEMA-EVOLUTION RULES above.
+  name    @3 :Text;        # externally-visible operation/tool name
 }
 
 annotation op @0xd3b652fd6a4debed (struct, interface) :OpInfo;

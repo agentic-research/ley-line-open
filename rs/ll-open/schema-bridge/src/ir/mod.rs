@@ -52,6 +52,9 @@ impl Default for Schema {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Enum {
     pub name: String,
+    // `$Doc` on the enum node — lowered to the enum def's JSON Schema
+    // `description`. `None` when unannotated.
+    pub doc: Option<String>,
     // Position-stable: enumerants[i] has capnp ordinal i. Wire-format
     // safety is the user's job (ADR-0004's monotonic-ordinal rule);
     // schema-bridge just preserves what capnp gave it.
@@ -61,11 +64,34 @@ pub struct Enum {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Struct {
     pub name: String,
+    // `$Doc` on the struct node — lowered to a JSON Schema struct-level
+    // `description`, and (for `$Op` structs) the tool-level
+    // `description` in the tool-definitions output. `None` when
+    // unannotated.
+    pub doc: Option<String>,
+    // `$Op(input, output, errors, name)` — present when the struct is
+    // annotated as an operation. Drives the tool-definitions emitter:
+    // the struct becomes an MCP `tools/list` entry. `None` for a plain
+    // data struct.
+    pub op: Option<OpInfo>,
     // Always-present fields. Capnp lets a struct carry both base
     // fields and a union; both forms (`struct Foo { x @0 :Text;
     // kind :union { … } }`) map naturally.
     pub fields: Vec<StructField>,
     pub union: Option<Union>,
+}
+
+// Lowered `$Op` annotation (`_traits.capnp` `OpInfo`). The
+// tool-definitions emitter uses `name` (verbatim MCP tool name) and
+// `input` (the struct whose schema is the `inputSchema`; empty ⇒ the
+// annotated struct itself). `output`/`errors` are carried for future
+// RPC-scaffolding targets and are not consumed by any emitter today.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpInfo {
+    pub name: String,
+    pub input: String,
+    pub output: String,
+    pub errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -97,6 +123,18 @@ pub struct StructField {
     pub name: String,
     pub ordinal: u16,
     pub ty: FieldType,
+    // `$Doc` on the field — lowered to the property's JSON Schema
+    // `description`. `None` when unannotated.
+    pub doc: Option<String>,
+    // `$Optional` on the field — when true the field is DROPPED from
+    // the JSON Schema `required` array. Capnp has no optional fields;
+    // this annotation is how a spec models a curated required-subset.
+    pub optional: bool,
+    // `$Default(json)` on the field — the JSON-encoded default value,
+    // stored verbatim (already valid JSON, e.g. `2`, `false`,
+    // `"task"`). Lowered to the property's JSON Schema `default`.
+    // `None` when unannotated.
+    pub default: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -15,7 +15,7 @@ use ::capnp::traits::FromPointerReader;
 
 use crate::error::{Result, SchemaBridgeError};
 use crate::ir::{
-    Const, ConstValue, Enum, FieldType, ScalarType, Schema, Struct, StructField, Union,
+    Const, ConstValue, Enum, FieldType, OpInfo, ScalarType, Schema, Struct, StructField, Union,
     UnionVariant,
 };
 
@@ -76,6 +76,163 @@ fn check_annotations(
     Ok(())
 }
 
+// `_traits.capnp` annotation ids — MUST match the ordinals declared
+// there. These are the annotations schema-bridge LOWERS (as opposed to
+// the json.* ids above, which it rejects). Per ley-line-open-beb8bb.
+const ANN_TRAITS_OP: u64 = 0xd3b652fd6a4debed;
+const ANN_TRAITS_DOC: u64 = 0xd3b652fd6a4debee;
+const ANN_TRAITS_OPTIONAL: u64 = 0xd3b652fd6a4debef;
+const ANN_TRAITS_DEFAULT: u64 = 0xd3b652fd6a4debf0;
+
+// An annotation id we don't lower → the same loud UnmappedConstruct the
+// old blanket `check_annotations` produced, with the same `kind` string
+// (so the json.* fail-fast tests keep asserting on it).
+fn unmapped_annotation(id: u64, location: &str) -> SchemaBridgeError {
+    SchemaBridgeError::unmapped(annotation_kind(id), location)
+}
+
+// Read a Text-typed annotation value (`$Doc`, `$Default`).
+fn annotation_text(ann: schema_capnp::annotation::Reader<'_>, location: &str) -> Result<String> {
+    use schema_capnp::value::Which as VW;
+    match ann.get_value()?.which()? {
+        VW::Text(t) => Ok(t?.to_str()?.to_owned()),
+        _ => Err(SchemaBridgeError::SchemaShape(format!(
+            "{location}: expected a Text annotation value"
+        ))),
+    }
+}
+
+struct FieldAnnotations {
+    doc: Option<String>,
+    optional: bool,
+    default: Option<String>,
+}
+
+// Lower the `_traits` annotations on a base data field: `$Doc`,
+// `$Optional`, `$Default`. Any other annotation is a loud gap.
+fn parse_field_annotations(
+    annotations: capnp::struct_list::Reader<'_, schema_capnp::annotation::Owned>,
+    location: &str,
+) -> Result<FieldAnnotations> {
+    let mut fa = FieldAnnotations {
+        doc: None,
+        optional: false,
+        default: None,
+    };
+    for ann in annotations.iter() {
+        match ann.get_id() {
+            ANN_TRAITS_DOC => fa.doc = Some(annotation_text(ann, location)?),
+            // `$Optional` is a Void annotation — presence is the signal.
+            ANN_TRAITS_OPTIONAL => fa.optional = true,
+            ANN_TRAITS_DEFAULT => fa.default = Some(annotation_text(ann, location)?),
+            other => return Err(unmapped_annotation(other, location)),
+        }
+    }
+    Ok(fa)
+}
+
+struct StructAnnotations {
+    doc: Option<String>,
+    op: Option<OpInfo>,
+}
+
+// Lower the `_traits` annotations on a struct node: `$Doc` and `$Op`.
+fn parse_struct_annotations(
+    annotations: capnp::struct_list::Reader<'_, schema_capnp::annotation::Owned>,
+    location: &str,
+) -> Result<StructAnnotations> {
+    let mut sa = StructAnnotations {
+        doc: None,
+        op: None,
+    };
+    for ann in annotations.iter() {
+        match ann.get_id() {
+            ANN_TRAITS_DOC => sa.doc = Some(annotation_text(ann, location)?),
+            ANN_TRAITS_OP => sa.op = Some(decode_op_info(ann, location)?),
+            other => return Err(unmapped_annotation(other, location)),
+        }
+    }
+    Ok(sa)
+}
+
+// Lower `$Doc` on an enum node. Other annotations are a loud gap.
+fn parse_enum_doc(
+    annotations: capnp::struct_list::Reader<'_, schema_capnp::annotation::Owned>,
+    location: &str,
+) -> Result<Option<String>> {
+    let mut doc = None;
+    for ann in annotations.iter() {
+        match ann.get_id() {
+            ANN_TRAITS_DOC => doc = Some(annotation_text(ann, location)?),
+            other => return Err(unmapped_annotation(other, location)),
+        }
+    }
+    Ok(doc)
+}
+
+// Enumerant annotations: `$Doc` is VALID per the vocabulary but NOT
+// lowered — JSON Schema draft 2020-12 has no per-enum-value description
+// slot, so there is nowhere to put it. Recognized-and-dropped (not a
+// silent gap: any OTHER annotation still fails loud). Carry it the day a
+// target grows a per-value doc slot.
+fn check_enumerant_annotations(
+    annotations: capnp::struct_list::Reader<'_, schema_capnp::annotation::Owned>,
+    location: &str,
+) -> Result<()> {
+    for ann in annotations.iter() {
+        match ann.get_id() {
+            ANN_TRAITS_DOC => {}
+            other => return Err(unmapped_annotation(other, location)),
+        }
+    }
+    Ok(())
+}
+
+// Decode a `$Op(OpInfo)` struct-valued annotation. OpInfo is an
+// all-pointer struct (`input @0`, `output @1`, `errors @2`, `name @3` —
+// all Text / List(Text)), so pointer-slot index == ordinal. We read the
+// slots directly rather than looking up OpInfo's node: the layout is
+// frozen by `_traits.capnp`'s append-only rule, and the annotation value
+// carries only the wire bytes, not a node reference. Mirrors how
+// `read_struct_slot` reads text/text-list off a StructReader.
+fn decode_op_info(ann: schema_capnp::annotation::Reader<'_>, location: &str) -> Result<OpInfo> {
+    use schema_capnp::value::Which as VW;
+    let any = match ann.get_value()?.which()? {
+        VW::Struct(any) => any,
+        _ => {
+            return Err(SchemaBridgeError::SchemaShape(format!(
+                "{location}: $Op annotation value is not a struct"
+            )));
+        }
+    };
+    let StructPeek(sr) = any.get_as::<StructPeek>()?;
+    Ok(OpInfo {
+        input: read_op_text(&sr, 0)?,
+        output: read_op_text(&sr, 1)?,
+        errors: read_op_text_list(&sr, 2)?,
+        name: read_op_text(&sr, 3)?,
+    })
+}
+
+// Read a Text field from a pointer slot; a null pointer (unset field)
+// yields "".
+fn read_op_text(sr: &StructReader<'_>, ptr_offset: usize) -> Result<String> {
+    let p = sr.get_pointer_field(ptr_offset);
+    let t: ::capnp::text::Reader = FromPointerReader::get_from_pointer(&p, None)?;
+    Ok(t.to_str()?.to_owned())
+}
+
+// Read a List(Text) field from a pointer slot; a null pointer yields [].
+fn read_op_text_list(sr: &StructReader<'_>, ptr_offset: usize) -> Result<Vec<String>> {
+    let p = sr.get_pointer_field(ptr_offset);
+    let list: ::capnp::text_list::Reader = FromPointerReader::get_from_pointer(&p, None)?;
+    let mut out = Vec::with_capacity(list.len() as usize);
+    for entry in list.iter() {
+        out.push(entry?.to_str()?.to_owned());
+    }
+    Ok(out)
+}
+
 pub fn parse(request: schema_capnp::code_generator_request::Reader<'_>) -> Result<Schema> {
     let nodes = request.get_nodes()?;
 
@@ -121,7 +278,9 @@ pub fn parse(request: schema_capnp::code_generator_request::Reader<'_>) -> Resul
                 if s.get_is_group() {
                     continue;
                 }
-                check_annotations(node.get_annotations()?, &location)?;
+                // Struct-level `$Doc`/`$Op` annotations are lowered
+                // inside parse_struct; unknown annotations still fail
+                // loud there.
                 schema.structs.push(parse_struct(
                     node,
                     s,
@@ -132,7 +291,8 @@ pub fn parse(request: schema_capnp::code_generator_request::Reader<'_>) -> Resul
                 )?);
             }
             schema_capnp::node::Which::Enum(e) => {
-                check_annotations(node.get_annotations()?, &location)?;
+                // Enum `$Doc` is lowered inside parse_enum; unknown
+                // annotations still fail loud there.
                 schema.enums.push(parse_enum(node, e)?);
             }
             schema_capnp::node::Which::Interface(_) => {
@@ -559,13 +719,18 @@ fn parse_enum(
     e: schema_capnp::node::enum_::Reader<'_>,
 ) -> Result<Enum> {
     let name = short_name(node)?;
+    let doc = parse_enum_doc(node.get_annotations()?, &format!("enum {name}"))?;
     let mut variants = Vec::new();
     for enumerant in e.get_enumerants()?.iter() {
         let v = enumerant.get_name()?.to_str()?.to_owned();
-        check_annotations(enumerant.get_annotations()?, &format!("enum {name}.{v}"))?;
+        check_enumerant_annotations(enumerant.get_annotations()?, &format!("enum {name}.{v}"))?;
         variants.push(v);
     }
-    Ok(Enum { name, variants })
+    Ok(Enum {
+        name,
+        doc,
+        variants,
+    })
 }
 
 fn parse_struct<'a>(
@@ -577,6 +742,8 @@ fn parse_struct<'a>(
     location: &str,
 ) -> Result<Struct> {
     let name = short_name(node)?;
+    // Struct-level `$Doc`/`$Op`; unknown annotations fail loud.
+    let sann = parse_struct_annotations(node.get_annotations()?, location)?;
 
     let mut fields = Vec::new();
     let mut union: Option<Union> = None;
@@ -593,8 +760,6 @@ fn parse_struct<'a>(
         let ordinal = field.get_code_order();
         let field_location = format!("{location} ({name}.{field_name})");
 
-        check_annotations(field.get_annotations()?, &field_location)?;
-
         // For anonymous-inline unions, a `discriminant_value !=
         // NO_DISCRIMINANT` marks the field as a variant of the
         // parent's union (vs a base field, which has
@@ -610,19 +775,29 @@ fn parse_struct<'a>(
             schema_capnp::field::Which::Slot(slot) => {
                 let ty = field_type(slot.get_type()?, struct_names, enum_names, &field_location)?;
                 if is_inline_variant {
+                    // Union variants don't carry the field vocabulary
+                    // ($Doc/$Optional/$Default) — reject any annotation.
+                    check_annotations(field.get_annotations()?, &field_location)?;
                     inline_variants.push(UnionVariant {
                         name: field_name,
                         ty,
                     });
                 } else {
+                    let fann = parse_field_annotations(field.get_annotations()?, &field_location)?;
                     fields.push(StructField {
                         name: field_name,
                         ordinal,
                         ty,
+                        doc: fann.doc,
+                        optional: fann.optional,
+                        default: fann.default,
                     });
                 }
             }
             schema_capnp::field::Which::Group(g) => {
+                // Group (named-union) fields don't carry the field
+                // vocabulary — reject any annotation.
+                check_annotations(field.get_annotations()?, &field_location)?;
                 // A group field points at an anonymous struct node.
                 // We only support the case where that node carries a
                 // union (the `name :union { … }` sugar). Non-union
@@ -686,6 +861,8 @@ fn parse_struct<'a>(
 
     Ok(Struct {
         name,
+        doc: sann.doc,
+        op: sann.op,
         fields,
         union,
     })

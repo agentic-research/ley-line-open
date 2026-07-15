@@ -39,10 +39,14 @@
 //   - const → `{"const": <value>}` $defs entry. Non-finite float
 //     consts are a hard error: zod/go emit a visible build-break
 //     sentinel, but JSON text has no sentinel that stays valid JSON.
-//   - no `description` fields: capnp's CodeGeneratorRequest carries
-//     no doc comments (capnp discards comments at parse), so there is
-//     nothing to map — descriptions arrive later via an annotation
-//     vocabulary, not invented here.
+//   - `$Doc(text)` annotation → `description` on the field property
+//     (and struct/enum def). `$Default(json)` → `default` (value
+//     injected verbatim). `$Optional` → the field is dropped from the
+//     struct's `required` array. Un-annotated fields stay required
+//     (capnp has no optional fields). Per ley-line-open-beb8bb — the
+//     annotation vocabulary the earlier header said "arrive later".
+//     Field annotations are lowered for plain-struct properties; union
+//     variant base fields keep the all-required union semantics.
 //
 // Determinism: output is built by direct string emission in IR
 // declaration order (enums, structs, consts — same order as zod/go).
@@ -52,7 +56,9 @@
 use std::fmt::Write as _;
 
 use crate::error::{Result, SchemaBridgeError};
-use crate::ir::{Const, ConstValue, Enum, FieldType, ScalarType, Schema, Struct, Union};
+use crate::ir::{
+    Const, ConstValue, Enum, FieldType, ScalarType, Schema, Struct, StructField, Union,
+};
 
 pub fn emit(schema: &Schema, schema_basename: &str) -> Result<String> {
     let mut defs: Vec<String> = Vec::new();
@@ -110,8 +116,13 @@ fn render_enum_def(e: &Enum) -> String {
         .iter()
         .map(|v| format!("\"{}\"", escape_json_string(v)))
         .collect();
+    // `$Doc` on the enum → a `description` between `type` and `enum`.
+    let desc = match &e.doc {
+        Some(d) => format!(r#""description": "{}", "#, escape_json_string(d)),
+        None => String::new(),
+    };
     format!(
-        r#"    "{name}": {{ "type": "string", "enum": [{values}] }}"#,
+        r#"    "{name}": {{ "type": "string", {desc}"enum": [{values}] }}"#,
         name = escape_json_string(&e.name),
         values = values.join(", ")
     )
@@ -158,14 +169,19 @@ fn render_struct_def(s: &Struct) -> String {
                     .expect("anonymous-inline unions route to the oneOf arm above")
             });
             writeln!(out, r#"      "type": "object","#).expect("write! to String is infallible");
+            // `$Doc` on the struct → a struct-level `description`.
+            if let Some(d) = &s.doc {
+                writeln!(out, r#"      "description": "{}","#, escape_json_string(d))
+                    .expect("write! to String is infallible");
+            }
             let mut props: Vec<String> = s
                 .fields
                 .iter()
                 .map(|f| {
                     format!(
-                        "        \"{name}\": {ty}",
+                        "        \"{name}\": {prop}",
                         name = escape_json_string(&f.name),
-                        ty = render_type(&f.ty)
+                        prop = render_property(f)
                     )
                 })
                 .collect();
@@ -181,9 +197,13 @@ fn render_struct_def(s: &Struct) -> String {
                 out.push('\n');
                 writeln!(out, "      }},").expect("write! to String is infallible");
             }
+            // `$Optional` fields drop out of `required`; the named-union
+            // discriminant is always required. Un-annotated fields stay
+            // required (capnp has no optional fields).
             let required: Vec<String> = s
                 .fields
                 .iter()
+                .filter(|f| !f.optional)
                 .map(|f| f.name.as_str())
                 .chain(disc)
                 .map(|n| format!("\"{}\"", escape_json_string(n)))
@@ -255,45 +275,72 @@ fn render_variant_payload(v: &crate::ir::UnionVariant) -> String {
     }
 }
 
-// Single-line type schema for a field position. Recursion depth is
-// bounded by the IR (lists nest; unions can't appear here).
+// Single-line type schema OBJECT for a field position (braces
+// included). Recursion depth is bounded by the IR (lists nest; unions
+// can't appear here).
 fn render_type(t: &FieldType) -> String {
+    format!("{{ {} }}", type_schema_pairs(t))
+}
+
+// The INNER key/value pairs of a type schema (no surrounding braces),
+// so callers that need to splice extra keys (`description`, `default`)
+// into the same object can do so. `render_type` wraps this in braces;
+// `render_property` composes it with the annotation-derived keys.
+// pub(crate) so the tool-definitions emitter shares one type mapping.
+pub(crate) fn type_schema_pairs(t: &FieldType) -> String {
     match t {
-        FieldType::Scalar(s) => render_scalar(*s).to_owned(),
+        FieldType::Scalar(s) => scalar_pairs(*s).to_owned(),
         // Struct and enum refs both resolve within this document —
         // schema-bridge only processes one capnp file per invocation,
         // so every referent has a $defs entry (the parser fails on
         // unresolved references before emit runs).
         FieldType::StructRef(name) | FieldType::EnumRef(name) => {
-            format!(r##"{{ "$ref": "#/$defs/{}" }}"##, escape_json_string(name))
+            format!(r##""$ref": "#/$defs/{}""##, escape_json_string(name))
         }
         FieldType::List(inner) => {
-            format!(r#"{{ "type": "array", "items": {} }}"#, render_type(inner))
+            format!(r#""type": "array", "items": {}"#, render_type(inner))
         }
     }
 }
 
-fn render_scalar(s: ScalarType) -> &'static str {
+// Full property schema object for a struct field: the type pairs plus
+// the annotation-derived `description` (`$Doc`) and `default`
+// (`$Default`, injected verbatim as already-valid JSON). Key order —
+// type, then description, then default — matches the hand-written MCP
+// registry shape. pub(crate) so the tool-definitions emitter reuses it.
+pub(crate) fn render_property(field: &StructField) -> String {
+    let mut inner = type_schema_pairs(&field.ty);
+    if let Some(d) = &field.doc {
+        inner.push_str(&format!(r#", "description": "{}""#, escape_json_string(d)));
+    }
+    if let Some(default) = &field.default {
+        // `default` is stored as verbatim JSON (`2`, `false`, `"task"`).
+        inner.push_str(&format!(r#", "default": {default}"#));
+    }
+    format!("{{ {inner} }}")
+}
+
+fn scalar_pairs(s: ScalarType) -> &'static str {
     match s {
         // Bare Void fields (outside unions) are `null` in capnp's
         // JSON encoding, same as Void union payloads.
-        ScalarType::Void => r#"{ "type": "null" }"#,
-        ScalarType::Bool => r#"{ "type": "boolean" }"#,
+        ScalarType::Void => r#""type": "null""#,
+        ScalarType::Bool => r#""type": "boolean""#,
         // All signed widths collapse to `integer` — same collapse the
         // zod emitter makes (`z.number().int()`); the capnp schema
         // remains the authority on width. 64-bit values above 2^53
         // lose precision in any JSON number pipeline; that constraint
         // is capnp-JSON's, not this emitter's.
         ScalarType::Int8 | ScalarType::Int16 | ScalarType::Int32 | ScalarType::Int64 => {
-            r#"{ "type": "integer" }"#
+            r#""type": "integer""#
         }
         // Unsigned adds `minimum: 0`, mirroring zod's `.nonnegative()`.
         ScalarType::UInt8 | ScalarType::UInt16 | ScalarType::UInt32 | ScalarType::UInt64 => {
-            r#"{ "type": "integer", "minimum": 0 }"#
+            r#""type": "integer", "minimum": 0"#
         }
-        ScalarType::Float32 | ScalarType::Float64 => r#"{ "type": "number" }"#,
-        ScalarType::Text => r#"{ "type": "string" }"#,
-        ScalarType::Data => r#"{ "type": "string", "contentEncoding": "base64" }"#,
+        ScalarType::Float32 | ScalarType::Float64 => r#""type": "number""#,
+        ScalarType::Text => r#""type": "string""#,
+        ScalarType::Data => r#""type": "string", "contentEncoding": "base64""#,
     }
 }
 
@@ -359,8 +406,9 @@ fn render_const_value(v: &ConstValue, location: &str) -> Result<String> {
 
 // RFC 8259 string escape: backslash, quote, and all control chars
 // (named escapes where they exist, \u00XX otherwise). Capnp Text is
-// UTF-8; non-control characters pass through verbatim.
-fn escape_json_string(s: &str) -> String {
+// UTF-8; non-control characters pass through verbatim. pub(crate) so
+// the tool-definitions emitter shares one escaper.
+pub(crate) fn escape_json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {

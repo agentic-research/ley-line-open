@@ -1,6 +1,6 @@
 [package]
 name = "leyline-schema-capnp"
-version = "0.7.8"
+version = "0.7.9"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "Cap'n Proto schemas for Σ event log — typed producer/consumer contract (T8)"

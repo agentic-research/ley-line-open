@@ -10,6 +10,20 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.7.9] — 2026-07-15
+
+**Fix the `nfs`-only feature build + guard it with a CI regression.**
+
+Patch release. No wire, schema, or API change — `wire_format_major = 1` and `compat_min_schema_version` stay unchanged. Bundles the #214 build fix with a permanent regression rail so an nfs-only consumer can't be broken again.
+
+### Fixed
+
+- **`leyline-fs` `nfs` feature was missing `dep:libc` (PR #214)**. `fs/nfs.rs` calls `libc::getuid()`, but `libc` was declared only under the `fuse` feature. The default build (`fuse` + `nfs`) masked it; a consumer building `--no-default-features --features nfs` — cloister's mediator, which serves NFS on macOS with no macFUSE/kext — hit `E0433: unresolved module libc`. The `nfs` feature now pulls `dep:libc` directly. Bead `ley-line-open-95cd90`.
+
+### Added
+
+- **`build:fs-nfs-isolated` CI regression task**. Builds `leyline-fs --no-default-features --features nfs` in isolation so a dep declared only under `fuse` can never again silently break the nfs-only surface. Runs in the common `ci` gate. Pure Rust (`nfsserve`), no system deps. Bead `ley-line-open-95cd90`.
+
 ## [0.7.8] — 2026-07-14
 
 **Mache CGO-removal unblock (validate `emit_ast` + identifier-as-VALUE refs) + substrate-quality wins (`parking_lot` swap, `smell-projector` rename, HDC + sheaf docs).**

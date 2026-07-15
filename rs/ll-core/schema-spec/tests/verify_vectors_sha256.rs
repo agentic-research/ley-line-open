@@ -33,6 +33,12 @@ const VECTORS_FILES: &[&str] = &[
     // JSON vector so two independent implementations reach the same
     // BLAKE3-256 digest under §6's canonical serialization rules.
     "confinement/v1/VECTORS.sha256",
+    // Bead ley-line-open-083344: leyline-net generic wire frames
+    // (Manifest/ToolCall/ToolResult, schemas/net.capnp). Pins the 12
+    // frame vectors in both byte forms (reference + strict canonical),
+    // digests.json, and fixtures.capnp. The BLAKE3 half of the gate
+    // lives in leyline-schema-capnp's tests/leyline_net_vectors.rs.
+    "leyline-net/v1/test-vectors/VECTORS.sha256",
 ];
 
 #[test]

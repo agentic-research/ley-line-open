@@ -49,6 +49,14 @@ pub mod cache_capnp {
     include!(concat!(env!("OUT_DIR"), "/cache_capnp.rs"));
 }
 
+/// leyline-net generic wire frames (Manifest / ToolCall / ToolResult).
+/// Canonical home per bead ley-line-open-083344; cloister + rosary
+/// vendor from `schemas/net.capnp`. Wire bytes pinned by
+/// `schema-spec/leyline-net/v1/test-vectors/` + `tests/leyline_net_vectors.rs`.
+pub mod net_capnp {
+    include!(concat!(env!("OUT_DIR"), "/net_capnp.rs"));
+}
+
 #[cfg(test)]
 mod tests {
     use super::cache_capnp::{

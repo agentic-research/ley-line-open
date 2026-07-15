@@ -22,7 +22,11 @@
 //!   defaults to `.`; a pattern overrides it with
 //!   `(#set! qualifier-separator "::")` — Rust fixtures pin
 //!   `std::process::exit`-shaped tokens, so the separator is
-//!   per-pattern data, not engine code
+//!   per-pattern data, not engine code. On Ref pairs the BARE row also
+//!   carries the qualifier text structurally
+//!   ([`ExtractedRef::Ref`]`::qualifier` → `node_refs.qualifier`, bead
+//!   `ley-line-open-4dde42`); the qualified row's field stays `None`
+//!   (its token embeds the qualifier)
 //! - `@path` → import path; surrounding delimiters are stripped
 //!   (string-literal quotes, and the `<`/`>` of a C/C++
 //!   `system_lib_string` — `#include <stdio.h>` carries the brackets
@@ -151,7 +155,10 @@ impl QueryEngine {
                 continue;
             }
             let canonical_kind = self.ts_lang.canonical_kind(node.kind());
-            let mut push = |token: String| {
+            // `qualifier` rides only on Ref rows (bead
+            // `ley-line-open-4dde42`): a def's qualified form stays a
+            // token-only dual-emit — node_defs has no qualifier column.
+            let mut push = |token: String, qualifier: Option<String>| {
                 if is_def {
                     out.push(ExtractedRef::Def {
                         token,
@@ -166,6 +173,7 @@ impl QueryEngine {
                         node_id: node_id.to_string(),
                         source_id: source_id.to_string(),
                         container_node_id: container_node_id.map(str::to_string),
+                        qualifier,
                     });
                 }
             };
@@ -182,9 +190,15 @@ impl QueryEngine {
                     .find(|p| &*p.key == "qualifier-separator")
                     .and_then(|p| p.value.as_deref())
                     .unwrap_or(".");
-                push(format!("{qualifier}{sep}{name}"));
+                // Qualified row: the token embeds the qualifier, so the
+                // structural field stays NULL — exactly ONE row per
+                // qualified call site carries the (name, qualifier)
+                // pair, and GROUP BY/filter consumers never double-count.
+                push(format!("{qualifier}{sep}{name}"), None);
+                push(name.to_string(), Some(qualifier.to_string()));
+            } else {
+                push(name.to_string(), None);
             }
-            push(name.to_string());
         }
         out
     }

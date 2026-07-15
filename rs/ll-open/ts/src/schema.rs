@@ -159,12 +159,25 @@ pub fn insert_ast(
 /// `fan_out_skew` + `untested_function` rules `GROUP BY` on to get
 /// per-caller aggregation. Additive column: legacy DBs read it as NULL
 /// via `create_container_id_columns`'s idempotent ALTER path.
+///
+/// `qualifier` (bead `ley-line-open-4dde42`, the `b9d1d5` leftover) is
+/// the syntactic receiver/selector text of a qualified call site,
+/// carried on the BARE-token row of the dual-emit pair (`fmt.Println(..)`
+/// → the `Println` row carries `'fmt'`; `std::process::exit()` → the
+/// `exit` row carries `'std::process'`). The qualified-token row and
+/// genuinely bare calls carry NULL — one row per qualified call site
+/// holds the structural (name, qualifier) pair, so consumers never
+/// double-count. NULL (not `''`) for "no qualifier": the additive ALTER
+/// backfills NULL on legacy rows, and a second `''` encoding would split
+/// the no-qualifier shape in two. Additive column: legacy DBs migrate
+/// via `create_qualifier_column`'s idempotent ALTER path.
 pub const REFS_TABLE_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS node_refs (
     token TEXT NOT NULL,
     node_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
-    container_node_id TEXT
+    container_node_id TEXT,
+    qualifier TEXT
 );";
 
 /// DDL for the `node_refs` indexes — deferred post-COMMIT.
@@ -182,7 +195,8 @@ CREATE TABLE IF NOT EXISTS node_refs (
     token TEXT NOT NULL,
     node_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
-    container_node_id TEXT
+    container_node_id TEXT,
+    qualifier TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_refs_token ON node_refs(token);
 CREATE INDEX IF NOT EXISTS idx_refs_node ON node_refs(node_id);
@@ -395,16 +409,22 @@ pub fn create_refs_indexes(conn: &Connection) -> Result<()> {
 /// `container_node_id` = node_id of the nearest enclosing function/method
 /// ancestor (per κ canonical kind); `None` for top-level refs. Bead
 /// `ley-line-open-6e798d`.
+///
+/// `qualifier` = receiver/selector text on the BARE-token row of a
+/// qualified call's dual-emit pair; `None` on the qualified-token row
+/// and on genuinely bare calls. See `REFS_TABLE_DDL`. Bead
+/// `ley-line-open-4dde42`.
 pub fn insert_ref(
     conn: &Connection,
     token: &str,
     node_id: &str,
     source_id: &str,
     container_node_id: Option<&str>,
+    qualifier: Option<&str>,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO node_refs (token, node_id, source_id, container_node_id) VALUES (?1, ?2, ?3, ?4)",
-        params![token, node_id, source_id, container_node_id],
+        "INSERT INTO node_refs (token, node_id, source_id, container_node_id, qualifier) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![token, node_id, source_id, container_node_id, qualifier],
     )?;
     Ok(())
 }
@@ -487,6 +507,32 @@ pub fn create_container_id_columns(conn: &Connection) -> Result<()> {
                 "ALTER TABLE {table} ADD COLUMN container_node_id TEXT;"
             ))?;
         }
+    }
+    Ok(())
+}
+
+/// True when `table` has a `qualifier` column. Same additive-migration
+/// pattern as `has_container_node_id_column`. Bead `ley-line-open-4dde42`.
+fn has_qualifier_column(conn: &Connection, table: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = 'qualifier'",
+        [table],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Additively stamp a `qualifier TEXT` column onto `node_refs` when it's
+/// absent — idempotent. Fresh DBs created via `REFS_DDL` already have the
+/// column; this migration fires on legacy (≤ v0.7.8) shapes. Wired into
+/// `cmd_parse` schema setup: the extraction-epoch bump (3→4) forces those
+/// arenas to re-derive facts, and the re-derive INSERT names the column,
+/// so the ALTER must run before the insert transaction. `node_refs` only
+/// — defs keep their qualified form in the token dual-emit (bead
+/// `ley-line-open-4dde42` is scoped to refs).
+pub fn create_qualifier_column(conn: &Connection) -> Result<()> {
+    if !has_qualifier_column(conn, "node_refs")? {
+        conn.execute_batch("ALTER TABLE node_refs ADD COLUMN qualifier TEXT;")?;
     }
     Ok(())
 }
@@ -940,7 +986,15 @@ mod tests {
         create_ast_schema(&conn).unwrap();
         create_refs_schema(&conn).unwrap();
 
-        insert_ref(&conn, "Println", "main.go/call_expression", "main.go", None).unwrap();
+        insert_ref(
+            &conn,
+            "Println",
+            "main.go/call_expression",
+            "main.go",
+            None,
+            None,
+        )
+        .unwrap();
         insert_def(
             &conn,
             "Add",
@@ -1087,8 +1141,8 @@ mod tests {
         insert_node(&conn, "b.go/func", "b.go", "func", 0, 10, 0, "body").unwrap();
         insert_source(&conn, "a.go", "go", b"package a").unwrap();
         insert_source(&conn, "b.go", "go", b"package b").unwrap();
-        insert_ref(&conn, "Foo", "a.go/call", "a.go", None).unwrap();
-        insert_ref(&conn, "Bar", "b.go/call", "b.go", None).unwrap();
+        insert_ref(&conn, "Foo", "a.go/call", "a.go", None, None).unwrap();
+        insert_ref(&conn, "Bar", "b.go/call", "b.go", None, None).unwrap();
         insert_def(&conn, "Foo", "a.go/func", "a.go", None, None).unwrap();
         insert_def(&conn, "Bar", "b.go/func", "b.go", None, None).unwrap();
         upsert_file_index(&conn, "a.go", 100, 50).unwrap();

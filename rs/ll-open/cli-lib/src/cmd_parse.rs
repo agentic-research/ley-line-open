@@ -29,9 +29,9 @@ pub const MAX_PARSE_FILE_SIZE: i64 = 8 * 1024 * 1024;
 use leyline_ts::refs::{ExtractedRef, current_extraction_epoch, extract_refs};
 use leyline_ts::schema::{
     create_ast_tables, create_index_schema, create_ir_indexes, create_ir_tables,
-    create_pointer_store_tables, create_post_load_indexes_skip_unused, create_refs_tables,
-    create_source_blobs_table, delete_file_rows, get_meta, read_file_index, set_meta,
-    sweep_orphaned_dirs,
+    create_pointer_store_tables, create_post_load_indexes_skip_unused, create_qualifier_column,
+    create_refs_tables, create_source_blobs_table, delete_file_rows, get_meta, read_file_index,
+    set_meta, sweep_orphaned_dirs,
 };
 use rayon::prelude::*;
 use rusqlite::Connection;
@@ -438,20 +438,25 @@ batch_table! {
     // `canonical_kind` column (mache-parity follow-up to 6e798d) —
     // refs don't get canonical_kind because a ref site's κ kind is
     // `call_expression` etc., not a symbol kind, so the column would
-    // always be NULL. Refs stay at 5 cols; defs are wider.
+    // always be NULL.
+    //
+    // `qualifier` (bead ley-line-open-4dde42) is the receiver/selector
+    // text on the BARE-token row of a qualified call's dual-emit pair;
+    // NULL on the qualified-token row and on genuinely bare calls.
     RefBatch, RefRow,
     "",
-    5,
-    push_fn: (token: String, node_id: String, source_id: String, node_hash: Option<Vec<u8>>, container_node_id: Option<String>),
-    push_body: { RefRow { token, node_id, source_id, node_hash, container_node_id } },
+    6,
+    push_fn: (token: String, node_id: String, source_id: String, node_hash: Option<Vec<u8>>, container_node_id: Option<String>, qualifier: Option<String>),
+    push_body: { RefRow { token, node_id, source_id, node_hash, container_node_id, qualifier } },
     flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 5);
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 6);
         for r in chunk {
             out.push(&r.token);
             out.push(&r.node_id);
             out.push(&r.source_id);
             out.push(&r.node_hash);
             out.push(&r.container_node_id);
+            out.push(&r.qualifier);
         }
         out
     },
@@ -459,14 +464,15 @@ batch_table! {
 
 impl RefBatch {
     fn flush_batched_for(self, conn: &Connection, prefix: &str) -> Result<()> {
-        flush_in_batches(conn, self.rows, prefix, 5, |chunk| {
-            let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 5);
+        flush_in_batches(conn, self.rows, prefix, 6, |chunk| {
+            let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 6);
             for r in chunk {
                 out.push(&r.token);
                 out.push(&r.node_id);
                 out.push(&r.source_id);
                 out.push(&r.node_hash);
                 out.push(&r.container_node_id);
+                out.push(&r.qualifier);
             }
             out
         })
@@ -770,6 +776,12 @@ pub fn parse_into_conn(
     // `create_post_load_indexes`. See bead `ley-line-open-9ccbc7`.
     create_ast_tables(conn)?;
     create_refs_tables(conn)?;
+    // Structural qualifier (bead `ley-line-open-4dde42`): additively ALTER
+    // legacy (≤ v0.7.8) node_refs shapes that predate the column. Must run
+    // after `create_refs_tables` (the ALTER target) and before the insert
+    // transaction — the extraction-epoch bump forces those arenas to
+    // re-derive facts, and the re-derive INSERT names the column.
+    create_qualifier_column(conn)?;
     // Merkle-AST IR (ADR-0027): create node_content/node_child and stamp the
     // additive node_hash column onto _ast/node_defs/node_refs. Must run after
     // the occurrence tables exist (the ALTER targets) and before the insert
@@ -1253,9 +1265,17 @@ pub fn parse_into_conn(
                             node_id,
                             source_id,
                             container_node_id,
+                            qualifier,
                         } => {
                             let nh = hash_by_id.get(node_id.as_str()).map(|h| h.to_vec());
-                            refs_buf.push(token, node_id, source_id, nh, container_node_id);
+                            refs_buf.push(
+                                token,
+                                node_id,
+                                source_id,
+                                nh,
+                                container_node_id,
+                                qualifier,
+                            );
                         }
                         ExtractedRef::Def {
                             token,
@@ -1328,7 +1348,7 @@ pub fn parse_into_conn(
     source_buf.flush_batched(conn)?;
     refs_buf.flush_batched_for(
         conn,
-        "INSERT INTO node_refs (token, node_id, source_id, node_hash, container_node_id) VALUES ",
+        "INSERT INTO node_refs (token, node_id, source_id, node_hash, container_node_id, qualifier) VALUES ",
     )?;
     defs_buf.flush_batched_for(
         conn,
@@ -2301,7 +2321,7 @@ pub(crate) fn parse_file_pure(
 ///   ],
 ///   "refs": [
 ///     {"token": "...", "node_id": "...", "source_id": "...",
-///      "container_node_id": "..."|null}
+///      "container_node_id": "..."|null, "qualifier": "..."|null}
 ///   ],
 ///   "imports": [{"alias": "...", "path": "...", "source_id": "..."}]
 /// }
@@ -2373,11 +2393,13 @@ pub(crate) fn parse_to_ast_json(
                 node_id,
                 source_id,
                 container_node_id,
+                qualifier,
             } => refs.push(serde_json::json!({
                 "token": token,
                 "node_id": node_id,
                 "source_id": source_id,
                 "container_node_id": container_node_id,
+                "qualifier": qualifier,
             })),
             leyline_ts::refs::ExtractedRef::Import {
                 alias,

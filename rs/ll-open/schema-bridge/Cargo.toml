@@ -3,7 +3,7 @@ name = "leyline-schema-bridge"
 version = "0.7.9"
 edition = "2024"
 license = "AGPL-3.0-or-later"
-description = "Capnp schemas → zod TS / Go codegen. Fail-fast: unmapped constructs are hard errors. Lifted from cloister/tools/schema-bridge per ADR-0036 Phase 2."
+description = "Capnp schemas → zod TS / Go / JSON Schema codegen. Fail-fast: unmapped constructs are hard errors. Lifted from cloister/tools/schema-bridge per ADR-0036 Phase 2."
 
 # One plugin binary per output format: capnp's PATH-search resolves
 # `-o<plugin>` to `capnpc-<plugin>`, so dispatch lives in the BINARY
@@ -20,9 +20,18 @@ path = "src/main.rs"
 name = "capnpc-schema-bridge-go"
 path = "src/main.rs"
 
+[[bin]]
+name = "capnpc-schema-bridge-jsonschema"
+path = "src/main.rs"
+
 [dependencies]
 capnp = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 indoc = "2.0"
+# Tests parse the jsonschema emitter's output to assert structural
+# facts (properties/required agreement with the IR) without coupling
+# every assertion to whitespace. Dev-only — the emitter itself builds
+# JSON text directly, keeping the runtime dep set at capnp + thiserror.
+serde_json = { workspace = true }

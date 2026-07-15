@@ -19,14 +19,16 @@ pub use ir::{
 use error::Result;
 
 // Output language selector for the plugin's `<format>:<dir>` argv
-// shape. Today only `Zod`; bead cloister-75f6d5 adds `Go`. New
-// variants land here + an arm in [`emit`] + a suffix in
+// shape. New variants land here + an arm in [`emit`] + a suffix in
 // [`OutputFormat::file_suffix`] — fail-fast keeps the seam honest.
-// Per cloister-7585bc / ADR-0036 Phase 1 piece A.
+// Per cloister-7585bc / ADR-0036 Phase 1 piece A. `JsonSchema`
+// (draft 2020-12) added for rosary's MCP tool registry per
+// ley-line-open-6585aa.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
     Zod,
     Go,
+    JsonSchema,
 }
 
 impl OutputFormat {
@@ -39,8 +41,11 @@ impl OutputFormat {
     // List of known format names, for both `parse` matching and the
     // error message body. Single source of truth so adding a variant
     // doesn't drift the parser away from the error hint.
-    const KNOWN: &'static [(&'static str, OutputFormat)] =
-        &[("zod", OutputFormat::Zod), ("go", OutputFormat::Go)];
+    const KNOWN: &'static [(&'static str, OutputFormat)] = &[
+        ("zod", OutputFormat::Zod),
+        ("go", OutputFormat::Go),
+        ("jsonschema", OutputFormat::JsonSchema),
+    ];
 
     pub fn parse(s: &str) -> Result<Self> {
         for (name, fmt) in Self::KNOWN {
@@ -89,6 +94,9 @@ impl OutputFormat {
         match self {
             Self::Zod => "zod.ts",
             Self::Go => "go",
+            // `tools.capnp` → `tools.schema.json` — the conventional
+            // basename shape editors resolve for `$schema` pointers.
+            Self::JsonSchema => "schema.json",
         }
     }
 }
@@ -112,5 +120,8 @@ pub fn emit(schema: &Schema, format: OutputFormat, schema_basename: &str) -> Res
             outputs::zod::emit(schema)
         }
         OutputFormat::Go => outputs::go::emit(schema, schema_basename),
+        // JSON Schema uses the basename for the document's `$id`
+        // (`<basename>.schema.json`).
+        OutputFormat::JsonSchema => outputs::json_schema::emit(schema, schema_basename),
     }
 }

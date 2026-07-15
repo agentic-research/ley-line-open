@@ -1,6 +1,6 @@
 # leyline-schema-bridge
 
-Capnp + JSON-extension schemas → zod / TS / (future: JSON Schema).
+Capnp + JSON-extension schemas → zod TS / Go / JSON Schema.
 Single source of truth, fail-fast codegen. Build-time only: no daemon,
 no port, no SQLite sidecar — same posture as `leyline-cas-ffi`.
 
@@ -173,6 +173,45 @@ Constructs without aspirational stubs (`interface`, generics,
 `anyPointer`) are deferred indefinitely — they're non-goals for the
 zod-validation surface today, not just "not yet."
 
+## JSON Schema output — draft 2020-12 (ley-line-open-6585aa)
+
+Third emitter. First consumer: rosary's MCP tool registry
+(rosary-08a278) — MCP `inputSchema` is a draft 2020-12 object schema,
+so each capnp struct lands as a `$defs` entry
+(`type`/`properties`/`required`) a consumer plucks verbatim into a
+`tools/list` response. One document per schema file:
+`$schema` + `$comment` + `$id` (`<basename>.schema.json`) + `$defs`.
+
+Mapping semantics mirror the zod emitter:
+
+- **structs** → object schemas with ALL fields `required` (capnp has
+  no optional fields) and `additionalProperties: false` (the
+  `.strict()` typo-rejection invariant, cloister-cf2e6a).
+- **named-group unions** → the discriminant property is a `oneOf` of
+  single-key branch objects (`"kind": {"durableObject": {…}}`), Void
+  payloads as `{"type":"null"}` — capnp's nested JSON convention.
+- **anonymous-inline unions** → the whole struct def is a `oneOf`
+  whose branches inline base fields + exactly one variant key (flat
+  encoding, cloister-77172d).
+- **Data** → `{"type":"string","contentEncoding":"base64"}` — the
+  wire-JSON view (Go's `encoding/json` base64s `[]byte`); zod's
+  `z.instanceof(Uint8Array)` validates the decoded in-memory value
+  instead.
+- **consts** → `{"const": <value>}` `$defs` entries. Non-finite float
+  consts are a hard error — JSON has no Inf/NaN literal and no
+  sentinel that stays valid JSON.
+- **no `description` fields**: capnp's CodeGeneratorRequest carries no
+  doc comments (capnp discards comments at parse). Descriptions arrive
+  via an annotation vocabulary when a consumer needs them, not
+  invented here.
+
+Determinism: direct string emission in IR declaration order (enums,
+structs, consts — the zod/go order); no map-keyed serialization, so
+key order is stable by construction. A cross-emitter consistency gate
+in `tests/integration.rs` (`assert_cross_emitter_agreement`) holds all
+three emitters to the same field names, optionality, union variants,
+and enum values for the shared fixtures.
+
 ## How it runs
 
 ```sh
@@ -187,13 +226,21 @@ capnp compile \
   -o./target/release/capnpc-schema-bridge-go:./gen \
   manifest/cluster.capnp
 # → ./gen/cluster.go
+
+# And JSON Schema:
+capnp compile \
+  -o./target/release/capnpc-schema-bridge-jsonschema:./gen \
+  manifest/cluster.capnp
+# → ./gen/cluster.schema.json
 ```
 
 One binary per output format, dispatched by argv[0] basename — same
 shape as `capnpc-rust` / `capnpc-go` / `capnpc-c++`. Today
-`capnpc-schema-bridge-zod` (cloister-7585bc) +
-`capnpc-schema-bridge-go` (cloister-75f6d5); Cargo declares both
-`[[bin]]` entries and they both compile from the same `src/main.rs`.
+`capnpc-schema-bridge-zod` (cloister-7585bc),
+`capnpc-schema-bridge-go` (cloister-75f6d5), and
+`capnpc-schema-bridge-jsonschema` (ley-line-open-6585aa); Cargo
+declares all three `[[bin]]` entries and they compile from the same
+`src/main.rs`.
 
 `capnp compile` invokes the binary with the parsed `CodeGeneratorRequest`
 on stdin. The binary writes `<output-dir>/<schema-basename>.<format-suffix>`
@@ -218,7 +265,7 @@ rs/ll-open/schema-bridge/
 │   ├── error.rs        SchemaBridgeError + UnmappedConstruct
 │   ├── ir/             the intermediate representation
 │   ├── inputs/         capnp → IR (future: json-extension/ for aggregation)
-│   └── outputs/        IR → zod (future: ts.rs, json_schema.rs)
+│   └── outputs/        IR → zod / go / json_schema (future: ts.rs)
 └── tests/
     └── integration.rs  golden + fail-case suite
 ```
@@ -235,11 +282,9 @@ Tracked separately from this initial drop. In rough priority order:
    defines the structural backbone, JSON files supply per-variant
    field extensions). Where the polymorphism for skill / mcp / agent
    actually lands.
-3. JSON Schema output adapter (`outputs/json_schema.rs`) — drives the
-   `$schema` field in `.cloister.json` for editor autocomplete.
-4. TS-types-only output adapter, separated from the zod emit, so
+3. TS-types-only output adapter, separated from the zod emit, so
    consumers can pick one or both.
-5. End-to-end fixture tests against cloister's `manifest/*.capnp` —
+4. End-to-end fixture tests against cloister's `manifest/*.capnp` —
    currently verified manually (see README "What's mapped today");
    locking that in as a golden-output test in CI prevents silent
    regressions.

@@ -3356,6 +3356,7 @@ version = "0.7.9"
 dependencies = [
  "capnp",
  "indoc",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 

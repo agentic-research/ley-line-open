@@ -18,6 +18,7 @@ use capnp::message::{Builder, HeapAllocator};
 use capnp::private::layout::{PointerBuilder, StructBuilder, StructSize};
 use capnp::schema_capnp;
 use capnp::traits::FromPointerBuilder;
+use indoc::indoc;
 
 use leyline_schema_bridge::error::SchemaBridgeError;
 use leyline_schema_bridge::{OutputFormat, emit, inputs, outputs};
@@ -1843,4 +1844,871 @@ fn go_emit_payload_only_union_skips_custom_marshalers() {
         !emitted.contains("import \"encoding/json\""),
         "must NOT import encoding/json for payload-only schema:\n{emitted}"
     );
+}
+
+// ── JSON Schema emitter (ley-line-open-6585aa) ─────────────────────
+//
+// Third output format: JSON Schema draft 2020-12. First consumer is
+// rosary's MCP tool registry (rosary-08a278) — MCP `inputSchema` is a
+// draft 2020-12 object schema (`type`/`properties`/`required`), so a
+// capnp struct per tool-input must land as a `$defs` entry a consumer
+// can pluck verbatim into a `tools/list` response.
+//
+// Mapping decisions (mirroring the zod emitter's semantics):
+//   - struct → `{"type":"object","properties":{…},"required":[all],
+//     "additionalProperties":false}`. All fields required — capnp has
+//     no optional fields (zod emits them non-optional for the same
+//     reason). `additionalProperties:false` mirrors zod's `.strict()`
+//     typo-rejection invariant (cloister-cf2e6a).
+//   - named-group union → the discriminant property is a `oneOf` of
+//     single-key branch objects (`{"kind":{"durableObject":{…}}}`),
+//     Void payloads as `{"type":"null"}` — capnp's JSON convention.
+//   - anonymous-inline union → the whole struct def is a `oneOf`
+//     whose branches inline base fields + exactly one variant key
+//     (flat encoding, per cloister-77172d).
+//   - Data → `{"type":"string","contentEncoding":"base64"}` — the
+//     wire-JSON view (Go's encoding/json base64s []byte). zod's
+//     `z.instanceof(Uint8Array)` validates the in-memory value, not
+//     the wire text, so the emitters already diverge on Data's
+//     runtime representation; the wire name/optionality still agree.
+//   - consts → `$defs` entries of the form `{"const": <value>}`.
+//   - no `description` fields: capnp's CodeGeneratorRequest does not
+//     carry doc comments (capnp discards comments at parse), and the
+//     zod emitter carries none either. Descriptions arrive later via
+//     an annotation vocabulary, not silently invented here.
+//
+// Determinism: output is built by direct string emission in IR
+// declaration order (enums, structs, consts — same as zod/go), no
+// map-ordered serialization anywhere.
+
+// Fixture: a struct shaped like an MCP tool input, covering every
+// scalar family (text/int32/int64/bool/float64/data/uint32).
+fn build_tool_input_fixture() -> Builder<HeapAllocator> {
+    let mut message = Builder::new_default();
+    {
+        let request = message.init_root::<schema_capnp::code_generator_request::Builder>();
+        let mut nodes = request.init_nodes(2);
+        fill_file_node(nodes.reborrow().get(0), 0xFFFE, "tools.capnp");
+
+        let mut node = nodes.reborrow().get(1);
+        node.set_id(0xAAAA);
+        node.set_display_name("tools.capnp:BeadCreate");
+        node.set_display_name_prefix_length("tools.capnp:".len() as u32);
+        let mut s = node.init_struct();
+        s.set_discriminant_count(0);
+        let mut fields = s.init_fields(7);
+        for (i, name) in [
+            "title", "priority", "epoch", "force", "weight", "payload", "limit",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut field = fields.reborrow().get(i as u32);
+            field.set_name(name);
+            field.set_code_order(i as u16);
+            let mut ty = field.init_slot().init_type();
+            match name {
+                "title" => ty.set_text(()),
+                "priority" => ty.set_int32(()),
+                "epoch" => ty.set_int64(()),
+                "force" => ty.set_bool(()),
+                "weight" => ty.set_float64(()),
+                "payload" => ty.set_data(()),
+                "limit" => ty.set_uint32(()),
+                _ => unreachable!(),
+            }
+        }
+    }
+    message
+}
+
+// Fixture: enum + base fields + named-group union — the Backend
+// shape from manifest/cluster.capnp plus a Tier enum field, so one
+// fixture exercises enum refs, struct refs, and the nested union.
+fn build_backend_fixture() -> Builder<HeapAllocator> {
+    let mut message = Builder::new_default();
+    let backend_id: u64 = 0xAAAA;
+    let kind_group_id: u64 = 0xBBBB;
+    let do_backend_id: u64 = 0xCCCC;
+    let http_backend_id: u64 = 0xDDDD;
+    let tier_enum_id: u64 = 0xEEEE;
+    {
+        let request = message.init_root::<schema_capnp::code_generator_request::Builder>();
+        let mut nodes = request.init_nodes(6);
+        fill_file_node(nodes.reborrow().get(0), 0xFFFE, "test.capnp");
+
+        // enum Tier { hypervisor @0; cluster @1; }
+        {
+            let mut n = nodes.reborrow().get(1);
+            n.set_id(tier_enum_id);
+            n.set_display_name("test.capnp:Tier");
+            n.set_display_name_prefix_length("test.capnp:".len() as u32);
+            let e = n.init_enum();
+            let mut enumerants = e.init_enumerants(2);
+            enumerants.reborrow().get(0).set_name("hypervisor");
+            enumerants.reborrow().get(1).set_name("cluster");
+        }
+        // struct Backend { name :Text; tier :Tier; kind :union {…} }
+        {
+            let mut node = nodes.reborrow().get(2);
+            node.set_id(backend_id);
+            node.set_display_name("test.capnp:Backend");
+            node.set_display_name_prefix_length("test.capnp:".len() as u32);
+            let mut s = node.init_struct();
+            s.set_discriminant_count(0);
+            let mut fields = s.init_fields(3);
+            {
+                let mut field = fields.reborrow().get(0);
+                field.set_name("name");
+                field.set_code_order(0);
+                field.set_discriminant_value(0xffff);
+                field.init_slot().init_type().set_text(());
+            }
+            {
+                let mut field = fields.reborrow().get(1);
+                field.set_name("tier");
+                field.set_code_order(1);
+                field.set_discriminant_value(0xffff);
+                field
+                    .init_slot()
+                    .init_type()
+                    .init_enum()
+                    .set_type_id(tier_enum_id);
+            }
+            {
+                let mut field = fields.reborrow().get(2);
+                field.set_name("kind");
+                field.set_code_order(2);
+                field.set_discriminant_value(0xffff);
+                field.init_group().set_type_id(kind_group_id);
+            }
+        }
+        // kind group: union of two struct variants.
+        {
+            let mut node = nodes.reborrow().get(3);
+            node.set_id(kind_group_id);
+            node.set_display_name("test.capnp:Backend.kind");
+            node.set_display_name_prefix_length("test.capnp:".len() as u32);
+            let mut s = node.init_struct();
+            s.set_is_group(true);
+            s.set_discriminant_count(2);
+            let mut fields = s.init_fields(2);
+            {
+                let mut field = fields.reborrow().get(0);
+                field.set_name("durableObject");
+                field.set_code_order(0);
+                field.set_discriminant_value(0);
+                field
+                    .init_slot()
+                    .init_type()
+                    .init_struct()
+                    .set_type_id(do_backend_id);
+            }
+            {
+                let mut field = fields.reborrow().get(1);
+                field.set_name("httpForward");
+                field.set_code_order(1);
+                field.set_discriminant_value(1);
+                field
+                    .init_slot()
+                    .init_type()
+                    .init_struct()
+                    .set_type_id(http_backend_id);
+            }
+        }
+        for (i, (id, name)) in [
+            (do_backend_id, "DoBackend"),
+            (http_backend_id, "HttpForwardBackend"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut node = nodes.reborrow().get(4 + i as u32);
+            node.set_id(id);
+            node.set_display_name(format!("test.capnp:{name}"));
+            node.set_display_name_prefix_length("test.capnp:".len() as u32);
+            let mut s = node.init_struct();
+            s.set_discriminant_count(0);
+            s.init_fields(0);
+        }
+    }
+    message
+}
+
+// Fixture: the Proof anonymous-inline union from identity.capnp —
+// the second-schema proof shape (cloister-77172d).
+fn build_proof_fixture() -> Builder<HeapAllocator> {
+    let mut message = Builder::new_default();
+    let proof_id: u64 = 0xAAAA;
+    let claims_id: u64 = 0xCAFE;
+    {
+        let request = message.init_root::<schema_capnp::code_generator_request::Builder>();
+        let mut nodes = request.init_nodes(3);
+        fill_file_node(nodes.reborrow().get(0), 0xFFFE, "identity.capnp");
+
+        {
+            let mut node = nodes.reborrow().get(1);
+            node.set_id(proof_id);
+            node.set_display_name("identity.capnp:Proof");
+            node.set_display_name_prefix_length("identity.capnp:".len() as u32);
+            let mut s = node.init_struct();
+            s.set_discriminant_count(3);
+            let mut fields = s.init_fields(3);
+            {
+                let mut field = fields.reborrow().get(0);
+                field.set_name("ghaOidc");
+                field.set_code_order(0);
+                field.set_discriminant_value(0);
+                field
+                    .init_slot()
+                    .init_type()
+                    .init_struct()
+                    .set_type_id(claims_id);
+            }
+            {
+                let mut field = fields.reborrow().get(1);
+                field.set_name("passkey");
+                field.set_code_order(1);
+                field.set_discriminant_value(1);
+                field.init_slot().init_type().set_data(());
+            }
+            {
+                let mut field = fields.reborrow().get(2);
+                field.set_name("bootstrapCode");
+                field.set_code_order(2);
+                field.set_discriminant_value(2);
+                field.init_slot().init_type().set_text(());
+            }
+        }
+        {
+            let mut node = nodes.reborrow().get(2);
+            node.set_id(claims_id);
+            node.set_display_name("identity.capnp:GHAClaims");
+            node.set_display_name_prefix_length("identity.capnp:".len() as u32);
+            let mut s = node.init_struct();
+            s.set_discriminant_count(0);
+            s.init_fields(0);
+        }
+    }
+    message
+}
+
+// ── Golden: full-document pin for the MCP-tool-input shape ────────
+//
+// Pins the exact emitted text — key order, indentation, scalar
+// mappings — so any drift in determinism or layout fails loudly.
+// This is also the consumer-contract proof: `$defs.BeadCreate` is an
+// MCP `inputSchema`-compatible object (`type`/`properties`/`required`).
+
+#[test]
+fn jsonschema_struct_scalars_golden() {
+    let message = build_tool_input_fixture();
+    let schema = parse(&message).expect("parse");
+    let emitted = outputs::json_schema::emit(&schema, "tools").expect("emit");
+
+    let expected = indoc! {r#"
+        {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "$comment": "Generated by schema-bridge — do not edit by hand.",
+          "$id": "tools.schema.json",
+          "$defs": {
+            "BeadCreate": {
+              "type": "object",
+              "properties": {
+                "title": { "type": "string" },
+                "priority": { "type": "integer" },
+                "epoch": { "type": "integer" },
+                "force": { "type": "boolean" },
+                "weight": { "type": "number" },
+                "payload": { "type": "string", "contentEncoding": "base64" },
+                "limit": { "type": "integer", "minimum": 0 }
+              },
+              "required": ["title", "priority", "epoch", "force", "weight", "payload", "limit"],
+              "additionalProperties": false
+            }
+          }
+        }
+    "#};
+    assert_eq!(emitted, expected, "golden mismatch — emitted:\n{emitted}");
+
+    // The output must parse as JSON, and the $defs entry must be an
+    // MCP inputSchema-shaped object.
+    let doc: serde_json::Value = serde_json::from_str(&emitted).expect("output must be valid JSON");
+    assert_eq!(
+        doc["$schema"], "https://json-schema.org/draft/2020-12/schema",
+        "must self-identify as draft 2020-12"
+    );
+    let def = &doc["$defs"]["BeadCreate"];
+    assert_eq!(def["type"], "object");
+    assert!(def["properties"].is_object());
+    assert!(def["required"].is_array());
+}
+
+#[test]
+fn jsonschema_struct_ref_emits_ref() {
+    // Outer { inner :Inner; } / Inner { tag :Text; } — struct refs
+    // become `$ref` pointers into `$defs`.
+    let mut message = Builder::new_default();
+    let outer_id: u64 = 0xAAAA;
+    let inner_id: u64 = 0xBBBB;
+    {
+        let request = message.init_root::<schema_capnp::code_generator_request::Builder>();
+        let mut nodes = request.init_nodes(3);
+        fill_file_node(nodes.reborrow().get(0), 0xFFFE, "test.capnp");
+
+        {
+            let mut node = nodes.reborrow().get(1);
+            node.set_id(outer_id);
+            node.set_display_name("test.capnp:Outer");
+            node.set_display_name_prefix_length("test.capnp:".len() as u32);
+            let mut s = node.init_struct();
+            s.set_discriminant_count(0);
+            let mut fields = s.init_fields(1);
+            let mut field = fields.reborrow().get(0);
+            field.set_name("inner");
+            field.set_code_order(0);
+            field
+                .init_slot()
+                .init_type()
+                .init_struct()
+                .set_type_id(inner_id);
+        }
+        {
+            let mut node = nodes.reborrow().get(2);
+            node.set_id(inner_id);
+            node.set_display_name("test.capnp:Inner");
+            node.set_display_name_prefix_length("test.capnp:".len() as u32);
+            let mut s = node.init_struct();
+            s.set_discriminant_count(0);
+            let mut fields = s.init_fields(1);
+            let mut field = fields.reborrow().get(0);
+            field.set_name("tag");
+            field.set_code_order(0);
+            field.init_slot().init_type().set_text(());
+        }
+    }
+
+    let schema = parse(&message).expect("parse");
+    let emitted = outputs::json_schema::emit(&schema, "test").expect("emit");
+    assert!(
+        emitted.contains(r##""inner": { "$ref": "#/$defs/Inner" }"##),
+        "emit:\n{emitted}"
+    );
+    // Both structs land in $defs.
+    let doc: serde_json::Value = serde_json::from_str(&emitted).expect("valid JSON");
+    assert!(doc["$defs"]["Outer"].is_object(), "emit:\n{emitted}");
+    assert!(doc["$defs"]["Inner"].is_object(), "emit:\n{emitted}");
+}
+
+#[test]
+fn jsonschema_list_emits_array_and_recurses() {
+    // tags :List(Text) + rows :List(List(Int32)).
+    let mut message = Builder::new_default();
+    {
+        let request = message.init_root::<schema_capnp::code_generator_request::Builder>();
+        let mut nodes = request.init_nodes(2);
+        fill_file_node(nodes.reborrow().get(0), 0xFFFE, "test.capnp");
+
+        let mut node = nodes.reborrow().get(1);
+        node.set_id(0xAAAA);
+        node.set_display_name("test.capnp:HasLists");
+        node.set_display_name_prefix_length("test.capnp:".len() as u32);
+        let mut s = node.init_struct();
+        s.set_discriminant_count(0);
+        let mut fields = s.init_fields(2);
+        {
+            let mut field = fields.reborrow().get(0);
+            field.set_name("tags");
+            field.set_code_order(0);
+            let mut slot = field.init_slot();
+            let list = slot.reborrow().init_type().init_list();
+            list.init_element_type().set_text(());
+        }
+        {
+            let mut field = fields.reborrow().get(1);
+            field.set_name("rows");
+            field.set_code_order(1);
+            let mut slot = field.init_slot();
+            let outer = slot.reborrow().init_type().init_list();
+            let inner = outer.init_element_type().init_list();
+            inner.init_element_type().set_int32(());
+        }
+    }
+
+    let schema = parse(&message).expect("parse");
+    let emitted = outputs::json_schema::emit(&schema, "test").expect("emit");
+    assert!(
+        emitted.contains(r#""tags": { "type": "array", "items": { "type": "string" } }"#),
+        "emit:\n{emitted}"
+    );
+    assert!(
+        emitted.contains(
+            r#""rows": { "type": "array", "items": { "type": "array", "items": { "type": "integer" } } }"#
+        ),
+        "emit:\n{emitted}"
+    );
+}
+
+#[test]
+fn jsonschema_enum_emits_string_enum_and_ref() {
+    let message = build_backend_fixture();
+    let schema = parse(&message).expect("parse");
+    let emitted = outputs::json_schema::emit(&schema, "test").expect("emit");
+
+    // Top-level enum → single-line $defs entry with the wire strings
+    // in ordinal order.
+    assert!(
+        emitted.contains(r#""Tier": { "type": "string", "enum": ["hypervisor", "cluster"] }"#),
+        "emit:\n{emitted}"
+    );
+    // Enum-typed field → $ref, same as struct refs.
+    assert!(
+        emitted.contains(r##""tier": { "$ref": "#/$defs/Tier" }"##),
+        "emit:\n{emitted}"
+    );
+}
+
+#[test]
+fn jsonschema_named_union_struct_variants_emits_oneof_under_discriminant() {
+    let message = build_backend_fixture();
+    let schema = parse(&message).expect("parse");
+    let emitted = outputs::json_schema::emit(&schema, "test").expect("emit");
+
+    let doc: serde_json::Value = serde_json::from_str(&emitted).expect("valid JSON");
+    let backend = &doc["$defs"]["Backend"];
+
+    // Base fields + the discriminant are all properties, all required.
+    // (serde_json's Map sorts keys on parse, so property ORDER is
+    // asserted by the golden text pin, not here.)
+    let props = backend["properties"].as_object().expect("properties");
+    let mut keys: Vec<&str> = props.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["kind", "name", "tier"], "emit:\n{emitted}");
+    let required: Vec<&str> = backend["required"]
+        .as_array()
+        .expect("required")
+        .iter()
+        .map(|v| v.as_str().expect("string"))
+        .collect();
+    assert_eq!(required, ["name", "tier", "kind"], "emit:\n{emitted}");
+    assert_eq!(backend["additionalProperties"], false, "emit:\n{emitted}");
+
+    // The discriminant property is a oneOf of single-key strict
+    // branch objects — capnp's nested JSON convention.
+    let branches = backend["properties"]["kind"]["oneOf"]
+        .as_array()
+        .expect("kind must be a oneOf");
+    assert_eq!(branches.len(), 2, "emit:\n{emitted}");
+    assert_eq!(
+        branches[0]["properties"]["durableObject"]["$ref"], "#/$defs/DoBackend",
+        "emit:\n{emitted}"
+    );
+    assert_eq!(
+        branches[1]["properties"]["httpForward"]["$ref"], "#/$defs/HttpForwardBackend",
+        "emit:\n{emitted}"
+    );
+    for branch in branches {
+        assert_eq!(branch["type"], "object", "emit:\n{emitted}");
+        assert_eq!(branch["additionalProperties"], false, "emit:\n{emitted}");
+        assert_eq!(
+            branch["required"].as_array().expect("required").len(),
+            1,
+            "each branch requires exactly its variant key — emit:\n{emitted}"
+        );
+    }
+}
+
+#[test]
+fn jsonschema_named_union_void_variants_emit_null_payload() {
+    // Wire.transport :union { uds :Void; leylineNet :Void; } — Void
+    // payloads are `null` in capnp's JSON convention.
+    let mut message = Builder::new_default();
+    let wire_id: u64 = 0xAAAA;
+    let transport_group_id: u64 = 0xBBBB;
+    {
+        let request = message.init_root::<schema_capnp::code_generator_request::Builder>();
+        let mut nodes = request.init_nodes(3);
+        fill_file_node(nodes.reborrow().get(0), 0xFFFE, "test.capnp");
+
+        {
+            let mut node = nodes.reborrow().get(1);
+            node.set_id(wire_id);
+            node.set_display_name("test.capnp:Wire");
+            node.set_display_name_prefix_length("test.capnp:".len() as u32);
+            let mut s = node.init_struct();
+            s.set_discriminant_count(0);
+            let mut fields = s.init_fields(1);
+            let mut field = fields.reborrow().get(0);
+            field.set_name("transport");
+            field.set_code_order(0);
+            field.set_discriminant_value(0xffff);
+            field.init_group().set_type_id(transport_group_id);
+        }
+        {
+            let mut node = nodes.reborrow().get(2);
+            node.set_id(transport_group_id);
+            node.set_display_name("test.capnp:Wire.transport");
+            node.set_display_name_prefix_length("test.capnp:".len() as u32);
+            let mut s = node.init_struct();
+            s.set_is_group(true);
+            s.set_discriminant_count(2);
+            let mut fields = s.init_fields(2);
+            for (i, name) in ["uds", "leylineNet"].iter().enumerate() {
+                let mut field = fields.reborrow().get(i as u32);
+                field.set_name(name);
+                field.set_code_order(i as u16);
+                field.set_discriminant_value(i as u16);
+                field.init_slot().init_type().set_void(());
+            }
+        }
+    }
+
+    let schema = parse(&message).expect("parse");
+    let emitted = outputs::json_schema::emit(&schema, "test").expect("emit");
+    assert!(
+        emitted.contains(
+            r#"{ "type": "object", "properties": { "uds": { "type": "null" } }, "required": ["uds"], "additionalProperties": false }"#
+        ),
+        "emit:\n{emitted}"
+    );
+    assert!(
+        emitted.contains(
+            r#"{ "type": "object", "properties": { "leylineNet": { "type": "null" } }, "required": ["leylineNet"], "additionalProperties": false }"#
+        ),
+        "emit:\n{emitted}"
+    );
+}
+
+#[test]
+fn jsonschema_anonymous_inline_union_emits_flat_oneof() {
+    // Proof from identity.capnp — the whole struct def is a oneOf
+    // over flat single-variant branches (no discriminator wrapper).
+    let message = build_proof_fixture();
+    let schema = parse(&message).expect("parse");
+    let emitted = outputs::json_schema::emit(&schema, "identity").expect("emit");
+
+    let doc: serde_json::Value = serde_json::from_str(&emitted).expect("valid JSON");
+    let proof = &doc["$defs"]["Proof"];
+    assert!(
+        proof.get("type").is_none(),
+        "flat-union struct def must be a bare oneOf, not an object schema — emit:\n{emitted}"
+    );
+    let branches = proof["oneOf"].as_array().expect("oneOf");
+    assert_eq!(branches.len(), 3, "emit:\n{emitted}");
+    assert_eq!(
+        branches[0]["properties"]["ghaOidc"]["$ref"], "#/$defs/GHAClaims",
+        "emit:\n{emitted}"
+    );
+    assert_eq!(
+        branches[1]["properties"]["passkey"]["type"], "string",
+        "passkey is Data → base64 string — emit:\n{emitted}"
+    );
+    assert_eq!(
+        branches[2]["properties"]["bootstrapCode"]["type"], "string",
+        "emit:\n{emitted}"
+    );
+    for branch in branches {
+        assert_eq!(branch["additionalProperties"], false, "emit:\n{emitted}");
+    }
+}
+
+#[test]
+fn jsonschema_consts_emit_const_keyword() {
+    // Scalar + list consts → `{"const": <value>}` $defs entries.
+    let mut message = Builder::new_default();
+    {
+        let request = message.init_root::<schema_capnp::code_generator_request::Builder>();
+        let mut nodes = request.init_nodes(4);
+        fill_file_node(nodes.reborrow().get(0), 0xFFFE, "with_const.capnp");
+
+        {
+            let mut node = nodes.reborrow().get(1);
+            node.set_id(0xC0DE_0001);
+            node.set_display_name("with_const.capnp:contractVersion");
+            node.set_display_name_prefix_length("with_const.capnp:".len() as u32);
+            let mut c = node.init_const();
+            c.reborrow().init_type().set_int32(());
+            c.init_value().set_int32(1);
+        }
+        {
+            let mut node = nodes.reborrow().get(2);
+            node.set_id(0xC0DE_0002);
+            node.set_display_name("with_const.capnp:productName");
+            node.set_display_name_prefix_length("with_const.capnp:".len() as u32);
+            let mut c = node.init_const();
+            c.reborrow().init_type().set_text(());
+            c.init_value().set_text("notme");
+        }
+        {
+            let mut node = nodes.reborrow().get(3);
+            node.set_id(0xC0DE_0010);
+            node.set_display_name("with_const.capnp:allowedScopes");
+            node.set_display_name_prefix_length("with_const.capnp:".len() as u32);
+            let mut c = node.init_const();
+            {
+                let ty = c.reborrow().init_type();
+                let list = ty.init_list();
+                list.init_element_type().set_text(());
+            }
+            {
+                let value = c.init_value();
+                let any_ptr = value.init_list();
+                let mut list: capnp::text_list::Builder = any_ptr.initn_as(3);
+                list.set(0, "read");
+                list.set(1, "write");
+                list.set(2, "admin");
+            }
+        }
+    }
+
+    let schema = parse(&message).expect("parse");
+    let emitted = outputs::json_schema::emit(&schema, "with_const").expect("emit");
+    assert!(
+        emitted.contains(r#""contractVersion": { "const": 1 }"#),
+        "emit:\n{emitted}"
+    );
+    assert!(
+        emitted.contains(r#""productName": { "const": "notme" }"#),
+        "emit:\n{emitted}"
+    );
+    assert!(
+        emitted.contains(r#""allowedScopes": { "const": ["read", "write", "admin"] }"#),
+        "emit:\n{emitted}"
+    );
+}
+
+#[test]
+fn jsonschema_nonfinite_float_const_fails_fast() {
+    // JSON has no representation for Inf/NaN. zod/go emit a visible
+    // build-break sentinel; JSON text has no sentinel that stays
+    // valid JSON, so the emitter must error loudly instead.
+    let mut message = Builder::new_default();
+    {
+        let request = message.init_root::<schema_capnp::code_generator_request::Builder>();
+        let mut nodes = request.init_nodes(2);
+        fill_file_node(nodes.reborrow().get(0), 0xFFFE, "with_const.capnp");
+
+        let mut node = nodes.reborrow().get(1);
+        node.set_id(0xC0DE_0BAD);
+        node.set_display_name("with_const.capnp:badFloat");
+        node.set_display_name_prefix_length("with_const.capnp:".len() as u32);
+        let mut c = node.init_const();
+        c.reborrow().init_type().set_float64(());
+        c.init_value().set_float64(f64::INFINITY);
+    }
+
+    let schema = parse(&message).expect("parse");
+    let err = outputs::json_schema::emit(&schema, "with_const")
+        .expect_err("must reject non-finite float const");
+    match err {
+        SchemaBridgeError::UnmappedConstruct { kind, .. } => {
+            assert_eq!(kind, "non-finite float const value");
+        }
+        other => panic!("expected UnmappedConstruct, got {other:?}"),
+    }
+}
+
+// ── JSON Schema output multiplexer wiring ──────────────────────────
+
+#[test]
+fn jsonschema_format_parses() {
+    let fmt = OutputFormat::parse("jsonschema").expect("parse jsonschema");
+    assert_eq!(fmt, OutputFormat::JsonSchema);
+}
+
+#[test]
+fn jsonschema_format_suffix_is_schema_json() {
+    // `tools.capnp` → `tools.schema.json`.
+    assert_eq!(OutputFormat::JsonSchema.file_suffix(), "schema.json");
+}
+
+#[test]
+fn jsonschema_format_parses_from_binary_name() {
+    let fmt = OutputFormat::from_binary_name("capnpc-schema-bridge-jsonschema").expect("parse");
+    assert_eq!(fmt, OutputFormat::JsonSchema);
+}
+
+#[test]
+fn jsonschema_dispatch_routes_to_jsonschema_emitter() {
+    let message = build_tool_input_fixture();
+    let schema = parse(&message).expect("parse");
+    let muxed = emit(&schema, OutputFormat::JsonSchema, "tools").expect("mux emit");
+    let direct = outputs::json_schema::emit(&schema, "tools").expect("direct emit");
+    assert_eq!(
+        direct, muxed,
+        "JsonSchema dispatcher must be a pure passthrough"
+    );
+    assert!(
+        muxed.contains("https://json-schema.org/draft/2020-12/schema"),
+        "emit:\n{muxed}"
+    );
+    assert!(!muxed.contains("import { z }"), "must not be zod output");
+    assert!(!muxed.contains("package tools"), "must not be Go output");
+}
+
+// ── Cross-emitter consistency gate ─────────────────────────────────
+//
+// The three emitters read the same IR, so deep agreement is by
+// construction; this gate catches an emitter DROPPING or RENAMING a
+// construct. For every struct/field/union-variant/enum-value in the
+// IR, the wire name must surface in all three outputs:
+//   - zod:        `<name>:` property / `"<value>"` enum literal
+//   - go:         `json:"<name>` tag / `= "<value>"` const
+//   - jsonschema: parsed `$defs` — properties/required/oneOf/enum
+//     compared structurally against the IR.
+
+fn assert_cross_emitter_agreement(schema: &leyline_schema_bridge::Schema) {
+    let zod = outputs::zod::emit(schema).expect("zod emit");
+    let go = outputs::go::emit(schema, "test").expect("go emit");
+    let js = outputs::json_schema::emit(schema, "test").expect("jsonschema emit");
+    let doc: serde_json::Value = serde_json::from_str(&js).expect("jsonschema must be valid JSON");
+    let defs = &doc["$defs"];
+
+    for e in &schema.enums {
+        let js_variants: Vec<&str> = defs[&e.name]["enum"]
+            .as_array()
+            .unwrap_or_else(|| panic!("jsonschema $defs.{} missing enum array:\n{js}", e.name))
+            .iter()
+            .map(|v| v.as_str().expect("enum value must be a string"))
+            .collect();
+        assert_eq!(
+            js_variants, e.variants,
+            "jsonschema enum values drifted:\n{js}"
+        );
+        for v in &e.variants {
+            assert!(
+                zod.contains(&format!("\"{v}\"")),
+                "zod missing enum value {v}:\n{zod}"
+            );
+            assert!(
+                go.contains(&format!("= \"{v}\"")),
+                "go missing enum value {v}:\n{go}"
+            );
+        }
+    }
+
+    for s in &schema.structs {
+        let def = &defs[&s.name];
+        assert!(
+            def.is_object(),
+            "jsonschema missing $defs.{}:\n{js}",
+            s.name
+        );
+        assert!(
+            zod.contains(&format!("export const {}Schema", s.name)),
+            "zod missing struct {}:\n{zod}",
+            s.name
+        );
+        assert!(
+            go.contains(&format!("type {} struct", s.name)),
+            "go missing struct {}:\n{go}",
+            s.name
+        );
+
+        for field in &s.fields {
+            assert!(
+                zod.contains(&format!("{}: ", field.name)),
+                "zod missing field {}:\n{zod}",
+                field.name
+            );
+            assert!(
+                go.contains(&format!("json:\"{}", field.name)),
+                "go missing field {}:\n{go}",
+                field.name
+            );
+        }
+
+        match &s.union {
+            None => {
+                let field_names: Vec<&str> = s.fields.iter().map(|f| f.name.as_str()).collect();
+                // serde_json's Map sorts keys on parse — compare the
+                // property SET here; declaration order is pinned by
+                // the required array (a JSON array keeps its order).
+                let mut sorted_fields = field_names.clone();
+                sorted_fields.sort_unstable();
+                let props: Vec<&str> = def["properties"]
+                    .as_object()
+                    .expect("plain struct must have properties")
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
+                assert_eq!(props, sorted_fields, "jsonschema properties drifted:\n{js}");
+                let required: Vec<&str> = def["required"]
+                    .as_array()
+                    .expect("plain struct must have required")
+                    .iter()
+                    .map(|v| v.as_str().expect("string"))
+                    .collect();
+                // capnp has no optional fields — all three emitters
+                // treat every base field as required.
+                assert_eq!(required, field_names, "jsonschema required drifted:\n{js}");
+            }
+            Some(u) if u.discriminant_name.is_none() => {
+                let branches = def["oneOf"]
+                    .as_array()
+                    .expect("anonymous-inline union must be a oneOf");
+                assert_eq!(
+                    branches.len(),
+                    u.variants.len(),
+                    "branch count drifted:\n{js}"
+                );
+                for (branch, v) in branches.iter().zip(&u.variants) {
+                    assert!(
+                        branch["properties"].get(&v.name).is_some(),
+                        "jsonschema branch missing variant {}:\n{js}",
+                        v.name
+                    );
+                }
+            }
+            Some(u) => {
+                let disc = u.discriminant_name.as_deref().expect("named union");
+                let branches = def["properties"][disc]["oneOf"]
+                    .as_array()
+                    .expect("named union discriminant must be a oneOf");
+                assert_eq!(
+                    branches.len(),
+                    u.variants.len(),
+                    "branch count drifted:\n{js}"
+                );
+                for (branch, v) in branches.iter().zip(&u.variants) {
+                    assert!(
+                        branch["properties"].get(&v.name).is_some(),
+                        "jsonschema branch missing variant {}:\n{js}",
+                        v.name
+                    );
+                }
+            }
+        }
+
+        if let Some(u) = &s.union {
+            for v in &u.variants {
+                assert!(
+                    zod.contains(v.name.as_str()),
+                    "zod missing union variant {}:\n{zod}",
+                    v.name
+                );
+                assert!(
+                    go.contains(&format!("json:\"{},omitempty\"", v.name)),
+                    "go missing union variant {}:\n{go}",
+                    v.name
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn cross_emitter_agreement_identity_proof() {
+    // identity.capnp's Proof — the second-schema proof fixture.
+    let message = build_proof_fixture();
+    let schema = parse(&message).expect("parse");
+    assert_cross_emitter_agreement(&schema);
+}
+
+#[test]
+fn cross_emitter_agreement_backend_named_union() {
+    // Enum + base fields + named-group union in one fixture.
+    let message = build_backend_fixture();
+    let schema = parse(&message).expect("parse");
+    assert_cross_emitter_agreement(&schema);
 }

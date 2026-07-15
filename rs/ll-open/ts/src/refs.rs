@@ -854,29 +854,17 @@ fn python_enclosing_class(func_node: &Node, source: &[u8]) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Extract JavaScript definitions, call references, and imports from a
-/// single AST node. Pure data — no DB access.
+/// single AST node. Pure data — no DB access, safe for parallel use.
 ///
-/// Bead `ley-line-open-caf423`: LLO had no JavaScript pipeline at all
-/// pre-fix (no `TsLanguage::JavaScript`, no `.js` mapping, no
-/// extractor). Mache's cross-language rules pretended JS was covered
-/// and joined against an empty projection, producing false positives.
-///
-/// Node kinds handled (tree-sitter-javascript grammar):
-/// - `function_declaration`, `generator_function_declaration` → Def
-///   (uses `name` field).
-/// - `class_declaration` → Def (name field).
-/// - `method_definition` → Def (uses `name` field). When nested inside
-///   a `class_declaration`, we also emit the qualified `Class.method`
-///   form.
-/// - `lexical_declaration` / `variable_declaration` bindings to
-///   `function_expression` / `arrow_function` → Def (name of the
-///   binding, treated as a top-level callable).
-/// - `call_expression` → Ref:
-///     - `function: identifier` → bare token
-///     - `function: member_expression` → qualified `obj.attr` + bare
-///       `attr`
-/// - `import_statement` → Import (per named binding; import specifiers
-///   carry `name`/`alias` fields).
+/// The per-language knowledge lives in `queries/javascript/tags.scm`;
+/// this function compiles it once and delegates to the generic
+/// [`QueryEngine`](crate::query_engine::QueryEngine) interpreter, then
+/// applies [`js_ts_context_fixups`] for the two facts an anchored
+/// downward-matching query cannot express (qualified `Class.method`
+/// defs, κ = "function" on var-bound arrows/function expressions).
+/// Emission behavior is pinned by the fixture tests in
+/// `rs/ll-open/cli-lib/tests/def_ref_extraction_fidelity_test.rs` —
+/// edit the `.scm`, keep the fixtures green.
 #[cfg(feature = "javascript")]
 pub fn extract_javascript(
     node: &Node,
@@ -885,516 +873,98 @@ pub fn extract_javascript(
     source_id: &str,
     container_node_id: Option<&str>,
 ) -> Vec<ExtractedRef> {
-    let mut out = Vec::new();
-
-    match node.kind() {
-        "function_declaration" | "generator_function_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name")
-                && let Ok(token) = name_node.utf8_text(source)
-                && !token.is_empty()
-            {
-                out.push(ExtractedRef::Def {
-                    token: token.to_string(),
-                    node_id: node_id.to_string(),
-                    source_id: source_id.to_string(),
-                    container_node_id: container_node_id.map(str::to_string),
-                    canonical_kind: crate::languages::TsLanguage::JavaScript
-                        .canonical_kind(node.kind()),
-                });
-            }
-        }
-        "class_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name")
-                && let Ok(token) = name_node.utf8_text(source)
-                && !token.is_empty()
-            {
-                out.push(ExtractedRef::Def {
-                    token: token.to_string(),
-                    node_id: node_id.to_string(),
-                    source_id: source_id.to_string(),
-                    container_node_id: container_node_id.map(str::to_string),
-                    canonical_kind: crate::languages::TsLanguage::JavaScript
-                        .canonical_kind(node.kind()),
-                });
-            }
-        }
-        "method_definition" => {
-            let Some(name_node) = node.child_by_field_name("name") else {
-                return out;
-            };
-            let Ok(name) = name_node.utf8_text(source) else {
-                return out;
-            };
-            if name.is_empty() {
-                return out;
-            }
-            // Qualified form when inside a `class_declaration`. The
-            // method_definition sits under `class_body`, which is under
-            // the class_declaration. Bead `ley-line-open-caf423`.
-            if let Some(cls) = js_enclosing_class(node, source) {
-                out.push(ExtractedRef::Def {
-                    token: format!("{cls}.{name}"),
-                    node_id: node_id.to_string(),
-                    source_id: source_id.to_string(),
-                    container_node_id: container_node_id.map(str::to_string),
-                    canonical_kind: crate::languages::TsLanguage::JavaScript
-                        .canonical_kind(node.kind()),
-                });
-            }
-            out.push(ExtractedRef::Def {
-                token: name.to_string(),
-                node_id: node_id.to_string(),
-                source_id: source_id.to_string(),
-                container_node_id: container_node_id.map(str::to_string),
-                canonical_kind: crate::languages::TsLanguage::JavaScript
-                    .canonical_kind(node.kind()),
-            });
-        }
-        // `const foo = () => 1;` / `let bar = function () {};` /
-        // `var baz = async () => x;`. Bead `ley-line-open-caf423`: without
-        // this arm, modern JS silently drops every arrow / function
-        // expression bound to a variable — despite the docstring above
-        // claiming these produce Defs. Walk the declaration's
-        // `variable_declarator` children; when the initializer is an
-        // arrow_function or function_expression, emit a Def whose token
-        // is the bound identifier. Destructuring patterns (`const { x } =
-        // …`) are skipped — the `name` field is only an identifier for
-        // the plain-binding case, so tree-sitter's own field lookup does
-        // the filtering for us.
-        "lexical_declaration" | "variable_declaration" => {
-            js_extract_var_bindings(
-                node,
-                source,
-                node_id,
-                source_id,
-                container_node_id,
-                &mut out,
-            );
-        }
-        "call_expression" => {
-            if let Some(func_node) = node.child_by_field_name("function") {
-                match func_node.kind() {
-                    "identifier" => {
-                        if let Ok(token) = func_node.utf8_text(source)
-                            && !token.is_empty()
-                        {
-                            out.push(ExtractedRef::Ref {
-                                token: token.to_string(),
-                                node_id: node_id.to_string(),
-                                source_id: source_id.to_string(),
-                                container_node_id: container_node_id.map(str::to_string),
-                            });
-                        }
-                    }
-                    "member_expression" => {
-                        let obj = func_node
-                            .child_by_field_name("object")
-                            .and_then(|n| n.utf8_text(source).ok())
-                            .unwrap_or("");
-                        let prop = func_node
-                            .child_by_field_name("property")
-                            .and_then(|n| n.utf8_text(source).ok())
-                            .unwrap_or("");
-                        if !prop.is_empty() {
-                            if !obj.is_empty() {
-                                out.push(ExtractedRef::Ref {
-                                    token: format!("{obj}.{prop}"),
-                                    node_id: node_id.to_string(),
-                                    source_id: source_id.to_string(),
-                                    container_node_id: container_node_id.map(str::to_string),
-                                });
-                            }
-                            out.push(ExtractedRef::Ref {
-                                token: prop.to_string(),
-                                node_id: node_id.to_string(),
-                                source_id: source_id.to_string(),
-                                container_node_id: container_node_id.map(str::to_string),
-                            });
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        "import_statement" => {
-            // `import { a, b as c } from "mod";` and `import d from "mod";`.
-            // The `source` field carries the module string; import clauses
-            // hang under `import_clause`.
-            let src_node = node.child_by_field_name("source");
-            let path = src_node
-                .and_then(|n| n.utf8_text(source).ok())
-                .unwrap_or("")
-                .trim_matches(|c| c == '"' || c == '\'');
-            if path.is_empty() {
-                return out;
-            }
-            // Walk every specifier under this import.
-            walk_js_import_specifiers(*node, source, path, source_id, &mut out);
-        }
-        _ => {}
-    }
-
+    use std::sync::OnceLock;
+    static ENGINE: OnceLock<crate::query_engine::QueryEngine> = OnceLock::new();
+    let mut out = ENGINE
+        .get_or_init(|| {
+            crate::query_engine::QueryEngine::new(
+                crate::languages::TsLanguage::JavaScript,
+                include_str!("../queries/javascript/tags.scm"),
+            )
+            .expect(
+                "compiled-in queries/javascript/tags.scm must compile against tree-sitter-javascript",
+            )
+        })
+        .extract(node, source, node_id, source_id, container_node_id);
+    js_ts_context_fixups(
+        node,
+        source,
+        crate::languages::TsLanguage::JavaScript,
+        &mut out,
+    );
     out
 }
 
-/// Walk a `lexical_declaration` / `variable_declaration` for
-/// `variable_declarator` children whose initializer is an arrow or
-/// function expression. Emit a Def with the bound identifier as the
-/// token. Shared between JS and TS extractors (TS uses the same node
-/// kinds — verified via tree-sitter-typescript's grammar). Destructuring
-/// patterns (`object_pattern` / `array_pattern` as `name`) are skipped:
-/// binding an arrow to a destructure is exotic and the emitted token
-/// wouldn't be a single callable identifier.
+/// Post-pass for the two facts the anchored query engine cannot
+/// express for JS/TS (bead `ley-line-open-451f77`); shared because the
+/// TSX grammar reuses the JS node kinds for both constructs.
 ///
-/// Bead `ley-line-open-caf423`.
+/// 1. Qualified `Class.method` defs: query patterns match downward
+///    from their root, so a pattern anchored at `method_definition`
+///    cannot capture the ANCESTOR class name. This walks
+///    `method_definition` → `class_body` → class parent and prepends
+///    the qualified form of the engine's bare-name def (qualified
+///    first, bare second — same dual-emit order as the engine's own
+///    `@qualifier` rule). `abstract_class_declaration` exists only in
+///    the TSX grammar; the kind check is inert for JS.
+/// 2. κ for var-bound functions: the engine derives `canonical_kind`
+///    from the ANCHOR node's kind, but a `lexical_declaration` /
+///    `variable_declaration` anchor records the definition of the
+///    FUNCTION it binds, not of a variable — κ pins to "function"
+///    (mache's `dead_code` / `god_file` rules filter on symbol-scope
+///    κ; bead `ley-line-open-caf423`).
 #[cfg(any(feature = "javascript", feature = "typescript"))]
-fn js_extract_var_bindings(
-    decl_node: &Node,
-    source: &[u8],
-    node_id: &str,
-    source_id: &str,
-    container_node_id: Option<&str>,
-    out: &mut Vec<ExtractedRef>,
-) {
-    let mut cursor = decl_node.walk();
-    for child in decl_node.named_children(&mut cursor) {
-        if child.kind() != "variable_declarator" {
-            continue;
-        }
-        let Some(name_node) = child.child_by_field_name("name") else {
-            continue;
-        };
-        // Only bind for plain identifier names; skip destructuring.
-        if name_node.kind() != "identifier" {
-            continue;
-        }
-        let Ok(name) = name_node.utf8_text(source) else {
-            continue;
-        };
-        if name.is_empty() {
-            continue;
-        }
-        let Some(value_node) = child.child_by_field_name("value") else {
-            continue;
-        };
-        match value_node.kind() {
-            "arrow_function" | "function_expression" => {
-                out.push(ExtractedRef::Def {
-                    token: name.to_string(),
-                    node_id: node_id.to_string(),
-                    source_id: source_id.to_string(),
-                    container_node_id: container_node_id.map(str::to_string),
-                    // Bound-to-variable functions get κ = "function"
-                    // directly — the enclosing var declarator itself
-                    // maps to "variable" but the DEFINITION being
-                    // recorded here is the function it binds.
-                    canonical_kind: Some("function"),
-                });
-            }
-            _ => {}
-        }
-    }
-}
-
-#[cfg(feature = "javascript")]
-fn js_enclosing_class(method_node: &Node, source: &[u8]) -> Option<String> {
-    // method_definition → class_body → class_declaration
-    let body = method_node.parent()?;
-    if body.kind() != "class_body" {
-        return None;
-    }
-    let cls = body.parent()?;
-    if cls.kind() != "class_declaration" {
-        return None;
-    }
-    let name = cls.child_by_field_name("name")?.utf8_text(source).ok()?;
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
-    }
-}
-
-/// Recursively walk `import_statement` / `import_clause` /
-/// `named_imports` looking for import specifiers, and emit each as an
-/// `ExtractedRef::Import` with the module path. Handles default imports
-/// (`import d from "m"`), named imports (`import { a, b as c } from
-/// "m"`), and namespace imports (`import * as ns from "m"`).
-#[cfg(feature = "javascript")]
-fn walk_js_import_specifiers(
-    node: Node<'_>,
-    source: &[u8],
-    path: &str,
-    source_id: &str,
-    out: &mut Vec<ExtractedRef>,
-) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        match child.kind() {
-            // Default import: `import d from "m";` — the identifier
-            // child of the import_clause is the alias.
-            "identifier" if node.kind() == "import_clause" => {
-                if let Ok(name) = child.utf8_text(source)
-                    && !name.is_empty()
-                {
-                    out.push(ExtractedRef::Import {
-                        alias: name.to_string(),
-                        path: path.to_string(),
-                        source_id: source_id.to_string(),
-                    });
-                }
-            }
-            // Namespace import: `import * as ns from "m";`.
-            "namespace_import" => {
-                let mut c2 = child.walk();
-                for gc in child.named_children(&mut c2) {
-                    if gc.kind() == "identifier"
-                        && let Ok(name) = gc.utf8_text(source)
-                        && !name.is_empty()
-                    {
-                        out.push(ExtractedRef::Import {
-                            alias: name.to_string(),
-                            path: path.to_string(),
-                            source_id: source_id.to_string(),
-                        });
-                    }
-                }
-            }
-            // Named import specifier: `a` or `a as b`. The `name` field
-            // is the imported name; the `alias` field is the local
-            // alias (present only when `as` was used).
-            "import_specifier" => {
-                let name = child
-                    .child_by_field_name("name")
-                    .and_then(|n| n.utf8_text(source).ok())
-                    .unwrap_or("");
-                let alias = child
-                    .child_by_field_name("alias")
-                    .and_then(|n| n.utf8_text(source).ok())
-                    .unwrap_or("");
-                let display_alias = if alias.is_empty() { name } else { alias };
-                if !name.is_empty() {
-                    out.push(ExtractedRef::Import {
-                        alias: display_alias.to_string(),
-                        path: path.to_string(),
-                        source_id: source_id.to_string(),
-                    });
-                }
-            }
-            // Recurse into `import_clause` / `named_imports` wrappers.
-            _ => {
-                walk_js_import_specifiers(child, source, path, source_id, out);
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// TypeScript extractor
-// ---------------------------------------------------------------------------
-
-/// Extract TypeScript definitions, call references, and imports from a
-/// single AST node. Pure data — no DB access.
-///
-/// Bead `ley-line-open-caf423`: same bug class as the JS gap that
-/// shipped alongside — TS files parse via leyline-fs's validate pass
-/// but LLO's producer had no `TsLanguage::TypeScript` arm, so every
-/// `.ts` / `.tsx` file wrote zero rows to `node_defs` / `node_refs`
-/// and mache's cross-language rules joined against an empty projection.
-///
-/// tree-sitter-typescript's TSX grammar is a strict superset of the JS
-/// grammar's node kinds — `function_declaration`, `class_declaration`,
-/// `method_definition`, `call_expression`, `import_statement` all have
-/// the same shape, so the JS arms port over unchanged. What's added:
-///
-/// - `interface_declaration` → Def (uses `name` field). Interfaces are
-///   pure type definitions and don't exist at runtime, but mache's
-///   cross-language rules still resolve callers who depend on their
-///   shape (implementer classes, generics constraints).
-/// - `type_alias_declaration` → Def (uses `name` field). Same
-///   reasoning: type aliases are stable identifiers other code names.
-/// - `enum_declaration` → Def (uses `name` field). TS enums also emit
-///   a runtime object, so they're both a value and a type binding.
-/// - `abstract_class_declaration` → Def (uses `name` field). Same
-///   shape as `class_declaration` but for abstract classes.
-/// - `lexical_declaration` / `variable_declaration` bindings to
-///   `function_expression` / `arrow_function` → Def (name of the binding).
-///   Shares the JS `js_extract_var_bindings` helper because TSX's grammar
-///   uses the same node kinds.
-#[cfg(feature = "typescript")]
-pub fn extract_typescript(
+fn js_ts_context_fixups(
     node: &Node,
     source: &[u8],
-    node_id: &str,
-    source_id: &str,
-    container_node_id: Option<&str>,
-) -> Vec<ExtractedRef> {
-    let mut out = Vec::new();
-
+    ts_lang: crate::languages::TsLanguage,
+    out: &mut Vec<ExtractedRef>,
+) {
     match node.kind() {
-        "function_declaration" | "generator_function_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name")
-                && let Ok(token) = name_node.utf8_text(source)
-                && !token.is_empty()
-            {
-                out.push(ExtractedRef::Def {
-                    token: token.to_string(),
-                    node_id: node_id.to_string(),
-                    source_id: source_id.to_string(),
-                    container_node_id: container_node_id.map(str::to_string),
-                    canonical_kind: crate::languages::TsLanguage::TypeScript
-                        .canonical_kind(node.kind()),
-                });
-            }
-        }
-        // `class` extends `class_declaration`; `abstract_class_declaration`
-        // is the TypeScript-specific abstract form. Both carry the same
-        // `name` field. `interface_declaration`, `type_alias_declaration`,
-        // and `enum_declaration` are pure TS constructs — no JS analog —
-        // but they follow the same name-field convention.
-        "class_declaration"
-        | "abstract_class_declaration"
-        | "interface_declaration"
-        | "type_alias_declaration"
-        | "enum_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name")
-                && let Ok(token) = name_node.utf8_text(source)
-                && !token.is_empty()
-            {
-                out.push(ExtractedRef::Def {
-                    token: token.to_string(),
-                    node_id: node_id.to_string(),
-                    source_id: source_id.to_string(),
-                    container_node_id: container_node_id.map(str::to_string),
-                    canonical_kind: crate::languages::TsLanguage::TypeScript
-                        .canonical_kind(node.kind()),
-                });
-            }
-        }
         "method_definition" => {
-            let Some(name_node) = node.child_by_field_name("name") else {
-                return out;
+            let Some(cls) = js_ts_enclosing_class(node, source) else {
+                return;
             };
-            let Ok(name) = name_node.utf8_text(source) else {
-                return out;
-            };
-            if name.is_empty() {
-                return out;
-            }
-            // Qualified `Class.method` form when the method sits inside
-            // a class or abstract class. Bead `ley-line-open-caf423` —
-            // same pattern as Python / JS / Rust: methods emit both the
-            // qualified form (for cross-language disambiguation) and
-            // the bare form (for unqualified call-site resolution).
-            if let Some(cls) = ts_enclosing_class(node, source) {
-                out.push(ExtractedRef::Def {
-                    token: format!("{cls}.{name}"),
-                    node_id: node_id.to_string(),
-                    source_id: source_id.to_string(),
-                    container_node_id: container_node_id.map(str::to_string),
-                    canonical_kind: crate::languages::TsLanguage::TypeScript
-                        .canonical_kind(node.kind()),
-                });
-            }
-            out.push(ExtractedRef::Def {
-                token: name.to_string(),
-                node_id: node_id.to_string(),
-                source_id: source_id.to_string(),
-                container_node_id: container_node_id.map(str::to_string),
-                canonical_kind: crate::languages::TsLanguage::TypeScript
-                    .canonical_kind(node.kind()),
-            });
-        }
-        // `const foo = () => 1;` / `let bar = function () {};` — same
-        // shape as JS. Bead `ley-line-open-caf423`: reuses the shared JS
-        // helper because tree-sitter-typescript's TSX grammar shares the
-        // `lexical_declaration` / `variable_declaration` /
-        // `variable_declarator` / `arrow_function` /
-        // `function_expression` node kinds unchanged.
-        "lexical_declaration" | "variable_declaration" => {
-            js_extract_var_bindings(
-                node,
-                source,
+            // The engine's only method_definition pattern emits exactly
+            // one bare-name def; an empty/suppressed name emits nothing
+            // and the qualified form is suppressed with it.
+            let Some(ExtractedRef::Def {
+                token,
                 node_id,
                 source_id,
                 container_node_id,
-                &mut out,
-            );
+                ..
+            }) = out.first()
+            else {
+                return;
+            };
+            let qualified = ExtractedRef::Def {
+                token: format!("{cls}.{token}"),
+                node_id: node_id.clone(),
+                source_id: source_id.clone(),
+                container_node_id: container_node_id.clone(),
+                canonical_kind: ts_lang.canonical_kind(node.kind()),
+            };
+            out.insert(0, qualified);
         }
-        "call_expression" => {
-            if let Some(func_node) = node.child_by_field_name("function") {
-                match func_node.kind() {
-                    "identifier" => {
-                        if let Ok(token) = func_node.utf8_text(source)
-                            && !token.is_empty()
-                        {
-                            out.push(ExtractedRef::Ref {
-                                token: token.to_string(),
-                                node_id: node_id.to_string(),
-                                source_id: source_id.to_string(),
-                                container_node_id: container_node_id.map(str::to_string),
-                            });
-                        }
-                    }
-                    "member_expression" => {
-                        let obj = func_node
-                            .child_by_field_name("object")
-                            .and_then(|n| n.utf8_text(source).ok())
-                            .unwrap_or("");
-                        let prop = func_node
-                            .child_by_field_name("property")
-                            .and_then(|n| n.utf8_text(source).ok())
-                            .unwrap_or("");
-                        if !prop.is_empty() {
-                            if !obj.is_empty() {
-                                out.push(ExtractedRef::Ref {
-                                    token: format!("{obj}.{prop}"),
-                                    node_id: node_id.to_string(),
-                                    source_id: source_id.to_string(),
-                                    container_node_id: container_node_id.map(str::to_string),
-                                });
-                            }
-                            out.push(ExtractedRef::Ref {
-                                token: prop.to_string(),
-                                node_id: node_id.to_string(),
-                                source_id: source_id.to_string(),
-                                container_node_id: container_node_id.map(str::to_string),
-                            });
-                        }
-                    }
-                    _ => {}
+        "lexical_declaration" | "variable_declaration" => {
+            for r in out {
+                if let ExtractedRef::Def { canonical_kind, .. } = r {
+                    *canonical_kind = Some("function");
                 }
             }
         }
-        "import_statement" => {
-            // Same shape as JS: `source` field carries the module string,
-            // `import_clause` / `named_imports` wrap the specifiers. TSX
-            // grammar uses the same node kinds — the JS specifier walker
-            // ports over unchanged.
-            let src_node = node.child_by_field_name("source");
-            let path = src_node
-                .and_then(|n| n.utf8_text(source).ok())
-                .unwrap_or("")
-                .trim_matches(|c| c == '"' || c == '\'');
-            if path.is_empty() {
-                return out;
-            }
-            walk_ts_import_specifiers(*node, source, path, source_id, &mut out);
-        }
         _ => {}
     }
-
-    out
 }
 
-/// Return the enclosing `class_declaration` / `abstract_class_declaration`
-/// name when `method_node` is a `method_definition` inside one. Returns
-/// `None` for method_definitions inside interface_declaration bodies or
-/// object literals (both carry `method_definition` in some grammar
-/// versions). Bead `ley-line-open-caf423`.
-#[cfg(feature = "typescript")]
-fn ts_enclosing_class(method_node: &Node, source: &[u8]) -> Option<String> {
-    // method_definition → class_body → class_declaration | abstract_class_declaration
+/// Enclosing class name for a `method_definition`:
+/// `method_definition` → `class_body` → `class_declaration` |
+/// `abstract_class_declaration`. Object-literal and class-expression
+/// methods return `None` — they emit bare-name defs only. Bead
+/// `ley-line-open-caf423`.
+#[cfg(any(feature = "javascript", feature = "typescript"))]
+fn js_ts_enclosing_class(method_node: &Node, source: &[u8]) -> Option<String> {
     let body = method_node.parent()?;
     if body.kind() != "class_body" {
         return None;
@@ -1411,82 +981,55 @@ fn ts_enclosing_class(method_node: &Node, source: &[u8]) -> Option<String> {
     }
 }
 
-/// Walk `import_statement` / `import_clause` / `named_imports` for
-/// import specifiers and emit each as `ExtractedRef::Import`. Mirrors
-/// `walk_js_import_specifiers` — TSX grammar uses the same node kinds
-/// for these constructs.
+// ---------------------------------------------------------------------------
+// TypeScript extractor
+// ---------------------------------------------------------------------------
+
+/// Extract TypeScript definitions, call references, and imports from a
+/// single AST node. Pure data — no DB access, safe for parallel use.
 ///
-/// TypeScript-specific: `import type { … } from "m"` is still an
-/// `import_statement` with the `type` keyword as an anonymous child;
-/// the specifier walk treats it identically.
+/// The per-language knowledge lives in `queries/typescript/tags.scm`,
+/// compiled against the TSX grammar (a superset of the JS grammar's
+/// node kinds — the query file is the JavaScript query plus the
+/// TS-only definition patterns: `interface_declaration`,
+/// `type_alias_declaration`, `enum_declaration`,
+/// `abstract_class_declaration`). This function compiles it once and
+/// delegates to the generic
+/// [`QueryEngine`](crate::query_engine::QueryEngine) interpreter, then
+/// applies [`js_ts_context_fixups`] for the two facts an anchored
+/// downward-matching query cannot express (qualified `Class.method`
+/// defs, κ = "function" on var-bound arrows/function expressions).
+/// Emission behavior is pinned by the fixture tests in
+/// `rs/ll-open/cli-lib/tests/def_ref_extraction_fidelity_test.rs` —
+/// edit the `.scm`, keep the fixtures green.
 #[cfg(feature = "typescript")]
-fn walk_ts_import_specifiers(
-    node: Node<'_>,
+pub fn extract_typescript(
+    node: &Node,
     source: &[u8],
-    path: &str,
+    node_id: &str,
     source_id: &str,
-    out: &mut Vec<ExtractedRef>,
-) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        match child.kind() {
-            // Default import: `import d from "m";` — the identifier
-            // child of the import_clause is the alias.
-            "identifier" if node.kind() == "import_clause" => {
-                if let Ok(name) = child.utf8_text(source)
-                    && !name.is_empty()
-                {
-                    out.push(ExtractedRef::Import {
-                        alias: name.to_string(),
-                        path: path.to_string(),
-                        source_id: source_id.to_string(),
-                    });
-                }
-            }
-            // Namespace import: `import * as ns from "m";`.
-            "namespace_import" => {
-                let mut c2 = child.walk();
-                for gc in child.named_children(&mut c2) {
-                    if gc.kind() == "identifier"
-                        && let Ok(name) = gc.utf8_text(source)
-                        && !name.is_empty()
-                    {
-                        out.push(ExtractedRef::Import {
-                            alias: name.to_string(),
-                            path: path.to_string(),
-                            source_id: source_id.to_string(),
-                        });
-                    }
-                }
-            }
-            // Named import specifier: `a` or `a as b`. `name` field is
-            // the imported name; `alias` field is the local alias
-            // (present only when `as` was used). `import type { … }`
-            // uses the same specifier shape.
-            "import_specifier" => {
-                let name = child
-                    .child_by_field_name("name")
-                    .and_then(|n| n.utf8_text(source).ok())
-                    .unwrap_or("");
-                let alias = child
-                    .child_by_field_name("alias")
-                    .and_then(|n| n.utf8_text(source).ok())
-                    .unwrap_or("");
-                let display_alias = if alias.is_empty() { name } else { alias };
-                if !name.is_empty() {
-                    out.push(ExtractedRef::Import {
-                        alias: display_alias.to_string(),
-                        path: path.to_string(),
-                        source_id: source_id.to_string(),
-                    });
-                }
-            }
-            // Recurse into `import_clause` / `named_imports` wrappers.
-            _ => {
-                walk_ts_import_specifiers(child, source, path, source_id, out);
-            }
-        }
-    }
+    container_node_id: Option<&str>,
+) -> Vec<ExtractedRef> {
+    use std::sync::OnceLock;
+    static ENGINE: OnceLock<crate::query_engine::QueryEngine> = OnceLock::new();
+    let mut out = ENGINE
+        .get_or_init(|| {
+            crate::query_engine::QueryEngine::new(
+                crate::languages::TsLanguage::TypeScript,
+                include_str!("../queries/typescript/tags.scm"),
+            )
+            .expect(
+                "compiled-in queries/typescript/tags.scm must compile against tree-sitter-typescript (TSX)",
+            )
+        })
+        .extract(node, source, node_id, source_id, container_node_id);
+    js_ts_context_fixups(
+        node,
+        source,
+        crate::languages::TsLanguage::TypeScript,
+        &mut out,
+    );
+    out
 }
 
 // ---------------------------------------------------------------------------

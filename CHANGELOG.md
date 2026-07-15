@@ -10,8 +10,19 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-07-15
+
+**Extraction becomes data: one generic query engine, ten languages, and grammar coverage for mache's full registry.**
+
+Minor release. Wire format unchanged (`wire_format_major = 1`, `compat_min_schema_version = 0.6.0`); `node_refs` gains one additive nullable column. `EXTRACTION_EPOCH` is 4 — arenas built by earlier binaries re-derive all facts on first adoption (one full-tree pass; the epoch mechanism below is itself new in this release).
+
 ### Added
 
+- **Generic `.scm` query engine — per-language extraction is data, not code**. `rs/ll-open/ts/src/query_engine.rs` interprets tree-sitter query files (`rs/ll-open/ts/queries/<lang>/tags.scm`) into `node_defs`/`node_refs`/`_imports` emissions under a small capture vocabulary (`@def`/`@ref`/`@import`/`@name`/`@qualifier`/`@path`/`@alias`, per-pattern `(#set! qualifier-separator …)`). All five hand-written extractors (go, rust, python, javascript, typescript) are ported behind their unchanged fixture tests — byte-identical emission, including dual-emit (`Receiver.Method`+`Method`), value-position refs, and import alias defaulting. Matching is anchored per node (`set_max_start_depth(0)`), so the content-addressing fold's `node_id`/`container_node_id` threading is untouched. Remaining per-language imperative code is limited to documented ancestor-qualification fixups (queries match downward only). Beads `ley-line-open-206d53`, `42f2b3`, `426dfd`, `451f77`.
+- **Tier 1+2 grammar coverage for 16 new languages** — sql, bash, java, c, cpp, toml, dockerfile, ruby, php, kotlin, swift, scala, c-sharp, css, groovy, lua now parse and validate (ERROR/MISSING enumeration via the `validate` op, name/extension/filename resolution incl. `Dockerfile`/`Containerfile`/`Jenkinsfile`). mache's post-CGO registry coverage: 27/28 (cue skipped — no tree-sitter-0.26-compatible crate; documented). Bead `ley-line-open-46ae48` under `e5addb`.
+- **Tier 3 extraction for five new languages, authored as queries from day one**: java, c, cpp (bead `ley-line-open-5e21c2` — `extract_c` is a pure engine delegate with zero imperative arms), plus honest PARTIAL algebras for sql and bash (bead `ley-line-open-780821` — CREATE-family defs with schema-qualified dual-emit + relation/invocation/trigger refs for sql; function defs + static command refs + static `source` imports for bash; rejections documented in the `.scm` headers: no index/trigger-name defs, no column refs, no `$VAR` refs, no dynamic source paths).
+- **`node_refs.qualifier` column (additive, nullable)**. The bare-token row of a dual-emit pair carries its qualifier (`fmt.Println()` → the `Println` row carries `fmt`; `std::process::exit()` → `exit` carries `std::process`; sql `analytics.events` → `events` carries `analytics`), NULL elsewhere — package-scoped consumer rules filter/GROUP BY structurally instead of string-splitting tokens. Legacy arenas get the column via ALTER on adoption. Discharges the `b9d1d5` plan (referrer half shipped as `container_node_id` in v0.7.4). Beads `ley-line-open-4dde42`, `b9d1d5`.
+- **`leyline-schema-bridge` json-schema emitter** (`capnpc-schema-bridge-jsonschema`): JSON Schema draft 2020-12, one MCP-`inputSchema`-compatible `$defs` entry per struct, unions as `oneOf` of strict single-key branches, `additionalProperties: false` mirroring zod's `.strict()`. Cross-emitter agreement gate keeps zod/Go/json-schema outputs structurally aligned. First consumer: rosary's generated MCP tool registry. Bead `ley-line-open-6585aa`.
 - **`leyline-schema-bridge` — capnp → zod TS / Go codegen, lifted from `cloister/tools/schema-bridge` (cloister ADR-0036 Phase 2)**. Build-time `capnpc` plugin family at `rs/ll-open/schema-bridge` — `capnpc-schema-bridge-zod` / `capnpc-schema-bridge-go`, output format dispatched by argv[0] basename, same shape as `capnpc-rust` / `capnpc-go`. Fail-fast self-maintenance invariant: any capnp construct without a complete IR-and-emit mapping is a hard error, never a silent `z.unknown()`. No daemon, no port, no SQLite sidecar — same posture as `leyline-cas-ffi`; same lift pattern as the 2026-05-09 `leyline-sign` lift. The hermetic test corpus (34 tests, no capnp CLI needed, + 2 `#[ignore]`d aspirational stubs) moves with it. Changes relative to the cloister copy beyond the rename: capnp 0.24 → the workspace's `=0.25.0` pin (builds clean, zero code change), and the emitters' 94 `write!`-to-`String` `.unwrap()`s become `.expect("write! to String is infallible")` per the `unwrap_without_expect` gate's drawdown discipline — no baseline growth. Cloister deletes its vendored copy and consumes upstream as a follow-up on its side; first planned new consumer after that is rosary (MCP `inputSchema` via a future json-schema output — follow-up bead). Bead `ley-line-open-0806dc`.
 
 ### Fixed
@@ -20,7 +31,24 @@ context, scoping notes, and review history are recoverable.
 
 ### Added
 
-- **`schemas/net.capnp` — canonical home for the leyline-net generic wire frames**. `Manifest` / `ToolCall` / `ToolResult` (plus `Content` / `BinaryContent`) were spec'd in cloister's `wire/cloister.capnp` (cloister ADR-0005) and hand re-vendored by rosary — a leyline-named protocol whose canonical copy lived in a cloister subdirectory. LLO now holds the canonical schema (`rs/ll-core/schema-capnp/schemas/net.capnp`, new fileId `0xa25bb2a310446125`; fileIds never reach the wire) with a `leyline-net/v1` spec dir (`rs/ll-core/schema-spec/leyline-net/v1/`: README, wire doc, 12 digest-pinned vectors × 2 byte-forms + `digests.json` + `VECTORS.sha256`). Vector bytes were captured from the ORIGINAL cloister schema and are byte-equal to cloister's committed TS fixtures — the split is provably wire-neutral. Drift gates: BLAKE3 pins hardcoded in `tests/leyline_net_vectors.rs` (encode byte-equality, decode field-equality, `capnp eval` cross-schema checks incl. a skip-if-missing live gate against a sibling cloister checkout) + the `VECTORS.sha256` gate in `leyline-schema-spec`. Go bindings at `clients/go/leyline-schema/net`. Downstream repoints are separate beads (cloister wire schema; rosary re-vendor `rosary-086973`). Bead `ley-line-open-083344`.
+- **`schemas/net.capnp` — canonical home for the leyline-net generic wire frames**. `Manifest` / `ToolCall` / `ToolResult` (plus `Content` / `BinaryContent`) were spec'd in cloister's `wire/cloister.capnp` (cloister ADR-0005) and hand re-vendored by rosary — a leyline-named protocol whose canonical copy lived in a cloister subdirectory. LLO now holds the canonical schema (`rs/ll-core/schema-capnp/schemas/net.capnp`, new fileId `0xa25bb2a310446125`; fileIds never reach the wire) with a `leyline-net/v1` spec dir (`rs/ll-core/schema-spec/leyline-net/v1/`: README, wire doc, 12 digest-pinned vectors × 2 byte-forms + `digests.json` + `VECTORS.sha256`). Vector bytes were captured from the ORIGINAL cloister schema and are byte-equal to cloister's committed TS fixtures — the split is provably wire-neutral. Drift gates: BLAKE3 pins hardcoded in `tests/leyline_net_vectors.rs` (encode byte-equality, decode field-equality, `capnp eval` cross-schema checks incl. a skip-if-missing live gate against a sibling cloister checkout) + the `VECTORS.sha256` gate in `leyline-schema-spec`. Go bindings at `clients/go/leyline-schema/net`. Downstream repoints are separate beads (cloister wire schema; rosary re-vendor `rosary-086973`, shipped same day as rosary PR #368). Bead `ley-line-open-083344`.
+
+### Changed
+
+- **`task ci` orders compile-free gates first** (`fmt:check`, `lint:blake3`, `readme:version-check` before `check`/`clippy`/`test`): a formatting slip now fails in under a second instead of after minutes of compilation. Bead `ley-line-open-9ca974`.
+
+### Compat matrix
+
+| | value |
+|---|---|
+| `binary_version` / `schema_version` | 0.8.0 |
+| `wire_format_major` | 1 (unchanged) |
+| `compat_min_schema_version` | 0.6.0 (unchanged) |
+| `EXTRACTION_EPOCH` | 4 (1 → 4 this release; older arenas re-derive facts on adoption) |
+
+### Not shipped this release
+
+- Injections (`injections.scm`, embedded-language blocks) and arena-resident query blobs (content-addressed `.scm` distribution with hash-allowlisted overrides) — the remaining phases of the queries-as-data design; next release.
 
 ## [0.7.9] — 2026-07-15
 

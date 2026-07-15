@@ -26,12 +26,13 @@ use leyline_ts::languages::TsLanguage;
 /// Without this cap, a single 1 GiB file in the source tree would OOM
 /// the daemon during full reparse on small machines.
 pub const MAX_PARSE_FILE_SIZE: i64 = 8 * 1024 * 1024;
-use leyline_ts::refs::{ExtractedRef, current_extraction_epoch, extract_refs};
+use leyline_ts::query_engine::QuerySet;
+use leyline_ts::refs::{ExtractedRef, current_extraction_epoch, extract_refs_resolved};
 use leyline_ts::schema::{
     create_ast_tables, create_index_schema, create_ir_indexes, create_ir_tables,
     create_pointer_store_tables, create_post_load_indexes_skip_unused, create_qualifier_column,
-    create_refs_tables, create_source_blobs_table, delete_file_rows, get_meta, read_file_index,
-    set_meta, sweep_orphaned_dirs,
+    create_query_blob_tables, create_refs_tables, create_source_blobs_table, delete_file_rows,
+    get_meta, read_file_index, set_meta, sweep_orphaned_dirs,
 };
 use rayon::prelude::*;
 use rusqlite::Connection;
@@ -142,6 +143,16 @@ pub(crate) struct ParsedFile {
     /// own content-addressed subtree. Merged into `hash_by_id` in the
     /// insert loop, next to the `_ast`-derived entries.
     injected_hashes: Vec<(String, [u8; 32])>,
+}
+
+/// Per-parse extraction context threaded through the fold (bead
+/// `ley-line-open-e72629`). `queries` is the resolved effective query
+/// set (compiled defaults + trusted arena overrides), shared read-only
+/// across rayon workers. `bounds` is a per-FILE flag (created inside the
+/// worker) set when an override engine trips its resource bounds.
+struct ExtractCtx<'a> {
+    queries: &'a QuerySet,
+    bounds: &'a std::cell::Cell<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -807,6 +818,11 @@ pub fn parse_into_conn(
     // (round-trip integrity), F4s (cross-gen dedup), F5s (cross-file dedup),
     // F-rename, and F-git assert continuous agreement.
     create_source_blobs_table(conn)?;
+    // Arena-resident query overrides (bead `ley-line-open-e72629`): the
+    // override-blob store lands with the rest of the schema so `resolve_query_set`
+    // below reads a well-formed (possibly empty) `_queries`/`query_blobs` pair,
+    // and so the FK check at COMMIT finds both tables present.
+    create_query_blob_tables(conn)?;
     create_index_schema(conn)?;
 
     let mtime = std::time::SystemTime::now()
@@ -850,15 +866,48 @@ pub fn parse_into_conn(
     // what delivers injected facts to existing arenas on upgrade — no
     // EXTRACTION_EPOCH bump accompanies the injections feature.
     let injection_epoch = leyline_ts::injections::current_injection_epoch();
+
+    // Arena-resident query overrides (bead `ley-line-open-e72629`): resolve the
+    // effective query set (compiled defaults + TRUSTED arena overrides) once per
+    // pass. The allowlist is operator-controlled via env — the arena writer must
+    // not be able to self-trust a blob. An untrusted/corrupt override is ignored
+    // with exactly one stderr line (compiled fallback); a trusted-but-malformed
+    // one fails the whole pass loud.
+    let trusted_hashes: std::collections::HashSet<String> =
+        std::env::var("LLO_TRUSTED_QUERY_HASHES")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .map(|h| h.trim().to_ascii_lowercase())
+                    .filter(|h| !h.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+    let resolution = leyline_ts::query_engine::resolve_query_set(conn, &trusted_hashes)?;
+    for w in &resolution.warnings {
+        eprintln!("warn: {w}");
+    }
+    let query_set = resolution.query_set;
+    // Composite query-set epoch — the active override set is a fact-derivation
+    // input the scalar extraction_epoch does not see (swapping an arena's
+    // override changes emission for byte-identical sources). Same staleness
+    // shape as extraction/injection epochs: ANY disagreement — including the
+    // missing row every pre-override arena has — disables the unchanged-skip and
+    // forces re-derivation; the missing-row case also delivers overrides to an
+    // existing arena on first adoption.
+    let query_set_epoch = leyline_ts::query_engine::query_set_epoch(&query_set);
+
     let epoch_current = incremental
         && get_meta(conn, "extraction_epoch").ok().flatten().as_deref()
             == Some(extraction_epoch.as_str())
         && get_meta(conn, "injection_epoch").ok().flatten().as_deref()
-            == Some(injection_epoch.as_str());
+            == Some(injection_epoch.as_str())
+        && get_meta(conn, "query_set_epoch").ok().flatten().as_deref()
+            == Some(query_set_epoch.as_str());
     if incremental && !epoch_current {
         eprintln!(
             "extraction epoch changed (binary epoch {extraction_epoch}, \
-             injection composite {injection_epoch}); \
+             injection composite {injection_epoch}, query-set {query_set_epoch}); \
              re-deriving facts for all files",
         );
     }
@@ -1043,7 +1092,15 @@ pub fn parse_into_conn(
             // fails (e.g. broken symlink), preserving prior behavior.
             let canon = abs_path.canonicalize().unwrap_or_else(|_| abs_path.clone());
             let abs_str = canon.to_string_lossy().to_string();
-            parse_file_pure(&content, *lang, rel, &abs_str, *file_mtime, *file_size)
+            parse_file_pure(
+                &content,
+                *lang,
+                rel,
+                &abs_str,
+                *file_mtime,
+                *file_size,
+                &query_set,
+            )
         })
         .collect();
 
@@ -1549,6 +1606,20 @@ pub fn parse_into_conn(
         // Composite injection epoch — same full-tree-only rationale as
         // extraction_epoch above (bead `ley-line-open-c822a6`).
         set_meta(conn, "injection_epoch", &injection_epoch)?;
+        // Query-set epoch + active-override provenance (bead
+        // `ley-line-open-e72629`). `query_source:<lang>` rows make the ACTIVE
+        // query-set source observable (`arena:<hex>`); absence of a row means
+        // the compiled default. Stale rows from a removed override are cleared
+        // first so provenance never over-reports.
+        set_meta(conn, "query_set_epoch", &query_set_epoch)?;
+        conn.execute("DELETE FROM _meta WHERE key LIKE 'query_source:%'", [])?;
+        for (lang, hex) in query_set.active() {
+            set_meta(
+                conn,
+                &format!("query_source:{}", lang.name()),
+                &format!("arena:{hex}"),
+            )?;
+        }
     }
     let sweep_close_elapsed = sweep_close_start.elapsed();
 
@@ -2174,6 +2245,7 @@ pub(crate) fn parse_file_pure(
     abs_path: &str,
     file_mtime: i64,
     file_size: i64,
+    queries: &QuerySet,
 ) -> Result<ParsedFile> {
     let mut parser = tree_sitter::Parser::new();
     parser
@@ -2222,6 +2294,13 @@ pub(crate) fn parse_file_pure(
     // independence gate, read once per file (rayon workers only read).
     let mut injected_hashes: Vec<(String, [u8; 32])> = Vec::new();
     let injections_on = !leyline_ts::injections::injections_disabled();
+    // Arena query overrides (bead `ley-line-open-e72629`): per-file bounds flag
+    // set when an override engine trips its resource ceiling on any node.
+    let bounds_tripped = std::cell::Cell::new(false);
+    let ctx = ExtractCtx {
+        queries,
+        bounds: &bounds_tripped,
+    };
 
     // File node.
     nodes.push(ParsedNode {
@@ -2270,8 +2349,23 @@ pub(crate) fn parse_file_pure(
         &mut node_contents,
         &mut node_children,
         &mut injected_hashes,
+        &ctx,
     );
     ast_entries[root_idx].node_hash = root_hash;
+
+    // Arena query overrides (bead `ley-line-open-e72629`): a pathological
+    // override tripped its resource ceiling somewhere in this file. Drop the
+    // file's extracted facts — "no facts for this file" — with exactly one
+    // stderr line; structural rows stay valid. Never a partial fact set, never
+    // a hung parse.
+    if bounds_tripped.get() {
+        refs.clear();
+        eprintln!(
+            "warn: query override for {} exceeded its resource bounds on {source_id}; \
+             dropped extracted facts for this file",
+            language.name()
+        );
+    }
 
     // Pre-serialize capnp records in the rayon worker so the post-
     // parse main-thread loop just writes pre-built byte buffers to the
@@ -2382,6 +2476,8 @@ pub(crate) fn parse_to_ast_json(
     // they're metadata for the file-index row, which callers of
     // parse_to_ast_json don't populate (no `_file_index` in the
     // JSON response shape).
+    // No arena connection here (in-memory validate path), so no overrides can
+    // apply — the compiled defaults are the effective query set.
     let parsed = parse_file_pure(
         content,
         language,
@@ -2389,6 +2485,7 @@ pub(crate) fn parse_to_ast_json(
         source_id,
         0,
         content.len() as i64,
+        &QuerySet::compiled(),
     )?;
 
     let ast: Vec<serde_json::Value> = parsed
@@ -2502,6 +2599,7 @@ fn fold_children(
     node_contents: &mut Vec<ContentRow>,
     node_children: &mut Vec<ChildRow>,
     injected_hashes: &mut Vec<(String, [u8; 32])>,
+    ctx: &ExtractCtx,
 ) -> [u8; 32] {
     // Gather non-extra children in source order, with tree-sitter field
     // names, and count named children per kind (for the node_id suffix).
@@ -2563,13 +2661,15 @@ fn fold_children(
             // Bead ley-line-open-6e798d: pass the current container so
             // every ExtractedRef::{Def, Ref} the language extractor
             // emits carries the enclosing κ function/method's node_id.
-            refs.extend(extract_refs(
+            refs.extend(extract_refs_resolved(
                 child,
                 content,
                 &id,
                 source_id,
                 language,
                 container_node_id,
+                ctx.queries,
+                ctx.bounds,
             ));
 
             // Injections (bead `ley-line-open-c822a6`): probe this node
@@ -2596,6 +2696,7 @@ fn fold_children(
                         node_contents,
                         node_children,
                         injected_hashes,
+                        ctx,
                     );
                 }
             }
@@ -2672,6 +2773,7 @@ fn fold_children(
                 node_contents,
                 node_children,
                 injected_hashes,
+                ctx,
             );
             ast_entries[entry_idx].node_hash = child_hash;
             child_hashes.push(child_hash);
@@ -2697,6 +2799,7 @@ fn fold_children(
                 node_contents,
                 node_children,
                 injected_hashes,
+                ctx,
             );
             child_hashes.push(child_hash);
         }
@@ -2786,6 +2889,7 @@ fn fold_injected(
     node_contents: &mut Vec<ContentRow>,
     node_children: &mut Vec<ChildRow>,
     injected_hashes: &mut Vec<(String, [u8; 32])>,
+    ctx: &ExtractCtx,
 ) {
     let mut parser = tree_sitter::Parser::new();
     if parser.set_language(&site.language.ts_language()).is_err() {
@@ -2810,6 +2914,7 @@ fn fold_injected(
         node_contents,
         node_children,
         injected_hashes,
+        ctx,
     );
     injected_hashes.push((root_id.to_string(), root_hash));
 }
@@ -2841,6 +2946,7 @@ fn fold_injected_node(
     node_contents: &mut Vec<ContentRow>,
     node_children: &mut Vec<ChildRow>,
     injected_hashes: &mut Vec<(String, [u8; 32])>,
+    ctx: &ExtractCtx,
 ) -> [u8; 32] {
     let mut children: Vec<tree_sitter::Node> = Vec::new();
     let mut fields: Vec<Option<&'static str>> = Vec::new();
@@ -2881,13 +2987,15 @@ fn fold_injected_node(
             };
             let id = format!("{node_id}/{name}");
 
-            refs.extend(extract_refs(
+            refs.extend(extract_refs_resolved(
                 child,
                 content,
                 &id,
                 source_id,
                 language,
                 container_node_id,
+                ctx.queries,
+                ctx.bounds,
             ));
 
             let child_container_owned;
@@ -2910,6 +3018,7 @@ fn fold_injected_node(
                 node_contents,
                 node_children,
                 injected_hashes,
+                ctx,
             );
             injected_hashes.push((id, child_hash));
             child_hashes.push(child_hash);
@@ -2926,6 +3035,7 @@ fn fold_injected_node(
                 node_contents,
                 node_children,
                 injected_hashes,
+                ctx,
             );
             child_hashes.push(child_hash);
         }

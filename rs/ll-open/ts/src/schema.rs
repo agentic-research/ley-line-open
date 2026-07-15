@@ -624,6 +624,84 @@ pub fn create_source_blobs_table(conn: &Connection) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Arena-resident query blobs — override .scm store (bead ley-line-open-e72629)
+// ---------------------------------------------------------------------------
+//
+// An arena may carry OVERRIDE tree-sitter `.scm` query blobs that replace the
+// compiled-in `queries/<lang>/tags.scm` defaults for a language, behind a
+// BLAKE3-hash allowlist (operator-controlled env `LLO_TRUSTED_QUERY_HASHES`).
+// Storage mirrors source_blobs/capnp_blobs: a content-addressed blob table
+// plus an FK-shaped pointer. Everything durable lives inside the one .db, so
+// an arena moves/backs-up as a single file — a sidecar would silently detach.
+//
+// `query_blobs` keys on BLAKE3(blob_bytes); the resolver verifies bytes hash
+// to their key before trusting a row. `_queries` points a (lang, kind) at a
+// blob. `kind` is 'tags' today (the extraction query); the column leaves room
+// for 'injections' without a schema change.
+
+/// DDL for `query_blobs` — content-addressed override-query store. One row per
+/// UNIQUE `.scm` blob keyed on BLAKE3(blob_bytes).
+pub const QUERY_BLOBS_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS query_blobs (
+    blob_hash BLOB PRIMARY KEY,
+    blob_bytes BLOB NOT NULL
+);";
+
+/// DDL for `_queries` — pointer from (lang, kind) to an override blob. The
+/// FK-shaped `blob_hash` references `query_blobs`, same discipline as
+/// `_source.content_hash → source_blobs.blob_hash`.
+pub const QUERIES_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS _queries (
+    lang TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'tags',
+    blob_hash BLOB NOT NULL REFERENCES query_blobs(blob_hash),
+    PRIMARY KEY (lang, kind)
+);";
+
+/// Create the override-query tables (idempotent). Runs alongside the existing
+/// schema; an arena with no override rows behaves exactly as the compiled-in
+/// defaults.
+pub fn create_query_blob_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(QUERY_BLOBS_DDL)?;
+    conn.execute_batch(QUERIES_DDL)?;
+    Ok(())
+}
+
+/// One arena-resident `tags` override: the pointer row joined to its blob
+/// bytes. `blob_hash` is the pointer's stored key; the resolver re-hashes
+/// `blob_bytes` and rejects any row where the two disagree.
+pub struct QueryOverrideRow {
+    pub lang: String,
+    pub blob_hash: Vec<u8>,
+    pub blob_bytes: Vec<u8>,
+}
+
+/// Read every `kind = 'tags'` override from the arena, joining the pointer to
+/// its blob bytes. A legacy arena with no `_queries`/`query_blobs` tables
+/// (the JOIN's prepare fails) yields an empty vec — absence of the tables is
+/// "no overrides", never an error.
+pub fn read_query_overrides(conn: &Connection) -> Result<Vec<QueryOverrideRow>> {
+    let mut stmt = match conn.prepare(
+        "SELECT q.lang, q.blob_hash, b.blob_bytes \
+         FROM _queries q JOIN query_blobs b ON b.blob_hash = q.blob_hash \
+         WHERE q.kind = 'tags' ORDER BY q.lang",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(QueryOverrideRow {
+                lang: r.get(0)?,
+                blob_hash: r.get(1)?,
+                blob_bytes: r.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
 // Analysis-substrate: _cfg + _cfg_edge (decade `dataflow-substrate` T1.b2)
 // bead `ley-line-open-46d46b`
 // ---------------------------------------------------------------------------

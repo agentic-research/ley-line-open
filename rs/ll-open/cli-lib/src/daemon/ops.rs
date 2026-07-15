@@ -1872,12 +1872,56 @@ fn op_validate(req: &ValidateRequest) -> Result<String> {
         })
         .unwrap_or_default();
 
-    Ok(json!({
+    // emit_ast (bead `ley-line-open-851f24` follow-up): when the caller
+    // opts in, run the extractor pipeline over the same buffer and return
+    // `_ast` / `node_defs` / `node_refs` / `_imports` rows in the same
+    // response. Mache's writeback linter folds ONE parse into both syntax
+    // validation and SQL-shaped AST rows, killing the interim go/parser
+    // and unblocking CGO removal on the mache side.
+    let ast_payload = if req.emit_ast.unwrap_or(false) {
+        // Determine the TsLanguage enum variant that matches. The
+        // `language_for_extension` above returns a raw tree-sitter
+        // `Language`, but the extractor pipeline keys on `TsLanguage`.
+        let ts_lang = req
+            .language
+            .as_deref()
+            .and_then(|l| leyline_ts::languages::TsLanguage::from_name(l).ok())
+            .or_else(|| {
+                req.path.as_deref().and_then(|p| {
+                    let ext = std::path::Path::new(p).extension()?.to_str()?;
+                    leyline_ts::languages::TsLanguage::from_name(ext).ok()
+                })
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "emit_ast: no `TsLanguage` variant for the requested language \
+                     (the extractor pipeline supports a subset of the validator's languages; \
+                     rules land per-language)"
+                )
+            })?;
+        // source_id = the caller's `path` (canonical), or a synthetic
+        // sentinel when the caller only sent `language` + `content`.
+        // Mache's linter fold always sends `path`; the sentinel is for
+        // ad-hoc callers.
+        let source_id = req.path.as_deref().unwrap_or("<inline>");
+        Some(crate::cmd_parse::parse_to_ast_json(
+            req.content.as_bytes(),
+            ts_lang,
+            source_id,
+        )?)
+    } else {
+        None
+    };
+
+    let mut response = json!({
         "ok": errors.is_empty(),
         "errors": error_objs,
         "diagnostics": diagnostics,
-    })
-    .to_string())
+    });
+    if let Some(ast_payload) = ast_payload {
+        response["ast"] = ast_payload;
+    }
+    Ok(response.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -4655,6 +4699,127 @@ mod tests {
             json!(false),
             "missing language+path should error; got {v}"
         );
+    }
+
+    // ── validate emit_ast (bead ley-line-open-851f24 follow-up) ────────
+
+    /// `validate` with `emit_ast: false` (or omitted) MUST NOT carry an
+    /// `ast` field. Pins the wire-additive contract — old callers see
+    /// exactly the pre-851f24 shape, no new keys.
+    #[cfg(feature = "validate")]
+    #[tokio::test]
+    async fn validate_op_emit_ast_default_omits_ast_field() {
+        let (_dir, ctx) = setup();
+        let response = handle_base_op_legacy(
+            &ctx,
+            "validate",
+            &json!({
+                "content": "package main\n\nfunc main() { println(\"hi\") }\n",
+                "language": "go",
+            }),
+        )
+        .expect("validate op dispatches");
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["ok"], json!(true));
+        assert!(
+            v.get("ast").is_none(),
+            "no emit_ast ⇒ no `ast` field; got {v}"
+        );
+    }
+
+    /// `validate` with `emit_ast: true` on a valid Go buffer MUST return
+    /// the `ast` payload with `_ast` rows + defs + refs + imports.
+    /// Pins the SQL-shaped row contract mache's writeback linter folds
+    /// against — every row carries a stable `node_id`, hex `node_hash`,
+    /// and the caller-supplied `source_id` (== `path`).
+    #[cfg(feature = "validate")]
+    #[tokio::test]
+    async fn validate_op_emit_ast_returns_ast_payload_on_valid_go() {
+        let (_dir, ctx) = setup();
+        let source = "package main\n\nfunc runServe() {}\n\nfunc main() { runServe() }\n";
+        let path = "cmd/serve.go";
+        let response = handle_base_op_legacy(
+            &ctx,
+            "validate",
+            &json!({
+                "content": source,
+                "language": "go",
+                "path": path,
+                "emit_ast": true,
+            }),
+        )
+        .expect("validate op dispatches");
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["ok"], json!(true), "clean Go ⇒ ok=true; got {v}");
+
+        let ast = v.get("ast").expect("emit_ast=true ⇒ `ast` payload");
+        assert_eq!(
+            ast["source_id"],
+            json!(path),
+            "source_id must equal caller-supplied `path`; got {ast}"
+        );
+        assert_eq!(ast["language"], json!("go"), "language name propagates");
+        let content_hash = ast["content_hash"].as_str().expect("content_hash string");
+        assert_eq!(
+            content_hash.len(),
+            64,
+            "content_hash must be 32-byte hex (64 chars); got {content_hash:?}"
+        );
+
+        let ast_rows = ast["ast"].as_array().expect("ast[] array");
+        assert!(
+            !ast_rows.is_empty(),
+            "Go buffer must produce at least one _ast row; got {ast}"
+        );
+        for row in ast_rows {
+            assert!(row["node_id"].as_str().is_some());
+            assert_eq!(row["source_id"], json!(path));
+            assert!(row["node_kind"].as_str().is_some());
+            assert_eq!(
+                row["node_hash"].as_str().map(str::len),
+                Some(64),
+                "node_hash is 32-byte hex; got {row}"
+            );
+        }
+
+        let defs = ast["defs"].as_array().expect("defs[] array");
+        let def_tokens: Vec<&str> = defs.iter().flat_map(|d| d["token"].as_str()).collect();
+        assert!(
+            def_tokens.contains(&"runServe") && def_tokens.contains(&"main"),
+            "defs must include both fn names; got {def_tokens:?}"
+        );
+
+        let refs = ast["refs"].as_array().expect("refs[] array");
+        let ref_tokens: Vec<&str> = refs.iter().flat_map(|r| r["token"].as_str()).collect();
+        assert!(
+            ref_tokens.contains(&"runServe"),
+            "refs must include the call-site token; got {ref_tokens:?}"
+        );
+    }
+
+    /// `validate` with `emit_ast: true` on invalid Go still returns
+    /// `errors` (the syntax errors). Whether `ast` is present in that
+    /// case is a soft contract — mache's fold triggers on `ok: true`
+    /// only. Pin it here so the shape doesn't silently regress.
+    #[cfg(feature = "validate")]
+    #[tokio::test]
+    async fn validate_op_emit_ast_invalid_go_still_reports_errors() {
+        let (_dir, ctx) = setup();
+        let response = handle_base_op_legacy(
+            &ctx,
+            "validate",
+            &json!({
+                "content": "package main\n\nfunc {{{ bad\n",
+                "language": "go",
+                "path": "bad.go",
+                "emit_ast": true,
+            }),
+        )
+        .expect("validate op dispatches");
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["ok"], json!(false));
+        let errors = v["errors"].as_array().unwrap();
+        assert!(!errors.is_empty(), "broken Go must yield errors");
     }
 
     // ── hdc ops (bead ley-line-open-c32596) ────────────────────────────

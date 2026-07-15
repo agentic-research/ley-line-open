@@ -10,6 +10,40 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.7.8] — 2026-07-14
+
+**Mache CGO-removal unblock (validate `emit_ast` + identifier-as-VALUE refs) + substrate-quality wins (`parking_lot` swap, `smell-projector` rename, HDC + sheaf docs).**
+
+Patch release bundling two mache-blocking feature adds with three substrate-quality wins. Wire-additive on the `validate` op JSON response; extractor-additive on the Go refs pipeline. `wire_format_major = 1` unchanged; `compat_min_schema_version` stays at 0.6.0.
+
+### Added
+
+- **`validate` op `emit_ast: true` extension** — mache's writeback linter folds ONE parse into both syntax validation AND `_ast` / `node_defs` / `node_refs` / `_imports` SQL-shaped rows. Kills the interim `go/parser` and unblocks CGO removal on the mache side. New `ast` field on the response (present only when opted in) carries the same row shape `parse_into_conn` produces (BLAKE3-32 `node_hash` per row, caller-supplied `source_id` from `path`). Old callers see the pre-0.7.8 shape unchanged. New public helper `cli-lib::cmd_parse::parse_to_ast_json(content, language, source_id)`. MCP tool schema updated. 3 new tests. Bead `ley-line-open-851f24` follow-up (mache ask).
+- **Identifier-as-VALUE refs in Go extractor** — `extract_go` in `leyline-ts::refs` now emits `ExtractedRef::Ref` for identifiers in composite-literal field values (`cobra.Command{RunE: runServe}`) and function-call arguments (`register(handler)`). Pre-fix these were captured only as defs, so mache's `dead_code` rule saw 13 factory-pattern functions as unreferenced. New `keyed_element` + `argument_list` arms; 3 new fixture tests. Collapses mache's grandfathered dead_code false-positives in the same baseline regen the pin bump requires. Bead `ley-line-open-77c13f` (mache ask).
+
+### Changed
+
+- **`parking_lot::{Mutex, RwLock}` replaces `std::sync::{Mutex, RwLock}` workspace-wide (PR #210)**. Internal-only — the daemon's binary API doesn't leak the lock type. Deletes 142 sites of `.expect("mutex poisoned")` noise and ~10 sites of `.unwrap_or_else(|p| p.into_inner())` recovery ceremony. `!Send` guard enforcement (the "no `.await` while holding the lock" compile-time check the daemon depends on for `rusqlite::Connection` correctness at `daemon/mod.rs:135`) is preserved — `parking_lot::MutexGuard<T>` is `!Send` when `T: !Send`, same as std. Three poison-recovery test blocks deleted because the contract they pinned is no longer expressible (parking_lot never poisons). Bead `ley-line-open-77c13f`.
+- **`cargo-toml-projector` → `smell-projector` rename (PR #211)**. The old name lied about scope once the `unsafe_sites` + `unwrap_sites` projections landed. Same binary + behavior; matching name. Provenance kept in the crate description + module docs. Bead `ley-line-open-85fb1f`.
+
+### Documentation
+
+- **HDC + sheaf top-of-crate docs surface load-bearing vs proxy split + kill criteria (PR #209)**. `hdc/src/lib.rs` now names the +7.7% weighted-fusion lift as the load-bearing signal and points at ADR-0025's pre-registered falsification thresholds for the compositional query path; `sheaf/src/lib.rs` names Σ‖δ⁰(stalks)‖² as the real H⁰ invariant, the XOR-Merkle + BFS pre-filter as the honest proxy, and the two Claim invariants in `tests/falsifiability_gates.rs` as the kill criteria. Answers "load-bearing or résumé-driven?" from a `cargo doc` read. No API changes.
+
+### Compat matrix
+
+| Field | v0.7.7 | v0.7.8 | Note |
+|-------|--------|--------|------|
+| `binary_version` | 0.7.7 | 0.7.8 | Bump |
+| `schema_version` | 0.7.7 | 0.7.8 | Parity bump (no DB schema change) |
+| `wire_format_major` | 1 | 1 | Unchanged |
+| `compat_min_schema_version` | 0.6.0 | 0.6.0 | Unchanged |
+
+### Not shipped this release
+
+- **Analysis-substrate decade in-flight** — T1.b3-followup (`ley-line-open-a0fadd`), T1.b4, T2, T3, T4, F5 all still open.
+- **`ley-line-open-7826c4`** — nightly-rustc pin (`nightly-2026-07-12`) still in effect; unpin once the upstream `#[serial(<key>)]` ICE rolls out.
+
 ## [0.7.7] — 2026-07-14
 
 **`validate` daemon op enumerates every ERROR/MISSING node with byte ranges — unblocks mache draft-mode UX.**

@@ -218,13 +218,14 @@ pub fn tool_registry() -> Vec<McpTool> {
         #[cfg(feature = "validate")]
         McpTool {
             name: "validate",
-            description: "Tree-sitter syntactic validation of source content — nothing is persisted. Takes `content` (UTF-8 source) plus either `language` (extension key: go|py|js|ts|tsx|rs|ex|exs) or `path` (extension extracted). Returns `{ok, errors: [{row, col, byte_start, byte_end, message}], diagnostics: [{line, col, message}]}` — `errors` lists EVERY ERROR/MISSING node (0-based row/col, byte range into the buffer); `diagnostics` is the legacy first-error-only shape. Read-only; the daemon does not touch the projected db. Mirrors mache's `writeback/validate.go` so consumers can drop the CGO tree-sitter link.",
+            description: "Tree-sitter syntactic validation of source content — nothing is persisted. Takes `content` (UTF-8 source) plus either `language` (extension key: go|py|js|ts|tsx|rs|ex|exs) or `path` (extension extracted). Returns `{ok, errors: [{row, col, byte_start, byte_end, message}], diagnostics: [{line, col, message}]}` — `errors` lists EVERY ERROR/MISSING node (0-based row/col, byte range into the buffer); `diagnostics` is the legacy first-error-only shape. When `emit_ast: true` (bead ley-line-open-851f24 follow-up), the response also carries an `ast` payload with `_ast` / `defs` / `refs` / `imports` rows — same shape `parse_into_conn` produces — so mache's writeback linter can fold ONE parse into both syntax validation AND SQL-shaped AST rows (kills the interim go/parser and unblocks CGO removal). Read-only; the daemon does not touch the projected db. Mirrors mache's `writeback/validate.go`.",
             schema: json!({
                 "type": "object",
                 "properties": {
                     "content":  {"type": "string", "description": "UTF-8 source text to validate."},
                     "language": {"type": "string", "description": "Extension key (go|py|js|ts|tsx|rs|ex|exs). Mutually exclusive with `path`; takes precedence if both supplied."},
-                    "path":     {"type": "string", "description": "Path whose file extension determines the language. Used when the caller has a path but not an explicit language id."}
+                    "path":     {"type": "string", "description": "Path whose file extension determines the language. Also doubles as the `source_id` stamped on every emitted row when `emit_ast` is true."},
+                    "emit_ast": {"type": "boolean", "description": "When true, run the extractor pipeline and return the parsed AST + defs/refs/imports rows in the response's `ast` payload. Defaults to false. Additive: the syntax-validation output is unchanged."}
                 },
                 "required": ["content"]
             }),

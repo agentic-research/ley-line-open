@@ -297,6 +297,80 @@ pub fn extract_go(
                 });
             }
         }
+        // ── Identifier-as-VALUE refs (mache-side ask; cross-repo
+        // follow-up under bead `ley-line-open-77c13f`). ──────────────
+        //
+        // Pre-fix, `extract_go` only recognized identifiers in *call-
+        // target* position (`runServe()` inside a `call_expression`).
+        // Identifiers in VALUE position — struct-literal field values
+        // (`cobra.Command{RunE: runServe}`) and function-call arguments
+        // (`registerHandler(runServe)`) — passed the function around
+        // without touching its call-site. Mache's `dead_code` rule
+        // then saw those functions as unreferenced (13 grandfathered
+        // false-positives in its baseline).
+        //
+        // The two arms below emit `ExtractedRef::Ref` for identifiers
+        // in the two value-positions mache flagged. `qualified_type`
+        // and other non-identifier values are handled by the existing
+        // per-arm recursion the caller does.
+        "keyed_element" => {
+            // Composite literal field: `Key: value`. tree-sitter-go
+            // wraps BOTH sides in a `literal_element` node, so the
+            // tree is `keyed_element → [literal_element(key),
+            // literal_element(value)]`; each `literal_element` has
+            // one named child which is the actual key/value node.
+            //
+            // Emit a Ref only when the value is a bare `identifier`
+            // (selector expressions like `pkg.Fn` and typed literals
+            // are handled through the extractor's recursive walk when
+            // it reaches those subtrees; no need to double-emit).
+            let mut cursor = node.walk();
+            let named: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+            let value_literal = named.get(1);
+            if let Some(value_wrapper) = value_literal
+                && value_wrapper.kind() == "literal_element"
+            {
+                let mut inner_cursor = value_wrapper.walk();
+                if let Some(inner) = value_wrapper.named_children(&mut inner_cursor).next()
+                    && inner.kind() == "identifier"
+                    && let Ok(token) = inner.utf8_text(source)
+                    && !token.is_empty()
+                {
+                    out.push(ExtractedRef::Ref {
+                        token: token.to_string(),
+                        node_id: node_id.to_string(),
+                        source_id: source_id.to_string(),
+                        container_node_id: container_node_id.map(str::to_string),
+                    });
+                }
+            }
+        }
+        "argument_list" => {
+            // Function-call arguments. Each direct-child identifier is
+            // a value-position ref to whatever it names (function,
+            // variable, const). tree-sitter-go's `argument_list` sits
+            // inside `call_expression` — the caller already handled
+            // the function-name; we handle the arguments.
+            //
+            // Selector expressions (`pkg.Handler`) as arguments emit
+            // via the extractor's tree walk finding the inner
+            // `identifier` on the operand side — no direct emit here
+            // to avoid double-counting.
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() == "identifier"
+                    && let Ok(token) = child.utf8_text(source)
+                    && !token.is_empty()
+                {
+                    out.push(ExtractedRef::Ref {
+                        token: token.to_string(),
+                        node_id: node_id.to_string(),
+                        source_id: source_id.to_string(),
+                        container_node_id: container_node_id.map(str::to_string),
+                    });
+                }
+            }
+        }
         _ => {}
     }
 
@@ -1730,6 +1804,96 @@ mod tests {
         let defs = all_defs(&conn);
         assert!(defs.contains(&"Server".to_string()));
         assert!(defs.contains(&"Start".to_string()));
+    }
+
+    // ── Identifier-as-VALUE refs (mache dead_code false-positive fix) ──
+
+    /// Composite literals that pass a function by name in a field-value
+    /// position (`cobra.Command{RunE: runServe}`) MUST surface the
+    /// function as a `node_refs` entry — pre-fix mache's `dead_code`
+    /// rule saw `runServe` as unused because only the call-site
+    /// (`function_declaration` for the def) was captured, not the
+    /// value-reference from the composite literal.
+    #[test]
+    fn extract_keyed_element_identifier_as_ref() {
+        let src = br#"package main
+
+func runServe() {}
+
+type Cmd struct {
+    RunE func()
+}
+
+var _ = &Cmd{RunE: runServe}
+"#;
+        let (conn, tree) = parse_go(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let refs = all_refs(&conn);
+        assert!(
+            refs.contains(&"runServe".to_string()),
+            "keyed_element value must emit `runServe` as a ref; got {refs:?}"
+        );
+    }
+
+    /// Function-call arguments that are bare identifiers MUST surface
+    /// as `node_refs` entries — factory-style APIs pass handlers as
+    /// values, and mache's `dead_code` rule needs the reference.
+    #[test]
+    fn extract_argument_list_identifier_as_ref() {
+        let src = br#"package main
+
+func handler() {}
+func register(f func()) {}
+
+func main() {
+    register(handler)
+}
+"#;
+        let (conn, tree) = parse_go(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let refs = all_refs(&conn);
+        assert!(
+            refs.contains(&"handler".to_string()),
+            "argument_list identifier must emit `handler` as a ref; got {refs:?}"
+        );
+        // Sanity: the call target (`register`) is still captured too.
+        assert!(
+            refs.contains(&"register".to_string()),
+            "call-target `register` must also be a ref; got {refs:?}"
+        );
+    }
+
+    /// Cross-pattern: multiple value-position refs in the same
+    /// composite literal + one in an argument list. Every function
+    /// name mache's `dead_code` rule cares about must appear.
+    #[test]
+    fn extract_mixed_value_position_refs() {
+        let src = br#"package main
+
+func runServe() {}
+func runPing() {}
+func middleware() {}
+
+type Command struct {
+    RunE   func()
+    PostE  func()
+}
+
+func New(m func()) *Command {
+    return &Command{RunE: runServe, PostE: runPing}
+}
+
+var _ = New(middleware)
+"#;
+        let (conn, tree) = parse_go(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let refs = all_refs(&conn);
+        for expected in ["runServe", "runPing", "middleware", "New"] {
+            assert!(
+                refs.contains(&expected.to_string()),
+                "expected ref `{expected}` missing; got {refs:?}"
+            );
+        }
     }
 }
 

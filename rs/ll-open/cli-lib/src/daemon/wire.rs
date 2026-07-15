@@ -332,8 +332,20 @@ pub struct ValidateRequest {
     pub language: Option<String>,
     /// Path the daemon infers the language from via the file extension.
     /// Used when the caller has a path but not an explicit language id.
+    /// When `emit_ast` is true, `path` doubles as the `source_id` stamped
+    /// on every emitted row (so a folded row inserts cleanly into an
+    /// existing `_ast` snapshot without an ID rewrite).
     #[serde(default)]
     pub path: Option<String>,
+    /// When true, run the extractor pipeline in addition to syntax
+    /// validation and return the parsed AST + defs/refs/imports rows in
+    /// the response's `ast` payload. Wire-additive extension (bead
+    /// `ley-line-open-851f24` follow-up): mache's writeback linter
+    /// folds ONE parse into both syntax validation AND the nil-slice
+    /// SQL rule, killing the interim `go/parser` and unblocking CGO
+    /// removal on the mache side.
+    #[serde(default)]
+    pub emit_ast: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------

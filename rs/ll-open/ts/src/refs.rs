@@ -184,10 +184,13 @@ pub fn extract_refs(
 ///
 /// Pure data — no database access, safe for parallel use.
 ///
-/// Node kinds handled:
-/// - `function_declaration`, `method_declaration`, `type_spec` → Def
-/// - `call_expression` → Ref (simple) or Ref (qualified: "pkg.Func")
-/// - `import_spec` → Import
+/// The per-language knowledge lives in `queries/go/tags.scm`; this
+/// function compiles it once and delegates to the generic
+/// [`QueryEngine`](crate::query_engine::QueryEngine) interpreter.
+/// Emission behavior (dual-emit `Receiver.Method`+`Method`,
+/// value-position identifier refs, import alias defaulting) is pinned
+/// by the fixture tests below — edit the `.scm`, keep the tests green.
+#[cfg(feature = "go")]
 pub fn extract_go(
     node: &Node,
     source: &[u8],
@@ -195,255 +198,17 @@ pub fn extract_go(
     source_id: &str,
     container_node_id: Option<&str>,
 ) -> Vec<ExtractedRef> {
-    let mut out = Vec::new();
-
-    match node.kind() {
-        "function_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name")
-                && let Ok(token) = name_node.utf8_text(source)
-                && !token.is_empty()
-            {
-                out.push(ExtractedRef::Def {
-                    token: token.to_string(),
-                    node_id: node_id.to_string(),
-                    source_id: source_id.to_string(),
-                    container_node_id: container_node_id.map(str::to_string),
-                    canonical_kind: crate::languages::TsLanguage::Go.canonical_kind(node.kind()),
-                });
-            }
-        }
-        "method_declaration" => {
-            // Bead `ley-line-open-caf423`: method defs need both the
-            // qualified form (`Receiver.Method`) mache's cross-language
-            // rules join on AND the bare form (`Method`) that keeps
-            // existing call-side resolution against unqualified calls
-            // working. Mirrors the call-side `selector_expression` arm
-            // below which already emits both `pkg.Func` and `Func`.
-            let name = node
-                .child_by_field_name("name")
-                .and_then(|n| n.utf8_text(source).ok())
-                .unwrap_or("");
-            if !name.is_empty() {
-                let receiver = go_receiver_type(node, source);
-                if let Some(recv) = receiver {
-                    out.push(ExtractedRef::Def {
-                        token: format!("{recv}.{name}"),
-                        node_id: node_id.to_string(),
-                        source_id: source_id.to_string(),
-                        container_node_id: container_node_id.map(str::to_string),
-                        canonical_kind: crate::languages::TsLanguage::Go
-                            .canonical_kind(node.kind()),
-                    });
-                }
-                out.push(ExtractedRef::Def {
-                    token: name.to_string(),
-                    node_id: node_id.to_string(),
-                    source_id: source_id.to_string(),
-                    container_node_id: container_node_id.map(str::to_string),
-                    canonical_kind: crate::languages::TsLanguage::Go.canonical_kind(node.kind()),
-                });
-            }
-        }
-        "type_spec" => {
-            if let Some(name_node) = node.child_by_field_name("name")
-                && let Ok(token) = name_node.utf8_text(source)
-                && !token.is_empty()
-            {
-                out.push(ExtractedRef::Def {
-                    token: token.to_string(),
-                    node_id: node_id.to_string(),
-                    source_id: source_id.to_string(),
-                    container_node_id: container_node_id.map(str::to_string),
-                    canonical_kind: crate::languages::TsLanguage::Go.canonical_kind(node.kind()),
-                });
-            }
-        }
-        "call_expression" => {
-            if let Some(func_node) = node.child_by_field_name("function") {
-                match func_node.kind() {
-                    "identifier" => {
-                        if let Ok(token) = func_node.utf8_text(source)
-                            && !token.is_empty()
-                        {
-                            out.push(ExtractedRef::Ref {
-                                token: token.to_string(),
-                                node_id: node_id.to_string(),
-                                source_id: source_id.to_string(),
-                                container_node_id: container_node_id.map(str::to_string),
-                            });
-                        }
-                    }
-                    "selector_expression" => {
-                        let pkg = func_node
-                            .child_by_field_name("operand")
-                            .and_then(|n| n.utf8_text(source).ok())
-                            .unwrap_or("");
-                        let func = func_node
-                            .child_by_field_name("field")
-                            .and_then(|n| n.utf8_text(source).ok())
-                            .unwrap_or("");
-                        if !func.is_empty() {
-                            if !pkg.is_empty() {
-                                out.push(ExtractedRef::Ref {
-                                    token: format!("{pkg}.{func}"),
-                                    node_id: node_id.to_string(),
-                                    source_id: source_id.to_string(),
-                                    container_node_id: container_node_id.map(str::to_string),
-                                });
-                            }
-                            out.push(ExtractedRef::Ref {
-                                token: func.to_string(),
-                                node_id: node_id.to_string(),
-                                source_id: source_id.to_string(),
-                                container_node_id: container_node_id.map(str::to_string),
-                            });
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        "import_spec" => {
-            let path = node
-                .child_by_field_name("path")
-                .and_then(|n| n.utf8_text(source).ok())
-                .unwrap_or("")
-                .trim_matches('"');
-
-            if !path.is_empty() {
-                let alias = node
-                    .child_by_field_name("name")
-                    .and_then(|n| n.utf8_text(source).ok())
-                    .unwrap_or("");
-
-                let alias = if alias.is_empty() || alias == "." {
-                    path.rsplit('/').next().unwrap_or(path)
-                } else {
-                    alias
-                };
-
-                out.push(ExtractedRef::Import {
-                    alias: alias.to_string(),
-                    path: path.to_string(),
-                    source_id: source_id.to_string(),
-                });
-            }
-        }
-        // ── Identifier-as-VALUE refs (mache-side ask; cross-repo
-        // follow-up under bead `ley-line-open-77c13f`). ──────────────
-        //
-        // Pre-fix, `extract_go` only recognized identifiers in *call-
-        // target* position (`runServe()` inside a `call_expression`).
-        // Identifiers in VALUE position — struct-literal field values
-        // (`cobra.Command{RunE: runServe}`) and function-call arguments
-        // (`registerHandler(runServe)`) — passed the function around
-        // without touching its call-site. Mache's `dead_code` rule
-        // then saw those functions as unreferenced (13 grandfathered
-        // false-positives in its baseline).
-        //
-        // The two arms below emit `ExtractedRef::Ref` for identifiers
-        // in the two value-positions mache flagged. `qualified_type`
-        // and other non-identifier values are handled by the existing
-        // per-arm recursion the caller does.
-        "keyed_element" => {
-            // Composite literal field: `Key: value`. tree-sitter-go
-            // wraps BOTH sides in a `literal_element` node, so the
-            // tree is `keyed_element → [literal_element(key),
-            // literal_element(value)]`; each `literal_element` has
-            // one named child which is the actual key/value node.
-            //
-            // Emit a Ref only when the value is a bare `identifier`
-            // (selector expressions like `pkg.Fn` and typed literals
-            // are handled through the extractor's recursive walk when
-            // it reaches those subtrees; no need to double-emit).
-            let mut cursor = node.walk();
-            let named: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
-            let value_literal = named.get(1);
-            if let Some(value_wrapper) = value_literal
-                && value_wrapper.kind() == "literal_element"
-            {
-                let mut inner_cursor = value_wrapper.walk();
-                if let Some(inner) = value_wrapper.named_children(&mut inner_cursor).next()
-                    && inner.kind() == "identifier"
-                    && let Ok(token) = inner.utf8_text(source)
-                    && !token.is_empty()
-                {
-                    out.push(ExtractedRef::Ref {
-                        token: token.to_string(),
-                        node_id: node_id.to_string(),
-                        source_id: source_id.to_string(),
-                        container_node_id: container_node_id.map(str::to_string),
-                    });
-                }
-            }
-        }
-        "argument_list" => {
-            // Function-call arguments. Each direct-child identifier is
-            // a value-position ref to whatever it names (function,
-            // variable, const). tree-sitter-go's `argument_list` sits
-            // inside `call_expression` — the caller already handled
-            // the function-name; we handle the arguments.
-            //
-            // Selector expressions (`pkg.Handler`) as arguments emit
-            // via the extractor's tree walk finding the inner
-            // `identifier` on the operand side — no direct emit here
-            // to avoid double-counting.
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                if child.kind() == "identifier"
-                    && let Ok(token) = child.utf8_text(source)
-                    && !token.is_empty()
-                {
-                    out.push(ExtractedRef::Ref {
-                        token: token.to_string(),
-                        node_id: node_id.to_string(),
-                        source_id: source_id.to_string(),
-                        container_node_id: container_node_id.map(str::to_string),
-                    });
-                }
-            }
-        }
-        _ => {}
-    }
-
-    out
-}
-
-/// Return the receiver *type* name for a Go `method_declaration` node,
-/// stripping a leading `*` (pointer receiver). Returns `None` when the
-/// receiver field is missing/malformed — the caller then only emits the
-/// bare method name (backward-compatible with pre-fix behavior).
-///
-/// tree-sitter-go models the receiver as a `parameter_list` containing
-/// one `parameter_declaration` with a `type` field. The type node is
-/// either a `type_identifier` (value receiver) or a `pointer_type`
-/// whose single named child is the `type_identifier`. Bead
-/// `ley-line-open-caf423`. Not `#[cfg(feature = "go")]`-gated: it only
-/// touches tree-sitter node kinds (strings), not `tree_sitter_go`, and
-/// `extract_go` (its sole caller) is itself always-compiled.
-fn go_receiver_type(method_node: &Node, source: &[u8]) -> Option<String> {
-    let receiver = method_node.child_by_field_name("receiver")?;
-    // Walk into the parameter_list to find the first parameter_declaration.
-    let mut cursor = receiver.walk();
-    for child in receiver.named_children(&mut cursor) {
-        if child.kind() != "parameter_declaration" {
-            continue;
-        }
-        let ty = child.child_by_field_name("type")?;
-        // Unwrap `*T` → `T`.
-        let ty_node = if ty.kind() == "pointer_type" {
-            let mut c2 = ty.walk();
-            ty.named_children(&mut c2).next().unwrap_or(ty)
-        } else {
-            ty
-        };
-        let name = ty_node.utf8_text(source).ok()?;
-        if name.is_empty() {
-            return None;
-        }
-        return Some(name.to_string());
-    }
-    None
+    use std::sync::OnceLock;
+    static ENGINE: OnceLock<crate::query_engine::QueryEngine> = OnceLock::new();
+    ENGINE
+        .get_or_init(|| {
+            crate::query_engine::QueryEngine::new(
+                crate::languages::TsLanguage::Go,
+                include_str!("../queries/go/tags.scm"),
+            )
+            .expect("compiled-in queries/go/tags.scm must compile against tree-sitter-go")
+        })
+        .extract(node, source, node_id, source_id, container_node_id)
 }
 
 // ---------------------------------------------------------------------------

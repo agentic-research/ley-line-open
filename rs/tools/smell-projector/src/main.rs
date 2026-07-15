@@ -1,9 +1,17 @@
-//! cargo-toml-projector — projects `rs/**/Cargo.toml` into a SQLite schema
-//! (`workspace_deps` + `crate_deps`) so mache-shaped smell rules can query
-//! it. Implements the workspace-deps drift gate (bead ley-line-open-3b2f55
-//! Phase 3): fail on any crate that pins a literal version for a dep that
-//! is already declared in `[workspace.dependencies]` (should be
-//! `{ workspace = true }` instead).
+//! smell-projector — projects `rs/` into a SQLite schema so mache-shaped
+//! smell rules can query it. Four tables today:
+//!
+//! - `workspace_deps` — deps declared in `[workspace.dependencies]`.
+//! - `crate_deps` — per-crate deps parsed from `rs/**/Cargo.toml`.
+//!   Drives the `workspace_deps_drift` rule (bead `ley-line-open-3b2f55`
+//!   Phase 3): fail on any crate that pins a literal version for a dep
+//!   already declared in `[workspace.dependencies]`.
+//! - `unsafe_sites` — every `unsafe` occurrence in `rs/*/src/**/*.rs`,
+//!   with a `has_safety` flag. Drives the `unsafe_without_safety` rule
+//!   (bead `ley-line-open-85fb1f`).
+//! - `unwrap_sites` — every bare `.unwrap()` in production code. Drives
+//!   the `unwrap_without_expect` rule (bead `ley-line-open-85fb1f`
+//!   follow-up).
 //!
 //! Deliberately mirrors mache's rule + baseline format so the projector
 //! is drop-in replaceable by mache proper if we ever want to swap the
@@ -11,6 +19,9 @@
 //! `ScopeColumn`, `Query` with `%s` scope placeholder), same
 //! `docs/smell-baseline.json` shape (`version: 1`, `counts: [{rule_id,
 //! source_id, count}]`).
+//!
+//! Renamed from `cargo-toml-projector` once the source-projection tables
+//! landed — the old name lied about scope.
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
@@ -30,7 +41,7 @@ use walkdir::WalkDir;
 #[command(
     author,
     version,
-    about = "Project rs/**/Cargo.toml into SQLite + run mache-shaped smell rules"
+    about = "Project rs/ (Cargo.toml + *.rs) into SQLite + run mache-shaped smell rules"
 )]
 struct Cli {
     /// Repo root (where `rs/Cargo.toml`, `smell-rules/`, `docs/smell-baseline.json` live).

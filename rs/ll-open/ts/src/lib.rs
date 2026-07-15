@@ -11,6 +11,7 @@ pub mod languages;
 pub mod project;
 #[cfg(feature = "pyproject")]
 pub mod pyproject;
+pub mod query_engine;
 pub mod refs;
 pub mod schema;
 pub mod splice;

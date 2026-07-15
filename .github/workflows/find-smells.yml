@@ -1,15 +1,15 @@
 name: find_smells
 
-# Workspace-deps drift GATE for LLO PRs. Bead ley-line-open-3b2f55
-# Phase 3. Invokes the `task smells` Taskfile target (taskfile-CI-parity:
-# CI calls the target, it does NOT re-implement the command inline) —
-# the same gate `task ci` runs locally.
+# Smell-rule GATE for LLO PRs — workspace deps drift + unsafe/unwrap
+# invariants. Beads `ley-line-open-3b2f55` (drift), `ley-line-open-85fb1f`
+# (unsafe/unwrap). Invokes the `task smells` Taskfile target
+# (taskfile-CI-parity: CI calls the target, it does NOT re-implement the
+# command inline) — the same gate `task ci` runs locally.
 #
-# `cargo-toml-projector` walks rs/**/Cargo.toml, projects into a SQLite
-# schema (workspace_deps + crate_deps), runs rules in `smell-rules/*.json`,
-# and diffs findings against `docs/smell-baseline.json`. Any dep that
-# has a `[workspace.dependencies]` entry and is still pinned literally
-# in a per-crate manifest is a NEW finding and fails the PR.
+# `smell-projector` walks `rs/`, projects Cargo.toml → workspace_deps +
+# crate_deps and *.rs → unsafe_sites + unwrap_sites, runs rules in
+# `smell-rules/*.json`, and diffs findings against
+# `docs/smell-baseline.json`.
 #
 # To grandfather a deliberate change: run `task smells:baseline` and
 # commit `docs/smell-baseline.json` in the same PR. Same discipline
@@ -22,18 +22,20 @@ on:
       # Anything that can change the finding set vs the baseline.
       - 'rs/Cargo.toml'
       - 'rs/**/Cargo.toml'
+      - 'rs/**/*.rs'
       - 'smell-rules/**'
       - 'docs/smell-baseline.json'
-      - 'rs/tools/cargo-toml-projector/**'
+      - 'rs/tools/smell-projector/**'
       - '.github/workflows/find-smells.yml'
   push:
     branches: [main]
     paths:
       - 'rs/Cargo.toml'
       - 'rs/**/Cargo.toml'
+      - 'rs/**/*.rs'
       - 'smell-rules/**'
       - 'docs/smell-baseline.json'
-      - 'rs/tools/cargo-toml-projector/**'
+      - 'rs/tools/smell-projector/**'
       - '.github/workflows/find-smells.yml'
 
 permissions:

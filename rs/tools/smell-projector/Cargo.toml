@@ -1,0 +1,19 @@
+[package]
+name = "smell-projector"
+version = "0.7.7"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Project rs/ into SQLite (workspace_deps + crate_deps from Cargo.toml; unsafe_sites + unwrap_sites from *.rs) and run mache-shaped smell rules against the projection. Renamed from cargo-toml-projector once source-projection tables landed. Bead ley-line-open-3b2f55 (workspace deps drift), ley-line-open-85fb1f (unsafe/unwrap gates)."
+
+[[bin]]
+name = "smell-projector"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+rusqlite = { workspace = true, features = ["bundled"] }
+clap = { workspace = true, features = ["derive"] }
+toml_edit = "0.25"
+walkdir = "2"

@@ -253,10 +253,10 @@ tasks:
       - tools/lint_blake3.sh
 
   # --------------------------------------------------------------------------
-  # Workspace-deps drift gate (Phase 3 of bead ley-line-open-3b2f55).
-  # Mache-shaped: `cargo-toml-projector` walks rs/**/Cargo.toml, projects
-  # `[workspace.dependencies]` + per-crate deps into a SQLite schema
-  # (workspace_deps + crate_deps), runs the rules in `smell-rules/*.json`,
+  # Smell-rule gate (workspace deps drift + unsafe/unwrap invariants).
+  # Mache-shaped: `smell-projector` walks `rs/`, projects Cargo.toml
+  # into `workspace_deps` + `crate_deps` and `*.rs` sources into
+  # `unsafe_sites` + `unwrap_sites`, runs the rules in `smell-rules/*.json`,
   # and diffs findings against `docs/smell-baseline.json`.
   #
   # Rule + baseline shape mirror mache's `find-smells` exactly (ID,
@@ -264,25 +264,28 @@ tasks:
   # version + counts array) so the engine is swappable for mache proper
   # if we ever want to unify. Same discipline `task compat:check` uses
   # for compatibility.json.
+  #
+  # Renamed from `cargo-toml-projector` once the source-projection tables
+  # landed (bead `ley-line-open-85fb1f`); old name lied about scope.
   # --------------------------------------------------------------------------
   smells:
-    desc: "Workspace-deps drift gate — fail on NEW findings vs docs/smell-baseline.json (bead ley-line-open-3b2f55 Phase 3)"
+    desc: "Smell-rule gate — fail on NEW findings vs docs/smell-baseline.json (beads ley-line-open-3b2f55, 85fb1f)"
     dir: rs
     cmds:
-      - cargo run -p cargo-toml-projector --quiet -- --repo-root ..
+      - cargo run -p smell-projector --quiet -- --repo-root ..
 
   smells:baseline:
     desc: "Regenerate docs/smell-baseline.json — grandfather current drift (run after a deliberate change and commit the baseline)"
     dir: rs
     cmds:
-      - cargo run -p cargo-toml-projector --quiet -- --repo-root .. --write-baseline
+      - cargo run -p smell-projector --quiet -- --repo-root .. --write-baseline
       - echo "regenerated docs/smell-baseline.json"
 
   smells:dogfood:
-    desc: "Dogfood — print all workspace_deps_drift findings without a gate"
+    desc: "Dogfood — print all smell findings without a gate"
     dir: rs
     cmds:
-      - cargo run -p cargo-toml-projector --quiet -- --repo-root .. --dogfood
+      - cargo run -p smell-projector --quiet -- --repo-root .. --dogfood
 
   # --------------------------------------------------------------------------
   # FFI / staticlib

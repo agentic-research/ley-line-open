@@ -58,9 +58,10 @@
 //! cycles. A future pass that wants long-horizon co-change weighting
 //! should persist tracker state into a dedicated table.
 
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -197,16 +198,13 @@ impl RealTracker {
     }
 
     pub fn into_inner(self) -> CoChangeTracker {
-        self.tracker.into_inner().expect("tracker mutex poisoned")
+        self.tracker.into_inner()
     }
 }
 
 impl TrackerSink for RealTracker {
     fn observe(&mut self, changed: &[RegionId], all_edges: &[(RegionId, RegionId)]) {
-        self.tracker
-            .lock()
-            .expect("tracker mutex poisoned")
-            .observe(changed, all_edges);
+        self.tracker.lock().observe(changed, all_edges);
     }
 
     fn take_tracker(&mut self) -> Option<CoChangeTracker> {
@@ -214,7 +212,7 @@ impl TrackerSink for RealTracker {
         // sink stays in a usable state after extraction. Callers only
         // invoke `take_tracker` once at end-of-run, so leaving a
         // defaulted tracker behind is fine.
-        let inner = self.tracker.get_mut().expect("tracker mutex poisoned");
+        let inner = self.tracker.get_mut();
         Some(std::mem::take(inner))
     }
 }

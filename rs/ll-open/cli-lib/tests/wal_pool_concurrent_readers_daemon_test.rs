@@ -28,8 +28,9 @@
 //! now holds — without spinning up the full daemon so we can drive the
 //! concurrency shape directly.
 
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -109,7 +110,7 @@ fn measure_mutex_shape(
     let writer_live = live.clone();
     let writer_handle = thread::spawn(move || {
         while !writer_stop.load(Ordering::Relaxed) {
-            let guard = writer_live.lock().unwrap();
+            let guard = writer_live.lock();
             let _ = guard.execute(
                 "INSERT INTO nodes (kind, payload) VALUES ('bg', ?1)",
                 [&vec![0xEFu8; 256]],
@@ -132,7 +133,7 @@ fn measure_mutex_shape(
                     .wrapping_add(1442695040888963407);
                 let id = ((lcg >> 33) as i64 % 10_000).abs() + 1;
                 let t0 = Instant::now();
-                let conn = live.lock().unwrap();
+                let conn = live.lock();
                 let _: String = conn
                     .query_row("SELECT kind FROM nodes WHERE id = ?1", [id], |r| r.get(0))
                     .unwrap();
@@ -167,7 +168,7 @@ fn measure_pool_shape(
     let writer_db = live_db.clone();
     let writer_handle = thread::spawn(move || {
         while !writer_stop.load(Ordering::Relaxed) {
-            let guard = writer_db.writer.lock().unwrap();
+            let guard = writer_db.writer.lock();
             let _ = guard.execute(
                 "INSERT INTO nodes (kind, payload) VALUES ('bg', ?1)",
                 [&vec![0xEFu8; 256]],
@@ -460,7 +461,7 @@ fn concurrent_writers_serialize_never_corrupt_state() {
 
     // Seed a counter row via the writer.
     {
-        let guard = live_db.writer.lock().unwrap();
+        let guard = live_db.writer.lock();
         guard
             .execute_batch(
                 "CREATE TABLE counter (id INTEGER PRIMARY KEY, value INTEGER);
@@ -476,7 +477,7 @@ fn concurrent_writers_serialize_never_corrupt_state() {
         let db = live_db.clone();
         handles.push(thread::spawn(move || {
             for _ in 0..n_incs {
-                let guard = db.writer.lock().unwrap();
+                let guard = db.writer.lock();
                 guard
                     .execute("UPDATE counter SET value = value + 1 WHERE id = 1", [])
                     .expect("writer UPDATE must succeed under serialization");
@@ -490,7 +491,6 @@ fn concurrent_writers_serialize_never_corrupt_state() {
     let final_value: i64 = live_db
         .writer
         .lock()
-        .unwrap()
         .query_row("SELECT value FROM counter WHERE id = 1", [], |r| r.get(0))
         .unwrap();
     assert_eq!(

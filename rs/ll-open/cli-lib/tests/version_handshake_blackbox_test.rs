@@ -31,7 +31,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 fn build_blackbox_ctx(dir: &Path) -> Arc<DaemonContext> {
-    use std::sync::{Mutex, RwLock};
+    use parking_lot::{Mutex, RwLock};
 
     let arena_path = dir.join("blackbox.arena");
     let ctrl_path = dir.join("blackbox.ctrl");

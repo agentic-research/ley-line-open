@@ -259,13 +259,13 @@ struct ResolveCacheInner {
 }
 
 struct ResolveCache {
-    inner: std::sync::Mutex<ResolveCacheInner>,
+    inner: parking_lot::Mutex<ResolveCacheInner>,
 }
 
 impl ResolveCache {
     fn new() -> Self {
         Self {
-            inner: std::sync::Mutex::new(ResolveCacheInner {
+            inner: parking_lot::Mutex::new(ResolveCacheInner {
                 cells: std::collections::HashMap::new(),
                 order: std::collections::VecDeque::new(),
             }),
@@ -306,7 +306,7 @@ impl ResolveCache {
 
         // Phase 1: under the map lock, decide the role.
         let role = {
-            let mut inner = self.inner.lock().expect("resolve cache mutex poisoned");
+            let mut inner = self.inner.lock();
             // Inspect existing entry.
             let existing_role = inner.cells.get(spec).map(|inflight| {
                 let snap = inflight.rx.borrow();
@@ -369,7 +369,7 @@ impl ResolveCache {
                 // (kept in the map for TTL>0) keeps the send Ok-shaped.
                 let _ = tx.send(Some(value));
                 if ttl.is_zero() {
-                    let mut inner = self.inner.lock().expect("resolve cache mutex poisoned");
+                    let mut inner = self.inner.lock();
                     inner.cells.remove(spec);
                     inner.order.retain(|s| s != spec);
                 }
@@ -382,7 +382,7 @@ impl ResolveCache {
     /// asserting bounded growth.
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.inner.lock().expect("mutex poisoned").cells.len()
+        self.inner.lock().cells.len()
     }
 }
 

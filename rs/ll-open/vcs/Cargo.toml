@@ -5,6 +5,7 @@ edition = "2024"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
+parking_lot = { workspace = true }
 leyline-core = { path = "../../ll-core/core" }
 leyline-fs = { path = "../fs", default-features = false }
 jj-lib = { version = "0.42", default-features = false }

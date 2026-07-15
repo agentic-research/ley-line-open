@@ -683,7 +683,8 @@ fn concurrent_updates_serialize_correctly() {
     // time, matching the daemon handler's lock-then-apply pattern). Both
     // threads add disjoint regions. Final state: every region from both
     // threads is present, no panics, defect well-defined.
-    use std::sync::{Arc, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
     use std::thread;
 
     let cx = Arc::new(Mutex::new(CellComplex::new(2)));
@@ -721,7 +722,7 @@ fn concurrent_updates_serialize_correctly() {
                     },
                     edges,
                 };
-                let mut g = cx.lock().unwrap();
+                let mut g = cx.lock();
                 g.apply_delta(&delta);
             }
         });
@@ -731,7 +732,7 @@ fn concurrent_updates_serialize_correctly() {
         h.join().expect("thread join");
     }
 
-    let cx = cx.lock().unwrap();
+    let cx = cx.lock();
     assert_eq!(cx.nodes.len(), 100, "all 100 regions must be present");
     // Defect must be a finite, non-negative number — no NaN poisoning
     // from a half-applied delta.

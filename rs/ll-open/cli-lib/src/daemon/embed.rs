@@ -8,10 +8,11 @@
 //! `sqlite3_serialize`/`deserialize`). It reads `nodes`/`_source` for file
 //! contents.
 
+use parking_lot::Mutex;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -354,16 +355,7 @@ pub fn start_drain(ctx: Arc<DaemonContext>) {
         loop {
             tick.tick().await;
             let batch: Vec<EmbedTask> = {
-                let mut q = match ctx.embed_queue.lock() {
-                    Ok(g) => g,
-                    Err(poisoned) => {
-                        // Some task panicked while holding the queue. Recover
-                        // the inner state and keep draining — losing a tick is
-                        // better than wedging the embedding loop forever.
-                        log::error!("embed_queue mutex poisoned, recovering");
-                        poisoned.into_inner()
-                    }
-                };
+                let mut q = ctx.embed_queue.lock();
                 let mut out = Vec::with_capacity(EMBED_DRAIN_BATCH);
                 for _ in 0..EMBED_DRAIN_BATCH {
                     match q.pop() {
@@ -511,7 +503,7 @@ mod tests {
 
         // BinaryHeap is max-heap on priority; later promotions get higher
         // priority numbers, so they pop out first.
-        let mut q = queue.lock().unwrap();
+        let mut q = queue.lock();
         assert_eq!(q.pop().map(|t| t.node_id), Some("third".to_string()));
         assert_eq!(q.pop().map(|t| t.node_id), Some("second".to_string()));
         assert_eq!(q.pop().map(|t| t.node_id), Some("first".to_string()));
@@ -535,7 +527,7 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
-        let q = queue.lock().unwrap();
+        let q = queue.lock();
         let priorities: std::collections::HashSet<u64> = q.iter().map(|t| t.priority).collect();
         assert_eq!(
             priorities.len(),
@@ -557,7 +549,7 @@ mod tests {
         for i in 0..100_000 {
             promote(&queue, &format!("n{i}"));
         }
-        let q = queue.lock().unwrap();
+        let q = queue.lock();
         assert_eq!(
             q.len(),
             100_000,

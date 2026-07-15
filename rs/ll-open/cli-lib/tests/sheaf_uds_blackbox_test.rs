@@ -32,7 +32,7 @@ use tempfile::TempDir;
 /// the controller + sheaf state. Anything else would invite false
 /// positives from neighboring subsystems.
 fn build_blackbox_ctx(dir: &Path) -> Arc<DaemonContext> {
-    use std::sync::{Mutex, RwLock};
+    use parking_lot::{Mutex, RwLock};
 
     let arena_path = dir.join("blackbox.arena");
     let ctrl_path = dir.join("blackbox.ctrl");

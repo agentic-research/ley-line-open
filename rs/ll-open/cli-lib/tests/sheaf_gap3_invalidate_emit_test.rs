@@ -152,7 +152,7 @@ fn build_ctx_with_labels(
     seed_regions: &[u32],
     seed_labels: Option<std::collections::HashMap<u32, String>>,
 ) -> (Arc<DaemonContext>, Arc<EventRouter>) {
-    use std::sync::{Mutex, RwLock};
+    use parking_lot::{Mutex, RwLock};
 
     let ctrl_path = fresh_arena(dir);
     let router = EventRouter::new(64);

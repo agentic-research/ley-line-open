@@ -35,6 +35,20 @@ tokio = "1.47"
 libc = "0.2.175"
 memmap2 = "0.9.9"
 
+# Sync primitives — `parking_lot::{Mutex, RwLock}` replace `std::sync`
+# equivalents on the daemon's hot paths. Semantics are the compatible
+# subset LLO uses (no `into_inner()` recovery, no poisoning) with a
+# smaller/faster fast-path and — crucially for our discipline —
+# lock/read/write return the guard directly, no `.expect("poisoned")`
+# noise at every call site.
+#
+# `!Send` guard enforcement is preserved: `parking_lot::MutexGuard<T>`
+# is `!Send` when `T: !Send` (same as std). The `Connection` /
+# `enrich_inflight` invariants documented at daemon/mod.rs:135 still
+# hold — the "no `.await` while holding the lock" check remains a
+# compile error via the guard's `!Send`-when-`T:!Send` property.
+parking_lot = "0.12"
+
 # Utilities
 log = "0.4.28"
 tempfile = "3.20.0"

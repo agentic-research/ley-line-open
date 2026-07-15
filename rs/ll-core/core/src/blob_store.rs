@@ -49,11 +49,11 @@
 //! impls live in their own module. Mirrors how `control.rs` and
 //! `layout.rs` are siblings.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
@@ -402,10 +402,7 @@ impl MemBlobStore {
     /// Current number of stored entries. Useful for tests verifying
     /// idempotency (insert same content twice ⇒ count stays 1).
     pub fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("MemBlobStore mutex poisoned")
-            .len()
+        self.inner.lock().len()
     }
 
     /// True iff no blobs are stored. Mirrors `Vec::is_empty` for parity.
@@ -417,10 +414,7 @@ impl MemBlobStore {
 impl BlobStore for MemBlobStore {
     fn put(&mut self, bytes: &[u8]) -> Result<Hash> {
         let hash = bytes.hash();
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|_| anyhow::anyhow!("MemBlobStore mutex poisoned"))?;
+        let mut guard = self.inner.lock();
         // (IM) axiom: same hash ⇒ already present ⇒ no-op. We do not
         // re-insert; the existing bytes are authoritative.
         guard.entry(hash).or_insert_with(|| bytes.to_vec());
@@ -428,10 +422,7 @@ impl BlobStore for MemBlobStore {
     }
 
     fn get(&self, h: Hash) -> Result<Option<Vec<u8>>> {
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|_| anyhow::anyhow!("MemBlobStore mutex poisoned"))?;
+        let guard = self.inner.lock();
         match guard.get(&h) {
             None => Ok(None),
             Some(bytes) => {
@@ -454,10 +445,7 @@ impl BlobStore for MemBlobStore {
     }
 
     fn contains(&self, h: Hash) -> Result<bool> {
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|_| anyhow::anyhow!("MemBlobStore mutex poisoned"))?;
+        let guard = self.inner.lock();
         Ok(guard.contains_key(&h))
     }
 }
@@ -608,7 +596,7 @@ mod tests {
         let bytes = b"original";
         let h = s.put(bytes).expect("put");
         {
-            let mut guard = s.inner.lock().unwrap();
+            let mut guard = s.inner.lock();
             guard.insert(h, b"tampered".to_vec());
         }
 

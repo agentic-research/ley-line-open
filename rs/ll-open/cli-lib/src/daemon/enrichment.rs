@@ -4,8 +4,9 @@
 //! Passes declare dependencies and run in topological order.
 //! The pipeline tracks version vectors in `_meta` for staleness detection.
 
+use parking_lot::RwLock;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -214,16 +215,7 @@ fn record_pass_outcome(
 ) {
     let Some(state) = state else { return };
     let basis = get_meta_u64(conn, "tree-sitter_version");
-    let mut s = match state.write() {
-        Ok(g) => g,
-        Err(poisoned) => {
-            // A previous writer panicked. Recover the inner state so
-            // status reporting keeps working — losing one update is
-            // better than wedging the daemon's state machine.
-            log::error!("daemon state RwLock poisoned in record_pass_outcome, recovering");
-            poisoned.into_inner()
-        }
-    };
+    let mut s = state.write();
     let entry = s
         .enrichment
         .entry(name.to_string())
@@ -532,7 +524,8 @@ mod tests {
 
     #[test]
     fn execute_pass_records_outcome_in_state() {
-        use std::sync::{Arc, RwLock};
+        use parking_lot::RwLock;
+        use std::sync::Arc;
         let conn = meta_conn();
         // Pre-populate tree-sitter_version so basis tracking can capture it.
         set_meta(&conn, "tree-sitter_version", "5").unwrap();
@@ -547,7 +540,7 @@ mod tests {
         execute_pass(&pass, &conn, Path::new("/"), None, Some(&state)).unwrap();
 
         // record_pass_outcome should have written a PassStatus entry.
-        let s = state.read().unwrap();
+        let s = state.read();
         let status = s.enrichment.get("beta").expect("beta status recorded");
         assert!(status.last_run_at_ms.is_some());
         assert_eq!(
@@ -566,7 +559,8 @@ mod tests {
         // record_pass_outcome surfaces here. The error message must be
         // stored verbatim — operators see it via op_status's
         // enrichment[name].error field.
-        use std::sync::{Arc, RwLock};
+        use parking_lot::RwLock;
+        use std::sync::Arc;
         let conn = meta_conn();
         // Pre-populate tree-sitter_version. On failure the basis MUST
         // NOT be updated (staleness detection relies on basis lagging
@@ -578,7 +572,7 @@ mod tests {
         let result = execute_pass(&pass, &conn, Path::new("/"), None, Some(&state));
         assert!(result.is_err(), "failing pass must propagate Err");
 
-        let s = state.read().unwrap();
+        let s = state.read();
         let status = s
             .enrichment
             .get("failing")
@@ -613,14 +607,15 @@ mod tests {
         // pin a refactor that wrote `entry.error = entry.error.take()`
         // — keeping last error around — would silently regress the
         // health signal).
-        use std::sync::{Arc, RwLock};
+        use parking_lot::RwLock;
+        use std::sync::Arc;
         let conn = meta_conn();
         let state = Arc::new(RwLock::new(DaemonState::initializing()));
 
         // 1. Fail once — error gets recorded.
         let _ = execute_pass(&FailingPass, &conn, Path::new("/"), None, Some(&state));
         {
-            let s = state.read().unwrap();
+            let s = state.read();
             let status = s
                 .enrichment
                 .get("failing")
@@ -639,7 +634,7 @@ mod tests {
         };
         execute_pass(&recovered, &conn, Path::new("/"), None, Some(&state)).unwrap();
 
-        let s = state.read().unwrap();
+        let s = state.read();
         let status = s
             .enrichment
             .get("failing")

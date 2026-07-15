@@ -3,8 +3,9 @@ use async_trait::async_trait;
 use nfsserve::nfs::*;
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const ROOT_FILEID: fileid3 = 1;
@@ -31,25 +32,21 @@ impl LeylineNfs {
     }
 
     fn ensure_ino(&self, id: &str) -> u64 {
-        let mut id_map = self.id_to_ino.lock().expect("mutex poisoned");
+        let mut id_map = self.id_to_ino.lock();
         if let Some(&ino) = id_map.get(id) {
             return ino;
         }
-        let mut next = self.next_ino.lock().expect("mutex poisoned");
+        let mut next = self.next_ino.lock();
         let ino = *next;
         *next += 1;
         id_map.insert(id.to_string(), ino);
-        self.ino_to_id
-            .lock()
-            .expect("mutex poisoned")
-            .insert(ino, id.to_string());
+        self.ino_to_id.lock().insert(ino, id.to_string());
         ino
     }
 
     fn resolve_id(&self, ino: fileid3) -> Result<String, nfsstat3> {
         self.ino_to_id
             .lock()
-            .expect("mutex poisoned")
             .get(&ino)
             .cloned()
             .ok_or(nfsstat3::NFS3ERR_STALE)
@@ -306,9 +303,9 @@ impl NFSFileSystem for LeylineNfs {
             .map_err(|_| nfsstat3::NFS3ERR_ROFS)?;
 
         // Clean up inode maps
-        let mut id_map = self.id_to_ino.lock().expect("mutex poisoned");
+        let mut id_map = self.id_to_ino.lock();
         if let Some(ino) = id_map.remove(&node.id) {
-            self.ino_to_id.lock().expect("mutex poisoned").remove(&ino);
+            self.ino_to_id.lock().remove(&ino);
         }
         Ok(())
     }
@@ -342,13 +339,10 @@ impl NFSFileSystem for LeylineNfs {
         } else {
             format!("{to_parent}/{to_name}")
         };
-        let mut id_map = self.id_to_ino.lock().expect("mutex poisoned");
+        let mut id_map = self.id_to_ino.lock();
         if let Some(ino) = id_map.remove(&old_id) {
             id_map.insert(new_id.clone(), ino);
-            self.ino_to_id
-                .lock()
-                .expect("mutex poisoned")
-                .insert(ino, new_id);
+            self.ino_to_id.lock().insert(ino, new_id);
         }
         Ok(())
     }

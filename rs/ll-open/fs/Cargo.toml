@@ -23,6 +23,7 @@ nfs = ["dep:nfsserve"]
 splice = ["dep:leyline-ts"]
 
 [dependencies]
+parking_lot = { workspace = true }
 leyline-core = { path = "../../ll-core/core" }
 # Shared C-boundary helpers (bead `ley-line-open-85fb1f` PR 2).
 leyline-ffi-helpers = { path = "../../ll-core/ffi-helpers" }

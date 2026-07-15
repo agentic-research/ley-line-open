@@ -40,10 +40,10 @@
 //! (sheaf == naive) and provides no signal about the fine-grained diff's
 //! precision.
 
+use parking_lot::Mutex;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 /// Env var that toggles ablation logging. Empty / unset → no-op.
 pub const ABLATION_LOG_ENV: &str = "LEYLINE_SHEAF_ABLATION_LOG";
@@ -103,7 +103,7 @@ pub fn log_event(
         }
     };
 
-    let mut slot = LOG_HANDLE.lock().unwrap_or_else(|p| p.into_inner());
+    let mut slot = LOG_HANDLE.lock();
     // Reopen the file if the path changed (env var edited between
     // emits) — supports the harness pattern that sets a fresh log path
     // per workload run without a daemon restart.
@@ -136,7 +136,7 @@ pub fn log_event(
 /// inode.
 #[doc(hidden)]
 pub fn reset_handle_for_tests() {
-    let mut slot = LOG_HANDLE.lock().unwrap_or_else(|p| p.into_inner());
+    let mut slot = LOG_HANDLE.lock();
     *slot = None;
 }
 

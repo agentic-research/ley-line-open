@@ -30,12 +30,13 @@ pub mod version;
 pub mod wire;
 
 #[cfg(feature = "vec")]
+use parking_lot::Mutex;
+use parking_lot::RwLock;
+#[cfg(feature = "vec")]
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::path::PathBuf;
-#[cfg(feature = "vec")]
-use std::sync::Mutex;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use anyhow::Result;
 
@@ -132,7 +133,7 @@ pub struct DaemonContext {
     /// out a reader connection from the pool) or `with_write` (locks
     /// the exclusive writer). See `daemon::db_pool::LiveDb`.
     ///
-    /// **Why `std::sync::Mutex`, not `tokio::sync::Mutex`** (5fea4e):
+    /// **Why `parking_lot::Mutex`, not `tokio::sync::Mutex`** (5fea4e):
     /// `rusqlite::Connection` is `!Send` (it holds a raw `*mut sqlite3`
     /// that's bound to the thread that opened it). `MutexGuard<Connection>`
     /// is therefore also `!Send`. Holding the guard across an `.await`
@@ -165,7 +166,7 @@ pub struct DaemonContext {
     /// A waiting variant (Notify-based) is more invasive and tracked as
     /// a follow-up; this fix prevents the duplicate-work pathology
     /// without introducing async coordination on the sync path.
-    pub enrich_inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    pub enrich_inflight: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     /// Source directory being tracked (if --source was given).
     pub source_dir: Option<PathBuf>,
     /// Language filter for parsing.
@@ -258,7 +259,7 @@ impl DaemonContext {
     where
         F: FnOnce(&rusqlite::Connection) -> Result<T>,
     {
-        let guard = self.live_db.writer.lock().expect("mutex poisoned");
+        let guard = self.live_db.writer.lock();
         f(&guard)
     }
 }

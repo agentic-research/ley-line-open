@@ -191,7 +191,7 @@ fn compute_recommendation(sheaf: &SheafState, touched_cells: &[u32]) -> Granular
     // needless — the numbers we care about are already local by the
     // time we release.
     let max_delta0 = {
-        let cache = sheaf.cache().lock().expect("cache mutex poisoned");
+        let cache = sheaf.cache().lock();
         let Some(complex) = cache.complex() else {
             // No complex attached → heuristic-only mode → no per-edge
             // δ⁰ to consult. Safe-default PerNode.

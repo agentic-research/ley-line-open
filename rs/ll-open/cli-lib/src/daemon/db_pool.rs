@@ -18,7 +18,7 @@
 //!   `PRAGMA query_only=ON` and `PRAGMA busy_timeout=5000` applied to
 //!   every checkout via `with_init`. Writes on a reader connection
 //!   fail-loud with `SQLITE_READONLY`.
-//! - **Writer**: single `std::sync::Mutex<rusqlite::Connection>`
+//! - **Writer**: single `parking_lot::Mutex<rusqlite::Connection>`
 //!   mirroring SQLite WAL's own writer-serialization at the Rust
 //!   level. This is not a limitation — it *matches* SQLite's
 //!   guarantee.
@@ -27,8 +27,8 @@
 //! showed N=10 as the sweet spot; higher hits diminishing returns as
 //! per-connection overhead outweighs concurrency gain.
 
+use parking_lot::Mutex;
 use std::path::Path;
-use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use r2d2_sqlite::SqliteConnectionManager;

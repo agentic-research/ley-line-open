@@ -62,7 +62,7 @@ fn complex_build_pass_installs_complex_into_sheaf_state() {
 
     // Pre-condition: cache carries no complex before the pass runs.
     {
-        let cache = sheaf.cache().lock().unwrap();
+        let cache = sheaf.cache().lock();
         assert!(
             cache.complex().is_none(),
             "pre-condition: SheafState cache must start with no complex",
@@ -96,7 +96,7 @@ fn complex_build_pass_installs_complex_into_sheaf_state() {
     // the fix, the cache's `complex()` accessor stayed `None` after
     // `run` because the pass dropped the built complex on return.
     {
-        let cache = sheaf.cache().lock().unwrap();
+        let cache = sheaf.cache().lock();
         let cx = cache
             .complex()
             .expect("ComplexBuildPass must install a CellComplex into SheafState");
@@ -172,7 +172,7 @@ fn complex_build_pass_default_ctor_does_not_touch_sheaf_state() {
     pass.run(&conn, std::path::Path::new("/"), None)
         .expect("ComplexBuildPass::run must succeed with no sheaf state");
 
-    let cache = sheaf.cache().lock().unwrap();
+    let cache = sheaf.cache().lock();
     assert!(
         cache.complex().is_none(),
         "Default-constructed ComplexBuildPass must NOT touch the \

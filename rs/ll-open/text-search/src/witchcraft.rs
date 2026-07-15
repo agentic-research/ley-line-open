@@ -21,8 +21,8 @@
 //! `Device::Cpu` on most targets), and stores only the `Embedder`, which
 //! is the bind point for the lifecycle.
 
+use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use uuid::Uuid;
 use witchcraft::{DB, Embedder, EmbeddingsCache};

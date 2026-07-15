@@ -153,7 +153,7 @@ fn build_ctx(
     dir: &Path,
     source_dir: PathBuf,
 ) -> (Arc<DaemonContext>, Arc<EventRouter>, Arc<SheafState>) {
-    use std::sync::{Mutex, RwLock};
+    use parking_lot::{Mutex, RwLock};
 
     let ctrl_path = fresh_arena(dir);
     let router = EventRouter::new(1024);
@@ -882,7 +882,7 @@ fn run_one_pass(repo_root: &Path, files: &[String], run_label: &str) -> Workload
 
     // 1. Do an initial parse so `TreeSitterPass` has an `_ast` baseline.
     {
-        let guard = ctx.live_db.writer.lock().expect("live_db lock");
+        let guard = ctx.live_db.writer.lock();
         leyline_cli_lib::cmd_parse::parse_into_conn(&guard, &source_dir, None, None)
             .expect("initial parse");
     }
@@ -890,7 +890,7 @@ fn run_one_pass(repo_root: &Path, files: &[String], run_label: &str) -> Workload
     // 2. Seed observations against the REAL repo file list — the labels
     //    the complex is built from name real files under `rs/`.
     {
-        let guard = ctx.live_db.writer.lock().expect("live_db lock");
+        let guard = ctx.live_db.writer.lock();
         seed_observations(&guard, files);
     }
 
@@ -913,7 +913,7 @@ fn run_one_pass(repo_root: &Path, files: &[String], run_label: &str) -> Workload
     // labels; otherwise the workload will emit only `all-known` events
     // and the study is meaningless.
     let complex_size = {
-        let cache = sheaf.cache().lock().expect("cache lock");
+        let cache = sheaf.cache().lock();
         cache.complex().map(|cx| cx.nodes.len()).unwrap_or(0)
     };
     assert!(

@@ -59,7 +59,8 @@ fn fresh_arena(dir: &Path) -> (PathBuf, PathBuf) {
 #[allow(dead_code)]
 fn default_test_ctx(ctrl_path: PathBuf) -> leyline_cli_lib::daemon::DaemonContext {
     use leyline_cli_lib::daemon::{DaemonContext, DaemonState, EventRouter, NoExt};
-    use std::sync::{Arc, Mutex, RwLock};
+    use parking_lot::{Mutex, RwLock};
+    use std::sync::Arc;
 
     // File-backed WAL live db — pool needs a real file (bead
     // `ley-line-open-f0239d`). Test uses the ctrl path to derive the
@@ -2143,7 +2144,8 @@ async fn test_embed_queue_drainer_refreshes_index() {
     use leyline_cli_lib::daemon::embed::{self, EmbedTask, Embedder, ZeroEmbedder};
     use leyline_cli_lib::daemon::vec_index::{VectorIndex, register_vec};
 
-    use std::sync::{Arc, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
 
     register_vec();
 
@@ -2159,7 +2161,6 @@ async fn test_embed_queue_drainer_refreshes_index() {
     live_db
         .writer
         .lock()
-        .unwrap()
         .execute_batch(
             "CREATE TABLE nodes (
             id TEXT PRIMARY KEY,
@@ -2191,7 +2192,7 @@ async fn test_embed_queue_drainer_refreshes_index() {
     assert_eq!(index.len().unwrap(), 0);
 
     // Push directly to bypass any other side-effect of MCP ops.
-    queue.lock().unwrap().push(EmbedTask {
+    queue.lock().push(EmbedTask {
         priority: 1,
         node_id: "a.go".to_string(),
     });
@@ -2245,7 +2246,7 @@ async fn test_op_vec_search_round_trip() {
     let ctx = Arc::new(DaemonContext {
         vec_index: index.clone(),
         embedder,
-        embed_queue: Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new())),
+        embed_queue: Arc::new(parking_lot::Mutex::new(std::collections::BinaryHeap::new())),
         #[cfg(feature = "text-search")]
         text_search: std::sync::Arc::new(leyline_text_search::null::NullEngine::new()),
         sheaf: Arc::new(leyline_cli_lib::daemon::sheaf_ops::SheafState::new()),
@@ -2283,7 +2284,8 @@ async fn test_op_vec_search_round_trip() {
 #[tokio::test]
 async fn test_status_reports_phase_and_enrichment() {
     use leyline_cli_lib::daemon::{DaemonContext, DaemonPhase, DaemonState, PassStatus};
-    use std::sync::{Arc, RwLock};
+    use parking_lot::RwLock;
+    use std::sync::Arc;
 
     let dir = TempDir::new().unwrap();
     let (_arena, ctrl_path) = fresh_arena(dir.path());
@@ -2490,7 +2492,8 @@ fn test_scoped_reparse_handles_deletion_in_scope() {
 #[tokio::test]
 async fn test_op_reparse_accepts_single_file_source() {
     use leyline_cli_lib::daemon::DaemonContext;
-    use std::sync::{Arc, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
 
     // Source tree with two go files. The hook will only "edit" one.
     let src = TempDir::new().unwrap();
@@ -2505,7 +2508,7 @@ async fn test_op_reparse_accepts_single_file_source() {
     // writer) so the daemon context can consume it.
     let live_db = cold_parse_go_live_db(&live_db_path, src.path());
     let snapshot = {
-        let guard = live_db.writer.lock().unwrap();
+        let guard = live_db.writer.lock();
         file_index_snapshot(&guard)
     };
     assert_eq!(snapshot.len(), 2);
@@ -2549,7 +2552,7 @@ async fn test_op_reparse_accepts_single_file_source() {
     assert_eq!(names, vec!["a.go"], "scope should be exactly [a.go]");
 
     // Verify b.go was NOT touched (its mtime/size in _file_index is unchanged).
-    let after = file_index_snapshot(&ctx.live_db.writer.lock().unwrap());
+    let after = file_index_snapshot(&ctx.live_db.writer.lock());
     assert_eq!(
         after.get("b.go"),
         snapshot.get("b.go"),
@@ -2717,7 +2720,7 @@ async fn test_op_query_destructive_runs_today_pin_for_6213d4() {
 
     let live_db = leyline_cli_lib::daemon::db_pool::LiveDb::open_fresh_for_test(&live_db_path);
     {
-        let guard = live_db.writer.lock().unwrap();
+        let guard = live_db.writer.lock();
         guard
             .execute_batch(
                 "CREATE TABLE doomed (id INTEGER PRIMARY KEY); INSERT INTO doomed VALUES (1);",
@@ -2747,7 +2750,6 @@ async fn test_op_query_destructive_runs_today_pin_for_6213d4() {
         .live_db
         .writer
         .lock()
-        .unwrap()
         .query_row(
             "SELECT COUNT(*) = 0 FROM sqlite_master WHERE type='table' AND name='doomed'",
             [],
@@ -2770,7 +2772,8 @@ async fn test_op_vec_search_dim_mismatch_returns_clean_error() {
     use leyline_cli_lib::daemon::DaemonContext;
     use leyline_cli_lib::daemon::embed::{Embedder, ZeroEmbedder};
     use leyline_cli_lib::daemon::vec_index::{VectorIndex, register_vec};
-    use std::sync::{Arc, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
 
     register_vec();
 
@@ -2989,7 +2992,7 @@ async fn test_op_text_search_success_path_returns_hits() {
 ///
 /// This is the test that would have flagged ley-line-open-5fea4e
 /// (mutex-held-across-await deadlock) earlier — under contention the
-/// existing std::sync::Mutex serializes everything, but we *should* still
+/// existing parking_lot::Mutex serializes everything, but we *should* still
 /// make forward progress and never starve a connection. If the daemon
 /// deadlocks, this test will hang and CI will time out (5s wall ceiling
 /// makes it visible).
@@ -3009,7 +3012,6 @@ async fn test_concurrent_uds_load_completes_bounded() {
     live_db
         .writer
         .lock()
-        .unwrap()
         .execute_batch(
             "CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT);
          INSERT INTO _meta VALUES ('parse_version', '1');",
@@ -3074,7 +3076,8 @@ async fn test_concurrent_uds_load_completes_bounded() {
 #[tokio::test]
 async fn test_status_reports_error_phase() {
     use leyline_cli_lib::daemon::{DaemonContext, DaemonPhase, DaemonState};
-    use std::sync::{Arc, RwLock};
+    use parking_lot::RwLock;
+    use std::sync::Arc;
 
     let dir = TempDir::new().unwrap();
     let (_arena, ctrl_path) = fresh_arena(dir.path());
@@ -3283,7 +3286,7 @@ async fn daemon_protocol_gate_handlers_emit_required_keys() {
     // unexpected ok=false. Pre-create the tables once (idempotent DDL) so
     // ops can return empty success shapes instead of erroring.
     {
-        let guard = ctx.live_db.writer.lock().unwrap();
+        let guard = ctx.live_db.writer.lock();
         leyline_schema::create_schema(&guard).expect("nodes schema");
         guard
             .execute_batch(leyline_ts::schema::REFS_DDL)

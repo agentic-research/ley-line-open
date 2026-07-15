@@ -5,6 +5,7 @@ edition = "2024"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
+parking_lot = { workspace = true }
 anyhow = { workspace = true }
 memmap2 = { workspace = true }
 bytemuck = { workspace = true, features = ["derive"] }

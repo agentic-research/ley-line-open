@@ -154,7 +154,7 @@ fn seed_observations(conn: &Connection) {
 /// (subscribers see the same emitter events the daemon-internal
 /// `run_watcher_enrichment` publishes).
 fn build_full_ctx(dir: &Path, source_dir: PathBuf) -> (Arc<DaemonContext>, Arc<EventRouter>) {
-    use std::sync::{Mutex, RwLock};
+    use parking_lot::{Mutex, RwLock};
 
     let ctrl_path = fresh_arena(dir);
     let router = EventRouter::new(64);
@@ -278,7 +278,7 @@ async fn file_change_drives_fine_grained_sheaf_invalidate_end_to_end() {
     // Mirrors the daemon's cold-start parse before `git_watch_loop`
     // takes over at `cmd_daemon.rs:513`.
     {
-        let guard = ctx.live_db.writer.lock().expect("live_db lock");
+        let guard = ctx.live_db.writer.lock();
         leyline_cli_lib::cmd_parse::parse_into_conn(&guard, &source_dir, None, None)
             .expect("initial parse");
     }
@@ -291,7 +291,7 @@ async fn file_change_drives_fine_grained_sheaf_invalidate_end_to_end() {
     // This test targets the non-empty case so the `region_ids` shape
     // is exercised end-to-end, not just structurally-present.
     {
-        let guard = ctx.live_db.writer.lock().expect("live_db lock");
+        let guard = ctx.live_db.writer.lock();
         seed_observations(&guard);
     }
 
@@ -349,7 +349,7 @@ async fn file_change_drives_fine_grained_sheaf_invalidate_end_to_end() {
     // `read_root_hex` from the controller path that arena creation
     // already populated).
     let reparse = {
-        let guard = ctx.live_db.writer.lock().expect("live_db lock");
+        let guard = ctx.live_db.writer.lock();
         leyline_cli_lib::cmd_parse::parse_into_conn(
             &guard,
             &source_dir,
@@ -595,7 +595,7 @@ async fn identical_content_rewrite_still_emits_invalidate_with_empty_changed_fil
     // Initial parse establishes the mtime + content-hash baseline for
     // the incremental reparse to compare against.
     {
-        let guard = ctx.live_db.writer.lock().expect("live_db lock");
+        let guard = ctx.live_db.writer.lock();
         leyline_cli_lib::cmd_parse::parse_into_conn(&guard, &source_dir, None, None)
             .expect("initial parse");
     }
@@ -618,7 +618,7 @@ async fn identical_content_rewrite_still_emits_invalidate_with_empty_changed_fil
     // structurally change and skips the tree-sitter walk.
     std::fs::write(&foo_path, foo_content).expect("re-write foo.rs with identical content");
     let reparse = {
-        let guard = ctx.live_db.writer.lock().expect("live_db lock");
+        let guard = ctx.live_db.writer.lock();
         leyline_cli_lib::cmd_parse::parse_into_conn(
             &guard,
             &source_dir,

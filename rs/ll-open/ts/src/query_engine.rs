@@ -16,9 +16,13 @@
 //! - `@ref` on the pattern root → [`ExtractedRef::Ref`]
 //! - `@import` on the pattern root → [`ExtractedRef::Import`]
 //! - `@name` → the emitted token (empty text suppresses the emission)
-//! - `@qualifier` → when captured, emit `{qualifier}.{name}` FIRST,
+//! - `@qualifier` → when captured, emit `{qualifier}{sep}{name}` FIRST,
 //!   then the bare `{name}` (dual-emit: consumers join on the
-//!   qualified form, call-side resolution uses the bare form)
+//!   qualified form, call-side resolution uses the bare form). `sep`
+//!   defaults to `.`; a pattern overrides it with
+//!   `(#set! qualifier-separator "::")` — Rust fixtures pin
+//!   `std::process::exit`-shaped tokens, so the separator is
+//!   per-pattern data, not engine code
 //! - `@path` → import path; surrounding string-literal quotes are
 //!   stripped
 //! - `@alias` → import alias; missing, empty, or `.` defaults to the
@@ -160,7 +164,17 @@ impl QueryEngine {
             if let Some(qualifier) = text(self.cap_qualifier)
                 && !qualifier.is_empty()
             {
-                push(format!("{qualifier}.{name}"));
+                // Per-pattern `(#set! qualifier-separator "::")`
+                // overrides the `.` default — the separator is language
+                // data (Go pins `pkg.Func`, Rust pins `mod::func`).
+                let sep = self
+                    .query
+                    .property_settings(m.pattern_index)
+                    .iter()
+                    .find(|p| &*p.key == "qualifier-separator")
+                    .and_then(|p| p.value.as_deref())
+                    .unwrap_or(".");
+                push(format!("{qualifier}{sep}{name}"));
             }
             push(name.to_string());
         }

@@ -1,0 +1,28 @@
+[package]
+name = "leyline-schema-bridge"
+version = "0.7.9"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Capnp schemas → zod TS / Go codegen. Fail-fast: unmapped constructs are hard errors. Lifted from cloister/tools/schema-bridge per ADR-0036 Phase 2."
+
+# One plugin binary per output format: capnp's PATH-search resolves
+# `-o<plugin>` to `capnpc-<plugin>`, so dispatch lives in the BINARY
+# NAME rather than an env var. main.rs reads argv[0] basename, strips
+# the `capnpc-schema-bridge-` prefix, parses the remainder as
+# OutputFormat. All bins compile from the same main.rs; OutputFormat
+# variants in src/lib.rs are the authoritative list of supported
+# formats.
+[[bin]]
+name = "capnpc-schema-bridge-zod"
+path = "src/main.rs"
+
+[[bin]]
+name = "capnpc-schema-bridge-go"
+path = "src/main.rs"
+
+[dependencies]
+capnp = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+indoc = "2.0"

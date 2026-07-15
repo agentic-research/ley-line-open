@@ -23,8 +23,10 @@
 //!   `(#set! qualifier-separator "::")` — Rust fixtures pin
 //!   `std::process::exit`-shaped tokens, so the separator is
 //!   per-pattern data, not engine code
-//! - `@path` → import path; surrounding string-literal quotes are
-//!   stripped
+//! - `@path` → import path; surrounding delimiters are stripped
+//!   (string-literal quotes, and the `<`/`>` of a C/C++
+//!   `system_lib_string` — `#include <stdio.h>` carries the brackets
+//!   in the node text)
 //! - `@alias` → import alias; missing, empty, or `.` defaults to the
 //!   path's last `/` segment
 //!
@@ -113,7 +115,13 @@ impl QueryEngine {
                 let Some(path) = text(self.cap_path) else {
                     continue;
                 };
-                let path = path.trim_matches(|c| c == '"' || c == '`');
+                // Delimiter stripping is generic engine behavior, not
+                // language data: quotes/backticks wrap string-literal
+                // paths (Go, JS/TS), `<`/`>` wrap a C/C++
+                // system_lib_string (`#include <stdio.h>` — bead
+                // ley-line-open-5e21c2). No language's import path
+                // legitimately starts or ends with any of these.
+                let path = path.trim_matches(|c| matches!(c, '"' | '`' | '<' | '>'));
                 if path.is_empty() {
                     continue;
                 }

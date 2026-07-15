@@ -78,10 +78,12 @@ pub enum TsLanguage {
     // e5addb) — the 16 mache-registry languages LLO lacked at mache's
     // CGO removal. Coverage per language: Tier 1 (parse → `_ast`) +
     // Tier 2 (validate: ERROR/MISSING enumeration via the daemon
-    // `validate` op). Tier 3 (def/ref extraction) is separate work —
-    // .scm query data over the generic engine — so `canonical_kind`
-    // and `canonical_cfg_kind` return `None` for all of these (the
-    // open-world escape: callers keep the raw grammar kind). ──
+    // `validate` op). Tier 3 (def/ref extraction) is .scm query data
+    // over the generic engine: java/c/cpp have it (bead
+    // ley-line-open-5e21c2, `queries/<lang>/tags.scm` + κ arms below);
+    // the rest return `None` from `canonical_kind` /
+    // `canonical_cfg_kind` (the open-world escape: callers keep the
+    // raw grammar kind) until their queries are authored. ──
     /// SQL (.sql). DerekStride/tree-sitter-sql (crate
     /// `tree-sitter-sequel`) — the same grammar mache vendored through
     /// smacker/go-tree-sitter before its CGO removal, so `_ast` node
@@ -390,6 +392,50 @@ impl TsLanguage {
                 | "enum_declaration" => Some("type"),
                 "import_statement" => Some("import"),
                 "program" => Some("module"),
+                _ => None,
+            },
+            // ── Tier 3 query-native languages (bead ley-line-open-5e21c2):
+            // κ covers exactly the def kinds queries/<lang>/tags.scm
+            // anchors at (mache's dead_code / god_file rules filter on
+            // symbol-scope κ), plus the import/module containers. ──
+            #[cfg(feature = "java")]
+            TsLanguage::Java => match raw_kind {
+                "method_declaration" => Some("method"),
+                "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration" => Some("type"),
+                "import_declaration" => Some("import"),
+                "program" => Some("module"),
+                _ => None,
+            },
+            #[cfg(feature = "c")]
+            TsLanguage::C => match raw_kind {
+                // Defs anchor at function_declarator (covers definitions
+                // AND prototypes); function_definition maps too so the
+                // symbols path collapses the enclosing node the same way.
+                "function_definition" | "function_declarator" => Some("function"),
+                "struct_specifier" | "union_specifier" | "enum_specifier" | "type_definition" => {
+                    Some("type")
+                }
+                "field_declaration" => Some("field"),
+                "preproc_include" => Some("import"),
+                "translation_unit" => Some("module"),
+                _ => None,
+            },
+            #[cfg(feature = "cpp")]
+            // The C++ grammar is a superset of C's; the C kinds collapse
+            // identically. In-class methods keep κ "function" (anchor is
+            // the same function_declarator kind) — impl-context promotion
+            // to "method" is the same documented follow-up as Rust's.
+            TsLanguage::Cpp => match raw_kind {
+                "function_definition" | "function_declarator" => Some("function"),
+                "struct_specifier" | "union_specifier" | "enum_specifier" | "type_definition"
+                | "class_specifier" => Some("type"),
+                "field_declaration" => Some("field"),
+                "preproc_include" => Some("import"),
+                "namespace_definition" => Some("module"),
+                "translation_unit" => Some("module"),
                 _ => None,
             },
             #[allow(unreachable_patterns)]
@@ -1106,10 +1152,12 @@ mod tests {
     /// returns `None` for every raw kind (the open-world escape), so the
     /// caller stores raw kinds untouched. For the config/data languages
     /// (toml, dockerfile, css) this is BY DESIGN — parse/validate only.
-    /// For the code languages (sql, bash, java, c, cpp, ruby, php,
-    /// kotlin, swift, scala, csharp, groovy, lua) Tier 3 lands as .scm
-    /// query data over the generic engine — separate work, never match
-    /// arms here.
+    /// For the remaining code languages (sql, bash, ruby, php, kotlin,
+    /// swift, scala, csharp, groovy, lua) Tier 3 lands as .scm query
+    /// data over the generic engine — separate work, never match arms
+    /// here. java/c/cpp graduated to Tier 3 (bead ley-line-open-5e21c2)
+    /// and are pinned positively in
+    /// `tier3_query_native_languages_map_emitted_def_kinds`.
     #[test]
     fn tier12_languages_have_no_canonical_kind_mapping() {
         #[allow(unused)]
@@ -1131,10 +1179,96 @@ mod tests {
         probe(TsLanguage::Dockerfile);
         #[cfg(feature = "css")]
         probe(TsLanguage::Css);
-        #[cfg(feature = "java")]
-        probe(TsLanguage::Java);
         #[cfg(feature = "lua")]
         probe(TsLanguage::Lua);
+    }
+
+    /// Tier 3 query-native languages (bead ley-line-open-5e21c2): κ
+    /// covers exactly the def kinds `queries/<lang>/tags.scm` anchors
+    /// at — the engine derives a def's `canonical_kind` from its anchor
+    /// node's raw kind, and mache's dead_code / god_file rules filter
+    /// on symbol-scope κ. An anchor kind mapping to `None` would write
+    /// NULL-kind def rows those rules silently skip.
+    #[test]
+    fn tier3_query_native_languages_map_emitted_def_kinds() {
+        #[cfg(feature = "java")]
+        {
+            assert_eq!(
+                TsLanguage::Java.canonical_kind("method_declaration"),
+                Some("method")
+            );
+            for raw in [
+                "class_declaration",
+                "interface_declaration",
+                "enum_declaration",
+                "record_declaration",
+            ] {
+                assert_eq!(
+                    TsLanguage::Java.canonical_kind(raw),
+                    Some("type"),
+                    "Java: {raw} must collapse to type"
+                );
+            }
+            assert_eq!(
+                TsLanguage::Java.canonical_kind("import_declaration"),
+                Some("import")
+            );
+            assert_eq!(TsLanguage::Java.canonical_kind("program"), Some("module"));
+        }
+        #[cfg(feature = "c")]
+        {
+            assert_eq!(
+                TsLanguage::C.canonical_kind("function_declarator"),
+                Some("function")
+            );
+            assert_eq!(
+                TsLanguage::C.canonical_kind("function_definition"),
+                Some("function")
+            );
+            for raw in [
+                "struct_specifier",
+                "union_specifier",
+                "enum_specifier",
+                "type_definition",
+            ] {
+                assert_eq!(
+                    TsLanguage::C.canonical_kind(raw),
+                    Some("type"),
+                    "C: {raw} must collapse to type"
+                );
+            }
+            assert_eq!(
+                TsLanguage::C.canonical_kind("preproc_include"),
+                Some("import")
+            );
+            assert_eq!(
+                TsLanguage::C.canonical_kind("translation_unit"),
+                Some("module")
+            );
+        }
+        #[cfg(feature = "cpp")]
+        {
+            assert_eq!(
+                TsLanguage::Cpp.canonical_kind("function_declarator"),
+                Some("function")
+            );
+            assert_eq!(
+                TsLanguage::Cpp.canonical_kind("class_specifier"),
+                Some("type")
+            );
+            assert_eq!(
+                TsLanguage::Cpp.canonical_kind("struct_specifier"),
+                Some("type")
+            );
+            assert_eq!(
+                TsLanguage::Cpp.canonical_kind("namespace_definition"),
+                Some("module")
+            );
+            assert_eq!(
+                TsLanguage::Cpp.canonical_kind("preproc_include"),
+                Some("import")
+            );
+        }
     }
 
     /// Parses a tiny proto3 fragment end-to-end to verify the

@@ -447,6 +447,200 @@ fn javascript_arrow_and_function_expression_bindings_extract_as_defs() {
     }
 }
 
+// ── Tier 3 query-native languages (bead ley-line-open-5e21c2) ───────────
+//
+// Java, C, and C++ registered Tier 1+2 (parse + validate, bead 46ae48)
+// with NO extractor: `extract_refs` had no dispatch arm and
+// `canonical_kind` returned None, so every .java/.c/.h/.cpp file wrote
+// zero node_defs / node_refs / _imports rows. Same "supported but
+// silent-empty" bug class as Python/JS/TS pre-PR-165 — pinned with the
+// same fixture-first + explicit-token discipline. These are the first
+// languages whose extraction is authored as .scm query data from day
+// one (no imperative extractor ever existed).
+
+#[test]
+fn java_files_produce_def_ref_rows() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("Main.java"),
+        b"import java.util.List;\n\npublic class Main {\n    static int foo() { return 1; }\n    int bar() { return foo(); }\n}\n",
+    )
+    .unwrap();
+
+    let conn = cold_parse(dir.path(), Some("java"));
+
+    let ast_rows = count_rows(
+        &conn,
+        "SELECT COUNT(*) FROM _ast WHERE source_id = 'Main.java'",
+    );
+    assert!(
+        ast_rows > 0,
+        "Java file must produce _ast rows (parse pipeline sanity); got {ast_rows}"
+    );
+
+    let def_rows = count_rows(
+        &conn,
+        "SELECT COUNT(*) FROM node_defs WHERE source_id = 'Main.java'",
+    );
+    assert!(
+        def_rows > 0,
+        "Java file must produce node_defs rows (Main, foo, bar); got {def_rows}. \
+         Symptom: extract_refs dispatcher has no Java arm."
+    );
+
+    let ref_rows = count_rows(
+        &conn,
+        "SELECT COUNT(*) FROM node_refs WHERE source_id = 'Main.java'",
+    );
+    assert!(
+        ref_rows > 0,
+        "Java file must produce node_refs rows (the foo() call); got {ref_rows}"
+    );
+
+    let defs = defs_tokens(&conn);
+    for want in ["Main", "foo", "bar"] {
+        assert!(
+            defs.contains(&want.to_string()),
+            "missing Java def token {want:?} in {defs:?}"
+        );
+    }
+    // Same qualified-method discipline as Go / Rust / Python / JS / TS.
+    assert!(
+        defs.contains(&"Main.foo".to_string()),
+        "Java method def token must be qualified as `Main.foo`; got {defs:?}"
+    );
+
+    let imports: Vec<(String, String)> = conn
+        .prepare("SELECT alias, path FROM _imports ORDER BY path")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert!(
+        imports.contains(&("List".to_string(), "java.util.List".to_string())),
+        "Java import must land in _imports as (List, java.util.List); got {imports:?}"
+    );
+}
+
+#[test]
+fn c_files_produce_def_ref_rows() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("mod.c"),
+        b"#include <stdio.h>\n\nstruct point { int x; int y; };\n\nint foo(void) { return 1; }\n\nint bar(void) { return foo(); }\n",
+    )
+    .unwrap();
+
+    let conn = cold_parse(dir.path(), Some("c"));
+
+    let ast_rows = count_rows(&conn, "SELECT COUNT(*) FROM _ast WHERE source_id = 'mod.c'");
+    assert!(
+        ast_rows > 0,
+        "C file must produce _ast rows (parse pipeline sanity); got {ast_rows}"
+    );
+
+    let def_rows = count_rows(
+        &conn,
+        "SELECT COUNT(*) FROM node_defs WHERE source_id = 'mod.c'",
+    );
+    assert!(
+        def_rows > 0,
+        "C file must produce node_defs rows (foo, bar, point); got {def_rows}. \
+         Symptom: extract_refs dispatcher has no C arm."
+    );
+
+    let ref_rows = count_rows(
+        &conn,
+        "SELECT COUNT(*) FROM node_refs WHERE source_id = 'mod.c'",
+    );
+    assert!(
+        ref_rows > 0,
+        "C file must produce node_refs rows (the foo() call); got {ref_rows}"
+    );
+
+    let defs = defs_tokens(&conn);
+    for want in ["foo", "bar", "point"] {
+        assert!(
+            defs.contains(&want.to_string()),
+            "missing C def token {want:?} in {defs:?}"
+        );
+    }
+
+    // The include lands with the angle brackets STRIPPED — `<stdio.h>`
+    // is the node text; the emitted path is `stdio.h`.
+    let imports: Vec<(String, String)> = conn
+        .prepare("SELECT alias, path FROM _imports ORDER BY path")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert!(
+        imports.contains(&("stdio.h".to_string(), "stdio.h".to_string())),
+        "C system include must land bracket-stripped as (stdio.h, stdio.h); got {imports:?}"
+    );
+}
+
+#[test]
+fn cpp_files_produce_def_ref_rows() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("mod.cpp"),
+        b"#include <vector>\n\nclass Shape {\npublic:\n    double area();\n    void draw() {}\n};\n\ndouble Shape::area() { return 0; }\n\nvoid render() { Shape s; s.draw(); }\n",
+    )
+    .unwrap();
+
+    let conn = cold_parse(dir.path(), Some("cpp"));
+
+    let ast_rows = count_rows(
+        &conn,
+        "SELECT COUNT(*) FROM _ast WHERE source_id = 'mod.cpp'",
+    );
+    assert!(
+        ast_rows > 0,
+        "C++ file must produce _ast rows (parse pipeline sanity); got {ast_rows}"
+    );
+
+    let def_rows = count_rows(
+        &conn,
+        "SELECT COUNT(*) FROM node_defs WHERE source_id = 'mod.cpp'",
+    );
+    assert!(
+        def_rows > 0,
+        "C++ file must produce node_defs rows (Shape, area, draw, render); got {def_rows}. \
+         Symptom: extract_refs dispatcher has no Cpp arm."
+    );
+
+    let ref_rows = count_rows(
+        &conn,
+        "SELECT COUNT(*) FROM node_refs WHERE source_id = 'mod.cpp'",
+    );
+    assert!(
+        ref_rows > 0,
+        "C++ file must produce node_refs rows (the s.draw() call); got {ref_rows}"
+    );
+
+    let defs = defs_tokens(&conn);
+    for want in ["Shape", "render", "draw", "area"] {
+        assert!(
+            defs.contains(&want.to_string()),
+            "missing C++ def token {want:?} in {defs:?}"
+        );
+    }
+    // Qualified forms: the out-of-line definition qualifies via query
+    // dual-emit; the in-class ones via the ancestor fixup. Same `::`
+    // spelling as Rust impl methods.
+    assert!(
+        defs.contains(&"Shape::area".to_string()),
+        "C++ out-of-line method def must be qualified as `Shape::area`; got {defs:?}"
+    );
+    assert!(
+        defs.contains(&"Shape::draw".to_string()),
+        "C++ in-class method def must be qualified as `Shape::draw`; got {defs:?}"
+    );
+}
+
 #[test]
 fn typescript_arrow_and_function_expression_bindings_extract_as_defs() {
     // Same shape as the JS test; TypeScript grammar shares the node

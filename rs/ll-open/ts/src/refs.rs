@@ -218,21 +218,25 @@ pub fn extract_go(
 /// Extract Rust definitions, call references, macro invocations, and `use`
 /// imports from a single AST node. Pure data — no DB access.
 ///
-/// Node kinds handled (tree-sitter-rust grammar):
-/// - `function_item`, `struct_item`, `enum_item`, `union_item`,
-///   `trait_item`, `type_item`, `mod_item`, `const_item`, `static_item`
-///   → Def (uses `name` field)
-/// - `call_expression`:
-///     - `function: identifier`           → Ref (bare token)
-///     - `function: field_expression`     → Ref (method name from `field`)
-///     - `function: scoped_identifier`    → Ref (qualified `pkg::func` + bare `func`)
-/// - `macro_invocation` → Ref (`macro` field; includes the `!` is dropped)
-/// - `use_declaration` → Import. Handles bare, scoped, aliased, and
-///   list/scoped-list use trees. Wildcards are skipped (no addressable
-///   alias). Nested `use_list` cases recurse via the walker, not here.
+/// The per-language knowledge lives in `queries/rust/tags.scm`,
+/// compiled once and interpreted by the generic
+/// [`QueryEngine`](crate::query_engine::QueryEngine). Two arms are
+/// outside the query→fact vocabulary and stay imperative (bead
+/// `ley-line-open-42f2b3`):
 ///
-/// Closures (`closure_expression`) are intentionally NOT matched — they're
-/// anonymous, no stable token.
+/// - Qualified `Receiver::method` defs (bead `ley-line-open-caf423`):
+///   the receiver is the `type`/`name` field of an ANCESTOR
+///   `impl_item`/`trait_item`, and tree-sitter patterns match downward
+///   only — no pattern anchored at the function node can capture it.
+/// - Use-tree flattening: `use a::{b, c as d, e::{f}}` joins the
+///   shared path prefix onto each leaf and recurses to unbounded
+///   depth; `@path` reads a single node's text.
+///
+/// Everything else — defs, call refs (bare / method / `::`-qualified
+/// dual-emit), macro refs, single-leaf imports — is pinned by the
+/// fixture tests below: edit the `.scm`, keep the tests green.
+/// Closures (`closure_expression`) are intentionally NOT matched —
+/// they're anonymous, no stable token.
 #[cfg(feature = "rust")]
 pub fn extract_rust(
     node: &Node,
@@ -241,167 +245,59 @@ pub fn extract_rust(
     source_id: &str,
     container_node_id: Option<&str>,
 ) -> Vec<ExtractedRef> {
+    use std::sync::OnceLock;
+    static ENGINE: OnceLock<crate::query_engine::QueryEngine> = OnceLock::new();
     let mut out = Vec::new();
 
-    match node.kind() {
-        // ── Definitions: anything with a `name` field that introduces a
-        // top-level binding the rest of the codebase can reference.
-        // `function_signature_item` is the bodyless form used in traits
-        // (`fn x(&self);`) and `extern` blocks. Same `name` field.
-        "function_item" | "function_signature_item" => {
-            if let Some(name_node) = node.child_by_field_name("name")
-                && let Ok(name) = name_node.utf8_text(source)
-                && !name.is_empty()
-            {
-                // Bead `ley-line-open-caf423`: when this `function_item`
-                // lives inside an `impl` block, emit the qualified
-                // `Receiver::method` form alongside the bare method name
-                // so mache's cross-language rules can disambiguate
-                // methods on different types. Walk parent chain:
-                //   function_item → declaration_list → impl_item(type=...)
-                // Trait signatures (`function_signature_item`) inside a
-                // `trait_item` get the same treatment via the same
-                // pattern — trait_item also carries a `name` field.
-                if let Some(recv) = rust_impl_receiver(node, source) {
-                    out.push(ExtractedRef::Def {
-                        token: format!("{recv}::{name}"),
-                        node_id: node_id.to_string(),
-                        source_id: source_id.to_string(),
-                        container_node_id: container_node_id.map(str::to_string),
-                        canonical_kind: crate::languages::TsLanguage::Rust
-                            .canonical_kind(node.kind()),
-                    });
-                }
-                out.push(ExtractedRef::Def {
-                    token: name.to_string(),
-                    node_id: node_id.to_string(),
-                    source_id: source_id.to_string(),
-                    container_node_id: container_node_id.map(str::to_string),
-                    canonical_kind: crate::languages::TsLanguage::Rust.canonical_kind(node.kind()),
-                });
-            }
-        }
-        "struct_item" | "enum_item" | "union_item" | "trait_item" | "type_item" | "mod_item"
-        | "const_item" | "static_item" => {
-            if let Some(name_node) = node.child_by_field_name("name")
-                && let Ok(token) = name_node.utf8_text(source)
-                && !token.is_empty()
-            {
-                out.push(ExtractedRef::Def {
-                    token: token.to_string(),
-                    node_id: node_id.to_string(),
-                    source_id: source_id.to_string(),
-                    container_node_id: container_node_id.map(str::to_string),
-                    canonical_kind: crate::languages::TsLanguage::Rust.canonical_kind(node.kind()),
-                });
-            }
-        }
-
-        // ── Call references: tree-sitter-rust's `call_expression` always
-        // has a `function` field; we branch on that field's kind.
-        "call_expression" => {
-            if let Some(func_node) = node.child_by_field_name("function") {
-                match func_node.kind() {
-                    // Bare call: `foo()`.
-                    "identifier" => {
-                        if let Ok(token) = func_node.utf8_text(source)
-                            && !token.is_empty()
-                        {
-                            out.push(ExtractedRef::Ref {
-                                token: token.to_string(),
-                                node_id: node_id.to_string(),
-                                source_id: source_id.to_string(),
-                                container_node_id: container_node_id.map(str::to_string),
-                            });
-                        }
-                    }
-                    // Method-like: `obj.method()`. The receiver isn't a
-                    // ref (it's a value), so we emit only the field name.
-                    "field_expression" => {
-                        if let Some(field_node) = func_node.child_by_field_name("field")
-                            && let Ok(token) = field_node.utf8_text(source)
-                            && !token.is_empty()
-                        {
-                            out.push(ExtractedRef::Ref {
-                                token: token.to_string(),
-                                node_id: node_id.to_string(),
-                                source_id: source_id.to_string(),
-                                container_node_id: container_node_id.map(str::to_string),
-                            });
-                        }
-                    }
-                    // Qualified: `mod::func()`. Emit both the qualified
-                    // form ("module::func") and the bare form ("func") so
-                    // a downstream resolver can match either.
-                    "scoped_identifier" => {
-                        let qualified = func_node.utf8_text(source).unwrap_or("");
-                        let bare = func_node
-                            .child_by_field_name("name")
-                            .and_then(|n| n.utf8_text(source).ok())
-                            .unwrap_or("");
-                        if !bare.is_empty() {
-                            if !qualified.is_empty() {
-                                out.push(ExtractedRef::Ref {
-                                    token: qualified.to_string(),
-                                    node_id: node_id.to_string(),
-                                    source_id: source_id.to_string(),
-                                    container_node_id: container_node_id.map(str::to_string),
-                                });
-                            }
-                            out.push(ExtractedRef::Ref {
-                                token: bare.to_string(),
-                                node_id: node_id.to_string(),
-                                source_id: source_id.to_string(),
-                                container_node_id: container_node_id.map(str::to_string),
-                            });
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // ── Macro invocations: `println!`, `vec!`, etc.
-        "macro_invocation" => {
-            if let Some(macro_node) = node.child_by_field_name("macro") {
-                // `macro` may be `identifier` or `scoped_identifier`.
-                let token = match macro_node.kind() {
-                    "scoped_identifier" => macro_node
-                        .child_by_field_name("name")
-                        .and_then(|n| n.utf8_text(source).ok())
-                        .unwrap_or(""),
-                    _ => macro_node.utf8_text(source).unwrap_or(""),
-                };
-                if !token.is_empty() {
-                    out.push(ExtractedRef::Ref {
-                        token: token.to_string(),
-                        node_id: node_id.to_string(),
-                        source_id: source_id.to_string(),
-                        container_node_id: container_node_id.map(str::to_string),
-                    });
-                }
-            }
-        }
-
-        // ── Imports: `use_declaration` wraps a single `argument` tree.
-        "use_declaration" => {
-            if let Some(arg) = node.child_by_field_name("argument") {
-                collect_use_imports(arg, source, source_id, &mut out);
-            }
-        }
-
-        _ => {}
+    // Upward-context arm: the qualified def precedes the bare def the
+    // `.scm` emits, preserving the pre-port emission order.
+    if matches!(node.kind(), "function_item" | "function_signature_item")
+        && let Some(name_node) = node.child_by_field_name("name")
+        && let Ok(name) = name_node.utf8_text(source)
+        && !name.is_empty()
+        && let Some(recv) = rust_impl_receiver(node, source)
+    {
+        out.push(ExtractedRef::Def {
+            token: format!("{recv}::{name}"),
+            node_id: node_id.to_string(),
+            source_id: source_id.to_string(),
+            container_node_id: container_node_id.map(str::to_string),
+            canonical_kind: crate::languages::TsLanguage::Rust.canonical_kind(node.kind()),
+        });
     }
 
+    // Use-list arm: single-leaf `use` forms come from the `.scm`; list
+    // forms need prefix joining + recursion.
+    if node.kind() == "use_declaration"
+        && let Some(arg) = node.child_by_field_name("argument")
+        && matches!(arg.kind(), "scoped_use_list" | "use_list")
+    {
+        collect_use_imports(arg, source, source_id, &mut out);
+    }
+
+    out.extend(
+        ENGINE
+            .get_or_init(|| {
+                crate::query_engine::QueryEngine::new(
+                    crate::languages::TsLanguage::Rust,
+                    include_str!("../queries/rust/tags.scm"),
+                )
+                .expect("compiled-in queries/rust/tags.scm must compile against tree-sitter-rust")
+            })
+            .extract(node, source, node_id, source_id, container_node_id),
+    );
     out
 }
 
-/// Recursively flatten a `use` argument into `ExtractedRef::Import`
-/// entries. Tree-sitter-rust models the `use` tree as nested
-/// `scoped_identifier` / `use_as_clause` / `use_list` / `scoped_use_list`
-/// nodes; the recursion mirrors that shape.
+/// Recursively flatten a `use` LIST tree into `ExtractedRef::Import`
+/// entries. Single-leaf forms (`use foo;`, `use a::b;`,
+/// `use a::b as c;`) are query patterns in `queries/rust/tags.scm`;
+/// this handles only the list shapes, whose shared-prefix joining and
+/// unbounded nesting the query vocabulary cannot express (bead
+/// `ley-line-open-42f2b3`).
 ///
-/// Wildcards (`use foo::*;`) are skipped — no stable alias to attach.
+/// Wildcards (`use foo::{a, io::*};`) are skipped — no stable alias to
+/// attach.
 #[cfg(feature = "rust")]
 fn collect_use_imports(
     node: Node<'_>,
@@ -410,52 +306,6 @@ fn collect_use_imports(
     out: &mut Vec<ExtractedRef>,
 ) {
     match node.kind() {
-        // Bare `use foo;`
-        "identifier" => {
-            if let Ok(name) = node.utf8_text(source)
-                && !name.is_empty()
-            {
-                out.push(ExtractedRef::Import {
-                    alias: name.to_string(),
-                    path: name.to_string(),
-                    source_id: source_id.to_string(),
-                });
-            }
-        }
-        // `use foo::bar;` — full path is the node text, alias = last
-        // segment.
-        "scoped_identifier" => {
-            let path = node.utf8_text(source).unwrap_or("");
-            let alias = node
-                .child_by_field_name("name")
-                .and_then(|n| n.utf8_text(source).ok())
-                .unwrap_or("");
-            if !path.is_empty() && !alias.is_empty() {
-                out.push(ExtractedRef::Import {
-                    alias: alias.to_string(),
-                    path: path.to_string(),
-                    source_id: source_id.to_string(),
-                });
-            }
-        }
-        // `use foo::bar as baz;` — explicit alias.
-        "use_as_clause" => {
-            let path = node
-                .child_by_field_name("path")
-                .and_then(|n| n.utf8_text(source).ok())
-                .unwrap_or("");
-            let alias = node
-                .child_by_field_name("alias")
-                .and_then(|n| n.utf8_text(source).ok())
-                .unwrap_or("");
-            if !path.is_empty() && !alias.is_empty() {
-                out.push(ExtractedRef::Import {
-                    alias: alias.to_string(),
-                    path: path.to_string(),
-                    source_id: source_id.to_string(),
-                });
-            }
-        }
         // `use foo::{a, b};` — list children are individual use trees
         // sharing the `foo::` prefix. tree-sitter-rust emits these as a
         // `scoped_use_list` node with `path: foo` and `list: use_list`.
@@ -478,8 +328,6 @@ fn collect_use_imports(
                 collect_use_list_child(child, source, source_id, "", out);
             }
         }
-        // `use foo::*;` — intentionally skipped (no addressable alias).
-        "use_wildcard" => {}
         _ => {}
     }
 }

@@ -26,11 +26,12 @@ use leyline_ts::languages::TsLanguage;
 /// Without this cap, a single 1 GiB file in the source tree would OOM
 /// the daemon during full reparse on small machines.
 pub const MAX_PARSE_FILE_SIZE: i64 = 8 * 1024 * 1024;
-use leyline_ts::refs::{ExtractedRef, extract_refs};
+use leyline_ts::refs::{ExtractedRef, current_extraction_epoch, extract_refs};
 use leyline_ts::schema::{
     create_ast_tables, create_index_schema, create_ir_indexes, create_ir_tables,
     create_pointer_store_tables, create_post_load_indexes_skip_unused, create_refs_tables,
-    create_source_blobs_table, delete_file_rows, read_file_index, set_meta, sweep_orphaned_dirs,
+    create_source_blobs_table, delete_file_rows, get_meta, read_file_index, set_meta,
+    sweep_orphaned_dirs,
 };
 use rayon::prelude::*;
 use rusqlite::Connection;
@@ -806,6 +807,29 @@ pub fn parse_into_conn(
         HashMap::new()
     };
 
+    // Extraction-rules provenance (bead `ley-line-open-20988a`).
+    // Derived facts (node_defs/node_refs/_imports) are keyed on
+    // node_hash — a fold over source bytes — so a rules change with
+    // unchanged sources is invisible to both the mtime+size skip below
+    // and the sheaf's node_hash invalidation (v0.7.8 shipped exactly
+    // this: extract_go emission changed, existing arenas kept serving
+    // the old node_refs). Compare the epoch that produced the arena's
+    // facts against this binary's; on any disagreement — including the
+    // missing row every pre-epoch arena has — disable the
+    // unchanged-skip so this pass re-derives every file. A rules
+    // change is inherently global: one-shot invalidation here, and the
+    // sheaf repopulates from the reparse like any other change.
+    let extraction_epoch = current_extraction_epoch().to_string();
+    let epoch_current = incremental
+        && get_meta(conn, "extraction_epoch").ok().flatten().as_deref()
+            == Some(extraction_epoch.as_str());
+    if incremental && !epoch_current {
+        eprintln!(
+            "extraction epoch changed (binary epoch {extraction_epoch}); \
+             re-deriving facts for all files",
+        );
+    }
+
     // Pre-allocate worst-case (every file gets reparsed) to avoid Vec
     // resizes during the classification loop. At registry-repo scale
     // (50k+ files) the default doubling-resize pattern would do
@@ -848,7 +872,8 @@ pub fn parse_into_conn(
             .as_nanos() as i64;
         let file_size = meta.len() as i64;
 
-        if let Some(&(old_m, old_s)) = old_index.get(&rel_str)
+        if epoch_current
+            && let Some(&(old_m, old_s)) = old_index.get(&rel_str)
             && file_mtime == old_m
             && file_size == old_s
         {
@@ -1466,6 +1491,14 @@ pub fn parse_into_conn(
     // shape (node_content/node_child/_ast.node_hash) from the retired
     // symbols/fact_edges shape.
     set_meta(conn, "ir_schema_version", "merkle-ast-v1")?;
+    // Stamp the extraction epoch only on full-tree passes. A scoped
+    // pass reparses just the dirty set; stamping the binary's epoch
+    // there would mark still-stale out-of-scope facts as current. The
+    // warm-start initial reparse and every cold parse are full-tree,
+    // so adoption of an arena by a new binary always lands here.
+    if scope.is_none() {
+        set_meta(conn, "extraction_epoch", &extraction_epoch)?;
+    }
     let sweep_close_elapsed = sweep_close_start.elapsed();
 
     // Σ root advance (bead `ley-line-open-ce55b1`) — join the worker

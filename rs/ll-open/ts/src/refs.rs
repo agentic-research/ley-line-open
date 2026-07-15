@@ -5,6 +5,38 @@
 
 use tree_sitter::Node;
 
+/// Version of the extraction rules — the `extract_*` emission behavior
+/// that derives `node_defs` / `node_refs` / `_imports` from an AST.
+///
+/// `node_hash` is a fold over source bytes only, so a rules change with
+/// unchanged sources is invisible to the merkle/sheaf invalidation
+/// layer (v0.7.8 hit this: keyed_element/argument_list value-position
+/// refs changed `extract_go` output for byte-identical files, and
+/// existing arenas kept serving the old rows). The parse layer stores
+/// this epoch in `_meta.extraction_epoch` and forces full fact
+/// re-derivation when the stored value disagrees with the binary's —
+/// see bead `ley-line-open-20988a`.
+///
+/// Bump whenever ANY `extract_*` emission behavior changes. When
+/// queries-as-data lands (bead `ley-line-open-206d53`) this constant is
+/// superseded by the query_set_hash computed over the loaded query set.
+///
+/// Deliberately NOT folded into `node_hash` itself — that would couple
+/// parse identity to extraction version and kill content dedup across
+/// versions.
+pub const EXTRACTION_EPOCH: u64 = 1;
+
+/// Effective extraction epoch: `LLO_EXTRACTION_EPOCH` overrides the
+/// compile-time constant so one test binary can act as two releases
+/// with different extraction rules. Unset or non-numeric values fall
+/// back to [`EXTRACTION_EPOCH`].
+pub fn current_extraction_epoch() -> u64 {
+    std::env::var("LLO_EXTRACTION_EPOCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(EXTRACTION_EPOCH)
+}
+
 /// A single extracted reference, definition, or import.
 ///
 /// Universal across languages — Go, Python, JS, etc. all produce these.

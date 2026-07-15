@@ -40,6 +40,47 @@
 //! [`CellComplex::consistency_analysis`] returns a section-dependent
 //! partition + defect — useful as a cache heuristic, not literal H⁰.
 //!
+//! ## What's load-bearing vs what's a proxy
+//!
+//! Read this before the code — it answers "is Čech cohomology
+//! load-bearing, or résumé-driven math?"
+//!
+//! **Load-bearing (real signal, wire-checked).** The defect metric
+//! `Σ‖δ⁰(stalks)‖²` is a genuine H⁰ distance — the coboundary operator
+//! δ⁰ is the actual sheaf-cohomology invariant and drives the
+//! per-cache-entry health metric that `daemon.sheaf.health` exports.
+//! [`CellComplex::h0_dimension`] computes the algebraic H⁰ dimension
+//! (independent of the current section) and is used by the ADR-0020
+//! agreement op.
+//!
+//! **Proxy for the wire path.** `SheafCache::on_change` uses an
+//! XOR-Merkle pre-filter + a bounded restriction-graph BFS as its
+//! fast path; the δ⁰-driven eviction is implemented but gated on the
+//! ADR-0020 falsifiability pass. The XOR pre-filter is honest — it's
+//! shaped by the sheaf but is not the literal δ⁰ output. The health
+//! metric (real δ⁰) runs in parallel so we can tell when the proxy
+//! diverges from truth.
+//!
+//! ## Kill criteria
+//!
+//! Falsification suite lives at `tests/falsifiability_gates.rs`
+//! (already shipping). Two invariants guard the load-bearing claims:
+//!
+//! - **Claim 1**: `CellComplex::detect_violations` returns exactly the
+//!   entries whose stalk change moves the boundary projection past
+//!   `DELTA0_EPS` in norm space.
+//! - **Claim 2**: `SheafCache::on_change` invalidates only
+//!   restriction-graph-reachable entries (no false positives, no
+//!   silent under-eviction on graph-transitive changes).
+//!
+//! Runtime falsification harness: the `sheaf_ablation` daemon op logs
+//! per-invalidation deltas; `docs/research/sheaf-ablation-study.md`
+//! documents the ablation methodology and the 91× reframing — a
+//! negative result made into a positive claim (the correct
+//! kill-criteria shape). ADR-0020 Gate 3 uses the `test-spies`
+//! feature's atomic reach-counter to falsify mechanical-reach claims
+//! on the `agreement` op.
+//!
 //! ## Provenance
 //!
 //! Lifted from the private `ley-line` repo into ley-line-open (AGPL-3)

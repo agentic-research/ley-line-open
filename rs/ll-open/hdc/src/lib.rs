@@ -1,21 +1,76 @@
 //! Hyperdimensional Computing (HDC) for structural code search.
 //!
-//! Provides per-scope hypervectors over multiple topology layers (AST, module,
-//! semantic, temporal, optionally HIR) plus a combined-view BLOB for fast
-//! prefilter queries. Hypervectors live in `_hdc*` sidecar tables; queries are
+//! Per-scope hypervectors over multiple topology layers (AST, module,
+//! semantic, temporal, optionally HIR) + a combined-view BLOB for fast
+//! prefilter. Hypervectors live in `_hdc*` sidecar tables; queries are
 //! popcount-distance over BLOBs.
 //!
-//! See `bead ley-line-open-96b1a9` for the full design rationale and the
-//! per-layer codebook plan. This crate ships the storage substrate (`hdc-1`);
-//! codebooks and encoders land in subsequent beads.
+//! Design rationale in bead `ley-line-open-96b1a9`; kill criteria and the
+//! phase-plan for compositional-vs-distance validation live in
+//! `docs/adr/0025-hdc-compositional-validation.md`.
+//!
+//! ## What's load-bearing vs what's a proxy
+//!
+//! Read this before the code — it answers "is this real signal or is this
+//! résumé-driven math?"
+//!
+//! **Load-bearing (real signal, empirically confirmed).** HDC-distance
+//! retrieval, measured under weighted score-fusion against a dense
+//! embedding baseline: **+7.7%** recall\@10 uplift (kernel-RBF, α=0.40;
+//! `phase_0b_real_ground_truth.rs`, 36 ground-truth groups, K=10). That's
+//! the lower bound of HDC's value-add — the weakest of five measurement
+//! axes (see ADR-0025 §"The honest framing"). The crate ships that
+//! retrieval mode today; every consumer (mache, cloister) rides it.
+//!
+//! **Proxy for what's coming, not yet validated.** Compositional query
+//! via role-bind (ADR-0025 Phase α/β/γ/δ) is designed but not shipped.
+//! Sequence retrieval via permute is stubbed for child-position only.
+//! The item-memory / clean-up codebook pattern is not implemented.
+//! These are the "HDC is genuinely different from a dense embedding"
+//! surfaces; ADR-0025 pre-registers the falsification thresholds that
+//! decide whether they earn a place in the substrate.
+//!
+//! ## Kill criteria
+//!
+//! ADR-0025 commits to falsifying "HDC has compositional value beyond
+//! distance retrieval" via four phases with explicit go/no-go bars. If
+//! Phase δ's compositional-query lift over vec-only fusion doesn't clear
+//! the pre-registered threshold, the phase is a documented negative
+//! result and the compositional channel does not ship — the substrate
+//! stays at ADR-0024's v0.5.0 distance-retrieval mode and this crate's
+//! scope narrows accordingly.
+//!
+//! Sheaf-layer kill criteria for HDC's use as a δ⁰ input live in
+//! `sheaf/tests/falsifiability_gates.rs` (invalidation reachability,
+//! cascade-truncation bounds). The `sheaf_ablation` daemon op is the
+//! runtime falsification harness — the 91× reframing in
+//! `docs/research/sheaf-ablation-study.md` is a negative result made
+//! into a positive claim, exactly the shape a real kill-criteria pass
+//! produces.
 //!
 //! ## Hypervector dimensionality
 //!
-//! D = 8192 bits per vector — 1024 bytes BLOB, byte-aligned for SIMD popcount.
-//! Math-friend review: D=8192 leaves ~7× capacity margin per layer for typical
-//! AST function sizes (50-150 nodes), so flat bundles stay discriminable. For
-//! deeper trees the encoder uses recursive (hierarchical) bundling, which
-//! sidesteps the saturation ceiling on flat bundles.
+//! `D_BITS = 8192` — 1024-byte BLOB, byte-aligned for SIMD popcount.
+//!
+//! Why 8192 specifically (and not 4096 or 16384): capacity math on the
+//! typical AST function size (50–150 nodes) leaves ~7× margin per layer
+//! at D=8192 so flat bundles stay discriminable well past the saturation
+//! ceiling. D=4096 halved the margin and started blurring 100+ node
+//! functions; D=16384 doubled the BLOB size and the popcount cost with
+//! no observed retrieval gain. 8192 is the empirically-tuned choice.
+//!
+//! Why byte-aligned (1024 bytes = 128 × u64): the popcount inner loop is
+//! `pdep`/`popcnt` on u64 chunks with AVX2 / NEON codegen — a
+//! misalignment would force scalar fallback and dominate query latency.
+//! Compile-time assertions in this file pin `D_BYTES == 1024` so a
+//! future D change that breaks alignment fails at build time, not on
+//! benchmarks.
+//!
+//! Deep trees use hierarchical bind+bundle (Plate 1994 / Schlegel 2022)
+//! — the encoder recursively folds child hypervectors so a perturbation
+//! that would be D/2 at the leaf attenuates to ≈ D/(F^depth) at the
+//! root (fan-out F). See [`encoder`] docstring for the derivation and
+//! the measured signal margins at typical AST shapes (depth 5–7).
 
 pub mod calibrate;
 pub mod canonical;

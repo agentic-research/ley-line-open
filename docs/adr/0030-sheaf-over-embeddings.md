@@ -117,10 +117,26 @@ uncorrelated with fact-stability → surface-embedding distance does not predict
 derived-fact stability → decoration confirmed, ship the BFS. This rung tests the
 one question the whole ADR hinges on.
 
-**Rung 3 — safety invariant (`d53329`).** Establish and test that `node_hash` is
-checked under the δ⁰ skip decision; inject a deliberate δ⁰ false-negative and
-assert the consumer still receives correct facts. Makes Rung 2's FN rate a
-performance cost, not a correctness bug. Parallel with Rung 1/2.
+**Rung 3 — safety invariant (`d53329`). HOLDS (2026-07-15).** Establish and test
+that `node_hash` is checked under the δ⁰ skip decision; inject a deliberate δ⁰
+false-negative and assert the consumer still receives correct facts. Makes Rung
+2's FN rate a performance cost, not a correctness bug. Parallel with Rung 1/2.
+
+*Result (measured, guard-path trace in bead d53329 + `cli-lib/tests/sheaf_skip_safety.rs`):*
+the floor is stronger than "underneath" — the δ⁰ skip is entirely **off** the
+fact-derivation and fact-serving paths. `SheafCache::on_change` / `reap` are
+consumed only by `daemon/sheaf_ops.rs`, which emits an advisory
+`daemon.sheaf.invalidate` event; `cmd_parse` re-derives on `epoch + mtime + size`
+and content-addresses every fact by `node_hash` (`_source.content_hash`,
+`_ast.node_hash`, `node_content` PK), reading nothing from the sheaf; query
+commands read facts straight from the node_hash-keyed tables. There is no code
+path where a δ⁰ skip can suppress a re-derivation whose `node_hash` would differ,
+so a δ⁰ false-negative degrades to unnecessary revalidation the hash catches,
+never stale-served facts. `sheaf_skip_safety.rs` pins this: it injects a real
+`SheafCache` δ⁰ false-negative (sub-`DELTA0_EPS` boundary-embedding move while the
+merkle/node-hash stalk changes) and asserts the node_hash floor still delivers
+the re-derived facts; the test fails if the floor term is removed from the
+consumer's refresh decision. No correctness gap found.
 
 ## The open question this exists to settle
 

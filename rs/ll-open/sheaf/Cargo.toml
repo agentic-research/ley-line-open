@@ -29,3 +29,10 @@ sha2 = "0.11"
 # ships single-threaded. Kept as a dev-dep so leyline-sheaf's
 # published API stays parking_lot-independent.
 parking_lot = { workspace = true }
+# Rung-1 (ADR-0030, bead ley-line-open-d4e605): the embedding-stalk
+# divergence test builds locality-preserving hypervector stalks from
+# region bytes using the HDC substrate's own `bytes_to_hv` +
+# popcount-distance primitives, then feeds them through the sheaf's
+# real `edge_violation_squared`. Dev-dep only — production `leyline-sheaf`
+# stays HDC-independent (the swap is not shipped, only falsified).
+leyline-hdc = { path = "../hdc" }

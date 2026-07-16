@@ -1,6 +1,6 @@
 # ADR-0030 — Sheaf over embeddings: making δ⁰ load-bearing
 
-**Status:** Proposed (2026-07-16)
+**Status:** Rejected — NO-GO (2026-07-16). The full ladder ran; verdict below. Adopt `716c69`'s reframe.
 **Bead:** `ley-line-open-d4b72e`
 **Related:**
 - `ley-line-open-716c69` (necessity audit — δ⁰ reduces to a hash-gated reverse-dep BFS on all OSS-live inputs)
@@ -58,7 +58,45 @@ The distinction is not "hash vs vector" — a SHA-256 *is* a vector. It is
 **avalanche (locality-destroying) vs locality-preserving.** The sheaf is wired to
 the wrong one.
 
-## Decision
+## Verdict (2026-07-16) — NO-GO, ladder complete
+
+All four rungs ran. Result: **reject.** Detail in
+`docs/research/sheaf-over-embeddings-value-experiment.md`.
+
+- **Rung 0** ✓ — δ⁰ on SHA stalks == a hash-gated reverse-dep BFS on every input.
+- **Rung 1** ✓ — a locality-preserving stalk de-degenerates δ⁰ (cosmetic reflow:
+  d/D=0.039 < EPS=0.10 while the hash flips). But the byte-surface stalk is
+  *anti-correlated* with fact change (rename moved it farther than a real edit).
+- **Rung 3** ✓ — the node_hash floor sits under the δ⁰ skip (today the skip is
+  advisory-only, off the fact path entirely); a false-negative degrades to
+  revalidation, never stale-served. Safe to be lossy — if it were worth being.
+- **Rung 2** ✗ — the deciding rung. A rename-invariant **AST-structural** stalk
+  passed the discrimination gate (meaningful > cosmetic, fixing Rung 1's
+  inversion) and, over a git-replay of LLO's own `rs/` (1960 region-edits / 572
+  commits, free re-derivation oracle), showed **real but insufficient** signal:
+  mean d/D = 0.111 (facts changed) vs 0.028 (unchanged), ~4× separation, ROC not
+  diagonal. It fails the safety bar anyway: EPS=0.02 → 60% skip-rate at **10.1%
+  false-negative**; and **19 fact-changing edits are structurally invisible**
+  (d/D=0 — a pure callee swap changes the *ref* but not the node-*kind*
+  structure), an irreducible ~1.7% FN floor. No EPS band delivers meaningful
+  true-skip at near-zero FN — the ADR's own falsification condition.
+
+**Why it fails, structurally.** The facts the sheaf would gate (`node_refs`) are
+**identifier-keyed**, but the stalk must exclude identifiers to be
+rename-invariant. Those two requirements pull in opposite directions: a
+structure-only embedding is blind to exactly the identifier-level changes that
+move the facts. And since every edit changes bytes, the exact hash gate dominates
+regardless — the same degeneracy `716c69` found.
+
+**Decision: adopt `716c69`.** Ship the honest hash-gated reverse-dep BFS; keep the
+health metric and agreement/`h0_dimension` ops (real and separate); do **not**
+wire locality-preserving stalks into the invalidation path; do not pursue the
+non-axis-aligned restriction-map follow-on. The ladder cost four small
+experiments and bought a definitive answer instead of a rewrite built on a hunch.
+
+---
+
+## Decision (original proposal — superseded by the verdict above)
 
 Pursue — **gated by a falsification ladder, not committed up front** — replacing
 the sheaf's cryptographic stalks with locality-preserving ones (HDC hypervector

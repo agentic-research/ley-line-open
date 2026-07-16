@@ -3387,6 +3387,7 @@ version = "0.8.0"
 dependencies = [
  "anyhow",
  "leyline-hdc",
+ "leyline-ts",
  "log",
  "nalgebra",
  "nalgebra-sparse",
@@ -3394,6 +3395,7 @@ dependencies = [
  "serde",
  "sha2 0.11.0",
  "thiserror 2.0.18",
+ "tree-sitter",
 ]
 
 [[package]]

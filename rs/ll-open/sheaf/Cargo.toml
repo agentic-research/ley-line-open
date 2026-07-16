@@ -36,3 +36,15 @@ parking_lot = { workspace = true }
 # real `edge_violation_squared`. Dev-dep only — production `leyline-sheaf`
 # stays HDC-independent (the swap is not shipped, only falsified).
 leyline-hdc = { path = "../hdc" }
+# Rung-2 (ADR-0030, bead ley-line-open-d50164): the AST-structural
+# value experiment. The discrimination test + git-replay bench build a
+# RENAME-INVARIANT structural stalk (an HV over the tree-sitter
+# node-kind sequence) and the FREE ORACLE (re-derive node_defs/node_refs
+# via `leyline_ts::refs::extract_rust`). Dev/bench-dep only — production
+# `leyline-sheaf` stays HDC- and parser-independent.
+leyline-ts = { path = "../ts", features = ["rust"] }
+tree-sitter = { workspace = true }
+
+[[bench]]
+name = "git_replay_invalidation"
+harness = false

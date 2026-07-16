@@ -146,20 +146,48 @@ That is the ADR's own falsification condition, arrived at with a number.
 ## Why the correlation, though real, cannot pay rent
 
 The ADR's safety model (Rung 3) says a δ⁰ false-negative should degrade to
-"unnecessary revalidation the hash catches, never stale served." But every edit
-in this corpus changed BYTES, so `node_hash` differs for **100%** of them. That
-forces the dilemma the necessity audit (`716c69`) already identified:
+"unnecessary revalidation the hash catches, never stale served." The real
+question is whether the embedding-skip adds anything *over the node_hash gate
+that already exists*. It does not — and stating it precisely sharpens why.
 
-- If the δ⁰-skip is trusted *without* re-checking the hash, ~10% of skips (at the
-  only useful EPS) serve stale facts — a correctness regression.
-- If the hash IS re-checked after a δ⁰-skip, it says "changed" for every edit and
-  re-derivation runs anyway — the skip saves nothing.
+`node_hash` is whitespace-insensitive (ADR-0027 merkle-AST content address), so
+it already skips re-derivation for free on whitespace-only edits; the embedding
+adds nothing there. The embedding's only *incremental* value is on edits where
+the tokens change but the facts do not (`node_hash` differs, facts stable) — the
+one class the hash gate cannot skip. But that is exactly the class where the ~10%
+false-negative lives: a rename-invariant stalk cannot separate
+token-changing-fact-preserving from token-changing-fact-changing edits, because
+the discriminating signal (the identifier tokens) is what it deliberately
+excludes. So:
 
-Either way the hash gate dominates. The structural stalk's genuine 4×
-separation is not strong enough to open a safe operating point between these two
-failure modes. The blind spot (structure-preserving fact changes: callee swaps,
-argument swaps, literal↔identifier) is intrinsic to a rename-invariant
-representation and is where the value proposition dies.
+- Trust the δ⁰-skip *without* re-checking the hash → ~10% of skips (at the only
+  useful EPS) serve stale facts — a correctness regression.
+- Re-check the hash after a δ⁰-skip → on the whitespace class the hash already
+  skipped for free (no gain); on the token-changing class the hash says "changed"
+  and re-derivation runs anyway (no saving).
+
+Either way the incremental value over the plain `node_hash` gate is nil or
+negative. The structural stalk's genuine 4× separation is not strong enough to
+open a safe operating point. The blind spot (structure-preserving fact changes:
+callee swaps, argument swaps, literal↔identifier) is intrinsic to a
+rename-invariant representation and is where the value proposition dies.
+
+## Caveats from independent review (verdict unchanged; all conservative)
+
+An independent code-level re-check of the bench (not the summary) confirmed the
+confusion matrix, the measured FN floor, and the blind-spot mechanism, and found
+two biases — both of which make the NO-GO *more* robust, not less:
+
+- **The 1.7% FN floor is a lower bound.** The replay aligns regions by
+  `name#occurrence`, so a *function rename* is excluded from the corpus — yet a
+  rename changes that function's own `node_defs` name (a real fact change) while
+  being structurally invisible (d=0). Counting it would raise the irreducible FN
+  floor above the measured 1.68%.
+- **Granularity gap (scope, not error).** This experiment operates on
+  function-AST regions; mache's production stalk is a community-level
+  cross-boundary-token SHA. The negative transfers in direction (rename-invariant
+  structure cannot see identifier-keyed facts) but the exact numbers are specific
+  to the function-region granularity tested here.
 
 ## Verdict: NO-GO on ADR-0030
 

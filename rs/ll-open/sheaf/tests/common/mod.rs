@@ -40,9 +40,13 @@
 
 use leyline_hdc::util::bytes_to_hv;
 use leyline_hdc::{D_BITS, D_BYTES, Hypervector, popcount_distance};
+use leyline_sheaf::restriction_cache::{
+    ContainerKeying, DefRow, FactSubstrate, ImportRow, RefRow, US,
+};
 use leyline_ts::languages::TsLanguage;
 use leyline_ts::refs::{ExtractedRef, extract_rust};
-use std::collections::BTreeSet;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use tree_sitter::{Node, Parser, Tree};
 
 // ---------------------------------------------------------------------------
@@ -224,4 +228,316 @@ fn walk_facts(node: Node<'_>, src: &[u8], facts: &mut BTreeSet<String>) {
 /// skipped this edit would serve stale `node_defs`/`node_refs`.
 pub fn facts_changed(before: &[u8], after: &[u8]) -> bool {
     derive_facts(before) != derive_facts(after)
+}
+
+// ===========================================================================
+// Restriction-addressed review cache (ADR-0031, bead ley-line-open-054048)
+//
+// Parser-dependent extraction that populates a parser-INDEPENDENT
+// `leyline_sheaf::restriction_cache::FactSubstrate` from Rust source. This
+// is the tree-sitter stand-in for the daemon's node_defs / node_refs /
+// _imports fact tables. It lives here (dev/bench shared) so the real-facts
+// test, the git-replay bench (`f3a81e`), and the second review family
+// (`f463aa`) all consult ONE extraction, and `leyline-sheaf` itself stays
+// parser-independent in production.
+// ===========================================================================
+
+/// Build a [`FactSubstrate`] from a multi-file corpus, deriving each
+/// function's container identity per `keying`. Fact rows are de-duplicated
+/// as sets (multiplicity of identical call sites does not enter the
+/// restriction or the review — the same set semantics as the rung-2
+/// oracle).
+pub fn build_substrate(corpus: &[(String, String)], keying: ContainerKeying) -> FactSubstrate {
+    let mut defs = BTreeSet::new();
+    let mut refs = BTreeSet::new();
+    let mut imports = BTreeSet::new();
+    let mut container_by_fn: BTreeMap<String, String> = BTreeMap::new();
+    for (path, src) in corpus {
+        let tree = parse_rust(src.as_bytes()).expect("fixture source must parse");
+        walk_extract(
+            tree.root_node(),
+            src.as_bytes(),
+            path,
+            path, // root node_id == source_id, mirroring cmd_parse's fold
+            None,
+            keying,
+            &mut defs,
+            &mut refs,
+            &mut imports,
+            &mut container_by_fn,
+        );
+    }
+    FactSubstrate::from_rows(
+        defs.into_iter().collect(),
+        refs.into_iter().collect(),
+        imports.into_iter().collect(),
+        container_by_fn,
+    )
+}
+
+/// Per-named-node fold mirroring the daemon's content-addressing walk.
+/// `extract_rust` is anchored (only patterns rooted at the node emit); the
+/// nearest enclosing `function_item`'s identity is threaded to its
+/// descendants as the container. `node_id` is the daemon-style positional
+/// AST path of `node` (`{parent}/{kind}[_{idx}]`), needed for
+/// [`ContainerKeying::Positional`].
+#[allow(clippy::too_many_arguments)]
+fn walk_extract(
+    node: Node<'_>,
+    src: &[u8],
+    source_id: &str,
+    node_id: &str,
+    container: Option<&str>,
+    keying: ContainerKeying,
+    defs: &mut BTreeSet<DefRow>,
+    refs: &mut BTreeSet<RefRow>,
+    imports: &mut BTreeSet<ImportRow>,
+    container_by_fn: &mut BTreeMap<String, String>,
+) {
+    // This node's own refs carry the ENCLOSING container (its function
+    // name-def is contained by the outer scope — matches cmd_parse).
+    for r in extract_rust(&node, src, "n", source_id, container) {
+        match r {
+            ExtractedRef::Def {
+                token,
+                canonical_kind,
+                ..
+            } => {
+                defs.insert(DefRow {
+                    token,
+                    source_id: source_id.to_string(),
+                    kind: canonical_kind.unwrap_or("?").to_string(),
+                });
+            }
+            ExtractedRef::Ref {
+                token,
+                qualifier,
+                container_node_id,
+                ..
+            } => {
+                refs.insert(RefRow {
+                    token,
+                    qualifier,
+                    container: container_node_id,
+                    source_id: source_id.to_string(),
+                });
+            }
+            ExtractedRef::Import { alias, path, .. } => {
+                imports.insert(ImportRow {
+                    alias,
+                    path,
+                    source_id: source_id.to_string(),
+                });
+            }
+        }
+    }
+
+    // If THIS node is a function, its subtree's container becomes the
+    // identity chosen by `keying`. Record name → id so a driver can resolve
+    // "review the function named F".
+    let own_container: Option<String> = (node.kind() == "function_item")
+        .then(|| node.child_by_field_name("name"))
+        .flatten()
+        .and_then(|n| n.utf8_text(src).ok())
+        .map(|name| {
+            let id = container_id(keying, node_id, node, src, name);
+            container_by_fn.insert(name.to_string(), id.clone());
+            id
+        });
+    let child_container = own_container.as_deref().or(container);
+
+    // Descend, assigning each named child its daemon-style positional
+    // node_id (`{kind}` or `{kind}_{idx}` for repeated same-kind siblings).
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    {
+        let mut c = node.walk();
+        for child in node.named_children(&mut c) {
+            *counts.entry(child.kind()).or_insert(0) += 1;
+        }
+    }
+    let mut idx: HashMap<&str, usize> = HashMap::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        let kind = child.kind();
+        let seg = if counts[kind] > 1 {
+            let i = idx.entry(kind).or_insert(0);
+            let s = format!("{kind}_{i}");
+            *i += 1;
+            s
+        } else {
+            kind.to_string()
+        };
+        let child_id = format!("{node_id}/{seg}");
+        walk_extract(
+            child,
+            src,
+            source_id,
+            &child_id,
+            child_container,
+            keying,
+            defs,
+            refs,
+            imports,
+            container_by_fn,
+        );
+    }
+}
+
+/// Resolve a function's container identity string under `keying`.
+///
+/// - `Name` → `fn:{name}` (the original experiment's key).
+/// - `Positional` → the daemon's `container_node_id`: the positional AST
+///   path. SHIFTS when a function is inserted above `F` (its `_{idx}`
+///   sibling suffix moves). Reproduces ADR-0031 caveat #1.
+/// - `Stable` → a reflow-invariant node_hash-style identity: the
+///   [`signature_node_hash`] of `F`. Position- and body-invariant.
+fn container_id(
+    keying: ContainerKeying,
+    node_id: &str,
+    node: Node<'_>,
+    src: &[u8],
+    name: &str,
+) -> String {
+    match keying {
+        ContainerKeying::Name => format!("fn:{name}"),
+        ContainerKeying::Positional => node_id.to_string(),
+        ContainerKeying::Stable => {
+            let h = signature_node_hash(node, src);
+            let mut s = String::with_capacity(2 + 64);
+            s.push_str("h:");
+            for b in h {
+                s.push_str(&format!("{b:02x}"));
+            }
+            s
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// node_hash-style stable container identity (ADR-0027 stand-in)
+// ---------------------------------------------------------------------------
+//
+// Reflow-invariant identity for the container, computed the SAME WAY as
+// ADR-0027's merkle-AST node_hash (bottom-up hash over canonical kind +
+// terminal token, source order; spans / positions OUT), but over F's
+// SIGNATURE subtree (function_item minus its `body` block) so it is also
+// BODY-invariant.
+//
+// Body-invariance is required, not incidental: the whole-function
+// node_hash changes on any body edit, which would defeat the load-bearing
+// body-only true-skips (local-rename, body-arith). Excluding the body
+// keeps those skips while still invalidating on a signature change.
+//
+// Two deliberate stand-in deviations from cmd_parse's production node_hash,
+// documented for the f38a86-follow-up integration (see final report):
+//   1. SHA-256 (leyline-sheaf's hash), not BLAKE3 — the container id is an
+//      opaque string; only the reflow/body invariance matters here.
+//   2. raw tree-sitter `node.kind()`, not `TsLanguage::canonical_kind`
+//      (κ canonicalization lives in leyline-ts, which production would use).
+// The DOMAIN below is distinct from `llo/ast/v1` so a stand-in hash can
+// never be mistaken for a production node_hash.
+
+const SIG_HASH_DOMAIN: &[u8] = b"llo/sheaf/restriction-cache/sig/v1";
+const SIG_TAG_LEAF: u8 = 0x00;
+const SIG_TAG_INTERNAL: u8 = 0x01;
+
+fn sig_write_uvarint(buf: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            buf.push(byte);
+            break;
+        }
+        buf.push(byte | 0x80);
+    }
+}
+
+fn sig_hash_leaf(kind: &str, token: &str) -> [u8; 32] {
+    let mut p = Vec::with_capacity(SIG_HASH_DOMAIN.len() + 8 + kind.len() + token.len());
+    p.extend_from_slice(SIG_HASH_DOMAIN);
+    p.push(SIG_TAG_LEAF);
+    sig_write_uvarint(&mut p, kind.len() as u64);
+    p.extend_from_slice(kind.as_bytes());
+    sig_write_uvarint(&mut p, token.len() as u64);
+    p.extend_from_slice(token.as_bytes());
+    Sha256::digest(&p).into()
+}
+
+fn sig_hash_internal(kind: &str, child_hashes: &[[u8; 32]]) -> [u8; 32] {
+    let mut p =
+        Vec::with_capacity(SIG_HASH_DOMAIN.len() + 8 + kind.len() + child_hashes.len() * 32);
+    p.extend_from_slice(SIG_HASH_DOMAIN);
+    p.push(SIG_TAG_INTERNAL);
+    sig_write_uvarint(&mut p, kind.len() as u64);
+    p.extend_from_slice(kind.as_bytes());
+    sig_write_uvarint(&mut p, child_hashes.len() as u64);
+    for h in child_hashes {
+        p.extend_from_slice(h);
+    }
+    Sha256::digest(&p).into()
+}
+
+/// Whole-subtree node_hash (kind + token, source order, position-blind).
+fn node_hash(node: Node<'_>, src: &[u8]) -> [u8; 32] {
+    let mut children: Vec<Node<'_>> = Vec::new();
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            let ch = cursor.node();
+            if !ch.is_extra() {
+                children.push(ch);
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    if children.is_empty() {
+        let token = node.utf8_text(src).unwrap_or("");
+        sig_hash_leaf(node.kind(), token)
+    } else {
+        let child_hashes: Vec<[u8; 32]> = children.iter().map(|c| node_hash(*c, src)).collect();
+        sig_hash_internal(node.kind(), &child_hashes)
+    }
+}
+
+/// The container's stable identity: `node_hash` of the function's
+/// SIGNATURE — its non-extra children in source order, EXCLUDING the `body`
+/// field (a.k.a. the `block`). Reflow-invariant (no spans) and
+/// body-invariant (no block), collision-resistant across signatures.
+fn signature_node_hash(func: Node<'_>, src: &[u8]) -> [u8; 32] {
+    let mut child_hashes: Vec<[u8; 32]> = Vec::new();
+    let mut cursor = func.walk();
+    if cursor.goto_first_child() {
+        loop {
+            let ch = cursor.node();
+            let is_body = cursor.field_name() == Some("body") || ch.kind() == "block";
+            if !ch.is_extra() && !is_body {
+                child_hashes.push(node_hash(ch, src));
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    sig_hash_internal(func.kind(), &child_hashes)
+}
+
+// ---------------------------------------------------------------------------
+// Parser-dependent baseline policy: the identifier-blind AST-shape hash.
+// ---------------------------------------------------------------------------
+
+/// Identifier-blind structural hash: the pre-order named-node kind sequence
+/// of every file (ADR-0030 rung 2's representation, exact-hashed). Parser-
+/// dependent, so it stays in the extraction layer.
+pub fn ast_shape_hash(corpus: &[(String, String)]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    for (path, src) in corpus {
+        let tree = parse_rust(src.as_bytes()).expect("fixture source must parse");
+        let mut kinds: Vec<&'static str> = Vec::new();
+        kind_sequence(tree.root_node(), &mut kinds);
+        h.update(format!("{path}{US}{}\n", kinds.join("\u{1f}")).as_bytes());
+    }
+    h.finalize().into()
 }

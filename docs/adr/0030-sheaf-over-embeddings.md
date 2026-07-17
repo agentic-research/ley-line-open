@@ -1,6 +1,6 @@
 # ADR-0030 — Sheaf over embeddings: making δ⁰ load-bearing
 
-**Status:** Rejected — NO-GO (2026-07-16). The full ladder ran; verdict below. Adopt `716c69`'s reframe.
+**Status:** Rejected — NO-GO (2026-07-16). The full ladder ran; verdict below. Adopt `716c69`'s reframe. **Addendum (2026-07-17): the NO-GO is scoped to *approximate* stalk-distance gating; the *exact* restriction-addressed variant is a positive result — see the addendum below and ADR-0031.**
 **Bead:** `ley-line-open-d4b72e`
 **Related:**
 - `ley-line-open-716c69` (necessity audit — δ⁰ reduces to a hash-gated reverse-dep BFS on all OSS-live inputs)
@@ -93,6 +93,37 @@ health metric and agreement/`h0_dimension` ops (real and separate); do **not**
 wire locality-preserving stalks into the invalidation path; do not pursue the
 non-axis-aligned restriction-map follow-on. The ladder cost four small
 experiments and bought a definitive answer instead of a rewrite built on a hunch.
+
+---
+
+## Addendum (2026-07-17) — the NO-GO does not generalize; the exact variant works
+
+This ADR is **not** wrong and is **not** reversed. Its NO-GO is specific: using an
+**approximate** embedding-stalk *distance* (δ⁰ + an EPS threshold) as a
+cache-invalidation skip gate. That result stands.
+
+A later experiment (commit `5b5b97c` on `codex-restriction-ast-review-toy`;
+`docs/research/restriction-addressed-review-real-facts.md`) tested a **different
+mechanism** and got a **positive** result: **restriction-addressed** caching — key
+an expensive derived-view (a code-review fact) on the **exact hash of the
+consumer's input closure** (the specific substrate rows the review observes),
+computed over LLO's real facts (`node_refs`/`node_defs`/`qualifier`/
+`container_node_id`/`_imports`). No embedding, no threshold, no distance — **exact
+identity**. It is sound by construction, tighter than the whole-object hash, and
+cheaper than the review at scale. Full write-up: **ADR-0031**.
+
+The intellectually honest distinction, and the whole prize:
+
+> **Restriction maps earned rent. Cohomology did not.**
+>
+> The sheaf-shaped restriction/topology structure is load-bearing for multi-object
+> derived-view caching; δ⁰/H⁰/cohomological machinery remains **unused** for this
+> cache-soundness result.
+
+The experiment succeeds precisely by **discarding** the cohomology and keeping only
+the topology (a restriction that projects onto — and, load-bearingly, *spans* —
+the objects a consumer observes). So `716c69`'s finding that the δ⁰ machinery is
+decoration **still holds**; the positive result does not revive it.
 
 ---
 

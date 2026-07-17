@@ -17,7 +17,7 @@ The harness models these cache keys:
 
 - `object_hash`: whole source identity.
 - `ast_shape_hash`: structure-only AST shape, intentionally identifier-blind.
-- `review_restriction_hash`: the fact-specific observable boundary used by a
+- per-fact `review_restriction_hash`: the observable boundary used by one
   review fact.
 
 The harness models these review facts:
@@ -42,14 +42,35 @@ cases. The test output is the artifact: a table of edit scenarios showing which
 policies would skip, whether the review facts changed, and whether a skip would
 be false.
 
+## Review-Driven Corrections
+
+Claude's review caught an important circularity in the first spike:
+`review_restriction_hash` was originally the hash of the same combined snapshot
+that the oracle compared. That made the "no false skips" column true by
+construction.
+
+The corrected toy keeps cheap review observables separate from policy outcomes
+and exposes per-fact restriction outcomes. It also adds a non-whitespace,
+fact-irrelevant local rename fixture. That fixture demonstrates the useful case
+where whole-object CAS recomputes but the fact-specific review restriction can
+skip.
+
+This still does not prove the economic claim. The real follow-up is to replace
+the toy parser's observables with LLO's existing fact tables, especially
+`node_refs`, `node_defs`, `qualifier`, and `container_node_id`, then gate an
+expensive review result on cheap exact restrictions.
+
 ## Invariants
 
 - Whitespace/comment-only edits should change the whole-object hash but leave
   review restrictions stable and safely skippable.
-- Identifier-blind AST shape should falsely skip pure callee swaps and `unwrap`
-  introductions.
+- Identifier-blind AST shape should falsely skip pure callee swaps, `unwrap`
+  introductions, branch condition changes, import changes, and public signature
+  changes.
 - Fact-specific review restrictions should not falsely skip any fixture where
   review facts change.
+- Fact-specific review restrictions should skip a non-whitespace local rename
+  whose review observables are unchanged.
 - No approximate embedding threshold participates in the decision.
 
 ## Non-Goals
@@ -58,3 +79,5 @@ be false.
 - No daemon op.
 - No production cache eviction change.
 - No claim that the toy parser is a real Rust parser.
+- No claim that the toy proves runtime economics; restriction extraction must be
+  cheaper than the gated review in the real system.

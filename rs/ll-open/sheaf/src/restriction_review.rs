@@ -3,8 +3,8 @@
 //! This module is deliberately narrow. It is not a Rust parser and it does
 //! not participate in production cache invalidation. It exists to make the
 //! ADR-0030 reframe executable: compare a whole-object hash, an
-//! identifier-blind AST-shape hash, and a fact-specific review restriction
-//! hash against review facts derived from the same toy AST.
+//! identifier-blind AST-shape hash, and fact-specific review restriction
+//! hashes against review facts derived from cheap observables.
 
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -34,9 +34,19 @@ pub struct PolicyOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FactPolicyOutcome {
+    pub fact: ReviewFactKind,
+    pub policy: CachePolicy,
+    pub would_skip: bool,
+    pub false_skip: bool,
+    pub saved_recompute: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScenarioReport {
     pub changed_facts: BTreeSet<ReviewFactKind>,
     pub outcomes: Vec<PolicyOutcome>,
+    pub fact_outcomes: Vec<FactPolicyOutcome>,
 }
 
 impl ScenarioReport {
@@ -44,6 +54,16 @@ impl ScenarioReport {
         self.outcomes
             .iter()
             .find(|outcome| outcome.policy == policy)
+    }
+
+    pub fn fact_outcome(
+        &self,
+        fact: ReviewFactKind,
+        policy: CachePolicy,
+    ) -> Option<&FactPolicyOutcome> {
+        self.fact_outcomes
+            .iter()
+            .find(|outcome| outcome.fact == fact && outcome.policy == policy)
     }
 
     pub fn as_table_row(&self, label: &str) -> String {
@@ -72,11 +92,11 @@ impl ScenarioReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ToyAst {
     shape: Vec<String>,
-    review: ReviewSnapshot,
+    observables: ReviewObservables,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ReviewSnapshot {
+struct ReviewObservables {
     uses_unwrap: bool,
     public_signatures: BTreeSet<String>,
     call_targets: BTreeSet<String>,
@@ -88,7 +108,7 @@ struct ReviewSnapshot {
 struct CacheKeys {
     object: [u8; 32],
     ast_shape: [u8; 32],
-    review_restriction: [u8; 32],
+    review_restrictions: Vec<(ReviewFactKind, [u8; 32])>,
 }
 
 pub fn compare_review_cache(before: &str, after: &str) -> ScenarioReport {
@@ -96,7 +116,7 @@ pub fn compare_review_cache(before: &str, after: &str) -> ScenarioReport {
     let after_ast = parse_toy_ast(after);
     let before_keys = cache_keys(before, &before_ast);
     let after_keys = cache_keys(after, &after_ast);
-    let changed_facts = changed_review_facts(&before_ast.review, &after_ast.review);
+    let changed_facts = changed_review_facts(&before_ast.observables, &after_ast.observables);
     let facts_changed = !changed_facts.is_empty();
 
     let policies = [
@@ -110,7 +130,7 @@ pub fn compare_review_cache(before: &str, after: &str) -> ScenarioReport {
         ),
         (
             CachePolicy::ReviewRestriction,
-            before_keys.review_restriction == after_keys.review_restriction,
+            before_keys.review_restrictions == after_keys.review_restrictions,
         ),
     ];
     let outcomes = policies
@@ -122,10 +142,12 @@ pub fn compare_review_cache(before: &str, after: &str) -> ScenarioReport {
             saved_recompute: would_skip && !facts_changed,
         })
         .collect();
+    let fact_outcomes = fact_policy_outcomes(&before_keys, &after_keys, &changed_facts);
 
     ScenarioReport {
         changed_facts,
         outcomes,
+        fact_outcomes,
     }
 }
 
@@ -133,8 +155,42 @@ fn cache_keys(source: &str, ast: &ToyAst) -> CacheKeys {
     CacheKeys {
         object: hash_bytes(source.as_bytes()),
         ast_shape: hash_bytes(ast.shape.join("\n").as_bytes()),
-        review_restriction: hash_bytes(ast.review.canonical().as_bytes()),
+        review_restrictions: ast.observables.restriction_hashes(),
     }
+}
+
+fn fact_policy_outcomes(
+    before_keys: &CacheKeys,
+    after_keys: &CacheKeys,
+    changed_facts: &BTreeSet<ReviewFactKind>,
+) -> Vec<FactPolicyOutcome> {
+    all_review_facts()
+        .into_iter()
+        .flat_map(|fact| {
+            let fact_changed = changed_facts.contains(&fact);
+            let fact_restriction_unchanged =
+                restriction_hash(before_keys, fact) == restriction_hash(after_keys, fact);
+            [
+                (
+                    CachePolicy::WholeObject,
+                    before_keys.object == after_keys.object,
+                ),
+                (
+                    CachePolicy::AstShape,
+                    before_keys.ast_shape == after_keys.ast_shape,
+                ),
+                (CachePolicy::ReviewRestriction, fact_restriction_unchanged),
+            ]
+            .into_iter()
+            .map(move |(policy, would_skip)| FactPolicyOutcome {
+                fact,
+                policy,
+                would_skip,
+                false_skip: would_skip && fact_changed,
+                saved_recompute: would_skip && !fact_changed,
+            })
+        })
+        .collect()
 }
 
 fn parse_toy_ast(source: &str) -> ToyAst {
@@ -173,7 +229,7 @@ fn parse_toy_ast(source: &str) -> ToyAst {
 
     ToyAst {
         shape,
-        review: ReviewSnapshot {
+        observables: ReviewObservables {
             uses_unwrap,
             public_signatures,
             call_targets,
@@ -184,8 +240,8 @@ fn parse_toy_ast(source: &str) -> ToyAst {
 }
 
 fn changed_review_facts(
-    before: &ReviewSnapshot,
-    after: &ReviewSnapshot,
+    before: &ReviewObservables,
+    after: &ReviewObservables,
 ) -> BTreeSet<ReviewFactKind> {
     let mut changed = BTreeSet::new();
     if before.uses_unwrap != after.uses_unwrap {
@@ -206,17 +262,44 @@ fn changed_review_facts(
     changed
 }
 
-impl ReviewSnapshot {
-    fn canonical(&self) -> String {
-        format!(
-            "unwrap={}\npublic={}\nimports={}\ncalls={}\nbranches={}",
-            self.uses_unwrap,
-            join_set(&self.public_signatures),
-            join_set(&self.imports),
-            join_set(&self.call_targets),
-            join_set(&self.branch_conditions)
-        )
+impl ReviewObservables {
+    fn restriction_hashes(&self) -> Vec<(ReviewFactKind, [u8; 32])> {
+        all_review_facts()
+            .into_iter()
+            .map(|fact| (fact, hash_bytes(self.restriction_for(fact).as_bytes())))
+            .collect()
     }
+
+    fn restriction_for(&self, fact: ReviewFactKind) -> String {
+        match fact {
+            ReviewFactKind::UsesUnwrap => format!("unwrap={}", self.uses_unwrap),
+            ReviewFactKind::PublicSignatureChanged => {
+                format!("public={}", join_set(&self.public_signatures))
+            }
+            ReviewFactKind::CallTargetChanged => format!("calls={}", join_set(&self.call_targets)),
+            ReviewFactKind::ImportSurfaceChanged => format!("imports={}", join_set(&self.imports)),
+            ReviewFactKind::BranchConditionChanged => {
+                format!("branches={}", join_set(&self.branch_conditions))
+            }
+        }
+    }
+}
+
+fn all_review_facts() -> [ReviewFactKind; 5] {
+    [
+        ReviewFactKind::UsesUnwrap,
+        ReviewFactKind::PublicSignatureChanged,
+        ReviewFactKind::CallTargetChanged,
+        ReviewFactKind::ImportSurfaceChanged,
+        ReviewFactKind::BranchConditionChanged,
+    ]
+}
+
+fn restriction_hash(keys: &CacheKeys, fact: ReviewFactKind) -> [u8; 32] {
+    keys.review_restrictions
+        .iter()
+        .find_map(|(candidate, hash)| (*candidate == fact).then_some(*hash))
+        .expect("review restriction hash present")
 }
 
 fn shape_token(line: &str) -> String {

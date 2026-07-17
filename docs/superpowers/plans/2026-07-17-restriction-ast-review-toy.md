@@ -71,3 +71,15 @@ Commit message:
 - Spec coverage: the plan covers the toy parser, cache key comparison, and falsification fixtures.
 - Placeholder scan: no placeholder requirements remain.
 - Type consistency: the test imports match the planned public module and function names.
+
+### Reviewer Follow-Up: Remove Combined-Snapshot Circularity
+
+**Files:**
+- Modify: `rs/ll-open/sheaf/src/restriction_review.rs`
+- Modify: `rs/ll-open/sheaf/tests/restriction_review_toy.rs`
+- Modify: `docs/superpowers/specs/2026-07-17-restriction-ast-review-toy-design.md`
+
+- [x] Add a non-whitespace, fact-irrelevant local rename fixture.
+- [x] Add per-fact review restriction outcomes.
+- [x] Rename the toy's cheap review inputs as observables rather than review results.
+- [x] Document that the remaining real-system proof needs LLO fact tables and economics.

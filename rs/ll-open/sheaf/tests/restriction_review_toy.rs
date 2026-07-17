@@ -91,6 +91,32 @@ pub fn score(value: i64) -> i64 {
 }
 "#;
 
+const LOCAL_RENAME_BEFORE: &str = r#"
+use crate::math::compute_weight;
+
+pub fn score(value: i64) -> i64 {
+    let adjusted = value + 1;
+    if value > 10 {
+        compute_weight(value)
+    } else {
+        adjusted
+    }
+}
+"#;
+
+const LOCAL_RENAME_AFTER: &str = r#"
+use crate::math::compute_weight;
+
+pub fn score(value: i64) -> i64 {
+    let local_value = value + 1;
+    if value > 10 {
+        compute_weight(value)
+    } else {
+        local_value
+    }
+}
+"#;
+
 fn outcome(src: &str, policy: CachePolicy) -> bool {
     compare_review_cache(BEFORE, src)
         .outcome(policy)
@@ -102,6 +128,13 @@ fn skips(src: &str, policy: CachePolicy) -> bool {
     compare_review_cache(BEFORE, src)
         .outcome(policy)
         .expect("policy outcome present")
+        .would_skip
+}
+
+fn per_fact_skips(src: &str, fact: ReviewFactKind) -> bool {
+    compare_review_cache(BEFORE, src)
+        .fact_outcome(fact, CachePolicy::ReviewRestriction)
+        .expect("per-fact policy outcome present")
         .would_skip
 }
 
@@ -180,4 +213,56 @@ fn review_restrictions_catch_public_and_import_surface_changes() {
         assert!(!skips(src, CachePolicy::ReviewRestriction));
         assert!(!outcome(src, CachePolicy::ReviewRestriction));
     }
+}
+
+#[test]
+fn non_whitespace_fact_irrelevant_edit_is_a_real_safe_skip() {
+    let report = compare_review_cache(LOCAL_RENAME_BEFORE, LOCAL_RENAME_AFTER);
+    eprintln!("{}", report.as_table_row("local-rename"));
+
+    assert!(report.changed_facts.is_empty());
+    assert!(!report.outcome(CachePolicy::WholeObject).unwrap().would_skip);
+    assert!(report.outcome(CachePolicy::AstShape).unwrap().would_skip);
+    assert!(
+        report
+            .outcome(CachePolicy::ReviewRestriction)
+            .unwrap()
+            .would_skip
+    );
+    assert!(
+        report
+            .fact_outcome(
+                ReviewFactKind::CallTargetChanged,
+                CachePolicy::ReviewRestriction
+            )
+            .unwrap()
+            .saved_recompute
+    );
+}
+
+#[test]
+fn review_restrictions_are_per_fact_not_one_combined_key() {
+    let report = compare_review_cache(BEFORE, AFTER_CALLEE_SWAP);
+    eprintln!("{}", report.as_table_row("callee-swap-per"));
+
+    assert!(!per_fact_skips(
+        AFTER_CALLEE_SWAP,
+        ReviewFactKind::CallTargetChanged
+    ));
+    assert!(per_fact_skips(
+        AFTER_CALLEE_SWAP,
+        ReviewFactKind::PublicSignatureChanged
+    ));
+    assert!(per_fact_skips(
+        AFTER_CALLEE_SWAP,
+        ReviewFactKind::ImportSurfaceChanged
+    ));
+    assert!(per_fact_skips(
+        AFTER_CALLEE_SWAP,
+        ReviewFactKind::BranchConditionChanged
+    ));
+    assert!(per_fact_skips(
+        AFTER_CALLEE_SWAP,
+        ReviewFactKind::UsesUnwrap
+    ));
 }

@@ -31,9 +31,35 @@
 //! A **sheaf** assigns data (stalks) to topological regions and enforces
 //! consistency across boundaries via restriction maps. The coboundary
 //! operator δ⁰: C⁰ → C¹ measures disagreement between adjacent stalks; the
-//! defect `‖δ⁰(stalks)‖²` is a real H⁰ distance metric and the load-bearing
-//! "sheaf-derived" quantity this crate exports. Entries in `ker(δ⁰)` — the
-//! zeroth cohomology group H⁰ — are globally consistent.
+//! defect `‖δ⁰(stalks)‖²` is a real H⁰ distance metric — a health/diagnostic
+//! quantity this crate exports (`daemon.sheaf.health`). It drives no
+//! correctness decision. Entries in `ker(δ⁰)` — the zeroth cohomology group
+//! H⁰ — are globally consistent.
+//!
+//! ## Status: δ⁰ as a cache-invalidation gate is a settled NO-GO (2026-07-16)
+//!
+//! The falsification ladder in ADR-0030 (`docs/adr/0030-sheaf-over-embeddings.md`,
+//! bead `ley-line-open-d4b72e`) ran to completion. Established, with executed
+//! experiments where noted:
+//!
+//! - On every live input, the δ⁰ cascade reduces to a hash-gated reverse-dep
+//!   BFS — live stalks are SHA-256 (avalanche: no metric geometry) and live
+//!   restriction maps are static axis-aligned masks (necessity audit
+//!   `ley-line-open-716c69`; Rung 0).
+//! - Swapping in a locality-preserving (HDC / AST-structural) stalk to make δ⁰
+//!   a *semantic* skip gate is a **measured NO-GO** for code cache invalidation:
+//!   real signal (~4× class separation) but a ~1.7% irreducible false-negative
+//!   floor and no safe EPS band (Rungs 1–2, `ley-line-open-d50164`). The facts
+//!   are identifier-keyed; a rename-invariant stalk cannot see them.
+//! - The δ⁰ skip is advisory-only and off the fact-serving path; `node_hash`
+//!   is the correctness floor (Rung 3, `ley-line-open-d53329`).
+//!
+//! What remains real and separate: this health metric, the agreement /
+//! `h0_dimension` ops, and the **label-index** region-precision (the genuine
+//! "91× vs naive" number — see `docs/research/sheaf-ablation-study.md`, which
+//! attributes it to the labeling scheme, NOT the cascade). Do not wire
+//! locality-preserving stalks into the invalidation path. Reframe tracked by
+//! `ley-line-open-716c69`.
 //!
 //! For the dimension of H⁰ as an algebraic invariant (independent of the
 //! current section), use [`CellComplex::h0_dimension`].

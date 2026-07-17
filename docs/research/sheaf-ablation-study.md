@@ -68,6 +68,18 @@ never triggered. The number is real and load-bearing for what it actually
 proves; citing it as evidence for the sheaf *constants* would be a category
 error.
 
+> **Follow-up (2026-07-16): the `on_change`/δ⁰ path this study never
+> triggered was subsequently exercised and settled.** ADR-0030
+> (`docs/adr/0030-sheaf-over-embeddings.md`) ran the falsification ladder on
+> the δ⁰ cascade as a cache-invalidation gate: on live inputs it reduces to a
+> hash-gated reverse-dep BFS (`ley-line-open-716c69`, Rung 0), and making it a
+> *semantic* skip gate via a locality-preserving stalk is a **measured NO-GO**
+> for code invalidation (~1.7% irreducible false-negative floor; Rungs 1–2,
+> `ley-line-open-d50164`). So this study's "the 91× is the labeling scheme, not
+> the cascade" framing is now doubly confirmed: the cascade was tested on its
+> own terms and does not carry an invalidation moat. The label-index
+> region-precision measured here remains the real, separate result.
+
 The constants themselves were audited separately and fixed under the P1-P7
 beads: `4e30d5` (stalks as rates — root cause), `4e8a8f` (h0_dimension),
 `4eef8d` (cascade fixed point), `4f3f6e` (δ⁰ tolerance shape), `4f9553`

@@ -93,6 +93,7 @@ pub mod cache;
 pub mod complex;
 pub mod learn;
 pub mod merkle;
+pub mod restriction_review;
 pub mod sparse;
 pub mod topology;
 

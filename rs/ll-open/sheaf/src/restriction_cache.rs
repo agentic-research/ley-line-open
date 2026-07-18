@@ -320,6 +320,190 @@ pub fn review_call_targets(
     out
 }
 
+// ===========================================================================
+// SECOND REVIEW FAMILY (bead ley-line-open-0567e8 / f463aa): PUBLIC-API
+// review, keyed on node_defs rather than node_refs.
+//
+// The call-target family above proves restriction-addressing for a review
+// that reads a function's CALL SITES (node_refs contained in `F`). This
+// family proves the pattern GENERALIZES to a review that reads a
+// definition's PUBLIC SURFACE (the node_def, its visibility, and the
+// SIGNATURE types it names) — a different projection of the same substrate,
+// with its OWN restriction key and its OWN false-skip measurement.
+//
+// The two families are genuinely distinct, not a relabeling: a body-only
+// edit (rename a private helper the public fn CALLS) invalidates the
+// call-target restriction but NOT the public-API restriction, because the
+// public-API review never observes the body. That contrast is the proof the
+// per-family restriction is scoped to what its review actually reads.
+// ===========================================================================
+
+/// The signature-scoped facts a PUBLIC-API review of one definition
+/// observes — a `node_defs` row enriched with the fields a public-surface
+/// review reads. Parser-independent; the extraction layer (tests/common)
+/// fills it from a `function_item`'s DECLARATION subtree (never its body).
+///
+/// - `token` / `qualifier` / `kind` — the def's identity as a public symbol
+///   (`qualifier` carries the receiver for an `impl` method, e.g. `Widget`
+///   in `Widget::area`).
+/// - `is_public` — visibility. A `pub` → private flip removes the symbol
+///   from the public surface, so the review output changes and the
+///   restriction MUST see it.
+/// - `sig_identity` — the reflow- AND body-invariant node_hash of the
+///   function's SIGNATURE subtree (declaration minus `body` block; see
+///   `tests/common::signature_node_hash`). This is the stable identity
+///   ADR-0031 caveat #1 requires, scoped so that body edits do not move it.
+/// - `sig_type_tokens` — the param/return TYPE identifiers the signature
+///   names (`i64`, `Widget`, …), sorted+deduped. These are what the review
+///   resolves across the corpus; a dep-side type-def change reaches the
+///   review through them, which is what makes this restriction span
+///   MULTIPLE objects (the sheaf-shaped property).
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ApiDefRow {
+    pub token: String,
+    pub qualifier: Option<String>,
+    pub kind: String,
+    pub source_id: String,
+    pub is_public: bool,
+    pub sig_identity: [u8; 32],
+    pub sig_type_tokens: Vec<String>,
+}
+
+/// Hex-encode a 32-byte hash into a hashable field (the container/sig
+/// identity enters the restriction buffer as text, like every other row).
+fn hex32(h: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in h {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// 1. RESTRICTION (cheap) for the PUBLIC-API review of `api`.
+///
+/// Hash of a sound superset of the review's INPUT rows:
+///   (a) the def's identity as a public symbol — `token`, `qualifier`,
+///       `kind`, and `is_public` (visibility);
+///   (b) the signature-scoped stable identity `sig_identity` — the
+///       declaration subtree hash, reflow- and body-invariant, so
+///       whitespace and body edits leave it fixed;
+///   (c) the sorted signature TYPE tokens; and
+///   (d) — load-bearingly, cross-object — the `node_defs` rows those type
+///       tokens resolve to across the WHOLE corpus, via the token-indexed
+///       point lookup. This is the multi-object span: a dep-side type-def
+///       rename in another file must invalidate even though `api`'s own
+///       file is byte-identical.
+///
+/// Indexed lookups only; no resolution logic. Never touches the body's
+/// `node_refs`. `rows_touched` is the cost proxy shared with
+/// [`review_public_api`].
+pub fn restriction_for_public_api(
+    sub: &FactSubstrate,
+    api: &ApiDefRow,
+    rows_touched: &mut u64,
+) -> [u8; 32] {
+    let mut buf = String::with_capacity(512);
+
+    // (a) the public symbol's identity + (b) its stable signature identity.
+    push_row(&mut buf, &["api", &api.token, &api.kind]);
+    push_row(
+        &mut buf,
+        &["qualifier", api.qualifier.as_deref().unwrap_or("")],
+    );
+    push_row(
+        &mut buf,
+        &["vis", if api.is_public { "pub" } else { "priv" }],
+    );
+    push_row(&mut buf, &["sig", &hex32(&api.sig_identity)]);
+
+    // (c) the signature type tokens, sorted+deduped for a canonical order.
+    let type_tokens: BTreeSet<&str> = api.sig_type_tokens.iter().map(String::as_str).collect();
+    for t in &type_tokens {
+        push_row(&mut buf, &["sigtype", t]);
+    }
+
+    // (d) the def rows those signature types resolve to — token-indexed
+    // point lookups, cross-file. The sound-superset arm that makes this a
+    // CROSS-ITEM review: a signature-named type whose def changes in a
+    // different file must invalidate `api`'s cached public surface.
+    for token in &type_tokens {
+        if let Some(rows) = sub.def_index.get(*token) {
+            for &i in rows {
+                let d = &sub.defs[i];
+                *rows_touched += 1;
+                push_row(&mut buf, &["typedef", &d.token, &d.source_id, &d.kind]);
+            }
+        }
+    }
+
+    Sha256::digest(buf.as_bytes()).into()
+}
+
+/// The resolved public surface of a definition — the [`review_public_api`]
+/// OUTPUT. Structurally DISTINCT from the restriction hash: it carries the
+/// resolved type defs, not a digest.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct PublicSurface {
+    /// `false` when the def is not `pub` — it contributes nothing to the
+    /// public surface, and the resolved types are not even computed.
+    pub exported: bool,
+    pub token: String,
+    pub qualifier: Option<String>,
+    pub kind: String,
+    /// For each signature type token, the def rows it resolves to across
+    /// the whole corpus (empty for a primitive like `i64`, or an
+    /// unresolved/renamed dep type).
+    pub resolved_types: Vec<(String, Vec<DefRow>)>,
+}
+
+/// 2. REVIEW RESULT (expensive, DISTINCT) for the PUBLIC-API review.
+///
+/// If `api` is not public, the surface is empty (early out — matching a real
+/// review that skips non-exported symbols). Otherwise, for every signature
+/// type token, JOIN against ALL `node_defs` rows in the corpus (unindexed
+/// scan — the honest cost of cross-item type resolution, and still only a
+/// stand-in for a real public-API review, which would build docs / an ABI
+/// descriptor / a semver-diff on top of these resolved types; the measured
+/// gap is a lower bound). Never equals the restriction: it returns the
+/// resolved [`PublicSurface`], not a hash.
+pub fn review_public_api(
+    sub: &FactSubstrate,
+    api: &ApiDefRow,
+    rows_touched: &mut u64,
+) -> PublicSurface {
+    if !api.is_public {
+        return PublicSurface {
+            exported: false,
+            token: api.token.clone(),
+            qualifier: api.qualifier.clone(),
+            kind: api.kind.clone(),
+            resolved_types: Vec::new(),
+        };
+    }
+
+    let type_tokens: BTreeSet<&str> = api.sig_type_tokens.iter().map(String::as_str).collect();
+    let mut resolved_types = Vec::new();
+    for token in &type_tokens {
+        let mut candidates = Vec::new();
+        for d in &sub.defs {
+            *rows_touched += 1;
+            if &d.token == token {
+                candidates.push(d.clone());
+            }
+        }
+        candidates.sort();
+        resolved_types.push((token.to_string(), candidates));
+    }
+
+    PublicSurface {
+        exported: true,
+        token: api.token.clone(),
+        qualifier: api.qualifier.clone(),
+        kind: api.kind.clone(),
+        resolved_types,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Baseline policies + evaluation scaffolding.
 // ---------------------------------------------------------------------------

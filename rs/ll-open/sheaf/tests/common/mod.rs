@@ -41,7 +41,7 @@
 use leyline_hdc::util::bytes_to_hv;
 use leyline_hdc::{D_BITS, D_BYTES, Hypervector, popcount_distance};
 use leyline_sheaf::restriction_cache::{
-    ContainerKeying, DefRow, FactSubstrate, ImportRow, RefRow, US,
+    ApiDefRow, ContainerKeying, DefRow, FactSubstrate, ImportRow, RefRow, US,
 };
 use leyline_ts::languages::TsLanguage;
 use leyline_ts::refs::{ExtractedRef, extract_rust};
@@ -522,6 +522,110 @@ fn signature_node_hash(func: Node<'_>, src: &[u8]) -> [u8; 32] {
         }
     }
     sig_hash_internal(func.kind(), &child_hashes)
+}
+
+// ===========================================================================
+// PUBLIC-API family extraction (bead ley-line-open-0567e8 / f463aa)
+//
+// Parser-dependent build of the parser-INDEPENDENT `ApiDefRow` — the
+// signature-scoped `node_defs` facts a public-API review reads. Populates
+// each public function's: visibility, the SIGNATURE stable identity
+// (`signature_node_hash`, declaration subtree minus body), and the
+// param/return TYPE identifiers the signature names. Body content never
+// enters — that is the whole point of the family, and the reason a
+// body-only edit (a private-helper rename) leaves the public-API
+// restriction unchanged while the call-target restriction would move.
+// ===========================================================================
+
+/// Build the `ApiDefRow` for every `function_item` in the corpus, keyed by
+/// function name. Parser-dependent stand-in for the daemon reading these
+/// fields off its `node_defs` fact table.
+pub fn build_api_defs(corpus: &[(String, String)]) -> BTreeMap<String, ApiDefRow> {
+    let mut out: BTreeMap<String, ApiDefRow> = BTreeMap::new();
+    for (path, src) in corpus {
+        let tree = parse_rust(src.as_bytes()).expect("fixture source must parse");
+        collect_api_defs(tree.root_node(), src.as_bytes(), path, &mut out);
+    }
+    out
+}
+
+fn collect_api_defs(
+    node: Node<'_>,
+    src: &[u8],
+    source_id: &str,
+    out: &mut BTreeMap<String, ApiDefRow>,
+) {
+    if node.kind() == "function_item"
+        && let Some(name_node) = node.child_by_field_name("name")
+        && let Ok(name) = name_node.utf8_text(src)
+        && !name.is_empty()
+    {
+        let mut sig_type_tokens: Vec<String> = Vec::new();
+        if let Some(params) = node.child_by_field_name("parameters") {
+            collect_type_tokens(params, src, &mut sig_type_tokens);
+        }
+        if let Some(ret) = node.child_by_field_name("return_type") {
+            collect_type_tokens(ret, src, &mut sig_type_tokens);
+        }
+        sig_type_tokens.sort();
+        sig_type_tokens.dedup();
+
+        out.insert(
+            name.to_string(),
+            ApiDefRow {
+                token: name.to_string(),
+                // Free functions in these fixtures carry no receiver; an
+                // impl method would carry `Recv` here (the row is
+                // keying-agnostic — the field exists, the fixtures don't
+                // exercise it).
+                qualifier: None,
+                kind: leyline_ts::languages::TsLanguage::Rust
+                    .canonical_kind(node.kind())
+                    .unwrap_or("?")
+                    .to_string(),
+                source_id: source_id.to_string(),
+                is_public: fn_is_public(node, src),
+                sig_identity: signature_node_hash(node, src),
+                sig_type_tokens,
+            },
+        );
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_api_defs(child, src, source_id, out);
+    }
+}
+
+/// `true` iff the function has a `visibility_modifier` child beginning with
+/// `pub` (`pub`, `pub(crate)`, `pub(super)`, …). A bare `fn` is private.
+fn fn_is_public(func: Node<'_>, src: &[u8]) -> bool {
+    let mut cursor = func.walk();
+    func.named_children(&mut cursor).any(|ch| {
+        ch.kind() == "visibility_modifier"
+            && ch
+                .utf8_text(src)
+                .map(|t| t.starts_with("pub"))
+                .unwrap_or(false)
+    })
+}
+
+/// Collect the TYPE identifiers a signature subtree names — `type_identifier`
+/// (`Widget`) and `primitive_type` (`i64`) leaves anywhere under the
+/// parameter list or return type (so `&Widget`, `Vec<Widget>`, `Option<i64>`
+/// all contribute their inner type names). Deliberately NOT the parameter
+/// NAMES (patterns) — a public API is its types, not its binding names.
+fn collect_type_tokens(node: Node<'_>, src: &[u8], out: &mut Vec<String>) {
+    if matches!(node.kind(), "type_identifier" | "primitive_type")
+        && let Ok(t) = node.utf8_text(src)
+        && !t.is_empty()
+    {
+        out.push(t.to_string());
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_type_tokens(child, src, out);
+    }
 }
 
 // ---------------------------------------------------------------------------

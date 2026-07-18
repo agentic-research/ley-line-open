@@ -401,16 +401,99 @@ fn container_id(
     match keying {
         ContainerKeying::Name => format!("fn:{name}"),
         ContainerKeying::Positional => node_id.to_string(),
-        ContainerKeying::Stable => {
-            let h = signature_node_hash(node, src);
-            let mut s = String::with_capacity(2 + 64);
-            s.push_str("h:");
-            for b in h {
-                s.push_str(&format!("{b:02x}"));
-            }
-            s
+        ContainerKeying::Stable => stable_container_id(node, src),
+    }
+}
+
+/// The reflow-invariant, body-invariant stable container identity string
+/// (`h:{hex}`) for a `function_item` node — the [`ContainerKeying::Stable`]
+/// id, computed position-independently so it is identical to the string
+/// [`build_substrate`] threads onto the function's refs. Exposed so the
+/// git-replay bench (`f3a81e`) can resolve a specific function region to the
+/// container id its refs are grouped under WITHOUT round-tripping through
+/// the name-keyed `container_by_fn` map (which collides on same-name
+/// functions across a multi-file corpus).
+pub fn stable_container_id(func: Node<'_>, src: &[u8]) -> String {
+    let h = signature_node_hash(func, src);
+    let mut s = String::with_capacity(2 + 64);
+    s.push_str("h:");
+    for b in h {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+// ---------------------------------------------------------------------------
+// Review-target enumeration for the git-replay superset-correctness bench
+// (ADR-0031 caveat #3, bead ley-line-open-055f79 / f3a81e).
+// ---------------------------------------------------------------------------
+
+/// One reviewable `function_item` region in a corpus: the alignment key
+/// (`source_id`, `name`, `occurrence` in document order within the file),
+/// the [`ContainerKeying::Stable`] container id its refs carry (so a driver
+/// can call `restriction_for_call_target` / `review_call_targets` for
+/// exactly this function), and its byte span within its file's source.
+#[derive(Clone, Debug)]
+pub struct ReviewTarget {
+    pub source_id: String,
+    pub name: String,
+    pub occurrence: u32,
+    pub container: String,
+    pub start: usize,
+    pub end: usize,
+}
+
+fn collect_function_items<'t>(node: Node<'t>, out: &mut Vec<Node<'t>>) {
+    if node.kind() == "function_item" {
+        out.push(node);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_function_items(child, out);
+    }
+}
+
+/// Enumerate every reviewable function region across a corpus, keyed by
+/// stable container identity. Document-order `occurrence` disambiguates a
+/// name appearing more than once in a file (mirrors the rung-2 replay's
+/// alignment key). Files the grammar refuses are skipped (a half-written
+/// file mid-rebase). The `container` string is byte-for-byte the id
+/// [`build_substrate`] stores on the same function's refs under the same
+/// `keying`, so restriction/review lookups by it hit the right rows.
+pub fn review_targets(corpus: &[(String, String)], keying: ContainerKeying) -> Vec<ReviewTarget> {
+    let mut out = Vec::new();
+    for (path, src) in corpus {
+        let Some(tree) = parse_rust(src.as_bytes()) else {
+            continue;
+        };
+        let mut nodes = Vec::new();
+        collect_function_items(tree.root_node(), &mut nodes);
+        let mut counts: BTreeMap<String, u32> = BTreeMap::new();
+        for node in nodes {
+            let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(src.as_bytes()).ok())
+            else {
+                continue;
+            };
+            let occurrence = {
+                let c = counts.entry(name.to_string()).or_insert(0);
+                let v = *c;
+                *c += 1;
+                v
+            };
+            let container = container_id(keying, "", node, src.as_bytes(), name);
+            out.push(ReviewTarget {
+                source_id: path.clone(),
+                name: name.to_string(),
+                occurrence,
+                container,
+                start: node.start_byte(),
+                end: node.end_byte(),
+            });
         }
     }
+    out
 }
 
 // ---------------------------------------------------------------------------

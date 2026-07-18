@@ -48,3 +48,7 @@ tree-sitter = { workspace = true }
 [[bench]]
 name = "git_replay_invalidation"
 harness = false
+
+[[bench]]
+name = "restriction_git_replay"
+harness = false

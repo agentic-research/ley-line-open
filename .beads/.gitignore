@@ -1,0 +1,29 @@
+# Managed by rosary (rosary-05fbe0). The bead-store BINARY is local — never
+# git-tracked: a binary DB has no git 3-way merge, so ordinary resolutions
+# (checkout --theirs/--ours, reset --hard, stash pop) silently eat live bead
+# state. Bead CONTENT is shared via the tracked, mergeable .beads/beads.jsonl.
+
+# SQLite store + sidecars (local only)
+beads.db
+beads.db-shm
+beads.db-wal
+beads.db-journal
+beads.db.migrated
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+
+# Dolt store + server runtime
+dolt/
+dolt-server.pid
+dolt-server.log
+dolt-server.port
+dolt-server.lock
+dolt-access.lock
+
+# Host-local runtime
+.beads-credential-key
+.local_version
+last-touched
+backup/

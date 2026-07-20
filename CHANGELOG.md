@@ -10,6 +10,29 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-07-20
+
+**The sheaf question resolves: restriction-addressed derived-view caching (ADR-0031 GO) after the embedding-stalk NO-GO (ADR-0030), plus injected-subtree extraction and arena-resident query sets.**
+
+Minor release. Wire format unchanged (`wire_format_major = 1`, `compat_min_schema_version = 0.6.0`, `EXTRACTION_EPOCH = 4`); `SCHEMA_VERSION` tracks the package version to `0.9.0` as usual. No table changes mache reads; arenas built by v0.8.0 need no re-derivation.
+
+### Added
+
+- **Injected-subtree extraction (injections MVP)**. `injections.scm` drives extraction into embedded languages — the first path is `go → sql` (SQL string literals inside Go). Injected subtrees are extracted under the same `@def`/`@ref` capture vocabulary as their host, so a query embedded in host code becomes first-class facts. Bead `ley-line-open-c822a6` (#230).
+- **Arena-resident query blobs**. The `.scm` query sets that drive extraction are carried inside the arena rather than only on disk, so an arena is self-describing about the rules that produced its facts. Bead `ley-line-open-e72629` (#231).
+- **`leyline-schema-bridge` annotation vocabulary + tool-definitions output**. Annotations on capnp structs drive an MCP tool-definitions emitter (first consumer: rosary's generated MCP registry), on top of the zod/Go/json-schema family. Bead `ley-line-open-beb8bb` (#232).
+- **`restriction_cache` — reusable restriction-addressed review cache (ADR-0031)**. `rs/ll-open/sheaf/src/restriction_cache.rs`: a parser-independent module keying an expensive derived-view review (call-target resolution, public-API surface) on a cheap, resolution-free input-closure hash. Two review families ship — call-target (over `node_refs`) and public-API (over `node_defs`) — each with its own restriction, so a helper rename invalidates the call-target review but not the public-API review. Keyed on the ADR-0027 `node_hash` declaration subtree for reflow- and body-invariant stable identity. Beads `ley-line-open-054048` (#242), `ley-line-open-0567e8` (#244).
+
+### Changed
+
+- **ADR-0030 (sheaf over embeddings) — NO-GO, scoped and amended**. A falsification ladder (rungs 1–3: embedding-stalk divergence, AST-structural value, skip-safety invariant) plus a git-replay value experiment found that approximate embedding-stalk distance is not a sound cache-invalidation skip gate — δ⁰ cohomology is decoration over a hash-gated reverse-dependency BFS. The NO-GO is scoped to *approximate distance gating* and amended (not reversed) to point at the exact construction below. Beads `d4e605`, `d53329`, `d50164`, `716c69` (#234–#239, #241).
+- **ADR-0031 (restriction-addressed derived-view caching) — GO, the positive construction**. CAS gives exact identity for stored objects; restriction-addressed caching gives exact identity for consumer-observable *derived views*. Verified empirically by git-replay: **0 false-skips over 1786 real region-edits** (682 sound true-skips, 90.7% skip rate, whole-object baseline 0). "Restriction maps earned rent; cohomology did not." Beads `ley-line-open-0505b3`, `055f79` (#240, #243).
+- Smell-baseline refresh — dropped ~200 phantom `unwrap` sites and a renamed-tool path. Bead `ley-line-open-4b7a1b` (#233).
+
+### Fixed
+
+- **beads store no longer git-tracks the binary DB**. `.beads/beads.db` (a binary store) was git-tracked, so a `git merge`/`checkout`/`reset` touching it on a binary conflict destroyed uncommitted bead state (observed as data-loss incident `rosary-05fbe0`). The binary is now gitignored and bead state is shared via a git-tracked `.beads/beads.jsonl` export — human-diffable, merge-safe, and reconstructible into the operational store. Bead `ley-line-open-8d47b2` (#245).
+
 ## [0.8.0] — 2026-07-15
 
 **Extraction becomes data: one generic query engine, ten languages, and grammar coverage for mache's full registry.**

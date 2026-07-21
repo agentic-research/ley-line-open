@@ -28,3 +28,4 @@ rs/ll-open/hdc/src/sheaf.rs:552	B	merkle empty-leaves arm
 rs/ll-open/hdc/src/sheaf.rs:566	B	merkle internal-node hash
 rs/ll-open/hdc/src/util.rs:158	C	HDC seed derivation (truncated to u64)
 rs/ll-open/cas-ffi/src/lib.rs:44	ffi	cas-ffi cross-check
+rs/ll-open/cli-lib/src/cmd_parse.rs:1991	C	S1 head signer kid — fingerprint of a public key, not a content address

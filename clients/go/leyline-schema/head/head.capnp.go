@@ -15,12 +15,12 @@ type Head capnp.Struct
 const Head_TypeID = 0xbc8eed64e8f5bae7
 
 func NewHead(s *capnp.Segment) (Head, error) {
-	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 24, PointerCount: 2})
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 24, PointerCount: 4})
 	return Head(st), err
 }
 
 func NewRootHead(s *capnp.Segment) (Head, error) {
-	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 24, PointerCount: 2})
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 24, PointerCount: 4})
 	return Head(st), err
 }
 
@@ -128,12 +128,38 @@ func (s Head) SetUnboundFacts(v uint64) {
 	capnp.Struct(s).SetUint64(16, v)
 }
 
+func (s Head) Signature() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(2)
+	return []byte(p.Data()), err
+}
+
+func (s Head) HasSignature() bool {
+	return capnp.Struct(s).HasPtr(2)
+}
+
+func (s Head) SetSignature(v []byte) error {
+	return capnp.Struct(s).SetData(2, v)
+}
+
+func (s Head) SignerKid() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(3)
+	return []byte(p.Data()), err
+}
+
+func (s Head) HasSignerKid() bool {
+	return capnp.Struct(s).HasPtr(3)
+}
+
+func (s Head) SetSignerKid(v []byte) error {
+	return capnp.Struct(s).SetData(3, v)
+}
+
 // Head_List is a list of Head.
 type Head_List = capnp.StructList[Head]
 
 // NewHead creates a new list of Head.
 func NewHead_List(s *capnp.Segment, sz int32) (Head_List, error) {
-	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 24, PointerCount: 2}, sz)
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 24, PointerCount: 4}, sz)
 	return capnp.StructList[Head](l), err
 }
 
@@ -151,23 +177,27 @@ func (p Head_Future) ParentHash() common.Hash_Future {
 	return common.Hash_Future{Future: p.Future.Field(1, nil)}
 }
 
-const schema_c7c7ada1403b9f78 = "x\xdal\xc9\xbdJ\x03A\x18\x05\xd0{\xbf\xd9\x18\xa2" +
-	"H2dK\x83X\xda\x08b\xa7MP\x90`\xe5\xb4" +
-	"vcv\xc8*8\x1b\xb2\x1bP\xd0F\x14,\xfc+" +
-	"\"X(j\xa5\x8d/ \xf6\x01_D\x0b-\xadG" +
-	"\xd2\xa4\xb2=\xa7\xf6\xdc\x8c\x16\xa73\x81\x98\x99\xd2D" +
-	"\xf8|\xfb\xfdJ~.\xdfa\xa6\xa8\xc2\xfe\xc3J\xf3" +
-	"\xe9u8DI\xca@\xbd\xc1\xe3\xfa\x1c\xcb\xc0R\x83" +
-	"\xb3\xc4ZH\x9dM\x16\xda\xb6K\xdf]n9\x9b`" +
-	"\x934\xb1\x8a\x80\x88\x80>\xda\x00\xcc\xa1\xa29\x13j" +
-	"2\xe6\x08O\xb7\x00s\xa2h\xae\x85\x94\x98\x02\xe8\x8b" +
-	"\x91\x9d+\x9a[\xa1V\x8c\xa9\x00}\xb3\x0b\x98\x81\xa2" +
-	"y\x14\xeaHbF\x80\xbe\x1f\xe1\x9d\xa2y\x11\x86^" +
-	"\x96\x15-\x9b\xa7\x00X\x0b\x1f\xf3\x93W\xe9 \xfa\x06" +
-	"\xc8\x1a\x18\xba\xb6\xe7|\xd1\xb2Py\xfaOw\x9cw" +
-	"=[\xec@e\x9e\x15\x08+`\xc8]g\xcf\xf9b" +
-	"\x15\xd5\x83\xc2\xe5c\xee\xfb\xed\xac\xef\x93uTm\xbb" +
-	"\x18\xf3_\x00\x00\x00\xff\xff\xec\x06J\x87"
+const schema_c7c7ada1403b9f78 = "x\xdal\xc9\xbfK\x1bQ\x00\x07\xf0\xef\xf7\xbd\xbb\x84" +
+	"\xb4\x84\xe4\x91\x1b\x93\xa1c\x97B\xe9\xd6.\xa1\x85\x12" +
+	"\xda\xc5\xe7\xe8\xf6\xcc=r\x11|\x17\xee.\xa0\xab\x7f" +
+	"\x80Y\xdc\xc5?\xc0M\x17\x89\xe0\xa0DD\xc1A\xc1" +
+	"A\xc1A1\x83\x82\x8b\xf3\xc9\x81?\x16\xd7\xcf\xa7>" +
+	"i{\xdf\xab\xb1\x80\xd0M\xbf\x94\xdf\xed<M\xc3\x87" +
+	"\xd51\xf4g\xca|i\xfdW{cs2\x81\xef\x95" +
+	"\x81F\x8b+\x8d/,\x03?Z\x1c\x11\x7f\xf2\xc8\x9a" +
+	"\xf0[\xd7\x0c\xe8\x06?;\xd6\x84\x98!uSz\x80" +
+	"G@m\xff\x03\xf4\x96\xa4\xde\x13Td\xc0\x02w\xe7" +
+	"\x00=\x96\xd4\x87\x82\x14\x01\x05\xa0\x0e\x0a\xdb\x97\xd4\xa7" +
+	"\x82J2\xa0\x04\xd4\xc9\x02\xa0\x8f%\xf5\x85\xa0\xf2D" +
+	"@\x0fP\xe7\x05\x9eI\xeakA\xe5\x8b\x80>\xa0\xae" +
+	"f\x01})\xa9\xa7\x82\xaa$\x03\x96\x00u[\xe0\x8d" +
+	"\xa4~\x14\xcc\x938\xce:&\x8d\x00\xb0\x9e\x1f}\xfd" +
+	"4\x8a\xd6\xbc{\x80\xac\x83\xf9\xc0$\xd6e\x1d\x03\x99" +
+	"F\x1ft\xcf:\x9b\x98\xac\x0f\x19;V X\x01\xf3" +
+	"\xd4\xf6\x16\xad\xcb~\xa3\xb6\x9c\xd9\xf4\x8d\x87n>\x1e" +
+	"\xba\xf0/j\xa6\x9b\xbds\xda\xef9\x93\x0d\x13\xd0\xb2" +
+	"\x0a\xc1\xea\x8b\xd9\xe4\x7f\x1f\x0c_\xed9\x00\x00\xff\xff" +
+	"\xba\xe0_\xf2"
 
 func RegisterSchema(reg *schemas.Registry) {
 	reg.Register(&schemas.Schema{

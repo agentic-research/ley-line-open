@@ -1917,12 +1917,6 @@ fn head_trusted_keys_from_env() -> Result<Vec<leyline_sign::root_signer::Verifyi
         .collect()
 }
 
-/// T8.5: compute the segment hash for this run (from `db_path`'s
-/// sibling ast/source segment files), read the existing Head for the
-/// parent/gen chain, and write the new Head. Pure filesystem work —
-/// no SQLite handle required, so a parent caller can dispatch this on
-/// a worker thread that runs concurrently with post-COMMIT SQLite work
-/// (e.g. `create_post_load_indexes`). See bead `ley-line-open-cbbedf`.
 /// S1: the optional head signing key — a hex-encoded 32-byte Ed25519 seed in
 /// `LEYLINE_HEAD_SIGNING_KEY`. Absent or empty ⇒ heads are written unsigned,
 /// byte-identical to pre-S1 behavior.
@@ -1955,6 +1949,12 @@ fn head_signer_from_env() -> Result<Option<leyline_sign::root_signer::Ed25519Roo
     ))
 }
 
+/// T8.5: compute the segment hash for this run (from `db_path`'s
+/// sibling ast/source segment files), read the existing Head for the
+/// parent/gen chain, and write the new Head. Pure filesystem work —
+/// no SQLite handle required, so a parent caller can dispatch this on
+/// a worker thread that runs concurrently with post-COMMIT SQLite work
+/// (e.g. `create_post_load_indexes`). See bead `ley-line-open-cbbedf`.
 fn write_head_for_path(db_path: &Path, unbound_facts: u64) -> Result<()> {
     let (root, segment_bytes) = hash_segment_files(db_path)?;
     let head_path = with_extension(db_path, "head.capnp");
@@ -1984,9 +1984,7 @@ fn write_head_for_path(db_path: &Path, unbound_facts: u64) -> Result<()> {
                 leyline_core::Hash::from_bytes(root),
                 leyline_core::Hash::from_bytes(parent),
             );
-            let sig = signer
-                .sign(digest)
-                .context("sign head digest")?;
+            let sig = signer.sign(digest).context("sign head digest")?;
             let pk = signer.verifying_key();
             // kid = BLAKE3(pubkey)[..8] — lets a verifier pick the key
             // without trial verification. BLAKE3 per the Σ hash lock.
@@ -3775,7 +3773,11 @@ mod tests {
 
         let sig_bytes = h.get_signature().unwrap();
         assert_eq!(sig_bytes.len(), 64, "head must carry an Ed25519 signature");
-        assert_eq!(h.get_signer_kid().unwrap().len(), 8, "head must carry a kid");
+        assert_eq!(
+            h.get_signer_kid().unwrap().len(),
+            8,
+            "head must carry a kid"
+        );
 
         // Re-derive the digest the way a verifier would, from the head itself.
         let root: [u8; 32] = h.get_root_hash().unwrap().get_bytes().unwrap()[..]

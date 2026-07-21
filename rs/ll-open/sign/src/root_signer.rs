@@ -242,11 +242,7 @@ mod tests {
     /// Sign a head the way `write_head_for_path` does, returning raw bytes as
     /// they would be read back out of the capnp `signature` field.
     fn signed(generation: u64, root: [u8; 32], parent: [u8; 32]) -> Vec<u8> {
-        let d = head_digest(
-            generation,
-            Hash::from_bytes(root),
-            Hash::from_bytes(parent),
-        );
+        let d = head_digest(generation, Hash::from_bytes(root), Hash::from_bytes(parent));
         signer().sign(d).expect("sign").to_bytes().to_vec()
     }
 

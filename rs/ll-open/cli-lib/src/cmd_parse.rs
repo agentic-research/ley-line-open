@@ -1860,6 +1860,38 @@ fn read_head_for_chain(head_path: &Path) -> ([u8; 32], u64) {
 /// no SQLite handle required, so a parent caller can dispatch this on
 /// a worker thread that runs concurrently with post-COMMIT SQLite work
 /// (e.g. `create_post_load_indexes`). See bead `ley-line-open-cbbedf`.
+/// S1: the optional head signing key — a hex-encoded 32-byte Ed25519 seed in
+/// `LEYLINE_HEAD_SIGNING_KEY`. Absent or empty ⇒ heads are written unsigned,
+/// byte-identical to pre-S1 behavior.
+///
+/// A *malformed* value is a hard error rather than a silent fall back to
+/// unsigned: a misconfigured signer must never be indistinguishable from
+/// "signing is switched off", or you get unsigned heads believing they're
+/// signed.
+fn head_signer_from_env() -> Result<Option<leyline_sign::root_signer::Ed25519RootSigner>> {
+    let Ok(raw) = std::env::var("LEYLINE_HEAD_SIGNING_KEY") else {
+        return Ok(None);
+    };
+    let hex = raw.trim();
+    if hex.is_empty() {
+        return Ok(None);
+    }
+    if !hex.is_ascii() || hex.len() != 64 {
+        anyhow::bail!(
+            "LEYLINE_HEAD_SIGNING_KEY must be 64 hex chars (32-byte Ed25519 seed), got {} chars",
+            hex.len()
+        );
+    }
+    let mut seed = [0u8; 32];
+    for (i, b) in seed.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .context("LEYLINE_HEAD_SIGNING_KEY is not valid hex")?;
+    }
+    Ok(Some(
+        leyline_sign::root_signer::Ed25519RootSigner::from_seed(&seed),
+    ))
+}
+
 fn write_head_for_path(db_path: &Path, unbound_facts: u64) -> Result<()> {
     let (root, segment_bytes) = hash_segment_files(db_path)?;
     let head_path = with_extension(db_path, "head.capnp");
@@ -1876,6 +1908,30 @@ fn write_head_for_path(db_path: &Path, unbound_facts: u64) -> Result<()> {
         h.set_unbound_facts(unbound_facts);
         h.reborrow().init_root_hash().set_bytes(&root);
         h.reborrow().init_parent_hash().set_bytes(&parent);
+
+        // S1: sign the head when a signing key is configured. The signature
+        // covers the canonical head digest — BLAKE3(generation ‖ root ‖
+        // parent) — not rootHash alone, so it cannot be replayed at another
+        // generation or grafted onto a forked chain. No key ⇒ the head is
+        // written unsigned, byte-identical to before.
+        if let Some(signer) = head_signer_from_env()? {
+            use leyline_core::RootSigner;
+            let digest = leyline_core::head_digest(
+                generation,
+                leyline_core::Hash::from_bytes(root),
+                leyline_core::Hash::from_bytes(parent),
+            );
+            let sig = signer
+                .sign(digest)
+                .context("sign head digest")?;
+            let pk = signer.verifying_key();
+            // kid = BLAKE3(pubkey)[..8] — lets a verifier pick the key
+            // without trial verification. BLAKE3 per the Σ hash lock.
+            let pk_hash = blake3::hash(pk.as_bytes());
+            let sig_bytes = sig.to_bytes();
+            h.set_signature(&sig_bytes);
+            h.set_signer_kid(&pk_hash.as_bytes()[..8]);
+        }
     }
     let mut f = std::fs::OpenOptions::new()
         .create(true)
@@ -3631,6 +3687,56 @@ mod tests {
     /// - run 2: parentHash == run1.rootHash, generation == 2
     ///
     /// And rootHash equals BLAKE3 of the segment files in canonical order.
+    /// S1 end-to-end: with a signing key configured, the head written to disk
+    /// carries a signature that verifies against the canonical head digest.
+    /// Without this test, "the head is signed" is a claim, not a fact.
+    #[test]
+    fn head_is_signed_and_verifies_when_key_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("signed.db");
+        std::fs::write(&db, b"").unwrap();
+
+        let seed = [3u8; 32];
+        let hex: String = seed.iter().map(|b| format!("{b:02x}")).collect();
+        // SAFETY: edition-2024 env mutation; no other test reads this key.
+        unsafe { std::env::set_var("LEYLINE_HEAD_SIGNING_KEY", &hex) };
+        let wrote = write_head_for_path(&db, 0);
+        unsafe { std::env::remove_var("LEYLINE_HEAD_SIGNING_KEY") };
+        wrote.expect("write signed head");
+
+        let bytes = std::fs::read(with_extension(&db, "head.capnp")).unwrap();
+        let msg = capnp::serialize::read_message(&mut &bytes[..], Default::default()).unwrap();
+        let h: leyline_schema_capnp::head_capnp::head::Reader = msg.get_root().unwrap();
+
+        let sig_bytes = h.get_signature().unwrap();
+        assert_eq!(sig_bytes.len(), 64, "head must carry an Ed25519 signature");
+        assert_eq!(h.get_signer_kid().unwrap().len(), 8, "head must carry a kid");
+
+        // Re-derive the digest the way a verifier would, from the head itself.
+        let root: [u8; 32] = h.get_root_hash().unwrap().get_bytes().unwrap()[..]
+            .try_into()
+            .unwrap();
+        let parent: [u8; 32] = h.get_parent_hash().unwrap().get_bytes().unwrap()[..]
+            .try_into()
+            .unwrap();
+        let digest = leyline_core::head_digest(
+            h.get_generation(),
+            leyline_core::Hash::from_bytes(root),
+            leyline_core::Hash::from_bytes(parent),
+        );
+
+        let sig = ed25519_dalek::Signature::from_bytes(sig_bytes.try_into().unwrap());
+        let signer = leyline_sign::root_signer::Ed25519RootSigner::from_seed(&seed);
+        assert!(
+            <leyline_sign::root_signer::Ed25519RootSigner as leyline_core::RootSigner>::verify(
+                digest,
+                &sig,
+                &signer.verifying_key()
+            ),
+            "the written head signature must verify against the canonical digest"
+        );
+    }
+
     #[test]
     fn parse_into_conn_chains_head_across_runs() {
         use leyline_schema_capnp::head_capnp::head;

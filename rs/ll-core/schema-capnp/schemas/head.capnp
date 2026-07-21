@@ -51,4 +51,20 @@ struct Head {
   # Zero for a db with no IR tables. Counted over the whole db post-
   # COMMIT, so it reflects the full graph, not just this run's delta.
   unboundFacts @4 :UInt64;
+
+  # Signature over the canonical head digest — NOT over rootHash alone.
+  # The digest is BLAKE3(generation LE-8 ‖ rootHash ‖ parentHash); see
+  # `leyline_core::head_digest`. Binding all three stops a signature being
+  # replayed at another generation or grafted onto a forked chain. Ed25519
+  # (64 bytes), matching the frozen leyline-net/v1 manifest so the in-flight
+  # manifest and the at-rest head share one scheme and one trust root.
+  #
+  # Empty when the head is unsigned. Additive field: an unset field does not
+  # change canonical bytes for existing instances (ADR-0014 §1), so adding
+  # this does not advance Σ root for unchanged data.
+  signature @5 :Data;
+
+  # Identifier of the signing key (Signet `kid`), so a verifier can select
+  # the right public key without trial verification. Empty when unsigned.
+  signerKid @6 :Data;
 }

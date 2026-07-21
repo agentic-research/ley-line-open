@@ -22,6 +22,9 @@ required-features = ["host"]
 
 [features]
 default = []
+# Concrete Ed25519 `RootSigner` over Σ roots (workstream S1). Native-only:
+# gated `not(target_arch = "wasm32")` at the module boundary.
+root-signer = ["dep:leyline-core", "dep:anyhow"]
 # Host-side feature — pulls in the HTTP server, OS-keystore client,
 # signing pipeline, rate limiter, and CLI. Disabled on wasm32 builds;
 # gated by `#[cfg(all(feature = "host", not(target_arch = "wasm32")))]`
@@ -75,6 +78,11 @@ x509-cert = { version = "0.2", default-features = false }
 spki = { version = "0.7", features = ["alloc"] }
 const-oid = { version = "0.9", features = ["db"] }
 ed25519-dalek = "3"
+# S1 signed head: concrete RootSigner over Σ roots. Optional so the wasm32
+# verifier artifact stays byte-identical when the feature toggles (same
+# discipline as `host`); leyline-core is not wasm-clean (memmap2/parking_lot).
+leyline-core = { path = "../../ll-core/core", optional = true }
+anyhow = { workspace = true, optional = true }
 sha2 = "0.11"
 thiserror = { workspace = true }
 log = { workspace = true }

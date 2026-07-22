@@ -1,0 +1,38 @@
+# Self-contained validation wiring (taskfile-ci-parity).
+#
+# The pre-push hook runs `task ci` — the SAME gate CI runs (ci.yml:
+# `run: task ci`) — so "passes locally" and "passes CI" cannot disagree:
+# they invoke one definition. Neither this file nor CI re-implements the
+# underlying commands; both point at Taskfile targets.
+#
+# Install once (does NOT touch the rsry-managed commit-msg/post-merge/
+# post-push hooks — pre-commit owns pre-commit + pre-push only):
+#
+#   pre-commit install --hook-type pre-commit --hook-type pre-push
+#
+# After that you never run clippy/fmt/blake3-lint by hand: `git commit`
+# fast-checks formatting, `git push` runs the full gate and blocks a push
+# CI would reject.
+repos:
+  - repo: local
+    hooks:
+      # Fast feedback at commit time — the recurring failure is formatting;
+      # catch it instantly instead of at CI. Non-mutating (fmt:check fails,
+      # never rewrites the tree).
+      - id: task-fmt-check
+        name: task fmt:check (fast — formatting gate)
+        entry: task fmt:check
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+
+      # The full 1:1-with-CI gate before push (fmt + clippy + blake3 lint +
+      # tests + compat/regen/readme checks). Invokes `task ci` verbatim.
+      - id: task-ci
+        name: task ci (1:1 with CI — full gate before push)
+        entry: task ci
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]

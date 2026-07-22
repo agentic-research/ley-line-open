@@ -12,6 +12,7 @@
 !GETTING-STARTED.md
 !CHANGELOG.md
 !server.json
+!.pre-commit-config.yaml
 
 # GitHub Actions
 !.github/**

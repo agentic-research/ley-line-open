@@ -103,6 +103,8 @@ Each parse run produces a fresh capnp segment, hashes it with BLAKE3 over **cano
 
 **What canonical encoding buys us** (ADR-0014 §1): adding a field at the next ordinal `@N` with default value does not change the canonical bytes for instances that don't set it. So additive schema changes do not advance Σ root for unchanged data — the substrate is byte-stable across schema evolution. Backed by Cap'n Proto's published canonical-encoding spec + the same precedent IPLD/DAG-CBOR and ATproto/DRISL follow.
 
+The signed `Head` (v0.10.0) is the concrete case: the `signature @5` / `signerKid @6` fields are additive, so an unsigned head stays byte-identical to v0.9.0 and Σ root does not advance for existing arenas. When `LEYLINE_HEAD_SIGNING_KEY` is set, each `Head` is signed over a domain-separated digest of `(generation, rootHash, parentHash)` — not `rootHash` alone, so a signature cannot be replayed at another generation or grafted onto a forked chain; `signerKid` is the substrate-canonical key id (`lowercasehex(SHA-256(SPKI)[:16])`, signet ADR-012). With `LEYLINE_HEAD_TRUSTED_KEYS` set, a head is verified before it is adopted as chain state and a tampered head is refused. Both are opt-in and off by default.
+
 ## Cross-runtime contract
 
 `leyline-schema-capnp` holds the canonical schemas. Other runtimes generate bindings from the same `.capnp` files:

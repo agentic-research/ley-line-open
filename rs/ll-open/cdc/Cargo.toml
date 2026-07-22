@@ -1,0 +1,17 @@
+[package]
+name = "leyline-cdc"
+version = "0.10.1"
+edition = "2024"
+description = "Content-defined chunking (GearHash CDC, xet-compatible params) over the Σ substrate — chunk-level dedup for the mount storage path (bead ley-line-open-9989d2 / xet gleaning)"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+# HuggingFace's SIMD-accelerated GearHash CDC rolling hash — the proven hard
+# part. We compose it rather than reinvent, and glean only xet's boundary
+# parameters (target ~64 KiB, clamp 8–128 KiB). Scoped to THIS crate so the
+# base dataplane (leyline-core/cli-lib/fs) stays lean — nothing pulls CDC
+# unless it opts in, same posture as jj-lib in leyline-vcs.
+gearhash = "0.1.3"
+# Chunk identity = σ = BLAKE3, via the sanctioned ContentAddressed path. This
+# is exactly xet's MerkleHash base, so LLO chunk hashes align with xet's.
+leyline-core = { path = "../../ll-core/core" }

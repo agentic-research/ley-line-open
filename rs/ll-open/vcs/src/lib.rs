@@ -17,8 +17,10 @@ use anyhow::{Context, Result};
 use futures::io::AsyncReadExt as _;
 use jj_lib::backend::{CopyId, TreeValue};
 use jj_lib::config::StackedConfig;
+use jj_lib::local_working_copy::LocalWorkingCopyFactory;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::object_id::ObjectId as _;
+use jj_lib::ref_name::WorkspaceNameBuf;
 use jj_lib::repo::{ReadonlyRepo, Repo as _};
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::settings::UserSettings;
@@ -117,6 +119,17 @@ fn is_ignored(id: &str) -> bool {
 // ---------------------------------------------------------------------------
 // JjIntegration — init/open/commit/revert against a jj repo
 // ---------------------------------------------------------------------------
+
+/// An isolated per-agent workspace over a shared content-addressed jj store
+/// (see [`JjIntegration::add_workspace`]). Handle to the workspace's root and
+/// jj name; the store lives in the parent [`JjIntegration`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentWorkspace {
+    /// The workspace's own working-copy root directory.
+    pub root: PathBuf,
+    /// The jj workspace name — its distinct working-copy identity.
+    pub name: String,
+}
 
 /// Manages a jj repository for snapshotting SQLite graph state.
 pub struct JjIntegration {
@@ -459,6 +472,71 @@ impl JjIntegration {
             .load_at_head()
             .block_on()
             .map_err(|e| anyhow::anyhow!("load repo: {e}"))
+    }
+
+    /// Create an additional isolated workspace that shares THIS integration's
+    /// content-addressed store (bead `ley-line-open-99a9fe`).
+    ///
+    /// Each agent gets its own `root` directory and jj `name` (a distinct
+    /// working-copy identity → isolation). All agents share the one backend
+    /// store, so identical content is deduplicated — worktree semantics
+    /// (isolation + copy-on-write) without the N× disk cost of `git worktree
+    /// add`. This is jj's native multi-workspace feature driven **purely
+    /// through `jj-lib`**: no `jj` process is ever spawned, so a caller
+    /// (rosary) can branch-dispatch agents entirely in-process.
+    pub fn add_workspace(&self, root: &Path, name: &str) -> Result<AgentWorkspace> {
+        // Reject a name already registered in the shared store. jj-lib's
+        // multi-workspace init silently clobbers a duplicate (last-wins),
+        // which would let one agent overwrite another's registration and
+        // break the isolation this API exists to provide.
+        if self.workspace_names()?.iter().any(|n| n == name) {
+            anyhow::bail!("workspace name {name:?} already exists in the shared store");
+        }
+        std::fs::create_dir_all(root)?;
+
+        // Load the shared repo (this integration's store + current head).
+        let primary = Workspace::load(
+            &self.settings,
+            &self.jj_dir,
+            &Default::default(),
+            &default_working_copy_factories(),
+        )
+        .map_err(|e| anyhow::anyhow!("load primary workspace: {e}"))?;
+        let repo_path = primary.repo_path().to_path_buf();
+        let repo = primary
+            .repo_loader()
+            .load_at_head()
+            .block_on()
+            .map_err(|e| anyhow::anyhow!("load shared repo: {e}"))?;
+
+        let factory = LocalWorkingCopyFactory {};
+        Workspace::init_workspace_with_existing_repo(
+            root,
+            &repo_path,
+            &repo,
+            &factory,
+            WorkspaceNameBuf::from(name),
+        )
+        .block_on()
+        .map_err(|e| anyhow::anyhow!("init agent workspace {name:?}: {e}"))?;
+
+        Ok(AgentWorkspace {
+            root: root.to_path_buf(),
+            name: name.to_string(),
+        })
+    }
+
+    /// Names of every workspace known to the shared store (default + agents).
+    /// Sees all workspaces precisely *because* they share one backend — a
+    /// convenient shared-store witness as well as a listing.
+    pub fn workspace_names(&self) -> Result<Vec<String>> {
+        let repo = self.load_repo()?;
+        Ok(repo
+            .view()
+            .wc_commit_ids()
+            .keys()
+            .map(|name| name.as_str().to_string())
+            .collect())
     }
 
     /// Recursively walk the graph and insert file entries into the tree builder.
@@ -1375,6 +1453,86 @@ mod tests {
 
         // init_or_open detects existing
         let _jj3 = JjIntegration::init_or_open(dir.path()).unwrap();
+    }
+
+    // ── Per-agent isolated workspaces over one shared store (bead 99a9fe) ──
+    //
+    // Regression coverage for the CAS-worktree substrate: N agents each get an
+    // isolated jj workspace, but they share ONE content-addressed store. All
+    // driven through jj-lib — the whole point is that NO `jj` process is ever
+    // spawned (rosary drives this in-process, deleting its Command::new("jj")
+    // exec-out site).
+
+    /// Isolation AND sharing in one assertion: after adding two named agent
+    /// workspaces, the *primary's* store sees all three (default + the two
+    /// agents). If the store were not shared, the primary's view could not
+    /// know about the agents; if they were not isolated, they would not be
+    /// distinct named working copies.
+    #[test]
+    fn add_workspace_registers_isolated_named_workspaces_in_one_shared_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("primary");
+        let jj = JjIntegration::init(&primary).unwrap();
+
+        jj.add_workspace(&dir.path().join("agent-a"), "agent-a")
+            .unwrap();
+        jj.add_workspace(&dir.path().join("agent-b"), "agent-b")
+            .unwrap();
+
+        let mut names = jj.workspace_names().unwrap();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "agent-a".to_string(),
+                "agent-b".to_string(),
+                "default".to_string()
+            ],
+            "the shared store must see the default + both agent workspaces"
+        );
+    }
+
+    /// Filesystem-level proof: an agent workspace has its OWN working copy
+    /// (isolation) but only a POINTER to the shared store (dedup, not a copy).
+    #[test]
+    fn agent_workspace_has_own_working_copy_but_a_shared_store_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("primary");
+        let jj = JjIntegration::init(&primary).unwrap();
+
+        let a = dir.path().join("agent-a");
+        let ws = jj.add_workspace(&a, "agent-a").unwrap();
+        assert_eq!(ws.name, "agent-a");
+        assert_eq!(ws.root, a);
+
+        // Own working copy → isolation.
+        assert!(
+            a.join(".jj/working_copy").exists(),
+            "agent workspace must have its own working copy"
+        );
+        // `.jj/repo` is a pointer FILE to the shared store, not a store dir.
+        assert!(
+            a.join(".jj/repo").is_file(),
+            "agent's .jj/repo must be a shared-store pointer, not a copy"
+        );
+        // The primary owns the actual store directory.
+        assert!(
+            primary.join(".jj/repo").is_dir(),
+            "the primary owns the real content-addressed store"
+        );
+    }
+
+    /// jj enforces unique workspace names; the library API must surface that as
+    /// an error rather than silently corrupting the shared store.
+    #[test]
+    fn duplicate_workspace_name_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let jj = JjIntegration::init(&dir.path().join("primary")).unwrap();
+        jj.add_workspace(&dir.path().join("a1"), "agent").unwrap();
+        assert!(
+            jj.add_workspace(&dir.path().join("a2"), "agent").is_err(),
+            "re-using a workspace name must be rejected"
+        );
     }
 
     #[test]

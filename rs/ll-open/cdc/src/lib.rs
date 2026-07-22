@@ -23,7 +23,8 @@
 //! ley-line-open-9989d2). Composing it under FUSE materialize-on-read + wiring
 //! it to the arena is the next layer.
 
-use leyline_core::{ContentAddressed, Hash};
+use anyhow::{Context, Result};
+use leyline_core::{BlobStore, ContentAddressed, Hash};
 
 /// Minimum chunk size — xet's floor (8 KiB). No chunk is smaller than this
 /// except the final tail. (huggingface.co/docs/xet/en/deduplication)
@@ -85,9 +86,70 @@ fn next_boundary(data: &[u8]) -> usize {
     }
 }
 
+// ── Materialize-on-read: store chunks, serve ranges from only the chunks ──────
+//
+// This is the layer the FUSE mount needs (bead 87bf00 next step): a mount
+// serving a small read of a large file must fetch only the chunks covering that
+// byte range, not the whole file. Mirrors xet's file-reconstruction (a manifest
+// of chunk hashes + spans; reconstruct by fetching the relevant chunks from CAS
+// and concatenating).
+
+/// Chunk `data` and store each chunk's bytes in `store` (content-addressed),
+/// returning the manifest that reconstructs it. Idempotent per chunk — identical
+/// chunks across files/versions dedup in the store.
+pub fn chunk_into<S: BlobStore>(data: &[u8], store: &mut S) -> Result<Vec<Chunk>> {
+    let chunks = chunk(data);
+    for c in &chunks {
+        let stored = store
+            .put(&data[c.offset..c.offset + c.len])
+            .context("store chunk")?;
+        debug_assert_eq!(
+            stored, c.hash,
+            "stored σ must equal the manifest chunk hash"
+        );
+    }
+    Ok(chunks)
+}
+
+/// Reconstruct the byte range `[offset, offset+len)` from a chunk manifest,
+/// fetching **only** the chunks that overlap the range. A read outside the file
+/// yields the clamped overlap (possibly empty). Verify-on-read is the
+/// `BlobStore` contract, so returned chunk bytes are σ-verified.
+pub fn read_range<S: BlobStore>(
+    chunks: &[Chunk],
+    store: &S,
+    offset: usize,
+    len: usize,
+) -> Result<Vec<u8>> {
+    let end = offset.saturating_add(len);
+    let mut out = Vec::with_capacity(len.min(1 << 20));
+    for c in chunks {
+        let c_end = c.offset + c.len;
+        if c_end <= offset || c.offset >= end {
+            continue; // no overlap — do NOT fetch this chunk
+        }
+        let bytes = store
+            .get(c.hash)
+            .context("get chunk")?
+            .with_context(|| format!("chunk {:?} missing from store", c.hash))?;
+        let lo = offset.saturating_sub(c.offset); // start within this chunk
+        let hi = end.min(c_end) - c.offset; // end within this chunk
+        out.extend_from_slice(&bytes[lo..hi]);
+    }
+    Ok(out)
+}
+
+/// Reconstruct the whole file from its chunk manifest.
+pub fn reconstruct<S: BlobStore>(chunks: &[Chunk], store: &S) -> Result<Vec<u8>> {
+    let total = chunks.last().map_or(0, |c| c.offset + c.len);
+    read_range(chunks, store, 0, total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use leyline_core::MemBlobStore;
+    use std::cell::Cell;
 
     /// Deterministic pseudo-random bytes (xorshift64), so chunk boundaries are
     /// content-defined AND reproducible without an RNG dependency.
@@ -249,5 +311,91 @@ mod tests {
     fn identical_bytes_hash_identically() {
         let a = prng_bytes(8, 300_000);
         assert_eq!(hashes(&chunk(&a)), hashes(&chunk(&a.clone())));
+    }
+
+    // ── materialize-on-read falsifiers ───────────────────────────────────────
+
+    /// A `BlobStore` that counts `get` calls, so a test can assert a range read
+    /// fetches only the chunks it needs (not the whole file).
+    struct CountingStore {
+        inner: MemBlobStore,
+        gets: Cell<usize>,
+    }
+    impl CountingStore {
+        fn new() -> Self {
+            Self {
+                inner: MemBlobStore::new(),
+                gets: Cell::new(0),
+            }
+        }
+    }
+    impl BlobStore for CountingStore {
+        fn put(&mut self, bytes: &[u8]) -> Result<Hash> {
+            self.inner.put(bytes)
+        }
+        fn get(&self, h: Hash) -> Result<Option<Vec<u8>>> {
+            self.gets.set(self.gets.get() + 1);
+            self.inner.get(h)
+        }
+        fn contains(&self, h: Hash) -> Result<bool> {
+            self.inner.contains(h)
+        }
+    }
+
+    /// Store → full reconstruct round-trips byte-for-byte.
+    #[test]
+    fn full_reconstruct_equals_input() {
+        let data = prng_bytes(10, 3_000_000);
+        let mut store = CountingStore::new();
+        let manifest = chunk_into(&data, &mut store).unwrap();
+        assert_eq!(reconstruct(&manifest, &store).unwrap(), data);
+    }
+
+    /// A range read returns exactly `data[offset..offset+len]`, for ranges that
+    /// straddle boundaries, sit inside one chunk, and clamp past EOF.
+    #[test]
+    fn range_read_returns_the_correct_subbytes() {
+        let data = prng_bytes(11, 3_000_000);
+        let mut store = CountingStore::new();
+        let manifest = chunk_into(&data, &mut store).unwrap();
+
+        for &(off, len) in &[
+            (0usize, 100usize),
+            (1_000_000, 500_000), // straddles many chunks
+            (data.len() - 10, 10),
+            (data.len() - 5, 1000), // clamps past EOF
+            (123_456, 4096),
+        ] {
+            let got = read_range(&manifest, &store, off, len).unwrap();
+            let end = (off + len).min(data.len());
+            assert_eq!(got, &data[off..end], "range ({off},{len}) mismatch");
+        }
+    }
+
+    /// THE materialize-on-read property: a small read of a large file touches
+    /// only the chunks overlapping the requested range — NOT the whole file.
+    /// This is what lets the FUSE mount serve a 4 KiB read of a 100 MB file
+    /// without fetching 100 MB.
+    #[test]
+    fn range_read_fetches_only_overlapping_chunks() {
+        let data = prng_bytes(12, 8_000_000); // ~120+ chunks at ~64 KiB
+        let mut store = CountingStore::new();
+        let manifest = chunk_into(&data, &mut store).unwrap();
+        assert!(manifest.len() > 50, "need a many-chunk file for this test");
+
+        // A 4 KiB read in the middle overlaps at most 2 chunks (it can straddle
+        // one boundary). Count the store gets it triggers.
+        store.gets.set(0);
+        let mid = data.len() / 2;
+        let got = read_range(&manifest, &store, mid, 4096).unwrap();
+        assert_eq!(got, &data[mid..mid + 4096]);
+
+        let fetched = store.gets.get();
+        assert!(
+            fetched <= 2,
+            "a 4KiB read must fetch <=2 chunks, fetched {fetched} of {} — \
+             materialize-on-read must not touch the whole file",
+            manifest.len()
+        );
     }
 }

@@ -14,4 +14,8 @@ license = "AGPL-3.0-or-later"
 gearhash = "0.1.3"
 # Chunk identity = σ = BLAKE3, via the sanctioned ContentAddressed path. This
 # is exactly xet's MerkleHash base, so LLO chunk hashes align with xet's.
+# Also provides the BlobStore trait the materialize-on-read layer stores/reads
+# chunks through.
 leyline-core = { path = "../../ll-core/core" }
+# BlobStore's methods return anyhow::Result; propagate it.
+anyhow = { workspace = true }

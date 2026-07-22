@@ -93,3 +93,6 @@
 # CRUMB - personal memory (not tracked)
 .crumb/
 .claude/worktrees/
+
+# Session/codex scratch worktrees — never commit as gitlinks (bit us on cochain + 0.10.1)
+.worktrees/

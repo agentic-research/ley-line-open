@@ -51,4 +51,27 @@ struct Head {
   # Zero for a db with no IR tables. Counted over the whole db post-
   # COMMIT, so it reflects the full graph, not just this run's delta.
   unboundFacts @4 :UInt64;
+
+  # Signature over the canonical head digest — NOT over rootHash alone.
+  # The digest is BLAKE3(generation LE-8 ‖ rootHash ‖ parentHash); see
+  # `leyline_core::head_digest`. Binding all three stops a signature being
+  # replayed at another generation or grafted onto a forked chain. Ed25519
+  # (64 bytes), matching the frozen leyline-net/v1 manifest so the in-flight
+  # manifest and the at-rest head share one scheme and one trust root.
+  #
+  # Empty when the head is unsigned. Additive field: an unset field does not
+  # change canonical bytes for existing instances (ADR-0014 §1), so adding
+  # this does not advance Σ root for unchanged data.
+  signature @5 :Data;
+
+  # Canonical key identifier of the signing key, so a verifier can select the
+  # right public key. The ONE derivation signet ratified across the substrate
+  # (signet ADR-012 / bead signet-248d17):
+  #   kid = lowercasehex(SHA-256(canonical SPKI DER)[:16])   — 32 hex chars.
+  # Stored as the 32-byte ASCII hex string so it is byte-identical to notme's
+  # JWKS `kid` and cloister's resolved kid. It SELECTS a key; it never confers
+  # authority — a verifier still checks the signature (ADR R1 parity). Empty
+  # when unsigned. Additive field (ADR-0014 §1): unset does not change
+  # canonical bytes.
+  signerKid @6 :Data;
 }

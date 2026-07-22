@@ -10,6 +10,48 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Added
+
+- **Signed at-rest `Head` (workstream S1/S2)** — bead `ley-line-open-f8eda9`.
+  The `Head` gains two additive capnp fields, `signature @5` and
+  `signerKid @6`. What is signed is not `rootHash` but a domain-separated
+  digest binding `(generation, rootHash, parentHash)`, so a signature cannot
+  be replayed at another generation or grafted onto a forked chain. Ed25519,
+  matching the frozen `leyline-net/v1` manifest so the in-flight manifest and
+  the at-rest head share one scheme and one trust root.
+
+  Both sides are opt-in and off by default:
+
+  - `LEYLINE_HEAD_SIGNING_KEY` — hex-encoded 32-byte Ed25519 seed. Absent ⇒
+    heads are written unsigned, byte-identical to pre-S1. Malformed ⇒ hard
+    error, never a silent fallback to unsigned.
+  - `LEYLINE_HEAD_TRUSTED_KEYS` — comma-separated hex Ed25519 public keys.
+    When set, a head is verified before it is adopted as chain state; a
+    signature that is present and does not verify is always refused. A list
+    rather than a single key so rotation has an overlap window.
+  - `LEYLINE_HEAD_REQUIRE_SIGNATURE=1` — additionally refuse *unsigned*
+    heads. Off by default so existing unsigned arenas keep working.
+
+  Adding these fields does not change canonical bytes for an unsigned head
+  (ADR-0014 §1 additive ordinals), so Σ root does not advance for unchanged
+  data. Go bindings regenerated.
+
+  `signerKid` is the canonical key identifier signet ratified for the whole
+  substrate (signet ADR-012 / bead `signet-248d17`, consumed here per
+  `ley-line-open-24bd97`): `lowercasehex(SHA-256(canonical SPKI DER)[:16])`,
+  32 hex chars, stored so it is byte-identical to notme's JWKS `kid`. LLO's
+  conforming derivation is gated against the ADR's pinned cross-language
+  vector. Three normative MUSTs are honored: the kid is canonicalize-then-hash
+  by construction (R2), shape-validated `^[0-9a-f]{32}$` at the read boundary
+  (R4), and used only as parity — `verify_head` still checks the signature
+  against every trusted key, so a spoofed `kid` can neither admit an untrusted
+  signer nor exclude a valid one (R1).
+
+  Known scope limit: no `kid`→public-key registry exists yet, so a verifier's
+  trust set is still supplied by configuration (`LEYLINE_HEAD_TRUSTED_KEYS`)
+  rather than resolved from a JWKS. Resolving the kid against notme's authority
+  is the downstream work (`notme-254f03`, `cloister-2508ec`).
+
 ## [0.9.0] — 2026-07-20
 
 **The sheaf question resolves: restriction-addressed derived-view caching (ADR-0031 GO) after the embedding-stalk NO-GO (ADR-0030), plus injected-subtree extraction and arena-resident query sets.**

@@ -45,6 +45,8 @@ leyline-schema = { path = "../../ll-core/schema" }
 leyline-schema-capnp = { path = "../../ll-core/schema-capnp" }
 leyline-public-schema = { path = "../../ll-core/public-schema" }
 leyline-core = { path = "../../ll-core/core" }
+# S1: the one RootSigner implementation, used to sign the at-rest Head.
+leyline-sign = { path = "../sign", features = ["root-signer"] }
 # ADR-0014 §3 — exact-pin declared in workspace (see schema-capnp/Cargo.toml).
 capnp = { workspace = true }
 # daemon wire codec (see daemon/wire.rs and ADR-0014 interim status).
@@ -105,6 +107,8 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 rusqlite = { workspace = true, features = ["bundled", "serialize"] }
 leyline-core = { path = "../../ll-core/core" }
+# S1: reconstruct a Signature from head bytes to verify a written head.
+ed25519-dalek = "3"
 bytemuck = { workspace = true, features = ["derive"] }
 # Mechanical-reach spy for the L10 `agreement` op (ADR-0020 §3 Gate 3).
 # Re-enables `leyline-sheaf` with its `test-spy` feature so the dev

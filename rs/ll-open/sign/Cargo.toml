@@ -22,6 +22,9 @@ required-features = ["host"]
 
 [features]
 default = []
+# Concrete Ed25519 `RootSigner` over Σ roots (workstream S1). Native-only:
+# gated `not(target_arch = "wasm32")` at the module boundary.
+root-signer = ["dep:leyline-core", "dep:anyhow"]
 # Host-side feature — pulls in the HTTP server, OS-keystore client,
 # signing pipeline, rate limiter, and CLI. Disabled on wasm32 builds;
 # gated by `#[cfg(all(feature = "host", not(target_arch = "wasm32")))]`
@@ -75,7 +78,21 @@ x509-cert = { version = "0.2", default-features = false }
 spki = { version = "0.7", features = ["alloc"] }
 const-oid = { version = "0.9", features = ["db"] }
 ed25519-dalek = "3"
+# S1 signed head: concrete RootSigner over Σ roots. Optional so the wasm32
+# verifier artifact stays byte-identical when the feature is off (same
+# discipline as `host`).
+#
+# Unlike `host`, this is deliberately NOT excluded on wasm32. Verified by
+# building, not by reading the dep list: `cargo build -p leyline-sign
+# --features root-signer --target wasm32-unknown-unknown` succeeds, pulling
+# leyline-core in. memmap2/parking_lot are present in leyline-core's manifest
+# but do not break the wasm32 build. Browser-side verification of a signed
+# head (S2's `verify_head`) is a wanted capability, so keep it reachable.
+leyline-core = { path = "../../ll-core/core", optional = true }
+anyhow = { workspace = true, optional = true }
 sha2 = "0.11"
+# ADR-012 canonical kid encodes to lowercase hex. Pure-Rust, wasm-clean.
+hex = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 libc = { workspace = true }

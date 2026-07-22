@@ -1,13 +1,19 @@
-//! SHA-256 Merkle tree with domain separation.
+//! SHA-256 Merkle tree with domain separation — root, leaf hashing, and
+//! per-leaf inclusion proofs.
 //!
-//! Provides generic Merkle root computation and leaf hashing, used by
-//! both the sheaf cache (structural invalidation) and the network layer
-//! (manifest verification).
+//! Used by the sheaf cache (structural invalidation), the network layer
+//! (manifest verification), and per-leaf progressive verification
+//! (BEP-52-style; bead ley-line-open-31ec98) — one primitive, so ley-line's
+//! wire path and LLO's at-rest path agree on the tree convention instead of
+//! forking two incompatible Merkle trees.
 //!
 //! Domain separation tags:
 //! - `0x00` — leaf node
 //! - `0x01` — internal node
 //! - `0x02` — empty tree marker
+//!
+//! Surface: [`compute_merkle_root`] / [`hash_node`] (root side),
+//! [`merkle_proof`] / [`verify_merkle_proof`] / [`MerkleProof`] (proof side).
 
 use sha2::{Digest, Sha256};
 
@@ -63,6 +69,100 @@ pub fn hash_node(data: &[u8]) -> [u8; 32] {
     hasher.update([0x00]); // leaf domain separator
     hasher.update(data);
     hasher.finalize().into()
+}
+
+/// A per-leaf Merkle inclusion proof.
+///
+/// `siblings` is the sequence, from the leaf's level up toward the root, of the
+/// sibling hash at each level where the leaf's running node was combined with
+/// another node. Each entry is `(sibling_hash, sibling_is_left)`:
+/// `sibling_is_left = true` means the sibling is the left operand of the
+/// internal-node hash `H(0x01 || left || right)`, which is what binds the proof
+/// to the leaf's *position*, not just its value.
+///
+/// Levels where the node was **promoted** (the odd-tail case in
+/// [`compute_merkle_root`]) contribute no sibling — mirroring the root
+/// computation exactly, so [`verify_merkle_proof`] recomputes the same root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MerkleProof {
+    /// `(sibling_hash, sibling_is_left)`, leaf-to-root order.
+    pub siblings: Vec<([u8; 32], bool)>,
+}
+
+/// Generate an inclusion proof for `leaf_hashes[index]` under the tree rooted by
+/// [`compute_merkle_root`]. Rebuilds the tree level-by-level with the identical
+/// pairing + odd-tail-promotion convention, recording the sibling of the target
+/// node at each level it is hashed.
+///
+/// Panics if `index >= leaf_hashes.len()`.
+pub fn merkle_proof(leaf_hashes: &[[u8; 32]], index: usize) -> MerkleProof {
+    assert!(
+        index < leaf_hashes.len(),
+        "merkle_proof: index {index} out of range for {} leaves",
+        leaf_hashes.len()
+    );
+
+    let mut siblings = Vec::new();
+    let mut level: Vec<[u8; 32]> = leaf_hashes.to_vec();
+    let mut pos = index;
+
+    while level.len() > 1 {
+        // Record the sibling of `pos` at this level (if it has one). Odd `pos`
+        // always has a left sibling; even `pos` has a right sibling unless it is
+        // the promoted odd tail.
+        let even = pos.is_multiple_of(2);
+        let has_sibling = if even { pos + 1 < level.len() } else { true };
+        if has_sibling {
+            if even {
+                siblings.push((level[pos + 1], false)); // sibling on the right
+            } else {
+                siblings.push((level[pos - 1], true)); // sibling on the left
+            }
+        }
+
+        // Build the next level with the same convention as compute_merkle_root.
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        for pair in level.chunks(2) {
+            if pair.len() == 2 {
+                let mut hasher = Sha256::new();
+                hasher.update([0x01]);
+                hasher.update(pair[0]);
+                hasher.update(pair[1]);
+                next.push(hasher.finalize().into());
+            } else {
+                next.push(pair[0]); // promoted
+            }
+        }
+
+        pos /= 2;
+        level = next;
+    }
+
+    MerkleProof { siblings }
+}
+
+/// Verify that `leaf` is included under `root` via `proof`. Folds `leaf` with
+/// each sibling using the internal-node hash `H(0x01 || left || right)` in the
+/// recorded order and side, and checks the result equals `root`.
+///
+/// Domain separation makes this safe: leaves are `H(0x00 || …)` and internal
+/// nodes `H(0x01 || …)`, so an internal-node value can never be presented as a
+/// leaf. A single-leaf tree has an empty proof and verifies iff `leaf == root`.
+pub fn verify_merkle_proof(leaf: [u8; 32], proof: &MerkleProof, root: [u8; 32]) -> bool {
+    let mut current = leaf;
+    for &(sibling, sibling_is_left) in &proof.siblings {
+        let mut hasher = Sha256::new();
+        hasher.update([0x01]);
+        if sibling_is_left {
+            hasher.update(sibling);
+            hasher.update(current);
+        } else {
+            hasher.update(current);
+            hasher.update(sibling);
+        }
+        current = hasher.finalize().into();
+    }
+    current == root
 }
 
 #[cfg(test)]
@@ -258,5 +358,96 @@ mod tests {
                 "count={count} should produce non-zero root"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-leaf inclusion proofs (bead ley-line-open-31ec98). `compute_merkle_root`
+    // is the correctness oracle: for every leaf, its proof must recompute exactly
+    // that root — and any tamper must break it.
+    // -----------------------------------------------------------------------
+
+    /// The load-bearing property: for every leaf of every (incl. odd-promotion)
+    /// tree size, `merkle_proof` produces a proof that `verify_merkle_proof`
+    /// folds back to the oracle root.
+    #[test]
+    fn proof_roundtrips_for_every_leaf_and_size() {
+        for count in [1usize, 2, 3, 4, 5, 7, 8, 15, 16, 17, 31, 32, 33] {
+            let leaves: Vec<[u8; 32]> = (0..count)
+                .map(|i| hash_node(&(i as u32).to_le_bytes()))
+                .collect();
+            let root = compute_merkle_root(&leaves);
+            for i in 0..count {
+                let proof = merkle_proof(&leaves, i);
+                assert!(
+                    verify_merkle_proof(leaves[i], &proof, root),
+                    "proof for leaf {i} of {count} must verify against the oracle root"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn single_leaf_proof_is_empty_and_verifies() {
+        let leaf = hash_node(b"solo");
+        let root = compute_merkle_root(&[leaf]);
+        let proof = merkle_proof(&[leaf], 0);
+        assert!(
+            proof.siblings.is_empty(),
+            "single-leaf proof has no siblings"
+        );
+        assert!(verify_merkle_proof(leaf, &proof, root));
+    }
+
+    #[test]
+    fn proof_rejects_wrong_leaf_or_root() {
+        let leaves: Vec<[u8; 32]> = (0..8).map(|i| hash_node(&[i as u8])).collect();
+        let root = compute_merkle_root(&leaves);
+        let proof = merkle_proof(&leaves, 3);
+        assert!(
+            !verify_merkle_proof(hash_node(b"forged"), &proof, root),
+            "a forged leaf must not verify"
+        );
+        assert!(
+            !verify_merkle_proof(leaves[3], &proof, [0xAB; 32]),
+            "a valid leaf+proof must not verify against the wrong root"
+        );
+    }
+
+    #[test]
+    fn proof_rejects_tampered_sibling() {
+        let leaves: Vec<[u8; 32]> = (0..8).map(|i| hash_node(&[i as u8])).collect();
+        let root = compute_merkle_root(&leaves);
+        let mut proof = merkle_proof(&leaves, 3);
+        proof.siblings[0].0[0] ^= 0xFF; // flip a byte of the first sibling
+        assert!(!verify_merkle_proof(leaves[3], &proof, root));
+    }
+
+    /// Flipping which side a sibling is on must break verification — this is
+    /// what binds the proof to the leaf's position, not just its value.
+    #[test]
+    fn proof_rejects_flipped_side() {
+        let leaves: Vec<[u8; 32]> = (0..8).map(|i| hash_node(&[i as u8])).collect();
+        let root = compute_merkle_root(&leaves);
+        let mut proof = merkle_proof(&leaves, 3);
+        proof.siblings[0].1 = !proof.siblings[0].1;
+        assert!(!verify_merkle_proof(leaves[3], &proof, root));
+    }
+
+    /// Domain separation at the proof level: an internal node value must not
+    /// pass as a leaf inclusion (0x00 leaf vs 0x01 internal prefixes).
+    #[test]
+    fn internal_node_does_not_verify_as_a_leaf() {
+        let leaves: Vec<[u8; 32]> = (0..4).map(|i| hash_node(&[i as u8])).collect();
+        let root = compute_merkle_root(&leaves);
+        let mut h = Sha256::new();
+        h.update([0x01]);
+        h.update(leaves[0]);
+        h.update(leaves[1]);
+        let internal_ab: [u8; 32] = h.finalize().into();
+        let proof0 = merkle_proof(&leaves, 0);
+        assert!(
+            !verify_merkle_proof(internal_ab, &proof0, root),
+            "an internal node must never be accepted as a leaf"
+        );
     }
 }

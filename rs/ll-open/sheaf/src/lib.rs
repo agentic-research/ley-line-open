@@ -127,6 +127,6 @@ pub mod topology;
 pub use cache::{CacheEntry, RestrictionEdge, SheafCache};
 pub use complex::{Cell, Cell2, CellComplex, RestrictionMap, Stalk, Violation};
 pub use learn::CoChangeTracker;
-pub use merkle::{compute_merkle_root, hash_node};
+pub use merkle::{MerkleProof, compute_merkle_root, hash_node, merkle_proof, verify_merkle_proof};
 pub use sparse::SparseOps;
 pub use topology::{RegionId, RestrictionGraph};

@@ -1,6 +1,6 @@
 [package]
 name = "leyline-schema-bridge"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "Capnp schemas → zod TS / Go / JSON Schema codegen. Fail-fast: unmapped constructs are hard errors. Lifted from cloister/tools/schema-bridge per ADR-0036 Phase 2."

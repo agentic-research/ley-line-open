@@ -10,6 +10,13 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.10.1] — 2026-07-22
+
+**Additive: per-leaf Merkle inclusion proofs on the shared tree primitive.**
+
+Patch release. No wire/schema change; no `SCHEMA_VERSION`-visible behavior change. `leyline-sheaf`'s Merkle primitive (`compute_merkle_root`/`hash_node`) gains `merkle_proof` / `verify_merkle_proof` / `MerkleProof` — per-leaf inclusion proofs on the existing SHA-256, domain-separated (0x00/0x01/0x02), odd-tail-promotion tree. Closes the gap ley-line's BEP-52 progressive verification and LLO's F4/T4 both need, so the wire and at-rest paths share one Merkle convention instead of forking. Bead `ley-line-open-31ec98`.
+
+
 ## [0.10.0] — 2026-07-22
 
 **The at-rest Σ `Head` can now be signed and verified on load, with a substrate-canonical key identifier (workstreams S1 · S2 · S3).**

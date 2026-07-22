@@ -1,6 +1,6 @@
 [package]
 name = "leyline-ffi-helpers"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "Typed helpers for the C-boundary raw-pointer pattern used by every LLO extern \"C\" fn."

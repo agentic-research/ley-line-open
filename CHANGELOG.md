@@ -10,9 +10,15 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-07-22
+
+**The at-rest Σ `Head` can now be signed and verified on load, with a substrate-canonical key identifier (workstreams S1 · S2 · S3).**
+
+Minor release. Wire format unchanged (`wire_format_major = 1`, `compat_min_schema_version = 0.6.0`); `SCHEMA_VERSION` tracks the package version to `0.10.0` as usual. The two new `Head` fields (`signature @5`, `signerKid @6`) are additive capnp ordinals — an unsigned head is byte-identical to v0.9.0, so Σ root does not advance for unchanged data and arenas built by v0.9.0 need no re-derivation. Signing and verification are both opt-in and off by default.
+
 ### Added
 
-- **Signed at-rest `Head` (workstream S1/S2)** — bead `ley-line-open-f8eda9`.
+- **Signed at-rest `Head` (workstreams S1 / S2 / S3)** — beads `ley-line-open-f8eda9` (sign + verify) and `ley-line-open-24bd97` (canonical kid).
   The `Head` gains two additive capnp fields, `signature @5` and
   `signerKid @6`. What is signed is not `rootHash` but a domain-separated
   digest binding `(generation, rootHash, parentHash)`, so a signature cannot

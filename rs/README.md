@@ -22,7 +22,7 @@ The Rust workspace for ley-line-open. Two tiers: `ll-core/` (infrastructure) and
 | [`leyline-hdc`](ll-open/hdc/) | Hyperdimensional computing — per-scope hypervectors for structural code search |
 | [`leyline-sheaf`](ll-open/sheaf/) | Čech cohomology engine — sheaf cache + coboundary operators + structural invalidation |
 | [`leyline-vcs`](ll-open/vcs/) | jj sidecar — automatic versioning of arena snapshots |
-| [`leyline-sign`](ll-open/sign/) | CMS signing primitives + gpgsm-compatible binary for jj commit signing (host feature ships `leyline-sign-helper` daemon per ADR-0019) |
+| [`leyline-sign`](ll-open/sign/) | Σ `Head` root signer/verifier (`Ed25519RootSigner`, `verify_head`, canonical `kid`; S1/S2/S3) + CMS signing primitives + gpgsm-compatible binary for jj commit signing (host feature ships `leyline-sign-helper` daemon per ADR-0019) |
 | [`leyline-cas-ffi`](ll-open/cas-ffi/) | Wasm32-callable FFI for BLAKE3-substrate hash. Consumed by cloister via workerd's cdylib loader |
 | [`leyline-text-search`](ll-open/text-search/) | Unstructured-text semantic search backend abstraction. `NullEngine` default; `WitchcraftEngine` (XTR-WARP) behind feature flag |
 | [`leyline-chat-embed`](ll-open/chat-embed/) | CLI binary: semantic search over Claude Code chat databases via fastembed/MiniLM |

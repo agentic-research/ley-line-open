@@ -116,6 +116,11 @@ pub fn create_observation_schema(conn: &Connection) -> Result<()> {
     .context("create observation schema")
 }
 
+/// The `(payload_inline, payload_hash)` column pair for one observation
+/// row. Exactly one side is `Some`: small payloads carry `payload_inline`,
+/// at-or-above-[`INLINE_THRESHOLD`] payloads carry `payload_hash`.
+pub type ObservationPayloadColumns = (Option<Vec<u8>>, Option<Vec<u8>>);
+
 /// Store an observation payload per ADR-0020 §1's inline-vs-hash rule,
 /// keeping everything durable in the one `.db` (arena-local dedup — the
 /// same pattern `source_blobs`/`capnp_blobs` use, so an arena stays a
@@ -132,7 +137,7 @@ pub fn create_observation_schema(conn: &Connection) -> Result<()> {
 pub fn put_observation_payload(
     conn: &Connection,
     bytes: &[u8],
-) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+) -> Result<ObservationPayloadColumns> {
     if bytes.len() < INLINE_THRESHOLD {
         return Ok((Some(bytes.to_vec()), None));
     }

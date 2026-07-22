@@ -36,9 +36,21 @@ context, scoping notes, and review history are recoverable.
   (ADR-0014 §1 additive ordinals), so Σ root does not advance for unchanged
   data. Go bindings regenerated.
 
+  `signerKid` is the canonical key identifier signet ratified for the whole
+  substrate (signet ADR-012 / bead `signet-248d17`, consumed here per
+  `ley-line-open-24bd97`): `lowercasehex(SHA-256(canonical SPKI DER)[:16])`,
+  32 hex chars, stored so it is byte-identical to notme's JWKS `kid`. LLO's
+  conforming derivation is gated against the ADR's pinned cross-language
+  vector. Three normative MUSTs are honored: the kid is canonicalize-then-hash
+  by construction (R2), shape-validated `^[0-9a-f]{32}$` at the read boundary
+  (R4), and used only as parity — `verify_head` still checks the signature
+  against every trusted key, so a spoofed `kid` can neither admit an untrusted
+  signer nor exclude a valid one (R1).
+
   Known scope limit: no `kid`→public-key registry exists yet, so a verifier's
-  trust set is supplied by configuration rather than resolved from the head.
-  `signerKid` is a selection hint and is never treated as authorization.
+  trust set is still supplied by configuration (`LEYLINE_HEAD_TRUSTED_KEYS`)
+  rather than resolved from a JWKS. Resolving the kid against notme's authority
+  is the downstream work (`notme-254f03`, `cloister-2508ec`).
 
 ## [0.9.0] — 2026-07-20
 

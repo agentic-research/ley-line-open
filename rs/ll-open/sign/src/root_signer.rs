@@ -112,10 +112,18 @@ pub fn verify_head(
     root: Hash,
     parent: Hash,
     signature: &[u8],
+    kid: &[u8],
     trusted: &[VerifyingKey],
 ) -> HeadVerdict {
     if signature.is_empty() {
         return HeadVerdict::Unsigned;
+    }
+    // R4 (ADR-012): a present `kid` MUST match the canonical shape. A malformed
+    // kid riding on an otherwise-signed head is tampering-adjacent — reject it
+    // rather than shrug and fall back to "no kid". An empty kid is the
+    // legitimate "unspecified" case and skips this gate.
+    if !kid.is_empty() && !crate::kid::is_canonical_kid_shape(kid) {
+        return HeadVerdict::Invalid;
     }
     let Ok(raw) = <[u8; 64]>::try_from(signature) else {
         // Wrong length is a malformed signature, not an absent one.
@@ -126,10 +134,20 @@ pub fn verify_head(
     // Re-deriving the digest here is what binds the verdict to the head the
     // caller actually holds: a signature lifted from another generation or
     // another chain verifies against *its* digest, never this one.
-    if trusted
-        .iter()
-        .any(|pk| <Ed25519RootSigner as RootSigner>::verify(digest, &sig, pk))
-    {
+    let verifies = |pk: &VerifyingKey| <Ed25519RootSigner as RootSigner>::verify(digest, &sig, pk);
+
+    // R1 (parity, not lookup): `kid` only *orders* the attempt — try the key
+    // whose canonical kid matches first — but the signature is verified against
+    // every trusted key regardless. So a spoofed or absent kid can neither
+    // admit an untrusted signer (still must produce a valid signature under a
+    // trusted key) nor exclude a genuinely trusted one (verify-all is the
+    // fallthrough). kid is never the sole selector.
+    let kid_hit = !kid.is_empty()
+        && trusted
+            .iter()
+            .filter(|pk| crate::kid::canonical_kid(pk).as_bytes() == kid)
+            .any(&verifies);
+    if kid_hit || trusted.iter().any(&verifies) {
         HeadVerdict::Valid
     } else {
         HeadVerdict::Invalid
@@ -230,7 +248,7 @@ mod tests {
         let junk = verifying_key_from_hex(&"ff".repeat(32)).expect("parses");
         let sig = signed(1, ROOT, [0u8; 32]);
         assert_eq!(
-            verify_head(1, Hash::from_bytes(ROOT), Hash::ZERO, &sig, &[junk]),
+            verify_head(1, Hash::from_bytes(ROOT), Hash::ZERO, &sig, b"", &[junk]),
             HeadVerdict::Invalid
         );
     }
@@ -255,6 +273,7 @@ mod tests {
                 Hash::from_bytes(ROOT),
                 Hash::ZERO,
                 &sig,
+                b"",
                 &[signer().verifying_key()]
             ),
             HeadVerdict::Valid
@@ -272,6 +291,7 @@ mod tests {
                 Hash::from_bytes([2u8; 32]), // attacker's arena
                 Hash::ZERO,
                 &sig,
+                b"",
                 &[signer().verifying_key()]
             ),
             HeadVerdict::Invalid
@@ -289,6 +309,7 @@ mod tests {
                 Hash::from_bytes(ROOT),
                 Hash::ZERO,
                 &sig,
+                b"",
                 &[signer().verifying_key()]
             ),
             HeadVerdict::Invalid
@@ -305,6 +326,7 @@ mod tests {
                 Hash::from_bytes(ROOT),
                 Hash::from_bytes([8u8; 32]),
                 &sig,
+                b"",
                 &[signer().verifying_key()]
             ),
             HeadVerdict::Invalid
@@ -322,6 +344,7 @@ mod tests {
                 Hash::from_bytes(ROOT),
                 Hash::ZERO,
                 &sig,
+                b"",
                 &[stranger.verifying_key()]
             ),
             HeadVerdict::Invalid
@@ -334,7 +357,7 @@ mod tests {
     fn verify_head_rejects_when_no_keys_are_trusted() {
         let sig = signed(1, ROOT, [0u8; 32]);
         assert_eq!(
-            verify_head(1, Hash::from_bytes(ROOT), Hash::ZERO, &sig, &[]),
+            verify_head(1, Hash::from_bytes(ROOT), Hash::ZERO, &sig, b"", &[]),
             HeadVerdict::Invalid
         );
     }
@@ -348,6 +371,7 @@ mod tests {
                 Hash::from_bytes(ROOT),
                 Hash::ZERO,
                 &[0u8; 17],
+                b"",
                 &[signer().verifying_key()]
             ),
             HeadVerdict::Invalid
@@ -364,6 +388,7 @@ mod tests {
                 Hash::from_bytes(ROOT),
                 Hash::ZERO,
                 &[],
+                b"",
                 &[signer().verifying_key()]
             ),
             HeadVerdict::Unsigned
@@ -382,9 +407,96 @@ mod tests {
                 Hash::from_bytes(ROOT),
                 Hash::ZERO,
                 &sig,
+                b"",
                 &[stranger.verifying_key(), signer().verifying_key()]
             ),
             HeadVerdict::Valid
+        );
+    }
+
+    // ── S3: kid parity (R1) + shape (R4) ──────────────────────────────
+
+    /// The canonical kid of our test signer — computed, so the test tracks the
+    /// real derivation rather than a copied constant.
+    fn signer_kid() -> String {
+        crate::kid::canonical_kid(&signer().verifying_key())
+    }
+
+    /// A correct kid selects its key and the signature verifies.
+    #[test]
+    fn verify_head_accepts_a_matching_kid() {
+        let sig = signed(1, ROOT, [0u8; 32]);
+        assert_eq!(
+            verify_head(
+                1,
+                Hash::from_bytes(ROOT),
+                Hash::ZERO,
+                &sig,
+                signer_kid().as_bytes(),
+                &[signer().verifying_key()]
+            ),
+            HeadVerdict::Valid
+        );
+    }
+
+    /// R1: kid is parity, not lookup. A kid that matches no trusted key must
+    /// NOT exclude a genuinely trusted signer — verify-all is the fallthrough,
+    /// so a wrong (even spoofed) kid cannot suppress a valid signature.
+    #[test]
+    fn verify_head_still_verifies_when_kid_matches_no_key() {
+        let sig = signed(1, ROOT, [0u8; 32]);
+        let stranger_kid =
+            crate::kid::canonical_kid(&Ed25519RootSigner::from_seed(&[42u8; 32]).verifying_key());
+        assert_eq!(
+            verify_head(
+                1,
+                Hash::from_bytes(ROOT),
+                Hash::ZERO,
+                &sig,
+                stranger_kid.as_bytes(),
+                &[signer().verifying_key()]
+            ),
+            HeadVerdict::Valid
+        );
+    }
+
+    /// R1, the other direction: a kid that matches a trusted key still cannot
+    /// admit an *untrusted* signature — the signature must verify under a
+    /// trusted key regardless of the kid claim.
+    #[test]
+    fn verify_head_rejects_untrusted_signature_even_with_a_known_kid() {
+        // Signed by the stranger, but the head claims our trusted signer's kid.
+        let stranger = Ed25519RootSigner::from_seed(&[9u8; 32]);
+        let d = head_digest(1, Hash::from_bytes(ROOT), Hash::ZERO);
+        let sig = stranger.sign(d).expect("sign").to_bytes();
+        assert_eq!(
+            verify_head(
+                1,
+                Hash::from_bytes(ROOT),
+                Hash::ZERO,
+                &sig,
+                signer_kid().as_bytes(),
+                &[signer().verifying_key()]
+            ),
+            HeadVerdict::Invalid
+        );
+    }
+
+    /// R4: a present kid that is not canonical shape is tampering-adjacent and
+    /// must be refused even though the signature itself would verify.
+    #[test]
+    fn verify_head_rejects_a_malformed_kid() {
+        let sig = signed(1, ROOT, [0u8; 32]);
+        assert_eq!(
+            verify_head(
+                1,
+                Hash::from_bytes(ROOT),
+                Hash::ZERO,
+                &sig,
+                b"not-a-valid-kid",
+                &[signer().verifying_key()]
+            ),
+            HeadVerdict::Invalid
         );
     }
 }

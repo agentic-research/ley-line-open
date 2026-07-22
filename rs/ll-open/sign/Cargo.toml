@@ -91,6 +91,8 @@ ed25519-dalek = "3"
 leyline-core = { path = "../../ll-core/core", optional = true }
 anyhow = { workspace = true, optional = true }
 sha2 = "0.11"
+# ADR-012 canonical kid encodes to lowercase hex. Pure-Rust, wasm-clean.
+hex = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 libc = { workspace = true }

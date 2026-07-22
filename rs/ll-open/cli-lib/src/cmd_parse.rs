@@ -1865,11 +1865,13 @@ fn read_head_for_chain(head_path: &Path) -> Result<([u8; 32], u64)> {
             .and_then(|b| <[u8; 32]>::try_from(b).ok())
             .unwrap_or([0u8; 32]);
         let signature = h.get_signature().unwrap_or(&[]);
+        let signer_kid = h.get_signer_kid().unwrap_or(&[]);
         let verdict = leyline_sign::root_signer::verify_head(
             prev_gen,
             leyline_core::Hash::from_bytes(prev_root),
             leyline_core::Hash::from_bytes(parent),
             signature,
+            signer_kid,
             &trusted,
         );
         match verdict {
@@ -1986,12 +1988,16 @@ fn write_head_for_path(db_path: &Path, unbound_facts: u64) -> Result<()> {
             );
             let sig = signer.sign(digest).context("sign head digest")?;
             let pk = signer.verifying_key();
-            // kid = BLAKE3(pubkey)[..8] — lets a verifier pick the key
-            // without trial verification. BLAKE3 per the Σ hash lock.
-            let pk_hash = blake3::hash(pk.as_bytes());
+            // kid = the canonical identifier signet ratified (ADR-012 /
+            // signet-248d17): lowercasehex(SHA-256(canonical SPKI)[:16]), 32
+            // hex chars. Stamped as the ASCII hex string so signerKid is
+            // byte-identical to notme's JWKS kid and cloister's resolved kid —
+            // the whole point of one derivation across the substrate. Lets a
+            // verifier select the key; it never confers authority (R1).
+            let kid = leyline_sign::kid::canonical_kid(&pk);
             let sig_bytes = sig.to_bytes();
             h.set_signature(&sig_bytes);
-            h.set_signer_kid(&pk_hash.as_bytes()[..8]);
+            h.set_signer_kid(kid.as_bytes());
         }
     }
     let mut f = std::fs::OpenOptions::new()
@@ -3773,10 +3779,21 @@ mod tests {
 
         let sig_bytes = h.get_signature().unwrap();
         assert_eq!(sig_bytes.len(), 64, "head must carry an Ed25519 signature");
+        // signerKid is the ADR-012 canonical kid: 32 lowercase-hex chars, and
+        // byte-identical to `canonical_kid` of the signing key.
+        let kid = h.get_signer_kid().unwrap();
+        assert!(
+            leyline_sign::kid::is_canonical_kid_shape(kid),
+            "head kid must be canonical shape, got {:?}",
+            std::str::from_utf8(kid)
+        );
+        let expected_kid = leyline_sign::kid::canonical_kid(
+            &leyline_sign::root_signer::Ed25519RootSigner::from_seed(&seed).verifying_key(),
+        );
         assert_eq!(
-            h.get_signer_kid().unwrap().len(),
-            8,
-            "head must carry a kid"
+            kid,
+            expected_kid.as_bytes(),
+            "head kid must equal canonical_kid(signing key)"
         );
 
         // Re-derive the digest the way a verifier would, from the head itself.

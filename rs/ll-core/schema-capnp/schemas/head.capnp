@@ -64,7 +64,14 @@ struct Head {
   # this does not advance Σ root for unchanged data.
   signature @5 :Data;
 
-  # Identifier of the signing key (Signet `kid`), so a verifier can select
-  # the right public key without trial verification. Empty when unsigned.
+  # Canonical key identifier of the signing key, so a verifier can select the
+  # right public key. The ONE derivation signet ratified across the substrate
+  # (signet ADR-012 / bead signet-248d17):
+  #   kid = lowercasehex(SHA-256(canonical SPKI DER)[:16])   — 32 hex chars.
+  # Stored as the 32-byte ASCII hex string so it is byte-identical to notme's
+  # JWKS `kid` and cloister's resolved kid. It SELECTS a key; it never confers
+  # authority — a verifier still checks the signature (ADR R1 parity). Empty
+  # when unsigned. Additive field (ADR-0014 §1): unset does not change
+  # canonical bytes.
   signerKid @6 :Data;
 }

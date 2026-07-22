@@ -3,6 +3,10 @@ pub mod cert_chain;
 pub mod cms;
 pub mod error;
 pub mod ffi;
+// ADR-012 canonical key identifier. Not feature-gated: the derivation and its
+// shape gate are needed on both the signing and the (wasm) verifying side, and
+// depend only on unconditional deps (ed25519-dalek, sha2, hex).
+pub mod kid;
 pub mod oid;
 
 // Concrete Ed25519 `RootSigner` over Σ roots (workstream S1). Gated on the

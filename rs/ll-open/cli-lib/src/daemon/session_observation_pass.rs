@@ -40,7 +40,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 use super::enrichment::{EnrichmentPass, EnrichmentStats};
-use super::observation_schema::{INLINE_THRESHOLD, create_observation_schema};
+use super::observation_schema::create_observation_schema;
 
 /// `_meta` key storing the highest `observed_at` (ms) the pass has
 /// seen. Re-runs skip turns at or before this value so the same
@@ -406,32 +406,20 @@ impl EnrichmentPass for SessionObservationPass {
                 let mentions_json =
                     serde_json::to_string(&mentions).context("serialize mentions json")?;
 
-                // Inline-vs-hash dispatch per ADR-0020 §1. Today the
-                // BlobStore-backed branch is a TODO — when ley-line-
-                // open-783d72 wires `DaemonContext::blob_store`, the
-                // `else` branch puts bytes into it and stores the
-                // hash. Until then large payloads are still stored
-                // inline (the SQLite BLOB column has no hard cap
-                // below ~1GB); we just don't get the BlobStore-side
-                // dedup. The fixture and current Claude Code turns
-                // are all far below the threshold, so this branch
-                // doesn't fire in the L8 ship.
-                let (payload_inline, payload_hash): (Option<Vec<u8>>, Option<Vec<u8>>) =
-                    if payload_bytes.len() < INLINE_THRESHOLD {
-                        (Some(payload_bytes), None)
-                    } else {
-                        // TODO(ley-line-open-783d72): route through
-                        // DaemonContext::blob_store and store the
-                        // 32-byte hash here. Until then keep the
-                        // bytes inline so no observation is dropped.
-                        log::debug!(
-                            "SessionObservationPass: payload {} bytes >= INLINE_THRESHOLD \
-                             {INLINE_THRESHOLD} but BlobStore not wired yet (783d72); \
-                             storing inline as fallback",
-                            payload_bytes.len(),
-                        );
-                        (Some(payload_bytes), None)
-                    };
+                // Inline-vs-hash dispatch per ADR-0020 §1 (bead d24e68).
+                // Small payloads stay inline; payloads at-or-above
+                // INLINE_THRESHOLD are content-addressed into the
+                // arena-local `observation_blobs` table (dedup, no inline
+                // bloat) — kept inside the one .db, consistent with
+                // `source_blobs`/`capnp_blobs`, so the arena stays a single
+                // portable file. Cross-arena dedup via the global
+                // FsBlobStore is the separate design-gated bead d22735.
+                let (payload_inline, payload_hash) =
+                    crate::daemon::observation_schema::put_observation_payload(
+                        conn,
+                        &payload_bytes,
+                    )
+                    .context("store observation payload")?;
 
                 insert_stmt.execute(rusqlite::params![
                     SOURCE_CLAUDE_CODE,

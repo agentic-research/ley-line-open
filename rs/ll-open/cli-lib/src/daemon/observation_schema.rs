@@ -3,8 +3,8 @@
 //! One table (`observation`) + two indices, owned by the
 //! `SessionObservationPass` and any future observation-emitting pass.
 //! Schema is intentionally minimal: a single row per observed event,
-//! payload stored inline below `INLINE_THRESHOLD` or hashed into the
-//! `BlobStore` above it.
+//! payload stored inline below `INLINE_THRESHOLD` or content-addressed
+//! into the arena-local `observation_blobs` table above it (bead d24e68).
 //!
 //! This module deliberately lives in `cli-lib` rather than a new crate.
 //! Per ADR-0020 §1 the table is one of the smallest stable surfaces in
@@ -29,12 +29,14 @@
 //! which column carries the payload.
 
 use anyhow::{Context, Result};
+use leyline_core::ContentAddressed;
 use rusqlite::Connection;
 
 /// Inline-vs-hash threshold per ADR-0020 §1. Payloads strictly smaller
 /// than this go in `observation.payload_inline` as raw bytes;
-/// payloads at-or-above the threshold are written to a [`BlobStore`]
-/// and `observation.payload_hash` carries the 32-byte BLAKE3 hash.
+/// payloads at-or-above the threshold are content-addressed into the
+/// arena-local `observation_blobs` table and `observation.payload_hash`
+/// carries the 32-byte BLAKE3 hash.
 ///
 /// 4096 bytes was chosen because:
 ///
@@ -65,7 +67,7 @@ pub const INLINE_THRESHOLD: usize = 4096;
 ///   registry (`agent.session_turn`, `code.symbol_def`, ...).
 /// - `payload_inline` — raw payload bytes when smaller than
 ///   [`INLINE_THRESHOLD`]; `NULL` when the payload was hashed.
-/// - `payload_hash` — 32-byte BLAKE3 hash into the [`BlobStore`] when
+/// - `payload_hash` — 32-byte BLAKE3 hash into `observation_blobs` when
 ///   the payload is at-or-above [`INLINE_THRESHOLD`]; `NULL` when
 ///   inline.
 /// - `mentions` — JSON array of stable tokens this observation
@@ -103,9 +105,79 @@ pub fn create_observation_schema(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS observation_by_mentions
              ON observation(mentions);
 
+         CREATE TABLE IF NOT EXISTS observation_blobs (
+             blob_hash  BLOB PRIMARY KEY,
+             blob_bytes BLOB NOT NULL,
+             byte_len   INTEGER GENERATED ALWAYS AS (length(blob_bytes)) STORED
+         );
+
          COMMIT;",
     )
     .context("create observation schema")
+}
+
+/// The `(payload_inline, payload_hash)` column pair for one observation
+/// row. Exactly one side is `Some`: small payloads carry `payload_inline`,
+/// at-or-above-[`INLINE_THRESHOLD`] payloads carry `payload_hash`.
+pub type ObservationPayloadColumns = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// Store an observation payload per ADR-0020 §1's inline-vs-hash rule,
+/// keeping everything durable in the one `.db` (arena-local dedup — the
+/// same pattern `source_blobs`/`capnp_blobs` use, so an arena stays a
+/// single portable file; no sidecar to detach).
+///
+/// Returns `(payload_inline, payload_hash)` for the observation row:
+/// - payload strictly below [`INLINE_THRESHOLD`] ⇒ `(Some(bytes), None)`.
+/// - payload at-or-above ⇒ the bytes are content-addressed into
+///   `observation_blobs` (idempotent `INSERT OR IGNORE`, so identical
+///   payloads dedup) and `(None, Some(σ-hash))` is returned.
+///
+/// σ is [`ContentAddressed::hash`], the sanctioned substrate hash — not a
+/// raw `blake3::hash` — so this stays on the locked Σ path.
+pub fn put_observation_payload(
+    conn: &Connection,
+    bytes: &[u8],
+) -> Result<ObservationPayloadColumns> {
+    if bytes.len() < INLINE_THRESHOLD {
+        return Ok((Some(bytes.to_vec()), None));
+    }
+    let hash = bytes.hash();
+    let hash_bytes = hash.as_bytes().to_vec();
+    conn.execute(
+        "INSERT OR IGNORE INTO observation_blobs (blob_hash, blob_bytes) VALUES (?1, ?2)",
+        rusqlite::params![hash_bytes, bytes],
+    )
+    .context("insert observation blob")?;
+    Ok((None, Some(hash_bytes)))
+}
+
+/// Resolve an observation payload back to its bytes: inline bytes if
+/// present, otherwise the content-addressed blob keyed by `hash`.
+///
+/// Verifies `σ(bytes) == hash` on read — the BlobStore verify-on-read
+/// contract (substrate.rs), applied to the arena-local table so a
+/// corrupted or tampered blob is refused rather than returned.
+pub fn get_observation_payload(
+    conn: &Connection,
+    inline: Option<&[u8]>,
+    hash: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    if let Some(b) = inline {
+        return Ok(b.to_vec());
+    }
+    let hash = hash.context("observation payload has neither inline bytes nor a hash")?;
+    let bytes: Vec<u8> = conn
+        .query_row(
+            "SELECT blob_bytes FROM observation_blobs WHERE blob_hash = ?1",
+            rusqlite::params![hash],
+            |r| r.get(0),
+        )
+        .context("observation blob not found for hash")?;
+    anyhow::ensure!(
+        bytes.hash().as_bytes().as_slice() == hash,
+        "observation blob failed σ verification (corruption or tamper)",
+    );
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -191,6 +263,93 @@ mod tests {
                 "observed_at".to_string(),
             ],
             "observation column set must match ADR-0020 §1",
+        );
+    }
+
+    // ── arena-local blob store for large payloads (bead d24e68) ──────
+
+    #[test]
+    fn create_observation_schema_creates_blob_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_observation_schema(&conn).unwrap();
+        assert_schema_object_exists(&conn, "table", "observation_blobs");
+    }
+
+    #[test]
+    fn sub_threshold_payload_stays_inline() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_observation_schema(&conn).unwrap();
+        let bytes = vec![7u8; INLINE_THRESHOLD - 1];
+        let (inline, hash) = put_observation_payload(&conn, &bytes).unwrap();
+        assert_eq!(inline.as_deref(), Some(bytes.as_slice()));
+        assert!(hash.is_none(), "sub-threshold payload must not be hashed");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM observation_blobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "no blob row for an inline payload");
+    }
+
+    /// The load-bearing case: a payload at-or-above the threshold must go
+    /// to the content-addressed table (not inline), and read back identical.
+    #[test]
+    fn at_threshold_payload_goes_to_blob_table_and_round_trips() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_observation_schema(&conn).unwrap();
+        let bytes = vec![9u8; INLINE_THRESHOLD]; // == threshold ⇒ hashed
+        let (inline, hash) = put_observation_payload(&conn, &bytes).unwrap();
+        assert!(
+            inline.is_none(),
+            "at-or-above threshold must not store inline"
+        );
+        let hash = hash.expect("must carry a 32-byte hash");
+        assert_eq!(hash.len(), 32);
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM observation_blobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        let got = get_observation_payload(&conn, None, Some(&hash)).unwrap();
+        assert_eq!(got, bytes, "blob must read back byte-identical");
+    }
+
+    #[test]
+    fn identical_large_payloads_dedup_to_one_blob() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_observation_schema(&conn).unwrap();
+        let bytes = vec![3u8; INLINE_THRESHOLD + 100];
+        let (_, h1) = put_observation_payload(&conn, &bytes).unwrap();
+        let (_, h2) = put_observation_payload(&conn, &bytes).unwrap();
+        assert_eq!(h1, h2, "same bytes ⇒ same hash");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM observation_blobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "identical payloads must dedup to one row");
+    }
+
+    #[test]
+    fn get_payload_prefers_inline_bytes() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_observation_schema(&conn).unwrap();
+        let bytes = vec![1u8; 10];
+        let got = get_observation_payload(&conn, Some(&bytes), None).unwrap();
+        assert_eq!(got, bytes);
+    }
+
+    /// verify-on-read: a blob whose stored bytes don't match the hash is
+    /// rejected, mirroring the BlobStore σ(v)==h contract.
+    #[test]
+    fn get_payload_rejects_a_corrupted_blob() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_observation_schema(&conn).unwrap();
+        let hash = vec![4u8; 32];
+        // Store bytes under a hash that is NOT their σ.
+        conn.execute(
+            "INSERT INTO observation_blobs (blob_hash, blob_bytes) VALUES (?1, ?2)",
+            rusqlite::params![hash, vec![0u8; 64]],
+        )
+        .unwrap();
+        assert!(
+            get_observation_payload(&conn, None, Some(&hash)).is_err(),
+            "corrupted blob (σ(bytes) != hash) must be refused"
         );
     }
 

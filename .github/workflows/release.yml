@@ -30,6 +30,11 @@ on:
 # below escalates only the permissions it actually needs.
 permissions: {}
 
+env:
+  CARGO_TERM_COLOR: always
+  SCCACHE_DIR: ${{ github.workspace }}/.cache/sccache
+  SCCACHE_CACHE_SIZE: 2G
+
 # Serialize tag releases — two simultaneous tag pushes would race on
 # the same GitHub release object (asset uploads overwrite each other).
 concurrency:
@@ -62,7 +67,7 @@ jobs:
     needs: create-release
     runs-on: ${{ matrix.os }}
     permissions:
-      contents: write # to upload assets to the release object
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -100,8 +105,7 @@ jobs:
       # SHA-pinned: actions/checkout@v6.0.2 (matches ci.yml).
       # `persist-credentials: false` so the GITHUB_TOKEN written by
       # checkout into the local git config can't be used by later
-      # steps to push back — the upload step uses an explicit, scoped
-      # GH_TOKEN env var instead.
+      # steps to push back. Build jobs have no release write permission.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
@@ -115,6 +119,14 @@ jobs:
           # (daf2e5e18 2026-07-13) rolls out.
           toolchain: 1.97.1  # must equal rust-toolchain.toml (task lint:toolchain-parity)
           targets: ${{ matrix.target }}
+
+      # Cargo registry/git inputs only. Compiler outputs are handled by the
+      # Taskfile-managed sccache below; duplicating target/ made the old cache
+      # both large and ineffective against final-link failures.
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0
+        with:
+          workspaces: rs
+          cache-targets: false
 
       - name: Install system deps (capnproto + pkg-config; libcapnp-dev only on Linux)
         run: |
@@ -134,34 +146,31 @@ jobs:
           capnp --version
           pkg-config --version
 
+      # Exact Taskfile version used by local development and ci.yml.
+      - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611
+        with:
+          version: 3.49.1
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # SHA-pinned: actions/cache@v6.1.0 (Node 24).
+      - name: Restore target compiler cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .cache/sccache
+          key: sccache-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-rust-1.97.1-${{ hashFiles('rs/Cargo.lock') }}
+          restore-keys: |
+            sccache-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-rust-1.97.1-
+
+      - name: Install pinned sccache through Taskfile
+        run: task cache:sccache:install
+
+      - name: Reset sccache statistics
+        run: task cache:sccache:zero
+
       - name: Build leyline (release, default features)
         env:
           BUILD_TARGET: ${{ matrix.target }}
-        run: |
-          cargo build --release --manifest-path rs/Cargo.toml \
-            -p leyline-cli --target "$BUILD_TARGET"
-
-      - name: Stage release artifact
-        env:
-          BUILD_TARGET: ${{ matrix.target }}
-          ASSET_NAME: ${{ matrix.asset }}
-        run: |
-          cp "rs/target/$BUILD_TARGET/release/leyline" "$ASSET_NAME"
-          chmod +x "$ASSET_NAME"
-          file "$ASSET_NAME"
-          ls -lh "$ASSET_NAME"
-
-      - name: Upload to GitHub release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
-          ASSET_NAME: ${{ matrix.asset }}
-        run: |
-          # --clobber so re-running a job (e.g. transient build flake)
-          # replaces the prior upload of the same asset rather than
-          # erroring on conflict. Idempotent end-to-end.
-          gh release upload "$TAG" "$ASSET_NAME" --clobber
+        run: task release:target
 
       # ---- FFI staticlib (consumed by mache's release build) ----
       # mache links `libleyline_fs-<os>-<arch>.a` + `leyline_fs.h` to build
@@ -184,35 +193,73 @@ jobs:
         if: matrix.lib_asset
         env:
           BUILD_TARGET: ${{ matrix.target }}
-        run: |
-          # macOS: the `fuse` feature pulls in `fuser`, whose build.rs probes
-          # pkg-config for `fuse`/`osxfuse`. fuse-t ships no such .pc, so point
-          # pkg-config at the bundled wrapper (same as the Taskfile does for
-          # task builds). Linux finds fuse.pc via system libfuse3-dev.
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            export PKG_CONFIG_PATH="$PWD/rs/pkgconfig"
-          fi
-          cargo build --release --lib -p leyline-fs \
-            --manifest-path rs/Cargo.toml --target "$BUILD_TARGET"
+        run: task release:fs-static:target
 
-      - name: Upload staticlib
-        if: matrix.lib_asset
+      - name: Stage exact build outputs and checksum manifest
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
           BUILD_TARGET: ${{ matrix.target }}
+          ASSET_NAME: ${{ matrix.asset }}
           LIB_ASSET: ${{ matrix.lib_asset }}
-        run: |
-          cp "rs/target/$BUILD_TARGET/release/libleyline_fs.a" "$LIB_ASSET"
-          ls -lh "$LIB_ASSET"
-          gh release upload "$TAG" "$LIB_ASSET" --clobber
+          INCLUDE_HEADER: ${{ matrix.include_header }}
+        run: task release:artifacts:stage
 
-      - name: Upload FFI header (once)
-        if: matrix.include_header
+      # SHA-pinned: actions/upload-artifact@v7.0.1 (Node 24). Build jobs only
+      # write workflow artifacts; they never receive release write permission.
+      - name: Upload immutable workflow artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-${{ matrix.asset }}
+          path: .artifacts/staged/${{ matrix.asset }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      - name: Report sccache statistics
+        if: always()
+        run: task cache:sccache:stats
+
+  publish:
+    name: Verify and publish release assets
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611
+        with:
+          version: 3.49.1
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # SHA-pinned: actions/download-artifact@v8.0.1 (Node 24). GitHub also
+      # validates the service-provided artifact digest during download; the
+      # committed verifier below checks our per-file manifests and uniqueness.
+      - name: Download all target artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: release-*
+          path: .artifacts/downloaded
+
+      - name: Verify manifests and reject duplicate assets
+        env:
+          ARTIFACT_ROOT: ${{ github.workspace }}/.artifacts/downloaded
+        run: task release:artifacts:verify
+
+      - name: Upload verified bytes to GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
-          gh release upload "$TAG" rs/ll-open/fs/include/leyline_fs.h --clobber
+          mapfile -t ASSETS < <(
+            find .artifacts/downloaded -mindepth 2 -maxdepth 2 \
+              -type f ! -name SHA256SUMS -print | LC_ALL=C sort
+          )
+          if [ "${#ASSETS[@]}" -eq 0 ]; then
+            echo "no verified release assets found"
+            exit 1
+          fi
+          gh release upload "$TAG" "${ASSETS[@]}" --clobber

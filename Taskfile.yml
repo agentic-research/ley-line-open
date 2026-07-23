@@ -4,20 +4,18 @@ version: '3'
 # Workflows (.github/workflows/) should call `task <name>`, never raw cargo.
 
 vars:
+  SCCACHE_VERSION: 0.15.0
+  SCCACHE_BIN: '{{.ROOT_DIR}}/.tools/bin/sccache'
   # macOS needs our fuse-t pkg-config wrapper; Linux uses system libfuse3.
   FUSE_PKG_CONFIG_PATH:
     sh: 'if [ "$(uname)" = "Darwin" ]; then echo "{{.ROOT_DIR}}/rs/pkgconfig"; fi'
 
 env:
   PKG_CONFIG_PATH: '{{.FUSE_PKG_CONFIG_PATH}}'
-  # Conditional sccache acceleration — the `sh:` block resolves to
-  # the sccache binary path when it's installed (e.g. `brew install
-  # sccache`), otherwise an empty string. Empty RUSTC_WRAPPER is a
-  # no-op for cargo, so contributors without sccache see no change;
-  # contributors with it get cross-invocation caching of byte-stable
-  # dep compilation (bead ley-line-open-488440).
+  # Prefer the Taskfile-pinned binary installed by cache:sccache:install.
+  # Standalone tasks retain the old optional-system-sccache behavior.
   RUSTC_WRAPPER:
-    sh: command -v sccache 2>/dev/null || true
+    sh: 'if [ -x "{{.SCCACHE_BIN}}" ]; then echo "{{.SCCACHE_BIN}}"; else command -v sccache 2>/dev/null || true; fi'
 
 tasks:
   default:
@@ -60,6 +58,121 @@ tasks:
         done
         [ "$FAIL" = "0" ] || { echo "--- fix: make the workflow pins match rust-toolchain.toml (or update both together)"; exit 1; }
         echo "toolchain parity OK — workflows and rust-toolchain.toml both pin $PIN"
+
+  lint:cache-contract:
+    desc: Verify the Taskfile-owned compiler-cache and release-artifact contract
+    cmds:
+      - |
+        set -eu
+        test -x tools/install_sccache.sh
+        test -f tools/sccache-checksums.txt
+        grep -q 'sccache-v0.15.0-' tools/sccache-checksums.txt
+        grep -q '^\.tools/$' .gitignore
+        grep -q '^\.cache/$' .gitignore
+        grep -q 'cache:sccache:install:' Taskfile.yml
+        grep -q 'cache:sccache:verify:' Taskfile.yml
+        grep -q 'cache:sccache:stats:' Taskfile.yml
+        grep -q 'sources:' Taskfile.yml
+        grep -q 'generates:' Taskfile.yml
+        test -f .cargo/config.toml
+        grep -q 'link-arg=-Wl,--threads=2' .cargo/config.toml
+        grep -q 'task cache:sccache:install' .github/workflows/ci.yml
+        grep -q 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' .github/workflows/ci.yml
+        grep -q 'path: .cache/sccache' .github/workflows/ci.yml
+        grep -q 'task cache:sccache:stats' .github/workflows/ci.yml
+        if grep -Eq 'run:.*cargo (build|test|clippy)' .github/workflows/ci.yml; then
+          echo "ci.yml must delegate Rust commands to Taskfile.yml"
+          exit 1
+        fi
+        test -x tools/stage_release_artifacts.sh
+        test -x tools/verify_release_artifacts.sh
+        grep -q 'release:artifacts:stage:' Taskfile.yml
+        grep -q 'release:artifacts:verify:' Taskfile.yml
+        grep -q -- '- task: release:artifacts:fixture-test' Taskfile.yml
+        grep -q 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' .github/workflows/release.yml
+        grep -q 'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c' .github/workflows/release.yml
+        awk '
+          /^  build:/ { section = "build" }
+          /^  publish:/ { section = "publish" }
+          /^  [a-zA-Z0-9_-]+:/ && $1 != "build:" && $1 != "publish:" { section = "" }
+          section == "build" && /contents: read/ { build_read = 1 }
+          section == "publish" && /contents: write/ { publish_write = 1 }
+          END { exit !(build_read && publish_write) }
+        ' .github/workflows/release.yml
+        if grep -Eq '^[[:space:]]+cargo build ' .github/workflows/release.yml; then
+          echo "release.yml must delegate Cargo builds to Taskfile.yml"
+          exit 1
+        fi
+        echo "cache contract OK"
+
+  cache:sccache:install:
+    desc: Install the pinned sccache binary for this host
+    sources:
+      - tools/install_sccache.sh
+      - tools/sccache-checksums.txt
+    generates:
+      - .tools/bin/sccache
+    method: checksum
+    cmds:
+      - tools/install_sccache.sh "{{.SCCACHE_VERSION}}" "{{.SCCACHE_BIN}}" tools/sccache-checksums.txt
+
+  cache:sccache:verify:
+    desc: Verify the Taskfile-managed sccache version
+    deps: [cache:sccache:install]
+    cmds:
+      - |
+        test "$("{{.SCCACHE_BIN}}" --version)" = "sccache {{.SCCACHE_VERSION}}"
+        echo "sccache parity OK — $("{{.SCCACHE_BIN}}" --version)"
+
+  cache:sccache:zero:
+    desc: Reset compiler-cache statistics without deleting cached objects
+    deps: [cache:sccache:install]
+    cmds:
+      - '"{{.SCCACHE_BIN}}" --zero-stats'
+
+  cache:sccache:stats:
+    desc: Print compiler-cache statistics
+    cmds:
+      - |
+        if [ -x "{{.SCCACHE_BIN}}" ]; then
+          "{{.SCCACHE_BIN}}" --show-stats
+        else
+          echo "Taskfile-managed sccache is not installed; no stats available"
+        fi
+
+  release:artifacts:fixture-test:
+    desc: Prove staged release manifests accept exact bytes and reject corruption
+    vars:
+      FIXTURE_DIR:
+        sh: mktemp -d "${TMPDIR:-/tmp}/leyline-release-fixture.XXXXXX"
+    cmds:
+      - defer: rm -r "{{.FIXTURE_DIR}}"
+      - |
+        set -eu
+        printf '#!/bin/sh\nexit 0\n' > "{{.FIXTURE_DIR}}/leyline"
+        chmod +x "{{.FIXTURE_DIR}}/leyline"
+        printf 'staticlib' > "{{.FIXTURE_DIR}}/libleyline_fs.a"
+        printf 'header' > "{{.FIXTURE_DIR}}/leyline_fs.h"
+      - task: release:artifacts:stage
+        vars:
+          BUILD_TARGET: fixture-target
+          ASSET_NAME: leyline-test-amd64
+          OUTPUT_DIR: '{{.FIXTURE_DIR}}/artifacts/leyline-test-amd64'
+          CLI_SOURCE: '{{.FIXTURE_DIR}}/leyline'
+          LIB_ASSET: libleyline_fs-test-amd64.a
+          STATICLIB_SOURCE: '{{.FIXTURE_DIR}}/libleyline_fs.a'
+          INCLUDE_HEADER: "true"
+          HEADER_SOURCE: '{{.FIXTURE_DIR}}/leyline_fs.h'
+      - task: release:artifacts:verify
+        vars:
+          ARTIFACT_ROOT: '{{.FIXTURE_DIR}}/artifacts'
+      - |
+        printf 'corruption' >> "{{.FIXTURE_DIR}}/artifacts/leyline-test-amd64/leyline-test-amd64"
+        if tools/verify_release_artifacts.sh "{{.FIXTURE_DIR}}/artifacts"; then
+          echo "corrupted release artifact unexpectedly verified"
+          exit 1
+        fi
+        echo "release artifact fixture accepted exact bytes and rejected corruption"
 
   check:all-features:
     desc: |
@@ -135,6 +248,58 @@ tasks:
     dir: rs
     cmds:
       - cargo build --release -p leyline-cli --features full
+
+  release:target:
+    desc: Build the release CLI for BUILD_TARGET (used by release.yml)
+    deps: [cache:sccache:install]
+    requires:
+      vars: [BUILD_TARGET]
+    dir: rs
+    cmds:
+      - cargo build --release -p leyline-cli --target "{{.BUILD_TARGET}}"
+
+  release:fs-static:target:
+    desc: Build the leyline-fs release staticlib for BUILD_TARGET
+    deps: [cache:sccache:install]
+    requires:
+      vars: [BUILD_TARGET]
+    dir: rs
+    cmds:
+      - cargo build --release --lib -p leyline-fs --target "{{.BUILD_TARGET}}"
+
+  release:artifacts:stage:
+    desc: Stage one target's exact release outputs and SHA-256 manifest
+    requires:
+      vars: [BUILD_TARGET, ASSET_NAME]
+    vars:
+      DEFAULT_OUTPUT_DIR: '{{.ROOT_DIR}}/.artifacts/staged/{{.ASSET_NAME}}'
+      DEFAULT_CLI_SOURCE: '{{.ROOT_DIR}}/rs/target/{{.BUILD_TARGET}}/release/leyline'
+      DEFAULT_STATICLIB_SOURCE: '{{.ROOT_DIR}}/rs/target/{{.BUILD_TARGET}}/release/libleyline_fs.a'
+      DEFAULT_HEADER_SOURCE: '{{.ROOT_DIR}}/rs/ll-open/fs/include/leyline_fs.h'
+    env:
+      ASSET_NAME: '{{.ASSET_NAME}}'
+      BUILD_TARGET: '{{.BUILD_TARGET}}'
+      OUTPUT_DIR: '{{.OUTPUT_DIR | default .DEFAULT_OUTPUT_DIR}}'
+      CLI_SOURCE: '{{.CLI_SOURCE | default .DEFAULT_CLI_SOURCE}}'
+      LIB_ASSET: '{{.LIB_ASSET | default ""}}'
+      INCLUDE_HEADER: '{{.INCLUDE_HEADER | default "false"}}'
+    cmds:
+      - |
+        set -eu
+        if [ -n "${LIB_ASSET:-}" ]; then
+          export STATICLIB_SOURCE='{{.STATICLIB_SOURCE | default .DEFAULT_STATICLIB_SOURCE}}'
+        fi
+        if [ "${INCLUDE_HEADER:-false}" = "true" ]; then
+          export HEADER_SOURCE='{{.HEADER_SOURCE | default .DEFAULT_HEADER_SOURCE}}'
+        fi
+        tools/stage_release_artifacts.sh
+
+  release:artifacts:verify:
+    desc: Verify downloaded release artifact manifests and unique asset names
+    requires:
+      vars: [ARTIFACT_ROOT]
+    cmds:
+      - tools/verify_release_artifacts.sh "{{.ARTIFACT_ROOT}}"
 
   install:full:
     desc: Build with `--features all` (everything except mount), codesign (macOS), and install to ~/.local/bin. Portable — no system-dep prerequisites. This is the recommended full install for mache + downstream daemon consumers.
@@ -290,6 +455,19 @@ tasks:
     dir: rs
     cmds:
       - cargo check --workspace
+
+  check:commit:
+    desc: Fast pre-commit gate — staged whitespace, Rust formatting, and type-check
+    deps: [cache:sccache:install]
+    cmds:
+      - task: lint:staged
+      - task: fmt:check
+      - task: check
+
+  lint:staged:
+    desc: Reject whitespace errors in the exact patch staged for commit
+    cmds:
+      - git diff --cached --check
 
   fmt:check:
     desc: Verify formatting (CI gate; use `task fmt` locally to fix)
@@ -628,6 +806,7 @@ tasks:
 
   ci:
     desc: Common CI gate — runs on every PR. Excludes `test:perf` (release-profile rebuild adds ~90-120s; main-push-only via ci.yml's conditional `test:perf` step). For the full main-push gate locally, run `task ci:full`.
+    deps: [cache:sccache:install]
     cmds:
       # Compile-free gates first (sub-second): a formatting slip or lint
       # hit fails here instead of after minutes of check+clippy — 3 of 6
@@ -635,6 +814,8 @@ tasks:
       # fmt:check at its old position (bead ley-line-open-9ca974).
       - task: fmt:check
       - task: lint:toolchain-parity
+      - task: lint:cache-contract
+      - task: release:artifacts:fixture-test
       - task: lint:blake3
       - task: readme:version-check
       - task: check

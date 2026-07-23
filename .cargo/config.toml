@@ -1,0 +1,6 @@
+# Rust 1.90+ defaults Linux x86_64 to rust-lld. GitHub's 4-vCPU hosted runner
+# saw rust-lld receive SIGBUS inside llvm::parallelFor while several large test
+# binaries linked concurrently. Limit LLD's internal workers without globally
+# serializing Cargo compilation or changing the linker on other targets.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,--threads=2"]

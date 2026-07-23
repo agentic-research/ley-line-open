@@ -31,7 +31,16 @@ repos:
       # tests + compat/regen/readme checks). Invokes `task ci` verbatim.
       - id: task-ci
         name: task ci (1:1 with CI — full gate before push)
-        entry: task ci
+        # `env -u GIT_DIR -u GIT_INDEX_FILE` is load-bearing for the 1:1 claim.
+        # git exports GIT_DIR (and GIT_INDEX_FILE) into hook processes, and it
+        # is inherited all the way down into test subprocesses. Tests that shell
+        # out to git in a tempdir (cli-lib's `cmd_daemon` git_* / watcher_*
+        # tests) then operate on THIS repo instead: `git init -q` fails and
+        # `git_head(tempdir)` returns this repo's HEAD. Result: 7 tests fail at
+        # push time and pass in CI — exactly the local/CI disagreement this
+        # file exists to prevent. CI has no GIT_DIR, so unsetting it here is
+        # what makes the two environments equal.
+        entry: env -u GIT_DIR -u GIT_INDEX_FILE task ci
         language: system
         pass_filenames: false
         always_run: true

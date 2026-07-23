@@ -84,6 +84,24 @@ tasks:
           echo "ci.yml must delegate Rust commands to Taskfile.yml"
           exit 1
         fi
+        test -x tools/stage_release_artifacts.sh
+        test -x tools/verify_release_artifacts.sh
+        grep -q 'release:artifacts:stage:' Taskfile.yml
+        grep -q 'release:artifacts:verify:' Taskfile.yml
+        grep -q 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' .github/workflows/release.yml
+        grep -q 'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c' .github/workflows/release.yml
+        awk '
+          /^  build:/ { section = "build" }
+          /^  publish:/ { section = "publish" }
+          /^  [a-zA-Z0-9_-]+:/ && $1 != "build:" && $1 != "publish:" { section = "" }
+          section == "build" && /contents: read/ { build_read = 1 }
+          section == "publish" && /contents: write/ { publish_write = 1 }
+          END { exit !(build_read && publish_write) }
+        ' .github/workflows/release.yml
+        if grep -Eq '^[[:space:]]+cargo build ' .github/workflows/release.yml; then
+          echo "release.yml must delegate Cargo builds to Taskfile.yml"
+          exit 1
+        fi
         echo "cache contract OK"
 
   cache:sccache:install:
@@ -120,6 +138,32 @@ tasks:
         else
           echo "Taskfile-managed sccache is not installed; no stats available"
         fi
+
+  release:artifacts:fixture-test:
+    desc: Prove staged release manifests accept exact bytes and reject corruption
+    cmds:
+      - |
+        set -eu
+        FIXTURE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/leyline-release-fixture.XXXXXX")
+        printf '#!/bin/sh\nexit 0\n' > "$FIXTURE_DIR/leyline"
+        chmod +x "$FIXTURE_DIR/leyline"
+        printf 'staticlib' > "$FIXTURE_DIR/libleyline_fs.a"
+        printf 'header' > "$FIXTURE_DIR/leyline_fs.h"
+        OUTPUT_DIR="$FIXTURE_DIR/artifacts/leyline-test-amd64" \
+          CLI_SOURCE="$FIXTURE_DIR/leyline" \
+          ASSET_NAME="leyline-test-amd64" \
+          STATICLIB_SOURCE="$FIXTURE_DIR/libleyline_fs.a" \
+          LIB_ASSET="libleyline_fs-test-amd64.a" \
+          HEADER_SOURCE="$FIXTURE_DIR/leyline_fs.h" \
+          tools/stage_release_artifacts.sh
+        tools/verify_release_artifacts.sh "$FIXTURE_DIR/artifacts"
+        printf 'corruption' >> "$FIXTURE_DIR/artifacts/leyline-test-amd64/leyline-test-amd64"
+        if tools/verify_release_artifacts.sh "$FIXTURE_DIR/artifacts"; then
+          echo "corrupted release artifact unexpectedly verified"
+          exit 1
+        fi
+        rm -rf "$FIXTURE_DIR"
+        echo "release artifact fixture accepted exact bytes and rejected corruption"
 
   check:all-features:
     desc: |
@@ -195,6 +239,48 @@ tasks:
     dir: rs
     cmds:
       - cargo build --release -p leyline-cli --features full
+
+  release:target:
+    desc: Build the release CLI for BUILD_TARGET (used by release.yml)
+    deps: [cache:sccache:install]
+    requires:
+      vars: [BUILD_TARGET]
+    dir: rs
+    cmds:
+      - cargo build --release -p leyline-cli --target "{{.BUILD_TARGET}}"
+
+  release:fs-static:target:
+    desc: Build the leyline-fs release staticlib for BUILD_TARGET
+    deps: [cache:sccache:install]
+    requires:
+      vars: [BUILD_TARGET]
+    dir: rs
+    cmds:
+      - cargo build --release --lib -p leyline-fs --target "{{.BUILD_TARGET}}"
+
+  release:artifacts:stage:
+    desc: Stage one target's exact release outputs and SHA-256 manifest
+    requires:
+      vars: [BUILD_TARGET, ASSET_NAME]
+    cmds:
+      - |
+        set -eu
+        export OUTPUT_DIR="{{.ROOT_DIR}}/.artifacts/staged/$ASSET_NAME"
+        export CLI_SOURCE="{{.ROOT_DIR}}/rs/target/$BUILD_TARGET/release/leyline"
+        if [ -n "${LIB_ASSET:-}" ]; then
+          export STATICLIB_SOURCE="{{.ROOT_DIR}}/rs/target/$BUILD_TARGET/release/libleyline_fs.a"
+        fi
+        if [ "${INCLUDE_HEADER:-false}" = "true" ]; then
+          export HEADER_SOURCE="{{.ROOT_DIR}}/rs/ll-open/fs/include/leyline_fs.h"
+        fi
+        tools/stage_release_artifacts.sh
+
+  release:artifacts:verify:
+    desc: Verify downloaded release artifact manifests and unique asset names
+    requires:
+      vars: [ARTIFACT_ROOT]
+    cmds:
+      - tools/verify_release_artifacts.sh "{{.ARTIFACT_ROOT}}"
 
   install:full:
     desc: Build with `--features all` (everything except mount), codesign (macOS), and install to ~/.local/bin. Portable — no system-dep prerequisites. This is the recommended full install for mache + downstream daemon consumers.

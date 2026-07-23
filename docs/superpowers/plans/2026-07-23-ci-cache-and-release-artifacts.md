@@ -29,7 +29,7 @@
 
 **Interfaces:**
 - Consumes: `SCCACHE_VERSION=0.15.0`, host `uname -s`/`uname -m`, official Mozilla release archives.
-- Produces: `.tools/bin/sccache`, `cache:sccache:install`, `cache:sccache:verify`, `cache:sccache:stats`, and Taskfile `RUSTC_WRAPPER`/`SCCACHE_DIR`.
+- Produces: `.tools/bin/sccache`, `cache:sccache:install`, `cache:sccache:verify`, `cache:sccache:stats`, and Taskfile `RUSTC_WRAPPER`. Local storage uses sccache's cross-project platform default; CI explicitly scopes storage to `.cache/sccache`.
 
 - [ ] **Step 1: Add the bootstrap contract test before the implementation**
 

@@ -81,8 +81,10 @@ responsibilities remain:
   write permission.
 
 The repository-local tool directory and transient staged artifacts remain
-ignored. Developers with a compatible system `sccache` may use it, but the
-pinned Taskfile path is authoritative for parity runs.
+ignored. The pinned Taskfile executable is authoritative for parity runs.
+Local builds retain sccache's platform-default cache directory so sibling
+repositories and worktrees share compiler outputs; ephemeral runners set
+`SCCACHE_DIR` to `.cache/sccache` so Actions can persist an isolated cache.
 
 ## Cache boundaries
 
@@ -92,6 +94,9 @@ pinned Taskfile path is authoritative for parity runs.
   the publish job.
 - Compiler cache entries may be reused only within the cache backend's
   content-addressed and platform/target-compatible scope.
+- Local caches may span trusted sibling repositories. Runner caches remain
+  scoped by GitHub's branch/cache rules plus OS, architecture, target, Rust
+  version, and Cargo lockfile keys.
 - The final linker still runs for each target. Caching compiler outputs is not
   treated as proof of final-artifact identity.
 - Cache credentials, if a remote backend is later configured, remain

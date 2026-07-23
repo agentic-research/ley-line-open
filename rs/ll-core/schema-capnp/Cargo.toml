@@ -2,7 +2,7 @@
 name = "leyline-schema-capnp"
 version = "0.10.1"
 edition = "2024"
-license = "AGPL-3.0-or-later"
+license = "Apache-2.0"
 description = "Cap'n Proto schemas for Σ event log — typed producer/consumer contract (T8)"
 
 [dependencies]

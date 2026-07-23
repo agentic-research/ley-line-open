@@ -262,4 +262,21 @@ Per-layer schema partitioning lives in [`docs/TABLE_CONTRACT.md`](docs/TABLE_CON
 
 ## License
 
-AGPL-3.0 — see [LICENSE](LICENSE).
+**Split by layer: the interface is permissive, the implementation is copyleft.**
+
+| Layer | License | Why |
+|---|---|---|
+| Schema / wire contracts | [Apache-2.0](LICENSE-APACHE) | So other runtimes can implement and consume the contract without inheriting copyleft |
+| Everything else | [AGPL-3.0-or-later](LICENSE) | The engine itself |
+
+Apache-2.0 covers exactly the crates that define the cross-runtime contract, and nothing that implements it:
+
+- `clients/go/leyline-schema/` — the generated Go bindings (this is what [mache](https://github.com/agentic-research/mache) imports)
+- `rs/ll-core/schema-capnp` — the `.capnp` wire definitions and their generated Rust
+- `rs/ll-core/public-schema` — the public capnp surface
+- `rs/ll-core/schema` — the canonical `nodes` table DDL ("mache writes it, leyline-fs reads it")
+- `rs/ll-core/schema-spec` — wire specs (`leyline-net`, `mcp-tool`, `credential-isolation`, `build-cache`)
+
+This is effective rather than nominal: none of those crates depend on an AGPL crate in this workspace. Their only dependencies are third-party permissive ones (`capnp`, `capnp-json`, `rusqlite`, `anyhow`). The dependency edge runs one way — AGPL crates consume the schema crates, never the reverse — so a downstream consumer can take the contract alone without linking the engine.
+
+Consuming the schema does not oblige you under the AGPL. Linking `leyline-core`, `leyline-fs`, `leyline-cli-lib`, or any other implementation crate does.

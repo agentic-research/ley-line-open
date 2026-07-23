@@ -1,4 +1,55 @@
 {
   "version": 1,
-  "counts": []
+  "counts": [
+    {
+      "rule_id": "sleep_in_tests",
+      "source_id": "rs/ll-core/core/src/control.rs",
+      "count": 1
+    },
+    {
+      "rule_id": "sleep_in_tests",
+      "source_id": "rs/ll-open/cli-lib/benches/wal_concurrent_readers.rs",
+      "count": 1
+    },
+    {
+      "rule_id": "sleep_in_tests",
+      "source_id": "rs/ll-open/cli-lib/benches/wal_snapshot_experiment.rs",
+      "count": 2
+    },
+    {
+      "rule_id": "sleep_in_tests",
+      "source_id": "rs/ll-open/cli-lib/tests/event_push_blackbox_test.rs",
+      "count": 2
+    },
+    {
+      "rule_id": "sleep_in_tests",
+      "source_id": "rs/ll-open/cli-lib/tests/integration.rs",
+      "count": 5
+    },
+    {
+      "rule_id": "sleep_in_tests",
+      "source_id": "rs/ll-open/cli-lib/tests/substrate/f1_crash_mid_write.rs",
+      "count": 1
+    },
+    {
+      "rule_id": "sleep_in_tests",
+      "source_id": "rs/ll-open/cli-lib/tests/version_handshake_blackbox_test.rs",
+      "count": 1
+    },
+    {
+      "rule_id": "sleep_in_tests",
+      "source_id": "rs/ll-open/cli-lib/tests/wal_pool_concurrent_readers_daemon_test.rs",
+      "count": 1
+    },
+    {
+      "rule_id": "sleep_in_tests",
+      "source_id": "rs/ll-open/sign/tests/host_adversarial.rs",
+      "count": 8
+    },
+    {
+      "rule_id": "sleep_in_tests",
+      "source_id": "rs/ll-open/sign/tests/host_integration.rs",
+      "count": 3
+    }
+  ]
 }

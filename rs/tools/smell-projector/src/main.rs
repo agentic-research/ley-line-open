@@ -184,6 +184,22 @@ fn schema() -> &'static str {
         -- `#[cfg(test)]` module subtrees are filtered at projection
         -- time. `.expect("msg")` is Rust's canonical annotation for a
         -- panicking accessor and is NOT flagged. Bead 85fb1f follow-up.
+        -- A `thread::sleep` in a test is a race against the scheduler: under
+        -- load the machine loses and the test fails with nothing broken.
+        -- `fs_concurrent_put_get_interleaved` flaked CI on a licensing PR that
+        -- touched zero code. Bead `ley-line-open-c6101e`. Baselined rather
+        -- than gated at zero — some remaining ones are poll-until-ready
+        -- backoffs that need a readiness predicate, not deletion.
+        CREATE TABLE sleep_sites (
+            source_id    TEXT NOT NULL,
+            node_id      TEXT NOT NULL,
+            start_row    INTEGER NOT NULL,
+            start_col    INTEGER NOT NULL,
+            end_row      INTEGER NOT NULL,
+            end_col      INTEGER NOT NULL,
+            PRIMARY KEY (source_id, start_row, start_col)
+        );
+
         CREATE TABLE unwrap_sites (
             source_id    TEXT NOT NULL,
             node_id      TEXT NOT NULL,
@@ -1318,6 +1334,137 @@ fn insert_unwrap_sites(conn: &Connection, rows: &[UnwrapRow]) -> Result<()> {
     Ok(())
 }
 
+/// One `thread::sleep(..)` / `sleep(Duration::..)` call site in test code.
+struct SleepRow {
+    source_id: String,
+    node_id: String,
+    start_row: u32,
+    start_col: u32,
+    end_row: u32,
+    end_col: u32,
+}
+
+/// Byte columns of every sleep call on `line`, or empty.
+///
+/// Matches `thread::sleep(` and `sleep(Duration`. Deliberately narrow: a bare
+/// `sleep(` would catch unrelated helpers, and the two forms above are what
+/// every occurrence in this workspace actually uses.
+fn sleep_positions(line: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    for pat in ["thread::sleep(", "sleep(Duration"] {
+        let mut from = 0usize;
+        while let Some(rel) = line[from..].find(pat) {
+            let col = from + rel;
+            // `thread::sleep(` already covers the `sleep(Duration` inside it —
+            // don't double-count the same call.
+            if pat == "sleep(Duration" && col >= 8 && line[..col].ends_with("thread::") {
+                from = col + pat.len();
+                continue;
+            }
+            out.push(col);
+            from = col + pat.len();
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Walk the workspace and emit one row per sleep call in TEST code.
+///
+/// Scope is the INVERSE of `unsafe_sites`/`unwrap_sites`: those deliberately
+/// skip `/tests/`, `/benches/` and `#[cfg(test)]` modules, because they audit
+/// production code. This rule audits the tests themselves, so it scans exactly
+/// what the others exclude — integration tests under `/tests/`, benches, and
+/// the `#[cfg(test)] mod tests` tail of `/src/` files.
+fn project_sleep_sites(workspace_root: &Path, repo_root: &Path) -> Result<Vec<SleepRow>> {
+    let mut rows = Vec::new();
+    for entry in WalkDir::new(workspace_root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+            continue;
+        }
+        let s = path.to_string_lossy();
+        if s.contains("/target/") {
+            continue;
+        }
+        let in_test_tree = s.contains("/tests/") || s.contains("/benches/");
+        let in_src = s.contains("/src/");
+        if !in_test_tree && !in_src {
+            continue;
+        }
+
+        let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let lines: Vec<&str> = text.lines().collect();
+        // In `/src/` files only the `#[cfg(test)]` tail counts; in a test tree
+        // the whole file does.
+        let test_start = if in_test_tree {
+            0usize
+        } else {
+            match find_test_module_line(&lines) {
+                Some(l) => l,
+                None => continue,
+            }
+        };
+        let inside_raw_string = raw_string_line_mask(&text);
+
+        for (idx, line) in lines.iter().enumerate() {
+            let line_no = idx + 1;
+            if line_no < test_start {
+                continue;
+            }
+            if inside_raw_string.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("*") {
+                continue;
+            }
+            for col in sleep_positions(line) {
+                let src_id = path
+                    .strip_prefix(repo_root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .to_string();
+                rows.push(SleepRow {
+                    node_id: format!("{}:{}:{}", src_id, line_no, col),
+                    source_id: src_id,
+                    start_row: line_no as u32,
+                    start_col: col as u32,
+                    end_row: line_no as u32,
+                    end_col: (col + 5) as u32,
+                });
+            }
+        }
+    }
+    rows.sort_by(|a, b| {
+        (&a.source_id, a.start_row, a.start_col).cmp(&(&b.source_id, b.start_row, b.start_col))
+    });
+    Ok(rows)
+}
+
+fn insert_sleep_sites(conn: &Connection, rows: &[SleepRow]) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "INSERT OR REPLACE INTO sleep_sites (
+            source_id, node_id, start_row, start_col, end_row, end_col
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    for r in rows {
+        stmt.execute(params![
+            r.source_id,
+            r.node_id,
+            r.start_row,
+            r.start_col,
+            r.end_row,
+            r.end_col,
+        ])?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Rule loading + execution
 // ---------------------------------------------------------------------------
@@ -1493,6 +1640,13 @@ fn main() -> Result<()> {
     // JSON rule can gate on the baseline count.
     let unwrap_rows = project_unwrap_sites(&workspace_root, &repo_root)?;
     insert_unwrap_sites(&conn, &unwrap_rows)?;
+
+    // Sleeps in TEST code (bead `ley-line-open-c6101e`) — a wall-clock stop
+    // condition is a race against the scheduler, and one already flaked CI on
+    // an unrelated PR. Inverse scope to the two above: this scans exactly the
+    // test trees they skip.
+    let sleep_rows = project_sleep_sites(&workspace_root, &repo_root)?;
+    insert_sleep_sites(&conn, &sleep_rows)?;
 
     let rules = load_rules(&rules_dir)?;
     if rules.is_empty() {

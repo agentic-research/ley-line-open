@@ -20,6 +20,12 @@ This is the release mache and rosary were both blocked on — `leyline-cdc` and 
 
 ### Added
 
+- **Go schema module `clients/go/leyline-schema/v0.10.2`** — first nested-module
+  tag since `v0.7.1`, carrying the canonical `leyline-net/v1` bindings, signed
+  `Head` fields, and the module-local Apache-2.0 license. The Go module has no
+  version file; the nested tag is its release boundary and is cut from the same
+  commit as the binary `v0.10.2` tag.
+
 - **Chunk-backed content storage (`leyline-fs --features cdc`)** — bead `ley-line-open-87bf00`.
   `read_content` served a byte range by `SELECT record`, loading the whole file and slicing it: a 4 KiB mount read of a 100 MB file materialized 100 MB. Content is now stored as content-defined chunks (`content_chunks`) plus per-node spans (`content_manifest`), so a range read becomes a `WHERE` clause and only overlapping chunks are read.
 

@@ -196,9 +196,9 @@ Generated Go bindings for every public capnp schema ship as a separate Go module
 import "github.com/agentic-research/ley-line-open/clients/go/leyline-schema/binding"
 ```
 
-One sub-package per schema (`ast`, `binding`, `common`, `daemon`, `head`, `source`). Regen via `clients/go/leyline-schema/regen.sh`; CI gates on `git diff --exit-code` plus `go test ./...` decoding the same `tests/fixtures/*.bin` the Rust suite asserts byte-equality against.
+One sub-package per schema (`ast`, `binding`, `cache`, `common`, `daemon`, `head`, `net`, `source`). Regen via `clients/go/leyline-schema/regen.sh`; CI gates on `git diff --exit-code` plus `go test ./...` decoding the same `tests/fixtures/*.bin` the Rust suite asserts byte-equality against.
 
-Latest tag: [`clients/go/leyline-schema/v0.2.3`](https://github.com/agentic-research/ley-line-open/releases/tag/clients%2Fgo%2Fleyline-schema%2Fv0.2.3) — see [CHANGELOG.md](CHANGELOG.md) for what each `0.2.x` carries.
+Latest tag: [`clients/go/leyline-schema/v0.10.2`](https://github.com/agentic-research/ley-line-open/releases/tag/clients%2Fgo%2Fleyline-schema%2Fv0.10.2) — paired with the binary release so Go consumers can pin the same public-schema surface.
 
 ## Daemon protocol
 

@@ -133,10 +133,10 @@ impl FastEmbedder {
 
 impl Embedder for FastEmbedder {
     fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|e| anyhow::anyhow!("FastEmbedder mutex poisoned: {e}"))?;
+        // `parking_lot::Mutex::lock` returns the guard directly — it has no
+        // poisoning, so there is no Result to map. This was written against
+        // `std::sync::Mutex`'s API and never compiled under `--features vec`.
+        let mut guard = self.inner.lock();
         let mut results = guard
             .embed(vec![text], None)
             .map_err(|e| anyhow::anyhow!("fastembed embed failed: {e}"))?;
@@ -334,12 +334,12 @@ fn next_priority() -> u64 {
 /// when a node is touched, so its embedding gets refreshed soon.
 pub fn promote(queue: &EmbedQueue, node_id: &str) {
     let priority = next_priority();
-    if let Ok(mut q) = queue.lock() {
-        q.push(EmbedTask {
-            priority,
-            node_id: node_id.to_string(),
-        });
-    }
+    // Same as above: parking_lot's guard is not a Result.
+    let mut q = queue.lock();
+    q.push(EmbedTask {
+        priority,
+        node_id: node_id.to_string(),
+    });
 }
 
 /// Spawn the background embed-queue drainer. Every 1s it pops up to 32 tasks

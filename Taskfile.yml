@@ -61,6 +61,26 @@ tasks:
         [ "$FAIL" = "0" ] || { echo "--- fix: make the workflow pins match rust-toolchain.toml (or update both together)"; exit 1; }
         echo "toolchain parity OK — workflows and rust-toolchain.toml both pin $PIN"
 
+  check:all-features:
+    desc: |
+      Type-check `--features all` — the feature set `task install:full` builds,
+      which ARCHITECTURE.md calls the recommended install for mache and
+      downstream daemon consumers.
+
+      `task ci` otherwise only builds DEFAULT features, so anything behind
+      `vec`/`hdc`/`lsp`/`text-search` is invisible to it. That is not
+      hypothetical: `daemon/embed.rs` sat on main calling `.lock().map_err(..)`
+      and `if let Ok(mut q) = queue.lock()` against a `parking_lot::Mutex`,
+      whose guard is not a Result. It had never compiled under `--features
+      vec`, and only surfaced when the 0.10.2 release build was validated by
+      hand.
+
+      `check` not `build`: this catches the type errors at a fraction of the
+      link cost. `task release:full` still does the real build.
+    dir: rs
+    cmds:
+      - cargo check -p leyline-cli --features all
+
   # --------------------------------------------------------------------------
   # Build
   # --------------------------------------------------------------------------
@@ -624,6 +644,7 @@ tasks:
       - task: build:fs-nfs-isolated
       - task: test:fs-cdc
       - task: tier:isolation
+      - task: check:all-features
       - task: test
       - task: sign:host:build
       - task: sign:host:test

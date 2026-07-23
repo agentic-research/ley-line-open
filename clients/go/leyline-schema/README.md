@@ -133,3 +133,13 @@ versionable contract, one tag per release (`clients/go/leyline-schema/vX.Y.Z`),
 no `replace` directives required for downstream consumers. The Rust
 workspace has no Go dependency; the Go module has no Rust dependency
 beyond reading the canonical `.capnp` files at regen time.
+
+## License
+
+**Apache-2.0** — see [LICENSE](LICENSE) in this directory.
+
+Deliberately different from the repository root, which is AGPL-3.0-or-later.
+This module is the cross-runtime *contract*, not the engine: it is generated
+Cap'n Proto bindings with no dependency on any AGPL crate in the workspace, so
+importing it carries no copyleft obligation. Linking ley-line-open's
+implementation crates does.

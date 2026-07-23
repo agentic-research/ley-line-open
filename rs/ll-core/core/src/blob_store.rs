@@ -1112,8 +1112,27 @@ mod tests {
     #[test]
     fn fs_concurrent_put_get_interleaved() {
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::thread;
+
+        // No sleep, no stop-flag, no wall-clock anywhere. Every thread runs a
+        // FIXED number of iterations, so the test does exactly the same work
+        // on an idle laptop and a saturated CI runner.
+        //
+        // It used to run the loops for 50ms and then signal an AtomicBool.
+        // That made the result depend on the scheduler: under load a thread
+        // might not run at all inside the window, observe `stop` already set,
+        // do zero iterations, and fail "reader loops produced 0 reads" with
+        // nothing actually broken. It flaked exactly that way. A timing-based
+        // stop condition cannot express "the loops weren't no-ops" — a count
+        // can, and it is what the test meant all along.
+        // Sized for interleaving, not volume. The old time-boxed version did
+        // however many iterations fit in 50ms; running the full 200/500 it
+        // nominally asked for costs ~3.2s of fsync-bound work for no extra
+        // signal. These counts keep every thread overlapping while the test
+        // stays sub-second.
+        const WRITES_PER_THREAD: u32 = 40;
+        const READS_PER_THREAD: u32 = 200;
+        const THREADS: u32 = 4;
 
         let td = TempDir::new().expect("tempdir");
         let root = td.path().join("objects");
@@ -1126,68 +1145,45 @@ mod tests {
             let mut s = FsBlobStore::new(&*root).unwrap();
             s.put(&bytes_a).expect("seed put")
         };
-
-        let stop = Arc::new(AtomicBool::new(false));
         let bytes_a = Arc::new(bytes_a);
 
-        // Writers: each puts distinct content in a loop.
+        // Writers: each puts distinct content.
         let mut writer_handles = Vec::new();
-        for tid in 0u32..4 {
+        for tid in 0..THREADS {
             let root = Arc::clone(&root);
-            let stop = Arc::clone(&stop);
             writer_handles.push(thread::spawn(move || {
                 let mut s = FsBlobStore::new(&*root).expect("open writer");
-                let mut i: u32 = 0;
-                while !stop.load(Ordering::Relaxed) {
+                for i in 0..WRITES_PER_THREAD {
                     let payload = format!("writer-{tid}-iter-{i}").into_bytes();
                     s.put(&payload).expect("put in loop");
-                    i += 1;
-                    if i > 200 {
-                        break;
-                    }
                 }
-                i
+                WRITES_PER_THREAD
             }));
         }
 
-        // Readers: each get()s the pre-seeded blob repeatedly. None
-        // may see corruption.
+        // Readers: each get()s the pre-seeded blob repeatedly, concurrently
+        // with those writes. None may observe a torn value — that is the
+        // actual property under test.
         let mut reader_handles = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..THREADS {
             let root = Arc::clone(&root);
-            let stop = Arc::clone(&stop);
             let bytes_a = Arc::clone(&bytes_a);
             reader_handles.push(thread::spawn(move || {
                 let s = FsBlobStore::new(&*root).expect("open reader");
-                let mut reads = 0u32;
-                while !stop.load(Ordering::Relaxed) {
+                for _ in 0..READS_PER_THREAD {
                     let got = s.get(hash_a).expect("get").expect("seeded blob present");
                     assert_eq!(&got, bytes_a.as_ref(), "torn read mid-write");
-                    reads += 1;
-                    if reads > 500 {
-                        break;
-                    }
                 }
-                reads
+                READS_PER_THREAD
             }));
         }
 
-        // Let them run briefly, then signal stop.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        stop.store(true, Ordering::Relaxed);
+        let total_writes: u32 = writer_handles.into_iter().map(|h| h.join().unwrap()).sum();
+        let total_reads: u32 = reader_handles.into_iter().map(|h| h.join().unwrap()).sum();
 
-        let mut total_writes = 0u32;
-        for h in writer_handles {
-            total_writes += h.join().unwrap();
-        }
-        let mut total_reads = 0u32;
-        for h in reader_handles {
-            total_reads += h.join().unwrap();
-        }
-
-        // Sanity: each side did SOMETHING. Not testing throughput
-        // (machine-dependent), just that the loops weren't no-ops.
-        assert!(total_writes > 0, "writer loops produced 0 writes");
-        assert!(total_reads > 0, "reader loops produced 0 reads");
+        // Exact, not `> 0`: the counts are fixed, so anything else means a
+        // thread bailed early and the interleaving was not what we claim.
+        assert_eq!(total_writes, THREADS * WRITES_PER_THREAD);
+        assert_eq!(total_reads, THREADS * READS_PER_THREAD);
     }
 }

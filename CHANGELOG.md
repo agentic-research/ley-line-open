@@ -10,6 +10,24 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Changed
+
+- **Schema and wire-contract crates relicensed to Apache-2.0** (repository
+  remains AGPL-3.0-or-later). The interface layer is now permissive so other
+  runtimes — mache first — can implement and consume the contract without
+  inheriting copyleft:
+
+  - `clients/go/leyline-schema/` (the generated Go bindings mache imports;
+    previously inherited the root AGPL by having no license of its own)
+  - `rs/ll-core/schema-capnp`, `rs/ll-core/public-schema`,
+    `rs/ll-core/schema`, `rs/ll-core/schema-spec`
+
+  Effective rather than nominal: none of these crates depend on an AGPL crate
+  in this workspace — only `capnp`, `capnp-json`, `rusqlite`, `anyhow`, all
+  permissive — and the dependency edge runs one way, with AGPL crates consuming
+  the schema crates and never the reverse. Relicensing is clean on authorship
+  as well: every commit touching these paths is from the sole copyright holder.
+
 ### Security
 
 - **`fuser` 0.15 → 0.16 — GHSA-cvmj-47v9-35m9 (high).** Uninitialized memory

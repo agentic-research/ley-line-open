@@ -158,6 +158,12 @@ tasks:
       LLO_PERF_GATES: "1"
     cmds:
       - cargo test --release -p leyline-cli-lib --test cold_parse_perf_regression
+      # F2 substrate falsifier (parallel-vs-serial write throughput). Lives
+      # here rather than in `task test` because it is a wall-clock ratio: under
+      # CPU contention the parallel arm gets no speedup and it fails without a
+      # regression. It always PRINTS its measurement in `task test`; this is
+      # where the assertion is enforced.
+      - cargo test --release -p leyline-cli-lib --test f2_concurrent_writers_throughput
 
   test:perf:topology:
     desc: Topology pre-pass cost gates (opt-in; tighter budgets than test:perf).

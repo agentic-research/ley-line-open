@@ -575,6 +575,65 @@ impl JjIntegration {
         })
     }
 
+    /// Un-register a workspace from the shared store — the inverse of
+    /// [`Self::add_workspace`], and the in-process equivalent of
+    /// `jj workspace forget`.
+    ///
+    /// This exists because `add_workspace` REJECTS a duplicate name. Without a
+    /// forget that runs in the same process, a caller that deletes a workspace
+    /// directory leaves the name registered forever, and its next
+    /// `add_workspace` for that name fails permanently. A create-only API with
+    /// a uniqueness constraint is a leak.
+    ///
+    /// Idempotent: forgetting an unknown name is `Ok(())`, so teardown paths do
+    /// not have to know whether creation got far enough to register anything.
+    /// Does NOT delete the workspace's directory — that is the caller's, since
+    /// only the caller knows whether the files still matter.
+    pub fn forget_workspace(&self, name: &str) -> Result<()> {
+        use jj_lib::workspace_store::{SimpleWorkspaceStore, WorkspaceStore as _};
+
+        let ws_name = WorkspaceNameBuf::from(name);
+        let primary = Workspace::load(
+            &self.settings,
+            &self.jj_dir,
+            &Default::default(),
+            &default_working_copy_factories(),
+        )
+        .map_err(|e| anyhow::anyhow!("load primary workspace: {e}"))?;
+        let repo_path = primary.repo_path().to_path_buf();
+        let repo = primary
+            .repo_loader()
+            .load_at_head()
+            .block_on()
+            .map_err(|e| anyhow::anyhow!("load shared repo: {e}"))?;
+        if repo.view().get_wc_commit_id(&ws_name).is_none() {
+            return Ok(());
+        }
+
+        let mut tx = repo.start_transaction();
+        tx.repo_mut()
+            .remove_wc_commit(&ws_name)
+            .block_on()
+            .map_err(|e| anyhow::anyhow!("forget workspace {name:?}: {e}"))?;
+        tx.repo_mut()
+            .rebase_descendants()
+            .block_on()
+            .map_err(|e| anyhow::anyhow!("rebase descendants forgetting {name:?}: {e}"))?;
+        tx.commit(format!("forget workspace '{name}'"))
+            .block_on()
+            .map_err(|e| anyhow::anyhow!("commit forget of {name:?}: {e}"))?;
+
+        // The view and the workspace-name index are separate records; dropping
+        // only the working-copy commit would leave a dangling name behind.
+        let store = SimpleWorkspaceStore::load(&repo_path)
+            .map_err(|e| anyhow::anyhow!("load workspace store: {e}"))?;
+        store
+            .forget(&[&ws_name])
+            .map_err(|e| anyhow::anyhow!("forget {name:?} from workspace store: {e}"))?;
+
+        Ok(())
+    }
+
     /// Names of every workspace known to the shared store (default + agents).
     /// Sees all workspaces precisely *because* they share one backend — a
     /// convenient shared-store witness as well as a listing.
@@ -2276,6 +2335,48 @@ mod tests {
             std::fs::read_to_string(ws.root.join("src/main.rs")).unwrap(),
             "fn main(){}"
         );
+    }
+
+    /// `add_workspace` rejects a duplicate name, so a create-only API would turn
+    /// any teardown into a permanent per-name failure. `forget_workspace` closes
+    /// the loop: forget, then re-add the SAME name successfully.
+    #[test]
+    fn forget_workspace_releases_the_name_for_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let jj = git_backed_repo_with_content(&dir.path().join("primary"));
+        let root = dir.path().join("agent-a");
+
+        jj.add_workspace(&root, "agent-a").unwrap();
+        assert!(
+            jj.add_workspace(&root, "agent-a").is_err(),
+            "duplicate name must be rejected"
+        );
+
+        jj.forget_workspace("agent-a").unwrap();
+        assert_eq!(jj.workspace_names().unwrap(), vec!["default".to_string()]);
+
+        // Forgetting is what a teardown does; the directory is the caller's.
+        std::fs::remove_dir_all(&root).unwrap();
+        let ws = jj
+            .add_workspace(&root, "agent-a")
+            .expect("the name must be reusable after a forget");
+        assert_eq!(
+            std::fs::read_to_string(ws.root.join("hello.txt")).unwrap(),
+            "hello"
+        );
+    }
+
+    /// Teardown must not have to know whether creation got far enough to
+    /// register anything.
+    #[test]
+    fn forget_workspace_is_idempotent_for_an_unknown_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let jj = git_backed_repo_with_content(&dir.path().join("primary"));
+        jj.forget_workspace("never-existed").unwrap();
+        jj.add_workspace(&dir.path().join("a"), "a").unwrap();
+        jj.forget_workspace("a").unwrap();
+        jj.forget_workspace("a").unwrap();
+        assert_eq!(jj.workspace_names().unwrap(), vec!["default".to_string()]);
     }
 
     /// The agent workspace is a real working copy over the SHARED store, not a

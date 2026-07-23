@@ -10,18 +10,18 @@
 #
 #   pre-commit install --hook-type pre-commit --hook-type pre-push
 #
-# After that you never run clippy/fmt/blake3-lint by hand: `git commit`
-# fast-checks formatting, `git push` runs the full gate and blocks a push
-# CI would reject.
+# After that you never run check/clippy/fmt/blake3-lint by hand: `git commit`
+# runs the Taskfile's fast commit gate, `git push` runs the full gate and
+# blocks a push CI would reject.
 repos:
   - repo: local
     hooks:
-      # Fast feedback at commit time — the recurring failure is formatting;
-      # catch it instantly instead of at CI. Non-mutating (fmt:check fails,
-      # never rewrites the tree).
-      - id: task-fmt-check
-        name: task fmt:check (fast — formatting gate)
-        entry: task fmt:check
+      # Fast feedback at commit time. Taskfile remains the source of truth:
+      # staged whitespace, Rust formatting, and cargo check are composed by
+      # check:commit rather than duplicated in this hook.
+      - id: task-check-commit
+        name: task check:commit (staged diff + fmt + type-check)
+        entry: task check:commit
         language: system
         pass_filenames: false
         always_run: true

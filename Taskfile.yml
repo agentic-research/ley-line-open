@@ -456,6 +456,19 @@ tasks:
     cmds:
       - cargo check --workspace
 
+  check:commit:
+    desc: Fast pre-commit gate — staged whitespace, Rust formatting, and type-check
+    deps: [cache:sccache:install]
+    cmds:
+      - task: lint:staged
+      - task: fmt:check
+      - task: check
+
+  lint:staged:
+    desc: Reject whitespace errors in the exact patch staged for commit
+    cmds:
+      - git diff --cached --check
+
   fmt:check:
     desc: Verify formatting (CI gate; use `task fmt` locally to fix)
     dir: rs

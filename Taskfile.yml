@@ -88,10 +88,6 @@ tasks:
         test -x tools/verify_release_artifacts.sh
         grep -q 'release:artifacts:stage:' Taskfile.yml
         grep -q 'release:artifacts:verify:' Taskfile.yml
-        RENDERED=$(task --dry release:artifacts:stage \
-          BUILD_TARGET=contract-target ASSET_NAME=contract-asset 2>&1)
-        printf '%s\n' "$RENDERED" | grep -Fq 'export ASSET_NAME="contract-asset"'
-        printf '%s\n' "$RENDERED" | grep -Fq 'export BUILD_TARGET="contract-target"'
         grep -q -- '- task: release:artifacts:fixture-test' Taskfile.yml
         grep -q 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' .github/workflows/release.yml
         grep -q 'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c' .github/workflows/release.yml
@@ -146,28 +142,36 @@ tasks:
 
   release:artifacts:fixture-test:
     desc: Prove staged release manifests accept exact bytes and reject corruption
+    vars:
+      FIXTURE_DIR:
+        sh: mktemp -d "${TMPDIR:-/tmp}/leyline-release-fixture.XXXXXX"
     cmds:
+      - defer: rm -r "{{.FIXTURE_DIR}}"
       - |
         set -eu
-        FIXTURE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/leyline-release-fixture.XXXXXX")
-        printf '#!/bin/sh\nexit 0\n' > "$FIXTURE_DIR/leyline"
-        chmod +x "$FIXTURE_DIR/leyline"
-        printf 'staticlib' > "$FIXTURE_DIR/libleyline_fs.a"
-        printf 'header' > "$FIXTURE_DIR/leyline_fs.h"
-        OUTPUT_DIR="$FIXTURE_DIR/artifacts/leyline-test-amd64" \
-          CLI_SOURCE="$FIXTURE_DIR/leyline" \
-          ASSET_NAME="leyline-test-amd64" \
-          STATICLIB_SOURCE="$FIXTURE_DIR/libleyline_fs.a" \
-          LIB_ASSET="libleyline_fs-test-amd64.a" \
-          HEADER_SOURCE="$FIXTURE_DIR/leyline_fs.h" \
-          tools/stage_release_artifacts.sh
-        tools/verify_release_artifacts.sh "$FIXTURE_DIR/artifacts"
-        printf 'corruption' >> "$FIXTURE_DIR/artifacts/leyline-test-amd64/leyline-test-amd64"
-        if tools/verify_release_artifacts.sh "$FIXTURE_DIR/artifacts"; then
+        printf '#!/bin/sh\nexit 0\n' > "{{.FIXTURE_DIR}}/leyline"
+        chmod +x "{{.FIXTURE_DIR}}/leyline"
+        printf 'staticlib' > "{{.FIXTURE_DIR}}/libleyline_fs.a"
+        printf 'header' > "{{.FIXTURE_DIR}}/leyline_fs.h"
+      - task: release:artifacts:stage
+        vars:
+          BUILD_TARGET: fixture-target
+          ASSET_NAME: leyline-test-amd64
+          OUTPUT_DIR: '{{.FIXTURE_DIR}}/artifacts/leyline-test-amd64'
+          CLI_SOURCE: '{{.FIXTURE_DIR}}/leyline'
+          LIB_ASSET: libleyline_fs-test-amd64.a
+          STATICLIB_SOURCE: '{{.FIXTURE_DIR}}/libleyline_fs.a'
+          INCLUDE_HEADER: "true"
+          HEADER_SOURCE: '{{.FIXTURE_DIR}}/leyline_fs.h'
+      - task: release:artifacts:verify
+        vars:
+          ARTIFACT_ROOT: '{{.FIXTURE_DIR}}/artifacts'
+      - |
+        printf 'corruption' >> "{{.FIXTURE_DIR}}/artifacts/leyline-test-amd64/leyline-test-amd64"
+        if tools/verify_release_artifacts.sh "{{.FIXTURE_DIR}}/artifacts"; then
           echo "corrupted release artifact unexpectedly verified"
           exit 1
         fi
-        rm -rf "$FIXTURE_DIR"
         echo "release artifact fixture accepted exact bytes and rejected corruption"
 
   check:all-features:
@@ -267,20 +271,26 @@ tasks:
     desc: Stage one target's exact release outputs and SHA-256 manifest
     requires:
       vars: [BUILD_TARGET, ASSET_NAME]
+    vars:
+      DEFAULT_OUTPUT_DIR: '{{.ROOT_DIR}}/.artifacts/staged/{{.ASSET_NAME}}'
+      DEFAULT_CLI_SOURCE: '{{.ROOT_DIR}}/rs/target/{{.BUILD_TARGET}}/release/leyline'
+      DEFAULT_STATICLIB_SOURCE: '{{.ROOT_DIR}}/rs/target/{{.BUILD_TARGET}}/release/libleyline_fs.a'
+      DEFAULT_HEADER_SOURCE: '{{.ROOT_DIR}}/rs/ll-open/fs/include/leyline_fs.h'
+    env:
+      ASSET_NAME: '{{.ASSET_NAME}}'
+      BUILD_TARGET: '{{.BUILD_TARGET}}'
+      OUTPUT_DIR: '{{.OUTPUT_DIR | default .DEFAULT_OUTPUT_DIR}}'
+      CLI_SOURCE: '{{.CLI_SOURCE | default .DEFAULT_CLI_SOURCE}}'
+      LIB_ASSET: '{{.LIB_ASSET | default ""}}'
+      INCLUDE_HEADER: '{{.INCLUDE_HEADER | default "false"}}'
     cmds:
       - |
         set -eu
-        export ASSET_NAME="{{.ASSET_NAME}}"
-        export BUILD_TARGET="{{.BUILD_TARGET}}"
-        export LIB_ASSET='{{ default "" .LIB_ASSET }}'
-        export INCLUDE_HEADER='{{ default "false" .INCLUDE_HEADER }}'
-        export OUTPUT_DIR="{{.ROOT_DIR}}/.artifacts/staged/{{.ASSET_NAME}}"
-        export CLI_SOURCE="{{.ROOT_DIR}}/rs/target/{{.BUILD_TARGET}}/release/leyline"
         if [ -n "${LIB_ASSET:-}" ]; then
-          export STATICLIB_SOURCE="{{.ROOT_DIR}}/rs/target/{{.BUILD_TARGET}}/release/libleyline_fs.a"
+          export STATICLIB_SOURCE='{{.STATICLIB_SOURCE | default .DEFAULT_STATICLIB_SOURCE}}'
         fi
         if [ "${INCLUDE_HEADER:-false}" = "true" ]; then
-          export HEADER_SOURCE="{{.ROOT_DIR}}/rs/ll-open/fs/include/leyline_fs.h"
+          export HEADER_SOURCE='{{.HEADER_SOURCE | default .DEFAULT_HEADER_SOURCE}}'
         fi
         tools/stage_release_artifacts.sh
 

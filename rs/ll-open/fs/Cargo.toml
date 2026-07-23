@@ -21,6 +21,11 @@ validate = [
 fuse = ["dep:fuser", "dep:libc"]
 nfs = ["dep:nfsserve", "dep:libc"]
 splice = ["dep:leyline-ts"]
+# Chunk-backed content storage (ADR-0026 at chunk granularity): the SQL
+# projection stores a chunk MANIFEST instead of whole file bytes, so a range
+# read selects only overlapping chunks. Opt-in so the lean mount build is
+# unchanged.
+cdc = ["dep:leyline-cdc"]
 
 [dependencies]
 parking_lot = { workspace = true }
@@ -52,6 +57,7 @@ tree-sitter-typescript = { version = "0.23", optional = true }
 tree-sitter-rust = { version = "0.24", optional = true }
 tree-sitter-elixir = { version = "0.3.5", optional = true }
 leyline-ts = { path = "../ts", optional = true }
+leyline-cdc = { path = "../cdc", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

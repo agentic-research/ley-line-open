@@ -382,26 +382,43 @@ impl Graph for SqliteGraphAdapter {
         })
     }
 
+    /// Serve a byte range.
+    ///
+    /// With `--features cdc` this delegates to [`crate::chunked::read_content_at`],
+    /// which uses the node's chunk manifest when the arena has one and only
+    /// touches the chunks overlapping the range. Without the feature — or for
+    /// an arena written by another runtime, which has no chunk tables — it is
+    /// the `nodes.record` path: load the whole file, return a slice of it.
+    ///
+    /// Both branches go through one accessor so the two storage generations
+    /// cannot drift into different range semantics.
     fn read_content(&self, id: &str, buf: &mut [u8], offset: u64) -> Result<usize> {
         self.with_reader(|reader| {
-            let record: Option<String> = reader
-                .conn()
-                .query_row("SELECT record FROM nodes WHERE id = ?1", [id], |row| {
-                    row.get(0)
-                })
-                .ok();
-            let Some(data) = record else {
-                return Ok(0);
-            };
-            let bytes = data.as_bytes();
-            let off = offset as usize;
-            if off >= bytes.len() {
-                return Ok(0);
+            #[cfg(feature = "cdc")]
+            {
+                crate::chunked::read_content_at(reader.conn(), id, buf, offset)
             }
-            let end = (off + buf.len()).min(bytes.len());
-            let n = end - off;
-            buf[..n].copy_from_slice(&bytes[off..end]);
-            Ok(n)
+            #[cfg(not(feature = "cdc"))]
+            {
+                let record: Option<String> = reader
+                    .conn()
+                    .query_row("SELECT record FROM nodes WHERE id = ?1", [id], |row| {
+                        row.get(0)
+                    })
+                    .ok();
+                let Some(data) = record else {
+                    return Ok(0);
+                };
+                let bytes = data.as_bytes();
+                let off = offset as usize;
+                if off >= bytes.len() {
+                    return Ok(0);
+                }
+                let end = (off + buf.len()).min(bytes.len());
+                let n = end - off;
+                buf[..n].copy_from_slice(&bytes[off..end]);
+                Ok(n)
+            }
         })
     }
 
@@ -484,6 +501,16 @@ impl Graph for SqliteGraphAdapter {
                 rusqlite::params![new_str.as_ref(), content.len() as i64, now, id],
             )?;
 
+            // Keep the chunk manifest in step with `record`. Re-chunking here
+            // is what makes CDC pay off on the write path: boundary stability
+            // means an edit only produces new chunks around the edit itself,
+            // so the unchanged majority of a large file is not re-stored.
+            //
+            // No-op unless this arena already has the chunk schema — writing
+            // through a foreign arena must not silently upgrade it.
+            #[cfg(feature = "cdc")]
+            crate::chunked::refresh_chunked_content(guard.conn(), id, new_str.as_ref().as_bytes())?;
+
             // Mark for splice on flush if this node has AST tracking
             #[cfg(feature = "splice")]
             {
@@ -530,6 +557,16 @@ impl Graph for SqliteGraphAdapter {
                 "DELETE FROM nodes WHERE id = ?1 OR id LIKE ?2",
                 rusqlite::params![id, format!("{id}/%")],
             )?;
+
+            // The manifest is keyed by node_id with no FK to `nodes`, so
+            // deleting the row leaves it behind. Node ids are PATHS and paths
+            // get reused: create a file at the same path afterwards and the
+            // orphaned manifest is found by `has_chunked_content`, serving the
+            // DELETED file's bytes to a brand-new, never-written node. That is
+            // a cross-generation content leak, not just staleness. Cascade over
+            // descendants exactly as the DELETE above does.
+            #[cfg(feature = "cdc")]
+            crate::chunked::invalidate_chunked_content_subtree(guard.conn(), id)?;
         }
         self.refresh_readers()?;
         Ok(())
@@ -562,6 +599,12 @@ impl Graph for SqliteGraphAdapter {
                 "UPDATE nodes SET record = NULL, size = 0, mtime = ?1 WHERE id = ?2",
                 rusqlite::params![now, id],
             )?;
+
+            // Without this, truncate is a silent NO-OP for chunk-backed nodes:
+            // `record` becomes NULL but the manifest still describes the old
+            // bytes, and the chunked read path keeps serving them.
+            #[cfg(feature = "cdc")]
+            crate::chunked::invalidate_chunked_content(guard.conn(), id)?;
         }
         self.refresh_readers()?;
         Ok(())
@@ -583,6 +626,31 @@ impl Graph for SqliteGraphAdapter {
                 return Ok(());
             };
             leyline_ts::splice::splice_and_reproject(guard.conn(), id, &text)?;
+
+            // Reproject rewrote `nodes.record` for the spliced node AND every
+            // other node of the same source, from inside leyline-ts — which
+            // knows nothing about chunk tables. Any manifest still on those
+            // nodes now describes the PRE-splice bytes, and the chunked read
+            // path would serve them without complaint. Invalidate so those
+            // reads fall back to `record`: slower, but correct. Reads
+            // re-chunk lazily on the next write through this crate.
+            #[cfg(feature = "cdc")]
+            {
+                let source_nodes: Vec<String> = {
+                    let mut stmt = guard.conn().prepare(
+                        "SELECT node_id FROM _ast WHERE source_id = \
+                         (SELECT source_id FROM _ast WHERE node_id = ?1)",
+                    )?;
+                    let rows = stmt.query_map([id], |r| r.get::<_, String>(0))?;
+                    rows.collect::<std::result::Result<_, _>>()?
+                };
+                for node in &source_nodes {
+                    crate::chunked::invalidate_chunked_content(guard.conn(), node)?;
+                }
+                // The spliced node itself may not be in _ast under this id.
+                crate::chunked::invalidate_chunked_content(guard.conn(), id)?;
+            }
+
             // Only remove from pending on success — failed attempts retry on next flush
             self.pending_splice.lock().remove(id);
             // Reproject replaced all nodes — shadows are stale
@@ -640,19 +708,31 @@ impl Graph for SqliteGraphAdapter {
                     });
                 }
                 Err(rusqlite::Error::QueryReturnedNoRows) => {
-                    // Non-AST node — direct record update or delete
+                    // Non-AST node — direct record update or delete.
+                    //
+                    // These write `nodes` directly and are NOT covered by the
+                    // post-reproject invalidation below: that loop walks
+                    // `_ast`-derived node ids, and by definition these nodes
+                    // have no `_ast` row. Each arm must invalidate its own
+                    // manifest or the read path serves pre-splice bytes (update
+                    // arm) or a deleted node's bytes to whatever reuses the
+                    // path (delete arm).
                     match text {
                         Some(t) => {
                             conn.execute(
                                 "UPDATE nodes SET record = ?1, size = ?2, mtime = ?3 WHERE id = ?4",
                                 rusqlite::params![t, t.len() as i64, now, node_id],
                             )?;
+                            #[cfg(feature = "cdc")]
+                            crate::chunked::invalidate_chunked_content(conn, node_id)?;
                         }
                         None => {
                             conn.execute(
                                 "DELETE FROM nodes WHERE id = ?1 OR id LIKE ?2",
                                 rusqlite::params![node_id, format!("{node_id}/%")],
                             )?;
+                            #[cfg(feature = "cdc")]
+                            crate::chunked::invalidate_chunked_content_subtree(conn, node_id)?;
                         }
                     }
                 }
@@ -735,16 +815,13 @@ impl Graph for SqliteGraphAdapter {
                 // Parse "error at byte N..M" from reproject error
                 if let Some(pos) = msg.find("error at byte ") {
                     let rest = &msg[pos + 14..];
-                    if let Some(dot_pos) = rest.find("..") {
-                        if let Ok(err_byte) = rest[..dot_pos].parse::<usize>() {
-                            // Find which edit's post-splice range contains the error byte
-                            for r in &ranges {
-                                if err_byte >= r.start && err_byte < r.end {
-                                    return anyhow::anyhow!(
-                                        "{e} (attributed to node '{}')",
-                                        r.node_id
-                                    );
-                                }
+                    if let Some(dot_pos) = rest.find("..")
+                        && let Ok(err_byte) = rest[..dot_pos].parse::<usize>()
+                    {
+                        // Find which edit's post-splice range contains the error byte
+                        for r in &ranges {
+                            if err_byte >= r.start && err_byte < r.end {
+                                return anyhow::anyhow!("{e} (attributed to node '{}')", r.node_id);
                             }
                         }
                     }
@@ -753,6 +830,24 @@ impl Graph for SqliteGraphAdapter {
                 let node_ids: Vec<&str> = group.iter().map(|e| e.node_id.as_str()).collect();
                 anyhow::anyhow!("{e} (source '{}', edited nodes: {:?})", source_id, node_ids)
             })?;
+
+            // Reproject rewrote `nodes.record` for EVERY node of this source
+            // from inside leyline-ts. Unlike the `write_content` path, nothing
+            // here re-chunks, so any manifest on those nodes now describes
+            // pre-splice bytes and the chunked read path would serve them.
+            // Invalidate the whole source: reads fall back to `record` until
+            // the next write refreshes them.
+            #[cfg(feature = "cdc")]
+            {
+                let mut stmt = conn.prepare("SELECT node_id FROM _ast WHERE source_id = ?1")?;
+                let node_ids: Vec<String> = stmt
+                    .query_map([&source_id], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<_, _>>()?;
+                drop(stmt);
+                for node in &node_ids {
+                    crate::chunked::invalidate_chunked_content(conn, node)?;
+                }
+            }
         }
 
         // Clear pending splice set
@@ -838,6 +933,23 @@ impl Graph for SqliteGraphAdapter {
                     "UPDATE nodes SET id = ?1, parent_id = ?2 WHERE id = ?3",
                     rusqlite::params![new_child_id, new_child_parent, old_child_id],
                 )?;
+            }
+
+            // `content_manifest.node_id` is a bare TEXT column with no FK to
+            // `nodes`, so renaming the row leaves the manifest keyed to the OLD
+            // id — orphaned on a path that may be reused (same leak as
+            // remove_node), while the NEW id has no manifest and would fall
+            // back to `record` anyway. Clear both sides.
+            //
+            // Invalidate rather than re-key: carrying the manifest across the
+            // rename would preserve chunked reads (the content is unchanged),
+            // but re-keying onto an id that already has a manifest violates the
+            // (node_id, seq) primary key. Correctness first; re-keying with
+            // conflict handling is an available optimization.
+            #[cfg(feature = "cdc")]
+            {
+                crate::chunked::invalidate_chunked_content_subtree(guard.conn(), id)?;
+                crate::chunked::invalidate_chunked_content_subtree(guard.conn(), &new_id)?;
             }
         }
         self.refresh_readers()?;
@@ -1917,6 +2029,267 @@ mod tests {
             "_source should contain final text, got: {source_str}"
         );
 
+        Ok(())
+    }
+
+    /// End-to-end for the write-then-flush path: write, splice, read back.
+    ///
+    /// NOTE on what this does and does not prove. It passes with or without
+    /// the manifest invalidation in `flush_node`, because `write_content`
+    /// re-chunks the node before the flush ever runs — so this node is never
+    /// stale by the time it is read. Verified by removing the invalidation:
+    /// still green. The genuine staleness case is
+    /// `batch_splice_does_not_leave_a_stale_chunk_manifest`, which reaches
+    /// `reproject_source` without any `write_content` refresh in front of it.
+    /// Kept as a path-integration check, not as the staleness falsifier.
+    #[test]
+    #[cfg(all(feature = "splice", feature = "cdc"))]
+    fn write_then_flush_serves_post_splice_bytes() -> Result<()> {
+        let adapter = writable_ast_adapter(b"<p>hello</p>")?;
+        let node_id = "element/text";
+
+        // Give the arena chunk storage, then populate this node's manifest so
+        // reads are genuinely being served from chunks before the splice.
+        {
+            let guard = adapter.writer.lock();
+            crate::chunked::create_chunked_content_schema(guard.conn())?;
+            crate::chunked::store_content_chunked(guard.conn(), node_id, b"hello")?;
+            assert!(crate::chunked::has_chunked_content(guard.conn(), node_id)?);
+        }
+        adapter.refresh_readers()?;
+
+        let mut buf = vec![0u8; 32];
+        let n = adapter.read_content(node_id, &mut buf, 0)?;
+        assert_eq!(
+            &buf[..n],
+            b"hello",
+            "precondition: chunked read serves old text"
+        );
+
+        // Write + flush: leyline-ts reprojects and rewrites `record` directly.
+        adapter.write_content(node_id, b"world", 0)?;
+        adapter.flush_node(node_id)?;
+
+        // The read must NOT return the stale chunked bytes.
+        let mut buf = vec![0u8; 32];
+        let n = adapter.read_content(node_id, &mut buf, 0)?;
+        assert_eq!(
+            &buf[..n],
+            b"world",
+            "read served stale pre-splice bytes from an invalidated-but-kept manifest"
+        );
+        Ok(())
+    }
+
+    /// The write path must keep the manifest current, so a mount that writes
+    /// then reads still gets chunked reads rather than silently degrading to
+    /// the whole-record path forever after the first write.
+    #[test]
+    #[cfg(feature = "cdc")]
+    fn write_refreshes_the_chunk_manifest() -> Result<()> {
+        let adapter = writable_adapter()?;
+        {
+            let guard = adapter.writer.lock();
+            crate::chunked::create_chunked_content_schema(guard.conn())?;
+        }
+
+        let body = "x".repeat(300_000);
+        adapter.write_content("docs/readme", body.as_bytes(), 0)?;
+
+        let guard = adapter.writer.lock();
+        assert!(
+            crate::chunked::has_chunked_content(guard.conn(), "docs/readme")?,
+            "a write into a chunk-enabled arena must populate the manifest"
+        );
+        drop(guard);
+
+        let mut buf = vec![0u8; 100];
+        let n = adapter.read_content("docs/readme", &mut buf, 150_000)?;
+        assert_eq!(&buf[..n], &body.as_bytes()[150_000..150_100]);
+        Ok(())
+    }
+
+    /// `batch_splice` (the ADR-007 commit path) calls `reproject_source`
+    /// DIRECTLY — it never goes through `write_content`, so nothing re-chunks.
+    /// A manifest populated before the splice therefore describes pre-splice
+    /// bytes, and the chunked read path would serve them: correct-looking
+    /// output that is silently the wrong content.
+    ///
+    /// This is the falsifying case for the invalidation in `batch_splice`.
+    /// Remove that invalidation and this test fails; every other test passes.
+    #[test]
+    #[cfg(all(feature = "splice", feature = "cdc"))]
+    fn batch_splice_does_not_leave_a_stale_chunk_manifest() -> Result<()> {
+        let adapter = writable_ast_adapter(b"<p>hello</p>")?;
+        let node_id = "element/text";
+
+        {
+            let guard = adapter.writer.lock();
+            crate::chunked::create_chunked_content_schema(guard.conn())?;
+            // Manifest describes the CURRENT content, "hello".
+            crate::chunked::store_content_chunked(guard.conn(), node_id, b"hello")?;
+        }
+        adapter.refresh_readers()?;
+
+        let mut buf = vec![0u8; 32];
+        let n = adapter.read_content(node_id, &mut buf, 0)?;
+        assert_eq!(&buf[..n], b"hello", "precondition: served from chunks");
+
+        // Commit path: no write_content, so no re-chunk anywhere.
+        adapter.batch_splice(&[(node_id.to_string(), Some("world".to_string()))])?;
+        adapter.refresh_readers()?;
+
+        let mut buf = vec![0u8; 32];
+        let n = adapter.read_content(node_id, &mut buf, 0)?;
+        assert_eq!(
+            &buf[..n],
+            b"world",
+            "batch_splice left a stale manifest — the read served pre-splice bytes"
+        );
+        Ok(())
+    }
+
+    /// Helper: writable adapter whose arena has chunk storage enabled.
+    #[cfg(feature = "cdc")]
+    fn chunked_adapter() -> Result<SqliteGraphAdapter> {
+        let adapter = writable_adapter()?;
+        {
+            let guard = adapter.writer.lock();
+            crate::chunked::create_chunked_content_schema(guard.conn())?;
+        }
+        Ok(adapter)
+    }
+
+    /// `truncate` must actually truncate a chunk-backed node. Without
+    /// invalidation it sets `record = NULL` while the manifest still describes
+    /// the old bytes, so the chunked read path keeps serving them — truncate
+    /// becomes a silent no-op. (Found by adversarial review; reproduced before
+    /// fixing: returned 5 bytes of "world" after truncate.)
+    #[test]
+    #[cfg(feature = "cdc")]
+    fn truncate_invalidates_the_chunk_manifest() -> Result<()> {
+        let adapter = chunked_adapter()?;
+        adapter.write_content("docs/readme", b"world", 0)?;
+
+        let mut buf = [0u8; 64];
+        let n = adapter.read_content("docs/readme", &mut buf, 0)?;
+        assert_eq!(&buf[..n], b"world", "precondition: content is readable");
+
+        adapter.truncate("docs/readme")?;
+
+        let mut buf = [0u8; 64];
+        let n = adapter.read_content("docs/readme", &mut buf, 0)?;
+        assert_eq!(
+            n, 0,
+            "truncate was a no-op — stale manifest still served {n} bytes"
+        );
+        Ok(())
+    }
+
+    /// THE severe one. Node ids are PATHS and paths get reused. A manifest that
+    /// outlives its `nodes` row is not merely stale — it attaches to whatever
+    /// node is created at that path next, so a brand-new, never-written file
+    /// serves a DELETED file's content. Cross-generation content leak.
+    /// (Found by adversarial review; reproduced before fixing: the fresh node
+    /// returned "secret-old-bytes".)
+    #[test]
+    #[cfg(feature = "cdc")]
+    fn recreating_a_removed_path_does_not_leak_the_old_content() -> Result<()> {
+        let adapter = chunked_adapter()?;
+        adapter.write_content("docs/readme", b"secret-old-bytes", 0)?;
+        adapter.remove_node("docs/readme")?;
+
+        let fresh = adapter.create_node("docs", "readme", false)?;
+        let mut buf = [0u8; 64];
+        let n = adapter.read_content(&fresh, &mut buf, 0)?;
+        assert_eq!(
+            n,
+            0,
+            "a newly created file leaked {} bytes of a deleted file: {:?}",
+            n,
+            String::from_utf8_lossy(&buf[..n])
+        );
+        Ok(())
+    }
+
+    /// `remove_node` cascades over descendants (`id LIKE 'x/%'`), so
+    /// invalidation must cascade identically or a child's manifest outlives
+    /// its row and leaks into a recreated child path.
+    #[test]
+    #[cfg(feature = "cdc")]
+    fn removing_a_directory_invalidates_descendant_manifests() -> Result<()> {
+        let adapter = chunked_adapter()?;
+        adapter.write_content("docs/readme", b"child-secret", 0)?;
+
+        adapter.remove_node("docs")?;
+
+        let guard = adapter.writer.lock();
+        assert!(
+            !crate::chunked::has_chunked_content(guard.conn(), "docs/readme")?,
+            "descendant manifest survived removal of its parent directory"
+        );
+        Ok(())
+    }
+
+    /// `batch_splice`'s non-AST arm writes `nodes` directly. The post-reproject
+    /// invalidation walks `_ast`-derived ids, so by definition it never sees
+    /// these nodes — each arm must invalidate itself.
+    #[test]
+    #[cfg(all(feature = "splice", feature = "cdc"))]
+    fn batch_splice_plain_node_arm_invalidates() -> Result<()> {
+        let adapter = writable_ast_adapter(b"<p>hello</p>")?;
+        {
+            let guard = adapter.writer.lock();
+            crate::chunked::create_chunked_content_schema(guard.conn())?;
+        }
+        // A node with no `_ast` row.
+        let plain = adapter.create_node("", "plain.txt", false)?;
+        adapter.write_content(&plain, b"world", 0)?;
+        {
+            let guard = adapter.writer.lock();
+            let is_ast: bool = guard
+                .conn()
+                .query_row("SELECT 1 FROM _ast WHERE node_id = ?1", [&plain], |_| {
+                    Ok(true)
+                })
+                .unwrap_or(false);
+            assert!(!is_ast, "fixture must be a NON-AST node");
+        }
+
+        adapter.batch_splice(&[(plain.clone(), Some("REPLACED".to_string()))])?;
+        adapter.refresh_readers()?;
+
+        let mut buf = [0u8; 64];
+        let n = adapter.read_content(&plain, &mut buf, 0)?;
+        assert_eq!(
+            &buf[..n],
+            b"REPLACED",
+            "plain-node splice served stale bytes from a live manifest"
+        );
+        Ok(())
+    }
+
+    /// `rename_node` moves the `nodes` row but the manifest is keyed by the old
+    /// id with no FK, so it orphans onto a path that may be reused.
+    #[test]
+    #[cfg(feature = "cdc")]
+    fn rename_does_not_orphan_a_manifest_on_the_vacated_path() -> Result<()> {
+        let adapter = chunked_adapter()?;
+        adapter.write_content("docs/readme", b"pre-rename-bytes", 0)?;
+        adapter.rename_node("docs/readme", "docs", "moved")?;
+
+        let guard = adapter.writer.lock();
+        assert!(
+            !crate::chunked::has_chunked_content(guard.conn(), "docs/readme")?,
+            "manifest orphaned on the vacated path — a new file there would \
+             read the pre-rename content"
+        );
+        drop(guard);
+
+        // And the renamed node still reads correctly (via the record path).
+        let mut buf = [0u8; 64];
+        let n = adapter.read_content("docs/moved", &mut buf, 0)?;
+        assert_eq!(&buf[..n], b"pre-rename-bytes");
         Ok(())
     }
 }

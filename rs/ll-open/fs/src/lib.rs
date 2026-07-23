@@ -1,3 +1,7 @@
+/// Chunk-backed content storage — a range read selects only the overlapping
+/// chunks instead of re-materializing the whole file. Opt-in (`--features cdc`).
+#[cfg(feature = "cdc")]
+pub mod chunked;
 #[cfg(feature = "fuse")]
 pub mod fuse;
 pub mod graph;

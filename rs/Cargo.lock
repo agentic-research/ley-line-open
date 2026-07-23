@@ -3306,6 +3306,7 @@ dependencies = [
  "bytemuck",
  "crossbeam-queue",
  "fuser",
+ "leyline-cdc",
  "leyline-core",
  "leyline-ffi-helpers",
  "leyline-schema",

@@ -308,6 +308,81 @@ tasks:
     cmds:
       - cargo build -p leyline-fs --no-default-features --features nfs
 
+  test:fs-cdc:
+    desc: |
+      Test the chunk-backed content path (`--features cdc`). REQUIRED because
+      `cdc` is non-default: `cargo test --workspace` never compiles
+      `leyline-fs::chunked`, so its tests — including the differential fuzzer
+      and the overlap-predicate falsifier — would silently not run. Same class
+      of hole as the #214 nfs-only libc bug that the default build masked.
+      `splice` is REQUIRED here, not incidental: the manifest-staleness tests
+      (a splice rewrites `nodes.record` from inside leyline-ts, so a surviving
+      manifest would serve pre-splice bytes) are gated on it. Without `splice`
+      the invalidation logic is never exercised — mutation testing caught
+      exactly that, with two live mutants in `invalidate_chunked_content`.
+      `--no-default-features` so the fuse system dep isn't needed in CI.
+    dir: rs
+    cmds:
+      - cargo test -p leyline-fs --no-default-features --features cdc,splice,validate
+      # `--no-deps`: -D warnings otherwise propagates into dependencies, and
+      # leyline-ts has items that are dead only under the feature set this
+      # invocation induces (they are live under its own defaults, which is why
+      # the workspace `task clippy` is clean). Linting a dependency through a
+      # consumer's feature selection is not this gate's job.
+      - cargo clippy -p leyline-fs --no-default-features --features cdc,splice,validate --no-deps -- -D warnings
+
+  # --------------------------------------------------------------------------
+  # Mutation testing — the gate that checks the TESTS, not the code.
+  #
+  # Why this exists: the chunked-content path can fail in a way no correctness
+  # test can see. Widening the overlap predicate (`<` → `<=`) fetches an extra
+  # non-overlapping chunk per read — the bytes returned are still correct, so
+  # every round-trip test passes while the module's entire reason for existing
+  # is defeated. `cargo mutants` catches exactly that class, and it already
+  # earned its keep twice on first run:
+  #   - `reconstruct`'s `c.offset + c.len` → `* ` survived, revealing the total
+  #     was an upper bound that `read_range` silently clamped (now removed).
+  #   - `ORDER BY seq` in the range query was unverifiable dead weight (removed).
+  #
+  # Scoped to the two files carrying falsifiable claims, not the workspace —
+  # a whole-workspace run is hours. Grow the --file list as more of the
+  # substrate gets this treatment.
+  #
+  # NOT in `task ci`: ~3 min warm, and it rebuilds per mutant so a cold run is
+  # several times that. Runs in its own path-filtered workflow
+  # (.github/workflows/mutants.yml) and on demand via `task mutants`.
+  # --------------------------------------------------------------------------
+  mutants:
+    desc: Mutation-test the CDC + chunked-content path (~3 min warm). Fails if any mutant survives.
+    cmds:
+      - task: mutants:cdc
+      - task: mutants:fs
+
+  mutants:fs:
+    desc: Mutation-test leyline-fs::chunked (the SQL materialize-on-read path).
+    dir: rs
+    cmds:
+      # `-C --lib`: the FFI smoke test links against a staticlib in the real
+      # target dir, which doesn't exist in the mutant scratch build. Lib tests
+      # are where every chunked assertion lives anyway.
+      - >-
+        cargo mutants -p leyline-fs --test-workspace=false
+        --no-default-features --features cdc,splice,validate
+        -C --lib --file ll-open/fs/src/chunked.rs
+
+  mutants:cdc:
+    desc: Mutation-test leyline-cdc (chunking + range reads).
+    dir: rs
+    cmds:
+      # Exit 3 = "some mutants timed out". For this crate that IS detection:
+      # the surviving-loop mutants (`< `→`<=` in the scan, `next_boundary -> 0`)
+      # make chunking never terminate, so a hang is the test noticing. Exit 2
+      # (a mutant no test caught) still fails, which is the point of the gate.
+      - >-
+        cargo mutants -p leyline-cdc --test-workspace=false
+        -C --lib --file ll-open/cdc/src/lib.rs
+        || [ $? -eq 3 ]
+
   # --------------------------------------------------------------------------
   # Tier isolation — guard against cross-tier dep creep. ll-core (Tier 1
   # OSS infrastructure) must build standalone with no transitive pull
@@ -504,6 +579,7 @@ tasks:
       - task: smells
       - task: build:fs-static
       - task: build:fs-nfs-isolated
+      - task: test:fs-cdc
       - task: tier:isolation
       - task: test
       - task: sign:host:build

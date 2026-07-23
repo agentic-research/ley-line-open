@@ -79,13 +79,6 @@
 # SQLite WAL/shared-memory sidecars are transient — never commit.
 .beads/*.db-wal
 .beads/*.db-shm
-# Superseded Dolt store kept around after a migration/repair. It is an OLD
-# copy of bead state, so committing it risks a future reader resurrecting
-# stale beads over the live ones. `.beads/.gitignore` (rosary-managed) already
-# denies `dolt/` and `backup/`; this covers the `.bak` form, and lives here so
-# rosary regenerating its own ignore file cannot drop it.
-.beads/dolt.bak/
-.beads/dolt.bak*
 
 # Go bindings module — clients/go/leyline-schema/ ships generated *.capnp.go
 # files; the regen-diff CI gate (.github/workflows/leyline-schema-go.yml)

@@ -20,7 +20,7 @@ use jj_lib::config::StackedConfig;
 use jj_lib::local_working_copy::LocalWorkingCopyFactory;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::object_id::ObjectId as _;
-use jj_lib::ref_name::WorkspaceNameBuf;
+use jj_lib::ref_name::{WorkspaceName, WorkspaceNameBuf};
 use jj_lib::repo::{ReadonlyRepo, Repo as _};
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::settings::UserSettings;
@@ -484,6 +484,10 @@ impl JjIntegration {
     /// add`. This is jj's native multi-workspace feature driven **purely
     /// through `jj-lib`**: no `jj` process is ever spawned, so a caller
     /// (rosary) can branch-dispatch agents entirely in-process.
+    ///
+    /// The new workspace is **materialized** with the content the `default`
+    /// workspace has checked out — the caller gets a populated tree, matching
+    /// what `jj workspace add` produces.
     pub fn add_workspace(&self, root: &Path, name: &str) -> Result<AgentWorkspace> {
         // Reject a name already registered in the shared store. jj-lib's
         // multi-workspace init silently clobbers a duplicate (last-wins),
@@ -509,8 +513,17 @@ impl JjIntegration {
             .block_on()
             .map_err(|e| anyhow::anyhow!("load shared repo: {e}"))?;
 
+        // The commit whose content the new workspace should start from: whatever
+        // the default workspace currently has checked out. Captured BEFORE the
+        // init below, which mutates the repo (it registers the new name at the
+        // empty root commit).
+        let base_id = repo
+            .view()
+            .get_wc_commit_id(WorkspaceName::DEFAULT)
+            .cloned();
+
         let factory = LocalWorkingCopyFactory {};
-        Workspace::init_workspace_with_existing_repo(
+        let (mut agent_ws, repo) = Workspace::init_workspace_with_existing_repo(
             root,
             &repo_path,
             &repo,
@@ -519,6 +532,42 @@ impl JjIntegration {
         )
         .block_on()
         .map_err(|e| anyhow::anyhow!("init agent workspace {name:?}: {e}"))?;
+
+        // MATERIALIZE. `init_workspace_with_existing_repo` registers the new
+        // workspace at the store's EMPTY root commit — the directory it leaves
+        // behind contains nothing but `.jj`. That is not a usable workspace: a
+        // caller that puts an agent in it hands the agent an empty tree. The
+        // `jj` CLI's `workspace add` does this second step itself; driving
+        // jj-lib directly means we must too.
+        if let Some(base_id) = base_id {
+            let base = repo
+                .store()
+                .get_commit(&base_id)
+                .map_err(|e| anyhow::anyhow!("load base commit for {name:?}: {e}"))?;
+
+            let mut tx = repo.start_transaction();
+            let wc_commit = tx
+                .repo_mut()
+                .check_out(WorkspaceNameBuf::from(name), &base)
+                .block_on()
+                .map_err(|e| anyhow::anyhow!("check out base for {name:?}: {e}"))?;
+            // `check_out` abandons the empty root-commit working copy the init
+            // step registered; that counts as a rewrite, and jj-lib asserts
+            // descendants were rebased before a transaction commits.
+            tx.repo_mut()
+                .rebase_descendants()
+                .block_on()
+                .map_err(|e| anyhow::anyhow!("rebase descendants for {name:?}: {e}"))?;
+            let repo = tx
+                .commit(format!("materialize workspace '{name}'"))
+                .block_on()
+                .map_err(|e| anyhow::anyhow!("commit checkout for {name:?}: {e}"))?;
+
+            agent_ws
+                .check_out(repo.op_id().clone(), None, &wc_commit)
+                .block_on()
+                .map_err(|e| anyhow::anyhow!("materialize working copy for {name:?}: {e}"))?;
+        }
 
         Ok(AgentWorkspace {
             root: root.to_path_buf(),
@@ -2115,5 +2164,137 @@ mod tests {
         let (vg, _jj_dir) = test_versioned_graph();
         let result = vg.write_content(".dex/complete", b"dex-999", 0);
         assert!(result.is_err());
+    }
+
+    // ── Git-backed repos: the shape every real jj repo actually has ──────
+    //
+    // `Workspace::init_simple` (used by `JjIntegration::init`) builds a
+    // SimpleBackend repo — a shape that exists only in tests. Real repos come
+    // from `jj git init` and are Git-backed. jj-lib gates that backend behind
+    // `#[cfg(feature = "git")]`, so a downstream `default-features = false`
+    // silently compiles it out and every one of these tests would pass while
+    // production failed with "Cannot read the repo". These tests pin the
+    // feature: they use `init_internal_git`, which does not exist without it.
+
+    /// Build a GIT-BACKED jj repo whose `default` workspace has real content
+    /// checked out — the production shape. No `jj` binary involved.
+    fn git_backed_repo_with_content(primary: &Path) -> JjIntegration {
+        use jj_lib::ref_name::WorkspaceName;
+
+        std::fs::create_dir_all(primary).unwrap();
+        let settings = JjIntegration::make_settings().unwrap();
+        Workspace::init_internal_git(&settings, primary)
+            .block_on()
+            .expect("init_internal_git requires jj-lib's `git` feature");
+
+        let jj = JjIntegration::open(primary).expect("open a git-backed repo");
+
+        let mut g = MemoryGraph::new();
+        g.add_node(
+            Node {
+                id: "hello.txt".into(),
+                name: "hello.txt".into(),
+                is_dir: false,
+                size: 5,
+                mtime_nanos: 0,
+            },
+            "",
+            Some(b"hello".to_vec()),
+        );
+        g.add_node(
+            Node {
+                id: "src".into(),
+                name: "src".into(),
+                is_dir: true,
+                size: 0,
+                mtime_nanos: 0,
+            },
+            "",
+            None,
+        );
+        g.add_node(
+            Node {
+                id: "src/main.rs".into(),
+                name: "main.rs".into(),
+                is_dir: false,
+                size: 11,
+                mtime_nanos: 0,
+            },
+            "src",
+            Some(b"fn main(){}".to_vec()),
+        );
+        let seed_hex = jj.commit_snapshot(&g, "seed").unwrap();
+
+        // `commit_snapshot` writes a commit but leaves the `default` workspace
+        // pointing at the empty root. Point it at the seed so the repo looks
+        // like a checkout someone has actually been working in.
+        let repo = jj.load_repo().unwrap();
+        let seed_id = repo
+            .view()
+            .heads()
+            .iter()
+            .find(|id| id.hex() == seed_hex)
+            .cloned()
+            .expect("seed commit must be a head");
+        let seed = repo.store().get_commit(&seed_id).unwrap();
+        let mut tx = repo.start_transaction();
+        tx.repo_mut()
+            .check_out(WorkspaceName::DEFAULT.to_owned(), &seed)
+            .block_on()
+            .unwrap();
+        tx.repo_mut().rebase_descendants().block_on().unwrap();
+        tx.commit("check out seed").block_on().unwrap();
+
+        jj
+    }
+
+    /// The falsifiable one: a GIT-BACKED repo opens, and the agent workspace it
+    /// produces is REGISTERED in the shared store *and* CONTAINS THE REPO'S
+    /// FILES. An empty directory satisfies neither half.
+    #[test]
+    fn add_workspace_on_a_git_backed_repo_materializes_the_repo_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let jj = git_backed_repo_with_content(&dir.path().join("primary"));
+
+        assert_eq!(jj.workspace_names().unwrap(), vec!["default".to_string()]);
+
+        let ws = jj
+            .add_workspace(&dir.path().join("agent-a"), "agent-a")
+            .expect("add_workspace on a git-backed repo");
+
+        let mut names = jj.workspace_names().unwrap();
+        names.sort();
+        assert_eq!(names, vec!["agent-a".to_string(), "default".to_string()]);
+
+        // The part that matters to a caller putting an agent in here: SOURCE.
+        assert_eq!(
+            std::fs::read_to_string(ws.root.join("hello.txt")).unwrap(),
+            "hello",
+            "the workspace must contain the repo's files, not just `.jj`"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.root.join("src/main.rs")).unwrap(),
+            "fn main(){}"
+        );
+    }
+
+    /// The agent workspace is a real working copy over the SHARED store, not a
+    /// copy of it — same invariant as the SimpleBackend test, but on the shape
+    /// production has.
+    #[test]
+    fn git_backed_agent_workspace_points_at_the_shared_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("primary");
+        let jj = git_backed_repo_with_content(&primary);
+
+        let a = dir.path().join("agent-a");
+        jj.add_workspace(&a, "agent-a").unwrap();
+
+        assert!(a.join(".jj/working_copy").exists());
+        assert!(
+            a.join(".jj/repo").is_file(),
+            "agent's .jj/repo must be a shared-store pointer, not a copy"
+        );
+        assert!(primary.join(".jj/repo").is_dir());
     }
 }

@@ -8,7 +8,14 @@ license = "AGPL-3.0-or-later"
 parking_lot = { workspace = true }
 leyline-core = { path = "../../ll-core/core" }
 leyline-fs = { path = "../fs", default-features = false }
-jj-lib = { version = "0.42", default-features = false }
+# `git` is NOT optional here despite `default-features = false`. jj-lib gates its
+# Git backend behind `#[cfg(feature = "git")]`, and `StoreFactories::default()`
+# only registers that backend when the feature is on. Every real-world jj repo is
+# Git-backed (`jj git init`), so with the feature off `Workspace::load` fails with
+# "Cannot read the repo" on anything but a `Workspace::init_simple` SimpleBackend
+# repo — i.e. only on test fixtures. `default-features = false` stays so we keep
+# opting out of jj-lib's *other* defaults; `git` is re-added explicitly.
+jj-lib = { version = "0.42", default-features = false, features = ["git"] }
 anyhow = { workspace = true }
 hex = { workspace = true }
 # `futures::io::AsyncReadExt` — provides `read()` on the `futures_io::AsyncRead`

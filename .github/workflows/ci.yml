@@ -23,12 +23,12 @@ jobs:
       # deprecation does not apply; latest commit on master as of 2026-03).
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
-          # Pinned per bead `ley-line-open-75444d`. Nightly daf2e5e18
-          # (2026-07-13) ICEs on `#[test]` + `#[serial(<key>)]`
-          # combination — hard-fails every PR + main. Unpin when
-          # upstream rolls a fix; last known-good was 77cf889bc
-          # (2026-07-12). Verify with a rebuild before unpinning.
-          toolchain: nightly-2026-07-12
+          # Must equal rust-toolchain.toml's `channel` — enforced by
+          # `task lint:toolchain-parity`. Stable, not nightly: nothing in
+          # `rs/` uses a `#![feature(...)]`, so the old nightly pin (bead
+          # `ley-line-open-75444d`, dodging an ICE on `#[test]` +
+          # `#[serial(<key>)]`) was babysitting a dependency we never needed.
+          toolchain: 1.97.1
           components: clippy, rustfmt
 
       # Cargo registry + rs/target cache. Median ~40-60s saved per run
@@ -59,7 +59,11 @@ jobs:
       # (Node 20 is force-defaulted June 2 2026, removed Sept 16 2026).
       - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611
         with:
-          version: 3.x
+          # Exact, not `3.x`: a floating minor means the runner can pick up a
+          # new go-task whose behaviour differs from the one developers have,
+          # which is the same class of drift rust-toolchain.toml exists to
+          # close. Bump deliberately, together with local installs.
+          version: 3.49.1
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run task ci (check + clippy + fmt + FFI staticlib + tier isolation + test)

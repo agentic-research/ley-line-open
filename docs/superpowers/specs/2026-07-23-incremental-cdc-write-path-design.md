@@ -167,27 +167,49 @@ field is required.
 
 No production edit occurs before the first test is written and observed RED.
 
-1. Add a graph test for a three-byte edit deep in a deterministic
-   multi-megabyte file. It calls the wished-for `write_content_traced` method
-   and first fails because the edit-aware graph behavior is absent.
-1. Add only the minimal outcome/API shell needed to compile. Re-run and observe
-   a semantic RED result: the current path reports `Full`, not `Incremental`.
-1. Capture the verified old manifest and call `rechunk_with_stats`. The focused
-   test turns GREEN only when:
-   - the manifest equals `chunk(new_data)`;
-   - a full read equals the edited bytes;
+### Differential graph-write harness
+
+One table-driven harness owns the byte-for-byte correctness proof. It keeps a
+plain `Vec<u8>` model, applies the exact `Graph::write_content` overwrite and
+zero-fill semantics to that model, and drives the same edit through the real
+SQLite graph adapter. After every write it:
+
+1. computes the oracle manifest with `leyline_cdc::chunk(&model)`;
+1. reads the real manifest as ordered `(hash, offset, len)` tuples;
+1. requires tuple-for-tuple equality with the oracle;
+1. reconstructs the whole file through the chunk-backed reader and requires
+   byte-for-byte equality with the model.
+
+The case table covers a deep small overwrite, append at EOF, write beyond EOF
+with a zero-filled gap, equal-length overwrite across chunk boundaries, and an
+empty write. Deterministic pseudo-random source bytes ensure the file has many
+content-defined boundaries without fixtures or timing thresholds.
+
+The harness is deliberately an integration oracle, not another test of the
+chunking algorithm. `leyline-cdc` already fuzzes
+`rechunk(new) == chunk(new)` directly; this harness proves the graph/SQLite
+wiring produces the same durable representation.
+
+### RED/GREEN order
+
+1. Add the harness with a deep three-byte edit calling the wished-for
+   `write_content_traced` method. Run it and record RED because the edit-aware
+   graph behavior is absent.
+1. Add only the minimal outcome/API shell needed to compile. Re-run and record
+   semantic RED: the current path reports `Full`, not `Incremental`.
+1. Capture the verified old manifest and call `rechunk_with_stats`. Turn the
+   first case GREEN only when the differential manifest and reconstructed bytes
+   match and:
    - `prefix_kept` and `tail_reused` are non-zero;
    - `bytes_scanned` is bounded by a small multiple of `MAX_CHUNK`, not file
      length.
-1. Add one RED test at a time for fallback and edge behavior:
-   - absent manifest uses `Full`;
-   - stale witness uses `Full`;
-   - write beyond EOF has exact coordinates and bytes;
-   - equal-length overwrite remains exact;
-   - foreign arena returns `Skipped`;
-   - refresh failure cannot make stale chunks readable.
-1. Refactor shared full/incremental manifest storage only after the focused
-   tests are GREEN.
+1. Add the remaining case-table rows one at a time. Each new row is run RED
+   before any corresponding coordinate or fallback change.
+1. Add a small fallback table for absent manifest (`Full`), stale witness
+   (`Full`), and foreign arena (`Skipped`). Existing freshness tests already
+   prove stale manifests cannot serve bytes; do not duplicate that suite.
+1. Refactor shared full/incremental manifest storage only after the harness and
+   fallback table are GREEN.
 
 Every RED invocation and expected failure is recorded on the bead before the
 corresponding production change.

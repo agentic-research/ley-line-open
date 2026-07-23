@@ -773,7 +773,7 @@ impl Graph for SqliteGraphAdapter {
             }
 
             // Sort by start_byte DESC (bottom-up: splice later offsets first)
-            group.sort_by(|a, b| b.start_byte.cmp(&a.start_byte));
+            group.sort_by_key(|a| std::cmp::Reverse(a.start_byte));
 
             // Read original source
             let source: Vec<u8> = conn

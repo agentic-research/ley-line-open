@@ -7,6 +7,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Runners persist this directory with actions/cache. Local Taskfile users
+  # intentionally retain sccache's platform-default cache so compiler outputs
+  # remain reusable across sibling repositories/worktrees.
+  SCCACHE_DIR: ${{ github.workspace }}/.cache/sccache
+  SCCACHE_CACHE_SIZE: 2G
 
 # CI is the same gate as local dev: every step delegates to a Taskfile
 # entry. If a check isn't reachable via `task <name>`, it doesn't belong
@@ -42,6 +47,11 @@ jobs:
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0
         with:
           workspaces: rs
+          # sccache owns compiler-output reuse. Retaining target/ as well
+          # duplicates a much larger, path-sensitive cache and still did not
+          # prevent the v0.10.2 rust-lld SIGBUS. rust-cache continues to cache
+          # the Cargo registry/git inputs.
+          cache-targets: false
 
       - name: Install system deps (libfuse for fuser, capnproto + libcapnp-dev for schema build.rs)
         run: |
@@ -66,8 +76,30 @@ jobs:
           version: 3.49.1
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # Compiler outputs use the same Taskfile-managed sccache path locally
+      # and on runners. The Taskfile pins + verifies the executable; this
+      # action only restores its content-addressed data.
+      # SHA-pinned: actions/cache@v6.1.0 (Node 24).
+      - name: Restore sccache compiler cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .cache/sccache
+          key: sccache-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('rs/Cargo.lock') }}
+          restore-keys: |
+            sccache-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-
+
+      - name: Install pinned sccache through Taskfile
+        run: task cache:sccache:install
+
+      - name: Reset sccache statistics
+        run: task cache:sccache:zero
+
       - name: Run task ci (check + clippy + fmt + FFI staticlib + tier isolation + test)
         run: task ci
+
+      - name: Report sccache statistics
+        if: always()
+        run: task cache:sccache:stats
 
       # Perf regression gate — release-profile build adds ~90-120s, so
       # we only run it on main pushes (every PR doesn't need to pay).

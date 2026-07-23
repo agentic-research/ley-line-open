@@ -6,7 +6,6 @@ version: '3'
 vars:
   SCCACHE_VERSION: 0.15.0
   SCCACHE_BIN: '{{.ROOT_DIR}}/.tools/bin/sccache'
-  SCCACHE_CACHE_DIR: '{{.ROOT_DIR}}/.cache/sccache'
   # macOS needs our fuse-t pkg-config wrapper; Linux uses system libfuse3.
   FUSE_PKG_CONFIG_PATH:
     sh: 'if [ "$(uname)" = "Darwin" ]; then echo "{{.ROOT_DIR}}/rs/pkgconfig"; fi'
@@ -17,7 +16,6 @@ env:
   # Standalone tasks retain the old optional-system-sccache behavior.
   RUSTC_WRAPPER:
     sh: 'if [ -x "{{.SCCACHE_BIN}}" ]; then echo "{{.SCCACHE_BIN}}"; else command -v sccache 2>/dev/null || true; fi'
-  SCCACHE_DIR: '{{.SCCACHE_CACHE_DIR}}'
 
 tasks:
   default:
@@ -76,6 +74,16 @@ tasks:
         grep -q 'cache:sccache:stats:' Taskfile.yml
         grep -q 'sources:' Taskfile.yml
         grep -q 'generates:' Taskfile.yml
+        test -f .cargo/config.toml
+        grep -q 'link-arg=-Wl,--threads=2' .cargo/config.toml
+        grep -q 'task cache:sccache:install' .github/workflows/ci.yml
+        grep -q 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' .github/workflows/ci.yml
+        grep -q 'path: .cache/sccache' .github/workflows/ci.yml
+        grep -q 'task cache:sccache:stats' .github/workflows/ci.yml
+        if grep -Eq 'run:.*cargo (build|test|clippy)' .github/workflows/ci.yml; then
+          echo "ci.yml must delegate Rust commands to Taskfile.yml"
+          exit 1
+        fi
         echo "cache contract OK"
 
   cache:sccache:install:
@@ -688,6 +696,7 @@ tasks:
       # fmt:check at its old position (bead ley-line-open-9ca974).
       - task: fmt:check
       - task: lint:toolchain-parity
+      - task: lint:cache-contract
       - task: lint:blake3
       - task: readme:version-check
       - task: check

@@ -18,6 +18,7 @@
 # Pins the compiler for local dev to exactly what CI uses — see the file's
 # header for why this is tracked rather than left to each contributor.
 !rust-toolchain.toml
+!.cargo/config.toml
 
 # GitHub Actions
 !.github/**

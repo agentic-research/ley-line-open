@@ -10,43 +10,63 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.10.2] — 2026-07-23
+
+**Chunk-backed content reads, a permissive schema layer, and a high-severity dependency fix.**
+
+Patch release. No wire/schema change — `wire_format_major` and `compat_min_schema_version` (0.6.0) are unchanged, and `SCHEMA_VERSION` tracks the package version to `0.10.2` as usual. Everything new is additive and opt-in: the chunk store lives behind `--features cdc`, and an arena without chunk tables reads exactly as it did before.
+
+This is the release mache and rosary were both blocked on — `leyline-cdc` and the jj multi-workspace API landed after `v0.10.1` and were unavailable to any consumer pinning a release.
+
+### Added
+
+- **Go schema module `clients/go/leyline-schema/v0.10.2`** — first nested-module
+  tag since `v0.7.1`, carrying the canonical `leyline-net/v1` bindings, signed
+  `Head` fields, and the module-local Apache-2.0 license. The Go module has no
+  version file; the nested tag is its release boundary and is cut from the same
+  commit as the binary `v0.10.2` tag.
+
+- **Chunk-backed content storage (`leyline-fs --features cdc`)** — bead `ley-line-open-87bf00`.
+  `read_content` served a byte range by `SELECT record`, loading the whole file and slicing it: a 4 KiB mount read of a 100 MB file materialized 100 MB. Content is now stored as content-defined chunks (`content_chunks`) plus per-node spans (`content_manifest`), so a range read becomes a `WHERE` clause and only overlapping chunks are read.
+
+  `nodes.record` remains authoritative — it is the cross-runtime contract mache also writes — and the manifest is a derived index. Because a stale manifest would serve wrong bytes, `content_manifest_meta` records the `(size, mtime)` each manifest was built from and reads refuse any manifest whose source moved on. A missed invalidation therefore degrades to slow-but-correct rather than silently wrong, including for writers outside this crate (`leyline-ts`'s reproject re-inserts nodes with a fresh `mtime`).
+
+- **`leyline-cdc`** (`ley-line-open-9989d2`) — content-defined chunking over HuggingFace's `gearhash` with xet's boundary parameters, BLAKE3 chunk identity. Includes `rechunk`, which rescans only an edit's interval and is required to equal a full re-chunk bit-for-bit. Not yet wired into the write path; writes still re-chunk in full.
+
+- **Per-agent jj workspaces over one shared store** (`ley-line-open-99a9fe`) — `add_workspace` / `forget_workspace` / `workspace_names`, driven purely through `jj-lib` with no `jj` subprocess. `leyline-vcs` now enables jj-lib's `git` backend, which `default-features = false` had silently removed.
+
 ### Changed
 
-- **Schema and wire-contract crates relicensed to Apache-2.0** (repository
-  remains AGPL-3.0-or-later). The interface layer is now permissive so other
-  runtimes — mache first — can implement and consume the contract without
-  inheriting copyleft:
+- **Schema and wire-contract crates relicensed to Apache-2.0** (repository remains AGPL-3.0-or-later). The interface layer is now permissive so other runtimes — mache first — can implement and consume the contract without inheriting copyleft:
 
-  - `clients/go/leyline-schema/` (the generated Go bindings mache imports;
-    previously inherited the root AGPL by having no license of its own)
-  - `rs/ll-core/schema-capnp`, `rs/ll-core/public-schema`,
-    `rs/ll-core/schema`, `rs/ll-core/schema-spec`
+  - `clients/go/leyline-schema/` (the generated Go bindings mache imports; previously inherited the root AGPL by having no license of its own)
+  - `rs/ll-core/schema-capnp`, `rs/ll-core/public-schema`, `rs/ll-core/schema`, `rs/ll-core/schema-spec`
 
-  Effective rather than nominal: none of these crates depend on an AGPL crate
-  in this workspace — only `capnp`, `capnp-json`, `rusqlite`, `anyhow`, all
-  permissive — and the dependency edge runs one way, with AGPL crates consuming
-  the schema crates and never the reverse. Relicensing is clean on authorship
-  as well: every commit touching these paths is from the sole copyright holder.
+  Effective rather than nominal: none of these crates depend on an AGPL crate in this workspace — only `capnp`, `capnp-json`, `rusqlite`, `anyhow`, all permissive — and the dependency edge runs one way, with AGPL crates consuming the schema crates and never the reverse. Relicensing is clean on authorship as well: every commit touching these paths is from the sole copyright holder.
+
+- **Toolchain pinned to stable 1.97.1 for CI *and* local** (`ley-line-open-75444d`). `rust-toolchain.toml` means rustup gives contributors exactly the compiler the runners use; `task lint:toolchain-parity` stops the two pins drifting. The previous `nightly-2026-07-12` pin existed only to dodge an ICE a later nightly introduced — nothing here needs nightly (no `#![feature(...)]` anywhere in `rs/`), so it was babysitting a problem being on nightly created.
 
 ### Security
 
-- **`fuser` 0.15 → 0.16 — GHSA-cvmj-47v9-35m9 (high).** Uninitialized memory
-  read and leak in `fuser` < 0.16.0, reachable through the FUSE mount path
-  (`leyline-fs --features fuse`). Dependabot alerts #1 and #2. No API change on
-  our side: `fuse.rs` compiles unmodified against 0.16.
+- **`fuser` 0.15 → 0.16 — GHSA-cvmj-47v9-35m9 (high).** Uninitialized memory read and leak in `fuser` < 0.16.0, reachable through the FUSE mount path (`leyline-fs --features fuse`). No API change on our side.
 
-  One non-obvious part of the bump. fuser 0.16 changed its **default feature
-  set** from `["libfuse"]` to `[]`, which silently switches the mount
-  implementation to the pure-Rust one — and that implementation is Linux-only,
-  so a macOS build fails inside fuser's `build.rs` with *"Building without
-  libfuse is only supported on Linux"*. `features = ["libfuse"]` is therefore
-  now declared explicitly, preserving 0.15's behaviour (libfuse2 through the
-  fuse-t wrapper in `rs/pkgconfig` on macOS, libfuse3 on Linux).
+  fuser 0.16 also changed its **default feature set** from `["libfuse"]` to `[]`, silently switching to a pure-Rust mount implementation that is Linux-only; `features = ["libfuse"]` is now explicit. That is the second dependency in as many days whose default-feature change removed a backend with no call-site signal — the first being `jj-lib`'s `git` feature above.
 
-  That is the second dependency in as many days whose default-feature change
-  silently removed a backend — the first being `jj-lib`'s `git` feature in
-  `leyline-vcs` (#257). Both were invisible at the call site and neither
-  produced a compile error on the platform that still worked.
+### Fixed
+
+- **`--features all` did not compile** — `daemon/embed.rs` called
+  `.lock().map_err(..)` and `if let Ok(mut q) = queue.lock()` against a
+  `parking_lot::Mutex`, whose guard is not a `Result`. Written against
+  `std::sync::Mutex`'s API, it had never built under `--features vec`. `task
+  ci` only builds DEFAULT features, so it was invisible; it surfaced only when
+  this release's binary was validated by hand. That matters because
+  `task install:full` uses `--features all` and is the documented install for
+  mache and downstream daemon consumers. New `task check:all-features` gate in
+  `task ci` stops it recurring.
+
+- **Four writers left a live, stale chunk manifest** — found by adversarial review before release. The worst was not staleness but disclosure: node ids are paths and paths get reused, so an orphaned manifest attached to the next file created at that path, and a brand-new never-written file read back a deleted file's bytes. Fixed structurally via the freshness witness above, with regression tests for `truncate`, `remove_node`, `rename_node`, and `batch_splice`'s non-AST arm.
+
+- **Two wall-clock test gates that failed under CPU load with nothing broken.** `f2_concurrent_writers_throughput`'s parallel-vs-serial ratio moved behind `LLO_PERF_GATES` (measured always, asserted in `task test:perf`), and `fs_concurrent_put_get_interleaved` lost its 50 ms sleep entirely in favour of fixed iteration counts. A new `sleep_in_tests` smell rule holds the line at the remaining 25 occurrences (bead `ley-line-open-c6101e`).
 
 ## [0.10.1] — 2026-07-22
 

@@ -162,12 +162,12 @@ All three codesign on macOS (ad-hoc + entitlements) and drop the binary at `~/.l
 
 ## Building the image
 
-A distroless OCI image (`ley-line-open:0.10.1`, ~20 MB) is built via [`krust`](https://github.com/imjasonh/krust) (cargo-zigbuild → static musl binary) + a one-line `docker build` that COPYs the binary onto `cgr.dev/chainguard/static`. See `image.Dockerfile` and `Taskfile.yml`. The image's default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0` headless — no FUSE/NFS, just the MCP HTTP transport on `:8384` inside the container (consumed by cloister via `LLO_MCP_URL`, default `http://localhost:8384/mcp`).
+A distroless OCI image (`ley-line-open:0.10.2`, ~20 MB) is built via [`krust`](https://github.com/imjasonh/krust) (cargo-zigbuild → static musl binary) + a one-line `docker build` that COPYs the binary onto `cgr.dev/chainguard/static`. See `image.Dockerfile` and `Taskfile.yml`. The image's default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0` headless — no FUSE/NFS, just the MCP HTTP transport on `:8384` inside the container (consumed by cloister via `LLO_MCP_URL`, default `http://localhost:8384/mcp`).
 
 ```bash
 brew install zig                   # cargo-zigbuild backend
 cargo install cargo-zigbuild krust # one-time
-task image                         # → ley-line-open:0.10.1 in local docker
+task image                         # → ley-line-open:0.10.2 in local docker
 task image:smoke                   # build + start daemon + curl tools/list
 ```
 
@@ -196,9 +196,9 @@ Generated Go bindings for every public capnp schema ship as a separate Go module
 import "github.com/agentic-research/ley-line-open/clients/go/leyline-schema/binding"
 ```
 
-One sub-package per schema (`ast`, `binding`, `common`, `daemon`, `head`, `source`). Regen via `clients/go/leyline-schema/regen.sh`; CI gates on `git diff --exit-code` plus `go test ./...` decoding the same `tests/fixtures/*.bin` the Rust suite asserts byte-equality against.
+One sub-package per schema (`ast`, `binding`, `cache`, `common`, `daemon`, `head`, `net`, `source`). Regen via `clients/go/leyline-schema/regen.sh`; CI gates on `git diff --exit-code` plus `go test ./...` decoding the same `tests/fixtures/*.bin` the Rust suite asserts byte-equality against.
 
-Latest tag: [`clients/go/leyline-schema/v0.2.3`](https://github.com/agentic-research/ley-line-open/releases/tag/clients%2Fgo%2Fleyline-schema%2Fv0.2.3) — see [CHANGELOG.md](CHANGELOG.md) for what each `0.2.x` carries.
+Latest tag: [`clients/go/leyline-schema/v0.10.2`](https://github.com/agentic-research/ley-line-open/releases/tag/clients%2Fgo%2Fleyline-schema%2Fv0.10.2) — paired with the binary release so Go consumers can pin the same public-schema surface.
 
 ## Daemon protocol
 

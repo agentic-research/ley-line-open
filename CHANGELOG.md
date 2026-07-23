@@ -10,6 +10,26 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Security
+
+- **`fuser` 0.15 → 0.16 — GHSA-cvmj-47v9-35m9 (high).** Uninitialized memory
+  read and leak in `fuser` < 0.16.0, reachable through the FUSE mount path
+  (`leyline-fs --features fuse`). Dependabot alerts #1 and #2. No API change on
+  our side: `fuse.rs` compiles unmodified against 0.16.
+
+  One non-obvious part of the bump. fuser 0.16 changed its **default feature
+  set** from `["libfuse"]` to `[]`, which silently switches the mount
+  implementation to the pure-Rust one — and that implementation is Linux-only,
+  so a macOS build fails inside fuser's `build.rs` with *"Building without
+  libfuse is only supported on Linux"*. `features = ["libfuse"]` is therefore
+  now declared explicitly, preserving 0.15's behaviour (libfuse2 through the
+  fuse-t wrapper in `rs/pkgconfig` on macOS, libfuse3 on Linux).
+
+  That is the second dependency in as many days whose default-feature change
+  silently removed a backend — the first being `jj-lib`'s `git` feature in
+  `leyline-vcs` (#257). Both were invisible at the call site and neither
+  produced a compile error on the platform that still worked.
+
 ## [0.10.1] — 2026-07-22
 
 **Additive: per-leaf Merkle inclusion proofs on the shared tree primitive.**

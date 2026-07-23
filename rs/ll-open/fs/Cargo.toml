@@ -34,7 +34,16 @@ bytemuck = { workspace = true, features = ["derive"] }
 # T2.3: BLAKE3 to verify σ(arena buffer) == ctrl.current_root before
 # deserialize. Locked to BLAKE3 per Σ §3.4.
 blake3 = { workspace = true }
-fuser = { version = "0.15", optional = true }
+# `features = ["libfuse"]` is REQUIRED, not incidental. fuser 0.16 changed its
+# default feature set from `["libfuse"]` to `[]`, which silently switches the
+# mount implementation to the pure-Rust one — and that is Linux-only, so a
+# macOS build fails in fuser's build.rs with "Building without libfuse is only
+# supported on Linux". Restoring it explicitly keeps 0.15's behaviour (libfuse2
+# via the fuse-t wrapper in rs/pkgconfig on macOS, libfuse3 on Linux).
+#
+# Bumped 0.15 -> 0.16 for GHSA-cvmj-47v9-35m9 (high): uninitialized memory read
+# and leak in fuser < 0.16.0.
+fuser = { version = "0.16", optional = true, features = ["libfuse"] }
 libc = { workspace = true, optional = true }
 log = { workspace = true }
 rusqlite = { workspace = true, features = ["bundled", "serialize"] }

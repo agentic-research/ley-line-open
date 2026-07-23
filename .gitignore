@@ -13,6 +13,9 @@
 !CHANGELOG.md
 !server.json
 !.pre-commit-config.yaml
+# Pins the compiler for local dev to exactly what CI uses — see the file's
+# header for why this is tracked rather than left to each contributor.
+!rust-toolchain.toml
 
 # GitHub Actions
 !.github/**
@@ -97,3 +100,8 @@
 
 # Session/codex scratch worktrees — never commit as gitlinks (bit us on cochain + 0.10.1)
 .worktrees/
+
+# Dolt migration backup: `rsry bead migrate --commit` renames dolt/ to
+# dolt.bak/ and never deletes it. Binary store — never commit (rosary-05fbe0).
+.beads/dolt.bak/
+.beads/dolt.bak.*/

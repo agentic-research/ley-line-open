@@ -1,0 +1,25 @@
+# THE toolchain, for CI and for you.
+#
+# rustup reads this file automatically, so `cargo`, `task ci`, and the pre-push
+# hook all use the same compiler the GitHub runners do. Without it, "green
+# locally" and "green in CI" are different claims — that gap bit PR #259, where
+# `unnecessary_sort_by` in splice-gated code passed `cargo clippy -D warnings`
+# locally (stable 1.94) and failed the runner (nightly).
+#
+# STABLE, deliberately. This repo previously pinned `nightly-2026-07-12` per
+# bead `ley-line-open-75444d`, because a later nightly ICEd on `#[test]` +
+# `#[serial(<key>)]`. That pin was a workaround for being on nightly at all:
+# nothing here needs it. There is not a single `#![feature(...)]` in `rs/`, and
+# edition 2024 has been stable since 1.85. Being on nightly bought us an ICE
+# and a pin to babysit.
+#
+# Exact version, not the floating `stable`: a floating channel means the
+# compiler changes under CI without a commit, which is the same drift the
+# SHA-pinned actions and the exact go-task version exist to prevent. Bump it
+# deliberately.
+#
+# `task lint:toolchain-parity` asserts the workflow pins equal `channel` below,
+# so the two cannot drift apart silently — same posture as `compat:check`.
+[toolchain]
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]

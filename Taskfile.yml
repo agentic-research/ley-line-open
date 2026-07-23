@@ -25,6 +25,42 @@ tasks:
     cmds:
       - task --list
 
+  lint:toolchain-parity:
+    desc: |
+      Assert every workflow's pinned `toolchain:` equals rust-toolchain.toml's
+      `channel`.
+
+      taskfile-ci-parity covers the COMMANDS (CI runs `task ci`), but that only
+      makes CI and local identical if they also run the same COMPILER. They did
+      not: workflows pinned a nightly while a contributor's rustup default is
+      usually stable, and nightly clippy carries lints stable does not. PR #259
+      passed `cargo clippy -D warnings` locally and failed the runner on
+      `unnecessary_sort_by`.
+
+      rust-toolchain.toml closes that for anyone using rustup. This gate stops
+      the two pins from drifting back apart.
+    cmds:
+      - |
+        set -eu
+        PIN=$(grep -E '^channel *=' rust-toolchain.toml | sed -E 's/.*"(.*)".*/\1/')
+        if [ -z "$PIN" ]; then echo "could not read channel from rust-toolchain.toml"; exit 1; fi
+        FAIL=0
+        for wf in .github/workflows/*.yml; do
+          # Workflows that never install Rust are legitimately exempt.
+          grep -q 'rust-toolchain@' "$wf" || continue
+          # Strip trailing comments and whitespace — a pin may legitimately
+          # carry an inline `# must equal ...` note. (The gate caught itself
+          # failing on exactly that.)
+          for got in $(grep -E '^\s*toolchain:' "$wf" | sed -E 's/.*toolchain: *//; s/#.*//; s/[[:space:]]+$//'); do
+            if [ "$got" != "$PIN" ]; then
+              echo "toolchain drift: $wf pins '$got', rust-toolchain.toml says '$PIN'"
+              FAIL=1
+            fi
+          done
+        done
+        [ "$FAIL" = "0" ] || { echo "--- fix: make the workflow pins match rust-toolchain.toml (or update both together)"; exit 1; }
+        echo "toolchain parity OK — workflows and rust-toolchain.toml both pin $PIN"
+
   # --------------------------------------------------------------------------
   # Build
   # --------------------------------------------------------------------------
@@ -578,6 +614,7 @@ tasks:
       # worktree agents on 2026-07-15 paid a full compile before reaching
       # fmt:check at its old position (bead ley-line-open-9ca974).
       - task: fmt:check
+      - task: lint:toolchain-parity
       - task: lint:blake3
       - task: readme:version-check
       - task: check

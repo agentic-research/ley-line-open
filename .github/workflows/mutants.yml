@@ -33,7 +33,7 @@ jobs:
       # toolchain reason CI wouldn't also hit.
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
-          toolchain: nightly-2026-07-12
+          toolchain: 1.97.1  # must equal rust-toolchain.toml (task lint:toolchain-parity)
 
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0
         with:
@@ -48,7 +48,11 @@ jobs:
 
       - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611
         with:
-          version: 3.x
+          # Exact, not `3.x`: a floating minor means the runner can pick up a
+          # new go-task whose behaviour differs from the one developers have,
+          # which is the same class of drift rust-toolchain.toml exists to
+          # close. Bump deliberately, together with local installs.
+          version: 3.49.1
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: task mutants

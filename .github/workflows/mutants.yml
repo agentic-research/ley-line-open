@@ -1,0 +1,66 @@
+name: Mutation testing
+
+# Checks the TESTS, not the code: rewrites the source in small ways and fails
+# if the suite still passes. It catches the class of defect a correctness test
+# structurally cannot — e.g. widening the chunk-overlap predicate, which
+# returns identical bytes while fetching chunks it never needed.
+#
+# Path-filtered and separate from `ci.yml` because it takes ~7 min. Same
+# taskfile-ci-parity rule as everything else: this workflow invokes
+# `task mutants`, it does not re-implement the command.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'rs/ll-open/cdc/**'
+      - 'rs/ll-open/fs/src/chunked.rs'
+      - 'Taskfile.yml'
+      - '.github/workflows/mutants.yml'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  mutants:
+    name: cargo mutants (task mutants)
+    runs-on: ubuntu-latest
+    steps:
+      # SHA-pinned: actions/checkout@v6.0.2 (Node 24)
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      # SHA-pinned: dtolnay/rust-toolchain. Same nightly pin as ci.yml
+      # (bead ley-line-open-75444d) so a mutant run can't fail for a
+      # toolchain reason CI wouldn't also hit.
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: nightly-2026-07-12
+
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0
+        with:
+          workspaces: rs
+
+      # Installed from source rather than via a prebuilt-binary action: every
+      # other action here is SHA-pinned against a commit verified in-repo, and
+      # adding an unvetted third-party action to save ~2 min isn't a trade this
+      # repo makes. --locked so the build can't drift with a transitive bump.
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+
+      - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: task mutants
+        run: task mutants
+
+      # The report says which mutants survived and where — far more useful
+      # than the exit code when this job goes red.
+      - name: Upload mutants report
+        if: always()
+        # SHA-pinned: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mutants-report
+          path: rs/mutants.out/
+          if-no-files-found: ignore

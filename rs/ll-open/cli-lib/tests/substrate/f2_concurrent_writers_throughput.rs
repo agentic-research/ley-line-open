@@ -271,6 +271,29 @@ fn concurrent_writers_beat_serial_baseline() {
          aspirational={ASPIRATIONAL_RATIO:.2}×)"
     );
 
+    // The ratio assertion is a WALL-CLOCK budget, so it is only sound on a
+    // machine that is not otherwise loaded: under CPU contention the parallel
+    // arm gets no speedup and the ratio collapses through the floor even
+    // though nothing regressed. This flaked a push whose `task ci` ran
+    // alongside `task mutants`.
+    //
+    // Same treatment the repo already gives its other wall-clock gates
+    // (`cold_parse_perf_regression.rs`, and the `test:perf` Taskfile comment:
+    // "wall-clock budgets flake under CI noise unless explicitly opted in"):
+    // ALWAYS measure and print, assert only under LLO_PERF_GATES=1. The
+    // measurement above is emitted either way, so a regression is still
+    // visible in every CI log — it just doesn't fail the run on a scheduling
+    // accident. `task test:perf` runs this with the gate on.
+    if std::env::var("LLO_PERF_GATES").ok().as_deref() != Some("1") {
+        eprintln!(
+            "F2: skipping the throughput-ratio assertion (LLO_PERF_GATES != 1). \
+             Measured ratio {ratio:.2}× is reported above. Run \
+             `LLO_PERF_GATES=1 cargo test -p leyline-cli-lib --test \
+             f2_concurrent_writers_throughput` or `task test:perf` to enforce it."
+        );
+        return;
+    }
+
     assert!(
         ratio >= MIN_THROUGHPUT_RATIO,
         "F2 falsified: parallel-to-serial throughput ratio {ratio:.2}× < required \

@@ -3952,6 +3952,7 @@ dependencies = [
 name = "leyline-cdc"
 version = "0.10.1"
 dependencies = [
+ "anyhow",
  "gearhash",
  "leyline-core",
 ]
@@ -4058,6 +4059,7 @@ dependencies = [
  "bytemuck",
  "crossbeam-queue",
  "fuser",
+ "leyline-cdc",
  "leyline-core",
  "leyline-ffi-helpers",
  "leyline-schema",

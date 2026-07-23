@@ -1,6 +1,6 @@
 # CI Cache and Release Artifact Design
 
-Status: proposed  
+Status: proposed
 Bead: `ley-line-open-7c2361`
 
 ## Problem

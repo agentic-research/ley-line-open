@@ -96,6 +96,10 @@
 **/*.dylib
 **/*.d
 
+# Taskfile-managed developer/CI caches and pinned tool binaries.
+.tools/
+.cache/
+
 # CRUMB - personal memory (not tracked)
 .crumb/
 .claude/worktrees/

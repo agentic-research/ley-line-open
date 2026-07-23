@@ -4,20 +4,20 @@ version: '3'
 # Workflows (.github/workflows/) should call `task <name>`, never raw cargo.
 
 vars:
+  SCCACHE_VERSION: 0.15.0
+  SCCACHE_BIN: '{{.ROOT_DIR}}/.tools/bin/sccache'
+  SCCACHE_CACHE_DIR: '{{.ROOT_DIR}}/.cache/sccache'
   # macOS needs our fuse-t pkg-config wrapper; Linux uses system libfuse3.
   FUSE_PKG_CONFIG_PATH:
     sh: 'if [ "$(uname)" = "Darwin" ]; then echo "{{.ROOT_DIR}}/rs/pkgconfig"; fi'
 
 env:
   PKG_CONFIG_PATH: '{{.FUSE_PKG_CONFIG_PATH}}'
-  # Conditional sccache acceleration — the `sh:` block resolves to
-  # the sccache binary path when it's installed (e.g. `brew install
-  # sccache`), otherwise an empty string. Empty RUSTC_WRAPPER is a
-  # no-op for cargo, so contributors without sccache see no change;
-  # contributors with it get cross-invocation caching of byte-stable
-  # dep compilation (bead ley-line-open-488440).
+  # Prefer the Taskfile-pinned binary installed by cache:sccache:install.
+  # Standalone tasks retain the old optional-system-sccache behavior.
   RUSTC_WRAPPER:
-    sh: command -v sccache 2>/dev/null || true
+    sh: 'if [ -x "{{.SCCACHE_BIN}}" ]; then echo "{{.SCCACHE_BIN}}"; else command -v sccache 2>/dev/null || true; fi'
+  SCCACHE_DIR: '{{.SCCACHE_CACHE_DIR}}'
 
 tasks:
   default:
@@ -60,6 +60,58 @@ tasks:
         done
         [ "$FAIL" = "0" ] || { echo "--- fix: make the workflow pins match rust-toolchain.toml (or update both together)"; exit 1; }
         echo "toolchain parity OK — workflows and rust-toolchain.toml both pin $PIN"
+
+  lint:cache-contract:
+    desc: Verify the Taskfile-owned compiler-cache and release-artifact contract
+    cmds:
+      - |
+        set -eu
+        test -x tools/install_sccache.sh
+        test -f tools/sccache-checksums.txt
+        grep -q 'sccache-v0.15.0-' tools/sccache-checksums.txt
+        grep -q '^\.tools/$' .gitignore
+        grep -q '^\.cache/$' .gitignore
+        grep -q 'cache:sccache:install:' Taskfile.yml
+        grep -q 'cache:sccache:verify:' Taskfile.yml
+        grep -q 'cache:sccache:stats:' Taskfile.yml
+        grep -q 'sources:' Taskfile.yml
+        grep -q 'generates:' Taskfile.yml
+        echo "cache contract OK"
+
+  cache:sccache:install:
+    desc: Install the pinned sccache binary for this host
+    sources:
+      - tools/install_sccache.sh
+      - tools/sccache-checksums.txt
+    generates:
+      - .tools/bin/sccache
+    method: checksum
+    cmds:
+      - tools/install_sccache.sh "{{.SCCACHE_VERSION}}" "{{.SCCACHE_BIN}}" tools/sccache-checksums.txt
+
+  cache:sccache:verify:
+    desc: Verify the Taskfile-managed sccache version
+    deps: [cache:sccache:install]
+    cmds:
+      - |
+        test "$("{{.SCCACHE_BIN}}" --version)" = "sccache {{.SCCACHE_VERSION}}"
+        echo "sccache parity OK — $("{{.SCCACHE_BIN}}" --version)"
+
+  cache:sccache:zero:
+    desc: Reset compiler-cache statistics without deleting cached objects
+    deps: [cache:sccache:install]
+    cmds:
+      - '"{{.SCCACHE_BIN}}" --zero-stats'
+
+  cache:sccache:stats:
+    desc: Print compiler-cache statistics
+    cmds:
+      - |
+        if [ -x "{{.SCCACHE_BIN}}" ]; then
+          "{{.SCCACHE_BIN}}" --show-stats
+        else
+          echo "Taskfile-managed sccache is not installed; no stats available"
+        fi
 
   check:all-features:
     desc: |
@@ -628,6 +680,7 @@ tasks:
 
   ci:
     desc: Common CI gate — runs on every PR. Excludes `test:perf` (release-profile rebuild adds ~90-120s; main-push-only via ci.yml's conditional `test:perf` step). For the full main-push gate locally, run `task ci:full`.
+    deps: [cache:sccache:install]
     cmds:
       # Compile-free gates first (sub-second): a formatting slip or lint
       # hit fails here instead of after minutes of check+clippy — 3 of 6

@@ -168,6 +168,13 @@ tasks:
           STATICLIB_SOURCE: '{{.FIXTURE_DIR}}/libleyline_fs.a'
           INCLUDE_HEADER: "true"
           HEADER_SOURCE: '{{.FIXTURE_DIR}}/leyline_fs.h'
+      - |
+        if command -v dash >/dev/null 2>&1; then
+          OUTPUT_DIR="{{.FIXTURE_DIR}}/artifacts/leyline-test-dash-amd64" \
+          CLI_SOURCE="{{.FIXTURE_DIR}}/leyline" \
+          ASSET_NAME="leyline-test-dash-amd64" \
+          dash tools/stage_release_artifacts.sh
+        fi
       - task: release:artifacts:verify
         vars:
           ARTIFACT_ROOT: '{{.FIXTURE_DIR}}/artifacts'

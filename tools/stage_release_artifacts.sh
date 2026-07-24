@@ -66,12 +66,16 @@ if [ -n "${HEADER_SOURCE:-}" ]; then
     cp "$HEADER_SOURCE" "$OUTPUT_DIR/leyline_fs.h"
 fi
 
+manifest_tmp="$OUTPUT_DIR/.SHA256SUMS.tmp.$$"
+trap 'rm -f "$manifest_tmp"' 0 1 2 15
 (
     cd "$OUTPUT_DIR"
     for file in *; do
         test -f "$file"
         sha256_file "$file"
-    done | LC_ALL=C sort -k 2 > SHA256SUMS
-)
+    done | LC_ALL=C sort -k 2
+) > "$manifest_tmp"
+mv "$manifest_tmp" "$OUTPUT_DIR/SHA256SUMS"
+trap - 0 1 2 15
 
 echo "staged release artifacts in $OUTPUT_DIR"

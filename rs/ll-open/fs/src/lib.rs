@@ -1,3 +1,6 @@
+/// Explicit, resumable activation of the chunk-backed content index.
+#[cfg(feature = "cdc")]
+pub mod activation;
 /// Chunk-backed content storage — a range read selects only the overlapping
 /// chunks instead of re-materializing the whole file. Opt-in (`--features cdc`).
 #[cfg(feature = "cdc")]

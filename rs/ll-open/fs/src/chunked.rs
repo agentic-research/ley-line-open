@@ -646,19 +646,22 @@ pub fn has_chunked_content(conn: &Connection, node_id: &str) -> Result<bool> {
 
     // One query: manifest witness joined to the live node row. Any missing
     // side (no manifest, no node) yields no row, hence `false`.
-    let fresh: Option<bool> = conn
+    let fresh: Option<(bool, i64)> = conn
         .query_row(
-            "SELECT m.source_len = n.size AND m.source_mtime IS n.mtime \
+            "SELECT m.source_len = n.size AND m.source_mtime IS n.mtime, n.size \
                FROM content_manifest_meta m JOIN nodes n ON n.id = m.node_id \
               WHERE m.node_id = ?1",
             params![node_id],
-            |r| r.get::<_, i64>(0).map(|v| v != 0),
+            |r| Ok((r.get::<_, i64>(0)? != 0, r.get(1)?)),
         )
         .optional()
         .context("check manifest freshness")?;
-    let Some(true) = fresh else {
+    let Some((true, live_size)) = fresh else {
         return Ok(false);
     };
+    if live_size == 0 {
+        return Ok(true);
+    }
 
     // Witness matches; confirm the manifest actually has spans.
     let has_rows: bool = conn

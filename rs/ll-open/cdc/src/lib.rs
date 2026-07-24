@@ -244,6 +244,60 @@ pub fn chunk_into<S: BlobStore>(data: &[u8], store: &mut S) -> Result<Vec<Chunk>
     Ok(chunks)
 }
 
+/// Reconstruct a range into `out`, returning the number of bytes written.
+///
+/// The manifest must tile exactly `[0, source_len)` with non-empty, ordered
+/// chunks. Bytes are accumulated privately and copied to `out` only after all
+/// manifest and blob checks succeed, so an error never leaves a partial range
+/// in the caller's destination.
+pub fn read_range_into<S: BlobStore>(
+    chunks: &[Chunk],
+    source_len: usize,
+    store: &S,
+    offset: usize,
+    out: &mut [u8],
+) -> Result<usize> {
+    anyhow::ensure!(
+        manifest_len(chunks)? == source_len,
+        "manifest length does not match source length"
+    );
+
+    let wanted_start = offset.min(source_len);
+    let wanted_end = offset.saturating_add(out.len()).min(source_len);
+    let mut result = Vec::with_capacity(wanted_end - wanted_start);
+
+    for chunk in chunks {
+        let chunk_end = chunk
+            .offset
+            .checked_add(chunk.len)
+            .context("chunk span overflows")?;
+        if chunk_end <= wanted_start || chunk.offset >= wanted_end {
+            continue;
+        }
+
+        let bytes = store
+            .get(chunk.hash)
+            .context("get chunk")?
+            .with_context(|| format!("chunk {:?} missing from store", chunk.hash))?;
+        anyhow::ensure!(
+            bytes.len() == chunk.len,
+            "chunk {:?} length does not match manifest",
+            chunk.hash
+        );
+
+        let lo = wanted_start.saturating_sub(chunk.offset);
+        let hi = wanted_end.min(chunk_end) - chunk.offset;
+        result.extend_from_slice(&bytes[lo..hi]);
+    }
+
+    anyhow::ensure!(
+        result.len() == wanted_end - wanted_start,
+        "selected chunks do not cover requested range"
+    );
+    out[..result.len()].copy_from_slice(&result);
+    Ok(result.len())
+}
+
 /// Reconstruct the byte range `[offset, offset+len)` from a chunk manifest,
 /// fetching **only** the chunks that overlap the range. A read outside the file
 /// yields the clamped overlap (possibly empty). Verify-on-read is the
@@ -254,33 +308,38 @@ pub fn read_range<S: BlobStore>(
     offset: usize,
     len: usize,
 ) -> Result<Vec<u8>> {
-    let end = offset.saturating_add(len);
-    let mut out = Vec::with_capacity(len.min(1 << 20));
-    for c in chunks {
-        let c_end = c.offset + c.len;
-        if c_end <= offset || c.offset >= end {
-            continue; // no overlap — do NOT fetch this chunk
-        }
-        let bytes = store
-            .get(c.hash)
-            .context("get chunk")?
-            .with_context(|| format!("chunk {:?} missing from store", c.hash))?;
-        let lo = offset.saturating_sub(c.offset); // start within this chunk
-        let hi = end.min(c_end) - c.offset; // end within this chunk
-        out.extend_from_slice(&bytes[lo..hi]);
-    }
+    let source_len = manifest_len(chunks)?;
+    let wanted_start = offset.min(source_len);
+    let wanted_end = offset.saturating_add(len).min(source_len);
+    let mut out = vec![0; wanted_end - wanted_start];
+    read_range_into(chunks, source_len, store, offset, &mut out)?;
     Ok(out)
+}
+
+/// Validate the manifest's strict contiguous tiling and return its total
+/// source length. No range reconstruction happens here.
+fn manifest_len(chunks: &[Chunk]) -> Result<usize> {
+    let mut end = 0;
+    for chunk in chunks {
+        anyhow::ensure!(chunk.len != 0, "chunk spans must be non-empty");
+        anyhow::ensure!(
+            chunk.offset == end,
+            "chunk at offset {} does not meet previous end {}",
+            chunk.offset,
+            end
+        );
+        end = chunk
+            .offset
+            .checked_add(chunk.len)
+            .context("chunk span overflows")?;
+    }
+    Ok(end)
 }
 
 /// Reconstruct the whole file from its chunk manifest.
 ///
-/// Asks for an unbounded range rather than computing the file length from the
-/// last chunk. Computing it would make the result depend on that arithmetic
-/// being right *and* on `read_range` clamping it — and since `read_range`
-/// clamps, an over-large total produces identical output, so no test could
-/// catch the arithmetic going wrong. (Found by mutation testing: `c.offset +
-/// c.len` → `c.offset * c.len` survived the whole suite.) `usize::MAX` states
-/// "every chunk" directly; the per-chunk overlap check does the rest.
+/// Delegates to [`read_range`], which derives and validates the source length
+/// from the complete manifest before using the canonical range implementation.
 pub fn reconstruct<S: BlobStore>(chunks: &[Chunk], store: &S) -> Result<Vec<u8>> {
     read_range(chunks, store, 0, usize::MAX)
 }
@@ -289,7 +348,10 @@ pub fn reconstruct<S: BlobStore>(chunks: &[Chunk], store: &S) -> Result<Vec<u8>>
 mod tests {
     use super::*;
     use leyline_core::MemBlobStore;
-    use std::cell::Cell;
+    use std::{
+        cell::{Cell, RefCell},
+        collections::HashMap,
+    };
 
     /// Deterministic pseudo-random bytes (xorshift64), so chunk boundaries are
     /// content-defined AND reproducible without an RNG dependency.
@@ -479,6 +541,209 @@ mod tests {
         }
         fn contains(&self, h: Hash) -> Result<bool> {
             self.inner.contains(h)
+        }
+    }
+
+    /// A test store that records every read and rejects blobs whose bytes do
+    /// not match their requested content address.
+    struct ScriptedStore {
+        blobs: HashMap<Hash, Vec<u8>>,
+        gets: RefCell<Vec<Hash>>,
+    }
+
+    impl BlobStore for ScriptedStore {
+        fn put(&mut self, bytes: &[u8]) -> Result<Hash> {
+            let hash = bytes.hash();
+            self.blobs.insert(hash, bytes.to_vec());
+            Ok(hash)
+        }
+
+        fn get(&self, hash: Hash) -> Result<Option<Vec<u8>>> {
+            self.gets.borrow_mut().push(hash);
+            let Some(bytes) = self.blobs.get(&hash) else {
+                return Ok(None);
+            };
+            anyhow::ensure!(bytes.as_slice().hash() == hash, "integrity violation");
+            Ok(Some(bytes.clone()))
+        }
+
+        fn contains(&self, hash: Hash) -> Result<bool> {
+            Ok(self.blobs.contains_key(&hash))
+        }
+    }
+
+    struct LengthMismatchStore;
+
+    impl BlobStore for LengthMismatchStore {
+        fn put(&mut self, bytes: &[u8]) -> Result<Hash> {
+            Ok(bytes.hash())
+        }
+
+        fn get(&self, _: Hash) -> Result<Option<Vec<u8>>> {
+            Ok(Some(b"short".to_vec()))
+        }
+
+        fn contains(&self, _: Hash) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    fn scripted_manifest(parts: &[&[u8]]) -> (Vec<Chunk>, ScriptedStore) {
+        let mut store = ScriptedStore {
+            blobs: HashMap::new(),
+            gets: RefCell::new(Vec::new()),
+        };
+        let mut offset = 0;
+        let chunks = parts
+            .iter()
+            .map(|bytes| {
+                let hash = store.put(bytes).unwrap();
+                let chunk = Chunk {
+                    hash,
+                    offset,
+                    len: bytes.len(),
+                };
+                offset += bytes.len();
+                chunk
+            })
+            .collect();
+        (chunks, store)
+    }
+
+    #[test]
+    fn read_range_into_is_atomic_when_a_selected_blob_is_corrupt() {
+        let (chunks, mut store) = scripted_manifest(&[b"abc", b"def"]);
+        store.blobs.insert(chunks[1].hash, b"bad".to_vec());
+        let mut out = [0xA5; 6];
+
+        assert!(read_range_into(&chunks, 6, &store, 0, &mut out).is_err());
+        assert_eq!(
+            out, [0xA5; 6],
+            "an error must not partly mutate destination"
+        );
+    }
+
+    #[test]
+    fn read_range_into_does_not_fetch_non_overlapping_corrupt_blobs() {
+        let (chunks, mut store) = scripted_manifest(&[b"abc", b"def", b"ghi"]);
+        store.blobs.insert(chunks[2].hash, b"bad".to_vec());
+        let mut out = [0; 3];
+
+        assert_eq!(read_range_into(&chunks, 9, &store, 0, &mut out).unwrap(), 3);
+        assert_eq!(out, *b"abc");
+        assert_eq!(*store.gets.borrow(), vec![chunks[0].hash]);
+    }
+
+    #[test]
+    fn read_range_into_rejects_missing_selected_blob_without_mutation() {
+        let (chunks, mut store) = scripted_manifest(&[b"abc"]);
+        store.blobs.remove(&chunks[0].hash);
+        let mut out = [0xA5; 3];
+
+        assert!(read_range_into(&chunks, 3, &store, 0, &mut out).is_err());
+        assert_eq!(out, [0xA5; 3]);
+    }
+
+    #[test]
+    fn read_range_into_rejects_blob_manifest_length_mismatch_without_mutation() {
+        let chunks = [Chunk {
+            hash: b"expected".hash(),
+            offset: 0,
+            len: 8,
+        }];
+        let mut out = [0xA5; 8];
+
+        assert!(read_range_into(&chunks, 8, &LengthMismatchStore, 0, &mut out).is_err());
+        assert_eq!(out, [0xA5; 8]);
+    }
+
+    #[test]
+    fn read_range_into_rejects_invalid_manifests_without_panicking() {
+        let hash = b"ab".hash();
+        let store = ScriptedStore {
+            blobs: HashMap::from([(hash, b"ab".to_vec())]),
+            gets: RefCell::new(Vec::new()),
+        };
+        let invalid = [
+            vec![
+                Chunk {
+                    hash,
+                    offset: 2,
+                    len: 2,
+                },
+                Chunk {
+                    hash,
+                    offset: 0,
+                    len: 2,
+                },
+            ],
+            vec![
+                Chunk {
+                    hash,
+                    offset: 0,
+                    len: 2,
+                },
+                Chunk {
+                    hash,
+                    offset: 3,
+                    len: 2,
+                },
+            ],
+            vec![
+                Chunk {
+                    hash,
+                    offset: 0,
+                    len: 2,
+                },
+                Chunk {
+                    hash,
+                    offset: 1,
+                    len: 2,
+                },
+            ],
+            vec![Chunk {
+                hash,
+                offset: 0,
+                len: 0,
+            }],
+            vec![
+                Chunk {
+                    hash,
+                    offset: 0,
+                    len: usize::MAX,
+                },
+                Chunk {
+                    hash,
+                    offset: usize::MAX,
+                    len: 1,
+                },
+            ],
+            vec![Chunk {
+                hash,
+                offset: 0,
+                len: 2,
+            }],
+        ];
+
+        for chunks in invalid {
+            let mut out = [0xA5; 4];
+            assert!(read_range_into(&chunks, 4, &store, 0, &mut out).is_err());
+            assert_eq!(out, [0xA5; 4]);
+        }
+    }
+
+    #[test]
+    fn read_range_into_matches_authoritative_clamped_slices() {
+        let data = b"abcdefghi";
+        let (chunks, store) = scripted_manifest(&[b"abc", b"defg", b"hi"]);
+
+        for &(offset, len) in &[(0, 0), (3, 4), (2, 4), (6, 4), (99, 5), (usize::MAX, 3)] {
+            let mut out = [0xA5; 8];
+            let n = read_range_into(&chunks, data.len(), &store, offset, &mut out[..len.min(8)])
+                .unwrap();
+            let start = offset.min(data.len());
+            let end = offset.saturating_add(len).min(data.len());
+            assert_eq!(&out[..n], &data[start..end], "range ({offset},{len})");
         }
     }
 

@@ -478,8 +478,7 @@ pub(crate) fn capture_chunked_content(
     let Some((source_len, source_mtime, live_len, live_mtime)) = witness else {
         return Ok(None);
     };
-    if source_len < 0 || live_len < 0 || source_len != live_len || source_mtime != Some(live_mtime)
-    {
+    if !manifest_witness_is_fresh(source_len, source_mtime, live_len, live_mtime) {
         return Ok(None);
     }
     let source_len =
@@ -544,6 +543,15 @@ pub(crate) fn capture_chunked_content(
     );
 
     Ok(Some(ChunkManifestSnapshot { chunks, source_len }))
+}
+
+fn manifest_witness_is_fresh(
+    source_len: i64,
+    source_mtime: Option<i64>,
+    live_len: i64,
+    live_mtime: i64,
+) -> bool {
+    source_len >= 0 && source_len == live_len && source_mtime == Some(live_mtime)
 }
 
 /// Refresh `node_id` after a known edit, but only if this arena already uses
@@ -800,6 +808,19 @@ mod tests {
         let c = Connection::open_in_memory().unwrap();
         create_chunked_content_schema(&c).unwrap();
         c
+    }
+
+    #[test]
+    fn manifest_freshness_witness_rejects_invalid_lengths() {
+        assert!(manifest_witness_is_fresh(0, Some(7), 0, 7));
+        assert!(manifest_witness_is_fresh(5, Some(7), 5, 7));
+
+        assert!(!manifest_witness_is_fresh(-1, Some(7), -1, 7));
+        assert!(!manifest_witness_is_fresh(-1, Some(7), 5, 7));
+        assert!(!manifest_witness_is_fresh(5, Some(7), -1, 7));
+        assert!(!manifest_witness_is_fresh(5, Some(7), 4, 7));
+        assert!(!manifest_witness_is_fresh(5, None, 5, 7));
+        assert!(!manifest_witness_is_fresh(5, Some(8), 5, 7));
     }
 
     /// Seeded xorshift — the fuzzer's only entropy source, so a failure is

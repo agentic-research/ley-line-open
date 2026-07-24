@@ -846,6 +846,66 @@ mod tests {
     }
 
     #[test]
+    fn transaction_owned_store_writes_the_manifest_and_reports_chunk_count() {
+        let conn = db();
+        let data = prng(0x5eed, MAX_CHUNK * 3);
+        let expected_chunks = leyline_cdc::chunk(&data).len();
+        assert!(expected_chunks > 1, "fixture must distinguish Ok(0)/Ok(1)");
+
+        let tx =
+            Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate).unwrap();
+        let stored = store_content_chunked_in_transaction(&tx, "large.bin", &data).unwrap();
+
+        assert_eq!(stored, expected_chunks);
+        let manifest_rows: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM content_manifest WHERE node_id = 'large.bin'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(manifest_rows, expected_chunks as i64);
+        let mut round_trip = vec![0_u8; data.len()];
+        assert_eq!(
+            read_content_chunked(&tx, "large.bin", &mut round_trip, 0).unwrap(),
+            data.len()
+        );
+        assert_eq!(round_trip, data);
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn fresh_empty_content_needs_a_witness_but_no_manifest_spans() {
+        let conn = db();
+        conn.execute_batch(
+            "CREATE TABLE nodes (
+                id TEXT PRIMARY KEY,
+                kind INTEGER NOT NULL,
+                size INTEGER NOT NULL,
+                mtime INTEGER NOT NULL,
+                record TEXT
+             );
+             INSERT INTO nodes VALUES ('empty', 0, 0, 7, '');",
+        )
+        .unwrap();
+
+        assert!(!has_chunked_content(&conn, "empty").unwrap());
+        assert_eq!(store_content_chunked(&conn, "empty", &[]).unwrap(), 0);
+        let manifest_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM content_manifest WHERE node_id = 'empty'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(manifest_rows, 0);
+        assert!(
+            has_chunked_content(&conn, "empty").unwrap(),
+            "a fresh zero-length witness is complete without impossible spans"
+        );
+    }
+
+    #[test]
     fn manifest_freshness_witness_rejects_invalid_lengths() {
         assert!(manifest_witness_is_fresh(0, Some(7), 0, 7));
         assert!(manifest_witness_is_fresh(5, Some(7), 5, 7));

@@ -28,12 +28,12 @@
 //! chunks in its own region, and unchanged chunks keep their identity — so an
 //! edit re-*stores* O(1) chunks rather than O(file).
 //!
-//! Note what that does and does not buy on the write path today.
-//! [`store_content_chunked`] calls `leyline_cdc::chunk` — a FULL re-chunk — on
-//! every write, so a write still HASHES O(file) bytes even though it STORES
-//! O(1) new ones. `leyline_cdc::rechunk` exists and is proven exact, but is not
-//! wired in here yet; until it is, do not read "CDC pays off on the write path"
-//! as a claim about write latency.
+//! The graph write path captures a freshness-verified old manifest before
+//! changing `nodes.record`, then calls `leyline_cdc::rechunk_with_stats` with
+//! the exact overwrite coordinates. A small edit therefore hashes only its
+//! bounded resync window and stores only its new chunks. Initial population,
+//! a missing manifest, or a stale freshness witness deliberately falls back to
+//! a full chunk.
 //!
 //! ## Public surface — one way in
 //!
@@ -117,13 +117,45 @@ pub fn create_chunked_content_schema(conn: &Connection) -> Result<()> {
         .context("create chunked content schema")
 }
 
+#[derive(Debug)]
+pub(crate) struct ChunkManifestSnapshot {
+    chunks: Vec<leyline_cdc::Chunk>,
+    source_len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefreshOutcome {
+    Skipped,
+    Full { bytes_scanned: usize },
+    Incremental(leyline_cdc::RechunkStats),
+}
+
+fn chunk_schema_present(conn: &Connection) -> Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='content_manifest'",
+        [],
+        |_| Ok(true),
+    )
+    .optional()
+    .context("probe for content_manifest")
+    .map(|present| present.unwrap_or(false))
+}
+
 /// Store `data` for `node_id` as content-defined chunks, replacing any existing
 /// manifest. Chunk bytes are `INSERT OR IGNORE`d, so a chunk shared with another
 /// file (or an earlier version of this one) costs nothing. Returns the chunk
 /// count.
 pub fn store_content_chunked(conn: &Connection, node_id: &str, data: &[u8]) -> Result<usize> {
     let chunks = leyline_cdc::chunk(data);
+    store_content_manifest(conn, node_id, data, &chunks)
+}
 
+fn store_content_manifest(
+    conn: &Connection,
+    node_id: &str,
+    data: &[u8],
+    chunks: &[leyline_cdc::Chunk],
+) -> Result<usize> {
     // Atomic, and it must be. The DELETE + per-chunk INSERT loop is only a
     // valid manifest at the end: interrupt it partway and the node's spans no
     // longer tile [0, len), which `read_content_chunked` cannot detect — it
@@ -409,30 +441,160 @@ pub(crate) fn invalidate_chunked_content_subtree(conn: &Connection, node_id: &st
     Ok(())
 }
 
-/// Re-chunk `node_id` from `data`, but only if this arena already uses chunk
-/// storage. Creating the tables on demand would silently upgrade a foreign
-/// arena's schema mid-write, so an arena opts in by having the schema.
-///
-/// Returns whether a manifest was written.
-pub(crate) fn refresh_chunked_content(
+/// Capture a manifest only while its freshness witness still matches the
+/// authoritative `nodes` row.
+pub(crate) fn capture_chunked_content(
     conn: &Connection,
     node_id: &str,
-    data: &[u8],
-) -> Result<bool> {
-    let table_present: bool = conn
+) -> Result<Option<ChunkManifestSnapshot>> {
+    if !chunk_schema_present(conn)? {
+        return Ok(None);
+    }
+
+    let nodes_table = conn
         .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='content_manifest'",
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes'",
             [],
             |_| Ok(true),
         )
         .optional()
-        .context("probe for content_manifest")?
+        .context("probe for nodes table")?
         .unwrap_or(false);
-    if !table_present {
-        return Ok(false);
+    if !nodes_table {
+        return Ok(None);
     }
-    store_content_chunked(conn, node_id, data)?;
-    Ok(true)
+
+    let witness: Option<(i64, Option<i64>, i64, i64)> = conn
+        .query_row(
+            "SELECT meta.source_len, meta.source_mtime, nodes.size, nodes.mtime
+               FROM content_manifest_meta AS meta
+               JOIN nodes ON nodes.id = meta.node_id
+              WHERE meta.node_id = ?1",
+            params![node_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .context("read chunk manifest freshness witness")?;
+    let Some((source_len, source_mtime, live_len, live_mtime)) = witness else {
+        return Ok(None);
+    };
+    if !manifest_witness_is_fresh(source_len, source_mtime, live_len, live_mtime) {
+        return Ok(None);
+    }
+    let source_len =
+        usize::try_from(source_len).context("chunk manifest source length exceeds usize")?;
+
+    let mut statement = conn
+        .prepare(
+            "SELECT chunk_hash, byte_offset, byte_len
+               FROM content_manifest
+              WHERE node_id = ?1
+              ORDER BY seq",
+        )
+        .context("prepare chunk manifest snapshot")?;
+    let rows = statement
+        .query_map(params![node_id], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .context("read chunk manifest snapshot")?;
+
+    let mut chunks = Vec::new();
+    for row in rows {
+        let (hash, offset, len) = row.context("decode chunk manifest row")?;
+        anyhow::ensure!(
+            hash.len() == blake3::OUT_LEN,
+            "chunk manifest for {node_id} has a {}-byte hash",
+            hash.len()
+        );
+        anyhow::ensure!(
+            offset >= 0 && len >= 0,
+            "chunk manifest for {node_id} has a negative span"
+        );
+        let hash: [u8; blake3::OUT_LEN] = hash
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("validated BLAKE3 hash length changed"))?;
+        chunks.push(leyline_cdc::Chunk {
+            hash: leyline_core::Hash::from_bytes(hash),
+            offset: usize::try_from(offset).context("chunk offset exceeds usize")?,
+            len: usize::try_from(len).context("chunk length exceeds usize")?,
+        });
+    }
+    if chunks.is_empty() {
+        return Ok(None);
+    }
+
+    let mut expected_offset = 0usize;
+    for chunk in &chunks {
+        anyhow::ensure!(
+            chunk.offset == expected_offset,
+            "chunk manifest for {node_id} has a gap or overlap at {expected_offset}"
+        );
+        expected_offset = expected_offset
+            .checked_add(chunk.len)
+            .context("chunk manifest length overflow")?;
+    }
+    anyhow::ensure!(
+        expected_offset == source_len,
+        "chunk manifest for {node_id} covers {expected_offset} bytes, expected {source_len}"
+    );
+
+    Ok(Some(ChunkManifestSnapshot { chunks, source_len }))
+}
+
+fn manifest_witness_is_fresh(
+    source_len: i64,
+    source_mtime: Option<i64>,
+    live_len: i64,
+    live_mtime: i64,
+) -> bool {
+    source_len >= 0 && source_len == live_len && source_mtime == Some(live_mtime)
+}
+
+/// Refresh `node_id` after a known edit, but only if this arena already uses
+/// chunk storage. A fresh previous manifest enables bounded incremental work;
+/// otherwise the authoritative bytes are chunked in full.
+pub(crate) fn refresh_chunked_content_after_edit(
+    conn: &Connection,
+    node_id: &str,
+    data: &[u8],
+    previous: Option<ChunkManifestSnapshot>,
+    edit_offset: usize,
+    old_edit_end: usize,
+    old_len: usize,
+) -> Result<RefreshOutcome> {
+    if !chunk_schema_present(conn)? {
+        return Ok(RefreshOutcome::Skipped);
+    }
+
+    let (chunks, outcome) = match previous {
+        Some(previous) => {
+            anyhow::ensure!(
+                previous.source_len == old_len,
+                "old manifest length {} does not match old record length {old_len}",
+                previous.source_len
+            );
+            let (chunks, stats) = leyline_cdc::rechunk_with_stats(
+                &previous.chunks,
+                data,
+                edit_offset,
+                old_edit_end,
+                old_len,
+            );
+            (chunks, RefreshOutcome::Incremental(stats))
+        }
+        None => (
+            leyline_cdc::chunk(data),
+            RefreshOutcome::Full {
+                bytes_scanned: data.len(),
+            },
+        ),
+    };
+    store_content_manifest(conn, node_id, data, &chunks)?;
+    Ok(outcome)
 }
 
 /// Is chunk-backed content available AND provably fresh for `node_id`?
@@ -646,6 +808,19 @@ mod tests {
         let c = Connection::open_in_memory().unwrap();
         create_chunked_content_schema(&c).unwrap();
         c
+    }
+
+    #[test]
+    fn manifest_freshness_witness_rejects_invalid_lengths() {
+        assert!(manifest_witness_is_fresh(0, Some(7), 0, 7));
+        assert!(manifest_witness_is_fresh(5, Some(7), 5, 7));
+
+        assert!(!manifest_witness_is_fresh(-1, Some(7), -1, 7));
+        assert!(!manifest_witness_is_fresh(-1, Some(7), 5, 7));
+        assert!(!manifest_witness_is_fresh(5, Some(7), -1, 7));
+        assert!(!manifest_witness_is_fresh(5, Some(7), 4, 7));
+        assert!(!manifest_witness_is_fresh(5, None, 5, 7));
+        assert!(!manifest_witness_is_fresh(5, Some(8), 5, 7));
     }
 
     /// Seeded xorshift — the fuzzer's only entropy source, so a failure is

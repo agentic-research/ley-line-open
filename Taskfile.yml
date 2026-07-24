@@ -561,6 +561,10 @@ tasks:
       the invalidation logic is never exercised — mutation testing caught
       exactly that, with two live mutants in `invalidate_chunked_content`.
       `--no-default-features` so the fuse system dep isn't needed in CI.
+    # smoke_ffi links target/debug/libleyline_fs. `task ci` used to mask this
+    # prerequisite by running build:fs-static earlier; a cold direct invocation
+    # failed at the linker after every Rust test passed.
+    deps: [build:fs-static]
     dir: rs
     cmds:
       - cargo test -p leyline-fs --no-default-features --features cdc,splice,validate

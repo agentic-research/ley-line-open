@@ -140,6 +140,23 @@ pub struct SqliteGraphAdapter {
     pending_splice: Mutex<HashSet<String>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriteRefreshOutcome {
+    #[cfg(not(feature = "cdc"))]
+    Disabled,
+    #[cfg(feature = "cdc")]
+    Skipped,
+    #[cfg(feature = "cdc")]
+    Full { bytes_scanned: usize },
+    #[cfg(feature = "cdc")]
+    Incremental {
+        prefix_kept: usize,
+        tail_reused: usize,
+        rehashed: usize,
+        bytes_scanned: usize,
+    },
+}
+
 impl SqliteGraphAdapter {
     pub fn new(graph: SqliteGraph) -> Self {
         Self::build(graph, None)
@@ -293,6 +310,146 @@ impl SqliteGraphAdapter {
         Ok(())
     }
 
+    fn write_content_traced(
+        &self,
+        id: &str,
+        data: &[u8],
+        offset: u64,
+    ) -> Result<(usize, WriteRefreshOutcome)> {
+        let refresh = {
+            let guard = self.writer.lock();
+            let now = now_nanos();
+
+            // Read existing content, patch in the new data
+            let existing: Option<String> = guard
+                .conn()
+                .query_row("SELECT record FROM nodes WHERE id = ?1", [id], |row| {
+                    row.get(0)
+                })
+                .ok()
+                .flatten();
+
+            let mut content = existing.map(|s| s.into_bytes()).unwrap_or_default();
+            #[cfg(feature = "cdc")]
+            let old_len = content.len();
+            #[cfg(feature = "cdc")]
+            let previous = crate::chunked::capture_chunked_content(guard.conn(), id)?;
+            let off = usize::try_from(offset).context("write offset exceeds usize")?;
+            let write_end = off
+                .checked_add(data.len())
+                .context("write offset + length overflow")?;
+            #[cfg(feature = "cdc")]
+            let edit_offset = off.min(old_len);
+            #[cfg(feature = "cdc")]
+            let old_edit_end = write_end.min(old_len);
+
+            // Extend if writing past current end
+            if write_end > content.len() {
+                content.resize(write_end, 0);
+            }
+            content[off..write_end].copy_from_slice(data);
+
+            // Validate via tree-sitter if a language is known for this node.
+            // Flash-clear pattern: always clear stale error first, then validate.
+            #[cfg(feature = "validate")]
+            {
+                let lang = crate::validate::language_for_node(id, self.default_language.as_ref());
+                if let Some(lang) = lang {
+                    // Flash clear: remove any previous error for this node
+                    guard
+                        .conn()
+                        .execute(
+                            "DELETE FROM _errors WHERE node_id = ?1",
+                            rusqlite::params![id],
+                        )
+                        .ok();
+
+                    if !content.is_empty()
+                        && let Err(e) = crate::validate::validate(&content, &lang)
+                    {
+                        // Write structured error to SQLite
+                        guard.conn().execute(
+                            "INSERT OR REPLACE INTO _errors (node_id, line, col, message, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
+                            rusqlite::params![id, e.line, e.column, e.message, now],
+                        ).ok();
+
+                        // Restore shadow copy if truncate wiped content before this write
+                        if let Some(old) = self.shadow.lock().remove(id) {
+                            guard
+                                .conn()
+                                .execute(
+                                    "UPDATE nodes SET record = ?1, size = ?2, mtime = ?3 WHERE id = ?4",
+                                    rusqlite::params![&old, old.len() as i64, now, id],
+                                )
+                                .ok();
+                            log::info!("restored shadow copy for {id} after validation failure");
+                        }
+
+                        log::warn!("validation failed for {id}: {e}");
+                        // Drop writer lock and refresh readers so shadow
+                        // restore (if any) is visible to subsequent reads.
+                        drop(guard);
+                        self.refresh_readers()?;
+                        return Err(anyhow::anyhow!("{e}"));
+                    }
+
+                    // Validation passed — clear shadow (no longer needed)
+                    self.shadow.lock().remove(id);
+                }
+            }
+
+            // Validation passed (or skipped) — commit the write
+            let new_str = String::from_utf8_lossy(&content);
+            guard.conn().execute(
+                "UPDATE nodes SET record = ?1, size = ?2, mtime = ?3 WHERE id = ?4",
+                rusqlite::params![new_str.as_ref(), content.len() as i64, now, id],
+            )?;
+
+            // No-op unless this arena already has the chunk schema — writing
+            // through a foreign arena must not silently upgrade it.
+            #[cfg(feature = "cdc")]
+            let refresh = match crate::chunked::refresh_chunked_content_after_edit(
+                guard.conn(),
+                id,
+                new_str.as_ref().as_bytes(),
+                previous,
+                edit_offset,
+                old_edit_end,
+                old_len,
+            )? {
+                crate::chunked::RefreshOutcome::Skipped => WriteRefreshOutcome::Skipped,
+                crate::chunked::RefreshOutcome::Full { bytes_scanned } => {
+                    WriteRefreshOutcome::Full { bytes_scanned }
+                }
+                crate::chunked::RefreshOutcome::Incremental(stats) => {
+                    WriteRefreshOutcome::Incremental {
+                        prefix_kept: stats.prefix_kept,
+                        tail_reused: stats.tail_reused,
+                        rehashed: stats.rehashed,
+                        bytes_scanned: stats.bytes_scanned,
+                    }
+                }
+            };
+            #[cfg(not(feature = "cdc"))]
+            let refresh = WriteRefreshOutcome::Disabled;
+
+            // Mark for splice on flush if this node has AST tracking
+            #[cfg(feature = "splice")]
+            {
+                let is_ast: bool = guard
+                    .conn()
+                    .query_row("SELECT 1 FROM _ast WHERE node_id = ?1", [id], |_| Ok(true))
+                    .unwrap_or(false);
+                if is_ast {
+                    self.pending_splice.lock().insert(id.to_string());
+                }
+            }
+            refresh
+        };
+        self.refresh_readers()?;
+        Ok((data.len(), refresh))
+    }
+
     fn row_to_node(row: &rusqlite::Row<'_>) -> std::result::Result<Node, rusqlite::Error> {
         let id: String = row.get("id")?;
         let name: String = row.get("name")?;
@@ -423,108 +580,8 @@ impl Graph for SqliteGraphAdapter {
     }
 
     fn write_content(&self, id: &str, data: &[u8], offset: u64) -> Result<usize> {
-        {
-            let guard = self.writer.lock();
-            let now = now_nanos();
-
-            // Read existing content, patch in the new data
-            let existing: Option<String> = guard
-                .conn()
-                .query_row("SELECT record FROM nodes WHERE id = ?1", [id], |row| {
-                    row.get(0)
-                })
-                .ok()
-                .flatten();
-
-            let mut content = existing.map(|s| s.into_bytes()).unwrap_or_default();
-            let off = offset as usize;
-
-            // Extend if writing past current end
-            if off + data.len() > content.len() {
-                content.resize(off + data.len(), 0);
-            }
-            content[off..off + data.len()].copy_from_slice(data);
-
-            // Validate via tree-sitter if a language is known for this node.
-            // Flash-clear pattern: always clear stale error first, then validate.
-            #[cfg(feature = "validate")]
-            {
-                let lang = crate::validate::language_for_node(id, self.default_language.as_ref());
-                if let Some(lang) = lang {
-                    // Flash clear: remove any previous error for this node
-                    guard
-                        .conn()
-                        .execute(
-                            "DELETE FROM _errors WHERE node_id = ?1",
-                            rusqlite::params![id],
-                        )
-                        .ok();
-
-                    if !content.is_empty()
-                        && let Err(e) = crate::validate::validate(&content, &lang)
-                    {
-                        // Write structured error to SQLite
-                        guard.conn().execute(
-                            "INSERT OR REPLACE INTO _errors (node_id, line, col, message, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
-                            rusqlite::params![id, e.line, e.column, e.message, now],
-                        ).ok();
-
-                        // Restore shadow copy if truncate wiped content before this write
-                        if let Some(old) = self.shadow.lock().remove(id) {
-                            guard
-                                .conn()
-                                .execute(
-                                    "UPDATE nodes SET record = ?1, size = ?2, mtime = ?3 WHERE id = ?4",
-                                    rusqlite::params![&old, old.len() as i64, now, id],
-                                )
-                                .ok();
-                            log::info!("restored shadow copy for {id} after validation failure");
-                        }
-
-                        log::warn!("validation failed for {id}: {e}");
-                        // Drop writer lock and refresh readers so shadow
-                        // restore (if any) is visible to subsequent reads.
-                        drop(guard);
-                        self.refresh_readers()?;
-                        return Err(anyhow::anyhow!("{e}"));
-                    }
-
-                    // Validation passed — clear shadow (no longer needed)
-                    self.shadow.lock().remove(id);
-                }
-            }
-
-            // Validation passed (or skipped) — commit the write
-            let new_str = String::from_utf8_lossy(&content);
-            guard.conn().execute(
-                "UPDATE nodes SET record = ?1, size = ?2, mtime = ?3 WHERE id = ?4",
-                rusqlite::params![new_str.as_ref(), content.len() as i64, now, id],
-            )?;
-
-            // Keep the chunk manifest in step with `record`. Re-chunking here
-            // is what makes CDC pay off on the write path: boundary stability
-            // means an edit only produces new chunks around the edit itself,
-            // so the unchanged majority of a large file is not re-stored.
-            //
-            // No-op unless this arena already has the chunk schema — writing
-            // through a foreign arena must not silently upgrade it.
-            #[cfg(feature = "cdc")]
-            crate::chunked::refresh_chunked_content(guard.conn(), id, new_str.as_ref().as_bytes())?;
-
-            // Mark for splice on flush if this node has AST tracking
-            #[cfg(feature = "splice")]
-            {
-                let is_ast: bool = guard
-                    .conn()
-                    .query_row("SELECT 1 FROM _ast WHERE node_id = ?1", [id], |_| Ok(true))
-                    .unwrap_or(false);
-                if is_ast {
-                    self.pending_splice.lock().insert(id.to_string());
-                }
-            }
-        }
-        self.refresh_readers()?;
-        Ok(data.len())
+        self.write_content_traced(id, data, offset)
+            .map(|(written, _)| written)
     }
 
     fn create_node(&self, parent_id: &str, name: &str, is_dir: bool) -> Result<String> {
@@ -2158,6 +2215,156 @@ mod tests {
             crate::chunked::create_chunked_content_schema(guard.conn())?;
         }
         Ok(adapter)
+    }
+
+    #[cfg(feature = "cdc")]
+    fn cdc_body(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                b'a' + (state % 26) as u8
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "cdc")]
+    fn manifest_tuples(
+        adapter: &SqliteGraphAdapter,
+        node_id: &str,
+    ) -> Result<Vec<(Vec<u8>, usize, usize)>> {
+        let guard = adapter.writer.lock();
+        let mut statement = guard.conn().prepare(
+            "SELECT chunk_hash, byte_offset, byte_len
+               FROM content_manifest
+              WHERE node_id = ?1
+              ORDER BY seq",
+        )?;
+        let rows = statement.query_map([node_id], |row| {
+            Ok((
+                row.get(0)?,
+                row.get::<_, i64>(1)? as usize,
+                row.get::<_, i64>(2)? as usize,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    #[cfg(feature = "cdc")]
+    fn assert_chunked_content_matches(
+        adapter: &SqliteGraphAdapter,
+        node_id: &str,
+        model: &[u8],
+    ) -> Result<()> {
+        let expected_manifest: Vec<_> = leyline_cdc::chunk(model)
+            .into_iter()
+            .map(|chunk| (chunk.hash.as_bytes().to_vec(), chunk.offset, chunk.len))
+            .collect();
+        assert_eq!(manifest_tuples(adapter, node_id)?, expected_manifest);
+
+        let mut reconstructed = vec![0; model.len()];
+        let read = adapter.read_content(node_id, &mut reconstructed, 0)?;
+        assert_eq!(&reconstructed[..read], model);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cdc")]
+    fn graph_write_incrementally_matches_full_chunk_oracle() -> Result<()> {
+        let adapter = chunked_adapter()?;
+        let node_id = "docs/readme";
+        let mut model = cdc_body(0xC0FFEE, 4_000_000);
+        adapter.write_content(node_id, &model, 0)?;
+
+        let initial_len = model.len();
+        let cases: [(&str, usize, &[u8]); 5] = [
+            ("deep overwrite", initial_len / 2, b"XYZ"),
+            (
+                "boundary overwrite",
+                leyline_cdc::MAX_CHUNK - 2,
+                b"boundary",
+            ),
+            ("append", initial_len, b"append"),
+            ("beyond EOF", initial_len + b"append".len() + 97, b"tail"),
+            ("empty write", initial_len / 3, b""),
+        ];
+
+        for (name, edit_offset, edit) in cases {
+            let write_end = edit_offset + edit.len();
+            if write_end > model.len() {
+                model.resize(write_end, 0);
+            }
+            model[edit_offset..write_end].copy_from_slice(edit);
+
+            let (_, outcome) = adapter.write_content_traced(node_id, edit, edit_offset as u64)?;
+            assert_chunked_content_matches(&adapter, node_id, &model)
+                .with_context(|| format!("{name} diverged from full-chunk oracle"))?;
+
+            let WriteRefreshOutcome::Incremental {
+                prefix_kept,
+                tail_reused,
+                bytes_scanned,
+                ..
+            } = outcome
+            else {
+                panic!("{name}: expected incremental refresh, got {outcome:?}");
+            };
+            if name == "deep overwrite" {
+                assert!(prefix_kept > 0);
+                assert!(tail_reused > 0);
+                assert!(bytes_scanned <= 4 * leyline_cdc::MAX_CHUNK);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cdc")]
+    fn graph_write_full_chunks_when_manifest_is_missing_or_stale() -> Result<()> {
+        for stale in [false, true] {
+            let adapter = chunked_adapter()?;
+            let node_id = "docs/readme";
+            if stale {
+                let guard = adapter.writer.lock();
+                crate::chunked::store_content_chunked(guard.conn(), node_id, b"hello")?;
+                guard.conn().execute(
+                    "UPDATE nodes SET mtime = mtime + 1 WHERE id = ?1",
+                    [node_id],
+                )?;
+            }
+
+            let edit = b"XY";
+            let (_, outcome) = adapter.write_content_traced(node_id, edit, 1)?;
+            assert_eq!(
+                outcome,
+                WriteRefreshOutcome::Full { bytes_scanned: 5 },
+                "stale={stale}"
+            );
+            assert_chunked_content_matches(&adapter, node_id, b"hXYlo")?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cdc")]
+    fn graph_write_does_not_add_chunk_schema_to_foreign_arena() -> Result<()> {
+        let adapter = writable_adapter()?;
+        let (_, outcome) = adapter.write_content_traced("docs/readme", b"XY", 1)?;
+        assert_eq!(outcome, WriteRefreshOutcome::Skipped);
+
+        let guard = adapter.writer.lock();
+        let chunk_tables: i64 = guard.conn().query_row(
+            "SELECT count(*) FROM sqlite_master
+              WHERE type = 'table'
+                AND name IN ('chunks', 'content_manifest', 'content_manifest_meta')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(chunk_tables, 0);
+        Ok(())
     }
 
     /// `truncate` must actually truncate a chunk-backed node. Without

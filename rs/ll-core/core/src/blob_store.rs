@@ -270,18 +270,14 @@ impl BlobStore for FsBlobStore {
         let hash = bytes.hash();
         let final_path = self.path_for(&hash);
 
-        // Idempotency (IM axiom): if the target already exists AND
-        // round-trip-verifies as the same hash, we're done. We do NOT
-        // re-write — that would also be correct but wastes IO and
-        // creates a torn-write window for a concurrent reader.
-        //
-        // Subtle: a corrupted file at `final_path` (bytes mutated
-        // since previous put) would have a hash mismatch on `get`,
-        // which the verify-on-read path catches. Here we trust the
-        // path's existence as a fast-path for the common case; the
-        // corrupt case fails loudly on read, not silently on write.
+        // Idempotency (IM axiom): a present entry is only a successful
+        // no-op when verify-on-read confirms that it matches the key.
+        // A corrupt physical entry must not be silently preserved by a
+        // successful put().
         if final_path.exists() {
-            return Ok(hash);
+            if self.get(hash)?.is_some() {
+                return Ok(hash);
+            }
         }
 
         // Ensure parent dir exists. `create_dir_all` is idempotent.
@@ -415,9 +411,16 @@ impl BlobStore for MemBlobStore {
     fn put(&mut self, bytes: &[u8]) -> Result<Hash> {
         let hash = bytes.hash();
         let mut guard = self.inner.lock();
-        // (IM) axiom: same hash ⇒ already present ⇒ no-op. We do not
-        // re-insert; the existing bytes are authoritative.
-        guard.entry(hash).or_insert_with(|| bytes.to_vec());
+        // (IM) axiom: same hash ⇒ no-op only when the existing value
+        // round-trip-verifies. Drop the lock before get() because it
+        // locks the same map to enforce the trait's verify-on-read rule.
+        if guard.contains_key(&hash) {
+            drop(guard);
+            self.get(hash)?;
+            return Ok(hash);
+        }
+        // Keep the lock across the absent-key check and insertion.
+        guard.insert(hash, bytes.to_vec());
         Ok(hash)
     }
 
@@ -602,6 +605,28 @@ mod tests {
 
         let err = s.get(h).expect_err("expected integrity violation");
         assert!(format!("{err:?}").contains("integrity violation"));
+    }
+
+    #[test]
+    fn fs_put_rejects_corrupt_existing_entry() {
+        let (mut store, _td) = fs_store();
+        let bytes = b"canonical";
+        let hash = store.put(bytes).unwrap();
+        std::fs::write(store.path_for(&hash), b"corrupted").unwrap();
+
+        let err = store.put(bytes).unwrap_err();
+        assert!(err.to_string().contains("integrity violation"), "{err:#}");
+    }
+
+    #[test]
+    fn mem_put_rejects_corrupt_existing_entry() {
+        let mut store = MemBlobStore::new();
+        let bytes = b"canonical";
+        let hash = store.put(bytes).unwrap();
+        store.inner.lock().insert(hash, b"corrupted".to_vec());
+
+        let err = store.put(bytes).unwrap_err();
+        assert!(err.to_string().contains("integrity violation"), "{err:#}");
     }
 
     // ── filesystem layout shape ───────────────────────────────────────

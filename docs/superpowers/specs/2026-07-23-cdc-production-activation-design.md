@@ -126,7 +126,11 @@ Each transition acquires an IMMEDIATE transaction, reads the authoritative
 manifest before commit. Caller-supplied stale bytes are rejected rather than
 paired with a newer `(size, mtime)` witness. Keyset pagination by `nodes.id`
 keeps page cost linear and prevents a deleted earlier row from shifting an
-unprocessed row behind an `OFFSET`.
+unprocessed row behind an `OFFSET`; the cursor is optional so an empty-string
+ID remains eligible. After each pass, activation acquires an IMMEDIATE
+transaction and proves every eligible row fresh. A concurrent insert or update
+behind the cursor is repaired and the bounded freshness scan repeats, so
+success describes a complete committed generation.
 
 The whole database is not wrapped in one transaction because that would make a
 large activation non-resumable and could retain a long-running WAL transaction.
@@ -191,6 +195,8 @@ a present consumer.
   or counted as complete.
 - A concurrent writer cannot pair pre-update bytes with a post-update
   freshness witness.
+- A concurrent insert behind the scan cursor is populated before activation
+  reports success.
 - Per-node transaction failure rolls back that node and preserves previously
   committed nodes.
 - Arena capacity is not estimated in the activation layer. The daemon's

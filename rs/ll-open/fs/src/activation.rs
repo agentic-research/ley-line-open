@@ -100,47 +100,28 @@ where
     let mut already_fresh_nodes = 0_u64;
     let mut processed_source_bytes = 0_u64;
     let mut visited_nodes = 0_u64;
-    let mut last_id = String::new();
+    let mut last_id = None;
 
     loop {
-        let rows = {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id
-                       FROM nodes
-                      WHERE kind = 0 AND record IS NOT NULL AND id > ?1
-                      ORDER BY id
-                      LIMIT ?2",
-                )
-                .context("prepare CDC activation page")?;
-            let mapped = stmt
-                .query_map(params![last_id, batch_size], |row| row.get::<_, String>(0))
-                .context("query CDC activation page")?;
-            mapped
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .context("decode CDC activation page")?
-        };
+        let rows = query_activation_page(conn, last_id.as_deref(), batch_size)?;
 
         if rows.is_empty() {
             break;
         }
-        last_id.clone_from(rows.last().context("nonempty CDC page has no final id")?);
-        visited_nodes = visited_nodes
-            .checked_add(u64::try_from(rows.len()).context("CDC page length exceeds u64")?)
-            .context("CDC activation visited-node count overflow")?;
+        last_id = rows.last().cloned();
 
         for node_id in rows {
             match activate_node(conn, &node_id)? {
                 NodeActivation::Gone => {}
                 NodeActivation::AlreadyFresh => {
-                    already_fresh_nodes = already_fresh_nodes
-                        .checked_add(1)
-                        .context("already-fresh CDC node count overflow")?;
+                    visited_nodes = checked_increment(visited_nodes, "visited CDC node count")?;
+                    already_fresh_nodes =
+                        checked_increment(already_fresh_nodes, "already-fresh CDC node count")?;
                 }
                 NodeActivation::Populated { source_bytes } => {
-                    populated_nodes = populated_nodes
-                        .checked_add(1)
-                        .context("populated CDC node count overflow")?;
+                    visited_nodes = checked_increment(visited_nodes, "visited CDC node count")?;
+                    populated_nodes =
+                        checked_increment(populated_nodes, "populated CDC node count")?;
                     processed_source_bytes = processed_source_bytes
                         .checked_add(source_bytes)
                         .context("processed CDC byte count overflow")?;
@@ -156,31 +137,132 @@ where
         });
     }
 
-    Ok(ActivationReport {
-        eligible_nodes: query_count(
-            conn,
-            "SELECT COUNT(*) FROM nodes WHERE kind = 0 AND record IS NOT NULL",
-            "count final eligible CDC nodes",
-        )?,
-        populated_nodes,
-        already_fresh_nodes,
-        processed_source_bytes,
-        manifest_rows: query_count(
-            conn,
-            "SELECT COUNT(*) FROM content_manifest",
-            "count CDC manifest rows",
-        )?,
-        unique_chunk_rows: query_count(
-            conn,
-            "SELECT COUNT(*) FROM content_chunks",
-            "count unique CDC chunks",
-        )?,
-        unique_chunk_bytes: query_count(
-            conn,
-            "SELECT COALESCE(SUM(length(chunk_bytes)), 0) FROM content_chunks",
-            "sum unique CDC chunk bytes",
-        )?,
-    })
+    loop {
+        // Exclude writers while proving the committed generation complete.
+        // A row inserted or changed behind the keyset cursor is repaired
+        // directly, keeping query memory bounded by batch_size.
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .context("begin final CDC activation freshness check")?;
+        let stale_node = first_nonfresh_node(&tx, batch_size)?;
+        let Some(stale_node) = stale_node else {
+            let report = ActivationReport {
+                eligible_nodes: query_count(
+                    &tx,
+                    "SELECT COUNT(*) FROM nodes WHERE kind = 0 AND record IS NOT NULL",
+                    "count final eligible CDC nodes",
+                )?,
+                populated_nodes,
+                already_fresh_nodes,
+                processed_source_bytes,
+                manifest_rows: query_count(
+                    &tx,
+                    "SELECT COUNT(*) FROM content_manifest",
+                    "count CDC manifest rows",
+                )?,
+                unique_chunk_rows: query_count(
+                    &tx,
+                    "SELECT COUNT(*) FROM content_chunks",
+                    "count unique CDC chunks",
+                )?,
+                unique_chunk_bytes: query_count(
+                    &tx,
+                    "SELECT COALESCE(SUM(length(chunk_bytes)), 0) FROM content_chunks",
+                    "sum unique CDC chunk bytes",
+                )?,
+            };
+            tx.commit()
+                .context("commit final CDC activation freshness check")?;
+            return Ok(report);
+        };
+        tx.commit()
+            .context("commit CDC activation convergence check")?;
+
+        match activate_node(conn, &stale_node)? {
+            NodeActivation::Gone => continue,
+            NodeActivation::AlreadyFresh => {
+                visited_nodes = checked_increment(visited_nodes, "visited CDC node count")?;
+                already_fresh_nodes =
+                    checked_increment(already_fresh_nodes, "already-fresh CDC node count")?;
+            }
+            NodeActivation::Populated { source_bytes } => {
+                visited_nodes = checked_increment(visited_nodes, "visited CDC node count")?;
+                populated_nodes = checked_increment(populated_nodes, "populated CDC node count")?;
+                processed_source_bytes = processed_source_bytes
+                    .checked_add(source_bytes)
+                    .context("processed CDC byte count overflow")?;
+            }
+        }
+        on_progress(ActivationProgress {
+            visited_nodes,
+            eligible_nodes: estimated_eligible_nodes,
+            populated_nodes,
+            already_fresh_nodes,
+            processed_source_bytes,
+        });
+    }
+}
+
+fn query_activation_page(
+    conn: &Connection,
+    last_id: Option<&str>,
+    batch_size: i64,
+) -> Result<Vec<String>> {
+    let (sql, cursor): (&str, Option<&str>) = match last_id {
+        Some(cursor) => (
+            "SELECT id
+               FROM nodes
+              WHERE kind = 0 AND record IS NOT NULL AND id > ?1
+              ORDER BY id
+              LIMIT ?2",
+            Some(cursor),
+        ),
+        None => (
+            "SELECT id
+               FROM nodes
+              WHERE kind = 0 AND record IS NOT NULL
+              ORDER BY id
+              LIMIT ?1",
+            None,
+        ),
+    };
+    let mut stmt = conn.prepare(sql).context("prepare CDC activation page")?;
+    let mapped = if let Some(cursor) = cursor {
+        stmt.query_map(params![cursor, batch_size], read_node_id)
+    } else {
+        stmt.query_map(params![batch_size], read_node_id)
+    }
+    .context("query CDC activation page")?;
+    mapped
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("decode CDC activation page")
+}
+
+fn read_node_id(row: &rusqlite::Row<'_>) -> rusqlite::Result<String> {
+    row.get(0)
+}
+
+fn first_nonfresh_node(conn: &Connection, batch_size: i64) -> Result<Option<String>> {
+    let mut last_id = None;
+    loop {
+        let rows = query_activation_page(conn, last_id.as_deref(), batch_size)?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        last_id = rows.last().cloned();
+        for node_id in rows {
+            if !has_chunked_content(conn, &node_id)
+                .with_context(|| format!("verify final CDC freshness for node {node_id}"))?
+            {
+                return Ok(Some(node_id));
+            }
+        }
+    }
+}
+
+fn checked_increment(value: u64, context: &'static str) -> Result<u64> {
+    value
+        .checked_add(1)
+        .with_context(|| format!("{context} overflow"))
 }
 
 enum NodeActivation {

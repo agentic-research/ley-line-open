@@ -243,6 +243,54 @@ fn activation_keyset_paging_does_not_skip_after_an_earlier_row_is_deleted() {
 }
 
 #[test]
+fn activation_keyset_includes_an_empty_string_node_id() {
+    let conn = projection();
+    conn.execute(
+        "INSERT INTO nodes
+         (id,parent_id,name,kind,size,mtime,record)
+         VALUES ('','','',0,5,7,'empty')",
+        [],
+    )
+    .unwrap();
+
+    let report = activate_chunked_content(&conn, ActivationOptions { batch_size: 1 }).unwrap();
+
+    assert_eq!(report.eligible_nodes, 3);
+    assert_eq!(report.populated_nodes, 3);
+    assert!(
+        leyline_fs::chunked::has_chunked_content(&conn, "").unwrap(),
+        "an empty string is a valid keyset value, not an absent cursor"
+    );
+}
+
+#[test]
+fn activation_converges_when_a_concurrent_insert_sorts_before_the_cursor() {
+    let conn = projection();
+    let mut pages = 0;
+    let report =
+        activate_chunked_content_with_progress(&conn, ActivationOptions { batch_size: 1 }, |_| {
+            pages += 1;
+            if pages == 1 {
+                conn.execute(
+                    "INSERT INTO nodes
+                     (id,parent_id,name,kind,size,mtime,record)
+                     VALUES ('0.rs','','0.rs',0,11,8,'fn zero(){}')",
+                    [],
+                )
+                .unwrap();
+            }
+        })
+        .unwrap();
+
+    assert_eq!(report.eligible_nodes, 3);
+    assert_eq!(report.populated_nodes, 3);
+    assert!(
+        leyline_fs::chunked::has_chunked_content(&conn, "0.rs").unwrap(),
+        "activation must not report success with an inserted eligible row stale"
+    );
+}
+
+#[test]
 fn stale_caller_bytes_cannot_be_paired_with_a_new_authoritative_witness() {
     let temp = TempDir::new().unwrap();
     let db = temp.path().join("projection.db");

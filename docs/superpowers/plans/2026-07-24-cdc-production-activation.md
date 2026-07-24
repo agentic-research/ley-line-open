@@ -173,8 +173,12 @@ source-file roots. A fresh row increments `already_fresh_nodes`; otherwise
 store the transaction-owned authoritative bytes and increment
 populated/processed counts with checked arithmetic. The lower-level store must
 reject caller bytes that differ from a present authoritative `nodes.record`,
-so no stale bytes can receive a newer witness. Finish by counting manifest
-rows, unique chunks, and `SUM(length(chunk_bytes))`.
+so no stale bytes can receive a newer witness. Use an optional cursor so the
+empty-string ID remains eligible. After each pass, acquire an IMMEDIATE
+transaction and verify that every eligible row is fresh; if a concurrent
+insert or update appeared behind the cursor, release it, repair that row, and
+repeat the bounded freshness scan. Count manifest rows, unique chunks, and
+`SUM(length(chunk_bytes))` inside the successful final transaction.
 
 Adjust `has_chunked_content` so a fresh zero-length witness is sufficient when
 `nodes.size = 0`; non-empty files still require manifest spans:

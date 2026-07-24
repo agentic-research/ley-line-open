@@ -100,6 +100,34 @@ fn activation_names_missing_nodes_columns_before_mutating() {
 }
 
 #[test]
+fn activation_rejects_an_unrepresentable_batch_size_before_mutating() {
+    let conn = projection();
+    let error = activate_chunked_content(
+        &conn,
+        ActivationOptions {
+            batch_size: usize::MAX,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("batch_size exceeds SQLite i64"),
+        "unexpected error: {error:#}"
+    );
+    let cdc_tables: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name LIKE 'content_%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        cdc_tables, 0,
+        "invalid options must not mutate the database"
+    );
+}
+
+#[test]
 fn activation_resumes_after_a_per_node_failure() {
     let conn = projection();
     leyline_fs::chunked::create_chunked_content_schema(&conn).unwrap();

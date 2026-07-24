@@ -83,6 +83,8 @@ where
         options.batch_size > 0,
         "CDC activation batch_size must be > 0"
     );
+    let batch_size = i64::try_from(options.batch_size)
+        .context("CDC activation batch_size exceeds SQLite i64")?;
     validate_nodes_contract(conn)?;
     create_chunked_content_schema(conn)?;
 
@@ -111,8 +113,7 @@ where
             let mapped = stmt
                 .query_map(
                     params![
-                        i64::try_from(options.batch_size)
-                            .context("CDC activation batch_size exceeds SQLite i64")?,
+                        batch_size,
                         i64::try_from(offset)
                             .context("CDC activation offset exceeds SQLite i64")?,
                     ],

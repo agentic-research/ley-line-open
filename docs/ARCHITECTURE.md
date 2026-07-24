@@ -8,8 +8,8 @@ Canonical architecture overview for ley-line-open (LLO). Companion to the [root 
 
 | Field | Value |
 |---|---|
-| LLO version | v0.10.0 |
-| Last verified | 2026-07-22 |
+| LLO version | v0.10.2 + Unreleased |
+| Last verified | 2026-07-24 |
 | Source of truth files | `rs/ll-core/`, `rs/ll-open/`, `rs/ll-open/cli-lib/src/daemon/`, `docs/adr/*.md`, `docs/decades/*.md`, `CHANGELOG.md` |
 
 This file is canonical for the architectural shape. Per-crate detail lives in each crate's `README.md`. Per-decision detail lives in `docs/adr/`. Per-table contract lives in [`TABLE_CONTRACT.md`](TABLE_CONTRACT.md). Per-decade design lives in [`docs/decades/`](decades/).
@@ -63,7 +63,7 @@ Where source becomes structure. Parses, enriches, signs, presents.
 | `leyline-lsp` | LSP client for ingesting language-server analysis into SQLite | `LspClient`, `document_symbols`, `hover` |
 | `leyline-hdc` | Hyperdimensional computing — D=8192 hypervectors via bundle composition + seeded leaves; popcount-Hamming distance (ADR-0024) | `EncoderNode`, `encode_fresh`, `Hypervector` |
 | `leyline-sheaf` | Čech-cohomology engine; structural cache + δ⁰-driven invalidation (ADR-0020) | `CellComplex`, `SheafCache` |
-| `leyline-fs` | Filesystem presentation — mounts arena as FUSE or NFS | `SqliteGraph`, `SqliteGraphAdapter` |
+| `leyline-fs` | Filesystem presentation — mounts arena as FUSE or NFS; optional CDC-derived chunk manifests for bounded range reads | `SqliteGraph`, `SqliteGraphAdapter`, `activate_chunked_content` |
 | `leyline-vcs` | jj sidecar — automatic versioning of arena snapshots | `VersionedGraph`, `.leyline/` virtual dir |
 | `leyline-sign` | Ed25519 `RootSigner` that signs the at-rest Σ `Head` (S1) + `verify_head` verify-on-load (S2) + the canonical key id `kid = lowercasehex(SHA-256(SPKI)[:16])` (S3, signet ADR-012); plus CMS/gpgsm verify primitives for jj commit signing (interactive host signing stays cloister-side per ADR-0019) | `Ed25519RootSigner`, `verify_head`, `canonical_kid`, Certificate, Signature |
 | `leyline-cas-ffi` | Wasm32-callable FFI for BLAKE3-substrate hash. Consumed by cloister via workerd's cdylib loader | `leyline_hash_bytes` |
@@ -95,8 +95,12 @@ LLO's daemon runs a **living SQLite database in memory** with an **arena snapsho
 
 1. **Parse phase**: `leyline-ts` walks tree-sitter ASTs into the in-memory db.
 2. **Enrichment phase**: each registered pass (LSP → `_lsp*` tables; HDC → `_hdc*` tables; etc.) writes sidecar rows.
-3. **Snapshot**: serialize current db state → arena buffer → BLAKE3-hash → advance `current_root` on the controller's generation counter.
-4. **Readers**: mmap the arena via `SqliteGraph` (zero-copy via `sqlite3_deserialize`); detect generation change → hot-swap to new buffer.
+3. **Optional CDC activation**: `daemon --cdc` resumably builds private chunk
+   manifests from authoritative readable `nodes.record` leaves before the
+   first snapshot. Missing or stale manifests fall back to authoritative
+   records; no schema-client or wire contract changes.
+4. **Snapshot**: serialize current db state → arena buffer → BLAKE3-hash → advance `current_root` on the controller's generation counter.
+5. **Readers**: mmap the arena via `SqliteGraph` (zero-copy via `sqlite3_deserialize`); detect generation change → hot-swap to new buffer.
 
 The arena is double-buffered: a writer flip advances the controller; readers see atomic transitions via the generation counter. Multiple readers share a lock-free pool (`SqliteGraphAdapter`), 2-8 readers auto-sized.
 
@@ -164,7 +168,7 @@ ADRs 0017-0019 are cloister-side and live in `~/remotes/art/cloister/docs/adr/`.
 
 | Surface | Built via |
 |---|---|
-| `leyline` binary (default features) | `task build` (debug, headless) / `task release` (release, headless) / `task install` (release + codesign + install to `~/.local/bin`). Default features are `lsp` + `validate` + `hdc` — the structural-analysis core |
+| `leyline` binary (default features) | `task build` (debug, headless) / `task release` (release, headless) / `task install` (release + codesign + install to `~/.local/bin`). Default features are `lsp` + `validate` + `hdc` + `cdc` — the structural-analysis core plus explicit CDC activation |
 | `leyline` binary (recommended for downstream consumers) | `task install:full` — `--features all` (adds `vec` + `text-search`). Portable — no libfuse-t/libfuse runtime dep |
 | `leyline` binary (everything including mount) | `task install:full+mount` — `--features full`. Requires libfuse-t (macOS `brew install fuse-t`) or libfuse (Linux `apt install libfuse-dev`) at runtime |
 | Distroless OCI image | `task image` — produces `ley-line-open:0.7.3` (~20 MB) via krust + cargo-zigbuild static musl; image default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0` |

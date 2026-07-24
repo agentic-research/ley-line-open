@@ -7,6 +7,9 @@ pub mod activation;
 pub mod chunked;
 #[cfg(feature = "fuse")]
 pub mod fuse;
+/// Explicit reachability garbage collection for unreferenced CDC chunks.
+#[cfg(feature = "cdc")]
+pub mod gc;
 pub mod graph;
 #[cfg(feature = "nfs")]
 pub mod nfs;

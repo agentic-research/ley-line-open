@@ -14,6 +14,7 @@ on:
     paths:
       - 'rs/ll-open/cdc/**'
       - 'rs/ll-open/fs/src/chunked.rs'
+      - 'rs/ll-open/fs/src/gc.rs'
       - 'Taskfile.yml'
       - '.github/workflows/mutants.yml'
   workflow_dispatch:

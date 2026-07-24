@@ -45,6 +45,21 @@ pub enum CdcCommands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Delete chunks unreachable from every committed manifest.
+    Gc {
+        /// Existing SQLite projection to collect in place.
+        #[arg(long)]
+        db: PathBuf,
+
+        /// Report unreachable rows and bytes without deleting them.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Emit the GC report as one JSON object.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Subcommands provided by ley-line open.
@@ -215,17 +230,26 @@ pub async fn run(cmd: Commands) -> Result<()> {
         Commands::Cdc { command } => {
             #[cfg(feature = "cdc")]
             {
-                let CdcCommands::Enable {
-                    db,
-                    batch_size,
-                    json,
-                } = command;
-                cmd_cdc::cmd_cdc_enable(&db, batch_size, json)
+                match command {
+                    CdcCommands::Enable {
+                        db,
+                        batch_size,
+                        json,
+                    } => cmd_cdc::cmd_cdc_enable(&db, batch_size, json),
+                    CdcCommands::Gc { db, dry_run, json } => {
+                        cmd_cdc::cmd_cdc_gc(&db, dry_run, json)
+                    }
+                }
             }
             #[cfg(not(feature = "cdc"))]
             {
-                let _ = command;
-                anyhow::bail!("cdc enable requires the 'cdc' feature (compile with --features cdc)")
+                let subcommand = match command {
+                    CdcCommands::Enable { .. } => "cdc enable",
+                    CdcCommands::Gc { .. } => "cdc gc",
+                };
+                anyhow::bail!(
+                    "{subcommand} requires the 'cdc' feature (compile with --features cdc)"
+                )
             }
         }
         Commands::Splice { db, node, text } => cmd_splice::cmd_splice(&db, &node, &text),

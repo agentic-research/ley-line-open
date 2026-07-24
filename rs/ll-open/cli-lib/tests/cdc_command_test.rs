@@ -2,6 +2,7 @@
 
 use clap::Parser;
 use leyline_fs::activation::{ActivationOptions, ActivationProgress, ActivationReport};
+use leyline_fs::gc::GcOptions;
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
 
@@ -149,4 +150,107 @@ fn cdc_progress_formats_as_one_stable_stderr_line() {
         line,
         "CDC activation: visited=8/21 populated=5 already_fresh=3 source_bytes=4096"
     );
+}
+
+#[test]
+fn cdc_gc_dry_run_then_delete_mutates_a_real_projection() {
+    let (_temp, db) = seed_projection_file();
+    leyline_cli_lib::cmd_cdc::enable_database(&db, ActivationOptions::default()).unwrap();
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("DELETE FROM content_manifest", []).unwrap();
+    let before: i64 = conn
+        .query_row("SELECT COUNT(*) FROM content_chunks", [], |row| row.get(0))
+        .unwrap();
+    assert!(before > 0);
+    drop(conn);
+
+    let dry_run = leyline_cli_lib::cmd_cdc::gc_database(&db, GcOptions { dry_run: true }).unwrap();
+    assert_eq!(dry_run.unreachable_chunk_rows, before as u64);
+    assert_eq!(dry_run.deleted_chunk_rows, 0);
+
+    let deleted = leyline_cli_lib::cmd_cdc::gc_database(&db, GcOptions { dry_run: false }).unwrap();
+    assert_eq!(deleted.deleted_chunk_rows, before as u64);
+    assert_eq!(deleted.remaining_chunk_rows, 0);
+}
+
+#[test]
+fn cdc_gc_does_not_create_a_misspelled_database_path() {
+    let temp = TempDir::new().unwrap();
+    let missing = temp.path().join("misspelled.db");
+
+    let error = leyline_cli_lib::cmd_cdc::gc_database(&missing, GcOptions::default()).unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("open CDC database"),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        !missing.exists(),
+        "collecting an existing projection must not create a typo path"
+    );
+}
+
+#[tokio::test]
+async fn cdc_gc_dispatches_through_the_public_command_runner() {
+    let (_temp, db) = seed_projection_file();
+    leyline_cli_lib::cmd_cdc::enable_database(&db, ActivationOptions::default()).unwrap();
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("DELETE FROM content_manifest", []).unwrap();
+    drop(conn);
+
+    leyline_cli_lib::run(leyline_cli_lib::Commands::Cdc {
+        command: leyline_cli_lib::CdcCommands::Gc {
+            db: db.clone(),
+            dry_run: false,
+            json: true,
+        },
+    })
+    .await
+    .unwrap();
+
+    let conn = Connection::open(&db).unwrap();
+    let remaining: i64 = conn
+        .query_row("SELECT COUNT(*) FROM content_chunks", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(remaining, 0);
+}
+
+#[test]
+fn cdc_gc_cli_parses_options_and_formats_stable_json() {
+    let cli = TestCli::try_parse_from([
+        "leyline",
+        "cdc",
+        "gc",
+        "--db",
+        "graph.db",
+        "--dry-run",
+        "--json",
+    ])
+    .unwrap();
+    match cli.command {
+        leyline_cli_lib::Commands::Cdc {
+            command: leyline_cli_lib::CdcCommands::Gc { db, dry_run, json },
+        } => {
+            assert_eq!(db, std::path::PathBuf::from("graph.db"));
+            assert!(dry_run);
+            assert!(json);
+        }
+        _ => panic!("expected cdc gc command"),
+    }
+
+    let report = leyline_fs::gc::GcReport {
+        before_chunk_rows: 4,
+        before_chunk_bytes: 400,
+        unreachable_chunk_rows: 2,
+        unreachable_chunk_bytes: 120,
+        deleted_chunk_rows: 0,
+        deleted_chunk_bytes: 0,
+        remaining_chunk_rows: 4,
+        remaining_chunk_bytes: 400,
+        dry_run: true,
+    };
+    let json = leyline_cli_lib::cmd_cdc::format_gc_report(report, true).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["unreachable_chunk_rows"], 2);
+    assert_eq!(value["dry_run"], true);
 }

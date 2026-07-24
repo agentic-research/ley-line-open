@@ -1,8 +1,7 @@
 #![cfg(feature = "cdc")]
 
 use clap::Parser;
-use leyline_fs::activation::ActivationOptions;
-use leyline_fs::activation::ActivationReport;
+use leyline_fs::activation::{ActivationOptions, ActivationProgress, ActivationReport};
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
 
@@ -119,4 +118,19 @@ fn cdc_report_formats_as_stable_human_and_json_output() {
     let value: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(value["eligible_nodes"], 3);
     assert_eq!(value["unique_chunk_bytes"], 88);
+}
+
+#[test]
+fn cdc_progress_formats_as_one_stable_stderr_line() {
+    let line = leyline_cli_lib::cmd_cdc::format_progress(ActivationProgress {
+        visited_nodes: 8,
+        eligible_nodes: 21,
+        populated_nodes: 5,
+        already_fresh_nodes: 3,
+        processed_source_bytes: 4096,
+    });
+    assert_eq!(
+        line,
+        "CDC activation: visited=8/21 populated=5 already_fresh=3 source_bytes=4096"
+    );
 }

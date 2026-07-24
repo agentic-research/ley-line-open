@@ -27,7 +27,7 @@ impl Default for ActivationOptions {
 /// Deterministic summary of one activation invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ActivationReport {
-    /// Total eligible file nodes in committed final state.
+    /// Total eligible readable leaf nodes in committed final state.
     pub eligible_nodes: u64,
     /// Nodes populated or rebuilt by this invocation.
     pub populated_nodes: u64,
@@ -43,7 +43,22 @@ pub struct ActivationReport {
     pub unique_chunk_bytes: u64,
 }
 
-/// Create the CDC schema and backfill every authoritative file record.
+/// Progress emitted after each completely processed query page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ActivationProgress {
+    /// Fresh or populated rows visited so far.
+    pub visited_nodes: u64,
+    /// Total eligible rows observed before processing began.
+    pub eligible_nodes: u64,
+    /// Rows populated or rebuilt so far.
+    pub populated_nodes: u64,
+    /// Rows already fresh so far.
+    pub already_fresh_nodes: u64,
+    /// Authoritative bytes processed so far.
+    pub processed_source_bytes: u64,
+}
+
+/// Create the CDC schema and backfill every authoritative readable leaf.
 ///
 /// Each node store is its own transaction. A failed or interrupted invocation
 /// therefore resumes by skipping manifests whose freshness witness already
@@ -52,6 +67,18 @@ pub fn activate_chunked_content(
     conn: &Connection,
     options: ActivationOptions,
 ) -> Result<ActivationReport> {
+    activate_chunked_content_with_progress(conn, options, |_| {})
+}
+
+/// Activate CDC and emit one progress update after each completed query page.
+pub fn activate_chunked_content_with_progress<F>(
+    conn: &Connection,
+    options: ActivationOptions,
+    mut on_progress: F,
+) -> Result<ActivationReport>
+where
+    F: FnMut(ActivationProgress),
+{
     ensure!(
         options.batch_size > 0,
         "CDC activation batch_size must be > 0"
@@ -74,7 +101,7 @@ pub fn activate_chunked_content(
         let rows = {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, CAST(record AS BLOB)
+                    "SELECT id, CAST(record AS BLOB), size
                        FROM nodes
                       WHERE kind = 0 AND record IS NOT NULL
                       ORDER BY id
@@ -89,7 +116,13 @@ pub fn activate_chunked_content(
                         i64::try_from(offset)
                             .context("CDC activation offset exceeds SQLite i64")?,
                     ],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
                 )
                 .context("query CDC activation page")?;
             mapped
@@ -104,7 +137,13 @@ pub fn activate_chunked_content(
             .checked_add(u64::try_from(rows.len()).context("CDC page length exceeds u64")?)
             .context("CDC activation offset overflow")?;
 
-        for (node_id, data) in rows {
+        for (node_id, data, declared_size) in rows {
+            ensure!(
+                declared_size >= 0
+                    && u64::try_from(declared_size).ok() == u64::try_from(data.len()).ok(),
+                "node {node_id} size {declared_size} does not match {} record bytes",
+                data.len()
+            );
             if has_chunked_content(conn, &node_id)
                 .with_context(|| format!("check CDC freshness for node {node_id}"))?
             {
@@ -122,6 +161,13 @@ pub fn activate_chunked_content(
                 .checked_add(u64::try_from(data.len()).context("node length exceeds u64")?)
                 .context("processed CDC byte count overflow")?;
         }
+        on_progress(ActivationProgress {
+            visited_nodes: offset,
+            eligible_nodes,
+            populated_nodes,
+            already_fresh_nodes,
+            processed_source_bytes,
+        });
     }
 
     Ok(ActivationReport {

@@ -52,8 +52,8 @@ leyline-cli-lib, Taskfile.
 
 - [ ] **Step 1: Write the failing public-API test**
 
-Create a real SQLite projection with two file rows and a directory row. Import
-the wished-for API before it exists:
+Create a real SQLite projection with two readable leaf rows and a directory
+row. Import the wished-for API before it exists:
 
 ```rust
 #![cfg(feature = "cdc")]
@@ -167,11 +167,12 @@ pub fn activate_chunked_content(
 Validate `batch_size > 0` and validate the required `nodes` columns through
 `pragma_table_info('nodes')`. Create the CDC schema, select
 `id, CAST(record AS BLOB)` for `kind = 0 AND record IS NOT NULL ORDER BY id`,
-and process rows in `LIMIT ? OFFSET ?` pages. Before storing a row, call
-`has_chunked_content`; a fresh row increments `already_fresh_nodes`, otherwise
-call `store_content_chunked` and increment populated/processed counts with
-checked arithmetic. Finish by counting manifest rows, unique chunks, and
-`SUM(length(chunk_bytes))`.
+and process rows in `LIMIT ? OFFSET ?` pages. These rows are readable
+structural leaves, not necessarily source-file roots. Before storing a row,
+call `has_chunked_content`; a fresh row increments `already_fresh_nodes`,
+otherwise call `store_content_chunked` and increment populated/processed
+counts with checked arithmetic. Finish by counting manifest rows, unique
+chunks, and `SUM(length(chunk_bytes))`.
 
 Adjust `has_chunked_content` so a fresh zero-length witness is sufficient when
 `nodes.size = 0`; non-empty files still require manifest spans:
@@ -468,12 +469,14 @@ Make the CLI/config tests GREEN.
 The integration test must:
 
 1. Write a deterministic 1 MiB valid JSON source fixture.
-2. Parse it with `cmd_parse::parse_into_conn` into a file-backed database.
+2. Parse it with `cmd_parse::parse_into_conn` into a file-backed database and
+   select the largest authoritative readable leaf.
 3. Call the production activation API.
 4. Create a deliberately small arena with `cmd_serve::setup_arena`.
 5. Publish with `cmd_daemon::snapshot_to_arena`.
 6. Reopen with `leyline_fs::SqliteGraph::from_arena`.
-7. Read an interior 4 KiB range through `read_content_at_traced`.
+7. Read an interior 4 KiB range of that leaf through
+   `read_content_at_traced`.
 8. Assert byte equality, `ContentSource::Chunked`, and
    `chunks_touched(...) <= 2`.
 9. Assert the controller's arena size grew and its current root equals the

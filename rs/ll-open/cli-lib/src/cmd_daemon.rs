@@ -122,6 +122,17 @@ pub struct DaemonConfig {
     pub reset_arena: bool,
 }
 
+/// Additive daemon behavior switches.
+///
+/// Kept separate from [`DaemonConfig`] so downstream crates that construct the
+/// long-lived public config with struct literals do not break when an opt-in
+/// behavior is added.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DaemonOptions {
+    /// Activate/resume the private CDC index before the first arena snapshot.
+    pub cdc: bool,
+}
+
 pub async fn cmd_daemon(config: DaemonConfig) -> Result<()> {
     let ext: Arc<dyn DaemonExt> = Arc::new(NoExt);
     run_daemon(config, ext).await
@@ -141,6 +152,15 @@ pub async fn cmd_daemon(config: DaemonConfig) -> Result<()> {
 /// 9. Wait for shutdown (Ctrl+C or timeout)
 /// 10. Cleanup (kill mache child, remove socket file)
 pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result<()> {
+    run_daemon_with_options(config, ext, DaemonOptions::default()).await
+}
+
+/// Run the daemon with explicit additive behavior options.
+pub async fn run_daemon_with_options(
+    config: DaemonConfig,
+    ext: Arc<dyn DaemonExt>,
+    options: DaemonOptions,
+) -> Result<()> {
     let DaemonConfig {
         arena,
         arena_size_mib,
@@ -258,10 +278,35 @@ pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result
         }
     };
 
-    // 3. Snapshot living db into arena (initial snapshot for mache/remote
-    // consumers). Runs before pool build so the reader connections
-    // observe a coherent post-snapshot file.
-    snapshot_to_arena(&live_conn, &ctrl_path)?;
+    #[cfg(feature = "cdc")]
+    {
+        let report = match activate_cdc_and_snapshot(&live_conn, &ctrl_path, options.cdc) {
+            Ok(report) => report,
+            Err(error) => {
+                state.write().phase =
+                    DaemonPhase::Error(format!("initial publish failed: {error:#}"));
+                return Err(error);
+            }
+        };
+        if let Some(report) = report {
+            eprintln!(
+                "CDC activation: eligible={} populated={} already_fresh={} source_bytes={}",
+                report.eligible_nodes,
+                report.populated_nodes,
+                report.already_fresh_nodes,
+                report.processed_source_bytes,
+            );
+        }
+    }
+    #[cfg(not(feature = "cdc"))]
+    {
+        if options.cdc {
+            state.write().phase =
+                DaemonPhase::Error("CDC activation unavailable in this build".into());
+            anyhow::bail!("daemon --cdc requires the 'cdc' feature (compile with --features cdc)");
+        }
+        snapshot_to_arena(&live_conn, &ctrl_path)?;
+    }
 
     // Build the LiveDb container (writer + reader pool). The writer
     // connection produced the file and applied WAL; the pool attaches
@@ -1226,6 +1271,32 @@ pub fn snapshot_to_arena(conn: &rusqlite::Connection, ctrl_path: &Path) -> Resul
         hex_short(&current_root),
     );
     Ok(())
+}
+
+/// Optionally activate CDC, then atomically publish the exact resulting
+/// database generation to the arena.
+///
+/// Activation failure leaves the previously published root intact.
+/// Successful activation and the disabled path both publish exactly once.
+#[cfg(feature = "cdc")]
+pub fn activate_cdc_and_snapshot(
+    conn: &rusqlite::Connection,
+    ctrl_path: &Path,
+    enabled: bool,
+) -> Result<Option<leyline_fs::activation::ActivationReport>> {
+    let report = if enabled {
+        Some(
+            leyline_fs::activation::activate_chunked_content(
+                conn,
+                leyline_fs::activation::ActivationOptions::default(),
+            )
+            .context("activate CDC in daemon living database")?,
+        )
+    } else {
+        None
+    };
+    snapshot_to_arena(conn, ctrl_path)?;
+    Ok(report)
 }
 
 /// Compact hex prefix for log lines (first 8 hex chars of a 32-byte hash).

@@ -97,8 +97,10 @@ than wrapping.
 The function:
 
 1. Creates the CDC tables idempotently.
-2. Selects eligible rows from `nodes` where `kind = 0` and `record IS NOT
-   NULL`, ordered by `id`.
+2. Selects eligible readable structural leaves from `nodes` where `kind = 0`
+   and `record IS NOT NULL`, ordered by `id`. In the parsed projection this
+   does not mean “source file”: source-file roots may be directory-like while
+   their readable content lives in descendant leaves.
 3. Treats a node as complete only when `has_chunked_content` proves its
    freshness witness matches the current `(size, mtime)`.
 4. Calls the existing atomic per-node store for missing or stale manifests.
@@ -107,12 +109,12 @@ The function:
 6. Returns deterministic counts and storage accounting read from committed
    database state.
 
-Empty records are eligible. They receive a freshness witness and an empty
+Empty leaf records are eligible. They receive a freshness witness and an empty
 manifest representation that must be distinguishable from “not activated.”
 The existing freshness/read API will be adjusted test-first so an activated
 empty file reads correctly without being perpetually reprocessed.
 
-Directories are never chunked.
+Directory-like nodes are never chunked.
 
 ## Transaction and Resume Semantics
 

@@ -1,6 +1,8 @@
 #![cfg(feature = "cdc")]
 
-use leyline_fs::activation::{ActivationOptions, activate_chunked_content};
+use leyline_fs::activation::{
+    ActivationOptions, activate_chunked_content, activate_chunked_content_with_progress,
+};
 use rusqlite::{Connection, params};
 
 fn projection() -> Connection {
@@ -136,4 +138,54 @@ fn activation_rebuilds_a_stale_manifest_from_authoritative_record() {
     assert_eq!(report.populated_nodes, 1);
     assert_eq!(report.already_fresh_nodes, 1);
     assert_eq!(report.processed_source_bytes, 15);
+}
+
+#[test]
+fn activation_rejects_a_record_whose_size_witness_is_inconsistent() {
+    let conn = projection();
+    conn.execute("UPDATE nodes SET size = 999 WHERE id = 'a.rs'", [])
+        .unwrap();
+
+    let error = activate_chunked_content(&conn, ActivationOptions::default()).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("a.rs"), "error must name node: {message}");
+    assert!(
+        message.contains("size 999") && message.contains("10 record bytes"),
+        "error must name both conflicting lengths: {message}"
+    );
+    let witnesses: i64 = conn
+        .query_row("SELECT COUNT(*) FROM content_manifest_meta", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        witnesses, 0,
+        "inconsistent authoritative metadata must fail before storing the node"
+    );
+}
+
+#[test]
+fn activation_reports_bounded_deterministic_progress() {
+    let conn = projection();
+    let mut progress = Vec::new();
+    let report = activate_chunked_content_with_progress(
+        &conn,
+        ActivationOptions { batch_size: 1 },
+        |update| progress.push(update),
+    )
+    .unwrap();
+
+    assert_eq!(progress.len(), 2);
+    assert_eq!(
+        progress
+            .iter()
+            .map(|update| update.visited_nodes)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert!(progress.iter().all(|update| update.eligible_nodes == 2));
+    let last = progress.last().unwrap();
+    assert_eq!(last.populated_nodes, report.populated_nodes);
+    assert_eq!(last.already_fresh_nodes, report.already_fresh_nodes);
+    assert_eq!(last.processed_source_bytes, report.processed_source_bytes);
 }

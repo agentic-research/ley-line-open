@@ -1130,10 +1130,9 @@ mod tests {
         assert_eq!(&got, bytes.as_ref());
     }
 
-    /// Concurrent put + get: while threads write, other threads read.
-    /// No reader should ever see a torn file (verify-on-read catches
-    /// that anyway, but the test pins that contains() / get() during
-    /// an active write don't expose intermediate state).
+    /// Concurrent same-key put + get: while writers repeatedly exercise
+    /// the occupied-key verification path, readers fetch that exact key.
+    /// Every successful operation must observe the canonical bytes.
     #[test]
     fn fs_concurrent_put_get_interleaved() {
         use std::sync::Arc;
@@ -1172,23 +1171,23 @@ mod tests {
         };
         let bytes_a = Arc::new(bytes_a);
 
-        // Writers: each puts distinct content.
+        // Writers: repeatedly put the same pre-seeded content. This exercises
+        // the occupied-key get/verify path concurrently with direct readers.
         let mut writer_handles = Vec::new();
-        for tid in 0..THREADS {
+        for _ in 0..THREADS {
             let root = Arc::clone(&root);
+            let bytes_a = Arc::clone(&bytes_a);
             writer_handles.push(thread::spawn(move || {
                 let mut s = FsBlobStore::new(&*root).expect("open writer");
-                for i in 0..WRITES_PER_THREAD {
-                    let payload = format!("writer-{tid}-iter-{i}").into_bytes();
-                    s.put(&payload).expect("put in loop");
+                for _ in 0..WRITES_PER_THREAD {
+                    let hash = s.put(bytes_a.as_ref()).expect("same-key put in loop");
+                    assert_eq!(hash, hash_a, "same bytes must retain the same key");
                 }
                 WRITES_PER_THREAD
             }));
         }
 
-        // Readers: each get()s the pre-seeded blob repeatedly, concurrently
-        // with those writes. None may observe a torn value — that is the
-        // actual property under test.
+        // Readers fetch the same key concurrently with occupied-key puts.
         let mut reader_handles = Vec::new();
         for _ in 0..THREADS {
             let root = Arc::clone(&root);

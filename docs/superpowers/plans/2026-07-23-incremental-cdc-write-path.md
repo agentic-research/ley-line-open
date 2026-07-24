@@ -40,9 +40,9 @@ ______________________________________________________________________
   coordinates, and differential integration harness.
 - Modify `rs/ll-open/fs/src/chunked.rs`: verified old-manifest capture,
   shared manifest persistence, full/incremental refresh outcome.
+- Modify `rs/ll-open/cdc/src/lib.rs`: update API documentation now that the
+  previously shipped primitive has a production caller.
 - Modify `CHANGELOG.md`: release-facing statement under `[Unreleased]`.
-- Do not modify `rs/ll-open/cdc/src/lib.rs`: `rechunk_with_stats` and its
-  exactness/work tests are already shipped and are the primitive being wired.
 
 ### Task 1: Establish the RED integration oracle and trace seam
 
@@ -85,7 +85,7 @@ ______________________________________________________________________
 - Temporarily consumes the existing full `refresh_chunked_content`; Task 2
   replaces its implementation.
 
-- [ ] **Step 1: Write the failing deep-edit differential test**
+- [x] **Step 1: Write the failing deep-edit differential test**
 
   Add printable deterministic bytes and a manifest oracle to the graph test
   module:
@@ -176,7 +176,7 @@ ______________________________________________________________________
   }
   ```
 
-- [ ] **Step 2: Run the focused test and record API RED**
+- [x] **Step 2: Run the focused test and record API RED**
 
   Run:
 
@@ -191,7 +191,7 @@ ______________________________________________________________________
   `write_content_traced`/`WriteRefreshOutcome` do not exist. Comment the exact
   failure on `ley-line-open-bd8d33`.
 
-- [ ] **Step 3: Add the minimal trace seam without incremental behavior**
+- [x] **Step 3: Add the minimal trace seam without incremental behavior**
 
   Move the current `Graph::write_content` body byte-for-byte into the inherent
   `write_content_traced` method. Define `WriteRefreshOutcome` as above. At the
@@ -222,7 +222,7 @@ ______________________________________________________________________
   }
   ```
 
-- [ ] **Step 4: Run the focused test and record semantic RED**
+- [x] **Step 4: Run the focused test and record semantic RED**
 
   Run the command from Step 2.
 
@@ -235,7 +235,7 @@ ______________________________________________________________________
   Comment this second RED on the bead. This proves the harness distinguishes
   the current full scan from the requested behavior.
 
-- [ ] **Step 5: Commit the RED harness and trace seam**
+- [x] **Step 5: Commit the RED harness and trace seam**
 
   ```bash
   git add rs/ll-open/fs/src/graph.rs
@@ -285,7 +285,7 @@ ______________________________________________________________________
 
 - Consumes `leyline_cdc::rechunk_with_stats`.
 
-- [ ] **Step 1: Add snapshot capture with explicit validation**
+- [x] **Step 1: Add snapshot capture with explicit validation**
 
   Probe for `content_manifest` exactly as existing refresh/invalidation code
   does. Return `Ok(None)` for an absent schema, missing metadata, missing node,
@@ -311,7 +311,7 @@ ______________________________________________________________________
   A non-32-byte hash and malformed tiling return an error; they are not
   silently treated as a valid incremental base.
 
-- [ ] **Step 2: Extract one atomic manifest writer**
+- [x] **Step 2: Extract one atomic manifest writer**
 
   Refactor `store_content_chunked` so full chunking delegates to:
 
@@ -327,7 +327,7 @@ ______________________________________________________________________
   Move the existing transaction, delete, chunk/blob inserts, metadata query,
   and commit into that function without changing SQL or ordering.
 
-- [ ] **Step 3: Implement full/incremental refresh**
+- [x] **Step 3: Implement full/incremental refresh**
 
   ```rust
   pub(crate) fn refresh_chunked_content_after_edit(
@@ -369,7 +369,7 @@ ______________________________________________________________________
   Keep the existing public `store_content_chunked` full-build behavior for
   initial population and direct callers.
 
-- [ ] **Step 4: Wire exact graph edit coordinates**
+- [x] **Step 4: Wire exact graph edit coordinates**
 
   Before modifying `content`, capture:
 
@@ -389,7 +389,7 @@ ______________________________________________________________________
   `refresh_chunked_content_after_edit`, map its result to
   `WriteRefreshOutcome`, and preserve the existing reader refresh.
 
-- [ ] **Step 5: Run the focused test and verify GREEN**
+- [x] **Step 5: Run the focused test and verify GREEN**
 
   Run:
 
@@ -404,7 +404,7 @@ ______________________________________________________________________
   reconstruction, non-zero prefix/tail reuse, and at most
   `4 * MAX_CHUNK` scanned bytes.
 
-- [ ] **Step 6: Run the existing focused crate gate**
+- [x] **Step 6: Run the existing focused crate gate**
 
   ```bash
   cd rs
@@ -414,7 +414,7 @@ ______________________________________________________________________
 
   Expected: all tests pass with no warnings.
 
-- [ ] **Step 7: Commit the incremental path**
+- [x] **Step 7: Commit the incremental path**
 
   ```bash
   git add rs/ll-open/fs/src/chunked.rs rs/ll-open/fs/src/graph.rs
@@ -436,7 +436,7 @@ ______________________________________________________________________
 
 - Produces one table-driven edit harness and one fallback table.
 
-- [ ] **Step 1: Convert the deep edit into a case table**
+- [x] **Step 1: Convert the deep edit into a case table**
 
   Define:
 
@@ -492,15 +492,16 @@ ______________________________________________________________________
 
   Assert the manifest oracle and reconstructed bytes after every row.
 
-- [ ] **Step 2: Run each new row RED before coordinate fixes**
+- [x] **Step 2: Run each new row before coordinate fixes**
 
   Add rows one at a time and run the named test after each addition. Record any
   newly exposed coordinate failure on the bead before changing production
-  code. Expected final state: every case reports `Incremental`, except a
-  semantically unchanged empty write may report incremental work with all
-  chunks reused.
+  code. If the generalized coordinate implementation already covers a row,
+  record its GREEN result rather than manufacturing a failure. Expected final
+  state: every case reports `Incremental`, except a semantically unchanged
+  empty write may report incremental work with all chunks reused.
 
-- [ ] **Step 3: Add the fallback table RED**
+- [x] **Step 3: Add the fallback proof**
 
   Cover:
 
@@ -514,13 +515,13 @@ ______________________________________________________________________
   `nodes.mtime` through SQL before `write_content_traced`. Assert the full
   fallback still produces the oracle manifest and bytes.
 
-- [ ] **Step 4: Implement only fallback corrections exposed by RED**
+- [x] **Step 4: Implement only fallback corrections exposed by RED**
 
   Keep missing/stale snapshots as `None`, preserve malformed-manifest errors,
   and leave foreign schemas untouched. Do not add branches that no harness row
   requires.
 
-- [ ] **Step 5: Run the full focused gate**
+- [x] **Step 5: Run the full focused gate**
 
   ```bash
   task test:fs-cdc
@@ -528,7 +529,7 @@ ______________________________________________________________________
 
   Expected: tests and `-D warnings` clippy pass.
 
-- [ ] **Step 6: Commit the expanded harness**
+- [x] **Step 6: Commit the expanded harness**
 
   ```bash
   git add rs/ll-open/fs/src/graph.rs rs/ll-open/fs/src/chunked.rs
@@ -549,7 +550,7 @@ ______________________________________________________________________
 
 - Does not change package or schema versions.
 
-- [ ] **Step 1: Update `[Unreleased]`**
+- [x] **Step 1: Update `[Unreleased]`**
 
   Add:
 
@@ -565,20 +566,22 @@ ______________________________________________________________________
     `leyline-schema` or wire-format change.
   ```
 
-- [ ] **Step 2: Run formatting and focused tests**
+- [x] **Step 2: Run formatting and focused tests**
 
   ```bash
   cargo fmt --manifest-path rs/Cargo.toml --all -- --check
   mdformat --check \
     docs/superpowers/specs/2026-07-23-incremental-cdc-write-path-design.md \
-    docs/superpowers/plans/2026-07-23-incremental-cdc-write-path.md \
-    CHANGELOG.md
+    docs/superpowers/plans/2026-07-23-incremental-cdc-write-path.md
+  git diff --check -- CHANGELOG.md
   task test:fs-cdc
   ```
 
-  Expected: all commands pass.
+  Expected: all commands pass. The historical changelog is not yet
+  mdformat-clean, so this change checks its patch for whitespace errors without
+  rewriting unrelated release history.
 
-- [ ] **Step 3: Run the complete Taskfile CI gate**
+- [x] **Step 3: Run the complete Taskfile CI gate**
 
   ```bash
   task ci
@@ -586,7 +589,7 @@ ______________________________________________________________________
 
   Expected: exit 0, including `check:all-features`.
 
-- [ ] **Step 4: Run both mutation gates**
+- [x] **Step 4: Run both mutation gates**
 
   ```bash
   task mutants:cdc

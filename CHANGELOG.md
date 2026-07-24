@@ -10,6 +10,16 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Changed
+
+- **Incremental CDC writes** (`ley-line-open-bd8d33`) — chunk-backed graph
+  writes now capture a freshness-verified old manifest and call
+  `rechunk_with_stats`, so a small edit hashes only its bounded resync window
+  instead of the whole file. A differential graph harness requires the durable
+  manifest and reconstructed bytes to equal a full rechunk after overwrite,
+  append, beyond-EOF, boundary, and empty-write cases. No `leyline-schema` or
+  wire-format change.
+
 ## [0.10.2] — 2026-07-23
 
 **Chunk-backed content reads, a permissive schema layer, and a high-severity dependency fix.**

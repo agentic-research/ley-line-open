@@ -199,12 +199,12 @@ manifest disappears.
 
 ## Building the image
 
-A distroless OCI image (`ley-line-open:0.10.2`, ~20 MB) is built via [`krust`](https://github.com/imjasonh/krust) (cargo-zigbuild → static musl binary) + a one-line `docker build` that COPYs the binary onto `cgr.dev/chainguard/static`. See `image.Dockerfile` and `Taskfile.yml`. The image's default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0` headless — no FUSE/NFS, just the MCP HTTP transport on `:8384` inside the container (consumed by cloister via `LLO_MCP_URL`, default `http://localhost:8384/mcp`).
+A distroless OCI image (`ley-line-open:0.10.3`, ~20 MB) is built via [`krust`](https://github.com/imjasonh/krust) (cargo-zigbuild → static musl binary) + a one-line `docker build` that COPYs the binary onto `cgr.dev/chainguard/static`. See `image.Dockerfile` and `Taskfile.yml`. The image's default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0` headless — no FUSE/NFS, just the MCP HTTP transport on `:8384` inside the container (consumed by cloister via `LLO_MCP_URL`, default `http://localhost:8384/mcp`).
 
 ```bash
 brew install zig                   # cargo-zigbuild backend
 cargo install cargo-zigbuild krust # one-time
-task image                         # → ley-line-open:0.10.2 in local docker
+task image                         # → ley-line-open:0.10.3 in local docker
 task image:smoke                   # build + start daemon + curl tools/list
 ```
 
@@ -219,8 +219,7 @@ The apko/melange path was evaluated and abandoned on Apple Silicon (Docker Deskt
 `leyline-fs` builds as a staticlib (`libleyline_fs.a`) with a C header (`include/leyline_fs.h`):
 
 ```bash
-cd rs
-cargo build -p leyline-fs --lib
+task build:fs-static               # default FFI features + CDC
 # Header: rs/ll-open/fs/include/leyline_fs.h
 # Library: rs/target/debug/libleyline_fs.a
 ```
@@ -235,7 +234,10 @@ import "github.com/agentic-research/ley-line-open/clients/go/leyline-schema/bind
 
 One sub-package per schema (`ast`, `binding`, `cache`, `common`, `daemon`, `head`, `net`, `source`). Regen via `clients/go/leyline-schema/regen.sh`; CI gates on `git diff --exit-code` plus `go test ./...` decoding the same `tests/fixtures/*.bin` the Rust suite asserts byte-equality against.
 
-Latest tag: [`clients/go/leyline-schema/v0.10.2`](https://github.com/agentic-research/ley-line-open/releases/tag/clients%2Fgo%2Fleyline-schema%2Fv0.10.2) — paired with the binary release so Go consumers can pin the same public-schema surface.
+Latest tag: [`clients/go/leyline-schema/v0.10.2`](https://github.com/agentic-research/ley-line-open/releases/tag/clients%2Fgo%2Fleyline-schema%2Fv0.10.2).
+Schema tags move only when this public contract changes. Binary v0.10.3 changes
+private CDC indexes, so it deliberately continues to advertise and consume the
+v0.10.2 schema surface.
 
 ## Daemon protocol
 

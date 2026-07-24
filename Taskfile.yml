@@ -92,6 +92,8 @@ tasks:
         grep -q 'release:artifacts:stage:' Taskfile.yml
         grep -q 'release:artifacts:verify:' Taskfile.yml
         grep -q -- '- task: release:artifacts:fixture-test' Taskfile.yml
+        grep -Eq 'cargo build -p leyline-fs --lib --features cdc$' Taskfile.yml
+        grep -Eq 'cargo build --release --lib -p leyline-fs --features cdc --target' Taskfile.yml
         grep -q 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' .github/workflows/release.yml
         grep -q 'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c' .github/workflows/release.yml
         awk '
@@ -241,7 +243,7 @@ tasks:
       - echo "installed $(~/.local/bin/leyline --version)"
 
   release:full:
-    desc: Release build with `--features all` — everything the CLI can expose EXCEPT mount. Portable (no libfuse-t / libfuse runtime dep). Includes lsp + vec + validate + hdc + text-search.
+    desc: Release build with `--features all` — everything the CLI can expose EXCEPT mount. Portable (no libfuse-t / libfuse runtime dep). Includes lsp + vec + validate + hdc + text-search + cdc.
     dir: rs
     cmds:
       - cargo build --release -p leyline-cli --features all
@@ -262,13 +264,13 @@ tasks:
       - cargo build --release -p leyline-cli --target "{{.BUILD_TARGET}}"
 
   release:fs-static:target:
-    desc: Build the leyline-fs release staticlib for BUILD_TARGET
+    desc: Build the CDC-capable leyline-fs release staticlib for BUILD_TARGET
     deps: [cache:sccache:install]
     requires:
       vars: [BUILD_TARGET]
     dir: rs
     cmds:
-      - cargo build --release --lib -p leyline-fs --target "{{.BUILD_TARGET}}"
+      - cargo build --release --lib -p leyline-fs --features cdc --target "{{.BUILD_TARGET}}"
 
   release:artifacts:stage:
     desc: Stage one target's exact release outputs and SHA-256 manifest
@@ -534,10 +536,10 @@ tasks:
   # FFI / staticlib
   # --------------------------------------------------------------------------
   build:fs-static:
-    desc: Build leyline-fs as a staticlib (consumed by smoke_ffi C tests)
+    desc: Build the CDC-capable leyline-fs staticlib (consumed by smoke_ffi C tests and matching release assets)
     dir: rs
     cmds:
-      - cargo build -p leyline-fs --lib
+      - cargo build -p leyline-fs --lib --features cdc
 
   build:fs-nfs-isolated:
     desc: |
@@ -833,6 +835,31 @@ tasks:
         fi
         echo "README.md version pins match $VERSION"
 
+  schema:version-check:
+    desc: |
+      Keep public Rust schema crates aligned with the independently published
+      daemon SCHEMA_VERSION. Private storage and binary-only releases must not
+      create a new schema-client package version.
+    cmds:
+      - |
+        SCHEMA_VERSION="$(sed -nE 's/^pub const SCHEMA_VERSION: &str = "([^"]+)";/\1/p' rs/ll-open/cli-lib/src/daemon/version.rs)"
+        if [ -z "$SCHEMA_VERSION" ]; then
+          echo "could not read the literal SCHEMA_VERSION"
+          exit 1
+        fi
+        for manifest in \
+          rs/ll-core/schema/Cargo.toml \
+          rs/ll-core/public-schema/Cargo.toml \
+          rs/ll-core/schema-capnp/Cargo.toml
+        do
+          PACKAGE_VERSION="$(grep -m1 '^version = ' "$manifest" | cut -d'"' -f2)"
+          if [ "$PACKAGE_VERSION" != "$SCHEMA_VERSION" ]; then
+            echo "$manifest is $PACKAGE_VERSION but SCHEMA_VERSION is $SCHEMA_VERSION"
+            exit 1
+          fi
+        done
+        echo "public Rust schema crates match SCHEMA_VERSION $SCHEMA_VERSION"
+
   ci:
     desc: Common CI gate — runs on every PR. Excludes `test:perf` (release-profile rebuild adds ~90-120s; main-push-only via ci.yml's conditional `test:perf` step). For the full main-push gate locally, run `task ci:full`.
     deps: [cache:sccache:install]
@@ -847,6 +874,7 @@ tasks:
       - task: release:artifacts:fixture-test
       - task: lint:blake3
       - task: readme:version-check
+      - task: schema:version-check
       - task: check
       - task: clippy
       - task: smells

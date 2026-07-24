@@ -129,8 +129,10 @@ End consumers don't need any of this — `go get` the module and import.
 ## Why a separate module
 
 Multi-module monorepo pattern (kubernetes/api, stripe-go). One
-versionable contract, one tag per release (`clients/go/leyline-schema/vX.Y.Z`),
-no `replace` directives required for downstream consumers. The Rust
+versionable contract, tagged when that public contract changes
+(`clients/go/leyline-schema/vX.Y.Z`), with no content-identical tag for
+binary-only or private-storage releases and no `replace` directives required
+for downstream consumers. The Rust
 workspace has no Go dependency; the Go module has no Rust dependency
 beyond reading the canonical `.capnp` files at regen time.
 

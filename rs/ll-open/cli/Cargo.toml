@@ -1,6 +1,6 @@
 [package]
 name = "leyline-cli"
-version = "0.10.2"
+version = "0.10.3"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 
@@ -9,7 +9,7 @@ name = "leyline"
 path = "src/main.rs"
 
 [features]
-# Match cli-lib's baseline defaults — lsp + validate + hdc are pure-Rust
+# Match cli-lib's baseline defaults — lsp + validate + hdc + cdc are pure-Rust
 # with no system-dep cost, and cli-lib treats them as always-available.
 # `mount` (libfuse-t/libfuse system dep) and `vec` (fastembed + ONNX
 # download at first use) stay opt-in to keep the default build portable.

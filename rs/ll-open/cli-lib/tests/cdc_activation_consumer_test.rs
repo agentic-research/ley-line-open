@@ -184,8 +184,22 @@ fn release_docs_pin_the_private_derived_ownership_contract() {
     assert!(
         normalized_readme.contains("Changes to those private indexes do not bump `leyline-schema`")
     );
+    let v0102 = changelog
+        .split("## [0.10.2]")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## [").next())
+        .expect("v0.10.2 changelog section");
     assert!(
-        !changelog.contains("At v0.10.2 release time this was not yet wired"),
-        "the v0.10.2 changelog must not contradict the now-wired incremental write path"
+        v0102.contains("still rebuilt the full manifest"),
+        "the immutable v0.10.2 history must describe what that release shipped"
+    );
+    let v0103 = changelog
+        .split("## [0.10.3]")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## [").next())
+        .expect("v0.10.3 changelog section");
+    assert!(
+        v0103.contains("Incremental CDC writes"),
+        "the release that wires incremental writes must claim them in its own section"
     );
 }

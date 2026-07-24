@@ -8,7 +8,18 @@ Each entry references the bead ID(s) tracking the work in
 [rsry](https://github.com/agentic-research/rosary) so the full design
 context, scoping notes, and review history are recoverable.
 
-## [Unreleased]
+## [0.10.3] — 2026-07-24
+
+**Consumer-ready CDC: incremental writes, explicit activation, and transactional
+reachability GC.**
+
+Patch release. The binary and implementation Rust packages advance to `0.10.3`.
+The public schema does not: the `leyline-schema`, `leyline-public-schema`, and
+`leyline-schema-capnp` Rust packages, daemon `SCHEMA_VERSION`, and latest Go
+module all remain `0.10.2`, because this release changes only private,
+rebuildable `content_*` indexes. No content-identical nested
+`clients/go/leyline-schema/v0.10.3` tag is published. `wire_format_major = 1`
+and `compat_min_schema_version = 0.6.0` are unchanged.
 
 ### Added
 
@@ -53,6 +64,19 @@ context, scoping notes, and review history are recoverable.
   append, beyond-EOF, boundary, and empty-write cases. No `leyline-schema` or
   wire-format change.
 
+- **Local/CI build parity and reusable release artifacts**
+  (`ley-line-open-7c2361`) — Taskfile tasks are the shared execution boundary
+  for local and runner stages, Rust 1.97.1 is pinned on both, sccache reuses
+  compilation across jobs without bypassing Task's hashed status checks, and
+  downstream release jobs consume verified staged artifacts instead of
+  rebuilding the same source independently.
+
+- **CDC-capable FFI release assets** (`ley-line-open-048393`) — the
+  `libleyline_fs-*` static libraries consumed by mache now build with explicit
+  `--features cdc`, matching the v0.10.3 CLI and the materialize-on-read tests.
+  A Taskfile contract gate keeps local smoke-test and target release builds on
+  the same feature surface.
+
 ## [0.10.2] — 2026-07-23
 
 **Chunk-backed content reads, a permissive schema layer, and a high-severity dependency fix.**
@@ -74,7 +98,7 @@ This is the release mache and rosary were both blocked on — `leyline-cdc` and 
 
   `nodes.record` remains authoritative — it is the cross-runtime contract mache also writes — and the manifest is a derived index. Because a stale manifest would serve wrong bytes, `content_manifest_meta` records the `(size, mtime)` each manifest was built from and reads refuse any manifest whose source moved on. A missed invalidation therefore degrades to slow-but-correct rather than silently wrong, including for writers outside this crate (`leyline-ts`'s reproject re-inserts nodes with a fresh `mtime`).
 
-- **`leyline-cdc`** (`ley-line-open-9989d2`) — content-defined chunking over HuggingFace's `gearhash` with xet's boundary parameters, BLAKE3 chunk identity. Includes `rechunk`, which rescans only an edit's interval and is required to equal a full re-chunk bit-for-bit. The v0.10.2 write path uses it for localized edits and is pinned byte-for-byte against a full re-chunk oracle.
+- **`leyline-cdc`** (`ley-line-open-9989d2`) — content-defined chunking over HuggingFace's `gearhash` with xet's boundary parameters, BLAKE3 chunk identity. Includes `rechunk`, which rescans only an edit's interval and is required to equal a full re-chunk bit-for-bit. In v0.10.2 the chunk-backed write path still rebuilt the full manifest; v0.10.3 wires this primitive into localized writes and pins it byte-for-byte against a full re-chunk oracle.
 
 - **Per-agent jj workspaces over one shared store** (`ley-line-open-99a9fe`) — `add_workspace` / `forget_workspace` / `workspace_names`, driven purely through `jj-lib` with no `jj` subprocess. `leyline-vcs` now enables jj-lib's `git` backend, which `default-features = false` had silently removed.
 

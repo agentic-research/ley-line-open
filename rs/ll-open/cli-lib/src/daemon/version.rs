@@ -21,9 +21,11 @@
 //! - `COMPAT_MIN_SCHEMA_VERSION` — earliest schema-client that can
 //!   safely talk to this daemon. Bump when older clients lose a
 //!   field they depend on; raise the floor.
-//! - `SCHEMA_VERSION` — today equals `BINARY_VERSION` (we release
-//!   them in lockstep). Reserved as a separate constant so the two
-//!   can diverge later without a wire shape change.
+//! - `SCHEMA_VERSION` — latest published public schema-client contract,
+//!   shared by the Rust schema crates and nested Go module.
+//!   Bump only when the public Cap'n Proto/schema surface changes and a
+//!   matching `clients/go/leyline-schema/vX.Y.Z` tag is published. Private
+//!   storage changes do not move it.
 //!
 //! These are the *only* hand-maintained version facts; the rest of
 //! the substrate's compatibility surface (cbea02) derives from them.
@@ -32,10 +34,11 @@
 /// compile time — no separate source of truth to drift against.
 pub const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// The Go schema-client version this daemon's wire shapes target.
-/// Today equals `BINARY_VERSION` since the two release in lockstep.
-/// Reserved as separate so they can diverge without a wire change.
-pub const SCHEMA_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The public Rust/Go schema-client version this daemon's wire shapes target.
+/// This is intentionally independent from `BINARY_VERSION`: v0.10.3 changes
+/// private CDC indexes only, so it continues to target the v0.10.2 schema
+/// module rather than publishing a content-identical nested tag.
+pub const SCHEMA_VERSION: &str = "0.10.2";
 
 /// Current major version of the JSON wire envelope shape. Bumps on
 /// incompatible changes (renames, removals, type changes); additions

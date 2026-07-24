@@ -116,13 +116,9 @@ fn next_boundary(data: &[u8]) -> usize {
 /// Between those two points the bytes are rescanned normally. Work is
 /// O(edit region + resync window), not O(stream).
 ///
-/// **Not yet wired into a caller.** `leyline_fs::chunked::store_content_chunked`
-/// still calls [`chunk`] for a full re-chunk on every write, so this function's
-/// benefit is currently unrealized in the mount path — it is proven
-/// (`fuzz_rechunk_equals_full_rechunk`) and measured
-/// (`rechunk_work_is_sublinear_in_stream_length`) but unused outside tests.
-/// Treat the complexity claim above as a property of THIS function, not a
-/// description of what a write costs today.
+/// `leyline_fs` wires this into freshness-verified graph writes. Initial
+/// manifest population and stale/missing manifests still use [`chunk`] in
+/// full; writes with a valid old manifest use this bounded rescan path.
 ///
 /// `edit_offset..old_edit_end` is the replaced range **in old coordinates**;
 /// `old_len` is the old stream's total length. The result is required to equal

@@ -142,11 +142,13 @@ pub struct SqliteGraphAdapter {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WriteRefreshOutcome {
+    #[cfg(not(feature = "cdc"))]
     Disabled,
+    #[cfg(feature = "cdc")]
     Skipped,
-    Full {
-        bytes_scanned: usize,
-    },
+    #[cfg(feature = "cdc")]
+    Full { bytes_scanned: usize },
+    #[cfg(feature = "cdc")]
     Incremental {
         prefix_kept: usize,
         tail_reused: usize,
@@ -328,13 +330,24 @@ impl SqliteGraphAdapter {
                 .flatten();
 
             let mut content = existing.map(|s| s.into_bytes()).unwrap_or_default();
-            let off = offset as usize;
+            #[cfg(feature = "cdc")]
+            let old_len = content.len();
+            #[cfg(feature = "cdc")]
+            let previous = crate::chunked::capture_chunked_content(guard.conn(), id)?;
+            let off = usize::try_from(offset).context("write offset exceeds usize")?;
+            let write_end = off
+                .checked_add(data.len())
+                .context("write offset + length overflow")?;
+            #[cfg(feature = "cdc")]
+            let edit_offset = off.min(old_len);
+            #[cfg(feature = "cdc")]
+            let old_edit_end = write_end.min(old_len);
 
             // Extend if writing past current end
-            if off + data.len() > content.len() {
-                content.resize(off + data.len(), 0);
+            if write_end > content.len() {
+                content.resize(write_end, 0);
             }
-            content[off..off + data.len()].copy_from_slice(data);
+            content[off..write_end].copy_from_slice(data);
 
             // Validate via tree-sitter if a language is known for this node.
             // Flash-clear pattern: always clear stale error first, then validate.
@@ -395,16 +408,27 @@ impl SqliteGraphAdapter {
             // No-op unless this arena already has the chunk schema — writing
             // through a foreign arena must not silently upgrade it.
             #[cfg(feature = "cdc")]
-            let refresh = if crate::chunked::refresh_chunked_content(
+            let refresh = match crate::chunked::refresh_chunked_content_after_edit(
                 guard.conn(),
                 id,
                 new_str.as_ref().as_bytes(),
+                previous,
+                edit_offset,
+                old_edit_end,
+                old_len,
             )? {
-                WriteRefreshOutcome::Full {
-                    bytes_scanned: new_str.len(),
+                crate::chunked::RefreshOutcome::Skipped => WriteRefreshOutcome::Skipped,
+                crate::chunked::RefreshOutcome::Full { bytes_scanned } => {
+                    WriteRefreshOutcome::Full { bytes_scanned }
                 }
-            } else {
-                WriteRefreshOutcome::Skipped
+                crate::chunked::RefreshOutcome::Incremental(stats) => {
+                    WriteRefreshOutcome::Incremental {
+                        prefix_kept: stats.prefix_kept,
+                        tail_reused: stats.tail_reused,
+                        rehashed: stats.rehashed,
+                        bytes_scanned: stats.bytes_scanned,
+                    }
+                }
             };
             #[cfg(not(feature = "cdc"))]
             let refresh = WriteRefreshOutcome::Disabled;

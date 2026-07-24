@@ -394,15 +394,28 @@ git commit -m "[ley-line-open-ef5c84] fix(fs): make CDC range reads transactiona
 - Modify: `docs/TABLE_CONTRACT.md`
 - Modify: `CHANGELOG.md`
 - Modify: `rs/ll-open/fs/src/chunked.rs`
-- Create: `rs/ll-open/cli-lib/tests/architecture_identity_contract.rs`
+- Create: `tools/check_architecture_vocabulary.sh`
+- Create: `tools/test_architecture_vocabulary.sh`
+- Modify: `Taskfile.yml`
 
 **Interfaces:**
 - Consumes: the four identity definitions approved in the design.
-- Produces: one executable documentation contract and corrected v0.10.3 release history.
+- Produces: one lightweight documentation linter with behavioral fixtures and corrected v0.10.3 release history.
 
-- [ ] **Step 1: Write the failing documentation contract**
+- [ ] **Step 1: Write the failing linter fixture**
 
-Register `architecture_identity_contract.rs` as an explicit integration test. Have it load the three documents with `include_str!` and require these exact terms:
+Create `tools/test_architecture_vocabulary.sh`. It builds a temporary directory containing `README.md`, `docs/ARCHITECTURE.md`, and `docs/TABLE_CONTRACT.md`, then runs the real linter against controlled inputs.
+
+The broken fixture contains:
+
+```sh
+printf '%s\n' \
+  'The .db file is the contract' \
+  '## The Σ substrate — runtime model' \
+  'core tables are the canonical substrate' > "$fixture/docs/ARCHITECTURE.md"
+```
+
+Require the linter to exit non-zero and name all three violations. Replace the fixture with the four approved terms and require exit zero:
 
 ```text
 Cap'n Proto segment root
@@ -411,28 +424,26 @@ blob hash
 SQL projection ABI
 ```
 
-Reject:
+The fixture tests the linter's observable exit/output behavior; it does not invoke Cargo.
 
-```text
-The .db file is the contract
-The Σ substrate — runtime model
-core tables are the canonical substrate
-```
-
-The test must also require README language stating that no equality between identity domains is implied without a named derivation.
-
-- [ ] **Step 2: Run the documentation contract and observe failure**
+- [ ] **Step 2: Run the fixture and observe failure**
 
 Run:
 
 ```bash
-cd rs
-cargo test -p leyline-cli-lib --test architecture_identity_contract
+sh tools/test_architecture_vocabulary.sh
 ```
 
-Expected: failure on current overloaded and contradictory terminology.
+Expected: failure because the linter script does not exist.
 
-- [ ] **Step 3: Rewrite authority statements**
+- [ ] **Step 3: Implement the linter and rewrite authority statements**
+
+Create `tools/check_architecture_vocabulary.sh` with an optional repository-root argument defaulting to `.`. It must:
+
+- fail if any of the three forbidden assertions appears;
+- require all four approved identity terms across the three documents;
+- print each missing or forbidden term and exit non-zero;
+- remain POSIX `sh`.
 
 Update the documents so:
 
@@ -444,6 +455,8 @@ Update the documents so:
 
 Update `chunked.rs` module documentation to remove the no-verify exception and describe transaction-scoped verification.
 
+Add `lint:architecture-vocabulary` to `Taskfile.yml`, invoking the script. Wire it into the lightweight docs/change-classification gate created by `ley-line-open-1df0cc`; until that bead lands, include it in `task ci` without adding a Rust dependency to the linter itself.
+
 - [ ] **Step 4: Correct v0.10.3 history**
 
 Change the v0.10.3 changelog statement that says no nested schema tag was published. Record that `clients/go/leyline-schema/v0.10.3` is a content-identical module tag at release commit `a4f57673f0f79d0e3dd8808f19a8b6fc9c5b3347`, published to satisfy public Go module consumers.
@@ -453,9 +466,8 @@ Change the v0.10.3 changelog statement that says no nested schema tag was publis
 Run:
 
 ```bash
-cd rs
-cargo test -p leyline-cli-lib --test architecture_identity_contract
-cd ..
+sh tools/test_architecture_vocabulary.sh
+task lint:architecture-vocabulary
 task test:cdc-activation
 task readme:version-check
 task schema:version-check
@@ -467,8 +479,8 @@ Expected: all pass.
 
 ```bash
 git add README.md docs/ARCHITECTURE.md docs/TABLE_CONTRACT.md CHANGELOG.md \
-  rs/ll-open/fs/src/chunked.rs \
-  rs/ll-open/cli-lib/tests/architecture_identity_contract.rs
+  rs/ll-open/fs/src/chunked.rs Taskfile.yml \
+  tools/check_architecture_vocabulary.sh tools/test_architecture_vocabulary.sh
 git commit -m "[ley-line-open-ef5c1d] docs(architecture): separate substrate identity domains"
 ```
 
@@ -493,8 +505,8 @@ task test:cdc-activation
 cd rs
 cargo test -p leyline-core blob_store
 cargo test -p leyline-cdc
-cargo test -p leyline-cli-lib --test architecture_identity_contract
 cd ..
+task lint:architecture-vocabulary
 ```
 
 Expected: all pass.

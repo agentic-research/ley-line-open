@@ -167,7 +167,9 @@ leyline daemon --source ./path/to/code --cdc
 `content_manifest`, and `content_manifest_meta` tables are private derived
 indexes: stale or absent manifests fall back to the authoritative record, and
 activation rebuilds them. Expect temporary storage amplification while both
-representations coexist.
+representations coexist. Changes to those private indexes do not bump
+`leyline-schema`; a version change is required only if the cross-runtime
+`nodes` contract or another public schema surface changes.
 
 Long-lived writable projections can inspect and collect chunk history
 explicitly:

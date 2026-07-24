@@ -74,7 +74,7 @@ This is the release mache and rosary were both blocked on — `leyline-cdc` and 
 
   `nodes.record` remains authoritative — it is the cross-runtime contract mache also writes — and the manifest is a derived index. Because a stale manifest would serve wrong bytes, `content_manifest_meta` records the `(size, mtime)` each manifest was built from and reads refuse any manifest whose source moved on. A missed invalidation therefore degrades to slow-but-correct rather than silently wrong, including for writers outside this crate (`leyline-ts`'s reproject re-inserts nodes with a fresh `mtime`).
 
-- **`leyline-cdc`** (`ley-line-open-9989d2`) — content-defined chunking over HuggingFace's `gearhash` with xet's boundary parameters, BLAKE3 chunk identity. Includes `rechunk`, which rescans only an edit's interval and is required to equal a full re-chunk bit-for-bit. At v0.10.2 release time this was not yet wired into the write path, so writes still re-chunked in full; the Unreleased incremental write path above supersedes that limitation.
+- **`leyline-cdc`** (`ley-line-open-9989d2`) — content-defined chunking over HuggingFace's `gearhash` with xet's boundary parameters, BLAKE3 chunk identity. Includes `rechunk`, which rescans only an edit's interval and is required to equal a full re-chunk bit-for-bit. The v0.10.2 write path uses it for localized edits and is pinned byte-for-byte against a full re-chunk oracle.
 
 - **Per-agent jj workspaces over one shared store** (`ley-line-open-99a9fe`) — `add_workspace` / `forget_workspace` / `workspace_names`, driven purely through `jj-lib` with no `jj` subprocess. `leyline-vcs` now enables jj-lib's `git` backend, which `default-features = false` had silently removed.
 

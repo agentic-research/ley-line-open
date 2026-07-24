@@ -8,7 +8,7 @@ Canonical architecture overview for ley-line-open (LLO). Companion to the [root 
 
 | Field | Value |
 |---|---|
-| LLO version | v0.10.2 + Unreleased |
+| LLO version | v0.10.3 |
 | Last verified | 2026-07-24 |
 | Source of truth files | `rs/ll-core/`, `rs/ll-open/`, `rs/ll-open/cli-lib/src/daemon/`, `docs/adr/*.md`, `docs/decades/*.md`, `CHANGELOG.md` |
 
@@ -174,9 +174,9 @@ ADRs 0017-0019 are cloister-side and live in `~/remotes/art/cloister/docs/adr/`.
 | `leyline` binary (default features) | `task build` (debug, headless) / `task release` (release, headless) / `task install` (release + codesign + install to `~/.local/bin`). Default features are `lsp` + `validate` + `hdc` + `cdc` — the structural-analysis core plus explicit CDC activation |
 | `leyline` binary (recommended for downstream consumers) | `task install:full` — `--features all` (adds `vec` + `text-search`). Portable — no libfuse-t/libfuse runtime dep |
 | `leyline` binary (everything including mount) | `task install:full+mount` — `--features full`. Requires libfuse-t (macOS `brew install fuse-t`) or libfuse (Linux `apt install libfuse-dev`) at runtime |
-| Distroless OCI image | `task image` — produces `ley-line-open:0.7.3` (~20 MB) via krust + cargo-zigbuild static musl; image default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0` |
-| FFI staticlibs + header | `task release:fs-static` / `task release:cas-ffi` — published as GitHub release artifacts (linux + darwin × amd64+arm64; macOS amd64 staticlib currently absent) |
-| Go schema client | `clients/go/leyline-schema` — nested Go module, tag-published as `clients/go/leyline-schema/v<version>` alongside the root release tag |
+| Distroless OCI image | `task image` — produces `ley-line-open:0.10.3` (~20 MB) via krust + cargo-zigbuild static musl; image default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0` |
+| FFI staticlibs + header | `task release:fs-static:target` — builds the mache-facing `leyline-fs` staticlib with explicit CDC support and publishes it as a verified GitHub release artifact (linux amd64/arm64 + darwin arm64; macOS amd64 staticlib currently absent) |
+| Go schema client | `clients/go/leyline-schema` — nested Go module, tag-published as `clients/go/leyline-schema/v<version>` only when the public schema changes; binary-only/private-storage releases keep advertising the latest schema tag |
 
 Release flow is on-tag-push: `task readme:version-check` gates README version-pin drift in CI (mirroring the `compat:check` + `gen:server-json:check` pattern). See [README.md § Build](../README.md#build) for the recommended install path per user type.
 

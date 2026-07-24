@@ -1,6 +1,6 @@
 [package]
 name = "leyline-cdc"
-version = "0.10.2"
+version = "0.10.3"
 edition = "2024"
 description = "Content-defined chunking (GearHash CDC, xet-compatible params) over the Σ substrate — chunk-level dedup for the mount storage path (bead ley-line-open-9989d2 / xet gleaning)"
 license = "AGPL-3.0-or-later"

@@ -22,8 +22,8 @@
 //! ```json
 //! {
 //!   "$schema_version": 1,
-//!   "binary_version": "0.4.5",
-//!   "schema_version": "0.4.5",
+//!   "binary_version": "0.10.3",
+//!   "schema_version": "0.10.2",
 //!   "wire_format_major": 1,
 //!   "compat_min_schema_version": "0.4.1",
 //!   "build_date": "unspecified"
@@ -56,8 +56,8 @@ struct CompatibilityDoc {
     /// equals `CARGO_PKG_VERSION` of `leyline-cli-lib` at build time).
     binary_version: &'static str,
 
-    /// Schema-client version this daemon targets. Today equals
-    /// `binary_version`; see `version::SCHEMA_VERSION`.
+    /// Independently released schema-client version this daemon targets;
+    /// see `version::SCHEMA_VERSION`.
     schema_version: &'static str,
 
     /// Current JSON wire envelope major. Bumps on incompatible

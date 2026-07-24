@@ -135,15 +135,18 @@ async fn version_op_returns_known_shape() {
         env!("CARGO_PKG_VERSION"),
         "binary_version must equal CARGO_PKG_VERSION at the consumer site",
     );
+    assert_eq!(bv, "0.10.3", "release metadata must pin the v0.10.3 binary");
 
-    // `schema_version` — same shape; today equals binary_version.
+    // `schema_version` is the independently versioned public schema contract.
+    // v0.10.3 changes only private CDC tables, so it must continue advertising
+    // the latest published schema module rather than following the binary.
     let sv = resp
         .get("schema_version")
         .and_then(|v| v.as_str())
         .expect("schema_version must be a string");
-    assert!(
-        !sv.is_empty(),
-        "schema_version must be non-empty; got {sv:?}",
+    assert_eq!(
+        sv, "0.10.2",
+        "private storage changes must not invent a new public schema release",
     );
 
     // `wire_format_major` — JSON number (UInt32, not stringified).

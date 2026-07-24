@@ -13,9 +13,9 @@ on:
 # binaries for the runtime, but cross-compiling macOS from Linux is a
 # notarization-adjacent rabbit hole we don't need here).
 #
-# Default features only (`lsp`). The `mount` (FUSE) feature is gated
-# off so the release binary doesn't depend on libfuse at the consumer
-# end — mache uses the daemon for MCP/UDS, not for FUSE mounting.
+# Default features (`lsp`, `validate`, `hdc`, `cdc`) are built. The `mount`
+# (FUSE) feature is gated off so the release binary doesn't depend on libfuse
+# at the consumer end — mache uses the daemon for MCP/UDS, not for mounting.
 #
 # Security posture:
 # - No third-party actions for release management (built-in `gh` CLI)
@@ -175,10 +175,10 @@ jobs:
       # ---- FFI staticlib (consumed by mache's release build) ----
       # mache links `libleyline_fs-<os>-<arch>.a` + `leyline_fs.h` to build
       # its NFS-backed binaries (mache-55d3e1 / ley-line-open-c33b9a). Built
-      # with leyline-fs default features (validate, fuse, nfs) to match what
-      # mache's cgo expects — mirrors private ley-line's `rs:release-lib`
-      # (`cargo build --release --lib -p leyline-fs`). Only the 3 platforms in
-      # mache's release matrix carry `lib_asset`; darwin-amd64 is skipped.
+      # with leyline-fs defaults (validate, fuse, nfs) plus explicit `cdc`, so
+      # mache's cgo reads use the same materialize-on-read path validated by
+      # this release. Only the 3 platforms in mache's release matrix carry
+      # `lib_asset`; darwin-amd64 is skipped.
       - name: Install FUSE deps (staticlib only)
         if: matrix.lib_asset
         run: |

@@ -101,8 +101,15 @@ leyline cdc enable --db /tmp/my-code.db
 
 Activation is explicit, bounded, resumable, and idempotent. It keeps
 `nodes.record` authoritative while building private derived chunk tables, so
-budget for both representations until follow-up garbage collection is
-available.
+budget for both representations. For a long-lived writable projection, inspect
+and collect unreachable chunk history explicitly:
+
+```bash
+leyline cdc gc --db /tmp/my-code.db --dry-run --json
+leyline cdc gc --db /tmp/my-code.db
+```
+
+The sweep is transactional and preserves chunks referenced by any manifest.
 
 ### Run the daemon
 

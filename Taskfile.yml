@@ -603,19 +603,20 @@ tasks:
   #     was an upper bound that `read_range` silently clamped (now removed).
   #   - `ORDER BY seq` in the range query was unverifiable dead weight (removed).
   #
-  # Scoped to the two files carrying falsifiable claims, not the workspace —
-  # a whole-workspace run is hours. Grow the --file list as more of the
-  # substrate gets this treatment.
+  # Scoped to the three modules carrying falsifiable claims, not the workspace
+  # — a whole-workspace run is hours. Each module gets its own task so local
+  # work can run the narrow gate; the path-filtered workflow runs all three.
   #
   # NOT in `task ci`: ~3 min warm, and it rebuilds per mutant so a cold run is
   # several times that. Runs in its own path-filtered workflow
   # (.github/workflows/mutants.yml) and on demand via `task mutants`.
   # --------------------------------------------------------------------------
   mutants:
-    desc: Mutation-test the CDC + chunked-content path (~3 min warm). Fails if any mutant survives.
+    desc: Mutation-test the CDC + chunked-content path. Fails if any mutant survives.
     cmds:
       - task: mutants:cdc
       - task: mutants:fs
+      - task: mutants:fs-gc
 
   mutants:fs:
     desc: Mutation-test leyline-fs::chunked (the SQL materialize-on-read path).
@@ -628,6 +629,15 @@ tasks:
         cargo mutants -p leyline-fs --test-workspace=false
         --no-default-features --features cdc,splice,validate
         -C --lib --file ll-open/fs/src/chunked.rs
+
+  mutants:fs-gc:
+    desc: Mutation-test transactional CDC reachability and accounting.
+    dir: rs
+    cmds:
+      - >-
+        cargo mutants -p leyline-fs --test-workspace=false
+        --no-default-features --features cdc,splice,validate
+        -C --lib --file ll-open/fs/src/gc.rs
 
   mutants:cdc:
     desc: Mutation-test leyline-cdc (chunking + range reads).

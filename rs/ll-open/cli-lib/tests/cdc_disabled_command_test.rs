@@ -21,4 +21,14 @@ async fn cdc_command_parses_and_returns_an_actionable_feature_error() {
         error.to_string(),
         "cdc enable requires the 'cdc' feature (compile with --features cdc)"
     );
+
+    let cli = TestCli::try_parse_from(["leyline", "cdc", "gc", "--db", "graph.db", "--dry-run"])
+        .expect("the GC command shape must remain discoverable without the feature");
+    let error = leyline_cli_lib::run(cli.command)
+        .await
+        .expect_err("a feature-disabled GC build must fail explicitly");
+    assert_eq!(
+        error.to_string(),
+        "cdc gc requires the 'cdc' feature (compile with --features cdc)"
+    );
 }

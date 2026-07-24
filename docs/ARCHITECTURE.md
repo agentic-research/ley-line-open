@@ -98,7 +98,10 @@ LLO's daemon runs a **living SQLite database in memory** with an **arena snapsho
 3. **Optional CDC activation**: `daemon --cdc` resumably builds private chunk
    manifests from authoritative readable `nodes.record` leaves before the
    first snapshot. Missing or stale manifests fall back to authoritative
-   records; no schema-client or wire contract changes.
+   records; no schema-client or wire contract changes. Long-lived writable
+   projections run explicit `leyline cdc gc` off the hot path; one IMMEDIATE
+   transaction deletes only chunk rows unreachable from every manifest and
+   reports rows and bytes before, unreachable, deleted, and remaining.
 4. **Snapshot**: serialize current db state → arena buffer → BLAKE3-hash → advance `current_root` on the controller's generation counter.
 5. **Readers**: mmap the arena via `SqliteGraph` (zero-copy via `sqlite3_deserialize`); detect generation change → hot-swap to new buffer.
 

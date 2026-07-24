@@ -12,6 +12,18 @@ context, scoping notes, and review history are recoverable.
 
 ### Added
 
+- **Transactional CDC reachability GC** (`ley-line-open-035363`) — `leyline
+  cdc gc --db <projection.db>` now accounts for and deletes chunk rows that no
+  committed manifest references. The reachability decision, deletion, and
+  final accounting share one IMMEDIATE transaction; shared chunks survive
+  until their final manifest disappears, failed sweeps roll back, repeated
+  sweeps are idempotent, and `--dry-run --json` exposes deterministic rows and
+  bytes without mutation. This operates only on private `content_*` indexes;
+  existing projections receive a private manifest-hash index so reachability
+  stays linearithmic instead of quadratic. Byte totals are deduplicated payload
+  accounting, not SQLite file shrinkage. There is no `leyline-schema`, wire,
+  `SCHEMA_VERSION`, or compatibility bump.
+
 - **Production CDC activation** (`ley-line-open-f16e53`) — `leyline cdc
   enable --db <projection.db>` now creates and resumably backfills the derived
   chunk tables from authoritative readable `nodes.record` leaves. `leyline

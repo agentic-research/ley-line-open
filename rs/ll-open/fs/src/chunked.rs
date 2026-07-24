@@ -55,13 +55,10 @@
 //!   crate's `lib.rs`), not from a per-chunk check here. Adding one is cheap
 //!   (BLAKE3 is ~10x faster than the SQLite read it would follow) if a threat
 //!   model ever wants defense in depth below the arena root.
-//! - **No garbage collection.** Nothing deletes from `content_chunks`. Storing
-//!   a node repeatedly retains every chunk any version ever had — content
-//!   addressing means re-storing identical data is free, but genuinely changed
-//!   regions accumulate. Fine for a write-once projection; a reachability
-//!   sweep (`DELETE FROM content_chunks WHERE chunk_hash NOT IN (SELECT
-//!   chunk_hash FROM content_manifest)`) is needed before this backs a
-//!   long-lived mount write path.
+//! - **Garbage collection is explicit.** Invalidating a manifest deliberately
+//!   leaves chunk bytes available for immediate reuse. Long-lived projections
+//!   bound that history with [`crate::gc::collect_unreachable_chunks`], an
+//!   off-hot-path transactional sweep over chunks no manifest references.
 //! - **The manifest is a derived index, not the source of truth.**
 //!   `nodes.record` remains authoritative — it is the cross-runtime contract
 //!   (`leyline-schema`: "mache writes it, leyline-fs reads it"). The manifest
@@ -99,6 +96,11 @@ CREATE TABLE IF NOT EXISTS content_manifest (
 -- The index that makes a range read a WHERE clause rather than a full scan.
 CREATE INDEX IF NOT EXISTS content_manifest_span
     ON content_manifest(node_id, byte_offset);
+
+-- The index that makes reachability GC one lookup per distinct chunk instead
+-- of a full manifest scan per chunk.
+CREATE INDEX IF NOT EXISTS content_manifest_chunk_hash
+    ON content_manifest(chunk_hash);
 
 -- Freshness witness: the (size, mtime) of the `nodes` row this manifest was
 -- built from. A read compares it against the row's CURRENT values, so a

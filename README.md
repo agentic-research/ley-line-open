@@ -169,6 +169,18 @@ indexes: stale or absent manifests fall back to the authoritative record, and
 activation rebuilds them. Expect temporary storage amplification while both
 representations coexist.
 
+Long-lived writable projections can inspect and collect chunk history
+explicitly:
+
+```bash
+leyline cdc gc --db /tmp/my-code.db --dry-run --json
+leyline cdc gc --db /tmp/my-code.db
+```
+
+GC is off the write path and transactional. It deletes only chunks that no
+committed manifest references, so shared chunks remain until their final
+manifest disappears.
+
 ### Prereqs
 
 **Build-time (all install paths):**

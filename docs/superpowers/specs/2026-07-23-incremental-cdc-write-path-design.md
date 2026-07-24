@@ -86,7 +86,10 @@ proven primitive.
 
 - ordered `leyline_cdc::Chunk` entries;
 - the witnessed old source length;
-- the witnessed old source mtime.
+
+The capture query verifies the witnessed source mtime against the live row but
+does not retain it after validation; incremental rechunking only consumes the
+old chunks and source length.
 
 The capture function returns a snapshot only when:
 

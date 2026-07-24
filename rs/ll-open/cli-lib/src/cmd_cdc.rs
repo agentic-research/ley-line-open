@@ -21,8 +21,9 @@ pub fn enable_database_with_progress<F>(
 where
     F: FnMut(ActivationProgress),
 {
-    let conn = rusqlite::Connection::open(db)
-        .with_context(|| format!("open CDC database {}", db.display()))?;
+    let conn =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .with_context(|| format!("open CDC database {}", db.display()))?;
     activate_chunked_content_with_progress(&conn, options, on_progress)
         .with_context(|| format!("activate CDC in {}", db.display()))
 }

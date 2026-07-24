@@ -67,6 +67,22 @@ fn cdc_enable_rejects_a_non_projection_database() {
 }
 
 #[test]
+fn cdc_enable_does_not_create_a_misspelled_database_path() {
+    let temp = TempDir::new().unwrap();
+    let missing = temp.path().join("misspelled.db");
+    let error = leyline_cli_lib::cmd_cdc::enable_database(&missing, ActivationOptions::default())
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("open CDC database"),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        !missing.exists(),
+        "activating an existing projection must not create a typo path"
+    );
+}
+
+#[test]
 fn cdc_enable_cli_parses_nested_command_and_options() {
     let cli = TestCli::try_parse_from([
         "leyline",

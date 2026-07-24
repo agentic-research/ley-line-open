@@ -588,6 +588,7 @@ tasks:
     dir: rs
     cmds:
       - cargo test -p leyline-cli-lib --no-default-features --features cdc --test cdc_command_test --test cdc_activation_consumer_test
+      - cargo test -p leyline-cli-lib --no-default-features --test cdc_disabled_command_test
 
   # --------------------------------------------------------------------------
   # Mutation testing — the gate that checks the TESTS, not the code.

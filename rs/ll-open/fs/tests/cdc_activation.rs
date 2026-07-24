@@ -4,6 +4,7 @@ use leyline_fs::activation::{
     ActivationOptions, activate_chunked_content, activate_chunked_content_with_progress,
 };
 use rusqlite::{Connection, params};
+use tempfile::TempDir;
 
 fn projection() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
@@ -216,4 +217,88 @@ fn activation_reports_bounded_deterministic_progress() {
     assert_eq!(last.populated_nodes, report.populated_nodes);
     assert_eq!(last.already_fresh_nodes, report.already_fresh_nodes);
     assert_eq!(last.processed_source_bytes, report.processed_source_bytes);
+}
+
+#[test]
+fn activation_keyset_paging_does_not_skip_after_an_earlier_row_is_deleted() {
+    let conn = projection();
+    let mut pages = 0;
+    let report =
+        activate_chunked_content_with_progress(&conn, ActivationOptions { batch_size: 1 }, |_| {
+            pages += 1;
+            if pages == 1 {
+                conn.execute("DELETE FROM nodes WHERE id = 'a.rs'", [])
+                    .unwrap();
+            }
+        })
+        .unwrap();
+
+    assert_eq!(pages, 2);
+    assert_eq!(report.eligible_nodes, 1);
+    assert_eq!(report.populated_nodes, 2);
+    assert!(
+        leyline_fs::chunked::has_chunked_content(&conn, "empty.rs").unwrap(),
+        "removing a processed row must not shift the next row behind an OFFSET"
+    );
+}
+
+#[test]
+fn stale_caller_bytes_cannot_be_paired_with_a_new_authoritative_witness() {
+    let temp = TempDir::new().unwrap();
+    let db = temp.path().join("projection.db");
+    let reader = Connection::open(&db).unwrap();
+    reader
+        .execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE nodes (
+                id TEXT PRIMARY KEY,
+                kind INTEGER NOT NULL,
+                size INTEGER NOT NULL,
+                mtime INTEGER NOT NULL,
+                record TEXT
+             );
+             INSERT INTO nodes VALUES ('a.rs', 0, 10, 7, 'fn a() {}\n');",
+        )
+        .unwrap();
+    leyline_fs::chunked::create_chunked_content_schema(&reader).unwrap();
+    let old_bytes: Vec<u8> = reader
+        .query_row(
+            "SELECT CAST(record AS BLOB) FROM nodes WHERE id = 'a.rs'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    leyline_fs::chunked::store_content_chunked(&reader, "a.rs", &old_bytes).unwrap();
+
+    let writer = Connection::open(&db).unwrap();
+    writer
+        .execute(
+            "UPDATE nodes
+                SET record = 'fn b() {}\n', mtime = 8
+              WHERE id = 'a.rs'",
+            [],
+        )
+        .unwrap();
+
+    let error = leyline_fs::chunked::store_content_chunked(&reader, "a.rs", &old_bytes)
+        .expect_err("stale caller bytes must not receive the new row witness");
+    assert!(
+        format!("{error:#}").contains("authoritative node changed"),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        !leyline_fs::chunked::has_chunked_content(&reader, "a.rs").unwrap(),
+        "a rejected stale store must never look fresh"
+    );
+    let preserved_witness: i64 = reader
+        .query_row(
+            "SELECT source_mtime FROM content_manifest_meta WHERE node_id = 'a.rs'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        preserved_witness, 7,
+        "rejection must roll back and preserve the prior manifest generation"
+    );
 }

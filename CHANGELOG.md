@@ -17,11 +17,13 @@ context, scoping notes, and review history are recoverable.
   chunk tables from authoritative readable `nodes.record` leaves. `leyline
   daemon --cdc` performs the same activation before publishing its first arena
   snapshot. Activation is deterministic, bounded by `--batch-size`, reports
-  progress, commits per node for safe resume, validates freshness and source
-  size witnesses, and is idempotent. A consumer gate parses a deterministic
-  1 MiB fixture, activates CDC, auto-grows and publishes the arena, reopens it
-  through the verified reader, and requires a 4 KiB interior read to be
-  byte-for-byte equal while touching at most two chunks. `nodes.record`
+  progress, reads and commits each node under an IMMEDIATE transaction for
+  safe concurrent-writer exclusion and resume, validates freshness and source
+  size witnesses, and is idempotent. Keyset pagination keeps the scan linear
+  and stable across deletion of earlier rows. A consumer gate parses a
+  deterministic 1 MiB fixture, activates CDC, auto-grows and publishes the
+  arena, reopens it through the verified reader, and requires a 4 KiB interior
+  read to be byte-for-byte equal while touching at most two chunks. `nodes.record`
   remains authoritative; `content_chunks`, `content_manifest`, and
   `content_manifest_meta` remain rebuildable private derived tables. No
   `leyline-schema`, Cap'n Proto wire, `SCHEMA_VERSION`, or compatibility

@@ -5,11 +5,13 @@
 //! point for library, CLI, and daemon consumers.
 
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use std::collections::BTreeSet;
 
-use crate::chunked::{create_chunked_content_schema, has_chunked_content, store_content_chunked};
+use crate::chunked::{
+    create_chunked_content_schema, has_chunked_content, store_content_chunked_in_transaction,
+};
 
 /// Controls bounded activation work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,7 +90,7 @@ where
     validate_nodes_contract(conn)?;
     create_chunked_content_schema(conn)?;
 
-    let eligible_nodes = query_count(
+    let estimated_eligible_nodes = query_count(
         conn,
         "SELECT COUNT(*) FROM nodes WHERE kind = 0 AND record IS NOT NULL",
         "count eligible CDC nodes",
@@ -97,34 +99,22 @@ where
     let mut populated_nodes = 0_u64;
     let mut already_fresh_nodes = 0_u64;
     let mut processed_source_bytes = 0_u64;
-    let mut offset = 0_u64;
+    let mut visited_nodes = 0_u64;
+    let mut last_id = String::new();
 
     loop {
         let rows = {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, CAST(record AS BLOB), size
+                    "SELECT id
                        FROM nodes
-                      WHERE kind = 0 AND record IS NOT NULL
+                      WHERE kind = 0 AND record IS NOT NULL AND id > ?1
                       ORDER BY id
-                      LIMIT ?1 OFFSET ?2",
+                      LIMIT ?2",
                 )
                 .context("prepare CDC activation page")?;
             let mapped = stmt
-                .query_map(
-                    params![
-                        batch_size,
-                        i64::try_from(offset)
-                            .context("CDC activation offset exceeds SQLite i64")?,
-                    ],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, Vec<u8>>(1)?,
-                            row.get::<_, i64>(2)?,
-                        ))
-                    },
-                )
+                .query_map(params![last_id, batch_size], |row| row.get::<_, String>(0))
                 .context("query CDC activation page")?;
             mapped
                 .collect::<rusqlite::Result<Vec<_>>>()
@@ -134,37 +124,32 @@ where
         if rows.is_empty() {
             break;
         }
-        offset = offset
+        last_id.clone_from(rows.last().context("nonempty CDC page has no final id")?);
+        visited_nodes = visited_nodes
             .checked_add(u64::try_from(rows.len()).context("CDC page length exceeds u64")?)
-            .context("CDC activation offset overflow")?;
+            .context("CDC activation visited-node count overflow")?;
 
-        for (node_id, data, declared_size) in rows {
-            ensure!(
-                declared_size >= 0
-                    && u64::try_from(declared_size).ok() == u64::try_from(data.len()).ok(),
-                "node {node_id} size {declared_size} does not match {} record bytes",
-                data.len()
-            );
-            if has_chunked_content(conn, &node_id)
-                .with_context(|| format!("check CDC freshness for node {node_id}"))?
-            {
-                already_fresh_nodes = already_fresh_nodes
-                    .checked_add(1)
-                    .context("already-fresh CDC node count overflow")?;
-                continue;
+        for node_id in rows {
+            match activate_node(conn, &node_id)? {
+                NodeActivation::Gone => {}
+                NodeActivation::AlreadyFresh => {
+                    already_fresh_nodes = already_fresh_nodes
+                        .checked_add(1)
+                        .context("already-fresh CDC node count overflow")?;
+                }
+                NodeActivation::Populated { source_bytes } => {
+                    populated_nodes = populated_nodes
+                        .checked_add(1)
+                        .context("populated CDC node count overflow")?;
+                    processed_source_bytes = processed_source_bytes
+                        .checked_add(source_bytes)
+                        .context("processed CDC byte count overflow")?;
+                }
             }
-            store_content_chunked(conn, &node_id, &data)
-                .with_context(|| format!("activate CDC for node {node_id}"))?;
-            populated_nodes = populated_nodes
-                .checked_add(1)
-                .context("populated CDC node count overflow")?;
-            processed_source_bytes = processed_source_bytes
-                .checked_add(u64::try_from(data.len()).context("node length exceeds u64")?)
-                .context("processed CDC byte count overflow")?;
         }
         on_progress(ActivationProgress {
-            visited_nodes: offset,
-            eligible_nodes,
+            visited_nodes,
+            eligible_nodes: estimated_eligible_nodes,
             populated_nodes,
             already_fresh_nodes,
             processed_source_bytes,
@@ -172,7 +157,11 @@ where
     }
 
     Ok(ActivationReport {
-        eligible_nodes,
+        eligible_nodes: query_count(
+            conn,
+            "SELECT COUNT(*) FROM nodes WHERE kind = 0 AND record IS NOT NULL",
+            "count final eligible CDC nodes",
+        )?,
         populated_nodes,
         already_fresh_nodes,
         processed_source_bytes,
@@ -191,6 +180,51 @@ where
             "SELECT COALESCE(SUM(length(chunk_bytes)), 0) FROM content_chunks",
             "sum unique CDC chunk bytes",
         )?,
+    })
+}
+
+enum NodeActivation {
+    Gone,
+    AlreadyFresh,
+    Populated { source_bytes: u64 },
+}
+
+fn activate_node(conn: &Connection, node_id: &str) -> Result<NodeActivation> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .with_context(|| format!("begin CDC activation transaction for node {node_id}"))?;
+    let source: Option<(Vec<u8>, i64)> = tx
+        .query_row(
+            "SELECT CAST(record AS BLOB), size
+               FROM nodes
+              WHERE id = ?1 AND kind = 0 AND record IS NOT NULL",
+            params![node_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .with_context(|| format!("read authoritative CDC source for node {node_id}"))?;
+    let Some((data, declared_size)) = source else {
+        tx.commit()
+            .with_context(|| format!("commit skipped CDC activation for node {node_id}"))?;
+        return Ok(NodeActivation::Gone);
+    };
+    ensure!(
+        declared_size >= 0 && u64::try_from(declared_size).ok() == u64::try_from(data.len()).ok(),
+        "node {node_id} size {declared_size} does not match {} record bytes",
+        data.len()
+    );
+    if has_chunked_content(&tx, node_id)
+        .with_context(|| format!("check CDC freshness for node {node_id}"))?
+    {
+        tx.commit()
+            .with_context(|| format!("commit fresh CDC activation for node {node_id}"))?;
+        return Ok(NodeActivation::AlreadyFresh);
+    }
+    store_content_chunked_in_transaction(&tx, node_id, &data)
+        .with_context(|| format!("activate CDC for node {node_id}"))?;
+    tx.commit()
+        .with_context(|| format!("commit CDC activation for node {node_id}"))?;
+    Ok(NodeActivation::Populated {
+        source_bytes: u64::try_from(data.len()).context("node length exceeds u64")?,
     })
 }
 

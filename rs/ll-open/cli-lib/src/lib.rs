@@ -29,7 +29,6 @@ use clap::Subcommand;
 pub const EDITION: &str = "open";
 
 /// CDC storage-administration subcommands.
-#[cfg(feature = "cdc")]
 #[derive(Debug, Subcommand)]
 pub enum CdcCommands {
     /// Populate or resume the private chunk-backed content index.
@@ -78,7 +77,6 @@ pub enum Commands {
     },
 
     /// Administer content-defined chunk storage.
-    #[cfg(feature = "cdc")]
     Cdc {
         #[command(subcommand)]
         command: CdcCommands,
@@ -214,15 +212,22 @@ pub async fn run(cmd: Commands) -> Result<()> {
             query,
         } => cmd_inspect::cmd_inspect(&id, &arena, control_path.as_deref(), query.as_deref()),
         Commands::Load { db, control } => cmd_load::cmd_load(&db, &control),
-        #[cfg(feature = "cdc")]
-        Commands::Cdc {
-            command:
-                CdcCommands::Enable {
+        Commands::Cdc { command } => {
+            #[cfg(feature = "cdc")]
+            {
+                let CdcCommands::Enable {
                     db,
                     batch_size,
                     json,
-                },
-        } => cmd_cdc::cmd_cdc_enable(&db, batch_size, json),
+                } = command;
+                cmd_cdc::cmd_cdc_enable(&db, batch_size, json)
+            }
+            #[cfg(not(feature = "cdc"))]
+            {
+                let _ = command;
+                anyhow::bail!("cdc enable requires the 'cdc' feature (compile with --features cdc)")
+            }
+        }
         Commands::Splice { db, node, text } => cmd_splice::cmd_splice(&db, &node, &text),
         #[cfg(feature = "lsp")]
         Commands::Lsp {

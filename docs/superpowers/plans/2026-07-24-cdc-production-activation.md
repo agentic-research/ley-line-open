@@ -165,14 +165,16 @@ pub fn activate_chunked_content(
 ```
 
 Validate `batch_size > 0` and validate the required `nodes` columns through
-`pragma_table_info('nodes')`. Create the CDC schema, select
-`id, CAST(record AS BLOB)` for `kind = 0 AND record IS NOT NULL ORDER BY id`,
-and process rows in `LIMIT ? OFFSET ?` pages. These rows are readable
-structural leaves, not necessarily source-file roots. Before storing a row,
-call `has_chunked_content`; a fresh row increments `already_fresh_nodes`,
-otherwise call `store_content_chunked` and increment populated/processed
-counts with checked arithmetic. Finish by counting manifest rows, unique
-chunks, and `SUM(length(chunk_bytes))`.
+`pragma_table_info('nodes')`. Create the CDC schema, select ordered eligible
+ids in `WHERE id > ? ORDER BY id LIMIT ?` keyset pages, then acquire an
+IMMEDIATE per-node transaction and read `record`, `size`, and freshness state
+inside it. These rows are readable structural leaves, not necessarily
+source-file roots. A fresh row increments `already_fresh_nodes`; otherwise
+store the transaction-owned authoritative bytes and increment
+populated/processed counts with checked arithmetic. The lower-level store must
+reject caller bytes that differ from a present authoritative `nodes.record`,
+so no stale bytes can receive a newer witness. Finish by counting manifest
+rows, unique chunks, and `SUM(length(chunk_bytes))`.
 
 Adjust `has_chunked_content` so a fresh zero-length witness is sufficient when
 `nodes.size = 0`; non-empty files still require manifest spans:

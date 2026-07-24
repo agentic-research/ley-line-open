@@ -121,6 +121,12 @@ Directory-like nodes are never chunked.
 Each node transition is atomic. A crash may leave earlier nodes committed and
 later nodes untouched, but never a partial manifest for one node. Re-running
 activation skips every fresh committed node and continues deterministically.
+Each transition acquires an IMMEDIATE transaction, reads the authoritative
+`record` and its freshness witness inside that transaction, then writes the
+manifest before commit. Caller-supplied stale bytes are rejected rather than
+paired with a newer `(size, mtime)` witness. Keyset pagination by `nodes.id`
+keeps page cost linear and prevents a deleted earlier row from shifting an
+unprocessed row behind an `OFFSET`.
 
 The whole database is not wrapped in one transaction because that would make a
 large activation non-resumable and could retain a long-running WAL transaction.
@@ -141,8 +147,11 @@ the next `--cdc` start and leaves the previously published arena root intact.
 `leyline cdc enable --db <path>`:
 
 - Opens the database read/write.
+- Does not create a missing path; a typo fails at open.
 - Refuses a database without the `nodes` table and names the expected
   projection contract.
+- Remains discoverable in feature-disabled builds and reports the exact
+  compile feature required.
 - Emits bounded progress to stderr.
 - Prints one stable human-readable summary on success.
 - Supports `--json` for machine-readable `ActivationReport` output.
@@ -180,6 +189,8 @@ a present consumer.
 - SQLite errors retain node context.
 - A stale manifest is rebuilt from authoritative `record`; it is never served
   or counted as complete.
+- A concurrent writer cannot pair pre-update bytes with a post-update
+  freshness witness.
 - Per-node transaction failure rolls back that node and preserves previously
   committed nodes.
 - Arena capacity is not estimated in the activation layer. The daemon's

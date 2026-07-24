@@ -72,8 +72,8 @@
 //!   leaving a manifest in place would serve stale bytes — that is the
 //!   invariant to preserve when adding write paths.
 
-use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use anyhow::{Context, Result, ensure};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Chunk store + per-node manifest. Mirrors the `source_blobs` shape so
@@ -169,6 +169,32 @@ fn store_content_manifest(
     let tx = conn
         .unchecked_transaction()
         .context("begin chunked store transaction")?;
+    store_content_manifest_in_transaction(&tx, node_id, data, chunks)?;
+    tx.commit().context("commit chunked store")?;
+    Ok(chunks.len())
+}
+
+/// Store authoritative bytes inside a transaction owned by the caller.
+///
+/// This is crate-private so activation can acquire an IMMEDIATE transaction,
+/// read `nodes.record`, and write its manifest without a time-of-check/time-of-
+/// use gap. The transaction is not committed here.
+pub(crate) fn store_content_chunked_in_transaction(
+    tx: &Transaction<'_>,
+    node_id: &str,
+    data: &[u8],
+) -> Result<usize> {
+    let chunks = leyline_cdc::chunk(data);
+    store_content_manifest_in_transaction(tx, node_id, data, &chunks)?;
+    Ok(chunks.len())
+}
+
+fn store_content_manifest_in_transaction(
+    tx: &Transaction<'_>,
+    node_id: &str,
+    data: &[u8],
+    chunks: &[leyline_cdc::Chunk],
+) -> Result<()> {
     tx.execute(
         "DELETE FROM content_manifest WHERE node_id = ?1",
         params![node_id],
@@ -227,30 +253,36 @@ fn store_content_manifest(
         .optional()
         .context("probe for nodes table")?
         .unwrap_or(false);
-    let node_meta: Option<(i64, i64)> = if nodes_table {
+    let node_meta: Option<(Vec<u8>, i64, i64)> = if nodes_table {
         tx.query_row(
-            "SELECT size, mtime FROM nodes WHERE id = ?1",
+            "SELECT CAST(record AS BLOB), size, mtime FROM nodes WHERE id = ?1",
             params![node_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()
         .context("read node freshness witness")?
     } else {
         None
     };
+    if let Some((record, source_len, _)) = &node_meta {
+        ensure!(
+            *source_len >= 0
+                && usize::try_from(*source_len).ok() == Some(data.len())
+                && record == data,
+            "authoritative node changed before chunk store for {node_id}"
+        );
+    }
     tx.execute(
         "INSERT OR REPLACE INTO content_manifest_meta (node_id, source_len, source_mtime) \
          VALUES (?1, ?2, ?3)",
         params![
             node_id,
             data.len() as i64,
-            node_meta.map(|(_, mtime)| mtime)
+            node_meta.map(|(_, _, mtime)| mtime)
         ],
     )
     .context("record manifest freshness witness")?;
-
-    tx.commit().context("commit chunked store")?;
-    Ok(chunks.len())
+    Ok(())
 }
 
 /// The overlap predicate, defined once. `?1` = node id, `?2` = range end,

@@ -5,7 +5,7 @@ edition = "2024"
 license = "AGPL-3.0-or-later"
 
 [features]
-default = ["lsp", "validate", "hdc"]
+default = ["lsp", "validate", "hdc", "cdc"]
 lsp = ["dep:leyline-lsp"]
 # Tree-sitter syntactic validation surface exposed as a daemon op for
 # mache's writeback path (ley-line-open-fa8638). Pulls leyline-fs's
@@ -26,6 +26,10 @@ hdc = ["dep:leyline-hdc", "leyline-ts/rust"]
 # The text-search crate's own `engine-witchcraft` feature is opt-in at
 # the extension level, not pulled by this base feature.
 text-search = ["dep:leyline-text-search"]
+# Explicit production activation for the private chunk-backed content index.
+# Pure Rust and runtime opt-in, so the command is present in ordinary builds
+# without changing any database merely by opening it.
+cdc = ["leyline-fs/cdc"]
 
 [dependencies]
 parking_lot = { workspace = true }

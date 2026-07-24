@@ -10,6 +10,27 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Added
+
+- **Production CDC activation** (`ley-line-open-f16e53`) — `leyline cdc
+  enable --db <projection.db>` now creates and resumably backfills the derived
+  chunk tables from authoritative readable `nodes.record` leaves. `leyline
+  daemon --cdc` performs the same activation before publishing its first arena
+  snapshot. Activation is deterministic, bounded by `--batch-size`, reports
+  progress, reads and commits each node under an IMMEDIATE transaction for
+  safe concurrent-writer exclusion and resume, validates freshness and source
+  size witnesses, and is idempotent. Keyset pagination keeps the scan linear
+  and stable across deletion of earlier rows. A final writer-excluding
+  freshness check repairs a concurrent insert or update that appeared behind
+  the cursor, then repeats its bounded scan. A consumer gate parses a
+  deterministic 1 MiB fixture, activates CDC, auto-grows and publishes the
+  arena, reopens it through the verified reader, and requires a 4 KiB interior
+  read to be byte-for-byte equal while touching at most two chunks.
+  `nodes.record` remains authoritative; `content_chunks`, `content_manifest`,
+  and `content_manifest_meta` remain rebuildable private derived tables. No
+  `leyline-schema`, Cap'n Proto wire, `SCHEMA_VERSION`, or compatibility
+  version change.
+
 ### Changed
 
 - **Incremental CDC writes** (`ley-line-open-bd8d33`) — chunk-backed graph
@@ -41,7 +62,7 @@ This is the release mache and rosary were both blocked on — `leyline-cdc` and 
 
   `nodes.record` remains authoritative — it is the cross-runtime contract mache also writes — and the manifest is a derived index. Because a stale manifest would serve wrong bytes, `content_manifest_meta` records the `(size, mtime)` each manifest was built from and reads refuse any manifest whose source moved on. A missed invalidation therefore degrades to slow-but-correct rather than silently wrong, including for writers outside this crate (`leyline-ts`'s reproject re-inserts nodes with a fresh `mtime`).
 
-- **`leyline-cdc`** (`ley-line-open-9989d2`) — content-defined chunking over HuggingFace's `gearhash` with xet's boundary parameters, BLAKE3 chunk identity. Includes `rechunk`, which rescans only an edit's interval and is required to equal a full re-chunk bit-for-bit. Not yet wired into the write path; writes still re-chunk in full.
+- **`leyline-cdc`** (`ley-line-open-9989d2`) — content-defined chunking over HuggingFace's `gearhash` with xet's boundary parameters, BLAKE3 chunk identity. Includes `rechunk`, which rescans only an edit's interval and is required to equal a full re-chunk bit-for-bit. At v0.10.2 release time this was not yet wired into the write path, so writes still re-chunked in full; the Unreleased incremental write path above supersedes that limitation.
 
 - **Per-agent jj workspaces over one shared store** (`ley-line-open-99a9fe`) — `add_workspace` / `forget_workspace` / `workspace_names`, driven purely through `jj-lib` with no `jj` subprocess. `leyline-vcs` now enables jj-lib's `git` backend, which `default-features = false` had silently removed.
 

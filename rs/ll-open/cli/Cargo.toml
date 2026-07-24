@@ -13,13 +13,14 @@ path = "src/main.rs"
 # with no system-dep cost, and cli-lib treats them as always-available.
 # `mount` (libfuse-t/libfuse system dep) and `vec` (fastembed + ONNX
 # download at first use) stay opt-in to keep the default build portable.
-default = ["lsp", "validate", "hdc"]
+default = ["lsp", "validate", "hdc", "cdc"]
 lsp = ["leyline-cli-lib/lsp"]
 mount = ["leyline-cli-lib/mount"]
 vec = ["leyline-cli-lib/vec"]
 validate = ["leyline-cli-lib/validate"]
 hdc = ["leyline-cli-lib/hdc"]
 text-search = ["leyline-cli-lib/text-search"]
+cdc = ["leyline-cli-lib/cdc"]
 # Meta-feature — everything the CLI can expose EXCEPT mount. Use for
 # `task install:full` or `cargo build -p leyline-cli --features all`
 # when you want the full daemon-op surface WITHOUT the libfuse-t / libfuse
@@ -31,9 +32,9 @@ text-search = ["leyline-cli-lib/text-search"]
 #   cargo build -p leyline-cli --features full
 # or `task install:full+mount` — but you MUST have libfuse-t (macOS
 # `brew install fuse-t`) or libfuse-dev (Linux) available at runtime.
-all = ["lsp", "vec", "validate", "hdc", "text-search"]
+all = ["lsp", "vec", "validate", "hdc", "text-search", "cdc"]
 # Everything, including mount. Runtime-requires libfuse-t / libfuse.
-full = ["lsp", "mount", "vec", "validate", "hdc", "text-search"]
+full = ["lsp", "mount", "vec", "validate", "hdc", "text-search", "cdc"]
 
 [dependencies]
 leyline-cli-lib = { path = "../cli-lib", default-features = false }

@@ -72,8 +72,8 @@
 //!   leaving a manifest in place would serve stale bytes — that is the
 //!   invariant to preserve when adding write paths.
 
-use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use anyhow::{Context, Result, ensure};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Chunk store + per-node manifest. Mirrors the `source_blobs` shape so
@@ -169,6 +169,32 @@ fn store_content_manifest(
     let tx = conn
         .unchecked_transaction()
         .context("begin chunked store transaction")?;
+    store_content_manifest_in_transaction(&tx, node_id, data, chunks)?;
+    tx.commit().context("commit chunked store")?;
+    Ok(chunks.len())
+}
+
+/// Store authoritative bytes inside a transaction owned by the caller.
+///
+/// This is crate-private so activation can acquire an IMMEDIATE transaction,
+/// read `nodes.record`, and write its manifest without a time-of-check/time-of-
+/// use gap. The transaction is not committed here.
+pub(crate) fn store_content_chunked_in_transaction(
+    tx: &Transaction<'_>,
+    node_id: &str,
+    data: &[u8],
+) -> Result<usize> {
+    let chunks = leyline_cdc::chunk(data);
+    store_content_manifest_in_transaction(tx, node_id, data, &chunks)?;
+    Ok(chunks.len())
+}
+
+fn store_content_manifest_in_transaction(
+    tx: &Transaction<'_>,
+    node_id: &str,
+    data: &[u8],
+    chunks: &[leyline_cdc::Chunk],
+) -> Result<()> {
     tx.execute(
         "DELETE FROM content_manifest WHERE node_id = ?1",
         params![node_id],
@@ -227,30 +253,36 @@ fn store_content_manifest(
         .optional()
         .context("probe for nodes table")?
         .unwrap_or(false);
-    let node_meta: Option<(i64, i64)> = if nodes_table {
+    let node_meta: Option<(Vec<u8>, i64, i64)> = if nodes_table {
         tx.query_row(
-            "SELECT size, mtime FROM nodes WHERE id = ?1",
+            "SELECT CAST(record AS BLOB), size, mtime FROM nodes WHERE id = ?1",
             params![node_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()
         .context("read node freshness witness")?
     } else {
         None
     };
+    if let Some((record, source_len, _)) = &node_meta {
+        ensure!(
+            *source_len >= 0
+                && usize::try_from(*source_len).ok() == Some(data.len())
+                && record == data,
+            "authoritative node changed before chunk store for {node_id}"
+        );
+    }
     tx.execute(
         "INSERT OR REPLACE INTO content_manifest_meta (node_id, source_len, source_mtime) \
          VALUES (?1, ?2, ?3)",
         params![
             node_id,
             data.len() as i64,
-            node_meta.map(|(_, mtime)| mtime)
+            node_meta.map(|(_, _, mtime)| mtime)
         ],
     )
     .context("record manifest freshness witness")?;
-
-    tx.commit().context("commit chunked store")?;
-    Ok(chunks.len())
+    Ok(())
 }
 
 /// The overlap predicate, defined once. `?1` = node id, `?2` = range end,
@@ -646,19 +678,22 @@ pub fn has_chunked_content(conn: &Connection, node_id: &str) -> Result<bool> {
 
     // One query: manifest witness joined to the live node row. Any missing
     // side (no manifest, no node) yields no row, hence `false`.
-    let fresh: Option<bool> = conn
+    let fresh: Option<(bool, i64)> = conn
         .query_row(
-            "SELECT m.source_len = n.size AND m.source_mtime IS n.mtime \
+            "SELECT m.source_len = n.size AND m.source_mtime IS n.mtime, n.size \
                FROM content_manifest_meta m JOIN nodes n ON n.id = m.node_id \
               WHERE m.node_id = ?1",
             params![node_id],
-            |r| r.get::<_, i64>(0).map(|v| v != 0),
+            |r| Ok((r.get::<_, i64>(0)? != 0, r.get(1)?)),
         )
         .optional()
         .context("check manifest freshness")?;
-    let Some(true) = fresh else {
+    let Some((true, live_size)) = fresh else {
         return Ok(false);
     };
+    if live_size == 0 {
+        return Ok(true);
+    }
 
     // Witness matches; confirm the manifest actually has spans.
     let has_rows: bool = conn
@@ -808,6 +843,66 @@ mod tests {
         let c = Connection::open_in_memory().unwrap();
         create_chunked_content_schema(&c).unwrap();
         c
+    }
+
+    #[test]
+    fn transaction_owned_store_writes_the_manifest_and_reports_chunk_count() {
+        let conn = db();
+        let data = prng(0x5eed, MAX_CHUNK * 3);
+        let expected_chunks = leyline_cdc::chunk(&data).len();
+        assert!(expected_chunks > 1, "fixture must distinguish Ok(0)/Ok(1)");
+
+        let tx =
+            Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate).unwrap();
+        let stored = store_content_chunked_in_transaction(&tx, "large.bin", &data).unwrap();
+
+        assert_eq!(stored, expected_chunks);
+        let manifest_rows: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM content_manifest WHERE node_id = 'large.bin'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(manifest_rows, expected_chunks as i64);
+        let mut round_trip = vec![0_u8; data.len()];
+        assert_eq!(
+            read_content_chunked(&tx, "large.bin", &mut round_trip, 0).unwrap(),
+            data.len()
+        );
+        assert_eq!(round_trip, data);
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn fresh_empty_content_needs_a_witness_but_no_manifest_spans() {
+        let conn = db();
+        conn.execute_batch(
+            "CREATE TABLE nodes (
+                id TEXT PRIMARY KEY,
+                kind INTEGER NOT NULL,
+                size INTEGER NOT NULL,
+                mtime INTEGER NOT NULL,
+                record TEXT
+             );
+             INSERT INTO nodes VALUES ('empty', 0, 0, 7, '');",
+        )
+        .unwrap();
+
+        assert!(!has_chunked_content(&conn, "empty").unwrap());
+        assert_eq!(store_content_chunked(&conn, "empty", &[]).unwrap(), 0);
+        let manifest_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM content_manifest WHERE node_id = 'empty'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(manifest_rows, 0);
+        assert!(
+            has_chunked_content(&conn, "empty").unwrap(),
+            "a fresh zero-length witness is complete without impossible spans"
+        );
     }
 
     #[test]

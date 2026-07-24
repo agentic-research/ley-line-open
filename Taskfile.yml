@@ -74,11 +74,14 @@ tasks:
         grep -q 'cache:sccache:stats:' Taskfile.yml
         grep -q 'sources:' Taskfile.yml
         grep -q 'generates:' Taskfile.yml
+        grep -q '^  test:cdc-activation:$' Taskfile.yml
+        grep -q '^      - task: test:cdc-activation$' Taskfile.yml
         test -f .cargo/config.toml
         grep -q 'link-arg=-Wl,--threads=2' .cargo/config.toml
         grep -q 'task cache:sccache:install' .github/workflows/ci.yml
         grep -q 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' .github/workflows/ci.yml
         grep -q 'path: .cache/sccache' .github/workflows/ci.yml
+        grep -Eq '^  SCCACHE_DIR: .*github\.workspace.*/\.cache/sccache$' .github/workflows/ci.yml
         grep -q 'task cache:sccache:stats' .github/workflows/ci.yml
         if grep -Eq 'run:.*cargo (build|test|clippy)' .github/workflows/ci.yml; then
           echo "ci.yml must delegate Rust commands to Taskfile.yml"
@@ -575,6 +578,18 @@ tasks:
       # consumer's feature selection is not this gate's job.
       - cargo clippy -p leyline-fs --no-default-features --features cdc,splice,validate --no-deps -- -D warnings
 
+  test:cdc-activation:
+    desc: |
+      Production CDC activation gate. Exercises both the explicit CLI command
+      and the real parse → activate → auto-grow/publish arena → verified 4 KiB
+      chunked-read consumer path. Isolated to the lightweight `cdc` feature so
+      unrelated default features cannot mask missing feature wiring.
+    deps: [cache:sccache:install]
+    dir: rs
+    cmds:
+      - cargo test -p leyline-cli-lib --no-default-features --features cdc --test cdc_command_test --test cdc_activation_consumer_test
+      - cargo test -p leyline-cli-lib --no-default-features --test cdc_disabled_command_test
+
   # --------------------------------------------------------------------------
   # Mutation testing — the gate that checks the TESTS, not the code.
   #
@@ -828,6 +843,7 @@ tasks:
       - task: build:fs-static
       - task: build:fs-nfs-isolated
       - task: test:fs-cdc
+      - task: test:cdc-activation
       - task: tier:isolation
       - task: check:all-features
       - task: test

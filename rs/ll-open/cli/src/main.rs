@@ -118,6 +118,11 @@ enum Cmd {
         /// `ley-line-open-c7d00f`.
         #[arg(long, default_value_t = false)]
         reset_arena: bool,
+
+        /// Activate or resume the private CDC index before publishing the
+        /// daemon's first arena snapshot.
+        #[arg(long, default_value_t = false)]
+        cdc: bool,
     },
 }
 
@@ -188,6 +193,7 @@ async fn main() -> Result<()> {
             mcp_allow_public,
             mcp_no_auth,
             reset_arena,
+            cdc,
         } => {
             // KNOWN scale limitation: arena_size_mib defaults to 64
             // (see Cmd::Daemon { arena_size_mib, default_value_t = 64 }).
@@ -219,9 +225,10 @@ async fn main() -> Result<()> {
                 mcp_no_auth,
                 reset_arena,
             };
-            leyline_cli_lib::cmd_daemon::run_daemon(
+            leyline_cli_lib::cmd_daemon::run_daemon_with_options(
                 config,
                 Arc::new(leyline_cli_lib::daemon::NoExt),
+                leyline_cli_lib::cmd_daemon::DaemonOptions { cdc },
             )
             .await
         }
@@ -263,6 +270,21 @@ mod tests {
             Cmd::Daemon { nfs_port, .. } => {
                 assert_eq!(nfs_port, 0, "nfs_port=0 means auto-assign");
             }
+            _ => panic!("expected Daemon variant"),
+        }
+    }
+
+    #[test]
+    fn daemon_cdc_is_explicit_and_parseable() {
+        let default_cli = Cli::try_parse_from(["leyline", "daemon"]).unwrap();
+        match default_cli.command {
+            Cmd::Daemon { cdc, .. } => assert!(!cdc),
+            _ => panic!("expected Daemon variant"),
+        }
+
+        let enabled_cli = Cli::try_parse_from(["leyline", "daemon", "--cdc"]).unwrap();
+        match enabled_cli.command {
+            Cmd::Daemon { cdc, .. } => assert!(cdc),
             _ => panic!("expected Daemon variant"),
         }
     }

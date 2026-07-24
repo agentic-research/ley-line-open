@@ -4,6 +4,8 @@
 //! a wrapper enum by downstream binaries (e.g. the private `leyline` binary
 //! that adds `daemon`, `embed`, `send`, etc.).
 
+#[cfg(feature = "cdc")]
+pub mod cmd_cdc;
 pub mod cmd_daemon;
 #[cfg(feature = "lsp")]
 pub mod cmd_doctor;
@@ -25,6 +27,25 @@ use clap::Subcommand;
 
 /// Edition tag for this build of the CLI library.
 pub const EDITION: &str = "open";
+
+/// CDC storage-administration subcommands.
+#[derive(Debug, Subcommand)]
+pub enum CdcCommands {
+    /// Populate or resume the private chunk-backed content index.
+    Enable {
+        /// SQLite projection to activate in place.
+        #[arg(long)]
+        db: PathBuf,
+
+        /// Authoritative rows loaded into memory per query page.
+        #[arg(long, default_value_t = 256)]
+        batch_size: usize,
+
+        /// Emit the activation report as one JSON object.
+        #[arg(long)]
+        json: bool,
+    },
+}
 
 /// Subcommands provided by ley-line open.
 #[derive(Debug, Subcommand)]
@@ -53,6 +74,12 @@ pub enum Commands {
         /// Path to the controller (.ctrl) file.
         #[arg(long)]
         control: PathBuf,
+    },
+
+    /// Administer content-defined chunk storage.
+    Cdc {
+        #[command(subcommand)]
+        command: CdcCommands,
     },
 
     /// Inspect the arena's active SQLite buffer — look up a node or run SQL.
@@ -185,6 +212,22 @@ pub async fn run(cmd: Commands) -> Result<()> {
             query,
         } => cmd_inspect::cmd_inspect(&id, &arena, control_path.as_deref(), query.as_deref()),
         Commands::Load { db, control } => cmd_load::cmd_load(&db, &control),
+        Commands::Cdc { command } => {
+            #[cfg(feature = "cdc")]
+            {
+                let CdcCommands::Enable {
+                    db,
+                    batch_size,
+                    json,
+                } = command;
+                cmd_cdc::cmd_cdc_enable(&db, batch_size, json)
+            }
+            #[cfg(not(feature = "cdc"))]
+            {
+                let _ = command;
+                anyhow::bail!("cdc enable requires the 'cdc' feature (compile with --features cdc)")
+            }
+        }
         Commands::Splice { db, node, text } => cmd_splice::cmd_splice(&db, &node, &text),
         #[cfg(feature = "lsp")]
         Commands::Lsp {

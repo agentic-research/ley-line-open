@@ -140,11 +140,34 @@ Three install paths, matching the three feature-graph shapes on `leyline-cli`:
 
 | Command | Features | When to use |
 |---------|----------|-------------|
-| `task install` | `lsp` + `validate` + `hdc` (default) | Structural-analysis core only. Portable, no system deps. Small binary. |
+| `task install` | `lsp` + `validate` + `hdc` + `cdc` (default) | Structural-analysis core plus opt-in chunk activation. Portable, no system deps. Small binary. |
 | **`task install:full`** | `--features all` = adds `vec` (fastembed) + `text-search` (WitchcraftEngine). NO mount | **Recommended for downstream consumers** (mache / cloister / notme / rosary). Portable — no libfuse-t/libfuse runtime dep. |
 | `task install:full+mount` | `--features full` = adds `mount` (FUSE/NFS backend) | Only if you're going to mount an arena as a filesystem. **Requires libfuse-t (macOS) or libfuse (Linux) at runtime** or the binary won't launch. |
 
 All three codesign on macOS (ad-hoc + entitlements) and drop the binary at `~/.local/bin/leyline`.
+
+### Activate chunk-backed reads
+
+CDC is compiled into every install shape but never mutates a projection
+implicitly. Activate an existing database explicitly:
+
+```bash
+leyline cdc enable --db /tmp/my-code.db
+```
+
+The command processes authoritative readable leaves in bounded deterministic
+pages, prints progress, and can safely resume after interruption. For a living
+daemon, opt in before its first published arena snapshot:
+
+```bash
+leyline daemon --source ./path/to/code --cdc
+```
+
+`nodes.record` stays authoritative. The `content_chunks`,
+`content_manifest`, and `content_manifest_meta` tables are private derived
+indexes: stale or absent manifests fall back to the authoritative record, and
+activation rebuilds them. Expect temporary storage amplification while both
+representations coexist.
 
 ### Prereqs
 

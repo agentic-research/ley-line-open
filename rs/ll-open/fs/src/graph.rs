@@ -2253,6 +2253,24 @@ mod tests {
             .map_err(Into::into)
     }
 
+    #[cfg(feature = "cdc")]
+    fn assert_chunked_content_matches(
+        adapter: &SqliteGraphAdapter,
+        node_id: &str,
+        model: &[u8],
+    ) -> Result<()> {
+        let expected_manifest: Vec<_> = leyline_cdc::chunk(model)
+            .into_iter()
+            .map(|chunk| (chunk.hash.as_bytes().to_vec(), chunk.offset, chunk.len))
+            .collect();
+        assert_eq!(manifest_tuples(adapter, node_id)?, expected_manifest);
+
+        let mut reconstructed = vec![0; model.len()];
+        let read = adapter.read_content(node_id, &mut reconstructed, 0)?;
+        assert_eq!(&reconstructed[..read], model);
+        Ok(())
+    }
+
     #[test]
     #[cfg(feature = "cdc")]
     fn graph_write_incrementally_matches_full_chunk_oracle() -> Result<()> {
@@ -2261,33 +2279,91 @@ mod tests {
         let mut model = cdc_body(0xC0FFEE, 4_000_000);
         adapter.write_content(node_id, &model, 0)?;
 
-        let edit_offset = model.len() / 2;
-        let edit = b"XYZ";
-        model[edit_offset..edit_offset + edit.len()].copy_from_slice(edit);
-        let (_, outcome) = adapter.write_content_traced(node_id, edit, edit_offset as u64)?;
+        let initial_len = model.len();
+        let cases: [(&str, usize, &[u8]); 5] = [
+            ("deep overwrite", initial_len / 2, b"XYZ"),
+            (
+                "boundary overwrite",
+                leyline_cdc::MAX_CHUNK - 2,
+                b"boundary",
+            ),
+            ("append", initial_len, b"append"),
+            ("beyond EOF", initial_len + b"append".len() + 97, b"tail"),
+            ("empty write", initial_len / 3, b""),
+        ];
 
-        let expected_manifest: Vec<_> = leyline_cdc::chunk(&model)
-            .into_iter()
-            .map(|chunk| (chunk.hash.as_bytes().to_vec(), chunk.offset, chunk.len))
-            .collect();
-        assert_eq!(manifest_tuples(&adapter, node_id)?, expected_manifest);
+        for (name, edit_offset, edit) in cases {
+            let write_end = edit_offset + edit.len();
+            if write_end > model.len() {
+                model.resize(write_end, 0);
+            }
+            model[edit_offset..write_end].copy_from_slice(edit);
 
-        let mut reconstructed = vec![0; model.len()];
-        let read = adapter.read_content(node_id, &mut reconstructed, 0)?;
-        assert_eq!(&reconstructed[..read], model);
-        match outcome {
-            WriteRefreshOutcome::Incremental {
+            let (_, outcome) = adapter.write_content_traced(node_id, edit, edit_offset as u64)?;
+            assert_chunked_content_matches(&adapter, node_id, &model)
+                .with_context(|| format!("{name} diverged from full-chunk oracle"))?;
+
+            let WriteRefreshOutcome::Incremental {
                 prefix_kept,
                 tail_reused,
                 bytes_scanned,
                 ..
-            } => {
+            } = outcome
+            else {
+                panic!("{name}: expected incremental refresh, got {outcome:?}");
+            };
+            if name == "deep overwrite" {
                 assert!(prefix_kept > 0);
                 assert!(tail_reused > 0);
                 assert!(bytes_scanned <= 4 * leyline_cdc::MAX_CHUNK);
             }
-            other => panic!("expected incremental refresh, got {other:?}"),
         }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cdc")]
+    fn graph_write_full_chunks_when_manifest_is_missing_or_stale() -> Result<()> {
+        for stale in [false, true] {
+            let adapter = chunked_adapter()?;
+            let node_id = "docs/readme";
+            if stale {
+                let guard = adapter.writer.lock();
+                crate::chunked::store_content_chunked(guard.conn(), node_id, b"hello")?;
+                guard.conn().execute(
+                    "UPDATE nodes SET mtime = mtime + 1 WHERE id = ?1",
+                    [node_id],
+                )?;
+            }
+
+            let edit = b"XY";
+            let (_, outcome) = adapter.write_content_traced(node_id, edit, 1)?;
+            assert_eq!(
+                outcome,
+                WriteRefreshOutcome::Full { bytes_scanned: 5 },
+                "stale={stale}"
+            );
+            assert_chunked_content_matches(&adapter, node_id, b"hXYlo")?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cdc")]
+    fn graph_write_does_not_add_chunk_schema_to_foreign_arena() -> Result<()> {
+        let adapter = writable_adapter()?;
+        let (_, outcome) = adapter.write_content_traced("docs/readme", b"XY", 1)?;
+        assert_eq!(outcome, WriteRefreshOutcome::Skipped);
+
+        let guard = adapter.writer.lock();
+        let chunk_tables: i64 = guard.conn().query_row(
+            "SELECT count(*) FROM sqlite_master
+              WHERE type = 'table'
+                AND name IN ('chunks', 'content_manifest', 'content_manifest_meta')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(chunk_tables, 0);
         Ok(())
     }
 

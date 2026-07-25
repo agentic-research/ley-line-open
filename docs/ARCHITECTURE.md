@@ -41,7 +41,7 @@ LLO is structured into three architectural layers:
 
 ### Layer 1: Infrastructure (`rs/ll-core/`)
 
-The Σ substrate — content-addressed storage primitives every other crate is built on.
+Content-addressed storage and snapshot primitives used by the other crates.
 
 | Crate | Purpose | Key types |
 |---|---|---|
@@ -72,7 +72,10 @@ Where source becomes structure. Parses, enriches, signs, presents.
 | `leyline-cli-lib` | The daemon. Owns the living db + UDS control socket + MCP HTTP transport; hosts all enrichment passes | `cmd_daemon`, `daemon::ops` |
 | `leyline-cli` | The `leyline` binary. Thin wrapper around `leyline-cli-lib` | `parse`, `daemon`, `serve`, `inspect` |
 
-**Contract:** Every enrichment pass writes into a sidecar (`_lsp*`, `_hdc*`, `_cfg`/`_cfg_edge`, etc.) — the `nodes` + `_ast` + `_source` + `node_content` core tables are the canonical substrate; sidecars are derived. Text-search engines are sidecar by construction (storage path lives OUTSIDE the arena; no capnp segments emitted; re-indexing never advances `current_root`).
+**Contract:** The `nodes` + `_ast` + `_source` + `node_content` tables form the
+core **SQL projection ABI**; enrichment passes write derived sidecars (`_lsp*`,
+`_hdc*`, `_cfg`/`_cfg_edge`, etc.). Re-indexing a sidecar does not redefine the
+Cap'n Proto or arena snapshot identities.
 
 **In-flight (analysis-substrate decade, `docs/decades/analysis-substrate.md`):** The `_cfg` / `_dfg` / `_taint` fact tables — three projections of one differential-dataflow computation over the existing `_ast` / `node_content` / `node_defs` / `node_refs` EDB, driven by `daemon.sheaf.invalidate` as the epoch tracker. v0.7.2 shipped T1's schema + κ CFG-kind vocabulary + reflow-invariant CFG builder + F1_cfg_reflow_stable gate. T1.b3-followup (bead `a0fadd`) wires `_cfg` population into `cmd_parse`; T2 / T3 / T4 still open. `docs/decades/analysis-substrate.md` §4.1 names the sub-file staging layer as a decade-level open question to resolve before T3.b3 (bead `c25128`).
 
@@ -89,7 +92,20 @@ Both transports dispatch to the same op registry — see `rs/ll-open/cli-lib/src
 
 ---
 
-## The Σ substrate — runtime model
+## Runtime identity and projection model
+
+Four identities are deliberately separate:
+
+| Identity | Commits to | Verification boundary |
+|---|---|---|
+| **Cap'n Proto segment root** | Canonical cross-runtime segment bytes and their `Head` chain | Canonical encoding fixtures |
+| **SQLite arena snapshot root** | The serialized active SQLite buffer named by `Controller.current_root` | BLAKE3 before deserialization |
+| **blob hash** | One CDC/CAS payload | `BlobStore::get` verify-on-read |
+| **SQL projection ABI** | Queryable tables, columns, and indexes | Schema and cross-runtime query fixtures |
+
+The “analysis substrate” dataflow tables and HDC similarity system are separate
+analysis facilities. Neither is another meaning of the four storage identities
+above.
 
 LLO's daemon runs a **living SQLite database in memory** with an **arena snapshot loop**:
 
@@ -103,7 +119,10 @@ LLO's daemon runs a **living SQLite database in memory** with an **arena snapsho
    transaction deletes only chunk rows unreachable from every manifest and
    reports rows and bytes before, unreachable, deleted, and remaining.
 4. **Snapshot**: serialize current db state → arena buffer → BLAKE3-hash → advance `current_root` on the controller's generation counter.
-5. **Readers**: mmap the arena via `SqliteGraph` (zero-copy via `sqlite3_deserialize`); detect generation change → hot-swap to new buffer.
+5. **Readers**: mmap the arena to validate the active serialized bytes, then
+   `deserialize_read_exact` copies the verified slice into SQLite-owned memory;
+   detect generation change → rebuild and hot-swap the reader. LLO is not
+   currently zero-copy.
 
 The arena is double-buffered: a writer flip advances the controller; readers see atomic transitions via the generation counter. Multiple readers share a lock-free pool (`SqliteGraphAdapter`), 2-8 readers auto-sized.
 
@@ -176,7 +195,7 @@ ADRs 0017-0019 are cloister-side and live in `~/remotes/art/cloister/docs/adr/`.
 | `leyline` binary (everything including mount) | `task install:full+mount` — `--features full`. Requires libfuse-t (macOS `brew install fuse-t`) or libfuse (Linux `apt install libfuse-dev`) at runtime |
 | Distroless OCI image | `task image` — produces `ley-line-open:0.10.3` (~20 MB) via krust + cargo-zigbuild static musl; image default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0` |
 | FFI staticlibs + header | `task release:fs-static:target` — builds the mache-facing `leyline-fs` staticlib with explicit CDC support and publishes it as a verified GitHub release artifact (linux amd64/arm64 + darwin arm64; macOS amd64 staticlib currently absent) |
-| Go schema client | `clients/go/leyline-schema` — nested Go module, tag-published as `clients/go/leyline-schema/v<version>` only when the public schema changes; binary-only/private-storage releases keep advertising the latest schema tag |
+| Go schema client | `clients/go/leyline-schema` — nested Go module, tag-published according to the release's declared consumer policy; v0.10.3 published a content-identical tag so public module consumers could resolve the release version |
 
 Release flow is on-tag-push: `task readme:version-check` gates README version-pin drift in CI (mirroring the `compat:check` + `gen:server-json:check` pattern). See [README.md § Build](../README.md#build) for the recommended install path per user type.
 

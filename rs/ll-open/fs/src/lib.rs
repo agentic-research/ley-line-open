@@ -171,6 +171,10 @@ impl SqliteGraph {
 
     fn deserialize(data: &[u8], readonly: bool) -> Result<Self> {
         let mut conn = Connection::open_in_memory()?;
+        // rusqlite's read-exact deserialize path allocates SQLite-owned
+        // storage and copies `data` into it. The mmap is the verified source,
+        // not memory attached to SQLite in place; zero-copy requires a
+        // separate lifetime-owning integration.
         let cursor = Cursor::new(data);
         conn.deserialize_read_exact("main", cursor, data.len(), readonly)
             .context("sqlite3_deserialize failed")?;

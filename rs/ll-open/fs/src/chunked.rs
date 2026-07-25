@@ -45,11 +45,12 @@
 //!
 //! ## What this does NOT do (stated so the claims stay honest)
 //!
-//! - **Freshness and blob reads are not yet one snapshot.** Chunk bytes are
-//!   fetched through [`SqliteBlobStore`], so the `BlobStore` verify-on-read
-//!   contract detects a hash/bytes mismatch. The public freshness check still
-//!   precedes the internal range-read transaction; the next integration step
-//!   must move both under one caller-owned read transaction.
+//! - **Freshness, selection, and blob reads share one snapshot.** The public
+//!   read path owns one SQLite read transaction, selects only overlapping
+//!   manifest rows, and fetches them through [`SqliteBlobStore`].
+//!   `BlobStore::get` verifies every selected blob before the caller's output
+//!   buffer is changed; integrity errors fail closed and never retry through
+//!   `nodes.record`.
 //! - **Garbage collection is explicit.** Invalidating a manifest deliberately
 //!   leaves chunk bytes available for immediate reuse. Long-lived projections
 //!   bound that history with [`crate::gc::collect_unreachable_chunks`], an

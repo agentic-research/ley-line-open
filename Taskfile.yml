@@ -504,6 +504,11 @@ tasks:
     cmds:
       - tools/lint_blake3.sh
 
+  lint:architecture-vocabulary:
+    desc: Keep storage identity domains distinct in architecture documentation
+    cmds:
+      - sh tools/check_architecture_vocabulary.sh .
+
   # --------------------------------------------------------------------------
   # Smell-rule gate (workspace deps drift + unsafe/unwrap invariants).
   # Mache-shaped: `smell-projector` walks `rs/`, projects Cargo.toml
@@ -880,6 +885,7 @@ tasks:
       - task: lint:cache-contract
       - task: release:artifacts:fixture-test
       - task: lint:blake3
+      - task: lint:architecture-vocabulary
       - task: readme:version-check
       - task: schema:version-check
       - task: check

@@ -17,9 +17,11 @@ Patch release. The binary and implementation Rust packages advance to `0.10.3`.
 The public schema does not: the `leyline-schema`, `leyline-public-schema`, and
 `leyline-schema-capnp` Rust packages, daemon `SCHEMA_VERSION`, and latest Go
 module all remain `0.10.2`, because this release changes only private,
-rebuildable `content_*` indexes. No content-identical nested
-`clients/go/leyline-schema/v0.10.3` tag is published. `wire_format_major = 1`
-and `compat_min_schema_version = 0.6.0` are unchanged.
+rebuildable `content_*` indexes. The content-identical nested
+`clients/go/leyline-schema/v0.10.3` module tag was published at release commit
+`a4f57673f0f79d0e3dd8808f19a8b6fc9c5b3347` so public Go module consumers
+could resolve the release version. `wire_format_major = 1` and
+`compat_min_schema_version = 0.6.0` are unchanged.
 
 ### Added
 

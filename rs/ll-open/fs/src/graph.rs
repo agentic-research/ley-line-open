@@ -2499,4 +2499,66 @@ mod tests {
         assert_eq!(&buf[..n], b"pre-rename-bytes");
         Ok(())
     }
+
+    #[test]
+    #[cfg(feature = "cdc")]
+    fn post_open_chunk_corruption_fails_closed() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let ctrl_path = dir.path().join("corrupt.ctrl");
+        let arena_path = dir.path().join("corrupt.arena");
+
+        let source = Connection::open_in_memory()?;
+        create_schema(&source)?;
+        crate::chunked::create_chunked_content_schema(&source)?;
+        let data = vec![b'x'; 256 * 1024];
+        let record = String::from_utf8(data.clone())?;
+        source.execute(
+            "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) \
+             VALUES ('docs/readme', 'docs', 'readme', 0, ?1, 1, ?2)",
+            rusqlite::params![i64::try_from(data.len())?, record],
+        )?;
+        crate::chunked::store_content_chunked(&source, "docs/readme", &data)?;
+        let db_bytes = source.serialize("main")?;
+
+        let arena_size = 4096 + 1024 * 1024 * 2;
+        let mut mmap = leyline_core::layout::create_arena(&arena_path, arena_size)?;
+        leyline_core::layout::write_to_arena(&mut mmap, db_bytes.as_ref())?;
+        let root: [u8; 32] = blake3::hash(db_bytes.as_ref()).into();
+        Controller::open_or_create(&ctrl_path)?.set_arena_with_root(
+            arena_path.to_str().unwrap(),
+            arena_size,
+            root,
+        )?;
+
+        let adapter = SqliteGraphAdapter::from_arena_writable(&ctrl_path)?;
+        let offset = {
+            let guard = adapter.writer.lock();
+            let (hash, offset, mut bytes): (Vec<u8>, i64, Vec<u8>) = guard.conn().query_row(
+                "SELECT m.chunk_hash, m.byte_offset, c.chunk_bytes \
+                   FROM content_manifest m JOIN content_chunks c USING (chunk_hash) \
+                  WHERE m.node_id = 'docs/readme' ORDER BY m.byte_offset LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            bytes[0] ^= 0xff;
+            guard.conn().execute(
+                "UPDATE content_chunks SET chunk_bytes = ?1 WHERE chunk_hash = ?2",
+                rusqlite::params![bytes, hash],
+            )?;
+            u64::try_from(offset)?
+        };
+        adapter.refresh_readers()?;
+
+        let before = vec![0xa5; 4096];
+        let mut out = before.clone();
+        let err = adapter
+            .read_content("docs/readme", &mut out, offset)
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("integrity violation"),
+            "{err:#}"
+        );
+        assert_eq!(out, before, "failed read partially modified destination");
+        Ok(())
+    }
 }

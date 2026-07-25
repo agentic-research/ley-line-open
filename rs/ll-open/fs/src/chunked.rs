@@ -502,6 +502,7 @@ pub fn chunks_touched(conn: &Connection, node_id: &str, offset: u64, len: usize)
 /// at the same path), and a `pub` unchecked reader is an open invitation to
 /// route around it. [`read_content_at`] is the entry point; the compiler now
 /// enforces that rather than a doc comment asking nicely.
+#[cfg(test)]
 pub(crate) fn read_content_chunked(
     conn: &Connection,
     node_id: &str,
@@ -511,21 +512,31 @@ pub(crate) fn read_content_chunked(
     if buf.is_empty() {
         return Ok(0);
     }
-    let start = usize::try_from(offset).context("range offset exceeds usize")?;
     let tx = conn
         .unchecked_transaction()
         .context("begin chunked range read transaction")?;
-    let Some(selected) = select_range_manifest(&tx, node_id, start, buf.len())? else {
-        return Ok(0);
-    };
-    let written = {
-        let store = SqliteBlobStore { tx: &tx };
-        leyline_cdc::read_range_into(&selected.chunks, selected.source_len, &store, start, buf)
-            .context("reconstruct SQLite chunk range")?
-    };
+    let written = read_content_chunked_in_transaction(&tx, node_id, buf, offset)?;
     tx.commit()
         .context("commit chunked range read transaction")?;
     Ok(written)
+}
+
+fn read_content_chunked_in_transaction(
+    tx: &Transaction<'_>,
+    node_id: &str,
+    buf: &mut [u8],
+    offset: u64,
+) -> Result<usize> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    let start = usize::try_from(offset).context("range offset exceeds usize")?;
+    let Some(selected) = select_range_manifest(tx, node_id, start, buf.len())? else {
+        return Ok(0);
+    };
+    let store = SqliteBlobStore { tx };
+    leyline_cdc::read_range_into(&selected.chunks, selected.source_len, &store, start, buf)
+        .context("reconstruct SQLite chunk range")
 }
 
 /// Drop `node_id`'s chunk manifest, so subsequent reads fall back to
@@ -773,8 +784,11 @@ pub(crate) fn refresh_chunked_content_after_edit(
 ///
 /// A node with no `nodes` row is refused: there is nothing to prove freshness
 /// against, and that is exactly the vacated-path case a rename leaves behind.
-pub fn has_chunked_content(conn: &Connection, node_id: &str) -> Result<bool> {
-    let tables_present: i64 = conn
+pub(crate) fn has_chunked_content_in_transaction(
+    tx: &Transaction<'_>,
+    node_id: &str,
+) -> Result<bool> {
+    let tables_present: i64 = tx
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' \
                AND name IN ('content_manifest','content_manifest_meta','nodes')",
@@ -788,7 +802,7 @@ pub fn has_chunked_content(conn: &Connection, node_id: &str) -> Result<bool> {
 
     // One query: manifest witness joined to the live node row. Any missing
     // side (no manifest, no node) yields no row, hence `false`.
-    let fresh: Option<(bool, i64)> = conn
+    let fresh: Option<(bool, i64)> = tx
         .query_row(
             "SELECT m.source_len = n.size AND m.source_mtime IS n.mtime, n.size \
                FROM content_manifest_meta m JOIN nodes n ON n.id = m.node_id \
@@ -806,7 +820,7 @@ pub fn has_chunked_content(conn: &Connection, node_id: &str) -> Result<bool> {
     }
 
     // Witness matches; confirm the manifest actually has spans.
-    let has_rows: bool = conn
+    let has_rows: bool = tx
         .query_row(
             "SELECT 1 FROM content_manifest WHERE node_id = ?1 LIMIT 1",
             params![node_id],
@@ -816,6 +830,15 @@ pub fn has_chunked_content(conn: &Connection, node_id: &str) -> Result<bool> {
         .context("probe node manifest")?
         .unwrap_or(false);
     Ok(has_rows)
+}
+
+pub fn has_chunked_content(conn: &Connection, node_id: &str) -> Result<bool> {
+    let tx = conn
+        .unchecked_transaction()
+        .context("begin chunk freshness transaction")?;
+    let fresh = has_chunked_content_in_transaction(&tx, node_id)?;
+    tx.commit().context("commit chunk freshness transaction")?;
+    Ok(fresh)
 }
 
 /// Which storage generation served a read.
@@ -873,14 +896,30 @@ pub fn read_content_at_traced(
     buf: &mut [u8],
     offset: u64,
 ) -> Result<(usize, ContentSource)> {
-    if has_chunked_content(conn, node_id)? {
-        CHUNKED_READS.fetch_add(1, Ordering::Relaxed);
-        let n = read_content_chunked(conn, node_id, buf, offset)?;
-        return Ok((n, ContentSource::Chunked));
+    if buf.is_empty() {
+        return Ok((0, ContentSource::Record));
     }
-    RECORD_READS.fetch_add(1, Ordering::Relaxed);
-    let n = read_content_from_record(conn, node_id, buf, offset)?;
-    Ok((n, ContentSource::Record))
+    let tx = conn
+        .unchecked_transaction()
+        .context("begin coherent content read transaction")?;
+    let (n, source) = if has_chunked_content_in_transaction(&tx, node_id)? {
+        (
+            read_content_chunked_in_transaction(&tx, node_id, buf, offset)?,
+            ContentSource::Chunked,
+        )
+    } else {
+        (
+            read_content_from_record_in_transaction(&tx, node_id, buf, offset)?,
+            ContentSource::Record,
+        )
+    };
+    tx.commit()
+        .context("commit coherent content read transaction")?;
+    match source {
+        ContentSource::Chunked => CHUNKED_READS.fetch_add(1, Ordering::Relaxed),
+        ContentSource::Record => RECORD_READS.fetch_add(1, Ordering::Relaxed),
+    };
+    Ok((n, source))
 }
 
 /// Legacy path: the whole file lives in `nodes.record`, so serving a range
@@ -891,13 +930,13 @@ pub fn read_content_at_traced(
 /// `pub(crate)` for symmetry with [`read_content_chunked`]: callers pick a
 /// storage generation by accident if both raw readers are reachable. Go through
 /// [`read_content_at`], which picks correctly and reports which ran.
-pub(crate) fn read_content_from_record(
-    conn: &Connection,
+fn read_content_from_record_in_transaction(
+    tx: &Transaction<'_>,
     node_id: &str,
     buf: &mut [u8],
     offset: u64,
 ) -> Result<usize> {
-    let record: Option<String> = conn
+    let record: Option<String> = tx
         .query_row(
             "SELECT record FROM nodes WHERE id = ?1",
             params![node_id],
@@ -1939,6 +1978,76 @@ mod tests {
         assert!(
             manifest_rows(&conn, "docsibling") > 0,
             "cascade over-matched a prefix sibling"
+        );
+    }
+
+    #[test]
+    fn range_read_transaction_observes_one_manifest_generation() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coherent.sqlite");
+        let reader = Connection::open(&path).unwrap();
+        reader.pragma_update(None, "journal_mode", "WAL").unwrap();
+        leyline_schema::create_schema(&reader).unwrap();
+        create_chunked_content_schema(&reader).unwrap();
+
+        let old = vec![b'a'; 2_000_000];
+        let new = vec![b'b'; old.len()];
+        let old_record = String::from_utf8(old.clone()).unwrap();
+        reader
+            .execute(
+                "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) \
+                 VALUES ('n', '', 'n', 0, ?1, 1, ?2)",
+                params![i64::try_from(old.len()).unwrap(), old_record],
+            )
+            .unwrap();
+        store_content_chunked(&reader, "n", &old).unwrap();
+
+        let selected = Arc::new(Barrier::new(2));
+        let committed = Arc::new(Barrier::new(2));
+        let writer_path = path.clone();
+        let writer_selected = Arc::clone(&selected);
+        let writer_committed = Arc::clone(&committed);
+        let writer = thread::spawn(move || {
+            let conn = Connection::open(writer_path).unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            writer_selected.wait();
+            let new_record = String::from_utf8(new.clone()).unwrap();
+            conn.execute(
+                "UPDATE nodes SET record = ?1, size = ?2, mtime = 2 WHERE id = 'n'",
+                params![new_record, i64::try_from(new.len()).unwrap()],
+            )
+            .unwrap();
+            store_content_chunked(&conn, "n", &new).unwrap();
+            writer_committed.wait();
+            new
+        });
+
+        let tx = reader.unchecked_transaction().unwrap();
+        assert!(has_chunked_content_in_transaction(&tx, "n").unwrap());
+        selected.wait();
+        committed.wait();
+        let mut old_out = vec![0xa5; 256 * 1024];
+        let old_written =
+            read_content_chunked_in_transaction(&tx, "n", &mut old_out, 64 * 1024).unwrap();
+        tx.commit().unwrap();
+        let new = writer.join().unwrap();
+        assert_eq!(
+            &old_out[..old_written],
+            &old[64 * 1024..64 * 1024 + old_written],
+            "reader mixed generations after writer commit"
+        );
+
+        let mut new_out = vec![0xa5; old_out.len()];
+        let (new_written, source) =
+            read_content_at_traced(&reader, "n", &mut new_out, 64 * 1024).unwrap();
+        assert_eq!(source, ContentSource::Chunked);
+        assert_eq!(
+            &new_out[..new_written],
+            &new[64 * 1024..64 * 1024 + new_written],
+            "next transaction did not observe the new coherent generation"
         );
     }
 }

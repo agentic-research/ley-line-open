@@ -1353,6 +1353,39 @@ mod tests {
         assert_eq!(&buf[..n], &data[mid..mid + n]);
     }
 
+    #[test]
+    fn read_content_chunked_does_not_fetch_a_corrupt_non_overlapping_blob() {
+        let conn = db();
+        let data = prng(0xc0ffee, 2_000_000);
+        store_content_chunked(&conn, "scoped", &data).unwrap();
+        let offset = data.len() / 2;
+        let (hash, mut bytes): (Vec<u8>, Vec<u8>) = conn
+            .query_row(
+                "SELECT manifest.chunk_hash, chunks.chunk_bytes \
+                   FROM content_manifest AS manifest \
+                   JOIN content_chunks AS chunks USING (chunk_hash) \
+                  WHERE manifest.node_id = 'scoped' \
+                    AND (manifest.byte_offset + manifest.byte_len) <= ?1 \
+                  ORDER BY manifest.byte_offset \
+                  LIMIT 1",
+                params![i64::try_from(offset).unwrap()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        bytes[0] ^= 0xff;
+        conn.execute(
+            "UPDATE content_chunks SET chunk_bytes = ?1 WHERE chunk_hash = ?2",
+            params![bytes, hash],
+        )
+        .unwrap();
+
+        let mut out = vec![0xa5; 4096];
+        let written = read_content_chunked(&conn, "scoped", &mut out, offset as u64).unwrap();
+
+        assert_eq!(written, out.len());
+        assert_eq!(out, data[offset..offset + written]);
+    }
+
     /// The shipped overlap predicate selects EXACTLY the overlapping spans —
     /// no extras. Checked against a Rust-side oracle at boundary-aligned
     /// ranges, where a `<` → `<=` slip would silently pull in an adjacent

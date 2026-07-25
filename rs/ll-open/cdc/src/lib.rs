@@ -261,10 +261,11 @@ pub fn read_range_into<S: BlobStore>(
 ) -> Result<usize> {
     let wanted_start = offset.min(source_len);
     let wanted_end = offset.saturating_add(out.len()).min(source_len);
-    let chunk_ends = validate_selected_range(chunks, source_len, wanted_start, wanted_end)?;
+    validate_selected_range(chunks, source_len, wanted_start, wanted_end)?;
     let mut result = Vec::with_capacity(wanted_end - wanted_start);
 
-    for (chunk, chunk_end) in chunks.iter().zip(chunk_ends) {
+    for chunk in chunks {
+        let chunk_end = chunk.offset.saturating_add(chunk.len);
         let bytes = store
             .get(chunk.hash)
             .context("get chunk")?
@@ -288,18 +289,25 @@ pub fn read_range_into<S: BlobStore>(
     Ok(result.len())
 }
 
-fn validate_selected_range(
+/// Validate that `chunks` contains exactly the ordered manifest rows that
+/// overlap `[wanted_start, wanted_end)` within a source of `source_len` bytes.
+///
+/// Boundary chunks may extend beyond the requested interval. The selection
+/// must otherwise be gapless, non-overlapping, non-empty per row, bounded by
+/// the source, and free of extra non-overlapping rows. An empty interval
+/// requires an empty selection.
+pub fn validate_selected_range(
     chunks: &[Chunk],
     source_len: usize,
     wanted_start: usize,
     wanted_end: usize,
-) -> Result<Vec<usize>> {
+) -> Result<()> {
     if wanted_start == wanted_end {
         anyhow::ensure!(
             chunks.is_empty(),
             "empty requested interval must have no selected chunks"
         );
-        return Ok(Vec::new());
+        return Ok(());
     }
     anyhow::ensure!(
         !chunks.is_empty(),
@@ -341,7 +349,7 @@ fn validate_selected_range(
         last.offset < wanted_end && wanted_end <= *last_end,
         "selected chunks do not cover requested range end"
     );
-    Ok(ends)
+    Ok(())
 }
 
 /// Reconstruct the byte range `[offset, offset+len)` from a chunk manifest,

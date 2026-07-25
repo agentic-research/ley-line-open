@@ -45,16 +45,11 @@
 //!
 //! ## What this does NOT do (stated so the claims stay honest)
 //!
-//! - **No verify-on-read.** `leyline_cdc::read_range` fetches through the
-//!   `BlobStore` trait, whose contract σ-verifies returned bytes. This path
-//!   reads `chunk_bytes` straight out of SQLite and trusts them. Chunk hashes
-//!   are still content-addressed *identity* (that is what makes dedup and
-//!   boundary stability work), but they are not re-checked on each read, so
-//!   this path does not by itself detect tampering with the `.db`. Integrity
-//!   at rest comes from arena-root verification (`verify_arena_root` in this
-//!   crate's `lib.rs`), not from a per-chunk check here. Adding one is cheap
-//!   (BLAKE3 is ~10x faster than the SQLite read it would follow) if a threat
-//!   model ever wants defense in depth below the arena root.
+//! - **Freshness and blob reads are not yet one snapshot.** Chunk bytes are
+//!   fetched through [`SqliteBlobStore`], so the `BlobStore` verify-on-read
+//!   contract detects a hash/bytes mismatch. The public freshness check still
+//!   precedes the internal range-read transaction; the next integration step
+//!   must move both under one caller-owned read transaction.
 //! - **Garbage collection is explicit.** Invalidating a manifest deliberately
 //!   leaves chunk bytes available for immediate reuse. Long-lived projections
 //!   bound that history with [`crate::gc::collect_unreachable_chunks`], an
@@ -70,6 +65,7 @@
 //!   invariant to preserve when adding write paths.
 
 use anyhow::{Context, Result, ensure};
+use leyline_core::{BlobStore, ContentAddressed, Hash};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -130,6 +126,63 @@ pub(crate) enum RefreshOutcome {
     Skipped,
     Full { bytes_scanned: usize },
     Incremental(leyline_cdc::RechunkStats),
+}
+
+pub(crate) struct SqliteBlobStore<'tx, 'conn> {
+    tx: &'tx Transaction<'conn>,
+}
+
+impl BlobStore for SqliteBlobStore<'_, '_> {
+    fn put(&mut self, bytes: &[u8]) -> Result<Hash> {
+        let hash = bytes.hash();
+        let inserted = self
+            .tx
+            .execute(
+                "INSERT OR IGNORE INTO content_chunks (chunk_hash, chunk_bytes) VALUES (?1, ?2)",
+                params![hash.as_bytes().as_slice(), bytes],
+            )
+            .context("insert SQLite blob")?;
+        if inserted == 0 {
+            ensure!(
+                self.get(hash)?.is_some(),
+                "SQLite blob disappeared after occupied insert"
+            );
+        }
+        Ok(hash)
+    }
+
+    fn get(&self, hash: Hash) -> Result<Option<Vec<u8>>> {
+        let bytes = self
+            .tx
+            .query_row(
+                "SELECT chunk_bytes FROM content_chunks WHERE chunk_hash = ?1",
+                params![hash.as_bytes().as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .context("read SQLite blob")?;
+
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        ensure!(
+            bytes.as_slice().hash() == hash,
+            "SqliteBlobStore integrity violation"
+        );
+        Ok(Some(bytes))
+    }
+
+    fn contains(&self, hash: Hash) -> Result<bool> {
+        self.tx
+            .query_row(
+                "SELECT 1 FROM content_chunks WHERE chunk_hash = ?1",
+                params![hash.as_bytes().as_slice()],
+                |_| Ok(true),
+            )
+            .optional()
+            .context("probe SQLite blob")
+            .map(|present| present.unwrap_or(false))
+    }
 }
 
 fn chunk_schema_present(conn: &Connection) -> Result<bool> {
@@ -203,32 +256,28 @@ fn store_content_manifest_in_transaction(
     )
     .context("clear previous manifest")?;
 
-    let mut put_chunk = tx
-        .prepare("INSERT OR IGNORE INTO content_chunks (chunk_hash, chunk_bytes) VALUES (?1, ?2)")
-        .context("prepare chunk insert")?;
     let mut put_span = tx
         .prepare(
             "INSERT INTO content_manifest (node_id, seq, chunk_hash, byte_offset, byte_len) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
         )
         .context("prepare manifest insert")?;
+    let mut store = SqliteBlobStore { tx };
 
     for (seq, c) in chunks.iter().enumerate() {
         let bytes = &data[c.offset..c.offset + c.len];
-        put_chunk
-            .execute(params![c.hash.as_bytes().as_slice(), bytes])
-            .context("insert chunk")?;
+        let stored = store.put(bytes).context("insert chunk")?;
+        ensure!(stored == c.hash, "chunk manifest hash does not match bytes");
         put_span
             .execute(params![
                 node_id,
-                seq as i64,
+                i64::try_from(seq).context("chunk sequence exceeds SQLite INTEGER")?,
                 c.hash.as_bytes().as_slice(),
-                c.offset as i64,
-                c.len as i64
+                i64::try_from(c.offset).context("chunk offset exceeds SQLite INTEGER")?,
+                i64::try_from(c.len).context("chunk length exceeds SQLite INTEGER")?
             ])
             .context("insert manifest span")?;
     }
-    drop(put_chunk);
     drop(put_span);
 
     // Capture the freshness witness inside the SAME transaction as the
@@ -279,7 +328,7 @@ fn store_content_manifest_in_transaction(
          VALUES (?1, ?2, ?3)",
         params![
             node_id,
-            data.len() as i64,
+            i64::try_from(data.len()).context("source length exceeds SQLite INTEGER")?,
             node_meta.map(|(_, _, mtime)| mtime)
         ],
     )
@@ -312,28 +361,135 @@ fn store_content_manifest_in_transaction(
 const OVERLAP_PREDICATE: &str = "node_id = ?1 AND byte_offset >= ?4 AND byte_offset < ?2 \
      AND (byte_offset + byte_len) > ?3";
 
+fn select_range_manifest_sql() -> String {
+    format!(
+        "SELECT chunk_hash, byte_offset, byte_len \
+           FROM content_manifest \
+          WHERE {OVERLAP_PREDICATE} \
+          ORDER BY byte_offset, seq"
+    )
+}
+
+#[derive(Debug)]
+struct ValidatedRangeManifest {
+    chunks: Vec<leyline_cdc::Chunk>,
+    source_len: usize,
+}
+
+fn decode_manifest_chunk(
+    node_id: &str,
+    hash: Vec<u8>,
+    offset: i64,
+    len: i64,
+) -> Result<leyline_cdc::Chunk> {
+    ensure!(
+        hash.len() == blake3::OUT_LEN,
+        "chunk manifest for {node_id} has a {}-byte hash",
+        hash.len()
+    );
+    let hash: [u8; blake3::OUT_LEN] = hash
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("validated BLAKE3 hash length changed"))?;
+    Ok(leyline_cdc::Chunk {
+        hash: Hash::from_bytes(hash),
+        offset: usize::try_from(offset)
+            .context("chunk manifest offset is negative or too large")?,
+        len: usize::try_from(len).context("chunk manifest length is negative or too large")?,
+    })
+}
+
+fn sqlite_integer(value: usize, label: &str) -> Result<i64> {
+    i64::try_from(value).with_context(|| format!("{label} exceeds SQLite INTEGER"))
+}
+
+fn select_range_manifest(
+    tx: &Transaction<'_>,
+    node_id: &str,
+    offset: usize,
+    len: usize,
+) -> Result<Option<ValidatedRangeManifest>> {
+    let source_len = tx
+        .query_row(
+            "SELECT source_len FROM content_manifest_meta WHERE node_id = ?1",
+            params![node_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .context("read range manifest source length")?;
+    let Some(source_len) = source_len else {
+        return Ok(None);
+    };
+    let source_len = usize::try_from(source_len)
+        .context("range manifest source length is negative or too large")?;
+    let wanted_start = offset.min(source_len);
+    let wanted_end = offset.saturating_add(len).min(source_len);
+    let sql = select_range_manifest_sql();
+    let mut statement = tx
+        .prepare(&sql)
+        .context("prepare range manifest selection")?;
+    let rows = statement
+        .query_map(
+            params![
+                node_id,
+                sqlite_integer(wanted_end, "range end")?,
+                sqlite_integer(wanted_start, "range start")?,
+                seek_floor(wanted_start)?
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .context("select range manifest")?;
+
+    let mut chunks = Vec::new();
+    for row in rows {
+        let (hash, chunk_offset, chunk_len) = row.context("decode range manifest row")?;
+        chunks.push(decode_manifest_chunk(
+            node_id,
+            hash,
+            chunk_offset,
+            chunk_len,
+        )?);
+    }
+    leyline_cdc::validate_selected_range(&chunks, source_len, wanted_start, wanted_end)
+        .with_context(|| format!("validate selected range manifest for {node_id}"))?;
+    Ok(Some(ValidatedRangeManifest { chunks, source_len }))
+}
+
 /// Lower bound for the index seek — see [`OVERLAP_PREDICATE`]. No chunk
 /// starting before this point can reach `start`, because CDC caps chunk length
 /// at `MAX_CHUNK`.
-fn seek_floor(start: usize) -> i64 {
-    start.saturating_sub(leyline_cdc::MAX_CHUNK) as i64
+fn seek_floor(start: usize) -> Result<i64> {
+    sqlite_integer(
+        start.saturating_sub(leyline_cdc::MAX_CHUNK),
+        "range seek floor",
+    )
 }
 
 /// How many chunks a read of `len` bytes at `offset` would touch. This is the
 /// cost of the read, in chunks — the number the whole design exists to keep
 /// small. Uses [`OVERLAP_PREDICATE`], so it measures the shipped selection.
 pub fn chunks_touched(conn: &Connection, node_id: &str, offset: u64, len: usize) -> Result<usize> {
-    let start = offset as usize;
+    let start = usize::try_from(offset).context("range offset exceeds usize")?;
     let end = start.saturating_add(len);
     let sql = format!("SELECT COUNT(*) FROM content_manifest WHERE {OVERLAP_PREDICATE}");
     let n: i64 = conn
         .query_row(
             &sql,
-            params![node_id, end as i64, start as i64, seek_floor(start)],
+            params![
+                node_id,
+                sqlite_integer(end, "range end")?,
+                sqlite_integer(start, "range start")?,
+                seek_floor(start)?
+            ],
             |r| r.get(0),
         )
         .context("count touched chunks")?;
-    Ok(n as usize)
+    usize::try_from(n).context("negative touched chunk count")
 }
 
 /// Read `buf.len()` bytes at `offset` for `node_id`, touching **only** the
@@ -352,55 +508,23 @@ pub(crate) fn read_content_chunked(
     buf: &mut [u8],
     offset: u64,
 ) -> Result<usize> {
-    let start = offset as usize;
-    let end = start.saturating_add(buf.len());
     if buf.is_empty() {
         return Ok(0);
     }
-
-    // The load-bearing query: overlap predicate in SQL, so unrequested chunks
-    // are never read off disk.
-    // No table alias: the predicate's columns live only on content_manifest,
-    // so OVERLAP_PREDICATE drops in verbatim — one definition, no drift.
-    //
-    // No ORDER BY: each chunk is copied to its own absolute position in `buf`,
-    // so the result does not depend on row order — and the manifest tiles the
-    // file without gaps (fuzzer invariant 1), so every byte of the range is
-    // covered exactly once regardless. Sorting here would be a real cost
-    // (SQLite can walk content_manifest_span directly) bought with nothing.
-    // Verified by mutation: adding/removing an ORDER BY changes no test.
-    let sql = format!(
-        "SELECT byte_offset, byte_len, chunk_bytes \
-           FROM content_manifest \
-           JOIN content_chunks USING (chunk_hash) \
-          WHERE {OVERLAP_PREDICATE}"
-    );
-    let mut stmt = conn.prepare(&sql).context("prepare range read")?;
-
-    let rows = stmt
-        .query_map(
-            params![node_id, end as i64, start as i64, seek_floor(start)],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0)? as usize,
-                    r.get::<_, i64>(1)? as usize,
-                    r.get::<_, Vec<u8>>(2)?,
-                ))
-            },
-        )
-        .context("run range read")?;
-
-    let mut written = 0usize;
-    for row in rows {
-        let (c_off, c_len, bytes) = row.context("decode chunk row")?;
-        let c_end = c_off + c_len;
-        let lo = start.saturating_sub(c_off); // first wanted byte within chunk
-        let hi = end.min(c_end) - c_off; // last wanted byte within chunk
-        let src = &bytes[lo..hi];
-        let dst = (c_off + lo) - start;
-        buf[dst..dst + src.len()].copy_from_slice(src);
-        written = written.max(dst + src.len());
-    }
+    let start = usize::try_from(offset).context("range offset exceeds usize")?;
+    let tx = conn
+        .unchecked_transaction()
+        .context("begin chunked range read transaction")?;
+    let Some(selected) = select_range_manifest(&tx, node_id, start, buf.len())? else {
+        return Ok(0);
+    };
+    let written = {
+        let store = SqliteBlobStore { tx: &tx };
+        leyline_cdc::read_range_into(&selected.chunks, selected.source_len, &store, start, buf)
+            .context("reconstruct SQLite chunk range")?
+    };
+    tx.commit()
+        .context("commit chunked range read transaction")?;
     Ok(written)
 }
 
@@ -539,23 +663,7 @@ pub(crate) fn capture_chunked_content(
     let mut chunks = Vec::new();
     for row in rows {
         let (hash, offset, len) = row.context("decode chunk manifest row")?;
-        anyhow::ensure!(
-            hash.len() == blake3::OUT_LEN,
-            "chunk manifest for {node_id} has a {}-byte hash",
-            hash.len()
-        );
-        anyhow::ensure!(
-            offset >= 0 && len >= 0,
-            "chunk manifest for {node_id} has a negative span"
-        );
-        let hash: [u8; blake3::OUT_LEN] = hash
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("validated BLAKE3 hash length changed"))?;
-        chunks.push(leyline_cdc::Chunk {
-            hash: leyline_core::Hash::from_bytes(hash),
-            offset: usize::try_from(offset).context("chunk offset exceeds usize")?,
-            len: usize::try_from(len).context("chunk length exceeds usize")?,
-        });
+        chunks.push(decode_manifest_chunk(node_id, hash, offset, len)?);
     }
     if chunks.is_empty() {
         return Ok(None);
@@ -828,6 +936,9 @@ pub fn chunked_content_len(conn: &Connection, node_id: &str) -> Result<usize> {
 mod tests {
     use super::*;
     use leyline_cdc::{MAX_CHUNK, MIN_CHUNK};
+    use leyline_core::{BlobStore, ContentAddressed, FsBlobStore, Hash, MemBlobStore};
+    use std::cell::Cell;
+    use tempfile::tempdir;
 
     fn prng(seed: u64, n: usize) -> Vec<u8> {
         let mut s = seed | 1;
@@ -845,6 +956,162 @@ mod tests {
         let c = Connection::open_in_memory().unwrap();
         create_chunked_content_schema(&c).unwrap();
         c
+    }
+
+    fn assert_blob_store_baseline<S: BlobStore>(store: &mut S) {
+        let bytes = b"shared contract";
+        let hash = store.put(bytes).unwrap();
+        assert_eq!(store.put(bytes).unwrap(), hash);
+        assert!(store.contains(hash).unwrap());
+        assert_eq!(store.get(hash).unwrap().unwrap(), bytes);
+        assert_eq!(store.get(Hash::ZERO).unwrap(), None);
+    }
+
+    struct CountingBlobStore<S> {
+        inner: S,
+        gets: Cell<usize>,
+    }
+
+    impl<S: BlobStore> BlobStore for CountingBlobStore<S> {
+        fn put(&mut self, bytes: &[u8]) -> Result<Hash> {
+            self.inner.put(bytes)
+        }
+
+        fn get(&self, hash: Hash) -> Result<Option<Vec<u8>>> {
+            self.gets.set(self.gets.get() + 1);
+            self.inner.get(hash)
+        }
+
+        fn contains(&self, hash: Hash) -> Result<bool> {
+            self.inner.contains(hash)
+        }
+    }
+
+    #[test]
+    fn sqlite_blob_store_matches_shared_backend_baseline() {
+        assert_blob_store_baseline(&mut MemBlobStore::new());
+
+        let temp = tempdir().unwrap();
+        assert_blob_store_baseline(&mut FsBlobStore::open(temp.path()).unwrap());
+
+        let conn = db();
+        let tx = conn.unchecked_transaction().unwrap();
+        assert_blob_store_baseline(&mut SqliteBlobStore { tx: &tx });
+    }
+
+    #[test]
+    fn sqlite_blob_store_detects_same_key_corruption_but_contains_reports_presence() {
+        let conn = db();
+        let tx = conn.unchecked_transaction().unwrap();
+        let mut store = SqliteBlobStore { tx: &tx };
+        let bytes = b"correct bytes";
+        let hash = store.put(bytes).unwrap();
+
+        tx.execute(
+            "UPDATE content_chunks SET chunk_bytes = ?1 WHERE chunk_hash = ?2",
+            params![b"corrupt bytes", hash.as_bytes().as_slice()],
+        )
+        .unwrap();
+
+        assert!(store.contains(hash).unwrap());
+        let err = store.get(hash).unwrap_err();
+        assert!(err.to_string().contains("integrity violation"), "{err:#}");
+    }
+
+    #[test]
+    fn sqlite_blob_store_detects_valid_bytes_stored_under_the_wrong_key() {
+        let conn = db();
+        let tx = conn.unchecked_transaction().unwrap();
+        let bytes = b"valid bytes";
+        let actual_hash = bytes.as_slice().hash();
+        assert_ne!(actual_hash, Hash::ZERO);
+        tx.execute(
+            "INSERT INTO content_chunks (chunk_hash, chunk_bytes) VALUES (?1, ?2)",
+            params![Hash::ZERO.as_bytes().as_slice(), bytes],
+        )
+        .unwrap();
+
+        let store = SqliteBlobStore { tx: &tx };
+        let err = store.get(Hash::ZERO).unwrap_err();
+        assert!(err.to_string().contains("integrity violation"), "{err:#}");
+    }
+
+    #[test]
+    fn sqlite_blob_store_put_rejects_an_already_corrupt_key() {
+        let conn = db();
+        let tx = conn.unchecked_transaction().unwrap();
+        let bytes = b"correct bytes";
+        let hash = bytes.as_slice().hash();
+        tx.execute(
+            "INSERT INTO content_chunks (chunk_hash, chunk_bytes) VALUES (?1, ?2)",
+            params![hash.as_bytes().as_slice(), b"corrupt bytes"],
+        )
+        .unwrap();
+
+        let mut store = SqliteBlobStore { tx: &tx };
+        let err = store.put(bytes).unwrap_err();
+        assert!(err.to_string().contains("integrity violation"), "{err:#}");
+    }
+
+    #[test]
+    fn sqlite_blob_store_selector_returns_only_ordered_overlapping_spans() {
+        let conn = db();
+        let data = prng(0x51ec7, MAX_CHUNK * 5);
+        store_content_chunked(&conn, "indexed", &data).unwrap();
+        let offset = data.len() / 2;
+        let len = 4096;
+        let expected = chunks_touched(&conn, "indexed", offset as u64, len).unwrap();
+
+        let tx = conn.unchecked_transaction().unwrap();
+        let selected = select_range_manifest(&tx, "indexed", offset, len)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(selected.source_len, data.len());
+        assert_eq!(selected.chunks.len(), expected);
+        assert!(
+            selected
+                .chunks
+                .windows(2)
+                .all(|pair| pair[0].offset < pair[1].offset)
+        );
+        leyline_cdc::validate_selected_range(
+            &selected.chunks,
+            selected.source_len,
+            offset,
+            offset + len,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn sqlite_blob_store_selector_rejects_invalid_integer_and_hash_rows() {
+        let conn = db();
+        let bytes = b"selected bytes";
+        store_content_chunked(&conn, "bad", bytes).unwrap();
+        conn.execute(
+            "UPDATE content_manifest SET chunk_hash = ?1 WHERE node_id = 'bad'",
+            params![b"short hash"],
+        )
+        .unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        assert!(select_range_manifest(&tx, "bad", 0, bytes.len()).is_err());
+        drop(tx);
+
+        conn.execute(
+            "UPDATE content_manifest_meta SET source_len = -1 WHERE node_id = 'bad'",
+            [],
+        )
+        .unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        assert!(select_range_manifest(&tx, "bad", 0, bytes.len()).is_err());
+    }
+
+    #[test]
+    fn chunks_touched_rejects_offsets_outside_sqlite_integer() {
+        let conn = db();
+        let offset = u64::try_from(i64::MAX).unwrap() + 1;
+        assert!(chunks_touched(&conn, "n", offset, 1).is_err());
     }
 
     #[test]
@@ -868,8 +1135,19 @@ mod tests {
             .unwrap();
         assert_eq!(manifest_rows, expected_chunks as i64);
         let mut round_trip = vec![0_u8; data.len()];
+        let selected = select_range_manifest(&tx, "large.bin", 0, data.len())
+            .unwrap()
+            .unwrap();
+        let store = SqliteBlobStore { tx: &tx };
         assert_eq!(
-            read_content_chunked(&tx, "large.bin", &mut round_trip, 0).unwrap(),
+            leyline_cdc::read_range_into(
+                &selected.chunks,
+                selected.source_len,
+                &store,
+                0,
+                &mut round_trip,
+            )
+            .unwrap(),
             data.len()
         );
         assert_eq!(round_trip, data);
@@ -1037,9 +1315,41 @@ mod tests {
              the SQL layer must not re-materialize the file"
         );
 
-        // ...and it still returns the right bytes.
+        let tx = conn.unchecked_transaction().unwrap();
+        let selected = select_range_manifest(&tx, "big", mid, 4096)
+            .unwrap()
+            .unwrap();
+        let non_overlapping_hash: Vec<u8> = tx
+            .query_row(
+                "SELECT chunk_hash FROM content_manifest \
+                  WHERE node_id = 'big' AND (byte_offset + byte_len) <= ?1 \
+                  ORDER BY byte_offset LIMIT 1",
+                params![i64::try_from(mid).unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        tx.execute(
+            "UPDATE content_chunks \
+                SET chunk_bytes = zeroblob(length(chunk_bytes)) \
+              WHERE chunk_hash = ?1",
+            params![non_overlapping_hash],
+        )
+        .unwrap();
+
+        let store = CountingBlobStore {
+            inner: SqliteBlobStore { tx: &tx },
+            gets: Cell::new(0),
+        };
         let mut buf = vec![0u8; 4096];
-        let n = read_content_chunked(&conn, "big", &mut buf, mid as u64).unwrap();
+        let n = leyline_cdc::read_range_into(
+            &selected.chunks,
+            selected.source_len,
+            &store,
+            mid,
+            &mut buf,
+        )
+        .unwrap();
+        assert_eq!(store.gets.get(), touched);
         assert_eq!(&buf[..n], &data[mid..mid + n]);
     }
 
@@ -1267,16 +1577,11 @@ mod tests {
         store_content_chunked(&conn, "n", &data).unwrap();
         conn.execute_batch("ANALYZE").unwrap();
 
-        let sql = format!(
-            "EXPLAIN QUERY PLAN SELECT byte_offset, byte_len, chunk_bytes \
-               FROM content_manifest \
-               JOIN content_chunks USING (chunk_hash) \
-              WHERE {OVERLAP_PREDICATE}"
-        );
+        let sql = format!("EXPLAIN QUERY PLAN {}", select_range_manifest_sql());
         let mut stmt = conn.prepare(&sql).unwrap();
         let plan: Vec<String> = stmt
             .query_map(
-                params!["n", 100_000i64, 90_000i64, seek_floor(90_000)],
+                params!["n", 100_000i64, 90_000i64, seek_floor(90_000).unwrap()],
                 |r| r.get::<_, String>(3),
             )
             .unwrap()
@@ -1335,7 +1640,7 @@ mod tests {
             .collect();
 
         for start in [0, 1, MAX_CHUNK, 1_000_000, 3_000_000, data.len() - 1] {
-            let floor = seek_floor(start) as usize;
+            let floor = usize::try_from(seek_floor(start).unwrap()).unwrap();
 
             // SOUND: no chunk overlapping `start` may begin below the floor.
             let first_overlapping = spans
@@ -1359,7 +1664,7 @@ mod tests {
 
         // And for a deep read the floor must actually be off the floor.
         assert!(
-            seek_floor(3_000_000) > 0,
+            seek_floor(3_000_000).unwrap() > 0,
             "a read 3MB into a file must not seek from offset 0"
         );
     }

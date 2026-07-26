@@ -53,7 +53,18 @@ flowchart LR
   class nodes proj;
 ```
 
-**The substrate is the bytes**, not the SQL tables. Producers emit canonical-encoded Cap'n Proto messages into segment files (`*.capnp`); the Σ root is `BLAKE3(canonical(segments))` chained through `head.capnp`. Local SQL tables (`nodes`, `_ast`, `_source`, `_file_index`) are *projections* — fast indexes derived from the substrate, not the contract.
+Canonical Cap'n Proto bytes, SQL snapshots, and individual blobs have distinct
+identities:
+
+- The **Cap'n Proto segment root** commits to canonical cross-runtime segment
+  bytes and is chained through `head.capnp`.
+- The **SQLite arena snapshot root** is `Controller.current_root`; it commits to
+  one serialized active SQLite buffer, not to a table or row.
+- A **blob hash** commits to one CDC or CAS payload and is verified on every
+  successful `BlobStore::get`.
+- The **SQL projection ABI** is the local query/table surface (`nodes`, `_ast`,
+  `_source`, `_file_index`, and private indexes). It is useful and shared, but
+  it is not interchangeable with any of the three content identities above.
 
 This is enforced — see [`docs/adr/0014-capnp-as-protocol.md`](docs/adr/0014-capnp-as-protocol.md). A `cargo test --test fileid_allowlist` gate locks every schema's `@0x...` fileId; a `cargo test --test cross_runtime_fixtures` gate asserts canonical-byte stability against committed fixtures.
 
@@ -72,7 +83,7 @@ This is enforced — see [`docs/adr/0014-capnp-as-protocol.md`](docs/adr/0014-ca
 
 | Crate | Purpose |
 |-------|---------|
-| `leyline-fs` | SqliteGraph (zero-copy `sqlite3_deserialize`), Graph trait, reader pool, NFS/FUSE mount (feature-gated), C FFI bridge |
+| `leyline-fs` | SqliteGraph (verified mmap slice copied into SQLite-owned memory by `deserialize_read_exact`), Graph trait, reader pool, NFS/FUSE mount (feature-gated), C FFI bridge |
 | `leyline-ts` | Tree-sitter AST projection + bidirectional splice |
 | `leyline-lsp` | LSP client — spawns language servers, projects symbols + diagnostics into nodes; emits `BindingRecord` capnp event log |
 | `leyline-hdc` | Hyperdimensional computing — D=8192 hypervectors via bundle composition + seeded leaves; popcount-Hamming distance; `HvCell` sheaf-stalks for `leyline-sheaf` (ADR-0024, ADR-0025) |

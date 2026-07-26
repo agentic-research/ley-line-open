@@ -10,7 +10,8 @@ use serde::Serialize;
 use std::collections::BTreeSet;
 
 use crate::chunked::{
-    create_chunked_content_schema, has_chunked_content, store_content_chunked_in_transaction,
+    create_chunked_content_schema, has_chunked_content_in_transaction,
+    store_content_chunked_in_transaction,
 };
 
 /// Controls bounded activation work.
@@ -241,16 +242,16 @@ fn read_node_id(row: &rusqlite::Row<'_>) -> rusqlite::Result<String> {
     row.get(0)
 }
 
-fn first_nonfresh_node(conn: &Connection, batch_size: i64) -> Result<Option<String>> {
+fn first_nonfresh_node(tx: &Transaction<'_>, batch_size: i64) -> Result<Option<String>> {
     let mut last_id = None;
     loop {
-        let rows = query_activation_page(conn, last_id.as_deref(), batch_size)?;
+        let rows = query_activation_page(tx, last_id.as_deref(), batch_size)?;
         if rows.is_empty() {
             return Ok(None);
         }
         last_id = rows.last().cloned();
         for node_id in rows {
-            if !has_chunked_content(conn, &node_id)
+            if !has_chunked_content_in_transaction(tx, &node_id)
                 .with_context(|| format!("verify final CDC freshness for node {node_id}"))?
             {
                 return Ok(Some(node_id));
@@ -294,7 +295,7 @@ fn activate_node(conn: &Connection, node_id: &str) -> Result<NodeActivation> {
         "node {node_id} size {declared_size} does not match {} record bytes",
         data.len()
     );
-    if has_chunked_content(&tx, node_id)
+    if has_chunked_content_in_transaction(&tx, node_id)
         .with_context(|| format!("check CDC freshness for node {node_id}"))?
     {
         tx.commit()

@@ -166,8 +166,9 @@ impl ContentAddressed for [u8] {
 /// `MemBlobStore` (testing).
 pub trait BlobStore {
     /// Insert `bytes` into the store. Returns the content address.
-    /// Idempotent: inserting the same bytes twice returns the same hash
-    /// and does not duplicate storage.
+    /// `put(v)` is idempotent for an absent key or a valid existing entry. A
+    /// corrupt existing entry must be repaired atomically or reported as an
+    /// error.
     fn put(&mut self, bytes: &[u8]) -> Result<Hash>;
 
     /// Retrieve the bytes stored under `h`, or `None` if absent.
@@ -177,8 +178,8 @@ pub trait BlobStore {
     /// for `σ(v) == h`" guarantee.
     fn get(&self, h: Hash) -> Result<Option<Vec<u8>>>;
 
-    /// True iff `h` is in the store. Useful for "should I fetch this
-    /// over the network?" decisions without paying the full read.
+    /// `contains(h)` reports physical key existence only. It does not verify
+    /// bytes; only a successful `get(h)` vouches for `σ(bytes) == h`.
     fn contains(&self, h: Hash) -> Result<bool>;
 }
 

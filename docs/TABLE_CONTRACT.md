@@ -150,7 +150,7 @@ cross-runtime fixture suite in CI:
 | **Daemon protocol** — UDS request/response JSON per `daemon.capnp` | JSON-as-carrier (per cloister `interlace-spec/0.1.0/README.md`) over UDS | `rs/ll-open/cli-lib/tests/fixtures/daemon-protocol.json` | `clients/go/leyline-schema/daemon/daemon_protocol_test.go` decodes via hand-written JSON-tagged structs that mirror `daemon.capnp` | A-1 / `b5a77b` |
 
 Both gates are wired into `.github/workflows/leyline-schema-go.yml`. The
-substrate gate asserts byte-equality on canonical encoding (T8.10's
+The Cap'n Proto segment root gate asserts byte-equality on canonical encoding (T8.10's
 falsifiable claim F8.6.4 — direct: byte-equal decode in both runtimes).
 
 The daemon protocol gate is a **two-step chain** through the fixture file,
@@ -181,5 +181,9 @@ skip to a pass.
    `parse_version` it was computed against. Staleness = basis < current parse_version.
 4. **Optional tables**: Consumers (mache, FUSE) must handle missing enrichment
    tables gracefully. Check `SELECT 1 FROM sqlite_master WHERE name = ?`.
-5. **The .db file is the contract**: LL opens the .db, adds its tables, closes.
-   LLO never needs to know about LL's tables.
+5. **SQL projection ABI**: LL and LLO may add/query documented tables in the
+   same SQLite projection without treating the database file as a canonical
+   content identity. The **SQLite arena snapshot root** commits to one
+   serialized snapshot; a **blob hash** commits to one payload; the
+   **Cap'n Proto segment root** remains the canonical cross-runtime segment
+   identity.

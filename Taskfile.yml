@@ -89,8 +89,20 @@ tasks:
         fi
         test -x tools/stage_release_artifacts.sh
         test -x tools/verify_release_artifacts.sh
+        test -x tools/prepare_public_release.sh
+        test -x tools/verify_public_release.sh
+        test -x tools/publish_release_assets.sh
+        test -x tools/release_publish.sh
+        test -x tools/recover_release_manifest.sh
+        test -f tools/release-assets.txt
+        test -f tools/release-version-manifests.txt
         grep -q 'release:artifacts:stage:' Taskfile.yml
         grep -q 'release:artifacts:verify:' Taskfile.yml
+        grep -q 'release:artifacts:prepare:' Taskfile.yml
+        grep -q 'release:artifacts:publish:' Taskfile.yml
+        grep -q 'release:publish:' Taskfile.yml
+        grep -q 'release:verify-public:' Taskfile.yml
+        grep -q 'release:recover-manifest:' Taskfile.yml
         grep -q -- '- task: release:artifacts:fixture-test' Taskfile.yml
         grep -Eq 'cargo build -p leyline-fs --lib --features cdc$' Taskfile.yml
         grep -Eq 'cargo build --release --lib -p leyline-fs --features cdc --target' Taskfile.yml
@@ -185,6 +197,60 @@ tasks:
           exit 1
         fi
         echo "release artifact fixture accepted exact bytes and rejected corruption"
+
+  release:publication:fixture-test:
+    desc: Prove aggregate release publication is exact and fail closed
+    cmds:
+      - tools/test_release_publication.sh
+
+  release:workflow:fixture-test:
+    desc: Prove the credentialed publisher is reachable only after all builds
+    cmds:
+      - tools/test_release_workflow.sh
+
+  release:tags:fixture-test:
+    desc: Prove release tag creation is atomic, idempotent, and version-aware
+    cmds:
+      - tools/test_release_tags.sh
+
+  release:publish:fixture-test:
+    desc: Prove the outer operation watches only its exact tag workflow
+    cmds:
+      - tools/test_release_publish.sh
+
+  schema:consumer-fixture-test:
+    desc: Compile the Apache daemon/wire API from an external Go module
+    cmds:
+      - tools/test_go_schema_consumer.sh
+
+  release:version-check:
+    desc: Require binary, schema, generated metadata, and docs to agree
+    cmds:
+      - tools/verify_release_version.sh
+
+  release:verify-public:
+    desc: Download and verify public assets plus the Apache Go module
+    requires:
+      vars: [VERSION]
+    cmds:
+      - tools/verify_public_release_remote.sh "{{.VERSION}}"
+
+  release:recover-manifest:
+    desc: Recover one missing public SHA256SUMS from GitHub-recorded digests
+    requires:
+      vars: [VERSION, EXPECTED_COMMIT]
+    cmds:
+      - >-
+        tools/recover_release_manifest.sh
+        "{{.VERSION}}"
+        "{{.EXPECTED_COMMIT}}"
+
+  release:publish:
+    desc: Atomically tag, wait for release CI, and verify public vVERSION
+    requires:
+      vars: [VERSION]
+    cmds:
+      - tools/release_publish.sh "{{.VERSION}}"
 
   check:all-features:
     desc: |
@@ -312,6 +378,38 @@ tasks:
       vars: [ARTIFACT_ROOT]
     cmds:
       - tools/verify_release_artifacts.sh "{{.ARTIFACT_ROOT}}"
+
+  release:artifacts:prepare:
+    desc: Verify target artifacts and create one aggregate publication set
+    requires:
+      vars: [ARTIFACT_ROOT, PUBLICATION_DIR]
+    cmds:
+      - >-
+        tools/prepare_public_release.sh
+        "{{.ARTIFACT_ROOT}}"
+        "{{.PUBLICATION_DIR}}"
+        tools/release-assets.txt
+
+  release:artifacts:verify-public:
+    desc: Verify an exact aggregate release directory and SHA256SUMS
+    requires:
+      vars: [PUBLICATION_DIR]
+    cmds:
+      - >-
+        tools/verify_public_release.sh
+        "{{.PUBLICATION_DIR}}"
+        tools/release-assets.txt
+
+  release:artifacts:publish:
+    desc: Reverify, then create the release and upload its exact asset set
+    requires:
+      vars: [PUBLICATION_DIR, TAG]
+    cmds:
+      - >-
+        tools/publish_release_assets.sh
+        "{{.PUBLICATION_DIR}}"
+        "{{.TAG}}"
+        tools/release-assets.txt
 
   install:full:
     desc: Build with `--features all` (everything except mount), codesign (macOS), and install to ~/.local/bin. Portable — no system-dep prerequisites. This is the recommended full install for mache + downstream daemon consumers.
@@ -698,10 +796,10 @@ tasks:
   # added by bead `ley-line-open-b7dd03` — outside a container, the
   # daemon refuses non-loopback binds without it.
   image:
-    desc: Build ley-line-open:0.9.0 OCI image (krust musl binary + docker COPY)
+    desc: Build ley-line-open:0.10.4 OCI image (krust musl binary + docker COPY)
     vars:
       KRUST_REPO: '{{.KRUST_REPO | default "localhost/leyline"}}'
-      VERSION: '0.9.0'
+      VERSION: '0.10.4'
       PLATFORM: '{{.PLATFORM | default "linux/arm64"}}'
       # Derive musl target triple from PLATFORM so cross-arch builds find
       # the right binary. Image.Dockerfile's BIN_PATH default targets
@@ -732,7 +830,7 @@ tasks:
     desc: Build image and run end-to-end smoke (start daemon, probe MCP tools/list)
     deps: [image]
     vars:
-      VERSION: '0.9.0'
+      VERSION: '0.10.4'
       PLATFORM: '{{.PLATFORM | default "linux/arm64"}}'
       HOST_PORT: '18384'
     cmds:
@@ -884,6 +982,12 @@ tasks:
       - task: lint:toolchain-parity
       - task: lint:cache-contract
       - task: release:artifacts:fixture-test
+      - task: release:publication:fixture-test
+      - task: release:workflow:fixture-test
+      - task: release:tags:fixture-test
+      - task: release:publish:fixture-test
+      - task: schema:consumer-fixture-test
+      - task: release:version-check
       - task: lint:blake3
       - task: lint:architecture-vocabulary
       - task: readme:version-check

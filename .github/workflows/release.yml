@@ -42,29 +42,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  create-release:
-    name: Create GitHub release for ${{ github.ref_name }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write # to create the release object
-    steps:
-      - name: Create release (idempotent; auto-generate notes)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          # gh release create fails if the release already exists; we
-          # `|| true` so re-runs (e.g. retried workflow on transient
-          # failure) don't poison the matrix builds below.
-          gh release create "$TAG" \
-            --title "$TAG" \
-            --generate-notes \
-            || echo "release $TAG already exists; continuing"
-
   build:
     name: build ${{ matrix.asset }}
-    needs: create-release
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -243,23 +222,21 @@ jobs:
           pattern: release-*
           path: .artifacts/downloaded
 
-      - name: Verify manifests and reject duplicate assets
+      - name: Prepare aggregate verified publication set
         env:
           ARTIFACT_ROOT: ${{ github.workspace }}/.artifacts/downloaded
-        run: task release:artifacts:verify
+          PUBLICATION_DIR: ${{ github.workspace }}/.artifacts/publication
+        run: task release:artifacts:prepare
 
       - name: Upload verified bytes to GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
-        run: |
-          mapfile -t ASSETS < <(
-            find .artifacts/downloaded -mindepth 2 -maxdepth 2 \
-              -type f ! -name SHA256SUMS -print | LC_ALL=C sort
-          )
-          if [ "${#ASSETS[@]}" -eq 0 ]; then
-            echo "no verified release assets found"
-            exit 1
-          fi
-          gh release upload "$TAG" "${ASSETS[@]}" --clobber
+          PUBLICATION_DIR: ${{ github.workspace }}/.artifacts/publication
+        run: task release:artifacts:publish
+
+      - name: Verify public assets and schema module
+        env:
+          TAG: ${{ github.ref_name }}
+        run: task release:verify-public VERSION="${TAG#v}"

@@ -20,6 +20,8 @@ test -d "$artifact_root"
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/leyline-release-verify.XXXXXX")
 trap 'rm -rf "$tmp_dir"' 0 1 2 15
 all_names="$tmp_dir/all-names"
+all_names_sorted="$tmp_dir/all-names-sorted"
+duplicate_names="$tmp_dir/duplicate-names"
 : > "$all_names"
 
 directory_count=0
@@ -30,13 +32,16 @@ for artifact_dir in "$artifact_root"/*; do
     test -s "$manifest"
 
     expected_names="$tmp_dir/expected-$directory_count"
+    expected_names_raw="$tmp_dir/expected-raw-$directory_count"
     actual_names="$tmp_dir/actual-$directory_count"
+    actual_names_raw="$tmp_dir/actual-raw-$directory_count"
 
     awk '
       NF != 2 || length($1) != 64 || $1 !~ /^[0-9a-f]+$/ ||
         $2 !~ /^[A-Za-z0-9._-]+$/ { exit 1 }
       { print $2 }
-    ' "$manifest" | LC_ALL=C sort > "$expected_names"
+    ' "$manifest" > "$expected_names_raw"
+    LC_ALL=C sort "$expected_names_raw" > "$expected_names"
 
     if [ -n "$(uniq -d "$expected_names")" ]; then
         echo "duplicate filename in $manifest" >&2
@@ -44,7 +49,8 @@ for artifact_dir in "$artifact_root"/*; do
     fi
 
     find "$artifact_dir" -maxdepth 1 -type f ! -name SHA256SUMS \
-        -exec basename {} \; | LC_ALL=C sort > "$actual_names"
+        -exec basename {} \; > "$actual_names_raw"
+    LC_ALL=C sort "$actual_names_raw" > "$actual_names"
     test -s "$actual_names"
     diff -u "$expected_names" "$actual_names"
 
@@ -60,7 +66,9 @@ if [ "$directory_count" -eq 0 ]; then
     exit 1
 fi
 
-duplicate=$(LC_ALL=C sort "$all_names" | uniq -d | head -n 1)
+LC_ALL=C sort "$all_names" > "$all_names_sorted"
+uniq -d "$all_names_sorted" > "$duplicate_names"
+duplicate=$(sed -n '1p' "$duplicate_names")
 if [ -n "$duplicate" ]; then
     echo "duplicate release asset across build artifacts: $duplicate" >&2
     exit 1

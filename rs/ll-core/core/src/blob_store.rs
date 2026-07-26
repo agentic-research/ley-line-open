@@ -274,10 +274,8 @@ impl BlobStore for FsBlobStore {
         // no-op when verify-on-read confirms that it matches the key.
         // A corrupt physical entry must not be silently preserved by a
         // successful put().
-        if final_path.exists() {
-            if self.get(hash)?.is_some() {
-                return Ok(hash);
-            }
+        if final_path.exists() && self.get(hash)?.is_some() {
+            return Ok(hash);
         }
 
         // Ensure parent dir exists. `create_dir_all` is idempotent.

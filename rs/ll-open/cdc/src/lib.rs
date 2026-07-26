@@ -302,6 +302,11 @@ pub fn validate_selected_range(
     wanted_start: usize,
     wanted_end: usize,
 ) -> Result<()> {
+    anyhow::ensure!(wanted_start <= wanted_end, "requested interval is reversed");
+    anyhow::ensure!(
+        wanted_end <= source_len,
+        "requested interval exceeds source length"
+    );
     if wanted_start == wanted_end {
         anyhow::ensure!(
             chunks.is_empty(),
@@ -1006,6 +1011,22 @@ mod tests {
                 "{case} returned an empty error"
             );
         }
+    }
+
+    #[test]
+    fn selected_range_validator_rejects_a_reversed_interval() {
+        let (chunks, _) = scripted_manifest(&[b"abcdefghij"]);
+
+        let err = validate_selected_range(&chunks, 10, 8, 2).unwrap_err();
+        assert!(err.to_string().contains("reversed"), "{err:#}");
+    }
+
+    #[test]
+    fn selected_range_validator_rejects_an_interval_past_source_end() {
+        let (chunks, _) = scripted_manifest(&[b"abcdefghij"]);
+
+        let err = validate_selected_range(&chunks, 10, 8, 11).unwrap_err();
+        assert!(err.to_string().contains("source length"), "{err:#}");
     }
 
     /// Store → full reconstruct round-trips byte-for-byte.

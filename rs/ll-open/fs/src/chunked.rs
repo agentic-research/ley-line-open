@@ -43,6 +43,15 @@
 //! invalidation from becoming silent data corruption. Making the unsafe path
 //! unreachable is stronger than documenting that it exists.
 //!
+//! ## Canonical operation ownership
+//!
+//! Each operation has one owner. SQL in this module selects ordered
+//! `(hash, offset, len)` addresses; [`SqliteBlobStore`] owns physical blob
+//! access and verify-on-read; [`leyline_cdc::read_range_into`] owns span
+//! validation and reconstruction. A SQL JOIN that also returns `chunk_bytes`,
+//! or a second copy loop in this module, duplicates an owned operation and is
+//! an architecture violation rather than an alternative implementation.
+//!
 //! ## What this does NOT do (stated so the claims stay honest)
 //!
 //! - **Freshness, selection, and blob reads share one snapshot.** The public
@@ -513,6 +522,7 @@ pub(crate) fn read_content_chunked(
     if buf.is_empty() {
         return Ok(0);
     }
+    let offset = checked_range_offset(offset)?;
     let tx = conn
         .unchecked_transaction()
         .context("begin chunked range read transaction")?;
@@ -526,17 +536,19 @@ fn read_content_chunked_in_transaction(
     tx: &Transaction<'_>,
     node_id: &str,
     buf: &mut [u8],
-    offset: u64,
+    offset: usize,
 ) -> Result<usize> {
     if buf.is_empty() {
         return Ok(0);
     }
-    let start = usize::try_from(offset).context("range offset exceeds usize")?;
-    let Some(selected) = select_range_manifest(tx, node_id, start, buf.len())? else {
+    let Some(selected) = select_range_manifest(tx, node_id, offset, buf.len())? else {
         return Ok(0);
     };
     let store = SqliteBlobStore { tx };
-    leyline_cdc::read_range_into(&selected.chunks, selected.source_len, &store, start, buf)
+    // CANONICAL OPERATION SEAM: SQL selects addresses, BlobStore verifies
+    // bytes, and leyline-cdc alone reconstructs them. Do not duplicate any of
+    // those operations with a JOIN/copy path here.
+    leyline_cdc::read_range_into(&selected.chunks, selected.source_len, &store, offset, buf)
         .context("reconstruct SQLite chunk range")
 }
 
@@ -897,25 +909,43 @@ pub fn read_content_at_traced(
     buf: &mut [u8],
     offset: u64,
 ) -> Result<(usize, ContentSource)> {
+    read_content_at_traced_with_finish(conn, node_id, buf, offset, |tx| {
+        tx.commit()
+            .context("commit coherent content read transaction")
+    })
+}
+
+fn read_content_at_traced_with_finish<F>(
+    conn: &Connection,
+    node_id: &str,
+    buf: &mut [u8],
+    offset: u64,
+    finish: F,
+) -> Result<(usize, ContentSource)>
+where
+    F: FnOnce(Transaction<'_>) -> Result<()>,
+{
     if buf.is_empty() {
         return Ok((0, ContentSource::Record));
     }
+    let offset = checked_range_offset(offset)?;
     let tx = conn
         .unchecked_transaction()
         .context("begin coherent content read transaction")?;
+    let mut staged = vec![0; buf.len()];
     let (n, source) = if has_chunked_content_in_transaction(&tx, node_id)? {
         (
-            read_content_chunked_in_transaction(&tx, node_id, buf, offset)?,
+            read_content_chunked_in_transaction(&tx, node_id, &mut staged, offset)?,
             ContentSource::Chunked,
         )
     } else {
         (
-            read_content_from_record_in_transaction(&tx, node_id, buf, offset)?,
+            read_content_from_record_in_transaction(&tx, node_id, &mut staged, offset)?,
             ContentSource::Record,
         )
     };
-    tx.commit()
-        .context("commit coherent content read transaction")?;
+    finish(tx)?;
+    buf[..n].copy_from_slice(&staged[..n]);
     match source {
         ContentSource::Chunked => CHUNKED_READS.fetch_add(1, Ordering::Relaxed),
         ContentSource::Record => RECORD_READS.fetch_add(1, Ordering::Relaxed),
@@ -935,7 +965,7 @@ fn read_content_from_record_in_transaction(
     tx: &Transaction<'_>,
     node_id: &str,
     buf: &mut [u8],
-    offset: u64,
+    offset: usize,
 ) -> Result<usize> {
     let record: Option<String> = tx
         .query_row(
@@ -950,14 +980,18 @@ fn read_content_from_record_in_transaction(
         return Ok(0);
     };
     let bytes = data.as_bytes();
-    let off = offset as usize;
-    if off >= bytes.len() {
+    if offset >= bytes.len() {
         return Ok(0);
     }
-    let end = (off + buf.len()).min(bytes.len());
-    let n = end - off;
-    buf[..n].copy_from_slice(&bytes[off..end]);
+    let end = offset.saturating_add(buf.len()).min(bytes.len());
+    let n = end - offset;
+    buf[..n].copy_from_slice(&bytes[offset..end]);
     Ok(n)
+}
+
+fn checked_range_offset(offset: u64) -> Result<usize> {
+    let offset = i64::try_from(offset).context("range offset exceeds SQLite INTEGER")?;
+    usize::try_from(offset).context("range offset exceeds usize")
 }
 
 /// Total byte length of `node_id`'s chunked content (manifest sum).
@@ -1820,6 +1854,37 @@ mod tests {
         let (n, src) = read_content_at_traced(&conn, "n", &mut buf, 6).unwrap();
         assert_eq!(&buf[..n], b"world");
         assert_eq!(src, ContentSource::Record);
+    }
+
+    #[test]
+    fn transaction_completion_error_does_not_mutate_the_destination() {
+        let conn = Connection::open_in_memory().unwrap();
+        insert_node_record(&conn, "n", "hello world");
+        let mut buf = [0xA5; 5];
+
+        let err = read_content_at_traced_with_finish(&conn, "n", &mut buf, 0, |_| {
+            anyhow::bail!("injected transaction completion failure")
+        })
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("injected transaction completion failure"),
+            "{err:#}"
+        );
+        assert_eq!(buf, [0xA5; 5]);
+    }
+
+    #[test]
+    fn record_fallback_rejects_an_unrepresentable_offset_without_mutation() {
+        let conn = Connection::open_in_memory().unwrap();
+        insert_node_record(&conn, "n", "hello world");
+        let mut buf = [0xA5; 5];
+
+        let err = read_content_at_traced(&conn, "n", &mut buf, u64::MAX).unwrap_err();
+
+        assert!(err.to_string().contains("range offset"), "{err:#}");
+        assert_eq!(buf, [0xA5; 5]);
     }
 
     /// The counters must actually move, or they cannot answer "is the mount

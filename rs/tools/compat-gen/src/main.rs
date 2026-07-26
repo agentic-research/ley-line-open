@@ -22,8 +22,8 @@
 //! ```json
 //! {
 //!   "$schema_version": 1,
-//!   "binary_version": "0.10.3",
-//!   "schema_version": "0.10.2",
+//!   "binary_version": "0.10.4",
+//!   "schema_version": "0.10.4",
 //!   "wire_format_major": 1,
 //!   "compat_min_schema_version": "0.4.1",
 //!   "build_date": "unspecified"

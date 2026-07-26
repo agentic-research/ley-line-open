@@ -8,6 +8,42 @@ Each entry references the bead ID(s) tracking the work in
 [rsry](https://github.com/agentic-research/rosary) so the full design
 context, scoping notes, and review history are recoverable.
 
+## [0.10.4] — 2026-07-26
+
+**Transactional CDC reads and a fail-closed public release contract.**
+
+Patch release. The binary, implementation crates, public schema crates, daemon
+`SCHEMA_VERSION`, and Apache-2.0 Go schema module advance together to
+`0.10.4`. The typed daemon JSON package at `daemon/wire` already existed in
+the v0.10.3 module; v0.10.4 makes that consumer surface explicit,
+documentation-visible, and executable through an external-module compilation
+gate. `wire_format_major = 1` and `compat_min_schema_version = 0.6.0` remain
+unchanged.
+
+### Fixed
+
+- **Transactional BlobStore range reads** (`ley-line-open-ef5c84`) — chunk
+  selection, manifest validation, blob fetch, reconstruction, and transaction
+  completion now form one fail-closed read. Reversed or out-of-bounds
+  intervals, missing chunks, malformed spans, length mismatches, and commit
+  failures return without modifying the caller buffer. Fallback offsets use a
+  checked conversion on 32-bit targets.
+
+- **Fail-closed release publication** (`ley-line-open-9bfd98`,
+  `ley-line-open-ed37c9`) — build jobs remain read-only; the sole credentialed
+  publisher is unreachable until every target artifact verifies. It flattens
+  the exact eight payloads, generates one aggregate non-self-referential
+  `SHA256SUMS`, reverifies it, and only then creates or updates the release.
+  The same public verifier recovers the missing v0.10.3 manifest without
+  rebuilding or moving either historical tag.
+
+### Changed
+
+- **Supported Apache schema consumer API** (`ley-line-open-efec2d`) —
+  `clients/go/leyline-schema/daemon/wire` is now documented as the canonical
+  typed JSON response/event package and compiled from a hermetic external Go
+  module in CI. Consumers should import it instead of duplicating wire structs.
+
 ## [0.10.3] — 2026-07-24
 
 **Consumer-ready CDC: incremental writes, explicit activation, and transactional

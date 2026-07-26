@@ -35,10 +35,11 @@
 pub const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The public Rust/Go schema-client version this daemon's wire shapes target.
-/// This is intentionally independent from `BINARY_VERSION`: v0.10.3 changes
-/// private CDC indexes only, so it continues to target the v0.10.2 schema
-/// module rather than publishing a content-identical nested tag.
-pub const SCHEMA_VERSION: &str = "0.10.2";
+/// This is intentionally independent from `BINARY_VERSION`, even though the
+/// v0.10.4 release advances both. Binary-only releases leave this literal
+/// unchanged; a public consumer-contract release requires a matching nested
+/// Go-module tag.
+pub const SCHEMA_VERSION: &str = "0.10.4";
 
 /// Current major version of the JSON wire envelope shape. Bumps on
 /// incompatible changes (renames, removals, type changes); additions

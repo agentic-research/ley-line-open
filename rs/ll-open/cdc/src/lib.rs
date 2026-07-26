@@ -1038,6 +1038,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn range_read_at_exact_chunk_boundaries_selects_only_overlapping_chunks() {
+        let (chunks, store) = scripted_manifest(&[b"abc", b"def", b"ghi"]);
+
+        assert_eq!(read_range(&chunks, &store, 3, 3).unwrap(), b"def");
+        assert_eq!(*store.gets.borrow(), vec![chunks[1].hash]);
+    }
+
     /// THE materialize-on-read property: a small read of a large file touches
     /// only the chunks overlapping the requested range — NOT the whole file.
     /// This is what lets the FUSE mount serve a 4 KiB read of a 100 MB file

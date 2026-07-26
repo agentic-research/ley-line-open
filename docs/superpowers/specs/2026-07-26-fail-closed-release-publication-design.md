@@ -1,7 +1,8 @@
 # Fail-Closed Release Publication Design
 
 Status: approved
-Bead: `ley-line-open-9bfd98`
+Beads: `ley-line-open-9bfd98`, `ley-line-open-efec2d`,
+`ley-line-open-ed37c9`
 
 ## Goal
 
@@ -22,18 +23,26 @@ The nested module contains its own Apache-2.0 `LICENSE`; the release gate must
 verify that the source tree and the downloaded public module both retain that
 license boundary.
 
-A binary-only storage change does not create a schema version. For the CDC
-integrity work, the compatibility pair is:
+The typed daemon JSON API already exists in the public `v0.10.3` module at
+`daemon/wire`. An external module-resolution probe confirms that the package
+exports its response and event types. The actual defect is that publication
+does not make that consumer contract executable: the repository still
+advertises schema `0.10.2`, the README omits `daemon/wire`, and downstream
+mache consequently retains a duplicate set of JSON structs under the stale
+assumption that the canonical types remain test-only.
+
+The `v0.10.4` release turns the existing package into an explicit, tested
+compatibility point and advances both artifacts:
 
 ```text
 binary: v0.10.4
-schema: v0.10.3
+schema: v0.10.4
 wire-format major: 1
 ```
 
-The publication command reads the canonical schema version and verifies its
-existing public nested tag. It creates a new nested tag only when the schema
-version has advanced.
+The publication command reads the canonical schema version and requires a new
+nested tag because the supported Apache-licensed consumer surface advances.
+Future binary-only releases still leave the schema version unchanged.
 
 ## Command shape
 
@@ -92,6 +101,7 @@ Fixture tests must prove:
 - upload is not invoked after any verifier failure;
 - unchanged schema versions do not create new nested tags;
 - changed schema versions require an atomic matching nested tag;
+- an external Go module imports `daemon/wire` response and event types;
 - a root/nested tag pointing at the wrong commit is rejected;
 - the public verifier rejects a release without `SHA256SUMS`;
 - the downloaded nested module contains the Apache-2.0 license; and

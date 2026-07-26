@@ -25,6 +25,7 @@ both runtimes from the same files.
 | `head` | `rs/ll-core/schema-capnp/schemas/head.capnp` | `Head` — Σ root pointer for file-backed dbs. Imports `common`. |
 | `source` | `rs/ll-core/schema-capnp/schemas/source.capnp` | `SourceFile` projection. Imports `common`. |
 | `daemon` | `rs/ll-core/public-schema/capnp/daemon.capnp` | UDS control-socket wire types. |
+| `daemon/wire` | Daemon JSON fixtures + Rust serde mirror | Canonical typed op responses, event envelopes, and event payloads for JSON consumers. |
 
 Import a sub-package directly:
 
@@ -43,6 +44,15 @@ func decodeRef(buf []byte) (binding.BindingRecord, error) {
     }
     return binding.ReadRootBindingRecord(msg)
 }
+```
+
+JSON-wire consumers import the canonical response/event package rather than
+declaring local mirror structs:
+
+```go
+import "github.com/agentic-research/ley-line-open/clients/go/leyline-schema/daemon/wire"
+
+var response wire.GetNodeResponse
 ```
 
 ## Schema-evolution contract

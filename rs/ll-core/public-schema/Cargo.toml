@@ -1,6 +1,6 @@
 [package]
 name = "leyline-public-schema"
-version = "0.10.2"
+version = "0.10.4"
 edition = "2024"
 license = "Apache-2.0"
 

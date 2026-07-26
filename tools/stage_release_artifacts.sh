@@ -67,15 +67,18 @@ if [ -n "${HEADER_SOURCE:-}" ]; then
 fi
 
 manifest_tmp="$OUTPUT_DIR/.SHA256SUMS.tmp.$$"
-trap 'rm -f "$manifest_tmp"' 0 1 2 15
+manifest_unsorted="$OUTPUT_DIR/.SHA256SUMS.unsorted.$$"
+trap 'rm -f "$manifest_tmp" "$manifest_unsorted"' 0 1 2 15
 (
     cd "$OUTPUT_DIR"
     for file in *; do
         test -f "$file"
         sha256_file "$file"
-    done | LC_ALL=C sort -k 2
-) > "$manifest_tmp"
+    done
+) > "$manifest_unsorted"
+LC_ALL=C sort -k 2 "$manifest_unsorted" > "$manifest_tmp"
 mv "$manifest_tmp" "$OUTPUT_DIR/SHA256SUMS"
+rm -f "$manifest_unsorted"
 trap - 0 1 2 15
 
 echo "staged release artifacts in $OUTPUT_DIR"

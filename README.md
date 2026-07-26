@@ -210,12 +210,12 @@ manifest disappears.
 
 ## Building the image
 
-A distroless OCI image (`ley-line-open:0.10.3`, ~20 MB) is built via [`krust`](https://github.com/imjasonh/krust) (cargo-zigbuild → static musl binary) + a one-line `docker build` that COPYs the binary onto `cgr.dev/chainguard/static`. See `image.Dockerfile` and `Taskfile.yml`. The image's default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0` headless — no FUSE/NFS, just the MCP HTTP transport on `:8384` inside the container (consumed by cloister via `LLO_MCP_URL`, default `http://localhost:8384/mcp`).
+A distroless OCI image (`ley-line-open:0.10.4`, ~20 MB) is built via [`krust`](https://github.com/imjasonh/krust) (cargo-zigbuild → static musl binary) + a one-line `docker build` that COPYs the binary onto `cgr.dev/chainguard/static`. See `image.Dockerfile` and `Taskfile.yml`. The image's default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0` headless — no FUSE/NFS, just the MCP HTTP transport on `:8384` inside the container (consumed by cloister via `LLO_MCP_URL`, default `http://localhost:8384/mcp`).
 
 ```bash
 brew install zig                   # cargo-zigbuild backend
 cargo install cargo-zigbuild krust # one-time
-task image                         # → ley-line-open:0.10.3 in local docker
+task image                         # → ley-line-open:0.10.4 in local docker
 task image:smoke                   # build + start daemon + curl tools/list
 ```
 
@@ -245,10 +245,12 @@ import "github.com/agentic-research/ley-line-open/clients/go/leyline-schema/bind
 
 One sub-package per schema (`ast`, `binding`, `cache`, `common`, `daemon`, `head`, `net`, `source`). Regen via `clients/go/leyline-schema/regen.sh`; CI gates on `git diff --exit-code` plus `go test ./...` decoding the same `tests/fixtures/*.bin` the Rust suite asserts byte-equality against.
 
-Latest tag: [`clients/go/leyline-schema/v0.10.2`](https://github.com/agentic-research/ley-line-open/releases/tag/clients%2Fgo%2Fleyline-schema%2Fv0.10.2).
-Schema tags move only when this public contract changes. Binary v0.10.3 changes
-private CDC indexes, so it deliberately continues to advertise and consume the
-v0.10.2 schema surface.
+Typed daemon JSON consumers should import
+`github.com/agentic-research/ley-line-open/clients/go/leyline-schema/daemon/wire`;
+it exposes the canonical response, event-envelope, and event-payload structs.
+
+Latest tag: [`clients/go/leyline-schema/v0.10.4`](https://github.com/agentic-research/ley-line-open/releases/tag/clients%2Fgo%2Fleyline-schema%2Fv0.10.4).
+Schema tags move only when this supported public contract changes.
 
 ## Daemon protocol
 

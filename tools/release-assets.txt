@@ -1,0 +1,8 @@
+leyline-darwin-amd64
+leyline-darwin-arm64
+leyline-linux-amd64
+leyline-linux-arm64
+leyline_fs.h
+libleyline_fs-darwin-arm64.a
+libleyline_fs-linux-amd64.a
+libleyline_fs-linux-arm64.a

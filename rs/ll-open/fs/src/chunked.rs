@@ -1004,6 +1004,7 @@ mod tests {
         assert_eq!(store.put(bytes).unwrap(), hash);
         assert!(store.contains(hash).unwrap());
         assert_eq!(store.get(hash).unwrap().unwrap(), bytes);
+        assert!(!store.contains(Hash::ZERO).unwrap());
         assert_eq!(store.get(Hash::ZERO).unwrap(), None);
     }
 

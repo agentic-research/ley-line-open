@@ -1,5 +1,12 @@
-//! SHA-256 Merkle tree with domain separation — root, leaf hashing, and
+//! Merkle tree over σ with domain separation — root, leaf hashing, and
 //! per-leaf inclusion proofs.
+//!
+//! Every hash here is the substrate's σ ([`ContentAddressed`], BLAKE3-locked
+//! per `substrate.rs`), reached through the trait rather than an inline call
+//! so a future algorithm change has exactly one place to happen. This crate
+//! hashes at a composition boundary, which is precisely where the lock's docs
+//! warn that mixing hash functions breaks (DET) and (CR) — see bead
+//! `ley-line-open-b61cd6` and ADR-0032 D5.
 //!
 //! Used by the sheaf cache (structural invalidation), the network layer
 //! (manifest verification), and per-leaf progressive verification
@@ -15,23 +22,43 @@
 //! Surface: [`compute_merkle_root`] / [`hash_node`] (root side),
 //! [`merkle_proof`] / [`verify_merkle_proof`] / [`MerkleProof`] (proof side).
 
-use sha2::{Digest, Sha256};
+use leyline_core::ContentAddressed;
+
+/// Leaf domain separator.
+const TAG_LEAF: u8 = 0x00;
+/// Internal-node domain separator.
+const TAG_INTERNAL: u8 = 0x01;
+/// Empty-tree domain separator.
+const TAG_EMPTY: u8 = 0x02;
+
+/// `σ(0x01 ‖ left ‖ right)` — the internal-node combiner.
+///
+/// The single place the spine is hashed. Extracted so the root builder, the
+/// proof builder, and the verifier cannot drift apart: three copies of this
+/// expression is three chances for one of them to be edited alone.
+fn combine(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut framed = [0u8; 1 + 32 + 32];
+    framed[0] = TAG_INTERNAL;
+    framed[1..33].copy_from_slice(left);
+    framed[33..].copy_from_slice(right);
+    *framed.as_slice().hash().as_bytes()
+}
 
 /// Compute a Merkle root from a set of leaf hashes.
 ///
-/// Uses SHA-256 with domain separation:
-/// - Leaf nodes: `H(0x00 || leaf_data)`
-/// - Internal nodes: `H(0x01 || left || right)`
-/// - Empty tree: `H(0x02 || "empty")` — never the all-zeros sentinel, so an
+/// Uses σ with domain separation:
+/// - Leaf nodes: `σ(0x00 || leaf_data)`
+/// - Internal nodes: `σ(0x01 || left || right)`
+/// - Empty tree: `σ(0x02 || "empty")` — never the all-zeros sentinel, so an
 ///   accidental zero-hash leaf never collides with "I have no data."
 ///
 /// If the number of leaves is odd, the last leaf is promoted without hashing.
 pub fn compute_merkle_root(leaf_hashes: &[[u8; 32]]) -> [u8; 32] {
     if leaf_hashes.is_empty() {
-        let mut hasher = Sha256::new();
-        hasher.update([0x02]);
-        hasher.update(b"empty");
-        return hasher.finalize().into();
+        let mut framed = Vec::with_capacity(6);
+        framed.push(TAG_EMPTY);
+        framed.extend_from_slice(b"empty");
+        return *framed.as_slice().hash().as_bytes();
     }
     if leaf_hashes.len() == 1 {
         return leaf_hashes[0];
@@ -44,11 +71,7 @@ pub fn compute_merkle_root(leaf_hashes: &[[u8; 32]]) -> [u8; 32] {
 
         for pair in current_level.chunks(2) {
             if pair.len() == 2 {
-                let mut hasher = Sha256::new();
-                hasher.update([0x01]); // internal node domain separator
-                hasher.update(pair[0]);
-                hasher.update(pair[1]);
-                next_level.push(hasher.finalize().into());
+                next_level.push(combine(&pair[0], &pair[1]));
             } else {
                 // Odd leaf — promote without re-hashing
                 next_level.push(pair[0]);
@@ -63,12 +86,12 @@ pub fn compute_merkle_root(leaf_hashes: &[[u8; 32]]) -> [u8; 32] {
 
 /// Hash a single node's content for use as a Merkle leaf.
 ///
-/// Domain-separated: `SHA-256(0x00 || data)`.
+/// Domain-separated: `σ(0x00 || data)`.
 pub fn hash_node(data: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update([0x00]); // leaf domain separator
-    hasher.update(data);
-    hasher.finalize().into()
+    let mut framed = Vec::with_capacity(1 + data.len());
+    framed.push(TAG_LEAF);
+    framed.extend_from_slice(data);
+    *framed.as_slice().hash().as_bytes()
 }
 
 /// A per-leaf Merkle inclusion proof.
@@ -124,11 +147,7 @@ pub fn merkle_proof(leaf_hashes: &[[u8; 32]], index: usize) -> MerkleProof {
         let mut next = Vec::with_capacity(level.len().div_ceil(2));
         for pair in level.chunks(2) {
             if pair.len() == 2 {
-                let mut hasher = Sha256::new();
-                hasher.update([0x01]);
-                hasher.update(pair[0]);
-                hasher.update(pair[1]);
-                next.push(hasher.finalize().into());
+                next.push(combine(&pair[0], &pair[1]));
             } else {
                 next.push(pair[0]); // promoted
             }
@@ -142,25 +161,20 @@ pub fn merkle_proof(leaf_hashes: &[[u8; 32]], index: usize) -> MerkleProof {
 }
 
 /// Verify that `leaf` is included under `root` via `proof`. Folds `leaf` with
-/// each sibling using the internal-node hash `H(0x01 || left || right)` in the
+/// each sibling using the internal-node hash `σ(0x01 || left || right)` in the
 /// recorded order and side, and checks the result equals `root`.
 ///
-/// Domain separation makes this safe: leaves are `H(0x00 || …)` and internal
-/// nodes `H(0x01 || …)`, so an internal-node value can never be presented as a
+/// Domain separation makes this safe: leaves are `σ(0x00 || …)` and internal
+/// nodes `σ(0x01 || …)`, so an internal-node value can never be presented as a
 /// leaf. A single-leaf tree has an empty proof and verifies iff `leaf == root`.
 pub fn verify_merkle_proof(leaf: [u8; 32], proof: &MerkleProof, root: [u8; 32]) -> bool {
     let mut current = leaf;
     for &(sibling, sibling_is_left) in &proof.siblings {
-        let mut hasher = Sha256::new();
-        hasher.update([0x01]);
-        if sibling_is_left {
-            hasher.update(sibling);
-            hasher.update(current);
+        current = if sibling_is_left {
+            combine(&sibling, &current)
         } else {
-            hasher.update(current);
-            hasher.update(sibling);
-        }
-        current = hasher.finalize().into();
+            combine(&current, &sibling)
+        };
     }
     current == root
 }
@@ -198,12 +212,8 @@ mod tests {
 
         let root = compute_merkle_root(&[a, b]);
 
-        // Manually compute expected: H(0x01 || a || b)
-        let mut hasher = Sha256::new();
-        hasher.update([0x01]);
-        hasher.update(a);
-        hasher.update(b);
-        let expected: [u8; 32] = hasher.finalize().into();
+        // Manually compute expected: σ(0x01 || a || b)
+        let expected = combine(&a, &b);
 
         assert_eq!(root, expected);
     }
@@ -216,19 +226,10 @@ mod tests {
 
         let root = compute_merkle_root(&[a, b, c]);
 
-        // Level 1: H(0x01||a||b), c promoted
-        let mut hasher = Sha256::new();
-        hasher.update([0x01]);
-        hasher.update(a);
-        hasher.update(b);
-        let ab: [u8; 32] = hasher.finalize().into();
-
-        // Level 2: H(0x01||ab||c)
-        let mut hasher = Sha256::new();
-        hasher.update([0x01]);
-        hasher.update(ab);
-        hasher.update(c);
-        let expected: [u8; 32] = hasher.finalize().into();
+        // Level 1: σ(0x01||a||b), c promoted
+        let ab = combine(&a, &b);
+        // Level 2: σ(0x01||ab||c)
+        let expected = combine(&ab, &c);
 
         assert_eq!(root, expected);
     }
@@ -254,11 +255,65 @@ mod tests {
 
     #[test]
     fn hash_node_domain_separated() {
-        // hash_node should differ from raw SHA-256
+        // hash_node must differ from the bare substrate hash of the same data
         let data = b"test data";
         let node_hash = hash_node(data);
-        let raw_hash: [u8; 32] = Sha256::digest(data).into();
-        assert_ne!(node_hash, raw_hash);
+        let raw_hash = data.as_slice().hash();
+        assert_ne!(&node_hash, raw_hash.as_bytes());
+    }
+
+    /// σ is BLAKE3-locked (`substrate.rs`), and this crate hashes at a
+    /// composition boundary — precisely where the lock's docs warn that a
+    /// second hash function breaks (DET) and (CR). Every hash here must be
+    /// the substrate's, reached through [`ContentAddressed`] rather than an
+    /// inline call, so a future algorithm change has one place to happen.
+    ///
+    /// Bead `ley-line-open-b61cd6`; ADR-0032 D5.
+    #[test]
+    fn merkle_leaf_hash_is_the_blake3_substrate_hash() {
+        let data = b"test data";
+        let mut framed = Vec::with_capacity(1 + data.len());
+        framed.push(0x00);
+        framed.extend_from_slice(data);
+
+        assert_eq!(
+            &hash_node(data),
+            framed.as_slice().hash().as_bytes(),
+            "hash_node must be σ(0x00 ‖ data), not SHA-256"
+        );
+    }
+
+    /// The internal-node combiner must also be σ. A tree whose leaves are
+    /// BLAKE3 and whose spine is SHA-256 would still "work" — and would be
+    /// exactly the mixed-function composition the lock forbids.
+    #[test]
+    fn merkle_internal_hash_is_the_blake3_substrate_hash() {
+        let left = [0xAAu8; 32];
+        let right = [0xBBu8; 32];
+
+        let mut framed = Vec::with_capacity(65);
+        framed.push(0x01);
+        framed.extend_from_slice(&left);
+        framed.extend_from_slice(&right);
+
+        assert_eq!(
+            &compute_merkle_root(&[left, right]),
+            framed.as_slice().hash().as_bytes(),
+            "internal nodes must combine under σ"
+        );
+    }
+
+    /// The empty-tree sentinel is part of the same algebra.
+    #[test]
+    fn merkle_empty_root_is_the_blake3_substrate_hash() {
+        let mut framed = Vec::with_capacity(6);
+        framed.push(0x02);
+        framed.extend_from_slice(b"empty");
+
+        assert_eq!(
+            &compute_merkle_root(&[]),
+            framed.as_slice().hash().as_bytes()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -315,18 +370,10 @@ mod tests {
     fn domain_separation_leaf_vs_internal() {
         let data = [0xAA; 32];
 
-        // Leaf hash: H(0x00 || data)
-        let mut h_leaf = Sha256::new();
-        h_leaf.update([0x00]);
-        h_leaf.update(data);
-        let leaf_hash: [u8; 32] = h_leaf.finalize().into();
-
-        // Internal hash: H(0x01 || data || [0;32])
-        let mut h_internal = Sha256::new();
-        h_internal.update([0x01]);
-        h_internal.update(data);
-        h_internal.update([0u8; 32]);
-        let internal_hash: [u8; 32] = h_internal.finalize().into();
+        // Leaf hash: σ(0x00 || data)
+        let leaf_hash = hash_node(&data);
+        // Internal hash: σ(0x01 || data || [0;32])
+        let internal_hash = combine(&data, &[0u8; 32]);
 
         assert_ne!(
             leaf_hash, internal_hash,
@@ -439,11 +486,7 @@ mod tests {
     fn internal_node_does_not_verify_as_a_leaf() {
         let leaves: Vec<[u8; 32]> = (0..4).map(|i| hash_node(&[i as u8])).collect();
         let root = compute_merkle_root(&leaves);
-        let mut h = Sha256::new();
-        h.update([0x01]);
-        h.update(leaves[0]);
-        h.update(leaves[1]);
-        let internal_ab: [u8; 32] = h.finalize().into();
+        let internal_ab = combine(&leaves[0], &leaves[1]);
         let proof0 = merkle_proof(&leaves, 0);
         assert!(
             !verify_merkle_proof(internal_ab, &proof0, root),

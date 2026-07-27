@@ -1503,10 +1503,26 @@ struct Finding {
     start_col: u32,
 }
 
-fn run_rule(conn: &Connection, rule: &Rule) -> Result<Vec<Finding>> {
-    // Check `Requires` — every named table must exist. Rules whose
-    // tables don't exist are silently skipped (mirrors mache's
-    // `--rule '*'` behavior).
+/// Whether a rule actually executed.
+///
+/// A rule whose `Requires` table is absent used to return an empty finding
+/// list — bit-identical to "ran and found nothing" — so the gate printed
+/// "N finding(s), all covered by baseline" and exited 0 while an unknown
+/// number of rules had never run. A count derived from a mechanism is only
+/// evidence if the mechanism fired; otherwise it is the safe-looking value by
+/// construction. Bead `ley-line-open-2607d2`.
+#[derive(Debug)]
+enum RuleOutcome {
+    /// The rule ran. Findings may still be empty, and that means something.
+    Ran(Vec<Finding>),
+    /// The rule did not run: a table it requires is absent.
+    Skipped { missing: String },
+}
+
+fn run_rule(conn: &Connection, rule: &Rule) -> Result<RuleOutcome> {
+    // Check `Requires` — every named table must exist. A rule whose tables
+    // are absent is SKIPPED, and the caller reports that rather than folding
+    // it into the finding count.
     for req in &rule.Requires {
         let exists: Option<i64> = conn
             .query_row(
@@ -1516,7 +1532,9 @@ fn run_rule(conn: &Connection, rule: &Rule) -> Result<Vec<Finding>> {
             )
             .unwrap_or(None);
         if exists.is_none() {
-            return Ok(Vec::new());
+            return Ok(RuleOutcome::Skipped {
+                missing: req.clone(),
+            });
         }
     }
     let sql = rule.Query.replace("%s", "");
@@ -1540,7 +1558,25 @@ fn run_rule(conn: &Connection, rule: &Rule) -> Result<Vec<Finding>> {
             start_col: start_col as u32,
         });
     }
-    Ok(findings)
+    Ok(RuleOutcome::Ran(findings))
+}
+
+/// State the denominator. A finding count without the number of rules that
+/// produced it cannot distinguish "clean" from "did not run".
+fn report_coverage(ran: usize, total: usize, skipped: &[(String, String)]) {
+    if skipped.is_empty() {
+        return;
+    }
+    eprintln!(
+        "smells: {} of {} rules SKIPPED — their required tables are absent, so \
+         this run says nothing about them:",
+        skipped.len(),
+        total
+    );
+    for (rule_id, missing) in skipped {
+        eprintln!("  {rule_id} (requires table `{missing}`)");
+    }
+    let _ = ran;
 }
 
 // ---------------------------------------------------------------------------
@@ -1657,10 +1693,14 @@ fn main() -> Result<()> {
     }
 
     let mut all_findings = Vec::new();
+    let mut skipped: Vec<(String, String)> = Vec::new();
     for rule in &rules {
-        let mut findings = run_rule(&conn, rule)?;
-        all_findings.append(&mut findings);
+        match run_rule(&conn, rule)? {
+            RuleOutcome::Ran(mut findings) => all_findings.append(&mut findings),
+            RuleOutcome::Skipped { missing } => skipped.push((rule.ID.clone(), missing)),
+        }
     }
+    let ran = rules.len() - skipped.len();
 
     let current_counts = findings_to_counts(&all_findings);
 
@@ -1721,6 +1761,7 @@ fn main() -> Result<()> {
                 );
             }
         }
+        report_coverage(ran, rules.len(), &skipped);
         eprintln!(
             "To grandfather (deliberate change): run `task smells:baseline` and commit {}.",
             baseline_path.display()
@@ -1728,9 +1769,12 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
+    report_coverage(ran, rules.len(), &skipped);
     eprintln!(
-        "smells: {} finding(s), all covered by baseline ({})",
+        "smells: {} finding(s) across {}/{} rules, all covered by baseline ({})",
         all_findings.len(),
+        ran,
+        rules.len(),
         baseline_path.display()
     );
     Ok(())
@@ -2078,5 +2122,57 @@ mod tests {
             "}",                     // 5
         ];
         assert_eq!(find_test_module_line(&lines), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod skip_visibility_tests {
+    //! A count derived from a mechanism is evidence only if the mechanism
+    //! fired. `run_rule` used to return an empty finding list for a rule whose
+    //! `Requires` table was absent — bit-identical to "ran and found nothing" —
+    //! so `task smells` printed "N finding(s), all covered by baseline" and
+    //! exited 0 while an unknown number of rules had never executed.
+    //!
+    //! The two tests below are a pair on purpose: the interesting property is
+    //! not that a skip is detected, it is that a skip and a genuinely clean
+    //! run are DISTINGUISHABLE. Bead `ley-line-open-2607d2`.
+    use super::*;
+
+    fn rule(requires: &str, query: &str) -> Rule {
+        Rule {
+            ID: "TEST-RULE".into(),
+            Description: String::new(),
+            Requires: vec![requires.into()],
+            ScopeColumn: String::new(),
+            Query: query.into(),
+        }
+    }
+
+    #[test]
+    fn a_rule_whose_required_table_is_absent_reports_skipped() {
+        let conn = Connection::open_in_memory().unwrap();
+        match run_rule(&conn, &rule("absent_table", "SELECT 'a','b',0,0")).unwrap() {
+            RuleOutcome::Skipped { missing } => assert_eq!(missing, "absent_table"),
+            RuleOutcome::Ran(f) => panic!(
+                "a rule that never ran must not report Ran; got {} findings",
+                f.len()
+            ),
+        }
+    }
+
+    #[test]
+    fn a_rule_that_runs_and_finds_nothing_reports_ran() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE present (x TEXT);")
+            .unwrap();
+        match run_rule(&conn, &rule("present", "SELECT 'a','b',0,0 WHERE 0")).unwrap() {
+            RuleOutcome::Ran(findings) => assert!(
+                findings.is_empty(),
+                "fixture query selects nothing, so the rule ran clean"
+            ),
+            RuleOutcome::Skipped { missing } => {
+                panic!("a rule whose tables exist must not report Skipped (missing={missing})")
+            }
+        }
     }
 }

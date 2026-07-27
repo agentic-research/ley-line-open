@@ -16,8 +16,10 @@
 package wire
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"strconv"
 )
 
 // Event is the JSON envelope wrapping every pushed event over the
@@ -36,9 +38,10 @@ type Event struct {
 	Event *bool `json:"event"`
 
 	// Seq is the monotonically increasing sequence number (Lamport
-	// timestamp) the daemon assigns at dispatch. Quoted-string per
-	// the capnp_json u64 convention.
-	Seq *uint64 `json:"seq,string"`
+	// timestamp) the daemon assigns at dispatch. LLO emits this as a
+	// JSON number. UnmarshalJSON below also accepts the legacy quoted
+	// capnp_json u64 form for compatibility with older producers.
+	Seq *uint64 `json:"seq"`
 
 	// Topic is the dot-separated hierarchical topic name. Examples:
 	// "sheaf.invalidate", "sheaf.topology", "daemon.snapshot",
@@ -54,6 +57,52 @@ type Event struct {
 	// callers can dispatch on Topic, then unmarshal into the typed
 	// payload struct ([DecodeEvent] does this in one step).
 	Data json.RawMessage `json:"data"`
+}
+
+// UnmarshalJSON accepts both the current numeric seq emitted by LLO and the
+// legacy quoted-u64 form. Keeping this tolerance at the published wire type
+// lets old and new daemons interoperate without making every subscriber add a
+// second envelope type.
+func (e *Event) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Event  *bool           `json:"event"`
+		Seq    json.RawMessage `json:"seq"`
+		Topic  *string         `json:"topic"`
+		Source *string         `json:"source"`
+		Data   json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	var seq *uint64
+	encoded := bytes.TrimSpace(raw.Seq)
+	if len(encoded) != 0 && !bytes.Equal(encoded, []byte("null")) {
+		var value uint64
+		if encoded[0] == '"' {
+			var quoted string
+			if err := json.Unmarshal(encoded, &quoted); err != nil {
+				return fmt.Errorf("seq: %w", err)
+			}
+			parsed, err := strconv.ParseUint(quoted, 10, 64)
+			if err != nil {
+				return fmt.Errorf("seq: %w", err)
+			}
+			value = parsed
+		} else if err := json.Unmarshal(encoded, &value); err != nil {
+			return fmt.Errorf("seq: %w", err)
+		}
+		seq = &value
+	}
+
+	*e = Event{
+		Event:  raw.Event,
+		Seq:    seq,
+		Topic:  raw.Topic,
+		Source: raw.Source,
+		Data:   raw.Data,
+	}
+	return nil
 }
 
 // SheafInvalidatePayload is the `data` payload for the `sheaf.invalidate`

@@ -407,9 +407,6 @@ fn insert_leaf(conn: &Connection, id: &str, record: &str) {
 /// binds bytes), which reaches mache and is therefore its own bead. Removing
 /// the attribute is the activation gesture once that lands.
 #[test]
-#[ignore = "ley-line-open-b5faa9: `record JSON` in the shared nodes contract carries NUMERIC \
-            affinity, so numeric-looking leaf tokens are coerced out of TEXT on insert and \
-            activation fails closed on the length change"]
 fn activation_survives_the_canonical_nodes_contract() {
     let conn = canonical_projection();
     insert_leaf(&conn, "a.rs/fn/body/int_literal", "007");
@@ -429,7 +426,7 @@ fn activation_survives_the_canonical_nodes_contract() {
 /// loudly at the moment the coercion stops happening, rather than leaving the
 /// ignored test above as the only signal.
 #[test]
-fn canonical_nodes_contract_coerces_numeric_records_and_blocks_activation() {
+fn canonical_nodes_contract_stores_numeric_tokens_verbatim() {
     let conn = canonical_projection();
     insert_leaf(&conn, "a.rs/fn/name", "main");
     insert_leaf(&conn, "a.rs/fn/body/int_literal", "007");
@@ -442,26 +439,31 @@ fn canonical_nodes_contract_coerces_numeric_records_and_blocks_activation() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(coerced, 2, "NUMERIC affinity takes both numeric tokens");
-
-    let stored: Vec<u8> = conn
-        .query_row(
-            "SELECT CAST(record AS BLOB) FROM nodes \
-              WHERE id = 'a.rs/fn/body/int_literal'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
     assert_eq!(
-        stored, b"7",
-        "the authoritative record is lossy: 007 reads back as 7"
+        coerced, 0,
+        "every record must read back as text; a non-text typeof means the \
+         column's declared type has drifted back to a NUMERIC-affinity name"
     );
 
-    let error = activate_chunked_content(&conn, ActivationOptions::default()).unwrap_err();
-    assert!(
-        format!("{error:#}").contains("does not match"),
-        "unexpected error: {error:#}"
-    );
+    for (id, expected) in [
+        ("a.rs/fn/body/int_literal", &b"007"[..]),
+        ("README.md/list/list_item_0/list_marker_dot", &b"1. "[..]),
+        ("a.rs/fn/name", &b"main"[..]),
+    ] {
+        let stored: Vec<u8> = conn
+            .query_row(
+                "SELECT CAST(record AS BLOB) FROM nodes WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, expected, "record for {id} must round-trip verbatim");
+    }
+
+    // And the size witness now agrees, so activation completes rather than
+    // failing closed on damage the DDL caused upstream.
+    let report = activate_chunked_content(&conn, ActivationOptions::default()).unwrap();
+    assert_eq!(report.populated_nodes, 3);
 }
 
 /// Activation opened one IMMEDIATE transaction PER NODE and committed it, so a

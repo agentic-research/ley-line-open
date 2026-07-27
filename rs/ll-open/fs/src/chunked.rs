@@ -1789,14 +1789,11 @@ mod tests {
 
     /// Minimal `nodes` row so the record-fallback path has something to read.
     fn insert_node_record(conn: &Connection, id: &str, content: &str) {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS nodes (
-                 id TEXT PRIMARY KEY, parent_id TEXT, name TEXT NOT NULL,
-                 kind INTEGER NOT NULL, size INTEGER DEFAULT 0,
-                 mtime INTEGER NOT NULL, record_id TEXT, record JSON,
-                 source_file TEXT);",
-        )
-        .unwrap();
+        // The CANONICAL contract, not a hand-rolled copy. A fixture that
+        // declares its own `nodes` DDL drifts from what producers ship
+        // against — which is how `record JSON`'s NUMERIC affinity went
+        // unnoticed (bead `ley-line-open-f7966d`).
+        leyline_schema::create_nodes_table(conn).unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO nodes (id, parent_id, name, kind, size, mtime, record) \
              VALUES (?1, '', ?1, 0, ?2, 1, ?3)",

@@ -18,10 +18,40 @@ use rusqlite::{Connection, params};
 ///     size INTEGER DEFAULT 0,
 ///     mtime INTEGER NOT NULL,
 ///     record_id TEXT,          -- optional: FK into results table (mache lazy loading)
-///     record JSON,
+///     record TEXT,             -- node content. TEXT, not JSON: see below.
 ///     source_file TEXT         -- optional: originating source file path (mache file tracking)
 /// );
 /// ```
+///
+/// # `record` is `TEXT`, deliberately — do not "restore" `JSON`
+///
+/// It was declared `JSON` until 2026-07-27. SQLite assigns column affinity by
+/// substring match: a declared type containing none of INT, CHAR, CLOB, TEXT,
+/// BLOB, REAL, FLOA, or DOUB gets **NUMERIC** affinity. `JSON` contains none
+/// of them, so every value that looked like a number was silently coerced:
+///
+/// ```text
+/// '007'   -> 7      typeof=integer   length 3 -> 1
+/// '1. '   -> 1      typeof=integer   length 3 -> 1
+/// '3.14'  -> 3.14   typeof=real
+/// 'hello' -> 'hello' typeof=text
+/// ```
+///
+/// Measured across three real projections: ~9,400 leaves per corpus stored
+/// with the wrong SQLite type and ~800-1,100 with the wrong BYTE LENGTH. That
+/// is silent corruption in the cross-runtime contract — "mache writes it,
+/// leyline-fs reads it" — and it also aborted `leyline cdc enable` on every
+/// real corpus, because activation's `size == record.len()` guard correctly
+/// failed closed on damage the DDL had caused upstream.
+///
+/// `record` is not JSON in any case. Producers write a node's CONTENT: an AST
+/// leaf token from `leyline-ts`, raw file bytes from `leyline-fs`'s
+/// `write_content`, a PEP 508 version specifier from `leyline-ts`'s pyproject
+/// projection. `TEXT` stores every one of them as given. What the column's
+/// contract SHOULD be is bead `ley-line-open-edec5b`; this only stops the
+/// corruption in the meantime.
+///
+/// Bead `ley-line-open-f7966d`.
 ///
 /// The `record_id` and `source_file` columns are nullable and default to NULL.
 /// They are used by mache's SQLiteGraph for lazy content resolution and
@@ -36,7 +66,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     size INTEGER DEFAULT 0,
     mtime INTEGER NOT NULL,
     record_id TEXT,
-    record JSON,
+    record TEXT,
     source_file TEXT
 );";
 
@@ -67,7 +97,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     size INTEGER DEFAULT 0,
     mtime INTEGER NOT NULL,
     record_id TEXT,
-    record JSON,
+    record TEXT,
     source_file TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_parent_name ON nodes(parent_id, name);

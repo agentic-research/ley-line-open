@@ -49,6 +49,8 @@ development, see [GETTING-STARTED.md](GETTING-STARTED.md).
   Cap'n Proto handoff is tracked by `ley-line-open-50be73`.
 - CDC is an explicit, derived read optimization. `nodes.record` remains
   authoritative; activate and collect CDC manifests with `leyline cdc`.
+- The `content_chunks`, `content_manifest`, and `content_manifest_meta` tables
+  are private derived indexes; they never replace the authoritative record.
 
 ## Install and build
 

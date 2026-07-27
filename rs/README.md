@@ -17,7 +17,7 @@ The Rust workspace for ley-line-open. Two tiers: `ll-core/` (infrastructure) and
 | Crate | Purpose |
 |---|---|
 | [`leyline-fs`](ll-open/fs/) | SqliteGraph (zero-copy `sqlite3_deserialize`), Graph trait, reader pool, NFS/FUSE mount |
-| [`leyline-ts`](ll-open/ts/) | Tree-sitter AST projection + bidirectional splice; κ CFG-kind vocabulary + CFG builder (T1.b3, dataflow-substrate decade) |
+| [`leyline-ts`](ll-open/ts/) | Tree-sitter AST projection + bidirectional splice; κ CFG-kind vocabulary + CFG builder (T1.b3, [`analysis-substrate`](../docs/decades/analysis-substrate.md) decade) |
 | [`leyline-lsp`](ll-open/lsp/) | LSP client — spawns language servers, projects symbols + diagnostics; emits `BindingRecord` capnp event log |
 | [`leyline-hdc`](ll-open/hdc/) | Hyperdimensional computing — per-scope hypervectors for structural code search |
 | [`leyline-sheaf`](ll-open/sheaf/) | Čech cohomology engine — sheaf cache + coboundary operators + structural invalidation |

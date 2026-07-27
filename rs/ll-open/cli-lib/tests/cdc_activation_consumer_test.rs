@@ -178,11 +178,27 @@ fn release_docs_pin_the_private_derived_ownership_contract() {
     let changelog = include_str!("../../../../CHANGELOG.md");
     let normalized_readme = readme.split_whitespace().collect::<Vec<_>>().join(" ");
 
-    assert!(readme.contains(
-        "`content_manifest`, and `content_manifest_meta` tables are private derived\nindexes"
-    ));
+    // Assert the CLAIM, not its line wrapping. The previous form matched a
+    // literal "private derived\nindexes" — a hard-wrap position — which is why
+    // the README carried a duplicated, unindented copy of this sentence purely
+    // to satisfy it. A gate that forces the prose it guards to be wrong is
+    // worse than no gate; these match on whitespace-normalized text so the
+    // paragraph can be rewrapped or reworded without weakening the contract.
+    for claim in [
+        "`content_chunks`, `content_manifest`, and `content_manifest_meta` tables",
+        "are private derived indexes",
+        "do not bump `leyline-schema`",
+    ] {
+        assert!(
+            normalized_readme.contains(claim),
+            "README must state the private-derived ownership contract; missing: {claim}"
+        );
+    }
+    // The authoritative-record claim is the load-bearing half — CDC may never
+    // be described as replacing `nodes.record` (ADR-0033 D1).
     assert!(
-        normalized_readme.contains("Changes to those private indexes do not bump `leyline-schema`")
+        normalized_readme.contains("never replace the authoritative record"),
+        "README must state that the private indexes never replace the authoritative record"
     );
     let v0102 = changelog
         .split("## [0.10.2]")

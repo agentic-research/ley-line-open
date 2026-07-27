@@ -21,9 +21,14 @@
 //!   same argument [`crate::head_digest`] makes for the head triple.
 //! * **Injectivity.** Every variable-length field is length-prefixed, so the
 //!   address commits to the decomposition rather than to the concatenation of
-//!   its parts. `Head.rootHash` currently lacks this (bead `b64505`): it
-//!   hashes `source ‖ ast ‖ bindings`, so two different segment splits with
-//!   equal concatenated bytes share a root.
+//!   its parts. `Head.rootHash` was the motivating defect (bead `b64505`): it
+//!   hashed `source ‖ ast ‖ bindings`, so two segment splits with equal
+//!   concatenated bytes shared a root. It now folds through this operator.
+//! * **Set canonicality.** For `ChunkSet` / `RowSet` the address is a function
+//!   of the SET: entries are sorted by address and their framing is dropped.
+//!   A set has no order, and the framing slot has no defined meaning there, so
+//!   folding either in would let a producer mint unlimited distinct addresses
+//!   for one set — malleability that breaks (DET) at this layer.
 //!
 //! **Deliberately absent: a hash-algorithm field.** Multihash-style agility is
 //! the one field every self-describing format adds and the one Σ must not —
@@ -33,12 +38,14 @@
 //! not choose a different `σ`.
 //!
 //! **No capnp schema yet, on purpose.** ADR-0014 fixes ordinals permanently —
-//! fields are appended, never renamed or removed. Nothing produces or consumes
-//! a `PartitionSpec` across a runtime boundary today, and freezing a wire
-//! shape before it has a producer is how you end up maintaining a hole. The
-//! wire form lands with its first consumer (bead `b68fa6`, `Head'`
-//! co-attestation), together with the Go bindings under
-//! `clients/go/leyline-schema/` so the two runtimes cannot drift.
+//! fields are appended, never renamed or removed. Nothing crosses a runtime
+//! boundary with a `PartitionSpec` today, and freezing a wire shape before it
+//! has a producer is how you end up maintaining a hole. The first real
+//! consumer is a receiver that must RE-DERIVE a partition rather than compare
+//! a root — cloister's skip attestation resolving a `spec_digest`, and the
+//! disclosure-stream bundling. Tracked as bead `ley-line-open-e1977b`, which
+//! lands the capnp family and the Go bindings together so the two runtimes
+//! cannot drift.
 //!
 //! Bead `ley-line-open-b67a73`. ADR: `docs/adr/0032-declared-decompositions.md`.
 
@@ -94,6 +101,18 @@ impl Domain {
             Domain::RowSet => 3,
         }
     }
+
+    /// Whether entry order and framing are part of this domain's identity.
+    ///
+    /// For an interval domain they are its content — offsets and lengths *are*
+    /// the decomposition. For a set domain they are not: a set has no order,
+    /// and the framing slot carries no defined meaning there. Folding them in
+    /// anyway would let a producer mint unlimited distinct addresses for one
+    /// set, so the address would stop being a function of the set — (DET)
+    /// failing at exactly the layer this type exists to make trustworthy.
+    const fn is_ordered(self) -> bool {
+        matches!(self, Domain::ByteStream)
+    }
 }
 
 impl PartitionSpec {
@@ -101,8 +120,11 @@ impl PartitionSpec {
     ///
     /// Every variable-length field is length-prefixed, so the address commits
     /// to the *decomposition* rather than to the concatenation of its parts.
-    /// That is what makes two different field splits distinguishable — the
-    /// property `Head.rootHash` currently lacks (bead `b64505`).
+    /// That is what makes two different field splits distinguishable.
+    ///
+    /// Ordered domains fold entry order and framing; set domains canonicalize
+    /// instead — sorted by address, framing dropped — so their address is a
+    /// function of the set rather than of how it was enumerated.
     pub fn address(&self, entries: &[Entry]) -> Hash {
         let mut hasher = blake3::Hasher::new_derive_key(PARTITION_CONTEXT);
         hasher.update(&[self.domain.tag()]);
@@ -112,11 +134,25 @@ impl PartitionSpec {
         hasher.update(&(self.params.len() as u64).to_le_bytes());
         hasher.update(&self.params);
         hasher.update(&(entries.len() as u64).to_le_bytes());
-        for entry in entries {
-            hasher.update(entry.addr.as_bytes());
-            hasher.update(&entry.a.to_le_bytes());
-            hasher.update(&entry.b.to_le_bytes());
+
+        if self.domain.is_ordered() {
+            for entry in entries {
+                hasher.update(entry.addr.as_bytes());
+                hasher.update(&entry.a.to_le_bytes());
+                hasher.update(&entry.b.to_le_bytes());
+            }
+        } else {
+            // Set domains canonicalize: sort by address, drop the framing.
+            // Both are required — sorting alone would still let framing
+            // malleate the address, and dropping framing alone would leave
+            // enumeration order significant for a thing that has no order.
+            let mut addrs: Vec<&Hash> = entries.iter().map(|e| &e.addr).collect();
+            addrs.sort_unstable();
+            for addr in addrs {
+                hasher.update(addr.as_bytes());
+            }
         }
+
         Hash::from_bytes(*hasher.finalize().as_bytes())
     }
 }
@@ -282,6 +318,92 @@ mod tests {
             plain.finalize().as_bytes(),
             "the fold must be keyed, not a bare hash of its children"
         );
+    }
+
+    /// A SET domain's address must be a function of the SET — not of the
+    /// order it happened to be enumerated in, nor of framing fields that carry
+    /// no meaning there. Otherwise two producers describing the identical row
+    /// set disagree on its address, which breaks (DET) at exactly the layer
+    /// this type exists to make trustworthy.
+    ///
+    /// Found by adversarial review of `Domain::RowSet` on the day it shipped.
+    #[test]
+    fn set_domains_ignore_entry_order() {
+        let s = spec(Domain::RowSet);
+        let fwd = [
+            Entry {
+                addr: h(1),
+                a: 0,
+                b: 0,
+            },
+            Entry {
+                addr: h(2),
+                a: 0,
+                b: 0,
+            },
+        ];
+        let rev = [fwd[1], fwd[0]];
+
+        assert_eq!(
+            s.address(&fwd),
+            s.address(&rev),
+            "a set is unordered; enumeration order must not change its address"
+        );
+    }
+
+    /// The framing slot is meaningful for `ByteStream` (offset, length) and
+    /// meaningless for set domains. Folding it in there would let a producer
+    /// mint unlimited distinct addresses for one set — a malleability slot.
+    #[test]
+    fn set_domains_ignore_entry_framing() {
+        let s = spec(Domain::ChunkSet);
+        let plain = [Entry {
+            addr: h(3),
+            a: 0,
+            b: 0,
+        }];
+        let garnished = [Entry {
+            addr: h(3),
+            a: 999,
+            b: 12345,
+        }];
+
+        assert_eq!(
+            s.address(&plain),
+            s.address(&garnished),
+            "framing carries no meaning in a set domain and must not be malleable"
+        );
+    }
+
+    /// The interval domain keeps both properties — order and framing are its
+    /// content. This is the guard that the fix above did not overreach.
+    #[test]
+    fn interval_domain_still_honours_order_and_framing() {
+        let s = spec(Domain::ByteStream);
+        let a = [
+            Entry {
+                addr: h(1),
+                a: 0,
+                b: 5,
+            },
+            Entry {
+                addr: h(2),
+                a: 5,
+                b: 5,
+            },
+        ];
+        let reordered = [a[1], a[0]];
+        let reframed = [
+            a[0],
+            Entry {
+                addr: h(2),
+                a: 5,
+                b: 6,
+            },
+        ];
+
+        assert_ne!(s.address(&a), s.address(&reordered));
+        assert_ne!(s.address(&a), s.address(&reframed));
     }
 
     /// (DET): same spec, same entries, same address across calls.

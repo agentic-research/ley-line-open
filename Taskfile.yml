@@ -617,6 +617,17 @@ tasks:
     cmds:
       - sh tools/check_architecture_vocabulary.sh .
 
+  # Claims, not vocabulary. `lint:architecture-vocabulary` asserts that terms
+  # are present or absent, which a document can satisfy while still stating
+  # something false — it passed green while the docs named a decade that does
+  # not exist, claimed SHA-256 lived in two places when a third shipped, and
+  # described a capnp read path mache does not implement. Every assertion here
+  # is checked against the repository, so it fails when the code moves.
+  lint:doc-claims:
+    desc: Verify documentation claims against the code they describe (ADR-0032 §D4)
+    cmds:
+      - sh tools/check_doc_claims.sh .
+
   # --------------------------------------------------------------------------
   # Smell-rule gate (workspace deps drift + unsafe/unwrap invariants).
   # Mache-shaped: `smell-projector` walks `rs/`, projects Cargo.toml
@@ -1008,6 +1019,7 @@ tasks:
       - task: release:version-check
       - task: lint:blake3
       - task: lint:architecture-vocabulary
+      - task: lint:doc-claims
       - task: readme:version-check
       - task: schema:version-check
       - task: check

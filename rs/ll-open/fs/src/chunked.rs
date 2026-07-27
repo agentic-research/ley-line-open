@@ -63,7 +63,17 @@
 //! - **Garbage collection is explicit.** Invalidating a manifest deliberately
 //!   leaves chunk bytes available for immediate reuse. Long-lived projections
 //!   bound that history with [`crate::gc::collect_unreachable_chunks`], an
-//!   off-hot-path transactional sweep over chunks no manifest references.
+//!   off-hot-path transactional sweep that first reaps manifests whose
+//!   freshness witness cannot be satisfied — a manifest every read already
+//!   refuses still *pins* its chunks, so without that step the collector
+//!   reports success and reclaims nothing (bead `ley-line-open-b5e56f`) —
+//!   and then deletes the chunks no surviving manifest references.
+//! - **Authority is scoped.** These tables are a DERIVED accelerator for this
+//!   crate's read path, not an identity domain. They have no root, are not a
+//!   cross-process contract, and are never the canonical substrate;
+//!   `nodes.record` holds that role. See ADR-0032 §D4 for the authority
+//!   assignment and ADR-0033 D1 for why the dual store is permanent rather
+//!   than a migration state.
 //! - **The manifest is a derived index, not the source of truth.**
 //!   `nodes.record` remains authoritative — it is the cross-runtime contract
 //!   (`leyline-schema`: "mache writes it, leyline-fs reads it"). The manifest

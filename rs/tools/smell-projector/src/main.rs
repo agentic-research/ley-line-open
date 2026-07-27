@@ -200,6 +200,26 @@ fn schema() -> &'static str {
             PRIMARY KEY (source_id, start_row, start_col)
         );
 
+        -- A `#[cfg(feature = ...)]` inside TEST code. Almost always the test
+        -- replicating the shape of a feature-gated PRODUCTION struct: seven
+        -- files build a `DaemonContext` literal and each must gate
+        -- `vec_index`/`embedder`/`embed_queue`/`text_search` itself, because
+        -- Rust will not let you initialise a field that does not exist. The
+        -- test then carries production's conditional shape, and `integration.rs`
+        -- is 3,522 lines partly for that reason. The fix is a constructor or
+        -- builder owning the cfg once, not a cfg per call site.
+        -- Bead `ley-line-open-2607d2` workstream. BASELINED — the existing
+        -- sites need a builder, which is a refactor, not a deletion.
+        CREATE TABLE cfg_feature_test_sites (
+            source_id    TEXT NOT NULL,
+            node_id      TEXT NOT NULL,
+            start_row    INTEGER NOT NULL,
+            start_col    INTEGER NOT NULL,
+            end_row      INTEGER NOT NULL,
+            end_col      INTEGER NOT NULL,
+            PRIMARY KEY (source_id, start_row, start_col)
+        );
+
         CREATE TABLE unwrap_sites (
             source_id    TEXT NOT NULL,
             node_id      TEXT NOT NULL,
@@ -1446,6 +1466,110 @@ fn project_sleep_sites(workspace_root: &Path, repo_root: &Path) -> Result<Vec<Sl
     Ok(rows)
 }
 
+/// Every `#[cfg(feature = "...")]` inside test code.
+///
+/// Same file scope as `project_sleep_sites`: whole file under `/tests/` or
+/// `/benches/`, and only the `#[cfg(test)]` tail of a `/src/` file. `cfg(test)`
+/// itself is NOT a finding — this is about FEATURE gating leaking into tests.
+fn project_cfg_feature_test_sites(
+    workspace_root: &Path,
+    repo_root: &Path,
+) -> Result<Vec<SleepRow>> {
+    let mut rows = Vec::new();
+    for entry in WalkDir::new(workspace_root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+            continue;
+        }
+        let s = path.to_string_lossy();
+        if s.contains("/target/") {
+            continue;
+        }
+        // TEST TREES ONLY. Unlike `sleep_sites`, this rule does NOT scan the
+        // `#[cfg(test)]` tail of `/src/` files: production code is exactly
+        // where feature gating belongs, and including src made the rule report
+        // 309 sites dominated by `languages.rs` (141) and `lib.rs` (89)
+        // legitimately gating grammars. The signal wanted here is a TEST
+        // carrying production's conditional shape.
+        if !(s.contains("/tests/") || s.contains("/benches/")) {
+            continue;
+        }
+
+        let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let lines: Vec<&str> = text.lines().collect();
+        let test_start = 0usize;
+        let inside_raw_string = raw_string_line_mask(&text);
+        let source_id = path
+            .strip_prefix(repo_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
+
+        for (idx, line) in lines.iter().enumerate() {
+            let line_no = idx + 1;
+            if line_no < test_start {
+                continue;
+            }
+            if inside_raw_string.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            // A whole-file gate is the GOOD pattern — it is the fix, not the
+            // smell. Only inner attributes on individual items are flagged.
+            if trimmed.starts_with("#![cfg(feature") {
+                continue;
+            }
+            // Skip matches inside string literals — this projector's own
+            // tests assert on `"#[cfg(feature = \"x\")]"` as DATA, and four of
+            // those were the rule's first findings. A false positive that gets
+            // baselined is indistinguishable from a real one that never burns
+            // down, so filter rather than grandfather.
+            if let Some(col) = line.find("#[cfg(feature").filter(|col| {
+                let unescaped_quotes = line[..*col]
+                    .char_indices()
+                    .filter(|(i, c)| *c == '"' && (*i == 0 || line.as_bytes()[i - 1] != b'\\'))
+                    .count();
+                unescaped_quotes % 2 == 0
+            }) {
+                rows.push(SleepRow {
+                    node_id: format!("{source_id}:{line_no}:{col}"),
+                    source_id: source_id.clone(),
+                    start_row: line_no as u32,
+                    start_col: col as u32,
+                    end_row: line_no as u32,
+                    end_col: col as u32,
+                });
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn insert_cfg_feature_test_sites(conn: &Connection, rows: &[SleepRow]) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "INSERT OR REPLACE INTO cfg_feature_test_sites (
+            source_id, node_id, start_row, start_col, end_row, end_col
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    for r in rows {
+        stmt.execute(params![
+            r.source_id,
+            r.node_id,
+            r.start_row,
+            r.start_col,
+            r.end_row,
+            r.end_col,
+        ])?;
+    }
+    Ok(())
+}
+
 fn insert_sleep_sites(conn: &Connection, rows: &[SleepRow]) -> Result<()> {
     let mut stmt = conn.prepare(
         "INSERT OR REPLACE INTO sleep_sites (
@@ -1683,6 +1807,9 @@ fn main() -> Result<()> {
     // test trees they skip.
     let sleep_rows = project_sleep_sites(&workspace_root, &repo_root)?;
     insert_sleep_sites(&conn, &sleep_rows)?;
+
+    let cfg_rows = project_cfg_feature_test_sites(&workspace_root, &repo_root)?;
+    insert_cfg_feature_test_sites(&conn, &cfg_rows)?;
 
     let rules = load_rules(&rules_dir)?;
     if rules.is_empty() {

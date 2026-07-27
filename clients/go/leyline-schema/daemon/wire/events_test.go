@@ -58,6 +58,21 @@ func TestDecodeEvent_SheafInvalidate(t *testing.T) {
 	}
 }
 
+func TestDecodeEvent_SheafInvalidate_NumericSeq(t *testing.T) {
+	line := []byte(`{"event":true,"seq":6,"topic":"sheaf.invalidate","source":"leyline","data":{"invalidated":[1],"count":1,"generation":"2","prior_generation":"1"}}`)
+
+	ev, payload, err := DecodeEvent(line)
+	if err != nil {
+		t.Fatalf("DecodeEvent numeric seq: %v", err)
+	}
+	if ev.Seq == nil || *ev.Seq != 6 {
+		t.Fatalf("envelope.seq: want 6, got %v", ev.Seq)
+	}
+	if _, ok := payload.(SheafInvalidatePayload); !ok {
+		t.Fatalf("payload type: want SheafInvalidatePayload, got %T", payload)
+	}
+}
+
 // TestDecodeEvent_SheafTopology_SetTopologyShape: sheaf.topology emitted
 // by op_sheaf_set_topology has no `kind` field. Discriminator: Kind nil.
 func TestDecodeEvent_SheafTopology_SetTopologyShape(t *testing.T) {

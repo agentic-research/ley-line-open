@@ -1,334 +1,105 @@
 # ley-line-open
 
-Open-source data plane primitives for agentic systems. Extracted from [ley-line](https://github.com/agentic-research/ley-line).
+Ley-line-open (LLO) is a continuously updated code-index database and query
+server. It turns source code into structured facts that agents and tools can
+query without repeatedly reparsing a repository.
 
-**New here?** [`GETTING-STARTED.md`](GETTING-STARTED.md) covers the user paths — mache auto-spawns leyline, so most users never run `leyline parse` themselves. Direct-use + working-on-LLO sections behind clear headers. Skip the rest of this README on first read.
+Most people use it through [mache](https://github.com/agentic-research/mache):
+mache installs or starts `leyline` for you. Start with
+[GETTING-STARTED.md](GETTING-STARTED.md). This README is the short orientation;
+the implementation-level contract is in
+[docs/TECHNICAL_OVERVIEW.md](docs/TECHNICAL_OVERVIEW.md).
 
-## Architecture
+## The useful mental model
 
-```mermaid
-flowchart LR
-  subgraph Producer[LLO producer]
-    parse[cmd_parse<br/>tree-sitter]
-    lsp[lsp pass<br/>LSP servers]
-  end
-
-  subgraph Σ[Σ Merkle-CAS substrate]
-    direction TB
-    ast[ast.capnp<br/>AstNode segments]
-    src[source.capnp<br/>SourceFile segments]
-    bind[bindings.capnp<br/>BindingRecord log]
-    head[head.capnp<br/>rootHash chain]
-    head -. parentHash .-> head
-  end
-
-  subgraph SQL[Local SQL projection]
-    nodes[(nodes / _ast<br/>_source / _file_index)]
-  end
-
-  subgraph Consumers[Cross-runtime consumers]
-    mache[mache<br/>Go]
-    workerd[cloister / workerd<br/>TS · future]
-    ctlroom[control-room<br/>Swift · future]
-  end
-
-  parse --> ast
-  parse --> src
-  parse --> nodes
-  lsp --> bind
-
-  ast -- BLAKE3 canonical bytes --> head
-  src -- BLAKE3 canonical bytes --> head
-  bind -- BLAKE3 canonical bytes --> head
-
-  bind -.-> mache
-  ast -.-> mache
-  src -.-> mache
-  bind -.-> workerd
-  bind -.-> ctlroom
-
-  classDef substrate fill:#0b3d2e,stroke:#1ed896,color:#e8f7ee;
-  classDef proj fill:#3a2c0e,stroke:#d8a31e,color:#f5e8c8;
-  class ast,src,bind,head substrate;
-  class nodes proj;
+```text
+source files
+    │ tree-sitter + language servers
+    ▼
+structured code facts
+    ├── SQLite projections for local queries
+    ├── Cap'n Proto records for cross-runtime interchange
+    └── BLAKE3 identities for verification and snapshot history
+             │
+             ▼
+       leyline daemon ── UDS / MCP HTTP ── mache, agents, other consumers
 ```
 
-Canonical Cap'n Proto bytes, SQL snapshots, and individual blobs have distinct
-identities:
-
-- The **Cap'n Proto segment root** commits to canonical cross-runtime segment
-  bytes and is chained through `head.capnp`.
-- The **SQLite arena snapshot root** is `Controller.current_root`; it commits to
-  one serialized active SQLite buffer, not to a table or row.
-- A **blob hash** commits to one CDC or CAS payload and is verified on every
-  successful `BlobStore::get`.
-- The **SQL projection ABI** is the local query/table surface (`nodes`, `_ast`,
-  `_source`, `_file_index`, and private indexes). It is useful and shared, but
-  it is not interchangeable with any of the three content identities above.
-
-This is enforced — see [`docs/adr/0014-capnp-as-protocol.md`](docs/adr/0014-capnp-as-protocol.md). A `cargo test --test fileid_allowlist` gate locks every schema's `@0x...` fileId; a `cargo test --test cross_runtime_fixtures` gate asserts canonical-byte stability against committed fixtures.
-
-## Crates
-
-### Tier 1: Infrastructure (`ll-core/`)
-
-| Crate | Purpose |
-|-------|---------|
-| `leyline-core` | Arena header (`repr(C)`, bytemuck), Controller (mmap'd control block, `current_root: [u8; 32]`) |
-| `leyline-schema` | Shared `nodes` table DDL — local SQL contract (a *projection* of the substrate) |
-| `leyline-public-schema` | Protobuf definition of nodes schema (cross-language SQL contract) |
-| `leyline-schema-capnp` | **Cap'n Proto schemas** (`AstNode`, `SourceFile`, `BindingRecord`, `Head`, `Position`, `Range`, `Hash`) — the typed cross-runtime substrate contract per ADR-0014 |
-
-### Tier 2: Projection Engine (`ll-open/`)
-
-| Crate | Purpose |
-|-------|---------|
-| `leyline-fs` | SqliteGraph (verified mmap slice copied into SQLite-owned memory by `deserialize_read_exact`), Graph trait, reader pool, NFS/FUSE mount (feature-gated), C FFI bridge |
-| `leyline-ts` | Tree-sitter AST projection + bidirectional splice |
-| `leyline-lsp` | LSP client — spawns language servers, projects symbols + diagnostics into nodes; emits `BindingRecord` capnp event log |
-| `leyline-hdc` | Hyperdimensional computing — D=8192 hypervectors via bundle composition + seeded leaves; popcount-Hamming distance; `HvCell` sheaf-stalks for `leyline-sheaf` (ADR-0024, ADR-0025) |
-| `leyline-sheaf` | Čech cohomology engine — cochain complex (δ⁰, δ¹), sheaf cache with H⁰-based invalidation, restriction-weight learning |
-| `leyline-cli-lib` | Daemon: living SQLite db + arena flip + Σ root advance + MCP/UDS surfaces |
-| `leyline-cli` | `leyline` binary — `parse`, `lsp`, `daemon`, `serve`, `inspect` subcommands |
-
-## Σ substrate
-
-The Σ Merkle-CAS substrate is the unifying primitive — see [`docs/decades/2026-merkle-cas-substrate.md`](docs/decades/2026-merkle-cas-substrate.md). One-line definition:
-
-> Σ = (𝓥, 𝓒, ρ, σ, R, S) is a content-addressed, **Merkle-rooted with BLAKE3**, CAS-advanced state substrate. The arena protocol is a degenerate case (sequence-named instead of hash-named). BLAKE3 is locked (post-red-team 2026-05-05).
-
-```mermaid
-flowchart TB
-  subgraph parse_run[Parse run @ generation N]
-    p1[serialize<br/>capnp segments]
-    p2[BLAKE3 canonical bytes]
-    p3["Head_N: rootHash, parentHash=Head_{N-1}.rootHash"]
-  end
-  prev["Head_{N-1}"] -. parentHash .-> p3
-  p3 --> next["Head_{N+1}<br/>future run"]
-  classDef chain fill:#1a2747,stroke:#5a8eed,color:#e3edff;
-  class prev,p3,next chain;
-```
-
-Each parse run produces a fresh capnp segment, hashes it with BLAKE3 over **canonical bytes** (segment-table prefix stripped per the canonical-encoding spec), and chains a new `Head` whose `parentHash` points at the previous run. The chain is the file-backed analogue of `Controller::current_root` (T2.1) for the daemon path.
-
-**What canonical encoding buys us** (ADR-0014 §1): adding a field at the next ordinal `@N` with default value does not change the canonical bytes for instances that don't set it. So additive schema changes do not advance Σ root for unchanged data — the substrate is byte-stable across schema evolution. Backed by Cap'n Proto's published canonical-encoding spec + the same precedent IPLD/DAG-CBOR and ATproto/DRISL follow.
-
-The signed `Head` (v0.10.0) is the concrete case: the `signature @5` / `signerKid @6` fields are additive, so an unsigned head stays byte-identical to v0.9.0 and Σ root does not advance for existing arenas. When `LEYLINE_HEAD_SIGNING_KEY` is set, each `Head` is signed over a domain-separated digest of `(generation, rootHash, parentHash)` — not `rootHash` alone, so a signature cannot be replayed at another generation or grafted onto a forked chain; `signerKid` is the substrate-canonical key id (`lowercasehex(SHA-256(SPKI)[:16])`, signet ADR-012). With `LEYLINE_HEAD_TRUSTED_KEYS` set, a head is verified before it is adopted as chain state and a tampered head is refused. Both are opt-in and off by default.
-
-## Cross-runtime contract
-
-`leyline-schema-capnp` holds the canonical schemas. Other runtimes generate bindings from the same `.capnp` files:
-
-| Runtime | Generator | Uses |
-|---------|-----------|------|
-| Rust (LLO) | `capnpc 0.20.0` (exact) | producer + local consumer |
-| Go ([mache](https://github.com/agentic-research/mache)) | `capnpc-go` (exact tag) | reads `*.bindings.capnp` directly; no SQL JOIN |
-| TypeScript (cloister/workerd) | future | edge gateway |
-| Swift (control-room) | future | mobile client |
-
-Toolchain triplet (compiler / generators / runtimes) exact-pinned per ADR-0014 §3. Cross-runtime byte-equality enforced by `tests/fixtures/*.bin` consumed by both Rust and Go CI.
-
-See [`rs/ll-core/schema-capnp/README.md`](rs/ll-core/schema-capnp/README.md) for the file-format conventions and producer/consumer reader patterns.
-
-## Build
+The normal path is:
 
 ```bash
-cd rs
-cargo build
-cargo test
+cd /path/to/mache && task install
+cd /path/to/ley-line-open && task install
+mache serve
 ```
 
-Or via Taskfile (preferred — wraps pkg-config for macFUSE-less hosts via the vendored `rs/pkgconfig/fuse.pc`):
+You generally do not need to run `leyline parse` yourself. For direct use or
+development, see [GETTING-STARTED.md](GETTING-STARTED.md).
+
+## What is stable
+
+- `nodes`, `_ast`, `_source`, and related SQLite tables are local query
+  projections, not the cross-runtime wire contract.
+- Cap'n Proto schemas under `rs/ll-core/schema-capnp/schemas/` are the typed
+  interchange contract. Go bindings live in
+  [`clients/go/leyline-schema`](clients/go/leyline-schema/).
+- The daemon serves line-delimited JSON over its Unix socket and MCP HTTP when
+  enabled. Typed fixtures test the Rust↔Go response surface.
+- Arenas publish consistent SQLite snapshots. The generalized arena↔consumer
+  Cap'n Proto handoff is tracked by `ley-line-open-50be73`.
+- CDC is an explicit, derived read optimization. `nodes.record` remains
+  authoritative; activate and collect CDC manifests with `leyline cdc`.
+- The `content_chunks`, `content_manifest`, and `content_manifest_meta` tables
+  are private derived indexes; they never replace the authoritative record.
+  The `content_manifest`, and `content_manifest_meta` tables are private derived
+indexes. Changes to those private indexes do not bump `leyline-schema`.
+
+## Install and build
 
 ```bash
-task ci      # check + clippy + test (workspace 285+ tests)
+task install              # released/default feature set
+task install:full         # portable full feature set, no mount backend
+task install:full+mount   # add FUSE/NFS support
+task ci                   # check, clippy, formatting, tests, FFI gates
 ```
 
-### Install
+The current release is `v0.10.4`. It publishes platform binaries, FFI
+staticlibs, and the Apache-2.0 Go schema module at
+`clients/go/leyline-schema/v0.10.4`. See
+[releases/latest](https://github.com/agentic-research/ley-line-open/releases/latest)
+for assets and [GETTING-STARTED.md](GETTING-STARTED.md) for download commands.
 
-Three install paths, matching the three feature-graph shapes on `leyline-cli`:
+## OCI image
 
-| Command | Features | When to use |
-|---------|----------|-------------|
-| `task install` | `lsp` + `validate` + `hdc` + `cdc` (default) | Structural-analysis core plus opt-in chunk activation. Portable, no system deps. Small binary. |
-| **`task install:full`** | `--features all` = adds `vec` (fastembed) + `text-search` (WitchcraftEngine). NO mount | **Recommended for downstream consumers** (mache / cloister / notme / rosary). Portable — no libfuse-t/libfuse runtime dep. |
-| `task install:full+mount` | `--features full` = adds `mount` (FUSE/NFS backend) | Only if you're going to mount an arena as a filesystem. **Requires libfuse-t (macOS) or libfuse (Linux) at runtime** or the binary won't launch. |
-
-All three codesign on macOS (ad-hoc + entitlements) and drop the binary at `~/.local/bin/leyline`.
-
-### Activate chunk-backed reads
-
-CDC is compiled into every install shape but never mutates a projection
-implicitly. Activate an existing database explicitly:
+`task image` builds a local distroless OCI image tagged
+`localhost/leyline:0.10.4` (equivalently `ley-line-open:0.10.4`). It uses
+krust/cargo-zigbuild for the static binary
+and `cgr.dev/chainguard/static:latest` as the runtime base. The image is not
+automatically pushed to GHCR; `ghcr.io/agentic-research/ley-line-open:0.10.4`
+is a registry reference only when an operator has published that image.
 
 ```bash
-leyline cdc enable --db /tmp/my-code.db
+task image
+task image:smoke
 ```
 
-The command processes authoritative readable leaves in bounded deterministic
-pages, prints progress, and can safely resume after interruption. For a living
-daemon, opt in before its first published arena snapshot:
+The image exposes MCP on container port 8384. Publish it to host loopback (for
+example `-p 127.0.0.1:18384:8384`) unless an authenticated proxy is in front.
 
-```bash
-leyline daemon --source ./path/to/code --cdc
-```
+## Repository map
 
-`nodes.record` stays authoritative. The `content_chunks`,
-`content_manifest`, and `content_manifest_meta` tables are private derived
-indexes: stale or absent manifests fall back to the authoritative record, and
-activation rebuilds them. Expect temporary storage amplification while both
-representations coexist. Changes to those private indexes do not bump
-`leyline-schema`; a version change is required only if the cross-runtime
-`nodes` contract or another public schema surface changes.
-
-Long-lived writable projections can inspect and collect chunk history
-explicitly:
-
-```bash
-leyline cdc gc --db /tmp/my-code.db --dry-run --json
-leyline cdc gc --db /tmp/my-code.db
-```
-
-GC is off the write path and transactional. It deletes only chunks that no
-committed manifest references, so shared chunks remain until their final
-manifest disappears.
-
-### Prereqs
-
-**Build-time (all install paths):**
-- `brew install capnp` (macOS) / `apt-get install capnproto libcapnp-dev` (Linux) — required for `build.rs` codegen; pinned to ≥1.3.0.
-
-**Runtime (only for `install:full+mount`):**
-- macOS: `brew install fuse-t` (no kernel extension needed).
-- Linux: `apt-get install libfuse3-dev`.
-
-`install` and `install:full` have NO runtime system-dep prereq.
-
-**Optional acceleration:**
-- `brew install sccache` (or `cargo install sccache`) — Taskfile auto-detects and sets `RUSTC_WRAPPER` for cross-invocation caching of byte-stable rustc work. No config needed.
-
-## Building the image
-
-A distroless OCI image (`ley-line-open:0.10.4`, ~20 MB) is built via [`krust`](https://github.com/imjasonh/krust) (cargo-zigbuild → static musl binary) + a one-line `docker build` that COPYs the binary onto `cgr.dev/chainguard/static`. See `image.Dockerfile` and `Taskfile.yml`. The image's default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0` headless — no FUSE/NFS, just the MCP HTTP transport on `:8384` inside the container (consumed by cloister via `LLO_MCP_URL`, default `http://localhost:8384/mcp`).
-
-```bash
-brew install zig                   # cargo-zigbuild backend
-cargo install cargo-zigbuild krust # one-time
-task image                         # → ley-line-open:0.10.4 in local docker
-task image:smoke                   # build + start daemon + curl tools/list
-```
-
-`--mcp-bind 0.0.0.0` is baked into the image's default CMD because docker port-forwarding can't reach a 127.0.0.1 (loopback-only) listener inside the container. The daemon binary still defaults to `127.0.0.1` for non-container use; only the image overrides.
-
-Cross-arch: `task image PLATFORM=linux/amd64` builds an amd64 image instead. The Taskfile derives the matching musl target triple and passes it to docker via `--build-arg BIN_PATH=…`.
-
-The apko/melange path was evaluated and abandoned on Apple Silicon (Docker Desktop's virtiofs stalls melange's workspace bind-mount; apko's multi-arch list fails when only the host arch APK exists). See bead `ley-line-open-2b255c` for the post-mortem.
-
-## C FFI
-
-`leyline-fs` builds as a staticlib (`libleyline_fs.a`) with a C header (`include/leyline_fs.h`):
-
-```bash
-task build:fs-static               # default FFI features + CDC
-# Header: rs/ll-open/fs/include/leyline_fs.h
-# Library: rs/target/debug/libleyline_fs.a
-```
-
-## Go bindings
-
-Generated Go bindings for every public capnp schema ship as a separate Go module under [`clients/go/leyline-schema/`](clients/go/leyline-schema/) (multi-module monorepo, kubernetes/api / stripe-go pattern). Downstream Go consumers (mache first) `go get` it directly — no forking the `.capnp` files:
-
-```go
-import "github.com/agentic-research/ley-line-open/clients/go/leyline-schema/binding"
-```
-
-One sub-package per schema (`ast`, `binding`, `cache`, `common`, `daemon`, `head`, `net`, `source`). Regen via `clients/go/leyline-schema/regen.sh`; CI gates on `git diff --exit-code` plus `go test ./...` decoding the same `tests/fixtures/*.bin` the Rust suite asserts byte-equality against.
-
-Typed daemon JSON consumers should import
-`github.com/agentic-research/ley-line-open/clients/go/leyline-schema/daemon/wire`;
-it exposes the canonical response, event-envelope, and event-payload structs.
-
-Latest tag: [`clients/go/leyline-schema/v0.10.4`](https://github.com/agentic-research/ley-line-open/releases/tag/clients%2Fgo%2Fleyline-schema%2Fv0.10.4).
-Schema tags move only when this supported public contract changes.
-
-## Daemon protocol
-
-`leyline-cli-lib` exposes the daemon over two transports — line-delimited JSON on a Unix-domain socket and JSON-RPC over MCP HTTP — sharing a single dispatch entry (`ops::handle_base_op` / `is_known_base_op`) covering 23 base ops plus `vec_search` under the `vec` Cargo feature: lifecycle (`status`, `flush`, `load`, `snapshot`, `reparse`, `enrich`), navigation (`list_roots`, `list_children`, `get_node`, `read_content`), graph queries (`find_callers`, `find_callees`, `find_defs`, `get_refs_map`, `get_defs_map`), introspection (`get_schema`, `get_db_path`), LSP (`lsp_hover`, `lsp_defs`, `lsp_refs`, `lsp_symbols`, `lsp_diagnostics`), bulk SQL (`query`), and embedding search (`vec_search`, feature-gated).
-
-Most base-op responses are typed against `daemon.capnp` via [`rs/ll-open/cli-lib/src/daemon/wire.rs`](rs/ll-open/cli-lib/src/daemon/wire.rs) — the 17 covered today are the lifecycle, navigation, graph-query, and introspection ops listed above (`list_roots` shares `ListChildrenResponse`). Three groups stay outside the typed mirror by design:
-
-- The 5 LSP ops (`lsp_hover`, `lsp_defs`, `lsp_refs`, `lsp_symbols`, `lsp_diagnostics`) emit ad-hoc JSON via a shared `lsp_rows_response` builder; their row shape is open-ended per LSP method, so a typed mirror would add ceremony without buying drift detection beyond what the fixture gate already provides.
-- `vec_search` (feature-gated) returns ad-hoc JSON for the same reason — search-result rows are embedder-specific.
-- `query` is the deliberate untyped escape hatch — its `rows` shape is column-keyed maps rather than the schema's positional `List(Text)` (tracked as a follow-up; the wire-shape change can't be reconciled additively).
-
-For the typed ops, `BaseRequest` is a serde tagged enum (`#[serde(tag = "op", rename_all = "snake_case")]`) so unknown ops, malformed args, and missing required fields surface as structured errors rather than silent miss-and-coerce. The JSON encoding is the carrier today; the typed contract is the schema. See ADR-0014's *Out of scope (future ADRs) → Live RPC* section for the framing.
-
-Cross-runtime parity is gated by `rs/ll-open/cli-lib/tests/fixtures/daemon-protocol.json`: a Rust integration test asserts every handler emits the required keys, and `clients/go/leyline-schema/daemon/daemon_protocol_test.go` decodes each fixture response into the matching typed Go struct under `json.DisallowUnknownFields` + explicit EOF (so unknown fields and trailing content also fail). Together the gates catch schema↔wire drift in CI; the typed enum + handler signatures catch most of it at compile time too, but wire.rs is a hand-written mirror so the fixture gate is the load-bearing guarantee.
-
-## Schema contracts
-
-Two layers of schema, intentionally distinct:
-
-### 1. The substrate contract (`*.capnp` files)
-
-The typed cross-runtime contract per ADR-0014. Lives in `rs/ll-core/schema-capnp/schemas/`:
-
-| File | Schemas |
-|------|---------|
-| `common.capnp` | `Position`, `Range`, `Hash` (BLAKE3-32), `NodeRef` |
-| `binding.capnp` | `BindingRecord` (target, refToken, construct/refSiteNodeId, refUri, range, parseGen, qualifier) |
-| `ast.capnp` | `AstNode` (nodeId, sourceId, nodeKind, range) |
-| `source.capnp` | `SourceFile` (id, language, canonicalPath, contentHash, mtime, size) |
-| `head.capnp` | `Head` (rootHash, parentHash, generation, segmentBytes) |
-
-Append-only-additive evolution. Never rename, never repurpose, never reuse ordinals. CI gate on `(filename, fileId)` allowlist. See [`docs/adr/0014-capnp-as-protocol.md`](docs/adr/0014-capnp-as-protocol.md).
-
-### 2. The local SQL projection (`nodes` table)
-
-Lives in `leyline-schema`. *Local query optimization*, not the contract. mache and other consumers may project capnp segments into SQL views of their own shape — the SQL columns are not the cross-process surface.
-
-```sql
-CREATE TABLE IF NOT EXISTS nodes (
-    id TEXT PRIMARY KEY,
-    parent_id TEXT,
-    name TEXT NOT NULL,
-    kind INTEGER NOT NULL,   -- 0=file, 1=dir
-    size INTEGER DEFAULT 0,
-    mtime INTEGER NOT NULL,
-    record_id TEXT,          -- optional: FK into results table (mache lazy loading)
-    record JSON,
-    source_file TEXT         -- optional: originating source file (mache file tracking)
-);
-```
-
-Per-layer schema partitioning lives in [`docs/TABLE_CONTRACT.md`](docs/TABLE_CONTRACT.md).
-
-## References
-
-- **ADR-0014 — Cap'n Proto as the producer/consumer protocol**: [`docs/adr/0014-capnp-as-protocol.md`](docs/adr/0014-capnp-as-protocol.md)
-- **Σ Merkle-CAS substrate decade**: [`docs/decades/2026-merkle-cas-substrate.md`](docs/decades/2026-merkle-cas-substrate.md)
-- **T8 thread design analysis**: [`docs/decades/T8/adr-0014-design-analysis.md`](docs/decades/T8/adr-0014-design-analysis.md)
-- **T8 thread RTFM dossier**: [`docs/decades/T8/capnp-rtfm-findings.md`](docs/decades/T8/capnp-rtfm-findings.md)
-- **Cross-runtime fixture conventions**: [`rs/ll-core/schema-capnp/README.md`](rs/ll-core/schema-capnp/README.md)
+- `rs/ll-core` — arena, hashes, schemas, and shared infrastructure.
+- `rs/ll-open/ts` — tree-sitter parsing and AST projections.
+- `rs/ll-open/lsp` — language-server enrichment.
+- `rs/ll-open/fs` — SQLite graph, arena reader, CDC, FFI, and mount adapters.
+- `rs/ll-open/cli-lib` — daemon lifecycle and UDS/MCP dispatch.
+- `clients/go/leyline-schema` — generated Go contract bindings.
+- `docs/ARCHITECTURE.md` — normative ownership and invariants.
+- `docs/TABLE_CONTRACT.md` — SQL projection contract.
+- `docs/TECHNICAL_OVERVIEW.md` — detailed concepts and glossary.
 
 ## License
 
-**Split by layer: the interface is permissive, the implementation is copyleft.**
-
-| Layer | License | Why |
-|---|---|---|
-| Schema / wire contracts | [Apache-2.0](LICENSE-APACHE) | So other runtimes can implement and consume the contract without inheriting copyleft |
-| Everything else | [AGPL-3.0-or-later](LICENSE) | The engine itself |
-
-Apache-2.0 covers exactly the crates that define the cross-runtime contract, and nothing that implements it:
-
-- `clients/go/leyline-schema/` — the generated Go bindings (this is what [mache](https://github.com/agentic-research/mache) imports)
-- `rs/ll-core/schema-capnp` — the `.capnp` wire definitions and their generated Rust
-- `rs/ll-core/public-schema` — the public capnp surface
-- `rs/ll-core/schema` — the canonical `nodes` table DDL ("mache writes it, leyline-fs reads it")
-- `rs/ll-core/schema-spec` — wire specs (`leyline-net`, `mcp-tool`, `credential-isolation`, `build-cache`)
-
-This is effective rather than nominal: none of those crates depend on an AGPL crate in this workspace. Their only dependencies are third-party permissive ones (`capnp`, `capnp-json`, `rusqlite`, `anyhow`). The dependency edge runs one way — AGPL crates consume the schema crates, never the reverse — so a downstream consumer can take the contract alone without linking the engine.
-
-Consuming the schema does not oblige you under the AGPL. Linking `leyline-core`, `leyline-fs`, `leyline-cli-lib`, or any other implementation crate does.
+The schema and wire-contract crates are Apache-2.0. The implementation crates
+are AGPL-3.0-or-later. See [LICENSE-APACHE](LICENSE-APACHE) and
+[LICENSE](LICENSE).

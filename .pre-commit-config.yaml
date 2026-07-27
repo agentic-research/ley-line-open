@@ -45,3 +45,8 @@ repos:
         pass_filenames: false
         always_run: true
         stages: [pre-push]
+        # pre-commit captures hook output and prints it only on failure, so a
+        # clean `git push` looked hung for the several minutes `task ci` takes.
+        # `verbose` surfaces the log — but only after the hook finishes, which
+        # is why the script also writes a live line straight to /dev/tty.
+        verbose: true

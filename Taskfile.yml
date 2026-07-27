@@ -464,6 +464,27 @@ tasks:
     cmds:
       - cargo test -p leyline-cli-lib
 
+  # `vec` and `text-search` SHIP — README documents `task install:full`, which
+  # builds `--features all` and includes both — but no test target enabled
+  # them, so 27 and 16 inline `#[cfg]` sections inside otherwise-running tests
+  # never compiled. `cargo test -p leyline-cli-lib` uses the DEFAULT set
+  # (lsp, validate, hdc, cdc), which excludes them.
+  #
+  # Both pass today; this is turning on existing coverage, not writing new.
+  # Enforced by `lint:feature-reachability`, which fails when a shipping
+  # feature has no test target (bead ley-line-open-2607d2).
+  test:vec:
+    desc: Tests for the `vec` feature (sqlite-vec + fastembed) — ships in install:full
+    dir: rs
+    cmds:
+      - cargo test -p leyline-cli-lib --features vec
+
+  test:text-search:
+    desc: Tests for the `text-search` feature (witchcraft) — ships in install:full
+    dir: rs
+    cmds:
+      - cargo test -p leyline-cli-lib --features text-search
+
   conformance:py:
     desc: |
       Python conformance suite for cloister/credential-isolation/v1
@@ -1042,6 +1063,8 @@ tasks:
       - task: build:fs-nfs-isolated
       - task: test:fs-cdc
       - task: test:cdc-activation
+      - task: test:vec
+      - task: test:text-search
       - task: tier:isolation
       - task: check:all-features
       - task: test

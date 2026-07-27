@@ -109,4 +109,65 @@ if [ "$failed" -ne 0 ]; then
     printf 'ledger in this script with a bead saying why.\n' >&2
     exit 1
 fi
-printf 'feature reachability verified against the shipping configurations (cargo-resolved)\n'
+
+# ── Claim 2: every SHIPPING CLI feature must be exercised by some test ───────
+#
+# Reachability says a feature lands in a binary. It says nothing about whether
+# anything ever ran it. The README documents three install paths — `task
+# install`, `install:full`, `install:full+mount` — so every feature they enable
+# reaches users, and a feature no test compiles is shipped-but-unexercised.
+#
+# Scope: the CLI-level feature names, which is what "a feature" means to
+# someone installing this. Crate-internal features are covered by claim 1.
+cli_manifest="ll-open/cli-lib/Cargo.toml"
+cli_defaults=$(sed -n 's/^default = \[\(.*\)\]/\1/p' "$cli_manifest" | tr -d '" ' | tr ',' ' ')
+cli_features=$(sed -n '/^\[features\]/,/^\[/p' "$cli_manifest" \
+                | grep -E '^[a-z][a-z0-9_-]* *=' | cut -d= -f1 | tr -d ' ' \
+                | grep -v '^default$')
+
+# Features named on a `cargo test` line owned by a target the CI CHAIN
+# actually invokes. Counting every `cargo test` line in the file would accept a
+# target that exists and never runs — the same unwired failure this gate exists
+# to catch, and one I shipped once already today.
+ci_tasks=$(sed -n '/^  ci:/,/^  [a-z][a-z0-9:_-]*:$/p' ../Taskfile.yml \
+            | grep -E '^[[:space:]]+- task:' | sed 's/.*task: //' | tr '\n' ' ')
+if [ -z "$ci_tasks" ]; then
+    echo "feature-coverage: could not read the ci chain — refusing to pass vacuously" >&2
+    exit 1
+fi
+tested_explicit=$(awk -v tasks="$ci_tasks" '
+    BEGIN { n = split(tasks, t, /[ \n]+/); for (i = 1; i <= n; i++) if (t[i] != "") in_ci[t[i]] = 1 }
+    /^  [a-z][a-z0-9:_-]*:/ { cur = $1; sub(/:$/, "", cur) }
+    /cargo test/ && (cur in in_ci) { print }
+' ../Taskfile.yml \
+    | grep -oE '\-\-features [a-z0-9_,-]+' | sed 's/--features //' | tr ',' '\n' | sort -u)
+
+for feature in $cli_features; do
+    # In the CLI default set => compiled by `cargo test -p leyline-cli-lib`.
+    printf '%s\n' $cli_defaults | grep -qx "$feature" && continue
+    printf '%s\n' "$tested_explicit" | grep -qx "$feature" && continue
+
+    # Coverage ledger — shipping features with no ci-invoked test, each with a
+    # bead. Separate from the not-shipping ledger above: these DO ship, they
+    # are just unexercised, which is the worse of the two states.
+    #
+    #   cli-lib/mount   ley-line-open-aed167 — zero test files gated on it at
+    #                   any level. Two BUILD checks exist; neither proves a
+    #                   mount serves correct bytes. Compounds 918a75, where
+    #                   flush_node is a silent no-op so mount writes never
+    #                   reproject. Remove when a round-trip test lands.
+    case "$feature" in
+        mount) continue ;;
+    esac
+
+    printf 'feature-coverage FAILED: cli-lib/%s ships but no ci-invoked test enables it\n' \
+        "$feature" >&2
+    failed=1
+done
+
+if [ "$failed" -ne 0 ]; then
+    printf '\nA shipping feature no test compiles has never been run in the shape users get.\n' >&2
+    printf 'Add a test target that enables it, or stop shipping it.\n' >&2
+    exit 1
+fi
+printf 'feature reachability + coverage verified against the shipping configurations\n'

@@ -791,7 +791,7 @@ tasks:
   # --------------------------------------------------------------------------
   # Two-step: krust+cargo-zigbuild produce a static musl binary (no docker
   # daemon involved in the compile); docker assembles a one-layer image by
-  # COPYing that binary onto cgr.dev/chainguard/static. See image.Dockerfile.
+  # COPYing that binary onto cgr.dev/chainguard/static:latest. See image.Dockerfile.
   #
   # Why not apko/melange? See ley-line-open-2b255c. tl;dr on Apple Silicon
   # the melange-via-docker workspace bind-mount stalls on virtiofs and
@@ -808,6 +808,7 @@ tasks:
   image:
     desc: Build ley-line-open:0.10.4 OCI image (krust musl binary + docker COPY)
     vars:
+      IMAGE_REF: '{{.IMAGE_REF | default "localhost/leyline:0.10.4"}}'
       KRUST_REPO: '{{.KRUST_REPO | default "localhost/leyline"}}'
       VERSION: '0.10.4'
       PLATFORM: '{{.PLATFORM | default "linux/arm64"}}'
@@ -822,13 +823,13 @@ tasks:
           --no-push --platform {{.PLATFORM}} -- --bin leyline
       - |
         docker build -f image.Dockerfile \
-          -t ley-line-open:{{.VERSION}} \
+          -t {{.IMAGE_REF}} \
           --platform {{.PLATFORM}} \
           --build-arg BIN_PATH=rs/ll-open/cli/target/krust/{{.RUST_ARCH}}-unknown-linux-musl/release/leyline \
           .
       - |
-        echo "Built ley-line-open:{{.VERSION}} ({{.PLATFORM}})."
-        echo "Smoke: docker run --rm -p 127.0.0.1:18384:8384 ley-line-open:{{.VERSION}}"
+        echo "Built {{.IMAGE_REF}} ({{.PLATFORM}})."
+        echo "Smoke: docker run --rm -p 127.0.0.1:18384:8384 {{.IMAGE_REF}}"
         echo "       (image CMD bakes in --mcp-bind 0.0.0.0 --mcp-allow-public — container-side"
         echo "        public bind is legitimate plumbing for docker NAT; host-side loopback"
         echo "        publish keeps the surface narrow — see image.Dockerfile security block)"
@@ -841,6 +842,7 @@ tasks:
     deps: [image]
     vars:
       VERSION: '0.10.4'
+      IMAGE_REF: 'localhost/leyline:0.10.4'
       PLATFORM: '{{.PLATFORM | default "linux/arm64"}}'
       HOST_PORT: '18384'
     cmds:
@@ -853,7 +855,7 @@ tasks:
         docker run -d --rm --name llo-smoke \
           --platform {{.PLATFORM}} \
           -p 127.0.0.1:{{.HOST_PORT}}:8384 \
-          ley-line-open:{{.VERSION}}
+          {{.IMAGE_REF}}
       - |
         until curl -sf -m 1 -X POST http://localhost:{{.HOST_PORT}}/mcp \
             -H 'Content-Type: application/json' -d '{}' >/dev/null 2>&1 \

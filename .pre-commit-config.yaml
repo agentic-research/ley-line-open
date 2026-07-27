@@ -27,10 +27,10 @@ repos:
         always_run: true
         stages: [pre-commit]
 
-      # The full 1:1-with-CI gate before push (fmt + clippy + blake3 lint +
-      # tests + compat/regen/readme checks). Invokes `task ci` verbatim.
+      # Reuse a successful task-ci receipt only when it addresses the exact
+      # committed tree and toolchain. Otherwise run the same full gate as CI.
       - id: task-ci
-        name: task ci (1:1 with CI — full gate before push)
+        name: task ci (exact-tree receipt or full gate)
         # `env -u GIT_DIR -u GIT_INDEX_FILE` is load-bearing for the 1:1 claim.
         # git exports GIT_DIR (and GIT_INDEX_FILE) into hook processes, and it
         # is inherited all the way down into test subprocesses. Tests that shell
@@ -40,7 +40,7 @@ repos:
         # push time and pass in CI — exactly the local/CI disagreement this
         # file exists to prevent. CI has no GIT_DIR, so unsetting it here is
         # what makes the two environments equal.
-        entry: env -u GIT_DIR -u GIT_INDEX_FILE task ci
+        entry: env -u GIT_DIR -u GIT_INDEX_FILE tools/pre_push_ci.sh
         language: system
         pass_filenames: false
         always_run: true

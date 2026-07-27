@@ -37,25 +37,36 @@ Nothing else in the projection addresses a construct durably:
   (`mod_item` → `mod_item_0`/`mod_item_1`, `project.rs:106`). A consumer diffing
   generations on `node_id` sees "unchanged" for a node that became something else.
 
-- **`token` is under-qualified.** `node_defs` qualifies by *receiver* (impl type,
-  trait, Go receiver, class) but never by enclosing **named lexical scope**. Seven
-  distinct `fn walk_and_insert` across seven `mod` blocks in LLO's own
-  `rs/ll-open/ts/src/refs.rs` carry one identical token. TS `namespace` has the same
-  defect. Go/Java/C do not — they have no named nestable in-file scope, so
-  `source_id` genuinely addresses their free functions.
+- **`token` is under-qualified, in five languages.** `node_defs` qualifies by
+  *receiver* (impl type, trait, Go receiver, class) but never by enclosing **named
+  lexical scope**. Seven distinct `fn walk_and_insert` across seven `mod` blocks in
+  LLO's own `rs/ll-open/ts/src/refs.rs` carry one identical token.
 
-- **`container_node_id` tracks a different relationship.** It is populated, but only
-  for *function-local* items — consts and nested defs declared inside a fn body
-  (mache corpus: 91/6,126 Rust rows = 1.5%, 383/4,707 Go = 8.1%):
+  Measured with `leyline parse`, grouping `node_defs` by `(token, source_id)`:
 
   ```
-  WRITES_PER_THREAD -> .../blob_store.rs/mod_item/declaration_list/function_item_30
+  python   Helper x2  Helper.run x2  run x2    nested classes; every decorator makes a nested def
+  java     Builder x2 Builder.build x2 build x2  nested types ARE named in-file scopes
+  cpp      helper x2                            in-namespace defs emit bare
+  rust     f x3 across mod a::b / mod a / mod c  plus Handler::run across mods
+  ts       walk x2 across namespace A / B
+  go       (none)                               the only measured-clean language
   ```
 
-  So it records lexical enclosure *by a definition*, not membership in a type or
-  module. It is still no fallback for qualification — but the mechanism is wired, not
-  absent, which matters because the obvious "just populate the column that already
-  exists" fix would overload a column that already means something else.
+  The cause is uniform: every extractor qualifies exactly **one** ancestor level —
+  `python_enclosing_class` `refs.rs:685`, `java_enclosing_type` `:964`,
+  `cpp_enclosing_class` `:1117`, `rust_impl_receiver` `:531`. One level is complete
+  for receivers, which do not nest; it is incomplete for lexical scopes, which do.
+
+  Ruby, PHP, Kotlin, Scala and C# have **no extractor at all** — no dispatch arm in
+  `refs.rs`, so zero `node_defs` rows. "Unaffected" there is vacuous, not safe.
+
+- **`container_node_id` is not a fallback, and is not a defect.** Its semantics are
+  *nearest enclosing κ container*, so NULL at top level is **by design**, and a
+  partial index is the correct shape for a sparse column (mache corpus: 91/6,126 Rust
+  rows non-NULL, 383/4,707 Go). It records enclosure by a *definition*, not membership
+  in a type or module — which matters because the obvious "just populate the column
+  that already exists" fix would overload a column that already means something else.
 
 The cost is not theoretical. mache measured **733 Rust constructs** and **16.9% of Go
 `init()` bodies** lost to keying on rendered names — the third, weaker identity it
@@ -86,9 +97,13 @@ look bigger than it is.
 differ only in what keys each step:
 
 ```
-tree-sitter (project.rs:106)   x.rs/mod_item_0/declaration_list/function_item   ← ORDINAL
-lsp         (project.rs:1028)  x.rs/alpha/walk                                  ← NAME
+tree-sitter (ts/src/project.rs:106)    x.rs/mod_item_0/declaration_list/function_item  ← ORDINAL
+lsp         (lsp/src/project.rs:1028)  symbols/alpha/walk                              ← NAME
 ```
+
+Note the LSP root: the literal string `"symbols"` (`lsp/src/project.rs:217`, `:957`).
+**No file segment enters the id at all** — which is why the mechanism is prior art and
+not a usable address; see below.
 
 `walk_symbol` and `flatten_symbols` in `rs/ll-open/lsp/src/project.rs` already build
 `format!("{parent_id}/{}", sym.name)` — name-keyed, recursive, over the hierarchical
@@ -107,15 +122,28 @@ symbols/impl fmt::Debug for Hash/fmt      method
 symbols/impl fmt::Display for Hash/fmt    method
 ```
 
-Two useful facts. First, impl blocks *are* nested as their own container symbols, so
-same-named methods across different impls get distinct parents — the `INSERT OR REPLACE`
-collision is unreachable for Rust through impls, since duplicate method names within one
-impl are not legal. (C++ overloads remain the open risk.) Second, and more important for
-the ADR: **the container name is the raw impl header text**, embedding the trait path
-exactly as written. Rewriting `fmt::Debug` to `std::fmt::Debug` changes the address
-without changing the code's meaning. The LSP walk is therefore name-keyed and
-collision-free but *syntactically derived* — prior art for the keying, not a canonical
-semantic path. The ADR must define the canonical form; it cannot simply adopt this one.
+Impl blocks *are* nested as their own container symbols, so same-named methods across
+different impls get distinct parents. But four things disqualify this as the address:
+
+1. **The container name is the raw impl header text**, embedding the trait path exactly
+   as written. Rewriting `fmt::Debug` to `std::fmt::Debug` changes the address without
+   changing the code's meaning. Name-keyed, yet syntactically derived.
+2. **No file segment**, so ids collide *across files* in the only multi-file artifact —
+   and `project_hover` is `INSERT OR REPLACE` on that id (`lsp/src/project.rs:783-786`),
+   so the last file processed wins.
+3. **It is not in the artifact consumers read.** `walk_symbol` runs only in the
+   standalone single-file path (`project_lsp_into` `:198`); the merged/daemon path
+   (`merge_lsp_into_ast` `:288`) keys `_lsp` by positional AST `node_id` instead.
+4. **The DocumentSymbol tree is not the AST.** LSP segments exist only at symbol levels,
+   while tree-sitter paths thread through `declaration_list`/`block`; and AST scope nodes
+   are frequently *nameless* — `impl_item` has no name field (rust-analyzer synthesises
+   "impl Handler" server-side), C++ has anonymous namespaces, TS `internal_module` emits
+   no def and has no κ mapping.
+
+So point 4 is the real cost: adopting the keying still requires per-language selection of
+scope-bearing node kinds and **name synthesis for nameless scopes** — which *is* the
+canonicalization the ADR must own. What exists in-tree is a name-keyed walk *mechanism*,
+not an address.
 
 ## What must be decided (the ADR)
 
@@ -135,9 +163,13 @@ The ADR must also state:
    and what is *allowed* to collide. `node_hash` colliding on identical bodies is
    correct behaviour and must be documented as such, not filed as a bug.
 2. **Namespace reconciliation.** Two id namespaces exist and are reconciled
-   *positionally* — `enrich_symbols` resolves `referrer_node_id` via an `_ast` JOIN on
-   line/char (ADR-0013 Step 1). **That JOIN is where `be6136` happened.** Reconciling
-   them is the actual deliverable.
+   *positionally*, via `_ast` JOINs on line/char (ADR-0013 Step 1) — the `be6136`
+   surface. Reconciling them is the actual deliverable. Note one of those JOINs is
+   outright broken today: `merge_symbol` (`lsp/src/project.rs:1089-1099`) has **no
+   `source_id` predicate**, so in the daemon a symbol can bind to a node in a
+   *different file* at the same coordinates. Its sibling `lookup_referrer_node_id`
+   (`:755-772`) filters correctly. Filed separately; the ADR should assume it is fixed,
+   not design around it.
 3. **The scope of the `be6136` cure.** *"Path never enters the address"* is true of
    `node_hash` only. `_source.id` **is** the relative path, so the occurrence key
    `(token, node_id, source_id)` is path-bearing. ADR-0027 handled that by making the
@@ -158,27 +190,48 @@ The ADR must also state:
 
 ## Plan
 
-**Phase 0 — unblock consumers (no ADR dependency).**
-Nothing below waits on the ADR; these are real defects now.
+**Phase 0 — unblock consumers.** These are real defects now, but the two steps are
+**ordered**, and the order is load-bearing:
 
-- `25811f` — `function_signature_item` emits `canonical_kind = NULL`. Trait signatures
-  fall out of a partial index *and* collide with the documented pre-migration escape.
-  Decide `'function'` vs a distinct kappa value; NULL is not an option. Audit sibling
-  languages for the same bodyless-declaration hole.
-- Tell mache to adopt `node_hash` **now** for dedup/CDC/memo, and never for addressing.
+1. `25811f` first — `function_signature_item` emits `canonical_kind = NULL`. Trait
+   signatures fall out of a partial index *and* collide with the documented
+   pre-migration escape. Decide `'function'` vs a distinct κ value; NULL is not an
+   option. Audit sibling languages for the same bodyless-declaration hole.
+2. *Then* tell consumers to adopt `node_hash` for dedup/CDC/memo, never for addressing.
+
+**The ordering is not cosmetic.** The `node_hash` preimage hashes
+`canonical_kind(raw).unwrap_or(raw)` (`cli-lib/src/cmd_parse.rs:2978`, `:3213`), so
+**fixing `25811f` rewrites every trait-signature `node_hash`.** Telling a consumer to
+pin to hashes first and fixing κ second would move the hashes under them. This
+sequencing error was made once already and corrected on `mache-e64f36`.
+
+Two further durability conditions follow from the same line, and the ADR must state
+both: most raw kinds are *unmapped* and fall through to `raw`, so a tree-sitter grammar
+bump that renames productions silently rewrites hashes; and Rust attributes are
+*siblings* of the item, so `#[inline]` / `#[cfg(...)]` change the parent's hash but not
+the function's own — a real hole for function-granularity memoization.
 
 **Phase 1 — the address half.**
 
-- `23377a` — key the tree-sitter walk by name. Requires an ancestor *walk* accumulating
-  the path, not a match arm: modules nest, and `rust_impl_receiver` returns one level
-  (correct for impls, which do not nest). Must cover TS `namespace`. Must leave
-  Go/Java/C emission byte-identical. Must **add** qualified rows without removing the
-  bare aliases — `node_defs` is explicitly a many-to-one alias index, and unqualified
-  lookup depends on the bare rows.
-- Verify the open question first: `walk_symbol` does `INSERT OR REPLACE INTO _lsp
-  (node_id, ...)`. If two symbols in one file produce the same `parent_id/name`, the
-  second silently replaces the first. Rust likely cannot hit it; C++ overloads and
-  multiple trait impls may. **Unverified — needs a fixture, not an assumption.**
+- `23377a` — key the tree-sitter walk by name, as a **generic enclosing-named-scope
+  accumulation with a per-language audit**, not a Rust/TS patch. Java, Python, C++,
+  Rust and TS are all measured-broken; **only Go is clean**, and languages with no
+  extractor (Ruby, PHP, Kotlin, Scala, C#) must be recorded as out of scope rather than
+  silently "passing". Requires an ancestor *walk*, since scopes nest and every extractor
+  qualifies one level. Requires name synthesis for nameless scopes (`impl_item`,
+  anonymous namespaces). Must **add** qualified rows without removing the bare aliases —
+  `node_defs` is explicitly a many-to-one alias index and unqualified lookup depends on
+  them.
+- **This phase makes ADR decision #1 de facto.** The path *syntax* — separator, depth,
+  how receiver and scope compose (`alpha::Handler::run` vs `alpha/Handler/run`) — *is*
+  the single canonicalization authority. Once qualified tokens land in `node_defs.token`
+  and a consumer keys on them, changing the scheme is a breaking re-emission. The
+  *carrier* (column vs derived `symbol_id`) is genuinely deferrable; the canonicalization
+  is not. Decide the syntax before emitting, even if the carrier waits.
+- Open, and **not** to be presumed either way: `project_hover` is `INSERT OR REPLACE`
+  on the LSP id (`lsp/src/project.rs:783-786`). Two `cfg`-paired `impl Handler` blocks in
+  one file would render as two same-named DocumentSymbols, so Rust is *not* safe by
+  assumption. C++ overloads are the other candidate. Needs a live-server fixture.
 
 **Phase 2 — the ADR and reconciliation.**
 
@@ -194,9 +247,11 @@ Nothing below waits on the ADR; these are real defects now.
 
 ## Consumer impact
 
-Consumers should adopt `node_hash` immediately for dedup/CDC/memoization — it is
-durable today and does not wait on the ADR — while never using it to address. The
-address half is what they must not hand-roll in the meantime; a rendered-name key
+Consumers should adopt `node_hash` for dedup/CDC/memoization — durable today, does not
+wait on the ADR — while never using it to address. **But adopt it after `25811f`**, per
+the Phase 0 ordering: fixing that bead rewrites every trait-signature hash.
+
+The address half is what they must not hand-roll in the meantime; a rendered-name key
 entrenches exactly the failure this problem describes.
 
 Release coupling: `nodes.record`'s declared type changes `JSON` → `TEXT` in
@@ -204,11 +259,135 @@ Release coupling: `nodes.record`'s declared type changes `JSON` → `TEXT` in
 Downstreams pinning `leyline-schema v0.10.3` need the bump coordinated with the release
 carrying Phase 0 + 1, not landed against an interim shape.
 
+## Publication — why fixing this alone is not enough
+
+Whatever the ADR decides must be **published through a generated consumer surface**, or
+consumers hand-mirror it and the class returns. That is how mache arrived at
+rendered-name keying in the first place.
+
+This is `vigil-4b304d`'s declare-vs-generate rule: *regenerable deterministically →
+GENERATE; drift becomes unrepresentable.* capnp schemas are deterministically
+regenerable, so identity types belong in the GENERATE arm. LLO already has the
+mechanism — `rs/ll-open/schema-bridge` (`leyline-schema-bridge`, ADR-0036 Phase 2) —
+and it is wired into **zero** Taskfile targets and **zero** workflows, the same
+unwired-capability shape as `918a75`. A generator nobody runs prevents no drift.
+
+Related: `ley-line-open-4ec276` (finish generalizing schema-bridge), `e7f466` (TS
+bindings — belongs in the GENERATE arm; the Go client already *is* generated),
+`41867b` (Go consumer surface, done).
+
 ## Open questions
 
-- Does `schema-bridge` relate to this, or to `ley-line-open-e7f466` (TS bindings)?
-  **Not investigated.** Flagged rather than guessed.
 - Does the `_lsp` `INSERT OR REPLACE` collision reproduce in any shipped language?
-- Should `container_node_id` be populated as part of Phase 1, or does the qualified
-  token make it redundant? The ADR should kill it or fill it, not leave it NULL behind
-  an index that implies otherwise.
+  Rust is not safe by assumption — see Phase 1.
+- Which κ value should a bodyless declaration carry (`25811f`): `'function'`, or a
+  distinct value that keeps declarations separable from projectable constructs?
+## Evidence
+
+Every claim above, with how it was checked. **Refs are pinned to `abd5b86`** — line
+numbers drift, so a stale ref means "re-locate the symbol," not "the claim is false."
+Verdicts use: `VERIFIED` (checked directly), `CORRECTED` (an earlier draft of this doc
+was wrong; the row states the correct claim), `CROSS-REPO` (measured by a consumer, not
+independently reproducible here), `UNVERIFIED` (stated as open, not relied upon).
+
+### Content half — `node_hash`
+
+| # | Claim | Method | Verdict | Ref |
+|---|---|---|---|---|
+| 1 | `node_content` is keyed `node_hash PRIMARY KEY`, so identical subtrees dedup to one row | read DDL | VERIFIED | `rs/ll-open/ts/src/schema.rs:302`; ADR-0027:153 |
+| 2 | Two identical-bodied fns in different `mod`s share one `node_hash` | `leyline parse` on a two-mod fixture; both `function_item` rows hashed `C64793AC…` | VERIFIED | fixture `idtest/gen1` |
+| 3 | Inserting a `mod` above others leaves an unrelated fn's `node_hash` unchanged | two-generation parse, hashes compared | VERIFIED | fixtures `idtest/gen1`, `gen2` |
+| 4 | Comment insertion does not change `node_hash` (`extra` excluded from the fold) | doc-comment + inner-comment fixture, hash byte-identical | VERIFIED (Fable) | `rs/ll-open/cli-lib/src/cmd_parse.rs:2782` |
+| 5 | **Durability is conditional on the κ map.** The preimage hashes `canonical_kind(raw).unwrap_or(raw)`, so changing a kind's κ mapping rewrites every `node_hash` of that kind | read preimage construction | VERIFIED | `cmd_parse.rs:2978`, `:3213` |
+| 6 | **Durability is conditional on grammar version.** Most raw kinds are unmapped and fall through to `raw`, so a tree-sitter grammar bump that renames productions silently rewrites hashes | follows from #5's `unwrap_or(raw)` | VERIFIED | `cmd_parse.rs:2978` |
+| 7 | Rust attributes are *siblings* of the item, so `#[inline]` / `#[cfg(...)]` change the parent's hash but **not the function's own** | `#[inline]` fixture; fn hash unchanged | VERIFIED (Fable) | — |
+
+Rows 5–7 are why "adopt `node_hash` now" carries conditions. In particular **row 5 means
+fixing `25811f` rewrites every trait-signature hash**, so that fix must land *before*
+consumers pin to hashes, not after.
+
+### Address half — what does not work
+
+| # | Claim | Method | Verdict | Ref |
+|---|---|---|---|---|
+| 8 | `node_id` ordinals are positional among same-kind siblings of one parent | read construction | VERIFIED | `rs/ll-open/ts/src/project.rs:106` |
+| 9 | `node_id` **silently rebinds**: same id, same span, different function across generations | two-generation parse; `x.rs/mod_item_0` = `mod alpha` in gen1, `mod aaa` in gen2, both bytes 0..26 | VERIFIED | fixtures `idtest/gen1`, `gen2` |
+| 10 | `node_id` *shape* changes when a singleton gains a sibling (`mod_item` → `mod_item_0`/`_1`) | two-generation parse | VERIFIED | fixtures `shape/a`, `shape/b` |
+| 11 | Seven distinct `fn walk_and_insert` in `refs.rs` share one token | `grep -c "fn walk_and_insert"` → 7, in seven test mods | VERIFIED | `rs/ll-open/ts/src/refs.rs` |
+| 12 | `mod_item` reaches the receiver match and is excluded by `_ => return None` | read `rust_impl_receiver` | VERIFIED | `refs.rs:531-549`, arm at `:541` |
+| 13 | **CORRECTED — the collision is not Rust+TS only.** An earlier draft said "Go/Java/C need nothing." Java, Python, and C++ all collide | `leyline parse` per language, group by `(token, source_id)` having count>1 | CORRECTED | see table below |
+| 14 | Only **Go** is measured-clean | mache corpus: 0 `(token, source_id)` collisions | CROSS-REPO | mache-e64f36 |
+| 15 | Ruby/PHP/Kotlin/Scala/C# have **no extractor** — zero `node_defs` rows, so "unaffected" is vacuous, not safe | no dispatch arm in `refs.rs` | VERIFIED (Fable) | `refs.rs` dispatch |
+
+Measured collisions (`leyline parse`, group by `(token, source_id)`):
+
+```
+python   Helper x2   Helper.run x2   build/run x2     nested classes; every decorator makes a nested def
+java     Builder x2  Builder.build x2  build x2       nested types are named in-file scopes
+cpp      helper x2                                    in-namespace defs emit bare
+rust     f x3 across mod a::b / mod a / mod c         plus Handler::run across mods
+ts       walk x2 across namespace A / B
+go       (none)
+```
+
+Each per-language extractor qualifies exactly **one** ancestor level:
+`python_enclosing_class` `refs.rs:685`, `java_enclosing_type` `:964`,
+`cpp_enclosing_class` `:1117`, `rust_impl_receiver` `:531`.
+
+| # | Claim | Method | Verdict | Ref |
+|---|---|---|---|---|
+| 16 | **CORRECTED — `container_node_id` is not a defect.** An earlier draft called it "NULL on every def row, despite an index that assumes otherwise." Its semantics are *nearest enclosing κ container*: NULL for top-level defs **by design**, populated where a container exists, and a partial index is the correct shape for a sparse column | read semantics; mache corpus 91/6,126 Rust, 383/4,707 Go non-NULL | CORRECTED | `ts/src/schema.rs:154`, `cmd_parse.rs:2915-2925`; mache-4b8a42 |
+
+The original error was generalizing from three-function fixtures that contained no
+function-local items. The operative point survives — it is not a qualification fallback —
+but "kill it or fill it" was the wrong question and has been removed.
+
+### The LSP walk — prior art, not an address
+
+| # | Claim | Method | Verdict | Ref |
+|---|---|---|---|---|
+| 17 | The LSP walk is name-keyed and recursive: `format!("{parent_id}/{}", sym.name)` | read | VERIFIED | `rs/ll-open/lsp/src/project.rs:1028` (`walk_symbol`), `:925` (`flatten_symbols`) |
+| 18 | **CORRECTED — the id has no file segment.** An earlier draft wrote `x.rs/alpha/walk`. The walk is rooted at the literal string `"symbols"`, so ids are `symbols/alpha/walk` | read call sites | CORRECTED | `project.rs:217`, `:957` |
+| 19 | Consequently ids collide **across files** in the only multi-file artifact, and `_lsp_hover` is `INSERT OR REPLACE` on that id — last file wins | read | VERIFIED (Fable) | `project.rs:783-786` |
+| 20 | `walk_symbol` runs only in the standalone single-file path; the merged/daemon path keys `_lsp` by positional AST `node_id` instead | traced both entry points | VERIFIED | `project_lsp_into` `:198` vs `merge_lsp_into_ast` `:288` |
+| 21 | rust-analyzer nests impl blocks as their own container symbols, so same-named methods across impls get distinct parents | `leyline lsp --server rust-analyzer` on an `impl Display`/`impl Debug` fixture | VERIFIED | output: `symbols/impl fmt::Debug for Hash/fmt`, `symbols/impl fmt::Display for Hash/fmt` |
+| 22 | The container name is the **raw impl header text**, so rewriting `fmt::Debug` → `std::fmt::Debug` changes the address without changing meaning | same run | VERIFIED | same output |
+| 23 | The DocumentSymbol tree is **not** the AST. LSP segments exist only at symbol levels; AST paths thread through `declaration_list`/`block`, and AST scope nodes are often nameless (`impl_item` has no name — rust-analyzer synthesises one server-side) | read | VERIFIED (Fable) | — |
+
+Rows 18–23 are why the claim is **"a name-keyed walk mechanism exists in-tree,"** not
+"the address half exists." Row 23 is the real cost: adopting the keying still requires
+per-language selection of scope-bearing node kinds and name synthesis for nameless
+scopes — which *is* the canonicalization the ADR must own.
+
+| # | Claim | Method | Verdict | Ref |
+|---|---|---|---|---|
+| 24 | **Unflagged bug:** `merge_symbol`'s `_ast` JOIN has **no `source_id` predicate**, so in the daemon (one connection, all files) a symbol can bind to a node in a *different file* at the same coordinates, then `INSERT OR REPLACE` cross-contaminates | read; contrasted with the sibling lookup that filters correctly | VERIFIED | `project.rs:1089-1099` (no filter) vs `lookup_referrer_node_id` `:755-772` (`WHERE source_id = ?1`) |
+
+### History — why `symbol_id` was deleted
+
+| # | Claim | Method | Verdict | Ref |
+|---|---|---|---|---|
+| 25 | The deleted `compute_symbol_id` hashed `(content_hash, span_start, span_end, kind, name)` — and `content_hash` is the **whole-file byte hash** (it is the value stored in `_source.content_hash`), so *any* edit anywhere in a file rewrote **every** `symbol_id` in that file. Stronger than "location-keyed" | read the deleted impl and its call site; traced `content_hash` to the `_source` insert | VERIFIED | `git show 34ed903` — `compute_symbol_id` body + call sites; `cmd_parse.rs:312` at that rev |
+| 25a | It was short-lived: added in `34ed903` ("produce unified code-fact IR"), removed by ADR-0027's implementation weeks later | `git show 34ed903 --stat` | VERIFIED | `34ed903` |
+| 26 | ADR-0027 states "span left symbol identity" and "Zero mache blast radius" | read | VERIFIED | ADR-0027:258, :241 |
+| 27 | The deletion was **also** cost-driven, not only `be6136`-principle-driven — the ADR's Costs section targets "the earlier location-keyed design's ~3× insert / ~1.0 GB regression" | read | VERIFIED (Fable) | ADR-0027 Costs |
+| 28 | ADR-0027's status is still **Proposed**, not Accepted | read frontmatter | VERIFIED | ADR-0027 header |
+| 29 | `_source.id` **is** the relative path, so the occurrence key is path-bearing | query a projection: `id = "x.rs"` | VERIFIED | fixture `idtest/gen1.db` |
+| 30 | ADR-0027 made `be6136`'s class loud rather than eliminating it (fail-loud FK integrity, `unbound_facts`) | read | VERIFIED | ADR-0027 §2, §3 |
+
+### κ / `canonical_kind`
+
+| # | Claim | Method | Verdict | Ref |
+|---|---|---|---|---|
+| 31 | `function_signature_item` has no arm in the Rust κ match and falls to `_ => None` | read | VERIFIED | `rs/ll-open/ts/src/languages.rs:342-356` |
+| 32 | Trait signatures therefore emit `canonical_kind = NULL` | `leyline parse` on a trait fixture: `Greet::hello` → NULL, `Greet::bye` → `function` | VERIFIED | fixture `sig.db` |
+| 33 | `idx_defs_canonical_kind` is partial (`WHERE canonical_kind IS NOT NULL`), so those rows are out of the index | read | VERIFIED | `ts/src/schema.rs:238` |
+| 34 | NULL is *also* the documented pre-migration escape, so the two states are indistinguishable | read | VERIFIED | `DEFS_TABLE_DDL` doc block, `schema.rs:205-230` |
+
+### Claims relied on but not independently verifiable here
+
+| # | Claim | Status |
+|---|---|---|
+| 35 | 733 Rust constructs and 16.9% of Go `init()` bodies lost to rendered-name keying | CROSS-REPO — mache's measurement (`mache-e64f36`); not reproducible from LLO. Cited as consumer-reported impact, not as an LLO fact. |
+| 36 | `_lsp` `INSERT OR REPLACE` collision reachable in a shipped language | UNVERIFIED. Rust is *not* safe by assumption: two `impl Handler` blocks in one file (e.g. `cfg`-paired) render as two same-named DocumentSymbols. Needs a live-server fixture. C++ overloads are the other candidate. |
+| 37 | Whether `container_node_id` should carry the qualified path | OPEN — but see row 16; it already means something else, so overloading it is a design choice, not a fill-in. |

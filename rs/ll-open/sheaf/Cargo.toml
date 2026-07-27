@@ -17,7 +17,11 @@ test-spy = []
 [dependencies]
 log = { workspace = true }
 nalgebra = "0.35"
-sha2 = "0.11"
+# σ, BLAKE3-locked. The sheaf crate hashes at a composition boundary
+# (restriction keys, Merkle roots), which is exactly where `substrate.rs`
+# warns that a second hash function breaks (DET) and (CR) — bead
+# `ley-line-open-b61cd6`, ADR-0032 D5.
+leyline-core = { path = "../../ll-core/core", default-features = false }
 nalgebra-sparse = "0.12"
 serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }

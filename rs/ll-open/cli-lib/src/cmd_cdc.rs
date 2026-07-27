@@ -85,7 +85,8 @@ pub fn format_gc_report(report: GcReport, json: bool) -> Result<String> {
     Ok(format!(
         "CDC GC: dry_run={} before_rows={} before_bytes={} \
          unreachable_rows={} unreachable_bytes={} deleted_rows={} deleted_bytes={} \
-         remaining_rows={} remaining_bytes={}",
+         remaining_rows={} remaining_bytes={} \
+         reaped_manifest_rows={} reaped_manifest_nodes={}",
         report.dry_run,
         report.before_chunk_rows,
         report.before_chunk_bytes,
@@ -95,6 +96,8 @@ pub fn format_gc_report(report: GcReport, json: bool) -> Result<String> {
         report.deleted_chunk_bytes,
         report.remaining_chunk_rows,
         report.remaining_chunk_bytes,
+        report.reaped_manifest_rows,
+        report.reaped_manifest_nodes,
     ))
 }
 

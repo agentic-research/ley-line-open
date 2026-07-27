@@ -35,6 +35,15 @@ pub struct GcReport {
     pub remaining_chunk_rows: u64,
     /// Deduplicated chunk payload bytes after collection.
     pub remaining_chunk_bytes: u64,
+    /// `content_manifest` span rows removed because their manifest was dead.
+    ///
+    /// Dead means the freshness witness cannot be satisfied: the node is gone,
+    /// its `(size, mtime)` moved on, or the witness row is missing entirely.
+    /// Such a manifest is already refused by every read — this reclaims the
+    /// storage it was pinning.
+    pub reaped_manifest_rows: u64,
+    /// `content_manifest_meta` witness rows removed (one per dead node).
+    pub reaped_manifest_nodes: u64,
     /// Whether this invocation was accounting-only.
     pub dry_run: bool,
 }
@@ -56,6 +65,13 @@ pub fn collect_unreachable_chunks(conn: &Connection, options: GcOptions) -> Resu
     .context("ensure CDC manifest reachability index")?;
     let (before_chunk_rows, before_chunk_bytes) =
         chunk_totals(&tx, "", "count CDC chunks before GC")?;
+
+    // Reap dead manifests FIRST, so the reachability pass below sees the
+    // chunks they were holding. Doing this after would leave them referenced
+    // for another whole cycle — and since every cycle can create new dead
+    // manifests, "another cycle" is never.
+    let (reaped_manifest_rows, reaped_manifest_nodes) = reap_dead_manifests(&tx)?;
+
     let unreachable_predicate = "\
         WHERE NOT EXISTS (
             SELECT 1
@@ -93,6 +109,8 @@ pub fn collect_unreachable_chunks(conn: &Connection, options: GcOptions) -> Resu
         deleted_chunk_bytes,
         remaining_chunk_rows,
         remaining_chunk_bytes,
+        reaped_manifest_rows,
+        reaped_manifest_nodes,
         dry_run: options.dry_run,
     };
     if options.dry_run {
@@ -102,6 +120,87 @@ pub fn collect_unreachable_chunks(conn: &Connection, options: GcOptions) -> Resu
         tx.commit().context("commit CDC reachability GC")?;
     }
     Ok(report)
+}
+
+/// A manifest is dead when its freshness witness cannot be satisfied.
+///
+/// One predicate covers all three ways that happens, which is why it is
+/// written once and applied to both tables:
+///
+/// * the node is gone — the join finds nothing (path reuse after
+///   `remove_node`/`rename_node`, the cross-generation leak from `0330c7`);
+/// * the witness disagrees — `(size, mtime)` moved on behind this crate;
+/// * the witness row is missing entirely — spans with no meta row.
+///
+/// In every case `has_chunked_content_in_transaction` already returns false,
+/// so reads are unaffected: this reclaims storage that was pinned by a
+/// manifest nothing could ever use. A dead manifest is also useless for
+/// incremental rechunking, which only accepts a *fresh* previous snapshot,
+/// so nothing downstream loses an optimization either.
+fn dead_manifest_predicate(table: &str) -> String {
+    format!(
+        "NOT EXISTS (
+             SELECT 1
+               FROM content_manifest_meta AS m
+               JOIN nodes AS n ON n.id = m.node_id
+              WHERE m.node_id = {table}.node_id
+                AND m.source_len = n.size
+                AND m.source_mtime IS n.mtime
+         )"
+    )
+}
+
+/// Delete manifests whose freshness witness is dead. Returns
+/// `(span_rows, witness_rows)`.
+///
+/// Runs unconditionally inside the caller's transaction, including on a dry
+/// run: the reachability pass that follows must see post-reap state or the
+/// dry-run estimate understates what is actually reclaimable, which is the
+/// number the operator is asking for. The caller's rollback is what makes a
+/// dry run non-mutating.
+fn reap_dead_manifests(tx: &Transaction<'_>) -> Result<(u64, u64)> {
+    // Freshness is only evaluable against the live rows. A standalone chunk
+    // store has no `nodes` table and no witnesses; there is nothing to prove
+    // dead, so reap nothing rather than guessing.
+    let evaluable: i64 = tx
+        .query_row(
+            "SELECT COUNT(*)
+               FROM sqlite_master
+              WHERE type = 'table'
+                AND name IN ('nodes', 'content_manifest_meta')",
+            [],
+            |row| row.get(0),
+        )
+        .context("probe for manifest freshness inputs")?;
+    if evaluable < 2 {
+        return Ok((0, 0));
+    }
+
+    // Spans first: the witness rows are the predicate's own input, so
+    // deleting them first would make every remaining manifest look dead.
+    let spans = tx
+        .execute(
+            &format!(
+                "DELETE FROM content_manifest WHERE {}",
+                dead_manifest_predicate("content_manifest")
+            ),
+            [],
+        )
+        .context("reap dead manifest spans")?;
+    let witnesses = tx
+        .execute(
+            &format!(
+                "DELETE FROM content_manifest_meta WHERE {}",
+                dead_manifest_predicate("content_manifest_meta")
+            ),
+            [],
+        )
+        .context("reap dead manifest witnesses")?;
+
+    Ok((
+        u64::try_from(spans).context("reaped manifest span count exceeds u64")?,
+        u64::try_from(witnesses).context("reaped manifest witness count exceeds u64")?,
+    ))
 }
 
 fn validate_gc_schema(conn: &Connection) -> Result<()> {
@@ -191,6 +290,113 @@ mod tests {
     fn count_chunks(conn: &Connection) -> i64 {
         conn.query_row("SELECT COUNT(*) FROM content_chunks", [], |row| row.get(0))
             .unwrap()
+    }
+
+    /// A `nodes` table plus one row, so manifest freshness is evaluable.
+    fn insert_node(conn: &Connection, id: &str, content: &str, mtime: i64) {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS nodes (
+                 id TEXT PRIMARY KEY, parent_id TEXT, name TEXT NOT NULL,
+                 kind INTEGER NOT NULL, size INTEGER DEFAULT 0,
+                 mtime INTEGER NOT NULL, record_id TEXT, record JSON,
+                 source_file TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO nodes (id, parent_id, name, kind, size, mtime, record) \
+             VALUES (?1, '', ?1, 0, ?2, ?3, ?4)",
+            rusqlite::params![id, content.len() as i64, mtime, content],
+        )
+        .unwrap();
+    }
+
+    fn count_manifest_rows(conn: &Connection, node_id: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM content_manifest WHERE node_id = ?1",
+            rusqlite::params![node_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Node ids are PATHS and paths get reused. A manifest whose node is gone
+    /// is refused by every read (the freshness witness has nothing to join
+    /// against) yet still references its chunks — so reachability GC sees them
+    /// as live and reclaims nothing, forever.
+    ///
+    /// Bead `ley-line-open-b5e56f`. This is the hygiene half of `0330c7`:
+    /// correctness degrades safely, storage does not.
+    #[test]
+    fn gc_reaps_manifests_whose_node_is_gone() {
+        let conn = db();
+        let data = vec![b'x'; 40_000];
+        insert_node(&conn, "n", std::str::from_utf8(&data).unwrap(), 1);
+        store_content_chunked(&conn, "n", &data).unwrap();
+        assert!(count_chunks(&conn) > 0, "precondition: chunks stored");
+
+        // Removed out of band — exactly the path-reuse orphan from 0330c7.
+        conn.execute("DELETE FROM nodes WHERE id = 'n'", [])
+            .unwrap();
+
+        collect_unreachable_chunks(&conn, GcOptions::default()).unwrap();
+
+        assert_eq!(
+            count_manifest_rows(&conn, "n"),
+            0,
+            "a manifest whose node is gone must be reaped"
+        );
+        assert_eq!(
+            count_chunks(&conn),
+            0,
+            "its chunks must then be unreachable and collected"
+        );
+    }
+
+    /// A manifest whose witness disagrees with the live row is refused by
+    /// reads and cannot serve incremental rechunking either, so it is dead
+    /// weight holding chunks alive.
+    #[test]
+    fn gc_reaps_manifests_with_a_stale_witness() {
+        let conn = db();
+        let data = vec![b'y'; 40_000];
+        insert_node(&conn, "n", std::str::from_utf8(&data).unwrap(), 1);
+        store_content_chunked(&conn, "n", &data).unwrap();
+
+        // Record moved on behind this crate's back: size and mtime both shift.
+        conn.execute(
+            "UPDATE nodes SET record = 'zzz', size = 3, mtime = 999 WHERE id = 'n'",
+            [],
+        )
+        .unwrap();
+
+        collect_unreachable_chunks(&conn, GcOptions::default()).unwrap();
+
+        assert_eq!(
+            count_manifest_rows(&conn, "n"),
+            0,
+            "a stale manifest must be reaped"
+        );
+        assert_eq!(count_chunks(&conn), 0, "and its chunks collected");
+    }
+
+    /// The safety direction: a manifest that IS fresh must survive GC
+    /// untouched, or the collector becomes a cache-destroyer.
+    #[test]
+    fn gc_preserves_fresh_manifests_and_their_chunks() {
+        let conn = db();
+        let data = vec![b'z'; 40_000];
+        insert_node(&conn, "n", std::str::from_utf8(&data).unwrap(), 1);
+        store_content_chunked(&conn, "n", &data).unwrap();
+        let before = count_chunks(&conn);
+
+        collect_unreachable_chunks(&conn, GcOptions::default()).unwrap();
+
+        assert!(count_manifest_rows(&conn, "n") > 0, "fresh manifest kept");
+        assert_eq!(count_chunks(&conn), before, "fresh chunks kept");
+        let mut buf = vec![0u8; data.len()];
+        let n = read_content_chunked(&conn, "n", &mut buf, 0).unwrap();
+        assert_eq!(n, data.len());
+        assert_eq!(buf, data, "and the content still reads back");
     }
 
     #[test]

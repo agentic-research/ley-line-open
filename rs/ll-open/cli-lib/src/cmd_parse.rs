@@ -1692,6 +1692,15 @@ pub fn parse_into_conn(
 /// dual-write hasn't run yet (e.g. parse-only without enrichment).
 const SEGMENT_FILE_SUFFIXES: &[&str] = &["source.capnp", "ast.capnp", "bindings.capnp"];
 
+/// Scheme tag for the segment-root fold, bound into the address itself.
+///
+/// Names the decomposition this root commits to: three ordinally-framed
+/// segments in `SEGMENT_FILE_SUFFIXES` order, each addressed by σ over its
+/// canonical bytes. Protocol-visible — changing the suffix list, their order,
+/// or the framing is a `v2`, not an edit, because it changes what every
+/// previously-issued root *means*.
+const SEGMENT_ROOT_SCHEME: &str = "leyline/segment-root/v1";
+
 /// T8.5+RTFM: hash the run's capnp segment files in canonical order
 /// over **canonical bytes** (segment-table prefix stripped per the
 /// canonical-encoding spec, bullet 2: *"the segment table shall not
@@ -1721,27 +1730,63 @@ const SEGMENT_FILE_SUFFIXES: &[&str] = &["source.capnp", "ast.capnp", "bindings.
 /// not the whole hash — so a single legacy file doesn't pay the slow
 /// path for the entire set.
 fn hash_segment_files(db_path: &Path) -> Result<([u8; 32], u64)> {
-    let mut hasher = blake3::Hasher::new();
+    use leyline_core::{Domain, Entry, Hash, PartitionSpec};
+
+    let mut entries = Vec::with_capacity(SEGMENT_FILE_SUFFIXES.len());
     let mut total: u64 = 0;
-    for suffix in SEGMENT_FILE_SUFFIXES {
+
+    for (ordinal, suffix) in SEGMENT_FILE_SUFFIXES.iter().enumerate() {
         let p = with_extension(db_path, suffix);
+        let ordinal = ordinal as u64;
+
         if !p.exists() {
+            // Absent segment. `Hash::ZERO` is the substrate's "nothing here"
+            // sentinel and no content hashes to it, so an absent segment stays
+            // distinguishable from a present-but-empty one — whose σ is
+            // BLAKE3-of-empty. Previously both contributed nothing and collided.
+            entries.push(Entry {
+                addr: Hash::ZERO,
+                a: ordinal,
+                b: 0,
+            });
             continue;
         }
+
         let file_bytes =
             std::fs::read(&p).with_context(|| format!("read segment {}", p.display()))?;
-        let bytes_after = hash_canonical_stream_fast(&file_bytes, &mut hasher)
-            .or_else(|| {
-                // Legacy producer / multi-segment record / corruption —
-                // fall through to the read_message+canonicalize path so
-                // the contract is honored even when the fast path's
-                // assumptions don't hold.
-                hash_canonical_stream_slow(&file_bytes, &mut hasher, &p).ok()
-            })
-            .ok_or_else(|| anyhow::anyhow!("parse segment {}", p.display()))?;
+
+        // A fresh hasher per attempt. The fast path updates as it walks and can
+        // bail on a later record, so sharing one hasher with the fallback would
+        // feed the prefix twice and silently corrupt the segment's address.
+        let mut fast = blake3::Hasher::new();
+        let (digest, bytes_after) = match hash_canonical_stream_fast(&file_bytes, &mut fast) {
+            Some(n) => (*fast.finalize().as_bytes(), n),
+            None => {
+                // Legacy producer / multi-segment record / corruption — fall
+                // through to read_message+canonicalize so the contract holds
+                // even when the fast path's assumptions don't.
+                let mut slow = blake3::Hasher::new();
+                let n = hash_canonical_stream_slow(&file_bytes, &mut slow, &p)
+                    .with_context(|| format!("parse segment {}", p.display()))?;
+                (*slow.finalize().as_bytes(), n)
+            }
+        };
+
+        entries.push(Entry {
+            addr: Hash::from_bytes(digest),
+            a: ordinal,
+            b: bytes_after,
+        });
         total = total.saturating_add(bytes_after);
     }
-    Ok((*hasher.finalize().as_bytes(), total))
+
+    let spec = PartitionSpec {
+        domain: Domain::ByteStream,
+        scheme: SEGMENT_ROOT_SCHEME.to_string(),
+        params: Vec::new(),
+        canon_version: 1,
+    };
+    Ok((*spec.address(&entries).as_bytes(), total))
 }
 
 /// Fast canonical-bytes hash: walks the on-disk capnp stream as
@@ -3757,6 +3802,81 @@ mod tests {
     /// S1 end-to-end: with a signing key configured, the head written to disk
     /// carries a signature that verifies against the canonical head digest.
     /// Without this test, "the head is signed" is a claim, not a fact.
+    /// One single-segment capnp stream record: `[u32 segcount-1][u32 words][payload]`.
+    fn capnp_record(payload: &[u8]) -> Vec<u8> {
+        assert!(
+            payload.len().is_multiple_of(8),
+            "capnp segments are word-aligned"
+        );
+        let mut out = 0u32.to_le_bytes().to_vec();
+        out.extend_from_slice(&((payload.len() / 8) as u32).to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// `rootHash` must commit to WHERE the segment boundaries fall, not just to
+    /// the concatenated bytes.
+    ///
+    /// Today it does not: `hash_segment_files` feeds all three files into one
+    /// running BLAKE3, so two runs that divide identical bytes differently share
+    /// a root. `segmentBytes` only records the TOTAL, so it detects a torn write
+    /// and not a re-division.
+    ///
+    /// Bead `ley-line-open-b64505`; ADR-0032 D2 — an address must commit to its
+    /// decomposition, not merely to its parts' concatenation.
+    #[test]
+    fn segment_root_commits_to_segment_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let x = capnp_record(b"XXXXXXXX");
+        let y = capnp_record(b"YYYYYYYY");
+
+        // A: both records live in `source`; no `ast` segment at all.
+        let db_a = dir.path().join("a.db");
+        let mut both = x.clone();
+        both.extend_from_slice(&y);
+        std::fs::write(with_extension(&db_a, "source.capnp"), &both).unwrap();
+
+        // B: the same two records, split across `source` and `ast`.
+        let db_b = dir.path().join("b.db");
+        std::fs::write(with_extension(&db_b, "source.capnp"), &x).unwrap();
+        std::fs::write(with_extension(&db_b, "ast.capnp"), &y).unwrap();
+
+        let (root_a, bytes_a) = hash_segment_files(&db_a).unwrap();
+        let (root_b, bytes_b) = hash_segment_files(&db_b).unwrap();
+
+        assert_eq!(
+            bytes_a, bytes_b,
+            "precondition: both runs carry identical canonical bytes"
+        );
+        assert_ne!(
+            root_a, root_b,
+            "distinct segment divisions of identical bytes MUST NOT share a root"
+        );
+    }
+
+    /// An absent segment and a present-but-empty one are different worlds and
+    /// must not collide. Today both contribute nothing to the running hash.
+    #[test]
+    fn segment_root_distinguishes_absent_from_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let x = capnp_record(b"XXXXXXXX");
+
+        let db_absent = dir.path().join("absent.db");
+        std::fs::write(with_extension(&db_absent, "source.capnp"), &x).unwrap();
+
+        let db_empty = dir.path().join("empty.db");
+        std::fs::write(with_extension(&db_empty, "source.capnp"), &x).unwrap();
+        std::fs::write(with_extension(&db_empty, "ast.capnp"), b"").unwrap();
+
+        let (root_absent, _) = hash_segment_files(&db_absent).unwrap();
+        let (root_empty, _) = hash_segment_files(&db_empty).unwrap();
+
+        assert_ne!(
+            root_absent, root_empty,
+            "\"no ast segment\" and \"an empty ast segment\" must be distinguishable"
+        );
+    }
+
     #[test]
     #[serial_test::serial(env_leyline_head_keys)]
     fn head_is_signed_and_verifies_when_key_configured() {

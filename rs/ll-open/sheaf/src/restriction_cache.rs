@@ -54,7 +54,7 @@
 //! sensitivity, whereas a reflow-invariant node_hash-style identity
 //! survives edits elsewhere. See [`ContainerKeying`].
 
-use sha2::{Digest, Sha256};
+use leyline_core::ContentAddressed;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Unit separator — cannot occur in tokens, paths, or grammar kinds, so
@@ -246,7 +246,7 @@ pub fn restriction_for_call_target(
         }
     }
 
-    Sha256::digest(buf.as_bytes()).into()
+    *buf.as_bytes().hash().as_bytes()
 }
 
 /// Append one US-delimited, newline-terminated canonical row.
@@ -436,7 +436,7 @@ pub fn restriction_for_public_api(
         }
     }
 
-    Sha256::digest(buf.as_bytes()).into()
+    *buf.as_bytes().hash().as_bytes()
 }
 
 /// The resolved public surface of a definition — the [`review_public_api`]
@@ -511,11 +511,11 @@ pub fn review_public_api(
 /// Whole-object CAS hash: the byte hash of the WHOLE CORPUS (the only
 /// per-object hash that is sound for a cross-file review). Parser-free.
 pub fn whole_object_hash(corpus: &[(String, String)]) -> [u8; 32] {
-    let mut h = Sha256::new();
+    let mut canonical = String::new();
     for (path, src) in corpus {
-        h.update(format!("{path}{US}{src}\n").as_bytes());
+        canonical.push_str(&format!("{path}{US}{src}\n"));
     }
-    h.finalize().into()
+    *canonical.as_bytes().hash().as_bytes()
 }
 
 /// The cache policies compared per fixture.
@@ -556,4 +556,33 @@ pub fn stats(results: &[FixtureResult], policy: Policy) -> PolicyStats {
         }
     }
     s
+}
+
+#[cfg(test)]
+mod sigma_tests {
+    use super::*;
+    use leyline_core::ContentAddressed;
+
+    /// σ is BLAKE3-locked (`substrate.rs`) and this crate hashes at a
+    /// composition boundary — the exact place the lock's docs warn a second
+    /// hash function breaks (DET) and (CR). Bead `ley-line-open-b61cd6`,
+    /// ADR-0032 D5.
+    #[test]
+    fn whole_object_hash_is_the_substrate_hash() {
+        let corpus = vec![
+            ("a.rs".to_string(), "fn a() {}".to_string()),
+            ("b.rs".to_string(), "fn b() {}".to_string()),
+        ];
+
+        let mut canonical = String::new();
+        for (path, src) in &corpus {
+            canonical.push_str(&format!("{path}{US}{src}\n"));
+        }
+
+        assert_eq!(
+            &whole_object_hash(&corpus),
+            canonical.as_bytes().hash().as_bytes(),
+            "whole_object_hash must be σ over the canonical serialization, not SHA-256"
+        );
+    }
 }

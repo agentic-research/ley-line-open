@@ -43,10 +43,30 @@ Three artifacts, kept **structurally separate** (the earlier toy conflated them,
 making soundness a tautology — this does not):
 
 1. **Restriction (cheap).** `hash(input_closure(F))` — a resolution-free gather +
-   SHA-256 of: `F`'s `container_node_id`; the sorted `(token, qualifier)` of
-   `node_refs` contained in `F`; the `_imports` rows those tokens name; and — load-
-   bearingly — the `node_defs` rows those tokens resolve to, **across files** (an
-   indexed point lookup). ~6 rows touched.
+   σ (BLAKE3, see the amendment below) of: `F`'s `container_node_id`; the sorted
+   `(token, qualifier)` of `node_refs` contained in `F`; the `_imports` rows those
+   tokens name; and — load-bearingly — the `node_defs` rows those tokens resolve
+   to, **across files** (an indexed point lookup). ~6 rows touched.
+
+   > **Amendment (2026-07-27, bead `ley-line-open-b61cd6`).** This ADR originally
+   > specified **SHA-256**, and the spike shipped it that way. That was wrong and
+   > is now corrected to σ (`leyline_core::ContentAddressed`, BLAKE3-locked per
+   > `substrate.rs`). A restriction key is an address at a *composition boundary* —
+   > exactly where the lock's own docs warn that mixing hash functions breaks
+   > (DET) and (CR). Concretely, a SHA-256 key cannot participate in the fold
+   > algebra of ADR-0032 at all, so restriction-addressed caching could never be
+   > composed with any other identity in the substrate. Amended rather than
+   > grandfathered, per the pre-1.0 clean-break policy. Nothing persisted these
+   > keys outside the sheaf crate, so the change invalidates in-memory cache
+   > entries and migrates nothing.
+   >
+   > **Also unchanged but now stated:** "the `node_defs` rows those tokens resolve
+   > to" is **bare token equality** (`JOIN node_defs d ON r.token = d.token`) —
+   > no scope, imports, or types. That makes the closure *over-broad*, which is
+   > conservative for the 0-false-skip result but caps the achievable true-skip
+   > rate. Any future scope-aware resolver changes what this key means, so the
+   > resolution rule must be named in the scheme tag (`…/token-eq/v1`) rather
+   > than left implicit — see ADR-0032 D2.
 2. **Review result (expensive, distinct).** The resolved call graph — for each
    call token, an *unindexed* cross-corpus join over all `node_defs` plus import
    resolution. 400 → 20,000 rows at scale. (A deliberate lower-bound stand-in for

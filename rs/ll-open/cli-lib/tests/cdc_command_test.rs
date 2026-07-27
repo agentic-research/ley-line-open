@@ -247,10 +247,16 @@ fn cdc_gc_cli_parses_options_and_formats_stable_json() {
         deleted_chunk_bytes: 0,
         remaining_chunk_rows: 4,
         remaining_chunk_bytes: 400,
+        reaped_manifest_rows: 3,
+        reaped_manifest_nodes: 1,
         dry_run: true,
     };
     let json = leyline_cli_lib::cmd_cdc::format_gc_report(report, true).unwrap();
     let value: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(value["unreachable_chunk_rows"], 2);
     assert_eq!(value["dry_run"], true);
+    // Dead-manifest reaping is operator-visible, or a silent reclaim looks
+    // identical to nothing having happened (bead ley-line-open-b5e56f).
+    assert_eq!(value["reaped_manifest_rows"], 3);
+    assert_eq!(value["reaped_manifest_nodes"], 1);
 }

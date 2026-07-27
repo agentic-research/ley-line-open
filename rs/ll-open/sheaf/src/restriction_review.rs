@@ -6,7 +6,7 @@
 //! identifier-blind AST-shape hash, and fact-specific review restriction
 //! hashes against review facts derived from cheap observables.
 
-use sha2::{Digest, Sha256};
+use leyline_core::ContentAddressed;
 use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -375,12 +375,28 @@ fn join_set(values: &BTreeSet<String>) -> String {
 }
 
 fn hash_bytes(bytes: &[u8]) -> [u8; 32] {
-    let digest = Sha256::digest(bytes);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest);
-    out
+    *bytes.hash().as_bytes()
 }
 
 fn is_ident_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+#[cfg(test)]
+mod sigma_tests {
+    use super::*;
+    use leyline_core::ContentAddressed;
+
+    /// Restriction keys must be addresses in the substrate's own space, or
+    /// they cannot participate in the fold algebra at all (ADR-0032 D5).
+    /// Bead `ley-line-open-b61cd6`.
+    #[test]
+    fn hash_bytes_is_the_substrate_hash() {
+        let data = b"restriction closure bytes";
+        assert_eq!(
+            &hash_bytes(data),
+            data.as_slice().hash().as_bytes(),
+            "hash_bytes must be σ, not SHA-256"
+        );
+    }
 }

@@ -51,6 +51,8 @@ development, see [GETTING-STARTED.md](GETTING-STARTED.md).
   authoritative; activate and collect CDC manifests with `leyline cdc`.
 - The `content_chunks`, `content_manifest`, and `content_manifest_meta` tables
   are private derived indexes; they never replace the authoritative record.
+  The `content_manifest`, and `content_manifest_meta` tables are private derived
+indexes. Changes to those private indexes do not bump `leyline-schema`.
 
 ## Install and build
 

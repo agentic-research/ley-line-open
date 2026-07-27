@@ -218,6 +218,11 @@ tasks:
     cmds:
       - tools/test_release_publish.sh
 
+  release:retry:fixture-test:
+    desc: Prove transient release dependencies retry within a strict bound
+    cmds:
+      - tools/test_release_retry.sh
+
   schema:consumer-fixture-test:
     desc: Compile the Apache daemon/wire API from an external Go module
     cmds:
@@ -986,6 +991,7 @@ tasks:
       - task: release:workflow:fixture-test
       - task: release:tags:fixture-test
       - task: release:publish:fixture-test
+      - task: release:retry:fixture-test
       - task: schema:consumer-fixture-test
       - task: release:version-check
       - task: lint:blake3

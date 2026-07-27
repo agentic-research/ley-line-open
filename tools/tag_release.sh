@@ -17,7 +17,7 @@ verify_version_bin=${VERIFY_VERSION_BIN:-"$repo_root/tools/verify_release_versio
 release_validate_version "$version"
 
 cd "$repo_root"
-"$verify_version_bin" "$version"
+"$verify_version_bin" "$version" >&2
 "$git_bin" diff --quiet
 "$git_bin" diff --cached --quiet
 test "$("$git_bin" branch --show-current)" = "main"

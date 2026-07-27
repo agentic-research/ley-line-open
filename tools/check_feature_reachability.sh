@@ -29,25 +29,62 @@ failed=0
 
 # The declared shipping configurations — what `task release`, `release:mount`,
 # `release:all`, and `release:full` actually build. Adding one is deliberate.
-resolve() {
-    # $1: extra cargo args describing one shipping config
+# A FAILED resolve must abort, never degrade into "nothing is reachable".
+#
+# The first cut ran `cargo tree ... 2>/dev/null` inside a command substitution
+# and kept only stdout. When a resolve failed — lock contention against a
+# concurrent `task ci` cargo job is the observed trigger — its rows silently
+# vanished and every feature that only that config enables was reported as
+# unreachable. One such run produced 34 findings, all false, while the actual
+# fault (cargo did not answer) was never printed. That is precisely the
+# silent-success class this gate exists to catch, so it may not be tolerated
+# HERE of all places.
+#
+# `exit` cannot live inside the resolve helper: these run inside `$( ... )`, and
+# exiting a subshell does not stop the parent. Status is therefore checked in
+# the main shell, before any parsing.
+raw=""
+for cfg in "" "--features mount" \
+           "--no-default-features --features all" \
+           "--no-default-features --features full"; do
+    # `$?` after `if ! cmd` is the NEGATION's status (always 0 in the taken
+    # branch), not cargo's — so capture it in the else arm, where it is real.
     # shellcheck disable=SC2086
-    cargo tree -p leyline-cli $1 -f '{p} FEATURES={f}' 2>/dev/null \
-        | sed -n 's/.*(\(.*\)) FEATURES=\(.*\)/\1 \2/p'
-}
+    if out=$(cargo tree -p leyline-cli $cfg -f '{p} FEATURES={f}' 2>&1); then
+        :
+    else
+        status=$?
+        printf 'feature-reachability: `cargo tree -p leyline-cli %s` FAILED (exit %s).\n' \
+            "${cfg:-<default>}" "$status" >&2
+        printf 'Refusing to report reachability from an incomplete resolve — the\n' >&2
+        printf 'findings would be fabricated. cargo said:\n\n' >&2
+        printf '%s\n' "$out" | head -5 >&2
+        exit 1
+    fi
+    raw="$raw
+$out"
+done
 
 reachable=$(
-    {
-        resolve ""
-        resolve "--features mount"
-        resolve "--no-default-features --features all"
-        resolve "--no-default-features --features full"
-    } | awk '{ dir=$1; n=split($2, f, ","); for (i=1;i<=n;i++) if (f[i] != "") print dir "/" f[i] }' \
+    printf '%s\n' "$raw" \
+      | sed -n 's/.*(\(.*\)) FEATURES=\(.*\)/\1 \2/p' \
+      | awk '{ dir=$1; n=split($2, f, ","); for (i=1;i<=n;i++) if (f[i] != "") print dir "/" f[i] }' \
       | sort -u
 )
 
 if [ -z "$reachable" ]; then
     echo "feature-reachability: cargo resolved nothing — refusing to pass vacuously" >&2
+    exit 1
+fi
+
+# Positive control. Non-emptiness is too weak: a PARTIAL resolve still clears it
+# and still fabricates findings (that is the 34-finding run). `leyline-ts/rust`
+# is enabled by the default config — the CLI cannot parse Rust without it — so
+# its absence means the resolve is incomplete, not that Rust stopped shipping.
+# Same rule the gate imposes on everyone else: assert the mechanism fired.
+if ! printf '%s\n' "$reachable" | grep -q '/ll-open/ts/rust$'; then
+    echo "feature-reachability: resolve is incomplete — the default config must" >&2
+    echo "enable ll-open/ts/rust and did not. Not reporting findings from it." >&2
     exit 1
 fi
 

@@ -84,3 +84,10 @@ rusqlite = { workspace = true, features = ["bundled", "serialize", "hooks"] }
 [[example]]
 name = "cdc_storage_bound"
 required-features = ["cdc"]
+
+# Cross-generation churn: what a one-commit diff costs CDC under each target
+# (bead `ley-line-open-b5faa9`). Companion to `cdc_storage_bound`, which
+# measured within one generation only.
+[[example]]
+name = "cdc_churn"
+required-features = ["cdc"]

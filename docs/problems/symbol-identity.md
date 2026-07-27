@@ -44,8 +44,18 @@ Nothing else in the projection addresses a construct durably:
   defect. Go/Java/C do not — they have no named nestable in-file scope, so
   `source_id` genuinely addresses their free functions.
 
-- **`container_node_id` is NULL** on every def row measured, Rust and Go, despite
-  carrying a partial index that assumes otherwise.
+- **`container_node_id` tracks a different relationship.** It is populated, but only
+  for *function-local* items — consts and nested defs declared inside a fn body
+  (mache corpus: 91/6,126 Rust rows = 1.5%, 383/4,707 Go = 8.1%):
+
+  ```
+  WRITES_PER_THREAD -> .../blob_store.rs/mod_item/declaration_list/function_item_30
+  ```
+
+  So it records lexical enclosure *by a definition*, not membership in a type or
+  module. It is still no fallback for qualification — but the mechanism is wired, not
+  absent, which matters because the obvious "just populate the column that already
+  exists" fix would overload a column that already means something else.
 
 The cost is not theoretical. mache measured **733 Rust constructs** and **16.9% of Go
 `init()` bodies** lost to keying on rendered names — the third, weaker identity it
@@ -84,10 +94,28 @@ lsp         (project.rs:1028)  x.rs/alpha/walk                                  
 `format!("{parent_id}/{}", sym.name)` — name-keyed, recursive, over the hierarchical
 `DocumentSymbol` tree (`client.rs:171` requests `hierarchicalDocumentSymbolSupport`).
 
-**The address half already exists in LLO.** It is in the LSP projection, and the
-tree-sitter projection uses ordinals for the same traversal. So the work is not "design
-an identity scheme" — it is "key the tree-sitter walk by name, as the sibling
-projection already does," plus reconciling the two namespaces.
+**The keying already exists in LLO** — in the LSP projection, while the tree-sitter
+projection uses ordinals for the same traversal. So the work is not "design an identity
+scheme" from nothing; it is "key the tree-sitter walk by name, as the sibling projection
+already does," plus reconciling the two namespaces.
+
+**But the LSP address is not a finished article, and must not be adopted verbatim.**
+Measured against rust-analyzer on an `impl Display` / `impl Debug` fixture:
+
+```
+symbols/impl fmt::Debug for Hash/fmt      method
+symbols/impl fmt::Display for Hash/fmt    method
+```
+
+Two useful facts. First, impl blocks *are* nested as their own container symbols, so
+same-named methods across different impls get distinct parents — the `INSERT OR REPLACE`
+collision is unreachable for Rust through impls, since duplicate method names within one
+impl are not legal. (C++ overloads remain the open risk.) Second, and more important for
+the ADR: **the container name is the raw impl header text**, embedding the trait path
+exactly as written. Rewriting `fmt::Debug` to `std::fmt::Debug` changes the address
+without changing the code's meaning. The LSP walk is therefore name-keyed and
+collision-free but *syntactically derived* — prior art for the keying, not a canonical
+semantic path. The ADR must define the canonical form; it cannot simply adopt this one.
 
 ## What must be decided (the ADR)
 

@@ -112,3 +112,8 @@
 # dolt.bak/ and never deletes it. Binary store — never commit (rosary-05fbe0).
 .beads/dolt.bak/
 .beads/dolt.bak.*/
+
+# fastembed downloads ONNX model cache next to the crate when `task test:vec`
+# runs. Not an artifact of the build — a runtime download — so it belongs
+# nowhere near the tree (bead ley-line-open-2607d2 wired test:vec into ci).
+.fastembed_cache/

@@ -13,6 +13,12 @@ if tools/ci_attestation.sh check; then
     exit 0
 fi
 
+# Straight to the terminal, not stdout: pre-commit captures stdout and holds
+# it until the hook exits, so a message there arrives after the wait it was
+# meant to explain. /dev/tty bypasses that. Guarded because a hook can run
+# without a controlling terminal (CI, a GUI client).
+{ echo "pre-push: no task ci receipt for this tree — running the full gate (several minutes)" \
+    > /dev/tty; } 2>/dev/null || true
 echo "no matching task ci receipt; running the full gate"
 "${TASK_BIN:-task}" ci
 tools/ci_attestation.sh check

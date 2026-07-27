@@ -350,3 +350,178 @@ fn stale_caller_bytes_cannot_be_paired_with_a_new_authoritative_witness() {
         "rejection must roll back and preserve the prior manifest generation"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The canonical `nodes` contract — bead `ley-line-open-b5faa9`
+//
+// Every test above builds its fixture from a hand-written `record TEXT`
+// column. The contract every real producer writes — `leyline_schema::
+// NODES_TABLE_DDL`, "mache writes it, leyline-fs reads it" — declares
+// `record JSON`. SQLite's affinity rules give a declared type containing none
+// of INT/CHAR/CLOB/TEXT/BLOB/REAL/FLOA/DOUB **NUMERIC** affinity, so `JSON`
+// silently coerces any leaf token that parses as a number out of TEXT on
+// insert. The fixture drift is why activation was never exercised against the
+// shape it ships against.
+//
+// Measured on three real projections (`leyline parse` at 2026-07-27):
+//
+// | corpus | eligible leaves | typeof=integer | typeof=real | size mismatch |
+// |--------|-----------------|----------------|-------------|---------------|
+// | mache  |         391,556 |          9,332 |         113 |         1,143 |
+// | rosary |         208,195 |          4,572 |         164 |           807 |
+// | LLO    |         254,472 |          9,669 |         166 |           801 |
+//
+// Most coercions round-trip textually ("42" -> 42 -> "42"). The mismatch
+// column is the subset whose BYTE LENGTH changed ("1. " -> 1, "007" -> 7),
+// and activation's `size == record.len()` guard fails closed on the first one
+// it meets — so `leyline cdc enable` cannot complete on any of the three.
+// ---------------------------------------------------------------------------
+
+/// The same fixture shape as [`projection`], built from the CANONICAL contract
+/// DDL rather than a hand-written `record TEXT` column.
+fn canonical_projection() -> Connection {
+    let conn = Connection::open_in_memory().unwrap();
+    leyline_schema::create_nodes_table(&conn).unwrap();
+    conn
+}
+
+fn insert_leaf(conn: &Connection, id: &str, record: &str) {
+    conn.execute(
+        "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) \
+         VALUES (?1, '', ?1, 0, ?2, 7, ?3)",
+        params![id, record.len() as i64, record],
+    )
+    .unwrap();
+}
+
+/// What the contract is supposed to guarantee, held here as executable
+/// evidence that it does not.
+///
+/// The three records are verbatim shapes from the measured corpora: a
+/// leading-zero literal, a markdown ordered-list marker, an ordinary
+/// identifier. Two of the three are numbers as far as NUMERIC affinity is
+/// concerned, and the marker's stored length drops from 3 to 1.
+///
+/// `#[ignore]` rather than deleted: the fix is a change to the shared
+/// `nodes` contract (`record JSON` -> `record TEXT`, plus a producer that
+/// binds bytes), which reaches mache and is therefore its own bead. Removing
+/// the attribute is the activation gesture once that lands.
+#[test]
+#[ignore = "ley-line-open-b5faa9: `record JSON` in the shared nodes contract carries NUMERIC \
+            affinity, so numeric-looking leaf tokens are coerced out of TEXT on insert and \
+            activation fails closed on the length change"]
+fn activation_survives_the_canonical_nodes_contract() {
+    let conn = canonical_projection();
+    insert_leaf(&conn, "a.rs/fn/body/int_literal", "007");
+    insert_leaf(&conn, "README.md/list/list_item_0/list_marker_dot", "1. ");
+    insert_leaf(&conn, "a.rs/fn/name", "main");
+
+    let report = activate_chunked_content(&conn, ActivationOptions::default()).unwrap();
+
+    assert_eq!(report.populated_nodes, 3);
+}
+
+/// The same defect, pinned as the behaviour that actually ships, so the
+/// measurement in `examples/cdc_storage_bound.rs` can state honestly which
+/// rows it had to repair before it could measure anything.
+///
+/// This test inverts when the contract is fixed. That is the point: it fails
+/// loudly at the moment the coercion stops happening, rather than leaving the
+/// ignored test above as the only signal.
+#[test]
+fn canonical_nodes_contract_coerces_numeric_records_and_blocks_activation() {
+    let conn = canonical_projection();
+    insert_leaf(&conn, "a.rs/fn/name", "main");
+    insert_leaf(&conn, "a.rs/fn/body/int_literal", "007");
+    insert_leaf(&conn, "README.md/list/list_item_0/list_marker_dot", "1. ");
+
+    let coerced: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM nodes WHERE typeof(record) <> 'text'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(coerced, 2, "NUMERIC affinity takes both numeric tokens");
+
+    let stored: Vec<u8> = conn
+        .query_row(
+            "SELECT CAST(record AS BLOB) FROM nodes \
+              WHERE id = 'a.rs/fn/body/int_literal'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stored, b"7",
+        "the authoritative record is lossy: 007 reads back as 7"
+    );
+
+    let error = activate_chunked_content(&conn, ActivationOptions::default()).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("does not match"),
+        "unexpected error: {error:#}"
+    );
+}
+
+/// Activation opened one IMMEDIATE transaction PER NODE and committed it, so a
+/// projection with 391,556 leaves paid 391,556 commits — measured at ~10 KiB/s
+/// against a chunker that benchmarks in the hundreds of MiB/s. The work per
+/// node is trivial; the commit is not.
+///
+/// Counting commits rather than timing them keeps this exact: a wall-clock
+/// assertion would be flaky on a loaded machine and would not say *why* it
+/// regressed. Resumability is preserved at page granularity — a crash re-does
+/// at most one page, and re-activation is idempotent through `AlreadyFresh`.
+///
+/// Bead `ley-line-open-b5faa9`.
+#[test]
+fn activation_commits_per_page_not_per_node() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    leyline_fs::chunked::create_chunked_content_schema(&conn).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE nodes (
+             id TEXT PRIMARY KEY, parent_id TEXT, name TEXT NOT NULL,
+             kind INTEGER NOT NULL, size INTEGER DEFAULT 0,
+             mtime INTEGER NOT NULL, record_id TEXT, record TEXT,
+             source_file TEXT);",
+    )
+    .unwrap();
+    const NODES: usize = 64;
+    for i in 0..NODES {
+        let body = format!("fn n{i}() {{}}");
+        conn.execute(
+            "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) \
+             VALUES (?1, '', ?1, 0, ?2, 1, ?3)",
+            rusqlite::params![format!("n{i}.rs"), body.len() as i64, body],
+        )
+        .unwrap();
+    }
+
+    let commits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&commits);
+    conn.commit_hook(Some(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+        false
+    }));
+
+    let report = leyline_fs::activation::activate_chunked_content(
+        &conn,
+        leyline_fs::activation::ActivationOptions { batch_size: 256 },
+    )
+    .unwrap();
+    assert_eq!(
+        report.populated_nodes as usize, NODES,
+        "all nodes activated"
+    );
+
+    let observed = commits.load(Ordering::SeqCst);
+    assert!(
+        observed < NODES,
+        "activation must batch commits per page, not per node: \
+         {NODES} nodes produced {observed} commits"
+    );
+}

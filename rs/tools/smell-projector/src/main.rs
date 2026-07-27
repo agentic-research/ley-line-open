@@ -200,6 +200,26 @@ fn schema() -> &'static str {
             PRIMARY KEY (source_id, start_row, start_col)
         );
 
+        -- A `#[cfg(feature = ...)]` inside TEST code. Almost always the test
+        -- replicating the shape of a feature-gated PRODUCTION struct: seven
+        -- files build a `DaemonContext` literal and each must gate
+        -- `vec_index`/`embedder`/`embed_queue`/`text_search` itself, because
+        -- Rust will not let you initialise a field that does not exist. The
+        -- test then carries production's conditional shape, and `integration.rs`
+        -- is 3,522 lines partly for that reason. The fix is a constructor or
+        -- builder owning the cfg once, not a cfg per call site.
+        -- Bead `ley-line-open-2607d2` workstream. BASELINED — the existing
+        -- sites need a builder, which is a refactor, not a deletion.
+        CREATE TABLE cfg_feature_test_sites (
+            source_id    TEXT NOT NULL,
+            node_id      TEXT NOT NULL,
+            start_row    INTEGER NOT NULL,
+            start_col    INTEGER NOT NULL,
+            end_row      INTEGER NOT NULL,
+            end_col      INTEGER NOT NULL,
+            PRIMARY KEY (source_id, start_row, start_col)
+        );
+
         CREATE TABLE unwrap_sites (
             source_id    TEXT NOT NULL,
             node_id      TEXT NOT NULL,
@@ -1446,6 +1466,110 @@ fn project_sleep_sites(workspace_root: &Path, repo_root: &Path) -> Result<Vec<Sl
     Ok(rows)
 }
 
+/// Every `#[cfg(feature = "...")]` inside test code.
+///
+/// Same file scope as `project_sleep_sites`: whole file under `/tests/` or
+/// `/benches/`, and only the `#[cfg(test)]` tail of a `/src/` file. `cfg(test)`
+/// itself is NOT a finding — this is about FEATURE gating leaking into tests.
+fn project_cfg_feature_test_sites(
+    workspace_root: &Path,
+    repo_root: &Path,
+) -> Result<Vec<SleepRow>> {
+    let mut rows = Vec::new();
+    for entry in WalkDir::new(workspace_root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+            continue;
+        }
+        let s = path.to_string_lossy();
+        if s.contains("/target/") {
+            continue;
+        }
+        // TEST TREES ONLY. Unlike `sleep_sites`, this rule does NOT scan the
+        // `#[cfg(test)]` tail of `/src/` files: production code is exactly
+        // where feature gating belongs, and including src made the rule report
+        // 309 sites dominated by `languages.rs` (141) and `lib.rs` (89)
+        // legitimately gating grammars. The signal wanted here is a TEST
+        // carrying production's conditional shape.
+        if !(s.contains("/tests/") || s.contains("/benches/")) {
+            continue;
+        }
+
+        let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let lines: Vec<&str> = text.lines().collect();
+        let test_start = 0usize;
+        let inside_raw_string = raw_string_line_mask(&text);
+        let source_id = path
+            .strip_prefix(repo_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
+
+        for (idx, line) in lines.iter().enumerate() {
+            let line_no = idx + 1;
+            if line_no < test_start {
+                continue;
+            }
+            if inside_raw_string.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            // A whole-file gate is the GOOD pattern — it is the fix, not the
+            // smell. Only inner attributes on individual items are flagged.
+            if trimmed.starts_with("#![cfg(feature") {
+                continue;
+            }
+            // Skip matches inside string literals — this projector's own
+            // tests assert on `"#[cfg(feature = \"x\")]"` as DATA, and four of
+            // those were the rule's first findings. A false positive that gets
+            // baselined is indistinguishable from a real one that never burns
+            // down, so filter rather than grandfather.
+            if let Some(col) = line.find("#[cfg(feature").filter(|col| {
+                let unescaped_quotes = line[..*col]
+                    .char_indices()
+                    .filter(|(i, c)| *c == '"' && (*i == 0 || line.as_bytes()[i - 1] != b'\\'))
+                    .count();
+                unescaped_quotes % 2 == 0
+            }) {
+                rows.push(SleepRow {
+                    node_id: format!("{source_id}:{line_no}:{col}"),
+                    source_id: source_id.clone(),
+                    start_row: line_no as u32,
+                    start_col: col as u32,
+                    end_row: line_no as u32,
+                    end_col: col as u32,
+                });
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn insert_cfg_feature_test_sites(conn: &Connection, rows: &[SleepRow]) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "INSERT OR REPLACE INTO cfg_feature_test_sites (
+            source_id, node_id, start_row, start_col, end_row, end_col
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    for r in rows {
+        stmt.execute(params![
+            r.source_id,
+            r.node_id,
+            r.start_row,
+            r.start_col,
+            r.end_row,
+            r.end_col,
+        ])?;
+    }
+    Ok(())
+}
+
 fn insert_sleep_sites(conn: &Connection, rows: &[SleepRow]) -> Result<()> {
     let mut stmt = conn.prepare(
         "INSERT OR REPLACE INTO sleep_sites (
@@ -1503,10 +1627,26 @@ struct Finding {
     start_col: u32,
 }
 
-fn run_rule(conn: &Connection, rule: &Rule) -> Result<Vec<Finding>> {
-    // Check `Requires` — every named table must exist. Rules whose
-    // tables don't exist are silently skipped (mirrors mache's
-    // `--rule '*'` behavior).
+/// Whether a rule actually executed.
+///
+/// A rule whose `Requires` table is absent used to return an empty finding
+/// list — bit-identical to "ran and found nothing" — so the gate printed
+/// "N finding(s), all covered by baseline" and exited 0 while an unknown
+/// number of rules had never run. A count derived from a mechanism is only
+/// evidence if the mechanism fired; otherwise it is the safe-looking value by
+/// construction. Bead `ley-line-open-2607d2`.
+#[derive(Debug)]
+enum RuleOutcome {
+    /// The rule ran. Findings may still be empty, and that means something.
+    Ran(Vec<Finding>),
+    /// The rule did not run: a table it requires is absent.
+    Skipped { missing: String },
+}
+
+fn run_rule(conn: &Connection, rule: &Rule) -> Result<RuleOutcome> {
+    // Check `Requires` — every named table must exist. A rule whose tables
+    // are absent is SKIPPED, and the caller reports that rather than folding
+    // it into the finding count.
     for req in &rule.Requires {
         let exists: Option<i64> = conn
             .query_row(
@@ -1516,7 +1656,9 @@ fn run_rule(conn: &Connection, rule: &Rule) -> Result<Vec<Finding>> {
             )
             .unwrap_or(None);
         if exists.is_none() {
-            return Ok(Vec::new());
+            return Ok(RuleOutcome::Skipped {
+                missing: req.clone(),
+            });
         }
     }
     let sql = rule.Query.replace("%s", "");
@@ -1540,7 +1682,25 @@ fn run_rule(conn: &Connection, rule: &Rule) -> Result<Vec<Finding>> {
             start_col: start_col as u32,
         });
     }
-    Ok(findings)
+    Ok(RuleOutcome::Ran(findings))
+}
+
+/// State the denominator. A finding count without the number of rules that
+/// produced it cannot distinguish "clean" from "did not run".
+fn report_coverage(ran: usize, total: usize, skipped: &[(String, String)]) {
+    if skipped.is_empty() {
+        return;
+    }
+    eprintln!(
+        "smells: {} of {} rules SKIPPED — their required tables are absent, so \
+         this run says nothing about them:",
+        skipped.len(),
+        total
+    );
+    for (rule_id, missing) in skipped {
+        eprintln!("  {rule_id} (requires table `{missing}`)");
+    }
+    let _ = ran;
 }
 
 // ---------------------------------------------------------------------------
@@ -1648,6 +1808,9 @@ fn main() -> Result<()> {
     let sleep_rows = project_sleep_sites(&workspace_root, &repo_root)?;
     insert_sleep_sites(&conn, &sleep_rows)?;
 
+    let cfg_rows = project_cfg_feature_test_sites(&workspace_root, &repo_root)?;
+    insert_cfg_feature_test_sites(&conn, &cfg_rows)?;
+
     let rules = load_rules(&rules_dir)?;
     if rules.is_empty() {
         eprintln!(
@@ -1657,10 +1820,14 @@ fn main() -> Result<()> {
     }
 
     let mut all_findings = Vec::new();
+    let mut skipped: Vec<(String, String)> = Vec::new();
     for rule in &rules {
-        let mut findings = run_rule(&conn, rule)?;
-        all_findings.append(&mut findings);
+        match run_rule(&conn, rule)? {
+            RuleOutcome::Ran(mut findings) => all_findings.append(&mut findings),
+            RuleOutcome::Skipped { missing } => skipped.push((rule.ID.clone(), missing)),
+        }
     }
+    let ran = rules.len() - skipped.len();
 
     let current_counts = findings_to_counts(&all_findings);
 
@@ -1721,6 +1888,7 @@ fn main() -> Result<()> {
                 );
             }
         }
+        report_coverage(ran, rules.len(), &skipped);
         eprintln!(
             "To grandfather (deliberate change): run `task smells:baseline` and commit {}.",
             baseline_path.display()
@@ -1728,9 +1896,12 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
+    report_coverage(ran, rules.len(), &skipped);
     eprintln!(
-        "smells: {} finding(s), all covered by baseline ({})",
+        "smells: {} finding(s) across {}/{} rules, all covered by baseline ({})",
         all_findings.len(),
+        ran,
+        rules.len(),
         baseline_path.display()
     );
     Ok(())
@@ -2078,5 +2249,57 @@ mod tests {
             "}",                     // 5
         ];
         assert_eq!(find_test_module_line(&lines), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod skip_visibility_tests {
+    //! A count derived from a mechanism is evidence only if the mechanism
+    //! fired. `run_rule` used to return an empty finding list for a rule whose
+    //! `Requires` table was absent — bit-identical to "ran and found nothing" —
+    //! so `task smells` printed "N finding(s), all covered by baseline" and
+    //! exited 0 while an unknown number of rules had never executed.
+    //!
+    //! The two tests below are a pair on purpose: the interesting property is
+    //! not that a skip is detected, it is that a skip and a genuinely clean
+    //! run are DISTINGUISHABLE. Bead `ley-line-open-2607d2`.
+    use super::*;
+
+    fn rule(requires: &str, query: &str) -> Rule {
+        Rule {
+            ID: "TEST-RULE".into(),
+            Description: String::new(),
+            Requires: vec![requires.into()],
+            ScopeColumn: String::new(),
+            Query: query.into(),
+        }
+    }
+
+    #[test]
+    fn a_rule_whose_required_table_is_absent_reports_skipped() {
+        let conn = Connection::open_in_memory().unwrap();
+        match run_rule(&conn, &rule("absent_table", "SELECT 'a','b',0,0")).unwrap() {
+            RuleOutcome::Skipped { missing } => assert_eq!(missing, "absent_table"),
+            RuleOutcome::Ran(f) => panic!(
+                "a rule that never ran must not report Ran; got {} findings",
+                f.len()
+            ),
+        }
+    }
+
+    #[test]
+    fn a_rule_that_runs_and_finds_nothing_reports_ran() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE present (x TEXT);")
+            .unwrap();
+        match run_rule(&conn, &rule("present", "SELECT 'a','b',0,0 WHERE 0")).unwrap() {
+            RuleOutcome::Ran(findings) => assert!(
+                findings.is_empty(),
+                "fixture query selects nothing, so the rule ran clean"
+            ),
+            RuleOutcome::Skipped { missing } => {
+                panic!("a rule whose tables exist must not report Skipped (missing={missing})")
+            }
+        }
     }
 }

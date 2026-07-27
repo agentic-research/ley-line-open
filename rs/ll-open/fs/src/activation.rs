@@ -111,8 +111,15 @@ where
         }
         last_id = rows.last().cloned();
 
+        // One transaction per PAGE, not per node. The work per node is a small
+        // read plus a manifest rewrite; the commit dominated it, so a
+        // 391,556-leaf projection paid 391,556 commits and ran at ~10 KiB/s.
+        // Resumability survives at page granularity: a crash re-does at most
+        // `batch_size` nodes, and re-activation is idempotent via AlreadyFresh.
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .context("begin CDC activation page transaction")?;
         for node_id in rows {
-            match activate_node(conn, &node_id)? {
+            match activate_node_in_tx(&tx, &node_id)? {
                 NodeActivation::Gone => {}
                 NodeActivation::AlreadyFresh => {
                     visited_nodes = checked_increment(visited_nodes, "visited CDC node count")?;
@@ -129,6 +136,7 @@ where
                 }
             }
         }
+        tx.commit().context("commit CDC activation page")?;
         on_progress(ActivationProgress {
             visited_nodes,
             eligible_nodes: estimated_eligible_nodes,
@@ -272,9 +280,13 @@ enum NodeActivation {
     Populated { source_bytes: u64 },
 }
 
-fn activate_node(conn: &Connection, node_id: &str) -> Result<NodeActivation> {
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
-        .with_context(|| format!("begin CDC activation transaction for node {node_id}"))?;
+/// Activate one node inside a caller-owned transaction.
+///
+/// The page loop batches many of these into one commit; the convergence loop
+/// uses [`activate_node`] for its single-node repairs. Neither begins nor
+/// commits — that is the caller's, so commit granularity is a policy decision
+/// rather than a property of this function.
+fn activate_node_in_tx(tx: &Transaction<'_>, node_id: &str) -> Result<NodeActivation> {
     let source: Option<(Vec<u8>, i64)> = tx
         .query_row(
             "SELECT CAST(record AS BLOB), size
@@ -286,8 +298,6 @@ fn activate_node(conn: &Connection, node_id: &str) -> Result<NodeActivation> {
         .optional()
         .with_context(|| format!("read authoritative CDC source for node {node_id}"))?;
     let Some((data, declared_size)) = source else {
-        tx.commit()
-            .with_context(|| format!("commit skipped CDC activation for node {node_id}"))?;
         return Ok(NodeActivation::Gone);
     };
     ensure!(
@@ -295,20 +305,27 @@ fn activate_node(conn: &Connection, node_id: &str) -> Result<NodeActivation> {
         "node {node_id} size {declared_size} does not match {} record bytes",
         data.len()
     );
-    if has_chunked_content_in_transaction(&tx, node_id)
+    if has_chunked_content_in_transaction(tx, node_id)
         .with_context(|| format!("check CDC freshness for node {node_id}"))?
     {
-        tx.commit()
-            .with_context(|| format!("commit fresh CDC activation for node {node_id}"))?;
         return Ok(NodeActivation::AlreadyFresh);
     }
-    store_content_chunked_in_transaction(&tx, node_id, &data)
+    store_content_chunked_in_transaction(tx, node_id, &data)
         .with_context(|| format!("activate CDC for node {node_id}"))?;
-    tx.commit()
-        .with_context(|| format!("commit CDC activation for node {node_id}"))?;
     Ok(NodeActivation::Populated {
         source_bytes: u64::try_from(data.len()).context("node length exceeds u64")?,
     })
+}
+
+/// Activate a single node in its own transaction — the convergence loop's
+/// repair path, where one stale row is fixed at a time.
+fn activate_node(conn: &Connection, node_id: &str) -> Result<NodeActivation> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .with_context(|| format!("begin CDC activation transaction for node {node_id}"))?;
+    let outcome = activate_node_in_tx(&tx, node_id)?;
+    tx.commit()
+        .with_context(|| format!("commit CDC activation for node {node_id}"))?;
+    Ok(outcome)
 }
 
 fn validate_nodes_contract(conn: &Connection) -> Result<()> {

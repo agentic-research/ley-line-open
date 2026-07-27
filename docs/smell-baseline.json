@@ -2,6 +2,66 @@
   "version": 1,
   "counts": [
     {
+      "rule_id": "cfg_feature_in_tests",
+      "source_id": "rs/ll-core/schema-capnp/tests/cross_runtime_fixtures.rs",
+      "count": 2
+    },
+    {
+      "rule_id": "cfg_feature_in_tests",
+      "source_id": "rs/ll-open/cli-lib/tests/event_push_blackbox_test.rs",
+      "count": 4
+    },
+    {
+      "rule_id": "cfg_feature_in_tests",
+      "source_id": "rs/ll-open/cli-lib/tests/integration.rs",
+      "count": 17
+    },
+    {
+      "rule_id": "cfg_feature_in_tests",
+      "source_id": "rs/ll-open/cli-lib/tests/sheaf_ablation_test.rs",
+      "count": 4
+    },
+    {
+      "rule_id": "cfg_feature_in_tests",
+      "source_id": "rs/ll-open/cli-lib/tests/sheaf_gap3_invalidate_emit_test.rs",
+      "count": 4
+    },
+    {
+      "rule_id": "cfg_feature_in_tests",
+      "source_id": "rs/ll-open/cli-lib/tests/sheaf_loop_end_to_end_test.rs",
+      "count": 4
+    },
+    {
+      "rule_id": "cfg_feature_in_tests",
+      "source_id": "rs/ll-open/cli-lib/tests/sheaf_uds_blackbox_test.rs",
+      "count": 4
+    },
+    {
+      "rule_id": "cfg_feature_in_tests",
+      "source_id": "rs/ll-open/cli-lib/tests/version_handshake_blackbox_test.rs",
+      "count": 4
+    },
+    {
+      "rule_id": "cfg_feature_in_tests",
+      "source_id": "rs/ll-open/cli-lib/tests/watcher_enrichment_gap1_test.rs",
+      "count": 4
+    },
+    {
+      "rule_id": "cfg_feature_in_tests",
+      "source_id": "rs/ll-open/sign/tests/wire_compat.rs",
+      "count": 2
+    },
+    {
+      "rule_id": "cfg_feature_in_tests",
+      "source_id": "rs/ll-open/text-search/tests/acceptance_gates.rs",
+      "count": 1
+    },
+    {
+      "rule_id": "cfg_feature_in_tests",
+      "source_id": "rs/ll-open/text-search/tests/substrate_non_leak.rs",
+      "count": 2
+    },
+    {
       "rule_id": "sleep_in_tests",
       "source_id": "rs/ll-core/core/src/control.rs",
       "count": 1

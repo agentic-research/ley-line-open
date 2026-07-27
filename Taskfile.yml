@@ -464,6 +464,27 @@ tasks:
     cmds:
       - cargo test -p leyline-cli-lib
 
+  # `vec` and `text-search` SHIP — README documents `task install:full`, which
+  # builds `--features all` and includes both — but no test target enabled
+  # them, so 27 and 16 inline `#[cfg]` sections inside otherwise-running tests
+  # never compiled. `cargo test -p leyline-cli-lib` uses the DEFAULT set
+  # (lsp, validate, hdc, cdc), which excludes them.
+  #
+  # Both pass today; this is turning on existing coverage, not writing new.
+  # Enforced by `lint:feature-reachability`, which fails when a shipping
+  # feature has no test target (bead ley-line-open-2607d2).
+  test:vec:
+    desc: Tests for the `vec` feature (sqlite-vec + fastembed) — ships in install:full
+    dir: rs
+    cmds:
+      - cargo test -p leyline-cli-lib --features vec
+
+  test:text-search:
+    desc: Tests for the `text-search` feature (witchcraft) — ships in install:full
+    dir: rs
+    cmds:
+      - cargo test -p leyline-cli-lib --features text-search
+
   conformance:py:
     desc: |
       Python conformance suite for cloister/credential-isolation/v1
@@ -627,6 +648,18 @@ tasks:
     desc: Verify documentation claims against the code they describe (ADR-0032 §D4)
     cmds:
       - sh tools/check_doc_claims.sh .
+
+  # A feature no shipping configuration enables is compiled out of every
+  # binary, and a test that enables it proves a capability the shipped
+  # artifact does not have. `leyline-fs/splice` was exactly that: enabled only
+  # by the test targets, so `flush_node` was a silent no-op in every build
+  # while a green test said otherwise (ley-line-open-918a75). Reachability is
+  # cargo's answer, not a grep — a grep-based first cut had a 97%
+  # false-positive rate, and a gate that cries wolf gets muted.
+  lint:feature-reachability:
+    desc: Every declared feature must be reachable from a shipping configuration
+    cmds:
+      - sh tools/check_feature_reachability.sh .
 
   # --------------------------------------------------------------------------
   # Smell-rule gate (workspace deps drift + unsafe/unwrap invariants).
@@ -1020,6 +1053,7 @@ tasks:
       - task: lint:blake3
       - task: lint:architecture-vocabulary
       - task: lint:doc-claims
+      - task: lint:feature-reachability
       - task: readme:version-check
       - task: schema:version-check
       - task: check
@@ -1029,6 +1063,8 @@ tasks:
       - task: build:fs-nfs-isolated
       - task: test:fs-cdc
       - task: test:cdc-activation
+      - task: test:vec
+      - task: test:text-search
       - task: tier:isolation
       - task: check:all-features
       - task: test

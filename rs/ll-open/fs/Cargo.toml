@@ -71,3 +71,23 @@ leyline-cdc = { path = "../cdc", optional = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 leyline-ts = { path = "../ts" }
+# `hooks` enables `Connection::commit_hook`, which lets the activation-batching
+# test COUNT commits instead of timing them. A wall-clock assertion on the same
+# property would be flaky and would not say why it regressed; a commit count is
+# exact and names the defect directly. Dev-only — production never links it.
+rusqlite = { workspace = true, features = ["bundled", "serialize", "hooks"] }
+
+# The F4c/F5c storage gate (bead `ley-line-open-b5faa9`). Needs `cdc` for the
+# activation + GC surface it measures, and nothing else — `--no-default-
+# features` keeps it off the FUSE/NFS toolchain so it runs anywhere a
+# projection does.
+[[example]]
+name = "cdc_storage_bound"
+required-features = ["cdc"]
+
+# Cross-generation churn: what a one-commit diff costs CDC under each target
+# (bead `ley-line-open-b5faa9`). Companion to `cdc_storage_bound`, which
+# measured within one generation only.
+[[example]]
+name = "cdc_churn"
+required-features = ["cdc"]

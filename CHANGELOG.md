@@ -8,6 +8,67 @@ Each entry references the bead ID(s) tracking the work in
 [rsry](https://github.com/agentic-research/rosary) so the full design
 context, scoping notes, and review history are recoverable.
 
+## [Unreleased]
+
+### Changed — BREAKING
+
+- **`Head.rootHash` now commits to the segment decomposition, not just to the
+  concatenated bytes** (`ley-line-open-b64505`, ADR-0032 D2). The root was
+  `BLAKE3(canonical(source) ‖ canonical(ast) ‖ canonical(bindings))` — a hash
+  of a concatenation, which does not commit to where the parts divide, so two
+  runs that split identical bytes differently shared a root. `segmentBytes`
+  guarded only the *total*, catching a torn write but not a re-division.
+  Absent and present-but-empty segments also collided, since both contributed
+  nothing to the running hash.
+
+  The root is now a tagged fold over the three segment addresses with ordinal
+  and length framing, under scheme `leyline/segment-root/v1`, via
+  `leyline_core::PartitionSpec`. Absent segments carry the `Hash::ZERO`
+  sentinel so they stay distinct from empty ones.
+
+  **Impact:** roots computed before this change are not reproducible after it.
+  Chain continuity is unaffected — `parentHash` is copied from the prior head
+  rather than recomputed — and existing signatures still verify against their
+  stored values, since `head_digest` binds the recorded triple. Go consumers
+  read `rootHash` and never recompute it, so no client breaks. Re-parse to
+  obtain roots under the new scheme. Clean break per the pre-1.0 policy; the
+  scheme tag is what makes any future change to this decomposition a `v2`
+  rather than a silent reinterpretation.
+
+### Fixed
+
+- **CDC GC reclaims chunks pinned by dead manifests** (`ley-line-open-b5e56f`)
+  — `collect_unreachable_chunks` deleted only from `content_chunks` and read
+  `content_manifest` purely as a reachability predicate, so a manifest whose
+  freshness witness could not be satisfied kept its chunks reachable forever:
+  reads correctly refused it, GC correctly saw a reference, and `leyline cdc
+  gc` reported success while reclaiming nothing. Dead manifests are now reaped
+  before the reachability pass, in the same transaction, including during a
+  dry run so the estimate reflects what is actually reclaimable. `GcReport`
+  gains `reaped_manifest_rows` / `reaped_manifest_nodes`.
+
+- **`leyline-sheaf` hashes through σ** (`ley-line-open-b61cd6`, ADR-0032 D5) —
+  restriction keys and Merkle roots used SHA-256 in production source, at
+  exactly the composition boundary where `substrate.rs` warns that mixing hash
+  functions breaks (DET) and (CR). All hashing now routes through
+  `leyline_core::ContentAddressed`; `sha2` is no longer a dependency. ADR-0031
+  is amended rather than grandfathered. Restriction keys are not persisted
+  outside the crate, so this invalidates in-memory cache entries and migrates
+  nothing.
+
+### Added
+
+- **`leyline_core::partition`** (`ley-line-open-b67a73`, ADR-0032) — the tagged
+  fold over a declared decomposition. Domain separation via `new_derive_key`
+  and length-prefixed fields, so an address commits to its decomposition rather
+  than to the concatenation of its parts. No hash-algorithm field, deliberately:
+  multiformats-style agility is an anti-feature under a locked σ.
+
+- **ADR-0032 — declared decompositions** (`ley-line-open-ef5c1d`). Records that
+  the substrate's roots are incommensurable rather than merely unlinked, that no
+  root homomorphism can exist, and that cross-structure binding is therefore
+  co-attestation with re-derivable consistency.
+
 ## [0.10.4] — 2026-07-26
 
 **Transactional CDC reads and a fail-closed public release contract.**

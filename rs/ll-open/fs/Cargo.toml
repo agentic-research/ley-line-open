@@ -71,3 +71,11 @@ leyline-cdc = { path = "../cdc", optional = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 leyline-ts = { path = "../ts" }
+
+# The F4c/F5c storage gate (bead `ley-line-open-b5faa9`). Needs `cdc` for the
+# activation + GC surface it measures, and nothing else — `--no-default-
+# features` keeps it off the FUSE/NFS toolchain so it runs anywhere a
+# projection does.
+[[example]]
+name = "cdc_storage_bound"
+required-features = ["cdc"]

@@ -45,7 +45,8 @@ done < "$tmp_dir/download-assets"
     export GOTELEMETRY=off
     export GOPROXY=https://proxy.golang.org,direct
     go mod init example.test/public-leyline-schema-consumer >/dev/null
-    go get "$module/daemon/wire@v$version"
+    release_retry 6 10 "public Go module resolution" \
+        go get "$module/daemon/wire@v$version"
     cp "$repo_root/tools/fixtures/schema-consumer/consumer_test.go" .
     go test ./...
     module_dir=$(go list -m -f '{{.Dir}}' "$module")

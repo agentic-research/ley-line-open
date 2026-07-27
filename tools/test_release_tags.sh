@@ -48,8 +48,16 @@ test "$(git -C "$work" ls-remote origin refs/tags/v0.10.4^{} |
 test "$(git -C "$work" ls-remote origin \
     refs/tags/clients/go/leyline-schema/v0.10.4^{} | cut -f1)" = \
     "$head_commit"
-REPO_ROOT="$work" VERIFY_VERSION_BIN=true \
-    "$repo_root/tools/tag_release.sh" 0.10.4 >/dev/null
+cat > "$tmp_dir/noisy-version-verifier" <<'EOF'
+#!/bin/sh
+set -eu
+printf '%s\n' "binary, schema, metadata, docs, and license agree"
+EOF
+chmod +x "$tmp_dir/noisy-version-verifier"
+tag_output=$(REPO_ROOT="$work" \
+    VERIFY_VERSION_BIN="$tmp_dir/noisy-version-verifier" \
+    "$repo_root/tools/tag_release.sh" 0.10.4)
+test "$tag_output" = "$head_commit"
 
 work=$(new_fixture unchanged)
 (

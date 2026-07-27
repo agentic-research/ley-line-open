@@ -628,6 +628,18 @@ tasks:
     cmds:
       - sh tools/check_doc_claims.sh .
 
+  # A feature no shipping configuration enables is compiled out of every
+  # binary, and a test that enables it proves a capability the shipped
+  # artifact does not have. `leyline-fs/splice` was exactly that: enabled only
+  # by the test targets, so `flush_node` was a silent no-op in every build
+  # while a green test said otherwise (ley-line-open-918a75). Reachability is
+  # cargo's answer, not a grep — a grep-based first cut had a 97%
+  # false-positive rate, and a gate that cries wolf gets muted.
+  lint:feature-reachability:
+    desc: Every declared feature must be reachable from a shipping configuration
+    cmds:
+      - sh tools/check_feature_reachability.sh .
+
   # --------------------------------------------------------------------------
   # Smell-rule gate (workspace deps drift + unsafe/unwrap invariants).
   # Mache-shaped: `smell-projector` walks `rs/`, projects Cargo.toml
@@ -1020,6 +1032,7 @@ tasks:
       - task: lint:blake3
       - task: lint:architecture-vocabulary
       - task: lint:doc-claims
+      - task: lint:feature-reachability
       - task: readme:version-check
       - task: schema:version-check
       - task: check

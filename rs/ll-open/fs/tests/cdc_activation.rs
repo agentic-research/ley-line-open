@@ -463,3 +463,65 @@ fn canonical_nodes_contract_coerces_numeric_records_and_blocks_activation() {
         "unexpected error: {error:#}"
     );
 }
+
+/// Activation opened one IMMEDIATE transaction PER NODE and committed it, so a
+/// projection with 391,556 leaves paid 391,556 commits — measured at ~10 KiB/s
+/// against a chunker that benchmarks in the hundreds of MiB/s. The work per
+/// node is trivial; the commit is not.
+///
+/// Counting commits rather than timing them keeps this exact: a wall-clock
+/// assertion would be flaky on a loaded machine and would not say *why* it
+/// regressed. Resumability is preserved at page granularity — a crash re-does
+/// at most one page, and re-activation is idempotent through `AlreadyFresh`.
+///
+/// Bead `ley-line-open-b5faa9`.
+#[test]
+fn activation_commits_per_page_not_per_node() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    leyline_fs::chunked::create_chunked_content_schema(&conn).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE nodes (
+             id TEXT PRIMARY KEY, parent_id TEXT, name TEXT NOT NULL,
+             kind INTEGER NOT NULL, size INTEGER DEFAULT 0,
+             mtime INTEGER NOT NULL, record_id TEXT, record TEXT,
+             source_file TEXT);",
+    )
+    .unwrap();
+    const NODES: usize = 64;
+    for i in 0..NODES {
+        let body = format!("fn n{i}() {{}}");
+        conn.execute(
+            "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) \
+             VALUES (?1, '', ?1, 0, ?2, 1, ?3)",
+            rusqlite::params![format!("n{i}.rs"), body.len() as i64, body],
+        )
+        .unwrap();
+    }
+
+    let commits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&commits);
+    conn.commit_hook(Some(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+        false
+    }));
+
+    let report = leyline_fs::activation::activate_chunked_content(
+        &conn,
+        leyline_fs::activation::ActivationOptions { batch_size: 256 },
+    )
+    .unwrap();
+    assert_eq!(
+        report.populated_nodes as usize, NODES,
+        "all nodes activated"
+    );
+
+    let observed = commits.load(Ordering::SeqCst);
+    assert!(
+        observed < NODES,
+        "activation must batch commits per page, not per node: \
+         {NODES} nodes produced {observed} commits"
+    );
+}

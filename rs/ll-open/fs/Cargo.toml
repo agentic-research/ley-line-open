@@ -71,6 +71,11 @@ leyline-cdc = { path = "../cdc", optional = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 leyline-ts = { path = "../ts" }
+# `hooks` enables `Connection::commit_hook`, which lets the activation-batching
+# test COUNT commits instead of timing them. A wall-clock assertion on the same
+# property would be flaky and would not say why it regressed; a commit count is
+# exact and names the defect directly. Dev-only — production never links it.
+rusqlite = { workspace = true, features = ["bundled", "serialize", "hooks"] }
 
 # The F4c/F5c storage gate (bead `ley-line-open-b5faa9`). Needs `cdc` for the
 # activation + GC surface it measures, and nothing else — `--no-default-

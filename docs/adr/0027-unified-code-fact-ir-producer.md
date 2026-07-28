@@ -1,6 +1,6 @@
 # ADR-0027 — Unified code-fact IR: the producer contract
 
-**Status:** Proposed (2026-07-06)
+**Status:** Accepted (2026-07-27)
 **Bead:** `ley-line-open-7ed023`
 **Related:**
 - mache ADR-0023 (Unified Code-Fact IR — the consumer/design side; this ADR is its producer mirror)

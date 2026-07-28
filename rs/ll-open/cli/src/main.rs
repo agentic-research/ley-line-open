@@ -108,6 +108,21 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         mcp_no_auth: bool,
 
+        /// Serve MCP over a Unix domain socket at this path (bead
+        /// `ley-line-open-6569de`).
+        ///
+        /// Independent of `--mcp-port`; either, both, or neither. The
+        /// socket is created mode `0600` — owner-only — and carries the
+        /// SAME ADR-0022 token gate as the TCP listener, so
+        /// `--mcp-no-auth` is not required to use it.
+        ///
+        /// This is what an attested caller dials. `--control` carries the
+        /// OPS protocol, not MCP; cloister runs in workerd and reaches
+        /// bundles over AF_UNIX through notme-proxy (cloister ADR-0005),
+        /// the same way rosary and mache are already reached.
+        #[arg(long)]
+        mcp_uds: Option<std::path::PathBuf>,
+
         /// Drop any existing live-db + zero the controller so this
         /// daemon starts with a cold parse against `--source`,
         /// regardless of what the arena's prior owner left behind.
@@ -192,6 +207,7 @@ async fn main() -> Result<()> {
             mcp_bind,
             mcp_allow_public,
             mcp_no_auth,
+            mcp_uds,
             reset_arena,
             cdc,
         } => {
@@ -223,6 +239,7 @@ async fn main() -> Result<()> {
                 mcp_bind,
                 mcp_allow_public,
                 mcp_no_auth,
+                mcp_uds,
                 reset_arena,
             };
             leyline_cli_lib::cmd_daemon::run_daemon_with_options(

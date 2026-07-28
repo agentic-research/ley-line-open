@@ -673,7 +673,82 @@ impl JsonRpcResponse {
 ///
 /// `bind` defaults to `127.0.0.1` for callers passing `None`. Container
 /// deployments need `0.0.0.0` so docker port-forwarding can reach the
-/// listener — a host-side `-p host:8384` only proxies to the container's
+//// Build the MCP router with the ADR-0022 token gate applied.
+///
+/// Shared by every transport. That sharing is the point, not a tidiness win: if
+/// each listener wired its own middleware, a new transport could ship without
+/// the gate and nothing would say so — the surface would simply be open. One
+/// builder means a transport cannot be added without inheriting the policy.
+///
+/// `None` means `--mcp-no-auth` was passed (and logged as a warning), or an
+/// in-process caller opted out. This function wires the router; it does not
+/// make the policy decision.
+fn build_router(ctx: Arc<DaemonContext>, token: Option<Arc<String>>) -> Router {
+    let mcp_routes = Router::new()
+        .route("/mcp", post(handle_post).get(handle_get))
+        .with_state(ctx);
+    match token {
+        Some(tok) => mcp_routes.layer(middleware::from_fn_with_state(tok, auth::require_token)),
+        None => mcp_routes,
+    }
+}
+
+/// Serve MCP over a **Unix domain socket** (bead `ley-line-open-6569de`).
+///
+/// The daemon's existing `--control` socket carries the OPS protocol, not MCP,
+/// so an attested caller had nothing to dial: the MCP surface was TCP-only.
+/// cloister runs in workerd, which cannot speak UDS directly — its answer is
+/// notme-proxy in the "cloister-companion" role (cloister ADR-0005), which
+/// receives `X-Cloister-Transport: uds` and connects `AF_UNIX` to the target
+/// bundle's socket. rosary and mache are already reached that way and both
+/// declare an `ipcSocket` in cloister's `cluster.toml`; LLO had no equivalent.
+///
+/// The socket is created with mode `0600` — owner-only. A UDS is a filesystem
+/// object, so its permissions ARE its reachability, and the token gate is a
+/// second layer rather than the only one. Note the ordering below: the mode is
+/// set immediately after bind, before any task can accept, so there is no
+/// window in which the socket exists at the default umask.
+pub fn spawn_uds(
+    ctx: Arc<DaemonContext>,
+    sock_path: std::path::PathBuf,
+    token: Option<Arc<String>>,
+) -> Result<tokio::task::JoinHandle<()>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let app = build_router(ctx, token);
+
+    // A stale socket file from a killed daemon makes bind fail with
+    // EADDRINUSE even though nothing is listening. Same treatment the control
+    // socket already gives it (daemon/socket.rs).
+    if sock_path.exists()
+        && let Err(e) = std::fs::remove_file(&sock_path)
+    {
+        log::warn!(
+            "could not remove stale MCP socket {}: {e}",
+            sock_path.display()
+        );
+    }
+    if let Some(parent) = sock_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create MCP socket dir {}", parent.display()))?;
+    }
+
+    let listener = tokio::net::UnixListener::bind(&sock_path)
+        .with_context(|| format!("bind MCP UDS on {}", sock_path.display()))?;
+    std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("restrict MCP socket {} to 0600", sock_path.display()))?;
+
+    eprintln!("MCP server listening on unix:{}", sock_path.display());
+
+    let handle = tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app).await {
+            log::error!("MCP UDS server exited: {e:#}");
+        }
+    });
+    Ok(handle)
+}
+
+// listener — a host-side `-p host:8384` only proxies to the container's
 /// external interfaces, not to the container's loopback.
 ///
 /// **Security:** the MCP wire has no auth (see the module docstring's
@@ -691,20 +766,7 @@ pub fn spawn(
     port: u16,
     token: Option<Arc<String>>,
 ) -> Result<tokio::task::JoinHandle<()>> {
-    let mcp_routes = Router::new()
-        .route("/mcp", post(handle_post).get(handle_get))
-        .with_state(ctx);
-
-    // ADR-0022: gate /mcp behind the shared-secret token when one was
-    // generated. In the daemon CLI wiring, `None` means `--mcp-no-auth`
-    // was passed (and logged as a warning). Direct in-process callers
-    // (tests, embedders) can also pass `None`; this function's job is
-    // wire-the-router, not enforce the policy decision.
-    let app = if let Some(tok) = token {
-        mcp_routes.layer(middleware::from_fn_with_state(tok, auth::require_token))
-    } else {
-        mcp_routes
-    };
+    let app = build_router(ctx, token);
 
     let bind = bind.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
     let addr: SocketAddr = SocketAddr::new(bind, port);

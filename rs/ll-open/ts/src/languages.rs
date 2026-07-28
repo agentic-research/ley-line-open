@@ -723,7 +723,6 @@ impl TsLanguage {
 mod tests {
     use super::*;
 
-    #[test]
     /// Bead `ley-line-open-25811f`. A BODYLESS declaration must carry the same
     /// kappa as a definition — `function_signature_item` had no arm at all and
     /// fell to `_ => None`, so every Rust trait signature emitted

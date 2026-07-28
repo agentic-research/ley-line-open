@@ -10,6 +10,71 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Added
+
+- **The OCI image `server.json` advertises is now actually published**
+  (`ley-line-open-e44960`, found by cloister reviewing #288). `server.json`
+  has named `ghcr.io/agentic-research/ley-line-open` since v0.8.0 and no
+  workflow ever pushed it — verified: zero `ghcr` references across
+  `.github/workflows/`, no build-push action anywhere.
+
+  That gap was made *quieter* by v0.11.3, not better. cloister derives
+  `<identifier>:<version>` (ADR-0038) and, when the address does not resolve,
+  does **not** fail — it warns *"could not resolve an OCI digest — pinning by
+  MUTABLE TAG"* and proceeds. So correcting the address **shape** converted a
+  loud resolve failure into a warning that flows through:
+
+  |          | v0.11.2            | v0.11.3         | now                |
+  |----------|--------------------|-----------------|--------------------|
+  | address  | derives to nothing | well-formed     | well-formed        |
+  | image    | absent             | absent          | **published**      |
+  | cloister | fails at resolve   | warns, proceeds | resolves a digest  |
+
+  A `v*` tag now builds the image on native runners per architecture, pushes
+  `linux/amd64` + `linux/arm64`, assembles a manifest list so
+  `<identifier>:<version>` resolves to the list rather than one arch, and
+  records a **build-provenance attestation** against the pushed digest
+  (`gh attestation verify oci://…`). That attestation is the supply-chain
+  property cloister asked for, and it is the one part that cannot live in the
+  Taskfile — its entire value is the runner's OIDC identity, so a locally
+  generated one would attest nothing.
+
+- **`task image:verify-published`** — reads the address out of the committed
+  `server.json` and proves it resolves to a digest. Schema validation
+  (`ley-line-open-891dd5`) proves the address is well-formed; only this proves
+  it is pullable, and v0.11.3 shipped well-formed and unpullable. Verified to
+  bite: it fails today against the unpublished v0.11.3 image.
+
+### Fixed — BREAKING (image tag)
+
+- **The image tag is `v`-prefixed everywhere** — `ley-line-open:v0.11.3`, not
+  `ley-line-open:0.11.3`, both locally and in the registry.
+
+  cloister's review found ADR-0041's rule is unsatisfiable as written
+  (`version` "MUST match the git tag AND the server.json version", where git
+  tags carry `v`). The ecosystem had already split, each side self-consistent:
+
+  ```
+  rosary:  VERSION="${TAG#v}"   -> image :0.10.0    packages 0.10.0
+  mache:   :${{ env.TAG }}      -> image :v0.19.0   packages v0.19.0
+  ```
+
+  The load-bearing invariant is that **`version` must match the pushed image
+  tag**, because that is what makes `<identifier>:<version>` resolve. LLO emits
+  `v0.11.3`, so it pushes `v0.11.3`. One convention, local and published, so
+  there is no second rule to get wrong.
+
+  **Impact:** `docker pull …/ley-line-open:0.11.3` was never valid (nothing was
+  published); the correct address is `…:v0.11.3`. Anyone scripting against
+  `task image`'s local tag should expect `localhost/leyline:v<version>`.
+
+- **The image version is derived, not hardcoded.** `Taskfile.yml` carried the
+  literal `0.11.3` in four places, which is exactly how an image gets published
+  under a tag that disagrees with `server.json`. It now derives from the CLI
+  crate's version — the same value `verify_release_version.sh` asserts across
+  every manifest — and `task image:publish` **refuses** a `TAG` that disagrees
+  rather than trusting its caller.
+
 ## [0.11.3] — 2026-07-28
 
 ### Fixed

@@ -796,11 +796,22 @@ tasks:
   # added by bead `ley-line-open-b7dd03` — outside a container, the
   # daemon refuses non-loopback binds without it.
   image:
-    desc: Build ley-line-open:0.11.3 OCI image (krust musl binary + docker COPY)
+    desc: Build the LLO OCI image for one platform (krust musl binary + docker COPY)
     vars:
-      IMAGE_REF: '{{.IMAGE_REF | default "localhost/leyline:0.11.3"}}'
+      # Derived, never literal. A hardcoded version here is precisely how an
+      # image gets published under a tag that disagrees with server.json's
+      # `packages[0].version` — cloister derives `<identifier>:<version>` and
+      # would resolve nothing (`ley-line-open-e44960`). The CLI crate's
+      # version is the same value `verify_release_version.sh` asserts across
+      # every manifest, so deriving from it cannot drift.
+      VERSION:
+        sh: "grep -m1 '^version = ' rs/ll-open/cli/Cargo.toml | cut -d'\"' -f2"
+      # `v`-prefixed locally too, so there is exactly ONE tag convention. The
+      # published tag MUST be `v`-prefixed to match server.json's
+      # packages[0].version; a different local convention is a second rule to
+      # get wrong, and getting it wrong is `ley-line-open-e44960`.
+      IMAGE_REF: '{{.IMAGE_REF | default (printf "localhost/leyline:v%s" .VERSION)}}'
       KRUST_REPO: '{{.KRUST_REPO | default "localhost/leyline"}}'
-      VERSION: '0.11.3'
       PLATFORM: '{{.PLATFORM | default "linux/arm64"}}'
       # Derive musl target triple from PLATFORM so cross-arch builds find
       # the right binary. Image.Dockerfile's BIN_PATH default targets
@@ -831,8 +842,11 @@ tasks:
     desc: Build image and run end-to-end smoke (start daemon, probe MCP tools/list)
     deps: [image]
     vars:
-      VERSION: '0.11.3'
-      IMAGE_REF: 'localhost/leyline:0.11.3'
+      # Same derivation as `image:` — see the comment there. These two MUST
+      # agree or the smoke test probes an image the build did not produce.
+      VERSION:
+        sh: "grep -m1 '^version = ' rs/ll-open/cli/Cargo.toml | cut -d'\"' -f2"
+      IMAGE_REF: '{{.IMAGE_REF | default (printf "localhost/leyline:v%s" .VERSION)}}'
       PLATFORM: '{{.PLATFORM | default "linux/arm64"}}'
       HOST_PORT: '18384'
     cmds:
@@ -860,6 +874,92 @@ tasks:
         echo
       - docker stop llo-smoke
       - echo "smoke passed"
+
+  # `image:publish` and `image:verify-published` exist because a well-formed
+  # OCI address for an image nobody publishes is WORSE than a malformed one
+  # (`ley-line-open-e44960`). cloister derives `<identifier>:<version>` from
+  # server.json; when that address 404s it does not fail, it emits
+  # "could not resolve an OCI digest — pinning by MUTABLE TAG" and proceeds.
+  # v0.11.3 fixed the address shape and thereby turned a loud resolve failure
+  # into a warning that flows through.
+  #
+  # CI supplies only REGISTRY_REF and TAG; the build lives here so the
+  # published artifact is the one `task image` produces locally.
+  image:publish:
+    desc: Build and push the LLO image for one platform to an OCI registry
+    vars:
+      VERSION:
+        sh: "grep -m1 '^version = ' rs/ll-open/cli/Cargo.toml | cut -d'\"' -f2"
+      # The registry path WITHOUT tag or digest — cloister ADR-0041's
+      # `identifier`. Must equal server.json's packages[0].identifier.
+      REGISTRY_REF: '{{.REGISTRY_REF | default "ghcr.io/agentic-research/ley-line-open"}}'
+      # `v`-prefixed. ADR-0041 says `version` must match the git tag; the real
+      # invariant is that it must match the PUSHED IMAGE TAG, since that is
+      # what makes `<identifier>:<version>` resolve. LLO emits `v0.11.3` in
+      # server.json (following mache), so an unprefixed push here would
+      # reintroduce the unresolvable address this target exists to prevent.
+      TAG: '{{.TAG | default (printf "v%s" .VERSION)}}'
+      PLATFORM: '{{.PLATFORM | default "linux/arm64"}}'
+      ARCH_SUFFIX:
+        sh: 'case "{{.PLATFORM | default "linux/arm64"}}" in linux/arm64) echo arm64;; linux/amd64) echo amd64;; *) echo "unsupported PLATFORM" >&2; exit 1;; esac'
+    preconditions:
+      - sh: 'test "{{.TAG}}" = "v{{.VERSION}}"'
+        msg: >-
+          TAG ({{.TAG}}) does not match v{{.VERSION}} derived from
+          rs/ll-open/cli/Cargo.toml. Publishing under a tag that disagrees with
+          the crate version is how server.json's packages[0].version comes to
+          name an image that does not exist (ley-line-open-e44960).
+    cmds:
+      - task: image
+        vars:
+          IMAGE_REF: '{{.REGISTRY_REF}}:{{.TAG}}-{{.ARCH_SUFFIX}}'
+          PLATFORM: '{{.PLATFORM}}'
+      - docker push '{{.REGISTRY_REF}}:{{.TAG}}-{{.ARCH_SUFFIX}}'
+      - echo "pushed {{.REGISTRY_REF}}:{{.TAG}}-{{.ARCH_SUFFIX}}"
+
+  image:manifest:
+    desc: Assemble the multi-arch manifest list from per-arch tags and push it
+    vars:
+      VERSION:
+        sh: "grep -m1 '^version = ' rs/ll-open/cli/Cargo.toml | cut -d'\"' -f2"
+      REGISTRY_REF: '{{.REGISTRY_REF | default "ghcr.io/agentic-research/ley-line-open"}}'
+      TAG: '{{.TAG | default (printf "v%s" .VERSION)}}'
+    cmds:
+      # `<identifier>:<version>` — the exact address cloister derives — must
+      # resolve to the manifest list, not to one architecture.
+      - |
+        docker buildx imagetools create \
+          -t '{{.REGISTRY_REF}}:{{.TAG}}' \
+          '{{.REGISTRY_REF}}:{{.TAG}}-amd64' \
+          '{{.REGISTRY_REF}}:{{.TAG}}-arm64'
+      - echo "pushed manifest list {{.REGISTRY_REF}}:{{.TAG}}"
+
+  image:verify-published:
+    desc: Prove the address server.json advertises actually resolves to a digest
+    vars:
+      REGISTRY_REF: '{{.REGISTRY_REF | default "ghcr.io/agentic-research/ley-line-open"}}'
+    cmds:
+      # Reads the ADVERTISED address out of server.json rather than
+      # reconstructing it, so this checks the thing consumers actually use.
+      # Asserting the manifest resolves is the whole point: the failure this
+      # guards is an address that is well-formed and unpullable, which no
+      # amount of schema validation can detect.
+      - |
+        set -eu
+        ID=$(jq -r '.packages[0].identifier' server.json)
+        VER=$(jq -r '.packages[0].version' server.json)
+        if [ -z "$ID" ] || [ "$ID" = "null" ] || [ -z "$VER" ] || [ "$VER" = "null" ]; then
+          echo "server.json packages[0] is missing identifier or version" >&2
+          exit 1
+        fi
+        echo "server.json advertises ${ID}:${VER}"
+        if ! docker buildx imagetools inspect "${ID}:${VER}" >/dev/null 2>&1; then
+          echo "FAIL: ${ID}:${VER} does not resolve." >&2
+          echo "cloister will not error on this — it warns and pins the mutable tag." >&2
+          exit 1
+        fi
+        docker buildx imagetools inspect "${ID}:${VER}" --format '{{`{{.Manifest.Digest}}`}}' \
+          | sed 's/^/resolved digest: /'
 
   # --------------------------------------------------------------------------
   # All-in-one

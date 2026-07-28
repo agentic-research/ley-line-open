@@ -81,11 +81,27 @@ for assets and [GETTING-STARTED.md](GETTING-STARTED.md) for download commands.
 ## OCI image
 
 `task image` builds a local distroless OCI image tagged
-`localhost/leyline:0.11.3` (equivalently `ley-line-open:0.11.3`). It uses
+`localhost/leyline:v0.11.3` (equivalently `ley-line-open:v0.11.3`). It uses
 krust/cargo-zigbuild for the static binary
-and `cgr.dev/chainguard/static:latest` as the runtime base. The image is not
-automatically pushed to GHCR; `ghcr.io/agentic-research/ley-line-open:0.11.3`
-is a registry reference only when an operator has published that image.
+and `cgr.dev/chainguard/static:latest` as the runtime base.
+
+Pushing a `v*` tag publishes the multi-arch image (linux/amd64 + linux/arm64)
+to `ghcr.io/agentic-research/ley-line-open:v0.11.3`, with a
+[build-provenance attestation](https://docs.github.com/actions/security-guides/using-artifact-attestations)
+recorded against the pushed digest:
+
+```bash
+docker pull ghcr.io/agentic-research/ley-line-open:v0.11.3
+gh attestation verify oci://ghcr.io/agentic-research/ley-line-open:v0.11.3 \
+  --repo agentic-research/ley-line-open
+```
+
+The image tag is **`v`-prefixed**, matching `server.json`'s
+`packages[0].version`. That is not cosmetic: cloister derives the image as
+`<identifier>:<version>` from `server.json`, so the published tag and that
+field must be the same string or the address resolves to nothing. `task
+image:verify-published` asserts exactly that, reading the address out of the
+committed `server.json` rather than reconstructing it.
 
 ```bash
 task image

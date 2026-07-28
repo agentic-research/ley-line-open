@@ -26,6 +26,28 @@ use leyline_ts::languages::TsLanguage;
 /// Without this cap, a single 1 GiB file in the source tree would OOM
 /// the daemon during full reparse on small machines.
 pub const MAX_PARSE_FILE_SIZE: i64 = 8 * 1024 * 1024;
+
+/// The `node_hash` ADDRESS LINEAGE this binary produces, recorded in
+/// `_meta.ir_schema_version` (ADR-0027 §Consequences, ADR-0034 D4).
+///
+/// `node_hash`'s preimage carries the canonical κ kind, not the raw
+/// tree-sitter kind — see `canonical_kind(raw).unwrap_or(raw)` below. So a
+/// change to the κ map, or to a tree-sitter grammar that renames productions,
+/// rewrites addresses for byte-identical sources. Neither is visible to the
+/// mtime+size unchanged-skip, which is why this value participates in the
+/// incremental-reuse guard alongside the extraction/injection/query-set epochs.
+///
+/// BUMP THIS whenever the preimage's meaning changes. Doing so forces full
+/// re-derivation on next parse, which is the announcement: consumers that
+/// pinned addresses under the prior lineage learn they are not comparable.
+///
+/// - `merkle-ast-v1` — the ADR-0027 shape (`node_content` / `node_child` /
+///   `_ast.node_hash`), replacing the retired `symbols`/`fact_edges` shape.
+/// - `merkle-ast-v2` — `ley-line-open-25811f` gave `function_signature_item`
+///   the κ `function` it lacked, so every Rust trait signature's `node_hash`
+///   moved. Nothing else changed: the fold, the `llo/ast/v1` domain tag, and
+///   every other kind are untouched.
+pub const IR_SCHEMA_VERSION: &str = "merkle-ast-v2";
 use leyline_ts::query_engine::QuerySet;
 use leyline_ts::refs::{ExtractedRef, current_extraction_epoch, extract_refs_resolved};
 use leyline_ts::schema::{
@@ -903,12 +925,20 @@ pub fn parse_into_conn(
         && get_meta(conn, "injection_epoch").ok().flatten().as_deref()
             == Some(injection_epoch.as_str())
         && get_meta(conn, "query_set_epoch").ok().flatten().as_deref()
-            == Some(query_set_epoch.as_str());
+            == Some(query_set_epoch.as_str())
+        // The node_hash ADDRESS lineage. The three epochs above guard derived
+        // FACTS going stale when emission rules change; this guards derived
+        // ADDRESSES going stale when the κ map does, since κ is in the
+        // node_hash preimage. Same staleness shape, one level down — and the
+        // same treatment of a MISSING row (every pre-marker arena) as
+        // disagreement, so absence reads as stale rather than as current.
+        && get_meta(conn, "ir_schema_version").ok().flatten().as_deref()
+            == Some(IR_SCHEMA_VERSION);
     if incremental && !epoch_current {
         eprintln!(
             "extraction epoch changed (binary epoch {extraction_epoch}, \
-             injection composite {injection_epoch}, query-set {query_set_epoch}); \
-             re-deriving facts for all files",
+             injection composite {injection_epoch}, query-set {query_set_epoch}, \
+             ir-schema {IR_SCHEMA_VERSION}); re-deriving facts for all files",
         );
     }
 
@@ -1595,7 +1625,7 @@ pub fn parse_into_conn(
     // generation. Bump the meta marker so consumers can tell the merkle-AST
     // shape (node_content/node_child/_ast.node_hash) from the retired
     // symbols/fact_edges shape.
-    set_meta(conn, "ir_schema_version", "merkle-ast-v1")?;
+    set_meta(conn, "ir_schema_version", IR_SCHEMA_VERSION)?;
     // Stamp the extraction epoch only on full-tree passes. A scoped
     // pass reparses just the dirty set; stamping the binary's epoch
     // there would mark still-stale out-of-scope facts as current. The

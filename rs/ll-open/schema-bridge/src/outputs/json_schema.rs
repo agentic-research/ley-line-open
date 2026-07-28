@@ -354,7 +354,16 @@ fn render_const_def(c: &Const) -> Result<String> {
     ))
 }
 
-fn render_const_value(v: &ConstValue, location: &str) -> Result<String> {
+// `pub(crate)` so the capnp INPUT can render a field's native
+// `= value` default into `StructField.default`, which the IR defines as
+// "already valid JSON" (`ley-line-open-f72fca`). One renderer, so the value a
+// consumer sees cannot depend on which side produced it.
+//
+// Layering note: an input reaching into `outputs::` is backwards. The honest
+// home is next to `ConstValue` in `ir/`, since JSON is the IR's declared
+// encoding for this field — moving it belongs in its own change rather than
+// inside a P1 fix, and is tracked on f72fca.
+pub(crate) fn render_const_value(v: &ConstValue, location: &str) -> Result<String> {
     Ok(match v {
         ConstValue::Void => "null".to_owned(),
         ConstValue::Bool(b) => b.to_string(),

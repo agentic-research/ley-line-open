@@ -1,0 +1,32 @@
+version: '3'
+
+# Crate-scoped tasks for `leyline-cli-lib`.
+#
+# Included by the root Taskfile under the `cli-lib:` namespace, so these run as
+# `task cli-lib:test:vec`. Tasks belong beside the crate they exercise; the root
+# Taskfile carries only repo-wide orchestration.
+#
+# `dir:` is set per task rather than at file level because these shell out to
+# cargo, which must run from the workspace root at `rs/`. Paths here are
+# relative to THIS file, so `../../..` is the repo root and `../../../rs` is the
+# cargo workspace.
+#
+# NOTE for anyone adding a task here that the `ci` chain invokes: the coverage
+# half of `tools/check_feature_reachability.sh` discovers `cargo test
+# --features` lines by asking `task --summary`, which resolves includes. It does
+# NOT parse Taskfiles textually — an earlier cut did, and would have silently
+# reported these features as uncovered the moment they moved out of the root
+# file. Adding a task here is safe; adding one that greps for it is not.
+
+tasks:
+  test:vec:
+    desc: Tests for the `vec` feature (sqlite-vec + fastembed) — ships in install:full
+    dir: '{{.ROOT_DIR}}/rs'
+    cmds:
+      - cargo test -p leyline-cli-lib --features vec
+
+  test:text-search:
+    desc: Tests for the `text-search` feature (witchcraft) — ships in install:full
+    dir: '{{.ROOT_DIR}}/rs'
+    cmds:
+      - cargo test -p leyline-cli-lib --features text-search

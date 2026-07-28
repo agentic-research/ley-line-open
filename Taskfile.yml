@@ -3,6 +3,18 @@ version: '3'
 # Golden path: CI and local dev both use these tasks.
 # Workflows (.github/workflows/) should call `task <name>`, never raw cargo.
 
+# Crate-scoped tasks live beside the crate they exercise; this file keeps only
+# repo-wide orchestration. Included tasks are namespaced by their key, so
+# `cli-lib:test:vec` runs the `test:vec` task in rs/ll-open/cli-lib/Taskfile.yml.
+#
+# `tools/check_feature_reachability.sh` discovers ci-invoked `cargo test
+# --features` lines via `task --summary`, which follows these includes. It does
+# not parse Taskfiles textually (ed356d7) — that was changed FIRST, precisely so
+# moving a task out of this file could not silently drop its feature coverage.
+includes:
+  cli-lib:
+    taskfile: rs/ll-open/cli-lib/Taskfile.yml
+
 vars:
   SCCACHE_VERSION: 0.15.0
   SCCACHE_BIN: '{{.ROOT_DIR}}/.tools/bin/sccache'
@@ -473,18 +485,6 @@ tasks:
   # Both pass today; this is turning on existing coverage, not writing new.
   # Enforced by `lint:feature-reachability`, which fails when a shipping
   # feature has no test target (bead ley-line-open-2607d2).
-  test:vec:
-    desc: Tests for the `vec` feature (sqlite-vec + fastembed) — ships in install:full
-    dir: rs
-    cmds:
-      - cargo test -p leyline-cli-lib --features vec
-
-  test:text-search:
-    desc: Tests for the `text-search` feature (witchcraft) — ships in install:full
-    dir: rs
-    cmds:
-      - cargo test -p leyline-cli-lib --features text-search
-
   conformance:py:
     desc: |
       Python conformance suite for cloister/credential-isolation/v1
@@ -1063,8 +1063,8 @@ tasks:
       - task: build:fs-nfs-isolated
       - task: test:fs-cdc
       - task: test:cdc-activation
-      - task: test:vec
-      - task: test:text-search
+      - task: cli-lib:test:vec
+      - task: cli-lib:test:text-search
       - task: tier:isolation
       - task: check:all-features
       - task: test

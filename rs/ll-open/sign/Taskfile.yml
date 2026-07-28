@@ -1,0 +1,29 @@
+version: '3'
+
+# Crate-scoped tasks for `leyline-sign`.
+#
+# Included by the root Taskfile under the `sign:` namespace, so these run as
+# `task sign:host:build`. The names are unchanged from when they lived in the
+# root file — `sign:` was already their prefix there, so the include reproduces
+# the exact same invocation.
+#
+# The `host` feature is in the not-shipping ledger of
+# tools/check_feature_reachability.sh (ADR-0019: interactive HOST signing lives
+# cloister-side, LLO ships verify-only). These tasks are what keep it compiled
+# and tested despite not being in a shipping configuration — which is the whole
+# reason the ledger entry is allowed to exist rather than the feature being
+# deleted.
+
+tasks:
+  host:build:
+    desc: Build leyline-sign with `host` + the gpgsm-compatible helper binary (ADR-0019)
+    dir: '{{.ROOT_DIR}}/rs'
+    cmds:
+      - cargo build -p leyline-sign --features host
+      - cargo build -p leyline-sign --features host --bin leyline-sign-helper
+
+  host:test:
+    desc: Tests for leyline-sign's `host` feature
+    dir: '{{.ROOT_DIR}}/rs'
+    cmds:
+      - cargo test -p leyline-sign --features host

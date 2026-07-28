@@ -30,3 +30,14 @@ tasks:
     dir: '{{.ROOT_DIR}}/rs'
     cmds:
       - cargo test -p leyline-cli-lib --features text-search
+
+  test:cdc-activation:
+    desc: CDC activation + the disabled-build counterpart — both halves of the cdc feature gate
+    dir: '{{.ROOT_DIR}}/rs'
+    cmds:
+      # The `cdc`-enabled half.
+      - cargo test -p leyline-cli-lib --no-default-features --features cdc --test cdc_command_test --test cdc_activation_consumer_test
+      # The DISABLED half. Both run: a feature gate is only proven when the
+      # off-path is exercised too, otherwise "cdc works" says nothing about what
+      # a build without it does.
+      - cargo test -p leyline-cli-lib --no-default-features --test cdc_disabled_command_test

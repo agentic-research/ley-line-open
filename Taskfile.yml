@@ -14,6 +14,10 @@ version: '3'
 includes:
   cli-lib:
     taskfile: rs/ll-open/cli-lib/Taskfile.yml
+  fs:
+    taskfile: rs/ll-open/fs/Taskfile.yml
+  sign:
+    taskfile: rs/ll-open/sign/Taskfile.yml
 
 vars:
   SCCACHE_VERSION: 0.15.0
@@ -563,24 +567,11 @@ tasks:
   # 1.94. When the workspace toolchain bumps, add
   # `cargo build -p leyline-sign --features host,host-extras` under the
   # `sign:host:build:extras` target below and wire it into ci.
-  sign:host:build:
-    desc: Build the leyline-sign helper daemon under `--features host`.
-    dir: rs
-    cmds:
-      - cargo build -p leyline-sign --features host
-      - cargo build -p leyline-sign --features host --bin leyline-sign-helper
-
   sign:host:build:extras:
     desc: Build leyline-sign under `--features host,host-extras` (requires rustc >= 1.95 for nono 0.54).
     dir: rs
     cmds:
       - cargo build -p leyline-sign --features host,host-extras
-
-  sign:host:test:
-    desc: Run the leyline-sign host-feature tests (integration + adversarial + wire-compat).
-    dir: rs
-    cmds:
-      - cargo test -p leyline-sign --features host
 
   # --------------------------------------------------------------------------
   # Quality
@@ -699,63 +690,6 @@ tasks:
   # --------------------------------------------------------------------------
   # FFI / staticlib
   # --------------------------------------------------------------------------
-  build:fs-static:
-    desc: Build the CDC-capable leyline-fs staticlib (consumed by smoke_ffi C tests and matching release assets)
-    dir: rs
-    cmds:
-      - cargo build -p leyline-fs --lib --features cdc
-
-  build:fs-nfs-isolated:
-    desc: |
-      Regression (ley-line-open-95cd90): build leyline-fs with `--features nfs`
-      in ISOLATION — no default features, so `fuse` is NOT pulled. An nfs-only
-      consumer (cloister's mediator; macOS, kext-free) must compile without the
-      fuse feature dragging in libc. The #214 bug was a libc dep declared only
-      under `fuse`; the default build (fuse+nfs) masked it. Pure Rust (nfsserve),
-      no system deps — safe in CI. Guards the nfs-only feature surface directly.
-    dir: rs
-    cmds:
-      - cargo build -p leyline-fs --no-default-features --features nfs
-
-  test:fs-cdc:
-    desc: |
-      Test the chunk-backed content path (`--features cdc`). REQUIRED because
-      `cdc` is non-default: `cargo test --workspace` never compiles
-      `leyline-fs::chunked`, so its tests — including the differential fuzzer
-      and the overlap-predicate falsifier — would silently not run. Same class
-      of hole as the #214 nfs-only libc bug that the default build masked.
-      `splice` is REQUIRED here, not incidental: the manifest-staleness tests
-      (a splice rewrites `nodes.record` from inside leyline-ts, so a surviving
-      manifest would serve pre-splice bytes) are gated on it. Without `splice`
-      the invalidation logic is never exercised — mutation testing caught
-      exactly that, with two live mutants in `invalidate_chunked_content`.
-      `--no-default-features` so the fuse system dep isn't needed in CI.
-    # smoke_ffi links target/debug/libleyline_fs. `task ci` used to mask this
-    # prerequisite by running build:fs-static earlier; a cold direct invocation
-    # failed at the linker after every Rust test passed.
-    deps: [build:fs-static]
-    dir: rs
-    cmds:
-      - cargo test -p leyline-fs --no-default-features --features cdc,splice,validate
-      # `--no-deps`: -D warnings otherwise propagates into dependencies, and
-      # leyline-ts has items that are dead only under the feature set this
-      # invocation induces (they are live under its own defaults, which is why
-      # the workspace `task clippy` is clean). Linting a dependency through a
-      # consumer's feature selection is not this gate's job.
-      - cargo clippy -p leyline-fs --no-default-features --features cdc,splice,validate --no-deps -- -D warnings
-
-  test:cdc-activation:
-    desc: |
-      Production CDC activation gate. Exercises both the explicit CLI command
-      and the real parse → activate → auto-grow/publish arena → verified 4 KiB
-      chunked-read consumer path. Isolated to the lightweight `cdc` feature so
-      unrelated default features cannot mask missing feature wiring.
-    deps: [cache:sccache:install]
-    dir: rs
-    cmds:
-      - cargo test -p leyline-cli-lib --no-default-features --features cdc --test cdc_command_test --test cdc_activation_consumer_test
-      - cargo test -p leyline-cli-lib --no-default-features --test cdc_disabled_command_test
-
   # --------------------------------------------------------------------------
   # Mutation testing — the gate that checks the TESTS, not the code.
   #
@@ -1059,10 +993,10 @@ tasks:
       - task: check
       - task: clippy
       - task: smells
-      - task: build:fs-static
-      - task: build:fs-nfs-isolated
-      - task: test:fs-cdc
-      - task: test:cdc-activation
+      - task: fs:build:static
+      - task: fs:build:nfs-isolated
+      - task: fs:test:cdc
+      - task: cli-lib:test:cdc-activation
       - task: cli-lib:test:vec
       - task: cli-lib:test:text-search
       - task: tier:isolation

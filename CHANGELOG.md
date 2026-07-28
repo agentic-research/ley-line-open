@@ -10,6 +10,36 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.11.1] — 2026-07-28
+
+### Fixed
+
+- **`ir_schema_version` is published on the version handshake and in
+  `compatibility.json`** (`ley-line-open-348de6`). v0.11.0 crossed the
+  `merkle-ast-v1` → `merkle-ast-v2` address lineage and **no consumer could
+  learn it happened.**
+
+  v0.11.0 made the marker load-bearing *inside* LLO — it joined the
+  incremental-reuse guard, so a lineage mismatch forces re-derivation. That
+  protects LLO's own parse path and does nothing for a consumer that reads the
+  projection and never re-parses. The marker lived only in
+  `_meta.ir_schema_version`, readable by someone who already had a projection
+  open; neither surface a consumer checks carried it.
+
+  `daemon.capnp` gains `irSchemaVersion @6` — additive, so `wire_format_major`
+  stays `1` — and `compatibility.json` gains `ir_schema_version`. The Go
+  bindings expose `HasIrSchemaVersion()`, which is the load-bearing accessor: a
+  consumer talking to a pre-0.11.1 daemon gets `false`, and that *is* the
+  answer — the lineage is unknowable there, so cached `node_hash` values cannot
+  be assumed comparable.
+
+  **Impact:** consumers that memoize on `node_hash` should compare this against
+  the lineage they cached under and discard on mismatch. `COMPAT_DOC_SCHEMA_VERSION`
+  bumps `1` → `2` per its own documented rule (adding a field bumps it).
+
+  **v0.11.0 remains lineage-crossing with no channel.** Upgrading past it is the
+  only way to detect the change.
+
 ## [0.11.0] — 2026-07-28
 
 ### Changed — BREAKING

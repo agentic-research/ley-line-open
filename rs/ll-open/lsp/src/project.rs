@@ -213,8 +213,42 @@ pub fn project_lsp_into(
 
     // /symbols — document symbol hierarchy
     insert_node(conn, "symbols", "", "symbols", 1, 0, mtime, "")?;
+    let mut collected = 0_usize;
     for sym in symbols {
-        walk_symbol(conn, sym, "symbols", mtime)?;
+        collected += walk_symbol(conn, sym, "symbols", mtime)?;
+    }
+
+    // ASSERT THE MECHANISM FIRED (bead `ley-line-open-2607d2`).
+    //
+    // `walk_symbol` keys `_lsp` on `{parent_id}/{name}`, so two constructs
+    // sharing a name in one scope — C++ / TypeScript overloads, TS declaration
+    // merging — collide, and `INSERT OR REPLACE` keeps the last. mache measured
+    // it against real servers: clangd emits 3 `DocumentSymbol`s for 3 overloads
+    // of `add` and exactly one row survived (bead `ley-line-open-5d3cb6`).
+    //
+    // The counters the CLI prints ("N symbols collected") describe the
+    // COLLECTION pass, so they reported 3 while 1 was written. A metric derived
+    // from a mechanism must assert the mechanism fired; this compares intent
+    // against outcome and says so when they disagree.
+    //
+    // Deliberately a WARNING, not an error. Overloads are ordinary in C++ and
+    // TypeScript, so failing here would break every parse of those languages
+    // for a defect in the ADDRESS SCHEME, not in the source. Whether the fix is
+    // a discriminator or an explicitly many-to-one address is an ADR-0034
+    // amendment (`ley-line-open-5d3cb6`); until it lands, silent loss becomes
+    // reported loss.
+    let written: usize = conn
+        .query_row("SELECT COUNT(*) FROM _lsp", [], |r| r.get::<_, i64>(0))
+        .map(|n| n as usize)
+        .unwrap_or(collected);
+    if written < collected {
+        eprintln!(
+            "warn: {} of {collected} symbols reached _lsp — {} dropped by \
+             name collision (overloads/declaration merging). See \
+             ley-line-open-5d3cb6; addresses are not unique per occurrence.",
+            written,
+            collected - written,
+        );
     }
 
     // /diagnostics — flat list keyed by severity + index
@@ -1023,7 +1057,12 @@ impl std::fmt::Display for EnrichmentStats {
 
 // ── Private helpers ────────────────────────────────────────────
 
-fn walk_symbol(conn: &Connection, sym: &DocumentSymbol, parent_id: &str, mtime: i64) -> Result<()> {
+fn walk_symbol(
+    conn: &Connection,
+    sym: &DocumentSymbol,
+    parent_id: &str,
+    mtime: i64,
+) -> Result<usize> {
     let kind_name = protocol::symbol_kind_name(sym.kind);
     let id = format!("{parent_id}/{}", sym.name);
     let has_children = sym.children.as_ref().is_some_and(|c| !c.is_empty());
@@ -1066,13 +1105,14 @@ fn walk_symbol(conn: &Connection, sym: &DocumentSymbol, parent_id: &str, mtime: 
         ],
     )?;
 
+    let mut visited = 1_usize;
     if let Some(children) = &sym.children {
         for child in children {
-            walk_symbol(conn, child, &id, mtime)?;
+            visited += walk_symbol(conn, child, &id, mtime)?;
         }
     }
 
-    Ok(())
+    Ok(visited)
 }
 
 fn merge_symbol(
@@ -1191,6 +1231,79 @@ mod tests {
                 .unwrap();
             assert!(exists, "missing LSP index: {index_name}");
         }
+    }
+
+    /// Bead `ley-line-open-5d3cb6`, confirmed by mache against real servers:
+    /// clangd emits 3 `DocumentSymbol`s for 3 C++ overloads of `add`, and
+    /// typescript-language-server does the same for TS overloads — but only
+    /// ONE row reached `_lsp`, the last one written.
+    ///
+    /// Cause: `walk_symbol` keys on `{parent_id}/{name}`, and `_lsp.node_id`
+    /// was `TEXT PRIMARY KEY`, so overloads collide by construction and
+    /// `INSERT OR REPLACE` keeps the survivor.
+    ///
+    /// This is the silent-success class (`ley-line-open-2607d2`) in its purest
+    /// form: the CLI printed "3 symbols collected, 3 defs" while writing one.
+    /// Those counters describe the COLLECTION pass, so any assertion on them
+    /// passes while the data is dropped — which is why this test counts ROWS
+    /// rather than trusting the reported total.
+    ///
+    /// TypeScript is the real exposure, not C++: overloads and declaration
+    /// merging are ordinary TS, and that one server covers
+    /// typescript/tsx/javascript/jsx.
+    #[test]
+    #[ignore = "RED until the delta discriminator lands (ley-line-open-5d3cb6). \
+                Reproduces the loss; the FIX is an ADR-0034 amendment, not a \
+                patch. Impossibility proof and the correct address shape are \
+                recorded on the bead — remove this attribute when delta ships."]
+    fn overloaded_symbols_all_reach_the_lsp_table() {
+        // Three same-named siblings at distinct ranges — the shape clangd and
+        // typescript-language-server both produce for overloads.
+        let symbols = vec![
+            make_symbol("add", SymbolKind::FUNCTION, 1, 3, vec![]),
+            make_symbol("add", SymbolKind::FUNCTION, 5, 7, vec![]),
+            make_symbol("add", SymbolKind::FUNCTION, 9, 11, vec![]),
+        ];
+
+        let bytes = project_lsp(&symbols, &[], "file:///overloads.cpp").unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.deserialize_read_exact("main", Cursor::new(&bytes), bytes.len(), true)
+            .unwrap();
+
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _lsp", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            rows,
+            symbols.len() as i64,
+            "every collected symbol must reach _lsp; overloads must not \
+             overwrite each other",
+        );
+
+        // And they must remain distinguishable — a row per overload is only
+        // useful if its own span survived.
+        // The `nodes` projection must not drop them either — walk_symbol
+        // writes both tables from the same id.
+        let node_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE id LIKE 'symbols/add%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            node_rows, 3,
+            "the nodes projection must keep every overload"
+        );
+
+        let spans: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT start_line) FROM _lsp WHERE node_id LIKE '%add%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(spans, 3, "each overload must keep its own start_line");
     }
 
     fn make_symbol(

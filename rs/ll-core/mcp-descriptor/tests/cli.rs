@@ -21,10 +21,13 @@ fn descriptor(extra_group_tool: Option<&str>) -> String {
     "version": "1.2.3",
     "repository_url": "https://github.com/example/thing.git",
     "repository_source": "github",
-    "oci_image": "ghcr.io/example/thing",
-    "oci_version": "v1.2.3",
-    "transport_type": "streamable-http",
-    "transport_url": "http://localhost:1234/mcp"
+    "packages": [
+      {{
+        "oci_image": "ghcr.io/example/thing",
+        "oci_version": "v1.2.3",
+        "transport": {{ "type": "streamable-http", "url": "http://localhost:1234/mcp" }}
+      }}
+    ]
   }},
   "tools": ["a"],
   "groups": [{{ "name": "g", "advertised_prefix": "g_", "upstream_names": ["a"{ghost}] }}]

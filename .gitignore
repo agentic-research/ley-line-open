@@ -38,6 +38,13 @@
 # workspace via rs/Cargo.toml's `members = ["tools/*"]`).
 !rs/tools/**
 
+# Vendored third-party schemas the build validates against (ley-line-open-891dd5).
+# Tracked deliberately: `mcp-descriptor` writes SCHEMA_URL into every emitted
+# server.json and the conformance gate checks the document against THIS file.
+# A gate that fetched its spec at runtime would fail open the moment the
+# network did, so the spec has to be part of the artifact.
+!schema/**
+
 # Build infrastructure
 !Taskfile.yml
 !rs/pkgconfig/**

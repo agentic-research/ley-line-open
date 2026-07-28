@@ -61,6 +61,12 @@ const VERSION: &str = leyline_cli_lib::daemon::version::BINARY_VERSION;
 /// here or land in any repo that adopts the emitter.
 const OCI_IMAGE: &str = "ghcr.io/agentic-research/ley-line-open";
 
+// The image tag is derived from VERSION at run time rather than from this
+// binary's own CARGO_PKG_VERSION. They agree today only because the release
+// bump moves all 23 manifests together; reading this crate's version here would
+// be a SECOND source that can drift from the daemon's, which is the whole
+// failure this generator exists to prevent.
+
 fn main() -> Result<()> {
     // The emitter owns the coverage invariants — orphans, ghosts,
     // double-claims — so this binary supplies identity and the registry, and
@@ -78,6 +84,9 @@ fn main() -> Result<()> {
         .map(|t| ToolRef { name: t.name })
         .collect();
 
+    // `v`-prefixed to match the git tag, as ADR-0041 requires and as mache emits.
+    let oci_version = format!("v{VERSION}");
+
     let meta = ServerMeta {
         name: SERVER_NAME,
         description: SERVER_DESCRIPTION,
@@ -85,6 +94,7 @@ fn main() -> Result<()> {
         repository_url: "https://github.com/agentic-research/ley-line-open.git",
         repository_source: "github",
         oci_image: OCI_IMAGE,
+        oci_version: &oci_version,
         transport_type: "streamable-http",
         transport_url: "http://localhost:8384/mcp",
     };

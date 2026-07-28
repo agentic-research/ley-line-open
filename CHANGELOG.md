@@ -10,6 +10,29 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.11.3] — 2026-07-28
+
+### Fixed
+
+- **`server.json`'s OCI identifier is resolvable again** (`ley-line-open-04300f`).
+  v0.11.2 made the identifier tagless per cloister ADR-0041 but did **not** add
+  the sibling `version` field that ADR-0041's shape pairs it with. ADR-0038's
+  derive rule builds the image as `<identifier>:<version>`, so an address with
+  no version derives to nothing — strictly worse than the tag it replaced.
+
+  mache, the compliant reference, emits both: `"identifier":
+  "ghcr.io/agentic-research/mache"` plus `"version": "v0.19.0"`. LLO now does
+  the same, `v`-prefixed to match the git tag as ADR-0041 requires.
+
+  `leyline-mcp-descriptor` now **rejects an empty `oci_version`**. Rejecting a
+  tagged identifier while permitting an absent version enforced half the rule,
+  which is how v0.11.2 shipped a broken shape past a guard that existed to
+  prevent exactly this.
+
+  **Impact:** consumers resolving the identifier can derive an image again.
+  Anything that read v0.11.2's `server.json` got an address with no version and
+  should re-read.
+
 ## [0.11.2] — 2026-07-28
 
 ### Fixed

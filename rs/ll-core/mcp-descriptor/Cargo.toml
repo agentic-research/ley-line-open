@@ -6,6 +6,14 @@ license = "Apache-2.0"
 description = "MCP Registry server.json emitter — validates tool/group coverage, then renders. Shared by every ART producer so the coverage invariants are not reimplemented per repo."
 repository = "https://github.com/agentic-research/ley-line-open"
 
+[[bin]]
+name = "leyline-mcp-descriptor"
+path = "src/main.rs"
+
+[lib]
+name = "leyline_mcp_descriptor"
+path = "src/lib.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

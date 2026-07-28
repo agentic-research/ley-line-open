@@ -135,9 +135,45 @@ include the parent hash or accept the miss.
 
 **Qualified token (address).** Survives: reflow, insertion, edits to the body. **Changes**
 when the construct is renamed or moved between scopes — which is correct, because that
-*is* a different address. Collides only where two constructs genuinely share a name in one
-scope in one file; where a language permits that (C++ overloads), the pair is
-insufficient and `node_id` disambiguates.
+*is* a different address. Collides where two constructs genuinely share a name in one
+scope in one file, which C++, TypeScript and Python all permit.
+
+> **AMENDED 2026-07-28** (`ley-line-open-5d3cb6`). This clause previously read
+> "…the pair is insufficient and `node_id` disambiguates." That was wrong, and it
+> conceded more stability than is necessary. `node_id` is positional, so it rebinds on
+> reorder — but **overloads are discernible**, and a discernible construct must not be
+> separated by position. The corrected two-tier rule:
+>
+> 1. **δ — a syntactic discriminator.** For overload languages, a hash of the parameter
+>    *type-position* tokens, **excluding parameter names** — the Itanium mangling rule.
+>    It therefore survives a parameter rename, and it is locally derivable because the
+>    type tokens are in the subtree. Its failure mode is a spurious *split* (two
+>    spellings of one type), never a collapse. For Rust `#[cfg]`-paired twins, fold the
+>    attribute **siblings** into δ — not into `node_hash`; the content layer is
+>    unchanged. That turns D4's own "honest hole" (attributes outside the fold) into an
+>    asset.
+> 2. **cohort-ordinal — only within a cohort δ cannot separate.** Position enters the
+>    address exactly where position is all that exists, and nowhere else.
+>
+> The second tier is **forced by a theorem**, not chosen. No address can be
+> simultaneously unique, stable under edits that do not move or rename the construct, and
+> derivable from the file alone, once the domain admits byte-identical twins in one scope
+> — and it does: C/C++ redeclaration, Python `def f()` twice, TS declaration merging,
+> Rust `#[cfg]`-paired identical bodies. Proof by confluence: inserting an identical copy
+> *above* or *below* an existing one yields **the same file, byte for byte**, so a
+> snapshot-local function cannot tell the two positions apart, yet stability demands both
+> keep the original address — contradicting uniqueness.
+>
+> The consequence for this ADR is larger than the clause: **an address is a presentation
+> of a construct in one generation, not the construct.** Identity-over-time of
+> indiscernibles lives in the edit trace, not in any snapshot. Cross-generation stability
+> therefore belongs to the `lineage` edge ADR-0027 already reserved (§Consequences,
+> "not overloaded to mean identity-over-time"), recovered pairwise between adjacent
+> generations the way git recovers renames — computed, not stored.
+>
+> clangd's `detail` remains disqualified as *substrate* identity per D5 (server-supplied,
+> not reproducible from source), but is the ideal **validator** for δ, which is precisely
+> the role D5 already assigns to LSP.
 
 ### D5 — Namespace reconciliation is the deliverable, and one JOIN is broken
 
@@ -173,11 +209,24 @@ becomes one such backend, not the substrate."*
 
 ### D6 — Content, address and provenance are three layers; do not fold them
 
-| layer | answers | where it lives |
-| --- | --- | --- |
-| content | what the code *is* | `node_hash` |
-| address | *which* construct | `(source_id, qualified token)` |
-| provenance | *which generation* | signed `Head` / Σ root |
+| layer | answers | cardinality | where it lives |
+| --- | --- | --- | --- |
+| content | what the code *is* | many-to-one | `node_hash` |
+| address | *which* construct | many-to-one lookup | `(source_id, qualified token)` |
+| **locator** | *which row, this generation* | **one-to-one, per generation** | `node_id` / `nodes.id` |
+| provenance | *which generation* | — | signed `Head` / Σ root |
+
+> **AMENDED 2026-07-28** (`ley-line-open-5d3cb6`). The **locator** row is new. Its absence
+> was not cosmetic: `nodes.id` and `_lsp.node_id` are `PRIMARY KEY`s, so they are
+> definitionally one-to-one, while the LSP walk built a many-to-one value and stored it
+> through `INSERT OR REPLACE` — destroying rows. clangd emitted three symbols for three
+> overloads of `add`; one survived.
+>
+> "The address is many-to-one" is a coherent statement about `node_defs`, which is an
+> alias index. It is **evasive** about `nodes`, because a primary key cannot be
+> many-to-one and the code was not treating it as such. A locator must satisfy uniqueness
+> and local derivability; it owes nothing across generations, and that is what the
+> `lineage` edge is for.
 
 Commit SHA and jj change-id are **provenance**. Folding them into an address would change
 identity every commit, destroying cross-generation tracking, CDC dedup and incremental

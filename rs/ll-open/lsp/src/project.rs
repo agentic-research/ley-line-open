@@ -213,10 +213,7 @@ pub fn project_lsp_into(
 
     // /symbols — document symbol hierarchy
     insert_node(conn, "symbols", "", "symbols", 1, 0, mtime, "")?;
-    let mut collected = 0_usize;
-    for sym in symbols {
-        collected += walk_symbol(conn, sym, "symbols", mtime)?;
-    }
+    let collected = walk_symbols(conn, symbols, "symbols", mtime)?;
 
     // ASSERT THE MECHANISM FIRED (bead `ley-line-open-2607d2`).
     //
@@ -1057,14 +1054,117 @@ impl std::fmt::Display for EnrichmentStats {
 
 // ── Private helpers ────────────────────────────────────────────
 
+/// Disambiguate same-named siblings, per the locator role in ADR-0034 and the
+/// impossibility result on `ley-line-open-5d3cb6`.
+///
+/// `{parent_id}/{name}` is not unique: C++ and TypeScript permit overloads, and
+/// TS permits declaration merging, so a scope can hold several constructs with
+/// one name. Stored through `INSERT OR REPLACE` into a `PRIMARY KEY`, the
+/// survivors overwrite each other — clangd emitted 3 symbols for 3 overloads of
+/// `add` and one row reached `_lsp`.
+///
+/// The address is built in two tiers, and the order matters:
+///
+/// 1. **δ — a discriminator.** Overloads are DISCERNIBLE, so they must not be
+///    separated by position. Here δ is the server's own `detail` (clangd gives
+///    `long (long, long)`), which is legitimate *in this projection*: `_lsp` is
+///    the LSP enrichment pass, already server-derived by construction, so
+///    `detail` is local data rather than an external dependency. ADR-0034 D5
+///    rules `detail` out as SUBSTRATE identity — that still holds; this is the
+///    locator for a server-derived table, not the substrate address.
+///
+/// 2. **cohort-ordinal — position, and only where position is all there is.**
+///    Applied ONLY within a cohort δ cannot separate. The impossibility proof
+///    shows some ordinal is unavoidable for byte-identical twins: inserting an
+///    identical copy above or below yields the same file, so no snapshot-local
+///    function can tell the two positions apart. Restricting the ordinal to
+///    indiscernible cohorts concedes exactly the stability the theorem forces
+///    and no more.
+///
+/// Singletons keep the bare `{parent_id}/{name}` — the overwhelming majority of
+/// symbols, and every language that cannot overload, are untouched.
+fn sibling_ids(syms: &[DocumentSymbol], parent_id: &str) -> Vec<String> {
+    use std::collections::HashMap;
+
+    let mut by_name: HashMap<&str, usize> = HashMap::new();
+    for s in syms {
+        *by_name.entry(s.name.as_str()).or_insert(0) += 1;
+    }
+
+    // Within a colliding name, how many share each δ? A δ-group of one is
+    // discernible and needs no ordinal.
+    let mut by_delta: HashMap<(&str, &str), usize> = HashMap::new();
+    for s in syms {
+        if by_name[s.name.as_str()] > 1 {
+            *by_delta
+                .entry((s.name.as_str(), s.detail.as_deref().unwrap_or("")))
+                .or_insert(0) += 1;
+        }
+    }
+
+    let mut seen: HashMap<(&str, &str), usize> = HashMap::new();
+    let mut out = Vec::with_capacity(syms.len());
+    for s in syms {
+        let name = s.name.as_str();
+        let base = format!("{parent_id}/{name}");
+        if by_name[name] == 1 {
+            out.push(base);
+            continue;
+        }
+        let detail = s.detail.as_deref().unwrap_or("");
+        let delta = sanitize_delta(detail);
+        let key = (name, detail);
+        let nth = seen.entry(key).or_insert(0);
+        // Ordinal only inside an indiscernible cohort.
+        let id = if by_delta[&key] == 1 {
+            format!("{base}#{delta}")
+        } else {
+            format!("{base}#{delta}~{nth}")
+        };
+        *nth += 1;
+        out.push(id);
+    }
+    out
+}
+
+/// `/` separates path segments and `#`/`~` delimit the discriminator, so a δ
+/// carrying them would make the id ambiguous. Collapse whitespace too: servers
+/// format signatures inconsistently across versions, and an id that changes
+/// because clangd added a space is a rebind with no cause.
+fn sanitize_delta(detail: &str) -> String {
+    let collapsed: String = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.replace(['/', '#', '~'], "_")
+}
+
+/// Insert a sibling group, disambiguating same-named members first.
+///
+/// Ids MUST be computed over the whole group: whether `add` needs a
+/// discriminator is a property of its siblings, not of `add` alone. Deriving
+/// the id inside `walk_symbol` — one symbol at a time, blind to its peers — is
+/// what made the collision unrepresentable and therefore silent.
+fn walk_symbols(
+    conn: &Connection,
+    syms: &[DocumentSymbol],
+    parent_id: &str,
+    mtime: i64,
+) -> Result<usize> {
+    let ids = sibling_ids(syms, parent_id);
+    let mut visited = 0_usize;
+    for (sym, id) in syms.iter().zip(ids.iter()) {
+        visited += walk_symbol(conn, sym, id, parent_id, mtime)?;
+    }
+    Ok(visited)
+}
+
 fn walk_symbol(
     conn: &Connection,
     sym: &DocumentSymbol,
+    id: &str,
     parent_id: &str,
     mtime: i64,
 ) -> Result<usize> {
     let kind_name = protocol::symbol_kind_name(sym.kind);
-    let id = format!("{parent_id}/{}", sym.name);
+    let id = id.to_string();
     let has_children = sym.children.as_ref().is_some_and(|c| !c.is_empty());
 
     let detail = sym.detail.as_deref().unwrap_or("");
@@ -1107,9 +1207,7 @@ fn walk_symbol(
 
     let mut visited = 1_usize;
     if let Some(children) = &sym.children {
-        for child in children {
-            visited += walk_symbol(conn, child, &id, mtime)?;
-        }
+        visited += walk_symbols(conn, children, &id, mtime)?;
     }
 
     Ok(visited)
@@ -1252,10 +1350,6 @@ mod tests {
     /// merging are ordinary TS, and that one server covers
     /// typescript/tsx/javascript/jsx.
     #[test]
-    #[ignore = "RED until the delta discriminator lands (ley-line-open-5d3cb6). \
-                Reproduces the loss; the FIX is an ADR-0034 amendment, not a \
-                patch. Impossibility proof and the correct address shape are \
-                recorded on the bead — remove this attribute when delta ships."]
     fn overloaded_symbols_all_reach_the_lsp_table() {
         // Three same-named siblings at distinct ranges — the shape clangd and
         // typescript-language-server both produce for overloads.
@@ -1304,6 +1398,71 @@ mod tests {
             )
             .unwrap();
         assert_eq!(spans, 3, "each overload must keep its own start_line");
+    }
+
+    /// The δ tier, and the property that justifies it (bead
+    /// `ley-line-open-5d3cb6`).
+    ///
+    /// DISCERNIBLE overloads — distinct signatures, which is the ordinary case
+    /// in C++ and TypeScript — must be separated by δ and NOT by position. The
+    /// test that matters is reorder: swapping two overloads in the file must
+    /// leave both addresses untouched. An ordinal scheme (`add_0`, `add_1`)
+    /// fails this, which is exactly why ADR-0034 D4's "node_id disambiguates"
+    /// clause conceded more stability than the impossibility theorem requires.
+    #[test]
+    fn discernible_overloads_are_separated_by_delta_not_position() {
+        let mk = |detail: &str, line: u32| {
+            let mut s = make_symbol("add", SymbolKind::FUNCTION, line, line + 1, vec![]);
+            s.detail = Some(detail.to_string());
+            s
+        };
+
+        let ids_of = |syms: &[DocumentSymbol]| -> Vec<String> {
+            let bytes = project_lsp(syms, &[], "file:///ov.cpp").unwrap();
+            let mut conn = Connection::open_in_memory().unwrap();
+            conn.deserialize_read_exact("main", Cursor::new(&bytes), bytes.len(), true)
+                .unwrap();
+            let mut stmt = conn
+                .prepare("SELECT node_id FROM _lsp ORDER BY node_id")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect::<Vec<_>>();
+            rows
+        };
+
+        let forward = vec![
+            mk("int (int, int)", 1),
+            mk("long (long, long)", 5),
+            mk("double (double, double)", 9),
+        ];
+        let ids = ids_of(&forward);
+        assert_eq!(ids.len(), 3, "all three overloads must persist: {ids:?}");
+
+        // δ, not position: no ordinal suffix appears when δ already separates.
+        for id in &ids {
+            assert!(
+                !id.contains('~'),
+                "discernible overloads must not carry a cohort ordinal: {id}",
+            );
+        }
+
+        // The load-bearing property. Reorder the SAME three overloads; every
+        // address must be identical, because none of them moved scope or
+        // changed signature.
+        let reordered = vec![
+            mk("double (double, double)", 1),
+            mk("int (int, int)", 5),
+            mk("long (long, long)", 9),
+        ];
+        assert_eq!(
+            ids,
+            ids_of(&reordered),
+            "δ addresses must survive reordering — this is what an ordinal \
+             scheme cannot do, and why δ is tried first",
+        );
     }
 
     fn make_symbol(

@@ -24,6 +24,9 @@
 set -eu
 
 root=${1:-.}
+# Absolute repo root, captured BEFORE the cd: claim 2 shells out to `task`, whose
+# Taskfile lives here, not in rs/.
+repo_root=$(cd "$root" && pwd)
 cd "$root/rs"
 failed=0
 
@@ -163,21 +166,55 @@ cli_features=$(sed -n '/^\[features\]/,/^\[/p' "$cli_manifest" \
                 | grep -v '^default$')
 
 # Features named on a `cargo test` line owned by a target the CI CHAIN
-# actually invokes. Counting every `cargo test` line in the file would accept a
-# target that exists and never runs — the same unwired failure this gate exists
-# to catch, and one I shipped once already today.
-ci_tasks=$(sed -n '/^  ci:/,/^  [a-z][a-z0-9:_-]*:$/p' ../Taskfile.yml \
-            | grep -E '^[[:space:]]+- task:' | sed 's/.*task: //' | tr '\n' ' ')
+# actually invokes. Counting every `cargo test` line would accept a target that
+# exists and never runs — the same unwired failure this gate exists to catch.
+#
+# ASK TASK, DO NOT PARSE THE TASKFILE. The previous cut read ../Taskfile.yml
+# textually — a `sed` range for the ci chain, then an `awk` scan for `cargo test`
+# lines. That works only while every task lives in ONE file. The moment the root
+# Taskfile uses `includes:` to pull crate-scoped Taskfiles, the awk finds no
+# `cargo test` lines for the moved tasks, `tested_explicit` silently shrinks, and
+# features that ARE covered get reported as uncovered.
+#
+# Same lesson as claim 1 above, where grepping manifests for feature edges was
+# replaced by `cargo tree`: when a tool owns a resolution, ask it rather than
+# re-implementing its output format. `task --summary` resolves includes and deps
+# itself.
+#
+# Equivalence was proved at abd5b86, BEFORE any Taskfile was split:
+#   ci chain        34 tasks                                    `diff` identical
+#   --features set  cdc host splice text-search validate vec    `diff` identical
+ci_tasks=$(task -d "$repo_root" --summary ci 2>/dev/null \
+            | sed -n '/commands:/,$p' \
+            | grep '^ - Task: ' \
+            | sed 's/^ - Task: //')
 if [ -z "$ci_tasks" ]; then
     echo "feature-coverage: could not read the ci chain — refusing to pass vacuously" >&2
     exit 1
 fi
-tested_explicit=$(awk -v tasks="$ci_tasks" '
-    BEGIN { n = split(tasks, t, /[ \n]+/); for (i = 1; i <= n; i++) if (t[i] != "") in_ci[t[i]] = 1 }
-    /^  [a-z][a-z0-9:_-]*:/ { cur = $1; sub(/:$/, "", cur) }
-    /cargo test/ && (cur in in_ci) { print }
-' ../Taskfile.yml \
-    | grep -oE '\-\-features [a-z0-9_,-]+' | sed 's/--features //' | tr ',' '\n' | sort -u)
+
+tested_explicit=$(
+    printf '%s\n' "$ci_tasks" | while IFS= read -r t; do
+        [ -n "$t" ] || continue
+        # `|| true` is load-bearing under `set -e`: most ci tasks have no
+        # `cargo test` line, so grep exits 1 and would kill this whole loop
+        # subshell on the FIRST such task (`fmt:check`), leaving
+        # `tested_explicit` empty and every coverage check vacuously passing.
+        task -d "$repo_root" --summary "$t" 2>/dev/null \
+            | sed -n '/commands:/,$p' | grep 'cargo test' || true
+    done \
+    | grep -oE '\-\-features [a-z0-9_,-]+' | sed 's/--features //' | tr ',' '\n' | sort -u
+)
+
+# Positive control. An empty result is indistinguishable from "no feature is
+# tested", which would silently pass every check below — the vacuous-pass shape
+# this whole gate exists to prevent. `cdc` is named on a ci-invoked `cargo test`
+# line; its absence means task resolution broke, not that coverage changed.
+if ! printf '%s\n' "$tested_explicit" | grep -qx 'cdc'; then
+    echo "feature-coverage: task resolution is incomplete — expected the ci chain" >&2
+    echo "to name --features cdc and it did not. Not reporting coverage from it." >&2
+    exit 1
+fi
 
 for feature in $cli_features; do
     # In the CLI default set => compiled by `cargo test -p leyline-cli-lib`.

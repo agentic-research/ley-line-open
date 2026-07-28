@@ -1,12 +1,28 @@
 [package]
 name = "leyline-mcp-descriptor"
-version = "0.11.2"
+version = "0.11.3"
 edition = "2024"
 license = "Apache-2.0"
 description = "MCP Registry server.json emitter — validates tool/group coverage, then renders. Shared by every ART producer so the coverage invariants are not reimplemented per repo."
 repository = "https://github.com/agentic-research/ley-line-open"
 
+[[bin]]
+name = "leyline-mcp-descriptor"
+path = "src/main.rs"
+
+[lib]
+name = "leyline_mcp_descriptor"
+path = "src/lib.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# Validates emitted descriptors against the MCP registry schema this crate
+# PINS (`SCHEMA_URL`), vendored under `schema/mcp/` so the gate runs offline —
+# a gate that fetches its own spec fails open the moment the network does.
+# Dev-only: the emitter builds JSON directly and must not take a validator
+# dependency at runtime (ley-line-open-891dd5).
+jsonschema = "0.33"

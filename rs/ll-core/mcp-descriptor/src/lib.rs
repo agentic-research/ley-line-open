@@ -66,6 +66,21 @@ pub struct ServerMeta<'a> {
     /// emitted a tagged identifier for an image it never published while mache
     /// complied and asserted the rule in a test.
     pub oci_image: &'a str,
+    /// The image tag, carried as a SIBLING of [`Self::oci_image`] rather than
+    /// baked into it.
+    ///
+    /// This is the half that makes tagless correct. cloister ADR-0038's derive
+    /// rule builds the image as `<identifier>:<version>`, so an identifier that
+    /// already carried a tag would yield `repo:1.2.3:1.2.3` — which is why
+    /// ADR-0041 requires the address alone. But removing the tag WITHOUT this
+    /// field leaves an address that derives to nothing, which is strictly worse
+    /// than the violation it replaced. `ley-line-open-04300f` shipped exactly
+    /// that in v0.11.2.
+    ///
+    /// ADR-0041: *"`version` is the human tag, and MUST match the git tag the
+    /// publish job ran against and the `server.json` `version`."* LLO's tags are
+    /// `v`-prefixed, and mache — the compliant reference — emits `v0.19.0`.
+    pub oci_version: &'a str,
     /// e.g. `"streamable-http"`.
     pub transport_type: &'a str,
     pub transport_url: &'a str,
@@ -111,6 +126,7 @@ struct Package<'a> {
     #[serde(rename = "registryType")]
     registry_type: &'a str,
     identifier: &'a str,
+    version: &'a str,
     transport: Transport<'a>,
     #[serde(rename = "environmentVariables")]
     environment_variables: Vec<()>,
@@ -178,6 +194,16 @@ pub fn render(
              be published under exactly that tag, and fails at compose up rather than \
              at resolve when it is not.",
             meta.oci_image,
+        );
+    }
+
+    if meta.oci_version.is_empty() {
+        bail!(
+            "oci_version is empty. Rejecting a tagged identifier without requiring \
+             the version that replaces it enforces half of cloister ADR-0041: the \
+             derive rule is `<identifier>:<version>`, so an address with no version \
+             resolves to nothing — strictly worse than the tag it replaced. \
+             `ley-line-open-04300f` shipped that in v0.11.2.",
         );
     }
 
@@ -249,6 +275,7 @@ pub fn render(
         packages: vec![Package {
             registry_type: "oci",
             identifier: meta.oci_image,
+            version: meta.oci_version,
             transport: Transport {
                 typ: meta.transport_type,
                 url: meta.transport_url,
@@ -286,6 +313,7 @@ mod tests {
             repository_url: "https://github.com/example/thing.git",
             repository_source: "github",
             oci_image: "ghcr.io/example/thing",
+            oci_version: "v1.2.3",
             transport_type: "streamable-http",
             transport_url: "http://localhost:1234/mcp",
         }
@@ -378,6 +406,35 @@ mod tests {
     /// an image that must be published under exactly that tag. LLO emitted one
     /// for an image it never publishes; mache is tagless and tests for it.
     /// Rejecting it here means no adopter can inherit that bug.
+    /// The other half of ADR-0041. Rejecting the tag while allowing an absent
+    /// version enforces half a rule and yields an address that derives to
+    /// nothing — which is what `ley-line-open-04300f` shipped in v0.11.2.
+    #[test]
+    fn empty_oci_version_is_rejected() {
+        let mut m = meta();
+        m.oci_version = "";
+        let err = render(&m, &[ToolRef { name: "a" }], &[group("g", "g_", vec!["a"])])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("derive rule"), "must explain why: {err}");
+    }
+
+    /// The pair is what makes the shape resolvable: `<identifier>:<version>`.
+    #[test]
+    fn identifier_and_version_are_emitted_as_siblings() {
+        let out = render(
+            &meta(),
+            &[ToolRef { name: "a" }],
+            &[group("g", "g_", vec!["a"])],
+        )
+        .unwrap();
+        assert!(
+            out.contains("\"identifier\": \"ghcr.io/example/thing\""),
+            "{out}"
+        );
+        assert!(out.contains("\"version\": \"v1.2.3\""), "{out}");
+    }
+
     #[test]
     fn tagged_or_digest_pinned_oci_image_is_rejected() {
         for bad in [

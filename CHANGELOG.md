@@ -10,6 +10,94 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.11.3] — 2026-07-28
+
+### Fixed
+
+- **Generated zod no longer contradicts capnp's append-only guarantee**
+  (`ley-line-open-8c00c6`, filed from cloister; ADR-0004's ordinal rule).
+  Every capnp scalar, enum and list has an *implicit default* — `Text` is `""`,
+  `Bool` is `false`, numerics are `0`, an enum is its zeroth variant, a list is
+  empty — which is precisely what makes appending a field at a higher ordinal a
+  backwards-compatible change. The zod emitter rendered every field as
+  unconditionally required, so appending one field broke six pre-existing
+  cloister fixtures with `ZodError: expected "string"`. Those fixtures stand in
+  for values written against the older schema — exactly the case the
+  compatibility rule promises will still parse.
+
+  The emitter also **dropped `$Optional` and `$Default` entirely**, while
+  `json_schema.rs` honoured both. One IR produced two artifacts that disagreed
+  about which fields may be absent, which is the failure generating both halves
+  from one source exists to make unrepresentable.
+
+  ```
+  metaNamespace: z.string()              →  z.string().default("")
+  tags:          z.array(...).readonly() →  ....readonly().default([])
+  tier:          TierSchema              →  TierSchema.default("cluster")
+  ```
+
+  **Not covered:** an appended *struct* field. capnp reads an absent struct
+  pointer as an all-defaults struct, but zod's `.default(v)` does not re-parse
+  `v`, so `.default({})` would hand consumers a value their own TS interface
+  says is impossible, and a lazily-parsed equivalent would not terminate for a
+  self-referential struct. Appending a struct field remains a break; the carve-
+  out is stated in `capnp_implicit_default` rather than left implicit.
+
+  **Impact:** downstream repos should regenerate. Previously-rejected documents
+  now validate and yield the value capnp would have.
+
+- **`server.json`'s OCI identifier is resolvable again** (`ley-line-open-04300f`).
+  v0.11.2 made the identifier tagless per cloister ADR-0041 but did **not** add
+  the sibling `version` field that ADR-0041's shape pairs it with. ADR-0038's
+  derive rule builds the image as `<identifier>:<version>`, so an address with
+  no version derives to nothing — strictly worse than the tag it replaced.
+
+  mache, the compliant reference, emits both: `"identifier":
+  "ghcr.io/agentic-research/mache"` plus `"version": "v0.19.0"`. LLO now does
+  the same, `v`-prefixed to match the git tag as ADR-0041 requires.
+
+  `leyline-mcp-descriptor` now **rejects an empty `oci_version`**. Rejecting a
+  tagged identifier while permitting an absent version enforced half the rule,
+  which is how v0.11.2 shipped a broken shape past a guard that existed to
+  prevent exactly this.
+
+  **Impact:** consumers resolving the identifier can derive an image again.
+  Anything that read v0.11.2's `server.json` got an address with no version and
+  should re-read.
+
+### Added
+
+- **`server.json` is validated against the schema it pins**
+  (`ley-line-open-891dd5`). The emitter declared `SCHEMA_URL`, wrote it into
+  every descriptor's `$schema` key, and nothing ever read the spec — the crate
+  asserted conformance it never checked. The schema is now vendored under
+  `schema/mcp/` and both the emitted and the **committed** descriptor are
+  validated against it, offline: a gate that fetches its own spec fails open
+  the moment the network does.
+
+  Three properties, because each covers a different way this drifts —
+  `gen:server-json:check` proves committed == emitted, the new gate proves
+  emitted is valid, and a `$id`/`SCHEMA_URL` equality check proves a bumped
+  pin cannot keep validating against a stale vendored copy. A negative case
+  (a `unix:` transport url) proves the validator reports violations rather
+  than passing vacuously.
+
+  **Correction to the record:** this was first filed claiming v0.11.2's
+  descriptor was schema-invalid. It was not — `version` is absent from the
+  schema's `required` array (`["registryType","identifier","transport"]`).
+  What v0.11.2 broke was cloister ADR-0038's derive rule, a consumer contract.
+  Both are now enforced, by different mechanisms.
+
+- **Property tests over arbitrary schema-bridge IR** (`ley-line-open-8c00c6`).
+  LLO owns the generator but runs no `tsc`, so emitted-TypeScript behaviour is
+  not directly observable here — and the existing goldens are substring checks
+  (`assert!(emitted.contains("subject: z.string()"))`), which accept any suffix
+  appended to the type and so could not have caught the append-only bug. The
+  new properties state the rule itself — *the emitted validator accepts absence
+  exactly where capnp permits it* — and let proptest search field-type
+  combinations no golden enumerates. Both are mutation-verified to fail when
+  the fix is reverted.
+
 ## [0.11.2] — 2026-07-28
 
 ### Fixed

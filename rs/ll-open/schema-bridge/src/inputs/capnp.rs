@@ -784,13 +784,45 @@ fn parse_struct<'a>(
                     });
                 } else {
                     let fann = parse_field_annotations(field.get_annotations()?, &field_location)?;
+                    // capnp's NATIVE default (`loud @0 :Bool = true`).
+                    //
+                    // `ley-line-open-f72fca`: this was never read, so
+                    // `ley-line-open-8c00c6` — which fills every field with
+                    // capnp's implicit default so appends stay
+                    // backwards-compatible — substituted the TYPE's zero and
+                    // emitted `.default(false)` for a field declared `= true`.
+                    // Silently, and capnp has no linter to say otherwise.
+                    //
+                    // `had_explicit_default` is the discriminator: capnp always
+                    // reports a defaultValue, so without it a declared `= false`
+                    // is indistinguishable from an undeclared Bool.
+                    let native_default = if slot.get_had_explicit_default() {
+                        let decoded = decode_value(
+                            slot.get_default_value()?,
+                            &ty,
+                            struct_names,
+                            enum_names,
+                            node_by_id,
+                            &field_location,
+                        )?;
+                        Some(crate::outputs::json_schema::render_const_value(
+                            &decoded,
+                            &field_location,
+                        )?)
+                    } else {
+                        None
+                    };
                     fields.push(StructField {
                         name: field_name,
                         ordinal,
                         ty,
                         doc: fann.doc,
                         optional: fann.optional,
-                        default: fann.default,
+                        // Precedence: `$Default` annotation > capnp `= value` >
+                        // the type's implicit zero (applied downstream by the
+                        // emitters). An explicit annotation overrides the
+                        // schema; the schema overrides the type.
+                        default: fann.default.or(native_default),
                     });
                 }
             }

@@ -10,6 +10,11 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-07-28
+
+Minor rather than patch: the partition-address fix below changes set-domain
+addresses, and pre-1.0 semver puts a breaking change in the minor position.
+
 ### Added
 
 - **Generator binaries are published with every release** (`ley-line-open-e44960`).

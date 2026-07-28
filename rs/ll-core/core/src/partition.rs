@@ -25,10 +25,14 @@
 //!   hashed `source ‖ ast ‖ bindings`, so two segment splits with equal
 //!   concatenated bytes shared a root. It now folds through this operator.
 //! * **Set canonicality.** For `ChunkSet` / `RowSet` the address is a function
-//!   of the SET: entries are sorted by address and their framing is dropped.
-//!   A set has no order, and the framing slot has no defined meaning there, so
-//!   folding either in would let a producer mint unlimited distinct addresses
-//!   for one set — malleability that breaks (DET) at this layer.
+//!   of the multiset of `(addr, a, b)` triples: entries are sorted wholesale
+//!   and enumeration order — and only enumeration order — is erased. A set has
+//!   no order, so folding it in would let a producer mint unlimited distinct
+//!   addresses for one set; framing, by contrast, is scheme-defined content of
+//!   the declared decomposition and IS committed. A prior revision dropped it,
+//!   which collided materially different decompositions into one address —
+//!   cloister's `glob-closure/v1` RowSet framing was the downstream casualty
+//!   (bead `b67a73` regression).
 //!
 //! **Deliberately absent: a hash-algorithm field.** Multihash-style agility is
 //! the one field every self-describing format adds and the one Σ must not —
@@ -56,9 +60,9 @@ use crate::substrate::Hash;
 pub enum Domain {
     /// Contiguous, ordered byte intervals that tile `[0, len)`.
     ByteStream,
-    /// An unordered set of parts, canonically ordered by address.
+    /// An unordered set of parts, canonically ordered by `(addr, a, b)`.
     ChunkSet,
-    /// Logical records, canonically ordered by address.
+    /// Logical records, canonically ordered by `(addr, a, b)`.
     RowSet,
 }
 
@@ -90,6 +94,36 @@ pub struct PartitionSpec {
 /// Protocol-visible and versioned, like [`crate::head_digest::HEAD_DIGEST_CONTEXT`]:
 /// changing this string invalidates every address ever produced, so a change
 /// means `v2`, not an edit.
+///
+/// # Why the `b67a73` framing fix did NOT bump this to `v2`
+///
+/// Recorded rather than left implicit, because the opposite conclusion is
+/// defensible and a reader will reasonably ask.
+///
+/// This constant is the fold ALGORITHM's version. `PartitionSpec.canon_version`
+/// is not — that is a caller-supplied field naming the *scheme's*
+/// canonicalization, so it cannot express "which fold implementation produced
+/// this address" and bumping it would misattribute an LLO change to every
+/// downstream scheme.
+///
+/// So the framing fix changed the algorithm without changing its version tag,
+/// which is normally exactly the hazard this constant exists to prevent: one
+/// tag denoting two algorithms, silently disagreeing. It is acceptable here for
+/// one checkable reason — **the buggy fold reached no tagged release**. The
+/// eraser (`ad272d3`) is an ancestor of no tag (`git tag --contains ad272d3` is
+/// empty; it is not an ancestor of `v0.11.3`), so no consumer could pull a
+/// build that produced framing-erased set addresses except by pinning `main`
+/// inside a ~24h window.
+///
+/// Bumping to `v2` would additionally invalidate every `ByteStream` address,
+/// which the fix provably does not move (`byte_stream_address_pin` holds a
+/// known-answer vector computed at the pre-fix revision). Paying a
+/// whole-family invalidation to version away a state nobody could obtain is
+/// the wrong trade.
+///
+/// **If a future fold change ships in a tag, this MUST bump.** The argument
+/// above is contingent on the never-released fact, not a general licence to
+/// change the algorithm in place.
 pub const PARTITION_CONTEXT: &str = "leyline partition fold v1";
 
 impl Domain {
@@ -102,14 +136,15 @@ impl Domain {
         }
     }
 
-    /// Whether entry order and framing are part of this domain's identity.
+    /// Whether entry *enumeration order* is part of this domain's identity.
     ///
-    /// For an interval domain they are its content — offsets and lengths *are*
-    /// the decomposition. For a set domain they are not: a set has no order,
-    /// and the framing slot carries no defined meaning there. Folding them in
-    /// anyway would let a producer mint unlimited distinct addresses for one
-    /// set, so the address would stop being a function of the set — (DET)
-    /// failing at exactly the layer this type exists to make trustworthy.
+    /// For an interval domain it is — the sequence of offsets and lengths *is*
+    /// the decomposition. For a set domain it is not: a set has no order, so
+    /// folding enumeration order in would let a producer mint unlimited
+    /// distinct addresses for one set — (DET) failing at exactly the layer
+    /// this type exists to make trustworthy. Framing is committed in BOTH
+    /// cases: it is scheme-defined content of the declared decomposition, not
+    /// an artifact of enumeration (see the decision comment in [`PartitionSpec::address`]).
     const fn is_ordered(self) -> bool {
         matches!(self, Domain::ByteStream)
     }
@@ -122,9 +157,10 @@ impl PartitionSpec {
     /// to the *decomposition* rather than to the concatenation of its parts.
     /// That is what makes two different field splits distinguishable.
     ///
-    /// Ordered domains fold entry order and framing; set domains canonicalize
-    /// instead — sorted by address, framing dropped — so their address is a
-    /// function of the set rather than of how it was enumerated.
+    /// Ordered domains fold entries in the given order; set domains
+    /// canonicalize — entries sorted wholesale by `(addr, a, b)` — so their
+    /// address is a function of the multiset of entries rather than of how it
+    /// was enumerated. Framing is committed in both cases.
     pub fn address(&self, entries: &[Entry]) -> Hash {
         let mut hasher = blake3::Hasher::new_derive_key(PARTITION_CONTEXT);
         hasher.update(&[self.domain.tag()]);
@@ -142,14 +178,32 @@ impl PartitionSpec {
                 hasher.update(&entry.b.to_le_bytes());
             }
         } else {
-            // Set domains canonicalize: sort by address, drop the framing.
-            // Both are required — sorting alone would still let framing
-            // malleate the address, and dropping framing alone would leave
-            // enumeration order significant for a thing that has no order.
-            let mut addrs: Vec<&Hash> = entries.iter().map(|e| &e.addr).collect();
-            addrs.sort_unstable();
-            for addr in addrs {
-                hasher.update(addr.as_bytes());
+            // Set domains canonicalize by sorting whole entries — the
+            // multiset commitment is over `(addr, a, b)` triples, with
+            // enumeration order (and only enumeration order) erased.
+            //
+            // DECISION (bead b67a73 regression, cloister probe at 39e1e9b4):
+            // order-insensitivity is deliberate — a set has no order, so
+            // folding enumeration order would be a malleability slot — but
+            // framing is part of the DECLARED decomposition and must be
+            // committed (ADR-0032's operator folds `(addrᵢ, frameᵢ)` pairs;
+            // it is silent on set-domain ordering, which is why sorting is a
+            // canonicalization choice made here, not in the ADR). An earlier
+            // revision dropped framing on the theory that it "carries no
+            // defined meaning" in set domains; `Entry` documents it as
+            // scheme-defined, and downstream schemes define it — cloister's
+            // `glob-closure/v1` — so dropping it collided materially
+            // different decompositions into one address. A scheme that
+            // assigns framing no meaning must canonicalize it to zero; the
+            // fold cannot know which fields a scheme uses, so it commits all
+            // of them, and a garnished sender is caught by re-derivation
+            // (bead b67a73 acceptance criterion 2), not by erasure.
+            let mut sorted: Vec<&Entry> = entries.iter().collect();
+            sorted.sort_unstable_by_key(|e| (e.addr, e.a, e.b));
+            for entry in sorted {
+                hasher.update(entry.addr.as_bytes());
+                hasher.update(&entry.a.to_le_bytes());
+                hasher.update(&entry.b.to_le_bytes());
             }
         }
 
@@ -321,10 +375,13 @@ mod tests {
     }
 
     /// A SET domain's address must be a function of the SET — not of the
-    /// order it happened to be enumerated in, nor of framing fields that carry
-    /// no meaning there. Otherwise two producers describing the identical row
-    /// set disagree on its address, which breaks (DET) at exactly the layer
-    /// this type exists to make trustworthy.
+    /// order it happened to be enumerated in. Otherwise two producers
+    /// describing the identical entry set disagree on its address, which
+    /// breaks (DET) at exactly the layer this type exists to make
+    /// trustworthy. Entries here carry distinct framing, so this also pins
+    /// that order-insensitivity survives the framing commitment: the
+    /// canonicalization sorts whole entries, it does not fold enumeration
+    /// order back in.
     ///
     /// Found by adversarial review of `Domain::RowSet` on the day it shipped.
     #[test]
@@ -334,12 +391,12 @@ mod tests {
             Entry {
                 addr: h(1),
                 a: 0,
-                b: 0,
+                b: 7,
             },
             Entry {
                 addr: h(2),
-                a: 0,
-                b: 0,
+                a: 7,
+                b: 9,
             },
         ];
         let rev = [fwd[1], fwd[0]];
@@ -351,28 +408,141 @@ mod tests {
         );
     }
 
-    /// The framing slot is meaningful for `ByteStream` (offset, length) and
-    /// meaningless for set domains. Folding it in there would let a producer
-    /// mint unlimited distinct addresses for one set — a malleability slot.
+    /// Entries that share an address but differ in framing are distinct
+    /// members of the declared decomposition — the multiset is of whole
+    /// `(addr, a, b)` triples, not of addresses. Before the fix these
+    /// collapsed to one sorted address list of length two.
     #[test]
-    fn set_domains_ignore_entry_framing() {
+    fn set_domains_distinguish_same_address_different_framing() {
         let s = spec(Domain::ChunkSet);
-        let plain = [Entry {
-            addr: h(3),
-            a: 0,
-            b: 0,
-        }];
-        let garnished = [Entry {
-            addr: h(3),
-            a: 999,
-            b: 12345,
-        }];
+        let two_frames = [
+            Entry {
+                addr: h(1),
+                a: 0,
+                b: 1,
+            },
+            Entry {
+                addr: h(1),
+                a: 0,
+                b: 2,
+            },
+        ];
+        let dup_frame = [
+            Entry {
+                addr: h(1),
+                a: 0,
+                b: 1,
+            },
+            Entry {
+                addr: h(1),
+                a: 0,
+                b: 1,
+            },
+        ];
 
-        assert_eq!(
-            s.address(&plain),
-            s.address(&garnished),
-            "framing carries no meaning in a set domain and must not be malleable"
+        assert_ne!(
+            s.address(&two_frames),
+            s.address(&dup_frame),
+            "the multiset is of (addr, a, b) triples, not of addresses"
         );
+    }
+
+    /// The interval fold's preimage is untouched by the set-domain framing
+    /// fix. This is a known-answer pin computed at the PRE-fix revision
+    /// (main @ 33c46dd): if it moves, every persisted `ByteStream` address —
+    /// including `cmd_parse`'s segment root — has been invalidated, which is
+    /// a generation-lineage event, not a refactor.
+    #[test]
+    fn byte_stream_address_pin() {
+        let s = spec(Domain::ByteStream);
+        let e = [
+            Entry {
+                addr: h(1),
+                a: 0,
+                b: 5,
+            },
+            Entry {
+                addr: h(2),
+                a: 5,
+                b: 5,
+            },
+        ];
+        let hex: String = s
+            .address(&e)
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            hex, "dedab6dfd1ecdcab242d1a050c2e2d216a31c4f5c6dfa10133775fec496c0ad9",
+            "ByteStream preimage moved — persisted interval addresses invalidated"
+        );
+    }
+
+    /// Set-domain framing is part of the declared decomposition and MUST be
+    /// committed (ADR-0032 D2: the operator folds `(addrᵢ, frameᵢ)` pairs).
+    /// `Entry.a`/`b` are scheme-defined for set domains, and downstream
+    /// schemes do define them — cloister's `glob-closure/v1` (RowSet) pins
+    /// exactly this property in cloister-cas's
+    /// `address_matches_upstream_fold_for_a_known_spec`. Dropping framing
+    /// collided every framing variant of one address multiset into a single
+    /// address: a producer could present materially different decompositions
+    /// under one digest, the inverse of the malleability it was meant to stop.
+    ///
+    /// Each assertion below is a row of cloister's probe table (bead
+    /// `b67a73` regression, found at rev 39e1e9b4) — every row collided
+    /// before the fix.
+    #[test]
+    fn set_domains_commit_entry_framing() {
+        for domain in [Domain::ChunkSet, Domain::RowSet] {
+            let s = spec(domain);
+            let at = |a, b| [Entry { addr: h(3), a, b }];
+
+            // (0,1) vs (1,0): a/b swapped
+            assert_ne!(
+                s.address(&at(0, 1)),
+                s.address(&at(1, 0)),
+                "{domain:?}: swapped framing must change the address"
+            );
+            // (0,1) vs (0,2): b varied outright
+            assert_ne!(
+                s.address(&at(0, 1)),
+                s.address(&at(0, 2)),
+                "{domain:?}: a changed framing value must change the address"
+            );
+            // (5,7) vs (7,5)
+            assert_ne!(
+                s.address(&at(5, 7)),
+                s.address(&at(7, 5)),
+                "{domain:?}: swapped framing must change the address"
+            );
+        }
+    }
+
+    /// The exact known-spec inputs of cloister-cas's
+    /// `address_matches_upstream_fold_for_a_known_spec`, upstreamed. That
+    /// test passed at cloister's older pin, regressed at 39e1e9b4, and must
+    /// never regress again — this is the downstream contract stated locally.
+    #[test]
+    fn cloister_known_spec_commits_framing() {
+        let s = PartitionSpec {
+            domain: Domain::RowSet,
+            scheme: "glob-closure/v1".into(),
+            params: b"\x00".to_vec(),
+            canon_version: 1,
+        };
+        let zero = Hash::from_bytes([0u8; 32]);
+        let a = s.address(&[Entry {
+            addr: zero,
+            a: 0,
+            b: 1,
+        }]);
+        let b = s.address(&[Entry {
+            addr: zero,
+            a: 1,
+            b: 0,
+        }]);
+        assert_ne!(a, b, "framing must be committed to, not ignored");
     }
 
     /// The interval domain keeps both properties — order and framing are its

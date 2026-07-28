@@ -45,6 +45,33 @@ context, scoping notes, and review history are recoverable.
   it is pullable, and v0.11.3 shipped well-formed and unpullable. Verified to
   bite: it fails today against the unpublished v0.11.3 image.
 
+### Fixed — BREAKING (set-domain partition addresses)
+
+- **`PartitionSpec::address` commits set-domain framing again**
+  (`ley-line-open-b67a73` regression; found by cloister probing at 39e1e9b4,
+  where their `address_matches_upstream_fold_for_a_known_spec` — green at the
+  older pin — started failing). An earlier revision canonicalized `ChunkSet` /
+  `RowSet` folds by sorting entry addresses **and dropping `Entry.a`/`b`**, on
+  the theory that framing "carries no defined meaning" in set domains. But
+  `Entry` documents those fields as scheme-defined, and downstream schemes
+  define them — cloister's `glob-closure/v1` — so the address collided every
+  framing variant of one address multiset: materially different declared
+  decompositions shared a digest, violating ADR-0032 D2's operator, which
+  folds `(addrᵢ, frameᵢ)` pairs.
+
+  Set domains now sort whole entries by `(addr, a, b)` and fold
+  `addr ‖ a ‖ b` per entry. Order-insensitivity is **kept** — a set has no
+  order, so enumeration order stays erased; only the erasure of framing was
+  the bug. A scheme that assigns framing no meaning must canonicalize it
+  (e.g. to zero); a garnished sender is rejected by re-derivation from
+  `scheme`+`params`, not by the fold guessing which fields matter.
+
+  **Impact:** every persisted `ChunkSet`/`RowSet` address changes (none are
+  produced in-repo; cloister's RowSet addresses re-derive under the fixed
+  fold). `ByteStream` addresses — including `cmd_parse`'s segment root — are
+  **bit-identical**, pinned by a known-answer test computed at the pre-fix
+  revision, so `_meta.ir_schema_version` does not bump.
+
 ### Fixed — BREAKING (image tag)
 
 - **The image tag is `v`-prefixed everywhere** — `ley-line-open:v0.11.3`, not

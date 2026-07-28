@@ -169,39 +169,66 @@ cli_features=$(sed -n '/^\[features\]/,/^\[/p' "$cli_manifest" \
 # actually invokes. Counting every `cargo test` line would accept a target that
 # exists and never runs — the same unwired failure this gate exists to catch.
 #
-# ASK TASK, DO NOT PARSE THE TASKFILE. The previous cut read ../Taskfile.yml
-# textually — a `sed` range for the ci chain, then an `awk` scan for `cargo test`
-# lines. That works only while every task lives in ONE file. The moment the root
-# Taskfile uses `includes:` to pull crate-scoped Taskfiles, the awk finds no
-# `cargo test` lines for the moved tasks, `tested_explicit` silently shrinks, and
-# features that ARE covered get reported as uncovered.
+# RESOLVE INCLUDES OURSELVES, WITH NO SUBPROCESS.
 #
-# Same lesson as claim 1 above, where grepping manifests for feature edges was
-# replaced by `cargo tree`: when a tool owns a resolution, ask it rather than
-# re-implementing its output format. `task --summary` resolves includes and deps
-# itself.
+# Three designs have been tried here. The first grepped the root Taskfile for
+# both the chain and the `cargo test` lines; it broke the moment tasks moved to
+# crate-scoped Taskfiles, because it asserted a LAYOUT rather than a contract.
+# The second shelled out to `task --summary`, which resolves includes properly —
+# and passed locally but failed in GitHub CI with an empty chain, for reasons
+# the script could not report because it had discarded task's stderr.
 #
-# Equivalence was proved at abd5b86, BEFORE any Taskfile was split:
-#   ci chain        34 tasks                                    `diff` identical
-#   --features set  cdc host splice text-search validate vec    `diff` identical
-ci_tasks=$(task -d "$repo_root" --summary ci 2>/dev/null \
-            | sed -n '/commands:/,$p' \
-            | grep '^ - Task: ' \
-            | sed 's/^ - Task: //')
+# The lesson is not "text parsing bad". It is that a gate must not depend on
+# behaviour that varies between the developer's machine and CI. `task --summary`
+# is a nested invocation of the very runner executing this script; that is a
+# runtime dependency with an environment-shaped failure mode.
+#
+# So: parse, but resolve includes EXACTLY, using the two facts the root Taskfile
+# states declaratively.
+#   1. The ci CHAIN is still in the root file — only task DEFINITIONS moved.
+#   2. `includes:` is an explicit prefix -> taskfile map.
+# A chain entry `fs:test:cdc` therefore means "task `test:cdc` in the file
+# mapped by prefix `fs`". Deterministic, no subprocess, identical everywhere.
+
+taskfile_root="$repo_root/Taskfile.yml"
+
+# prefix -> taskfile path, from the `includes:` block.
+include_map=$(awk '
+    /^includes:/ { inc = 1; next }
+    /^[a-z]/     { inc = 0 }
+    inc && /^  [a-z][a-z0-9_-]*:/ { p = $1; sub(/:$/, "", p) }
+    inc && /taskfile:/            { print p, $2 }
+' "$taskfile_root")
+
+ci_tasks=$(sed -n '/^  ci:/,/^  [a-z][a-z0-9:_-]*:$/p' "$taskfile_root" \
+            | grep -E '^[[:space:]]+- task:' | sed 's/.*task: //')
 if [ -z "$ci_tasks" ]; then
     echo "feature-coverage: could not read the ci chain — refusing to pass vacuously" >&2
     exit 1
 fi
 
+# Emit every `cargo test` line belonging to a ci-invoked task, following
+# includes. An unmapped prefix (e.g. `lint:doc-claims`, where `lint` is a naming
+# convention and not an include) resolves to the root file, which is correct.
 tested_explicit=$(
     printf '%s\n' "$ci_tasks" | while IFS= read -r t; do
         [ -n "$t" ] || continue
-        # `|| true` is load-bearing under `set -e`: most ci tasks have no
-        # `cargo test` line, so grep exits 1 and would kill this whole loop
-        # subshell on the FIRST such task (`fmt:check`), leaving
-        # `tested_explicit` empty and every coverage check vacuously passing.
-        task -d "$repo_root" --summary "$t" 2>/dev/null \
-            | sed -n '/commands:/,$p' | grep 'cargo test' || true
+        prefix=${t%%:*}
+        file=$(printf '%s\n' "$include_map" | awk -v p="$prefix" '$1 == p { print $2 }')
+        if [ -n "$file" ]; then
+            scan="$repo_root/$file"
+            local_name=${t#*:}
+        else
+            scan="$taskfile_root"
+            local_name="$t"
+        fi
+        [ -f "$scan" ] || continue
+        # The task's own block: from `  <name>:` to the next two-space key.
+        awk -v n="  $local_name:" '
+            $0 == n            { inblock = 1; next }
+            /^  [a-z][a-z0-9:_-]*:/ { inblock = 0 }
+            inblock && /cargo test/ { print }
+        ' "$scan"
     done \
     | grep -oE '\-\-features [a-z0-9_,-]+' | sed 's/--features //' | tr ',' '\n' | sort -u
 )

@@ -90,18 +90,16 @@ tasks:
         grep -q 'cache:sccache:stats:' Taskfile.yml
         grep -q 'sources:' Taskfile.yml
         grep -q 'generates:' Taskfile.yml
-        # ASK TASK, DO NOT GREP THE TASKFILE. These two lines used to be
-        #   grep -q '^  test:cdc-activation:$' Taskfile.yml
-        #   grep -q '^      - task: test:cdc-activation$' Taskfile.yml
-        # which asserted the task's DEFINITION SITE and its literal indentation
-        # in this one file. Moving it to rs/ll-open/cli-lib/Taskfile.yml broke
-        # both, even though the task still exists and still runs in ci — the
-        # assertion was about text, not about the contract.
+        # These assert the task EXISTS where the include map says it does, and
+        # that the ci chain invokes it. They previously grepped this file for
+        # the definition, which broke when the task moved to a crate Taskfile.
         #
-        # Same fix as tools/check_feature_reachability.sh (ed356d7): `task
-        # --summary` resolves includes, so this survives the task moving again.
-        task --summary cli-lib:test:cdc-activation >/dev/null
-        task --summary ci | grep -q '^ - Task: cli-lib:test:cdc-activation$'
+        # NOT via `task --summary`: that is a nested invocation of the runner
+        # already executing this task, and it behaved differently in GitHub CI
+        # than locally. A gate must not depend on behaviour that varies between
+        # a developer's machine and CI.
+        grep -q '^  test:cdc-activation:$' rs/ll-open/cli-lib/Taskfile.yml
+        grep -q '^      - task: cli-lib:test:cdc-activation$' Taskfile.yml
         test -f .cargo/config.toml
         grep -q 'link-arg=-Wl,--threads=2' .cargo/config.toml
         grep -q 'task cache:sccache:install' .github/workflows/ci.yml
@@ -130,10 +128,9 @@ tasks:
         grep -q 'release:verify-public:' Taskfile.yml
         grep -q 'release:recover-manifest:' Taskfile.yml
         grep -q -- '- task: release:artifacts:fixture-test' Taskfile.yml
-        # Ask task: this command moved to rs/ll-open/fs/Taskfile.yml, and the
-        # contract is "the FFI staticlib is built with cdc", not "that string
-        # appears in this file".
-        task --summary fs:build:static | grep -Eq 'cargo build -p leyline-fs --lib --features cdc$'
+        # The FFI staticlib is built with cdc. This command moved to the fs
+        # crate Taskfile, so assert it there rather than here.
+        grep -Eq 'cargo build -p leyline-fs --lib --features cdc$' rs/ll-open/fs/Taskfile.yml
         # Still asserted against the root file: release:ffi is repo-level
         # release orchestration and has not moved.
         grep -Eq 'cargo build --release --lib -p leyline-fs --features cdc --target' Taskfile.yml

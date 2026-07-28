@@ -1,8 +1,8 @@
-# image.Dockerfile — assemble LLO OCI image from a krust-built static musl binary.
+# image.Dockerfile — assemble LLO OCI image from a zigbuild static musl binary.
 #
 # Build is a two-step flow:
-#   1. krust + cargo-zigbuild produces a static musl binary at
-#      rs/ll-open/cli/target/krust/<arch>-unknown-linux-musl/release/leyline
+#   1. cargo-zigbuild produces a static musl binary at
+#      rs/target/<arch>-unknown-linux-musl/release/leyline
 #      (no docker daemon involved; native cross-compile via zig).
 #   2. This Dockerfile drops that binary onto chainguard/static:latest
 #      (distroless, nonroot uid 65532) — a single COPY, no Rust toolchain in the
@@ -38,7 +38,7 @@
 # attested" — there is no auth on the wire, so do not publish to a public
 # host IP without a reverse proxy / mTLS / cloister attestation in front.
 
-ARG BIN_PATH=rs/ll-open/cli/target/krust/aarch64-unknown-linux-musl/release/leyline
+ARG BIN_PATH=rs/target/aarch64-unknown-linux-musl/release/leyline
 
 FROM cgr.dev/chainguard/static:latest
 

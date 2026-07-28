@@ -1,0 +1,155 @@
+name: Release dry-run
+
+# The release path used to run ONLY on a `v*` tag, so a tag was the first time
+# any of it executed. v0.12.0 proved the cost: the image jobs failed on a
+# permanent tag, and the cause (`cargo install krust` resolving to an unrelated
+# crates.io package) was something a single PR run would have caught.
+#
+# This job builds and stages exactly what release.yml does, and publishes
+# NOTHING. Separate workflow rather than a `pull_request:` trigger on
+# release.yml, so the credentialed publish and attest jobs cannot fire on a PR
+# by accident — a paths filter is not a permission boundary.
+#
+# Paths-filtered because a 4-target matrix on every docs change is the kind of
+# tax that makes people stop reading CI.
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - '.github/workflows/release-dryrun.yml'
+      - 'Taskfile.yml'
+      - 'image.Dockerfile'
+      - 'tools/stage_release_artifacts.sh'
+      - 'tools/prepare_public_release.sh'
+      - 'tools/verify_public_release.sh'
+      - 'tools/release-assets.txt'
+      - 'tools/release-version-manifests.txt'
+      - 'rs/ll-open/schema-bridge/**'
+      - 'rs/ll-core/mcp-descriptor/**'
+      - 'rs/ll-open/cli/**'
+
+# Read-only at the workflow level and never escalated. This job has no reason
+# to hold a registry credential, a release token, or an OIDC identity — it
+# proves things BUILD, and anything it could publish would be from unreviewed
+# PR code.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-dryrun-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stage:
+    name: build + stage (no publish)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611
+        with:
+          version: 3.49.1
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: 1.97.1
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0
+        with:
+          cache-targets: false
+
+      # One target, not the full matrix. The failures this guards against are
+      # in the SHARED logic — the staging contract, the asserted asset set, the
+      # generator build — not in per-arch differences, which the tag run still
+      # covers. One target keeps a PR check honest without making it expensive.
+      - name: Build CLI
+        env:
+          BUILD_TARGET: x86_64-unknown-linux-gnu
+        run: task release:target
+
+      - name: Build generator binaries
+        env:
+          BUILD_TARGET: x86_64-unknown-linux-gnu
+        run: task release:generators:target
+
+      # The step that caught a real incompleteness while it was being written:
+      # release-assets.txt asserted 28 names while staging produced 8, and
+      # prepare_public_release diffed them and failed. Exercising staging on a
+      # PR is what turns that from a tag-time surprise into a review comment.
+      - name: Stage artifacts
+        env:
+          BUILD_TARGET: x86_64-unknown-linux-gnu
+          ASSET_NAME: leyline-linux-amd64
+          GENERATOR_BINS: >-
+            capnpc-schema-bridge-zod
+            capnpc-schema-bridge-go
+            capnpc-schema-bridge-jsonschema
+            capnpc-schema-bridge-tooldefs
+            leyline-mcp-descriptor
+        run: task release:artifacts:stage
+
+      - name: Assert the staged set matches what the release asserts
+        run: |
+          set -eu
+          staged=$(find .artifacts/staged/leyline-linux-amd64 -maxdepth 1 -type f \
+            ! -name SHA256SUMS -exec basename {} \; | LC_ALL=C sort)
+          # Every asset release-assets.txt names for THIS target must be present.
+          # Grepping the asserted set rather than hardcoding names here keeps
+          # one source of truth; a second list would be free to disagree.
+          missing=0
+          while IFS= read -r want; do
+            case "$want" in
+              *-linux-amd64) ;;
+              *) continue ;;
+            esac
+            printf '%s\n' "$staged" | grep -qx "$want" || {
+              echo "::error::release-assets.txt names '$want' but staging did not produce it"
+              missing=1
+            }
+          done < tools/release-assets.txt
+          test "$missing" = 0 || exit 1
+          printf '%s\n' "$staged" | sed 's/^/staged: /'
+
+  image:
+    name: build image (no push)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611
+        with:
+          version: 3.49.1
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: 1.97.1
+
+      # The exact step that failed on the v0.12.0 tag. It ran `cargo install
+      # krust --locked`, where the local krust was a /tmp path install and the
+      # crates.io `krust` is an unrelated 2016 Vulkan wrapper. Running this on
+      # a PR is the whole point of this workflow.
+      - name: Install zig toolchain
+        run: |
+          cargo install cargo-zigbuild --locked
+          python3 -m pip install --break-system-packages ziglang
+          rustup target add x86_64-unknown-linux-musl
+
+      # `task image` builds and tags locally. No `docker login`, no push — the
+      # job holds no registry credential, so it could not push if it tried.
+      - name: Build image
+        run: task image PLATFORM=linux/amd64
+
+      - name: Assert the image exists and carries the derived tag
+        run: |
+          set -eu
+          VERSION=$(grep -m1 '^version = ' rs/ll-open/cli/Cargo.toml | cut -d'"' -f2)
+          REF="localhost/leyline:v${VERSION}"
+          docker image inspect "$REF" >/dev/null
+          echo "built $REF"

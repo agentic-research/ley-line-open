@@ -289,12 +289,18 @@ jobs:
       matrix:
         include:
           # Native runners per arch — same reasoning as the binary matrix
-          # above. krust/zigbuild cross-compiles, but building each arch on
-          # its own runner keeps the musl toolchain path identical to local.
+          # above. zigbuild cross-compiles, but building each arch on its own
+          # runner keeps the musl toolchain path identical to local.
+          #
+          # rust_target must agree with the triple `task image` derives from
+          # PLATFORM; the build fails loudly on a mismatch (missing binary at
+          # the BIN_PATH docker COPYs) rather than shipping the wrong arch.
           - platform: linux/amd64
             os: ubuntu-latest
+            rust_target: x86_64-unknown-linux-musl
           - platform: linux/arm64
             os: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
@@ -309,16 +315,26 @@ jobs:
         with:
           toolchain: 1.97.1
 
-      # `task image` shells out to krust, which drives cargo-zigbuild to
-      # produce the static musl binary image.Dockerfile COPYs onto
-      # chainguard/static. The release matrix builds *gnu* targets, which
-      # would not run on a distroless base — so this is a separate build, not
-      # a reuse of those artifacts.
-      - name: Install krust + zig toolchain
+      # `task image` runs `cargo zigbuild` to produce the static musl binary
+      # image.Dockerfile COPYs onto chainguard/static. The release matrix builds
+      # *gnu* targets, which would not run on a distroless base — so this is a
+      # separate build, not a reuse of those artifacts.
+      #
+      # This previously also ran `cargo install krust --locked`, which is why
+      # the v0.12.0 image jobs failed and could never have succeeded: the krust
+      # this repo used was a LOCAL PATH install (`/tmp/krust`), while the
+      # `krust` on crates.io is an unrelated abandoned 2016 Vulkan bindings
+      # wrapper. The step either failed or installed a stranger's crate on a
+      # name collision. Installing by bare name does not belong in a release
+      # path (`ley-line-open-e44960`).
+      - name: Install zig toolchain
         run: |
-          cargo install krust --locked
           cargo install cargo-zigbuild --locked
-          pip install ziglang
+          python3 -m pip install --break-system-packages ziglang
+          rustup target add "${RUST_TARGET}"
+        env:
+          # musl, not gnu: chainguard/static carries no glibc.
+          RUST_TARGET: ${{ matrix.rust_target }}
 
       - name: Log in to ghcr
         uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772

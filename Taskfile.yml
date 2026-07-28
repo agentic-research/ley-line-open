@@ -813,16 +813,22 @@ tasks:
       - cargo build -p leyline-core -p leyline-schema -p leyline-public-schema
 
   # --------------------------------------------------------------------------
-  # Image build (krust + docker → distroless OCI image)
+  # Image build (cargo-zigbuild + docker → distroless OCI image)
   # --------------------------------------------------------------------------
-  # Two-step: krust+cargo-zigbuild produce a static musl binary (no docker
+  # Two-step: cargo-zigbuild produces a static musl binary (no docker
   # daemon involved in the compile); docker assembles a one-layer image by
   # COPYing that binary onto cgr.dev/chainguard/static:latest. See image.Dockerfile.
   #
   # Why not apko/melange? See ley-line-open-2b255c. tl;dr on Apple Silicon
   # the melange-via-docker workspace bind-mount stalls on virtiofs and
   # leaks ~30 GB tmpdirs per run; apko's `archs: [x86_64, aarch64]` also
-  # fails when only one arch APK is built. krust sidesteps both.
+  # fails when only one arch APK is built. cargo-zigbuild sidesteps both:
+  # zig is the cross-linker, so no emulation and no container in the compile.
+  #
+  # This used to shell out to `krust`, a wrapper around cargo-zigbuild. It was
+  # removed in `ley-line-open-e44960`: the only krust here was a /tmp path
+  # install, and `cargo install krust` resolves to an unrelated crates.io
+  # package, so the release image job could never build on any other machine.
   #
   # The image runs `leyline daemon --mcp-port 8384 --mcp-bind 0.0.0.0
   # --mcp-allow-public` headless (no FUSE). The --mcp-bind 0.0.0.0
@@ -832,7 +838,7 @@ tasks:
   # added by bead `ley-line-open-b7dd03` — outside a container, the
   # daemon refuses non-loopback binds without it.
   image:
-    desc: Build the LLO OCI image for one platform (krust musl binary + docker COPY)
+    desc: Build the LLO OCI image for one platform (zigbuild musl binary + docker COPY)
     vars:
       # Derived, never literal. A hardcoded version here is precisely how an
       # image gets published under a tag that disagrees with server.json's
@@ -847,22 +853,41 @@ tasks:
       # packages[0].version; a different local convention is a second rule to
       # get wrong, and getting it wrong is `ley-line-open-e44960`.
       IMAGE_REF: '{{.IMAGE_REF | default (printf "localhost/leyline:v%s" .VERSION)}}'
-      KRUST_REPO: '{{.KRUST_REPO | default "localhost/leyline"}}'
       PLATFORM: '{{.PLATFORM | default "linux/arm64"}}'
       # Derive musl target triple from PLATFORM so cross-arch builds find
       # the right binary. Image.Dockerfile's BIN_PATH default targets
       # aarch64; for amd64 we override via --build-arg below.
       RUST_ARCH:
         sh: 'case "{{.PLATFORM}}" in linux/arm64) echo aarch64;; linux/amd64) echo x86_64;; *) echo "unsupported PLATFORM: {{.PLATFORM}}" >&2; exit 1;; esac'
+    # `cargo zigbuild`, NOT krust (`ley-line-open-e44960`).
+    #
+    # The v0.12.0 image jobs failed and could never have succeeded: the workflow
+    # ran `cargo install krust --locked`, but the krust on this machine is
+    # `krust v0.0.1 (/tmp/krust)` — a LOCAL PATH install no CI can reproduce —
+    # while the `krust` on crates.io is an unrelated abandoned 2016 Vulkan
+    # bindings wrapper. So the step either failed or installed a stranger's
+    # crate on a name collision. Installing by bare name does not belong in a
+    # release path.
+    #
+    # krust was only wrapping cargo-zigbuild here anyway (we invoked it with
+    # `--no-push`), so calling zigbuild directly removes an unreproducible
+    # dependency rather than replacing it with another.
     cmds:
+      # `-p leyline-cli` is load-bearing, not tidiness. Without it cargo
+      # resolves features across the whole workspace, drags in `leyline-fs`,
+      # and fuser's build script panics — it needs libfuse, which does not
+      # exist for musl. `mount` is not even in the CLI's default features;
+      # workspace feature unification pulls it in regardless. Verified by
+      # hitting exactly that failure while porting off krust.
       - |
-        KRUST_REPO={{.KRUST_REPO}} krust build "$(pwd)/rs/ll-open/cli" \
-          --no-push --platform {{.PLATFORM}} -- --bin leyline
+        cargo zigbuild --release --manifest-path rs/Cargo.toml \
+          -p leyline-cli --bin leyline \
+          --target {{.RUST_ARCH}}-unknown-linux-musl
       - |
         docker build -f image.Dockerfile \
           -t {{.IMAGE_REF}} \
           --platform {{.PLATFORM}} \
-          --build-arg BIN_PATH=rs/ll-open/cli/target/krust/{{.RUST_ARCH}}-unknown-linux-musl/release/leyline \
+          --build-arg BIN_PATH=rs/target/{{.RUST_ARCH}}-unknown-linux-musl/release/leyline \
           .
       - |
         echo "Built {{.IMAGE_REF}} ({{.PLATFORM}})."

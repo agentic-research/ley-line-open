@@ -72,11 +72,11 @@ fn llo_meta() -> ServerMeta<'static> {
     ServerMeta {
         name: "io.github.agentic-research/ley-line-open",
         description: "Open-source data plane primitives.",
-        version: "0.11.3",
+        version: "0.12.0",
         repository_url: "https://github.com/agentic-research/ley-line-open.git",
         repository_source: "github",
         oci_image: "ghcr.io/agentic-research/ley-line-open",
-        oci_version: "v0.11.3",
+        oci_version: "v0.12.0",
         transport_type: "streamable-http",
         transport_url: "http://localhost:8384/mcp",
     }

@@ -263,18 +263,41 @@ carrying Phase 0 + 1, not landed against an interim shape.
 
 Whatever the ADR decides must be **published through a generated consumer surface**, or
 consumers hand-mirror it and the class returns. That is how mache arrived at
-rendered-name keying in the first place.
+rendered-name keying, and how `cloister/src/routes/vault-proxy.ts:21` came to hand-write
+an `InjectionStrategy` union mirroring a wire spec that lives here.
 
 This is `vigil-4b304d`'s declare-vs-generate rule: *regenerable deterministically →
-GENERATE; drift becomes unrepresentable.* capnp schemas are deterministically
-regenerable, so identity types belong in the GENERATE arm. LLO already has the
-mechanism — `rs/ll-open/schema-bridge` (`leyline-schema-bridge`, ADR-0036 Phase 2) —
-and it is wired into **zero** Taskfile targets and **zero** workflows, the same
-unwired-capability shape as `918a75`. A generator nobody runs prevents no drift.
+GENERATE.* capnp schemas are deterministically regenerable, so identity **types** belong
+in the GENERATE arm. `cloister-86ce1f` states the stronger form — generate both halves
+from one source and disagreement is not caught, it is *unrepresentable*; the check
+ceases to exist rather than passing.
 
-Related: `ley-line-open-4ec276` (finish generalizing schema-bridge), `e7f466` (TS
-bindings — belongs in the GENERATE arm; the Go client already *is* generated),
-`41867b` (Go consumer surface, done).
+Note the boundary this does **not** cross. A reference implementation — LLO's
+`schema-spec/credential-isolation/v1/ref-impl-py/` — is deliberately *not* generated. Its
+purpose is to be an independent second statement of the spec's semantics, so
+spec-vs-implementation disagreement remains detectable. Types generated, semantics
+declared independently; `vigil-4b304d` carves out exactly this case ("declare
+independently when you want two statements that are ALLOWED to disagree, because the
+disagreement is the signal").
+
+**LLO already hosts the generator, and does not run it.** `rs/ll-open/schema-bridge`
+(`leyline-schema-bridge`, ADR-0036 Phase 2) emits zod TS / Go / JSON Schema from capnp
+and hard-errors on any unmapped construct rather than silently emitting `z.unknown()`.
+LLO tests the crate — `schema-bridge/tests/integration.rs` runs in the workspace sweep —
+but invokes it as a generator **nowhere**: zero `schema-bridge` references in
+`Taskfile.yml` and zero in `.github/workflows/`.
+
+Downstream is where it actually runs. cloister's Taskfile carries `cluster:zod`,
+`cluster:zod:verify` and `cluster:zod:check-drift` against LLO's plugin binaries today.
+So the generator is exercised — just not by the repo that owns it. The gap is therefore
+narrower than "nobody runs it", and differently shaped: **LLO can regress generation
+semantics and only a downstream repo finds out.** One (schema, format) pair of LLO's own
+in `task ci`, with a drift check, closes it.
+
+Related: `ley-line-open-4ec276` (finish generalizing schema-bridge; its acceptance
+criteria already ask for adoption beads downstream), `cloister-871aed` (the cloister
+adoption bead that answers it), `cloister-5e4402` (`leyline-*` primitives belong in LLO),
+`e7f466` (TS surface), `41867b` (Go consumer surface, done).
 
 ## Open questions
 

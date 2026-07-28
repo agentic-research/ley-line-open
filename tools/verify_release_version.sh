@@ -51,12 +51,49 @@ test "$schema_version" = "$version"
 grep -q "\"binary_version\": \"$version\"" compatibility.json
 grep -q "\"schema_version\": \"$version\"" compatibility.json
 grep -q "\"version\": \"$version\"" server.json
-grep -q "ley-line-open:$version" server.json
+# The OCI identifier is TAGLESS (cloister ADR-0041, bead `ley-line-open-04300f`).
+# This line previously read `grep -q "ley-line-open:$version" server.json`, i.e. it
+# proved server.json carried the release version by checking the IMAGE TAG — so the
+# ADR-0041 violation was not merely emitted, it was load-bearing for this gate.
+# The version itself is already asserted directly, one line above. What is checked
+# here is that the identifier is present and correctly tagless.
+grep -q '"identifier": "ghcr.io/agentic-research/ley-line-open"' server.json
 grep -q "^## \\[$version\\]" CHANGELOG.md
 grep -q "ley-line-open:$version" README.md
 grep -q "clients/go/leyline-schema/v$version" README.md
 grep -Fq "| LLO version | v$version |" docs/ARCHITECTURE.md
 grep -q 'daemon/wire' clients/go/leyline-schema/README.md
 grep -q "Apache License" clients/go/leyline-schema/LICENSE
+
+# The claim below says "docs agree". It did not check that.
+#
+# This gate greps a handful of exact patterns, so version strings in PROSE went
+# unchecked — and at v0.11.1 it printed "docs agree" while README.md still said
+# "The current release is `v0.10.4`" and docs/ARCHITECTURE.md still advertised a
+# 0.10.4 image and Go-client compatibility point.
+#
+# The first attempt at a fix banned EVERY earlier version string from the doc
+# set. That was wrong and worth recording: docs/ARCHITECTURE.md legitimately
+# says "Accepted (shipped v0.5.0)" and "v0.7.2 shipped T1's schema" — true
+# statements about the past. A gate that forces the prose it guards to become
+# false is worse than the drift it prevents.
+#
+# So assert the sentences that claim CURRENCY, and leave history alone. Each
+# pattern below is a place a reader learns "what is the version NOW".
+assert_current() {
+    file=$1
+    what=$2
+    pattern=$3
+    if ! grep -Fq "$pattern" "$file"; then
+        printf 'stale currency claim: %s should state %s as %s\n' "$file" "$what" "$version" >&2
+        printf '  expected to find: %s\n' "$pattern" >&2
+        exit 1
+    fi
+}
+
+assert_current README.md "the current release" "The current release is \`v$version\`"
+assert_current docs/ARCHITECTURE.md "the OCI image tag" "produces \`ley-line-open:$version\`"
+assert_current docs/ARCHITECTURE.md "the Go client compatibility point" \
+    "v$version is its tested compatibility point"
 
 echo "binary, schema, metadata, docs, and license agree on v$version"

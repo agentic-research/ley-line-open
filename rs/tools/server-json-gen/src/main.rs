@@ -36,206 +36,62 @@
 //! `groups[]` array order matches `cloister_groups()` order. No
 //! HashMap iteration — every container is a Vec.
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use leyline_cli_lib::daemon::mcp;
-use serde::Serialize;
-use std::collections::HashMap;
-
-/// MCP Registry schema URL pinned to the 2025-12-11 release. Bumps
-/// when the registry schema itself ships a new dated version; update
-/// the test fixtures and any registry-side consumers in lockstep.
-const SCHEMA_URL: &str =
-    "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json";
+use leyline_mcp_descriptor::{GroupRef, ServerMeta, ToolRef};
 
 /// Registry-facing canonical name for this server. Matches the GitHub
 /// `<owner>/<repo>` shape registries dispatch on.
 const SERVER_NAME: &str = "io.github.agentic-research/ley-line-open";
 
-/// One-sentence description shown in registry listings and link
-/// previews. Kept synced with the README opener (the existing
-/// handwritten `server.json` carried this exact text; the generator
-/// preserves it byte-for-byte so the initial regen produces a clean
-/// diff modulo the `_meta` block + version expansion).
+/// One-sentence description shown in registry listings and link previews.
 const SERVER_DESCRIPTION: &str =
     "Open-source data plane primitives — tree-sitter parse, LSP, sheaf cache, observation lattice.";
 
-/// Source-of-truth version. Equals `CARGO_PKG_VERSION` of
-/// `leyline-cli-lib`, threaded through this binary via the same
-/// cargo-env mechanism the daemon's `leyline_version` op uses.
-/// `leyline-cli-lib`'s `package.version` is the workspace's single
-/// authoritative version string today.
+/// Source-of-truth version — `CARGO_PKG_VERSION` of `leyline-cli-lib`, the
+/// workspace's single authoritative version string.
 const VERSION: &str = leyline_cli_lib::daemon::version::BINARY_VERSION;
 
-#[derive(Serialize)]
-struct ServerDoc<'a> {
-    #[serde(rename = "$schema")]
-    schema: &'static str,
-    name: &'static str,
-    description: &'static str,
-    version: &'static str,
-    repository: Repository,
-    packages: Vec<Package>,
-    #[serde(rename = "_meta")]
-    meta: Meta<'a>,
-}
+/// OCI path, **tagless**, per cloister ADR-0041 (bead `ley-line-open-04300f`).
+///
+/// This previously read `format!("ghcr.io/agentic-research/ley-line-open:{VERSION}")`
+/// and so regenerated a fresh ADR-0041 violation on every release: a tag
+/// promising an image LLO does not build and never pushes. `leyline-mcp-descriptor`
+/// now rejects a tagged identifier outright, so the violation cannot come back
+/// here or land in any repo that adopts the emitter.
+const OCI_IMAGE: &str = "ghcr.io/agentic-research/ley-line-open";
 
-#[derive(Serialize)]
-struct Repository {
-    url: &'static str,
-    source: &'static str,
-}
-
-#[derive(Serialize)]
-struct Package {
-    #[serde(rename = "registryType")]
-    registry_type: &'static str,
-    identifier: String,
-    transport: Transport,
-    #[serde(rename = "environmentVariables")]
-    environment_variables: Vec<()>,
-}
-
-#[derive(Serialize)]
-struct Transport {
-    #[serde(rename = "type")]
-    typ: &'static str,
-    url: &'static str,
-}
-
-#[derive(Serialize)]
-struct Meta<'a> {
-    #[serde(rename = "art.cloister/v1")]
-    art_cloister_v1: ArtCloisterV1<'a>,
-}
-
-#[derive(Serialize)]
-struct ArtCloisterV1<'a> {
-    groups: Vec<GroupOut<'a>>,
-}
-
-#[derive(Serialize)]
-struct GroupOut<'a> {
-    name: &'a str,
-    #[serde(rename = "advertisedPrefix")]
-    advertised_prefix: &'a str,
-    #[serde(rename = "upstreamNames")]
-    upstream_names: Vec<&'a str>,
-}
-
-fn build_doc() -> Result<ServerDoc<'static>> {
-    let groups_decl = mcp::cloister_groups();
-    let registry = mcp::tool_registry();
-
-    // Coverage enforcement — every registered tool must be claimed by
-    // exactly one group. Mirrors the unit test in
-    // `daemon::mcp::tests::cloister_groups_cover_every_registered_tool_exactly_once`
-    // so the generator can run standalone (and refuse to emit a stale
-    // artifact) without depending on `cargo test` having run.
-    let mut owner: HashMap<&str, Vec<&str>> = HashMap::new();
-    for g in &groups_decl {
-        if g.name.is_empty() {
-            bail!("cloister group has empty `name` — spec violation");
-        }
-        if g.upstream_names.is_empty() {
-            bail!(
-                "cloister group `{}` has empty upstream_names — spec violation",
-                g.name
-            );
-        }
-        for tool in &g.upstream_names {
-            owner.entry(tool).or_default().push(g.name);
-        }
-    }
-
-    let registered: std::collections::HashSet<&str> = registry.iter().map(|t| t.name).collect();
-
-    let mut orphans: Vec<&str> = registered
-        .iter()
-        .filter(|t| !owner.contains_key(*t))
-        .copied()
-        .collect();
-    orphans.sort();
-    if !orphans.is_empty() {
-        bail!(
-            "{} tool(s) in tool_registry() are not claimed by any cloister group: {:?}",
-            orphans.len(),
-            orphans,
-        );
-    }
-
-    let mut over: Vec<(&str, Vec<&str>)> = owner
-        .iter()
-        .filter(|(_, names)| names.len() > 1)
-        .map(|(t, names)| (*t, names.clone()))
-        .collect();
-    over.sort_by_key(|(t, _)| *t);
-    if !over.is_empty() {
-        bail!("tools claimed by multiple cloister groups: {:?}", over);
-    }
-
-    let mut ghosts: Vec<&str> = owner
-        .keys()
-        .filter(|t| !registered.contains(*t))
-        .copied()
-        .collect();
-    ghosts.sort();
-    if !ghosts.is_empty() {
-        bail!(
-            "{} cloister group claim(s) reference tools that are not in tool_registry(): {:?}",
-            ghosts.len(),
-            ghosts,
-        );
-    }
-
-    // Convert the declaration into the wire-shape `GroupOut`. The
-    // generator preserves both the array order and the inner
-    // upstream_names order from `cloister_groups()` so regens diff
-    // cleanly.
-    let groups: Vec<GroupOut<'static>> = groups_decl
+fn main() -> Result<()> {
+    // The emitter owns the coverage invariants — orphans, ghosts,
+    // double-claims — so this binary supplies identity and the registry, and
+    // cannot render a manifest that advertises something untrue.
+    let groups: Vec<GroupRef<'_>> = mcp::cloister_groups()
         .into_iter()
-        .map(|g| GroupOut {
+        .map(|g| GroupRef {
             name: g.name,
             advertised_prefix: g.advertised_prefix,
             upstream_names: g.upstream_names,
         })
         .collect();
+    let tools: Vec<ToolRef<'_>> = mcp::tool_registry()
+        .iter()
+        .map(|t| ToolRef { name: t.name })
+        .collect();
 
-    // Package identifier embeds the version — string-formatting once
-    // at build time keeps the registry artifact in lockstep with the
-    // workspace's source-of-truth version constant.
-    let identifier = format!("ghcr.io/agentic-research/ley-line-open:{VERSION}");
-
-    Ok(ServerDoc {
-        schema: SCHEMA_URL,
+    let meta = ServerMeta {
         name: SERVER_NAME,
         description: SERVER_DESCRIPTION,
         version: VERSION,
-        repository: Repository {
-            url: "https://github.com/agentic-research/ley-line-open.git",
-            source: "github",
-        },
-        packages: vec![Package {
-            registry_type: "oci",
-            identifier,
-            transport: Transport {
-                typ: "streamable-http",
-                url: "http://localhost:8384/mcp",
-            },
-            environment_variables: vec![],
-        }],
-        meta: Meta {
-            art_cloister_v1: ArtCloisterV1 { groups },
-        },
-    })
-}
+        repository_url: "https://github.com/agentic-research/ley-line-open.git",
+        repository_source: "github",
+        oci_image: OCI_IMAGE,
+        transport_type: "streamable-http",
+        transport_url: "http://localhost:8384/mcp",
+    };
 
-fn main() -> Result<()> {
-    let doc = build_doc().context("build server.json document")?;
-    // Pretty-print with a trailing newline — diffs against the
-    // committed file should compare line-for-line. Same convention as
-    // `compat-gen`.
-    let mut s = serde_json::to_string_pretty(&doc)?;
-    s.push('\n');
-    print!("{s}");
+    print!(
+        "{}",
+        leyline_mcp_descriptor::render(&meta, &tools, &groups)?
+    );
     Ok(())
 }

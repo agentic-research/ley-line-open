@@ -1,5 +1,6 @@
 rs/ll-core/core/Cargo.toml
 rs/ll-core/ffi-helpers/Cargo.toml
+rs/ll-core/mcp-descriptor/Cargo.toml
 rs/ll-core/public-schema/Cargo.toml
 rs/ll-core/schema-capnp/Cargo.toml
 rs/ll-core/schema/Cargo.toml

@@ -113,6 +113,15 @@ pub struct DaemonConfig {
     pub mcp_allow_public: bool,
     /// Disables MCP wire authentication. See ADR-0022.
     pub mcp_no_auth: bool,
+    /// Optional MCP **Unix domain socket** path (bead
+    /// `ley-line-open-6569de`). `None` disables the UDS transport.
+    ///
+    /// Independent of `mcp_port` — a daemon may serve both, one, or
+    /// neither. cloister reaches bundles over UDS via notme-proxy
+    /// (cloister ADR-0005); the `--control` socket carries the OPS
+    /// protocol, not MCP, so this is the only MCP surface an attested
+    /// caller can dial.
+    pub mcp_uds: Option<std::path::PathBuf>,
     /// Bead `ley-line-open-c7d00f`: when `true`, drop any existing
     /// live-db + zero the controller before starting so a cold parse
     /// runs against `--source` regardless of prior arena state.
@@ -175,6 +184,7 @@ pub async fn run_daemon_with_options(
         mcp_bind,
         mcp_allow_public,
         mcp_no_auth,
+        mcp_uds,
         reset_arena,
     } = config;
     let arena = arena.as_path();
@@ -487,7 +497,10 @@ pub async fn run_daemon_with_options(
     // start an unauthenticated listener. The previous draft logged
     // "refusing to serve /mcp" but still called spawn with `token=None`,
     // which silently opened the gate (Copilot finding on PR #66).
-    let mcp_handle = if let Some(port) = mcp_port {
+    // Either transport arms the token decision. Gating this on `mcp_port`
+    // alone meant `--mcp-uds` on its own started nothing — and UDS-only is
+    // precisely cloister's case, since notme-proxy dials AF_UNIX.
+    let mcp_handle = if mcp_port.is_some() || mcp_uds.is_some() {
         enum TokenDecision {
             Gated(Arc<String>),
             NoAuth,
@@ -526,12 +539,38 @@ pub async fn run_daemon_with_options(
                     TokenDecision::Gated(t) => Some(t.clone()),
                     _ => None,
                 };
-                match crate::daemon::mcp::spawn(ctx.clone(), mcp_bind, port, token) {
-                    Ok(h) => Some(h),
-                    Err(e) => {
-                        log::error!("MCP HTTP server failed to start on port {port}: {e:#}");
-                        None
+                // Same token decision governs BOTH transports. A UDS that
+                // served ungated while TCP was gated would be an auth bypass
+                // reachable by anyone who can open the socket file — so the
+                // gate is decided once, above, and applied to each listener.
+                if let Some(uds_path) = mcp_uds.clone() {
+                    match crate::daemon::mcp::spawn_uds(
+                        ctx.clone(),
+                        uds_path.clone(),
+                        token.clone(),
+                    ) {
+                        Ok(_h) => {}
+                        Err(e) => log::error!(
+                            "MCP UDS server failed to start at {}: {e:#}",
+                            uds_path.display(),
+                        ),
                     }
+                }
+                match mcp_port {
+                    Some(port) => {
+                        match crate::daemon::mcp::spawn(ctx.clone(), mcp_bind, port, token) {
+                            Ok(h) => Some(h),
+                            Err(e) => {
+                                log::error!(
+                                    "MCP HTTP server failed to start on port {port}: {e:#}"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    // UDS-only: no TCP listener to hand back. The UDS task is
+                    // already spawned above and owns its own lifetime.
+                    None => None,
                 }
             }
         }
@@ -2699,6 +2738,7 @@ mod tests {
             mcp_bind: None,
             mcp_allow_public: false,
             mcp_no_auth: false,
+            mcp_uds: None,
             reset_arena: false,
         }
     }

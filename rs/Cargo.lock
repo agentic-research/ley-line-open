@@ -4114,6 +4114,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "leyline-mcp-descriptor"
+version = "0.11.1"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "leyline-public-schema"
 version = "0.11.1"
 dependencies = [
@@ -6522,6 +6531,7 @@ version = "0.11.1"
 dependencies = [
  "anyhow",
  "leyline-cli-lib",
+ "leyline-mcp-descriptor",
  "serde",
  "serde_json",
 ]

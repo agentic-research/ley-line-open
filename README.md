@@ -72,7 +72,7 @@ task install:full+mount   # add FUSE/NFS support
 task ci                   # check, clippy, formatting, tests, FFI gates
 ```
 
-The current release is `v0.10.4`. It publishes platform binaries, FFI
+The current release is `v0.11.1`. It publishes platform binaries, FFI
 staticlibs, and the Apache-2.0 Go schema module at
 `clients/go/leyline-schema/v0.11.1`. See
 [releases/latest](https://github.com/agentic-research/ley-line-open/releases/latest)
@@ -81,7 +81,7 @@ for assets and [GETTING-STARTED.md](GETTING-STARTED.md) for download commands.
 ## OCI image
 
 `task image` builds a local distroless OCI image tagged
-`localhost/leyline:0.10.4` (equivalently `ley-line-open:0.11.1`). It uses
+`localhost/leyline:0.11.1` (equivalently `ley-line-open:0.11.1`). It uses
 krust/cargo-zigbuild for the static binary
 and `cgr.dev/chainguard/static:latest` as the runtime base. The image is not
 automatically pushed to GHCR; `ghcr.io/agentic-research/ley-line-open:0.11.1`

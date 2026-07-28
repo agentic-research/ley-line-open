@@ -146,6 +146,43 @@ fn the_committed_server_json_conforms_to_the_pinned_schema() {
 }
 
 #[test]
+fn the_vendored_schema_is_tracked_by_git() {
+    // This gate shipped once already validating against a file that existed
+    // ONLY on the author's disk. `.gitignore` line 3 is `*` — a deny-all
+    // allowlist — so `git add -A` silently skipped the new `schema/`
+    // directory, every local run passed, and CI on a clean checkout failed
+    // with "No such file or directory".
+    //
+    // A local `task ci` cannot catch that by construction: it runs against a
+    // working tree where the file is present. So the claim "the spec is part
+    // of the artifact" has to be asserted directly, or the next vendored file
+    // repeats it.
+    let (path, _) = vendored_schema();
+
+    let out = match std::process::Command::new("git")
+        .args(["ls-files", "--error-unmatch", &path])
+        .output()
+    {
+        Ok(o) => o,
+        // Not in a git checkout (e.g. a packaged source tarball). The file was
+        // readable — `vendored_schema()` just read it — so it shipped. Nothing
+        // to assert.
+        Err(_) => return,
+    };
+    if !out.status.success() && out.status.code() == Some(128) {
+        // git present but this is not a repository — same reasoning.
+        return;
+    }
+
+    assert!(
+        out.status.success(),
+        "the vendored schema at {path} is NOT tracked by git, so it will be \
+         absent on a clean checkout even though it is present here. This \
+         repo's .gitignore denies by default — add an explicit `!` allow rule.",
+    );
+}
+
+#[test]
 fn the_declared_schema_url_is_the_one_actually_validated_against() {
     // Without this, bumping SCHEMA_URL would silently keep validating against
     // the stale vendored copy, and the `$schema` key would advertise

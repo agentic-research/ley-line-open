@@ -226,11 +226,45 @@ fn zod_honours_the_same_annotations_as_json_schema() {
     let doc: serde_json::Value = serde_json::from_str(&json_schema).unwrap_or_else(|e| {
         panic!("json_schema emitter produced invalid JSON: {e}\n{json_schema}")
     });
-    let required: Vec<&str> = doc["definitions"]["S"]["required"]
+    // `$defs`, not `definitions` — json_schema.rs emits JSON Schema 2020-12.
+    //
+    // This lookup previously read `doc["definitions"]`, fell back to a
+    // top-level `doc["required"]` that emit() never writes, and finished with
+    // `.unwrap_or_default()`. All three resolved to Null/empty, so
+    // `!required.contains("curated")` was trivially true and the cross-emitter
+    // claim asserted NOTHING — three layers of failing open, in the file whose
+    // own docstring says absence must read as stale rather than as current.
+    //
+    // Resolved strictly now: a missing path is a test failure, not an empty
+    // list. An assertion that cannot find what it is asserting about has not
+    // succeeded.
+    let defs = doc
+        .get("$defs")
+        .unwrap_or_else(|| panic!("json_schema emitter wrote no $defs:\n{json_schema}"));
+    let s = defs
+        .get("S")
+        .unwrap_or_else(|| panic!("no $defs entry for struct S:\n{json_schema}"));
+    let required: Vec<&str> = s
+        .get("required")
+        .unwrap_or_else(|| panic!("struct S has no `required` array:\n{json_schema}"))
         .as_array()
-        .or_else(|| doc["required"].as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-        .unwrap_or_default();
+        .unwrap_or_else(|| panic!("`required` is not an array:\n{json_schema}"))
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .unwrap_or_else(|| panic!("non-string in `required`:\n{json_schema}"))
+        })
+        .collect();
+
+    // The positive half: the check is looking at a populated array, so the
+    // negative assertion below cannot pass by finding nothing.
+    assert!(
+        required.contains(&"mode"),
+        "`mode` carries $Default but is still a required capnp field, so it \
+         must appear in `required`. If it does not, this lookup is inspecting \
+         the wrong thing and the assertion below proves nothing.\n\n\
+         required = {required:?}\n{json_schema}",
+    );
     assert!(
         !required.contains(&"curated"),
         "an $Optional field must not appear in the JSON Schema required array; \

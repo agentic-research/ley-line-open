@@ -30,7 +30,6 @@
 //!     "repository_source": "github",
 //!     "oci_image": "ghcr.io/org/thing",
 //!     "oci_version": "v1.2.3",
-//!     "oci_version": "v1.2.3",
 //!     "transport_type": "streamable-http",
 //!     "transport_url": "http://localhost:8384/mcp"
 //!   },

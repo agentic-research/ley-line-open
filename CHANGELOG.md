@@ -10,7 +10,28 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-07-28
+
 ### Changed — BREAKING
+
+
+- **`node_hash` is rewritten for bodyless trait signatures**
+  (`ley-line-open-25811f`, ADR-0034 D4). The `node_hash` preimage hashes
+  `canonical_kind(raw).unwrap_or(raw)`, and `function_signature_item` had no κ
+  arm — so its preimage carried the raw tree-sitter kind. It now carries
+  `function`, and every trait-signature `node_hash` changes with it.
+
+  **Impact:** a consumer that cached or pinned `node_hash` for a Rust trait
+  signature will see a different address after this release. Nothing else moves:
+  the fold, the domain tag `llo/ast/v1`, and every other kind are unchanged, so
+  hashes for all other nodes are byte-identical across the boundary.
+
+  `_meta.ir_schema_version` moves `merkle-ast-v1` → `merkle-ast-v2` to record
+  the lineage break. **Re-parse to obtain addresses under the new κ map.**
+
+  This is the general rule ADR-0034 D4 now states: `node_hash` durability is
+  conditional on the κ map and the tree-sitter grammar version, and any change
+  to either is a generation-lineage event rather than a silent reinterpretation.
 
 - **`Head.rootHash` now commits to the segment decomposition, not just to the
   concatenated bytes** (`ley-line-open-b64505`, ADR-0032 D2). The root was
@@ -35,7 +56,119 @@ context, scoping notes, and review history are recoverable.
   scheme tag is what makes any future change to this decomposition a `v2`
   rather than a silent reinterpretation.
 
+### Changed
+
+
+- **`nodes.record` is declared `TEXT`, not `JSON`** (`ley-line-open-f7966d`).
+  SQLite assigns column affinity by substring-matching the *declared* type.
+  `JSON` contains no affinity keyword, so it fell through to NUMERIC — and
+  NUMERIC coerces any string that looks like a number:
+
+  ```
+  '007'  ->  7        typeof = integer     length 3 -> 1
+  ```
+
+  Every AST leaf whose text was numeric-looking was silently rewritten on the
+  way in, and `leyline cdc enable` aborted on real corpora because of it.
+  Changed at all three canonical DDL sites in `leyline-schema`.
+
+  **Impact:** downstream repos pinning `leyline-schema` should move to this
+  release together with the binary. Stored values are unaffected for
+  non-numeric-looking tokens; numeric-looking tokens were already corrupted
+  under the old declaration and are correct after a re-parse.
+
+- **`node_defs` qualifies definitions by their full enclosing named-scope path**
+  (`ley-line-open-23377a`, ADR-0034 D1). Definitions were qualified by *receiver*
+  (impl type, trait, Go receiver, class) but never by enclosing named lexical
+  scope, so five languages emitted colliding bare tokens — seven distinct
+  `walk_and_insert` functions in LLO's own `refs.rs` shared one token.
+
+  Qualification now accumulates the whole ancestor chain, in each language's own
+  separator:
+
+  ```
+  rust    alpha::beta::f,  alpha::Handler::run
+  java    Outer1.Builder.build
+  cpp     alpha::helper,   geo::Shape::area
+  python  Outer1.Helper.run,  deco1.wrapper
+  ts      A.walk,  A.C.walk
+  go      unchanged — the only language already correct
+  ```
+
+  **Impact: additive.** `node_defs` is a many-to-one alias index, so qualified
+  rows are *added* and the bare aliases are preserved — every existing
+  unqualified `find_definition` keeps working. Consumers wanting a durable
+  address should key on `(source_id, qualified token)` per ADR-0034 D1.
+
+  Ruby, PHP, Kotlin, Scala and C# have no def extractor and emit no `node_defs`
+  rows at all; they are unaffected because they were never covered.
+
+- **`_meta.ir_schema_version` is now load-bearing, and moves to `merkle-ast-v2`**
+  (`ley-line-open-25811f`, ADR-0027 §Consequences, ADR-0034 D4). The marker was
+  **write-only** — `cmd_parse` set it and nothing read it, so the lineage break
+  it exists to announce was announced to nobody.
+
+  It now participates in the incremental-reuse guard alongside the
+  extraction/injection/query-set epochs, with the semantics those already
+  document: **any disagreement — including the missing row every pre-marker
+  arena has — disables the mtime+size unchanged-skip and forces full
+  re-derivation.** Absence reads as stale, not as current.
+
+  **Impact:** the first parse after upgrading re-derives every file, once. That
+  is intended — it is how addresses under the previous κ map are replaced rather
+  than silently retained. Consumers now have a programmatic way to ask whether
+  cached `node_hash` values are comparable, which did not exist before.
+
+  New gate `f8_ir_schema_version_invalidation` pins the behaviour from both
+  sides: mutation-verified to fail on under-invalidation (no guard) *and* on
+  over-invalidation (a guard that never matches, which would silently disable
+  the incremental fast path).
+
+- **ADR-0027 and ADR-0034 move from Proposed to Accepted.** LLO has committed to
+  being mache's storage/presentation substrate — LLO is the data plane — and
+  consumers pin against these contracts, so they no longer stand as drafts.
+
+### Added
+
+
+- **ADR-0034 — construct identity is a content/address pair.** `node_hash`
+  answers *what is this code* durably; nothing answered *which one do I mean*.
+  Records that ADR-0027 deleted the location-keyed `symbol_id` correctly (its
+  preimage hashed the whole-file content hash, so any edit anywhere in a file
+  rewrote every `symbol_id` in it) but never scoped a replacement. Fixes the
+  address as `(source_id, qualified token)`, names the emitter as the single
+  canonicalization authority, and states `node_hash`'s durability conditions.
+
+- **`docs/problems/symbol-identity.md`** — the problem decomposition behind
+  ADR-0034, with a 38-row evidence matrix. Each claim carries its verification
+  method and a ref pinned to a commit, and verdicts distinguish what was
+  measured here from what a consumer reported and what remains unverified.
+
+- **`leyline_core::partition`** (`ley-line-open-b67a73`, ADR-0032) — the tagged
+  fold over a declared decomposition. Domain separation via `new_derive_key`
+  and length-prefixed fields, so an address commits to its decomposition rather
+  than to the concatenation of its parts. No hash-algorithm field, deliberately:
+  multiformats-style agility is an anti-feature under a locked σ.
+
+- **ADR-0032 — declared decompositions** (`ley-line-open-ef5c1d`). Records that
+  the substrate's roots are incommensurable rather than merely unlinked, that no
+  root homomorphism can exist, and that cross-structure binding is therefore
+  co-attestation with re-derivable consistency.
+
 ### Fixed
+
+
+- **Bodyless trait signatures carry `canonical_kind = 'function'`, not NULL**
+  (`ley-line-open-25811f`). `function_signature_item` had no arm in the Rust κ
+  match and fell through to `None`. NULL was doubly wrong:
+  `idx_defs_canonical_kind` is a *partial* index (`WHERE canonical_kind IS NOT
+  NULL`), so those rows left the index entirely; and NULL is also the documented
+  pre-migration escape, so a consumer could not distinguish an old projection
+  from a trait signature.
+
+  Rust was the outlier, not the precedent — C folds a prototype and its
+  definition both to `function`, Java's `abstract void run()` yields `method`,
+  and a TS interface's `walk(): void` yields `method`.
 
 - **CDC GC reclaims chunks pinned by dead manifests** (`ley-line-open-b5e56f`)
   — `collect_unreachable_chunks` deleted only from `content_chunks` and read
@@ -55,19 +188,6 @@ context, scoping notes, and review history are recoverable.
   is amended rather than grandfathered. Restriction keys are not persisted
   outside the crate, so this invalidates in-memory cache entries and migrates
   nothing.
-
-### Added
-
-- **`leyline_core::partition`** (`ley-line-open-b67a73`, ADR-0032) — the tagged
-  fold over a declared decomposition. Domain separation via `new_derive_key`
-  and length-prefixed fields, so an address commits to its decomposition rather
-  than to the concatenation of its parts. No hash-algorithm field, deliberately:
-  multiformats-style agility is an anti-feature under a locked σ.
-
-- **ADR-0032 — declared decompositions** (`ley-line-open-ef5c1d`). Records that
-  the substrate's roots are incommensurable rather than merely unlinked, that no
-  root homomorphism can exist, and that cross-structure binding is therefore
-  co-attestation with re-derivable consistency.
 
 ## [0.10.4] — 2026-07-26
 

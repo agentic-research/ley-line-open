@@ -1,6 +1,6 @@
 # ADR-0034 — Construct identity is a pair: `node_hash` (content) + qualified token (address)
 
-**Status:** Proposed (2026-07-27)
+**Status:** Accepted (2026-07-27)
 **Bead:** `ley-line-open-2037b4`
 **Problem decomposition:** [`docs/problems/symbol-identity.md`](../problems/symbol-identity.md) — 38-row evidence matrix, refs pinned to `abd5b86`
 **Related:**

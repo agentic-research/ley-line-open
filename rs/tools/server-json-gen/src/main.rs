@@ -93,10 +93,17 @@ fn main() -> Result<()> {
         version: VERSION,
         repository_url: "https://github.com/agentic-research/ley-line-open.git",
         repository_source: "github",
-        oci_image: OCI_IMAGE,
-        oci_version: &oci_version,
-        transport_type: "streamable-http",
-        transport_url: "http://localhost:8384/mcp",
+        // LLO ships one image, which serves MCP. Producers shipping several —
+        // or none that speak MCP — declare more entries or omit `transport`
+        // (`ley-line-open-44cc45`).
+        packages: vec![leyline_mcp_descriptor::PackageMeta {
+            oci_image: OCI_IMAGE,
+            oci_version: &oci_version,
+            transport: Some(leyline_mcp_descriptor::TransportMeta {
+                typ: "streamable-http",
+                url: "http://localhost:8384/mcp",
+            }),
+        }],
     };
 
     print!(

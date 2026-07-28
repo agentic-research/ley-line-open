@@ -68,7 +68,7 @@
 use std::io::Read;
 
 use anyhow::{Context, Result};
-use leyline_mcp_descriptor::{GroupRef, ServerMeta, ToolRef, render};
+use leyline_mcp_descriptor::{GroupRef, PackageMeta, ServerMeta, ToolRef, TransportMeta, render};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -85,10 +85,28 @@ struct MetaIn {
     version: String,
     repository_url: String,
     repository_source: String,
+    /// One entry per published artifact. A producer shipping two images
+    /// (notme: `notme` and `notme-proxy`) declares two.
+    packages: Vec<PackageIn>,
+}
+
+#[derive(Deserialize)]
+struct PackageIn {
     oci_image: String,
     oci_version: String,
-    transport_type: String,
-    transport_url: String,
+    /// Omit for a package that does not serve MCP. Absent is meaningful:
+    /// cloister derives session behaviour from `packages[].transport.type`, so
+    /// a placeholder would make it generate backends for tools that do not
+    /// exist.
+    #[serde(default)]
+    transport: Option<TransportIn>,
+}
+
+#[derive(Deserialize)]
+struct TransportIn {
+    #[serde(rename = "type")]
+    typ: String,
+    url: String,
 }
 
 #[derive(Deserialize)]
@@ -111,10 +129,19 @@ fn main() -> Result<()> {
         version: &d.meta.version,
         repository_url: &d.meta.repository_url,
         repository_source: &d.meta.repository_source,
-        oci_image: &d.meta.oci_image,
-        oci_version: &d.meta.oci_version,
-        transport_type: &d.meta.transport_type,
-        transport_url: &d.meta.transport_url,
+        packages: d
+            .meta
+            .packages
+            .iter()
+            .map(|p| PackageMeta {
+                oci_image: &p.oci_image,
+                oci_version: &p.oci_version,
+                transport: p.transport.as_ref().map(|t| TransportMeta {
+                    typ: &t.typ,
+                    url: &t.url,
+                }),
+            })
+            .collect(),
     };
     let tools: Vec<ToolRef<'_>> = d.tools.iter().map(|t| ToolRef { name: t }).collect();
     let groups: Vec<GroupRef<'_>> = d

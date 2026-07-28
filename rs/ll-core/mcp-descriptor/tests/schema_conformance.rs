@@ -34,7 +34,9 @@
 //! - `SCHEMA_URL` bumped to a release that has not been vendored, so the
 //!   document claims conformance to a spec the gate cannot read.
 
-use leyline_mcp_descriptor::{GroupRef, SCHEMA_URL, ServerMeta, ToolRef, render};
+use leyline_mcp_descriptor::{
+    GroupRef, PackageMeta, SCHEMA_URL, ServerMeta, ToolRef, TransportMeta, render,
+};
 
 /// Vendored copy of the registry schema named by [`SCHEMA_URL`].
 fn vendored_schema() -> (String, serde_json::Value) {
@@ -75,10 +77,14 @@ fn llo_meta() -> ServerMeta<'static> {
         version: "0.12.0",
         repository_url: "https://github.com/agentic-research/ley-line-open.git",
         repository_source: "github",
-        oci_image: "ghcr.io/agentic-research/ley-line-open",
-        oci_version: "v0.12.0",
-        transport_type: "streamable-http",
-        transport_url: "http://localhost:8384/mcp",
+        packages: vec![PackageMeta {
+            oci_image: "ghcr.io/agentic-research/ley-line-open",
+            oci_version: "v0.12.0",
+            transport: Some(TransportMeta {
+                typ: "streamable-http",
+                url: "http://localhost:8384/mcp",
+            }),
+        }],
     }
 }
 
@@ -203,7 +209,10 @@ fn a_non_http_transport_url_is_rejected_by_the_schema() {
     // `url` pattern is `^https?://[^\s]+$`, so a Unix socket cannot be
     // advertised in server.json at all.
     let mut meta = llo_meta();
-    meta.transport_url = "unix:///run/leyline/mcp.sock";
+    meta.packages[0].transport = Some(TransportMeta {
+        typ: "streamable-http",
+        url: "unix:///run/leyline/mcp.sock",
+    });
 
     let tools = [ToolRef { name: "query" }];
     let groups = [GroupRef {
@@ -221,4 +230,160 @@ fn a_non_http_transport_url_is_rejected_by_the_schema() {
         "a `unix:` transport url must fail schema validation — if this passes, \
          the gate is not actually validating anything\n\n{rendered}",
     );
+}
+
+// ── Multi-package and non-MCP producers (`ley-line-open-44cc45`) ────────────
+//
+// Fixtures are notme's REAL descriptor shape, not one invented here. notme
+// publishes two OCI images from a single `v*` tag and serves no MCP at all —
+// it is an identity authority, and its own `_meta` note says declaring a
+// transport "would be worse than omitting it: cloister would generate backends
+// for tools that do not exist."
+//
+// Using the real shape matters: an invented fixture would have quietly assumed
+// LLO's conventions, and the point of this change is that other producers do
+// not share them.
+
+/// notme: two images, one version, no MCP transport, no cloister groups.
+fn notme_meta() -> ServerMeta<'static> {
+    ServerMeta {
+        name: "io.github.agentic-research/notme",
+        description: "Self-hostable identity authority.",
+        version: "0.1.0-rc3",
+        repository_url: "https://github.com/agentic-research/notme",
+        repository_source: "github",
+        packages: vec![
+            PackageMeta {
+                oci_image: "ghcr.io/agentic-research/notme",
+                // NOT `v`-prefixed. notme pushes `:0.1.0-rc3` from a `v0.1.0-rc3`
+                // tag; LLO pushes `v0.12.0`. Both satisfy ADR-0041, whose real
+                // invariant is "matches the tag actually pushed" — this crate
+                // must not impose either convention on the other.
+                oci_version: "0.1.0-rc3",
+                transport: None,
+            },
+            PackageMeta {
+                oci_image: "ghcr.io/agentic-research/notme-proxy",
+                oci_version: "0.1.0-rc3",
+                transport: None,
+            },
+        ],
+    }
+}
+
+#[test]
+fn a_transportless_package_is_refused_because_the_schema_requires_transport() {
+    // notme's real shape: two images, no MCP. The MCP schema lists `transport`
+    // in Package.required, so this CANNOT render to a schema-valid document —
+    // and notme's own committed server.json, which omits it on both packages,
+    // is invalid against the schema its `$schema` key declares.
+    //
+    // The emitter refuses rather than emitting a file that fails its own
+    // declared spec. That is a real spec limitation surfaced loudly, not a
+    // missing feature: the MCP schema has no way to describe a producer that
+    // publishes images and serves no MCP.
+    let err = render(&notme_meta(), &[], &[]).expect_err(
+        "a transport-less package must be refused, not silently emitted as \
+         schema-invalid JSON",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("packages[0]") && msg.contains("Package.required"),
+        "the error must name the offending package AND why the schema forbids \
+         it, or the reader cannot tell this is a spec conflict rather than a \
+         bug here; got: {msg}",
+    );
+}
+
+#[test]
+fn two_packages_that_both_serve_mcp_render_and_validate() {
+    // The multi-package half of ley-line-open-44cc45, which IS expressible:
+    // repeated packages[] entries, each with its own transport. mache's case
+    // (stdio + streamable-http) is this shape — the schema has `transport` as
+    // a single object, so two transports are two PACKAGES.
+    let mut meta = notme_meta();
+    for (i, p) in meta.packages.iter_mut().enumerate() {
+        p.transport = Some(TransportMeta {
+            typ: "streamable-http",
+            url: if i == 0 {
+                "http://localhost:9000/mcp"
+            } else {
+                "http://localhost:9001/mcp"
+            },
+        });
+    }
+    let rendered = render(&meta, &[], &[]).expect("render");
+    let doc: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+
+    let pkgs = doc["packages"].as_array().expect("packages array");
+    assert_eq!(pkgs.len(), 2, "both packages must render\n\n{rendered}");
+    assert_eq!(pkgs[0]["identifier"], "ghcr.io/agentic-research/notme");
+    assert_eq!(
+        pkgs[1]["identifier"],
+        "ghcr.io/agentic-research/notme-proxy"
+    );
+    assert_eq!(pkgs[0]["transport"]["url"], "http://localhost:9000/mcp");
+    assert_eq!(pkgs[1]["transport"]["url"], "http://localhost:9001/mcp");
+
+    // Not `v`-prefixed: notme pushes `:0.1.0-rc3`, LLO pushes `v0.12.0`. The
+    // invariant is "matches the tag actually pushed", so this crate must not
+    // impose either convention.
+    assert_eq!(pkgs[0]["version"], "0.1.0-rc3");
+
+    assert!(
+        doc.get("_meta").is_none(),
+        "with no groups there is no cloister surface; an empty \
+         `art.cloister/v1` block would claim one\n\n{rendered}",
+    );
+
+    let errors = validate(&doc);
+    assert!(
+        errors.is_empty(),
+        "a multi-package MCP producer must satisfy the pinned schema:\n  {}\n\n{rendered}",
+        errors.join("\n  "),
+    );
+}
+
+/// notme's shape, but with transports so the per-package checks below are
+/// reached — otherwise the transport refusal fires first and masks them.
+fn mcp_serving_two_package_meta() -> ServerMeta<'static> {
+    let mut m = notme_meta();
+    for p in m.packages.iter_mut() {
+        p.transport = Some(TransportMeta {
+            typ: "streamable-http",
+            url: "http://localhost:9000/mcp",
+        });
+    }
+    m
+}
+
+#[test]
+fn every_package_is_validated_not_just_the_first() {
+    // The failure that would matter in practice: a SECOND package smuggling a
+    // tagged identifier past a check that only looked at packages[0]. That is
+    // the gap that made check-image-versions.ts necessary downstream.
+    let mut meta = mcp_serving_two_package_meta();
+    meta.packages[1].oci_image = "ghcr.io/agentic-research/notme-proxy:0.1.0-rc3";
+    let err = render(&meta, &[], &[]).expect_err("a tagged identifier must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("packages[1]"),
+        "the error must name WHICH package is wrong, or a multi-package producer \
+         cannot tell which line to fix; got: {msg}",
+    );
+
+    let mut meta = mcp_serving_two_package_meta();
+    meta.packages[1].oci_version = "";
+    let err = render(&meta, &[], &[]).expect_err("an empty version must be rejected");
+    assert!(err.to_string().contains("packages[1]"), "got: {}", err);
+}
+
+#[test]
+fn a_descriptor_with_no_packages_is_rejected() {
+    // Nothing to derive `<identifier>:<version>` from — the v0.11.2 failure
+    // with the address absent rather than malformed.
+    let mut meta = notme_meta();
+    meta.packages.clear();
+    let err = render(&meta, &[], &[]).expect_err("no packages must be rejected");
+    assert!(err.to_string().contains("no packages"), "got: {}", err);
 }

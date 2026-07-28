@@ -57,14 +57,29 @@ pub struct ServerMeta<'a> {
     pub repository_url: &'a str,
     /// Forge identifier, e.g. `"github"`.
     pub repository_source: &'a str,
+    /// The OCI packages this producer publishes. **At least one.**
+    ///
+    /// A list, not a single image, because real producers ship more than one:
+    /// notme publishes `notme` and `notme-proxy` from one `v*` tag
+    /// (`ley-line-open-44cc45`). The MCP schema models this as repeated
+    /// `packages[]` entries — `transport` on a package is a single object, not
+    /// an array, so two transports are also two packages rather than one
+    /// package with a transport list.
+    pub packages: Vec<PackageMeta<'a>>,
+}
+
+/// One published artifact: its address, its tag, and how (or whether) it
+/// speaks MCP.
+#[derive(Debug, Clone)]
+pub struct PackageMeta<'a> {
     /// OCI image path, **without tag or digest**.
     ///
     /// cloister ADR-0041: *"`identifier` is the registry path with no tag and
-    /// no digest"*. This field is named `oci_image` rather than `identifier`
-    /// so the constraint is legible at the call site, and [`render`] rejects a
-    /// value carrying `:` or `@` — see `ley-line-open-04300f`, where LLO
-    /// emitted a tagged identifier for an image it never published while mache
-    /// complied and asserted the rule in a test.
+    /// no digest"*. Named `oci_image` rather than `identifier` so the
+    /// constraint is legible at the call site, and [`render`] rejects a value
+    /// carrying `:` or `@` — see `ley-line-open-04300f`, where LLO emitted a
+    /// tagged identifier for an image it never published while mache complied
+    /// and asserted the rule in a test.
     pub oci_image: &'a str,
     /// The image tag, carried as a SIBLING of [`Self::oci_image`] rather than
     /// baked into it.
@@ -73,17 +88,33 @@ pub struct ServerMeta<'a> {
     /// rule builds the image as `<identifier>:<version>`, so an identifier that
     /// already carried a tag would yield `repo:1.2.3:1.2.3` — which is why
     /// ADR-0041 requires the address alone. But removing the tag WITHOUT this
-    /// field leaves an address that derives to nothing, which is strictly worse
-    /// than the violation it replaced. `ley-line-open-04300f` shipped exactly
-    /// that in v0.11.2.
+    /// field leaves an address that derives to nothing, strictly worse than the
+    /// violation it replaced. `ley-line-open-04300f` shipped exactly that in
+    /// v0.11.2.
     ///
-    /// ADR-0041: *"`version` is the human tag, and MUST match the git tag the
-    /// publish job ran against and the `server.json` `version`."* LLO's tags are
-    /// `v`-prefixed, and mache — the compliant reference — emits `v0.19.0`.
+    /// The invariant is that this MUST equal the tag the publish job actually
+    /// pushes — NOT that it carries any particular prefix. LLO pushes
+    /// `v0.12.0` and emits `v0.12.0`; notme pushes `0.1.0-rc3` and emits
+    /// `0.1.0-rc3`. Both are correct, and this crate must not impose either
+    /// convention on the other.
     pub oci_version: &'a str,
+    /// How this package serves MCP, or `None` when it does not serve MCP.
+    ///
+    /// `None` is a first-class case, not a degenerate one. notme is an identity
+    /// authority with no MCP tools; its own descriptor says declaring a
+    /// transport there *"would be worse than omitting it: cloister would
+    /// generate backends for tools that do not exist."* A producer that ships
+    /// images and no MCP server is ordinary, and the emitter must be able to
+    /// say so.
+    pub transport: Option<TransportMeta<'a>>,
+}
+
+/// How a package serves MCP.
+#[derive(Debug, Clone, Copy)]
+pub struct TransportMeta<'a> {
     /// e.g. `"streamable-http"`.
-    pub transport_type: &'a str,
-    pub transport_url: &'a str,
+    pub typ: &'a str,
+    pub url: &'a str,
 }
 
 /// A tool the server registers. Only the name participates in coverage.
@@ -111,8 +142,8 @@ struct ServerDoc<'a> {
     version: &'a str,
     repository: Repository<'a>,
     packages: Vec<Package<'a>>,
-    #[serde(rename = "_meta")]
-    meta: Meta<'a>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    meta: Option<Meta<'a>>,
 }
 
 #[derive(Serialize)]
@@ -127,7 +158,12 @@ struct Package<'a> {
     registry_type: &'a str,
     identifier: &'a str,
     version: &'a str,
-    transport: Transport<'a>,
+    // Omitted entirely when the package serves no MCP. An empty or
+    // placeholder transport would be worse than absence: cloister derives
+    // session behaviour from `packages[].transport.type`, and a present-but-
+    // meaningless one makes it generate backends for tools that do not exist.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transport: Option<Transport<'a>>,
     #[serde(rename = "environmentVariables")]
     environment_variables: Vec<()>,
 }
@@ -187,24 +223,76 @@ pub fn render(
     tools: &[ToolRef<'_>],
     groups: &[GroupRef<'_>],
 ) -> Result<String> {
-    if meta.oci_image.contains(':') || meta.oci_image.contains('@') {
+    // A descriptor with no packages names no artifact, so `<identifier>:<version>`
+    // derives from nothing. That is the v0.11.2 failure with the address absent
+    // rather than malformed.
+    if meta.packages.is_empty() {
         bail!(
-            "oci_image `{}` carries a tag or digest; cloister ADR-0041 requires the \
-             registry path alone. A tagged identifier promises an image that must then \
-             be published under exactly that tag, and fails at compose up rather than \
-             at resolve when it is not.",
-            meta.oci_image,
+            "no packages declared. A descriptor exists so a consumer can derive \
+             `<identifier>:<version>` (cloister ADR-0038); with no packages there is \
+             nothing to derive and the file describes an artifact that cannot be \
+             fetched.",
         );
     }
 
-    if meta.oci_version.is_empty() {
-        bail!(
-            "oci_version is empty. Rejecting a tagged identifier without requiring \
-             the version that replaces it enforces half of cloister ADR-0041: the \
-             derive rule is `<identifier>:<version>`, so an address with no version \
-             resolves to nothing — strictly worse than the tag it replaced. \
-             `ley-line-open-04300f` shipped that in v0.11.2.",
-        );
+    // Per-entry, not once. Checking only the first would let a second package
+    // carry a tagged identifier through — which is exactly the shape
+    // check-image-versions.ts already guards downstream, and the reason notme
+    // could not adopt this crate (`ley-line-open-44cc45`).
+    for (i, pkg) in meta.packages.iter().enumerate() {
+        if pkg.oci_image.contains(':') || pkg.oci_image.contains('@') {
+            bail!(
+                "packages[{i}].oci_image `{}` carries a tag or digest; cloister \
+                 ADR-0041 requires the registry path alone. A tagged identifier \
+                 promises an image that must then be published under exactly that \
+                 tag, and fails at compose up rather than at resolve when it is not.",
+                pkg.oci_image,
+            );
+        }
+
+        if pkg.oci_version.is_empty() {
+            bail!(
+                "packages[{i}].oci_version is empty. Rejecting a tagged identifier \
+                 without requiring the version that replaces it enforces half of \
+                 cloister ADR-0041: the derive rule is `<identifier>:<version>`, so \
+                 an address with no version resolves to nothing — strictly worse \
+                 than the tag it replaced. `ley-line-open-04300f` shipped that in \
+                 v0.11.2.",
+            );
+        }
+
+        // The MCP registry schema lists `transport` in `Package.required`:
+        //
+        //     Package.required = ["registryType", "identifier", "transport"]
+        //
+        // So a package without one is INVALID against the very schema the
+        // document's `$schema` key declares. This crate will not emit a file
+        // that fails its own declared spec — that is the "well-formed but
+        // wrong" shape ley-line-open-891dd5 exists to prevent, and emitting it
+        // silently would be worse than refusing.
+        //
+        // This is a real spec limitation, not an oversight here: the MCP
+        // schema has no way to describe a producer that publishes images and
+        // serves no MCP. notme is such a producer, and its own descriptor says
+        // the file "exists for the ADR-0041 image-publish contract … not an
+        // MCP registry entry" — which is precisely the case the schema cannot
+        // express. Its committed server.json omits `transport` on both
+        // packages and is therefore schema-invalid today.
+        //
+        // Resolving that needs an ecosystem decision (a package-identity
+        // manifest distinct from an MCP registry entry), not a quiet
+        // workaround here. Tracked on `ley-line-open-44cc45`.
+        if pkg.transport.is_none() {
+            bail!(
+                "packages[{i}] (`{}`) declares no transport, but the MCP registry \
+                 schema lists `transport` in Package.required — the emitted file \
+                 would fail the schema its own `$schema` key names. The MCP schema \
+                 cannot describe a producer that publishes images and serves no \
+                 MCP; that needs a package-identity manifest distinct from an MCP \
+                 registry entry. See `ley-line-open-44cc45`.",
+                pkg.oci_image,
+            );
+        }
     }
 
     let mut owner: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -272,27 +360,40 @@ pub fn render(
             url: meta.repository_url,
             source: meta.repository_source,
         },
-        packages: vec![Package {
-            registry_type: "oci",
-            identifier: meta.oci_image,
-            version: meta.oci_version,
-            transport: Transport {
-                typ: meta.transport_type,
-                url: meta.transport_url,
-            },
-            environment_variables: vec![],
-        }],
-        meta: Meta {
-            art_cloister_v1: ArtCloisterV1 {
-                groups: groups
-                    .iter()
-                    .map(|g| GroupOut {
-                        name: g.name,
-                        advertised_prefix: g.advertised_prefix,
-                        upstream_names: g.upstream_names.clone(),
-                    })
-                    .collect(),
-            },
+        packages: meta
+            .packages
+            .iter()
+            .map(|p| Package {
+                registry_type: "oci",
+                identifier: p.oci_image,
+                version: p.oci_version,
+                transport: p.transport.map(|t| Transport {
+                    typ: t.typ,
+                    url: t.url,
+                }),
+                environment_variables: vec![],
+            })
+            .collect(),
+        // Omitted entirely when the producer declares no groups. An empty
+        // `art.cloister/v1` block would advertise a cloister surface that does
+        // not exist; notme's own descriptor makes the point — declaring one
+        // there would make cloister "generate backends for tools that do not
+        // exist." Absence is the correct signal, not an empty object.
+        meta: if groups.is_empty() {
+            None
+        } else {
+            Some(Meta {
+                art_cloister_v1: ArtCloisterV1 {
+                    groups: groups
+                        .iter()
+                        .map(|g| GroupOut {
+                            name: g.name,
+                            advertised_prefix: g.advertised_prefix,
+                            upstream_names: g.upstream_names.clone(),
+                        })
+                        .collect(),
+                },
+            })
         },
     };
 
@@ -312,10 +413,14 @@ mod tests {
             version: "1.2.3",
             repository_url: "https://github.com/example/thing.git",
             repository_source: "github",
-            oci_image: "ghcr.io/example/thing",
-            oci_version: "v1.2.3",
-            transport_type: "streamable-http",
-            transport_url: "http://localhost:1234/mcp",
+            packages: vec![PackageMeta {
+                oci_image: "ghcr.io/example/thing",
+                oci_version: "v1.2.3",
+                transport: Some(TransportMeta {
+                    typ: "streamable-http",
+                    url: "http://localhost:1234/mcp",
+                }),
+            }],
         }
     }
 
@@ -412,7 +517,7 @@ mod tests {
     #[test]
     fn empty_oci_version_is_rejected() {
         let mut m = meta();
-        m.oci_version = "";
+        m.packages[0].oci_version = "";
         let err = render(&m, &[ToolRef { name: "a" }], &[group("g", "g_", vec!["a"])])
             .unwrap_err()
             .to_string();
@@ -442,7 +547,7 @@ mod tests {
             "ghcr.io/example/thing@sha256:abc",
         ] {
             let mut m = meta();
-            m.oci_image = bad;
+            m.packages[0].oci_image = bad;
             let err = render(&m, &[ToolRef { name: "a" }], &[group("g", "g_", vec!["a"])])
                 .unwrap_err()
                 .to_string();

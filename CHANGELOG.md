@@ -10,6 +10,62 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.11.2] — 2026-07-28
+
+### Fixed
+
+- **Overloaded symbols no longer overwrite each other** (`ley-line-open-5d3cb6`).
+  The LSP walk keyed `_lsp` on `{parent_id}/{name}`, so C++ and TypeScript
+  overloads — and TS declaration merging — collided by construction and
+  `INSERT OR REPLACE` kept only the last. Measured against real servers: clangd
+  emitted 3 `DocumentSymbol`s for 3 overloads of `add` and **one row survived**.
+  `insert_node` is itself `INSERT OR REPLACE`, so the canonical `nodes`
+  projection collapsed them by the same mechanism.
+
+  Addresses are now built in two tiers. **δ** — the server's `detail`, e.g.
+  `long (long, long)` — separates *discernible* overloads, so reordering them in
+  a file leaves every address unchanged. A **cohort ordinal** applies only where
+  δ cannot separate, i.e. byte-identical twins, where an impossibility result
+  forces it: inserting an identical copy above or below yields the same file
+  byte-for-byte, so no snapshot-local function can distinguish the two positions.
+
+  Singletons keep the bare `{parent}/{name}`; every language that cannot
+  overload is untouched.
+
+  **Impact:** consumers reading `_lsp` or `nodes` for an overload-bearing
+  language get one row per overload where they previously got one row total.
+  The CLI also now reports when symbols collected exceed rows written, rather
+  than printing a count of what the *server* returned and writing fewer.
+
+### Added
+
+- **MCP over a Unix domain socket** (`ley-line-open-6569de`) — `--mcp-uds <PATH>`,
+  independent of `--mcp-port`. The socket is created mode `0600` and carries the
+  same ADR-0022 token gate as the TCP listener, so `--mcp-no-auth` is not
+  required to use it. The daemon's `--control` socket carries the ops protocol,
+  not MCP, so this is the first MCP surface an attested caller can dial —
+  cloister reaches bundles over `AF_UNIX` through notme-proxy.
+
+- **`leyline-mcp-descriptor`** (`ley-line-open-4ec276`) — the `server.json`
+  emitter as a shared crate, so producers stop reimplementing it. What it shares
+  is the coverage enforcement, not the structs: every registered tool must be
+  claimed by exactly one group, and orphans, ghosts, and double-claims are hard
+  errors. A manifest advertising a tool the server does not register fails at the
+  consumer, not at build.
+
+### Changed — BREAKING for registry consumers
+
+- **`server.json`'s OCI identifier is tagless** (`ley-line-open-04300f`). It read
+  `ghcr.io/agentic-research/ley-line-open:<version>` — a tag, for an image LLO
+  does not build and never pushes. cloister ADR-0041 requires "the registry path
+  with no tag and no digest"; mache complied and asserted it in a test, LLO did
+  not. `leyline-mcp-descriptor` now rejects a tagged or digest-pinned identifier
+  outright, so no adopter can inherit it.
+
+  **Impact:** anything resolving that identifier expecting a version-pinned tag
+  must now resolve the path and select a tag itself. Publishing the image at all
+  remains open against ADR-0041's own Opens.
+
 ## [0.11.1] — 2026-07-28
 
 ### Fixed

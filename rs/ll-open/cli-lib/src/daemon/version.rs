@@ -54,6 +54,23 @@ pub const SCHEMA_VERSION: &str = "0.11.0";
 /// client's expectations, even though both predate this constant — the
 /// op didn't exist then, so the mismatch surfaced as silent
 /// `parseUint64`-returns-0 drift instead of a clean handshake failure.
+/// The `node_hash` ADDRESS LINEAGE this binary produces, published on the
+/// version handshake and in `compatibility.json` (bead `ley-line-open-348de6`).
+///
+/// `node_hash`'s preimage carries the canonical κ kind, so a change to the κ
+/// map — or to a tree-sitter grammar that renames productions — rewrites
+/// addresses for byte-identical sources. `_meta.ir_schema_version` records that
+/// inside a projection, which is enough for LLO's own incremental guard but
+/// useless to a consumer that reads the projection and never re-parses.
+///
+/// v0.11.0 crossed `merkle-ast-v1` -> `merkle-ast-v2` with no consumer-facing
+/// channel at all. This is that channel. A consumer memoizing on `node_hash`
+/// compares this against the lineage it cached under; a mismatch means its
+/// cached addresses are not comparable and must be discarded.
+///
+/// Bump lives in `cmd_parse::IR_SCHEMA_VERSION`, which re-exports this.
+pub const IR_SCHEMA_VERSION: &str = "merkle-ast-v2";
+
 pub const WIRE_FORMAT_MAJOR: u32 = 1;
 
 /// Earliest schema-client version compatible with this daemon binary.

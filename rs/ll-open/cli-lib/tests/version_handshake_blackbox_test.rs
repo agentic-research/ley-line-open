@@ -151,6 +151,22 @@ async fn version_op_returns_known_shape() {
         "the supported public daemon/wire API must carry the release version",
     );
 
+    // `ir_schema_version` — the node_hash ADDRESS LINEAGE (bead
+    // ley-line-open-348de6). Without it on this surface a consumer that
+    // memoizes on node_hash has no channel to learn the lineage moved: the
+    // marker lives in `_meta.ir_schema_version` inside a projection, readable
+    // only by someone who already has one open. v0.11.0 crossed
+    // merkle-ast-v1 -> merkle-ast-v2 with no way for mache — which pins an
+    // older release and memoizes on node_hash — to detect it.
+    let ir = resp
+        .get("ir_schema_version")
+        .and_then(|v| v.as_str())
+        .expect("ir_schema_version must be a string on the version handshake");
+    assert_eq!(
+        ir, "merkle-ast-v2",
+        "the handshake must publish the address lineage this binary produces",
+    );
+
     // `wire_format_major` — JSON number (UInt32, not stringified).
     let wfm = resp
         .get("wire_format_major")

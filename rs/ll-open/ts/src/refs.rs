@@ -356,7 +356,7 @@ pub fn extract_rust(
         && let Some(name_node) = node.child_by_field_name("name")
         && let Ok(name) = name_node.utf8_text(source)
         && !name.is_empty()
-        && let Some(recv) = rust_impl_receiver(node, source)
+        && let Some(recv) = enclosing_scope_path(node, source, RUST_SCOPES, "::")
     {
         out.push(ExtractedRef::Def {
             token: format!("{recv}::{name}"),
@@ -513,41 +513,120 @@ fn collect_use_list_child(
     }
 }
 
-/// When `func_node` (a `function_item` / `function_signature_item`) is
-/// nested inside an `impl_item` or `trait_item`, return the receiver's
-/// text. Returns `None` when the parent chain doesn't match the
-/// `function_item → declaration_list → impl_item|trait_item` shape (bare
-/// top-level function, function nested inside another function, etc.).
+/// Accumulate the enclosing **named-scope path** for `node`, per ADR-0034 D1
+/// (bead `ley-line-open-23377a`).
 ///
-/// Bead `ley-line-open-caf423`. tree-sitter-rust's `impl_item` node has
-/// a `type` field carrying the impl'd type (e.g. `S` in `impl S {…}` or
-/// `Vec<u8>` in `impl Vec<u8> {…}`). `trait_item` carries a `name` field
-/// with the trait's identifier (e.g. `Greet` in `trait Greet {…}`). For
-/// impl blocks we take the raw type text — a generics-bearing type
-/// qualifies as `Vec<u8>::foo`, which is the least-surprising round-trip.
-/// For trait blocks the receiver is the trait name itself so a default
-/// method `hello` inside `trait Greet` qualifies as `Greet::hello`,
-/// mirroring the docstring claim on `extract_rust`.
-#[cfg(feature = "rust")]
-fn rust_impl_receiver(func_node: &Node, source: &[u8]) -> Option<String> {
-    let list = func_node.parent()?;
-    if list.kind() != "declaration_list" {
+/// Walks the whole ancestor chain rather than one level. That distinction is
+/// the entire bug: receivers do not nest, so one level was complete for
+/// `impl`/`class`; lexical scopes *do* nest, so one level was never enough for
+/// `mod` / `namespace` / nested types / nested defs. Measured before this
+/// landed: Java, Python, C++, Rust and TS all emitted colliding bare tokens;
+/// only Go was clean.
+///
+/// `scopes` is the per-language policy, as `(node kind, name field)` pairs, and
+/// carries the judgement calls:
+///
+/// - Rust omits `function_item`, so a function-local item stays bare — matching
+///   the pre-existing behaviour, where a nested `fn` was deliberately *not*
+///   qualified by its enclosing method.
+/// - Python includes `function_definition`, because a nested `def` is the
+///   common case (every decorator makes one) and two decorators in one module
+///   otherwise collide on `wrapper`.
+///
+/// Anonymous scopes contribute **no segment** rather than a placeholder
+/// (ADR-0034 D1): a placeholder would be a naming rule consumers must learn,
+/// which is exactly what that decision avoids. Same for a scope whose name
+/// field is absent or empty — skipped, not substituted.
+///
+/// Returns `None` when no named scope encloses `node`, so callers emit the bare
+/// token alone.
+fn enclosing_scope_path(
+    node: &Node,
+    source: &[u8],
+    scopes: &[(&str, &str)],
+    sep: &str,
+) -> Option<String> {
+    let mut segments: Vec<String> = Vec::new();
+    let mut cursor = node.parent();
+    while let Some(ancestor) = cursor {
+        if let Some((_, field)) = scopes.iter().find(|(kind, _)| *kind == ancestor.kind())
+            && let Some(name_node) = ancestor.child_by_field_name(field)
+            && let Ok(name) = name_node.utf8_text(source)
+            && !name.is_empty()
+        {
+            segments.push(name.to_string());
+        }
+        cursor = ancestor.parent();
+    }
+    if segments.is_empty() {
         return None;
     }
-    let container = list.parent()?;
-    let field = match container.kind() {
-        "impl_item" => "type",
-        "trait_item" => "name",
-        _ => return None,
-    };
-    let recv_node = container.child_by_field_name(field)?;
-    let recv = recv_node.utf8_text(source).ok()?;
-    if recv.is_empty() {
-        None
-    } else {
-        Some(recv.to_string())
-    }
+    segments.reverse();
+    Some(segments.join(sep))
 }
+
+/// Rust scope-bearing kinds. `impl_item` carries its receiver on the `type`
+/// field (`Vec<u8>` in `impl Vec<u8>`), `trait_item` and `mod_item` on `name`.
+#[cfg(feature = "rust")]
+const RUST_SCOPES: &[(&str, &str)] = &[
+    ("mod_item", "name"),
+    ("impl_item", "type"),
+    ("trait_item", "name"),
+];
+
+/// Java scope-bearing kinds — nested types. Anonymous-class bodies hang off
+/// `object_creation_expression`, which has no `name` field, so they contribute
+/// no segment (ADR-0034 D1) and their methods emit bare.
+#[cfg(feature = "java")]
+const JAVA_SCOPES: &[(&str, &str)] = &[
+    ("class_declaration", "name"),
+    ("interface_declaration", "name"),
+    ("enum_declaration", "name"),
+    ("record_declaration", "name"),
+];
+
+/// C++ scope-bearing kinds. `namespace_definition` is the one the previous
+/// one-level helper could not reach at all — it only matched in-class members,
+/// so every in-namespace free function emitted bare. An ANONYMOUS namespace has
+/// no `name` field and therefore contributes no segment, per ADR-0034 D1.
+#[cfg(feature = "cpp")]
+const CPP_SCOPES: &[(&str, &str)] = &[
+    ("namespace_definition", "name"),
+    ("class_specifier", "name"),
+    ("struct_specifier", "name"),
+    ("union_specifier", "name"),
+];
+
+/// Python scope-bearing kinds. `function_definition` IS included, unlike Rust:
+/// a nested `def` is the common case — every decorator makes one — so two
+/// decorators in a module would otherwise both emit bare `wrapper`.
+#[cfg(feature = "python")]
+const PYTHON_SCOPES: &[(&str, &str)] = &[
+    ("class_definition", "name"),
+    ("function_definition", "name"),
+];
+
+/// JS/TS scope-bearing kinds. TS `namespace` lowers to `internal_module` —
+/// nothing qualified by it before, so two namespaces each exporting `walk` were
+/// indistinguishable. Harmless for plain JS, which has no `internal_module`.
+#[cfg(any(feature = "javascript", feature = "typescript"))]
+const JS_TS_SCOPES: &[(&str, &str)] = &[
+    ("internal_module", "name"),
+    ("class_declaration", "name"),
+    ("abstract_class_declaration", "name"),
+];
+
+// `rust_impl_receiver` lived here (bead `ley-line-open-caf423`). It matched the
+// exact `function_item → declaration_list → impl_item|trait_item` shape and so
+// returned exactly ONE level of receiver. `enclosing_scope_path` + `RUST_SCOPES`
+// subsumes it — `impl S { fn f }` still yields `S::f`, `trait Greet { fn hello }`
+// still yields `Greet::hello`, and a generics-bearing type still round-trips as
+// `Vec<u8>::foo` — while additionally accumulating `mod` ancestors, which is the
+// defect it could not express. All eight of its tests pass unchanged.
+//
+// `function_item` is deliberately absent from `RUST_SCOPES`, so a function-local
+// item stays bare — preserving the old behaviour, where a nested `fn` was not
+// qualified by its enclosing method.
 
 // ---------------------------------------------------------------------------
 // Python extractor
@@ -601,7 +680,7 @@ pub fn extract_python(
             if let Some(name_node) = node.child_by_field_name("name")
                 && let Ok(name) = name_node.utf8_text(source)
                 && !name.is_empty()
-                && let Some(cls) = python_enclosing_class(node, source)
+                && let Some(cls) = enclosing_scope_path(node, source, PYTHON_SCOPES, ".")
             {
                 out.push(ExtractedRef::Def {
                     token: format!("{cls}.{name}"),
@@ -677,28 +756,12 @@ pub fn extract_python(
     out
 }
 
-/// Return the enclosing `class_definition`'s name when `func_node` (a
-/// `function_definition`) is a method. Returns `None` for module-level
-/// functions or functions nested inside other functions. Bead
-/// `ley-line-open-caf423`.
-#[cfg(feature = "python")]
-fn python_enclosing_class(func_node: &Node, source: &[u8]) -> Option<String> {
-    // function_definition → block → class_definition
-    let block = func_node.parent()?;
-    if block.kind() != "block" {
-        return None;
-    }
-    let cls = block.parent()?;
-    if cls.kind() != "class_definition" {
-        return None;
-    }
-    let name = cls.child_by_field_name("name")?.utf8_text(source).ok()?;
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
-    }
-}
+// `python_enclosing_class` lived here (bead `ley-line-open-caf423`). It matched
+// `function_definition → block → class_definition` and returned ONE level, so a
+// method in a nested class, and a `def` nested in a `def`, both lost their outer
+// scope. `enclosing_scope_path` + `PYTHON_SCOPES` subsumes it and accumulates the
+// full path — including `function_definition`, because every decorator creates a
+// nested `def` and two of them otherwise collide on a bare `wrapper`.
 
 // ---------------------------------------------------------------------------
 // JavaScript extractor
@@ -773,7 +836,7 @@ fn js_ts_context_fixups(
 ) {
     match node.kind() {
         "method_definition" => {
-            let Some(cls) = js_ts_enclosing_class(node, source) else {
+            let Some(cls) = enclosing_scope_path(node, source, JS_TS_SCOPES, ".") else {
                 return;
             };
             // The engine's only method_definition pattern emits exactly
@@ -798,6 +861,34 @@ fn js_ts_context_fixups(
             };
             out.insert(0, qualified);
         }
+        // A `function_declaration` inside a named scope. The engine's `.scm`
+        // emits exactly one bare-name def for it; this prepends the qualified
+        // form, matching the dual-emit order used by `method_definition` above.
+        // A top-level function has no enclosing named scope, so
+        // `enclosing_scope_path` returns None and nothing is added.
+        "function_declaration" => {
+            let Some(scope) = enclosing_scope_path(node, source, JS_TS_SCOPES, ".") else {
+                return;
+            };
+            let Some(ExtractedRef::Def {
+                token,
+                node_id,
+                source_id,
+                container_node_id,
+                ..
+            }) = out.first()
+            else {
+                return;
+            };
+            let qualified = ExtractedRef::Def {
+                token: format!("{scope}.{token}"),
+                node_id: node_id.clone(),
+                source_id: source_id.clone(),
+                container_node_id: container_node_id.clone(),
+                canonical_kind: ts_lang.canonical_kind(node.kind()),
+            };
+            out.insert(0, qualified);
+        }
         "lexical_declaration" | "variable_declaration" => {
             for r in out {
                 if let ExtractedRef::Def { canonical_kind, .. } = r {
@@ -809,28 +900,11 @@ fn js_ts_context_fixups(
     }
 }
 
-/// Enclosing class name for a `method_definition`:
-/// `method_definition` → `class_body` → `class_declaration` |
-/// `abstract_class_declaration`. Object-literal and class-expression
-/// methods return `None` — they emit bare-name defs only. Bead
-/// `ley-line-open-caf423`.
-#[cfg(any(feature = "javascript", feature = "typescript"))]
-fn js_ts_enclosing_class(method_node: &Node, source: &[u8]) -> Option<String> {
-    let body = method_node.parent()?;
-    if body.kind() != "class_body" {
-        return None;
-    }
-    let cls = body.parent()?;
-    if cls.kind() != "class_declaration" && cls.kind() != "abstract_class_declaration" {
-        return None;
-    }
-    let name = cls.child_by_field_name("name")?.utf8_text(source).ok()?;
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
-    }
-}
+// `js_ts_enclosing_class` lived here. It matched `method_definition → class_body
+// → class_declaration` — one level — so a class inside a TS `namespace` lost the
+// namespace, and a `function_declaration` inside one was never qualified at all.
+// `enclosing_scope_path` + `JS_TS_SCOPES` subsumes it and adds the
+// `function_declaration` arm above.
 
 // ---------------------------------------------------------------------------
 // TypeScript extractor
@@ -922,7 +996,7 @@ pub fn extract_java(
         && let Some(name_node) = node.child_by_field_name("name")
         && let Ok(name) = name_node.utf8_text(source)
         && !name.is_empty()
-        && let Some(ty) = java_enclosing_type(node, source)
+        && let Some(ty) = enclosing_scope_path(node, source, JAVA_SCOPES, ".")
     {
         out.push(ExtractedRef::Def {
             token: format!("{ty}.{name}"),
@@ -947,46 +1021,12 @@ pub fn extract_java(
     out
 }
 
-/// Return the enclosing type declaration's name when `method_node` (a
-/// `method_declaration`) is a member. Two parent-chain shapes cover
-/// every body that can hold a method_declaration:
-///
-/// - `method_declaration → class_body|interface_body →
-///   class|interface|record_declaration` (a record's body is a
-///   `class_body`)
-/// - `method_declaration → enum_body_declarations → enum_body →
-///   enum_declaration`
-///
-/// Returns `None` when the chain doesn't match (anonymous-class bodies
-/// hang off `object_creation_expression`, which has no `name` field —
-/// those methods emit bare only). Bead `ley-line-open-5e21c2`.
-#[cfg(feature = "java")]
-fn java_enclosing_type(method_node: &Node, source: &[u8]) -> Option<String> {
-    let body = method_node.parent()?;
-    let decl = match body.kind() {
-        "class_body" | "interface_body" => body.parent()?,
-        "enum_body_declarations" => {
-            let enum_body = body.parent()?;
-            if enum_body.kind() != "enum_body" {
-                return None;
-            }
-            enum_body.parent()?
-        }
-        _ => return None,
-    };
-    if !matches!(
-        decl.kind(),
-        "class_declaration" | "interface_declaration" | "enum_declaration" | "record_declaration"
-    ) {
-        return None;
-    }
-    let name = decl.child_by_field_name("name")?.utf8_text(source).ok()?;
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
-    }
-}
+// `java_enclosing_type` lived here (bead `ley-line-open-5e21c2`). It matched one
+// level of `class_body`/`interface_body`/`enum_body_declarations`, so
+// `Outer1.Builder.build` and `Outer2.Builder.build` both emitted as
+// `Builder.build`. `enclosing_scope_path` + `JAVA_SCOPES` subsumes it. Anonymous
+// classes still emit bare: their bodies hang off `object_creation_expression`,
+// which has no `name` field, so they contribute no segment (ADR-0034 D1).
 
 // ---------------------------------------------------------------------------
 // C extractor
@@ -1078,8 +1118,8 @@ pub fn extract_cpp(
     if node.kind() == "function_declarator"
         && node
             .child_by_field_name("declarator")
-            .is_some_and(|d| d.kind() == "field_identifier")
-        && let Some(cls) = cpp_enclosing_class(node, source)
+            .is_some_and(|d| matches!(d.kind(), "field_identifier" | "identifier"))
+        && let Some(cls) = enclosing_scope_path(node, source, CPP_SCOPES, "::")
         && let Some(ExtractedRef::Def {
             token,
             node_id,
@@ -1100,43 +1140,13 @@ pub fn extract_cpp(
     out
 }
 
-/// Return the enclosing class/struct/union name when `decl_node` (a
-/// `function_declarator` naming a field_identifier) is an in-class
-/// member. Two parent-chain shapes:
-///
-/// - inline definition: `function_declarator → function_definition →
-///   field_declaration_list → class_specifier|struct_specifier|…`
-/// - declaration only: `function_declarator → field_declaration →
-///   field_declaration_list → …`
-///
-/// Returns `None` when the chain doesn't match (anonymous classes have
-/// no `name` field; lambdas and function pointers never reach here —
-/// their declarators aren't field_identifiers). Bead
-/// `ley-line-open-5e21c2`.
-#[cfg(feature = "cpp")]
-fn cpp_enclosing_class(decl_node: &Node, source: &[u8]) -> Option<String> {
-    let member = decl_node.parent()?;
-    if !matches!(member.kind(), "function_definition" | "field_declaration") {
-        return None;
-    }
-    let body = member.parent()?;
-    if body.kind() != "field_declaration_list" {
-        return None;
-    }
-    let cls = body.parent()?;
-    if !matches!(
-        cls.kind(),
-        "class_specifier" | "struct_specifier" | "union_specifier"
-    ) {
-        return None;
-    }
-    let name = cls.child_by_field_name("name")?.utf8_text(source).ok()?;
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
-    }
-}
+// `cpp_enclosing_class` lived here. It required the in-class member shape
+// (`field_declaration_list` → `class_specifier`), so it could not see
+// `namespace_definition` at all and every in-namespace free function emitted
+// bare. `enclosing_scope_path` + `CPP_SCOPES` subsumes it; the call site's
+// declarator guard now admits `identifier` as well as `field_identifier` so
+// namespace-level free functions qualify, while out-of-line definitions
+// (`qualified_identifier`) stay excluded as before.
 
 // ---------------------------------------------------------------------------
 // SQL extractor
@@ -1562,6 +1572,29 @@ mod java_tests {
             .collect()
     }
 
+    /// ADR-0034 D1 / bead `ley-line-open-23377a`. Java nested types ARE named
+    /// in-file scopes, so `Outer1.Builder.build` and `Outer2.Builder.build`
+    /// must be distinguishable. This bead's ORIGINAL acceptance criteria
+    /// required "Go/Java/C emission byte-identical", i.e. mandated preserving
+    /// this bug; corrected after the collision was measured.
+    #[test]
+    fn defs_qualify_by_nested_type_path() {
+        let src = b"class Outer1 { static class Builder { void build() {} } }\nclass Outer2 { static class Builder { void build() {} } }\n";
+        let (conn, tree) = parse_java(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let defs = all_defs(&conn);
+        for want in &["Outer1.Builder.build", "Outer2.Builder.build"] {
+            assert!(
+                defs.contains(&want.to_string()),
+                "missing qualified {want}: {defs:?}"
+            );
+        }
+        assert!(
+            defs.contains(&"build".to_string()),
+            "bare alias must be preserved: {defs:?}"
+        );
+    }
+
     #[test]
     fn extract_type_defs() {
         // All four Java type-declaration shapes emit defs.
@@ -1911,11 +1944,41 @@ mod cpp_tests {
             .collect()
     }
 
+    /// ADR-0034 D1 / bead `ley-line-open-23377a`. In-namespace definitions
+    /// emitted bare, so two namespaces with the same helper collided.
+    /// Anonymous namespaces contribute NO segment (D1) rather than a
+    /// placeholder.
+    #[test]
+    fn defs_qualify_by_enclosing_namespace() {
+        let src = b"namespace alpha { int helper() { return 1; } }\nnamespace beta { int helper() { return 2; } }\n";
+        let (conn, tree) = parse_cpp(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let defs = all_defs(&conn);
+        for want in &["alpha::helper", "beta::helper"] {
+            assert!(
+                defs.contains(&want.to_string()),
+                "missing qualified {want}: {defs:?}"
+            );
+        }
+        assert!(
+            defs.contains(&"helper".to_string()),
+            "bare alias must be preserved: {defs:?}"
+        );
+    }
+
     #[test]
     fn extract_class_namespace_and_inclass_method_defs() {
         // Class + struct + namespace defs, and in-class methods
         // (declaration `area();` AND inline definition `draw() {}`)
-        // dual-emit `Class::method` + `method`.
+        // dual-emit the qualified form + the bare alias.
+        //
+        // The qualified form is the FULL scope path as of ADR-0034 D1 / bead
+        // `ley-line-open-23377a`. This test previously asserted `Shape::area`,
+        // which was the one-level output of `cpp_enclosing_class` — it stopped
+        // at the class and dropped the enclosing `namespace geo`. That is the
+        // defect the bead exists to fix, so the expectation is updated rather
+        // than preserved: two namespaces each containing a `Shape::area` were
+        // indistinguishable under the old form.
         let src = b"namespace geo {\nclass Shape { public: double area(); void draw() {} };\nstruct Box { int v; };\n}\n";
         let (conn, tree) = parse_cpp(src);
         walk_and_insert(tree.root_node(), src, &conn, "");
@@ -1924,9 +1987,9 @@ mod cpp_tests {
             "geo",
             "Shape",
             "Box",
-            "Shape::area",
+            "geo::Shape::area",
             "area",
-            "Shape::draw",
+            "geo::Shape::draw",
             "draw",
         ] {
             assert!(
@@ -2115,6 +2178,43 @@ mod rust_tests {
         );
     }
 
+    /// ADR-0034 D1 / bead `ley-line-open-23377a`. Seven distinct
+    /// `walk_and_insert` functions in this very file share one bare token
+    /// because `mod` never qualified. Nested scopes accumulate with the
+    /// language's own separator; the bare alias is always preserved, since
+    /// `node_defs` is a many-to-one alias index and unqualified lookup
+    /// depends on those rows.
+    #[test]
+    fn defs_qualify_by_enclosing_module_path() {
+        let src = b"mod a { mod b { fn f() {} } fn f() {} }\nmod c { fn f() {} }\n";
+        let (conn, tree) = parse_rust(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let defs = all_defs(&conn);
+        for want in &["a::b::f", "a::f", "c::f"] {
+            assert!(
+                defs.contains(&want.to_string()),
+                "missing qualified {want}: {defs:?}"
+            );
+        }
+        assert!(
+            defs.contains(&"f".to_string()),
+            "bare alias must be preserved: {defs:?}"
+        );
+    }
+
+    /// A receiver nested inside a module carries BOTH scopes, in order.
+    #[test]
+    fn defs_compose_module_path_with_receiver() {
+        let src = b"mod alpha { struct H; impl H { fn run(&self) {} } }\n";
+        let (conn, tree) = parse_rust(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let defs = all_defs(&conn);
+        assert!(
+            defs.contains(&"alpha::H::run".to_string()),
+            "module path must compose with receiver: {defs:?}"
+        );
+    }
+
     #[test]
     fn extract_type_kind_defs() {
         let src = b"struct S;\nenum E { A, B }\ntrait T { fn x(&self); }\ntype Alias = u32;\nconst K: u32 = 1;\nstatic S2: u32 = 2;\nmod m { fn inner() {} }\n";
@@ -2250,6 +2350,171 @@ mod rust_tests {
         assert!(
             refs.contains(&("helper".to_string(), None)),
             "bare call must carry NULL qualifier; got {refs:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "python")]
+mod python_tests {
+    use super::*;
+    use crate::schema::{create_ast_schema, create_refs_schema};
+    use rusqlite::Connection;
+    use tree_sitter::Parser;
+
+    fn parse_py(src: &[u8]) -> (Connection, tree_sitter::Tree) {
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_schema(&conn).unwrap();
+        create_refs_schema(&conn).unwrap();
+        let mut parser = Parser::new();
+        let lang: tree_sitter::Language = tree_sitter_python::LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        (conn, tree)
+    }
+
+    fn walk_and_insert(node: tree_sitter::Node, src: &[u8], conn: &Connection, prefix: &str) {
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                let child = cursor.node();
+                if child.is_named() {
+                    let id = format!("{prefix}/{}", child.kind());
+                    let refs = extract_python(&child, src, &id, "test.py", None);
+                    insert_extracted_refs(conn, &refs).unwrap();
+                    walk_and_insert(child, src, conn, &id);
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn all_defs(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT token FROM node_defs ORDER BY token")
+            .unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        rows.filter_map(Result::ok).collect()
+    }
+
+    /// ADR-0034 D1 / bead `ley-line-open-23377a`. Nested classes: `Outer1.Helper`
+    /// and `Outer2.Helper` are different types, so their `run` methods must be
+    /// distinguishable. The previous one-level helper emitted `Helper.run` for
+    /// both.
+    #[test]
+    fn defs_qualify_by_nested_class_path() {
+        let src = b"class Outer1:\n    class Helper:\n        def run(self): pass\nclass Outer2:\n    class Helper:\n        def run(self): pass\n";
+        let (conn, tree) = parse_py(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let defs = all_defs(&conn);
+        for want in &["Outer1.Helper.run", "Outer2.Helper.run"] {
+            assert!(
+                defs.contains(&want.to_string()),
+                "missing qualified {want}: {defs:?}"
+            );
+        }
+        assert!(
+            defs.contains(&"run".to_string()),
+            "bare alias must be preserved: {defs:?}"
+        );
+    }
+
+    /// Nested `def` is why `function_definition` is in `PYTHON_SCOPES` and not
+    /// in `RUST_SCOPES`: every decorator creates one, so two decorators in a
+    /// module would otherwise both emit a bare `wrapper` and collide.
+    #[test]
+    fn defs_qualify_nested_defs_so_decorators_do_not_collide() {
+        let src = b"def deco1(fn):\n    def wrapper(): pass\n    return wrapper\ndef deco2(fn):\n    def wrapper(): pass\n    return wrapper\n";
+        let (conn, tree) = parse_py(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let defs = all_defs(&conn);
+        for want in &["deco1.wrapper", "deco2.wrapper"] {
+            assert!(
+                defs.contains(&want.to_string()),
+                "missing qualified {want}: {defs:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "typescript")]
+mod ts_tests {
+    use super::*;
+    use crate::schema::{create_ast_schema, create_refs_schema};
+    use rusqlite::Connection;
+    use tree_sitter::Parser;
+
+    fn parse_ts(src: &[u8]) -> (Connection, tree_sitter::Tree) {
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_schema(&conn).unwrap();
+        create_refs_schema(&conn).unwrap();
+        let mut parser = Parser::new();
+        let lang: tree_sitter::Language = tree_sitter_typescript::LANGUAGE_TSX.into();
+        parser.set_language(&lang).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        (conn, tree)
+    }
+
+    fn walk_and_insert(node: tree_sitter::Node, src: &[u8], conn: &Connection, prefix: &str) {
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                let child = cursor.node();
+                if child.is_named() {
+                    let id = format!("{prefix}/{}", child.kind());
+                    let refs = extract_typescript(&child, src, &id, "test.ts", None);
+                    insert_extracted_refs(conn, &refs).unwrap();
+                    walk_and_insert(child, src, conn, &id);
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn all_defs(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT token FROM node_defs ORDER BY token")
+            .unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        rows.filter_map(Result::ok).collect()
+    }
+
+    /// ADR-0034 D1 / bead `ley-line-open-23377a`. TS `namespace` lowers to
+    /// `internal_module`, which nothing qualified by — so two namespaces
+    /// each exporting `walk` were indistinguishable.
+    #[test]
+    fn defs_qualify_by_enclosing_namespace() {
+        let src = b"namespace A { export function walk() {} }\nnamespace B { export function walk() {} }\n";
+        let (conn, tree) = parse_ts(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let defs = all_defs(&conn);
+        for want in &["A.walk", "B.walk"] {
+            assert!(
+                defs.contains(&want.to_string()),
+                "missing qualified {want}: {defs:?}"
+            );
+        }
+        assert!(
+            defs.contains(&"walk".to_string()),
+            "bare alias must be preserved: {defs:?}"
+        );
+    }
+
+    /// A class method inside a namespace carries both scopes.
+    #[test]
+    fn defs_compose_namespace_with_class() {
+        let src = b"namespace A { export class C { walk() {} } }\n";
+        let (conn, tree) = parse_ts(src);
+        walk_and_insert(tree.root_node(), src, &conn, "");
+        let defs = all_defs(&conn);
+        assert!(
+            defs.contains(&"A.C.walk".to_string()),
+            "namespace must compose with class: {defs:?}"
         );
     }
 }

@@ -66,6 +66,44 @@ if [ -n "${HEADER_SOURCE:-}" ]; then
     cp "$HEADER_SOURCE" "$OUTPUT_DIR/leyline_fs.h"
 fi
 
+# Generator binaries (ley-line-open-e44960 sibling gap).
+#
+# LLO ships generators that downstream repos RUN — the capnp plugins cloister
+# invokes via `task cluster:zod`, the tooldefs plugin rosary uses, and the
+# mcp-descriptor emitter. Until now none were published, so consumers had to
+# SHA-pin a git dep and `cargo build` a build tool from source. v0.11.3 shipped
+# the `8c00c6` zod fix and cloister still could not obtain it from the release:
+# "released" and "deliverable" were different statements.
+#
+# Every named binary MUST exist. A missing one aborts the release rather than
+# quietly shipping a smaller asset set — a partial publish is exactly the
+# silent-success failure this whole change exists to remove.
+if [ -n "${GENERATOR_BINS:-}" ]; then
+    : "${GENERATOR_SOURCE_DIR:?GENERATOR_SOURCE_DIR is required with GENERATOR_BINS}"
+    : "${GENERATOR_SUFFIX:?GENERATOR_SUFFIX is required with GENERATOR_BINS}"
+    for generator_bin in $GENERATOR_BINS; do
+        generator_src="$GENERATOR_SOURCE_DIR/$generator_bin"
+        if [ ! -f "$generator_src" ]; then
+            echo "generator binary not built: $generator_src" >&2
+            echo "run 'task release:generators:target' for this BUILD_TARGET" >&2
+            exit 1
+        fi
+        generator_asset="$generator_bin-$GENERATOR_SUFFIX"
+        case "$generator_asset" in
+            *[!A-Za-z0-9._-]*)
+                echo "unsafe generator asset name: $generator_asset" >&2
+                exit 1
+                ;;
+        esac
+        if [ -e "$OUTPUT_DIR/$generator_asset" ]; then
+            echo "release asset names would collide: $generator_asset" >&2
+            exit 1
+        fi
+        cp "$generator_src" "$OUTPUT_DIR/$generator_asset"
+        chmod +x "$OUTPUT_DIR/$generator_asset"
+    done
+fi
+
 manifest_tmp="$OUTPUT_DIR/.SHA256SUMS.tmp.$$"
 manifest_unsorted="$OUTPUT_DIR/.SHA256SUMS.unsorted.$$"
 trap 'rm -f "$manifest_tmp" "$manifest_unsorted"' 0 1 2 15

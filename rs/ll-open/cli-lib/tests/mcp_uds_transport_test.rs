@@ -20,60 +20,12 @@
 //! would pass a happy-path-only test while shipping an open surface, which is
 //! precisely the shape of `ley-line-open-2607d2`.
 
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-
-use leyline_cli_lib::daemon::{
-    DaemonContext, DaemonState, EventRouter, NoExt, sheaf_ops::SheafState,
-};
-use leyline_core::{Controller, create_arena};
-
-/// Same shape as `event_push_blackbox_test.rs`'s helper, deliberately — a
-/// regression in shared daemon bring-up should surface in both files at once
-/// rather than in whichever happens to run first.
-fn build_ctx(dir: &Path) -> Arc<DaemonContext> {
-    use parking_lot::{Mutex, RwLock};
-
-    let arena_path = dir.join("uds.arena");
-    let ctrl_path = dir.join("uds.ctrl");
-    let _mmap = create_arena(&arena_path, 2 * 1024 * 1024).expect("create arena");
-    let mut ctrl = Controller::open_or_create(&ctrl_path).expect("open ctrl");
-    ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024)
-        .expect("set arena");
-    drop(ctrl);
-
-    let router = EventRouter::new(16);
-    let sheaf = Arc::new(SheafState::new());
-    sheaf.set_emitter(router.emitter());
-    let live_db_path = ctrl_path.with_extension("live.db");
-    let live_db = leyline_cli_lib::daemon::db_pool::LiveDb::open_fresh_for_test(&live_db_path);
-
-    Arc::new(DaemonContext {
-        ctrl_path,
-        ext: Arc::new(NoExt),
-        router,
-        live_db,
-        enrich_inflight: Arc::new(Mutex::new(std::collections::HashSet::new())),
-        source_dir: None,
-        lang_filter: None,
-        enrichment_passes: vec![],
-        state: Arc::new(RwLock::new(DaemonState::initializing())),
-        #[cfg(feature = "vec")]
-        vec_index: {
-            leyline_cli_lib::daemon::vec_index::register_vec();
-            Arc::new(leyline_cli_lib::daemon::vec_index::VectorIndex::new(4, None).unwrap())
-        },
-        #[cfg(feature = "vec")]
-        embedder: Arc::new(leyline_cli_lib::daemon::embed::ZeroEmbedder { dim: 4 }),
-        #[cfg(feature = "vec")]
-        embed_queue: Arc::new(Mutex::new(std::collections::BinaryHeap::new())),
-        #[cfg(feature = "text-search")]
-        text_search: Arc::new(leyline_text_search::null::NullEngine::new()),
-        sheaf,
-    })
-}
 
 /// Minimal HTTP/1.1 POST over an already-connected UDS. Written by hand
 /// because the point is to prove a RAW socket client works — the same thing
@@ -124,12 +76,14 @@ fn mcp_tools_list_completes_over_uds_with_the_token_gate_enabled() {
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _guard = rt.enter();
-    let ctx = build_ctx(tmp.path());
+    let ctx = common::daemon_context(tmp.path());
     leyline_cli_lib::daemon::mcp::spawn_uds(ctx, sock.clone(), Some(Arc::new(token.clone())))
         .expect("spawn MCP over uds");
 
-    // Give the listener a moment to accept.
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    // Poll the real condition rather than sleeping a fixed interval — a
+    // wall-clock sleep as a stop condition races the scheduler and flakes under
+    // load with nothing actually broken (`sleep_in_tests`).
+    drop(common::wait_for_uds(&sock, 10_000));
 
     assert!(
         sock.exists(),

@@ -668,12 +668,7 @@ impl JsonRpcResponse {
 // Server entry point
 // ---------------------------------------------------------------------------
 
-/// Spawn the MCP HTTP server bound to `bind:port`. Returns a join
-/// handle so the caller can keep it alive (or `.abort()` it on shutdown).
-///
-/// `bind` defaults to `127.0.0.1` for callers passing `None`. Container
-/// deployments need `0.0.0.0` so docker port-forwarding can reach the
-//// Build the MCP router with the ADR-0022 token gate applied.
+/// Build the MCP router with the ADR-0022 token gate applied.
 ///
 /// Shared by every transport. That sharing is the point, not a tidiness win: if
 /// each listener wired its own middleware, a new transport could ship without
@@ -748,7 +743,12 @@ pub fn spawn_uds(
     Ok(handle)
 }
 
-// listener — a host-side `-p host:8384` only proxies to the container's
+/// Spawn the MCP HTTP server bound to `bind:port`. Returns a join
+/// handle so the caller can keep it alive (or `.abort()` it on shutdown).
+///
+/// `bind` defaults to `127.0.0.1` for callers passing `None`. Container
+/// deployments need `0.0.0.0` so docker port-forwarding can reach the
+/// listener — a host-side `-p host:8384` only proxies to the container's
 /// external interfaces, not to the container's loopback.
 ///
 /// **Security:** the MCP wire has no auth (see the module docstring's

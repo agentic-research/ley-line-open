@@ -51,11 +51,29 @@ make_source "$tmp_dir/leyline" '#!/bin/sh'
 chmod +x "$tmp_dir/leyline"
 make_source "$tmp_dir/libleyline_fs.a" 'staticlib'
 make_source "$tmp_dir/leyline_fs.h" 'header'
+
+# Generator binaries (ley-line-open-e44960). This list must match the one
+# release.yml passes as GENERATOR_BINS and the one
+# `task release:generators:target` builds; tools/release-assets.txt asserts the
+# resulting `<bin>-<suffix>` names, so all three agreeing is what this fixture
+# proves. Fabricated here because the fixture must not depend on a real cargo
+# build — the property under test is the STAGING contract, not the compiler.
+GENERATOR_BINS='capnpc-schema-bridge-zod capnpc-schema-bridge-go capnpc-schema-bridge-jsonschema capnpc-schema-bridge-tooldefs leyline-mcp-descriptor'
+export GENERATOR_BINS
+mkdir -p "$tmp_dir/generators"
+for generator_bin in $GENERATOR_BINS; do
+    make_source "$tmp_dir/generators/$generator_bin" '#!/bin/sh'
+    chmod +x "$tmp_dir/generators/$generator_bin"
+done
+GENERATOR_SOURCE_DIR="$tmp_dir/generators"
+export GENERATOR_SOURCE_DIR
+
 mkdir -p "$tmp_dir/staged"
 
 OUTPUT_DIR="$tmp_dir/staged/leyline-linux-amd64" \
 CLI_SOURCE="$tmp_dir/leyline" \
 ASSET_NAME="leyline-linux-amd64" \
+GENERATOR_SUFFIX="linux-amd64" \
 LIB_ASSET="libleyline_fs-linux-amd64.a" \
 STATICLIB_SOURCE="$tmp_dir/libleyline_fs.a" \
 HEADER_SOURCE="$tmp_dir/leyline_fs.h" \
@@ -64,6 +82,7 @@ HEADER_SOURCE="$tmp_dir/leyline_fs.h" \
 OUTPUT_DIR="$tmp_dir/staged/leyline-linux-arm64" \
 CLI_SOURCE="$tmp_dir/leyline" \
 ASSET_NAME="leyline-linux-arm64" \
+GENERATOR_SUFFIX="linux-arm64" \
 LIB_ASSET="libleyline_fs-linux-arm64.a" \
 STATICLIB_SOURCE="$tmp_dir/libleyline_fs.a" \
     "$repo_root/tools/stage_release_artifacts.sh"
@@ -71,6 +90,7 @@ STATICLIB_SOURCE="$tmp_dir/libleyline_fs.a" \
 OUTPUT_DIR="$tmp_dir/staged/leyline-darwin-arm64" \
 CLI_SOURCE="$tmp_dir/leyline" \
 ASSET_NAME="leyline-darwin-arm64" \
+GENERATOR_SUFFIX="darwin-arm64" \
 LIB_ASSET="libleyline_fs-darwin-arm64.a" \
 STATICLIB_SOURCE="$tmp_dir/libleyline_fs.a" \
     "$repo_root/tools/stage_release_artifacts.sh"
@@ -78,6 +98,7 @@ STATICLIB_SOURCE="$tmp_dir/libleyline_fs.a" \
 OUTPUT_DIR="$tmp_dir/staged/leyline-darwin-amd64" \
 CLI_SOURCE="$tmp_dir/leyline" \
 ASSET_NAME="leyline-darwin-amd64" \
+GENERATOR_SUFFIX="darwin-amd64" \
     "$repo_root/tools/stage_release_artifacts.sh"
 
 publication="$tmp_dir/publication"

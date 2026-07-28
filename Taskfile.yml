@@ -383,6 +383,33 @@ tasks:
     cmds:
       - cargo build --release --lib -p leyline-fs --features cdc --target "{{.BUILD_TARGET}}"
 
+  release:generators:target:
+    desc: Build the generator binaries downstream repos invoke, for BUILD_TARGET
+    deps: [cache:sccache:install]
+    requires:
+      vars: [BUILD_TARGET]
+    dir: rs
+    # LLO ships generators that other repos RUN — capnp resolves `-o<plugin>`
+    # by PATH-searching `capnpc-<plugin>`, so cloister's `task cluster:zod` and
+    # rosary's tooldefs path both need these on disk. Publishing them means a
+    # consumer downloads a binary instead of SHA-pinning a git dep and building
+    # a build tool from source (`ley-line-open-e44960`).
+    #
+    # GENERATOR_BINS below is the SINGLE list: this task builds exactly it, and
+    # `release:artifacts:stage` ships exactly it. Adding a binary in one place
+    # and not the other is the drift this consolidation prevents.
+    cmds:
+      - >-
+        cargo build --release --target "{{.BUILD_TARGET}}"
+        -p leyline-schema-bridge
+        --bin capnpc-schema-bridge-zod
+        --bin capnpc-schema-bridge-go
+        --bin capnpc-schema-bridge-jsonschema
+        --bin capnpc-schema-bridge-tooldefs
+      - >-
+        cargo build --release --target "{{.BUILD_TARGET}}"
+        -p leyline-mcp-descriptor --bin leyline-mcp-descriptor
+
   release:artifacts:stage:
     desc: Stage one target's exact release outputs and SHA-256 manifest
     requires:
@@ -399,6 +426,15 @@ tasks:
       CLI_SOURCE: '{{.CLI_SOURCE | default .DEFAULT_CLI_SOURCE}}'
       LIB_ASSET: '{{.LIB_ASSET | default ""}}'
       INCLUDE_HEADER: '{{.INCLUDE_HEADER | default "false"}}'
+      # The generator binaries, staged as `<bin>-<suffix>` alongside the CLI.
+      # Empty by default so a caller that only wants the CLI is unaffected;
+      # release.yml sets it for every target. Same list as
+      # `release:generators:target` builds — see the comment there.
+      GENERATOR_BINS: '{{.GENERATOR_BINS | default ""}}'
+      GENERATOR_SOURCE_DIR: '{{.ROOT_DIR}}/rs/target/{{.BUILD_TARGET}}/release'
+      # `leyline-darwin-arm64` -> `darwin-arm64`, so a generator asset reads
+      # `capnpc-schema-bridge-zod-darwin-arm64` and matches the CLI's scheme.
+      GENERATOR_SUFFIX: '{{.GENERATOR_SUFFIX | default (trimPrefix "leyline-" .ASSET_NAME)}}'
     cmds:
       - |
         set -eu

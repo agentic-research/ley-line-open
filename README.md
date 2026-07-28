@@ -78,6 +78,37 @@ staticlibs, and the Apache-2.0 Go schema module at
 [releases/latest](https://github.com/agentic-research/ley-line-open/releases/latest)
 for assets and [GETTING-STARTED.md](GETTING-STARTED.md) for download commands.
 
+## Generator binaries
+
+LLO ships code generators that downstream repos **run**. Every release publishes
+them per platform, so consuming one is a download rather than a Rust build:
+
+| binary | what it emits |
+|---|---|
+| `capnpc-schema-bridge-zod` | capnp → zod TypeScript validators |
+| `capnpc-schema-bridge-go` | capnp → Go types |
+| `capnpc-schema-bridge-jsonschema` | capnp → JSON Schema |
+| `capnpc-schema-bridge-tooldefs` | capnp → MCP `tools/list` definitions |
+| `leyline-mcp-descriptor` | descriptor JSON → `server.json`, with coverage validation |
+
+```bash
+# capnp resolves `-o<plugin>` by PATH-searching `capnpc-<plugin>`, so the
+# schema-bridge assets must be installed under their unsuffixed names.
+curl -fsSLO https://github.com/agentic-research/ley-line-open/releases/download/v0.11.3/capnpc-schema-bridge-zod-darwin-arm64
+install -m 0755 capnpc-schema-bridge-zod-darwin-arm64 ~/.local/bin/capnpc-schema-bridge-zod
+```
+
+Verify against the release's `SHA256SUMS` before installing.
+
+The four `capnpc-*` binaries are capnp plugins. `leyline-mcp-descriptor` is a
+plain filter — descriptor JSON on stdin, `server.json` on stdout, exit 1 with
+**empty stdout** on failure, so `leyline-mcp-descriptor < in.json > server.json`
+cannot truncate a good artifact when validation fails.
+
+Prior releases published none of these, so consumers had to SHA-pin a git
+dependency and build a build-tool from source — which meant a fix could be
+*tagged* without being *obtainable* (`ley-line-open-e44960`).
+
 ## OCI image
 
 `task image` builds a local distroless OCI image tagged

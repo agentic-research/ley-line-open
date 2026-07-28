@@ -12,6 +12,30 @@ context, scoping notes, and review history are recoverable.
 
 ### Added
 
+- **Generator binaries are published with every release** (`ley-line-open-e44960`).
+  LLO ships five code generators that downstream repos *run* — the four capnp
+  plugins (`zod`, `go`, `jsonschema`, `tooldefs`) and `leyline-mcp-descriptor` —
+  and none of them were ever released. Consumers had to SHA-pin a git dependency
+  and `cargo build` a build-tool from source.
+
+  That gap had a concrete cost: v0.11.3 shipped the `8c00c6` zod fix and cloister
+  **still could not obtain it from the release** — they had to be told to move a
+  git rev from `e8a501ba` (v0.7.9) to the v0.11.3 commit. "Released" and
+  "deliverable" were different statements, which is the same shape as the OCI
+  address being well-formed but unpullable.
+
+  Now 20 assets (5 binaries × 4 targets) ship alongside the CLI, checksummed into
+  the same `SHA256SUMS`. `tools/release-assets.txt` asserts the exact set, so a
+  binary that fails to build **fails the release** rather than silently shipping
+  a smaller asset set — verified by removing one and confirming staging aborts
+  with the missing path named. Build cost is ~6.5s for all five, against ~52s for
+  the CLI alone.
+
+  **Not solved by this:** libraries. Consumers still SHA-pin `leyline-core` and
+  friends as git dependencies, and cargo cannot unify git deps at differing revs
+  — cloister had `leyline-core` resolving three times simultaneously. That needs
+  crates.io and is tracked separately (`ley-line-open-c3e8c6`).
+
 - **The OCI image `server.json` advertises is now actually published**
   (`ley-line-open-e44960`, found by cloister reviewing #288). `server.json`
   has named `ghcr.io/agentic-research/ley-line-open` since v0.8.0 and no

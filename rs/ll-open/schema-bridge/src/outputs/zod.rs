@@ -39,7 +39,7 @@ pub fn emit(schema: &Schema) -> Result<String> {
     }
 
     for s in &schema.structs {
-        emit_struct(&mut out, s)?;
+        emit_struct(&mut out, s, schema)?;
         writeln!(out).expect("write! to String is infallible");
     }
 
@@ -73,7 +73,7 @@ fn emit_enum(out: &mut String, e: &Enum) {
     .expect("write! to String is infallible");
 }
 
-fn emit_struct(out: &mut String, s: &Struct) -> Result<()> {
+fn emit_struct(out: &mut String, s: &Struct, schema: &Schema) -> Result<()> {
     // `z.lazy` lets struct refs forward-declare without a topological
     // sort. The cost is one extra closure per schema; the saving is
     // not having to detect cycles.
@@ -87,7 +87,7 @@ fn emit_struct(out: &mut String, s: &Struct) -> Result<()> {
     match (&s.fields[..], &s.union) {
         // Plain struct: no union.
         (fields, None) => {
-            emit_zod_object(out, "  ", fields, None);
+            emit_zod_object(out, "  ", fields, None, schema);
             writeln!(out, ");").expect("write! to String is infallible");
         }
         // Struct with an anonymous-inline union (`struct Foo {
@@ -96,7 +96,7 @@ fn emit_struct(out: &mut String, s: &Struct) -> Result<()> {
         // where each variant-object carries base fields + exactly one
         // variant field.
         (fields, Some(u)) if u.discriminant_name.is_none() => {
-            emit_zod_flat_union(out, "  ", fields, u);
+            emit_zod_flat_union(out, "  ", fields, u, schema);
             writeln!(out, ");").expect("write! to String is infallible");
         }
         // Struct with a named-group union — variants nest under the
@@ -105,7 +105,7 @@ fn emit_struct(out: &mut String, s: &Struct) -> Result<()> {
         // `"transport": { "uds": null }` for Void variants). Base
         // fields are siblings of that nested object.
         (fields, Some(u)) => {
-            emit_zod_object(out, "  ", fields, Some(u));
+            emit_zod_object(out, "  ", fields, Some(u), schema);
             writeln!(out, ");").expect("write! to String is infallible");
         }
     }
@@ -121,7 +121,13 @@ fn emit_struct(out: &mut String, s: &Struct) -> Result<()> {
 // wrapper), so the schema must accept any of N branches where each
 // branch is `{ ...baseFields, oneVariant: T }.strict()`. Per
 // cloister-77172d.
-fn emit_zod_flat_union(out: &mut String, indent: &str, base_fields: &[StructField], u: &Union) {
+fn emit_zod_flat_union(
+    out: &mut String,
+    indent: &str,
+    base_fields: &[StructField],
+    u: &Union,
+    schema: &Schema,
+) {
     writeln!(out, "{indent}z.union([").expect("write! to String is infallible");
     for variant in &u.variants {
         let inner_indent = format!("{indent}  ");
@@ -131,7 +137,7 @@ fn emit_zod_flat_union(out: &mut String, indent: &str, base_fields: &[StructFiel
                 out,
                 "{inner_indent}  {}: {},",
                 field.name,
-                render_field(field)
+                render_field(field, schema)
             )
             .expect("write! to String is infallible");
         }
@@ -153,10 +159,16 @@ fn emit_zod_flat_union(out: &mut String, indent: &str, base_fields: &[StructFiel
 // Per cloister-cf2e6a / skeptic N1: the schema-bridge is the boundary
 // where typos must become errors. Inner union variants ALSO use
 // `.strict()` (see `emit_zod_union` below).
-fn emit_zod_object(out: &mut String, indent: &str, fields: &[StructField], union: Option<&Union>) {
+fn emit_zod_object(
+    out: &mut String,
+    indent: &str,
+    fields: &[StructField],
+    union: Option<&Union>,
+    schema: &Schema,
+) {
     writeln!(out, "{indent}z.object({{").expect("write! to String is infallible");
     for field in fields {
-        let rendered = render_field(field);
+        let rendered = render_field(field, schema);
         writeln!(out, "{indent}  {}: {},", field.name, rendered)
             .expect("write! to String is infallible");
     }
@@ -271,8 +283,87 @@ fn render_ts_union(u: &Union) -> String {
     parts.join(" | ")
 }
 
-fn render_field(field: &StructField) -> String {
-    render_zod_type(&field.ty)
+// Absence-handling for a struct field, in the order the IR's own
+// annotations take precedence (ley-line-open-8c00c6).
+//
+// The emitter previously rendered the bare type and dropped both
+// `$Optional` and `$Default` on the floor — while json_schema.rs honoured
+// them (`filter(|f| !f.optional)`, and the `default` key). One IR producing
+// two artifacts that disagree about which fields may be absent is the
+// failure that generating both halves is supposed to make unrepresentable.
+//
+// The unannotated case is the load-bearing one. Every capnp scalar, enum and
+// list has an IMPLICIT default, which is the whole basis of ADR-0004's
+// append-only rule: a value written before a field was appended is still a
+// valid value of the new schema. Rendering such a field as required
+// contradicts the compatibility guarantee the schema header promises.
+fn render_field(field: &StructField, schema: &Schema) -> String {
+    let base = render_zod_type(&field.ty);
+
+    // `$Optional` is the curated required-subset escape (capnp itself has no
+    // optional fields). It says "absent is meaningful", so it must NOT be
+    // collapsed to a default value.
+    if field.optional {
+        return format!("{base}.optional()");
+    }
+
+    // `$Default(json)` is stored verbatim as valid JSON, which is also a
+    // valid TS literal for every value capnp can express here.
+    if let Some(explicit) = &field.default {
+        return format!("{base}.default({explicit})");
+    }
+
+    match capnp_implicit_default(&field.ty, schema) {
+        Some(implicit) => format!("{base}.default({implicit})"),
+        None => base,
+    }
+}
+
+// capnp's implicit default for a field type, rendered as a TS literal.
+//
+// `None` means "no defaulting applied", which is correct for exactly two
+// cases:
+//
+//   - `Void`. The zod rendering is already `z.void()`, which accepts
+//     `undefined`; wrapping it in a default would add nothing.
+//   - `StructRef`. capnp reads an absent struct pointer as an all-defaults
+//     struct, but there is no sound eager TS literal for that: zod's
+//     `.default(v)` does not re-parse `v`, so `.default({})` would hand the
+//     consumer a value its own TS interface says is impossible, and a
+//     lazily-parsed `.default(() => FooSchema.parse({}))` would not terminate
+//     for a self-referential struct. Appending a STRUCT field therefore
+//     remains a compatibility break; appending a scalar, enum or list — the
+//     overwhelmingly common case, and the one that broke cloister — does not.
+//     Tracked on ley-line-open-8c00c6 rather than guessed at here.
+fn capnp_implicit_default(t: &FieldType, schema: &Schema) -> Option<String> {
+    match t {
+        FieldType::Scalar(ScalarType::Void) => None,
+        FieldType::Scalar(ScalarType::Bool) => Some("false".to_owned()),
+        FieldType::Scalar(
+            ScalarType::Int8
+            | ScalarType::Int16
+            | ScalarType::Int32
+            | ScalarType::Int64
+            | ScalarType::UInt8
+            | ScalarType::UInt16
+            | ScalarType::UInt32
+            | ScalarType::UInt64
+            | ScalarType::Float32
+            | ScalarType::Float64,
+        ) => Some("0".to_owned()),
+        FieldType::Scalar(ScalarType::Text) => Some(r#""""#.to_owned()),
+        FieldType::Scalar(ScalarType::Data) => Some("new Uint8Array()".to_owned()),
+        // A capnp list defaults to empty, never to null.
+        FieldType::List(_) => Some("[]".to_owned()),
+        // An enum defaults to its ZEROTH enumerant. The IR keeps `variants`
+        // position-stable (variants[i] has capnp ordinal i), so index 0 is
+        // authoritative rather than a guess.
+        FieldType::EnumRef(name) => schema
+            .find_enum(name)
+            .and_then(|e| e.variants.first())
+            .map(|zeroth| format!("\"{zeroth}\"")),
+        FieldType::StructRef(_) => None,
+    }
 }
 
 fn render_zod_type(t: &FieldType) -> String {

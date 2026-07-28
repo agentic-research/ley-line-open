@@ -18,3 +18,11 @@ path = "src/lib.rs"
 anyhow = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# Validates emitted descriptors against the MCP registry schema this crate
+# PINS (`SCHEMA_URL`), vendored under `schema/mcp/` so the gate runs offline —
+# a gate that fetches its own spec fails open the moment the network does.
+# Dev-only: the emitter builds JSON directly and must not take a validator
+# dependency at runtime (ley-line-open-891dd5).
+jsonschema = "0.33"

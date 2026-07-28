@@ -26,7 +26,8 @@
 //!   "schema_version": "0.10.4",
 //!   "wire_format_major": 1,
 //!   "compat_min_schema_version": "0.4.1",
-//!   "build_date": "unspecified"
+//!   "build_date": "unspecified",
+//!   "ir_schema_version": "merkle-ast-v2"
 //! }
 //! ```
 //!
@@ -41,7 +42,9 @@ use serde::Serialize;
 /// Schema version of the `compatibility.json` document itself. Bumps
 /// when this binary's output shape changes (adds fields, removes
 /// fields, renames). Independent of the daemon's `wire_format_major`.
-const COMPAT_DOC_SCHEMA_VERSION: u32 = 1;
+// v2 adds `ir_schema_version` (bead `ley-line-open-348de6`). Per the rule
+// above, adding a field bumps this.
+const COMPAT_DOC_SCHEMA_VERSION: u32 = 2;
 
 /// One row of the compat surface. Field order matches what serde_json
 /// emits in pretty-print mode — stable across regens so the committed
@@ -71,6 +74,16 @@ struct CompatibilityDoc {
     /// ISO-8601 build date or `"unspecified"`. See
     /// `version::BUILD_DATE`.
     build_date: &'static str,
+
+    /// The `node_hash` address lineage this binary produces, e.g.
+    /// `"merkle-ast-v2"`. See `version::IR_SCHEMA_VERSION`.
+    ///
+    /// Distinct from every other field here: the others describe the WIRE and
+    /// the BINARY, this one describes the ADDRESSES the parse emits. A
+    /// consumer that memoizes on `node_hash` compares this against the lineage
+    /// it cached under — a mismatch means those addresses are not comparable
+    /// (bead `ley-line-open-348de6`).
+    ir_schema_version: &'static str,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -81,6 +94,7 @@ fn main() -> anyhow::Result<()> {
         wire_format_major: version::WIRE_FORMAT_MAJOR,
         compat_min_schema_version: version::COMPAT_MIN_SCHEMA_VERSION,
         build_date: version::BUILD_DATE,
+        ir_schema_version: version::IR_SCHEMA_VERSION,
     };
     // Pretty-print with a trailing newline — diffs against the
     // committed file should compare line-for-line.

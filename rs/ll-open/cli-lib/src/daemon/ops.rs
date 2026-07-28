@@ -1789,6 +1789,7 @@ fn op_leyline_version() -> Result<String> {
     root.set_wire_format_major(version::WIRE_FORMAT_MAJOR);
     root.set_compat_min(version::COMPAT_MIN_SCHEMA_VERSION);
     root.set_build_date(version::BUILD_DATE);
+    root.set_ir_schema_version(version::IR_SCHEMA_VERSION);
     let reader = builder
         .get_root_as_reader::<leyline_public_schema::daemon_capnp::leyline_version_response::Reader>(
         )?;

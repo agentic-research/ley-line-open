@@ -47,7 +47,7 @@ pub const MAX_PARSE_FILE_SIZE: i64 = 8 * 1024 * 1024;
 ///   the κ `function` it lacked, so every Rust trait signature's `node_hash`
 ///   moved. Nothing else changed: the fold, the `llo/ast/v1` domain tag, and
 ///   every other kind are untouched.
-pub const IR_SCHEMA_VERSION: &str = "merkle-ast-v2";
+pub use crate::daemon::version::IR_SCHEMA_VERSION;
 use leyline_ts::query_engine::QuerySet;
 use leyline_ts::refs::{ExtractedRef, current_extraction_epoch, extract_refs_resolved};
 use leyline_ts::schema::{

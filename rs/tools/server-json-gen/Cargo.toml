@@ -10,6 +10,7 @@ name = "server-json-gen"
 path = "src/main.rs"
 
 [dependencies]
+leyline-mcp-descriptor = { path = "../../ll-core/mcp-descriptor" }
 # Imports the daemon's MCP tool registry + cloister group declarations
 # — this is the single source of truth. server-json-gen has no opinion
 # of its own; it's a printer over leyline-cli-lib's mcp module.

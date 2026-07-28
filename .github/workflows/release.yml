@@ -240,3 +240,147 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: task release:verify-public VERSION="${TAG#v}"
+
+  # ---------------------------------------------------------------------------
+  # OCI image (`ley-line-open-e44960`)
+  #
+  # server.json has advertised `ghcr.io/agentic-research/ley-line-open` since
+  # v0.8.0 and nothing ever pushed it. That is worse than it sounds: cloister
+  # derives `<identifier>:<version>` (ADR-0038) and, when the address does not
+  # resolve, does NOT fail — it warns "could not resolve an OCI digest, pinning
+  # by MUTABLE TAG" and proceeds. v0.11.3 corrected the address SHAPE and so
+  # converted a loud resolve failure into a warning that flows through.
+  #
+  # Build logic lives in the Taskfile (`task image:publish`), not here. This
+  # job supplies only what is intrinsically CI's: the registry credential, the
+  # tag, and the build-provenance attestation — which cannot move into the
+  # Taskfile because its entire value is the runner's OIDC identity. A locally
+  # generated attestation attests nothing.
+  # ---------------------------------------------------------------------------
+  image:
+    name: build+push image ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native runners per arch — same reasoning as the binary matrix
+          # above. krust/zigbuild cross-compiles, but building each arch on
+          # its own runner keeps the musl toolchain path identical to local.
+          - platform: linux/amd64
+            os: ubuntu-latest
+          - platform: linux/arm64
+            os: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611
+        with:
+          version: 3.49.1
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: 1.97.1
+
+      # `task image` shells out to krust, which drives cargo-zigbuild to
+      # produce the static musl binary image.Dockerfile COPYs onto
+      # chainguard/static. The release matrix builds *gnu* targets, which
+      # would not run on a distroless base — so this is a separate build, not
+      # a reuse of those artifacts.
+      - name: Install krust + zig toolchain
+        run: |
+          cargo install krust --locked
+          cargo install cargo-zigbuild --locked
+          pip install ziglang
+
+      - name: Log in to ghcr
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # TAG is `v`-prefixed deliberately. ADR-0041 says `version` must match
+      # the git tag; the load-bearing invariant is that it must match the
+      # PUSHED IMAGE TAG, because that is what makes `<identifier>:<version>`
+      # resolve. LLO emits `v0.11.3` in server.json, so the pushed tag must
+      # carry the `v`. `task image:publish` refuses a mismatch rather than
+      # trusting this line.
+      - name: Build and push
+        env:
+          TAG: ${{ github.ref_name }}
+        run: task image:publish TAG="$TAG" PLATFORM="${{ matrix.platform }}"
+
+  image-manifest:
+    name: Publish multi-arch manifest and attest
+    needs: image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      # Required by attest-build-provenance: it signs with the runner's
+      # short-lived OIDC identity and records the attestation against the
+      # repository. This is the supply-chain property cloister asked for —
+      # it turns "pinning by mutable tag" into a verifiable digest.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611
+        with:
+          version: 3.49.1
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to ghcr
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `<identifier>:<version>` must resolve to the manifest list, not to a
+      # single architecture — cloister derives exactly that address.
+      - name: Assemble manifest list
+        env:
+          TAG: ${{ github.ref_name }}
+        run: task image:manifest TAG="$TAG"
+
+      - name: Resolve pushed digest
+        id: digest
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          REF="ghcr.io/agentic-research/ley-line-open"
+          # Plain Go template. Actions expands only dollar-brace-brace
+          # expressions, so these single braces reach docker untouched.
+          # (Writing that sigil literally here would itself be parsed as an
+          # expression — actionlint rejects it even inside a shell comment.)
+          DIGEST=$(docker buildx imagetools inspect "${REF}:${TAG}" \
+            --format '{{.Manifest.Digest}}')
+          test -n "$DIGEST"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "resolved ${REF}:${TAG} -> $DIGEST"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-name: ghcr.io/agentic-research/ley-line-open
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          push-to-registry: true
+
+      # The gate that makes this job meaningful: reads the address out of the
+      # COMMITTED server.json and proves it resolves. Schema validation
+      # (ley-line-open-891dd5) proves the address is well-formed; only this
+      # proves it is pullable. v0.11.3 shipped well-formed and unpullable.
+      - name: Verify the advertised address resolves
+        run: task image:verify-published

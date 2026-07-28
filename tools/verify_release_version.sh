@@ -59,7 +59,11 @@ grep -q "\"version\": \"$version\"" server.json
 # here is that the identifier is present and correctly tagless.
 grep -q '"identifier": "ghcr.io/agentic-research/ley-line-open"' server.json
 grep -q "^## \\[$version\\]" CHANGELOG.md
-grep -q "ley-line-open:$version" README.md
+# `v`-prefixed. The image tag must equal server.json's packages[0].version,
+# because cloister derives `<identifier>:<version>` from it (ADR-0038) — a
+# README documenting an unprefixed pull command would name an image the
+# publish job never pushes (`ley-line-open-e44960`).
+grep -q "ley-line-open:v$version" README.md
 grep -q "clients/go/leyline-schema/v$version" README.md
 grep -Fq "| LLO version | v$version |" docs/ARCHITECTURE.md
 grep -q 'daemon/wire' clients/go/leyline-schema/README.md
@@ -92,7 +96,7 @@ assert_current() {
 }
 
 assert_current README.md "the current release" "The current release is \`v$version\`"
-assert_current docs/ARCHITECTURE.md "the OCI image tag" "produces \`ley-line-open:$version\`"
+assert_current docs/ARCHITECTURE.md "the OCI image tag" "produces \`ley-line-open:v$version\`"
 assert_current docs/ARCHITECTURE.md "the Go client compatibility point" \
     "v$version is its tested compatibility point"
 

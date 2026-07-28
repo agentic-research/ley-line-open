@@ -15,6 +15,39 @@ context, scoping notes, and review history are recoverable.
 Minor rather than patch: the partition-address fix below changes set-domain
 addresses, and pre-1.0 semver puts a breaking change in the minor position.
 
+> ### ⚠️ Read this before regenerating zod (`ley-line-open-8c00c6`)
+>
+> **Generated zod validators no longer reject a missing field.** This is a
+> consequence of the append-only fix, not a bug in it, and **every** zod
+> consumer inherits it silently on upgrade.
+>
+> capnp has no required fields — `Text` defaults to `""`, `Bool` to `false`,
+> numerics to `0`. Emitting `.default("")` is therefore a *faithful* model of
+> capnp, and faithfulness is exactly what removes zod's ability to reject an
+> absent field. Reported by cloister after regenerating: a `cluster.toml` with
+> no `metadata.name` now validates clean and builds unnamed.
+>
+> ```
+> before:  metadata.name absent  ->  ZodError
+> after:   metadata.name absent  ->  parses, yields ""
+> ```
+>
+> That is correct for **decoding a wire message**, where absence genuinely means
+> the default. It is wrong for a **hand-authored operator surface**, where
+> absence usually means a typo — and it is the more dangerous direction, because
+> the old behaviour failed loudly and the new one succeeds quietly.
+>
+> **If you validate hand-authored input with generated zod, you have lost a
+> check and nothing will tell you.** The fix is not to re-add `required` to the
+> generated schema — that would make it stop modelling capnp, and the next
+> appended field would break old documents again. Move required-ness into a
+> consumer-side semantic pass, which is what cloister did: *the schema models
+> capnp, the consumer models its own surface.*
+>
+> `$Optional` and `$Default` are now honoured too, so a field a scheme
+> genuinely wants optional can say so in the capnp rather than relying on the
+> validator's accident.
+
 ### Added
 
 - **Generator binaries are published with every release** (`ley-line-open-e44960`).

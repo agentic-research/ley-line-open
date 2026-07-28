@@ -595,4 +595,165 @@ mod tests {
         let e: [Entry; 0] = [];
         assert_ne!(spec(Domain::ChunkSet).address(&e), Hash::ZERO);
     }
+
+    // ── Invariants that must hold for EVERY domain ────────────────────────
+    //
+    // `ley-line-open-c3916b`. The `b67a73` regression survived upstream CI
+    // because `framing_is_committed_to_the_address` asserts a universal-sounding
+    // property in its NAME while its body tests `Domain::ByteStream` only. So
+    // erasing framing for `ChunkSet`/`RowSet` failed nothing here, and the only
+    // detector was a test in cloister's tree that happened to run when they
+    // bumped their pin. An invariant whose sole detector lives downstream is
+    // not an invariant this crate holds.
+    //
+    // Everything below iterates ALL_DOMAINS. Adding a `Domain` variant makes
+    // these fail until its behaviour is declared, and adding an invariant here
+    // covers every domain by construction rather than by the author remembering.
+    //
+    // Domain-SPECIFIC behaviour stays in individually-named tests
+    // (`byte_stream_*`, `set_domains_*`), so an unqualified name means "all
+    // domains" and is enforced to mean it.
+
+    const ALL_DOMAINS: [Domain; 3] = [Domain::ByteStream, Domain::ChunkSet, Domain::RowSet];
+
+    /// Framing is part of the declared decomposition in every domain.
+    ///
+    /// This is the assertion `ad272d3` broke for two of three domains while
+    /// upstream CI stayed green.
+    #[test]
+    fn every_domain_commits_entry_framing() {
+        for domain in ALL_DOMAINS {
+            let s = spec(domain);
+            let base = [Entry {
+                addr: h(1),
+                a: 0,
+                b: 1,
+            }];
+            // Same address, different framing — and framing swapped rather than
+            // merely changed, so a fold that sorted `(a, b)` as a set would not
+            // pass either.
+            let swapped = [Entry {
+                addr: h(1),
+                a: 1,
+                b: 0,
+            }];
+            let widened = [Entry {
+                addr: h(1),
+                a: 0,
+                b: 2,
+            }];
+            assert_ne!(
+                s.address(&base),
+                s.address(&swapped),
+                "{domain:?}: swapping framing must change the address",
+            );
+            assert_ne!(
+                s.address(&base),
+                s.address(&widened),
+                "{domain:?}: changing framing must change the address",
+            );
+        }
+    }
+
+    /// The scheme, its params, and the canonicalization version are all part of
+    /// the address in every domain — a partition is declared, not inferred.
+    #[test]
+    fn every_domain_commits_the_spec_fields() {
+        let entries = [Entry {
+            addr: h(7),
+            a: 3,
+            b: 4,
+        }];
+        for domain in ALL_DOMAINS {
+            let base = spec(domain);
+
+            let mut other_scheme = spec(domain);
+            other_scheme.scheme = "test/scheme/v2".into();
+            assert_ne!(
+                base.address(&entries),
+                other_scheme.address(&entries),
+                "{domain:?}: scheme must be committed",
+            );
+
+            let mut other_params = spec(domain);
+            other_params.params = vec![9];
+            assert_ne!(
+                base.address(&entries),
+                other_params.address(&entries),
+                "{domain:?}: params must be committed",
+            );
+
+            let mut other_canon = spec(domain);
+            other_canon.canon_version = base.canon_version.wrapping_add(1);
+            assert_ne!(
+                base.address(&entries),
+                other_canon.address(&entries),
+                "{domain:?}: canon_version must be committed",
+            );
+        }
+    }
+
+    /// Every domain is domain-separated from every other, and from a plain
+    /// BLAKE3 of the same bytes. Without this an address could be confused with
+    /// a content address under a shared signing key.
+    #[test]
+    fn every_domain_is_separated_from_the_others() {
+        let entries = [Entry {
+            addr: h(5),
+            a: 0,
+            b: 1,
+        }];
+        for (i, a) in ALL_DOMAINS.iter().enumerate() {
+            for b in ALL_DOMAINS.iter().skip(i + 1) {
+                assert_ne!(
+                    spec(*a).address(&entries),
+                    spec(*b).address(&entries),
+                    "{a:?} and {b:?} must not share an address for identical entries",
+                );
+            }
+            assert_ne!(
+                spec(*a).address(&entries).as_bytes(),
+                blake3::hash(entries[0].addr.as_bytes()).as_bytes(),
+                "{a:?}: address must not equal a plain BLAKE3 of its child",
+            );
+        }
+    }
+
+    /// The fold is a function of its inputs in every domain — (DET).
+    #[test]
+    fn every_domain_is_deterministic() {
+        let entries = [
+            Entry {
+                addr: h(2),
+                a: 1,
+                b: 2,
+            },
+            Entry {
+                addr: h(3),
+                a: 3,
+                b: 4,
+            },
+        ];
+        for domain in ALL_DOMAINS {
+            let s = spec(domain);
+            assert_eq!(
+                s.address(&entries),
+                s.address(&entries),
+                "{domain:?}: repeated folds over identical input must agree",
+            );
+        }
+    }
+
+    /// An empty decomposition is still declared, in every domain.
+    #[test]
+    fn every_domain_distinguishes_empty_from_the_sentinel() {
+        let empty: [Entry; 0] = [];
+        for domain in ALL_DOMAINS {
+            assert_ne!(
+                spec(domain).address(&empty),
+                Hash::ZERO,
+                "{domain:?}: empty partition must not collapse to the zero sentinel",
+            );
+        }
+    }
 }

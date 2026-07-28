@@ -24,30 +24,70 @@
 set -eu
 
 root=${1:-.}
+# Absolute repo root, captured BEFORE the cd: claim 2 shells out to `task`, whose
+# Taskfile lives here, not in rs/.
+repo_root=$(cd "$root" && pwd)
 cd "$root/rs"
 failed=0
 
 # The declared shipping configurations — what `task release`, `release:mount`,
 # `release:all`, and `release:full` actually build. Adding one is deliberate.
-resolve() {
-    # $1: extra cargo args describing one shipping config
+# A FAILED resolve must abort, never degrade into "nothing is reachable".
+#
+# The first cut ran `cargo tree ... 2>/dev/null` inside a command substitution
+# and kept only stdout. When a resolve failed — lock contention against a
+# concurrent `task ci` cargo job is the observed trigger — its rows silently
+# vanished and every feature that only that config enables was reported as
+# unreachable. One such run produced 34 findings, all false, while the actual
+# fault (cargo did not answer) was never printed. That is precisely the
+# silent-success class this gate exists to catch, so it may not be tolerated
+# HERE of all places.
+#
+# `exit` cannot live inside the resolve helper: these run inside `$( ... )`, and
+# exiting a subshell does not stop the parent. Status is therefore checked in
+# the main shell, before any parsing.
+raw=""
+for cfg in "" "--features mount" \
+           "--no-default-features --features all" \
+           "--no-default-features --features full"; do
+    # `$?` after `if ! cmd` is the NEGATION's status (always 0 in the taken
+    # branch), not cargo's — so capture it in the else arm, where it is real.
     # shellcheck disable=SC2086
-    cargo tree -p leyline-cli $1 -f '{p} FEATURES={f}' 2>/dev/null \
-        | sed -n 's/.*(\(.*\)) FEATURES=\(.*\)/\1 \2/p'
-}
+    if out=$(cargo tree -p leyline-cli $cfg -f '{p} FEATURES={f}' 2>&1); then
+        :
+    else
+        status=$?
+        printf 'feature-reachability: `cargo tree -p leyline-cli %s` FAILED (exit %s).\n' \
+            "${cfg:-<default>}" "$status" >&2
+        printf 'Refusing to report reachability from an incomplete resolve — the\n' >&2
+        printf 'findings would be fabricated. cargo said:\n\n' >&2
+        printf '%s\n' "$out" | head -5 >&2
+        exit 1
+    fi
+    raw="$raw
+$out"
+done
 
 reachable=$(
-    {
-        resolve ""
-        resolve "--features mount"
-        resolve "--no-default-features --features all"
-        resolve "--no-default-features --features full"
-    } | awk '{ dir=$1; n=split($2, f, ","); for (i=1;i<=n;i++) if (f[i] != "") print dir "/" f[i] }' \
+    printf '%s\n' "$raw" \
+      | sed -n 's/.*(\(.*\)) FEATURES=\(.*\)/\1 \2/p' \
+      | awk '{ dir=$1; n=split($2, f, ","); for (i=1;i<=n;i++) if (f[i] != "") print dir "/" f[i] }' \
       | sort -u
 )
 
 if [ -z "$reachable" ]; then
     echo "feature-reachability: cargo resolved nothing — refusing to pass vacuously" >&2
+    exit 1
+fi
+
+# Positive control. Non-emptiness is too weak: a PARTIAL resolve still clears it
+# and still fabricates findings (that is the 34-finding run). `leyline-ts/rust`
+# is enabled by the default config — the CLI cannot parse Rust without it — so
+# its absence means the resolve is incomplete, not that Rust stopped shipping.
+# Same rule the gate imposes on everyone else: assert the mechanism fired.
+if ! printf '%s\n' "$reachable" | grep -q '/ll-open/ts/rust$'; then
+    echo "feature-reachability: resolve is incomplete — the default config must" >&2
+    echo "enable ll-open/ts/rust and did not. Not reporting findings from it." >&2
     exit 1
 fi
 
@@ -126,21 +166,82 @@ cli_features=$(sed -n '/^\[features\]/,/^\[/p' "$cli_manifest" \
                 | grep -v '^default$')
 
 # Features named on a `cargo test` line owned by a target the CI CHAIN
-# actually invokes. Counting every `cargo test` line in the file would accept a
-# target that exists and never runs — the same unwired failure this gate exists
-# to catch, and one I shipped once already today.
-ci_tasks=$(sed -n '/^  ci:/,/^  [a-z][a-z0-9:_-]*:$/p' ../Taskfile.yml \
-            | grep -E '^[[:space:]]+- task:' | sed 's/.*task: //' | tr '\n' ' ')
+# actually invokes. Counting every `cargo test` line would accept a target that
+# exists and never runs — the same unwired failure this gate exists to catch.
+#
+# RESOLVE INCLUDES OURSELVES, WITH NO SUBPROCESS.
+#
+# Three designs have been tried here. The first grepped the root Taskfile for
+# both the chain and the `cargo test` lines; it broke the moment tasks moved to
+# crate-scoped Taskfiles, because it asserted a LAYOUT rather than a contract.
+# The second shelled out to `task --summary`, which resolves includes properly —
+# and passed locally but failed in GitHub CI with an empty chain, for reasons
+# the script could not report because it had discarded task's stderr.
+#
+# The lesson is not "text parsing bad". It is that a gate must not depend on
+# behaviour that varies between the developer's machine and CI. `task --summary`
+# is a nested invocation of the very runner executing this script; that is a
+# runtime dependency with an environment-shaped failure mode.
+#
+# So: parse, but resolve includes EXACTLY, using the two facts the root Taskfile
+# states declaratively.
+#   1. The ci CHAIN is still in the root file — only task DEFINITIONS moved.
+#   2. `includes:` is an explicit prefix -> taskfile map.
+# A chain entry `fs:test:cdc` therefore means "task `test:cdc` in the file
+# mapped by prefix `fs`". Deterministic, no subprocess, identical everywhere.
+
+taskfile_root="$repo_root/Taskfile.yml"
+
+# prefix -> taskfile path, from the `includes:` block.
+include_map=$(awk '
+    /^includes:/ { inc = 1; next }
+    /^[a-z]/     { inc = 0 }
+    inc && /^  [a-z][a-z0-9_-]*:/ { p = $1; sub(/:$/, "", p) }
+    inc && /taskfile:/            { print p, $2 }
+' "$taskfile_root")
+
+ci_tasks=$(sed -n '/^  ci:/,/^  [a-z][a-z0-9:_-]*:$/p' "$taskfile_root" \
+            | grep -E '^[[:space:]]+- task:' | sed 's/.*task: //')
 if [ -z "$ci_tasks" ]; then
     echo "feature-coverage: could not read the ci chain — refusing to pass vacuously" >&2
     exit 1
 fi
-tested_explicit=$(awk -v tasks="$ci_tasks" '
-    BEGIN { n = split(tasks, t, /[ \n]+/); for (i = 1; i <= n; i++) if (t[i] != "") in_ci[t[i]] = 1 }
-    /^  [a-z][a-z0-9:_-]*:/ { cur = $1; sub(/:$/, "", cur) }
-    /cargo test/ && (cur in in_ci) { print }
-' ../Taskfile.yml \
-    | grep -oE '\-\-features [a-z0-9_,-]+' | sed 's/--features //' | tr ',' '\n' | sort -u)
+
+# Emit every `cargo test` line belonging to a ci-invoked task, following
+# includes. An unmapped prefix (e.g. `lint:doc-claims`, where `lint` is a naming
+# convention and not an include) resolves to the root file, which is correct.
+tested_explicit=$(
+    printf '%s\n' "$ci_tasks" | while IFS= read -r t; do
+        [ -n "$t" ] || continue
+        prefix=${t%%:*}
+        file=$(printf '%s\n' "$include_map" | awk -v p="$prefix" '$1 == p { print $2 }')
+        if [ -n "$file" ]; then
+            scan="$repo_root/$file"
+            local_name=${t#*:}
+        else
+            scan="$taskfile_root"
+            local_name="$t"
+        fi
+        [ -f "$scan" ] || continue
+        # The task's own block: from `  <name>:` to the next two-space key.
+        awk -v n="  $local_name:" '
+            $0 == n            { inblock = 1; next }
+            /^  [a-z][a-z0-9:_-]*:/ { inblock = 0 }
+            inblock && /cargo test/ { print }
+        ' "$scan"
+    done \
+    | grep -oE '\-\-features [a-z0-9_,-]+' | sed 's/--features //' | tr ',' '\n' | sort -u
+)
+
+# Positive control. An empty result is indistinguishable from "no feature is
+# tested", which would silently pass every check below — the vacuous-pass shape
+# this whole gate exists to prevent. `cdc` is named on a ci-invoked `cargo test`
+# line; its absence means task resolution broke, not that coverage changed.
+if ! printf '%s\n' "$tested_explicit" | grep -qx 'cdc'; then
+    echo "feature-coverage: task resolution is incomplete — expected the ci chain" >&2
+    echo "to name --features cdc and it did not. Not reporting coverage from it." >&2
+    exit 1
+fi
 
 for feature in $cli_features; do
     # In the CLI default set => compiled by `cargo test -p leyline-cli-lib`.

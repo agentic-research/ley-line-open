@@ -340,7 +340,21 @@ impl TsLanguage {
             },
             #[cfg(feature = "rust")]
             TsLanguage::Rust => match raw_kind {
-                "function_item" => Some("function"),
+                // A bodyless trait signature carries the DEFINING kind, not
+                // NULL (bead `ley-line-open-25811f`). It previously had no arm
+                // and fell to `_ => None`, which was doubly wrong:
+                // `idx_defs_canonical_kind` is partial (`WHERE canonical_kind
+                // IS NOT NULL`) so the rows left the index, and NULL is also
+                // the documented pre-migration escape, so consumers could not
+                // tell "old projection" from "trait signature".
+                //
+                // Rust was the OUTLIER here, not the precedent — measured: C
+                // folds a prototype and its definition both to `function`,
+                // Java's `abstract void run()` yields `method`, a TS
+                // interface's `walk(): void` yields `method`. Separating
+                // declarations from projectable constructs is a different,
+                // cross-language request needing a κ vocabulary addition.
+                "function_item" | "function_signature_item" => Some("function"),
                 // Rust methods are function_items inside an impl block; the
                 // grammar doesn't distinguish at the node level, so a bare
                 // function_item is "function". impl-context promotion to
@@ -708,6 +722,37 @@ impl TsLanguage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    /// Bead `ley-line-open-25811f`. A BODYLESS declaration must carry the same
+    /// kappa as a definition — `function_signature_item` had no arm at all and
+    /// fell to `_ => None`, so every Rust trait signature emitted
+    /// `canonical_kind = NULL`.
+    ///
+    /// NULL is not merely a missing kind. `idx_defs_canonical_kind` is a PARTIAL
+    /// index (`WHERE canonical_kind IS NOT NULL`), so those rows fell out of the
+    /// index entirely; and NULL is ALSO the documented pre-migration escape, so a
+    /// consumer could not distinguish "old projection" from "trait signature".
+    ///
+    /// `function` is the consistent answer because Rust was the OUTLIER, not the
+    /// precedent — measured: C folds a prototype and its definition both to
+    /// `function`, Java's `abstract void run()` yields `method`, and a TS
+    /// interface's `walk(): void` yields `method`. Every other language already
+    /// collapses bodyless declarations into the defining kind.
+    ///
+    /// Separating declarations from projectable constructs is a DIFFERENT,
+    /// cross-language request (mache asked for it) that needs a kappa vocabulary
+    /// addition applied to all of them — deliberately not bundled here.
+    #[test]
+    #[cfg(feature = "rust")]
+    fn bodyless_trait_signatures_carry_the_defining_kappa() {
+        assert_eq!(
+            TsLanguage::Rust.canonical_kind("function_signature_item"),
+            Some("function"),
+            "a trait signature must not fall through to NULL — NULL collides \
+             with the pre-migration escape and drops the row from the partial index"
+        );
+    }
 
     #[test]
     fn canonical_kind_collapses_function_across_languages() {

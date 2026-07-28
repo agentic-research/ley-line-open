@@ -1,0 +1,36 @@
+version: '3'
+
+# Crate-scoped tasks for `leyline-fs`.
+#
+# Included by the root Taskfile under the `fs:` namespace, so these run as
+# `task fs:test:cdc`. Tasks belong beside the crate they exercise; the root
+# Taskfile carries only repo-wide orchestration.
+#
+# `{{.ROOT_DIR}}` resolves to the repo root even from an included file, so
+# `dir:` points cargo at the workspace at rs/.
+#
+# NOTE for anyone adding a task the `ci` chain invokes: the coverage half of
+# tools/check_feature_reachability.sh discovers `cargo test --features` lines by
+# asking `task --summary`, which follows includes. It does NOT parse Taskfiles
+# textually (ed356d7) — that was changed before any split precisely so moving a
+# task here could not silently drop its feature coverage.
+
+tasks:
+  test:cdc:
+    desc: leyline-fs CDC tests + clippy (cdc,splice,validate) — no default features
+    dir: '{{.ROOT_DIR}}/rs'
+    cmds:
+      - cargo test -p leyline-fs --no-default-features --features cdc,splice,validate
+      - cargo clippy -p leyline-fs --no-default-features --features cdc,splice,validate --no-deps -- -D warnings
+
+  build:static:
+    desc: Build the leyline-fs staticlib with `cdc` — the FFI surface consumers link
+    dir: '{{.ROOT_DIR}}/rs'
+    cmds:
+      - cargo build -p leyline-fs --lib --features cdc
+
+  build:nfs-isolated:
+    desc: Build leyline-fs with ONLY `nfs` — proves the NFS path compiles without cdc/fuse
+    dir: '{{.ROOT_DIR}}/rs'
+    cmds:
+      - cargo build -p leyline-fs --no-default-features --features nfs

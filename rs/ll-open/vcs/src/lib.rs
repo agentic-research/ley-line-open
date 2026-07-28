@@ -1515,7 +1515,7 @@ mod tests {
                     kind INTEGER NOT NULL,
                     size INTEGER DEFAULT 0,
                     mtime INTEGER NOT NULL,
-                    record JSON
+                    record TEXT
                 );
                 CREATE INDEX idx_parent_name ON nodes(parent_id, name);",
             )

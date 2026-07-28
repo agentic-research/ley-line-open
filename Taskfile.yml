@@ -3,6 +3,22 @@ version: '3'
 # Golden path: CI and local dev both use these tasks.
 # Workflows (.github/workflows/) should call `task <name>`, never raw cargo.
 
+# Crate-scoped tasks live beside the crate they exercise; this file keeps only
+# repo-wide orchestration. Included tasks are namespaced by their key, so
+# `cli-lib:test:vec` runs the `test:vec` task in rs/ll-open/cli-lib/Taskfile.yml.
+#
+# `tools/check_feature_reachability.sh` discovers ci-invoked `cargo test
+# --features` lines via `task --summary`, which follows these includes. It does
+# not parse Taskfiles textually (ed356d7) — that was changed FIRST, precisely so
+# moving a task out of this file could not silently drop its feature coverage.
+includes:
+  cli-lib:
+    taskfile: rs/ll-open/cli-lib/Taskfile.yml
+  fs:
+    taskfile: rs/ll-open/fs/Taskfile.yml
+  sign:
+    taskfile: rs/ll-open/sign/Taskfile.yml
+
 vars:
   SCCACHE_VERSION: 0.15.0
   SCCACHE_BIN: '{{.ROOT_DIR}}/.tools/bin/sccache'
@@ -74,8 +90,16 @@ tasks:
         grep -q 'cache:sccache:stats:' Taskfile.yml
         grep -q 'sources:' Taskfile.yml
         grep -q 'generates:' Taskfile.yml
-        grep -q '^  test:cdc-activation:$' Taskfile.yml
-        grep -q '^      - task: test:cdc-activation$' Taskfile.yml
+        # These assert the task EXISTS where the include map says it does, and
+        # that the ci chain invokes it. They previously grepped this file for
+        # the definition, which broke when the task moved to a crate Taskfile.
+        #
+        # NOT via `task --summary`: that is a nested invocation of the runner
+        # already executing this task, and it behaved differently in GitHub CI
+        # than locally. A gate must not depend on behaviour that varies between
+        # a developer's machine and CI.
+        grep -q '^  test:cdc-activation:$' rs/ll-open/cli-lib/Taskfile.yml
+        grep -q '^      - task: cli-lib:test:cdc-activation$' Taskfile.yml
         test -f .cargo/config.toml
         grep -q 'link-arg=-Wl,--threads=2' .cargo/config.toml
         grep -q 'task cache:sccache:install' .github/workflows/ci.yml
@@ -104,7 +128,11 @@ tasks:
         grep -q 'release:verify-public:' Taskfile.yml
         grep -q 'release:recover-manifest:' Taskfile.yml
         grep -q -- '- task: release:artifacts:fixture-test' Taskfile.yml
-        grep -Eq 'cargo build -p leyline-fs --lib --features cdc$' Taskfile.yml
+        # The FFI staticlib is built with cdc. This command moved to the fs
+        # crate Taskfile, so assert it there rather than here.
+        grep -Eq 'cargo build -p leyline-fs --lib --features cdc$' rs/ll-open/fs/Taskfile.yml
+        # Still asserted against the root file: release:ffi is repo-level
+        # release orchestration and has not moved.
         grep -Eq 'cargo build --release --lib -p leyline-fs --features cdc --target' Taskfile.yml
         grep -q 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' .github/workflows/release.yml
         grep -q 'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c' .github/workflows/release.yml
@@ -473,18 +501,6 @@ tasks:
   # Both pass today; this is turning on existing coverage, not writing new.
   # Enforced by `lint:feature-reachability`, which fails when a shipping
   # feature has no test target (bead ley-line-open-2607d2).
-  test:vec:
-    desc: Tests for the `vec` feature (sqlite-vec + fastembed) — ships in install:full
-    dir: rs
-    cmds:
-      - cargo test -p leyline-cli-lib --features vec
-
-  test:text-search:
-    desc: Tests for the `text-search` feature (witchcraft) — ships in install:full
-    dir: rs
-    cmds:
-      - cargo test -p leyline-cli-lib --features text-search
-
   conformance:py:
     desc: |
       Python conformance suite for cloister/credential-isolation/v1
@@ -563,24 +579,11 @@ tasks:
   # 1.94. When the workspace toolchain bumps, add
   # `cargo build -p leyline-sign --features host,host-extras` under the
   # `sign:host:build:extras` target below and wire it into ci.
-  sign:host:build:
-    desc: Build the leyline-sign helper daemon under `--features host`.
-    dir: rs
-    cmds:
-      - cargo build -p leyline-sign --features host
-      - cargo build -p leyline-sign --features host --bin leyline-sign-helper
-
   sign:host:build:extras:
     desc: Build leyline-sign under `--features host,host-extras` (requires rustc >= 1.95 for nono 0.54).
     dir: rs
     cmds:
       - cargo build -p leyline-sign --features host,host-extras
-
-  sign:host:test:
-    desc: Run the leyline-sign host-feature tests (integration + adversarial + wire-compat).
-    dir: rs
-    cmds:
-      - cargo test -p leyline-sign --features host
 
   # --------------------------------------------------------------------------
   # Quality
@@ -699,63 +702,6 @@ tasks:
   # --------------------------------------------------------------------------
   # FFI / staticlib
   # --------------------------------------------------------------------------
-  build:fs-static:
-    desc: Build the CDC-capable leyline-fs staticlib (consumed by smoke_ffi C tests and matching release assets)
-    dir: rs
-    cmds:
-      - cargo build -p leyline-fs --lib --features cdc
-
-  build:fs-nfs-isolated:
-    desc: |
-      Regression (ley-line-open-95cd90): build leyline-fs with `--features nfs`
-      in ISOLATION — no default features, so `fuse` is NOT pulled. An nfs-only
-      consumer (cloister's mediator; macOS, kext-free) must compile without the
-      fuse feature dragging in libc. The #214 bug was a libc dep declared only
-      under `fuse`; the default build (fuse+nfs) masked it. Pure Rust (nfsserve),
-      no system deps — safe in CI. Guards the nfs-only feature surface directly.
-    dir: rs
-    cmds:
-      - cargo build -p leyline-fs --no-default-features --features nfs
-
-  test:fs-cdc:
-    desc: |
-      Test the chunk-backed content path (`--features cdc`). REQUIRED because
-      `cdc` is non-default: `cargo test --workspace` never compiles
-      `leyline-fs::chunked`, so its tests — including the differential fuzzer
-      and the overlap-predicate falsifier — would silently not run. Same class
-      of hole as the #214 nfs-only libc bug that the default build masked.
-      `splice` is REQUIRED here, not incidental: the manifest-staleness tests
-      (a splice rewrites `nodes.record` from inside leyline-ts, so a surviving
-      manifest would serve pre-splice bytes) are gated on it. Without `splice`
-      the invalidation logic is never exercised — mutation testing caught
-      exactly that, with two live mutants in `invalidate_chunked_content`.
-      `--no-default-features` so the fuse system dep isn't needed in CI.
-    # smoke_ffi links target/debug/libleyline_fs. `task ci` used to mask this
-    # prerequisite by running build:fs-static earlier; a cold direct invocation
-    # failed at the linker after every Rust test passed.
-    deps: [build:fs-static]
-    dir: rs
-    cmds:
-      - cargo test -p leyline-fs --no-default-features --features cdc,splice,validate
-      # `--no-deps`: -D warnings otherwise propagates into dependencies, and
-      # leyline-ts has items that are dead only under the feature set this
-      # invocation induces (they are live under its own defaults, which is why
-      # the workspace `task clippy` is clean). Linting a dependency through a
-      # consumer's feature selection is not this gate's job.
-      - cargo clippy -p leyline-fs --no-default-features --features cdc,splice,validate --no-deps -- -D warnings
-
-  test:cdc-activation:
-    desc: |
-      Production CDC activation gate. Exercises both the explicit CLI command
-      and the real parse → activate → auto-grow/publish arena → verified 4 KiB
-      chunked-read consumer path. Isolated to the lightweight `cdc` feature so
-      unrelated default features cannot mask missing feature wiring.
-    deps: [cache:sccache:install]
-    dir: rs
-    cmds:
-      - cargo test -p leyline-cli-lib --no-default-features --features cdc --test cdc_command_test --test cdc_activation_consumer_test
-      - cargo test -p leyline-cli-lib --no-default-features --test cdc_disabled_command_test
-
   # --------------------------------------------------------------------------
   # Mutation testing — the gate that checks the TESTS, not the code.
   #
@@ -1059,12 +1005,12 @@ tasks:
       - task: check
       - task: clippy
       - task: smells
-      - task: build:fs-static
-      - task: build:fs-nfs-isolated
-      - task: test:fs-cdc
-      - task: test:cdc-activation
-      - task: test:vec
-      - task: test:text-search
+      - task: fs:build:static
+      - task: fs:build:nfs-isolated
+      - task: fs:test:cdc
+      - task: cli-lib:test:cdc-activation
+      - task: cli-lib:test:vec
+      - task: cli-lib:test:text-search
       - task: tier:isolation
       - task: check:all-features
       - task: test

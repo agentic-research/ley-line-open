@@ -28,6 +28,93 @@ context, scoping notes, and review history are recoverable.
   which proposes extending the existing `lint:toolchain-parity` precedent
   rather than inventing a new gate.
 
+- **The workflows can no longer drift apart on setup** (`ley-line-open-2bea72`).
+  The durable half of the fix above: every inline package install moved out of
+  the five workflows into single-source Taskfile `deps:*` targets — the same
+  rule the rest of this repo already follows for build/test commands — and
+  `lint:workflow-parity` (wired into `task ci`) asserts what remains
+  assertable: no inline installs anywhere, every release-pair job that
+  installs Rust calls `task deps:capnp`, every image-building job calls
+  `task deps:zig`, and all `setup-task` pins are exact and identical.
+
+  `tools/test_workflow_parity.sh` proves each acceptance mutation fails the
+  gate on copies of the REAL workflows, every run. Found while migrating:
+  `leyline-schema-go.yml`'s hand-copied capnp block was already missing
+  `pkg-config` — exactly the drift class this closes.
+
+- **Filing a bead during `task ci` no longer destroys the run**
+  (`ley-line-open-080643`). The attestation snapshot hashed the whole tree,
+  and `.beads/beads.jsonl` is tracked, so any rsry write between `begin` and
+  `finish` invalidated the receipt — three full runs lost in one session. The
+  receipt's claim should be "task ci passed for these INPUTS", and the bead
+  export is not an input: nothing `task ci` runs reads `.beads/` (now asserted
+  against the real repo by the fixture, so a future subtask that consumes the
+  export re-fails the gate). Excluded via one pathspec — that file only, not
+  `.beads/`, not a tolerate-churn mode. A source edit in the same window still
+  invalidates, even alongside bead churn.
+
+- **`lint:feature-reachability` no longer false-fails under a symlinked
+  checkout** (`ley-line-open-db0920`). cargo prints physical manifest paths;
+  the script compared them against a logical `pwd`. Entered through the
+  `~/github → ~/remotes` alias every comparison missed and all 40+ declared
+  features reported unreachable, aborting `task ci`. `pwd -P` canonicalizes,
+  and the gate now asserts the CLI crate's own dir appears in cargo's
+  reachable set before issuing any verdict — proving the two path universes
+  coincide instead of trusting that they do.
+
+### Added
+
+- **MCP wire-protocol facts are generated from a digest-pinned schema**
+  (`ley-line-open-60f0d3`). LLO hand-mirrored MCP protocol facts and one went
+  stale within days: SEP-2567/SEP-2575 removed sessions and `initialize` from
+  the spec, and nothing noticed. `schema/mcp/protocol.2026-07-28.json` is now
+  vendored (sha256 `ef70b61f…f40203`), and the new
+  `leyline-mcp-protocol-schema` crate's `build.rs` fails COMPILATION on a
+  digest mismatch, then derives every exported constant from the verified
+  bytes — 21 `METHOD_*` constants plus `METHODS`, enumerated from the schema's
+  `method.const` values, not curated. The build refuses to emit a set
+  containing `initialize`; the only hand-typed value left is the digest, which
+  verifies rather than trusts. The daemon's `tools/list` and `tools/call` arms
+  import the generated constants. Found during wiring: the daemon still
+  answers `initialize` (hardcoding `protocolVersion: 2024-11-05`) and `ping`,
+  neither of which the pinned revision defines — the legacy posture is
+  `ley-line-open-1227f2`.
+
+  **cloister needs this**: `4ec276`'s session-semantics work was blocked on
+  trustworthy protocol facts; these are generated, not recorded.
+
+- **`mcp-descriptor` can describe an image publisher that serves no MCP**
+  (`ley-line-open-0135fa`). notme's `server.json` failed validation because
+  `Package.required` includes `transport`, and a placeholder transport would
+  make cloister generate backends for tools that do not exist
+  (`notme-6e5330`). The registry schema makes `packages[]` optional and
+  provides the publisher-provided `_meta` extension, so an artifact-only
+  descriptor now emits NO `packages` key and declares
+  `…publisher-provided".artifacts` entries (Package shape minus transport,
+  same tagless-identifier + version validation). A descriptor may carry
+  packages, artifacts, or both; a transport-less `packages[]` entry still
+  refuses. LLO's own `server.json` is byte-identical across this change.
+
+  **notme + cloister need this**: the contract is on `cloister-02dd65`;
+  notme regenerates after cloister's consumer lands.
+
+- **Markdown inline content parses — doc symbol citations become facts**
+  (`ley-line-open-ea1e42`). The block grammar leaves a paragraph as one
+  opaque `inline` node: code spans did not exist as nodes at all, so no query
+  over a parsed db could find a doc's symbol citations (measured by
+  `mache-eb2bf3`). Every `inline` node now reparses under tree-sitter-md's
+  `INLINE_LANGUAGE` via the existing injection mechanism, and each
+  `code_span` emits a `node_refs` row on the host file with delimiters
+  stripped — a backtick span citing a symbol IS a reference. Host `_ast` and
+  `node_hash` values are byte-identical with the pass on or off: no κ
+  additions, no `ir_schema_version` bump, no forced re-parse downstream.
+  Escaped backticks and double-backtick spans behave per the grammar — which
+  is the point; hand-rolled backtick scanning is where the precision problem
+  came from.
+
+  **mache needs this**: `drift_doc_dead_symbol_reference` (their 0.20)
+  becomes writable — refs from `*.md` whose token joins no living def.
+
 ## [0.12.1] — 2026-07-29
 
 Cut because three fixes landed on `main` after v0.12.0 was tagged, and two of

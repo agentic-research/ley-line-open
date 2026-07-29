@@ -62,6 +62,20 @@ jobs:
         with:
           cache-targets: false
 
+      # Same system deps ci.yml and release.yml install. Omitting them is what
+      # made this workflow fail its own first run:
+      #
+      #   capnp codegen failed (is `capnp` on PATH?)
+      #
+      # `leyline-schema-capnp`'s build script shells out to the capnp compiler,
+      # and libcapnp-dev (not the capnproto package alone) ships the standard
+      # schema includes that `import "/capnp/c++.capnp"` resolves against.
+      - name: Install system deps (capnproto + libcapnp-dev + pkg-config)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends capnproto libcapnp-dev pkg-config
+          capnp --version
+
       # One target, not the full matrix. The failures this guards against are
       # in the SHARED logic — the staging contract, the asserted asset set, the
       # generator build — not in per-arch differences, which the tag run still
@@ -130,6 +144,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: 1.97.1
+
+      # Same system deps as the stage job — the image build compiles the same
+      # workspace and hits the same capnp build script.
+      - name: Install system deps (capnproto + libcapnp-dev + pkg-config)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends capnproto libcapnp-dev pkg-config
+          capnp --version
 
       # The exact step that failed on the v0.12.0 tag. It ran `cargo install
       # krust --locked`, where the local krust was a /tmp path install and the

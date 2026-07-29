@@ -126,8 +126,22 @@ ll-open/vcs/sqlite
 #   text-search/engine-witchcraft  engine selection, not built into the CLI.
 #   ll-open/vcs/sqlite         leyline-vcs is not a CLI dependency at all.
 
+# Both sides of the grep -qx below must live in the same path universe.
+# cargo prints PHYSICAL manifest paths, while a plain `pwd` reports the
+# LOGICAL one — under the ~/github → ~/remotes symlink those differ, every
+# comparison missed, and all 40+ declared features false-failed as
+# unreachable (ley-line-open-db0920). `pwd -P` canonicalizes; the control
+# below asserts the universes actually coincide instead of trusting this.
+cli_dir=$(cd ll-open/cli && pwd -P)
+if ! printf '%s\n' "$reachable" | grep -q "^$cli_dir/"; then
+    echo "feature-reachability: the CLI crate dir ($cli_dir) appears nowhere in" >&2
+    echo "cargo's reachable set — the path comparison is comparing different" >&2
+    echo "path universes and every verdict below would be fabricated." >&2
+    exit 1
+fi
+
 for manifest in $(find . -name Cargo.toml -not -path '*/target/*' -not -path '*worktree*' | sort); do
-    dir=$(cd "$(dirname "$manifest")" && pwd)
+    dir=$(cd "$(dirname "$manifest")" && pwd -P)
     for feature in $(sed -n '/^\[features\]/,/^\[/p' "$manifest" \
                      | grep -E '^[a-z][a-z0-9_-]* *=' | cut -d= -f1 | tr -d ' '); do
         [ "$feature" = "default" ] && continue

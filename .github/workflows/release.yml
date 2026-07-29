@@ -327,6 +327,21 @@ jobs:
       # wrapper. The step either failed or installed a stranger's crate on a
       # name collision. Installing by bare name does not belong in a release
       # path (`ley-line-open-e44960`).
+      # The `build` job above installs these; this job did not, and that is why
+      # the image failed on v0.12.1 — `leyline-schema-capnp`'s build script
+      # shells out to the capnp compiler, and libcapnp-dev (not the capnproto
+      # package alone) ships the standard schema includes that
+      # `import "/capnp/c++.capnp"` resolves against.
+      #
+      # release-dryrun.yml caught exactly this on a branch and I fixed it THERE
+      # only, shipping the same bug here. The dry-run told the truth; the answer
+      # went into the wrong file.
+      - name: Install system deps (capnproto + libcapnp-dev + pkg-config)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends capnproto libcapnp-dev pkg-config
+          capnp --version
+
       - name: Install zig toolchain
         run: |
           cargo install cargo-zigbuild --locked

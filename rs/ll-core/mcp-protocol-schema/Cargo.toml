@@ -3,13 +3,20 @@ name = "leyline-mcp-protocol-schema"
 version = "0.12.1"
 edition = "2024"
 license = "Apache-2.0"
-description = "Pins the MCP wire protocol schema (JSON-RPC message shapes) behind a digest gate. Vendoring-only step (ley-line-open-60f0d3) — no generator/emitter here; the bead's inventory of hand-encoded protocol facts is what a follow-up generator would replace."
+description = "MCP wire-protocol facts generated at build time from a digest-pinned schema (ley-line-open-60f0d3). The digest gate fails compilation, not a test; every exported constant derives from the verified bytes."
 repository = "https://github.com/agentic-research/ley-line-open"
 publish = false
 
 [lib]
 name = "leyline_mcp_protocol_schema"
 path = "src/lib.rs"
+
+[build-dependencies]
+# The build-time gate + generator: sha2 verifies the vendored bytes
+# (compilation fails on mismatch), serde_json extracts the method
+# constants from the verified document. See build.rs.
+serde_json = { workspace = true }
+sha2 = "0.11"
 
 [dev-dependencies]
 # Validates the vendored schema compiles as JSON Schema and, in the

@@ -27,12 +27,15 @@
 //!    re-derived from the vendored bytes on every run.
 //! 4. A negative case proving the validator actually bites.
 //!
-//! ## What this crate is NOT
+//! ## Step 2: the generator (and what this file adds for it)
 //!
-//! It ships no generator and no emitter. Nothing here reads this schema
-//! to produce protocol facts elsewhere in the repo — that is deliberately
-//! out of scope for this step. See the bead for the inventory of
-//! hand-encoded facts a follow-up generator would need to replace.
+//! `build.rs` now verifies the digest at COMPILE time and generates the
+//! `METHOD_*` constants and [`METHODS`] from the verified bytes —
+//! recorded facts were the same drift risk as the stale literals they
+//! described (cloister's correction on the bead). The tests below
+//! cross-check the generated set against this file's own independent
+//! read of the JSON, so the generator cannot silently diverge from its
+//! source either.
 //!
 //! ## Offline by construction
 //!
@@ -273,5 +276,64 @@ fn a_call_tool_request_with_the_wrong_method_const_is_rejected() {
         "a CallToolRequest with method \"tools/invoke\" must be rejected — \
          the schema pins the const \"tools/call\" — but the validator \
          reported no errors",
+    );
+}
+
+#[test]
+fn generated_methods_match_an_independent_read_of_the_schema() {
+    // The generator (build.rs) and this test read the same file through
+    // DIFFERENT code: if the generator's extraction drifts — wrong key,
+    // missed definitions, over-curation — the sets disagree here.
+    let doc = vendored_doc();
+    let mut independent: Vec<String> = doc["$defs"]
+        .as_object()
+        .expect("$defs map")
+        .values()
+        .filter_map(|d| {
+            d.pointer("/properties/method/const")?
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    independent.sort();
+    independent.dedup();
+
+    assert_eq!(
+        leyline_mcp_protocol_schema::METHODS,
+        independent.as_slice(),
+        "generated METHODS must equal the schema's own method-const set — \
+         enumerated, not curated"
+    );
+}
+
+#[test]
+fn generated_constants_carry_the_wire_values() {
+    // Spot-check the two constants the daemon's handshake work
+    // (ley-line-open-1227f2) imports first. The values here are
+    // assertions ABOUT generated facts, checked against the set the
+    // independent-read test just tied to the schema — not free-standing
+    // hand-mirrors.
+    assert_eq!(leyline_mcp_protocol_schema::METHOD_TOOLS_CALL, "tools/call");
+    assert_eq!(
+        leyline_mcp_protocol_schema::METHOD_SERVER_DISCOVER,
+        "server/discover"
+    );
+    assert!(
+        leyline_mcp_protocol_schema::METHODS
+            .contains(&leyline_mcp_protocol_schema::METHOD_TOOLS_LIST),
+        "every METHOD_* constant is a member of METHODS"
+    );
+}
+
+#[test]
+fn no_initialize_method_in_the_generated_set() {
+    // The revision-defining absence, now at the FACT level rather than
+    // the definition level: a generator emitting an `initialize` method
+    // would mean the vendored bytes are not the pinned revision.
+    // build.rs refuses at compile time; this keeps the property visible
+    // where the other absence checks live.
+    assert!(
+        !leyline_mcp_protocol_schema::METHODS.contains(&"initialize"),
+        "SEP-2567/2575 removed initialize; the 2026-07-28 fact set cannot contain it"
     );
 }

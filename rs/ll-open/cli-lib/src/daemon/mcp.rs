@@ -820,6 +820,14 @@ async fn handle_post(State(ctx): State<Arc<DaemonContext>>, body: String) -> Res
     };
 
     let response = match request.method.as_str() {
+        // STALE against the pinned 2026-07-28 revision (bead
+        // `ley-line-open-1227f2`): SEP-2567/2575 removed `initialize`
+        // (replacement: server/discover) and this revision defines no
+        // `ping` — neither string is derivable from the pinned schema,
+        // which is why they stay literals instead of importing a
+        // generated constant. The legacy-compat posture (answer old
+        // clients vs refuse naming the pinned revision) is that bead's
+        // decision; do not extend these arms.
         "initialize" => JsonRpcResponse::ok(
             Some(id),
             json!({
@@ -828,8 +836,10 @@ async fn handle_post(State(ctx): State<Arc<DaemonContext>>, body: String) -> Res
                 "serverInfo": {"name": "leyline", "version": env!("CARGO_PKG_VERSION")}
             }),
         ),
-        "tools/list" => handle_tools_list(id),
-        "tools/call" => handle_tools_call(&ctx, id, &request.params),
+        leyline_mcp_protocol_schema::METHOD_TOOLS_LIST => handle_tools_list(id),
+        leyline_mcp_protocol_schema::METHOD_TOOLS_CALL => {
+            handle_tools_call(&ctx, id, &request.params)
+        }
         "ping" => JsonRpcResponse::ok(Some(id), json!({})),
         other => JsonRpcResponse::err(Some(id), -32601, format!("method not found: {other}")),
     };

@@ -47,6 +47,10 @@ leyline-ts = { path = "../ts", features = [
 ] }
 leyline-schema = { path = "../../ll-core/schema" }
 leyline-schema-capnp = { path = "../../ll-core/schema-capnp" }
+# MCP wire-protocol facts generated from the digest-pinned schema
+# (ley-line-open-60f0d3): the daemon's method names import from here
+# instead of hand-encoding string literals that go stale.
+leyline-mcp-protocol-schema = { path = "../../ll-core/mcp-protocol-schema" }
 leyline-public-schema = { path = "../../ll-core/public-schema" }
 leyline-core = { path = "../../ll-core/core" }
 # S1: the one RootSigner implementation, used to sign the at-rest Head.

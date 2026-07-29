@@ -4084,6 +4084,7 @@ dependencies = [
  "leyline-fs",
  "leyline-hdc",
  "leyline-lsp",
+ "leyline-mcp-protocol-schema",
  "leyline-public-schema",
  "leyline-schema",
  "leyline-schema-capnp",

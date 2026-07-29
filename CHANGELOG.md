@@ -8,7 +8,14 @@ Each entry references the bead ID(s) tracking the work in
 [rsry](https://github.com/agentic-research/rosary) so the full design
 context, scoping notes, and review history are recoverable.
 
-## [Unreleased]
+## [0.13.0] — 2026-07-29
+
+The release-hardening train: CI gates that mean what they say, MCP protocol
+facts generated from a digest-pinned spec instead of hand-mirrored, and the
+three downstream unblocks (mache 0.20's doc-drift rule, cloister's session
+semantics, notme's artifact-only descriptor). Also the first release cut
+under branch protection — the merge that produced it required a green
+`task ci` on an up-to-date, linear main.
 
 ### Fixed
 

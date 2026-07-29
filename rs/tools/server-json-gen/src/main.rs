@@ -104,6 +104,9 @@ fn main() -> Result<()> {
                 url: "http://localhost:8384/mcp",
             }),
         }],
+        // LLO ships nothing outside `packages` — no bare OCI artifacts to
+        // declare via the publisher-provided extension (`ley-line-open-0135fa`).
+        artifacts: vec![],
     };
 
     print!(

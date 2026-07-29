@@ -18,7 +18,10 @@
 //! ```
 //!
 //! Input shape — `meta` mirrors [`ServerMeta`], `tools` is a list of names,
-//! `groups` carries the cloister claims:
+//! `groups` carries the cloister claims. `meta.packages` is for producers
+//! that serve MCP; `meta.artifacts` (`ley-line-open-0135fa`) is for OCI
+//! images a producer publishes but does not serve as MCP — both default to
+//! `[]` when omitted, but [`render`] refuses a descriptor with neither:
 //!
 //! ```json
 //! {
@@ -28,10 +31,16 @@
 //!     "version": "1.2.3",
 //!     "repository_url": "https://github.com/org/thing.git",
 //!     "repository_source": "github",
-//!     "oci_image": "ghcr.io/org/thing",
-//!     "oci_version": "v1.2.3",
-//!     "transport_type": "streamable-http",
-//!     "transport_url": "http://localhost:8384/mcp"
+//!     "packages": [
+//!       {
+//!         "oci_image": "ghcr.io/org/thing",
+//!         "oci_version": "v1.2.3",
+//!         "transport": { "type": "streamable-http", "url": "http://localhost:8384/mcp" }
+//!       }
+//!     ],
+//!     "artifacts": [
+//!       { "oci_image": "ghcr.io/org/thing-sidecar", "oci_version": "v1.2.3" }
+//!     ]
 //!   },
 //!   "tools": ["a", "b"],
 //!   "groups": [
@@ -68,7 +77,9 @@
 use std::io::Read;
 
 use anyhow::{Context, Result};
-use leyline_mcp_descriptor::{GroupRef, PackageMeta, ServerMeta, ToolRef, TransportMeta, render};
+use leyline_mcp_descriptor::{
+    ArtifactMeta, GroupRef, PackageMeta, ServerMeta, ToolRef, TransportMeta, render,
+};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -85,9 +96,16 @@ struct MetaIn {
     version: String,
     repository_url: String,
     repository_source: String,
-    /// One entry per published artifact. A producer shipping two images
-    /// (notme: `notme` and `notme-proxy`) declares two.
+    /// One entry per published `packages[]` MCP-registry artifact. A producer
+    /// shipping two images (notme: `notme` and `notme-proxy`) declares two.
+    #[serde(default)]
     packages: Vec<PackageIn>,
+    /// One entry per published OCI image this producer does NOT serve as MCP
+    /// (`ley-line-open-0135fa`). Renders into the publisher-provided `_meta`
+    /// extension instead of `packages[]`. Defaulted to empty so existing
+    /// callers that predate this field need no input change.
+    #[serde(default)]
+    artifacts: Vec<ArtifactIn>,
 }
 
 #[derive(Deserialize)]
@@ -107,6 +125,12 @@ struct TransportIn {
     #[serde(rename = "type")]
     typ: String,
     url: String,
+}
+
+#[derive(Deserialize)]
+struct ArtifactIn {
+    oci_image: String,
+    oci_version: String,
 }
 
 #[derive(Deserialize)]
@@ -140,6 +164,15 @@ fn main() -> Result<()> {
                     typ: &t.typ,
                     url: &t.url,
                 }),
+            })
+            .collect(),
+        artifacts: d
+            .meta
+            .artifacts
+            .iter()
+            .map(|a| ArtifactMeta {
+                oci_image: &a.oci_image,
+                oci_version: &a.oci_version,
             })
             .collect(),
     };

@@ -225,6 +225,10 @@ pub fn extract_refs(
         crate::languages::TsLanguage::Bash => {
             extract_bash(node, source, node_id, source_id, container_node_id)
         }
+        #[cfg(feature = "markdown")]
+        crate::languages::TsLanguage::MarkdownInline => {
+            extract_markdown_inline(node, source, node_id, source_id, container_node_id)
+        }
         _ => Vec::new(),
     }
 }
@@ -1227,6 +1231,67 @@ pub fn extract_bash(
             .expect("compiled-in queries/bash/tags.scm must compile against tree-sitter-bash")
         })
         .extract(node, source, node_id, source_id, container_node_id)
+}
+
+// ---------------------------------------------------------------------------
+// Markdown-inline extractor
+// ---------------------------------------------------------------------------
+
+/// Extract doc-symbol references from a markdown-inline node (bead
+/// `ley-line-open-ea1e42`). Pure data — no DB access, safe for
+/// parallel use.
+///
+/// Reachable only through the injection pass: `TsLanguage::Markdown`
+/// parses with the block grammar, whose `inline` nodes reparse under
+/// `INLINE_LANGUAGE` via `queries/markdown/injections.scm`. A backtick
+/// code span citing a symbol IS a reference — this is the join surface
+/// mache's `drift_doc_dead_symbol_reference` reads (mache-eb2bf3), so
+/// `code_span` emits [`ExtractedRef::Ref`] with the delimiters
+/// stripped.
+///
+/// Imperative arm, not a `tags.scm`: the token needs the backtick
+/// delimiters and the CommonMark one-space padding trimmed
+/// (`` ` code ` `` → `code`), which the emission vocabulary's `@name`
+/// capture does not do (delimiter stripping exists only for `@path`).
+/// Emission changes here require the scalar `EXTRACTION_EPOCH` bump,
+/// same as every other imperative extractor.
+///
+/// NOT emitted, with reasons:
+/// - `link` / `emphasis`: prose structure, not symbol citations — a
+///   ref row for every link target would be join noise for the drift
+///   rule this exists to serve. If a consumer wants them, that is an
+///   additive follow-up, not a default.
+/// - qualifier splitting (`PartitionSpec::address` → bare `address`):
+///   prose cites symbols in many shapes (`a.b`, `a::b`, `fn()`); the
+///   span text is emitted verbatim and consumers own their matching.
+#[cfg(feature = "markdown")]
+pub fn extract_markdown_inline(
+    node: &Node,
+    source: &[u8],
+    node_id: &str,
+    source_id: &str,
+    container_node_id: Option<&str>,
+) -> Vec<ExtractedRef> {
+    if node.kind() != "code_span" {
+        return Vec::new();
+    }
+    let Ok(raw) = node.utf8_text(source) else {
+        return Vec::new();
+    };
+    // Delimiters are runs of backticks (`` ``x`` `` is a legal span
+    // containing a backtick); CommonMark strips one space of padding
+    // when both sides carry it. trim_matches + trim covers both.
+    let token = raw.trim_matches('`').trim();
+    if token.is_empty() {
+        return Vec::new();
+    }
+    vec![ExtractedRef::Ref {
+        token: token.to_string(),
+        node_id: node_id.to_string(),
+        source_id: source_id.to_string(),
+        container_node_id: container_node_id.map(str::to_string),
+        qualifier: None,
+    }]
 }
 
 // ---------------------------------------------------------------------------

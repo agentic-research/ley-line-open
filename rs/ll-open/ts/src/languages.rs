@@ -39,6 +39,15 @@ pub enum TsLanguage {
     Html,
     #[cfg(feature = "markdown")]
     Markdown,
+    /// tree-sitter-md's SECOND grammar (`INLINE_LANGUAGE`). The block
+    /// grammar leaves a paragraph's content as one opaque `inline`
+    /// node — code spans, links, and emphasis do not exist as nodes at
+    /// all (bead `ley-line-open-ea1e42`, found by mache-eb2bf3). Never
+    /// a file language: it is reachable only as an injection target
+    /// from `queries/markdown/injections.scm`, so it has no
+    /// `from_extension`/`from_filename` arm on purpose.
+    #[cfg(feature = "markdown")]
+    MarkdownInline,
     #[cfg(feature = "json")]
     Json,
     #[cfg(feature = "yaml")]
@@ -160,6 +169,8 @@ impl TsLanguage {
             TsLanguage::Html => tree_sitter_html::LANGUAGE.into(),
             #[cfg(feature = "markdown")]
             TsLanguage::Markdown => tree_sitter_md::LANGUAGE.into(),
+            #[cfg(feature = "markdown")]
+            TsLanguage::MarkdownInline => tree_sitter_md::INLINE_LANGUAGE.into(),
             #[cfg(feature = "json")]
             TsLanguage::Json => tree_sitter_json::LANGUAGE.into(),
             #[cfg(feature = "yaml")]
@@ -229,6 +240,8 @@ impl TsLanguage {
             TsLanguage::Html => "html",
             #[cfg(feature = "markdown")]
             TsLanguage::Markdown => "markdown",
+            #[cfg(feature = "markdown")]
+            TsLanguage::MarkdownInline => "markdown-inline",
             #[cfg(feature = "json")]
             TsLanguage::Json => "json",
             #[cfg(feature = "yaml")]
@@ -561,6 +574,8 @@ impl TsLanguage {
             "html" => Ok(TsLanguage::Html),
             #[cfg(feature = "markdown")]
             "markdown" | "md" => Ok(TsLanguage::Markdown),
+            #[cfg(feature = "markdown")]
+            "markdown-inline" | "markdown_inline" => Ok(TsLanguage::MarkdownInline),
             #[cfg(feature = "json")]
             "json" => Ok(TsLanguage::Json),
             #[cfg(feature = "yaml")]

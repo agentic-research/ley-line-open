@@ -42,6 +42,12 @@ use crate::languages::TsLanguage;
 #[cfg(all(feature = "go", feature = "sql"))]
 const GO_INJECTIONS_SCM: &str = include_str!("../queries/go/injections.scm");
 
+/// Compiled-in Markdown injections query (bead `ley-line-open-ea1e42`):
+/// every block-grammar `inline` node reparses under
+/// `tree_sitter_md::INLINE_LANGUAGE`. Also the epoch preimage bytes.
+#[cfg(feature = "markdown")]
+const MD_INJECTIONS_SCM: &str = include_str!("../queries/markdown/injections.scm");
+
 /// One embedded-language region: reparse `range` under `language`.
 pub struct InjectionSite {
     /// Target (injected) language, resolved from the pattern's
@@ -126,6 +132,15 @@ pub fn injection_engine(host: TsLanguage) -> Option<&'static InjectionEngine> {
             Some(ENGINE.get_or_init(|| {
                 InjectionEngine::new(TsLanguage::Go, GO_INJECTIONS_SCM).expect(
                     "compiled-in queries/go/injections.scm must compile against tree-sitter-go",
+                )
+            }))
+        }
+        #[cfg(feature = "markdown")]
+        TsLanguage::Markdown => {
+            static ENGINE: OnceLock<InjectionEngine> = OnceLock::new();
+            Some(ENGINE.get_or_init(|| {
+                InjectionEngine::new(TsLanguage::Markdown, MD_INJECTIONS_SCM).expect(
+                    "compiled-in queries/markdown/injections.scm must compile against tree-sitter-md",
                 )
             }))
         }
@@ -221,6 +236,20 @@ pub fn current_injection_epoch() -> String {
         push_part(&mut p, injections_scm.as_bytes());
         push_part(&mut p, grammar_fingerprint(TsLanguage::Sql).as_bytes());
         push_part(&mut p, include_str!("../queries/sql/tags.scm").as_bytes());
+    }
+
+    #[cfg(feature = "markdown")]
+    {
+        // No tags.scm part for the target: markdown-inline extraction
+        // is an imperative arm (`extract_markdown_inline`), so its
+        // emission changes ride the scalar EXTRACTION_EPOCH already
+        // pushed above — same rule as every other imperative extractor.
+        push_part(&mut p, grammar_fingerprint(TsLanguage::Markdown).as_bytes());
+        push_part(&mut p, MD_INJECTIONS_SCM.as_bytes());
+        push_part(
+            &mut p,
+            grammar_fingerprint(TsLanguage::MarkdownInline).as_bytes(),
+        );
     }
 
     p.hash().to_string()
@@ -357,6 +386,166 @@ func f() []string {
             a,
             current_injection_epoch(),
             "removing the override must restore the compiled-in composite"
+        );
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "markdown")]
+mod markdown_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse_markdown(src: &[u8]) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&TsLanguage::Markdown.ts_language())
+            .unwrap();
+        parser.parse(src, None).unwrap()
+    }
+
+    /// Walk every named node the way the fold does and collect the
+    /// (language, content-text) of each detected site.
+    fn detect_all(src: &[u8]) -> Vec<(&'static str, String)> {
+        let tree = parse_markdown(src);
+        let engine =
+            injection_engine(TsLanguage::Markdown).expect("markdown ships injections.scm");
+        let mut out = Vec::new();
+        fn walk(
+            node: tree_sitter::Node,
+            src: &[u8],
+            engine: &InjectionEngine,
+            out: &mut Vec<(&'static str, String)>,
+        ) {
+            for site in engine.sites(&node, src) {
+                let text = std::str::from_utf8(&src[site.range.start_byte..site.range.end_byte])
+                    .unwrap()
+                    .to_string();
+                out.push((site.language.name(), text));
+            }
+            let mut c = node.walk();
+            if c.goto_first_child() {
+                loop {
+                    if c.node().is_named() {
+                        walk(c.node(), src, engine, out);
+                    }
+                    if !c.goto_next_sibling() {
+                        break;
+                    }
+                }
+            }
+        }
+        walk(tree.root_node(), src, engine, &mut out);
+        out
+    }
+
+    #[test]
+    fn every_inline_node_is_a_site_and_fenced_blocks_are_not() {
+        // mache-eb2bf3's fixture shape: prose citing symbols in
+        // backtick spans, plus a fenced block. The block grammar
+        // routes fenced content to code_fence_content, never `inline`,
+        // so only the paragraph and heading text become sites.
+        let src = b"# Title\n\nCalls `PartitionSpec::address` then `render`.\n\n```rust\nlet x = 1;\n```\n";
+        let sites = detect_all(src);
+        assert_eq!(
+            sites,
+            vec![
+                ("markdown-inline", "Title".to_string()),
+                (
+                    "markdown-inline",
+                    "Calls `PartitionSpec::address` then `render`.".to_string()
+                ),
+            ],
+            "one site per inline node; fenced content must not inject"
+        );
+    }
+
+    #[test]
+    fn sites_are_anchored_at_the_inline_node() {
+        // Probing an ANCESTOR must not yield the site — otherwise the
+        // fold would emit it once per ancestor (document, section,
+        // paragraph all enclose the inline node).
+        let src = b"a `span` b\n";
+        let tree = parse_markdown(src);
+        let engine = injection_engine(TsLanguage::Markdown).unwrap();
+        assert!(
+            engine.sites(&tree.root_node(), src).is_empty(),
+            "document root must not anchor the inline pattern"
+        );
+        assert_eq!(detect_all(src).len(), 1, "the inline node itself must");
+    }
+
+    /// End-to-end across both grammars, the way cli-lib's fold runs it:
+    /// block parse → inline site → reparse the range under
+    /// INLINE_LANGUAGE with set_included_ranges → extract refs from
+    /// every named node. This is the whole mechanism ea1e42 exists
+    /// for, pinned at the ts layer.
+    #[test]
+    fn injected_inline_tree_yields_code_span_refs_with_clean_tokens() {
+        let src: &[u8] =
+            b"Calls `PartitionSpec::address` and `` `render` `` but \\`not\\` this.\n";
+        let sites = detect_all(src);
+        assert_eq!(sites.len(), 1);
+
+        let tree = parse_markdown(src);
+        let engine = injection_engine(TsLanguage::Markdown).unwrap();
+        let mut inline_sites = Vec::new();
+        fn collect(
+            node: tree_sitter::Node,
+            src: &[u8],
+            engine: &InjectionEngine,
+            out: &mut Vec<InjectionSite>,
+        ) {
+            out.extend(engine.sites(&node, src));
+            let mut c = node.walk();
+            if c.goto_first_child() {
+                loop {
+                    if c.node().is_named() {
+                        collect(c.node(), src, engine, out);
+                    }
+                    if !c.goto_next_sibling() {
+                        break;
+                    }
+                }
+            }
+        }
+        collect(tree.root_node(), src, engine, &mut inline_sites);
+        let site = &inline_sites[0];
+
+        let mut parser = Parser::new();
+        parser.set_language(&site.language.ts_language()).unwrap();
+        parser.set_included_ranges(&[site.range]).unwrap();
+        let inline_tree = parser.parse(src, None).unwrap();
+
+        let mut tokens = Vec::new();
+        fn extract_walk(node: tree_sitter::Node, src: &[u8], out: &mut Vec<String>) {
+            for r in crate::refs::extract_markdown_inline(&node, src, "id", "src", None) {
+                if let crate::refs::ExtractedRef::Ref { token, .. } = r {
+                    out.push(token);
+                }
+            }
+            let mut c = node.walk();
+            if c.goto_first_child() {
+                loop {
+                    if c.node().is_named() {
+                        extract_walk(c.node(), src, out);
+                    }
+                    if !c.goto_next_sibling() {
+                        break;
+                    }
+                }
+            }
+        }
+        extract_walk(inline_tree.root_node(), src, &mut tokens);
+
+        // The escaped backticks are prose, not a span — the grammar
+        // decides that, which is exactly why this is not a hand-rolled
+        // backtick scanner. The double-backtick span keeps its inner
+        // backticks after delimiter trimming.
+        assert_eq!(
+            tokens,
+            vec!["PartitionSpec::address".to_string(), "`render`".to_string()],
+            "delimiters and padding stripped; escaped backticks never emit"
         );
     }
 }

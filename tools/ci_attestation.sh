@@ -19,7 +19,14 @@ ci_snapshot() (
 
     cd "$repo_root"
     GIT_INDEX_FILE="$temporary_index" git read-tree HEAD
-    GIT_INDEX_FILE="$temporary_index" git add -A -- .
+    # The receipt claims "task ci passed for these INPUTS", and the bead
+    # export is not an input: nothing task ci runs reads .beads/ (asserted by
+    # tools/test_ci_attestation.sh against the real repo, so a subtask that
+    # starts consuming it fails the gate). Excluding that one path — not
+    # .beads/, not a general tolerate-churn mode — lets a bead filed during
+    # the run coexist with attestation (bead ley-line-open-080643). The
+    # excluded path keeps HEAD's entry from read-tree above.
+    GIT_INDEX_FILE="$temporary_index" git add -A -- . ':(exclude).beads/beads.jsonl'
     GIT_INDEX_FILE="$temporary_index" git write-tree
 )
 

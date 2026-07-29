@@ -10,6 +10,24 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The release workflow's image job installs capnproto** (`ley-line-open-e44960`).
+  v0.12.1's image jobs failed on `capnp codegen failed (is capnp on PATH?)` —
+  `leyline-schema-capnp`'s build script shells out to the capnp compiler, and
+  the `build` job installed those deps while the `image` job never did.
+
+  `release-dryrun.yml` caught this exact error on a branch first, and the fix
+  went into that file only. So the signal was correct and was applied to the
+  wrong place: **the OCI image has now failed on two consecutive tags for two
+  different reasons** — v0.12.0 on `cargo install krust` resolving to an
+  unrelated crates.io package, v0.12.1 on this.
+
+  Nothing enforces that the two workflows keep the same setup; today that was
+  verified by counting grep hits by hand. Tracked as `ley-line-open-2bea72`,
+  which proposes extending the existing `lint:toolchain-parity` precedent
+  rather than inventing a new gate.
+
 ## [0.12.1] — 2026-07-29
 
 Cut because three fixes landed on `main` after v0.12.0 was tagged, and two of
@@ -56,6 +74,31 @@ this project spent v0.11.3 and v0.12.0 closing — so it gets a release instead.
   describe a producer that publishes images and serves no MCP. `render()`
   refuses such a package rather than emit a document that fails its own
   declared `$schema`. Tracked as `notme-6e5330`.
+
+- **Two CI gates now mean what their names say** (`ley-line-open-085dff`,
+  `ley-line-open-49da9a`). Omitted from this entry when v0.12.1 was first
+  written, and added afterwards — the work shipped in #297, which is in this
+  tag.
+
+  `task image:smoke` **could not fail, only hang.** Its readiness probe sent no
+  ADR-0022 token, so the gate answered 401, `curl -sf` treated 4xx as failure,
+  and the container stayed up — neither loop condition could ever become true,
+  and there was no deadline. Observed at 10 minutes against a healthy daemon.
+  The step after it was independently vacuous: plain `curl -s`, piped to
+  `head`, asserting nothing, then an unconditional `echo "smoke passed"`. It
+  now authenticates, bounds every wait at 60s with container logs on failure,
+  and asserts `tools/list` returns a **non-empty** array.
+
+  The mutants check was named for the command it ran rather than what it
+  covered, so on a PR touching both `Taskfile.yml` and unrelated source it
+  rendered as an unqualified green while having mutated only the CDC allowlist.
+  It is now named for its coverage, triggers on all of `rs/**` (previously
+  `partition.rs` and the schema-bridge emitters got none), keeps the expensive
+  allowlist run conditional, and adds diff-scoped mutation whose cost is
+  proportional to the change rather than the codebase.
+
+  Both scripts moved to `tools/` so shellcheck can read them, which immediately
+  found an `eval` the YAML had been hiding.
 
 - **Partition invariants are asserted across every domain**
   (`ley-line-open-c3916b`). The `b67a73` framing regression survived upstream

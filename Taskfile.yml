@@ -261,6 +261,12 @@ tasks:
     cmds:
       - tools/test_go_schema_consumer.sh
 
+  schema:mcp-protocol-pin-test:
+    desc: Prove the vendored MCP wire schema (ley-line-open-60f0d3) is git-tracked, digest-pinned, and structurally the 2026-07-28 revision
+    dir: rs
+    cmds:
+      - cargo test -p leyline-mcp-protocol-schema
+
   release:version-check:
     desc: Require binary, schema, generated metadata, and docs to agree
     cmds:
@@ -1230,6 +1236,7 @@ tasks:
       - task: release:publish:fixture-test
       - task: release:retry:fixture-test
       - task: schema:consumer-fixture-test
+      - task: schema:mcp-protocol-pin-test
       - task: release:version-check
       - task: lint:blake3
       - task: lint:architecture-vocabulary

@@ -10,6 +10,78 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.12.1] — 2026-07-29
+
+Cut because three fixes landed on `main` after v0.12.0 was tagged, and two of
+them are what downstream is actually waiting on. Telling consumers to pin a git
+rev past the tag is exactly the "released is not the same as deliverable" gap
+this project spent v0.11.3 and v0.12.0 closing — so it gets a release instead.
+
+### Fixed
+
+- **capnp's native field defaults reach the generated output**
+  (`ley-line-open-f72fca`). `loud @0 :Bool = true` generated
+  `.default(false)` — the type's zero standing in for the value the schema
+  declares. `inputs/capnp.rs` never read `slot.defaultValue`, so a declared
+  default never reached any emitter; v0.12.0's implicit-default fill then
+  substituted the type zero.
+
+  Precedence is now `$Default` annotation → capnp `= value` → type implicit.
+  Covers `Bool`, `Text`, `Int32`, `UInt16` and both emitters — `json_schema.rs`
+  had the same blind spot, since both read the one IR field.
+
+  **cloister needs this**: any capnp field carrying a declared default has been
+  generating the wrong value since v0.12.0.
+
+### Added
+
+- **`mcp-descriptor` describes multiple packages, each with its own optional
+  transport** (`ley-line-open-44cc45`). `ServerMeta` carried a single
+  `oci_image`/`oci_version` and required a transport, so it modelled exactly
+  one producer — LLO — while claiming to be shared across ART.
+
+  Validation now runs **per package**, so a second entry cannot carry a tagged
+  identifier past a check that only looked at the first. The
+  `art.cloister/v1` block is omitted entirely when there are no groups rather
+  than emitted empty.
+
+  **mache needs this**: two transports are two `packages[]` entries. Their
+  original `Vec<Transport>` request would have emitted invalid JSON — the MCP
+  schema has `transport` as a single `$ref`, not an array.
+
+  LLO's own `server.json` is byte-identical across this change.
+
+  **notme still cannot adopt it**, and that is a spec limitation rather than a
+  gap here: `Package.required` includes `transport`, so the MCP schema cannot
+  describe a producer that publishes images and serves no MCP. `render()`
+  refuses such a package rather than emit a document that fails its own
+  declared `$schema`. Tracked as `notme-6e5330`.
+
+- **Partition invariants are asserted across every domain**
+  (`ley-line-open-c3916b`). The `b67a73` framing regression survived upstream
+  CI because `framing_is_committed_to_the_address` tested `ByteStream` only —
+  a universal-sounding name over a one-domain body — leaving the invariant's
+  sole detector in a downstream repo. A parametrized harness now covers all
+  three domains; reproducing the regression byte-for-byte fails it, while the
+  old test still passes under the same mutation.
+
+### Changed
+
+- **The OCI image builds with `cargo-zigbuild` instead of krust**
+  (`ley-line-open-e44960`). v0.12.0's image jobs failed and could never have
+  succeeded: the workflow ran `cargo install krust --locked`, but the krust in
+  use was a local `/tmp` path install while the `krust` on crates.io is an
+  unrelated abandoned Vulkan bindings wrapper. Installing by bare name does not
+  belong in a release path.
+
+  **v0.12.1 is therefore the first release that publishes an OCI image.**
+
+- **The release path is exercised on PRs** (`release-dryrun.yml`) — build and
+  stage only, no publish, no registry credential, no OIDC identity. It found a
+  missing `capnproto` dependency on its first run, on a branch rather than on a
+  tag, which is the entire argument for it.
+
+
 ## [0.12.0] — 2026-07-28
 
 Minor rather than patch: the partition-address fix below changes set-domain

@@ -72,9 +72,9 @@ task install:full+mount   # add FUSE/NFS support
 task ci                   # check, clippy, formatting, tests, FFI gates
 ```
 
-The current release is `v0.12.0`. It publishes platform binaries, FFI
+The current release is `v0.12.1`. It publishes platform binaries, FFI
 staticlibs, and the Apache-2.0 Go schema module at
-`clients/go/leyline-schema/v0.12.0`. See
+`clients/go/leyline-schema/v0.12.1`. See
 [releases/latest](https://github.com/agentic-research/ley-line-open/releases/latest)
 for assets and [GETTING-STARTED.md](GETTING-STARTED.md) for download commands.
 
@@ -94,7 +94,7 @@ them per platform, so consuming one is a download rather than a Rust build:
 ```bash
 # capnp resolves `-o<plugin>` by PATH-searching `capnpc-<plugin>`, so the
 # schema-bridge assets must be installed under their unsuffixed names.
-curl -fsSLO https://github.com/agentic-research/ley-line-open/releases/download/v0.12.0/capnpc-schema-bridge-zod-darwin-arm64
+curl -fsSLO https://github.com/agentic-research/ley-line-open/releases/download/v0.12.1/capnpc-schema-bridge-zod-darwin-arm64
 install -m 0755 capnpc-schema-bridge-zod-darwin-arm64 ~/.local/bin/capnpc-schema-bridge-zod
 ```
 
@@ -112,18 +112,18 @@ dependency and build a build-tool from source — which meant a fix could be
 ## OCI image
 
 `task image` builds a local distroless OCI image tagged
-`localhost/leyline:v0.12.0` (equivalently `ley-line-open:v0.12.0`). It uses
+`localhost/leyline:v0.12.1` (equivalently `ley-line-open:v0.12.1`). It uses
 krust/cargo-zigbuild for the static binary
 and `cgr.dev/chainguard/static:latest` as the runtime base.
 
 Pushing a `v*` tag publishes the multi-arch image (linux/amd64 + linux/arm64)
-to `ghcr.io/agentic-research/ley-line-open:v0.12.0`, with a
+to `ghcr.io/agentic-research/ley-line-open:v0.12.1`, with a
 [build-provenance attestation](https://docs.github.com/actions/security-guides/using-artifact-attestations)
 recorded against the pushed digest:
 
 ```bash
-docker pull ghcr.io/agentic-research/ley-line-open:v0.12.0
-gh attestation verify oci://ghcr.io/agentic-research/ley-line-open:v0.12.0 \
+docker pull ghcr.io/agentic-research/ley-line-open:v0.12.1
+gh attestation verify oci://ghcr.io/agentic-research/ley-line-open:v0.12.1 \
   --repo agentic-research/ley-line-open
 ```
 

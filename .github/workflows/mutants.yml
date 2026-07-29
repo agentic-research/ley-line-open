@@ -8,13 +8,21 @@ name: Mutation testing
 # Path-filtered and separate from `ci.yml` because it takes ~7 min. Same
 # taskfile-ci-parity rule as everything else: this workflow invokes
 # `task mutants`, it does not re-implement the command.
+# Broadened to all Rust (`ley-line-open-085dff`). Previously this fired only on
+# the allowlist paths, so a PR touching `partition.rs` or the schema-bridge
+# emitters — the two places that produced silent wrong-output bugs this week —
+# got no mutation coverage at all.
+#
+# Broadening is affordable only because the diff-scoped run costs time
+# proportional to the DIFF rather than the codebase. The expensive allowlist run
+# stays conditional on the allowlist actually being touched; see the step guard
+# below. Without that guard this would add ~7 min to every Rust PR, and a gate
+# people route around has already failed.
 on:
   pull_request:
     branches: [main]
     paths:
-      - 'rs/ll-open/cdc/**'
-      - 'rs/ll-open/fs/src/chunked.rs'
-      - 'rs/ll-open/fs/src/gc.rs'
+      - 'rs/**'
       - 'Taskfile.yml'
       - '.github/workflows/mutants.yml'
   workflow_dispatch:
@@ -24,11 +32,22 @@ env:
 
 jobs:
   mutants:
-    name: cargo mutants (task mutants)
+    # Named for WHAT IT COVERS, not for the command it runs. It previously read
+    # `cargo mutants (task mutants)`, which on a PR touching both Taskfile.yml
+    # and unrelated source rendered as an unqualified green — a reader
+    # reasonably concluded the PR's new logic survived mutation testing, when
+    # the run had covered the CDC allowlist and nothing the PR changed
+    # (`ley-line-open-085dff`).
+    name: cargo mutants (allowlist + this PR's diff)
     runs-on: ubuntu-latest
     steps:
       # SHA-pinned: actions/checkout@v6.0.2 (Node 24)
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          # The diff-scoped run needs the merge base, which a depth-1 checkout
+          # does not have. Without this, the diff comes out empty and
+          # `mutants:diff` reports SKIPPED — green, having tested nothing.
+          fetch-depth: 0
       # SHA-pinned: dtolnay/rust-toolchain. Same nightly pin as ci.yml
       # (bead ley-line-open-75444d) so a mutant run can't fail for a
       # toolchain reason CI wouldn't also hit.
@@ -56,8 +75,57 @@ jobs:
           version: 3.49.1
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: task mutants
+      # Which of the two runs are warranted for THIS PR. Computed from the diff
+      # rather than from a paths filter, because the workflow-level filter is
+      # now deliberately broad and the two runs answer different questions.
+      - name: Decide which runs apply
+        id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
+          changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
+          # The allowlist run is ~7 min, so it fires only when the modules it
+          # covers changed, OR when the task definitions themselves changed —
+          # editing `mutants:*` should re-verify the gate still runs, which is
+          # the reason Taskfile.yml is a trigger at all.
+          if printf '%s\n' "$changed" | grep -qE \
+            '^(rs/ll-open/cdc/|rs/ll-open/fs/src/(chunked|gc)\.rs|rs/ll-core/core/src/partition\.rs|Taskfile\.yml|\.github/workflows/mutants\.yml)'; then
+            echo "allowlist=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "allowlist=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::allowlist run skipped — this PR touches none of the covered modules"
+          fi
+
+      # Full coverage of the modules carrying falsifiable claims. Answers "do
+      # the tests for THOSE modules still bite?"
+      - name: task mutants (allowlist)
+        if: steps.scope.outputs.allowlist == 'true'
         run: task mutants
+
+      # The diff: coverage of what THIS PR changed. Answers the question the
+      # allowlist cannot, and costs time proportional to the diff rather than
+      # to the codebase (a whole-workspace run enumerates 5806 mutants).
+      #
+      # `--relative=rs` is load-bearing. cargo-mutants runs in `rs/`, so the
+      # diff's paths must be workspace-relative (`a/ll-core/...`). A diff made
+      # from the repo root carries `a/rs/ll-core/...`, matches nothing, prints
+      # "No mutants to filter" and EXITS 0 — a permanently green check that
+      # tests nothing, from a path prefix. `task mutants:diff` detects that
+      # case and fails rather than passing; this line is what keeps it from
+      # having to.
+      - name: Generate workspace-relative diff
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
+          git diff --relative=rs "$BASE_SHA...$HEAD_SHA" -- rs/ > /tmp/pr.diff
+          wc -l < /tmp/pr.diff
+
+      - name: task mutants:diff (this PR)
+        run: task mutants:diff DIFF=/tmp/pr.diff
 
       # The report says which mutants survived and where — far more useful
       # than the exit code when this job goes red.

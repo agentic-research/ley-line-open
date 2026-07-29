@@ -758,13 +758,93 @@ tasks:
   # NOT in `task ci`: ~3 min warm, and it rebuilds per mutant so a cold run is
   # several times that. Runs in its own path-filtered workflow
   # (.github/workflows/mutants.yml) and on demand via `task mutants`.
+  #
+  # ── The coverage ladder (`ley-line-open-085dff`) ──────────────────────────
+  #
+  # Two complementary modes, because they answer different questions:
+  #
+  #   `mutants`        FULL coverage of an allowlist. Answers "do the tests for
+  #                    THIS module still bite?" Grows one justified entry at a
+  #                    time. A whole-workspace run enumerates 5806 mutants and
+  #                    is not a thing anyone will wait for.
+  #
+  #   `mutants:diff`   Coverage of the lines a change touches. Answers "are the
+  #                    tests for THIS PR real?" Cost is proportional to the
+  #                    diff, so it can be on for everything.
+  #
+  # Add a rung when a real defect justifies it, not when a file seems
+  # important. Current allowlist and why each earned it:
+  #
+  #   leyline-cdc, chunked.rs   the overlap-predicate class described above
+  #   gc.rs                     transactional reachability + accounting
+  #   ll-core/core/partition.rs `ad272d3` collided materially different
+  #                             decompositions into one address, and the only
+  #                             detector was in a DOWNSTREAM repo's tree
+  #                             (`ley-line-open-afa8be`). A collision in a
+  #                             content-addressed substrate is the worst
+  #                             failure class here: silent, corrupts identity,
+  #                             and every layer above inherits it.
+  #
+  # Climb the ladder in tier order, because the tier boundary decides the cost.
+  # `ll-core/*` compiles without `ll-open/*` (the tier-isolation gate), so those
+  # crates mutate with no feature incantation at all — note `mutants:fs` needs
+  # `--no-default-features --features cdc,splice,validate` purely because
+  # leyline-fs reaches libfuse. Ask "which tier is this in?" before "is this
+  # important?": a file in the wrong tier is expensive to mutate regardless.
+  #
+  # Next rungs, both already tier-clean: the schema-bridge emitters
+  # (`8c00c6` and `f72fca` were both silent WRONG-OUTPUT bugs this week — the
+  # class mutation testing is good at and review is bad at).
   # --------------------------------------------------------------------------
   mutants:
-    desc: Mutation-test the CDC + chunked-content path. Fails if any mutant survives.
+    desc: Mutation-test the allowlist (CDC, chunked path, partition address). Fails if any mutant survives.
     cmds:
       - task: mutants:cdc
       - task: mutants:fs
       - task: mutants:fs-gc
+      - task: mutants:partition
+
+  mutants:partition:
+    desc: Mutation-test the partition address fold — the Σ address algebra.
+    dir: rs
+    # `leyline-core` is tier-isolated, so no feature flags are needed here —
+    # contrast `mutants:fs` below. Earned its place via `ley-line-open-afa8be`:
+    # the set-domain fold dropped Entry framing, collapsing different
+    # decompositions onto one address, and upstream tests stayed green because
+    # the one that checked framing covered a single domain of three
+    # (`ley-line-open-c3916b`).
+    cmds:
+      - >-
+        cargo mutants -p leyline-core --test-workspace=false
+        -C --lib --file ll-core/core/src/partition.rs
+
+  mutants:diff:
+    desc: Mutation-test only the lines a diff touches. Requires DIFF=<path>.
+    dir: rs
+    requires:
+      vars: [DIFF]
+    # THREE outcomes, deliberately distinguished. Two of them exit 0 in a naive
+    # implementation and are indistinguishable from success:
+    #
+    #   tested N        mutants ran; survivors fail the gate.
+    #   SKIPPED         the diff changes no Rust. Nothing ran — reported as
+    #                   skipped, never as a pass.
+    #   MISCONFIGURED   the diff DOES change Rust but enumerated zero mutants.
+    #                   Hard failure.
+    #
+    # The third is the trap this task exists to avoid. `cargo mutants` runs in
+    # `rs/`, so the diff's paths must be workspace-relative (`a/ll-core/...`).
+    # A diff produced from the repo root carries `a/rs/ll-core/...`, matches
+    # nothing, prints "No mutants to filter", and EXITS 0 — a permanently green
+    # check that tests nothing, from a path prefix. Generate the diff with
+    # `git diff --relative=rs`.
+    cmds:
+      # Logic in tools/mutants_diff.sh — same reasoning as image:smoke. The
+      # three-state reporting below is conditional enough that it belongs
+      # somewhere shellcheck can read it.
+      # ROOT_DIR-anchored: this task sets `dir: rs`, so a bare relative path
+      # would resolve to rs/tools/ and not exist.
+      - '{{.ROOT_DIR}}/tools/mutants_diff.sh "{{.DIFF}}"'
 
   mutants:fs:
     desc: Mutation-test leyline-fs::chunked (the SQL materialize-on-read path).
@@ -921,20 +1001,14 @@ tasks:
           --platform {{.PLATFORM}} \
           -p 127.0.0.1:{{.HOST_PORT}}:8384 \
           {{.IMAGE_REF}}
-      - |
-        until curl -sf -m 1 -X POST http://localhost:{{.HOST_PORT}}/mcp \
-            -H 'Content-Type: application/json' -d '{}' >/dev/null 2>&1 \
-          || ! docker ps -q --filter name=llo-smoke | grep -q .; do
-          sleep 0.3
-        done
-      - |
-        echo "== tools/list =="
-        curl -s -X POST http://localhost:{{.HOST_PORT}}/mcp \
-          -H 'Content-Type: application/json' \
-          -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | head -c 400
-        echo
-      - docker stop llo-smoke
-      - echo "smoke passed"
+      # Logic lives in tools/image_smoke.sh, not inline here. It was three
+      # near-identical deadline loops embedded in YAML, where shellcheck cannot
+      # see them and nothing can test them — the same reasoning that puts the
+      # release staging logic in tools/. Extracting it immediately earned its
+      # keep: shellcheck flagged an `eval` (SC2016) that YAML had been hiding.
+      - >-
+        IMAGE_REF={{.IMAGE_REF}} PLATFORM={{.PLATFORM}} HOST_PORT={{.HOST_PORT}}
+        tools/image_smoke.sh
 
   # `image:publish` and `image:verify-published` exist because a well-formed
   # OCI address for an image nobody publishes is WORSE than a malformed one

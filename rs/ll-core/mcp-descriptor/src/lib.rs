@@ -57,7 +57,9 @@ pub struct ServerMeta<'a> {
     pub repository_url: &'a str,
     /// Forge identifier, e.g. `"github"`.
     pub repository_source: &'a str,
-    /// The OCI packages this producer publishes. **At least one.**
+    /// The OCI packages this producer publishes as MCP-registry `packages[]`
+    /// entries. **At least one of [`Self::packages`] or [`Self::artifacts`]
+    /// must be non-empty.**
     ///
     /// A list, not a single image, because real producers ship more than one:
     /// notme publishes `notme` and `notme-proxy` from one `v*` tag
@@ -66,6 +68,28 @@ pub struct ServerMeta<'a> {
     /// an array, so two transports are also two packages rather than one
     /// package with a transport list.
     pub packages: Vec<PackageMeta<'a>>,
+    /// OCI artifacts this producer publishes but does **not** serve as MCP.
+    ///
+    /// The schema's `Package.required` includes `transport`
+    /// (`ley-line-open-44cc45`), so a producer with no MCP surface — notme is
+    /// the motivating case, an identity authority with no tools — cannot
+    /// declare its images as `packages[]` without either a placeholder
+    /// transport (a runtime lie: cloister derives session behaviour from it)
+    /// or a schema violation. `artifacts` is the sanctioned way to say "this
+    /// image exists and this is its address" without claiming to serve MCP:
+    /// each entry renders into the extension slot
+    /// `_meta."io.modelcontextprotocol.registry/publisher-provided".artifacts`,
+    /// which the schema declares `additionalProperties: true` specifically so
+    /// downstream registries can carry producer-defined data the core spec
+    /// does not model.
+    ///
+    /// Upstream follow-up: the registry schema should model non-serving
+    /// publishers directly (bead `ley-line-open-0135fa`) — an SEP, not a
+    /// per-producer workaround. Until one lands, the publisher-provided
+    /// extension is the sanctioned slot.
+    ///
+    /// A descriptor may declare only packages, only artifacts, or both.
+    pub artifacts: Vec<ArtifactMeta<'a>>,
 }
 
 /// One published artifact: its address, its tag, and how (or whether) it
@@ -117,6 +141,25 @@ pub struct TransportMeta<'a> {
     pub url: &'a str,
 }
 
+/// One published OCI artifact that is not an MCP `packages[]` entry.
+///
+/// [`PackageMeta`] minus [`PackageMeta::transport`] — same identity fields,
+/// same ADR-0041 tagless-identifier + sibling-version pairing, but no
+/// transport, because declaring one here would assert the artifact serves
+/// MCP, which is the exact claim a producer with no MCP surface must not
+/// make. See [`ServerMeta::artifacts`] for why this exists as a distinct
+/// list rather than an optional field on [`PackageMeta`].
+#[derive(Debug, Clone)]
+pub struct ArtifactMeta<'a> {
+    /// OCI image path, **without tag or digest**. Same rule as
+    /// [`PackageMeta::oci_image`] — cloister ADR-0041.
+    pub oci_image: &'a str,
+    /// The image tag, carried as a sibling of [`Self::oci_image`]. Same rule
+    /// as [`PackageMeta::oci_version`] — MUST equal the tag the publish job
+    /// actually pushes.
+    pub oci_version: &'a str,
+}
+
 /// A tool the server registers. Only the name participates in coverage.
 #[derive(Debug, Clone, Copy)]
 pub struct ToolRef<'a> {
@@ -141,6 +184,13 @@ struct ServerDoc<'a> {
     description: &'a str,
     version: &'a str,
     repository: Repository<'a>,
+    // Absent, not `[]`, for an artifact-only descriptor (`ley-line-open-0135fa`).
+    // `packages[]` is optional in the vendored schema's top-level `required`
+    // (name, description, version only) — an empty array would still be
+    // schema-valid, but an absent key is the honest signal that this
+    // producer declares no `packages[]` entries at all, mirroring how `_meta`
+    // below is omitted rather than emitted empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     packages: Vec<Package<'a>>,
     #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
     meta: Option<Meta<'a>>,
@@ -175,10 +225,26 @@ struct Transport<'a> {
     url: &'a str,
 }
 
+// `_meta` has two independent occupants, each a sibling key under its own
+// reverse-DNS namespace: `art.cloister/v1` (this crate's own extension) and
+// `io.modelcontextprotocol.registry/publisher-provided` (the schema's
+// sanctioned catch-all, `additionalProperties: true`). Modelling them as two
+// `Option` fields on one struct — rather than building `_meta` as a bag of
+// dynamically-inserted keys — is itself the merge-not-clobber guarantee:
+// populating one can never touch or overwrite the other, and a value present
+// in neither is omitted because `Option::is_none` skips it. If a second
+// occupant of `publisher-provided` itself (e.g. `buildInfo`, `tool` — see the
+// schema's own example) is ever needed, it becomes a third field on
+// [`PublisherProvided`] below, not a reason to revisit this shape.
 #[derive(Serialize)]
 struct Meta<'a> {
-    #[serde(rename = "art.cloister/v1")]
-    art_cloister_v1: ArtCloisterV1<'a>,
+    #[serde(rename = "art.cloister/v1", skip_serializing_if = "Option::is_none")]
+    art_cloister_v1: Option<ArtCloisterV1<'a>>,
+    #[serde(
+        rename = "io.modelcontextprotocol.registry/publisher-provided",
+        skip_serializing_if = "Option::is_none"
+    )]
+    publisher_provided: Option<PublisherProvided<'a>>,
 }
 
 #[derive(Serialize)]
@@ -193,6 +259,28 @@ struct GroupOut<'a> {
     advertised_prefix: &'a str,
     #[serde(rename = "upstreamNames")]
     upstream_names: Vec<&'a str>,
+}
+
+/// `io.modelcontextprotocol.registry/publisher-provided`. The schema
+/// declares this `additionalProperties: true` — an open extension object —
+/// so this type carries only the one key this crate populates. See the
+/// comment on [`Meta`] for why adding a second field here is the correct
+/// extension point rather than a reason to change how `_meta` is assembled.
+#[derive(Serialize)]
+struct PublisherProvided<'a> {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    artifacts: Vec<ArtifactOut<'a>>,
+}
+
+/// [`ArtifactMeta`] on the wire — same three fields as [`Package`] minus
+/// `transport` and `environmentVariables`, since neither means anything for
+/// an entry that only exists to name a published image.
+#[derive(Serialize)]
+struct ArtifactOut<'a> {
+    #[serde(rename = "registryType")]
+    registry_type: &'a str,
+    identifier: &'a str,
+    version: &'a str,
 }
 
 // ── the one entry point ──────────────────────────────────────────────────────
@@ -214,7 +302,10 @@ struct GroupOut<'a> {
 ///   serves it is undefined
 /// - a **ghost**: a group naming a tool that is not registered — the manifest
 ///   advertises a tool the server does not have
-/// - a tagged or digest-pinned `oci_image` (cloister ADR-0041)
+/// - a tagged or digest-pinned `oci_image`, in either `packages` or
+///   `artifacts` (cloister ADR-0041)
+/// - neither `packages` nor `artifacts` declared — nothing to derive
+///   `<identifier>:<version>` from
 ///
 /// Group order and `upstream_names` order are preserved exactly as given, so a
 /// producer controls its own diff stability.
@@ -223,15 +314,19 @@ pub fn render(
     tools: &[ToolRef<'_>],
     groups: &[GroupRef<'_>],
 ) -> Result<String> {
-    // A descriptor with no packages names no artifact, so `<identifier>:<version>`
+    // A descriptor with neither names no artifact, so `<identifier>:<version>`
     // derives from nothing. That is the v0.11.2 failure with the address absent
-    // rather than malformed.
-    if meta.packages.is_empty() {
+    // rather than malformed. `artifacts` is an equally valid source of that
+    // derivation (`ley-line-open-0135fa`) — a producer with no MCP surface
+    // still needs at least one way to say what it publishes.
+    if meta.packages.is_empty() && meta.artifacts.is_empty() {
         bail!(
-            "no packages declared. A descriptor exists so a consumer can derive \
-             `<identifier>:<version>` (cloister ADR-0038); with no packages there is \
-             nothing to derive and the file describes an artifact that cannot be \
-             fetched.",
+            "no packages or artifacts declared. A descriptor exists so a consumer \
+             can derive `<identifier>:<version>` (cloister ADR-0038) — from \
+             `packages[]` for a producer that serves MCP, or from the \
+             publisher-provided `artifacts` extension for one that does not; with \
+             neither there is nothing to derive and the file describes something \
+             that cannot be fetched.",
         );
     }
 
@@ -272,16 +367,17 @@ pub fn render(
         // silently would be worse than refusing.
         //
         // This is a real spec limitation, not an oversight here: the MCP
-        // schema has no way to describe a producer that publishes images and
-        // serves no MCP. notme is such a producer, and its own descriptor says
-        // the file "exists for the ADR-0041 image-publish contract … not an
-        // MCP registry entry" — which is precisely the case the schema cannot
-        // express. Its committed server.json omits `transport` on both
-        // packages and is therefore schema-invalid today.
-        //
-        // Resolving that needs an ecosystem decision (a package-identity
-        // manifest distinct from an MCP registry entry), not a quiet
-        // workaround here. Tracked on `ley-line-open-44cc45`.
+        // schema has no way to describe a `packages[]` entry for a producer
+        // that publishes images and serves no MCP. `ley-line-open-0135fa`
+        // resolved this at the ecosystem level: such a producer declares
+        // [`ServerMeta::artifacts`] instead of `packages`, which renders into
+        // the publisher-provided `_meta` extension the schema reserves for
+        // exactly this kind of producer-defined data (see that field's
+        // doc comment). A `packages[]` entry, once declared, is still an MCP
+        // claim and still requires `transport` — this check does not soften
+        // for that case, it stays refused, on purpose: `packages` and
+        // `artifacts` are different claims, not interchangeable spellings of
+        // the same one.
         if pkg.transport.is_none() {
             bail!(
                 "packages[{i}] (`{}`) declares no transport, but the MCP registry \
@@ -291,6 +387,30 @@ pub fn render(
                  MCP; that needs a package-identity manifest distinct from an MCP \
                  registry entry. See `ley-line-open-44cc45`.",
                 pkg.oci_image,
+            );
+        }
+    }
+
+    // Same two ADR-0041 checks as packages above, minus the transport
+    // requirement — that is the entire difference between the two lists.
+    // Per-entry for the same reason as packages: a second artifact smuggling
+    // a tagged identifier past a check that only looked at the first must not
+    // slip through.
+    for (i, art) in meta.artifacts.iter().enumerate() {
+        if art.oci_image.contains(':') || art.oci_image.contains('@') {
+            bail!(
+                "artifacts[{i}].oci_image `{}` carries a tag or digest; cloister \
+                 ADR-0041 requires the registry path alone, the same rule this \
+                 crate enforces for `packages[]`.",
+                art.oci_image,
+            );
+        }
+
+        if art.oci_version.is_empty() {
+            bail!(
+                "artifacts[{i}].oci_version is empty. The derive rule is \
+                 `<identifier>:<version>`; an address with no version resolves \
+                 to nothing, the same failure this crate rejects for `packages[]`.",
             );
         }
     }
@@ -374,24 +494,47 @@ pub fn render(
                 environment_variables: vec![],
             })
             .collect(),
-        // Omitted entirely when the producer declares no groups. An empty
-        // `art.cloister/v1` block would advertise a cloister surface that does
-        // not exist; notme's own descriptor makes the point — declaring one
-        // there would make cloister "generate backends for tools that do not
-        // exist." Absence is the correct signal, not an empty object.
-        meta: if groups.is_empty() {
+        // `art_cloister_v1` is omitted entirely when the producer declares no
+        // groups. An empty `art.cloister/v1` block would advertise a cloister
+        // surface that does not exist; notme's own descriptor makes the point
+        // — declaring one there would make cloister "generate backends for
+        // tools that do not exist." Absence is the correct signal, not an
+        // empty object. Likewise `publisher_provided` is omitted when there
+        // are no artifacts. Both are independent `Option`s on the same
+        // struct, so setting one never overwrites the other — see the
+        // comment on [`Meta`].
+        meta: if groups.is_empty() && meta.artifacts.is_empty() {
             None
         } else {
             Some(Meta {
-                art_cloister_v1: ArtCloisterV1 {
-                    groups: groups
-                        .iter()
-                        .map(|g| GroupOut {
-                            name: g.name,
-                            advertised_prefix: g.advertised_prefix,
-                            upstream_names: g.upstream_names.clone(),
-                        })
-                        .collect(),
+                art_cloister_v1: if groups.is_empty() {
+                    None
+                } else {
+                    Some(ArtCloisterV1 {
+                        groups: groups
+                            .iter()
+                            .map(|g| GroupOut {
+                                name: g.name,
+                                advertised_prefix: g.advertised_prefix,
+                                upstream_names: g.upstream_names.clone(),
+                            })
+                            .collect(),
+                    })
+                },
+                publisher_provided: if meta.artifacts.is_empty() {
+                    None
+                } else {
+                    Some(PublisherProvided {
+                        artifacts: meta
+                            .artifacts
+                            .iter()
+                            .map(|a| ArtifactOut {
+                                registry_type: "oci",
+                                identifier: a.oci_image,
+                                version: a.oci_version,
+                            })
+                            .collect(),
+                    })
                 },
             })
         },
@@ -421,6 +564,7 @@ mod tests {
                     url: "http://localhost:1234/mcp",
                 }),
             }],
+            artifacts: vec![],
         }
     }
 

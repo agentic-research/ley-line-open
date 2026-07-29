@@ -103,4 +103,68 @@ git -C "$fixture" commit -qm "invalidate receipt"
 )
 test "$(cat "$TASK_COUNT")" -eq 1
 
-echo "CI attestation fixture proved exact-tree reuse and fail-closed invalidation"
+# The receipt attests "task ci passed for these INPUTS", and .beads/beads.jsonl
+# is not an input: nothing task ci runs reads it (asserted below against the
+# real repo). A bead filed while task ci runs must therefore not destroy the
+# run (bead ley-line-open-080643 — this cost three full runs in one session).
+mkdir -p "$fixture/.beads"
+printf '%s\n' '{"id":"fixture-000001"}' > "$fixture/.beads/beads.jsonl"
+git -C "$fixture" add .beads/beads.jsonl
+git -C "$fixture" commit -qm "track bead export"
+(
+    cd "$fixture"
+    tools/ci_attestation.sh begin
+    printf '%s\n' '{"id":"fixture-000002"}' >> .beads/beads.jsonl
+    if ! tools/ci_attestation.sh finish; then
+        echo "bead export write during task ci destroyed the attestation" >&2
+        exit 1
+    fi
+    tools/ci_attestation.sh check
+)
+
+# The exclusion is that one path, nothing wider: a source edit in the same
+# window must still invalidate, even when accompanied by bead churn.
+(
+    cd "$fixture"
+    tools/ci_attestation.sh begin
+    printf '%s\n' '{"id":"fixture-000003"}' >> .beads/beads.jsonl
+    printf '%s\n' "source edited during CI" > tracked.txt
+    if tools/ci_attestation.sh finish; then
+        echo "source edit hidden by concurrent bead churn was attested" >&2
+        exit 1
+    fi
+)
+git -C "$fixture" restore tracked.txt
+
+# A tracked file elsewhere under .beads/ is NOT excluded — only beads.jsonl.
+(
+    cd "$fixture"
+    printf '%s\n' "other" > .beads/other.txt
+    git add .beads/other.txt
+    git commit -qm "track another .beads file"
+    tools/ci_attestation.sh begin
+    printf '%s\n' "changed during CI" > .beads/other.txt
+    if tools/ci_attestation.sh finish; then
+        echo "exclusion is wider than .beads/beads.jsonl" >&2
+        exit 1
+    fi
+)
+
+# The exclusion rests on a fact that must stay true: no file task ci can
+# execute reads .beads/. Assert it against the real repo, not the fixture,
+# so a future subtask that consumes the export re-fails this gate instead of
+# silently trusting an input the receipt no longer covers.
+beads_readers=$(
+    git -C "$repo_root" ls-files 'Taskfile.yml' '*/Taskfile.yml' 'tools/*.sh' '.github/workflows/*.yml' |
+        grep -v -e '^tools/ci_attestation\.sh$' -e '^tools/test_ci_attestation\.sh$' |
+        while IFS= read -r f; do
+            grep -l '\.beads' "$repo_root/$f" || true
+        done
+)
+if [ -n "$beads_readers" ]; then
+    echo "task ci-reachable files reference .beads/ — the attestation exclusion is no longer sound:" >&2
+    printf '%s\n' "$beads_readers" >&2
+    exit 1
+fi
+
+echo "CI attestation fixture proved exact-tree reuse, fail-closed invalidation, and bead-export exclusion"

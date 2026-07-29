@@ -135,7 +135,7 @@ async fn version_op_returns_known_shape() {
         env!("CARGO_PKG_VERSION"),
         "binary_version must equal CARGO_PKG_VERSION at the consumer site",
     );
-    assert_eq!(bv, "0.12.1", "release metadata must pin the v0.12.1 binary");
+    assert_eq!(bv, "0.13.0", "release metadata must pin the v0.13.0 binary");
 
     // `schema_version` is the independently versioned public schema contract.
     // v0.10.4 established daemon/wire as a supported public consumer surface;
@@ -147,7 +147,7 @@ async fn version_op_returns_known_shape() {
         .and_then(|v| v.as_str())
         .expect("schema_version must be a string");
     assert_eq!(
-        sv, "0.12.1",
+        sv, "0.13.0",
         "the supported public daemon/wire API must carry the release version",
     );
 

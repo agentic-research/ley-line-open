@@ -53,16 +53,6 @@ jobs:
           # the Cargo registry/git inputs.
           cache-targets: false
 
-      - name: Install system deps (libfuse for fuser, capnproto + libcapnp-dev for schema build.rs)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends capnproto libcapnp-dev libdbus-1-dev libfuse-dev pkg-config
-          # libcapnp-dev ships /usr/include/capnp/c++.capnp and the other
-          # standard schema includes that the capnp compiler resolves
-          # `using Cxx = import "/capnp/c++.capnp";`-style imports against.
-          # Required by capnp-json's build script (b0ea2e) — the
-          # capnproto package alone ships only the binaries.
-
       # SHA-pinned: arduino/setup-task@v2.0.0 (Taskfile runner, the golden
       # path; see Taskfile.yml at the repo root).
       # TODO: bump to a Node 24 release once arduino/setup-task#1359 ships
@@ -75,6 +65,14 @@ jobs:
           # close. Bump deliberately, together with local installs.
           version: 3.49.1
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # System deps (libfuse for fuser, capnproto + libcapnp-dev for schema
+      # build.rs, libdbus-1-dev for keyring) live in Taskfile deps:ci —
+      # single source across ci.yml/release.yml/release-dryrun.yml/
+      # leyline-schema-go.yml, enforced by `task lint:workflow-parity`
+      # (bead ley-line-open-2bea72).
+      - name: Install system deps
+        run: task deps:ci
 
       # Compiler outputs use the same Taskfile-managed sccache path locally
       # and on runners. The Taskfile pins + verifies the executable; this

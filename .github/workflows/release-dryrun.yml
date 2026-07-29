@@ -62,19 +62,16 @@ jobs:
         with:
           cache-targets: false
 
-      # Same system deps ci.yml and release.yml install. Omitting them is what
-      # made this workflow fail its own first run:
+      # Same Taskfile deps:capnp target ci.yml and release.yml call. Omitting
+      # this install is what made this workflow fail its own first run:
       #
       #   capnp codegen failed (is `capnp` on PATH?)
       #
       # `leyline-schema-capnp`'s build script shells out to the capnp compiler,
       # and libcapnp-dev (not the capnproto package alone) ships the standard
       # schema includes that `import "/capnp/c++.capnp"` resolves against.
-      - name: Install system deps (capnproto + libcapnp-dev + pkg-config)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends capnproto libcapnp-dev pkg-config
-          capnp --version
+      - name: Install system deps
+        run: task deps:capnp
 
       # One target, not the full matrix. The failures this guards against are
       # in the SHARED logic — the staging contract, the asserted asset set, the
@@ -145,23 +142,18 @@ jobs:
         with:
           toolchain: 1.97.1
 
-      # Same system deps as the stage job — the image build compiles the same
-      # workspace and hits the same capnp build script.
-      - name: Install system deps (capnproto + libcapnp-dev + pkg-config)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends capnproto libcapnp-dev pkg-config
-          capnp --version
+      # Same Taskfile deps:capnp target as the stage job — the image build
+      # compiles the same workspace and hits the same capnp build script.
+      - name: Install system deps
+        run: task deps:capnp
 
       # The exact step that failed on the v0.12.0 tag. It ran `cargo install
       # krust --locked`, where the local krust was a /tmp path install and the
       # crates.io `krust` is an unrelated 2016 Vulkan wrapper. Running this on
-      # a PR is the whole point of this workflow.
+      # a PR is the whole point of this workflow. Same deps:zig target
+      # release.yml's image job calls (bead ley-line-open-2bea72).
       - name: Install zig toolchain
-        run: |
-          cargo install cargo-zigbuild --locked
-          python3 -m pip install --break-system-packages ziglang
-          rustup target add x86_64-unknown-linux-musl
+        run: task deps:zig RUST_TARGET=x86_64-unknown-linux-musl
 
       # `task image` builds and tags locally. No `docker login`, no push — the
       # job holds no registry credential, so it could not push if it tried.

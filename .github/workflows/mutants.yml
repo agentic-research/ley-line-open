@@ -59,13 +59,6 @@ jobs:
         with:
           workspaces: rs
 
-      # Installed from source rather than via a prebuilt-binary action: every
-      # other action here is SHA-pinned against a commit verified in-repo, and
-      # adding an unvetted third-party action to save ~2 min isn't a trade this
-      # repo makes. --locked so the build can't drift with a transitive bump.
-      - name: Install cargo-mutants
-        run: cargo install cargo-mutants --locked
-
       - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611
         with:
           # Exact, not `3.x`: a floating minor means the runner can pick up a
@@ -74,6 +67,14 @@ jobs:
           # close. Bump deliberately, together with local installs.
           version: 3.49.1
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Installed from source rather than via a prebuilt-binary action: every
+      # other action here is SHA-pinned against a commit verified in-repo, and
+      # adding an unvetted third-party action to save ~2 min isn't a trade this
+      # repo makes. --locked so the build can't drift with a transitive bump.
+      # Single-sourced in Taskfile deps:cargo-mutants (bead ley-line-open-2bea72).
+      - name: Install cargo-mutants
+        run: task deps:cargo-mutants
 
       # Which of the two runs are warranted for THIS PR. Computed from the diff
       # rather than from a paths filter, because the workflow-level filter is

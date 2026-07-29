@@ -4205,7 +4205,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-mcp-protocol-schema"
-version = "0.1.0"
+version = "0.12.1"
 dependencies = [
  "jsonschema",
  "serde_json",

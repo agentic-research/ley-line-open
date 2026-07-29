@@ -136,7 +136,10 @@ fn md_code_span_citations_land_in_node_refs_on_the_host_file() {
     assert_eq!(
         ref_rows(&db_path),
         vec![
-            ("PartitionSpec::address".to_string(), "README.md".to_string()),
+            (
+                "PartitionSpec::address".to_string(),
+                "README.md".to_string()
+            ),
             ("`tick`".to_string(), "README.md".to_string()),
             ("render".to_string(), "README.md".to_string()),
         ],

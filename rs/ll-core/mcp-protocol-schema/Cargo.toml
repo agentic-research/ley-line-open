@@ -1,6 +1,6 @@
 [package]
 name = "leyline-mcp-protocol-schema"
-version = "0.1.0"
+version = "0.12.1"
 edition = "2024"
 license = "Apache-2.0"
 description = "Pins the MCP wire protocol schema (JSON-RPC message shapes) behind a digest gate. Vendoring-only step (ley-line-open-60f0d3) — no generator/emitter here; the bead's inventory of hand-encoded protocol facts is what a follow-up generator would replace."

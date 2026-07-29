@@ -408,8 +408,7 @@ mod markdown_tests {
     /// (language, content-text) of each detected site.
     fn detect_all(src: &[u8]) -> Vec<(&'static str, String)> {
         let tree = parse_markdown(src);
-        let engine =
-            injection_engine(TsLanguage::Markdown).expect("markdown ships injections.scm");
+        let engine = injection_engine(TsLanguage::Markdown).expect("markdown ships injections.scm");
         let mut out = Vec::new();
         fn walk(
             node: tree_sitter::Node,
@@ -482,8 +481,7 @@ mod markdown_tests {
     /// for, pinned at the ts layer.
     #[test]
     fn injected_inline_tree_yields_code_span_refs_with_clean_tokens() {
-        let src: &[u8] =
-            b"Calls `PartitionSpec::address` and `` `render` `` but \\`not\\` this.\n";
+        let src: &[u8] = b"Calls `PartitionSpec::address` and `` `render` `` but \\`not\\` this.\n";
         let sites = detect_all(src);
         assert_eq!(sites.len(), 1);
 

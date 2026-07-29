@@ -35,7 +35,7 @@
 //!   document claims conformance to a spec the gate cannot read.
 
 use leyline_mcp_descriptor::{
-    GroupRef, PackageMeta, SCHEMA_URL, ServerMeta, ToolRef, TransportMeta, render,
+    ArtifactMeta, GroupRef, PackageMeta, SCHEMA_URL, ServerMeta, ToolRef, TransportMeta, render,
 };
 
 /// Vendored copy of the registry schema named by [`SCHEMA_URL`].
@@ -85,6 +85,7 @@ fn llo_meta() -> ServerMeta<'static> {
                 url: "http://localhost:8384/mcp",
             }),
         }],
+        artifacts: vec![],
     }
 }
 
@@ -268,6 +269,33 @@ fn notme_meta() -> ServerMeta<'static> {
                 transport: None,
             },
         ],
+        artifacts: vec![],
+    }
+}
+
+/// notme's ACTUAL shape once it adopts `artifacts` instead of `packages`
+/// (`ley-line-open-0135fa`): two OCI images, no `packages[]` at all, both
+/// addresses carried in the publisher-provided `_meta` extension. This is
+/// the fixture the bead asks to mirror byte-for-byte — same two images, same
+/// version, no packages.
+fn notme_artifacts_meta() -> ServerMeta<'static> {
+    ServerMeta {
+        name: "io.github.agentic-research/notme",
+        description: "Self-hostable identity authority.",
+        version: "0.1.0-rc3",
+        repository_url: "https://github.com/agentic-research/notme",
+        repository_source: "github",
+        packages: vec![],
+        artifacts: vec![
+            ArtifactMeta {
+                oci_image: "ghcr.io/agentic-research/notme",
+                oci_version: "0.1.0-rc3",
+            },
+            ArtifactMeta {
+                oci_image: "ghcr.io/agentic-research/notme-proxy",
+                oci_version: "0.1.0-rc3",
+            },
+        ],
     }
 }
 
@@ -386,4 +414,177 @@ fn a_descriptor_with_no_packages_is_rejected() {
     meta.packages.clear();
     let err = render(&meta, &[], &[]).expect_err("no packages must be rejected");
     assert!(err.to_string().contains("no packages"), "got: {}", err);
+}
+
+// ── Artifact-only producers (`ley-line-open-0135fa`) ────────────────────────
+//
+// notme publishes OCI images and serves no MCP. `packages[]` requires
+// `transport`, and a placeholder transport is a runtime lie downstream
+// (cloister derives session behaviour from it). `artifacts` renders into the
+// `_meta."io.modelcontextprotocol.registry/publisher-provided"` extension
+// slot instead — a Package shape minus transport, which the schema declares
+// `additionalProperties: true` specifically so producer-defined data like
+// this fits without a schema change.
+
+/// (a) An artifact-only descriptor renders and validates — positive.
+#[test]
+fn artifact_only_descriptor_renders_and_validates() {
+    let rendered = render(&notme_artifacts_meta(), &[], &[]).expect("render");
+    let doc: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+
+    let errors = validate(&doc);
+    assert!(
+        errors.is_empty(),
+        "an artifact-only descriptor must satisfy the pinned schema:\n  {}\n\n{rendered}",
+        errors.join("\n  "),
+    );
+}
+
+/// (d) The artifact-only output has NO `packages` key — absence, not
+/// emptiness. `packages[]` is optional in the schema's top-level `required`
+/// (name, description, version only), so an absent key and an empty array
+/// are both schema-valid; the contract is specifically absence, because an
+/// empty `packages: []` would still read as "this producer declares an
+/// (empty) MCP packages list" rather than "this producer has none".
+#[test]
+fn artifact_only_output_has_no_packages_key() {
+    let rendered = render(&notme_artifacts_meta(), &[], &[]).expect("render");
+    let doc: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+
+    assert!(
+        doc.get("packages").is_none(),
+        "an artifact-only descriptor must omit `packages` entirely, not emit \
+         an empty array\n\n{rendered}",
+    );
+
+    let artifacts =
+        &doc["_meta"]["io.modelcontextprotocol.registry/publisher-provided"]["artifacts"];
+    let arr = artifacts.as_array().expect("artifacts array");
+    assert_eq!(arr.len(), 2, "both notme images must render\n\n{rendered}");
+    assert_eq!(arr[0]["registryType"], "oci");
+    assert_eq!(arr[0]["identifier"], "ghcr.io/agentic-research/notme");
+    assert_eq!(arr[0]["version"], "0.1.0-rc3");
+    assert_eq!(arr[1]["identifier"], "ghcr.io/agentic-research/notme-proxy");
+    // Package shape minus transport: an artifact entry never carries one.
+    assert!(arr[0].get("transport").is_none());
+    assert!(arr[1].get("transport").is_none());
+}
+
+/// (b) A descriptor with BOTH packages and artifacts renders both and
+/// validates. mache's shape once it ships a non-MCP-serving sidecar image
+/// alongside its MCP-serving binary would look like this.
+#[test]
+fn descriptor_with_both_packages_and_artifacts_renders_both_and_validates() {
+    let mut meta = notme_artifacts_meta();
+    // Give it one MCP-serving package alongside the two bare artifacts, so
+    // both lists are populated in the same descriptor.
+    meta.packages.push(PackageMeta {
+        oci_image: "ghcr.io/agentic-research/notme-mcp-sidecar",
+        oci_version: "0.1.0-rc3",
+        transport: Some(TransportMeta {
+            typ: "streamable-http",
+            url: "http://localhost:9100/mcp",
+        }),
+    });
+
+    let tools = [ToolRef { name: "whoami" }];
+    let groups = [GroupRef {
+        name: "identity",
+        advertised_prefix: "",
+        upstream_names: vec!["whoami"],
+    }];
+
+    let rendered = render(&meta, &tools, &groups).expect("render");
+    let doc: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+
+    let pkgs = doc["packages"].as_array().expect("packages array present");
+    assert_eq!(
+        pkgs.len(),
+        1,
+        "the one MCP-serving package renders\n\n{rendered}"
+    );
+    assert_eq!(
+        pkgs[0]["identifier"],
+        "ghcr.io/agentic-research/notme-mcp-sidecar"
+    );
+
+    let artifacts =
+        doc["_meta"]["io.modelcontextprotocol.registry/publisher-provided"]["artifacts"]
+            .as_array()
+            .expect("artifacts array present");
+    assert_eq!(
+        artifacts.len(),
+        2,
+        "both bare artifacts render\n\n{rendered}"
+    );
+
+    // Both `_meta` occupants coexist — the cloister group AND the
+    // publisher-provided artifacts — proving one does not clobber the other.
+    assert!(doc["_meta"]["art.cloister/v1"]["groups"].is_array());
+
+    let errors = validate(&doc);
+    assert!(
+        errors.is_empty(),
+        "a descriptor mixing packages and artifacts must satisfy the pinned schema:\n  {}\n\n{rendered}",
+        errors.join("\n  "),
+    );
+}
+
+/// (c) The existing failure mode stays a failure: a transport-less
+/// `packages[]` entry is still refused even now that `artifacts` exists as
+/// an alternative. A producer that wants to publish an image with no
+/// transport must use `artifacts`, not lean on a softened `packages` check.
+#[test]
+fn transportless_package_still_refuses_even_with_artifacts_available() {
+    let mut meta = notme_artifacts_meta();
+    meta.packages.push(PackageMeta {
+        oci_image: "ghcr.io/agentic-research/notme-mcp-sidecar",
+        oci_version: "0.1.0-rc3",
+        transport: None,
+    });
+
+    let err = render(&meta, &[], &[])
+        .expect_err("a transport-less package must still be refused, artifacts notwithstanding");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("packages[0]") && msg.contains("Package.required"),
+        "got: {msg}",
+    );
+}
+
+/// An artifact carrying a tagged identifier is rejected the same way a
+/// package's is — the ADR-0041 rule applies to both lists.
+#[test]
+fn a_tagged_artifact_identifier_is_rejected() {
+    let mut meta = notme_artifacts_meta();
+    meta.artifacts[0].oci_image = "ghcr.io/agentic-research/notme:0.1.0-rc3";
+    let err = render(&meta, &[], &[]).expect_err("a tagged artifact identifier must be rejected");
+    assert!(err.to_string().contains("artifacts[0]"), "got: {err}");
+}
+
+/// An artifact with an empty version is rejected the same way a package's
+/// is.
+#[test]
+fn an_empty_artifact_version_is_rejected() {
+    let mut meta = notme_artifacts_meta();
+    meta.artifacts[1].oci_version = "";
+    let err = render(&meta, &[], &[]).expect_err("an empty artifact version must be rejected");
+    assert!(err.to_string().contains("artifacts[1]"), "got: {err}");
+}
+
+/// A descriptor with neither packages nor artifacts is still rejected —
+/// `artifacts` widens what counts as "something to derive from", it does
+/// not remove the requirement that there be at least one.
+#[test]
+fn a_descriptor_with_neither_packages_nor_artifacts_is_rejected() {
+    // notme_artifacts_meta() already declares `packages: vec![]`; clearing
+    // `artifacts` too leaves nothing to derive `<identifier>:<version>` from.
+    let mut meta = notme_artifacts_meta();
+    meta.artifacts.clear();
+    let err = render(&meta, &[], &[])
+        .expect_err("neither packages nor artifacts declared must be rejected");
+    assert!(
+        err.to_string().contains("no packages or artifacts"),
+        "got: {err}"
+    );
 }

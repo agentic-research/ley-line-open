@@ -107,29 +107,17 @@ jobs:
           workspaces: rs
           cache-targets: false
 
-      - name: Install system deps (capnproto + pkg-config; libcapnp-dev only on Linux)
-        run: |
-          case "$RUNNER_OS" in
-            Linux)
-              sudo apt-get update
-              sudo apt-get install -y --no-install-recommends capnproto libcapnp-dev pkg-config
-              ;;
-            macOS)
-              # capnp ships /usr/local/include/capnp/c++.capnp and the
-              # standard schema includes that the capnp compiler
-              # resolves `using Cxx = import "/capnp/c++.capnp";`-style
-              # imports against — same role libcapnp-dev plays on Debian.
-              brew install capnp pkg-config
-              ;;
-          esac
-          capnp --version
-          pkg-config --version
-
       # Exact Taskfile version used by local development and ci.yml.
       - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611
         with:
           version: 3.49.1
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # capnproto + libcapnp-dev/capnp + pkg-config, single-sourced in
+      # Taskfile deps:capnp — same target ci.yml, release-dryrun.yml, and
+      # leyline-schema-go.yml call (bead ley-line-open-2bea72).
+      - name: Install system deps
+        run: task deps:capnp
 
       # SHA-pinned: actions/cache@v6.1.0 (Node 24).
       - name: Restore target compiler cache
@@ -160,13 +148,7 @@ jobs:
       # `lib_asset`; darwin-amd64 is skipped.
       - name: Install FUSE deps (staticlib only)
         if: matrix.lib_asset
-        run: |
-          # capnproto/pkg-config already installed above; add only the fuse
-          # headers the `fuse` feature links against. apt-get update already ran.
-          case "$RUNNER_OS" in
-            Linux) sudo apt-get install -y --no-install-recommends libfuse3-dev ;;
-            macOS) brew install --cask fuse-t ;;
-          esac
+        run: task deps:fuse
 
       - name: Build leyline-fs staticlib
         if: matrix.lib_asset
@@ -335,21 +317,18 @@ jobs:
       #
       # release-dryrun.yml caught exactly this on a branch and I fixed it THERE
       # only, shipping the same bug here. The dry-run told the truth; the answer
-      # went into the wrong file.
-      - name: Install system deps (capnproto + libcapnp-dev + pkg-config)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends capnproto libcapnp-dev pkg-config
-          capnp --version
+      # went into the wrong file. Both jobs now call the same Taskfile
+      # deps:capnp target — `task lint:workflow-parity` fails the build if
+      # either release-pair file's install-Rust job doesn't call it
+      # (bead ley-line-open-2bea72).
+      - name: Install system deps
+        run: task deps:capnp
 
+      # musl, not gnu: chainguard/static carries no glibc. RUST_TARGET is a
+      # required task var, not an env passthrough — deps:zig has no safe
+      # default to guess.
       - name: Install zig toolchain
-        run: |
-          cargo install cargo-zigbuild --locked
-          python3 -m pip install --break-system-packages ziglang
-          rustup target add "${RUST_TARGET}"
-        env:
-          # musl, not gnu: chainguard/static carries no glibc.
-          RUST_TARGET: ${{ matrix.rust_target }}
+        run: task deps:zig RUST_TARGET="${{ matrix.rust_target }}"
 
       - name: Log in to ghcr
         uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772

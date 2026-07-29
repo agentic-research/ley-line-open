@@ -75,6 +75,27 @@ tasks:
         [ "$FAIL" = "0" ] || { echo "--- fix: make the workflow pins match rust-toolchain.toml (or update both together)"; exit 1; }
         echo "toolchain parity OK — workflows and rust-toolchain.toml both pin $PIN"
 
+  # --------------------------------------------------------------------------
+  # Workflow parity gate (bead ley-line-open-2bea72)
+  #
+  # v0.12.1 failed on a capnp install that existed in release-dryrun.yml but
+  # not release.yml; two hand-mirrored copies of a command WILL drift, so the
+  # install commands moved into the deps:* targets below (this file's rule
+  # for every other CI command already applies here). This gate asserts the
+  # workflows actually call those targets and never inline an install again.
+  # --------------------------------------------------------------------------
+
+  lint:workflow-parity:
+    desc: |
+      Assert the workflows stay in step: no inline package installs (one copy
+      lives in deps:* below), every release-pair job that installs Rust calls
+      `task deps:capnp`, every image-building job calls `task deps:zig`, and
+      all setup-task pins are exact and identical. The v0.12.1 image job
+      failed on exactly the drift this closes — the dry-run caught the bug,
+      the fix landed in the dry-run file only (ley-line-open-2bea72).
+    cmds:
+      - sh tools/lint_workflow_parity.sh
+
   lint:cache-contract:
     desc: Verify the Taskfile-owned compiler-cache and release-artifact contract
     cmds:
@@ -185,6 +206,100 @@ tasks:
           echo "Taskfile-managed sccache is not installed; no stats available"
         fi
 
+  # --------------------------------------------------------------------------
+  # CI system dependencies (bead ley-line-open-2bea72)
+  #
+  # One copy of every install command, invoked by the workflows — the same rule
+  # the rest of this repo already follows for build/test commands. v0.12.1
+  # failed on a capnp install that existed in release-dryrun.yml but not
+  # release.yml; two hand-mirrored copies of a command WILL drift, so there is
+  # now one copy here. tools/lint_workflow_parity.sh (wired into `task ci`)
+  # asserts the workflows actually call these and never inline an install.
+  #
+  # `sudo` is deliberate: these run on CI runners. Locally they work too, but
+  # your package manager will ask for your password — that is the target doing
+  # what it says, not a bug.
+  # --------------------------------------------------------------------------
+
+  deps:capnp:
+    desc: |
+      Install the capnp compiler + standard schema includes + pkg-config.
+      `leyline-schema-capnp`'s build script shells out to the capnp compiler,
+      and libcapnp-dev (brew: capnp) ships the standard includes that
+      `import "/capnp/c++.capnp"` resolves against — the capnproto package
+      alone is just the binaries. Single source for ci.yml, release.yml,
+      release-dryrun.yml, and leyline-schema-go.yml.
+    cmds:
+      - |
+        set -eu
+        case "${RUNNER_OS:-$(uname -s)}" in
+          Linux)
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends capnproto libcapnp-dev pkg-config
+            ;;
+          macOS|Darwin)
+            brew install capnp pkg-config
+            ;;
+          *)
+            echo "deps:capnp: unsupported OS '${RUNNER_OS:-$(uname -s)}'" >&2
+            exit 1
+            ;;
+        esac
+        capnp --version
+        pkg-config --version
+
+  deps:ci:
+    desc: |
+      Everything `task ci` compiles against on a Linux runner: the capnp
+      toolchain plus libdbus-1-dev (keyring) and libfuse-dev (fuser).
+      ci.yml calls this; the extras ride on deps:capnp's apt-get update.
+    cmds:
+      - task: deps:capnp
+      - sudo apt-get install -y --no-install-recommends libdbus-1-dev libfuse-dev
+
+  deps:fuse:
+    desc: |
+      FUSE headers for the leyline-fs staticlib build (`fuse` feature links
+      libfuse3). release.yml's build job calls this only for matrix entries
+      that carry lib_asset.
+    cmds:
+      - |
+        set -eu
+        case "${RUNNER_OS:-$(uname -s)}" in
+          Linux)
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends libfuse3-dev
+            ;;
+          macOS|Darwin)
+            brew install --cask fuse-t
+            ;;
+          *)
+            echo "deps:fuse: unsupported OS '${RUNNER_OS:-$(uname -s)}'" >&2
+            exit 1
+            ;;
+        esac
+
+  deps:zig:
+    desc: |
+      The zigbuild cross-toolchain the OCI image build compiles with, plus
+      the musl rustup target. RUST_TARGET is required — the image jobs pass
+      their matrix target; there is no safe default to guess.
+    requires:
+      vars: [RUST_TARGET]
+    cmds:
+      - cargo install cargo-zigbuild --locked
+      - python3 -m pip install --break-system-packages ziglang
+      - rustup target add "{{.RUST_TARGET}}"
+
+  deps:cargo-mutants:
+    desc: |
+      cargo-mutants from source with --locked — installed from source rather
+      than a prebuilt-binary action because every action in this repo is
+      SHA-pinned against a verified commit, and an unvetted third-party
+      action isn't a trade this repo makes to save ~2 min.
+    cmds:
+      - cargo install cargo-mutants --locked
+
   release:artifacts:fixture-test:
     desc: Prove staged release manifests accept exact bytes and reject corruption
     vars:
@@ -255,6 +370,11 @@ tasks:
     desc: Prove task ci receipts reuse only the exact tested Git tree
     cmds:
       - tools/test_ci_attestation.sh
+
+  ci:workflow-parity:fixture-test:
+    desc: Prove the parity gate fails on each drift it exists to catch
+    cmds:
+      - sh tools/test_workflow_parity.sh
 
   schema:consumer-fixture-test:
     desc: Compile the Apache daemon/wire API from an external Go module
@@ -1227,8 +1347,10 @@ tasks:
       # fmt:check at its old position (bead ley-line-open-9ca974).
       - task: fmt:check
       - task: lint:toolchain-parity
+      - task: lint:workflow-parity
       - task: lint:cache-contract
       - task: ci:attestation:fixture-test
+      - task: ci:workflow-parity:fixture-test
       - task: release:artifacts:fixture-test
       - task: release:publication:fixture-test
       - task: release:workflow:fixture-test

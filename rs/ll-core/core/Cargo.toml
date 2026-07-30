@@ -2,6 +2,8 @@
 name = "leyline-core"
 version = "0.13.0"
 edition = "2024"
+description = "Σ substrate core for ley-line: BLAKE3 content addressing, the BlobStore contract, arena layout and mmap primitives, and the incremental outboard hash tree"
+repository = "https://github.com/agentic-research/ley-line-open"
 license = "AGPL-3.0-or-later"
 
 [dependencies]

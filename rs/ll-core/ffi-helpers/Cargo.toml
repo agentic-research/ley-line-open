@@ -4,6 +4,7 @@ version = "0.13.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "Typed helpers for the C-boundary raw-pointer pattern used by every LLO extern \"C\" fn."
+repository = "https://github.com/agentic-research/ley-line-open"
 
 [lib]
 

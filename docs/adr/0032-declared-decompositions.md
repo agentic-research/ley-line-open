@@ -174,6 +174,13 @@ no root and should never be given one.
 BLAKE3, per `substrate.rs:28-42`. No `sha2` in any substrate crate. ADR-0031 is **amended**, not
 grandfathered — pre-1.0 clean break with a CHANGELOG entry (bead `b61cd6`).
 
+Two stated exceptions, both INTEROP identifiers owned by external specs rather than substrate
+addresses (`tools/check_doc_claims.sh` enforces this list exactly): `leyline-sign` (canonical
+kid — sha256 appears in signet ADR-012's derivation lineage) and `leyline-envelope` (in-toto
+Statement v1 subject digests — the in-toto spec names sha256 as the interop digest algorithm,
+and byte-compatibility with rosary's emitted envelopes requires computing it; bead `be5f86`).
+Neither hash ever names substrate content — σ remains BLAKE3 everywhere an address lives.
+
 Deliberately **absent** from the descriptor: a per-address hash-algorithm field. Multihash-style
 agility is an anti-feature under a locked `σ`; it reintroduces at the descriptor layer exactly
 the ambiguity D2 exists to remove.

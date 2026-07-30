@@ -221,6 +221,32 @@ impl SqliteGraphAdapter {
         Ok(Self::new(graph))
     }
 
+    /// `from_arena` with the load pulled through the verify-on-fault gate
+    /// (bead `ley-line-open-b6a4dd`): every 1 KiB page of the arena payload
+    /// is proof-verified against `ctrl.current_root` by
+    /// [`crate::verified::VerifiedArena`] on its way into SQLite, replacing
+    /// the flat whole-buffer hash. Same refusal posture as T2.3: a root
+    /// mismatch or a zero-sentinel root over data refuses the load at open;
+    /// a page tampered between open and the copy is refused per-page by the
+    /// fault gate.
+    #[cfg(feature = "verify")]
+    pub fn from_arena_verified(control_path: &Path) -> Result<Self> {
+        let arena = crate::verified::VerifiedArena::open(control_path)?;
+        let graph = SqliteGraph::from_bytes(&arena.read_all()?)?;
+        Ok(Self::new(graph))
+    }
+
+    /// Writable sibling of [`Self::from_arena_verified`] — the daemon's
+    /// write-back mount, loaded through the same per-page gate.
+    #[cfg(feature = "verify")]
+    pub fn from_arena_writable_verified(control_path: &Path) -> Result<Self> {
+        let arena = crate::verified::VerifiedArena::open(control_path)?;
+        let graph = SqliteGraph::from_bytes_writable(&arena.read_all()?)?;
+        let adapter = Self::new(graph);
+        adapter.ensure_errors_table()?;
+        Ok(adapter)
+    }
+
     /// Create a writable adapter from an arena (for daemon with write-back).
     ///
     /// **T2.3 verification:** same content-addressed pin as
@@ -1060,6 +1086,18 @@ pub struct HotSwapGraph {
     /// Default tree-sitter language for extensionless files (e.g. `source`).
     #[cfg(feature = "validate")]
     default_language: Option<tree_sitter::Language>,
+    /// Route every (re)load through the verify-on-fault gate and advance
+    /// `current_root` incrementally on flush (bead `ley-line-open-b6a4dd`).
+    /// Runtime opt-in via [`HotSwapGraph::with_verify_on_fault`], so the
+    /// compiled-in feature changes nothing until a call site asks.
+    #[cfg(feature = "verify")]
+    verify_on_fault: bool,
+    /// Writer half of the outboard seam: the previous flush's payload and
+    /// its tree, so the next flush re-hashes only the dirty span instead of
+    /// the whole buffer. One extra payload copy — the same order of memory
+    /// the adapter's reader-bytes cache already holds.
+    #[cfg(feature = "verify")]
+    flip_state: Mutex<Option<(Vec<u8>, leyline_core::outboard::Outboard)>>,
 }
 
 impl HotSwapGraph {
@@ -1081,7 +1119,33 @@ impl HotSwapGraph {
             writable: false,
             #[cfg(feature = "validate")]
             default_language: None,
+            #[cfg(feature = "verify")]
+            verify_on_fault: false,
+            #[cfg(feature = "verify")]
+            flip_state: Mutex::new(None),
         })
+    }
+
+    /// Enable verify-on-fault mode (bead `ley-line-open-b6a4dd`): every
+    /// (re)load pulls the arena through
+    /// [`crate::verified::VerifiedArena`]'s per-page gate, and
+    /// [`HotSwapGraph::flush_to_arena`] advances `current_root` via the
+    /// outboard's incremental update instead of a full re-hash.
+    ///
+    /// Re-opens the inner graph through the gate if already loaded.
+    /// Unlike `with_writable`'s builder shape, a failed re-open here is an
+    /// ERROR, not a silent keep-the-old-graph: swallowing it would leave an
+    /// unverified graph serving under a mode that promised the gate — the
+    /// exact verify-fallback smell the chunked module documents.
+    #[cfg(feature = "verify")]
+    pub fn with_verify_on_fault(mut self) -> Result<Self> {
+        self.verify_on_fault = true;
+        let cached_root = *self.last_root.lock();
+        if cached_root != [0u8; 32] {
+            let new_graph = self.build_adapter(&self.control_path)?;
+            *self.inner.write() = new_graph;
+        }
+        Ok(self)
     }
 
     /// Enable writable mode with optional validation language for extensionless files.
@@ -1114,6 +1178,22 @@ impl HotSwapGraph {
 
     /// Build an adapter for the current root.
     fn build_adapter(&self, control_path: &Path) -> Result<Arc<dyn Graph>> {
+        #[cfg(feature = "verify")]
+        if self.verify_on_fault {
+            #[allow(unused_mut)]
+            let mut adapter = if self.writable {
+                SqliteGraphAdapter::from_arena_writable_verified(control_path)?
+            } else {
+                SqliteGraphAdapter::from_arena_verified(control_path)?
+            };
+            #[cfg(feature = "validate")]
+            if self.writable
+                && let Some(ref lang) = self.default_language
+            {
+                adapter.set_default_language(lang.clone());
+            }
+            return Ok(Arc::new(adapter));
+        }
         if self.writable {
             #[allow(unused_mut)]
             let mut adapter = SqliteGraphAdapter::from_arena_writable(control_path)?;
@@ -1151,6 +1231,18 @@ impl HotSwapGraph {
         // Retrofitted from inline `blake3::hash` per bead
         // `ley-line-open-32201a`. graph.rs:1449's blake3::hash call stays
         // inline — that's a #[test] oracle, not a production bypass.
+        //
+        // Verify-on-fault mode advances the root through the outboard tree
+        // instead (bead `ley-line-open-b6a4dd`): same BLAKE3 root, bit for
+        // bit (the outboard module's pinned identity), but the flip
+        // re-hashes only the span this flush actually changed.
+        #[cfg(feature = "verify")]
+        let new_root: [u8; 32] = if self.verify_on_fault {
+            self.advance_root_incrementally(&bytes)
+        } else {
+            *bytes.as_slice().hash().as_bytes()
+        };
+        #[cfg(not(feature = "verify"))]
         let new_root: [u8; 32] = *bytes.as_slice().hash().as_bytes();
         let mut ctrl = Controller::open_or_create(&self.control_path)?;
         ctrl.set_arena_with_root(&arena_path, arena_size, new_root)?;
@@ -1163,6 +1255,41 @@ impl HotSwapGraph {
             bytes.len()
         );
         Ok(())
+    }
+
+    /// The writer half of the outboard seam (bead `ley-line-open-b6a4dd`):
+    /// maintain the tree across flushes so `current_root` advances by
+    /// re-hashing only the dirty span. First flush of a session builds the
+    /// tree (O(n) — the cost the flat hash paid anyway); every later flush
+    /// pays `Outboard::update` over `dirty_span(prev, next)` plus O(log n)
+    /// merges. The result is bit-identical to `blake3::hash(bytes)` — the
+    /// outboard module pins that identity, and the verified-writer test
+    /// here re-checks it against the T2.3 loader as an independent oracle.
+    #[cfg(feature = "verify")]
+    fn advance_root_incrementally(&self, bytes: &[u8]) -> [u8; 32] {
+        use leyline_core::outboard::Outboard;
+        let mut state = self.flip_state.lock();
+        let outboard = match state.take() {
+            Some((prev, mut outboard)) => {
+                let dirty = crate::verified::dirty_span(&prev, bytes);
+                match outboard.update(bytes, dirty) {
+                    Ok(_) => outboard,
+                    Err(e) => {
+                        // dirty_span is total over its inputs, so update's
+                        // range check cannot fire here — but if it ever
+                        // does, a half-updated tree must not become the
+                        // published root. Rebuild from scratch: correct by
+                        // construction, merely un-incremental.
+                        log::warn!("incremental root update refused ({e:#}); rebuilding tree");
+                        Outboard::build(bytes)
+                    }
+                }
+            }
+            None => Outboard::build(bytes),
+        };
+        let root = *outboard.root().as_bytes();
+        *state = Some((bytes.to_vec(), outboard));
+        root
     }
 
     /// T2.4: poll `current_root`; swap if it differs from cached.
@@ -2594,6 +2721,171 @@ mod tests {
             "{err:#}"
         );
         assert_eq!(out, before, "failed read partially modified destination");
+        Ok(())
+    }
+
+    /// Publish a minimal nodes-schema SQLite image into a fresh on-disk
+    /// arena the way the producer does, returning the control path and the
+    /// one file node's content.
+    #[cfg(feature = "verify")]
+    fn publish_nodes_arena(dir: &Path) -> Result<(PathBuf, String)> {
+        let source = Connection::open_in_memory()?;
+        create_schema(&source)?;
+        let content = "verify-on-fault must serve exactly these bytes".to_string();
+        source.execute(
+            "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) \
+             VALUES ('docs/readme', 'docs', 'readme', 0, ?1, 1, ?2)",
+            rusqlite::params![content.len() as i64, content],
+        )?;
+        let db_bytes = source.serialize("main")?;
+
+        let arena_path = dir.join("verified.arena");
+        let ctrl_path = dir.join("verified.ctrl");
+        let arena_size = 4096 + 2 * 1024 * 1024;
+        let mut mmap = leyline_core::layout::create_arena(&arena_path, arena_size)?;
+        leyline_core::layout::write_to_arena(&mut mmap, db_bytes.as_ref())?;
+        let root: [u8; 32] = blake3::hash(db_bytes.as_ref()).into();
+        Controller::open_or_create(&ctrl_path)?.set_arena_with_root(
+            arena_path.to_str().unwrap(),
+            arena_size,
+            root,
+        )?;
+        Ok((ctrl_path, content))
+    }
+
+    /// Flip one byte of the ACTIVE payload via a direct file write — the
+    /// tamper the verified load path must refuse.
+    #[cfg(feature = "verify")]
+    fn flip_active_payload_byte(ctrl_path: &Path, at: u64) -> Result<()> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let controller = Controller::open_or_create(ctrl_path)?;
+        let arena_path = PathBuf::from(controller.arena_path());
+        let bytes = std::fs::read(&arena_path)?;
+        let header: &ArenaHeader =
+            bytemuck::from_bytes(&bytes[..std::mem::size_of::<ArenaHeader>()]);
+        let offset = header
+            .validate_header(bytes.len() as u64)
+            .context("arena header validation failed")?;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&arena_path)?;
+        file.seek(SeekFrom::Start(offset + at))?;
+        let mut b = [0u8; 1];
+        file.read_exact(&mut b)?;
+        file.seek(SeekFrom::Start(offset + at))?;
+        file.write_all(&[b[0] ^ 0x01])?;
+        file.flush()?;
+        Ok(())
+    }
+
+    /// The verified load call-site: byte-identical service through the
+    /// per-page gate, and a pre-load tamper refused at open (bead
+    /// `ley-line-open-b6a4dd`; the post-load per-page refusal is pinned in
+    /// `verified::tests`).
+    #[test]
+    #[cfg(feature = "verify")]
+    fn verified_load_serves_identical_content_and_refuses_tamper() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (ctrl, content) = publish_nodes_arena(dir.path())?;
+
+        let adapter = SqliteGraphAdapter::from_arena_verified(&ctrl)?;
+        let mut buf = [0u8; 128];
+        let n = adapter.read_content("docs/readme", &mut buf, 0)?;
+        assert_eq!(&buf[..n], content.as_bytes());
+
+        // Byte 100 sits in the SQLite header page; any flipped payload byte
+        // must fail the load-time root check.
+        flip_active_payload_byte(&ctrl, 100)?;
+        // `.err()` rather than `unwrap_err()`: the adapter has no Debug impl
+        // (a live SQLite pool has nothing useful to print).
+        let err = SqliteGraphAdapter::from_arena_verified(&ctrl)
+            .err()
+            .expect("tampered arena must be refused at load");
+        assert!(
+            format!("{err:#}").contains("root mismatch at load"),
+            "{err:#}"
+        );
+        Ok(())
+    }
+
+    /// The FUSE serving path, gated: `LeylineFuse::read` calls exactly
+    /// `Graph::read_content` on the mounted graph — this is that call on a
+    /// `HotSwapGraph` in verify-on-fault mode.
+    #[test]
+    #[cfg(feature = "verify")]
+    fn verified_hot_swap_graph_serves_the_fuse_read_path() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (ctrl, content) = publish_nodes_arena(dir.path())?;
+
+        let graph = HotSwapGraph::new(ctrl)?.with_verify_on_fault()?;
+        let mut buf = [0u8; 128];
+        let n = graph.read_content("docs/readme", &mut buf, 0)?;
+        assert_eq!(&buf[..n], content.as_bytes());
+        Ok(())
+    }
+
+    /// The builder must fail closed: enabling verify-on-fault on a graph
+    /// whose arena was tampered AFTER the (unverified) initial load is an
+    /// error — keeping the already-loaded unverified graph and returning Ok
+    /// would be the verify-fallback smell wearing a builder costume. This
+    /// is also the only observable that proves the builder actually
+    /// re-loads through the gate rather than skipping the reload.
+    #[test]
+    #[cfg(feature = "verify")]
+    fn with_verify_on_fault_refuses_a_tampered_arena() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (ctrl, _content) = publish_nodes_arena(dir.path())?;
+
+        // Loads clean (the arena is untampered at construction time)...
+        let graph = HotSwapGraph::new(ctrl.clone())?;
+        // ...then the file is tampered behind its back...
+        flip_active_payload_byte(&ctrl, 100)?;
+        // ...so the gate must refuse, not shrug and serve the copy.
+        let err = graph
+            .with_verify_on_fault()
+            .err()
+            .expect("verify-on-fault over a tampered arena must refuse");
+        assert!(
+            format!("{err:#}").contains("root mismatch at load"),
+            "{err:#}"
+        );
+        Ok(())
+    }
+
+    /// The writer half: `flush_to_arena` in verify-on-fault mode advances
+    /// `current_root` through the outboard (build on the first flush,
+    /// incremental update on the second) and the result must be
+    /// bit-identical to the reference hash — checked directly AND through
+    /// the T2.3 flat-hash loader as an independent oracle, which refuses
+    /// the arena outright if the incremental root ever diverges.
+    #[test]
+    #[cfg(feature = "verify")]
+    fn verified_writer_advances_root_incrementally_and_stays_bit_identical() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (ctrl, _content) = publish_nodes_arena(dir.path())?;
+
+        let graph = HotSwapGraph::new(ctrl.clone())?
+            .with_writable()
+            .with_verify_on_fault()?;
+
+        for (flush, edit) in ["first edit", "second, rather longer edit body"]
+            .iter()
+            .enumerate()
+        {
+            graph.write_content("docs/readme", edit.as_bytes(), 0)?;
+            graph.flush_to_arena()?;
+
+            let bytes = graph.serialize()?;
+            let published = Controller::open_or_create(&ctrl)?.current_root();
+            assert_eq!(
+                published,
+                *blake3::hash(&bytes).as_bytes(),
+                "flush {flush}: incremental root diverged from the reference hash"
+            );
+            SqliteGraphAdapter::from_arena(&ctrl)
+                .with_context(|| format!("flush {flush}: T2.3 loader refused the arena"))?;
+        }
         Ok(())
     }
 }

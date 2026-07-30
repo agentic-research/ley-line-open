@@ -20,6 +20,11 @@ pub mod graph;
 pub mod nfs;
 pub mod staging;
 pub mod validate;
+/// Verify-on-fault serving of the arena payload against the Σ root — the
+/// mount half of the outboard tree (bead `ley-line-open-b6a4dd`). Opt-in
+/// (`--features verify`); default mounts keep the load-time flat hash.
+#[cfg(feature = "verify")]
+pub mod verified;
 
 use anyhow::{Context, Result, bail};
 use leyline_core::mmap::mmap_read;
@@ -113,7 +118,7 @@ fn verify_arena_root<'a>(
     Ok(data)
 }
 
-fn hex_short_8(bytes: &[u8; 32]) -> String {
+pub(crate) fn hex_short_8(bytes: &[u8; 32]) -> String {
     let mut s = String::with_capacity(8);
     use std::fmt::Write;
     for b in &bytes[..4] {

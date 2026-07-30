@@ -52,6 +52,29 @@ context, scoping notes, and review history are recoverable.
   other asset. Local builds: `task deps:wasm32`, then `task sign:wasm:build`
   / `task cas-ffi:wasm:build`.
 
+- **Verify-on-fault arena serving** (`ley-line-open-b6a4dd`, second half —
+  the outboard tree primitive shipped in v0.13.0's `leyline_core::outboard`).
+  New opt-in `leyline-fs` feature `verify`: `VerifiedArena` keeps the arena
+  mapped for the session, builds the outboard BLAKE3 tree at load (refusing a
+  root that is not bit-identical to `ctrl.current_root`, and refusing the
+  zero-sentinel over data), and gates every 1 KiB page on its way out — a
+  page not yet served this session is verified against the trusted root via
+  `verify_chunk` (leaf CV recomputed from the live mapping, folded through
+  the inclusion proof) BEFORE any byte reaches the caller. A bitmap caches
+  verified state so the steady-state cost is zero (asserted on the
+  verify-call counter, not narrated); a failed verification is a refused
+  read — counted, logged, destination untouched — never silently-served
+  bytes. Wired call-sites: `SqliteGraphAdapter::from_arena_verified` /
+  `from_arena_writable_verified` pull the mount's arena load through the
+  per-page gate, `HotSwapGraph::with_verify_on_fault()` routes every (re)load
+  of the FUSE/NFS serving graph through them, and `flush_to_arena` in that
+  mode advances `current_root` through `Outboard::update` over the flip's
+  dirty span instead of a full re-hash (bit-identical by the outboard's
+  pinned root identity; re-checked in tests against the T2.3 flat-hash
+  loader as an independent oracle). Default OFF — compiled out of every
+  shipping configuration (recorded in the feature-reachability ledger) and
+  runtime-inert until a call site opts in; the flag flips in a later bead.
+
 - **A second CDC activation target: `source_blobs`** (`ley-line-open-baa57f`,
   ADR-0033). `leyline cdc enable --target nodes|source-blobs` (default `nodes`
   — unchanged behavior) can now build the chunk index over the whole-file

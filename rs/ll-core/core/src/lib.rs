@@ -5,6 +5,7 @@ pub mod head_digest;
 pub mod interrupt;
 pub mod layout;
 pub mod mmap;
+pub mod outboard;
 pub mod partition;
 pub mod substrate;
 

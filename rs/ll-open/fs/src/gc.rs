@@ -44,6 +44,15 @@ pub struct GcReport {
     pub reaped_manifest_rows: u64,
     /// `content_manifest_meta` witness rows removed (one per dead node).
     pub reaped_manifest_nodes: u64,
+    /// `blob_manifest` span rows removed because their manifest was dead.
+    ///
+    /// A blob manifest dies exactly one way: its `source_blobs` row is gone.
+    /// Rows are immutable under their content address, so there is no
+    /// stale-witness arm here (see `blob_chunked`); deletion of the
+    /// authoritative row is the entire failure surface.
+    pub reaped_blob_manifest_rows: u64,
+    /// Distinct blobs whose manifests were removed.
+    pub reaped_blob_manifest_blobs: u64,
     /// Whether this invocation was accounting-only.
     pub dry_run: bool,
 }
@@ -57,17 +66,16 @@ pub fn collect_unreachable_chunks(conn: &Connection, options: GcOptions) -> Resu
     validate_gc_schema(conn)?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .context("begin CDC reachability GC transaction")?;
-    tx.execute(
-        "CREATE INDEX IF NOT EXISTS content_manifest_chunk_hash
-             ON content_manifest(chunk_hash)",
-        [],
-    )
-    .context("ensure CDC manifest reachability index")?;
-    // The freshness predicate references content_generation; a pre-b82f56
-    // arena being GC'd for the first time post-upgrade migrates here.
-    // Idempotent DDL inside this transaction — a dry run's rollback keeps
-    // it non-mutating, same as the index above.
-    crate::chunked::ensure_generation_infra(&tx).context("ensure generation infra before GC")?;
+    // Both per-target manifest schemas, idempotent inside this transaction —
+    // a projection activated for only ONE target still needs both tables to
+    // exist for the predicates below to reference, and a pre-b82f56 arena
+    // being GC'd for the first time post-upgrade migrates its witness
+    // infrastructure here. A dry run's rollback keeps all of it
+    // non-mutating.
+    crate::chunked::create_chunked_content_schema(&tx)
+        .context("ensure node manifest schema before GC")?;
+    crate::blob_chunked::ensure_blob_manifest_infra(&tx)
+        .context("ensure blob manifest schema before GC")?;
     let (before_chunk_rows, before_chunk_bytes) =
         chunk_totals(&tx, "", "count CDC chunks before GC")?;
 
@@ -76,12 +84,23 @@ pub fn collect_unreachable_chunks(conn: &Connection, options: GcOptions) -> Resu
     // for another whole cycle — and since every cycle can create new dead
     // manifests, "another cycle" is never.
     let (reaped_manifest_rows, reaped_manifest_nodes) = reap_dead_manifests(&tx)?;
+    let (reaped_blob_manifest_rows, reaped_blob_manifest_blobs) = reap_dead_blob_manifests(&tx)?;
 
+    // Reachable means referenced by EITHER manifest table: the chunk pool is
+    // shared across activation targets, so a chunk referenced only by a blob
+    // manifest is live. The previous single-table predicate here would have
+    // deleted live blob chunks the moment a second manifest table existed —
+    // `gc_keeps_chunks_referenced_only_by_blob_manifests` pins this.
     let unreachable_predicate = "\
         WHERE NOT EXISTS (
             SELECT 1
               FROM content_manifest AS manifest
              WHERE manifest.chunk_hash = content_chunks.chunk_hash
+        )
+          AND NOT EXISTS (
+            SELECT 1
+              FROM blob_manifest AS blob_ref
+             WHERE blob_ref.chunk_hash = content_chunks.chunk_hash
         )";
     let (unreachable_chunk_rows, unreachable_chunk_bytes) =
         chunk_totals(&tx, unreachable_predicate, "count unreachable CDC chunks")?;
@@ -131,6 +150,8 @@ pub fn collect_unreachable_chunks(conn: &Connection, options: GcOptions) -> Resu
         remaining_chunk_bytes,
         reaped_manifest_rows,
         reaped_manifest_nodes,
+        reaped_blob_manifest_rows,
+        reaped_blob_manifest_blobs,
         dry_run: options.dry_run,
     };
     if options.dry_run {
@@ -228,19 +249,85 @@ fn reap_dead_manifests(tx: &Transaction<'_>) -> Result<(u64, u64)> {
     ))
 }
 
-fn validate_gc_schema(conn: &Connection) -> Result<()> {
-    let present: i64 = conn
+/// Delete blob manifests whose `source_blobs` row is gone. Returns
+/// `(span_rows, distinct_blobs)`.
+///
+/// Deletion of the authoritative row is the ONLY way a blob manifest dies —
+/// rows are immutable under their content address, so there is no
+/// stale-witness arm (see `blob_chunked`). When the `source_blobs` table
+/// itself is absent, EVERY blob manifest is dead by the same reasoning: the
+/// manifest is a derived index over `source_blobs` rows, and a database
+/// without the table has no authoritative row for any manifest to describe —
+/// so unlike the node reaper's "nothing to prove, reap nothing" stance, the
+/// absence here is itself the proof.
+///
+/// Runs unconditionally inside the caller's transaction, including on a dry
+/// run, for the same reason as [`reap_dead_manifests`]: the reachability
+/// pass must see post-reap state or the dry-run estimate understates what is
+/// reclaimable.
+fn reap_dead_blob_manifests(tx: &Transaction<'_>) -> Result<(u64, u64)> {
+    let source_blobs_present: bool = tx
         .query_row(
-            "SELECT COUNT(*)
+            "SELECT COUNT(*) > 0
                FROM sqlite_master
-              WHERE type = 'table'
-                AND name IN ('content_chunks', 'content_manifest')",
+              WHERE type = 'table' AND name = 'source_blobs'",
             [],
             |row| row.get(0),
         )
-        .context("inspect CDC tables for reachability GC")?;
+        .context("probe for source_blobs table")?;
+    let dead_predicate = if source_blobs_present {
+        "NOT EXISTS (
+             SELECT 1
+               FROM source_blobs
+              WHERE source_blobs.blob_hash = blob_manifest.blob_hash
+         )"
+    } else {
+        "1"
+    };
+
+    // Count distinct blobs before the delete removes the evidence; the row
+    // count comes from the DELETE itself.
+    let blobs: i64 = tx
+        .query_row(
+            &format!("SELECT COUNT(DISTINCT blob_hash) FROM blob_manifest WHERE {dead_predicate}"),
+            [],
+            |row| row.get(0),
+        )
+        .context("count dead blob manifests")?;
+    let spans = tx
+        .execute(
+            &format!("DELETE FROM blob_manifest WHERE {dead_predicate}"),
+            [],
+        )
+        .context("reap dead blob manifests")?;
+
+    Ok((
+        u64::try_from(spans).context("reaped blob manifest span count exceeds u64")?,
+        u64::try_from(blobs).context("reaped blob manifest blob count exceeds u64")?,
+    ))
+}
+
+fn validate_gc_schema(conn: &Connection) -> Result<()> {
+    let table_present = |name: &str| -> Result<bool> {
+        conn.query_row(
+            "SELECT COUNT(*) > 0
+               FROM sqlite_master
+              WHERE type = 'table' AND name = ?1",
+            [name],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("inspect CDC table {name} for reachability GC"))
+    };
+    // The pool is the collection target and must already exist. The manifest
+    // tables are per-TARGET: a projection activated for only one target
+    // legitimately has one of them, and the missing one is created
+    // idempotently inside the GC transaction. A database with neither has no
+    // CDC schema at all and is refused rather than mutated.
+    let pool = table_present("content_chunks")?;
+    let node_manifest = table_present("content_manifest")?;
+    let blob_manifest = table_present("blob_manifest")?;
     ensure!(
-        present == 2,
+        pool && (node_manifest || blob_manifest),
         "missing required CDC tables for reachability GC"
     );
     validate_table_columns(
@@ -248,11 +335,20 @@ fn validate_gc_schema(conn: &Connection) -> Result<()> {
         "content_chunks",
         &["chunk_hash", "chunk_bytes", "chunk_len"],
     )?;
-    validate_table_columns(
-        conn,
-        "content_manifest",
-        &["node_id", "seq", "chunk_hash", "byte_offset", "byte_len"],
-    )?;
+    if node_manifest {
+        validate_table_columns(
+            conn,
+            "content_manifest",
+            &["node_id", "seq", "chunk_hash", "byte_offset", "byte_len"],
+        )?;
+    }
+    if blob_manifest {
+        validate_table_columns(
+            conn,
+            "blob_manifest",
+            &["blob_hash", "seq", "chunk_hash", "byte_offset", "byte_len"],
+        )?;
+    }
     Ok(())
 }
 

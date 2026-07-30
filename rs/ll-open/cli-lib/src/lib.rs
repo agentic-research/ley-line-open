@@ -23,10 +23,35 @@ pub mod walk;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 
 /// Edition tag for this build of the CLI library.
 pub const EDITION: &str = "open";
+
+/// Which authoritative table `cdc enable` builds the derived chunk index
+/// over. Explicit, never heuristic (ADR-0033): the two targets have
+/// different freshness designs — `nodes` rows mutate, so their manifests
+/// carry a witness; `source_blobs` rows are content-addressed and immutable,
+/// so theirs do not — and a database may legitimately carry either or both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CdcTarget {
+    /// Construct-granular `nodes` rows (witness-gated manifests).
+    Nodes,
+    /// Whole-file `source_blobs` rows (witness-free manifests; rows below
+    /// the 8 KiB chunking floor are skipped by design).
+    SourceBlobs,
+}
+
+impl std::fmt::Display for CdcTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The clap-facing name IS the display name, so `--help`'s default
+        // shows exactly the token a user must type.
+        self.to_possible_value()
+            .expect("CdcTarget has no skipped variants")
+            .get_name()
+            .fmt(f)
+    }
+}
 
 /// CDC storage-administration subcommands.
 #[derive(Debug, Subcommand)]
@@ -36,6 +61,10 @@ pub enum CdcCommands {
         /// SQLite projection to activate in place.
         #[arg(long)]
         db: PathBuf,
+
+        /// Authoritative table to build the chunk index over.
+        #[arg(long, value_enum, default_value_t = CdcTarget::Nodes)]
+        target: CdcTarget,
 
         /// Authoritative rows loaded into memory per query page.
         #[arg(long, default_value_t = 256)]
@@ -233,9 +262,15 @@ pub async fn run(cmd: Commands) -> Result<()> {
                 match command {
                     CdcCommands::Enable {
                         db,
+                        target,
                         batch_size,
                         json,
-                    } => cmd_cdc::cmd_cdc_enable(&db, batch_size, json),
+                    } => match target {
+                        CdcTarget::Nodes => cmd_cdc::cmd_cdc_enable(&db, batch_size, json),
+                        CdcTarget::SourceBlobs => {
+                            cmd_cdc::cmd_cdc_enable_source_blobs(&db, batch_size, json)
+                        }
+                    },
                     CdcCommands::Gc { db, dry_run, json } => {
                         cmd_cdc::cmd_cdc_gc(&db, dry_run, json)
                     }

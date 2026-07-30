@@ -8,6 +8,40 @@ Each entry references the bead ID(s) tracking the work in
 [rsry](https://github.com/agentic-research/rosary) so the full design
 context, scoping notes, and review history are recoverable.
 
+## [Unreleased]
+
+### Added
+
+- **A second CDC activation target: `source_blobs`** (`ley-line-open-baa57f`,
+  ADR-0033). `leyline cdc enable --target nodes|source-blobs` (default `nodes`
+  — unchanged behavior) can now build the chunk index over the whole-file
+  `source_blobs` table, where chunking's economics actually work: on a real
+  mache projection, 100% of `nodes` rows (395,173 of 395,173) sat below the
+  8 KiB chunking floor, so nodes-target activation added +21% database size
+  (440 MB of overhead for 1.9 MB of dedup). The new target skips sub-floor
+  rows by design and counts them in its report (`skipped_sub_floor_blobs`).
+  Because `source_blobs` rows are content-addressed and immutable, blob
+  manifests carry **no freshness witness** — existence is freshness; the
+  integrity obligation moves to the store path, which refuses a blob whose
+  bytes do not hash to its claimed key. The chunk pool is shared across
+  targets (cross-target dedup), and `cdc gc` is now two-armed: a chunk is
+  unreachable only when neither `content_manifest` nor `blob_manifest`
+  references it (without this, GC would have deleted live blob chunks), and
+  dead blob manifests — those whose `source_blobs` row is gone — are reaped
+  first, reported as `reaped_blob_manifest_rows`/`_blobs`. Internal break:
+  `leyline_fs::chunked::CONTENT_CHUNKS_DDL` is no longer exported (the pool
+  DDL is split from the nodes-manifest DDL so the blob target can create the
+  pool without the witness apparatus).
+
+### Documentation
+
+- **ADR-0033 written into its reserved slot** (`ley-line-open-b6653a`): the
+  retroactive CDC decision record — the chunk-store/manifest/witness design
+  as shipped, D1 (the dual store is permanent; the derived index never
+  replaces `nodes.record`), D2 (activation targets are explicit, never
+  heuristic), and D3 (witness-free blob manifests + the sub-floor skip
+  policy, with baa57f's measurement).
+
 ## [0.13.0] — 2026-07-29
 
 The release-hardening train: CI gates that mean what they say, MCP protocol

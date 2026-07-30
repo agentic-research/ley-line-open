@@ -17,11 +17,11 @@ version: '3'
 
 tasks:
   test:cdc:
-    desc: leyline-fs CDC tests + clippy (cdc,splice,validate) — no default features
+    desc: leyline-fs CDC + verify-on-fault tests + clippy (cdc,splice,validate,verify) — no default features
     dir: '{{.ROOT_DIR}}/rs'
     cmds:
-      - cargo test -p leyline-fs --no-default-features --features cdc,splice,validate
-      - cargo clippy -p leyline-fs --no-default-features --features cdc,splice,validate --no-deps -- -D warnings
+      - cargo test -p leyline-fs --no-default-features --features cdc,splice,validate,verify
+      - cargo clippy -p leyline-fs --no-default-features --features cdc,splice,validate,verify --no-deps -- -D warnings
 
   build:static:
     desc: Build the leyline-fs staticlib with `cdc` — the FFI surface consumers link

@@ -28,6 +28,13 @@ splice = ["dep:leyline-ts"]
 # read selects only overlapping chunks. Opt-in so the lean mount build is
 # unchanged.
 cdc = ["dep:leyline-cdc"]
+# Verify-on-fault arena serving (bead ley-line-open-b6a4dd): keep the arena
+# mapped, hold the outboard BLAKE3 tree beside it, and verify each 1 KiB page
+# against `ctrl.current_root` the first time it is served (bitmap-cached, so
+# the steady state re-hashes nothing). Opt-in AND runtime-activated
+# (`HotSwapGraph::with_verify_on_fault`); default mounts are unchanged, and
+# the flag flips into a shipping config in a later bead.
+verify = []
 
 [dependencies]
 parking_lot = { workspace = true }

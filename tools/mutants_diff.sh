@@ -85,6 +85,13 @@ run_slice() {
         } >&2
         exit 4
     fi
+    # Exit 3 = timeouts only — the allowlist tasks' stance applies here too:
+    # a mutant the harness had to STOP is detected, not missed. Exit 2
+    # (genuinely missed mutants) is what fails the gate.
+    if [ "$rc" -eq 3 ]; then
+        echo "TIMEOUT(s) only in this slice — stopped mutants count as detected"
+        return 0
+    fi
     if [ "$rc" -ne 0 ]; then
         overall=$rc
     fi

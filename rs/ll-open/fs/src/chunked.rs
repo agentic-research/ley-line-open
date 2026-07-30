@@ -31,9 +31,13 @@
 //! The graph write path captures a freshness-verified old manifest before
 //! changing `nodes.record`, then calls `leyline_cdc::rechunk_with_stats` with
 //! the exact overwrite coordinates. A small edit therefore hashes only its
-//! bounded resync window and stores only its new chunks. Initial population,
-//! a missing manifest, or a stale freshness witness deliberately falls back to
-//! a full chunk.
+//! bounded resync window and stores only its new chunks — the manifest store
+//! is told the rescan window and verifies carried-over rows by existence
+//! probe, never by re-hashing (this was false until ley-line-open-f8ebe7:
+//! the store re-hashed every chunk, making refresh O(file) while the stat
+//! that should have caught it measured the scanner one layer down). Initial
+//! population, a missing manifest, or a stale freshness witness deliberately
+//! falls back to a full chunk.
 //!
 //! ## Public surface — one way in
 //!
@@ -222,7 +226,8 @@ fn chunk_schema_present(conn: &Connection) -> Result<bool> {
 /// count.
 pub fn store_content_chunked(conn: &Connection, node_id: &str, data: &[u8]) -> Result<usize> {
     let chunks = leyline_cdc::chunk(data);
-    store_content_manifest(conn, node_id, data, &chunks)
+    let all = 0..chunks.len();
+    store_content_manifest(conn, node_id, data, &chunks, all)
 }
 
 fn store_content_manifest(
@@ -230,6 +235,7 @@ fn store_content_manifest(
     node_id: &str,
     data: &[u8],
     chunks: &[leyline_cdc::Chunk],
+    rehashed: std::ops::Range<usize>,
 ) -> Result<usize> {
     // Atomic, and it must be. The DELETE + per-chunk INSERT loop is only a
     // valid manifest at the end: interrupt it partway and the node's spans no
@@ -244,7 +250,7 @@ fn store_content_manifest(
     let tx = conn
         .unchecked_transaction()
         .context("begin chunked store transaction")?;
-    store_content_manifest_in_transaction(&tx, node_id, data, chunks)?;
+    store_content_manifest_in_transaction(&tx, node_id, data, chunks, rehashed)?;
     tx.commit().context("commit chunked store")?;
     Ok(chunks.len())
 }
@@ -260,16 +266,42 @@ pub(crate) fn store_content_chunked_in_transaction(
     data: &[u8],
 ) -> Result<usize> {
     let chunks = leyline_cdc::chunk(data);
-    store_content_manifest_in_transaction(tx, node_id, data, &chunks)?;
+    let all = 0..chunks.len();
+    store_content_manifest_in_transaction(tx, node_id, data, &chunks, all)?;
     Ok(chunks.len())
 }
 
+/// `rehashed` is the index range of chunks whose bytes are NEW under this
+/// write — the incremental path's rescan window, or `0..chunks.len()` for a
+/// full chunking. Only those chunks are hashed and `put`; rows outside the
+/// range were carried over from a manifest that already stored their blobs,
+/// so they are verified by existence (`BlobStore::contains`, an index probe)
+/// rather than re-hashed. This is what makes a small edit cost
+/// O(edit + resync window) in hashing instead of O(file) — the sub-file
+/// premise the whole CDC layer exists for (ley-line-open-f8ebe7).
+///
+/// THE TRADE, NAMED (types-friend F2/F6): the old whole-file re-hash was
+/// incidentally the enforcement that the caller's [`leyline_cdc::Edit`]
+/// coordinates were truthful. With it gone, that obligation is carried by:
+/// the [`leyline_cdc::Edit`] parse type (ordering unrepresentable), the
+/// graph write path deriving coordinates from the write op itself and
+/// falling back to a full re-chunk when its UTF-8-lossy conversion changed
+/// the bytes, and the end-to-end oracle test
+/// (`graph_write_incrementally_matches_full_chunk_oracle`) asserting the
+/// stored manifest equals `chunk(new_data)`. Do not add a carried-row
+/// shortcut for a NEW caller without walking that chain.
 fn store_content_manifest_in_transaction(
     tx: &Transaction<'_>,
     node_id: &str,
     data: &[u8],
     chunks: &[leyline_cdc::Chunk],
+    rehashed: std::ops::Range<usize>,
 ) -> Result<()> {
+    ensure!(
+        rehashed.start <= rehashed.end && rehashed.end <= chunks.len(),
+        "rehashed window {rehashed:?} does not lie within the {} manifest rows",
+        chunks.len()
+    );
     tx.execute(
         "DELETE FROM content_manifest WHERE node_id = ?1",
         params![node_id],
@@ -285,9 +317,20 @@ fn store_content_manifest_in_transaction(
     let mut store = SqliteBlobStore { tx };
 
     for (seq, c) in chunks.iter().enumerate() {
-        let bytes = &data[c.offset..c.offset + c.len];
-        let stored = store.put(bytes).context("insert chunk")?;
-        ensure!(stored == c.hash, "chunk manifest hash does not match bytes");
+        if rehashed.contains(&seq) {
+            let bytes = &data[c.offset..c.offset + c.len];
+            let stored = store.put(bytes).context("insert chunk")?;
+            ensure!(stored == c.hash, "chunk manifest hash does not match bytes");
+        } else {
+            // Carried over from the previous manifest: the blob was stored
+            // (and hash-verified) when it was first written, and blobs are
+            // immutable under their content address. Existence is the whole
+            // check — catches a GC that reaped a still-referenced chunk.
+            ensure!(
+                store.contains(c.hash).context("probe carried chunk")?,
+                "carried-over chunk {seq} is missing from the blob store"
+            );
+        }
         put_span
             .execute(params![
                 node_id,
@@ -738,38 +781,42 @@ pub(crate) fn refresh_chunked_content_after_edit(
     node_id: &str,
     data: &[u8],
     previous: Option<ChunkManifestSnapshot>,
-    edit_offset: usize,
-    old_edit_end: usize,
+    edit: leyline_cdc::Edit,
     old_len: usize,
 ) -> Result<RefreshOutcome> {
     if !chunk_schema_present(conn)? {
         return Ok(RefreshOutcome::Skipped);
     }
 
-    let (chunks, outcome) = match previous {
+    let (chunks, rehashed, outcome) = match previous {
         Some(previous) => {
             anyhow::ensure!(
                 previous.source_len == old_len,
                 "old manifest length {} does not match old record length {old_len}",
                 previous.source_len
             );
-            let (chunks, stats) = leyline_cdc::rechunk_with_stats(
-                &previous.chunks,
-                data,
-                edit_offset,
-                old_edit_end,
-                old_len,
-            );
-            (chunks, RefreshOutcome::Incremental(stats))
+            let (chunks, stats) = leyline_cdc::rechunk_with_stats(&previous.chunks, data, edit);
+            // The rescan window: everything between the kept prefix and the
+            // reused tail was hashed by rechunk; only those rows carry new
+            // bytes for the store. Exact accounting is pinned by the cdc
+            // fuzzer (prefix_kept + tail_reused + rehashed == len).
+            let rehashed = stats.prefix_kept..chunks.len() - stats.tail_reused;
+            (chunks, rehashed, RefreshOutcome::Incremental(stats))
         }
-        None => (
-            leyline_cdc::chunk(data),
-            RefreshOutcome::Full {
-                bytes_scanned: data.len(),
-            },
-        ),
+        None => {
+            let chunks = leyline_cdc::chunk(data);
+            let all = 0..chunks.len();
+            let scanned = data.len();
+            (
+                chunks,
+                all,
+                RefreshOutcome::Full {
+                    bytes_scanned: scanned,
+                },
+            )
+        }
     };
-    store_content_manifest(conn, node_id, data, &chunks)?;
+    store_content_manifest(conn, node_id, data, &chunks, rehashed)?;
     Ok(outcome)
 }
 
@@ -1040,6 +1087,103 @@ mod tests {
         let c = Connection::open_in_memory().unwrap();
         create_chunked_content_schema(&c).unwrap();
         c
+    }
+
+    /// The store must NOT re-derive carried-over rows from `data` — that is
+    /// the whole of ley-line-open-f8ebe7 (a small edit was hashing the entire
+    /// file, O(file) instead of O(edit + resync window), while the stat that
+    /// should have caught it measured the boundary scanner one layer down).
+    ///
+    /// Pinned behaviorally rather than by counting: `data` is CORRUPTED in
+    /// the carried region. The old implementation hashed those bytes and
+    /// errored on the mismatch; the fixed one never reads them (existence
+    /// probe only), succeeds, and range reads still serve the TRUE bytes
+    /// because blobs are fetched by content address. The same corruption
+    /// placed INSIDE the rehash window must still be refused — the
+    /// coordinate-honesty backstop survives on exactly the rows that carry
+    /// new bytes.
+    #[test]
+    fn carried_rows_are_probed_not_rehashed_and_the_window_is_still_verified() {
+        let conn = db();
+        let body = prng(0xF8EB_E700, 6 * MAX_CHUNK);
+        store_content_chunked(&conn, "n", &body).unwrap();
+        let snapshot = capture_manifest_rows(&conn, "n");
+        assert!(
+            snapshot.len() >= 4,
+            "fixture must span several chunks; got {}",
+            snapshot.len()
+        );
+
+        // Same manifest, but the caller's buffer is WRONG everywhere except
+        // the declared rehash window (the last two chunks).
+        let window_start_row = snapshot.len() - 2;
+        let window_byte_start = snapshot[window_start_row].offset;
+        let mut corrupted = vec![0u8; body.len()];
+        corrupted[window_byte_start..].copy_from_slice(&body[window_byte_start..]);
+
+        let tx = conn.unchecked_transaction().unwrap();
+        store_content_manifest_in_transaction(
+            &tx,
+            "n",
+            &corrupted,
+            &snapshot,
+            window_start_row..snapshot.len(),
+        )
+        .expect("carried rows must be verified by existence, not by re-hashing caller bytes");
+        tx.commit().unwrap();
+
+        // Reads still serve the TRUE bytes: manifests address blobs by hash.
+        // (The test-only unchecked reader — this fixture has no `nodes` row,
+        // and the freshness gate is not what this test is about.)
+        let mut out = vec![0u8; 64];
+        let n = read_content_chunked(&conn, "n", &mut out, 0).unwrap();
+        assert_eq!(
+            &out[..n],
+            &body[..n],
+            "content addressing ignores the caller's corrupt buffer"
+        );
+
+        // The backstop still bites where the bytes are claimed to be new.
+        let tx = conn.unchecked_transaction().unwrap();
+        let err = store_content_manifest_in_transaction(
+            &tx,
+            "n",
+            &corrupted,
+            &snapshot,
+            0..snapshot.len(),
+        )
+        .expect_err("bytes inside the rehash window must still hash-match the manifest");
+        assert!(
+            err.to_string().contains("does not match"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// Rows of the stored manifest for direct store-layer tests.
+    fn capture_manifest_rows(conn: &Connection, node_id: &str) -> Vec<leyline_cdc::Chunk> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT chunk_hash, byte_offset, byte_len FROM content_manifest \
+                 WHERE node_id = ?1 ORDER BY seq",
+            )
+            .unwrap();
+        stmt.query_map(params![node_id], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })
+        .unwrap()
+        .map(|r| {
+            let (h, off, len) = r.unwrap();
+            leyline_cdc::Chunk {
+                hash: Hash::from_bytes(h.as_slice().try_into().unwrap()),
+                offset: usize::try_from(off).unwrap(),
+                len: usize::try_from(len).unwrap(),
+            }
+        })
+        .collect()
     }
 
     fn assert_blob_store_baseline<S: BlobStore>(store: &mut S) {

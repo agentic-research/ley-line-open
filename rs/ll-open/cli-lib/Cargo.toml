@@ -92,6 +92,12 @@ axum = "0.8"
 base64 = "0.22"
 dirs = "6"
 which = "8"
+# `leyline self install|update|where` (bead ley-line-open-321ded).
+# ureq fetches the release asset + SHA256SUMS in one-shot synchronous
+# GETs; sha2 verifies the digest before the installed binary is
+# touched. Both pinned in the workspace table per ADR-0026.
+ureq = { workspace = true }
+sha2 = { workspace = true }
 rayon = "1"
 tempfile = { workspace = true }
 # `ignore` crate — ripgrep's + mache's source-tree walker. Bead

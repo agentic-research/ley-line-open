@@ -91,6 +91,27 @@ context, scoping notes, and review history are recoverable.
   shipping configuration (recorded in the feature-reachability ledger) and
   runtime-inert until a call site opts in; the flag flips in a later bead.
 
+- **`leyline self install|update|where` — install/update as a first-class
+  product surface** (`ley-line-open-321ded`). The rustup/uv model: the binary
+  owns its own installation instead of every consumer's Taskfile reinventing a
+  copy step (motivating failure: mache's `task install` parked leyline in
+  `~/.mache`, off PATH). `self install [--bin-dir DIR]` copies the running
+  executable into `~/.local/bin` (overridable by `$LEYLINE_INSTALL_DIR`; the
+  flag wins), idempotently (byte-identical → reported no-op) and atomically
+  (same-dir staging + rename — a crash leaves old bytes or new bytes, never a
+  torn binary); if the dir is off PATH it prints the exact export line for
+  your shell and never edits rc files. `self update [--version vX.Y.Z]
+  [--force]` resolves a GitHub release (latest, or pinned), downloads the
+  platform asset (`leyline-{darwin|linux}-{amd64|arm64}`) plus the release's
+  `SHA256SUMS`, verifies the digest **before** the installed binary is
+  touched, then atomically swaps it in with the previous binary kept as
+  `leyline.prev` for rollback; downgrades are refused without `--force`, and
+  `$GITHUB_TOKEN` is honored for rate limits (never required — releases are
+  public). `self where` prints the resolved install dir, its PATH status, and
+  the running binary's path in a grep-stable shape. `leyline doctor` now also
+  reports whether the running binary's directory is on PATH (warn-only; the
+  exit code is unchanged).
+
 - **A second CDC activation target: `source_blobs`** (`ley-line-open-baa57f`,
   ADR-0033). `leyline cdc enable --target nodes|source-blobs` (default `nodes`
   — unchanged behavior) can now build the chunk index over the whole-file

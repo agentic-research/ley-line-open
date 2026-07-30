@@ -122,21 +122,137 @@ CREATE INDEX IF NOT EXISTS content_manifest_span
 CREATE INDEX IF NOT EXISTS content_manifest_chunk_hash
     ON content_manifest(chunk_hash);
 
--- Freshness witness: the (size, mtime) of the `nodes` row this manifest was
--- built from. A read compares it against the row's CURRENT values, so a
--- manifest whose source moved on is REFUSED rather than served. This is what
--- makes a missed invalidation degrade to slow-but-correct instead of silently
--- wrong. See `has_chunked_content`.
+-- Freshness witness: the generation and length of the `nodes` row this
+-- manifest was built from. A read compares them against the row's CURRENT
+-- values, so a manifest whose source moved on is REFUSED rather than served.
+-- This is what makes a missed invalidation degrade to slow-but-correct
+-- instead of silently wrong. See `has_chunked_content`.
+--
+-- `source_generation` is the load-bearing half (ley-line-open-b82f56): the
+-- old (size, mtime) pair was a change HEURISTIC, not a mutation identity — a
+-- same-length replacement within mtime granularity, or any writer reproducing
+-- both, served the previous occupant's bytes. The generation is bumped by a
+-- TRIGGER on `nodes` (see GENERATION_TRIGGERS_DDL), so every writer that goes
+-- through SQL advances it — including foreign writers that have never heard
+-- of this module, which is exactly the writer class the witness exists for.
+-- `source_mtime` remains as a column for older readers but no longer enters
+-- the freshness predicate.
 CREATE TABLE IF NOT EXISTS content_manifest_meta (
-    node_id      TEXT PRIMARY KEY,
-    source_len   INTEGER NOT NULL,
-    source_mtime INTEGER
+    node_id           TEXT PRIMARY KEY,
+    source_len        INTEGER NOT NULL,
+    source_mtime      INTEGER,
+    source_generation INTEGER NOT NULL DEFAULT -1
+);
+
+-- One row per node: how many times `nodes.record` has been replaced (or the
+-- row re-inserted) since this arena gained the CDC schema. Maintained by
+-- triggers, never by application code.
+CREATE TABLE IF NOT EXISTS content_generation (
+    node_id    TEXT PRIMARY KEY,
+    generation INTEGER NOT NULL DEFAULT 0
 );";
 
-/// Create the chunk store + manifest tables (idempotent).
+/// Triggers that make `content_generation` writer-proof. Separate from the
+/// base DDL because they reference `nodes`, which pure content-addressed
+/// arenas (some tests, non-graph use) do not have; applied wherever the
+/// witness is actually consulted — see [`ensure_generation_infra`].
+///
+/// INSERT bumps too: a fresh row at a reused node id is the disclosure
+/// scenario (new file at an old path serving the previous occupant's
+/// bytes), and it must invalidate any manifest the old occupant left.
+const GENERATION_TRIGGERS_DDL: &str = "\
+CREATE TRIGGER IF NOT EXISTS content_generation_on_update
+AFTER UPDATE OF record ON nodes
+WHEN new.record IS NOT old.record
+BEGIN
+    INSERT INTO content_generation(node_id, generation) VALUES (new.id, 1)
+    ON CONFLICT(node_id) DO UPDATE SET generation = generation + 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS content_generation_on_insert
+AFTER INSERT ON nodes
+BEGIN
+    INSERT INTO content_generation(node_id, generation) VALUES (new.id, 1)
+    ON CONFLICT(node_id) DO UPDATE SET generation = generation + 1;
+END;";
+
+/// The freshness witness, defined ONCE (types-friend F3 — the module already
+/// states the rule for `OVERLAP_PREDICATE`: a second hand-written copy is how
+/// the read gate and the GC reaper drift apart, and they had). `m` is the
+/// witness table alias, `n` the nodes alias. The Rust arm is
+/// [`manifest_witness_is_fresh`]; `witness_predicate_arms_agree` drives both
+/// over one truth table.
+///
+/// `COALESCE(n.size, -1)`: a NULL `size` (the column is nullable in the
+/// canonical DDL) must read as NOT FRESH, not as a SQL NULL that errors at
+/// decode (types-friend F4).
+pub(crate) const WITNESS_FRESH_PREDICATE: &str = "\
+m.source_len >= 0 \
+AND m.source_len = COALESCE(n.size, -1) \
+AND m.source_generation = COALESCE(\
+    (SELECT g.generation FROM content_generation g WHERE g.node_id = n.id), 0)";
+
+/// Create the chunk store + manifest tables (idempotent), migrate a
+/// pre-generation witness table, and install the generation triggers when
+/// the arena has a `nodes` table to hang them on.
 pub fn create_chunked_content_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(CONTENT_CHUNKS_DDL)
-        .context("create chunked content schema")
+        .context("create chunked content schema")?;
+    ensure_generation_infra(conn)
+}
+
+/// Idempotently bring an arena's generation infrastructure current:
+/// - add `source_generation` to a pre-b82f56 witness table (DEFAULT -1, which
+///   matches no real generation, so every OLD manifest reads stale — the
+///   design's own degradation: slow-but-correct, then reaped by GC);
+/// - install the `nodes` triggers when `nodes` exists.
+///
+/// Called from schema creation, the manifest store path, and GC — any of
+/// which may be the first post-upgrade writer to touch an old arena. All
+/// statements are IF-NOT-EXISTS-shaped, and SQLite DDL is transactional, so
+/// a dry-run GC that runs this inside its rolled-back transaction stays
+/// non-mutating.
+pub(crate) fn ensure_generation_infra(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS content_generation (
+             node_id    TEXT PRIMARY KEY,
+             generation INTEGER NOT NULL DEFAULT 0
+         );",
+    )
+    .context("create content_generation")?;
+
+    let has_generation_column: bool = conn
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('content_manifest_meta') \
+              WHERE name = 'source_generation'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()
+        .context("probe witness generation column")?
+        .unwrap_or(false);
+    if !has_generation_column {
+        conn.execute_batch(
+            "ALTER TABLE content_manifest_meta \
+             ADD COLUMN source_generation INTEGER NOT NULL DEFAULT -1;",
+        )
+        .context("migrate witness table to generations")?;
+    }
+
+    let nodes_table: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()
+        .context("probe for nodes table")?
+        .unwrap_or(false);
+    if nodes_table {
+        conn.execute_batch(GENERATION_TRIGGERS_DDL)
+            .context("install generation triggers")?;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -367,7 +483,11 @@ fn store_content_manifest_in_transaction(
         .optional()
         .context("probe for nodes table")?
         .unwrap_or(false);
-    let node_meta: Option<(Vec<u8>, i64, i64)> = if nodes_table {
+    // Option decodes throughout (types-friend F4): `record` and `size` are
+    // nullable in the canonical `nodes` DDL, and a NULL must be a NAMED
+    // refusal here, not a rusqlite InvalidColumnType error.
+    let node_meta: Option<(Option<Vec<u8>>, Option<i64>, i64)> = if nodes_table {
+        ensure_generation_infra(tx).context("ensure generation infra before store")?;
         tx.query_row(
             "SELECT CAST(record AS BLOB), size, mtime FROM nodes WHERE id = ?1",
             params![node_id],
@@ -379,6 +499,12 @@ fn store_content_manifest_in_transaction(
         None
     };
     if let Some((record, source_len, _)) = &node_meta {
+        let (Some(record), Some(source_len)) = (record, source_len) else {
+            anyhow::bail!(
+                "cannot chunk-store {node_id}: its nodes row has a NULL record \
+                 or size, so no freshness witness can be captured"
+            );
+        };
         ensure!(
             *source_len >= 0
                 && usize::try_from(*source_len).ok() == Some(data.len())
@@ -386,13 +512,26 @@ fn store_content_manifest_in_transaction(
             "authoritative node changed before chunk store for {node_id}"
         );
     }
+    // The generation captured in the SAME transaction as the manifest —
+    // the mutation identity this witness is keyed on (b82f56). Zero when
+    // the node predates the triggers or there is no nodes row.
+    let generation: i64 = tx
+        .query_row(
+            "SELECT COALESCE(\
+                 (SELECT generation FROM content_generation WHERE node_id = ?1), 0)",
+            params![node_id],
+            |r| r.get(0),
+        )
+        .context("read content generation")?;
     tx.execute(
-        "INSERT OR REPLACE INTO content_manifest_meta (node_id, source_len, source_mtime) \
-         VALUES (?1, ?2, ?3)",
+        "INSERT OR REPLACE INTO content_manifest_meta \
+         (node_id, source_len, source_mtime, source_generation) \
+         VALUES (?1, ?2, ?3, ?4)",
         params![
             node_id,
             i64::try_from(data.len()).context("source length exceeds SQLite INTEGER")?,
-            node_meta.map(|(_, _, mtime)| mtime)
+            node_meta.map(|(_, _, mtime)| mtime),
+            generation
         ],
     )
     .context("record manifest freshness witness")?;
@@ -694,9 +833,28 @@ pub(crate) fn capture_chunked_content(
         return Ok(None);
     }
 
-    let witness: Option<(i64, Option<i64>, i64, i64)> = conn
+    // The generation-infra probe doubles as the migration gate: an arena
+    // whose chunk schema predates b82f56 has no content_generation table,
+    // and every witness on it must read stale (the -1 default) — which the
+    // early return models by refusing to capture.
+    let generation_infra: bool = conn
         .query_row(
-            "SELECT meta.source_len, meta.source_mtime, nodes.size, nodes.mtime
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='content_generation'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()
+        .context("probe for content_generation")?
+        .unwrap_or(false);
+    if !generation_infra {
+        return Ok(None);
+    }
+
+    let witness: Option<(i64, i64, Option<i64>, i64)> = conn
+        .query_row(
+            "SELECT meta.source_len, meta.source_generation, nodes.size,
+                    COALESCE((SELECT g.generation FROM content_generation g
+                               WHERE g.node_id = nodes.id), 0)
                FROM content_manifest_meta AS meta
                JOIN nodes ON nodes.id = meta.node_id
               WHERE meta.node_id = ?1",
@@ -705,10 +863,10 @@ pub(crate) fn capture_chunked_content(
         )
         .optional()
         .context("read chunk manifest freshness witness")?;
-    let Some((source_len, source_mtime, live_len, live_mtime)) = witness else {
+    let Some((source_len, source_generation, live_len, live_generation)) = witness else {
         return Ok(None);
     };
-    if !manifest_witness_is_fresh(source_len, source_mtime, live_len, live_mtime) {
+    if !manifest_witness_is_fresh(source_len, source_generation, live_len, live_generation) {
         return Ok(None);
     }
     let source_len =
@@ -759,13 +917,16 @@ pub(crate) fn capture_chunked_content(
     Ok(Some(ChunkManifestSnapshot { chunks, source_len }))
 }
 
+/// The Rust arm of [`WITNESS_FRESH_PREDICATE`] — keep the two in agreement;
+/// `witness_predicate_arms_agree` drives both over one truth table. `None`
+/// for `live_len` models a NULL `nodes.size` (never fresh, types-friend F4).
 fn manifest_witness_is_fresh(
     source_len: i64,
-    source_mtime: Option<i64>,
-    live_len: i64,
-    live_mtime: i64,
+    source_generation: i64,
+    live_len: Option<i64>,
+    live_generation: i64,
 ) -> bool {
-    source_len >= 0 && source_len == live_len && source_mtime == Some(live_mtime)
+    source_len >= 0 && Some(source_len) == live_len && source_generation == live_generation
 }
 
 /// Refresh `node_id` after a known edit, but only if this arena already uses
@@ -853,28 +1014,38 @@ pub(crate) fn has_chunked_content_in_transaction(
     tx: &Transaction<'_>,
     node_id: &str,
 ) -> Result<bool> {
+    // content_generation included: an arena whose chunk schema predates the
+    // generation witness (b82f56) reads as "no chunked content" — every read
+    // falls back to the record, slow-but-correct, until a store path
+    // migrates it.
     let tables_present: i64 = tx
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' \
-               AND name IN ('content_manifest','content_manifest_meta','nodes')",
+               AND name IN ('content_manifest','content_manifest_meta',\
+                            'content_generation','nodes')",
             [],
             |r| r.get(0),
         )
         .context("probe for chunk tables")?;
-    if tables_present < 3 {
+    if tables_present < 4 {
         return Ok(false);
     }
 
-    // One query: manifest witness joined to the live node row. Any missing
-    // side (no manifest, no node) yields no row, hence `false`.
+    // One query: manifest witness joined to the live node row, freshness by
+    // the ONE predicate definition (WITNESS_FRESH_PREDICATE — the same
+    // string GC reaps on; see its doc for why there is exactly one copy).
+    // COALESCE on size: NULL must read as a value we can decode, not a SQL
+    // NULL that errors (types-friend F4); -1 also fails the length branch
+    // when it is the live length of a fresh-looking witness.
+    let sql = format!(
+        "SELECT ({WITNESS_FRESH_PREDICATE}), COALESCE(n.size, -1) \
+           FROM content_manifest_meta m JOIN nodes n ON n.id = m.node_id \
+          WHERE m.node_id = ?1"
+    );
     let fresh: Option<(bool, i64)> = tx
-        .query_row(
-            "SELECT m.source_len = n.size AND m.source_mtime IS n.mtime, n.size \
-               FROM content_manifest_meta m JOIN nodes n ON n.id = m.node_id \
-              WHERE m.node_id = ?1",
-            params![node_id],
-            |r| Ok((r.get::<_, i64>(0)? != 0, r.get(1)?)),
-        )
+        .query_row(&sql, params![node_id], |r| {
+            Ok((r.get::<_, i64>(0)? != 0, r.get(1)?))
+        })
         .optional()
         .context("check manifest freshness")?;
     let Some((true, live_size)) = fresh else {
@@ -1412,15 +1583,151 @@ mod tests {
 
     #[test]
     fn manifest_freshness_witness_rejects_invalid_lengths() {
-        assert!(manifest_witness_is_fresh(0, Some(7), 0, 7));
-        assert!(manifest_witness_is_fresh(5, Some(7), 5, 7));
+        // (source_len, source_generation, live_len, live_generation)
+        assert!(manifest_witness_is_fresh(0, 0, Some(0), 0));
+        assert!(manifest_witness_is_fresh(5, 3, Some(5), 3));
 
-        assert!(!manifest_witness_is_fresh(-1, Some(7), -1, 7));
-        assert!(!manifest_witness_is_fresh(-1, Some(7), 5, 7));
-        assert!(!manifest_witness_is_fresh(5, Some(7), -1, 7));
-        assert!(!manifest_witness_is_fresh(5, Some(7), 4, 7));
-        assert!(!manifest_witness_is_fresh(5, None, 5, 7));
-        assert!(!manifest_witness_is_fresh(5, Some(8), 5, 7));
+        assert!(!manifest_witness_is_fresh(-1, 3, Some(-1), 3));
+        assert!(!manifest_witness_is_fresh(-1, 3, Some(5), 3));
+        assert!(!manifest_witness_is_fresh(5, 3, Some(-1), 3));
+        assert!(!manifest_witness_is_fresh(5, 3, Some(4), 3));
+        assert!(
+            !manifest_witness_is_fresh(5, 3, None, 3),
+            "NULL size is never fresh"
+        );
+        assert!(
+            !manifest_witness_is_fresh(5, 3, Some(5), 4),
+            "stale generation"
+        );
+        assert!(
+            !manifest_witness_is_fresh(5, -1, Some(5), 0),
+            "migrated -1 default never fresh"
+        );
+    }
+
+    /// F3's mechanism: the Rust arm and WITNESS_FRESH_PREDICATE evaluated by
+    /// SQLite must agree on every row of one truth table — including the
+    /// NULL-size row (F4) and the (-1, -1) row the previous predicate
+    /// triplication got wrong on the shipped gates.
+    #[test]
+    fn witness_predicate_arms_agree() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE nodes (id TEXT PRIMARY KEY, size INTEGER);
+             CREATE TABLE content_manifest_meta (
+                 node_id TEXT PRIMARY KEY,
+                 source_len INTEGER NOT NULL,
+                 source_generation INTEGER NOT NULL
+             );
+             CREATE TABLE content_generation (
+                 node_id TEXT PRIMARY KEY,
+                 generation INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+
+        // (source_len, source_generation, live_size, live_generation-row)
+        let cases: &[(i64, i64, Option<i64>, Option<i64>)] = &[
+            (0, 0, Some(0), None), // gen row absent → live gen 0
+            (5, 3, Some(5), Some(3)),
+            (-1, 3, Some(-1), Some(3)),
+            (5, 3, None, Some(3)),    // NULL size
+            (5, 3, Some(5), Some(4)), // stale generation
+            (5, -1, Some(5), None),   // migrated default vs absent row (0)
+            (5, 0, Some(5), None),    // explicit 0 vs absent row (0) → fresh
+        ];
+        let sql = format!(
+            "SELECT ({WITNESS_FRESH_PREDICATE}) \
+               FROM content_manifest_meta m JOIN nodes n ON n.id = m.node_id \
+              WHERE m.node_id = 'x'"
+        );
+        for &(source_len, source_gen, live_size, live_gen_row) in cases {
+            conn.execute_batch("DELETE FROM nodes; DELETE FROM content_manifest_meta; DELETE FROM content_generation;")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO nodes (id, size) VALUES ('x', ?1)",
+                params![live_size],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO content_manifest_meta VALUES ('x', ?1, ?2)",
+                params![source_len, source_gen],
+            )
+            .unwrap();
+            if let Some(g) = live_gen_row {
+                conn.execute(
+                    "INSERT INTO content_generation VALUES ('x', ?1)",
+                    params![g],
+                )
+                .unwrap();
+            }
+            let sql_verdict: bool = conn
+                .query_row(&sql, [], |r| Ok(r.get::<_, i64>(0)? != 0))
+                .unwrap();
+            let rust_verdict = manifest_witness_is_fresh(
+                source_len,
+                source_gen,
+                live_size,
+                live_gen_row.unwrap_or(0),
+            );
+            assert_eq!(
+                sql_verdict, rust_verdict,
+                "arms disagree on (len={source_len}, gen={source_gen}, \
+                 size={live_size:?}, live_gen={live_gen_row:?})"
+            );
+        }
+    }
+
+    /// THE b82f56 case, end to end: a foreign writer replaces the record
+    /// with SAME-LENGTH bytes via raw SQL. Under the (size, mtime) witness
+    /// this served the previous occupant's bytes; the generation trigger
+    /// fires for any SQL writer, so the read must fall back to the live
+    /// record instead of the stale manifest.
+    #[test]
+    fn same_shape_replacement_by_a_foreign_writer_is_not_served_stale() {
+        let conn = db();
+        conn.execute_batch(
+            "CREATE TABLE nodes (
+                 id TEXT PRIMARY KEY, record TEXT, size INTEGER, mtime INTEGER
+             );",
+        )
+        .unwrap();
+        // Re-run schema creation now that nodes exists so triggers install.
+        create_chunked_content_schema(&conn).unwrap();
+
+        let old = "the first occupant's secret bytes".repeat(1000);
+        conn.execute(
+            "INSERT INTO nodes (id, record, size, mtime) VALUES ('n', ?1, ?2, 7)",
+            params![old, old.len() as i64],
+        )
+        .unwrap();
+        store_content_chunked(&conn, "n", old.as_bytes()).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        assert!(has_chunked_content_in_transaction(&tx, "n").unwrap());
+        tx.commit().unwrap();
+
+        // Foreign writer: same length, same mtime, different bytes, raw SQL.
+        let new = "the second occupant's public bytes".repeat(1000)[..old.len()].to_string();
+        assert_eq!(new.len(), old.len());
+        conn.execute("UPDATE nodes SET record = ?1 WHERE id = 'n'", params![new])
+            .unwrap();
+
+        let tx = conn.unchecked_transaction().unwrap();
+        assert!(
+            !has_chunked_content_in_transaction(&tx, "n").unwrap(),
+            "a same-shape replacement must invalidate the witness — the \
+             generation trigger fires for writers that never heard of this \
+             module"
+        );
+        drop(tx);
+
+        let mut buf = vec![0u8; 64];
+        let n = read_content_at(&conn, "n", &mut buf, 0).unwrap();
+        assert_eq!(
+            &buf[..n],
+            &new.as_bytes()[..n],
+            "the read must serve the NEW bytes via the record fallback"
+        );
     }
 
     /// Seeded xorshift — the fuzzer's only entropy source, so a failure is

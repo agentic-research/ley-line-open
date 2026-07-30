@@ -63,6 +63,11 @@ pub fn collect_unreachable_chunks(conn: &Connection, options: GcOptions) -> Resu
         [],
     )
     .context("ensure CDC manifest reachability index")?;
+    // The freshness predicate references content_generation; a pre-b82f56
+    // arena being GC'd for the first time post-upgrade migrates here.
+    // Idempotent DDL inside this transaction — a dry run's rollback keeps
+    // it non-mutating, same as the index above.
+    crate::chunked::ensure_generation_infra(&tx).context("ensure generation infra before GC")?;
     let (before_chunk_rows, before_chunk_bytes) =
         chunk_totals(&tx, "", "count CDC chunks before GC")?;
 
@@ -153,15 +158,20 @@ pub fn collect_unreachable_chunks(conn: &Connection, options: GcOptions) -> Resu
 /// incremental rechunking, which only accepts a *fresh* previous snapshot,
 /// so nothing downstream loses an optimization either.
 fn dead_manifest_predicate(table: &str) -> String {
+    // Freshness comes from the ONE definition the read gate uses
+    // (WITNESS_FRESH_PREDICATE) — a hand-written second copy is how the
+    // reaper and the gate drifted apart the first time (types-friend F3:
+    // this site was missing the source_len guard the tested Rust arm had,
+    // and predates the generation witness entirely).
     format!(
         "NOT EXISTS (
              SELECT 1
                FROM content_manifest_meta AS m
                JOIN nodes AS n ON n.id = m.node_id
               WHERE m.node_id = {table}.node_id
-                AND m.source_len = n.size
-                AND m.source_mtime IS n.mtime
-         )"
+                AND {}
+         )",
+        crate::chunked::WITNESS_FRESH_PREDICATE
     )
 }
 

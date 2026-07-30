@@ -2355,10 +2355,16 @@ mod tests {
             if stale {
                 let guard = adapter.writer.lock();
                 crate::chunked::store_content_chunked(guard.conn(), node_id, b"hello")?;
-                guard.conn().execute(
-                    "UPDATE nodes SET mtime = mtime + 1 WHERE id = ?1",
-                    [node_id],
-                )?;
+                // Staleness means the RECORD moved on (a foreign writer
+                // replacing the bytes bumps the generation via trigger) —
+                // same length on purpose: this is exactly the same-shape
+                // replacement the old (size, mtime) witness could not see.
+                // An mtime-only touch deliberately no longer invalidates —
+                // the generation witness keys on mutation, not metadata
+                // (ley-line-open-b82f56).
+                guard
+                    .conn()
+                    .execute("UPDATE nodes SET record = 'holla' WHERE id = ?1", [node_id])?;
             }
 
             let edit = b"XY";
@@ -2368,7 +2374,11 @@ mod tests {
                 WriteRefreshOutcome::Full { bytes_scanned: 5 },
                 "stale={stale}"
             );
-            assert_chunked_content_matches(&adapter, node_id, b"hXYlo")?;
+            // The stale branch's write lands on the FOREIGN bytes — the
+            // whole point is that the tampered record, not the stale
+            // manifest, is what the write path reads and re-chunks.
+            let model: &[u8] = if stale { b"hXYla" } else { b"hXYlo" };
+            assert_chunked_content_matches(&adapter, node_id, model)?;
         }
         Ok(())
     }

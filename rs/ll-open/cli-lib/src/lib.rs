@@ -353,3 +353,38 @@ pub async fn run(cmd: Commands) -> Result<()> {
         } => cmd_doctor::run_doctor(json, allow_missing),
     }
 }
+
+// In-module falsifiers for the diff-scoped mutants gate (lib tests only):
+// the dispatcher's error propagation and the target token are contract, and
+// their killers previously lived only in integration tests it cannot see.
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+
+    /// The Display token IS the clap token — `--help` shows exactly what a
+    /// user must type, so a Display that renders nothing is a broken help
+    /// surface, not a cosmetic bug.
+    #[test]
+    fn cdc_target_displays_its_clap_tokens() {
+        assert_eq!(CdcTarget::Nodes.to_string(), "nodes");
+        assert_eq!(CdcTarget::SourceBlobs.to_string(), "source-blobs");
+    }
+
+    /// `run` must propagate command failure — an `Ok(())` stub turns every
+    /// failing invocation into a silent success at the process boundary.
+    /// Feature-independent on purpose: with `cdc` the missing database is
+    /// the error, without it the refused subcommand is — either way, Err.
+    #[tokio::test]
+    async fn run_surfaces_a_failing_command_as_an_error() {
+        let missing = run(Commands::Cdc {
+            command: CdcCommands::Enable {
+                db: std::path::PathBuf::from("/nonexistent/llo-dispatch-test/x.db"),
+                target: CdcTarget::SourceBlobs,
+                batch_size: 16,
+                json: false,
+            },
+        })
+        .await;
+        assert!(missing.is_err());
+    }
+}

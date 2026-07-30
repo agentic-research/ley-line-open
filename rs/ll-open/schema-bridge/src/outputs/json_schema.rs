@@ -297,6 +297,16 @@ pub(crate) fn type_schema_pairs(t: &FieldType) -> String {
         FieldType::StructRef(name) | FieldType::EnumRef(name) => {
             format!(r##""$ref": "#/$defs/{}""##, escape_json_string(name))
         }
+        // An open-ended object: keys are unconstrained, every value
+        // matches. `additionalProperties` rather than `patternProperties`
+        // because the key vocabulary is data, not schema — the whole
+        // reason this is a map and not a struct.
+        FieldType::Map(value) => {
+            format!(
+                r#""type": "object", "additionalProperties": {}"#,
+                render_type(value)
+            )
+        }
         FieldType::List(inner) => {
             format!(r#""type": "array", "items": {}"#, render_type(inner))
         }

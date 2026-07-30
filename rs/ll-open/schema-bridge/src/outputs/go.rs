@@ -350,6 +350,9 @@ fn render_go_type(t: &FieldType) -> String {
         FieldType::StructRef(name) => name.clone(),
         FieldType::EnumRef(name) => name.clone(),
         FieldType::List(inner) => format!("[]{}", render_go_type(inner)),
+        // Go has a native map; the key is always string because that is
+        // the only key the JSON these targets face can carry.
+        FieldType::Map(value) => format!("map[string]{}", render_go_type(value)),
     }
 }
 

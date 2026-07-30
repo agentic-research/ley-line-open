@@ -37,21 +37,45 @@
 //! statement bytes — never the base64 text — so any external DSSE verifier
 //! can check it by decoding the payload and reconstructing PAE.
 //!
-//! ## keyid: emission vs acceptance (migration posture)
+//! ## keyid
 //!
 //! DSSE's `keyid` is an **unauthenticated hint** — it is not covered by the
 //! signature, so verification never trusts it. [`Envelope::verify`] verifies
 //! the supplied key against every signature regardless of what the `keyid`
 //! claims (the same parity-not-lookup rule as ADR-012 / R1 in
-//! `leyline_sign::root_signer::verify_head`).
+//! `leyline_sign::root_signer::verify_head`). Emission writes the
+//! ecosystem-canonical kid — `leyline_sign::kid::canonical_kid`, ADR-012's
+//! `lowercasehex(SHA-256(SPKI DER)[:16])` — and nothing else: rosary's
+//! pre-hoist `hex(sha256(raw pubkey))` scheme retired with zero surviving
+//! envelopes (rosary-33670d — envelopes lived only in ephemeral per-dispatch
+//! workspaces, deleted with them), so there is no legacy population and no
+//! migration posture. Any hint value still parses and verifies, because the
+//! hint is never consulted.
 //!
-//! - **Emission**: new envelopes write the ecosystem-canonical kid —
-//!   `leyline_sign::kid::canonical_kid`, ADR-012's
-//!   `lowercasehex(SHA-256(SPKI DER)[:16])`.
-//! - **Acceptance**: envelopes carrying the legacy rosary keyid —
-//!   `hex(sha256(raw pubkey))`, 64 hex chars — or any other hint, or none at
-//!   all, verify forever. Since the hint is never consulted, legacy envelopes
-//!   need no re-signing and no translation.
+//! ## Two byte streams, deliberately distinct inputs
+//!
+//! The signature covers PAE over the **compact** statement JSON (the payload
+//! bytes). A subject digest covers **whatever bytes the caller persisted** —
+//! for rosary's handoffs, pretty-printed JSON on disk. These are different
+//! encodings of related data and MUST NOT be derived from one another:
+//! [`Subject::sha256_of`] takes the artifact's bytes as given, and signing
+//! serializes the statement itself. Conflating them is the classic
+//! reimplementation bug this API shape exists to prevent.
+//!
+//! Note on map ordering: a `predicate` is a `serde_json::Value`, and the
+//! byte-level order of its object keys follows the *consumer build's*
+//! serde_json configuration (rosary's dependency graph enables
+//! `preserve_order`; this workspace's does not). That is why the cross-repo
+//! fixture below pins payload bytes + signature — those are exact for a
+//! given payload regardless of who serialized the predicate.
+//!
+//! ## Composability
+//!
+//! [`pae`], [`sign_payload`], and [`verify_payload`] are standalone
+//! primitives over raw payload bytes: consumers with a different payload
+//! shape (rosary's planned `observation::SignetCert` / `quarantine`
+//! certificate paths) compose these directly rather than going through the
+//! in-toto [`Statement`] type.
 //!
 //! ## Unsigned forensic records
 //!
@@ -137,6 +161,27 @@ pub fn pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
     out.push(b' ');
     out.extend_from_slice(payload);
     out
+}
+
+/// Sign raw payload bytes: Ed25519 over `PAE(payload_type, payload)`,
+/// through the substrate signer. Standalone so consumers with a payload
+/// shape other than an in-toto [`Statement`] can build their own envelope
+/// forms on the same signing discipline.
+pub fn sign_payload(payload_type: &str, payload: &[u8], signer: &Ed25519RootSigner) -> [u8; 64] {
+    signer.sign_message(&pae(payload_type, payload)).to_bytes()
+}
+
+/// Verify a detached DSSE signature over raw payload bytes with an explicit
+/// key: true iff `sig` is a valid Ed25519 signature by `key` over
+/// `PAE(payload_type, payload)`.
+pub fn verify_payload(
+    payload_type: &str,
+    payload: &[u8],
+    sig: &[u8; 64],
+    key: &VerifyingKey,
+) -> bool {
+    let sig = ed25519_dalek::Signature::from_bytes(sig);
+    key.verify(&pae(payload_type, payload), &sig).is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -359,12 +404,12 @@ impl Envelope {
     /// signer's public key.
     pub fn sign(statement: &Statement, signer: &Ed25519RootSigner) -> Self {
         let payload = statement.to_json_vec();
-        let sig = signer.sign_message(&pae(PAYLOAD_TYPE, &payload));
+        let sig = sign_payload(PAYLOAD_TYPE, &payload, signer);
         Self {
             payload,
             signatures: vec![SignatureEntry {
                 keyid: leyline_sign::kid::canonical_kid(&signer.verifying_key()),
-                sig: sig.to_bytes(),
+                sig,
             }],
         }
     }
@@ -431,14 +476,11 @@ impl Envelope {
     ///
     /// `keyid` is deliberately ignored: it is an unauthenticated hint, so
     /// trusting it would let an attacker steer key selection. The caller's
-    /// key is tried against the actual signature bytes — which is why both
-    /// canonical-kid and legacy `hex(sha256(pubkey))` envelopes (and
-    /// hint-less ones) verify identically.
+    /// key is tried against the actual signature bytes — whatever the hint
+    /// says, and whether or not one is present.
     pub fn verify(&self, key: &VerifyingKey) -> Result<Statement, VerifyError> {
-        let pae_bytes = pae(PAYLOAD_TYPE, &self.payload);
         for entry in &self.signatures {
-            let sig = ed25519_dalek::Signature::from_bytes(&entry.sig);
-            if key.verify(&pae_bytes, &sig).is_err() {
+            if !verify_payload(PAYLOAD_TYPE, &self.payload, &entry.sig, key) {
                 return Err(VerifyError::SignatureInvalid);
             }
         }
@@ -456,14 +498,29 @@ impl Envelope {
 mod tests {
     use super::*;
 
-    // ── rosary byte-compat vector ─────────────────────────────────────
+    // ── rosary golden fixture (primary byte-compat proof) ─────────────
     //
-    // Generated by running rosary/src/dsse.rs's reference logic (verbatim
-    // replica, ed25519-dalek 2 as pinned by rosary's manifest) over its own
-    // `vector_gen` inputs: seed 0102…20, the sample handoff predicate,
-    // subject = the pretty-printed on-disk bytes. Every literal below is
-    // pinned OUTPUT of that run — nothing here is derived by the code under
-    // test.
+    // Imported verbatim from rosary's `golden_vector` module (PR #458 /
+    // rosary-33670d): Ed25519 is deterministic (RFC 8032), so for their
+    // pinned payload bytes and seed there is exactly one valid signature.
+    // Asserted at the payload/sig level because the payload embeds a
+    // predicate whose key order follows rosary's serde_json config
+    // (`preserve_order` via their dep graph) — bytes this workspace's
+    // sorted-map serde_json cannot produce from a `json!` literal. Their
+    // pinned keyid (legacy hex(sha256(pubkey))) is carried in the envelope
+    // literal below only to prove the hint is never consulted.
+
+    const ROSARY_PAYLOAD_B64: &str = "eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJzdWJqZWN0IjpbeyJuYW1lIjoiLnJzcnktaGFuZG9mZi0wLmpzb24iLCJkaWdlc3QiOnsic2hhMjU2IjoiMjNhZDA4MGY5MzJjZjE0YTUyNDcyY2M2NzcyNTdjMDY0YjFjZTM4YWFjYzZmZTM2ZDk2ZWRiNTQyNjU3YzkxMiJ9fV0sInByZWRpY2F0ZVR5cGUiOiJodHRwczovL3Jvc2FyeS5kZXYvSGFuZG9mZi92MSIsInByZWRpY2F0ZSI6eyJwaGFzZSI6MCwiZnJvbV9hZ2VudCI6ImRldi1hZ2VudCIsImJlYWRfaWQiOiJyb3NhcnktdGVzdCIsInN1bW1hcnkiOiJGaXhlZCB0aGUgdGhpbmcuIn19";
+    const ROSARY_SIG_B64: &str =
+        "CrW_3tZq2bf06flvXYKIO1xx4jCp4nqVf2Mo81E_pf5nhGm13dABaELzrEZqbw0yf6v1D-VZi56V10ga30PPAA";
+    const ROSARY_KEYID: &str = "65b60673d6ed884bf01c2c222d82ada0740f29ac3355d6a925c81f17f47a27b8";
+
+    // ── LLO-side serialization vector ─────────────────────────────────
+    //
+    // Same seed and inputs, serialized under THIS workspace's serde_json
+    // (sorted maps). Generated by an independent verbatim replica of
+    // rosary's dsse.rs logic, not by the code under test — pins the whole
+    // envelope emission (field order, encodings, canonical kid) end to end.
 
     const VECTOR_SEED: [u8; 32] = [
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
@@ -476,12 +533,14 @@ mod tests {
     const VECTOR_SIG_B64: &str =
         "GyM3MI_KILb9e9O-ySSYa1SWrtFulVlLwigwCLTZJz6P9P8jHHTSj7Ljk3wYzOriHyc-IOqdJ0e9h3oW9M98Cg";
     const VECTOR_CANONICAL_KID: &str = "646d6be49d9f0048f94f67749eca3515";
-    /// The envelope rosary's emitter produces today — legacy
-    /// `hex(sha256(pubkey))` keyid. Must verify forever.
-    const VECTOR_LEGACY_ENVELOPE: &str = r#"{"payloadType":"application/vnd.in-toto+json","payload":"eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJzdWJqZWN0IjpbeyJuYW1lIjoiLnJzcnktaGFuZG9mZi0wLmpzb24iLCJkaWdlc3QiOnsic2hhMjU2IjoiZWVmYzg0ODg0NDVlMTQ3ZGU4NmQ1ODJjOGY2MTUwNGNlOWVkMzk3MWE3NWMyNTk1YjBjMmQ4ZmY4YzhiMzBiNyJ9fV0sInByZWRpY2F0ZVR5cGUiOiJodHRwczovL3Jvc2FyeS5kZXYvSGFuZG9mZi92MSIsInByZWRpY2F0ZSI6eyJiZWFkX2lkIjoicm9zYXJ5LXRlc3QiLCJmcm9tX2FnZW50IjoiZGV2LWFnZW50IiwicGhhc2UiOjAsInN1bW1hcnkiOiJGaXhlZCB0aGUgdGhpbmcuIn19","signatures":[{"keyid":"65b60673d6ed884bf01c2c222d82ada0740f29ac3355d6a925c81f17f47a27b8","sig":"GyM3MI_KILb9e9O-ySSYa1SWrtFulVlLwigwCLTZJz6P9P8jHHTSj7Ljk3wYzOriHyc-IOqdJ0e9h3oW9M98Cg"}]}"#;
-    /// The same (statement, key) signed by THIS crate: payload and sig bytes
-    /// identical to rosary's; only the unauthenticated keyid hint differs
-    /// (canonical kid — the documented migration).
+    /// A full envelope in rosary's historical emission shape (their golden
+    /// payload, their legacy keyid hint). Used to prove the verify path is
+    /// keyid-agnostic on genuine rosary bytes — NOT a migration commitment;
+    /// the legacy scheme retired with zero surviving envelopes
+    /// (rosary-33670d).
+    const ROSARY_ENVELOPE: &str = r#"{"payloadType":"application/vnd.in-toto+json","payload":"eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJzdWJqZWN0IjpbeyJuYW1lIjoiLnJzcnktaGFuZG9mZi0wLmpzb24iLCJkaWdlc3QiOnsic2hhMjU2IjoiMjNhZDA4MGY5MzJjZjE0YTUyNDcyY2M2NzcyNTdjMDY0YjFjZTM4YWFjYzZmZTM2ZDk2ZWRiNTQyNjU3YzkxMiJ9fV0sInByZWRpY2F0ZVR5cGUiOiJodHRwczovL3Jvc2FyeS5kZXYvSGFuZG9mZi92MSIsInByZWRpY2F0ZSI6eyJwaGFzZSI6MCwiZnJvbV9hZ2VudCI6ImRldi1hZ2VudCIsImJlYWRfaWQiOiJyb3NhcnktdGVzdCIsInN1bW1hcnkiOiJGaXhlZCB0aGUgdGhpbmcuIn19","signatures":[{"keyid":"65b60673d6ed884bf01c2c222d82ada0740f29ac3355d6a925c81f17f47a27b8","sig":"CrW_3tZq2bf06flvXYKIO1xx4jCp4nqVf2Mo81E_pf5nhGm13dABaELzrEZqbw0yf6v1D-VZi56V10ga30PPAA"}]}"#;
+    /// The full envelope THIS crate emits for the (sorted-map) vector
+    /// statement: canonical kid, compact JSON, declared field order.
     const VECTOR_CANONICAL_ENVELOPE: &str = r#"{"payloadType":"application/vnd.in-toto+json","payload":"eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJzdWJqZWN0IjpbeyJuYW1lIjoiLnJzcnktaGFuZG9mZi0wLmpzb24iLCJkaWdlc3QiOnsic2hhMjU2IjoiZWVmYzg0ODg0NDVlMTQ3ZGU4NmQ1ODJjOGY2MTUwNGNlOWVkMzk3MWE3NWMyNTk1YjBjMmQ4ZmY4YzhiMzBiNyJ9fV0sInByZWRpY2F0ZVR5cGUiOiJodHRwczovL3Jvc2FyeS5kZXYvSGFuZG9mZi92MSIsInByZWRpY2F0ZSI6eyJiZWFkX2lkIjoicm9zYXJ5LXRlc3QiLCJmcm9tX2FnZW50IjoiZGV2LWFnZW50IiwicGhhc2UiOjAsInN1bW1hcnkiOiJGaXhlZCB0aGUgdGhpbmcuIn19","signatures":[{"keyid":"646d6be49d9f0048f94f67749eca3515","sig":"GyM3MI_KILb9e9O-ySSYa1SWrtFulVlLwigwCLTZJz6P9P8jHHTSj7Ljk3wYzOriHyc-IOqdJ0e9h3oW9M98Cg"}]}"#;
 
     fn vector_signer() -> Ed25519RootSigner {
@@ -532,25 +591,126 @@ mod tests {
         assert_eq!(wire["signatures"][0]["sig"], VECTOR_SIG_B64);
     }
 
+    /// The rosary-33670d golden fixture at the primitive level: signing
+    /// their exact payload bytes with their seed must reproduce their exact
+    /// signature. This is the proof that PAE + Ed25519 + encodings match
+    /// rosary's byte for byte, independent of predicate-map ordering.
     #[test]
-    fn rosary_legacy_envelope_verifies_under_the_same_key() {
-        let env = Envelope::from_json_slice(VECTOR_LEGACY_ENVELOPE.as_bytes()).expect("parse");
-        let stmt = env
-            .verify(&vector_pubkey())
-            .expect("legacy envelopes verify forever");
+    fn golden_fixture_signature_reproduced_over_rosary_payload_bytes() {
+        let payload = B64
+            .decode(ROSARY_PAYLOAD_B64.as_bytes())
+            .expect("payload b64");
+        let expected: [u8; 64] = B64
+            .decode(ROSARY_SIG_B64.as_bytes())
+            .expect("sig b64")
+            .try_into()
+            .expect("64 bytes");
+        let sig = sign_payload(PAYLOAD_TYPE, &payload, &vector_signer());
+        assert_eq!(sig, expected);
+        assert_eq!(B64.encode(sig), ROSARY_SIG_B64);
+        assert!(verify_payload(
+            PAYLOAD_TYPE,
+            &payload,
+            &sig,
+            &vector_pubkey()
+        ));
+    }
+
+    #[test]
+    fn rosary_emitted_envelope_verifies_end_to_end() {
+        let env = Envelope::from_json_slice(ROSARY_ENVELOPE.as_bytes()).expect("parse");
+        assert_eq!(env.keyids(), [ROSARY_KEYID]);
+        let stmt = env.verify(&vector_pubkey()).expect("verifies");
         assert_eq!(stmt.predicate()["bead_id"], "rosary-test");
         assert_eq!(stmt.predicate_type(), "https://rosary.dev/Handoff/v1");
         assert_eq!(stmt.subject()[0].name(), ".rsry-handoff-0.json");
         assert_eq!(
             stmt.subject()[0].sha256_hex(),
-            Some("eefc8488445e147de86d582c8f61504ce9ed3971a75c2595b0c2d8ff8c8b30b7")
+            Some("23ad080f932cf14a52472cc677257c064b1ce38aacc6fe36d96edb542657c912")
         );
     }
 
     #[test]
     fn parsed_envelope_reserializes_byte_identically() {
-        let env = Envelope::from_json_slice(VECTOR_LEGACY_ENVELOPE.as_bytes()).expect("parse");
-        assert_eq!(env.to_json_vec(), VECTOR_LEGACY_ENVELOPE.as_bytes());
+        let env = Envelope::from_json_slice(ROSARY_ENVELOPE.as_bytes()).expect("parse");
+        assert_eq!(env.to_json_vec(), ROSARY_ENVELOPE.as_bytes());
+    }
+
+    /// The gotcha rosary-33670d flags for reimplementers: the signature
+    /// covers the COMPACT statement JSON, while the subject digest covers
+    /// the bytes the caller persisted (pretty-printed, for handoffs). The
+    /// two encodings genuinely differ, and each check binds to its own.
+    #[test]
+    fn digest_covers_disk_bytes_while_signature_covers_compact_payload() {
+        let predicate = serde_json::json!({"a": 1, "b": 2});
+        let disk = serde_json::to_vec_pretty(&predicate).expect("pretty");
+        let compact_predicate = serde_json::to_vec(&predicate).expect("compact");
+        assert_ne!(
+            disk, compact_predicate,
+            "forms must differ for this test to bite"
+        );
+
+        let stmt = Statement::new(
+            vec![Subject::sha256_of("f.json", &disk)],
+            "https://example.invalid/T/v1",
+            predicate,
+        );
+        // Digest: over the pretty/disk form, not the compact one.
+        assert_eq!(
+            stmt.subject()[0].sha256_hex(),
+            Some(hex::encode(Sha256::digest(&disk)).as_str())
+        );
+        assert_ne!(
+            stmt.subject()[0].sha256_hex(),
+            Some(hex::encode(Sha256::digest(&compact_predicate)).as_str())
+        );
+        // Signature: over the compact statement bytes, and NOT over any
+        // pretty rendering of them.
+        let signer = vector_signer();
+        let env = Envelope::sign(&stmt, &signer);
+        let compact_stmt = stmt.to_json_vec();
+        assert!(verify_payload(
+            PAYLOAD_TYPE,
+            &compact_stmt,
+            &env.signatures[0].sig,
+            &signer.verifying_key()
+        ));
+        let pretty_stmt: Vec<u8> = {
+            let v: serde_json::Value = serde_json::from_slice(&compact_stmt).expect("json");
+            serde_json::to_vec_pretty(&v).expect("pretty")
+        };
+        assert!(!verify_payload(
+            PAYLOAD_TYPE,
+            &pretty_stmt,
+            &env.signatures[0].sig,
+            &signer.verifying_key()
+        ));
+    }
+
+    /// The primitives bind the payload TYPE as well as the body — a
+    /// signature made under one type must not verify under another.
+    #[test]
+    fn payload_type_is_covered_by_the_signature() {
+        let signer = vector_signer();
+        let sig = sign_payload(PAYLOAD_TYPE, b"body", &signer);
+        assert!(verify_payload(
+            PAYLOAD_TYPE,
+            b"body",
+            &sig,
+            &signer.verifying_key()
+        ));
+        assert!(!verify_payload(
+            "application/json",
+            b"body",
+            &sig,
+            &signer.verifying_key()
+        ));
+        assert!(!verify_payload(
+            PAYLOAD_TYPE,
+            b"bodyx",
+            &sig,
+            &signer.verifying_key()
+        ));
     }
 
     // ── keyid: emission vs acceptance ─────────────────────────────────
@@ -754,7 +914,7 @@ mod tests {
 
     #[test]
     fn envelope_parse_rejects_wrong_payload_type() {
-        let json = VECTOR_LEGACY_ENVELOPE.replace(PAYLOAD_TYPE, "application/json");
+        let json = ROSARY_ENVELOPE.replace(PAYLOAD_TYPE, "application/json");
         assert!(matches!(
             Envelope::from_json_slice(json.as_bytes()),
             Err(ParseError::WrongPayloadType(_))

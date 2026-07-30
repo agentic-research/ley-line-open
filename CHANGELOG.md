@@ -15,20 +15,24 @@ context, scoping notes, and review history are recoverable.
 - **`leyline-envelope`: DSSE + in-toto Statement v1 attestation in the
   substrate** (`ley-line-open-319a08`). New crate `rs/ll-open/envelope`
   consolidating the ecosystem's only DSSE implementation (rosary's
-  `src/dsse.rs`) into ley-line, byte-compatible by pinned vector: identical
-  `(statement, key)` inputs reproduce rosary's exact payload and signature
-  bytes. Signing composes over `leyline-sign`'s `Ed25519RootSigner` (new
-  `sign_message` full-message surface — the `RootSigner` trait stays
-  digest-only for Σ roots); the envelope API never takes raw key bytes.
-  keyid migration posture: new envelopes emit the ADR-012 canonical kid,
-  and because DSSE's `keyid` is an unauthenticated hint that verification
-  never consults, legacy `hex(sha256(pubkey))` envelopes verify forever.
-  Parse-don't-validate types (`Envelope` refuses empty signatures; the
-  unsigned forensic record is a distinct `UnsignedStatement` that
-  structurally cannot grow a `signatures` field), PAE with
-  prefix-injection-resistance falsifiers, wasm32-unknown-unknown green.
-  The envelope wasm publish artifact joins the release pipeline in a
-  follow-up alongside the a2099a wasm work.
+  `src/dsse.rs`) into ley-line, byte-compatible against rosary's committed
+  golden vector (rosary PR #458 / rosary-33670d): their exact payload bytes
+  and seed reproduce their exact signature. Signing composes over
+  `leyline-sign`'s `Ed25519RootSigner` (new `sign_message` full-message
+  surface — the `RootSigner` trait stays digest-only for Σ roots); the
+  envelope API never takes raw key bytes. Emission writes the ADR-012
+  canonical kid only — rosary's pre-hoist `hex(sha256(pubkey))` keyid
+  scheme retired with zero surviving envelopes — and verification is
+  keyid-agnostic (the hint is unauthenticated and never consulted).
+  `pae`/`sign_payload`/`verify_payload` are standalone primitives so
+  consumers with other payload shapes (rosary's planned certificate paths)
+  compose the same signing discipline. Parse-don't-validate types
+  (`Envelope` refuses empty signatures; the unsigned forensic record is a
+  distinct `UnsignedStatement` that structurally cannot grow a
+  `signatures` field), PAE prefix-injection falsifiers, an explicit
+  falsifier for the compact-payload-vs-pretty-disk-digest gotcha,
+  wasm32-unknown-unknown green. The envelope wasm publish artifact joins
+  the release pipeline in a follow-up alongside the a2099a wasm work.
 
 - **A second CDC activation target: `source_blobs`** (`ley-line-open-baa57f`,
   ADR-0033). `leyline cdc enable --target nodes|source-blobs` (default `nodes`

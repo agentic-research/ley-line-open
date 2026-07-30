@@ -10,6 +10,7 @@ rs/ll-open/cdc/Cargo.toml
 rs/ll-open/chat-embed/Cargo.toml
 rs/ll-open/cli-lib/Cargo.toml
 rs/ll-open/cli/Cargo.toml
+rs/ll-open/envelope/Cargo.toml
 rs/ll-open/fs/Cargo.toml
 rs/ll-open/hdc/Cargo.toml
 rs/ll-open/lsp/Cargo.toml

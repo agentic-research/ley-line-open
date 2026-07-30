@@ -45,6 +45,17 @@ impl Ed25519RootSigner {
     pub fn verifying_key(&self) -> VerifyingKey {
         self.key.verifying_key()
     }
+
+    /// Sign an arbitrary message with the root key — the full-message Ed25519
+    /// surface `leyline-envelope` signs DSSE PAE bytes through.
+    ///
+    /// Deliberately a separate entry point from [`RootSigner::sign`]: the
+    /// trait stays digest-only (a 32-byte [`Hash`]) so Σ-root signer
+    /// implementations never see content, while DSSE mandates the signature
+    /// cover the entire pre-authentication encoding, not a hash of it.
+    pub fn sign_message(&self, message: &[u8]) -> Signature {
+        self.key.sign(message)
+    }
 }
 
 impl RootSigner for Ed25519RootSigner {
@@ -196,6 +207,22 @@ mod tests {
         let d = digest(1);
         let sig = s.sign(d).expect("sign");
         assert!(!Ed25519RootSigner::verify(d, &sig, &other.verifying_key()));
+    }
+
+    /// `sign_message` covers exactly the given bytes (the DSSE PAE surface):
+    /// the signature verifies over those bytes and over nothing else — no
+    /// silent pre-hashing that a DSSE verifier reconstructing PAE would miss.
+    #[test]
+    fn sign_message_covers_exactly_the_given_bytes() {
+        let s = signer();
+        let msg = b"DSSEv1 4 type 4 body";
+        let sig = s.sign_message(msg);
+        assert!(s.verifying_key().verify(msg, &sig).is_ok());
+        assert!(
+            s.verifying_key()
+                .verify(b"DSSEv1 4 type 4 bodyX", &sig)
+                .is_err()
+        );
     }
 
     /// Verification needs no signer state — it is a static method by design.

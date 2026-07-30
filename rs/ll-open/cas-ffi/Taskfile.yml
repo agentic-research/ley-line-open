@@ -1,0 +1,28 @@
+version: '3'
+
+# Crate-scoped tasks for `leyline-cas-ffi`, included by the root Taskfile
+# under the `cas-ffi:` namespace (same placement rule as rs/ll-open/sign).
+#
+# The crate is wasm32-callable by design (bead ley-line-open-0c8c0b); this
+# pair is the publish path that turns that property into a released,
+# SHA256SUMS-verified artifact (bead ley-line-open-a2099a). No feature
+# pins — the crate declares no features, so the default build IS the wasm
+# surface.
+
+tasks:
+  wasm:build:
+    desc: Release wasm32 cdylib build of leyline-cas-ffi
+    dir: '{{.ROOT_DIR}}/rs'
+    cmds:
+      - cargo build --release -p leyline-cas-ffi --target wasm32-unknown-unknown
+
+  # Same `--ignored` reasoning as sign:wasm:verify — see that task.
+  wasm:verify:
+    desc: Parse WASM_ARTIFACT's export section and assert the exact exported surface
+    dir: '{{.ROOT_DIR}}/rs'
+    vars:
+      WASM_ARTIFACT: '{{.WASM_ARTIFACT | default (printf "%s/rs/target/wasm32-unknown-unknown/release/leyline_cas_ffi.wasm" .ROOT_DIR)}}'
+    env:
+      LEYLINE_WASM_ARTIFACT: '{{.WASM_ARTIFACT}}'
+    cmds:
+      - cargo test -p leyline-cas-ffi --test wasm_export_surface -- --ignored

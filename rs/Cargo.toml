@@ -66,6 +66,9 @@ rand = "0.9"
 # Domain / parsing
 tree-sitter = "0.26.0"
 clap = "4.5"
+# Export-surface gate for the published wasm32 artifacts — a real parse of
+# the wasm export section, dev-dep of sign + cas-ffi (ley-line-open-a2099a).
+wasmparser = "0.254.0"
 
 # Cross-crate inlining + single codegen unit so the sheaf hot paths
 # (per-edge δ⁰, sparse matvec, restriction-map composition) vectorize

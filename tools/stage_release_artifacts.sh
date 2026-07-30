@@ -66,6 +66,40 @@ if [ -n "${HEADER_SOURCE:-}" ]; then
     cp "$HEADER_SOURCE" "$OUTPUT_DIR/leyline_fs.h"
 fi
 
+# Platform-independent wasm32 artifacts (ley-line-open-a2099a).
+#
+# leyline_sign.wasm / leyline_cas_ffi.wasm are wasm32-unknown-unknown cdylib
+# builds: one artifact each for every platform, so exactly ONE release job
+# stages them — the same single-uploader rule as leyline_fs.h. Staged under
+# their build names, no per-target suffix, and not chmod +x: a wasm module
+# is loaded, never executed by the host.
+#
+# Every named asset MUST exist. A missing one aborts the release rather than
+# quietly shipping a smaller asset set — same fail-closed stance as
+# GENERATOR_BINS above.
+if [ -n "${WASM_ASSETS:-}" ]; then
+    : "${WASM_SOURCE_DIR:?WASM_SOURCE_DIR is required with WASM_ASSETS}"
+    for wasm_asset in $WASM_ASSETS; do
+        case "$wasm_asset" in
+            *[!A-Za-z0-9._-]*)
+                echo "unsafe wasm asset name: $wasm_asset" >&2
+                exit 1
+                ;;
+        esac
+        wasm_src="$WASM_SOURCE_DIR/$wasm_asset"
+        if [ ! -f "$wasm_src" ]; then
+            echo "wasm artifact not built: $wasm_src" >&2
+            echo "run 'task sign:wasm:build' / 'task cas-ffi:wasm:build'" >&2
+            exit 1
+        fi
+        if [ -e "$OUTPUT_DIR/$wasm_asset" ]; then
+            echo "release asset names would collide: $wasm_asset" >&2
+            exit 1
+        fi
+        cp "$wasm_src" "$OUTPUT_DIR/$wasm_asset"
+    done
+fi
+
 # Generator binaries (ley-line-open-e44960 sibling gap).
 #
 # LLO ships generators that downstream repos RUN — the capnp plugins cloister

@@ -26,3 +26,7 @@ leyline-ffi-helpers = { path = "../../ll-core/ffi-helpers", version = "0.13.0" }
 # Used by the FFI round-trip test to cross-check the FFI surface
 # against direct `<&[u8] as ContentAddressed>::hash()` calls.
 blake3 = { workspace = true }
+# Export-surface gate for the published leyline_cas_ffi.wasm (bead
+# ley-line-open-a2099a): tests/wasm_export_surface.rs parses the real
+# export section of the built artifact, run via `task cas-ffi:wasm:verify`.
+wasmparser = { workspace = true }

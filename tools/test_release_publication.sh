@@ -68,6 +68,17 @@ done
 GENERATOR_SOURCE_DIR="$tmp_dir/generators"
 export GENERATOR_SOURCE_DIR
 
+# Platform-independent wasm artifacts (ley-line-open-a2099a). Deliberately
+# NOT exported: exactly one target job stages them (same single-uploader rule
+# as the header), so they ride only on the linux-amd64 invocation below.
+# Fabricated bytes for the same reason as the generators — the property under
+# test is the staging contract, not the compiler.
+wasm_assets='leyline_sign.wasm leyline_cas_ffi.wasm'
+mkdir -p "$tmp_dir/wasm"
+for wasm_asset in $wasm_assets; do
+    make_source "$tmp_dir/wasm/$wasm_asset" 'wasm'
+done
+
 mkdir -p "$tmp_dir/staged"
 
 OUTPUT_DIR="$tmp_dir/staged/leyline-linux-amd64" \
@@ -77,6 +88,8 @@ GENERATOR_SUFFIX="linux-amd64" \
 LIB_ASSET="libleyline_fs-linux-amd64.a" \
 STATICLIB_SOURCE="$tmp_dir/libleyline_fs.a" \
 HEADER_SOURCE="$tmp_dir/leyline_fs.h" \
+WASM_ASSETS="$wasm_assets" \
+WASM_SOURCE_DIR="$tmp_dir/wasm" \
     "$repo_root/tools/stage_release_artifacts.sh"
 
 OUTPUT_DIR="$tmp_dir/staged/leyline-linux-arm64" \
@@ -134,6 +147,14 @@ expect_failure duplicate-entry \
 case_dir=$(mutation_case missing-file)
 rm "$case_dir/leyline-darwin-amd64"
 expect_failure missing-file \
+    "$repo_root/tools/verify_public_release.sh" "$case_dir" "$assets_file"
+
+# The wasm slot specifically: a single-uploader asset that only one job
+# stages is exactly the kind that can vanish while every per-platform set
+# stays complete.
+case_dir=$(mutation_case missing-wasm)
+rm "$case_dir/leyline_sign.wasm"
+expect_failure missing-wasm \
     "$repo_root/tools/verify_public_release.sh" "$case_dir" "$assets_file"
 
 case_dir=$(mutation_case extra-file)

@@ -27,6 +27,9 @@ on:
       - 'rs/ll-open/schema-bridge/**'
       - 'rs/ll-core/mcp-descriptor/**'
       - 'rs/ll-open/cli/**'
+      # The crates behind the published wasm artifacts (ley-line-open-a2099a).
+      - 'rs/ll-open/sign/**'
+      - 'rs/ll-open/cas-ffi/**'
 
 # Read-only at the workflow level and never escalated. This job has no reason
 # to hold a registry credential, a release token, or an OIDC identity — it
@@ -87,6 +90,18 @@ jobs:
           BUILD_TARGET: x86_64-unknown-linux-gnu
         run: task release:generators:target
 
+      # Same wasm pair release.yml's linux-amd64 job builds and stages —
+      # the whole point of this workflow is that the release path gets
+      # rehearsed, and the wasm slot is single-uploader, so this is the
+      # only job shape that ever exercises it (ley-line-open-a2099a).
+      - name: Install wasm32 target
+        run: task deps:wasm32
+
+      - name: Build wasm artifacts
+        run: |
+          task sign:wasm:build
+          task cas-ffi:wasm:build
+
       # The step that caught a real incompleteness while it was being written:
       # release-assets.txt asserted 28 names while staging produced 8, and
       # prepare_public_release diffed them and failed. Exercising staging on a
@@ -101,7 +116,13 @@ jobs:
             capnpc-schema-bridge-jsonschema
             capnpc-schema-bridge-tooldefs
             leyline-mcp-descriptor
+          WASM_ASSETS: leyline_sign.wasm leyline_cas_ffi.wasm
         run: task release:artifacts:stage
+
+      - name: Verify staged wasm export surface
+        run: |
+          task sign:wasm:verify WASM_ARTIFACT="$PWD/.artifacts/staged/leyline-linux-amd64/leyline_sign.wasm"
+          task cas-ffi:wasm:verify WASM_ARTIFACT="$PWD/.artifacts/staged/leyline-linux-amd64/leyline_cas_ffi.wasm"
 
       - name: Assert the staged set matches what the release asserts
         run: |
@@ -113,8 +134,10 @@ jobs:
           # one source of truth; a second list would be free to disagree.
           missing=0
           while IFS= read -r want; do
+            # This job stages the linux-amd64 set plus the platform-independent
+            # wasm artifacts, so both shapes are asserted here.
             case "$want" in
-              *-linux-amd64) ;;
+              *-linux-amd64 | *.wasm) ;;
               *) continue ;;
             esac
             printf '%s\n' "$staged" | grep -qx "$want" || {

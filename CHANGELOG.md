@@ -34,6 +34,24 @@ context, scoping notes, and review history are recoverable.
   wasm32-unknown-unknown green. The envelope wasm publish artifact joins
   the release pipeline in a follow-up alongside the a2099a wasm work.
 
+- **wasm32 artifacts join the release** (`ley-line-open-a2099a`). Every
+  release now publishes two platform-independent WebAssembly modules in the
+  SHA256SUMS-verified asset set: `leyline_sign.wasm` (the CMS/cert-chain
+  verifier surface — built `--features root-signer`, `host` off, so signed-Σ
+  root verification is reachable from browsers/workerd while the host daemon
+  stays native-only) and `leyline_cas_ffi.wasm` (the substrate BLAKE3
+  `leyline_hash_bytes` entry point). Consumers bind the exports by name:
+  `leyline_sign.wasm` exports `lsign_alloc`/`lsign_free` (linear-memory
+  helpers), `leyline_sign_data`, `leyline_sign_data_without_attributes`,
+  `leyline_verify`, and `leyline_verify_cert_chain`; `leyline_cas_ffi.wasm`
+  exports `leyline_hash_bytes`. That exact surface is enforced at staging
+  time by a wasmparser-based export-section parse
+  (`tests/wasm_export_surface.rs` in each crate, run via
+  `task sign:wasm:verify` / `task cas-ffi:wasm:verify` against the staged
+  bytes), and the artifacts' integrity by the release SHA256SUMS like every
+  other asset. Local builds: `task deps:wasm32`, then `task sign:wasm:build`
+  / `task cas-ffi:wasm:build`.
+
 - **A second CDC activation target: `source_blobs`** (`ley-line-open-baa57f`,
   ADR-0033). `leyline cdc enable --target nodes|source-blobs` (default `nodes`
   — unchanged behavior) can now build the chunk index over the whole-file

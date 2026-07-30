@@ -27,3 +27,32 @@ tasks:
     dir: '{{.ROOT_DIR}}/rs'
     cmds:
       - cargo test -p leyline-sign --features host
+
+  # wasm32 publish pair (bead ley-line-open-a2099a). The feature pins are the
+  # wasm32 discipline Cargo.toml documents: `root-signer` ON — browser-side
+  # verification of a signed head is a wanted capability and the feature is
+  # deliberately wasm32-reachable — and `host` OFF, since it is native-only
+  # and gated so toggling it cannot change the wasm artifact. Output:
+  # rs/target/wasm32-unknown-unknown/release/leyline_sign.wasm. The rustup
+  # target itself comes from `task deps:wasm32` (root Taskfile).
+  wasm:build:
+    desc: Release wasm32 cdylib build of leyline-sign (root-signer ON, host OFF)
+    dir: '{{.ROOT_DIR}}/rs'
+    cmds:
+      - cargo build --release -p leyline-sign --features root-signer --target wasm32-unknown-unknown
+
+  # `--ignored`, not a default-run test: the assertion needs a wasm32
+  # artifact on disk, which plain `cargo test --workspace` does not build.
+  # Invoking it explicitly here keeps the gate loud — a missing or corrupt
+  # artifact FAILS — while the workspace run reports it as ignored instead
+  # of silently passing. WASM_ARTIFACT defaults to the local build output;
+  # release.yml points it at the STAGED bytes.
+  wasm:verify:
+    desc: Parse WASM_ARTIFACT's export section and assert the exact exported surface
+    dir: '{{.ROOT_DIR}}/rs'
+    vars:
+      WASM_ARTIFACT: '{{.WASM_ARTIFACT | default (printf "%s/rs/target/wasm32-unknown-unknown/release/leyline_sign.wasm" .ROOT_DIR)}}'
+    env:
+      LEYLINE_WASM_ARTIFACT: '{{.WASM_ARTIFACT}}'
+    cmds:
+      - cargo test -p leyline-sign --test wasm_export_surface -- --ignored

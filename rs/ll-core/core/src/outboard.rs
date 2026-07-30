@@ -29,13 +29,26 @@
 //! not a reimplementation. Tree shape follows the BLAKE3 spec via
 //! [`blake3::hazmat::left_subtree_len`].
 //!
+//! # The interior cache is ADR-0031 at its fixed point
+//!
+//! Interior parent nodes are cached in per-level arrays and maintained
+//! along the dirty ancestor path, making [`Outboard::root`] O(log n)
+//! merges after an edit. ADR-0031 (restriction-addressed caching) keys a
+//! derived view on the exact hash of its input closure; a Merkle parent
+//! node IS definitionally the hash of its input closure (its two child
+//! chaining values), so the cache key and the cached value coincide and a
+//! false-skip is structurally unrepresentable rather than empirically
+//! zero — a stale parent would disagree with its recomputed children by
+//! construction, and the root-identity test falsifies the stack end to
+//! end. The cache layout leans on a BLAKE3 tree property: every left
+//! child is a PERFECT power-of-two subtree aligned to its own size, so
+//! `levels[k][i]` (the subtree over chunks `[i·2^k, (i+1)·2^k)`) covers
+//! every interior node except the O(log n) right-spine, which
+//! [`Outboard::root`] re-merges per call and counts — the cache's claim
+//! is asserted by test, not narrated.
+//!
 //! # What this module deliberately is not (yet)
 //!
-//! - Internal parent nodes are re-merged on every [`Outboard::root`] call
-//!   rather than cached: O(chunks/1024) 64-byte compressions per root —
-//!   microseconds at arena scale. The BYTES-hashed cost (the expensive
-//!   part) is O(dirty) via [`Outboard::update`]; caching interior nodes
-//!   for O(log n) merges is a later optimization with the same API.
 //! - Mount-path verify-on-fault wiring is the bead's remaining half; this
 //!   is the primitive it consumes.
 
@@ -63,14 +76,21 @@ pub struct ProofStep {
 /// CDC chunks dedupe storage; these chunks are the hash tree's leaves.
 #[derive(Debug, Clone)]
 pub struct Outboard {
-    /// Non-root chaining value per 1 KiB chunk. Empty only for `len == 0`.
-    leaf_cvs: Vec<ChainingValue>,
+    /// `levels[0]` is the non-root chaining value per 1 KiB chunk (empty
+    /// only for `len == 0`); `levels[k][i]` is the cached CV of the
+    /// perfect subtree over chunks `[i·2^k, (i+1)·2^k)`, present iff that
+    /// range lies fully within the buffer (`levels[k].len()` is exactly
+    /// `levels[0].len() >> k`).
+    levels: Vec<Vec<ChainingValue>>,
     /// Total buffer length in bytes.
     len: usize,
     /// Root for the degenerate `<= 1` chunk tree, where the single chunk
     /// is finalized with the root flag and no parent merge exists. Kept
     /// current by [`Outboard::build`] / [`Outboard::update`].
     small_root: Option<Hash>,
+    /// Merges performed since the last [`Outboard::root`] call began —
+    /// the observable that lets tests assert the cache actually caches.
+    merges: std::cell::Cell<usize>,
 }
 
 /// Non-root chaining value of the 1 KiB chunk at `index` covering `bytes`.
@@ -81,44 +101,112 @@ fn leaf_cv(index: usize, bytes: &[u8]) -> ChainingValue {
     hasher.finalize_non_root()
 }
 
-/// Chaining value of the subtree whose leaves are `cvs`, spanning
-/// `byte_len` bytes. Splits per the BLAKE3 spec (left subtree is the
-/// largest power-of-two chunk count strictly inside the input).
-fn subtree_cv(cvs: &[ChainingValue], byte_len: usize) -> ChainingValue {
-    if cvs.len() == 1 {
-        return cvs[0];
-    }
-    let left_bytes = hazmat::left_subtree_len(byte_len as u64) as usize;
-    let left_chunks = left_bytes / CHUNK_LEN;
-    hazmat::merge_subtrees_non_root(
-        &subtree_cv(&cvs[..left_chunks], left_bytes),
-        &subtree_cv(&cvs[left_chunks..], byte_len - left_bytes),
-        Mode::Hash,
-    )
-}
-
 impl Outboard {
     /// Build the leaf layer from the full buffer. O(len) hashing — the
     /// one-time cost [`Outboard::update`] amortizes away thereafter.
     pub fn build(data: &[u8]) -> Self {
+        let mut leaves = Vec::with_capacity(data.len().div_ceil(CHUNK_LEN));
+        for (index, chunk) in data.chunks(CHUNK_LEN).enumerate() {
+            leaves.push(leaf_cv(index, chunk));
+        }
         let mut out = Self {
-            leaf_cvs: Vec::with_capacity(data.len().div_ceil(CHUNK_LEN)),
+            levels: vec![leaves],
             len: data.len(),
             small_root: None,
+            merges: std::cell::Cell::new(0),
         };
-        for (index, chunk) in data.chunks(CHUNK_LEN).enumerate() {
-            out.leaf_cvs.push(leaf_cv(index, chunk));
-        }
+        out.rebuild_parents_from(0);
         out.refresh_small_root(data);
         out
     }
 
+    fn n_chunks(&self) -> usize {
+        self.levels[0].len()
+    }
+
     fn refresh_small_root(&mut self, data: &[u8]) {
-        self.small_root = if self.leaf_cvs.len() <= 1 {
+        self.small_root = if self.n_chunks() <= 1 {
             Some(Hash::from_bytes(*blake3::hash(data).as_bytes()))
         } else {
             None
         };
+    }
+
+    /// (Re)derive every cached parent entry covering leaves at or after
+    /// `first_leaf`, truncating each level to its valid entry count.
+    fn rebuild_parents_from(&mut self, first_leaf: usize) {
+        let mut k = 1;
+        loop {
+            let below_len = self.levels[k - 1].len();
+            let len_k = below_len / 2;
+            if len_k == 0 {
+                self.levels.truncate(k);
+                return;
+            }
+            if self.levels.len() == k {
+                self.levels.push(Vec::new());
+            }
+            let lo = (first_leaf >> k).min(len_k);
+            let (below, above) = self.levels.split_at_mut(k);
+            let prev = &below[k - 1];
+            let cur = &mut above[0];
+            cur.truncate(lo);
+            for i in lo..len_k {
+                cur.push(hazmat::merge_subtrees_non_root(
+                    &prev[2 * i],
+                    &prev[2 * i + 1],
+                    Mode::Hash,
+                ));
+            }
+            k += 1;
+        }
+    }
+
+    /// Recompute the cached ancestors of leaves `[lo_leaf, hi_leaf)` in
+    /// place — the ADR-0031 restriction map: exactly the dirty path.
+    fn propagate(&mut self, lo_leaf: usize, hi_leaf_exclusive: usize) {
+        if hi_leaf_exclusive <= lo_leaf {
+            return;
+        }
+        for k in 1..self.levels.len() {
+            let (below, above) = self.levels.split_at_mut(k);
+            let prev = &below[k - 1];
+            let cur = &mut above[0];
+            if cur.is_empty() {
+                continue;
+            }
+            let lo = (lo_leaf >> k).min(cur.len());
+            let hi = (((hi_leaf_exclusive - 1) >> k) + 1).min(cur.len());
+            for i in lo..hi {
+                cur[i] =
+                    hazmat::merge_subtrees_non_root(&prev[2 * i], &prev[2 * i + 1], Mode::Hash);
+            }
+        }
+    }
+
+    /// Chaining value of the subtree over chunks
+    /// `[start_chunk, start_chunk + count)` spanning `byte_len` bytes.
+    /// Perfect aligned subtrees are cache hits; only the right-spine of
+    /// an uneven shape is merged on the fly (counted in `merges`).
+    fn cached_cv(&self, start_chunk: usize, count: usize, byte_len: usize) -> ChainingValue {
+        if count.is_power_of_two() && start_chunk.is_multiple_of(count) {
+            let k = count.trailing_zeros() as usize;
+            if let Some(cv) = self.levels.get(k).and_then(|lvl| lvl.get(start_chunk >> k)) {
+                return *cv;
+            }
+        }
+        let left_bytes = hazmat::left_subtree_len(byte_len as u64) as usize;
+        let left_chunks = left_bytes / CHUNK_LEN;
+        self.merges.set(self.merges.get() + 1);
+        hazmat::merge_subtrees_non_root(
+            &self.cached_cv(start_chunk, left_chunks, left_bytes),
+            &self.cached_cv(
+                start_chunk + left_chunks,
+                count - left_chunks,
+                byte_len - left_bytes,
+            ),
+            Mode::Hash,
+        )
     }
 
     /// Re-hash exactly the chunks an in-place edit dirtied, returning how
@@ -143,6 +231,7 @@ impl Outboard {
         let rehashed = if data.len() == self.len {
             // In-place edit: splice recomputed CVs over exactly the chunks
             // the dirty range overlaps; the untouched tail keeps its CVs.
+            // Parents refresh along the dirty ancestor path only.
             let last_chunk_exclusive = if dirty.is_empty() {
                 first_chunk
             } else {
@@ -151,19 +240,22 @@ impl Outboard {
             for index in first_chunk..last_chunk_exclusive {
                 let start = index * CHUNK_LEN;
                 let end = (start + CHUNK_LEN).min(data.len());
-                self.leaf_cvs[index] = leaf_cv(index, &data[start..end]);
+                self.levels[0][index] = leaf_cv(index, &data[start..end]);
             }
+            self.propagate(first_chunk, last_chunk_exclusive);
             last_chunk_exclusive.saturating_sub(first_chunk)
         } else {
             // Length changed: the fixed 1 KiB grid past the edit start no
             // longer matches the stored leaves — re-derive to the end.
             let first = first_chunk.min(n_chunks);
-            self.leaf_cvs.truncate(first);
+            self.levels[0].truncate(first);
             for index in first..n_chunks {
                 let start = index * CHUNK_LEN;
                 let end = (start + CHUNK_LEN).min(data.len());
-                self.leaf_cvs.push(leaf_cv(index, &data[start..end]));
+                let cv = leaf_cv(index, &data[start..end]);
+                self.levels[0].push(cv);
             }
+            self.rebuild_parents_from(first);
             n_chunks - first
         };
         self.len = data.len();
@@ -182,18 +274,32 @@ impl Outboard {
     }
 
     /// The BLAKE3 root — **bit-identical to `blake3::hash` of the buffer**.
+    ///
+    /// O(log n) merges from the cached perfect subtrees (only the
+    /// right-spine of an uneven shape merges on the fly); the count is
+    /// observable via [`Outboard::merges_since_last_root`].
     pub fn root(&self) -> Hash {
+        self.merges.set(0);
         if let Some(small) = self.small_root {
             return small;
         }
         let left_bytes = hazmat::left_subtree_len(self.len as u64) as usize;
         let left_chunks = left_bytes / CHUNK_LEN;
+        let n = self.n_chunks();
+        self.merges.set(self.merges.get() + 1);
         let root = hazmat::merge_subtrees_root(
-            &subtree_cv(&self.leaf_cvs[..left_chunks], left_bytes),
-            &subtree_cv(&self.leaf_cvs[left_chunks..], self.len - left_bytes),
+            &self.cached_cv(0, left_chunks, left_bytes),
+            &self.cached_cv(left_chunks, n - left_chunks, self.len - left_bytes),
             Mode::Hash,
         );
         Hash::from_bytes(*root.as_bytes())
+    }
+
+    /// Merges performed by the most recent [`Outboard::root`] call (and
+    /// any [`Outboard::prove`] calls since). The test observable for the
+    /// interior cache's O(log n) claim — asserted, not narrated.
+    pub fn merges_since_last_root(&self) -> usize {
+        self.merges.get()
     }
 
     /// Inclusion proof for the 1 KiB chunk at `index`: sibling chaining
@@ -203,46 +309,59 @@ impl Outboard {
         // An empty buffer still has a well-defined "chunk 0": the empty
         // chunk whose direct hash IS the root, proof-free.
         ensure!(
-            index < self.leaf_cvs.len().max(1),
+            index < self.n_chunks().max(1),
             "chunk index {index} out of range for {} chunks",
-            self.leaf_cvs.len()
+            self.n_chunks()
         );
         let mut steps = Vec::new();
-        if self.leaf_cvs.len() <= 1 {
+        if self.n_chunks() <= 1 {
             return Ok(steps);
         }
-        collect_proof(&self.leaf_cvs, self.len, index, &mut steps);
+        self.collect_proof(0, self.n_chunks(), self.len, index, &mut steps);
         // Collected root-down; verification folds leaf-up.
         steps.reverse();
         Ok(steps)
     }
-}
 
-/// Walk from the top of the subtree down to `index`, recording the sibling
-/// at each level (top-first; caller reverses for leaf-up folding).
-fn collect_proof(cvs: &[ChainingValue], byte_len: usize, index: usize, out: &mut Vec<ProofStep>) {
-    if cvs.len() == 1 {
-        return;
-    }
-    let left_bytes = hazmat::left_subtree_len(byte_len as u64) as usize;
-    let left_chunks = left_bytes / CHUNK_LEN;
-    if index < left_chunks {
-        out.push(ProofStep {
-            sibling: subtree_cv(&cvs[left_chunks..], byte_len - left_bytes),
-            sibling_is_left: false,
-        });
-        collect_proof(&cvs[..left_chunks], left_bytes, index, out);
-    } else {
-        out.push(ProofStep {
-            sibling: subtree_cv(&cvs[..left_chunks], left_bytes),
-            sibling_is_left: true,
-        });
-        collect_proof(
-            &cvs[left_chunks..],
-            byte_len - left_bytes,
-            index - left_chunks,
-            out,
-        );
+    /// Walk from the top of the subtree over chunks
+    /// `[start, start + count)` down to relative chunk `index`, recording
+    /// the sibling at each level (top-first; caller reverses).
+    fn collect_proof(
+        &self,
+        start: usize,
+        count: usize,
+        byte_len: usize,
+        index: usize,
+        out: &mut Vec<ProofStep>,
+    ) {
+        if count == 1 {
+            return;
+        }
+        let left_bytes = hazmat::left_subtree_len(byte_len as u64) as usize;
+        let left_chunks = left_bytes / CHUNK_LEN;
+        if index < left_chunks {
+            out.push(ProofStep {
+                sibling: self.cached_cv(
+                    start + left_chunks,
+                    count - left_chunks,
+                    byte_len - left_bytes,
+                ),
+                sibling_is_left: false,
+            });
+            self.collect_proof(start, left_chunks, left_bytes, index, out);
+        } else {
+            out.push(ProofStep {
+                sibling: self.cached_cv(start, left_chunks, left_bytes),
+                sibling_is_left: true,
+            });
+            self.collect_proof(
+                start + left_chunks,
+                count - left_chunks,
+                byte_len - left_bytes,
+                index - left_chunks,
+                out,
+            );
+        }
     }
 }
 
@@ -461,6 +580,39 @@ mod tests {
             .is_err(),
             "a truncated proof must be refused"
         );
+    }
+
+    /// The interior cache's claim, asserted on the merge counter: after a
+    /// small in-place edit, root() performs O(log n) merges — the
+    /// right-spine of the uneven shape — not O(n). An uncached
+    /// implementation performs n-1; the bound here is a loose 4·log2(n),
+    /// three orders of magnitude below that, so a cache regression cannot
+    /// slip past as noise (ADR-0031's discipline, structural variant).
+    #[test]
+    fn root_after_an_edit_merges_logarithmically_not_linearly() {
+        let n_chunks = 1500usize;
+        let size = n_chunks * CHUNK_LEN + 123;
+        let mut data = prng_bytes(0x0ADA_0031, size);
+        let mut ob = Outboard::build(&data);
+        assert_eq!(ob.root(), blake3_ref(&data));
+
+        data[700 * CHUNK_LEN + 5] ^= 0xFF;
+        let rehashed = ob
+            .update(&data, 700 * CHUNK_LEN + 5..700 * CHUNK_LEN + 6)
+            .unwrap();
+        assert_eq!(rehashed, 1, "a one-byte edit dirties one chunk");
+
+        let root = ob.root();
+        assert_eq!(root, blake3_ref(&data), "cached root must stay exact");
+        let merges = ob.merges_since_last_root();
+        let log2 = usize::BITS as usize - n_chunks.leading_zeros() as usize;
+        assert!(
+            merges <= 4 * log2,
+            "root() performed {merges} merges over {n_chunks} chunks — the \
+             interior cache is not caching (uncached would be ~{})",
+            n_chunks - 1
+        );
+        assert!(merges >= 1, "the counter itself must be live");
     }
 
     /// Single-chunk and empty trees: proofs are empty, verification is the

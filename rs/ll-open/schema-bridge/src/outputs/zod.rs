@@ -355,6 +355,9 @@ fn capnp_implicit_default(t: &FieldType, schema: &Schema) -> Option<String> {
         FieldType::Scalar(ScalarType::Data) => Some("new Uint8Array()".to_owned()),
         // A capnp list defaults to empty, never to null.
         FieldType::List(_) => Some("[]".to_owned()),
+        // Same reasoning as the list: capnp has no null pointer at read
+        // time, so an unset map field decodes as an empty dictionary.
+        FieldType::Map(_) => Some("{}".to_owned()),
         // An enum defaults to its ZEROTH enumerant. The IR keeps `variants`
         // position-stable (variants[i] has capnp ordinal i), so index 0 is
         // authoritative rather than a guess.
@@ -378,6 +381,14 @@ fn render_zod_type(t: &FieldType) -> String {
         // declaration would type-mismatch (zod's inferred type wouldn't
         // include the readonly modifier). Per cloister-818f2b.
         FieldType::List(inner) => format!("z.array({}).readonly()", render_zod_type(inner)),
+        // `.readonly()` for the same reason the array carries it: the
+        // emitted TS interface field is `readonly Record<string, T>`, and
+        // without the matching modifier on the schema the `z.ZodType<X>`
+        // declaration type-mismatches (cloister-818f2b).
+        FieldType::Map(value) => format!(
+            "z.record(z.string(), {}).readonly()",
+            render_zod_type(value)
+        ),
     }
 }
 
@@ -402,6 +413,8 @@ fn render_ts_type(t: &FieldType) -> String {
         FieldType::Scalar(s) => render_ts_scalar(*s).to_owned(),
         FieldType::StructRef(name) => name.clone(),
         FieldType::EnumRef(name) => name.clone(),
+        // Matches the `.readonly()` on the emitted zod schema.
+        FieldType::Map(value) => format!("Readonly<Record<string, {}>>", render_ts_type(value)),
         FieldType::List(inner) => {
             // `readonly T[]` — capnp lists are conceptually read-only
             // from the TS consumer's point of view (the wire is the

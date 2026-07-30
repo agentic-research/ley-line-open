@@ -149,6 +149,32 @@ annotation optional @0xd3b652fd6a4debef (field) :Void;
 #   - zod/Go: NOT lowered today — a no-op for those targets per §Naming 4.
 annotation default @0xd3b652fd6a4debf0 (field) :Text;
 
+# `$Map` — field is a string-keyed dictionary, not a list.
+#
+# Capnp has no map type. A schema that needs one models it as
+# `List(Entry)` where `Entry` is a two-field struct of `key :Text` and
+# `value :T`, and marks the field with this annotation. Targets that have
+# a native map emit one:
+#   - zod (schema-bridge): `z.record(z.string(), <T>)`
+#   - Go (schema-bridge): `map[string]<T>`
+#   - JSON Schema (schema-bridge): `{"type": "object",
+#     "additionalProperties": <T>}`
+#
+# WHY AN ANNOTATION RATHER THAN SHAPE DETECTION
+# ---------------------------------------------
+# Inferring "this is a map" from a `List` of two-field `key`/`value`
+# structs would silently reinterpret any struct that happens to have
+# those field names. That is the guessing this crate's unmapped-construct
+# invariant exists to prevent: a declaration and a shape that resembles
+# one are different things, and only the author knows which they meant.
+# The annotation makes it a statement.
+#
+# The wire is unaffected — capnp still carries `List(Entry)`. This
+# changes only how the JSON-facing targets render it, which is the point:
+# `resolution["git-url"]` is a lookup, and lowering it to an array turns
+# every lookup into a scan.
+annotation map @0xd3b652fd6a4debf1 (field) :Void;
+
 # ── §Struct-level annotations ─────────────────────────────────────────────
 
 # `$Op(input, output, errors)` — declares a struct represents an

@@ -93,7 +93,22 @@ pub fn chunk(data: &[u8]) -> Vec<Chunk> {
             offset: start,
             len,
         });
-        start += len;
+        // Progress is asserted, not assumed. `next_boundary` of a nonempty
+        // slice is always >= 1, so this cannot fire in production — but a
+        // zero-progress iteration is not a wrong answer, it is an allocation
+        // bomb: this loop pushes ~48-byte chunks forever, and under
+        // cargo-mutants (which mutates the condition and the cursor step)
+        // that reliably OOM-killed a 7 GB CI runner before the 90 s mutant
+        // timeout could. The assert turns that class of mutant into an
+        // instant kill. Asserted on the CURSOR, not on `len`: a `+=`→`*=`
+        // step mutation keeps `len > 0` true while never advancing.
+        let next = start + len;
+        assert!(
+            next > start,
+            "chunker made no progress at offset {start} of {} bytes",
+            data.len()
+        );
+        start = next;
     }
     chunks
 }
@@ -279,7 +294,16 @@ pub fn rechunk_with_stats(
             offset: pos,
             len,
         });
-        pos += len;
+        // Same progress assertion as `chunk` and for the same reason: a
+        // zero-progress iteration here is an allocation bomb, not a wrong
+        // answer, and only the cursor observable catches every step mutant.
+        let next = pos + len;
+        assert!(
+            next > pos,
+            "rechunk made no progress at offset {pos} of {} bytes",
+            new_data.len()
+        );
+        pos = next;
         rehashed += 1;
     }
     let stats = RechunkStats {

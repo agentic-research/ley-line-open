@@ -501,14 +501,22 @@ tasks:
     desc: Build release, codesign (macOS), and install to ~/.local/bin
     deps: [release]
     cmds:
-      - mkdir -p ~/.local/bin
-      - cp rs/target/release/leyline ~/.local/bin/leyline
+      # The binary installs ITSELF (ley-line-open-321ded): atomic staging +
+      # rename, idempotent, prints the PATH export line if the dir is off
+      # PATH. This task is a thin wrapper, not a second copy-step
+      # implementation — the single source for install mechanics is
+      # `leyline self install`, which is also what downstream consumers
+      # (mache) delegate to instead of inventing their own binary home.
+      - rs/target/release/leyline self install
       # macOS: ad-hoc codesign with explicit network entitlements.
       # Without this, the binary launches but is SIGKILLed on first
       # network/socket use (exit 137). The linker's adhoc signature
       # alone is insufficient — macOS evaluates the entitlements
       # plist on launch and refuses unentitled network ops. Mirrors
-      # mache's install flow (which hit the same issue).
+      # mache's install flow (which hit the same issue). Runs AFTER
+      # self install: signing mutates the installed copy, so the next
+      # install's byte-compare sees a diff and re-copies — correct,
+      # since the fresh build is the authority.
       - cmd: codesign -s - --force --deep --entitlements entitlements.plist ~/.local/bin/leyline
         platforms: [darwin]
       - echo "installed $(~/.local/bin/leyline --version)"
@@ -655,8 +663,8 @@ tasks:
     desc: Build with `--features all` (everything except mount), codesign (macOS), and install to ~/.local/bin. Portable — no system-dep prerequisites. This is the recommended full install for mache + downstream daemon consumers.
     deps: [release:full]
     cmds:
-      - mkdir -p ~/.local/bin
-      - cp rs/target/release/leyline ~/.local/bin/leyline
+      # Thin wrapper over `leyline self install` — see `install:`.
+      - rs/target/release/leyline self install
       # Same ad-hoc codesign flow as `task install`. See the comment
       # on that task for the SIGKILL-on-network rationale.
       - cmd: codesign -s - --force --deep --entitlements entitlements.plist ~/.local/bin/leyline
@@ -667,8 +675,8 @@ tasks:
     desc: Build with `--features full` INCLUDING mount, codesign (macOS), and install. ONLY use this if libfuse-t (macOS) / libfuse (Linux) is installed at runtime — otherwise the binary won't launch, even for non-mount ops.
     deps: [release:full+mount]
     cmds:
-      - mkdir -p ~/.local/bin
-      - cp rs/target/release/leyline ~/.local/bin/leyline
+      # Thin wrapper over `leyline self install` — see `install:`.
+      - rs/target/release/leyline self install
       - cmd: codesign -s - --force --deep --entitlements entitlements.plist ~/.local/bin/leyline
         platforms: [darwin]
       - echo "installed (full+mount) $(~/.local/bin/leyline --version)"

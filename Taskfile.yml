@@ -979,19 +979,26 @@ tasks:
       # `-C --lib`: the FFI smoke test links against a staticlib in the real
       # target dir, which doesn't exist in the mutant scratch build. Lib tests
       # are where every chunked assertion lives anyway.
+      #
+      # Exit 3 = "some mutants timed out" — the same stance as mutants:cdc: a
+      # mutant the suite STOPS (hang killed by the harness) is detected, not
+      # missed. Exit 2 (a mutant no test caught) still fails.
       - >-
         cargo mutants -p leyline-fs --test-workspace=false
         --no-default-features --features cdc,splice,validate
         -C --lib --file ll-open/fs/src/chunked.rs
+        || [ $? -eq 3 ]
 
   mutants:fs-gc:
     desc: Mutation-test transactional CDC reachability and accounting.
     dir: rs
     cmds:
+      # Exit 3 tolerated for the same reason as mutants:fs/mutants:cdc.
       - >-
         cargo mutants -p leyline-fs --test-workspace=false
         --no-default-features --features cdc,splice,validate
         -C --lib --file ll-open/fs/src/gc.rs
+        || [ $? -eq 3 ]
 
   mutants:cdc:
     desc: Mutation-test leyline-cdc (chunking + range reads).

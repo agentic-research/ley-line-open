@@ -693,6 +693,17 @@ fn activate_blob_in_tx(tx: &Transaction<'_>, blob_hash: &[u8]) -> Result<BlobAct
     // bytes do not hash to its key is refused, never manifested.
     store_blob_chunked_in_transaction(tx, blob_hash, &bytes)
         .with_context(|| format!("activate CDC for blob {blob_hash}"))?;
+    // Liveness, not paranoia: the convergence loop repairs whatever this
+    // probe reports non-fresh, so a store that does not satisfy its own
+    // freshness probe turns that loop into an infinite spin on one blob —
+    // observed as a mutants TIMEOUT (sqlite_integer → constant corrupted the
+    // manifest rows) rather than any wrong answer. Same-transaction, so no
+    // writer can race the check; in production the store writes exactly what
+    // the probe reads and this cannot fire.
+    ensure!(
+        has_blob_chunked(tx, blob_hash).context("re-check blob CDC completeness")?,
+        "activation stored blob {blob_hash} without making it fresh — refusing to spin"
+    );
     Ok(BlobActivation::Populated {
         source_bytes: u64::try_from(bytes.len()).context("blob length exceeds u64")?,
     })

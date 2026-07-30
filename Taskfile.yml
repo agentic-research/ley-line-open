@@ -972,6 +972,29 @@ tasks:
       # would resolve to rs/tools/ and not exist.
       - '{{.ROOT_DIR}}/tools/mutants_diff.sh "{{.DIFF}}"'
 
+  mutants:pr:
+    desc: |
+      Run the PR mutants gate locally: the exact diff-scoped run mutants.yml
+      executes, against your branch's diff from origin/main — INCLUDING
+      uncommitted work, since that is what you are about to commit and push.
+      Exists because each surviving mutant discovered on the runner costs a
+      ~35-minute CI round trip to learn about; this surfaces the survivor
+      list before the push instead of after (PR #308 took three such trips).
+    dir: rs
+    cmds:
+      - |
+        set -eu
+        git fetch origin main --quiet
+        BASE=$(git merge-base origin/main HEAD)
+        DIFF=$(mktemp)
+        trap 'rm -f "$DIFF"' EXIT
+        # No three-dot and no HEAD bound: diff the WORKING TREE against the
+        # merge base, so uncommitted changes are gated too. cargo-mutants
+        # applies --in-diff to the tree as it stands, which is exactly this.
+        git diff --relative=rs "$BASE" -- rs/ > "$DIFF"
+        echo "diff vs $(git rev-parse --short "$BASE") (merge-base with origin/main)"
+        '{{.ROOT_DIR}}/tools/mutants_diff.sh' "$DIFF"
+
   mutants:fs:
     desc: Mutation-test leyline-fs::chunked (the SQL materialize-on-read path).
     dir: rs

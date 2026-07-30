@@ -23,7 +23,7 @@
 //! ley-line-open-9989d2). Composing it under FUSE materialize-on-read + wiring
 //! it to the arena is the next layer.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use leyline_core::{BlobStore, ContentAddressed, Hash};
 
 /// Minimum chunk size — xet's floor (8 KiB). No chunk is smaller than this
@@ -120,18 +120,53 @@ fn next_boundary(data: &[u8]) -> usize {
 /// manifest population and stale/missing manifests still use [`chunk`] in
 /// full; writes with a valid old manifest use this bounded rescan path.
 ///
-/// `edit_offset..old_edit_end` is the replaced range **in old coordinates**;
-/// `old_len` is the old stream's total length. The result is required to equal
-/// `chunk(new_data)` exactly — `fuzz_rechunk_equals_full_rechunk` falsifies
-/// that against random edits rather than trusting the argument above.
-pub fn rechunk(
-    old: &[Chunk],
-    new_data: &[u8],
-    edit_offset: usize,
-    old_edit_end: usize,
+/// The result is required to equal `chunk(new_data)` exactly —
+/// `fuzz_rechunk_equals_full_rechunk` falsifies that against random edits
+/// rather than trusting the argument above. That equality is conditional on
+/// the [`Edit`] being TRUTHFUL; see [`Edit`] for exactly which half of that
+/// contract is enforced where.
+pub fn rechunk(old: &[Chunk], new_data: &[u8], edit: Edit) -> Vec<Chunk> {
+    rechunk_with_stats(old, new_data, edit).0
+}
+
+/// The replaced interval of an edit, in OLD-stream coordinates.
+///
+/// A parsed value, not three interchangeable `usize`s: [`Edit::parse`] is the
+/// only constructor, so a reversed or out-of-bounds interval is
+/// unrepresentable and a call site cannot transpose the arguments (bead
+/// `ley-line-open-b86699`).
+///
+/// The SEMANTIC half of the contract — the bytes outside
+/// `offset..old_end` are actually unchanged between the old and new
+/// streams — cannot be checked here without the full comparison the
+/// incremental path exists to avoid, so it stays a caller obligation:
+/// derive the coordinates from the edit operation itself (the write op's own
+/// offset and length), never reconstruct them from transformed bytes.
+/// `leyline-fs` enforces this at its call site by falling back to a full
+/// re-chunk whenever its UTF-8-lossy conversion changed the bytes, and its
+/// oracle test (`graph_write_incrementally_matches_full_chunk_oracle`)
+/// asserts the stored manifest equals `chunk(new_data)` end to end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Edit {
+    offset: usize,
+    old_end: usize,
     old_len: usize,
-) -> Vec<Chunk> {
-    rechunk_with_stats(old, new_data, edit_offset, old_edit_end, old_len).0
+}
+
+impl Edit {
+    /// The only constructor. Refuses a reversed interval or one that
+    /// extends past the old stream's end.
+    pub fn parse(offset: usize, old_end: usize, old_len: usize) -> Result<Self> {
+        ensure!(
+            offset <= old_end && old_end <= old_len,
+            "edit interval {offset}..{old_end} is reversed or past the old length {old_len}"
+        );
+        Ok(Self {
+            offset,
+            old_end,
+            old_len,
+        })
+    }
 }
 
 /// What an incremental re-chunk actually cost.
@@ -153,6 +188,12 @@ pub struct RechunkStats {
     pub rehashed: usize,
     /// Bytes fed to the boundary scanner. This is the number the whole
     /// construction exists to keep sublinear in the stream length.
+    ///
+    /// Since ley-line-open-f8ebe7 the fs manifest store hashes only the
+    /// `rehashed` window (carried rows are existence-probed), so this is
+    /// also an honest proxy for a refresh's hashing cost — it previously
+    /// was not: the store re-hashed every chunk while this field reported
+    /// the scanner's bounded work.
     pub bytes_scanned: usize,
 }
 
@@ -160,10 +201,13 @@ pub struct RechunkStats {
 pub fn rechunk_with_stats(
     old: &[Chunk],
     new_data: &[u8],
-    edit_offset: usize,
-    old_edit_end: usize,
-    old_len: usize,
+    edit: Edit,
 ) -> (Vec<Chunk>, RechunkStats) {
+    let Edit {
+        offset: edit_offset,
+        old_end: old_edit_end,
+        old_len,
+    } = edit;
     // A shrinking edit can move the tail before the region we would keep;
     // the resync check below handles growth and shrinkage alike, but the
     // delta must be computed against the true old length.
@@ -236,8 +280,13 @@ pub fn chunk_into<S: BlobStore>(data: &[u8], store: &mut S) -> Result<Vec<Chunk>
         let stored = store
             .put(&data[c.offset..c.offset + c.len])
             .context("store chunk")?;
-        debug_assert_eq!(
-            stored, c.hash,
+        // ensure!, not debug_assert: BlobStore::put is contractually
+        // BLAKE3(bytes), but non-conforming impls are this crate's own
+        // test-suite threat model (LengthMismatchStore et al.), and the
+        // fs layer's sibling loop already enforces the same invariant
+        // release-mode. One invariant, one rung (types-friend F9).
+        ensure!(
+            stored == c.hash,
             "stored σ must equal the manifest chunk hash"
         );
     }
@@ -1097,6 +1146,22 @@ mod tests {
     /// The whole claim, stated as an identity: an incremental re-chunk must be
     /// *bit-identical* to a full re-chunk of the same bytes. Not "close", not
     /// "usually" — equal. If it ever differs, a manifest built incrementally
+    /// The ordering half of the edit contract is unrepresentable: a
+    /// reversed interval or one past the old end cannot reach `rechunk`
+    /// because [`Edit::parse`] is the only constructor (b86699). The
+    /// semantic half (bytes outside the interval unchanged) is the
+    /// caller's obligation, documented on [`Edit`].
+    #[test]
+    fn edit_parse_rejects_reversed_and_out_of_bounds_intervals() {
+        assert!(Edit::parse(0, 0, 0).is_ok(), "empty edit on empty stream");
+        assert!(Edit::parse(3, 3, 10).is_ok(), "pure insertion point");
+        assert!(Edit::parse(3, 7, 10).is_ok(), "interior replacement");
+        assert!(Edit::parse(0, 10, 10).is_ok(), "full replacement");
+        assert!(Edit::parse(7, 3, 10).is_err(), "reversed interval");
+        assert!(Edit::parse(3, 11, 10).is_err(), "end past old length");
+        assert!(Edit::parse(11, 11, 10).is_err(), "offset past old length");
+    }
+
     /// describes different chunks than one built from scratch, and two writers
     /// of the same content would disagree about its chunk identity.
     #[test]
@@ -1143,8 +1208,11 @@ mod tests {
             new_data.extend_from_slice(&insert);
             new_data.extend_from_slice(&old_data[old_edit_end..]);
 
-            let (incremental, stats) =
-                rechunk_with_stats(&old_chunks, &new_data, edit_offset, old_edit_end, old_len);
+            let (incremental, stats) = rechunk_with_stats(
+                &old_chunks,
+                &new_data,
+                Edit::parse(edit_offset, old_edit_end, old_len).unwrap(),
+            );
             let full = chunk(&new_data);
 
             assert_eq!(
@@ -1227,7 +1295,7 @@ mod tests {
                 new_data.extend_from_slice(&old_data[ee..]);
 
                 assert_eq!(
-                    rechunk(&old_chunks, &new_data, eo, ee, n),
+                    rechunk(&old_chunks, &new_data, Edit::parse(eo, ee, n).unwrap()),
                     chunk(&new_data),
                     "old_len {old_len}, edit {eo}..{ee}, ins {ins}"
                 );
@@ -1259,7 +1327,11 @@ mod tests {
             new_data.extend(std::iter::repeat_n(0x5Au8, ins));
             new_data.extend_from_slice(&body[ee..]);
             assert_eq!(
-                rechunk(&old_chunks, &new_data, eo, ee, body.len()),
+                rechunk(
+                    &old_chunks,
+                    &new_data,
+                    Edit::parse(eo, ee, body.len()).unwrap()
+                ),
                 chunk(&new_data),
                 "repetitive: edit {eo}..{ee}, ins {ins}"
             );
@@ -1286,7 +1358,11 @@ mod tests {
         let mut new_data = old_data.clone();
         new_data.splice(at..at, [1u8, 2, 3]);
 
-        let incremental = rechunk(&old_chunks, &new_data, at, at, old_data.len());
+        let incremental = rechunk(
+            &old_chunks,
+            &new_data,
+            Edit::parse(at, at, old_data.len()).unwrap(),
+        );
         assert_eq!(incremental, chunk(&new_data), "must still be exact");
 
         let old_hashes: std::collections::HashSet<_> = old_chunks.iter().map(|c| c.hash).collect();
@@ -1322,7 +1398,11 @@ mod tests {
         let mut new_data = old_data.clone();
         new_data.splice(at..at, [1u8, 2, 3]);
 
-        let (out, stats) = rechunk_with_stats(&old_chunks, &new_data, at, at, old_data.len());
+        let (out, stats) = rechunk_with_stats(
+            &old_chunks,
+            &new_data,
+            Edit::parse(at, at, old_data.len()).unwrap(),
+        );
         assert_eq!(out, chunk(&new_data), "must remain exact");
 
         // The prefix must actually be kept: roughly half the chunks precede a
@@ -1396,7 +1476,11 @@ mod tests {
             "delta must be 0 for this case"
         );
 
-        let out = rechunk(&old_chunks, &new_data, eo, ee, old_data.len());
+        let out = rechunk(
+            &old_chunks,
+            &new_data,
+            Edit::parse(eo, ee, old_data.len()).unwrap(),
+        );
         assert_eq!(
             out,
             chunk(&new_data),

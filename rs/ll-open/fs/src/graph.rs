@@ -405,6 +405,32 @@ impl SqliteGraphAdapter {
                 rusqlite::params![new_str.as_ref(), content.len() as i64, now, id],
             )?;
 
+            // The edit coordinates were computed against `content` (the raw
+            // bytes), but the stored stream is `new_str` — the LOSSY UTF-8
+            // conversion of it. When the write landed mid-way through a
+            // multi-byte sequence, lossy replacement rewrites bytes OUTSIDE
+            // the edit interval, so the coordinates would describe an edit
+            // that is not the edit that happened and the incremental path's
+            // kept prefix could carry stale hashes (types-friend F6). A
+            // truthful Edit exists only when the conversion was the
+            // identity; otherwise drop the old manifest and re-chunk in
+            // full — correctness costs one full pass exactly when the
+            // content stopped being valid UTF-8.
+            #[cfg(feature = "cdc")]
+            let (previous, edit) = if new_str.as_bytes() == content.as_slice() {
+                (
+                    previous,
+                    leyline_cdc::Edit::parse(edit_offset, old_edit_end, old_len)
+                        .context("write-derived edit coordinates")?,
+                )
+            } else {
+                (
+                    None,
+                    leyline_cdc::Edit::parse(0, old_len, old_len)
+                        .context("full-replacement edit coordinates")?,
+                )
+            };
+
             // No-op unless this arena already has the chunk schema — writing
             // through a foreign arena must not silently upgrade it.
             #[cfg(feature = "cdc")]
@@ -413,8 +439,7 @@ impl SqliteGraphAdapter {
                 id,
                 new_str.as_ref().as_bytes(),
                 previous,
-                edit_offset,
-                old_edit_end,
+                edit,
                 old_len,
             )? {
                 crate::chunked::RefreshOutcome::Skipped => WriteRefreshOutcome::Skipped,

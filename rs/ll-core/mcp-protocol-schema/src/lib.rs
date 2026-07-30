@@ -37,6 +37,9 @@
 include!(concat!(env!("OUT_DIR"), "/protocol_facts.rs"));
 
 /// Path to the vendored schema, relative to this crate's manifest dir.
+/// Inside the crate (not repo-root `schema/mcp/`) so the crate is
+/// self-contained: scratch builds that copy only the cargo workspace
+/// and an eventual crates.io package both carry the pin.
 pub fn vendored_relative_path() -> String {
-    format!("../../../schema/mcp/protocol.{PINNED_REVISION}.json")
+    format!("protocol.{PINNED_REVISION}.json")
 }

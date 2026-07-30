@@ -53,9 +53,12 @@ const SOURCE_URL: &str = "https://raw.githubusercontent.com/modelcontextprotocol
 const EXPECTED_SHA256: &str = "ef70b61f99b6d2e5e3b46863822eab08dff6a45bedc7a08914e0e5b133f40203";
 
 fn main() {
+    // Inside the crate directory, not the repo-root schema/ convention:
+    // the crate must be self-contained so scratch builds that copy only
+    // the cargo workspace (cargo-mutants' baseline broke on the root
+    // path) and an eventual crates.io package both carry their pin.
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
-    let schema_path =
-        Path::new(&manifest_dir).join(format!("../../../schema/mcp/protocol.{REVISION}.json"));
+    let schema_path = Path::new(&manifest_dir).join(format!("protocol.{REVISION}.json"));
     // Re-run when the vendored bytes change — the whole point is that a
     // schema edit re-derives every fact (or fails the digest gate).
     println!("cargo::rerun-if-changed={}", schema_path.display());

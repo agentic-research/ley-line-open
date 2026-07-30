@@ -41,7 +41,14 @@ use leyline_ts::languages::TsLanguage;
 use leyline_ts::refs::{ExtractedRef, extract_refs};
 
 struct Contract {
-    lang: TsLanguage,
+    /// Language name as `TsLanguage::from_name` resolves it. A NAME,
+    /// not the enum variant, so this file carries no `#[cfg(feature)]`
+    /// gates (the repo's cfg_feature_in_tests smell — a cfg-gated test
+    /// silently skips when the feature is off, the exact silent-skip
+    /// class this harness exists to fight). Contracts for languages
+    /// not compiled into the current build are skipped at RUNTIME with
+    /// an eprintln, visibly.
+    lang_name: &'static str,
     fixture: &'static str,
     /// (construct label, token that must appear as a def)
     expect_def: &'static [(&'static str, &'static str)],
@@ -65,11 +72,9 @@ const NOT_YET_COVERED: &[&str] = &[
 ];
 
 fn contracts() -> Vec<Contract> {
-    #[allow(unused_mut)]
     let mut out: Vec<Contract> = Vec::new();
-    #[cfg(feature = "go")]
     out.push(Contract {
-        lang: TsLanguage::Go,
+        lang_name: "go",
         fixture: r#"package main
 
 import "fmt"
@@ -99,9 +104,8 @@ func caller() {
             ("package-level var", "packageVar", "ley-line-open-651909"),
         ],
     });
-    #[cfg(feature = "typescript")]
     out.push(Contract {
-        lang: TsLanguage::TypeScript,
+        lang_name: "typescript",
         fixture: r#"import { z } from "zod";
 
 export function plainFn(): void {}
@@ -144,12 +148,11 @@ export enum Mode { A, B }
             ),
         ],
     });
-    #[cfg(feature = "markdown")]
     out.push(Contract {
         // Reached only via injection from the Markdown block grammar
         // (ea1e42); contracted here directly against INLINE_LANGUAGE
         // because the extractor arm is per-node and pure.
-        lang: TsLanguage::MarkdownInline,
+        lang_name: "markdown-inline",
         fixture: "Calls `PartitionSpec::address` and plain *emphasis* and [a link](https://x).\n",
         expect_def: &[],
         ledgered_absent: &[],
@@ -204,10 +207,31 @@ fn extract_all(lang: TsLanguage, fixture: &str) -> (Vec<String>, Vec<String>) {
     (defs, refs)
 }
 
+/// Resolve a contract's language, or skip it VISIBLY when the feature
+/// is not compiled into this build. Runtime probing instead of
+/// `#[cfg(feature)]` on tests: a cfg-gated test silently vanishes from
+/// the run, which is the silent-skip class this harness exists to
+/// fight (and the repo's cfg_feature_in_tests smell rule bans).
+fn resolve_or_skip(c: &Contract) -> Option<TsLanguage> {
+    match TsLanguage::from_name(c.lang_name) {
+        Ok(lang) => Some(lang),
+        Err(_) => {
+            eprintln!(
+                "coverage-contract: skipping {} — feature not compiled into this build",
+                c.lang_name
+            );
+            None
+        }
+    }
+}
+
 #[test]
 fn every_contracted_language_emits_what_it_declares_and_nothing_it_ledgers() {
     for c in contracts() {
-        let (defs, _refs) = extract_all(c.lang, c.fixture);
+        let Some(lang) = resolve_or_skip(&c) else {
+            continue;
+        };
+        let (defs, _refs) = extract_all(lang, c.fixture);
 
         for (label, token) in c.expect_def {
             assert!(
@@ -216,7 +240,7 @@ fn every_contracted_language_emits_what_it_declares_and_nothing_it_ledgers() {
                  emitted defs {defs:?}. A query/extractor edit dropped \
                  declared coverage — restore it or move the construct to \
                  the ledger WITH a bead.",
-                c.lang.name(),
+                c.lang_name,
             );
         }
 
@@ -228,7 +252,7 @@ fn every_contracted_language_emits_what_it_declares_and_nothing_it_ledgers() {
                  improved — promote this entry to expect_def and update \
                  the bead; a stale ledger is the lie this test exists to \
                  prevent.",
-                c.lang.name(),
+                c.lang_name,
             );
         }
     }
@@ -237,14 +261,16 @@ fn every_contracted_language_emits_what_it_declares_and_nothing_it_ledgers() {
 /// The markdown-inline contract is ref-shaped, not def-shaped: a code
 /// span is a doc-symbol REFERENCE (the mache join surface), and prose
 /// structure deliberately emits nothing.
-#[cfg(feature = "markdown")]
 #[test]
 fn markdown_inline_emits_code_span_refs_and_no_prose_facts() {
     let c = contracts()
         .into_iter()
-        .find(|c| c.lang == TsLanguage::MarkdownInline)
+        .find(|c| c.lang_name == "markdown-inline")
         .expect("markdown-inline contract exists");
-    let (defs, refs) = extract_all(c.lang, c.fixture);
+    let Some(lang) = resolve_or_skip(&c) else {
+        return;
+    };
+    let (defs, refs) = extract_all(lang, c.fixture);
 
     assert_eq!(
         refs,
@@ -263,7 +289,7 @@ fn markdown_inline_emits_code_span_refs_and_no_prose_facts() {
 /// gets a contract or a listed exemption.
 #[test]
 fn uncontracted_languages_are_exactly_the_declared_ratchet_list() {
-    let contracted: Vec<&str> = contracts().iter().map(|c| c.lang.name()).collect();
+    let contracted: Vec<&str> = contracts().iter().map(|c| c.lang_name).collect();
 
     // The languages with an extract_refs dispatch arm — the fact-emitting
     // set, which is what a coverage contract is ABOUT. Structural-only

@@ -101,20 +101,26 @@ impl SelfContext {
     /// Capture the real process environment. The only place in this
     /// module allowed to touch `std::env`.
     pub fn from_process() -> Self {
-        let non_empty =
-            |v: std::result::Result<String, std::env::VarError>| v.ok().filter(|s| !s.is_empty());
         Self {
             home: dirs::home_dir(),
-            env_install_dir: non_empty(std::env::var("LEYLINE_INSTALL_DIR")),
+            env_install_dir: env_non_empty(std::env::var("LEYLINE_INSTALL_DIR")),
             path_env: std::env::var("PATH").unwrap_or_default(),
-            shell: non_empty(std::env::var("SHELL")),
+            shell: env_non_empty(std::env::var("SHELL")),
             current_exe: std::env::current_exe().ok(),
             current_version: crate::daemon::version::BINARY_VERSION.to_string(),
             api_base: RELEASE_API_BASE.to_string(),
             download_base: RELEASE_DOWNLOAD_BASE.to_string(),
-            github_token: non_empty(std::env::var("GITHUB_TOKEN")),
+            github_token: env_non_empty(std::env::var("GITHUB_TOKEN")),
         }
     }
+}
+
+/// An env var is meaningful only when set AND non-empty — an exported
+/// `LEYLINE_INSTALL_DIR=` must not select "" as an install dir. A
+/// module-level fn (not a closure inside `from_process`) so its
+/// falsifier can hit it without mutating process env from a test.
+fn env_non_empty(value: std::result::Result<String, std::env::VarError>) -> Option<String> {
+    value.ok().filter(|s| !s.is_empty())
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -160,7 +166,9 @@ fn dir_on_path(dir: &Path, path_env: &str) -> bool {
 
 /// The exact one-line command that puts `dir` on PATH in the user's
 /// shell. Printed, never executed — rc files belong to the user.
-fn export_hint(dir: &Path, shell: Option<&str>) -> String {
+/// `pub` because `leyline doctor`'s warn-only PATH check phrases its
+/// hint with the same line.
+pub fn export_hint(dir: &Path, shell: Option<&str>) -> String {
     let is_fish = shell
         .map(Path::new)
         .and_then(Path::file_name)
@@ -181,11 +189,6 @@ pub fn running_binary_status(ctx: &SelfContext) -> Option<(PathBuf, bool)> {
     let dir = exe.parent()?;
     let on_path = dir_on_path(dir, &ctx.path_env);
     Some((exe, on_path))
-}
-
-/// Re-phrase the PATH hint for consumers outside this module (doctor).
-pub fn path_hint_for(dir: &Path, shell: Option<&str>) -> String {
-    export_hint(dir, shell)
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -942,6 +945,15 @@ mod tests {
             .into_string()
             .unwrap();
         assert_eq!(running_binary_status(&ctx), Some((exe, true)));
+    }
+
+    #[test]
+    fn env_values_count_only_when_set_and_non_empty() {
+        // `export LEYLINE_INSTALL_DIR=` (empty) must not select "" as
+        // an install dir — empty and unset are the same non-signal.
+        assert_eq!(env_non_empty(Ok("x".to_string())), Some("x".to_string()));
+        assert_eq!(env_non_empty(Ok(String::new())), None);
+        assert_eq!(env_non_empty(Err(std::env::VarError::NotPresent)), None);
     }
 
     #[test]

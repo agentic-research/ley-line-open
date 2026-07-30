@@ -74,7 +74,7 @@ pub fn run_doctor(json: bool, allow_missing: bool) -> Result<()> {
                 );
                 println!(
                     "     → {}   # or: leyline self install",
-                    crate::cmd_self::path_hint_for(dir, self_ctx.shell.as_deref())
+                    crate::cmd_self::export_hint(dir, self_ctx.shell.as_deref())
                 );
             }
             None => println!("Binary dir on PATH: (could not determine current exe)"),

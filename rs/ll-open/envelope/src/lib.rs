@@ -90,6 +90,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
+// Verification-only extern-C surface for wasm32/browser consumers
+// (`leyline_envelope.wasm`). Signing is deliberately not exported — see
+// the module docs.
+pub mod ffi;
+
 // The signer surface this crate composes over, re-exported so consumers need
 // no direct leyline-sign dependency for the common sign/verify path.
 pub use leyline_sign::root_signer::{Ed25519RootSigner, VerifyingKey};
@@ -538,16 +543,21 @@ mod tests {
     /// keyid-agnostic on genuine rosary bytes — NOT a migration commitment;
     /// the legacy scheme retired with zero surviving envelopes
     /// (rosary-33670d).
-    const ROSARY_ENVELOPE: &str = r#"{"payloadType":"application/vnd.in-toto+json","payload":"eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJzdWJqZWN0IjpbeyJuYW1lIjoiLnJzcnktaGFuZG9mZi0wLmpzb24iLCJkaWdlc3QiOnsic2hhMjU2IjoiMjNhZDA4MGY5MzJjZjE0YTUyNDcyY2M2NzcyNTdjMDY0YjFjZTM4YWFjYzZmZTM2ZDk2ZWRiNTQyNjU3YzkxMiJ9fV0sInByZWRpY2F0ZVR5cGUiOiJodHRwczovL3Jvc2FyeS5kZXYvSGFuZG9mZi92MSIsInByZWRpY2F0ZSI6eyJwaGFzZSI6MCwiZnJvbV9hZ2VudCI6ImRldi1hZ2VudCIsImJlYWRfaWQiOiJyb3NhcnktdGVzdCIsInN1bW1hcnkiOiJGaXhlZCB0aGUgdGhpbmcuIn19","signatures":[{"keyid":"65b60673d6ed884bf01c2c222d82ada0740f29ac3355d6a925c81f17f47a27b8","sig":"CrW_3tZq2bf06flvXYKIO1xx4jCp4nqVf2Mo81E_pf5nhGm13dABaELzrEZqbw0yf6v1D-VZi56V10ga30PPAA"}]}"#;
+    // pub(crate): the ffi module's falsifiers reuse this genuine rosary
+    // fixture rather than duplicating a 700-byte literal that could drift.
+    pub(crate) const ROSARY_ENVELOPE: &str = r#"{"payloadType":"application/vnd.in-toto+json","payload":"eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJzdWJqZWN0IjpbeyJuYW1lIjoiLnJzcnktaGFuZG9mZi0wLmpzb24iLCJkaWdlc3QiOnsic2hhMjU2IjoiMjNhZDA4MGY5MzJjZjE0YTUyNDcyY2M2NzcyNTdjMDY0YjFjZTM4YWFjYzZmZTM2ZDk2ZWRiNTQyNjU3YzkxMiJ9fV0sInByZWRpY2F0ZVR5cGUiOiJodHRwczovL3Jvc2FyeS5kZXYvSGFuZG9mZi92MSIsInByZWRpY2F0ZSI6eyJwaGFzZSI6MCwiZnJvbV9hZ2VudCI6ImRldi1hZ2VudCIsImJlYWRfaWQiOiJyb3NhcnktdGVzdCIsInN1bW1hcnkiOiJGaXhlZCB0aGUgdGhpbmcuIn19","signatures":[{"keyid":"65b60673d6ed884bf01c2c222d82ada0740f29ac3355d6a925c81f17f47a27b8","sig":"CrW_3tZq2bf06flvXYKIO1xx4jCp4nqVf2Mo81E_pf5nhGm13dABaELzrEZqbw0yf6v1D-VZi56V10ga30PPAA"}]}"#;
     /// The full envelope THIS crate emits for the (sorted-map) vector
     /// statement: canonical kid, compact JSON, declared field order.
     const VECTOR_CANONICAL_ENVELOPE: &str = r#"{"payloadType":"application/vnd.in-toto+json","payload":"eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJzdWJqZWN0IjpbeyJuYW1lIjoiLnJzcnktaGFuZG9mZi0wLmpzb24iLCJkaWdlc3QiOnsic2hhMjU2IjoiZWVmYzg0ODg0NDVlMTQ3ZGU4NmQ1ODJjOGY2MTUwNGNlOWVkMzk3MWE3NWMyNTk1YjBjMmQ4ZmY4YzhiMzBiNyJ9fV0sInByZWRpY2F0ZVR5cGUiOiJodHRwczovL3Jvc2FyeS5kZXYvSGFuZG9mZi92MSIsInByZWRpY2F0ZSI6eyJiZWFkX2lkIjoicm9zYXJ5LXRlc3QiLCJmcm9tX2FnZW50IjoiZGV2LWFnZW50IiwicGhhc2UiOjAsInN1bW1hcnkiOiJGaXhlZCB0aGUgdGhpbmcuIn19","signatures":[{"keyid":"646d6be49d9f0048f94f67749eca3515","sig":"GyM3MI_KILb9e9O-ySSYa1SWrtFulVlLwigwCLTZJz6P9P8jHHTSj7Ljk3wYzOriHyc-IOqdJ0e9h3oW9M98Cg"}]}"#;
 
-    fn vector_signer() -> Ed25519RootSigner {
+    // pub(crate) on the three vector helpers: shared with the ffi
+    // module's tests for the same no-drifting-duplicates reason as
+    // ROSARY_ENVELOPE above.
+    pub(crate) fn vector_signer() -> Ed25519RootSigner {
         Ed25519RootSigner::from_seed(&VECTOR_SEED)
     }
 
-    fn vector_pubkey() -> VerifyingKey {
+    pub(crate) fn vector_pubkey() -> VerifyingKey {
         let raw: [u8; 32] = hex::decode(VECTOR_PUBKEY_HEX)
             .expect("hex")
             .try_into()
@@ -557,7 +567,7 @@ mod tests {
 
     /// Rosary's sample handoff, subject-digested over the same
     /// pretty-printed "disk bytes" its vector uses.
-    fn vector_statement() -> Statement {
+    pub(crate) fn vector_statement() -> Statement {
         let predicate = serde_json::json!({
             "phase": 0,
             "from_agent": "dev-agent",

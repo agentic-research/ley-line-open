@@ -6,6 +6,15 @@ description = "DSSE envelope + in-toto Statement v1 attestation over the leyline
 repository = "https://github.com/agentic-research/ley-line-open"
 license = "AGPL-3.0-or-later"
 
+[lib]
+# Subset of leyline-sign's triple (rs/ll-open/sign/Cargo.toml):
+# - cdylib for the published wasm32 verification artifact
+#          (`leyline_envelope.wasm`, task envelope:wasm:build)
+# - rlib   for in-workspace Rust consumers and `cargo test`
+# No staticlib: unlike sign/cas-ffi there is no static-link C consumer —
+# native callers use the Rust API, and the FFI exists for wasm32.
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 # Signing composes over the substrate's signer surface (`Ed25519RootSigner`,
 # ADR-012 canonical kid). The envelope crate never takes raw key bytes in its
@@ -13,7 +22,15 @@ license = "AGPL-3.0-or-later"
 # CONFIGURATION (where the key comes from) on their side. `root-signer` is
 # deliberately wasm-reachable (verified by leyline-sign's own wasm32 build),
 # so the whole sign+verify path works in a browser.
-leyline-sign = { path = "../sign", version = "0.13.0", features = ["root-signer"] }
+#
+# `default-features = false` switches OFF leyline-sign's `ffi` feature:
+# `#[no_mangle]` symbols from an rlib dependency leak into the dependent
+# cdylib's export section, and without this pin `leyline_envelope.wasm`
+# would re-export leyline-sign's six extern-C entry points — including the
+# SIGNING ones this crate's FFI exists to keep out of the wasm consumer.
+# tests/wasm_export_surface.rs asserts export-set equality, so a slip here
+# fails the release gate rather than shipping.
+leyline-sign = { path = "../sign", version = "0.13.0", default-features = false, features = ["root-signer"] }
 # Signature/Verifier types for the verify path. Same major as leyline-sign's
 # so `VerifyingKey` re-exported from there is the same type callers hand us.
 ed25519-dalek = "3"
@@ -27,3 +44,12 @@ base64 = "0.22"
 sha2 = "0.11"
 hex = { workspace = true }
 thiserror = { workspace = true }
+# Shared C-boundary helpers (bead `ley-line-open-85fb1f` PR 2) — the
+# raw-pointer discipline behind src/ffi.rs, same as leyline-sign's FFI.
+leyline-ffi-helpers = { path = "../../ll-core/ffi-helpers", version = "0.13.0" }
+
+[dev-dependencies]
+# Export-surface gate for the published leyline_envelope.wasm (bead
+# ley-line-open-be5f86): tests/wasm_export_surface.rs parses the real
+# export section of the built artifact, run via `task envelope:wasm:verify`.
+wasmparser = { workspace = true }

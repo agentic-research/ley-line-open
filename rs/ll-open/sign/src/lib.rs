@@ -2,6 +2,12 @@ pub mod cert;
 pub mod cert_chain;
 pub mod cms;
 pub mod error;
+// The extern-C exports. Default-ON feature gate, not a plain module:
+// `#[no_mangle]` symbols in an rlib dependency surface in the dependent
+// cdylib's export section, so a downstream crate shipping its own wasm
+// artifact (leyline-envelope) opts out with `default-features = false`
+// to keep its exported surface its own (bead ley-line-open-be5f86).
+#[cfg(feature = "ffi")]
 pub mod ffi;
 // ADR-012 canonical key identifier. Not feature-gated: the derivation and its
 // shape gate are needed on both the signing and the (wasm) verifying side, and

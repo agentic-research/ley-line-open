@@ -23,7 +23,16 @@ path = "src/bin/helper.rs"
 required-features = ["host"]
 
 [features]
-default = []
+default = ["ffi"]
+# The extern-C exports (src/ffi.rs). Default-ON: the native cdylib and the
+# published leyline_sign.wasm both carry them, so every existing build is
+# unchanged. It is a feature at all because `#[no_mangle]` symbols from an
+# rlib DEPENDENCY leak into the final cdylib's export section — a dependent
+# crate publishing its own wasm artifact (leyline-envelope, bead
+# ley-line-open-be5f86) would otherwise re-export this crate's signing entry
+# points from a module documented as verification-only. Such consumers
+# depend with `default-features = false`.
+ffi = []
 # Concrete Ed25519 `RootSigner` over Σ roots (workstream S1). Native-only:
 # gated `not(target_arch = "wasm32")` at the module boundary.
 root-signer = ["dep:leyline-core", "dep:anyhow"]

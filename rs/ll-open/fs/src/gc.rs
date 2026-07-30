@@ -470,6 +470,58 @@ mod tests {
         );
     }
 
+    /// The blob reaper's COUNTS are the contract, not just its side effect:
+    /// mutation testing replaced `reap_dead_blob_manifests` with every
+    /// constant tuple and the integration suite couldn't object — the diff
+    /// gate runs lib tests only, so the killer has to live here. Exact
+    /// equality against independently observed row/blob counts refutes all
+    /// four constants at once; the quiet phase pins the no-dead case.
+    #[test]
+    fn gc_reports_exact_blob_reap_counts() {
+        let conn = db();
+        leyline_ts::schema::create_source_blobs_table(&conn).unwrap();
+        // One blob past MAX_CHUNK (>= 2 manifest rows) plus one small
+        // eligible blob: total rows >= 3 and distinct blobs == 2, so no
+        // 0/1-valued tuple can coincide with the real counts.
+        let big = vec![b'a'; 200_000];
+        let small = vec![b'b'; 9_000];
+        for bytes in [&big, &small] {
+            let hash = leyline_core::ContentAddressed::hash(&bytes[..]);
+            conn.execute(
+                "INSERT OR IGNORE INTO source_blobs (blob_hash, blob_bytes) VALUES (?1, ?2)",
+                rusqlite::params![hash.as_bytes().as_slice(), bytes],
+            )
+            .unwrap();
+        }
+        crate::activation::activate_chunked_source_blobs(
+            &conn,
+            crate::activation::ActivationOptions::default(),
+        )
+        .unwrap();
+        let manifest_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM blob_manifest", [], |row| row.get(0))
+            .unwrap();
+        assert!(manifest_rows >= 3, "precondition: {manifest_rows} rows");
+
+        // Nothing is dead yet: the reap must report exactly zero work.
+        let quiet = collect_unreachable_chunks(&conn, GcOptions::default()).unwrap();
+        assert_eq!(quiet.reaped_blob_manifest_rows, 0);
+        assert_eq!(quiet.reaped_blob_manifest_blobs, 0);
+
+        conn.execute("DELETE FROM source_blobs", []).unwrap();
+        let report = collect_unreachable_chunks(&conn, GcOptions::default()).unwrap();
+        assert_eq!(
+            report.reaped_blob_manifest_rows,
+            u64::try_from(manifest_rows).unwrap(),
+            "reaped span rows must equal the rows that existed"
+        );
+        assert_eq!(
+            report.reaped_blob_manifest_blobs, 2,
+            "reaped blobs must equal the distinct dead blobs"
+        );
+        assert_eq!(count_chunks(&conn), 0, "their chunks must then collect");
+    }
+
     /// A manifest whose witness disagrees with the live row is refused by
     /// reads and cannot serve incremental rechunking either, so it is dead
     /// weight holding chunks alive.

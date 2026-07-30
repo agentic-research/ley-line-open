@@ -364,3 +364,77 @@ pub fn blob_chunks_touched(
         .context("count touched blob chunks")?;
     usize::try_from(n).context("negative touched blob chunk count")
 }
+
+// In-module falsifiers, not only integration tests: the diff-scoped mutants
+// gate runs lib tests only, so a killer that lives in tests/ is invisible to
+// it — every constant-replacement mutant in this module survived the gate
+// until these landed. Same discipline as `chunked`'s and `gc`'s own modules.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic bytes; no RNG dependency.
+    fn prng_bytes(seed: u64, n: usize) -> Vec<u8> {
+        let mut s = seed | 1;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 24) as u8
+            })
+            .collect()
+    }
+
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        create_blob_chunked_schema(&conn).unwrap();
+        conn
+    }
+
+    /// Store → read round trip plus the two counted claims: an interior
+    /// window touches exactly one manifest row, the full range touches all
+    /// of them, and a past-EOF window clamps to empty (an `==` flipped to
+    /// `!=` in that clamp returns empty for every NON-empty request
+    /// instead — the interior read is what refutes it).
+    #[test]
+    fn stored_blobs_read_back_byte_identically_and_touch_only_the_overlap() {
+        let conn = db();
+        let data = prng_bytes(7, 200_000);
+        let hash = data[..].hash();
+        let tx = conn.unchecked_transaction().unwrap();
+        let chunks = store_blob_chunked_in_transaction(&tx, hash, &data).unwrap();
+        tx.commit().unwrap();
+        assert!(chunks >= 2, "200 KB must exceed MAX_CHUNK: {chunks} chunks");
+
+        assert_eq!(read_blob_range(&conn, hash, 0..200_000).unwrap(), data);
+        assert_eq!(
+            read_blob_range(&conn, hash, 130_000..140_010).unwrap(),
+            &data[130_000..140_010]
+        );
+        assert_eq!(
+            read_blob_range(&conn, hash, 300_000..300_005).unwrap(),
+            Vec::<u8>::new(),
+            "a window past EOF clamps to the empty overlap"
+        );
+
+        assert_eq!(blob_chunks_touched(&conn, hash, 130_000, 10).unwrap(), 1);
+        assert_eq!(
+            blob_chunks_touched(&conn, hash, 0, 200_000).unwrap(),
+            chunks
+        );
+    }
+
+    /// The unactivated-blob error names the blob — the label is contract
+    /// (operators grep it), so a constant-replacement of it must fail here.
+    #[test]
+    fn a_missing_manifest_error_names_the_blob() {
+        let conn = db();
+        let hash = b"never stored".as_slice().hash();
+        let err = read_blob_range(&conn, hash, 0..1).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("blob {hash}")),
+            "error must name the blob: {err}"
+        );
+    }
+}

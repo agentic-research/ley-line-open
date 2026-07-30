@@ -755,3 +755,66 @@ fn validate_source_blobs_contract(conn: &Connection) -> Result<()> {
     );
     Ok(())
 }
+
+// In-module falsifiers for the diff-scoped mutants gate (lib tests only —
+// a killer in tests/ is invisible to it). Same reasoning as blob_chunked's.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leyline_core::ContentAddressed;
+
+    /// Literal, not `MIN_CHUNK`: a floor test that reads the const moves its
+    /// goalposts with the mutation (the CDC bounds lesson, twice now).
+    #[test]
+    fn the_chunking_floor_is_the_xet_floor() {
+        assert_eq!(chunk_floor().unwrap(), 8192);
+    }
+
+    /// The contract failure is a NAMED refusal, not whatever SQL error
+    /// happens to fall out downstream — a mutant that skips the validation
+    /// still errors on the missing table, so the message text is the
+    /// distinguishing observable.
+    #[test]
+    fn activation_without_the_source_blobs_table_names_the_contract() {
+        let conn = Connection::open_in_memory().unwrap();
+        let err = activate_chunked_source_blobs(&conn, ActivationOptions::default()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("missing required source_blobs table"),
+            "must refuse by name: {err:#}"
+        );
+    }
+
+    /// The convergence probe's two answers, asserted directly: an eligible
+    /// blob with no manifest is reported (an unconditional `Ok(None)` here
+    /// silently voids the completeness proof), and a converged state is not.
+    #[test]
+    fn the_completeness_probe_reports_an_unactivated_blob_then_convergence() {
+        let conn = Connection::open_in_memory().unwrap();
+        leyline_ts::schema::create_source_blobs_table(&conn).unwrap();
+        crate::blob_chunked::ensure_blob_manifest_infra(&conn).unwrap();
+        let bytes = vec![b'q'; 9_000];
+        let hash = bytes[..].hash();
+        conn.execute(
+            "INSERT INTO source_blobs (blob_hash, blob_bytes) VALUES (?1, ?2)",
+            rusqlite::params![hash.as_bytes().as_slice(), bytes],
+        )
+        .unwrap();
+
+        let tx = conn.unchecked_transaction().unwrap();
+        let found = first_incomplete_blob(&tx, 16, chunk_floor().unwrap()).unwrap();
+        assert_eq!(
+            found.as_deref(),
+            Some(hash.as_bytes().as_slice()),
+            "an eligible blob with no manifest is incomplete"
+        );
+        drop(tx);
+
+        activate_chunked_source_blobs(&conn, ActivationOptions::default()).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        assert_eq!(
+            first_incomplete_blob(&tx, 16, chunk_floor().unwrap()).unwrap(),
+            None,
+            "after activation the probe must report convergence"
+        );
+    }
+}

@@ -433,12 +433,6 @@ fn select_range_manifest_sql() -> String {
     )
 }
 
-#[derive(Debug)]
-struct ValidatedRangeManifest {
-    chunks: Vec<leyline_cdc::Chunk>,
-    source_len: usize,
-}
-
 fn decode_manifest_chunk(
     node_id: &str,
     hash: Vec<u8>,
@@ -470,7 +464,7 @@ fn select_range_manifest(
     node_id: &str,
     offset: usize,
     len: usize,
-) -> Result<Option<ValidatedRangeManifest>> {
+) -> Result<Option<leyline_cdc::SelectedRange>> {
     let source_len = tx
         .query_row(
             "SELECT source_len FROM content_manifest_meta WHERE node_id = ?1",
@@ -518,9 +512,11 @@ fn select_range_manifest(
             chunk_len,
         )?);
     }
-    leyline_cdc::validate_selected_range(&chunks, source_len, wanted_start, wanted_end)
+    // Parse, don't validate: the returned type carries the selection
+    // contract, and the cdc read performs no second pass (types-friend F5).
+    let selected = leyline_cdc::SelectedRange::parse(chunks, source_len, wanted_start, wanted_end)
         .with_context(|| format!("validate selected range manifest for {node_id}"))?;
-    Ok(Some(ValidatedRangeManifest { chunks, source_len }))
+    Ok(Some(selected))
 }
 
 /// Lower bound for the index seek — see [`OVERLAP_PREDICATE`]. No chunk
@@ -601,8 +597,7 @@ fn read_content_chunked_in_transaction(
     // CANONICAL OPERATION SEAM: SQL selects addresses, BlobStore verifies
     // bytes, and leyline-cdc alone reconstructs them. Do not duplicate any of
     // those operations with a JOIN/copy path here.
-    leyline_cdc::read_range_into(&selected.chunks, selected.source_len, &store, offset, buf)
-        .context("reconstruct SQLite chunk range")
+    leyline_cdc::read_range_into(&selected, &store, buf).context("reconstruct SQLite chunk range")
 }
 
 /// Drop `node_id`'s chunk manifest, so subsequent reads fall back to
@@ -923,6 +918,11 @@ pub enum ContentSource {
     Chunked,
     /// Served from `nodes.record` — the whole file was materialized to slice it.
     Record,
+    /// No read occurred (an empty destination buffer). Neither path ran and
+    /// neither counter moved — previously this fabricated `Record`, which a
+    /// caller doing its own tallying would count against the slow path
+    /// (types-friend F11).
+    Empty,
 }
 
 /// Process-wide tally of reads by source. Lets a long-running mount answer
@@ -983,7 +983,7 @@ where
     F: FnOnce(Transaction<'_>) -> Result<()>,
 {
     if buf.is_empty() {
-        return Ok((0, ContentSource::Record));
+        return Ok((0, ContentSource::Empty));
     }
     let offset = checked_range_offset(offset)?;
     let tx = conn
@@ -1006,6 +1006,9 @@ where
     match source {
         ContentSource::Chunked => CHUNKED_READS.fetch_add(1, Ordering::Relaxed),
         ContentSource::Record => RECORD_READS.fetch_add(1, Ordering::Relaxed),
+        // Unreachable on this path (the empty-buffer early return above),
+        // but the exhaustive match forces every future consumer to decide.
+        ContentSource::Empty => 0,
     };
     Ok((n, source))
 }
@@ -1060,7 +1063,10 @@ pub fn chunked_content_len(conn: &Connection, node_id: &str) -> Result<usize> {
             |r| r.get(0),
         )
         .context("content length")?;
-    Ok(n.unwrap_or(0) as usize)
+    // try_from, not `as`: a negative MAX(...) from a corrupt manifest row
+    // must be an error, not a near-usize::MAX length (types-friend F8 —
+    // every sibling decoder in this file already uses the checked form).
+    usize::try_from(n.unwrap_or(0)).context("chunked content length is negative or too large")
 }
 
 #[cfg(test)]
@@ -1296,21 +1302,18 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(selected.source_len, data.len());
-        assert_eq!(selected.chunks.len(), expected);
+        // SelectedRange::parse already ran inside select_range_manifest —
+        // the value's existence IS the validation (types-friend F5). The
+        // oracle assertions below check the SQL selection agreed with the
+        // Rust-side expectations.
+        assert_eq!(selected.chunks().len(), expected);
         assert!(
             selected
-                .chunks
+                .chunks()
                 .windows(2)
                 .all(|pair| pair[0].offset < pair[1].offset)
         );
-        leyline_cdc::validate_selected_range(
-            &selected.chunks,
-            selected.source_len,
-            offset,
-            offset + len,
-        )
-        .unwrap();
+        assert_eq!(selected.len(), len, "clipped interval spans the request");
     }
 
     #[test]
@@ -1369,14 +1372,7 @@ mod tests {
             .unwrap();
         let store = SqliteBlobStore { tx: &tx };
         assert_eq!(
-            leyline_cdc::read_range_into(
-                &selected.chunks,
-                selected.source_len,
-                &store,
-                0,
-                &mut round_trip,
-            )
-            .unwrap(),
+            leyline_cdc::read_range_into(&selected, &store, &mut round_trip).unwrap(),
             data.len()
         );
         assert_eq!(round_trip, data);
@@ -1570,14 +1566,7 @@ mod tests {
             gets: Cell::new(0),
         };
         let mut buf = vec![0u8; 4096];
-        let n = leyline_cdc::read_range_into(
-            &selected.chunks,
-            selected.source_len,
-            &store,
-            mid,
-            &mut buf,
-        )
-        .unwrap();
+        let n = leyline_cdc::read_range_into(&selected, &store, &mut buf).unwrap();
         assert_eq!(store.gets.get(), touched);
         assert_eq!(&buf[..n], &data[mid..mid + n]);
     }

@@ -100,6 +100,21 @@ pub fn collect_unreachable_chunks(conn: &Connection, options: GcOptions) -> Resu
 
     let (remaining_chunk_rows, remaining_chunk_bytes) =
         chunk_totals(&tx, "", "count CDC chunks after GC")?;
+    // The balance the report CLAIMS, enforced inside the transaction rather
+    // than assumed by assignment (types-friend F10). The byte figure is the
+    // one an operator acts on; rows were already ensured above, bytes were
+    // not. Both identities hold on the dry-run path too (deleted = 0,
+    // remaining = before), so no branch.
+    ensure!(
+        before_chunk_rows == deleted_chunk_rows + remaining_chunk_rows,
+        "CDC GC row accounting does not balance: {before_chunk_rows} != \
+         {deleted_chunk_rows} + {remaining_chunk_rows}"
+    );
+    ensure!(
+        before_chunk_bytes == deleted_chunk_bytes + remaining_chunk_bytes,
+        "CDC GC byte accounting does not balance: {before_chunk_bytes} != \
+         {deleted_chunk_bytes} + {remaining_chunk_bytes}"
+    );
     let report = GcReport {
         before_chunk_rows,
         before_chunk_bytes,

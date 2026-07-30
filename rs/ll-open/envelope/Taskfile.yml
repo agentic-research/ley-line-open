@@ -1,0 +1,30 @@
+version: '3'
+
+# Crate-scoped tasks for `leyline-envelope`, included by the root Taskfile
+# under the `envelope:` namespace (same placement rule as rs/ll-open/sign).
+#
+# This pair is the publish path for `leyline_envelope.wasm` (bead
+# ley-line-open-be5f86), joining the a2099a wasm artifacts: browser/edge
+# envelope VERIFICATION for notme + cloister. No feature flags on the build
+# — the crate declares none, and its manifest pins leyline-sign to
+# `default-features = false` precisely so this default build exports ONLY
+# the envelope surface (sign's `#[no_mangle]` exports would otherwise leak
+# into this cdylib's export section).
+
+tasks:
+  wasm:build:
+    desc: Release wasm32 cdylib build of leyline-envelope (verification-only surface)
+    dir: '{{.ROOT_DIR}}/rs'
+    cmds:
+      - cargo build --release -p leyline-envelope --target wasm32-unknown-unknown
+
+  # Same `--ignored` reasoning as sign:wasm:verify — see that task.
+  wasm:verify:
+    desc: Parse WASM_ARTIFACT's export section and assert the exact exported surface
+    dir: '{{.ROOT_DIR}}/rs'
+    vars:
+      WASM_ARTIFACT: '{{.WASM_ARTIFACT | default (printf "%s/rs/target/wasm32-unknown-unknown/release/leyline_envelope.wasm" .ROOT_DIR)}}'
+    env:
+      LEYLINE_WASM_ARTIFACT: '{{.WASM_ARTIFACT}}'
+    cmds:
+      - cargo test -p leyline-envelope --test wasm_export_surface -- --ignored

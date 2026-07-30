@@ -16,6 +16,8 @@ includes:
     taskfile: rs/ll-open/cas-ffi/Taskfile.yml
   cli-lib:
     taskfile: rs/ll-open/cli-lib/Taskfile.yml
+  envelope:
+    taskfile: rs/ll-open/envelope/Taskfile.yml
   fs:
     taskfile: rs/ll-open/fs/Taskfile.yml
   sign:
@@ -157,15 +159,20 @@ tasks:
         # Still asserted against the root file: release:ffi is repo-level
         # release orchestration and has not moved.
         grep -Eq 'cargo build --release --lib -p leyline-fs --features cdc --target' Taskfile.yml
-        # The wasm publish pair (ley-line-open-a2099a): build commands live in
-        # the crate Taskfiles, the deps target and asset names in the release
-        # contract. Feature pins asserted verbatim — `root-signer` ON / `host`
-        # OFF is what keeps the published artifact the documented surface.
+        # The wasm publish set (ley-line-open-a2099a, ley-line-open-be5f86):
+        # build commands live in the crate Taskfiles, the deps target and
+        # asset names in the release contract. Feature pins asserted verbatim
+        # — `root-signer` ON / `host` OFF is what keeps the published sign
+        # artifact the documented surface, and the envelope build is
+        # deliberately pin-free (its manifest's `default-features = false` on
+        # leyline-sign is what keeps ITS export surface verification-only).
         grep -q 'deps:wasm32:' Taskfile.yml
         grep -Eq 'cargo build --release -p leyline-sign --features root-signer --target wasm32-unknown-unknown$' rs/ll-open/sign/Taskfile.yml
         grep -Eq 'cargo build --release -p leyline-cas-ffi --target wasm32-unknown-unknown$' rs/ll-open/cas-ffi/Taskfile.yml
+        grep -Eq 'cargo build --release -p leyline-envelope --target wasm32-unknown-unknown$' rs/ll-open/envelope/Taskfile.yml
         grep -q '^leyline_sign.wasm$' tools/release-assets.txt
         grep -q '^leyline_cas_ffi.wasm$' tools/release-assets.txt
+        grep -q '^leyline_envelope.wasm$' tools/release-assets.txt
         grep -q 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' .github/workflows/release.yml
         grep -q 'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c' .github/workflows/release.yml
         awk '
@@ -314,7 +321,8 @@ tasks:
   deps:wasm32:
     desc: |
       The wasm32-unknown-unknown rustup target the wasm publish artifacts
-      (`sign:wasm:build` / `cas-ffi:wasm:build`) compile against. Idempotent
+      (`sign:wasm:build` / `cas-ffi:wasm:build` / `envelope:wasm:build`)
+      compile against. Idempotent
       — `rustup target add` is a no-op when the target is already installed.
       Single source for release.yml and release-dryrun.yml, same rule as
       every other deps:* target here.
@@ -336,6 +344,7 @@ tasks:
         printf 'header' > "{{.FIXTURE_DIR}}/leyline_fs.h"
         printf 'wasm' > "{{.FIXTURE_DIR}}/leyline_sign.wasm"
         printf 'wasm' > "{{.FIXTURE_DIR}}/leyline_cas_ffi.wasm"
+        printf 'wasm' > "{{.FIXTURE_DIR}}/leyline_envelope.wasm"
       - task: release:artifacts:stage
         vars:
           BUILD_TARGET: fixture-target
@@ -346,7 +355,7 @@ tasks:
           STATICLIB_SOURCE: '{{.FIXTURE_DIR}}/libleyline_fs.a'
           INCLUDE_HEADER: "true"
           HEADER_SOURCE: '{{.FIXTURE_DIR}}/leyline_fs.h'
-          WASM_ASSETS: leyline_sign.wasm leyline_cas_ffi.wasm
+          WASM_ASSETS: leyline_sign.wasm leyline_cas_ffi.wasm leyline_envelope.wasm
           WASM_SOURCE_DIR: '{{.FIXTURE_DIR}}'
       - |
         if command -v dash >/dev/null 2>&1; then

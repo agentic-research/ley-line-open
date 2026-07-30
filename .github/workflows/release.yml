@@ -61,10 +61,11 @@ jobs:
             # --clobber races on the same asset).
             include_header: true
             # wasm_assets present → this job also builds + stages the
-            # platform-independent wasm32 artifacts (ley-line-open-a2099a).
-            # One artifact each for every platform, so exactly one job
-            # carries them — same single-uploader rule as the header.
-            wasm_assets: leyline_sign.wasm leyline_cas_ffi.wasm
+            # platform-independent wasm32 artifacts (ley-line-open-a2099a;
+            # envelope joined under ley-line-open-be5f86). One artifact each
+            # for every platform, so exactly one job carries them — same
+            # single-uploader rule as the header.
+            wasm_assets: leyline_sign.wasm leyline_cas_ffi.wasm leyline_envelope.wasm
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             asset: leyline-linux-arm64
@@ -172,12 +173,14 @@ jobs:
           BUILD_TARGET: ${{ matrix.target }}
         run: task release:generators:target
 
-      # ---- wasm32 artifacts (ley-line-open-a2099a) ----
-      # leyline-sign builds with root-signer ON / host OFF and cas-ffi with
-      # its default (only) surface — the feature pins live in the crate
-      # Taskfiles, not here. The rustup target install is single-sourced in
-      # `task deps:wasm32` (task lint:workflow-parity's rule: workflows
-      # invoke deps targets, they never inline installs).
+      # ---- wasm32 artifacts (ley-line-open-a2099a, ley-line-open-be5f86) ----
+      # leyline-sign builds with root-signer ON / host OFF, cas-ffi with its
+      # default (only) surface, and envelope with its default surface (whose
+      # manifest keeps the export set verification-only) — the feature pins
+      # live in the crate Taskfiles and manifests, not here. The rustup
+      # target install is single-sourced in `task deps:wasm32` (task
+      # lint:workflow-parity's rule: workflows invoke deps targets, they
+      # never inline installs).
       - name: Install wasm32 target
         if: matrix.wasm_assets
         run: task deps:wasm32
@@ -187,6 +190,7 @@ jobs:
         run: |
           task sign:wasm:build
           task cas-ffi:wasm:build
+          task envelope:wasm:build
 
       - name: Stage exact build outputs and checksum manifest
         env:
@@ -218,6 +222,7 @@ jobs:
         run: |
           task sign:wasm:verify WASM_ARTIFACT="$PWD/.artifacts/staged/$ASSET_NAME/leyline_sign.wasm"
           task cas-ffi:wasm:verify WASM_ARTIFACT="$PWD/.artifacts/staged/$ASSET_NAME/leyline_cas_ffi.wasm"
+          task envelope:wasm:verify WASM_ARTIFACT="$PWD/.artifacts/staged/$ASSET_NAME/leyline_envelope.wasm"
 
       # SHA-pinned: actions/upload-artifact@v7.0.1 (Node 24). Build jobs only
       # write workflow artifacts; they never receive release write permission.

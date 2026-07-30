@@ -23,6 +23,7 @@ leyline-mcp-descriptor-darwin-arm64
 leyline-mcp-descriptor-linux-amd64
 leyline-mcp-descriptor-linux-arm64
 leyline_cas_ffi.wasm
+leyline_envelope.wasm
 leyline_fs.h
 leyline_sign.wasm
 libleyline_fs-darwin-arm64.a

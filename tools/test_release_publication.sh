@@ -68,12 +68,13 @@ done
 GENERATOR_SOURCE_DIR="$tmp_dir/generators"
 export GENERATOR_SOURCE_DIR
 
-# Platform-independent wasm artifacts (ley-line-open-a2099a). Deliberately
-# NOT exported: exactly one target job stages them (same single-uploader rule
-# as the header), so they ride only on the linux-amd64 invocation below.
-# Fabricated bytes for the same reason as the generators — the property under
-# test is the staging contract, not the compiler.
-wasm_assets='leyline_sign.wasm leyline_cas_ffi.wasm'
+# Platform-independent wasm artifacts (ley-line-open-a2099a; envelope joined
+# under ley-line-open-be5f86). Deliberately NOT exported: exactly one target
+# job stages them (same single-uploader rule as the header), so they ride
+# only on the linux-amd64 invocation below. Fabricated bytes for the same
+# reason as the generators — the property under test is the staging contract,
+# not the compiler.
+wasm_assets='leyline_sign.wasm leyline_cas_ffi.wasm leyline_envelope.wasm'
 mkdir -p "$tmp_dir/wasm"
 for wasm_asset in $wasm_assets; do
     make_source "$tmp_dir/wasm/$wasm_asset" 'wasm'
@@ -155,6 +156,15 @@ expect_failure missing-file \
 case_dir=$(mutation_case missing-wasm)
 rm "$case_dir/leyline_sign.wasm"
 expect_failure missing-wasm \
+    "$repo_root/tools/verify_public_release.sh" "$case_dir" "$assets_file"
+
+# One case per wasm asset, not one shared case: a single multi-removal run
+# would pass as long as ANY missing artifact is noticed, leaving the others
+# free to vanish undetected. The envelope artifact is the newest and so the
+# likeliest to be dropped from a build matrix edit (ley-line-open-be5f86).
+case_dir=$(mutation_case missing-wasm-envelope)
+rm "$case_dir/leyline_envelope.wasm"
+expect_failure missing-wasm-envelope \
     "$repo_root/tools/verify_public_release.sh" "$case_dir" "$assets_file"
 
 case_dir=$(mutation_case extra-file)

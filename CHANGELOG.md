@@ -31,26 +31,42 @@ context, scoping notes, and review history are recoverable.
   distinct `UnsignedStatement` that structurally cannot grow a
   `signatures` field), PAE prefix-injection falsifiers, an explicit
   falsifier for the compact-payload-vs-pretty-disk-digest gotcha,
-  wasm32-unknown-unknown green. The envelope wasm publish artifact joins
-  the release pipeline in a follow-up alongside the a2099a wasm work.
+  wasm32-unknown-unknown green. The envelope wasm publish artifact ships
+  in this release alongside the a2099a wasm assets: `leyline_envelope.wasm`
+  (`ley-line-open-be5f86`) exports a verification-only extern-C surface —
+  `envelope_verify` returns the authenticated payload bytes exactly as
+  signed (plus `envelope_alloc`/`envelope_free` linear-memory helpers) with
+  distinct error codes for caller-side input problems (`-1`), malformed
+  envelopes (`-2`), and signatures that do not verify (`-3`). Signing is
+  deliberately NOT exported over FFI — key material never belongs in the
+  browser/edge consumer — and leyline-sign's extern-C exports moved behind
+  a new default-ON `ffi` feature so the envelope artifact cannot re-export
+  sign's entry points (`#[no_mangle]` symbols from an rlib dependency leak
+  into a dependent cdylib's export section; the envelope manifest pins
+  `default-features = false`).
 
-- **wasm32 artifacts join the release** (`ley-line-open-a2099a`). Every
-  release now publishes two platform-independent WebAssembly modules in the
-  SHA256SUMS-verified asset set: `leyline_sign.wasm` (the CMS/cert-chain
-  verifier surface — built `--features root-signer`, `host` off, so signed-Σ
-  root verification is reachable from browsers/workerd while the host daemon
-  stays native-only) and `leyline_cas_ffi.wasm` (the substrate BLAKE3
-  `leyline_hash_bytes` entry point). Consumers bind the exports by name:
-  `leyline_sign.wasm` exports `lsign_alloc`/`lsign_free` (linear-memory
-  helpers), `leyline_sign_data`, `leyline_sign_data_without_attributes`,
-  `leyline_verify`, and `leyline_verify_cert_chain`; `leyline_cas_ffi.wasm`
-  exports `leyline_hash_bytes`. That exact surface is enforced at staging
-  time by a wasmparser-based export-section parse
-  (`tests/wasm_export_surface.rs` in each crate, run via
-  `task sign:wasm:verify` / `task cas-ffi:wasm:verify` against the staged
-  bytes), and the artifacts' integrity by the release SHA256SUMS like every
-  other asset. Local builds: `task deps:wasm32`, then `task sign:wasm:build`
-  / `task cas-ffi:wasm:build`.
+- **wasm32 artifacts join the release** (`ley-line-open-a2099a`,
+  `ley-line-open-be5f86`). Every release now publishes three
+  platform-independent WebAssembly modules in the SHA256SUMS-verified asset
+  set: `leyline_sign.wasm` (the CMS/cert-chain verifier surface — built
+  `--features root-signer`, `host` off, so signed-Σ root verification is
+  reachable from browsers/workerd while the host daemon stays native-only),
+  `leyline_cas_ffi.wasm` (the substrate BLAKE3 `leyline_hash_bytes` entry
+  point), and `leyline_envelope.wasm` (DSSE envelope verification for
+  notme/cloister browser + edge consumers). Consumers bind the exports by
+  name: `leyline_sign.wasm` exports `lsign_alloc`/`lsign_free`
+  (linear-memory helpers), `leyline_sign_data`,
+  `leyline_sign_data_without_attributes`, `leyline_verify`, and
+  `leyline_verify_cert_chain`; `leyline_cas_ffi.wasm` exports
+  `leyline_hash_bytes`; `leyline_envelope.wasm` exports `envelope_verify`
+  plus `envelope_alloc`/`envelope_free` — verification only, no signing
+  entry points. That exact surface is enforced at staging time by a
+  wasmparser-based export-section parse (`tests/wasm_export_surface.rs` in
+  each crate, run via `task sign:wasm:verify` / `task cas-ffi:wasm:verify`
+  / `task envelope:wasm:verify` against the staged bytes), and the
+  artifacts' integrity by the release SHA256SUMS like every other asset.
+  Local builds: `task deps:wasm32`, then `task sign:wasm:build` /
+  `task cas-ffi:wasm:build` / `task envelope:wasm:build`.
 
 - **Verify-on-fault arena serving** (`ley-line-open-b6a4dd`, second half —
   the outboard tree primitive shipped in v0.13.0's `leyline_core::outboard`).

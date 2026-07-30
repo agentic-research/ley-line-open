@@ -628,17 +628,23 @@ mod tests {
             "a 4MB stream must split into many content-defined chunks, got {}",
             chunks.len()
         );
+        // Literal bounds, deliberately NOT the consts: a test that compares
+        // against MIN_CHUNK/MAX_CHUNK moves its goalposts when the const
+        // moves — mutation testing proved `8 * 1024`→`8 + 1024` survived the
+        // whole suite exactly because every falsifier re-read the mutated
+        // value. The xet floor/ceiling are the spec, so they appear here as
+        // the spec's numbers.
         for (i, c) in chunks.iter().enumerate() {
             let is_last = i == chunks.len() - 1;
             assert!(
-                c.len <= MAX_CHUNK,
-                "chunk {i} exceeds MAX_CHUNK ({})",
+                c.len <= 128 * 1024,
+                "chunk {i} exceeds the 128 KiB ceiling ({})",
                 c.len
             );
             if !is_last {
                 assert!(
-                    c.len >= MIN_CHUNK,
-                    "interior chunk {i} below MIN_CHUNK ({})",
+                    c.len >= 8 * 1024,
+                    "interior chunk {i} below the 8 KiB floor ({})",
                     c.len
                 );
             }

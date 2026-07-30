@@ -178,6 +178,11 @@ impl Outboard {
             let lo = (lo_leaf >> k).min(cur.len());
             let hi = (((hi_leaf_exclusive - 1) >> k) + 1).min(cur.len());
             for i in lo..hi {
+                // Counted: "exactly the dirty path" is a work claim, and
+                // work claims are asserted on counts (the RechunkStats
+                // discipline) — a superset refresh recomputes identical
+                // values, so nothing but the counter can catch it.
+                self.merges.set(self.merges.get() + 1);
                 cur[i] =
                     hazmat::merge_subtrees_non_root(&prev[2 * i], &prev[2 * i + 1], Mode::Hash);
             }
@@ -239,7 +244,10 @@ impl Outboard {
             };
             for index in first_chunk..last_chunk_exclusive {
                 let start = index * CHUNK_LEN;
-                let end = (start + CHUNK_LEN).min(data.len());
+                // saturating: the clamp must see a real value, not a wrapped
+                // one, even for buffers near usize::MAX (F8's checked-ops
+                // convention; unreachable on real hardware, free to close).
+                let end = data.len().min(start.saturating_add(CHUNK_LEN));
                 self.levels[0][index] = leaf_cv(index, &data[start..end]);
             }
             self.propagate(first_chunk, last_chunk_exclusive);
@@ -251,7 +259,7 @@ impl Outboard {
             self.levels[0].truncate(first);
             for index in first..n_chunks {
                 let start = index * CHUNK_LEN;
-                let end = (start + CHUNK_LEN).min(data.len());
+                let end = data.len().min(start.saturating_add(CHUNK_LEN));
                 let cv = leaf_cv(index, &data[start..end]);
                 self.levels[0].push(cv);
             }
@@ -296,8 +304,9 @@ impl Outboard {
     }
 
     /// Merges performed by the most recent [`Outboard::root`] call (and
-    /// any [`Outboard::prove`] calls since). The test observable for the
-    /// interior cache's O(log n) claim — asserted, not narrated.
+    /// any [`Outboard::prove`] or [`Outboard::update`] calls since). The
+    /// test observable for the interior cache's O(log n) claim and for
+    /// update's dirty-path-only claim — asserted, not narrated.
     pub fn merges_since_last_root(&self) -> usize {
         self.merges.get()
     }
@@ -459,6 +468,21 @@ mod tests {
             // Odd (non-power-of-two) chunk counts exercise the uneven split.
             sizes.push((chunks + 1) * CHUNK_LEN + 7);
         }
+        // Spine shapes whose remainder exceeds 1 AND whose interior right
+        // subtrees start at multiples of their own non-power-of-two count
+        // (15 chunks → subtree over chunks [12, 15): start 12, count 3).
+        // Mutation testing proved the `2^k+1` shapes above never exercise
+        // the cache-lookup guard for that case: a `&&`→`||` mutant in
+        // cached_cv survived the whole suite until these landed.
+        for chunks in [7usize, 11, 15, 23, 31] {
+            sizes.push(chunks * CHUNK_LEN + 5);
+        }
+        // 60 chunks (no tail): the recursion reaches the subtree over chunks
+        // [48, 60) — start 48 IS a multiple of count 12 while 12 is NOT a
+        // power of two, the one disjunct combination the shapes above never
+        // produce. An `&&`→`||` mutant in cached_cv's guard turns that call
+        // into a level-2 cache hit for chunks [48, 52) and corrupts the root.
+        sizes.push(60 * CHUNK_LEN);
         for size in sizes {
             let data = prng_bytes(size as u64 + 1, size);
             assert_eq!(
@@ -500,6 +524,51 @@ mod tests {
             assert_eq!(rehashed, expected, "work must equal the dirty chunk span");
             assert_eq!(ob.root(), blake3_ref(&data), "root diverged after edit");
         }
+
+        // Dirty ranges ending EXACTLY on a chunk boundary: the seeded loop
+        // above never produces one, and `(end - 1) / CHUNK_LEN` is off by a
+        // whole chunk under a `-`→`+` (or `-`→`/`) mutation only at that
+        // alignment — dirty [0, 1024) must rehash 1 chunk, not 2.
+        for (range, expected) in [
+            (0..CHUNK_LEN, 1),
+            (CHUNK_LEN..2 * CHUNK_LEN, 1),
+            (CHUNK_LEN - 1..3 * CHUNK_LEN, 3),
+        ] {
+            data[range.start] ^= 0x5A;
+            let rehashed = ob.update(&data, range.clone()).unwrap();
+            assert_eq!(
+                rehashed, expected,
+                "boundary-aligned dirty range {range:?} rehashed the wrong span"
+            );
+            assert_eq!(ob.root(), blake3_ref(&data));
+        }
+    }
+
+    /// An in-place single-chunk edit refreshes EXACTLY one parent per
+    /// level — the ADR-0031 "exactly the dirty path" claim as a counted
+    /// assertion. A superset refresh recomputes identical CVs, so the
+    /// merge counter is the only observable that can refute it.
+    #[test]
+    fn update_refreshes_exactly_one_parent_per_level() {
+        let mut data = prng_bytes(0xADD, 1024 * CHUNK_LEN);
+        let mut ob = Outboard::build(&data);
+        assert_eq!(ob.root(), blake3_ref(&data));
+        let after_root = ob.merges_since_last_root();
+        assert_eq!(after_root, 1, "power-of-two root is a single merge");
+
+        // Chunk 511 sits mid-tree so both the lo and hi shifts are
+        // load-bearing at every one of the 10 parent levels.
+        data[511 * CHUNK_LEN] ^= 0x77;
+        let rehashed = ob
+            .update(&data, 511 * CHUNK_LEN..511 * CHUNK_LEN + 1)
+            .unwrap();
+        assert_eq!(rehashed, 1);
+        assert_eq!(
+            ob.merges_since_last_root() - after_root,
+            10,
+            "1024 chunks = 10 parent levels; the dirty path is one refresh per level"
+        );
+        assert_eq!(ob.root(), blake3_ref(&data));
     }
 
     /// Length-changing updates re-derive from the edit start onward and
@@ -532,6 +601,66 @@ mod tests {
                 "root diverged after {from} -> {to} byte resize"
             );
         }
+
+        // A resize whose edit starts DEEP in the buffer: the prng cases
+        // above always differ at byte 0, so first_chunk was always 0 and a
+        // `>>`→`<<` mutant in rebuild_parents_from survived — the kept
+        // prefix's cached parents were never load-bearing under resize.
+        let old = prng_bytes(0xB16, 9 * CHUNK_LEN + 100);
+        let mut ob = Outboard::build(&old);
+        let mut new = old[..6 * CHUNK_LEN + 40].to_vec();
+        new.extend_from_slice(&prng_bytes(0xB17, 3 * CHUNK_LEN));
+        let rehashed = ob.update(&new, 6 * CHUNK_LEN + 40..new.len()).unwrap();
+        // 10 post-edit chunks, 6 kept: the resize path's return is a work
+        // claim too — `n_chunks - first`, counted, not just "some number".
+        assert_eq!(rehashed, 4, "resize must re-derive edit-start..end only");
+        assert_eq!(
+            ob.root(),
+            blake3_ref(&new),
+            "late-prefix resize must reuse the kept prefix's cached parents"
+        );
+    }
+
+    /// Accessors are part of the contract too — mutation testing found all
+    /// three replaceable with constants without a single test noticing.
+    #[test]
+    fn accessors_track_the_buffer() {
+        let empty = Outboard::build(&[]);
+        assert_eq!(empty.len(), 0);
+        assert!(empty.is_empty());
+
+        let data = prng_bytes(3, 5 * CHUNK_LEN + 9);
+        let mut ob = Outboard::build(&data);
+        assert_eq!(ob.len(), 5 * CHUNK_LEN + 9);
+        assert!(!ob.is_empty());
+
+        let shrunk = &data[..2 * CHUNK_LEN];
+        ob.update(shrunk, 0..shrunk.len()).unwrap();
+        assert_eq!(ob.len(), 2 * CHUNK_LEN, "len tracks a resize");
+    }
+
+    /// Exact merge counts, not just bounds: a perfect power-of-two tree has
+    /// both root children cached, so root() performs EXACTLY one merge —
+    /// which kills the counter-increment mutants a >=1 bound let live —
+    /// and an uneven tree's spine performs at least two.
+    #[test]
+    fn merge_counts_are_exact_for_known_shapes() {
+        let perfect = prng_bytes(0x101, 1024 * CHUNK_LEN);
+        let ob = Outboard::build(&perfect);
+        assert_eq!(ob.root(), blake3_ref(&perfect));
+        assert_eq!(
+            ob.merges_since_last_root(),
+            1,
+            "a power-of-two tree roots in exactly one (the root) merge"
+        );
+
+        let uneven = prng_bytes(0x102, 1500 * CHUNK_LEN + 3);
+        let ob = Outboard::build(&uneven);
+        assert_eq!(ob.root(), blake3_ref(&uneven));
+        assert!(
+            ob.merges_since_last_root() >= 2,
+            "an uneven spine cannot root in a single merge"
+        );
     }
 
     /// The verify-on-fault primitive: every chunk of a multi-level tree

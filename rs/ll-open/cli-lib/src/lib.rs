@@ -14,6 +14,7 @@ pub mod cmd_load;
 #[cfg(feature = "lsp")]
 pub mod cmd_lsp;
 pub mod cmd_parse;
+pub mod cmd_self;
 pub mod cmd_serve;
 pub mod cmd_splice;
 pub mod daemon;
@@ -89,6 +90,40 @@ pub enum CdcCommands {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// Self-management subcommands (bead ley-line-open-321ded, rustup/uv
+/// model — the binary owns its own install/update instead of every
+/// consumer's Taskfile reinventing a copy step; see `cmd_self` for the
+/// full contract).
+#[derive(Debug, Subcommand)]
+pub enum SelfCommands {
+    /// Copy the running executable into a stable install dir
+    /// (default ~/.local/bin; $LEYLINE_INSTALL_DIR overrides the
+    /// default; --bin-dir wins over both). Idempotent and atomic.
+    /// Prints the PATH export line if the dir is off PATH — never
+    /// edits rc files.
+    Install {
+        /// Target directory for the binary (wins over $LEYLINE_INSTALL_DIR).
+        #[arg(long)]
+        bin_dir: Option<PathBuf>,
+    },
+
+    /// Download a release, verify its SHA256SUMS digest, and atomically
+    /// replace the installed binary (previous kept as leyline.prev).
+    Update {
+        /// Pin a release tag (e.g. v0.13.0). Defaults to the latest release.
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Allow downgrades and same-version reinstalls.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Print the resolved install dir, whether it is on PATH, and the
+    /// running binary's path.
+    Where,
 }
 
 /// Subcommands provided by ley-line open.
@@ -222,6 +257,17 @@ pub enum Commands {
         timeout: Option<String>,
     },
 
+    /// Manage this binary's own installation: install, update, where.
+    //
+    // Bead ley-line-open-321ded. Doc comment above is user-facing help
+    // text; this note is not: `Self` is a Rust keyword, so the variant
+    // is `SelfManage` with the CLI token pinned to `self` explicitly.
+    #[command(name = "self")]
+    SelfManage {
+        #[command(subcommand)]
+        command: SelfCommands,
+    },
+
     /// Check environment: which bundled LSP language servers are on
     /// PATH and which languages will fall back to tree-sitter-only.
     /// Exit code 0 if every bundled language has its server; nonzero if
@@ -346,6 +392,22 @@ pub async fn run(cmd: Commands) -> Result<()> {
                 anyhow::bail!("serve requires the 'mount' feature (compile with --features mount)")
             }
         }
+        Commands::SelfManage { command } => {
+            // Process env, current exe, and the release endpoints are
+            // captured HERE, at the imperative boundary — cmd_self is
+            // pure over SelfContext so its whole surface (including the
+            // digest-refusal path) tests against file:// fixtures.
+            let ctx = cmd_self::SelfContext::from_process();
+            match command {
+                SelfCommands::Install { bin_dir } => {
+                    cmd_self::self_install(&ctx, bin_dir.as_deref()).map(|_| ())
+                }
+                SelfCommands::Update { version, force } => {
+                    cmd_self::self_update(&ctx, version.as_deref(), force).map(|_| ())
+                }
+                SelfCommands::Where => cmd_self::self_where(&ctx).map(|_| ()),
+            }
+        }
         #[cfg(feature = "lsp")]
         Commands::Doctor {
             json,
@@ -386,5 +448,46 @@ mod dispatch_tests {
         })
         .await;
         assert!(missing.is_err());
+    }
+
+    /// The `self` token and its three subcommands are the product
+    /// surface consumers script against (`leyline self install` in
+    /// mache's install flow) — pin that clap parses them exactly.
+    #[test]
+    fn self_surface_parses_install_update_where() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Harness {
+            #[command(subcommand)]
+            cmd: Commands,
+        }
+
+        let h = Harness::try_parse_from(["t", "self", "install", "--bin-dir", "/x/bin"]).unwrap();
+        match h.cmd {
+            Commands::SelfManage {
+                command: SelfCommands::Install { bin_dir },
+            } => assert_eq!(bin_dir, Some(PathBuf::from("/x/bin"))),
+            other => panic!("expected self install, got {other:?}"),
+        }
+
+        let h = Harness::try_parse_from(["t", "self", "update", "--version", "v1.2.3", "--force"])
+            .unwrap();
+        match h.cmd {
+            Commands::SelfManage {
+                command: SelfCommands::Update { version, force },
+            } => {
+                assert_eq!(version.as_deref(), Some("v1.2.3"));
+                assert!(force);
+            }
+            other => panic!("expected self update, got {other:?}"),
+        }
+
+        let h = Harness::try_parse_from(["t", "self", "where"]).unwrap();
+        assert!(matches!(
+            h.cmd,
+            Commands::SelfManage {
+                command: SelfCommands::Where
+            }
+        ));
     }
 }

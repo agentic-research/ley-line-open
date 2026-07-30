@@ -36,15 +36,49 @@ pub fn run_doctor(json: bool, allow_missing: bool) -> Result<()> {
     let rows = collect_rows();
     let all_present = rows.iter().all(|r| r.resolved_path.is_some());
 
+    // Bead ley-line-open-321ded: is the RUNNING binary itself reachable
+    // via PATH? mache's `task install` historically parked leyline in
+    // ~/.mache, so a leyline that works when invoked by absolute path
+    // still fails every `which leyline` consumer. Warn-only — an
+    // off-PATH binary is degraded ergonomics, not a broken environment,
+    // so it never flips the exit code (matching `--allow-missing`'s
+    // warn-don't-fail philosophy).
+    let self_ctx = crate::cmd_self::SelfContext::from_process();
+    let binary_status = crate::cmd_self::running_binary_status(&self_ctx);
+
     if json {
         // Machine-readable output for cloister / mache install scripts.
+        let binary = binary_status.as_ref().map(|(path, on_path)| {
+            serde_json::json!({
+                "path": path.display().to_string(),
+                "dir_on_path": on_path,
+            })
+        });
         let out = serde_json::json!({
             "ok": all_present,
             "languages": rows,
+            "binary": binary,
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
         print_human_table(&rows);
+        match &binary_status {
+            Some((path, true)) => {
+                println!("Binary dir on PATH: ✅ {}", path.display());
+            }
+            Some((path, false)) => {
+                let dir = path.parent().unwrap_or(std::path::Path::new("."));
+                println!(
+                    "  ⚠️ this binary's directory is not on PATH ({})",
+                    path.display()
+                );
+                println!(
+                    "     → {}   # or: leyline self install",
+                    crate::cmd_self::path_hint_for(dir, self_ctx.shell.as_deref())
+                );
+            }
+            None => println!("Binary dir on PATH: (could not determine current exe)"),
+        }
     }
 
     if !all_present && !allow_missing {

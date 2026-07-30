@@ -4107,12 +4107,14 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "sha2 0.10.9",
  "sqlite-vec",
  "subtle",
  "tempfile",
  "tokio",
  "tower",
  "tree-sitter",
+ "ureq",
  "which",
 ]
 

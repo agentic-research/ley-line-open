@@ -70,6 +70,14 @@ clap = "4.5"
 # the wasm export section, dev-dep of sign + cas-ffi (ley-line-open-a2099a).
 wasmparser = "0.254.0"
 
+# Self-managing install/update (`leyline self`, bead ley-line-open-321ded).
+# ureq: synchronous one-shot HTTP with rustls — the update path is a
+# single GET, so no tokio wiring or system-OpenSSL linkage belongs at
+# the CLI boundary. sha2: SHA256SUMS digest verification gates every
+# downloaded byte before it may replace an installed binary.
+ureq = { version = "3.3", default-features = false, features = ["rustls"] }
+sha2 = "0.10"
+
 # Cross-crate inlining + single codegen unit so the sheaf hot paths
 # (per-edge δ⁰, sparse matvec, restriction-map composition) vectorize
 # end-to-end without being interrupted by the crate boundary. The

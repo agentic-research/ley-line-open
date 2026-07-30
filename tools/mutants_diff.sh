@@ -66,22 +66,44 @@ echo "mutating $n candidate(s) from the diff"
 # (mcp-descriptor's tests/cli.rs asserts exit codes and stdout), which `-C --lib`
 # excludes by construction. Reporting it missed is TRUE but would fail every PR
 # touching any main.rs, and a gate people learn to ignore has already failed.
-set +e
-cargo mutants --in-diff "$DIFF" -C --lib -E 'replace main'
-rc=$?
-set -e
-
+#
 # Exit 4 is not "a mutant survived" — it is "the baseline suite failed in the
 # scratch tree", so nothing was tested. They need opposite fixes: one is a
 # missing test, the other is a test that cannot run here.
-if [ "$rc" -eq 4 ]; then
-    {
-        echo "BASELINE BROKEN: the unmutated tree failed its own tests in the"
-        echo "                 mutants scratch build, so NOTHING was mutated."
-        echo "                 This is not a surviving mutant. Usually a test"
-        echo "                 reading files outside its crate."
-    } >&2
-    exit 4
+overall=0
+run_slice() {
+    set +e
+    cargo mutants --in-diff "$DIFF" -C --lib -E 'replace main' "$@"
+    rc=$?
+    set -e
+    if [ "$rc" -eq 4 ]; then
+        {
+            echo "BASELINE BROKEN: the unmutated tree failed its own tests in the"
+            echo "                 mutants scratch build, so NOTHING was mutated."
+            echo "                 This is not a surviving mutant. Usually a test"
+            echo "                 reading files outside its crate."
+        } >&2
+        exit 4
+    fi
+    if [ "$rc" -ne 0 ]; then
+        overall=$rc
+    fi
+}
+
+# Feature-gated code is INVISIBLE to a default-features run: a mutant inside
+# `#[cfg(feature = "cdc")]` builds in 0s (the mutated code never compiles),
+# every test trivially passes, and it is reported MISSED — a false survivor
+# on healthy code. This gate failed PR #306 with 24 such phantoms while the
+# feature-correct allowlist run caught all 86 real ones in the same file.
+# leyline-fs's covered modules (chunked.rs, gc.rs) are exactly that shape, so
+# fs files route to their own invocation carrying the same feature set as
+# `mutants:fs`/`mutants:fs-gc`. If another crate ever hides covered code
+# behind non-default features, it needs the same routing — a default-features
+# run structurally cannot test it.
+run_slice --exclude 'll-open/fs/**'
+if grep -qE '^\+\+\+ b/ll-open/fs/.*\.rs$' "$DIFF"; then
+    run_slice --package leyline-fs --test-workspace=false \
+        --no-default-features --features cdc,splice,validate
 fi
 
-exit "$rc"
+exit "$overall"

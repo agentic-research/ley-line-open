@@ -1222,6 +1222,32 @@ mod tests {
         }
     }
 
+    /// The accessor surface is contract too — mutation testing found
+    /// `is_empty`, `chunks`, and `Manifest::source_len` each replaceable
+    /// with a constant without any test noticing (the same round caught
+    /// the outboard accessors the same way).
+    #[test]
+    fn selection_and_manifest_accessors_report_the_parsed_state() {
+        let (chunks, _) = scripted_manifest(&[b"abcdefghij"]);
+
+        let sel = SelectedRange::parse(chunks.clone(), 10, 2, 9).unwrap();
+        assert_eq!(sel.len(), 7);
+        assert!(!sel.is_empty());
+        assert_eq!(
+            sel.chunks(),
+            &chunks[..],
+            "chunks() must expose the selected rows"
+        );
+
+        let empty = SelectedRange::parse(Vec::new(), 10, 10, 10).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
+        assert!(empty.chunks().is_empty());
+
+        let manifest = Manifest::parse(&chunks).unwrap();
+        assert_eq!(manifest.source_len(), 10);
+    }
+
     #[test]
     fn selected_range_validator_rejects_a_reversed_interval() {
         let (chunks, _) = scripted_manifest(&[b"abcdefghij"]);

@@ -93,17 +93,25 @@ use leyline_core::{BlobStore, ContentAddressed, Hash};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Chunk store + per-node manifest. Mirrors the `source_blobs` shape so
-/// everything durable stays inside the one `.db`.
-pub const CONTENT_CHUNKS_DDL: &str = "\
+/// The shared content-addressed chunk pool. Mirrors the `source_blobs` shape
+/// so everything durable stays inside the one `.db`. Split from the per-node
+/// manifest DDL because BOTH activation targets store into it — `nodes`
+/// manifests (this module) and `source_blobs` manifests
+/// ([`crate::blob_chunked`]) address the same rows, which is what makes
+/// identical content reached through either target cost one row.
+pub(crate) const CHUNK_POOL_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS content_chunks (
     chunk_hash  BLOB PRIMARY KEY,
     chunk_bytes BLOB NOT NULL,
     -- Named chunk_len, not byte_len: the manifest's byte_len joins against
     -- this table, and a shared name makes the join predicate ambiguous.
     chunk_len   INTEGER GENERATED ALWAYS AS (length(chunk_bytes)) STORED
-);
+);";
 
+/// Per-node manifest plus its freshness-witness apparatus. This half is
+/// specific to the MUTABLE `nodes` target; the blob target deliberately has
+/// none of it (see `blob_chunked` — existence is freshness there).
+const NODE_MANIFEST_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS content_manifest (
     node_id    TEXT    NOT NULL,
     seq        INTEGER NOT NULL,
@@ -196,7 +204,9 @@ AND m.source_generation = COALESCE(\
 /// pre-generation witness table, and install the generation triggers when
 /// the arena has a `nodes` table to hang them on.
 pub fn create_chunked_content_schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch(CONTENT_CHUNKS_DDL)
+    conn.execute_batch(CHUNK_POOL_DDL)
+        .context("create shared chunk pool")?;
+    conn.execute_batch(NODE_MANIFEST_DDL)
         .context("create chunked content schema")?;
     ensure_generation_infra(conn)
 }
@@ -270,6 +280,14 @@ pub(crate) enum RefreshOutcome {
 
 pub(crate) struct SqliteBlobStore<'tx, 'conn> {
     tx: &'tx Transaction<'conn>,
+}
+
+impl<'tx, 'conn> SqliteBlobStore<'tx, 'conn> {
+    /// Crate-wide constructor: `blob_chunked` stores into and reads from the
+    /// SAME pool as this module, through the same verify-on-read gate.
+    pub(crate) fn new(tx: &'tx Transaction<'conn>) -> Self {
+        Self { tx }
+    }
 }
 
 impl BlobStore for SqliteBlobStore<'_, '_> {
@@ -572,7 +590,7 @@ fn select_range_manifest_sql() -> String {
     )
 }
 
-fn decode_manifest_chunk(
+pub(crate) fn decode_manifest_chunk(
     node_id: &str,
     hash: Vec<u8>,
     offset: i64,
@@ -594,7 +612,7 @@ fn decode_manifest_chunk(
     })
 }
 
-fn sqlite_integer(value: usize, label: &str) -> Result<i64> {
+pub(crate) fn sqlite_integer(value: usize, label: &str) -> Result<i64> {
     i64::try_from(value).with_context(|| format!("{label} exceeds SQLite INTEGER"))
 }
 
@@ -661,7 +679,7 @@ fn select_range_manifest(
 /// Lower bound for the index seek — see [`OVERLAP_PREDICATE`]. No chunk
 /// starting before this point can reach `start`, because CDC caps chunk length
 /// at `MAX_CHUNK`.
-fn seek_floor(start: usize) -> Result<i64> {
+pub(crate) fn seek_floor(start: usize) -> Result<i64> {
     sqlite_integer(
         start.saturating_sub(leyline_cdc::MAX_CHUNK),
         "range seek floor",

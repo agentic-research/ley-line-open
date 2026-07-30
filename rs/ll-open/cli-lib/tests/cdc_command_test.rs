@@ -101,16 +101,53 @@ fn cdc_enable_cli_parses_nested_command_and_options() {
             command:
                 leyline_cli_lib::CdcCommands::Enable {
                     db,
+                    target,
                     batch_size,
                     json,
                 },
         } => {
             assert_eq!(db, std::path::PathBuf::from("graph.db"));
+            // Omitted --target must preserve the original behavior exactly.
+            assert_eq!(target, leyline_cli_lib::CdcTarget::Nodes);
             assert_eq!(batch_size, 8);
             assert!(json);
         }
         _ => panic!("expected cdc enable command"),
     }
+}
+
+#[test]
+fn cdc_enable_cli_parses_the_source_blobs_target() {
+    let cli = TestCli::try_parse_from([
+        "leyline",
+        "cdc",
+        "enable",
+        "--db",
+        "graph.db",
+        "--target",
+        "source-blobs",
+    ])
+    .unwrap();
+    match cli.command {
+        leyline_cli_lib::Commands::Cdc {
+            command: leyline_cli_lib::CdcCommands::Enable { target, .. },
+        } => assert_eq!(target, leyline_cli_lib::CdcTarget::SourceBlobs),
+        _ => panic!("expected cdc enable command"),
+    }
+
+    // A target outside the enum is a parse error, not a runtime branch.
+    assert!(
+        TestCli::try_parse_from([
+            "leyline",
+            "cdc",
+            "enable",
+            "--db",
+            "graph.db",
+            "--target",
+            "capnp_blobs",
+        ])
+        .is_err()
+    );
 }
 
 #[test]
@@ -249,6 +286,8 @@ fn cdc_gc_cli_parses_options_and_formats_stable_json() {
         remaining_chunk_bytes: 400,
         reaped_manifest_rows: 3,
         reaped_manifest_nodes: 1,
+        reaped_blob_manifest_rows: 4,
+        reaped_blob_manifest_blobs: 2,
         dry_run: true,
     };
     let json = leyline_cli_lib::cmd_cdc::format_gc_report(report, true).unwrap();
@@ -259,4 +298,64 @@ fn cdc_gc_cli_parses_options_and_formats_stable_json() {
     // identical to nothing having happened (bead ley-line-open-b5e56f).
     assert_eq!(value["reaped_manifest_rows"], 3);
     assert_eq!(value["reaped_manifest_nodes"], 1);
+    assert_eq!(value["reaped_blob_manifest_rows"], 4);
+    assert_eq!(value["reaped_blob_manifest_blobs"], 2);
+}
+
+#[test]
+fn cdc_blob_report_formats_as_stable_human_and_json_output() {
+    let report = leyline_fs::activation::BlobActivationReport {
+        eligible_blobs: 3,
+        populated_blobs: 2,
+        already_fresh_blobs: 1,
+        skipped_sub_floor_blobs: 9,
+        processed_source_bytes: 99,
+        manifest_rows: 7,
+        unique_chunk_rows: 5,
+        unique_chunk_bytes: 88,
+    };
+    let human = leyline_cli_lib::cmd_cdc::format_blob_report(report, false).unwrap();
+    assert_eq!(
+        human,
+        "CDC source_blobs enabled: eligible=3 populated=2 already_fresh=1 \
+         skipped_sub_floor=9 source_bytes=99 manifest_rows=7 unique_chunks=5 \
+         unique_chunk_bytes=88"
+    );
+
+    let json = leyline_cli_lib::cmd_cdc::format_blob_report(report, true).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["eligible_blobs"], 3);
+    // The counted policy field must survive serialization — it is how an
+    // operator sees the floor doing its job.
+    assert_eq!(value["skipped_sub_floor_blobs"], 9);
+    assert_eq!(value["unique_chunk_bytes"], 88);
+}
+
+#[test]
+fn cdc_blob_progress_formats_as_one_stable_stderr_line() {
+    let line = leyline_cli_lib::cmd_cdc::format_blob_progress(
+        leyline_fs::activation::BlobActivationProgress {
+            visited_blobs: 8,
+            eligible_blobs: 21,
+            populated_blobs: 5,
+            already_fresh_blobs: 3,
+            processed_source_bytes: 4096,
+        },
+    );
+    assert_eq!(
+        line,
+        "CDC source_blobs activation: visited=8/21 populated=5 already_fresh=3 source_bytes=4096"
+    );
+}
+
+#[test]
+fn cdc_enable_source_blobs_rejects_a_database_without_the_table() {
+    let (_temp, db) = seed_projection_file();
+    let error =
+        leyline_cli_lib::cmd_cdc::enable_source_blobs_database(&db, ActivationOptions::default())
+            .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("missing required source_blobs table"),
+        "unexpected error: {error:#}"
+    );
 }

@@ -103,6 +103,41 @@ git -C "$fixture" commit -qm "invalidate receipt"
 )
 test "$(cat "$TASK_COUNT")" -eq 1
 
+# PRE_COMMIT_REMOTE_BRANCH scopes the full gate to pushes that land on main
+# (bead ley-line-open-24b91d): every PR now gets `task ci` on a runner via
+# ci.yml's pull_request trigger, so a push to any other branch can defer to
+# that instead of paying for the full gate on the laptop.
+printf '%s\n' "feature branch push" > "$fixture/tracked.txt"
+git -C "$fixture" add tracked.txt
+git -C "$fixture" commit -qm "invalidate receipt for scoping tests"
+
+# (a) Non-main target: the full gate is deferred to PR CI, task ci does not
+# run (TASK_COUNT stays untouched), and the hook exits 0.
+(
+    cd "$fixture"
+    PRE_COMMIT_REMOTE_BRANCH=refs/heads/feature-x TASK_BIN="$fake_task" tools/pre_push_ci.sh
+)
+test "$(cat "$TASK_COUNT")" -eq 1
+
+# (b) main target: gate runs as today.
+(
+    cd "$fixture"
+    PRE_COMMIT_REMOTE_BRANCH=refs/heads/main TASK_BIN="$fake_task" tools/pre_push_ci.sh
+)
+test "$(cat "$TASK_COUNT")" -eq 2
+
+# (c) Variable unset (a raw `git push` outside the pre-commit framework):
+# fail CLOSED to the full gate — a missing signal must never mean "skip".
+printf '%s\n' "raw git push" > "$fixture/tracked.txt"
+git -C "$fixture" add tracked.txt
+git -C "$fixture" commit -qm "invalidate receipt again"
+(
+    cd "$fixture"
+    unset PRE_COMMIT_REMOTE_BRANCH
+    TASK_BIN="$fake_task" tools/pre_push_ci.sh
+)
+test "$(cat "$TASK_COUNT")" -eq 3
+
 # The receipt attests "task ci passed for these INPUTS", and .beads/beads.jsonl
 # is not an input: nothing task ci runs reads it (asserted below against the
 # real repo). A bead filed while task ci runs must therefore not destroy the

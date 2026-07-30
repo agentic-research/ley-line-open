@@ -34,11 +34,32 @@ pub const MIN_CHUNK: usize = 8 * 1024;
 /// if the rolling hash has not matched.
 pub const MAX_CHUNK: usize = 128 * 1024;
 
-/// GearHash boundary mask. A boundary is declared where `hash & MASK == 0`; the
-/// number of set bits sets the expected chunk size (~`2^bits`). 16 bits ⇒ a
-/// ~64 KiB average, xet's target. The exact value is validated empirically by
-/// `chunk_sizes_respect_the_xet_bounds` — we do not assert it, we falsify it.
-const BOUNDARY_MASK: u64 = 0x0000_5890_5303_0000;
+/// GearHash boundary mask. A boundary is declared where `hash & MASK == 0`;
+/// the number of set bits sets the expected boundary spacing (~`2^bits`
+/// bytes), so the expected chunk is `MIN_CHUNK + 2^bits` ≈ 72 KiB — the xet
+/// 64 KiB-class target.
+///
+/// Sixteen HIGH bits: GearHash mixes by `h = (h << 1) + gear[byte]`, so
+/// entropy accumulates toward the high end and the high bits are the
+/// best-mixed predicate surface (upstream masks follow the same
+/// convention).
+///
+/// History (ley-line-open-ae432c): the previous mask claimed "16 bits ⇒
+/// ~64 KiB" while having ELEVEN set bits — a measured mean of ~10 KiB,
+/// 6.4× off, with 6.4× the manifest rows and per-chunk overhead. The test
+/// named as its falsifier checked only the clamp bounds, which both masks
+/// satisfied. Both halves are now mechanized: the bit count is a
+/// compile-time assertion below, and `mean_chunk_size_matches_the_target`
+/// pins the average with a TWO-SIDED band — the only bound shape that can
+/// tell 10 KiB from 64 KiB.
+const BOUNDARY_MASK: u64 = 0xFFFF_0000_0000_0000;
+
+/// The bit count IS the chunk-size target; a mask edit that changes it must
+/// fail the build, not a test someone follows a stale doc pointer to.
+const _: () = assert!(
+    BOUNDARY_MASK.count_ones() == 16,
+    "BOUNDARY_MASK bit count sets the ~2^bits boundary spacing"
+);
 
 /// One content-defined chunk: its σ (BLAKE3) hash and its span in the source.
 ///
@@ -568,6 +589,31 @@ mod tests {
             out.extend_from_slice(&data[c.offset..c.offset + c.len]);
         }
         assert_eq!(out, data, "concatenated chunks must equal the input");
+    }
+
+    /// The distribution falsifier ae432c found missing: a TWO-SIDED band on
+    /// the mean chunk size — the only bound shape that distinguishes the
+    /// documented ~64 KiB-class target from the ~10 KiB the previous
+    /// 11-bit mask actually produced (every clamp-only assertion passed
+    /// both). 16 MiB of PRNG bytes ≈ 280 chunks at the target, enough for
+    /// the mean to concentrate. The band is [48, 80] KiB: the naive
+    /// `MIN + 2^16` = 72 KiB expectation overshoots because the 128 KiB
+    /// ceiling censors the geometric tail (measured: ~58 KiB), and 48 KiB
+    /// still sits nearly 5× above the old defective mean, so the band
+    /// cannot re-admit the failure it exists to exclude.
+    #[test]
+    fn mean_chunk_size_matches_the_target() {
+        let data = prng_bytes(0xAE43_2C00, 16 * 1024 * 1024);
+        let chunks = chunk(&data);
+        let mean = data.len() / chunks.len();
+        assert!(
+            (48 * 1024..=80 * 1024).contains(&mean),
+            "mean chunk size {mean} bytes is outside the 48-80 KiB target \
+             band ({} chunks over {} bytes) — the BOUNDARY_MASK no longer \
+             hits its documented target",
+            chunks.len(),
+            data.len()
+        );
     }
 
     /// The chunker actually fires content-defined boundaries (it is not
@@ -1458,9 +1504,15 @@ mod tests {
             .iter()
             .filter(|c| !old_hashes.contains(&c.hash))
             .count();
+        // O(1) in chunks, and tiny against the total: the edit's chunk,
+        // plus neighbors whose MAX_CHUNK (128 KiB ≈ 2 chunks at the ~58 KiB
+        // measured mean) decision window overlaps it, plus the resync
+        // chunk. Recalibrated from <=3 when ae432c moved the mean from
+        // ~10 KiB to the xet-class target — the locality guarantee is the
+        // invariant, not the old mean's constant.
         assert!(
-            rehashed <= 3,
-            "a 3-byte edit should force rehashing <=3 of {} chunks, forced {rehashed}",
+            rehashed <= 5,
+            "a 3-byte edit should force rehashing <=5 of {} chunks, forced {rehashed}",
             incremental.len()
         );
     }

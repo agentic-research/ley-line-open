@@ -60,6 +60,11 @@ jobs:
             # Upload the C header from exactly one job (avoids 3-way
             # --clobber races on the same asset).
             include_header: true
+            # wasm_assets present → this job also builds + stages the
+            # platform-independent wasm32 artifacts (ley-line-open-a2099a).
+            # One artifact each for every platform, so exactly one job
+            # carries them — same single-uploader rule as the header.
+            wasm_assets: leyline_sign.wasm leyline_cas_ffi.wasm
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             asset: leyline-linux-arm64
@@ -167,6 +172,22 @@ jobs:
           BUILD_TARGET: ${{ matrix.target }}
         run: task release:generators:target
 
+      # ---- wasm32 artifacts (ley-line-open-a2099a) ----
+      # leyline-sign builds with root-signer ON / host OFF and cas-ffi with
+      # its default (only) surface — the feature pins live in the crate
+      # Taskfiles, not here. The rustup target install is single-sourced in
+      # `task deps:wasm32` (task lint:workflow-parity's rule: workflows
+      # invoke deps targets, they never inline installs).
+      - name: Install wasm32 target
+        if: matrix.wasm_assets
+        run: task deps:wasm32
+
+      - name: Build wasm artifacts
+        if: matrix.wasm_assets
+        run: |
+          task sign:wasm:build
+          task cas-ffi:wasm:build
+
       - name: Stage exact build outputs and checksum manifest
         env:
           BUILD_TARGET: ${{ matrix.target }}
@@ -183,7 +204,20 @@ jobs:
             capnpc-schema-bridge-jsonschema
             capnpc-schema-bridge-tooldefs
             leyline-mcp-descriptor
+          WASM_ASSETS: ${{ matrix.wasm_assets }}
         run: task release:artifacts:stage
+
+      # Against the STAGED bytes, not the build output — what this proves is
+      # that the files entering the SHA256SUMS chain export the surface
+      # consumers bind by name (a real wasmparser parse of the export
+      # section; see rs/ll-open/sign/tests/wasm_export_surface.rs).
+      - name: Verify staged wasm export surface
+        if: matrix.wasm_assets
+        env:
+          ASSET_NAME: ${{ matrix.asset }}
+        run: |
+          task sign:wasm:verify WASM_ARTIFACT="$PWD/.artifacts/staged/$ASSET_NAME/leyline_sign.wasm"
+          task cas-ffi:wasm:verify WASM_ARTIFACT="$PWD/.artifacts/staged/$ASSET_NAME/leyline_cas_ffi.wasm"
 
       # SHA-pinned: actions/upload-artifact@v7.0.1 (Node 24). Build jobs only
       # write workflow artifacts; they never receive release write permission.

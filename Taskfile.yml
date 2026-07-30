@@ -12,6 +12,8 @@ version: '3'
 # not parse Taskfiles textually (ed356d7) — that was changed FIRST, precisely so
 # moving a task out of this file could not silently drop its feature coverage.
 includes:
+  cas-ffi:
+    taskfile: rs/ll-open/cas-ffi/Taskfile.yml
   cli-lib:
     taskfile: rs/ll-open/cli-lib/Taskfile.yml
   fs:
@@ -155,6 +157,15 @@ tasks:
         # Still asserted against the root file: release:ffi is repo-level
         # release orchestration and has not moved.
         grep -Eq 'cargo build --release --lib -p leyline-fs --features cdc --target' Taskfile.yml
+        # The wasm publish pair (ley-line-open-a2099a): build commands live in
+        # the crate Taskfiles, the deps target and asset names in the release
+        # contract. Feature pins asserted verbatim — `root-signer` ON / `host`
+        # OFF is what keeps the published artifact the documented surface.
+        grep -q 'deps:wasm32:' Taskfile.yml
+        grep -Eq 'cargo build --release -p leyline-sign --features root-signer --target wasm32-unknown-unknown$' rs/ll-open/sign/Taskfile.yml
+        grep -Eq 'cargo build --release -p leyline-cas-ffi --target wasm32-unknown-unknown$' rs/ll-open/cas-ffi/Taskfile.yml
+        grep -q '^leyline_sign.wasm$' tools/release-assets.txt
+        grep -q '^leyline_cas_ffi.wasm$' tools/release-assets.txt
         grep -q 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' .github/workflows/release.yml
         grep -q 'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c' .github/workflows/release.yml
         awk '
@@ -300,6 +311,16 @@ tasks:
     cmds:
       - cargo install cargo-mutants --locked
 
+  deps:wasm32:
+    desc: |
+      The wasm32-unknown-unknown rustup target the wasm publish artifacts
+      (`sign:wasm:build` / `cas-ffi:wasm:build`) compile against. Idempotent
+      — `rustup target add` is a no-op when the target is already installed.
+      Single source for release.yml and release-dryrun.yml, same rule as
+      every other deps:* target here.
+    cmds:
+      - rustup target add wasm32-unknown-unknown
+
   release:artifacts:fixture-test:
     desc: Prove staged release manifests accept exact bytes and reject corruption
     vars:
@@ -313,6 +334,8 @@ tasks:
         chmod +x "{{.FIXTURE_DIR}}/leyline"
         printf 'staticlib' > "{{.FIXTURE_DIR}}/libleyline_fs.a"
         printf 'header' > "{{.FIXTURE_DIR}}/leyline_fs.h"
+        printf 'wasm' > "{{.FIXTURE_DIR}}/leyline_sign.wasm"
+        printf 'wasm' > "{{.FIXTURE_DIR}}/leyline_cas_ffi.wasm"
       - task: release:artifacts:stage
         vars:
           BUILD_TARGET: fixture-target
@@ -323,6 +346,8 @@ tasks:
           STATICLIB_SOURCE: '{{.FIXTURE_DIR}}/libleyline_fs.a'
           INCLUDE_HEADER: "true"
           HEADER_SOURCE: '{{.FIXTURE_DIR}}/leyline_fs.h'
+          WASM_ASSETS: leyline_sign.wasm leyline_cas_ffi.wasm
+          WASM_SOURCE_DIR: '{{.FIXTURE_DIR}}'
       - |
         if command -v dash >/dev/null 2>&1; then
           OUTPUT_DIR="{{.FIXTURE_DIR}}/artifacts/leyline-test-dash-amd64" \
@@ -561,6 +586,12 @@ tasks:
       # `leyline-darwin-arm64` -> `darwin-arm64`, so a generator asset reads
       # `capnpc-schema-bridge-zod-darwin-arm64` and matches the CLI's scheme.
       GENERATOR_SUFFIX: '{{.GENERATOR_SUFFIX | default (trimPrefix "leyline-" .ASSET_NAME)}}'
+      # Platform-independent wasm32 artifacts (ley-line-open-a2099a), staged
+      # as-is with no per-target suffix — one artifact each for every
+      # platform, so exactly ONE release job sets this (same single-uploader
+      # rule as INCLUDE_HEADER). Empty by default.
+      WASM_ASSETS: '{{.WASM_ASSETS | default ""}}'
+      WASM_SOURCE_DIR: '{{.WASM_SOURCE_DIR | default (printf "%s/rs/target/wasm32-unknown-unknown/release" .ROOT_DIR)}}'
     cmds:
       - |
         set -eu

@@ -160,3 +160,7 @@ tempfile = { workspace = true }
 # the "I mutate this env var" property compile-checked-by-label across
 # the test suite, not just an inline SAFETY comment.
 serial_test = "3"
+# Export-surface gate for the published leyline_sign.wasm (bead
+# ley-line-open-a2099a): tests/wasm_export_surface.rs parses the real
+# export section of the built artifact, run via `task sign:wasm:verify`.
+wasmparser = { workspace = true }

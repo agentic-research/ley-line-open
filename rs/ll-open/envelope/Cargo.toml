@@ -1,0 +1,29 @@
+[package]
+name = "leyline-envelope"
+version = "0.13.0"
+edition = "2024"
+description = "DSSE envelope + in-toto Statement v1 attestation over the leyline-sign signer — one signing implementation for every runtime, wasm included (bead ley-line-open-319a08; byte-compatible hoist of rosary's dsse.rs)"
+repository = "https://github.com/agentic-research/ley-line-open"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+# Signing composes over the substrate's signer surface (`Ed25519RootSigner`,
+# ADR-012 canonical kid). The envelope crate never takes raw key bytes in its
+# API — key material handling stays in leyline-sign; consumers keep only key
+# CONFIGURATION (where the key comes from) on their side. `root-signer` is
+# deliberately wasm-reachable (verified by leyline-sign's own wasm32 build),
+# so the whole sign+verify path works in a browser.
+leyline-sign = { path = "../sign", version = "0.13.0", features = ["root-signer"] }
+# Signature/Verifier types for the verify path. Same major as leyline-sign's
+# so `VerifyingKey` re-exported from there is the same type callers hand us.
+ed25519-dalek = "3"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+# base64url-no-pad payload/sig encoding, per the DSSE spec. The engine's
+# strict decode (canonical-only, no trailing bits) is load-bearing: it makes
+# encode(decode(s)) == s, so a parsed envelope re-serializes byte-identically.
+base64 = "0.22"
+# in-toto subject digests are sha256 (rosary wire compat), not σ/BLAKE3.
+sha2 = "0.11"
+hex = { workspace = true }
+thiserror = { workspace = true }

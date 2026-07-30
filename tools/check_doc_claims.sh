@@ -36,12 +36,14 @@ done
 
 # --- Claim 2: the SHA-256 exception set matches the code ---------------------
 #
-# Sigma is BLAKE3-locked (ADR-0032 D5). Exactly one crate may carry sha2 as a
-# real dependency: leyline-sign, whose canonical_kid is an INTEROP identifier
-# owned by signet's ADR-012, not a substrate address. If that set changes, the
-# documented exception is stale and must be rewritten rather than quietly
-# broadened.
-expected_sha2_crates="rs/ll-open/sign/Cargo.toml"
+# Sigma is BLAKE3-locked (ADR-0032 D5). Exactly two crates may carry sha2 as
+# a real dependency, both for INTEROP identifiers owned by external specs
+# rather than substrate addresses: leyline-sign (canonical_kid lineage,
+# signet ADR-012) and leyline-envelope (in-toto Statement v1 subject digests
+# — the in-toto spec names sha256, and rosary byte-compat requires computing
+# it; bead be5f86). If this set changes, the documented exception in
+# ADR-0032 D5 is stale and must be rewritten rather than quietly broadened.
+expected_sha2_crates="rs/ll-open/envelope/Cargo.toml rs/ll-open/sign/Cargo.toml"
 actual_sha2_crates=$(
   find "$root/rs" -name Cargo.toml -not -path '*/target/*' -not -path '*worktree*' 2>/dev/null \
     | while read -r f; do

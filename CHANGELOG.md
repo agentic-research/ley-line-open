@@ -19,6 +19,20 @@ under branch protection — the merge that produced it required a green
 
 ### Fixed
 
+- **A small edit no longer re-hashes the entire file** (`ley-line-open-f8ebe7`).
+  The incremental re-chunk computed the right answer and the manifest store
+  threw the work away: it received a bare chunk list, and a content-addressed
+  `put` must hash to derive its key — so a 3-byte edit to a 4 MB body paid a
+  full 4 MB BLAKE3 pass while `bytes_scanned` reported the boundary scanner's
+  bounded work one layer down. The store now receives the rescan window;
+  carried-over rows are verified by existence probe, never re-hashed. Found by
+  a type-driven-correctness review; load-bearing for sub-file consumers (LL
+  wire CDC, mache dataflow). The trade the old re-hash silently funded —
+  it was the only enforcement of edit-coordinate honesty — is carried openly:
+  `leyline_cdc::Edit` is a parse type (reversed/out-of-bounds intervals are
+  unrepresentable), and the graph write path falls back to a full re-chunk
+  whenever its UTF-8-lossy conversion changed the bytes.
+
 - **The release workflow's image job installs capnproto** (`ley-line-open-e44960`).
   v0.12.1's image jobs failed on `capnp codegen failed (is capnp on PATH?)` —
   `leyline-schema-capnp`'s build script shells out to the capnp compiler, and
@@ -69,7 +83,35 @@ under branch protection — the merge that produced it required a green
   reachable set before issuing any verdict — proving the two path universes
   coincide instead of trusting that they do.
 
+### Changed
+
+- **`leyline-cdc`'s read and rechunk APIs take parsed types**
+  (`ley-line-open-b86699`, clean pre-1.0 break). `rechunk` takes
+  `Edit::parse(offset, old_end, old_len)` instead of three transposable
+  `usize`s. `read_range_into` takes a `SelectedRange` — parse-don't-validate;
+  the read performs no second validation pass and its arithmetic is total
+  under the type. `read_range`/`reconstruct` take a `Manifest`, making the
+  previously undocumented complete-tiling precondition a signature. Also from
+  the same review: `chunk_into` verifies stored hashes with `ensure!` in
+  release builds (was debug-only), GC's byte-accounting balance is enforced
+  in-transaction, `chunked_content_len` refuses negative lengths instead of
+  wrapping, and `ContentSource::Empty` replaces the fabricated `Record`
+  answer for zero-length reads.
+
 ### Added
+
+- **`leyline_core::outboard` — incremental BLAKE3 root maintenance and
+  per-chunk inclusion proofs** (`ley-line-open-b6a4dd`, the content-address
+  half of the sub-file premise). Built on `blake3::hazmat`, so the chaining
+  values and merges are the reference implementation's own: `root()` is
+  bit-identical to `blake3::hash` of the buffer, pinned across every tree
+  boundary shape. In-place edits re-hash only their dirtied 1 KiB chunks and
+  refresh only the dirty ancestor path (interior nodes are cached per level —
+  restriction-addressed caching at its fixed point, where the cache key IS
+  the cached value); `root()` after an edit is O(log n) merges, asserted on a
+  live counter. `prove`/`verify_chunk` are the per-page verify-on-fault
+  primitive: any chunk verifies against the root alone. Mount wiring is the
+  bead's tracked remaining half.
 
 - **MCP wire-protocol facts are generated from a digest-pinned schema**
   (`ley-line-open-60f0d3`). LLO hand-mirrored MCP protocol facts and one went

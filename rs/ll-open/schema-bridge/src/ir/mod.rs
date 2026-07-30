@@ -146,6 +146,16 @@ pub enum FieldType {
     // representable without making FieldType itself recursive at the
     // type level.
     List(Box<FieldType>),
+    // A string-keyed dictionary, carried on the wire as `List(Entry)`
+    // where `Entry` is `{ key :Text, value :T }` and the field is marked
+    // `$Map`. The boxed type is the VALUE type; the key is always Text,
+    // because that is the only key JSON can express and every emit target
+    // here is JSON-facing.
+    //
+    // Capnp has no map, so this exists only in the IR and above. The wire
+    // stays `List(Entry)`; what changes is that targets with a native map
+    // emit one instead of an array, which keeps a lookup a lookup.
+    Map(Box<FieldType>),
 }
 
 // Top-level `const Name :Type = value;` declaration. The capnp parser

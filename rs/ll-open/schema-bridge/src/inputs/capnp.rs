@@ -83,6 +83,7 @@ const ANN_TRAITS_OP: u64 = 0xd3b652fd6a4debed;
 const ANN_TRAITS_DOC: u64 = 0xd3b652fd6a4debee;
 const ANN_TRAITS_OPTIONAL: u64 = 0xd3b652fd6a4debef;
 const ANN_TRAITS_DEFAULT: u64 = 0xd3b652fd6a4debf0;
+const ANN_TRAITS_MAP: u64 = 0xd3b652fd6a4debf1;
 
 // An annotation id we don't lower → the same loud UnmappedConstruct the
 // old blanket `check_annotations` produced, with the same `kind` string
@@ -106,6 +107,9 @@ struct FieldAnnotations {
     doc: Option<String>,
     optional: bool,
     default: Option<String>,
+    // `$Map` — render this `List(Entry)` field as a string-keyed
+    // dictionary rather than an array. See `_traits.capnp`.
+    map: bool,
 }
 
 // Lower the `_traits` annotations on a base data field: `$Doc`,
@@ -118,6 +122,7 @@ fn parse_field_annotations(
         doc: None,
         optional: false,
         default: None,
+        map: false,
     };
     for ann in annotations.iter() {
         match ann.get_id() {
@@ -125,6 +130,7 @@ fn parse_field_annotations(
             // `$Optional` is a Void annotation — presence is the signal.
             ANN_TRAITS_OPTIONAL => fa.optional = true,
             ANN_TRAITS_DEFAULT => fa.default = Some(annotation_text(ann, location)?),
+            ANN_TRAITS_MAP => fa.map = true,
             other => return Err(unmapped_annotation(other, location)),
         }
     }
@@ -270,6 +276,10 @@ pub fn parse(request: schema_capnp::code_generator_request::Reader<'_>) -> Resul
     // (isGroup=true) are skipped at the top level because they're
     // owned by their parent struct, not first-class IR entities.
     let mut schema = Schema::new();
+    // (struct name, field name, location) for every `$Map` field. Lowering
+    // needs the Entry struct, which may be parsed after the field that
+    // references it, so it happens in one pass at the end.
+    let mut map_fields: Vec<(String, String, String)> = Vec::new();
     for node in nodes.iter() {
         let location = format!("node id={:x}", node.get_id());
         match node.which()? {
@@ -288,6 +298,7 @@ pub fn parse(request: schema_capnp::code_generator_request::Reader<'_>) -> Resul
                     &enum_names,
                     &node_by_id,
                     &location,
+                    &mut map_fields,
                 )?);
             }
             schema_capnp::node::Which::Enum(e) => {
@@ -321,7 +332,94 @@ pub fn parse(request: schema_capnp::code_generator_request::Reader<'_>) -> Resul
         }
     }
 
+    lower_map_fields(&mut schema, &map_fields)?;
     Ok(schema)
+}
+
+/// Rewrite every `$Map`-annotated field from `List(Entry)` to `Map(value)`.
+///
+/// The shape is checked rather than assumed: the field must be a list of a
+/// struct carrying exactly `key :Text` and `value :T`. Anything else is a
+/// loud error, because a `$Map` on a field that is not entry-shaped is a
+/// mistake in the schema and the alternative — quietly leaving it a list —
+/// is the silent-fallback behaviour this crate exists to refuse.
+fn lower_map_fields(schema: &mut Schema, map_fields: &[(String, String, String)]) -> Result<()> {
+    for (struct_name, field_name, location) in map_fields {
+        let entry_name = {
+            let owner = schema
+                .structs
+                .iter()
+                .find(|st| &st.name == struct_name)
+                .ok_or_else(|| {
+                    SchemaBridgeError::SchemaShape(format!(
+                        "{location}: $Map on a field of unknown struct `{struct_name}`"
+                    ))
+                })?;
+            let field = owner
+                .fields
+                .iter()
+                .find(|f| &f.name == field_name)
+                .ok_or_else(|| {
+                    SchemaBridgeError::SchemaShape(format!(
+                        "{location}: $Map field `{field_name}` vanished before lowering"
+                    ))
+                })?;
+            match &field.ty {
+                FieldType::List(inner) => match inner.as_ref() {
+                    FieldType::StructRef(n) => n.clone(),
+                    other => {
+                        return Err(SchemaBridgeError::SchemaShape(format!(
+                            "{location}: $Map requires List(Entry) where Entry is a struct of \
+                             `key :Text` and `value :T`; this list holds {other:?}"
+                        )));
+                    }
+                },
+                other => {
+                    return Err(SchemaBridgeError::SchemaShape(format!(
+                        "{location}: $Map applies to a List(Entry) field; this field is {other:?}"
+                    )));
+                }
+            }
+        };
+
+        let value_ty = {
+            let entry = schema
+                .structs
+                .iter()
+                .find(|st| st.name == entry_name)
+                .ok_or_else(|| SchemaBridgeError::UnresolvedReference {
+                    name: entry_name.clone(),
+                    location: location.clone(),
+                })?;
+            let has_text_key = entry
+                .fields
+                .iter()
+                .any(|f| f.name == "key" && matches!(f.ty, FieldType::Scalar(ScalarType::Text)));
+            let value = entry.fields.iter().find(|f| f.name == "value");
+            match (has_text_key, value) {
+                (true, Some(v)) if entry.fields.len() == 2 => v.ty.clone(),
+                _ => {
+                    return Err(SchemaBridgeError::SchemaShape(format!(
+                        "{location}: $Map entry struct `{entry_name}` must have exactly two \
+                         fields, `key :Text` and `value :T`"
+                    )));
+                }
+            }
+        };
+
+        let owner = schema
+            .structs
+            .iter_mut()
+            .find(|st| &st.name == struct_name)
+            .expect("located above");
+        let field = owner
+            .fields
+            .iter_mut()
+            .find(|f| &f.name == field_name)
+            .expect("located above");
+        field.ty = FieldType::Map(Box::new(value_ty));
+    }
+    Ok(())
 }
 
 fn parse_const<'a>(
@@ -467,6 +565,10 @@ fn decode_list_value(
             location,
         )),
         FieldType::List(_) => Err(SchemaBridgeError::unmapped("const list of list", location)),
+        // A `$Map` field inside a const would need a literal dictionary,
+        // which no schema needs yet. Loud rather than guessed, per the
+        // crate's unmapped-construct invariant.
+        FieldType::Map(_) => Err(SchemaBridgeError::unmapped("const list of map", location)),
     }
 }
 
@@ -644,6 +746,9 @@ fn read_struct_slot<'a>(
 ) -> Result<ConstValue> {
     let off = offset as usize;
     match field_ty {
+        // A dictionary-valued const would need a literal map; nothing
+        // needs one yet, so it stays loud rather than being guessed.
+        FieldType::Map(_) => Err(SchemaBridgeError::unmapped("const of map", location)),
         FieldType::Scalar(ScalarType::Void) => Ok(ConstValue::Void),
         FieldType::Scalar(ScalarType::Bool) => Ok(ConstValue::Bool(sr.get_bool_field(off))),
         FieldType::Scalar(ScalarType::Int8) => {
@@ -740,6 +845,9 @@ fn parse_struct<'a>(
     enum_names: &HashMap<u64, String>,
     node_by_id: &HashMap<u64, schema_capnp::node::Reader<'a>>,
     location: &str,
+    // `$Map` fields, appended as (struct, field, location). Lowered by
+    // `lower_map_fields` once every struct exists.
+    map_fields: &mut Vec<(String, String, String)>,
 ) -> Result<Struct> {
     let name = short_name(node)?;
     // Struct-level `$Doc`/`$Op`; unknown annotations fail loud.
@@ -824,6 +932,15 @@ fn parse_struct<'a>(
                         // schema; the schema overrides the type.
                         default: fann.default.or(native_default),
                     });
+                    if fann.map {
+                        // Resolved after the walk: the Entry struct this
+                        // field points at may not be parsed yet.
+                        map_fields.push((
+                            name.clone(),
+                            fields.last().expect("just pushed").name.clone(),
+                            field_location.clone(),
+                        ));
+                    }
                 }
             }
             schema_capnp::field::Which::Group(g) => {

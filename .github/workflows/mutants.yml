@@ -68,6 +68,17 @@ jobs:
           version: 3.49.1
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # System deps (libfuse for fuser, capnproto + libcapnp-dev for schema
+      # build.rs, libdbus-1-dev for keyring) live in Taskfile deps:ci —
+      # single source across ci.yml/release.yml/release-dryrun.yml/
+      # leyline-schema-go.yml/mutants.yml, enforced by
+      # `task lint:workflow-parity` (bead ley-line-open-e9e5b5). Without this
+      # the diff-scoped BASELINE build fails on any diff touching leyline-fs:
+      # the scratch build compiles fuser, and the runner never installed
+      # libfuse.
+      - name: Install system deps
+        run: task deps:ci
+
       # Installed from source rather than via a prebuilt-binary action: every
       # other action here is SHA-pinned against a commit verified in-repo, and
       # adding an unvetted third-party action to save ~2 min isn't a trade this

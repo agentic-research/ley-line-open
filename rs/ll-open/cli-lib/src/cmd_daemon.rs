@@ -6,7 +6,6 @@
 //!   called by ley-line (private) with its own extension.
 
 use std::path::Path;
-use std::process::Child;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -157,9 +156,8 @@ pub async fn cmd_daemon(config: DaemonConfig) -> Result<()> {
 /// 5. UDS socket spawned (base ops + extension ops)
 /// 6. If `--mount`: mount via NFS/FUSE (omit for headless mode)
 /// 7. `ext.on_post_mount(ctrl_path, router)` — extension spawns background tasks
-/// 8. If mache on PATH: spawn `mache serve --control <ctrl>` as child
-/// 9. Wait for shutdown (Ctrl+C or timeout)
-/// 10. Cleanup (kill mache child, remove socket file)
+/// 8. Wait for shutdown (Ctrl+C or timeout)
+/// 9. Cleanup (remove socket file)
 pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result<()> {
     run_daemon_with_options(config, ext, DaemonOptions::default()).await
 }
@@ -620,33 +618,17 @@ pub async fn run_daemon_with_options(
     // 7. Extension post-mount.
     ext.on_post_mount(&ctrl_path, &router);
 
-    // 8. Auto-spawn mache if on PATH.
-    let mut mache_child: Option<Child> = None;
-    if let Ok(mache_bin) = which::which("mache") {
-        let ctrl_str = ctrl_path.to_string_lossy().to_string();
-        eprintln!(
-            "spawning mache: {} serve --control {}",
-            mache_bin.display(),
-            ctrl_str
-        );
-        match std::process::Command::new(&mache_bin)
-            .args(["serve", "--control", &ctrl_str])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-        {
-            Ok(child) => {
-                eprintln!("mache started (pid={})", child.id());
-                mache_child = Some(child);
-            }
-            Err(e) => {
-                eprintln!("warn: failed to start mache: {e}");
-            }
-        }
-    } else {
-        eprintln!("mache not found on PATH — skipping auto-spawn");
-    }
+    // mache is deliberately NOT spawned here (ley-line-open-620c3f). The
+    // daemon used to run `mache serve --control <ctrl>` as a child, but
+    // mache's `--control` flag was removed, so the spawn could only start
+    // a child that exits on an unknown flag. The replacement is NOT
+    // exec-coupling in either direction: both daemons are independently
+    // operational services sharing the IPC surface (the control file +
+    // UDS ops this function already exposes), with process lifecycle and
+    // startup ordering owned by the init system — LaunchAgent/systemd
+    // user units, ley-line-open-4bd5e0 (LLO unit) and the mache-side
+    // twin. launchd/systemd declare the dependency order; a daemon
+    // exec'ing its peer cannot.
 
     // 9. Git-aware file watcher — poll git status, reparse on change.
     if let Some(ref source_dir) = ctx.source_dir {
@@ -724,11 +706,6 @@ pub async fn run_daemon_with_options(
         } else {
             eprintln!("final snapshot saved to arena");
         }
-    }
-    if let Some(mut child) = mache_child {
-        eprintln!("stopping mache (pid={})...", child.id());
-        let _ = child.kill();
-        let _ = child.wait();
     }
     if let Some(handle) = mcp_handle {
         handle.abort();

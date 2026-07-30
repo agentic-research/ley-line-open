@@ -96,6 +96,19 @@ context, scoping notes, and review history are recoverable.
   DDL is split from the nodes-manifest DDL so the blob target can create the
   pool without the witness apparatus).
 
+### Removed
+
+- **The daemon no longer exec-spawns mache** (`ley-line-open-620c3f`).
+  `run_daemon` used to launch `mache serve --control <ctrl>` as a child;
+  mache removed the `--control` flag (its serve is a self-managed shared
+  HTTP daemon now), so every daemon start with mache on PATH spawned a
+  child that exited on an unknown flag. The replacement is not
+  exec-coupling in either direction: both daemons run as independently
+  operational services sharing the IPC surface (the control file + UDS
+  ops), with process lifecycle and startup ordering declared at the init
+  layer — LaunchAgent/systemd user units (`ley-line-open-4bd5e0` for the
+  LLO unit, `mache-be8a08` for mache's twin).
+
 ### Documentation
 
 - **ADR-0033 written into its reserved slot** (`ley-line-open-b6653a`): the

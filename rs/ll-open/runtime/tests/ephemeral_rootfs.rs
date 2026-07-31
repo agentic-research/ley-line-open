@@ -19,11 +19,8 @@ fn rootfs_fixture(parent: &Path) -> ResolvedRootfs {
     fs::create_dir_all(&bin).expect("rootfs directories");
     fs::set_permissions(&bin, fs::Permissions::from_mode(0o750)).expect("bin mode");
     fs::write(bin.join("probe"), content).expect("rootfs executable");
-    fs::set_permissions(
-        bin.join("probe"),
-        fs::Permissions::from_mode(0o755),
-    )
-    .expect("executable mode");
+    fs::set_permissions(bin.join("probe"), fs::Permissions::from_mode(0o755))
+        .expect("executable mode");
     fs::write(rootfs.join("rootfs.manifest.json"), manifest).expect("rootfs manifest");
 
     ResolvedRootfs {
@@ -65,8 +62,11 @@ fn guest_writes_are_isolated_from_the_immutable_cas_root() {
     );
 
     fs::write(&executable, b"guest-write").expect("write ephemeral rootfs");
-    fs::write(materialized.canonical_path.join("guest-created"), b"scratch")
-        .expect("create guest file");
+    fs::write(
+        materialized.canonical_path.join("guest-created"),
+        b"scratch",
+    )
+    .expect("create guest file");
 
     assert_eq!(
         fs::read(source.canonical_path.join("usr/bin/probe")).expect("read immutable source"),
@@ -107,8 +107,8 @@ fn materializer_rejects_symlinks_even_when_given_a_pre_resolved_path() {
     let destination = fixture.path().join("run-root");
     fs::create_dir(&destination).expect("run root");
 
-    let error = materialize_ephemeral_rootfs(&source, &destination)
-        .expect_err("symlink must be rejected");
+    let error =
+        materialize_ephemeral_rootfs(&source, &destination).expect_err("symlink must be rejected");
 
     assert!(
         error.detail.contains("symbolic links are not supported"),
@@ -128,7 +128,9 @@ fn materializer_requires_an_empty_destination() {
         .expect_err("non-empty destination must be rejected");
 
     assert!(
-        error.detail.contains("ephemeral rootfs destination must be empty"),
+        error
+            .detail
+            .contains("ephemeral rootfs destination must be empty"),
         "unexpected error: {error:?}"
     );
 }

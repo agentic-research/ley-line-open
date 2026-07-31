@@ -1,11 +1,15 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use leyline_runtime::backends::libkrun::backend::{KrunWorkerBackend, KrunWorkerConfig};
 use leyline_runtime::{Backend, BackendClass, DigestRef, ExecutionRequest, ResourceLimits};
 use tempfile::TempDir;
+
+fn run_root_count(path: &std::path::Path) -> usize {
+    fs::read_dir(path).expect("enumerate run roots").count()
+}
 
 fn request() -> ExecutionRequest {
     ExecutionRequest {
@@ -47,9 +51,12 @@ fn backend_spawns_the_explicit_first_party_worker_and_waits_for_ready() {
     fs::create_dir(&cas).expect("CAS");
     let libkrun = fixture.path().join("libkrun.dylib");
     fs::write(&libkrun, b"library").expect("library fixture");
+    let ephemeral_root = fixture.path().join("runs");
+    fs::create_dir(&ephemeral_root).expect("ephemeral root");
     let backend = KrunWorkerBackend::new(KrunWorkerConfig {
         worker,
         cas_root: cas,
+        ephemeral_root: ephemeral_root.clone(),
         libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
@@ -65,4 +72,79 @@ fn backend_spawns_the_explicit_first_party_worker_and_waits_for_ready() {
     let observed: ExecutionRequest =
         serde_json::from_slice(&fs::read(request_log).expect("request log")).expect("request JSON");
     assert_eq!(observed, request());
+    assert_eq!(run_root_count(&ephemeral_root), 1);
+
+    drop(backend);
+    assert_eq!(run_root_count(&ephemeral_root), 0);
+}
+
+#[test]
+fn backend_removes_the_run_root_when_a_worker_exits() {
+    let fixture = TempDir::new().expect("fixture");
+    let worker = fixture.path().join("leyline-krun-worker");
+    fs::write(
+        &worker,
+        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n",
+    )
+    .expect("fake worker");
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("worker mode");
+    let cas_root = fixture.path().join("cas");
+    let ephemeral_root = fixture.path().join("runs");
+    fs::create_dir(&cas_root).expect("CAS");
+    fs::create_dir(&ephemeral_root).expect("ephemeral root");
+    let libkrun = fixture.path().join("libkrun.dylib");
+    fs::write(&libkrun, b"library").expect("library fixture");
+    let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+        worker,
+        cas_root,
+        ephemeral_root: ephemeral_root.clone(),
+        libkrun,
+        runtime_files: Vec::new(),
+        devices: Vec::new(),
+        ready_timeout: Duration::from_secs(1),
+    });
+
+    backend.start(&request()).expect("ready worker");
+    assert_eq!(run_root_count(&ephemeral_root), 1);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while run_root_count(&ephemeral_root) != 0 && Instant::now() < deadline {
+        backend.capabilities();
+        std::thread::yield_now();
+    }
+
+    assert_eq!(run_root_count(&ephemeral_root), 0);
+}
+
+#[test]
+fn backend_cancel_terminates_the_worker_and_removes_its_run_root() {
+    let fixture = TempDir::new().expect("fixture");
+    let worker = fixture.path().join("leyline-krun-worker");
+    fs::write(
+        &worker,
+        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n/bin/sleep 30\n",
+    )
+    .expect("fake worker");
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("worker mode");
+    let cas_root = fixture.path().join("cas");
+    let ephemeral_root = fixture.path().join("runs");
+    fs::create_dir(&cas_root).expect("CAS");
+    fs::create_dir(&ephemeral_root).expect("ephemeral root");
+    let libkrun = fixture.path().join("libkrun.dylib");
+    fs::write(&libkrun, b"library").expect("library fixture");
+    let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+        worker,
+        cas_root,
+        ephemeral_root: ephemeral_root.clone(),
+        libkrun,
+        runtime_files: Vec::new(),
+        devices: Vec::new(),
+        ready_timeout: Duration::from_secs(1),
+    });
+
+    backend.start(&request()).expect("ready worker");
+    assert_eq!(run_root_count(&ephemeral_root), 1);
+    assert!(backend.cancel("run-backend-01"));
+
+    assert_eq!(run_root_count(&ephemeral_root), 0);
+    assert!(!backend.cancel("run-backend-01"));
 }

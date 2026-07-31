@@ -6,6 +6,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
+use tempfile::{Builder as TempDirBuilder, TempDir};
 
 use crate::{
     Backend, BackendCapabilities, BackendClass, BackendRun, ExecutionError, ExecutionRequest,
@@ -17,6 +18,7 @@ use super::worker::WorkerEvent;
 pub struct KrunWorkerConfig {
     pub worker: PathBuf,
     pub cas_root: PathBuf,
+    pub ephemeral_root: PathBuf,
     pub libkrun: PathBuf,
     pub runtime_files: Vec<PathBuf>,
     pub devices: Vec<PathBuf>,
@@ -25,7 +27,12 @@ pub struct KrunWorkerConfig {
 
 pub struct KrunWorkerBackend {
     config: KrunWorkerConfig,
-    children: Mutex<HashMap<String, Child>>,
+    children: Mutex<HashMap<String, WorkerProcess>>,
+}
+
+struct WorkerProcess {
+    child: Child,
+    _rootfs: TempDir,
 }
 
 impl KrunWorkerBackend {
@@ -39,6 +46,7 @@ impl KrunWorkerBackend {
     fn configured(&self) -> bool {
         self.config.worker.is_file()
             && self.config.cas_root.is_dir()
+            && self.config.ephemeral_root.is_dir()
             && self.config.libkrun.is_file()
             && self.config.runtime_files.iter().all(|path| path.is_file())
             && self.config.devices.iter().all(|path| path.exists())
@@ -47,12 +55,23 @@ impl KrunWorkerBackend {
     fn reap_finished(&self) {
         self.children
             .lock()
-            .retain(|_, child| matches!(child.try_wait(), Ok(None)));
+            .retain(|_, process| matches!(process.child.try_wait(), Ok(None)));
     }
 
-    fn terminate(child: &mut Child) {
-        let _ = child.kill();
-        let _ = child.wait();
+    fn terminate(process: &mut WorkerProcess) {
+        let _ = process.child.kill();
+        let _ = process.child.wait();
+    }
+
+    /// Stop one backend run and release its parent-owned ephemeral rootfs.
+    pub fn cancel(&self, run_id: &str) -> bool {
+        let process = self.children.lock().remove(run_id);
+        if let Some(mut process) = process {
+            Self::terminate(&mut process);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -74,12 +93,21 @@ impl Backend for KrunWorkerBackend {
             ));
         }
 
+        let rootfs = TempDirBuilder::new()
+            .prefix("leyline-run-")
+            .tempdir_in(&self.config.ephemeral_root)
+            .map_err(|error| {
+                ExecutionError::backend(format!("create ephemeral rootfs volume: {error}"))
+            })?;
+
         let mut command = Command::new(&self.config.worker);
         command
             .arg("--cas-root")
             .arg(&self.config.cas_root)
             .arg("--libkrun")
             .arg(&self.config.libkrun)
+            .arg("--run-root")
+            .arg(rootfs.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -97,13 +125,15 @@ impl Backend for KrunWorkerBackend {
             ExecutionError::backend("first-party libkrun worker stdin was not piped")
         })?;
         if let Err(error) = serde_json::to_writer(&mut stdin, request) {
-            Self::terminate(&mut child);
+            let _ = child.kill();
+            let _ = child.wait();
             return Err(ExecutionError::backend(format!(
                 "send execution request to libkrun worker: {error}"
             )));
         }
         if let Err(error) = stdin.flush() {
-            Self::terminate(&mut child);
+            let _ = child.kill();
+            let _ = child.wait();
             return Err(ExecutionError::backend(format!(
                 "flush execution request to libkrun worker: {error}"
             )));
@@ -134,32 +164,37 @@ impl Backend for KrunWorkerBackend {
                 )));
             }
             Ok(Err(error)) => {
-                Self::terminate(&mut child);
+                let _ = child.kill();
+                let _ = child.wait();
                 return Err(ExecutionError::backend(format!(
                     "read libkrun worker readiness: {error}"
                 )));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                Self::terminate(&mut child);
+                let _ = child.kill();
+                let _ = child.wait();
                 return Err(ExecutionError::backend(
                     "timed out waiting for libkrun worker readiness",
                 ));
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Self::terminate(&mut child);
+                let _ = child.kill();
+                let _ = child.wait();
                 return Err(ExecutionError::backend(
                     "libkrun worker readiness channel disconnected",
                 ));
             }
         };
         let event: WorkerEvent = serde_json::from_str(line.trim()).map_err(|error| {
-            Self::terminate(&mut child);
+            let _ = child.kill();
+            let _ = child.wait();
             ExecutionError::backend(format!("invalid libkrun worker readiness event: {error}"))
         })?;
         match event {
             WorkerEvent::Ready { run_id } if run_id == request.run_id => {}
             WorkerEvent::Ready { run_id } => {
-                Self::terminate(&mut child);
+                let _ = child.kill();
+                let _ = child.wait();
                 return Err(ExecutionError::backend(format!(
                     "libkrun worker readiness named unexpected run {run_id}"
                 )));
@@ -170,7 +205,13 @@ impl Backend for KrunWorkerBackend {
             }
         }
 
-        self.children.lock().insert(request.run_id.clone(), child);
+        self.children.lock().insert(
+            request.run_id.clone(),
+            WorkerProcess {
+                child,
+                _rootfs: rootfs,
+            },
+        );
         Ok(BackendRun {
             backend_id: "libkrun/1".into(),
         })
@@ -179,8 +220,8 @@ impl Backend for KrunWorkerBackend {
 
 impl Drop for KrunWorkerBackend {
     fn drop(&mut self) {
-        for child in self.children.get_mut().values_mut() {
-            Self::terminate(child);
+        for process in self.children.get_mut().values_mut() {
+            Self::terminate(process);
         }
     }
 }

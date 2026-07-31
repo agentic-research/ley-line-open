@@ -90,9 +90,8 @@ fn copy_directory_contents(source: &Path, destination: &Path) -> Result<(), Exec
         } else if metadata.is_file() {
             fs::copy(&source_path, &destination_path)
                 .map_err(|error| invalid_io("copy ephemeral rootfs file", error))?;
-            fs::set_permissions(&destination_path, metadata.permissions()).map_err(|error| {
-                invalid_io("preserve ephemeral rootfs file permissions", error)
-            })?;
+            fs::set_permissions(&destination_path, metadata.permissions())
+                .map_err(|error| invalid_io("preserve ephemeral rootfs file permissions", error))?;
         } else {
             return Err(ExecutionError::invalid(
                 "rootfs contains a non-regular filesystem entry",

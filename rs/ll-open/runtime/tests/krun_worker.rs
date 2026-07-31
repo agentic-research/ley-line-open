@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 
-use leyline_runtime::backends::libkrun::worker::WorkerEvent;
+use leyline_runtime::backends::libkrun::worker::{WorkerEvent, WorkerOptions};
 use leyline_runtime::{DigestRef, ErrorCode, ExecutionRequest, ResourceLimits};
 use tempfile::TempDir;
 
@@ -47,6 +48,7 @@ fn first_party_worker_never_falls_back_to_the_krunvm_cli() {
     // PATH trap makes this behavioral rather than a source-text assertion.
     let cas = TempDir::new().expect("CAS");
     let request = request_fixture(&cas);
+    let run_root = TempDir::new().expect("run root");
     let trap = TempDir::new().expect("PATH trap");
     let marker = trap.path().join("krunvm-was-invoked");
     let krunvm = trap.path().join("krunvm");
@@ -63,6 +65,8 @@ fn first_party_worker_never_falls_back_to_the_krunvm_cli() {
             cas.path().to_str().expect("CAS UTF-8"),
             "--libkrun",
             "/definitely/missing/libkrun",
+            "--run-root",
+            run_root.path().to_str().expect("run root UTF-8"),
         ])
         .env("PATH", trap.path())
         .stdin(Stdio::piped())
@@ -84,4 +88,36 @@ fn first_party_worker_never_falls_back_to_the_krunvm_cli() {
     assert_eq!(error.code, ErrorCode::BackendFailed);
     assert!(error.detail.contains("load libkrun shared library"));
     assert!(!marker.exists(), "worker invoked the krunvm PATH trap");
+    assert_eq!(
+        fs::read(run_root.path().join("usr/bin/probe")).expect("ephemeral executable"),
+        b"probe-v1"
+    );
+    assert_eq!(
+        fs::read(cas.path().join(&request.rootfs.value).join("usr/bin/probe"))
+            .expect("immutable executable"),
+        b"probe-v1"
+    );
+}
+
+#[test]
+fn worker_options_require_an_explicit_run_root() {
+    let error = WorkerOptions::parse([
+        OsString::from("--cas-root"),
+        OsString::from("/cas"),
+        OsString::from("--libkrun"),
+        OsString::from("/libkrun"),
+    ])
+    .expect_err("run root is required");
+    assert!(error.detail.contains("missing --run-root option"));
+
+    let options = WorkerOptions::parse([
+        OsString::from("--cas-root"),
+        OsString::from("/cas"),
+        OsString::from("--libkrun"),
+        OsString::from("/libkrun"),
+        OsString::from("--run-root"),
+        OsString::from("/run-root"),
+    ])
+    .expect("explicit run root");
+    assert_eq!(options.run_root, std::path::PathBuf::from("/run-root"));
 }

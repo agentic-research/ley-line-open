@@ -8,10 +8,12 @@ use serde::{Deserialize, Serialize};
 use super::api::{DynamicKrunApi, PreparedVm, prepare_vm};
 use super::confinement::{VmmHostResources, apply};
 use super::plan::{DirectoryRootfsResolver, compile_plan};
+use super::volume::materialize_ephemeral_rootfs;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerOptions {
     pub cas_root: PathBuf,
+    pub run_root: PathBuf,
     pub libkrun: PathBuf,
     pub runtime_files: Vec<PathBuf>,
     pub devices: Vec<PathBuf>,
@@ -28,6 +30,7 @@ impl WorkerOptions {
     pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Self, ExecutionError> {
         let mut arguments = arguments.into_iter();
         let mut cas_root = None;
+        let mut run_root = None;
         let mut libkrun = None;
         let mut runtime_files = Vec::new();
         let mut devices = Vec::new();
@@ -42,6 +45,7 @@ impl WorkerOptions {
             match argument.to_str() {
                 Some("--cas-root") if cas_root.is_none() => cas_root = Some(value.into()),
                 Some("--libkrun") if libkrun.is_none() => libkrun = Some(value.into()),
+                Some("--run-root") if run_root.is_none() => run_root = Some(value.into()),
                 Some("--runtime-file") => runtime_files.push(value.into()),
                 Some("--device") => devices.push(value.into()),
                 _ => {
@@ -56,6 +60,8 @@ impl WorkerOptions {
         Ok(Self {
             cas_root: cas_root
                 .ok_or_else(|| ExecutionError::invalid("missing --cas-root option"))?,
+            run_root: run_root
+                .ok_or_else(|| ExecutionError::invalid("missing --run-root option"))?,
             libkrun: libkrun.ok_or_else(|| ExecutionError::invalid("missing --libkrun option"))?,
             runtime_files,
             devices,
@@ -103,7 +109,8 @@ pub fn execute_with_ready(
     on_ready: impl FnOnce(&WorkerEvent) -> Result<(), ExecutionError>,
 ) -> Result<(), ExecutionError> {
     let resolver = DirectoryRootfsResolver::new(&options.cas_root);
-    let config = compile_plan(&resolver, request)?;
+    let mut config = compile_plan(&resolver, request)?;
+    config.rootfs = materialize_ephemeral_rootfs(&config.rootfs, &options.run_root)?;
 
     // Loading occurs before nono is applied because the platform dynamic
     // loader may need to resolve libkrun's transitive libraries. All actual VM

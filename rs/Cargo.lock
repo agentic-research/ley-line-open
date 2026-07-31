@@ -4248,8 +4248,11 @@ dependencies = [
 name = "leyline-runtime"
 version = "0.14.0"
 dependencies = [
+ "blake3",
  "parking_lot",
  "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 

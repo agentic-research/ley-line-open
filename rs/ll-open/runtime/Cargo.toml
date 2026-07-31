@@ -7,6 +7,11 @@ repository = "https://github.com/agentic-research/ley-line-open"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
+blake3 = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

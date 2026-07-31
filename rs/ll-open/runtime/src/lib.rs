@@ -4,6 +4,7 @@
 //! content identities and guest-relative names; backend-only host paths are
 //! introduced behind trusted resolver boundaries.
 
+pub mod backends;
 mod error;
 mod model;
 mod service;

@@ -13,4 +13,15 @@ fn main() {
         .file("capnp/daemon.capnp")
         .run()
         .expect("capnp compile daemon.capnp");
+
+    // execution/v1 lives with its normative spec and conformance vectors.
+    // Compile that exact file rather than maintaining a public-schema copy:
+    // Rust, JSON Schema, and MCP projections therefore share one IDL input.
+    let spec_root = std::path::PathBuf::from(leyline_schema_spec::SPEC_DIR);
+    capnpc::CompilerCommand::new()
+        .src_prefix(&spec_root)
+        .file(spec_root.join("_traits.capnp"))
+        .file(spec_root.join("execution/v1/execution.capnp"))
+        .run()
+        .expect("capnp compile execution/v1/execution.capnp");
 }

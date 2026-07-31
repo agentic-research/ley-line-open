@@ -38,7 +38,7 @@
 
 use std::fmt::Write as _;
 
-use super::json_schema::{escape_json_string, render_property};
+use super::json_schema::{escape_json_string, render_definitions, render_property};
 use crate::error::{Result, SchemaBridgeError};
 use crate::ir::{OpInfo, Schema, Struct};
 
@@ -142,6 +142,17 @@ fn render_tool(schema: &Schema, op_struct: &Struct, op: &OpInfo) -> Result<Strin
         .filter(|f| !f.optional)
         .map(|f| format!("\"{}\"", escape_json_string(&f.name)))
         .collect();
+    if input_struct
+        .fields
+        .iter()
+        .any(|field| field.ty.has_reference())
+    {
+        let defs = render_definitions(schema)?;
+        writeln!(out, r#"      "$defs": {{"#).expect("write! to String is infallible");
+        out.push_str(&defs.join(",\n"));
+        out.push('\n');
+        writeln!(out, "      }},").expect("write! to String is infallible");
+    }
     writeln!(out, r#"      "required": [{}]"#, required.join(", "))
         .expect("write! to String is infallible");
 

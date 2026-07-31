@@ -3,8 +3,9 @@
 //! This crate is a *spec-artifact holder*, not a Rust API. It ships the
 //! `_traits.capnp` trait library, `_capability-mapping.md`, `_traits.md`,
 //! `LAYOUT.md`, and per-capability spec directories (`credential-isolation/v1/`,
-//! `build-cache/v1/`, `mcp-tool/v1/`) verbatim from their original home under
-//! `cloister/cloister-spec/`. See the crate README for the file inventory.
+//! `build-cache/v1/`, `mcp-tool/v1/`, `execution/v1/`). The initial specs moved
+//! from `cloister/cloister-spec/`; execution/v1 was authored here after that
+//! ownership transfer. See the crate README for the file inventory.
 //!
 //! The crate's one load-bearing runtime behaviour is the
 //! `verify_vectors_sha256` test: it walks every `VECTORS.sha256` file the
@@ -24,7 +25,8 @@
 //! ├── LAYOUT.md
 //! ├── credential-isolation/v1/     (README, QUICKSTART, wire/, test-vectors/, ref-impl-py/, VECTORS.sha256)
 //! ├── build-cache/v1/              (README, wire/, vectors/ with VECTORS.sha256)
-//! └── mcp-tool/v1/                 (README, wire/, vectors/)
+//! ├── mcp-tool/v1/                 (README, wire/, vectors/)
+//! └── execution/v1/                (Cap'n Proto IDL, README, vectors)
 //! ```
 //!
 //! # Rust API

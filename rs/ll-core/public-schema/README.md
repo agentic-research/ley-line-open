@@ -1,12 +1,17 @@
 # leyline-public-schema
 
-Cap'n Proto schema for the daemon UDS + MCP wire — the typed contract between the ley-line daemon and consumers (mache, cloister, future TS/Swift clients).
+Generated Rust bindings for Leyline's public Cap'n Proto protocols: the daemon
+UDS/MCP wire and the vendor-neutral execution capability consumed by mache,
+cloister, and other clients.
 
 ## What's here
 
 - **`capnp/daemon.capnp`** — the schema. Source of truth for every base op's request and response shape. Field-level `$Json.name(...)` annotations map camelCase capnp names to snake_case JSON wire names per the capnp-json codec.
 - **`capnp/capnp/compat/json.capnp`** — vendored from [capnp-json](https://crates.io/crates/capnp-json) (which vendors from upstream [capnproto/capnproto](https://github.com/capnproto/capnproto)). Provides the `$Json.name` / `$Json.flatten` / `$Json.discriminator` annotation IDs. **Don't edit** — kept byte-identical to upstream so regen is clean.
 - **`build.rs`** — invokes capnpc-rust with `crate_provides("capnp_json", ...)` so generated bindings resolve the json annotations to the capnp-json crate's types. Re-runs on any schema change.
+- **`leyline-schema-spec` build dependency** — owns the canonical
+  `execution/v1/execution.capnp` and shared `_traits.capnp`; this crate compiles
+  those packaged files rather than carrying a second IDL copy.
 
 ## What this crate is NOT
 
@@ -18,6 +23,10 @@ Cap'n Proto schema for the daemon UDS + MCP wire — the typed contract between 
 - **Append-only-additive.** Add fields at the next ordinal; never rename or remove. Per [ADR-0014 §2](../../../docs/adr/0014-capnp-as-protocol.md).
 - **Exact-pinned toolchain.** `capnp = "=0.25.0"`, `capnpc = "=0.25.0"`, `capnp-json = "=0.1.0"`. Version drift could change canonical bytes.
 - **Cross-runtime gate.** Schema changes regenerate `clients/go/leyline-schema/daemon/daemon.capnp.go`; CI's regen-diff gate fails if the committed bindings don't match.
+- **Publish-order gate.** `task release:crates:check` packages
+  `leyline-schema-spec` first and rejects release/version drift or a reversed
+  dependency order. Cargo can fully package this crate after that exact
+  schema-spec version has reached the registry.
 
 ## Consumers
 

@@ -61,18 +61,7 @@ use crate::ir::{
 };
 
 pub fn emit(schema: &Schema, schema_basename: &str) -> Result<String> {
-    let mut defs: Vec<String> = Vec::new();
-    // Enums first, then structs, then consts — the zod/go declaration
-    // order, kept identical so cross-emitter diffs line up.
-    for e in &schema.enums {
-        defs.push(render_enum_def(e));
-    }
-    for s in &schema.structs {
-        defs.push(render_struct_def(s));
-    }
-    for c in &schema.consts {
-        defs.push(render_const_def(c)?);
-    }
+    let defs = render_definitions(schema)?;
 
     let mut out = String::new();
     writeln!(out, "{{").expect("write! to String is infallible");
@@ -105,6 +94,30 @@ pub fn emit(schema: &Schema, schema_basename: &str) -> Result<String> {
     }
     writeln!(out, "}}").expect("write! to String is infallible");
     Ok(out)
+}
+
+/// Render the canonical `$defs` entries shared by the standalone JSON Schema
+/// document and self-contained MCP input schemas.
+///
+/// Keeping this in the JSON Schema emitter prevents the tool-definitions
+/// projection from acquiring a second type renderer as its schemas grow
+/// nested references. Entries include their four-space document indentation;
+/// JSON treats the additional indentation used by a nested caller as
+/// insignificant.
+pub(crate) fn render_definitions(schema: &Schema) -> Result<Vec<String>> {
+    let mut defs = Vec::new();
+    // Enums first, then structs, then consts — the zod/go declaration
+    // order, kept identical so cross-emitter diffs line up.
+    for e in &schema.enums {
+        defs.push(render_enum_def(e));
+    }
+    for s in &schema.structs {
+        defs.push(render_struct_def(s));
+    }
+    for c in &schema.consts {
+        defs.push(render_const_def(c)?);
+    }
+    Ok(defs)
 }
 
 // `"Tier": { "type": "string", "enum": ["hypervisor", "cluster"] }` —

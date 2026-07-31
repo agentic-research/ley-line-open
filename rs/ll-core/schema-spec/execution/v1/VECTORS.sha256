@@ -1,0 +1,3 @@
+# execution/v1 canonical JSON carrier fixture.
+# Verified by `cargo test -p leyline-schema-spec`.
+b27808e8762da2893d83c3fccf3d9de8fef229be315fc8a131d8344d13408343  test-vectors/canonical-run.json

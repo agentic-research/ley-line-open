@@ -4241,6 +4241,7 @@ dependencies = [
  "capnp",
  "capnp-json",
  "capnpc",
+ "leyline-schema-spec",
 ]
 
 [[package]]

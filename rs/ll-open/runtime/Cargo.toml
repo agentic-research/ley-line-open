@@ -1,0 +1,12 @@
+[package]
+name = "leyline-runtime"
+version = "0.14.0"
+edition = "2024"
+description = "Capability-resolved execution lifecycle and isolation backends for Leyline"
+repository = "https://github.com/agentic-research/ley-line-open"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+parking_lot = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }

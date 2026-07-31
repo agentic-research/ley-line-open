@@ -4,6 +4,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
+use leyline_core::ContentAddressed;
 use serde::Deserialize;
 
 use crate::{DigestRef, ExecutionError, ExecutionRequest};
@@ -138,7 +139,7 @@ pub(crate) fn verify_manifest(rootfs: &Path, digest: &DigestRef) -> Result<(), E
     }
     let bytes =
         fs::read(&manifest_path).map_err(|error| invalid_io("read rootfs manifest", error))?;
-    if blake3::hash(&bytes).to_hex().as_str() != digest.value {
+    if bytes.as_slice().hash().to_string() != digest.value {
         return Err(ExecutionError::invalid(
             "rootfs manifest digest does not match requested content identity",
         ));
@@ -205,7 +206,7 @@ fn verify_manifest_file(rootfs: &Path, entry: &ManifestFile) -> Result<(), Execu
         )));
     }
     let bytes = fs::read(&canonical).map_err(|error| invalid_io("read rootfs file", error))?;
-    if blake3::hash(&bytes).to_hex().as_str() != entry.blake3 {
+    if bytes.as_slice().hash().to_string() != entry.blake3 {
         return Err(ExecutionError::invalid(format!(
             "rootfs content digest differs from manifest: {}",
             entry.path

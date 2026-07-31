@@ -4601,6 +4601,7 @@ name = "leyline-runtime"
 version = "0.14.0"
 dependencies = [
  "blake3",
+ "leyline-core",
  "libloading 0.9.0",
  "nono",
  "parking_lot",

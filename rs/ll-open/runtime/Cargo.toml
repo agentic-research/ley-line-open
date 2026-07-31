@@ -7,11 +7,14 @@ repository = "https://github.com/agentic-research/ley-line-open"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
-blake3 = { workspace = true }
 libloading = { workspace = true }
+leyline-core = { path = "../../ll-core/core", version = "0.14.0" }
 nono = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+blake3 = { workspace = true }

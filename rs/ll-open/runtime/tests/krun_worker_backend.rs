@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use leyline_runtime::backends::libkrun::backend::{KrunWorkerBackend, KrunWorkerConfig};
@@ -108,7 +109,6 @@ fn backend_removes_the_run_root_when_a_worker_exits() {
     assert_eq!(run_root_count(&ephemeral_root), 1);
     let deadline = Instant::now() + Duration::from_secs(1);
     while run_root_count(&ephemeral_root) != 0 && Instant::now() < deadline {
-        backend.capabilities();
         std::thread::yield_now();
     }
 
@@ -143,8 +143,178 @@ fn backend_cancel_terminates_the_worker_and_removes_its_run_root() {
 
     backend.start(&request()).expect("ready worker");
     assert_eq!(run_root_count(&ephemeral_root), 1);
-    assert!(backend.cancel("run-backend-01"));
+    assert!(backend.cancel("run-backend-01").expect("cancel worker"));
 
     assert_eq!(run_root_count(&ephemeral_root), 0);
-    assert!(!backend.cancel("run-backend-01"));
+    assert!(!backend.cancel("run-backend-01").expect("repeat cancel"));
+}
+
+#[test]
+fn backend_cleanup_handles_guest_created_restrictive_directories() {
+    let fixture = TempDir::new().expect("fixture");
+    let worker = fixture.path().join("leyline-krun-worker");
+    fs::write(
+        &worker,
+        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n/bin/sleep 30\n",
+    )
+    .expect("fake worker");
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("worker mode");
+    let cas_root = fixture.path().join("cas");
+    let ephemeral_root = fixture.path().join("runs");
+    fs::create_dir(&cas_root).expect("CAS");
+    fs::create_dir(&ephemeral_root).expect("ephemeral root");
+    let libkrun = fixture.path().join("libkrun.dylib");
+    fs::write(&libkrun, b"library").expect("library fixture");
+    let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+        worker,
+        cas_root,
+        ephemeral_root: ephemeral_root.clone(),
+        libkrun,
+        runtime_files: Vec::new(),
+        devices: Vec::new(),
+        ready_timeout: Duration::from_secs(1),
+    });
+
+    backend.start(&request()).expect("ready worker");
+    let run_root = fs::read_dir(&ephemeral_root)
+        .expect("run roots")
+        .next()
+        .expect("one run root")
+        .expect("run root entry")
+        .path();
+    let locked = run_root.join("guest-locked");
+    fs::create_dir(&locked).expect("guest directory");
+    fs::write(locked.join("state"), b"guest").expect("guest state");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("restrict directory");
+
+    assert!(backend.cancel("run-backend-01").expect("cancel worker"));
+    assert_eq!(run_root_count(&ephemeral_root), 0);
+    assert!(backend.take_cleanup_errors().is_empty());
+}
+
+#[test]
+fn failed_start_removes_a_restrictive_worker_created_run_root() {
+    let fixture = TempDir::new().expect("fixture");
+    let worker = fixture.path().join("leyline-krun-worker");
+    fs::write(
+        &worker,
+        r#"#!/bin/sh
+run_root=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--run-root" ]; then run_root="$2"; shift 2; else shift; fi
+done
+/bin/cat >/dev/null
+/bin/mkdir "$run_root/guest-locked"
+/bin/chmod 000 "$run_root/guest-locked"
+printf '%s\n' '{"type":"failed","error":{"code":"backend-failed","retryable":false,"detail":"injected setup failure"}}' >&2
+"#,
+    )
+    .expect("fake worker");
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("worker mode");
+    let cas_root = fixture.path().join("cas");
+    let ephemeral_root = fixture.path().join("runs");
+    fs::create_dir(&cas_root).expect("CAS");
+    fs::create_dir(&ephemeral_root).expect("ephemeral root");
+    let libkrun = fixture.path().join("libkrun.dylib");
+    fs::write(&libkrun, b"library").expect("library fixture");
+    let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+        worker,
+        cas_root,
+        ephemeral_root: ephemeral_root.clone(),
+        libkrun,
+        runtime_files: Vec::new(),
+        devices: Vec::new(),
+        ready_timeout: Duration::from_secs(1),
+    });
+
+    let error = backend.start(&request()).expect_err("worker setup failure");
+
+    assert!(error.detail.contains("injected setup failure"));
+    assert_eq!(run_root_count(&ephemeral_root), 0);
+}
+
+#[test]
+fn backend_rejects_a_duplicate_run_id_without_replacing_the_live_worker() {
+    let fixture = TempDir::new().expect("fixture");
+    let worker = fixture.path().join("leyline-krun-worker");
+    fs::write(
+        &worker,
+        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n/bin/sleep 30\n",
+    )
+    .expect("fake worker");
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("worker mode");
+    let cas_root = fixture.path().join("cas");
+    let ephemeral_root = fixture.path().join("runs");
+    fs::create_dir(&cas_root).expect("CAS");
+    fs::create_dir(&ephemeral_root).expect("ephemeral root");
+    let libkrun = fixture.path().join("libkrun.dylib");
+    fs::write(&libkrun, b"library").expect("library fixture");
+    let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+        worker,
+        cas_root,
+        ephemeral_root: ephemeral_root.clone(),
+        libkrun,
+        runtime_files: Vec::new(),
+        devices: Vec::new(),
+        ready_timeout: Duration::from_secs(1),
+    });
+
+    backend.start(&request()).expect("first worker");
+    let error = backend.start(&request()).expect_err("duplicate run ID");
+
+    assert!(error.detail.contains("run_id already active"));
+    assert_eq!(run_root_count(&ephemeral_root), 1);
+    assert!(backend.cancel("run-backend-01").expect("cancel worker"));
+}
+
+#[test]
+fn concurrent_starts_reserve_a_run_id_before_spawning() {
+    let fixture = TempDir::new().expect("fixture");
+    let worker = fixture.path().join("leyline-krun-worker");
+    fs::write(
+        &worker,
+        "#!/bin/sh\n/bin/cat >/dev/null\n/bin/sleep 0.2\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n/bin/sleep 30\n",
+    )
+    .expect("fake worker");
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("worker mode");
+    let cas_root = fixture.path().join("cas");
+    let ephemeral_root = fixture.path().join("runs");
+    fs::create_dir(&cas_root).expect("CAS");
+    fs::create_dir(&ephemeral_root).expect("ephemeral root");
+    let libkrun = fixture.path().join("libkrun.dylib");
+    fs::write(&libkrun, b"library").expect("library fixture");
+    let backend = Arc::new(KrunWorkerBackend::new(KrunWorkerConfig {
+        worker,
+        cas_root,
+        ephemeral_root,
+        libkrun,
+        runtime_files: Vec::new(),
+        devices: Vec::new(),
+        ready_timeout: Duration::from_secs(1),
+    }));
+    let barrier = Arc::new(Barrier::new(3));
+    let starts: Vec<_> = (0..2)
+        .map(|_| {
+            let backend = Arc::clone(&backend);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                backend.start(&request())
+            })
+        })
+        .collect();
+
+    barrier.wait();
+    let results: Vec<_> = starts
+        .into_iter()
+        .map(|start| start.join().expect("start thread"))
+        .collect();
+
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    let conflict = results
+        .iter()
+        .find_map(|result| result.as_ref().err())
+        .expect("one conflict");
+    assert_eq!(conflict.code, leyline_runtime::ErrorCode::ResourceConflict);
+    assert!(backend.cancel("run-backend-01").expect("cancel worker"));
 }

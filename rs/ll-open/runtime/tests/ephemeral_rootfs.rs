@@ -1,10 +1,13 @@
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
+use std::process::Command;
 
 use leyline_runtime::DigestRef;
 use leyline_runtime::backends::libkrun::plan::ResolvedRootfs;
-use leyline_runtime::backends::libkrun::volume::materialize_ephemeral_rootfs;
+use leyline_runtime::backends::libkrun::volume::{
+    materialize_ephemeral_rootfs, verify_ephemeral_rootfs,
+};
 use tempfile::TempDir;
 
 fn rootfs_fixture(parent: &Path) -> ResolvedRootfs {
@@ -96,6 +99,31 @@ fn copied_bytes_are_reverified_against_the_requested_identity() {
 }
 
 #[test]
+fn destination_tampering_is_rejected_before_vm_entry() {
+    let fixture = TempDir::new().expect("fixture");
+    let source = rootfs_fixture(fixture.path());
+    let destination = fixture.path().join("run-root");
+    fs::create_dir(&destination).expect("run root");
+    let materialized =
+        materialize_ephemeral_rootfs(&source, &destination).expect("materialize rootfs");
+    fs::write(
+        materialized.canonical_path.join("usr/bin/probe"),
+        b"tampered-after-copy",
+    )
+    .expect("tamper copied rootfs");
+
+    let error = verify_ephemeral_rootfs(&materialized)
+        .expect_err("destination tampering must be rejected before VM entry");
+
+    assert!(
+        error
+            .detail
+            .contains("rootfs content digest differs from manifest"),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
 fn materializer_rejects_symlinks_even_when_given_a_pre_resolved_path() {
     let fixture = TempDir::new().expect("fixture");
     let source = rootfs_fixture(fixture.path());
@@ -131,6 +159,28 @@ fn materializer_requires_an_empty_destination() {
         error
             .detail
             .contains("ephemeral rootfs destination must be empty"),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn materializer_rejects_special_files_without_blocking() {
+    let fixture = TempDir::new().expect("fixture");
+    let source = rootfs_fixture(fixture.path());
+    let fifo = source.canonical_path.join("guest.fifo");
+    let status = Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("run mkfifo");
+    assert!(status.success(), "mkfifo failed: {status}");
+    let destination = fixture.path().join("run-root");
+    fs::create_dir(&destination).expect("run root");
+
+    let error = materialize_ephemeral_rootfs(&source, &destination)
+        .expect_err("socket must be rejected without blocking");
+
+    assert!(
+        error.detail.contains("non-regular filesystem entry"),
         "unexpected error: {error:?}"
     );
 }

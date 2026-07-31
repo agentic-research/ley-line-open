@@ -48,16 +48,20 @@ impl KrunApi for RecordingApi {
         self.record(format!("vm:{context}:{vcpus}:{ram_mib}"))
     }
 
-    fn add_read_only_rootfs(&self, context: u32, rootfs: &CStr) -> Result<(), ExecutionError> {
-        self.record(format!("root:{context}:{}", rootfs.to_string_lossy()))
+    fn add_rootfs(
+        &self,
+        context: u32,
+        rootfs: &CStr,
+        read_only: bool,
+    ) -> Result<(), ExecutionError> {
+        self.record(format!(
+            "root:{context}:{read_only}:{}",
+            rootfs.to_string_lossy()
+        ))
     }
 
     fn disable_implicit_vsock(&self, context: u32) -> Result<(), ExecutionError> {
         self.record(format!("no-vsock:{context}"))
-    }
-
-    fn disable_host_port_exposure(&self, context: u32) -> Result<(), ExecutionError> {
-        self.record(format!("no-ports:{context}"))
     }
 
     fn set_workdir(&self, context: u32, workdir: &CStr) -> Result<(), ExecutionError> {
@@ -104,9 +108,9 @@ fn config(rootfs: &TempDir) -> KrunConfig {
 }
 
 #[test]
-fn prepares_a_read_only_networkless_vm_without_entering_it() {
-    // Catches accidental TSI/network exposure and writable rootfs mounting at
-    // the C API mapping seam.
+fn prepares_a_writable_ephemeral_networkless_vm_without_entering_it() {
+    // Catches accidental TSI/network exposure and regression to a read-only
+    // guest mount at the C API mapping seam.
     let rootfs = TempDir::new().expect("rootfs");
     let api = RecordingApi::default();
     let canonical_rootfs = rootfs.path().canonicalize().expect("canonical rootfs");
@@ -119,9 +123,8 @@ fn prepares_a_read_only_networkless_vm_without_entering_it() {
         vec![
             "create",
             "vm:42:2:1024",
-            &format!("root:42:{}", canonical_rootfs.display()),
+            &format!("root:42:false:{}", canonical_rootfs.display()),
             "no-vsock:42",
-            "no-ports:42",
             "workdir:42:/",
             "exec:42:usr/bin/probe:1:1",
         ]

@@ -17,9 +17,13 @@ pub trait KrunApi: Send + Sync {
     fn create_context(&self) -> Result<u32, ExecutionError>;
     fn free_context(&self, context: u32);
     fn set_vm_config(&self, context: u32, vcpus: u8, ram_mib: u32) -> Result<(), ExecutionError>;
-    fn add_read_only_rootfs(&self, context: u32, rootfs: &CStr) -> Result<(), ExecutionError>;
+    fn add_rootfs(
+        &self,
+        context: u32,
+        rootfs: &CStr,
+        read_only: bool,
+    ) -> Result<(), ExecutionError>;
     fn disable_implicit_vsock(&self, context: u32) -> Result<(), ExecutionError>;
-    fn disable_host_port_exposure(&self, context: u32) -> Result<(), ExecutionError>;
     fn set_workdir(&self, context: u32, workdir: &CStr) -> Result<(), ExecutionError>;
     fn set_exec(
         &self,
@@ -37,7 +41,6 @@ type SetVmConfigFn = unsafe extern "C" fn(u32, u8, u32) -> i32;
 type AddVirtiofs3Fn = unsafe extern "C" fn(u32, *const c_char, *const c_char, u64, bool) -> i32;
 type ContextOnlyFn = unsafe extern "C" fn(u32) -> i32;
 type StringOptionFn = unsafe extern "C" fn(u32, *const c_char) -> i32;
-type StringArrayOptionFn = unsafe extern "C" fn(u32, *const *const c_char) -> i32;
 type SetExecFn =
     unsafe extern "C" fn(u32, *const c_char, *const *const c_char, *const *const c_char) -> i32;
 
@@ -51,7 +54,6 @@ pub struct DynamicKrunApi {
     set_vm_config: SetVmConfigFn,
     add_virtiofs3: AddVirtiofs3Fn,
     disable_implicit_vsock: ContextOnlyFn,
-    set_port_map: StringArrayOptionFn,
     set_workdir: StringOptionFn,
     set_exec: SetExecFn,
     start_enter: ContextOnlyFn,
@@ -82,7 +84,6 @@ impl DynamicKrunApi {
         let set_vm_config = load_symbol(&library, b"krun_set_vm_config\0")?;
         let add_virtiofs3 = load_symbol(&library, b"krun_add_virtiofs3\0")?;
         let disable_implicit_vsock = load_symbol(&library, b"krun_disable_implicit_vsock\0")?;
-        let set_port_map = load_symbol(&library, b"krun_set_port_map\0")?;
         let set_workdir = load_symbol(&library, b"krun_set_workdir\0")?;
         let set_exec = load_symbol(&library, b"krun_set_exec\0")?;
         let start_enter = load_symbol(&library, b"krun_start_enter\0")?;
@@ -94,7 +95,6 @@ impl DynamicKrunApi {
             set_vm_config,
             add_virtiofs3,
             disable_implicit_vsock,
-            set_port_map,
             set_workdir,
             set_exec,
             start_enter,
@@ -125,12 +125,17 @@ impl KrunApi for DynamicKrunApi {
         })
     }
 
-    fn add_read_only_rootfs(&self, context: u32, rootfs: &CStr) -> Result<(), ExecutionError> {
+    fn add_rootfs(
+        &self,
+        context: u32,
+        rootfs: &CStr,
+        read_only: bool,
+    ) -> Result<(), ExecutionError> {
         const ROOT_TAG: &CStr = c"/dev/root";
         // SAFETY: both C strings live through the call; DAX is disabled and
-        // the read-only flag is always true for the authenticated rootfs.
+        // the caller explicitly chooses the guest mount's write policy.
         check_ffi("krun_add_virtiofs3", unsafe {
-            (self.add_virtiofs3)(context, ROOT_TAG.as_ptr(), rootfs.as_ptr(), 0, true)
+            (self.add_virtiofs3)(context, ROOT_TAG.as_ptr(), rootfs.as_ptr(), 0, read_only)
         })
     }
 
@@ -138,15 +143,6 @@ impl KrunApi for DynamicKrunApi {
         // SAFETY: scalar argument matches the loaded C signature.
         check_ffi("krun_disable_implicit_vsock", unsafe {
             (self.disable_implicit_vsock)(context)
-        })
-    }
-
-    fn disable_host_port_exposure(&self, context: u32) -> Result<(), ExecutionError> {
-        let empty = [std::ptr::null()];
-        // SAFETY: libkrun requires a NULL-terminated array. Passing an array
-        // containing only NULL explicitly disables all host port mappings.
-        check_ffi("krun_set_port_map", unsafe {
-            (self.set_port_map)(context, empty.as_ptr())
         })
     }
 
@@ -266,9 +262,8 @@ pub fn prepare_vm<'api>(
     };
 
     api.set_vm_config(context, config.vcpus, config.ram_mib)?;
-    api.add_read_only_rootfs(context, &rootfs)?;
+    api.add_rootfs(context, &rootfs, false)?;
     api.disable_implicit_vsock(context)?;
-    api.disable_host_port_exposure(context)?;
     api.set_workdir(context, &config.workdir)?;
     api.set_exec(
         context,

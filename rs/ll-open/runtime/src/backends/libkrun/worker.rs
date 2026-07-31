@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::api::{DynamicKrunApi, PreparedVm, prepare_vm};
 use super::confinement::{VmmHostResources, apply};
 use super::plan::{DirectoryRootfsResolver, compile_plan};
-use super::volume::materialize_ephemeral_rootfs;
+use super::volume::{materialize_ephemeral_rootfs, verify_ephemeral_rootfs};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerOptions {
@@ -116,6 +116,7 @@ pub fn execute_with_ready(
     // loader may need to resolve libkrun's transitive libraries. All actual VM
     // configuration and execution happen after ambient authority is dropped.
     let api = DynamicKrunApi::load(&options.libkrun)?;
+    verify_ephemeral_rootfs(&config.rootfs)?;
     let mut runtime_files = options.runtime_files;
     runtime_files.push(options.libkrun);
     apply(

@@ -4,8 +4,15 @@
 //! parent-owned directory, copies the verified tree into it, then verifies the
 //! copy against the same manifest before giving libkrun access to it.
 
-use std::fs;
+use std::ffi::OsStr;
+use std::fs::{self, File, OpenOptions};
+use std::io;
+use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+
+use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, fstat, open, openat, statat};
 
 use crate::ExecutionError;
 
@@ -55,52 +62,117 @@ pub fn materialize_ephemeral_rootfs(
             .permissions(),
     )
     .map_err(|error| invalid_io("preserve ephemeral rootfs permissions", error))?;
-    verify_manifest(&destination, &source.digest)?;
-
-    Ok(ResolvedRootfs {
+    let materialized = ResolvedRootfs {
         digest: source.digest.clone(),
         canonical_path: destination,
-    })
+    };
+    verify_ephemeral_rootfs(&materialized)?;
+    Ok(materialized)
 }
 
 fn copy_directory_contents(source: &Path, destination: &Path) -> Result<(), ExecutionError> {
-    let mut entries = fs::read_dir(source)
-        .map_err(|error| invalid_io("enumerate immutable rootfs", error))?
+    let source = open(
+        source,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| invalid_rustix("open immutable rootfs directory", error))?;
+    copy_directory_fd(&source, destination)
+}
+
+fn copy_directory_fd(source: &impl AsFd, destination: &Path) -> Result<(), ExecutionError> {
+    let mut entries = Dir::read_from(source)
+        .map_err(|error| invalid_rustix("enumerate immutable rootfs", error))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| invalid_io("enumerate immutable rootfs entry", error))?;
-    entries.sort_by_key(|entry| entry.file_name());
+        .map_err(|error| invalid_rustix("enumerate immutable rootfs entry", error))?;
+    entries.sort_by(|left, right| {
+        left.file_name()
+            .to_bytes()
+            .cmp(right.file_name().to_bytes())
+    });
 
     for entry in entries {
-        let source_path = entry.path();
-        let destination_path: PathBuf = destination.join(entry.file_name());
-        let metadata = fs::symlink_metadata(&source_path)
-            .map_err(|error| invalid_io("read immutable rootfs entry metadata", error))?;
-        if metadata.file_type().is_symlink() {
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        let before = statat(source, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| invalid_rustix("inspect immutable rootfs entry", error))?;
+        let expected_type = FileType::from_raw_mode(before.st_mode);
+        if expected_type.is_symlink() {
             return Err(ExecutionError::invalid(
                 "rootfs symbolic links are not supported",
             ));
         }
-        if metadata.is_dir() {
-            fs::create_dir(&destination_path)
-                .map_err(|error| invalid_io("create ephemeral rootfs directory", error))?;
-            copy_directory_contents(&source_path, &destination_path)?;
-            fs::set_permissions(&destination_path, metadata.permissions()).map_err(|error| {
-                invalid_io("preserve ephemeral rootfs directory permissions", error)
-            })?;
-        } else if metadata.is_file() {
-            fs::copy(&source_path, &destination_path)
-                .map_err(|error| invalid_io("copy ephemeral rootfs file", error))?;
-            fs::set_permissions(&destination_path, metadata.permissions())
-                .map_err(|error| invalid_io("preserve ephemeral rootfs file permissions", error))?;
-        } else {
+        if !expected_type.is_dir() && !expected_type.is_file() {
             return Err(ExecutionError::invalid(
                 "rootfs contains a non-regular filesystem entry",
             ));
+        }
+
+        let flags = OFlags::RDONLY
+            | OFlags::NOFOLLOW
+            | OFlags::CLOEXEC
+            | OFlags::NONBLOCK
+            | if expected_type.is_dir() {
+                OFlags::DIRECTORY
+            } else {
+                OFlags::empty()
+            };
+        let opened = openat(source, name, flags, Mode::empty()).map_err(|error| {
+            invalid_rustix("open immutable rootfs entry without following", error)
+        })?;
+        ensure_same_entry(&before, &opened)?;
+
+        let destination_path: PathBuf =
+            destination.join(OsStr::from_bytes(entry.file_name().to_bytes()));
+        let permissions = fs::Permissions::from_mode((before.st_mode as u32) & 0o7777);
+        if expected_type.is_dir() {
+            fs::create_dir(&destination_path)
+                .map_err(|error| invalid_io("create ephemeral rootfs directory", error))?;
+            copy_directory_fd(&opened, &destination_path)?;
+            fs::set_permissions(&destination_path, permissions).map_err(|error| {
+                invalid_io("preserve ephemeral rootfs directory permissions", error)
+            })?;
+        } else {
+            let mut source_file = File::from(opened);
+            let mut destination_file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&destination_path)
+                .map_err(|error| invalid_io("create ephemeral rootfs file", error))?;
+            io::copy(&mut source_file, &mut destination_file)
+                .map_err(|error| invalid_io("copy ephemeral rootfs file", error))?;
+            fs::set_permissions(&destination_path, permissions)
+                .map_err(|error| invalid_io("preserve ephemeral rootfs file permissions", error))?;
         }
     }
     Ok(())
 }
 
+fn ensure_same_entry(before: &rustix::fs::Stat, opened: &OwnedFd) -> Result<(), ExecutionError> {
+    let after = fstat(opened)
+        .map_err(|error| invalid_rustix("inspect opened immutable rootfs entry", error))?;
+    if before.st_dev != after.st_dev
+        || before.st_ino != after.st_ino
+        || FileType::from_raw_mode(before.st_mode) != FileType::from_raw_mode(after.st_mode)
+    {
+        return Err(ExecutionError::invalid(
+            "immutable rootfs entry changed during materialization",
+        ));
+    }
+    Ok(())
+}
+
+/// Recheck a completed per-run view immediately before VM configuration.
+pub fn verify_ephemeral_rootfs(rootfs: &ResolvedRootfs) -> Result<(), ExecutionError> {
+    verify_manifest(&rootfs.canonical_path, &rootfs.digest)
+}
+
 fn invalid_io(action: &str, error: std::io::Error) -> ExecutionError {
+    ExecutionError::invalid(format!("{action}: {error}"))
+}
+
+fn invalid_rustix(action: &str, error: rustix::io::Errno) -> ExecutionError {
     ExecutionError::invalid(format!("{action}: {error}"))
 }

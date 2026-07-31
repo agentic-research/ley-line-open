@@ -1,6 +1,6 @@
 [package]
 name = "leyline-schema"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 description = "Canonical nodes-table schema shared by the ley-line crates — one definition of the SQLite contract that writers project into and leyline-fs reads, no drift"
 repository = "https://github.com/agentic-research/ley-line-open"

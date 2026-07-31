@@ -10,6 +10,15 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-07-30
+
+The signing train: the ecosystem's one signing implementation reaches every
+runtime (DSSE/in-toto consolidated from rosary, three wasm artifacts in the
+verified asset set), the mount proof-verifies what it serves, install/update
+becomes product surface, and the whole train paid exactly one runner gate —
+every commit was gated by the attested local `task ci` on the integration
+branch first.
+
 ### Added
 
 - **`leyline-envelope`: DSSE + in-toto Statement v1 attestation in the

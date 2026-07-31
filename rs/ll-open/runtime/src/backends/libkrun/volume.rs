@@ -54,17 +54,17 @@ pub fn materialize_ephemeral_rootfs(
         ));
     }
 
-    copy_directory_contents(&source_path, &destination)?;
-    fs::set_permissions(
-        &destination,
-        fs::symlink_metadata(&source_path)
-            .map_err(|error| invalid_io("read immutable rootfs metadata", error))?
-            .permissions(),
-    )
-    .map_err(|error| invalid_io("preserve ephemeral rootfs permissions", error))?;
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o700))
+        .map_err(|error| invalid_io("make ephemeral run directory private", error))?;
+    let guest_root = destination.join("rootfs");
+    fs::create_dir(&guest_root)
+        .map_err(|error| invalid_io("create ephemeral guest rootfs", error))?;
+    fs::set_permissions(&guest_root, fs::Permissions::from_mode(0o700))
+        .map_err(|error| invalid_io("make rootfs private during materialization", error))?;
+    copy_directory_contents(&source_path, &guest_root)?;
     let materialized = ResolvedRootfs {
         digest: source.digest.clone(),
-        canonical_path: destination,
+        canonical_path: guest_root,
     };
     verify_ephemeral_rootfs(&materialized)?;
     Ok(materialized)
@@ -77,7 +77,14 @@ fn copy_directory_contents(source: &Path, destination: &Path) -> Result<(), Exec
         Mode::empty(),
     )
     .map_err(|error| invalid_rustix("open immutable rootfs directory", error))?;
-    copy_directory_fd(&source, destination)
+    let source_metadata =
+        fstat(&source).map_err(|error| invalid_rustix("inspect opened immutable rootfs", error))?;
+    copy_directory_fd(&source, destination)?;
+    fs::set_permissions(
+        destination,
+        fs::Permissions::from_mode((source_metadata.st_mode as u32) & 0o7777),
+    )
+    .map_err(|error| invalid_io("preserve ephemeral guest rootfs permissions", error))
 }
 
 fn copy_directory_fd(source: &impl AsFd, destination: &Path) -> Result<(), ExecutionError> {

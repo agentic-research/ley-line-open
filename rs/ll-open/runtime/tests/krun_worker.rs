@@ -89,7 +89,7 @@ fn first_party_worker_never_falls_back_to_the_krunvm_cli() {
     assert!(error.detail.contains("load libkrun shared library"));
     assert!(!marker.exists(), "worker invoked the krunvm PATH trap");
     assert_eq!(
-        fs::read(run_root.path().join("usr/bin/probe")).expect("ephemeral executable"),
+        fs::read(run_root.path().join("rootfs/usr/bin/probe")).expect("ephemeral executable"),
         b"probe-v1"
     );
     assert_eq!(

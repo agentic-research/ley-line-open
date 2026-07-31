@@ -45,6 +45,21 @@ fn guest_writes_are_isolated_from_the_immutable_cas_root() {
     let materialized =
         materialize_ephemeral_rootfs(&source, &destination).expect("materialize rootfs");
 
+    assert_eq!(
+        materialized.canonical_path,
+        destination
+            .canonicalize()
+            .expect("canonical run directory")
+            .join("rootfs")
+    );
+    assert_eq!(
+        fs::metadata(&destination)
+            .expect("private run directory")
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o700
+    );
     let executable = materialized.canonical_path.join("usr/bin/probe");
     assert_eq!(fs::read(&executable).expect("read copy"), b"probe-v1");
     assert_eq!(

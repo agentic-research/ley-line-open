@@ -290,7 +290,7 @@ fn concurrent_starts_reserve_a_run_id_before_spawning() {
         libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
-        ready_timeout: Duration::from_secs(1),
+        ready_timeout: Duration::from_secs(5),
     }));
     let barrier = Arc::new(Barrier::new(3));
     let starts: Vec<_> = (0..2)

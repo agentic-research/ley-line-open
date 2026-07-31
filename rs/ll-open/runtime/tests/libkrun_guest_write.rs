@@ -14,7 +14,11 @@ use tempfile::TempDir;
 #[ignore = "requires macOS/ARM64 with libkrun, libkrunfw, and the Linux musl Rust target"]
 fn guest_writes_the_ephemeral_root_without_mutating_cas() {
     let libkrun = std::env::var_os("LEYLINE_LIBKRUN_PATH").expect("LEYLINE_LIBKRUN_PATH");
-    let libkrunfw = std::env::var_os("LEYLINE_LIBKRUNFW_PATH").expect("LEYLINE_LIBKRUNFW_PATH");
+    let libkrunfw = std::path::PathBuf::from(
+        std::env::var_os("LEYLINE_LIBKRUNFW_PATH").expect("LEYLINE_LIBKRUNFW_PATH"),
+    )
+    .canonicalize()
+    .expect("canonical LEYLINE_LIBKRUNFW_PATH");
     let fixture = TempDir::new().expect("fixture");
     let staging = fixture.path().join("staging");
     let staging_bin = staging.join("bin");
@@ -155,7 +159,7 @@ fn guest_writes_the_ephemeral_root_without_mutating_cas() {
     );
     assert!(output.status.success(), "worker failed: {stderr}");
     assert_eq!(
-        fs::read(run_root.join("guest-write")).expect("guest output"),
+        fs::read(run_root.join("rootfs/guest-write")).expect("guest output"),
         b"written inside libkrun guest\n"
     );
     assert!(!immutable_root.join("guest-write").exists());

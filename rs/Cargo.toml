@@ -33,6 +33,7 @@ capnpc = "=0.25.0"
 # Async / IO
 tokio = "1.47"
 libc = "0.2.175"
+libloading = "0.9.0"
 memmap2 = "0.9.9"
 
 # Sync primitives — `parking_lot::{Mutex, RwLock}` replace `std::sync`
@@ -87,4 +88,3 @@ sha2 = "0.10"
 [profile.release]
 lto = "thin"
 codegen-units = 1
-

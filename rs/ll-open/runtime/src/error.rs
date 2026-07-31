@@ -37,4 +37,12 @@ impl ExecutionError {
             detail: detail.into(),
         }
     }
+
+    pub(crate) fn backend(detail: impl Into<String>) -> Self {
+        Self {
+            code: ErrorCode::BackendFailed,
+            retryable: false,
+            detail: detail.into(),
+        }
+    }
 }

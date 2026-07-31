@@ -24,10 +24,8 @@ then
 fi
 
 find rs -maxdepth 4 -name Cargo.toml -type f > "$tmp_dir/all-manifests"
-awk '
-  $0 != "rs/Cargo.toml" &&
-    $0 != "rs/ll-core/schema-spec/Cargo.toml" { print }
-' "$tmp_dir/all-manifests" > "$tmp_dir/release-manifests-raw"
+awk '$0 != "rs/Cargo.toml" { print }' \
+    "$tmp_dir/all-manifests" > "$tmp_dir/release-manifests-raw"
 LC_ALL=C sort "$tmp_dir/release-manifests-raw" \
     > "$tmp_dir/release-manifests"
 LC_ALL=C sort tools/release-version-manifests.txt \

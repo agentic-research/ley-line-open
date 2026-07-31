@@ -4,6 +4,7 @@ rs/ll-core/mcp-descriptor/Cargo.toml
 rs/ll-core/mcp-protocol-schema/Cargo.toml
 rs/ll-core/public-schema/Cargo.toml
 rs/ll-core/schema-capnp/Cargo.toml
+rs/ll-core/schema-spec/Cargo.toml
 rs/ll-core/schema/Cargo.toml
 rs/ll-open/cas-ffi/Cargo.toml
 rs/ll-open/cdc/Cargo.toml

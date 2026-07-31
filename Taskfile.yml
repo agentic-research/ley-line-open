@@ -426,6 +426,16 @@ tasks:
     cmds:
       - tools/verify_release_version.sh
 
+  release:crates:check:
+    desc: Package the schema-spec bootstrap and verify it precedes public-schema
+    cmds:
+      - tools/verify_crate_publish_order.sh
+
+  release:crates:fixture-test:
+    desc: Prove the public schema crate has a valid first-publication order
+    cmds:
+      - tools/test_crate_publish_order.sh
+
   release:verify-public:
     desc: Download and verify public assets plus the Apache Go module
     requires:
@@ -1401,6 +1411,7 @@ tasks:
         for manifest in \
           rs/ll-core/schema/Cargo.toml \
           rs/ll-core/public-schema/Cargo.toml \
+          rs/ll-core/schema-spec/Cargo.toml \
           rs/ll-core/schema-capnp/Cargo.toml
         do
           PACKAGE_VERSION="$(grep -m1 '^version = ' "$manifest" | cut -d'"' -f2)"
@@ -1438,6 +1449,7 @@ tasks:
       - task: schema:consumer-fixture-test
       - task: schema:mcp-protocol-pin-test
       - task: release:version-check
+      - task: release:crates:fixture-test
       - task: lint:blake3
       - task: lint:architecture-vocabulary
       - task: lint:doc-claims

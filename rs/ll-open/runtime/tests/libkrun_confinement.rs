@@ -51,6 +51,8 @@ fn nono_enforcement_denies_ambient_host_reads() {
 
         apply(&config_for_path(Path::new(&rootfs)), &resources).expect("apply nono");
         fs::read(Path::new(&rootfs).join("allowed")).expect("read granted rootfs");
+        fs::write(Path::new(&rootfs).join("guest-write"), b"ephemeral")
+            .expect("write granted ephemeral rootfs");
         let error = fs::read(denied_file).expect_err("ambient read must be denied");
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         return;
@@ -106,7 +108,7 @@ fn nono_policy_wraps_the_vmm_with_minimal_host_capabilities() {
     let grants = capabilities.fs_capabilities();
     assert!(grants.iter().any(|grant| {
         grant.resolved == rootfs.path().canonicalize().expect("rootfs")
-            && grant.access == AccessMode::Read
+            && grant.access == AccessMode::ReadWrite
             && !grant.is_file
     }));
     for resource in [libkrun, firmware] {

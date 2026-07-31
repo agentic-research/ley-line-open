@@ -20,7 +20,7 @@ pub fn build_capabilities(
     resources: &VmmHostResources,
 ) -> Result<CapabilitySet, ExecutionError> {
     let mut capabilities = CapabilitySet::new()
-        .allow_path(&config.rootfs.canonical_path, AccessMode::Read)
+        .allow_path(&config.rootfs.canonical_path, AccessMode::ReadWrite)
         .map_err(nono_error)?;
     for path in &resources.runtime_files {
         capabilities = capabilities

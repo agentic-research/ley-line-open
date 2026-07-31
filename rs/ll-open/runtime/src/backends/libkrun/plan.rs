@@ -126,7 +126,10 @@ struct ManifestFile {
     blake3: String,
 }
 
-fn verify_manifest(rootfs: &Path, digest: &DigestRef) -> Result<(), ExecutionError> {
+pub(crate) fn verify_manifest(
+    rootfs: &Path,
+    digest: &DigestRef,
+) -> Result<(), ExecutionError> {
     let manifest_path = rootfs.join(ROOTFS_MANIFEST);
     let metadata = manifest_path
         .symlink_metadata()

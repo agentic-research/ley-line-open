@@ -65,7 +65,11 @@ fn nono_enforcement_denies_ambient_host_reads() {
     fs::write(&denied_file, b"secret").expect("denied fixture");
 
     let status = Command::new(std::env::current_exe().expect("current test executable"))
-        .args(["--exact", "nono_enforcement_denies_ambient_host_reads"])
+        .args([
+            "--ignored",
+            "--exact",
+            "nono_enforcement_denies_ambient_host_reads",
+        ])
         .env("LEYLINE_NONO_CHILD", "1")
         .env("LEYLINE_NONO_ROOTFS", rootfs.path())
         .env("LEYLINE_NONO_RUNTIME_FILE", &runtime_file)

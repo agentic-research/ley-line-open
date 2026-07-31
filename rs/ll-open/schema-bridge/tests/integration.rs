@@ -2851,7 +2851,7 @@ fn build_tool_fixture(
 
         let mut node = nodes.reborrow().get(1);
         node.set_id(0xA11CE);
-        node.set_display_name(&format!("tools.capnp:{struct_name}"));
+        node.set_display_name(format!("tools.capnp:{struct_name}"));
         node.set_display_name_prefix_length("tools.capnp:".len() as u32);
 
         // Struct-node annotations: $Doc (tool description) + $Op (name).

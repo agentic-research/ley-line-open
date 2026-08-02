@@ -569,9 +569,9 @@ mod tests {
     /// pretty-printed "disk bytes" its vector uses.
     pub(crate) fn vector_statement() -> Statement {
         let predicate = serde_json::json!({
-            "phase": 0,
-            "from_agent": "dev-agent",
             "bead_id": "rosary-test",
+            "from_agent": "dev-agent",
+            "phase": 0,
             "summary": "Fixed the thing."
         });
         let disk = serde_json::to_vec_pretty(&predicate).expect("pretty");

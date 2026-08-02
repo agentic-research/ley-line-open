@@ -150,6 +150,49 @@ fn backend_cancel_terminates_the_worker_and_removes_its_run_root() {
 }
 
 #[test]
+fn backend_enforces_the_wall_clock_limit_and_cleans_up() {
+    let fixture = TempDir::new().expect("fixture");
+    let worker = fixture.path().join("leyline-krun-worker");
+    fs::write(
+        &worker,
+        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n/usr/bin/tail -f /dev/null\n",
+    )
+    .expect("fake worker");
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("worker mode");
+    let cas_root = fixture.path().join("cas");
+    let ephemeral_root = fixture.path().join("runs");
+    fs::create_dir(&cas_root).expect("CAS");
+    fs::create_dir(&ephemeral_root).expect("ephemeral root");
+    let libkrun = fixture.path().join("libkrun.dylib");
+    fs::write(&libkrun, b"library").expect("library fixture");
+    let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+        worker,
+        cas_root,
+        ephemeral_root: ephemeral_root.clone(),
+        libkrun,
+        runtime_files: Vec::new(),
+        devices: Vec::new(),
+        ready_timeout: Duration::from_secs(1),
+    });
+    let mut request = request();
+    request.limits.wall_time_ms = 50;
+
+    backend.start(&request).expect("ready worker");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while run_root_count(&ephemeral_root) != 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+
+    assert_eq!(run_root_count(&ephemeral_root), 0);
+    let errors = backend.take_cleanup_errors();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(
+        errors[0].code,
+        leyline_runtime::ErrorCode::ResourceExhausted
+    );
+}
+
+#[test]
 fn backend_cleanup_handles_guest_created_restrictive_directories() {
     let fixture = TempDir::new().expect("fixture");
     let worker = fixture.path().join("leyline-krun-worker");

@@ -31,6 +31,7 @@ fn config_for_path(rootfs: &Path) -> KrunConfig {
         workdir: CString::new("/").expect("workdir"),
         vcpus: 1,
         ram_mib: 512,
+        wall_time_ms: 1_000,
     }
 }
 

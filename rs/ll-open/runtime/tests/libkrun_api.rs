@@ -104,6 +104,7 @@ fn config(rootfs: &TempDir) -> KrunConfig {
         workdir: std::ffi::CString::new("/").expect("workdir"),
         vcpus: 2,
         ram_mib: 1024,
+        wall_time_ms: 1_000,
     }
 }
 

@@ -69,6 +69,7 @@ pub struct KrunConfig {
     pub workdir: CString,
     pub vcpus: u8,
     pub ram_mib: u32,
+    pub wall_time_ms: u64,
 }
 
 pub fn compile_plan(
@@ -109,6 +110,7 @@ pub fn compile_plan(
         workdir: CString::new("/").expect("static workdir has no NUL"),
         vcpus: request.limits.vcpus,
         ram_mib: request.limits.memory_mib,
+        wall_time_ms: request.limits.wall_time_ms,
     })
 }
 

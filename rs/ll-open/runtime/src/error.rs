@@ -8,6 +8,7 @@ pub enum ErrorCode {
     InvalidSpec,
     UnsupportedBackend,
     ResourceConflict,
+    ResourceExhausted,
     BackendFailed,
     Internal,
 }

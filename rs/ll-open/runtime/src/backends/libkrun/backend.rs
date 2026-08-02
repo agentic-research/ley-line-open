@@ -5,7 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tempfile::{Builder as TempDirBuilder, TempDir};
@@ -86,6 +86,7 @@ impl Backend for KrunWorkerBackend {
     }
 
     fn start(&self, request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+        request.validate()?;
         if !self.configured() {
             return Err(ExecutionError::backend(
                 "libkrun worker backend is not configured with existing first-party resources",
@@ -263,8 +264,11 @@ impl Backend for KrunWorkerBackend {
         );
         let children = Arc::clone(&self.children);
         let cleanup_errors = Arc::clone(&self.cleanup_errors);
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(request.limits.wall_time_ms))
+            .ok_or_else(|| ExecutionError::invalid("wall-clock limit is too large"))?;
         std::thread::spawn(move || {
-            let result = supervise_worker(child, rootfs, cancel_rx);
+            let result = supervise_worker(child, rootfs, cancel_rx, deadline);
             if let Err(error) = &result {
                 cleanup_errors.lock().push(error.clone());
             }
@@ -298,6 +302,7 @@ fn supervise_worker(
     mut child: Child,
     rootfs: TempDir,
     cancel: mpsc::Receiver<()>,
+    deadline: Instant,
 ) -> Result<(), ExecutionError> {
     loop {
         match child.try_wait() {
@@ -311,6 +316,16 @@ fn supervise_worker(
                     "poll libkrun worker status: {error}"
                 )));
             }
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            cleanup_tempdir(rootfs)?;
+            return Err(ExecutionError {
+                code: crate::ErrorCode::ResourceExhausted,
+                retryable: false,
+                detail: "execution exceeded wall-clock limit".into(),
+            });
         }
         match cancel.recv_timeout(Duration::from_millis(10)) {
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {

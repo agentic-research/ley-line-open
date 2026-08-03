@@ -106,6 +106,13 @@ content-addressed receipt assembly. Native backend conformance and mmap-backed
 CAS projection remain separate follow-on gates in beads
 `ley-line-open-f81567` and `ley-line-open-16c953`.
 
+For embedders that keep an explicit artifact catalog, `CatalogResolver` binds
+the authorized executable artifact and workspace graph identities to a
+content-addressed rootfs digest and guest-relative entrypoint. It rejects
+unknown or duplicate identities, workspace drift, path traversal, and output
+limits that the backend cannot enforce; it never accepts host paths from the
+execution wire request.
+
 Mutation testing remains a separate hardening pass: use the repository's
 `task mutants:diff DIFF=<path>` gate after the runtime edge-case tests are
 expanded. The initial local runtime mutation run exposed survivor cases that

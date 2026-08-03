@@ -6,11 +6,16 @@
 
 pub mod authorization;
 pub mod backends;
+mod catalog;
 mod error;
 mod model;
 mod service;
 pub mod transport;
 
+pub use authorization::{
+    ArtifactIdentity, AuthorizedExecution, SchemaIntent, SchemaLimits, WorkspaceInput,
+};
+pub use catalog::{CatalogBuilder, CatalogResolver};
 pub use error::{ErrorCode, ExecutionError};
 pub use model::{
     BackendCapabilities, BackendClass, BackendRun, BackendRunStatus, DigestRef, ExecutionRequest,

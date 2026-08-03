@@ -15,4 +15,4 @@ pub use model::{
     BackendCapabilities, BackendClass, BackendRun, DigestRef, ExecutionRequest, ResourceLimits,
     RunRecord, RunState,
 };
-pub use service::{Backend, ExecutionService};
+pub use service::{Backend, ExecutionResolver, ExecutionService};

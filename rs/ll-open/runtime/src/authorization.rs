@@ -6,6 +6,7 @@
 //! define a second wire model.  Backend/rootfs resolution happens after this
 //! check, through a trusted resolver owned by the runtime.
 
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use capnp::message::ReaderOptions;
@@ -44,6 +45,41 @@ pub struct AuthorizedExecution {
     pub confinement_digest: String,
     pub backend: BackendClass,
     pub allowed_egress: Vec<String>,
+    pub intent: SchemaIntent,
+}
+
+/// Owned, policy-free intent extracted from the generated `RunSpec` reader.
+///
+/// A resolver may use these logical identities to select a content-addressed
+/// rootfs and guest-relative executable. It must not accept host paths from a
+/// caller or skip the preceding [`authorize`] call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaIntent {
+    pub executable: ArtifactIdentity,
+    pub arguments: Vec<String>,
+    pub public_environment: BTreeMap<String, String>,
+    pub workspace_inputs: Vec<WorkspaceInput>,
+    pub requested_limits: SchemaLimits,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactIdentity {
+    pub digest: String,
+    pub media_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceInput {
+    pub name: String,
+    pub graph_root: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaLimits {
+    pub wall_time_ms: u64,
+    pub memory_bytes: u64,
+    pub cpu_millis: u64,
+    pub output_bytes: u64,
 }
 
 /// Validate and bind serialized execution/v1 `RunSpec` and `RunGrant` values.
@@ -104,6 +140,7 @@ pub fn authorize(
         read_digest(grant.get_confinement_digest(), "RunGrant.confinementDigest")?;
     validate_limits(spec.get_requested_limits(), grant.get_limits())?;
     validate_workspaces(spec.get_workspace_inputs(), grant.get_workspaces())?;
+    let intent = read_intent(&spec)?;
 
     let mut has_execution_capability = false;
     let capabilities = grant
@@ -159,6 +196,7 @@ pub fn authorize(
         confinement_digest,
         backend,
         allowed_egress,
+        intent,
     })
 }
 
@@ -240,6 +278,70 @@ fn validate_evidence(
     )?;
     let _ = read_digest(evidence.get_digest(), &format!("{field}.digest"))?;
     Ok(())
+}
+
+fn read_intent(
+    spec: &execution_capnp::run_spec::Reader<'_>,
+) -> Result<SchemaIntent, ExecutionError> {
+    let executable = spec
+        .get_executable()
+        .map_err(|error| ExecutionError::invalid(format!("invalid executable: {error}")))?;
+    let media_type = nonempty(
+        text(executable.get_media_type(), "executable.mediaType")?,
+        "executable.mediaType",
+    )?;
+    let arguments = spec
+        .get_arguments()
+        .map_err(|error| ExecutionError::invalid(format!("invalid arguments: {error}")))?
+        .iter()
+        .map(|value| text(value, "arguments entry"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut public_environment = BTreeMap::new();
+    for entry in spec
+        .get_public_environment()
+        .map_err(|error| ExecutionError::invalid(format!("invalid publicEnvironment: {error}")))?
+    {
+        let key = nonempty(text(entry.get_key(), "environment key")?, "environment key")?;
+        let value = text(entry.get_value(), "environment value")?;
+        if public_environment.insert(key.clone(), value).is_some() {
+            return Err(ExecutionError::invalid(format!(
+                "duplicate public environment key: {key}"
+            )));
+        }
+    }
+    let workspace_inputs = spec
+        .get_workspace_inputs()
+        .map_err(|error| ExecutionError::invalid(format!("invalid workspaceInputs: {error}")))?
+        .iter()
+        .map(|workspace| {
+            Ok(WorkspaceInput {
+                name: nonempty(
+                    text(workspace.get_name(), "workspaceInputs.name")?,
+                    "workspace name",
+                )?,
+                graph_root: read_digest(workspace.get_graph_root(), "workspaceInputs.graphRoot")?,
+            })
+        })
+        .collect::<Result<Vec<_>, ExecutionError>>()?;
+    let limits = spec
+        .get_requested_limits()
+        .map_err(|error| ExecutionError::invalid(format!("invalid requestedLimits: {error}")))?;
+
+    Ok(SchemaIntent {
+        executable: ArtifactIdentity {
+            digest: read_digest(executable.get_digest(), "executable.digest")?,
+            media_type,
+        },
+        arguments,
+        public_environment,
+        workspace_inputs,
+        requested_limits: SchemaLimits {
+            wall_time_ms: limits.get_wall_time_ms(),
+            memory_bytes: limits.get_memory_bytes(),
+            cpu_millis: limits.get_cpu_millis(),
+            output_bytes: limits.get_output_bytes(),
+        },
+    })
 }
 
 fn validate_limits(

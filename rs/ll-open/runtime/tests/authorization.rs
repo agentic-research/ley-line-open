@@ -1,10 +1,14 @@
 use capnp::message::Builder;
 use leyline_public_schema::execution_capnp;
-use leyline_runtime::BackendClass;
 use leyline_runtime::authorization::{
     AuthorizationPolicy, EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION, authorize,
     canonical_digest,
 };
+use leyline_runtime::{
+    Backend, BackendCapabilities, BackendClass, BackendRun, ExecutionError, ExecutionRequest,
+    ExecutionResolver, ExecutionService, ResourceLimits,
+};
+use std::collections::BTreeMap;
 
 fn spec_bytes() -> Vec<u8> {
     spec_bytes_with_interface(None, 0)
@@ -14,6 +18,9 @@ fn spec_bytes_with_interface(interface: Option<&str>, wall_time_ms: u64) -> Vec<
     let mut message = Builder::new_default();
     let mut spec = message.init_root::<execution_capnp::run_spec::Builder<'_>>();
     spec.set_schema_version(EXECUTION_SCHEMA_VERSION);
+    let mut executable = spec.reborrow().init_executable();
+    executable.set_media_type("application/test-executable");
+    set_digest(executable.reborrow().init_digest(), &"c".repeat(64));
     if let Some(interface) = interface {
         let mut interfaces = spec.reborrow().init_requested_interfaces(1);
         interfaces.set(0, interface);
@@ -151,4 +158,73 @@ fn rejects_grant_that_widens_requested_limits() {
     )
     .expect_err("widened grant must be rejected");
     assert!(error.detail.contains("widens"));
+}
+
+struct RecordingBackend;
+
+impl Backend for RecordingBackend {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            backend_id: "test/1".into(),
+            backend_class: BackendClass::MicroVm,
+            available: true,
+        }
+    }
+
+    fn start(&self, request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+        Ok(BackendRun {
+            backend_id: format!("test/{}", request.run_id),
+        })
+    }
+
+    fn cancel(&self, _run_id: &str) -> Result<bool, ExecutionError> {
+        Ok(true)
+    }
+}
+
+struct TestResolver;
+
+impl ExecutionResolver for TestResolver {
+    fn resolve(
+        &self,
+        authorized: &leyline_runtime::authorization::AuthorizedExecution,
+    ) -> Result<ExecutionRequest, ExecutionError> {
+        Ok(ExecutionRequest {
+            run_id: authorized.run_id.clone(),
+            replay_key: authorized.replay_key.clone(),
+            rootfs: leyline_runtime::DigestRef {
+                algorithm: "blake3-256".into(),
+                value: "a".repeat(64),
+            },
+            executable: "usr/bin/true".into(),
+            arguments: vec![],
+            public_environment: BTreeMap::new(),
+            allowed_egress: authorized.allowed_egress.clone(),
+            limits: ResourceLimits {
+                vcpus: 1,
+                memory_mib: 128,
+                wall_time_ms: 1_000,
+            },
+        })
+    }
+}
+
+#[test]
+fn service_schema_entrypoint_authorizes_before_resolving() {
+    let spec = spec_bytes();
+    let grant = grant_bytes(&spec, true, 2_000, 0);
+    let service = ExecutionService::new(RecordingBackend);
+    let record = service
+        .start_authorized(
+            &spec,
+            &grant,
+            &AuthorizationPolicy {
+                now_unix_ms: 1_000,
+                required_backend: BackendClass::MicroVm,
+            },
+            &TestResolver,
+        )
+        .expect("schema request should enter shared lifecycle");
+    assert!(record.run_id.starts_with("run-"));
+    assert_eq!(record.state, leyline_runtime::RunState::Running);
 }

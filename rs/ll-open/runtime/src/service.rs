@@ -4,7 +4,20 @@ use parking_lot::RwLock;
 
 use crate::{
     BackendCapabilities, BackendRun, ExecutionError, ExecutionRequest, RunRecord, RunState,
+    authorization::{AuthorizationPolicy, AuthorizedExecution, authorize},
 };
+
+/// Trusted boundary that resolves schema-level logical identities into the
+/// private guest-relative request understood by a backend.
+///
+/// Implementations own CAS/Graph lookup and may introduce host paths only
+/// internally. Callers must not supply a host path through this trait; the
+/// resolver receives the already-authorized, owned intent extracted from the
+/// generated execution/v1 schema.
+pub trait ExecutionResolver: Send + Sync + 'static {
+    fn resolve(&self, authorized: &AuthorizedExecution)
+    -> Result<ExecutionRequest, ExecutionError>;
+}
 
 /// Backend boundary shared by native and microVM implementations.
 pub trait Backend: Send + Sync + 'static {
@@ -86,6 +99,37 @@ impl<B: Backend> ExecutionService<B> {
             .insert(request.replay_key, request.run_id.clone());
         state.runs.insert(request.run_id, record.clone());
         Ok(record)
+    }
+
+    /// Authorize a generated execution/v1 spec and grant, resolve their
+    /// logical identities, then enter the same lifecycle as every other
+    /// transport. This is the only schema-to-backend entry point; UDS, CLI,
+    /// and MCP adapters should all call it instead of reimplementing policy.
+    pub fn start_authorized<R: ExecutionResolver>(
+        &self,
+        spec_bytes: &[u8],
+        grant_bytes: &[u8],
+        policy: &AuthorizationPolicy,
+        resolver: &R,
+    ) -> Result<RunRecord, ExecutionError> {
+        let authorized = authorize(spec_bytes, grant_bytes, policy)?;
+        let request = resolver.resolve(&authorized)?;
+        if request.run_id != authorized.run_id {
+            return Err(ExecutionError::invalid(
+                "resolver returned a run_id different from the authorized identity",
+            ));
+        }
+        if request.replay_key != authorized.replay_key {
+            return Err(ExecutionError::invalid(
+                "resolver returned a replay key different from the authorized grant",
+            ));
+        }
+        if request.allowed_egress != authorized.allowed_egress {
+            return Err(ExecutionError::invalid(
+                "resolver changed the grant's allowed egress",
+            ));
+        }
+        self.start(request)
     }
 
     /// Cancel one active run and return its terminal record.

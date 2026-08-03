@@ -74,6 +74,11 @@ impl NativeWorkerBackend {
             if let Some(status) = completed.remove(run_id) {
                 return Ok(status);
             }
+            if !self.children.lock().contains_key(run_id) {
+                return Err(ExecutionError::invalid(format!(
+                    "run_id is not active or pending completion: {run_id}"
+                )));
+            }
             self.completion_cv.wait(&mut completed);
         }
     }

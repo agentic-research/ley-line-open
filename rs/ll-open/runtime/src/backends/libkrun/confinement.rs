@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use nono::{AccessMode, CapabilitySet, Sandbox};
 
@@ -19,15 +19,33 @@ pub fn build_capabilities(
     config: &KrunConfig,
     resources: &VmmHostResources,
 ) -> Result<CapabilitySet, ExecutionError> {
+    build_process_capabilities(
+        &config.rootfs.canonical_path,
+        &resources.runtime_files,
+        &resources.devices,
+    )
+}
+
+/// Build the common fail-closed policy for a native worker or a VMM worker.
+///
+/// The rootfs is the only read/write tree. Runtime libraries are read-only;
+/// optional device paths are explicitly read/write. No network capability is
+/// granted here. Keeping this policy independent of libkrun prevents a native
+/// nono backend from silently widening authority while the backend is added.
+pub fn build_process_capabilities(
+    rootfs: &Path,
+    runtime_files: &[PathBuf],
+    devices: &[PathBuf],
+) -> Result<CapabilitySet, ExecutionError> {
     let mut capabilities = CapabilitySet::new()
-        .allow_path(&config.rootfs.canonical_path, AccessMode::ReadWrite)
+        .allow_path(rootfs, AccessMode::ReadWrite)
         .map_err(nono_error)?;
-    for path in &resources.runtime_files {
+    for path in runtime_files {
         capabilities = capabilities
             .allow_file(path, AccessMode::Read)
             .map_err(nono_error)?;
     }
-    for path in &resources.devices {
+    for path in devices {
         capabilities = capabilities
             .allow_file(path, AccessMode::ReadWrite)
             .map_err(nono_error)?;

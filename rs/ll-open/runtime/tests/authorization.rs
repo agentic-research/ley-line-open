@@ -9,8 +9,8 @@ use leyline_runtime::transport::{
     capabilities_json, cleanup_json, collect_json, start_json, status_json,
 };
 use leyline_runtime::{
-    Backend, BackendCapabilities, BackendClass, BackendRun, ExecutionError, ExecutionRequest,
-    ExecutionResolver, ExecutionService, ResourceLimits,
+    Backend, BackendCapabilities, BackendClass, BackendRun, BackendRunStatus, ExecutionError,
+    ExecutionRequest, ExecutionResolver, ExecutionService, ResourceLimits,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -189,6 +189,32 @@ impl Backend for RecordingBackend {
 
 struct TestResolver;
 
+struct CompletingBackend;
+
+impl Backend for CompletingBackend {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            backend_id: "completing/1".into(),
+            backend_class: BackendClass::MicroVm,
+            available: true,
+        }
+    }
+
+    fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+        Ok(BackendRun {
+            backend_id: "completing/1".into(),
+        })
+    }
+
+    fn poll(&self, _run_id: &str) -> Result<Option<BackendRunStatus>, ExecutionError> {
+        Ok(Some(BackendRunStatus::Succeeded))
+    }
+
+    fn cancel(&self, _run_id: &str) -> Result<bool, ExecutionError> {
+        Ok(true)
+    }
+}
+
 impl ExecutionResolver for TestResolver {
     fn resolve(
         &self,
@@ -245,6 +271,33 @@ fn service_schema_entrypoint_authorizes_before_resolving() {
         inspection.events[3].state,
         leyline_runtime::RunState::Running
     );
+}
+
+#[test]
+fn natural_backend_completion_can_collect_a_schema_receipt() {
+    let spec = spec_bytes();
+    let grant = grant_bytes(&spec, true, 2_000, 0);
+    let service = ExecutionService::new(CompletingBackend);
+    service
+        .provision(BackendClass::MicroVm, "provision-completing")
+        .expect("provision backend");
+    let record = service
+        .start_authorized(
+            &spec,
+            &grant,
+            &AuthorizationPolicy {
+                now_unix_ms: 1_000,
+                required_backend: BackendClass::MicroVm,
+            },
+            &TestResolver,
+        )
+        .expect("schema request should start");
+
+    let receipt = service
+        .collect(&record.run_id)
+        .expect("collect terminal receipt");
+    assert_eq!(receipt.terminal_state, leyline_runtime::RunState::Succeeded);
+    assert!(receipt.event_log_root.starts_with("blake3-256:"));
 }
 
 fn spec_json(bytes: &[u8]) -> String {

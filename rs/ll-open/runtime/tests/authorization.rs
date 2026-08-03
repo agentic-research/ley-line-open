@@ -230,6 +230,16 @@ fn service_schema_entrypoint_authorizes_before_resolving() {
         .expect("schema request should enter shared lifecycle");
     assert!(record.run_id.starts_with("run-"));
     assert_eq!(record.state, leyline_runtime::RunState::Running);
+    let inspection = service.inspect(&record.run_id, 0).expect("inspect events");
+    assert_eq!(inspection.events.len(), 4);
+    assert_eq!(
+        inspection.events[0].state,
+        leyline_runtime::RunState::Accepted
+    );
+    assert_eq!(
+        inspection.events[3].state,
+        leyline_runtime::RunState::Running
+    );
 }
 
 fn spec_json(bytes: &[u8]) -> String {

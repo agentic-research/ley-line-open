@@ -116,8 +116,31 @@ pub struct BackendRun {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RunState {
+    Accepted,
+    Provisioning,
+    Ready,
     Running,
+    Succeeded,
+    Failed,
     Cancelled,
+    Cleaning,
+    Cleaned,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunEventRecord {
+    pub sequence: u64,
+    pub state: RunState,
+    pub timestamp_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunInspection {
+    pub run_id: String,
+    pub state: RunState,
+    pub events: Vec<RunEventRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

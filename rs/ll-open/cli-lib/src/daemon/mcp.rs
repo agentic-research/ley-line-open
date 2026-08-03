@@ -478,6 +478,16 @@ pub fn tool_registry() -> Vec<McpTool> {
             }),
         },
         McpTool {
+            name: "llo_execution_inspect",
+            description: "Read ordered lifecycle events for one LLO execution.",
+            schema: json!({
+                "type": "object",
+                "properties": {"runId": {"type": "string"}, "afterSequence": {"type": "integer"}},
+                "required": ["runId"],
+                "additionalProperties": false
+            }),
+        },
+        McpTool {
             name: "llo_execution_cancel",
             description: "Cancel an active execution through LLO's shared lifecycle.",
             schema: json!({
@@ -629,6 +639,7 @@ pub fn cloister_groups() -> Vec<CloisterGroupDecl> {
             "llo_execution_capabilities",
             "llo_execution_status",
             "llo_execution_start",
+            "llo_execution_inspect",
             "llo_execution_cancel",
         ],
     });

@@ -127,6 +127,43 @@ pub fn cancel_json<B: crate::Backend>(
     encode_cancel(output_message)
 }
 
+pub fn inspect_json<B: crate::Backend>(
+    service: &ExecutionService<B>,
+    input_json: &str,
+) -> Result<String, ExecutionError> {
+    let mut input_message = Builder::new_default();
+    let input = input_message.init_root::<execution_capnp::inspect_input::Builder<'_>>();
+    capnp_json::from_json(input_json, input).map_err(|error| {
+        ExecutionError::invalid(format!("invalid execution inspect input: {error}"))
+    })?;
+    let input = input_message
+        .get_root_as_reader::<execution_capnp::inspect_input::Reader<'_>>()
+        .map_err(|error| ExecutionError::invalid(format!("invalid inspect input root: {error}")))?;
+    let run_id = input
+        .get_run_id()
+        .map_err(|error| ExecutionError::invalid(format!("invalid inspect runId: {error}")))?
+        .to_str()
+        .map_err(|error| ExecutionError::invalid(format!("inspect runId is not UTF-8: {error}")))?;
+    let after_sequence = input.get_after_sequence();
+    let inspection = service.inspect(run_id, after_sequence)?;
+
+    let mut output_message = Builder::new_default();
+    let mut output = output_message.init_root::<execution_capnp::inspect_output::Builder<'_>>();
+    output.set_run_id(&inspection.run_id);
+    output.set_state(to_schema_state(inspection.state));
+    let mut events = output
+        .reborrow()
+        .init_events(inspection.events.len() as u32);
+    for (index, event) in inspection.events.iter().enumerate() {
+        let mut entry = events.reborrow().get(index as u32);
+        entry.set_sequence(event.sequence);
+        entry.set_run_id(&inspection.run_id);
+        entry.set_state(to_schema_state(event.state));
+        entry.set_timestamp_ms(event.timestamp_ms);
+    }
+    encode_inspect(output_message)
+}
+
 fn serialize_root<T: capnp::traits::Owned>(
     reader: T::Reader<'_>,
 ) -> Result<Vec<u8>, ExecutionError> {
@@ -174,9 +211,24 @@ fn encode_cancel(message: Builder<HeapAllocator>) -> Result<String, ExecutionErr
         .map_err(|error| ExecutionError::internal(format!("encode execution response: {error}")))
 }
 
+fn encode_inspect(message: Builder<HeapAllocator>) -> Result<String, ExecutionError> {
+    let reader = message
+        .get_root_as_reader::<execution_capnp::inspect_output::Reader<'_>>()
+        .map_err(|error| ExecutionError::internal(format!("read inspect response: {error}")))?;
+    capnp_json::to_json(reader)
+        .map_err(|error| ExecutionError::internal(format!("encode inspect response: {error}")))
+}
+
 fn to_schema_state(state: RunState) -> execution_capnp::RunState {
     match state {
+        RunState::Accepted => execution_capnp::RunState::Accepted,
+        RunState::Provisioning => execution_capnp::RunState::Provisioning,
+        RunState::Ready => execution_capnp::RunState::Ready,
         RunState::Running => execution_capnp::RunState::Running,
+        RunState::Succeeded => execution_capnp::RunState::Succeeded,
+        RunState::Failed => execution_capnp::RunState::Failed,
         RunState::Cancelled => execution_capnp::RunState::Cancelled,
+        RunState::Cleaning => execution_capnp::RunState::Cleaning,
+        RunState::Cleaned => execution_capnp::RunState::Cleaned,
     }
 }

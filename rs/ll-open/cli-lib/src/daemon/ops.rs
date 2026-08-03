@@ -188,6 +188,10 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
         BaseRequest::LloExecutionCapabilities => op_execution_capabilities(ctx),
         BaseRequest::LloExecutionStatus { run_id } => op_execution_status(ctx, run_id),
         BaseRequest::LloExecutionStart { spec, grant } => op_execution_start(ctx, spec, grant),
+        BaseRequest::LloExecutionInspect {
+            run_id,
+            after_sequence,
+        } => op_execution_inspect(ctx, run_id, after_sequence),
         BaseRequest::LloExecutionCancel {
             run_id,
             idempotency_key,
@@ -223,6 +227,17 @@ fn op_execution_start(
     grant: serde_json::Value,
 ) -> Result<String> {
     Ok(execution_handler(ctx)?.start(&json!({"spec": spec, "grant": grant}))?)
+}
+
+fn op_execution_inspect(
+    ctx: &DaemonContext,
+    run_id: String,
+    after_sequence: Option<u64>,
+) -> Result<String> {
+    Ok(execution_handler(ctx)?.inspect(&json!({
+        "runId": run_id,
+        "afterSequence": after_sequence.unwrap_or(0),
+    }))?)
 }
 
 fn op_execution_cancel(

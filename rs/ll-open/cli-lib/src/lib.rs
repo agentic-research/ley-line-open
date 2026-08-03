@@ -307,6 +307,15 @@ pub enum ExecutionCommands {
         #[arg(long)]
         run_id: Option<String>,
     },
+    /// Read ordered lifecycle events for one run.
+    Inspect {
+        #[arg(long)]
+        control: PathBuf,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long, default_value_t = 0)]
+        after_sequence: u64,
+    },
     /// Start a signed execution/v1 spec and grant from JSON files.
     Start {
         #[arg(long)]
@@ -337,6 +346,11 @@ pub async fn run(cmd: Commands) -> Result<()> {
             ExecutionCommands::Status { control, run_id } => {
                 cmd_execution::status(&control, run_id.as_deref()).await
             }
+            ExecutionCommands::Inspect {
+                control,
+                run_id,
+                after_sequence,
+            } => cmd_execution::inspect(&control, &run_id, after_sequence).await,
             ExecutionCommands::Start {
                 control,
                 spec,

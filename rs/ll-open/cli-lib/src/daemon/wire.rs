@@ -117,6 +117,7 @@ pub const BASE_OP_NAMES: &[&str] = &[
     "llo_execution_capabilities",
     "llo_execution_status",
     "llo_execution_start",
+    "llo_execution_inspect",
     "llo_execution_cancel",
 ];
 
@@ -294,6 +295,13 @@ pub enum BaseRequest {
     LloExecutionStart {
         spec: serde_json::Value,
         grant: serde_json::Value,
+    },
+    /// Generated execution/v1 event inspection input.
+    LloExecutionInspect {
+        #[serde(rename = "runId")]
+        run_id: String,
+        #[serde(rename = "afterSequence", default)]
+        after_sequence: Option<u64>,
     },
     /// Generated execution/v1 cancellation input.
     LloExecutionCancel {

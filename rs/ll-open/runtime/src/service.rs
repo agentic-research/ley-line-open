@@ -1,9 +1,11 @@
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
 
 use crate::{
-    BackendCapabilities, BackendRun, ExecutionError, ExecutionRequest, RunRecord, RunState,
+    BackendCapabilities, BackendRun, ExecutionError, ExecutionRequest, RunEventRecord,
+    RunInspection, RunRecord, RunState,
     authorization::{AuthorizationPolicy, AuthorizedExecution, authorize},
 };
 
@@ -39,6 +41,7 @@ pub trait Backend: Send + Sync + 'static {
 struct ServiceState {
     runs: HashMap<String, RunRecord>,
     replay: HashMap<String, String>,
+    events: HashMap<String, Vec<RunEventRecord>>,
 }
 
 /// One lifecycle implementation used by every transport adapter.
@@ -61,6 +64,32 @@ impl<B: Backend> ExecutionService<B> {
 
     pub fn status(&self, run_id: &str) -> Result<Option<RunRecord>, ExecutionError> {
         Ok(self.state.read().runs.get(run_id).cloned())
+    }
+
+    /// Read the current run state and ordered events after a cursor.
+    pub fn inspect(
+        &self,
+        run_id: &str,
+        after_sequence: u64,
+    ) -> Result<RunInspection, ExecutionError> {
+        let state = self.state.read();
+        let record = state
+            .runs
+            .get(run_id)
+            .ok_or_else(|| ExecutionError::invalid("run_id not found"))?;
+        let events = state
+            .events
+            .get(run_id)
+            .into_iter()
+            .flatten()
+            .filter(|event| event.sequence > after_sequence)
+            .cloned()
+            .collect();
+        Ok(RunInspection {
+            run_id: record.run_id.clone(),
+            state: record.state,
+            events,
+        })
     }
 
     pub fn start(&self, request: ExecutionRequest) -> Result<RunRecord, ExecutionError> {
@@ -98,6 +127,16 @@ impl<B: Backend> ExecutionService<B> {
             .replay
             .insert(request.replay_key, request.run_id.clone());
         state.runs.insert(request.run_id, record.clone());
+        let run_id = record.run_id.clone();
+        state.events.insert(
+            run_id,
+            vec![
+                event(1, RunState::Accepted),
+                event(2, RunState::Provisioning),
+                event(3, RunState::Ready),
+                event(4, RunState::Running),
+            ],
+        );
         Ok(record)
     }
 
@@ -152,11 +191,34 @@ impl<B: Backend> ExecutionService<B> {
         }
 
         let mut state = self.state.write();
-        let record = state
-            .runs
-            .get_mut(run_id)
-            .ok_or_else(|| ExecutionError::internal("run disappeared during cancellation"))?;
-        record.state = RunState::Cancelled;
-        Ok(record.clone())
+        let record = {
+            let record = state
+                .runs
+                .get_mut(run_id)
+                .ok_or_else(|| ExecutionError::internal("run disappeared during cancellation"))?;
+            record.state = RunState::Cancelled;
+            record.clone()
+        };
+        let sequence = state
+            .events
+            .get(run_id)
+            .map_or(1, |events| events.len() as u64 + 1);
+        state
+            .events
+            .entry(run_id.to_owned())
+            .or_default()
+            .push(event(sequence, RunState::Cancelled));
+        Ok(record)
+    }
+}
+
+fn event(sequence: u64, state: RunState) -> RunEventRecord {
+    RunEventRecord {
+        sequence,
+        state,
+        timestamp_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
     }
 }

@@ -54,6 +54,18 @@ pub async fn start(control: &Path, spec: &Path, grant: &Path) -> Result<()> {
     .await
 }
 
+pub async fn inspect(control: &Path, run_id: &str, after_sequence: u64) -> Result<()> {
+    call(
+        control,
+        json!({
+            "op": "llo_execution_inspect",
+            "runId": run_id,
+            "afterSequence": after_sequence
+        }),
+    )
+    .await
+}
+
 pub async fn cancel(control: &Path, run_id: &str, idempotency_key: Option<&str>) -> Result<()> {
     call(
         control,

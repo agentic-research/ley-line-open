@@ -14,6 +14,6 @@ pub mod transport;
 pub use error::{ErrorCode, ExecutionError};
 pub use model::{
     BackendCapabilities, BackendClass, BackendRun, DigestRef, ExecutionRequest, ResourceLimits,
-    RunRecord, RunState,
+    RunEventRecord, RunInspection, RunRecord, RunState,
 };
 pub use service::{Backend, ExecutionResolver, ExecutionService};

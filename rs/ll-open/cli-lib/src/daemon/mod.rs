@@ -11,6 +11,7 @@ pub mod embed;
 pub mod enrichment;
 pub mod events;
 pub mod execution;
+pub mod execution_contract;
 pub mod ext;
 pub mod granularity_router;
 #[cfg(feature = "hdc")]

@@ -7,7 +7,7 @@ use std::path::Path;
 
 use crate::daemon::client::ExecutionClient;
 use anyhow::{Context, Result};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 async fn call(control: &Path, request: Value) -> Result<()> {
     let response = ExecutionClient::new(control).call(request).await?;
@@ -16,27 +16,19 @@ async fn call(control: &Path, request: Value) -> Result<()> {
 }
 
 pub async fn capabilities(control: &Path) -> Result<()> {
-    call(control, json!({"op": "llo_execution_capabilities"})).await
+    call(control, crate::daemon::execution_contract::capabilities()).await
 }
 
 pub async fn provision(control: &Path, backend_class: &str, idempotency_key: &str) -> Result<()> {
     call(
         control,
-        json!({
-            "op": "llo_execution_provision",
-            "backendClass": backend_class,
-            "idempotencyKey": idempotency_key
-        }),
+        crate::daemon::execution_contract::provision(backend_class, idempotency_key),
     )
     .await
 }
 
 pub async fn status(control: &Path, run_id: Option<&str>) -> Result<()> {
-    call(
-        control,
-        json!({"op": "llo_execution_status", "runId": run_id.unwrap_or("")}),
-    )
-    .await
+    call(control, crate::daemon::execution_contract::status(run_id)).await
 }
 
 pub async fn start(control: &Path, spec: &Path, grant: &Path) -> Result<()> {
@@ -50,7 +42,7 @@ pub async fn start(control: &Path, spec: &Path, grant: &Path) -> Result<()> {
     .context("parse grant JSON")?;
     call(
         control,
-        json!({"op": "llo_execution_start", "spec": spec, "grant": grant}),
+        crate::daemon::execution_contract::start(spec, grant),
     )
     .await
 }
@@ -58,31 +50,19 @@ pub async fn start(control: &Path, spec: &Path, grant: &Path) -> Result<()> {
 pub async fn inspect(control: &Path, run_id: &str, after_sequence: u64) -> Result<()> {
     call(
         control,
-        json!({
-            "op": "llo_execution_inspect",
-            "runId": run_id,
-            "afterSequence": after_sequence
-        }),
+        crate::daemon::execution_contract::inspect(run_id, after_sequence),
     )
     .await
 }
 
 pub async fn collect(control: &Path, run_id: &str) -> Result<()> {
-    call(
-        control,
-        json!({"op": "llo_execution_collect", "runId": run_id}),
-    )
-    .await
+    call(control, crate::daemon::execution_contract::collect(run_id)).await
 }
 
 pub async fn cleanup(control: &Path, run_id: &str, idempotency_key: Option<&str>) -> Result<()> {
     call(
         control,
-        json!({
-            "op": "llo_execution_cleanup",
-            "runId": run_id,
-            "idempotencyKey": idempotency_key.unwrap_or("")
-        }),
+        crate::daemon::execution_contract::cleanup(run_id, idempotency_key),
     )
     .await
 }
@@ -90,11 +70,7 @@ pub async fn cleanup(control: &Path, run_id: &str, idempotency_key: Option<&str>
 pub async fn cancel(control: &Path, run_id: &str, idempotency_key: Option<&str>) -> Result<()> {
     call(
         control,
-        json!({
-            "op": "llo_execution_cancel",
-            "runId": run_id,
-            "idempotencyKey": idempotency_key.unwrap_or("")
-        }),
+        crate::daemon::execution_contract::cancel(run_id, idempotency_key),
     )
     .await
 }

@@ -7,9 +7,11 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+
+use super::execution_contract;
 
 #[derive(Debug, Clone)]
 pub struct ExecutionClient {
@@ -44,67 +46,41 @@ impl ExecutionClient {
     }
 
     pub async fn capabilities(&self) -> Result<Value> {
-        self.call(json!({"op": "llo_execution_capabilities"})).await
+        self.call(execution_contract::capabilities()).await
     }
 
     pub async fn provision(&self, backend_class: &str, idempotency_key: &str) -> Result<Value> {
-        self.call(json!({
-            "op": "llo_execution_provision",
-            "backendClass": backend_class,
-            "idempotencyKey": idempotency_key,
-        }))
+        self.call(execution_contract::provision(
+            backend_class,
+            idempotency_key,
+        ))
         .await
     }
 
     pub async fn status(&self, run_id: Option<&str>) -> Result<Value> {
-        self.call(json!({
-            "op": "llo_execution_status",
-            "runId": run_id.unwrap_or(""),
-        }))
-        .await
+        self.call(execution_contract::status(run_id)).await
     }
 
     pub async fn start(&self, spec: Value, grant: Value) -> Result<Value> {
-        self.call(json!({
-            "op": "llo_execution_start",
-            "spec": spec,
-            "grant": grant,
-        }))
-        .await
+        self.call(execution_contract::start(spec, grant)).await
     }
 
     pub async fn inspect(&self, run_id: &str, after_sequence: u64) -> Result<Value> {
-        self.call(json!({
-            "op": "llo_execution_inspect",
-            "runId": run_id,
-            "afterSequence": after_sequence,
-        }))
-        .await
+        self.call(execution_contract::inspect(run_id, after_sequence))
+            .await
     }
 
     pub async fn collect(&self, run_id: &str) -> Result<Value> {
-        self.call(json!({
-            "op": "llo_execution_collect",
-            "runId": run_id,
-        }))
-        .await
+        self.call(execution_contract::collect(run_id)).await
     }
 
     pub async fn cleanup(&self, run_id: &str, idempotency_key: Option<&str>) -> Result<Value> {
-        self.call(json!({
-            "op": "llo_execution_cleanup",
-            "runId": run_id,
-            "idempotencyKey": idempotency_key.unwrap_or(""),
-        }))
-        .await
+        self.call(execution_contract::cleanup(run_id, idempotency_key))
+            .await
     }
 
     pub async fn cancel(&self, run_id: &str, idempotency_key: Option<&str>) -> Result<Value> {
-        self.call(json!({
-            "op": "llo_execution_cancel",
-            "runId": run_id,
-            "idempotencyKey": idempotency_key.unwrap_or(""),
-        }))
-        .await
+        self.call(execution_contract::cancel(run_id, idempotency_key))
+            .await
     }
 }

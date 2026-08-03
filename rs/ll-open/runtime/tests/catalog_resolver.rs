@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use leyline_runtime::{
-    ArtifactIdentity, AuthorizedExecution, CatalogResolver, DigestRef, ErrorCode,
+    ArtifactIdentity, AuthorizedExecution, CatalogBuilder, CatalogResolver, DigestRef, ErrorCode,
     ExecutionResolver, SchemaIntent, SchemaLimits, WorkspaceInput,
 };
 
@@ -44,10 +44,21 @@ fn catalog_resolver_rejects_limits_that_would_round_up() {
         .resolve(&intent)
         .expect_err("fractional CPU units must not be widened");
     assert_eq!(error.code, ErrorCode::InvalidSpec);
+
+    let mut intent = authorized();
+    // This is divisible by the two obvious broken unit factors (`1024 + 1024`
+    // and `1024 / 1024`) but not by one MiB. It therefore proves that this
+    // check uses the exact backend unit rather than merely rejecting a small
+    // value later as zero MiB.
+    intent.intent.requested_limits.memory_bytes = 1024 * 1024 + 2048;
+    let error = resolver()
+        .resolve(&intent)
+        .expect_err("fractional MiB units must not be widened");
+    assert_eq!(error.code, ErrorCode::InvalidSpec);
 }
 
 fn resolver() -> CatalogResolver {
-    CatalogResolver::builder()
+    CatalogBuilder::default()
         .entry(
             "blake3-256:artifact",
             "application/vnd.leyline.executable",
@@ -114,7 +125,7 @@ fn catalog_resolver_rejects_unenforced_output_limit() {
 
 #[test]
 fn catalog_builder_rejects_duplicate_artifact_identities() {
-    let error = CatalogResolver::builder()
+    let error = CatalogBuilder::default()
         .entry(
             "blake3-256:artifact",
             "application/vnd.leyline.executable",
@@ -138,6 +149,65 @@ fn catalog_builder_rejects_duplicate_artifact_identities() {
         .build()
         .expect_err("ambiguous catalog identity must fail closed");
     assert_eq!(error.code, ErrorCode::ResourceConflict);
+}
+
+#[test]
+fn catalog_builder_rejects_each_empty_identity_component() {
+    for (digest, media_type) in [
+        ("", "application/vnd.leyline.executable"),
+        ("blake3-256:artifact", ""),
+    ] {
+        let error = CatalogBuilder::default()
+            .entry(
+                digest,
+                media_type,
+                DigestRef {
+                    algorithm: "blake3-256".into(),
+                    value: "a".repeat(64),
+                },
+                "bin/agent",
+                Vec::new(),
+            )
+            .build()
+            .expect_err("partial artifact identity must fail closed");
+        assert_eq!(error.code, ErrorCode::InvalidSpec);
+    }
+}
+
+#[test]
+fn catalog_builder_rejects_each_unsafe_guest_path_shape() {
+    for executable in ["", "/bin/agent", "bin/../agent"] {
+        let error = CatalogBuilder::default()
+            .entry(
+                "blake3-256:artifact",
+                "application/vnd.leyline.executable",
+                DigestRef {
+                    algorithm: "blake3-256".into(),
+                    value: "a".repeat(64),
+                },
+                executable,
+                Vec::new(),
+            )
+            .build()
+            .expect_err("guest executable must remain relative and traversal-free");
+        assert_eq!(error.code, ErrorCode::InvalidSpec);
+    }
+}
+
+#[test]
+fn catalog_resolver_rejects_each_zero_backend_limit() {
+    for mutate in [
+        |limits: &mut SchemaLimits| limits.cpu_millis = 0,
+        |limits: &mut SchemaLimits| limits.memory_bytes = 0,
+        |limits: &mut SchemaLimits| limits.wall_time_ms = 0,
+    ] {
+        let mut intent = authorized();
+        mutate(&mut intent.intent.requested_limits);
+        let error = resolver()
+            .resolve(&intent)
+            .expect_err("every backend limit must be non-zero");
+        assert_eq!(error.code, ErrorCode::InvalidSpec);
+    }
 }
 
 #[test]

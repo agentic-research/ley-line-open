@@ -65,6 +65,57 @@ fn capabilities_are_native_and_fail_closed_when_resources_are_missing() {
 }
 
 #[test]
+fn every_native_resource_is_required_independently() {
+    let fixture = TempDir::new().expect("fixture");
+    let worker = fixture.path().join("worker");
+    let cas_root = fixture.path().join("cas");
+    let ephemeral_root = fixture.path().join("runs");
+    let runtime_file = fixture.path().join("runtime");
+    fs::write(&worker, "#!/bin/sh\n").expect("worker");
+    fs::create_dir(&cas_root).expect("CAS");
+    fs::create_dir(&ephemeral_root).expect("runs");
+    fs::write(&runtime_file, "runtime").expect("runtime file");
+
+    let configurations = [
+        NativeWorkerConfig {
+            worker: fixture.path().join("missing-worker"),
+            cas_root: cas_root.clone(),
+            ephemeral_root: ephemeral_root.clone(),
+            runtime_files: vec![runtime_file.clone()],
+            ready_timeout: Duration::from_secs(1),
+        },
+        NativeWorkerConfig {
+            worker: worker.clone(),
+            cas_root: fixture.path().join("missing-cas"),
+            ephemeral_root: ephemeral_root.clone(),
+            runtime_files: vec![runtime_file.clone()],
+            ready_timeout: Duration::from_secs(1),
+        },
+        NativeWorkerConfig {
+            worker: worker.clone(),
+            cas_root: cas_root.clone(),
+            ephemeral_root: fixture.path().join("missing-runs"),
+            runtime_files: vec![runtime_file.clone()],
+            ready_timeout: Duration::from_secs(1),
+        },
+        NativeWorkerConfig {
+            worker,
+            cas_root,
+            ephemeral_root,
+            runtime_files: vec![fixture.path().join("missing-runtime")],
+            ready_timeout: Duration::from_secs(1),
+        },
+    ];
+    for configuration in configurations {
+        assert!(
+            !NativeWorkerBackend::new(configuration)
+                .capabilities()
+                .available
+        );
+    }
+}
+
+#[test]
 fn worker_exit_is_observable_and_run_root_is_removed() {
     let fixture = TempDir::new().expect("fixture");
     let (backend, runs) = backend(
@@ -100,6 +151,37 @@ fn failed_worker_is_reported_and_cleaned() {
         other => panic!("expected failed worker, got {other:?}"),
     }
     assert_eq!(fs::read_dir(runs).expect("runs").count(), 0);
+    let errors = backend.take_cleanup_errors();
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].detail.contains("native worker exited"));
+}
+
+#[test]
+fn readiness_for_another_run_is_rejected_and_cleaned() {
+    let fixture = TempDir::new().expect("fixture");
+    let (backend, runs) = backend(
+        &fixture,
+        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"other-run\"}' >&2\n",
+    );
+    let error = backend
+        .start(&request())
+        .expect_err("worker readiness must bind to the requested run");
+    assert!(error.detail.contains("unexpected run"));
+    assert_eq!(fs::read_dir(runs).expect("runs").count(), 0);
+}
+
+#[test]
+fn native_cleanup_restores_guest_created_permissions() {
+    let fixture = TempDir::new().expect("fixture");
+    let (backend, runs) = backend(
+        &fixture,
+        "#!/bin/sh\n/bin/cat >/dev/null\nmkdir -p \"$4/locked\"\nprintf x > \"$4/locked/file\"\nchmod 000 \"$4/locked\"\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\n",
+    );
+    backend.start(&request()).expect("worker readiness");
+    backend
+        .wait_for_completion("native-run-01")
+        .expect("worker completion");
+    assert_eq!(fs::read_dir(runs).expect("runs").count(), 0);
 }
 
 #[test]
@@ -120,4 +202,21 @@ fn cancel_kills_worker_and_removes_run_root() {
             .is_none()
     );
     assert!(!backend.cancel("native-run-01").expect("repeat cancel"));
+}
+
+#[test]
+fn backend_trait_cancel_delegates_and_drop_waits_for_cleanup() {
+    let fixture = TempDir::new().expect("fixture");
+    let (backend, runs) = backend(
+        &fixture,
+        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\n/usr/bin/tail -f /dev/null\n",
+    );
+    backend.start(&request()).expect("worker readiness");
+    assert!(Backend::cancel(&backend, "native-run-01").expect("trait cancel"));
+    assert_eq!(fs::read_dir(&runs).expect("runs").count(), 0);
+
+    backend.start(&request()).expect("second worker readiness");
+    assert_eq!(fs::read_dir(&runs).expect("runs").count(), 1);
+    drop(backend);
+    assert_eq!(fs::read_dir(runs).expect("runs").count(), 0);
 }

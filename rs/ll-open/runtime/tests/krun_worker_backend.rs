@@ -36,6 +36,31 @@ fn request() -> ExecutionRequest {
     }
 }
 
+fn backend_with_worker(
+    fixture: &TempDir,
+    worker_body: &str,
+) -> (KrunWorkerBackend, std::path::PathBuf) {
+    let worker = fixture.path().join("leyline-krun-worker");
+    fs::write(&worker, worker_body).expect("fake worker");
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("worker mode");
+    let cas_root = fixture.path().join("cas");
+    let ephemeral_root = fixture.path().join("runs");
+    fs::create_dir(&cas_root).expect("CAS");
+    fs::create_dir(&ephemeral_root).expect("ephemeral root");
+    let libkrun = fixture.path().join("libkrun.dylib");
+    fs::write(&libkrun, b"library").expect("library fixture");
+    let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+        worker,
+        cas_root,
+        ephemeral_root: ephemeral_root.clone(),
+        libkrun,
+        runtime_files: Vec::new(),
+        devices: Vec::new(),
+        ready_timeout: READY_TIMEOUT,
+    });
+    (backend, ephemeral_root)
+}
+
 #[test]
 fn backend_spawns_the_explicit_first_party_worker_and_waits_for_ready() {
     // Catches reporting a run as started before the confined worker has
@@ -118,10 +143,32 @@ fn backend_removes_the_run_root_when_a_worker_exits() {
         .expect("run root entry")
         .path();
     fs::write(run_root.join("control"), b"exit\n").expect("release worker");
-    backend
+    let completion = backend
         .wait_for_completion("run-backend-01")
         .expect("worker completion");
+    assert!(matches!(completion, BackendRunStatus::Succeeded));
 
+    assert_eq!(run_root_count(&ephemeral_root), 0);
+}
+
+#[test]
+fn backend_reports_a_nonzero_worker_exit_as_failed() {
+    let fixture = TempDir::new().expect("fixture");
+    let (backend, ephemeral_root) = backend_with_worker(
+        &fixture,
+        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\nexit 7\n",
+    );
+
+    backend.start(&request()).expect("ready worker");
+    let completion = backend
+        .wait_for_completion("run-backend-01")
+        .expect("worker completion");
+    match completion {
+        BackendRunStatus::Failed(error) => {
+            assert!(error.detail.contains("libkrun worker exited"));
+        }
+        other => panic!("expected failed worker, got {other:?}"),
+    }
     assert_eq!(run_root_count(&ephemeral_root), 0);
 }
 
@@ -153,10 +200,10 @@ fn backend_cancel_terminates_the_worker_and_removes_its_run_root() {
 
     backend.start(&request()).expect("ready worker");
     assert_eq!(run_root_count(&ephemeral_root), 1);
-    assert!(backend.cancel("run-backend-01").expect("cancel worker"));
+    assert!(Backend::cancel(&backend, "run-backend-01").expect("cancel worker"));
 
     assert_eq!(run_root_count(&ephemeral_root), 0);
-    assert!(!backend.cancel("run-backend-01").expect("repeat cancel"));
+    assert!(!Backend::cancel(&backend, "run-backend-01").expect("repeat cancel"));
 }
 
 #[test]

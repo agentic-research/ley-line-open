@@ -1,0 +1,49 @@
+version: '3'
+
+# Rust-workspace tasks. Included by the repository Taskfile under `rs:`, while
+# root compatibility aliases keep `task mutants:diff` and `task mutants:pr`
+# stable for CI and contributors.
+#
+# Mutation process count and timeout calibration live here so every invocation
+# uses the same defaults. Callers may override them as Task variables; they do
+# not need to know cargo-mutants' environment variable names.
+
+vars:
+  MUTANTS_JOBS_VALUE: '{{.MUTANTS_JOBS | default "4"}}'
+  MUTANTS_MINIMUM_TEST_TIMEOUT_VALUE: '{{.MUTANTS_MINIMUM_TEST_TIMEOUT | default "60"}}'
+
+env:
+  CARGO_MUTANTS_JOBS: '{{.MUTANTS_JOBS_VALUE}}'
+  CARGO_MUTANTS_MINIMUM_TEST_TIMEOUT: '{{.MUTANTS_MINIMUM_TEST_TIMEOUT_VALUE}}'
+
+tasks:
+  mutants:diff:
+    desc: Run the workspace-relative Rust diff mutation gate
+    dir: '{{.ROOT_DIR}}/rs'
+    requires:
+      vars: [DIFF]
+    cmds:
+      - '{{.ROOT_DIR}}/tools/mutants_diff.sh "{{.DIFF}}" "{{.MUTANTS_SCOPE | default "all"}}"'
+
+  mutants:pr:
+    desc: Generate the integration-base working-tree diff and mutation-test it
+    dir: '{{.ROOT_DIR}}/rs'
+    cmds:
+      - |
+        set -eu
+        BASE_REF="${BASE_REF:-origin/integration}"
+        if ! git rev-parse --verify "$BASE_REF" >/dev/null 2>&1; then
+          git fetch origin "${BASE_REF#origin/}" --quiet
+        fi
+        if ! git rev-parse --verify "$BASE_REF" >/dev/null 2>&1; then
+          BASE_REF=origin/main
+          git fetch origin main --quiet
+        fi
+        BASE=$(git merge-base "$BASE_REF" HEAD)
+        DIFF=$(mktemp)
+        trap 'rm -f "$DIFF"' EXIT
+        # No three-dot and no HEAD bound: include uncommitted work in the exact
+        # tree that is about to be committed and pushed.
+        git diff --relative=rs "$BASE" -- . > "$DIFF"
+        echo "diff vs $(git rev-parse --short "$BASE") (merge-base with $BASE_REF)"
+        '{{.ROOT_DIR}}/tools/mutants_diff.sh' "$DIFF" '{{.MUTANTS_SCOPE | default "all"}}'

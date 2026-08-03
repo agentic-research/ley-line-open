@@ -384,6 +384,12 @@ impl<B: Backend> ExecutionService<B> {
 
     /// Cancel one active run and return its terminal record.
     pub fn cancel(&self, run_id: &str) -> Result<RunRecord, ExecutionError> {
+        // Project any backend completion first, exactly as every other read
+        // path does. Without this, a worker that finished between the
+        // caller's decision and its request surfaces as a hard backend error
+        // ("no longer owns the active run") while `cleanup` on the same run
+        // succeeds — a benign race reported as a failure.
+        self.refresh_run(run_id)?;
         let existing = self
             .state
             .read()
@@ -392,7 +398,13 @@ impl<B: Backend> ExecutionService<B> {
             .cloned()
             .ok_or_else(|| ExecutionError::invalid("run_id not found"))?;
 
-        if existing.state == RunState::Cancelled {
+        // Cancellation asks for "this run is not executing". A run that
+        // already reached a terminal state satisfies that, so cancelling it
+        // is an idempotent no-op rather than an error.
+        if matches!(
+            existing.state,
+            RunState::Cancelled | RunState::Succeeded | RunState::Failed
+        ) {
             return Ok(existing);
         }
         if !self.backend.cancel(run_id)? {

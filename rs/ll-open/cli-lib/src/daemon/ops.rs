@@ -3561,7 +3561,9 @@ mod tests {
         );
     }
 
-    fn setup() -> (TempDir, std::sync::Arc<DaemonContext>) {
+    fn setup_with_ext(
+        ext: Arc<dyn crate::daemon::DaemonExt>,
+    ) -> (TempDir, std::sync::Arc<DaemonContext>) {
         let dir = TempDir::new().unwrap();
         let arena_path = dir.path().join("test.arena");
         let ctrl_path = dir.path().join("test.ctrl");
@@ -3595,7 +3597,7 @@ mod tests {
             Arc::new(crate::daemon::embed::ZeroEmbedder { dim: 4 });
         let ctx = DaemonContext {
             ctrl_path,
-            ext: Arc::new(crate::daemon::NoExt),
+            ext,
             router: crate::daemon::EventRouter::new(16),
             live_db,
             enrich_inflight: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
@@ -3614,6 +3616,130 @@ mod tests {
             sheaf: Arc::new(crate::daemon::sheaf_ops::SheafState::new()),
         };
         (dir, std::sync::Arc::new(ctx))
+    }
+
+    fn setup() -> (TempDir, std::sync::Arc<DaemonContext>) {
+        setup_with_ext(Arc::new(crate::daemon::NoExt))
+    }
+
+    #[derive(Default)]
+    struct RecordingExecutionHandler {
+        calls: parking_lot::Mutex<Vec<(String, serde_json::Value)>>,
+    }
+
+    impl RecordingExecutionHandler {
+        fn record(&self, method: &str, input: serde_json::Value) -> Result<String> {
+            self.calls.lock().push((method.to_owned(), input.clone()));
+            Ok(json!({"method": method, "input": input}).to_string())
+        }
+    }
+
+    impl crate::daemon::execution::ExecutionHandler for RecordingExecutionHandler {
+        fn capabilities(&self) -> Result<String> {
+            self.record("capabilities", serde_json::Value::Null)
+        }
+
+        fn provision(&self, input: &serde_json::Value) -> Result<String> {
+            self.record("provision", input.clone())
+        }
+
+        fn start(&self, input: &serde_json::Value) -> Result<String> {
+            self.record("start", input.clone())
+        }
+
+        fn status(&self, input: &serde_json::Value) -> Result<String> {
+            self.record("status", input.clone())
+        }
+
+        fn inspect(&self, input: &serde_json::Value) -> Result<String> {
+            self.record("inspect", input.clone())
+        }
+
+        fn collect(&self, input: &serde_json::Value) -> Result<String> {
+            self.record("collect", input.clone())
+        }
+
+        fn cleanup(&self, input: &serde_json::Value) -> Result<String> {
+            self.record("cleanup", input.clone())
+        }
+
+        fn cancel(&self, input: &serde_json::Value) -> Result<String> {
+            self.record("cancel", input.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_ops_dispatch_exact_payloads_to_the_configured_handler() {
+        let handler = Arc::new(RecordingExecutionHandler::default());
+        let extension = Arc::new(crate::daemon::ExecutionDaemonExt::new(handler.clone()));
+        let (_dir, ctx) = setup_with_ext(extension);
+        let cases = [
+            (
+                "llo_execution_capabilities",
+                json!({}),
+                "capabilities",
+                serde_json::Value::Null,
+            ),
+            (
+                "llo_execution_provision",
+                json!({"backendClass":"microVm", "idempotencyKey":"provision-1"}),
+                "provision",
+                json!({"backendClass":"microVm", "idempotencyKey":"provision-1"}),
+            ),
+            (
+                "llo_execution_status",
+                json!({"runId":"run-1"}),
+                "status",
+                json!({"runId":"run-1"}),
+            ),
+            (
+                "llo_execution_start",
+                json!({"spec":{"spec":1}, "grant":{"grant":2}}),
+                "start",
+                json!({"spec":{"spec":1}, "grant":{"grant":2}}),
+            ),
+            (
+                "llo_execution_inspect",
+                json!({"runId":"run-1", "afterSequence":9}),
+                "inspect",
+                json!({"runId":"run-1", "afterSequence":9}),
+            ),
+            (
+                "llo_execution_cancel",
+                json!({"runId":"run-1", "idempotencyKey":"cancel-1"}),
+                "cancel",
+                json!({"runId":"run-1", "idempotencyKey":"cancel-1"}),
+            ),
+            (
+                "llo_execution_collect",
+                json!({"runId":"run-1"}),
+                "collect",
+                json!({"runId":"run-1"}),
+            ),
+            (
+                "llo_execution_cleanup",
+                json!({"runId":"run-1", "idempotencyKey":"cleanup-1"}),
+                "cleanup",
+                json!({"runId":"run-1", "idempotencyKey":"cleanup-1"}),
+            ),
+        ];
+
+        for (op, request, method, expected_input) in &cases {
+            let response = handle_base_op_legacy(&ctx, op, request)
+                .unwrap_or_else(|| panic!("{op} must be handled"));
+            let response: serde_json::Value =
+                serde_json::from_str(&response).expect("handler response JSON");
+            assert_eq!(response, json!({"method": method, "input": expected_input}));
+        }
+
+        let calls = handler.calls.lock();
+        assert_eq!(calls.len(), cases.len());
+        for ((method, input), (_, _, expected_method, expected_input)) in
+            calls.iter().zip(cases.iter())
+        {
+            assert_eq!(method, expected_method);
+            assert_eq!(input, expected_input);
+        }
     }
 
     /// 5f7100-4 / 606e64: regression pin for the self-deadlock fix.

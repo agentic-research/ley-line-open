@@ -87,10 +87,6 @@ pub struct CatalogResolver {
 }
 
 impl CatalogResolver {
-    pub fn builder() -> CatalogBuilder {
-        CatalogBuilder::default()
-    }
-
     /// Load the explicit, embedding-owned catalog document used by the
     /// first-party execution daemon. This document is configuration, not a
     /// replacement for the signed execution/v1 wire schema.
@@ -98,7 +94,7 @@ impl CatalogResolver {
         let document: CatalogDocument = serde_json::from_slice(bytes).map_err(|error| {
             ExecutionError::invalid(format!("invalid execution catalog: {error}"))
         })?;
-        let mut builder = Self::builder();
+        let mut builder = CatalogBuilder::default();
         for entry in document.entries {
             builder = builder.entry(
                 entry.artifact_digest,
@@ -208,11 +204,6 @@ fn resource_limits(limits: SchemaLimits) -> Result<ResourceLimits, ExecutionErro
         .ok_or_else(|| ExecutionError::invalid("memory limit conversion failed"))?
         .try_into()
         .map_err(|_| ExecutionError::invalid("memory limit exceeds backend capacity"))?;
-    if vcpus == 0 || memory_mib == 0 || limits.wall_time_ms == 0 {
-        return Err(ExecutionError::invalid(
-            "requested execution limits must be non-zero",
-        ));
-    }
     Ok(ResourceLimits {
         vcpus,
         memory_mib,

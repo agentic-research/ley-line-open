@@ -1,22 +1,28 @@
 use std::collections::HashMap;
-use std::fs;
-use std::io::{self, BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::io::{BufReader, Write};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
-use tempfile::{Builder as TempDirBuilder, TempDir};
+use tempfile::Builder as TempDirBuilder;
 
 use crate::{
     Backend, BackendCapabilities, BackendClass, BackendRun, BackendRunStatus, ExecutionError,
     ExecutionRequest,
 };
 
+use super::super::process::{
+    SupervisionLabels, WorkerProcess, abort_failed_start, configure_process_group,
+    finish_failed_start, read_readiness_line, supervise_worker,
+};
 use super::worker::WorkerEvent;
+
+const LABELS: SupervisionLabels = SupervisionLabels {
+    worker: "libkrun worker",
+    ephemeral: "ephemeral rootfs volume",
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KrunWorkerConfig {
@@ -156,13 +162,14 @@ impl Backend for KrunWorkerBackend {
         for path in &self.config.devices {
             command.arg("--device").arg(path);
         }
-        configure_worker_process_group(&mut command);
+        configure_process_group(&mut command);
 
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
                 return Err(finish_failed_start(
                     rootfs,
+                    LABELS,
                     ExecutionError::backend(format!("start first-party libkrun worker: {error}")),
                 ));
             }
@@ -173,6 +180,7 @@ impl Backend for KrunWorkerBackend {
                 return Err(abort_failed_start(
                     &mut child,
                     rootfs,
+                    LABELS,
                     ExecutionError::backend("first-party libkrun worker stdin was not piped"),
                 ));
             }
@@ -181,6 +189,7 @@ impl Backend for KrunWorkerBackend {
             return Err(abort_failed_start(
                 &mut child,
                 rootfs,
+                LABELS,
                 ExecutionError::backend(format!(
                     "send execution request to libkrun worker: {error}"
                 )),
@@ -190,6 +199,7 @@ impl Backend for KrunWorkerBackend {
             return Err(abort_failed_start(
                 &mut child,
                 rootfs,
+                LABELS,
                 ExecutionError::backend(format!(
                     "flush execution request to libkrun worker: {error}"
                 )),
@@ -203,6 +213,7 @@ impl Backend for KrunWorkerBackend {
                 return Err(abort_failed_start(
                     &mut child,
                     rootfs,
+                    LABELS,
                     ExecutionError::backend("first-party libkrun worker stderr was not piped"),
                 ));
             }
@@ -210,11 +221,7 @@ impl Backend for KrunWorkerBackend {
         let (event_tx, event_rx) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stderr);
-            let mut line = String::new();
-            let result = reader
-                .read_line(&mut line)
-                .map(|bytes| if bytes == 0 { None } else { Some(line) })
-                .map_err(|error| error.to_string());
+            let result = read_readiness_line(&mut reader);
             let _ = event_tx.send(result);
             let _ = std::io::copy(&mut reader, &mut std::io::sink());
         });
@@ -222,18 +229,18 @@ impl Backend for KrunWorkerBackend {
         let line = match event_rx.recv_timeout(self.config.ready_timeout) {
             Ok(Ok(Some(line))) => line,
             Ok(Ok(None)) => {
-                let status = child.wait().ok();
-                return Err(finish_failed_start(
+                return Err(abort_failed_start(
+                    &mut child,
                     rootfs,
-                    ExecutionError::backend(format!(
-                        "libkrun worker exited before readiness: {status:?}"
-                    )),
+                    LABELS,
+                    ExecutionError::backend("libkrun worker closed stderr before readiness"),
                 ));
             }
             Ok(Err(error)) => {
                 return Err(abort_failed_start(
                     &mut child,
                     rootfs,
+                    LABELS,
                     ExecutionError::backend(format!("read libkrun worker readiness: {error}")),
                 ));
             }
@@ -241,6 +248,7 @@ impl Backend for KrunWorkerBackend {
                 return Err(abort_failed_start(
                     &mut child,
                     rootfs,
+                    LABELS,
                     ExecutionError::backend("timed out waiting for libkrun worker readiness"),
                 ));
             }
@@ -248,6 +256,7 @@ impl Backend for KrunWorkerBackend {
                 return Err(abort_failed_start(
                     &mut child,
                     rootfs,
+                    LABELS,
                     ExecutionError::backend("libkrun worker readiness channel disconnected"),
                 ));
             }
@@ -258,6 +267,7 @@ impl Backend for KrunWorkerBackend {
                 return Err(abort_failed_start(
                     &mut child,
                     rootfs,
+                    LABELS,
                     ExecutionError::backend(format!(
                         "invalid libkrun worker readiness event: {error}"
                     )),
@@ -270,6 +280,7 @@ impl Backend for KrunWorkerBackend {
                 return Err(abort_failed_start(
                     &mut child,
                     rootfs,
+                    LABELS,
                     ExecutionError::backend(format!(
                         "libkrun worker readiness named unexpected run {run_id}"
                     )),
@@ -277,9 +288,27 @@ impl Backend for KrunWorkerBackend {
             }
             WorkerEvent::Failed { error } => {
                 let _ = child.wait();
-                return Err(finish_failed_start(rootfs, error));
+                return Err(finish_failed_start(rootfs, LABELS, error));
             }
         }
+
+        // Every fallible step must happen BEFORE the run is published in
+        // `children`. Returning `Err` after the insert but before the
+        // supervisor is spawned would strand a started, confined worker with
+        // nothing to reap it and wedge the run id permanently, because
+        // `wait_for_completion` would block on a condvar nobody can notify.
+        let deadline =
+            match Instant::now().checked_add(Duration::from_millis(request.limits.wall_time_ms)) {
+                Some(deadline) => deadline,
+                None => {
+                    return Err(abort_failed_start(
+                        &mut child,
+                        rootfs,
+                        LABELS,
+                        ExecutionError::invalid("wall-clock limit is too large"),
+                    ));
+                }
+            };
 
         let (cancel_tx, cancel_rx) = mpsc::channel();
         let (finished_tx, finished_rx) = mpsc::sync_channel(1);
@@ -295,11 +324,14 @@ impl Backend for KrunWorkerBackend {
         let cleanup_errors = Arc::clone(&self.cleanup_errors);
         let completed = Arc::clone(&self.completed);
         let completion_cv = Arc::clone(&self.completion_cv);
-        let deadline = Instant::now()
-            .checked_add(Duration::from_millis(request.limits.wall_time_ms))
-            .ok_or_else(|| ExecutionError::invalid("wall-clock limit is too large"))?;
         std::thread::spawn(move || {
-            let result = supervise_worker(child, rootfs, cancel_rx, deadline);
+            let result = supervise_worker(
+                WorkerProcess::new(child),
+                rootfs,
+                cancel_rx,
+                deadline,
+                LABELS,
+            );
             if let Err(error) = &result {
                 cleanup_errors.lock().push(error.clone());
             }
@@ -345,175 +377,31 @@ impl Drop for KrunWorkerBackend {
     }
 }
 
-fn supervise_worker(
-    mut child: Child,
-    rootfs: TempDir,
-    cancel: mpsc::Receiver<()>,
-    deadline: Instant,
-) -> Result<(), ExecutionError> {
-    // Wait for child exit and cancellation as events. The deadline is the
-    // only timed wait; there is no 10ms child-state polling loop.
-    enum Event {
-        Exited(std::io::Result<std::process::ExitStatus>),
-        Cancelled,
-    }
-    let pid = child.id();
-    let (event_tx, event_rx) = mpsc::sync_channel(2);
-    let exit_tx = event_tx.clone();
-    std::thread::spawn(move || {
-        let _ = exit_tx.send(Event::Exited(child.wait()));
-    });
-    std::thread::spawn(move || {
-        if cancel.recv().is_ok() {
-            let _ = event_tx.send(Event::Cancelled);
-        }
-    });
+#[cfg(test)]
+mod tests {
+    use super::{KrunWorkerBackend, KrunWorkerConfig};
+    use crate::{Backend, BackendRunStatus};
+    use std::path::PathBuf;
+    use std::time::Duration;
 
-    let event = match deadline.checked_duration_since(Instant::now()) {
-        Some(remaining) => match event_rx.recv_timeout(remaining) {
-            Ok(event) => event,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                terminate_worker(pid);
-                let _ = event_rx.recv();
-                return cleanup_with_error(
-                    rootfs,
-                    ExecutionError {
-                        code: crate::ErrorCode::ResourceExhausted,
-                        retryable: false,
-                        detail: "execution exceeded wall-clock limit".into(),
-                    },
-                );
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                terminate_worker(pid);
-                let _ = event_rx.recv();
-                return cleanup_with_error(
-                    rootfs,
-                    ExecutionError::backend("libkrun worker supervision channel disconnected"),
-                );
-            }
-        },
-        None => {
-            terminate_worker(pid);
-            let _ = event_rx.recv();
-            return cleanup_with_error(
-                rootfs,
-                ExecutionError {
-                    code: crate::ErrorCode::ResourceExhausted,
-                    retryable: false,
-                    detail: "execution exceeded wall-clock limit".into(),
-                },
-            );
-        }
-    };
-
-    match event {
-        Event::Cancelled => {
-            terminate_worker(pid);
-            let _ = event_rx.recv();
-            cleanup_tempdir(rootfs)
-        }
-        Event::Exited(Ok(status)) if status.success() => cleanup_tempdir(rootfs),
-        Event::Exited(Ok(status)) => cleanup_with_error(
-            rootfs,
-            ExecutionError::backend(format!("libkrun worker exited with {status}")),
-        ),
-        Event::Exited(Err(error)) => cleanup_with_error(
-            rootfs,
-            ExecutionError::backend(format!("wait for libkrun worker: {error}")),
-        ),
-    }
-}
-
-fn terminate_worker(pid: u32) {
-    // SAFETY: `pid` came directly from the live `Child` immediately before it
-    // was moved to the waiter thread; sending SIGKILL does not dereference it
-    // or create an alias to process memory.
-    #[cfg(unix)]
-    unsafe {
-        let process_group = -(pid as libc::pid_t);
-        if libc::kill(process_group, libc::SIGKILL) == -1 {
-            let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
-        }
-    }
-}
-
-fn configure_worker_process_group(command: &mut Command) {
-    // SAFETY: `pre_exec` runs in the child after fork and before exec. The
-    // callback performs only the async-signal-safe `setpgid` syscall and
-    // allocates no Rust state.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) == -1 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
+    #[test]
+    fn backend_trait_poll_returns_published_completion() {
+        let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+            worker: PathBuf::new(),
+            cas_root: PathBuf::new(),
+            ephemeral_root: PathBuf::new(),
+            libkrun: PathBuf::new(),
+            runtime_files: Vec::new(),
+            devices: Vec::new(),
+            ready_timeout: Duration::from_secs(1),
         });
+        backend
+            .completed
+            .lock()
+            .insert("run-1".into(), BackendRunStatus::Succeeded);
+        assert!(matches!(
+            Backend::poll(&backend, "run-1").expect("poll"),
+            Some(BackendRunStatus::Succeeded)
+        ));
     }
-}
-
-fn cleanup_with_error(rootfs: TempDir, error: ExecutionError) -> Result<(), ExecutionError> {
-    match cleanup_tempdir(rootfs) {
-        Ok(()) => Err(error),
-        Err(cleanup_error) => Err(ExecutionError {
-            detail: format!(
-                "{}; cleanup also failed: {}",
-                error.detail, cleanup_error.detail
-            ),
-            ..error
-        }),
-    }
-}
-
-fn cleanup_tempdir(rootfs: TempDir) -> Result<(), ExecutionError> {
-    make_tree_removable(rootfs.path())?;
-    rootfs.close().map_err(|error| {
-        ExecutionError::backend(format!("remove ephemeral rootfs volume: {error}"))
-    })
-}
-
-fn abort_failed_start(child: &mut Child, rootfs: TempDir, error: ExecutionError) -> ExecutionError {
-    terminate_worker(child.id());
-    let _ = child.wait();
-    finish_failed_start(rootfs, error)
-}
-
-fn finish_failed_start(rootfs: TempDir, error: ExecutionError) -> ExecutionError {
-    match cleanup_tempdir(rootfs) {
-        Ok(()) => error,
-        Err(cleanup_error) => ExecutionError {
-            detail: format!(
-                "{}; cleanup also failed: {}",
-                error.detail, cleanup_error.detail
-            ),
-            ..error
-        },
-    }
-}
-
-fn make_tree_removable(path: &Path) -> Result<(), ExecutionError> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        ExecutionError::backend(format!("inspect ephemeral rootfs cleanup path: {error}"))
-    })?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Ok(());
-    }
-
-    let mut permissions = metadata.permissions();
-    permissions.set_mode(permissions.mode() | 0o700);
-    fs::set_permissions(path, permissions).map_err(|error| {
-        ExecutionError::backend(format!(
-            "restore ephemeral rootfs cleanup permissions: {error}"
-        ))
-    })?;
-    for entry in fs::read_dir(path).map_err(|error| {
-        ExecutionError::backend(format!("enumerate ephemeral rootfs for cleanup: {error}"))
-    })? {
-        let entry = entry.map_err(|error| {
-            ExecutionError::backend(format!("enumerate ephemeral rootfs cleanup entry: {error}"))
-        })?;
-        make_tree_removable(&entry.path())?;
-    }
-    Ok(())
 }

@@ -1,0 +1,17 @@
+version: '3'
+
+# Crate-scoped tasks for the embedded execution runtime. Included by the root
+# Taskfile under the `runtime:` namespace; the root keeps compatibility aliases
+# while this file owns the actual cargo invocation and local environment.
+
+tasks:
+  test:
+    desc: Run embedded execution runtime tests (fake-worker contracts; no host VM required)
+    dir: '{{.ROOT_DIR}}/rs'
+    env:
+      # Local developer toolchains commonly configure sccache globally. The
+      # restricted runtime/UDS test harness cannot use that daemon reliably;
+      # CI and local Taskfile invocation therefore share the direct rustc path.
+      RUSTC_WRAPPER: ''
+    cmds:
+      - cargo test -p leyline-runtime

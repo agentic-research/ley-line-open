@@ -22,7 +22,15 @@ const APAS_PREDICATE_TYPE: &str = "https://rosary.dev/Handoff/v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizationPolicy {
-    pub now_unix_ms: u64,
+    /// Wall clock used to evaluate `RunGrant.expiresAtUnixMs`.
+    ///
+    /// `None` — the default — samples the clock on **every** authorization.
+    /// A policy is built once and reused for the life of a daemon, so a
+    /// captured timestamp would make every grant that was valid at startup
+    /// valid forever; expiry would stop being enforced after the first
+    /// millisecond of uptime. `Some` pins the clock, for tests and for
+    /// embedders that supply their own trusted time source.
+    pub now_unix_ms: Option<u64>,
     pub required_backend: BackendClass,
     /// Digest of the confinement policy the selected backend will enforce.
     /// A grant for any other policy is rejected before resolver invocation.
@@ -142,10 +150,7 @@ impl EvidenceVerifier for RejectUnverifiedEvidence {
 impl Default for AuthorizationPolicy {
     fn default() -> Self {
         Self {
-            now_unix_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
+            now_unix_ms: None,
             required_backend: BackendClass::MicroVm,
             required_confinement_digest: None,
         }
@@ -244,7 +249,8 @@ pub fn authorize_with_verifier(
         text(grant.get_replay_key(), "RunGrant.replayKey")?,
         "replayKey",
     )?;
-    if grant.get_expires_at_unix_ms() <= policy.now_unix_ms {
+    let now_unix_ms = policy.now_unix_ms.unwrap_or_else(current_unix_ms);
+    if grant.get_expires_at_unix_ms() <= now_unix_ms {
         return Err(ExecutionError::invalid("RunGrant has expired"));
     }
 
@@ -313,12 +319,9 @@ pub fn authorize_with_verifier(
     }
 
     // A run ID is derived from the bound authority and intent. This makes
-    // retries stable while preventing callers from selecting arbitrary IDs.
-    let mut run_id_material = Vec::new();
-    run_id_material.extend_from_slice(spec_bytes);
-    run_id_material.extend_from_slice(grant_id.as_bytes());
-    run_id_material.extend_from_slice(replay_key.as_bytes());
-    let run_id = format!("run-{}", run_id_material.hash());
+    // retries stable, prevents callers from selecting arbitrary IDs, and lets
+    // a second implementation derive the same name from the same content.
+    let run_id = derive_run_id(&spec_digest, &grant_id, &replay_key);
 
     let allowed_egress = grant
         .get_allowed_egress()
@@ -376,6 +379,42 @@ fn nonempty(value: String, field: &str) -> Result<String, ExecutionError> {
     } else {
         Ok(value)
     }
+}
+
+/// Domain separator for run-identity derivation.
+const RUN_ID_DOMAIN: &[u8] = b"cloister/execution/v1/run-id";
+
+/// Milliseconds since the Unix epoch, sampled when a policy pins no clock.
+pub fn current_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Derive the content-addressed name of a run from its authorized identity.
+///
+/// The inputs are the spec's **canonical** digest — not the received wire
+/// bytes, whose segment layout is an encoder choice rather than content — and
+/// the grant's identity fields, each length-prefixed. A bare concatenation is
+/// ambiguous at the field boundaries: `("ab", "c")` and `("a", "bc")` would
+/// otherwise share one run identity. Both properties are required for a
+/// consumer to compute this id locally and address a run without waiting for
+/// `start` to return; `execution/v1/test-vectors/run-id.json` pins the
+/// derivation for cross-implementation conformance.
+pub fn derive_run_id(canonical_spec_digest: &str, grant_id: &str, replay_key: &str) -> String {
+    let mut material = Vec::new();
+    material.extend_from_slice(RUN_ID_DOMAIN);
+    material.push(0);
+    for field in [
+        canonical_spec_digest.as_bytes(),
+        grant_id.as_bytes(),
+        replay_key.as_bytes(),
+    ] {
+        material.extend_from_slice(&(field.len() as u64).to_le_bytes());
+        material.extend_from_slice(field);
+    }
+    format!("run-{}", material.hash())
 }
 
 /// Return the digest of a schema message's Cap'n Proto canonical form.

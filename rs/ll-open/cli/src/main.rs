@@ -352,7 +352,10 @@ async fn main() -> Result<()> {
                     leyline_cli_lib::cmd_daemon::run_execution_daemon_with_options(
                         config,
                         handler,
-                        leyline_cli_lib::cmd_daemon::DaemonOptions { cdc },
+                        leyline_cli_lib::cmd_daemon::DaemonOptions {
+                            cdc,
+                            ..Default::default()
+                        },
                     )
                     .await
                 }
@@ -392,7 +395,10 @@ async fn main() -> Result<()> {
                     leyline_cli_lib::cmd_daemon::run_execution_daemon_with_options(
                         config,
                         handler,
-                        leyline_cli_lib::cmd_daemon::DaemonOptions { cdc },
+                        leyline_cli_lib::cmd_daemon::DaemonOptions {
+                            cdc,
+                            ..Default::default()
+                        },
                     )
                     .await
                 }
@@ -450,7 +456,10 @@ async fn main() -> Result<()> {
             leyline_cli_lib::cmd_daemon::run_daemon_with_options(
                 config,
                 Arc::new(leyline_cli_lib::daemon::NoExt),
-                leyline_cli_lib::cmd_daemon::DaemonOptions { cdc },
+                leyline_cli_lib::cmd_daemon::DaemonOptions {
+                    cdc,
+                    ..Default::default()
+                },
             )
             .await
         }

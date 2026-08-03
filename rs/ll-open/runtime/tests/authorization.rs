@@ -7,7 +7,8 @@ use leyline_runtime::authorization::{
     canonical_digest,
 };
 use leyline_runtime::transport::{
-    capabilities_json, cleanup_json, collect_json, start_json_with_verifier, status_json,
+    cancel_json, capabilities_json, cleanup_json, collect_json, inspect_json, start_json,
+    start_json_with_verifier, status_json,
 };
 use leyline_runtime::{
     Backend, BackendCapabilities, BackendClass, BackendRun, BackendRunStatus, ExecutionError,
@@ -21,6 +22,14 @@ fn spec_bytes() -> Vec<u8> {
 }
 
 fn spec_bytes_with_interface(interface: Option<&str>, wall_time_ms: u64) -> Vec<u8> {
+    spec_bytes_with_details(interface, wall_time_ms, &[])
+}
+
+fn spec_bytes_with_details(
+    interface: Option<&str>,
+    wall_time_ms: u64,
+    workspaces: &[(&str, &str)],
+) -> Vec<u8> {
     let mut message = Builder::new_default();
     let mut spec = message.init_root::<execution_capnp::run_spec::Builder<'_>>();
     spec.set_schema_version(EXECUTION_SCHEMA_VERSION);
@@ -35,6 +44,14 @@ fn spec_bytes_with_interface(interface: Option<&str>, wall_time_ms: u64) -> Vec<
         spec.reborrow()
             .init_requested_limits()
             .set_wall_time_ms(wall_time_ms);
+    }
+    let mut workspace_inputs = spec
+        .reborrow()
+        .init_workspace_inputs(workspaces.len() as u32);
+    for (index, (name, graph_root)) in workspaces.iter().enumerate() {
+        let mut workspace = workspace_inputs.reborrow().get(index as u32);
+        workspace.set_name(name);
+        set_digest(workspace.init_graph_root(), graph_root);
     }
     let mut bytes = Vec::new();
     capnp::serialize::write_message(&mut bytes, &message).expect("serialize spec");
@@ -71,7 +88,31 @@ impl EvidenceStore for FixtureEvidenceStore {
     }
 }
 
+struct GrantFixture<'a> {
+    capability: Option<(&'a str, &'a str)>,
+    expires_at: u64,
+    wall_time_ms: u64,
+    confinement_algorithm: &'a str,
+    confinement_value: &'a str,
+    workspaces: Vec<(&'a str, &'a str, Vec<execution_capnp::WorkspaceOperation>)>,
+}
+
 fn grant_bytes(spec_bytes: &[u8], capability: bool, expires_at: u64, wall_time_ms: u64) -> Vec<u8> {
+    let confinement_value = "b".repeat(64);
+    grant_bytes_with_fixture(
+        spec_bytes,
+        GrantFixture {
+            capability: capability.then_some((EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION)),
+            expires_at,
+            wall_time_ms,
+            confinement_algorithm: "blake3-256",
+            confinement_value: &confinement_value,
+            workspaces: Vec::new(),
+        },
+    )
+}
+
+fn grant_bytes_with_fixture(spec_bytes: &[u8], fixture: GrantFixture<'_>) -> Vec<u8> {
     let spec_digest = canonical_digest(spec_bytes)
         .expect("canonical spec digest")
         .strip_prefix("blake3-256:")
@@ -80,25 +121,41 @@ fn grant_bytes(spec_bytes: &[u8], capability: bool, expires_at: u64, wall_time_m
     let mut message = Builder::new_default();
     let mut grant = message.init_root::<execution_capnp::run_grant::Builder<'_>>();
     grant.set_grant_id("grant-01");
-    grant.set_expires_at_unix_ms(expires_at);
+    grant.set_expires_at_unix_ms(fixture.expires_at);
     grant.set_replay_key("replay-01");
     set_digest(grant.reborrow().init_run_spec_digest(), &spec_digest);
     set_evidence(grant.reborrow().init_issuer_evidence());
     set_evidence(grant.reborrow().init_workload_identity_evidence());
     set_evidence(grant.reborrow().init_actor_provenance_evidence());
-    set_digest(grant.reborrow().init_confinement_digest(), &"b".repeat(64));
-    if wall_time_ms != 0 {
+    let mut confinement = grant.reborrow().init_confinement_digest();
+    confinement.set_algorithm(fixture.confinement_algorithm);
+    confinement.set_value(fixture.confinement_value);
+    if fixture.wall_time_ms != 0 {
         grant
             .reborrow()
             .init_limits()
-            .set_wall_time_ms(wall_time_ms);
+            .set_wall_time_ms(fixture.wall_time_ms);
     }
     grant.set_backend_class(execution_capnp::BackendClass::MicroVm);
-    let capabilities = grant.init_capabilities(u32::from(capability));
-    if capability {
+    let capabilities = grant
+        .reborrow()
+        .init_capabilities(u32::from(fixture.capability.is_some()));
+    if let Some((name, interface)) = fixture.capability {
         let mut entry = capabilities.get(0);
-        entry.set_grant(EXECUTION_CAPABILITY);
-        entry.set_interface(EXECUTION_SCHEMA_VERSION);
+        entry.set_grant(name);
+        entry.set_interface(interface);
+    }
+    let mut workspaces = grant
+        .reborrow()
+        .init_workspaces(fixture.workspaces.len() as u32);
+    for (index, (name, graph_root, operations)) in fixture.workspaces.iter().enumerate() {
+        let mut workspace = workspaces.reborrow().get(index as u32);
+        workspace.set_name(name);
+        set_digest(workspace.reborrow().init_graph_root(), graph_root);
+        let mut granted_operations = workspace.init_operations(operations.len() as u32);
+        for (operation_index, operation) in operations.iter().enumerate() {
+            granted_operations.set(operation_index as u32, *operation);
+        }
     }
     let mut bytes = Vec::new();
     capnp::serialize::write_message(&mut bytes, &message).expect("serialize grant");
@@ -129,7 +186,7 @@ fn binds_grant_to_spec_and_derives_run_id() {
         &spec,
         &grant,
         &AuthorizationPolicy {
-            now_unix_ms: 1_000,
+            now_unix_ms: Some(1_000),
             required_backend: BackendClass::MicroVm,
             required_confinement_digest: None,
         },
@@ -150,7 +207,7 @@ fn rejects_expired_grants_and_missing_capability() {
         &spec,
         &expired,
         &AuthorizationPolicy {
-            now_unix_ms: 1_000,
+            now_unix_ms: Some(1_000),
             required_backend: BackendClass::MicroVm,
             required_confinement_digest: None,
         },
@@ -163,13 +220,99 @@ fn rejects_expired_grants_and_missing_capability() {
         &spec,
         &missing,
         &AuthorizationPolicy {
-            now_unix_ms: 1_000,
+            now_unix_ms: Some(1_000),
             required_backend: BackendClass::MicroVm,
             required_confinement_digest: None,
         },
     )
     .expect_err("grant without execution capability must be rejected");
     assert!(error.detail.contains("capability"));
+}
+
+#[test]
+fn execution_capability_requires_both_grant_and_interface() {
+    let spec = spec_bytes();
+    let confinement = "b".repeat(64);
+    for capability in [
+        (EXECUTION_CAPABILITY, "wrong/interface"),
+        ("wrong/grant", EXECUTION_SCHEMA_VERSION),
+    ] {
+        let grant = grant_bytes_with_fixture(
+            &spec,
+            GrantFixture {
+                capability: Some(capability),
+                expires_at: 2_000,
+                wall_time_ms: 0,
+                confinement_algorithm: "blake3-256",
+                confinement_value: &confinement,
+                workspaces: Vec::new(),
+            },
+        );
+        let error = authorize(
+            &spec,
+            &grant,
+            &AuthorizationPolicy {
+                now_unix_ms: Some(1_000),
+                required_backend: BackendClass::MicroVm,
+                required_confinement_digest: None,
+            },
+        )
+        .expect_err("partial capability match must fail closed");
+        assert!(error.detail.contains("capability"));
+    }
+}
+
+#[test]
+fn digest_validation_rejects_each_malformed_component_independently() {
+    let spec = spec_bytes();
+    let valid = "b".repeat(64);
+    let short = "b".repeat(63);
+    let uppercase = "B".repeat(64);
+    for (algorithm, value) in [
+        ("sha256", valid.as_str()),
+        ("blake3-256", short.as_str()),
+        ("blake3-256", uppercase.as_str()),
+    ] {
+        let grant = grant_bytes_with_fixture(
+            &spec,
+            GrantFixture {
+                capability: Some((EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION)),
+                expires_at: 2_000,
+                wall_time_ms: 0,
+                confinement_algorithm: algorithm,
+                confinement_value: value,
+                workspaces: Vec::new(),
+            },
+        );
+        let error = authorize(
+            &spec,
+            &grant,
+            &AuthorizationPolicy {
+                now_unix_ms: Some(1_000),
+                required_backend: BackendClass::MicroVm,
+                required_confinement_digest: None,
+            },
+        )
+        .expect_err("malformed digest component must fail closed");
+        assert!(error.detail.contains("lowercase blake3-256 digest"));
+    }
+}
+
+#[test]
+fn unsupported_requested_interface_is_rejected_after_binding() {
+    let spec = spec_bytes_with_interface(Some("unsupported/interface"), 0);
+    let grant = grant_bytes(&spec, true, 2_000, 0);
+    let error = authorize(
+        &spec,
+        &grant,
+        &AuthorizationPolicy {
+            now_unix_ms: Some(1_000),
+            required_backend: BackendClass::MicroVm,
+            required_confinement_digest: None,
+        },
+    )
+    .expect_err("a bound but unsupported interface must fail closed");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::UnsupportedBackend);
 }
 
 #[test]
@@ -180,7 +323,7 @@ fn verifier_adapter_can_fail_closed_before_backend_resolution() {
         &spec,
         &grant,
         &AuthorizationPolicy {
-            now_unix_ms: 1_000,
+            now_unix_ms: Some(1_000),
             required_backend: BackendClass::MicroVm,
             required_confinement_digest: None,
         },
@@ -198,7 +341,7 @@ fn default_authorization_fails_closed_without_embedding_trust() {
         &spec,
         &grant,
         &AuthorizationPolicy {
-            now_unix_ms: 1_000,
+            now_unix_ms: Some(1_000),
             required_backend: BackendClass::MicroVm,
             required_confinement_digest: None,
         },
@@ -268,7 +411,7 @@ fn rejects_grant_bound_to_different_spec() {
         &spec,
         &grant,
         &AuthorizationPolicy {
-            now_unix_ms: 1_000,
+            now_unix_ms: Some(1_000),
             required_backend: BackendClass::MicroVm,
             required_confinement_digest: None,
         },
@@ -285,13 +428,120 @@ fn rejects_grant_that_widens_requested_limits() {
         &spec,
         &grant,
         &AuthorizationPolicy {
-            now_unix_ms: 1_000,
+            now_unix_ms: Some(1_000),
             required_backend: BackendClass::MicroVm,
             required_confinement_digest: None,
         },
     )
     .expect_err("widened grant must be rejected");
     assert!(error.detail.contains("widens"));
+}
+
+#[test]
+fn grant_limit_equal_to_requested_boundary_is_valid_but_zero_is_not() {
+    let spec = spec_bytes_with_interface(None, 100);
+    let equal = grant_bytes(&spec, true, 2_000, 100);
+    authorize(
+        &spec,
+        &equal,
+        &AuthorizationPolicy {
+            now_unix_ms: Some(1_000),
+            required_backend: BackendClass::MicroVm,
+            required_confinement_digest: None,
+        },
+    )
+    .expect("an equal resolved limit does not widen authority");
+
+    let unresolved = grant_bytes(&spec, true, 2_000, 0);
+    let error = authorize(
+        &spec,
+        &unresolved,
+        &AuthorizationPolicy {
+            now_unix_ms: Some(1_000),
+            required_backend: BackendClass::MicroVm,
+            required_confinement_digest: None,
+        },
+    )
+    .expect_err("zero must not erase an explicitly requested ceiling");
+    assert!(error.detail.contains("widens"));
+}
+
+#[test]
+fn workspace_grants_require_exact_identity_cardinality_and_unique_names() {
+    let confinement = "b".repeat(64);
+    let policy = AuthorizationPolicy {
+        now_unix_ms: Some(1_000),
+        required_backend: BackendClass::MicroVm,
+        required_confinement_digest: None,
+    };
+    let read = vec![execution_capnp::WorkspaceOperation::Read];
+
+    let spec = spec_bytes_with_details(None, 0, &[("repo", &"a".repeat(64))]);
+    let exact = grant_bytes_with_fixture(
+        &spec,
+        GrantFixture {
+            capability: Some((EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION)),
+            expires_at: 2_000,
+            wall_time_ms: 0,
+            confinement_algorithm: "blake3-256",
+            confinement_value: &confinement,
+            workspaces: vec![("repo", &"a".repeat(64), read.clone())],
+        },
+    );
+    authorize(&spec, &exact, &policy).expect("exact workspace grant");
+
+    let extra = grant_bytes_with_fixture(
+        &spec,
+        GrantFixture {
+            capability: Some((EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION)),
+            expires_at: 2_000,
+            wall_time_ms: 0,
+            confinement_algorithm: "blake3-256",
+            confinement_value: &confinement,
+            workspaces: vec![
+                ("repo", &"a".repeat(64), read.clone()),
+                ("extra", &"b".repeat(64), read.clone()),
+            ],
+        },
+    );
+    authorize(&spec, &extra, &policy)
+        .expect_err("an unrequested workspace must fail cardinality validation");
+
+    let wrong_identity = grant_bytes_with_fixture(
+        &spec,
+        GrantFixture {
+            capability: Some((EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION)),
+            expires_at: 2_000,
+            wall_time_ms: 0,
+            confinement_algorithm: "blake3-256",
+            confinement_value: &confinement,
+            workspaces: vec![("repo", &"c".repeat(64), read.clone())],
+        },
+    );
+    authorize(&spec, &wrong_identity, &policy)
+        .expect_err("same-sized workspace sets must still match content identity");
+
+    let duplicate_spec = spec_bytes_with_details(
+        None,
+        0,
+        &[("repo", &"a".repeat(64)), ("repo", &"b".repeat(64))],
+    );
+    let duplicate = grant_bytes_with_fixture(
+        &duplicate_spec,
+        GrantFixture {
+            capability: Some((EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION)),
+            expires_at: 2_000,
+            wall_time_ms: 0,
+            confinement_algorithm: "blake3-256",
+            confinement_value: &confinement,
+            workspaces: vec![
+                ("repo", &"a".repeat(64), read.clone()),
+                ("repo", &"b".repeat(64), read),
+            ],
+        },
+    );
+    authorize(&duplicate_spec, &duplicate, &policy)
+        .expect_err("duplicate workspace names are ambiguous authority");
 }
 
 #[test]
@@ -302,7 +552,7 @@ fn rejects_grant_with_a_confinement_policy_the_backend_will_not_enforce() {
         &spec,
         &grant,
         &AuthorizationPolicy {
-            now_unix_ms: 1_000,
+            now_unix_ms: Some(1_000),
             required_backend: BackendClass::MicroVm,
             required_confinement_digest: Some(format!("blake3-256:{}", "c".repeat(64))),
         },
@@ -402,7 +652,7 @@ fn service_schema_entrypoint_authorizes_before_resolving() {
             &spec,
             &grant,
             &AuthorizationPolicy {
-                now_unix_ms: 1_000,
+                now_unix_ms: Some(1_000),
                 required_backend: BackendClass::MicroVm,
                 required_confinement_digest: None,
             },
@@ -433,7 +683,7 @@ fn schema_start_requires_explicit_backend_provisioning() {
             &spec,
             &grant,
             &AuthorizationPolicy {
-                now_unix_ms: 1_000,
+                now_unix_ms: Some(1_000),
                 required_backend: BackendClass::MicroVm,
                 required_confinement_digest: None,
             },
@@ -456,7 +706,7 @@ fn natural_backend_completion_can_collect_a_schema_receipt() {
             &spec,
             &grant,
             &AuthorizationPolicy {
-                now_unix_ms: 1_000,
+                now_unix_ms: Some(1_000),
                 required_backend: BackendClass::MicroVm,
                 required_confinement_digest: None,
             },
@@ -504,7 +754,7 @@ fn json_adapter_uses_generated_input_and_output_shapes() {
     .to_string();
     let service = ExecutionService::new(RecordingBackend);
     let policy = AuthorizationPolicy {
-        now_unix_ms: 1_000,
+        now_unix_ms: Some(1_000),
         required_backend: BackendClass::MicroVm,
         required_confinement_digest: None,
     };
@@ -514,6 +764,9 @@ fn json_adapter_uses_generated_input_and_output_shapes() {
     )
     .expect("provision JSON");
     assert!(provision.contains("provisioned"));
+    let error = start_json(&service, &input, &policy, &TestResolver)
+        .expect_err("the default JSON surface must reject unsigned evidence");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::Unauthenticated);
     let start = start_json_with_verifier(
         &service,
         &input,
@@ -530,10 +783,41 @@ fn json_adapter_uses_generated_input_and_output_shapes() {
 
     let start_value: serde_json::Value = serde_json::from_str(&start).unwrap();
     let run_id = start_value["runId"].as_str().unwrap();
-    service.cancel(run_id).expect("cancel for receipt");
+    let inspection: serde_json::Value = serde_json::from_str(
+        &inspect_json(
+            &service,
+            &json!({"runId": run_id, "afterSequence": 2}).to_string(),
+        )
+        .expect("inspect JSON"),
+    )
+    .expect("inspect output JSON");
+    assert_eq!(inspection["runId"], run_id);
+    assert_eq!(inspection["events"].as_array().unwrap().len(), 2);
+
+    let cancellation: serde_json::Value = serde_json::from_str(
+        &cancel_json(
+            &service,
+            &json!({"runId": run_id, "idempotencyKey": "cancel-01"}).to_string(),
+        )
+        .expect("cancel JSON"),
+    )
+    .expect("cancel output JSON");
+    assert_eq!(cancellation["runId"], run_id);
+    assert_eq!(cancellation["state"], "cancelled");
     let receipt = collect_json(&service, &json!({"runId": run_id}).to_string())
         .expect("collect receipt JSON");
-    assert!(receipt.contains("eventLogRoot"));
+    let receipt: serde_json::Value = serde_json::from_str(&receipt).expect("receipt JSON");
+    assert_eq!(
+        receipt["receipt"]["eventLogRoot"]["algorithm"],
+        "blake3-256"
+    );
+    assert_eq!(
+        receipt["receipt"]["eventLogRoot"]["value"]
+            .as_str()
+            .expect("event root value")
+            .len(),
+        64
+    );
     let cleanup =
         cleanup_json(&service, &json!({"runId": run_id}).to_string()).expect("cleanup JSON");
     assert!(cleanup.contains("cleaned"));
@@ -568,4 +852,113 @@ fn capabilities_projection_uses_declared_backend_class() {
     assert!(capabilities.contains("backend/native"));
     assert!(!capabilities.contains("backend/microvm"));
     assert!(capabilities.contains("unavailable"));
+}
+
+// ── run identity is a content-addressed name ────────────────────────────────
+//
+// `run_id` is the handle a consumer derives locally to address a run —
+// ideally before `start` returns, so inspect/collect/cancel can be pipelined
+// over a stateless transport. That only works if the id is a function of the
+// authorized *content*, computable by a second implementation. Two properties
+// are load-bearing: framing independence, and unambiguous field boundaries.
+
+/// Re-encode one RunSpec with a deliberately different segment layout. The
+/// canonical form — and therefore the content identity — is unchanged.
+fn reframed_spec(bytes: &[u8]) -> Vec<u8> {
+    let reader = capnp::serialize::read_message(&mut &bytes[..], ReaderOptions::new())
+        .expect("read spec message");
+    let source = reader
+        .get_root::<execution_capnp::run_spec::Reader<'_>>()
+        .expect("spec root");
+    let mut message = Builder::new(capnp::message::HeapAllocator::new().first_segment_words(1));
+    message.set_root(source).expect("copy spec root");
+    let mut out = Vec::new();
+    capnp::serialize::write_message(&mut out, &message).expect("serialize reframed spec");
+    out
+}
+
+#[test]
+fn run_id_names_spec_content_not_its_capnp_framing() {
+    let single = spec_bytes();
+    let reframed = reframed_spec(&single);
+    assert_ne!(
+        single, reframed,
+        "fixture must actually differ in wire framing"
+    );
+    assert_eq!(
+        canonical_digest(&single).expect("canonical digest"),
+        canonical_digest(&reframed).expect("canonical digest"),
+        "fixture must remain one content identity"
+    );
+
+    let policy = AuthorizationPolicy {
+        now_unix_ms: Some(1_000),
+        required_backend: BackendClass::MicroVm,
+        required_confinement_digest: None,
+    };
+    let from_single = authorize(&single, &grant_bytes(&single, true, 2_000, 0), &policy)
+        .expect("authorize single-segment spec");
+    let from_reframed = authorize(&reframed, &grant_bytes(&reframed, true, 2_000, 0), &policy)
+        .expect("authorize reframed spec");
+
+    assert_eq!(
+        from_single.spec_digest, from_reframed.spec_digest,
+        "spec digest already binds canonical content"
+    );
+    assert_eq!(
+        from_single.run_id, from_reframed.run_id,
+        "run_id must name the same content under a different encoding"
+    );
+}
+
+#[test]
+fn run_id_separates_the_grant_id_from_the_replay_key() {
+    // ("grant-ab", "c…") and ("grant-a", "bc…") are distinct authorities. A
+    // bare concatenation of the two fields would give them one run identity.
+    let spec = spec_bytes();
+    let policy = AuthorizationPolicy {
+        now_unix_ms: Some(1_000),
+        required_backend: BackendClass::MicroVm,
+        required_confinement_digest: None,
+    };
+    let spec_digest = canonical_digest(&spec).expect("canonical digest");
+    assert_ne!(
+        leyline_runtime::authorization::derive_run_id(&spec_digest, "ab", "c"),
+        leyline_runtime::authorization::derive_run_id(&spec_digest, "a", "bc"),
+        "adjacent identity fields must not be ambiguous at their boundary"
+    );
+    // The pinned clock keeps this a pure identity assertion.
+    let _ = policy;
+}
+
+// ── grant expiry is evaluated against the current clock ─────────────────────
+
+#[test]
+fn the_default_policy_does_not_capture_a_construction_time_clock() {
+    // A daemon builds one policy at startup and reuses it for every request
+    // (see `leyline execution-daemon`). If that policy carried the timestamp
+    // it was constructed with, a grant that expired seconds after startup
+    // would still authorize days later.
+    assert_eq!(
+        AuthorizationPolicy::default().now_unix_ms,
+        None,
+        "a reused policy must sample the wall clock per authorization"
+    );
+}
+
+#[test]
+fn a_reused_default_policy_rejects_a_grant_that_expired_before_now() {
+    let spec = spec_bytes();
+    let policy = AuthorizationPolicy {
+        required_backend: BackendClass::MicroVm,
+        ..Default::default()
+    };
+    let now = leyline_runtime::authorization::current_unix_ms();
+
+    let expired = grant_bytes(&spec, true, now - 1, 0);
+    let error = authorize(&spec, &expired, &policy).expect_err("expired grant must be rejected");
+    assert!(error.detail.contains("RunGrant has expired"), "{error:?}");
+
+    let live = grant_bytes(&spec, true, now + 600_000, 0);
+    authorize(&spec, &live, &policy).expect("an unexpired grant must still authorize");
 }

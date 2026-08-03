@@ -19,6 +19,12 @@ version: '3'
 # file. Adding a task here is safe; adding one that greps for it is not.
 
 tasks:
+  test:
+    desc: Run the default CLI library and integration test suite
+    dir: '{{.ROOT_DIR}}/rs'
+    cmds:
+      - cargo test -p leyline-cli-lib
+
   test:vec:
     desc: Tests for the `vec` feature (sqlite-vec + fastembed) — ships in install:full
     dir: '{{.ROOT_DIR}}/rs'

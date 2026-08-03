@@ -131,16 +131,23 @@ pub fn execute_with_ready(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     for entry in &config.environment {
-        let bytes = entry.as_bytes();
-        let separator = bytes.iter().position(|byte| *byte == b'=').ok_or_else(|| {
-            ExecutionError::invalid("native environment entry has no key/value separator")
-        })?;
-        let (key, value) = (&bytes[..separator], &bytes[separator + 1..]);
+        let (key, value) = split_environment_entry(entry.as_bytes())?;
         command.env(OsStr::from_bytes(key), OsStr::from_bytes(value));
     }
     let status = command.status().map_err(|error| {
         ExecutionError::backend(format!("start native guest executable: {error}"))
     })?;
+    guest_exit_result(status)
+}
+
+fn split_environment_entry(bytes: &[u8]) -> Result<(&[u8], &[u8]), ExecutionError> {
+    let separator = bytes.iter().position(|byte| *byte == b'=').ok_or_else(|| {
+        ExecutionError::invalid("native environment entry has no key/value separator")
+    })?;
+    Ok((&bytes[..separator], &bytes[separator + 1..]))
+}
+
+fn guest_exit_result(status: std::process::ExitStatus) -> Result<(), ExecutionError> {
     if status.success() {
         Ok(())
     } else {
@@ -152,8 +159,15 @@ pub fn execute_with_ready(
 
 #[cfg(test)]
 mod tests {
-    use super::WorkerOptions;
+    use super::{
+        WorkerOptions, execute_from_reader_with_events, execute_with_ready, guest_exit_result,
+        split_environment_entry,
+    };
+    use crate::{DigestRef, ExecutionRequest, ResourceLimits};
+    use std::collections::BTreeMap;
     use std::ffi::OsString;
+    use std::path::PathBuf;
+    use std::process::Command;
 
     #[test]
     fn worker_options_require_trusted_roots() {
@@ -171,5 +185,105 @@ mod tests {
         ])
         .expect_err("unknown host-path option must fail closed");
         assert!(error.detail.contains("unknown or duplicate"));
+    }
+
+    #[test]
+    fn worker_options_preserve_runtime_files_and_reject_duplicate_roots() {
+        let options = WorkerOptions::parse([
+            OsString::from("--cas-root"),
+            OsString::from("cas"),
+            OsString::from("--run-root"),
+            OsString::from("run"),
+            OsString::from("--runtime-file"),
+            OsString::from("lib-a"),
+            OsString::from("--runtime-file"),
+            OsString::from("lib-b"),
+        ])
+        .expect("valid worker options");
+        assert_eq!(options.cas_root, PathBuf::from("cas"));
+        assert_eq!(options.run_root, PathBuf::from("run"));
+        assert_eq!(
+            options.runtime_files,
+            vec![PathBuf::from("lib-a"), PathBuf::from("lib-b")]
+        );
+
+        for duplicate in ["--cas-root", "--run-root"] {
+            let mut arguments = vec![
+                OsString::from("--cas-root"),
+                OsString::from("cas"),
+                OsString::from("--run-root"),
+                OsString::from("run"),
+            ];
+            arguments.push(OsString::from(duplicate));
+            arguments.push(OsString::from("other"));
+            let error = WorkerOptions::parse(arguments)
+                .expect_err("duplicate trusted root must fail closed");
+            assert!(error.detail.contains("unknown or duplicate"));
+        }
+    }
+
+    fn invalid_request() -> ExecutionRequest {
+        ExecutionRequest {
+            run_id: "run-invalid".into(),
+            replay_key: "replay-invalid".into(),
+            rootfs: DigestRef {
+                algorithm: "sha256".into(),
+                value: "a".repeat(64),
+            },
+            executable: "bin/agent".into(),
+            arguments: Vec::new(),
+            public_environment: BTreeMap::new(),
+            allowed_egress: Vec::new(),
+            limits: ResourceLimits {
+                vcpus: 1,
+                memory_mib: 64,
+                wall_time_ms: 1_000,
+            },
+        }
+    }
+
+    #[test]
+    fn native_entrypoints_reject_invalid_input_before_confinement() {
+        let options = WorkerOptions {
+            cas_root: PathBuf::from("missing-cas"),
+            run_root: PathBuf::from("missing-run"),
+            runtime_files: Vec::new(),
+        };
+        let error =
+            execute_from_reader_with_events(options.clone(), b"not-json".as_slice(), Vec::new())
+                .expect_err("invalid worker JSON must fail");
+        assert!(error.detail.contains("invalid native worker request JSON"));
+
+        let mut ready_called = false;
+        execute_with_ready(options, &invalid_request(), |_| {
+            ready_called = true;
+            Ok(())
+        })
+        .expect_err("invalid request must fail before rootfs resolution");
+        assert!(!ready_called);
+    }
+
+    #[test]
+    fn environment_split_preserves_equals_in_the_value() {
+        let (key, value) = split_environment_entry(b"TOKEN=a=b").expect("environment entry");
+        assert_eq!(key, b"TOKEN");
+        assert_eq!(value, b"a=b");
+        split_environment_entry(b"TOKEN").expect_err("missing separator must fail");
+    }
+
+    #[test]
+    fn guest_exit_status_controls_native_success() {
+        let success = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .status()
+            .expect("success status");
+        guest_exit_result(success).expect("successful guest");
+
+        let failure = Command::new("sh")
+            .args(["-c", "exit 7"])
+            .status()
+            .expect("failure status");
+        let error = guest_exit_result(failure).expect_err("failed guest must fail");
+        assert!(error.detail.contains("native guest executable exited"));
     }
 }

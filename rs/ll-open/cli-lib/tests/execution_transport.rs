@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use capnp::message::{Builder, ReaderOptions};
-use leyline_cli_lib::daemon::execution::{ExecutionHandler, RuntimeExecutionHandler};
+use leyline_cli_lib::daemon::DaemonExt;
+use leyline_cli_lib::daemon::execution::{ExecutionDaemonExt, RuntimeExecutionHandler};
 use leyline_public_schema::execution_capnp;
 use leyline_runtime::authorization::{
     AuthorizationPolicy, EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION, canonical_digest,
@@ -150,13 +151,18 @@ fn canonical_fixture_uses_one_runtime_handler_for_lifecycle_operations() {
     let handler = RuntimeExecutionHandler::new_with_verifier(
         Arc::clone(&service),
         AuthorizationPolicy {
-            now_unix_ms: 1_000,
+            now_unix_ms: Some(1_000),
             required_backend: BackendClass::MicroVm,
             required_confinement_digest: None,
         },
         Arc::new(Resolver),
         Arc::new(leyline_runtime::MetadataOnlyEvidenceVerifier),
     );
+
+    let extension = ExecutionDaemonExt::new(Arc::new(handler));
+    let handler = extension
+        .execution_handler()
+        .expect("execution extension must expose its handler");
 
     let capabilities: Value = serde_json::from_str(&handler.capabilities().unwrap()).unwrap();
     assert!(capabilities.to_string().contains("cloister/execution/v1"));
@@ -182,6 +188,15 @@ fn canonical_fixture_uses_one_runtime_handler_for_lifecycle_operations() {
         serde_json::from_str(&handler.status(&json!({"runId": run_id})).unwrap()).unwrap();
     assert_eq!(status["state"], "running");
 
+    let inspection: Value = serde_json::from_str(
+        &handler
+            .inspect(&json!({"runId": run_id, "afterSequence": 0}))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(inspection["runId"], run_id);
+    assert!(inspection["events"].as_array().is_some());
+
     let cancel: Value = serde_json::from_str(
         &handler
             .cancel(&json!({"runId": run_id, "idempotencyKey":"c-transport"}))
@@ -193,4 +208,13 @@ fn canonical_fixture_uses_one_runtime_handler_for_lifecycle_operations() {
         serde_json::from_str(&handler.collect(&json!({"runId": run_id})).unwrap()).unwrap();
     assert_eq!(receipt["receipt"]["runId"], run_id);
     assert_eq!(receipt["receipt"]["terminalState"], "cancelled");
+
+    let cleanup: Value = serde_json::from_str(
+        &handler
+            .cleanup(&json!({"runId": run_id, "idempotencyKey":"x-transport"}))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cleanup["runId"], run_id);
+    assert_eq!(cleanup["state"], "cleaned");
 }

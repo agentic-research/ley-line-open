@@ -148,11 +148,16 @@ To select the embedded VM path, use `--backend micro-vm --libkrun
 paths. This selects LLO's `KrunWorkerBackend`; it does not invoke the
 `krunvm` CLI.
 
-Mutation testing remains a separate hardening pass: use the repository's
-`task mutants:diff DIFF=<path>` gate after the runtime edge-case tests are
-expanded. The initial local runtime mutation run exposed survivor cases that
-are tracked in `ley-line-open-ce0cf0`; they are intentionally not presented as
-covered by this vertical slice.
+Mutation testing is invoked through the repository Taskfile. Run
+`task mutants:pr` to exercise the same diff-scoped slices as CI against the
+working tree, including uncommitted changes. For a shorter local feedback loop,
+`task mutants:pr MUTANTS_SCOPE=runtime` and `MUTANTS_SCOPE=cli` select the
+corresponding package, while CI always runs every slice. Runtime behavior is
+mutated with its integration tests enabled; CLI-library execution mutations
+run the library plus the `execution_client` and `execution_transport` contract
+tests. The Taskfile fixture gate rejects Rust diffs that enumerate no mutants,
+focused scopes that run no matching slice, and baseline suites that cannot run
+inside cargo-mutants' scratch tree.
 
 The current release is `v0.14.0`. It publishes platform binaries, FFI
 staticlibs, and the Apache-2.0 Go schema module at

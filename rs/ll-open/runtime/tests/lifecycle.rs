@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Duration;
 
@@ -21,6 +22,16 @@ struct FailingBackend;
 #[derive(Clone)]
 struct BlockingBackend {
     gate: Arc<StartGate>,
+    starts: Arc<AtomicUsize>,
+}
+
+impl BlockingBackend {
+    fn new(gate: Arc<StartGate>) -> Self {
+        Self {
+            gate,
+            starts: Arc::new(AtomicUsize::new(0)),
+        }
+    }
 }
 
 struct StartGate {
@@ -115,6 +126,13 @@ impl Backend for BlockingBackend {
     }
 
     fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+        if self.starts.fetch_add(1, Ordering::SeqCst) != 0 {
+            return Err(ExecutionError {
+                code: ErrorCode::BackendFailed,
+                retryable: false,
+                detail: "blocking backend was entered more than once".into(),
+            });
+        }
         *self.gate.entered.lock().expect("entered lock") = true;
         self.gate.entered_cv.notify_all();
         let mut release = self.gate.release.lock().expect("release lock");
@@ -212,6 +230,30 @@ fn status_projects_backend_completion_without_sleeping() {
         inspection.events.last().expect("terminal event").state,
         RunState::Succeeded
     );
+    assert_eq!(
+        inspection
+            .events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5]
+    );
+}
+
+#[test]
+fn inspect_cursor_is_strictly_after_the_reported_sequence() {
+    let service = ExecutionService::new(RecordingBackend::default());
+    service.start(request("cursor")).expect("start");
+
+    let inspection = service.inspect("run-01", 2).expect("inspect after cursor");
+    assert_eq!(
+        inspection
+            .events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![3, 4]
+    );
 }
 
 #[test]
@@ -254,9 +296,9 @@ fn status_progresses_while_backend_start_is_waiting() {
     // service state lock must not be held across that wait, or an unrelated
     // status request would block behind one slow launch.
     let gate = Arc::new(StartGate::new());
-    let service = Arc::new(ExecutionService::new(BlockingBackend {
-        gate: Arc::clone(&gate),
-    }));
+    let service = Arc::new(ExecutionService::new(BlockingBackend::new(Arc::clone(
+        &gate,
+    ))));
     let start_service = Arc::clone(&service);
     let start_thread = std::thread::spawn(move || start_service.start(request("blocking-start")));
 
@@ -286,6 +328,30 @@ fn status_progresses_while_backend_start_is_waiting() {
 }
 
 #[test]
+fn concurrent_start_rejects_the_same_replay_key_before_backend_ready() {
+    let gate = Arc::new(StartGate::new());
+    let service = Arc::new(ExecutionService::new(BlockingBackend::new(Arc::clone(
+        &gate,
+    ))));
+    let start_service = Arc::clone(&service);
+    let start_thread = std::thread::spawn(move || start_service.start(request("reserved-replay")));
+
+    gate.wait_until_entered();
+    let mut competing = request("reserved-replay");
+    competing.run_id = "run-02".into();
+    let competing_result = service.start(competing);
+    gate.release();
+    start_thread
+        .join()
+        .expect("start thread")
+        .expect("backend start");
+    let error = competing_result
+        .expect_err("an in-flight replay key must be reserved before backend readiness");
+    assert_eq!(error.code, ErrorCode::ResourceConflict);
+    assert!(error.retryable);
+}
+
+#[test]
 fn cancel_is_idempotent_and_updates_the_shared_lifecycle_state() {
     let backend = RecordingBackend::default();
     let service = ExecutionService::new(backend.clone());
@@ -304,6 +370,40 @@ fn cancel_is_idempotent_and_updates_the_shared_lifecycle_state() {
     let repeated = service.cancel("run-01").expect("repeat cancel");
     assert_eq!(repeated.state, RunState::Cancelled);
     assert_eq!(backend.calls(), vec!["start", "cancel"]);
+    let inspection = service.inspect("run-01", 0).expect("cancel events");
+    assert_eq!(
+        inspection
+            .events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5]
+    );
+}
+
+#[test]
+fn cleanup_appends_two_consecutive_terminal_events() {
+    let service = ExecutionService::new(RecordingBackend::default());
+    service.start(request("cleanup")).expect("start");
+    let cleaned = service.cleanup("run-01").expect("cleanup");
+    assert_eq!(cleaned.state, RunState::Cleaned);
+
+    let inspection = service.inspect("run-01", 0).expect("cleanup events");
+    assert_eq!(
+        inspection
+            .events
+            .iter()
+            .map(|event| (event.sequence, event.state))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, RunState::Accepted),
+            (2, RunState::Provisioning),
+            (3, RunState::Ready),
+            (4, RunState::Running),
+            (5, RunState::Cleaning),
+            (6, RunState::Cleaned),
+        ]
+    );
 }
 
 #[test]
@@ -347,4 +447,48 @@ fn egress_grant_fails_closed_until_a_network_broker_exists() {
 
     assert_eq!(error.code, ErrorCode::UnsupportedBackend);
     assert!(backend.calls().is_empty());
+}
+
+/// A worker that finished a moment ago: its supervisor has already dropped the
+/// run from the backend's active table — so `cancel` reports it no longer owns
+/// it — while the terminal status is still waiting to be projected.
+struct JustFinishedBackend;
+
+impl Backend for JustFinishedBackend {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            backend_id: "just-finished/1".into(),
+            backend_class: BackendClass::MicroVm,
+            available: true,
+        }
+    }
+
+    fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+        Ok(BackendRun {
+            backend_id: "just-finished/1".into(),
+        })
+    }
+
+    fn poll(&self, _run_id: &str) -> Result<Option<BackendRunStatus>, ExecutionError> {
+        Ok(Some(BackendRunStatus::Succeeded))
+    }
+
+    fn cancel(&self, _run_id: &str) -> Result<bool, ExecutionError> {
+        Ok(false)
+    }
+}
+
+#[test]
+fn cancelling_a_run_that_just_completed_returns_its_terminal_record() {
+    let service = ExecutionService::new(JustFinishedBackend);
+    let record = service.start(request("cancel-race")).expect("start");
+
+    // Every other read path projects the backend completion before acting.
+    // `cancel` must too, or a benign race — the worker finishing between the
+    // caller's decision and its request — surfaces as a hard backend error
+    // while `cleanup` on the same run succeeds.
+    let cancelled = service
+        .cancel(&record.run_id)
+        .expect("cancelling a completed run must project its terminal state");
+    assert_eq!(cancelled.state, RunState::Succeeded);
 }

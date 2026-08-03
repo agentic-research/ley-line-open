@@ -7,16 +7,21 @@ use leyline_runtime::authorization::{
 };
 
 fn spec_bytes() -> Vec<u8> {
-    spec_bytes_with_interface(None)
+    spec_bytes_with_interface(None, 0)
 }
 
-fn spec_bytes_with_interface(interface: Option<&str>) -> Vec<u8> {
+fn spec_bytes_with_interface(interface: Option<&str>, wall_time_ms: u64) -> Vec<u8> {
     let mut message = Builder::new_default();
     let mut spec = message.init_root::<execution_capnp::run_spec::Builder<'_>>();
     spec.set_schema_version(EXECUTION_SCHEMA_VERSION);
     if let Some(interface) = interface {
         let mut interfaces = spec.reborrow().init_requested_interfaces(1);
         interfaces.set(0, interface);
+    }
+    if wall_time_ms != 0 {
+        spec.reborrow()
+            .init_requested_limits()
+            .set_wall_time_ms(wall_time_ms);
     }
     let mut bytes = Vec::new();
     capnp::serialize::write_message(&mut bytes, &message).expect("serialize spec");
@@ -33,7 +38,7 @@ fn set_evidence(mut evidence: execution_capnp::evidence_ref::Builder<'_>) {
     set_digest(evidence.init_digest(), &"a".repeat(64));
 }
 
-fn grant_bytes(spec_bytes: &[u8], capability: bool, expires_at: u64) -> Vec<u8> {
+fn grant_bytes(spec_bytes: &[u8], capability: bool, expires_at: u64, wall_time_ms: u64) -> Vec<u8> {
     let spec_digest = canonical_digest(spec_bytes)
         .expect("canonical spec digest")
         .strip_prefix("blake3-256:")
@@ -49,6 +54,12 @@ fn grant_bytes(spec_bytes: &[u8], capability: bool, expires_at: u64) -> Vec<u8> 
     set_evidence(grant.reborrow().init_workload_identity_evidence());
     set_evidence(grant.reborrow().init_actor_provenance_evidence());
     set_digest(grant.reborrow().init_confinement_digest(), &"b".repeat(64));
+    if wall_time_ms != 0 {
+        grant
+            .reborrow()
+            .init_limits()
+            .set_wall_time_ms(wall_time_ms);
+    }
     grant.set_backend_class(execution_capnp::BackendClass::MicroVm);
     let capabilities = grant.init_capabilities(u32::from(capability));
     if capability {
@@ -64,7 +75,7 @@ fn grant_bytes(spec_bytes: &[u8], capability: bool, expires_at: u64) -> Vec<u8> 
 #[test]
 fn binds_grant_to_spec_and_derives_run_id() {
     let spec = spec_bytes();
-    let grant = grant_bytes(&spec, true, 2_000);
+    let grant = grant_bytes(&spec, true, 2_000, 0);
     let authorized = authorize(
         &spec,
         &grant,
@@ -84,7 +95,7 @@ fn binds_grant_to_spec_and_derives_run_id() {
 #[test]
 fn rejects_expired_grants_and_missing_capability() {
     let spec = spec_bytes();
-    let expired = grant_bytes(&spec, true, 1_000);
+    let expired = grant_bytes(&spec, true, 1_000, 0);
     let error = authorize(
         &spec,
         &expired,
@@ -96,7 +107,7 @@ fn rejects_expired_grants_and_missing_capability() {
     .expect_err("expired grant must be rejected");
     assert!(error.detail.contains("expired"));
 
-    let missing = grant_bytes(&spec, false, 2_000);
+    let missing = grant_bytes(&spec, false, 2_000, 0);
     let error = authorize(
         &spec,
         &missing,
@@ -112,8 +123,8 @@ fn rejects_expired_grants_and_missing_capability() {
 #[test]
 fn rejects_grant_bound_to_different_spec() {
     let spec = spec_bytes();
-    let other_spec = spec_bytes_with_interface(Some("different/interface"));
-    let grant = grant_bytes(&other_spec, true, 2_000);
+    let other_spec = spec_bytes_with_interface(Some("different/interface"), 0);
+    let grant = grant_bytes(&other_spec, true, 2_000, 0);
     let error = authorize(
         &spec,
         &grant,
@@ -124,4 +135,20 @@ fn rejects_grant_bound_to_different_spec() {
     )
     .expect_err("digest from a different spec must be rejected");
     assert!(error.detail.contains("does not bind"));
+}
+
+#[test]
+fn rejects_grant_that_widens_requested_limits() {
+    let spec = spec_bytes_with_interface(None, 100);
+    let grant = grant_bytes(&spec, true, 2_000, 101);
+    let error = authorize(
+        &spec,
+        &grant,
+        &AuthorizationPolicy {
+            now_unix_ms: 1_000,
+            required_backend: BackendClass::MicroVm,
+        },
+    )
+    .expect_err("widened grant must be rejected");
+    assert!(error.detail.contains("widens"));
 }

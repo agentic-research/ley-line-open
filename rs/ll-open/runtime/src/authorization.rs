@@ -114,9 +114,9 @@ pub struct EvidenceRef {
     pub digest: String,
 }
 
-/// Compatibility verifier for existing unit fixtures only. Production
-/// integrations must use an embedding-owned verifier and call
-/// [`authorize_with_verifier`].
+/// Compatibility verifier for explicitly opted-in fixture tests only.
+/// Production integrations must use an embedding-owned verifier and call
+/// [`authorize_with_verifier`]. It intentionally performs no authentication.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MetadataOnlyEvidenceVerifier;
 
@@ -212,12 +212,7 @@ pub fn authorize(
     grant_bytes: &[u8],
     policy: &AuthorizationPolicy,
 ) -> Result<AuthorizedExecution, ExecutionError> {
-    authorize_with_verifier(
-        spec_bytes,
-        grant_bytes,
-        policy,
-        &MetadataOnlyEvidenceVerifier,
-    )
+    authorize_with_verifier(spec_bytes, grant_bytes, policy, &RejectUnverifiedEvidence)
 }
 
 /// Validate and bind execution values after the embedding authority has

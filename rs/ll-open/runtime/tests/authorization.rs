@@ -3,10 +3,11 @@ use capnp::message::ReaderOptions;
 use leyline_public_schema::execution_capnp;
 use leyline_runtime::authorization::{
     AuthorizationPolicy, EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION, EvidenceRef,
-    EvidenceStore, EvidenceVerifier, authorize, canonical_digest,
+    EvidenceStore, EvidenceVerifier, MetadataOnlyEvidenceVerifier, authorize_with_verifier,
+    canonical_digest,
 };
 use leyline_runtime::transport::{
-    capabilities_json, cleanup_json, collect_json, start_json, status_json,
+    capabilities_json, cleanup_json, collect_json, start_json_with_verifier, status_json,
 };
 use leyline_runtime::{
     Backend, BackendCapabilities, BackendClass, BackendRun, BackendRunStatus, ExecutionError,
@@ -104,6 +105,22 @@ fn grant_bytes(spec_bytes: &[u8], capability: bool, expires_at: u64, wall_time_m
     bytes
 }
 
+// Unsigned fixture evidence is only valid through an explicit test adapter.
+// Production `authorize` and `start_json` fail closed without a trust-domain
+// verifier supplied by the embedding application.
+fn authorize(
+    spec_bytes: &[u8],
+    grant_bytes: &[u8],
+    policy: &AuthorizationPolicy,
+) -> Result<leyline_runtime::authorization::AuthorizedExecution, ExecutionError> {
+    authorize_with_verifier(
+        spec_bytes,
+        grant_bytes,
+        policy,
+        &MetadataOnlyEvidenceVerifier,
+    )
+}
+
 #[test]
 fn binds_grant_to_spec_and_derives_run_id() {
     let spec = spec_bytes();
@@ -170,6 +187,23 @@ fn verifier_adapter_can_fail_closed_before_backend_resolution() {
         &RejectEvidence,
     )
     .expect_err("unverified upstream evidence must fail closed");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::Unauthenticated);
+}
+
+#[test]
+fn default_authorization_fails_closed_without_embedding_trust() {
+    let spec = spec_bytes();
+    let grant = grant_bytes(&spec, true, 2_000, 0);
+    let error = leyline_runtime::authorization::authorize(
+        &spec,
+        &grant,
+        &AuthorizationPolicy {
+            now_unix_ms: 1_000,
+            required_backend: BackendClass::MicroVm,
+            required_confinement_digest: None,
+        },
+    )
+    .expect_err("unsigned fixture evidence must not pass the production default");
     assert_eq!(error.code, leyline_runtime::ErrorCode::Unauthenticated);
 }
 
@@ -480,7 +514,14 @@ fn json_adapter_uses_generated_input_and_output_shapes() {
     )
     .expect("provision JSON");
     assert!(provision.contains("provisioned"));
-    let start = start_json(&service, &input, &policy, &TestResolver).expect("start JSON");
+    let start = start_json_with_verifier(
+        &service,
+        &input,
+        &policy,
+        &TestResolver,
+        &MetadataOnlyEvidenceVerifier,
+    )
+    .expect("start JSON");
     assert!(start.contains("run-"));
     let status = status_json(&service, r#"{"runId":""}"#).expect("status JSON");
     assert!(status.contains("test/1"));

@@ -49,7 +49,7 @@ pub fn start_json<B: crate::Backend, R: ExecutionResolver>(
         input_json,
         policy,
         resolver,
-        &crate::MetadataOnlyEvidenceVerifier,
+        &crate::RejectUnverifiedEvidence,
     )
 }
 

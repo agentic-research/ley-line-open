@@ -6,10 +6,16 @@ use thiserror::Error;
 #[serde(rename_all = "kebab-case")]
 pub enum ErrorCode {
     InvalidSpec,
+    InvalidGrant,
+    Unauthenticated,
+    Unauthorized,
+    IdentityPolicyMismatch,
     UnsupportedBackend,
+    NotProvisioned,
     ResourceConflict,
     ResourceExhausted,
     BackendFailed,
+    Cancelled,
     Internal,
 }
 
@@ -39,9 +45,33 @@ impl ExecutionError {
         }
     }
 
+    pub(crate) fn identity_mismatch(detail: impl Into<String>) -> Self {
+        Self {
+            code: ErrorCode::IdentityPolicyMismatch,
+            retryable: false,
+            detail: detail.into(),
+        }
+    }
+
+    pub(crate) fn not_provisioned(detail: impl Into<String>) -> Self {
+        Self {
+            code: ErrorCode::NotProvisioned,
+            retryable: true,
+            detail: detail.into(),
+        }
+    }
+
     pub(crate) fn backend(detail: impl Into<String>) -> Self {
         Self {
             code: ErrorCode::BackendFailed,
+            retryable: false,
+            detail: detail.into(),
+        }
+    }
+
+    pub(crate) fn internal(detail: impl Into<String>) -> Self {
+        Self {
+            code: ErrorCode::Internal,
             retryable: false,
             detail: detail.into(),
         }

@@ -80,10 +80,15 @@ trap 'rm -rf "$tmp_dir"' 0 1 2 15
 "$cargo_bin" package --manifest-path "$schema_manifest" \
     --allow-dirty --list > "$tmp_dir/schema-files"
 
+# The vector file is as load-bearing as the IDL: a consumer with no LLO
+# checkout (cloister CI) pins conformance against these bytes, and shipping
+# VECTORS.sha256 without the vector it pins is a dangling digest.
 for required in \
     _traits.capnp \
     execution/v1/execution.capnp \
-    execution/v1/VECTORS.sha256
+    execution/v1/VECTORS.sha256 \
+    execution/v1/test-vectors/canonical-run.json \
+    execution/v1/test-vectors/run-id.json
 do
     grep -Fqx "$required" "$tmp_dir/schema-files" || {
         echo "schema-spec package omits canonical IDL asset: $required" >&2

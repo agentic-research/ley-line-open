@@ -7,8 +7,14 @@ repository = "https://github.com/agentic-research/ley-line-open"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
+blake3 = { workspace = true }
+capnp = { workspace = true }
+capnp-json = { workspace = true }
+leyline-public-schema = { path = "../../ll-core/public-schema", version = "0.14.0" }
 libloading = { workspace = true }
+libc = { workspace = true }
 leyline-core = { path = "../../ll-core/core", version = "0.14.0" }
+leyline-envelope = { path = "../envelope", version = "0.14.0" }
 nono = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -18,4 +24,5 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-blake3 = { workspace = true }
+hex = { workspace = true }
+wait-timeout = "0.2"

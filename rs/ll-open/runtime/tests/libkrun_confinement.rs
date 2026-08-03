@@ -5,7 +5,7 @@ use std::process::Command;
 
 use leyline_runtime::DigestRef;
 use leyline_runtime::backends::libkrun::confinement::{
-    VmmHostResources, apply, build_capabilities,
+    VmmHostResources, apply, build_capabilities, build_process_capabilities,
 };
 use leyline_runtime::backends::libkrun::plan::{KrunConfig, ResolvedRootfs};
 use nono::AccessMode;
@@ -104,6 +104,12 @@ fn nono_policy_wraps_the_vmm_with_minimal_host_capabilities() {
         },
     )
     .expect("nono capability policy");
+    let native_capabilities = build_process_capabilities(
+        rootfs.path(),
+        &[libkrun.clone(), firmware.clone()],
+        std::slice::from_ref(&device),
+    )
+    .expect("native nono capability policy");
 
     assert!(capabilities.is_network_blocked());
     let grants = capabilities.fs_capabilities();
@@ -124,4 +130,23 @@ fn nono_policy_wraps_the_vmm_with_minimal_host_capabilities() {
             && grant.access == AccessMode::ReadWrite
             && grant.is_file
     }));
+
+    let summarize = |caps: &nono::CapabilitySet| {
+        caps.fs_capabilities()
+            .iter()
+            .map(|grant| {
+                (
+                    grant.resolved.clone(),
+                    format!("{:?}", grant.access),
+                    grant.is_file,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        summarize(&capabilities),
+        summarize(&native_capabilities),
+        "native and libkrun confinement policies must grant the same host paths"
+    );
+    assert!(native_capabilities.is_network_blocked());
 }

@@ -4,14 +4,24 @@
 //! content identities and guest-relative names; backend-only host paths are
 //! introduced behind trusted resolver boundaries.
 
+pub mod authorization;
 pub mod backends;
+mod catalog;
 mod error;
 mod model;
 mod service;
+pub mod transport;
 
+pub use authorization::{
+    ArtifactIdentity, AuthorizedExecution, CasDsseEvidenceVerifier, EvidenceBinding, EvidenceField,
+    EvidenceRef, EvidenceStore, EvidenceVerifier, GrantSignature, MetadataOnlyEvidenceVerifier,
+    RejectUnverifiedEvidence, SchemaIntent, SchemaLimits, SignedGrant, WorkspaceInput,
+};
+pub use catalog::{CatalogBuilder, CatalogResolver};
 pub use error::{ErrorCode, ExecutionError};
 pub use model::{
-    BackendCapabilities, BackendClass, BackendRun, DigestRef, ExecutionRequest, ResourceLimits,
-    RunRecord, RunState,
+    BackendCapabilities, BackendClass, BackendRun, BackendRunStatus, DigestRef, ExecutionRequest,
+    ReceiptContext, ResourceLimits, RunEventRecord, RunInspection, RunReceiptData, RunRecord,
+    RunState,
 };
-pub use service::{Backend, ExecutionService};
+pub use service::{Backend, ExecutionResolver, ExecutionService};

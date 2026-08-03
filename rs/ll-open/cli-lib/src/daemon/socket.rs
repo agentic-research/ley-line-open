@@ -1,5 +1,6 @@
 //! UDS listener that dispatches ops to the event router, base ops, and extension.
 
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -26,27 +27,105 @@ fn remove_file_best_effort(path: &std::path::Path, what: &str) {
     }
 }
 
+/// Which auto-discovery symlink a bound daemon publishes under `~/.mache`.
+///
+/// Two daemons that publish the same name silently steal each other's
+/// clients: the second to start repoints the symlink, and every client that
+/// resolves it then talks to the wrong daemon against the wrong arena. The
+/// execution/v1 surface therefore owns a distinct name rather than sharing
+/// the substrate daemon's `default.sock`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SocketDiscovery {
+    /// `~/.mache/default.sock` — the substrate daemon mache resolves.
+    #[default]
+    Substrate,
+    /// `~/.mache/execution.sock` — the first-party execution/v1 surface.
+    /// Consumers may override the path with `LEYLINE_EXECUTION_SOCKET`.
+    Execution,
+    /// Publish nothing. For tests, and for embedders that hand the socket
+    /// path to their clients directly instead of relying on discovery.
+    Unpublished,
+}
+
+impl SocketDiscovery {
+    /// Symlink filename this daemon owns, or `None` when it publishes none.
+    pub fn symlink_name(self) -> Option<&'static str> {
+        match self {
+            Self::Substrate => Some("default.sock"),
+            Self::Execution => Some("execution.sock"),
+            Self::Unpublished => None,
+        }
+    }
+}
+
+/// Bind a listener that is never reachable under umask-derived permissions.
+///
+/// `bind` applies the process umask to the new socket inode, so a `chmod`
+/// afterwards is one syscall too late: for that interval any local uid can
+/// connect, and a connection established in the window survives the later
+/// tightening.
+///
+/// Narrowing the umask around the `bind` would fix the socket and break
+/// everything else — umask is process-global, so every concurrent file and
+/// directory creation in the process inherits it. `0o177` in particular
+/// strips owner-execute, so a directory created by another thread during the
+/// window comes out untraversable. That is a worse bug than the one being
+/// fixed, and the test suite catches it immediately.
+///
+/// Instead the socket is bound inside a private `0o700` directory, where no
+/// other uid can traverse to it at any point, then atomically renamed into
+/// place. Renaming a bound unix socket keeps the listener valid: the binding
+/// belongs to the inode, not to the directory entry that names it.
+fn bind_owner_only(sock_path: &std::path::Path) -> UnixListener {
+    let parent = sock_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let staging = parent.join(format!(".leyline-sock-stage-{}", std::process::id()));
+    // A staging directory left by a previous process with this pid would
+    // otherwise fail the create below.
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&staging)
+        .expect("create private staging directory for UDS bind");
+
+    let staged_path = staging.join("socket");
+    let listener = UnixListener::bind(&staged_path).expect("bind UDS socket");
+    std::fs::set_permissions(&staged_path, std::fs::Permissions::from_mode(0o600))
+        .expect("restrict UDS socket to owner-only permissions");
+    std::fs::rename(&staged_path, sock_path).expect("publish UDS socket");
+    let _ = std::fs::remove_dir(&staging);
+    listener
+}
+
 /// Spawn the UDS socket listener as a background tokio task.
 ///
 /// 1. Removes any stale socket file at `sock_path`.
-/// 2. Binds a `UnixListener`.
-/// 3. Symlinks to `~/.mache/default.sock` for auto-discovery.
+/// 2. Binds a `UnixListener` under an owner-only umask.
+/// 3. Publishes the `discovery` symlink under `~/.mache`, if any.
 /// 4. Spawns a tokio task per connection.
 /// 5. Each connection reads line-delimited JSON, dispatches, writes response.
 ///
 /// Returns the socket path. The listener runs in the background.
-pub fn spawn(ctx: Arc<DaemonContext>, sock_path: PathBuf) -> PathBuf {
+pub fn spawn(ctx: Arc<DaemonContext>, sock_path: PathBuf, discovery: SocketDiscovery) -> PathBuf {
     // Remove any stale socket left from a previous run.
     remove_file_best_effort(&sock_path, "stale socket");
 
-    // Bind the listener synchronously so the path is ready on return.
-    let listener = UnixListener::bind(&sock_path).expect("bind UDS socket");
+    // Bind synchronously so the path is ready on return. A control socket is
+    // a filesystem capability: the path itself grants access to every daemon
+    // operation, so it is never reachable under inherited permissions, even
+    // briefly. MCP's UDS transport applies the same owner-only boundary.
+    let listener = bind_owner_only(&sock_path);
 
-    // Symlink to ~/.mache/default.sock for auto-discovery.
-    // Skip if sock_path is already at the default location (avoids self-referencing symlink).
-    if let Some(home) = dirs::home_dir() {
+    // Publish this daemon's own discovery symlink. Skipped when the socket
+    // already IS that path (avoids a self-referencing symlink) and when the
+    // caller publishes nothing.
+    if let Some(symlink_name) = discovery.symlink_name()
+        && let Some(home) = dirs::home_dir()
+    {
         let mache_dir = home.join(".mache");
-        let symlink_path = mache_dir.join("default.sock");
+        let symlink_path = mache_dir.join(symlink_name);
         if sock_path != symlink_path {
             // Each step is best-effort — a daemon that can't auto-symlink
             // is still functional, just not discoverable via the default
@@ -57,10 +136,10 @@ pub fn spawn(ctx: Arc<DaemonContext>, sock_path: PathBuf) -> PathBuf {
                     mache_dir.display(),
                 );
             }
-            remove_file_best_effort(&symlink_path, "old default.sock symlink");
+            remove_file_best_effort(&symlink_path, "old discovery symlink");
             if let Err(e) = std::os::unix::fs::symlink(&sock_path, &symlink_path) {
                 log::warn!(
-                    "could not create default.sock symlink at {}: {e}",
+                    "could not create {symlink_name} symlink at {}: {e}",
                     symlink_path.display(),
                 );
             }
@@ -319,6 +398,8 @@ async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::{Mutex, RwLock};
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     #[test]
@@ -359,5 +440,78 @@ mod tests {
         // The dir is still there because the call was a no-op (errored
         // and was swallowed).
         assert!(nested.exists());
+    }
+
+    fn test_context(dir: &std::path::Path) -> Arc<DaemonContext> {
+        let arena_path = dir.join("socket.arena");
+        let ctrl_path = dir.join("socket.ctrl");
+        let _mmap = leyline_core::create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
+        let mut ctrl = leyline_core::Controller::open_or_create(&ctrl_path).unwrap();
+        ctrl.set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024)
+            .unwrap();
+        let live_db = crate::daemon::db_pool::LiveDb::open_fresh_for_test(
+            &ctrl_path.with_extension("live.db"),
+        );
+
+        Arc::new(DaemonContext {
+            ctrl_path,
+            ext: Arc::new(crate::daemon::NoExt),
+            router: crate::daemon::EventRouter::new(16),
+            live_db,
+            enrich_inflight: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            source_dir: None,
+            lang_filter: None,
+            enrichment_passes: vec![],
+            state: Arc::new(RwLock::new(crate::daemon::DaemonState::initializing())),
+            #[cfg(feature = "vec")]
+            vec_index: {
+                crate::daemon::vec_index::register_vec();
+                Arc::new(crate::daemon::vec_index::VectorIndex::new(4, None).unwrap())
+            },
+            #[cfg(feature = "vec")]
+            embedder: Arc::new(crate::daemon::embed::ZeroEmbedder { dim: 4 }),
+            #[cfg(feature = "vec")]
+            embed_queue: Arc::new(Mutex::new(std::collections::BinaryHeap::new())),
+            #[cfg(feature = "text-search")]
+            text_search: Arc::new(leyline_text_search::null::NullEngine::new()),
+            sheaf: Arc::new(crate::daemon::sheaf_ops::SheafState::new()),
+        })
+    }
+
+    #[test]
+    fn each_daemon_surface_owns_a_distinct_discovery_name() {
+        // Two daemons publishing one name is the whole defect: the second to
+        // bind repoints the symlink under the first one's clients.
+        assert_eq!(
+            SocketDiscovery::Substrate.symlink_name(),
+            Some("default.sock")
+        );
+        assert_eq!(
+            SocketDiscovery::Execution.symlink_name(),
+            Some("execution.sock")
+        );
+        assert_eq!(SocketDiscovery::Unpublished.symlink_name(), None);
+    }
+
+    #[tokio::test]
+    async fn spawn_binds_requested_owner_only_socket_before_returning() {
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("control.sock");
+        let returned = spawn(
+            test_context(dir.path()),
+            socket.clone(),
+            SocketDiscovery::Unpublished,
+        );
+
+        assert_eq!(returned, socket);
+        assert!(returned.exists(), "spawn must bind synchronously");
+        #[cfg(unix)]
+        {
+            let mode = std::fs::metadata(&returned).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "control socket must be owner-only");
+        }
+        tokio::net::UnixStream::connect(&returned)
+            .await
+            .expect("bound listener must accept immediately");
     }
 }

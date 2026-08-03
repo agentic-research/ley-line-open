@@ -20,6 +20,10 @@ includes:
     taskfile: rs/ll-open/envelope/Taskfile.yml
   fs:
     taskfile: rs/ll-open/fs/Taskfile.yml
+  rs:
+    taskfile: rs/Taskfile.yml
+  runtime:
+    taskfile: rs/ll-open/runtime/Taskfile.yml
   sign:
     taskfile: rs/ll-open/sign/Taskfile.yml
 
@@ -410,6 +414,11 @@ tasks:
     cmds:
       - sh tools/test_workflow_parity.sh
 
+  mutants:diff:fixture-test:
+    desc: Prove diff mutation routing runs the tests that observe each changed surface
+    cmds:
+      - sh tools/test_mutants_diff.sh
+
   schema:consumer-fixture-test:
     desc: Compile the Apache daemon/wire API from an external Go module
     cmds:
@@ -708,16 +717,8 @@ tasks:
 
   test:cli:
     desc: Run CLI integration tests
-    dir: rs
     cmds:
-      - cargo test -p leyline-cli-lib
-
-  runtime:test:
-    desc: Run the embedded execution runtime tests (fake-worker contracts; no host VM required)
-    dir: rs
-    cmds:
-      - env RUSTC_WRAPPER= cargo test -p leyline-runtime
-
+      - task: cli-lib:test
 
   # `vec` and `text-search` SHIP — README documents `task install:full`, which
   # builds `--features all` and includes both — but no test target enabled
@@ -862,6 +863,17 @@ tasks:
       invariants stay load-bearing.
     cmds:
       - tools/lint_blake3.sh
+
+  taskfile:anchors:fixture-test:
+    desc: |
+      Prove every included Taskfile's `dir:` resolves to the cargo workspace
+      from the repo root, from `rs/`, and from inside a package directory.
+
+      Both failure modes this defends against create a wrong directory and run
+      in it rather than erroring, so neither is visible from the repo root —
+      which is the only place CI ever invokes `task`.
+    cmds:
+      - tools/test_taskfile_anchors.sh
 
   lint:architecture-vocabulary:
     desc: Keep storage identity domains distinct in architecture documentation
@@ -1010,55 +1022,49 @@ tasks:
         -C --lib --file ll-core/core/src/partition.rs
 
   mutants:diff:
-    desc: Mutation-test only the lines a diff touches. Requires DIFF=<path>.
-    dir: rs
+    desc: Mutation-test only the Rust lines a diff touches. Requires DIFF=<path>.
     requires:
       vars: [DIFF]
-    # THREE outcomes, deliberately distinguished. Two of them exit 0 in a naive
-    # implementation and are indistinguishable from success:
+    # FOUR outcomes, deliberately distinguished. Three of them can look green
+    # or misleadingly similar in a naive implementation:
     #
     #   tested N        mutants ran; survivors fail the gate.
     #   SKIPPED         the diff changes no Rust. Nothing ran — reported as
     #                   skipped, never as a pass.
     #   MISCONFIGURED   the diff DOES change Rust but enumerated zero mutants.
     #                   Hard failure.
+    #   BASELINE BROKEN the unmutated scratch tree failed before mutation.
+    #                   Hard failure, distinct from a surviving mutant.
     #
-    # The third is the trap this task exists to avoid. `cargo mutants` runs in
+    # MISCONFIGURED is the trap this task exists to avoid. `cargo mutants` runs in
     # `rs/`, so the diff's paths must be workspace-relative (`a/ll-core/...`).
     # A diff produced from the repo root carries `a/rs/ll-core/...`, matches
     # nothing, prints "No mutants to filter", and EXITS 0 — a permanently green
     # check that tests nothing, from a path prefix. Generate the diff with
     # `git diff --relative=rs`.
     cmds:
-      # Logic in tools/mutants_diff.sh — same reasoning as image:smoke. The
-      # three-state reporting below is conditional enough that it belongs
-      # somewhere shellcheck can read it.
-      # ROOT_DIR-anchored: this task sets `dir: rs`, so a bare relative path
-      # would resolve to rs/tools/ and not exist.
-      - '{{.ROOT_DIR}}/tools/mutants_diff.sh "{{.DIFF}}"'
+      # Compatibility entry point for workflows and contributors. The Rust
+      # workspace Taskfile owns cargo-mutants configuration and execution.
+      - task: rs:mutants:diff
+        vars:
+          DIFF: '{{.DIFF}}'
+          MUTANTS_SCOPE: '{{.MUTANTS_SCOPE | default "all"}}'
 
   mutants:pr:
     desc: |
       Run the PR mutants gate locally: the exact diff-scoped run mutants.yml
-      executes, against your branch's diff from origin/main — INCLUDING
+      executes, against your branch's diff from the integration base by
+      default — INCLUDING
       uncommitted work, since that is what you are about to commit and push.
       Exists because each surviving mutant discovered on the runner costs a
       ~35-minute CI round trip to learn about; this surfaces the survivor
       list before the push instead of after (PR #308 took three such trips).
-    dir: rs
+      Set MUTANTS_SCOPE=runtime or MUTANTS_SCOPE=cli for a focused local
+      feedback loop; CI always uses the default all-slices scope.
     cmds:
-      - |
-        set -eu
-        git fetch origin main --quiet
-        BASE=$(git merge-base origin/main HEAD)
-        DIFF=$(mktemp)
-        trap 'rm -f "$DIFF"' EXIT
-        # No three-dot and no HEAD bound: diff the WORKING TREE against the
-        # merge base, so uncommitted changes are gated too. cargo-mutants
-        # applies --in-diff to the tree as it stands, which is exactly this.
-        git diff --relative=rs "$BASE" -- rs/ > "$DIFF"
-        echo "diff vs $(git rev-parse --short "$BASE") (merge-base with origin/main)"
-        '{{.ROOT_DIR}}/tools/mutants_diff.sh' "$DIFF"
+      - task: rs:mutants:pr
+        vars:
+          MUTANTS_SCOPE: '{{.MUTANTS_SCOPE | default "all"}}'
 
   mutants:fs:
     desc: Mutation-test leyline-fs::chunked (the SQL materialize-on-read path).
@@ -1348,6 +1354,31 @@ tasks:
         fi
         echo "compatibility.json is up to date"
 
+  gen:execution-tools:
+    desc: |
+      Regenerate cli-lib's execution-tools.json from the execution/v1 IDL
+      through the tooldefs schema-bridge plugin — the same emitter
+      `leyline-schema-bridge`'s execution_v1 conformance test compares
+      against. Run after any edit to execution.capnp, including doc
+      annotations, which are part of the emitted tool descriptions.
+
+      Without this the only signal is that test failing with "registry
+      artifact drifted", which says a regeneration is owed but not how to
+      perform one.
+    dir: rs
+    cmds:
+      - |
+        set -eu
+        out="$(mktemp -d)"
+        trap 'rm -rf "$out"' EXIT
+        cargo build --quiet -p leyline-schema-bridge \
+          --bin capnpc-schema-bridge-tooldefs
+        capnp compile \
+          -o"$PWD/target/debug/capnpc-schema-bridge-tooldefs:$out" \
+          ll-core/schema-spec/execution/v1/execution.capnp
+        cp "$out/execution.tools.json" ll-open/cli-lib/src/daemon/execution-tools.json
+        echo "regenerated ll-open/cli-lib/src/daemon/execution-tools.json"
+
   gen:server-json:
     desc: |
       Regenerate server.json from leyline-cli-lib::daemon::mcp
@@ -1447,6 +1478,8 @@ tasks:
       - task: lint:cache-contract
       - task: ci:attestation:fixture-test
       - task: ci:workflow-parity:fixture-test
+      - task: mutants:diff:fixture-test
+      - task: taskfile:anchors:fixture-test
       - task: release:artifacts:fixture-test
       - task: release:publication:fixture-test
       - task: release:workflow:fixture-test

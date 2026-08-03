@@ -185,11 +185,105 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
         BaseRequest::InspectNeighborhood(r) => op_inspect_neighborhood(ctx, &r),
         BaseRequest::SearchSymbols(r) => op_search_symbols(ctx, &r),
         BaseRequest::Agreement(r) => op_agreement(ctx, &r),
+        BaseRequest::LloExecutionCapabilities => op_execution_capabilities(ctx),
+        BaseRequest::LloExecutionProvision {
+            backend_class,
+            idempotency_key,
+        } => op_execution_provision(ctx, backend_class, idempotency_key),
+        BaseRequest::LloExecutionStatus { run_id } => op_execution_status(ctx, run_id),
+        BaseRequest::LloExecutionStart { spec, grant } => op_execution_start(ctx, spec, grant),
+        BaseRequest::LloExecutionInspect {
+            run_id,
+            after_sequence,
+        } => op_execution_inspect(ctx, run_id, after_sequence),
+        BaseRequest::LloExecutionCollect { run_id } => op_execution_collect(ctx, run_id),
+        BaseRequest::LloExecutionCleanup {
+            run_id,
+            idempotency_key,
+        } => op_execution_cleanup(ctx, run_id, idempotency_key),
+        BaseRequest::LloExecutionCancel {
+            run_id,
+            idempotency_key,
+        } => op_execution_cancel(ctx, run_id, idempotency_key),
     };
     result.unwrap_or_else(|e| {
         build_error_response(&format!("{e:#}"))
             .unwrap_or_else(|enc| fallback_error_envelope(&format!("handler error: {enc}")))
     })
+}
+
+fn execution_handler(
+    ctx: &DaemonContext,
+) -> Result<std::sync::Arc<dyn super::execution::ExecutionHandler>> {
+    ctx.ext
+        .execution_handler()
+        .ok_or_else(|| anyhow::anyhow!("execution/v1 service is not configured"))
+}
+
+fn op_execution_capabilities(ctx: &DaemonContext) -> Result<String> {
+    execution_handler(ctx)?.capabilities()
+}
+
+fn op_execution_provision(
+    ctx: &DaemonContext,
+    backend_class: String,
+    idempotency_key: String,
+) -> Result<String> {
+    execution_handler(ctx)?.provision(&json!({
+        "backendClass": backend_class,
+        "idempotencyKey": idempotency_key,
+    }))
+}
+
+fn op_execution_status(ctx: &DaemonContext, run_id: Option<String>) -> Result<String> {
+    execution_handler(ctx)?.status(&json!({
+        "runId": run_id.unwrap_or_default(),
+    }))
+}
+
+fn op_execution_start(
+    ctx: &DaemonContext,
+    spec: serde_json::Value,
+    grant: serde_json::Value,
+) -> Result<String> {
+    execution_handler(ctx)?.start(&json!({"spec": spec, "grant": grant}))
+}
+
+fn op_execution_inspect(
+    ctx: &DaemonContext,
+    run_id: String,
+    after_sequence: Option<u64>,
+) -> Result<String> {
+    execution_handler(ctx)?.inspect(&json!({
+        "runId": run_id,
+        "afterSequence": after_sequence.unwrap_or(0),
+    }))
+}
+
+fn op_execution_collect(ctx: &DaemonContext, run_id: String) -> Result<String> {
+    execution_handler(ctx)?.collect(&json!({"runId": run_id}))
+}
+
+fn op_execution_cleanup(
+    ctx: &DaemonContext,
+    run_id: String,
+    idempotency_key: Option<String>,
+) -> Result<String> {
+    execution_handler(ctx)?.cleanup(&json!({
+        "runId": run_id,
+        "idempotencyKey": idempotency_key.unwrap_or_default(),
+    }))
+}
+
+fn op_execution_cancel(
+    ctx: &DaemonContext,
+    run_id: String,
+    idempotency_key: Option<String>,
+) -> Result<String> {
+    execution_handler(ctx)?.cancel(&json!({
+        "runId": run_id,
+        "idempotencyKey": idempotency_key.unwrap_or_default(),
+    }))
 }
 
 /// Legacy compat wrapper for tests that constructed (op, args:Value) pairs
@@ -3172,6 +3266,7 @@ mod tests {
 
     // ── Helper unit tests ───────────────────────────────────────────────
 
+    #[test]
     fn normalize_file_uri_strips_prefix() {
         assert_eq!(normalize_file_uri("file:///abs/foo.rs"), "/abs/foo.rs");
     }
@@ -3466,7 +3561,9 @@ mod tests {
         );
     }
 
-    fn setup() -> (TempDir, std::sync::Arc<DaemonContext>) {
+    fn setup_with_ext(
+        ext: Arc<dyn crate::daemon::DaemonExt>,
+    ) -> (TempDir, std::sync::Arc<DaemonContext>) {
         let dir = TempDir::new().unwrap();
         let arena_path = dir.path().join("test.arena");
         let ctrl_path = dir.path().join("test.ctrl");
@@ -3500,7 +3597,7 @@ mod tests {
             Arc::new(crate::daemon::embed::ZeroEmbedder { dim: 4 });
         let ctx = DaemonContext {
             ctrl_path,
-            ext: Arc::new(crate::daemon::NoExt),
+            ext,
             router: crate::daemon::EventRouter::new(16),
             live_db,
             enrich_inflight: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
@@ -3519,6 +3616,130 @@ mod tests {
             sheaf: Arc::new(crate::daemon::sheaf_ops::SheafState::new()),
         };
         (dir, std::sync::Arc::new(ctx))
+    }
+
+    fn setup() -> (TempDir, std::sync::Arc<DaemonContext>) {
+        setup_with_ext(Arc::new(crate::daemon::NoExt))
+    }
+
+    #[derive(Default)]
+    struct RecordingExecutionHandler {
+        calls: parking_lot::Mutex<Vec<(String, serde_json::Value)>>,
+    }
+
+    impl RecordingExecutionHandler {
+        fn record(&self, method: &str, input: serde_json::Value) -> Result<String> {
+            self.calls.lock().push((method.to_owned(), input.clone()));
+            Ok(json!({"method": method, "input": input}).to_string())
+        }
+    }
+
+    impl crate::daemon::execution::ExecutionHandler for RecordingExecutionHandler {
+        fn capabilities(&self) -> Result<String> {
+            self.record("capabilities", serde_json::Value::Null)
+        }
+
+        fn provision(&self, input: &serde_json::Value) -> Result<String> {
+            self.record("provision", input.clone())
+        }
+
+        fn start(&self, input: &serde_json::Value) -> Result<String> {
+            self.record("start", input.clone())
+        }
+
+        fn status(&self, input: &serde_json::Value) -> Result<String> {
+            self.record("status", input.clone())
+        }
+
+        fn inspect(&self, input: &serde_json::Value) -> Result<String> {
+            self.record("inspect", input.clone())
+        }
+
+        fn collect(&self, input: &serde_json::Value) -> Result<String> {
+            self.record("collect", input.clone())
+        }
+
+        fn cleanup(&self, input: &serde_json::Value) -> Result<String> {
+            self.record("cleanup", input.clone())
+        }
+
+        fn cancel(&self, input: &serde_json::Value) -> Result<String> {
+            self.record("cancel", input.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_ops_dispatch_exact_payloads_to_the_configured_handler() {
+        let handler = Arc::new(RecordingExecutionHandler::default());
+        let extension = Arc::new(crate::daemon::ExecutionDaemonExt::new(handler.clone()));
+        let (_dir, ctx) = setup_with_ext(extension);
+        let cases = [
+            (
+                "llo_execution_capabilities",
+                json!({}),
+                "capabilities",
+                serde_json::Value::Null,
+            ),
+            (
+                "llo_execution_provision",
+                json!({"backendClass":"microVm", "idempotencyKey":"provision-1"}),
+                "provision",
+                json!({"backendClass":"microVm", "idempotencyKey":"provision-1"}),
+            ),
+            (
+                "llo_execution_status",
+                json!({"runId":"run-1"}),
+                "status",
+                json!({"runId":"run-1"}),
+            ),
+            (
+                "llo_execution_start",
+                json!({"spec":{"spec":1}, "grant":{"grant":2}}),
+                "start",
+                json!({"spec":{"spec":1}, "grant":{"grant":2}}),
+            ),
+            (
+                "llo_execution_inspect",
+                json!({"runId":"run-1", "afterSequence":9}),
+                "inspect",
+                json!({"runId":"run-1", "afterSequence":9}),
+            ),
+            (
+                "llo_execution_cancel",
+                json!({"runId":"run-1", "idempotencyKey":"cancel-1"}),
+                "cancel",
+                json!({"runId":"run-1", "idempotencyKey":"cancel-1"}),
+            ),
+            (
+                "llo_execution_collect",
+                json!({"runId":"run-1"}),
+                "collect",
+                json!({"runId":"run-1"}),
+            ),
+            (
+                "llo_execution_cleanup",
+                json!({"runId":"run-1", "idempotencyKey":"cleanup-1"}),
+                "cleanup",
+                json!({"runId":"run-1", "idempotencyKey":"cleanup-1"}),
+            ),
+        ];
+
+        for (op, request, method, expected_input) in &cases {
+            let response = handle_base_op_legacy(&ctx, op, request)
+                .unwrap_or_else(|| panic!("{op} must be handled"));
+            let response: serde_json::Value =
+                serde_json::from_str(&response).expect("handler response JSON");
+            assert_eq!(response, json!({"method": method, "input": expected_input}));
+        }
+
+        let calls = handler.calls.lock();
+        assert_eq!(calls.len(), cases.len());
+        for ((method, input), (_, _, expected_method, expected_input)) in
+            calls.iter().zip(cases.iter())
+        {
+            assert_eq!(method, expected_method);
+            assert_eq!(input, expected_input);
+        }
     }
 
     /// 5f7100-4 / 606e64: regression pin for the self-deadlock fix.

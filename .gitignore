@@ -26,6 +26,13 @@
 # Rust workspace
 !rs/Cargo.toml
 !rs/Cargo.lock
+# cargo-mutants adjudication: which surviving mutants are provably equivalent,
+# and why. The path is `.cargo/mutants.toml` because that is where
+# cargo-mutants reads it from — a `mutants.toml` at the workspace root is
+# silently ignored, which is how this file spent one full 14-minute run being
+# inert. Untracked it would be worse still: a gate that passes only on the
+# machine holding the file.
+!rs/.cargo/mutants.toml
 
 # ll-core crates (Tier 1: OSS infrastructure)
 !rs/ll-core/**

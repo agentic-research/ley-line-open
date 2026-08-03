@@ -109,7 +109,20 @@ async fn spawn_test_socket(
 ) -> PathBuf {
     use tokio::net::UnixStream;
 
-    let path = leyline_cli_lib::daemon::socket::spawn(ctx, sock_path);
+    let path = leyline_cli_lib::daemon::socket::spawn(
+        ctx,
+        sock_path,
+        leyline_cli_lib::daemon::socket::SocketDiscovery::Unpublished,
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "control socket must be owner-only; got {mode:o}"
+        );
+    }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while std::time::Instant::now() < deadline {
         if UnixStream::connect(&path).await.is_ok() {
@@ -2492,7 +2505,6 @@ fn test_scoped_reparse_handles_deletion_in_scope() {
 #[tokio::test]
 async fn test_op_reparse_accepts_single_file_source() {
     use leyline_cli_lib::daemon::DaemonContext;
-    use parking_lot::Mutex;
     use std::sync::Arc;
 
     // Source tree with two go files. The hook will only "edit" one.

@@ -42,6 +42,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::sync::OnceLock;
 
 use super::DaemonContext;
 use super::auth;
@@ -62,6 +63,57 @@ pub struct McpTool {
     pub name: &'static str,
     pub description: &'static str,
     pub schema: Value,
+}
+
+const GENERATED_EXECUTION_TOOLS: &str = include_str!("execution-tools.json");
+
+/// Return the complete IDL-generated execution/v1 MCP registry.
+///
+/// The generated artifact carries names, descriptions, input schemas, and
+/// their nested `$defs` graph. Keeping the whole registry data-driven means a
+/// new `$Op` cannot silently land in the schema while being omitted from the
+/// live MCP surface. `McpTool` stores static strings because the server-json
+/// generator borrows them; the one-time owned parse is intentionally promoted
+/// to the process lifetime here.
+fn generated_execution_tools() -> Vec<McpTool> {
+    static TOOLS: OnceLock<Vec<McpTool>> = OnceLock::new();
+    TOOLS
+        .get_or_init(|| {
+            let generated: Vec<Value> = serde_json::from_str(GENERATED_EXECUTION_TOOLS)
+                .expect("schema-bridge execution tool definitions must be valid JSON");
+            generated
+                .into_iter()
+                .map(|tool| {
+                    let name = tool
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_else(|| panic!("generated execution tool has no name"))
+                        .to_owned();
+                    let description = tool
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or_else(|| {
+                            panic!("generated execution tool has no description: {name}")
+                        })
+                        .to_owned();
+                    let schema = tool.get("inputSchema").cloned().unwrap_or_else(|| {
+                        panic!("generated execution tool has no inputSchema: {name}")
+                    });
+                    McpTool {
+                        name: Box::leak(name.into_boxed_str()),
+                        description: Box::leak(description.into_boxed_str()),
+                        schema,
+                    }
+                })
+                .collect()
+        })
+        .iter()
+        .map(|tool| McpTool {
+            name: tool.name,
+            description: tool.description,
+            schema: tool.schema.clone(),
+        })
+        .collect()
 }
 
 /// Build the canonical tool registry. The MCP `tools/list` response,
@@ -453,6 +505,10 @@ pub fn tool_registry() -> Vec<McpTool> {
         }),
     });
 
+    // execution/v1 runtime adapters. Names, descriptions, and nested input
+    // schemas all come from the normative Cap'n Proto IDL artifact.
+    tools.extend(generated_execution_tools());
+
     tools
 }
 
@@ -584,6 +640,21 @@ pub fn cloister_groups() -> Vec<CloisterGroupDecl> {
         name: "hdc",
         advertised_prefix: "hdc_",
         upstream_names: vec!["hdc_search", "hdc_calibrate", "hdc_density"],
+    });
+
+    groups.push(CloisterGroupDecl {
+        name: "execution",
+        advertised_prefix: "llo_execution_",
+        upstream_names: vec![
+            "llo_execution_capabilities",
+            "llo_execution_provision",
+            "llo_execution_status",
+            "llo_execution_start",
+            "llo_execution_inspect",
+            "llo_execution_cancel",
+            "llo_execution_collect",
+            "llo_execution_cleanup",
+        ],
     });
 
     groups
@@ -1038,6 +1109,37 @@ mod tests {
         ] {
             assert!(names.contains(op), "missing LSP tool: {op}");
         }
+    }
+
+    #[test]
+    fn execution_registry_uses_idl_generated_nested_schemas() {
+        let tools = tool_registry();
+        let start = tools
+            .iter()
+            .find(|tool| tool.name == "llo_execution_start")
+            .expect("execution start tool");
+        let defs = start
+            .schema
+            .get("$defs")
+            .and_then(Value::as_object)
+            .expect("generated start schema definitions");
+        for name in [
+            "RunSpec",
+            "RunGrant",
+            "ArtifactRef",
+            "DigestRef",
+            "EvidenceRef",
+        ] {
+            assert!(defs.contains_key(name), "missing generated $defs.{name}");
+        }
+        assert_eq!(
+            start.schema["properties"]["spec"]["$ref"],
+            "#/$defs/RunSpec"
+        );
+        assert_eq!(
+            start.schema["properties"]["grant"]["$ref"],
+            "#/$defs/RunGrant"
+        );
     }
 
     #[test]

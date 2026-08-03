@@ -86,7 +86,7 @@ impl ExecutionRequest {
         }
         if !self.allowed_egress.is_empty() {
             return Err(ExecutionError::unsupported(
-                "the embedded libkrun backend does not yet support egress grants",
+                "the configured execution backend does not yet support egress grants",
             ));
         }
         Ok(())
@@ -113,10 +113,69 @@ pub struct BackendRun {
     pub backend_id: String,
 }
 
+/// Terminal result observed by a backend supervisor.  The service projects
+/// this into the shared execution/v1 lifecycle and receipt stream instead of
+/// leaving a run permanently `Running` after its worker exits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendRunStatus {
+    Succeeded,
+    Failed(ExecutionError),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RunState {
+    Accepted,
+    Provisioning,
+    Ready,
     Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Cleaning,
+    Cleaned,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunEventRecord {
+    pub sequence: u64,
+    pub state: RunState,
+    pub timestamp_ms: u64,
+    /// Content-addressed diagnostic detail for terminal failures.
+    /// The detail itself is kept out of the lifecycle stream; consumers can
+    /// resolve the digest through the attested evidence store.
+    pub detail_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunInspection {
+    pub run_id: String,
+    pub state: RunState,
+    pub events: Vec<RunEventRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptContext {
+    pub run_spec_digest: String,
+    pub run_grant_digest: String,
+    pub confinement_digest: String,
+    pub backend_class: BackendClass,
+    pub input_roots: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunReceiptData {
+    pub run_id: String,
+    pub terminal_state: RunState,
+    pub event_log_root: String,
+    pub context: ReceiptContext,
+    pub backend_id: String,
+    pub started_at_unix_ms: u64,
+    pub completed_at_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

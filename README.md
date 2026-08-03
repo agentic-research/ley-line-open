@@ -76,11 +76,14 @@ task runtime:test        # embedded libkrun runtime contract tests (fake worker)
 ### Embedded execution runtime
 
 The experimental `leyline-runtime` crate owns the execution/v1 lifecycle and
-the embedded `libkrun` backend. It verifies a content-addressed rootfs, copies
-it into a private per-run userspace volume, and applies `nono` to the
-first-party worker before entering the microVM. The worker path does not invoke
+the first-party `libkrun` and native-`nono` worker backends. Both verify a
+content-addressed rootfs and copy it into a private per-run userspace volume;
+the native backend applies `nono` before launching the guest-relative
+executable, while the libkrun backend enters a microVM. Neither worker invokes
 `krunvm`, Taskfile, or repository scripts. The immutable CAS source remains
-outside the guest's writable boundary.
+outside the guest's writable boundary. Embedders select a backend explicitly
+when constructing `run_execution_daemon`; the ordinary daemon remains backend-
+free for compatibility.
 
 The portable runtime tests use a fake worker and do not require libkrun or
 Hypervisor.framework. The real Apple Silicon guest-write proof is ignored by
@@ -89,15 +92,72 @@ the Hypervisor.framework entitlement; see
 [`libkrun_guest_write.rs`](rs/ll-open/runtime/tests/libkrun_guest_write.rs) and
 bead `ley-line-open-16a994` for the CI/release gate.
 
-This is a backend vertical slice, not yet the complete product API: terminal
-execution/v1 receipts and mmap-backed CAS projection are tracked separately by
-beads `ley-line-open-16aa10` and `ley-line-open-16c953`.
+The execution/v1 API is exposed through the runtime crate, the explicit
+`run_execution_daemon` UDS entry point, first-party CLI client, and MCP
+registry. Its schema version
+(`cloister/execution/v1`) is deliberately independent of the repository and
+crate release version; consumers must negotiate API compatibility rather than
+infer it from `v0.14.0`. The ordinary open `leyline daemon` command remains a
+substrate daemon with no execution backend; an embedding application must opt
+into `run_execution_daemon` after constructing a trusted resolver/backend
+handler. The service currently proves schema binding,
+provisioning, ordered lifecycle events, cancellation, cleanup, and
+content-addressed receipt assembly. Native backend conformance and mmap-backed
+CAS projection remain separate follow-on gates in beads
+`ley-line-open-f81567` and `ley-line-open-16c953`.
 
-Mutation testing remains a separate hardening pass: use the repository's
-`task mutants:diff DIFF=<path>` gate after the runtime edge-case tests are
-expanded. The initial local runtime mutation run exposed survivor cases that
-are tracked in `ley-line-open-ce0cf0`; they are intentionally not presented as
-covered by this vertical slice.
+For embedders that keep an explicit artifact catalog, `CatalogResolver` binds
+the authorized executable artifact and workspace graph identities to a
+content-addressed rootfs digest and guest-relative entrypoint. It rejects
+unknown or duplicate identities, workspace drift, path traversal, and output
+limits that the backend cannot enforce; it never accepts host paths from the
+execution wire request.
+
+The open binary can host the native surface directly when those resources are
+provisioned explicitly:
+
+```bash
+leyline execution-daemon \
+  --cas-root /var/lib/leyline/cas \
+  --run-root /var/lib/leyline/runs \
+  --worker /usr/libexec/leyline-native-worker \
+  --catalog /etc/leyline/execution-catalog.json
+```
+
+The catalog is local trusted configuration; it is not a substitute for the
+signed `RunSpec`/`RunGrant` wire contract. Signet/NotMe/Interlace trust roots
+remain embedding-owned: production callers must pass an `EvidenceVerifier` to
+`start_authorized_with_verifier`, which resolves each content-addressed
+evidence reference and verifies its signed envelope or certificate chain. The
+default first-party CLI rejects execution unless an embedding verifier is
+installed. `--allow-unverified-evidence` exists only for local fixtures and is
+an explicit downgrade. The legacy `start_authorized` path uses a metadata-only
+fixture verifier and is not a production trust boundary. The daemon owns the
+worker and UDS lifecycle, while callers provide logical intent and the
+embedding verifier.
+
+LLO also ships `CasDsseEvidenceVerifier`, which verifies APAS
+`application/vnd.in-toto+json` envelopes from an embedding-provided
+content-addressed store against embedding-provided Signet/NotMe trust keys.
+It requires the APAS Handoff/v1 predicate as well as the in-toto envelope
+type. Cloister may use that adapter or supply its own verifier for Interlace
+certificate/lease evidence; key distribution and rotation remain outside LLO.
+
+To select the embedded VM path, use `--backend micro-vm --libkrun
+/path/to/libkrun` and repeat `--device` only for explicitly granted device
+paths. This selects LLO's `KrunWorkerBackend`; it does not invoke the
+`krunvm` CLI.
+
+Mutation testing is invoked through the repository Taskfile. Run
+`task mutants:pr` to exercise the same diff-scoped slices as CI against the
+working tree, including uncommitted changes. For a shorter local feedback loop,
+`task mutants:pr MUTANTS_SCOPE=runtime` and `MUTANTS_SCOPE=cli` select the
+corresponding package, while CI always runs every slice. Runtime behavior is
+mutated with its integration tests enabled; CLI-library execution mutations
+run the library plus the `execution_client` and `execution_transport` contract
+tests. The Taskfile fixture gate rejects Rust diffs that enumerate no mutants,
+focused scopes that run no matching slice, and baseline suites that cannot run
+inside cargo-mutants' scratch tree.
 
 The current release is `v0.14.0`. It publishes platform binaries, FFI
 staticlibs, and the Apache-2.0 Go schema module at
@@ -176,7 +236,7 @@ example `-p 127.0.0.1:18384:8384`) unless an authenticated proxy is in front.
 - `rs/ll-open/lsp` — language-server enrichment.
 - `rs/ll-open/fs` — SQLite graph, arena reader, CDC, FFI, and mount adapters.
 - `rs/ll-open/runtime` — execution/v1 lifecycle, private rootfs materialization,
-  nono confinement, and the embedded libkrun worker backend.
+  native nono and embedded libkrun worker backends, and confinement policy.
 - `rs/ll-open/cli-lib` — daemon lifecycle and UDS/MCP dispatch.
 - `clients/go/leyline-schema` — generated Go contract bindings.
 - `docs/ARCHITECTURE.md` — normative vocabulary, ownership, and the authority

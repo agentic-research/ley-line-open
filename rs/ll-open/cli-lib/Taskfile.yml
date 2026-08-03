@@ -19,21 +19,27 @@ version: '3'
 # file. Adding a task here is safe; adding one that greps for it is not.
 
 tasks:
+  test:
+    desc: Run the default CLI library and integration test suite
+    dir: '{{.TASKFILE_DIR}}/../..'
+    cmds:
+      - cargo test -p leyline-cli-lib
+
   test:vec:
     desc: Tests for the `vec` feature (sqlite-vec + fastembed) — ships in install:full
-    dir: '{{.ROOT_DIR}}/rs'
+    dir: '{{.TASKFILE_DIR}}/../..'
     cmds:
       - cargo test -p leyline-cli-lib --features vec
 
   test:text-search:
     desc: Tests for the `text-search` feature (witchcraft) — ships in install:full
-    dir: '{{.ROOT_DIR}}/rs'
+    dir: '{{.TASKFILE_DIR}}/../..'
     cmds:
       - cargo test -p leyline-cli-lib --features text-search
 
   test:cdc-activation:
     desc: CDC activation + the disabled-build counterpart — both halves of the cdc feature gate
-    dir: '{{.ROOT_DIR}}/rs'
+    dir: '{{.TASKFILE_DIR}}/../..'
     cmds:
       # The `cdc`-enabled half.
       - cargo test -p leyline-cli-lib --no-default-features --features cdc --test cdc_command_test --test cdc_activation_consumer_test

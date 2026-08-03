@@ -114,6 +114,14 @@ pub const BASE_OP_NAMES: &[&str] = &[
     "inspect_neighborhood",
     "search_symbols",
     "agreement",
+    "llo_execution_capabilities",
+    "llo_execution_provision",
+    "llo_execution_status",
+    "llo_execution_start",
+    "llo_execution_inspect",
+    "llo_execution_cancel",
+    "llo_execution_collect",
+    "llo_execution_cleanup",
 ];
 
 // ---------------------------------------------------------------------------
@@ -277,6 +285,53 @@ pub enum BaseRequest {
     /// `detect_violations`, and returns `coherence_defect` + per-pair
     /// `defects`. Read-only.
     Agreement(AgreementRequest),
+    /// Generated execution/v1 capability discovery delegated to the shared
+    /// LLO runtime handler.
+    LloExecutionCapabilities,
+    /// Generated execution/v1 explicit provisioning input.
+    LloExecutionProvision {
+        #[serde(rename = "backendClass")]
+        backend_class: String,
+        #[serde(rename = "idempotencyKey")]
+        idempotency_key: String,
+    },
+    /// Generated execution/v1 substrate status.
+    LloExecutionStatus {
+        #[serde(rename = "runId", default)]
+        run_id: Option<String>,
+    },
+    /// Generated execution/v1 start input. The nested objects are decoded by
+    /// capnp-json in the runtime adapter, not hand-mirrored here.
+    LloExecutionStart {
+        spec: serde_json::Value,
+        grant: serde_json::Value,
+    },
+    /// Generated execution/v1 event inspection input.
+    LloExecutionInspect {
+        #[serde(rename = "runId")]
+        run_id: String,
+        #[serde(rename = "afterSequence", default)]
+        after_sequence: Option<u64>,
+    },
+    /// Generated execution/v1 receipt collection input.
+    LloExecutionCollect {
+        #[serde(rename = "runId")]
+        run_id: String,
+    },
+    /// Generated execution/v1 cleanup input.
+    LloExecutionCleanup {
+        #[serde(rename = "runId")]
+        run_id: String,
+        #[serde(rename = "idempotencyKey", default)]
+        idempotency_key: Option<String>,
+    },
+    /// Generated execution/v1 cancellation input.
+    LloExecutionCancel {
+        #[serde(rename = "runId")]
+        run_id: String,
+        #[serde(rename = "idempotencyKey", default)]
+        idempotency_key: Option<String>,
+    },
 }
 
 #[cfg(feature = "vec")]

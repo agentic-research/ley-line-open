@@ -9,6 +9,7 @@ pub mod cmd_cdc;
 pub mod cmd_daemon;
 #[cfg(feature = "lsp")]
 pub mod cmd_doctor;
+pub mod cmd_execution;
 pub mod cmd_inspect;
 pub mod cmd_load;
 #[cfg(feature = "lsp")]
@@ -129,6 +130,11 @@ pub enum SelfCommands {
 /// Subcommands provided by ley-line open.
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    /// Call the first-party execution/v1 service over the daemon UDS.
+    Execution {
+        #[command(subcommand)]
+        command: ExecutionCommands,
+    },
     /// Parse a source directory into a .db with nodes + _ast + _source tables.
     Parse {
         /// Source directory to parse.
@@ -287,9 +293,113 @@ pub enum Commands {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum ExecutionCommands {
+    /// Discover execution interfaces and backend availability.
+    Capabilities {
+        #[arg(long)]
+        control: PathBuf,
+    },
+    /// Explicitly provision one execution backend.
+    Provision {
+        #[arg(long)]
+        control: PathBuf,
+        #[arg(long, default_value = "microVm")]
+        backend_class: String,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Read substrate or one run's status.
+    Status {
+        #[arg(long)]
+        control: PathBuf,
+        #[arg(long)]
+        run_id: Option<String>,
+    },
+    /// Read ordered lifecycle events for one run.
+    Inspect {
+        #[arg(long)]
+        control: PathBuf,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long, default_value_t = 0)]
+        after_sequence: u64,
+    },
+    /// Collect a terminal receipt for one run.
+    Collect {
+        #[arg(long)]
+        control: PathBuf,
+        #[arg(long)]
+        run_id: String,
+    },
+    /// Idempotently release one run's ephemeral resources.
+    Cleanup {
+        #[arg(long)]
+        control: PathBuf,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// Start a signed execution/v1 spec and grant from JSON files.
+    Start {
+        #[arg(long)]
+        control: PathBuf,
+        #[arg(long)]
+        spec: PathBuf,
+        #[arg(long)]
+        grant: PathBuf,
+    },
+    /// Cancel one active run.
+    Cancel {
+        #[arg(long)]
+        control: PathBuf,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+}
+
 /// Dispatch a command to its implementation.
 pub async fn run(cmd: Commands) -> Result<()> {
     match cmd {
+        Commands::Execution { command } => match command {
+            ExecutionCommands::Capabilities { control } => {
+                cmd_execution::capabilities(&control).await
+            }
+            ExecutionCommands::Provision {
+                control,
+                backend_class,
+                idempotency_key,
+            } => cmd_execution::provision(&control, &backend_class, &idempotency_key).await,
+            ExecutionCommands::Status { control, run_id } => {
+                cmd_execution::status(&control, run_id.as_deref()).await
+            }
+            ExecutionCommands::Inspect {
+                control,
+                run_id,
+                after_sequence,
+            } => cmd_execution::inspect(&control, &run_id, after_sequence).await,
+            ExecutionCommands::Collect { control, run_id } => {
+                cmd_execution::collect(&control, &run_id).await
+            }
+            ExecutionCommands::Cleanup {
+                control,
+                run_id,
+                idempotency_key,
+            } => cmd_execution::cleanup(&control, &run_id, idempotency_key.as_deref()).await,
+            ExecutionCommands::Start {
+                control,
+                spec,
+                grant,
+            } => cmd_execution::start(&control, &spec, &grant).await,
+            ExecutionCommands::Cancel {
+                control,
+                run_id,
+                idempotency_key,
+            } => cmd_execution::cancel(&control, &run_id, idempotency_key.as_deref()).await,
+        },
         Commands::Parse {
             source,
             output,

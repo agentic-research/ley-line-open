@@ -142,6 +142,14 @@ fn real_execution_schema_emits_public_types_and_operations() {
     let tool_defs =
         emit(&schema, OutputFormat::ToolDefs, "execution").expect("emit execution MCP tools");
     let tools: Value = serde_json::from_str(&tool_defs).expect("valid MCP tool definitions");
+    let checked_in_cli_tools: Value = serde_json::from_str(include_str!(
+        "../../cli-lib/src/daemon/execution-tools.json"
+    ))
+    .expect("checked-in CLI execution tool definitions are valid JSON");
+    assert_eq!(
+        tools, checked_in_cli_tools,
+        "cli-lib MCP execution registry artifact drifted from schema-bridge output"
+    );
     let names: Vec<_> = tools
         .as_array()
         .expect("tool definitions array")

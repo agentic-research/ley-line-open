@@ -1,4 +1,21 @@
 fn main() {
+    // capnpc emits no `rerun-if-changed`, and Cargo's default only watches
+    // this package — so an edit to the normative IDL, which lives in
+    // leyline-schema-spec, would leave the generated bindings stale until
+    // something else forced a rebuild. Declaring the inputs explicitly is
+    // what makes the "one IDL input" claim below true incrementally and not
+    // only on a clean checkout. Naming any input here also switches Cargo
+    // off its default whole-package watch, so the local `capnp/` tree must
+    // be declared too.
+    let spec_root = std::path::PathBuf::from(leyline_schema_spec::SPEC_DIR);
+    for input in [
+        std::path::PathBuf::from("capnp"),
+        spec_root.join("_traits.capnp"),
+        spec_root.join("execution/v1/execution.capnp"),
+    ] {
+        println!("cargo:rerun-if-changed={}", input.display());
+    }
+
     capnpc::CompilerCommand::new()
         // Resolve `using Go = import "/go.capnp";` via the vendored
         // capnp/go.capnp (inert for capnpc-rust; consumed by capnpc-go).
@@ -17,7 +34,6 @@ fn main() {
     // execution/v1 lives with its normative spec and conformance vectors.
     // Compile that exact file rather than maintaining a public-schema copy:
     // Rust, JSON Schema, and MCP projections therefore share one IDL input.
-    let spec_root = std::path::PathBuf::from(leyline_schema_spec::SPEC_DIR);
     capnpc::CompilerCommand::new()
         .src_prefix(&spec_root)
         .file(spec_root.join("_traits.capnp"))

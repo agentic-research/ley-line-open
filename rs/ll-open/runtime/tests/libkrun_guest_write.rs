@@ -3,12 +3,12 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use leyline_runtime::backends::libkrun::worker::WorkerEvent;
 use leyline_runtime::{DigestRef, ExecutionRequest, ResourceLimits};
 use tempfile::TempDir;
+use wait_timeout::ChildExt;
 
 #[test]
 #[ignore = "requires macOS/ARM64 with libkrun, libkrunfw, and the Linux musl Rust target"]
@@ -132,17 +132,13 @@ fn guest_writes_the_ephemeral_root_without_mutating_cas() {
         .expect("write request");
     child.stdin.take().expect("close stdin").flush().ok();
 
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let (_delay_tx, delay_rx) = mpsc::channel::<()>();
-    loop {
-        if child.try_wait().expect("poll worker").is_some() {
-            break;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            panic!("libkrun guest did not exit within 15 seconds");
-        }
-        let _ = delay_rx.recv_timeout(Duration::from_millis(10));
+    if child
+        .wait_timeout(Duration::from_secs(15))
+        .expect("wait for worker")
+        .is_none()
+    {
+        let _ = child.kill();
+        panic!("libkrun guest did not exit within 15 seconds");
     }
     let output = child.wait_with_output().expect("worker output");
     let stderr = String::from_utf8(output.stderr).expect("worker stderr UTF-8");

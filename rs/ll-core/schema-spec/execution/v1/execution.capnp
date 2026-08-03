@@ -118,14 +118,20 @@ struct RunSpec $Traits.doc("Content-addressed execution intent. It is not author
   compatibilityRuntime  @10 :ArtifactRef             $Traits.doc("Optional guest runtime artifact; an empty digest means none.") $Traits.optional;
 }
 
+struct GrantSignature $Traits.doc("Detached issuer signature over a RunGrant. See wire/run-grant.md for the covered bytes.") {
+  algorithm @0 :Text $Traits.doc("Signature algorithm; ed25519 is the only value this contract defines.");
+  keyId     @1 :Text $Traits.doc("Unauthenticated issuer key hint. A verifier checks every trusted key regardless and never selects one by this.");
+  value     @2 :Data $Traits.doc("Raw signature bytes; 64 for ed25519.");
+}
+
 struct RunGrant $Traits.doc("Authenticated, resolved execution authority bound to one RunSpec digest.") {
   grantId                    @0  :Text                  $Traits.doc("Issuer-unique grant identifier.");
-  issuerEvidence             @1  :EvidenceRef           $Traits.doc("Verified issuer/signature evidence.");
+  issuerEvidence             @1  :EvidenceRef           $Traits.doc("Verified issuer/signature evidence. Must be bound to this run — see the evidence-binding rule in README.md.");
   expiresAtUnixMs            @2  :UInt64                $Traits.doc("Absolute expiry in Unix milliseconds.");
   replayKey                  @3  :Text                  $Traits.doc("Idempotency and replay-protection key.");
   runSpecDigest              @4  :DigestRef             $Traits.doc("Digest of the authorized RunSpec.");
-  workloadIdentityEvidence   @5  :EvidenceRef           $Traits.doc("Verified Interlace/WIMSE workload identity evidence.");
-  actorProvenanceEvidence    @6  :EvidenceRef           $Traits.doc("Verified delegated actor/provenance evidence, such as a Signet bridge certificate.");
+  workloadIdentityEvidence   @5  :EvidenceRef           $Traits.doc("Verified Interlace/WIMSE workload identity evidence. Must be bound to this run — see the evidence-binding rule in README.md.");
+  actorProvenanceEvidence    @6  :EvidenceRef           $Traits.doc("Verified delegated actor/provenance evidence, such as a Signet bridge certificate. Must be bound to this run — see the evidence-binding rule in README.md.");
   capabilities               @7  :List(CapabilityGrant) $Traits.doc("Exact verified grants and interface mappings.");
   confinementDigest          @8  :DigestRef             $Traits.doc("confinement/v1 digest that enforcement must match.");
   backendClass               @9  :BackendClass          $Traits.doc("Required isolation class; callers cannot weaken it.");
@@ -133,6 +139,7 @@ struct RunGrant $Traits.doc("Authenticated, resolved execution authority bound t
   workspaces                 @11 :List(WorkspaceGrant)  $Traits.doc("Resolved Graph authority.");
   allowedEgress              @12 :List(Text)            $Traits.doc("Resolved egress endpoints or capability references.");
   credentialBrokerRefs       @13 :List(Text)            $Traits.doc("Resolved credential brokers; never credential values.");
+  signature                  @14 :GrantSignature       $Traits.doc("Issuer signature binding every other field of this grant; absent only when the caller is the issuer. See wire/run-grant.md.") $Traits.optional;
 }
 
 struct ExecutionError $Traits.doc("Stable transport-independent execution error.") {

@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use leyline_runtime::{
-    Backend, BackendCapabilities, BackendClass, BackendRun, BackendRunStatus, DigestRef,
-    ErrorCode, ExecutionError, ExecutionRequest, ExecutionService, ResourceLimits, RunState,
+    Backend, BackendCapabilities, BackendClass, BackendRun, BackendRunStatus, DigestRef, ErrorCode,
+    ExecutionError, ExecutionRequest, ExecutionService, ResourceLimits, RunState,
 };
 
 #[derive(Clone, Default)]
@@ -115,7 +115,10 @@ fn status_projects_backend_completion_without_sleeping() {
     assert_eq!(record.state, RunState::Succeeded);
 
     let inspection = service.inspect("run-01", 0).expect("inspect");
-    assert_eq!(inspection.events.last().expect("terminal event").state, RunState::Succeeded);
+    assert_eq!(
+        inspection.events.last().expect("terminal event").state,
+        RunState::Succeeded
+    );
 }
 
 #[test]

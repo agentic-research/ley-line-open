@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use parking_lot::RwLock;
 use leyline_core::ContentAddressed;
+use parking_lot::RwLock;
 
 use crate::{
-    BackendCapabilities, BackendRun, BackendRunStatus, ExecutionError, ExecutionRequest, ReceiptContext,
-    RunEventRecord, RunInspection, RunReceiptData, RunRecord, RunState,
+    BackendCapabilities, BackendRun, BackendRunStatus, ExecutionError, ExecutionRequest,
+    ReceiptContext, RunEventRecord, RunInspection, RunReceiptData, RunRecord, RunState,
     authorization::{AuthorizationPolicy, AuthorizedExecution, authorize},
 };
 
@@ -363,12 +363,12 @@ impl<B: Backend> ExecutionService<B> {
     /// observe the same terminal transition without a transport-specific
     /// watcher or arbitrary polling sleeps.
     fn refresh_run(&self, run_id: &str) -> Result<(), ExecutionError> {
-        let active = self
-            .state
-            .read()
-            .runs
-            .get(run_id)
-            .is_some_and(|record| matches!(record.state, RunState::Accepted | RunState::Provisioning | RunState::Ready | RunState::Running));
+        let active = self.state.read().runs.get(run_id).is_some_and(|record| {
+            matches!(
+                record.state,
+                RunState::Accepted | RunState::Provisioning | RunState::Ready | RunState::Running
+            )
+        });
         if !active {
             return Ok(());
         }
@@ -384,7 +384,10 @@ impl<B: Backend> ExecutionService<B> {
             .runs
             .get_mut(run_id)
             .ok_or_else(|| ExecutionError::internal("run disappeared during completion refresh"))?;
-        if !matches!(record.state, RunState::Accepted | RunState::Provisioning | RunState::Ready | RunState::Running) {
+        if !matches!(
+            record.state,
+            RunState::Accepted | RunState::Provisioning | RunState::Ready | RunState::Running
+        ) {
             return Ok(());
         }
         record.state = terminal;

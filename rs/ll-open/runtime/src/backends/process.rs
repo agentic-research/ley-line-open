@@ -13,9 +13,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::Instant;
 
+use parking_lot::Mutex;
 use tempfile::TempDir;
 
 use crate::ExecutionError;
@@ -58,29 +59,136 @@ pub(super) fn terminate_process_group(pid: u32) {
     }
 }
 
+/// Wait for `pid` to exit **without reaping it**.
+///
+/// This is the load-bearing primitive for the whole module. Reaping frees the
+/// pid for reuse, and a process-group id *is* a pid — so `kill(-pid)` issued
+/// after the leader has been reaped can land on an unrelated process group.
+/// macOS wraps its pid space at ~100k, so that is not a theoretical concern.
+///
+/// `WNOWAIT` leaves the child in a waitable state: the zombie keeps the pid,
+/// and therefore the process-group id, allocated until someone actually reaps.
+/// That is what makes the subsequent group kill safe.
+fn await_exit_without_reaping(pid: u32) -> io::Result<()> {
+    loop {
+        // SAFETY: `waitid` with `WNOWAIT` only observes; it does not consume
+        // the child. `info` is written by the kernel and never read here.
+        let rc = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(error);
+    }
+}
+
+/// Kill the group, then reap. **This ordering is the module's one rule** and
+/// every terminal path goes through here so it is stated exactly once.
+fn kill_group_then_reap(child: &mut Child) -> io::Result<std::process::ExitStatus> {
+    terminate_process_group(child.id());
+    child.wait()
+}
+
+enum ProcessState {
+    Live(Child),
+    Reaped,
+}
+
+/// A worker process and its process group, with the kill-before-reap rule
+/// encoded rather than left to call-site ordering.
+///
+/// The raw pid deliberately has no accessor: `pid` is reachable only from the
+/// reaper, which holds the lock. Removing the getter is what makes "signal a
+/// pid you no longer own" unrepresentable rather than merely discouraged.
+///
+/// The previous shape handed out a raw `Child` *and* a raw pid, so the reap
+/// (on the waiting thread) and the group kill (on the supervising thread)
+/// were ordered only by accident. Here the `Child` never escapes: the reaper
+/// and every signaller take the same lock, so "signal a pid that was already
+/// reaped" cannot be expressed.
 pub(super) struct WorkerProcess {
-    child: Option<Child>,
+    state: Arc<Mutex<ProcessState>>,
+    pid: u32,
+}
+
+/// A handle that can request termination but can never reap.
+#[derive(Clone)]
+pub(super) struct TerminationSignal {
+    state: Arc<Mutex<ProcessState>>,
+}
+
+impl TerminationSignal {
+    /// Kill the worker's process group, unless it has already been reaped.
+    /// Holding the lock across the kill is what makes the pid safe to use:
+    /// the reaper cannot reap underneath it.
+    pub(super) fn terminate(&self) {
+        if let ProcessState::Live(child) = &*self.state.lock() {
+            terminate_process_group(child.id());
+        }
+    }
 }
 
 impl WorkerProcess {
     pub(super) fn new(child: Child) -> Self {
-        Self { child: Some(child) }
+        let pid = child.id();
+        Self {
+            state: Arc::new(Mutex::new(ProcessState::Live(child))),
+            pid,
+        }
     }
 
-    pub(super) fn id(&self) -> u32 {
-        self.child.as_ref().expect("worker process ownership").id()
+    pub(super) fn signal(&self) -> TerminationSignal {
+        TerminationSignal {
+            state: Arc::clone(&self.state),
+        }
     }
 
-    pub(super) fn take_for_wait(&mut self) -> Child {
-        self.child.take().expect("worker process ownership")
+    /// Wait for a natural exit, then terminate the group and reap.
+    ///
+    /// The group kill happens *after* exit is observed but *before* the reap,
+    /// so descendants the worker left behind are collected while the pid is
+    /// still provably ours. A worker exiting says nothing about its group: a
+    /// guest that double-forked, or a worker killed while its guest kept
+    /// running, both leave live processes whose rootfs cleanup is next.
+    pub(super) fn await_exit_and_reap(self) -> io::Result<std::process::ExitStatus> {
+        // Deliberately outside the lock: this blocks for the run's lifetime,
+        // and signallers must stay able to terminate while it waits.
+        let awaited = await_exit_without_reaping(self.pid);
+        let mut state = self.state.lock();
+        match std::mem::replace(&mut *state, ProcessState::Reaped) {
+            ProcessState::Live(mut child) => {
+                let status = kill_group_then_reap(&mut child);
+                awaited.and(status)
+            }
+            ProcessState::Reaped => Err(io::Error::other("worker was already reaped")),
+        }
+    }
+
+    /// Terminate and reap without waiting for a natural exit.
+    pub(super) fn terminate_and_reap(&self) -> io::Result<std::process::ExitStatus> {
+        let mut state = self.state.lock();
+        match std::mem::replace(&mut *state, ProcessState::Reaped) {
+            ProcessState::Live(mut child) => kill_group_then_reap(&mut child),
+            ProcessState::Reaped => Err(io::Error::other("worker was already reaped")),
+        }
     }
 }
 
 impl Drop for WorkerProcess {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            terminate_process_group(child.id());
-            let _ = child.wait();
+        if matches!(&*self.state.lock(), ProcessState::Live(_)) {
+            let _ = self.terminate_and_reap();
         }
     }
 }
@@ -103,7 +211,7 @@ pub(super) fn read_readiness_line(reader: &mut impl BufRead) -> Result<Option<St
 /// about to be deleted. `SIGKILL` to an already-empty group is a no-op, so
 /// the unconditional call costs nothing on the ordinary path.
 pub(super) fn supervise_worker(
-    mut process: WorkerProcess,
+    process: WorkerProcess,
     run_root: TempDir,
     cancel: mpsc::Receiver<()>,
     deadline: Instant,
@@ -117,12 +225,13 @@ pub(super) fn supervise_worker(
         Exited(io::Result<std::process::ExitStatus>),
         Cancelled,
     }
-    let pid = process.id();
-    let mut child = process.take_for_wait();
+    let signal = process.signal();
     let (event_tx, event_rx) = mpsc::sync_channel(2);
     let exit_tx = event_tx.clone();
     std::thread::spawn(move || {
-        let _ = exit_tx.send(Event::Exited(child.wait()));
+        // The reaper. It is the only thing that reaps, and it kills the group
+        // first — see `WorkerProcess::await_exit_and_reap`.
+        let _ = exit_tx.send(Event::Exited(process.await_exit_and_reap()));
     });
     std::thread::spawn(move || {
         if cancel.recv().is_ok() {
@@ -134,12 +243,12 @@ pub(super) fn supervise_worker(
         Some(remaining) => match event_rx.recv_timeout(remaining) {
             Ok(event) => event,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                terminate_process_group(pid);
+                signal.terminate();
                 let _ = event_rx.recv();
                 return cleanup_with_error(run_root, labels, wall_clock_exceeded());
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                terminate_process_group(pid);
+                signal.terminate();
                 let _ = event_rx.recv();
                 return cleanup_with_error(
                     run_root,
@@ -152,20 +261,18 @@ pub(super) fn supervise_worker(
             }
         },
         None => {
-            terminate_process_group(pid);
+            signal.terminate();
             let _ = event_rx.recv();
             return cleanup_with_error(run_root, labels, wall_clock_exceeded());
         }
     };
 
-    // Every remaining path is terminal for the run, so the group must not
-    // outlive it. `Event::Exited` says the *worker* is gone, not the group:
-    // a guest that double-forked, or a worker killed while its guest kept
-    // running, both leave live processes whose rootfs cleanup is next.
-    terminate_process_group(pid);
-
+    // No group kill on this side of an `Exited` event. The reaper already
+    // killed the group before reaping; killing here would be signalling a pid
+    // that has been freed and possibly recycled.
     match event {
         Event::Cancelled => {
+            signal.terminate();
             let _ = event_rx.recv();
             cleanup_tempdir(run_root, labels)
         }
@@ -288,8 +395,9 @@ pub(super) fn make_tree_removable(
 #[cfg(test)]
 mod tests {
     use super::{
-        SupervisionLabels, WorkerProcess, cleanup_tempdir, configure_process_group,
-        finish_failed_start, make_tree_removable, read_readiness_line, supervise_worker,
+        SupervisionLabels, WorkerProcess, await_exit_without_reaping, cleanup_tempdir,
+        configure_process_group, finish_failed_start, make_tree_removable, read_readiness_line,
+        supervise_worker,
     };
     use crate::ExecutionError;
     use std::fs;
@@ -303,6 +411,54 @@ mod tests {
         worker: "test worker",
         ephemeral: "test ephemeral rootfs",
     };
+
+    /// The pid-safety invariant, proved directly.
+    ///
+    /// A reaped pid is free for reuse, and a process-group id *is* a pid, so
+    /// `kill(-pid)` after a reap can land on an unrelated group. The reaper
+    /// therefore observes exit with `WNOWAIT` and kills the group *before*
+    /// reaping. This asserts the observation genuinely does not consume the
+    /// child: a second observation must also succeed. If the first had reaped,
+    /// this fails with ECHILD — which is exactly the freed pid we must avoid.
+    #[test]
+    fn awaiting_exit_leaves_the_child_reapable_so_its_group_stays_allocated() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 3"]);
+        configure_process_group(&mut command);
+        let mut child = command.spawn().expect("spawn exiting fixture");
+        let pid = child.id();
+
+        await_exit_without_reaping(pid).expect("observe exit without reaping");
+        await_exit_without_reaping(pid)
+            .expect("child must still be reapable — observation must not free the pid");
+
+        assert_eq!(
+            child.wait().expect("reap").code(),
+            Some(3),
+            "the status must survive to the real reap"
+        );
+    }
+
+    /// A signaller that races the reaper must never signal a freed pid. Once
+    /// reaped, `terminate` takes the same lock, sees `Reaped`, and does
+    /// nothing — the kill is unreachable rather than merely unlikely.
+    #[test]
+    fn terminating_after_the_reap_cannot_signal_a_recycled_pid() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 0"]);
+        configure_process_group(&mut command);
+        let child = command.spawn().expect("spawn exiting fixture");
+
+        let process = WorkerProcess::new(child);
+        let signal = process.signal();
+        process.terminate_and_reap().expect("reap");
+
+        signal.terminate();
+        assert!(
+            process.terminate_and_reap().is_err(),
+            "a second reap must report the worker is already gone, not wait again"
+        );
+    }
 
     #[test]
     fn readiness_line_distinguishes_data_from_eof() {

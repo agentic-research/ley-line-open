@@ -70,6 +70,10 @@ impl KrunWorkerBackend {
         control.finished.recv().map_err(|_| {
             ExecutionError::backend("libkrun worker supervisor stopped before cleanup completed")
         })??;
+        // Cancellation is represented by the shared lifecycle, not as a
+        // successful backend completion. Drop the supervisor's completion
+        // marker so a later poll cannot retain a stale terminal result.
+        self.completed.lock().remove(run_id);
         Ok(true)
     }
 

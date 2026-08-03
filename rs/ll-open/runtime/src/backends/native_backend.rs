@@ -71,6 +71,10 @@ impl NativeWorkerBackend {
         control.finished.recv().map_err(|_| {
             ExecutionError::backend("native worker supervisor stopped before cleanup completed")
         })??;
+        // Cancellation is represented by the shared lifecycle, not as a
+        // successful backend completion. Drop the supervisor's completion
+        // marker so a later poll cannot retain a stale terminal result.
+        self.completed.lock().remove(run_id);
         Ok(true)
     }
 }
@@ -219,7 +223,9 @@ impl Backend for NativeWorkerBackend {
                 return Err(abort_failed_start(
                     &mut child,
                     run_root,
-                    ExecutionError::backend(format!("invalid native worker readiness event: {error}")),
+                    ExecutionError::backend(format!(
+                        "invalid native worker readiness event: {error}"
+                    )),
                 ));
             }
         }
@@ -341,7 +347,10 @@ fn finish_cleanup(run_root: TempDir, error: ExecutionError) -> Result<(), Execut
     match cleanup_tempdir(run_root) {
         Ok(()) => Err(error),
         Err(cleanup_error) => Err(ExecutionError {
-            detail: format!("{}; cleanup also failed: {}", error.detail, cleanup_error.detail),
+            detail: format!(
+                "{}; cleanup also failed: {}",
+                error.detail, cleanup_error.detail
+            ),
             ..error
         }),
     }
@@ -354,13 +363,20 @@ fn cleanup_tempdir(run_root: TempDir) -> Result<(), ExecutionError> {
     })
 }
 
-fn abort_failed_start(child: &mut Child, run_root: TempDir, error: ExecutionError) -> ExecutionError {
+fn abort_failed_start(
+    child: &mut Child,
+    run_root: TempDir,
+    error: ExecutionError,
+) -> ExecutionError {
     let _ = child.kill();
     let _ = child.wait();
     match cleanup_tempdir(run_root) {
         Ok(()) => error,
         Err(cleanup_error) => ExecutionError {
-            detail: format!("{}; cleanup also failed: {}", error.detail, cleanup_error.detail),
+            detail: format!(
+                "{}; cleanup also failed: {}",
+                error.detail, cleanup_error.detail
+            ),
             ..error
         },
     }
@@ -370,7 +386,10 @@ fn finish_failed_start(run_root: TempDir, error: ExecutionError) -> ExecutionErr
     match cleanup_tempdir(run_root) {
         Ok(()) => error,
         Err(cleanup_error) => ExecutionError {
-            detail: format!("{}; cleanup also failed: {}", error.detail, cleanup_error.detail),
+            detail: format!(
+                "{}; cleanup also failed: {}",
+                error.detail, cleanup_error.detail
+            ),
             ..error
         },
     }
@@ -385,14 +404,17 @@ fn make_tree_removable(path: &Path) -> Result<(), ExecutionError> {
     }
     let mut permissions = metadata.permissions();
     permissions.set_mode(permissions.mode() | 0o700);
-    fs::set_permissions(path, permissions)
-        .map_err(|error| ExecutionError::backend(format!("restore native cleanup permissions: {error}")))?;
-    for entry in fs::read_dir(path)
-        .map_err(|error| ExecutionError::backend(format!("enumerate native cleanup path: {error}")))?
-    {
+    fs::set_permissions(path, permissions).map_err(|error| {
+        ExecutionError::backend(format!("restore native cleanup permissions: {error}"))
+    })?;
+    for entry in fs::read_dir(path).map_err(|error| {
+        ExecutionError::backend(format!("enumerate native cleanup path: {error}"))
+    })? {
         make_tree_removable(
             &entry
-                .map_err(|error| ExecutionError::backend(format!("read native cleanup entry: {error}")))?
+                .map_err(|error| {
+                    ExecutionError::backend(format!("read native cleanup entry: {error}"))
+                })?
                 .path(),
         )?;
     }

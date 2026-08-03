@@ -77,7 +77,10 @@ fn worker_exit_is_observable_and_run_root_is_removed() {
         assert!(Instant::now() < deadline, "worker did not finish");
         std::thread::yield_now();
     };
-    assert!(matches!(status, leyline_runtime::BackendRunStatus::Succeeded));
+    assert!(matches!(
+        status,
+        leyline_runtime::BackendRunStatus::Succeeded
+    ));
     assert_eq!(fs::read_dir(runs).expect("runs").count(), 0);
 }
 
@@ -117,5 +120,11 @@ fn cancel_kills_worker_and_removes_run_root() {
     assert_eq!(fs::read_dir(&runs).expect("runs").count(), 1);
     assert!(backend.cancel("native-run-01").expect("cancel"));
     assert_eq!(fs::read_dir(runs).expect("runs").count(), 0);
+    assert!(
+        backend
+            .poll("native-run-01")
+            .expect("poll after cancel")
+            .is_none()
+    );
     assert!(!backend.cancel("native-run-01").expect("repeat cancel"));
 }

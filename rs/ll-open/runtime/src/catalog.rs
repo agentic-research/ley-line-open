@@ -8,6 +8,8 @@
 
 use std::collections::HashMap;
 
+use serde::Deserialize;
+
 use crate::{
     ExecutionError, ExecutionRequest, ExecutionResolver, ResourceLimits,
     authorization::{AuthorizedExecution, SchemaLimits, WorkspaceInput},
@@ -88,6 +90,60 @@ impl CatalogResolver {
     pub fn builder() -> CatalogBuilder {
         CatalogBuilder::default()
     }
+
+    /// Load the explicit, embedding-owned catalog document used by the
+    /// first-party execution daemon. This document is configuration, not a
+    /// replacement for the signed execution/v1 wire schema.
+    pub fn from_json(bytes: &[u8]) -> Result<Self, ExecutionError> {
+        let document: CatalogDocument = serde_json::from_slice(bytes).map_err(|error| {
+            ExecutionError::invalid(format!("invalid execution catalog: {error}"))
+        })?;
+        let mut builder = Self::builder();
+        for entry in document.entries {
+            builder = builder.entry(
+                entry.artifact_digest,
+                entry.media_type,
+                entry.rootfs,
+                entry.executable,
+                entry
+                    .workspace_inputs
+                    .into_iter()
+                    .map(|workspace| WorkspaceInput {
+                        name: workspace.name,
+                        graph_root: workspace.graph_root,
+                    })
+                    .collect(),
+            );
+        }
+        builder.build()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogDocument {
+    entries: Vec<CatalogEntryDocument>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogEntryDocument {
+    #[serde(rename = "artifactDigest")]
+    artifact_digest: String,
+    #[serde(rename = "mediaType")]
+    media_type: String,
+    rootfs: DigestRef,
+    executable: String,
+    #[serde(rename = "workspaceInputs")]
+    workspace_inputs: Vec<WorkspaceInputDocument>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceInputDocument {
+    name: String,
+    #[serde(rename = "graphRoot")]
+    graph_root: String,
 }
 
 impl ExecutionResolver for CatalogResolver {

@@ -113,6 +113,21 @@ unknown or duplicate identities, workspace drift, path traversal, and output
 limits that the backend cannot enforce; it never accepts host paths from the
 execution wire request.
 
+The open binary can host the native surface directly when those resources are
+provisioned explicitly:
+
+```bash
+leyline execution-daemon \
+  --cas-root /var/lib/leyline/cas \
+  --run-root /var/lib/leyline/runs \
+  --worker /usr/libexec/leyline-native-worker \
+  --catalog /etc/leyline/execution-catalog.json
+```
+
+The catalog is local trusted configuration; it is not a substitute for the
+signed `RunSpec`/`RunGrant` wire contract. The daemon owns the worker and UDS
+lifecycle, while callers still provide only signed logical intent.
+
 Mutation testing remains a separate hardening pass: use the repository's
 `task mutants:diff DIFF=<path>` gate after the runtime edge-case tests are
 expanded. The initial local runtime mutation run exposed survivor cases that

@@ -129,3 +129,22 @@ fn catalog_builder_rejects_duplicate_artifact_identities() {
         .expect_err("ambiguous catalog identity must fail closed");
     assert_eq!(error.code, ErrorCode::ResourceConflict);
 }
+
+#[test]
+fn catalog_resolver_loads_the_explicit_json_document_shape() {
+    let json = format!(
+        r#"{{"entries":[{{
+            "artifactDigest":"blake3-256:artifact",
+            "mediaType":"application/vnd.leyline.executable",
+            "rootfs":{{"algorithm":"blake3-256","value":"{}"}},
+            "executable":"bin/agent",
+            "workspaceInputs":[{{"name":"repo","graphRoot":"blake3-256:graph"}}]
+        }}]}}"#,
+        "a".repeat(64)
+    );
+    let resolver = CatalogResolver::from_json(json.as_bytes()).expect("catalog JSON");
+    let request = resolver
+        .resolve(&authorized())
+        .expect("resolve JSON catalog");
+    assert_eq!(request.executable, "bin/agent");
+}

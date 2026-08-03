@@ -4414,6 +4414,7 @@ dependencies = [
  "dirs",
  "env_logger",
  "leyline-cli-lib",
+ "leyline-runtime",
  "libc",
  "tokio",
 ]

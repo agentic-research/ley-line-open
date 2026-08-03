@@ -128,6 +128,11 @@ The catalog is local trusted configuration; it is not a substitute for the
 signed `RunSpec`/`RunGrant` wire contract. The daemon owns the worker and UDS
 lifecycle, while callers still provide only signed logical intent.
 
+To select the embedded VM path, use `--backend micro-vm --libkrun
+/path/to/libkrun` and repeat `--device` only for explicitly granted device
+paths. This selects LLO's `KrunWorkerBackend`; it does not invoke the
+`krunvm` CLI.
+
 Mutation testing remains a separate hardening pass: use the repository's
 `task mutants:diff DIFF=<path>` gate after the runtime edge-case tests are
 expanded. The initial local runtime mutation run exposed survivor cases that

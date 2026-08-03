@@ -9,8 +9,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use leyline_cli_lib::cmd_serve;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ExecutionBackendKind {
+    Native,
+    #[value(name = "micro-vm")]
+    MicroVm,
+}
 
 #[derive(Subcommand)]
 enum Cmd {
@@ -44,6 +51,18 @@ enum Cmd {
         /// Trusted artifact/workspace-to-rootfs catalog JSON document.
         #[arg(long)]
         catalog: PathBuf,
+
+        /// Backend to supervise: native nono or embedded libkrun microVM.
+        #[arg(long, value_enum, default_value_t = ExecutionBackendKind::Native)]
+        backend: ExecutionBackendKind,
+
+        /// Embedded libkrun shared library (required for `--backend micro-vm`).
+        #[arg(long)]
+        libkrun: Option<PathBuf>,
+
+        /// Device paths explicitly granted to the libkrun worker.
+        #[arg(long = "device")]
+        devices: Vec<PathBuf>,
 
         /// Read-only runtime library/resource paths passed to nono.
         #[arg(long = "runtime-file")]
@@ -242,6 +261,9 @@ async fn main() -> Result<()> {
             run_root,
             worker,
             catalog,
+            backend: backend_kind,
+            libkrun,
+            devices,
             runtime_files,
             ready_timeout_ms,
             cdc,
@@ -266,25 +288,6 @@ async fn main() -> Result<()> {
                 leyline_runtime::CatalogResolver::from_json(&catalog_bytes)
                     .context("parse execution catalog")?,
             );
-            let backend = leyline_runtime::backends::native_backend::NativeWorkerBackend::new(
-                leyline_runtime::backends::native_backend::NativeWorkerConfig {
-                    worker,
-                    cas_root,
-                    ephemeral_root: run_root,
-                    runtime_files,
-                    ready_timeout: Duration::from_millis(ready_timeout_ms),
-                },
-            );
-            let service = Arc::new(leyline_runtime::ExecutionService::new(backend));
-            let policy = leyline_runtime::authorization::AuthorizationPolicy {
-                required_backend: leyline_runtime::BackendClass::Native,
-                ..Default::default()
-            };
-            let handler = Arc::new(
-                leyline_cli_lib::daemon::execution::RuntimeExecutionHandler::new(
-                    service, policy, resolver,
-                ),
-            );
             let mache_dir = dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(".mache");
@@ -307,12 +310,78 @@ async fn main() -> Result<()> {
                 mcp_uds: None,
                 reset_arena: false,
             };
-            leyline_cli_lib::cmd_daemon::run_execution_daemon_with_options(
-                config,
-                handler,
-                leyline_cli_lib::cmd_daemon::DaemonOptions { cdc },
-            )
-            .await
+            match backend_kind {
+                ExecutionBackendKind::Native => {
+                    if libkrun.is_some() || !devices.is_empty() {
+                        bail!("--libkrun and --device require --backend micro-vm");
+                    }
+                    let backend =
+                        leyline_runtime::backends::native_backend::NativeWorkerBackend::new(
+                            leyline_runtime::backends::native_backend::NativeWorkerConfig {
+                                worker,
+                                cas_root,
+                                ephemeral_root: run_root,
+                                runtime_files,
+                                ready_timeout: Duration::from_millis(ready_timeout_ms),
+                            },
+                        );
+                    let service = Arc::new(leyline_runtime::ExecutionService::new(backend));
+                    let policy = leyline_runtime::authorization::AuthorizationPolicy {
+                        required_backend: leyline_runtime::BackendClass::Native,
+                        ..Default::default()
+                    };
+                    let handler = Arc::new(
+                        leyline_cli_lib::daemon::execution::RuntimeExecutionHandler::new(
+                            service, policy, resolver,
+                        ),
+                    );
+                    leyline_cli_lib::cmd_daemon::run_execution_daemon_with_options(
+                        config,
+                        handler,
+                        leyline_cli_lib::cmd_daemon::DaemonOptions { cdc },
+                    )
+                    .await
+                }
+                ExecutionBackendKind::MicroVm => {
+                    let Some(libkrun) = libkrun else {
+                        bail!("--libkrun is required with --backend micro-vm");
+                    };
+                    if !libkrun.is_file() {
+                        bail!("libkrun is not an existing file: {}", libkrun.display());
+                    }
+                    if devices.iter().any(|path| !path.exists()) {
+                        bail!("all --device paths must exist");
+                    }
+                    let backend =
+                        leyline_runtime::backends::libkrun::backend::KrunWorkerBackend::new(
+                            leyline_runtime::backends::libkrun::backend::KrunWorkerConfig {
+                                worker,
+                                cas_root,
+                                ephemeral_root: run_root,
+                                libkrun,
+                                runtime_files,
+                                devices,
+                                ready_timeout: Duration::from_millis(ready_timeout_ms),
+                            },
+                        );
+                    let service = Arc::new(leyline_runtime::ExecutionService::new(backend));
+                    let policy = leyline_runtime::authorization::AuthorizationPolicy {
+                        required_backend: leyline_runtime::BackendClass::MicroVm,
+                        ..Default::default()
+                    };
+                    let handler = Arc::new(
+                        leyline_cli_lib::daemon::execution::RuntimeExecutionHandler::new(
+                            service, policy, resolver,
+                        ),
+                    );
+                    leyline_cli_lib::cmd_daemon::run_execution_daemon_with_options(
+                        config,
+                        handler,
+                        leyline_cli_lib::cmd_daemon::DaemonOptions { cdc },
+                    )
+                    .await
+                }
+            }
         }
         Cmd::Daemon {
             arena,
@@ -457,6 +526,42 @@ mod tests {
                     catalog,
                     PathBuf::from("/etc/leyline/execution-catalog.json")
                 );
+            }
+            _ => panic!("expected execution-daemon command"),
+        }
+    }
+
+    #[test]
+    fn execution_daemon_can_select_embedded_libkrun_without_a_subprocess_provider() {
+        let cli = Cli::try_parse_from([
+            "leyline",
+            "execution-daemon",
+            "--backend",
+            "micro-vm",
+            "--cas-root",
+            "/cas",
+            "--run-root",
+            "/runs",
+            "--worker",
+            "/worker",
+            "--catalog",
+            "/catalog.json",
+            "--libkrun",
+            "/lib/libkrun.dylib",
+            "--device",
+            "/dev/null",
+        ])
+        .unwrap();
+        match cli.command {
+            Cmd::ExecutionDaemon {
+                backend,
+                libkrun,
+                devices,
+                ..
+            } => {
+                assert_eq!(backend, ExecutionBackendKind::MicroVm);
+                assert_eq!(libkrun, Some(PathBuf::from("/lib/libkrun.dylib")));
+                assert_eq!(devices, vec![PathBuf::from("/dev/null")]);
             }
             _ => panic!("expected execution-daemon command"),
         }

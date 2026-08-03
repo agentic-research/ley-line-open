@@ -86,7 +86,7 @@ impl ExecutionRequest {
         }
         if !self.allowed_egress.is_empty() {
             return Err(ExecutionError::unsupported(
-                "the embedded libkrun backend does not yet support egress grants",
+                "the configured execution backend does not yet support egress grants",
             ));
         }
         Ok(())

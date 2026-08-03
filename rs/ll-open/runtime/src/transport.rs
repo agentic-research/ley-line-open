@@ -283,6 +283,14 @@ pub fn collect_json<B: crate::Backend>(
     let mut backend = receipt.reborrow().init_backend();
     backend.set_backend_class(to_schema_backend(receipt_data.context.backend_class));
     backend.set_backend_id(&receipt_data.backend_id);
+    {
+        // ADR-0035 §3: the ceiling's meaning is the mechanism, so the receipt
+        // records which layer applied each one rather than only the number.
+        let mut enforced = backend.reborrow().init_enforced();
+        enforced.set_wall_time(to_schema_mechanism(receipt_data.enforced.wall_time));
+        enforced.set_vcpus(to_schema_mechanism(receipt_data.enforced.vcpus));
+        enforced.set_memory(to_schema_mechanism(receipt_data.enforced.memory));
+    }
     let mut evidence = backend.reborrow().init_evidence();
     evidence.set_media_type("application/vnd.leyline.backend-evidence");
     set_digest(evidence.init_digest(), &receipt_data.event_log_root)?;
@@ -425,6 +433,14 @@ fn to_schema_backend(class: crate::BackendClass) -> execution_capnp::BackendClas
     match class {
         crate::BackendClass::Native => execution_capnp::BackendClass::Native,
         crate::BackendClass::MicroVm => execution_capnp::BackendClass::MicroVm,
+    }
+}
+
+fn to_schema_mechanism(mechanism: crate::CeilingMechanism) -> execution_capnp::CeilingMechanism {
+    match mechanism {
+        crate::CeilingMechanism::Unenforced => execution_capnp::CeilingMechanism::Unenforced,
+        crate::CeilingMechanism::Supervisor => execution_capnp::CeilingMechanism::Supervisor,
+        crate::CeilingMechanism::Hypervisor => execution_capnp::CeilingMechanism::Hypervisor,
     }
 }
 

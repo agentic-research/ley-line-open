@@ -22,6 +22,7 @@ impl Backend for CompletingBackend {
             backend_id: "transport-test/1".into(),
             backend_class: BackendClass::MicroVm,
             available: true,
+            enforced: leyline_runtime::EnforcedCeilings::hypervisor_backed(),
         }
     }
 

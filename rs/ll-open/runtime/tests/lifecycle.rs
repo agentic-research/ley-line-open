@@ -70,6 +70,7 @@ impl Backend for CompletingBackend {
             backend_id: "completing/1".into(),
             backend_class: BackendClass::MicroVm,
             available: true,
+            enforced: leyline_runtime::EnforcedCeilings::hypervisor_backed(),
         }
     }
 
@@ -94,6 +95,7 @@ impl Backend for FailingBackend {
             backend_id: "failing/1".into(),
             backend_class: BackendClass::MicroVm,
             available: true,
+            enforced: leyline_runtime::EnforcedCeilings::hypervisor_backed(),
         }
     }
 
@@ -122,6 +124,7 @@ impl Backend for BlockingBackend {
             backend_id: "blocking/1".into(),
             backend_class: BackendClass::MicroVm,
             available: true,
+            enforced: leyline_runtime::EnforcedCeilings::hypervisor_backed(),
         }
     }
 
@@ -161,6 +164,7 @@ impl Backend for RecordingBackend {
             backend_id: "recording/1".into(),
             backend_class: BackendClass::MicroVm,
             available: true,
+            enforced: leyline_runtime::EnforcedCeilings::hypervisor_backed(),
         }
     }
 
@@ -460,6 +464,7 @@ impl Backend for JustFinishedBackend {
             backend_id: "just-finished/1".into(),
             backend_class: BackendClass::MicroVm,
             available: true,
+            enforced: leyline_runtime::EnforcedCeilings::hypervisor_backed(),
         }
     }
 

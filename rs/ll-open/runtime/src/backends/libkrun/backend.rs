@@ -116,6 +116,15 @@ impl Backend for KrunWorkerBackend {
             backend_id: "libkrun/1".into(),
             backend_class: BackendClass::MicroVm,
             available: self.configured(),
+            // `krun_set_vm_config(ctx, vcpus, ram_mib)` applies both at VM
+            // configuration time, before the guest runs — see plan.rs, which
+            // carries `request.limits.vcpus` and `.memory_mib` straight
+            // through. The wall clock is still the supervisor's.
+            enforced: crate::EnforcedCeilings {
+                wall_time: crate::CeilingMechanism::Supervisor,
+                vcpus: crate::CeilingMechanism::Hypervisor,
+                memory: crate::CeilingMechanism::Hypervisor,
+            },
         }
     }
 

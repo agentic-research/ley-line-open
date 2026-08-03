@@ -18,6 +18,7 @@ use crate::{BackendClass, ExecutionError};
 
 pub const EXECUTION_SCHEMA_VERSION: &str = "cloister/execution/v1";
 pub const EXECUTION_CAPABILITY: &str = "urn:signet:cap:execute:run";
+const APAS_PREDICATE_TYPE: &str = "https://rosary.dev/Handoff/v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizationPolicy {
@@ -80,16 +81,27 @@ impl<S: EvidenceStore> EvidenceVerifier for CasDsseEvidenceVerifier<S> {
             retryable: false,
             detail: format!("{field} DSSE envelope is invalid: {error}"),
         })?;
-        if self.trust_keys.is_empty()
-            || !self
-                .trust_keys
-                .iter()
-                .any(|key| envelope.verify(key).is_ok())
-        {
+        if self.trust_keys.is_empty() {
             return Err(ExecutionError {
                 code: crate::ErrorCode::Unauthenticated,
                 retryable: false,
                 detail: format!("{field} DSSE signature is not trusted"),
+            });
+        }
+        let statement = self
+            .trust_keys
+            .iter()
+            .find_map(|key| envelope.verify(key).ok())
+            .ok_or_else(|| ExecutionError {
+                code: crate::ErrorCode::Unauthenticated,
+                retryable: false,
+                detail: format!("{field} DSSE signature is not trusted"),
+            })?;
+        if statement.predicate_type() != APAS_PREDICATE_TYPE {
+            return Err(ExecutionError {
+                code: crate::ErrorCode::Unauthenticated,
+                retryable: false,
+                detail: format!("{field} DSSE predicate is not APAS Handoff/v1"),
             });
         }
         Ok(())

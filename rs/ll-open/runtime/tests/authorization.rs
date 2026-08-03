@@ -199,6 +199,33 @@ fn cas_dsse_verifier_binds_and_verifies_apas_evidence() {
 }
 
 #[test]
+fn cas_dsse_verifier_rejects_a_signed_non_apas_statement() {
+    let signer = leyline_envelope::Ed25519RootSigner::from_seed(&[12u8; 32]);
+    let statement = leyline_envelope::Statement::new(
+        Vec::new(),
+        "https://example.test/Unrelated/v1",
+        serde_json::json!({"dispatchId":"run-01"}),
+    );
+    let bytes = leyline_envelope::Envelope::sign(&statement, &signer).to_json_vec();
+    let digest = format!("blake3-256:{}", blake3::hash(&bytes).to_hex());
+    let verifier = leyline_runtime::CasDsseEvidenceVerifier::new(
+        std::sync::Arc::new(FixtureEvidenceStore(bytes)),
+        vec![signer.verifying_key()],
+    );
+    let error = verifier
+        .verify(
+            "actorProvenanceEvidence",
+            &EvidenceRef {
+                media_type: "application/vnd.in-toto+json".into(),
+                digest,
+            },
+        )
+        .expect_err("a signed unrelated statement is not APAS evidence");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::Unauthenticated);
+    assert!(error.detail.contains("not APAS"));
+}
+
+#[test]
 fn rejects_grant_bound_to_different_spec() {
     let spec = spec_bytes();
     let other_spec = spec_bytes_with_interface(Some("different/interface"), 0);

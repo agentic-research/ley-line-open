@@ -139,7 +139,8 @@ embedding verifier.
 LLO also ships `CasDsseEvidenceVerifier`, which verifies APAS
 `application/vnd.in-toto+json` envelopes from an embedding-provided
 content-addressed store against embedding-provided Signet/NotMe trust keys.
-Cloister may use that adapter or supply its own verifier for Interlace
+It requires the APAS Handoff/v1 predicate as well as the in-toto envelope
+type. Cloister may use that adapter or supply its own verifier for Interlace
 certificate/lease evidence; key distribution and rotation remain outside LLO.
 
 To select the embedded VM path, use `--backend micro-vm --libkrun

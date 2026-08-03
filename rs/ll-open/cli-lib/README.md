@@ -38,6 +38,9 @@ Every base-op response except `query`/`lsp_*`/`vec_search` is typed against `dae
 
 - `tests/fixtures/daemon-protocol.json` + `tests/integration.rs::daemon_protocol_gate_handlers_emit_required_keys` — runtime handler ↔ schema parity
 - `clients/go/leyline-schema/daemon/daemon_protocol_test.go` — cross-runtime: every fixture decodes into typed Go bindings under strict-unmarshal
+- `tests/execution_transport.rs` — canonical execution/v1 fixture through the
+  shared `RuntimeExecutionHandler`, covering provision, status, cancellation,
+  and receipt collection without a second lifecycle implementation
 
 Execution API compatibility is versioned by the public schema
 (`cloister/execution/v1`), not by this crate's release number. The normative

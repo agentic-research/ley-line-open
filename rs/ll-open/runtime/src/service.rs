@@ -212,17 +212,17 @@ impl<B: Backend> ExecutionService<B> {
         let authorized = authorize(spec_bytes, grant_bytes, policy)?;
         let request = resolver.resolve(&authorized)?;
         if request.run_id != authorized.run_id {
-            return Err(ExecutionError::invalid(
+            return Err(ExecutionError::identity_mismatch(
                 "resolver returned a run_id different from the authorized identity",
             ));
         }
         if request.replay_key != authorized.replay_key {
-            return Err(ExecutionError::invalid(
+            return Err(ExecutionError::identity_mismatch(
                 "resolver returned a replay key different from the authorized grant",
             ));
         }
         if request.allowed_egress != authorized.allowed_egress {
-            return Err(ExecutionError::invalid(
+            return Err(ExecutionError::identity_mismatch(
                 "resolver changed the grant's allowed egress",
             ));
         }

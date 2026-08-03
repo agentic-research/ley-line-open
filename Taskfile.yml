@@ -712,6 +712,13 @@ tasks:
     cmds:
       - cargo test -p leyline-cli-lib
 
+  runtime:test:
+    desc: Run the embedded execution runtime tests (fake-worker contracts; no host VM required)
+    dir: rs
+    cmds:
+      - env RUSTC_WRAPPER= cargo test -p leyline-runtime
+
+
   # `vec` and `text-search` SHIP — README documents `task install:full`, which
   # builds `--features all` and includes both — but no test target enabled
   # them, so 27 and 16 inline `#[cfg]` sections inside otherwise-running tests

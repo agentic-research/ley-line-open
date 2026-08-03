@@ -1,0 +1,21 @@
+[package]
+name = "leyline-runtime"
+version = "0.14.0"
+edition = "2024"
+description = "Capability-resolved execution lifecycle and isolation backends for Leyline"
+repository = "https://github.com/agentic-research/ley-line-open"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+libloading = { workspace = true }
+leyline-core = { path = "../../ll-core/core", version = "0.14.0" }
+nono = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+rustix = { version = "1.1.4", features = ["fs"] }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+blake3 = { workspace = true }

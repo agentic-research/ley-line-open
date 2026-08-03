@@ -2279,8 +2279,9 @@ fn jsonschema_named_union_struct_variants_emits_oneof_under_discriminant() {
     let backend = &doc["$defs"]["Backend"];
 
     // Base fields + the discriminant are all properties, all required.
-    // (serde_json's Map sorts keys on parse, so property ORDER is
-    // asserted by the golden text pin, not here.)
+    // Object member order is not semantic (and may be declaration-preserving
+    // when serde_json/preserve_order is enabled), so property ORDER is
+    // asserted by the golden text pin, not here.
     let props = backend["properties"].as_object().expect("properties");
     let mut keys: Vec<&str> = props.keys().map(String::as_str).collect();
     keys.sort_unstable();
@@ -2622,17 +2623,19 @@ fn assert_cross_emitter_agreement(schema: &leyline_schema_bridge::Schema) {
         match &s.union {
             None => {
                 let field_names: Vec<&str> = s.fields.iter().map(|f| f.name.as_str()).collect();
-                // serde_json's Map sorts keys on parse — compare the
-                // property SET here; declaration order is pinned by
-                // the required array (a JSON array keeps its order).
+                // Compare the property SET here; declaration order is pinned
+                // by the required array (a JSON array keeps its order). The
+                // workspace may enable serde_json's `preserve_order` feature,
+                // so parsed object keys must be sorted explicitly.
                 let mut sorted_fields = field_names.clone();
                 sorted_fields.sort_unstable();
-                let props: Vec<&str> = def["properties"]
+                let mut props: Vec<&str> = def["properties"]
                     .as_object()
                     .expect("plain struct must have properties")
                     .keys()
                     .map(String::as_str)
                     .collect();
+                props.sort_unstable();
                 assert_eq!(props, sorted_fields, "jsonschema properties drifted:\n{js}");
                 let required: Vec<&str> = def["required"]
                     .as_array()
@@ -3295,6 +3298,29 @@ fn bead_create_fields() -> Vec<FieldSpec> {
     ]
 }
 
+/// JSON object member order is not part of the IDL/MCP contract. Keep array
+/// order significant, but canonicalize object keys before comparing an
+/// independently-built expected value with generated output. This remains
+/// deterministic when the workspace enables serde_json's `preserve_order`
+/// feature through an unrelated consumer such as the runtime's nono backend.
+fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(object) => {
+            let mut entries: Vec<_> = object.iter().collect();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            let mut canonical = serde_json::Map::new();
+            for (key, value) in entries {
+                canonical.insert(key.clone(), canonical_json(value));
+            }
+            serde_json::Value::Object(canonical)
+        }
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(canonical_json).collect())
+        }
+        scalar => scalar.clone(),
+    }
+}
+
 const BEAD_CREATE_DESC: &str = "Create a new bead (work item) in a repo's Dolt database. Use when you've identified a discrete, actionable issue. Set file scopes accurately — they determine parallel dispatch safety via has_file_overlap(). IMPLEMENTATION beads (bug/feature/task/chore) MUST declare a close condition — a runnable test/build command in `description` (e.g. `cargo test -p <crate>`) or `test_files` — or the create fails loud (ADR-0010: a bead with no defined 'done' can never be closed by an observation). Pass either `scope: 'repo:<name>'` (canonical) or `repo_path: '/path/to/repo'` (legacy).";
 
 #[test]
@@ -3333,7 +3359,8 @@ fn bead_create_tooldefs_matches_live_tools_rs() {
         }
     });
     assert_eq!(
-        tool, &expected,
+        canonical_json(tool),
+        canonical_json(&expected),
         "tooldefs entry drifted from tools.rs shape"
     );
 

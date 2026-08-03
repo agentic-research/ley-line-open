@@ -1,0 +1,128 @@
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
+use leyline_runtime::{
+    Backend, BackendCapabilities, BackendClass, BackendRun, DigestRef, ErrorCode, ExecutionError,
+    ExecutionRequest, ExecutionService, ResourceLimits, RunState,
+};
+
+#[derive(Clone, Default)]
+struct RecordingBackend {
+    calls: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl RecordingBackend {
+    fn calls(&self) -> Vec<&'static str> {
+        self.calls.lock().expect("recording backend lock").clone()
+    }
+}
+
+impl Backend for RecordingBackend {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            backend_id: "recording/1".into(),
+            backend_class: BackendClass::MicroVm,
+            available: true,
+        }
+    }
+
+    fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+        self.calls
+            .lock()
+            .expect("recording backend lock")
+            .push("start");
+        Ok(BackendRun {
+            backend_id: "recording/1".into(),
+        })
+    }
+}
+
+fn request(replay_key: &str) -> ExecutionRequest {
+    ExecutionRequest {
+        run_id: "run-01".into(),
+        replay_key: replay_key.into(),
+        rootfs: DigestRef {
+            algorithm: "blake3-256".into(),
+            value: "a".repeat(64),
+        },
+        executable: "usr/bin/true".into(),
+        arguments: vec!["true".into()],
+        public_environment: BTreeMap::from([("CI".into(), "true".into())]),
+        allowed_egress: Vec::new(),
+        limits: ResourceLimits {
+            vcpus: 2,
+            memory_mib: 2048,
+            wall_time_ms: 30_000,
+        },
+    }
+}
+
+#[test]
+fn status_before_start_is_read_only() {
+    // Catches a status implementation that probes, provisions, or starts the
+    // backend merely to answer that no run exists.
+    let backend = RecordingBackend::default();
+    let service = ExecutionService::new(backend.clone());
+
+    assert_eq!(service.status("missing").expect("status"), None);
+    assert!(backend.calls().is_empty());
+}
+
+#[test]
+fn repeated_start_with_one_replay_key_returns_the_same_run() {
+    // Catches loss of replay-key idempotency, which would boot two VMs for a
+    // retried transport request.
+    let backend = RecordingBackend::default();
+    let service = ExecutionService::new(backend.clone());
+
+    let first = service.start(request("replay-1")).expect("first start");
+    let second = service.start(request("replay-1")).expect("replayed start");
+
+    assert_eq!(first.run_id, second.run_id);
+    assert_eq!(first.state, RunState::Running);
+    assert_eq!(second.state, RunState::Running);
+    assert_eq!(backend.calls(), vec!["start"]);
+}
+
+#[test]
+fn invalid_content_identity_fails_before_backend_start() {
+    // Catches accepting a mutable/ambiguous rootfs identity at the authority
+    // boundary or discovering it only after backend materialization.
+    let backend = RecordingBackend::default();
+    let service = ExecutionService::new(backend.clone());
+    let mut request = request("invalid-digest");
+    request.rootfs.algorithm = "sha256".into();
+
+    let error = service.start(request).expect_err("digest must be rejected");
+
+    assert_eq!(error.code, ErrorCode::InvalidSpec);
+    assert!(backend.calls().is_empty());
+}
+
+#[test]
+fn guest_path_traversal_fails_before_backend_start() {
+    // Catches turning a guest entrypoint into ambient host path authority.
+    let backend = RecordingBackend::default();
+    let service = ExecutionService::new(backend.clone());
+    let mut request = request("path-traversal");
+    request.executable = "../../bin/sh".into();
+
+    let error = service.start(request).expect_err("path must be rejected");
+
+    assert_eq!(error.code, ErrorCode::InvalidSpec);
+    assert!(backend.calls().is_empty());
+}
+
+#[test]
+fn egress_grant_fails_closed_until_a_network_broker_exists() {
+    // Catches libkrun's implicit TSI path becoming ambient network authority.
+    let backend = RecordingBackend::default();
+    let service = ExecutionService::new(backend.clone());
+    let mut request = request("egress");
+    request.allowed_egress = vec!["example.com:443".into()];
+
+    let error = service.start(request).expect_err("egress must fail closed");
+
+    assert_eq!(error.code, ErrorCode::UnsupportedBackend);
+    assert!(backend.calls().is_empty());
+}

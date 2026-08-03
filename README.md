@@ -70,7 +70,34 @@ task install              # released/default feature set
 task install:full         # portable full feature set, no mount backend
 task install:full+mount   # add FUSE/NFS support
 task ci                   # check, clippy, formatting, tests, FFI gates
+task runtime:test        # embedded libkrun runtime contract tests (fake worker)
 ```
+
+### Embedded execution runtime
+
+The experimental `leyline-runtime` crate owns the execution/v1 lifecycle and
+the embedded `libkrun` backend. It verifies a content-addressed rootfs, copies
+it into a private per-run userspace volume, and applies `nono` to the
+first-party worker before entering the microVM. The worker path does not invoke
+`krunvm`, Taskfile, or repository scripts. The immutable CAS source remains
+outside the guest's writable boundary.
+
+The portable runtime tests use a fake worker and do not require libkrun or
+Hypervisor.framework. The real Apple Silicon guest-write proof is ignored by
+default because it requires a locally installed libkrun/libkrunfw toolchain and
+the Hypervisor.framework entitlement; see
+[`libkrun_guest_write.rs`](rs/ll-open/runtime/tests/libkrun_guest_write.rs) and
+bead `ley-line-open-16a994` for the CI/release gate.
+
+This is a backend vertical slice, not yet the complete product API: terminal
+execution/v1 receipts and mmap-backed CAS projection are tracked separately by
+beads `ley-line-open-16aa10` and `ley-line-open-16c953`.
+
+Mutation testing remains a separate hardening pass: use the repository's
+`task mutants:diff DIFF=<path>` gate after the runtime edge-case tests are
+expanded. The initial local runtime mutation run exposed survivor cases that
+are tracked in `ley-line-open-ce0cf0`; they are intentionally not presented as
+covered by this vertical slice.
 
 The current release is `v0.14.0`. It publishes platform binaries, FFI
 staticlibs, and the Apache-2.0 Go schema module at
@@ -148,6 +175,8 @@ example `-p 127.0.0.1:18384:8384`) unless an authenticated proxy is in front.
 - `rs/ll-open/ts` — tree-sitter parsing and AST projections.
 - `rs/ll-open/lsp` — language-server enrichment.
 - `rs/ll-open/fs` — SQLite graph, arena reader, CDC, FFI, and mount adapters.
+- `rs/ll-open/runtime` — execution/v1 lifecycle, private rootfs materialization,
+  nono confinement, and the embedded libkrun worker backend.
 - `rs/ll-open/cli-lib` — daemon lifecycle and UDS/MCP dispatch.
 - `clients/go/leyline-schema` — generated Go contract bindings.
 - `docs/ARCHITECTURE.md` — normative vocabulary, ownership, and the authority

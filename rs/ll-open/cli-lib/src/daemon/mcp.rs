@@ -67,38 +67,53 @@ pub struct McpTool {
 
 const GENERATED_EXECUTION_TOOLS: &str = include_str!("execution-tools.json");
 
-/// Return the IDL-generated input schema for one execution/v1 MCP tool.
+/// Return the complete IDL-generated execution/v1 MCP registry.
 ///
-/// The generated artifact carries the complete `$defs` graph (RunSpec,
-/// RunGrant, ArtifactRef, and nested evidence types). Keeping this lookup at
-/// the registry boundary prevents transport code from silently replacing
-/// those definitions with permissive `{type: object}` placeholders.
-fn generated_execution_tool_schema(name: &str) -> Value {
-    static TOOLS: OnceLock<Vec<Value>> = OnceLock::new();
-    let tools = TOOLS.get_or_init(|| {
-        serde_json::from_str(GENERATED_EXECUTION_TOOLS)
-            .expect("schema-bridge execution tool definitions must be valid JSON")
-    });
-    tools
+/// The generated artifact carries names, descriptions, input schemas, and
+/// their nested `$defs` graph. Keeping the whole registry data-driven means a
+/// new `$Op` cannot silently land in the schema while being omitted from the
+/// live MCP surface. `McpTool` stores static strings because the server-json
+/// generator borrows them; the one-time owned parse is intentionally promoted
+/// to the process lifetime here.
+fn generated_execution_tools() -> Vec<McpTool> {
+    static TOOLS: OnceLock<Vec<McpTool>> = OnceLock::new();
+    TOOLS
+        .get_or_init(|| {
+            let generated: Vec<Value> = serde_json::from_str(GENERATED_EXECUTION_TOOLS)
+                .expect("schema-bridge execution tool definitions must be valid JSON");
+            generated
+                .into_iter()
+                .map(|tool| {
+                    let name = tool
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_else(|| panic!("generated execution tool has no name"))
+                        .to_owned();
+                    let description = tool
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or_else(|| {
+                            panic!("generated execution tool has no description: {name}")
+                        })
+                        .to_owned();
+                    let schema = tool.get("inputSchema").cloned().unwrap_or_else(|| {
+                        panic!("generated execution tool has no inputSchema: {name}")
+                    });
+                    McpTool {
+                        name: Box::leak(name.into_boxed_str()),
+                        description: Box::leak(description.into_boxed_str()),
+                        schema,
+                    }
+                })
+                .collect()
+        })
         .iter()
-        .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
-        .and_then(|tool| tool.get("inputSchema"))
-        .cloned()
-        .unwrap_or_else(|| panic!("generated execution tool is missing: {name}"))
-}
-
-fn generated_execution_tool_description(name: &str) -> &'static str {
-    static TOOLS: OnceLock<Vec<Value>> = OnceLock::new();
-    let tools = TOOLS.get_or_init(|| {
-        serde_json::from_str(GENERATED_EXECUTION_TOOLS)
-            .expect("schema-bridge execution tool definitions must be valid JSON")
-    });
-    tools
-        .iter()
-        .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
-        .and_then(|tool| tool.get("description"))
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("generated execution tool is missing: {name}"))
+        .map(|tool| McpTool {
+            name: tool.name,
+            description: tool.description,
+            schema: tool.schema.clone(),
+        })
+        .collect()
 }
 
 /// Build the canonical tool registry. The MCP `tools/list` response,
@@ -490,51 +505,9 @@ pub fn tool_registry() -> Vec<McpTool> {
         }),
     });
 
-    // execution/v1 runtime adapters. The nested schema is owned by the
-    // normative Cap'n Proto IDL; these registry entries only describe the
-    // operation envelope consumed by `daemon::execution`.
-    tools.extend([
-        McpTool {
-            name: "llo_execution_capabilities",
-            description: generated_execution_tool_description("llo_execution_capabilities"),
-            schema: generated_execution_tool_schema("llo_execution_capabilities"),
-        },
-        McpTool {
-            name: "llo_execution_provision",
-            description: generated_execution_tool_description("llo_execution_provision"),
-            schema: generated_execution_tool_schema("llo_execution_provision"),
-        },
-        McpTool {
-            name: "llo_execution_status",
-            description: generated_execution_tool_description("llo_execution_status"),
-            schema: generated_execution_tool_schema("llo_execution_status"),
-        },
-        McpTool {
-            name: "llo_execution_start",
-            description: generated_execution_tool_description("llo_execution_start"),
-            schema: generated_execution_tool_schema("llo_execution_start"),
-        },
-        McpTool {
-            name: "llo_execution_inspect",
-            description: generated_execution_tool_description("llo_execution_inspect"),
-            schema: generated_execution_tool_schema("llo_execution_inspect"),
-        },
-        McpTool {
-            name: "llo_execution_collect",
-            description: generated_execution_tool_description("llo_execution_collect"),
-            schema: generated_execution_tool_schema("llo_execution_collect"),
-        },
-        McpTool {
-            name: "llo_execution_cleanup",
-            description: generated_execution_tool_description("llo_execution_cleanup"),
-            schema: generated_execution_tool_schema("llo_execution_cleanup"),
-        },
-        McpTool {
-            name: "llo_execution_cancel",
-            description: generated_execution_tool_description("llo_execution_cancel"),
-            schema: generated_execution_tool_schema("llo_execution_cancel"),
-        },
-    ]);
+    // execution/v1 runtime adapters. Names, descriptions, and nested input
+    // schemas all come from the normative Cap'n Proto IDL artifact.
+    tools.extend(generated_execution_tools());
 
     tools
 }

@@ -300,6 +300,26 @@ fn service_schema_entrypoint_authorizes_before_resolving() {
 }
 
 #[test]
+fn schema_start_requires_explicit_backend_provisioning() {
+    let spec = spec_bytes();
+    let grant = grant_bytes(&spec, true, 2_000, 0);
+    let service = ExecutionService::new(RecordingBackend);
+    let error = service
+        .start_authorized(
+            &spec,
+            &grant,
+            &AuthorizationPolicy {
+                now_unix_ms: 1_000,
+                required_backend: BackendClass::MicroVm,
+                required_confinement_digest: None,
+            },
+            &TestResolver,
+        )
+        .expect_err("unprovisioned backend must fail closed");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::NotProvisioned);
+}
+
+#[test]
 fn natural_backend_completion_can_collect_a_schema_receipt() {
     let spec = spec_bytes();
     let grant = grant_bytes(&spec, true, 2_000, 0);

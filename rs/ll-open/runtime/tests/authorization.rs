@@ -3,7 +3,7 @@ use capnp::message::ReaderOptions;
 use leyline_public_schema::execution_capnp;
 use leyline_runtime::authorization::{
     AuthorizationPolicy, EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION, EvidenceRef,
-    EvidenceVerifier, authorize, canonical_digest,
+    EvidenceStore, EvidenceVerifier, authorize, canonical_digest,
 };
 use leyline_runtime::transport::{
     capabilities_json, cleanup_json, collect_json, start_json, status_json,
@@ -59,6 +59,14 @@ impl EvidenceVerifier for RejectEvidence {
             retryable: false,
             detail: format!("unverified evidence: {field}"),
         })
+    }
+}
+
+struct FixtureEvidenceStore(Vec<u8>);
+
+impl EvidenceStore for FixtureEvidenceStore {
+    fn load(&self, _digest: &str) -> Result<Vec<u8>, ExecutionError> {
+        Ok(self.0.clone())
     }
 }
 
@@ -163,6 +171,31 @@ fn verifier_adapter_can_fail_closed_before_backend_resolution() {
     )
     .expect_err("unverified upstream evidence must fail closed");
     assert_eq!(error.code, leyline_runtime::ErrorCode::Unauthenticated);
+}
+
+#[test]
+fn cas_dsse_verifier_binds_and_verifies_apas_evidence() {
+    let signer = leyline_envelope::Ed25519RootSigner::from_seed(&[11u8; 32]);
+    let statement = leyline_envelope::Statement::new(
+        Vec::new(),
+        "https://rosary.dev/Handoff/v1",
+        serde_json::json!({"dispatchId":"run-01"}),
+    );
+    let bytes = leyline_envelope::Envelope::sign(&statement, &signer).to_json_vec();
+    let digest = format!("blake3-256:{}", blake3::hash(&bytes).to_hex());
+    let verifier = leyline_runtime::CasDsseEvidenceVerifier::new(
+        std::sync::Arc::new(FixtureEvidenceStore(bytes)),
+        vec![signer.verifying_key()],
+    );
+    verifier
+        .verify(
+            "actorProvenanceEvidence",
+            &EvidenceRef {
+                media_type: "application/vnd.in-toto+json".into(),
+                digest,
+            },
+        )
+        .expect("valid APAS DSSE evidence");
 }
 
 #[test]

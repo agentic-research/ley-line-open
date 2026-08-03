@@ -136,6 +136,12 @@ fixture verifier and is not a production trust boundary. The daemon owns the
 worker and UDS lifecycle, while callers provide logical intent and the
 embedding verifier.
 
+LLO also ships `CasDsseEvidenceVerifier`, which verifies APAS
+`application/vnd.in-toto+json` envelopes from an embedding-provided
+content-addressed store against embedding-provided Signet/NotMe trust keys.
+Cloister may use that adapter or supply its own verifier for Interlace
+certificate/lease evidence; key distribution and rotation remain outside LLO.
+
 To select the embedded VM path, use `--backend micro-vm --libkrun
 /path/to/libkrun` and repeat `--device` only for explicitly granted device
 paths. This selects LLO's `KrunWorkerBackend`; it does not invoke the

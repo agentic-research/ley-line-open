@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use capnp::message::ReaderOptions;
 use leyline_core::ContentAddressed;
+use leyline_envelope::{Envelope, VerifyingKey};
 use leyline_public_schema::execution_capnp;
 
 use crate::{BackendClass, ExecutionError};
@@ -35,6 +36,64 @@ pub struct AuthorizationPolicy {
 /// envelope/certificate chain before authorization can be called with it.
 pub trait EvidenceVerifier: Send + Sync {
     fn verify(&self, field: &str, evidence: &EvidenceRef) -> Result<(), ExecutionError>;
+}
+
+/// Minimal CAS interface needed by the built-in APAS DSSE verifier. Cloister
+/// can provide its mmap/SQLite CAS adapter without giving LLO host paths.
+pub trait EvidenceStore: Send + Sync {
+    fn load(&self, digest: &str) -> Result<Vec<u8>, ExecutionError>;
+}
+
+/// Verifies APAS/in-toto DSSE evidence from a content-addressed store against
+/// embedding-provided trust keys. Key distribution/rotation remains owned by
+/// Signet/NotMe; this type only performs cryptographic verification and digest
+/// binding once Cloister supplies the active keys.
+pub struct CasDsseEvidenceVerifier<S> {
+    store: std::sync::Arc<S>,
+    trust_keys: Vec<VerifyingKey>,
+}
+
+impl<S: EvidenceStore> CasDsseEvidenceVerifier<S> {
+    pub fn new(store: std::sync::Arc<S>, trust_keys: Vec<VerifyingKey>) -> Self {
+        Self { store, trust_keys }
+    }
+}
+
+impl<S: EvidenceStore> EvidenceVerifier for CasDsseEvidenceVerifier<S> {
+    fn verify(&self, field: &str, evidence: &EvidenceRef) -> Result<(), ExecutionError> {
+        if evidence.media_type != "application/vnd.in-toto+json" {
+            return Err(ExecutionError::unsupported(format!(
+                "{field} is not an APAS in-toto evidence envelope"
+            )));
+        }
+        let bytes = self.store.load(&evidence.digest)?;
+        let observed = format!("blake3-256:{}", bytes.hash());
+        if observed != evidence.digest {
+            return Err(ExecutionError {
+                code: crate::ErrorCode::Unauthenticated,
+                retryable: false,
+                detail: format!("{field} CAS digest does not match evidence bytes"),
+            });
+        }
+        let envelope = Envelope::from_json_slice(&bytes).map_err(|error| ExecutionError {
+            code: crate::ErrorCode::Unauthenticated,
+            retryable: false,
+            detail: format!("{field} DSSE envelope is invalid: {error}"),
+        })?;
+        if self.trust_keys.is_empty()
+            || !self
+                .trust_keys
+                .iter()
+                .any(|key| envelope.verify(key).is_ok())
+        {
+            return Err(ExecutionError {
+                code: crate::ErrorCode::Unauthenticated,
+                retryable: false,
+                detail: format!("{field} DSSE signature is not trusted"),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

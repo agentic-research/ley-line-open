@@ -75,6 +75,12 @@ enum Cmd {
         /// Activate or resume the private CDC index.
         #[arg(long, default_value_t = false)]
         cdc: bool,
+
+        /// Explicitly allow metadata-only evidence validation for local
+        /// fixtures. Production Cloister integrations must provide a real
+        /// Signet/NotMe/Interlace verifier instead.
+        #[arg(long, default_value_t = false)]
+        allow_unverified_evidence: bool,
     },
 
     /// Run the daemon: arena + mount + UDS socket for coordination.
@@ -267,6 +273,7 @@ async fn main() -> Result<()> {
             runtime_files,
             ready_timeout_ms,
             cdc,
+            allow_unverified_evidence,
         } => {
             if !worker.is_file() {
                 bail!(
@@ -310,6 +317,12 @@ async fn main() -> Result<()> {
                 mcp_uds: None,
                 reset_arena: false,
             };
+            let verifier: Arc<dyn leyline_runtime::EvidenceVerifier> = if allow_unverified_evidence
+            {
+                Arc::new(leyline_runtime::MetadataOnlyEvidenceVerifier)
+            } else {
+                Arc::new(leyline_runtime::RejectUnverifiedEvidence)
+            };
             match backend_kind {
                 ExecutionBackendKind::Native => {
                     if libkrun.is_some() || !devices.is_empty() {
@@ -331,8 +344,9 @@ async fn main() -> Result<()> {
                         ..Default::default()
                     };
                     let handler = Arc::new(
-                        leyline_cli_lib::daemon::execution::RuntimeExecutionHandler::new(
+                        leyline_cli_lib::daemon::execution::RuntimeExecutionHandler::new_with_verifier(
                             service, policy, resolver,
+                            Arc::clone(&verifier),
                         ),
                     );
                     leyline_cli_lib::cmd_daemon::run_execution_daemon_with_options(
@@ -370,8 +384,9 @@ async fn main() -> Result<()> {
                         ..Default::default()
                     };
                     let handler = Arc::new(
-                        leyline_cli_lib::daemon::execution::RuntimeExecutionHandler::new(
+                        leyline_cli_lib::daemon::execution::RuntimeExecutionHandler::new_with_verifier(
                             service, policy, resolver,
+                            Arc::clone(&verifier),
                         ),
                     );
                     leyline_cli_lib::cmd_daemon::run_execution_daemon_with_options(

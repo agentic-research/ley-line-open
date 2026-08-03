@@ -129,9 +129,12 @@ signed `RunSpec`/`RunGrant` wire contract. Signet/NotMe/Interlace trust roots
 remain embedding-owned: production callers must pass an `EvidenceVerifier` to
 `start_authorized_with_verifier`, which resolves each content-addressed
 evidence reference and verifies its signed envelope or certificate chain. The
-legacy `start_authorized` path uses a metadata-only fixture verifier and is not
-a production trust boundary. The daemon owns the worker and UDS lifecycle,
-while callers provide logical intent and the embedding verifier.
+default first-party CLI rejects execution unless an embedding verifier is
+installed. `--allow-unverified-evidence` exists only for local fixtures and is
+an explicit downgrade. The legacy `start_authorized` path uses a metadata-only
+fixture verifier and is not a production trust boundary. The daemon owns the
+worker and UDS lifecycle, while callers provide logical intent and the
+embedding verifier.
 
 To select the embedded VM path, use `--backend micro-vm --libkrun
 /path/to/libkrun` and repeat `--device` only for explicitly granted device

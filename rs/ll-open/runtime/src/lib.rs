@@ -14,7 +14,8 @@ pub mod transport;
 
 pub use authorization::{
     ArtifactIdentity, AuthorizedExecution, EvidenceRef, EvidenceVerifier,
-    MetadataOnlyEvidenceVerifier, SchemaIntent, SchemaLimits, WorkspaceInput,
+    MetadataOnlyEvidenceVerifier, RejectUnverifiedEvidence, SchemaIntent, SchemaLimits,
+    WorkspaceInput,
 };
 pub use catalog::{CatalogBuilder, CatalogResolver};
 pub use error::{ErrorCode, ExecutionError};

@@ -44,6 +44,22 @@ pub fn start_json<B: crate::Backend, R: ExecutionResolver>(
     policy: &AuthorizationPolicy,
     resolver: &R,
 ) -> Result<String, ExecutionError> {
+    start_json_with_verifier(
+        service,
+        input_json,
+        policy,
+        resolver,
+        &crate::MetadataOnlyEvidenceVerifier,
+    )
+}
+
+pub fn start_json_with_verifier<B: crate::Backend, R: ExecutionResolver>(
+    service: &ExecutionService<B>,
+    input_json: &str,
+    policy: &AuthorizationPolicy,
+    resolver: &R,
+    verifier: &dyn crate::EvidenceVerifier,
+) -> Result<String, ExecutionError> {
     let mut input_message = Builder::new_default();
     let input = input_message.init_root::<execution_capnp::start_input::Builder<'_>>();
     capnp_json::from_json(input_json, input).map_err(|error| {
@@ -62,7 +78,13 @@ pub fn start_json<B: crate::Backend, R: ExecutionResolver>(
         .map_err(|error| ExecutionError::invalid(format!("invalid start grant: {error}")))?;
     let spec_bytes = serialize_root::<execution_capnp::run_spec::Owned>(spec)?;
     let grant_bytes = serialize_root::<execution_capnp::run_grant::Owned>(grant)?;
-    let record = service.start_authorized(&spec_bytes, &grant_bytes, policy, resolver)?;
+    let record = service.start_authorized_with_verifier(
+        &spec_bytes,
+        &grant_bytes,
+        policy,
+        resolver,
+        verifier,
+    )?;
 
     let mut output_message = Builder::new_default();
     let mut output = output_message.init_root::<execution_capnp::start_output::Builder<'_>>();

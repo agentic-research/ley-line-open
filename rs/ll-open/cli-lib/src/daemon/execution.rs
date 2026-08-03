@@ -49,6 +49,7 @@ pub struct RuntimeExecutionHandler<B, R> {
     service: Arc<ExecutionService<B>>,
     policy: AuthorizationPolicy,
     resolver: Arc<R>,
+    verifier: Arc<dyn leyline_runtime::EvidenceVerifier>,
 }
 
 impl<B, R> RuntimeExecutionHandler<B, R>
@@ -61,10 +62,25 @@ where
         policy: AuthorizationPolicy,
         resolver: Arc<R>,
     ) -> Self {
+        Self::new_with_verifier(
+            service,
+            policy,
+            resolver,
+            Arc::new(leyline_runtime::RejectUnverifiedEvidence),
+        )
+    }
+
+    pub fn new_with_verifier(
+        service: Arc<ExecutionService<B>>,
+        policy: AuthorizationPolicy,
+        resolver: Arc<R>,
+        verifier: Arc<dyn leyline_runtime::EvidenceVerifier>,
+    ) -> Self {
         Self {
             service,
             policy,
             resolver,
+            verifier,
         }
     }
 }
@@ -86,11 +102,12 @@ where
     }
 
     fn start(&self, input: &Value) -> Result<String> {
-        Ok(transport::start_json(
+        Ok(transport::start_json_with_verifier(
             &self.service,
             &input.to_string(),
             &self.policy,
             self.resolver.as_ref(),
+            self.verifier.as_ref(),
         )?)
     }
 

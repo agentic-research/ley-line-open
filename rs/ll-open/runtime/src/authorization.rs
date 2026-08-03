@@ -33,7 +33,7 @@ pub struct AuthorizationPolicy {
 /// `EvidenceRef` is a CAS reference, not proof by itself. An adapter must
 /// resolve the referenced canonical bytes and verify the appropriate signed
 /// envelope/certificate chain before authorization can be called with it.
-pub trait EvidenceVerifier {
+pub trait EvidenceVerifier: Send + Sync {
     fn verify(&self, field: &str, evidence: &EvidenceRef) -> Result<(), ExecutionError>;
 }
 
@@ -52,6 +52,19 @@ pub struct MetadataOnlyEvidenceVerifier;
 impl EvidenceVerifier for MetadataOnlyEvidenceVerifier {
     fn verify(&self, _field: &str, _evidence: &EvidenceRef) -> Result<(), ExecutionError> {
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RejectUnverifiedEvidence;
+
+impl EvidenceVerifier for RejectUnverifiedEvidence {
+    fn verify(&self, field: &str, _evidence: &EvidenceRef) -> Result<(), ExecutionError> {
+        Err(ExecutionError {
+            code: crate::ErrorCode::Unauthenticated,
+            retryable: false,
+            detail: format!("no trusted verifier configured for {field}"),
+        })
     }
 }
 

@@ -147,7 +147,7 @@ fn canonical_fixture_uses_one_runtime_handler_for_lifecycle_operations() {
     let spec = spec_bytes();
     let grant = grant_bytes(&spec);
     let service = Arc::new(ExecutionService::new(CompletingBackend));
-    let handler = RuntimeExecutionHandler::new(
+    let handler = RuntimeExecutionHandler::new_with_verifier(
         Arc::clone(&service),
         AuthorizationPolicy {
             now_unix_ms: 1_000,
@@ -155,6 +155,7 @@ fn canonical_fixture_uses_one_runtime_handler_for_lifecycle_operations() {
             required_confinement_digest: None,
         },
         Arc::new(Resolver),
+        Arc::new(leyline_runtime::MetadataOnlyEvidenceVerifier),
     );
 
     let capabilities: Value = serde_json::from_str(&handler.capabilities().unwrap()).unwrap();

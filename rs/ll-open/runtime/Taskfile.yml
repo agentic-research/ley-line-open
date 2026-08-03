@@ -7,7 +7,7 @@ version: '3'
 tasks:
   test:
     desc: Run embedded execution runtime tests (fake-worker contracts; no host VM required)
-    dir: '{{.ROOT_DIR}}/rs'
+    dir: '{{.TASKFILE_DIR}}/../..'
     env:
       # Local developer toolchains commonly configure sccache globally. The
       # restricted runtime/UDS test harness cannot use that daemon reliably;

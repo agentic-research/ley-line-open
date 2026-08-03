@@ -7,6 +7,19 @@ version: '3'
 # Mutation process count and timeout calibration live here so every invocation
 # uses the same defaults. Callers may override them as Task variables; they do
 # not need to know cargo-mutants' environment variable names.
+#
+# Paths anchor on `{{"{{"}}.TASKFILE_DIR{{"}}"}}`, used DIRECTLY. Two measured
+# rules, both enforced by `tools/lint_taskfile_anchors.sh`:
+#
+#   1. `ROOT_DIR` is the directory of whichever Taskfile `task` DISCOVERED —
+#      the repo root under the root Taskfile's `includes`, but `<repo>/rs`
+#      when someone runs `task` from inside `rs/`. `dir: '{{"{{"}}.ROOT_DIR{{"}}"}}/rs'`
+#      therefore resolves to `<repo>/rs/rs` from there, and Task CREATES the
+#      wrong directory rather than failing.
+#   2. A special variable in `dir:` is treated as absolute only when written
+#      directly. Route the identical value through a `vars:` entry and Task
+#      joins it onto the base directory instead — producing a doubled path
+#      like `<repo>/Users/.../rs`. Do not indirect `dir:` through a variable.
 
 vars:
   MUTANTS_JOBS_VALUE: '{{.MUTANTS_JOBS | default "4"}}'
@@ -19,15 +32,15 @@ env:
 tasks:
   mutants:diff:
     desc: Run the workspace-relative Rust diff mutation gate
-    dir: '{{.ROOT_DIR}}/rs'
+    dir: '{{.TASKFILE_DIR}}'
     requires:
       vars: [DIFF]
     cmds:
-      - '{{.ROOT_DIR}}/tools/mutants_diff.sh "{{.DIFF}}" "{{.MUTANTS_SCOPE | default "all"}}"'
+      - '{{.TASKFILE_DIR}}/../tools/mutants_diff.sh "{{.DIFF}}" "{{.MUTANTS_SCOPE | default "all"}}"'
 
   mutants:pr:
     desc: Generate the integration-base working-tree diff and mutation-test it
-    dir: '{{.ROOT_DIR}}/rs'
+    dir: '{{.TASKFILE_DIR}}'
     cmds:
       - |
         set -eu
@@ -44,6 +57,27 @@ tasks:
         trap 'rm -f "$DIFF"' EXIT
         # No three-dot and no HEAD bound: include uncommitted work in the exact
         # tree that is about to be committed and pushed.
-        git diff --relative=rs "$BASE" -- . > "$DIFF"
+        #
+        # The pathspec is `:/rs` — repo-root-anchored — not `.`. With `.` the
+        # diff's contents depend on the working directory, so a change to this
+        # task's `dir:` silently produced an EMPTY diff and the gate reported
+        # SKIPPED: no Rust changed, nothing mutated, exit 0. That is the
+        # script's "this is NOT a pass" path arriving as a pass, which is the
+        # exact false-green `mutants_diff.sh` exists to prevent — reintroduced
+        # one level up, in how its input is built.
+        git diff --relative=rs "$BASE" -- ':/rs' > "$DIFF"
+        # `mutants_diff.sh` distinguishes "no Rust changed" (SKIPPED, exit 0)
+        # from "enumeration broke" (MISCONFIGURED, exit 1), but it cannot see
+        # the difference between a branch that genuinely changed nothing and a
+        # diff this task failed to build. Only the caller knows a diff was
+        # meant to be produced, so the emptiness check belongs here.
+        if [ ! -s "$DIFF" ]; then
+          echo "EMPTY DIFF vs $BASE — nothing to mutate." >&2
+          echo "  Either this branch has no changes against its base, or the" >&2
+          echo "  diff was built wrong. Both are failures for this task: it" >&2
+          echo "  exists to mutate a branch's changes, and reporting SKIPPED" >&2
+          echo "  on a broken diff is a false green." >&2
+          exit 1
+        fi
         echo "diff vs $(git rev-parse --short "$BASE") (merge-base with $BASE_REF)"
-        '{{.ROOT_DIR}}/tools/mutants_diff.sh' "$DIFF" '{{.MUTANTS_SCOPE | default "all"}}'
+        '{{.TASKFILE_DIR}}/../tools/mutants_diff.sh' "$DIFF" '{{.MUTANTS_SCOPE | default "all"}}'

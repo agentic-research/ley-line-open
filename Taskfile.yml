@@ -864,6 +864,17 @@ tasks:
     cmds:
       - tools/lint_blake3.sh
 
+  taskfile:anchors:fixture-test:
+    desc: |
+      Prove every included Taskfile's `dir:` resolves to the cargo workspace
+      from the repo root, from `rs/`, and from inside a package directory.
+
+      Both failure modes this defends against create a wrong directory and run
+      in it rather than erroring, so neither is visible from the repo root —
+      which is the only place CI ever invokes `task`.
+    cmds:
+      - tools/test_taskfile_anchors.sh
+
   lint:architecture-vocabulary:
     desc: Keep storage identity domains distinct in architecture documentation
     cmds:
@@ -1468,6 +1479,7 @@ tasks:
       - task: ci:attestation:fixture-test
       - task: ci:workflow-parity:fixture-test
       - task: mutants:diff:fixture-test
+      - task: taskfile:anchors:fixture-test
       - task: release:artifacts:fixture-test
       - task: release:publication:fixture-test
       - task: release:workflow:fixture-test

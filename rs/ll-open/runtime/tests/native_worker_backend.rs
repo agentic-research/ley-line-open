@@ -82,6 +82,31 @@ fn worker_exit_is_observable_and_run_root_is_removed() {
 }
 
 #[test]
+fn failed_worker_is_reported_and_cleaned() {
+    let fixture = TempDir::new().expect("fixture");
+    let (backend, runs) = backend(
+        &fixture,
+        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\nexit 7\n",
+    );
+    backend.start(&request()).expect("worker readiness");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let status = loop {
+        if let Some(status) = backend.poll("native-run-01").expect("poll") {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "worker did not finish");
+        std::thread::yield_now();
+    };
+    match status {
+        leyline_runtime::BackendRunStatus::Failed(error) => {
+            assert!(error.detail.contains("native worker exited"));
+        }
+        other => panic!("expected failed worker, got {other:?}"),
+    }
+    assert_eq!(fs::read_dir(runs).expect("runs").count(), 0);
+}
+
+#[test]
 fn cancel_kills_worker_and_removes_run_root() {
     let fixture = TempDir::new().expect("fixture");
     let (backend, runs) = backend(

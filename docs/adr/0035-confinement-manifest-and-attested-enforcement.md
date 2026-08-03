@@ -1,6 +1,6 @@
 # ADR-0035 — Confinement is one manifest; the enforcement mechanism is attested, not assumed
 
-**Status:** Proposed (2026-08-03)
+**Status:** Accepted (2026-08-03)
 **Bead:** `ley-line-open-da36d2`
 **Related:**
 - PR #312 review finding 2 (`confinementDigest` is on the wire and never enforced)
@@ -161,11 +161,19 @@ requests per-tree pid capping and the selected backend is native-macOS, authoriz
 one level up.
 
 **5. Delegation attenuates only, and the chain is checked.** A delegated grant may narrow
-what it conveys and never widen it. That needs three things: the grant unforgeable (a
-subject binding, and ultimately a signature — see the execution/v2 question), the chain
-verified through `actorProvenanceEvidence`, and a resolver that refuses widening — which
-is already structural via catalog equality. Until the first two land, composition is
-unsafe regardless of what the enforcement layers do.
+what it conveys and never widen it. That needs three things: the grant unforgeable, the
+chain verified through `actorProvenanceEvidence`, and a resolver that refuses widening —
+which is already structural via catalog equality.
+
+*Amended 2026-08-03 (PR #312).* The first requirement is met. This decision was drafted
+expecting the grant signature to cost an execution/v2, so it deferred to "a subject
+binding, and ultimately a signature — see the execution/v2 question". Both landed in v1
+instead: evidence now binds to a derived run identity, and `RunGrant.signature @14` covers
+`PAE(run-grant payload type, canonical(grant with signature cleared))`. execution/v1 had
+never shipped — 0 files on `origin/main`, 0 in the v0.14.0 tag — so the amendment was free
+where a released v1 would have forced a new `<v>` directory. There is no execution/v2
+question outstanding for delegation; what remains is chain verification through
+`actorProvenanceEvidence`.
 
 **6. Multi-tenancy is Cloister's, and this ADR says so out loud.** One LLO daemon is one
 trust domain, with one catalog. Cloister runs a daemon per domain. A tenant dimension
@@ -174,10 +182,29 @@ to Cloister. This is recorded as a *decision* because today it is merely an *abs
 from a consumer's side those look identical — a consumer cannot tell "deliberately yours"
 from "nobody built it."
 
+*External corroboration (2026-08-03).* Memoria — an agent-memory layer with
+snapshot/branch/merge over MatrixOne — shipped the other shape first and migrated out of
+it. Their architecture note states the reason directly: Git-for-Data semantics do not hold
+in a shared database ("Git-for-Data 语义在共享库里不成立"). Rollback becomes inherently
+global, snapshots capture other users' state, and branch/diff filtered in the application
+layer is "a patch, not isolation". They moved to one database per user, and describe the
+benefit as scoping snapshot/branch/restore/rollback rather than making queries faster. The
+rule generalizes past databases: **the version-control boundary and the isolation boundary
+must be the same boundary.** Their cost list is the forewarning for us — per-boundary
+isolation multiplied object counts and broke naive global aggregation badly enough that
+`/metrics` had to become a shared-DB summary with async refresh. If Cloister runs a daemon
+per trust domain, that observability bill is ours too. See
+`ley-line/docs/prior-art/memoria.md`.
+
 **7. Bind the evidence before building layer 3.** Per-workspace isolation inside the guest
 can only enforce a separation that authorization actually decided. Layer 3 over a
 forgeable authority would be isolation at the wrong altitude: precise enforcement of an
 untrustworthy decision. Order is evidence binding → layer 3.
+
+*Amended 2026-08-03 (PR #312).* This precondition is satisfied. Evidence binding shipped:
+a statement authorizes a given `RunGrant` field only if it carries an in-toto subject
+named for that field whose `digest["blake3"]` is the derived run identity, so one trusted
+envelope can no longer satisfy all three evidence references. Layer 3 is unblocked.
 
 **8. confinement/v1 gains a JSON Schema — JSON-Schema-first, not capnp.** The
 `confinementDigest` is defined over canonical JSON (§6: UTF-8, ASCII-sorted keys,
@@ -240,6 +267,33 @@ than requiring every future call site to re-derive kill-before-reap.
   and Landlock present in the guest's LSM list. libkrunfw is a minimal kernel; this must be
   verified before layer 3 is committed to, and if absent, the fallback is seccomp inside
   the guest or a libkrunfw configuration change.
+
+  *Still open (2026-08-03).* Not answerable from a dev machine without the artifact —
+  libkrunfw is not installed here, and `runtime/tests/libkrun_*.rs` are `#[ignore]`-gated
+  on exactly that. Two things would settle it: grep the libkrunfw kernel config for
+  `CONFIG_SECURITY_LANDLOCK`, or boot a guest and read `/sys/kernel/security/lsm`. The
+  second is authoritative — a compiled-in LSM still has to be in the active list.
+
 - **Does confinement/v1's manifest shape reconcile with nono's `CapabilityManifest`?**
   If they are close, §1's `TryFrom` is direct; if they diverge, LLO owns a mapping and
   should document why rather than silently maintaining two shapes.
+
+  *Answered 2026-08-03 — close, with one deliberate divergence.* nono 0.71's
+  `CapabilityManifest` is generated from `schema/capability-manifest.schema.json` via
+  typify, and that JSON Schema is stated as the source of truth — the same
+  JSON-Schema-first shape §8 chose independently, so §8 is matching its dependency rather
+  than inventing. Top-level keys are `credentials, filesystem, network, process,
+  resources, rollback, version`, which line up with §2's `fs.allow`,
+  `network.allowHosts` and `credentialSource`. `TryFrom<&CapabilityManifest> for
+  CapabilitySet` exists at `src/manifest_convert.rs:21`, so §1's conversion is real code,
+  not a hope.
+
+  The divergence is `resources`, and it is intentional. nono's covers memory and max
+  processes only, and its own schema says they are "enforced by the supervisor. Requires
+  `exec_strategy: \"supervised\"`" — confirming §1's finding that nono does not enforce
+  resource limits on the library path LLO uses. §2 conforms `resources` to OCI
+  `linux.resources`, which is strictly wider. So the mapping is total in one direction
+  only: every nono resource has an OCI counterpart, and OCI dimensions nono cannot enforce
+  have none. That asymmetry is not a defect to paper over — it is the exact input to §4,
+  which requires a ceiling the selected tier cannot enforce to be a **rejection**. The
+  empty cells are now enumerable rather than hypothetical.

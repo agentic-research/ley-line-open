@@ -205,7 +205,7 @@ impl<B: Backend> ExecutionService<B> {
         resolver: &R,
     ) -> Result<RunRecord, ExecutionError> {
         if !self.is_provisioned() {
-            return Err(ExecutionError::unsupported(
+            return Err(ExecutionError::not_provisioned(
                 "execution backend must be explicitly provisioned before start",
             ));
         }

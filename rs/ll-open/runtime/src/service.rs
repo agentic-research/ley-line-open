@@ -63,6 +63,11 @@ pub trait Backend: Send + Sync + 'static {
 struct ServiceState {
     runs: HashMap<String, RunRecord>,
     replay: HashMap<String, String>,
+    /// Run identities reserved while the backend performs startup.  Backend
+    /// startup may materialize a rootfs or wait for worker readiness, so it
+    /// must not happen while the lifecycle state lock is held.  Reservations
+    /// preserve run-id/replay-key uniqueness during that lock-free interval.
+    starting: HashMap<String, String>,
     events: HashMap<String, Vec<RunEventRecord>>,
     receipts: HashMap<String, ReceiptContext>,
     provisioned: bool,
@@ -148,34 +153,69 @@ impl<B: Backend> ExecutionService<B> {
     pub fn start(&self, request: ExecutionRequest) -> Result<RunRecord, ExecutionError> {
         request.validate()?;
 
-        let mut state = self.state.write();
-        if let Some(run_id) = state.replay.get(&request.replay_key) {
-            return state
-                .runs
-                .get(run_id)
-                .cloned()
-                .ok_or_else(|| ExecutionError {
-                    code: crate::ErrorCode::Internal,
-                    retryable: false,
-                    detail: "replay index references a missing run".into(),
+        {
+            let mut state = self.state.write();
+            if let Some(run_id) = state.replay.get(&request.replay_key) {
+                return state
+                    .runs
+                    .get(run_id)
+                    .cloned()
+                    .ok_or_else(|| ExecutionError {
+                        code: crate::ErrorCode::Internal,
+                        retryable: false,
+                        detail: "replay index references a missing run".into(),
+                    });
+            }
+
+            if state
+                .starting
+                .values()
+                .any(|replay| replay == &request.replay_key)
+            {
+                return Err(ExecutionError {
+                    code: crate::ErrorCode::ResourceConflict,
+                    retryable: true,
+                    detail: format!("replay key is already starting: {}", request.replay_key),
                 });
+            }
+            if state.runs.contains_key(&request.run_id) {
+                return Err(ExecutionError {
+                    code: crate::ErrorCode::ResourceConflict,
+                    retryable: false,
+                    detail: format!("run_id already exists: {}", request.run_id),
+                });
+            }
+            if state.starting.contains_key(&request.run_id) {
+                return Err(ExecutionError {
+                    code: crate::ErrorCode::ResourceConflict,
+                    retryable: true,
+                    detail: format!("run_id is already starting: {}", request.run_id),
+                });
+            }
+            state
+                .starting
+                .insert(request.run_id.clone(), request.replay_key.clone());
         }
 
-        if state.runs.contains_key(&request.run_id) {
-            return Err(ExecutionError {
-                code: crate::ErrorCode::ResourceConflict,
-                retryable: false,
-                detail: format!("run_id already exists: {}", request.run_id),
-            });
-        }
-
-        let started = self.backend.start(&request)?;
+        // Rootfs materialization and worker readiness are deliberately outside
+        // the service lock.  The reservation above keeps identity uniqueness
+        // intact while allowing status/inspect/cancel for other runs to make
+        // progress.
+        let started = match self.backend.start(&request) {
+            Ok(started) => started,
+            Err(error) => {
+                self.state.write().starting.remove(&request.run_id);
+                return Err(error);
+            }
+        };
         let record = RunRecord {
             run_id: request.run_id.clone(),
             replay_key: request.replay_key.clone(),
             state: RunState::Running,
             backend_id: started.backend_id,
         };
+        let mut state = self.state.write();
+        state.starting.remove(&request.run_id);
         state
             .replay
             .insert(request.replay_key, request.run_id.clone());

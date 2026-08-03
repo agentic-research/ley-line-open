@@ -196,6 +196,18 @@ isolation multiplied object counts and broke naive global aggregation badly enou
 per trust domain, that observability bill is ours too. See
 `ley-line/docs/prior-art/memoria.md`.
 
+*Scope correction (2026-08-03).* Read plainly, "one daemon per trust domain" bounds the
+blast radius of a compromise to one domain — and that is true. It must not be read as
+defence in depth, because **the domain boundary is currently the only boundary.** Cloister
+confirmed it from their side: LLO appears in `cluster.toml` as `[inputs.llo]` with a
+`serviceBinding` and **no `[[bundles]]` entry**, so it has no `executionMode`, no
+confinement facet, and their lint Inv 13 cannot see it — it runs as a host process with
+zero confinement applied. Their calibration is worth carrying: only one of five declared
+bundles is `microvm`, so what cloister has is *declaration discipline* (ADR-0062 makes
+`process` an exemption from isolation rather than a peer of it) rather than broad
+isolation. LLO's gap is being absent from that ledger rather than permissive within it.
+Until §9 lands, "one domain" is the whole of the containment story.
+
 **7. Bind the evidence before building layer 3.** Per-workspace isolation inside the guest
 can only enforce a separation that authorization actually decided. Layer 3 over a
 forgeable authority would be isolation at the wrong altitude: precise enforcement of an
@@ -211,6 +223,80 @@ envelope can no longer satisfy all three evidence references. Layer 3 is unblock
 two-space indent, no trailing newline). A capnp IDL would be a *projection* beside a
 JSON-defined digest — two sources of truth for one signed surface. That is the same defect
 shape as PR #312 finding 10, where `run_id` hashed capnp framing instead of content.
+
+**9. The daemon is in the TCB by declaration, and that declaration is getting more
+expensive.** The execution design doc's threat model item 3 states it plainly: neither
+`libkrun` nor `nono` protects secrets from host root, a compromised hypervisor, or *a
+compromised LLO daemon*. That is a legitimate boundary — nothing defends against its own
+TCB — and the code matches: nono is applied in `backends/native.rs` and
+`backends/libkrun/confinement.rs` only, never to the daemon process.
+
+What has changed is the cost. The daemon owns the CAS root, is wire-reachable through
+`llo_execution_start` over a UDS, is the component that *applies* confinement (so a
+compromised one does not escape a sandbox — it decides there is not one), and once
+`ley-line-open-410921` lands it holds the trust root for the whole domain. "Out of scope"
+cost almost nothing when it held no keys.
+
+So the manifest of §1 applies to the daemon too: one manifest type, two consumers — the
+worker's policy and the daemon's own — both digest-pinned from one declaration. Its
+capability set is bounded and knowable: CAS root, arena, UDS, spawn. Self-confinement
+cannot stop a compromised daemon misusing what it legitimately holds, but it bounds
+lateral movement, so a parsing bug on the wire cannot reach `~/.ssh` or open arbitrary
+sockets.
+
+**10. The trust root is public key material, and the scheme that loads it is a
+confinement decision.** Verification keys need integrity and authenticity, not
+confidentiality. A vault buys secrecy we do not need and supplies integrity only because
+the vault is trusted anyway. Cloister reached the same conclusion independently:
+`INTERLACE_ROOT_PUBKEY` is an env var, deliberately not vaulted, resolved through one
+fail-closed resolver (their ADR-0053).
+
+**LLO consumes notme's `/.well-known/jwks.json`, not `/.well-known/ca-bundle.pem`.** notme
+publishes both from one Ed25519 authority; they are two projections of the same root.
+`jwks.json` is an Ed25519 JWK Set — raw public keys that map directly to
+`leyline_envelope::VerifyingKey`, carrying a `kid` in the form `sign/src/kid.rs` already
+computes (ADR-012's `SHA-256(SPKI DER)[:16]`). `ca-bundle.pem` is X.509, and consuming it
+would require chain validation and the x509-cert/sigstore/aws-lc-rs closure that cloister's
+own 2026-05-13 cycle (row 17.1) removed from the signing helper. The correct artifact is
+the one whose shape our verifier already speaks.
+
+The scheme then determines the daemon's capability grant, which is why this is a
+confinement decision rather than a configuration one:
+
+| Source | Daemon capability required |
+| --- | --- |
+| `file:///…` | one read-only path |
+| notme `jwks.json` over HTTPS | one outbound host, pinned |
+| `keychain://` / `secret-tool://` | Security-framework or D-Bus access |
+
+Widening from the first two to the third must appear *in the manifest*, digest-pinned,
+rather than as an invisible consequence of a config string.
+
+---
+
+## Identity, authority, interface — and the trust root, which is none of them
+
+Four things are routinely conflated because all four are "security". The first three are
+the normative three-lane mapping from the execution design doc:
+
+| Lane | Example | Meaning |
+| --- | --- | --- |
+| Signet grant | `urn:signet:cap:<action>:<resource>` | what the holder may do |
+| Interlace/WIMSE identity | `wimse://…` | which workload is acting |
+| Cloister interface | `cloister/<name>/v<n>` | which contract shape is requested |
+
+The fourth is **the trust root**, and it is orthogonal to all three: *which keys do I
+trust to sign assertions about any lane.* A `RunGrant` carries all four concerns at once —
+`capabilities` is lane 1, `workloadIdentityEvidence` is lane 2, the `schemaVersion` and
+capability `interface` are lane 3, and every signature over any of it verifies against the
+trust root. Mixing them produces specific, recognisable mistakes: reaching for a *vault*
+(a confidentiality tool) to hold a *public* trust root, or pulling an mTLS-shaped artifact
+into a DSSE-shaped verifier because both are "the notme cert thing".
+
+Repo ownership follows the same split. Signet owns capability grants; Interlace/notme owns
+workload identity and the authority that signs it; Cloister owns policy resolution and
+supplies the `EvidenceVerifier`; LLO owns none of them and verifies against what it is
+given. That is why `EvidenceVerifier` is a trait rather than an implementation.
 
 ---
 

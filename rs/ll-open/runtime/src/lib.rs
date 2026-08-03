@@ -13,7 +13,7 @@ pub mod transport;
 
 pub use error::{ErrorCode, ExecutionError};
 pub use model::{
-    BackendCapabilities, BackendClass, BackendRun, DigestRef, ExecutionRequest, ResourceLimits,
-    RunEventRecord, RunInspection, RunRecord, RunState,
+    BackendCapabilities, BackendClass, BackendRun, DigestRef, ExecutionRequest, ReceiptContext,
+    ResourceLimits, RunEventRecord, RunInspection, RunReceiptData, RunRecord, RunState,
 };
 pub use service::{Backend, ExecutionResolver, ExecutionService};

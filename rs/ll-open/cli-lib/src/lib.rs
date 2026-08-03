@@ -316,6 +316,22 @@ pub enum ExecutionCommands {
         #[arg(long, default_value_t = 0)]
         after_sequence: u64,
     },
+    /// Collect a terminal receipt for one run.
+    Collect {
+        #[arg(long)]
+        control: PathBuf,
+        #[arg(long)]
+        run_id: String,
+    },
+    /// Idempotently release one run's ephemeral resources.
+    Cleanup {
+        #[arg(long)]
+        control: PathBuf,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
     /// Start a signed execution/v1 spec and grant from JSON files.
     Start {
         #[arg(long)]
@@ -351,6 +367,14 @@ pub async fn run(cmd: Commands) -> Result<()> {
                 run_id,
                 after_sequence,
             } => cmd_execution::inspect(&control, &run_id, after_sequence).await,
+            ExecutionCommands::Collect { control, run_id } => {
+                cmd_execution::collect(&control, &run_id).await
+            }
+            ExecutionCommands::Cleanup {
+                control,
+                run_id,
+                idempotency_key,
+            } => cmd_execution::cleanup(&control, &run_id, idempotency_key.as_deref()).await,
             ExecutionCommands::Start {
                 control,
                 spec,

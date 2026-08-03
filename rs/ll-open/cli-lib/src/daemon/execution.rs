@@ -16,6 +16,8 @@ pub trait ExecutionHandler: Send + Sync {
     fn start(&self, input: &Value) -> Result<String>;
     fn status(&self, input: &Value) -> Result<String>;
     fn inspect(&self, input: &Value) -> Result<String>;
+    fn collect(&self, input: &Value) -> Result<String>;
+    fn cleanup(&self, input: &Value) -> Result<String>;
     fn cancel(&self, input: &Value) -> Result<String>;
 }
 
@@ -68,6 +70,14 @@ where
 
     fn inspect(&self, input: &Value) -> Result<String> {
         Ok(transport::inspect_json(&self.service, &input.to_string())?)
+    }
+
+    fn collect(&self, input: &Value) -> Result<String> {
+        Ok(transport::collect_json(&self.service, &input.to_string())?)
+    }
+
+    fn cleanup(&self, input: &Value) -> Result<String> {
+        Ok(transport::cleanup_json(&self.service, &input.to_string())?)
     }
 
     fn cancel(&self, input: &Value) -> Result<String> {

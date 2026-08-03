@@ -192,6 +192,11 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
             run_id,
             after_sequence,
         } => op_execution_inspect(ctx, run_id, after_sequence),
+        BaseRequest::LloExecutionCollect { run_id } => op_execution_collect(ctx, run_id),
+        BaseRequest::LloExecutionCleanup {
+            run_id,
+            idempotency_key,
+        } => op_execution_cleanup(ctx, run_id, idempotency_key),
         BaseRequest::LloExecutionCancel {
             run_id,
             idempotency_key,
@@ -237,6 +242,21 @@ fn op_execution_inspect(
     Ok(execution_handler(ctx)?.inspect(&json!({
         "runId": run_id,
         "afterSequence": after_sequence.unwrap_or(0),
+    }))?)
+}
+
+fn op_execution_collect(ctx: &DaemonContext, run_id: String) -> Result<String> {
+    Ok(execution_handler(ctx)?.collect(&json!({"runId": run_id}))?)
+}
+
+fn op_execution_cleanup(
+    ctx: &DaemonContext,
+    run_id: String,
+    idempotency_key: Option<String>,
+) -> Result<String> {
+    Ok(execution_handler(ctx)?.cleanup(&json!({
+        "runId": run_id,
+        "idempotencyKey": idempotency_key.unwrap_or_default(),
     }))?)
 }
 

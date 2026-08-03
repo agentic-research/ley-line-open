@@ -5,7 +5,9 @@ use leyline_runtime::authorization::{
     AuthorizationPolicy, EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION, authorize,
     canonical_digest,
 };
-use leyline_runtime::transport::{capabilities_json, start_json, status_json};
+use leyline_runtime::transport::{
+    capabilities_json, cleanup_json, collect_json, start_json, status_json,
+};
 use leyline_runtime::{
     Backend, BackendCapabilities, BackendClass, BackendRun, ExecutionError, ExecutionRequest,
     ExecutionResolver, ExecutionService, ResourceLimits,
@@ -284,4 +286,14 @@ fn json_adapter_uses_generated_input_and_output_shapes() {
     assert!(status.contains("test/1"));
     let capabilities = capabilities_json(&service).expect("capabilities JSON");
     assert!(capabilities.contains("cloister/execution/v1"));
+
+    let start_value: serde_json::Value = serde_json::from_str(&start).unwrap();
+    let run_id = start_value["runId"].as_str().unwrap();
+    service.cancel(run_id).expect("cancel for receipt");
+    let receipt = collect_json(&service, &json!({"runId": run_id}).to_string())
+        .expect("collect receipt JSON");
+    assert!(receipt.contains("eventLogRoot"));
+    let cleanup =
+        cleanup_json(&service, &json!({"runId": run_id}).to_string()).expect("cleanup JSON");
+    assert!(cleanup.contains("cleaned"));
 }

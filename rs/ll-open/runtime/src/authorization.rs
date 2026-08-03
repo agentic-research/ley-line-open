@@ -42,6 +42,7 @@ pub struct AuthorizedExecution {
     pub grant_id: String,
     pub replay_key: String,
     pub spec_digest: String,
+    pub grant_digest: String,
     pub confinement_digest: String,
     pub backend: BackendClass,
     pub allowed_egress: Vec<String>,
@@ -120,6 +121,7 @@ pub fn authorize(
     }
 
     let spec_digest = canonical_digest(spec_bytes)?;
+    let grant_digest = canonical_digest(grant_bytes)?;
     let bound_digest = read_digest(grant.get_run_spec_digest(), "RunGrant.runSpecDigest")?;
     if bound_digest != spec_digest {
         return Err(ExecutionError::invalid(
@@ -193,6 +195,7 @@ pub fn authorize(
         grant_id,
         replay_key,
         spec_digest,
+        grant_digest,
         confinement_digest,
         backend,
         allowed_egress,

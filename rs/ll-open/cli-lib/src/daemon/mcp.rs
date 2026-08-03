@@ -488,6 +488,26 @@ pub fn tool_registry() -> Vec<McpTool> {
             }),
         },
         McpTool {
+            name: "llo_execution_collect",
+            description: "Collect the terminal content-addressed receipt for one execution.",
+            schema: json!({
+                "type": "object",
+                "properties": {"runId": {"type": "string"}},
+                "required": ["runId"],
+                "additionalProperties": false
+            }),
+        },
+        McpTool {
+            name: "llo_execution_cleanup",
+            description: "Idempotently release one execution's ephemeral resources.",
+            schema: json!({
+                "type": "object",
+                "properties": {"runId": {"type": "string"}, "idempotencyKey": {"type": "string"}},
+                "required": ["runId"],
+                "additionalProperties": false
+            }),
+        },
+        McpTool {
             name: "llo_execution_cancel",
             description: "Cancel an active execution through LLO's shared lifecycle.",
             schema: json!({
@@ -641,6 +661,8 @@ pub fn cloister_groups() -> Vec<CloisterGroupDecl> {
             "llo_execution_start",
             "llo_execution_inspect",
             "llo_execution_cancel",
+            "llo_execution_collect",
+            "llo_execution_cleanup",
         ],
     });
 

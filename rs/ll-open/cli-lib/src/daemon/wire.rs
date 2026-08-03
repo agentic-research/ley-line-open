@@ -119,6 +119,8 @@ pub const BASE_OP_NAMES: &[&str] = &[
     "llo_execution_start",
     "llo_execution_inspect",
     "llo_execution_cancel",
+    "llo_execution_collect",
+    "llo_execution_cleanup",
 ];
 
 // ---------------------------------------------------------------------------
@@ -302,6 +304,18 @@ pub enum BaseRequest {
         run_id: String,
         #[serde(rename = "afterSequence", default)]
         after_sequence: Option<u64>,
+    },
+    /// Generated execution/v1 receipt collection input.
+    LloExecutionCollect {
+        #[serde(rename = "runId")]
+        run_id: String,
+    },
+    /// Generated execution/v1 cleanup input.
+    LloExecutionCleanup {
+        #[serde(rename = "runId")]
+        run_id: String,
+        #[serde(rename = "idempotencyKey", default)]
+        idempotency_key: Option<String>,
     },
     /// Generated execution/v1 cancellation input.
     LloExecutionCancel {

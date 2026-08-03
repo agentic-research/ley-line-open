@@ -145,6 +145,28 @@ pub struct RunInspection {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ReceiptContext {
+    pub run_spec_digest: String,
+    pub run_grant_digest: String,
+    pub confinement_digest: String,
+    pub backend_class: BackendClass,
+    pub input_roots: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunReceiptData {
+    pub run_id: String,
+    pub terminal_state: RunState,
+    pub event_log_root: String,
+    pub context: ReceiptContext,
+    pub backend_id: String,
+    pub started_at_unix_ms: u64,
+    pub completed_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RunRecord {
     pub run_id: String,
     pub replay_key: String,

@@ -66,6 +66,26 @@ pub async fn inspect(control: &Path, run_id: &str, after_sequence: u64) -> Resul
     .await
 }
 
+pub async fn collect(control: &Path, run_id: &str) -> Result<()> {
+    call(
+        control,
+        json!({"op": "llo_execution_collect", "runId": run_id}),
+    )
+    .await
+}
+
+pub async fn cleanup(control: &Path, run_id: &str, idempotency_key: Option<&str>) -> Result<()> {
+    call(
+        control,
+        json!({
+            "op": "llo_execution_cleanup",
+            "runId": run_id,
+            "idempotencyKey": idempotency_key.unwrap_or("")
+        }),
+    )
+    .await
+}
+
 pub async fn cancel(control: &Path, run_id: &str, idempotency_key: Option<&str>) -> Result<()> {
     call(
         control,

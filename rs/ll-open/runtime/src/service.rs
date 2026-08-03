@@ -4,8 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use parking_lot::RwLock;
 
 use crate::{
-    BackendCapabilities, BackendRun, ExecutionError, ExecutionRequest, RunEventRecord,
-    RunInspection, RunRecord, RunState,
+    BackendCapabilities, BackendRun, ExecutionError, ExecutionRequest, ReceiptContext,
+    RunEventRecord, RunInspection, RunReceiptData, RunRecord, RunState,
     authorization::{AuthorizationPolicy, AuthorizedExecution, authorize},
 };
 
@@ -42,6 +42,7 @@ struct ServiceState {
     runs: HashMap<String, RunRecord>,
     replay: HashMap<String, String>,
     events: HashMap<String, Vec<RunEventRecord>>,
+    receipts: HashMap<String, ReceiptContext>,
 }
 
 /// One lifecycle implementation used by every transport adapter.
@@ -168,7 +169,92 @@ impl<B: Backend> ExecutionService<B> {
                 "resolver changed the grant's allowed egress",
             ));
         }
-        self.start(request)
+        let record = self.start(request)?;
+        self.state.write().receipts.insert(
+            record.run_id.clone(),
+            ReceiptContext {
+                run_spec_digest: authorized.spec_digest,
+                run_grant_digest: authorized.grant_digest,
+                confinement_digest: authorized.confinement_digest,
+                backend_class: authorized.backend,
+                input_roots: authorized
+                    .intent
+                    .workspace_inputs
+                    .into_iter()
+                    .map(|workspace| workspace.graph_root)
+                    .collect(),
+            },
+        );
+        Ok(record)
+    }
+
+    /// Collect terminal evidence for one run. Collection is read-only; the
+    /// caller must explicitly request cleanup afterwards.
+    pub fn collect(&self, run_id: &str) -> Result<RunReceiptData, ExecutionError> {
+        let state = self.state.read();
+        let record = state
+            .runs
+            .get(run_id)
+            .ok_or_else(|| ExecutionError::invalid("run_id not found"))?;
+        if !matches!(
+            record.state,
+            RunState::Cancelled | RunState::Succeeded | RunState::Failed
+        ) {
+            return Err(ExecutionError::invalid(
+                "run is not terminal; cancel or await completion before collect",
+            ));
+        }
+        let events = state.events.get(run_id).cloned().unwrap_or_default();
+        let event_bytes = serde_json::to_vec(&events)
+            .map_err(|error| ExecutionError::internal(format!("encode event log: {error}")))?;
+        let context = state
+            .receipts
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| ExecutionError::invalid("run has no schema receipt context"))?;
+        let started_at_unix_ms = events.first().map_or(0, |event| event.timestamp_ms);
+        let completed_at_unix_ms = events
+            .last()
+            .map_or(started_at_unix_ms, |event| event.timestamp_ms);
+        Ok(RunReceiptData {
+            run_id: record.run_id.clone(),
+            terminal_state: record.state,
+            event_log_root: format!("blake3-256:{}", blake3::hash(&event_bytes).to_hex()),
+            backend_id: record.backend_id.clone(),
+            context,
+            started_at_unix_ms,
+            completed_at_unix_ms,
+        })
+    }
+
+    /// Idempotently release backend-owned resources and mark the lifecycle
+    /// cleaned. A worker that already exited is a successful cleanup result.
+    pub fn cleanup(&self, run_id: &str) -> Result<RunRecord, ExecutionError> {
+        let existing = self
+            .state
+            .read()
+            .runs
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| ExecutionError::invalid("run_id not found"))?;
+        if existing.state == RunState::Cleaned {
+            return Ok(existing);
+        }
+        let _ = self.backend.cancel(run_id)?;
+        let mut state = self.state.write();
+        let record = {
+            let record = state
+                .runs
+                .get_mut(run_id)
+                .ok_or_else(|| ExecutionError::internal("run disappeared during cleanup"))?;
+            record.state = RunState::Cleaned;
+            record.clone()
+        };
+        let events = state.events.entry(run_id.to_owned()).or_default();
+        let next = events.len() as u64 + 1;
+        events.push(event(next, RunState::Cleaning));
+        events.push(event(next + 1, RunState::Cleaned));
+        Ok(record)
     }
 
     /// Cancel one active run and return its terminal record.

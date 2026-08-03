@@ -164,6 +164,94 @@ pub fn inspect_json<B: crate::Backend>(
     encode_inspect(output_message)
 }
 
+pub fn collect_json<B: crate::Backend>(
+    service: &ExecutionService<B>,
+    input_json: &str,
+) -> Result<String, ExecutionError> {
+    let mut input_message = Builder::new_default();
+    let input = input_message.init_root::<execution_capnp::collect_input::Builder<'_>>();
+    capnp_json::from_json(input_json, input).map_err(|error| {
+        ExecutionError::invalid(format!("invalid execution collect input: {error}"))
+    })?;
+    let input = input_message
+        .get_root_as_reader::<execution_capnp::collect_input::Reader<'_>>()
+        .map_err(|error| ExecutionError::invalid(format!("invalid collect input root: {error}")))?;
+    let run_id = input
+        .get_run_id()
+        .map_err(|error| ExecutionError::invalid(format!("invalid collect runId: {error}")))?
+        .to_str()
+        .map_err(|error| ExecutionError::invalid(format!("collect runId is not UTF-8: {error}")))?;
+    let receipt_data = service.collect(run_id)?;
+    let mut output_message = Builder::new_default();
+    let mut output = output_message.init_root::<execution_capnp::collect_output::Builder<'_>>();
+    let mut receipt = output.reborrow().init_receipt();
+    receipt.set_schema_version("cloister/execution/v1");
+    receipt.set_run_id(&receipt_data.run_id);
+    receipt.set_terminal_state(to_schema_state(receipt_data.terminal_state));
+    set_digest(
+        receipt.reborrow().init_event_log_root(),
+        &receipt_data.event_log_root,
+    )?;
+    set_digest(
+        receipt.reborrow().init_run_spec_digest(),
+        &receipt_data.context.run_spec_digest,
+    )?;
+    set_digest(
+        receipt.reborrow().init_run_grant_digest(),
+        &receipt_data.context.run_grant_digest,
+    )?;
+    set_digest(
+        receipt.reborrow().init_confinement_digest(),
+        &receipt_data.context.confinement_digest,
+    )?;
+    let mut backend = receipt.reborrow().init_backend();
+    backend.set_backend_class(to_schema_backend(receipt_data.context.backend_class));
+    backend.set_backend_id(&receipt_data.backend_id);
+    let mut evidence = backend.reborrow().init_evidence();
+    evidence.set_media_type("application/vnd.leyline.backend-evidence");
+    set_digest(evidence.init_digest(), &receipt_data.event_log_root)?;
+    let mut roots = receipt
+        .reborrow()
+        .init_input_roots(receipt_data.context.input_roots.len() as u32);
+    for (index, root) in receipt_data.context.input_roots.iter().enumerate() {
+        set_digest(roots.reborrow().get(index as u32), root)?;
+    }
+    let mut usage = receipt.reborrow().init_usage();
+    usage.set_wall_time_ms(
+        receipt_data
+            .completed_at_unix_ms
+            .saturating_sub(receipt_data.started_at_unix_ms),
+    );
+    receipt.set_started_at_unix_ms(receipt_data.started_at_unix_ms);
+    receipt.set_completed_at_unix_ms(receipt_data.completed_at_unix_ms);
+    encode_collect(output_message)
+}
+
+pub fn cleanup_json<B: crate::Backend>(
+    service: &ExecutionService<B>,
+    input_json: &str,
+) -> Result<String, ExecutionError> {
+    let mut input_message = Builder::new_default();
+    let input = input_message.init_root::<execution_capnp::cleanup_input::Builder<'_>>();
+    capnp_json::from_json(input_json, input).map_err(|error| {
+        ExecutionError::invalid(format!("invalid execution cleanup input: {error}"))
+    })?;
+    let input = input_message
+        .get_root_as_reader::<execution_capnp::cleanup_input::Reader<'_>>()
+        .map_err(|error| ExecutionError::invalid(format!("invalid cleanup input root: {error}")))?;
+    let run_id = input
+        .get_run_id()
+        .map_err(|error| ExecutionError::invalid(format!("invalid cleanup runId: {error}")))?
+        .to_str()
+        .map_err(|error| ExecutionError::invalid(format!("cleanup runId is not UTF-8: {error}")))?;
+    let record = service.cleanup(run_id)?;
+    let mut output_message = Builder::new_default();
+    let mut output = output_message.init_root::<execution_capnp::cleanup_output::Builder<'_>>();
+    output.set_run_id(&record.run_id);
+    output.set_state(to_schema_state(record.state));
+    encode_cleanup(output_message)
+}
+
 fn serialize_root<T: capnp::traits::Owned>(
     reader: T::Reader<'_>,
 ) -> Result<Vec<u8>, ExecutionError> {
@@ -219,6 +307,22 @@ fn encode_inspect(message: Builder<HeapAllocator>) -> Result<String, ExecutionEr
         .map_err(|error| ExecutionError::internal(format!("encode inspect response: {error}")))
 }
 
+fn encode_collect(message: Builder<HeapAllocator>) -> Result<String, ExecutionError> {
+    let reader = message
+        .get_root_as_reader::<execution_capnp::collect_output::Reader<'_>>()
+        .map_err(|error| ExecutionError::internal(format!("read collect response: {error}")))?;
+    capnp_json::to_json(reader)
+        .map_err(|error| ExecutionError::internal(format!("encode collect response: {error}")))
+}
+
+fn encode_cleanup(message: Builder<HeapAllocator>) -> Result<String, ExecutionError> {
+    let reader = message
+        .get_root_as_reader::<execution_capnp::cleanup_output::Reader<'_>>()
+        .map_err(|error| ExecutionError::internal(format!("read cleanup response: {error}")))?;
+    capnp_json::to_json(reader)
+        .map_err(|error| ExecutionError::internal(format!("encode cleanup response: {error}")))
+}
+
 fn to_schema_state(state: RunState) -> execution_capnp::RunState {
     match state {
         RunState::Accepted => execution_capnp::RunState::Accepted,
@@ -231,4 +335,23 @@ fn to_schema_state(state: RunState) -> execution_capnp::RunState {
         RunState::Cleaning => execution_capnp::RunState::Cleaning,
         RunState::Cleaned => execution_capnp::RunState::Cleaned,
     }
+}
+
+fn to_schema_backend(class: crate::BackendClass) -> execution_capnp::BackendClass {
+    match class {
+        crate::BackendClass::Native => execution_capnp::BackendClass::Native,
+        crate::BackendClass::MicroVm => execution_capnp::BackendClass::MicroVm,
+    }
+}
+
+fn set_digest(
+    mut builder: execution_capnp::digest_ref::Builder<'_>,
+    value: &str,
+) -> Result<(), ExecutionError> {
+    let (algorithm, value) = value.split_once(':').ok_or_else(|| {
+        ExecutionError::internal("receipt digest is missing its algorithm prefix")
+    })?;
+    builder.set_algorithm(algorithm);
+    builder.set_value(value);
+    Ok(())
 }

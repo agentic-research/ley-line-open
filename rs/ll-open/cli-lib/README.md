@@ -54,4 +54,19 @@ The execution MCP definitions checked into
 artifact with fresh output, so changing the IDL requires regenerating it
 before the CLI can compile the drift-free registry.
 
+An embedding such as Cloister keeps policy and trust-root selection on its
+side, then uses the Rust client against the daemon socket:
+
+```rust
+let llo = leyline_cli_lib::daemon::client::ExecutionClient::new(socket);
+llo.provision("microVm", idempotency_key).await?;
+let response = llo.start(spec_json, grant_json).await?;
+```
+
+`spec_json` and `grant_json` must be the schema-bridge-generated
+`cloister/execution/v1` shapes. LLO resolves the authorized logical identities
+to private guest paths; the client never accepts host paths or a backend
+command. The compatibility provider remains a Cloister-side fallback until
+this provider path passes its parity gate.
+
 Both gates are load-bearing; `wire.rs` is hand-written (request enum + LSP args + intermediate plain data) and the response side is codegen'd at runtime by capnp-json from the typed `daemon.capnp` schema.

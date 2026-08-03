@@ -2,9 +2,10 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
+use leyline_core::ContentAddressed;
 
 use crate::{
-    BackendCapabilities, BackendRun, ExecutionError, ExecutionRequest, ReceiptContext,
+    BackendCapabilities, BackendRun, BackendRunStatus, ExecutionError, ExecutionRequest, ReceiptContext,
     RunEventRecord, RunInspection, RunReceiptData, RunRecord, RunState,
     authorization::{AuthorizationPolicy, AuthorizedExecution, authorize},
 };
@@ -42,6 +43,13 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Start one already validated execution.
     fn start(&self, request: &ExecutionRequest) -> Result<BackendRun, ExecutionError>;
+
+    /// Observe a worker that may have completed without an explicit cancel.
+    /// Backends that cannot report completion leave the result absent; the
+    /// service still preserves the explicit-cancel lifecycle for them.
+    fn poll(&self, _run_id: &str) -> Result<Option<BackendRunStatus>, ExecutionError> {
+        Ok(None)
+    }
 
     /// Cancel one active execution and release backend-owned resources.
     ///
@@ -106,6 +114,7 @@ impl<B: Backend> ExecutionService<B> {
     }
 
     pub fn status(&self, run_id: &str) -> Result<Option<RunRecord>, ExecutionError> {
+        self.refresh_run(run_id)?;
         Ok(self.state.read().runs.get(run_id).cloned())
     }
 
@@ -115,6 +124,7 @@ impl<B: Backend> ExecutionService<B> {
         run_id: &str,
         after_sequence: u64,
     ) -> Result<RunInspection, ExecutionError> {
+        self.refresh_run(run_id)?;
         let state = self.state.read();
         let record = state
             .runs
@@ -238,6 +248,7 @@ impl<B: Backend> ExecutionService<B> {
     /// Collect terminal evidence for one run. Collection is read-only; the
     /// caller must explicitly request cleanup afterwards.
     pub fn collect(&self, run_id: &str) -> Result<RunReceiptData, ExecutionError> {
+        self.refresh_run(run_id)?;
         let state = self.state.read();
         let record = state
             .runs
@@ -266,7 +277,7 @@ impl<B: Backend> ExecutionService<B> {
         Ok(RunReceiptData {
             run_id: record.run_id.clone(),
             terminal_state: record.state,
-            event_log_root: format!("blake3-256:{}", blake3::hash(&event_bytes).to_hex()),
+            event_log_root: format!("blake3-256:{}", event_bytes.hash()),
             backend_id: record.backend_id.clone(),
             context,
             started_at_unix_ms,
@@ -277,6 +288,7 @@ impl<B: Backend> ExecutionService<B> {
     /// Idempotently release backend-owned resources and mark the lifecycle
     /// cleaned. A worker that already exited is a successful cleanup result.
     pub fn cleanup(&self, run_id: &str) -> Result<RunRecord, ExecutionError> {
+        self.refresh_run(run_id)?;
         let existing = self
             .state
             .read()
@@ -342,6 +354,50 @@ impl<B: Backend> ExecutionService<B> {
             .or_default()
             .push(event(sequence, RunState::Cancelled));
         Ok(record)
+    }
+}
+
+impl<B: Backend> ExecutionService<B> {
+    /// Project one backend completion into the shared append-only lifecycle.
+    /// This is deliberately called by read paths, so UDS, CLI, and MCP all
+    /// observe the same terminal transition without a transport-specific
+    /// watcher or arbitrary polling sleeps.
+    fn refresh_run(&self, run_id: &str) -> Result<(), ExecutionError> {
+        let active = self
+            .state
+            .read()
+            .runs
+            .get(run_id)
+            .is_some_and(|record| matches!(record.state, RunState::Accepted | RunState::Provisioning | RunState::Ready | RunState::Running));
+        if !active {
+            return Ok(());
+        }
+        let Some(outcome) = self.backend.poll(run_id)? else {
+            return Ok(());
+        };
+        let terminal = match outcome {
+            BackendRunStatus::Succeeded => RunState::Succeeded,
+            BackendRunStatus::Failed(_) => RunState::Failed,
+        };
+        let mut state = self.state.write();
+        let record = state
+            .runs
+            .get_mut(run_id)
+            .ok_or_else(|| ExecutionError::internal("run disappeared during completion refresh"))?;
+        if !matches!(record.state, RunState::Accepted | RunState::Provisioning | RunState::Ready | RunState::Running) {
+            return Ok(());
+        }
+        record.state = terminal;
+        let sequence = state
+            .events
+            .get(run_id)
+            .map_or(1, |events| events.len() as u64 + 1);
+        state
+            .events
+            .entry(run_id.to_owned())
+            .or_default()
+            .push(event(sequence, terminal));
+        Ok(())
     }
 }
 

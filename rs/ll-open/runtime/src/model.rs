@@ -113,6 +113,15 @@ pub struct BackendRun {
     pub backend_id: String,
 }
 
+/// Terminal result observed by a backend supervisor.  The service projects
+/// this into the shared execution/v1 lifecycle and receipt stream instead of
+/// leaving a run permanently `Running` after its worker exits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendRunStatus {
+    Succeeded,
+    Failed(ExecutionError),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RunState {

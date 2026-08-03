@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use capnp::message::ReaderOptions;
+use leyline_core::ContentAddressed;
 use leyline_public_schema::execution_capnp;
 
 use crate::{BackendClass, ExecutionError};
@@ -181,7 +182,7 @@ pub fn authorize(
     run_id_material.extend_from_slice(spec_bytes);
     run_id_material.extend_from_slice(grant_id.as_bytes());
     run_id_material.extend_from_slice(replay_key.as_bytes());
-    let run_id = format!("run-{}", blake3::hash(&run_id_material).to_hex());
+    let run_id = format!("run-{}", run_id_material.hash());
 
     let allowed_egress = grant
         .get_allowed_egress()
@@ -244,7 +245,7 @@ pub fn canonical_digest(bytes: &[u8]) -> Result<String, ExecutionError> {
     })?;
     Ok(format!(
         "blake3-256:{}",
-        blake3::hash(capnp::Word::words_to_bytes(&canonical)).to_hex()
+        capnp::Word::words_to_bytes(&canonical).hash().to_string()
     ))
 }
 

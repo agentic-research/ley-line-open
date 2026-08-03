@@ -11,7 +11,8 @@ use parking_lot::Mutex;
 use tempfile::{Builder as TempDirBuilder, TempDir};
 
 use crate::{
-    Backend, BackendCapabilities, BackendClass, BackendRun, ExecutionError, ExecutionRequest,
+    Backend, BackendCapabilities, BackendClass, BackendRun, BackendRunStatus, ExecutionError,
+    ExecutionRequest,
 };
 
 use super::worker::WorkerEvent;
@@ -32,6 +33,7 @@ pub struct KrunWorkerBackend {
     start_lock: Mutex<()>,
     children: Arc<Mutex<HashMap<String, WorkerControl>>>,
     cleanup_errors: Arc<Mutex<Vec<ExecutionError>>>,
+    completed: Arc<Mutex<HashMap<String, BackendRunStatus>>>,
 }
 
 struct WorkerControl {
@@ -46,6 +48,7 @@ impl KrunWorkerBackend {
             start_lock: Mutex::new(()),
             children: Arc::new(Mutex::new(HashMap::new())),
             cleanup_errors: Arc::new(Mutex::new(Vec::new())),
+            completed: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -264,6 +267,7 @@ impl Backend for KrunWorkerBackend {
         );
         let children = Arc::clone(&self.children);
         let cleanup_errors = Arc::clone(&self.cleanup_errors);
+        let completed = Arc::clone(&self.completed);
         let deadline = Instant::now()
             .checked_add(Duration::from_millis(request.limits.wall_time_ms))
             .ok_or_else(|| ExecutionError::invalid("wall-clock limit is too large"))?;
@@ -272,12 +276,23 @@ impl Backend for KrunWorkerBackend {
             if let Err(error) = &result {
                 cleanup_errors.lock().push(error.clone());
             }
+            completed.lock().insert(
+                run_id.clone(),
+                match result.clone() {
+                    Ok(()) => BackendRunStatus::Succeeded,
+                    Err(error) => BackendRunStatus::Failed(error),
+                },
+            );
             let _ = finished_tx.send(result);
             children.lock().remove(&run_id);
         });
         Ok(BackendRun {
             backend_id: "libkrun/1".into(),
         })
+    }
+
+    fn poll(&self, run_id: &str) -> Result<Option<BackendRunStatus>, ExecutionError> {
+        Ok(self.completed.lock().remove(run_id))
     }
 
     fn cancel(&self, run_id: &str) -> Result<bool, ExecutionError> {

@@ -2,13 +2,40 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use leyline_runtime::{
-    Backend, BackendCapabilities, BackendClass, BackendRun, DigestRef, ErrorCode, ExecutionError,
-    ExecutionRequest, ExecutionService, ResourceLimits, RunState,
+    Backend, BackendCapabilities, BackendClass, BackendRun, BackendRunStatus, DigestRef,
+    ErrorCode, ExecutionError, ExecutionRequest, ExecutionService, ResourceLimits, RunState,
 };
 
 #[derive(Clone, Default)]
 struct RecordingBackend {
     calls: Arc<Mutex<Vec<&'static str>>>,
+}
+
+#[derive(Clone)]
+struct CompletingBackend;
+
+impl Backend for CompletingBackend {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            backend_id: "completing/1".into(),
+            backend_class: BackendClass::MicroVm,
+            available: true,
+        }
+    }
+
+    fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+        Ok(BackendRun {
+            backend_id: "completing/1".into(),
+        })
+    }
+
+    fn poll(&self, _run_id: &str) -> Result<Option<BackendRunStatus>, ExecutionError> {
+        Ok(Some(BackendRunStatus::Succeeded))
+    }
+
+    fn cancel(&self, _run_id: &str) -> Result<bool, ExecutionError> {
+        Ok(true)
+    }
 }
 
 impl RecordingBackend {
@@ -74,6 +101,21 @@ fn status_before_start_is_read_only() {
 
     assert_eq!(service.status("missing").expect("status"), None);
     assert!(backend.calls().is_empty());
+}
+
+#[test]
+fn status_projects_backend_completion_without_sleeping() {
+    let service = ExecutionService::new(CompletingBackend);
+    service.start(request("completion-replay")).expect("start");
+
+    let record = service
+        .status("run-01")
+        .expect("refresh status")
+        .expect("run record");
+    assert_eq!(record.state, RunState::Succeeded);
+
+    let inspection = service.inspect("run-01", 0).expect("inspect");
+    assert_eq!(inspection.events.last().expect("terminal event").state, RunState::Succeeded);
 }
 
 #[test]

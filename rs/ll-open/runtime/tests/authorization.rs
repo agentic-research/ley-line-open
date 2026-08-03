@@ -108,28 +108,53 @@ fn signed_evidence(
     leyline_envelope::Envelope::sign(&statement, signer).to_json_vec()
 }
 
-struct RejectEvidence;
+fn unauthenticated(detail: String) -> ExecutionError {
+    ExecutionError {
+        code: leyline_runtime::ErrorCode::Unauthenticated,
+        retryable: false,
+        detail,
+    }
+}
 
-impl EvidenceVerifier for RejectEvidence {
+/// Refuses evidence, accepts grants.
+///
+/// `authorize` runs two independent fail-closed gates — the grant signature
+/// first, then each evidence reference. A fixture that refuses both makes
+/// either gate sufficient to keep a test green, so a test named for one of
+/// them passes when only the *other* fires. These two fixtures isolate the
+/// gates so a name and its reason cannot drift apart.
+struct RejectEvidenceOnly;
+
+impl EvidenceVerifier for RejectEvidenceOnly {
     fn verify(
         &self,
         field: EvidenceField,
         _binding: &EvidenceBinding,
         _evidence: &EvidenceRef,
     ) -> Result<(), ExecutionError> {
-        Err(ExecutionError {
-            code: leyline_runtime::ErrorCode::Unauthenticated,
-            retryable: false,
-            detail: format!("unverified evidence: {field}"),
-        })
+        Err(unauthenticated(format!("unverified evidence: {field}")))
     }
 
     fn verify_grant(&self, _grant: &SignedGrant) -> Result<(), ExecutionError> {
-        Err(ExecutionError {
-            code: leyline_runtime::ErrorCode::Unauthenticated,
-            retryable: false,
-            detail: "unverified grant".into(),
-        })
+        Ok(())
+    }
+}
+
+/// Accepts evidence, refuses grants — the mirror of [`RejectEvidenceOnly`].
+struct RejectGrantOnly;
+
+impl EvidenceVerifier for RejectGrantOnly {
+    fn verify(
+        &self,
+        _field: EvidenceField,
+        _binding: &EvidenceBinding,
+        _evidence: &EvidenceRef,
+    ) -> Result<(), ExecutionError> {
+        Ok(())
+    }
+
+    fn verify_grant(&self, _grant: &SignedGrant) -> Result<(), ExecutionError> {
+        Err(unauthenticated("unverified grant signature".into()))
     }
 }
 
@@ -416,10 +441,92 @@ fn verifier_adapter_can_fail_closed_before_backend_resolution() {
             required_backend: BackendClass::MicroVm,
             required_confinement_digest: None,
         },
-        &RejectEvidence,
+        &RejectEvidenceOnly,
     )
     .expect_err("unverified upstream evidence must fail closed");
     assert_eq!(error.code, leyline_runtime::ErrorCode::Unauthenticated);
+    assert!(
+        error.detail.contains("issuerEvidence"),
+        "this test is named for the evidence gate; it must fail there: {}",
+        error.detail
+    );
+}
+
+/// The mirror: a trust domain that accepts the evidence but refuses to
+/// vouch for the grant's own fields must still fail closed.
+#[test]
+fn a_refused_grant_signature_alone_fails_closed() {
+    let spec = spec_bytes();
+    let grant = grant_bytes(&spec, true, 2_000, 0);
+    let error = leyline_runtime::authorization::authorize_with_verifier(
+        &spec,
+        &grant,
+        &AuthorizationPolicy {
+            now_unix_ms: Some(1_000),
+            required_backend: BackendClass::MicroVm,
+            required_confinement_digest: None,
+        },
+        &RejectGrantOnly,
+    )
+    .expect_err("a grant no issuer vouches for must fail closed");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::Unauthenticated);
+    assert!(
+        error.detail.contains("grant signature"),
+        "must fail at the grant gate: {}",
+        error.detail
+    );
+}
+
+/// `RejectUnverifiedEvidence` is what the shipped daemon installs unless the
+/// operator passes `--allow-unverified-evidence`. Both of its refusals are
+/// pinned here, individually: routing through `authorize` cannot distinguish
+/// them, because whichever gate runs first satisfies the assertion and the
+/// other is free to regress to `Ok(())` unnoticed.
+#[test]
+fn the_production_default_verifier_refuses_every_evidence_role() {
+    for field in [
+        EvidenceField::Issuer,
+        EvidenceField::WorkloadIdentity,
+        EvidenceField::ActorProvenance,
+    ] {
+        let error = leyline_runtime::RejectUnverifiedEvidence
+            .verify(
+                field,
+                &binding_for(&other_run_id()),
+                &EvidenceRef {
+                    media_type: "application/vnd.in-toto+json".into(),
+                    digest: format!("blake3-256:{}", "a".repeat(64)),
+                },
+            )
+            .expect_err("the production default must not verify anything");
+        assert_eq!(error.code, leyline_runtime::ErrorCode::Unauthenticated);
+        assert!(error.detail.contains(field.as_str()), "{}", error.detail);
+    }
+}
+
+#[test]
+fn the_production_default_verifier_refuses_every_grant() {
+    let error = leyline_runtime::RejectUnverifiedEvidence
+        .verify_grant(&SignedGrant {
+            signing_bytes: Vec::new(),
+            signature: None,
+        })
+        .expect_err("the production default must not vouch for a grant");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::Unauthenticated);
+    assert!(error.detail.contains("signature"), "{}", error.detail);
+}
+
+/// `current_unix_ms` is the seam that keeps grant expiry enforceable across a
+/// daemon's lifetime. Every expiry test in this file derives both its
+/// deadline and its comparison from this one call, so a constant would
+/// satisfy all of them while making expiry unenforced in production —
+/// exactly the frozen-clock defect the seam was introduced to fix.
+#[test]
+fn current_unix_ms_reads_a_real_wall_clock() {
+    assert!(
+        leyline_runtime::authorization::current_unix_ms() > 1_767_225_600_000,
+        "expiry needs a real clock, not a fixed value"
+    );
 }
 
 #[test]
@@ -437,6 +544,15 @@ fn default_authorization_fails_closed_without_embedding_trust() {
     )
     .expect_err("unsigned fixture evidence must not pass the production default");
     assert_eq!(error.code, leyline_runtime::ErrorCode::Unauthenticated);
+    // Both of the default's gates would refuse this grant, and the first one
+    // reached decides the message — so this asserts only that the entry point
+    // fails closed. Which gate refuses is pinned individually below, in
+    // `the_production_default_verifier_refuses_*`.
+    assert!(
+        error.detail.contains("no trusted verifier"),
+        "{}",
+        error.detail
+    );
 }
 
 /// A run identity that is well-formed but belongs to no fixture here.

@@ -33,12 +33,26 @@ pub(super) struct SupervisionLabels {
 }
 
 pub(super) fn configure_process_group(command: &mut Command) {
+    // SAFETY: the injected call is the async-signal-safe `setpgid` syscall;
+    // see `configure_process_group_with` for the `pre_exec` contract.
+    configure_process_group_with(command, || unsafe { libc::setpgid(0, 0) });
+}
+
+/// `configure_process_group` with the syscall injected.
+///
+/// The failure branch is unreachable from a test that can only call the real
+/// `setpgid`, which has no portable way to fail here — so it survived
+/// mutation as a branch nothing observes. Taking the syscall as a parameter
+/// makes "group setup failed at the OS boundary" a state a test can produce,
+/// which matters because that failure is what the fallback in
+/// [`terminate_process_group`] exists to cover.
+fn configure_process_group_with(command: &mut Command, setpgid: fn() -> libc::c_int) {
     // SAFETY: `pre_exec` runs in the child after fork and before exec. The
-    // callback performs only the async-signal-safe `setpgid` syscall and
+    // callback performs only the async-signal-safe syscall it is given and
     // allocates no Rust state.
     unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) == -1 {
+        command.pre_exec(move || {
+            if setpgid() == -1 {
                 Err(io::Error::last_os_error())
             } else {
                 Ok(())
@@ -70,26 +84,45 @@ pub(super) fn terminate_process_group(pid: u32) {
 /// and therefore the process-group id, allocated until someone actually reaps.
 /// That is what makes the subsequent group kill safe.
 fn await_exit_without_reaping(pid: u32) -> io::Result<()> {
+    retry_while_interrupted(|| observe_exit(pid))
+}
+
+/// One `waitid` observation of `pid`.
+fn observe_exit(pid: u32) -> io::Result<()> {
+    // SAFETY: `waitid` with `WNOWAIT` only observes; it does not consume the
+    // child. `info` is written by the kernel and never read here.
+    let rc = unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Retry `observe` while the kernel reports `EINTR`, propagating every other
+/// error.
+///
+/// Split out from the syscall so the retry rule is testable: a signal
+/// arriving mid-`waitid` is not something a test can schedule, so as one
+/// inlined loop this branch was unobservable — invert the `EINTR` check and
+/// nothing failed. The two ways to get it wrong have opposite failure modes
+/// and both are covered below: treating `EINTR` as fatal aborts a healthy
+/// wait, and treating a real error as `EINTR` spins forever.
+fn retry_while_interrupted(mut observe: impl FnMut() -> io::Result<()>) -> io::Result<()> {
     loop {
-        // SAFETY: `waitid` with `WNOWAIT` only observes; it does not consume
-        // the child. `info` is written by the kernel and never read here.
-        let rc = unsafe {
-            let mut info: libc::siginfo_t = std::mem::zeroed();
-            libc::waitid(
-                libc::P_PID,
-                pid as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOWAIT,
-            )
-        };
-        if rc == 0 {
-            return Ok(());
+        match observe() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
         }
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
-        return Err(error);
     }
 }
 
@@ -396,16 +429,19 @@ pub(super) fn make_tree_removable(
 mod tests {
     use super::{
         SupervisionLabels, WorkerProcess, await_exit_without_reaping, cleanup_tempdir,
-        configure_process_group, finish_failed_start, make_tree_removable, read_readiness_line,
-        supervise_worker,
+        configure_process_group, configure_process_group_with, finish_failed_start,
+        make_tree_removable, read_readiness_line, retry_while_interrupted, supervise_worker,
+        terminate_process_group,
     };
     use crate::ExecutionError;
     use std::fs;
+    use std::io;
     use std::io::{BufRead, BufReader, Cursor, Read};
     use std::os::unix::fs::PermissionsExt;
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+    use wait_timeout::ChildExt;
 
     const LABELS: SupervisionLabels = SupervisionLabels {
         worker: "test worker",
@@ -436,6 +472,98 @@ mod tests {
             child.wait().expect("reap").code(),
             Some(3),
             "the status must survive to the real reap"
+        );
+    }
+
+    /// Group setup failing at the OS boundary must fail the spawn, not be
+    /// swallowed into a worker silently sharing its parent's group.
+    ///
+    /// A worker in the parent's group is the dangerous shape: the supervisor
+    /// believes it owns a group it does not, and the guarantee that every
+    /// terminal path reaps the *whole* group quietly degrades to reaping one
+    /// process. Real `setpgid(0, 0)` has no portable way to fail here, so the
+    /// syscall is injected.
+    #[test]
+    fn a_worker_whose_process_group_cannot_be_established_never_starts() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        configure_process_group_with(&mut command, || -1);
+
+        let spawned = command.spawn();
+        assert!(
+            spawned.is_err(),
+            "a worker that could not be placed in its own process group must \
+             not start — the supervisor would otherwise reap only part of it"
+        );
+    }
+
+    /// `EINTR` is a retry, not a failure: a signal arriving mid-`waitid` must
+    /// not abort a healthy wait.
+    #[test]
+    fn an_interrupted_observation_is_retried_rather_than_reported() {
+        let mut attempts = 0;
+        let result = retry_while_interrupted(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(io::Error::from(io::ErrorKind::Interrupted))
+            } else {
+                Ok(())
+            }
+        });
+
+        result.expect("an interrupted wait must resume, not fail");
+        assert_eq!(
+            attempts, 3,
+            "each interruption must be retried exactly once"
+        );
+    }
+
+    /// The other direction: a real error must propagate. Treating it as an
+    /// interruption would spin forever on a wait that can never succeed.
+    #[test]
+    fn a_non_interrupt_error_propagates_instead_of_spinning() {
+        let mut attempts = 0;
+        let error = retry_while_interrupted(|| {
+            attempts += 1;
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        })
+        .expect_err("a non-interrupt error must be reported");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(attempts, 1, "a fatal error must not be retried");
+    }
+
+    /// The direct-pid fallback, proved by denying it the group it falls back
+    /// from.
+    ///
+    /// This child is spawned **without** `configure_process_group`, so it
+    /// stays in the test runner's group and no process group carries its pid
+    /// as an id. `kill(-pid)` therefore fails with ESRCH and only the
+    /// fallback can reach it. That makes the group kill's error check the
+    /// entire subject of this test: invert it, or make it never match, and
+    /// this child outlives the call.
+    ///
+    /// The comment on `terminate_process_group` claims the fallback "still
+    /// reaps a worker if group setup failed at the OS boundary". Nothing
+    /// proved that until here — every other test in this module configures
+    /// the group first, so they all exercise the success path.
+    #[test]
+    fn terminating_a_worker_with_no_group_of_its_own_falls_back_to_the_pid() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn long-lived fixture");
+        let pid = child.id();
+
+        terminate_process_group(pid);
+
+        let status = child
+            .wait_timeout(Duration::from_secs(5))
+            .expect("wait on the fixture");
+        assert!(
+            status.is_some(),
+            "the direct-pid fallback must reap a worker that has no process \
+             group of its own; without it this child sleeps out the timeout"
         );
     }
 

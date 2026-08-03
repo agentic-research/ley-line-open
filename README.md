@@ -76,11 +76,14 @@ task runtime:test        # embedded libkrun runtime contract tests (fake worker)
 ### Embedded execution runtime
 
 The experimental `leyline-runtime` crate owns the execution/v1 lifecycle and
-the embedded `libkrun` backend. It verifies a content-addressed rootfs, copies
-it into a private per-run userspace volume, and applies `nono` to the
-first-party worker before entering the microVM. The worker path does not invoke
+the first-party `libkrun` and native-`nono` worker backends. Both verify a
+content-addressed rootfs and copy it into a private per-run userspace volume;
+the native backend applies `nono` before launching the guest-relative
+executable, while the libkrun backend enters a microVM. Neither worker invokes
 `krunvm`, Taskfile, or repository scripts. The immutable CAS source remains
-outside the guest's writable boundary.
+outside the guest's writable boundary. Embedders select a backend explicitly
+when constructing `run_execution_daemon`; the ordinary daemon remains backend-
+free for compatibility.
 
 The portable runtime tests use a fake worker and do not require libkrun or
 Hypervisor.framework. The real Apple Silicon guest-write proof is ignored by
@@ -99,9 +102,9 @@ substrate daemon with no execution backend; an embedding application must opt
 into `run_execution_daemon` after constructing a trusted resolver/backend
 handler. The service currently proves authorization,
 provisioning, ordered lifecycle events, cancellation, cleanup, and
-content-addressed receipt assembly. Native nono execution and mmap-backed CAS
-projection remain separate follow-on gates in beads `ley-line-open-f81567` and
-`ley-line-open-16c953`.
+content-addressed receipt assembly. Native backend conformance and mmap-backed
+CAS projection remain separate follow-on gates in beads
+`ley-line-open-f81567` and `ley-line-open-16c953`.
 
 Mutation testing remains a separate hardening pass: use the repository's
 `task mutants:diff DIFF=<path>` gate after the runtime edge-case tests are
@@ -186,7 +189,7 @@ example `-p 127.0.0.1:18384:8384`) unless an authenticated proxy is in front.
 - `rs/ll-open/lsp` — language-server enrichment.
 - `rs/ll-open/fs` — SQLite graph, arena reader, CDC, FFI, and mount adapters.
 - `rs/ll-open/runtime` — execution/v1 lifecycle, private rootfs materialization,
-  nono confinement, and the embedded libkrun worker backend.
+  native nono and embedded libkrun worker backends, and confinement policy.
 - `rs/ll-open/cli-lib` — daemon lifecycle and UDS/MCP dispatch.
 - `clients/go/leyline-schema` — generated Go contract bindings.
 - `docs/ARCHITECTURE.md` — normative vocabulary, ownership, and the authority

@@ -197,6 +197,9 @@ pub fn inspect_json<B: crate::Backend>(
         entry.set_run_id(&inspection.run_id);
         entry.set_state(to_schema_state(event.state));
         entry.set_timestamp_ms(event.timestamp_ms);
+        if let Some(detail_digest) = &event.detail_digest {
+            set_digest(entry.init_detail_digest(), detail_digest)?;
+        }
     }
     encode_inspect(output_message)
 }

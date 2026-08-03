@@ -14,6 +14,9 @@ struct RecordingBackend {
 #[derive(Clone)]
 struct CompletingBackend;
 
+#[derive(Clone)]
+struct FailingBackend;
+
 impl Backend for CompletingBackend {
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
@@ -31,6 +34,34 @@ impl Backend for CompletingBackend {
 
     fn poll(&self, _run_id: &str) -> Result<Option<BackendRunStatus>, ExecutionError> {
         Ok(Some(BackendRunStatus::Succeeded))
+    }
+
+    fn cancel(&self, _run_id: &str) -> Result<bool, ExecutionError> {
+        Ok(true)
+    }
+}
+
+impl Backend for FailingBackend {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            backend_id: "failing/1".into(),
+            backend_class: BackendClass::MicroVm,
+            available: true,
+        }
+    }
+
+    fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+        Ok(BackendRun {
+            backend_id: "failing/1".into(),
+        })
+    }
+
+    fn poll(&self, _run_id: &str) -> Result<Option<BackendRunStatus>, ExecutionError> {
+        Ok(Some(BackendRunStatus::Failed(ExecutionError {
+            code: ErrorCode::BackendFailed,
+            retryable: false,
+            detail: "guest exited with status 127".into(),
+        })))
     }
 
     fn cancel(&self, _run_id: &str) -> Result<bool, ExecutionError> {
@@ -118,6 +149,24 @@ fn status_projects_backend_completion_without_sleeping() {
     assert_eq!(
         inspection.events.last().expect("terminal event").state,
         RunState::Succeeded
+    );
+}
+
+#[test]
+fn failed_completion_preserves_content_addressed_detail_on_event() {
+    let service = ExecutionService::new(FailingBackend);
+    service.start(request("failure-detail")).expect("start");
+
+    let inspection = service.inspect("run-01", 0).expect("inspect");
+    let terminal = inspection.events.last().expect("terminal event");
+    assert_eq!(terminal.state, RunState::Failed);
+    let detail = terminal
+        .detail_digest
+        .as_deref()
+        .expect("failure detail digest");
+    assert!(
+        detail.starts_with("blake3-256:"),
+        "unexpected digest: {detail}"
     );
 }
 

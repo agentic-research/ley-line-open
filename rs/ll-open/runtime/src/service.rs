@@ -375,9 +375,21 @@ impl<B: Backend> ExecutionService<B> {
         let Some(outcome) = self.backend.poll(run_id)? else {
             return Ok(());
         };
-        let terminal = match outcome {
-            BackendRunStatus::Succeeded => RunState::Succeeded,
-            BackendRunStatus::Failed(_) => RunState::Failed,
+        let (terminal, detail_digest) = match outcome {
+            BackendRunStatus::Succeeded => (RunState::Succeeded, None),
+            BackendRunStatus::Failed(error) => (
+                RunState::Failed,
+                Some(format!(
+                    "blake3-256:{}",
+                    serde_json::to_vec(&error)
+                        .map_err(|encode| {
+                            ExecutionError::internal(format!(
+                                "encode backend failure detail: {encode}"
+                            ))
+                        })?
+                        .hash()
+                )),
+            ),
         };
         let mut state = self.state.write();
         let record = state
@@ -399,12 +411,20 @@ impl<B: Backend> ExecutionService<B> {
             .events
             .entry(run_id.to_owned())
             .or_default()
-            .push(event(sequence, terminal));
+            .push(event_with_detail(sequence, terminal, detail_digest));
         Ok(())
     }
 }
 
 fn event(sequence: u64, state: RunState) -> RunEventRecord {
+    event_with_detail(sequence, state, None)
+}
+
+fn event_with_detail(
+    sequence: u64,
+    state: RunState,
+    detail_digest: Option<String>,
+) -> RunEventRecord {
     RunEventRecord {
         sequence,
         state,
@@ -412,5 +432,6 @@ fn event(sequence: u64, state: RunState) -> RunEventRecord {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64,
+        detail_digest,
     }
 }

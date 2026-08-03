@@ -142,6 +142,10 @@ pub struct RunEventRecord {
     pub sequence: u64,
     pub state: RunState,
     pub timestamp_ms: u64,
+    /// Content-addressed diagnostic detail for terminal failures.
+    /// The detail itself is kept out of the lifecycle stream; consumers can
+    /// resolve the digest through the attested evidence store.
+    pub detail_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -102,6 +102,8 @@ pub fn authorize(
     )?;
     let confinement_digest =
         read_digest(grant.get_confinement_digest(), "RunGrant.confinementDigest")?;
+    validate_limits(spec.get_requested_limits(), grant.get_limits())?;
+    validate_workspaces(spec.get_workspace_inputs(), grant.get_workspaces())?;
 
     let mut has_execution_capability = false;
     let capabilities = grant
@@ -237,5 +239,90 @@ fn validate_evidence(
         field,
     )?;
     let _ = read_digest(evidence.get_digest(), &format!("{field}.digest"))?;
+    Ok(())
+}
+
+fn validate_limits(
+    requested: capnp::Result<execution_capnp::resource_limits::Reader<'_>>,
+    resolved: capnp::Result<execution_capnp::resource_limits::Reader<'_>>,
+) -> Result<(), ExecutionError> {
+    let requested = requested
+        .map_err(|error| ExecutionError::invalid(format!("invalid requestedLimits: {error}")))?;
+    let resolved = resolved
+        .map_err(|error| ExecutionError::invalid(format!("invalid grant limits: {error}")))?;
+    for (name, requested, resolved) in [
+        (
+            "wallTimeMs",
+            requested.get_wall_time_ms(),
+            resolved.get_wall_time_ms(),
+        ),
+        (
+            "memoryBytes",
+            requested.get_memory_bytes(),
+            resolved.get_memory_bytes(),
+        ),
+        (
+            "cpuMillis",
+            requested.get_cpu_millis(),
+            resolved.get_cpu_millis(),
+        ),
+        (
+            "outputBytes",
+            requested.get_output_bytes(),
+            resolved.get_output_bytes(),
+        ),
+    ] {
+        if requested != 0 && (resolved == 0 || resolved > requested) {
+            return Err(ExecutionError::invalid(format!(
+                "grant limit {name} widens the requested limit"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_workspaces(
+    requested: capnp::Result<
+        capnp::struct_list::Reader<'_, execution_capnp::workspace_intent::Owned>,
+    >,
+    resolved: capnp::Result<
+        capnp::struct_list::Reader<'_, execution_capnp::workspace_grant::Owned>,
+    >,
+) -> Result<(), ExecutionError> {
+    let requested = requested
+        .map_err(|error| ExecutionError::invalid(format!("invalid workspaceInputs: {error}")))?;
+    let resolved = resolved
+        .map_err(|error| ExecutionError::invalid(format!("invalid grant workspaces: {error}")))?;
+    let requested = requested
+        .iter()
+        .map(|workspace| {
+            Ok((
+                text(workspace.get_name(), "workspaceInputs.name")?,
+                read_digest(workspace.get_graph_root(), "workspaceInputs.graphRoot")?,
+            ))
+        })
+        .collect::<Result<Vec<_>, ExecutionError>>()?;
+    let resolved = resolved
+        .iter()
+        .map(|workspace| {
+            let name = text(workspace.get_name(), "grant workspace name")?;
+            let graph_root = read_digest(workspace.get_graph_root(), "grant workspace graphRoot")?;
+            let operations = workspace.get_operations().map_err(|error| {
+                ExecutionError::invalid(format!("invalid operations for {name}: {error}"))
+            })?;
+            if operations.len() == 0 {
+                return Err(ExecutionError::invalid(format!(
+                    "grant workspace {name} has no authorized operations"
+                )));
+            }
+            Ok((name, graph_root))
+        })
+        .collect::<Result<Vec<_>, ExecutionError>>()?;
+
+    if resolved.iter().any(|entry| !requested.contains(entry)) {
+        return Err(ExecutionError::invalid(
+            "grant workspace authority is not present in RunSpec.workspaceInputs",
+        ));
+    }
     Ok(())
 }

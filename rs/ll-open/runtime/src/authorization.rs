@@ -245,7 +245,7 @@ pub fn canonical_digest(bytes: &[u8]) -> Result<String, ExecutionError> {
     })?;
     Ok(format!(
         "blake3-256:{}",
-        capnp::Word::words_to_bytes(&canonical).hash().to_string()
+        capnp::Word::words_to_bytes(&canonical).hash()
     ))
 }
 
@@ -416,7 +416,7 @@ fn validate_workspaces(
             let operations = workspace.get_operations().map_err(|error| {
                 ExecutionError::invalid(format!("invalid operations for {name}: {error}"))
             })?;
-            if operations.len() == 0 {
+            if operations.is_empty() {
                 return Err(ExecutionError::invalid(format!(
                     "grant workspace {name} has no authorized operations"
                 )));

@@ -1,5 +1,7 @@
 //! UDS listener that dispatches ops to the event router, base ops, and extension.
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -41,6 +43,12 @@ pub fn spawn(ctx: Arc<DaemonContext>, sock_path: PathBuf) -> PathBuf {
 
     // Bind the listener synchronously so the path is ready on return.
     let listener = UnixListener::bind(&sock_path).expect("bind UDS socket");
+    // A control socket is a filesystem capability: the path itself grants
+    // access to every daemon operation. Never inherit a permissive umask.
+    // MCP's UDS transport applies the same owner-only boundary.
+    #[cfg(unix)]
+    std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))
+        .expect("restrict UDS socket to owner-only permissions");
 
     // Symlink to ~/.mache/default.sock for auto-discovery.
     // Skip if sock_path is already at the default location (avoids self-referencing symlink).

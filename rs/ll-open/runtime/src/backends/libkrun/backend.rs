@@ -7,7 +7,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use tempfile::{Builder as TempDirBuilder, TempDir};
 
 use crate::{
@@ -34,6 +34,7 @@ pub struct KrunWorkerBackend {
     children: Arc<Mutex<HashMap<String, WorkerControl>>>,
     cleanup_errors: Arc<Mutex<Vec<ExecutionError>>>,
     completed: Arc<Mutex<HashMap<String, BackendRunStatus>>>,
+    completion_cv: Arc<Condvar>,
 }
 
 struct WorkerControl {
@@ -49,6 +50,7 @@ impl KrunWorkerBackend {
             children: Arc::new(Mutex::new(HashMap::new())),
             cleanup_errors: Arc::new(Mutex::new(Vec::new())),
             completed: Arc::new(Mutex::new(HashMap::new())),
+            completion_cv: Arc::new(Condvar::new()),
         }
     }
 
@@ -80,6 +82,19 @@ impl KrunWorkerBackend {
     /// Drain cleanup failures observed by autonomous worker supervisors.
     pub fn take_cleanup_errors(&self) -> Vec<ExecutionError> {
         std::mem::take(&mut *self.cleanup_errors.lock())
+    }
+
+    /// Wait for one known run's terminal backend result. This is an explicit
+    /// lifecycle synchronization point; callers must not infer completion by
+    /// watching the ephemeral filesystem or sleeping for a guessed duration.
+    pub fn wait_for_completion(&self, run_id: &str) -> Result<BackendRunStatus, ExecutionError> {
+        let mut completed = self.completed.lock();
+        loop {
+            if let Some(status) = completed.remove(run_id) {
+                return Ok(status);
+            }
+            self.completion_cv.wait(&mut completed);
+        }
     }
 }
 
@@ -272,6 +287,7 @@ impl Backend for KrunWorkerBackend {
         let children = Arc::clone(&self.children);
         let cleanup_errors = Arc::clone(&self.cleanup_errors);
         let completed = Arc::clone(&self.completed);
+        let completion_cv = Arc::clone(&self.completion_cv);
         let deadline = Instant::now()
             .checked_add(Duration::from_millis(request.limits.wall_time_ms))
             .ok_or_else(|| ExecutionError::invalid("wall-clock limit is too large"))?;
@@ -287,6 +303,7 @@ impl Backend for KrunWorkerBackend {
                     Err(error) => BackendRunStatus::Failed(error),
                 },
             );
+            completion_cv.notify_all();
             let _ = finished_tx.send(result);
             children.lock().remove(&run_id);
         });

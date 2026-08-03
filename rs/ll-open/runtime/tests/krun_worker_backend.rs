@@ -2,10 +2,12 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Barrier};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use leyline_runtime::backends::libkrun::backend::{KrunWorkerBackend, KrunWorkerConfig};
-use leyline_runtime::{Backend, BackendClass, DigestRef, ExecutionRequest, ResourceLimits};
+use leyline_runtime::{
+    Backend, BackendClass, BackendRunStatus, DigestRef, ExecutionRequest, ResourceLimits,
+};
 use tempfile::TempDir;
 
 fn run_root_count(path: &std::path::Path) -> usize {
@@ -116,10 +118,9 @@ fn backend_removes_the_run_root_when_a_worker_exits() {
         .expect("run root entry")
         .path();
     fs::write(run_root.join("control"), b"exit\n").expect("release worker");
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while run_root_count(&ephemeral_root) != 0 && Instant::now() < deadline {
-        std::thread::yield_now();
-    }
+    backend
+        .wait_for_completion("run-backend-01")
+        .expect("worker completion");
 
     assert_eq!(run_root_count(&ephemeral_root), 0);
 }
@@ -187,13 +188,13 @@ fn backend_enforces_the_wall_clock_limit_and_cleans_up() {
     request.limits.wall_time_ms = 50;
 
     backend.start(&request).expect("ready worker");
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while run_root_count(&ephemeral_root) != 0 && Instant::now() < deadline {
-        std::thread::yield_now();
-    }
+    let completion = backend
+        .wait_for_completion("run-backend-01")
+        .expect("worker completion");
 
     assert_eq!(run_root_count(&ephemeral_root), 0);
     let errors = backend.take_cleanup_errors();
+    assert!(matches!(completion, BackendRunStatus::Failed(_)));
     assert_eq!(errors.len(), 1);
     assert_eq!(
         errors[0].code,

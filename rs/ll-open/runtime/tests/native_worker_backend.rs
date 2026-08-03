@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use leyline_runtime::backends::native_backend::{NativeWorkerBackend, NativeWorkerConfig};
 use leyline_runtime::{Backend, BackendClass, DigestRef, ExecutionRequest, ResourceLimits};
@@ -69,14 +69,9 @@ fn worker_exit_is_observable_and_run_root_is_removed() {
         "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\n",
     );
     backend.start(&request()).expect("worker readiness");
-    let deadline = Instant::now() + Duration::from_secs(1);
-    let status = loop {
-        if let Some(status) = backend.poll("native-run-01").expect("poll") {
-            break status;
-        }
-        assert!(Instant::now() < deadline, "worker did not finish");
-        std::thread::yield_now();
-    };
+    let status = backend
+        .wait_for_completion("native-run-01")
+        .expect("worker completion");
     assert!(matches!(
         status,
         leyline_runtime::BackendRunStatus::Succeeded
@@ -92,14 +87,9 @@ fn failed_worker_is_reported_and_cleaned() {
         "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\nexit 7\n",
     );
     backend.start(&request()).expect("worker readiness");
-    let deadline = Instant::now() + Duration::from_secs(1);
-    let status = loop {
-        if let Some(status) = backend.poll("native-run-01").expect("poll") {
-            break status;
-        }
-        assert!(Instant::now() < deadline, "worker did not finish");
-        std::thread::yield_now();
-    };
+    let status = backend
+        .wait_for_completion("native-run-01")
+        .expect("worker completion");
     match status {
         leyline_runtime::BackendRunStatus::Failed(error) => {
             assert!(error.detail.contains("native worker exited"));

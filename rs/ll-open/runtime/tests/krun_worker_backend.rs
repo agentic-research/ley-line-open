@@ -85,7 +85,7 @@ fn backend_removes_the_run_root_when_a_worker_exits() {
     let worker = fixture.path().join("leyline-krun-worker");
     fs::write(
         &worker,
-        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n",
+        "#!/bin/sh\nrun_root=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--run-root\" ]; then run_root=\"$2\"; shift 2; else shift; fi\ndone\n/bin/cat >/dev/null\ncontrol=\"$run_root/control\"\n/usr/bin/mkfifo \"$control\"\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\nIFS= read -r _ < \"$control\"\n",
     )
     .expect("fake worker");
     fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("worker mode");
@@ -107,6 +107,13 @@ fn backend_removes_the_run_root_when_a_worker_exits() {
 
     backend.start(&request()).expect("ready worker");
     assert_eq!(run_root_count(&ephemeral_root), 1);
+    let run_root = fs::read_dir(&ephemeral_root)
+        .expect("run roots")
+        .next()
+        .expect("one run root")
+        .expect("run root entry")
+        .path();
+    fs::write(run_root.join("control"), b"exit\n").expect("release worker");
     let deadline = Instant::now() + Duration::from_secs(1);
     while run_root_count(&ephemeral_root) != 0 && Instant::now() < deadline {
         std::thread::yield_now();

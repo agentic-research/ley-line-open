@@ -399,6 +399,9 @@ fn supervise_worker(
 fn terminate_worker(pid: u32) {
     // The waiter thread owns `Child`, so termination is issued by PID and the
     // waiter remains responsible for reaping the process.
+    // SAFETY: `pid` came directly from the live `Child` immediately before it
+    // was moved to the waiter thread; sending SIGKILL does not dereference it
+    // or create an alias to process memory.
     #[cfg(unix)]
     unsafe {
         let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);

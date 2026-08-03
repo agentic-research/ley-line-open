@@ -40,7 +40,10 @@ fn backend(fixture: &TempDir, worker_body: &str) -> (NativeWorkerBackend, std::p
         cas_root,
         ephemeral_root: ephemeral_root.clone(),
         runtime_files: Vec::new(),
-        ready_timeout: Duration::from_secs(2),
+        // The fixture launches a shell worker and may share a loaded host
+        // with the libkrun suite. Keep this test budget generous; readiness
+        // is still synchronized by the event, never by a sleep.
+        ready_timeout: Duration::from_secs(10),
     });
     (backend, ephemeral_root)
 }

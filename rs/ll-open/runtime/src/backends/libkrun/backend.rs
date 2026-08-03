@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, mpsc};
@@ -155,6 +156,7 @@ impl Backend for KrunWorkerBackend {
         for path in &self.config.devices {
             command.arg("--device").arg(path);
         }
+        configure_worker_process_group(&mut command);
 
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -429,7 +431,25 @@ fn terminate_worker(pid: u32) {
     // or create an alias to process memory.
     #[cfg(unix)]
     unsafe {
-        let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        let process_group = -(pid as libc::pid_t);
+        if libc::kill(process_group, libc::SIGKILL) == -1 {
+            let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+}
+
+fn configure_worker_process_group(command: &mut Command) {
+    // SAFETY: `pre_exec` runs in the child after fork and before exec. The
+    // callback performs only the async-signal-safe `setpgid` syscall and
+    // allocates no Rust state.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
     }
 }
 
@@ -454,7 +474,7 @@ fn cleanup_tempdir(rootfs: TempDir) -> Result<(), ExecutionError> {
 }
 
 fn abort_failed_start(child: &mut Child, rootfs: TempDir, error: ExecutionError) -> ExecutionError {
-    let _ = child.kill();
+    terminate_worker(child.id());
     let _ = child.wait();
     finish_failed_start(rootfs, error)
 }

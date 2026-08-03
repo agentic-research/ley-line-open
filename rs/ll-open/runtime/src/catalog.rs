@@ -81,7 +81,7 @@ impl CatalogBuilder {
 }
 
 /// Trusted resolver backed by an explicit content-addressed execution catalog.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CatalogResolver {
     entries: HashMap<ArtifactKey, CatalogEntry>,
 }
@@ -223,4 +223,55 @@ fn validate_guest_path(value: &str) -> Result<(), ExecutionError> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::authorization::{ArtifactIdentity, SchemaIntent};
+
+    #[test]
+    fn json_catalog_is_used_to_resolve_a_guest_entrypoint() {
+        let artifact = "blake3-256:artifact";
+        let json = format!(
+            r#"{{"entries":[{{
+                "artifactDigest":"{artifact}",
+                "mediaType":"application/test-executable",
+                "rootfs":{{"algorithm":"blake3-256","value":"{}"}},
+                "executable":"bin/agent",
+                "workspaceInputs":[]
+            }}]}}"#,
+            "a".repeat(64)
+        );
+        let resolver = CatalogResolver::from_json(json.as_bytes()).expect("catalog JSON");
+        let authorized = AuthorizedExecution {
+            run_id: "run-1".into(),
+            grant_id: "grant-1".into(),
+            replay_key: "replay-1".into(),
+            spec_digest: "blake3-256:spec".into(),
+            grant_digest: "blake3-256:grant".into(),
+            confinement_digest: "blake3-256:confinement".into(),
+            backend: crate::BackendClass::Native,
+            allowed_egress: Vec::new(),
+            intent: SchemaIntent {
+                executable: ArtifactIdentity {
+                    digest: artifact.into(),
+                    media_type: "application/test-executable".into(),
+                },
+                arguments: Vec::new(),
+                public_environment: BTreeMap::new(),
+                workspace_inputs: Vec::new(),
+                requested_limits: SchemaLimits {
+                    wall_time_ms: 1_000,
+                    memory_bytes: 1024 * 1024,
+                    cpu_millis: 1_000,
+                    output_bytes: 0,
+                },
+            },
+        };
+        let request = resolver.resolve(&authorized).expect("resolve catalog");
+        assert_eq!(request.executable, "bin/agent");
+    }
 }

@@ -30,6 +30,18 @@ pub async fn capabilities(control: &Path) -> Result<()> {
     call(control, json!({"op": "llo_execution_capabilities"})).await
 }
 
+pub async fn provision(control: &Path, backend_class: &str, idempotency_key: &str) -> Result<()> {
+    call(
+        control,
+        json!({
+            "op": "llo_execution_provision",
+            "backendClass": backend_class,
+            "idempotencyKey": idempotency_key
+        }),
+    )
+    .await
+}
+
 pub async fn status(control: &Path, run_id: Option<&str>) -> Result<()> {
     call(
         control,

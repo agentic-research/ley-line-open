@@ -13,6 +13,7 @@ use leyline_runtime::{
 /// neither transport owns policy or lifecycle state.
 pub trait ExecutionHandler: Send + Sync {
     fn capabilities(&self) -> Result<String>;
+    fn provision(&self, input: &Value) -> Result<String>;
     fn start(&self, input: &Value) -> Result<String>;
     fn status(&self, input: &Value) -> Result<String>;
     fn inspect(&self, input: &Value) -> Result<String>;
@@ -53,6 +54,13 @@ where
 {
     fn capabilities(&self) -> Result<String> {
         Ok(transport::capabilities_json(&self.service)?)
+    }
+
+    fn provision(&self, input: &Value) -> Result<String> {
+        Ok(transport::provision_json(
+            &self.service,
+            &input.to_string(),
+        )?)
     }
 
     fn start(&self, input: &Value) -> Result<String> {

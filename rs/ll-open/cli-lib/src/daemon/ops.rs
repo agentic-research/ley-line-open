@@ -186,6 +186,10 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
         BaseRequest::SearchSymbols(r) => op_search_symbols(ctx, &r),
         BaseRequest::Agreement(r) => op_agreement(ctx, &r),
         BaseRequest::LloExecutionCapabilities => op_execution_capabilities(ctx),
+        BaseRequest::LloExecutionProvision {
+            backend_class,
+            idempotency_key,
+        } => op_execution_provision(ctx, backend_class, idempotency_key),
         BaseRequest::LloExecutionStatus { run_id } => op_execution_status(ctx, run_id),
         BaseRequest::LloExecutionStart { spec, grant } => op_execution_start(ctx, spec, grant),
         BaseRequest::LloExecutionInspect {
@@ -218,6 +222,17 @@ fn execution_handler(
 
 fn op_execution_capabilities(ctx: &DaemonContext) -> Result<String> {
     Ok(execution_handler(ctx)?.capabilities()?)
+}
+
+fn op_execution_provision(
+    ctx: &DaemonContext,
+    backend_class: String,
+    idempotency_key: String,
+) -> Result<String> {
+    Ok(execution_handler(ctx)?.provision(&json!({
+        "backendClass": backend_class,
+        "idempotencyKey": idempotency_key,
+    }))?)
 }
 
 fn op_execution_status(ctx: &DaemonContext, run_id: Option<String>) -> Result<String> {

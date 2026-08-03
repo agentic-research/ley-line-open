@@ -115,6 +115,7 @@ pub const BASE_OP_NAMES: &[&str] = &[
     "search_symbols",
     "agreement",
     "llo_execution_capabilities",
+    "llo_execution_provision",
     "llo_execution_status",
     "llo_execution_start",
     "llo_execution_inspect",
@@ -287,6 +288,13 @@ pub enum BaseRequest {
     /// Generated execution/v1 capability discovery delegated to the shared
     /// LLO runtime handler.
     LloExecutionCapabilities,
+    /// Generated execution/v1 explicit provisioning input.
+    LloExecutionProvision {
+        #[serde(rename = "backendClass")]
+        backend_class: String,
+        #[serde(rename = "idempotencyKey")]
+        idempotency_key: String,
+    },
     /// Generated execution/v1 substrate status.
     LloExecutionStatus {
         #[serde(rename = "runId", default)]

@@ -463,6 +463,16 @@ pub fn tool_registry() -> Vec<McpTool> {
             schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
         },
         McpTool {
+            name: "llo_execution_provision",
+            description: "Explicitly provision one supported execution backend.",
+            schema: json!({
+                "type": "object",
+                "properties": {"backendClass": {"type": "string"}, "idempotencyKey": {"type": "string"}},
+                "required": ["backendClass", "idempotencyKey"],
+                "additionalProperties": false
+            }),
+        },
+        McpTool {
             name: "llo_execution_status",
             description: "Read substrate or one execution's current status without provisioning.",
             schema: json!({"type": "object", "properties": {"runId": {"type": "string"}}, "additionalProperties": false}),
@@ -657,6 +667,7 @@ pub fn cloister_groups() -> Vec<CloisterGroupDecl> {
         advertised_prefix: "llo_execution_",
         upstream_names: vec![
             "llo_execution_capabilities",
+            "llo_execution_provision",
             "llo_execution_status",
             "llo_execution_start",
             "llo_execution_inspect",

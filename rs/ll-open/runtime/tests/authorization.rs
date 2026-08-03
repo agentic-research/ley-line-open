@@ -219,6 +219,9 @@ fn service_schema_entrypoint_authorizes_before_resolving() {
     let spec = spec_bytes();
     let grant = grant_bytes(&spec, true, 2_000, 0);
     let service = ExecutionService::new(RecordingBackend);
+    service
+        .provision(BackendClass::MicroVm, "provision-01")
+        .expect("provision backend");
     let record = service
         .start_authorized(
             &spec,
@@ -280,6 +283,12 @@ fn json_adapter_uses_generated_input_and_output_shapes() {
         now_unix_ms: 1_000,
         required_backend: BackendClass::MicroVm,
     };
+    let provision = leyline_runtime::transport::provision_json(
+        &service,
+        r#"{"backendClass":"microVm","idempotencyKey":"provision-01"}"#,
+    )
+    .expect("provision JSON");
+    assert!(provision.contains("provisioned"));
     let start = start_json(&service, &input, &policy, &TestResolver).expect("start JSON");
     assert!(start.contains("run-"));
     let status = status_json(&service, r#"{"runId":""}"#).expect("status JSON");

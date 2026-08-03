@@ -300,6 +300,15 @@ pub enum ExecutionCommands {
         #[arg(long)]
         control: PathBuf,
     },
+    /// Explicitly provision one execution backend.
+    Provision {
+        #[arg(long)]
+        control: PathBuf,
+        #[arg(long, default_value = "microVm")]
+        backend_class: String,
+        #[arg(long)]
+        idempotency_key: String,
+    },
     /// Read substrate or one run's status.
     Status {
         #[arg(long)]
@@ -359,6 +368,11 @@ pub async fn run(cmd: Commands) -> Result<()> {
             ExecutionCommands::Capabilities { control } => {
                 cmd_execution::capabilities(&control).await
             }
+            ExecutionCommands::Provision {
+                control,
+                backend_class,
+                idempotency_key,
+            } => cmd_execution::provision(&control, &backend_class, &idempotency_key).await,
             ExecutionCommands::Status { control, run_id } => {
                 cmd_execution::status(&control, run_id.as_deref()).await
             }

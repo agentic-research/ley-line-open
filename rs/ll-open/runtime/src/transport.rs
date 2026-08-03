@@ -67,6 +67,43 @@ pub fn start_json<B: crate::Backend, R: ExecutionResolver>(
     encode_start(output_message)
 }
 
+pub fn provision_json<B: crate::Backend>(
+    service: &ExecutionService<B>,
+    input_json: &str,
+) -> Result<String, ExecutionError> {
+    let mut input_message = Builder::new_default();
+    let input = input_message.init_root::<execution_capnp::provision_input::Builder<'_>>();
+    capnp_json::from_json(input_json, input).map_err(|error| {
+        ExecutionError::invalid(format!("invalid execution provision input: {error}"))
+    })?;
+    let input = input_message
+        .get_root_as_reader::<execution_capnp::provision_input::Reader<'_>>()
+        .map_err(|error| {
+            ExecutionError::invalid(format!("invalid provision input root: {error}"))
+        })?;
+    let backend_class = match input.get_backend_class().map_err(|error| {
+        ExecutionError::invalid(format!("invalid provision backendClass: {error}"))
+    })? {
+        execution_capnp::BackendClass::Native => crate::BackendClass::Native,
+        execution_capnp::BackendClass::MicroVm => crate::BackendClass::MicroVm,
+    };
+    let idempotency_key = input
+        .get_idempotency_key()
+        .map_err(|error| {
+            ExecutionError::invalid(format!("invalid provision idempotencyKey: {error}"))
+        })?
+        .to_str()
+        .map_err(|error| {
+            ExecutionError::invalid(format!("provision idempotencyKey is not UTF-8: {error}"))
+        })?;
+    let capabilities = service.provision(backend_class, idempotency_key)?;
+    let mut output_message = Builder::new_default();
+    let mut output = output_message.init_root::<execution_capnp::provision_output::Builder<'_>>();
+    output.set_provisioned(true);
+    output.set_backend_id(&capabilities.backend_id);
+    encode_provision(output_message)
+}
+
 pub fn status_json<B: crate::Backend>(
     service: &ExecutionService<B>,
     input_json: &str,
@@ -88,7 +125,7 @@ pub fn status_json<B: crate::Backend>(
     let mut output_message = Builder::new_default();
     let mut output = output_message.init_root::<execution_capnp::status_output::Builder<'_>>();
     let capabilities = service.capabilities();
-    output.set_provisioned(capabilities.available);
+    output.set_provisioned(service.is_provisioned());
     output.set_backend(&capabilities.backend_id);
     if !run_id.is_empty() {
         let record = service
@@ -281,6 +318,14 @@ fn encode_start(message: Builder<HeapAllocator>) -> Result<String, ExecutionErro
         .map_err(|error| ExecutionError::internal(format!("read start response: {error}")))?;
     capnp_json::to_json(reader)
         .map_err(|error| ExecutionError::internal(format!("encode start response: {error}")))
+}
+
+fn encode_provision(message: Builder<HeapAllocator>) -> Result<String, ExecutionError> {
+    let reader = message
+        .get_root_as_reader::<execution_capnp::provision_output::Reader<'_>>()
+        .map_err(|error| ExecutionError::internal(format!("read provision response: {error}")))?;
+    capnp_json::to_json(reader)
+        .map_err(|error| ExecutionError::internal(format!("encode provision response: {error}")))
 }
 
 fn encode_status(message: Builder<HeapAllocator>) -> Result<String, ExecutionError> {

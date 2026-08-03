@@ -26,6 +26,20 @@ pub trait Backend: Send + Sync + 'static {
     /// A read-only availability/capability snapshot.
     fn capabilities(&self) -> BackendCapabilities;
 
+    /// Explicitly provision backend-owned resources. The default is a
+    /// read-only readiness check for backends whose resources are supplied by
+    /// the host/container and do not need a separate mount operation.
+    fn provision(&self) -> Result<BackendCapabilities, ExecutionError> {
+        let capabilities = self.capabilities();
+        if capabilities.available {
+            Ok(capabilities)
+        } else {
+            Err(ExecutionError::unsupported(
+                "requested execution backend is unavailable",
+            ))
+        }
+    }
+
     /// Start one already validated execution.
     fn start(&self, request: &ExecutionRequest) -> Result<BackendRun, ExecutionError>;
 
@@ -43,6 +57,8 @@ struct ServiceState {
     replay: HashMap<String, String>,
     events: HashMap<String, Vec<RunEventRecord>>,
     receipts: HashMap<String, ReceiptContext>,
+    provisioned: bool,
+    provisioned_backend: Option<String>,
 }
 
 /// One lifecycle implementation used by every transport adapter.
@@ -61,6 +77,32 @@ impl<B: Backend> ExecutionService<B> {
 
     pub fn capabilities(&self) -> BackendCapabilities {
         self.backend.capabilities()
+    }
+
+    pub fn provision(
+        &self,
+        backend_class: crate::BackendClass,
+        idempotency_key: &str,
+    ) -> Result<BackendCapabilities, ExecutionError> {
+        if idempotency_key.is_empty() {
+            return Err(ExecutionError::invalid(
+                "provision idempotency key must not be empty",
+            ));
+        }
+        let capabilities = self.backend.provision()?;
+        if capabilities.backend_class != backend_class {
+            return Err(ExecutionError::unsupported(
+                "requested backend class is unavailable",
+            ));
+        }
+        let mut state = self.state.write();
+        state.provisioned = true;
+        state.provisioned_backend = Some(capabilities.backend_id.clone());
+        Ok(capabilities)
+    }
+
+    pub fn is_provisioned(&self) -> bool {
+        self.state.read().provisioned
     }
 
     pub fn status(&self, run_id: &str) -> Result<Option<RunRecord>, ExecutionError> {
@@ -152,6 +194,11 @@ impl<B: Backend> ExecutionService<B> {
         policy: &AuthorizationPolicy,
         resolver: &R,
     ) -> Result<RunRecord, ExecutionError> {
+        if !self.is_provisioned() {
+            return Err(ExecutionError::unsupported(
+                "execution backend must be explicitly provisioned before start",
+            ));
+        }
         let authorized = authorize(spec_bytes, grant_bytes, policy)?;
         let request = resolver.resolve(&authorized)?;
         if request.run_id != authorized.run_id {

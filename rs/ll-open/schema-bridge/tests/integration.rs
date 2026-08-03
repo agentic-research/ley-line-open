@@ -2279,8 +2279,9 @@ fn jsonschema_named_union_struct_variants_emits_oneof_under_discriminant() {
     let backend = &doc["$defs"]["Backend"];
 
     // Base fields + the discriminant are all properties, all required.
-    // (serde_json's Map sorts keys on parse, so property ORDER is
-    // asserted by the golden text pin, not here.)
+    // Object member order is not semantic (and may be declaration-preserving
+    // when serde_json/preserve_order is enabled), so property ORDER is
+    // asserted by the golden text pin, not here.
     let props = backend["properties"].as_object().expect("properties");
     let mut keys: Vec<&str> = props.keys().map(String::as_str).collect();
     keys.sort_unstable();

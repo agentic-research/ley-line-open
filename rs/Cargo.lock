@@ -4441,6 +4441,7 @@ dependencies = [
  "leyline-lsp",
  "leyline-mcp-protocol-schema",
  "leyline-public-schema",
+ "leyline-runtime",
  "leyline-schema",
  "leyline-schema-capnp",
  "leyline-sheaf",

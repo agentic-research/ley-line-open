@@ -453,6 +453,42 @@ pub fn tool_registry() -> Vec<McpTool> {
         }),
     });
 
+    // execution/v1 runtime adapters. The nested schema is owned by the
+    // normative Cap'n Proto IDL; these registry entries only describe the
+    // operation envelope consumed by `daemon::execution`.
+    tools.extend([
+        McpTool {
+            name: "llo_execution_capabilities",
+            description: "Discover LLO execution/v1 and available isolation backends.",
+            schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
+        },
+        McpTool {
+            name: "llo_execution_status",
+            description: "Read substrate or one execution's current status without provisioning.",
+            schema: json!({"type": "object", "properties": {"runId": {"type": "string"}}, "additionalProperties": false}),
+        },
+        McpTool {
+            name: "llo_execution_start",
+            description: "Authorize a signed execution/v1 RunSpec + RunGrant and start it through LLO.",
+            schema: json!({
+                "type": "object",
+                "properties": {"spec": {"type": "object"}, "grant": {"type": "object"}},
+                "required": ["spec", "grant"],
+                "additionalProperties": false
+            }),
+        },
+        McpTool {
+            name: "llo_execution_cancel",
+            description: "Cancel an active execution through LLO's shared lifecycle.",
+            schema: json!({
+                "type": "object",
+                "properties": {"runId": {"type": "string"}, "idempotencyKey": {"type": "string"}},
+                "required": ["runId"],
+                "additionalProperties": false
+            }),
+        },
+    ]);
+
     tools
 }
 
@@ -584,6 +620,17 @@ pub fn cloister_groups() -> Vec<CloisterGroupDecl> {
         name: "hdc",
         advertised_prefix: "hdc_",
         upstream_names: vec!["hdc_search", "hdc_calibrate", "hdc_density"],
+    });
+
+    groups.push(CloisterGroupDecl {
+        name: "execution",
+        advertised_prefix: "llo_execution_",
+        upstream_names: vec![
+            "llo_execution_capabilities",
+            "llo_execution_status",
+            "llo_execution_start",
+            "llo_execution_cancel",
+        ],
     });
 
     groups

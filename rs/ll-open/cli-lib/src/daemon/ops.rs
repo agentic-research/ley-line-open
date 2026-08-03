@@ -185,11 +185,55 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
         BaseRequest::InspectNeighborhood(r) => op_inspect_neighborhood(ctx, &r),
         BaseRequest::SearchSymbols(r) => op_search_symbols(ctx, &r),
         BaseRequest::Agreement(r) => op_agreement(ctx, &r),
+        BaseRequest::LloExecutionCapabilities => op_execution_capabilities(ctx),
+        BaseRequest::LloExecutionStatus { run_id } => op_execution_status(ctx, run_id),
+        BaseRequest::LloExecutionStart { spec, grant } => op_execution_start(ctx, spec, grant),
+        BaseRequest::LloExecutionCancel {
+            run_id,
+            idempotency_key,
+        } => op_execution_cancel(ctx, run_id, idempotency_key),
     };
     result.unwrap_or_else(|e| {
         build_error_response(&format!("{e:#}"))
             .unwrap_or_else(|enc| fallback_error_envelope(&format!("handler error: {enc}")))
     })
+}
+
+fn execution_handler(
+    ctx: &DaemonContext,
+) -> Result<std::sync::Arc<dyn super::execution::ExecutionHandler>> {
+    ctx.ext
+        .execution_handler()
+        .ok_or_else(|| anyhow::anyhow!("execution/v1 service is not configured"))
+}
+
+fn op_execution_capabilities(ctx: &DaemonContext) -> Result<String> {
+    Ok(execution_handler(ctx)?.capabilities()?)
+}
+
+fn op_execution_status(ctx: &DaemonContext, run_id: Option<String>) -> Result<String> {
+    Ok(execution_handler(ctx)?.status(&json!({
+        "runId": run_id.unwrap_or_default(),
+    }))?)
+}
+
+fn op_execution_start(
+    ctx: &DaemonContext,
+    spec: serde_json::Value,
+    grant: serde_json::Value,
+) -> Result<String> {
+    Ok(execution_handler(ctx)?.start(&json!({"spec": spec, "grant": grant}))?)
+}
+
+fn op_execution_cancel(
+    ctx: &DaemonContext,
+    run_id: String,
+    idempotency_key: Option<String>,
+) -> Result<String> {
+    Ok(execution_handler(ctx)?.cancel(&json!({
+        "runId": run_id,
+        "idempotencyKey": idempotency_key.unwrap_or_default(),
+    }))?)
 }
 
 /// Legacy compat wrapper for tests that constructed (op, args:Value) pairs

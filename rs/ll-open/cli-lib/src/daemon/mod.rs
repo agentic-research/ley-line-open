@@ -9,6 +9,7 @@ pub mod db_pool;
 pub mod embed;
 pub mod enrichment;
 pub mod events;
+pub mod execution;
 pub mod ext;
 pub mod granularity_router;
 #[cfg(feature = "hdc")]

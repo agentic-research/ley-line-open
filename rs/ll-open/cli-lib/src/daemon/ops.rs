@@ -221,7 +221,7 @@ fn execution_handler(
 }
 
 fn op_execution_capabilities(ctx: &DaemonContext) -> Result<String> {
-    Ok(execution_handler(ctx)?.capabilities()?)
+    execution_handler(ctx)?.capabilities()
 }
 
 fn op_execution_provision(
@@ -229,16 +229,16 @@ fn op_execution_provision(
     backend_class: String,
     idempotency_key: String,
 ) -> Result<String> {
-    Ok(execution_handler(ctx)?.provision(&json!({
+    execution_handler(ctx)?.provision(&json!({
         "backendClass": backend_class,
         "idempotencyKey": idempotency_key,
-    }))?)
+    }))
 }
 
 fn op_execution_status(ctx: &DaemonContext, run_id: Option<String>) -> Result<String> {
-    Ok(execution_handler(ctx)?.status(&json!({
+    execution_handler(ctx)?.status(&json!({
         "runId": run_id.unwrap_or_default(),
-    }))?)
+    }))
 }
 
 fn op_execution_start(
@@ -246,7 +246,7 @@ fn op_execution_start(
     spec: serde_json::Value,
     grant: serde_json::Value,
 ) -> Result<String> {
-    Ok(execution_handler(ctx)?.start(&json!({"spec": spec, "grant": grant}))?)
+    execution_handler(ctx)?.start(&json!({"spec": spec, "grant": grant}))
 }
 
 fn op_execution_inspect(
@@ -254,14 +254,14 @@ fn op_execution_inspect(
     run_id: String,
     after_sequence: Option<u64>,
 ) -> Result<String> {
-    Ok(execution_handler(ctx)?.inspect(&json!({
+    execution_handler(ctx)?.inspect(&json!({
         "runId": run_id,
         "afterSequence": after_sequence.unwrap_or(0),
-    }))?)
+    }))
 }
 
 fn op_execution_collect(ctx: &DaemonContext, run_id: String) -> Result<String> {
-    Ok(execution_handler(ctx)?.collect(&json!({"runId": run_id}))?)
+    execution_handler(ctx)?.collect(&json!({"runId": run_id}))
 }
 
 fn op_execution_cleanup(
@@ -269,10 +269,10 @@ fn op_execution_cleanup(
     run_id: String,
     idempotency_key: Option<String>,
 ) -> Result<String> {
-    Ok(execution_handler(ctx)?.cleanup(&json!({
+    execution_handler(ctx)?.cleanup(&json!({
         "runId": run_id,
         "idempotencyKey": idempotency_key.unwrap_or_default(),
-    }))?)
+    }))
 }
 
 fn op_execution_cancel(
@@ -280,10 +280,10 @@ fn op_execution_cancel(
     run_id: String,
     idempotency_key: Option<String>,
 ) -> Result<String> {
-    Ok(execution_handler(ctx)?.cancel(&json!({
+    execution_handler(ctx)?.cancel(&json!({
         "runId": run_id,
         "idempotencyKey": idempotency_key.unwrap_or_default(),
-    }))?)
+    }))
 }
 
 /// Legacy compat wrapper for tests that constructed (op, args:Value) pairs

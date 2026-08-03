@@ -349,39 +349,98 @@ fn supervise_worker(
     cancel: mpsc::Receiver<()>,
     deadline: Instant,
 ) -> Result<(), ExecutionError> {
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {}
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                cleanup_tempdir(rootfs)?;
-                return Err(ExecutionError::backend(format!(
-                    "poll libkrun worker status: {error}"
-                )));
-            }
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            cleanup_tempdir(rootfs)?;
-            return Err(ExecutionError {
-                code: crate::ErrorCode::ResourceExhausted,
-                retryable: false,
-                detail: "execution exceeded wall-clock limit".into(),
-            });
-        }
-        match cancel.recv_timeout(Duration::from_millis(10)) {
-            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break;
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-        }
+    // Wait for child exit and cancellation as events. The deadline is the
+    // only timed wait; there is no 10ms child-state polling loop.
+    enum Event {
+        Exited(std::io::Result<std::process::ExitStatus>),
+        Cancelled,
     }
-    cleanup_tempdir(rootfs)
+    let pid = child.id();
+    let (event_tx, event_rx) = mpsc::sync_channel(2);
+    let exit_tx = event_tx.clone();
+    std::thread::spawn(move || {
+        let _ = exit_tx.send(Event::Exited(child.wait()));
+    });
+    std::thread::spawn(move || {
+        if cancel.recv().is_ok() {
+            let _ = event_tx.send(Event::Cancelled);
+        }
+    });
+
+    let event = match deadline.checked_duration_since(Instant::now()) {
+        Some(remaining) => match event_rx.recv_timeout(remaining) {
+            Ok(event) => event,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                terminate_worker(pid);
+                let _ = event_rx.recv();
+                return cleanup_with_error(
+                    rootfs,
+                    ExecutionError {
+                        code: crate::ErrorCode::ResourceExhausted,
+                        retryable: false,
+                        detail: "execution exceeded wall-clock limit".into(),
+                    },
+                );
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                terminate_worker(pid);
+                let _ = event_rx.recv();
+                return cleanup_with_error(
+                    rootfs,
+                    ExecutionError::backend("libkrun worker supervision channel disconnected"),
+                );
+            }
+        },
+        None => {
+            terminate_worker(pid);
+            let _ = event_rx.recv();
+            return cleanup_with_error(
+                rootfs,
+                ExecutionError {
+                    code: crate::ErrorCode::ResourceExhausted,
+                    retryable: false,
+                    detail: "execution exceeded wall-clock limit".into(),
+                },
+            );
+        }
+    };
+
+    match event {
+        Event::Cancelled => {
+            terminate_worker(pid);
+            let _ = event_rx.recv();
+            cleanup_tempdir(rootfs)
+        }
+        Event::Exited(Ok(status)) if status.success() => cleanup_tempdir(rootfs),
+        Event::Exited(Ok(status)) => cleanup_with_error(
+            rootfs,
+            ExecutionError::backend(format!("libkrun worker exited with {status}")),
+        ),
+        Event::Exited(Err(error)) => cleanup_with_error(
+            rootfs,
+            ExecutionError::backend(format!("wait for libkrun worker: {error}")),
+        ),
+    }
+}
+
+fn terminate_worker(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+}
+
+fn cleanup_with_error(rootfs: TempDir, error: ExecutionError) -> Result<(), ExecutionError> {
+    match cleanup_tempdir(rootfs) {
+        Ok(()) => Err(error),
+        Err(cleanup_error) => Err(ExecutionError {
+            detail: format!(
+                "{}; cleanup also failed: {}",
+                error.detail, cleanup_error.detail
+            ),
+            ..error
+        }),
+    }
 }
 
 fn cleanup_tempdir(rootfs: TempDir) -> Result<(), ExecutionError> {

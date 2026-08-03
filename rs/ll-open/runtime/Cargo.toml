@@ -12,6 +12,7 @@ capnp = { workspace = true }
 capnp-json = { workspace = true }
 leyline-public-schema = { path = "../../ll-core/public-schema", version = "0.14.0" }
 libloading = { workspace = true }
+libc = { workspace = true }
 leyline-core = { path = "../../ll-core/core", version = "0.14.0" }
 leyline-envelope = { path = "../envelope", version = "0.14.0" }
 nono = { workspace = true }

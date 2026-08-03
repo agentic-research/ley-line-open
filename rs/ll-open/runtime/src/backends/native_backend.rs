@@ -320,30 +320,53 @@ fn supervise_worker(
     cancel: mpsc::Receiver<()>,
     deadline: Instant,
 ) -> Result<(), ExecutionError> {
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if status.success() {
-                    break;
-                }
-                return finish_cleanup(
-                    run_root,
-                    ExecutionError::backend(format!("native worker exited with {status}")),
-                );
-            }
-            Ok(None) => {}
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return finish_cleanup(
-                    run_root,
-                    ExecutionError::backend(format!("poll native worker status: {error}")),
-                );
-            }
+    // `Child::try_wait` plus a short timeout is scheduler polling. Instead,
+    // dedicate one thread to the blocking wait and merge its exit event with
+    // cancellation events. The only timed wait below is the actual deadline;
+    // no child-state polling or sleep is involved.
+    enum Event {
+        Exited(std::io::Result<std::process::ExitStatus>),
+        Cancelled,
+    }
+    let pid = child.id();
+    let (event_tx, event_rx) = mpsc::sync_channel(2);
+    let exit_tx = event_tx.clone();
+    std::thread::spawn(move || {
+        let _ = exit_tx.send(Event::Exited(child.wait()));
+    });
+    std::thread::spawn(move || {
+        if cancel.recv().is_ok() {
+            let _ = event_tx.send(Event::Cancelled);
         }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+    });
+
+    let event = match deadline.checked_duration_since(Instant::now()) {
+        Some(remaining) => match event_rx.recv_timeout(remaining) {
+            Ok(event) => event,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                terminate_worker(pid);
+                let _ = event_rx.recv();
+                return finish_cleanup(
+                    run_root,
+                    ExecutionError {
+                        code: crate::ErrorCode::ResourceExhausted,
+                        retryable: false,
+                        detail: "execution exceeded wall-clock limit".into(),
+                    },
+                );
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                terminate_worker(pid);
+                let _ = event_rx.recv();
+                return finish_cleanup(
+                    run_root,
+                    ExecutionError::backend("native worker supervision channel disconnected"),
+                );
+            }
+        },
+        None => {
+            terminate_worker(pid);
+            let _ = event_rx.recv();
             return finish_cleanup(
                 run_root,
                 ExecutionError {
@@ -353,16 +376,33 @@ fn supervise_worker(
                 },
             );
         }
-        match cancel.recv_timeout(Duration::from_millis(10)) {
-            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break;
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+    };
+
+    match event {
+        Event::Cancelled => {
+            terminate_worker(pid);
+            let _ = event_rx.recv();
+            cleanup_tempdir(run_root)
         }
+        Event::Exited(Ok(status)) if status.success() => cleanup_tempdir(run_root),
+        Event::Exited(Ok(status)) => finish_cleanup(
+            run_root,
+            ExecutionError::backend(format!("native worker exited with {status}")),
+        ),
+        Event::Exited(Err(error)) => finish_cleanup(
+            run_root,
+            ExecutionError::backend(format!("wait for native worker: {error}")),
+        ),
     }
-    cleanup_tempdir(run_root)
+}
+
+fn terminate_worker(pid: u32) {
+    // The waiter thread owns `Child`, so termination is issued by PID and the
+    // waiter remains responsible for reaping the process.
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
 }
 
 fn finish_cleanup(run_root: TempDir, error: ExecutionError) -> Result<(), ExecutionError> {

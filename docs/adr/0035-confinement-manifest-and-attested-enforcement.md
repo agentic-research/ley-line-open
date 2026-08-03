@@ -293,10 +293,19 @@ trust root. Mixing them produces specific, recognisable mistakes: reaching for a
 (a confidentiality tool) to hold a *public* trust root, or pulling an mTLS-shaped artifact
 into a DSSE-shaped verifier because both are "the notme cert thing".
 
-Repo ownership follows the same split. Signet owns capability grants; Interlace/notme owns
-workload identity and the authority that signs it; Cloister owns policy resolution and
-supplies the `EvidenceVerifier`; LLO owns none of them and verifies against what it is
-given. That is why `EvidenceVerifier` is a trait rather than an implementation.
+Repo ownership does **not** map one-lane-per-repo, which is the second thing routinely got
+wrong:
+
+| Repo | Owns |
+| --- | --- |
+| signet | The capability-grant vocabulary — `urn:signet:cap:<action>:<resource>` (lane 1). |
+| cloister | **Interlace** — the workload-identity substrate (`interlace-spec/`, their ADR-0007) — *and* policy resolution, the interface vocabulary (lane 3), and the `EvidenceVerifier` LLO is handed. Interlace is cloister's, not notme's; `INTERLACE_ROOT_PUBKEY` is a cloister deployment variable. |
+| notme | The deployed identity **authority** — one Ed25519 root issuing X.509 bridge certs and DPoP tokens, publishing `/.well-known/{signet-authority.json,jwks.json,ca-bundle.pem}`. The thing that *signs*, distinct from the lane whose assertions it signs. |
+| LLO | None of them. It verifies what it is given, which is why `EvidenceVerifier` is a trait and not an implementation. |
+
+So cloister owns two of the three lanes and notme owns the trust root, while lane 2's
+*spec* and lane 2's *authority* live in different repos. That asymmetry is the reason
+"Interlace/notme" reads as one thing and is not.
 
 ---
 

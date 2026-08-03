@@ -87,6 +87,20 @@ fn generated_execution_tool_schema(name: &str) -> Value {
         .unwrap_or_else(|| panic!("generated execution tool is missing: {name}"))
 }
 
+fn generated_execution_tool_description(name: &str) -> &'static str {
+    static TOOLS: OnceLock<Vec<Value>> = OnceLock::new();
+    let tools = TOOLS.get_or_init(|| {
+        serde_json::from_str(GENERATED_EXECUTION_TOOLS)
+            .expect("schema-bridge execution tool definitions must be valid JSON")
+    });
+    tools
+        .iter()
+        .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+        .and_then(|tool| tool.get("description"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("generated execution tool is missing: {name}"))
+}
+
 /// Build the canonical tool registry. The MCP `tools/list` response,
 /// the generated `server.json` (`tools/server-json-gen`), and the
 /// `cloister_groups()` partitioning all derive from this single list.
@@ -482,42 +496,42 @@ pub fn tool_registry() -> Vec<McpTool> {
     tools.extend([
         McpTool {
             name: "llo_execution_capabilities",
-            description: "Discover LLO execution/v1 and available isolation backends.",
+            description: generated_execution_tool_description("llo_execution_capabilities"),
             schema: generated_execution_tool_schema("llo_execution_capabilities"),
         },
         McpTool {
             name: "llo_execution_provision",
-            description: "Explicitly provision one supported execution backend.",
+            description: generated_execution_tool_description("llo_execution_provision"),
             schema: generated_execution_tool_schema("llo_execution_provision"),
         },
         McpTool {
             name: "llo_execution_status",
-            description: "Read substrate or one execution's current status without provisioning.",
+            description: generated_execution_tool_description("llo_execution_status"),
             schema: generated_execution_tool_schema("llo_execution_status"),
         },
         McpTool {
             name: "llo_execution_start",
-            description: "Authorize a signed execution/v1 RunSpec + RunGrant and start it through LLO.",
+            description: generated_execution_tool_description("llo_execution_start"),
             schema: generated_execution_tool_schema("llo_execution_start"),
         },
         McpTool {
             name: "llo_execution_inspect",
-            description: "Read ordered lifecycle events for one LLO execution.",
+            description: generated_execution_tool_description("llo_execution_inspect"),
             schema: generated_execution_tool_schema("llo_execution_inspect"),
         },
         McpTool {
             name: "llo_execution_collect",
-            description: "Collect the terminal content-addressed receipt for one execution.",
+            description: generated_execution_tool_description("llo_execution_collect"),
             schema: generated_execution_tool_schema("llo_execution_collect"),
         },
         McpTool {
             name: "llo_execution_cleanup",
-            description: "Idempotently release one execution's ephemeral resources.",
+            description: generated_execution_tool_description("llo_execution_cleanup"),
             schema: generated_execution_tool_schema("llo_execution_cleanup"),
         },
         McpTool {
             name: "llo_execution_cancel",
-            description: "Cancel an active execution through LLO's shared lifecycle.",
+            description: generated_execution_tool_description("llo_execution_cancel"),
             schema: generated_execution_tool_schema("llo_execution_cancel"),
         },
     ]);

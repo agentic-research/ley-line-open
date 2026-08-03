@@ -99,6 +99,20 @@
             "hdc_calibrate",
             "hdc_density"
           ]
+        },
+        {
+          "name": "execution",
+          "advertisedPrefix": "llo_execution_",
+          "upstreamNames": [
+            "llo_execution_capabilities",
+            "llo_execution_provision",
+            "llo_execution_status",
+            "llo_execution_start",
+            "llo_execution_inspect",
+            "llo_execution_cancel",
+            "llo_execution_collect",
+            "llo_execution_cleanup"
+          ]
         }
       ]
     }

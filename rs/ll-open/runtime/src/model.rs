@@ -117,6 +117,7 @@ pub struct BackendRun {
 #[serde(rename_all = "camelCase")]
 pub enum RunState {
     Running,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

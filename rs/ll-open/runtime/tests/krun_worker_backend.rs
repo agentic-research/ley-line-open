@@ -12,6 +12,8 @@ fn run_root_count(path: &std::path::Path) -> usize {
     fs::read_dir(path).expect("enumerate run roots").count()
 }
 
+const READY_TIMEOUT: Duration = Duration::from_secs(15);
+
 fn request() -> ExecutionRequest {
     ExecutionRequest {
         run_id: "run-backend-01".into(),
@@ -61,7 +63,7 @@ fn backend_spawns_the_explicit_first_party_worker_and_waits_for_ready() {
         libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
-        ready_timeout: Duration::from_secs(5),
+        ready_timeout: READY_TIMEOUT,
     });
 
     let capabilities = backend.capabilities();
@@ -102,7 +104,7 @@ fn backend_removes_the_run_root_when_a_worker_exits() {
         libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
-        ready_timeout: Duration::from_secs(5),
+        ready_timeout: READY_TIMEOUT,
     });
 
     backend.start(&request()).expect("ready worker");
@@ -145,7 +147,7 @@ fn backend_cancel_terminates_the_worker_and_removes_its_run_root() {
         libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
-        ready_timeout: Duration::from_secs(5),
+        ready_timeout: READY_TIMEOUT,
     });
 
     backend.start(&request()).expect("ready worker");
@@ -179,7 +181,7 @@ fn backend_enforces_the_wall_clock_limit_and_cleans_up() {
         libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
-        ready_timeout: Duration::from_secs(5),
+        ready_timeout: READY_TIMEOUT,
     });
     let mut request = request();
     request.limits.wall_time_ms = 50;
@@ -222,7 +224,7 @@ fn backend_cleanup_handles_guest_created_restrictive_directories() {
         libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
-        ready_timeout: Duration::from_secs(5),
+        ready_timeout: READY_TIMEOUT,
     });
 
     backend.start(&request()).expect("ready worker");
@@ -274,7 +276,7 @@ printf '%s\n' '{"type":"failed","error":{"code":"backend-failed","retryable":fal
         libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
-        ready_timeout: Duration::from_secs(5),
+        ready_timeout: READY_TIMEOUT,
     });
 
     let error = backend.start(&request()).expect_err("worker setup failure");
@@ -306,7 +308,7 @@ fn backend_rejects_a_duplicate_run_id_without_replacing_the_live_worker() {
         libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
-        ready_timeout: Duration::from_secs(5),
+        ready_timeout: READY_TIMEOUT,
     });
 
     backend.start(&request()).expect("first worker");
@@ -340,7 +342,7 @@ fn concurrent_starts_reserve_a_run_id_before_spawning() {
         libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
-        ready_timeout: Duration::from_secs(5),
+        ready_timeout: READY_TIMEOUT,
     }));
     let barrier = Arc::new(Barrier::new(3));
     let starts: Vec<_> = (0..2)

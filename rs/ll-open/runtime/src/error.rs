@@ -46,4 +46,12 @@ impl ExecutionError {
             detail: detail.into(),
         }
     }
+
+    pub(crate) fn internal(detail: impl Into<String>) -> Self {
+        Self {
+            code: ErrorCode::Internal,
+            retryable: false,
+            detail: detail.into(),
+        }
+    }
 }

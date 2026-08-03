@@ -13,6 +13,13 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Start one already validated execution.
     fn start(&self, request: &ExecutionRequest) -> Result<BackendRun, ExecutionError>;
+
+    /// Cancel one active execution and release backend-owned resources.
+    ///
+    /// The boolean is false when the backend has no active run with this ID;
+    /// transport adapters can project that as an idempotent no-op or a typed
+    /// not-found result without reaching into backend internals.
+    fn cancel(&self, run_id: &str) -> Result<bool, ExecutionError>;
 }
 
 #[derive(Default)]
@@ -79,5 +86,33 @@ impl<B: Backend> ExecutionService<B> {
             .insert(request.replay_key, request.run_id.clone());
         state.runs.insert(request.run_id, record.clone());
         Ok(record)
+    }
+
+    /// Cancel one active run and return its terminal record.
+    pub fn cancel(&self, run_id: &str) -> Result<RunRecord, ExecutionError> {
+        let existing = self
+            .state
+            .read()
+            .runs
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| ExecutionError::invalid("run_id not found"))?;
+
+        if existing.state == RunState::Cancelled {
+            return Ok(existing);
+        }
+        if !self.backend.cancel(run_id)? {
+            return Err(ExecutionError::backend(
+                "backend no longer owns the active run",
+            ));
+        }
+
+        let mut state = self.state.write();
+        let record = state
+            .runs
+            .get_mut(run_id)
+            .ok_or_else(|| ExecutionError::internal("run disappeared during cancellation"))?;
+        record.state = RunState::Cancelled;
+        Ok(record.clone())
     }
 }

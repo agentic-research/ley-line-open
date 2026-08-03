@@ -35,6 +35,14 @@ impl Backend for RecordingBackend {
             backend_id: "recording/1".into(),
         })
     }
+
+    fn cancel(&self, _run_id: &str) -> Result<bool, ExecutionError> {
+        self.calls
+            .lock()
+            .expect("recording backend lock")
+            .push("cancel");
+        Ok(true)
+    }
 }
 
 fn request(replay_key: &str) -> ExecutionRequest {
@@ -82,6 +90,27 @@ fn repeated_start_with_one_replay_key_returns_the_same_run() {
     assert_eq!(first.state, RunState::Running);
     assert_eq!(second.state, RunState::Running);
     assert_eq!(backend.calls(), vec!["start"]);
+}
+
+#[test]
+fn cancel_is_idempotent_and_updates_the_shared_lifecycle_state() {
+    let backend = RecordingBackend::default();
+    let service = ExecutionService::new(backend.clone());
+    service.start(request("cancel-1")).expect("start");
+
+    let cancelled = service.cancel("run-01").expect("cancel");
+    assert_eq!(cancelled.state, RunState::Cancelled);
+    assert_eq!(
+        service
+            .status("run-01")
+            .expect("status")
+            .expect("record")
+            .state,
+        RunState::Cancelled
+    );
+    let repeated = service.cancel("run-01").expect("repeat cancel");
+    assert_eq!(repeated.state, RunState::Cancelled);
+    assert_eq!(backend.calls(), vec!["start", "cancel"]);
 }
 
 #[test]

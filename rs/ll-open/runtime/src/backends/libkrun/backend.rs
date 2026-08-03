@@ -279,6 +279,10 @@ impl Backend for KrunWorkerBackend {
             backend_id: "libkrun/1".into(),
         })
     }
+
+    fn cancel(&self, run_id: &str) -> Result<bool, ExecutionError> {
+        KrunWorkerBackend::cancel(self, run_id)
+    }
 }
 
 impl Drop for KrunWorkerBackend {

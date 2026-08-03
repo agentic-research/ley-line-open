@@ -1,13 +1,16 @@
 use capnp::message::Builder;
+use capnp::message::ReaderOptions;
 use leyline_public_schema::execution_capnp;
 use leyline_runtime::authorization::{
     AuthorizationPolicy, EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION, authorize,
     canonical_digest,
 };
+use leyline_runtime::transport::{capabilities_json, start_json, status_json};
 use leyline_runtime::{
     Backend, BackendCapabilities, BackendClass, BackendRun, ExecutionError, ExecutionRequest,
     ExecutionResolver, ExecutionService, ResourceLimits,
 };
+use serde_json::json;
 use std::collections::BTreeMap;
 
 fn spec_bytes() -> Vec<u8> {
@@ -227,4 +230,48 @@ fn service_schema_entrypoint_authorizes_before_resolving() {
         .expect("schema request should enter shared lifecycle");
     assert!(record.run_id.starts_with("run-"));
     assert_eq!(record.state, leyline_runtime::RunState::Running);
+}
+
+fn spec_json(bytes: &[u8]) -> String {
+    let mut input = bytes;
+    let message = capnp::serialize::read_message(&mut input, ReaderOptions::new()).unwrap();
+    capnp_json::to_json(
+        message
+            .get_root::<execution_capnp::run_spec::Reader<'_>>()
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+fn grant_json(bytes: &[u8]) -> String {
+    let mut input = bytes;
+    let message = capnp::serialize::read_message(&mut input, ReaderOptions::new()).unwrap();
+    capnp_json::to_json(
+        message
+            .get_root::<execution_capnp::run_grant::Reader<'_>>()
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn json_adapter_uses_generated_input_and_output_shapes() {
+    let spec = spec_bytes();
+    let grant = grant_bytes(&spec, true, 2_000, 0);
+    let input = json!({
+        "spec": serde_json::from_str::<serde_json::Value>(&spec_json(&spec)).unwrap(),
+        "grant": serde_json::from_str::<serde_json::Value>(&grant_json(&grant)).unwrap(),
+    })
+    .to_string();
+    let service = ExecutionService::new(RecordingBackend);
+    let policy = AuthorizationPolicy {
+        now_unix_ms: 1_000,
+        required_backend: BackendClass::MicroVm,
+    };
+    let start = start_json(&service, &input, &policy, &TestResolver).expect("start JSON");
+    assert!(start.contains("run-"));
+    let status = status_json(&service, r#"{"runId":""}"#).expect("status JSON");
+    assert!(status.contains("test/1"));
+    let capabilities = capabilities_json(&service).expect("capabilities JSON");
+    assert!(capabilities.contains("cloister/execution/v1"));
 }

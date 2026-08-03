@@ -9,6 +9,7 @@ pub mod backends;
 mod error;
 mod model;
 mod service;
+pub mod transport;
 
 pub use error::{ErrorCode, ExecutionError};
 pub use model::{

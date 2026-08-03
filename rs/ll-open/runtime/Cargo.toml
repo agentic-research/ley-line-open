@@ -9,6 +9,7 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 blake3 = { workspace = true }
 capnp = { workspace = true }
+capnp-json = { workspace = true }
 leyline-public-schema = { path = "../../ll-core/public-schema", version = "0.14.0" }
 libloading = { workspace = true }
 leyline-core = { path = "../../ll-core/core", version = "0.14.0" }

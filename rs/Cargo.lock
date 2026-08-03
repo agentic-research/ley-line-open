@@ -4602,6 +4602,7 @@ version = "0.14.0"
 dependencies = [
  "blake3",
  "capnp",
+ "capnp-json",
  "leyline-core",
  "leyline-public-schema",
  "libloading 0.9.0",

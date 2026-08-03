@@ -187,14 +187,25 @@ fn resource_limits(limits: SchemaLimits) -> Result<ResourceLimits, ExecutionErro
             "output byte limits are not enforced by the execution backend",
         ));
     }
+    // The backend accepts whole vCPUs/MiB. Rounding up would widen the
+    // caller's authorized ceiling (e.g. 1001 millis -> 2 vCPUs), so reject
+    // values that cannot be represented exactly instead.
+    if !limits.cpu_millis.is_multiple_of(1_000) || !limits.memory_bytes.is_multiple_of(1024 * 1024)
+    {
+        return Err(ExecutionError::invalid(
+            "cpu and memory limits must be whole backend units",
+        ));
+    }
     let vcpus = limits
         .cpu_millis
-        .div_ceil(1_000)
+        .checked_div(1_000)
+        .ok_or_else(|| ExecutionError::invalid("cpu limit conversion failed"))?
         .try_into()
         .map_err(|_| ExecutionError::invalid("cpu limit exceeds backend capacity"))?;
     let memory_mib = limits
         .memory_bytes
-        .div_ceil(1024 * 1024)
+        .checked_div(1024 * 1024)
+        .ok_or_else(|| ExecutionError::invalid("memory limit conversion failed"))?
         .try_into()
         .map_err(|_| ExecutionError::invalid("memory limit exceeds backend capacity"))?;
     if vcpus == 0 || memory_mib == 0 || limits.wall_time_ms == 0 {

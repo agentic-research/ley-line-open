@@ -27,6 +27,34 @@ pub struct AuthorizationPolicy {
     pub required_confinement_digest: Option<String>,
 }
 
+/// A trust-domain adapter supplied by the embedding authority (Cloister /
+/// Interlace). LLO deliberately does not own Signet/NotMe trust roots.
+///
+/// `EvidenceRef` is a CAS reference, not proof by itself. An adapter must
+/// resolve the referenced canonical bytes and verify the appropriate signed
+/// envelope/certificate chain before authorization can be called with it.
+pub trait EvidenceVerifier {
+    fn verify(&self, field: &str, evidence: &EvidenceRef) -> Result<(), ExecutionError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceRef {
+    pub media_type: String,
+    pub digest: String,
+}
+
+/// Compatibility verifier for existing unit fixtures only. Production
+/// integrations must use an embedding-owned verifier and call
+/// [`authorize_with_verifier`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MetadataOnlyEvidenceVerifier;
+
+impl EvidenceVerifier for MetadataOnlyEvidenceVerifier {
+    fn verify(&self, _field: &str, _evidence: &EvidenceRef) -> Result<(), ExecutionError> {
+        Ok(())
+    }
+}
+
 impl Default for AuthorizationPolicy {
     fn default() -> Self {
         Self {
@@ -100,6 +128,22 @@ pub fn authorize(
     grant_bytes: &[u8],
     policy: &AuthorizationPolicy,
 ) -> Result<AuthorizedExecution, ExecutionError> {
+    authorize_with_verifier(
+        spec_bytes,
+        grant_bytes,
+        policy,
+        &MetadataOnlyEvidenceVerifier,
+    )
+}
+
+/// Validate and bind execution values after the embedding authority has
+/// verified every external identity/provenance evidence reference.
+pub fn authorize_with_verifier(
+    spec_bytes: &[u8],
+    grant_bytes: &[u8],
+    policy: &AuthorizationPolicy,
+    verifier: &dyn EvidenceVerifier,
+) -> Result<AuthorizedExecution, ExecutionError> {
     let spec_message = read_message(spec_bytes, "RunSpec")?;
     let grant_message = read_message(grant_bytes, "RunGrant")?;
     let spec = spec_message
@@ -134,14 +178,16 @@ pub fn authorize(
         ));
     }
 
-    validate_evidence(grant.get_issuer_evidence(), "issuerEvidence")?;
+    validate_evidence(grant.get_issuer_evidence(), "issuerEvidence", verifier)?;
     validate_evidence(
         grant.get_workload_identity_evidence(),
         "workloadIdentityEvidence",
+        verifier,
     )?;
     validate_evidence(
         grant.get_actor_provenance_evidence(),
         "actorProvenanceEvidence",
+        verifier,
     )?;
     let confinement_digest =
         read_digest(grant.get_confinement_digest(), "RunGrant.confinementDigest")?;
@@ -201,6 +247,14 @@ pub fn authorize(
         .iter()
         .map(|value| text(value, "allowedEgress entry"))
         .collect::<Result<Vec<_>, _>>()?;
+    let credential_brokers = grant.get_credential_broker_refs().map_err(|error| {
+        ExecutionError::invalid(format!("invalid credentialBrokerRefs: {error}"))
+    })?;
+    if !credential_brokers.is_empty() {
+        return Err(ExecutionError::unsupported(
+            "credential broker authority requires a broker integration",
+        ));
+    }
 
     Ok(AuthorizedExecution {
         run_id,
@@ -284,20 +338,65 @@ fn read_digest(
 fn validate_evidence(
     value: capnp::Result<execution_capnp::evidence_ref::Reader<'_>>,
     field: &str,
+    verifier: &dyn EvidenceVerifier,
 ) -> Result<(), ExecutionError> {
     let evidence =
         value.map_err(|error| ExecutionError::invalid(format!("invalid {field}: {error}")))?;
-    nonempty(
+    let media_type = nonempty(
         text(evidence.get_media_type(), &format!("{field}.mediaType"))?,
         field,
     )?;
-    let _ = read_digest(evidence.get_digest(), &format!("{field}.digest"))?;
+    let digest = read_digest(evidence.get_digest(), &format!("{field}.digest"))?;
+    verifier.verify(field, &EvidenceRef { media_type, digest })?;
     Ok(())
 }
 
 fn read_intent(
     spec: &execution_capnp::run_spec::Reader<'_>,
 ) -> Result<SchemaIntent, ExecutionError> {
+    let requested_interfaces = spec.get_requested_interfaces().map_err(|error| {
+        ExecutionError::invalid(format!("invalid requestedInterfaces: {error}"))
+    })?;
+    for interface in requested_interfaces.iter() {
+        let interface = text(interface, "requestedInterfaces entry")?;
+        if interface != EXECUTION_SCHEMA_VERSION {
+            return Err(ExecutionError::unsupported(format!(
+                "requested interface is not supported by this LLO execution surface: {interface}"
+            )));
+        }
+    }
+    if !spec
+        .get_secret_handles()
+        .map_err(|error| ExecutionError::invalid(format!("invalid secretHandles: {error}")))?
+        .is_empty()
+    {
+        return Err(ExecutionError::unsupported(
+            "secret handles require a credential broker integration",
+        ));
+    }
+    if !spec
+        .get_outputs()
+        .map_err(|error| ExecutionError::invalid(format!("invalid outputs: {error}")))?
+        .is_empty()
+    {
+        return Err(ExecutionError::unsupported(
+            "declared outputs require the collect/output backend",
+        ));
+    }
+    if spec
+        .get_cancellation_mode()
+        .map_err(|error| ExecutionError::invalid(format!("invalid cancellationMode: {error}")))?
+        != execution_capnp::CancellationMode::ExplicitOnly
+    {
+        return Err(ExecutionError::unsupported(
+            "cancel-on-disconnect is not supported by this execution surface",
+        ));
+    }
+    if spec.has_compatibility_runtime() {
+        return Err(ExecutionError::unsupported(
+            "compatibility runtime selection is not supported by this execution surface",
+        ));
+    }
     let executable = spec
         .get_executable()
         .map_err(|error| ExecutionError::invalid(format!("invalid executable: {error}")))?;
@@ -436,9 +535,21 @@ fn validate_workspaces(
         })
         .collect::<Result<Vec<_>, ExecutionError>>()?;
 
-    if resolved.iter().any(|entry| !requested.contains(entry)) {
+    // A grant must resolve exactly the requested workspace set.  A strict
+    // equality check prevents an omitted workspace from silently becoming an
+    // empty/implicitly-authorized input, and duplicate names are ambiguous.
+    if requested.len() != resolved.len()
+        || requested.iter().any(|entry| !resolved.contains(entry))
+        || resolved.iter().any(|entry| {
+            resolved
+                .iter()
+                .filter(|candidate| candidate.0 == entry.0)
+                .count()
+                != 1
+        })
+    {
         return Err(ExecutionError::invalid(
-            "grant workspace authority is not present in RunSpec.workspaceInputs",
+            "grant workspaces must exactly match RunSpec.workspaceInputs",
         ));
     }
     Ok(())

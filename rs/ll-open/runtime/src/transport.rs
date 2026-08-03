@@ -67,7 +67,17 @@ pub fn start_json<B: crate::Backend, R: ExecutionResolver>(
     let mut output_message = Builder::new_default();
     let mut output = output_message.init_root::<execution_capnp::start_output::Builder<'_>>();
     output.set_run_id(&record.run_id);
-    output.set_state(execution_capnp::RunState::Accepted);
+    output.set_state(match record.state {
+        RunState::Accepted => execution_capnp::RunState::Accepted,
+        RunState::Provisioning => execution_capnp::RunState::Provisioning,
+        RunState::Ready => execution_capnp::RunState::Ready,
+        RunState::Running => execution_capnp::RunState::Running,
+        RunState::Succeeded => execution_capnp::RunState::Succeeded,
+        RunState::Failed => execution_capnp::RunState::Failed,
+        RunState::Cancelled => execution_capnp::RunState::Cancelled,
+        RunState::Cleaning => execution_capnp::RunState::Cleaning,
+        RunState::Cleaned => execution_capnp::RunState::Cleaned,
+    });
     encode_start(output_message)
 }
 

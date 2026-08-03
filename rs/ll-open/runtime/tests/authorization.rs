@@ -2,8 +2,8 @@ use capnp::message::Builder;
 use capnp::message::ReaderOptions;
 use leyline_public_schema::execution_capnp;
 use leyline_runtime::authorization::{
-    AuthorizationPolicy, EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION, authorize,
-    canonical_digest,
+    AuthorizationPolicy, EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION, EvidenceRef,
+    EvidenceVerifier, authorize, canonical_digest,
 };
 use leyline_runtime::transport::{
     capabilities_json, cleanup_json, collect_json, start_json, status_json,
@@ -48,6 +48,18 @@ fn set_digest(mut digest: execution_capnp::digest_ref::Builder<'_>, value: &str)
 fn set_evidence(mut evidence: execution_capnp::evidence_ref::Builder<'_>) {
     evidence.set_media_type("application/test-evidence");
     set_digest(evidence.init_digest(), &"a".repeat(64));
+}
+
+struct RejectEvidence;
+
+impl EvidenceVerifier for RejectEvidence {
+    fn verify(&self, field: &str, _evidence: &EvidenceRef) -> Result<(), ExecutionError> {
+        Err(ExecutionError {
+            code: leyline_runtime::ErrorCode::Unauthenticated,
+            retryable: false,
+            detail: format!("unverified evidence: {field}"),
+        })
+    }
 }
 
 fn grant_bytes(spec_bytes: &[u8], capability: bool, expires_at: u64, wall_time_ms: u64) -> Vec<u8> {
@@ -133,6 +145,24 @@ fn rejects_expired_grants_and_missing_capability() {
     )
     .expect_err("grant without execution capability must be rejected");
     assert!(error.detail.contains("capability"));
+}
+
+#[test]
+fn verifier_adapter_can_fail_closed_before_backend_resolution() {
+    let spec = spec_bytes();
+    let grant = grant_bytes(&spec, true, 2_000, 0);
+    let error = leyline_runtime::authorization::authorize_with_verifier(
+        &spec,
+        &grant,
+        &AuthorizationPolicy {
+            now_unix_ms: 1_000,
+            required_backend: BackendClass::MicroVm,
+            required_confinement_digest: None,
+        },
+        &RejectEvidence,
+    )
+    .expect_err("unverified upstream evidence must fail closed");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::Unauthenticated);
 }
 
 #[test]

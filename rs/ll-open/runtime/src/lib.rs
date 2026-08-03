@@ -13,7 +13,8 @@ mod service;
 pub mod transport;
 
 pub use authorization::{
-    ArtifactIdentity, AuthorizedExecution, SchemaIntent, SchemaLimits, WorkspaceInput,
+    ArtifactIdentity, AuthorizedExecution, EvidenceRef, EvidenceVerifier,
+    MetadataOnlyEvidenceVerifier, SchemaIntent, SchemaLimits, WorkspaceInput,
 };
 pub use catalog::{CatalogBuilder, CatalogResolver};
 pub use error::{ErrorCode, ExecutionError};

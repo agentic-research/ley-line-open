@@ -7,7 +7,7 @@ use parking_lot::RwLock;
 use crate::{
     BackendCapabilities, BackendRun, BackendRunStatus, ExecutionError, ExecutionRequest,
     ReceiptContext, RunEventRecord, RunInspection, RunReceiptData, RunRecord, RunState,
-    authorization::{AuthorizationPolicy, AuthorizedExecution, authorize},
+    authorization::{AuthorizationPolicy, AuthorizedExecution},
 };
 
 /// Trusted boundary that resolves schema-level logical identities into the
@@ -204,12 +204,38 @@ impl<B: Backend> ExecutionService<B> {
         policy: &AuthorizationPolicy,
         resolver: &R,
     ) -> Result<RunRecord, ExecutionError> {
+        self.start_authorized_with_verifier(
+            spec_bytes,
+            grant_bytes,
+            policy,
+            resolver,
+            &crate::authorization::MetadataOnlyEvidenceVerifier,
+        )
+    }
+
+    /// Production entry point: the embedding authority supplies the verifier
+    /// for Signet/NotMe/Interlace evidence. The compatibility method above is
+    /// retained for existing local fixtures and must not be used as a trust
+    /// boundary.
+    pub fn start_authorized_with_verifier<R: ExecutionResolver>(
+        &self,
+        spec_bytes: &[u8],
+        grant_bytes: &[u8],
+        policy: &AuthorizationPolicy,
+        resolver: &R,
+        verifier: &dyn crate::authorization::EvidenceVerifier,
+    ) -> Result<RunRecord, ExecutionError> {
         if !self.is_provisioned() {
             return Err(ExecutionError::not_provisioned(
                 "execution backend must be explicitly provisioned before start",
             ));
         }
-        let authorized = authorize(spec_bytes, grant_bytes, policy)?;
+        let authorized = crate::authorization::authorize_with_verifier(
+            spec_bytes,
+            grant_bytes,
+            policy,
+            verifier,
+        )?;
         let request = resolver.resolve(&authorized)?;
         if request.run_id != authorized.run_id {
             return Err(ExecutionError::identity_mismatch(

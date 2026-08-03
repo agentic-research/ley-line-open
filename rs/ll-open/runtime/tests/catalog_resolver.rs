@@ -29,11 +29,21 @@ fn authorized() -> AuthorizedExecution {
             requested_limits: SchemaLimits {
                 wall_time_ms: 2_000,
                 memory_bytes: 2 * 1024 * 1024,
-                cpu_millis: 1_001,
+                cpu_millis: 2_000,
                 output_bytes: 0,
             },
         },
     }
+}
+
+#[test]
+fn catalog_resolver_rejects_limits_that_would_round_up() {
+    let mut intent = authorized();
+    intent.intent.requested_limits.cpu_millis = 1_001;
+    let error = resolver()
+        .resolve(&intent)
+        .expect_err("fractional CPU units must not be widened");
+    assert_eq!(error.code, ErrorCode::InvalidSpec);
 }
 
 fn resolver() -> CatalogResolver {

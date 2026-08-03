@@ -22,7 +22,11 @@ pub fn capabilities_json<B: crate::Backend>(
     let mut entries = output.reborrow().init_capabilities(2);
     entries.reborrow().get(0).set_name("cloister/execution/v1");
     entries.reborrow().get(0).set_version("v1");
-    entries.reborrow().get(1).set_name("backend/microvm");
+    let backend_name = match capabilities.backend_class {
+        crate::BackendClass::Native => "backend/native",
+        crate::BackendClass::MicroVm => "backend/microvm",
+    };
+    entries.reborrow().get(1).set_name(backend_name);
     entries
         .reborrow()
         .get(1)

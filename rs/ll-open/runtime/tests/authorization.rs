@@ -359,3 +359,34 @@ fn json_adapter_uses_generated_input_and_output_shapes() {
         cleanup_json(&service, &json!({"runId": run_id}).to_string()).expect("cleanup JSON");
     assert!(cleanup.contains("cleaned"));
 }
+
+#[test]
+fn capabilities_projection_uses_declared_backend_class() {
+    struct NativeBackend;
+    impl Backend for NativeBackend {
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                backend_id: "native-nono/1".into(),
+                backend_class: BackendClass::Native,
+                available: false,
+            }
+        }
+
+        fn start(
+            &self,
+            _request: &ExecutionRequest,
+        ) -> Result<leyline_runtime::BackendRun, ExecutionError> {
+            unreachable!("unavailable backend must not start")
+        }
+
+        fn cancel(&self, _run_id: &str) -> Result<bool, ExecutionError> {
+            Ok(false)
+        }
+    }
+
+    let capabilities =
+        capabilities_json(&ExecutionService::new(NativeBackend)).expect("capabilities JSON");
+    assert!(capabilities.contains("backend/native"));
+    assert!(!capabilities.contains("backend/microvm"));
+    assert!(capabilities.contains("unavailable"));
+}

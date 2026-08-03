@@ -22,6 +22,28 @@ pub trait ExecutionHandler: Send + Sync {
     fn cancel(&self, input: &Value) -> Result<String>;
 }
 
+/// Daemon extension that exposes one trusted execution/v1 handler.
+///
+/// The handler is constructed by the embedding application, where the host
+/// capability policy, CAS resolver, and backend configuration are available.
+/// Callers pass only signed execution intent over the daemon protocol; this
+/// extension never accepts host paths from a request.
+pub struct ExecutionDaemonExt {
+    handler: Arc<dyn ExecutionHandler>,
+}
+
+impl ExecutionDaemonExt {
+    pub fn new(handler: Arc<dyn ExecutionHandler>) -> Self {
+        Self { handler }
+    }
+}
+
+impl super::DaemonExt for ExecutionDaemonExt {
+    fn execution_handler(&self) -> Option<Arc<dyn ExecutionHandler>> {
+        Some(Arc::clone(&self.handler))
+    }
+}
+
 /// First-party handler backed by one shared LLO `ExecutionService`.
 pub struct RuntimeExecutionHandler<B, R> {
     service: Arc<ExecutionService<B>>,

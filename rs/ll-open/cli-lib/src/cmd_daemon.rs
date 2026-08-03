@@ -14,7 +14,10 @@ use leyline_core::ContentAddressed;
 use leyline_fs::graph::HotSwapGraph;
 
 use crate::cmd_serve;
-use crate::daemon::{DaemonContext, DaemonExt, DaemonPhase, DaemonState, EventRouter, NoExt};
+use crate::daemon::{
+    DaemonContext, DaemonExt, DaemonPhase, DaemonState, EventRouter, NoExt,
+    execution::{ExecutionDaemonExt, ExecutionHandler},
+};
 
 // ---------------------------------------------------------------------------
 // Tuning constants — extracted from the daemon orchestration so each magic
@@ -160,6 +163,33 @@ pub async fn cmd_daemon(config: DaemonConfig) -> Result<()> {
 /// 9. Cleanup (remove socket file)
 pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result<()> {
     run_daemon_with_options(config, ext, DaemonOptions::default()).await
+}
+
+/// Run a daemon with the first-party execution/v1 surface enabled.
+///
+/// `handler` must be constructed by a trusted embedding application. In
+/// particular, rootfs/CAS resolution and backend host paths are never read
+/// from execution requests received over UDS. Existing callers that do not
+/// need execution continue to use [`run_daemon`] with [`NoExt`].
+pub async fn run_execution_daemon(
+    config: DaemonConfig,
+    handler: Arc<dyn ExecutionHandler>,
+) -> Result<()> {
+    run_daemon_with_options(
+        config,
+        Arc::new(ExecutionDaemonExt::new(handler)),
+        DaemonOptions::default(),
+    )
+    .await
+}
+
+/// Variant of [`run_execution_daemon`] with explicit daemon options.
+pub async fn run_execution_daemon_with_options(
+    config: DaemonConfig,
+    handler: Arc<dyn ExecutionHandler>,
+    options: DaemonOptions,
+) -> Result<()> {
+    run_daemon_with_options(config, Arc::new(ExecutionDaemonExt::new(handler)), options).await
 }
 
 /// Run the daemon with explicit additive behavior options.

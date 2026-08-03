@@ -89,11 +89,15 @@ the Hypervisor.framework entitlement; see
 [`libkrun_guest_write.rs`](rs/ll-open/runtime/tests/libkrun_guest_write.rs) and
 bead `ley-line-open-16a994` for the CI/release gate.
 
-The execution/v1 API is exposed through the runtime crate, daemon UDS dispatch,
-first-party CLI, and MCP registry. Its schema version
+The execution/v1 API is exposed through the runtime crate, the explicit
+`run_execution_daemon` UDS entry point, first-party CLI client, and MCP
+registry. Its schema version
 (`cloister/execution/v1`) is deliberately independent of the repository and
 crate release version; consumers must negotiate API compatibility rather than
-infer it from `v0.14.0`. The service currently proves authorization,
+infer it from `v0.14.0`. The ordinary open `leyline daemon` command remains a
+substrate daemon with no execution backend; an embedding application must opt
+into `run_execution_daemon` after constructing a trusted resolver/backend
+handler. The service currently proves authorization,
 provisioning, ordered lifecycle events, cancellation, cleanup, and
 content-addressed receipt assembly. Native nono execution and mmap-backed CAS
 projection remain separate follow-on gates in beads `ley-line-open-f81567` and

@@ -42,6 +42,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 pub use events::EventRouter;
+pub use execution::ExecutionDaemonExt;
 pub use ext::{DaemonExt, NoExt};
 
 /// Wall-clock millis since UNIX_EPOCH. Used by the daemon's `last_*_ms`

@@ -17,7 +17,9 @@ pub fn capabilities_json<B: crate::Backend>(
     let mut message = Builder::new_default();
     let mut output = message.init_root::<execution_capnp::capabilities_output::Builder<'_>>();
     let capabilities = service.capabilities();
-    let mut entries = output.reborrow().init_capabilities(3);
+    // Advertise only backends actually owned by this service. A placeholder
+    // native entry would make capability discovery lie to Cloister.
+    let mut entries = output.reborrow().init_capabilities(2);
     entries.reborrow().get(0).set_name("cloister/execution/v1");
     entries.reborrow().get(0).set_version("v1");
     entries.reborrow().get(1).set_name("backend/microvm");
@@ -29,8 +31,6 @@ pub fn capabilities_json<B: crate::Backend>(
         } else {
             "unavailable"
         });
-    entries.reborrow().get(2).set_name("backend/native");
-    entries.get(2).set_version("not-configured");
     encode_capabilities(message)
 }
 

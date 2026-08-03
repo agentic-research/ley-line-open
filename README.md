@@ -89,9 +89,15 @@ the Hypervisor.framework entitlement; see
 [`libkrun_guest_write.rs`](rs/ll-open/runtime/tests/libkrun_guest_write.rs) and
 bead `ley-line-open-16a994` for the CI/release gate.
 
-This is a backend vertical slice, not yet the complete product API: terminal
-execution/v1 receipts and mmap-backed CAS projection are tracked separately by
-beads `ley-line-open-16aa10` and `ley-line-open-16c953`.
+The execution/v1 API is exposed through the runtime crate, daemon UDS dispatch,
+first-party CLI, and MCP registry. Its schema version
+(`cloister/execution/v1`) is deliberately independent of the repository and
+crate release version; consumers must negotiate API compatibility rather than
+infer it from `v0.14.0`. The service currently proves authorization,
+provisioning, ordered lifecycle events, cancellation, cleanup, and
+content-addressed receipt assembly. Native nono execution and mmap-backed CAS
+projection remain separate follow-on gates in beads `ley-line-open-f81567` and
+`ley-line-open-16c953`.
 
 Mutation testing remains a separate hardening pass: use the repository's
 `task mutants:diff DIFF=<path>` gate after the runtime edge-case tests are

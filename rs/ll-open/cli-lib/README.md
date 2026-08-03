@@ -5,7 +5,12 @@ The ley-line daemon — living SQLite database + arena snapshot loop + UDS/MCP s
 ## What's here
 
 - **`cmd_daemon`** — daemon entry point. Owns the living db (in-memory SQLite), the Σ snapshot loop (arena flip + BLAKE3 root advance), and lifecycle phases (`Initializing` → `Parsing` → `Enriching` → `Ready`).
-- **`daemon::ops`** — request dispatch. 23 base ops grouped by purpose: lifecycle (status, flush, load, snapshot, reparse, enrich), navigation (list_roots, list_children, get_node, read_content), graph queries (find_callers, find_callees, find_defs, get_refs_map, get_defs_map), introspection (get_schema, get_db_path), LSP (lsp_hover, lsp_defs, lsp_refs, lsp_symbols, lsp_diagnostics), bulk SQL (query), and embedding search (vec_search, feature-gated). Adding a new op: variant in `BaseRequest`, arm in `dispatch_typed`, entry in `is_known_base_op`.
+- **`daemon::ops`** — request dispatch. Base substrate ops and the
+  schema-owned `llo_execution_*` operations share this table. Execution
+  requests are authorized and lifecycle-managed by `leyline-runtime`; the
+  daemon does not duplicate policy or shell out to `krunvm`/Taskfile. Adding a
+  new op: variant in `BaseRequest`, arm in `dispatch_typed`, entry in
+  `is_known_base_op`, and the generated execution schema when applicable.
 - **`daemon::wire`** — request-side serde dispatch (`BaseRequest` tagged enum + `LspPosition`/`LspFile` typed args). The response side is generated from `daemon.capnp` via the capnp-json codec; there is no hand-written response mirror after b0ea2e.
 - **`daemon::socket`** — UDS read loop, dispatch chain (event ops → base ops → extension async → extension sync → unknown).
 - **`daemon::mcp`** — MCP HTTP transport. Maps each base op to an `McpTool` and routes through the same `handle_base_op_value` entry as the UDS path.
@@ -32,5 +37,10 @@ Every base-op response except `query`/`lsp_*`/`vec_search` is typed against `dae
 
 - `tests/fixtures/daemon-protocol.json` + `tests/integration.rs::daemon_protocol_gate_handlers_emit_required_keys` — runtime handler ↔ schema parity
 - `clients/go/leyline-schema/daemon/daemon_protocol_test.go` — cross-runtime: every fixture decodes into typed Go bindings under strict-unmarshal
+
+Execution API compatibility is versioned by the public schema
+(`cloister/execution/v1`), not by this crate's release number. The normative
+Cap'n Proto IDL generates the Rust bindings and MCP tool definitions; consumers
+must not recreate the nested `RunSpec`/`RunGrant` shapes by hand.
 
 Both gates are load-bearing; `wire.rs` is hand-written (request enum + LSP args + intermediate plain data) and the response side is codegen'd at runtime by capnp-json from the typed `daemon.capnp` schema.

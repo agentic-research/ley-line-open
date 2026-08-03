@@ -42,6 +42,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::sync::OnceLock;
 
 use super::DaemonContext;
 use super::auth;
@@ -62,6 +63,28 @@ pub struct McpTool {
     pub name: &'static str,
     pub description: &'static str,
     pub schema: Value,
+}
+
+const GENERATED_EXECUTION_TOOLS: &str = include_str!("execution-tools.json");
+
+/// Return the IDL-generated input schema for one execution/v1 MCP tool.
+///
+/// The generated artifact carries the complete `$defs` graph (RunSpec,
+/// RunGrant, ArtifactRef, and nested evidence types). Keeping this lookup at
+/// the registry boundary prevents transport code from silently replacing
+/// those definitions with permissive `{type: object}` placeholders.
+fn generated_execution_tool_schema(name: &str) -> Value {
+    static TOOLS: OnceLock<Vec<Value>> = OnceLock::new();
+    let tools = TOOLS.get_or_init(|| {
+        serde_json::from_str(GENERATED_EXECUTION_TOOLS)
+            .expect("schema-bridge execution tool definitions must be valid JSON")
+    });
+    tools
+        .iter()
+        .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+        .and_then(|tool| tool.get("inputSchema"))
+        .cloned()
+        .unwrap_or_else(|| panic!("generated execution tool is missing: {name}"))
 }
 
 /// Build the canonical tool registry. The MCP `tools/list` response,
@@ -460,72 +483,42 @@ pub fn tool_registry() -> Vec<McpTool> {
         McpTool {
             name: "llo_execution_capabilities",
             description: "Discover LLO execution/v1 and available isolation backends.",
-            schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
+            schema: generated_execution_tool_schema("llo_execution_capabilities"),
         },
         McpTool {
             name: "llo_execution_provision",
             description: "Explicitly provision one supported execution backend.",
-            schema: json!({
-                "type": "object",
-                "properties": {"backendClass": {"type": "string"}, "idempotencyKey": {"type": "string"}},
-                "required": ["backendClass", "idempotencyKey"],
-                "additionalProperties": false
-            }),
+            schema: generated_execution_tool_schema("llo_execution_provision"),
         },
         McpTool {
             name: "llo_execution_status",
             description: "Read substrate or one execution's current status without provisioning.",
-            schema: json!({"type": "object", "properties": {"runId": {"type": "string"}}, "additionalProperties": false}),
+            schema: generated_execution_tool_schema("llo_execution_status"),
         },
         McpTool {
             name: "llo_execution_start",
             description: "Authorize a signed execution/v1 RunSpec + RunGrant and start it through LLO.",
-            schema: json!({
-                "type": "object",
-                "properties": {"spec": {"type": "object"}, "grant": {"type": "object"}},
-                "required": ["spec", "grant"],
-                "additionalProperties": false
-            }),
+            schema: generated_execution_tool_schema("llo_execution_start"),
         },
         McpTool {
             name: "llo_execution_inspect",
             description: "Read ordered lifecycle events for one LLO execution.",
-            schema: json!({
-                "type": "object",
-                "properties": {"runId": {"type": "string"}, "afterSequence": {"type": "integer"}},
-                "required": ["runId"],
-                "additionalProperties": false
-            }),
+            schema: generated_execution_tool_schema("llo_execution_inspect"),
         },
         McpTool {
             name: "llo_execution_collect",
             description: "Collect the terminal content-addressed receipt for one execution.",
-            schema: json!({
-                "type": "object",
-                "properties": {"runId": {"type": "string"}},
-                "required": ["runId"],
-                "additionalProperties": false
-            }),
+            schema: generated_execution_tool_schema("llo_execution_collect"),
         },
         McpTool {
             name: "llo_execution_cleanup",
             description: "Idempotently release one execution's ephemeral resources.",
-            schema: json!({
-                "type": "object",
-                "properties": {"runId": {"type": "string"}, "idempotencyKey": {"type": "string"}},
-                "required": ["runId"],
-                "additionalProperties": false
-            }),
+            schema: generated_execution_tool_schema("llo_execution_cleanup"),
         },
         McpTool {
             name: "llo_execution_cancel",
             description: "Cancel an active execution through LLO's shared lifecycle.",
-            schema: json!({
-                "type": "object",
-                "properties": {"runId": {"type": "string"}, "idempotencyKey": {"type": "string"}},
-                "required": ["runId"],
-                "additionalProperties": false
-            }),
+            schema: generated_execution_tool_schema("llo_execution_cancel"),
         },
     ]);
 
@@ -1129,6 +1122,37 @@ mod tests {
         ] {
             assert!(names.contains(op), "missing LSP tool: {op}");
         }
+    }
+
+    #[test]
+    fn execution_registry_uses_idl_generated_nested_schemas() {
+        let tools = tool_registry();
+        let start = tools
+            .iter()
+            .find(|tool| tool.name == "llo_execution_start")
+            .expect("execution start tool");
+        let defs = start
+            .schema
+            .get("$defs")
+            .and_then(Value::as_object)
+            .expect("generated start schema definitions");
+        for name in [
+            "RunSpec",
+            "RunGrant",
+            "ArtifactRef",
+            "DigestRef",
+            "EvidenceRef",
+        ] {
+            assert!(defs.contains_key(name), "missing generated $defs.{name}");
+        }
+        assert_eq!(
+            start.schema["properties"]["spec"]["$ref"],
+            "#/$defs/RunSpec"
+        );
+        assert_eq!(
+            start.schema["properties"]["grant"]["$ref"],
+            "#/$defs/RunGrant"
+        );
     }
 
     #[test]

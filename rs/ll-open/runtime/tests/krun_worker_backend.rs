@@ -42,7 +42,7 @@ fn backend_spawns_the_explicit_first_party_worker_and_waits_for_ready() {
     fs::write(
         &worker,
         format!(
-            "#!/bin/sh\n/bin/cat > '{}'\nprintf '%s\\n' '{{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}}' >&2\n/bin/sleep 2\n",
+            "#!/bin/sh\n/bin/cat > '{}'\nprintf '%s\\n' '{{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}}' >&2\n/usr/bin/tail -f /dev/null\n",
             request_log.display()
         ),
     )
@@ -128,7 +128,7 @@ fn backend_cancel_terminates_the_worker_and_removes_its_run_root() {
     let worker = fixture.path().join("leyline-krun-worker");
     fs::write(
         &worker,
-        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n/bin/sleep 30\n",
+        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n/usr/bin/tail -f /dev/null\n",
     )
     .expect("fake worker");
     fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("worker mode");
@@ -205,7 +205,7 @@ fn backend_cleanup_handles_guest_created_restrictive_directories() {
     let worker = fixture.path().join("leyline-krun-worker");
     fs::write(
         &worker,
-        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n/bin/sleep 30\n",
+        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n/usr/bin/tail -f /dev/null\n",
     )
     .expect("fake worker");
     fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("worker mode");
@@ -289,7 +289,7 @@ fn backend_rejects_a_duplicate_run_id_without_replacing_the_live_worker() {
     let worker = fixture.path().join("leyline-krun-worker");
     fs::write(
         &worker,
-        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n/bin/sleep 30\n",
+        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n/usr/bin/tail -f /dev/null\n",
     )
     .expect("fake worker");
     fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("worker mode");
@@ -323,7 +323,7 @@ fn concurrent_starts_reserve_a_run_id_before_spawning() {
     let worker = fixture.path().join("leyline-krun-worker");
     fs::write(
         &worker,
-        "#!/bin/sh\n/bin/cat >/dev/null\n/bin/sleep 0.2\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n/bin/sleep 30\n",
+        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n/usr/bin/tail -f /dev/null\n",
     )
     .expect("fake worker");
     fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("worker mode");

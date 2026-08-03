@@ -22,6 +22,9 @@ pub const EXECUTION_CAPABILITY: &str = "urn:signet:cap:execute:run";
 pub struct AuthorizationPolicy {
     pub now_unix_ms: u64,
     pub required_backend: BackendClass,
+    /// Digest of the confinement policy the selected backend will enforce.
+    /// A grant for any other policy is rejected before resolver invocation.
+    pub required_confinement_digest: Option<String>,
 }
 
 impl Default for AuthorizationPolicy {
@@ -32,6 +35,7 @@ impl Default for AuthorizationPolicy {
                 .unwrap_or_default()
                 .as_millis() as u64,
             required_backend: BackendClass::MicroVm,
+            required_confinement_digest: None,
         }
     }
 }
@@ -141,6 +145,13 @@ pub fn authorize(
     )?;
     let confinement_digest =
         read_digest(grant.get_confinement_digest(), "RunGrant.confinementDigest")?;
+    if let Some(required) = &policy.required_confinement_digest
+        && required != &confinement_digest
+    {
+        return Err(ExecutionError::identity_mismatch(
+            "RunGrant confinement digest does not match the enforcement policy",
+        ));
+    }
     validate_limits(spec.get_requested_limits(), grant.get_limits())?;
     validate_workspaces(spec.get_workspace_inputs(), grant.get_workspaces())?;
     let intent = read_intent(&spec)?;

@@ -94,6 +94,7 @@ fn binds_grant_to_spec_and_derives_run_id() {
         &AuthorizationPolicy {
             now_unix_ms: 1_000,
             required_backend: BackendClass::MicroVm,
+            required_confinement_digest: None,
         },
     )
     .expect("valid bound grant");
@@ -114,6 +115,7 @@ fn rejects_expired_grants_and_missing_capability() {
         &AuthorizationPolicy {
             now_unix_ms: 1_000,
             required_backend: BackendClass::MicroVm,
+            required_confinement_digest: None,
         },
     )
     .expect_err("expired grant must be rejected");
@@ -126,6 +128,7 @@ fn rejects_expired_grants_and_missing_capability() {
         &AuthorizationPolicy {
             now_unix_ms: 1_000,
             required_backend: BackendClass::MicroVm,
+            required_confinement_digest: None,
         },
     )
     .expect_err("grant without execution capability must be rejected");
@@ -143,6 +146,7 @@ fn rejects_grant_bound_to_different_spec() {
         &AuthorizationPolicy {
             now_unix_ms: 1_000,
             required_backend: BackendClass::MicroVm,
+            required_confinement_digest: None,
         },
     )
     .expect_err("digest from a different spec must be rejected");
@@ -159,10 +163,31 @@ fn rejects_grant_that_widens_requested_limits() {
         &AuthorizationPolicy {
             now_unix_ms: 1_000,
             required_backend: BackendClass::MicroVm,
+            required_confinement_digest: None,
         },
     )
     .expect_err("widened grant must be rejected");
     assert!(error.detail.contains("widens"));
+}
+
+#[test]
+fn rejects_grant_with_a_confinement_policy_the_backend_will_not_enforce() {
+    let spec = spec_bytes();
+    let grant = grant_bytes(&spec, true, 2_000, 0);
+    let error = authorize(
+        &spec,
+        &grant,
+        &AuthorizationPolicy {
+            now_unix_ms: 1_000,
+            required_backend: BackendClass::MicroVm,
+            required_confinement_digest: Some(format!("blake3-256:{}", "c".repeat(64))),
+        },
+    )
+    .expect_err("confinement digest mismatch must fail before resolution");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::IdentityPolicyMismatch
+    );
 }
 
 struct RecordingBackend;
@@ -255,6 +280,7 @@ fn service_schema_entrypoint_authorizes_before_resolving() {
             &AuthorizationPolicy {
                 now_unix_ms: 1_000,
                 required_backend: BackendClass::MicroVm,
+                required_confinement_digest: None,
             },
             &TestResolver,
         )
@@ -288,6 +314,7 @@ fn natural_backend_completion_can_collect_a_schema_receipt() {
             &AuthorizationPolicy {
                 now_unix_ms: 1_000,
                 required_backend: BackendClass::MicroVm,
+                required_confinement_digest: None,
             },
             &TestResolver,
         )
@@ -335,6 +362,7 @@ fn json_adapter_uses_generated_input_and_output_shapes() {
     let policy = AuthorizationPolicy {
         now_unix_ms: 1_000,
         required_backend: BackendClass::MicroVm,
+        required_confinement_digest: None,
     };
     let provision = leyline_runtime::transport::provision_json(
         &service,

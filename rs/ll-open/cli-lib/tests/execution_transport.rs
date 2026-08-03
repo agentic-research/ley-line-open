@@ -152,6 +152,7 @@ fn canonical_fixture_uses_one_runtime_handler_for_lifecycle_operations() {
         AuthorizationPolicy {
             now_unix_ms: 1_000,
             required_backend: BackendClass::MicroVm,
+            required_confinement_digest: None,
         },
         Arc::new(Resolver),
     );

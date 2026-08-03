@@ -6,6 +6,7 @@ use thiserror::Error;
 #[serde(rename_all = "kebab-case")]
 pub enum ErrorCode {
     InvalidSpec,
+    IdentityPolicyMismatch,
     UnsupportedBackend,
     ResourceConflict,
     ResourceExhausted,
@@ -34,6 +35,14 @@ impl ExecutionError {
     pub(crate) fn unsupported(detail: impl Into<String>) -> Self {
         Self {
             code: ErrorCode::UnsupportedBackend,
+            retryable: false,
+            detail: detail.into(),
+        }
+    }
+
+    pub(crate) fn identity_mismatch(detail: impl Into<String>) -> Self {
+        Self {
+            code: ErrorCode::IdentityPolicyMismatch,
             retryable: false,
             detail: detail.into(),
         }

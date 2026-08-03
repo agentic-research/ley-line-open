@@ -24,4 +24,5 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+hex = { workspace = true }
 wait-timeout = "0.2"

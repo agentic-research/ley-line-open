@@ -4605,6 +4605,7 @@ dependencies = [
  "blake3",
  "capnp",
  "capnp-json",
+ "hex",
  "leyline-core",
  "leyline-envelope",
  "leyline-public-schema",

@@ -1343,6 +1343,31 @@ tasks:
         fi
         echo "compatibility.json is up to date"
 
+  gen:execution-tools:
+    desc: |
+      Regenerate cli-lib's execution-tools.json from the execution/v1 IDL
+      through the tooldefs schema-bridge plugin — the same emitter
+      `leyline-schema-bridge`'s execution_v1 conformance test compares
+      against. Run after any edit to execution.capnp, including doc
+      annotations, which are part of the emitted tool descriptions.
+
+      Without this the only signal is that test failing with "registry
+      artifact drifted", which says a regeneration is owed but not how to
+      perform one.
+    dir: rs
+    cmds:
+      - |
+        set -eu
+        out="$(mktemp -d)"
+        trap 'rm -rf "$out"' EXIT
+        cargo build --quiet -p leyline-schema-bridge \
+          --bin capnpc-schema-bridge-tooldefs
+        capnp compile \
+          -o"$PWD/target/debug/capnpc-schema-bridge-tooldefs:$out" \
+          ll-core/schema-spec/execution/v1/execution.capnp
+        cp "$out/execution.tools.json" ll-open/cli-lib/src/daemon/execution-tools.json
+        echo "regenerated ll-open/cli-lib/src/daemon/execution-tools.json"
+
   gen:server-json:
     desc: |
       Regenerate server.json from leyline-cli-lib::daemon::mcp

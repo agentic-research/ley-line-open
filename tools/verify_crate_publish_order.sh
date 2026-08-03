@@ -87,7 +87,8 @@ for required in \
     _traits.capnp \
     execution/v1/execution.capnp \
     execution/v1/VECTORS.sha256 \
-    execution/v1/test-vectors/canonical-run.json
+    execution/v1/test-vectors/canonical-run.json \
+    execution/v1/test-vectors/run-id.json
 do
     grep -Fqx "$required" "$tmp_dir/schema-files" || {
         echo "schema-spec package omits canonical IDL asset: $required" >&2

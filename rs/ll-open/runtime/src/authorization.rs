@@ -37,14 +37,112 @@ pub struct AuthorizationPolicy {
     pub required_confinement_digest: Option<String>,
 }
 
+/// Which authority a `RunGrant` evidence reference is claimed to carry.
+///
+/// The three references are structurally identical, so a role passed as a
+/// `&str` is only as good as the caller's discipline — and the original
+/// implementation used it for error strings alone, which is how one trusted
+/// envelope came to satisfy all three at once. A closed enum makes the roles
+/// distinguishable by type, and gives a verifier a value it can require the
+/// evidence to name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EvidenceField {
+    Issuer,
+    WorkloadIdentity,
+    ActorProvenance,
+}
+
+impl EvidenceField {
+    /// The `RunGrant` field name — and the in-toto subject name a statement
+    /// must carry for the statement to assert this role.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Issuer => "issuerEvidence",
+            Self::WorkloadIdentity => "workloadIdentityEvidence",
+            Self::ActorProvenance => "actorProvenanceEvidence",
+        }
+    }
+}
+
+impl std::fmt::Display for EvidenceField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The run an evidence reference must authorize.
+///
+/// Evidence that merely *exists* and verifies is not authority to execute:
+/// without this, any envelope in the trusted catalog authorizes any run. The
+/// run identity is derived from the bound spec digest and the grant's
+/// identity fields before any evidence is checked, so a verifier can require
+/// the evidence to commit to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceBinding {
+    /// Content-addressed identity of the run being authorized, in the
+    /// `run-<64 hex>` form [`derive_run_id`] produces.
+    pub run_id: String,
+    /// Canonical digest of the `RunSpec` the grant binds.
+    pub spec_digest: String,
+}
+
+/// A `RunGrant`'s detached issuer signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantSignature {
+    /// Signature algorithm; `ed25519` is the only value execution/v1 defines.
+    pub algorithm: String,
+    /// Unauthenticated issuer hint. A verifier must check every trusted key
+    /// regardless and never select one by this — the same parity-not-lookup
+    /// rule DSSE's `keyid` follows (signet ADR-012 R1).
+    pub key_id: String,
+    pub value: Vec<u8>,
+}
+
+/// A `RunGrant` presented for authorization, with the exact bytes its issuer
+/// signature covers already computed.
+///
+/// A verifier is handed the covered bytes rather than the grant, so it cannot
+/// disagree with the substrate about what was signed — the classic
+/// reimplementation bug in detached-signature schemes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedGrant {
+    /// Cap'n Proto canonical bytes of the grant with `signature` cleared.
+    /// A valid signature is over
+    /// `PAE(GRANT_SIGNATURE_PAYLOAD_TYPE, signing_bytes)`.
+    pub signing_bytes: Vec<u8>,
+    /// The carried signature; `None` when the grant is unsigned.
+    pub signature: Option<GrantSignature>,
+}
+
+/// DSSE pre-authentication payload type separating a `RunGrant` signature
+/// from every other Ed25519 signature in the substrate.
+pub const GRANT_SIGNATURE_PAYLOAD_TYPE: &str = "application/vnd.cloister.execution.run-grant+capnp";
+
 /// A trust-domain adapter supplied by the embedding authority (Cloister /
 /// Interlace). LLO deliberately does not own Signet/NotMe trust roots.
 ///
+/// One adapter owns the whole execution/v1 trust domain: the issuer signature
+/// on the grant, and each of the three evidence references it carries.
+///
 /// `EvidenceRef` is a CAS reference, not proof by itself. An adapter must
 /// resolve the referenced canonical bytes and verify the appropriate signed
-/// envelope/certificate chain before authorization can be called with it.
+/// envelope/certificate chain before authorization can be called with it —
+/// and must check that what it verified authorizes `binding`, not merely
+/// that it verifies.
 pub trait EvidenceVerifier: Send + Sync {
-    fn verify(&self, field: &str, evidence: &EvidenceRef) -> Result<(), ExecutionError>;
+    fn verify(
+        &self,
+        field: EvidenceField,
+        binding: &EvidenceBinding,
+        evidence: &EvidenceRef,
+    ) -> Result<(), ExecutionError>;
+
+    /// Check that this grant's fields were authorized by an issuer this trust
+    /// domain accepts. Every other check in `authorize` reads fields the
+    /// grant chose for itself; without this one, nothing ties `capabilities`,
+    /// `limits`, `backendClass`, `confinementDigest` or `expiresAtUnixMs` to
+    /// an authority.
+    fn verify_grant(&self, grant: &SignedGrant) -> Result<(), ExecutionError>;
 }
 
 /// Minimal CAS interface needed by the built-in APAS DSSE verifier. Cloister
@@ -69,7 +167,12 @@ impl<S: EvidenceStore> CasDsseEvidenceVerifier<S> {
 }
 
 impl<S: EvidenceStore> EvidenceVerifier for CasDsseEvidenceVerifier<S> {
-    fn verify(&self, field: &str, evidence: &EvidenceRef) -> Result<(), ExecutionError> {
+    fn verify(
+        &self,
+        field: EvidenceField,
+        binding: &EvidenceBinding,
+        evidence: &EvidenceRef,
+    ) -> Result<(), ExecutionError> {
         if evidence.media_type != "application/vnd.in-toto+json" {
             return Err(ExecutionError::unsupported(format!(
                 "{field} is not an APAS in-toto evidence envelope"
@@ -112,7 +215,84 @@ impl<S: EvidenceStore> EvidenceVerifier for CasDsseEvidenceVerifier<S> {
                 detail: format!("{field} DSSE predicate is not APAS Handoff/v1"),
             });
         }
-        Ok(())
+        // The statement must assert *this* role for *this* run. A subject
+        // named for the role is the issuer's assertion of it; the subject's
+        // BLAKE3 digest is the run it commits to. Without both, one trusted
+        // envelope authorizes every run and every role.
+        let mut asserts_role = false;
+        for subject in statement.subject() {
+            if subject.name() != field.as_str() {
+                continue;
+            }
+            asserts_role = true;
+            let Some(claimed) = subject.digest(RUN_BINDING_ALGORITHM) else {
+                continue;
+            };
+            // ADR-012 R4: gate the identifier against its shape here rather
+            // than comparing whatever string arrived, and R1: compare for
+            // equality against a run identity we derived — never look
+            // anything up by it.
+            if !is_run_id(claimed) {
+                return Err(ExecutionError {
+                    code: crate::ErrorCode::Unauthenticated,
+                    retryable: false,
+                    detail: format!("{field} subject digest is not a run identity"),
+                });
+            }
+            if claimed == binding.run_id {
+                return Ok(());
+            }
+        }
+        Err(ExecutionError {
+            code: crate::ErrorCode::Unauthenticated,
+            retryable: false,
+            detail: if asserts_role {
+                format!("{field} does not authorize this run")
+            } else {
+                format!("{field} statement asserts no {field} subject")
+            },
+        })
+    }
+
+    fn verify_grant(&self, grant: &SignedGrant) -> Result<(), ExecutionError> {
+        let unauthenticated = |detail: String| ExecutionError {
+            code: crate::ErrorCode::Unauthenticated,
+            retryable: false,
+            detail,
+        };
+        let signature = grant
+            .signature
+            .as_ref()
+            .ok_or_else(|| unauthenticated("RunGrant carries no issuer signature".into()))?;
+        if signature.algorithm != GRANT_SIGNATURE_ALGORITHM {
+            return Err(unauthenticated(format!(
+                "RunGrant signature algorithm {:?} is not supported",
+                signature.algorithm
+            )));
+        }
+        let value: [u8; 64] = signature.value.as_slice().try_into().map_err(|_| {
+            unauthenticated(format!(
+                "RunGrant ed25519 signature must be 64 bytes, got {}",
+                signature.value.len()
+            ))
+        })?;
+        // Parity, not lookup: every trusted key is tried and `key_id` selects
+        // nothing, so an attacker-chosen hint cannot steer verification.
+        let trusted = self.trust_keys.iter().any(|key| {
+            leyline_envelope::verify_payload(
+                GRANT_SIGNATURE_PAYLOAD_TYPE,
+                &grant.signing_bytes,
+                &value,
+                key,
+            )
+        });
+        if trusted {
+            Ok(())
+        } else {
+            Err(unauthenticated(
+                "RunGrant signature is not by a trusted issuer".into(),
+            ))
+        }
     }
 }
 
@@ -129,7 +309,16 @@ pub struct EvidenceRef {
 pub struct MetadataOnlyEvidenceVerifier;
 
 impl EvidenceVerifier for MetadataOnlyEvidenceVerifier {
-    fn verify(&self, _field: &str, _evidence: &EvidenceRef) -> Result<(), ExecutionError> {
+    fn verify(
+        &self,
+        _field: EvidenceField,
+        _binding: &EvidenceBinding,
+        _evidence: &EvidenceRef,
+    ) -> Result<(), ExecutionError> {
+        Ok(())
+    }
+
+    fn verify_grant(&self, _grant: &SignedGrant) -> Result<(), ExecutionError> {
         Ok(())
     }
 }
@@ -138,11 +327,24 @@ impl EvidenceVerifier for MetadataOnlyEvidenceVerifier {
 pub struct RejectUnverifiedEvidence;
 
 impl EvidenceVerifier for RejectUnverifiedEvidence {
-    fn verify(&self, field: &str, _evidence: &EvidenceRef) -> Result<(), ExecutionError> {
+    fn verify(
+        &self,
+        field: EvidenceField,
+        _binding: &EvidenceBinding,
+        _evidence: &EvidenceRef,
+    ) -> Result<(), ExecutionError> {
         Err(ExecutionError {
             code: crate::ErrorCode::Unauthenticated,
             retryable: false,
             detail: format!("no trusted verifier configured for {field}"),
+        })
+    }
+
+    fn verify_grant(&self, _grant: &SignedGrant) -> Result<(), ExecutionError> {
+        Err(ExecutionError {
+            code: crate::ErrorCode::Unauthenticated,
+            retryable: false,
+            detail: "no trusted verifier configured for RunGrant.signature".into(),
         })
     }
 }
@@ -244,6 +446,14 @@ pub fn authorize_with_verifier(
         )));
     }
 
+    // Before any field of the grant is read as authority, establish that an
+    // issuer authorized those fields. Everything below this line is the
+    // grant describing itself.
+    verifier.verify_grant(&SignedGrant {
+        signing_bytes: grant_signing_bytes(grant_bytes)?,
+        signature: read_grant_signature(&grant)?,
+    })?;
+
     let grant_id = nonempty(text(grant.get_grant_id(), "RunGrant.grantId")?, "grantId")?;
     let replay_key = nonempty(
         text(grant.get_replay_key(), "RunGrant.replayKey")?,
@@ -263,15 +473,33 @@ pub fn authorize_with_verifier(
         ));
     }
 
-    validate_evidence(grant.get_issuer_evidence(), "issuerEvidence", verifier)?;
+    // A run ID is derived from the bound authority and intent. This makes
+    // retries stable, prevents callers from selecting arbitrary IDs, and lets
+    // a second implementation derive the same name from the same content.
+    // It is derived *here*, before any evidence is checked, because evidence
+    // must commit to the run identity — so the identity has to exist first.
+    let run_id = derive_run_id(&spec_digest, &grant_id, &replay_key);
+    let binding = EvidenceBinding {
+        run_id: run_id.clone(),
+        spec_digest: spec_digest.clone(),
+    };
+
+    validate_evidence(
+        grant.get_issuer_evidence(),
+        EvidenceField::Issuer,
+        &binding,
+        verifier,
+    )?;
     validate_evidence(
         grant.get_workload_identity_evidence(),
-        "workloadIdentityEvidence",
+        EvidenceField::WorkloadIdentity,
+        &binding,
         verifier,
     )?;
     validate_evidence(
         grant.get_actor_provenance_evidence(),
-        "actorProvenanceEvidence",
+        EvidenceField::ActorProvenance,
+        &binding,
         verifier,
     )?;
     let confinement_digest =
@@ -317,11 +545,6 @@ pub fn authorize_with_verifier(
             policy.required_backend
         )));
     }
-
-    // A run ID is derived from the bound authority and intent. This makes
-    // retries stable, prevents callers from selecting arbitrary IDs, and lets
-    // a second implementation derive the same name from the same content.
-    let run_id = derive_run_id(&spec_digest, &grant_id, &replay_key);
 
     let allowed_egress = grant
         .get_allowed_egress()
@@ -381,8 +604,92 @@ fn nonempty(value: String, field: &str) -> Result<String, ExecutionError> {
     }
 }
 
+/// The only signature algorithm execution/v1 defines for a `RunGrant`.
+const GRANT_SIGNATURE_ALGORITHM: &str = "ed25519";
+
+/// The exact bytes a `RunGrant`'s issuer signature covers: the grant's
+/// Cap'n Proto **canonical** form with the `signature` field cleared.
+///
+/// Two properties make this the signable form. Canonical, so the signature
+/// survives re-framing — segment layout and padding are an encoder's choice,
+/// not content, exactly as for `runSpecDigest`. Signature-cleared, so signing
+/// and verifying agree without a second encoding: an issuer computes these
+/// bytes from the grant it is about to sign, and a verifier recomputes them
+/// from the grant it received, signature and all.
+///
+/// A cleared `signature` canonicalizes to a null pointer in the trailing
+/// pointer slot, which canonicalization truncates — so these bytes are also
+/// what a producer that predates the field would have emitted.
+pub fn grant_signing_bytes(grant_bytes: &[u8]) -> Result<Vec<u8>, ExecutionError> {
+    let message = read_message(grant_bytes, "RunGrant")?;
+    let grant = message
+        .get_root::<execution_capnp::run_grant::Reader<'_>>()
+        .map_err(|error| ExecutionError::invalid(format!("invalid RunGrant root: {error}")))?;
+    let mut builder = capnp::message::Builder::new_default();
+    builder
+        .set_root(grant)
+        .map_err(|error| ExecutionError::invalid(format!("cannot copy RunGrant: {error}")))?;
+    builder
+        .get_root::<execution_capnp::run_grant::Builder<'_>>()
+        .map_err(|error| ExecutionError::invalid(format!("invalid RunGrant root: {error}")))?
+        .init_signature();
+    let canonical = builder.into_reader().canonicalize().map_err(|error| {
+        ExecutionError::invalid(format!("cannot canonicalize RunGrant: {error}"))
+    })?;
+    Ok(capnp::Word::words_to_bytes(&canonical).to_vec())
+}
+
+fn read_grant_signature(
+    grant: &execution_capnp::run_grant::Reader<'_>,
+) -> Result<Option<GrantSignature>, ExecutionError> {
+    if !grant.has_signature() {
+        return Ok(None);
+    }
+    let signature = grant
+        .get_signature()
+        .map_err(|error| ExecutionError::invalid(format!("invalid RunGrant.signature: {error}")))?;
+    Ok(Some(GrantSignature {
+        algorithm: text(signature.get_algorithm(), "RunGrant.signature.algorithm")?,
+        key_id: text(signature.get_key_id(), "RunGrant.signature.keyId")?,
+        value: signature
+            .get_value()
+            .map_err(|error| {
+                ExecutionError::invalid(format!("invalid RunGrant.signature.value: {error}"))
+            })?
+            .to_vec(),
+    }))
+}
+
 /// Domain separator for run-identity derivation.
 const RUN_ID_DOMAIN: &[u8] = b"cloister/execution/v1/run-id";
+
+/// Prefix carried by every derived run identity.
+const RUN_ID_PREFIX: &str = "run-";
+
+/// Digest algorithm under which an in-toto subject binds evidence to a run.
+///
+/// BLAKE3, because a run identity is a Σ content address. Per signet ADR-012
+/// SHA-256 names a *key* (kid, JWKS, X.509 SKI, DPoP jkt) and BLAKE3
+/// addresses content; digesting a run identity under `sha256` would be that
+/// category error in reverse. The in-toto digest set is open, so this
+/// coexists with the `sha256` subject digests the same producer writes for
+/// file artifacts.
+const RUN_BINDING_ALGORITHM: &str = "blake3";
+
+/// Whether `value` has the shape [`derive_run_id`] produces.
+///
+/// ADR-012 R4: an identifier crossing a trust boundary is gated against its
+/// shape before it is used, so a malformed value fails as malformed rather
+/// than as a mismatch — and so the gate stays a gate if a later caller is
+/// tempted to use the value for anything but equality.
+fn is_run_id(value: &str) -> bool {
+    value.strip_prefix(RUN_ID_PREFIX).is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
 
 /// Milliseconds since the Unix epoch, sampled when a policy pins no clock.
 pub fn current_unix_ms() -> u64 {
@@ -414,7 +721,7 @@ pub fn derive_run_id(canonical_spec_digest: &str, grant_id: &str, replay_key: &s
         material.extend_from_slice(&(field.len() as u64).to_le_bytes());
         material.extend_from_slice(field);
     }
-    format!("run-{}", material.hash())
+    format!("{RUN_ID_PREFIX}{}", material.hash())
 }
 
 /// Return the digest of a schema message's Cap'n Proto canonical form.
@@ -455,17 +762,18 @@ fn read_digest(
 
 fn validate_evidence(
     value: capnp::Result<execution_capnp::evidence_ref::Reader<'_>>,
-    field: &str,
+    field: EvidenceField,
+    binding: &EvidenceBinding,
     verifier: &dyn EvidenceVerifier,
 ) -> Result<(), ExecutionError> {
     let evidence =
         value.map_err(|error| ExecutionError::invalid(format!("invalid {field}: {error}")))?;
     let media_type = nonempty(
         text(evidence.get_media_type(), &format!("{field}.mediaType"))?,
-        field,
+        field.as_str(),
     )?;
     let digest = read_digest(evidence.get_digest(), &format!("{field}.digest"))?;
-    verifier.verify(field, &EvidenceRef { media_type, digest })?;
+    verifier.verify(field, binding, &EvidenceRef { media_type, digest })?;
     Ok(())
 }
 

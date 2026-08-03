@@ -76,8 +76,9 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         cdc: bool,
 
-        /// Explicitly allow metadata-only evidence validation for local
-        /// fixtures. Production Cloister integrations must provide a real
+        /// Explicitly accept unverified authority for local fixtures: no
+        /// issuer signature on the RunGrant, and metadata-only evidence
+        /// validation. Production Cloister integrations must provide a real
         /// Signet/NotMe/Interlace verifier instead.
         #[arg(long, default_value_t = false)]
         allow_unverified_evidence: bool,

@@ -157,24 +157,36 @@
       "required": ["schemaVersion", "executable", "arguments", "workspaceInputs", "publicEnvironment", "secretHandles", "requestedInterfaces", "requestedLimits", "outputs", "cancellationMode"],
       "additionalProperties": false
     },
+    "GrantSignature": {
+      "type": "object",
+      "description": "Detached issuer signature over a RunGrant. See wire/run-grant.md for the covered bytes.",
+      "properties": {
+        "algorithm": { "type": "string", "description": "Signature algorithm; ed25519 is the only value this contract defines." },
+        "keyId": { "type": "string", "description": "Unauthenticated issuer key hint. A verifier checks every trusted key regardless and never selects one by this." },
+        "value": { "type": "string", "contentEncoding": "base64", "description": "Raw signature bytes; 64 for ed25519." }
+      },
+      "required": ["algorithm", "keyId", "value"],
+      "additionalProperties": false
+    },
     "RunGrant": {
       "type": "object",
       "description": "Authenticated, resolved execution authority bound to one RunSpec digest.",
       "properties": {
         "grantId": { "type": "string", "description": "Issuer-unique grant identifier." },
-        "issuerEvidence": { "$ref": "#/$defs/EvidenceRef", "description": "Verified issuer/signature evidence." },
+        "issuerEvidence": { "$ref": "#/$defs/EvidenceRef", "description": "Verified issuer/signature evidence. Must be bound to this run — see the evidence-binding rule in README.md." },
         "expiresAtUnixMs": { "type": "integer", "minimum": 0, "description": "Absolute expiry in Unix milliseconds." },
         "replayKey": { "type": "string", "description": "Idempotency and replay-protection key." },
         "runSpecDigest": { "$ref": "#/$defs/DigestRef", "description": "Digest of the authorized RunSpec." },
-        "workloadIdentityEvidence": { "$ref": "#/$defs/EvidenceRef", "description": "Verified Interlace/WIMSE workload identity evidence." },
-        "actorProvenanceEvidence": { "$ref": "#/$defs/EvidenceRef", "description": "Verified delegated actor/provenance evidence, such as a Signet bridge certificate." },
+        "workloadIdentityEvidence": { "$ref": "#/$defs/EvidenceRef", "description": "Verified Interlace/WIMSE workload identity evidence. Must be bound to this run — see the evidence-binding rule in README.md." },
+        "actorProvenanceEvidence": { "$ref": "#/$defs/EvidenceRef", "description": "Verified delegated actor/provenance evidence, such as a Signet bridge certificate. Must be bound to this run — see the evidence-binding rule in README.md." },
         "capabilities": { "type": "array", "items": { "$ref": "#/$defs/CapabilityGrant" }, "description": "Exact verified grants and interface mappings." },
         "confinementDigest": { "$ref": "#/$defs/DigestRef", "description": "confinement/v1 digest that enforcement must match." },
         "backendClass": { "$ref": "#/$defs/BackendClass", "description": "Required isolation class; callers cannot weaken it." },
         "limits": { "$ref": "#/$defs/ResourceLimits", "description": "Resolved ceilings." },
         "workspaces": { "type": "array", "items": { "$ref": "#/$defs/WorkspaceGrant" }, "description": "Resolved Graph authority." },
         "allowedEgress": { "type": "array", "items": { "type": "string" }, "description": "Resolved egress endpoints or capability references." },
-        "credentialBrokerRefs": { "type": "array", "items": { "type": "string" }, "description": "Resolved credential brokers; never credential values." }
+        "credentialBrokerRefs": { "type": "array", "items": { "type": "string" }, "description": "Resolved credential brokers; never credential values." },
+        "signature": { "$ref": "#/$defs/GrantSignature", "description": "Issuer signature binding every other field of this grant; absent only when the caller is the issuer. See wire/run-grant.md." }
       },
       "required": ["grantId", "issuerEvidence", "expiresAtUnixMs", "replayKey", "runSpecDigest", "workloadIdentityEvidence", "actorProvenanceEvidence", "capabilities", "confinementDigest", "backendClass", "limits", "workspaces", "allowedEgress", "credentialBrokerRefs"],
       "additionalProperties": false
@@ -581,24 +593,36 @@
       "required": ["schemaVersion", "executable", "arguments", "workspaceInputs", "publicEnvironment", "secretHandles", "requestedInterfaces", "requestedLimits", "outputs", "cancellationMode"],
       "additionalProperties": false
     },
+    "GrantSignature": {
+      "type": "object",
+      "description": "Detached issuer signature over a RunGrant. See wire/run-grant.md for the covered bytes.",
+      "properties": {
+        "algorithm": { "type": "string", "description": "Signature algorithm; ed25519 is the only value this contract defines." },
+        "keyId": { "type": "string", "description": "Unauthenticated issuer key hint. A verifier checks every trusted key regardless and never selects one by this." },
+        "value": { "type": "string", "contentEncoding": "base64", "description": "Raw signature bytes; 64 for ed25519." }
+      },
+      "required": ["algorithm", "keyId", "value"],
+      "additionalProperties": false
+    },
     "RunGrant": {
       "type": "object",
       "description": "Authenticated, resolved execution authority bound to one RunSpec digest.",
       "properties": {
         "grantId": { "type": "string", "description": "Issuer-unique grant identifier." },
-        "issuerEvidence": { "$ref": "#/$defs/EvidenceRef", "description": "Verified issuer/signature evidence." },
+        "issuerEvidence": { "$ref": "#/$defs/EvidenceRef", "description": "Verified issuer/signature evidence. Must be bound to this run — see the evidence-binding rule in README.md." },
         "expiresAtUnixMs": { "type": "integer", "minimum": 0, "description": "Absolute expiry in Unix milliseconds." },
         "replayKey": { "type": "string", "description": "Idempotency and replay-protection key." },
         "runSpecDigest": { "$ref": "#/$defs/DigestRef", "description": "Digest of the authorized RunSpec." },
-        "workloadIdentityEvidence": { "$ref": "#/$defs/EvidenceRef", "description": "Verified Interlace/WIMSE workload identity evidence." },
-        "actorProvenanceEvidence": { "$ref": "#/$defs/EvidenceRef", "description": "Verified delegated actor/provenance evidence, such as a Signet bridge certificate." },
+        "workloadIdentityEvidence": { "$ref": "#/$defs/EvidenceRef", "description": "Verified Interlace/WIMSE workload identity evidence. Must be bound to this run — see the evidence-binding rule in README.md." },
+        "actorProvenanceEvidence": { "$ref": "#/$defs/EvidenceRef", "description": "Verified delegated actor/provenance evidence, such as a Signet bridge certificate. Must be bound to this run — see the evidence-binding rule in README.md." },
         "capabilities": { "type": "array", "items": { "$ref": "#/$defs/CapabilityGrant" }, "description": "Exact verified grants and interface mappings." },
         "confinementDigest": { "$ref": "#/$defs/DigestRef", "description": "confinement/v1 digest that enforcement must match." },
         "backendClass": { "$ref": "#/$defs/BackendClass", "description": "Required isolation class; callers cannot weaken it." },
         "limits": { "$ref": "#/$defs/ResourceLimits", "description": "Resolved ceilings." },
         "workspaces": { "type": "array", "items": { "$ref": "#/$defs/WorkspaceGrant" }, "description": "Resolved Graph authority." },
         "allowedEgress": { "type": "array", "items": { "type": "string" }, "description": "Resolved egress endpoints or capability references." },
-        "credentialBrokerRefs": { "type": "array", "items": { "type": "string" }, "description": "Resolved credential brokers; never credential values." }
+        "credentialBrokerRefs": { "type": "array", "items": { "type": "string" }, "description": "Resolved credential brokers; never credential values." },
+        "signature": { "$ref": "#/$defs/GrantSignature", "description": "Issuer signature binding every other field of this grant; absent only when the caller is the issuer. See wire/run-grant.md." }
       },
       "required": ["grantId", "issuerEvidence", "expiresAtUnixMs", "replayKey", "runSpecDigest", "workloadIdentityEvidence", "actorProvenanceEvidence", "capabilities", "confinementDigest", "backendClass", "limits", "workspaces", "allowedEgress", "credentialBrokerRefs"],
       "additionalProperties": false
@@ -915,4 +939,3 @@
     }
   }
 ]
-

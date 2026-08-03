@@ -2,9 +2,10 @@ use capnp::message::Builder;
 use capnp::message::ReaderOptions;
 use leyline_public_schema::execution_capnp;
 use leyline_runtime::authorization::{
-    AuthorizationPolicy, EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION, EvidenceRef,
-    EvidenceStore, EvidenceVerifier, MetadataOnlyEvidenceVerifier, authorize_with_verifier,
-    canonical_digest,
+    AuthorizationPolicy, EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION, EvidenceBinding,
+    EvidenceField, EvidenceRef, EvidenceStore, EvidenceVerifier, GRANT_SIGNATURE_PAYLOAD_TYPE,
+    MetadataOnlyEvidenceVerifier, SignedGrant, authorize_with_verifier, canonical_digest,
+    derive_run_id, grant_signing_bytes,
 };
 use leyline_runtime::transport::{
     cancel_json, capabilities_json, cleanup_json, collect_json, inspect_json, start_json,
@@ -63,19 +64,71 @@ fn set_digest(mut digest: execution_capnp::digest_ref::Builder<'_>, value: &str)
     digest.set_value(value);
 }
 
-fn set_evidence(mut evidence: execution_capnp::evidence_ref::Builder<'_>) {
-    evidence.set_media_type("application/test-evidence");
-    set_digest(evidence.init_digest(), &"a".repeat(64));
+/// What a grant fixture's three `EvidenceRef`s point at.
+enum EvidenceFixture<'a> {
+    /// Unsigned placeholder bytes; only `MetadataOnlyEvidenceVerifier` accepts
+    /// them.
+    Placeholder,
+    /// All three references naming one CAS digest of in-toto DSSE bytes —
+    /// finding 3's attack shape, and the shape a legitimate issuer uses when
+    /// one envelope asserts every role.
+    SharedInToto(&'a str),
+}
+
+fn set_evidence(
+    mut evidence: execution_capnp::evidence_ref::Builder<'_>,
+    fixture: &EvidenceFixture<'_>,
+) {
+    match fixture {
+        EvidenceFixture::Placeholder => {
+            evidence.set_media_type("application/test-evidence");
+            set_digest(evidence.init_digest(), &"a".repeat(64));
+        }
+        EvidenceFixture::SharedInToto(digest) => {
+            evidence.set_media_type("application/vnd.in-toto+json");
+            set_digest(evidence.init_digest(), digest);
+        }
+    }
+}
+
+/// One APAS Handoff/v1 envelope signed by `signer`, asserting each
+/// `(role, run_id)` pair as an in-toto subject.
+fn signed_evidence(
+    signer: &leyline_envelope::Ed25519RootSigner,
+    subjects: &[(&str, &str)],
+) -> Vec<u8> {
+    let statement = leyline_envelope::Statement::new(
+        subjects
+            .iter()
+            .map(|(role, run_id)| leyline_envelope::Subject::with_digest(*role, "blake3", *run_id))
+            .collect(),
+        "https://rosary.dev/Handoff/v1",
+        serde_json::json!({"dispatchId": "run-01"}),
+    );
+    leyline_envelope::Envelope::sign(&statement, signer).to_json_vec()
 }
 
 struct RejectEvidence;
 
 impl EvidenceVerifier for RejectEvidence {
-    fn verify(&self, field: &str, _evidence: &EvidenceRef) -> Result<(), ExecutionError> {
+    fn verify(
+        &self,
+        field: EvidenceField,
+        _binding: &EvidenceBinding,
+        _evidence: &EvidenceRef,
+    ) -> Result<(), ExecutionError> {
         Err(ExecutionError {
             code: leyline_runtime::ErrorCode::Unauthenticated,
             retryable: false,
             detail: format!("unverified evidence: {field}"),
+        })
+    }
+
+    fn verify_grant(&self, _grant: &SignedGrant) -> Result<(), ExecutionError> {
+        Err(ExecutionError {
+            code: leyline_runtime::ErrorCode::Unauthenticated,
+            retryable: false,
+            detail: "unverified grant".into(),
         })
     }
 }
@@ -95,6 +148,9 @@ struct GrantFixture<'a> {
     confinement_algorithm: &'a str,
     confinement_value: &'a str,
     workspaces: Vec<(&'a str, &'a str, Vec<execution_capnp::WorkspaceOperation>)>,
+    evidence: EvidenceFixture<'a>,
+    /// Issuer that signs the finished grant; `None` leaves it unsigned.
+    signer: Option<&'a leyline_envelope::Ed25519RootSigner>,
 }
 
 fn grant_bytes(spec_bytes: &[u8], capability: bool, expires_at: u64, wall_time_ms: u64) -> Vec<u8> {
@@ -108,6 +164,8 @@ fn grant_bytes(spec_bytes: &[u8], capability: bool, expires_at: u64, wall_time_m
             confinement_algorithm: "blake3-256",
             confinement_value: &confinement_value,
             workspaces: Vec::new(),
+            evidence: EvidenceFixture::Placeholder,
+            signer: None,
         },
     )
 }
@@ -124,9 +182,15 @@ fn grant_bytes_with_fixture(spec_bytes: &[u8], fixture: GrantFixture<'_>) -> Vec
     grant.set_expires_at_unix_ms(fixture.expires_at);
     grant.set_replay_key("replay-01");
     set_digest(grant.reborrow().init_run_spec_digest(), &spec_digest);
-    set_evidence(grant.reborrow().init_issuer_evidence());
-    set_evidence(grant.reborrow().init_workload_identity_evidence());
-    set_evidence(grant.reborrow().init_actor_provenance_evidence());
+    set_evidence(grant.reborrow().init_issuer_evidence(), &fixture.evidence);
+    set_evidence(
+        grant.reborrow().init_workload_identity_evidence(),
+        &fixture.evidence,
+    );
+    set_evidence(
+        grant.reborrow().init_actor_provenance_evidence(),
+        &fixture.evidence,
+    );
     let mut confinement = grant.reborrow().init_confinement_digest();
     confinement.set_algorithm(fixture.confinement_algorithm);
     confinement.set_value(fixture.confinement_value);
@@ -159,6 +223,27 @@ fn grant_bytes_with_fixture(spec_bytes: &[u8], fixture: GrantFixture<'_>) -> Vec
     }
     let mut bytes = Vec::new();
     capnp::serialize::write_message(&mut bytes, &message).expect("serialize grant");
+
+    let Some(signer) = fixture.signer else {
+        return bytes;
+    };
+    // An issuer signs the grant it just built: the canonical bytes with the
+    // signature field cleared, which for a never-signed grant is what the
+    // bytes above already canonicalize to.
+    let value = leyline_envelope::sign_payload(
+        GRANT_SIGNATURE_PAYLOAD_TYPE,
+        &grant_signing_bytes(&bytes).expect("signing bytes"),
+        signer,
+    );
+    let mut signature = message
+        .get_root::<execution_capnp::run_grant::Builder<'_>>()
+        .expect("grant root")
+        .init_signature();
+    signature.set_algorithm("ed25519");
+    signature.set_key_id("issuer-01");
+    signature.set_value(&value);
+    let mut bytes = Vec::new();
+    capnp::serialize::write_message(&mut bytes, &message).expect("serialize signed grant");
     bytes
 }
 
@@ -246,6 +331,8 @@ fn execution_capability_requires_both_grant_and_interface() {
                 confinement_algorithm: "blake3-256",
                 confinement_value: &confinement,
                 workspaces: Vec::new(),
+                evidence: EvidenceFixture::Placeholder,
+                signer: None,
             },
         );
         let error = authorize(
@@ -282,6 +369,8 @@ fn digest_validation_rejects_each_malformed_component_independently() {
                 confinement_algorithm: algorithm,
                 confinement_value: value,
                 workspaces: Vec::new(),
+                evidence: EvidenceFixture::Placeholder,
+                signer: None,
             },
         );
         let error = authorize(
@@ -350,29 +439,48 @@ fn default_authorization_fails_closed_without_embedding_trust() {
     assert_eq!(error.code, leyline_runtime::ErrorCode::Unauthenticated);
 }
 
+/// A run identity that is well-formed but belongs to no fixture here.
+fn other_run_id() -> String {
+    format!("run-{}", "f".repeat(64))
+}
+
+fn binding_for(run_id: &str) -> EvidenceBinding {
+    EvidenceBinding {
+        run_id: run_id.to_owned(),
+        spec_digest: format!("blake3-256:{}", "0".repeat(64)),
+    }
+}
+
+fn cas_verifier(
+    bytes: Vec<u8>,
+    signer: &leyline_envelope::Ed25519RootSigner,
+) -> leyline_runtime::CasDsseEvidenceVerifier<FixtureEvidenceStore> {
+    leyline_runtime::CasDsseEvidenceVerifier::new(
+        std::sync::Arc::new(FixtureEvidenceStore(bytes)),
+        vec![signer.verifying_key()],
+    )
+}
+
+fn in_toto_ref(bytes: &[u8]) -> EvidenceRef {
+    EvidenceRef {
+        media_type: "application/vnd.in-toto+json".into(),
+        digest: format!("blake3-256:{}", blake3::hash(bytes).to_hex()),
+    }
+}
+
 #[test]
 fn cas_dsse_verifier_binds_and_verifies_apas_evidence() {
     let signer = leyline_envelope::Ed25519RootSigner::from_seed(&[11u8; 32]);
-    let statement = leyline_envelope::Statement::new(
-        Vec::new(),
-        "https://rosary.dev/Handoff/v1",
-        serde_json::json!({"dispatchId":"run-01"}),
-    );
-    let bytes = leyline_envelope::Envelope::sign(&statement, &signer).to_json_vec();
-    let digest = format!("blake3-256:{}", blake3::hash(&bytes).to_hex());
-    let verifier = leyline_runtime::CasDsseEvidenceVerifier::new(
-        std::sync::Arc::new(FixtureEvidenceStore(bytes)),
-        vec![signer.verifying_key()],
-    );
-    verifier
+    let run_id = other_run_id();
+    let bytes = signed_evidence(&signer, &[("actorProvenanceEvidence", &run_id)]);
+    let evidence = in_toto_ref(&bytes);
+    cas_verifier(bytes, &signer)
         .verify(
-            "actorProvenanceEvidence",
-            &EvidenceRef {
-                media_type: "application/vnd.in-toto+json".into(),
-                digest,
-            },
+            EvidenceField::ActorProvenance,
+            &binding_for(&run_id),
+            &evidence,
         )
-        .expect("valid APAS DSSE evidence");
+        .expect("valid APAS DSSE evidence naming this run and role");
 }
 
 #[test]
@@ -384,22 +492,172 @@ fn cas_dsse_verifier_rejects_a_signed_non_apas_statement() {
         serde_json::json!({"dispatchId":"run-01"}),
     );
     let bytes = leyline_envelope::Envelope::sign(&statement, &signer).to_json_vec();
-    let digest = format!("blake3-256:{}", blake3::hash(&bytes).to_hex());
-    let verifier = leyline_runtime::CasDsseEvidenceVerifier::new(
-        std::sync::Arc::new(FixtureEvidenceStore(bytes)),
-        vec![signer.verifying_key()],
-    );
-    let error = verifier
+    let evidence = in_toto_ref(&bytes);
+    let error = cas_verifier(bytes, &signer)
         .verify(
-            "actorProvenanceEvidence",
-            &EvidenceRef {
-                media_type: "application/vnd.in-toto+json".into(),
-                digest,
-            },
+            EvidenceField::ActorProvenance,
+            &binding_for(&other_run_id()),
+            &evidence,
         )
         .expect_err("a signed unrelated statement is not APAS evidence");
     assert_eq!(error.code, leyline_runtime::ErrorCode::Unauthenticated);
     assert!(error.detail.contains("not APAS"));
+}
+
+/// Finding 3: a trusted envelope from some *other* run must not authorize
+/// this one. Without a subject binding, every envelope in a trusted catalog
+/// authorizes every run.
+#[test]
+fn cas_dsse_verifier_rejects_evidence_bound_to_another_run() {
+    let signer = leyline_envelope::Ed25519RootSigner::from_seed(&[13u8; 32]);
+    let bytes = signed_evidence(&signer, &[("actorProvenanceEvidence", &other_run_id())]);
+    let evidence = in_toto_ref(&bytes);
+    let this_run = format!("run-{}", "1".repeat(64));
+    let error = cas_verifier(bytes, &signer)
+        .verify(
+            EvidenceField::ActorProvenance,
+            &binding_for(&this_run),
+            &evidence,
+        )
+        .expect_err("evidence naming another run must not authorize this one");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::Unauthenticated);
+    assert!(error.detail.contains("does not authorize"));
+}
+
+/// The three references are structurally identical, so a statement that
+/// asserts one role must not silently satisfy the other two.
+#[test]
+fn cas_dsse_verifier_rejects_a_statement_asserting_a_different_role() {
+    let signer = leyline_envelope::Ed25519RootSigner::from_seed(&[14u8; 32]);
+    let run_id = other_run_id();
+    let bytes = signed_evidence(&signer, &[("issuerEvidence", &run_id)]);
+    let evidence = in_toto_ref(&bytes);
+    let error = cas_verifier(bytes, &signer)
+        .verify(
+            EvidenceField::WorkloadIdentity,
+            &binding_for(&run_id),
+            &evidence,
+        )
+        .expect_err("an issuer assertion is not a workload identity assertion");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::Unauthenticated);
+    assert!(error.detail.contains("workloadIdentityEvidence"));
+}
+
+/// ADR-012 R4: the subject digest is gated against the run-identity shape at
+/// the boundary. A malformed value is a malformed statement, reported
+/// separately from one that names a different run.
+#[test]
+fn cas_dsse_verifier_rejects_a_subject_digest_that_is_not_a_run_identity() {
+    let signer = leyline_envelope::Ed25519RootSigner::from_seed(&[15u8; 32]);
+    for malformed in [
+        &"a".repeat(64),                    // bare hex, unprefixed
+        &format!("run-{}", "a".repeat(63)), // one nibble short
+        &format!("run-{}", "A".repeat(64)), // uppercase
+        &"run-".to_string(),
+    ] {
+        let bytes = signed_evidence(&signer, &[("issuerEvidence", malformed)]);
+        let evidence = in_toto_ref(&bytes);
+        let error = cas_verifier(bytes, &signer)
+            .verify(
+                EvidenceField::Issuer,
+                &binding_for(&other_run_id()),
+                &evidence,
+            )
+            .expect_err("a subject digest that is not a run identity must fail closed");
+        assert_eq!(error.code, leyline_runtime::ErrorCode::Unauthenticated);
+        assert!(
+            error.detail.contains("not a run identity"),
+            "unexpected detail for {malformed:?}: {}",
+            error.detail
+        );
+    }
+}
+
+/// Finding 3's failure scenario end to end: a caller who knows the digest of
+/// one trusted envelope points all three `EvidenceRef`s at it. The envelope
+/// asserts only the issuer role, so authorization must stop at the next
+/// field rather than accept the same bytes three times.
+#[test]
+fn one_trusted_envelope_cannot_satisfy_every_evidence_field() {
+    let signer = leyline_envelope::Ed25519RootSigner::from_seed(&[16u8; 32]);
+    let spec = spec_bytes();
+    let spec_digest = canonical_digest(&spec).expect("canonical spec digest");
+    let run_id = derive_run_id(&spec_digest, "grant-01", "replay-01");
+    let bytes = signed_evidence(&signer, &[("issuerEvidence", &run_id)]);
+    let hex = blake3::hash(&bytes).to_hex().to_string();
+    let confinement = "b".repeat(64);
+    let grant = grant_bytes_with_fixture(
+        &spec,
+        GrantFixture {
+            capability: Some((EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION)),
+            expires_at: 2_000,
+            wall_time_ms: 0,
+            confinement_algorithm: "blake3-256",
+            confinement_value: &confinement,
+            workspaces: Vec::new(),
+            evidence: EvidenceFixture::SharedInToto(&hex),
+            signer: Some(&signer),
+        },
+    );
+    let error = authorize_with_verifier(
+        &spec,
+        &grant,
+        &AuthorizationPolicy {
+            now_unix_ms: Some(1_000),
+            required_backend: BackendClass::MicroVm,
+            required_confinement_digest: None,
+        },
+        &cas_verifier(bytes, &signer),
+    )
+    .expect_err("one issuer assertion must not stand in for all three roles");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::Unauthenticated);
+    assert!(error.detail.contains("workloadIdentityEvidence"));
+}
+
+/// The binding is satisfiable: an issuer that asserts all three roles for
+/// this run authorizes it, and the run it authorizes is the one the caller
+/// can derive locally.
+#[test]
+fn evidence_asserting_every_role_for_this_run_authorizes_it() {
+    let signer = leyline_envelope::Ed25519RootSigner::from_seed(&[17u8; 32]);
+    let spec = spec_bytes();
+    let spec_digest = canonical_digest(&spec).expect("canonical spec digest");
+    let run_id = derive_run_id(&spec_digest, "grant-01", "replay-01");
+    let bytes = signed_evidence(
+        &signer,
+        &[
+            ("issuerEvidence", &run_id),
+            ("workloadIdentityEvidence", &run_id),
+            ("actorProvenanceEvidence", &run_id),
+        ],
+    );
+    let hex = blake3::hash(&bytes).to_hex().to_string();
+    let confinement = "b".repeat(64);
+    let grant = grant_bytes_with_fixture(
+        &spec,
+        GrantFixture {
+            capability: Some((EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION)),
+            expires_at: 2_000,
+            wall_time_ms: 0,
+            confinement_algorithm: "blake3-256",
+            confinement_value: &confinement,
+            workspaces: Vec::new(),
+            evidence: EvidenceFixture::SharedInToto(&hex),
+            signer: Some(&signer),
+        },
+    );
+    let authorized = authorize_with_verifier(
+        &spec,
+        &grant,
+        &AuthorizationPolicy {
+            now_unix_ms: Some(1_000),
+            required_backend: BackendClass::MicroVm,
+            required_confinement_digest: None,
+        },
+        &cas_verifier(bytes, &signer),
+    )
+    .expect("evidence asserting every role for this run");
+    assert_eq!(authorized.run_id, run_id);
 }
 
 #[test]
@@ -486,6 +744,8 @@ fn workspace_grants_require_exact_identity_cardinality_and_unique_names() {
             confinement_algorithm: "blake3-256",
             confinement_value: &confinement,
             workspaces: vec![("repo", &"a".repeat(64), read.clone())],
+            evidence: EvidenceFixture::Placeholder,
+            signer: None,
         },
     );
     authorize(&spec, &exact, &policy).expect("exact workspace grant");
@@ -502,6 +762,8 @@ fn workspace_grants_require_exact_identity_cardinality_and_unique_names() {
                 ("repo", &"a".repeat(64), read.clone()),
                 ("extra", &"b".repeat(64), read.clone()),
             ],
+            evidence: EvidenceFixture::Placeholder,
+            signer: None,
         },
     );
     authorize(&spec, &extra, &policy)
@@ -516,6 +778,8 @@ fn workspace_grants_require_exact_identity_cardinality_and_unique_names() {
             confinement_algorithm: "blake3-256",
             confinement_value: &confinement,
             workspaces: vec![("repo", &"c".repeat(64), read.clone())],
+            evidence: EvidenceFixture::Placeholder,
+            signer: None,
         },
     );
     authorize(&spec, &wrong_identity, &policy)
@@ -538,6 +802,8 @@ fn workspace_grants_require_exact_identity_cardinality_and_unique_names() {
                 ("repo", &"a".repeat(64), read.clone()),
                 ("repo", &"b".repeat(64), read),
             ],
+            evidence: EvidenceFixture::Placeholder,
+            signer: None,
         },
     );
     authorize(&duplicate_spec, &duplicate, &policy)
@@ -961,4 +1227,257 @@ fn a_reused_default_policy_rejects_a_grant_that_expired_before_now() {
 
     let live = grant_bytes(&spec, true, now + 600_000, 0);
     authorize(&spec, &live, &policy).expect("an unexpired grant must still authorize");
+}
+
+/// A grant fixture carrying signed, run-bound evidence for every role, so a
+/// signature test exercises only the signature.
+fn signed_grant_fixture<'a>(
+    spec: &[u8],
+    evidence_hex: &'a str,
+    confinement: &'a str,
+    signer: Option<&'a leyline_envelope::Ed25519RootSigner>,
+    expires_at: u64,
+) -> Vec<u8> {
+    grant_bytes_with_fixture(
+        spec,
+        GrantFixture {
+            capability: Some((EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION)),
+            expires_at,
+            wall_time_ms: 0,
+            confinement_algorithm: "blake3-256",
+            confinement_value: confinement,
+            workspaces: Vec::new(),
+            evidence: EvidenceFixture::SharedInToto(evidence_hex),
+            signer,
+        },
+    )
+}
+
+/// Evidence bytes asserting all three roles for the run `grant-01` /
+/// `replay-01` names over `spec`, plus their CAS digest hex.
+fn all_roles_evidence(
+    spec: &[u8],
+    signer: &leyline_envelope::Ed25519RootSigner,
+) -> (Vec<u8>, String) {
+    let spec_digest = canonical_digest(spec).expect("canonical spec digest");
+    let run_id = derive_run_id(&spec_digest, "grant-01", "replay-01");
+    let bytes = signed_evidence(
+        signer,
+        &[
+            ("issuerEvidence", &run_id),
+            ("workloadIdentityEvidence", &run_id),
+            ("actorProvenanceEvidence", &run_id),
+        ],
+    );
+    let hex = blake3::hash(&bytes).to_hex().to_string();
+    (bytes, hex)
+}
+
+fn signed_grant_policy() -> AuthorizationPolicy {
+    AuthorizationPolicy {
+        now_unix_ms: Some(1_000),
+        required_backend: BackendClass::MicroVm,
+        required_confinement_digest: None,
+    }
+}
+
+/// A grant whose signature verifies under a trusted key is authority; the
+/// same fields without one are not. Nothing else cryptographically ties
+/// `capabilities`, `limits`, `backendClass` or `expiresAtUnixMs` to the
+/// issuer.
+#[test]
+fn a_signed_grant_authorizes_and_an_unsigned_one_does_not() {
+    let signer = leyline_envelope::Ed25519RootSigner::from_seed(&[31u8; 32]);
+    let spec = spec_bytes();
+    let (evidence, hex) = all_roles_evidence(&spec, &signer);
+    let confinement = "b".repeat(64);
+
+    let signed = signed_grant_fixture(&spec, &hex, &confinement, Some(&signer), 2_000);
+    authorize_with_verifier(
+        &spec,
+        &signed,
+        &signed_grant_policy(),
+        &cas_verifier(evidence.clone(), &signer),
+    )
+    .expect("a grant signed by a trusted issuer is authority");
+
+    let unsigned = signed_grant_fixture(&spec, &hex, &confinement, None, 2_000);
+    let error = authorize_with_verifier(
+        &spec,
+        &unsigned,
+        &signed_grant_policy(),
+        &cas_verifier(evidence, &signer),
+    )
+    .expect_err("an unsigned grant carries no issuer authority");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::Unauthenticated);
+    assert!(error.detail.contains("signature"), "{}", error.detail);
+}
+
+/// The signature covers the whole grant, so widening any field after signing
+/// invalidates it. `expiresAtUnixMs` is the field finding 1 showed is worth
+/// the most to an attacker.
+#[test]
+fn editing_a_signed_grant_invalidates_its_signature() {
+    let signer = leyline_envelope::Ed25519RootSigner::from_seed(&[32u8; 32]);
+    let spec = spec_bytes();
+    let (evidence, hex) = all_roles_evidence(&spec, &signer);
+    let confinement = "b".repeat(64);
+    let signed = signed_grant_fixture(&spec, &hex, &confinement, Some(&signer), 2_000);
+
+    // Re-encode the signed grant with a later expiry, carrying the original
+    // signature forward — the edit an interposed caller would make.
+    let message = capnp::serialize::read_message(&mut &signed[..], ReaderOptions::new())
+        .expect("read signed grant");
+    let reader = message
+        .get_root::<execution_capnp::run_grant::Reader<'_>>()
+        .expect("grant root");
+    let mut forged = Builder::new_default();
+    forged.set_root(reader).expect("copy grant");
+    forged
+        .get_root::<execution_capnp::run_grant::Builder<'_>>()
+        .expect("forged root")
+        .set_expires_at_unix_ms(9_999_999);
+    let mut forged_bytes = Vec::new();
+    capnp::serialize::write_message(&mut forged_bytes, &forged).expect("serialize forged grant");
+
+    let error = authorize_with_verifier(
+        &spec,
+        &forged_bytes,
+        &signed_grant_policy(),
+        &cas_verifier(evidence, &signer),
+    )
+    .expect_err("an edited grant must not verify under the original signature");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::Unauthenticated);
+    assert!(error.detail.contains("signature"), "{}", error.detail);
+}
+
+#[test]
+fn a_grant_signed_by_an_untrusted_key_is_rejected() {
+    let issuer = leyline_envelope::Ed25519RootSigner::from_seed(&[33u8; 32]);
+    let impostor = leyline_envelope::Ed25519RootSigner::from_seed(&[34u8; 32]);
+    let spec = spec_bytes();
+    let (evidence, hex) = all_roles_evidence(&spec, &issuer);
+    let confinement = "b".repeat(64);
+    let grant = signed_grant_fixture(&spec, &hex, &confinement, Some(&impostor), 2_000);
+
+    let error = authorize_with_verifier(
+        &spec,
+        &grant,
+        &signed_grant_policy(),
+        &cas_verifier(evidence, &issuer),
+    )
+    .expect_err("a signature by an untrusted key is not issuer authority");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::Unauthenticated);
+}
+
+/// The covered bytes are the grant with the signature field cleared, so a
+/// grant's signing bytes do not change when the signature is attached — the
+/// property that makes signing and verifying agree without a second encoding.
+#[test]
+fn grant_signing_bytes_ignore_the_carried_signature() {
+    let signer = leyline_envelope::Ed25519RootSigner::from_seed(&[35u8; 32]);
+    let spec = spec_bytes();
+    let (_, hex) = all_roles_evidence(&spec, &signer);
+    let confinement = "b".repeat(64);
+
+    let unsigned = signed_grant_fixture(&spec, &hex, &confinement, None, 2_000);
+    let signed = signed_grant_fixture(&spec, &hex, &confinement, Some(&signer), 2_000);
+    assert_ne!(unsigned, signed, "the fixture must actually attach one");
+    assert_eq!(
+        grant_signing_bytes(&unsigned).expect("unsigned signing bytes"),
+        grant_signing_bytes(&signed).expect("signed signing bytes"),
+    );
+}
+
+/// Like `runSpecDigest`, the signature covers canonical content — not the
+/// segment table and padding a particular encoder happened to emit.
+#[test]
+fn grant_signing_bytes_name_content_not_capnp_framing() {
+    let signer = leyline_envelope::Ed25519RootSigner::from_seed(&[36u8; 32]);
+    let spec = spec_bytes();
+    let (_, hex) = all_roles_evidence(&spec, &signer);
+    let confinement = "b".repeat(64);
+    let grant = signed_grant_fixture(&spec, &hex, &confinement, Some(&signer), 2_000);
+
+    // Re-frame the same content through a fresh builder: identical message,
+    // different serialized bytes are permitted by the encoding.
+    let message =
+        capnp::serialize::read_message(&mut &grant[..], ReaderOptions::new()).expect("read grant");
+    let mut reframed = Builder::new_default();
+    reframed
+        .set_root(
+            message
+                .get_root::<execution_capnp::run_grant::Reader<'_>>()
+                .expect("grant root"),
+        )
+        .expect("copy grant");
+    let mut reframed_bytes = Vec::new();
+    capnp::serialize::write_message(&mut reframed_bytes, &reframed).expect("serialize reframed");
+
+    assert_eq!(
+        grant_signing_bytes(&grant).expect("signing bytes"),
+        grant_signing_bytes(&reframed_bytes).expect("reframed signing bytes"),
+    );
+}
+
+/// `execution/v1/test-vectors/run-id.json` is the cross-implementation gate
+/// for run-identity derivation: a second implementation reproduces a run's
+/// name from `(canonical spec digest, grantId, replayKey)` without an LLO
+/// checkout. This test holds both halves of that claim — that the preimage
+/// the vector documents is the one this crate hashes, built here from the
+/// documented encoding rather than by calling `derive_run_id`, and that
+/// `derive_run_id` still produces the pinned names.
+#[test]
+fn run_id_vector_pins_the_derivation_for_other_implementations() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../ll-core/schema-spec/execution/v1/test-vectors/run-id.json");
+    let vector: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap_or_else(|error| {
+            panic!(
+                "run-id vector must ship with the schema: {}: {error}",
+                path.display()
+            )
+        }))
+        .expect("run-id vector is JSON");
+
+    let derivation = &vector["derivation"];
+    let domain = derivation["domain"].as_str().expect("domain");
+    let prefix = derivation["prefix"].as_str().expect("prefix");
+    let cases = vector["cases"].as_array().expect("cases");
+    assert!(!cases.is_empty(), "a vector with no cases gates nothing");
+
+    for case in cases {
+        let spec_digest = case["canonicalSpecDigest"].as_str().expect("specDigest");
+        let grant_id = case["grantId"].as_str().expect("grantId");
+        let replay_key = case["replayKey"].as_str().expect("replayKey");
+
+        // The documented encoding, reconstructed from the vector's own
+        // description — this is what a second implementation writes.
+        let mut preimage = Vec::from(domain.as_bytes());
+        preimage.push(0);
+        for field in [spec_digest, grant_id, replay_key] {
+            preimage.extend_from_slice(&(field.len() as u64).to_le_bytes());
+            preimage.extend_from_slice(field.as_bytes());
+        }
+        assert_eq!(
+            hex::encode(&preimage),
+            case["preimageHex"].as_str().expect("preimageHex"),
+            "preimage drifted for case {}",
+            case["name"]
+        );
+
+        let expected = format!("{prefix}{}", blake3::hash(&preimage).to_hex());
+        assert_eq!(
+            case["runId"].as_str(),
+            Some(expected.as_str()),
+            "pinned runId is not blake3 of the pinned preimage for case {}",
+            case["name"]
+        );
+        assert_eq!(
+            derive_run_id(spec_digest, grant_id, replay_key),
+            expected,
+            "derive_run_id drifted from the vector for case {}",
+            case["name"]
+        );
+    }
 }

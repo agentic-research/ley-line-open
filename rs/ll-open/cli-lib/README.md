@@ -18,6 +18,7 @@ The ley-line daemon — living SQLite database + arena snapshot loop + UDS/MCP s
 - **`daemon::enrichment`** — extension-pass orchestration. LSP, embeddings, HDC each register as `EnrichmentPass`; `run_pass` resolves dependencies and runs them in order. Stats reported via the `enrich` op.
 - **`daemon::ext`** — extension trait. Private LLO consumers (ley-line proper) implement `DaemonExt` to add custom ops and enrichment passes without forking.
 - **`run_execution_daemon`** — explicit first-party entry point that installs an `ExecutionDaemonExt` around a trusted `ExecutionHandler`. Embedders construct the handler with their own resolver and backend policy; UDS/MCP requests carry only signed execution intent and never host paths. The ordinary `run_daemon`/`leyline daemon` path remains `NoExt` for compatibility.
+- **`daemon::client::ExecutionClient`** — public Rust client for the execution UDS. Cloister and other trusted embedders can call the generated execution operations directly; it never spawns `krunvm`, Taskfile, or a repository helper. The first-party CLI delegates to this client.
 - **`cmd_parse`** — tree-sitter parse pass. Walks source dirs, emits AST + source segment files + populates `nodes`/`_ast`/`_source`/`node_refs`/`node_defs`.
 - **`cmd_load`** — restore from arena: BLAKE3-verify the buffer, `sqlite3_deserialize` into the living db.
 

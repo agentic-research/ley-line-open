@@ -3266,6 +3266,7 @@ mod tests {
 
     // ── Helper unit tests ───────────────────────────────────────────────
 
+    #[test]
     fn normalize_file_uri_strips_prefix() {
         assert_eq!(normalize_file_uri("file:///abs/foo.rs"), "/abs/foo.rs");
     }

@@ -3,6 +3,7 @@
 pub mod arena_lock;
 pub mod arena_owner;
 pub mod auth;
+pub mod client;
 pub mod complex_build_pass;
 pub mod db_pool;
 #[cfg(feature = "vec")]

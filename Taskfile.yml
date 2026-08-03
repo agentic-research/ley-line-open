@@ -1040,7 +1040,8 @@ tasks:
   mutants:pr:
     desc: |
       Run the PR mutants gate locally: the exact diff-scoped run mutants.yml
-      executes, against your branch's diff from origin/main — INCLUDING
+      executes, against your branch's diff from the integration base by
+      default — INCLUDING
       uncommitted work, since that is what you are about to commit and push.
       Exists because each surviving mutant discovered on the runner costs a
       ~35-minute CI round trip to learn about; this surfaces the survivor
@@ -1049,15 +1050,24 @@ tasks:
     cmds:
       - |
         set -eu
-        git fetch origin main --quiet
-        BASE=$(git merge-base origin/main HEAD)
+        BASE_REF="${BASE_REF:-origin/integration}"
+        if ! git rev-parse --verify "$BASE_REF" >/dev/null 2>&1; then
+          git fetch origin "${BASE_REF#origin/}" --quiet
+        fi
+        if ! git rev-parse --verify "$BASE_REF" >/dev/null 2>&1; then
+          BASE_REF=origin/main
+          git fetch origin main --quiet
+        fi
+        BASE=$(git merge-base "$BASE_REF" HEAD)
         DIFF=$(mktemp)
         trap 'rm -f "$DIFF"' EXIT
         # No three-dot and no HEAD bound: diff the WORKING TREE against the
         # merge base, so uncommitted changes are gated too. cargo-mutants
         # applies --in-diff to the tree as it stands, which is exactly this.
-        git diff --relative=rs "$BASE" -- rs/ > "$DIFF"
-        echo "diff vs $(git rev-parse --short "$BASE") (merge-base with origin/main)"
+        # This task runs from rs/, so `-- .` is the workspace path. Using
+        # `-- rs/` here silently produces an empty diff and a false SKIPPED.
+        git diff --relative=rs "$BASE" -- . > "$DIFF"
+        echo "diff vs $(git rev-parse --short "$BASE") (merge-base with $BASE_REF)"
         '{{.ROOT_DIR}}/tools/mutants_diff.sh' "$DIFF"
 
   mutants:fs:

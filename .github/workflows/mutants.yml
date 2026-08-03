@@ -20,7 +20,7 @@ name: Mutation testing
 # people route around has already failed.
 on:
   pull_request:
-    branches: [main]
+    branches: [main, integration]
     paths:
       - 'rs/**'
       - 'Taskfile.yml'

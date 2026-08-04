@@ -46,6 +46,7 @@ use std::sync::OnceLock;
 
 use super::DaemonContext;
 use super::auth;
+use super::execution_contract;
 
 // ---------------------------------------------------------------------------
 // Tool registry — static descriptions of every op exposed over MCP.
@@ -642,19 +643,14 @@ pub fn cloister_groups() -> Vec<CloisterGroupDecl> {
         upstream_names: vec!["hdc_search", "hdc_calibrate", "hdc_density"],
     });
 
+    // execution/v1 — derived, never hand-listed. `execution_contract::OP_NAMES`
+    // is the single source for these names (pinned against the generated
+    // `execution-tools.json` by a test in that module), so a new `$Op` cannot
+    // land in the IDL and go unclaimed by a cloister group.
     groups.push(CloisterGroupDecl {
         name: "execution",
         advertised_prefix: "llo_execution_",
-        upstream_names: vec![
-            "llo_execution_capabilities",
-            "llo_execution_provision",
-            "llo_execution_status",
-            "llo_execution_start",
-            "llo_execution_inspect",
-            "llo_execution_cancel",
-            "llo_execution_collect",
-            "llo_execution_cleanup",
-        ],
+        upstream_names: execution_contract::OP_NAMES.to_vec(),
     });
 
     groups

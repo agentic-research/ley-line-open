@@ -105,8 +105,8 @@
           "advertisedPrefix": "llo_execution_",
           "upstreamNames": [
             "llo_execution_capabilities",
-            "llo_execution_provision",
             "llo_execution_status",
+            "llo_execution_provision",
             "llo_execution_start",
             "llo_execution_inspect",
             "llo_execution_cancel",

@@ -21,9 +21,11 @@
 //! - `BASE_OP_NAMES`: the canonical string-list of every known op
 //!   name. Single source of truth for `is_known_base_op`, the
 //!   `base_op_names()` test helper, and the `mcp::tool_registry` drift
-//!   check. Adding a new op means editing this list AND adding a
-//!   `BaseRequest` variant (the two are tied together by drift tests
-//!   in `ops.rs`).
+//!   check. Adding a new op means editing `NATIVE_OP_NAMES` AND adding
+//!   a `BaseRequest` variant (the two are tied together by drift tests
+//!   in `ops.rs`). The execution/v1 tail is not written here at all —
+//!   it is spliced in at compile time from
+//!   `execution_contract::OP_NAMES`.
 //! - `LspPosition` / `LspFile`: small typed-args structs the LSP ops
 //!   consume.
 //! - `Ref` / `TokenMapEntry`: intermediate data types used inside
@@ -34,8 +36,12 @@
 //! Beads:
 //! - `ley-line-open-b0ea2e` (the wire.rs codegen / capnp-json adoption thread)
 //! - `ley-line-open-b632ee` (collapse of 4 op-name SoTs into BASE_OP_NAMES)
+//! - `ley-line-open-6d811a` (execution/v1 tail derived from
+//!   `execution_contract::OP_NAMES` instead of re-typed here)
 
 use serde::Deserialize;
+
+use super::execution_contract;
 
 // ---------------------------------------------------------------------------
 // Canonical op-name list.
@@ -51,20 +57,24 @@ use serde::Deserialize;
 //
 // Adding a new op means:
 //   1. Add a `BaseRequest` variant below.
-//   2. Add the snake_case name to `BASE_OP_NAMES`.
+//   2. Add the snake_case name to `NATIVE_OP_NAMES`.
 //   3. Add a match arm in `ops.rs::dispatch_typed` (compiler-enforced).
 //   4. Optionally expose it via `tool_registry()` in `daemon::mcp`
 //      (drift test enforces tool_registry ⊆ BASE_OP_NAMES).
+//
+// The execution/v1 ops are the exception to step 2: their names live in
+// `execution_contract::OP_NAMES` (which the `execution-tools.json`
+// generator pins) and are spliced onto the tail of `BASE_OP_NAMES` at
+// compile time. There is no second copy to keep in sync.
 //
 // Down from 4-5 hand-maintained lists (pre-b632ee) to 2 paired
 // structures with bidirectional drift tests.
 // ---------------------------------------------------------------------------
 
-/// The canonical set of op names the daemon's UDS dispatcher recognizes.
-/// Feature-gated entries appear conditionally; the consts below pin the
-/// expected counts so a refactor that drops a name without updating the
-/// gates is caught at compile time.
-pub const BASE_OP_NAMES: &[&str] = &[
+/// Op names the daemon implements natively, i.e. everything that is not
+/// an IDL-generated execution/v1 operation. Feature-gated entries appear
+/// conditionally. Consumers want [`BASE_OP_NAMES`], not this.
+const NATIVE_OP_NAMES: &[&str] = &[
     "status",
     "flush",
     "load",
@@ -114,15 +124,40 @@ pub const BASE_OP_NAMES: &[&str] = &[
     "inspect_neighborhood",
     "search_symbols",
     "agreement",
-    "llo_execution_capabilities",
-    "llo_execution_provision",
-    "llo_execution_status",
-    "llo_execution_start",
-    "llo_execution_inspect",
-    "llo_execution_cancel",
-    "llo_execution_collect",
-    "llo_execution_cleanup",
 ];
+
+/// Length of [`BASE_OP_NAMES`]: the natively-implemented ops plus every
+/// execution/v1 op name the shared contract exports.
+const BASE_OP_NAMES_LEN: usize = NATIVE_OP_NAMES.len() + execution_contract::OP_NAMES.len();
+
+/// Splice `NATIVE_OP_NAMES ++ execution_contract::OP_NAMES` at compile
+/// time. Deriving rather than re-typing the execution names means the
+/// class of bug this replaced — a second hand-maintained list that
+/// silently disagreed with the generated contract about order — is not
+/// expressible any more.
+const fn concat_base_op_names() -> [&'static str; BASE_OP_NAMES_LEN] {
+    let mut names = [""; BASE_OP_NAMES_LEN];
+    let mut i = 0;
+    while i < NATIVE_OP_NAMES.len() {
+        names[i] = NATIVE_OP_NAMES[i];
+        i += 1;
+    }
+    let mut j = 0;
+    while j < execution_contract::OP_NAMES.len() {
+        names[NATIVE_OP_NAMES.len() + j] = execution_contract::OP_NAMES[j];
+        j += 1;
+    }
+    names
+}
+
+const BASE_OP_NAMES_STORAGE: [&str; BASE_OP_NAMES_LEN] = concat_base_op_names();
+
+/// The canonical set of op names the daemon's UDS dispatcher recognizes.
+///
+/// Membership, not position, is what every consumer reads: `is_known_base_op`
+/// does a `contains`, the drift tests iterate or collect into a `HashSet`.
+/// Nothing indexes this slice, so the splice point is free to sit at the tail.
+pub const BASE_OP_NAMES: &[&str] = &BASE_OP_NAMES_STORAGE;
 
 // ---------------------------------------------------------------------------
 // Request enum — typed dispatch surface for socket.rs.

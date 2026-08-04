@@ -10,6 +10,22 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Changed
+
+- **The execution/v1 operation names are written once.** `BASE_OP_NAMES`
+  (`daemon::wire`) and the `execution` cloister group (`daemon::mcp`) each
+  carried their own copy of the eight `llo_execution_*` names, and both had
+  drifted from the generated contract — `provision` and `status` were
+  transposed relative to `execution_contract::OP_NAMES` and the IDL-generated
+  `execution-tools.json`. Neither list is read positionally, so no dispatch or
+  routing behaviour was wrong; the copies were simply free to disagree, and
+  did. Both are now spliced from `execution_contract::OP_NAMES` — the first at
+  compile time, the second by value — so the names cannot be re-typed
+  incorrectly. `server.json`'s `execution` group lists `upstreamNames` in the
+  contract's order as a result; the field is a set of upstream names, not a
+  sequence, so consumers resolving by name are unaffected.
+  (`ley-line-open-6d811a`)
+
 ## [0.15.1] — 2026-08-04
 
 **v0.15.0's confinement attestation did not function.** This release makes the

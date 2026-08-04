@@ -4666,6 +4666,39 @@ mod tests {
     }
 
     #[test]
+    fn execution_contract_op_names_map_to_base_request_variants() {
+        // Drift guard (6d811a): `execution_contract::OP_NAMES` is the
+        // single source for execution/v1 operation names. `BASE_OP_NAMES`
+        // splices it in at compile time and `mcp::cloister_groups()`
+        // clones it, so both of those agree by construction. What is NOT
+        // derivable is the `BaseRequest::LloExecution*` variant set —
+        // serde's `rename_all = "snake_case"` tags are produced from
+        // hand-written variant names. This asserts that mapping directly
+        // against OP_NAMES rather than transitively through
+        // BASE_OP_NAMES, so it keeps holding even if a future refactor
+        // un-derives the splice.
+        use super::BaseRequest;
+        use crate::daemon::execution_contract::OP_NAMES;
+        use serde_json::json;
+
+        for name in OP_NAMES {
+            assert!(
+                is_known_base_op(name),
+                "execution_contract::OP_NAMES has `{name}` but BASE_OP_NAMES does not",
+            );
+            let result: std::result::Result<BaseRequest, _> =
+                serde_json::from_value(json!({"op": name}));
+            if let Err(e) = result {
+                let msg = e.to_string();
+                assert!(
+                    !msg.starts_with("unknown variant"),
+                    "no BaseRequest variant carries the serde tag `{name}`: {msg}",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn is_known_base_op_agrees_with_base_op_names() {
         // Drift guard (b632ee): post-collapse, is_known_base_op and
         // base_op_names() both derive from BASE_OP_NAMES — this test

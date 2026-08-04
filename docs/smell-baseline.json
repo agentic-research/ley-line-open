@@ -103,6 +103,11 @@
     },
     {
       "rule_id": "sleep_in_tests",
+      "source_id": "rs/ll-open/runtime/tests/libkrun_guest_listener.rs",
+      "count": 1
+    },
+    {
+      "rule_id": "sleep_in_tests",
       "source_id": "rs/ll-open/sign/tests/host_adversarial.rs",
       "count": 8
     },

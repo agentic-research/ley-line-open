@@ -108,6 +108,60 @@ pub fn capabilities_from_manifest(
                 .map_err(nono_error)?
         };
     }
+
+    // §3 egress. nono's CapabilitySet filters by PORT, never by hostname —
+    // host-based egress is nono's *manifest* `network.allow_domains`, which
+    // rides its proxy path, not the `apply_auto` path this compiles to. So a
+    // manifest declaring allowHosts describes something this tier cannot
+    // enforce, and the answer is to say so rather than to block everything and
+    // let the digest attest a policy that never took effect.
+    //
+    // The failure direction is closed either way — dropping the grant leaves
+    // the sandbox stricter than the manifest. That is exactly why it needs an
+    // error: a silent over-restriction still means the attested confinement
+    // digest commits to a document whose §3 had no effect, which is the drift
+    // ADR-0035 exists to prevent, one dimension over.
+    if !manifest.allowed_hosts().is_empty() {
+        return Err(ExecutionError::invalid(format!(
+            "confinement/v1 §3 network.allowHosts is not enforceable on this tier: \
+             nono filters by port, not by hostname, so the {} declared host(s) \
+             would be silently dropped. Route host-scoped egress through the \
+             proxy, or omit the dimension.",
+            manifest.allowed_hosts().len()
+        )));
+    }
+
+    // §4 listener. Exactly the shape cloister-harness runs today — deny
+    // everything, then open one loopback port to the vault-proxy shim.
+    //
+    // `allow_localhost_port` is bidirectional (connect + bind) and applies
+    // regardless of network mode. On Linux, Landlock filters by port and NOT by
+    // destination IP, so "loopback only" is a property of the `block_network`
+    // below rather than of this call; on macOS, Seatbelt scopes it to localhost
+    // directly. Both reach §4's default of 127.0.0.1, by different routes.
+    if let Some((bind, address)) = manifest.port_bind() {
+        // §4 defaults to 127.0.0.1 and requires anything wider to be declared
+        // explicitly. That declaration is precisely what cannot be honoured
+        // here: with Landlock filtering on port alone, a grant for 0.0.0.0 and
+        // a grant for loopback compile to the identical rule, so accepting the
+        // wider one would attest an exposure decision nothing enforces.
+        let loopback = matches!(
+            address,
+            None | Some("127.0.0.1") | Some("localhost") | Some("::1")
+        );
+        if !loopback {
+            return Err(ExecutionError::invalid(format!(
+                "confinement/v1 §4 port.address {:?} is not enforceable on this tier: \
+                 nono filters by port, not by bind address, so a non-loopback \
+                 listener compiles to the same rule as a loopback one. §4 requires \
+                 exposure beyond loopback to be an explicit declaration, and this \
+                 tier cannot honour that declaration.",
+                address.unwrap_or_default()
+            )));
+        }
+        capabilities = capabilities.allow_localhost_port(bind);
+    }
+
     Ok(capabilities.block_network())
 }
 

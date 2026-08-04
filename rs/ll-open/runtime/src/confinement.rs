@@ -142,6 +142,27 @@ impl ConfinementManifest {
         &self.fs_allow
     }
 
+    /// The hosts §3 permits egress to, if any.
+    ///
+    /// Exposed for the same reason `port_bind` is: a compiler that cannot read
+    /// a dimension cannot refuse it either, and silently dropping a dimension
+    /// the manifest declares is what `ley-line-open-17536d` is about.
+    pub fn allowed_hosts(&self) -> &[String] {
+        &self.allow_hosts
+    }
+
+    /// The single listener §4 permits, as `(port, address)`. `None` means the
+    /// manifest declares no listener, which §4 defines as MUST NOT bind.
+    ///
+    /// The address is returned unresolved — `None` here means "§4's default",
+    /// not "any address", and only the caller knows whether it can enforce the
+    /// distinction.
+    pub fn port_bind(&self) -> Option<(u16, Option<&str>)> {
+        self.port
+            .as_ref()
+            .map(|port| (port.bind, port.address.as_deref()))
+    }
+
     /// Serialize to the canonical JSON the digest is computed over (§6).
     ///
     /// Every object is built as a `BTreeMap`, at every level, rather than as a

@@ -10,15 +10,61 @@ use leyline_runtime::{DigestRef, ExecutionRequest, ResourceLimits};
 use tempfile::TempDir;
 use wait_timeout::ChildExt;
 
+/// Resolve the hypervisor this test needs, or report that it did not run.
+///
+/// Previously the test carried a bare `#[ignore]`, which meant it ran NOWHERE —
+/// not in CI, which lacks libkrun, and not on a developer machine that has it,
+/// because running it required remembering `-- --ignored`. A gate that no
+/// environment satisfies produces no signal anywhere, and this is the tier
+/// whose confinement drift check turned out to be entirely untested
+/// (`ley-line-open-17536d`) precisely because everything here was skipped by
+/// construction.
+///
+/// So the gate is now the actual precondition rather than a blanket opt-out: it
+/// runs wherever `LEYLINE_LIBKRUN_PATH` and `LEYLINE_LIBKRUNFW_PATH` are set,
+/// and says so loudly when they are not. The message is deliberately worded as
+/// NOT a pass — the same stance `mutants_diff.sh` takes about a skipped gate,
+/// for the same reason: a green tick that tested nothing is worse than a red
+/// one, because nobody investigates it.
+fn hypervisor_or_skip() -> Option<(std::ffi::OsString, std::path::PathBuf)> {
+    let (Some(libkrun), Some(libkrunfw)) = (
+        std::env::var_os("LEYLINE_LIBKRUN_PATH"),
+        std::env::var_os("LEYLINE_LIBKRUNFW_PATH"),
+    ) else {
+        // A soft skip is still a green tick, and `cargo test` captures this
+        // message unless someone passes `--nocapture` — so on its own it is a
+        // quieter version of the same false green the bare `#[ignore]` was.
+        // `LEYLINE_REQUIRE_HYPERVISOR` is the escape: any environment that
+        // believes it can run this asserts so, and absence becomes a hard
+        // failure there instead of a silent pass. A runner that gains libkrun
+        // and forgets to set it degrades to "skipped", not to "wrong".
+        assert!(
+            std::env::var_os("LEYLINE_REQUIRE_HYPERVISOR").is_none(),
+            "LEYLINE_REQUIRE_HYPERVISOR is set, so this environment claims a \
+             hypervisor, but LEYLINE_LIBKRUN_PATH / LEYLINE_LIBKRUNFW_PATH are \
+             not both set. Refusing to report a pass for a microVM test that \
+             did not boot a microVM."
+        );
+        eprintln!(
+            "SKIPPED (NOT a pass): no hypervisor. This test exercises a real \
+             libkrun guest and needs LEYLINE_LIBKRUN_PATH + \
+             LEYLINE_LIBKRUNFW_PATH, plus the aarch64-unknown-linux-musl \
+             target. Nothing about the microVM backend was verified by this \
+             run. Set LEYLINE_REQUIRE_HYPERVISOR to make this absence fail."
+        );
+        return None;
+    };
+    let libkrunfw = std::path::PathBuf::from(libkrunfw)
+        .canonicalize()
+        .expect("canonical LEYLINE_LIBKRUNFW_PATH");
+    Some((libkrun, libkrunfw))
+}
+
 #[test]
-#[ignore = "requires macOS/ARM64 with libkrun, libkrunfw, and the Linux musl Rust target"]
 fn guest_writes_the_ephemeral_root_without_mutating_cas() {
-    let libkrun = std::env::var_os("LEYLINE_LIBKRUN_PATH").expect("LEYLINE_LIBKRUN_PATH");
-    let libkrunfw = std::path::PathBuf::from(
-        std::env::var_os("LEYLINE_LIBKRUNFW_PATH").expect("LEYLINE_LIBKRUNFW_PATH"),
-    )
-    .canonicalize()
-    .expect("canonical LEYLINE_LIBKRUNFW_PATH");
+    let Some((libkrun, libkrunfw)) = hypervisor_or_skip() else {
+        return;
+    };
     let fixture = TempDir::new().expect("fixture");
     let staging = fixture.path().join("staging");
     let staging_bin = staging.join("bin");

@@ -116,7 +116,7 @@ port, so §4 means on Linux what it says. Seatbelt cannot: it scopes only the
 *outbound* direction per port, and the bind/inbound direction is all-or-nothing
 — a conformant macOS runner asked for one listener would have to grant every
 port on every address. A runner that cannot express a §4 declaration MUST refuse
-it (§9 condition 5) rather than grant the wider rule.
+it (§9 condition 6) rather than grant the wider rule.
 
 **§6 has the mirror-image gap, and the two do not cancel.** Seatbelt filters a
 UNIX socket by path — it classifies the connect as `network-outbound` and emits
@@ -134,7 +134,7 @@ is expressible on Linux upstream. What blocks it is this stack: the `landlock`
 crate stops at ABI 7 and has no `RESOLVE_UNIX` constant to emit, and the sandbox
 layer targets ABI 5 and consults its UNIX-socket capabilities only in the macOS
 backend. When those advance, §6 becomes enforceable on Linux without a spec
-change, and the refusal in condition 5 stops firing on its own.
+change, and the refusal in condition 6 stops firing on its own.
 
 Note also that `RESOLVE_UNIX` is scoped by domain: it governs connections to
 server sockets created *outside* the new Landlock domain, while sockets created
@@ -151,7 +151,7 @@ at declared granularity on both.
 
 The practical rule that follows: a capability needing a local channel declares
 §4 where Landlock enforces and §6 where Seatbelt does, and a conformant runner
-REFUSES the dimension its kernel cannot express (§9 condition 5) rather than
+REFUSES the dimension its kernel cannot express (§9 condition 6) rather than
 compiling it to nothing. A silently-dropped grant is worse than a refused one,
 because §8 commits the manifest's digest either way — the identity claim then
 attests a clause that had no effect.
@@ -328,7 +328,7 @@ path filter cannot express.
 That asymmetry is the mode's cost. `connect` and `connect-bind` are
 purely positive grants, but `bind` carries a **negative** clause —
 MUST NOT dial — and a runner whose mechanism cannot withhold
-`connect(2)` MUST refuse `bind` (§9 condition 5) rather than widen it
+`connect(2)` MUST refuse `bind` (§9 condition 6) rather than widen it
 to `connect-bind`. A mode that some tier refuses is recoverable; a mode
 missing from v1 is a v2 break, which is why the vocabulary is fixed
 here even though not every tier can serve all of it.
@@ -419,6 +419,14 @@ A second implementation is conformant when:
 5. Its identity-commit check (§8) refuses to start a bundle whose
    identity claim commits to a `confinementDigest` different from
    the runner's computed one.
+6. It REFUSES any declaration its mechanism cannot express at the
+   granularity the dimension states, rather than widening it to
+   something broader or dropping it silently. A grant that compiles
+   to nothing, or to more than was asked for, leaves the digest
+   committing to a policy that never took effect — which conditions
+   2 and 5 cannot detect, because the bytes still hash correctly.
+   This is the condition §1, §3, §4, §5 and §6 each invoke when they
+   say a runner that cannot express a declaration MUST refuse it.
 
 Cross-impl conformance already proven: cloister computed
 `d9b5b7270bb6e5ec068aec92798dd76b0f71d1fe2640b3a09833b7742d51c617`

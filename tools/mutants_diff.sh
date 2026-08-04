@@ -101,7 +101,7 @@ echo "mutating $n candidate(s) from the diff"
 # the pairing instead of trusting whoever edits the exclude list next.
 # Overridable ONLY so tools/test_mutants_diff.sh can prove the pairing check
 # actually fires; production callers must never set it.
-GENERIC_EXCLUDES=${MUTANTS_GENERIC_EXCLUDES:-'ll-open/fs ll-open/runtime ll-open/cli-lib ll-open/cli'}
+GENERIC_EXCLUDES=${MUTANTS_GENERIC_EXCLUDES:-'ll-open/fs ll-open/runtime ll-open/cli-lib ll-open/cli ll-open/schema-bridge'}
 
 overall=0
 ran_slice=0
@@ -188,7 +188,22 @@ if [ "$SCOPE" = all ]; then
         --exclude 'll-open/fs/**' \
         --exclude 'll-open/runtime/**' \
         --exclude 'll-open/cli-lib/**' \
-        --exclude 'll-open/cli/**'
+        --exclude 'll-open/cli/**' \
+        --exclude 'll-open/schema-bridge/**'
+fi
+
+# schema-bridge is the same case runtime and cli-lib are, in its purest form:
+# it has no `#[cfg(test)]` module ANYWHERE. Every assertion about the emitters
+# lives in `tests/` — `doc_projection.rs`, `execution_v1.rs`, `map_field.rs`
+# and the rest — so the lib-only generic slice ran zero of them and reported
+# every emitter mutant as missed. It failed this PR for 7 of them, `write_doc`
+# among them, each one killed outright by `tests/doc_projection.rs`.
+#
+# `--test-workspace=false` keeps that from costing anything: the crate's own
+# suite is what runs, so no other crate's tests can break this baseline.
+if [ "$SCOPE" = all ] && package_changed_in_diff ll-open/schema-bridge; then
+    claim_package ll-open/schema-bridge
+    run_slice integration --package leyline-schema-bridge --test-workspace=false
 fi
 
 if [ "$SCOPE" = all ] || [ "$SCOPE" = runtime ]; then

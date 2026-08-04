@@ -236,5 +236,59 @@ mod tests {
             msg.to_lowercase().contains("readonly"),
             "expected SQLITE_READONLY error, got: {msg}",
         );
+
+        // --- post-fault usability (bead `ley-line-open-5e6ce6`) ---
+        //
+        // Everything above stops at "it returned an error", which is only
+        // half the contract. A refusal that also wedged the connection, or
+        // poisoned the pool, or left a lock behind would satisfy every
+        // assertion above and still break the caller.
+        //
+        // That is not hypothetical: the same shape let a first-draft fix for
+        // a Turso checkpoint bug look complete, because its test checked only
+        // `result.is_err()`. An adversarial pass had to add "insert another
+        // row, read it back" to catch that the connection had been left
+        // corrupt. These three assertions are that pass, applied here.
+
+        // 1. The connection that refused the write still reads. A refusal
+        //    must not consume the connection it refused on.
+        let seen: i64 = reader
+            .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+            .expect("the refusing connection must remain usable for reads");
+        assert_eq!(seen, 0, "the refused INSERT must not have landed");
+
+        // 2. The pool still vends. Returning a connection that errored must
+        //    not poison it for the next checkout — this is the assertion
+        //    that would fail if a failed statement left an open transaction.
+        drop(reader);
+        let reader = live
+            .reader_pool
+            .get()
+            .expect("the pool must still vend readers after a refused write");
+        let seen: i64 = reader
+            .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+            .expect("a freshly checked-out reader must work");
+        assert_eq!(seen, 0);
+
+        // 3. The writer is unaffected, and its work is visible to readers.
+        //    A refused write that had left a lock behind would hang or fail
+        //    here rather than at the point of the refusal, which is exactly
+        //    why asserting on the error alone is not enough.
+        //
+        //    (`writer` is a `parking_lot::Mutex`, which does not poison, so
+        //    the thing under test is SQLite's file-level state rather than
+        //    Rust's lock state.)
+        live.writer
+            .lock()
+            .execute("INSERT INTO t (v) VALUES ('real')", [])
+            .expect("the writer must still write after a reader was refused");
+        let seen: i64 = reader
+            .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+            .expect("reader must observe the writer's committed row");
+        assert_eq!(
+            seen, 1,
+            "a reader must see a post-refusal commit — otherwise the refusal \
+             left the WAL or the pool in a state that hides new writes"
+        );
     }
 }

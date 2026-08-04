@@ -16,6 +16,27 @@ env:
 # entry. If a check isn't reachable via `task <name>`, it doesn't belong
 # in CI either. Adding a new gate? Add it to Taskfile.yml first, then
 # add a step here that calls it.
+#
+# ## Two tiers, selected by where the change is GOING
+#
+# The gate scales with what merging would commit us to, not with the event:
+#
+#   feature -> integration   `task ci`. Fast, run constantly. Integration is
+#                            where work converges; a slow gate here is paid on
+#                            every iteration and buys nothing that the
+#                            promotion gate will not catch.
+#
+#   * -> main                `task ci` + the release-profile perf gate + the
+#                            version-consistency check. `main` is what releases
+#                            are cut from, so an integration -> main promotion
+#                            is the last point where a regression is cheap to
+#                            stop. This is `task ci:full` plus the release
+#                            gate, spelled out as steps so a failure names the
+#                            gate that failed.
+#
+# Selecting on `github.base_ref` rather than on the event is the point. Perf
+# used to run only on PUSH to main — i.e. after the merge had already landed,
+# where a failure reports a regression instead of preventing one.
 jobs:
   ci:
     name: Check + Clippy + Test (task ci)
@@ -98,10 +119,28 @@ jobs:
         if: always()
         run: task cache:sccache:stats
 
-      # Perf regression gate — release-profile build adds ~90-120s, so
-      # we only run it on main pushes (every PR doesn't need to pay).
-      # Authors of perf-sensitive changes should run `task ci:full`
-      # locally before requesting review.
-      - name: Run task test:perf (main pushes only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      # Perf regression gate — the release-profile build adds ~90-120s, so a
+      # PR targeting `integration` does not pay it. A PR targeting `main` does:
+      # that is the promotion into the branch releases are cut from, and it is
+      # the last point where stopping a regression is cheap. Still runs on push
+      # to main as a backstop for anything that reaches main without a PR.
+      #
+      # Authors of perf-sensitive changes should run `task ci:full` locally
+      # before requesting review, whichever branch they are targeting.
+      - name: Run task test:perf (main-bound changes only)
+        if: >-
+          (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+          (github.event_name == 'pull_request' && github.base_ref == 'main')
         run: task test:perf
+
+      # Version consistency across binary, schema, generated metadata and docs.
+      # Only meaningful on the main-bound path: `integration` legitimately
+      # carries unreleased work whose versions have not been reconciled yet,
+      # so running this on every feature PR would fail for a reason that is not
+      # a defect. Immediately before a release cut, it is exactly the check
+      # that matters.
+      - name: Run task release:version-check (main-bound changes only)
+        if: >-
+          (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+          (github.event_name == 'pull_request' && github.base_ref == 'main')
+        run: task release:version-check

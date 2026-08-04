@@ -4,7 +4,7 @@
 **Audience:** anyone building a second implementation of kernel-level
 bundle confinement — whether in Rust, Go, or as a different
 substrate-side runner. If your enforcement engine consumes a
-`ConfinementManifest` conformant to §5's shape and passes the
+`ConfinementManifest` conformant to §1's dimensions and passes the
 conformance vectors in `test-vectors/`, you're conformant.
 
 **Non-goals:** v1 does NOT cover eBPF-level syscall filtering, seccomp
@@ -23,8 +23,8 @@ outside its declared manifest fails closed at the kernel boundary.
 
 Three load-bearing properties this v1 publishes:
 
-1. **Fail-closed by construction.** All four dimensions (fs / network /
-   port / credential-source) default to DENY. Anything the manifest
+1. **Fail-closed by construction.** All five dimensions (fs / network /
+   port / unix-socket / credential-source) default to DENY. Anything the manifest
    does not explicitly allow is rejected at the kernel boundary — no
    "implicit inherit-from-parent" fallback.
 2. **Declarative, not procedural.** The manifest names desired end
@@ -62,10 +62,11 @@ This v1 **CONSUMES**:
 
 This v1 **DEFINES** (new content not in either upstream spec):
 
-- The `ConfinementManifest` JSON structure (§5).
-- The four dimensions and their allow-list semantics
-  (`fs.allow` / `network.allowHosts` / `port.bind` / `credentialSource`).
-- The canonical serialization rules (§6) so two independent
+- The `ConfinementManifest` JSON structure (§1-§6).
+- The five dimensions and their allow-list semantics
+  (`fs.allow` / `network.allowHosts` / `port.bind` / `unixSocket.allow` /
+  `credentialSource`).
+- The canonical serialization rules (§7) so two independent
   implementations reach the same BLAKE3 digest on the same manifest.
 
 ## Document map
@@ -73,31 +74,31 @@ This v1 **DEFINES** (new content not in either upstream spec):
 - `README.md` (this file) — the spec proper.
 - `confinement.schema.json` — the **machine-readable shape** (bead
   `ley-line-open-41297c`). JSON Schema rather than a capnp IDL because
-  `confinementDigest` is computed over canonical JSON (§6), and the IDL
+  `confinementDigest` is computed over canonical JSON (§7), and the IDL
   format follows the digest definition — see schema-spec `LAYOUT.md`.
   A capnp source would make the JSON a projection, leaving two
   definitions for one signed surface. Verified by
   `verify_confinement_schema` (schema-spec crate), which checks both
   that the pinned canonical manifest satisfies it and that each
-  refusal §2–§5 states in prose is actually refused.
+  refusal §2–§6 states in prose is actually refused.
 - `test-vectors/manifest-canonical.json` — a canonical example
   manifest.
 - `VECTORS.sha256` — **SHA-256 CONTENT-INTEGRITY pins** for the test
   vectors ("the bytes on disk haven't drifted"). Verified by
   `verify_vectors_sha256` (schema-spec crate). This is a
   cross-cutting concern of the whole spec tree, NOT the
-  identity digest §7 names.
+  identity digest §8 names.
 - `CONFINEMENT_DIGESTS.blake3` — **BLAKE3-256 IDENTITY pins** for the
-  test vectors — the `confinementDigest` per §7. Verified by
+  test vectors — the `confinementDigest` per §8. Verified by
   `verify_confinement_digest` (schema-spec crate). Bead
   `ley-line-open-193170`: distinct from the SHA-256 integrity pin
-  above because §7's semantics require the substrate's Σ hash
+  above because §8's semantics require the substrate's Σ hash
   (BLAKE3-256), and pinning it separately lets us prove cross-impl
   conformance on every workspace test run.
 
-## §1 Four dimensions
+## §1 Five dimensions
 
-A `ConfinementManifest` describes four orthogonal capability
+A `ConfinementManifest` describes five orthogonal capability
 boundaries. Every dimension defaults to **DENY**; the manifest names
 only what is allowed.
 
@@ -105,8 +106,70 @@ only what is allowed.
 |-----------|-------|--------------------|--------------------------|--------------------------|
 | **fs** | `fs.allow` | Path prefixes readable/writable by the bundle | `landlock_ruleset_add_rule` (LANDLOCK) | `sandbox_init` with path allow-list |
 | **network** | `network.allowHosts` | Host allow-list for egress | Network namespace + userspace SOCKS filter | `pf` (packet filter) allow-list |
-| **port** | `port.bind` | Listener ports the bundle may bind | `SO_REUSEPORT` + per-port capability | Same |
+| **port** | `port.bind` | Listener ports the bundle may bind | Landlock `BindTcp`, per port | **Not expressible** — see below |
+| **unixSocket** | `unixSocket.allow` | UNIX socket paths the bundle may connect to, and may bind | **Not available** at the targeted ABI — see below | Seatbelt `(allow network-outbound (literal …))`, per path |
 | **credentialSource** | `credentialSource` | Vault backend for credential vending | URL/scheme validation before `nono::keystore::load_secret_by_ref` | Same |
+
+**§4 and §6 are not interchangeable, and the asymmetry is a property of the
+kernels rather than of any implementation.** Landlock filters TCP `bind(2)` by
+port, so §4 means on Linux what it says. Seatbelt cannot: it scopes only the
+*outbound* direction per port, and the bind/inbound direction is all-or-nothing
+— a conformant macOS runner asked for one listener would have to grant every
+port on every address. A runner that cannot express a §4 declaration MUST refuse
+it (§9 condition 6) rather than grant the wider rule.
+
+**§6 has the mirror-image gap, and the two do not cancel.** Seatbelt filters a
+UNIX socket by path — it classifies the connect as `network-outbound` and emits
+a literal rule. Landlock, at the ABI this implementation targets, cannot: its
+network access set is `BindTcp | ConnectTcp` and nothing else, and no *network*
+right covers AF_UNIX at any ABI. A §6 grant is therefore enforceable on macOS
+and unavailable on Linux here, exactly inverting §4.
+
+**"Unavailable here", not "impossible".** The distinction is load-bearing, and
+the sloppier claim expires. Landlock ABI 9 (kernel 7.1) adds
+`LANDLOCK_ACCESS_FS_RESOLVE_UNIX` — a *filesystem* right, not a network one —
+which mediates `connect(2)` and `sendmsg(2)`-with-explicit-recipient on pathname
+UNIX sockets, at exactly the per-path granularity §6 declares. So the dimension
+is expressible on Linux upstream. What blocks it is this stack: the `landlock`
+crate stops at ABI 7 and has no `RESOLVE_UNIX` constant to emit, and the sandbox
+layer targets ABI 5 and consults its UNIX-socket capabilities only in the macOS
+backend. When those advance, §6 becomes enforceable on Linux without a spec
+change, and the refusal in condition 6 stops firing on its own.
+
+Note also that `RESOLVE_UNIX` is scoped by domain: it governs connections to
+server sockets created *outside* the new Landlock domain, while sockets created
+within it stay reachable. A §6 grant naming a proxy socket that the sandboxed
+process itself creates is therefore unaffected by it either way.
+
+An earlier draft of this section claimed a socket, being a filesystem object, is
+filtered by path on both kernels, and that §6 was therefore the one channel
+dimension enforceable everywhere. That is false, and it is recorded here rather
+than quietly deleted because the mistake is instructive: routing a channel
+through a socket instead of a port does not close the platform gap, it swaps
+which platform has one. There is currently **no** channel dimension enforceable
+at declared granularity on both.
+
+The practical rule that follows: a capability needing a local channel declares
+§4 where Landlock enforces and §6 where Seatbelt does, and a conformant runner
+REFUSES the dimension its kernel cannot express (§9 condition 6) rather than
+compiling it to nothing. A silently-dropped grant is worse than a refused one,
+because §8 commits the manifest's digest either way — the identity claim then
+attests a clause that had no effect.
+
+Two properties of §6 that no kernel enforces, and which a runner therefore
+cannot make true on its own:
+
+- **A grant inherits its peer's authority.** Both kernels evaluate at
+  `connect(2)`, never at use. A file descriptor received over `SCM_RIGHTS`
+  carries no residual policy, so a peer may delegate any capability it holds —
+  a socket, a directory outside `fs.allow`, its own control channel. A §6 grant
+  means "may talk to X, and holds whatever X hands over." Endpoints reachable
+  from a confined workload SHOULD refuse ancillary data.
+- **The abstract namespace is out of scope.** Sockets whose name begins with a
+  NUL byte have no filesystem path, so a path-based grant cannot name them and
+  §1's DENY-by-default does not reach them. `socketpair(2)` is likewise
+  ungrantable and undeniable. Confining that address space requires a
+  whole-namespace control, not a per-path one.
 
 Any dimension the manifest omits defaults to DENY. There is no
 "unrestricted" mode; a runner given a manifest with `fs.allow: []`
@@ -210,7 +273,96 @@ A bundle needing no credentials omits the field. `nono::keystore`'s
 URI validator is the reference implementation; conforming runners
 call it before storing the manifest.
 
-## §6 Canonical serialization
+## §6 unixSocket.allow
+
+A list of UNIX socket paths the bundle may reach. Same spelling
+convention as §2, for the same reason — the shape of the entry says
+what kind of grant it is, so a reader of the JSON can tell:
+
+```json
+"unixSocket": {
+  "allow": [
+    "/run/llo/vault-proxy.sock",
+    {"path": "/run/llo/shims/", "mode": "connect-bind"}
+  ]
+}
+```
+
+- **Bare string ⇒ `connect` only.** As in §2, the cheaper spelling is
+  the safer one: a plain path grants `connect(2)` and nothing else.
+- **`mode` is closed: `"bind"` | `"connect-bind"`.** It appears only on
+  the object form, and is **required** there. Connect-only has no
+  spelling as a `mode` because it *is* the bare-string form — one
+  grant, one spelling, so two documents cannot differ only in how they
+  write the same grant and digest differently. An explicit
+  `"mode": "connect"` is rejected, exactly as §2 rejects `"mode": "ro"`.
+- **Trailing slash ⇒ directory.** `/run/llo/shims/` grants the sockets
+  directly inside that directory; a path with no trailing slash names
+  one socket. Same distinction §2 draws, encoded the same way.
+
+**The three modes are not a convenience set.** Each names a distinct
+authority over the path:
+
+| mode | `connect(2)` | `bind(2)` | who wants it |
+|---|---|---|---|
+| `connect` (bare string) | ✅ | ❌ | a capability dialling a shim |
+| `bind` | ❌ | ✅ | the shim itself — serve, never dial |
+| `connect-bind` | ✅ | ✅ | a process that owns an endpoint *and* dials through it |
+
+`connect` requires the socket to already exist — the grant is "you may
+talk to whatever is listening there". `bind` *creates* the socket file
+and so lets the bundle decide what the path means, while withholding
+the dial. `connect-bind` is both. Granting a wider mode by default
+would repeat §4's failure at a different granularity: a declaration
+that names one thing and permits another.
+
+**`bind` exists because a mechanism enforces exactly it.** It was not
+added for vocabulary symmetry. A hypervisor tier that pairs a host
+socket to a guest port with a listen side enforces serve-without-dial
+directly — libkrun's vsock muxer answers a guest-originated connection
+request against a `listen=true` mapping with a reset rather than a
+connection. That is a boundary rather than a filter: it enforces by not
+constructing the dial path at all, which is why it can hold a clause a
+path filter cannot express.
+
+That asymmetry is the mode's cost. `connect` and `connect-bind` are
+purely positive grants, but `bind` carries a **negative** clause —
+MUST NOT dial — and a runner whose mechanism cannot withhold
+`connect(2)` MUST refuse `bind` (§9 condition 6) rather than widen it
+to `connect-bind`. A mode that some tier refuses is recoverable; a mode
+missing from v1 is a v2 break, which is why the vocabulary is fixed
+here even though not every tier can serve all of it.
+
+**A `connect` grant carries an ordering requirement.** The endpoint it
+names MUST be bound before confinement is applied. This is not an
+implementation quirk to be worked around — the path is *resolved* when
+the grant is compiled, not merely recorded, and that resolution is what
+stops a symlink planted at the path from redirecting the grant to a
+different endpoint. A grant that cannot be resolved cannot be shown to
+mean what it says.
+
+A runner MUST therefore refuse a `connect` grant whose endpoint is not
+yet bound, and MUST distinguish that refusal from a malformed manifest:
+the same document compiles unchanged once the peer is up. `bind` and
+`connect-bind` carry no such requirement — they create the socket — but
+their *parent directory* must exist, for the same resolution reason.
+
+The consequence for §8 is worth stating plainly, because it qualifies a
+claim made there: compiling a manifest is **not** a pure function of the
+manifest. Two runs of the same bytes can differ in outcome as the peer
+comes up. The digest still commits to the declaration, and the applied
+policy is still exactly what the declaration says — but "compiles" is a
+property of the declaration *and* the moment, and a verifier must not
+read a compile failure as evidence the manifest was wrong.
+
+Per §1, this dimension is enforceable at declared granularity on macOS
+and unavailable on Linux at the ABI this implementation targets — the
+mirror image of §4, not a dimension that escapes the platform gap.
+
+A bundle needing no local channel omits the block entirely, which —
+per §1 — denies all of them.
+
+## §7 Canonical serialization
 
 Two implementations reach the same BLAKE3 digest on the same manifest
 by following these rules:
@@ -232,7 +384,7 @@ Its BLAKE3-256 `confinementDigest` is pinned in
 SHA-256 content-integrity pin — a distinct concern; see the
 Document map for the split).
 
-## §7 Committing the manifest to identity
+## §8 Committing the manifest to identity
 
 At bundle-start time, the substrate runner:
 
@@ -251,7 +403,7 @@ identity** — a runner enforcing a different manifest than the one
 committed at identity issuance surfaces as a cryptographic
 mismatch, not a runtime drift.
 
-## §8 Conformance
+## §9 Conformance
 
 A second implementation is conformant when:
 
@@ -261,12 +413,20 @@ A second implementation is conformant when:
    `CONFINEMENT_DIGESTS.blake3` for that vector.
 3. Independently, its stored bytes match the SHA-256 content-integrity
    pin in `VECTORS.sha256` (a cross-cutting spec-tree convention;
-   distinct concern from §7's identity digest).
-4. Its enforcement engine implements the four dimensions with
+   distinct concern from §8's identity digest).
+4. Its enforcement engine implements the five dimensions with
    fail-closed defaults matching §1's DENY-by-default rule.
-5. Its identity-commit check (§7) refuses to start a bundle whose
+5. Its identity-commit check (§8) refuses to start a bundle whose
    identity claim commits to a `confinementDigest` different from
    the runner's computed one.
+6. It REFUSES any declaration its mechanism cannot express at the
+   granularity the dimension states, rather than widening it to
+   something broader or dropping it silently. A grant that compiles
+   to nothing, or to more than was asked for, leaves the digest
+   committing to a policy that never took effect — which conditions
+   2 and 5 cannot detect, because the bytes still hash correctly.
+   This is the condition §1, §3, §4, §5 and §6 each invoke when they
+   say a runner that cannot express a declaration MUST refuse it.
 
 Cross-impl conformance already proven: cloister computed
 `d9b5b7270bb6e5ec068aec92798dd76b0f71d1fe2640b3a09833b7742d51c617`

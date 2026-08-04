@@ -10,6 +10,161 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.15.1] — 2026-08-04
+
+**v0.15.0's confinement attestation did not function.** This release makes the
+mechanism it advertised actually work, and lets a grant carry the policy it
+commits to.
+
+### Fixed
+
+- **The attested digest had no satisfying input.** The confinement manifest
+  named the materialized rootfs directly, and that path is
+  `<per-run temporary directory>/rootfs` — so every run digested differently and
+  no issuer could ever commit to a value the runner would produce. The drift
+  check both backends perform could only ever *reject*. Nothing caught it
+  because every real-worker test passed an empty digest, which skips the
+  comparison entirely.
+
+  The manifest now names the run root symbolically and the realization is
+  substituted at compile time. No coverage is lost: the rootfs *content* is
+  attested by its own digest, verified before execution, and reaches the receipt
+  as `inputRoots`. The host path was only ever where those already-verified
+  bytes were placed.
+
+- **A resolver could silently disable the attestation.** `start_authorized`
+  verified the resolver preserved `run_id`, `replay_key` and `allowed_egress`,
+  but not `confinement_digest` — and both backends gate the drift check on that
+  field being non-empty, so *dropping* it turned the check off with no error.
+  Adding the check immediately failed six tests across two crates: two
+  independent fixtures were dropping it, with nothing failing between them.
+
+- **Three of four confinement dimensions were inert.** `port.bind`,
+  `network.allowHosts` and `credentialSource` were declared, digested, and read
+  by nothing. §5 had no accessor at all, so the compiler could not have refused
+  it even in principle. Each is now enforced or refused; a dimension a tier
+  cannot enforce is a rejection, never a silent drop.
+
+- **On macOS, a single-port listener grant meant every port.** Seatbelt cannot
+  filter bind or inbound by port, so nono emits an unqualified
+  `(allow network-bind)`. §4 is refused on that platform rather than granting
+  more than it says.
+
+- **The manifest admitted documents its own schema refuses** — privileged
+  ports, port 0 (which compiles to a `localhost:*` wildcard), relative paths,
+  `..` traversal, interior-wildcard hosts, unenumerated credential schemes.
+
+### Added
+
+- **`RunGrant.confinementManifest`** — the `confinement/v1` document the digest
+  is taken over, as canonical JSON. Carrying the digest alone let an issuer
+  commit to a policy the runner could never obtain: a runner could verify that
+  what it applied matched, and never learn what was authorized. A carried
+  document must digest to `confinementDigest` and must parse under every §2–§5
+  refusal, so a grant cannot name one policy and carry another.
+
+- **`ConfinementManifest::parse`** — the wire-form reader. The type was
+  write-only, which is why a grant's document could never become the manifest
+  LLO compiles.
+
+- **An explicit vsock boundary for the microVM tier**, with socket hijacking
+  (`--tsi-hijack-inet`) as an operator opt-in that is never the default.
+
+### Changed
+
+- **`confinementDigest` now commits to the policy, not the run instance.**
+  Digests computed against v0.15.0's shape will not match.
+- Previously-accepted input now fails: a resolver dropping the digest, `port.bind`
+  on macOS, and manifests violating the schema.
+- The microVM backend requires a libkrun exporting `krun_add_vsock`,
+  `krun_add_vsock_port2` and `krun_set_port_map`. An older one makes the backend
+  unavailable rather than running with a weaker boundary than it reports.
+
+## [0.15.0] — 2026-08-04
+
+Execution/v1 stops accepting what it cannot verify. A ceiling the selected
+tier cannot enforce is now a rejection rather than a silent acceptance;
+confinement is one manifest whose digest the worker attests and both
+supervisors check; and the capnp doc comments reach the zod and Go emitters,
+so a consumer can generate its types instead of hand-maintaining a mirror
+beside them.
+
+### Added
+
+- **Tier ceilings, and the mechanism that backs each one**
+  (`ley-line-open-da36d2`). `CeilingMechanism` names what actually applies a
+  limit — `Unenforced`, `Supervisor` (LLO's own backend, observing a
+  wall-clock deadline), or `Hypervisor` (libkrun, at VM configuration time,
+  before the guest runs) — and `EnforcedCeilings::check` refuses a request for
+  a ceiling the selected tier cannot apply. The native tier is
+  `wall_clock_only`; the microVM tier is `hypervisor_backed`. This closes the
+  case where a grant asked for a vCPU or memory bound that nothing on the
+  chosen path would have enforced, and nothing said so. ADR-0035 records the
+  measurement behind it: nono carries `resource_limits` through serialization
+  but enforces them only on `exec_strategy: supervised` via cgroup v2, which
+  is not the library path LLO uses, and which has no macOS equivalent at all.
+
+- **The confinement manifest, and its attested digest**
+  (`ley-line-open-da36d2`). One manifest is the single object: the
+  `CapabilitySet` nono applies is derived *from* it, and the digest attested
+  over it describes the same bytes — so the attestation is true by
+  construction rather than by discipline. The worker compiles the policy after
+  fork, applies it irreversibly, and only then reports the digest on the
+  readiness protocol; the supervisor compares that against what the grant
+  authorized and refuses the run with `confinement drift` if they disagree.
+  Both tiers enforce it. The comparison cannot be made daemon-side — the
+  rootfs path is resolved against a materialized tree inside the worker, so
+  recomputing it in the daemon would be a second implementation of one
+  derivation, which is the drift the single manifest exists to prevent.
+
+- **`cloister/confinement/v1` ships a machine-readable shape**
+  (`ley-line-open-41297c`). `confinement.schema.json` encodes the spec's
+  *refusals*, not merely its structure, and `verify_confinement_schema` checks
+  both that the pinned canonical manifest satisfies it and that each refusal
+  §2–§5 states in prose is actually refused. JSON Schema rather than a capnp
+  IDL because `confinementDigest` is computed over canonical JSON — the IDL
+  format follows the digest definition, not the other way round, a rule now
+  written into schema-spec `LAYOUT.md`.
+
+- **Doc comments reach every codegen target** (`ley-line-open-d554a0`). The IR
+  has always carried `doc` on structs, fields and enums, and the JSON Schema
+  and tool-definitions emitters lowered it; the zod and Go emitters dropped it
+  silently. That omission is what forces a consumer to keep a second,
+  hand-written copy of every generated type just to hold the documentation —
+  and a hand-maintained mirror is a thing that silently disagrees.
+  `doc_projection.rs` pins the projection per target.
+
+- **Kernel-confinement assertions ported from harness-sandbox**
+  (`ley-line-open-704853`).
+
+### Changed
+
+- **Evidence binding: one trusted envelope no longer satisfies three fields.**
+  `EvidenceField` and `EvidenceBinding` bind each evidence field to the run
+  and spec digest it was issued for, so an envelope that legitimately proves
+  one claim cannot be replayed to prove the other two.
+
+- **The mutation gate stopped reporting healthy code as uncovered**
+  (`ley-line-open-368ef3`, `ley-line-open-7675fe`). Two independent
+  false-failure classes, both measured rather than assumed. A diff touching
+  only `.rs` *test* code correctly enumerates zero mutants and was being
+  failed as `MISCONFIGURED`; the guard now decides by asking whether the
+  changed paths resolve from cargo-mutants' working directory, which is the
+  claim its error message actually makes. And a blanket `-C --lib` meant no
+  integration test ever ran, so crates whose assertions live in `tests/` were
+  reported as failures — `schema-bridge` has no `#[cfg(test)]` module at all,
+  so all 7 of its emitter mutants were called missed while
+  `doc_projection.rs` killed every one. Slices are now per package, and the
+  lib-only restriction is scoped to the two crates measured to need it
+  (`mcp-descriptor` and `leyline-fs`, whose scratch baselines genuinely fail).
+
+### Fixed
+
+- **Worker process trees terminate with the rootfs lifecycle**
+  (`ley-line-open-e27f51`).
+- **The execution service releases its lock during backend start**, so a slow
+  backend no longer serializes unrelated runs.
+
 ## [0.14.0] — 2026-07-30
 
 The signing train: the ecosystem's one signing implementation reaches every

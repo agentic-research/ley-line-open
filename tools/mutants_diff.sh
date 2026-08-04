@@ -42,16 +42,60 @@ listing=$(cargo mutants --in-diff "$DIFF" --list 2>&1 || true)
 n=$(printf '%s\n' "$listing" | grep -cE '^[^ ].*:[0-9]+:[0-9]+:' || true)
 
 if [ "${n:-0}" -eq 0 ]; then
-    {
-        echo "MISCONFIGURED: the diff changes Rust source but enumerated zero"
-        echo "               mutants. Almost always the diff's paths are not"
-        echo "               workspace-relative — cargo mutants runs in rs/ and"
-        echo "               needs 'a/ll-core/...', not 'a/rs/ll-core/...'."
-        echo "               Regenerate with: git diff --relative=rs"
-        echo "--- cargo mutants said ---"
-        printf '%s\n' "$listing"
-    } >&2
-    exit 1
+    # Zero mutants from a Rust-touching diff has two causes that need opposite
+    # responses, and the difference is not visible in cargo-mutants' output —
+    # it prints "No mutants to filter" for both.
+    #
+    #   1. The paths do not resolve. This is the trap: a diff generated from
+    #      the repo root carries `b/rs/ll-core/...`, matches nothing, and the
+    #      naive implementation exits 0 forever.
+    #   2. The paths resolve fine and the changed lines simply hold nothing
+    #      mutable — a `#[cfg(test)] mod tests` edit, a doc comment, a `use`.
+    #      Nothing to mutate is the correct answer here, not a failure.
+    #
+    # Deciding between them by asking the filesystem tests the actual claim the
+    # error message makes ("your paths are not workspace-relative") rather than
+    # a proxy for it. This script's cwd IS the cargo-mutants working directory,
+    # so a workspace-relative path is exactly one that resolves from here.
+    changed=$(sed -n 's|^+++ b/\(.*\.rs\)$|\1|p' "$DIFF")
+    resolved=0
+    unresolved=""
+    # Here-doc rather than a pipe: a pipeline would run this loop in a subshell
+    # and the counters would not survive it. Read line-wise, not word-wise, so
+    # a path containing a space is still one path.
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        if [ -f "$path" ]; then
+            resolved=$((resolved + 1))
+        else
+            unresolved="${unresolved}${path}
+"
+        fi
+    done <<EOF
+$changed
+EOF
+
+    if [ "$resolved" -eq 0 ]; then
+        {
+            echo "MISCONFIGURED: the diff changes Rust source but enumerated zero"
+            echo "               mutants, and none of its paths resolve from"
+            echo "               $(pwd) — where cargo mutants runs."
+            echo "               Paths must be workspace-relative: 'b/ll-core/...',"
+            echo "               not 'b/rs/ll-core/...'."
+            echo "               Regenerate with: git diff --relative=rs"
+            echo "--- unresolved paths ---"
+            printf '%s' "$unresolved" | sed 's/^/    /'
+            echo "--- cargo mutants said ---"
+            printf '%s\n' "$listing"
+        } >&2
+        exit 1
+    fi
+
+    echo "NO MUTABLE LINES: the diff's $resolved Rust file(s) resolve, but the"
+    echo "                  lines it changes hold nothing cargo-mutants can"
+    echo "                  mutate — test modules, comments or imports. This is"
+    echo "                  NOT a pass; no mutation testing ran."
+    exit 0
 fi
 
 if [ "$SCOPE" != all ]; then

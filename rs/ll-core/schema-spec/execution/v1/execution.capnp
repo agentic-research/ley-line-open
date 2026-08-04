@@ -140,6 +140,7 @@ struct RunGrant $Traits.doc("Authenticated, resolved execution authority bound t
   allowedEgress              @12 :List(Text)            $Traits.doc("Resolved egress endpoints or capability references.");
   credentialBrokerRefs       @13 :List(Text)            $Traits.doc("Resolved credential brokers; never credential values.");
   signature                  @14 :GrantSignature       $Traits.doc("Issuer signature binding every other field of this grant; absent only when the caller is the issuer. See wire/run-grant.md.") $Traits.optional;
+  confinementManifest        @15 :Text                  $Traits.doc("The confinement/v1 document `confinementDigest` is taken over, as canonical JSON. Carrying the digest alone let an issuer commit to a policy the runner could never obtain, so a runner could verify a match and never learn WHAT was authorized. Absent means the issuer names a policy by digest only, and a runner that cannot otherwise obtain that document must refuse rather than guess.") $Traits.optional;
 }
 
 struct ExecutionError $Traits.doc("Stable transport-independent execution error.") {

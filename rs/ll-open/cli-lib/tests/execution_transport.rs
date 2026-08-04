@@ -59,7 +59,18 @@ impl ExecutionResolver for Resolver {
             arguments: Vec::new(),
             public_environment: BTreeMap::new(),
             allowed_egress: authorized.allowed_egress.clone(),
-            confinement_digest: String::new(),
+            // Carried, not chosen — like every other field above. Writing
+            // `String::new()` here is what `service.rs` now refuses: both
+            // backends gate the ADR-0035 drift comparison on the digest being
+            // non-empty, so a resolver that merely dropped it silently disabled
+            // the attestation for that run.
+            //
+            // This is the SECOND fixture found doing it, independently of the
+            // one in `runtime/tests/authorization.rs`. Two test resolvers, two
+            // silent opt-outs, no failing test between them — which is the
+            // argument for the check living on the seam rather than in prose on
+            // one implementation.
+            confinement_digest: authorized.confinement_digest.clone(),
             limits: ResourceLimits {
                 vcpus: 1,
                 memory_mib: 64,

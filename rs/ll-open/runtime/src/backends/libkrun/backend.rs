@@ -33,6 +33,20 @@ pub struct KrunWorkerConfig {
     pub runtime_files: Vec<PathBuf>,
     pub devices: Vec<PathBuf>,
     pub ready_timeout: Duration,
+    /// Carry guest `AF_INET` sockets over vsock (`KRUN_TSI_HIJACK_INET`) for
+    /// every run this backend starts.
+    ///
+    /// This is the operator surface, and it has to live here rather than only
+    /// on the worker's command line: operators do not spawn the worker, this
+    /// backend does. A flag the backend never forwards is settable by tests and
+    /// by nobody else.
+    ///
+    /// Default off, and deliberately NOT reachable from an `ExecutionRequest` —
+    /// a workload must not be able to widen its own boundary. It exists for the
+    /// case where an unmodified guest binds TCP (mache on 7532) and could not
+    /// otherwise be reached across a vsock-only boundary; what the host may
+    /// then reach is still decided by the port map, not by the guest.
+    pub tsi_hijack_inet: bool,
 }
 
 pub struct KrunWorkerBackend {
@@ -170,6 +184,12 @@ impl Backend for KrunWorkerBackend {
         }
         for path in &self.config.devices {
             command.arg("--device").arg(path);
+        }
+        // The operator's opt-in, forwarded. Without this line the worker flag
+        // is reachable only by a test that spawns the worker itself, which is
+        // not an opt-in at all — it is dead configuration.
+        if self.config.tsi_hijack_inet {
+            command.arg("--tsi-hijack-inet");
         }
         configure_process_group(&mut command);
 
@@ -425,6 +445,7 @@ mod tests {
             runtime_files: Vec::new(),
             devices: Vec::new(),
             ready_timeout: Duration::from_secs(1),
+            tsi_hijack_inet: false,
         });
         backend
             .completed

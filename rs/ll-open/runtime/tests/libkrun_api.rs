@@ -1,4 +1,4 @@
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::sync::Mutex;
 
 use leyline_runtime::backends::libkrun::api::{DynamicKrunApi, KrunApi, prepare_vm};
@@ -64,6 +64,39 @@ impl KrunApi for RecordingApi {
         self.record(format!("no-vsock:{context}"))
     }
 
+    fn add_vsock(&self, context: u32, tsi_features: u32) -> Result<(), ExecutionError> {
+        self.record(format!("vsock:{context}:tsi={tsi_features}"))
+    }
+
+    fn add_vsock_port(
+        &self,
+        context: u32,
+        port: u32,
+        host_path: &CStr,
+        listen: bool,
+    ) -> Result<(), ExecutionError> {
+        self.record(format!(
+            "vsock-port:{context}:{port}:{}:listen={listen}",
+            host_path.to_string_lossy()
+        ))
+    }
+
+    fn set_port_map(&self, context: u32, entries: &[CString]) -> Result<(), ExecutionError> {
+        // Recorded with its arity because the empty case is the load-bearing
+        // one: libkrun reads "never called" as expose-everything and "called
+        // with an empty array" as expose-nothing, so a test must be able to
+        // tell those apart. `port-map:<ctx>:` with nothing after it is the
+        // closed default; absence of this record entirely is the open one.
+        self.record(format!(
+            "port-map:{context}:{}",
+            entries
+                .iter()
+                .map(|entry| entry.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(",")
+        ))
+    }
+
     fn set_workdir(&self, context: u32, workdir: &CStr) -> Result<(), ExecutionError> {
         self.record(format!("workdir:{context}:{}", workdir.to_string_lossy()))
     }
@@ -105,6 +138,8 @@ fn config(rootfs: &TempDir) -> KrunConfig {
         vcpus: 2,
         ram_mib: 1024,
         wall_time_ms: 1_000,
+        tsi_features: 0,
+        port_map: Vec::new(),
     }
 }
 
@@ -126,6 +161,17 @@ fn prepares_a_writable_ephemeral_networkless_vm_without_entering_it() {
             "vm:42:2:1024",
             &format!("root:42:false:{}", canonical_rootfs.display()),
             "no-vsock:42",
+            // The implicit device is dropped, then re-added explicitly with
+            // tsi=0 — no socket impersonation. A future change that enabled
+            // hijacking by default would show up here as a non-zero mask
+            // rather than as silently rerouted guest sockets.
+            "vsock:42:tsi=0",
+            // Empty port map, and its PRESENCE is the assertion. libkrun reads
+            // "never called" as expose-every-listening-guest-port and "called
+            // with an empty array" as expose-none, so deleting this line would
+            // not fail as a missing feature — it would open every guest
+            // listener to the host while every other test stayed green.
+            "port-map:42:",
             "workdir:42:/",
             "exec:42:usr/bin/probe:1:1",
         ]

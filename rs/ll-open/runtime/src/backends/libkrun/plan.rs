@@ -70,6 +70,22 @@ pub struct KrunConfig {
     pub vcpus: u8,
     pub ram_mib: u32,
     pub wall_time_ms: u64,
+    /// TSI feature mask for the guest's vsock device. `0` — no Transparent
+    /// Socket Impersonation — is the default and the safe one: the guest
+    /// reaches the host only over ports it was explicitly handed.
+    ///
+    /// Non-zero enables socket hijacking, which lets an unmodified guest keep
+    /// binding `AF_INET` and have it carried out over vsock. That is strictly
+    /// weaker — the boundary stops being "channels the guest was given" — so it
+    /// is an operator decision, expressed here rather than inferred, and
+    /// recorded so a receipt can say which boundary a run actually had.
+    pub tsi_features: u32,
+    /// Guest TCP ports exposed to the host, as libkrun's `"host:guest"` strings.
+    ///
+    /// EMPTY IS MEANINGFUL AND IS THE DEFAULT. libkrun treats "never called"
+    /// as expose-every-listening-port and "called with an empty array" as
+    /// expose-none, so this must always be passed — see `prepare_vm`.
+    pub port_map: Vec<CString>,
 }
 
 pub fn compile_plan(
@@ -111,6 +127,13 @@ pub fn compile_plan(
         vcpus: request.limits.vcpus,
         ram_mib: request.limits.memory_mib,
         wall_time_ms: request.limits.wall_time_ms,
+        // Both default closed, and neither is derived from the request: a
+        // workload does not get to widen its own boundary. Socket hijacking is
+        // an operator decision made at backend configuration, and an exposed
+        // port has to come from a manifest the grant authorized — so a plan
+        // compiled straight from an ExecutionRequest grants neither.
+        tsi_features: 0,
+        port_map: Vec::new(),
     })
 }
 

@@ -72,6 +72,20 @@ enum Cmd {
         #[arg(long, default_value_t = 5_000)]
         ready_timeout_ms: u64,
 
+        /// Carry guest TCP sockets over vsock (libkrun TSI). WEAKENS ISOLATION.
+        ///
+        /// Off by default. Without it a microVM guest reaches the host only
+        /// over vsock ports it was explicitly granted, and an ordinary
+        /// `AF_INET` bind inside the guest goes nowhere. With it, the guest's
+        /// sockets are transparently carried out, and what the host can reach
+        /// is decided by the port map rather than by what the grant authorized.
+        ///
+        /// Exists for unmodified guests that bind TCP and cannot otherwise be
+        /// reached across a vsock-only boundary. Enable deliberately, per
+        /// deployment — never as a convenience.
+        #[arg(long)]
+        tsi_hijack_inet: bool,
+
         /// Activate or resume the private CDC index.
         #[arg(long, default_value_t = false)]
         cdc: bool,
@@ -273,6 +287,7 @@ async fn main() -> Result<()> {
             devices,
             runtime_files,
             ready_timeout_ms,
+            tsi_hijack_inet,
             cdc,
             allow_unverified_evidence,
         } => {
@@ -380,6 +395,7 @@ async fn main() -> Result<()> {
                                 runtime_files,
                                 devices,
                                 ready_timeout: Duration::from_millis(ready_timeout_ms),
+                                tsi_hijack_inet,
                             },
                         );
                     let service = Arc::new(leyline_runtime::ExecutionService::new(backend));

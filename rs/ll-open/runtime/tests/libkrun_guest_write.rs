@@ -102,6 +102,7 @@ fn guest_writes_the_ephemeral_root_without_mutating_cas() {
         arguments: vec!["guest-write".into()],
         public_environment: BTreeMap::new(),
         allowed_egress: Vec::new(),
+        confinement_digest: String::new(),
         limits: ResourceLimits {
             vcpus: 1,
             memory_mib: 256,
@@ -146,13 +147,24 @@ fn guest_writes_the_ephemeral_root_without_mutating_cas() {
         .lines()
         .find_map(|line| serde_json::from_str(line).ok())
         .unwrap_or_else(|| panic!("missing readiness JSON in worker stderr: {stderr}"));
-    assert_eq!(
-        event,
+    // Matched rather than compared for equality: the attested confinement
+    // digest is derived from the resolved rootfs path, which is a temp dir
+    // this test cannot predict. What it can assert — and what matters — is
+    // that a live worker attests a real policy rather than an empty string.
+    match event {
         WorkerEvent::Ready {
-            run_id: "live-guest-write".into()
-        },
-        "worker stderr: {stderr}"
-    );
+            run_id,
+            confinement_digest,
+        } => {
+            assert_eq!(run_id, "live-guest-write", "worker stderr: {stderr}");
+            assert!(
+                confinement_digest.starts_with("blake3-256:"),
+                "a live worker must attest the policy it applied, got \
+                 {confinement_digest:?} — worker stderr: {stderr}"
+            );
+        }
+        other => panic!("expected readiness, got {other:?} — worker stderr: {stderr}"),
+    }
     assert!(output.status.success(), "worker failed: {stderr}");
     assert_eq!(
         fs::read(run_root.join("rootfs/guest-write")).expect("guest output"),

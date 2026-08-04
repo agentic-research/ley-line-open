@@ -7,6 +7,7 @@
 pub mod authorization;
 pub mod backends;
 mod catalog;
+pub mod confinement;
 mod error;
 mod model;
 mod service;
@@ -20,8 +21,8 @@ pub use authorization::{
 pub use catalog::{CatalogBuilder, CatalogResolver};
 pub use error::{ErrorCode, ExecutionError};
 pub use model::{
-    BackendCapabilities, BackendClass, BackendRun, BackendRunStatus, DigestRef, ExecutionRequest,
-    ReceiptContext, ResourceLimits, RunEventRecord, RunInspection, RunReceiptData, RunRecord,
-    RunState,
+    BackendCapabilities, BackendClass, BackendRun, BackendRunStatus, CeilingMechanism, DigestRef,
+    EnforcedCeilings, ExecutionRequest, ReceiptContext, ResourceLimits, RunEventRecord,
+    RunInspection, RunReceiptData, RunRecord, RunState,
 };
 pub use service::{Backend, ExecutionResolver, ExecutionService};

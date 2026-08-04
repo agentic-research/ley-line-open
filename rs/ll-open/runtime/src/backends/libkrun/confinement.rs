@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use nono::{AccessMode, CapabilitySet, Sandbox};
 
 use crate::ExecutionError;
+use crate::confinement::{ConfinementManifest, FsGrant};
 
 use super::plan::KrunConfig;
 
@@ -26,29 +27,86 @@ pub fn build_capabilities(
     )
 }
 
-/// Build the common fail-closed policy for a native worker or a VMM worker.
+/// The `confinement/v1` manifest this backend compiles for one worker.
 ///
-/// The rootfs is the only read/write tree. Runtime libraries are read-only;
-/// optional device paths are explicitly read/write. No network capability is
-/// granted here. Keeping this policy independent of libkrun prevents a native
-/// nono backend from silently widening authority while the backend is added.
+/// The common fail-closed policy for a native or VMM worker: the rootfs is
+/// the only read/write tree, runtime libraries are read-only, device paths
+/// are explicitly read/write, and no network capability is granted. Keeping
+/// it independent of libkrun stops a native nono backend from silently
+/// widening authority as that backend is built out.
+///
+/// ADR-0035 §1: the applied `CapabilitySet` and the declared
+/// `confinementDigest` must be projections of one object. This is that
+/// object. `build_process_capabilities` derives the CapabilitySet *from* it
+/// rather than beside it, so a policy change that skipped the manifest would
+/// not compile.
+///
+/// The trailing slash on the rootfs is load-bearing: `confinement/v1` §2
+/// distinguishes a directory subtree from a single file by it, and that
+/// distinction is exactly nono's `allow_path` vs `allow_file`. Encoding it in
+/// the path rather than in a separate flag keeps the manifest self-describing
+/// — a reader of the JSON can tell which grant a path is.
+pub fn confinement_manifest(
+    rootfs: &Path,
+    runtime_files: &[PathBuf],
+    devices: &[PathBuf],
+) -> ConfinementManifest {
+    let mut manifest = ConfinementManifest::new()
+        .with_fs_grant(FsGrant::read_write(format!("{}/", rootfs.display())));
+    for path in runtime_files {
+        manifest = manifest.with_fs_grant(FsGrant::read_only(path.display().to_string()));
+    }
+    for path in devices {
+        manifest = manifest.with_fs_grant(FsGrant::read_write(path.display().to_string()));
+    }
+    // No `network` block at all. §3: an omitted block means no egress, which
+    // is what `block_network()` enforces — so declaring an empty allow-list
+    // would say the same thing twice, in two places that could disagree.
+    manifest
+}
+
 pub fn build_process_capabilities(
     rootfs: &Path,
     runtime_files: &[PathBuf],
     devices: &[PathBuf],
 ) -> Result<CapabilitySet, ExecutionError> {
-    let mut capabilities = CapabilitySet::new()
-        .allow_path(rootfs, AccessMode::ReadWrite)
-        .map_err(nono_error)?;
-    for path in runtime_files {
-        capabilities = capabilities
-            .allow_file(path, AccessMode::Read)
-            .map_err(nono_error)?;
-    }
-    for path in devices {
-        capabilities = capabilities
-            .allow_file(path, AccessMode::ReadWrite)
-            .map_err(nono_error)?;
+    capabilities_from_manifest(&confinement_manifest(rootfs, runtime_files, devices))
+}
+
+/// Compile a manifest into the `CapabilitySet` nono applies.
+///
+/// A trailing slash selects `allow_path` (directory subtree); anything else
+/// is `allow_file`. nono rejects a directory passed to `allow_file` and a
+/// non-directory passed to `allow_path`, so a manifest that mislabels a path
+/// fails here rather than granting the wrong shape.
+///
+/// This compiles confinement/v1 **directly**, deliberately bypassing nono's own
+/// `CapabilityManifest` and its `TryFrom<&CapabilityManifest> for CapabilitySet`.
+/// The two manifest shapes diverge structurally — `credentials` alone is an array
+/// of objects against confinement/v1's scalar `credentialSource`, so no
+/// field-for-field mapping exists — and routing through nono's would put a second
+/// shape between the object whose digest is attested and the policy actually
+/// applied, which is the drift the single manifest exists to prevent. The full
+/// field-by-field mapping and the rationale are ADR-0035's second open question
+/// (bead `ley-line-open-c17486`).
+pub fn capabilities_from_manifest(
+    manifest: &ConfinementManifest,
+) -> Result<CapabilitySet, ExecutionError> {
+    let mut capabilities = CapabilitySet::new();
+    for grant in manifest.fs_grants() {
+        let (path, mode) = match grant {
+            FsGrant::ReadOnly(path) => (path.as_str(), AccessMode::Read),
+            FsGrant::ReadWrite { path } => (path.as_str(), AccessMode::ReadWrite),
+        };
+        capabilities = if let Some(directory) = path.strip_suffix('/') {
+            capabilities
+                .allow_path(Path::new(directory), mode)
+                .map_err(nono_error)?
+        } else {
+            capabilities
+                .allow_file(Path::new(path), mode)
+                .map_err(nono_error)?
+        };
     }
     Ok(capabilities.block_network())
 }

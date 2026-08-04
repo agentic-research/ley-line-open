@@ -6,7 +6,7 @@ use crate::{ExecutionError, ExecutionRequest};
 use serde::{Deserialize, Serialize};
 
 use super::api::{DynamicKrunApi, PreparedVm, prepare_vm};
-use super::confinement::{VmmHostResources, apply};
+use super::confinement::{VmmHostResources, apply, confinement_manifest};
 use super::plan::{DirectoryRootfsResolver, compile_plan};
 use super::volume::{materialize_ephemeral_rootfs, verify_ephemeral_rootfs};
 
@@ -22,8 +22,17 @@ pub struct WorkerOptions {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkerEvent {
-    Ready { run_id: String },
-    Failed { error: ExecutionError },
+    Ready {
+        run_id: String,
+        /// The digest of the confinement manifest this worker compiled and
+        /// applied. Same contract as the native worker's — see
+        /// `backends::native::WorkerEvent`.
+        #[serde(default)]
+        confinement_digest: String,
+    },
+    Failed {
+        error: ExecutionError,
+    },
 }
 
 impl WorkerOptions {
@@ -119,17 +128,23 @@ pub fn execute_with_ready(
     verify_ephemeral_rootfs(&config.rootfs)?;
     let mut runtime_files = options.runtime_files;
     runtime_files.push(options.libkrun);
-    apply(
-        &config,
-        &VmmHostResources {
-            runtime_files,
-            devices: options.devices,
-        },
-    )?;
+    let resources = VmmHostResources {
+        runtime_files,
+        devices: options.devices,
+    };
+    // The manifest that `apply` compiles, kept so the digest attested below
+    // describes the policy this process is actually confined by.
+    let manifest = confinement_manifest(
+        &config.rootfs.canonical_path,
+        &resources.runtime_files,
+        &resources.devices,
+    );
+    apply(&config, &resources)?;
 
     let vm: PreparedVm<'_> = prepare_vm(&api, &config)?;
     on_ready(&WorkerEvent::Ready {
         run_id: config.run_id.clone(),
+        confinement_digest: manifest.confinement_digest()?,
     })?;
     vm.enter()
 }

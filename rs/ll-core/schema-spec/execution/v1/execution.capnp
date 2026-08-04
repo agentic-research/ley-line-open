@@ -169,10 +169,23 @@ struct ResourceUsage $Traits.doc("Terminal resource accounting.") {
   outputBytes @3 :UInt64 $Traits.doc("Collected output bytes.");
 }
 
+enum CeilingMechanism $Traits.doc("How a tier applies one resource ceiling, or that it does not.") {
+  unenforced @0 $Traits.doc("This tier does not apply the ceiling; a grant requesting one is rejected, not accepted silently.");
+  supervisor @1 $Traits.doc("The supervising process applies it — a deadline it observes and acts on.");
+  hypervisor @2 $Traits.doc("The hypervisor applies it at VM configuration time, before the guest runs.");
+}
+
+struct EnforcedCeilings $Traits.doc("Which resource ceilings the selected backend actually applied, and by what mechanism. A ceiling means different things under a hypervisor, a cgroup, and a supervisor, so the number alone attests less than it appears to.") {
+  wallTime @0 :CeilingMechanism $Traits.doc("Wall-clock deadline.");
+  vcpus    @1 :CeilingMechanism $Traits.doc("vCPU count.");
+  memory   @2 :CeilingMechanism $Traits.doc("Memory ceiling.");
+}
+
 struct BackendEvidence $Traits.doc("Implementation and enforcement evidence for the selected backend class.") {
-  backendClass @0 :BackendClass $Traits.doc("Isolation class actually used.");
-  backendId    @1 :Text         $Traits.doc("Versioned implementation identifier.");
-  evidence     @2 :EvidenceRef  $Traits.doc("Content-addressed backend enforcement evidence.");
+  backendClass @0 :BackendClass    $Traits.doc("Isolation class actually used.");
+  backendId    @1 :Text            $Traits.doc("Versioned implementation identifier.");
+  evidence     @2 :EvidenceRef     $Traits.doc("Content-addressed backend enforcement evidence.");
+  enforced     @3 :EnforcedCeilings $Traits.doc("Per-ceiling enforcement mechanism actually applied by this backend. Absent on receipts from producers that predate it; a consumer treats absence as unknown, never as unenforced.") $Traits.optional;
 }
 
 struct RunReceipt $Traits.doc("Terminal substrate evidence; may be embedded by a separate APAS attester.") {

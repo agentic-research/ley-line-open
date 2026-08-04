@@ -116,6 +116,15 @@ impl Backend for KrunWorkerBackend {
             backend_id: "libkrun/1".into(),
             backend_class: BackendClass::MicroVm,
             available: self.configured(),
+            // `krun_set_vm_config(ctx, vcpus, ram_mib)` applies both at VM
+            // configuration time, before the guest runs — see plan.rs, which
+            // carries `request.limits.vcpus` and `.memory_mib` straight
+            // through. The wall clock is still the supervisor's.
+            enforced: crate::EnforcedCeilings {
+                wall_time: crate::CeilingMechanism::Supervisor,
+                vcpus: crate::CeilingMechanism::Hypervisor,
+                memory: crate::CeilingMechanism::Hypervisor,
+            },
         }
     }
 
@@ -275,8 +284,30 @@ impl Backend for KrunWorkerBackend {
             }
         };
         match event {
-            WorkerEvent::Ready { run_id } if run_id == request.run_id => {}
-            WorkerEvent::Ready { run_id } => {
+            WorkerEvent::Ready {
+                run_id,
+                confinement_digest,
+            } if run_id == request.run_id => {
+                // Same check as the native tier: the worker attests the
+                // policy it applied, and a disagreement with the grant stops
+                // the run before it executes.
+                if !request.confinement_digest.is_empty()
+                    && confinement_digest != request.confinement_digest
+                {
+                    return Err(abort_failed_start(
+                        &mut child,
+                        rootfs,
+                        LABELS,
+                        ExecutionError::identity_mismatch(format!(
+                            "confinement drift: the worker applied a policy \
+                             digesting to {confinement_digest}, but the grant \
+                             authorized {}",
+                            request.confinement_digest
+                        )),
+                    ));
+                }
+            }
+            WorkerEvent::Ready { run_id, .. } => {
                 return Err(abort_failed_start(
                     &mut child,
                     rootfs,

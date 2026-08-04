@@ -152,6 +152,15 @@ impl<B: Backend> ExecutionService<B> {
 
     pub fn start(&self, request: ExecutionRequest) -> Result<RunRecord, ExecutionError> {
         request.validate()?;
+        // ADR-0035 §4: a ceiling the selected tier cannot enforce is a
+        // rejection, not a no-op. This sits on `start` rather than on
+        // `start_authorized` so the direct-request path cannot route around
+        // it — otherwise the check would guard the schema entry point and
+        // leave the one an embedder calls wide open.
+        self.backend
+            .capabilities()
+            .enforced
+            .check(&request.limits)?;
 
         {
             let mut state = self.state.write();
@@ -345,6 +354,7 @@ impl<B: Backend> ExecutionService<B> {
             terminal_state: record.state,
             event_log_root: format!("blake3-256:{}", event_bytes.hash()),
             backend_id: record.backend_id.clone(),
+            enforced: self.backend.capabilities().enforced,
             context,
             started_at_unix_ms,
             completed_at_unix_ms,

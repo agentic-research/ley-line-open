@@ -34,6 +34,7 @@
     "ErrorCode": { "type": "string", "description": "Stable error classification shared by every transport.", "enum": ["invalidSpec", "invalidGrant", "unauthenticated", "unauthorized", "identityPolicyMismatch", "unsupportedBackend", "notProvisioned", "resourceConflict", "resourceExhausted", "backendFailed", "cancelled", "internal"] },
     "WorkspaceOperation": { "type": "string", "description": "Operation authorized on one logical Graph workspace.", "enum": ["read", "list", "query", "mutate", "commit"] },
     "CancellationMode": { "type": "string", "description": "Behavior requested when a caller cancels or disconnects.", "enum": ["explicitOnly", "cancelOnDisconnect"] },
+    "CeilingMechanism": { "type": "string", "description": "How a tier applies one resource ceiling, or that it does not.", "enum": ["unenforced", "supervisor", "hypervisor"] },
     "DigestRef": {
       "type": "object",
       "description": "Algorithm-tagged content digest.",
@@ -238,13 +239,25 @@
       "required": ["wallTimeMs", "cpuMillis", "peakMemory", "outputBytes"],
       "additionalProperties": false
     },
+    "EnforcedCeilings": {
+      "type": "object",
+      "description": "Which resource ceilings the selected backend actually applied, and by what mechanism. A ceiling means different things under a hypervisor, a cgroup, and a supervisor, so the number alone attests less than it appears to.",
+      "properties": {
+        "wallTime": { "$ref": "#/$defs/CeilingMechanism", "description": "Wall-clock deadline." },
+        "vcpus": { "$ref": "#/$defs/CeilingMechanism", "description": "vCPU count." },
+        "memory": { "$ref": "#/$defs/CeilingMechanism", "description": "Memory ceiling." }
+      },
+      "required": ["wallTime", "vcpus", "memory"],
+      "additionalProperties": false
+    },
     "BackendEvidence": {
       "type": "object",
       "description": "Implementation and enforcement evidence for the selected backend class.",
       "properties": {
         "backendClass": { "$ref": "#/$defs/BackendClass", "description": "Isolation class actually used." },
         "backendId": { "type": "string", "description": "Versioned implementation identifier." },
-        "evidence": { "$ref": "#/$defs/EvidenceRef", "description": "Content-addressed backend enforcement evidence." }
+        "evidence": { "$ref": "#/$defs/EvidenceRef", "description": "Content-addressed backend enforcement evidence." },
+        "enforced": { "$ref": "#/$defs/EnforcedCeilings", "description": "Per-ceiling enforcement mechanism actually applied by this backend. Absent on receipts from producers that predate it; a consumer treats absence as unknown, never as unenforced." }
       },
       "required": ["backendClass", "backendId", "evidence"],
       "additionalProperties": false
@@ -470,6 +483,7 @@
     "ErrorCode": { "type": "string", "description": "Stable error classification shared by every transport.", "enum": ["invalidSpec", "invalidGrant", "unauthenticated", "unauthorized", "identityPolicyMismatch", "unsupportedBackend", "notProvisioned", "resourceConflict", "resourceExhausted", "backendFailed", "cancelled", "internal"] },
     "WorkspaceOperation": { "type": "string", "description": "Operation authorized on one logical Graph workspace.", "enum": ["read", "list", "query", "mutate", "commit"] },
     "CancellationMode": { "type": "string", "description": "Behavior requested when a caller cancels or disconnects.", "enum": ["explicitOnly", "cancelOnDisconnect"] },
+    "CeilingMechanism": { "type": "string", "description": "How a tier applies one resource ceiling, or that it does not.", "enum": ["unenforced", "supervisor", "hypervisor"] },
     "DigestRef": {
       "type": "object",
       "description": "Algorithm-tagged content digest.",
@@ -674,13 +688,25 @@
       "required": ["wallTimeMs", "cpuMillis", "peakMemory", "outputBytes"],
       "additionalProperties": false
     },
+    "EnforcedCeilings": {
+      "type": "object",
+      "description": "Which resource ceilings the selected backend actually applied, and by what mechanism. A ceiling means different things under a hypervisor, a cgroup, and a supervisor, so the number alone attests less than it appears to.",
+      "properties": {
+        "wallTime": { "$ref": "#/$defs/CeilingMechanism", "description": "Wall-clock deadline." },
+        "vcpus": { "$ref": "#/$defs/CeilingMechanism", "description": "vCPU count." },
+        "memory": { "$ref": "#/$defs/CeilingMechanism", "description": "Memory ceiling." }
+      },
+      "required": ["wallTime", "vcpus", "memory"],
+      "additionalProperties": false
+    },
     "BackendEvidence": {
       "type": "object",
       "description": "Implementation and enforcement evidence for the selected backend class.",
       "properties": {
         "backendClass": { "$ref": "#/$defs/BackendClass", "description": "Isolation class actually used." },
         "backendId": { "type": "string", "description": "Versioned implementation identifier." },
-        "evidence": { "$ref": "#/$defs/EvidenceRef", "description": "Content-addressed backend enforcement evidence." }
+        "evidence": { "$ref": "#/$defs/EvidenceRef", "description": "Content-addressed backend enforcement evidence." },
+        "enforced": { "$ref": "#/$defs/EnforcedCeilings", "description": "Per-ceiling enforcement mechanism actually applied by this backend. Absent on receipts from producers that predate it; a consumer treats absence as unknown, never as unenforced." }
       },
       "required": ["backendClass", "backendId", "evidence"],
       "additionalProperties": false

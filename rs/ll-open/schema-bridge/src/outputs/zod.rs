@@ -54,7 +54,36 @@ pub fn emit(schema: &Schema) -> Result<String> {
     Ok(out)
 }
 
+/// Write `doc` as a TSDoc block at `indent`, or nothing when absent.
+///
+/// Absence is a valid state, so an unannotated node must emit no comment at
+/// all — an empty `/** */` is noise that a reader learns to skip, which is
+/// how a real doc later gets skipped too. Multi-line docs keep their line
+/// breaks; TSDoc is the form editors surface on hover, which is the whole
+/// point of carrying the prose across (bead `ley-line-open-d554a0`).
+fn write_doc(out: &mut String, indent: &str, doc: Option<&str>) {
+    let Some(doc) = doc else {
+        return;
+    };
+    let mut lines = doc.lines();
+    let Some(first) = lines.next() else {
+        return;
+    };
+    let rest: Vec<&str> = lines.collect();
+    if rest.is_empty() {
+        writeln!(out, "{indent}/** {first} */").expect("write! to String is infallible");
+        return;
+    }
+    writeln!(out, "{indent}/**").expect("write! to String is infallible");
+    writeln!(out, "{indent} * {first}").expect("write! to String is infallible");
+    for line in rest {
+        writeln!(out, "{indent} * {line}").expect("write! to String is infallible");
+    }
+    writeln!(out, "{indent} */").expect("write! to String is infallible");
+}
+
 fn emit_enum(out: &mut String, e: &Enum) {
+    write_doc(out, "", e.doc.as_deref());
     let variants_zod: Vec<String> = e.variants.iter().map(|v| format!("\"{v}\"")).collect();
     let variants_ts: Vec<String> = e.variants.iter().map(|v| format!("\"{v}\"")).collect();
     writeln!(
@@ -74,6 +103,7 @@ fn emit_enum(out: &mut String, e: &Enum) {
 }
 
 fn emit_struct(out: &mut String, s: &Struct, schema: &Schema) -> Result<()> {
+    write_doc(out, "", s.doc.as_deref());
     // `z.lazy` lets struct refs forward-declare without a topological
     // sort. The cost is one extra closure per schema; the saving is
     // not having to detect cycles.
@@ -168,6 +198,7 @@ fn emit_zod_object(
 ) {
     writeln!(out, "{indent}z.object({{").expect("write! to String is infallible");
     for field in fields {
+        write_doc(out, &format!("{indent}  "), field.doc.as_deref());
         let rendered = render_field(field, schema);
         writeln!(out, "{indent}  {}: {},", field.name, rendered)
             .expect("write! to String is infallible");

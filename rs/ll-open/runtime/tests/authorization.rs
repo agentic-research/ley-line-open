@@ -176,6 +176,10 @@ struct GrantFixture<'a> {
     evidence: EvidenceFixture<'a>,
     /// Issuer that signs the finished grant; `None` leaves it unsigned.
     signer: Option<&'a leyline_envelope::Ed25519RootSigner>,
+    /// Isolation class the grant demands. Most fixtures want `MicroVm`; a
+    /// tier-capability test needs `Native`, because the two enforce
+    /// different ceilings.
+    backend_class: execution_capnp::BackendClass,
 }
 
 fn grant_bytes(spec_bytes: &[u8], capability: bool, expires_at: u64, wall_time_ms: u64) -> Vec<u8> {
@@ -191,6 +195,7 @@ fn grant_bytes(spec_bytes: &[u8], capability: bool, expires_at: u64, wall_time_m
             workspaces: Vec::new(),
             evidence: EvidenceFixture::Placeholder,
             signer: None,
+            backend_class: execution_capnp::BackendClass::MicroVm,
         },
     )
 }
@@ -225,7 +230,7 @@ fn grant_bytes_with_fixture(spec_bytes: &[u8], fixture: GrantFixture<'_>) -> Vec
             .init_limits()
             .set_wall_time_ms(fixture.wall_time_ms);
     }
-    grant.set_backend_class(execution_capnp::BackendClass::MicroVm);
+    grant.set_backend_class(fixture.backend_class);
     let capabilities = grant
         .reborrow()
         .init_capabilities(u32::from(fixture.capability.is_some()));
@@ -358,6 +363,7 @@ fn execution_capability_requires_both_grant_and_interface() {
                 workspaces: Vec::new(),
                 evidence: EvidenceFixture::Placeholder,
                 signer: None,
+                backend_class: execution_capnp::BackendClass::MicroVm,
             },
         );
         let error = authorize(
@@ -396,6 +402,7 @@ fn digest_validation_rejects_each_malformed_component_independently() {
                 workspaces: Vec::new(),
                 evidence: EvidenceFixture::Placeholder,
                 signer: None,
+                backend_class: execution_capnp::BackendClass::MicroVm,
             },
         );
         let error = authorize(
@@ -713,6 +720,7 @@ fn one_trusted_envelope_cannot_satisfy_every_evidence_field() {
             workspaces: Vec::new(),
             evidence: EvidenceFixture::SharedInToto(&hex),
             signer: Some(&signer),
+            backend_class: execution_capnp::BackendClass::MicroVm,
         },
     );
     let error = authorize_with_verifier(
@@ -760,6 +768,7 @@ fn evidence_asserting_every_role_for_this_run_authorizes_it() {
             workspaces: Vec::new(),
             evidence: EvidenceFixture::SharedInToto(&hex),
             signer: Some(&signer),
+            backend_class: execution_capnp::BackendClass::MicroVm,
         },
     );
     let authorized = authorize_with_verifier(
@@ -862,6 +871,7 @@ fn workspace_grants_require_exact_identity_cardinality_and_unique_names() {
             workspaces: vec![("repo", &"a".repeat(64), read.clone())],
             evidence: EvidenceFixture::Placeholder,
             signer: None,
+            backend_class: execution_capnp::BackendClass::MicroVm,
         },
     );
     authorize(&spec, &exact, &policy).expect("exact workspace grant");
@@ -880,6 +890,7 @@ fn workspace_grants_require_exact_identity_cardinality_and_unique_names() {
             ],
             evidence: EvidenceFixture::Placeholder,
             signer: None,
+            backend_class: execution_capnp::BackendClass::MicroVm,
         },
     );
     authorize(&spec, &extra, &policy)
@@ -896,6 +907,7 @@ fn workspace_grants_require_exact_identity_cardinality_and_unique_names() {
             workspaces: vec![("repo", &"c".repeat(64), read.clone())],
             evidence: EvidenceFixture::Placeholder,
             signer: None,
+            backend_class: execution_capnp::BackendClass::MicroVm,
         },
     );
     authorize(&spec, &wrong_identity, &policy)
@@ -920,6 +932,7 @@ fn workspace_grants_require_exact_identity_cardinality_and_unique_names() {
             ],
             evidence: EvidenceFixture::Placeholder,
             signer: None,
+            backend_class: execution_capnp::BackendClass::MicroVm,
         },
     );
     authorize(&duplicate_spec, &duplicate, &policy)
@@ -954,6 +967,11 @@ impl Backend for RecordingBackend {
             backend_id: "test/1".into(),
             backend_class: BackendClass::MicroVm,
             available: true,
+            enforced: leyline_runtime::EnforcedCeilings {
+                wall_time: leyline_runtime::CeilingMechanism::Supervisor,
+                vcpus: leyline_runtime::CeilingMechanism::Hypervisor,
+                memory: leyline_runtime::CeilingMechanism::Hypervisor,
+            },
         }
     }
 
@@ -978,6 +996,11 @@ impl Backend for CompletingBackend {
             backend_id: "completing/1".into(),
             backend_class: BackendClass::MicroVm,
             available: true,
+            enforced: leyline_runtime::EnforcedCeilings {
+                wall_time: leyline_runtime::CeilingMechanism::Supervisor,
+                vcpus: leyline_runtime::CeilingMechanism::Hypervisor,
+                memory: leyline_runtime::CeilingMechanism::Hypervisor,
+            },
         }
     }
 
@@ -1012,6 +1035,7 @@ impl ExecutionResolver for TestResolver {
             arguments: vec![],
             public_environment: BTreeMap::new(),
             allowed_egress: authorized.allowed_egress.clone(),
+            confinement_digest: String::new(),
             limits: ResourceLimits {
                 vcpus: 1,
                 memory_mib: 128,
@@ -1214,6 +1238,11 @@ fn capabilities_projection_uses_declared_backend_class() {
                 backend_id: "native-nono/1".into(),
                 backend_class: BackendClass::Native,
                 available: false,
+                enforced: leyline_runtime::EnforcedCeilings {
+                    wall_time: leyline_runtime::CeilingMechanism::Supervisor,
+                    vcpus: leyline_runtime::CeilingMechanism::Unenforced,
+                    memory: leyline_runtime::CeilingMechanism::Unenforced,
+                },
             }
         }
 
@@ -1365,6 +1394,7 @@ fn signed_grant_fixture<'a>(
             workspaces: Vec::new(),
             evidence: EvidenceFixture::SharedInToto(evidence_hex),
             signer,
+            backend_class: execution_capnp::BackendClass::MicroVm,
         },
     )
 }
@@ -1596,4 +1626,117 @@ fn run_id_vector_pins_the_derivation_for_other_implementations() {
             case["name"]
         );
     }
+}
+
+/// ADR-0035 §4: a ceiling the selected tier cannot enforce is a rejection,
+/// not a no-op.
+///
+/// libkrun applies `vcpus` and `memory_mib` through `krun_set_vm_config`, so
+/// a microVM grant's memory ceiling is real. The native tier reads neither —
+/// `native_backend.rs` consumes only `wall_time_ms` — so the identical grant
+/// silently becomes a suggestion there. A caller cannot tell the two apart
+/// from the outside, and the receipt attests a ceiling that was never
+/// applied.
+#[test]
+fn a_memory_ceiling_the_native_tier_cannot_enforce_is_rejected() {
+    struct NativeTier;
+    impl Backend for NativeTier {
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                backend_id: "native-nono/1".into(),
+                backend_class: BackendClass::Native,
+                available: true,
+                enforced: leyline_runtime::EnforcedCeilings {
+                    wall_time: leyline_runtime::CeilingMechanism::Supervisor,
+                    vcpus: leyline_runtime::CeilingMechanism::Unenforced,
+                    memory: leyline_runtime::CeilingMechanism::Unenforced,
+                },
+            }
+        }
+        fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+            panic!("start must not be reached: the ceiling is unenforceable here");
+        }
+        fn cancel(&self, _run_id: &str) -> Result<bool, ExecutionError> {
+            Ok(false)
+        }
+    }
+
+    let spec = spec_bytes();
+    let confinement = "b".repeat(64);
+    let grant = grant_bytes_with_fixture(
+        &spec,
+        GrantFixture {
+            capability: Some((EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION)),
+            expires_at: 2_000,
+            wall_time_ms: 0,
+            confinement_algorithm: "blake3-256",
+            confinement_value: &confinement,
+            workspaces: Vec::new(),
+            evidence: EvidenceFixture::Placeholder,
+            signer: None,
+            backend_class: execution_capnp::BackendClass::Native,
+        },
+    );
+    let service = ExecutionService::new(NativeTier);
+    service
+        .provision(BackendClass::Native, "provision-native")
+        .expect("provision backend");
+
+    // TestResolver resolves memory_mib: 128 — a real ceiling under a
+    // hypervisor and nothing at all under nono.
+    let error = service
+        .start_authorized(
+            &spec,
+            &grant,
+            &AuthorizationPolicy {
+                now_unix_ms: Some(1_000),
+                required_backend: BackendClass::Native,
+                required_confinement_digest: None,
+            },
+            &TestResolver,
+        )
+        .expect_err("an unenforceable memory ceiling must fail closed");
+
+    assert_eq!(error.code, leyline_runtime::ErrorCode::UnsupportedBackend);
+    assert!(
+        error.detail.contains("cannot be enforced"),
+        "the rejection must say the ceiling is unenforceable: {}",
+        error.detail
+    );
+    // `TestResolver` requests both vcpus and memory, and this tier applies
+    // neither, so either name is a correct report — but it must name one, so
+    // an operator learns which ceiling to drop rather than that "something"
+    // was wrong.
+    assert!(
+        error.detail.contains("vcpus") || error.detail.contains("memoryBytes"),
+        "the rejection must name the ceiling: {}",
+        error.detail
+    );
+}
+
+/// The mirror, and the reason §4 is a rejection rather than a blanket ban:
+/// the same ceiling on the tier that *can* apply it must still run.
+/// libkrun passes `vcpus`/`memory_mib` to `krun_set_vm_config`, so a microVM
+/// grant's ceilings are real and must be accepted.
+#[test]
+fn the_same_ceiling_is_accepted_by_the_tier_that_enforces_it() {
+    let spec = spec_bytes();
+    let grant = grant_bytes(&spec, true, 2_000, 0);
+    let service = ExecutionService::new(RecordingBackend);
+    service
+        .provision(BackendClass::MicroVm, "provision-01")
+        .expect("provision backend");
+
+    service
+        .start_authorized(
+            &spec,
+            &grant,
+            &AuthorizationPolicy {
+                now_unix_ms: Some(1_000),
+                required_backend: BackendClass::MicroVm,
+                required_confinement_digest: None,
+            },
+            &TestResolver,
+        )
+        .expect("a hypervisor-enforced ceiling must be accepted, not rejected");
 }

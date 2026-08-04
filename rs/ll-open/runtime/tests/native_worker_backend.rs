@@ -19,6 +19,7 @@ fn request() -> ExecutionRequest {
         arguments: vec!["true".into()],
         public_environment: BTreeMap::new(),
         allowed_egress: Vec::new(),
+        confinement_digest: String::new(),
         limits: ResourceLimits {
             vcpus: 1,
             memory_mib: 64,
@@ -219,4 +220,72 @@ fn backend_trait_cancel_delegates_and_drop_waits_for_cleanup() {
     assert_eq!(fs::read_dir(&runs).expect("runs").count(), 1);
     drop(backend);
     assert_eq!(fs::read_dir(runs).expect("runs").count(), 0);
+}
+
+/// ADR-0035 finding 2's last link: the worker attests the policy it compiled,
+/// and a run whose attestation disagrees with the grant never reaches
+/// `Running`.
+///
+/// The comparison cannot be made daemon-side. The policy is compiled in the
+/// worker, after fork — `apply_auto` runs there, and the rootfs path comes
+/// from a resolver that canonicalizes a materialized tree. For the daemon to
+/// compute the digest itself it would have to re-derive that path, which is
+/// two implementations of one derivation: exactly the drift the single
+/// manifest exists to prevent, one layer up.
+///
+/// So the worker reports, and the supervisor checks. This fixture worker
+/// reports a policy nobody authorized.
+#[test]
+fn a_worker_attesting_an_unauthorized_policy_never_reaches_running() {
+    let fixture = TempDir::new().expect("fixture");
+    // Well-formed readiness, correct run id, wrong policy.
+    let (backend, _root) = backend(
+        &fixture,
+        // Readiness travels on stderr — the backend nulls stdout.
+        r#"#!/bin/sh
+echo '{"type":"ready","run_id":"native-run-01","confinement_digest":"blake3-256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}' >&2
+sleep 30
+"#,
+    );
+
+    let mut request = request();
+    request.confinement_digest = format!("blake3-256:{}", "a".repeat(64));
+
+    let error = backend
+        .start(&request)
+        .expect_err("a worker attesting an unauthorized policy must not start");
+    assert!(
+        format!("{error:?}").contains("confinement drift"),
+        "the refusal must name drift, so an operator learns the worker applied \
+         a policy the grant did not authorize: {error:?}"
+    );
+}
+
+/// The other half of the same condition, and the one that makes it a
+/// comparison rather than a blanket refusal: when the grant authorizes no
+/// particular policy, whatever the worker attests is not drift.
+///
+/// Only reachable by embedding this backend directly — the service path always
+/// carries a digest, because `read_digest` rejects a `RunGrant.confinementDigest`
+/// that is not a lowercase blake3-256 value. It still needs pinning:
+/// `replace && with ||` survived at `native_backend.rs:259`, and under `||` an
+/// absent authorization would start refusing every worker that attested
+/// anything. That is a fail-CLOSED break of direct embedding rather than a
+/// security hole — the kind that surfaces as "it worked last release".
+#[test]
+fn a_grant_authorizing_no_policy_does_not_constrain_what_the_worker_attests() {
+    let fixture = TempDir::new().expect("fixture");
+    let (backend, _runs) = backend(
+        &fixture,
+        r#"#!/bin/sh
+echo '{"type":"ready","run_id":"native-run-01","confinement_digest":"blake3-256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}' >&2
+sleep 30
+"#,
+    );
+
+    // `request()` leaves `confinement_digest` empty: nothing was authorized.
+    backend
+        .start(&request())
+        .expect("an unauthorized-policy grant must not refuse an attesting worker");
+    assert!(Backend::cancel(&backend, "native-run-01").expect("cancel"));
 }

@@ -112,6 +112,17 @@ impl Backend for NativeWorkerBackend {
             backend_id: "native-nono/1".into(),
             backend_class: BackendClass::Native,
             available: self.configured(),
+            // nono mediates capabilities, not resources. Its manifest does
+            // carry a `resources` block, but its own schema scopes that to
+            // "enforced by the supervisor. Requires exec_strategy:
+            // \"supervised\"" — nono's CLI runner, not the library this
+            // links. So the wall clock (which `supervise_worker` enforces
+            // here) is the only ceiling this tier applies.
+            enforced: crate::EnforcedCeilings {
+                wall_time: crate::CeilingMechanism::Supervisor,
+                vcpus: crate::CeilingMechanism::Unenforced,
+                memory: crate::CeilingMechanism::Unenforced,
+            },
         }
     }
 
@@ -236,8 +247,31 @@ impl Backend for NativeWorkerBackend {
             }
         };
         match serde_json::from_str::<WorkerEvent>(line.trim()) {
-            Ok(WorkerEvent::Ready { run_id }) if run_id == request.run_id => {}
-            Ok(WorkerEvent::Ready { run_id }) => {
+            Ok(WorkerEvent::Ready {
+                run_id,
+                confinement_digest,
+            }) if run_id == request.run_id => {
+                // ADR-0035: the worker attests the policy it compiled, and a
+                // run whose attestation disagrees with the grant never
+                // reaches Running. Checked here, before the worker is
+                // allowed to proceed, because after this point it executes.
+                if !request.confinement_digest.is_empty()
+                    && confinement_digest != request.confinement_digest
+                {
+                    return Err(abort_failed_start(
+                        &mut child,
+                        run_root,
+                        LABELS,
+                        ExecutionError::identity_mismatch(format!(
+                            "confinement drift: the worker applied a policy \
+                             digesting to {confinement_digest}, but the grant \
+                             authorized {}",
+                            request.confinement_digest
+                        )),
+                    ));
+                }
+            }
+            Ok(WorkerEvent::Ready { run_id, .. }) => {
                 return Err(abort_failed_start(
                     &mut child,
                     run_root,

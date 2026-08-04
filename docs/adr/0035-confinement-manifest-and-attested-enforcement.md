@@ -356,6 +356,43 @@ than requiring every future call site to re-derive kill-before-reap.
 
 ---
 
+## The daemon cannot declare what the worker compiles — the worker must attest it
+
+*Added 2026-08-03, from implementing §1.*
+
+§1 is now real on the compile side: `confinement_manifest()` builds the
+`confinement/v1` manifest and `capabilities_from_manifest()` derives the
+`nono::CapabilitySet` from it, so the applied policy and the declared digest
+are projections of one object and a policy change that skipped the manifest
+would not compile.
+
+Closing finding 2 end to end needs one more link — comparing that digest to
+the grant's `confinementDigest` — and the obvious placement does not work.
+**The policy is compiled in the worker, after fork.** `apply()` runs
+worker-side, and the rootfs path comes from `DirectoryRootfsResolver::resolve`,
+which canonicalizes a materialized tree. The daemon therefore cannot compute
+the digest at `start` time without re-deriving the path itself, which would
+mean two implementations of the same derivation — reintroducing precisely the
+drift §1 exists to prevent, one layer up.
+
+So the remaining shape is an **attestation, not a lookup**: the worker reports
+the digest of the policy it compiled, and the daemon refuses to mark the run
+`Running` unless it equals the grant's `confinementDigest`. The readiness
+protocol is already that channel — `read_readiness_line` carries a
+worker-authored message the supervisor parses, and every failure mode of it
+(EOF, malformed, wrong run id) already routes to `abort_failed_start` and a
+group kill.
+
+That also matches this ADR's title. A digest the daemon computed about the
+worker is an assumption; a digest the worker reports about itself, checked
+against what the grant authorized, is attestation. The unenforceable-ceiling
+rejection in §4 is the same shape: refuse rather than proceed on an unverified
+claim.
+
+Not implemented here. It changes the readiness message, which is a
+worker/daemon contract, and belongs with §9's daemon-manifest work rather than
+bolted onto the compile-side change.
+
 ## Open questions
 
 - **Does libkrunfw's kernel enable Landlock?** Layer 3 requires `CONFIG_SECURITY_LANDLOCK`
@@ -373,7 +410,69 @@ than requiring every future call site to re-derive kill-before-reap.
   If they are close, §1's `TryFrom` is direct; if they diverge, LLO owns a mapping and
   should document why rather than silently maintaining two shapes.
 
-  *Answered 2026-08-03 — close, with one deliberate divergence.* nono 0.71's
+  *Resolved 2026-08-04 (bead `ley-line-open-c17486`). They diverge structurally.
+  LLO owns the mapping, does not route through nono's manifest, and the reason is
+  attestation correctness rather than convenience.*
+
+  An earlier answer here said "close, with one deliberate divergence". That compared
+  top-level key names and stopped. Read from
+  `nono-0.71.0/schema/capability-manifest.schema.json`:
+
+  | confinement/v1 | nono 0.71 | kind of difference |
+  | --- | --- | --- |
+  | `fs.allow` | `filesystem.grants` — `FsGrant{path, access, type}` | nesting + per-entry shape |
+  | `network.allowHosts` | `network.allow_domains` | rename |
+  | `port.bind` (top level) | `network.ports` — `PortConfig{bind, connect, localhost, localhost_range}` | re-parented and widened |
+  | `credentialSource` (scalar) | `credentials` — **array** of `Credential{name, upstream, source, …}` | cardinality |
+  | — | `dns`, `endpoints`, `mode`, `rollback`, `exec_strategy` | nono-only dimensions |
+  | camelCase | snake_case | naming convention |
+
+  The `credentials` row settles it: an array of objects against a scalar means no
+  field-for-field rename exists even in principle.
+
+  **Why LLO does not route through nono's manifest.** The alternative — map
+  confinement/v1 into `CapabilityManifest`, then reuse nono's `validate()` and its
+  `TryFrom<&CapabilityManifest> for CapabilitySet` — looks like free validation. It
+  is not:
+
+  1. *It buys no resource enforcement.* Routing through the manifest does not move LLO
+     onto the supervised strategy, and off that strategy nono's own `validate()`
+     **refuses** a manifest carrying resources at all (`src/manifest.rs:79-87`). LLO
+     would have to emit `resources: null` and keep enforcing ceilings itself — which is
+     what §3 and §4 already do.
+  2. *It requires LLO to invent values it has no basis for.* `dns`, `endpoints`, `mode`,
+     `rollback` and `exec_strategy` have no confinement/v1 counterpart. A total mapping
+     means LLO making policy decisions in a vocabulary it does not own.
+  3. *It breaks the property this ADR rests on.* The design is **one** manifest:
+     capabilities derived from it, digest attested over it, so the attestation is true by
+     construction rather than by discipline. Inserting nono's manifest between the
+     digested object and the applied policy puts a second shape in exactly that gap —
+     reintroducing, one layer down, the drift surface the single manifest removes.
+
+  So LLO keeps `confinement_manifest()` → `capabilities_from_manifest()` →
+  `CapabilitySet` (`backends/libkrun/confinement.rs`), compiling confinement/v1 directly
+  via `allow_path`/`allow_file`. The table above is the mapping this open question asked
+  LLO to own.
+
+  **§3's `Supervisor` is not nono's supervisor** — a conflation worth stating outright,
+  because the two mechanisms share a word and nothing else:
+
+  | `CeilingMechanism` | what actually applies it | covers |
+  | --- | --- | --- |
+  | `Unenforced` | nothing | native tier's vcpus + memory |
+  | `Supervisor` | **LLO's own backend**, observing a wall-clock deadline | wall time, both tiers |
+  | `Hypervisor` | libkrun, at VM configuration time, before the guest runs | vcpus + memory, microVM tier |
+
+  nono's cgroup-v2 enforcement appears nowhere in that table. It is a capability LLO has
+  **available and unused**: taking it would mean adopting `exec_strategy: supervised`,
+  which the `apply_auto` path does not use. Worth naming as a concrete future option
+  rather than a present property — adopting it would move the native tier's `memory`
+  ceiling from `Unenforced` to genuinely enforced, with `max_processes` alongside. That
+  option is **Linux-only**, and not by omission: nono 0.71 has no macOS resource
+  enforcement at all, so a native-tier memory ceiling on macOS stays `Unenforced` and
+  only the hypervisor tier can carry one there.
+
+  *Original answer, retained for the resources finding it got right:* nono 0.71's
   `CapabilityManifest` is generated from `schema/capability-manifest.schema.json` via
   typify, and that JSON Schema is stated as the source of truth — the same
   JSON-Schema-first shape §8 chose independently, so §8 is matching its dependency rather
@@ -384,9 +483,23 @@ than requiring every future call site to re-derive kill-before-reap.
   not a hope.
 
   The divergence is `resources`, and it is intentional. nono's covers memory and max
-  processes only, and its own schema says they are "enforced by the supervisor. Requires
-  `exec_strategy: \"supervised\"`" — confirming §1's finding that nono does not enforce
-  resource limits on the library path LLO uses. §2 conforms `resources` to OCI
+  processes only, and they require the supervised strategy — confirming §1's finding that
+  nono does not enforce resource limits on the library path LLO uses.
+
+  *Sourcing corrected 2026-08-04 (`c17486`).* That claim was attributed to the schema's
+  property descriptions, which in 0.71 say the opposite-sounding thing — `memory_bytes`
+  is "Enforced via cgroup `memory.max`", `max_processes` via `pids.max`. The claim
+  survives, from three places that are actually load-bearing:
+  `src/manifest.rs:53` ("resources (memory_bytes / max_processes) require
+  `exec_strategy: \"supervised\"`"), the validation enforcing it at `:79-87`, a test
+  pinning it at `:185` ("memory_bytes without supervised must fail validation"), and
+  `src/capability.rs:961` on `CapabilitySet.resource_limits` — "Plumbed through here so
+  they ride the serialization layer like other policy; **enforced by the supervisor via
+  cgroup v2 on Linux**." Both statements are true and not in tension: the ceilings *are*
+  cgroup-enforced, but only on the supervised strategy, and LLO's
+  `Sandbox::apply_auto(&CapabilitySet)` carries them while enforcing nothing.
+
+  §2 conforms `resources` to OCI
   `linux.resources`, which is strictly wider. So the mapping is total in one direction
   only: every nono resource has an OCI counterpart, and OCI dimensions nono cannot enforce
   have none. That asymmetry is not a defect to paper over — it is the exact input to §4,

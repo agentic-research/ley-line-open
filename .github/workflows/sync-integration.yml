@@ -38,10 +38,15 @@ on:
 # ## Why conflicts open a PR instead of being resolved here
 #
 # A conflict means the same lines moved on both branches, which is a content
-# decision no automation should make silently — and the first run of this
-# workflow is expected to conflict in `confinement.rs`. On conflict the merge is
+# decision no automation should make silently. On conflict the merge is
 # aborted, the attempt is pushed to a branch, and a PR is opened for a human.
 # Nothing is left half-merged and `integration` is never force-updated.
+#
+# The drift this was written against has already been reconciled by hand, in
+# the merge commit that made `main`'s tip an ancestor of `integration`. So the
+# first run of this workflow takes the `--is-ancestor` early exit and reports
+# `current`, having done nothing. That is the steady state it maintains from
+# then on, and the reason step 0 of the release plan never recurs.
 
 permissions:
   contents: write

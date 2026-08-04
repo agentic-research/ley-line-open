@@ -10,6 +10,91 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-08-04
+
+Execution/v1 stops accepting what it cannot verify. A ceiling the selected
+tier cannot enforce is now a rejection rather than a silent acceptance;
+confinement is one manifest whose digest the worker attests and both
+supervisors check; and the capnp doc comments reach the zod and Go emitters,
+so a consumer can generate its types instead of hand-maintaining a mirror
+beside them.
+
+### Added
+
+- **Tier ceilings, and the mechanism that backs each one**
+  (`ley-line-open-da36d2`). `CeilingMechanism` names what actually applies a
+  limit — `Unenforced`, `Supervisor` (LLO's own backend, observing a
+  wall-clock deadline), or `Hypervisor` (libkrun, at VM configuration time,
+  before the guest runs) — and `EnforcedCeilings::check` refuses a request for
+  a ceiling the selected tier cannot apply. The native tier is
+  `wall_clock_only`; the microVM tier is `hypervisor_backed`. This closes the
+  case where a grant asked for a vCPU or memory bound that nothing on the
+  chosen path would have enforced, and nothing said so. ADR-0035 records the
+  measurement behind it: nono carries `resource_limits` through serialization
+  but enforces them only on `exec_strategy: supervised` via cgroup v2, which
+  is not the library path LLO uses, and which has no macOS equivalent at all.
+
+- **The confinement manifest, and its attested digest**
+  (`ley-line-open-da36d2`). One manifest is the single object: the
+  `CapabilitySet` nono applies is derived *from* it, and the digest attested
+  over it describes the same bytes — so the attestation is true by
+  construction rather than by discipline. The worker compiles the policy after
+  fork, applies it irreversibly, and only then reports the digest on the
+  readiness protocol; the supervisor compares that against what the grant
+  authorized and refuses the run with `confinement drift` if they disagree.
+  Both tiers enforce it. The comparison cannot be made daemon-side — the
+  rootfs path is resolved against a materialized tree inside the worker, so
+  recomputing it in the daemon would be a second implementation of one
+  derivation, which is the drift the single manifest exists to prevent.
+
+- **`cloister/confinement/v1` ships a machine-readable shape**
+  (`ley-line-open-41297c`). `confinement.schema.json` encodes the spec's
+  *refusals*, not merely its structure, and `verify_confinement_schema` checks
+  both that the pinned canonical manifest satisfies it and that each refusal
+  §2–§5 states in prose is actually refused. JSON Schema rather than a capnp
+  IDL because `confinementDigest` is computed over canonical JSON — the IDL
+  format follows the digest definition, not the other way round, a rule now
+  written into schema-spec `LAYOUT.md`.
+
+- **Doc comments reach every codegen target** (`ley-line-open-d554a0`). The IR
+  has always carried `doc` on structs, fields and enums, and the JSON Schema
+  and tool-definitions emitters lowered it; the zod and Go emitters dropped it
+  silently. That omission is what forces a consumer to keep a second,
+  hand-written copy of every generated type just to hold the documentation —
+  and a hand-maintained mirror is a thing that silently disagrees.
+  `doc_projection.rs` pins the projection per target.
+
+- **Kernel-confinement assertions ported from harness-sandbox**
+  (`ley-line-open-704853`).
+
+### Changed
+
+- **Evidence binding: one trusted envelope no longer satisfies three fields.**
+  `EvidenceField` and `EvidenceBinding` bind each evidence field to the run
+  and spec digest it was issued for, so an envelope that legitimately proves
+  one claim cannot be replayed to prove the other two.
+
+- **The mutation gate stopped reporting healthy code as uncovered**
+  (`ley-line-open-368ef3`, `ley-line-open-7675fe`). Two independent
+  false-failure classes, both measured rather than assumed. A diff touching
+  only `.rs` *test* code correctly enumerates zero mutants and was being
+  failed as `MISCONFIGURED`; the guard now decides by asking whether the
+  changed paths resolve from cargo-mutants' working directory, which is the
+  claim its error message actually makes. And a blanket `-C --lib` meant no
+  integration test ever ran, so crates whose assertions live in `tests/` were
+  reported as failures — `schema-bridge` has no `#[cfg(test)]` module at all,
+  so all 7 of its emitter mutants were called missed while
+  `doc_projection.rs` killed every one. Slices are now per package, and the
+  lib-only restriction is scoped to the two crates measured to need it
+  (`mcp-descriptor` and `leyline-fs`, whose scratch baselines genuinely fail).
+
+### Fixed
+
+- **Worker process trees terminate with the rootfs lifecycle**
+  (`ley-line-open-e27f51`).
+- **The execution service releases its lock during backend start**, so a slow
+  backend no longer serializes unrelated runs.
+
 ## [0.14.0] — 2026-07-30
 
 The signing train: the ecosystem's one signing implementation reaches every

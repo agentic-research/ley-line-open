@@ -194,17 +194,33 @@ pub fn execute_with_ready(
     // UNREACHABLE TODAY, and saying so rather than letting it read as a shipped
     // feature. `confinement_manifest` builds LLO's OWN policy from host
     // resources — rootfs, runtime files, devices — and never sets a port, so
-    // `dimensions().port` is always `None` here. There is no route for a §4
-    // declaration to ORIGINATE from a grant, because the manifest is
-    // constructed internally rather than ingested from the authorized document.
+    // `dimensions().port` is always `None` here.
     //
-    // That missing route is the real remaining gap, tracked on
-    // `ley-line-open-17536d`: `ConfinementManifest` is write-only (it can emit
-    // canonical JSON but not parse it), so a grant's confinement/v1 document
-    // cannot become the manifest LLO compiles. Until it can, this arm is the
-    // correct handling of a case that cannot yet arrive — kept because the
-    // alternative is the microVM tier silently ignoring §4 the moment that
-    // route exists, which is precisely the defect this branch is about.
+    // Where the gap actually is, stated precisely because the earlier version
+    // of this comment named the wrong one and would have sent the next reader
+    // to build something that already exists. `ConfinementManifest` is NOT
+    // write-only any more: `parse` ingests a confinement/v1 document, and
+    // `authorization.rs` already calls it on `RunGrant.confinementManifest`
+    // and refuses a grant whose carried document does not digest to the
+    // `confinementDigest` it names.
+    //
+    // What is missing is the LAST HOP. That parsed manifest is stored on
+    // `AuthorizedRun.confinement_manifest` and then never read: the worker
+    // compiles the internally-built document instead. So a grant declaring §4
+    // or §6 is parsed, digest-verified, and then not the policy applied — and
+    // the run is stopped, correctly, by the drift check in `backend.rs`, which
+    // compares the digest the worker attests against the one the grant
+    // authorized. Fail-closed, not silent, and non-functional: that is the
+    // whole of what "port.bind is inert" means today.
+    //
+    // Closing it is not plumbing. The enforced policy must ALSO carry the host
+    // resources a grant's author cannot know — the per-run rootfs path, the
+    // libkrun runtime files, the device nodes — so a merged document digests
+    // differently from the one signed, and the drift check would then reject
+    // every run. `ATTESTED_RUN_ROOTFS` is the existing answer for exactly one
+    // of those (a symbolic name in the attested bytes, substituted for the
+    // real path at compile time); generalizing it to runtime files and devices
+    // is the open design decision, tracked on `ley-line-open-17536d`.
     if let Some((bind, _address)) = manifest.dimensions().port {
         if config.tsi_features == 0 {
             return Err(ExecutionError::invalid(format!(

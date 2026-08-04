@@ -97,6 +97,25 @@ pub struct ConfinementManifest {
     port: Option<PortBlock>,
 }
 
+/// The four dimensions of `confinement/v1`, decomposed so a compiler must name
+/// all of them. See [`ConfinementManifest::dimensions`] for why this exists as
+/// a struct rather than as four accessors.
+///
+/// Adding a dimension here is deliberately a breaking change for every
+/// consumer. That is the feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dimensions<'a> {
+    /// §2 — filesystem grants. Trailing slash marks a directory subtree.
+    pub fs_allow: &'a [FsGrant],
+    /// §3 — hosts egress is permitted to. Empty means none.
+    pub allow_hosts: &'a [String],
+    /// §4 — the single listener, as `(port, address)`. `None` address means
+    /// §4's 127.0.0.1 default, not "any".
+    pub port: Option<(u16, Option<&'a str>)>,
+    /// §5 — the vault backend this workload authenticates against.
+    pub credential_source: Option<&'a str>,
+}
+
 impl Default for ConfinementManifest {
     fn default() -> Self {
         Self::new()
@@ -115,27 +134,119 @@ impl ConfinementManifest {
         }
     }
 
-    pub fn with_credential_source(mut self, uri: impl Into<String>) -> Self {
-        self.credential_source = Some(uri.into());
-        self
+    /// Declare §5's vault backend.
+    ///
+    /// The scheme enumeration is closed by the spec, on the stated grounds that
+    /// "a scheme this spec does not name is a scheme the reference validator
+    /// will refuse, and accepting it here would move the refusal to a less
+    /// obvious place." Accepting an arbitrary string here did exactly that.
+    pub fn with_credential_source(
+        mut self,
+        uri: impl Into<String>,
+    ) -> Result<Self, ExecutionError> {
+        const SCHEMES: [&str; 6] = [
+            "keychain://",
+            "secret-tool://",
+            "keyring://",
+            "file://",
+            "op://",
+            "apple-password://",
+        ];
+        let uri = uri.into();
+        let scheme_ok = SCHEMES
+            .iter()
+            .any(|scheme| uri.starts_with(scheme) && uri.len() > scheme.len());
+        if !scheme_ok {
+            return Err(ExecutionError::invalid(format!(
+                "confinement/v1 §5 credentialSource {uri:?} does not use one of \
+                 the schemes the spec closes over ({}), each with a non-empty \
+                 remainder.",
+                SCHEMES.join(", ")
+            )));
+        }
+        self.credential_source = Some(uri);
+        Ok(self)
     }
 
-    pub fn with_fs_grant(mut self, grant: FsGrant) -> Self {
+    /// Declare a §2 filesystem grant.
+    ///
+    /// `AbsolutePath` in the schema is `^/(?!.*(?:^|/)\.\.(?:/|$)).*$` — leading
+    /// slash, no `..` component. Symlink resolution is explicitly the runner's
+    /// obligation and stays out of scope here, as the schema says.
+    pub fn with_fs_grant(mut self, grant: FsGrant) -> Result<Self, ExecutionError> {
+        let path = grant.path();
+        if !path.starts_with('/') {
+            return Err(ExecutionError::invalid(format!(
+                "confinement/v1 §2 fs.allow path {path:?} must be absolute"
+            )));
+        }
+        if path.split('/').any(|component| component == "..") {
+            return Err(ExecutionError::invalid(format!(
+                "confinement/v1 §2 fs.allow path {path:?} must not traverse with `..`"
+            )));
+        }
         self.fs_allow.push(grant);
-        self
+        Ok(self)
     }
 
-    pub fn with_allowed_host(mut self, host: impl Into<String>) -> Self {
-        self.allow_hosts.push(host.into());
-        self
+    /// Declare a §3 egress host.
+    ///
+    /// One leading `*.` or none. The spec rejects an interior wildcard because
+    /// "a pattern whose match set is hard to read is a pattern whose grant is
+    /// hard to audit" — which is a property of the grant, not of the parser,
+    /// and so belongs at the point the grant is made.
+    pub fn with_allowed_host(mut self, host: impl Into<String>) -> Result<Self, ExecutionError> {
+        let host = host.into();
+        let labels = host.strip_prefix("*.").unwrap_or(&host);
+        let well_formed = !labels.is_empty()
+            && labels.split('.').all(|label| {
+                !label.is_empty()
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            });
+        if !well_formed {
+            return Err(ExecutionError::invalid(format!(
+                "confinement/v1 §3 network.allowHosts entry {host:?} is not a \
+                 hostname with at most one leading `*.` wildcard"
+            )));
+        }
+        self.allow_hosts.push(host);
+        Ok(self)
     }
 
-    pub fn with_port_bind(mut self, bind: u16, address: Option<&str>) -> Self {
+    /// Declare §4's single listener.
+    ///
+    /// Fallible because `confinement.schema.json` constrains `bind` to
+    /// 1024–65535 and this type is named for that spec. Accepting a wider `u16`
+    /// made `ConfinementManifest` decorative: it could produce, and digest, a
+    /// document its own schema refuses — with the refusal asserted only against
+    /// `json!` literals in another crate, never against the type that computes
+    /// the attested bytes.
+    ///
+    /// Port 0 is the reason this is a refusal rather than a lint. nono
+    /// documents it as the macOS `localhost:*` wildcard and emits
+    /// `(allow network-outbound (remote tcp "localhost:*"))`, so a `u16` field
+    /// admitted a value whose compiled meaning is "every localhost port" — the
+    /// exact inverse of a single-port grant.
+    pub fn with_port_bind(
+        mut self,
+        bind: u16,
+        address: Option<&str>,
+    ) -> Result<Self, ExecutionError> {
+        if bind < 1024 {
+            return Err(ExecutionError::invalid(format!(
+                "confinement/v1 §4 port.bind must be 1024-65535, got {bind}. \
+                 Privileged ports are out of scope in v1, and 0 is nono's \
+                 macOS `localhost:*` wildcard — a value whose compiled meaning \
+                 is every port rather than one."
+            )));
+        }
         self.port = Some(PortBlock {
             bind,
             address: address.map(str::to_owned),
         });
-        self
+        Ok(self)
     }
 
     pub fn fs_grants(&self) -> &[FsGrant] {
@@ -149,6 +260,47 @@ impl ConfinementManifest {
     /// the manifest declares is what `ley-line-open-17536d` is about.
     pub fn allowed_hosts(&self) -> &[String] {
         &self.allow_hosts
+    }
+
+    /// The vault backend §5 binds this workload to, if any.
+    pub fn credential_source(&self) -> Option<&str> {
+        self.credential_source.as_deref()
+    }
+
+    /// Every dimension `confinement/v1` defines, in a shape a consumer must
+    /// name exhaustively.
+    ///
+    /// Accessors alone were not enough, and this crate has the scar: a compiler
+    /// that calls `fs_grants()`, `allowed_hosts()` and `port_bind()` reads three
+    /// dimensions and silently ignores the fourth, which is exactly what
+    /// happened to §5 — `credential_source` had no accessor at all, so the
+    /// omission could not even be seen at the call site. Adding a dimension
+    /// compiled clean everywhere and no-oped somewhere.
+    ///
+    /// Destructured with a struct pattern and NO `..`, this becomes a compile
+    /// error instead:
+    ///
+    /// ```text
+    /// error[E0027]: pattern does not mention field `gpu`
+    ///    --> backends/libkrun/confinement.rs:96:9
+    ///     |
+    ///     |     let Dimensions { fs_allow, allow_hosts, port, credential_source } =
+    ///     |         ^^^^^^^^^^^^^ missing field `gpu`
+    /// ```
+    ///
+    /// Note this is checked at the CONSUMER, which makes it stronger than
+    /// `EnforcedCeilings`' per-tier table: that one gets its teeth from every
+    /// construction site being a full struct literal, and a single
+    /// `..Default::default()` would absorb a new field in silence. The only
+    /// escape here is a `..` in the pattern — one visible, greppable token.
+    /// For the same reason, `EnforcedCeilings` must never derive `Default`.
+    pub fn dimensions(&self) -> Dimensions<'_> {
+        Dimensions {
+            fs_allow: &self.fs_allow,
+            allow_hosts: &self.allow_hosts,
+            port: self.port_bind(),
+            credential_source: self.credential_source(),
+        }
     }
 
     /// The single listener §4 permits, as `(port, address)`. `None` means the

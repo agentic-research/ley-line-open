@@ -122,8 +122,8 @@ pub fn execute_with_ready(
     // One manifest, two uses: the capabilities actually applied, and the
     // digest attested below. Deriving both from `manifest` is what makes the
     // attestation true by construction rather than by discipline.
-    let manifest = confinement_manifest(&config.rootfs.canonical_path, &options.runtime_files, &[]);
-    let capabilities = capabilities_from_manifest(&manifest)?;
+    let manifest = confinement_manifest(&options.runtime_files, &[])?;
+    let capabilities = capabilities_from_manifest(&manifest, &config.rootfs.canonical_path)?;
     nono::Sandbox::apply_auto(&capabilities).map_err(|error| {
         ExecutionError::backend(format!("apply native nono confinement: {error}"))
     })?;

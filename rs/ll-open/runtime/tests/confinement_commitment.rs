@@ -44,11 +44,17 @@ fn vector_path(name: &str) -> std::path::PathBuf {
 fn canonical_manifest() -> ConfinementManifest {
     ConfinementManifest::new()
         .with_credential_source("keychain://bundle-X-credentials")
+        .expect("valid credential source")
         .with_fs_grant(FsGrant::read_only("/etc/hosts"))
+        .expect("valid fs grant")
         .with_fs_grant(FsGrant::read_write("/var/lib/bundle-X/"))
+        .expect("valid fs grant")
         .with_allowed_host("*.telemetry.example.com")
+        .expect("valid host")
         .with_allowed_host("api.example.com")
+        .expect("valid host")
         .with_port_bind(8443, Some("127.0.0.1"))
+        .expect("valid port")
 }
 
 /// Cloister's `canonicalizer_reproduces_llo_v1_pin`, in the direction that
@@ -104,7 +110,9 @@ fn a_manifest_matching_the_committed_digest_is_accepted() {
 fn widening_the_enforced_policy_is_refused_as_drift() {
     let committed = canonical_manifest().confinement_digest().expect("digest");
 
-    let widened = canonical_manifest().with_fs_grant(FsGrant::read_only("/"));
+    let widened = canonical_manifest()
+        .with_fs_grant(FsGrant::read_only("/"))
+        .expect("valid fs grant");
 
     let error = widened
         .assert_matches(&committed)
@@ -129,9 +137,13 @@ fn narrowing_the_enforced_policy_is_refused_too() {
 
     let narrowed = ConfinementManifest::new()
         .with_credential_source("keychain://bundle-X-credentials")
+        .expect("valid credential source")
         .with_fs_grant(FsGrant::read_only("/etc/hosts"))
+        .expect("valid fs grant")
         .with_allowed_host("api.example.com")
-        .with_port_bind(8443, Some("127.0.0.1"));
+        .expect("valid host")
+        .with_port_bind(8443, Some("127.0.0.1"))
+        .expect("valid port");
 
     assert!(
         narrowed.assert_matches(&committed).is_err(),
@@ -156,18 +168,21 @@ fn narrowing_the_enforced_policy_is_refused_too() {
 #[test]
 fn the_declared_manifest_names_exactly_what_the_backend_compiles() {
     let manifest = leyline_runtime::backends::libkrun::confinement::confinement_manifest(
-        std::path::Path::new("/run/llo/rootfs-a"),
         &[std::path::PathBuf::from("/usr/lib/libkrun.dylib")],
         &[std::path::PathBuf::from("/dev/kvm")],
-    );
+    )
+    .expect("valid manifest");
 
     let granted: Vec<&str> = manifest.fs_grants().iter().map(FsGrant::path).collect();
     assert_eq!(
         granted,
         vec![
-            // The rootfs is the one writable tree, and the trailing slash is
-            // what marks it a directory subtree rather than a single file.
-            "/run/llo/rootfs-a/",
+            // The one writable tree, named SYMBOLICALLY. The realization is a
+            // per-run temporary directory, and putting that in the attested
+            // document would have made the digest unpredictable — see
+            // `the_digest_does_not_move_with_the_ephemeral_root` below for why
+            // that mattered. The trailing slash still marks a directory subtree.
+            "/run/rootfs/",
             "/usr/lib/libkrun.dylib",
             "/dev/kvm",
         ],
@@ -191,19 +206,55 @@ fn the_declared_manifest_names_exactly_what_the_backend_compiles() {
 #[test]
 fn a_different_compiled_policy_yields_a_different_declared_digest() {
     let a = leyline_runtime::backends::libkrun::confinement::confinement_manifest(
-        std::path::Path::new("/run/llo/rootfs-a"),
+        &[std::path::PathBuf::from("/usr/lib/libkrun.dylib")],
         &[],
-        &[],
-    );
+    )
+    .expect("valid manifest");
     let b = leyline_runtime::backends::libkrun::confinement::confinement_manifest(
-        std::path::Path::new("/run/llo/rootfs-b"),
-        &[],
-        &[],
-    );
+        &[std::path::PathBuf::from("/usr/lib/libkrun.dylib")],
+        &[std::path::PathBuf::from("/dev/kvm")],
+    )
+    .expect("valid manifest");
 
     assert_ne!(
         a.confinement_digest().expect("digest a"),
         b.confinement_digest().expect("digest b"),
-        "two different rootfs grants must not share a confinement digest"
+        "granting a device must not share a digest with not granting it"
+    );
+}
+
+/// The digest must NOT move when only the ephemeral realization moves — and
+/// this is the property that makes `RunGrant.confinementDigest` usable at all.
+///
+/// The manifest used to name the materialized rootfs directly, and that path is
+/// `<run_root>/rootfs` where `run_root` is a fresh `leyline-run-XXXXXX` tempdir
+/// per run. So every run produced a different digest, and no issuer could ever
+/// commit to one: the drift check both backends perform could only reject.
+/// Nothing caught it because every real-worker test passed
+/// `confinement_digest: String::new()`, which skips the comparison entirely.
+///
+/// Naming the root symbolically is what closes that. Coverage is not lost — the
+/// rootfs CONTENT is attested separately by `ResolvedRootfs.digest`, verified by
+/// `verify_ephemeral_rootfs` before anything runs, and reaches the receipt as
+/// `inputRoots`. The host path is where those already-verified bytes were put.
+#[test]
+fn the_digest_does_not_move_with_the_ephemeral_root() {
+    let first = leyline_runtime::backends::libkrun::confinement::confinement_manifest(&[], &[])
+        .expect("valid manifest");
+    let second = leyline_runtime::backends::libkrun::confinement::confinement_manifest(&[], &[])
+        .expect("valid manifest");
+
+    assert_eq!(
+        first.confinement_digest().expect("first digest"),
+        second.confinement_digest().expect("second digest"),
+        "two runs of the same policy must produce the same digest, or no \
+         issuer can commit to it and the drift check can only ever reject"
+    );
+    assert!(
+        !first
+            .to_canonical_json()
+            .expect("canonical")
+            .contains("leyline-run-"),
+        "the attested document must not carry a per-run temporary path"
     );
 }

@@ -1035,7 +1035,13 @@ impl ExecutionResolver for TestResolver {
             arguments: vec![],
             public_environment: BTreeMap::new(),
             allowed_egress: authorized.allowed_egress.clone(),
-            confinement_digest: String::new(),
+            // Carried, not chosen. This fixture used to write `String::new()`
+            // here, which is precisely the resolver behaviour `service.rs` now
+            // refuses: dropping the digest silently disabled ADR-0035's drift
+            // check for the run, because both backends gate that comparison on
+            // the field being non-empty. Five tests in this file passed
+            // vacuously as a result.
+            confinement_digest: authorized.confinement_digest.clone(),
             limits: ResourceLimits {
                 vcpus: 1,
                 memory_mib: 128,

@@ -6,7 +6,7 @@ use crate::{ExecutionError, ExecutionRequest};
 use serde::{Deserialize, Serialize};
 
 use super::api::{DynamicKrunApi, KRUN_TSI_HIJACK_INET, PreparedVm, prepare_vm};
-use super::confinement::{VmmHostResources, apply, confinement_manifest};
+use super::confinement::{VmmHostResources, apply_manifest, confinement_manifest};
 use super::plan::{DirectoryRootfsResolver, compile_plan};
 use super::volume::{materialize_ephemeral_rootfs, verify_ephemeral_rootfs};
 
@@ -159,14 +159,20 @@ pub fn execute_with_ready(
         runtime_files,
         devices: options.devices,
     };
-    // The manifest that `apply` compiles, kept so the digest attested below
-    // describes the policy this process is actually confined by.
-    let manifest = confinement_manifest(
-        &config.rootfs.canonical_path,
-        &resources.runtime_files,
-        &resources.devices,
-    );
-    apply(&config, &resources)?;
+    // ONE manifest, applied and attested. The previous version built a manifest
+    // here and then called `apply(&config, &resources)`, which built a SECOND
+    // one from the same inputs — and its comment claimed the digest described
+    // "the policy this process is actually confined by", which held only because
+    // the arguments happened to match. Change which path `apply` derives from
+    // and the worker would attest a digest for a policy it did not apply, with
+    // nothing to catch it: the digest's only consumer is a comparison against
+    // the grant, not against the applied set.
+    //
+    // `native.rs` already did it this way, and its comment — "Deriving both from
+    // `manifest` is what makes the attestation true by construction rather than
+    // by discipline" — was accurate there and inaccurate one directory over.
+    let manifest = confinement_manifest(&resources.runtime_files, &resources.devices)?;
+    apply_manifest(&manifest, &config.rootfs.canonical_path)?;
 
     let vm: PreparedVm<'_> = prepare_vm(&api, &config)?;
     on_ready(&WorkerEvent::Ready {

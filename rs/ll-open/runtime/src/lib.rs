@@ -7,6 +7,7 @@
 pub mod authorization;
 pub mod backends;
 mod catalog;
+pub mod confinement;
 mod error;
 mod model;
 mod service;

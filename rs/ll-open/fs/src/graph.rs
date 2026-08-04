@@ -2839,6 +2839,7 @@ mod tests {
 
         // Loads clean (the arena is untampered at construction time)...
         let graph = HotSwapGraph::new(ctrl.clone())?;
+        let root_before = Controller::open_or_create(&ctrl)?.current_root();
         // ...then the file is tampered behind its back...
         flip_active_payload_byte(&ctrl, 100)?;
         // ...so the gate must refuse, not shrug and serve the copy.
@@ -2849,6 +2850,48 @@ mod tests {
         assert!(
             format!("{err:#}").contains("root mismatch at load"),
             "{err:#}"
+        );
+
+        // --- post-fault state (bead `ley-line-open-5e6ce6`) ---
+        //
+        // The builder consumes `self`, so there is no surviving graph to
+        // probe — the post-fault question here is not "is it still usable"
+        // but "did the refusal change anything it should not have".
+        //
+        // The dangerous outcome is a refusal that *repairs*: a failed
+        // verified load which wrote the observed root into `current_root`
+        // would make the second attempt succeed. That is a silent trust
+        // downgrade — the tamper becomes the new baseline — and the
+        // assertion above cannot see it, because it only ever runs one
+        // attempt. Stopping at "it returned an error" is exactly the gap
+        // this bead exists to close.
+
+        // 1. The published root is untouched. A refusal must observe, not
+        //    reconcile.
+        assert_eq!(
+            Controller::open_or_create(&ctrl)?.current_root(),
+            root_before,
+            "a refused verified load must not rewrite current_root — \
+             adopting the tampered root would make the tamper canonical"
+        );
+
+        // 2. The refusal is stable. Retrying must fail, not succeed because
+        //    the first attempt cached or repaired something.
+        //
+        //    Note where it fails: `HotSwapGraph::new` itself refuses now,
+        //    before the builder is reached. Two independent gates cover a
+        //    tampered arena — the T2.3 loader's root check at deserialize
+        //    time, and verify-on-fault's check at load — and the assertion
+        //    above only exercises the second because the graph was
+        //    constructed *before* the tamper. So this chains both: whichever
+        //    gate catches it, a retry must not get a working graph.
+        let retry = HotSwapGraph::new(ctrl.clone())
+            .and_then(HotSwapGraph::with_verify_on_fault)
+            .err()
+            .expect("a second attempt over the same tampered arena must also refuse");
+        assert!(
+            format!("{retry:#}").contains("root mismatch"),
+            "the refusal must be stable across attempts, got: {retry:#}"
         );
         Ok(())
     }

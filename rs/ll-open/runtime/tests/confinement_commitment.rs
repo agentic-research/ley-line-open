@@ -258,3 +258,99 @@ fn the_digest_does_not_move_with_the_ephemeral_root() {
         "the attested document must not carry a per-run temporary path"
     );
 }
+
+/// The wire form round-trips through the type that computes the attested bytes.
+///
+/// `ConfinementManifest` used to be write-only — canonical JSON out, nothing in
+/// — so a grant's confinement/v1 document could never become the manifest LLO
+/// compiles. §4 therefore had no route to originate from an authorizer, and the
+/// microVM tier's listener handling was unreachable even after it was written.
+///
+/// Round-trip over the pinned cross-impl vector, so this asserts against the
+/// document both implementations agree on rather than one we made up.
+#[test]
+fn the_pinned_vector_parses_back_into_the_manifest_that_produced_it() {
+    let pinned = std::fs::read_to_string(vector_path("test-vectors/manifest-canonical.json"))
+        .expect("the pinned canonical manifest");
+
+    let parsed = ConfinementManifest::parse(&pinned).expect("the pinned vector must parse");
+
+    assert_eq!(
+        parsed.to_canonical_json().expect("re-serialize"),
+        pinned,
+        "parse and serialize must be inverses, or a grant's document and the \
+         digest LLO computes over it are two different things"
+    );
+    assert_eq!(
+        parsed.confinement_digest().expect("digest"),
+        canonical_manifest().confinement_digest().expect("digest"),
+        "a parsed manifest and the programmatically-built one must agree"
+    );
+}
+
+/// Parsing applies the SAME refusals as the builders, so there is no path that
+/// produces a manifest the constructors would have rejected.
+///
+/// This is what lets the schema's refusal table be asserted against the Rust
+/// type that computes the attested bytes, rather than only against `json!`
+/// literals in a different crate — which is what §8's cross-impl conformance
+/// claim actually rests on.
+#[test]
+fn parsing_refuses_every_document_the_schema_refuses() {
+    // Each document carries a valid `version`, so the ONLY thing wrong with it
+    // is the constraint it is meant to exercise. Without that these all passed
+    // by being refused for a missing version — a test green for a reason it did
+    // not name, which is the same defect this file exists to catch.
+    const V: &str = r#""version":"cloister/confinement/v1""#;
+    let refusals = [
+        (
+            format!(r#"{{{V},"port":{{"bind":0}}}}"#),
+            "port 0 — nono's localhost:* wildcard",
+        ),
+        (
+            format!(r#"{{{V},"port":{{"bind":80}}}}"#),
+            "privileged port, §4 minimum is 1024",
+        ),
+        (
+            format!(r#"{{{V},"fs":{{"allow":["relative/path"]}}}}"#),
+            "relative path",
+        ),
+        (
+            format!(r#"{{{V},"fs":{{"allow":["/srv/../etc"]}}}}"#),
+            "`..` traversal",
+        ),
+        (
+            format!(r#"{{{V},"network":{{"allowHosts":["api.*.example.com"]}}}}"#),
+            "interior wildcard",
+        ),
+        (
+            format!(r#"{{{V},"credentialSource":"https://vault/x"}}"#),
+            "scheme outside the closed set",
+        ),
+        (
+            format!(r#"{{{V},"gpu":{{"devices":[]}}}}"#),
+            "unknown dimension",
+        ),
+        (
+            format!(r#"{{{V},"fs":{{"allow":[{{"path":"/x","mode":"rx"}}]}}}}"#),
+            "bogus mode",
+        ),
+        (
+            r#"{"version":"cloister/confinement/v2","fs":{"allow":["/x"]}}"#.to_owned(),
+            "a version this reader does not implement",
+        ),
+        (r#"{"fs":{"allow":["/x"]}}"#.to_owned(), "no version at all"),
+    ];
+
+    // And the same document WITHOUT its defect must parse, so each case above
+    // is refused for its own reason rather than for something shared.
+    ConfinementManifest::parse(&format!(r#"{{{V},"port":{{"bind":8443}}}}"#))
+        .expect("an otherwise-identical conformant document must parse");
+
+    for (document, case) in refusals {
+        assert!(
+            ConfinementManifest::parse(&document).is_err(),
+            "parse must refuse {case}: {document}"
+        );
+    }
+}

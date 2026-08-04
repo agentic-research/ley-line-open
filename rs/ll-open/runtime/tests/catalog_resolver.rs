@@ -13,6 +13,9 @@ fn authorized() -> AuthorizedExecution {
         spec_digest: "blake3-256:spec".into(),
         grant_digest: "blake3-256:grant".into(),
         confinement_digest: "blake3-256:confinement".into(),
+        // Committed by digest alone — this exercises the resolver, not the
+        // grant reader that verifies a carried document against its digest.
+        confinement_manifest: None,
         backend: leyline_runtime::BackendClass::Native,
         allowed_egress: Vec::new(),
         intent: SchemaIntent {

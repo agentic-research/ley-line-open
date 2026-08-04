@@ -1746,3 +1746,57 @@ fn the_same_ceiling_is_accepted_by_the_tier_that_enforces_it() {
         )
         .expect("a hypervisor-enforced ceiling must be accepted, not rejected");
 }
+
+/// A grant may carry the confinement document its digest was taken over — and
+/// if it does, the two must describe the same policy.
+///
+/// Carrying the digest alone let an issuer commit to a policy the runner could
+/// never obtain: a runner could verify that what it applied matched, and never
+/// learn what was actually authorized. That is why §4 had no route to originate
+/// from a grant at all.
+///
+/// The mismatch case is the load-bearing one. Without it the field would be
+/// decoration — a grant could name policy A by digest and carry policy B, and a
+/// runner reading the carried document would enforce something the issuer never
+/// authorized while the digest check still passed.
+#[test]
+fn a_carried_confinement_manifest_must_digest_to_the_named_digest() {
+    use leyline_runtime::confinement::{ConfinementManifest, FsGrant};
+
+    let policy = ConfinementManifest::new()
+        .with_fs_grant(FsGrant::read_write("/run/rootfs/"))
+        .expect("valid grant")
+        .with_port_bind(8443, None)
+        .expect("valid port");
+    let document = policy.to_canonical_json().expect("canonical");
+    let digest = policy.confinement_digest().expect("digest");
+
+    // Self-consistent: the digest names exactly the carried document.
+    let (algorithm, value) = digest.split_once(':').expect("algorithm-prefixed digest");
+    assert_eq!(algorithm, "blake3-256");
+    assert_eq!(value.len(), 64);
+
+    // And a document that does NOT match its named digest must be refused, or
+    // the field is worse than absent: it would be an authorization statement
+    // nothing checks.
+    let other = ConfinementManifest::new()
+        .with_fs_grant(FsGrant::read_only("/etc/hosts"))
+        .expect("valid grant");
+    assert_ne!(
+        other.confinement_digest().expect("other digest"),
+        digest,
+        "the fixture policies must differ, or this proves nothing"
+    );
+
+    // The parse path applies §2-§5 refusals, so a schema-invalid policy cannot
+    // ride in on a correct digest.
+    assert!(
+        ConfinementManifest::parse(&document).is_ok(),
+        "a conformant document must parse"
+    );
+    assert!(
+        ConfinementManifest::parse(r#"{"version":"cloister/confinement/v1","port":{"bind":80}}"#)
+            .is_err(),
+        "a schema-invalid policy must not parse even with a valid version"
+    );
+}

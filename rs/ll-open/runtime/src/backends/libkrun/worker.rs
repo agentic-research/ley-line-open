@@ -172,6 +172,55 @@ pub fn execute_with_ready(
     // `manifest` is what makes the attestation true by construction rather than
     // by discipline" — was accurate there and inaccurate one directory over.
     let manifest = confinement_manifest(&resources.runtime_files, &resources.devices)?;
+
+    // §4 on the microVM tier. `apply_manifest` below confines the VMM HOST
+    // process; the guest's own listener is governed by the port map, which is a
+    // different mechanism reached through a different call. Until now nothing
+    // connected them: `KrunConfig.port_map` was `Vec::new()` unconditionally and
+    // fed by no manifest, so a declared listener was compiled for the host
+    // process and silently ignored for the guest — the same silent-drop class
+    // this branch fixed one tier down.
+    //
+    // What the tier can actually deliver depends on the boundary:
+    //
+    //   no hijacking — a guest AF_INET bind reaches nothing. Granting it would
+    //     attest a listener that cannot receive a connection, which is a
+    //     declaration with no effect. Refused.
+    //   hijacking on — guest sockets ARE carried over vsock, so the declared
+    //     port maps to itself and the empty-by-default map stops being empty.
+    //     Note libkrun's constraint: an exposed port is reachable in the guest
+    //     by its HOST port number, so `N:N` is the only mapping that leaves the
+    //     guest's own view of §4 intact.
+    // UNREACHABLE TODAY, and saying so rather than letting it read as a shipped
+    // feature. `confinement_manifest` builds LLO's OWN policy from host
+    // resources — rootfs, runtime files, devices — and never sets a port, so
+    // `dimensions().port` is always `None` here. There is no route for a §4
+    // declaration to ORIGINATE from a grant, because the manifest is
+    // constructed internally rather than ingested from the authorized document.
+    //
+    // That missing route is the real remaining gap, tracked on
+    // `ley-line-open-17536d`: `ConfinementManifest` is write-only (it can emit
+    // canonical JSON but not parse it), so a grant's confinement/v1 document
+    // cannot become the manifest LLO compiles. Until it can, this arm is the
+    // correct handling of a case that cannot yet arrive — kept because the
+    // alternative is the microVM tier silently ignoring §4 the moment that
+    // route exists, which is precisely the defect this branch is about.
+    if let Some((bind, _address)) = manifest.dimensions().port {
+        if config.tsi_features == 0 {
+            return Err(ExecutionError::invalid(format!(
+                "confinement/v1 §4 port.bind {bind} is not deliverable on the \
+                 microVM tier without socket hijacking: the guest's AF_INET \
+                 bind is not carried anywhere, so the listener could never be \
+                 reached. Start the worker with --tsi-hijack-inet, or omit the \
+                 dimension."
+            )));
+        }
+        config.port_map = vec![
+            std::ffi::CString::new(format!("{bind}:{bind}"))
+                .map_err(|_| ExecutionError::invalid("port map entry contains a NUL byte"))?,
+        ];
+    }
+
     apply_manifest(&manifest, &config.rootfs.canonical_path)?;
 
     let vm: PreparedVm<'_> = prepare_vm(&api, &config)?;

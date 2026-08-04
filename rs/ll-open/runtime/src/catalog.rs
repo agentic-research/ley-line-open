@@ -260,6 +260,11 @@ mod tests {
             spec_digest: "blake3-256:spec".into(),
             grant_digest: "blake3-256:grant".into(),
             confinement_digest: "blake3-256:confinement".into(),
+            // The issuer committed by digest alone. Distinct from carrying a
+            // document that disagrees with it — that is refused at
+            // authorization — and this fixture exercises the resolver, not the
+            // grant reader.
+            confinement_manifest: None,
             backend: crate::BackendClass::Native,
             allowed_egress: Vec::new(),
             intent: SchemaIntent {

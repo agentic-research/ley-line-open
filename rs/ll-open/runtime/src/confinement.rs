@@ -380,6 +380,139 @@ impl ConfinementManifest {
         json_object(root)
     }
 
+    /// Read a `confinement/v1` document — the wire form a grant carries.
+    ///
+    /// Without this the type was WRITE-ONLY: it could emit canonical JSON and
+    /// not consume it, so a grant's confinement document could never become the
+    /// manifest LLO compiles. §4 had no route to originate from an authorizer at
+    /// all, which is why the microVM tier's listener handling was unreachable
+    /// even once it existed.
+    ///
+    /// Parse, not validate. Every field goes through the same fallible builder
+    /// a programmatic caller uses, so a parsed manifest carries exactly the
+    /// invariants a constructed one does — there is no path that produces a
+    /// `ConfinementManifest` the builders would have refused. That is also what
+    /// lets the schema's refusal table be pointed at this type instead of at
+    /// `json!` literals in another crate.
+    pub fn parse(document: &str) -> Result<Self, ExecutionError> {
+        let value: serde_json::Value = serde_json::from_str(document).map_err(|error| {
+            ExecutionError::invalid(format!("invalid confinement JSON: {error}"))
+        })?;
+        let object = value.as_object().ok_or_else(|| {
+            ExecutionError::invalid("a confinement/v1 manifest must be a JSON object")
+        })?;
+
+        // Unknown keys are refused rather than ignored. The schema sets
+        // `additionalProperties: false` throughout, and a dimension we do not
+        // recognise is exactly the case where silently dropping it would attest
+        // a document whose clause had no effect.
+        for key in object.keys() {
+            if !matches!(
+                key.as_str(),
+                "version" | "credentialSource" | "fs" | "network" | "port"
+            ) {
+                return Err(ExecutionError::invalid(format!(
+                    "unknown confinement/v1 dimension {key:?}; refusing rather \
+                     than digesting a clause nothing reads"
+                )));
+            }
+        }
+
+        // The version is the document's claim about which spec it conforms to,
+        // and it is the first thing that must hold: every refusal below is a
+        // v1 rule, so applying them to a document announcing something else
+        // would be checking the wrong contract.
+        match object.get("version").and_then(serde_json::Value::as_str) {
+            Some(CONFINEMENT_SCHEMA_VERSION) => {}
+            Some(other) => {
+                return Err(ExecutionError::invalid(format!(
+                    "confinement manifest declares version {other:?}, but this \
+                     reader implements {CONFINEMENT_SCHEMA_VERSION}"
+                )));
+            }
+            None => {
+                return Err(ExecutionError::invalid(
+                    "a confinement manifest must declare its `version`",
+                ));
+            }
+        }
+
+        let mut manifest = Self::new();
+
+        if let Some(source) = object.get("credentialSource") {
+            let source = source
+                .as_str()
+                .ok_or_else(|| ExecutionError::invalid("credentialSource must be a string"))?;
+            manifest = manifest.with_credential_source(source)?;
+        }
+
+        if let Some(fs) = object.get("fs") {
+            let allow = fs
+                .get("allow")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| ExecutionError::invalid("fs must carry an `allow` array"))?;
+            for entry in allow {
+                let grant = match entry {
+                    // §2's two spellings: a bare string is read-only, an object
+                    // with `mode: "rw"` is read-write. The trailing slash still
+                    // marks a directory subtree in both.
+                    serde_json::Value::String(path) => FsGrant::read_only(path.clone()),
+                    serde_json::Value::Object(map) => {
+                        let path = map
+                            .get("path")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| {
+                                ExecutionError::invalid("an fs.allow object needs a `path`")
+                            })?;
+                        match map.get("mode").and_then(serde_json::Value::as_str) {
+                            Some("rw") => FsGrant::read_write(path),
+                            other => {
+                                return Err(ExecutionError::invalid(format!(
+                                    "fs.allow mode must be \"rw\" when present, got {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(ExecutionError::invalid(format!(
+                            "an fs.allow entry must be a string or an object, got {other}"
+                        )));
+                    }
+                };
+                manifest = manifest.with_fs_grant(grant)?;
+            }
+        }
+
+        if let Some(network) = object.get("network") {
+            let hosts = network
+                .get("allowHosts")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    ExecutionError::invalid("network must carry an `allowHosts` array")
+                })?;
+            for host in hosts {
+                let host = host.as_str().ok_or_else(|| {
+                    ExecutionError::invalid("an allowHosts entry must be a string")
+                })?;
+                manifest = manifest.with_allowed_host(host)?;
+            }
+        }
+
+        if let Some(port) = object.get("port") {
+            let bind = port
+                .get("bind")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| ExecutionError::invalid("port must carry an integer `bind`"))?;
+            let bind = u16::try_from(bind).map_err(|_| {
+                ExecutionError::invalid(format!("port.bind {bind} exceeds the 16-bit port space"))
+            })?;
+            let address = port.get("address").and_then(serde_json::Value::as_str);
+            manifest = manifest.with_port_bind(bind, address)?;
+        }
+
+        Ok(manifest)
+    }
+
     pub fn to_canonical_json(&self) -> Result<String, ExecutionError> {
         // `to_string_pretty` emits two-space indent and no trailing newline,
         // which is exactly §6.

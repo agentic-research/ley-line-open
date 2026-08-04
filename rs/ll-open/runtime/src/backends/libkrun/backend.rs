@@ -284,8 +284,30 @@ impl Backend for KrunWorkerBackend {
             }
         };
         match event {
-            WorkerEvent::Ready { run_id } if run_id == request.run_id => {}
-            WorkerEvent::Ready { run_id } => {
+            WorkerEvent::Ready {
+                run_id,
+                confinement_digest,
+            } if run_id == request.run_id => {
+                // Same check as the native tier: the worker attests the
+                // policy it applied, and a disagreement with the grant stops
+                // the run before it executes.
+                if !request.confinement_digest.is_empty()
+                    && confinement_digest != request.confinement_digest
+                {
+                    return Err(abort_failed_start(
+                        &mut child,
+                        rootfs,
+                        LABELS,
+                        ExecutionError::identity_mismatch(format!(
+                            "confinement drift: the worker applied a policy \
+                             digesting to {confinement_digest}, but the grant \
+                             authorized {}",
+                            request.confinement_digest
+                        )),
+                    ));
+                }
+            }
+            WorkerEvent::Ready { run_id, .. } => {
                 return Err(abort_failed_start(
                     &mut child,
                     rootfs,

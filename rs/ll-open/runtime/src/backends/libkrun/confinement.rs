@@ -79,7 +79,7 @@ pub fn build_process_capabilities(
 /// is `allow_file`. nono rejects a directory passed to `allow_file` and a
 /// non-directory passed to `allow_path`, so a manifest that mislabels a path
 /// fails here rather than granting the wrong shape.
-fn capabilities_from_manifest(
+pub fn capabilities_from_manifest(
     manifest: &ConfinementManifest,
 ) -> Result<CapabilitySet, ExecutionError> {
     let mut capabilities = CapabilitySet::new();

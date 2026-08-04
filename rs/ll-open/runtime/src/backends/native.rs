@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ExecutionError, ExecutionRequest};
 
-use super::libkrun::confinement::build_process_capabilities;
+use super::libkrun::confinement::{capabilities_from_manifest, confinement_manifest};
 use super::libkrun::plan::{DirectoryRootfsResolver, compile_plan};
 use super::libkrun::volume::{materialize_ephemeral_rootfs, verify_ephemeral_rootfs};
 
@@ -29,8 +29,23 @@ pub struct WorkerOptions {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkerEvent {
-    Ready { run_id: String },
-    Failed { error: ExecutionError },
+    Ready {
+        run_id: String,
+        /// The digest of the confinement manifest this worker actually
+        /// compiled and applied (ADR-0035). The worker is the only party
+        /// that can report this — the policy is built here, after fork, from
+        /// a rootfs path resolved against a materialized tree. A daemon-side
+        /// recomputation would be a second implementation of that
+        /// derivation, which is the drift the single manifest prevents.
+        ///
+        /// `#[serde(default)]` so a worker predating the field is reported
+        /// as attesting nothing, and refused, rather than failing to parse.
+        #[serde(default)]
+        confinement_digest: String,
+    },
+    Failed {
+        error: ExecutionError,
+    },
 }
 
 impl WorkerOptions {
@@ -104,14 +119,21 @@ pub fn execute_with_ready(
 
     // Resolve every host path before nono becomes irreversible. The child
     // process receives no ambient path authority after this call.
-    let capabilities =
-        build_process_capabilities(&config.rootfs.canonical_path, &options.runtime_files, &[])?;
+    // One manifest, two uses: the capabilities actually applied, and the
+    // digest attested below. Deriving both from `manifest` is what makes the
+    // attestation true by construction rather than by discipline.
+    let manifest = confinement_manifest(&config.rootfs.canonical_path, &options.runtime_files, &[]);
+    let capabilities = capabilities_from_manifest(&manifest)?;
     nono::Sandbox::apply_auto(&capabilities).map_err(|error| {
         ExecutionError::backend(format!("apply native nono confinement: {error}"))
     })?;
 
+    // Reported *after* the policy is irreversibly applied, so the digest
+    // describes what this process is now confined by rather than what it
+    // intended to be confined by.
     on_ready(&WorkerEvent::Ready {
         run_id: config.run_id.clone(),
+        confinement_digest: manifest.confinement_digest()?,
     })?;
 
     let executable = config
@@ -234,6 +256,7 @@ mod tests {
             arguments: Vec::new(),
             public_environment: BTreeMap::new(),
             allowed_egress: Vec::new(),
+            confinement_digest: String::new(),
             limits: ResourceLimits {
                 vcpus: 1,
                 memory_mib: 64,

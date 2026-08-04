@@ -28,6 +28,7 @@ fn request() -> ExecutionRequest {
         arguments: vec!["true".into()],
         public_environment: BTreeMap::new(),
         allowed_egress: Vec::new(),
+        confinement_digest: String::new(),
         limits: ResourceLimits {
             vcpus: 1,
             memory_mib: 512,

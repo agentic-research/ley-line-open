@@ -1,0 +1,144 @@
+name: Sync integration
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Keep `integration` current with `main` automatically, so the long-lived
+# branch never again drifts behind the branch it promotes to.
+#
+# ## Why this exists
+#
+# `integration` promoted to `main` by squash merge. A squash records the
+# combined tree as ONE new commit on `main` with no second parent, so none of
+# integration's commits become ancestors of `main` and the merge base stays
+# anchored where the branch originally diverged. The branches then report
+# wildly asymmetric ahead/behind counts while `integration` quietly LACKS every
+# fix that landed on `main` — which is how it ended up 6 commits behind and
+# missing an entire correctness chain (v0.15.0, v0.15.1, #319, #320) while
+# reporting 92 ahead. Releasing from it in that state would have regressed all
+# of it.
+#
+# ## Why a true merge, and not the two alternatives
+#
+# `git merge --no-ff main` (run ON integration) is the only correct option here:
+# integration keeps the work it legitimately carries AND gains main's content,
+# and the merge base advances so later diffs stop replaying old history.
+#
+#   - `git reset --hard main` would discard the commits integration carries.
+#     Correct only if integration is disposable after each promotion. It is not.
+#   - `git merge -s ours main` is actively dangerous and must never be used
+#     here. It records `main` as an ancestor while KEEPING integration's tree —
+#     so integration would claim to contain main's fixes while containing none
+#     of them, and the next promotion would revert them on `main`. That is
+#     precisely the regression this workflow exists to prevent, dressed up as
+#     the cure. It is only sound when the trees are already identical.
+#
+# ## Why conflicts open a PR instead of being resolved here
+#
+# A conflict means the same lines moved on both branches, which is a content
+# decision no automation should make silently. On conflict the merge is
+# aborted, the attempt is pushed to a branch, and a PR is opened for a human.
+# Nothing is left half-merged and `integration` is never force-updated.
+#
+# The drift this was written against has already been reconciled by hand, in
+# the merge commit that made `main`'s tip an ancestor of `integration`. So the
+# first run of this workflow takes the `--is-ancestor` early exit and reports
+# `current`, having done nothing. That is the steady state it maintains from
+# then on, and the reason step 0 of the release plan never recurs.
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Serialize: two pushes to main must not race to update the same branch.
+# Never cancel in progress — a cancelled run could leave a pushed branch with
+# no PR opened for it.
+concurrency:
+  group: sync-integration
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge main into integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          # Full history: a shallow clone has no merge base to compute.
+          fetch-depth: 0
+
+      - name: Merge main into integration
+        id: merge
+        env:
+          # Branch name carries the run id so a conflict during one sync cannot
+          # clobber the unresolved attempt from a previous one.
+          ATTEMPT_BRANCH: sync/main-into-integration-${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          if ! git ls-remote --exit-code --heads origin integration >/dev/null 2>&1; then
+            echo "no integration branch — nothing to sync"
+            echo "outcome=absent" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git checkout -B integration origin/integration
+
+          if git merge-base --is-ancestor origin/main HEAD; then
+            echo "integration already contains main — nothing to do"
+            echo "outcome=current" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # --no-ff unconditionally: an explicit merge commit is what makes
+          # main's commits ancestors of integration and moves the merge base.
+          if git merge --no-ff --no-edit origin/main \
+              -m "Merge main into integration (automated post-promotion sync)"; then
+            git push origin integration
+            echo "outcome=merged" >>"$GITHUB_OUTPUT"
+          else
+            git merge --abort || true
+            echo "outcome=conflict" >>"$GITHUB_OUTPUT"
+            echo "attempt_branch=${ATTEMPT_BRANCH}" >>"$GITHUB_OUTPUT"
+            # Push integration's tip unchanged so the PR's diff is exactly the
+            # merge a human must resolve — no partial resolution is committed.
+            git push origin "HEAD:refs/heads/${ATTEMPT_BRANCH}"
+          fi
+
+      - name: Open a PR when the merge needs a human
+        if: steps.merge.outputs.outcome == 'conflict'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ATTEMPT_BRANCH: ${{ steps.merge.outputs.attempt_branch }}
+          # Kept as a YAML block scalar rather than a shell heredoc: a heredoc
+          # body has to start at column 0, which terminates the enclosing
+          # block scalar and makes the workflow unparseable.
+          PR_BODY: |
+            `main` advanced and the automated sync could not merge it into
+            `integration` cleanly. Resolve the conflicts here, then merge —
+            **with a merge commit, not a squash** — so `main`'s commits become
+            ancestors of `integration` and the merge base advances.
+
+            Do not resolve this by resetting `integration` to `main` (it would
+            discard the work `integration` carries), and not with `-s ours` (it
+            would record `main` as merged while keeping `integration`'s tree,
+            so the fixes would be claimed but absent — and reverted on the next
+            promotion).
+
+            Opened by `.github/workflows/sync-integration.yml`.
+        run: |
+          set -euo pipefail
+          gh pr create \
+            --base integration \
+            --head "${ATTEMPT_BRANCH}" \
+            --title "Sync: merge main into integration (conflicts)" \
+            --body "${PR_BODY}"
+
+      - name: Report
+        run: |
+          echo "sync outcome: ${{ steps.merge.outputs.outcome }}"

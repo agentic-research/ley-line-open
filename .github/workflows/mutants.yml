@@ -102,8 +102,14 @@ jobs:
           # covers changed, OR when the task definitions themselves changed —
           # editing `mutants:*` should re-verify the gate still runs, which is
           # the reason Taskfile.yml is a trigger at all.
+          #
+          # tools/mutants_diff.sh is in this list for exactly that reason: the
+          # gate's logic MOVED there, out of the Taskfile, so shellcheck could
+          # read it. Leaving it out meant a change to the gate itself no longer
+          # re-verified the gate — the trigger kept pointing at the file the
+          # logic used to live in.
           if printf '%s\n' "$changed" | grep -qE \
-            '^(rs/ll-open/cdc/|rs/ll-open/fs/src/(chunked|gc)\.rs|rs/ll-core/core/src/partition\.rs|Taskfile\.yml|\.github/workflows/mutants\.yml)'; then
+            '^(rs/ll-open/cdc/|rs/ll-open/fs/src/(chunked|gc)\.rs|rs/ll-core/core/src/partition\.rs|Taskfile\.yml|tools/mutants_diff\.sh|\.github/workflows/mutants\.yml)'; then
             echo "allowlist=true" >> "$GITHUB_OUTPUT"
           else
             echo "allowlist=false" >> "$GITHUB_OUTPUT"

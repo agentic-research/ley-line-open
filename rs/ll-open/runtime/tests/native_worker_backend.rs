@@ -260,3 +260,32 @@ sleep 30
          a policy the grant did not authorize: {error:?}"
     );
 }
+
+/// The other half of the same condition, and the one that makes it a
+/// comparison rather than a blanket refusal: when the grant authorizes no
+/// particular policy, whatever the worker attests is not drift.
+///
+/// Only reachable by embedding this backend directly — the service path always
+/// carries a digest, because `read_digest` rejects a `RunGrant.confinementDigest`
+/// that is not a lowercase blake3-256 value. It still needs pinning:
+/// `replace && with ||` survived at `native_backend.rs:259`, and under `||` an
+/// absent authorization would start refusing every worker that attested
+/// anything. That is a fail-CLOSED break of direct embedding rather than a
+/// security hole — the kind that surfaces as "it worked last release".
+#[test]
+fn a_grant_authorizing_no_policy_does_not_constrain_what_the_worker_attests() {
+    let fixture = TempDir::new().expect("fixture");
+    let (backend, _runs) = backend(
+        &fixture,
+        r#"#!/bin/sh
+echo '{"type":"ready","run_id":"native-run-01","confinement_digest":"blake3-256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}' >&2
+sleep 30
+"#,
+    );
+
+    // `request()` leaves `confinement_digest` empty: nothing was authorized.
+    backend
+        .start(&request())
+        .expect("an unauthorized-policy grant must not refuse an attesting worker");
+    assert!(Backend::cancel(&backend, "native-run-01").expect("cancel"));
+}

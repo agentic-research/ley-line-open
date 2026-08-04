@@ -419,3 +419,172 @@ fn concurrent_starts_reserve_a_run_id_before_spawning() {
     assert_eq!(conflict.code, leyline_runtime::ErrorCode::ResourceConflict);
     assert!(backend.cancel("run-backend-01").expect("cancel worker"));
 }
+
+/// ADR-0035 finding 2, microVM tier. The native tier pins this in
+/// `native_worker_backend.rs`; the same refusal on the libkrun backend had no
+/// test at all, because every `libkrun_*.rs` test is `#[ignore]`-gated on
+/// having a hypervisor. The backend's readiness handling does not need one —
+/// it reads a worker's stderr — so the drift check is testable here with the
+/// same shell-script worker the rest of this file uses.
+///
+/// Surfaced by cargo-mutants: `replace != with ==` and `delete !` at
+/// `backend.rs:294-295` both survived, meaning nothing observed whether this
+/// backend compared the attested policy to the authorized one at all.
+#[test]
+fn a_worker_attesting_an_unauthorized_policy_never_reaches_running() {
+    let fixture = TempDir::new().expect("fixture");
+    // Well-formed readiness, correct run id, wrong policy.
+    let (backend, ephemeral_root) = backend_with_worker(
+        &fixture,
+        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\",\"confinement_digest\":\"blake3-256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"}' >&2\n/usr/bin/tail -f /dev/null\n",
+    );
+
+    let mut request = request();
+    request.confinement_digest = format!("blake3-256:{}", "a".repeat(64));
+
+    let error = backend
+        .start(&request)
+        .expect_err("a worker attesting an unauthorized policy must not start");
+    assert!(
+        format!("{error:?}").contains("confinement drift"),
+        "the refusal must name drift, so an operator learns the worker applied \
+         a policy the grant did not authorize: {error:?}"
+    );
+    assert_eq!(run_root_count(&ephemeral_root), 0);
+}
+
+/// The other half of the same condition, and the one that makes it a
+/// comparison rather than a blanket refusal: when the grant authorizes no
+/// particular policy, whatever the worker attests is not drift.
+///
+/// This is the branch reached only by embedding a backend directly — the
+/// service path always carries a digest, because `read_digest` rejects a
+/// `RunGrant.confinementDigest` that is not a lowercase blake3-256 value. It
+/// still needs pinning: `replace && with ||` survived on both backends, and
+/// under `||` an absent authorization would start refusing every worker that
+/// attested anything, which is a fail-CLOSED break of direct embedding rather
+/// than a security hole — the kind that shows up as "it worked last release".
+#[test]
+fn a_grant_authorizing_no_policy_does_not_constrain_what_the_worker_attests() {
+    let fixture = TempDir::new().expect("fixture");
+    let (backend, _ephemeral_root) = backend_with_worker(
+        &fixture,
+        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\",\"confinement_digest\":\"blake3-256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"}' >&2\n/usr/bin/tail -f /dev/null\n",
+    );
+
+    // `request()` leaves `confinement_digest` empty: nothing was authorized.
+    backend
+        .start(&request())
+        .expect("an unauthorized-policy grant must not refuse an attesting worker");
+    assert!(backend.cancel("run-backend-01").expect("cancel worker"));
+}
+
+/// Readiness must bind to the run that was asked for. `replace match guard
+/// run_id == request.run_id with true` survived here, so this backend would
+/// have accepted a readiness event announcing any run at all — including one
+/// whose confinement digest was checked against the wrong request.
+#[test]
+fn readiness_announcing_another_run_is_rejected() {
+    let fixture = TempDir::new().expect("fixture");
+    let (backend, ephemeral_root) = backend_with_worker(
+        &fixture,
+        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"some-other-run\"}' >&2\n/usr/bin/tail -f /dev/null\n",
+    );
+
+    let error = backend
+        .start(&request())
+        .expect_err("readiness must bind to the requested run");
+    assert!(
+        format!("{error:?}").contains("unexpected run"),
+        "the refusal must name the binding that failed: {error:?}"
+    );
+    assert_eq!(run_root_count(&ephemeral_root), 0);
+}
+
+/// `configured()` is a six-term `&&` chain, and until now nothing observed any
+/// individual term: every `&&` in it, plus the whole function's return, could
+/// be mutated without a test noticing. A backend that reports itself available
+/// while missing its worker binary or its CAS root fails at `start` instead of
+/// at capability negotiation, which is the difference between "this host
+/// cannot run microVMs" and "this run mysteriously died".
+///
+/// The native tier already pins this shape in
+/// `every_native_resource_is_required_independently`; this is its microVM
+/// counterpart. Each case removes exactly one resource and leaves the other
+/// five intact, which is what makes it a test of that term rather than of the
+/// conjunction.
+#[test]
+fn every_libkrun_resource_is_required_independently() {
+    let fixture = TempDir::new().expect("fixture");
+    let worker = fixture.path().join("worker");
+    let cas_root = fixture.path().join("cas");
+    let ephemeral_root = fixture.path().join("runs");
+    let libkrun = fixture.path().join("libkrun.dylib");
+    let runtime_file = fixture.path().join("runtime");
+    let device = fixture.path().join("device");
+    fs::write(&worker, "#!/bin/sh\n").expect("worker");
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("worker mode");
+    fs::create_dir(&cas_root).expect("CAS");
+    fs::create_dir(&ephemeral_root).expect("runs");
+    fs::write(&libkrun, b"library").expect("library");
+    fs::write(&runtime_file, b"runtime").expect("runtime file");
+    fs::write(&device, b"device").expect("device");
+
+    let complete = || KrunWorkerConfig {
+        worker: worker.clone(),
+        cas_root: cas_root.clone(),
+        ephemeral_root: ephemeral_root.clone(),
+        libkrun: libkrun.clone(),
+        runtime_files: vec![runtime_file.clone()],
+        devices: vec![device.clone()],
+        ready_timeout: READY_TIMEOUT,
+    };
+
+    assert!(
+        KrunWorkerBackend::new(complete()).capabilities().available,
+        "a fully provisioned host must report the backend available, or the \
+         cases below would pass for the wrong reason"
+    );
+
+    let missing = fixture.path().join("missing");
+    let incomplete = [
+        ("worker", {
+            let mut c = complete();
+            c.worker = missing.clone();
+            c
+        }),
+        ("cas root", {
+            let mut c = complete();
+            c.cas_root = missing.clone();
+            c
+        }),
+        ("ephemeral root", {
+            let mut c = complete();
+            c.ephemeral_root = missing.clone();
+            c
+        }),
+        ("libkrun library", {
+            let mut c = complete();
+            c.libkrun = missing.clone();
+            c
+        }),
+        ("runtime file", {
+            let mut c = complete();
+            c.runtime_files = vec![missing.clone()];
+            c
+        }),
+        ("device", {
+            let mut c = complete();
+            c.devices = vec![missing.clone()];
+            c
+        }),
+    ];
+    for (resource, configuration) in incomplete {
+        assert!(
+            !KrunWorkerBackend::new(configuration)
+                .capabilities()
+                .available,
+            "a missing {resource} must make the backend unavailable"
+        );
+    }
+}

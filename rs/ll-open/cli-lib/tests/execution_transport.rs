@@ -59,6 +59,7 @@ impl ExecutionResolver for Resolver {
             arguments: Vec::new(),
             public_environment: BTreeMap::new(),
             allowed_egress: authorized.allowed_egress.clone(),
+            confinement_digest: String::new(),
             limits: ResourceLimits {
                 vcpus: 1,
                 memory_mib: 64,

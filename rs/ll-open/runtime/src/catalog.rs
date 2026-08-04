@@ -171,6 +171,11 @@ impl ExecutionResolver for CatalogResolver {
             public_environment: authorized.intent.public_environment.clone(),
             allowed_egress: authorized.allowed_egress.clone(),
             limits,
+            // Carried, never chosen: this is the digest the grant committed
+            // to, forwarded so the supervisor can check the worker's
+            // attestation against it. The resolver must not substitute its
+            // own — that would make the check compare a value to itself.
+            confinement_digest: authorized.confinement_digest.clone(),
         };
         request.validate()?;
         Ok(request)

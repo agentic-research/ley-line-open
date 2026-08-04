@@ -1035,6 +1035,7 @@ impl ExecutionResolver for TestResolver {
             arguments: vec![],
             public_environment: BTreeMap::new(),
             allowed_egress: authorized.allowed_egress.clone(),
+            confinement_digest: String::new(),
             limits: ResourceLimits {
                 vcpus: 1,
                 memory_mib: 128,

@@ -154,6 +154,15 @@ pub struct ExecutionRequest {
     pub public_environment: BTreeMap<String, String>,
     pub allowed_egress: Vec<String>,
     pub limits: ResourceLimits,
+    /// The `confinementDigest` the grant authorized, carried through so the
+    /// supervisor can check the worker's attestation against it.
+    ///
+    /// Empty means the resolver declared none, and the worker's attestation
+    /// is then not checked — a state the shipped resolver never produces, and
+    /// which exists only so an embedder-supplied resolver fails loudly at its
+    /// own boundary rather than silently here.
+    #[serde(default)]
+    pub confinement_digest: String,
 }
 
 impl ExecutionRequest {

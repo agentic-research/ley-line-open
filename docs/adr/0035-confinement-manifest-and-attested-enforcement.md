@@ -410,19 +410,67 @@ bolted onto the compile-side change.
   If they are close, §1's `TryFrom` is direct; if they diverge, LLO owns a mapping and
   should document why rather than silently maintaining two shapes.
 
-  *Corrected 2026-08-03 (bead `ley-line-open-c17486`).* The answer below said
-  "close, with one deliberate divergence". That was wrong — it compared
-  top-level key names and stopped. The divergence is structural:
-  `fs.allow`↔`filesystem`, `network.allowHosts`↔`network.allow_domains`,
-  top-level `port.bind`↔nested `network.ports`,
-  `credentialSource`↔`credentials`, camelCase↔snake_case, plus nono-only
-  dimensions (`dns`, `endpoints`, `mode`, `rollback`, `exec_strategy`). So
-  §1's `TryFrom` is real code but takes *nono's* manifest, and LLO owns a
-  mapping — which is the branch this open question named. LLO currently
-  compiles confinement/v1 straight to a `CapabilitySet` via
-  `allow_path`/`allow_file` rather than routing through nono's manifest at
-  all; that preserves §1's no-drift property but the divergence is not yet
-  written down. Tracked in `c17486`.
+  *Resolved 2026-08-04 (bead `ley-line-open-c17486`). They diverge structurally.
+  LLO owns the mapping, does not route through nono's manifest, and the reason is
+  attestation correctness rather than convenience.*
+
+  An earlier answer here said "close, with one deliberate divergence". That compared
+  top-level key names and stopped. Read from
+  `nono-0.71.0/schema/capability-manifest.schema.json`:
+
+  | confinement/v1 | nono 0.71 | kind of difference |
+  | --- | --- | --- |
+  | `fs.allow` | `filesystem.grants` — `FsGrant{path, access, type}` | nesting + per-entry shape |
+  | `network.allowHosts` | `network.allow_domains` | rename |
+  | `port.bind` (top level) | `network.ports` — `PortConfig{bind, connect, localhost, localhost_range}` | re-parented and widened |
+  | `credentialSource` (scalar) | `credentials` — **array** of `Credential{name, upstream, source, …}` | cardinality |
+  | — | `dns`, `endpoints`, `mode`, `rollback`, `exec_strategy` | nono-only dimensions |
+  | camelCase | snake_case | naming convention |
+
+  The `credentials` row settles it: an array of objects against a scalar means no
+  field-for-field rename exists even in principle.
+
+  **Why LLO does not route through nono's manifest.** The alternative — map
+  confinement/v1 into `CapabilityManifest`, then reuse nono's `validate()` and its
+  `TryFrom<&CapabilityManifest> for CapabilitySet` — looks like free validation. It
+  is not:
+
+  1. *It buys no resource enforcement.* Routing through the manifest does not move LLO
+     onto the supervised strategy, and off that strategy nono's own `validate()`
+     **refuses** a manifest carrying resources at all (`src/manifest.rs:79-87`). LLO
+     would have to emit `resources: null` and keep enforcing ceilings itself — which is
+     what §3 and §4 already do.
+  2. *It requires LLO to invent values it has no basis for.* `dns`, `endpoints`, `mode`,
+     `rollback` and `exec_strategy` have no confinement/v1 counterpart. A total mapping
+     means LLO making policy decisions in a vocabulary it does not own.
+  3. *It breaks the property this ADR rests on.* The design is **one** manifest:
+     capabilities derived from it, digest attested over it, so the attestation is true by
+     construction rather than by discipline. Inserting nono's manifest between the
+     digested object and the applied policy puts a second shape in exactly that gap —
+     reintroducing, one layer down, the drift surface the single manifest removes.
+
+  So LLO keeps `confinement_manifest()` → `capabilities_from_manifest()` →
+  `CapabilitySet` (`backends/libkrun/confinement.rs`), compiling confinement/v1 directly
+  via `allow_path`/`allow_file`. The table above is the mapping this open question asked
+  LLO to own.
+
+  **§3's `Supervisor` is not nono's supervisor** — a conflation worth stating outright,
+  because the two mechanisms share a word and nothing else:
+
+  | `CeilingMechanism` | what actually applies it | covers |
+  | --- | --- | --- |
+  | `Unenforced` | nothing | native tier's vcpus + memory |
+  | `Supervisor` | **LLO's own backend**, observing a wall-clock deadline | wall time, both tiers |
+  | `Hypervisor` | libkrun, at VM configuration time, before the guest runs | vcpus + memory, microVM tier |
+
+  nono's cgroup-v2 enforcement appears nowhere in that table. It is a capability LLO has
+  **available and unused**: taking it would mean adopting `exec_strategy: supervised`,
+  which the `apply_auto` path does not use. Worth naming as a concrete future option
+  rather than a present property — adopting it would move the native tier's `memory`
+  ceiling from `Unenforced` to genuinely enforced, with `max_processes` alongside. That
+  option is **Linux-only**, and not by omission: nono 0.71 has no macOS resource
+  enforcement at all, so a native-tier memory ceiling on macOS stays `Unenforced` and
+  only the hypervisor tier can carry one there.
 
   *Original answer, retained for the resources finding it got right:* nono 0.71's
   `CapabilityManifest` is generated from `schema/capability-manifest.schema.json` via
@@ -435,9 +483,23 @@ bolted onto the compile-side change.
   not a hope.
 
   The divergence is `resources`, and it is intentional. nono's covers memory and max
-  processes only, and its own schema says they are "enforced by the supervisor. Requires
-  `exec_strategy: \"supervised\"`" — confirming §1's finding that nono does not enforce
-  resource limits on the library path LLO uses. §2 conforms `resources` to OCI
+  processes only, and they require the supervised strategy — confirming §1's finding that
+  nono does not enforce resource limits on the library path LLO uses.
+
+  *Sourcing corrected 2026-08-04 (`c17486`).* That claim was attributed to the schema's
+  property descriptions, which in 0.71 say the opposite-sounding thing — `memory_bytes`
+  is "Enforced via cgroup `memory.max`", `max_processes` via `pids.max`. The claim
+  survives, from three places that are actually load-bearing:
+  `src/manifest.rs:53` ("resources (memory_bytes / max_processes) require
+  `exec_strategy: \"supervised\"`"), the validation enforcing it at `:79-87`, a test
+  pinning it at `:185` ("memory_bytes without supervised must fail validation"), and
+  `src/capability.rs:961` on `CapabilitySet.resource_limits` — "Plumbed through here so
+  they ride the serialization layer like other policy; **enforced by the supervisor via
+  cgroup v2 on Linux**." Both statements are true and not in tension: the ceilings *are*
+  cgroup-enforced, but only on the supervised strategy, and LLO's
+  `Sandbox::apply_auto(&CapabilitySet)` carries them while enforcing nothing.
+
+  §2 conforms `resources` to OCI
   `linux.resources`, which is strictly wider. So the mapping is total in one direction
   only: every nono resource has an OCI counterpart, and OCI dimensions nono cannot enforce
   have none. That asymmetry is not a defect to paper over — it is the exact input to §4,

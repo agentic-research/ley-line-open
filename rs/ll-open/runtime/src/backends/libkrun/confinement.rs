@@ -79,6 +79,16 @@ pub fn build_process_capabilities(
 /// is `allow_file`. nono rejects a directory passed to `allow_file` and a
 /// non-directory passed to `allow_path`, so a manifest that mislabels a path
 /// fails here rather than granting the wrong shape.
+///
+/// This compiles confinement/v1 **directly**, deliberately bypassing nono's own
+/// `CapabilityManifest` and its `TryFrom<&CapabilityManifest> for CapabilitySet`.
+/// The two manifest shapes diverge structurally — `credentials` alone is an array
+/// of objects against confinement/v1's scalar `credentialSource`, so no
+/// field-for-field mapping exists — and routing through nono's would put a second
+/// shape between the object whose digest is attested and the policy actually
+/// applied, which is the drift the single manifest exists to prevent. The full
+/// field-by-field mapping and the rationale are ADR-0035's second open question
+/// (bead `ley-line-open-c17486`).
 pub fn capabilities_from_manifest(
     manifest: &ConfinementManifest,
 ) -> Result<CapabilitySet, ExecutionError> {

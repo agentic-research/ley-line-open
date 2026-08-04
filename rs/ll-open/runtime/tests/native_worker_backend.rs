@@ -289,3 +289,38 @@ sleep 30
         .expect("an unauthorized-policy grant must not refuse an attesting worker");
     assert!(Backend::cancel(&backend, "native-run-01").expect("cancel"));
 }
+
+/// The accept branch — and until v0.15.1 there was no input that could reach it.
+///
+/// The manifest named the materialized rootfs, whose path is a per-run
+/// temporary directory, so the digest changed every run and no grant could ever
+/// carry a matching value. Both backends gate on
+/// `!request.confinement_digest.is_empty()`, so the only reachable states were
+/// "skipped" (empty) and "drift" (non-empty, never equal). The mechanism could
+/// reject and could be switched off, and could not accept.
+///
+/// Every real-worker test passed an empty digest, which takes the skip path, so
+/// nothing noticed. This asserts the third state exists: a worker attesting the
+/// policy the grant authorized starts, and reaches `Running`.
+#[test]
+fn a_worker_attesting_the_authorized_policy_starts() {
+    let fixture = TempDir::new().expect("fixture");
+    let authorized = format!("blake3-256:{}", "d".repeat(64));
+    let (backend, _runs) = backend(
+        &fixture,
+        &format!(
+            r#"#!/bin/sh
+echo '{{"type":"ready","run_id":"native-run-01","confinement_digest":"{authorized}"}}' >&2
+sleep 30
+"#
+        ),
+    );
+
+    let mut request = request();
+    request.confinement_digest = authorized;
+
+    backend
+        .start(&request)
+        .expect("a worker attesting exactly the authorized policy must start");
+    assert!(Backend::cancel(&backend, "native-run-01").expect("cancel"));
+}

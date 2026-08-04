@@ -10,6 +10,76 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.15.1] — 2026-08-04
+
+**v0.15.0's confinement attestation did not function.** This release makes the
+mechanism it advertised actually work, and lets a grant carry the policy it
+commits to.
+
+### Fixed
+
+- **The attested digest had no satisfying input.** The confinement manifest
+  named the materialized rootfs directly, and that path is
+  `<per-run temporary directory>/rootfs` — so every run digested differently and
+  no issuer could ever commit to a value the runner would produce. The drift
+  check both backends perform could only ever *reject*. Nothing caught it
+  because every real-worker test passed an empty digest, which skips the
+  comparison entirely.
+
+  The manifest now names the run root symbolically and the realization is
+  substituted at compile time. No coverage is lost: the rootfs *content* is
+  attested by its own digest, verified before execution, and reaches the receipt
+  as `inputRoots`. The host path was only ever where those already-verified
+  bytes were placed.
+
+- **A resolver could silently disable the attestation.** `start_authorized`
+  verified the resolver preserved `run_id`, `replay_key` and `allowed_egress`,
+  but not `confinement_digest` — and both backends gate the drift check on that
+  field being non-empty, so *dropping* it turned the check off with no error.
+  Adding the check immediately failed six tests across two crates: two
+  independent fixtures were dropping it, with nothing failing between them.
+
+- **Three of four confinement dimensions were inert.** `port.bind`,
+  `network.allowHosts` and `credentialSource` were declared, digested, and read
+  by nothing. §5 had no accessor at all, so the compiler could not have refused
+  it even in principle. Each is now enforced or refused; a dimension a tier
+  cannot enforce is a rejection, never a silent drop.
+
+- **On macOS, a single-port listener grant meant every port.** Seatbelt cannot
+  filter bind or inbound by port, so nono emits an unqualified
+  `(allow network-bind)`. §4 is refused on that platform rather than granting
+  more than it says.
+
+- **The manifest admitted documents its own schema refuses** — privileged
+  ports, port 0 (which compiles to a `localhost:*` wildcard), relative paths,
+  `..` traversal, interior-wildcard hosts, unenumerated credential schemes.
+
+### Added
+
+- **`RunGrant.confinementManifest`** — the `confinement/v1` document the digest
+  is taken over, as canonical JSON. Carrying the digest alone let an issuer
+  commit to a policy the runner could never obtain: a runner could verify that
+  what it applied matched, and never learn what was authorized. A carried
+  document must digest to `confinementDigest` and must parse under every §2–§5
+  refusal, so a grant cannot name one policy and carry another.
+
+- **`ConfinementManifest::parse`** — the wire-form reader. The type was
+  write-only, which is why a grant's document could never become the manifest
+  LLO compiles.
+
+- **An explicit vsock boundary for the microVM tier**, with socket hijacking
+  (`--tsi-hijack-inet`) as an operator opt-in that is never the default.
+
+### Changed
+
+- **`confinementDigest` now commits to the policy, not the run instance.**
+  Digests computed against v0.15.0's shape will not match.
+- Previously-accepted input now fails: a resolver dropping the digest, `port.bind`
+  on macOS, and manifests violating the schema.
+- The microVM backend requires a libkrun exporting `krun_add_vsock`,
+  `krun_add_vsock_port2` and `krun_set_port_map`. An older one makes the backend
+  unavailable rather than running with a weaker boundary than it reports.
+
 ## [0.15.0] — 2026-08-04
 
 Execution/v1 stops accepting what it cannot verify. A ceiling the selected

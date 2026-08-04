@@ -1,6 +1,6 @@
 [package]
 name = "leyline-envelope"
-version = "0.15.0"
+version = "0.15.1"
 edition = "2024"
 description = "DSSE envelope + in-toto Statement v1 attestation over the leyline-sign signer — one signing implementation for every runtime, wasm included (bead ley-line-open-319a08; byte-compatible hoist of rosary's dsse.rs)"
 repository = "https://github.com/agentic-research/ley-line-open"
@@ -30,7 +30,7 @@ crate-type = ["cdylib", "rlib"]
 # SIGNING ones this crate's FFI exists to keep out of the wasm consumer.
 # tests/wasm_export_surface.rs asserts export-set equality, so a slip here
 # fails the release gate rather than shipping.
-leyline-sign = { path = "../sign", version = "0.15.0", default-features = false, features = ["root-signer"] }
+leyline-sign = { path = "../sign", version = "0.15.1", default-features = false, features = ["root-signer"] }
 # Signature/Verifier types for the verify path. Same major as leyline-sign's
 # so `VerifyingKey` re-exported from there is the same type callers hand us.
 ed25519-dalek = "3"
@@ -46,7 +46,7 @@ hex = { workspace = true }
 thiserror = { workspace = true }
 # Shared C-boundary helpers (bead `ley-line-open-85fb1f` PR 2) — the
 # raw-pointer discipline behind src/ffi.rs, same as leyline-sign's FFI.
-leyline-ffi-helpers = { path = "../../ll-core/ffi-helpers", version = "0.15.0" }
+leyline-ffi-helpers = { path = "../../ll-core/ffi-helpers", version = "0.15.1" }
 
 [dev-dependencies]
 # Export-surface gate for the published leyline_envelope.wasm (bead

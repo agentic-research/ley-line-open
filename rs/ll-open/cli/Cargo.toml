@@ -38,6 +38,7 @@ full = ["lsp", "mount", "vec", "validate", "hdc", "text-search", "cdc"]
 
 [dependencies]
 leyline-cli-lib = { path = "../cli-lib", default-features = false }
+leyline-runtime = { path = "../runtime" }
 clap = { workspace = true, features = ["derive"] }
 anyhow = { workspace = true }
 dirs = "6"

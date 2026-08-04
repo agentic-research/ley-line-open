@@ -8,8 +8,8 @@ that any second implementation can conform to.
 
 - **`_traits.capnp`** — canonical Cap'n Proto trait annotations
   (`$Sensitive`, `$Op(...)`, `$SinceVersion(...)`, …) used across every
-  capability spec's schema. Downstream emitters (zod today, Rust later)
-  read these annotations and honor them at codegen time.
+  capability spec's schema. Downstream emitters and Cap'n Proto language
+  generators read these annotations from the same IDL at codegen time.
 - **`_capability-mapping.md`** — the three-lane identifier scheme
   (signet URN / WIMSE URI / cloister interface name) that keys every
   capability to its concrete implementation.
@@ -32,6 +32,9 @@ that any second implementation can conform to.
   `wire/cloister.capnp` — bead `ley-line-open-083344`). Ships 12
   digest-pinned frame vectors in two byte-forms (reference + strict
   canonical) under `test-vectors/`.
+- **`execution/v1/`** — execution intent, resolved grant, lifecycle, errors,
+  receipts, and operation annotations. The same `execution.capnp` generates
+  Rust wire types, JSON Schema, and self-contained MCP tool definitions.
 
 ## Conformance vectors and `VECTORS.sha256`
 
@@ -41,6 +44,7 @@ These spec dirs pin their vector bundles with a `VECTORS.sha256` file:
 - `build-cache/v1/vectors/VECTORS.sha256` — 5 vectors alongside it
 - `confinement/v1/VECTORS.sha256` — canonical `ConfinementManifest` vector
 - `leyline-net/v1/test-vectors/VECTORS.sha256` — 24 frame vectors + digests.json + fixtures.capnp
+- `execution/v1/VECTORS.sha256` — canonical intent/grant/receipt carrier vector
 
 The crate's `verify_vectors_sha256` test walks every listed file and re-hashes
 every listed vector, asserting SHA-256 equality. Any drift between the
@@ -49,8 +53,8 @@ leyline-schema-spec`.
 
 ## History
 
-Content moved verbatim from `cloister/cloister-spec/` (see bead
-`ley-line-open-729a7e` and ADR-0029). Byte-identity was verified with
-`cmp -s` at move time. The cloister-side follow-up (deleting cloister's
-copy + depending on this crate) is tracked separately; until it lands,
-both trees co-exist byte-for-byte.
+The initial content moved verbatim from `cloister/cloister-spec/` (see bead
+`ley-line-open-729a7e` and ADR-0029), with byte identity verified by `cmp -s`.
+New substrate capabilities such as execution/v1 are authored here. The
+cloister-side follow-up deletes its copies and consumes the packaged spec and
+generated artifacts instead.

@@ -91,6 +91,39 @@ cloister-spec/credential-isolation/v1/
 | `ref-impl-<lang>/` | MUST (≥1) | A second implementation. If only one implementation exists, the wire isn't a wire. Python is the default reference language. |
 | `VECTORS.sha256` | MUST | Pinned SHA-256 of every `test-vectors/*.json` file. Output of `shasum -a 256 test-vectors/*.json`. |
 
+**Source-of-truth format**
+
+> **The IDL format follows the digest definition, not the other way round.**
+
+A capability's normative shape may be a Cap'n Proto IDL *or* a JSON Schema.
+Which one is not a style choice — it is decided by what the capability's
+signed digest is computed over:
+
+| The digest is over | Normative shape | Example |
+|---|---|---|
+| Cap'n Proto canonical bytes | `<cap>.capnp` | `execution/v1` — `runSpecDigest`, `run_id` |
+| Canonical JSON | `<cap>.schema.json` | `confinement/v1` — `confinementDigest` (ADR-0035 §8) |
+
+The failure this prevents is two sources of truth for one signed surface.
+`capnpc-schema-bridge-jsonschema` will happily emit a JSON Schema from a
+`.capnp`, which makes capnp-first look like the universal answer — but that
+JSON Schema is then a *projection*, and a digest defined over the JSON is
+signing a document whose shape is authored elsewhere. That is the same defect
+as PR #312 finding 10, where `run_id` hashed Cap'n Proto framing instead of
+content: a name derived from the wrong artifact.
+
+Two corollaries:
+
+- A JSON-native upstream (OCI `config.json`, an existing JSON Schema in a
+  dependency) is a reason to be JSON-first, not a thing to wrap. `confinement/v1`
+  is JSON-first partly because nono's `CapabilityManifest` is itself generated
+  from `schema/capability-manifest.schema.json` via typify, so the two
+  reconcile schema-to-schema rather than through a hand-written mapping.
+- Being JSON-first does **not** exempt a capability from `wire/*.md`. The
+  canonical-bytes rules — encoding, key order, indentation, trailing newline —
+  are what make the digest reproducible, and a JSON Schema does not express
+  them.
+
 **Naming rules**
 
 - `<cap>`: kebab-case, English, no underscores. E.g. `credential-isolation`, `substrate-manifest`. Not `credIsol` or `cred_isolation`.

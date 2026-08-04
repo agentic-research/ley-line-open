@@ -72,7 +72,7 @@ fn build_blackbox_ctx(dir: &Path) -> Arc<DaemonContext> {
 }
 
 async fn spawn_blackbox_socket(ctx: Arc<DaemonContext>, sock_path: PathBuf) -> PathBuf {
-    let path = socket::spawn(ctx, sock_path);
+    let path = socket::spawn(ctx, sock_path, socket::SocketDiscovery::Unpublished);
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while std::time::Instant::now() < deadline {
         if UnixStream::connect(&path).await.is_ok() {

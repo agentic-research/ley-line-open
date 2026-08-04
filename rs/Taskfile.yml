@@ -1,0 +1,83 @@
+version: '3'
+
+# Rust-workspace tasks. Included by the repository Taskfile under `rs:`, while
+# root compatibility aliases keep `task mutants:diff` and `task mutants:pr`
+# stable for CI and contributors.
+#
+# Mutation process count and timeout calibration live here so every invocation
+# uses the same defaults. Callers may override them as Task variables; they do
+# not need to know cargo-mutants' environment variable names.
+#
+# Paths anchor on `{{"{{"}}.TASKFILE_DIR{{"}}"}}`, used DIRECTLY. Two measured
+# rules, both enforced by `tools/lint_taskfile_anchors.sh`:
+#
+#   1. `ROOT_DIR` is the directory of whichever Taskfile `task` DISCOVERED —
+#      the repo root under the root Taskfile's `includes`, but `<repo>/rs`
+#      when someone runs `task` from inside `rs/`. `dir: '{{"{{"}}.ROOT_DIR{{"}}"}}/rs'`
+#      therefore resolves to `<repo>/rs/rs` from there, and Task CREATES the
+#      wrong directory rather than failing.
+#   2. A special variable in `dir:` is treated as absolute only when written
+#      directly. Route the identical value through a `vars:` entry and Task
+#      joins it onto the base directory instead — producing a doubled path
+#      like `<repo>/Users/.../rs`. Do not indirect `dir:` through a variable.
+
+vars:
+  MUTANTS_JOBS_VALUE: '{{.MUTANTS_JOBS | default "4"}}'
+  MUTANTS_MINIMUM_TEST_TIMEOUT_VALUE: '{{.MUTANTS_MINIMUM_TEST_TIMEOUT | default "60"}}'
+
+env:
+  CARGO_MUTANTS_JOBS: '{{.MUTANTS_JOBS_VALUE}}'
+  CARGO_MUTANTS_MINIMUM_TEST_TIMEOUT: '{{.MUTANTS_MINIMUM_TEST_TIMEOUT_VALUE}}'
+
+tasks:
+  mutants:diff:
+    desc: Run the workspace-relative Rust diff mutation gate
+    dir: '{{.TASKFILE_DIR}}'
+    requires:
+      vars: [DIFF]
+    cmds:
+      - '{{.TASKFILE_DIR}}/../tools/mutants_diff.sh "{{.DIFF}}" "{{.MUTANTS_SCOPE | default "all"}}"'
+
+  mutants:pr:
+    desc: Generate the integration-base working-tree diff and mutation-test it
+    dir: '{{.TASKFILE_DIR}}'
+    cmds:
+      - |
+        set -eu
+        BASE_REF="${BASE_REF:-origin/integration}"
+        if ! git rev-parse --verify "$BASE_REF" >/dev/null 2>&1; then
+          git fetch origin "${BASE_REF#origin/}" --quiet
+        fi
+        if ! git rev-parse --verify "$BASE_REF" >/dev/null 2>&1; then
+          BASE_REF=origin/main
+          git fetch origin main --quiet
+        fi
+        BASE=$(git merge-base "$BASE_REF" HEAD)
+        DIFF=$(mktemp)
+        trap 'rm -f "$DIFF"' EXIT
+        # No three-dot and no HEAD bound: include uncommitted work in the exact
+        # tree that is about to be committed and pushed.
+        #
+        # The pathspec is `:/rs` — repo-root-anchored — not `.`. With `.` the
+        # diff's contents depend on the working directory, so a change to this
+        # task's `dir:` silently produced an EMPTY diff and the gate reported
+        # SKIPPED: no Rust changed, nothing mutated, exit 0. That is the
+        # script's "this is NOT a pass" path arriving as a pass, which is the
+        # exact false-green `mutants_diff.sh` exists to prevent — reintroduced
+        # one level up, in how its input is built.
+        git diff --relative=rs "$BASE" -- ':/rs' > "$DIFF"
+        # `mutants_diff.sh` distinguishes "no Rust changed" (SKIPPED, exit 0)
+        # from "enumeration broke" (MISCONFIGURED, exit 1), but it cannot see
+        # the difference between a branch that genuinely changed nothing and a
+        # diff this task failed to build. Only the caller knows a diff was
+        # meant to be produced, so the emptiness check belongs here.
+        if [ ! -s "$DIFF" ]; then
+          echo "EMPTY DIFF vs $BASE — nothing to mutate." >&2
+          echo "  Either this branch has no changes against its base, or the" >&2
+          echo "  diff was built wrong. Both are failures for this task: it" >&2
+          echo "  exists to mutate a branch's changes, and reporting SKIPPED" >&2
+          echo "  on a broken diff is a false green." >&2
+          exit 1
+        fi
+        echo "diff vs $(git rev-parse --short "$BASE") (merge-base with $BASE_REF)"
+        '{{.TASKFILE_DIR}}/../tools/mutants_diff.sh' "$DIFF" '{{.MUTANTS_SCOPE | default "all"}}'

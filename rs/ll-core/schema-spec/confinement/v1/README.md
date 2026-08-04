@@ -71,6 +71,15 @@ This v1 **DEFINES** (new content not in either upstream spec):
 ## Document map
 
 - `README.md` (this file) — the spec proper.
+- `confinement.schema.json` — the **machine-readable shape** (bead
+  `ley-line-open-41297c`). JSON Schema rather than a capnp IDL because
+  `confinementDigest` is computed over canonical JSON (§6), and the IDL
+  format follows the digest definition — see schema-spec `LAYOUT.md`.
+  A capnp source would make the JSON a projection, leaving two
+  definitions for one signed surface. Verified by
+  `verify_confinement_schema` (schema-spec crate), which checks both
+  that the pinned canonical manifest satisfies it and that each
+  refusal §2–§5 states in prose is actually refused.
 - `test-vectors/manifest-canonical.json` — a canonical example
   manifest.
 - `VECTORS.sha256` — **SHA-256 CONTENT-INTEGRITY pins** for the test
@@ -118,6 +127,24 @@ non-canonical prefixes.
 - **No file-level entries.** Prefixes MUST end at directory
   boundaries. This keeps the enforcement engine's decision O(depth)
   not O(n_files).
+
+  > **Erratum (2026-08-03, bead `ley-line-open-41297c`).** This rule
+  > and the load-bearing example directly below it contradict each
+  > other: `/etc/hosts` is a file, and it is also in
+  > `test-vectors/manifest-canonical.json`, whose BLAKE3 digest both
+  > LLO and cloister have independently reproduced. Writing
+  > `confinement.schema.json` forced the contradiction into the open —
+  > encoding "must end at `/`" would have made this spec's own pinned
+  > vector invalid.
+  >
+  > The schema therefore does **not** encode the directory-boundary
+  > rule, and this is recorded rather than resolved: choosing a side
+  > changes either the normative text or a digest two implementations
+  > already agree on, and that is a v1-vs-v2 decision, not an errata
+  > edit. The O(depth) rationale is real, so the likely resolution is
+  > that file-level entries are permitted and the rule should read as
+  > a recommendation — but the vector is the load-bearing artifact and
+  > it says files are allowed today.
 - **Load-bearing example.** A bundle that reads `/etc/hosts` and
   writes to `/var/lib/bundle-X/` declares:
   ```json

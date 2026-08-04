@@ -24,6 +24,11 @@ on:
       - 'tools/verify_public_release.sh'
       - 'tools/release-assets.txt'
       - 'tools/release-version-manifests.txt'
+      - 'tools/crate-publish-order.txt'
+      - 'tools/verify_crate_publish_order.sh'
+      - 'tools/test_crate_publish_order.sh'
+      - 'rs/ll-core/schema-spec/**'
+      - 'rs/ll-core/public-schema/**'
       - 'rs/ll-open/schema-bridge/**'
       - 'rs/ll-core/mcp-descriptor/**'
       - 'rs/ll-open/cli/**'
@@ -77,6 +82,9 @@ jobs:
       # schema includes that `import "/capnp/c++.capnp"` resolves against.
       - name: Install system deps
         run: task deps:capnp
+
+      - name: Verify schema crate package order
+        run: task release:crates:check
 
       # One target, not the full matrix. The failures this guards against are
       # in the SHARED logic — the staging contract, the asserted asset set, the

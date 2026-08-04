@@ -114,7 +114,7 @@ libc = { workspace = true }
 #
 # `keyring` — direct dep for the default `host` feature (post-2026-05-13
 # cycle: avoids the sigstore-verify closure that came with nono).
-# Platform features pinned per nono 0.54's verified-in-practice choices:
+# Platform features pinned per nono 0.71's verified-in-practice choices:
 # `apple-native` on macOS, `sync-secret-service` on Linux (see the
 # target-cfg sections below).
 keyring             = { version = "3", optional = true }
@@ -123,7 +123,7 @@ zeroize             = { version = "1", optional = true, features = ["alloc"] }
 # + load_secret_by_ref dispatcher for the `op://` and `apple-password://`
 # schemes. The sigstore-verify / aws-lc-rs / landlock closure flagged
 # in cloister's 2026-05-13 §17.1 is the cost of opting in.
-nono                = { version = "0.54", optional = true, default-features = false, features = ["system-keyring"] }
+nono                = { workspace = true, optional = true, features = ["system-keyring"] }
 axum                = { version = "0.7", optional = true, default-features = false, features = ["http1", "tokio", "macros", "json", "query"] }
 tokio               = { workspace = true, optional = true, features = ["rt-multi-thread", "macros", "signal", "time", "net", "sync"] }
 tower               = { version = "0.5", optional = true, default-features = false, features = ["util"] }

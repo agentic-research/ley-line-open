@@ -1,0 +1,4 @@
+# Cargo cannot package a crate whose registry dependency has not been
+# published. Keep dependency crates before their consumers.
+rs/ll-core/schema-spec/Cargo.toml
+rs/ll-core/public-schema/Cargo.toml

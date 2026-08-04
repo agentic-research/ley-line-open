@@ -10,6 +10,7 @@ use std::sync::Arc;
 use super::embed::Embedder;
 use super::enrichment::EnrichmentPass;
 use super::events::{EventEmitter, EventRouter};
+use super::execution::ExecutionHandler;
 
 /// Extension point for private daemon ops and lifecycle hooks.
 ///
@@ -19,6 +20,13 @@ use super::events::{EventEmitter, EventRouter};
 /// Lifecycle hooks let the extension spawn background tasks (receiver,
 /// inference, TCP control, etc.) without the base daemon knowing about them.
 pub trait DaemonExt: Send + Sync {
+    /// Provide the first-party execution/v1 service used by UDS, CLI, and
+    /// MCP dispatch. The default remains absent so existing consumers can
+    /// opt into runtime ownership without changing daemon construction.
+    fn execution_handler(&self) -> Option<Arc<dyn ExecutionHandler>> {
+        None
+    }
+
     /// Handle a synchronous UDS op.
     /// Return `Some(json_string)` if handled, `None` to fall through.
     fn handle_op(&self, op: &str, req: &serde_json::Value) -> Option<String> {

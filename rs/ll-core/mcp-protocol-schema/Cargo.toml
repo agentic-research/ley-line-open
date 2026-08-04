@@ -1,6 +1,6 @@
 [package]
 name = "leyline-mcp-protocol-schema"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "MCP wire-protocol facts generated at build time from a digest-pinned schema (ley-line-open-60f0d3). The digest gate fails compilation, not a test; every exported constant derives from the verified bytes."

@@ -1,6 +1,6 @@
 [package]
 name = "leyline-public-schema"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Generated Rust bindings for Leyline's public Cap'n Proto protocols"
@@ -24,4 +24,4 @@ capnpc = { workspace = true }
 # leyline-schema-spec. Referencing the build dependency's SPEC_DIR keeps one
 # schema source while remaining valid when these crates are published and
 # built outside the monorepo.
-leyline-schema-spec = { path = "../schema-spec", version = "=0.14.0" }
+leyline-schema-spec = { path = "../schema-spec", version = "=0.15.0" }

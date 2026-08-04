@@ -1,6 +1,6 @@
 [package]
 name = "leyline-mcp-descriptor"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "MCP Registry server.json emitter — validates tool/group coverage, then renders. Shared by every ART producer so the coverage invariants are not reimplemented per repo."

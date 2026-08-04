@@ -14,7 +14,10 @@ use leyline_core::ContentAddressed;
 use leyline_fs::graph::HotSwapGraph;
 
 use crate::cmd_serve;
-use crate::daemon::{DaemonContext, DaemonExt, DaemonPhase, DaemonState, EventRouter, NoExt};
+use crate::daemon::{
+    DaemonContext, DaemonExt, DaemonPhase, DaemonState, EventRouter, NoExt,
+    execution::{ExecutionDaemonExt, ExecutionHandler},
+};
 
 // ---------------------------------------------------------------------------
 // Tuning constants — extracted from the daemon orchestration so each magic
@@ -139,6 +142,10 @@ pub struct DaemonConfig {
 pub struct DaemonOptions {
     /// Activate/resume the private CDC index before the first arena snapshot.
     pub cdc: bool,
+    /// Auto-discovery symlink this daemon publishes. The execution entry
+    /// points force their own name so an execution daemon cannot silently
+    /// take over `~/.mache/default.sock` from a running substrate daemon.
+    pub discovery: crate::daemon::socket::SocketDiscovery,
 }
 
 pub async fn cmd_daemon(config: DaemonConfig) -> Result<()> {
@@ -160,6 +167,45 @@ pub async fn cmd_daemon(config: DaemonConfig) -> Result<()> {
 /// 9. Cleanup (remove socket file)
 pub async fn run_daemon(config: DaemonConfig, ext: Arc<dyn DaemonExt>) -> Result<()> {
     run_daemon_with_options(config, ext, DaemonOptions::default()).await
+}
+
+/// Run a daemon with the first-party execution/v1 surface enabled.
+///
+/// `handler` must be constructed by a trusted embedding application. In
+/// particular, rootfs/CAS resolution and backend host paths are never read
+/// from execution requests received over UDS. Existing callers that do not
+/// need execution continue to use [`run_daemon`] with [`NoExt`].
+pub async fn run_execution_daemon(
+    config: DaemonConfig,
+    handler: Arc<dyn ExecutionHandler>,
+) -> Result<()> {
+    run_execution_daemon_with_options(config, handler, DaemonOptions::default()).await
+}
+
+/// Variant of [`run_execution_daemon`] with explicit daemon options.
+pub async fn run_execution_daemon_with_options(
+    config: DaemonConfig,
+    handler: Arc<dyn ExecutionHandler>,
+    options: DaemonOptions,
+) -> Result<()> {
+    run_daemon_with_options(
+        config,
+        Arc::new(ExecutionDaemonExt::new(handler)),
+        execution_daemon_options(options),
+    )
+    .await
+}
+
+/// The execution surface always publishes under its own discovery name,
+/// whatever the caller passed. Sharing `default.sock` with the substrate
+/// daemon means whichever starts second silently steals the other's clients:
+/// every mache client that resolves the symlink then talks to the wrong
+/// daemon against the wrong arena.
+fn execution_daemon_options(options: DaemonOptions) -> DaemonOptions {
+    DaemonOptions {
+        discovery: crate::daemon::socket::SocketDiscovery::Execution,
+        ..options
+    }
 }
 
 /// Run the daemon with explicit additive behavior options.
@@ -477,7 +523,7 @@ pub async fn run_daemon_with_options(
     state.write().phase = DaemonPhase::Ready;
 
     let sock_path = ctrl_path.with_extension("sock");
-    crate::daemon::socket::spawn(ctx.clone(), sock_path.clone());
+    crate::daemon::socket::spawn(ctx.clone(), sock_path.clone(), options.discovery);
     eprintln!("daemon socket at {}", sock_path.display());
 
     // Optional MCP HTTP transport — feeds cloister gateway / any MCP client.
@@ -636,7 +682,7 @@ pub async fn run_daemon_with_options(
         let watch_source = source_dir.clone();
         let watch_emitter = router.emitter();
         tokio::spawn(async move {
-            git_watch_loop(watch_ctx, &watch_source, watch_emitter).await;
+            git_watch_loop(watch_ctx, &watch_source, watch_emitter, None).await;
         });
     }
 
@@ -1340,6 +1386,7 @@ async fn git_watch_loop(
     ctx: Arc<DaemonContext>,
     source_dir: &Path,
     emitter: crate::daemon::events::EventEmitter,
+    mut baseline_ready: Option<tokio::sync::oneshot::Sender<()>>,
 ) {
     use std::collections::HashSet;
     use tokio::time::interval;
@@ -1386,6 +1433,13 @@ async fn git_watch_loop(
                 continue;
             }
         };
+
+        // The first successful HEAD + dirty-set sample is the watcher's
+        // synchronization boundary. Production does not need a notification;
+        // tests use it instead of guessing readiness with a fixed sleep.
+        if let Some(ready) = baseline_ready.take() {
+            let _ = ready.send(());
+        }
 
         let dirty_changed = current_dirty != last_dirty;
 
@@ -2586,11 +2640,9 @@ mod tests {
     }
 
     /// Spin up a fresh git fixture + DaemonContext + RecordingExt, subscribe
-    /// to `topic`, and spawn `git_watch_loop`. Sleeps 2500ms so the watcher
-    /// has ticked once before the test makes its first observable change —
-    /// otherwise the first tick's "establish baseline" call could race with
-    /// the test's modification and miss the event. Returns a bundle the
-    /// caller can drive with arbitrary file/HEAD changes.
+    /// to `topic`, and spawn `git_watch_loop`. The watcher explicitly signals
+    /// when its first HEAD + dirty-set sample is complete, so callers cannot
+    /// race the baseline and no timing delay is needed.
     async fn start_watcher_test(topic: &str) -> WatcherTestBed {
         let repo = fixture_repo();
         let dir = TempDir::new().unwrap();
@@ -2602,11 +2654,13 @@ mod tests {
 
         let watch_ctx = ctx.clone();
         let watch_source = repo.path().to_path_buf();
+        let (baseline_tx, baseline_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            git_watch_loop(watch_ctx, &watch_source, emitter).await;
+            git_watch_loop(watch_ctx, &watch_source, emitter, Some(baseline_tx)).await;
         });
-
-        tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+        baseline_rx
+            .await
+            .expect("git watcher must publish its initial baseline");
 
         WatcherTestBed {
             repo,
@@ -2740,6 +2794,77 @@ mod tests {
         );
     }
 
+    #[derive(Default)]
+    struct RejectingExecutionHandler;
+
+    impl ExecutionHandler for RejectingExecutionHandler {
+        fn capabilities(&self) -> Result<String> {
+            anyhow::bail!("not called")
+        }
+
+        fn provision(&self, _input: &serde_json::Value) -> Result<String> {
+            anyhow::bail!("not called")
+        }
+
+        fn start(&self, _input: &serde_json::Value) -> Result<String> {
+            anyhow::bail!("not called")
+        }
+
+        fn status(&self, _input: &serde_json::Value) -> Result<String> {
+            anyhow::bail!("not called")
+        }
+
+        fn inspect(&self, _input: &serde_json::Value) -> Result<String> {
+            anyhow::bail!("not called")
+        }
+
+        fn collect(&self, _input: &serde_json::Value) -> Result<String> {
+            anyhow::bail!("not called")
+        }
+
+        fn cleanup(&self, _input: &serde_json::Value) -> Result<String> {
+            anyhow::bail!("not called")
+        }
+
+        fn cancel(&self, _input: &serde_json::Value) -> Result<String> {
+            anyhow::bail!("not called")
+        }
+    }
+
+    fn rejected_execution_config(arena: &Path) -> DaemonConfig {
+        let mut config = test_mcp_gate_config(arena, 12348);
+        config.mcp_port = Some(8384);
+        config.mcp_bind = Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        config.mcp_no_auth = true;
+        config
+    }
+
+    #[tokio::test]
+    async fn execution_daemon_entry_points_preserve_fail_fast_admission() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handler: Arc<dyn ExecutionHandler> = Arc::new(RejectingExecutionHandler);
+
+        let error = run_execution_daemon(
+            rejected_execution_config(&tmp.path().join("execution-default.arena")),
+            Arc::clone(&handler),
+        )
+        .await
+        .expect_err("execution daemon must preserve public-bind admission");
+        assert!(format!("{error:#}").contains("--mcp-allow-public"));
+
+        let error = run_execution_daemon_with_options(
+            rejected_execution_config(&tmp.path().join("execution-options.arena")),
+            handler,
+            DaemonOptions {
+                cdc: true,
+                ..DaemonOptions::default()
+            },
+        )
+        .await
+        .expect_err("execution daemon options entry point must preserve admission");
+        assert!(format!("{error:#}").contains("--mcp-allow-public"));
+    }
+
     #[tokio::test]
     async fn mcp_loopback_bind_without_allow_flag_proceeds_past_gate() {
         // Loopback bind never trips the gate regardless of the flag.
@@ -2802,5 +2927,26 @@ mod tests {
                 "gate must NOT fire when mcp_port is None; got: {msg}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod execution_discovery_tests {
+    use super::{DaemonOptions, execution_daemon_options};
+    use crate::daemon::socket::SocketDiscovery;
+
+    #[test]
+    fn execution_daemon_cannot_be_configured_onto_the_substrate_socket_name() {
+        let caller = DaemonOptions {
+            cdc: true,
+            discovery: SocketDiscovery::Substrate,
+        };
+        let effective = execution_daemon_options(caller);
+        assert_eq!(
+            effective.discovery,
+            SocketDiscovery::Execution,
+            "the execution surface must never publish default.sock"
+        );
+        assert!(effective.cdc, "unrelated caller options must survive");
     }
 }

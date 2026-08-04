@@ -3,12 +3,15 @@
 pub mod arena_lock;
 pub mod arena_owner;
 pub mod auth;
+pub mod client;
 pub mod complex_build_pass;
 pub mod db_pool;
 #[cfg(feature = "vec")]
 pub mod embed;
 pub mod enrichment;
 pub mod events;
+pub mod execution;
+pub mod execution_contract;
 pub mod ext;
 pub mod granularity_router;
 #[cfg(feature = "hdc")]
@@ -41,6 +44,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 pub use events::EventRouter;
+pub use execution::ExecutionDaemonExt;
 pub use ext::{DaemonExt, NoExt};
 
 /// Wall-clock millis since UNIX_EPOCH. Used by the daemon's `last_*_ms`

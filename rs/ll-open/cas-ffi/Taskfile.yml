@@ -12,16 +12,16 @@ version: '3'
 tasks:
   wasm:build:
     desc: Release wasm32 cdylib build of leyline-cas-ffi
-    dir: '{{.ROOT_DIR}}/rs'
+    dir: '{{.TASKFILE_DIR}}/../..'
     cmds:
       - cargo build --release -p leyline-cas-ffi --target wasm32-unknown-unknown
 
   # Same `--ignored` reasoning as sign:wasm:verify — see that task.
   wasm:verify:
     desc: Parse WASM_ARTIFACT's export section and assert the exact exported surface
-    dir: '{{.ROOT_DIR}}/rs'
+    dir: '{{.TASKFILE_DIR}}/../..'
     vars:
-      WASM_ARTIFACT: '{{.WASM_ARTIFACT | default (printf "%s/rs/target/wasm32-unknown-unknown/release/leyline_cas_ffi.wasm" .ROOT_DIR)}}'
+      WASM_ARTIFACT: '{{.WASM_ARTIFACT | default (printf "%s/../../target/wasm32-unknown-unknown/release/leyline_cas_ffi.wasm" .TASKFILE_DIR)}}'
     env:
       LEYLINE_WASM_ARTIFACT: '{{.WASM_ARTIFACT}}'
     cmds:

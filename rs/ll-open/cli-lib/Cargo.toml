@@ -52,6 +52,7 @@ leyline-schema-capnp = { path = "../../ll-core/schema-capnp" }
 # instead of hand-encoding string literals that go stale.
 leyline-mcp-protocol-schema = { path = "../../ll-core/mcp-protocol-schema" }
 leyline-public-schema = { path = "../../ll-core/public-schema" }
+leyline-runtime = { path = "../runtime" }
 leyline-core = { path = "../../ll-core/core" }
 # S1: the one RootSigner implementation, used to sign the at-rest Head.
 leyline-sign = { path = "../sign", features = ["root-signer"] }

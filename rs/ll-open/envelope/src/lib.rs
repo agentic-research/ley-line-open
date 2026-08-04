@@ -261,14 +261,43 @@ impl Subject {
         }
     }
 
+    /// Subject naming an artifact by a digest the caller already holds.
+    ///
+    /// Prefer [`Subject::sha256_of`] whenever the bytes are in hand — it
+    /// cannot produce a digest that disagrees with them. This constructor is
+    /// for digests that name something the caller has no byte string for: a
+    /// derived identity, or a remote artifact known only by digest.
+    pub fn with_digest(
+        name: impl Into<String>,
+        algorithm: impl Into<String>,
+        digest: impl Into<String>,
+    ) -> Self {
+        let mut digests = BTreeMap::new();
+        digests.insert(algorithm.into(), digest.into());
+        Self {
+            name: name.into(),
+            digest: digests,
+        }
+    }
+
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// This subject's digest under `algorithm`, if it carries one.
+    ///
+    /// The digest set is open by construction — a statement from another
+    /// producer may digest under any algorithm, and [`Subject::from_wire`]
+    /// copies the map wholesale — so reading one is a lookup, not a fixed
+    /// accessor per algorithm.
+    pub fn digest(&self, algorithm: &str) -> Option<&str> {
+        self.digest.get(algorithm).map(String::as_str)
     }
 
     /// The `sha256` digest as lowercase hex, if this subject carries one
     /// (foreign statements may digest under other algorithms).
     pub fn sha256_hex(&self) -> Option<&str> {
-        self.digest.get("sha256").map(String::as_str)
+        self.digest("sha256")
     }
 
     fn from_wire(w: SubjectWire) -> Self {
@@ -569,9 +598,9 @@ mod tests {
     /// pretty-printed "disk bytes" its vector uses.
     pub(crate) fn vector_statement() -> Statement {
         let predicate = serde_json::json!({
-            "phase": 0,
-            "from_agent": "dev-agent",
             "bead_id": "rosary-test",
+            "from_agent": "dev-agent",
+            "phase": 0,
             "summary": "Fixed the thing."
         });
         let disk = serde_json::to_vec_pretty(&predicate).expect("pretty");
@@ -1000,5 +1029,36 @@ mod tests {
         let subject = Subject::sha256_of("a", b"artifact bytes");
         assert_eq!(subject.name(), "a");
         assert_eq!(subject.sha256_hex(), Some(expected.as_str()));
+    }
+
+    /// A parsed statement may digest its subjects under an algorithm this
+    /// crate has no constructor for. `digest` reaches those; `sha256_hex` is
+    /// the sha256 special case of it and must not claim a foreign digest.
+    #[test]
+    fn subject_digest_reads_foreign_algorithms() {
+        let json = br#"{"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"issuerEvidence","digest":{"blake3":"run-0000000000000000000000000000000000000000000000000000000000000000"}}],"predicateType":"https://rosary.dev/Handoff/v1","predicate":{}}"#;
+        let statement = Statement::from_json_slice(json).expect("parse");
+        let subject = &statement.subject()[0];
+        assert_eq!(
+            subject.digest("blake3"),
+            Some("run-0000000000000000000000000000000000000000000000000000000000000000")
+        );
+        assert_eq!(subject.digest("sha256"), None);
+        assert_eq!(subject.sha256_hex(), None);
+    }
+
+    /// Digests that name something other than bytes in hand — a derived run
+    /// identity, a remote artifact — round-trip through the wire unchanged.
+    #[test]
+    fn subject_with_digest_round_trips_through_the_wire() {
+        let subject = Subject::with_digest("issuerEvidence", "blake3", "run-abc");
+        let statement = Statement::new(
+            vec![subject],
+            "https://rosary.dev/Handoff/v1",
+            serde_json::json!({}),
+        );
+        let parsed = Statement::from_json_slice(&statement.to_json_vec()).expect("parse");
+        assert_eq!(parsed.subject()[0].name(), "issuerEvidence");
+        assert_eq!(parsed.subject()[0].digest("blake3"), Some("run-abc"));
     }
 }

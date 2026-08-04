@@ -73,6 +73,9 @@ meet programmatically.
 | `urn:signet:cap:write:bead-store` | `cloister/bead-store/v1` | Read-write access (bead_create/update/close). Implies read. |
 | `urn:signet:cap:read:credential-isolation` | `cloister/credential-isolation/v1` | Vault-proxy read on configured `defaultAllowedSubs`. |
 | `urn:signet:cap:enforce:confinement` | `cloister/confinement/v1` | Kernel-confinement manifest enforcement (fs allow-list + fail-closed network + port allow-list + credential source). Bead `ley-line-open-a2f94f`. Runner-side grant — the substrate runner uses this to prove it enforced a specific `confinementDigest` at bundle-start; the bundle-side commit lives in lane-2 (workload identity). |
+| `urn:signet:cap:read:execution` | `cloister/execution/v1` | Read-only `capabilities`, `status`, and `inspect`; these operations MUST NOT provision storage or a backend. |
+| `urn:signet:cap:provision:execution` | `cloister/execution/v1` | Explicit idempotent backend/storage provisioning. Kept separate so an observer cannot create `/Volumes/krunvm` or equivalent state. |
+| `urn:signet:cap:execute:run` | `cloister/execution/v1` | Run lifecycle (`start`, `cancel`, `collect`, `cleanup`). The verified `RunGrant` further narrows this interface grant to exact content roots, operations, confinement digest, and backend class. |
 | `urn:signet:cap:sign:artifact` | `cloister/sign-helper/v1` | leyline-sign-helper (`POST /sign`) invocation grant. |
 | `urn:signet:cap:read:disclosure:<fp>` | `cloister/interlace-discovery/v1` | Per-peer disclosure-endpoint read; `<fp>` is the target peer fingerprint. |
 | n/a (substrate-internal) | `cloister/mcp-tool/v1` | `_meta.art.cloister/v1` extension on MCP `server.json`; build-time partitioning hint for the resolver, not a wire surface a cert authorizes. Authorization for invoking the resulting MCP tools belongs to each upstream tool's own capability, not to the partitioning hint itself. |

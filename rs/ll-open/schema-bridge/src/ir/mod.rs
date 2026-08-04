@@ -158,6 +158,19 @@ pub enum FieldType {
     Map(Box<FieldType>),
 }
 
+impl FieldType {
+    /// Whether JSON Schema renders this field with a `$ref`, including refs
+    /// nested below lists or maps. MCP tool inputs carrying such a field need
+    /// a local `$defs` graph to remain self-contained.
+    pub(crate) fn has_reference(&self) -> bool {
+        match self {
+            Self::StructRef(_) | Self::EnumRef(_) => true,
+            Self::List(inner) | Self::Map(inner) => inner.has_reference(),
+            Self::Scalar(_) => false,
+        }
+    }
+}
+
 // Top-level `const Name :Type = value;` declaration. The capnp parser
 // surfaces these alongside structs/enums; the zod emitter writes them
 // as `export const Name = <literal> as const;` so consumers get

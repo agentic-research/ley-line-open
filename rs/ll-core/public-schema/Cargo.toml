@@ -3,6 +3,9 @@ name = "leyline-public-schema"
 version = "0.14.0"
 edition = "2024"
 license = "Apache-2.0"
+description = "Generated Rust bindings for Leyline's public Cap'n Proto protocols"
+repository = "https://github.com/agentic-research/ley-line-open"
+readme = "README.md"
 
 [dependencies]
 # ADR-0014 §3 — exact-pin declared in workspace (matches schema-capnp, cli-lib, lsp).
@@ -17,3 +20,8 @@ capnp-json = { workspace = true }
 [build-dependencies]
 # ADR-0014 §3 — exact-pin declared in workspace (matches schema-capnp).
 capnpc = { workspace = true }
+# The normative execution/v1 IDL and shared annotations are package data in
+# leyline-schema-spec. Referencing the build dependency's SPEC_DIR keeps one
+# schema source while remaining valid when these crates are published and
+# built outside the monorepo.
+leyline-schema-spec = { path = "../schema-spec", version = "=0.14.0" }

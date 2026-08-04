@@ -1,0 +1,36 @@
+# cargo-mutants adjudication.
+#
+# This file records mutants that survive for a reason OTHER than missing test
+# coverage. It is deliberately hard to add to: a surviving mutant is a missing
+# assertion until proven otherwise, and "proven otherwise" means the entry
+# below states why no test could ever kill it.
+#
+# It is not an ignore list. Nothing here is "we'll get to it" — that belongs in
+# a bead with the gate left red. Every entry must be an EQUIVALENT MUTANT: a
+# mutation that produces a program behaviourally indistinguishable from the
+# original, so there is no observable difference for a test to assert on.
+#
+# Adding an entry that is merely inconvenient to test defeats the gate. The
+# three other survivors found on this branch were all "inconvenient to test" —
+# a `setpgid` that will not fail, an `EINTR` that cannot be scheduled — and
+# each was fixed by making the failure injectable
+# (`configure_process_group_with`, `retry_while_interrupted`) rather than
+# listed here.
+
+exclude_re = [
+    # `observe_exit` passes `libc::WEXITED | libc::WNOWAIT` to `waitid`.
+    #
+    # Those two constants are disjoint bit flags — on Linux 0x00000004 and
+    # 0x01000000, on macOS 0x00000004 and 0x00000020 — and for operands with
+    # no bits in common, `a | b` and `a ^ b` produce the identical integer.
+    # The mutated program is therefore not merely hard to distinguish from the
+    # original; it is the same program, and passes the same flags to the same
+    # syscall.
+    #
+    # No restructuring changes this. Hoisting the expression to a `const` only
+    # relocates the mutant, and writing it as `WEXITED + WNOWAIT` would trade a
+    # true statement for one that silently breaks the day the flags overlap.
+    # The bitwise-or is the correct expression; the mutation operator simply
+    # has no semantic target here.
+    'process\.rs.*replace \| with \^ in observe_exit',
+]

@@ -22,12 +22,17 @@
 set -eu
 
 DIFF=${1:?usage: mutants_diff.sh <diff-file>}
+SCOPE=${2:-all}
 test -f "$DIFF" || { echo "DIFF file not found: $DIFF" >&2; exit 1; }
+case "$SCOPE" in
+    all|runtime|cli) ;;
+    *) echo "unknown mutation scope: $SCOPE (expected all, runtime, or cli)" >&2; exit 1 ;;
+esac
 
 # Decided from the diff itself, not from cargo-mutants' output, so "did this
 # change Rust?" and "did enumeration work?" stay independent questions. Folding
 # them together is what makes the misconfigured case look like the skipped one.
-if ! grep -qE '^\+\+\+ b/.*\.rs$' "$DIFF"; then
+if ! grep -qE '^--- a/.*\.rs$|^\+\+\+ b/.*\.rs$' "$DIFF"; then
     echo "SKIPPED: this diff changes no Rust source, so there is nothing to"
     echo "         mutate. This is NOT a pass — no mutation testing ran."
     exit 0
@@ -93,51 +98,93 @@ EOF
     exit 0
 fi
 
+if [ "$SCOPE" != all ]; then
+    case "$SCOPE" in
+        runtime) scope_prefix='ll-open/runtime' ;;
+        cli) scope_prefix='ll-open/cli-lib' ;;
+    esac
+    scope_n=$(printf '%s\n' "$listing" | grep -cE "^$scope_prefix/.*:[0-9]+:[0-9]+:" || true)
+    if [ "${scope_n:-0}" -eq 0 ]; then
+        {
+            echo "MISCONFIGURED: mutation scope '$SCOPE' enumerated zero candidates"
+            echo "               from that package. Mutants in another changed package"
+            echo "               cannot make this focused run pass."
+        } >&2
+        exit 1
+    fi
+fi
+
 echo "mutating $n candidate(s) from the diff"
 
-# `--test-workspace=false`: each mutant is tested by its OWN crate's suite,
-# lib and integration alike, rather than by the whole workspace's.
+# The generic slice uses `-C --lib`: cargo-mutants builds in a scratch copy, so
+# any test reading repo files outside its own crate fails there and takes the
+# whole run with it. mcp-descriptor's schema_conformance does exactly that
+# (vendored schema, committed server.json, `git ls-files`), and it is right to —
+# those assertions are about the repo, not the crate.
 #
-# This replaces a blanket `-C --lib` (`ley-line-open-7675fe`). The problem
-# `-C --lib` solved is real: cargo-mutants builds in a scratch copy, and a test
-# reading repo files outside its crate fails there and takes the run with it.
-# But it solved that by never running ANY integration test, which made the gate
-# structurally blind to crates whose assertions live in `tests/` — and, worse,
-# made it report them as failures. schema-bridge has no `#[cfg(test)]` module at
-# all, so the gate called all 7 of its mutants MISSED while
-# `tests/doc_projection.rs` kills every one of them.
-#
-# Measured per crate, in the scratch tree, own-tests-only:
-#
-#   leyline-mcp-descriptor   baseline FAILED (exit 4)  -> needs `-C --lib`
-#   leyline-fs               baseline FAILED (exit 4)  -> needs `-C --lib`
-#   leyline-schema-bridge    ok — 7/7 caught
-#   leyline-schema-capnp     ok
-#
-# So the workaround is scoped to the two crates that measurably need it instead
-# of taxing every crate that does not. Per-crate testing is also what keeps a
-# broken baseline local: under `--test-workspace=true` mcp-descriptor's tests
-# run for every mutant in the workspace, so one unrunnable crate breaks the
-# baseline for all of them.
-#
-# NARROWER IN ONE DIRECTION, stated rather than hidden: a mutant whose only
-# killer lives in a DIFFERENT crate's tests is now reported missed. That is a
-# real trade for no longer missing every integration test in the mutant's own
-# crate, which is where this repo keeps most of its assertions.
+# Runtime and CLI-library behavior is intentionally tested through public
+# integration tests, however. Running those packages through the generic slice
+# made every forwarding and lifecycle mutant survive without executing its
+# actual contract tests. They therefore get package-specific slices without
+# `--lib`; the generic slice excludes them so each mutant is evaluated once.
 #
 # `-E 'replace main'`: a binary's `main` is killed by subprocess tests
-# (mcp-descriptor's tests/cli.rs asserts exit codes and stdout), which the
-# `-C --lib` slices exclude by construction. Reporting it missed is TRUE but
-# would fail every PR touching any main.rs, and a gate people learn to ignore
-# has already failed.
+# (mcp-descriptor's tests/cli.rs asserts exit codes and stdout), which `-C --lib`
+# excludes by construction. Reporting it missed is TRUE but would fail every PR
+# touching any main.rs, and a gate people learn to ignore has already failed.
 #
 # Exit 4 is not "a mutant survived" — it is "the baseline suite failed in the
 # scratch tree", so nothing was tested. They need opposite fixes: one is a
 # missing test, the other is a test that cannot run here.
+# Packages the generic slice excludes. Each MUST be claimed by a slice of its
+# own below. A package that is excluded here and covered nowhere would let a
+# diff touching only that package enumerate mutants (so the MISCONFIGURED
+# check above passes), run the generic slice that skips it, match no other
+# slice, and exit 0 having evaluated nothing — the exact false green this
+# script exists to prevent. `assert_excluded_packages_were_covered` enforces
+# the pairing instead of trusting whoever edits the exclude list next.
+# Overridable ONLY so tools/test_mutants_diff.sh can prove the pairing check
+# actually fires; production callers must never set it.
+GENERIC_EXCLUDES=${MUTANTS_GENERIC_EXCLUDES:-'ll-open/fs ll-open/runtime ll-open/cli-lib ll-open/cli ll-open/schema-bridge'}
+
 overall=0
+ran_slice=0
+covered_packages=''
+claim_package() {
+    covered_packages="$covered_packages $1"
+}
+
+package_changed_in_diff() {
+    grep -qE "^--- a/$1/.*\.rs\$|^\+\+\+ b/$1/.*\.rs\$" "$DIFF"
+}
+
+assert_excluded_packages_were_covered() {
+    for package in $GENERIC_EXCLUDES; do
+        package_changed_in_diff "$package" || continue
+        case " $covered_packages " in
+            *" $package "*) continue ;;
+        esac
+        {
+            echo "MISCONFIGURED: the diff changes $package, which the generic"
+            echo "               slice excludes and no package slice covers."
+            echo "               Nothing mutated it. Add a slice for that"
+            echo "               package or stop excluding it — do not let this"
+            echo "               exit 0."
+        } >&2
+        exit 1
+    done
+}
+
 run_slice() {
+    mode=$1
+    shift
+    ran_slice=1
     set +e
-    cargo mutants --in-diff "$DIFF" -E 'replace main' --test-workspace=false "$@"
+    if [ "$mode" = lib ]; then
+        cargo mutants --in-diff "$DIFF" -C --lib -E 'replace main' "$@"
+    else
+        cargo mutants --in-diff "$DIFF" -E 'replace main' "$@"
+    fi
     rc=$?
     set -e
     if [ "$rc" -eq 4 ]; then
@@ -149,9 +196,18 @@ run_slice() {
         } >&2
         exit 4
     fi
-    # Exit 3 = timeouts only — the allowlist tasks' stance applies here too:
-    # a mutant the harness had to STOP is detected, not missed. Exit 2
-    # (genuinely missed mutants) is what fails the gate.
+    # cargo-mutants returns exit 3 whenever any mutant times out, even when
+    # other mutants also survived. Its report is therefore authoritative over
+    # that ambiguous exit code: a non-empty missed.txt must fail the gate.
+    if [ -s mutants.out/missed.txt ]; then
+        missed=$(wc -l < mutants.out/missed.txt | tr -d ' ')
+        echo "MISSED: $missed surviving mutant(s) in this slice" >&2
+        overall=2
+        return 0
+    fi
+    # Exit 3 with an empty survivor report means timeouts only. The allowlist
+    # tasks' stance applies here too: a mutant the harness had to STOP is
+    # detected, not missed.
     if [ "$rc" -eq 3 ]; then
         echo "TIMEOUT(s) only in this slice — stopped mutants count as detected"
         return 0
@@ -171,17 +227,73 @@ run_slice() {
 # `mutants:fs`/`mutants:fs-gc`. If another crate ever hides covered code
 # behind non-default features, it needs the same routing — a default-features
 # run structurally cannot test it.
-run_slice --exclude 'll-open/fs/**' --exclude 'll-core/mcp-descriptor/**'
-if grep -qE '^\+\+\+ b/ll-open/fs/.*\.rs$' "$DIFF"; then
-    run_slice --package leyline-fs -C --lib \
+if [ "$SCOPE" = all ]; then
+    run_slice lib \
+        --exclude 'll-open/fs/**' \
+        --exclude 'll-open/runtime/**' \
+        --exclude 'll-open/cli-lib/**' \
+        --exclude 'll-open/cli/**' \
+        --exclude 'll-open/schema-bridge/**'
+fi
+
+# schema-bridge is the same case runtime and cli-lib are, in its purest form:
+# it has no `#[cfg(test)]` module ANYWHERE. Every assertion about the emitters
+# lives in `tests/` — `doc_projection.rs`, `execution_v1.rs`, `map_field.rs`
+# and the rest — so the lib-only generic slice ran zero of them and reported
+# every emitter mutant as missed. It failed this PR for 7 of them, `write_doc`
+# among them, each one killed outright by `tests/doc_projection.rs`.
+#
+# `--test-workspace=false` keeps that from costing anything: the crate's own
+# suite is what runs, so no other crate's tests can break this baseline.
+if [ "$SCOPE" = all ] && package_changed_in_diff ll-open/schema-bridge; then
+    claim_package ll-open/schema-bridge
+    run_slice integration --package leyline-schema-bridge --test-workspace=false
+fi
+
+if [ "$SCOPE" = all ] || [ "$SCOPE" = runtime ]; then
+  if package_changed_in_diff ll-open/runtime; then
+    claim_package ll-open/runtime
+    run_slice integration --package leyline-runtime --test-workspace=false
+  fi
+fi
+
+if [ "$SCOPE" = all ] || [ "$SCOPE" = cli ]; then
+  if package_changed_in_diff ll-open/cli-lib; then
+    claim_package ll-open/cli-lib
+    run_slice integration \
+        -C --lib \
+        -C --test -C execution_client \
+        -C --test -C execution_transport \
+        --package leyline-cli-lib --test-workspace=false
+  fi
+fi
+
+if [ "$SCOPE" = all ] && package_changed_in_diff ll-open/fs; then
+    claim_package ll-open/fs
+    run_slice lib --package leyline-fs --test-workspace=false \
         --no-default-features --features cdc,splice,validate
 fi
-# Its `schema_conformance` reads the vendored schema, the committed server.json
-# and `git ls-files` — assertions about the repo, not the crate, and right to
-# be. They cannot run in a scratch copy with no `.git`, so this crate is the
-# one that keeps the lib-only restriction.
-if grep -qE '^\+\+\+ b/ll-core/mcp-descriptor/.*\.rs$' "$DIFF"; then
-    run_slice --package leyline-mcp-descriptor -C --lib
+
+# `ll-open/cli` is the thin clap binary: its only mutant is `replace main`,
+# which `-E` excludes because subprocess tests, not lib tests, kill it. It is
+# claimed here so the pairing check stays honest — the moment that crate grows
+# a mutable helper, the claim is a lie and the exclude list needs a real slice.
+if package_changed_in_diff ll-open/cli; then
+    claim_package ll-open/cli
+    echo "NOTE: ll-open/cli carries only 'replace main', which -E excludes;"
+    echo "      its behavior is gated by leyline-cli-lib's slice."
+fi
+
+if [ "$SCOPE" = all ]; then
+    assert_excluded_packages_were_covered
+fi
+
+if [ "$SCOPE" != all ] && [ "$ran_slice" -eq 0 ]; then
+    {
+        echo "MISCONFIGURED: mutation scope '$SCOPE' matched no changed Rust package"
+        echo "               and therefore ran no mutation slice. This is not a pass."
+    } >&2
+    exit 1
 fi
 
 exit "$overall"

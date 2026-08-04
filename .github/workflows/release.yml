@@ -125,6 +125,14 @@ jobs:
       - name: Install system deps
         run: task deps:capnp
 
+      # Cargo requires a registry dependency to exist before packaging its
+      # consumer. The linux-amd64 leg proves schema-spec is a complete first
+      # package and appears before public-schema in the release graph; no
+      # registry credential is needed for this check.
+      - name: Verify schema crate package order
+        if: matrix.asset == 'leyline-linux-amd64'
+        run: task release:crates:check
+
       # SHA-pinned: actions/cache@v6.1.0 (Node 24).
       - name: Restore target compiler cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9

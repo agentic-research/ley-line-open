@@ -4657,6 +4657,7 @@ name = "leyline-schema-spec"
 version = "0.14.0"
 dependencies = [
  "blake3",
+ "jsonschema",
  "serde_json",
  "sha2 0.11.0",
 ]

@@ -98,7 +98,24 @@ fn union_has_void_variant(u: &Union) -> bool {
         .any(|v| matches!(v.ty, FieldType::Scalar(ScalarType::Void)))
 }
 
+/// Write `doc` as a Go line comment at `indent`, or nothing when absent.
+///
+/// `//` rather than `/* */` because godoc only associates line comments
+/// directly above a declaration with it, and an unassociated comment is prose
+/// that no tool surfaces. Absence emits nothing: an empty comment is noise a
+/// reader learns to skip, which is how a real one later gets skipped too
+/// (bead `ley-line-open-d554a0`).
+fn write_doc(out: &mut String, indent: &str, doc: Option<&str>) {
+    let Some(doc) = doc else {
+        return;
+    };
+    for line in doc.lines() {
+        writeln!(out, "{indent}// {line}").expect("write! to String is infallible");
+    }
+}
+
 fn emit_enum(out: &mut String, e: &Enum) {
+    write_doc(out, "", e.doc.as_deref());
     // Blank line between `type X string` and `const (…)` matches
     // gofmt — the rest of gofmt's alignment work (column padding
     // within const/struct blocks) is delegated to gofmt itself in
@@ -147,8 +164,10 @@ fn emit_struct(out: &mut String, s: &Struct) -> Result<()> {
         }
     }
 
+    write_doc(out, "", s.doc.as_deref());
     writeln!(out, "type {name} struct {{", name = s.name).expect("write! to String is infallible");
     for field in &s.fields {
+        write_doc(out, "\t", field.doc.as_deref());
         writeln!(
             out,
             "\t{field_name} {ty} `json:\"{wire}\"`",

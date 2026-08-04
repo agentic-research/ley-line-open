@@ -451,3 +451,56 @@ fn every_socket_mode_round_trips_through_its_one_spelling() {
         );
     }
 }
+
+/// The mode predicates decide both §6 refusals, so they are load-bearing on
+/// every platform even though the compile path they feed is macOS-only. CI runs
+/// on Linux, where §6 refuses at the top for the ABI reason and the per-grant
+/// logic is never reached — which left `permits_bind`, `permits_connect` and
+/// both refusal conditions unexercised there. cargo-mutants found exactly that:
+/// seven survivors, all reachable only through a platform branch.
+///
+/// Asserting the predicates directly is platform-independent, so it closes the
+/// gap without pretending the compile path is portable.
+#[test]
+fn the_mode_predicates_answer_for_each_mode_on_every_platform() {
+    let connect = UnixSocketGrant::connect("/run/llo/a.sock");
+    let bind = UnixSocketGrant::bind("/run/llo/b.sock");
+    let connect_bind = UnixSocketGrant::connect_bind("/run/llo/c.sock");
+
+    // permits_bind: false only for connect. A mutant returning a constant
+    // either widens connect into a bind grant or strips bind from the two
+    // modes that have it — both are policy changes, not refactors.
+    assert!(!connect.permits_bind(), "connect must not permit bind(2)");
+    assert!(bind.permits_bind(), "bind must permit bind(2)");
+    assert!(
+        connect_bind.permits_bind(),
+        "connect-bind must permit bind(2)"
+    );
+
+    // permits_connect: false only for bind. This is the predicate the
+    // serve-without-dial refusal reads, so a constant here either lets `bind`
+    // compile as a dial grant or refuses the two modes that legitimately dial.
+    assert!(connect.permits_connect(), "connect must permit connect(2)");
+    assert!(
+        !bind.permits_connect(),
+        "bind withholds connect(2) — that is the whole mode"
+    );
+    assert!(
+        connect_bind.permits_connect(),
+        "connect-bind must permit connect(2)"
+    );
+
+    // The two predicates must not collapse into one. If they ever agree on
+    // every mode, one of them is redundant and the refusals lose a distinction.
+    assert_ne!(
+        bind.permits_bind(),
+        bind.permits_connect(),
+        "bind is precisely where the two predicates disagree"
+    );
+
+    // And the wire spelling each mode reports, since `mode()` is the single
+    // source consulted by canonical bytes, the schema and every diagnostic.
+    assert_eq!(connect.mode(), "connect");
+    assert_eq!(bind.mode(), "bind");
+    assert_eq!(connect_bind.mode(), "connect-bind");
+}

@@ -265,3 +265,76 @@ fn a_manifest_declaring_no_listener_grants_no_port() {
     assert!(without.localhost_ports().is_empty());
     assert!(without.tcp_bind_ports().is_empty());
 }
+
+/// The boundaries themselves, because cargo-mutants showed the comparisons were
+/// unobserved: `replace < with <=` in `with_port_bind` and `replace > with >=`
+/// in `with_credential_source` both survived. A test that only tries 80 and
+/// 8443 never distinguishes `< 1024` from `<= 1024`.
+#[test]
+fn the_refusal_boundaries_are_exactly_where_the_spec_puts_them() {
+    // §4: 1024 is the first permitted port, 1023 the last refused one.
+    assert!(
+        ConfinementManifest::new()
+            .with_port_bind(1023, None)
+            .is_err(),
+        "1023 is privileged and must be refused"
+    );
+    assert!(
+        ConfinementManifest::new()
+            .with_port_bind(1024, None)
+            .is_ok(),
+        "1024 is the spec's minimum and must be permitted"
+    );
+    assert!(
+        ConfinementManifest::new()
+            .with_port_bind(u16::MAX, None)
+            .is_ok(),
+        "65535 is the spec's maximum and must be permitted"
+    );
+
+    // §5: the scheme must be followed by something. A bare scheme names no
+    // vault, and `>` vs `>=` on the length check is exactly that distinction.
+    assert!(
+        ConfinementManifest::new()
+            .with_credential_source("keychain://")
+            .is_err(),
+        "a scheme with an empty remainder names no vault"
+    );
+    assert!(
+        ConfinementManifest::new()
+            .with_credential_source("keychain://x")
+            .is_ok(),
+        "one character of remainder is a vault reference"
+    );
+}
+
+/// `allowed_hosts` is read by the compiler to decide §3's refusal, so a mutant
+/// replacing the accessor must not survive. Three of them did.
+#[test]
+fn the_hosts_accessor_reports_what_was_declared() {
+    let manifest = ConfinementManifest::new()
+        .with_allowed_host("api.example.com")
+        .expect("valid host")
+        .with_allowed_host("*.telemetry.example.com")
+        .expect("valid wildcard");
+
+    // Both the accessor and the destructured view, because they are separate
+    // code paths and cargo-mutants killed neither when only one was asserted.
+    assert_eq!(
+        manifest.allowed_hosts(),
+        ["api.example.com", "*.telemetry.example.com"],
+        "the compiler decides §3 from this; a wrong answer here is a wrong policy"
+    );
+    assert_eq!(
+        manifest.dimensions().allow_hosts,
+        manifest.allowed_hosts(),
+        "the destructured view and the accessor must agree"
+    );
+    assert!(
+        ConfinementManifest::new()
+            .dimensions()
+            .allow_hosts
+            .is_empty(),
+        "an undeclared §3 must read as empty, not as a phantom grant"
+    );
+}

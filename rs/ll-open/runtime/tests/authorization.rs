@@ -172,6 +172,8 @@ struct GrantFixture<'a> {
     wall_time_ms: u64,
     confinement_algorithm: &'a str,
     confinement_value: &'a str,
+    /// The confinement/v1 document the grant carries, if any.
+    confinement_manifest: &'a str,
     workspaces: Vec<(&'a str, &'a str, Vec<execution_capnp::WorkspaceOperation>)>,
     evidence: EvidenceFixture<'a>,
     /// Issuer that signs the finished grant; `None` leaves it unsigned.
@@ -191,6 +193,7 @@ fn grant_bytes(spec_bytes: &[u8], capability: bool, expires_at: u64, wall_time_m
             expires_at,
             wall_time_ms,
             confinement_algorithm: "blake3-256",
+            confinement_manifest: "",
             confinement_value: &confinement_value,
             workspaces: Vec::new(),
             evidence: EvidenceFixture::Placeholder,
@@ -224,6 +227,11 @@ fn grant_bytes_with_fixture(spec_bytes: &[u8], fixture: GrantFixture<'_>) -> Vec
     let mut confinement = grant.reborrow().init_confinement_digest();
     confinement.set_algorithm(fixture.confinement_algorithm);
     confinement.set_value(fixture.confinement_value);
+    if !fixture.confinement_manifest.is_empty() {
+        grant
+            .reborrow()
+            .set_confinement_manifest(fixture.confinement_manifest);
+    }
     if fixture.wall_time_ms != 0 {
         grant
             .reborrow()
@@ -359,6 +367,7 @@ fn execution_capability_requires_both_grant_and_interface() {
                 expires_at: 2_000,
                 wall_time_ms: 0,
                 confinement_algorithm: "blake3-256",
+                confinement_manifest: "",
                 confinement_value: &confinement,
                 workspaces: Vec::new(),
                 evidence: EvidenceFixture::Placeholder,
@@ -398,6 +407,7 @@ fn digest_validation_rejects_each_malformed_component_independently() {
                 expires_at: 2_000,
                 wall_time_ms: 0,
                 confinement_algorithm: algorithm,
+                confinement_manifest: "",
                 confinement_value: value,
                 workspaces: Vec::new(),
                 evidence: EvidenceFixture::Placeholder,
@@ -716,6 +726,7 @@ fn one_trusted_envelope_cannot_satisfy_every_evidence_field() {
             expires_at: 2_000,
             wall_time_ms: 0,
             confinement_algorithm: "blake3-256",
+            confinement_manifest: "",
             confinement_value: &confinement,
             workspaces: Vec::new(),
             evidence: EvidenceFixture::SharedInToto(&hex),
@@ -764,6 +775,7 @@ fn evidence_asserting_every_role_for_this_run_authorizes_it() {
             expires_at: 2_000,
             wall_time_ms: 0,
             confinement_algorithm: "blake3-256",
+            confinement_manifest: "",
             confinement_value: &confinement,
             workspaces: Vec::new(),
             evidence: EvidenceFixture::SharedInToto(&hex),
@@ -867,6 +879,7 @@ fn workspace_grants_require_exact_identity_cardinality_and_unique_names() {
             expires_at: 2_000,
             wall_time_ms: 0,
             confinement_algorithm: "blake3-256",
+            confinement_manifest: "",
             confinement_value: &confinement,
             workspaces: vec![("repo", &"a".repeat(64), read.clone())],
             evidence: EvidenceFixture::Placeholder,
@@ -883,6 +896,7 @@ fn workspace_grants_require_exact_identity_cardinality_and_unique_names() {
             expires_at: 2_000,
             wall_time_ms: 0,
             confinement_algorithm: "blake3-256",
+            confinement_manifest: "",
             confinement_value: &confinement,
             workspaces: vec![
                 ("repo", &"a".repeat(64), read.clone()),
@@ -903,6 +917,7 @@ fn workspace_grants_require_exact_identity_cardinality_and_unique_names() {
             expires_at: 2_000,
             wall_time_ms: 0,
             confinement_algorithm: "blake3-256",
+            confinement_manifest: "",
             confinement_value: &confinement,
             workspaces: vec![("repo", &"c".repeat(64), read.clone())],
             evidence: EvidenceFixture::Placeholder,
@@ -925,6 +940,7 @@ fn workspace_grants_require_exact_identity_cardinality_and_unique_names() {
             expires_at: 2_000,
             wall_time_ms: 0,
             confinement_algorithm: "blake3-256",
+            confinement_manifest: "",
             confinement_value: &confinement,
             workspaces: vec![
                 ("repo", &"a".repeat(64), read.clone()),
@@ -1396,6 +1412,7 @@ fn signed_grant_fixture<'a>(
             expires_at,
             wall_time_ms: 0,
             confinement_algorithm: "blake3-256",
+            confinement_manifest: "",
             confinement_value: confinement,
             workspaces: Vec::new(),
             evidence: EvidenceFixture::SharedInToto(evidence_hex),
@@ -1676,6 +1693,7 @@ fn a_memory_ceiling_the_native_tier_cannot_enforce_is_rejected() {
             expires_at: 2_000,
             wall_time_ms: 0,
             confinement_algorithm: "blake3-256",
+            confinement_manifest: "",
             confinement_value: &confinement,
             workspaces: Vec::new(),
             evidence: EvidenceFixture::Placeholder,
@@ -1747,56 +1765,117 @@ fn the_same_ceiling_is_accepted_by_the_tier_that_enforces_it() {
         .expect("a hypervisor-enforced ceiling must be accepted, not rejected");
 }
 
-/// A grant may carry the confinement document its digest was taken over — and
-/// if it does, the two must describe the same policy.
+/// A grant carrying a confinement document must have it agree with the digest.
 ///
-/// Carrying the digest alone let an issuer commit to a policy the runner could
-/// never obtain: a runner could verify that what it applied matched, and never
-/// learn what was actually authorized. That is why §4 had no route to originate
-/// from a grant at all.
+/// cargo-mutants found this untested: `replace != with ==` in
+/// `authorize_with_verifier` survived, meaning nothing observed whether the
+/// carried document and the named digest were compared at all. The earlier test
+/// exercised the manifest type and never the grant path — coverage of the parts
+/// reading as coverage of the mechanism.
 ///
-/// The mismatch case is the load-bearing one. Without it the field would be
-/// decoration — a grant could name policy A by digest and carry policy B, and a
-/// runner reading the carried document would enforce something the issuer never
-/// authorized while the digest check still passed.
+/// Both directions, because only the pair pins the comparison: a matching
+/// document must be ACCEPTED and carried through, and a mismatching one must be
+/// refused. With only the refusal, `== ` would still fail the accept case; with
+/// only the accept, `==` would pass both.
 #[test]
-fn a_carried_confinement_manifest_must_digest_to_the_named_digest() {
+fn a_carried_confinement_manifest_is_verified_against_its_digest() {
     use leyline_runtime::confinement::{ConfinementManifest, FsGrant};
 
     let policy = ConfinementManifest::new()
         .with_fs_grant(FsGrant::read_write("/run/rootfs/"))
-        .expect("valid grant")
-        .with_port_bind(8443, None)
-        .expect("valid port");
+        .expect("valid grant");
     let document = policy.to_canonical_json().expect("canonical");
     let digest = policy.confinement_digest().expect("digest");
+    let value = digest
+        .strip_prefix("blake3-256:")
+        .expect("algorithm-prefixed digest")
+        .to_owned();
 
-    // Self-consistent: the digest names exactly the carried document.
-    let (algorithm, value) = digest.split_once(':').expect("algorithm-prefixed digest");
-    assert_eq!(algorithm, "blake3-256");
-    assert_eq!(value.len(), 64);
-
-    // And a document that does NOT match its named digest must be refused, or
-    // the field is worse than absent: it would be an authorization statement
-    // nothing checks.
-    let other = ConfinementManifest::new()
-        .with_fs_grant(FsGrant::read_only("/etc/hosts"))
-        .expect("valid grant");
-    assert_ne!(
-        other.confinement_digest().expect("other digest"),
-        digest,
-        "the fixture policies must differ, or this proves nothing"
+    // Agreeing: accepted, and the document reaches the authorized execution.
+    let spec = spec_bytes();
+    let grant = grant_bytes_with_fixture(
+        &spec,
+        GrantFixture {
+            capability: Some((EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION)),
+            expires_at: 2_000,
+            wall_time_ms: 0,
+            confinement_algorithm: "blake3-256",
+            confinement_manifest: &document,
+            confinement_value: &value,
+            workspaces: Vec::new(),
+            evidence: EvidenceFixture::Placeholder,
+            signer: None,
+            backend_class: execution_capnp::BackendClass::MicroVm,
+        },
+    );
+    let authorized = authorize(
+        &spec,
+        &grant,
+        &AuthorizationPolicy {
+            now_unix_ms: Some(1_000),
+            required_backend: BackendClass::MicroVm,
+            required_confinement_digest: None,
+        },
+    )
+    .expect("a grant whose carried manifest matches its digest must authorize");
+    assert_eq!(
+        authorized.confinement_manifest.as_deref(),
+        Some(document.as_str()),
+        "the carried policy must reach the runner, or the field is write-only"
     );
 
-    // The parse path applies §2-§5 refusals, so a schema-invalid policy cannot
-    // ride in on a correct digest.
-    assert!(
-        ConfinementManifest::parse(&document).is_ok(),
-        "a conformant document must parse"
+    // Disagreeing: refused. The digest names a different policy.
+    let other = "c".repeat(64);
+    let mismatched = grant_bytes_with_fixture(
+        &spec,
+        GrantFixture {
+            capability: Some((EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION)),
+            expires_at: 2_000,
+            wall_time_ms: 0,
+            confinement_algorithm: "blake3-256",
+            confinement_manifest: &document,
+            confinement_value: &other,
+            workspaces: Vec::new(),
+            evidence: EvidenceFixture::Placeholder,
+            signer: None,
+            backend_class: execution_capnp::BackendClass::MicroVm,
+        },
     );
+    let error = authorize(
+        &spec,
+        &mismatched,
+        &AuthorizationPolicy {
+            now_unix_ms: Some(1_000),
+            required_backend: BackendClass::MicroVm,
+            required_confinement_digest: None,
+        },
+    )
+    .expect_err("a carried manifest that does not match its digest must be refused");
     assert!(
-        ConfinementManifest::parse(r#"{"version":"cloister/confinement/v1","port":{"bind":80}}"#)
-            .is_err(),
-        "a schema-invalid policy must not parse even with a valid version"
+        format!("{error:?}").contains("confinementDigest names"),
+        "the refusal must show both digests so an operator sees which \
+         disagreed: {error:?}"
+    );
+}
+
+/// Absence is a distinct, legitimate state: the issuer committed by digest
+/// alone. It must authorize, and must not invent a document.
+#[test]
+fn a_grant_may_commit_by_digest_alone() {
+    let spec = spec_bytes();
+    let grant = grant_bytes(&spec, true, 2_000, 0);
+    let authorized = authorize(
+        &spec,
+        &grant,
+        &AuthorizationPolicy {
+            now_unix_ms: Some(1_000),
+            required_backend: BackendClass::MicroVm,
+            required_confinement_digest: None,
+        },
+    )
+    .expect("a digest-only grant must authorize");
+    assert!(
+        authorized.confinement_manifest.is_none(),
+        "no document was carried, so none may be reported"
     );
 }

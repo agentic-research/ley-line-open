@@ -138,3 +138,72 @@ fn narrowing_the_enforced_policy_is_refused_too() {
         "the commitment is an equality, not an upper bound"
     );
 }
+
+/// Finding 2's other half: the backend must declare the digest of the policy
+/// it *actually compiles*, not a digest handed to it.
+///
+/// `build_process_capabilities` used to construct a `nono::CapabilitySet`
+/// directly from paths, so there was no manifest, no digest, and nothing the
+/// grant's `confinementDigest` could be compared against. ADR-0035 §1 makes
+/// the manifest the single declaration that both the applied CapabilitySet
+/// and the declared digest are projections of — which is only true if the
+/// manifest is the input to the CapabilitySet, not a description written
+/// beside it.
+///
+/// This asserts the manifest names exactly what the backend was asked to
+/// grant. If the two could be edited independently, the receipt would attest
+/// a policy nobody applied.
+#[test]
+fn the_declared_manifest_names_exactly_what_the_backend_compiles() {
+    let manifest = leyline_runtime::backends::libkrun::confinement::confinement_manifest(
+        std::path::Path::new("/run/llo/rootfs-a"),
+        &[std::path::PathBuf::from("/usr/lib/libkrun.dylib")],
+        &[std::path::PathBuf::from("/dev/kvm")],
+    );
+
+    let granted: Vec<&str> = manifest.fs_grants().iter().map(FsGrant::path).collect();
+    assert_eq!(
+        granted,
+        vec![
+            // The rootfs is the one writable tree, and the trailing slash is
+            // what marks it a directory subtree rather than a single file.
+            "/run/llo/rootfs-a/",
+            "/usr/lib/libkrun.dylib",
+            "/dev/kvm",
+        ],
+        "the manifest must name exactly the paths the backend grants"
+    );
+
+    // No egress: confinement/v1 §3 makes an omitted `network` block "no
+    // egress at all", which is what `block_network()` does.
+    assert!(
+        !manifest
+            .to_canonical_json()
+            .expect("canonical")
+            .contains("allowHosts"),
+        "a policy that blocks the network must not declare allowed hosts"
+    );
+}
+
+/// The declared digest must move when the compiled policy moves. A digest
+/// that stayed constant across different policies would satisfy any
+/// commitment, which is the failure the whole mechanism exists to prevent.
+#[test]
+fn a_different_compiled_policy_yields_a_different_declared_digest() {
+    let a = leyline_runtime::backends::libkrun::confinement::confinement_manifest(
+        std::path::Path::new("/run/llo/rootfs-a"),
+        &[],
+        &[],
+    );
+    let b = leyline_runtime::backends::libkrun::confinement::confinement_manifest(
+        std::path::Path::new("/run/llo/rootfs-b"),
+        &[],
+        &[],
+    );
+
+    assert_ne!(
+        a.confinement_digest().expect("digest a"),
+        b.confinement_digest().expect("digest b"),
+        "two different rootfs grants must not share a confinement digest"
+    );
+}

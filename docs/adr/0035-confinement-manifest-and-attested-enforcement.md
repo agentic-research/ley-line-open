@@ -356,6 +356,43 @@ than requiring every future call site to re-derive kill-before-reap.
 
 ---
 
+## The daemon cannot declare what the worker compiles — the worker must attest it
+
+*Added 2026-08-03, from implementing §1.*
+
+§1 is now real on the compile side: `confinement_manifest()` builds the
+`confinement/v1` manifest and `capabilities_from_manifest()` derives the
+`nono::CapabilitySet` from it, so the applied policy and the declared digest
+are projections of one object and a policy change that skipped the manifest
+would not compile.
+
+Closing finding 2 end to end needs one more link — comparing that digest to
+the grant's `confinementDigest` — and the obvious placement does not work.
+**The policy is compiled in the worker, after fork.** `apply()` runs
+worker-side, and the rootfs path comes from `DirectoryRootfsResolver::resolve`,
+which canonicalizes a materialized tree. The daemon therefore cannot compute
+the digest at `start` time without re-deriving the path itself, which would
+mean two implementations of the same derivation — reintroducing precisely the
+drift §1 exists to prevent, one layer up.
+
+So the remaining shape is an **attestation, not a lookup**: the worker reports
+the digest of the policy it compiled, and the daemon refuses to mark the run
+`Running` unless it equals the grant's `confinementDigest`. The readiness
+protocol is already that channel — `read_readiness_line` carries a
+worker-authored message the supervisor parses, and every failure mode of it
+(EOF, malformed, wrong run id) already routes to `abort_failed_start` and a
+group kill.
+
+That also matches this ADR's title. A digest the daemon computed about the
+worker is an assumption; a digest the worker reports about itself, checked
+against what the grant authorized, is attestation. The unenforceable-ceiling
+rejection in §4 is the same shape: refuse rather than proceed on an unverified
+claim.
+
+Not implemented here. It changes the readiness message, which is a
+worker/daemon contract, and belongs with §9's daemon-manifest work rather than
+bolted onto the compile-side change.
+
 ## Open questions
 
 - **Does libkrunfw's kernel enable Landlock?** Layer 3 requires `CONFIG_SECURITY_LANDLOCK`
@@ -373,7 +410,21 @@ than requiring every future call site to re-derive kill-before-reap.
   If they are close, §1's `TryFrom` is direct; if they diverge, LLO owns a mapping and
   should document why rather than silently maintaining two shapes.
 
-  *Answered 2026-08-03 — close, with one deliberate divergence.* nono 0.71's
+  *Corrected 2026-08-03 (bead `ley-line-open-c17486`).* The answer below said
+  "close, with one deliberate divergence". That was wrong — it compared
+  top-level key names and stopped. The divergence is structural:
+  `fs.allow`↔`filesystem`, `network.allowHosts`↔`network.allow_domains`,
+  top-level `port.bind`↔nested `network.ports`,
+  `credentialSource`↔`credentials`, camelCase↔snake_case, plus nono-only
+  dimensions (`dns`, `endpoints`, `mode`, `rollback`, `exec_strategy`). So
+  §1's `TryFrom` is real code but takes *nono's* manifest, and LLO owns a
+  mapping — which is the branch this open question named. LLO currently
+  compiles confinement/v1 straight to a `CapabilitySet` via
+  `allow_path`/`allow_file` rather than routing through nono's manifest at
+  all; that preserves §1's no-drift property but the divergence is not yet
+  written down. Tracked in `c17486`.
+
+  *Original answer, retained for the resources finding it got right:* nono 0.71's
   `CapabilityManifest` is generated from `schema/capability-manifest.schema.json` via
   typify, and that JSON Schema is stated as the source of truth — the same
   JSON-Schema-first shape §8 chose independently, so §8 is matching its dependency rather

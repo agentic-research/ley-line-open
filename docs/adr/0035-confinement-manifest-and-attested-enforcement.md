@@ -400,11 +400,38 @@ bolted onto the compile-side change.
   verified before layer 3 is committed to, and if absent, the fallback is seccomp inside
   the guest or a libkrunfw configuration change.
 
-  *Still open (2026-08-03).* Not answerable from a dev machine without the artifact —
-  libkrunfw is not installed here, and `runtime/tests/libkrun_*.rs` are `#[ignore]`-gated
-  on exactly that. Two things would settle it: grep the libkrunfw kernel config for
-  `CONFIG_SECURITY_LANDLOCK`, or boot a guest and read `/sys/kernel/security/lsm`. The
-  second is authoritative — a compiled-in LSM still has to be in the active list.
+  *Resolved 2026-08-04, and the answer is stronger than the question anticipated:
+  there is no LSM framework in the guest at all on this architecture.*
+
+  Measured two ways, agreeing. From `containers/libkrunfw`'s
+  `config-libkrunfw_aarch64`:
+
+  ```
+  # CONFIG_SECURITY is not set
+  # CONFIG_SECURITYFS is not set
+  CONFIG_SECCOMP=y
+  CONFIG_SECCOMP_FILTER=y
+  ```
+
+  `CONFIG_SECURITY_LANDLOCK` and `CONFIG_LSM` do not appear. Against the shipped
+  artifact — libkrunfw 5.5.0, guest kernel `Linux version 6.12.91` — the strings
+  measurement matches exactly: `securityfs` 0 hits, `security_init` 0,
+  `security/security.c` 0, `commoncap.c` 1. `commoncap.o` builds unconditionally;
+  `security.c` is `CONFIG_SECURITY`-gated and is absent.
+
+  Three consequences worth keeping:
+
+  1. Guest-side confinement is **seccomp-bpf only** — capabilities, keys, seccomp,
+     and nothing else. A future ABI-9 `nono` would not help inside the guest here.
+  2. The `/sys/kernel/security/lsm` probe proposed above would have returned ENOENT
+     and been misread as "Landlock absent" rather than "no LSM framework". The
+     authoritative-looking check was the misleading one.
+  3. 6.12 is exactly where Landlock ABI v6 landed, so this is a **config choice,
+     not a version limitation**. A custom libkrunfw would be required to change it.
+
+  For the libkrun tier the hypervisor is therefore the only boundary, and there is no
+  silent second layer to credit: `Mechanism::Hypervisor` for constructible dimensions,
+  `Unenforced` for the rest, with no third state.
 
 - **Does confinement/v1's manifest shape reconcile with nono's `CapabilityManifest`?**
   If they are close, §1's `TryFrom` is direct; if they diverge, LLO owns a mapping and

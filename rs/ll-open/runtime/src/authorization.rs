@@ -520,7 +520,7 @@ pub fn authorize_with_verifier(
     // carried one would enforce something the issuer never authorized while the
     // digest check still passed.
     //
-    // Parsed, not merely hashed. `ConfinementManifest::parse` applies every §2-§5
+    // Parsed, not merely hashed. `ConfinementManifest::parse` applies every §2-§6
     // refusal, so a document that hashes correctly but violates the spec is
     // refused here rather than at the backend — and a grant cannot smuggle a
     // schema-invalid policy past authorization by having the right digest.

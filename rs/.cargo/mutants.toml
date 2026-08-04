@@ -33,4 +33,18 @@ exclude_re = [
     # The bitwise-or is the correct expression; the mutation operator simply
     # has no semantic target here.
     'process\.rs.*replace \| with \^ in observe_exit',
+
+    # `KRUN_TSI_HIJACK_INET = 1 << 0`, mutated to `1 >> 0`.
+    #
+    # Shifting by zero is the identity in both directions, so `1 << 0` and
+    # `1 >> 0` are the same integer — the mutated program is not merely hard to
+    # distinguish from the original, it IS the original. No test can observe a
+    # difference because there is none.
+    #
+    # Writing the constant as a literal `1` would relocate the mutant rather
+    # than remove it, and would lose the `1 << bit` shape that says this is a
+    # flag mask from `libkrun.h` rather than an arbitrary number. The shift is
+    # the correct expression; the operator has no semantic target at
+    # shift-distance zero.
+    'api\.rs.*replace << with >>',
 ]

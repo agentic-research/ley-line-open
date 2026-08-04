@@ -301,6 +301,22 @@ impl<B: Backend> ExecutionService<B> {
                 "resolver changed the grant's allowed egress",
             ));
         }
+        // The fourth check, and the one whose absence failed OPEN rather than
+        // closed. Both backends gate the ADR-0035 drift comparison behind
+        // `if !request.confinement_digest.is_empty()`, so a resolver that
+        // merely DROPPED this field silently disabled the attestation for that
+        // run — no error, no receipt anomaly, nothing to notice.
+        //
+        // `catalog.rs` already says the digest is "carried, never chosen", and
+        // the shipped resolver obeys. But `ExecutionResolver` is a public
+        // trait: the rule was prose on one implementation rather than a check
+        // on the seam. This repo's own `TestResolver` writes `String::new()`
+        // here, which is why the entrypoint test passed vacuously.
+        if request.confinement_digest != authorized.confinement_digest {
+            return Err(ExecutionError::identity_mismatch(
+                "resolver changed the grant's confinement digest",
+            ));
+        }
         let record = self.start(request)?;
         self.state.write().receipts.insert(
             record.run_id.clone(),

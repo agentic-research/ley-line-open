@@ -368,6 +368,15 @@ pub struct AuthorizedExecution {
     pub spec_digest: String,
     pub grant_digest: String,
     pub confinement_digest: String,
+    /// The confinement/v1 document `confinement_digest` was taken over, when
+    /// the issuer carried it.
+    ///
+    /// Verified self-consistent at authorization: if present, its digest MUST
+    /// equal `confinement_digest`, so a grant cannot name one policy and carry
+    /// another. `None` means the issuer committed by digest alone — a runner
+    /// that cannot otherwise obtain that document knows only whether what it
+    /// applied matched, never what was authorized.
+    pub confinement_manifest: Option<String>,
     pub backend: BackendClass,
     pub allowed_egress: Vec<String>,
     pub intent: SchemaIntent,
@@ -504,6 +513,41 @@ pub fn authorize_with_verifier(
     )?;
     let confinement_digest =
         read_digest(grant.get_confinement_digest(), "RunGrant.confinementDigest")?;
+
+    // If the issuer carried the document, it must be the document the digest
+    // was taken over. Without this the field would be decoration: a grant could
+    // name policy A by digest and carry policy B, and a runner reading the
+    // carried one would enforce something the issuer never authorized while the
+    // digest check still passed.
+    //
+    // Parsed, not merely hashed. `ConfinementManifest::parse` applies every §2-§5
+    // refusal, so a document that hashes correctly but violates the spec is
+    // refused here rather than at the backend — and a grant cannot smuggle a
+    // schema-invalid policy past authorization by having the right digest.
+    let confinement_manifest = {
+        let carried = text(
+            grant.get_confinement_manifest(),
+            "RunGrant.confinementManifest",
+        )?;
+        if carried.is_empty() {
+            None
+        } else {
+            let parsed =
+                crate::confinement::ConfinementManifest::parse(&carried).map_err(|error| {
+                    ExecutionError::invalid(format!(
+                        "RunGrant.confinementManifest is not a valid confinement/v1 document: {}",
+                        error.detail
+                    ))
+                })?;
+            let carried_digest = parsed.confinement_digest()?;
+            if carried_digest != confinement_digest {
+                return Err(ExecutionError::identity_mismatch(format!(
+                    "RunGrant carries a confinement manifest digesting to                      {carried_digest}, but confinementDigest names                      {confinement_digest}"
+                )));
+            }
+            Some(carried)
+        }
+    };
     if let Some(required) = &policy.required_confinement_digest
         && required != &confinement_digest
     {
@@ -568,6 +612,7 @@ pub fn authorize_with_verifier(
         spec_digest,
         grant_digest,
         confinement_digest,
+        confinement_manifest,
         backend,
         allowed_egress,
         intent,

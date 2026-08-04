@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use crate::{ExecutionError, ExecutionRequest};
 use serde::{Deserialize, Serialize};
 
-use super::api::{DynamicKrunApi, PreparedVm, prepare_vm};
-use super::confinement::{VmmHostResources, apply, confinement_manifest};
+use super::api::{DynamicKrunApi, KRUN_TSI_HIJACK_INET, PreparedVm, prepare_vm};
+use super::confinement::{VmmHostResources, apply_manifest, confinement_manifest};
 use super::plan::{DirectoryRootfsResolver, compile_plan};
 use super::volume::{materialize_ephemeral_rootfs, verify_ephemeral_rootfs};
 
@@ -17,6 +17,18 @@ pub struct WorkerOptions {
     pub libkrun: PathBuf,
     pub runtime_files: Vec<PathBuf>,
     pub devices: Vec<PathBuf>,
+    /// Carry the guest's `AF_INET` sockets over vsock (`KRUN_TSI_HIJACK_INET`).
+    ///
+    /// Off unless an operator asks for it, and asked for HERE — on the worker's
+    /// command line — rather than anywhere a workload can reach. It exists
+    /// because an unmodified guest that binds TCP (mache on 7532) cannot
+    /// otherwise be reached across a vsock-only boundary.
+    ///
+    /// It is strictly weaker than the default. Without it the guest talks to
+    /// the host only over vsock ports it was explicitly handed; with it, the
+    /// guest's ordinary sockets are silently rerouted, and what the host can
+    /// reach is decided by the port map instead of by what was granted.
+    pub tsi_hijack_inet: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,7 +56,15 @@ impl WorkerOptions {
         let mut runtime_files = Vec::new();
         let mut devices = Vec::new();
 
+        let mut tsi_hijack_inet = false;
+
         while let Some(argument) = arguments.next() {
+            // Checked before a value is consumed: this is the one valueless
+            // flag, and the loop below assumes every option takes a path.
+            if argument.to_str() == Some("--tsi-hijack-inet") {
+                tsi_hijack_inet = true;
+                continue;
+            }
             let value = arguments.next().ok_or_else(|| {
                 ExecutionError::invalid(format!(
                     "worker option {} requires a path",
@@ -74,6 +94,7 @@ impl WorkerOptions {
             libkrun: libkrun.ok_or_else(|| ExecutionError::invalid("missing --libkrun option"))?,
             runtime_files,
             devices,
+            tsi_hijack_inet,
         })
     }
 }
@@ -119,6 +140,12 @@ pub fn execute_with_ready(
 ) -> Result<(), ExecutionError> {
     let resolver = DirectoryRootfsResolver::new(&options.cas_root);
     let mut config = compile_plan(&resolver, request)?;
+    // `compile_plan` hardcodes 0 — a workload cannot widen its own boundary
+    // through the request. Hijacking is applied here, from the operator's
+    // command line, and nowhere else.
+    if options.tsi_hijack_inet {
+        config.tsi_features = KRUN_TSI_HIJACK_INET;
+    }
     config.rootfs = materialize_ephemeral_rootfs(&config.rootfs, &options.run_root)?;
 
     // Loading occurs before nono is applied because the platform dynamic
@@ -132,14 +159,69 @@ pub fn execute_with_ready(
         runtime_files,
         devices: options.devices,
     };
-    // The manifest that `apply` compiles, kept so the digest attested below
-    // describes the policy this process is actually confined by.
-    let manifest = confinement_manifest(
-        &config.rootfs.canonical_path,
-        &resources.runtime_files,
-        &resources.devices,
-    );
-    apply(&config, &resources)?;
+    // ONE manifest, applied and attested. The previous version built a manifest
+    // here and then called `apply(&config, &resources)`, which built a SECOND
+    // one from the same inputs — and its comment claimed the digest described
+    // "the policy this process is actually confined by", which held only because
+    // the arguments happened to match. Change which path `apply` derives from
+    // and the worker would attest a digest for a policy it did not apply, with
+    // nothing to catch it: the digest's only consumer is a comparison against
+    // the grant, not against the applied set.
+    //
+    // `native.rs` already did it this way, and its comment — "Deriving both from
+    // `manifest` is what makes the attestation true by construction rather than
+    // by discipline" — was accurate there and inaccurate one directory over.
+    let manifest = confinement_manifest(&resources.runtime_files, &resources.devices)?;
+
+    // §4 on the microVM tier. `apply_manifest` below confines the VMM HOST
+    // process; the guest's own listener is governed by the port map, which is a
+    // different mechanism reached through a different call. Until now nothing
+    // connected them: `KrunConfig.port_map` was `Vec::new()` unconditionally and
+    // fed by no manifest, so a declared listener was compiled for the host
+    // process and silently ignored for the guest — the same silent-drop class
+    // this branch fixed one tier down.
+    //
+    // What the tier can actually deliver depends on the boundary:
+    //
+    //   no hijacking — a guest AF_INET bind reaches nothing. Granting it would
+    //     attest a listener that cannot receive a connection, which is a
+    //     declaration with no effect. Refused.
+    //   hijacking on — guest sockets ARE carried over vsock, so the declared
+    //     port maps to itself and the empty-by-default map stops being empty.
+    //     Note libkrun's constraint: an exposed port is reachable in the guest
+    //     by its HOST port number, so `N:N` is the only mapping that leaves the
+    //     guest's own view of §4 intact.
+    // UNREACHABLE TODAY, and saying so rather than letting it read as a shipped
+    // feature. `confinement_manifest` builds LLO's OWN policy from host
+    // resources — rootfs, runtime files, devices — and never sets a port, so
+    // `dimensions().port` is always `None` here. There is no route for a §4
+    // declaration to ORIGINATE from a grant, because the manifest is
+    // constructed internally rather than ingested from the authorized document.
+    //
+    // That missing route is the real remaining gap, tracked on
+    // `ley-line-open-17536d`: `ConfinementManifest` is write-only (it can emit
+    // canonical JSON but not parse it), so a grant's confinement/v1 document
+    // cannot become the manifest LLO compiles. Until it can, this arm is the
+    // correct handling of a case that cannot yet arrive — kept because the
+    // alternative is the microVM tier silently ignoring §4 the moment that
+    // route exists, which is precisely the defect this branch is about.
+    if let Some((bind, _address)) = manifest.dimensions().port {
+        if config.tsi_features == 0 {
+            return Err(ExecutionError::invalid(format!(
+                "confinement/v1 §4 port.bind {bind} is not deliverable on the \
+                 microVM tier without socket hijacking: the guest's AF_INET \
+                 bind is not carried anywhere, so the listener could never be \
+                 reached. Start the worker with --tsi-hijack-inet, or omit the \
+                 dimension."
+            )));
+        }
+        config.port_map = vec![
+            std::ffi::CString::new(format!("{bind}:{bind}"))
+                .map_err(|_| ExecutionError::invalid("port map entry contains a NUL byte"))?,
+        ];
+    }
+
+    apply_manifest(&manifest, &config.rootfs.canonical_path)?;
 
     let vm: PreparedVm<'_> = prepare_vm(&api, &config)?;
     on_ready(&WorkerEvent::Ready {

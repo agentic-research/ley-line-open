@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use nono::{AccessMode, CapabilitySet, Sandbox};
+use nono::{AccessMode, CapabilitySet, Sandbox, UnixSocketMode};
 
 use crate::ExecutionError;
 use crate::confinement::{ConfinementManifest, Dimensions, FsGrant};
@@ -125,6 +125,7 @@ pub fn capabilities_from_manifest(
         allow_hosts,
         port,
         credential_source,
+        unix_sockets,
     } = manifest.dimensions();
 
     let mut capabilities = CapabilitySet::new();
@@ -149,6 +150,130 @@ pub fn capabilities_from_manifest(
         } else {
             capabilities
                 .allow_file(Path::new(path), mode)
+                .map_err(nono_error)?
+        };
+    }
+
+    // §6 local channels. Enforceable on Seatbelt, and NOT on Landlock — the
+    // exact mirror of §4, which is enforceable on Landlock and not on Seatbelt.
+    //
+    // I wrote the opposite here first, and it was wrong. Be precise about *why*
+    // it is refused, because the imprecise version of this claim expires:
+    //
+    //   - `AccessNet` is `BindTcp | ConnectTcp` and nothing else, at every ABI
+    //     the crate knows (landlock-0.4.5/src/net.rs:45, `from_all` for V4..V7).
+    //     No network right ever covers AF_UNIX. That part is durable.
+    //   - But pathname-AF_UNIX *is* expressible on Linux as of Landlock ABI 9
+    //     (kernel 7.1): `LANDLOCK_ACCESS_FS_RESOLVE_UNIX`, an AccessFs right,
+    //     restricts `connect(2)` and `sendmsg(2)`-with-recipient per path.
+    //     So "Landlock cannot express §6" is false in general and must not be
+    //     written down as if it were a property of the dimension.
+    //
+    // What is true *here* is narrower and entirely about this stack:
+    //   - landlock 0.4.5 tops out at ABI V7 (compat.rs:57-75); it has no
+    //     `RESOLVE_UNIX` constant to emit.
+    //   - nono targets ABI 5, and reads `unix_socket_capabilities()` in exactly
+    //     one enforcement backend — `sandbox/macos.rs:429` — and zero times in
+    //     `sandbox/linux.rs`.
+    // A §6 grant therefore compiles to nothing on this tier today.
+    //
+    // So the refusal is not conservatism, it is the §3/§5 rule applied to the
+    // dimension I added while fixing that very defect: a clause a tier cannot
+    // enforce must be a rejection, never a silent pass-through into an
+    // identity-committed digest. Routing a channel through a socket rather than
+    // a port does not close the platform gap — it swaps which platform has one.
+    #[cfg(target_os = "linux")]
+    if !unix_sockets.is_empty() {
+        return Err(ExecutionError::invalid(format!(
+            "confinement/v1 §6 unixSocket.allow is not enforceable by the \
+             Landlock ABI this build targets, so the {} declared socket \
+             grant(s) would compile to nothing while the attested digest \
+             committed to them. Per-path AF_UNIX mediation exists upstream as \
+             LANDLOCK_ACCESS_FS_RESOLVE_UNIX (ABI 9, kernel 7.1), but the \
+             landlock crate here stops at ABI 7 and nono targets ABI 5 and \
+             consults unix_socket_capabilities() only in its macOS backend. \
+             Use §4 port.bind on this tier, which Landlock does filter per port.",
+            unix_sockets.len()
+        )));
+    }
+
+    for grant in unix_sockets {
+        let path = grant.path();
+        // §6 `bind` is serve-without-dial: it grants `bind(2)` and WITHHOLDS
+        // `connect(2)`. nono's `UnixSocketMode` has no bind-only member — the
+        // pair is `Connect | ConnectBind` — so neither available value carries
+        // the mode. `ConnectBind` would add the `connect(2)` the grant exists to
+        // withhold, and `Connect` inverts it outright. Widening is the failure
+        // this dimension was added while fixing, so refuse.
+        //
+        // The mode is not unenforceable in general: the hypervisor tier does
+        // enforce exactly it, because a `krun_add_vsock_port2` mapping with
+        // `listen=true` answers a guest-originated connect with a reset. That is
+        // a boundary, not a filter — it enforces by not constructing the dial
+        // path at all — which is why it can hold a clause a filter cannot.
+        if !grant.permits_connect() {
+            return Err(ExecutionError::invalid(format!(
+                "confinement/v1 §6 unixSocket.allow mode {:?} for {path:?} is not \
+                 enforceable through a CapabilitySet: the only modes available are \
+                 connect and connect-bind, and granting connect-bind would add the \
+                 connect(2) this mode exists to withhold. Serve-without-dial is a \
+                 hypervisor-tier construction (a listen=true vsock port mapping), \
+                 not a sandbox filter.",
+                grant.mode()
+            )));
+        }
+        // Trailing slash is a directory of sockets, exactly as in §2. The
+        // spelling is shared on purpose: a reader of the JSON should not have
+        // to learn two conventions for "this names a tree, not a leaf".
+        let mode = if grant.permits_bind() {
+            UnixSocketMode::ConnectBind
+        } else {
+            UnixSocketMode::Connect
+        };
+
+        // §6 `connect` names an endpoint SOMEONE ELSE owns, and nono requires it
+        // to exist: `UnixSocketCapability::new_file` canonicalizes the path, and
+        // it only tolerates a missing leaf when the mode permits `bind(2)` — its
+        // reasoning being that bind will create the file. That reasoning does not
+        // cover the case this dimension exists for, where the peer binds and the
+        // grantee only dials.
+        //
+        // The requirement is nonetheless real and must not be papered over. The
+        // two ways to "fix" it here are both widenings: granting the parent
+        // directory would cover every socket in it, and passing ConnectBind would
+        // add the `bind(2)` a connect grant deliberately withholds. Canonicalization
+        // is also load-bearing rather than incidental — resolving the leaf is what
+        // stops a symlink planted at the path from redirecting the grant to some
+        // other endpoint, which is exactly the §6 redirect hazard.
+        //
+        // So the endpoint must be bound before confinement is applied. That is an
+        // ordering contract (README §6), and the deployment satisfies it naturally:
+        // the proxy binds, then the confined child is spawned. What was wrong was
+        // letting it surface as `BackendFailed: ... Path does not exist`, which
+        // reads as an internal fault rather than as the contract it is. Check it
+        // here so the diagnostic names the dimension, the path, and the ordering.
+        if !grant.permits_bind()
+            && let Some(socket) = path.strip_suffix('/').is_none().then_some(path)
+            && !Path::new(socket).exists()
+        {
+            return Err(ExecutionError::invalid(format!(
+                "confinement/v1 §6 unixSocket.allow grants connect(2) on {socket:?}, \
+                 but nothing is bound there yet. A connect grant names an endpoint \
+                 owned by another process, and it is resolved — not merely recorded \
+                 — when confinement is applied, so that a symlink planted at the \
+                 path cannot redirect the grant. Bind the endpoint before starting \
+                 the confined workload. This is an ordering requirement, not a \
+                 malformed manifest: the same document compiles once the peer is up."
+            )));
+        }
+
+        capabilities = if let Some(directory) = path.strip_suffix('/') {
+            capabilities
+                .allow_unix_socket_dir(Path::new(directory), mode)
+                .map_err(nono_error)?
+        } else {
+            capabilities
+                .allow_unix_socket(Path::new(path), mode)
                 .map_err(nono_error)?
         };
     }

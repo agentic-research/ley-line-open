@@ -29,7 +29,7 @@
 use std::path::Path;
 
 use leyline_runtime::backends::libkrun::confinement::capabilities_from_manifest;
-use leyline_runtime::confinement::{ConfinementManifest, FsGrant};
+use leyline_runtime::confinement::{ConfinementManifest, FsGrant, UnixSocketGrant};
 
 /// §4 is enforceable on Landlock and not on Seatbelt, so the expected outcome
 /// is genuinely platform-dependent. Stated once rather than inline everywhere.
@@ -337,4 +337,117 @@ fn the_hosts_accessor_reports_what_was_declared() {
             .is_empty(),
         "an undeclared §3 must read as empty, not as a phantom grant"
     );
+}
+
+/// §6 `bind` is serve-without-dial: it grants `bind(2)` and *withholds*
+/// `connect(2)`. A `CapabilitySet` has no mode carrying that — the pair is
+/// `Connect | ConnectBind` — so the compiler must refuse it rather than reach
+/// for `ConnectBind`, which would add back exactly the `connect(2)` the mode
+/// exists to remove.
+///
+/// This is the §4 failure one dimension over: a declaration that names one
+/// thing and permits another. The refusal is what keeps the attested digest
+/// describing the policy actually applied.
+#[test]
+fn a_serve_only_socket_is_refused_rather_than_widened_to_dial() {
+    let manifest = ConfinementManifest::new()
+        .with_unix_socket(UnixSocketGrant::bind("/run/llo/shim.sock"))
+        .expect("an absolute socket path is a valid §6 grant");
+
+    let error = compile(&manifest).expect_err("bind withholds connect; no mode carries that");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("§6") && rendered.contains("bind"),
+        "the refusal must name the dimension and the mode it could not honour, got: {rendered}"
+    );
+}
+
+/// The positive half, so the test above cannot pass by refusing *everything*
+/// in §6. On Seatbelt a dial-only grant compiles; on Landlock the whole
+/// dimension is refused at the ABI this build targets, and that split is the
+/// §1 table rather than an accident here.
+///
+/// # The ordering requirement is part of the contract
+///
+/// A `connect` grant only compiles once the endpoint is bound, because the path
+/// is *resolved* when the grant is compiled — which is what stops a symlink
+/// planted at the path from redirecting the grant somewhere else. So compiling
+/// is a function of the manifest *and* the moment, and README §6 says so rather
+/// than leaving it to be discovered.
+///
+/// The half that was genuinely wrong was the diagnostic: this surfaced as
+/// `BackendFailed: ... Path does not exist`, which reads as an internal fault
+/// and invites a caller to "fix" the manifest. It must name the dimension, the
+/// path, and the ordering, and it must say the same document compiles unchanged
+/// once the peer is up.
+#[test]
+fn a_dial_only_socket_compiles_where_the_mechanism_carries_it() {
+    let existing = tempfile::tempdir().expect("tempdir");
+    let socket_path = existing.path().join("vault-proxy.sock");
+    std::os::unix::net::UnixListener::bind(&socket_path).expect("bind a real socket");
+
+    let bound = ConfinementManifest::new()
+        .with_unix_socket(UnixSocketGrant::connect(socket_path.to_string_lossy()))
+        .expect("an absolute socket path is a valid §6 grant");
+    let outcome = compile(&bound);
+    assert_eq!(
+        outcome.is_ok(),
+        SEATBELT,
+        "§6 connect is expressible on Seatbelt and unavailable at the targeted \
+         Landlock ABI — see the §1 table. Got: {:?}",
+        outcome.err().map(|e| e.to_string())
+    );
+
+    // Same manifest shape, same digest semantics, socket not yet bound. The
+    // refusal must be legible on BOTH platforms: on Linux the whole dimension is
+    // unavailable, on macOS it is the ordering contract. Neither may render as a
+    // bare backend fault.
+    let unbound = ConfinementManifest::new()
+        .with_unix_socket(UnixSocketGrant::connect(
+            existing.path().join("not-yet.sock").to_string_lossy(),
+        ))
+        .expect("an absolute socket path is a valid §6 grant");
+    let rendered = compile(&unbound)
+        .expect_err("a connect grant on an unbound endpoint cannot be resolved")
+        .to_string();
+    assert!(
+        rendered.contains("§6"),
+        "the refusal must name the dimension, not leak nono's wording: {rendered:?}"
+    );
+    if SEATBELT {
+        assert!(
+            rendered.contains("nothing is bound there yet")
+                && rendered.contains("compiles once the peer is up"),
+            "the refusal must state the ordering contract and that the manifest is \
+             not at fault, so a caller does not go 'fix' a correct document: {rendered:?}"
+        );
+    }
+}
+
+/// The wire vocabulary is what v1 pins, so each mode must have exactly one
+/// spelling and it must survive the round-trip the authorization path depends
+/// on. A mode that canonicalizes to a string the parser rejects would digest
+/// fine and fail to re-parse — the drift §7 exists to prevent.
+#[test]
+fn every_socket_mode_round_trips_through_its_one_spelling() {
+    for grant in [
+        UnixSocketGrant::connect("/run/llo/a.sock"),
+        UnixSocketGrant::bind("/run/llo/b.sock"),
+        UnixSocketGrant::connect_bind("/run/llo/c.sock"),
+    ] {
+        let manifest = ConfinementManifest::new()
+            .with_unix_socket(grant.clone())
+            .expect("valid §6 grant");
+        let canonical = manifest
+            .to_canonical_json()
+            .expect("a valid manifest must canonicalize");
+        let parsed =
+            ConfinementManifest::parse(&canonical).expect("canonical bytes must parse back");
+        assert_eq!(
+            parsed.unix_sockets(),
+            [grant.clone()],
+            "mode {:?} did not survive the canonical round-trip",
+            grant.mode()
+        );
+    }
 }

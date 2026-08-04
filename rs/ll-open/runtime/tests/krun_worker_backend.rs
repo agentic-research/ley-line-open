@@ -58,6 +58,7 @@ fn backend_with_worker(
         runtime_files: Vec::new(),
         devices: Vec::new(),
         ready_timeout: READY_TIMEOUT,
+        tsi_hijack_inet: false,
     });
     (backend, ephemeral_root)
 }
@@ -92,6 +93,7 @@ fn backend_spawns_the_explicit_first_party_worker_and_waits_for_ready() {
         runtime_files: Vec::new(),
         devices: Vec::new(),
         ready_timeout: READY_TIMEOUT,
+        tsi_hijack_inet: false,
     });
 
     let capabilities = backend.capabilities();
@@ -133,6 +135,7 @@ fn backend_removes_the_run_root_when_a_worker_exits() {
         runtime_files: Vec::new(),
         devices: Vec::new(),
         ready_timeout: READY_TIMEOUT,
+        tsi_hijack_inet: false,
     });
 
     backend.start(&request()).expect("ready worker");
@@ -197,6 +200,7 @@ fn backend_cancel_terminates_the_worker_and_removes_its_run_root() {
         runtime_files: Vec::new(),
         devices: Vec::new(),
         ready_timeout: READY_TIMEOUT,
+        tsi_hijack_inet: false,
     });
 
     backend.start(&request()).expect("ready worker");
@@ -231,6 +235,7 @@ fn backend_enforces_the_wall_clock_limit_and_cleans_up() {
         runtime_files: Vec::new(),
         devices: Vec::new(),
         ready_timeout: READY_TIMEOUT,
+        tsi_hijack_inet: false,
     });
     let mut request = request();
     request.limits.wall_time_ms = 50;
@@ -274,6 +279,7 @@ fn backend_cleanup_handles_guest_created_restrictive_directories() {
         runtime_files: Vec::new(),
         devices: Vec::new(),
         ready_timeout: READY_TIMEOUT,
+        tsi_hijack_inet: false,
     });
 
     backend.start(&request()).expect("ready worker");
@@ -326,6 +332,7 @@ printf '%s\n' '{"type":"failed","error":{"code":"backend-failed","retryable":fal
         runtime_files: Vec::new(),
         devices: Vec::new(),
         ready_timeout: READY_TIMEOUT,
+        tsi_hijack_inet: false,
     });
 
     let error = backend.start(&request()).expect_err("worker setup failure");
@@ -358,6 +365,7 @@ fn backend_rejects_a_duplicate_run_id_without_replacing_the_live_worker() {
         runtime_files: Vec::new(),
         devices: Vec::new(),
         ready_timeout: READY_TIMEOUT,
+        tsi_hijack_inet: false,
     });
 
     backend.start(&request()).expect("first worker");
@@ -392,6 +400,7 @@ fn concurrent_starts_reserve_a_run_id_before_spawning() {
         runtime_files: Vec::new(),
         devices: Vec::new(),
         ready_timeout: READY_TIMEOUT,
+        tsi_hijack_inet: false,
     }));
     let barrier = Arc::new(Barrier::new(3));
     let starts: Vec<_> = (0..2)
@@ -418,6 +427,62 @@ fn concurrent_starts_reserve_a_run_id_before_spawning() {
         .expect("one conflict");
     assert_eq!(conflict.code, leyline_runtime::ErrorCode::ResourceConflict);
     assert!(backend.cancel("run-backend-01").expect("cancel worker"));
+}
+
+/// The operator's socket-hijacking opt-in has to REACH the worker.
+///
+/// This was shipped broken once and caught in review: `WorkerOptions` parsed
+/// `--tsi-hijack-inet`, and the backend never passed it. Operators do not spawn
+/// the worker — this backend does — so the flag was settable by tests and by
+/// nobody else, which is dead configuration wearing the shape of a feature.
+///
+/// Asserted against the worker's own view of its argv rather than against the
+/// backend's config, because the config being right is exactly what was already
+/// true when the bug existed.
+#[test]
+fn the_hijack_opt_in_reaches_the_worker_and_is_absent_by_default() {
+    for hijack in [false, true] {
+        let fixture = TempDir::new().expect("fixture");
+        let argv_log = fixture.path().join("argv");
+        let worker = fixture.path().join("leyline-krun-worker");
+        fs::write(
+            &worker,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n/bin/cat >/dev/null\nprintf '%s\\n' \
+                 '{{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}}' >&2\n/usr/bin/tail -f /dev/null\n",
+                argv_log.display()
+            ),
+        )
+        .expect("fake worker");
+        fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("worker mode");
+        let cas_root = fixture.path().join("cas");
+        let ephemeral_root = fixture.path().join("runs");
+        fs::create_dir(&cas_root).expect("CAS");
+        fs::create_dir(&ephemeral_root).expect("ephemeral root");
+        let libkrun = fixture.path().join("libkrun.dylib");
+        fs::write(&libkrun, b"library").expect("library fixture");
+
+        let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+            worker,
+            cas_root,
+            ephemeral_root,
+            libkrun,
+            runtime_files: Vec::new(),
+            devices: Vec::new(),
+            ready_timeout: READY_TIMEOUT,
+            tsi_hijack_inet: hijack,
+        });
+        backend.start(&request()).expect("worker readiness");
+
+        let argv = fs::read_to_string(&argv_log).expect("worker argv");
+        assert_eq!(
+            argv.lines().any(|line| line == "--tsi-hijack-inet"),
+            hijack,
+            "tsi_hijack_inet={hijack} must decide whether the worker is told to \
+             hijack; the worker saw: {argv:?}"
+        );
+        assert!(backend.cancel("run-backend-01").expect("cancel worker"));
+    }
 }
 
 /// ADR-0035 finding 2, microVM tier. The native tier pins this in
@@ -538,6 +603,7 @@ fn every_libkrun_resource_is_required_independently() {
         runtime_files: vec![runtime_file.clone()],
         devices: vec![device.clone()],
         ready_timeout: READY_TIMEOUT,
+        tsi_hijack_inet: false,
     };
 
     assert!(

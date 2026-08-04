@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use crate::{ExecutionError, ExecutionRequest};
 use serde::{Deserialize, Serialize};
 
-use super::api::{DynamicKrunApi, PreparedVm, prepare_vm};
+use super::api::{DynamicKrunApi, KRUN_TSI_HIJACK_INET, PreparedVm, prepare_vm};
 use super::confinement::{VmmHostResources, apply, confinement_manifest};
 use super::plan::{DirectoryRootfsResolver, compile_plan};
 use super::volume::{materialize_ephemeral_rootfs, verify_ephemeral_rootfs};
@@ -17,6 +17,18 @@ pub struct WorkerOptions {
     pub libkrun: PathBuf,
     pub runtime_files: Vec<PathBuf>,
     pub devices: Vec<PathBuf>,
+    /// Carry the guest's `AF_INET` sockets over vsock (`KRUN_TSI_HIJACK_INET`).
+    ///
+    /// Off unless an operator asks for it, and asked for HERE — on the worker's
+    /// command line — rather than anywhere a workload can reach. It exists
+    /// because an unmodified guest that binds TCP (mache on 7532) cannot
+    /// otherwise be reached across a vsock-only boundary.
+    ///
+    /// It is strictly weaker than the default. Without it the guest talks to
+    /// the host only over vsock ports it was explicitly handed; with it, the
+    /// guest's ordinary sockets are silently rerouted, and what the host can
+    /// reach is decided by the port map instead of by what was granted.
+    pub tsi_hijack_inet: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,7 +56,15 @@ impl WorkerOptions {
         let mut runtime_files = Vec::new();
         let mut devices = Vec::new();
 
+        let mut tsi_hijack_inet = false;
+
         while let Some(argument) = arguments.next() {
+            // Checked before a value is consumed: this is the one valueless
+            // flag, and the loop below assumes every option takes a path.
+            if argument.to_str() == Some("--tsi-hijack-inet") {
+                tsi_hijack_inet = true;
+                continue;
+            }
             let value = arguments.next().ok_or_else(|| {
                 ExecutionError::invalid(format!(
                     "worker option {} requires a path",
@@ -74,6 +94,7 @@ impl WorkerOptions {
             libkrun: libkrun.ok_or_else(|| ExecutionError::invalid("missing --libkrun option"))?,
             runtime_files,
             devices,
+            tsi_hijack_inet,
         })
     }
 }
@@ -119,6 +140,12 @@ pub fn execute_with_ready(
 ) -> Result<(), ExecutionError> {
     let resolver = DirectoryRootfsResolver::new(&options.cas_root);
     let mut config = compile_plan(&resolver, request)?;
+    // `compile_plan` hardcodes 0 — a workload cannot widen its own boundary
+    // through the request. Hijacking is applied here, from the operator's
+    // command line, and nowhere else.
+    if options.tsi_hijack_inet {
+        config.tsi_features = KRUN_TSI_HIJACK_INET;
+    }
     config.rootfs = materialize_ephemeral_rootfs(&config.rootfs, &options.run_root)?;
 
     // Loading occurs before nono is applied because the platform dynamic

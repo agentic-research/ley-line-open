@@ -32,6 +32,8 @@ fn config_for_path(rootfs: &Path) -> KrunConfig {
         vcpus: 1,
         ram_mib: 512,
         wall_time_ms: 1_000,
+        tsi_features: 0,
+        port_map: Vec::new(),
     }
 }
 

@@ -7,7 +7,9 @@ use crate::{ExecutionError, ExecutionRequest};
 use serde::{Deserialize, Serialize};
 
 use super::api::{DynamicKrunApi, KRUN_TSI_HIJACK_INET, PreparedVm, prepare_vm};
-use super::confinement::{VmmHostResources, apply_manifest, confinement_manifest};
+use super::confinement::{
+    VmmHostResources, apply_manifest, confinement_manifest, vsock_unix_mappings,
+};
 use super::plan::{DirectoryRootfsResolver, compile_plan};
 use super::volume::{materialize_ephemeral_rootfs, verify_ephemeral_rootfs};
 
@@ -250,6 +252,13 @@ pub fn execute_with_ready(
                 .map_err(|_| ExecutionError::invalid("port map entry contains a NUL byte"))?,
         ];
     }
+
+    // §6 on this tier: the folded socket grants compile to vsock↔socket
+    // mappings, consumed by `prepare_vm`. Derived from the same manifest the
+    // digest below attests, through the pure function documented at
+    // `vsock_unix_mappings` — so the receipt already covers every mapping and
+    // the issuer can compute every port from the document they signed.
+    config.vsock_unix_map = vsock_unix_mappings(&manifest)?;
 
     apply_manifest(&manifest, &config.rootfs.canonical_path)?;
 

@@ -5,7 +5,7 @@ name: Mutation testing
 # structurally cannot — e.g. widening the chunk-overlap predicate, which
 # returns identical bytes while fetching chunks it never needed.
 #
-# Path-filtered and separate from `ci.yml` because it takes ~7 min. Same
+# Path-filtered and separate from `ci.yml` because it takes ~17 min. Same
 # taskfile-ci-parity rule as everything else: this workflow invokes
 # `task mutants`, it does not re-implement the command.
 # Broadened to all Rust (`ley-line-open-085dff`). Previously this fired only on
@@ -16,7 +16,7 @@ name: Mutation testing
 # Broadening is affordable only because the diff-scoped run costs time
 # proportional to the DIFF rather than the codebase. The expensive allowlist run
 # stays conditional on the allowlist actually being touched; see the step guard
-# below. Without that guard this would add ~7 min to every Rust PR, and a gate
+# below. Without that guard this would add ~17 min to every Rust PR, and a gate
 # people route around has already failed.
 on:
   pull_request:
@@ -98,7 +98,10 @@ jobs:
         run: |
           set -eu
           changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
-          # The allowlist run is ~7 min, so it fires only when the modules it
+          # The allowlist run is ~17 min (measured 2026-08-05; the three "~7
+          # min" figures this file reasoned from were 2.4x low, so the guard
+          # was more load-bearing than its own comments claimed). It fires
+          # only when the modules it
           # covers changed, OR when the task definitions themselves changed —
           # editing `mutants:*` should re-verify the gate still runs, which is
           # the reason Taskfile.yml is a trigger at all.
@@ -108,8 +111,23 @@ jobs:
           # read it. Leaving it out meant a change to the gate itself no longer
           # re-verified the gate — the trigger kept pointing at the file the
           # logic used to live in.
+          # `cdc/` is matched as its RUST SOURCES, not as a directory prefix.
+          # Written bare it also matched `rs/ll-open/cdc/Cargo.toml`, so every
+          # release fired the 17-minute allowlist run: a version bump touches
+          # 20 manifests, one of them cdc's. Measured on chore/release-0.17.0,
+          # where the same job reported `task mutants (allowlist) 17m` beside
+          # `task mutants:diff (this PR) — nothing to mutate`. Seventeen
+          # minutes covering nothing the PR changed, on the one hop that is
+          # actually on the release critical path (vigil, `ley-line-open-f951a9`).
+          #
+          # This removes no coverage. The other three entries are already exact
+          # `.rs` paths, so a change to `fs/Cargo.toml` or `core/Cargo.toml`
+          # has never triggered them either — the fix makes cdc consistent with
+          # the rest rather than carving an exception. What a manifest-only
+          # change to cdc still gets is `mutants:diff`, which covers whatever
+          # the PR actually touched.
           if printf '%s\n' "$changed" | grep -qE \
-            '^(rs/ll-open/cdc/|rs/ll-open/fs/src/(chunked|gc)\.rs|rs/ll-core/core/src/partition\.rs|Taskfile\.yml|tools/mutants_diff\.sh|\.github/workflows/mutants\.yml)'; then
+            '^(rs/ll-open/cdc/.*\.rs$|rs/ll-open/fs/src/(chunked|gc)\.rs|rs/ll-core/core/src/partition\.rs|Taskfile\.yml|tools/mutants_diff\.sh|\.github/workflows/mutants\.yml)'; then
             echo "allowlist=true" >> "$GITHUB_OUTPUT"
           else
             echo "allowlist=false" >> "$GITHUB_OUTPUT"

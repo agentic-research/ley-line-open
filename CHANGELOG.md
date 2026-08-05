@@ -10,7 +10,55 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.17.0] — 2026-08-05
+
+**§4 reaches the tier that enforces it.** A grant's confinement document now
+becomes the policy the worker applies, which makes `port.bind` deliverable
+end-to-end for the first time — and makes disagreement between the two a named
+refusal instead of a bare digest mismatch.
+
+### Added
+
+- **A grant-carried confinement document is now the applied policy's §4
+  source.** `ExecutionRequest` gains `confinement_manifest` (optional,
+  additive; absent means exactly the pre-existing behaviour) carrying the
+  document `authorization.rs` already parsed and digest-verified — on the same
+  rule as the digest beside it: carried, never chosen. Both workers parse it
+  and fold a declared §4 listener **into** the document they compile, so the
+  digest the worker attests covers the listener and ADR-0035 §1 holds — one
+  object, applied and attested. On the microVM tier the folded port becomes
+  libkrun's `port_map` (`N:N`, matching guest-sees-host-port semantics), with
+  a refusal when socket hijacking is off rather than a listener that silently
+  receives nothing.
+
+  An issuer can predict the digest because every other input to the compiled
+  document is deployment configuration or the symbolic rootfs — which is why
+  this needed one field, not the symbolic-resource vocabulary ADR-0036's first
+  draft proposed.
+
+- **The equality contract.** After the fold, a carried document must equal the
+  compiled policy, or the run is refused at compile time with the differing
+  dimensions named by section — in both directions. A dimension the tier will
+  not deliver (§3, §5, §6) is named rather than surfacing later as a digest
+  mismatch that names nothing (found by cloister, whose §6 grant for the macOS
+  shim would have hit exactly that), and a document *missing* a compiled grant
+  is refused rather than run under narrower authority than its issuer signed.
+
 ### Fixed
+
+- **The sync workflow treated a missing `integration` branch as "nothing to
+  sync"** and exited green — which it did, once, on the first real promotion,
+  because merging a promotion PR deletes its head branch
+  (`delete_branch_on_merge` is server-side and overrides `--delete-branch=false`).
+  It now recreates the branch from `main` and emits a notice. Branch
+  protection (`allow_deletions: false`) stops the deletion at the source; the
+  workflow arm is the second guard.
+
+- **The worker's §4 comment was stale a second time** — still claiming
+  `dimensions().port` is always `None` above the thirty lines that read it.
+  Rewritten with both prior wrong versions named and the rule that prevents a
+  third: if the code and the comment disagree, trust the code and fix the
+  comment in the same commit that changed it.
 
 - **Stale section numbers the §6 insertion left in code comments.** Canonical
   serialization is §7 now, not §6 (three sites); `Dimensions` carries five
@@ -23,6 +71,15 @@ context, scoping notes, and review history are recoverable.
   deleted because a changelog that has been wrong once is worth being able to
   see: it is the same defect class as §9 condition 5 and as §8 step 2 — a claim
   that reads as current and is not.
+
+### Known boundary
+
+- The fold is verified **executed** (cloister ran grant → parse → equality
+  contract → `dimensions().port == Some((8443, None))`). `port_map` delivery
+  to a live guest and the tsi refusal are verified **by reading**: macOS has
+  no libkrun, CI has no KVM, and `libkrun_guest_listener.rs` self-skips
+  without a hypervisor. Run it on Linux hardware before calling the
+  guest-listener path proven.
 
 ### Documentation
 

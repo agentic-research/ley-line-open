@@ -1,6 +1,6 @@
 [package]
 name = "leyline-schema-spec"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Vendor-neutral substrate capability specs (moved from cloister/cloister-spec/ per bead ley-line-open-729a7e)"

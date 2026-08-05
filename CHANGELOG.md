@@ -10,6 +10,108 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.16.0] — 2026-08-04
+
+**A fifth confinement dimension, and a conformance list that tests the rule it
+already stated.** `confinement/v1` gains `unixSocket.allow`; §9 gains the
+condition every other section was already pointing at.
+
+### Added
+
+- **`confinement/v1` §6 `unixSocket.allow`** — UNIX socket paths a bundle may
+  dial, may serve, or both, in three modes: `connect`, `bind`, `connect-bind`.
+  Connect-only is the bare-string form and the bind-capable modes take the
+  object form, so the cheaper spelling is the safer one — the shape §2 already
+  uses, for the same reason.
+
+  `bind` exists because a mechanism underneath enforces exactly it, not because
+  the vocabulary looked symmetric: libkrun's vsock muxer answers a
+  guest-originated request against a `listen=true` mapping with a reset rather
+  than a connection (`process_op_request`, `virtio/vsock/muxer.rs`). Serve
+  -without-dial is a real enforced state, so the manifest must be able to name
+  it. A mode refused everywhere is recoverable; a missing mode is a v2 break.
+
+  §4 and §6 are **not** interchangeable, and the asymmetry belongs to the
+  kernels rather than to any implementation. Landlock filters TCP `bind(2)` per
+  port, so §4 means on Linux what it says; Seatbelt cannot, and refuses §4.
+  Seatbelt filters a UNIX socket per path, so §6 means on macOS what it says;
+  Landlock at the ABI this stack targets cannot — its network access set is
+  `BindTcp | ConnectTcp` and no network right covers AF_UNIX at any ABI — and
+  refuses §6. Routing a channel through a socket instead of a port does not
+  close the platform gap; it swaps which platform has one.
+
+  Recorded as *unavailable here*, not *impossible*: Landlock ABI 9 (kernel 7.1)
+  adds `LANDLOCK_ACCESS_FS_RESOLVE_UNIX` at exactly §6's per-path granularity.
+  The refusal rests on three current facts — the `landlock` crate stops at ABI
+  V7, nono targets ABI 5, and nono reads its UNIX-socket capabilities only in
+  the macOS backend — so it expires on its own when those advance, rather than
+  becoming a stale claim.
+
+- **`confinement/v1` §9 conformance condition 6** — a runner MUST refuse any
+  declaration its mechanism cannot express at the declared granularity, rather
+  than widening or silently dropping it.
+
+  The rule was already normative in §1, §4 and §6, and three of those sections
+  cited "§9 condition 5" as its home. Condition 5 is the identity-commit check
+  and says nothing of the kind. So the conformance list — the one an implementer
+  checks themselves against — never tested for it, and an implementation could
+  satisfy all five conditions while widening every declaration it could not
+  express. Found by cloister, who followed the cross-reference and correctly
+  reported themselves non-conformant against a clause that does not say what
+  they were sent there to find.
+
+  Condition 6 also states why the others cannot cover it: a widened or dropped
+  grant still hashes correctly, so conditions 2 and 5 are blind to it by
+  construction — the bytes are not what went wrong.
+
+### Changed
+
+- **CI is tiered by where a change is going, not by the event.** A PR targeting
+  `integration` runs `task ci`; a PR targeting `main` additionally runs the
+  release-profile perf gate and the version-consistency check. Selecting on
+  `github.base_ref` is the point: perf previously ran only on *push* to `main`,
+  where a failure reports a regression instead of preventing one.
+
+- **`integration` is kept current with `main` automatically.** A squash
+  promotion records the combined tree as one commit with no second parent, so
+  none of `integration`'s commits become ancestors of `main` and the merge base
+  never advances — which is how the branch came to be 92 ahead while missing an
+  entire correctness chain. A post-promotion workflow now merges `main` back
+  with `--no-ff`, and opens a PR rather than resolving conflicts silently.
+
+### Fixed
+
+- **§6's per-grant refusals were unreachable on the platform CI runs.** Both
+  conditions sat below the arm that refuses §6 wholesale on Linux, so no test
+  driving the compile path could execute them — cargo-mutants reported three
+  surviving mutants that were a property of where the logic sat rather than a
+  gap a test could close. The decisions are properties of the dimension, not of
+  the tier, and now live outside the platform-gated arm where every platform can
+  reach them.
+
+- **Stale section numbers left by the §6 insertion.** Canonical serialization is
+  §7 now, not §6 (three sites); `Dimensions` carries five dimensions, not four;
+  and `parse` applies the §2–§6 refusals, not §2–§5.
+
+### Documentation
+
+- **ADR-0035's first open question is answered**, and more strongly than it
+  asked: the aarch64 guest has no LSM framework at all — `CONFIG_SECURITY` is
+  unset in libkrunfw's config, and the shipped 5.5.0 dylib agrees
+  (`security/security.c` absent, `commoncap.c` present). Guest-side confinement
+  is seccomp-bpf only, and the `/sys/kernel/security/lsm` probe the ADR called
+  authoritative would have returned ENOENT and been read as "Landlock absent".
+  6.12 is where Landlock ABI v6 landed, so this is a config choice rather than a
+  version limitation.
+
+- **ADR-0036 (proposed)** — what a `confinementDigest` covers. A grant-carried
+  document is parsed and digest-verified today and then not applied, so §4 and
+  §6 are declarable, verified and undeliverable. The ADR is proposed, not
+  accepted; consumers should not yet depend on either reading of
+  `confinementDigest`.
+
+Beads: `ley-line-open-17536d`, `ley-line-open-5de852`, `ley-line-open-368ef3`.
+
 ## [0.15.1] — 2026-08-04
 
 **v0.15.0's confinement attestation did not function.** This release makes the

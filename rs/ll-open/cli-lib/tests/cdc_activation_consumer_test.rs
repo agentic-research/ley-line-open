@@ -42,9 +42,16 @@ fn activated_projection_publishes_chunked_4k_reads_to_a_real_arena() {
     let ctrl_path = temp.path().join("graph.ctrl");
     leyline_cli_lib::cmd_serve::setup_arena(&arena_path, 4 * 1024, Some(&ctrl_path)).unwrap();
 
-    let report = leyline_cli_lib::cmd_daemon::activate_cdc_and_snapshot(&conn, &ctrl_path, true)
-        .unwrap()
-        .expect("CDC was enabled");
+    let report = leyline_cli_lib::cmd_daemon::activate_cdc_and_snapshot(
+        &conn,
+        &ctrl_path,
+        Some(leyline_cli_lib::CdcTarget::Nodes),
+    )
+    .unwrap()
+    .expect("CDC was enabled");
+    let leyline_cli_lib::cmd_daemon::CdcActivationReport::Nodes(report) = report else {
+        panic!("the `nodes` target must report a nodes activation");
+    };
     assert!(report.populated_nodes > 0);
     assert_eq!(report.populated_nodes, report.eligible_nodes);
 
@@ -74,6 +81,111 @@ fn activated_projection_publishes_chunked_4k_reads_to_a_real_arena() {
         controller.current_root(),
         *serialized_bytes.hash().as_bytes(),
         "published root must pin the exact activated database bytes"
+    );
+}
+
+/// `ley-line-open-c3d746`: the daemon entry point hardcoded
+/// `activate_chunked_content`, so `--target source-blobs` reached only the
+/// standalone `leyline cdc enable` CLI and never the daemon path mache
+/// actually spawns. Mache traced this while trying to flip its own `--cdc`
+/// default and could not, because no daemon invocation could select the
+/// target.
+///
+/// The load-bearing assertion is the NEGATIVE one: `content_manifest` must
+/// stay empty. Asserting only that blob rows appeared would still pass if the
+/// daemon ran BOTH targets, or ran nodes and happened to leave blob rows from
+/// elsewhere. Empty `content_manifest` is what proves the selector chose.
+#[test]
+fn the_daemon_entry_point_honors_the_source_blobs_target() {
+    let temp = TempDir::new().unwrap();
+    let source_dir = temp.path().join("source");
+    std::fs::create_dir(&source_dir).unwrap();
+    // Comfortably above the 8 KiB chunking floor, so the target has real work
+    // and `populated_blobs > 0` distinguishes "selected" from "skipped".
+    let payload = "fedcba9876543210".repeat(64 * 1024);
+    std::fs::write(
+        source_dir.join("blobs.json"),
+        format!("{{\"data\":\"{payload}\"}}\n"),
+    )
+    .unwrap();
+
+    let db_path = temp.path().join("blobs.db");
+    let conn = Connection::open(&db_path).unwrap();
+    leyline_cli_lib::cmd_parse::parse_into_conn(&conn, &source_dir, Some("json"), None).unwrap();
+
+    let arena_path = temp.path().join("blobs.arena");
+    let ctrl_path = temp.path().join("blobs.ctrl");
+    leyline_cli_lib::cmd_serve::setup_arena(&arena_path, 4 * 1024, Some(&ctrl_path)).unwrap();
+
+    let report = leyline_cli_lib::cmd_daemon::activate_cdc_and_snapshot(
+        &conn,
+        &ctrl_path,
+        Some(leyline_cli_lib::CdcTarget::SourceBlobs),
+    )
+    .unwrap()
+    .expect("CDC was enabled");
+    let leyline_cli_lib::cmd_daemon::CdcActivationReport::SourceBlobs(report) = report else {
+        panic!("the `source-blobs` target must report a source_blobs activation");
+    };
+    assert!(
+        report.populated_blobs > 0,
+        "the fixture blob is above the chunking floor, so the target must populate it"
+    );
+
+    let blob_spans: i64 = conn
+        .query_row("SELECT COUNT(*) FROM blob_manifest", [], |row| row.get(0))
+        .unwrap();
+    assert!(blob_spans > 0, "source_blobs activation must tile the blob");
+
+    let node_spans: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+              WHERE type = 'table' AND name = 'content_manifest'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    if node_spans > 0 {
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM content_manifest", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            rows, 0,
+            "selecting source-blobs must NOT also build the nodes index — a \
+             populated content_manifest means the daemon ignored the target"
+        );
+    }
+}
+
+/// The disabled path must publish exactly once and activate neither target.
+#[test]
+fn no_target_activates_nothing_and_still_publishes() {
+    let temp = TempDir::new().unwrap();
+    let source_dir = temp.path().join("source");
+    std::fs::create_dir(&source_dir).unwrap();
+    std::fs::write(source_dir.join("small.json"), "{\"k\":\"v\"}\n").unwrap();
+
+    let db_path = temp.path().join("off.db");
+    let conn = Connection::open(&db_path).unwrap();
+    leyline_cli_lib::cmd_parse::parse_into_conn(&conn, &source_dir, Some("json"), None).unwrap();
+
+    let arena_path = temp.path().join("off.arena");
+    let ctrl_path = temp.path().join("off.ctrl");
+    leyline_cli_lib::cmd_serve::setup_arena(&arena_path, 4 * 1024, Some(&ctrl_path)).unwrap();
+
+    let report =
+        leyline_cli_lib::cmd_daemon::activate_cdc_and_snapshot(&conn, &ctrl_path, None).unwrap();
+    assert!(report.is_none(), "no target must activate nothing");
+
+    let controller = Controller::open_or_create(&ctrl_path).unwrap();
+    let serialized = conn.serialize("main").unwrap();
+    let serialized_bytes: &[u8] = serialized.as_ref();
+    assert_eq!(
+        controller.current_root(),
+        *serialized_bytes.hash().as_bytes(),
+        "the disabled path must still publish the exact database bytes"
     );
 }
 

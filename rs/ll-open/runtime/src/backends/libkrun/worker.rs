@@ -2,6 +2,7 @@ use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
+use crate::confinement::ConfinementManifest;
 use crate::{ExecutionError, ExecutionRequest};
 use serde::{Deserialize, Serialize};
 
@@ -171,7 +172,23 @@ pub fn execute_with_ready(
     // `native.rs` already did it this way, and its comment — "Deriving both from
     // `manifest` is what makes the attestation true by construction rather than
     // by discipline" — was accurate there and inaccurate one directory over.
-    let manifest = confinement_manifest(&resources.runtime_files, &resources.devices)?;
+    // Re-parsed rather than carried as a value: the worker is a separate
+    // process, so the document crosses as JSON either way, and parsing it here
+    // means the worker applies the same builder invariants `authorization.rs`
+    // did instead of trusting a shape someone else validated.
+    let authorized = match &request.confinement_manifest {
+        Some(document) => Some(ConfinementManifest::parse(document).map_err(|error| {
+            ExecutionError::invalid(format!(
+                "RunGrant.confinementManifest did not survive the worker boundary: {error}"
+            ))
+        })?),
+        None => None,
+    };
+    let manifest = confinement_manifest(
+        &resources.runtime_files,
+        &resources.devices,
+        authorized.as_ref(),
+    )?;
 
     // §4 on the microVM tier. `apply_manifest` below confines the VMM HOST
     // process; the guest's own listener is governed by the port map, which is a
@@ -191,36 +208,33 @@ pub fn execute_with_ready(
     //     Note libkrun's constraint: an exposed port is reachable in the guest
     //     by its HOST port number, so `N:N` is the only mapping that leaves the
     //     guest's own view of §4 intact.
-    // UNREACHABLE TODAY, and saying so rather than letting it read as a shipped
-    // feature. `confinement_manifest` builds LLO's OWN policy from host
-    // resources — rootfs, runtime files, devices — and never sets a port, so
-    // `dimensions().port` is always `None` here.
+    // REACHABLE since #329, through exactly one route. `confinement_manifest`
+    // above folds §4 from the grant's carried document — parsed and
+    // digest-verified in `authorization.rs`, forwarded on
+    // `ExecutionRequest.confinement_manifest`, re-parsed at this boundary —
+    // and from nowhere else: LLO's own policy never sets a port, and the
+    // equality contract inside the fold refuses any carried document that
+    // differs from the compiled one, differing dimensions named by section.
+    // So a `Some` here is always an issuer-committed listener, never caller
+    // intent, and never a partial document.
     //
-    // Where the gap actually is, stated precisely because the earlier version
-    // of this comment named the wrong one and would have sent the next reader
-    // to build something that already exists. `ConfinementManifest` is NOT
-    // write-only any more: `parse` ingests a confinement/v1 document, and
-    // `authorization.rs` already calls it on `RunGrant.confinementManifest`
-    // and refuses a grant whose carried document does not digest to the
-    // `confinementDigest` it names.
+    // Two prior versions of this comment were each wrong in turn, in the
+    // direction that misdirects hardest, and this file seems to attract the
+    // failure — so, plainly: the first said the manifest could not be parsed
+    // (it could; the ingest route existed), the second said `dimensions().port`
+    // was always `None` here and pointed at an open design question that #329
+    // closed with one field and no new machinery. If the code below and this
+    // comment ever disagree again, trust the code and fix the comment in the
+    // same commit that changed it.
     //
-    // What is missing is the LAST HOP. That parsed manifest is stored on
-    // `AuthorizedRun.confinement_manifest` and then never read: the worker
-    // compiles the internally-built document instead. So a grant declaring §4
-    // or §6 is parsed, digest-verified, and then not the policy applied — and
-    // the run is stopped, correctly, by the drift check in `backend.rs`, which
-    // compares the digest the worker attests against the one the grant
-    // authorized. Fail-closed, not silent, and non-functional: that is the
-    // whole of what "port.bind is inert" means today.
-    //
-    // Closing it is not plumbing. The enforced policy must ALSO carry the host
-    // resources a grant's author cannot know — the per-run rootfs path, the
-    // libkrun runtime files, the device nodes — so a merged document digests
-    // differently from the one signed, and the drift check would then reject
-    // every run. `ATTESTED_RUN_ROOTFS` is the existing answer for exactly one
-    // of those (a symbolic name in the attested bytes, substituted for the
-    // real path at compile time); generalizing it to runtime files and devices
-    // is the open design decision, tracked on `ley-line-open-17536d`.
+    // VERIFIED BY READING, NOT YET BY RUNNING: cloister executed the fold up
+    // to `dimensions().port == Some((bind, None))`, but no live microVM has
+    // exercised port_map delivery or the tsi refusal below — macOS has no
+    // libkrun to run and CI has no KVM. `libkrun_guest_listener.rs` is the
+    // test that does it — it self-skips via `hypervisor_or_skip()` when no
+    // hypervisor is present, so it runs green-by-vacuity everywhere but real
+    // Linux hardware. Run it there before calling the guest-listener path
+    // proven.
     if let Some((bind, _address)) = manifest.dimensions().port {
         if config.tsi_features == 0 {
             return Err(ExecutionError::invalid(format!(

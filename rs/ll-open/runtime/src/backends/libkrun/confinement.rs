@@ -68,6 +68,7 @@ pub const ATTESTED_RUN_ROOTFS: &str = "/run/rootfs/";
 pub fn confinement_manifest(
     runtime_files: &[PathBuf],
     devices: &[PathBuf],
+    authorized: Option<&ConfinementManifest>,
 ) -> Result<ConfinementManifest, ExecutionError> {
     // Fallible now that §2 refuses relative and traversing paths at the point
     // the grant is made. A caller handing us a relative `--runtime-file` gets
@@ -81,10 +82,104 @@ pub fn confinement_manifest(
     for path in devices {
         manifest = manifest.with_fs_grant(FsGrant::read_write(path.display().to_string()))?;
     }
+    // §4 is the one dimension a grant can originate, and the ONLY source is the
+    // authorized document — never the `ExecutionRequest`, which is caller
+    // intent. `authorization.rs` has already refused any grant whose carried
+    // document does not digest to the `confinementDigest` it names, so what
+    // arrives here has an issuer behind it.
+    //
+    // Taken INTO the manifest rather than applied beside it, which is what
+    // keeps ADR-0035 §1 true: the digest the worker attests is computed over
+    // this document, so the listener is inside the object the receipt commits
+    // to instead of being a grant nothing describes.
+    //
+    // The digest therefore changes when a listener is declared, and an issuer
+    // has to predict it. That is achievable precisely because the other inputs
+    // are stable: the rootfs is symbolic (ATTESTED_RUN_ROOTFS), and runtime
+    // files and devices come from `LibkrunBackendConfig` — deployment
+    // configuration fixed when the backend is constructed, not per-run values.
+    // An issuer configured for a deployment can compute this document exactly.
+    //
+    // §2, §3, §5 and §6 are deliberately NOT merged. Each would either widen
+    // what LLO grants itself or is refused by the compiler on one of the two
+    // tiers, and merging a dimension whose tier refuses it would turn a clean
+    // refusal into a digest mismatch — a worse diagnostic for the same outcome.
+    // §4 is the dimension the microVM tier can actually deliver.
+    if let Some((bind, address)) = authorized.and_then(|m| m.dimensions().port) {
+        manifest = manifest.with_port_bind(bind, address)?;
+    }
+    // A carried document is a COMMITMENT, not a menu. The fold above takes §4 —
+    // the one dimension a grant can originate on this tier — and everything
+    // else in the compiled document is LLO's own policy, so if the two still
+    // differ, some clause the issuer committed to is not the policy this
+    // worker would apply. Without this check that surfaced as a bare
+    // "confinement drift" digest mismatch from the supervisor: refused, never
+    // widened, but an error naming neither the dimension nor the reason —
+    // exactly the diagnostic downgrade the comment above warns folding would
+    // cause, produced instead by not folding. Found by cloister, whose §6
+    // grant for the macOS shim would have hit it first.
+    //
+    // Equality, not subset: an authorized document carrying an EXTRA §2 grant
+    // must also be refused here, because the alternative is a workload running
+    // under narrower filesystem authority than its issuer signed for, with the
+    // drift check as the only witness. The issuer can always satisfy this —
+    // every input to the compiled document is deployment configuration or the
+    // symbolic rootfs, none of it per-run.
+    if let Some(authorized) = authorized
+        && *authorized != manifest
+    {
+        return Err(ExecutionError::invalid(format!(
+            "confinement/v1: the authorized document commits to dimension(s) this \
+             tier's compiled policy does not carry ({}). The compiled document is \
+             LLO's own policy plus the §4 listener a grant may originate; a carried \
+             clause outside that cannot take effect, and proceeding would refuse \
+             the run later as a digest mismatch that names no dimension. Narrow \
+             the document to what this tier compiles, or drop the dimension.",
+            differing_dimensions(authorized, &manifest).join(", ")
+        )));
+    }
     // No `network` block at all. §3: an omitted block means no egress, which
     // is what `block_network()` enforces — so declaring an empty allow-list
     // would say the same thing twice, in two places that could disagree.
     Ok(manifest)
+}
+
+/// Which of the five dimensions differ, by section name, for the refusal
+/// above. Exhaustive by the same construction `capabilities_from_manifest`
+/// uses: destructuring `Dimensions` means a sixth dimension fails to compile
+/// here rather than being silently absent from a diagnostic.
+fn differing_dimensions(a: &ConfinementManifest, b: &ConfinementManifest) -> Vec<&'static str> {
+    let Dimensions {
+        fs_allow: a_fs,
+        allow_hosts: a_hosts,
+        port: a_port,
+        credential_source: a_cred,
+        unix_sockets: a_sockets,
+    } = a.dimensions();
+    let Dimensions {
+        fs_allow: b_fs,
+        allow_hosts: b_hosts,
+        port: b_port,
+        credential_source: b_cred,
+        unix_sockets: b_sockets,
+    } = b.dimensions();
+    let mut differing = Vec::new();
+    if a_fs != b_fs {
+        differing.push("§2 fs.allow");
+    }
+    if a_hosts != b_hosts {
+        differing.push("§3 network.allowHosts");
+    }
+    if a_port != b_port {
+        differing.push("§4 port.bind");
+    }
+    if a_cred != b_cred {
+        differing.push("§5 credentialSource");
+    }
+    if a_sockets != b_sockets {
+        differing.push("§6 unixSocket.allow");
+    }
+    differing
 }
 
 pub fn build_process_capabilities(
@@ -92,7 +187,7 @@ pub fn build_process_capabilities(
     runtime_files: &[PathBuf],
     devices: &[PathBuf],
 ) -> Result<CapabilitySet, ExecutionError> {
-    capabilities_from_manifest(&confinement_manifest(runtime_files, devices)?, rootfs)
+    capabilities_from_manifest(&confinement_manifest(runtime_files, devices, None)?, rootfs)
 }
 
 /// Compile a manifest into the `CapabilitySet` nono applies.
@@ -414,7 +509,7 @@ fn unix_socket_mode(grant: &UnixSocketGrant) -> Result<UnixSocketMode, Execution
 /// called only after the worker has loaded libkrun and resolved its rootfs.
 pub fn apply(config: &KrunConfig, resources: &VmmHostResources) -> Result<(), ExecutionError> {
     apply_manifest(
-        &confinement_manifest(&resources.runtime_files, &resources.devices)?,
+        &confinement_manifest(&resources.runtime_files, &resources.devices, None)?,
         &config.rootfs.canonical_path,
     )
 }
@@ -546,5 +641,135 @@ mod tests {
         let mode = unix_socket_mode(&UnixSocketGrant::connect(directory))
             .expect("a directory grant names a tree, so no leaf is resolved here");
         assert!(matches!(mode, UnixSocketMode::Connect));
+    }
+
+    /// Every comparison in `differing_dimensions` is load-bearing for a
+    /// diagnostic, and a diagnostic is exactly the kind of output a mutant
+    /// survives in: invert one `!=` and no refusal changes, only the message —
+    /// which then names a dimension that agrees, or omits the one that
+    /// differs. cargo-mutants found the §3 and §5 comparisons unexercised;
+    /// this pins all five, both directions, rather than the two the
+    /// integration tests happen to walk.
+    #[test]
+    fn differing_dimensions_names_exactly_the_dimensions_that_differ() {
+        let base = || {
+            ConfinementManifest::new()
+                .with_fs_grant(FsGrant::read_write(ATTESTED_RUN_ROOTFS))
+                .expect("rootfs grant")
+        };
+
+        assert!(
+            differing_dimensions(&base(), &base()).is_empty(),
+            "identical manifests must report no differing dimension"
+        );
+
+        let cases: Vec<(ConfinementManifest, &str)> = vec![
+            (
+                base()
+                    .with_fs_grant(FsGrant::read_only("/etc/hosts"))
+                    .expect("fs grant"),
+                "§2 fs.allow",
+            ),
+            (
+                base()
+                    .with_allowed_host("api.example.com")
+                    .expect("host grant"),
+                "§3 network.allowHosts",
+            ),
+            (
+                base().with_port_bind(8443, None).expect("port grant"),
+                "§4 port.bind",
+            ),
+            (
+                base()
+                    .with_credential_source("keychain://bundle-creds")
+                    .expect("credential source"),
+                "§5 credentialSource",
+            ),
+            (
+                base()
+                    .with_unix_socket(UnixSocketGrant::connect("/run/peer.sock"))
+                    .expect("socket grant"),
+                "§6 unixSocket.allow",
+            ),
+        ];
+
+        for (varied, expected) in &cases {
+            let named = differing_dimensions(varied, &base());
+            assert_eq!(
+                named,
+                vec![*expected],
+                "varying only {expected} must name exactly {expected}"
+            );
+        }
+
+        // All five at once, in section order — so no comparison can be
+        // silently dropped in favour of its neighbours.
+        let everything = base()
+            .with_fs_grant(FsGrant::read_only("/etc/hosts"))
+            .expect("fs grant")
+            .with_allowed_host("api.example.com")
+            .expect("host grant")
+            .with_port_bind(8443, None)
+            .expect("port grant")
+            .with_credential_source("keychain://bundle-creds")
+            .expect("credential source")
+            .with_unix_socket(UnixSocketGrant::connect("/run/peer.sock"))
+            .expect("socket grant");
+        assert_eq!(
+            differing_dimensions(&everything, &base()),
+            vec![
+                "§2 fs.allow",
+                "§3 network.allowHosts",
+                "§4 port.bind",
+                "§5 credentialSource",
+                "§6 unixSocket.allow",
+            ],
+            "every differing dimension must be named, in section order"
+        );
+    }
+
+    /// `apply` must surface a manifest-construction failure, not swallow it.
+    ///
+    /// The mutant this kills replaces `apply`'s body with `Ok(())` — a worker
+    /// that reports itself confined without having applied anything, which is
+    /// the falsest possible state. A relative runtime file fails §2 validation
+    /// inside `confinement_manifest`, so the error path is reachable without
+    /// touching the real sandbox: the failure fires before any irreversible
+    /// `Sandbox::apply_auto`.
+    #[test]
+    fn apply_refuses_before_the_sandbox_when_the_manifest_is_invalid() {
+        let config = KrunConfig {
+            run_id: "run-apply-test".into(),
+            rootfs: super::super::plan::ResolvedRootfs {
+                digest: crate::DigestRef {
+                    algorithm: "blake3-256".into(),
+                    value: "a".repeat(64),
+                },
+                canonical_path: std::env::temp_dir(),
+            },
+            executable: std::ffi::CString::new("/bin/true").expect("no NUL"),
+            arguments: Vec::new(),
+            environment: Vec::new(),
+            workdir: std::ffi::CString::new("/").expect("no NUL"),
+            vcpus: 1,
+            ram_mib: 64,
+            wall_time_ms: 1_000,
+            tsi_features: 0,
+            port_map: Vec::new(),
+        };
+        let resources = VmmHostResources {
+            // Relative: §2 refuses it at grant time, inside
+            // `confinement_manifest`, before anything irreversible.
+            runtime_files: vec![PathBuf::from("relative/libkrun.dylib")],
+            devices: Vec::new(),
+        };
+
+        let error = apply(&config, &resources)
+            .expect_err("an invalid runtime file must fail apply, not be skipped");
+        assert!(
+            error.to_string().contains("relative/libkrun.dylib"),
+            "the failure must name the offending path: {error}"
+        );
     }
 }

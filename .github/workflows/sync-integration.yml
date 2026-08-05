@@ -78,9 +78,31 @@ jobs:
         run: |
           set -euo pipefail
 
+          # A missing `integration` is NOT "nothing to do". This workflow runs on
+          # push to main, and the ordinary way main advances is an
+          # integration -> main promotion PR — whose head branch this repo
+          # deletes on merge (`delete_branch_on_merge: true`, which is a repo
+          # setting and overrides `gh pr merge --delete-branch=false`). So the
+          # single most likely reason the branch is absent here is that the
+          # promotion just deleted it, seconds ago.
+          #
+          # The first version of this arm printed a line and exited 0. It ran
+          # exactly once, on the first real promotion (run 30960935840), reported
+          # `absent`, went green, and repaired nothing — the drift it exists to
+          # prevent survived a successful run of the thing that prevents it. A
+          # gate that reports success for the one state it was written to catch
+          # is worse than no gate, because the green is read as evidence.
+          #
+          # Recreate it from main and say so loudly. After a promotion this is
+          # exactly right: main carries integration's work, so a branch cut from
+          # main loses nothing and the merge base starts advanced. If the branch
+          # went missing for some other reason, main is still the correct base to
+          # rebuild from, and the notice is the signal to go look.
           if ! git ls-remote --exit-code --heads origin integration >/dev/null 2>&1; then
-            echo "no integration branch — nothing to sync"
-            echo "outcome=absent" >>"$GITHUB_OUTPUT"
+            git push origin "origin/main:refs/heads/integration"
+            echo "::notice::integration was absent and has been recreated from main — \
+          expected immediately after a promotion PR, since merging it deletes the head branch"
+            echo "outcome=recreated" >>"$GITHUB_OUTPUT"
             exit 0
           fi
 

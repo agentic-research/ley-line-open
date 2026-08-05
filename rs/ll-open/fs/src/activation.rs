@@ -51,6 +51,13 @@ pub struct ActivationReport {
     pub unique_chunk_rows: u64,
     /// Total bytes stored across unique chunk rows in committed final state.
     pub unique_chunk_bytes: u64,
+    /// Rows in `blob_manifest` at commit — the `source_blobs` target's index,
+    /// present only if that target was activated on this database at some
+    /// point. Nonzero here means this `nodes` activation left it behind:
+    /// ordinary GC cannot reclaim it, because those rows are still FRESH, not
+    /// dead (`ley-line-open-1869d0`). Reported rather than silently carried,
+    /// matching `BlobActivationReport::skipped_sub_floor_blobs`.
+    pub stranded_source_blobs_manifest_rows: u64,
 }
 
 /// Progress emitted after each completely processed query page.
@@ -184,6 +191,10 @@ where
                     &tx,
                     "SELECT COALESCE(SUM(length(chunk_bytes)), 0) FROM content_chunks",
                     "sum unique CDC chunk bytes",
+                )?,
+                stranded_source_blobs_manifest_rows: table_row_count_if_exists(
+                    &tx,
+                    "blob_manifest",
                 )?,
             };
             tx.commit()
@@ -373,6 +384,31 @@ fn query_count(conn: &Connection, sql: &str, context: &'static str) -> Result<u6
     u64::try_from(value).context("nonnegative SQLite count exceeds u64")
 }
 
+/// Row count of `table` if it exists, else 0.
+///
+/// Used to report the OTHER activation target's manifest rows, so a
+/// `nodes`-only or `source_blobs`-only activation never has to CREATE the
+/// other target's schema purely to learn it is empty.
+/// `create_blob_chunked_schema`'s doc comment declines exactly that cost for
+/// `content_manifest`'s nodes generation triggers — this helper keeps the
+/// count query from reintroducing it through the back door. `table` is
+/// always a static literal from this module, never external input.
+fn table_row_count_if_exists(conn: &Connection, table: &str) -> Result<u64> {
+    let exists = query_count(
+        conn,
+        &format!("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '{table}'"),
+        "check for the other CDC target's manifest table",
+    )? > 0;
+    if !exists {
+        return Ok(0);
+    }
+    query_count(
+        conn,
+        &format!("SELECT COUNT(*) FROM {table}"),
+        "count the other CDC target's stranded manifest rows",
+    )
+}
+
 // ── source_blobs target ──────────────────────────────────────────────────────
 
 /// Deterministic summary of one `source_blobs` activation invocation.
@@ -400,6 +436,12 @@ pub struct BlobActivationReport {
     pub unique_chunk_rows: u64,
     /// Total bytes stored across unique chunk rows in committed final state.
     pub unique_chunk_bytes: u64,
+    /// Rows in `content_manifest` at commit — the `nodes` target's index,
+    /// present only if that target was activated on this database at some
+    /// point. Nonzero here means this `source_blobs` activation left it
+    /// behind: ordinary GC cannot reclaim it, because those rows are still
+    /// FRESH, not dead (`ley-line-open-1869d0`).
+    pub stranded_nodes_manifest_rows: u64,
 }
 
 /// Progress emitted after each completely processed query page.
@@ -551,6 +593,7 @@ where
                     "SELECT COALESCE(SUM(length(chunk_bytes)), 0) FROM content_chunks",
                     "sum unique CDC chunk bytes",
                 )?,
+                stranded_nodes_manifest_rows: table_row_count_if_exists(&tx, "content_manifest")?,
             };
             tx.commit()
                 .context("commit final blob CDC activation completeness check")?;
@@ -768,6 +811,44 @@ mod tests {
     #[test]
     fn the_chunking_floor_is_the_xet_floor() {
         assert_eq!(chunk_floor().unwrap(), 8192);
+    }
+
+    /// Direct unit coverage for `table_row_count_if_exists`, not just the
+    /// end-to-end `switching_targets_reports_the_abandoned_index_as_stranded`
+    /// falsifier in `fs/tests/cdc_source_blobs.rs`: this crate's diff-scoped
+    /// mutants slice runs `-C --lib` only (`tools/mutants_diff.sh`), so a
+    /// mutant here is invisible to any `tests/*.rs` integration file no
+    /// matter how thorough. The three real answers, in order:
+    ///   1. table absent → 0 (kills `Ok(0)`, trivially — but also the
+    ///      baseline every other case must beat).
+    ///   2. table present with 3 rows → 3, not merely nonzero (kills both
+    ///      `Ok(0)` AND `Ok(1)`; a mutant surviving on a "nonzero" assertion
+    ///      alone is exactly the report-formatting gap this module already
+    ///      exists to avoid).
+    ///   3. same table, real count still 3 — proves the exists-check itself
+    ///      is live: `> 0` mutated to `< 0` on an UNSIGNED count is always
+    ///      false, so a broken exists-check silently reports 0 even though
+    ///      the table is right there with rows in it.
+    #[test]
+    fn table_row_count_if_exists_reports_zero_absent_and_the_real_count_present() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert_eq!(
+            table_row_count_if_exists(&conn, "definitely_not_a_real_table").unwrap(),
+            0,
+            "a table that was never created must report 0, not error"
+        );
+
+        conn.execute_batch("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        for _ in 0..3 {
+            conn.execute("INSERT INTO probe DEFAULT VALUES", [])
+                .unwrap();
+        }
+        assert_eq!(
+            table_row_count_if_exists(&conn, "probe").unwrap(),
+            3,
+            "an existing table must report its REAL row count, not merely nonzero"
+        );
     }
 
     /// The contract failure is a NAMED refusal, not whatever SQL error

@@ -160,18 +160,21 @@ fn cdc_report_formats_as_stable_human_and_json_output() {
         manifest_rows: 7,
         unique_chunk_rows: 5,
         unique_chunk_bytes: 88,
+        stranded_source_blobs_manifest_rows: 6,
     };
     let human = leyline_cli_lib::cmd_cdc::format_report(report, false).unwrap();
     assert_eq!(
         human,
         "CDC enabled: eligible=3 populated=2 already_fresh=1 source_bytes=99 \
-         manifest_rows=7 unique_chunks=5 unique_chunk_bytes=88"
+         manifest_rows=7 unique_chunks=5 unique_chunk_bytes=88 \
+         stranded_source_blobs_manifest_rows=6"
     );
 
     let json = leyline_cli_lib::cmd_cdc::format_report(report, true).unwrap();
     let value: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(value["eligible_nodes"], 3);
     assert_eq!(value["unique_chunk_bytes"], 88);
+    assert_eq!(value["stranded_source_blobs_manifest_rows"], 6);
 }
 
 #[test]
@@ -313,13 +316,14 @@ fn cdc_blob_report_formats_as_stable_human_and_json_output() {
         manifest_rows: 7,
         unique_chunk_rows: 5,
         unique_chunk_bytes: 88,
+        stranded_nodes_manifest_rows: 4,
     };
     let human = leyline_cli_lib::cmd_cdc::format_blob_report(report, false).unwrap();
     assert_eq!(
         human,
         "CDC source_blobs enabled: eligible=3 populated=2 already_fresh=1 \
          skipped_sub_floor=9 source_bytes=99 manifest_rows=7 unique_chunks=5 \
-         unique_chunk_bytes=88"
+         unique_chunk_bytes=88 stranded_nodes_manifest_rows=4"
     );
 
     let json = leyline_cli_lib::cmd_cdc::format_blob_report(report, true).unwrap();
@@ -329,6 +333,7 @@ fn cdc_blob_report_formats_as_stable_human_and_json_output() {
     // operator sees the floor doing its job.
     assert_eq!(value["skipped_sub_floor_blobs"], 9);
     assert_eq!(value["unique_chunk_bytes"], 88);
+    assert_eq!(value["stranded_nodes_manifest_rows"], 4);
 }
 
 #[test]

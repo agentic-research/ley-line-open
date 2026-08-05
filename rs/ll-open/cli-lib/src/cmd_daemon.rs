@@ -348,28 +348,38 @@ pub async fn run_daemon_with_options(
             }
         };
         match report {
+            // `stranded_source_blobs_manifest_rows` is not padding either. A
+            // switch FROM `source_blobs` TO `nodes` on the same long-lived
+            // arena leaves the `source_blobs` index behind: normal GC cannot
+            // reclaim it (those rows are still fresh, not dead), so silence
+            // here reads as "nothing left over" when the arena is actually
+            // carrying two indexes (`ley-line-open-1869d0`).
             Some(CdcActivationReport::Nodes(report)) => eprintln!(
                 "CDC activation (nodes): eligible={} populated={} already_fresh={} \
-                 source_bytes={}",
+                 source_bytes={} stranded_source_blobs_manifest_rows={}",
                 report.eligible_nodes,
                 report.populated_nodes,
                 report.already_fresh_nodes,
                 report.processed_source_bytes,
+                report.stranded_source_blobs_manifest_rows,
             ),
             // `skipped_sub_floor` is not padding. A `source_blobs` run over a
             // corpus of small rows legitimately populates nothing, and without
             // this count that outcome is indistinguishable from a silent
             // no-op. It is the number that explains a disappointing result:
             // 395,173 of 395,173 nodes fell below the chunking floor on a real
-            // mache projection (`ley-line-open-baa57f`).
+            // mache projection (`ley-line-open-baa57f`). `stranded_nodes_manifest_rows`
+            // is the mirror of the nodes-branch count above, same reasoning.
             Some(CdcActivationReport::SourceBlobs(report)) => eprintln!(
                 "CDC activation (source-blobs): eligible={} populated={} \
-                 already_fresh={} skipped_sub_floor={} source_bytes={}",
+                 already_fresh={} skipped_sub_floor={} source_bytes={} \
+                 stranded_nodes_manifest_rows={}",
                 report.eligible_blobs,
                 report.populated_blobs,
                 report.already_fresh_blobs,
                 report.skipped_sub_floor_blobs,
                 report.processed_source_bytes,
+                report.stranded_nodes_manifest_rows,
             ),
             None => {}
         }

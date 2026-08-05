@@ -7,7 +7,7 @@ use crate::{ExecutionError, ExecutionRequest};
 use serde::{Deserialize, Serialize};
 
 use super::api::{DynamicKrunApi, KRUN_TSI_HIJACK_INET, PreparedVm, prepare_vm};
-use super::confinement::{VmmHostResources, apply_manifest, confinement_manifest};
+use super::confinement::{GrantFold, VmmHostResources, apply_manifest, confinement_manifest};
 use super::plan::{DirectoryRootfsResolver, compile_plan};
 use super::volume::{materialize_ephemeral_rootfs, verify_ephemeral_rootfs};
 
@@ -188,6 +188,7 @@ pub fn execute_with_ready(
         &resources.runtime_files,
         &resources.devices,
         authorized.as_ref(),
+        GrantFold::MicroVm,
     )?;
 
     // §4 on the microVM tier. `apply_manifest` below confines the VMM HOST

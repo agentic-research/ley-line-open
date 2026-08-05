@@ -56,21 +56,34 @@ who vouches for the expansion — that nothing currently needs, and the reviewed
 draft's mechanisms are preserved in git history at `640a056` for when
 something does.
 
-### O2. §6 delivery
+### O2. §6 delivery — native half DELIVERED, microVM half open
 
-A §6 grant is now refused by name at the fold, which is correct and
-uninformative: the dimension is enforceable on macOS today. Two pieces, in
-increasing order of design weight:
+**Native (delivered).** The fold is tier-scoped (`GrantFold::Native` vs
+`::MicroVm`): on the native tier — where the confined process IS the workload —
+it takes `unix_sockets` into the compiled document, the equality contract
+admits the carrying document, and `capabilities_from_manifest` compiles it
+(Seatbelt per-path on macOS; on Linux the Landlock ABI refusal keeps firing,
+named). Modes stay governed by `unix_socket_mode`: `bind` remains refused.
+Pinned by `a_unix_socket_grant_reaches_the_native_tier_and_moves_its_digest`,
+which uses cloister's shim socket verbatim.
 
-- **Native macOS:** the fold takes `unix_sockets` on the tier whose compiler
-  already accepts them (`capabilities_from_manifest` compiles §6 via Seatbelt;
-  the per-grant refusals in `unix_socket_mode` keep governing modes). The
-  equality contract then admits a §6-carrying document instead of refusing it.
-  Small, and unblocks cloister's shim.
-- **microVM:** §6 `bind` maps to the vsock `listen=true` mechanism — the
-  `add_vsock_port` caller that still does not exist. This needs decisions the
-  fold does not: guest port allocation, the path↔port pairing's place in the
-  attested document, and receipt evidence for the mapping.
+This is what retires cloister's `CLOISTER_ACCEPT_UNENFORCED_BIND` hole rather
+than acknowledging it: their harness-sandbox's own comment names the design —
+Seatbelt grants `network-bind`/`network-inbound` unqualified whenever localhost
+TCP is allowed at all, while "a connect-only UDS grant IS enforceable where a
+port is not." A §6 connect grant gives the workload the one socket the issuer
+named and no TCP capability whatsoever.
+
+**microVM (open).** The tier-scoping is why: there the confined process is the
+VMM host, and the workload reaches host sockets only through vsock mappings.
+Folding §6 there would grant the dial right to the wrong process while the
+workload still could not reach the endpoint — a policy attesting a channel the
+workload does not have. The named refusal stays
+(`the_microvm_tier_still_refuses_a_carried_unix_socket_by_name`) until the
+vsock `listen=true` mapping is wired — the `add_vsock_port` caller — which
+needs decisions the fold does not: guest port allocation, the path↔port
+pairing's place in the attested document, and receipt evidence for the
+mapping.
 
 ### O3. The platform-split digest
 

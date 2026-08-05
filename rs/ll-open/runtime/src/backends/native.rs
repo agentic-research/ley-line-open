@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::confinement::ConfinementManifest;
 use crate::{ExecutionError, ExecutionRequest};
 
-use super::libkrun::confinement::{capabilities_from_manifest, confinement_manifest};
+use super::libkrun::confinement::{GrantFold, capabilities_from_manifest, confinement_manifest};
 use super::libkrun::plan::{DirectoryRootfsResolver, compile_plan};
 use super::libkrun::volume::{materialize_ephemeral_rootfs, verify_ephemeral_rootfs};
 
@@ -137,7 +137,12 @@ pub fn execute_with_ready(
         })?),
         None => None,
     };
-    let manifest = confinement_manifest(&options.runtime_files, &[], authorized.as_ref())?;
+    let manifest = confinement_manifest(
+        &options.runtime_files,
+        &[],
+        authorized.as_ref(),
+        GrantFold::Native,
+    )?;
     let capabilities = capabilities_from_manifest(&manifest, &config.rootfs.canonical_path)?;
     nono::Sandbox::apply_auto(&capabilities).map_err(|error| {
         ExecutionError::backend(format!("apply native nono confinement: {error}"))

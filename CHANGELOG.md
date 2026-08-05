@@ -10,6 +10,28 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Added
+
+- **§6 `unixSocket.allow` is deliverable on the native tier** (ADR-0036 O2's
+  macOS half). The grant fold is now tier-scoped: on the native tier — where
+  the confined process is the workload — a carried §6 grant is folded into the
+  compiled document, admitted by the equality contract, and compiled by
+  Seatbelt per path; on Linux the Landlock ABI refusal keeps firing, named.
+  `bind` mode stays refused (`unix_socket_mode` is unchanged). On the microVM
+  tier the named refusal stays, deliberately: the confined process there is
+  the VMM host, and folding §6 would grant the dial right to the wrong
+  process while the guest workload still could not reach the endpoint — that
+  half waits on the vsock `listen=true` mapping.
+
+  This is the dimension cloister's macOS shim needs. Their harness-sandbox
+  currently rides an acknowledged unenforced hole — Seatbelt grants
+  `network-bind`/`network-inbound` unqualified whenever localhost TCP is
+  allowed at all, gated behind `CLOISTER_ACCEPT_UNENFORCED_BIND` — and its own
+  comment names this design as the fix: "a connect-only UDS grant IS
+  enforceable where a port is not." A §6 connect grant closes the hole: the
+  workload may dial the one socket the issuer named, and holds no TCP
+  capability whatsoever.
+
 ## [0.17.0] — 2026-08-05
 
 **§4 reaches the tier that enforces it.** A grant's confinement document now

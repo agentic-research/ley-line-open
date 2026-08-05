@@ -65,10 +65,37 @@ pub fn build_capabilities(
 /// meaningful paths like `/var/lib/bundle-X/`, not tempdirs.
 pub const ATTESTED_RUN_ROOTFS: &str = "/run/rootfs/";
 
+/// Which grant-originated dimensions the calling tier can deliver to the
+/// WORKLOAD — not to whatever process happens to get confined.
+///
+/// The distinction exists because the two tiers confine different processes.
+/// On the native tier the confined process IS the workload, so a §6 socket
+/// grant compiled into the policy is a right the workload holds. On the
+/// microVM tier the confined process is the VMM host; the workload runs
+/// inside the guest and reaches host sockets only through vsock mappings that
+/// are a separate mechanism (`add_vsock_port`, not yet wired — ADR-0036 O2's
+/// remaining half). Folding §6 there would grant the dial right to the VMM
+/// process while the workload still could not reach the endpoint: a policy
+/// that attests a channel the workload does not have, which is the exact
+/// shape ADR-0035 exists to prevent.
+///
+/// §4 folds on both: the native tier compiles it to a per-port kernel rule
+/// (Landlock `BindTcp`; refused on Seatbelt), and the microVM tier delivers
+/// it through the guest port map, wired in `worker.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantFold {
+    /// Native worker: the confined process is the workload. Folds §4 and §6.
+    Native,
+    /// microVM worker: the confined process is the VMM host. Folds §4 only;
+    /// a carried §6 keeps its named refusal until the vsock mapping exists.
+    MicroVm,
+}
+
 pub fn confinement_manifest(
     runtime_files: &[PathBuf],
     devices: &[PathBuf],
     authorized: Option<&ConfinementManifest>,
+    fold: GrantFold,
 ) -> Result<ConfinementManifest, ExecutionError> {
     // Fallible now that §2 refuses relative and traversing paths at the point
     // the grant is made. A caller handing us a relative `--runtime-file` gets
@@ -100,13 +127,33 @@ pub fn confinement_manifest(
     // configuration fixed when the backend is constructed, not per-run values.
     // An issuer configured for a deployment can compute this document exactly.
     //
-    // §2, §3, §5 and §6 are deliberately NOT merged. Each would either widen
-    // what LLO grants itself or is refused by the compiler on one of the two
-    // tiers, and merging a dimension whose tier refuses it would turn a clean
-    // refusal into a digest mismatch — a worse diagnostic for the same outcome.
-    // §4 is the dimension the microVM tier can actually deliver.
+    // §2, §3 and §5 are deliberately NOT merged on any tier. §2 would widen
+    // what LLO grants itself, and §3/§5 are refused by the compiler on both
+    // tiers — merging a dimension whose tier refuses it would turn a clean
+    // refusal into a digest mismatch, a worse diagnostic for the same outcome.
     if let Some((bind, address)) = authorized.and_then(|m| m.dimensions().port) {
         manifest = manifest.with_port_bind(bind, address)?;
+    }
+    // §6 folds on the native tier only — see `GrantFold` for why the microVM
+    // tier must not. This is the dimension cloister's macOS shim needs: their
+    // harness-sandbox names the exact design ("a connect-only UDS grant IS
+    // enforceable where a port is not") because Seatbelt grants network-bind
+    // and network-inbound UNQUALIFIED whenever localhost TCP is allowed at
+    // all, so their TCP shim channel rides an acknowledged un-enforced hole
+    // (CLOISTER_ACCEPT_UNENFORCED_BIND). A §6 connect grant closes that hole
+    // instead of acknowledging it: the workload can dial the one socket the
+    // issuer named, and holds no TCP capability whatsoever.
+    //
+    // Modes are still governed by `unix_socket_mode` at compile time — `bind`
+    // stays refused (no CapabilitySet member withholds connect), and on Linux
+    // the whole dimension keeps its Landlock ABI refusal. Both are named
+    // refusals at compile, not digest mismatches.
+    if matches!(fold, GrantFold::Native)
+        && let Some(authorized) = authorized
+    {
+        for grant in authorized.dimensions().unix_sockets {
+            manifest = manifest.with_unix_socket(grant.clone())?;
+        }
     }
     // A carried document is a COMMITMENT, not a menu. The fold above takes §4 —
     // the one dimension a grant can originate on this tier — and everything
@@ -187,7 +234,10 @@ pub fn build_process_capabilities(
     runtime_files: &[PathBuf],
     devices: &[PathBuf],
 ) -> Result<CapabilitySet, ExecutionError> {
-    capabilities_from_manifest(&confinement_manifest(runtime_files, devices, None)?, rootfs)
+    capabilities_from_manifest(
+        &confinement_manifest(runtime_files, devices, None, GrantFold::MicroVm)?,
+        rootfs,
+    )
 }
 
 /// Compile a manifest into the `CapabilitySet` nono applies.
@@ -509,7 +559,12 @@ fn unix_socket_mode(grant: &UnixSocketGrant) -> Result<UnixSocketMode, Execution
 /// called only after the worker has loaded libkrun and resolved its rootfs.
 pub fn apply(config: &KrunConfig, resources: &VmmHostResources) -> Result<(), ExecutionError> {
     apply_manifest(
-        &confinement_manifest(&resources.runtime_files, &resources.devices, None)?,
+        &confinement_manifest(
+            &resources.runtime_files,
+            &resources.devices,
+            None,
+            GrantFold::MicroVm,
+        )?,
         &config.rootfs.canonical_path,
     )
 }

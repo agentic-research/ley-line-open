@@ -395,7 +395,19 @@ fn an_authorized_listener_reaches_the_compiled_manifest_and_moves_its_digest() {
          compiled before this field existed"
     );
 
+    // The full document, exactly as an issuer commits to it: LLO's own policy
+    // for this deployment plus the listener. Partial documents are refused by
+    // the equality contract — a carried document is what the digest covers, so
+    // it has to BE the policy, not a fragment of one.
     let authorized = ConfinementManifest::new()
+        .with_fs_grant(leyline_runtime::confinement::FsGrant::read_write(
+            leyline_runtime::backends::libkrun::confinement::ATTESTED_RUN_ROOTFS,
+        ))
+        .expect("rootfs grant")
+        .with_fs_grant(leyline_runtime::confinement::FsGrant::read_only(
+            "/usr/lib/libkrun.dylib",
+        ))
+        .expect("runtime file grant")
         .with_port_bind(8443, None)
         .expect("8443 is a legal §4 port");
     let with = leyline_runtime::backends::libkrun::confinement::confinement_manifest(
@@ -427,7 +439,14 @@ fn an_authorized_listener_reaches_the_compiled_manifest_and_moves_its_digest() {
 /// document through cannot silently open a port that nobody declared.
 #[test]
 fn an_authorized_document_without_a_listener_does_not_acquire_one() {
-    let authorized = ConfinementManifest::new();
+    // LLO's exact document for an empty deployment — the rootfs grant and
+    // nothing else. That is what "declares no listener" means for a carried
+    // document: identical to the compiled policy, minus nothing.
+    let authorized = ConfinementManifest::new()
+        .with_fs_grant(leyline_runtime::confinement::FsGrant::read_write(
+            leyline_runtime::backends::libkrun::confinement::ATTESTED_RUN_ROOTFS,
+        ))
+        .expect("rootfs grant");
     let compiled = leyline_runtime::backends::libkrun::confinement::confinement_manifest(
         &[],
         &[],
@@ -448,5 +467,80 @@ fn an_authorized_document_without_a_listener_does_not_acquire_one() {
             .expect("digest"),
         "carrying a document that declares nothing must digest identically to \
          carrying no document at all"
+    );
+}
+
+/// The case cloister found before any test did: a carried dimension the fold
+/// does not deliver.
+///
+/// Their scenario exactly — a §6 grant for the macOS shim. Before this check,
+/// that document was parsed, digest-verified, authorized, and then the fold
+/// dropped §6: the compiled document digested differently from the grant's
+/// commitment, and the supervisor refused the run as "confinement drift" — an
+/// error naming neither §6 nor the reason. Refused, never widened, so not a
+/// security hole; but the issuer believed they granted a channel, the workload
+/// could not use it, and nothing said why.
+///
+/// Now the refusal happens at compile time and names the dimension. This is
+/// §9 condition 6 applied to a narrower commitment: a clause that cannot take
+/// effect is a rejection, never a silent pass-through into a digest mismatch.
+#[test]
+fn a_carried_dimension_the_fold_does_not_deliver_is_refused_by_name() {
+    let authorized = ConfinementManifest::new()
+        .with_fs_grant(leyline_runtime::confinement::FsGrant::read_write(
+            leyline_runtime::backends::libkrun::confinement::ATTESTED_RUN_ROOTFS,
+        ))
+        .expect("rootfs grant")
+        .with_unix_socket(leyline_runtime::confinement::UnixSocketGrant::connect(
+            "/run/cloister/shim.sock",
+        ))
+        .expect("a legal §6 grant");
+
+    let error = leyline_runtime::backends::libkrun::confinement::confinement_manifest(
+        &[],
+        &[],
+        Some(&authorized),
+    )
+    .expect_err("a carried §6 cannot take effect on this tier and must be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains("§6 unixSocket.allow"),
+        "the refusal must name the dimension the issuer committed to: {message}"
+    );
+    assert!(
+        !message.contains("§2") && !message.contains("§4 port.bind"),
+        "and must not name dimensions that agree: {message}"
+    );
+}
+
+/// The other half of the equality contract: a carried document missing a grant
+/// the compiled policy carries is refused too, not run narrower than signed.
+///
+/// Equality rather than subset is deliberate. A document missing the runtime
+/// file grants would digest differently from the applied policy, so the drift
+/// check would refuse it anyway — but as a bare mismatch. Worse, treating the
+/// carried document as a lower bound would let a run proceed under filesystem
+/// authority its issuer never saw. Both directions of disagreement are the
+/// same defect: the commitment and the policy are not one object.
+#[test]
+fn a_carried_document_missing_a_compiled_grant_is_refused_by_name() {
+    // LLO's document for a deployment WITH a runtime file — but the issuer
+    // committed to a document without it.
+    let authorized = ConfinementManifest::new()
+        .with_fs_grant(leyline_runtime::confinement::FsGrant::read_write(
+            leyline_runtime::backends::libkrun::confinement::ATTESTED_RUN_ROOTFS,
+        ))
+        .expect("rootfs grant");
+
+    let error = leyline_runtime::backends::libkrun::confinement::confinement_manifest(
+        &[std::path::PathBuf::from("/usr/lib/libkrun.dylib")],
+        &[],
+        Some(&authorized),
+    )
+    .expect_err("a document narrower than the compiled policy must be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains("§2 fs.allow"),
+        "the refusal must name the filesystem dimension: {message}"
     );
 }

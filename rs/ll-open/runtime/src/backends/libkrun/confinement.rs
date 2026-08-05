@@ -108,10 +108,78 @@ pub fn confinement_manifest(
     if let Some((bind, address)) = authorized.and_then(|m| m.dimensions().port) {
         manifest = manifest.with_port_bind(bind, address)?;
     }
+    // A carried document is a COMMITMENT, not a menu. The fold above takes §4 —
+    // the one dimension a grant can originate on this tier — and everything
+    // else in the compiled document is LLO's own policy, so if the two still
+    // differ, some clause the issuer committed to is not the policy this
+    // worker would apply. Without this check that surfaced as a bare
+    // "confinement drift" digest mismatch from the supervisor: refused, never
+    // widened, but an error naming neither the dimension nor the reason —
+    // exactly the diagnostic downgrade the comment above warns folding would
+    // cause, produced instead by not folding. Found by cloister, whose §6
+    // grant for the macOS shim would have hit it first.
+    //
+    // Equality, not subset: an authorized document carrying an EXTRA §2 grant
+    // must also be refused here, because the alternative is a workload running
+    // under narrower filesystem authority than its issuer signed for, with the
+    // drift check as the only witness. The issuer can always satisfy this —
+    // every input to the compiled document is deployment configuration or the
+    // symbolic rootfs, none of it per-run.
+    if let Some(authorized) = authorized
+        && *authorized != manifest
+    {
+        return Err(ExecutionError::invalid(format!(
+            "confinement/v1: the authorized document commits to dimension(s) this \
+             tier's compiled policy does not carry ({}). The compiled document is \
+             LLO's own policy plus the §4 listener a grant may originate; a carried \
+             clause outside that cannot take effect, and proceeding would refuse \
+             the run later as a digest mismatch that names no dimension. Narrow \
+             the document to what this tier compiles, or drop the dimension.",
+            differing_dimensions(authorized, &manifest).join(", ")
+        )));
+    }
     // No `network` block at all. §3: an omitted block means no egress, which
     // is what `block_network()` enforces — so declaring an empty allow-list
     // would say the same thing twice, in two places that could disagree.
     Ok(manifest)
+}
+
+/// Which of the five dimensions differ, by section name, for the refusal
+/// above. Exhaustive by the same construction `capabilities_from_manifest`
+/// uses: destructuring `Dimensions` means a sixth dimension fails to compile
+/// here rather than being silently absent from a diagnostic.
+fn differing_dimensions(a: &ConfinementManifest, b: &ConfinementManifest) -> Vec<&'static str> {
+    let Dimensions {
+        fs_allow: a_fs,
+        allow_hosts: a_hosts,
+        port: a_port,
+        credential_source: a_cred,
+        unix_sockets: a_sockets,
+    } = a.dimensions();
+    let Dimensions {
+        fs_allow: b_fs,
+        allow_hosts: b_hosts,
+        port: b_port,
+        credential_source: b_cred,
+        unix_sockets: b_sockets,
+    } = b.dimensions();
+    let mut differing = Vec::new();
+    if a_fs != b_fs {
+        differing.push("§2 fs.allow");
+    }
+    if a_hosts != b_hosts {
+        differing.push("§3 network.allowHosts");
+    }
+    if a_port != b_port {
+        differing.push("§4 port.bind");
+    }
+    if a_cred != b_cred {
+        differing.push("§5 credentialSource");
+    }
+    if a_sockets != b_sockets {
+        differing.push("§6 unixSocket.allow");
+    }
+    differing
 }
 
 pub fn build_process_capabilities(

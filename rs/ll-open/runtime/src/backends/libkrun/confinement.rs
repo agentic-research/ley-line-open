@@ -642,4 +642,134 @@ mod tests {
             .expect("a directory grant names a tree, so no leaf is resolved here");
         assert!(matches!(mode, UnixSocketMode::Connect));
     }
+
+    /// Every comparison in `differing_dimensions` is load-bearing for a
+    /// diagnostic, and a diagnostic is exactly the kind of output a mutant
+    /// survives in: invert one `!=` and no refusal changes, only the message —
+    /// which then names a dimension that agrees, or omits the one that
+    /// differs. cargo-mutants found the §3 and §5 comparisons unexercised;
+    /// this pins all five, both directions, rather than the two the
+    /// integration tests happen to walk.
+    #[test]
+    fn differing_dimensions_names_exactly_the_dimensions_that_differ() {
+        let base = || {
+            ConfinementManifest::new()
+                .with_fs_grant(FsGrant::read_write(ATTESTED_RUN_ROOTFS))
+                .expect("rootfs grant")
+        };
+
+        assert!(
+            differing_dimensions(&base(), &base()).is_empty(),
+            "identical manifests must report no differing dimension"
+        );
+
+        let cases: Vec<(ConfinementManifest, &str)> = vec![
+            (
+                base()
+                    .with_fs_grant(FsGrant::read_only("/etc/hosts"))
+                    .expect("fs grant"),
+                "§2 fs.allow",
+            ),
+            (
+                base()
+                    .with_allowed_host("api.example.com")
+                    .expect("host grant"),
+                "§3 network.allowHosts",
+            ),
+            (
+                base().with_port_bind(8443, None).expect("port grant"),
+                "§4 port.bind",
+            ),
+            (
+                base()
+                    .with_credential_source("keychain://bundle-creds")
+                    .expect("credential source"),
+                "§5 credentialSource",
+            ),
+            (
+                base()
+                    .with_unix_socket(UnixSocketGrant::connect("/run/peer.sock"))
+                    .expect("socket grant"),
+                "§6 unixSocket.allow",
+            ),
+        ];
+
+        for (varied, expected) in &cases {
+            let named = differing_dimensions(varied, &base());
+            assert_eq!(
+                named,
+                vec![*expected],
+                "varying only {expected} must name exactly {expected}"
+            );
+        }
+
+        // All five at once, in section order — so no comparison can be
+        // silently dropped in favour of its neighbours.
+        let everything = base()
+            .with_fs_grant(FsGrant::read_only("/etc/hosts"))
+            .expect("fs grant")
+            .with_allowed_host("api.example.com")
+            .expect("host grant")
+            .with_port_bind(8443, None)
+            .expect("port grant")
+            .with_credential_source("keychain://bundle-creds")
+            .expect("credential source")
+            .with_unix_socket(UnixSocketGrant::connect("/run/peer.sock"))
+            .expect("socket grant");
+        assert_eq!(
+            differing_dimensions(&everything, &base()),
+            vec![
+                "§2 fs.allow",
+                "§3 network.allowHosts",
+                "§4 port.bind",
+                "§5 credentialSource",
+                "§6 unixSocket.allow",
+            ],
+            "every differing dimension must be named, in section order"
+        );
+    }
+
+    /// `apply` must surface a manifest-construction failure, not swallow it.
+    ///
+    /// The mutant this kills replaces `apply`'s body with `Ok(())` — a worker
+    /// that reports itself confined without having applied anything, which is
+    /// the falsest possible state. A relative runtime file fails §2 validation
+    /// inside `confinement_manifest`, so the error path is reachable without
+    /// touching the real sandbox: the failure fires before any irreversible
+    /// `Sandbox::apply_auto`.
+    #[test]
+    fn apply_refuses_before_the_sandbox_when_the_manifest_is_invalid() {
+        let config = KrunConfig {
+            run_id: "run-apply-test".into(),
+            rootfs: super::super::plan::ResolvedRootfs {
+                digest: crate::DigestRef {
+                    algorithm: "blake3-256".into(),
+                    value: "a".repeat(64),
+                },
+                canonical_path: std::env::temp_dir(),
+            },
+            executable: std::ffi::CString::new("/bin/true").expect("no NUL"),
+            arguments: Vec::new(),
+            environment: Vec::new(),
+            workdir: std::ffi::CString::new("/").expect("no NUL"),
+            vcpus: 1,
+            ram_mib: 64,
+            wall_time_ms: 1_000,
+            tsi_features: 0,
+            port_map: Vec::new(),
+        };
+        let resources = VmmHostResources {
+            // Relative: §2 refuses it at grant time, inside
+            // `confinement_manifest`, before anything irreversible.
+            runtime_files: vec![PathBuf::from("relative/libkrun.dylib")],
+            devices: Vec::new(),
+        };
+
+        let error = apply(&config, &resources)
+            .expect_err("an invalid runtime file must fail apply, not be skipped");
+        assert!(
+            error.to_string().contains("relative/libkrun.dylib"),
+            "the failure must name the offending path: {error}"
+        );
+    }
 }

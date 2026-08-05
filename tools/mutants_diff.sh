@@ -264,6 +264,8 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = cli ]; then
         -C --lib \
         -C --test -C execution_client \
         -C --test -C execution_transport \
+        -C --test -C cdc_activation_consumer_test \
+        -C --test -C cdc_command_test \
         --package leyline-cli-lib --test-workspace=false
   fi
 fi

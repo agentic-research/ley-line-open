@@ -212,6 +212,91 @@ fn identical_content_in_nodes_and_source_blobs_shares_one_chunk_pool() {
     );
 }
 
+/// `ley-line-open-1869d0`: switching which target a long-lived arena indexes
+/// is additive, not a migration — the target you stop using keeps its
+/// manifest rows, and ordinary GC cannot reclaim them because they are still
+/// FRESH (a stale witness or a deleted source row is what makes a manifest
+/// DEAD; a row nothing reads anymore is neither). Filed while reviewing
+/// #338 (`ley-line-open-c3d746`, daemon `--cdc-target`): that PR made the
+/// switch reachable, but nothing in activation reports what the switch
+/// leaves behind.
+///
+/// This is the falsifier for the cheapest of the bead's three sketched
+/// resolutions: report the OTHER target's resident row count at activation
+/// time rather than silently carrying it. Three states, in order, because
+/// the interesting bug is not "the count is ever nonzero" but "the count is
+/// zero exactly when the other target's manifest table does not exist yet,
+/// and nonzero exactly once it does":
+///   1. Only `nodes` activated: `source_blobs` was NEVER activated on this
+///      database, so `blob_manifest` does not exist. The reported count must
+///      be 0 — not merely small, but computed via a path that does not
+///      require creating the table to prove it is empty.
+///   2. `source_blobs` activated next, on the SAME database: its report
+///      must show the `nodes` target's manifest rows as stranded, and the
+///      count must equal the real `content_manifest` row count, not just be
+///      nonzero.
+///   3. `nodes` re-activated a second time: `blob_manifest` now exists (step
+///      2 created it), so the nodes report's count must flip from 0 to
+///      nonzero — proving the FIRST activation's 0 was "table absent", not a
+///      query that always returns 0.
+#[test]
+fn switching_targets_reports_the_abandoned_index_as_stranded() {
+    let conn = Connection::open_in_memory().unwrap();
+    leyline_schema::create_nodes_table(&conn).unwrap();
+    leyline_ts::schema::create_source_blobs_table(&conn).unwrap();
+
+    let text = "abcdefghij".repeat(1024);
+    conn.execute(
+        "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) \
+         VALUES ('f.txt', '', 'f.txt', 0, ?1, 7, ?2)",
+        params![text.len() as i64, text],
+    )
+    .unwrap();
+    insert_blob(&conn, text.as_bytes());
+
+    // 1. nodes only — source_blobs was never activated, blob_manifest does
+    // not exist. Nothing to strand yet.
+    let first_nodes = activate_chunked_content(&conn, ActivationOptions::default()).unwrap();
+    assert_eq!(
+        first_nodes.stranded_source_blobs_manifest_rows, 0,
+        "no source_blobs activation has ever run — there is no manifest to strand"
+    );
+
+    // 2. source_blobs activated on the SAME database — the nodes index it
+    // did not touch must now read as stranded, at the real row count.
+    let blob_report = activate_chunked_source_blobs(&conn, ActivationOptions::default()).unwrap();
+    let real_node_manifest_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM content_manifest", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(
+        real_node_manifest_rows > 0,
+        "precondition: the nodes activation above must have written spans"
+    );
+    assert_eq!(
+        blob_report.stranded_nodes_manifest_rows, real_node_manifest_rows as u64,
+        "the reported count must be the REAL content_manifest row count, \
+         not merely nonzero"
+    );
+
+    // 3. nodes re-activated — blob_manifest exists now (step 2 created it),
+    // so the count must flip from 0 to nonzero, proving step 1's 0 meant
+    // "table absent" and not "always report 0".
+    let second_nodes = activate_chunked_content(&conn, ActivationOptions::default()).unwrap();
+    let real_blob_manifest_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM blob_manifest", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        real_blob_manifest_rows > 0,
+        "precondition: the source_blobs activation above must have written spans"
+    );
+    assert_eq!(
+        second_nodes.stranded_source_blobs_manifest_rows, real_blob_manifest_rows as u64,
+        "once blob_manifest exists, the nodes report must count its real rows"
+    );
+}
+
 #[test]
 fn gc_keeps_chunks_referenced_only_by_blob_manifests() {
     let conn = blob_db();

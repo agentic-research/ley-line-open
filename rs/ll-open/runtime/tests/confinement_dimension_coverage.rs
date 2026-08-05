@@ -555,3 +555,84 @@ fn the_microvm_projection_accepts_the_socket_grant_the_native_tier_refuses() {
         "macOS must refuse the mode, naming it: {message}"
     );
 }
+
+/// §3 `connectLocal` compiles on BOTH native tiers — the first channel clause
+/// with no platform split, and the reason ADR-0037 exists.
+///
+/// §4 is Linux-only (Seatbelt cannot scope a bind by port) and §6 is
+/// macOS-only at this ABI (Landlock has no AF_UNIX right ≤ V7). This one is
+/// enforceable on both today: Landlock scopes `ConnectTcp` per port, and
+/// Seatbelt scopes `network-outbound` per port. That claim was disbelieved by
+/// both implementers until it was measured (ADR-0037, ley-line-open-e41717),
+/// so it gets a test rather than a comment.
+#[test]
+fn a_local_connect_grant_compiles_on_every_native_platform() {
+    let manifest = ConfinementManifest::new()
+        .with_fs_grant(FsGrant::read_only("/usr/lib/"))
+        .expect("valid fs grant")
+        .with_connect_local(8443)
+        .expect("8443 is a legal loopback target");
+
+    let capabilities = compile(&manifest).expect("connectLocal compiles on this platform");
+
+    // ProxyOnly, not Blocked: the dimension replaces the terminal
+    // `block_network()` with a mode that permits exactly one destination.
+    // This assertion is load-bearing beyond "we used the right builder", and
+    // the reason is not obvious: nono's emitter triggers on the LIST, not the
+    // mode — `if !bind_ports.is_empty() || has_localhost_tcp`. A populated
+    // `localhost_ports` re-adds network-bind and network-inbound UNDERNEATH a
+    // mode that still reads ProxyOnly, silently reopening the hole. Today the
+    // §3-only path never calls `allow_localhost_port`, which is incidental to
+    // how the branches are ordered rather than enforced by anything — so this
+    // is the guard. Cloister hit exactly this coupling fixing 2d420c: setting
+    // the mode was necessary and not sufficient.
+    assert!(
+        capabilities.localhost_ports().is_empty(),
+        "connectLocal must NOT go through allow_localhost_port — that grant is \
+         bidirectional, and a populated localhost_ports re-adds bind/inbound \
+         under a ProxyOnly mode, which is the hole this dimension avoids"
+    );
+}
+
+/// The dimension is refused on the microVM tier, naming itself.
+///
+/// There the workload is the guest; its egress crosses the hypervisor, and
+/// this profile confines the VMM host. `krun_add_vsock_port2` pairs a guest
+/// port with a host UNIX SOCKET and has no TCP analogue, so delivering it
+/// would need socket hijacking — a boundary inversion. §9 condition 6.
+#[test]
+fn a_local_connect_grant_is_refused_on_the_microvm_tier_by_name() {
+    let manifest = ConfinementManifest::new()
+        .with_connect_local(8443)
+        .expect("valid connectLocal");
+
+    let error = capabilities_from_manifest(&manifest, run_rootfs(), Tier::MicroVm)
+        .expect_err("the guest's egress does not cross this profile");
+    let message = error.to_string();
+    assert!(
+        message.contains("connectLocal") && message.contains("§6"),
+        "the refusal must name the dimension and point at the one this tier \
+         does deliver: {message}"
+    );
+}
+
+/// A manifest without §3 still compiles to a fully blocked network.
+///
+/// The seam worth pinning: `connectLocal` swaps the terminal
+/// `block_network()` for `proxy_only`, so the no-§3 path must be shown to
+/// still reach Blocked. A regression here would open a destination on every
+/// manifest that never asked for one.
+#[test]
+fn a_manifest_without_local_connect_still_blocks_the_network() {
+    let capabilities = compile(
+        &ConfinementManifest::new()
+            .with_fs_grant(FsGrant::read_only("/usr/lib/"))
+            .expect("valid fs grant"),
+    )
+    .expect("fs-only manifest compiles");
+
+    assert!(
+        capabilities.is_network_blocked(),
+        "a manifest declaring no channel must reach block_network()"
+    );
+}

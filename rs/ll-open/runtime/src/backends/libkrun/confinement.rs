@@ -168,6 +168,14 @@ pub fn confinement_manifest(
             manifest = manifest.with_unix_socket(grant.clone())?;
         }
     }
+    // §3 `connectLocal` — the third dimension a grant may originate, and the
+    // first with no platform split between the native tiers: Landlock scopes
+    // ConnectTcp per port, and Seatbelt scopes network-outbound per port
+    // (measured — ADR-0037, `ley-line-open-e41717`). Refused on the microVM
+    // tier, where the workload's egress boundary is the hypervisor.
+    if let Some(port) = authorized.and_then(|m| m.dimensions().connect_local) {
+        manifest = manifest.with_connect_local(port)?;
+    }
     // A carried document is a COMMITMENT, not a menu. The folds above take §4
     // and §6 — the two dimensions a grant can originate — and everything
     // else in the compiled document is LLO's own policy, so if the two still
@@ -215,6 +223,7 @@ fn differing_dimensions(a: &ConfinementManifest, b: &ConfinementManifest) -> Vec
         port: a_port,
         credential_source: a_cred,
         unix_sockets: a_sockets,
+        connect_local: a_connect,
     } = a.dimensions();
     let Dimensions {
         fs_allow: b_fs,
@@ -222,6 +231,7 @@ fn differing_dimensions(a: &ConfinementManifest, b: &ConfinementManifest) -> Vec
         port: b_port,
         credential_source: b_cred,
         unix_sockets: b_sockets,
+        connect_local: b_connect,
     } = b.dimensions();
     let mut differing = Vec::new();
     if a_fs != b_fs {
@@ -238,6 +248,9 @@ fn differing_dimensions(a: &ConfinementManifest, b: &ConfinementManifest) -> Vec
     }
     if a_sockets != b_sockets {
         differing.push("§6 unixSocket.allow");
+    }
+    if a_connect != b_connect {
+        differing.push("§3 network.connectLocal");
     }
     differing
 }
@@ -286,6 +299,7 @@ pub fn capabilities_from_manifest(
         port,
         credential_source,
         unix_sockets,
+        connect_local,
     } = manifest.dimensions();
 
     let mut capabilities = CapabilitySet::new();
@@ -493,6 +507,73 @@ pub fn capabilities_from_manifest(
         // property of the `block_network()` below rather than of this call —
         // the filter is by port, not by destination IP.
         capabilities = capabilities.allow_localhost_port(bind);
+    }
+
+    // §3 `connectLocal` — the workload dials one loopback port and may not
+    // bind it. The whole dimension rests on `proxy_only` being the ONE builder
+    // that compiles to connect-without-bind on both platforms:
+    //
+    //   allow_tcp_connect     Linux only — errors on macOS (macos.rs:857)
+    //   allow_localhost_port  bidirectional by definition; on macOS its
+    //                         bind/inbound is blanket. This is the hole.
+    //   proxy_only            macOS: (allow network-outbound (remote tcp
+    //                         "localhost:N")) with bind_ports empty, so no
+    //                         network-bind and no network-inbound is emitted.
+    //                         Linux: a NetPort rule for that port.
+    //
+    // A third fact, from cloister, that only bites an embedder going through
+    // nono's CapabilityManifest rather than its CapabilitySet: the good path
+    // is unreachable from that surface at all. `manifest_convert.rs:51` maps
+    // NetworkMode::Proxy to `ProxyOnly { port: 0, bind_ports: vec![] }` —
+    // "Port 0 is a placeholder, the CLI fills in the actual proxy port" — so
+    // a manifest embedder cannot NAME the port and gets pushed onto the
+    // bidirectional list to express a unidirectional need. LLO is unaffected
+    // because it compiles confinement/v1 straight to a CapabilitySet
+    // (`capabilities_from_manifest`, deliberately bypassing nono's manifest),
+    // but anyone reading this for the pattern should know the surface they
+    // reach for is the broken one.
+    //
+    // AND THE MODE ALONE IS NOT ENOUGH. The emitter's trigger is the LIST:
+    // `if !bind_ports.is_empty() || has_localhost_tcp`. A populated
+    // `localhost_ports` re-adds bind and inbound underneath a mode that still
+    // reads ProxyOnly — so setting the mode while leaving the bidirectional
+    // list populated silently reopens the hole. Cloister hit exactly this
+    // fixing 2d420c; both halves were required.
+    //
+    // Measured rather than assumed, because the claim it rests on ("Seatbelt
+    // cannot separate outbound from bind") was believed by both implementers
+    // until it was run: connect to the granted port succeeds, bind gets EPERM,
+    // connect to an ungranted port gets EPERM, and the control — bind WITH the
+    // grant — succeeds. ADR-0037; probes on `ley-line-open-e41717`.
+    //
+    // Refused on the microVM tier: there the workload is the guest, whose
+    // egress crosses the hypervisor, and this profile confines the VMM host.
+    // Granting the VMM a dial right the guest cannot use would attest a
+    // channel the workload does not have — §9 condition 6.
+    if let Some(connect) = connect_local {
+        if matches!(tier, Tier::MicroVm) {
+            return Err(ExecutionError::invalid(format!(
+                "confinement/v1 §3 network.connectLocal {connect} is not deliverable \
+                 on the microVM tier: the workload runs in the guest and reaches the \
+                 host only over vsock, which pairs a guest port with a host UNIX \
+                 SOCKET and has no TCP analogue. Carrying it would require socket \
+                 hijacking, which converts the boundary from channels the guest was \
+                 given into the guest's sockets being carried out. Declare §6 \
+                 unixSocket.allow instead — this tier delivers it — and bridge to \
+                 TCP host-side if the upstream needs it."
+            )));
+        }
+        // `proxy_only` sets the network MODE, so it replaces the
+        // `block_network()` this function otherwise ends with rather than
+        // adding to it. Both are closed by default; ProxyOnly is Blocked plus
+        // exactly one outbound destination.
+        capabilities = match port {
+            // §4 and §3 together: one listener and one dial target. Only
+            // reachable on Linux, since §4 is refused above on Seatbelt.
+            Some((bind, _)) => capabilities.proxy_only_with_bind(connect, vec![bind]),
+            None => capabilities.proxy_only(connect),
+        };
+        return Ok(capabilities);
     }
 
     Ok(capabilities.block_network())

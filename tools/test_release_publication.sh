@@ -51,6 +51,7 @@ make_source "$tmp_dir/leyline" '#!/bin/sh'
 chmod +x "$tmp_dir/leyline"
 make_source "$tmp_dir/libleyline_fs.a" 'staticlib'
 make_source "$tmp_dir/leyline_fs.h" 'header'
+make_source "$tmp_dir/execution-tools.json" 'tooldefs'
 
 # Generator binaries (ley-line-open-e44960). This list must match the one
 # release.yml passes as GENERATOR_BINS and the one
@@ -89,6 +90,7 @@ GENERATOR_SUFFIX="linux-amd64" \
 LIB_ASSET="libleyline_fs-linux-amd64.a" \
 STATICLIB_SOURCE="$tmp_dir/libleyline_fs.a" \
 HEADER_SOURCE="$tmp_dir/leyline_fs.h" \
+TOOLDEFS_SOURCE="$tmp_dir/execution-tools.json" \
 WASM_ASSETS="$wasm_assets" \
 WASM_SOURCE_DIR="$tmp_dir/wasm" \
     "$repo_root/tools/stage_release_artifacts.sh"

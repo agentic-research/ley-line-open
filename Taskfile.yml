@@ -346,6 +346,7 @@ tasks:
         chmod +x "{{.FIXTURE_DIR}}/leyline"
         printf 'staticlib' > "{{.FIXTURE_DIR}}/libleyline_fs.a"
         printf 'header' > "{{.FIXTURE_DIR}}/leyline_fs.h"
+        printf 'tooldefs' > "{{.FIXTURE_DIR}}/execution-tools.json"
         printf 'wasm' > "{{.FIXTURE_DIR}}/leyline_sign.wasm"
         printf 'wasm' > "{{.FIXTURE_DIR}}/leyline_cas_ffi.wasm"
         printf 'wasm' > "{{.FIXTURE_DIR}}/leyline_envelope.wasm"
@@ -359,6 +360,8 @@ tasks:
           STATICLIB_SOURCE: '{{.FIXTURE_DIR}}/libleyline_fs.a'
           INCLUDE_HEADER: "true"
           HEADER_SOURCE: '{{.FIXTURE_DIR}}/leyline_fs.h'
+          INCLUDE_TOOLDEFS: "true"
+          TOOLDEFS_SOURCE: '{{.FIXTURE_DIR}}/execution-tools.json'
           WASM_ASSETS: leyline_sign.wasm leyline_cas_ffi.wasm leyline_envelope.wasm
           WASM_SOURCE_DIR: '{{.FIXTURE_DIR}}'
       - |
@@ -606,6 +609,7 @@ tasks:
       DEFAULT_CLI_SOURCE: '{{.ROOT_DIR}}/rs/target/{{.BUILD_TARGET}}/release/leyline'
       DEFAULT_STATICLIB_SOURCE: '{{.ROOT_DIR}}/rs/target/{{.BUILD_TARGET}}/release/libleyline_fs.a'
       DEFAULT_HEADER_SOURCE: '{{.ROOT_DIR}}/rs/ll-open/fs/include/leyline_fs.h'
+      DEFAULT_TOOLDEFS_SOURCE: '{{.ROOT_DIR}}/rs/ll-open/cli-lib/src/daemon/execution-tools.json'
     env:
       ASSET_NAME: '{{.ASSET_NAME}}'
       BUILD_TARGET: '{{.BUILD_TARGET}}'
@@ -613,6 +617,16 @@ tasks:
       CLI_SOURCE: '{{.CLI_SOURCE | default .DEFAULT_CLI_SOURCE}}'
       LIB_ASSET: '{{.LIB_ASSET | default ""}}'
       INCLUDE_HEADER: '{{.INCLUDE_HEADER | default "false"}}'
+      # The generated execution/v1 tool definitions — one platform-independent
+      # JSON, so exactly ONE release job sets this (same single-uploader rule
+      # as INCLUDE_HEADER). Off by default.
+      #
+      # Only the FLAG lives here. `TOOLDEFS_SOURCE` is exported from `cmds`
+      # under this flag, exactly as `HEADER_SOURCE` is: putting the path in
+      # `env` would set it on every leg, the stage script's `-n` test would
+      # fire everywhere, and three copies would each land in the basename
+      # inventory and break the expected-asset diff.
+      INCLUDE_TOOLDEFS: '{{.INCLUDE_TOOLDEFS | default "false"}}'
       # The generator binaries, staged as `<bin>-<suffix>` alongside the CLI.
       # Empty by default so a caller that only wants the CLI is unaffected;
       # release.yml sets it for every target. Same list as
@@ -636,6 +650,9 @@ tasks:
         fi
         if [ "${INCLUDE_HEADER:-false}" = "true" ]; then
           export HEADER_SOURCE='{{.HEADER_SOURCE | default .DEFAULT_HEADER_SOURCE}}'
+        fi
+        if [ "${INCLUDE_TOOLDEFS:-false}" = "true" ]; then
+          export TOOLDEFS_SOURCE='{{.TOOLDEFS_SOURCE | default .DEFAULT_TOOLDEFS_SOURCE}}'
         fi
         tools/stage_release_artifacts.sh
 

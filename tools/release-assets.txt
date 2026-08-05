@@ -14,6 +14,7 @@ capnpc-schema-bridge-zod-darwin-amd64
 capnpc-schema-bridge-zod-darwin-arm64
 capnpc-schema-bridge-zod-linux-amd64
 capnpc-schema-bridge-zod-linux-arm64
+execution.tools.json
 leyline-darwin-amd64
 leyline-darwin-arm64
 leyline-linux-amd64

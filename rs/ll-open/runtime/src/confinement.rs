@@ -178,6 +178,7 @@ pub struct ConfinementManifest {
     allow_hosts: Vec<String>,
     port: Option<PortBlock>,
     unix_sockets: Vec<UnixSocketGrant>,
+    connect_local: Option<u16>,
 }
 
 /// The five dimensions of `confinement/v1`, decomposed so a compiler must name
@@ -199,6 +200,21 @@ pub struct Dimensions<'a> {
     pub credential_source: Option<&'a str>,
     /// §6 — UNIX sockets this workload may reach. Empty means none.
     pub unix_sockets: &'a [UnixSocketGrant],
+    /// §3 `network.connectLocal` — the single loopback port this workload may
+    /// `connect(2)` to. `None` means none, which is the default.
+    ///
+    /// A sixth dimension living under §3's `network` object rather than in a
+    /// section of its own: the JSON already groups it there, and this document
+    /// has been renumbered three times, the last of which left a citation
+    /// pointing at the section §6 had taken over. A fourth renumber to buy a
+    /// heading is a bad trade while the number+title citation lint
+    /// (`ley-line-open-6dac72`) is still unbuilt.
+    ///
+    /// **This does not authenticate the peer.** A loopback port is a shared
+    /// host namespace; the grant says which port the workload may dial, not
+    /// who is listening on it. §6 gets peer identity from the filesystem, this
+    /// gets it from the protocol or not at all — see ADR-0037.
+    pub connect_local: Option<u16>,
 }
 
 impl Default for ConfinementManifest {
@@ -217,6 +233,7 @@ impl ConfinementManifest {
             allow_hosts: Vec::new(),
             port: None,
             unix_sockets: Vec::new(),
+            connect_local: None,
         }
     }
 
@@ -414,7 +431,39 @@ impl ConfinementManifest {
             port: self.port_bind(),
             credential_source: self.credential_source(),
             unix_sockets: &self.unix_sockets,
+            connect_local: self.connect_local,
         }
+    }
+
+    /// The single loopback port §3 `connectLocal` permits dialing.
+    pub fn connect_local(&self) -> Option<u16> {
+        self.connect_local
+    }
+
+    /// Declare §3's `connectLocal` — one loopback port the workload may
+    /// `connect(2)` to.
+    ///
+    /// Single-valued, matching §4's "deliberately single-port; multi-port
+    /// bundles publish v2" rather than fighting it. The constraint is also
+    /// mechanical: `nono::CapabilitySet::proxy_only` takes one port, and it is
+    /// the only builder that compiles to connect-WITHOUT-bind on both
+    /// platforms. Declaring a list we could not enforce would be the
+    /// declared-but-dead class §9 condition 6 exists to forbid.
+    ///
+    /// No 1024 floor, unlike §4. That floor exists because binding a
+    /// privileged port is a privileged act; CONNECTING to one is not — a
+    /// proxy on :443 is ordinary — so the same floor here would refuse a
+    /// legitimate document for a reason that does not apply.
+    pub fn with_connect_local(mut self, port: u16) -> Result<Self, ExecutionError> {
+        if port == 0 {
+            return Err(ExecutionError::invalid(
+                "confinement/v1 §3 network.connectLocal must name a port in \
+                 1-65535; 0 is not an address a workload can dial, and on some \
+                 mechanisms it compiles to a wildcard",
+            ));
+        }
+        self.connect_local = Some(port);
+        Ok(self)
     }
 
     /// The single listener §4 permits, as `(port, address)`. `None` means the
@@ -472,15 +521,24 @@ impl ConfinementManifest {
             fs.insert("allow".into(), serde_json::Value::Array(allow));
             root.insert("fs".into(), json_object(fs));
         }
-        if !self.allow_hosts.is_empty() {
-            let hosts: Vec<serde_json::Value> = self
-                .allow_hosts
-                .iter()
-                .cloned()
-                .map(serde_json::Value::String)
-                .collect();
+        // One `network` object carrying whichever of its two clauses are
+        // declared. Emitted only when at least one is, so a manifest using
+        // neither digests exactly as it did before `connectLocal` existed —
+        // which is what keeps the pinned v1 vector still.
+        if !self.allow_hosts.is_empty() || self.connect_local.is_some() {
             let mut network: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-            network.insert("allowHosts".into(), serde_json::Value::Array(hosts));
+            if !self.allow_hosts.is_empty() {
+                let hosts: Vec<serde_json::Value> = self
+                    .allow_hosts
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect();
+                network.insert("allowHosts".into(), serde_json::Value::Array(hosts));
+            }
+            if let Some(port) = self.connect_local {
+                network.insert("connectLocal".into(), serde_json::Value::from(port));
+            }
             root.insert("network".into(), json_object(network));
         }
         if !self.unix_sockets.is_empty() {
@@ -667,17 +725,38 @@ impl ConfinementManifest {
         }
 
         if let Some(network) = object.get("network") {
-            let hosts = network
-                .get("allowHosts")
-                .and_then(serde_json::Value::as_array)
-                .ok_or_else(|| {
-                    ExecutionError::invalid("network must carry an `allowHosts` array")
+            // Either clause may be absent, but an empty `network` object is
+            // refused: it digests as a declaration while granting nothing, and
+            // §1's rule is that an omitted block is the refusal. A document
+            // meaning "no egress, no local channel" omits `network` entirely.
+            if network.get("allowHosts").is_none() && network.get("connectLocal").is_none() {
+                return Err(ExecutionError::invalid(
+                    "confinement/v1 §3 `network` must carry `allowHosts`, \
+                     `connectLocal`, or both — an empty block declares nothing \
+                     and an omitted one is already the refusal",
+                ));
+            }
+            if let Some(hosts) = network.get("allowHosts") {
+                let hosts = hosts.as_array().ok_or_else(|| {
+                    ExecutionError::invalid("network.allowHosts must be an array")
                 })?;
-            for host in hosts {
-                let host = host.as_str().ok_or_else(|| {
-                    ExecutionError::invalid("an allowHosts entry must be a string")
+                for host in hosts {
+                    let host = host.as_str().ok_or_else(|| {
+                        ExecutionError::invalid("an allowHosts entry must be a string")
+                    })?;
+                    manifest = manifest.with_allowed_host(host)?;
+                }
+            }
+            if let Some(port) = network.get("connectLocal") {
+                let port = port.as_u64().ok_or_else(|| {
+                    ExecutionError::invalid("network.connectLocal must be an integer port")
                 })?;
-                manifest = manifest.with_allowed_host(host)?;
+                let port = u16::try_from(port).map_err(|_| {
+                    ExecutionError::invalid(format!(
+                        "network.connectLocal {port} exceeds the 16-bit port space"
+                    ))
+                })?;
+                manifest = manifest.with_connect_local(port)?;
             }
         }
 

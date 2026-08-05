@@ -686,3 +686,72 @@ fn the_microvm_mappings_refuse_what_a_mapping_cannot_express() {
         "the refusal must name the ordering contract: {error}"
     );
 }
+
+/// §3 `connectLocal` is ADDITIVE: the pinned v1 vector does not move.
+///
+/// This is the claim every downstream consumer relies on when a dimension is
+/// added — cloister's pinned vector and their `confinement_digest.rs`
+/// conformance test must not need touching. It held for §6 in v0.16.0 and it
+/// has to hold here, so it is asserted rather than assumed: absent fields are
+/// omitted from canonical bytes, and a manifest declaring no `network` block
+/// emits none.
+#[test]
+fn adding_the_local_connect_dimension_does_not_move_the_pinned_vector() {
+    assert_eq!(
+        canonical_manifest()
+            .confinement_digest()
+            .expect("digest the pinned manifest"),
+        format!("blake3-256:{CANONICAL_PIN}"),
+        "the canonical vector's digest must be unchanged by a new dimension it \
+         does not declare"
+    );
+}
+
+/// A declared `connectLocal` moves the digest and survives a round trip.
+///
+/// Two properties in one, because they fail differently: a digest that did not
+/// move would let one commitment satisfy two policies, and bytes that did not
+/// round-trip would mean an issuer and a runner computing different documents
+/// from the same declaration.
+#[test]
+fn a_local_connect_grant_moves_the_digest_and_round_trips() {
+    let base = ConfinementManifest::new()
+        .with_fs_grant(FsGrant::read_only("/etc/hosts"))
+        .expect("fs grant");
+    let with = base
+        .clone()
+        .with_connect_local(8443)
+        .expect("legal loopback target");
+
+    assert_ne!(
+        base.confinement_digest().expect("digest without"),
+        with.confinement_digest().expect("digest with"),
+        "declaring a channel must move the digest the receipt commits to"
+    );
+
+    let canonical = with.to_canonical_json().expect("canonical bytes");
+    assert!(
+        canonical.contains("connectLocal"),
+        "the clause must appear under the network block: {canonical}"
+    );
+    assert_eq!(
+        ConfinementManifest::parse(&canonical).expect("re-parse"),
+        with,
+        "parse must reconstruct exactly the manifest that produced the bytes"
+    );
+}
+
+/// An empty `network` block is refused rather than digesting as a declaration.
+///
+/// §1's rule is that an omitted block IS the refusal, so `{"network": {}}`
+/// would be a document committing bytes while granting nothing — the
+/// declared-but-dead shape, one level up.
+#[test]
+fn an_empty_network_block_is_refused() {
+    let error = ConfinementManifest::parse(r#"{"version":"cloister/confinement/v1","network":{}}"#)
+        .expect_err("an empty network block declares nothing");
+    assert!(
+        error.to_string().contains("network"),
+        "the refusal must name the block: {error}"
+    );
+}

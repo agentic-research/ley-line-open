@@ -14,7 +14,7 @@
 //!
 //! ## Canonical form
 //!
-//! The digest is over canonical JSON, per `confinement/v1` README §6: UTF-8
+//! The digest is over canonical JSON, per `confinement/v1` README §7: UTF-8
 //! with no BOM, object keys sorted in ASCII byte order at every level,
 //! two-space indent, **no trailing newline**, and absent fields omitted
 //! rather than emitted as `null`. `BTreeMap` gives the key order and
@@ -180,7 +180,7 @@ pub struct ConfinementManifest {
     unix_sockets: Vec<UnixSocketGrant>,
 }
 
-/// The four dimensions of `confinement/v1`, decomposed so a compiler must name
+/// The five dimensions of `confinement/v1`, decomposed so a compiler must name
 /// all of them. See [`ConfinementManifest::dimensions`] for why this exists as
 /// a struct rather than as four accessors.
 ///
@@ -429,7 +429,7 @@ impl ConfinementManifest {
             .map(|port| (port.bind, port.address.as_deref()))
     }
 
-    /// Serialize to the canonical JSON the digest is computed over (§6).
+    /// Serialize to the canonical JSON the digest is computed over (§7).
     ///
     /// Every object is built as a `BTreeMap`, at every level, rather than as a
     /// `#[derive(Serialize)]` struct. That is not stylistic: this workspace
@@ -698,7 +698,7 @@ impl ConfinementManifest {
 
     pub fn to_canonical_json(&self) -> Result<String, ExecutionError> {
         // `to_string_pretty` emits two-space indent and no trailing newline,
-        // which is exactly §6.
+        // which is exactly §7.
         serde_json::to_string_pretty(&self.canonical_value())
             .map_err(|error| ExecutionError::invalid(format!("cannot canonicalize: {error}")))
     }

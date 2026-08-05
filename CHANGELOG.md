@@ -26,10 +26,14 @@ context, scoping notes, and review history are recoverable.
 
 ### Documentation
 
-- **ADR-0036 (proposed)** — what a `confinementDigest` covers. A grant-carried
-  document is parsed and digest-verified today and then not applied, so §4 and
-  §6 are declarable, verified and undeliverable. Proposed, not accepted:
-  consumers should not yet depend on either reading of `confinementDigest`.
+- **ADR-0036 (proposed)** — what a `confinementDigest` covers, cut down to the
+  three cases the §4 equality contract leaves open: an issuer that cannot know
+  the deployment, §6 delivery (native macOS via the fold; microVM via the
+  vsock `listen=true` mapping), and the platform-split digest. Its original
+  core case shipped as `ExecutionRequest.confinement_manifest` plus an
+  equality contract, with no new wire field — the draft's premise that host
+  resources are unknowable to a pre-host issuer was disproved by reading
+  `LibkrunBackendConfig`. `confinementDigest` semantics are unchanged.
 
 - **ADR-0035's first open question is answered**, and more strongly than it
   asked: the aarch64 guest has no LSM framework at all (`CONFIG_SECURITY`

@@ -163,6 +163,24 @@ pub struct ExecutionRequest {
     /// own boundary rather than silently here.
     #[serde(default)]
     pub confinement_digest: String,
+    /// The `confinement/v1` document `confinement_digest` was taken over, when
+    /// the grant carried one.
+    ///
+    /// Carried for the same reason the digest is — the worker needs it, and the
+    /// resolver must not substitute its own. `authorization.rs` has already
+    /// parsed it and refused any grant whose document does not digest to
+    /// `confinement_digest`, so a value here is authorized, not caller intent.
+    /// That distinction is what makes it a legitimate source for a dimension
+    /// the plan refuses to take from the request: `plan.rs` declines to derive
+    /// a listener from an `ExecutionRequest` because "a workload does not get
+    /// to widen its own boundary", and names the manifest the grant authorized
+    /// as where one must come from. This is that manifest.
+    ///
+    /// `None` means the grant carried no document. The worker then compiles its
+    /// own policy exactly as before, so a run that worked without this field
+    /// still does.
+    #[serde(default)]
+    pub confinement_manifest: Option<String>,
 }
 
 impl ExecutionRequest {

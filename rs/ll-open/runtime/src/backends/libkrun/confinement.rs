@@ -68,6 +68,7 @@ pub const ATTESTED_RUN_ROOTFS: &str = "/run/rootfs/";
 pub fn confinement_manifest(
     runtime_files: &[PathBuf],
     devices: &[PathBuf],
+    authorized: Option<&ConfinementManifest>,
 ) -> Result<ConfinementManifest, ExecutionError> {
     // Fallible now that §2 refuses relative and traversing paths at the point
     // the grant is made. A caller handing us a relative `--runtime-file` gets
@@ -81,6 +82,32 @@ pub fn confinement_manifest(
     for path in devices {
         manifest = manifest.with_fs_grant(FsGrant::read_write(path.display().to_string()))?;
     }
+    // §4 is the one dimension a grant can originate, and the ONLY source is the
+    // authorized document — never the `ExecutionRequest`, which is caller
+    // intent. `authorization.rs` has already refused any grant whose carried
+    // document does not digest to the `confinementDigest` it names, so what
+    // arrives here has an issuer behind it.
+    //
+    // Taken INTO the manifest rather than applied beside it, which is what
+    // keeps ADR-0035 §1 true: the digest the worker attests is computed over
+    // this document, so the listener is inside the object the receipt commits
+    // to instead of being a grant nothing describes.
+    //
+    // The digest therefore changes when a listener is declared, and an issuer
+    // has to predict it. That is achievable precisely because the other inputs
+    // are stable: the rootfs is symbolic (ATTESTED_RUN_ROOTFS), and runtime
+    // files and devices come from `LibkrunBackendConfig` — deployment
+    // configuration fixed when the backend is constructed, not per-run values.
+    // An issuer configured for a deployment can compute this document exactly.
+    //
+    // §2, §3, §5 and §6 are deliberately NOT merged. Each would either widen
+    // what LLO grants itself or is refused by the compiler on one of the two
+    // tiers, and merging a dimension whose tier refuses it would turn a clean
+    // refusal into a digest mismatch — a worse diagnostic for the same outcome.
+    // §4 is the dimension the microVM tier can actually deliver.
+    if let Some((bind, address)) = authorized.and_then(|m| m.dimensions().port) {
+        manifest = manifest.with_port_bind(bind, address)?;
+    }
     // No `network` block at all. §3: an omitted block means no egress, which
     // is what `block_network()` enforces — so declaring an empty allow-list
     // would say the same thing twice, in two places that could disagree.
@@ -92,7 +119,7 @@ pub fn build_process_capabilities(
     runtime_files: &[PathBuf],
     devices: &[PathBuf],
 ) -> Result<CapabilitySet, ExecutionError> {
-    capabilities_from_manifest(&confinement_manifest(runtime_files, devices)?, rootfs)
+    capabilities_from_manifest(&confinement_manifest(runtime_files, devices, None)?, rootfs)
 }
 
 /// Compile a manifest into the `CapabilitySet` nono applies.
@@ -414,7 +441,7 @@ fn unix_socket_mode(grant: &UnixSocketGrant) -> Result<UnixSocketMode, Execution
 /// called only after the worker has loaded libkrun and resolved its rootfs.
 pub fn apply(config: &KrunConfig, resources: &VmmHostResources) -> Result<(), ExecutionError> {
     apply_manifest(
-        &confinement_manifest(&resources.runtime_files, &resources.devices)?,
+        &confinement_manifest(&resources.runtime_files, &resources.devices, None)?,
         &config.rootfs.canonical_path,
     )
 }

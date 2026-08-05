@@ -13,6 +13,7 @@ use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 
+use crate::confinement::ConfinementManifest;
 use crate::{ExecutionError, ExecutionRequest};
 
 use super::libkrun::confinement::{capabilities_from_manifest, confinement_manifest};
@@ -122,7 +123,21 @@ pub fn execute_with_ready(
     // One manifest, two uses: the capabilities actually applied, and the
     // digest attested below. Deriving both from `manifest` is what makes the
     // attestation true by construction rather than by discipline.
-    let manifest = confinement_manifest(&options.runtime_files, &[])?;
+    // Same source as the microVM tier, and for the same reason: §4 may only
+    // originate from the document the grant authorized. This tier is where
+    // §4 is strongest — Landlock filters `bind(2)` per port, so the grant
+    // means here exactly what it says — which is why it would be wrong to
+    // wire the listener on the tier that needs a port map and leave it
+    // unreachable on the tier whose kernel enforces it directly.
+    let authorized = match &request.confinement_manifest {
+        Some(document) => Some(ConfinementManifest::parse(document).map_err(|error| {
+            ExecutionError::invalid(format!(
+                "RunGrant.confinementManifest did not survive the worker boundary: {error}"
+            ))
+        })?),
+        None => None,
+    };
+    let manifest = confinement_manifest(&options.runtime_files, &[], authorized.as_ref())?;
     let capabilities = capabilities_from_manifest(&manifest, &config.rootfs.canonical_path)?;
     nono::Sandbox::apply_auto(&capabilities).map_err(|error| {
         ExecutionError::backend(format!("apply native nono confinement: {error}"))
@@ -257,6 +272,7 @@ mod tests {
             public_environment: BTreeMap::new(),
             allowed_egress: Vec::new(),
             confinement_digest: String::new(),
+            confinement_manifest: None,
             limits: ResourceLimits {
                 vcpus: 1,
                 memory_mib: 64,

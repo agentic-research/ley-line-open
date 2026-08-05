@@ -2,6 +2,7 @@ use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
+use crate::confinement::ConfinementManifest;
 use crate::{ExecutionError, ExecutionRequest};
 use serde::{Deserialize, Serialize};
 
@@ -171,7 +172,23 @@ pub fn execute_with_ready(
     // `native.rs` already did it this way, and its comment — "Deriving both from
     // `manifest` is what makes the attestation true by construction rather than
     // by discipline" — was accurate there and inaccurate one directory over.
-    let manifest = confinement_manifest(&resources.runtime_files, &resources.devices)?;
+    // Re-parsed rather than carried as a value: the worker is a separate
+    // process, so the document crosses as JSON either way, and parsing it here
+    // means the worker applies the same builder invariants `authorization.rs`
+    // did instead of trusting a shape someone else validated.
+    let authorized = match &request.confinement_manifest {
+        Some(document) => Some(ConfinementManifest::parse(document).map_err(|error| {
+            ExecutionError::invalid(format!(
+                "RunGrant.confinementManifest did not survive the worker boundary: {error}"
+            ))
+        })?),
+        None => None,
+    };
+    let manifest = confinement_manifest(
+        &resources.runtime_files,
+        &resources.devices,
+        authorized.as_ref(),
+    )?;
 
     // §4 on the microVM tier. `apply_manifest` below confines the VMM HOST
     // process; the guest's own listener is governed by the port map, which is a

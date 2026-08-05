@@ -10,6 +10,34 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Stale section numbers the §6 insertion left in code comments.** Canonical
+  serialization is §7 now, not §6 (three sites); `Dimensions` carries five
+  dimensions, not four; and `parse` applies the §2–§6 refusals, not §2–§5.
+
+  v0.16.0's entry claimed these, and they did not ship in it — the edits sat on
+  an unmerged branch while the release was cut, and the claim was written from
+  the branch rather than from what was being tagged. Corrected there and moved
+  here, to the release that actually carries them. Recorded rather than quietly
+  deleted because a changelog that has been wrong once is worth being able to
+  see: it is the same defect class as §9 condition 5 and as §8 step 2 — a claim
+  that reads as current and is not.
+
+### Documentation
+
+- **ADR-0036 (proposed)** — what a `confinementDigest` covers. A grant-carried
+  document is parsed and digest-verified today and then not applied, so §4 and
+  §6 are declarable, verified and undeliverable. Proposed, not accepted:
+  consumers should not yet depend on either reading of `confinementDigest`.
+
+- **ADR-0035's first open question is answered**, and more strongly than it
+  asked: the aarch64 guest has no LSM framework at all (`CONFIG_SECURITY`
+  unset), verified against both the libkrunfw config and the shipped 5.5.0
+  dylib. Guest-side confinement is seccomp-bpf only, and the
+  `/sys/kernel/security/lsm` probe the ADR called authoritative would have
+  returned ENOENT and been read as "Landlock absent".
+
 ## [0.16.0] — 2026-08-04
 
 **A fifth confinement dimension, and a conformance list that tests the rule it
@@ -89,26 +117,12 @@ condition every other section was already pointing at.
   the tier, and now live outside the platform-gated arm where every platform can
   reach them.
 
-- **Stale section numbers left by the §6 insertion.** Canonical serialization is
-  §7 now, not §6 (three sites); `Dimensions` carries five dimensions, not four;
-  and `parse` applies the §2–§6 refusals, not §2–§5.
-
-### Documentation
-
-- **ADR-0035's first open question is answered**, and more strongly than it
-  asked: the aarch64 guest has no LSM framework at all — `CONFIG_SECURITY` is
-  unset in libkrunfw's config, and the shipped 5.5.0 dylib agrees
-  (`security/security.c` absent, `commoncap.c` present). Guest-side confinement
-  is seccomp-bpf only, and the `/sys/kernel/security/lsm` probe the ADR called
-  authoritative would have returned ENOENT and been read as "Landlock absent".
-  6.12 is where Landlock ABI v6 landed, so this is a config choice rather than a
-  version limitation.
-
-- **ADR-0036 (proposed)** — what a `confinementDigest` covers. A grant-carried
-  document is parsed and digest-verified today and then not applied, so §4 and
-  §6 are declarable, verified and undeliverable. The ADR is proposed, not
-  accepted; consumers should not yet depend on either reading of
-  `confinementDigest`.
+- **A stale spec cross-reference the §6 insertion left behind.** §8 step 2 said
+  "Canonicalizes per §6" — a section that still exists and now describes UNIX
+  socket grants, so the instruction read as valid while pointing at the wrong
+  place. Found by cloister, whose own consumer files carried the same stale
+  pair. Now cites the number and the title together, because a bare number
+  carries no redundancy and cannot be checked against renumbering.
 
 Beads: `ley-line-open-17536d`, `ley-line-open-5de852`, `ley-line-open-368ef3`.
 

@@ -56,7 +56,7 @@ who vouches for the expansion — that nothing currently needs, and the reviewed
 draft's mechanisms are preserved in git history at `640a056` for when
 something does.
 
-### O2. §6 delivery — native half DELIVERED, microVM half open
+### O2. §6 delivery — DELIVERED on both tiers
 
 **Native (delivered).** The fold is tier-scoped (`GrantFold::Native` vs
 `::MicroVm`): on the native tier — where the confined process IS the workload —
@@ -67,23 +67,48 @@ named). Modes stay governed by `unix_socket_mode`: `bind` remains refused.
 Pinned by `a_unix_socket_grant_reaches_the_native_tier_and_moves_its_digest`,
 which uses cloister's shim socket verbatim.
 
-This is what retires cloister's `CLOISTER_ACCEPT_UNENFORCED_BIND` hole rather
-than acknowledging it: their harness-sandbox's own comment names the design —
-Seatbelt grants `network-bind`/`network-inbound` unqualified whenever localhost
-TCP is allowed at all, while "a connect-only UDS grant IS enforceable where a
-port is not." A §6 connect grant gives the workload the one socket the issuer
-named and no TCP capability whatsoever.
+This closes cloister's `CLOISTER_ACCEPT_UNENFORCED_BIND` hole **for a workload
+that can dial a UNIX socket**: the compiled capability set then carries no TCP
+at all. Their harness-sandbox's own comment names the design — Seatbelt grants
+`network-bind`/`network-inbound` unqualified whenever localhost TCP is allowed
+at all, while "a connect-only UDS grant IS enforceable where a port is not."
 
-**microVM (open).** The tier-scoping is why: there the confined process is the
-VMM host, and the workload reaches host sockets only through vsock mappings.
-Folding §6 there would grant the dial right to the wrong process while the
-workload still could not reach the endpoint — a policy attesting a channel the
-workload does not have. The named refusal stays
-(`the_microvm_tier_still_refuses_a_carried_unix_socket_by_name`) until the
-vsock `listen=true` mapping is wired — the `add_vsock_port` caller — which
-needs decisions the fold does not: guest port allocation, the path↔port
-pairing's place in the attested document, and receipt evidence for the
-mapping.
+The scoping is load-bearing, and cloister verified its limit: the stock
+harnesses cannot take this deal — their API transport is TCP-only (a `unix://`
+proxy URL has no host:port and is discarded; the binary's `unix://` handling
+is Bun's inspector, not the HTTP client), and Codex's UDS support governs its
+own sandbox map, not its egress. For harness workloads the TCP shim survives,
+the acknowledgment with it, and the residual problem is nono's Seatbelt
+emission — outbound-to-localhost inseparable from bind+inbound — which is
+cloister's `2d420c`, with Codex's separate `allow_local_binding` as evidence
+the distinction is expressible. Not a confinement/v1 problem, and not this
+ADR's.
+
+**microVM (delivered).** §6 compiles to vsock↔socket mappings — the
+`add_vsock_port` caller, `vsock_unix_mappings` — and the three design
+questions this section used to hold resolved as:
+
+- **Guest port allocation:** a pure function of document order. Grant `i`
+  owns `VSOCK_UNIX_BASE_PORT + 2i` (dial, `listen=false`) and `+ 2i + 1`
+  (serve, `listen=true`); `connect` materializes only the dial port, `bind`
+  only the serve port, `connect-bind` both. The base is `0x1_0000` — above
+  every TCP port, so a collision with TSI's guest-TCP-over-vsock use of port
+  numbers is impossible by construction.
+- **The pairing's place in the attested document:** nowhere, deliberately —
+  it is *derived* from the document, not stored in it. Because the mapping is
+  a pure function of the §6 grants in order, the digest already commits to
+  every mapping, and both the issuer and the guest workload compute the same
+  ports from the document they already hold.
+- **Receipt evidence:** the digest plus the documented pure function. No new
+  wire field.
+
+Serve-without-dial (`bind`) is deliverable here and NOT on the native tier —
+the withhold is the muxer's reset on a `listen=true` port, a boundary rather
+than a filter. The VMM's own nono profile carries the host half of each
+channel (`vmm_unix_socket_mode`: `bind` → `ConnectBind`, legitimate for the
+TCB where it is refused for the workload). Directory grants are refused by
+name — a tree has no endpoint to map — and connect grants keep the §6
+ordering contract.
 
 ### O3. The platform-split digest
 
@@ -102,14 +127,13 @@ argues for deciding this as late as possible.
 
 ## Decision
 
-**Nothing further is decided here.** O1 waits for a consumer; O2's macOS half
-should be implemented next (it is a fold extension, not new machinery) and its
-microVM half needs a design pass against libkrun's muxer semantics; O3 waits
-until a cross-platform capability actually needs two commitments, and must land
-as a new field.
+**O2 is resolved by implementation** (both tiers; the port-pairing decisions
+are recorded above). **O1 and O3 remain open:** O1 waits for a consumer that
+genuinely cannot know its deployment; O3 waits until a cross-platform
+capability actually needs two commitments, and must land as a new field.
 
-This ADR stays Proposed as the tracking document for the three remainders. If
-all three resolve elsewhere, it should be closed Rejected-as-superseded rather
+This ADR stays Proposed as the tracking document for the two remainders. If
+both resolve elsewhere, it should be closed Rejected-as-superseded rather
 than Accepted — accepting it would imply it decided something.
 
 ## Review history

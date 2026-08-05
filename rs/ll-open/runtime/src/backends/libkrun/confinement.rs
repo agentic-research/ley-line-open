@@ -65,29 +65,30 @@ pub fn build_capabilities(
 /// meaningful paths like `/var/lib/bundle-X/`, not tempdirs.
 pub const ATTESTED_RUN_ROOTFS: &str = "/run/rootfs/";
 
-/// Which grant-originated dimensions the calling tier can deliver to the
-/// WORKLOAD — not to whatever process happens to get confined.
+/// Which process the calling tier confines — the distinction every per-tier
+/// decision in this module derives from.
 ///
-/// The distinction exists because the two tiers confine different processes.
-/// On the native tier the confined process IS the workload, so a §6 socket
-/// grant compiled into the policy is a right the workload holds. On the
-/// microVM tier the confined process is the VMM host; the workload runs
-/// inside the guest and reaches host sockets only through vsock mappings that
-/// are a separate mechanism (`add_vsock_port`, not yet wired — ADR-0036 O2's
-/// remaining half). Folding §6 there would grant the dial right to the VMM
-/// process while the workload still could not reach the endpoint: a policy
-/// that attests a channel the workload does not have, which is the exact
-/// shape ADR-0035 exists to prevent.
+/// On the native tier the confined process IS the workload, so a dimension
+/// compiled into the nono profile is a right the workload holds, with
+/// workload semantics: §6 `bind` must be refused there because no
+/// `UnixSocketMode` withholds `connect(2)`.
 ///
-/// §4 folds on both: the native tier compiles it to a per-port kernel rule
-/// (Landlock `BindTcp`; refused on Seatbelt), and the microVM tier delivers
-/// it through the guest port map, wired in `worker.rs`.
+/// On the microVM tier the confined process is the VMM HOST, and the
+/// workload's boundary is the hypervisor: §4 is delivered by the guest port
+/// map, §6 by vsock↔UNIX-socket mappings (`add_vsock_port`), and the
+/// serve-without-dial clause of §6 `bind` is enforced by the muxer answering
+/// a guest-originated `VSOCK_OP_REQUEST` on a `listen=true` port with a
+/// reset — a boundary, not a filter. The VMM's own nono profile then needs
+/// the HOST half of each channel (dial or bind the UNIX socket for the
+/// muxer), which is a different projection of the same attested document,
+/// not a different document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GrantFold {
-    /// Native worker: the confined process is the workload. Folds §4 and §6.
+pub enum Tier {
+    /// The confined process is the workload; dimensions carry workload
+    /// semantics.
     Native,
-    /// microVM worker: the confined process is the VMM host. Folds §4 only;
-    /// a carried §6 keeps its named refusal until the vsock mapping exists.
+    /// The confined process is the VMM host; the workload's boundary is the
+    /// hypervisor, and the nono profile carries the VMM-side projection.
     MicroVm,
 }
 
@@ -95,7 +96,6 @@ pub fn confinement_manifest(
     runtime_files: &[PathBuf],
     devices: &[PathBuf],
     authorized: Option<&ConfinementManifest>,
-    fold: GrantFold,
 ) -> Result<ConfinementManifest, ExecutionError> {
     // Fallible now that §2 refuses relative and traversing paths at the point
     // the grant is made. A caller handing us a relative `--runtime-file` gets
@@ -134,29 +134,42 @@ pub fn confinement_manifest(
     if let Some((bind, address)) = authorized.and_then(|m| m.dimensions().port) {
         manifest = manifest.with_port_bind(bind, address)?;
     }
-    // §6 folds on the native tier only — see `GrantFold` for why the microVM
-    // tier must not. This is the dimension cloister's macOS shim needs: their
+    // §6 folds on both tiers, because both deliver it — through different
+    // mechanisms, which is `Tier`'s concern at compile time, not the fold's.
+    // The native tier compiles it into the workload's own nono profile
+    // (Seatbelt per-path; the named Landlock ABI refusal on Linux); the
+    // microVM tier delivers it as vsock↔UNIX-socket mappings
+    // (`vsock_unix_mappings`, consumed by `prepare_vm`), where the
+    // serve-without-dial clause is held by the muxer's reset rather than by
+    // any filter.
+    //
+    // This is the dimension cloister's macOS shim needs: their
     // harness-sandbox names the exact design ("a connect-only UDS grant IS
     // enforceable where a port is not") because Seatbelt grants network-bind
     // and network-inbound UNQUALIFIED whenever localhost TCP is allowed at
     // all, so their TCP shim channel rides an acknowledged un-enforced hole
     // (CLOISTER_ACCEPT_UNENFORCED_BIND). A §6 connect grant closes that hole
-    // instead of acknowledging it: the workload can dial the one socket the
-    // issuer named, and holds no TCP capability whatsoever.
+    // FOR A WORKLOAD THAT CAN DIAL A UNIX SOCKET: the compiled capability set
+    // then carries no TCP capability at all — `block_network()` with no port.
     //
-    // Modes are still governed by `unix_socket_mode` at compile time — `bind`
-    // stays refused (no CapabilitySet member withholds connect), and on Linux
-    // the whole dimension keeps its Landlock ABI refusal. Both are named
-    // refusals at compile, not digest mismatches.
-    if matches!(fold, GrantFold::Native)
-        && let Some(authorized) = authorized
-    {
+    // That scoping is load-bearing, and cloister verified its limit: the
+    // stock harnesses cannot take this deal. Their API transport is TCP-only
+    // — a `unix://` proxy URL has no host:port, so the proxy is discarded and
+    // HTTPS rides `net.connect({host, port})`; the binary's `unix://` code is
+    // Bun's inspector, a different subsystem — and Codex's UDS support
+    // likewise governs its own sandbox map, not its egress. So for harness
+    // workloads the TCP shim channel survives, the acknowledgment with it,
+    // and the residual problem is nono's Seatbelt emission: outbound-to-
+    // localhost cannot be granted without unqualified bind+inbound, though
+    // Codex's separate `allow_local_binding` permission is evidence the
+    // distinction is expressible (cloister 2d420c — theirs, not ours).
+    if let Some(authorized) = authorized {
         for grant in authorized.dimensions().unix_sockets {
             manifest = manifest.with_unix_socket(grant.clone())?;
         }
     }
-    // A carried document is a COMMITMENT, not a menu. The fold above takes §4 —
-    // the one dimension a grant can originate on this tier — and everything
+    // A carried document is a COMMITMENT, not a menu. The folds above take §4
+    // and §6 — the two dimensions a grant can originate — and everything
     // else in the compiled document is LLO's own policy, so if the two still
     // differ, some clause the issuer committed to is not the policy this
     // worker would apply. Without this check that surfaced as a bare
@@ -235,8 +248,9 @@ pub fn build_process_capabilities(
     devices: &[PathBuf],
 ) -> Result<CapabilitySet, ExecutionError> {
     capabilities_from_manifest(
-        &confinement_manifest(runtime_files, devices, None, GrantFold::MicroVm)?,
+        &confinement_manifest(runtime_files, devices, None)?,
         rootfs,
+        Tier::MicroVm,
     )
 }
 
@@ -259,6 +273,7 @@ pub fn build_process_capabilities(
 pub fn capabilities_from_manifest(
     manifest: &ConfinementManifest,
     run_rootfs: &Path,
+    tier: Tier,
 ) -> Result<CapabilitySet, ExecutionError> {
     // Exhaustive by construction: no `..`, so a fifth dimension is a compile
     // error here rather than a clause this function silently ignores. §5 is in
@@ -327,8 +342,13 @@ pub fn capabilities_from_manifest(
     // enforce must be a rejection, never a silent pass-through into an
     // identity-committed digest. Routing a channel through a socket rather than
     // a port does not close the platform gap — it swaps which platform has one.
+    // NATIVE tier only: on the microVM tier the workload's §6 boundary is the
+    // hypervisor — the guest can only reach vsock ports that have mappings
+    // (`vsock_unix_mappings`), and Landlock neither mediates AF_UNIX connect
+    // at this ABI nor needs to. What this profile carries under MicroVm is
+    // the VMM's HOST half of each channel, below.
     #[cfg(target_os = "linux")]
-    if !unix_sockets.is_empty() {
+    if matches!(tier, Tier::Native) && !unix_sockets.is_empty() {
         return Err(ExecutionError::invalid(format!(
             "confinement/v1 §6 unixSocket.allow is not enforceable by the \
              Landlock ABI this build targets, so the {} declared socket \
@@ -344,7 +364,10 @@ pub fn capabilities_from_manifest(
 
     for grant in unix_sockets {
         let path = grant.path();
-        let mode = unix_socket_mode(grant)?;
+        let mode = match tier {
+            Tier::Native => unix_socket_mode(grant)?,
+            Tier::MicroVm => vmm_unix_socket_mode(grant),
+        };
 
         // Trailing slash is a directory of sockets, exactly as in §2. The
         // spelling is shared on purpose: a reader of the JSON should not have
@@ -445,25 +468,31 @@ pub fn capabilities_from_manifest(
         // stronger on the port axis on macOS — `bind: 8443` and `bind: anything`
         // compile identically — and it was applied to the address axis on the
         // platform where the port axis is the broken one.
+        // NATIVE tier only: the refusal is about what the WORKLOAD's own
+        // profile can express, and under MicroVm the workload's §4 boundary
+        // is not this profile at all — it is the guest port map, which
+        // exposes exactly the declared port and nothing else (`worker.rs`).
+        // What this profile carries under MicroVm is the VMM's host half:
+        // with hijacking on, the VMM process is what actually binds, so it
+        // needs the TCP capability, and Seatbelt's unqualified bind is
+        // latitude granted to the TCB — the same standing the muxer already
+        // has — not to the workload.
         #[cfg(target_os = "macos")]
-        {
-            let _ = bind;
+        if matches!(tier, Tier::Native) {
             return Err(ExecutionError::invalid(format!(
                 "confinement/v1 §4 port.bind {bind} is not enforceable on Seatbelt: \
                  macOS cannot filter bind by port, so nono emits an unqualified \
                  `(allow network-bind)` and declaring one listener would grant \
                  every listener on every address. Run the listener tier on Linux, \
-                 or omit the dimension."
+                 use §6 unixSocket.allow (which Seatbelt filters per path), or \
+                 omit the dimension."
             )));
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            // Landlock filters per port (`NetPort::new(port, AccessNet::BindTcp)`),
-            // so the grant means what §4 says. Loopback-only is a property of the
-            // `block_network()` below rather than of this call — Landlock filters
-            // by port, not by destination IP.
-            capabilities = capabilities.allow_localhost_port(bind);
-        }
+        // Landlock filters per port (`NetPort::new(port, AccessNet::BindTcp)`),
+        // so on Linux the grant means what §4 says. Loopback-only is a
+        // property of the `block_network()` below rather than of this call —
+        // the filter is by port, not by destination IP.
+        capabilities = capabilities.allow_localhost_port(bind);
     }
 
     Ok(capabilities.block_network())
@@ -559,12 +588,7 @@ fn unix_socket_mode(grant: &UnixSocketGrant) -> Result<UnixSocketMode, Execution
 /// called only after the worker has loaded libkrun and resolved its rootfs.
 pub fn apply(config: &KrunConfig, resources: &VmmHostResources) -> Result<(), ExecutionError> {
     apply_manifest(
-        &confinement_manifest(
-            &resources.runtime_files,
-            &resources.devices,
-            None,
-            GrantFold::MicroVm,
-        )?,
+        &confinement_manifest(&resources.runtime_files, &resources.devices, None)?,
         &config.rootfs.canonical_path,
     )
 }
@@ -575,6 +599,10 @@ pub fn apply(config: &KrunConfig, resources: &VmmHostResources) -> Result<(), Ex
 /// attests a digest can apply *that* document instead of a second one derived
 /// from the same arguments. `apply` above keeps the old shape for callers with
 /// no digest to attest; the worker uses this one.
+///
+/// Always the microVM projection: this confines the VMM HOST process, which is
+/// this module's whole subject. The native worker compiles its own profile
+/// through `capabilities_from_manifest(.., Tier::Native)` directly.
 pub fn apply_manifest(
     manifest: &ConfinementManifest,
     run_rootfs: &Path,
@@ -586,10 +614,123 @@ pub fn apply_manifest(
             support.platform, support.details
         )));
     }
-    let capabilities = capabilities_from_manifest(manifest, run_rootfs)?;
+    let capabilities = capabilities_from_manifest(manifest, run_rootfs, Tier::MicroVm)?;
     Sandbox::apply_auto(&capabilities)
         .map(|_| ())
         .map_err(nono_error)
+}
+
+/// The VMM-side [`UnixSocketMode`] for one §6 grant — the HOST half of the
+/// channel, on the tier where the workload's half is the vsock boundary.
+///
+/// `bind` maps to `ConnectBind` here, which `unix_socket_mode` refuses for
+/// the workload — and the difference is the whole point of `Tier`. For the
+/// WORKLOAD, `bind` withholds `connect(2)`, and no `UnixSocketMode` can
+/// express that withhold, so the native tier refuses. On the microVM tier
+/// that clause is enforced where it can be: the muxer answers a
+/// guest-originated `VSOCK_OP_REQUEST` on a `listen=true` port with a reset
+/// (`process_op_request`, libkrun `virtio/vsock/muxer.rs`), so the workload
+/// cannot dial regardless of what the VMM's own profile permits. What the
+/// VMM process needs is to BIND the host socket for the muxer to serve —
+/// and the VMM dialing a socket it binds is TCB latitude, not a workload
+/// right.
+///
+/// Infallible where the workload projection is not: every §6 mode has a
+/// well-defined VMM half.
+fn vmm_unix_socket_mode(grant: &UnixSocketGrant) -> UnixSocketMode {
+    if grant.permits_bind() {
+        UnixSocketMode::ConnectBind
+    } else {
+        UnixSocketMode::Connect
+    }
+}
+
+/// A guest-vsock-port ↔ host-UNIX-socket pairing `prepare_vm` hands to
+/// `krun_add_vsock_port2`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VsockUnixMapping {
+    pub port: u32,
+    pub host_path: std::ffi::CString,
+    pub listen: bool,
+}
+
+/// The first vsock port §6 grants map onto.
+///
+/// Above 65535 deliberately: with socket hijacking on, guest TCP rides vsock
+/// using the TCP port NUMBER as the vsock port (which is why `port_map` is
+/// `N:N`), so every value ≤ 65535 is potentially claimed by §4. vsock ports
+/// are u32; starting at 0x1_0000 makes a §6 mapping collision with any TCP
+/// port impossible by construction rather than by coordination.
+pub const VSOCK_UNIX_BASE_PORT: u32 = 0x1_0000;
+
+/// Compile §6 grants into the vsock mappings that deliver them on the
+/// microVM tier.
+///
+/// The pairing is a PURE FUNCTION of the attested document, and that is the
+/// load-bearing property: grant `i` in document order owns the port pair
+/// `BASE + 2i` (dial: `listen=false`, a guest connect is muxed to the host
+/// socket) and `BASE + 2i + 1` (serve: `listen=true`, a host peer dialing
+/// the socket is muxed to a guest listener, and a guest-originated request
+/// on that port is answered with a reset). `connect` materializes only the
+/// dial port, `bind` only the serve port, `connect-bind` both. Because the
+/// mapping derives from the document alone, the digest the worker attests
+/// already covers it — the receipt needs no new field — and both the issuer
+/// and the guest workload can compute every port from the document they
+/// already hold.
+///
+/// Note what this makes expressible that the native tier cannot: `bind` —
+/// serve-without-dial — is deliverable here precisely because the withhold
+/// is a boundary (the muxer's reset) rather than a filter.
+pub fn vsock_unix_mappings(
+    manifest: &ConfinementManifest,
+) -> Result<Vec<VsockUnixMapping>, ExecutionError> {
+    let mut mappings = Vec::new();
+    for (index, grant) in manifest.dimensions().unix_sockets.iter().enumerate() {
+        let path = grant.path();
+        // A directory grant names a tree; a vsock mapping needs a leaf. There
+        // is no per-member enumeration to do at setup — the members are not
+        // known — so the dimension form itself is undeliverable on this tier.
+        if path.ends_with('/') {
+            return Err(ExecutionError::invalid(format!(
+                "confinement/v1 §6 unixSocket.allow {path:?} is a directory grant, \
+                 and the microVM tier delivers §6 as one vsock↔socket mapping per \
+                 endpoint — a tree has no endpoint to map. Name the socket leaf, \
+                 or run this workload on the native tier, where a directory grant \
+                 compiles to a per-tree filter."
+            )));
+        }
+        // The §6 ordering contract (README §6), enforced here for the same
+        // reason `unix_socket_mode` enforces it on the native tier: a connect
+        // grant names an endpoint someone else owns, and a guest dial against
+        // a mapping whose socket nobody bound surfaces as an opaque in-guest
+        // connection failure rather than as the contract it is.
+        if grant.permits_connect() && !grant.permits_bind() && !Path::new(path).exists() {
+            return Err(ExecutionError::invalid(format!(
+                "confinement/v1 §6 unixSocket.allow grants connect(2) on {path:?}, \
+                 but nothing is bound there yet. Bind the endpoint before starting \
+                 the confined workload; the same document compiles once the peer \
+                 is up."
+            )));
+        }
+        let host_path = std::ffi::CString::new(path)
+            .map_err(|_| ExecutionError::invalid("§6 socket path contains a NUL byte"))?;
+        let base = VSOCK_UNIX_BASE_PORT + 2 * index as u32;
+        if grant.permits_connect() {
+            mappings.push(VsockUnixMapping {
+                port: base,
+                host_path: host_path.clone(),
+                listen: false,
+            });
+        }
+        if grant.permits_bind() {
+            mappings.push(VsockUnixMapping {
+                port: base + 1,
+                host_path,
+                listen: true,
+            });
+        }
+    }
+    Ok(mappings)
 }
 
 fn nono_error(error: nono::NonoError) -> ExecutionError {
@@ -812,6 +953,7 @@ mod tests {
             wall_time_ms: 1_000,
             tsi_features: 0,
             port_map: Vec::new(),
+            vsock_unix_map: Vec::new(),
         };
         let resources = VmmHostResources {
             // Relative: §2 refuses it at grant time, inside
@@ -825,6 +967,29 @@ mod tests {
         assert!(
             error.to_string().contains("relative/libkrun.dylib"),
             "the failure must name the offending path: {error}"
+        );
+    }
+
+    /// `apply_manifest` must surface a compile refusal, not swallow it.
+    ///
+    /// Same mutant class as `apply` above — a body replaced with `Ok(())` is
+    /// a worker reporting itself confined having applied nothing. §3 is the
+    /// reachable error path on every platform and tier: `allowHosts` rides
+    /// the proxy, never `apply_auto`, so the refusal fires inside
+    /// `capabilities_from_manifest` before anything irreversible.
+    #[test]
+    fn apply_manifest_refuses_before_the_sandbox_when_a_dimension_cannot_take_effect() {
+        let manifest = ConfinementManifest::new()
+            .with_fs_grant(FsGrant::read_write(ATTESTED_RUN_ROOTFS))
+            .expect("rootfs grant")
+            .with_allowed_host("api.example.com")
+            .expect("a legal §3 host");
+
+        let error = apply_manifest(&manifest, &std::env::temp_dir())
+            .expect_err("§3 cannot take effect on this path and must refuse");
+        assert!(
+            error.to_string().contains("allowHosts"),
+            "the refusal must name the dimension: {error}"
         );
     }
 }

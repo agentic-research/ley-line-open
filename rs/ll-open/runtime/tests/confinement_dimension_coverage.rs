@@ -28,7 +28,7 @@
 
 use std::path::Path;
 
-use leyline_runtime::backends::libkrun::confinement::capabilities_from_manifest;
+use leyline_runtime::backends::libkrun::confinement::{Tier, capabilities_from_manifest};
 use leyline_runtime::confinement::{ConfinementManifest, FsGrant, UnixSocketGrant};
 
 /// §4 is enforceable on Landlock and not on Seatbelt, so the expected outcome
@@ -47,7 +47,11 @@ fn run_rootfs() -> &'static Path {
 fn compile(
     manifest: &ConfinementManifest,
 ) -> Result<nono::CapabilitySet, leyline_runtime::ExecutionError> {
-    capabilities_from_manifest(manifest, run_rootfs())
+    // Native: these tests are about WORKLOAD semantics — what a dimension
+    // means for the process that holds it. The microVM projection has its own
+    // pair below, because the two must be allowed to disagree (that is what
+    // `Tier` exists to express).
+    capabilities_from_manifest(manifest, run_rootfs(), Tier::Native)
 }
 
 /// §2 alone compiles everywhere — the baseline the other cases vary from.
@@ -503,4 +507,51 @@ fn the_mode_predicates_answer_for_each_mode_on_every_platform() {
     assert_eq!(connect.mode(), "connect");
     assert_eq!(bind.mode(), "bind");
     assert_eq!(connect_bind.mode(), "connect-bind");
+}
+
+/// The tier projection, on the pair the platforms disagree hardest about.
+///
+/// The SAME §6-carrying manifest must be refused under `Tier::Native` on
+/// Linux (Landlock at this ABI has no AF_UNIX right — the grant would compile
+/// to nothing the workload is bound by) and accepted under `Tier::MicroVm` on
+/// every platform (the workload's boundary there is the vsock mapping, and
+/// this profile carries only the VMM's host half of the channel). One
+/// document, two confined processes, two correct answers — which is exactly
+/// what `Tier` exists to express, and what a tier-blind compiler cannot.
+#[test]
+fn the_microvm_projection_accepts_the_socket_grant_the_native_tier_refuses() {
+    // A path whose PARENT exists: nono canonicalizes the parent at add time
+    // (the §6 anti-symlink property), and a bind-capable grant tolerates a
+    // missing leaf because bind creates it. In a deployment the socket's
+    // directory exists for the same reason.
+    let served = std::env::temp_dir().join("llo-vsock-served.sock");
+    let manifest = ConfinementManifest::new()
+        .with_fs_grant(FsGrant::read_write("/run/rootfs/"))
+        .expect("rootfs grant")
+        .with_unix_socket(UnixSocketGrant::bind(served.display().to_string()))
+        .expect("a legal §6 grant");
+
+    let microvm = capabilities_from_manifest(&manifest, run_rootfs(), Tier::MicroVm);
+    assert!(
+        microvm.is_ok(),
+        "the VMM projection must accept §6 on every platform — the workload's \
+         boundary is the vsock mapping, not this profile: {microvm:?}"
+    );
+
+    // Native: platform-split by design. Linux refuses the dimension (ABI);
+    // macOS refuses this MODE (`bind` withholds connect(2), which no
+    // UnixSocketMode expresses) — so the grant is refused on both, for two
+    // different, correctly-named reasons.
+    let native = compile(&manifest).expect_err("bind is refused under workload semantics");
+    let message = native.to_string();
+    #[cfg(target_os = "linux")]
+    assert!(
+        message.contains("Landlock ABI"),
+        "Linux must refuse the dimension, naming the ABI: {message}"
+    );
+    #[cfg(not(target_os = "linux"))]
+    assert!(
+        message.contains("§6") && message.contains("bind"),
+        "macOS must refuse the mode, naming it: {message}"
+    );
 }

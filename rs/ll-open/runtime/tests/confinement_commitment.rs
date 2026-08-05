@@ -26,7 +26,7 @@
 //! one, and the receipt attested the named one. A verifier downstream got a
 //! true answer to the wrong question.
 
-use leyline_runtime::backends::libkrun::confinement::GrantFold;
+use leyline_runtime::backends::libkrun::confinement::{VSOCK_UNIX_BASE_PORT, vsock_unix_mappings};
 use leyline_runtime::confinement::{ConfinementManifest, FsGrant};
 
 /// The digest both implementations must reach, pinned in
@@ -172,7 +172,6 @@ fn the_declared_manifest_names_exactly_what_the_backend_compiles() {
         &[std::path::PathBuf::from("/usr/lib/libkrun.dylib")],
         &[std::path::PathBuf::from("/dev/kvm")],
         None,
-        GrantFold::MicroVm,
     )
     .expect("valid manifest");
 
@@ -212,14 +211,12 @@ fn a_different_compiled_policy_yields_a_different_declared_digest() {
         &[std::path::PathBuf::from("/usr/lib/libkrun.dylib")],
         &[],
         None,
-        GrantFold::MicroVm,
     )
     .expect("valid manifest");
     let b = leyline_runtime::backends::libkrun::confinement::confinement_manifest(
         &[std::path::PathBuf::from("/usr/lib/libkrun.dylib")],
         &[std::path::PathBuf::from("/dev/kvm")],
         None,
-        GrantFold::MicroVm,
     )
     .expect("valid manifest");
 
@@ -246,20 +243,12 @@ fn a_different_compiled_policy_yields_a_different_declared_digest() {
 /// `inputRoots`. The host path is where those already-verified bytes were put.
 #[test]
 fn the_digest_does_not_move_with_the_ephemeral_root() {
-    let first = leyline_runtime::backends::libkrun::confinement::confinement_manifest(
-        &[],
-        &[],
-        None,
-        GrantFold::MicroVm,
-    )
-    .expect("valid manifest");
-    let second = leyline_runtime::backends::libkrun::confinement::confinement_manifest(
-        &[],
-        &[],
-        None,
-        GrantFold::MicroVm,
-    )
-    .expect("valid manifest");
+    let first =
+        leyline_runtime::backends::libkrun::confinement::confinement_manifest(&[], &[], None)
+            .expect("valid manifest");
+    let second =
+        leyline_runtime::backends::libkrun::confinement::confinement_manifest(&[], &[], None)
+            .expect("valid manifest");
 
     assert_eq!(
         first.confinement_digest().expect("first digest"),
@@ -398,7 +387,6 @@ fn an_authorized_listener_reaches_the_compiled_manifest_and_moves_its_digest() {
         &runtime_files,
         &[],
         None,
-        GrantFold::MicroVm,
     )
     .expect("valid manifest");
     assert_eq!(
@@ -427,7 +415,6 @@ fn an_authorized_listener_reaches_the_compiled_manifest_and_moves_its_digest() {
         &runtime_files,
         &[],
         Some(&authorized),
-        GrantFold::MicroVm,
     )
     .expect("valid manifest");
 
@@ -465,7 +452,6 @@ fn an_authorized_document_without_a_listener_does_not_acquire_one() {
         &[],
         &[],
         Some(&authorized),
-        GrantFold::MicroVm,
     )
     .expect("valid manifest");
 
@@ -476,34 +462,27 @@ fn an_authorized_document_without_a_listener_does_not_acquire_one() {
     );
     assert_eq!(
         compiled.confinement_digest().expect("digest"),
-        leyline_runtime::backends::libkrun::confinement::confinement_manifest(
-            &[],
-            &[],
-            None,
-            GrantFold::MicroVm
-        )
-        .expect("valid manifest")
-        .confinement_digest()
-        .expect("digest"),
+        leyline_runtime::backends::libkrun::confinement::confinement_manifest(&[], &[], None)
+            .expect("valid manifest")
+            .confinement_digest()
+            .expect("digest"),
         "carrying a document that declares nothing must digest identically to \
          carrying no document at all"
     );
 }
 
 /// The case cloister found before any test did: a carried dimension the fold
-/// does not deliver.
+/// does not deliver, refused at compile time with the dimension named.
 ///
-/// Their scenario exactly — a §6 grant for the macOS shim. Before this check,
-/// that document was parsed, digest-verified, authorized, and then the fold
-/// dropped §6: the compiled document digested differently from the grant's
-/// commitment, and the supervisor refused the run as "confinement drift" — an
-/// error naming neither §6 nor the reason. Refused, never widened, so not a
-/// security hole; but the issuer believed they granted a channel, the workload
-/// could not use it, and nothing said why.
-///
-/// Now the refusal happens at compile time and names the dimension. This is
-/// §9 condition 6 applied to a narrower commitment: a clause that cannot take
-/// effect is a rejection, never a silent pass-through into a digest mismatch.
+/// Their original scenario was a §6 grant — which the fold has since learned
+/// to deliver on both tiers, so this test moved to §3, one of the two
+/// dimensions that still cannot originate from a grant (§3 needs the proxy
+/// path; §5 has no reader on `apply_auto` at all). The property under test is
+/// unchanged and is §9 condition 6 applied to a narrower commitment: before
+/// this check, a carried undeliverable clause was parsed, digest-verified,
+/// authorized, then dropped by the fold — and surfaced only as a bare
+/// "confinement drift" digest mismatch from the supervisor, an error naming
+/// neither the dimension nor the reason.
 #[test]
 fn a_carried_dimension_the_fold_does_not_deliver_is_refused_by_name() {
     let authorized = ConfinementManifest::new()
@@ -511,25 +490,22 @@ fn a_carried_dimension_the_fold_does_not_deliver_is_refused_by_name() {
             leyline_runtime::backends::libkrun::confinement::ATTESTED_RUN_ROOTFS,
         ))
         .expect("rootfs grant")
-        .with_unix_socket(leyline_runtime::confinement::UnixSocketGrant::connect(
-            "/run/cloister/shim.sock",
-        ))
-        .expect("a legal §6 grant");
+        .with_allowed_host("api.example.com")
+        .expect("a legal §3 host");
 
     let error = leyline_runtime::backends::libkrun::confinement::confinement_manifest(
         &[],
         &[],
         Some(&authorized),
-        GrantFold::MicroVm,
     )
-    .expect_err("a carried §6 cannot take effect on this tier and must be refused");
+    .expect_err("a carried §3 cannot take effect on this tier and must be refused");
     let message = error.to_string();
     assert!(
-        message.contains("§6 unixSocket.allow"),
+        message.contains("§3 network.allowHosts"),
         "the refusal must name the dimension the issuer committed to: {message}"
     );
     assert!(
-        !message.contains("§2") && !message.contains("§4 port.bind"),
+        !message.contains("§2") && !message.contains("§4 port.bind") && !message.contains("§6"),
         "and must not name dimensions that agree: {message}"
     );
 }
@@ -557,7 +533,6 @@ fn a_carried_document_missing_a_compiled_grant_is_refused_by_name() {
         &[std::path::PathBuf::from("/usr/lib/libkrun.dylib")],
         &[],
         Some(&authorized),
-        GrantFold::MicroVm,
     )
     .expect_err("a document narrower than the compiled policy must be refused");
     let message = error.to_string();
@@ -599,7 +574,6 @@ fn a_unix_socket_grant_reaches_the_native_tier_and_moves_its_digest() {
         &[],
         &[],
         Some(&authorized),
-        GrantFold::Native,
     )
     .expect("the native tier delivers §6 to the workload");
 
@@ -614,49 +588,101 @@ fn a_unix_socket_grant_reaches_the_native_tier_and_moves_its_digest() {
     );
     assert_ne!(
         compiled.confinement_digest().expect("digest with §6"),
-        leyline_runtime::backends::libkrun::confinement::confinement_manifest(
-            &[],
-            &[],
-            None,
-            GrantFold::Native,
-        )
-        .expect("valid manifest")
-        .confinement_digest()
-        .expect("digest without §6"),
+        leyline_runtime::backends::libkrun::confinement::confinement_manifest(&[], &[], None)
+            .expect("valid manifest")
+            .confinement_digest()
+            .expect("digest without §6"),
         "declaring a socket must move the digest — the receipt commits to the channel"
     );
 }
 
-/// The §6 named refusal is a property of the MICROVM tier, not of the
-/// dimension — and it must survive the native tier gaining delivery.
+/// ADR-0036 O2's microVM half: §6 delivered as vsock↔socket mappings.
 ///
-/// On the microVM tier the confined process is the VMM host; the workload
-/// runs in the guest and reaches host sockets only through vsock mappings
-/// that do not exist yet (ADR-0036 O2's remaining half). Folding §6 there
-/// would grant the dial right to the VMM while the workload still could not
-/// reach the endpoint: a policy attesting a channel the workload does not
-/// have. Until the vsock mapping is wired, the refusal names the dimension.
+/// On this tier the confined process is the VMM host; the workload runs in
+/// the guest and reaches host sockets only through the mappings constructed
+/// here — "only what was constructed exists" IS the enforcement mechanism.
+/// The pairing is a pure function of document order (grant `i` owns ports
+/// `BASE+2i` dial / `BASE+2i+1` serve), so the attested digest already
+/// covers every mapping and the receipt needs no new field. An earlier
+/// version of this test pinned the named refusal that stood here before the
+/// mapping existed.
 #[test]
-fn the_microvm_tier_still_refuses_a_carried_unix_socket_by_name() {
-    let authorized = ConfinementManifest::new()
-        .with_fs_grant(leyline_runtime::confinement::FsGrant::read_write(
-            leyline_runtime::backends::libkrun::confinement::ATTESTED_RUN_ROOTFS,
-        ))
-        .expect("rootfs grant")
-        .with_unix_socket(leyline_runtime::confinement::UnixSocketGrant::connect(
-            "/run/cloister/shim.sock",
-        ))
-        .expect("a legal §6 grant");
+fn a_socket_grant_becomes_exactly_the_vsock_mappings_its_modes_permit() {
+    // A bound endpoint for the connect grant's ordering contract — the test
+    // binary itself, same stand-in `unix_socket_mode`'s tests use: the check
+    // reads `Path::exists`, not "is a socket", and the binary cannot race or
+    // leak.
+    let bound = std::env::current_exe()
+        .expect("test binary has a path")
+        .display()
+        .to_string();
 
-    let error = leyline_runtime::backends::libkrun::confinement::confinement_manifest(
-        &[],
-        &[],
-        Some(&authorized),
-        GrantFold::MicroVm,
-    )
-    .expect_err("the microVM tier cannot deliver §6 to the workload yet");
+    let manifest = ConfinementManifest::new()
+        .with_unix_socket(leyline_runtime::confinement::UnixSocketGrant::connect(
+            &bound,
+        ))
+        .expect("connect grant")
+        .with_unix_socket(leyline_runtime::confinement::UnixSocketGrant::bind(
+            "/run/llo/served.sock",
+        ))
+        .expect("bind grant")
+        .with_unix_socket(leyline_runtime::confinement::UnixSocketGrant::connect_bind(
+            "/run/llo/both.sock",
+        ))
+        .expect("connect-bind grant");
+
+    let mappings = vsock_unix_mappings(&manifest).expect("every mode maps");
+    let shape: Vec<(u32, String, bool)> = mappings
+        .iter()
+        .map(|m| (m.port, m.host_path.to_string_lossy().into_owned(), m.listen))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            // Grant 0, connect: the dial port only.
+            (VSOCK_UNIX_BASE_PORT, bound, false),
+            // Grant 1, bind: the serve port only — the mode the NATIVE tier
+            // cannot express at all, deliverable here because the withhold is
+            // the muxer's reset, not a filter.
+            (
+                VSOCK_UNIX_BASE_PORT + 3,
+                "/run/llo/served.sock".into(),
+                true
+            ),
+            // Grant 2, connect-bind: both halves, each on its own port.
+            (VSOCK_UNIX_BASE_PORT + 4, "/run/llo/both.sock".into(), false),
+            (VSOCK_UNIX_BASE_PORT + 5, "/run/llo/both.sock".into(), true),
+        ],
+        "grant i owns ports BASE+2i / BASE+2i+1 — a pure function of document \
+         order, so the attested digest already covers every mapping"
+    );
+}
+
+/// The two microVM refusals that remain, each naming its reason.
+#[test]
+fn the_microvm_mappings_refuse_what_a_mapping_cannot_express() {
+    // A directory grant names a tree; a mapping needs a leaf.
+    let directory = ConfinementManifest::new()
+        .with_unix_socket(leyline_runtime::confinement::UnixSocketGrant::connect(
+            "/run/llo/sockets/",
+        ))
+        .expect("directory grant");
+    let error = vsock_unix_mappings(&directory).expect_err("a tree has no endpoint to map");
     assert!(
-        error.to_string().contains("§6 unixSocket.allow"),
-        "the refusal must still name the dimension: {error}"
+        error.to_string().contains("directory grant"),
+        "the refusal must say why: {error}"
+    );
+
+    // The §6 ordering contract, same as the native tier: a connect grant
+    // names an endpoint someone else owns, bound before the workload starts.
+    let unbound = ConfinementManifest::new()
+        .with_unix_socket(leyline_runtime::confinement::UnixSocketGrant::connect(
+            "/run/llo/nobody-bound-this.sock",
+        ))
+        .expect("connect grant");
+    let error = vsock_unix_mappings(&unbound).expect_err("nothing is bound at the endpoint");
+    assert!(
+        error.to_string().contains("nothing is bound there yet"),
+        "the refusal must name the ordering contract: {error}"
     );
 }

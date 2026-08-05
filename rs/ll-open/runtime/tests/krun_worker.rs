@@ -35,6 +35,7 @@ fn request_fixture(cas: &TempDir) -> ExecutionRequest {
         public_environment: BTreeMap::new(),
         allowed_egress: Vec::new(),
         confinement_digest: String::new(),
+        confinement_manifest: None,
         limits: ResourceLimits {
             vcpus: 1,
             memory_mib: 512,

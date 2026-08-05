@@ -71,6 +71,7 @@ impl ExecutionResolver for Resolver {
             // argument for the check living on the seam rather than in prose on
             // one implementation.
             confinement_digest: authorized.confinement_digest.clone(),
+            confinement_manifest: authorized.confinement_manifest.clone(),
             limits: ResourceLimits {
                 vcpus: 1,
                 memory_mib: 64,

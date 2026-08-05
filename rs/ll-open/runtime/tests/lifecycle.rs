@@ -200,6 +200,7 @@ fn request(replay_key: &str) -> ExecutionRequest {
         public_environment: BTreeMap::from([("CI".into(), "true".into())]),
         allowed_egress: Vec::new(),
         confinement_digest: String::new(),
+        confinement_manifest: None,
         limits: ResourceLimits {
             vcpus: 2,
             memory_mib: 2048,

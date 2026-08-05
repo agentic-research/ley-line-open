@@ -1058,6 +1058,7 @@ impl ExecutionResolver for TestResolver {
             // the field being non-empty. Five tests in this file passed
             // vacuously as a result.
             confinement_digest: authorized.confinement_digest.clone(),
+            confinement_manifest: authorized.confinement_manifest.clone(),
             limits: ResourceLimits {
                 vcpus: 1,
                 memory_mib: 128,

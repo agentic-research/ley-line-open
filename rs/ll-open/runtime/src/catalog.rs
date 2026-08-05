@@ -176,6 +176,11 @@ impl ExecutionResolver for CatalogResolver {
             // attestation against it. The resolver must not substitute its
             // own — that would make the check compare a value to itself.
             confinement_digest: authorized.confinement_digest.clone(),
+            // Same rule as the digest above: carried, never chosen. Before
+            // this, the grant's document was parsed and digest-verified in
+            // `authorization.rs` and then dropped here, so no dimension it
+            // declared could reach the tier that enforces it.
+            confinement_manifest: authorized.confinement_manifest.clone(),
         };
         request.validate()?;
         Ok(request)

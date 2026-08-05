@@ -734,10 +734,33 @@ fn a_local_connect_grant_moves_the_digest_and_round_trips() {
         canonical.contains("connectLocal"),
         "the clause must appear under the network block: {canonical}"
     );
+    let reparsed = ConfinementManifest::parse(&canonical).expect("re-parse");
     assert_eq!(
-        ConfinementManifest::parse(&canonical).expect("re-parse"),
-        with,
+        reparsed, with,
         "parse must reconstruct exactly the manifest that produced the bytes"
+    );
+
+    // Read back through the ACCESSOR, not just structural equality. The
+    // assertions above compare whole manifests with PartialEq, which reads the
+    // fields directly and so never executes `connect_local()` — cloister's
+    // actual read surface, alongside `unix_sockets()` and `port_bind()`. Three
+    // mutants of that getter survived the first gate on this branch for
+    // exactly that reason. The port is deliberately neither 0 nor 1, so a
+    // getter stubbed to any constant fails here.
+    assert_eq!(
+        with.connect_local(),
+        Some(8443),
+        "the accessor must report the declared port"
+    );
+    assert_eq!(
+        reparsed.connect_local(),
+        Some(8443),
+        "the accessor must survive a canonical-JSON round trip"
+    );
+    assert_eq!(
+        base.connect_local(),
+        None,
+        "a manifest that never declared the dimension must report None"
     );
 }
 

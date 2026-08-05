@@ -1,6 +1,6 @@
 # ADR-0037 — Naming the proxy channel: confinement/v1 assumes an egress path it cannot express
 
-**Status:** Proposed (2026-08-05) — **for cloister review before any implementation**
+**Status:** Accepted (2026-08-05) — cloister reviewed and confirmed the §3 placement; implemented in the same release that lands this ADR.
 **Bead:** `ley-line-open-0e73e8`
 **Related:**
 - `ley-line-open-e41717` (the Seatbelt measurement this rests on)

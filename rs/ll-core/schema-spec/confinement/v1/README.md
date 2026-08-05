@@ -389,7 +389,7 @@ Document map for the split).
 At bundle-start time, the substrate runner:
 
 1. Reads the `ConfinementManifest` JSON.
-2. Canonicalizes per §6.
+2. Canonicalizes per §7 (Canonical serialization).
 3. Computes BLAKE3-256 of the canonical bytes. Call this
    `confinementDigest`.
 4. Verifies that the bundle's identity claim (lane-2 workload

@@ -136,13 +136,42 @@ tracing             = { version = "0.1", optional = true }
 tracing-subscriber  = { version = "0.3", optional = true, features = ["env-filter", "fmt"] }
 
 # Platform-specific keyring features. macOS uses the Security framework
-# directly; Linux uses libsecret synchronously. Both run inside
-# `spawn_blocking` so the sync variant is correct.
+# directly; Linux uses libsecret. Both run inside `spawn_blocking`, so the
+# sync/async distinction is invisible to this crate's callers.
+#
+# LINUX USES THE **ASYNC** BACKEND, and must, because `nono` does. keyring
+# refuses to build with both at once:
+#
+#     compile_error!("This crate cannot use both the sync and async versions
+#                     of any credential store")   — keyring-3.6.3/src/lib.rs:202
+#
+# nono pins `async-secret-service` in its own `cfg(target_os = "linux")` block
+# (nono-0.71.0/Cargo.toml:139-142), and `host-extras` pulls nono in. So a
+# `host-extras` build on Linux had sync from here and async from there, and did
+# not compile — on Linux only, which is why it survived: macOS resolves to
+# `apple-native` and never reaches the guard. Reported by cloister, whose
+# `task verify` is the first gate that ran this combination on a Linux runner.
+#
+# Aligning on async is the right direction rather than merely the available one.
+# `sync-secret-service` uses `dbus-secret-service`, which links libdbus and
+# therefore needs `libdbus-1-dev` + `pkg-config` at build time — a system
+# prerequisite cloister's threat model §17.1 documents CI installing. The async
+# backend goes through `zbus`, which is pure Rust, so this removes a C build
+# dependency rather than trading one for another.
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-keyring = { version = "3", features = ["sync-secret-service"], optional = true }
+keyring = { version = "3", optional = true, default-features = false, features = [
+  # Exactly nono's Linux set (nono-0.71.0/Cargo.toml:139-147). `async-secret-service`
+  # alone does not build: the crate picks its backend but not a RUNTIME, and
+  # `secret-service` then refuses with its own compile_error asking for one.
+  # `async-io` is that runtime and `crypto-rust` the cipher, so all three travel
+  # together or none do.
+  "async-secret-service",
+  "crypto-rust",
+  "async-io",
+] }
 
 [dev-dependencies]
 # Phase 2/3 exception (bead ley-line-open-3b2f55): rand stays at the

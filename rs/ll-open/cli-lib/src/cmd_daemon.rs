@@ -920,14 +920,21 @@ fn init_living_db(
             live_db_path.display(),
         );
         unlink_live_db(live_db_path);
-        // Zero the controller so `controller_is_fresh` reads true and
-        // downstream `try_warm_start_from_arena` returns None.
-        // `set_arena_with_root` takes the arena path as &str; the
-        // controller stores it verbatim, so we pass the empty string
-        // (arena path not published in this reset step; a real value
-        // gets stamped by `setup_arena`'s follow-on flow if needed).
+        // Zero the ROOT so `controller_is_fresh` reads true and
+        // downstream `try_warm_start_from_arena` returns None — "no
+        // prior snapshot", not "no arena". `setup_arena` (this
+        // function's caller, always run first) already stamped the
+        // path and size; blanking them too (as an earlier version of
+        // this fix did, `ley-line-open-e37e03`) makes the next
+        // `snapshot_to_arena` open an empty path and fail with "open
+        // arena file" — including on a completely fresh arena, since
+        // the flag's whole job is to run regardless of prior state.
+        // Reading them back from the controller we just opened is
+        // exactly `setup_arena`'s own stamp, not a guess.
         if let Ok(mut c) = leyline_core::Controller::open_or_create(ctrl_path) {
-            let _ = c.set_arena_with_root("", 0, [0u8; 32]);
+            let arena_path = c.arena_path();
+            let arena_size = c.arena_size();
+            let _ = c.set_arena_with_root(&arena_path, arena_size, [0u8; 32]);
         }
     }
 
@@ -970,7 +977,18 @@ fn init_living_db(
     //       fresh file-backed WAL connection so subsequent snapshots
     //       and reads stay on the 15a substrate.
     //   (b) Controller is fresh — cold start.
-    if let Some(conn) = try_warm_start_from_arena(ctrl_path, live_db_path)? {
+    //
+    // `!reset_arena` guards this whole branch, not just the live-db one
+    // above (`ley-line-open-e37e03`, second half): zeroing the
+    // controller's root does not touch the ARENA FILE's own embedded
+    // header, which still carries whatever a prior daemon last
+    // snapshotted there. Without this guard, unlinking the live db just
+    // routes a reset-requested startup into recovering that same stale
+    // content one layer down — the exact failure mode this function's
+    // own doc comment already promised could never happen ("a
+    // reset-requested startup NEVER warm-starts, regardless of what the
+    // prior daemon left behind").
+    if !reset_arena && let Some(conn) = try_warm_start_from_arena(ctrl_path, live_db_path)? {
         // Same source-root guard as the live-db warm-start branch
         // above. The arena might have been snapshotted by daemon A
         // against repo R1; if daemon B started against repo R2 with
@@ -2563,6 +2581,124 @@ mod tests {
             .query_row("SELECT count(*) FROM snap_rows", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 3, "live db must remain queryable after snapshot");
+    }
+
+    /// `ley-line-open-e37e03`, filed by mache: `--reset-arena` ALWAYS
+    /// failed, including on a completely fresh arena with no prior
+    /// state, because the reset zeroed the arena PATH along with the
+    /// root — but `cmd_serve::setup_arena` (this function's real
+    /// caller, always run first) had already stamped the path, and
+    /// nothing re-stamps it. The next `snapshot_to_arena` then opens
+    /// an empty path and fails with "open arena file".
+    ///
+    /// This is case (a) of the bead's acceptance criteria — reproduces
+    /// the exact reported repro (real `setup_arena`, `--reset-arena`,
+    /// through to a completed snapshot) rather than a paraphrase of
+    /// it, since the bug is specifically about what THAT function
+    /// stamps and THIS one blanks.
+    #[test]
+    fn reset_arena_reaches_a_completed_snapshot_on_a_fresh_arena() {
+        let dir = TempDir::new().unwrap();
+        let arena_path = dir.path().join("reset.arena");
+        let ctrl_path = dir.path().join("reset.ctrl");
+        let live_db_path = live_db_path_for(&ctrl_path);
+
+        // The real caller, not a hand-rolled mimic — the bug is specifically
+        // about what THIS stamps and the reset then blanks.
+        let ctrl_path_returned =
+            cmd_serve::setup_arena(&arena_path, 2 * 1024 * 1024, Some(&ctrl_path))
+                .expect("setup_arena on a completely fresh arena");
+        assert_eq!(ctrl_path_returned, ctrl_path);
+
+        let conn = init_living_db(&ctrl_path, &live_db_path, None, None, true)
+            .expect("--reset-arena must succeed on a fresh arena — this is the reported failure");
+        conn.execute_batch(
+            "CREATE TABLE reset_rows (id INTEGER PRIMARY KEY, payload TEXT);
+             INSERT INTO reset_rows (payload) VALUES ('after-reset');",
+        )
+        .unwrap();
+
+        // The exact failure site: `snapshot_to_arena` reading back
+        // whatever path the reset left behind.
+        snapshot_to_arena(&conn, &ctrl_path)
+            .expect("snapshot_to_arena after --reset-arena on a fresh arena");
+
+        let c = leyline_core::Controller::open_or_create(&ctrl_path).unwrap();
+        assert_ne!(
+            c.current_root(),
+            [0u8; 32],
+            "snapshot must publish a non-zero root after reset"
+        );
+        assert!(
+            !c.arena_path().is_empty(),
+            "the arena path must survive the reset — this is the actual bug"
+        );
+    }
+
+    /// Case (b) of `ley-line-open-e37e03`'s acceptance criteria: the
+    /// PRESCRIBED remedy for a cross-source refusal must itself work.
+    /// `verify_source_root_matches` tells an operator verbatim to pass
+    /// `--reset-arena` when a shared arena was previously parsed
+    /// against a different `--source` — so a daemon that starts
+    /// against repo B with `--reset-arena` after a prior run against
+    /// repo A must reach ready, not hit the same "open arena file"
+    /// this bead is about.
+    #[test]
+    fn reset_arena_reaches_a_completed_snapshot_across_a_source_switch() {
+        let dir = TempDir::new().unwrap();
+        let arena_path = dir.path().join("switch.arena");
+        let ctrl_path = dir.path().join("switch.ctrl");
+        let live_db_path = live_db_path_for(&ctrl_path);
+
+        let repo_a = dir.path().join("repo_a");
+        std::fs::create_dir(&repo_a).unwrap();
+        std::fs::write(repo_a.join("a.json"), "{\"k\":\"a\"}\n").unwrap();
+        let repo_b = dir.path().join("repo_b");
+        std::fs::create_dir(&repo_b).unwrap();
+        std::fs::write(repo_b.join("b.json"), "{\"k\":\"b\"}\n").unwrap();
+
+        // First daemon: cold start against repo A, snapshot it — this is
+        // the prior state a shared arena (e.g. `~/.mache/default.arena`)
+        // carries into the next run.
+        cmd_serve::setup_arena(&arena_path, 2 * 1024 * 1024, Some(&ctrl_path))
+            .expect("setup_arena for repo A");
+        let conn_a = init_living_db(
+            &ctrl_path,
+            &live_db_path,
+            Some(&repo_a),
+            Some("json"),
+            false,
+        )
+        .expect("cold start against repo A");
+        snapshot_to_arena(&conn_a, &ctrl_path).expect("snapshot repo A's parse");
+        drop(conn_a);
+
+        // Confirm the refusal this bead's remedy exists for actually
+        // fires, so the test proves the REMEDY works — not that the
+        // refusal never triggered in the first place.
+        let refused = init_living_db(
+            &ctrl_path,
+            &live_db_path,
+            Some(&repo_b),
+            Some("json"),
+            false,
+        )
+        .expect_err("warm start against a different --source must be refused");
+        assert!(
+            format!("{refused:#}").contains("warm start"),
+            "must fail via verify_source_root_matches, not some other error: {refused:#}"
+        );
+
+        // The prescribed remedy: --reset-arena, now against repo B.
+        let conn_b = init_living_db(&ctrl_path, &live_db_path, Some(&repo_b), Some("json"), true)
+            .expect("--reset-arena is the documented remedy for a source switch — it must work");
+        snapshot_to_arena(&conn_b, &ctrl_path)
+            .expect("snapshot_to_arena after reset across a source switch");
+
+        let row_count: i64 = conn_b
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+            .unwrap();
+        assert!(row_count > 0, "repo B must have actually been parsed");
     }
 
     /// DaemonExt that records every VCS hook invocation.

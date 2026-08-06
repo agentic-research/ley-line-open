@@ -18,6 +18,13 @@ name: Mutation testing
 # stays conditional on the allowlist actually being touched; see the step guard
 # below. Without that guard this would add ~17 min to every Rust PR, and a gate
 # people route around has already failed.
+#
+# Also tiered by TARGET (`ley-line-open-804f7e`): the allowlist run only fires
+# on integration -> main PRs, never on feature -> integration PRs, mirroring
+# ci.yml's existing base_ref tiering rather than inventing a second axis.
+# A feature PR still gets `mutants:diff`, scoped to its own diff; the
+# allowlist's full-module sweep runs once, at the promotion gate, where the
+# diff against main naturally accumulates everything a release bundles.
 on:
   pull_request:
     branches: [main, integration]
@@ -95,6 +102,7 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.base_ref }}
         run: |
           set -eu
           changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
@@ -126,9 +134,31 @@ jobs:
           # the rest rather than carving an exception. What a manifest-only
           # change to cdc still gets is `mutants:diff`, which covers whatever
           # the PR actually touched.
-          if printf '%s\n' "$changed" | grep -qE \
+          # Tiered by target, same axis ci.yml already tiers `task ci` on
+          # (`github.base_ref`) — not by a separate concept. A feature PR
+          # lands on `integration` constantly; the allowlist's own 17 minutes
+          # is the cost of running it on every one of those, for coverage that
+          # `mutants:diff` already gives per-PR and the promotion gate gives
+          # again, accumulated, before anything reaches `main`. Reserving it
+          # for `integration` -> `main` PRs means it still runs before every
+          # release — main's own diff against `integration` naturally spans
+          # everything a promotion bundles — while dev flow on `integration`
+          # keeps just the diff-scoped run.
+          #
+          # Traded away deliberately, not accidentally: a feature PR that
+          # introduces a real survivor in an allowlisted module won't see it
+          # until the PROMOTION PR, which usually bundles several feature
+          # PRs — worse attribution than catching it at the PR that caused
+          # it. Accepted for now because the alternative (paying 17 minutes
+          # on every feature PR) was the thing making dev flow painful; if
+          # attribution turns out to matter more than the wait, this is the
+          # line to revert.
+          if [ "$BASE_REF" = "main" ] && printf '%s\n' "$changed" | grep -qE \
             '^(rs/ll-open/cdc/.*\.rs$|rs/ll-open/fs/src/(chunked|gc)\.rs|rs/ll-core/core/src/partition\.rs|Taskfile\.yml|tools/mutants_diff\.sh|\.github/workflows/mutants\.yml)'; then
             echo "allowlist=true" >> "$GITHUB_OUTPUT"
+          elif [ "$BASE_REF" != "main" ]; then
+            echo "allowlist=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::allowlist run skipped — reserved for integration -> main promotions (ley-line-open-804f7e)"
           else
             echo "allowlist=false" >> "$GITHUB_OUTPUT"
             echo "::notice::allowlist run skipped — this PR touches none of the covered modules"

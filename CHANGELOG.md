@@ -10,6 +10,30 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.18.1] — 2026-08-06
+
+**`leyline-sign`'s `host-extras` feature has never compiled on Linux.**
+Reported and precisely diagnosed by cloister: `leyline-sign` pinned
+`sync-secret-service` in its own `cfg(linux)` block while `nono` 0.71 pins
+`async-secret-service` in its; `keyring` refuses both at once. Latent since
+at least v0.15.1 — invisible because every development machine here is
+macOS, which resolves to `apple-native` and never reaches the guard.
+
+### Fixed
+
+- **Linux `keyring` now aligns on nono's exact async triple**
+  (`async-secret-service` + `crypto-rust` + `async-io`,
+  `default-features = false`), matching `nono-0.71.0/Cargo.toml:139-147`
+  exactly. This is the better direction, not just the available one:
+  `sync-secret-service` links libdbus and needs `libdbus-1-dev` +
+  `pkg-config` at build time; the async backend goes through `zbus`, pure
+  Rust, so this removes a C build dependency rather than trading one.
+  Verified independently, not just reviewed: the cited triple was confirmed
+  byte-for-byte against the real cached crate source, and the exact failing
+  configuration (`leyline-sign --features host-extras`) was built to
+  completion inside a real Linux container on this repo's pinned toolchain
+  — clean, both with and without `host-extras`.
+
 ## [0.18.0] — 2026-08-05
 
 **A sixth confinement dimension, the daemon catches up to the CLI, and

@@ -10,6 +10,77 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Added
+
+- **§6 `unixSocket.allow` is deliverable on both tiers** (ADR-0036 O2, both
+  halves). A carried §6 grant folds into the compiled document, is admitted by
+  the equality contract, and is delivered by the mechanism appropriate to
+  which process the tier confines — `Tier::Native` vs `Tier::MicroVm`, the
+  distinction every per-tier decision now derives from.
+
+  **Native:** the workload's own nono profile carries the grant — Seatbelt per
+  path on macOS; the named Landlock ABI refusal on Linux; `bind` mode refused
+  as before, since no `UnixSocketMode` withholds `connect(2)`.
+
+  **microVM:** §6 compiles to vsock↔socket mappings — `add_vsock_port`'s
+  first caller. Grant `i` in document order owns ports `0x1_0000 + 2i` (dial)
+  and `+ 2i + 1` (serve): a pure function of the attested document, so the
+  digest already commits to every mapping, the receipt needs no new field,
+  and issuer and guest compute the same ports from the document they hold.
+  Serve-without-dial (`bind`) is deliverable HERE and not on native — the
+  withhold is the muxer's reset on a `listen=true` port, a boundary rather
+  than a filter. Directory grants are refused by name (a tree has no endpoint
+  to map); connect grants keep the §6 ordering contract. The base sits above
+  every TCP port, so collision with TSI's guest-TCP vsock use is impossible
+  by construction.
+
+  The tier projection also fixes a v0.17.0 gap: §4-microVM on a macOS host
+  was refused at `apply_manifest` by the native-shaped Seatbelt refusal, even
+  though the workload's §4 boundary there is the guest port map. Under
+  `Tier::MicroVm` the VMM profile now takes the host half of the channel, and
+  the workload-facing refusals stay native-only.
+
+  This is the dimension cloister's macOS shim needs. Their harness-sandbox
+  currently rides an acknowledged unenforced hole — Seatbelt grants
+  `network-bind`/`network-inbound` unqualified whenever localhost TCP is
+  allowed at all, gated behind `CLOISTER_ACCEPT_UNENFORCED_BIND` — and its own
+  comment names this design as the fix: "a connect-only UDS grant IS
+  enforceable where a port is not." A §6 connect grant closes the hole **for
+  a workload that can dial a UNIX socket** — the compiled capability set then
+  carries no TCP at all. Cloister verified the scoping's limit: the stock
+  harnesses' API transport is TCP-only, so for those workloads the TCP shim
+  and its acknowledgment survive, and the residual problem is nono's Seatbelt
+  emission (outbound-to-localhost inseparable from bind+inbound — cloister's
+  `2d420c`, not a confinement/v1 concern).
+
+### Fixed
+
+- **`daemon --reset-arena` never actually worked.** Filed and precisely
+  diagnosed by mache (`ley-line-open-e37e03`): the flag failed even on a
+  completely fresh arena with no prior state, and it was the PRESCRIBED
+  remedy for a cross-source refusal that itself could not be followed. Two
+  compounding bugs, both fixed:
+  - The reset zeroed the controller's arena PATH along with its root, but
+    `setup_arena` (this function's caller, always run first) had already
+    stamped the path — so the next `snapshot_to_arena` opened an empty path
+    and failed with "open arena file". Fixed by zeroing only the root,
+    preserving the path/size the controller was just given.
+  - Fixing that alone reopened a second hole the same bead's "Consumer
+    impact" section had already anticipated: the arena FILE's own embedded
+    header still carries a prior daemon's snapshot content, and the
+    arena-recovery fallback wasn't gated on `reset_arena` at all — so a
+    reset-requested cross-source startup silently recovered the WRONG
+    repo's cached parse instead of cold-starting. Fixed by skipping that
+    fallback entirely when `reset_arena` is true, matching what
+    `init_living_db`'s own doc comment already promised ("a reset-requested
+    startup NEVER warm-starts, regardless of what the prior daemon left
+    behind").
+
+  Both regression cases from the bead's acceptance criteria — a fresh
+  arena, and a reset across a source switch — verified by falsification:
+  each fix reverted independently and confirmed to break exactly the case
+  it covers.
+
 ## [0.17.0] — 2026-08-05
 
 **§4 reaches the tier that enforces it.** A grant's confinement document now

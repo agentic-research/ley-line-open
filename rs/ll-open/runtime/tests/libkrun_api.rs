@@ -2,6 +2,7 @@ use std::ffi::{CStr, CString};
 use std::sync::Mutex;
 
 use leyline_runtime::backends::libkrun::api::{DynamicKrunApi, KrunApi, prepare_vm};
+use leyline_runtime::backends::libkrun::confinement::{VSOCK_UNIX_BASE_PORT, VsockUnixMapping};
 use leyline_runtime::backends::libkrun::plan::{KrunConfig, ResolvedRootfs};
 use leyline_runtime::{DigestRef, ErrorCode, ExecutionError};
 use tempfile::TempDir;
@@ -140,6 +141,7 @@ fn config(rootfs: &TempDir) -> KrunConfig {
         wall_time_ms: 1_000,
         tsi_features: 0,
         port_map: Vec::new(),
+        vsock_unix_map: Vec::new(),
     }
 }
 
@@ -219,4 +221,65 @@ fn installed_libkrun_exports_the_embedded_api() {
 
     let context = api.create_context().expect("create libkrun context");
     api.free_context(context);
+}
+
+/// §6's vsock mappings reach libkrun, in order, between the vsock device and
+/// the port map — the first caller `add_vsock_port` has ever had.
+///
+/// The positions matter: after `add_vsock` because the ports belong to that
+/// device, and the recorded sequence pins that a mapping can never be added
+/// to the implicit device this module deliberately disables.
+#[test]
+fn socket_mappings_reach_the_vsock_device_in_document_order() {
+    let rootfs = TempDir::new().expect("rootfs");
+    let api = RecordingApi::default();
+    let mut with_sockets = config(&rootfs);
+    with_sockets.vsock_unix_map = vec![
+        VsockUnixMapping {
+            port: VSOCK_UNIX_BASE_PORT,
+            host_path: std::ffi::CString::new("/run/cloister/shim.sock").expect("path"),
+            listen: false,
+        },
+        VsockUnixMapping {
+            port: VSOCK_UNIX_BASE_PORT + 3,
+            host_path: std::ffi::CString::new("/run/llo/served.sock").expect("path"),
+            listen: true,
+        },
+    ];
+
+    let vm = prepare_vm(&api, &with_sockets).expect("prepared VM");
+    drop(vm);
+
+    let calls = api.calls();
+    let vsock = calls
+        .iter()
+        .position(|c| c.starts_with("vsock:"))
+        .expect("vsock device added");
+    let first = calls
+        .iter()
+        .position(|c| {
+            c == &format!(
+                "vsock-port:42:{}:/run/cloister/shim.sock:listen=false",
+                VSOCK_UNIX_BASE_PORT
+            )
+        })
+        .expect("dial mapping recorded");
+    let second = calls
+        .iter()
+        .position(|c| {
+            c == &format!(
+                "vsock-port:42:{}:/run/llo/served.sock:listen=true",
+                VSOCK_UNIX_BASE_PORT + 3
+            )
+        })
+        .expect("serve mapping recorded");
+    let port_map = calls
+        .iter()
+        .position(|c| c.starts_with("port-map:"))
+        .expect("port map still always called");
+    assert!(
+        vsock < first && first < second && second < port_map,
+        "mappings must follow their device and precede the port map, in \
+         document order: {calls:?}"
+    );
 }

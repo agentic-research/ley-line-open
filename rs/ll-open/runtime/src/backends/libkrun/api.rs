@@ -396,6 +396,18 @@ pub fn prepare_vm<'api>(
     // an operator makes explicitly, not a default anyone inherits.
     api.add_vsock(context, config.tsi_features)?;
 
+    // §6 on this tier: one explicit channel per mapping, and ONLY those. The
+    // guest can reach a vsock port precisely when a mapping constructed it —
+    // "only what was constructed exists" is the enforcement mechanism, not a
+    // profile rule — and a `listen=true` port additionally answers a
+    // guest-originated request with a reset, which is what makes
+    // serve-without-dial (§6 `bind`) a real state here. Ports are the pure
+    // function of document order defined at `vsock_unix_mappings`; empty means
+    // the manifest declared no sockets, and nothing is mapped.
+    for mapping in &config.vsock_unix_map {
+        api.add_vsock_port(context, mapping.port, &mapping.host_path, mapping.listen)?;
+    }
+
     // Always called, including with nothing to map: libkrun reads "never
     // called" as expose-EVERY-listening-guest-port and "called with an empty
     // array" as expose-none.

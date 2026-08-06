@@ -34,6 +34,7 @@ fn config_for_path(rootfs: &Path) -> KrunConfig {
         wall_time_ms: 1_000,
         tsi_features: 0,
         port_map: Vec::new(),
+        vsock_unix_map: Vec::new(),
     }
 }
 

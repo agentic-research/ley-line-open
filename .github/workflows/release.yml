@@ -60,6 +60,12 @@ jobs:
             # Upload the C header from exactly one job (avoids 3-way
             # --clobber races on the same asset).
             include_header: true
+            # Same single-uploader rule: the generated execution/v1 tool
+            # definitions are one platform-independent JSON, shipped so a
+            # consumer can advance its contract lock by fetch + digest-verify
+            # instead of needing an LLO checkout and a capnp toolchain
+            # (ley-line-open-6bb789).
+            include_tooldefs: true
             # wasm_assets present → this job also builds + stages the
             # platform-independent wasm32 artifacts (ley-line-open-a2099a;
             # envelope joined under ley-line-open-be5f86). One artifact each
@@ -206,6 +212,7 @@ jobs:
           ASSET_NAME: ${{ matrix.asset }}
           LIB_ASSET: ${{ matrix.lib_asset }}
           INCLUDE_HEADER: ${{ matrix.include_header }}
+          INCLUDE_TOOLDEFS: ${{ matrix.include_tooldefs }}
           # Staged as `<bin>-<suffix>`; the suffix derives from ASSET_NAME.
           # tools/release-assets.txt asserts the resulting 20 names, so a
           # binary that fails to build fails the release rather than silently

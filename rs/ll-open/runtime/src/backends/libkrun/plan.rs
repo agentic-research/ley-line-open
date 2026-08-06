@@ -86,6 +86,14 @@ pub struct KrunConfig {
     /// as expose-every-listening-port and "called with an empty array" as
     /// expose-none, so this must always be passed — see `prepare_vm`.
     pub port_map: Vec<CString>,
+    /// Guest-vsock-port ↔ host-UNIX-socket pairings delivering §6 on this
+    /// tier, handed verbatim to `krun_add_vsock_port2` by `prepare_vm`.
+    ///
+    /// EMPTY IS THE CLOSED DEFAULT, same discipline as `port_map` above: a
+    /// mapping only ever originates from the manifest the grant authorized
+    /// (`vsock_unix_mappings` in `worker.rs`), never from the request, so a
+    /// plan compiled straight from an `ExecutionRequest` grants none.
+    pub vsock_unix_map: Vec<super::confinement::VsockUnixMapping>,
 }
 
 pub fn compile_plan(
@@ -134,6 +142,7 @@ pub fn compile_plan(
         // compiled straight from an ExecutionRequest grants neither.
         tsi_features: 0,
         port_map: Vec::new(),
+        vsock_unix_map: Vec::new(),
     })
 }
 

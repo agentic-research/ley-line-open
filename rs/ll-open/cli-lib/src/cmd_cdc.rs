@@ -50,7 +50,8 @@ pub fn format_report(report: ActivationReport, json: bool) -> Result<String> {
     }
     Ok(format!(
         "CDC enabled: eligible={} populated={} already_fresh={} source_bytes={} \
-         manifest_rows={} unique_chunks={} unique_chunk_bytes={}",
+         manifest_rows={} unique_chunks={} unique_chunk_bytes={} \
+         stranded_source_blobs_manifest_rows={}",
         report.eligible_nodes,
         report.populated_nodes,
         report.already_fresh_nodes,
@@ -58,6 +59,7 @@ pub fn format_report(report: ActivationReport, json: bool) -> Result<String> {
         report.manifest_rows,
         report.unique_chunk_rows,
         report.unique_chunk_bytes,
+        report.stranded_source_blobs_manifest_rows,
     ))
 }
 
@@ -116,7 +118,7 @@ pub fn format_blob_report(report: BlobActivationReport, json: bool) -> Result<St
     Ok(format!(
         "CDC source_blobs enabled: eligible={} populated={} already_fresh={} \
          skipped_sub_floor={} source_bytes={} manifest_rows={} unique_chunks={} \
-         unique_chunk_bytes={}",
+         unique_chunk_bytes={} stranded_nodes_manifest_rows={}",
         report.eligible_blobs,
         report.populated_blobs,
         report.already_fresh_blobs,
@@ -125,6 +127,7 @@ pub fn format_blob_report(report: BlobActivationReport, json: bool) -> Result<St
         report.manifest_rows,
         report.unique_chunk_rows,
         report.unique_chunk_bytes,
+        report.stranded_nodes_manifest_rows,
     ))
 }
 
@@ -201,7 +204,44 @@ mod tests {
             manifest_rows: 6,
             unique_chunk_rows: 7,
             unique_chunk_bytes: 8,
+            stranded_nodes_manifest_rows: 9,
         }
+    }
+
+    /// Distinct value per field, matching `blob_report()`'s discipline.
+    fn nodes_report() -> ActivationReport {
+        ActivationReport {
+            eligible_nodes: 1,
+            populated_nodes: 2,
+            already_fresh_nodes: 3,
+            processed_source_bytes: 4,
+            manifest_rows: 5,
+            unique_chunk_rows: 6,
+            unique_chunk_bytes: 7,
+            stranded_source_blobs_manifest_rows: 8,
+        }
+    }
+
+    /// `format_report` (the `nodes` render) had no in-module twin, unlike
+    /// `format_blob_report` and `format_gc_report` right below — the module
+    /// header explains why that matters: the diff-scoped mutants gate sees
+    /// `--lib` only, so a constant-replacement mutant here is invisible to
+    /// `tests/cdc_command_test.rs` no matter how thorough that file is.
+    /// `ley-line-open-c3d746`'s own diff landed on this exact function and
+    /// found the gap live (`Ok(String::new())` and `Ok("xyzzy".into())`
+    /// both survived) before this test existed.
+    #[test]
+    fn nodes_report_renders_stable_human_and_json_forms() {
+        assert_eq!(
+            format_report(nodes_report(), false).unwrap(),
+            "CDC enabled: eligible=1 populated=2 already_fresh=3 source_bytes=4 \
+             manifest_rows=5 unique_chunks=6 unique_chunk_bytes=7 \
+             stranded_source_blobs_manifest_rows=8"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&format_report(nodes_report(), true).unwrap()).unwrap();
+        assert_eq!(json["eligible_nodes"], 1);
+        assert_eq!(json["stranded_source_blobs_manifest_rows"], 8);
     }
 
     #[test]
@@ -225,11 +265,12 @@ mod tests {
             format_blob_report(blob_report(), false).unwrap(),
             "CDC source_blobs enabled: eligible=1 populated=2 already_fresh=3 \
              skipped_sub_floor=4 source_bytes=5 manifest_rows=6 unique_chunks=7 \
-             unique_chunk_bytes=8"
+             unique_chunk_bytes=8 stranded_nodes_manifest_rows=9"
         );
         let json: serde_json::Value =
             serde_json::from_str(&format_blob_report(blob_report(), true).unwrap()).unwrap();
         assert_eq!(json["skipped_sub_floor_blobs"], 4);
+        assert_eq!(json["stranded_nodes_manifest_rows"], 9);
     }
 
     #[test]

@@ -44,10 +44,41 @@ done < "$tmp_dir/release-manifests"
 schema_version=$(sed -nE \
     's/^pub const SCHEMA_VERSION: &str = "([^"]+)";/\1/p' \
     rs/ll-open/cli-lib/src/daemon/version.rs)
-test "$schema_version" = "$version"
+# SCHEMA_VERSION is intentionally independent from the binary release
+# version (see the doc comment on the const itself) — a binary-only release
+# leaves it at whatever it last was. Two valid states, mirroring
+# tools/tag_release.sh's own branching at tag time exactly, so this gate
+# cannot pass something that script would then refuse to tag:
+#   1. schema_version == version: this release also bumps the public schema
+#      surface. The new clients/go/leyline-schema/v$version tag is expected
+#      to not exist yet — tag_release.sh creates it.
+#   2. schema_version != version: binary-only release, reusing an
+#      ALREADY-PUBLISHED schema tag. Refuse if that tag was never actually
+#      published (a schema_version pointing nowhere is not "unchanged", it's
+#      wrong), and refuse if clients/go/leyline-schema drifted from that tag
+#      without SCHEMA_VERSION moving to match — the same drift
+#      tag_release.sh's own diff --quiet catches at tag time, caught here
+#      instead so a release fails fast rather than at the tag step.
+if [ "$schema_version" != "$version" ]; then
+    old_schema_tag="clients/go/leyline-schema/v$schema_version"
+    if ! git rev-parse -q --verify "refs/tags/$old_schema_tag" >/dev/null 2>&1; then
+        git fetch -q origin "refs/tags/$old_schema_tag:refs/tags/$old_schema_tag" 2>/dev/null || true
+    fi
+    if ! git rev-parse -q --verify "refs/tags/$old_schema_tag" >/dev/null 2>&1; then
+        echo "SCHEMA_VERSION is $schema_version (binary release is $version), but" \
+             "$old_schema_tag is not a published tag — nothing to reuse" >&2
+        exit 1
+    fi
+    if ! git diff --quiet "$old_schema_tag" -- clients/go/leyline-schema; then
+        echo "SCHEMA_VERSION is unchanged at $schema_version, but" \
+             "clients/go/leyline-schema differs from $old_schema_tag — bump" \
+             "SCHEMA_VERSION to $version or revert the schema-client change" >&2
+        exit 1
+    fi
+fi
 
 grep -q "\"binary_version\": \"$version\"" compatibility.json
-grep -q "\"schema_version\": \"$version\"" compatibility.json
+grep -q "\"schema_version\": \"$schema_version\"" compatibility.json
 grep -q "\"version\": \"$version\"" server.json
 # The OCI identifier is TAGLESS (cloister ADR-0041, bead `ley-line-open-04300f`).
 # This line previously read `grep -q "ley-line-open:$version" server.json`, i.e. it
@@ -62,7 +93,9 @@ grep -q "^## \\[$version\\]" CHANGELOG.md
 # README documenting an unprefixed pull command would name an image the
 # publish job never pushes (`ley-line-open-e44960`).
 grep -q "ley-line-open:v$version" README.md
-grep -q "clients/go/leyline-schema/v$version" README.md
+# Tracks schema_version, not the binary release — the README's own text
+# names a Go-module tag, and that tag only moves when SCHEMA_VERSION does.
+grep -q "clients/go/leyline-schema/v$schema_version" README.md
 grep -Fq "| LLO version | v$version |" docs/ARCHITECTURE.md
 grep -q 'daemon/wire' clients/go/leyline-schema/README.md
 grep -q "Apache License" clients/go/leyline-schema/LICENSE

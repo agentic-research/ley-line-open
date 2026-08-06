@@ -53,6 +53,34 @@ context, scoping notes, and review history are recoverable.
   emission (outbound-to-localhost inseparable from bind+inbound — cloister's
   `2d420c`, not a confinement/v1 concern).
 
+### Fixed
+
+- **`daemon --reset-arena` never actually worked.** Filed and precisely
+  diagnosed by mache (`ley-line-open-e37e03`): the flag failed even on a
+  completely fresh arena with no prior state, and it was the PRESCRIBED
+  remedy for a cross-source refusal that itself could not be followed. Two
+  compounding bugs, both fixed:
+  - The reset zeroed the controller's arena PATH along with its root, but
+    `setup_arena` (this function's caller, always run first) had already
+    stamped the path — so the next `snapshot_to_arena` opened an empty path
+    and failed with "open arena file". Fixed by zeroing only the root,
+    preserving the path/size the controller was just given.
+  - Fixing that alone reopened a second hole the same bead's "Consumer
+    impact" section had already anticipated: the arena FILE's own embedded
+    header still carries a prior daemon's snapshot content, and the
+    arena-recovery fallback wasn't gated on `reset_arena` at all — so a
+    reset-requested cross-source startup silently recovered the WRONG
+    repo's cached parse instead of cold-starting. Fixed by skipping that
+    fallback entirely when `reset_arena` is true, matching what
+    `init_living_db`'s own doc comment already promised ("a reset-requested
+    startup NEVER warm-starts, regardless of what the prior daemon left
+    behind").
+
+  Both regression cases from the bead's acceptance criteria — a fresh
+  arena, and a reset across a source switch — verified by falsification:
+  each fix reverted independently and confirmed to break exactly the case
+  it covers.
+
 ## [0.17.0] — 2026-08-05
 
 **§4 reaches the tier that enforces it.** A grant's confinement document now

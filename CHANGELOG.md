@@ -10,6 +10,17 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.18.0] — 2026-08-05
+
+**A sixth confinement dimension, the daemon catches up to the CLI, and
+`--reset-arena` finally works.** `network.connectLocal` closes the last
+proxy-shaped gap confinement/v1 left in its own refusals; the daemon's
+`--cdc-target` selector and its honest accounting for what a target switch
+leaves behind close the matching gap on the CDC side; and the flag
+`verify_source_root_matches` has always prescribed as its own remedy now
+actually works. All three traced from real consumer work — cloister and
+mache.
+
 ### Added
 
 - **§6 `unixSocket.allow` is deliverable on both tiers** (ADR-0036 O2, both
@@ -53,7 +64,54 @@ context, scoping notes, and review history are recoverable.
   emission (outbound-to-localhost inseparable from bind+inbound — cloister's
   `2d420c`, not a confinement/v1 concern).
 
+- **A sixth confinement/v1 dimension: `network.connectLocal`** (ADR-0037,
+  `ley-line-open-e41717`). One loopback TCP port a workload may `connect(2)`
+  to and must not bind or listen on — the shape a local proxy client needs,
+  which the existing `port.bind`/`allow_localhost_port` grants could not
+  express without also handing out the ability to listen. Compiles to
+  `proxy_only`/`proxy_only_with_bind`: on macOS, `(allow network-outbound
+  (remote tcp "localhost:N"))` with no `network-bind`/`network-inbound`
+  emitted; on Linux, a single NetPort `ConnectTcp` rule. Measured, not
+  argued — both implementers believed Seatbelt could not separate outbound
+  from bind until it was run; the probe table is in ADR-0037. Refused by
+  name on the microVM tier (§9 condition 6): a guest's loopback is its own,
+  so a host-loopback port is not a channel the guest has. Digest-neutral for
+  every existing document — the field is absent-omitted in canonical JSON,
+  so the pinned confinement/v1 vector is unmoved.
+
+- **`leyline daemon --cdc` can now select its target.** `--cdc-target
+  nodes|source-blobs` (default `nodes`, unchanged) reaches the daemon path,
+  not only the standalone `leyline cdc enable` CLI — the daemon previously
+  hardcoded the `nodes` walk regardless of what a caller asked for. Filed
+  and traced by mache (`ley-line-open-c3d746`) while trying to flip its own
+  managed daemon's default to the cost-neutral `source-blobs` target and
+  finding no selector reached that code path.
+
+- **A CDC activation report now names the OTHER target's abandoned manifest
+  rows.** Switching which target a long-lived arena indexes is additive, not
+  a migration: neither activation touches the other target's tables, and
+  ordinary GC only reaps a manifest with a stale witness or a deleted source
+  row — a manifest whose row is untouched is FRESH, not dead, whether or not
+  anything reads it anymore. `ActivationReport::stranded_source_blobs_manifest_rows`
+  / `BlobActivationReport::stranded_nodes_manifest_rows` report the count (0
+  when that target was never activated on this database) rather than
+  carrying it silently; printed by both `leyline cdc enable` forms and the
+  daemon's activation log line. `ley-line-open-1869d0`, found reviewing the
+  `--cdc-target` PR itself. The reclaim path this does not ship — an
+  operator-invoked `--drop-target` — is documented as open work in ADR-0033
+  D4, not implied done.
+
+- **The generated `execution/v1` tooldefs document ships as a release asset**
+  (`execution.tools.json`), alongside the existing platform binaries.
+
 ### Fixed
+
+- **The mutants allowlist gate false-triggered on every release PR.**
+  `^rs/ll-open/cdc/` matched the directory, not just `.rs` sources, so a
+  `Cargo.toml`-only version bump (every release touches ~20 of them) fired
+  the full 17-minute allowlist run for a change the run covered nothing of.
+  Now scoped to `cdc`'s actual Rust sources, consistent with the other three
+  allowlist entries, which were already exact `.rs` paths.
 
 - **`daemon --reset-arena` never actually worked.** Filed and precisely
   diagnosed by mache (`ley-line-open-e37e03`): the flag failed even on a
@@ -80,6 +138,12 @@ context, scoping notes, and review history are recoverable.
   arena, and a reset across a source switch — verified by falsification:
   each fix reverted independently and confirmed to break exactly the case
   it covers.
+
+### Documentation
+
+- **ADR-0037** — naming the proxy channel: `confinement/v1` told operators to
+  use a proxy in two of its own refusals without a way to declare one.
+  Cloister-reviewed and accepted; implemented in this release.
 
 ## [0.17.0] — 2026-08-05
 

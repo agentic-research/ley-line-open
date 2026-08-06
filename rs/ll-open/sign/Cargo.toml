@@ -162,7 +162,16 @@ tracing-subscriber  = { version = "0.3", optional = true, features = ["env-filte
 keyring = { version = "3", features = ["apple-native"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-keyring = { version = "3", features = ["async-secret-service"], optional = true }
+keyring = { version = "3", optional = true, default-features = false, features = [
+  # Exactly nono's Linux set (nono-0.71.0/Cargo.toml:139-147). `async-secret-service`
+  # alone does not build: the crate picks its backend but not a RUNTIME, and
+  # `secret-service` then refuses with its own compile_error asking for one.
+  # `async-io` is that runtime and `crypto-rust` the cipher, so all three travel
+  # together or none do.
+  "async-secret-service",
+  "crypto-rust",
+  "async-io",
+] }
 
 [dev-dependencies]
 # Phase 2/3 exception (bead ley-line-open-3b2f55): rand stays at the

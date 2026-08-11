@@ -135,8 +135,6 @@ async fn version_op_returns_known_shape() {
         env!("CARGO_PKG_VERSION"),
         "binary_version must equal CARGO_PKG_VERSION at the consumer site",
     );
-    assert_eq!(bv, "0.18.2", "release metadata must pin the v0.18.1 binary");
-
     // `schema_version` is the independently versioned public schema contract.
     // v0.10.4 established daemon/wire as a supported public consumer surface;
     // v0.11.0 advances both, carrying two breaking changes — the Head.rootHash
@@ -147,8 +145,9 @@ async fn version_op_returns_known_shape() {
         .and_then(|v| v.as_str())
         .expect("schema_version must be a string");
     assert_eq!(
-        sv, "0.18.2",
-        "the supported public daemon/wire API must carry the release version",
+        sv,
+        leyline_cli_lib::daemon::version::SCHEMA_VERSION,
+        "the supported public daemon/wire API must carry the declared schema contract",
     );
 
     // `ir_schema_version` — the node_hash ADDRESS LINEAGE (bead

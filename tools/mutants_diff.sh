@@ -228,7 +228,13 @@ run_slice() {
 # behind non-default features, it needs the same routing — a default-features
 # run structurally cannot test it.
 if [ "$SCOPE" = all ]; then
+    # `refs.rs` contains HCL extraction behind an optional grammar feature.
+    # Keep HCL enabled in the generic slice: without it, cargo-mutants can
+    # mutate the feature-gated lines while compiling them out, which reports
+    # false surviving mutants. The tiny grammar adds coverage without changing
+    # the default-feature contract exercised by the rest of this invocation.
     run_slice lib \
+        --features hcl \
         --exclude 'll-open/fs/**' \
         --exclude 'll-open/runtime/**' \
         --exclude 'll-open/cli-lib/**' \

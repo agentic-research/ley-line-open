@@ -105,6 +105,31 @@ func caller() {
         ],
     });
     out.push(Contract {
+        // HCL's contracted algebra is ref-only: typed cross-language
+        // locators for Terraform variables and module sources. The
+        // dedicated test below pins the exact ref set and negative cases.
+        lang_name: "hcl",
+        fixture: r#"variable "DATABASE_URL" {
+  default = "postgres://localhost/app"
+}
+
+module "app" {
+  version = "1.0.0"
+  source  = "./modules/app"
+}
+
+module "dynamic" {
+  source = local.module_source
+}
+
+resource "aws_instance" "web" {
+  source = "resource-source-must-not-emit"
+}
+"#,
+        expect_def: &[],
+        ledgered_absent: &[],
+    });
+    out.push(Contract {
         lang_name: "typescript",
         fixture: r#"import { z } from "zod";
 
@@ -283,6 +308,31 @@ fn markdown_inline_emits_code_span_refs_and_no_prose_facts() {
     );
 }
 
+/// HCL's contract is also ref-shaped: variable labels and literal module
+/// sources become typed cross-language locators. Dynamic module sources and
+/// non-module `source` attributes are not stable locators and stay silent.
+#[test]
+fn hcl_emits_only_declared_typed_address_refs() {
+    let c = contracts()
+        .into_iter()
+        .find(|c| c.lang_name == "hcl")
+        .expect("hcl contract exists");
+    let Some(lang) = resolve_or_skip(&c) else {
+        return;
+    };
+    let (defs, mut refs) = extract_all(lang, c.fixture);
+    refs.sort();
+
+    assert_eq!(
+        refs,
+        vec![
+            "env:DATABASE_URL".to_string(),
+            "mod:./modules/app".to_string(),
+        ]
+    );
+    assert!(defs.is_empty(), "HCL address extraction emits no defs");
+}
+
 /// The unconsidered bucket, made visible and ratcheted. Exact match:
 /// contracting a language means removing it HERE in the same commit;
 /// adding a workspace language means deciding, in this file, whether it
@@ -300,6 +350,7 @@ fn uncontracted_languages_are_exactly_the_declared_ratchet_list() {
     // compiled-in subset is asserted under any feature set.
     let fact_emitting = [
         "go",
+        "hcl",
         "rust",
         "python",
         "javascript",

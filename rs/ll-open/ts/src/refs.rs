@@ -44,7 +44,11 @@ use tree_sitter::Node;
 ///   nullable `node_refs.qualifier` column. Emission change with
 ///   byte-identical sources — without the bump, an upgraded arena keeps
 ///   serving all-NULL qualifiers forever.
-pub const EXTRACTION_EPOCH: u64 = 4;
+/// - 5: typed HCL/Terraform address refs (bead
+///   `ley-line-open-55c1cc`). HCL previously emitted `_ast` but no
+///   `node_refs`; the bump forces existing arenas to re-derive
+///   `env:<variable>` and `mod:<module-source>` rows.
+pub const EXTRACTION_EPOCH: u64 = 5;
 
 /// Effective extraction epoch: `LLO_EXTRACTION_EPOCH` overrides the
 /// compile-time constant so one test binary can act as two releases
@@ -189,6 +193,10 @@ pub fn extract_refs(
         crate::languages::TsLanguage::Go => {
             extract_go(node, source, node_id, source_id, container_node_id)
         }
+        #[cfg(feature = "hcl")]
+        crate::languages::TsLanguage::Hcl => {
+            extract_hcl(node, source, node_id, source_id, container_node_id)
+        }
         #[cfg(feature = "rust")]
         crate::languages::TsLanguage::Rust => {
             extract_rust(node, source, node_id, source_id, container_node_id)
@@ -314,6 +322,83 @@ pub fn extract_go(
             .expect("compiled-in queries/go/tags.scm must compile against tree-sitter-go")
         })
         .extract(node, source, node_id, source_id, container_node_id)
+}
+
+// ---------------------------------------------------------------------------
+// HCL/Terraform extractor
+// ---------------------------------------------------------------------------
+
+/// Extract typed cross-language locators from one HCL/Terraform block.
+///
+/// The structural selection lives in `queries/hcl/tags.scm`: variable block
+/// labels and literal module `source` attributes are the only matches. The
+/// generic query engine preserves the block's `node_id`, `source_id`, and
+/// nearest enclosing container. This adapter adds the consumer-visible scheme
+/// and removes the HCL string delimiter that is part of `string_lit` text:
+///
+/// - `variable "NAME" { ... }` -> `env:NAME`
+/// - `module "NAME" { source = "LOCATOR" }` -> `mod:LOCATOR`
+///
+/// Dynamic module sources do not match the query's `literal_value/string_lit`
+/// shape. Resource/provider sources do not match its `module` predicate.
+#[cfg(feature = "hcl")]
+pub fn extract_hcl(
+    node: &Node,
+    source: &[u8],
+    node_id: &str,
+    source_id: &str,
+    container_node_id: Option<&str>,
+) -> Vec<ExtractedRef> {
+    use std::sync::OnceLock;
+    static ENGINE: OnceLock<crate::query_engine::QueryEngine> = OnceLock::new();
+
+    if node.kind() != "block" {
+        return Vec::new();
+    }
+    let mut cursor = node.walk();
+    let Some(block_type) = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "identifier")
+        .and_then(|child| child.utf8_text(source).ok())
+    else {
+        return Vec::new();
+    };
+    let scheme = match block_type {
+        "variable" => "env",
+        "module" => "mod",
+        _ => return Vec::new(),
+    };
+
+    ENGINE
+        .get_or_init(|| {
+            crate::query_engine::QueryEngine::new(
+                crate::languages::TsLanguage::Hcl,
+                include_str!("../queries/hcl/tags.scm"),
+            )
+            .expect("compiled-in queries/hcl/tags.scm must compile against tree-sitter-hcl")
+        })
+        .extract(node, source, node_id, source_id, container_node_id)
+        .into_iter()
+        .filter_map(|fact| match fact {
+            ExtractedRef::Ref {
+                token,
+                node_id,
+                source_id,
+                container_node_id,
+                qualifier,
+            } => {
+                let locator = token.trim_matches('"');
+                (!locator.is_empty()).then(|| ExtractedRef::Ref {
+                    token: format!("{scheme}:{locator}"),
+                    node_id,
+                    source_id,
+                    container_node_id,
+                    qualifier,
+                })
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -2865,6 +2950,60 @@ mod sql_tests {
         assert!(
             refs.contains(&("users".to_string(), None)),
             "unqualified relation must carry NULL qualifier; got {refs:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "hcl")]
+mod hcl_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn extract_all_blocks(node: tree_sitter::Node, src: &[u8], out: &mut Vec<String>) {
+        if node.kind() == "block" {
+            out.extend(
+                extract_refs(
+                    &node,
+                    src,
+                    "block-node",
+                    "main.tf",
+                    crate::languages::TsLanguage::Hcl,
+                    None,
+                )
+                .into_iter()
+                .filter_map(|fact| match fact {
+                    ExtractedRef::Ref { token, .. } => Some(token),
+                    _ => None,
+                }),
+            );
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            extract_all_blocks(child, src, out);
+        }
+    }
+
+    #[test]
+    fn dispatcher_emits_only_typed_static_terraform_addresses() {
+        let src = b"variable \"DATABASE_URL\" { type = string }\n\
+            module \"app\" {\n\
+              note = \"before source\"\n\
+              source = \"./modules/app\"\n\
+            }\n\
+            module \"dynamic\" { source = var.module_source }\n\
+            resource \"aws_instance\" \"web\" { source = \"not-a-module\" }\n";
+        let mut parser = Parser::new();
+        let language: tree_sitter::Language = tree_sitter_hcl::LANGUAGE.into();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let mut got = Vec::new();
+        extract_all_blocks(tree.root_node(), src, &mut got);
+
+        assert_eq!(
+            got,
+            ["env:DATABASE_URL", "mod:./modules/app"],
+            "only static variable and module locators may emit"
         );
     }
 }

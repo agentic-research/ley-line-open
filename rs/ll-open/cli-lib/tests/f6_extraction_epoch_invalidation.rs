@@ -129,13 +129,37 @@ func lower(s string) string {
     td
 }
 
+/// One unchanged HCL source carrying the typed facts introduced at extraction
+/// epoch 5 (ley-line-open-55c1cc). Its bytes stay fixed while the test models
+/// adoption of an epoch-4 arena that legitimately contained no HCL refs.
+fn hcl_fixture_repo() -> TempDir {
+    let td = TempDir::new().unwrap();
+    fs::write(
+        td.path().join("main.tf"),
+        r#"variable "DATABASE_URL" {
+  default = "postgres://localhost/app"
+}
+
+module "app" {
+  source = "./modules/app"
+}
+"#,
+    )
+    .unwrap();
+    td
+}
+
 /// Parse `repo` into the file-backed db at `db_path` on a fresh
 /// connection, mirroring the daemon's warm-start shape (reopen the
 /// arena's db, run a full-tree pass). Returns the `ParseResult` so
 /// tests can assert parsed/unchanged counts.
 fn parse_pass(db_path: &Path, repo: &Path) -> cmd_parse::ParseResult {
+    parse_pass_for_language(db_path, repo, "go")
+}
+
+fn parse_pass_for_language(db_path: &Path, repo: &Path, language: &str) -> cmd_parse::ParseResult {
     let conn = Connection::open(db_path).unwrap();
-    cmd_parse::parse_into_conn(&conn, repo, Some("go"), None).unwrap()
+    cmd_parse::parse_into_conn(&conn, repo, Some(language), None).unwrap()
 }
 
 /// Per-(token) ref counts, sorted — order-insensitive snapshot of the
@@ -235,6 +259,45 @@ fn f6_epoch_mismatch_forces_full_rederivation() {
         Some("2"),
         "the stored epoch must advance to the binary's epoch after re-derivation",
     );
+}
+
+#[test]
+fn f6_epoch_5_rederives_hcl_typed_refs_from_epoch_4_arena() {
+    let _l = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let repo = hcl_fixture_repo();
+    let db_dir = TempDir::new().unwrap();
+    let db_path = db_dir.path().join("live.db");
+
+    // Model the last shipped extraction identity. The current extractor code
+    // runs only to build a structurally valid arena; deleting its HCL rows
+    // below models epoch 4's real output (HCL parsed, zero refs).
+    {
+        let _g = EpochOverride::set("4");
+        parse_pass_for_language(&db_path, repo.path(), "hcl");
+    }
+    execute(&db_path, "DELETE FROM node_refs");
+    assert!(refs_snapshot(&db_path).is_empty());
+
+    let current_epoch = leyline_ts::refs::EXTRACTION_EPOCH.to_string();
+    let result = {
+        let _g = EpochOverride::set(&current_epoch);
+        parse_pass_for_language(&db_path, repo.path(), "hcl")
+    };
+
+    assert_eq!(
+        (result.parsed, result.unchanged),
+        (1, 0),
+        "the current extraction identity must invalidate an epoch-4 HCL arena"
+    );
+    assert_eq!(
+        refs_snapshot(&db_path),
+        vec![
+            ("env:DATABASE_URL".to_string(), 1),
+            ("mod:./modules/app".to_string(), 1),
+        ],
+        "epoch migration must materialize the new HCL typed refs"
+    );
+    assert_eq!(stored_epoch(&db_path).as_deref(), Some("5"));
 }
 
 #[test]

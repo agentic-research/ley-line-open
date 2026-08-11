@@ -1,6 +1,6 @@
 [package]
 name = "leyline-runtime"
-version = "0.18.1"
+version = "0.18.2"
 edition = "2024"
 description = "Capability-resolved execution lifecycle and isolation backends for Leyline"
 repository = "https://github.com/agentic-research/ley-line-open"
@@ -10,11 +10,11 @@ license = "AGPL-3.0-or-later"
 blake3 = { workspace = true }
 capnp = { workspace = true }
 capnp-json = { workspace = true }
-leyline-public-schema = { path = "../../ll-core/public-schema", version = "0.18.1" }
+leyline-public-schema = { path = "../../ll-core/public-schema", version = "0.18.2" }
 libloading = { workspace = true }
 libc = { workspace = true }
-leyline-core = { path = "../../ll-core/core", version = "0.18.1" }
-leyline-envelope = { path = "../envelope", version = "0.18.1" }
+leyline-core = { path = "../../ll-core/core", version = "0.18.2" }
+leyline-envelope = { path = "../envelope", version = "0.18.2" }
 nono = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

@@ -10,6 +10,31 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.18.2] — 2026-08-11
+
+**Terraform files now publish the typed addresses Mache consumes.** HCL had
+always produced `_ast` rows, but its extraction dispatcher had no HCL arm, so
+valid Terraform produced zero `node_refs`. This binary-only patch release
+repairs that existing relational contract; the Cap'n Proto/public-schema and
+`SCHEMA_VERSION` remain at v0.18.1.
+
+### Fixed
+
+- Terraform `variable "NAME"` blocks now emit `env:NAME`; literal module
+  `source` locators now emit `mod:LOCATOR`. Dynamic sources and unrelated HCL
+  blocks remain silent. The extraction epoch advances from 4 to 5 so unchanged
+  arenas are reprojected rather than retaining missing HCL rows.
+- The mutation gate now enables the optional HCL grammar when testing the
+  generic Tree-sitter slice, preventing feature-gated HCL mutations from being
+  compiled out and falsely reported as survivors.
+
+### Changed
+
+- Release version tooling now keeps binary and public-schema versions
+  independent: binary-only releases update package metadata and generated
+  surfaces while retaining the published schema tag when the schema client has
+  not changed.
+
 ## [0.18.1] — 2026-08-06
 
 **`leyline-sign`'s `host-extras` feature has never compiled on Linux.**

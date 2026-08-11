@@ -2955,6 +2955,60 @@ mod sql_tests {
 }
 
 #[cfg(test)]
+#[cfg(feature = "hcl")]
+mod hcl_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn extract_all_blocks(node: tree_sitter::Node, src: &[u8], out: &mut Vec<String>) {
+        if node.kind() == "block" {
+            out.extend(
+                extract_refs(
+                    &node,
+                    src,
+                    "block-node",
+                    "main.tf",
+                    crate::languages::TsLanguage::Hcl,
+                    None,
+                )
+                .into_iter()
+                .filter_map(|fact| match fact {
+                    ExtractedRef::Ref { token, .. } => Some(token),
+                    _ => None,
+                }),
+            );
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            extract_all_blocks(child, src, out);
+        }
+    }
+
+    #[test]
+    fn dispatcher_emits_only_typed_static_terraform_addresses() {
+        let src = b"variable \"DATABASE_URL\" { type = string }\n\
+            module \"app\" {\n\
+              note = \"before source\"\n\
+              source = \"./modules/app\"\n\
+            }\n\
+            module \"dynamic\" { source = var.module_source }\n\
+            resource \"aws_instance\" \"web\" { source = \"not-a-module\" }\n";
+        let mut parser = Parser::new();
+        let language: tree_sitter::Language = tree_sitter_hcl::LANGUAGE.into();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let mut got = Vec::new();
+        extract_all_blocks(tree.root_node(), src, &mut got);
+
+        assert_eq!(
+            got,
+            ["env:DATABASE_URL", "mod:./modules/app"],
+            "only static variable and module locators may emit"
+        );
+    }
+}
+
+#[cfg(test)]
 #[cfg(feature = "bash")]
 mod bash_tests {
     use super::*;

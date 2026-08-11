@@ -1453,14 +1453,15 @@ tasks:
 
   schema:version-check:
     desc: |
-      Keep public Rust schema crates aligned with the independently published
-      daemon SCHEMA_VERSION. Private storage and binary-only releases must not
-      create a new schema-client package version.
+      Keep public Rust schema crates aligned with the binary release package
+      version. SCHEMA_VERSION names the independently published wire/schema
+      surface and is validated, including its Go-client tag, by
+      release:version-check and tag_release.sh.
     cmds:
       - |
-        SCHEMA_VERSION="$(sed -nE 's/^pub const SCHEMA_VERSION: &str = "([^"]+)";/\1/p' rs/ll-open/cli-lib/src/daemon/version.rs)"
-        if [ -z "$SCHEMA_VERSION" ]; then
-          echo "could not read the literal SCHEMA_VERSION"
+        BINARY_VERSION="$(grep -m1 '^version = ' rs/ll-open/cli/Cargo.toml | cut -d'"' -f2)"
+        if [ -z "$BINARY_VERSION" ]; then
+          echo "could not read the binary package version"
           exit 1
         fi
         for manifest in \
@@ -1470,12 +1471,12 @@ tasks:
           rs/ll-core/schema-capnp/Cargo.toml
         do
           PACKAGE_VERSION="$(grep -m1 '^version = ' "$manifest" | cut -d'"' -f2)"
-          if [ "$PACKAGE_VERSION" != "$SCHEMA_VERSION" ]; then
-            echo "$manifest is $PACKAGE_VERSION but SCHEMA_VERSION is $SCHEMA_VERSION"
+          if [ "$PACKAGE_VERSION" != "$BINARY_VERSION" ]; then
+            echo "$manifest is $PACKAGE_VERSION but binary release is $BINARY_VERSION"
             exit 1
           fi
         done
-        echo "public Rust schema crates match SCHEMA_VERSION $SCHEMA_VERSION"
+        echo "public Rust schema crates match binary release $BINARY_VERSION"
 
   ci:
     desc: Common CI gate — runs on every PR. Excludes `test:perf` (release-profile rebuild adds ~90-120s; main-push-only via ci.yml's conditional `test:perf` step). For the full main-push gate locally, run `task ci:full`.

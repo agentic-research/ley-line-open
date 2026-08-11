@@ -83,17 +83,6 @@ if grep -q "version = \"=$old_version\"" "$public_schema"; then
     echo "bumped $public_schema (exact-pin straggler)" >&2
 fi
 
-# version_handshake_blackbox_test.rs — verified at each of v0.18.0/v0.18.1
-# that the current release version appears in this file ONLY as these two
-# assertions (no COMPAT_MIN or other version-shaped literal to accidentally
-# catch), so a scoped literal replace is safe here.
-handshake_test=rs/ll-open/cli-lib/tests/version_handshake_blackbox_test.rs
-if grep -q "\"$old_version\"" "$handshake_test"; then
-    sed -i.bak "s/\"$old_version\"/\"$new_version\"/g" "$handshake_test"
-    rm -f "$handshake_test.bak"
-    echo "bumped $handshake_test" >&2
-fi
-
 # BINARY_VERSION is env!("CARGO_PKG_VERSION") — nothing to bump here, it
 # follows cli-lib's Cargo.toml automatically. SCHEMA_VERSION is the one
 # hand-maintained constant in this file, and it moves conditionally.

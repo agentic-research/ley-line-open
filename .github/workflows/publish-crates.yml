@@ -1,0 +1,146 @@
+name: Publish crates
+
+# Fixes ley-line-open-a03156 (the release workflow was green for every
+# release since v0.14.0 but never actually published to crates.io — the
+# pre-flight `task release:crates:check` gate has been passing in front of a
+# publish step that did not exist) and starts closing ley-line-open-c3e8c6
+# (git-rev pinning makes multi-version resolution of e.g. leyline-core
+# structurally unavoidable for consumers — see docs/ARCHITECTURE.md's
+# "Cross-runtime consumers" section for the verified cloister/rosary impact).
+#
+# Auth model is Trusted Publishing (OIDC), not a stored token. This repo has
+# zero secrets configured (`gh secret list` is empty) and that stays true
+# here — see bead a03156 comments 723/725 for the auth-model decision record
+# and the precedent in 0day-api/notme/codex's own OIDC publishing workflows.
+#
+# IMPORTANT — bootstrapping constraint (verified against crates.io's own
+# RFC 3691, 2026-08-07): a Trusted Publisher Configuration can only be
+# registered for a crate AFTER its first manual publish. crates.io does not
+# yet support "pending" pre-publish registration (listed in the RFC as a
+# future enhancement, unimplemented as of this writing) — unlike PyPI. So
+# this workflow can only automate crates that are ALREADY on crates.io
+# today. Publishing a crate for the FIRST time is still a one-time manual
+# `cargo publish` from a local checkout, using a personal API token that
+# never touches this repo. Once that first publish lands: add the crate to
+# the `for crate in ...` list below (keeping the topological order) and
+# register its Trusted Publisher (repository owner=agentic-research,
+# repository name=ley-line-open, workflow filename=publish-crates.yml) on
+# crates.io — every release after that is then automatic.
+#
+# Full intended publish order (tools/crate-publish-order.txt is a partial
+# ordering hint — it only names the one non-obvious constraint,
+# schema-spec-before-public-schema — not the complete list; this is the full
+# topological sort computed from the real workspace dependency graph via
+# `cargo metadata`, 2026-08-07):
+#   leyline-chat-embed, leyline-core, leyline-ffi-helpers, leyline-hdc,
+#   leyline-mcp-descriptor, leyline-schema, leyline-schema-bridge,
+#   leyline-schema-capnp, leyline-schema-spec, leyline-text-search,
+#   leyline-cas-ffi, leyline-cdc, leyline-lsp, leyline-public-schema,
+#   leyline-sign, leyline-ts, leyline-envelope, leyline-fs, leyline-sheaf,
+#   leyline-runtime, leyline-vcs, leyline-cli-lib, leyline-cli
+# (leyline-mcp-protocol-schema is deliberately excluded — `publish = false`
+# in its own Cargo.toml.)
+
+on:
+  push:
+    tags: ['v*']
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: cargo publish (crates.io, trusted publishing)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required for the OIDC exchange with crates.io — see
+      # rust-lang/crates-io-auth-action. This is the only permission this
+      # job needs; no secrets, no CARGO_REGISTRY_TOKEN in repo settings.
+      id-token: write
+    steps:
+      # SHA-pinned: actions/checkout@v6.0.2 (matches ci.yml/mutants.yml/release.yml).
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      # SHA-pinned: dtolnay/rust-toolchain, same nightly pin as ci.yml/mutants.yml
+      # (bead ley-line-open-75444d) so a publish can't fail for a toolchain
+      # reason CI wouldn't also hit.
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: 1.97.1 # must equal rust-toolchain.toml (task lint:toolchain-parity)
+
+      # libfuse for fuser (leyline-fs), capnproto + libcapnp-dev for
+      # schema build.rs (leyline-public-schema, leyline-schema-capnp),
+      # libdbus-1-dev for keyring (leyline-sign) — `cargo publish`'s local
+      # verification build needs these to succeed, same as `task ci`.
+      - name: Install system deps
+        run: task deps:ci
+
+      # One OIDC exchange for the job. NOTE: it is undocumented whether the
+      # returned token is scoped to a single crate or valid for every crate
+      # this repo+workflow has a Trusted Publisher Configuration for —
+      # rust-lang/crates-io-auth-action's README doesn't say, and RFC 3691
+      # doesn't spell it out either (checked 2026-08-07). If a `cargo
+      # publish` step below fails with an auth error on the SECOND or later
+      # crate while the first succeeded, that's the hypothesis to check
+      # first: move this step inside the publish loop so each crate gets
+      # its own token.
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      # Crates with a live Trusted Publisher Configuration today. Extend
+      # this list ONLY after a crate's first manual publish + registration —
+      # see the bootstrapping constraint above. Order matters: cargo cannot
+      # package a crate whose registry dependency has not been published.
+      - name: Publish crates
+        working-directory: rs
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set -eu
+          for crate in \
+            leyline-core \
+            leyline-schema \
+            leyline-cdc \
+            leyline-fs \
+          ; do
+            echo "::group::cargo publish -p $crate"
+            cargo publish -p "$crate" --locked
+            echo "::endgroup::"
+          done
+
+      # Decision-independent drift check (bead a03156 comment 725's "second
+      # arm") over every crate this repo intends to eventually publish, not
+      # just the ones the step above actually published today. Deliberately
+      # non-fatal: a crate not yet bootstrapped onto crates.io is a known,
+      # in-progress rollout (see the constraint at the top of this file),
+      # not a regression, and turning every release red for a deliberately
+      # partial rollout is the same gate-people-route-around failure
+      # mutants.yml's own comments warn about. The point is to make drift
+      # loud, not to block on it.
+      - name: Report crates.io drift (all intended crates, non-fatal)
+        if: always()
+        run: |
+          set -u
+          tag="${GITHUB_REF_NAME#v}"
+          for crate in \
+            leyline-chat-embed leyline-core leyline-ffi-helpers leyline-hdc \
+            leyline-mcp-descriptor leyline-schema leyline-schema-bridge \
+            leyline-schema-capnp leyline-schema-spec leyline-text-search \
+            leyline-cas-ffi leyline-cdc leyline-lsp leyline-public-schema \
+            leyline-sign leyline-ts leyline-envelope leyline-fs leyline-sheaf \
+            leyline-runtime leyline-vcs leyline-cli-lib leyline-cli \
+          ; do
+            published=$(curl -s -H "User-Agent: ley-line-open-ci (+https://github.com/agentic-research/ley-line-open)" \
+              "https://crates.io/api/v1/crates/$crate" | \
+              python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('crate',{}).get('max_stable_version','NOT_PUBLISHED'))" \
+              2>/dev/null || echo "NOT_PUBLISHED")
+            if [ "$published" != "$tag" ]; then
+              echo "::warning::$crate on crates.io is at '$published', release tag is v$tag"
+            fi
+          done

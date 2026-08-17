@@ -1122,8 +1122,12 @@ pub fn parse_into_conn(
             // fails (e.g. broken symlink), preserving prior behavior.
             let canon = abs_path.canonicalize().unwrap_or_else(|_| abs_path.clone());
             let abs_str = canon.to_string_lossy().to_string();
+            // `content` is MOVED here — this worker has no further use for it,
+            // and handing over the original allocation is what lets the bytes
+            // reach `source_blobs.blob_bytes` without a copy
+            // (ley-line-open-cd052b).
             parse_file_pure(
-                &content,
+                content,
                 *lang,
                 rel,
                 &abs_str,
@@ -1256,7 +1260,14 @@ pub fn parse_into_conn(
                 // IGNORE` on the `blob_hash` PK collapses byte-identical files
                 // to one row (F5s). `_source.content_hash` (pushed above) is
                 // the FK-shaped pointer at this blob (F1s asserts round-trip).
-                source_blob_buf.push(pf.content_hash.to_vec(), pf.source_blob_bytes.clone());
+                // MOVED, not cloned: this is the only use of
+                // `source_blob_bytes` in the loop, `pf` is owned by value, and
+                // the generated `push` takes `blob_bytes: Vec<u8>` by value.
+                // The clone that used to be here copied every file's verbatim
+                // bytes a second time, on this single-threaded path — roughly
+                // one extra full-corpus memcpy per ingest, serialized behind
+                // the insert loop (ley-line-open-cd052b).
+                source_blob_buf.push(pf.content_hash.to_vec(), pf.source_blob_bytes);
 
                 // capnp dual-write (`ley-line-open-cdf098`): same fields
                 // as the SQL row, typed and content-addressable. The
@@ -1362,7 +1373,9 @@ pub fn parse_into_conn(
                 // enumerate() order `serialize_ast_node_list_record` used, so
                 // decoding the blob at `offset` byte-identically reproduces
                 // this entry's fields (asserted by the F1 integration test).
-                blob_buf.push(pf.pointer_blob_hash.to_vec(), pf.pointer_blob_bytes.clone());
+                // Moved for the same reason as `source_blob_bytes` above:
+                // sole use, owned `pf`, by-value `push` (ley-line-open-cd052b).
+                blob_buf.push(pf.pointer_blob_hash.to_vec(), pf.pointer_blob_bytes);
                 for (offset, a) in pf.ast_entries.iter().enumerate() {
                     pointer_buf.push(
                         a.node_id.clone(),
@@ -2436,8 +2449,14 @@ fn hash_internal(kind: &str, child_hashes: &[[u8; 32]]) -> [u8; 32] {
 // ---------------------------------------------------------------------------
 
 /// Parse a single file into a `ParsedFile`. No database access.
+///
+/// Takes `content` BY VALUE so the ADR-0028 `source_blob_bytes` field can be
+/// the caller's original allocation rather than a copy of it. Every read here
+/// borrows it (`&content`); the last statement moves it. Passing `&[u8]` forced
+/// a `content.to_vec()` at the end, which cost one full-file copy per file on
+/// top of the read — see ley-line-open-cd052b.
 pub(crate) fn parse_file_pure(
-    content: &[u8],
+    content: Vec<u8>,
     language: TsLanguage,
     source_id: &str,
     abs_path: &str,
@@ -2451,7 +2470,7 @@ pub(crate) fn parse_file_pure(
         .context("failed to set tree-sitter language")?;
 
     let tree = parser
-        .parse(content, None)
+        .parse(&content, None)
         .context("tree-sitter parse returned None")?;
 
     // BLAKE3 of the file bytes — the byte-level content address feeding
@@ -2531,7 +2550,7 @@ pub(crate) fn parse_file_pure(
     // for every NAMED descendant (parent-creates-child, pre-order) and the
     // deduped `node_content`/`node_child` rows for every unique subtree.
     let root_hash = fold_children(
-        content,
+        &content,
         root,
         source_id,
         source_id,
@@ -2599,12 +2618,16 @@ pub(crate) fn parse_file_pure(
     let pointer_blob_hash: [u8; 32] = *pointer_blob_bytes.as_slice().hash().as_bytes();
 
     // ADR-0028 source-blob bytes (bead `ley-line-open-9e4416`, Phase 1 dual-
-    // store). Owning clone of the input source bytes so the main-thread insert
-    // loop can move them into `source_blobs.blob_bytes` without re-reading from
-    // disk. `content_hash` above is already BLAKE3 of this exact slice, so
+    // store). The caller's own allocation, moved — not copied. The main-thread
+    // insert loop then moves it again into `source_blobs.blob_bytes`, so the
+    // bytes read from disk reach SQLite without an intervening copy.
+    // `content_hash` above is BLAKE3 of these exact bytes, so
     // (blob_hash, blob_bytes) is content-consistent by construction (F1s pins
     // this in-DB; F-git pins hash-compatibility with `git cat-file blob`).
-    let source_blob_bytes = content.to_vec();
+    //
+    // This must stay the LAST use of `content` in this function
+    // (ley-line-open-cd052b).
+    let source_blob_bytes = content;
 
     Ok(ParsedFile {
         rel: source_id.to_string(),
@@ -2676,8 +2699,10 @@ pub(crate) fn parse_to_ast_json(
     // JSON response shape).
     // No arena connection here (in-memory validate path), so no overrides can
     // apply — the compiled defaults are the effective query set.
+    // This path holds only a borrow, so it owes the copy `parse_file_pure`
+    // used to make internally — same cost as before, not a regression.
     let parsed = parse_file_pure(
-        content,
+        content.to_vec(),
         language,
         source_id,
         source_id,

@@ -59,10 +59,21 @@ fn handcrafted_files() -> Vec<PathBuf> {
 // CI runs that opt in via the env var fail on budget overruns.
 // ---------------------------------------------------------------------------
 
+/// The one spelling of the opt-in env var.
+const GATE_ENV: &str = "LLO_PERF_GATES";
+
+/// Pure predicate over the raw env value. Split out so the sanity test
+/// below can pin the "exactly the literal 1" contract without writing to
+/// the process environment — see `cold_parse_perf_regression.rs` for the
+/// CI failure the env-mutating shape caused there.
+fn gate_enabled_from(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
 /// Read the perf-gate env var. Pulled out so the gating logic can be
 /// unit-tested by injecting a known value.
 fn perf_gate_enabled() -> bool {
-    std::env::var("LLO_PERF_GATES").ok().as_deref() == Some("1")
+    gate_enabled_from(std::env::var(GATE_ENV).ok().as_deref())
 }
 
 /// Print the timing line and (conditionally) assert the budget.
@@ -86,7 +97,7 @@ fn perf_gate_assert(elapsed_ms: u128, budget_ms: u128, label: &str, gate_enabled
 ///
 /// 1. With `gate_enabled=true`, an over-budget elapsed value panics.
 /// 2. With `gate_enabled=false`, the same over-budget value does NOT panic.
-/// 3. `perf_gate_enabled()` reads the env var correctly.
+/// 3. `gate_enabled_from` arms on exactly the literal `"1"`.
 ///
 /// Without this test, the gating could silently default to "always off"
 /// and we'd never know — the budget assertion would be unreachable code
@@ -133,47 +144,38 @@ fn perf_gate_mechanism_works_in_both_modes() {
          perf_gate_assert has inverted comparison (bug)"
     );
 
-    // Branch 4: confirm the env-var reader recognizes only the literal "1".
-    // Save and restore so we don't pollute other parallel tests. Tests in
-    // the same binary share process env; in cargo's default settings this
-    // crate's test binary has a single thread by default for any test
-    // that mutates env vars. We scope tightly and restore.
+    // Branch 4: confirm the reader recognizes only the literal "1".
     //
-    // SAFETY: `std::env::set_var` / `std::env::remove_var` are `unsafe` on
-    // Rust 2024 because mutating env is not thread-safe with respect to
-    // concurrent libc calls. We sequence the set/check/restore inside a
-    // single unsafe block; the surrounding test does no other env work
-    // and runs as its own #[test] (Rust runs tests in parallel but each
-    // assertion below is local — the only risk is a *different* test
-    // also touching LLO_PERF_GATES, which none of the gate1* tests do).
-    let original = std::env::var("LLO_PERF_GATES").ok();
-    unsafe {
-        std::env::set_var("LLO_PERF_GATES", "1");
-        assert!(
-            perf_gate_enabled(),
-            "perf_gate_enabled() returned false when LLO_PERF_GATES=1"
-        );
-        std::env::set_var("LLO_PERF_GATES", "0");
-        assert!(
-            !perf_gate_enabled(),
-            "perf_gate_enabled() returned true when LLO_PERF_GATES=0"
-        );
-        std::env::set_var("LLO_PERF_GATES", "yes");
-        assert!(
-            !perf_gate_enabled(),
-            "perf_gate_enabled() returned true for non-1 value 'yes'"
-        );
-        std::env::remove_var("LLO_PERF_GATES");
-        assert!(
-            !perf_gate_enabled(),
-            "perf_gate_enabled() returned true when env var unset"
-        );
-        // Restore original to be a polite citizen.
-        match original {
-            Some(v) => std::env::set_var("LLO_PERF_GATES", v),
-            None => std::env::remove_var("LLO_PERF_GATES"),
-        }
-    }
+    // Checked against the pure predicate, with NO process-env mutation.
+    // The previous version set/restored `LLO_PERF_GATES` inside an
+    // `unsafe` block, reasoning that "the only risk is a *different* test
+    // also touching LLO_PERF_GATES, which none of the gate1* tests do".
+    // The gate1* tests below all call `perf_gate_enabled()`, so they do
+    // touch it — as concurrent READERS, which is the other half of the
+    // race. Cargo runs them on parallel threads against a process-global
+    // environment, so a read landing inside this test's write window sees
+    // "1" and arms a release-calibrated budget in a debug build.
+    //
+    // That is not hypothetical: the identical shape in
+    // `cold_parse_perf_regression.rs` failed `task ci` on main at 3752ce6
+    // (run 31848026749) exactly that way, and the budgets here are
+    // TIGHTER than that one's. Keep this branch env-free.
+    assert!(
+        gate_enabled_from(Some("1")),
+        "gate_enabled_from returned false for \"1\""
+    );
+    assert!(
+        !gate_enabled_from(Some("0")),
+        "gate_enabled_from returned true for \"0\""
+    );
+    assert!(
+        !gate_enabled_from(Some("yes")),
+        "gate_enabled_from returned true for non-1 value \"yes\""
+    );
+    assert!(
+        !gate_enabled_from(None),
+        "gate_enabled_from returned true when unset"
+    );
 }
 
 // ---------------------------------------------------------------------------

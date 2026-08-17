@@ -10,6 +10,22 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The cold-parse perf gate could fail CI on a build profile it was never
+  calibrated for.** Its sanity test wrote `LLO_PERF_GATES` to the process
+  environment while the gate test read it from a parallel thread, so a read
+  landing inside that window armed a release-calibrated 500ms ceiling inside
+  `cargo test -p leyline-cli-lib --features vec` — a debug build, with the
+  variable unset. That is how `task ci` failed on main at 3752ce6 (debug
+  `wall=580ms`, against release `wall=131ms` measured on the same machine),
+  and PR #304's 635ms failure has the same signature. The predicate is now a
+  pure function the sanity test checks directly, so no test mutates the
+  environment, and the gate additionally hard-skips under `debug_assertions`
+  because both of its ceilings are release numbers. `topology_pass_test.rs`
+  carried the identical racy shape with tighter budgets and is fixed the same
+  way. Sibling defect: `ley-line-open-d71cf6`.
+
 ## [0.18.2] — 2026-08-11
 
 **Terraform files now publish the typed addresses Mache consumes.** HCL had

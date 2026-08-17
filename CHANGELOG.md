@@ -10,6 +10,23 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Performance
+
+- **Cold ingest no longer holds the whole repository in memory.** `parse_into_conn`
+  materialised every `ParsedFile` via `par_iter().collect()` and then filled 13 row
+  buffers that were only flushed after the last file, so peak memory was O(corpus)
+  from two directions at once — 14.2 GB resident to ingest 193 MB of kibana
+  TypeScript (32k files, 28.5M rows), enough to swap the machine. Parse and insert
+  now run in 1024-file chunks, bounding both. Measured on that corpus: 32k files
+  go from 566s / 14.2 GB to 358s / 8.3 GB (−37% wall, −41% peak RSS); 8k files
+  from 11.4 GB to 5.0 GB (−56%). Chunks are sequential slices of the sorted
+  work-list, so insert order — and the sorted-insert B-tree locality it buys — is
+  byte-identical to before, as is the resulting projection (verified per-table on
+  counts and content checksums, including the deduped `node_content` and
+  `source_blobs`). Small corpora regress slightly (~5% at 2k files) where the
+  extra flushes land with no memory benefit to offset them (bead
+  `ley-line-open-e9f829`).
+
 ### Fixed
 
 - **The cold-parse perf gate could fail CI on a build profile it was never

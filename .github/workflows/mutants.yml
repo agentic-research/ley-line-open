@@ -47,6 +47,11 @@ jobs:
     # (`ley-line-open-085dff`).
     name: cargo mutants (allowlist + this PR's diff)
     runs-on: ubuntu-latest
+    # Same reasoning as ci.yml. This job legitimately runs longer — the
+    # allowlist arm is ~17 min by its own accounting above, and a diff arm has
+    # been seen at 14 min — so the ceiling is higher, but a ceiling still beats
+    # the 6-hour default when a mutant build wedges.
+    timeout-minutes: 60
     steps:
       # SHA-pinned: actions/checkout@v6.0.2 (Node 24)
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd

@@ -221,6 +221,24 @@ const BULK_BATCH_ROWS: usize = 3000;
 /// throughput and cost linear memory.
 const PARSE_CHUNK_FILES: usize = 1024;
 
+/// Number of pipeline chunks `n_files` will be carried through.
+///
+/// A pure function of the work-list length so the count is assertable without
+/// running a parse, and so the tail-chunk boundary is pinned by a test rather
+/// than by a `+= 1` nothing observes.
+fn chunk_count_for(n_files: usize) -> usize {
+    n_files.div_ceil(PARSE_CHUNK_FILES)
+}
+
+/// Whether the insert-phase profile breakdown is armed.
+///
+/// Split from the env read so the "exactly the literal 1" contract is checked
+/// as a pure function — no test needs to mutate the process environment. Same
+/// shape, and same reason, as the perf gates (bead `ley-line-open-f07c20`).
+fn insert_profile_enabled_from(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
 /// One entry in the parse work-list: `(rel_path, abs_path, language, mtime, size)`.
 /// Named so the per-chunk parse closure can spell its parameter type.
 type FileToParse = (String, PathBuf, TsLanguage, i64, i64);
@@ -1291,7 +1309,6 @@ pub fn parse_into_conn(
     // LEYLINE_PROFILE=1 breakdown (they no longer occupy contiguous spans).
     let mut buffer_elapsed = std::time::Duration::ZERO;
     let mut flush_elapsed = std::time::Duration::ZERO;
-    let mut chunk_count = 0usize;
 
     // ---- Chunked pipeline (bead `ley-line-open-e9f829`) ----
     //
@@ -1558,7 +1575,6 @@ pub fn parse_into_conn(
         pointer_buf.flush_batched(conn)?;
 
         flush_elapsed += chunk_flush_start.elapsed();
-        chunk_count += 1;
     }
     let sub_chunks_end = std::time::Instant::now();
 
@@ -1571,7 +1587,8 @@ pub fn parse_into_conn(
     //
     // Buffer-fill and flush are accumulated per chunk (they interleave now),
     // so they are reported as summed Durations rather than Instant deltas.
-    let profile_insert = std::env::var("LEYLINE_PROFILE").ok().as_deref() == Some("1");
+    let profile_insert =
+        insert_profile_enabled_from(std::env::var("LEYLINE_PROFILE").ok().as_deref());
 
     // Flush the capnp dual-write `BufWriter`s before COMMIT and before
     // `write_head_after_parse` reads the segments for hashing —
@@ -1678,7 +1695,8 @@ pub fn parse_into_conn(
             "  insert-detail: buffer+capnp_write={buf_ms}ms \
              sql_flush={flush_ms}ms capnp_flush={capnp_ms}ms \
              commit={commit_ms}ms index_build={index_ms}ms \
-             chunks={chunk_count} chunk_files={PARSE_CHUNK_FILES}"
+             chunks={} chunk_files={PARSE_CHUNK_FILES}",
+            chunk_count_for(to_parse.len())
         );
     }
 
@@ -3675,6 +3693,143 @@ mod tests {
         assert_eq!(keep_present, 1);
     }
 
+    /// `node_refs` and `node_defs` are flushed through `flush_batched_for`,
+    /// which is the one flush path the macro does not generate. Nothing
+    /// asserted that it actually wrote anything: replacing either body with
+    /// `Ok(())` left every test passing while the symbol layer — the rows
+    /// mache's find_definition / find_callers are built on — silently landed
+    /// empty. Surfaced as two surviving mutants on bead
+    /// `ley-line-open-e9f829` (cmd_parse.rs:545, :595).
+    ///
+    /// Asserts content, not just cardinality: a token that exists only in the
+    /// def position and one that exists only in the ref position, so a flush
+    /// that wrote the wrong buffer to the wrong table also fails.
+    #[test]
+    fn flush_batched_for_actually_writes_the_symbol_layer() {
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        std::fs::write(
+            root.join("sym.go"),
+            b"package sym\n\nfunc Definiendum() {}\n\nfunc Caller() { Definiendum() }\n",
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        parse_into_conn(&conn, root, None, None).unwrap();
+
+        let defs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM node_defs", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            defs > 0,
+            "node_defs is empty — DefBatch::flush_batched_for wrote nothing"
+        );
+
+        let refs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM node_refs", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            refs > 0,
+            "node_refs is empty — RefBatch::flush_batched_for wrote nothing"
+        );
+
+        // `Definiendum` is declared once and referenced once, so it must be
+        // reachable through BOTH tables. Pins that each flush wrote its own
+        // rows rather than one table receiving both buffers.
+        let def_hit: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_defs WHERE token = 'Definiendum'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            def_hit > 0,
+            "node_defs has rows but not the declared token — wrong buffer flushed"
+        );
+
+        let ref_hit: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_refs WHERE token = 'Definiendum'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            ref_hit > 0,
+            "node_refs has rows but not the referenced token — wrong buffer flushed"
+        );
+    }
+
+    /// `ParseResult.errors` is the only signal a caller gets that a file in
+    /// the tree did not parse. Nothing asserted it, so dropping the increment
+    /// reported a clean run over a corpus that partly failed — the shape of
+    /// bug that makes an arena silently incomplete. Surviving mutant on bead
+    /// `ley-line-open-e9f829` (cmd_parse.rs:1508, `errors += 1`).
+    ///
+    /// Uses the binary-file rejection (null byte inside the first 8 KiB) as
+    /// the failure injector: it is the parse path's own documented error, so
+    /// the test does not depend on a malformed-syntax heuristic that a
+    /// future grammar bump could start accepting.
+    #[test]
+    fn parse_errors_are_counted_not_silently_swallowed() {
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        // Parses cleanly.
+        std::fs::write(root.join("ok.go"), b"package ok\n\nfunc Fine() {}\n").unwrap();
+        // `.go` extension so it is selected for parsing, NUL byte so the
+        // worker rejects it as binary.
+        std::fs::write(root.join("bad.go"), b"package bad\n\x00\n").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        let result = parse_into_conn(&conn, root, None, None).unwrap();
+
+        assert_eq!(
+            result.errors, 1,
+            "exactly one file is unparseable; errors must report it (got {})",
+            result.errors
+        );
+        assert_eq!(
+            result.parsed, 1,
+            "the other file parses; parsed must report it (got {})",
+            result.parsed
+        );
+    }
+
+    /// The insert-phase profile breakdown is opt-in via `LEYLINE_PROFILE=1`.
+    /// Checked as a pure predicate so no test mutates the process
+    /// environment — same contract, and same reasoning, as the perf gates in
+    /// `cold_parse_perf_regression.rs` (bead `ley-line-open-f07c20`), where a
+    /// concurrent env write is what armed a release ceiling inside a debug
+    /// build.
+    #[test]
+    fn insert_profile_arms_on_exactly_one() {
+        assert!(insert_profile_enabled_from(Some("1")));
+        assert!(!insert_profile_enabled_from(Some("0")));
+        assert!(!insert_profile_enabled_from(Some("true")));
+        assert!(!insert_profile_enabled_from(None));
+    }
+
+    /// The pipeline runs `to_parse.len().div_ceil(PARSE_CHUNK_FILES)` chunks.
+    /// Pinned because the count is reported in the profile line and, more
+    /// importantly, because an off-by-one here would either drop the tail
+    /// chunk or run an empty one.
+    #[test]
+    fn chunk_count_covers_every_file_including_a_partial_tail() {
+        assert_eq!(chunk_count_for(0), 0, "no files, no chunks");
+        assert_eq!(chunk_count_for(1), 1);
+        assert_eq!(
+            chunk_count_for(PARSE_CHUNK_FILES),
+            1,
+            "an exactly-full chunk must not spill into a second, empty one"
+        );
+        assert_eq!(
+            chunk_count_for(PARSE_CHUNK_FILES + 1),
+            2,
+            "one file past the boundary needs a tail chunk"
+        );
+        assert_eq!(chunk_count_for(PARSE_CHUNK_FILES * 3), 3);
+    }
     #[test]
     fn batched_inserts_preserve_record_content_not_just_row_count() {
         // Skeptic finding on bead `ley-line-open-cbbedf`: row-count parity

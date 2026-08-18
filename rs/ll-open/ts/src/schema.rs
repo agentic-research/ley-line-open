@@ -340,16 +340,10 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     Ok(n > 0)
 }
 
-/// True when `table` already has a `node_hash` column. Thin wrapper kept so
-/// the merkle-AST migration reads as what it is at its call site.
-fn has_node_hash_column(conn: &Connection, table: &str) -> Result<bool> {
-    has_column(conn, table, "node_hash")
-}
-
 /// Create the merkle-AST IR tables (`node_content`, `node_child`) and
 /// additively stamp a `node_hash` column onto the occurrence tables
 /// (`_ast`, `node_defs`, `node_refs`) that already exist. Idempotent: the
-/// `node_hash` ALTERs are gated on [`has_node_hash_column`].
+/// `node_hash` ALTERs are gated on [`has_column`].
 ///
 /// Must be called AFTER `create_ast_tables` + `create_refs_tables` (the
 /// ALTER targets must exist) and BEFORE the insert transaction. The
@@ -360,7 +354,7 @@ pub fn create_ir_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(NODE_CONTENT_TABLE_DDL)?;
     conn.execute_batch(NODE_CHILD_TABLE_DDL)?;
     for table in ["_ast", "node_defs", "node_refs"] {
-        if !has_node_hash_column(conn, table)? {
+        if !has_column(conn, table, "node_hash")? {
             conn.execute_batch(&format!(
                 "ALTER TABLE {table} ADD COLUMN node_hash BLOB REFERENCES node_content(node_hash);"
             ))?;
@@ -463,7 +457,7 @@ pub fn insert_def(
 }
 
 /// True when `table` has a `container_node_id` column. Same pattern as
-/// `has_node_hash_column` — SQLite has no `ADD COLUMN IF NOT EXISTS`,
+/// `has_column` — SQLite has no `ADD COLUMN IF NOT EXISTS`,
 /// so the additive migration probes `pragma_table_info` and only ALTERs
 /// when the column is absent. Bead `ley-line-open-6e798d`.
 fn has_container_node_id_column(conn: &Connection, table: &str) -> Result<bool> {

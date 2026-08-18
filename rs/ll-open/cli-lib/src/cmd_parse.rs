@@ -3859,6 +3859,58 @@ mod tests {
         );
         assert_eq!(chunk_count_for(PARSE_CHUNK_FILES * 3), 3);
     }
+
+    /// `rows_per_batch` is the only thing keeping a multi-row INSERT under
+    /// SQLite's bound-parameter ceiling. Stubbing it to `1`, or flipping its
+    /// division to a multiplication, left every test passing: a batch of 1 is
+    /// merely slow, and an oversized batch only fails at RUNTIME on the widest
+    /// table. Both survived as mutants on bead `ley-line-open-17c271`.
+    ///
+    /// The load-bearing assertion is the invariant, not any single value —
+    /// that is what stays true when a column is added to any table.
+    #[test]
+    fn rows_per_batch_never_exceeds_the_bound_parameter_ceiling() {
+        for cols in 1..=64usize {
+            let rows = rows_per_batch(cols);
+            assert!(
+                rows >= 1,
+                "a batch must carry at least one row (cols={cols})"
+            );
+            assert!(
+                rows * cols <= SQLITE_MAX_BOUND_PARAMS,
+                "cols={cols}: {rows} rows x {cols} cols = {} params, over the \
+                 {SQLITE_MAX_BOUND_PARAMS} ceiling — this is the failure that \
+                 took every parse down when `_ast` gained a column",
+                rows * cols
+            );
+        }
+    }
+
+    /// The ceiling must BIND on wide tables and NOT cost anything on narrow
+    /// ones. Without this, `rows_per_batch -> 1` satisfies the ceiling
+    /// invariant above while destroying the batching the insert path exists
+    /// for (`ley-line-open-cbbedf` measured un-batched inserts at ~10x).
+    #[test]
+    fn rows_per_batch_binds_only_where_the_ceiling_requires_it() {
+        // 2 columns: 3000 x 2 = 6000 params, far under the cap — full batch.
+        assert_eq!(
+            rows_per_batch(2),
+            BULK_BATCH_ROWS,
+            "a narrow table must still get the full {BULK_BATCH_ROWS}-row batch"
+        );
+        // 11 columns (today's `_ast`): 3000 x 11 = 33000, over the cap, so the
+        // batch must shrink to exactly the ceiling's quotient.
+        assert_eq!(
+            rows_per_batch(11),
+            SQLITE_MAX_BOUND_PARAMS / 11,
+            "a table wide enough to breach the cap must be clamped to the quotient"
+        );
+        assert!(
+            rows_per_batch(11) < BULK_BATCH_ROWS,
+            "11 columns MUST bind — if this stops holding, the constant moved \
+             and the clamp is no longer exercised by any test"
+        );
+    }
     #[test]
     fn batched_inserts_preserve_record_content_not_just_row_count() {
         // Skeptic finding on bead `ley-line-open-cbbedf`: row-count parity

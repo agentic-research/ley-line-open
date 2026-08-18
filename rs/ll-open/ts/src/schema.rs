@@ -1812,6 +1812,79 @@ mod tests {
         );
     }
 
+    /// `has_column` is the idempotence guard for every additive ALTER in this
+    /// module: `create_ir_tables` uses it for `node_hash`, and
+    /// `create_pointer_store_tables` for `blob_ord`. Stubbing it to a constant
+    /// broke nothing that was tested — `Ok(true)` skips the ALTER so the column
+    /// never appears and every INSERT naming it fails at runtime, while
+    /// `Ok(false)` re-runs the ALTER on an existing column and errors on the
+    /// second parse. Surfaced as two surviving mutants on bead
+    /// `ley-line-open-17c271`.
+    #[test]
+    fn has_column_distinguishes_present_from_absent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (a INTEGER, b TEXT);")
+            .unwrap();
+
+        assert!(has_column(&conn, "t", "a").unwrap(), "column a is present");
+        assert!(has_column(&conn, "t", "b").unwrap(), "column b is present");
+        assert!(
+            !has_column(&conn, "t", "nope").unwrap(),
+            "column `nope` is absent — a constant-true probe would skip the ALTER \
+             that adds it and every INSERT naming the column would then fail"
+        );
+        assert!(
+            !has_column(&conn, "t", "").unwrap(),
+            "the empty name matches nothing"
+        );
+    }
+
+    /// The ADR-0026 pointer store is `capnp_blobs` + the per-file `_ast_blob`
+    /// map + `_ast.blob_ord`. Nothing asserted the constructor actually built
+    /// them, so replacing its body with `Ok(())` passed — an arena would then
+    /// silently lack the resolution path entirely.
+    ///
+    /// Also pins idempotence: `create_pointer_store_tables` runs on every
+    /// parse, including reparses of an arena that already has `blob_ord`, and
+    /// SQLite has no `ADD COLUMN IF NOT EXISTS`.
+    #[test]
+    fn create_pointer_store_tables_builds_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_schema(&conn).unwrap();
+
+        assert!(
+            !pointer_store_present(&conn),
+            "precondition: the pointer store does not exist yet"
+        );
+
+        create_pointer_store_tables(&conn).unwrap();
+
+        for table in ["capnp_blobs", "_ast_blob"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{table} MUST exist after create_pointer_store_tables");
+        }
+        assert!(
+            has_column(&conn, "_ast", "blob_ord").unwrap(),
+            "_ast MUST carry blob_ord — it is how a row addresses its capnp record \
+             now that the map is per-file"
+        );
+        assert!(
+            pointer_store_present(&conn),
+            "pointer_store_present MUST report the store it just built; a \
+             constant-false gates the per-file delete in delete_file_rows off \
+             and leaks a stale _ast_blob row on every reparse"
+        );
+
+        // Second call must be a no-op, not an "duplicate column name" error.
+        create_pointer_store_tables(&conn).unwrap();
+        assert!(has_column(&conn, "_ast", "blob_ord").unwrap());
+    }
     #[test]
     fn sweep_orphaned_dirs_removes_empty_parents() {
         let conn = Connection::open_in_memory().unwrap();

@@ -3868,6 +3868,62 @@ mod tests {
     ///
     /// The load-bearing assertion is the invariant, not any single value —
     /// that is what stays true when a column is added to any table.
+
+    /// `flush_in_batches` walks `i` forward one batch at a time and flushes a
+    /// short tail. Nothing exercised that walk: every existing test flushes
+    /// far fewer rows than one batch, so the loop body ran at most once and
+    /// its arithmetic was unobserved. Mutating `i + batch` to `i - batch`, or
+    /// `i += batch` to `i -= batch`, survived (bead `ley-line-open-17c271`).
+    ///
+    /// A silent failure here drops or duplicates rows at a batch boundary —
+    /// the projection would be wrong only on corpora large enough to cross
+    /// 3000 rows in a single table, which is every real one and no test one.
+    ///
+    /// Sized `BULK_BATCH_ROWS * 2 + 1` so the loop runs twice AND leaves a
+    /// one-row tail, covering both the full-batch path and the partial one.
+    #[test]
+    fn flush_in_batches_lands_every_row_across_batch_boundaries() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (v INTEGER NOT NULL);")
+            .unwrap();
+
+        let n = BULK_BATCH_ROWS * 2 + 1;
+        let mut rows: Vec<i64> = (0..n as i64).collect();
+        flush_in_batches(&conn, &mut rows, "INSERT INTO t (v) VALUES ", 1, |chunk| {
+            chunk
+                .iter()
+                .map(|r| r as &dyn rusqlite::ToSql)
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count,
+            n as i64,
+            "every row must land: {n} pushed across {} batches plus a tail",
+            n / BULK_BATCH_ROWS
+        );
+
+        // Content, not just cardinality — a boundary bug that re-flushes one
+        // batch twice and skips another keeps the count and corrupts the data.
+        let sum: i64 = conn
+            .query_row("SELECT SUM(v) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            sum,
+            (0..n as i64).sum::<i64>(),
+            "the rows that landed must be the rows that were pushed, once each"
+        );
+
+        assert!(
+            rows.is_empty(),
+            "the buffer is cleared for reuse — the chunked pipeline flushes it \
+             once per chunk and relies on it keeping its allocation"
+        );
+    }
     #[test]
     fn rows_per_batch_never_exceeds_the_bound_parameter_ceiling() {
         for cols in 1..=64usize {

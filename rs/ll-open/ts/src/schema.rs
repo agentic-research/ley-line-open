@@ -1814,6 +1814,56 @@ mod tests {
     /// `Ok(false)` re-runs the ALTER on an existing column and errors on the
     /// second parse. Surfaced as two surviving mutants on bead
     /// `ley-line-open-17c271`.
+
+    /// `create_ir_tables` stamps the ADR-0027 `node_hash` column onto the three
+    /// occurrence tables that predate it. Nothing asserted that it did, so
+    /// inverting its idempotence guard survived mutation: with the `!` deleted
+    /// the ALTER runs only when the column ALREADY exists, so a fresh arena
+    /// never gets `node_hash` at all and every INSERT naming it fails at
+    /// runtime, while a reparse hits "duplicate column name".
+    ///
+    /// Sibling of `create_pointer_store_tables_builds_and_is_idempotent` — both
+    /// are additive migrations run on EVERY parse, and SQLite has no
+    /// `ADD COLUMN IF NOT EXISTS` (bead `ley-line-open-17c271`).
+    #[test]
+    fn create_ir_tables_stamps_node_hash_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_schema(&conn).unwrap();
+        conn.execute_batch(DEFS_TABLE_DDL).unwrap();
+        conn.execute_batch(REFS_TABLE_DDL).unwrap();
+
+        for table in ["_ast", "node_defs", "node_refs"] {
+            assert!(
+                !has_column(&conn, table, "node_hash").unwrap(),
+                "precondition: {table} has no node_hash before the migration"
+            );
+        }
+
+        create_ir_tables(&conn).unwrap();
+
+        for table in ["_ast", "node_defs", "node_refs"] {
+            assert!(
+                has_column(&conn, table, "node_hash").unwrap(),
+                "{table} MUST carry node_hash after create_ir_tables — without it \
+                 every INSERT naming the column fails at runtime"
+            );
+        }
+        for table in ["node_content", "node_child"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{table} MUST exist after create_ir_tables");
+        }
+
+        // Runs on every parse, so the second call must be a no-op rather than a
+        // "duplicate column name" error.
+        create_ir_tables(&conn).unwrap();
+        assert!(has_column(&conn, "_ast", "node_hash").unwrap());
+    }
     #[test]
     fn has_column_distinguishes_present_from_absent() {
         let conn = Connection::open_in_memory().unwrap();

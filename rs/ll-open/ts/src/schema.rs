@@ -327,17 +327,23 @@ CREATE TABLE IF NOT EXISTS node_child (
 pub const AST_NODE_HASH_INDEX_DDL: &str =
     "CREATE INDEX IF NOT EXISTS idx_ast_node_hash ON _ast(node_hash);";
 
-/// True when `table` already has a `node_hash` column. SQLite has no
-/// `ADD COLUMN IF NOT EXISTS`, so the merkle-AST migration probes
-/// `pragma_table_info` and only ALTERs when the column is absent — makes
-/// the additive migration idempotent across incremental reparses.
-fn has_node_hash_column(conn: &Connection, table: &str) -> Result<bool> {
+/// True when `table` already has `column`. SQLite has no
+/// `ADD COLUMN IF NOT EXISTS`, so the additive migrations probe
+/// `pragma_table_info` and only ALTER when the column is absent — which is
+/// what makes them idempotent across incremental reparses.
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let n: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = 'node_hash'",
-        [table],
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+        [table, column],
         |r| r.get(0),
     )?;
     Ok(n > 0)
+}
+
+/// True when `table` already has a `node_hash` column. Thin wrapper kept so
+/// the merkle-AST migration reads as what it is at its call site.
+fn has_node_hash_column(conn: &Connection, table: &str) -> Result<bool> {
+    has_column(conn, table, "node_hash")
 }
 
 /// Create the merkle-AST IR tables (`node_content`, `node_child`) and
@@ -566,26 +572,51 @@ CREATE TABLE IF NOT EXISTS capnp_blobs (
     blob_bytes BLOB NOT NULL
 );";
 
-/// DDL for `_ast_pointer` — lightweight index into `capnp_blobs`. One row
-/// per AstNode, mirroring the `_ast` row set 1-to-1 in Phase 1 dual-write.
-/// `offset_in_blob` indexes into the blob's `AstNodeList.nodes` list.
-/// `kind` is the semantic-kind tag per ADR-0026 §2.1 (INTEGER for query
-/// filter — populated by `semantic_kind_tag` in the producer; the Phase 2
-/// allowlist refines the enum).
-pub const AST_POINTER_DDL: &str = "\
-CREATE TABLE IF NOT EXISTS _ast_pointer (
-    node_id TEXT PRIMARY KEY,
-    blob_hash BLOB NOT NULL,
-    offset_in_blob INTEGER NOT NULL,
-    kind INTEGER NOT NULL,
-    source_id TEXT NOT NULL
+/// DDL for `_ast_blob` — the file-to-blob map for the ADR-0026 pointer
+/// store. ONE row per source file, not per AST node.
+///
+/// This replaces `_ast_pointer`, which carried one row per AstNode and did
+/// not, in practice, store a pointer. Measured on an 8000-file TypeScript
+/// arena, each of its 3 150 849 rows held:
+///
+///   node_id         232 bytes   already the PK of `_ast`
+///   source_id        27.6 bytes already a column of `_ast`
+///   blob_hash        32 bytes   only 8000 DISTINCT values across all rows
+///   offset_in_blob   int        a dense 0..n-1 per file, verified with no
+///                               gaps or duplicates in 8000/8000 files
+///   kind             int        `semantic_kind_tag(node_kind)`, a pure
+///                               function of a column `_ast` already has
+///
+/// ~294 bytes per row to address a record of ~370 — the pointer was 80% the
+/// size of its referent — costing 927 MB plus an 830 MB shadow index for a
+/// mapping that is `blob(file)` plus an ordinal. Both survive here: the file
+/// keys this table, and the ordinal moves onto `_ast.blob_ord` (one small
+/// integer per row, ~6 MB) where the row it describes already lives.
+///
+/// The ADR-0026 §6.F1 resolution capability is unchanged: any `_ast` row
+/// still resolves to its capnp record, via `source_id -> blob_hash` here and
+/// `blob_ord` as the index into that blob's `AstNodeList.nodes`.
+///
+/// Bead `ley-line-open-17c271`.
+pub const AST_BLOB_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS _ast_blob (
+    source_id TEXT PRIMARY KEY,
+    blob_hash BLOB NOT NULL
 );";
 
 /// Create the pointer-store tables (idempotent). Must run alongside the
 /// existing row-projected schema; Phase 1 is dual-write.
+///
+/// `_ast.blob_ord` is added by ALTER rather than sitting in `AST_TABLE_DDL`
+/// because it belongs to the pointer store, not to the row projection —
+/// same reasoning as the `node_hash` column in [`create_ir_tables`], and it
+/// keeps `_ast` correct for callers that never enable the pointer store.
 pub fn create_pointer_store_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(CAPNP_BLOBS_DDL)?;
-    conn.execute_batch(AST_POINTER_DDL)?;
+    conn.execute_batch(AST_BLOB_DDL)?;
+    if !has_column(conn, "_ast", "blob_ord")? {
+        conn.execute_batch("ALTER TABLE _ast ADD COLUMN blob_ord INTEGER;")?;
+    }
     Ok(())
 }
 
@@ -968,10 +999,10 @@ pub fn delete_file_rows(conn: &Connection, path: &str) -> Result<()> {
     // Skip cleanly when the tables don't exist — the pointer store is additive
     // and older databases may predate its creation.
     if pointer_store_present(conn) {
-        conn.execute("DELETE FROM _ast_pointer WHERE source_id = ?1", [path])?;
+        conn.execute("DELETE FROM _ast_blob WHERE source_id = ?1", [path])?;
         // capnp_blobs is keyed on blob_hash (content-addressed), not source_id.
         // Orphaned blobs are ignored here — a Phase 2/3 GC sweep collects blobs
-        // no `_ast_pointer` row references. Phase 1 dual-write recreates the
+        // no `_ast_blob` row references. Phase 1 dual-write recreates the
         // blob row on reparse via `INSERT OR IGNORE`, so nothing accumulates
         // per file (blobs dedup on identical file content).
     }
@@ -984,14 +1015,14 @@ pub fn delete_file_rows(conn: &Connection, path: &str) -> Result<()> {
     Ok(())
 }
 
-/// True when the pointer-store tables (`_ast_pointer`) exist on this
+/// True when the pointer-store tables (`_ast_blob`) exist on this
 /// connection. Additive-schema guard for `delete_file_rows`: older
 /// databases predate the pointer store, and legacy paths that call
 /// `delete_file_rows` without first running `create_pointer_store_tables`
 /// must not error on the missing table.
 fn pointer_store_present(conn: &Connection) -> bool {
     conn.query_row(
-        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='_ast_pointer'",
+        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='_ast_blob'",
         [],
         |r| r.get::<_, bool>(0),
     )

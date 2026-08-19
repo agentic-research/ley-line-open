@@ -47,4 +47,29 @@ exclude_re = [
     # the correct expression; the operator has no semantic target at
     # shift-distance zero.
     'api\.rs.*replace << with >>',
+
+    # `let chunk_rows = chunk_files * ROWS_PER_FILE_EST;` feeding
+    # `Vec::with_capacity(chunk_rows)` for the per-chunk row buffers, mutated
+    # to `+` or `/`.
+    #
+    # The value is a capacity HINT and nothing else. `Vec::with_capacity(n)`
+    # and `Vec::with_capacity(m)` produce vectors that are equal for every
+    # operation the program performs on them — same elements, same order, same
+    # length, same iteration, same flush. A wrong hint changes how many times
+    # the allocator is asked to grow, which is a performance property with no
+    # observable behavioural difference to assert on. Every row still lands,
+    # which is exactly what `chunked_pipeline_projects_identically_*` and the
+    # F-gates check.
+    #
+    # This is NOT "inconvenient to test". `Vec::capacity()` is technically
+    # readable, but asserting on it would pin an allocator hint rather than a
+    # behaviour, and would have to be rewritten every time the per-file row
+    # estimate is retuned — the assertion would encode the implementation it is
+    # supposed to be independent of.
+    #
+    # Restructuring does not remove the mutant either: hoisting the product to
+    # a const or a helper relocates it, and writing the estimate as a single
+    # baked-in number would lose the `files × rows_per_file` shape that says
+    # why the number is what it is.
+    'cmd_parse\.rs.*replace \* with (\+|/) in parse_into_conn',
 ]

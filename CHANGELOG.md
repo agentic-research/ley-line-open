@@ -10,6 +10,92 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A microsecond wall-clock comparison was reddening CI ~8% of the time.**
+  `public_api_restriction_is_cheaper_than_review` asserted that sheaf restriction
+  beats the review join in wall time — at a scale where one preemption reverses
+  the result (7.6us vs 852us on a quiet run; 649us vs 424us on the loaded run
+  that tripped it, an ~85x swing from scheduling alone). Measured 1 failure in
+  12 runs on an idle machine. The test's real invariant — `restriction_ops <
+  review_ops`, the row count, which is what "cheaper" means structurally — was
+  passing every time. The wall-clock half now follows the same convention as the
+  F2 throughput ratio (bead `ley-line-open-c6101e`): always measured and
+  printed, asserted only under `LLO_PERF_GATES=1`, and enforced by
+  `task test:perf`, which now runs it.
+
+### Performance
+
+- **The ADR-0026 pointer store stopped storing pointers.** `_ast_pointer` held one
+  row per AST node — 3 150 849 on an 8000-file TypeScript arena — and each row
+  carried a `node_id` already on the `_ast` row, a `source_id` already on the
+  `_ast` row, a `blob_hash` with only 8000 distinct values across all of them, an
+  `offset_in_blob` that was provably the dense array index (0..n-1, no gaps, in
+  8000/8000 files), and a `kind` that is a pure function of `_ast.node_kind`. At
+  ~294 bytes per row addressing a ~370-byte record, the pointer was 80% the size
+  of its referent. It is now `_ast_blob`, one row per FILE (8000 rows, a 394x
+  collapse), with the ordinal on `_ast.blob_ord` and the semantic tag exposed as
+  `semantic_kind_tag()` for consumers to derive rather than a column ingest
+  writes 3.15M times. Measured 8.82 GB -> 7.11 GB (-1.71 GB) with `_ast` and
+  `node_defs` row counts unchanged, and ~17% off ingest wall. The ADR-0026 §6.F1
+  round-trip capability is unchanged, and the per-file ordinal density it now
+  depends on is asserted by that gate rather than assumed (bead
+  `ley-line-open-17c271`).
+
+### Added
+
+- **`_meta.projection_schema_version` — a consumer-facing channel for the
+  projection SHAPE.** `IR_SCHEMA_VERSION` versions what `node_hash` addresses
+  mean and `SCHEMA_VERSION` versions the public schema-client contract, but
+  nothing versioned which tables and columns an arena actually has. A consumer
+  could only detect a projection change by interrogating `sqlite_master` — which
+  is why mache carries a byte-identical DDL pin plus a drift-conformance test.
+  This is the same gap `IR_SCHEMA_VERSION` exists to close, one layer down.
+  Absent means an arena written before this landed, i.e. one carrying the
+  per-node `_ast_pointer` table.
+
+### Fixed
+
+- **Multi-row INSERT batch size is derived instead of asserted in a comment.**
+  The 3000-row batch was kept under SQLite's 32 766 bound-parameter ceiling by a
+  comment doing the arithmetic ("3000 rows x 9 columns = 27 000 params, ~5 700
+  headroom"). Adding one column to `_ast` took it to 33 000 and every parse
+  failed with "too many SQL variables". `rows_per_batch(cols)` now derives it, so
+  the widest table is correct by construction.
+
+### Performance
+
+- **Cold ingest no longer holds the whole repository in memory.** `parse_into_conn`
+  materialised every `ParsedFile` via `par_iter().collect()` and then filled 13 row
+  buffers that were only flushed after the last file, so peak memory was O(corpus)
+  from two directions at once — 14.2 GB resident to ingest 193 MB of kibana
+  TypeScript (32k files, 28.5M rows), enough to swap the machine. Parse and insert
+  now run in 1024-file chunks, bounding both. Measured on that corpus: 32k files
+  go from 566s / 14.2 GB to 358s / 8.3 GB (−37% wall, −41% peak RSS); 8k files
+  from 11.4 GB to 5.0 GB (−56%). Chunks are sequential slices of the sorted
+  work-list, so insert order — and the sorted-insert B-tree locality it buys — is
+  byte-identical to before, as is the resulting projection (verified per-table on
+  counts and content checksums, including the deduped `node_content` and
+  `source_blobs`). Small corpora regress slightly (~5% at 2k files) where the
+  extra flushes land with no memory benefit to offset them (bead
+  `ley-line-open-e9f829`).
+
+### Fixed
+
+- **The cold-parse perf gate could fail CI on a build profile it was never
+  calibrated for.** Its sanity test wrote `LLO_PERF_GATES` to the process
+  environment while the gate test read it from a parallel thread, so a read
+  landing inside that window armed a release-calibrated 500ms ceiling inside
+  `cargo test -p leyline-cli-lib --features vec` — a debug build, with the
+  variable unset. That is how `task ci` failed on main at 3752ce6 (debug
+  `wall=580ms`, against release `wall=131ms` measured on the same machine),
+  and PR #304's 635ms failure has the same signature. The predicate is now a
+  pure function the sanity test checks directly, so no test mutates the
+  environment, and the gate additionally hard-skips under `debug_assertions`
+  because both of its ceilings are release numbers. `topology_pass_test.rs`
+  carried the identical racy shape with tighter budgets and is fixed the same
+  way. Sibling defect: `ley-line-open-d71cf6`.
+
 ## [0.18.2] — 2026-08-11
 
 **Terraform files now publish the typed addresses Mache consumes.** HCL had

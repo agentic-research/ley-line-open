@@ -787,6 +787,13 @@ tasks:
       # regression. It always PRINTS its measurement in `task test`; this is
       # where the assertion is enforced.
       - cargo test --release -p leyline-cli-lib --test f2_concurrent_writers_throughput
+      # Sheaf restriction-vs-review wall-time corroboration. Same shape as F2:
+      # the ROW-COUNT invariant is asserted on every push inside the test, and
+      # only the wall-clock comparison is gated here. It measures at microsecond
+      # scale (7.6us vs 852us on a quiet run, but 649us vs 424us on a loaded
+      # one), so it is a scheduler race in the every-push gate and a real
+      # signal here.
+      - cargo test --release -p leyline-sheaf --test restriction_review_public_api
 
   test:perf:topology:
     desc: Topology pre-pass cost gates (opt-in; tighter budgets than test:perf).

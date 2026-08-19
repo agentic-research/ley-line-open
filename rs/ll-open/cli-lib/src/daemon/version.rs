@@ -71,6 +71,28 @@ pub const SCHEMA_VERSION: &str = "0.18.1";
 /// Bump lives in `cmd_parse::IR_SCHEMA_VERSION`, which re-exports this.
 pub const IR_SCHEMA_VERSION: &str = "merkle-ast-v2";
 
+/// Shape of the SQLite projection: which tables exist and which columns they
+/// carry.
+///
+/// Distinct from [`IR_SCHEMA_VERSION`], which versions the CONTENT of
+/// `node_hash` addresses, and from [`SCHEMA_VERSION`], which versions the
+/// public schema-client contract. Neither says anything about the table
+/// shape, so until now a consumer could only detect a projection change by
+/// querying `sqlite_master` — which is exactly why mache carries a
+/// byte-identical DDL pin and a conformance test to catch drift.
+///
+/// This is the same gap `IR_SCHEMA_VERSION` was added to close, one layer
+/// down: that comment records v0.11.0 crossing `merkle-ast-v1` ->
+/// `merkle-ast-v2` "with no consumer-facing channel at all". The projection
+/// has crossed shapes with no channel either.
+///
+/// Recorded as `_meta.projection_schema_version`. ABSENT means an arena
+/// written before this existed — i.e. one with the per-node `_ast_pointer`
+/// table rather than the per-file `_ast_blob` map.
+///
+/// Bump on ANY table added or removed, or column added or removed.
+pub const PROJECTION_SCHEMA_VERSION: &str = "projection-v2";
+
 pub const WIRE_FORMAT_MAJOR: u32 = 1;
 
 /// Earliest schema-client version compatible with this daemon binary.

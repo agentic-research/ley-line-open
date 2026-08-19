@@ -10,6 +10,20 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A microsecond wall-clock comparison was reddening CI ~8% of the time.**
+  `public_api_restriction_is_cheaper_than_review` asserted that sheaf restriction
+  beats the review join in wall time — at a scale where one preemption reverses
+  the result (7.6us vs 852us on a quiet run; 649us vs 424us on the loaded run
+  that tripped it, an ~85x swing from scheduling alone). Measured 1 failure in
+  12 runs on an idle machine. The test's real invariant — `restriction_ops <
+  review_ops`, the row count, which is what "cheaper" means structurally — was
+  passing every time. The wall-clock half now follows the same convention as the
+  F2 throughput ratio (bead `ley-line-open-c6101e`): always measured and
+  printed, asserted only under `LLO_PERF_GATES=1`, and enforced by
+  `task test:perf`, which now runs it.
+
 ### Performance
 
 - **The ADR-0026 pointer store stopped storing pointers.** `_ast_pointer` held one

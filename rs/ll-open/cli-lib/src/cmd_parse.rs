@@ -197,6 +197,24 @@ struct ExtractCtx<'a> {
 /// `SQLITE_MAX_VARIABLE_NUMBER` at SQLite build time.
 const BULK_BATCH_ROWS: usize = 3000;
 
+/// SQLite's bound-parameter ceiling (`SQLITE_MAX_VARIABLE_NUMBER`, 32766
+/// since 3.32). Exceeding it is a RUNTIME error, so neither the compiler nor
+/// review catches it.
+const SQLITE_MAX_BOUND_PARAMS: usize = 32_766;
+
+/// Rows per multi-row INSERT for a table of `cols` columns.
+///
+/// [`BULK_BATCH_ROWS`] unless that many rows would exceed
+/// [`SQLITE_MAX_BOUND_PARAMS`]. The margin used to be maintained by a COMMENT
+/// — "3000 rows x 9 columns = 27 000 params, ~5 700 headroom" — which is
+/// exactly the kind of invariant that goes stale silently: adding one column
+/// to `_ast` took it to 33 000 params and every parse failed with "too many
+/// SQL variables". Deriving it keeps the widest table correct by
+/// construction, for one division per flush.
+fn rows_per_batch(cols: usize) -> usize {
+    BULK_BATCH_ROWS.min(SQLITE_MAX_BOUND_PARAMS / cols.max(1))
+}
+
 /// Files carried through parse → buffer-fill → flush as one pipeline chunk.
 ///
 /// The whole-corpus shape this replaces did `par_iter().collect()` over every
@@ -317,12 +335,13 @@ where
     if total == 0 {
         return Ok(());
     }
+    let batch = rows_per_batch(cols);
     let mut i = 0;
-    while i + BULK_BATCH_ROWS <= total {
-        let chunk = &rows[i..i + BULK_BATCH_ROWS];
+    while i + batch <= total {
+        let chunk = &rows[i..i + batch];
         let params = into_params(chunk);
-        exec_batched(conn, prefix, BULK_BATCH_ROWS, cols, &params)?;
-        i += BULK_BATCH_ROWS;
+        exec_batched(conn, prefix, batch, cols, &params)?;
+        i += batch;
     }
     if i < total {
         let chunk = &rows[i..];
@@ -426,12 +445,12 @@ batch_table! {
     // the mache 765-file bench that's ~535K extra B-tree probes. See
     // bead `ley-line-open-cbbedf`.
     AstBatch, AstRow,
-    "INSERT INTO _ast (node_id, source_id, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col, node_hash) VALUES ",
-    10,
-    push_fn: (node_id: String, source_id: String, node_kind: String, start_byte: i64, end_byte: i64, start_row: i64, start_col: i64, end_row: i64, end_col: i64, node_hash: Vec<u8>),
-    push_body: { AstRow { node_id, source_id, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col, node_hash } },
+    "INSERT INTO _ast (node_id, source_id, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col, node_hash, blob_ord) VALUES ",
+    11,
+    push_fn: (node_id: String, source_id: String, node_kind: String, start_byte: i64, end_byte: i64, start_row: i64, start_col: i64, end_row: i64, end_col: i64, node_hash: Vec<u8>, blob_ord: i64),
+    push_body: { AstRow { node_id, source_id, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col, node_hash, blob_ord } },
     flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 10);
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 11);
         for r in chunk {
             out.push(&r.node_id);
             out.push(&r.source_id);
@@ -443,6 +462,7 @@ batch_table! {
             out.push(&r.end_row);
             out.push(&r.end_col);
             out.push(&r.node_hash);
+            out.push(&r.blob_ord);
         }
         out
     },
@@ -706,22 +726,26 @@ batch_table! {
 }
 
 batch_table! {
-    // ADR-0026 pointer rows — one per `_ast` entry, dual-write for Phase 1
-    // (bead `ley-line-open-3e87ad`). `delete_file_rows` clears prior rows
-    // per file, so plain `INSERT` doesn't conflict.
-    AstPointerBatch, AstPointerRow,
-    "INSERT INTO _ast_pointer (node_id, blob_hash, offset_in_blob, kind, source_id) VALUES ",
-    5,
-    push_fn: (node_id: String, blob_hash: Vec<u8>, offset_in_blob: i64, kind: i64, source_id: String),
-    push_body: { AstPointerRow { node_id, blob_hash, offset_in_blob, kind, source_id } },
+    // ADR-0026 file-to-blob map — ONE row per source file (bead
+    // `ley-line-open-17c271`, superseding the per-node `_ast_pointer` from
+    // `ley-line-open-3e87ad`). `delete_file_rows` clears the prior row per
+    // file, so plain `INSERT` doesn't conflict.
+    //
+    // The per-node table it replaces stored, for each of 3.15M rows, a
+    // node_id already in `_ast`, a source_id already in `_ast`, a blob_hash
+    // with only 8000 distinct values, an offset that was the dense array
+    // index, and a kind derivable from `_ast.node_kind`. The offset now
+    // rides on `_ast.blob_ord`, on the row it describes.
+    AstBlobBatch, AstBlobRow,
+    "INSERT INTO _ast_blob (source_id, blob_hash) VALUES ",
+    2,
+    push_fn: (source_id: String, blob_hash: Vec<u8>),
+    push_body: { AstBlobRow { source_id, blob_hash } },
     flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 5);
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 2);
         for r in chunk {
-            out.push(&r.node_id);
-            out.push(&r.blob_hash);
-            out.push(&r.offset_in_blob);
-            out.push(&r.kind);
             out.push(&r.source_id);
+            out.push(&r.blob_hash);
         }
         out
     },
@@ -1275,7 +1299,7 @@ pub fn parse_into_conn(
     // (mirrors the `_ast` row count 1-to-1). Pre-sized like `ast_buf` since
     // pointer rows and _ast rows are in 1-to-1 correspondence.
     let mut blob_buf: CapnpBlobBatch = CapnpBlobBatch::with_capacity(chunk_files);
-    let mut pointer_buf: AstPointerBatch = AstPointerBatch::with_capacity(chunk_rows);
+    let mut ast_blob_buf: AstBlobBatch = AstBlobBatch::with_capacity(chunk_files);
 
     // ADR-0028 source blobs (Phase 1 dual-store, bead `ley-line-open-9e4416`).
     // One `source_blobs` row per file *before* `INSERT OR IGNORE` dedup; unique
@@ -1436,7 +1460,12 @@ pub fn parse_into_conn(
                         hash_by_id.insert(id.as_str(), *h);
                     }
 
-                    for a in &pf.ast_entries {
+                    // `blob_ord` is this entry's index in the file's
+                    // `AstNodeList.nodes` — the same `enumerate()` order
+                    // `serialize_ast_node_list_record` wrote. Carrying it on
+                    // the `_ast` row is what lets the pointer store be one row
+                    // per FILE rather than one per node (`ley-line-open-17c271`).
+                    for (blob_ord, a) in pf.ast_entries.iter().enumerate() {
                         ast_buf.push(
                             a.node_id.clone(),
                             a.source_id.clone(),
@@ -1448,6 +1477,7 @@ pub fn parse_into_conn(
                             a.end_row as i64,
                             a.end_col as i64,
                             a.node_hash.to_vec(),
+                            blob_ord as i64,
                         );
                     }
 
@@ -1462,15 +1492,7 @@ pub fn parse_into_conn(
                     // Moved for the same reason as `source_blob_bytes` above:
                     // sole use, owned `pf`, by-value `push` (ley-line-open-cd052b).
                     blob_buf.push(pf.pointer_blob_hash.to_vec(), pf.pointer_blob_bytes);
-                    for (offset, a) in pf.ast_entries.iter().enumerate() {
-                        pointer_buf.push(
-                            a.node_id.clone(),
-                            pf.pointer_blob_hash.to_vec(),
-                            offset as i64,
-                            semantic_kind_tag(&a.node_kind),
-                            a.source_id.clone(),
-                        );
-                    }
+                    ast_blob_buf.push(pf.rel.clone(), pf.pointer_blob_hash.to_vec());
 
                     for r in pf.refs {
                         match r {
@@ -1572,7 +1594,7 @@ pub fn parse_into_conn(
         // FK becomes load-bearing when Phase 2 flips consumers to reads), but
         // ordering the writes correctly means the promotion is a one-line edit.
         blob_buf.flush_batched(conn)?;
-        pointer_buf.flush_batched(conn)?;
+        ast_blob_buf.flush_batched(conn)?;
 
         flush_elapsed += chunk_flush_start.elapsed();
     }
@@ -1739,6 +1761,13 @@ pub fn parse_into_conn(
     // shape (node_content/node_child/_ast.node_hash) from the retired
     // symbols/fact_edges shape.
     set_meta(conn, "ir_schema_version", IR_SCHEMA_VERSION)?;
+    // Projection shape, so a consumer can tell `_ast_blob` from `_ast_pointer`
+    // without interrogating `sqlite_master` (bead `ley-line-open-17c271`).
+    set_meta(
+        conn,
+        "projection_schema_version",
+        crate::daemon::version::PROJECTION_SCHEMA_VERSION,
+    )?;
     // Stamp the extraction epoch only on full-tree passes. A scoped
     // pass reparses just the dirty set; stamping the binary's epoch
     // there would mark still-stale out-of-scope facts as current. The
@@ -2397,7 +2426,7 @@ pub const SEMANTIC_KIND_IMPORT: i64 = 4;
 /// Map a tree-sitter node kind string to its semantic-kind tag. Phase 1
 /// covers the categories the ADR calls out (§2.1); Phase 2 refines the
 /// allowlist per measured mache query patterns (§2.2).
-fn semantic_kind_tag(node_kind: &str) -> i64 {
+pub fn semantic_kind_tag(node_kind: &str) -> i64 {
     match node_kind {
         // Function-like across Go / Rust / Python / JS / TS.
         "function_declaration" | "function_definition" | "function_item" => SEMANTIC_KIND_FUNCTION,
@@ -3829,6 +3858,114 @@ mod tests {
             "one file past the boundary needs a tail chunk"
         );
         assert_eq!(chunk_count_for(PARSE_CHUNK_FILES * 3), 3);
+    }
+
+    /// `rows_per_batch` is the only thing keeping a multi-row INSERT under
+    /// SQLite's bound-parameter ceiling. Stubbing it to `1`, or flipping its
+    /// division to a multiplication, left every test passing: a batch of 1 is
+    /// merely slow, and an oversized batch only fails at RUNTIME on the widest
+    /// table. Both survived as mutants on bead `ley-line-open-17c271`.
+    ///
+    /// The load-bearing assertion is the invariant, not any single value —
+    /// that is what stays true when a column is added to any table.
+
+    /// `flush_in_batches` walks `i` forward one batch at a time and flushes a
+    /// short tail. Nothing exercised that walk: every existing test flushes
+    /// far fewer rows than one batch, so the loop body ran at most once and
+    /// its arithmetic was unobserved. Mutating `i + batch` to `i - batch`, or
+    /// `i += batch` to `i -= batch`, survived (bead `ley-line-open-17c271`).
+    ///
+    /// A silent failure here drops or duplicates rows at a batch boundary —
+    /// the projection would be wrong only on corpora large enough to cross
+    /// 3000 rows in a single table, which is every real one and no test one.
+    ///
+    /// Sized `BULK_BATCH_ROWS * 2 + 1` so the loop runs twice AND leaves a
+    /// one-row tail, covering both the full-batch path and the partial one.
+    #[test]
+    fn flush_in_batches_lands_every_row_across_batch_boundaries() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (v INTEGER NOT NULL);")
+            .unwrap();
+
+        let n = BULK_BATCH_ROWS * 2 + 1;
+        let mut rows: Vec<i64> = (0..n as i64).collect();
+        flush_in_batches(&conn, &mut rows, "INSERT INTO t (v) VALUES ", 1, |chunk| {
+            chunk
+                .iter()
+                .map(|r| r as &dyn rusqlite::ToSql)
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count,
+            n as i64,
+            "every row must land: {n} pushed across {} batches plus a tail",
+            n / BULK_BATCH_ROWS
+        );
+
+        // Content, not just cardinality — a boundary bug that re-flushes one
+        // batch twice and skips another keeps the count and corrupts the data.
+        let sum: i64 = conn
+            .query_row("SELECT SUM(v) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            sum,
+            (0..n as i64).sum::<i64>(),
+            "the rows that landed must be the rows that were pushed, once each"
+        );
+
+        assert!(
+            rows.is_empty(),
+            "the buffer is cleared for reuse — the chunked pipeline flushes it \
+             once per chunk and relies on it keeping its allocation"
+        );
+    }
+    #[test]
+    fn rows_per_batch_never_exceeds_the_bound_parameter_ceiling() {
+        for cols in 1..=64usize {
+            let rows = rows_per_batch(cols);
+            assert!(
+                rows >= 1,
+                "a batch must carry at least one row (cols={cols})"
+            );
+            assert!(
+                rows * cols <= SQLITE_MAX_BOUND_PARAMS,
+                "cols={cols}: {rows} rows x {cols} cols = {} params, over the \
+                 {SQLITE_MAX_BOUND_PARAMS} ceiling — this is the failure that \
+                 took every parse down when `_ast` gained a column",
+                rows * cols
+            );
+        }
+    }
+
+    /// The ceiling must BIND on wide tables and NOT cost anything on narrow
+    /// ones. Without this, `rows_per_batch -> 1` satisfies the ceiling
+    /// invariant above while destroying the batching the insert path exists
+    /// for (`ley-line-open-cbbedf` measured un-batched inserts at ~10x).
+    #[test]
+    fn rows_per_batch_binds_only_where_the_ceiling_requires_it() {
+        // 2 columns: 3000 x 2 = 6000 params, far under the cap — full batch.
+        assert_eq!(
+            rows_per_batch(2),
+            BULK_BATCH_ROWS,
+            "a narrow table must still get the full {BULK_BATCH_ROWS}-row batch"
+        );
+        // 11 columns (today's `_ast`): 3000 x 11 = 33000, over the cap, so the
+        // batch must shrink to exactly the ceiling's quotient.
+        assert_eq!(
+            rows_per_batch(11),
+            SQLITE_MAX_BOUND_PARAMS / 11,
+            "a table wide enough to breach the cap must be clamped to the quotient"
+        );
+        assert!(
+            rows_per_batch(11) < BULK_BATCH_ROWS,
+            "11 columns MUST bind — if this stops holding, the constant moved \
+             and the clamp is no longer exercised by any test"
+        );
     }
     #[test]
     fn batched_inserts_preserve_record_content_not_just_row_count() {

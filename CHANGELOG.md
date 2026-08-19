@@ -12,6 +12,45 @@ context, scoping notes, and review history are recoverable.
 
 ### Performance
 
+- **The ADR-0026 pointer store stopped storing pointers.** `_ast_pointer` held one
+  row per AST node — 3 150 849 on an 8000-file TypeScript arena — and each row
+  carried a `node_id` already on the `_ast` row, a `source_id` already on the
+  `_ast` row, a `blob_hash` with only 8000 distinct values across all of them, an
+  `offset_in_blob` that was provably the dense array index (0..n-1, no gaps, in
+  8000/8000 files), and a `kind` that is a pure function of `_ast.node_kind`. At
+  ~294 bytes per row addressing a ~370-byte record, the pointer was 80% the size
+  of its referent. It is now `_ast_blob`, one row per FILE (8000 rows, a 394x
+  collapse), with the ordinal on `_ast.blob_ord` and the semantic tag exposed as
+  `semantic_kind_tag()` for consumers to derive rather than a column ingest
+  writes 3.15M times. Measured 8.82 GB -> 7.11 GB (-1.71 GB) with `_ast` and
+  `node_defs` row counts unchanged, and ~17% off ingest wall. The ADR-0026 §6.F1
+  round-trip capability is unchanged, and the per-file ordinal density it now
+  depends on is asserted by that gate rather than assumed (bead
+  `ley-line-open-17c271`).
+
+### Added
+
+- **`_meta.projection_schema_version` — a consumer-facing channel for the
+  projection SHAPE.** `IR_SCHEMA_VERSION` versions what `node_hash` addresses
+  mean and `SCHEMA_VERSION` versions the public schema-client contract, but
+  nothing versioned which tables and columns an arena actually has. A consumer
+  could only detect a projection change by interrogating `sqlite_master` — which
+  is why mache carries a byte-identical DDL pin plus a drift-conformance test.
+  This is the same gap `IR_SCHEMA_VERSION` exists to close, one layer down.
+  Absent means an arena written before this landed, i.e. one carrying the
+  per-node `_ast_pointer` table.
+
+### Fixed
+
+- **Multi-row INSERT batch size is derived instead of asserted in a comment.**
+  The 3000-row batch was kept under SQLite's 32 766 bound-parameter ceiling by a
+  comment doing the arithmetic ("3000 rows x 9 columns = 27 000 params, ~5 700
+  headroom"). Adding one column to `_ast` took it to 33 000 and every parse
+  failed with "too many SQL variables". `rows_per_batch(cols)` now derives it, so
+  the widest table is correct by construction.
+
+### Performance
+
 - **Cold ingest no longer holds the whole repository in memory.** `parse_into_conn`
   materialised every `ParsedFile` via `par_iter().collect()` and then filled 13 row
   buffers that were only flushed after the last file, so peak memory was O(corpus)

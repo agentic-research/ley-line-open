@@ -10,6 +10,22 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Changed
+
+- **`node_defs` and `node_refs` carry their own span and grammar kind, so
+  resolving a definition no longer JOINs `_ast`.** `query_definitions` reached
+  into the 3.15M-row `_ast` table purely to recover position for a 337k-row
+  answer, and that join is why `_ast` had to be materialised eagerly. The range
+  now lives on the occurrence row — the shape SCIP uses, and the same
+  denormalisation `canonical_kind` already applies on this table to avoid a
+  JOIN through `node_content.kind`. Measured on a 2000-file slice: +2.2 MB on
+  the occurrence tables against a 209.5 MB `_ast` that becomes optional for the
+  primary query path, and `find_definition` returns complete answers with `_ast`
+  dropped entirely. NULL spans are preserved and meaningful: injected nodes
+  (`ley-line-open-c822a6`) have no `_ast` row and had no span under the old LEFT
+  JOIN either. `_meta.projection_schema_version` advances to `projection-v3`
+  (bead `ley-line-open-b4509b`).
+
 ### Fixed
 
 - **A microsecond wall-clock comparison was reddening CI ~8% of the time.**

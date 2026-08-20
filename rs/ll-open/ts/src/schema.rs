@@ -177,6 +177,26 @@ CREATE TABLE IF NOT EXISTS node_refs (
     node_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
     container_node_id TEXT,
+    -- ADR-0026-adjacent denormalisation (bead `ley-line-open-b4509b`): the
+    -- occurrence's own source span and grammar kind, so resolving a
+    -- definition or a caller does not JOIN `_ast`. That join is why the
+    -- 3.15M-row `_ast` table has to be materialised eagerly for a 337k-row
+    -- answer; SCIP carries the range inline on the occurrence for the same
+    -- reason. Same shape as `canonical_kind` below, which already lives here
+    -- to avoid a JOIN through `node_content.kind`.
+    --
+    -- NULLABLE, and NULL is meaningful: injected nodes (bead
+    -- `ley-line-open-c822a6`) have no `_ast` row, so they had no span under
+    -- the old LEFT JOIN either. Preserving NULL keeps their behaviour
+    -- byte-identical rather than inventing coordinates in the host file's
+    -- space.
+    node_kind TEXT,
+    start_byte INTEGER,
+    end_byte INTEGER,
+    start_row INTEGER,
+    start_col INTEGER,
+    end_row INTEGER,
+    end_col INTEGER,
     qualifier TEXT
 );";
 
@@ -196,6 +216,26 @@ CREATE TABLE IF NOT EXISTS node_refs (
     node_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
     container_node_id TEXT,
+    -- ADR-0026-adjacent denormalisation (bead `ley-line-open-b4509b`): the
+    -- occurrence's own source span and grammar kind, so resolving a
+    -- definition or a caller does not JOIN `_ast`. That join is why the
+    -- 3.15M-row `_ast` table has to be materialised eagerly for a 337k-row
+    -- answer; SCIP carries the range inline on the occurrence for the same
+    -- reason. Same shape as `canonical_kind` below, which already lives here
+    -- to avoid a JOIN through `node_content.kind`.
+    --
+    -- NULLABLE, and NULL is meaningful: injected nodes (bead
+    -- `ley-line-open-c822a6`) have no `_ast` row, so they had no span under
+    -- the old LEFT JOIN either. Preserving NULL keeps their behaviour
+    -- byte-identical rather than inventing coordinates in the host file's
+    -- space.
+    node_kind TEXT,
+    start_byte INTEGER,
+    end_byte INTEGER,
+    start_row INTEGER,
+    start_col INTEGER,
+    end_row INTEGER,
+    end_col INTEGER,
     qualifier TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_refs_token ON node_refs(token);
@@ -224,6 +264,26 @@ CREATE TABLE IF NOT EXISTS node_defs (
     node_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
     container_node_id TEXT,
+    -- ADR-0026-adjacent denormalisation (bead `ley-line-open-b4509b`): the
+    -- occurrence's own source span and grammar kind, so resolving a
+    -- definition or a caller does not JOIN `_ast`. That join is why the
+    -- 3.15M-row `_ast` table has to be materialised eagerly for a 337k-row
+    -- answer; SCIP carries the range inline on the occurrence for the same
+    -- reason. Same shape as `canonical_kind` below, which already lives here
+    -- to avoid a JOIN through `node_content.kind`.
+    --
+    -- NULLABLE, and NULL is meaningful: injected nodes (bead
+    -- `ley-line-open-c822a6`) have no `_ast` row, so they had no span under
+    -- the old LEFT JOIN either. Preserving NULL keeps their behaviour
+    -- byte-identical rather than inventing coordinates in the host file's
+    -- space.
+    node_kind TEXT,
+    start_byte INTEGER,
+    end_byte INTEGER,
+    start_row INTEGER,
+    start_col INTEGER,
+    end_row INTEGER,
+    end_col INTEGER,
     canonical_kind TEXT
 );";
 
@@ -244,6 +304,26 @@ CREATE TABLE IF NOT EXISTS node_defs (
     node_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
     container_node_id TEXT,
+    -- ADR-0026-adjacent denormalisation (bead `ley-line-open-b4509b`): the
+    -- occurrence's own source span and grammar kind, so resolving a
+    -- definition or a caller does not JOIN `_ast`. That join is why the
+    -- 3.15M-row `_ast` table has to be materialised eagerly for a 337k-row
+    -- answer; SCIP carries the range inline on the occurrence for the same
+    -- reason. Same shape as `canonical_kind` below, which already lives here
+    -- to avoid a JOIN through `node_content.kind`.
+    --
+    -- NULLABLE, and NULL is meaningful: injected nodes (bead
+    -- `ley-line-open-c822a6`) have no `_ast` row, so they had no span under
+    -- the old LEFT JOIN either. Preserving NULL keeps their behaviour
+    -- byte-identical rather than inventing coordinates in the host file's
+    -- space.
+    node_kind TEXT,
+    start_byte INTEGER,
+    end_byte INTEGER,
+    start_row INTEGER,
+    start_col INTEGER,
+    end_row INTEGER,
+    end_col INTEGER,
     canonical_kind TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_defs_token ON node_defs(token);
@@ -533,6 +613,40 @@ fn has_qualifier_column(conn: &Connection, table: &str) -> Result<bool> {
 pub fn create_qualifier_column(conn: &Connection) -> Result<()> {
     if !has_qualifier_column(conn, "node_refs")? {
         conn.execute_batch("ALTER TABLE node_refs ADD COLUMN qualifier TEXT;")?;
+    }
+    Ok(())
+}
+
+/// Additively stamp the occurrence span columns onto `node_defs` / `node_refs`
+/// when absent — idempotent.
+///
+/// Fresh DBs get them from `REFS_DDL` / `DEFS_DDL`; this fires on any arena
+/// created before `projection-v3`. Same discipline, and same ordering
+/// requirement, as [`create_qualifier_column`]: `CREATE TABLE IF NOT EXISTS`
+/// is a no-op on an existing table, so without this an older arena keeps the
+/// narrow shape and the reparse INSERT — which names these columns — fails
+/// with "table node_refs has no column named node_kind". The ALTER therefore
+/// has to run before the insert transaction opens.
+///
+/// The columns are left NULL for rows already present. They are refilled for
+/// every row the reparse rewrites, and a NULL span already means "no `_ast`
+/// row" to every reader, so a partially-migrated arena degrades to the
+/// pre-v3 answer rather than to a wrong one.
+pub fn create_occurrence_span_columns(conn: &Connection) -> Result<()> {
+    for table in ["node_defs", "node_refs"] {
+        for (col, ty) in [
+            ("node_kind", "TEXT"),
+            ("start_byte", "INTEGER"),
+            ("end_byte", "INTEGER"),
+            ("start_row", "INTEGER"),
+            ("start_col", "INTEGER"),
+            ("end_row", "INTEGER"),
+            ("end_col", "INTEGER"),
+        ] {
+            if !has_column(conn, table, col)? {
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col} {ty};"))?;
+            }
+        }
     }
     Ok(())
 }
@@ -1863,6 +1977,110 @@ mod tests {
         // "duplicate column name" error.
         create_ir_tables(&conn).unwrap();
         assert!(has_column(&conn, "_ast", "node_hash").unwrap());
+    }
+
+    /// **Every additive ALTER migration, gated as a class.**
+    ///
+    /// Each of these stamps a column onto a table that predates it, and each
+    /// has the same two failure modes: a body replaced by `Ok(())` (the column
+    /// never appears, and the next INSERT naming it fails at runtime), and an
+    /// inverted idempotence guard (the ALTER runs only when the column already
+    /// exists, so a fresh arena never gets it AND a reparse hits "duplicate
+    /// column name").
+    ///
+    /// Both modes survived mutation on THREE separate migrations in this
+    /// module — `create_ir_tables`, `create_pointer_store_tables`, and
+    /// `create_occurrence_span_columns` — because each was covered, when it was
+    /// covered at all, by a bespoke test written after the fact. Three
+    /// identical gaps is a class, not three accidents, so this gates the class:
+    /// a migration added later is covered by adding one line to the table
+    /// below, and an uncovered one shows up as a surviving mutant immediately.
+    ///
+    /// SQLite has no `ADD COLUMN IF NOT EXISTS`, and these run on EVERY parse,
+    /// so idempotence is not optional — it is the difference between a reparse
+    /// working and erroring.
+    #[test]
+    fn every_additive_migration_adds_its_columns_and_is_idempotent() {
+        type Migration = fn(&Connection) -> Result<()>;
+        let cases: &[(&str, Migration, &[(&str, &str)])] = &[
+            (
+                "create_ir_tables",
+                create_ir_tables,
+                &[
+                    ("_ast", "node_hash"),
+                    ("node_defs", "node_hash"),
+                    ("node_refs", "node_hash"),
+                ],
+            ),
+            (
+                "create_canonical_kind_column",
+                create_canonical_kind_column,
+                &[("node_defs", "canonical_kind")],
+            ),
+            (
+                "create_container_id_columns",
+                create_container_id_columns,
+                &[
+                    ("node_defs", "container_node_id"),
+                    ("node_refs", "container_node_id"),
+                ],
+            ),
+            (
+                "create_qualifier_column",
+                create_qualifier_column,
+                &[("node_refs", "qualifier")],
+            ),
+            (
+                "create_occurrence_span_columns",
+                create_occurrence_span_columns,
+                &[
+                    ("node_defs", "node_kind"),
+                    ("node_defs", "start_byte"),
+                    ("node_defs", "end_col"),
+                    ("node_refs", "node_kind"),
+                    ("node_refs", "start_byte"),
+                    ("node_refs", "end_col"),
+                ],
+            ),
+        ];
+
+        for (name, migrate, expected) in cases {
+            // A deliberately LEGACY-shaped arena: the narrow tables these
+            // migrations exist to widen. Building it from the current DDL would
+            // defeat the test, because the current DDL already has the columns.
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE _ast (node_id TEXT PRIMARY KEY, source_id TEXT NOT NULL, \
+                    node_kind TEXT NOT NULL, start_byte INTEGER, end_byte INTEGER, \
+                    start_row INTEGER, start_col INTEGER, end_row INTEGER, end_col INTEGER);
+                 CREATE TABLE node_defs (token TEXT NOT NULL, node_id TEXT NOT NULL, source_id TEXT NOT NULL);
+                 CREATE TABLE node_refs (token TEXT NOT NULL, node_id TEXT NOT NULL, source_id TEXT NOT NULL);",
+            )
+            .unwrap();
+
+            migrate(&conn).unwrap_or_else(|e| panic!("{name} must succeed on a legacy shape: {e}"));
+
+            for (table, col) in *expected {
+                assert!(
+                    has_column(&conn, table, col).unwrap(),
+                    "{name}: {table}.{col} MUST exist after the migration — without it \
+                     every INSERT naming the column fails at runtime"
+                );
+            }
+
+            // Runs on every parse. A second call must be a no-op, not
+            // "duplicate column name".
+            migrate(&conn).unwrap_or_else(|e| {
+                panic!("{name} MUST be idempotent — it runs on every parse: {e}")
+            });
+
+            for (table, col) in *expected {
+                assert!(
+                    has_column(&conn, table, col).unwrap(),
+                    "{name}: {table}.{col} vanished across a second run"
+                );
+            }
+        }
     }
     #[test]
     fn has_column_distinguishes_present_from_absent() {

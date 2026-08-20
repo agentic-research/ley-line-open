@@ -86,9 +86,13 @@ pub const IR_SCHEMA_VERSION: &str = "merkle-ast-v2";
 /// `merkle-ast-v2` "with no consumer-facing channel at all". The projection
 /// has crossed shapes with no channel either.
 ///
-/// Recorded as `_meta.projection_schema_version`. ABSENT means an arena
-/// written before this existed — i.e. one with the per-node `_ast_pointer`
-/// table rather than the per-file `_ast_blob` map.
+/// Recorded as `_meta.projection_schema_version`.
+///
+/// - ABSENT — written before this key existed; carries the per-node
+///   `_ast_pointer` table rather than the per-file `_ast_blob` map.
+/// - `projection-v2` — `_ast_blob` + `_ast.blob_ord`.
+/// - `projection-v3` — `node_defs`/`node_refs` carry their own span and
+///   grammar kind, so resolving a definition no longer JOINs `_ast`.
 ///
 /// `projection-v3` (from `projection-v2`): `nodes.parent_id` is no longer a
 /// stored column but a VIRTUAL generated one derived from `id` and `name`.

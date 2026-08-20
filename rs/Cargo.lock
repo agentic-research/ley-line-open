@@ -4788,6 +4788,7 @@ dependencies = [
  "jj-lib",
  "leyline-core",
  "leyline-fs",
+ "leyline-schema",
  "log",
  "parking_lot",
  "pollster",

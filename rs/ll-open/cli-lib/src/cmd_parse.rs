@@ -65,7 +65,6 @@ use rusqlite::Connection;
 
 struct ParsedNode {
     id: String,
-    parent_id: String,
     name: String,
     kind: i32,
     size: i64,
@@ -417,15 +416,14 @@ batch_table! {
     // it was always NULL and the rules silently reduced to false
     // positives.
     NodeBatch, NodeRow,
-    "INSERT OR IGNORE INTO nodes (id, parent_id, name, kind, size, mtime, record, source_file) VALUES ",
-    8,
-    push_fn: (id: String, parent_id: String, name: String, kind: i32, size: i64, mtime: i64, record: String, source_file: Option<String>),
-    push_body: { NodeRow { id, parent_id, name, kind, size, mtime, record, source_file } },
+    "INSERT OR IGNORE INTO nodes (id, name, kind, size, mtime, record, source_file) VALUES ",
+    7,
+    push_fn: (id: String, name: String, kind: i32, size: i64, mtime: i64, record: String, source_file: Option<String>),
+    push_body: { NodeRow { id, name, kind, size, mtime, record, source_file } },
     flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 8);
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 7);
         for r in chunk {
             out.push(&r.id);
-            out.push(&r.parent_id);
             out.push(&r.name);
             out.push(&r.kind);
             out.push(&r.size);
@@ -931,8 +929,8 @@ pub fn parse_into_conn(
         .as_nanos() as i64;
 
     conn.execute(
-        "INSERT OR IGNORE INTO nodes (id, parent_id, name, kind, size, mtime, record) \
-         VALUES ('', '', '', 1, 0, ?1, '')",
+        "INSERT OR IGNORE INTO nodes (id, name, kind, size, mtime, record) \
+         VALUES ('', '', 1, 0, ?1, '')",
         [mtime],
     )?;
 
@@ -1404,7 +1402,6 @@ pub fn parse_into_conn(
                     for n in pf.nodes {
                         nodes_buf.push(
                             n.id,
-                            n.parent_id,
                             n.name,
                             n.kind,
                             n.size,
@@ -2614,12 +2611,6 @@ pub(crate) fn parse_file_pure(
     let root = tree.root_node();
     let lang_name = language.name();
 
-    let parent_id = source_id
-        .rsplit_once('/')
-        .map(|(p, _)| p)
-        .unwrap_or("")
-        .to_string();
-
     let file_name = source_id
         .rsplit_once('/')
         .map(|(_, n)| n)
@@ -2651,7 +2642,6 @@ pub(crate) fn parse_file_pure(
     // File node.
     nodes.push(ParsedNode {
         id: source_id.to_string(),
-        parent_id: parent_id.clone(),
         name: file_name,
         kind: 1,
         size: 0,
@@ -3074,7 +3064,6 @@ fn fold_children(
             if has_named_children {
                 nodes.push(ParsedNode {
                     id: id.clone(),
-                    parent_id: node_id.to_string(),
                     name,
                     kind: 1,
                     size: 0,
@@ -3084,7 +3073,6 @@ fn fold_children(
                 let text = child.utf8_text(content).unwrap_or("");
                 nodes.push(ParsedNode {
                     id: id.clone(),
-                    parent_id: node_id.to_string(),
                     name,
                     kind: 0,
                     size: text.len() as i64,
@@ -3462,7 +3450,6 @@ fn collect_dirs(rel: &Path, created: &mut HashSet<String>, nodes_buf: &mut NodeB
 
     for comp in components {
         let name = comp.as_os_str().to_string_lossy().into_owned();
-        let parent = accumulated.clone();
         if accumulated.is_empty() {
             accumulated = name.clone();
         } else {
@@ -3471,16 +3458,7 @@ fn collect_dirs(rel: &Path, created: &mut HashSet<String>, nodes_buf: &mut NodeB
         if created.insert(accumulated.clone()) {
             // Directory-only rows: `source_file` stays `None`. Only
             // file nodes + their AST descendants carry the path.
-            nodes_buf.push(
-                accumulated.clone(),
-                parent,
-                name,
-                1,
-                0,
-                mtime,
-                String::new(),
-                None,
-            );
+            nodes_buf.push(accumulated.clone(), name, 1, 0, mtime, String::new(), None);
         }
     }
 }

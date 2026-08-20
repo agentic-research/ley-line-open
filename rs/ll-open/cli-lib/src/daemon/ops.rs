@@ -4326,10 +4326,10 @@ mod tests {
         // Option<String> mapper. Centralizing here unifies behavior.
         let conn = Connection::open_in_memory().unwrap();
         leyline_schema::create_schema(&conn).unwrap();
-        leyline_schema::insert_node(&conn, "n_with", "", "n_with", 1, 0, 0, "hello").unwrap();
+        leyline_schema::insert_node(&conn, "n_with", "n_with", 1, 0, 0, "hello").unwrap();
         // Row with record IS NULL — bypass insert_node since it always
         // takes a non-null record. Use a direct UPDATE.
-        leyline_schema::insert_node(&conn, "n_null", "", "n_null", 1, 0, 0, "x").unwrap();
+        leyline_schema::insert_node(&conn, "n_null", "n_null", 1, 0, 0, "x").unwrap();
         conn.execute("UPDATE nodes SET record = NULL WHERE id = 'n_null'", [])
             .unwrap();
 

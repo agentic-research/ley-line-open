@@ -1237,11 +1237,11 @@ mod tests {
         create_index_schema(&conn).unwrap();
 
         // Two files
-        insert_node(&conn, "", "", "", 1, 0, 0, "").unwrap();
-        insert_node(&conn, "a.go", "", "a.go", 1, 0, 0, "").unwrap();
-        insert_node(&conn, "a.go/func", "a.go", "func", 0, 10, 0, "body").unwrap();
-        insert_node(&conn, "b.go", "", "b.go", 1, 0, 0, "").unwrap();
-        insert_node(&conn, "b.go/func", "b.go", "func", 0, 10, 0, "body").unwrap();
+        insert_node(&conn, "", "", 1, 0, 0, "").unwrap();
+        insert_node(&conn, "a.go", "a.go", 1, 0, 0, "").unwrap();
+        insert_node(&conn, "a.go/func", "func", 0, 10, 0, "body").unwrap();
+        insert_node(&conn, "b.go", "b.go", 1, 0, 0, "").unwrap();
+        insert_node(&conn, "b.go/func", "func", 0, 10, 0, "body").unwrap();
         insert_source(&conn, "a.go", "go", b"package a").unwrap();
         insert_source(&conn, "b.go", "go", b"package b").unwrap();
         insert_ref(&conn, "Foo", "a.go/call", "a.go", None, None).unwrap();
@@ -1407,7 +1407,7 @@ mod tests {
         create_index_schema(&conn).unwrap();
         // Note: NO _lsp* tables created.
 
-        insert_node(&conn, "a.go", "", "a.go", 1, 0, 0, "").unwrap();
+        insert_node(&conn, "a.go", "a.go", 1, 0, 0, "").unwrap();
         upsert_file_index(&conn, "a.go", 100, 50).unwrap();
 
         // delete_file_rows must succeed even without _lsp* tables.
@@ -1437,10 +1437,10 @@ mod tests {
 
         // "a" and "ab" — would collide under `LIKE 'a%'` but must NOT
         // collide under `LIKE 'a/%'`.
-        insert_node(&conn, "a", "", "a", 1, 0, 0, "").unwrap();
-        insert_node(&conn, "a/sub", "a", "sub", 0, 1, 0, "x").unwrap();
-        insert_node(&conn, "ab", "", "ab", 1, 0, 0, "").unwrap();
-        insert_node(&conn, "ab/sub", "ab", "sub", 0, 1, 0, "y").unwrap();
+        insert_node(&conn, "a", "a", 1, 0, 0, "").unwrap();
+        insert_node(&conn, "a/sub", "sub", 0, 1, 0, "x").unwrap();
+        insert_node(&conn, "ab", "ab", 1, 0, 0, "").unwrap();
+        insert_node(&conn, "ab/sub", "sub", 0, 1, 0, "y").unwrap();
 
         // Delete "a" — should remove "a" and "a/sub" only.
         delete_file_rows(&conn, "a").unwrap();
@@ -1539,7 +1539,7 @@ mod tests {
         create_ast_schema(&conn).unwrap();
 
         // Build a deeply-nested chain: ""→d0→d0/d1→...→d0/.../d29→file.
-        insert_node(&conn, "", "", "", 1, 0, 0, "").unwrap();
+        insert_node(&conn, "", "", 1, 0, 0, "").unwrap();
         let mut current = String::new();
         for i in 0..30 {
             let parent = current.clone();
@@ -1548,10 +1548,10 @@ mod tests {
             } else {
                 format!("{current}/d{i}")
             };
-            insert_node(&conn, &current, &parent, &format!("d{i}"), 1, 0, 0, "").unwrap();
+            insert_node(&conn, &current, &format!("d{i}"), 1, 0, 0, "").unwrap();
         }
         let file_id = format!("{current}/leaf.go");
-        insert_node(&conn, &file_id, &current, "leaf.go", 1, 0, 0, "").unwrap();
+        insert_node(&conn, &file_id, "leaf.go", 1, 0, 0, "").unwrap();
 
         // Delete the file — every dir in the chain is now orphaned.
         conn.execute("DELETE FROM nodes WHERE id = ?1", [&file_id])
@@ -1934,10 +1934,10 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         create_ast_schema(&conn).unwrap();
 
-        insert_node(&conn, "", "", "", 1, 0, 0, "").unwrap();
-        insert_node(&conn, "src", "", "src", 1, 0, 0, "").unwrap();
-        insert_node(&conn, "src/pkg", "src", "pkg", 1, 0, 0, "").unwrap();
-        insert_node(&conn, "src/pkg/a.go", "src/pkg", "a.go", 1, 0, 0, "").unwrap();
+        insert_node(&conn, "", "", 1, 0, 0, "").unwrap();
+        insert_node(&conn, "src", "src", 1, 0, 0, "").unwrap();
+        insert_node(&conn, "src/pkg", "pkg", 1, 0, 0, "").unwrap();
+        insert_node(&conn, "src/pkg/a.go", "a.go", 1, 0, 0, "").unwrap();
 
         conn.execute("DELETE FROM nodes WHERE id = 'src/pkg/a.go'", [])
             .unwrap();

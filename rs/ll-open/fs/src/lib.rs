@@ -630,9 +630,9 @@ mod tests {
         create_schema(&source).unwrap();
         source
             .execute_batch(
-                "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('vulns', '', 'vulns', 1, 0, 1000, NULL);
-                INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('vulns/CVE-1', 'vulns', 'CVE-1', 0, 23, 2000, '{\"severity\":\"critical\"}');
-                INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('vulns/CVE-2', 'vulns', 'CVE-2', 0, 10, 3000, '{\"severity\":\"high\"}');",
+                "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('vulns', 'vulns', 1, 0, 1000, NULL);
+                INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('vulns/CVE-1', 'CVE-1', 0, 23, 2000, '{\"severity\":\"critical\"}');
+                INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('vulns/CVE-2', 'CVE-2', 0, 10, 3000, '{\"severity\":\"high\"}');",
             )
             .unwrap();
 
@@ -740,34 +740,32 @@ mod tests {
         // Use schema helper, then parameterized inserts for special chars
         create_schema(&source).unwrap();
         source
-            .execute_batch("INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('root', '', 'root', 1, 0, 1000, NULL);")
+            .execute_batch("INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('root', 'root', 1, 0, 1000, NULL);")
             .unwrap();
 
-        // Insert nodes with real special characters via params
-        source
-            .execute(
-                "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES (?1, 'root', ?2, 0, 0, 2000, NULL)",
-                rusqlite::params!["root/tricky", "line1\nline2"],
-            )
-            .unwrap();
-        source
-            .execute(
-                "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES (?1, 'root', ?2, 0, 0, 3000, NULL)",
-                rusqlite::params!["root/bs", "back\\slash"],
-            )
-            .unwrap();
-        source
-            .execute(
-                "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES (?1, 'root', ?2, 0, 0, 4000, NULL)",
-                rusqlite::params!["root/qt", "has\"quote"],
-            )
-            .unwrap();
-        source
-            .execute(
-                "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES (?1, 'root', ?2, 0, 0, 5000, NULL)",
-                rusqlite::params!["root/tab", "col1\tcol2"],
-            )
-            .unwrap();
+        // Insert nodes with real special characters via params.
+        //
+        // The id is `root/{name}` rather than an unrelated slug: `parent_id` is
+        // derived as the id with its trailing `/{name}` removed, so a node whose
+        // name is not the last segment of its own id has no parent. That is the
+        // invariant every writer maintains by construction — `create_node`
+        // literally builds `format!("{parent}/{name}")` — and these rows now
+        // hold to it too. The special characters, which are what this test is
+        // actually about, are untouched.
+        for (mtime, name) in [
+            (2000, "line1\nline2"),
+            (3000, "back\\slash"),
+            (4000, "has\"quote"),
+            (5000, "col1\tcol2"),
+        ] {
+            source
+                .execute(
+                    "INSERT INTO nodes (id, name, kind, size, mtime, record) \
+                     VALUES (?1, ?2, 0, 0, ?3, NULL)",
+                    rusqlite::params![format!("root/{name}"), name, mtime],
+                )
+                .unwrap();
+        }
 
         let data = source.serialize("main").unwrap();
         let graph = SqliteGraph::from_bytes(data.as_ref()).unwrap();
@@ -776,40 +774,25 @@ mod tests {
 
         let mut buf = [0u8; 512];
 
-        // Test node with newline in name
-        let id = std::ffi::CString::new("root/tricky").unwrap();
+        // Each node is addressed by the id it was inserted under, `root/{name}`.
+        for name in ["line1\nline2", "back\\slash", "has\"quote", "col1\tcol2"] {
+            let id = std::ffi::CString::new(format!("root/{name}")).unwrap();
+            let n = unsafe { leyline_get_node(ctx, id.as_ptr(), buf.as_mut_ptr(), buf.len()) };
+            assert!(n > 0, "get_node should succeed for name {name:?}");
+            let json = std::str::from_utf8(&buf[..n as usize])?;
+            let parsed: serde_json::Value = serde_json::from_str(json)?;
+            assert_eq!(
+                parsed["name"], name,
+                "the special characters must survive JSON encoding: {json}"
+            );
+        }
+
+        // The newline specifically must be ESCAPED, not emitted raw — a raw
+        // newline would still parse here but breaks line-oriented consumers.
+        let id = std::ffi::CString::new("root/line1\nline2").unwrap();
         let n = unsafe { leyline_get_node(ctx, id.as_ptr(), buf.as_mut_ptr(), buf.len()) };
-        assert!(n > 0, "get_node should succeed for tricky name");
         let json = std::str::from_utf8(&buf[..n as usize])?;
-        // serde_json escapes \n as \\n in the JSON string
         assert!(json.contains(r#"\n"#), "newline should be escaped: {json}");
-        // Verify it parses as valid JSON and round-trips
-        let parsed: serde_json::Value = serde_json::from_str(json)?;
-        assert_eq!(parsed["name"], "line1\nline2");
-
-        // Test node with backslash in name
-        let id = std::ffi::CString::new("root/bs").unwrap();
-        let n = unsafe { leyline_get_node(ctx, id.as_ptr(), buf.as_mut_ptr(), buf.len()) };
-        assert!(n > 0);
-        let json = std::str::from_utf8(&buf[..n as usize])?;
-        let parsed: serde_json::Value = serde_json::from_str(json)?;
-        assert_eq!(parsed["name"], "back\\slash");
-
-        // Test node with quote in name
-        let id = std::ffi::CString::new("root/qt").unwrap();
-        let n = unsafe { leyline_get_node(ctx, id.as_ptr(), buf.as_mut_ptr(), buf.len()) };
-        assert!(n > 0);
-        let json = std::str::from_utf8(&buf[..n as usize])?;
-        let parsed: serde_json::Value = serde_json::from_str(json)?;
-        assert_eq!(parsed["name"], "has\"quote");
-
-        // Test node with tab in name
-        let id = std::ffi::CString::new("root/tab").unwrap();
-        let n = unsafe { leyline_get_node(ctx, id.as_ptr(), buf.as_mut_ptr(), buf.len()) };
-        assert!(n > 0);
-        let json = std::str::from_utf8(&buf[..n as usize])?;
-        let parsed: serde_json::Value = serde_json::from_str(json)?;
-        assert_eq!(parsed["name"], "col1\tcol2");
 
         // Test list_children also produces valid JSON with special chars
         let parent = std::ffi::CString::new("root").unwrap();

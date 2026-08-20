@@ -90,8 +90,17 @@ pub const IR_SCHEMA_VERSION: &str = "merkle-ast-v2";
 /// written before this existed — i.e. one with the per-node `_ast_pointer`
 /// table rather than the per-file `_ast_blob` map.
 ///
+/// `projection-v3` (from `projection-v2`): `nodes.parent_id` is no longer a
+/// stored column but a VIRTUAL generated one derived from `id` and `name`.
+/// Reads are unaffected — `SELECT parent_id`, `SELECT *` and
+/// `WHERE parent_id = ?` all behave as before, still index-backed. Two things
+/// DO change for a consumer: an INSERT that names `parent_id` is now rejected
+/// outright ("cannot INSERT into generated column"), and `pragma_table_info`
+/// no longer lists the column at all — only `pragma_table_xinfo` does. Any
+/// byte-identical DDL pin over `sqlite_master.sql` needs re-pinning.
+///
 /// Bump on ANY table added or removed, or column added or removed.
-pub const PROJECTION_SCHEMA_VERSION: &str = "projection-v2";
+pub const PROJECTION_SCHEMA_VERSION: &str = "projection-v3";
 
 pub const WIRE_FORMAT_MAJOR: u32 = 1;
 

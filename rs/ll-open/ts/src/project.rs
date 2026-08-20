@@ -44,7 +44,7 @@ pub fn project_ast_with_source(
 
     // Insert root directory node
     let root = tree.root_node();
-    insert_node(conn, "", "", "", 1, 0, mtime, "")?;
+    insert_node(conn, "", "", 1, 0, mtime, "")?;
     insert_ast(
         conn,
         "",
@@ -138,22 +138,13 @@ fn walk_children(
 
         if has_named_children {
             // Directory node — empty record
-            insert_node(conn, &id, parent_id, &name, 1, 0, mtime, "")?;
+            insert_node(conn, &id, &name, 1, 0, mtime, "")?;
             let mut sub_cursor = child.walk();
             walk_children(content, &mut sub_cursor, &id, mtime, conn, source_id)?;
         } else {
             // Leaf (file) node — record is plain text from source
             let text = child.utf8_text(content).unwrap_or("");
-            insert_node(
-                conn,
-                &id,
-                parent_id,
-                &name,
-                0,
-                text.len() as i64,
-                mtime,
-                text,
-            )?;
+            insert_node(conn, &id, &name, 0, text.len() as i64, mtime, text)?;
         }
     }
 

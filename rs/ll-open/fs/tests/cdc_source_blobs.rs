@@ -179,8 +179,7 @@ fn identical_content_in_nodes_and_source_blobs_shares_one_chunk_pool() {
     leyline_schema::create_nodes_table(&nodes_only).unwrap();
     nodes_only
         .execute(
-            "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) \
-             VALUES ('f.txt', '', 'f.txt', 0, ?1, 7, ?2)",
+            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('f.txt', 'f.txt', 0, ?1, 7, ?2)",
             params![content.len() as i64, text],
         )
         .unwrap();
@@ -193,8 +192,7 @@ fn identical_content_in_nodes_and_source_blobs_shares_one_chunk_pool() {
     leyline_schema::create_nodes_table(&dual).unwrap();
     leyline_ts::schema::create_source_blobs_table(&dual).unwrap();
     dual.execute(
-        "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) \
-         VALUES ('f.txt', '', 'f.txt', 0, ?1, 7, ?2)",
+        "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('f.txt', 'f.txt', 0, ?1, 7, ?2)",
         params![content.len() as i64, text],
     )
     .unwrap();
@@ -247,8 +245,7 @@ fn switching_targets_reports_the_abandoned_index_as_stranded() {
 
     let text = "abcdefghij".repeat(1024);
     conn.execute(
-        "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) \
-         VALUES ('f.txt', '', 'f.txt', 0, ?1, 7, ?2)",
+        "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('f.txt', 'f.txt', 0, ?1, 7, ?2)",
         params![text.len() as i64, text],
     )
     .unwrap();

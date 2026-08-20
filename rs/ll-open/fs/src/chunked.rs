@@ -2253,8 +2253,7 @@ mod tests {
         // unnoticed (bead `ley-line-open-f7966d`).
         leyline_schema::create_nodes_table(conn).unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO nodes (id, parent_id, name, kind, size, mtime, record) \
-             VALUES (?1, '', ?1, 0, ?2, 1, ?3)",
+            "INSERT OR REPLACE INTO nodes (id, name, kind, size, mtime, record) VALUES (?1, ?1, 0, ?2, 1, ?3)",
             params![id, content.len() as i64, content],
         )
         .unwrap();
@@ -2530,8 +2529,7 @@ mod tests {
         let old_record = String::from_utf8(old.clone()).unwrap();
         reader
             .execute(
-                "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) \
-                 VALUES ('n', '', 'n', 0, ?1, 1, ?2)",
+                "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('n', 'n', 0, ?1, 1, ?2)",
                 params![i64::try_from(old.len()).unwrap(), old_record],
             )
             .unwrap();

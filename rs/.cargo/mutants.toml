@@ -72,4 +72,38 @@ exclude_re = [
     # baked-in number would lose the `files × rows_per_file` shape that says
     # why the number is what it is.
     'cmd_parse\.rs.*replace \* with (\+|/) in parse_into_conn',
+    # `verify_head`'s `kid_hit` fast path, mutated two ways: `delete !` on
+    # `!kid.is_empty()`, and `==` -> `!=` on the canonical-kid comparison.
+    #
+    # Both are equivalent, and for the same one-line reason. The verdict is
+    #
+    #     if kid_hit || trusted.iter().any(&verifies) { Valid } else { Invalid }
+    #
+    # and `kid_hit` IMPLIES the right-hand disjunct: `kid_hit` can only be true
+    # if some key drawn from `trusted` satisfied `verifies`, and that same key
+    # makes `trusted.iter().any(&verifies)` true. A disjunct that implies its
+    # neighbour cannot change the disjunction. So `kid_hit || any` is
+    # `any` for every input, and ANY mutation of how `kid_hit` is computed
+    # leaves the verdict identical.
+    #
+    # Neither mutation escapes that. Both only change WHICH trusted keys the
+    # filter admits — the iterator is over `trusted` either way, and `.any(&
+    # verifies)` still demands a real signature verification, so neither can
+    # make `kid_hit` true without a key that would have verified anyway.
+    # `verify_head` returns the verdict and nothing else, and `verifies` is a
+    # pure closure over `RootSigner::verify`, so there is no other channel to
+    # observe.
+    #
+    # This is the R1 property the code comment above the expression states
+    # outright: "kid only *orders* the attempt ... kid is never the sole
+    # selector." A spoofed or absent kid can neither admit an untrusted signer
+    # nor exclude a trusted one. Mutation testing cannot see an ordering
+    # optimisation, and a test that could distinguish these would be asserting
+    # that kid IS load-bearing — the opposite of the security property.
+    #
+    # NOT "inconvenient to test": there is no behavioural difference to assert
+    # on. Restructuring does not help either — collapsing the fast path away
+    # would remove the mutants by removing the optimisation, and hoisting it
+    # into a helper only relocates them.
+    'root_signer\.rs.*(delete ! in verify_head|replace == with != in verify_head)',
 ]

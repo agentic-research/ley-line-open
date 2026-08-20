@@ -29,6 +29,49 @@ The living database is the union of tables owned by independent enrichment
 layers. Each layer owns a disjoint set of tables — no two layers write to
 the same table. This is the **Schema Partition Invariant**.
 
+## Who READS each table (measured, 2026-08-19)
+
+This document has always recorded which layer OWNS and WRITES each table — the
+Schema Partition Invariant below. It recorded nothing about who READS them, and
+that asymmetry has cost real design time: the node-key work (bead
+`ley-line-open-17c271`) had to reconstruct the read surface by grepping a
+consumer repo, and the consumer had to answer four questions LLO could not
+answer about its own ABI. A producer contract is only half a contract.
+
+Counts are non-test, non-writer `FROM`/`JOIN` references at the stated commit.
+They are a floor, not an audit: dynamic SQL and consumers outside this
+workspace are invisible to them. Re-derive rather than trust when it matters.
+
+| Table | LLO readers | Notes |
+|-------|------------:|-------|
+| `nodes` | 41+ | Filesystem projection (`fs/src/graph.rs`), `ts/pyproject.rs`, `ll-core/schema`. Load-bearing for mount — NOT droppable. |
+| `_ast` | 34 | `fs/src/graph.rs`, `ts/src/splice.rs`, `lsp/src/project.rs`, `daemon/ops.rs`. `find_definition` stopped needing it at `projection-v3`, but the mount and splice paths still read it directly. |
+| `node_defs` / `node_refs` | 32 | The symbol layer. Also the agent-facing one: `find_definition` returns `node_id` STRINGS straight through MCP, so these ids are user-visible output, not an internal key. |
+| `source_blobs` | 11 | |
+| `node_content` | **0** | No SELECT anywhere. Survives as the FK target of `node_defs`/`node_refs.node_hash`. |
+| `node_child` | **0** | No SELECT, and nothing FKs into it. 3.41M rows / 405 MB on an 8000-file arena. |
+| `capnp_blobs` | **0** | No SELECT. Load-bearing only for the ADR-0026 §6.F1 resolution capability via `_ast_blob`. |
+| `_ast_blob` | **0** | Same — written and gated by F1, not queried. |
+
+A zero here means "nothing in this workspace SELECTs it", which is not the same
+as "safe to delete": three of the four zeros are load-bearing for an FK or an
+ADR-stated capability. It does mean the row count is not being paid for a query.
+
+### Known external consumers
+
+mache reads this projection directly (no cgo) and is the reason several of these
+columns exist. Its measured dependencies, as of `mache-93e84b`:
+
+- `node_id` is rendered to agents through MCP (`find_definition`, `get_impact`,
+  `get_dataflow`). Any change to its shape must retain a way to reconstruct the
+  displayed path.
+- `parent_id` has ~50 non-test references, dominated by `WHERE parent_id = ?` —
+  direct-child listing, which backs every `list_directory`. Depth-1 is NOT
+  derivable from byte spans, so this cannot become an inferred relation.
+- `internal/fixturedb/schema_leyline.go` pins this DDL byte-identically and has
+  a conformance test, so any column change here surfaces there as drift at
+  whatever release mache re-pins to.
+
 ## Layer Ownership
 
 ### Tree-sitter (base layer, LLO)
@@ -40,8 +83,8 @@ Produced by `parse_into_conn`. Always present.
 | `nodes` | Hierarchical node tree (id, parent_id, name, kind, size, record) |
 | `_ast` | AST positions (node_id → source_id, node_kind, byte/row/col ranges) |
 | `_source` | Source file metadata (id → language, abs path) |
-| `node_refs` | Token references (token → node_id, source_id, node_hash, container_node_id, qualifier). `qualifier` (v0.7.9, bead `ley-line-open-4dde42`) = receiver/selector text on the BARE-token row of a qualified call's dual-emit pair (`fmt.Println(..)` → the `Println` row carries `'fmt'`); NULL on the qualified-token row and on bare calls — one row per qualified call site carries the structural (name, qualifier) pair. |
-| `node_defs` | Token definitions (token → node_id, source_id, node_hash, container_node_id, canonical_kind). No `qualifier` column — qualified defs stay token-only dual-emits (`Server.Validate` + `Validate`). |
+| `node_refs` | Token references (token → node_id, source_id, node_hash, container_node_id, qualifier, and since `projection-v3` the occurrence's own `node_kind` + `start_byte`/`end_byte`/`start_row`/`start_col`/`end_row`/`end_col`). `qualifier` (v0.7.9, bead `ley-line-open-4dde42`) = receiver/selector text on the BARE-token row of a qualified call's dual-emit pair (`fmt.Println(..)` → the `Println` row carries `'fmt'`); NULL on the qualified-token row and on bare calls — one row per qualified call site carries the structural (name, qualifier) pair. |
+| `node_defs` | Token definitions (token → node_id, source_id, node_hash, container_node_id, canonical_kind, and since `projection-v3` the occurrence's own `node_kind` + span columns as on `node_refs`). The span is carried here rather than JOINed from `_ast` — SCIP's `Occurrence` shape — which is what lets `find_definition` answer without touching the 3.15M-row AST table (bead `ley-line-open-b4509b`). NULL span means the locator has no `_ast` row (injected nodes), exactly as the prior LEFT JOIN yielded. No `qualifier` column — qualified defs stay token-only dual-emits (`Server.Validate` + `Validate`). |
 | `_imports` | Import statements (alias, path, source_id) |
 | `_file_index` | Incremental parse index (path → mtime, size) |
 | `_meta` | Key-value metadata (source_root, parse_time, version vectors) |
@@ -58,7 +101,7 @@ Produced by `parse_into_conn`. Always present.
 | Table | Purpose |
 |-------|---------|
 | `capnp_blobs` | Content-addressed blob store — `blob_hash BLOB PRIMARY KEY`, `blob_bytes BLOB`. |
-| `_ast_pointer` | Row-per-AstNode index into `capnp_blobs.blob_bytes[offset_in_blob]`. `kind INTEGER` = semantic tag per ADR-0026 §2.1. |
+| `_ast_blob` | File-to-blob map — `source_id TEXT PRIMARY KEY`, `blob_hash BLOB`. ONE row per source file. Replaced the row-per-AstNode `_ast_pointer` in `projection-v2` (bead `ley-line-open-17c271`): that table carried a node_id and source_id already on the `_ast` row, a blob_hash with only 8000 distinct values across 3.15M rows, and an offset that was provably the dense array index — ~294 bytes to address a ~370-byte record. The offset now rides on `_ast.blob_ord`; resolution is `source_id → blob_hash`, indexed at `blob_ord`. |
 
 **Source blobs** (added v0.6.0 per ADR-0028 Phase 1 dual-store):
 

@@ -2403,12 +2403,16 @@ fn op_inspect_symbol(
 
 /// SQL: node_defs ⋈ _ast for definition rows with full location info.
 fn query_definitions(conn: &Connection, token: &str) -> Result<Vec<DefRow>> {
+    // Reads the occurrence's own span. This used to LEFT JOIN `_ast` purely
+    // to recover position — the join that forced the 3.15M-row `_ast` table to
+    // be materialised eagerly so a 337k-row question could be answered
+    // (bead `ley-line-open-b4509b`). NULL span still means "no `_ast` row",
+    // which is what the LEFT JOIN yielded for injected nodes.
     let sql = "\
-        SELECT d.node_id, d.source_id, a.node_kind, \
-               a.start_row, a.start_col, a.end_row, a.end_col, \
-               a.start_byte, a.end_byte \
+        SELECT d.node_id, d.source_id, d.node_kind, \
+               d.start_row, d.start_col, d.end_row, d.end_col, \
+               d.start_byte, d.end_byte \
         FROM node_defs d \
-        LEFT JOIN _ast a ON a.node_id = d.node_id AND a.source_id = d.source_id \
         WHERE d.token = ?1";
     let mut stmt = conn.prepare_cached(sql)?;
     let rows: Vec<DefRow> = stmt
@@ -2565,14 +2569,14 @@ fn op_at_position(ctx: &std::sync::Arc<DaemonContext>, p: &LspPosition) -> Resul
         // `find_node_at_position` (the LSP-hover internal helper)
         // would otherwise force.
         let sql = "\
-            SELECT d.token, a.node_kind \
+            SELECT d.token, d.node_kind \
             FROM node_defs d \
-            JOIN _ast a ON a.node_id = d.node_id AND a.source_id = d.source_id \
-            WHERE a.source_id = ?1 \
-              AND a.start_row <= ?2 AND a.end_row >= ?2 \
-              AND (a.start_row < ?2 OR a.start_col <= ?3) \
-              AND (a.end_row > ?2 OR a.end_col >= ?3) \
-            ORDER BY (a.end_byte - a.start_byte) ASC \
+            WHERE d.source_id = ?1 \
+              AND d.start_row IS NOT NULL \
+              AND d.start_row <= ?2 AND d.end_row >= ?2 \
+              AND (d.start_row < ?2 OR d.start_col <= ?3) \
+              AND (d.end_row > ?2 OR d.end_col >= ?3) \
+            ORDER BY (d.end_byte - d.start_byte) ASC \
             LIMIT 1";
         let row: Option<(String, String)> =
             query_row_opt(conn, sql, rusqlite::params![file, line, col], |r| {
@@ -2861,9 +2865,8 @@ fn op_search_symbols(
         // collapses duplicate (token, node_id, source_id) tuples
         // that can arise from re-indexing.
         let sql = "\
-            SELECT DISTINCT d.token, d.node_id, d.source_id, a.node_kind \
+            SELECT DISTINCT d.token, d.node_id, d.source_id, d.node_kind \
             FROM node_defs d \
-            LEFT JOIN _ast a ON a.node_id = d.node_id AND a.source_id = d.source_id \
             WHERE d.token GLOB ?1 \
             ORDER BY d.token \
             LIMIT ?2";
@@ -3422,6 +3425,33 @@ mod tests {
         // not be called state-changing (avoids spurious events).
         assert!(!is_state_changing("nonexistent_op"));
         assert!(!is_state_changing(""));
+    }
+
+    /// Mirror `_ast` spans onto the occurrence rows, the way a real parse does
+    /// in one pass.
+    ///
+    /// Fixtures here hand-write `_ast` because it reads clearly, but since
+    /// `projection-v3` the span lives ON `node_defs` / `node_refs` and the
+    /// query no longer JOINs `_ast` to find it (bead `ley-line-open-b4509b`).
+    /// A hand-built arena that populates only `_ast` is a v2 arena, and asking
+    /// v3 questions of it returns NULL kinds and no positions — which is the
+    /// real consumer contract, not a test artifact. This helper makes the
+    /// fixtures produce a v3 arena rather than papering over the difference in
+    /// the query.
+    fn backfill_occurrence_spans(conn: &Connection) {
+        for table in ["node_defs", "node_refs"] {
+            conn.execute_batch(&format!(
+                "UPDATE {table} SET \
+                   node_kind  = (SELECT a.node_kind  FROM _ast a WHERE a.node_id = {table}.node_id AND a.source_id = {table}.source_id), \
+                   start_byte = (SELECT a.start_byte FROM _ast a WHERE a.node_id = {table}.node_id AND a.source_id = {table}.source_id), \
+                   end_byte   = (SELECT a.end_byte   FROM _ast a WHERE a.node_id = {table}.node_id AND a.source_id = {table}.source_id), \
+                   start_row  = (SELECT a.start_row  FROM _ast a WHERE a.node_id = {table}.node_id AND a.source_id = {table}.source_id), \
+                   start_col  = (SELECT a.start_col  FROM _ast a WHERE a.node_id = {table}.node_id AND a.source_id = {table}.source_id), \
+                   end_row    = (SELECT a.end_row    FROM _ast a WHERE a.node_id = {table}.node_id AND a.source_id = {table}.source_id), \
+                   end_col    = (SELECT a.end_col    FROM _ast a WHERE a.node_id = {table}.node_id AND a.source_id = {table}.source_id)"
+            ))
+            .expect("backfill occurrence spans");
+        }
     }
 
     #[tokio::test]
@@ -5368,6 +5398,7 @@ mod tests {
                    ('Helper', 'pkg/Helper', 'helper.go');",
             )
             .expect("seed test data");
+            backfill_occurrence_spans(&live);
         }
 
         let response =
@@ -5504,6 +5535,7 @@ mod tests {
                     150, 250, 7, 0, 9, 1);",
             )
             .expect("seed test data");
+            backfill_occurrence_spans(&live);
         }
 
         // Row 12 is outside Helper but inside SendOp → SendOp wins.
@@ -5565,6 +5597,7 @@ mod tests {
                    ('Bar', 'pkg/Foo', 'pkg.go');",
             )
             .expect("seed test data");
+            backfill_occurrence_spans(&live);
         }
 
         let response =
@@ -5643,6 +5676,7 @@ mod tests {
                    ('A', 'pkg/C', 'pkg.go');",
             )
             .expect("seed test data");
+            backfill_occurrence_spans(&live);
         }
 
         let response = handle_base_op_legacy(
@@ -5716,6 +5750,7 @@ mod tests {
                     0, 100, 1, 0, 10, 1);",
             )
             .expect("seed test data");
+            backfill_occurrence_spans(&live);
         }
 
         // Step 1: at_position → symbol_id
@@ -5789,6 +5824,7 @@ mod tests {
                    ('pkg/Receive',   'pkg.go', 'function_declaration', 100, 150, 11, 0, 15, 0);",
             )
             .expect("seed test data");
+            backfill_occurrence_spans(&live);
         }
 
         let response =
@@ -5837,6 +5873,7 @@ mod tests {
                    ('Match5', 'pkg/Match5', 'pkg.go');",
             )
             .expect("seed test data");
+            backfill_occurrence_spans(&live);
         }
 
         let response = handle_base_op_legacy(
@@ -5874,6 +5911,7 @@ mod tests {
                    ('pkg/FooConst',  'pkg.go', 'const_declaration',    100, 150, 11, 0, 15, 0);",
             )
             .expect("seed test data");
+            backfill_occurrence_spans(&live);
         }
 
         let response = handle_base_op_legacy(

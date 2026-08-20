@@ -52,9 +52,10 @@ use leyline_ts::query_engine::QuerySet;
 use leyline_ts::refs::{ExtractedRef, current_extraction_epoch, extract_refs_resolved};
 use leyline_ts::schema::{
     create_ast_tables, create_index_schema, create_ir_indexes, create_ir_tables,
-    create_pointer_store_tables, create_post_load_indexes_skip_unused, create_qualifier_column,
-    create_query_blob_tables, create_refs_tables, create_source_blobs_table, delete_file_rows,
-    get_meta, read_file_index, set_meta, sweep_orphaned_dirs,
+    create_occurrence_span_columns, create_pointer_store_tables,
+    create_post_load_indexes_skip_unused, create_qualifier_column, create_query_blob_tables,
+    create_refs_tables, create_source_blobs_table, delete_file_rows, get_meta, read_file_index,
+    set_meta, sweep_orphaned_dirs,
 };
 use rayon::prelude::*;
 use rusqlite::Connection;
@@ -561,11 +562,11 @@ batch_table! {
     // NULL on the qualified-token row and on genuinely bare calls.
     RefBatch, RefRow,
     "",
-    6,
-    push_fn: (token: String, node_id: String, source_id: String, node_hash: Option<Vec<u8>>, container_node_id: Option<String>, qualifier: Option<String>),
-    push_body: { RefRow { token, node_id, source_id, node_hash, container_node_id, qualifier } },
+    13,
+    push_fn: (token: String, node_id: String, source_id: String, node_hash: Option<Vec<u8>>, container_node_id: Option<String>, qualifier: Option<String>, node_kind: Option<String>, start_byte: Option<i64>, end_byte: Option<i64>, start_row: Option<i64>, start_col: Option<i64>, end_row: Option<i64>, end_col: Option<i64>),
+    push_body: { RefRow { token, node_id, source_id, node_hash, container_node_id, qualifier, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col } },
     flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 6);
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 13);
         for r in chunk {
             out.push(&r.token);
             out.push(&r.node_id);
@@ -573,6 +574,13 @@ batch_table! {
             out.push(&r.node_hash);
             out.push(&r.container_node_id);
             out.push(&r.qualifier);
+            out.push(&r.node_kind);
+            out.push(&r.start_byte);
+            out.push(&r.end_byte);
+            out.push(&r.start_row);
+            out.push(&r.start_col);
+            out.push(&r.end_row);
+            out.push(&r.end_col);
         }
         out
     },
@@ -580,8 +588,8 @@ batch_table! {
 
 impl RefBatch {
     fn flush_batched_for(&mut self, conn: &Connection, prefix: &str) -> Result<()> {
-        flush_in_batches(conn, &mut self.rows, prefix, 6, |chunk| {
-            let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 6);
+        flush_in_batches(conn, &mut self.rows, prefix, 13, |chunk| {
+            let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 13);
             for r in chunk {
                 out.push(&r.token);
                 out.push(&r.node_id);
@@ -589,6 +597,13 @@ impl RefBatch {
                 out.push(&r.node_hash);
                 out.push(&r.container_node_id);
                 out.push(&r.qualifier);
+                out.push(&r.node_kind);
+                out.push(&r.start_byte);
+                out.push(&r.end_byte);
+                out.push(&r.start_row);
+                out.push(&r.start_col);
+                out.push(&r.end_row);
+                out.push(&r.end_col);
             }
             out
         })
@@ -604,18 +619,19 @@ batch_table! {
     // container_node_id) shape as refs, plus `canonical_kind`.
     DefBatch, DefRow,
     "",
-    6,
+    13,
     push_fn: (
         token: String,
         node_id: String,
         source_id: String,
         node_hash: Option<Vec<u8>>,
         container_node_id: Option<String>,
-        canonical_kind: Option<&'static str>
+        canonical_kind: Option<&'static str>,
+        node_kind: Option<String>, start_byte: Option<i64>, end_byte: Option<i64>, start_row: Option<i64>, start_col: Option<i64>, end_row: Option<i64>, end_col: Option<i64>
     ),
-    push_body: { DefRow { token, node_id, source_id, node_hash, container_node_id, canonical_kind } },
+    push_body: { DefRow { token, node_id, source_id, node_hash, container_node_id, canonical_kind, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col } },
     flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 6);
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 13);
         for r in chunk {
             out.push(&r.token);
             out.push(&r.node_id);
@@ -623,6 +639,13 @@ batch_table! {
             out.push(&r.node_hash);
             out.push(&r.container_node_id);
             out.push(&r.canonical_kind);
+            out.push(&r.node_kind);
+            out.push(&r.start_byte);
+            out.push(&r.end_byte);
+            out.push(&r.start_row);
+            out.push(&r.start_col);
+            out.push(&r.end_row);
+            out.push(&r.end_col);
         }
         out
     },
@@ -630,8 +653,8 @@ batch_table! {
 
 impl DefBatch {
     fn flush_batched_for(&mut self, conn: &Connection, prefix: &str) -> Result<()> {
-        flush_in_batches(conn, &mut self.rows, prefix, 6, |chunk| {
-            let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 6);
+        flush_in_batches(conn, &mut self.rows, prefix, 13, |chunk| {
+            let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 13);
             for r in chunk {
                 out.push(&r.token);
                 out.push(&r.node_id);
@@ -639,6 +662,13 @@ impl DefBatch {
                 out.push(&r.node_hash);
                 out.push(&r.container_node_id);
                 out.push(&r.canonical_kind);
+                out.push(&r.node_kind);
+                out.push(&r.start_byte);
+                out.push(&r.end_byte);
+                out.push(&r.start_row);
+                out.push(&r.start_col);
+                out.push(&r.end_row);
+                out.push(&r.end_col);
             }
             out
         })
@@ -902,6 +932,9 @@ pub fn parse_into_conn(
     // transaction — the extraction-epoch bump forces those arenas to
     // re-derive facts, and the re-derive INSERT names the column.
     create_qualifier_column(conn)?;
+    // projection-v3: the span columns the occurrence rows now carry. Must run
+    // before the insert transaction — the INSERT names them.
+    create_occurrence_span_columns(conn)?;
     // Merkle-AST IR (ADR-0027): create node_content/node_child and stamp the
     // additive node_hash column onto _ast/node_defs/node_refs. Must run after
     // the occurrence tables exist (the ALTER targets) and before the insert
@@ -1460,6 +1493,23 @@ pub fn parse_into_conn(
                         hash_by_id.insert(id.as_str(), *h);
                     }
 
+                    // node_id -> the `_ast` entry, so an occurrence row can
+                    // carry its OWN span and grammar kind instead of the
+                    // consumer JOINing `_ast` to recover them
+                    // (bead `ley-line-open-b4509b`).
+                    //
+                    // Built only from `ast_entries`, deliberately: injected
+                    // nodes (`ley-line-open-c822a6`) appear in `hash_by_id`
+                    // but have no `_ast` row, so they resolve to None here and
+                    // their span columns stay NULL — exactly what the LEFT
+                    // JOIN this replaces produced for them.
+                    let mut entry_by_id: HashMap<&str, &AstEntry> =
+                        HashMap::with_capacity(pf.ast_entries.len());
+                    for a in &pf.ast_entries {
+                        entry_by_id.insert(a.node_id.as_str(), a);
+                    }
+                    let span_of = |id: &str| OccurrenceSpan::of(entry_by_id.get(id).copied());
+
                     // `blob_ord` is this entry's index in the file's
                     // `AstNodeList.nodes` — the same `enumerate()` order
                     // `serialize_ast_node_list_record` wrote. Carrying it on
@@ -1504,6 +1554,7 @@ pub fn parse_into_conn(
                                 qualifier,
                             } => {
                                 let nh = hash_by_id.get(node_id.as_str()).map(|h| h.to_vec());
+                                let sp = span_of(node_id.as_str());
                                 refs_buf.push(
                                     token,
                                     node_id,
@@ -1511,6 +1562,13 @@ pub fn parse_into_conn(
                                     nh,
                                     container_node_id,
                                     qualifier,
+                                    sp.node_kind,
+                                    sp.start_byte,
+                                    sp.end_byte,
+                                    sp.start_row,
+                                    sp.start_col,
+                                    sp.end_row,
+                                    sp.end_col,
                                 );
                             }
                             ExtractedRef::Def {
@@ -1521,6 +1579,7 @@ pub fn parse_into_conn(
                                 canonical_kind,
                             } => {
                                 let nh = hash_by_id.get(node_id.as_str()).map(|h| h.to_vec());
+                                let sp = span_of(node_id.as_str());
                                 defs_buf.push(
                                     token,
                                     node_id,
@@ -1528,6 +1587,13 @@ pub fn parse_into_conn(
                                     nh,
                                     container_node_id,
                                     canonical_kind,
+                                    sp.node_kind,
+                                    sp.start_byte,
+                                    sp.end_byte,
+                                    sp.start_row,
+                                    sp.start_col,
+                                    sp.end_row,
+                                    sp.end_col,
                                 );
                             }
                             ExtractedRef::Import {
@@ -1579,11 +1645,11 @@ pub fn parse_into_conn(
         source_buf.flush_batched(conn)?;
         refs_buf.flush_batched_for(
         conn,
-        "INSERT INTO node_refs (token, node_id, source_id, node_hash, container_node_id, qualifier) VALUES ",
+        "INSERT INTO node_refs (token, node_id, source_id, node_hash, container_node_id, qualifier, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col) VALUES ",
     )?;
         defs_buf.flush_batched_for(
         conn,
-        "INSERT INTO node_defs (token, node_id, source_id, node_hash, container_node_id, canonical_kind) VALUES ",
+        "INSERT INTO node_defs (token, node_id, source_id, node_hash, container_node_id, canonical_kind, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col) VALUES ",
     )?;
         imports_buf.flush_batched(conn)?;
         file_idx_buf.flush_batched(conn)?;
@@ -2576,6 +2642,49 @@ fn hash_internal(kind: &str, child_hashes: &[[u8; 32]]) -> [u8; 32] {
 // ---------------------------------------------------------------------------
 // Pure file parser (no Connection — safe for rayon)
 // ---------------------------------------------------------------------------
+
+/// The span and grammar kind an occurrence row carries in its own columns,
+/// denormalised from the matching `_ast` entry.
+///
+/// Every field is `None` together when the ref/def locator has no `_ast` row.
+/// That is not missing data: injected nodes (bead `ley-line-open-c822a6`) have
+/// facts but no `_ast` row, so the LEFT JOIN this denormalisation replaces
+/// yielded NULLs for them, and preserving NULL keeps their behaviour identical
+/// rather than inventing coordinates in the host file's space.
+struct OccurrenceSpan {
+    node_kind: Option<String>,
+    start_byte: Option<i64>,
+    end_byte: Option<i64>,
+    start_row: Option<i64>,
+    start_col: Option<i64>,
+    end_row: Option<i64>,
+    end_col: Option<i64>,
+}
+
+impl OccurrenceSpan {
+    fn of(entry: Option<&AstEntry>) -> Self {
+        match entry {
+            Some(a) => Self {
+                node_kind: Some(a.node_kind.clone()),
+                start_byte: Some(a.start_byte as i64),
+                end_byte: Some(a.end_byte as i64),
+                start_row: Some(a.start_row as i64),
+                start_col: Some(a.start_col as i64),
+                end_row: Some(a.end_row as i64),
+                end_col: Some(a.end_col as i64),
+            },
+            None => Self {
+                node_kind: None,
+                start_byte: None,
+                end_byte: None,
+                start_row: None,
+                start_col: None,
+                end_row: None,
+                end_col: None,
+            },
+        }
+    }
+}
 
 /// Parse a single file into a `ParsedFile`. No database access.
 ///
@@ -3860,15 +3969,6 @@ mod tests {
         assert_eq!(chunk_count_for(PARSE_CHUNK_FILES * 3), 3);
     }
 
-    /// `rows_per_batch` is the only thing keeping a multi-row INSERT under
-    /// SQLite's bound-parameter ceiling. Stubbing it to `1`, or flipping its
-    /// division to a multiplication, left every test passing: a batch of 1 is
-    /// merely slow, and an oversized batch only fails at RUNTIME on the widest
-    /// table. Both survived as mutants on bead `ley-line-open-17c271`.
-    ///
-    /// The load-bearing assertion is the invariant, not any single value —
-    /// that is what stays true when a column is added to any table.
-
     /// `flush_in_batches` walks `i` forward one batch at a time and flushes a
     /// short tail. Nothing exercised that walk: every existing test flushes
     /// far fewer rows than one batch, so the loop body ran at most once and
@@ -3881,6 +3981,100 @@ mod tests {
     ///
     /// Sized `BULK_BATCH_ROWS * 2 + 1` so the loop runs twice AND leaves a
     /// one-row tail, covering both the full-batch path and the partial one.
+
+    /// `node_defs` / `node_refs` now carry their own span and grammar kind, so
+    /// `query_definitions` reads them directly instead of LEFT JOINing `_ast`.
+    /// That join was the reason the 3.15M-row `_ast` table had to be
+    /// materialised eagerly to answer a 337k-row question
+    /// (bead `ley-line-open-b4509b`).
+    ///
+    /// The contract is EQUIVALENCE, not merely "a span is present": every
+    /// occurrence row must carry exactly what the old join would have yielded,
+    /// including NULL where there is no `_ast` row. Injected nodes
+    /// (`ley-line-open-c822a6`) are precisely that case — they have refs but no
+    /// `_ast` row, so the LEFT JOIN produced NULLs and the denormalised columns
+    /// must too, rather than inventing coordinates in the host file's space.
+    #[test]
+    fn occurrence_spans_equal_what_the_ast_join_would_have_returned() {
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        // Plain Go: every ref/def locator has an `_ast` row.
+        std::fs::write(
+            root.join("plain.go"),
+            b"package plain\n\nfunc Alpha() {}\n\nfunc Beta() { Alpha() }\n",
+        )
+        .unwrap();
+        // SQL injected into a Go string literal: refs with NO `_ast` row.
+        std::fs::write(
+            root.join("inj.go"),
+            b"package inj\n\nimport \"database/sql\"\n\nfunc Load(db *sql.DB) {\n\trows, _ := db.Query(\"SELECT id FROM users JOIN orgs ON orgs.id = users.org_id\")\n\t_ = rows\n}\n",
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        parse_into_conn(&conn, root, None, None).unwrap();
+
+        // `IS NOT` is null-safe in SQLite, so this counts genuine divergence
+        // including NULL-vs-value on either side.
+        for table in ["node_defs", "node_refs"] {
+            let sql = format!(
+                "SELECT COUNT(*) FROM {table} o \
+                 LEFT JOIN _ast a ON a.node_id = o.node_id AND a.source_id = o.source_id \
+                 WHERE o.node_kind IS NOT a.node_kind \
+                    OR o.start_byte IS NOT a.start_byte OR o.end_byte IS NOT a.end_byte \
+                    OR o.start_row IS NOT a.start_row OR o.start_col IS NOT a.start_col \
+                    OR o.end_row IS NOT a.end_row OR o.end_col IS NOT a.end_col"
+            );
+            let diverged: i64 = conn.query_row(&sql, [], |r| r.get(0)).unwrap();
+            assert_eq!(
+                diverged, 0,
+                "{table}: denormalised span must equal the `_ast` join result on every row"
+            );
+        }
+
+        // The populated case must actually be exercised, or the equivalence
+        // above is satisfied trivially by everything being NULL.
+        let populated: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_defs WHERE start_byte IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            populated > 0,
+            "the fixture must produce defs WITH spans, otherwise this test \
+             passes on an empty projection"
+        );
+
+        // And the NULL case must be exercised too: injected refs have no `_ast`
+        // row, and the count must agree exactly with the join's own view.
+        let null_spans: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_refs WHERE start_byte IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let no_ast_row: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_refs r \
+                 LEFT JOIN _ast a ON a.node_id = r.node_id AND a.source_id = r.source_id \
+                 WHERE a.node_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            null_spans, no_ast_row,
+            "a NULL span must mean exactly `no _ast row` — no more, no fewer"
+        );
+        assert!(
+            null_spans > 0,
+            "the injected-SQL fixture must produce refs with no `_ast` row, or \
+             the NULL-preservation half of the contract is untested"
+        );
+    }
     #[test]
     fn flush_in_batches_lands_every_row_across_batch_boundaries() {
         let conn = Connection::open_in_memory().unwrap();
@@ -3924,6 +4118,14 @@ mod tests {
              once per chunk and relies on it keeping its allocation"
         );
     }
+    /// `rows_per_batch` is the only thing keeping a multi-row INSERT under
+    /// SQLite's bound-parameter ceiling. Stubbing it to `1`, or flipping its
+    /// division to a multiplication, left every test passing: a batch of 1 is
+    /// merely slow, and an oversized batch only fails at RUNTIME on the widest
+    /// table. Both survived as mutants on bead `ley-line-open-17c271`.
+    ///
+    /// The load-bearing assertion is the invariant, not any single value —
+    /// that is what stays true when a column is added to any table.
     #[test]
     fn rows_per_batch_never_exceeds_the_bound_parameter_ceiling() {
         for cols in 1..=64usize {

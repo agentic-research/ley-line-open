@@ -228,13 +228,20 @@ run_slice() {
 # behind non-default features, it needs the same routing — a default-features
 # run structurally cannot test it.
 if [ "$SCOPE" = all ]; then
-    # `refs.rs` contains HCL extraction behind an optional grammar feature.
-    # Keep HCL enabled in the generic slice: without it, cargo-mutants can
-    # mutate the feature-gated lines while compiling them out, which reports
-    # false surviving mutants. The tiny grammar adds coverage without changing
-    # the default-feature contract exercised by the rest of this invocation.
+    # `refs.rs` contains HCL extraction behind an optional grammar feature, and
+    # `pyproject.rs` is behind `pyproject`. Keep both enabled in the generic
+    # slice: without the feature, cargo-mutants mutates the gated lines while
+    # compiling them OUT, so every mutant in that module survives having tested
+    # nothing. That is a false survivor, not a missing test — the module's own
+    # `#[cfg(test)]` tests kill it the moment the feature is on.
+    #
+    # `pyproject` was added after `project_pyproject_into -> Ok(())` survived a
+    # slice in which `leyline-ts` compiled 73 tests; with the feature it is 184
+    # and four of them assert the projected rows directly. This is the routing
+    # the comment above already prescribed, applied to the second crate to need
+    # it. Any future non-default feature hiding covered code belongs here too.
     run_slice lib \
-        --features hcl \
+        --features hcl,pyproject \
         --exclude 'll-open/fs/**' \
         --exclude 'll-open/runtime/**' \
         --exclude 'll-open/cli-lib/**' \

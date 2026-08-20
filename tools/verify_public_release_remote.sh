@@ -9,10 +9,18 @@ fi
 version=$1
 repo_root=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 module=github.com/agentic-research/ley-line-open/clients/go/leyline-schema
+schema_version=$(sed -nE \
+    's/^pub const SCHEMA_VERSION: &str = "([^"]+)";/\1/p' \
+    "$repo_root/rs/ll-open/cli-lib/src/daemon/version.rs")
 # shellcheck source=tools/release_common.sh
 . "$repo_root/tools/release_common.sh"
 
 release_validate_version "$version"
+if [ -z "$schema_version" ]; then
+    echo "could not read SCHEMA_VERSION" >&2
+    exit 1
+fi
+release_validate_version "$schema_version"
 
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/leyline-public-postflight.XXXXXX")
 cleanup() {
@@ -46,7 +54,7 @@ done < "$tmp_dir/download-assets"
     export GOPROXY=https://proxy.golang.org,direct
     go mod init example.test/public-leyline-schema-consumer >/dev/null
     release_retry 6 10 "public Go module resolution" \
-        go get "$module/daemon/wire@v$version"
+        go get "$module/daemon/wire@v$schema_version"
     cp "$repo_root/tools/fixtures/schema-consumer/consumer_test.go" .
     go test ./...
     module_dir=$(go list -m -f '{{.Dir}}' "$module")
@@ -54,4 +62,4 @@ done < "$tmp_dir/download-assets"
     grep -q "Apache License" "$module_dir/LICENSE"
 )
 
-echo "verified public assets and Apache schema module v$version"
+echo "verified public assets v$version and Apache schema module v$schema_version"

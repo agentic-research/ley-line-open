@@ -197,6 +197,70 @@ struct ExtractCtx<'a> {
 /// `SQLITE_MAX_VARIABLE_NUMBER` at SQLite build time.
 const BULK_BATCH_ROWS: usize = 3000;
 
+/// SQLite's bound-parameter ceiling (`SQLITE_MAX_VARIABLE_NUMBER`, 32766
+/// since 3.32). Exceeding it is a RUNTIME error, so neither the compiler nor
+/// review catches it.
+const SQLITE_MAX_BOUND_PARAMS: usize = 32_766;
+
+/// Rows per multi-row INSERT for a table of `cols` columns.
+///
+/// [`BULK_BATCH_ROWS`] unless that many rows would exceed
+/// [`SQLITE_MAX_BOUND_PARAMS`]. The margin used to be maintained by a COMMENT
+/// — "3000 rows x 9 columns = 27 000 params, ~5 700 headroom" — which is
+/// exactly the kind of invariant that goes stale silently: adding one column
+/// to `_ast` took it to 33 000 params and every parse failed with "too many
+/// SQL variables". Deriving it keeps the widest table correct by
+/// construction, for one division per flush.
+fn rows_per_batch(cols: usize) -> usize {
+    BULK_BATCH_ROWS.min(SQLITE_MAX_BOUND_PARAMS / cols.max(1))
+}
+
+/// Files carried through parse → buffer-fill → flush as one pipeline chunk.
+///
+/// The whole-corpus shape this replaces did `par_iter().collect()` over every
+/// file and only flushed the row buffers after the last one, so BOTH the
+/// `ParsedFile` set and every buffered row were live at once and peak memory
+/// scaled with the repository: 14.2 GB resident to ingest 193 MB of kibana
+/// TypeScript (32k files, 28.5M rows), enough to drive an M-series laptop into
+/// swap. Chunking bounds both to this many files — see bead
+/// `ley-line-open-e9f829` for the measurements.
+///
+/// Chunks are sequential slices of the already-sorted `to_parse`, so the
+/// sorted-insert B-tree locality win (see the `sort_unstable_by` above) is
+/// fully preserved: order within a chunk and across chunks is unchanged from
+/// the unchunked version. This is why the pipeline is chunked rather than
+/// streamed through a channel — rayon would deliver results in completion
+/// order and forfeit that.
+///
+/// Sized so a chunk still fills the `BULK_BATCH_ROWS` multi-row VALUES
+/// statements many times over: at ~700-900 rows/file, 1024 files is ~800k
+/// rows, i.e. ~270 full-width statements for the widest table. Smaller chunks
+/// start paying partial-batch overhead on every flush; larger ones buy no
+/// throughput and cost linear memory.
+const PARSE_CHUNK_FILES: usize = 1024;
+
+/// Number of pipeline chunks `n_files` will be carried through.
+///
+/// A pure function of the work-list length so the count is assertable without
+/// running a parse, and so the tail-chunk boundary is pinned by a test rather
+/// than by a `+= 1` nothing observes.
+fn chunk_count_for(n_files: usize) -> usize {
+    n_files.div_ceil(PARSE_CHUNK_FILES)
+}
+
+/// Whether the insert-phase profile breakdown is armed.
+///
+/// Split from the env read so the "exactly the literal 1" contract is checked
+/// as a pure function — no test needs to mutate the process environment. Same
+/// shape, and same reason, as the perf gates (bead `ley-line-open-f07c20`).
+fn insert_profile_enabled_from(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
+/// One entry in the parse work-list: `(rel_path, abs_path, language, mtime, size)`.
+/// Named so the per-chunk parse closure can spell its parameter type.
+type FileToParse = (String, PathBuf, TsLanguage, i64, i64);
+
 /// Build a multi-row VALUES placeholder string: `(?,?,?,...),(?,?,...),...`.
 /// `rows` total tuples, each with `cols` placeholders.
 fn build_values_clause(rows: usize, cols: usize) -> String {
@@ -251,9 +315,15 @@ fn exec_batched(
 /// the chunk (no per-row allocation). Borrow rules: the returned
 /// references live as long as the chunk slice, which is at least the
 /// statement-step scope.
+///
+/// Takes `&mut Vec<R>` and `clear()`s on the way out rather than consuming
+/// the Vec, so a buffer can be flushed repeatedly and keep its allocation.
+/// The pipeline flushes once per `PARSE_CHUNK_FILES`-sized chunk, so a
+/// consuming signature would drop and re-grow every buffer on every chunk
+/// (bead `ley-line-open-e9f829`).
 fn flush_in_batches<R, F>(
     conn: &Connection,
-    rows: Vec<R>,
+    rows: &mut Vec<R>,
     prefix: &str,
     cols: usize,
     mut into_params: F,
@@ -265,12 +335,13 @@ where
     if total == 0 {
         return Ok(());
     }
+    let batch = rows_per_batch(cols);
     let mut i = 0;
-    while i + BULK_BATCH_ROWS <= total {
-        let chunk = &rows[i..i + BULK_BATCH_ROWS];
+    while i + batch <= total {
+        let chunk = &rows[i..i + batch];
         let params = into_params(chunk);
-        exec_batched(conn, prefix, BULK_BATCH_ROWS, cols, &params)?;
-        i += BULK_BATCH_ROWS;
+        exec_batched(conn, prefix, batch, cols, &params)?;
+        i += batch;
     }
     if i < total {
         let chunk = &rows[i..];
@@ -278,6 +349,8 @@ where
         let params = into_params(chunk);
         exec_batched(conn, prefix, n, cols, &params)?;
     }
+    // Keeps the capacity for the next chunk; `mem::take` would not.
+    rows.clear();
     Ok(())
 }
 
@@ -317,8 +390,8 @@ macro_rules! batch_table {
             // separate type per table) trades real complexity for one
             // warning we already understand.
             #[allow(dead_code)]
-            fn flush_batched(self, conn: &Connection) -> Result<()> {
-                flush_in_batches(conn, self.rows, $prefix, $cols, |$chunk| $flatten_body)
+            fn flush_batched(&mut self, conn: &Connection) -> Result<()> {
+                flush_in_batches(conn, &mut self.rows, $prefix, $cols, |$chunk| $flatten_body)
             }
         }
     };
@@ -372,12 +445,12 @@ batch_table! {
     // the mache 765-file bench that's ~535K extra B-tree probes. See
     // bead `ley-line-open-cbbedf`.
     AstBatch, AstRow,
-    "INSERT INTO _ast (node_id, source_id, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col, node_hash) VALUES ",
-    10,
-    push_fn: (node_id: String, source_id: String, node_kind: String, start_byte: i64, end_byte: i64, start_row: i64, start_col: i64, end_row: i64, end_col: i64, node_hash: Vec<u8>),
-    push_body: { AstRow { node_id, source_id, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col, node_hash } },
+    "INSERT INTO _ast (node_id, source_id, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col, node_hash, blob_ord) VALUES ",
+    11,
+    push_fn: (node_id: String, source_id: String, node_kind: String, start_byte: i64, end_byte: i64, start_row: i64, start_col: i64, end_row: i64, end_col: i64, node_hash: Vec<u8>, blob_ord: i64),
+    push_body: { AstRow { node_id, source_id, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col, node_hash, blob_ord } },
     flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 10);
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 11);
         for r in chunk {
             out.push(&r.node_id);
             out.push(&r.source_id);
@@ -389,6 +462,7 @@ batch_table! {
             out.push(&r.end_row);
             out.push(&r.end_col);
             out.push(&r.node_hash);
+            out.push(&r.blob_ord);
         }
         out
     },
@@ -505,8 +579,8 @@ batch_table! {
 }
 
 impl RefBatch {
-    fn flush_batched_for(self, conn: &Connection, prefix: &str) -> Result<()> {
-        flush_in_batches(conn, self.rows, prefix, 6, |chunk| {
+    fn flush_batched_for(&mut self, conn: &Connection, prefix: &str) -> Result<()> {
+        flush_in_batches(conn, &mut self.rows, prefix, 6, |chunk| {
             let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 6);
             for r in chunk {
                 out.push(&r.token);
@@ -555,8 +629,8 @@ batch_table! {
 }
 
 impl DefBatch {
-    fn flush_batched_for(self, conn: &Connection, prefix: &str) -> Result<()> {
-        flush_in_batches(conn, self.rows, prefix, 6, |chunk| {
+    fn flush_batched_for(&mut self, conn: &Connection, prefix: &str) -> Result<()> {
+        flush_in_batches(conn, &mut self.rows, prefix, 6, |chunk| {
             let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 6);
             for r in chunk {
                 out.push(&r.token);
@@ -652,22 +726,26 @@ batch_table! {
 }
 
 batch_table! {
-    // ADR-0026 pointer rows — one per `_ast` entry, dual-write for Phase 1
-    // (bead `ley-line-open-3e87ad`). `delete_file_rows` clears prior rows
-    // per file, so plain `INSERT` doesn't conflict.
-    AstPointerBatch, AstPointerRow,
-    "INSERT INTO _ast_pointer (node_id, blob_hash, offset_in_blob, kind, source_id) VALUES ",
-    5,
-    push_fn: (node_id: String, blob_hash: Vec<u8>, offset_in_blob: i64, kind: i64, source_id: String),
-    push_body: { AstPointerRow { node_id, blob_hash, offset_in_blob, kind, source_id } },
+    // ADR-0026 file-to-blob map — ONE row per source file (bead
+    // `ley-line-open-17c271`, superseding the per-node `_ast_pointer` from
+    // `ley-line-open-3e87ad`). `delete_file_rows` clears the prior row per
+    // file, so plain `INSERT` doesn't conflict.
+    //
+    // The per-node table it replaces stored, for each of 3.15M rows, a
+    // node_id already in `_ast`, a source_id already in `_ast`, a blob_hash
+    // with only 8000 distinct values, an offset that was the dense array
+    // index, and a kind derivable from `_ast.node_kind`. The offset now
+    // rides on `_ast.blob_ord`, on the row it describes.
+    AstBlobBatch, AstBlobRow,
+    "INSERT INTO _ast_blob (source_id, blob_hash) VALUES ",
+    2,
+    push_fn: (source_id: String, blob_hash: Vec<u8>),
+    push_body: { AstBlobRow { source_id, blob_hash } },
     flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 5);
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 2);
         for r in chunk {
-            out.push(&r.node_id);
-            out.push(&r.blob_hash);
-            out.push(&r.offset_in_blob);
-            out.push(&r.kind);
             out.push(&r.source_id);
+            out.push(&r.blob_hash);
         }
         out
     },
@@ -946,8 +1024,7 @@ pub fn parse_into_conn(
     // resizes during the classification loop. At registry-repo scale
     // (50k+ files) the default doubling-resize pattern would do
     // ~16 reallocations from 4-element initial capacity to 50000.
-    let mut to_parse: Vec<(String, PathBuf, TsLanguage, i64, i64)> =
-        Vec::with_capacity(files.len());
+    let mut to_parse: Vec<FileToParse> = Vec::with_capacity(files.len());
     let mut unchanged = 0u64;
     let mut oversized = 0u64;
 
@@ -1095,46 +1172,54 @@ pub fn parse_into_conn(
     // bench this saves ~150-200ms across the nodes + _ast flushes.
     to_parse.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-    let parse_start = std::time::Instant::now();
+    // Parse and insert are interleaved per chunk (see PARSE_CHUNK_FILES), so
+    // both phase timings accumulate across chunks rather than bracketing one
+    // contiguous span. The reported `parse=` / `insert=` split keeps meaning
+    // exactly what it did before: total CPU-wall spent in each phase.
+    let mut parse_elapsed = std::time::Duration::ZERO;
 
-    let parsed_files: Vec<Result<ParsedFile>> = to_parse
-        .par_iter()
-        .map(|(rel, abs_path, lang, file_mtime, file_size)| {
-            let content =
-                std::fs::read(abs_path).with_context(|| format!("read {}", abs_path.display()))?;
+    let parse_chunk = |chunk: &[FileToParse]| -> Vec<Result<ParsedFile>> {
+        chunk
+            .par_iter()
+            .map(|(rel, abs_path, lang, file_mtime, file_size)| {
+                let content = std::fs::read(abs_path)
+                    .with_context(|| format!("read {}", abs_path.display()))?;
 
-            // Skip binary files (null byte in first 8KB — same heuristic as git).
-            let check_len = content.len().min(8192);
-            if content[..check_len].contains(&0) {
-                bail!(
-                    "binary file (null byte in first 8KB): {}",
-                    abs_path.display()
-                );
-            }
+                // Skip binary files (null byte in first 8KB — same heuristic as git).
+                let check_len = content.len().min(8192);
+                if content[..check_len].contains(&0) {
+                    bail!(
+                        "binary file (null byte in first 8KB): {}",
+                        abs_path.display()
+                    );
+                }
 
-            // Canonicalize so `_source.path` matches the LSP-derived
-            // file:// URI (lsp_pass.rs canonicalizes before constructing
-            // the URI). Without this, on macOS `/tmp` vs `/private/tmp`
-            // and elsewhere any symlink-rooted path produces a path
-            // mismatch in `lookup_referrer_node_id` — every lookup
-            // misses, every `_lsp_refs.referrer_node_id` is NULL
-            // (be6136). Fall back to the original path if canonicalize
-            // fails (e.g. broken symlink), preserving prior behavior.
-            let canon = abs_path.canonicalize().unwrap_or_else(|_| abs_path.clone());
-            let abs_str = canon.to_string_lossy().to_string();
-            parse_file_pure(
-                &content,
-                *lang,
-                rel,
-                &abs_str,
-                *file_mtime,
-                *file_size,
-                &query_set,
-            )
-        })
-        .collect();
-
-    let parse_elapsed = parse_start.elapsed();
+                // Canonicalize so `_source.path` matches the LSP-derived
+                // file:// URI (lsp_pass.rs canonicalizes before constructing
+                // the URI). Without this, on macOS `/tmp` vs `/private/tmp`
+                // and elsewhere any symlink-rooted path produces a path
+                // mismatch in `lookup_referrer_node_id` — every lookup
+                // misses, every `_lsp_refs.referrer_node_id` is NULL
+                // (be6136). Fall back to the original path if canonicalize
+                // fails (e.g. broken symlink), preserving prior behavior.
+                let canon = abs_path.canonicalize().unwrap_or_else(|_| abs_path.clone());
+                let abs_str = canon.to_string_lossy().to_string();
+                // `content` is MOVED here — this worker has no further use for it,
+                // and handing over the original allocation is what lets the bytes
+                // reach `source_blobs.blob_bytes` without a copy
+                // (ley-line-open-cd052b).
+                parse_file_pure(
+                    content,
+                    *lang,
+                    rel,
+                    &abs_str,
+                    *file_mtime,
+                    *file_size,
+                    &query_set,
+                )
+            })
+            .collect()
+    };
 
     // ---- Batch insert (multi-row VALUES + single transaction) ----
     //
@@ -1192,37 +1277,43 @@ pub fn parse_into_conn(
     // ToSql references to params_from_iter without lifetime gymnastics
     // through the parsed_files Vec.
     //
-    // Pre-allocate at the per-file estimate × file_count: ~700 nodes
-    // and ~700 ast entries per file on the mache benchmark, so 500K
-    // capacity each is the right ballpark to avoid mid-loop reallocs.
-    let mut nodes_buf: NodeBatch = NodeBatch::with_capacity(550_000);
-    let mut ast_buf: AstBatch = AstBatch::with_capacity(550_000);
+    // Pre-allocate at the per-file estimate × the CHUNK size, not × the
+    // corpus. Buffers are flushed and `clear()`ed once per chunk and keep
+    // their allocation, so one chunk's worth is the steady-state high-water
+    // mark; sizing at corpus scale was itself a term in the O(corpus) memory
+    // profile this pipeline exists to remove (bead `ley-line-open-e9f829`).
+    // ~700-900 rows/file on the mache and kibana benchmarks.
+    const ROWS_PER_FILE_EST: usize = 900;
+    let chunk_files = to_parse.len().min(PARSE_CHUNK_FILES);
+    let chunk_rows = chunk_files * ROWS_PER_FILE_EST;
+    let mut nodes_buf: NodeBatch = NodeBatch::with_capacity(chunk_rows);
+    let mut ast_buf: AstBatch = AstBatch::with_capacity(chunk_rows);
     let mut refs_buf: RefBatch = RefBatch::with_capacity(40_000);
     let mut defs_buf: DefBatch = DefBatch::with_capacity(3_000);
     let mut imports_buf: ImportBatch = ImportBatch::with_capacity(2_000);
-    let mut source_buf: SourceBatch = SourceBatch::with_capacity(to_parse.len());
-    let mut file_idx_buf: FileIdxBatch = FileIdxBatch::with_capacity(to_parse.len());
+    let mut source_buf: SourceBatch = SourceBatch::with_capacity(chunk_files);
+    let mut file_idx_buf: FileIdxBatch = FileIdxBatch::with_capacity(chunk_files);
 
     // ADR-0026 pointer store (Phase 1 dual-write, bead `ley-line-open-3e87ad`).
     // One `capnp_blobs` row per file; one `_ast_pointer` row per AstEntry
     // (mirrors the `_ast` row count 1-to-1). Pre-sized like `ast_buf` since
     // pointer rows and _ast rows are in 1-to-1 correspondence.
-    let mut blob_buf: CapnpBlobBatch = CapnpBlobBatch::with_capacity(to_parse.len());
-    let mut pointer_buf: AstPointerBatch = AstPointerBatch::with_capacity(550_000);
+    let mut blob_buf: CapnpBlobBatch = CapnpBlobBatch::with_capacity(chunk_files);
+    let mut ast_blob_buf: AstBlobBatch = AstBlobBatch::with_capacity(chunk_files);
 
     // ADR-0028 source blobs (Phase 1 dual-store, bead `ley-line-open-9e4416`).
     // One `source_blobs` row per file *before* `INSERT OR IGNORE` dedup; unique
-    // source content collapses at flush time. Pre-sized at `to_parse.len()` —
-    // the pre-dedup upper bound.
-    let mut source_blob_buf: SourceBlobBatch = SourceBlobBatch::with_capacity(to_parse.len());
+    // source content collapses at flush time. Pre-sized at one chunk's file
+    // count — the per-chunk pre-dedup upper bound.
+    let mut source_blob_buf: SourceBlobBatch = SourceBlobBatch::with_capacity(chunk_files);
 
     // Merkle-AST IR (ADR-0027). `node_content`/`node_child` are the deduped
     // content layer (`INSERT OR IGNORE` collapses identical subtrees across
     // files); `_ast`/`node_defs`/`node_refs` carry the additive `node_hash`
     // pointer. No `gen`/edge machinery: contains is intrinsic (node_child),
     // and defines/references stay as occurrence rows keyed by token+node_id.
-    let mut content_buf: NodeContentBatch = NodeContentBatch::with_capacity(550_000);
-    let mut child_buf: NodeChildBatch = NodeChildBatch::with_capacity(550_000);
+    let mut content_buf: NodeContentBatch = NodeContentBatch::with_capacity(chunk_rows);
+    let mut child_buf: NodeChildBatch = NodeChildBatch::with_capacity(chunk_rows);
     // Cross-file dedup in memory, NOT via `INSERT OR IGNORE`. The per-file
     // fold already dedups within a file, but identical subtrees recur across
     // files (~2M fold rows collapse to ~150k unique). Letting SQL dedup means
@@ -1238,248 +1329,288 @@ pub fn parse_into_conn(
     let mut dirs_created: HashSet<String> = HashSet::new();
     let mut changed_files: Vec<String> = Vec::new();
 
-    for result in parsed_files {
-        match result {
-            Ok(pf) => {
-                let rel_path = Path::new(&pf.rel);
-                collect_dirs(rel_path, &mut dirs_created, &mut nodes_buf, mtime);
+    // Buffer-fill and flush time, accumulated per chunk for the
+    // LEYLINE_PROFILE=1 breakdown (they no longer occupy contiguous spans).
+    let mut buffer_elapsed = std::time::Duration::ZERO;
+    let mut flush_elapsed = std::time::Duration::ZERO;
 
-                source_buf.push(
-                    pf.rel.clone(),
-                    pf.language.clone(),
-                    pf.abs_path.clone(),
-                    pf.content_hash.to_vec(),
-                );
+    // ---- Chunked pipeline (bead `ley-line-open-e9f829`) ----
+    //
+    // Each chunk is parsed in parallel, drained into the row buffers, and
+    // flushed before the next chunk is read, so peak memory is bounded by
+    // PARSE_CHUNK_FILES rather than by the size of the repository.
+    //
+    // What deliberately does NOT reset per chunk: `seen_content` / `seen_edge`
+    // (cross-file content dedup — keyed by BLAKE3 hash and bounded by the
+    // number of UNIQUE subtrees, ~150k, not by corpus size), `dirs_created`,
+    // and `changed_files`. Resetting those would re-emit already-inserted
+    // content rows and change the projection.
+    for chunk in to_parse.chunks(PARSE_CHUNK_FILES) {
+        let chunk_parse_start = std::time::Instant::now();
+        let parsed_files = parse_chunk(chunk);
+        parse_elapsed += chunk_parse_start.elapsed();
 
-                // ADR-0028 dual-store (Phase 1, bead `ley-line-open-9e4416`).
-                // One `source_blobs` row per file, byte-verbatim; `INSERT OR
-                // IGNORE` on the `blob_hash` PK collapses byte-identical files
-                // to one row (F5s). `_source.content_hash` (pushed above) is
-                // the FK-shaped pointer at this blob (F1s asserts round-trip).
-                source_blob_buf.push(pf.content_hash.to_vec(), pf.source_blob_bytes.clone());
+        let chunk_buffer_start = std::time::Instant::now();
 
-                // capnp dual-write (`ley-line-open-cdf098`): same fields
-                // as the SQL row, typed and content-addressable. The
-                // per-message capnp serialization happened in the rayon
-                // worker (`parse_file_pure`); here we just append the
-                // pre-built byte buffer to the BufWriter. See bead
-                // `ley-line-open-cbbedf`.
-                if let Some(w) = source_writer.as_mut() {
-                    w.write_all(&pf.source_capnp_bytes)
-                        .context("write SourceFile capnp bytes")?;
-                }
-                if let Some(w) = ast_writer.as_mut() {
-                    w.write_all(&pf.ast_capnp_bytes)
-                        .context("write AstNode capnp bytes")?;
-                }
+        for result in parsed_files {
+            match result {
+                Ok(pf) => {
+                    let rel_path = Path::new(&pf.rel);
+                    collect_dirs(rel_path, &mut dirs_created, &mut nodes_buf, mtime);
 
-                // Bead `ley-line-open-caf423`: every AST-derived node
-                // carries its source file's `_source.id` as
-                // `source_file`. The file's own row + every descendant
-                // AST node share the same `source_file` (the
-                // relative path). Directory nodes (created via
-                // `collect_dirs`) intentionally leave `source_file` as
-                // `None` — they don't belong to a single file.
-                for n in pf.nodes {
-                    nodes_buf.push(
-                        n.id,
-                        n.parent_id,
-                        n.name,
-                        n.kind,
-                        n.size,
-                        mtime,
-                        n.record,
-                        Some(pf.rel.clone()),
+                    source_buf.push(
+                        pf.rel.clone(),
+                        pf.language.clone(),
+                        pf.abs_path.clone(),
+                        pf.content_hash.to_vec(),
                     );
-                }
 
-                // Merkle-AST content layer (post-order, children before
-                // parents). Cross-file dedup happens here in memory: only the
-                // FIRST occurrence of a content hash / (parent,ordinal) edge is
-                // buffered, so the SQL insert sees ~150k unique rows, not ~2M.
-                // The `INSERT OR IGNORE` prefix stays as a byte-identical-file
-                // backstop, but the probe storm is gone.
-                for c in pf.node_contents {
-                    if seen_content.insert(c.node_hash) {
-                        content_buf.push(
-                            c.node_hash.to_vec(),
-                            c.node_tag as i64,
-                            c.kind,
-                            c.raw_kind,
-                            c.lang,
-                            c.token,
-                            c.arity as i64,
+                    // ADR-0028 dual-store (Phase 1, bead `ley-line-open-9e4416`).
+                    // One `source_blobs` row per file, byte-verbatim; `INSERT OR
+                    // IGNORE` on the `blob_hash` PK collapses byte-identical files
+                    // to one row (F5s). `_source.content_hash` (pushed above) is
+                    // the FK-shaped pointer at this blob (F1s asserts round-trip).
+                    // MOVED, not cloned: this is the only use of
+                    // `source_blob_bytes` in the loop, `pf` is owned by value, and
+                    // the generated `push` takes `blob_bytes: Vec<u8>` by value.
+                    // The clone that used to be here copied every file's verbatim
+                    // bytes a second time, on this single-threaded path — roughly
+                    // one extra full-corpus memcpy per ingest, serialized behind
+                    // the insert loop (ley-line-open-cd052b).
+                    source_blob_buf.push(pf.content_hash.to_vec(), pf.source_blob_bytes);
+
+                    // capnp dual-write (`ley-line-open-cdf098`): same fields
+                    // as the SQL row, typed and content-addressable. The
+                    // per-message capnp serialization happened in the rayon
+                    // worker (`parse_file_pure`); here we just append the
+                    // pre-built byte buffer to the BufWriter. See bead
+                    // `ley-line-open-cbbedf`.
+                    if let Some(w) = source_writer.as_mut() {
+                        w.write_all(&pf.source_capnp_bytes)
+                            .context("write SourceFile capnp bytes")?;
+                    }
+                    if let Some(w) = ast_writer.as_mut() {
+                        w.write_all(&pf.ast_capnp_bytes)
+                            .context("write AstNode capnp bytes")?;
+                    }
+
+                    // Bead `ley-line-open-caf423`: every AST-derived node
+                    // carries its source file's `_source.id` as
+                    // `source_file`. The file's own row + every descendant
+                    // AST node share the same `source_file` (the
+                    // relative path). Directory nodes (created via
+                    // `collect_dirs`) intentionally leave `source_file` as
+                    // `None` — they don't belong to a single file.
+                    for n in pf.nodes {
+                        nodes_buf.push(
+                            n.id,
+                            n.parent_id,
+                            n.name,
+                            n.kind,
+                            n.size,
+                            mtime,
+                            n.record,
+                            Some(pf.rel.clone()),
                         );
                     }
-                }
-                for c in pf.node_children {
-                    if seen_edge.insert((c.parent_hash, c.ordinal as i64)) {
-                        child_buf.push(
-                            c.parent_hash.to_vec(),
-                            c.ordinal as i64,
-                            c.child_hash.to_vec(),
-                            c.field,
+
+                    // Merkle-AST content layer (post-order, children before
+                    // parents). Cross-file dedup happens here in memory: only the
+                    // FIRST occurrence of a content hash / (parent,ordinal) edge is
+                    // buffered, so the SQL insert sees ~150k unique rows, not ~2M.
+                    // The `INSERT OR IGNORE` prefix stays as a byte-identical-file
+                    // backstop, but the probe storm is gone.
+                    for c in pf.node_contents {
+                        if seen_content.insert(c.node_hash) {
+                            content_buf.push(
+                                c.node_hash.to_vec(),
+                                c.node_tag as i64,
+                                c.kind,
+                                c.raw_kind,
+                                c.lang,
+                                c.token,
+                                c.arity as i64,
+                            );
+                        }
+                    }
+                    for c in pf.node_children {
+                        if seen_edge.insert((c.parent_hash, c.ordinal as i64)) {
+                            child_buf.push(
+                                c.parent_hash.to_vec(),
+                                c.ordinal as i64,
+                                c.child_hash.to_vec(),
+                                c.field,
+                            );
+                        }
+                    }
+
+                    // node_id → node_hash for this file, so the additive
+                    // node_hash pointer on node_defs/node_refs can be attached
+                    // by the ref locator (which is always an `_ast` node_id).
+                    let mut hash_by_id: HashMap<&str, [u8; 32]> =
+                        HashMap::with_capacity(pf.ast_entries.len() + pf.injected_hashes.len());
+                    for a in &pf.ast_entries {
+                        hash_by_id.insert(a.node_id.as_str(), a.node_hash);
+                    }
+                    // Injections (bead `ley-line-open-c822a6`): injected
+                    // nodes have no `_ast` rows; their (node_id →
+                    // node_hash) pairs ride ParsedFile so injected fact
+                    // rows resolve to their own content-addressed subtrees.
+                    for (id, h) in &pf.injected_hashes {
+                        hash_by_id.insert(id.as_str(), *h);
+                    }
+
+                    // `blob_ord` is this entry's index in the file's
+                    // `AstNodeList.nodes` — the same `enumerate()` order
+                    // `serialize_ast_node_list_record` wrote. Carrying it on
+                    // the `_ast` row is what lets the pointer store be one row
+                    // per FILE rather than one per node (`ley-line-open-17c271`).
+                    for (blob_ord, a) in pf.ast_entries.iter().enumerate() {
+                        ast_buf.push(
+                            a.node_id.clone(),
+                            a.source_id.clone(),
+                            a.node_kind.clone(),
+                            a.start_byte as i64,
+                            a.end_byte as i64,
+                            a.start_row as i64,
+                            a.start_col as i64,
+                            a.end_row as i64,
+                            a.end_col as i64,
+                            a.node_hash.to_vec(),
+                            blob_ord as i64,
                         );
                     }
-                }
 
-                // node_id → node_hash for this file, so the additive
-                // node_hash pointer on node_defs/node_refs can be attached
-                // by the ref locator (which is always an `_ast` node_id).
-                let mut hash_by_id: HashMap<&str, [u8; 32]> =
-                    HashMap::with_capacity(pf.ast_entries.len() + pf.injected_hashes.len());
-                for a in &pf.ast_entries {
-                    hash_by_id.insert(a.node_id.as_str(), a.node_hash);
-                }
-                // Injections (bead `ley-line-open-c822a6`): injected
-                // nodes have no `_ast` rows; their (node_id →
-                // node_hash) pairs ride ParsedFile so injected fact
-                // rows resolve to their own content-addressed subtrees.
-                for (id, h) in &pf.injected_hashes {
-                    hash_by_id.insert(id.as_str(), *h);
-                }
+                    // ADR-0026 dual-write (Phase 1, bead `ley-line-open-3e87ad`).
+                    // One `capnp_blobs` row per file (the per-file AstNodeList
+                    // canonical bytes, content-addressed by BLAKE3); one
+                    // `_ast_pointer` row per AstEntry, mirroring the `_ast` row
+                    // set. `offset_in_blob` is the list index — the same
+                    // enumerate() order `serialize_ast_node_list_record` used, so
+                    // decoding the blob at `offset` byte-identically reproduces
+                    // this entry's fields (asserted by the F1 integration test).
+                    // Moved for the same reason as `source_blob_bytes` above:
+                    // sole use, owned `pf`, by-value `push` (ley-line-open-cd052b).
+                    blob_buf.push(pf.pointer_blob_hash.to_vec(), pf.pointer_blob_bytes);
+                    ast_blob_buf.push(pf.rel.clone(), pf.pointer_blob_hash.to_vec());
 
-                for a in &pf.ast_entries {
-                    ast_buf.push(
-                        a.node_id.clone(),
-                        a.source_id.clone(),
-                        a.node_kind.clone(),
-                        a.start_byte as i64,
-                        a.end_byte as i64,
-                        a.start_row as i64,
-                        a.start_col as i64,
-                        a.end_row as i64,
-                        a.end_col as i64,
-                        a.node_hash.to_vec(),
-                    );
-                }
-
-                // ADR-0026 dual-write (Phase 1, bead `ley-line-open-3e87ad`).
-                // One `capnp_blobs` row per file (the per-file AstNodeList
-                // canonical bytes, content-addressed by BLAKE3); one
-                // `_ast_pointer` row per AstEntry, mirroring the `_ast` row
-                // set. `offset_in_blob` is the list index — the same
-                // enumerate() order `serialize_ast_node_list_record` used, so
-                // decoding the blob at `offset` byte-identically reproduces
-                // this entry's fields (asserted by the F1 integration test).
-                blob_buf.push(pf.pointer_blob_hash.to_vec(), pf.pointer_blob_bytes.clone());
-                for (offset, a) in pf.ast_entries.iter().enumerate() {
-                    pointer_buf.push(
-                        a.node_id.clone(),
-                        pf.pointer_blob_hash.to_vec(),
-                        offset as i64,
-                        semantic_kind_tag(&a.node_kind),
-                        a.source_id.clone(),
-                    );
-                }
-
-                for r in pf.refs {
-                    match r {
-                        ExtractedRef::Ref {
-                            token,
-                            node_id,
-                            source_id,
-                            container_node_id,
-                            qualifier,
-                        } => {
-                            let nh = hash_by_id.get(node_id.as_str()).map(|h| h.to_vec());
-                            refs_buf.push(
+                    for r in pf.refs {
+                        match r {
+                            ExtractedRef::Ref {
                                 token,
                                 node_id,
                                 source_id,
-                                nh,
                                 container_node_id,
                                 qualifier,
-                            );
-                        }
-                        ExtractedRef::Def {
-                            token,
-                            node_id,
-                            source_id,
-                            container_node_id,
-                            canonical_kind,
-                        } => {
-                            let nh = hash_by_id.get(node_id.as_str()).map(|h| h.to_vec());
-                            defs_buf.push(
+                            } => {
+                                let nh = hash_by_id.get(node_id.as_str()).map(|h| h.to_vec());
+                                refs_buf.push(
+                                    token,
+                                    node_id,
+                                    source_id,
+                                    nh,
+                                    container_node_id,
+                                    qualifier,
+                                );
+                            }
+                            ExtractedRef::Def {
                                 token,
                                 node_id,
                                 source_id,
-                                nh,
                                 container_node_id,
                                 canonical_kind,
-                            );
+                            } => {
+                                let nh = hash_by_id.get(node_id.as_str()).map(|h| h.to_vec());
+                                defs_buf.push(
+                                    token,
+                                    node_id,
+                                    source_id,
+                                    nh,
+                                    container_node_id,
+                                    canonical_kind,
+                                );
+                            }
+                            ExtractedRef::Import {
+                                alias,
+                                path,
+                                source_id,
+                            } => imports_buf.push(alias, path, source_id),
                         }
-                        ExtractedRef::Import {
-                            alias,
-                            path,
-                            source_id,
-                        } => imports_buf.push(alias, path, source_id),
                     }
-                }
 
-                file_idx_buf.push(pf.rel.clone(), pf.file_mtime, pf.file_size);
-                changed_files.push(pf.rel);
-                parsed += 1;
-            }
-            Err(e) => {
-                eprintln!("warn: {e:#}");
-                errors += 1;
+                    file_idx_buf.push(pf.rel.clone(), pf.file_mtime, pf.file_size);
+                    changed_files.push(pf.rel);
+                    parsed += 1;
+                }
+                Err(e) => {
+                    eprintln!("warn: {e:#}");
+                    errors += 1;
+                }
             }
         }
-    }
 
-    // Insert-phase sub-timing (gated on LEYLINE_PROFILE=1) — measures
-    // where the insert budget goes: main-thread row-buffer loop (which
-    // includes the capnp BufWriter writes at :779-786), bulk INSERT
-    // flushes, capnp-flush-before-COMMIT, COMMIT itself, and the
-    // post-load index build. Immune to background I/O contention
-    // because it's measuring wall-time deltas in-process, not sampling.
-    let profile_insert = std::env::var("LEYLINE_PROFILE").ok().as_deref() == Some("1");
-    let sub_buffer_end = std::time::Instant::now();
+        buffer_elapsed += chunk_buffer_start.elapsed();
 
-    // Flush each table in BULK_BATCH_ROWS-sized chunks via multi-row
-    // VALUES inserts. Tail (last <BULK_BATCH_ROWS rows) flushed in one
-    // partial-size statement so we don't fall back to per-row execute.
-    //
-    // FK ordering (ADR-0027): with `foreign_keys = ON` the node_hash FKs
-    // (_ast/node_defs/node_refs → node_content, node_child → node_content)
-    // are checked immediately per row. `node_content` must therefore land
-    // FIRST so every referencing row finds its content target (uncommitted
-    // rows in the same transaction satisfy the FK). The post-order fold
-    // already emitted content children-before-parents, but the cross-table
-    // ordering here is what makes the referencing rows safe.
-    content_buf.flush_batched(conn)?;
-    child_buf.flush_batched(conn)?;
-    nodes_buf.flush_batched(conn)?;
-    ast_buf.flush_batched(conn)?;
-    // ADR-0028 source-blob dual-store (bead `ley-line-open-9e4416`). Flush
-    // source_blobs BEFORE `_source` so the FK-shaped pointer (`_source.
-    // content_hash → source_blobs.blob_hash`) always finds its referent —
-    // matches the capnp_blobs→_ast_pointer ordering below. Phase 1 doesn't
-    // declare the FK (dual-store is additive; the FK becomes load-bearing
-    // when Phase 2 flips consumers to reads), but ordering the writes
-    // correctly means the promotion is a one-line edit.
-    source_blob_buf.flush_batched(conn)?;
-    source_buf.flush_batched(conn)?;
-    refs_buf.flush_batched_for(
+        let chunk_flush_start = std::time::Instant::now();
+
+        // Flush each table in BULK_BATCH_ROWS-sized chunks via multi-row
+        // VALUES inserts. Tail (last <BULK_BATCH_ROWS rows) flushed in one
+        // partial-size statement so we don't fall back to per-row execute.
+        //
+        // FK ordering (ADR-0027): with `foreign_keys = ON` the node_hash FKs
+        // (_ast/node_defs/node_refs → node_content, node_child → node_content)
+        // are checked immediately per row. `node_content` must therefore land
+        // FIRST so every referencing row finds its content target (uncommitted
+        // rows in the same transaction satisfy the FK). The post-order fold
+        // already emitted content children-before-parents, but the cross-table
+        // ordering here is what makes the referencing rows safe.
+        content_buf.flush_batched(conn)?;
+        child_buf.flush_batched(conn)?;
+        nodes_buf.flush_batched(conn)?;
+        ast_buf.flush_batched(conn)?;
+        // ADR-0028 source-blob dual-store (bead `ley-line-open-9e4416`). Flush
+        // source_blobs BEFORE `_source` so the FK-shaped pointer (`_source.
+        // content_hash → source_blobs.blob_hash`) always finds its referent —
+        // matches the capnp_blobs→_ast_pointer ordering below. Phase 1 doesn't
+        // declare the FK (dual-store is additive; the FK becomes load-bearing
+        // when Phase 2 flips consumers to reads), but ordering the writes
+        // correctly means the promotion is a one-line edit.
+        source_blob_buf.flush_batched(conn)?;
+        source_buf.flush_batched(conn)?;
+        refs_buf.flush_batched_for(
         conn,
         "INSERT INTO node_refs (token, node_id, source_id, node_hash, container_node_id, qualifier) VALUES ",
     )?;
-    defs_buf.flush_batched_for(
+        defs_buf.flush_batched_for(
         conn,
         "INSERT INTO node_defs (token, node_id, source_id, node_hash, container_node_id, canonical_kind) VALUES ",
     )?;
-    imports_buf.flush_batched(conn)?;
-    file_idx_buf.flush_batched(conn)?;
-    // ADR-0026 pointer-store dual-write (bead `ley-line-open-3e87ad`). Flush
-    // blobs BEFORE the pointer rows so an implementation that later adds a FK
-    // on `_ast_pointer.blob_hash → capnp_blobs.blob_hash` finds every referent
-    // present. Phase 1 doesn't declare the FK (dual-write is additive; the
-    // FK becomes load-bearing when Phase 2 flips consumers to reads), but
-    // ordering the writes correctly means the promotion is a one-line edit.
-    blob_buf.flush_batched(conn)?;
-    pointer_buf.flush_batched(conn)?;
-    let sub_flush_end = std::time::Instant::now();
+        imports_buf.flush_batched(conn)?;
+        file_idx_buf.flush_batched(conn)?;
+        // ADR-0026 pointer-store dual-write (bead `ley-line-open-3e87ad`). Flush
+        // blobs BEFORE the pointer rows so an implementation that later adds a FK
+        // on `_ast_pointer.blob_hash → capnp_blobs.blob_hash` finds every referent
+        // present. Phase 1 doesn't declare the FK (dual-write is additive; the
+        // FK becomes load-bearing when Phase 2 flips consumers to reads), but
+        // ordering the writes correctly means the promotion is a one-line edit.
+        blob_buf.flush_batched(conn)?;
+        ast_blob_buf.flush_batched(conn)?;
+
+        flush_elapsed += chunk_flush_start.elapsed();
+    }
+    let sub_chunks_end = std::time::Instant::now();
+
+    // Insert-phase sub-timing (gated on LEYLINE_PROFILE=1) — measures
+    // where the insert budget goes: main-thread row-buffer loop (which
+    // includes the capnp BufWriter writes), bulk INSERT flushes,
+    // capnp-flush-before-COMMIT, COMMIT itself, and the post-load index
+    // build. Immune to background I/O contention because it's measuring
+    // wall-time deltas in-process, not sampling.
+    //
+    // Buffer-fill and flush are accumulated per chunk (they interleave now),
+    // so they are reported as summed Durations rather than Instant deltas.
+    let profile_insert =
+        insert_profile_enabled_from(std::env::var("LEYLINE_PROFILE").ok().as_deref());
 
     // Flush the capnp dual-write `BufWriter`s before COMMIT and before
     // `write_head_after_parse` reads the segments for hashing —
@@ -1571,10 +1702,12 @@ pub fn parse_into_conn(
     let insert_elapsed = insert_start.elapsed();
 
     if profile_insert {
-        let buf_ms = sub_buffer_end.duration_since(insert_start).as_millis();
-        let flush_ms = sub_flush_end.duration_since(sub_buffer_end).as_millis();
+        // buffer / sql_flush are summed across chunks; the rest still bracket
+        // single contiguous spans after the chunk loop.
+        let buf_ms = buffer_elapsed.as_millis();
+        let flush_ms = flush_elapsed.as_millis();
         let capnp_ms = sub_capnp_flush_end
-            .duration_since(sub_flush_end)
+            .duration_since(sub_chunks_end)
             .as_millis();
         let commit_ms = sub_commit_end
             .duration_since(sub_capnp_flush_end)
@@ -1583,7 +1716,9 @@ pub fn parse_into_conn(
         eprintln!(
             "  insert-detail: buffer+capnp_write={buf_ms}ms \
              sql_flush={flush_ms}ms capnp_flush={capnp_ms}ms \
-             commit={commit_ms}ms index_build={index_ms}ms"
+             commit={commit_ms}ms index_build={index_ms}ms \
+             chunks={} chunk_files={PARSE_CHUNK_FILES}",
+            chunk_count_for(to_parse.len())
         );
     }
 
@@ -1626,6 +1761,13 @@ pub fn parse_into_conn(
     // shape (node_content/node_child/_ast.node_hash) from the retired
     // symbols/fact_edges shape.
     set_meta(conn, "ir_schema_version", IR_SCHEMA_VERSION)?;
+    // Projection shape, so a consumer can tell `_ast_blob` from `_ast_pointer`
+    // without interrogating `sqlite_master` (bead `ley-line-open-17c271`).
+    set_meta(
+        conn,
+        "projection_schema_version",
+        crate::daemon::version::PROJECTION_SCHEMA_VERSION,
+    )?;
     // Stamp the extraction epoch only on full-tree passes. A scoped
     // pass reparses just the dirty set; stamping the binary's epoch
     // there would mark still-stale out-of-scope facts as current. The
@@ -2284,7 +2426,7 @@ pub const SEMANTIC_KIND_IMPORT: i64 = 4;
 /// Map a tree-sitter node kind string to its semantic-kind tag. Phase 1
 /// covers the categories the ADR calls out (§2.1); Phase 2 refines the
 /// allowlist per measured mache query patterns (§2.2).
-fn semantic_kind_tag(node_kind: &str) -> i64 {
+pub fn semantic_kind_tag(node_kind: &str) -> i64 {
     match node_kind {
         // Function-like across Go / Rust / Python / JS / TS.
         "function_declaration" | "function_definition" | "function_item" => SEMANTIC_KIND_FUNCTION,
@@ -2436,8 +2578,14 @@ fn hash_internal(kind: &str, child_hashes: &[[u8; 32]]) -> [u8; 32] {
 // ---------------------------------------------------------------------------
 
 /// Parse a single file into a `ParsedFile`. No database access.
+///
+/// Takes `content` BY VALUE so the ADR-0028 `source_blob_bytes` field can be
+/// the caller's original allocation rather than a copy of it. Every read here
+/// borrows it (`&content`); the last statement moves it. Passing `&[u8]` forced
+/// a `content.to_vec()` at the end, which cost one full-file copy per file on
+/// top of the read — see ley-line-open-cd052b.
 pub(crate) fn parse_file_pure(
-    content: &[u8],
+    content: Vec<u8>,
     language: TsLanguage,
     source_id: &str,
     abs_path: &str,
@@ -2451,7 +2599,7 @@ pub(crate) fn parse_file_pure(
         .context("failed to set tree-sitter language")?;
 
     let tree = parser
-        .parse(content, None)
+        .parse(&content, None)
         .context("tree-sitter parse returned None")?;
 
     // BLAKE3 of the file bytes — the byte-level content address feeding
@@ -2531,7 +2679,7 @@ pub(crate) fn parse_file_pure(
     // for every NAMED descendant (parent-creates-child, pre-order) and the
     // deduped `node_content`/`node_child` rows for every unique subtree.
     let root_hash = fold_children(
-        content,
+        &content,
         root,
         source_id,
         source_id,
@@ -2599,12 +2747,16 @@ pub(crate) fn parse_file_pure(
     let pointer_blob_hash: [u8; 32] = *pointer_blob_bytes.as_slice().hash().as_bytes();
 
     // ADR-0028 source-blob bytes (bead `ley-line-open-9e4416`, Phase 1 dual-
-    // store). Owning clone of the input source bytes so the main-thread insert
-    // loop can move them into `source_blobs.blob_bytes` without re-reading from
-    // disk. `content_hash` above is already BLAKE3 of this exact slice, so
+    // store). The caller's own allocation, moved — not copied. The main-thread
+    // insert loop then moves it again into `source_blobs.blob_bytes`, so the
+    // bytes read from disk reach SQLite without an intervening copy.
+    // `content_hash` above is BLAKE3 of these exact bytes, so
     // (blob_hash, blob_bytes) is content-consistent by construction (F1s pins
     // this in-DB; F-git pins hash-compatibility with `git cat-file blob`).
-    let source_blob_bytes = content.to_vec();
+    //
+    // This must stay the LAST use of `content` in this function
+    // (ley-line-open-cd052b).
+    let source_blob_bytes = content;
 
     Ok(ParsedFile {
         rel: source_id.to_string(),
@@ -2676,8 +2828,10 @@ pub(crate) fn parse_to_ast_json(
     // JSON response shape).
     // No arena connection here (in-memory validate path), so no overrides can
     // apply — the compiled defaults are the effective query set.
+    // This path holds only a borrow, so it owes the copy `parse_file_pure`
+    // used to make internally — same cost as before, not a regression.
     let parsed = parse_file_pure(
-        content,
+        content.to_vec(),
         language,
         source_id,
         source_id,
@@ -3568,6 +3722,251 @@ mod tests {
         assert_eq!(keep_present, 1);
     }
 
+    /// `node_refs` and `node_defs` are flushed through `flush_batched_for`,
+    /// which is the one flush path the macro does not generate. Nothing
+    /// asserted that it actually wrote anything: replacing either body with
+    /// `Ok(())` left every test passing while the symbol layer — the rows
+    /// mache's find_definition / find_callers are built on — silently landed
+    /// empty. Surfaced as two surviving mutants on bead
+    /// `ley-line-open-e9f829` (cmd_parse.rs:545, :595).
+    ///
+    /// Asserts content, not just cardinality: a token that exists only in the
+    /// def position and one that exists only in the ref position, so a flush
+    /// that wrote the wrong buffer to the wrong table also fails.
+    #[test]
+    fn flush_batched_for_actually_writes_the_symbol_layer() {
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        std::fs::write(
+            root.join("sym.go"),
+            b"package sym\n\nfunc Definiendum() {}\n\nfunc Caller() { Definiendum() }\n",
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        parse_into_conn(&conn, root, None, None).unwrap();
+
+        let defs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM node_defs", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            defs > 0,
+            "node_defs is empty — DefBatch::flush_batched_for wrote nothing"
+        );
+
+        let refs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM node_refs", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            refs > 0,
+            "node_refs is empty — RefBatch::flush_batched_for wrote nothing"
+        );
+
+        // `Definiendum` is declared once and referenced once, so it must be
+        // reachable through BOTH tables. Pins that each flush wrote its own
+        // rows rather than one table receiving both buffers.
+        let def_hit: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_defs WHERE token = 'Definiendum'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            def_hit > 0,
+            "node_defs has rows but not the declared token — wrong buffer flushed"
+        );
+
+        let ref_hit: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_refs WHERE token = 'Definiendum'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            ref_hit > 0,
+            "node_refs has rows but not the referenced token — wrong buffer flushed"
+        );
+    }
+
+    /// `ParseResult.errors` is the only signal a caller gets that a file in
+    /// the tree did not parse. Nothing asserted it, so dropping the increment
+    /// reported a clean run over a corpus that partly failed — the shape of
+    /// bug that makes an arena silently incomplete. Surviving mutant on bead
+    /// `ley-line-open-e9f829` (cmd_parse.rs:1508, `errors += 1`).
+    ///
+    /// Uses the binary-file rejection (null byte inside the first 8 KiB) as
+    /// the failure injector: it is the parse path's own documented error, so
+    /// the test does not depend on a malformed-syntax heuristic that a
+    /// future grammar bump could start accepting.
+    #[test]
+    fn parse_errors_are_counted_not_silently_swallowed() {
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        // Parses cleanly.
+        std::fs::write(root.join("ok.go"), b"package ok\n\nfunc Fine() {}\n").unwrap();
+        // `.go` extension so it is selected for parsing, NUL byte so the
+        // worker rejects it as binary.
+        std::fs::write(root.join("bad.go"), b"package bad\n\x00\n").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        let result = parse_into_conn(&conn, root, None, None).unwrap();
+
+        assert_eq!(
+            result.errors, 1,
+            "exactly one file is unparseable; errors must report it (got {})",
+            result.errors
+        );
+        assert_eq!(
+            result.parsed, 1,
+            "the other file parses; parsed must report it (got {})",
+            result.parsed
+        );
+    }
+
+    /// The insert-phase profile breakdown is opt-in via `LEYLINE_PROFILE=1`.
+    /// Checked as a pure predicate so no test mutates the process
+    /// environment — same contract, and same reasoning, as the perf gates in
+    /// `cold_parse_perf_regression.rs` (bead `ley-line-open-f07c20`), where a
+    /// concurrent env write is what armed a release ceiling inside a debug
+    /// build.
+    #[test]
+    fn insert_profile_arms_on_exactly_one() {
+        assert!(insert_profile_enabled_from(Some("1")));
+        assert!(!insert_profile_enabled_from(Some("0")));
+        assert!(!insert_profile_enabled_from(Some("true")));
+        assert!(!insert_profile_enabled_from(None));
+    }
+
+    /// The pipeline runs `to_parse.len().div_ceil(PARSE_CHUNK_FILES)` chunks.
+    /// Pinned because the count is reported in the profile line and, more
+    /// importantly, because an off-by-one here would either drop the tail
+    /// chunk or run an empty one.
+    #[test]
+    fn chunk_count_covers_every_file_including_a_partial_tail() {
+        assert_eq!(chunk_count_for(0), 0, "no files, no chunks");
+        assert_eq!(chunk_count_for(1), 1);
+        assert_eq!(
+            chunk_count_for(PARSE_CHUNK_FILES),
+            1,
+            "an exactly-full chunk must not spill into a second, empty one"
+        );
+        assert_eq!(
+            chunk_count_for(PARSE_CHUNK_FILES + 1),
+            2,
+            "one file past the boundary needs a tail chunk"
+        );
+        assert_eq!(chunk_count_for(PARSE_CHUNK_FILES * 3), 3);
+    }
+
+    /// `rows_per_batch` is the only thing keeping a multi-row INSERT under
+    /// SQLite's bound-parameter ceiling. Stubbing it to `1`, or flipping its
+    /// division to a multiplication, left every test passing: a batch of 1 is
+    /// merely slow, and an oversized batch only fails at RUNTIME on the widest
+    /// table. Both survived as mutants on bead `ley-line-open-17c271`.
+    ///
+    /// The load-bearing assertion is the invariant, not any single value —
+    /// that is what stays true when a column is added to any table.
+
+    /// `flush_in_batches` walks `i` forward one batch at a time and flushes a
+    /// short tail. Nothing exercised that walk: every existing test flushes
+    /// far fewer rows than one batch, so the loop body ran at most once and
+    /// its arithmetic was unobserved. Mutating `i + batch` to `i - batch`, or
+    /// `i += batch` to `i -= batch`, survived (bead `ley-line-open-17c271`).
+    ///
+    /// A silent failure here drops or duplicates rows at a batch boundary —
+    /// the projection would be wrong only on corpora large enough to cross
+    /// 3000 rows in a single table, which is every real one and no test one.
+    ///
+    /// Sized `BULK_BATCH_ROWS * 2 + 1` so the loop runs twice AND leaves a
+    /// one-row tail, covering both the full-batch path and the partial one.
+    #[test]
+    fn flush_in_batches_lands_every_row_across_batch_boundaries() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (v INTEGER NOT NULL);")
+            .unwrap();
+
+        let n = BULK_BATCH_ROWS * 2 + 1;
+        let mut rows: Vec<i64> = (0..n as i64).collect();
+        flush_in_batches(&conn, &mut rows, "INSERT INTO t (v) VALUES ", 1, |chunk| {
+            chunk
+                .iter()
+                .map(|r| r as &dyn rusqlite::ToSql)
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count,
+            n as i64,
+            "every row must land: {n} pushed across {} batches plus a tail",
+            n / BULK_BATCH_ROWS
+        );
+
+        // Content, not just cardinality — a boundary bug that re-flushes one
+        // batch twice and skips another keeps the count and corrupts the data.
+        let sum: i64 = conn
+            .query_row("SELECT SUM(v) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            sum,
+            (0..n as i64).sum::<i64>(),
+            "the rows that landed must be the rows that were pushed, once each"
+        );
+
+        assert!(
+            rows.is_empty(),
+            "the buffer is cleared for reuse — the chunked pipeline flushes it \
+             once per chunk and relies on it keeping its allocation"
+        );
+    }
+    #[test]
+    fn rows_per_batch_never_exceeds_the_bound_parameter_ceiling() {
+        for cols in 1..=64usize {
+            let rows = rows_per_batch(cols);
+            assert!(
+                rows >= 1,
+                "a batch must carry at least one row (cols={cols})"
+            );
+            assert!(
+                rows * cols <= SQLITE_MAX_BOUND_PARAMS,
+                "cols={cols}: {rows} rows x {cols} cols = {} params, over the \
+                 {SQLITE_MAX_BOUND_PARAMS} ceiling — this is the failure that \
+                 took every parse down when `_ast` gained a column",
+                rows * cols
+            );
+        }
+    }
+
+    /// The ceiling must BIND on wide tables and NOT cost anything on narrow
+    /// ones. Without this, `rows_per_batch -> 1` satisfies the ceiling
+    /// invariant above while destroying the batching the insert path exists
+    /// for (`ley-line-open-cbbedf` measured un-batched inserts at ~10x).
+    #[test]
+    fn rows_per_batch_binds_only_where_the_ceiling_requires_it() {
+        // 2 columns: 3000 x 2 = 6000 params, far under the cap — full batch.
+        assert_eq!(
+            rows_per_batch(2),
+            BULK_BATCH_ROWS,
+            "a narrow table must still get the full {BULK_BATCH_ROWS}-row batch"
+        );
+        // 11 columns (today's `_ast`): 3000 x 11 = 33000, over the cap, so the
+        // batch must shrink to exactly the ceiling's quotient.
+        assert_eq!(
+            rows_per_batch(11),
+            SQLITE_MAX_BOUND_PARAMS / 11,
+            "a table wide enough to breach the cap must be clamped to the quotient"
+        );
+        assert!(
+            rows_per_batch(11) < BULK_BATCH_ROWS,
+            "11 columns MUST bind — if this stops holding, the constant moved \
+             and the clamp is no longer exercised by any test"
+        );
+    }
     #[test]
     fn batched_inserts_preserve_record_content_not_just_row_count() {
         // Skeptic finding on bead `ley-line-open-cbbedf`: row-count parity

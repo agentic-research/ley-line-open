@@ -327,14 +327,14 @@ CREATE TABLE IF NOT EXISTS node_child (
 pub const AST_NODE_HASH_INDEX_DDL: &str =
     "CREATE INDEX IF NOT EXISTS idx_ast_node_hash ON _ast(node_hash);";
 
-/// True when `table` already has a `node_hash` column. SQLite has no
-/// `ADD COLUMN IF NOT EXISTS`, so the merkle-AST migration probes
-/// `pragma_table_info` and only ALTERs when the column is absent — makes
-/// the additive migration idempotent across incremental reparses.
-fn has_node_hash_column(conn: &Connection, table: &str) -> Result<bool> {
+/// True when `table` already has `column`. SQLite has no
+/// `ADD COLUMN IF NOT EXISTS`, so the additive migrations probe
+/// `pragma_table_info` and only ALTER when the column is absent — which is
+/// what makes them idempotent across incremental reparses.
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let n: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = 'node_hash'",
-        [table],
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+        [table, column],
         |r| r.get(0),
     )?;
     Ok(n > 0)
@@ -343,7 +343,7 @@ fn has_node_hash_column(conn: &Connection, table: &str) -> Result<bool> {
 /// Create the merkle-AST IR tables (`node_content`, `node_child`) and
 /// additively stamp a `node_hash` column onto the occurrence tables
 /// (`_ast`, `node_defs`, `node_refs`) that already exist. Idempotent: the
-/// `node_hash` ALTERs are gated on [`has_node_hash_column`].
+/// `node_hash` ALTERs are gated on [`has_column`].
 ///
 /// Must be called AFTER `create_ast_tables` + `create_refs_tables` (the
 /// ALTER targets must exist) and BEFORE the insert transaction. The
@@ -354,7 +354,7 @@ pub fn create_ir_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(NODE_CONTENT_TABLE_DDL)?;
     conn.execute_batch(NODE_CHILD_TABLE_DDL)?;
     for table in ["_ast", "node_defs", "node_refs"] {
-        if !has_node_hash_column(conn, table)? {
+        if !has_column(conn, table, "node_hash")? {
             conn.execute_batch(&format!(
                 "ALTER TABLE {table} ADD COLUMN node_hash BLOB REFERENCES node_content(node_hash);"
             ))?;
@@ -457,7 +457,7 @@ pub fn insert_def(
 }
 
 /// True when `table` has a `container_node_id` column. Same pattern as
-/// `has_node_hash_column` — SQLite has no `ADD COLUMN IF NOT EXISTS`,
+/// `has_column` — SQLite has no `ADD COLUMN IF NOT EXISTS`,
 /// so the additive migration probes `pragma_table_info` and only ALTERs
 /// when the column is absent. Bead `ley-line-open-6e798d`.
 fn has_container_node_id_column(conn: &Connection, table: &str) -> Result<bool> {
@@ -566,26 +566,51 @@ CREATE TABLE IF NOT EXISTS capnp_blobs (
     blob_bytes BLOB NOT NULL
 );";
 
-/// DDL for `_ast_pointer` — lightweight index into `capnp_blobs`. One row
-/// per AstNode, mirroring the `_ast` row set 1-to-1 in Phase 1 dual-write.
-/// `offset_in_blob` indexes into the blob's `AstNodeList.nodes` list.
-/// `kind` is the semantic-kind tag per ADR-0026 §2.1 (INTEGER for query
-/// filter — populated by `semantic_kind_tag` in the producer; the Phase 2
-/// allowlist refines the enum).
-pub const AST_POINTER_DDL: &str = "\
-CREATE TABLE IF NOT EXISTS _ast_pointer (
-    node_id TEXT PRIMARY KEY,
-    blob_hash BLOB NOT NULL,
-    offset_in_blob INTEGER NOT NULL,
-    kind INTEGER NOT NULL,
-    source_id TEXT NOT NULL
+/// DDL for `_ast_blob` — the file-to-blob map for the ADR-0026 pointer
+/// store. ONE row per source file, not per AST node.
+///
+/// This replaces `_ast_pointer`, which carried one row per AstNode and did
+/// not, in practice, store a pointer. Measured on an 8000-file TypeScript
+/// arena, each of its 3 150 849 rows held:
+///
+///   node_id         232 bytes   already the PK of `_ast`
+///   source_id        27.6 bytes already a column of `_ast`
+///   blob_hash        32 bytes   only 8000 DISTINCT values across all rows
+///   offset_in_blob   int        a dense 0..n-1 per file, verified with no
+///                               gaps or duplicates in 8000/8000 files
+///   kind             int        `semantic_kind_tag(node_kind)`, a pure
+///                               function of a column `_ast` already has
+///
+/// ~294 bytes per row to address a record of ~370 — the pointer was 80% the
+/// size of its referent — costing 927 MB plus an 830 MB shadow index for a
+/// mapping that is `blob(file)` plus an ordinal. Both survive here: the file
+/// keys this table, and the ordinal moves onto `_ast.blob_ord` (one small
+/// integer per row, ~6 MB) where the row it describes already lives.
+///
+/// The ADR-0026 §6.F1 resolution capability is unchanged: any `_ast` row
+/// still resolves to its capnp record, via `source_id -> blob_hash` here and
+/// `blob_ord` as the index into that blob's `AstNodeList.nodes`.
+///
+/// Bead `ley-line-open-17c271`.
+pub const AST_BLOB_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS _ast_blob (
+    source_id TEXT PRIMARY KEY,
+    blob_hash BLOB NOT NULL
 );";
 
 /// Create the pointer-store tables (idempotent). Must run alongside the
 /// existing row-projected schema; Phase 1 is dual-write.
+///
+/// `_ast.blob_ord` is added by ALTER rather than sitting in `AST_TABLE_DDL`
+/// because it belongs to the pointer store, not to the row projection —
+/// same reasoning as the `node_hash` column in [`create_ir_tables`], and it
+/// keeps `_ast` correct for callers that never enable the pointer store.
 pub fn create_pointer_store_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(CAPNP_BLOBS_DDL)?;
-    conn.execute_batch(AST_POINTER_DDL)?;
+    conn.execute_batch(AST_BLOB_DDL)?;
+    if !has_column(conn, "_ast", "blob_ord")? {
+        conn.execute_batch("ALTER TABLE _ast ADD COLUMN blob_ord INTEGER;")?;
+    }
     Ok(())
 }
 
@@ -968,10 +993,10 @@ pub fn delete_file_rows(conn: &Connection, path: &str) -> Result<()> {
     // Skip cleanly when the tables don't exist — the pointer store is additive
     // and older databases may predate its creation.
     if pointer_store_present(conn) {
-        conn.execute("DELETE FROM _ast_pointer WHERE source_id = ?1", [path])?;
+        conn.execute("DELETE FROM _ast_blob WHERE source_id = ?1", [path])?;
         // capnp_blobs is keyed on blob_hash (content-addressed), not source_id.
         // Orphaned blobs are ignored here — a Phase 2/3 GC sweep collects blobs
-        // no `_ast_pointer` row references. Phase 1 dual-write recreates the
+        // no `_ast_blob` row references. Phase 1 dual-write recreates the
         // blob row on reparse via `INSERT OR IGNORE`, so nothing accumulates
         // per file (blobs dedup on identical file content).
     }
@@ -984,14 +1009,14 @@ pub fn delete_file_rows(conn: &Connection, path: &str) -> Result<()> {
     Ok(())
 }
 
-/// True when the pointer-store tables (`_ast_pointer`) exist on this
+/// True when the pointer-store tables (`_ast_blob`) exist on this
 /// connection. Additive-schema guard for `delete_file_rows`: older
 /// databases predate the pointer store, and legacy paths that call
 /// `delete_file_rows` without first running `create_pointer_store_tables`
 /// must not error on the missing table.
 fn pointer_store_present(conn: &Connection) -> bool {
     conn.query_row(
-        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='_ast_pointer'",
+        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='_ast_blob'",
         [],
         |r| r.get::<_, bool>(0),
     )
@@ -1781,6 +1806,129 @@ mod tests {
         );
     }
 
+    /// `has_column` is the idempotence guard for every additive ALTER in this
+    /// module: `create_ir_tables` uses it for `node_hash`, and
+    /// `create_pointer_store_tables` for `blob_ord`. Stubbing it to a constant
+    /// broke nothing that was tested — `Ok(true)` skips the ALTER so the column
+    /// never appears and every INSERT naming it fails at runtime, while
+    /// `Ok(false)` re-runs the ALTER on an existing column and errors on the
+    /// second parse. Surfaced as two surviving mutants on bead
+    /// `ley-line-open-17c271`.
+
+    /// `create_ir_tables` stamps the ADR-0027 `node_hash` column onto the three
+    /// occurrence tables that predate it. Nothing asserted that it did, so
+    /// inverting its idempotence guard survived mutation: with the `!` deleted
+    /// the ALTER runs only when the column ALREADY exists, so a fresh arena
+    /// never gets `node_hash` at all and every INSERT naming it fails at
+    /// runtime, while a reparse hits "duplicate column name".
+    ///
+    /// Sibling of `create_pointer_store_tables_builds_and_is_idempotent` — both
+    /// are additive migrations run on EVERY parse, and SQLite has no
+    /// `ADD COLUMN IF NOT EXISTS` (bead `ley-line-open-17c271`).
+    #[test]
+    fn create_ir_tables_stamps_node_hash_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_schema(&conn).unwrap();
+        conn.execute_batch(DEFS_TABLE_DDL).unwrap();
+        conn.execute_batch(REFS_TABLE_DDL).unwrap();
+
+        for table in ["_ast", "node_defs", "node_refs"] {
+            assert!(
+                !has_column(&conn, table, "node_hash").unwrap(),
+                "precondition: {table} has no node_hash before the migration"
+            );
+        }
+
+        create_ir_tables(&conn).unwrap();
+
+        for table in ["_ast", "node_defs", "node_refs"] {
+            assert!(
+                has_column(&conn, table, "node_hash").unwrap(),
+                "{table} MUST carry node_hash after create_ir_tables — without it \
+                 every INSERT naming the column fails at runtime"
+            );
+        }
+        for table in ["node_content", "node_child"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{table} MUST exist after create_ir_tables");
+        }
+
+        // Runs on every parse, so the second call must be a no-op rather than a
+        // "duplicate column name" error.
+        create_ir_tables(&conn).unwrap();
+        assert!(has_column(&conn, "_ast", "node_hash").unwrap());
+    }
+    #[test]
+    fn has_column_distinguishes_present_from_absent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (a INTEGER, b TEXT);")
+            .unwrap();
+
+        assert!(has_column(&conn, "t", "a").unwrap(), "column a is present");
+        assert!(has_column(&conn, "t", "b").unwrap(), "column b is present");
+        assert!(
+            !has_column(&conn, "t", "nope").unwrap(),
+            "column `nope` is absent — a constant-true probe would skip the ALTER \
+             that adds it and every INSERT naming the column would then fail"
+        );
+        assert!(
+            !has_column(&conn, "t", "").unwrap(),
+            "the empty name matches nothing"
+        );
+    }
+
+    /// The ADR-0026 pointer store is `capnp_blobs` + the per-file `_ast_blob`
+    /// map + `_ast.blob_ord`. Nothing asserted the constructor actually built
+    /// them, so replacing its body with `Ok(())` passed — an arena would then
+    /// silently lack the resolution path entirely.
+    ///
+    /// Also pins idempotence: `create_pointer_store_tables` runs on every
+    /// parse, including reparses of an arena that already has `blob_ord`, and
+    /// SQLite has no `ADD COLUMN IF NOT EXISTS`.
+    #[test]
+    fn create_pointer_store_tables_builds_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_schema(&conn).unwrap();
+
+        assert!(
+            !pointer_store_present(&conn),
+            "precondition: the pointer store does not exist yet"
+        );
+
+        create_pointer_store_tables(&conn).unwrap();
+
+        for table in ["capnp_blobs", "_ast_blob"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{table} MUST exist after create_pointer_store_tables");
+        }
+        assert!(
+            has_column(&conn, "_ast", "blob_ord").unwrap(),
+            "_ast MUST carry blob_ord — it is how a row addresses its capnp record \
+             now that the map is per-file"
+        );
+        assert!(
+            pointer_store_present(&conn),
+            "pointer_store_present MUST report the store it just built; a \
+             constant-false gates the per-file delete in delete_file_rows off \
+             and leaks a stale _ast_blob row on every reparse"
+        );
+
+        // Second call must be a no-op, not an "duplicate column name" error.
+        create_pointer_store_tables(&conn).unwrap();
+        assert!(has_column(&conn, "_ast", "blob_ord").unwrap());
+    }
     #[test]
     fn sweep_orphaned_dirs_removes_empty_parents() {
         let conn = Connection::open_in_memory().unwrap();

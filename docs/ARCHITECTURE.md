@@ -86,6 +86,8 @@ Content-addressed storage and snapshot primitives used by the other crates.
 | `leyline-schema-capnp` | Capnp schemas for the Σ event log (`AstNode`, `SourceFile`, `BindingRecord`, `Head`, `AstNodeList`). Decade `ley-line-open-9d30ac` | Generated Rust bindings |
 | `leyline-ffi-helpers` | Typed helpers for the C-boundary raw-pointer pattern used by every LLO `extern "C" fn`, so the SAFETY contract lives in one place | `c_input`, `c_output` |
 | `leyline-schema-spec` | Vendor-neutral IDL crate. Ships per-capability specs (`credential-isolation/v1`, `confinement/v1`, `build-cache/v1`, `mcp-tool/v1`) with canonical test vectors + integrity/identity pins. Verified by `verify_vectors_sha256` (SHA-256 integrity) + `verify_confinement_digest` (BLAKE3-256 identity) + `capability_mapping_coverage` + `version_bump_on_vector_change` cargo tests | Non-code artifact — spec dirs + pin files |
+| `leyline-mcp-descriptor` | MCP Registry `server.json` emitter — coverage validation + render, shared across ART producers (bead `ley-line-open-4ec276`) | `render`, `ServerMeta`, `ToolRef` |
+| `leyline-mcp-protocol-schema` | MCP JSON-RPC method-name facts generated at build time from a digest-pinned schema; digest mismatch fails compilation, not a test (bead `ley-line-open-60f0d3`) | build-generated constants |
 
 **Contract:** the Σ substrate is **BLAKE3-locked** (ADR-0032 §D5). Every content address is a BLAKE3 digest (`leyline-core::substrate::ContentAddressed for [u8]`, `rs/ll-core/core/src/substrate.rs:129-147`).
 
@@ -108,13 +110,15 @@ Where source becomes structure. Parses, enriches, signs, presents.
 | `leyline-ts` | Tree-sitter AST projection + bidirectional splice | `parse`, `splice` |
 | `leyline-lsp` | LSP client for ingesting language-server analysis into SQLite | `LspClient`, `document_symbols`, `hover` |
 | `leyline-hdc` | Hyperdimensional computing — D=8192 hypervectors via bundle composition + seeded leaves; popcount-Hamming distance (ADR-0024) | `EncoderNode`, `encode_fresh`, `Hypervector` |
-| `leyline-sheaf` | Čech-cohomology engine; structural cache + δ⁰-driven invalidation (ADR-0020) | `CellComplex`, `SheafCache` |
+| `leyline-sheaf` | Čech-cohomology engine; structural cache + δ⁰-driven invalidation (ADR-0020). **3 sub-components, 3 risk profiles** — see [`sheaf/README.md`](../rs/ll-open/sheaf/README.md) | `CellComplex`, `SheafCache` |
 | `leyline-cdc` | Content-defined chunking (GearHash, xet-compatible params), 8–128 KiB bounds (`cdc/src/lib.rs:29-40`). Produces blob hashes; produces **no** root | `chunk_into`, `read_range` |
-| `leyline-fs` | Filesystem presentation — mounts arena as FUSE or NFS; optional CDC-derived chunk manifests for bounded range reads | `SqliteGraph`, `SqliteGraphAdapter`, `activate_chunked_content` |
-| `leyline-schema-bridge` | capnp compiler plugin family — capnp schemas → zod TS / Go / JSON Schema codegen; unmapped constructs are hard errors | `capnpc-schema-bridge-*` binaries |
-| `leyline-vcs` | jj sidecar — automatic versioning of arena snapshots | `VersionedGraph`, `.leyline/` virtual dir |
-| `leyline-sign` | Ed25519 `RootSigner` that signs the at-rest Σ `Head` (S1) + `verify_head` verify-on-load (S2) + the canonical key id `kid = lowercasehex(SHA-256(SPKI)[:16])` (S3, signet ADR-012); plus CMS/gpgsm verify primitives for jj commit signing (interactive host signing stays cloister-side per ADR-0019) | `Ed25519RootSigner`, `verify_head`, `canonical_kid`, Certificate, Signature |
-| `leyline-cas-ffi` | Wasm32-callable FFI for BLAKE3-substrate hash. Consumed by cloister via workerd's cdylib loader | `leyline_hash_bytes` |
+| `leyline-fs` | Filesystem presentation — mounts arena as FUSE or NFS; optional CDC-derived chunk manifests for bounded range reads. **Externally pinned** — cloister depends on this crate directly | `SqliteGraph`, `SqliteGraphAdapter`, `activate_chunked_content` |
+| `leyline-envelope` | DSSE envelope + in-toto Statement v1 attestation over `leyline-sign`'s root signer; byte-compatible hoist of rosary's `dsse.rs` | `Envelope`, `Statement`, `sign_payload`, `verify_payload` |
+| `leyline-runtime` | Capability-resolved execution lifecycle + isolation backends (`execution/v1`) — authorization, native/libkrun backends, confinement (ADR-0035). **Externally pinned** — cloister's `host-runtime` depends on this crate, gated behind its own `llo-execution` feature | `ExecutionService`, `AuthorizedExecution`, `Backend` |
+| `leyline-schema-bridge` | capnp compiler plugin family — capnp schemas → zod TS / Go / JSON Schema codegen; unmapped constructs are hard errors. Also a rosary build-anchor | `capnpc-schema-bridge-*` binaries |
+| `leyline-vcs` | jj sidecar — automatic versioning of arena snapshots. **External-facing**: no in-workspace consumer; git-rev pinned directly by rosary (see Cross-runtime consumers below) | `VersionedGraph`, `.leyline/` virtual dir |
+| `leyline-sign` | Ed25519 `RootSigner` that signs the at-rest Σ `Head` (S1) + `verify_head` verify-on-load (S2) + the canonical key id `kid = lowercasehex(SHA-256(SPKI)[:16])` (S3, signet ADR-012); plus CMS/gpgsm verify primitives for jj commit signing (interactive host signing stays cloister-side per ADR-0019). **Externally pinned twice** by cloister, at two different revs — see Cross-runtime consumers below | `Ed25519RootSigner`, `verify_head`, `canonical_kid`, Certificate, Signature |
+| `leyline-cas-ffi` | Wasm32-callable FFI for BLAKE3-substrate hash. **External-facing**: no in-workspace consumer; consumed by cloister via workerd's cdylib loader | `leyline_hash_bytes` |
 | `leyline-text-search` | Unstructured-text semantic search backend abstraction. `NullEngine` default; `WitchcraftEngine` (XTR-WARP) behind feature flag | `TextSearchEngine` trait |
 | `leyline-chat-embed` | CLI binary: semantic search over Claude Code chat databases (mache's `claude-chats` ingest) via fastembed/MiniLM | `chat-embed` binary |
 | `leyline-cli-lib` | The daemon. Owns the living db + UDS control socket + MCP HTTP transport; hosts all enrichment passes | `cmd_daemon`, `daemon::ops` |
@@ -283,10 +287,57 @@ LLO is consumed across language runtimes:
     reading `current_root` (`mache/internal/control/control.go:24-25`).
 
   It reads no CDC table. It exposes its own MCP surface for code-intel tools.
-- **cloister (TS / workerd)** — agent execution + network topology layer. Consumes leyline-cas-ffi via `cloister-cas.wasm` for substrate-aligned hashing. Calls LLO's MCP over HTTP through Cloudflare Access (per ADR-0022's Mode B).
+- **cloister (Rust / TS / workerd)** — agent execution + network topology layer. Consumes `leyline-cas-ffi` via `cloister-cas.wasm` for substrate-aligned hashing. Calls LLO's MCP over HTTP through Cloudflare Access (per ADR-0022's Mode B). Also a **direct compiled-crate consumer** — see the pin table below.
+- **rosary (Rust)** — agent orchestration + bead tracking. Direct compiled-crate consumer of `leyline-core` (CAS hashing — rosary dropped `blake3` as a direct dep so it cannot drift off the substrate lock), `leyline-vcs` (jj sidecar integration), and `leyline-envelope` (DSSE/in-toto signing hoisted out of rosary per `rosary-30ae8c`), plus a build-anchor dependency on `leyline-schema-bridge`.
 - **Control-room (Swift, future)** — consumes the same FFI surface as cloister via the C ABI.
+- **notme** — **not a dependency.** Its `server.json` hand-copies the JSON shape `leyline-mcp-descriptor` renders, with an explicit comment that the LLO version noted there is "a provenance note, not a pin." No build or runtime coupling.
 
 Naming rule (cross-repo design beads `cloister-5e4402` / `ley-line-open-5e05e6`): **anything named `leyline-*` lives in LLO**. Cloister hosts `cloister-*` bridge crates that depend on LLO primitives — never forks or symlink-plus-extensions.
+
+### Compiled-crate consumers — verified pin state (2026-08-14, against `main` = v0.18.2 / `75e3af6`)
+
+Unlike mache (binary + wire-protocol only, no compiled-crate coupling), cloister and rosary link LLO crates directly via git-rev/tag pins in their own `Cargo.toml`. This is where version skew becomes a live risk, not a hypothetical one. Distances below are `git rev-list --count <pin>..main` at the stated date — re-measure before trusting them, since only the pinning repo can move a pin:
+
+```mermaid
+graph LR
+    subgraph LLO["ley-line-open"]
+        sign["leyline-sign"]
+        fs["leyline-fs"]
+        runtime["leyline-runtime"]
+        core["leyline-core"]
+        casffi["leyline-cas-ffi"]
+        vcs["leyline-vcs"]
+        envelope["leyline-envelope"]
+        schemabridge["leyline-schema-bridge"]
+        schemago["clients/go/leyline-schema"]
+        binary["leyline binary (GH Release asset)"]
+        uds["UDS / MCP JSON wire"]
+    end
+
+    cloister -->|"rev 75e3af6, v0.18.2 — current"| fs
+    cloister -->|"rev 75e3af6, v0.18.2 — current"| runtime
+    cloister -->|"rev 75e3af6, v0.18.2 — current"| core
+    cloister -->|"rev 75e3af6, v0.18.2 — current"| casffi
+    cloister -->|"rev 75e3af6, v0.18.2 — current (crates/cas)"| sign
+    cloister -.->|"SEPARATE Cargo.lock, tools/harness-sandbox — rev a6eba83, v0.7.6, 203 commits stale"| sign
+
+    rosary -->|"rev c3515b9 — 260 commits stale"| core
+    rosary -->|"rev 1671942 — 141 commits stale"| vcs
+    rosary -->|"rev 51434261 — 32 commits stale"| envelope
+    rosary -.->|"rev c9ec2bbf, v0.8.0 — build-anchor only, not linked; 167 commits stale"| schemabridge
+
+    mache -->|"HTTP download, GH Release"| binary
+    mache -->|"line-delimited JSON"| uds
+    mache -->|"tag-pinned, decoupled via SCHEMA_VERSION"| schemago
+```
+
+Three drift findings, all worth checking before assuming a pin is current:
+
+- **cloister's main workspace is now exactly current.** `rs/crates/cas` and `rs/crates/host-runtime` (one shared `Cargo.lock`) are uniformly on rev `75e3af6` (v0.18.2) — the same commit `main` points at. The earlier code comment claiming a 3-way `leyline-core` version conflict there is stale; the lock file shows no duplicates.
+- **cloister's `leyline-sign` pin is still split across two generations within the same repo, and the gap has widened.** `tools/harness-sandbox` is a **separate crate with its own `Cargo.lock`**, still pinned at rev `a6eba83` (v0.7.6, 2026-07-13) — now **203 commits** behind, against a main workspace sitting at HEAD — with a comment asserting it's "SAME rev as `rs/crates/cas`," which is no longer true. `harness-sandbox` uses this pin to verify the `confinementDigest` Interlace cert extension; whether the cert format is still compatible across that gap is unverified, and every LLO release widens it.
+- **rosary pins three LLO crates at three different generations.** `leyline-core` at rev `c3515b9` (260 commits), `leyline-vcs` at rev `1671942` (141 commits), `leyline-envelope` at rev `51434261` (32 commits). The `leyline-vcs` pin is deliberate — it sits exactly at the commit that fixed a real incident (`ley-line-open-99a9fe` / PR #257 — `jj-lib`'s Git backend was silently compiled out, breaking every `jj git init` repo rosary dispatches against), and `workspace_root_pins_the_jj_git_backend` fails if a future repin drops the backend again. The `leyline-core` pin being the *oldest* of the three is the one to look at: rosary routes CAS hashing through `leyline-core`'s `ContentAddressed::hash` specifically so it cannot drift off the substrate lock, and a 260-commit-old substrate is a weaker version of that guarantee than the comment implies.
+
+None of these is LLO's to fix directly — every pin lives in another repo's `Cargo.toml`. What LLO owes them is published crates instead of git revs, which is what `.github/workflows/publish-crates.yml` and bead `ley-line-open-c3e8c6` exist to deliver.
 
 ---
 
@@ -312,6 +363,13 @@ Architectural decisions that shape LLO today:
 | [ADR-0030](adr/0030-sheaf-over-embeddings.md) | Sheaf over embeddings — making δ⁰ load-bearing | Rejected — NO-GO, scoped to *approximate* stalk-distance gating |
 | [ADR-0031](adr/0031-restriction-addressed-review-caching.md) | Restriction-addressed derived-view caching over CAS (the *exact* variant ADR-0030's addendum endorses) | Proposed; **amended** by ADR-0032 §D5 to drop SHA-256 |
 | [ADR-0032](adr/0032-declared-decompositions.md) | **Declared decompositions** — three identity structures, one fold operator. §D4 is the authority table this doc's [Authority model](#authority-model) implements | Proposed |
+| [ADR-0033](adr/0033-cdc-chunk-backed-content.md) | CDC chunk-backed content — a derived chunk index over declared targets | Accepted (retroactive — records what shipped since 0.10.x) |
+| [ADR-0034](adr/0034-construct-identity-content-address-pair.md) | Construct identity is a pair: `node_hash` (content) + qualified token (address) | Accepted |
+| [ADR-0035](adr/0035-confinement-manifest-and-attested-enforcement.md) | Confinement is one manifest; the enforcement mechanism is attested, not assumed | Accepted |
+| [ADR-0036](adr/0036-what-a-confinement-digest-covers.md) | What a `confinementDigest` covers — the cases the equality contract does not close | Proposed (narrowed twice; see its *Review history*) |
+| [ADR-0037](adr/0037-naming-the-proxy-channel.md) | Naming the proxy channel — `confinement/v1` assumes an egress path it cannot express | Accepted (shipped in the release that landed it) |
+| [ADR-0038](adr/0038-host-side-subscription-credential-ingress.md) | Host-side subscription credential ingress: proxy/vault custody without exposing tokens to confined harnesses | Proposed |
+| [ADR-0039](adr/0039-multi-vector-retrieval-over-cas.md) | Multi-vector retrieval over CAS — kernel-delegated caching instead of a bespoke index | Proposed — falsification ladder has not run; no implementation exists |
 
 ADRs 0017-0019 are cloister-side and live in `~/remotes/art/cloister/docs/adr/`. Mache's ADR-0024 (`incremental-dataflow-taint-as-substrate-queries`) is a separate document in the mache repo whose producer-side lives in LLO's `analysis-substrate` decade — see the decade doc for the mapping.
 

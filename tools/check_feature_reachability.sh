@@ -97,7 +97,6 @@ fi
 #
 #   <crate-dir>/<feature>   # bead — why
 not_shipping="
-ll-open/fs/splice
 ll-open/fs/verify
 ll-core/core/interrupt
 ll-core/schema-capnp/regen-fixtures
@@ -111,15 +110,16 @@ ll-open/vcs/sqlite
 # Ledger notes — why each of the above does not ship. Kept as prose beside the
 # list because a bare allowlist decays into "things we muted".
 #
-#   ll-open/fs/splice          ley-line-open-918a75 — SHIPPED DEFECT. Enabled
-#                              only by test targets; flush_node is a silent
-#                              no-op in every build, so mount writes never
-#                              reproject. Remove this line when 918a75 decides.
 #   ll-open/fs/verify          ley-line-open-b6a4dd — verify-on-fault arena
 #                              serving, deliberately default-OFF: additive API
 #                              (VerifiedArena + with_verify_on_fault), nothing
-#                              degrades when compiled out, unlike splice. The
-#                              flag flips into a shipping config in a later
+#                              degrades when compiled out. That is the whole
+#                              distinction from the splice entry this list used
+#                              to carry: splice DEGRADED when compiled out
+#                              (`flush_node` fell back to a bare `Ok(())`), so
+#                              it was a defect being recorded, not a knob. It
+#                              ships as of 918a75 and left this list. The flag
+#                              here flips into a shipping config in a later
 #                              bead; remove this line then.
 #   ll-open/ts/pyproject       ley-line-open-988b93 — NOT a grammar: a 349-line
 #                              dependency-graph projection (pyproject.toml ->

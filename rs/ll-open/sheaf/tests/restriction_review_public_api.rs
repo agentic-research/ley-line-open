@@ -487,6 +487,34 @@ fn public_api_restriction_is_cheaper_than_review() {
     }
 
     let (restriction_time, review_time) = last.expect("at least one scale");
+
+    // ALWAYS measured and printed above; asserted only under LLO_PERF_GATES=1.
+    //
+    // The load-bearing claim of this test is the ROW-COUNT assertion in the
+    // loop — `restriction_ops < review_ops` — which is what "cheaper" means
+    // structurally and holds under any scheduler. The wall-clock comparison
+    // below is a corroboration of it at MICROSECOND scale (measured 649us vs
+    // 424us on the run that first tripped it), where a single preemption
+    // reverses the ordering. It failed 1 run in 12 on an idle machine, i.e.
+    // roughly an 8% chance of reddening any CI run, on a test whose real
+    // invariant was passing every time.
+    //
+    // Same treatment, and same reasoning, as the F2 throughput ratio
+    // (`f2_concurrent_writers_throughput`, bead `ley-line-open-c6101e`): a
+    // wall-clock assertion inside the every-push gate is a race against the
+    // scheduler, so it moves behind the opt-in and `task test:perf` enforces
+    // it. The measurement is still emitted on every run, so a real regression
+    // remains visible in the log rather than being silently dropped.
+    if std::env::var("LLO_PERF_GATES").ok().as_deref() != Some("1") {
+        eprintln!(
+            "restriction-vs-review: skipping the wall-time assertion \
+             (LLO_PERF_GATES != 1). Measured restriction={restriction_time:?} \
+             review={review_time:?}; the row-count invariant was asserted above. \
+             Run `LLO_PERF_GATES=1 cargo test -p leyline-sheaf --test \
+             restriction_review_public_api` or `task test:perf` to enforce it."
+        );
+        return;
+    }
     assert!(
         restriction_time < review_time,
         "at the largest corpus the restriction ({restriction_time:?}) must be cheaper in wall \

@@ -18,10 +18,18 @@
 //! 1. **Absolute wall ceiling** — the parse must complete in under
 //!    `WALL_CEILING_MS`. The measured value is the MIN of three cold
 //!    runs: shared-runner scheduler noise is strictly additive, so the
-//!    minimum approximates true capability (a one-shot measurement lost
-//!    the runner lottery at 635ms on PR #304 with no insert-path
-//!    change), while a real regression lifts all three runs and still
-//!    trips the 500ms ceiling.
+//!    minimum approximates true capability, while a real regression
+//!    lifts all three runs and still trips the 500ms ceiling.
+//!
+//!    This ceiling is a RELEASE number and is only ever asserted in a
+//!    release build — `task test:perf` passes `--release`, and the gate
+//!    hard-skips under `debug_assertions`. A debug build runs this path
+//!    ~an order of magnitude slower, so comparing it to a release
+//!    ceiling measures the build profile, not the insert path. That
+//!    mismatch, not runner noise, is what failed `task ci` on main at
+//!    3752ce6 (580ms) and, on the same signature, PR #304 (635ms); the
+//!    min-of-three was added for that misdiagnosis and is kept because
+//!    it is still the right shape for a wall-clock gate.
 //! 2. **Per-row budget** — `wall_ms × 1000 / row_count` must stay
 //!    under `PER_ROW_BUDGET_MICROS`. This is the adaptive assertion:
 //!    if the corpus grows or shrinks across branches, the per-row time
@@ -66,10 +74,24 @@ const PER_ROW_BUDGET_MICROS: u128 = 25;
 /// rows per VALUES statement at this corpus size).
 const REPLICATION_COUNT: usize = 200;
 
+/// The one spelling of the opt-in env var. Referenced by both the reader
+/// below and the skip message, so the name exists in exactly one place.
+const GATE_ENV: &str = "LLO_PERF_GATES";
+
+/// Pure predicate over the raw env value.
+///
+/// Split out from `perf_gate_enabled` so the sanity test below can pin the
+/// "exactly the literal 1" contract WITHOUT writing to the process
+/// environment. That is not a stylistic preference — see the test for the
+/// CI failure the previous env-mutating version caused.
+fn gate_enabled_from(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
 /// Same env-var contract as `topology_pass_test.rs` — keep both in sync
 /// or callers will need two opt-in switches.
 fn perf_gate_enabled() -> bool {
-    std::env::var("LLO_PERF_GATES").ok().as_deref() == Some("1")
+    gate_enabled_from(std::env::var(GATE_ENV).ok().as_deref())
 }
 
 /// Build the synthetic corpus by copying every Go file under the
@@ -124,8 +146,28 @@ fn count_rows(db_path: &Path) -> rusqlite::Result<u64> {
 async fn cold_parse_wall_within_budget_on_synthetic_go_corpus() {
     if !perf_gate_enabled() {
         eprintln!(
-            "skipping cold-parse perf gate: LLO_PERF_GATES not set to '1'. \
+            "skipping cold-parse perf gate: {GATE_ENV} not set to '1'. \
              Run `LLO_PERF_GATES=1 cargo test --release` or `task ci`."
+        );
+        return;
+    }
+
+    // Both ceilings below are calibrated against a RELEASE build (see the
+    // module header's baseline: wall 69-76ms). A debug build runs this
+    // path roughly an order of magnitude slower, so asserting either
+    // ceiling here measures the profile, not a regression — 580ms of
+    // debug-build wall against a 500ms release ceiling is exactly how run
+    // 31848026749 failed on main.
+    //
+    // `task test:perf` passes `--release`, so the real gate is unaffected.
+    // This only catches an armed gate reaching a debug binary: a developer
+    // who follows the header's instructions but drops `--release`, or any
+    // future path that re-arms the gate where it shouldn't.
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "skipping cold-parse perf gate: {GATE_ENV}=1 but this is a debug \
+             build, and WALL_CEILING_MS/PER_ROW_BUDGET_MICROS are calibrated \
+             for --release. Run `task test:perf`."
         );
         return;
     }
@@ -134,14 +176,16 @@ async fn cold_parse_wall_within_budget_on_synthetic_go_corpus() {
     let db_dir = TempDir::new().expect("db tempdir");
     let corpus = build_corpus(corpus_root.path(), REPLICATION_COUNT).expect("build corpus");
 
-    // MIN of three cold runs, not one shot. Shared CI runners lost the
-    // one-shot lottery at 635ms against the 500ms ceiling (PR #304) with
-    // no code change on the insert path — scheduler noise is strictly
-    // ADDITIVE, so the minimum approximates true capability while a
-    // real regression (un-batched inserts, dropped BufWriter) lifts
-    // every run by multiples and still trips. Each run parses into its
-    // own fresh db so all three stay cold; the corpus build is shared
-    // and unmeasured.
+    // MIN of three cold runs, not one shot. Scheduler noise on a shared
+    // runner is strictly ADDITIVE, so the minimum approximates true
+    // capability while a real regression (un-batched inserts, dropped
+    // BufWriter) lifts every run by multiples and still trips. Each run
+    // parses into its own fresh db so all three stay cold; the corpus
+    // build is shared and unmeasured.
+    //
+    // This does NOT defend against the debug-vs-release mismatch that
+    // actually failed CI — three debug runs are all ~10× over. The
+    // `debug_assertions` skip above is what covers that.
     let mut walls_ms: Vec<u128> = Vec::with_capacity(3);
     let mut row_counts: Vec<u64> = Vec::with_capacity(3);
     for i in 0..3 {
@@ -207,35 +251,45 @@ async fn cold_parse_wall_within_budget_on_synthetic_go_corpus() {
     );
 }
 
-/// Falsifiability sanity test for the gate mechanism. Confirms the gate
-/// env-var read works correctly (we don't want a silent skip on the
-/// real test due to env-var typo).
+/// Falsifiability sanity test for the gate mechanism: the gate arms on
+/// exactly the literal `"1"` and on nothing else, so neither a loosened
+/// comparison nor a stray value can flip it.
+///
+/// This exercises the PURE predicate and never touches `std::env`, which
+/// is load-bearing rather than tidy. The previous version set
+/// `LLO_PERF_GATES=1` on the process environment and restored it
+/// afterwards, justified as:
+///
+/// > tests in this file run in serial wrt this env var because
+/// > only this test mutates it; the real gate test only reads it.
+///
+/// That is not what serial means. Cargo runs both tests in this binary on
+/// parallel threads and the environment is process-global, so "only one
+/// writer" still leaves a concurrent reader racing the write window. When
+/// the gate test's `perf_gate_enabled()` read landed inside that window it
+/// ARMED under `cargo test -p leyline-cli-lib --features vec` — a DEBUG
+/// build with the env var unset — and asserted the release-calibrated
+/// 500ms ceiling against a debug measurement.
+///
+/// That is what broke `task ci` on main at 3752ce6 (`cli-lib:test:vec`,
+/// run 31848026749, wall=580ms with `per_row=15us` comfortably inside its
+/// own 25us budget). PR #304's 635ms failure has the same signature and
+/// was read as runner noise; the min-of-three mitigation above was added
+/// for that misdiagnosis.
+///
+/// Keep this test free of `std::env` mutation. The sibling case in
+/// `daemon/sheaf_ablation.rs` (bead `ley-line-open-d71cf6`, PR #184) is
+/// the same defect and took the `#[serial(...)]` route because production
+/// code there genuinely reads the env; here the predicate is separable, so
+/// deleting the shared mutable state beats arbitrating access to it.
 #[test]
-fn perf_gate_env_var_read_is_correct() {
-    let prior = std::env::var("LLO_PERF_GATES").ok();
-    // Safety: tests in this file run in serial wrt this env var because
-    // only this test mutates it; the real gate test only reads it.
-    unsafe {
-        std::env::set_var("LLO_PERF_GATES", "1");
-    }
-    assert!(perf_gate_enabled(), "gate should be enabled when env=1");
-    unsafe {
-        std::env::set_var("LLO_PERF_GATES", "0");
-    }
-    assert!(!perf_gate_enabled(), "gate should be disabled when env=0");
-    unsafe {
-        std::env::remove_var("LLO_PERF_GATES");
-    }
+fn perf_gate_arms_on_exactly_one() {
+    assert!(gate_enabled_from(Some("1")), "gate arms on \"1\"");
+    assert!(!gate_enabled_from(Some("0")), "gate stays off on \"0\"");
+    assert!(!gate_enabled_from(None), "gate stays off when unset");
+    assert!(!gate_enabled_from(Some("")), "gate stays off on empty");
     assert!(
-        !perf_gate_enabled(),
-        "gate should be disabled when env unset"
+        !gate_enabled_from(Some("true")),
+        "gate stays off on \"true\" — the contract is the literal \"1\""
     );
-    // Restore prior state so subsequent tests in this binary see the
-    // original env.
-    unsafe {
-        match prior {
-            Some(v) => std::env::set_var("LLO_PERF_GATES", v),
-            None => std::env::remove_var("LLO_PERF_GATES"),
-        }
-    }
 }

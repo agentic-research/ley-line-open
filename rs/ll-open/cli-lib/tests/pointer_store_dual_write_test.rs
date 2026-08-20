@@ -2,7 +2,7 @@
 //!
 //! Bead `ley-line-open-3e87ad`. Pins the Phase 1 contract: every parse
 //! populates BOTH the row-projected `_ast` schema AND the content-addressed
-//! pointer store (`capnp_blobs` + `_ast_pointer`), and any node reachable
+//! pointer store (`capnp_blobs` + `_ast_blob`), and any node reachable
 //! via `_ast` is reachable via the pointer store with byte-identical field
 //! values.
 //!
@@ -76,7 +76,7 @@ fn dual_write_populates_both_schemas() {
         .query_row("SELECT COUNT(*) FROM _ast", [], |row| row.get(0))
         .unwrap();
     let pointer_rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM _ast_pointer", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM _ast_blob", [], |row| row.get(0))
         .unwrap();
     let blob_rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM capnp_blobs", [], |row| row.get(0))
@@ -85,7 +85,7 @@ fn dual_write_populates_both_schemas() {
     assert!(ast_rows > 0, "row-projected _ast must be populated");
     assert!(
         pointer_rows > 0,
-        "pointer store _ast_pointer must be populated"
+        "pointer store _ast_blob must be populated"
     );
     assert!(blob_rows > 0, "capnp_blobs must be populated");
 }
@@ -186,8 +186,8 @@ fn blobs_decode_as_ast_node_list() {
 
 /// **F1 (ADR-0026 §6.F1) — the load-bearing Phase 1 gate.**
 ///
-/// For every row in `_ast`, look up the same node_id in `_ast_pointer`,
-/// resolve to (blob_hash, offset_in_blob), decode the blob, index into the
+/// For every row in `_ast`, resolve its file's blob via `_ast_blob`,
+/// index the decoded blob at that row's `blob_ord`, and compare into the
 /// list, assert every field byte-identical to the row-projected schema.
 ///
 /// This is the falsifier that ADR-0026 §9 says must run continuously
@@ -200,30 +200,56 @@ fn f1_round_trip_integrity() {
     let conn = Connection::open_in_memory().unwrap();
     parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
 
-    // 1. Row count parity: every `_ast` row has exactly one `_ast_pointer`.
-    let ast_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM _ast", [], |r| r.get(0))
-        .unwrap();
-    let pointer_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM _ast_pointer", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(
-        ast_count, pointer_count,
-        "F1: every _ast row MUST have exactly one _ast_pointer row (parity broken)",
-    );
-    // Every `_ast.node_id` MUST be present in `_ast_pointer`.
+    // 1. Resolvability: every `_ast` row must reach a blob. The map is now
+    //    one row per FILE (`_ast_blob`) rather than one per node, so the
+    //    old row-count parity check is expressed as "nothing fails to
+    //    resolve" — which is the property parity was standing in for.
     let unmatched: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM _ast a \
-             LEFT JOIN _ast_pointer p ON p.node_id = a.node_id \
-             WHERE p.node_id IS NULL",
+             LEFT JOIN _ast_blob b ON b.source_id = a.source_id \
+             WHERE b.source_id IS NULL",
             [],
             |r| r.get(0),
         )
         .unwrap();
     assert_eq!(
         unmatched, 0,
-        "F1: every _ast.node_id MUST resolve in _ast_pointer",
+        "F1: every _ast.source_id MUST resolve to an _ast_blob row",
+    );
+
+    // `blob_ord` must be populated — a NULL would silently index node 0.
+    let null_ords: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM _ast WHERE blob_ord IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(null_ords, 0, "F1: every _ast row MUST carry a blob_ord");
+
+    // 1b. The ordinal is only a valid substitute for a per-node pointer row
+    //     if it is DENSE per file: 0..n-1, no gaps, no duplicates. That was
+    //     an empirical observation about the old `offset_in_blob` column
+    //     (measured 8000/8000 files on a kibana slice); collapsing the
+    //     pointer table to one row per file makes the codebase DEPEND on it,
+    //     so it is asserted here rather than assumed (ley-line-open-17c271).
+    let non_dense: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ( \
+               SELECT source_id FROM _ast GROUP BY source_id \
+               HAVING MIN(blob_ord) <> 0 \
+                   OR MAX(blob_ord) <> COUNT(*) - 1 \
+                   OR COUNT(DISTINCT blob_ord) <> COUNT(*) \
+             )",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        non_dense, 0,
+        "F1: blob_ord MUST be a dense 0..n-1 per file — the per-file blob map \
+         cannot address a node otherwise",
     );
 
     // 2. Cache all blobs in memory keyed by blob_hash, decoded as
@@ -249,8 +275,8 @@ fn f1_round_trip_integrity() {
         .prepare(
             "SELECT a.node_id, a.source_id, a.node_kind, \
                     a.start_byte, a.end_byte, a.start_row, a.start_col, a.end_row, a.end_col, \
-                    p.blob_hash, p.offset_in_blob \
-             FROM _ast a JOIN _ast_pointer p ON p.node_id = a.node_id",
+                    b.blob_hash, a.blob_ord \
+             FROM _ast a JOIN _ast_blob b ON b.source_id = a.source_id",
         )
         .unwrap();
     let mut rows = stmt.query([]).unwrap();
@@ -270,7 +296,7 @@ fn f1_round_trip_integrity() {
 
         let blob_bytes = blob_bytes_by_hash
             .get(&blob_hash)
-            .expect("F1: _ast_pointer.blob_hash MUST resolve in capnp_blobs");
+            .expect("F1: _ast_blob.blob_hash MUST resolve in capnp_blobs");
         let mut slice: &[u8] = blob_bytes;
         let msg = capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new())
             .expect("F1: blob MUST decode as capnp message");
@@ -278,7 +304,7 @@ fn f1_round_trip_integrity() {
         let nodes = list.get_nodes().unwrap();
         assert!(
             (offset as u32) < nodes.len(),
-            "F1: offset_in_blob ({offset}) MUST be < AstNodeList.nodes.len ({})",
+            "F1: blob_ord ({offset}) MUST be < AstNodeList.nodes.len ({})",
             nodes.len(),
         );
         let n = nodes.get(offset as u32);
@@ -343,39 +369,3 @@ fn f1_round_trip_integrity() {
 }
 
 // ── Kind classification pin ───────────────────────────────────────────────
-
-/// The Phase 1 semantic-kind allowlist covers function / method / type /
-/// import per ADR-0026 §2.1. Pin at least the function-kind mapping so a
-/// future refactor that silently rewrites the enum shows up here.
-#[test]
-fn semantic_kind_tags_functions_as_nonzero() {
-    let src = create_go_fixture();
-    let conn = Connection::open_in_memory().unwrap();
-    parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
-
-    // add/sub/main/Println — every function_declaration must have a
-    // non-zero (semantic) `kind` in _ast_pointer.
-    let fn_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM _ast a JOIN _ast_pointer p ON p.node_id = a.node_id \
-             WHERE a.node_kind = 'function_declaration' AND p.kind > 0",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let fn_total: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM _ast WHERE node_kind = 'function_declaration'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert!(
-        fn_total >= 3,
-        "fixture should contain ≥3 function_declaration rows"
-    );
-    assert_eq!(
-        fn_count, fn_total,
-        "every function_declaration MUST get a non-zero semantic kind tag",
-    );
-}

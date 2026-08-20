@@ -41,6 +41,15 @@ jobs:
   ci:
     name: Check + Clippy + Test (task ci)
     runs-on: ubuntu-latest
+    # A hung test otherwise burns GitHub's 6-hour default. This job's observed
+    # range is 9-11 min (runs 32059251009, 32071678194), so 30 leaves ~3x
+    # headroom for a cold cache while still failing a wedge in minutes.
+    #
+    # Not hypothetical: `KrunWorkerBackend::start` can block indefinitely
+    # inside `Command::spawn`, and did — 1h33m at 0% CPU, killed by hand
+    # (bead `ley-line-open-cdd5d0`). This bounds the blast radius; it is not
+    # the fix for that bug.
+    timeout-minutes: 30
     steps:
       # SHA-pinned: actions/checkout@v6.0.2 (Node 24)
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd

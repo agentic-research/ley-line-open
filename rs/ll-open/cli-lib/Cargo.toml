@@ -12,7 +12,17 @@ lsp = ["dep:leyline-lsp"]
 # `validate` feature only; does not pull `fuse`/`nfs`. Default-on so
 # the op is always available; turn off for ultra-slim builds.
 validate = ["leyline-fs/validate"]
-mount = ["leyline-fs/nfs", "leyline-fs/fuse", "leyline-fs/validate"]
+# `splice` rides with `mount` rather than standing alone, because the only
+# caller of `flush_node` is the mount write path (`fs/src/fuse.rs` flush +
+# fsync). Without it the trait's default `flush_node` — a bare `Ok(())` —
+# was what every shipped binary compiled, so a FUSE write reported success
+# and never reprojected (ley-line-open-918a75; DECISION 2026-07-27 was
+# "FINISH IT, do not remove"). Mounting without splice is the broken
+# configuration, so the two are not separable knobs.
+#
+# Costs no new system dep: `leyline-fs/splice` pulls `leyline-ts`, which
+# cli-lib already depends on directly.
+mount = ["leyline-fs/nfs", "leyline-fs/fuse", "leyline-fs/validate", "leyline-fs/splice"]
 vec = ["dep:sqlite-vec", "dep:fastembed"]
 # HDC structural-equivalence surface exposed as daemon ops
 # (ley-line-open-c32596). Pulls leyline-hdc + leyline-ts's `rust`

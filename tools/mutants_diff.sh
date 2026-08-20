@@ -228,20 +228,30 @@ run_slice() {
 # behind non-default features, it needs the same routing — a default-features
 # run structurally cannot test it.
 if [ "$SCOPE" = all ]; then
-    # `refs.rs` contains HCL extraction behind an optional grammar feature, and
-    # `pyproject.rs` is behind `pyproject`. Keep both enabled in the generic
-    # slice: without the feature, cargo-mutants mutates the gated lines while
-    # compiling them OUT, so every mutant in that module survives having tested
-    # nothing. That is a false survivor, not a missing test — the module's own
-    # `#[cfg(test)]` tests kill it the moment the feature is on.
+    # EVERY non-default feature that gates covered code in a generic-slice
+    # package must be listed here. Without the feature, cargo-mutants mutates
+    # the gated lines while compiling them OUT, so every mutant in that module
+    # survives having tested nothing. It reports MISSED, which reads as "you
+    # are missing a test" when the truth is "this gate never saw the module."
     #
-    # `pyproject` was added after `project_pyproject_into -> Ok(())` survived a
-    # slice in which `leyline-ts` compiled 73 tests; with the feature it is 184
-    # and four of them assert the projected rows directly. This is the routing
-    # the comment above already prescribed, applied to the second crate to need
-    # it. Any future non-default feature hiding covered code belongs here too.
+    # Measured before adding them — mutants in the module, gate as it stood:
+    #
+    #   ll-open/sign/src/root_signer.rs        24 tested, 24 MISSED
+    #   ll-open/text-search/src/witchcraft.rs  28 tested, 28 MISSED
+    #   ll-core/core/src/interrupt.rs          25 tested, 25 MISSED
+    #   ll-open/ts/src/pyproject.rs             1 MISSED (the one that surfaced this)
+    #
+    # With the features on, 44 of those are caught. `root_signer`'s 23 tests
+    # catch 18 of its 20 viable mutants — strong tests the gate had simply
+    # never run. The remainder are genuine gaps, tracked on
+    # `ley-line-open-b23c41`, and now visible instead of laundered.
+    #
+    # `witchcraft.rs` did not even COMPILE under its feature: PR #210's
+    # std::sync -> parking_lot refactor left six `.map_err()` calls on a
+    # non-poisoning guard, and nothing built the module for five weeks. A
+    # feature the gate cannot see is a feature CI cannot see.
     run_slice lib \
-        --features hcl,pyproject \
+        --features hcl,pyproject,root-signer,engine-witchcraft,interrupt \
         --exclude 'll-open/fs/**' \
         --exclude 'll-open/runtime/**' \
         --exclude 'll-open/cli-lib/**' \

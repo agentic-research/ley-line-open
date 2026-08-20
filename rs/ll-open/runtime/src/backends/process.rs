@@ -32,33 +32,44 @@ pub(super) struct SupervisionLabels {
     pub(super) ephemeral: &'static str,
 }
 
-pub(super) fn configure_process_group(command: &mut Command) {
-    // SAFETY: the injected call is the async-signal-safe `setpgid` syscall;
-    // see `configure_process_group_with` for the `pre_exec` contract.
-    configure_process_group_with(command, || unsafe { libc::setpgid(0, 0) });
-}
-
-/// `configure_process_group` with the syscall injected.
+/// Place the worker in its own process group, so every terminal path can reap
+/// the WHOLE group rather than just the leader.
 ///
-/// The failure branch is unreachable from a test that can only call the real
-/// `setpgid`, which has no portable way to fail here — so it survived
-/// mutation as a branch nothing observes. Taking the syscall as a parameter
-/// makes "group setup failed at the OS boundary" a state a test can produce,
-/// which matters because that failure is what the fallback in
-/// [`terminate_process_group`] exists to cover.
-fn configure_process_group_with(command: &mut Command, setpgid: fn() -> libc::c_int) {
-    // SAFETY: `pre_exec` runs in the child after fork and before exec. The
-    // callback performs only the async-signal-safe syscall it is given and
-    // allocates no Rust state.
-    unsafe {
-        command.pre_exec(move || {
-            if setpgid() == -1 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
-    }
+/// Uses `Command::process_group` and NOT `pre_exec(setpgid)`, and the
+/// difference is a hang, not a style preference.
+///
+/// `pre_exec` installs a closure, and std refuses `posix_spawn` when any
+/// closure is present (`!self.get_closures().is_empty() => return Ok(None)` in
+/// `sys::process::unix`). That forces the fork+exec path, which allocates a
+/// CLOEXEC error pipe for the child to report exec failure on: the parent
+/// blocks reading it until the child either writes an errno or execs, closing
+/// its end via CLOEXEC.
+///
+/// On a platform without `pipe2` — macOS is one, and std says so in
+/// `sys::pipe::unix`: "The only known way right now to create atomically set
+/// the CLOEXEC flag is to use the `pipe2` syscall" — that pipe is created by
+/// `libc::pipe()` and then marked CLOEXEC in a SECOND step. Between the two, a
+/// fork on any other thread inherits the write end, and the inherited copy has
+/// no CLOEXEC to close it. It outlives that child's exec, the original
+/// parent's read never reaches EOF, and `Command::spawn` blocks forever.
+///
+/// That window is real, and closing it is why this uses `process_group`.
+///
+/// It is NOT known to be `ley-line-open-cdd5d0`. An interleaved A/B — 60
+/// iterations per arm, arms alternating inside each iteration, 6 CPU hogs at
+/// `--test-threads=16` — measured 2 failures on `pre_exec` against 3 on
+/// `process_group`: indistinguishable. The flake's symptom is also a
+/// readiness TIMEOUT, meaning `spawn` returned, which is not the hang this
+/// mechanism produces. Do not read this comment as a fix for that bead.
+///
+/// `process_group` carries the same request through
+/// `POSIX_SPAWN_SETPGROUP`/`posix_spawnattr_setpgroup` on the `posix_spawn`
+/// fast path, so no such pipe is ever created and the window does not exist.
+/// A failure to set the group still fails the spawn — libc reports it — which
+/// is the property `a_worker_lands_in_its_own_process_group` pins directly.
+pub(super) fn configure_process_group(command: &mut Command) {
+    // 0 means "the child's own pid", matching `setpgid(0, 0)`.
+    command.process_group(0);
 }
 
 pub(super) fn terminate_process_group(pid: u32) {
@@ -429,9 +440,8 @@ pub(super) fn make_tree_removable(
 mod tests {
     use super::{
         SupervisionLabels, WorkerProcess, await_exit_without_reaping, cleanup_tempdir,
-        configure_process_group, configure_process_group_with, finish_failed_start,
-        make_tree_removable, read_readiness_line, retry_while_interrupted, supervise_worker,
-        terminate_process_group,
+        configure_process_group, finish_failed_start, make_tree_removable, read_readiness_line,
+        retry_while_interrupted, supervise_worker, terminate_process_group,
     };
     use crate::ExecutionError;
     use std::fs;
@@ -475,25 +485,48 @@ mod tests {
         );
     }
 
-    /// Group setup failing at the OS boundary must fail the spawn, not be
-    /// swallowed into a worker silently sharing its parent's group.
+    /// The worker must land in its OWN process group, not share its parent's.
     ///
     /// A worker in the parent's group is the dangerous shape: the supervisor
     /// believes it owns a group it does not, and the guarantee that every
     /// terminal path reaps the *whole* group quietly degrades to reaping one
-    /// process. Real `setpgid(0, 0)` has no portable way to fail here, so the
-    /// syscall is injected.
+    /// process.
+    ///
+    /// This asserts the guarantee DIRECTLY — spawn, then ask the OS which
+    /// group the child is in. The previous version injected a failing
+    /// `setpgid` instead, because `pre_exec` was the mechanism and a real
+    /// `setpgid(0, 0)` has no portable way to fail here. `process_group` moved
+    /// the request into `posix_spawn` (see `configure_process_group` for why
+    /// that matters — it is what stops `Command::spawn` wedging), where there
+    /// is no callback to inject into. The positive property is both observable
+    /// and the thing actually promised, so it is the better assertion
+    /// regardless: it fails if the call is dropped, and it fails if the group
+    /// is established as something other than the child's own.
     #[test]
-    fn a_worker_whose_process_group_cannot_be_established_never_starts() {
+    fn a_worker_lands_in_its_own_process_group() {
         let mut command = Command::new("sleep");
         command.arg("30");
-        configure_process_group_with(&mut command, || -1);
+        configure_process_group(&mut command);
 
-        let spawned = command.spawn();
-        assert!(
-            spawned.is_err(),
-            "a worker that could not be placed in its own process group must \
-             not start — the supervisor would otherwise reap only part of it"
+        let mut child = command.spawn().expect("sleep must spawn");
+        let pid = child.id() as libc::pid_t;
+        // SAFETY: both calls only read process-group state. `getpgid(0)` is
+        // this process; `getpgid(pid)` is the live child, which has not been
+        // reaped yet because `child` is still held.
+        let (child_pgid, parent_pgid) = unsafe { (libc::getpgid(pid), libc::getpgid(0)) };
+
+        terminate_process_group(child.id());
+        let _ = child.wait();
+
+        assert_eq!(
+            child_pgid, pid,
+            "the worker must LEAD its own process group, so that signalling \
+             -pgid reaches the worker and everything it spawned"
+        );
+        assert_ne!(
+            child_pgid, parent_pgid,
+            "a worker sharing the supervisor's group means every group-wide \
+             kill either misses the worker's children or hits the supervisor"
         );
     }
 

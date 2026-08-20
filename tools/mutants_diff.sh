@@ -228,18 +228,82 @@ run_slice() {
 # behind non-default features, it needs the same routing — a default-features
 # run structurally cannot test it.
 if [ "$SCOPE" = all ]; then
-    # `refs.rs` contains HCL extraction behind an optional grammar feature.
-    # Keep HCL enabled in the generic slice: without it, cargo-mutants can
-    # mutate the feature-gated lines while compiling them out, which reports
-    # false surviving mutants. The tiny grammar adds coverage without changing
-    # the default-feature contract exercised by the rest of this invocation.
-    run_slice lib \
-        --features hcl \
-        --exclude 'll-open/fs/**' \
-        --exclude 'll-open/runtime/**' \
-        --exclude 'll-open/cli-lib/**' \
-        --exclude 'll-open/cli/**' \
-        --exclude 'll-open/schema-bridge/**'
+    # cargo-mutants selects only the packages the diff touches, and cargo
+    # REJECTS a `--features` name that none of the selected packages declares.
+    # A STATIC list is therefore wrong, and was already wrong before these
+    # entries were added: `--features hcl` broke every diff that did not touch
+    # leyline-ts with "the package 'X' does not contain this feature: hcl" — a
+    # BASELINE BROKEN whose message says nothing about the code under test.
+    # Build the list from the packages actually in the diff instead.
+    #
+    # Each entry is a non-default feature gating COVERED code in a generic-slice
+    # package. Without it, cargo-mutants mutates the gated lines while compiling
+    # them OUT, so every mutant in that module survives having tested nothing.
+    # It reports MISSED, which reads as "you are missing a test" when the truth
+    # is "this gate never saw the module."
+    #
+    # Measured before these were wired in — mutants in the module, gate as it
+    # then stood:
+    #
+    #   ll-open/sign/src/root_signer.rs        24 tested, 24 MISSED
+    #   ll-open/text-search/src/witchcraft.rs  28 tested, 28 MISSED
+    #   ll-core/core/src/interrupt.rs          25 tested, 25 MISSED
+    #   ll-open/ts/src/pyproject.rs             1 MISSED (the one that surfaced it)
+    #
+    # With the features on, 44 of those are caught. `root_signer`'s 23 tests
+    # catch 18 of its 20 viable mutants — strong tests the gate had never run.
+    # The remainder are genuine gaps, tracked on `ley-line-open-b23c41`, and now
+    # visible rather than laundered into a false green.
+    generic_features=''
+    add_generic_features() {
+        package_changed_in_diff "$1" || return 0
+        generic_features="${generic_features:+$generic_features,}$2"
+    }
+    add_generic_features ll-open/ts   hcl,pyproject
+    add_generic_features ll-core/core interrupt
+    add_generic_features ll-open/sign root-signer
+
+    # `witchcraft.rs` is EXCLUDED from mutation rather than given its feature.
+    #
+    # Its `TextSearchEngine` impl — upsert, remove, finalize, search, len,
+    # clear — cannot be reached without a live `Embedder`, and `Embedder::new`
+    # requires a T5 model directory (tokenizer + safetensors). CI has no such
+    # directory; that is the same reason `engine-witchcraft` sits on the
+    # not-shipping ledger. Enabling the feature here makes the gate honest and
+    # then permanently red: it reports 7 surviving whole-method stubs that no
+    # test CI can run is able to kill.
+    #
+    # Excluding is the lesser evil ONLY because it is written down. Without the
+    # feature the same 7 would still be enumerated and reported MISSED, which is
+    # the false-survivor reading this whole feature-routing block exists to end;
+    # an exclusion at least says which code is unmutated and why.
+    #
+    # `check_feature_reachability.sh` Claim 3 still compiles this module with
+    # its feature and runs its tests, so it cannot rot the way it did between
+    # PR #210 and 2026-08-20. Remove this exclusion when the engine's DB layer
+    # is separable from the Embedder, or when CI carries the assets —
+    # `ley-line-open-b23c41`.
+    witchcraft_exclusion="ll-open/text-search/src/witchcraft.rs"
+
+    if [ -n "$generic_features" ]; then
+        echo "generic slice features (from packages in the diff): $generic_features"
+        run_slice lib \
+            --features "$generic_features" \
+            --exclude "$witchcraft_exclusion" \
+            --exclude 'll-open/fs/**' \
+            --exclude 'll-open/runtime/**' \
+            --exclude 'll-open/cli-lib/**' \
+            --exclude 'll-open/cli/**' \
+            --exclude 'll-open/schema-bridge/**'
+    else
+        run_slice lib \
+            --exclude "$witchcraft_exclusion" \
+            --exclude 'll-open/fs/**' \
+            --exclude 'll-open/runtime/**' \
+            --exclude 'll-open/cli-lib/**' \
+            --exclude 'll-open/cli/**' \
+            --exclude 'll-open/schema-bridge/**'
+    fi
 fi
 
 # schema-bridge is the same case runtime and cli-lib are, in its purest form:

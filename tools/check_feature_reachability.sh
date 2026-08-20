@@ -292,4 +292,59 @@ if [ "$failed" -ne 0 ]; then
     printf 'Add a test target that enables it, or stop shipping it.\n' >&2
     exit 1
 fi
-printf 'feature reachability + coverage verified against the shipping configurations\n'
+# ── Claim 3: every NOT-SHIPPING feature must still COMPILE, tests included ──
+#
+# Claim 1 lets a feature opt out of shipping. Nothing then compiled it, so the
+# ledger above quietly became a list of code that no build in this repo touches
+# — and unbuilt code does not stay correct just because it stopped being
+# interesting.
+#
+# `engine-witchcraft` spent five weeks proving it. PR #210's
+# `std::sync::{Mutex,RwLock}` -> parking_lot refactor rewrote the mutex type and
+# left six `.map_err()` calls behind on a guard that no longer returns a
+# `Result`. The module — 444 lines carrying five tests — did not compile AT ALL,
+# and no gate said so, because every gate skipped it. A workspace-wide refactor
+# is exactly the change that reaches this code, and exactly the one nothing
+# verified against it.
+#
+# It also blinded the mutation gate: `tools/mutants_diff.sh` mutates gated
+# source whether or not the gate is on, so all 28 of witchcraft's mutants
+# reported MISSED while testing nothing — a false survivor that reads as a
+# missing test.
+#
+# Not-shipping describes what USERS get. It is not permission for the tree to
+# stop building. `--lib --no-run` compiles the test targets too, which is what
+# catches a break confined to `#[cfg(test)]`.
+for entry in $not_shipping; do
+    dir=${entry%/*}
+    feature=${entry##*/}
+    manifest="$dir/Cargo.toml"
+    if [ ! -f "$manifest" ]; then
+        printf 'feature-rot FAILED: %s names %s, which does not exist — stale ledger entry\n' \
+            "$entry" "$manifest" >&2
+        failed=1
+        continue
+    fi
+    pkg=$(sed -n 's/^name = "\(.*\)"/\1/p' "$manifest" | head -1)
+    if [ -z "$pkg" ]; then
+        printf 'feature-rot FAILED: could not read a package name from %s\n' "$manifest" >&2
+        failed=1
+        continue
+    fi
+    if ! cargo test --package "$pkg" --features "$feature" --lib --no-run >/dev/null 2>&1; then
+        printf 'feature-rot FAILED: %s/%s is on the not-shipping ledger and no longer COMPILES\n' \
+            "$dir" "$feature" >&2
+        printf '                    reproduce: cargo test --package %s --features %s --lib\n' \
+            "$pkg" "$feature" >&2
+        failed=1
+    fi
+done
+
+if [ "$failed" -ne 0 ]; then
+    printf '\nCode behind a not-shipping feature is still in the tree and still swept up by\n' >&2
+    printf 'every workspace-wide refactor. Fix it, or delete the feature and its module —\n' >&2
+    printf 'those are the two honest options. Leaving it on the ledger is how it rots.\n' >&2
+    exit 1
+fi
+
+printf 'feature reachability + coverage + not-shipping build verified against the shipping configurations\n'

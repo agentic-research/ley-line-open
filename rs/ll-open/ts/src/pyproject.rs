@@ -60,17 +60,16 @@ pub fn project_pyproject_into(content: &str, conn: &Connection) -> Result<()> {
         .as_secs() as i64;
 
     // Root directory
-    insert_node(conn, "", "", "", 1, 0, mtime, "")?;
+    insert_node(conn, "", "", 1, 0, mtime, "")?;
 
     // /project metadata
     if let Some(project) = doc.get("project").and_then(|v| v.as_table()) {
-        insert_node(conn, "project", "", "project", 1, 0, mtime, "")?;
+        insert_node(conn, "project", "project", 1, 0, mtime, "")?;
 
         if let Some(name) = project.get("name").and_then(|v| v.as_str()) {
             insert_node(
                 conn,
                 "project/name",
-                "project",
                 "name",
                 0,
                 name.len() as i64,
@@ -82,7 +81,6 @@ pub fn project_pyproject_into(content: &str, conn: &Connection) -> Result<()> {
             insert_node(
                 conn,
                 "project/version",
-                "project",
                 "version",
                 0,
                 version.len() as i64,
@@ -94,7 +92,6 @@ pub fn project_pyproject_into(content: &str, conn: &Connection) -> Result<()> {
             insert_node(
                 conn,
                 "project/description",
-                "project",
                 "description",
                 0,
                 desc.len() as i64,
@@ -106,7 +103,6 @@ pub fn project_pyproject_into(content: &str, conn: &Connection) -> Result<()> {
             insert_node(
                 conn,
                 "project/requires-python",
-                "project",
                 "requires-python",
                 0,
                 rp.len() as i64,
@@ -117,7 +113,7 @@ pub fn project_pyproject_into(content: &str, conn: &Connection) -> Result<()> {
 
         // /deps — project.dependencies
         if let Some(deps) = project.get("dependencies").and_then(|v| v.as_array()) {
-            insert_node(conn, "deps", "", "deps", 1, 0, mtime, "")?;
+            insert_node(conn, "deps", "deps", 1, 0, mtime, "")?;
             for raw in deps {
                 if let Some(s) = raw.as_str() {
                     let dep = parse_dep(s).with_context(|| format!("parsing dep: {s}"))?;
@@ -125,7 +121,6 @@ pub fn project_pyproject_into(content: &str, conn: &Connection) -> Result<()> {
                     insert_node(
                         conn,
                         &id,
-                        "deps",
                         &dep.name,
                         0,
                         dep.version_spec.len() as i64,
@@ -141,7 +136,7 @@ pub fn project_pyproject_into(content: &str, conn: &Connection) -> Result<()> {
     if let Some(groups) = doc.get("dependency-groups").and_then(|v| v.as_table()) {
         for (group_name, entries) in groups {
             let group_id = group_name.as_str();
-            insert_node(conn, group_id, "", group_id, 1, 0, mtime, "")?;
+            insert_node(conn, group_id, group_id, 1, 0, mtime, "")?;
             if let Some(arr) = entries.as_array() {
                 for raw in arr {
                     if let Some(s) = raw.as_str() {
@@ -151,7 +146,6 @@ pub fn project_pyproject_into(content: &str, conn: &Connection) -> Result<()> {
                         insert_node(
                             conn,
                             &id,
-                            group_id,
                             &dep.name,
                             0,
                             dep.version_spec.len() as i64,
@@ -170,10 +164,10 @@ pub fn project_pyproject_into(content: &str, conn: &Connection) -> Result<()> {
             .get("optional-dependencies")
             .and_then(|v| v.as_table())
         {
-            insert_node(conn, "optional", "", "optional", 1, 0, mtime, "")?;
+            insert_node(conn, "optional", "optional", 1, 0, mtime, "")?;
             for (extra_name, entries) in opt {
                 let extra_id = format!("optional/{extra_name}");
-                insert_node(conn, &extra_id, "optional", extra_name, 1, 0, mtime, "")?;
+                insert_node(conn, &extra_id, extra_name, 1, 0, mtime, "")?;
                 if let Some(arr) = entries.as_array() {
                     for raw in arr {
                         if let Some(s) = raw.as_str() {
@@ -183,7 +177,6 @@ pub fn project_pyproject_into(content: &str, conn: &Connection) -> Result<()> {
                             insert_node(
                                 conn,
                                 &id,
-                                &extra_id,
                                 &dep.name,
                                 0,
                                 dep.version_spec.len() as i64,

@@ -93,9 +93,23 @@ pub const IR_SCHEMA_VERSION: &str = "merkle-ast-v2";
 /// - `projection-v2` — `_ast_blob` + `_ast.blob_ord`.
 /// - `projection-v3` — `node_defs`/`node_refs` carry their own span and
 ///   grammar kind, so resolving a definition no longer JOINs `_ast`.
+/// - `projection-v4` — `nodes.parent_id` is DERIVED, not stored: a VIRTUAL
+///   generated column over `id` and `name`. Reads are unaffected —
+///   `SELECT parent_id`, `SELECT *`, and `WHERE parent_id = ?` all behave as
+///   before, the column keeps its declared position, and the index still
+///   serves the lookup. Writers are NOT: an INSERT or UPDATE naming
+///   `parent_id` is rejected at prepare time ("cannot INSERT into generated
+///   column"). Two introspection surfaces move with it — `pragma_table_info`
+///   does not list generated columns AT ALL (only `pragma_table_xinfo`
+///   does), and the `sqlite_master` DDL text changes, so a byte-identical
+///   pin needs re-pinning.
 ///
-/// Bump on ANY table added or removed, or column added or removed.
-pub const PROJECTION_SCHEMA_VERSION: &str = "projection-v3";
+/// Bump on ANY table added or removed, or column added or removed. Two
+/// changes in flight at once need two numbers: v3 and v4 landed in the same
+/// window, and both first claimed v3 — a clean textual merge, because both
+/// wrote the same string, describing two different table shapes. A consumer
+/// reading that would have had no way to tell which one it held.
+pub const PROJECTION_SCHEMA_VERSION: &str = "projection-v4";
 
 pub const WIRE_FORMAT_MAJOR: u32 = 1;
 

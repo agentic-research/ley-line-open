@@ -209,10 +209,10 @@ pub fn project_lsp_into(
         .as_secs() as i64;
 
     // Root
-    insert_node(conn, "", "", "", 1, 0, mtime, "")?;
+    insert_node(conn, "", "", 1, 0, mtime, "")?;
 
     // /symbols — document symbol hierarchy
-    insert_node(conn, "symbols", "", "symbols", 1, 0, mtime, "")?;
+    insert_node(conn, "symbols", "symbols", 1, 0, mtime, "")?;
     let collected = walk_symbols(conn, symbols, "symbols", mtime)?;
 
     // ASSERT THE MECHANISM FIRED (bead `ley-line-open-2607d2`).
@@ -250,7 +250,7 @@ pub fn project_lsp_into(
 
     // /diagnostics — flat list keyed by severity + index
     if !diagnostics.is_empty() {
-        insert_node(conn, "diagnostics", "", "diagnostics", 1, 0, mtime, "")?;
+        insert_node(conn, "diagnostics", "diagnostics", 1, 0, mtime, "")?;
 
         for severity_label in &["error", "warning", "info", "hint"] {
             let severity_val = match *severity_label {
@@ -269,16 +269,7 @@ pub fn project_lsp_into(
             }
 
             let group_id = format!("diagnostics/{severity_label}");
-            insert_node(
-                conn,
-                &group_id,
-                "diagnostics",
-                severity_label,
-                1,
-                0,
-                mtime,
-                "",
-            )?;
+            insert_node(conn, &group_id, severity_label, 1, 0, mtime, "")?;
 
             for (i, diag) in matching.iter().enumerate() {
                 let diag_id = format!("{group_id}/{i}");
@@ -296,7 +287,6 @@ pub fn project_lsp_into(
                 insert_node(
                     conn,
                     &diag_id,
-                    &group_id,
                     &name,
                     0,
                     record_str.len() as i64,
@@ -864,10 +854,10 @@ pub fn project_definitions_into_nodes(
     // type mismatch) MUST propagate — silently swallowing them via
     // `let _ =` would let children land under a missing parent dir,
     // producing orphaned nodes that downstream walks can't navigate to.
-    insert_node(conn, "definitions", "", "definitions", 1, 0, mtime, "")?;
+    insert_node(conn, "definitions", "definitions", 1, 0, mtime, "")?;
 
     let parent_id = format!("definitions/{node_id}");
-    insert_node(conn, &parent_id, "definitions", node_id, 1, 0, mtime, "")?;
+    insert_node(conn, &parent_id, node_id, 1, 0, mtime, "")?;
 
     for (i, loc) in locations.iter().enumerate() {
         let def_id = format!("{parent_id}/{i}");
@@ -881,7 +871,6 @@ pub fn project_definitions_into_nodes(
         insert_node(
             conn,
             &def_id,
-            &parent_id,
             &format!("{i}"),
             0,
             record_str.len() as i64,
@@ -906,10 +895,10 @@ pub fn project_references_into_nodes(
     // real errors (missing schema, locked db) instead of orphaning
     // children under a parent that failed to insert. See the matching
     // explanation in project_definitions_into_nodes.
-    insert_node(conn, "references", "", "references", 1, 0, mtime, "")?;
+    insert_node(conn, "references", "references", 1, 0, mtime, "")?;
 
     let parent_id = format!("references/{node_id}");
-    insert_node(conn, &parent_id, "references", node_id, 1, 0, mtime, "")?;
+    insert_node(conn, &parent_id, node_id, 1, 0, mtime, "")?;
 
     for (i, loc) in locations.iter().enumerate() {
         let ref_id = format!("{parent_id}/{i}");
@@ -923,7 +912,6 @@ pub fn project_references_into_nodes(
         insert_node(
             conn,
             &ref_id,
-            &parent_id,
             &format!("{i}"),
             0,
             record_str.len() as i64,
@@ -1151,18 +1139,12 @@ fn walk_symbols(
     let ids = sibling_ids(syms, parent_id);
     let mut visited = 0_usize;
     for (sym, id) in syms.iter().zip(ids.iter()) {
-        visited += walk_symbol(conn, sym, id, parent_id, mtime)?;
+        visited += walk_symbol(conn, sym, id, mtime)?;
     }
     Ok(visited)
 }
 
-fn walk_symbol(
-    conn: &Connection,
-    sym: &DocumentSymbol,
-    id: &str,
-    parent_id: &str,
-    mtime: i64,
-) -> Result<usize> {
+fn walk_symbol(conn: &Connection, sym: &DocumentSymbol, id: &str, mtime: i64) -> Result<usize> {
     let kind_name = protocol::symbol_kind_name(sym.kind);
     let id = id.to_string();
     let has_children = sym.children.as_ref().is_some_and(|c| !c.is_empty());
@@ -1181,7 +1163,6 @@ fn walk_symbol(
     insert_node(
         conn,
         &id,
-        parent_id,
         &sym.name,
         node_kind,
         record_str.len() as i64,
@@ -1652,11 +1633,10 @@ mod tests {
         )
         .unwrap();
 
-        insert_node(&conn, "", "", "", 1, 0, 0, "").unwrap();
+        insert_node(&conn, "", "", 1, 0, 0, "").unwrap();
         insert_node(
             &conn,
             "function_definition",
-            "",
             "function_definition",
             1,
             0,

@@ -1506,20 +1506,7 @@ mod tests {
     fn writable_graph() -> SqliteGraphAdapter {
         use rusqlite::Connection;
         let source = Connection::open_in_memory().unwrap();
-        source
-            .execute_batch(
-                "CREATE TABLE nodes (
-                    id TEXT PRIMARY KEY,
-                    parent_id TEXT,
-                    name TEXT NOT NULL,
-                    kind INTEGER NOT NULL,
-                    size INTEGER DEFAULT 0,
-                    mtime INTEGER NOT NULL,
-                    record TEXT
-                );
-                CREATE INDEX idx_parent_name ON nodes(parent_id, name);",
-            )
-            .unwrap();
+        source.execute_batch(leyline_schema::NODES_DDL).unwrap();
         let data = source.serialize("main").unwrap();
         SqliteGraphAdapter::new_writable(data.as_ref()).unwrap()
     }

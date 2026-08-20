@@ -67,7 +67,13 @@ columns exist. Its measured dependencies, as of `mache-93e84b`:
   displayed path.
 - `parent_id` has ~50 non-test references, dominated by `WHERE parent_id = ?` —
   direct-child listing, which backs every `list_directory`. Depth-1 is NOT
-  derivable from byte spans, so this cannot become an inferred relation.
+  derivable from byte spans, so this cannot become an inferred relation. It IS
+  derivable from the row itself, and as of `projection-v4` it is: a VIRTUAL
+  generated column over `id` and `name`. Every read above is unchanged,
+  including the index seek. Writes are not — mache names `parent_id` in 10
+  non-test INSERTs, and SQLite now rejects those at prepare time
+  (`mache-bc6ca3`). `pragma_table_info` also stops listing the column;
+  only `pragma_table_xinfo` shows a generated column.
 - `internal/fixturedb/schema_leyline.go` pins this DDL byte-identically and has
   a conformance test, so any column change here surfaces there as drift at
   whatever release mache re-pins to.
@@ -80,7 +86,7 @@ Produced by `parse_into_conn`. Always present.
 
 | Table | Purpose |
 |-------|---------|
-| `nodes` | Hierarchical node tree (id, parent_id, name, kind, size, record) |
+| `nodes` | Hierarchical node tree (id, name, kind, size, record; `parent_id` derived from id+name, not stored) |
 | `_ast` | AST positions (node_id → source_id, node_kind, byte/row/col ranges) |
 | `_source` | Source file metadata (id → language, abs path) |
 | `node_refs` | Token references (token → node_id, source_id, node_hash, container_node_id, qualifier, and since `projection-v3` the occurrence's own `node_kind` + `start_byte`/`end_byte`/`start_row`/`start_col`/`end_row`/`end_col`). `qualifier` (v0.7.9, bead `ley-line-open-4dde42`) = receiver/selector text on the BARE-token row of a qualified call's dual-emit pair (`fmt.Println(..)` → the `Println` row carries `'fmt'`); NULL on the qualified-token row and on bare calls — one row per qualified call site carries the structural (name, qualifier) pair. |

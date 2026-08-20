@@ -12,6 +12,24 @@ context, scoping notes, and review history are recoverable.
 
 ### Changed
 
+- **`nodes.parent_id` is derived, not stored.** A node's parent is its own `id`
+  with the trailing `/<name>` removed, and both `id` and `name` are already on
+  the row, so the column was a third copy of what the row could compute. It is
+  now a VIRTUAL generated column. Measured on a 3,150,850-node arena: the
+  `nodes` table goes 1,577 MB -> 914 MB, a saving of 663 MB (-42%);
+  `idx_parent_name` is unchanged at 731 MB because the index still materialises
+  the value, which is why `WHERE parent_id = ?` is still an index seek. Verified
+  against the stored column on that arena before converting — 3,150,850 of
+  3,150,850 rows agree, 0 mismatches. Reads are unaffected, `SELECT *` included,
+  and the column keeps its declared position. Writers are not: an INSERT or
+  UPDATE naming `parent_id` is rejected at prepare time, which was 58 INSERT
+  sites here and is 10 non-test sites in mache (`mache-bc6ca3`). Legacy arenas
+  migrate in place on the next parse, rebuilding the table rather than ALTERing
+  it so a migrated arena is byte-identical to a fresh one, and refusing outright
+  if any stored parent disagrees with the derivation.
+  `_meta.projection_schema_version` advances to `projection-v4`
+  (bead `ley-line-open-17c271`).
+
 - **`node_defs` and `node_refs` carry their own span and grammar kind, so
   resolving a definition no longer JOINs `_ast`.** `query_definitions` reached
   into the 3.15M-row `_ast` table purely to recover position for a 337k-row

@@ -30,7 +30,7 @@
 
 use parking_lot::Mutex;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -292,7 +292,43 @@ fn concurrent_readers_beat_pre_15b_mutex_shape() {
     let writer = Connection::open(&db_path).unwrap();
     writer.pragma_update(None, "synchronous", "NORMAL").unwrap();
     let live_db = Arc::new(LiveDb::new(writer, &db_path, N_READERS as u32).unwrap());
+    // Structural probe, asserted on EVERY push: the maximum number of reader
+    // connections checked out SIMULTANEOUSLY.
+    //
+    // This is the property the throughput floor below was standing in for, and
+    // it is the one the failure message has always described — "readers
+    // regressed to serializing on a shared lock". Serialization is structural:
+    // a pool whose readers serialize can never have two connections out at
+    // once, by construction. Throughput is a downstream symptom of that
+    // structure, contaminated by every other process on the machine.
+    //
+    // It does not merely survive load, it IMPROVES under it. A thread
+    // descheduled mid-query still HOLDS its connection, so CPU contention
+    // makes checkouts pile up rather than thin out — the opposite of what
+    // contention does to reads-per-second. A busy machine gives the same
+    // verdict, and gives it more emphatically.
+    let max_checked_out = Arc::new(AtomicU64::new(0));
+    let sampling = Arc::new(AtomicBool::new(true));
+    let sampler = {
+        let db = live_db.clone();
+        let max = Arc::clone(&max_checked_out);
+        let run = Arc::clone(&sampling);
+        thread::spawn(move || {
+            while run.load(Ordering::Relaxed) {
+                let state = db.reader_pool.state();
+                let checked_out =
+                    u64::from(state.connections.saturating_sub(state.idle_connections));
+                max.fetch_max(checked_out, Ordering::Relaxed);
+                thread::yield_now();
+            }
+        })
+    };
+
     let (pool_reads, pool_samples) = measure_pool_shape(live_db.clone(), N_READERS, DURATION);
+
+    sampling.store(false, Ordering::Relaxed);
+    sampler.join().expect("sampler thread");
+    let max_checked_out = max_checked_out.load(Ordering::Relaxed);
     let pool_p50 = percentile(&mut pool_samples.clone(), 0.50);
     let pool_p99 = percentile(&mut pool_samples.clone(), 0.99);
     let pool_max = *pool_samples.iter().max().unwrap_or(&Duration::ZERO);
@@ -307,6 +343,21 @@ fn concurrent_readers_beat_pre_15b_mutex_shape() {
         "  LiveDb pool + writer:       {pool_reads} reads, p99={pool_p99:?}, p50={pool_p50:?}, max={pool_max:?}"
     );
     eprintln!("  pool-vs-mutex throughput scale: {scale:.2}×");
+    eprintln!("  max simultaneous reader checkouts: {max_checked_out} of {N_READERS}");
+
+    // Assertion 0 (structural, always on): readers did NOT serialize.
+    //
+    // One checkout at a time is what a `Mutex<Connection>` shape produces and
+    // the only thing it can produce. More than one is proof the pool handed
+    // out connections concurrently — which is the whole of 15b.
+    assert!(
+        max_checked_out >= 2,
+        "readers serialized on a shared lock: never saw more than \
+         {max_checked_out} reader connection(s) checked out at once across \
+         {N_READERS} reader threads over {DURATION:?}. A pool that hands out \
+         connections concurrently reaches at least 2; a Mutex<Connection> \
+         shape cannot exceed 1 by construction."
+    );
 
     // Assertion 1: p99 read latency < 10 ms.
     //
@@ -323,34 +374,82 @@ fn concurrent_readers_beat_pre_15b_mutex_shape() {
          WAL@N=10 p99 = 290–375 µs; DELETE-journal p99 = 120–250 ms.",
     );
 
-    // Assertion 2 (bead `ley-line-open-14b7a2`): absolute pool
-    // throughput floor. A pool that truly parallelizes N=10 readers
-    // over WAL delivers stable ~120k reads/1.5s across debug + release
-    // (local + CI). A pool that regressed to serialized behavior would
-    // collapse toward the single-reader Mutex baseline (~30–60k). 80k
-    // is comfortably above every mutex-shape observation and well
-    // below every pool-shape observation, so:
+    // Assertion 2 (bead `ley-line-open-14b7a2`): absolute pool throughput
+    // floor — asserted only under `LLO_PERF_GATES=1`.
     //
-    //   - real regression → drop into the 30–60k band → hard fail
-    //   - CI/co-tenant noise → still 100k+ → clean pass
+    // The floor is 80k against a healthy ~120k, i.e. about 1.5x of headroom,
+    // and it is an ABSOLUTE count of work done in 1.5s of wall clock. That
+    // makes it a measurement of the machine as much as of the pool, and on a
+    // loaded machine it fails while the pool is behaving perfectly: the run
+    // that moved this behind the gate recorded pool=67389 against
+    // mutex=46359 — the pool beating the serialized baseline by 1.45x, which
+    // is precisely the regression this assertion says it detects NOT having
+    // happened, and it failed anyway.
     //
-    // The previous ratio-vs-mutex assertion (≥3×) was replaced because
-    // its DIVISOR (mutex baseline) swung 40k → 90k depending on
-    // scheduler noise during `cargo test --workspace`, flipping
-    // pass/fail on scheduling instead of on pool behavior. Ratio was
-    // measuring the wrong thing; absolute floor measures what the
-    // pool actually buys.
-    assert!(
-        pool_reads >= 80_000,
-        "pool aggregate throughput collapsed to serialized levels: got \
-         {pool_reads} reads in {DURATION:?}, floor is 80000. Stable pool \
-         shape delivers ~120k across debug + release; a drop to this \
-         band means readers regressed to serializing on a shared lock. \
-         Mutex baseline (info only): {mutex_reads} reads.",
+    // The history matters, because the obvious repair has already been tried.
+    // This started as a ratio (>= 3x mutex) and was replaced BY the absolute
+    // floor because the divisor swung 40k -> 90k with scheduler noise. Both
+    // formulations flake, in opposite directions, for the same underlying
+    // reason: throughput under arbitrary co-tenant load is not a property a
+    // correctness gate can assert. That same run would also have failed the
+    // old ratio.
+    //
+    // So it moves to the perf tier rather than being retuned a third time —
+    // the disposition `restriction_review_public_api` already took for its
+    // wall-clock ordering (#360), and `cold_parse_perf_regression` before it.
+    // The numbers are printed unconditionally above, so the signal stays
+    // visible in every CI log; only `task test:perf` fails on it.
+    //
+    // What is NOT gated: assertion 1's p99 latency, which carries ~30x of
+    // headroom against the DELETE-journal baseline it exists to catch and has
+    // never been observed flaking. Gating a budget with real headroom would
+    // give up signal for nothing.
+    let gate_enabled = perf_gate_enabled();
+    eprintln!(
+        "  throughput floor gate: enabled={gate_enabled} (LLO_PERF_GATES=1), \
+         pool_reads={pool_reads} floor=80000"
     );
+    if gate_enabled {
+        assert!(
+            pool_reads >= 80_000,
+            "pool aggregate throughput collapsed to serialized levels: got \
+             {pool_reads} reads in {DURATION:?}, floor is 80000. Stable pool \
+             shape delivers ~120k across debug + release; a drop to this \
+             band means readers regressed to serializing on a shared lock. \
+             Mutex baseline (info only): {mutex_reads} reads.",
+        );
+    }
 
     // scale is kept as a log line only — informative, not asserted.
     let _ = scale;
+}
+
+/// The one spelling of the perf-gate opt-in, matching `topology_pass_test.rs`
+/// and `cold_parse_perf_regression.rs`.
+const GATE_ENV: &str = "LLO_PERF_GATES";
+
+/// Pure predicate over the raw value, so the contract can be pinned without
+/// writing to the process environment — an env-mutating gate check is what
+/// raced CI in `cold_parse_perf_regression.rs` (#356).
+fn gate_enabled_from(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
+fn perf_gate_enabled() -> bool {
+    gate_enabled_from(std::env::var(GATE_ENV).ok().as_deref())
+}
+
+/// The gate mechanism itself, pinned without touching process state.
+#[test]
+fn perf_gate_reads_exactly_the_literal_one() {
+    assert!(gate_enabled_from(Some("1")));
+    assert!(!gate_enabled_from(None), "unset means print, do not assert");
+    assert!(!gate_enabled_from(Some("0")));
+    assert!(
+        !gate_enabled_from(Some("true")),
+        "only the literal 1 opts in"
+    );
+    assert!(!gate_enabled_from(Some("")));
 }
 
 // ── (2) Reader pragma enforcement ───────────────────────────────────

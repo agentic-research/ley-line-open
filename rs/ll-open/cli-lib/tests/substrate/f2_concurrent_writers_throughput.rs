@@ -225,14 +225,57 @@ fn concurrent_writers_beat_serial_baseline() {
     // puts, so total workload matches. Parallel: N writers × M puts.
     // Same fsync count either way — the comparison is about
     // concurrency, not workload size.
-    let (serial_elapsed, serial_puts) = run_parallel(
-        &root_serial,
-        1,
-        N_WRITERS_PARALLEL * BLOBS_PER_WRITER,
-        "run",
-    );
-    let (parallel_elapsed, parallel_puts) =
-        run_parallel(&root_parallel, N_WRITERS_PARALLEL, BLOBS_PER_WRITER, "run");
+    //
+    // BEST of `REPS`, arms INTERLEAVED. Two separate corrections, both
+    // needed:
+    //
+    // Best-of, because load can only make a run SLOWER. The minimum
+    // elapsed is therefore the closest estimate of each shape's true cost,
+    // and a busy machine cannot push a minimum down — it can only fail to
+    // lower it. This is the technique `cold_parse_perf_regression` already
+    // uses (`walls_ms.iter().min()` over three runs); f2 took a single
+    // sample per arm and divided one by the other, so noise in EITHER
+    // landed directly on the ratio.
+    //
+    // Interleaved, because sampling the arms in sequence attributes any
+    // drift in machine load to whichever arm ran during it. That is not
+    // hypothetical here — it is the same error that produced a bogus
+    // 0-vs-3 result while investigating `ley-line-open-cdd5d0`, and the
+    // same one recorded on `ley-line-open-b4509b`.
+    //
+    // What made this load-bearing: measured on an IDLE machine, the serial
+    // divisor swung 141.7 -> 193.1 tx/s across three runs (36%) while the
+    // parallel arm held near 245. Pairing the fastest observed serial with
+    // the slowest observed parallel gives ratio = 189.5/193.1 = 0.98x —
+    // below the 1.0 falsification bar, let alone the 1.1x gate, from two
+    // real measurements taken minutes apart with nothing else running.
+    // The ratio was reporting the scheduler, not the substrate.
+    const REPS: usize = 3;
+    let mut serial: Option<(std::time::Duration, u64)> = None;
+    let mut parallel: Option<(std::time::Duration, u64)> = None;
+    for rep in 0..REPS {
+        let prefix = format!("run{rep}");
+        let s = run_parallel(
+            &root_serial,
+            1,
+            N_WRITERS_PARALLEL * BLOBS_PER_WRITER,
+            &prefix,
+        );
+        if serial.is_none_or(|(best, _)| s.0 < best) {
+            serial = Some(s);
+        }
+        let p = run_parallel(
+            &root_parallel,
+            N_WRITERS_PARALLEL,
+            BLOBS_PER_WRITER,
+            &prefix,
+        );
+        if parallel.is_none_or(|(best, _)| p.0 < best) {
+            parallel = Some(p);
+        }
+    }
+    let (serial_elapsed, serial_puts) = serial.expect("at least one rep");
+    let (parallel_elapsed, parallel_puts) = parallel.expect("at least one rep");
 
     assert_eq!(
         serial_puts,

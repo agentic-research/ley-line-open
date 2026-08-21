@@ -224,6 +224,20 @@ impl Backend for KrunWorkerBackend {
                 )),
             ));
         }
+        // Terminate the request with a newline. Nothing downstream may depend
+        // on stdin reaching EOF to know the request is complete: EOF arrives
+        // only when EVERY copy of the pipe's write end is closed, and a
+        // process spawned concurrently can inherit one (see `read_request`).
+        if let Err(error) = stdin.write_all(b"\n") {
+            return Err(abort_failed_start(
+                &mut child,
+                rootfs,
+                LABELS,
+                ExecutionError::backend(format!(
+                    "send execution request to libkrun worker: {error}"
+                )),
+            ));
+        }
         if let Err(error) = stdin.flush() {
             return Err(abort_failed_start(
                 &mut child,

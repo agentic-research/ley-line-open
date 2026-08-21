@@ -179,6 +179,21 @@ run_slice() {
     mode=$1
     shift
     ran_slice=1
+    # cargo-mutants writes `mutants.out/missed.txt` for the run it actually
+    # performs. A slice that enumerates ZERO mutants never writes it at all —
+    # it prints "No mutants to filter" and exits — so the check below would
+    # read whatever the PREVIOUS slice, or a previous local invocation, left
+    # behind.
+    #
+    # That is not hypothetical: a clean diff reported "MISSED: 13 surviving
+    # mutant(s)" against a slice whose very next line was "Found 5 mutants to
+    # test", because a whole-file `cargo mutants` run minutes earlier had left
+    # 13 entries in the file. CI did not see it only because a fresh checkout
+    # starts with no `mutants.out` at all.
+    #
+    # Clearing it first makes the check able to see only THIS slice's result,
+    # which is the difference between a gate and a rumour.
+    rm -f mutants.out/missed.txt
     set +e
     if [ "$mode" = lib ]; then
         cargo mutants --in-diff "$DIFF" -C --lib -E 'replace main' "$@"

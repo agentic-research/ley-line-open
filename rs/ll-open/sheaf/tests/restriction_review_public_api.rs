@@ -42,7 +42,7 @@ use leyline_sheaf::restriction_cache::{
     review_public_api, stats, whole_object_hash,
 };
 use std::hint::black_box;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// The public function under review in every fixture.
 const TARGET_FN: &str = "score";
@@ -455,18 +455,42 @@ fn public_api_restriction_is_cheaper_than_review() {
         let mut review_ops = 0u64;
         black_box(review_public_api(&sub, &api, &mut review_ops));
 
-        let t0 = Instant::now();
+        // Fastest single iteration, arms INTERLEAVED — not the mean of a
+        // batch, and not one arm's whole batch followed by the other's.
+        //
+        // Both corrections matter at this scale. The mean divides total
+        // elapsed by `iters`, so ONE preemption anywhere in the batch is
+        // smeared across every iteration; at 2.5µs per call a single 1ms
+        // scheduling event is 400 iterations' worth of work and dominates
+        // the answer outright. The minimum is the closest estimate of the
+        // real cost, because load can only ever make an iteration slower.
+        //
+        // Interleaving removes the other half: timing one arm's batch and
+        // then the other's attributes any drift in machine load to
+        // whichever arm was running during it. That is the error that
+        // produced a bogus 0-vs-3 result while investigating
+        // `ley-line-open-cdd5d0`, and it is recorded on
+        // `ley-line-open-b4509b` too.
+        //
+        // Note the ratio being comfortable is NOT protection here. At the
+        // largest corpus this measures 2.5µs against 83.1µs — 33x — and a
+        // single 1ms preemption on the restriction arm still inverts it.
+        // A large ratio over a tiny absolute is a coin flip wearing a
+        // margin. `cold_parse_perf_regression` already takes the min over
+        // three runs for exactly this reason.
+        let mut restriction_time = Duration::MAX;
+        let mut review_time = Duration::MAX;
         for _ in 0..iters {
+            let t0 = Instant::now();
             let mut c = 0u64;
             black_box(restriction_for_public_api(&sub, &api, &mut c));
-        }
-        let restriction_time = t0.elapsed() / iters;
-        let t1 = Instant::now();
-        for _ in 0..iters {
+            restriction_time = restriction_time.min(t0.elapsed());
+
+            let t1 = Instant::now();
             let mut c = 0u64;
             black_box(review_public_api(&sub, &api, &mut c));
+            review_time = review_time.min(t1.elapsed());
         }
-        let review_time = t1.elapsed() / iters;
 
         eprintln!(
             "{:>9} {:>10} {:>9} {:>12} {:>12} {:>8.1}x {:>9.1}x",

@@ -30,7 +30,7 @@
 
 use parking_lot::Mutex;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -292,7 +292,43 @@ fn concurrent_readers_beat_pre_15b_mutex_shape() {
     let writer = Connection::open(&db_path).unwrap();
     writer.pragma_update(None, "synchronous", "NORMAL").unwrap();
     let live_db = Arc::new(LiveDb::new(writer, &db_path, N_READERS as u32).unwrap());
+    // Structural probe, asserted on EVERY push: the maximum number of reader
+    // connections checked out SIMULTANEOUSLY.
+    //
+    // This is the property the throughput floor below was standing in for, and
+    // it is the one the failure message has always described — "readers
+    // regressed to serializing on a shared lock". Serialization is structural:
+    // a pool whose readers serialize can never have two connections out at
+    // once, by construction. Throughput is a downstream symptom of that
+    // structure, contaminated by every other process on the machine.
+    //
+    // It does not merely survive load, it IMPROVES under it. A thread
+    // descheduled mid-query still HOLDS its connection, so CPU contention
+    // makes checkouts pile up rather than thin out — the opposite of what
+    // contention does to reads-per-second. A busy machine gives the same
+    // verdict, and gives it more emphatically.
+    let max_checked_out = Arc::new(AtomicU64::new(0));
+    let sampling = Arc::new(AtomicBool::new(true));
+    let sampler = {
+        let db = live_db.clone();
+        let max = Arc::clone(&max_checked_out);
+        let run = Arc::clone(&sampling);
+        thread::spawn(move || {
+            while run.load(Ordering::Relaxed) {
+                let state = db.reader_pool.state();
+                let checked_out =
+                    u64::from(state.connections.saturating_sub(state.idle_connections));
+                max.fetch_max(checked_out, Ordering::Relaxed);
+                thread::yield_now();
+            }
+        })
+    };
+
     let (pool_reads, pool_samples) = measure_pool_shape(live_db.clone(), N_READERS, DURATION);
+
+    sampling.store(false, Ordering::Relaxed);
+    sampler.join().expect("sampler thread");
+    let max_checked_out = max_checked_out.load(Ordering::Relaxed);
     let pool_p50 = percentile(&mut pool_samples.clone(), 0.50);
     let pool_p99 = percentile(&mut pool_samples.clone(), 0.99);
     let pool_max = *pool_samples.iter().max().unwrap_or(&Duration::ZERO);
@@ -307,6 +343,21 @@ fn concurrent_readers_beat_pre_15b_mutex_shape() {
         "  LiveDb pool + writer:       {pool_reads} reads, p99={pool_p99:?}, p50={pool_p50:?}, max={pool_max:?}"
     );
     eprintln!("  pool-vs-mutex throughput scale: {scale:.2}×");
+    eprintln!("  max simultaneous reader checkouts: {max_checked_out} of {N_READERS}");
+
+    // Assertion 0 (structural, always on): readers did NOT serialize.
+    //
+    // One checkout at a time is what a `Mutex<Connection>` shape produces and
+    // the only thing it can produce. More than one is proof the pool handed
+    // out connections concurrently — which is the whole of 15b.
+    assert!(
+        max_checked_out >= 2,
+        "readers serialized on a shared lock: never saw more than \
+         {max_checked_out} reader connection(s) checked out at once across \
+         {N_READERS} reader threads over {DURATION:?}. A pool that hands out \
+         connections concurrently reaches at least 2; a Mutex<Connection> \
+         shape cannot exceed 1 by construction."
+    );
 
     // Assertion 1: p99 read latency < 10 ms.
     //

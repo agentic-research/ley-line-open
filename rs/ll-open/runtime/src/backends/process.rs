@@ -237,6 +237,40 @@ impl Drop for WorkerProcess {
     }
 }
 
+/// Read exactly one JSON value from `reader`, without waiting for EOF.
+///
+/// `serde_json::from_reader` finishes by calling `Deserializer::end()`, which
+/// verifies that nothing but whitespace follows the value — and proving that
+/// requires reading to EOF. A worker's stdin reaches EOF only when EVERY copy
+/// of the pipe's write end is closed, and the supervisor's copy is not the
+/// only one that can exist.
+///
+/// `Stdio::piped()` creates that pipe with `libc::pipe()` and marks it CLOEXEC
+/// in a SECOND step wherever `pipe2` is unavailable — std says so itself in
+/// `sys::pipe::unix`, and macOS is on the wrong side of that list. A process
+/// spawned by any other thread inside that two-syscall window inherits the
+/// write end and holds it for its own lifetime.
+///
+/// The worker then blocks forever with the entire request already in hand,
+/// unable to prove nothing follows it. The supervisor sees no readiness line
+/// and no EOF, and reports "timed out waiting for ... worker readiness" —
+/// which is `ley-line-open-cdd5d0`, and why raising the readiness timeout was
+/// never going to help: the wait is unbounded, not slow.
+///
+/// A `StreamDeserializer` yields the value the moment its closing brace is
+/// parsed, so the request is complete as soon as it has been sent. The cost is
+/// that trailing bytes stop being rejected, which this protocol never relied
+/// on — one request per worker, one value per request.
+pub(crate) fn read_request<T: serde::de::DeserializeOwned>(
+    reader: impl io::Read,
+) -> Result<T, serde_json::Error> {
+    use serde::de::Error as _;
+    serde_json::Deserializer::from_reader(reader)
+        .into_iter::<T>()
+        .next()
+        .unwrap_or_else(|| Err(serde_json::Error::custom("worker request was empty")))
+}
+
 pub(super) fn read_readiness_line(reader: &mut impl BufRead) -> Result<Option<String>, String> {
     let mut line = String::new();
     reader
@@ -441,12 +475,88 @@ mod tests {
     use super::{
         SupervisionLabels, WorkerProcess, await_exit_without_reaping, cleanup_tempdir,
         configure_process_group, finish_failed_start, make_tree_removable, read_readiness_line,
-        retry_while_interrupted, supervise_worker, terminate_process_group,
+        read_request, retry_while_interrupted, supervise_worker, terminate_process_group,
     };
     use crate::ExecutionError;
     use std::fs;
     use std::io;
     use std::io::{BufRead, BufReader, Cursor, Read};
+
+    /// A reader that yields `bytes` and then never reaches EOF — it blocks the
+    /// way an open pipe does, rather than returning `Ok(0)`.
+    ///
+    /// This is what a worker's stdin looks like when another process inherited
+    /// the write end: the request has arrived in full, and EOF never comes.
+    struct NeverEof {
+        bytes: Cursor<Vec<u8>>,
+        blocked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Read for NeverEof {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let read = self.bytes.read(buf)?;
+            if read == 0 {
+                // Drained. A real pipe with a live writer would block here
+                // forever; record that we got here and say so, which is the
+                // closest a synchronous test can get without hanging.
+                self.blocked
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "stdin has no EOF: a writer is still holding the pipe",
+                ));
+            }
+            Ok(read)
+        }
+    }
+
+    /// A worker must finish parsing its request the moment the request is
+    /// complete, NOT when its stdin reaches EOF.
+    ///
+    /// `serde_json::from_reader` calls `Deserializer::end()` to prove nothing
+    /// follows the value, which reads to EOF. A worker's stdin only reaches
+    /// EOF once every copy of the pipe's write end is closed — and on a
+    /// platform without `pipe2`, `Stdio::piped()` leaves a two-syscall window
+    /// in which a concurrently spawned process inherits that write end and
+    /// holds it. The worker then sits on a complete request forever, the
+    /// supervisor's readiness wait expires, and the failure reads as
+    /// "timed out waiting for ... worker readiness" (`ley-line-open-cdd5d0`).
+    ///
+    /// This pins the property directly rather than through the race: feed a
+    /// whole request, then refuse to ever return EOF. Before the fix this
+    /// fails; the deserializer reaches past the closing brace looking for the
+    /// end of input it will never be given.
+    #[test]
+    fn a_request_parses_without_its_reader_ever_reaching_eof() {
+        let blocked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = NeverEof {
+            bytes: Cursor::new(br#"{"alpha":1,"beta":"two"}"#.to_vec()),
+            blocked: std::sync::Arc::clone(&blocked),
+        };
+
+        let parsed: serde_json::Value =
+            read_request(reader).expect("a complete request must parse before EOF");
+
+        assert_eq!(parsed["alpha"], 1);
+        assert_eq!(parsed["beta"], "two");
+        assert!(
+            !blocked.load(std::sync::atomic::Ordering::SeqCst),
+            "the request was complete, so the reader must never have been asked \
+             for the byte after it — asking is what blocks forever against a \
+             pipe whose write end another process inherited"
+        );
+    }
+
+    /// An empty stdin is still an error, not a hang or a default request.
+    #[test]
+    fn an_empty_request_is_rejected() {
+        let reader = NeverEof {
+            bytes: Cursor::new(Vec::new()),
+            blocked: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let parsed: Result<serde_json::Value, _> = read_request(reader);
+        assert!(parsed.is_err(), "no request at all must fail loudly");
+    }
     use std::os::unix::fs::PermissionsExt;
     use std::process::{Command, Stdio};
     use std::sync::mpsc;

@@ -118,7 +118,7 @@ fn backend_removes_the_run_root_when_a_worker_exits() {
     let worker = fixture.path().join("leyline-krun-worker");
     fs::write(
         &worker,
-        "#!/bin/sh\nrun_root=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--run-root\" ]; then run_root=\"$2\"; shift 2; else shift; fi\ndone\n/bin/cat >/dev/null\ncontrol=\"$run_root/control\"\n/usr/bin/mkfifo \"$control\"\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\nIFS= read -r _ < \"$control\"\n",
+        "#!/bin/sh\nrun_root=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--run-root\" ]; then run_root=\"$2\"; shift 2; else shift; fi\ndone\nIFS= read -r _\ncontrol=\"$run_root/control\"\n/usr/bin/mkfifo \"$control\"\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\nIFS= read -r _ < \"$control\"\n",
     )
     .expect("fake worker");
     fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("worker mode");
@@ -161,7 +161,7 @@ fn backend_reports_a_nonzero_worker_exit_as_failed() {
     let fixture = TempDir::new().expect("fixture");
     let (backend, ephemeral_root) = backend_with_worker(
         &fixture,
-        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\nexit 7\n",
+        "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\nexit 7\n",
     );
 
     backend.start(&request()).expect("ready worker");
@@ -183,7 +183,7 @@ fn backend_cancel_terminates_the_worker_and_removes_its_run_root() {
     let worker = fixture.path().join("leyline-krun-worker");
     fs::write(
         &worker,
-        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n/usr/bin/tail -f /dev/null\n",
+        "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n/usr/bin/tail -f /dev/null\n",
     )
     .expect("fake worker");
     fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("worker mode");
@@ -218,7 +218,7 @@ fn backend_enforces_the_wall_clock_limit_and_cleans_up() {
     let worker = fixture.path().join("leyline-krun-worker");
     fs::write(
         &worker,
-        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n/usr/bin/tail -f /dev/null\n",
+        "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n/usr/bin/tail -f /dev/null\n",
     )
     .expect("fake worker");
     fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("worker mode");
@@ -262,7 +262,7 @@ fn backend_cleanup_handles_guest_created_restrictive_directories() {
     let worker = fixture.path().join("leyline-krun-worker");
     fs::write(
         &worker,
-        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n/usr/bin/tail -f /dev/null\n",
+        "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n/usr/bin/tail -f /dev/null\n",
     )
     .expect("fake worker");
     fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("worker mode");
@@ -311,7 +311,7 @@ run_root=
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--run-root" ]; then run_root="$2"; shift 2; else shift; fi
 done
-/bin/cat >/dev/null
+IFS= read -r _
 /bin/mkdir "$run_root/guest-locked"
 /bin/chmod 000 "$run_root/guest-locked"
 printf '%s\n' '{"type":"failed","error":{"code":"backend-failed","retryable":false,"detail":"injected setup failure"}}' >&2
@@ -348,7 +348,7 @@ fn backend_rejects_a_duplicate_run_id_without_replacing_the_live_worker() {
     let worker = fixture.path().join("leyline-krun-worker");
     fs::write(
         &worker,
-        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n/usr/bin/tail -f /dev/null\n",
+        "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n/usr/bin/tail -f /dev/null\n",
     )
     .expect("fake worker");
     fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("worker mode");
@@ -383,7 +383,7 @@ fn concurrent_starts_reserve_a_run_id_before_spawning() {
     let worker = fixture.path().join("leyline-krun-worker");
     fs::write(
         &worker,
-        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n/usr/bin/tail -f /dev/null\n",
+        "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n/usr/bin/tail -f /dev/null\n",
     )
     .expect("fake worker");
     fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("worker mode");
@@ -449,7 +449,7 @@ fn the_hijack_opt_in_reaches_the_worker_and_is_absent_by_default() {
         fs::write(
             &worker,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n/bin/cat >/dev/null\nprintf '%s\\n' \
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nIFS= read -r _\nprintf '%s\\n' \
                  '{{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}}' >&2\n/usr/bin/tail -f /dev/null\n",
                 argv_log.display()
             ),
@@ -502,7 +502,7 @@ fn a_worker_attesting_an_unauthorized_policy_never_reaches_running() {
     // Well-formed readiness, correct run id, wrong policy.
     let (backend, ephemeral_root) = backend_with_worker(
         &fixture,
-        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\",\"confinement_digest\":\"blake3-256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"}' >&2\n/usr/bin/tail -f /dev/null\n",
+        "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\",\"confinement_digest\":\"blake3-256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"}' >&2\n/usr/bin/tail -f /dev/null\n",
     );
 
     let mut request = request();
@@ -535,7 +535,7 @@ fn a_grant_authorizing_no_policy_does_not_constrain_what_the_worker_attests() {
     let fixture = TempDir::new().expect("fixture");
     let (backend, _ephemeral_root) = backend_with_worker(
         &fixture,
-        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\",\"confinement_digest\":\"blake3-256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"}' >&2\n/usr/bin/tail -f /dev/null\n",
+        "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\",\"confinement_digest\":\"blake3-256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"}' >&2\n/usr/bin/tail -f /dev/null\n",
     );
 
     // `request()` leaves `confinement_digest` empty: nothing was authorized.
@@ -554,7 +554,7 @@ fn readiness_announcing_another_run_is_rejected() {
     let fixture = TempDir::new().expect("fixture");
     let (backend, ephemeral_root) = backend_with_worker(
         &fixture,
-        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"some-other-run\"}' >&2\n/usr/bin/tail -f /dev/null\n",
+        "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"some-other-run\"}' >&2\n/usr/bin/tail -f /dev/null\n",
     );
 
     let error = backend

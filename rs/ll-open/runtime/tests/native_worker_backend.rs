@@ -122,7 +122,7 @@ fn worker_exit_is_observable_and_run_root_is_removed() {
     let fixture = TempDir::new().expect("fixture");
     let (backend, runs) = backend(
         &fixture,
-        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\n",
+        "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\n",
     );
     backend.start(&request()).expect("worker readiness");
     let status = backend
@@ -140,7 +140,7 @@ fn failed_worker_is_reported_and_cleaned() {
     let fixture = TempDir::new().expect("fixture");
     let (backend, runs) = backend(
         &fixture,
-        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\nexit 7\n",
+        "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\nexit 7\n",
     );
     backend.start(&request()).expect("worker readiness");
     let status = backend
@@ -163,7 +163,7 @@ fn readiness_for_another_run_is_rejected_and_cleaned() {
     let fixture = TempDir::new().expect("fixture");
     let (backend, runs) = backend(
         &fixture,
-        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"other-run\"}' >&2\n",
+        "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"other-run\"}' >&2\n",
     );
     let error = backend
         .start(&request())
@@ -177,7 +177,7 @@ fn native_cleanup_restores_guest_created_permissions() {
     let fixture = TempDir::new().expect("fixture");
     let (backend, runs) = backend(
         &fixture,
-        "#!/bin/sh\n/bin/cat >/dev/null\nmkdir -p \"$4/locked\"\nprintf x > \"$4/locked/file\"\nchmod 000 \"$4/locked\"\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\n",
+        "#!/bin/sh\nIFS= read -r _\nmkdir -p \"$4/locked\"\nprintf x > \"$4/locked/file\"\nchmod 000 \"$4/locked\"\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\n",
     );
     backend.start(&request()).expect("worker readiness");
     backend
@@ -191,7 +191,7 @@ fn cancel_kills_worker_and_removes_run_root() {
     let fixture = TempDir::new().expect("fixture");
     let (backend, runs) = backend(
         &fixture,
-        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\n/usr/bin/tail -f /dev/null\n",
+        "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\n/usr/bin/tail -f /dev/null\n",
     );
     backend.start(&request()).expect("worker readiness");
     assert_eq!(fs::read_dir(&runs).expect("runs").count(), 1);
@@ -211,7 +211,7 @@ fn backend_trait_cancel_delegates_and_drop_waits_for_cleanup() {
     let fixture = TempDir::new().expect("fixture");
     let (backend, runs) = backend(
         &fixture,
-        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\n/usr/bin/tail -f /dev/null\n",
+        "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\n/usr/bin/tail -f /dev/null\n",
     );
     backend.start(&request()).expect("worker readiness");
     assert!(Backend::cancel(&backend, "native-run-01").expect("trait cancel"));

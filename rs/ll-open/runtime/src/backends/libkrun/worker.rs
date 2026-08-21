@@ -102,17 +102,6 @@ impl WorkerOptions {
     }
 }
 
-pub fn execute_from_reader(
-    options: WorkerOptions,
-    reader: impl Read,
-) -> Result<(), ExecutionError> {
-    let request: ExecutionRequest =
-        crate::backends::process::read_request(reader).map_err(|error| {
-            ExecutionError::invalid(format!("invalid worker request JSON: {error}"))
-        })?;
-    execute(options, &request)
-}
-
 pub fn execute_from_reader_with_events(
     options: WorkerOptions,
     reader: impl Read,

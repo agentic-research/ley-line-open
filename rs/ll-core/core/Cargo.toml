@@ -1,6 +1,6 @@
 [package]
 name = "leyline-core"
-version = "0.18.2"
+version = "0.19.0"
 edition = "2024"
 description = "Σ substrate core for ley-line: BLAKE3 content addressing, the BlobStore contract, arena layout and mmap primitives, and the incremental outboard hash tree"
 repository = "https://github.com/agentic-research/ley-line-open"

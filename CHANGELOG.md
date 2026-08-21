@@ -10,6 +10,96 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.19.0] — 2026-08-21
+
+### Fixed
+
+- **Worker startup could wedge indefinitely, and the cause was a request that
+  needed EOF to be considered complete.** `serde_json::from_reader` finishes by
+  calling `Deserializer::end()`, which proves nothing but whitespace follows the
+  value — and proving that requires reading to EOF. A worker's stdin reaches EOF
+  only when EVERY copy of the pipe's write end is closed, and `Stdio::piped()`
+  creates the pipe with `libc::pipe()` and marks it CLOEXEC in a SECOND step
+  wherever `pipe2` is unavailable (std records macOS as one such platform). A
+  process spawned by any other thread inside that two-syscall window inherits
+  the write end and holds it for its lifetime, so the worker blocked forever
+  holding a COMPLETE request, and the supervisor reported "timed out waiting for
+  worker readiness". Raising the readiness timeout could not help: the wait was
+  unbounded, not slow. The request is now self-delimiting end to end — workers
+  parse with a `StreamDeserializer` that yields at the closing brace, and the
+  supervisor terminates the request with a newline. Verified by feeding a
+  complete request through a reader that never returns EOF (fails on the old
+  parser, passes on the new), and by 60 saturation iterations with zero failures
+  against 2-3 before (bead `ley-line-open-cdd5d0`).
+
+- **`leyline-text-search`'s `witchcraft` module had not compiled since
+  2026-07-14.** PR #210's `std::sync::{Mutex,RwLock}` -> parking_lot refactor
+  rewrote the mutex type and left six `.map_err()` calls on a guard that no
+  longer returns a `Result`. The module — 444 lines carrying five tests — was
+  behind the non-default `engine-witchcraft` feature, so no CI job built it and
+  the mutation gate reported all 28 of its mutants as surviving while testing
+  nothing. Its tests pass on the first run they have ever had. Claim 3 in
+  `check_feature_reachability.sh` now requires every entry on the not-shipping
+  ledger to compile WITH its test targets: not-shipping describes what users
+  get, not permission for the tree to stop building
+  (bead `ley-line-open-b23c41`).
+
+- **Four CI gates were reporting on code or properties they could not see.**
+  Each was found by using the gate, and each fix is verified by making it fail
+  on purpose:
+  - The mutation gate mutates feature-gated source whether or not the gate is
+    on, so a module compiled OUT had every mutant survive. Measured:
+    `root_signer.rs` 24/24 missed, `interrupt.rs` 25/25, `witchcraft.rs` 28/28 —
+    all testing nothing. Its `--features` list is now derived from the packages
+    in the diff, which also fixes a latent break where any diff not touching
+    `leyline-ts` failed with "the package does not contain this feature".
+  - The mutation gate also read `mutants.out/missed.txt` without clearing it, so
+    a slice enumerating zero mutants inherited a previous run's survivors —
+    reporting "MISSED: 13" on a diff that had none. Invisible on CI, where a
+    fresh checkout has no `mutants.out`, and therefore firing only for whoever
+    tried to reproduce a failure locally.
+  - The WAL reader-pool gate asserted an absolute throughput floor and failed at
+    67389 reads while the pool was beating its serialized baseline by 1.45× —
+    the exact regression it claims to detect NOT having happened. It now asserts
+    the structural property instead: the maximum number of reader connections
+    checked out simultaneously, observed at 10 of 10 against a floor of 2. A
+    serialized pool cannot exceed 1 by construction, and the measure sharpens
+    under load rather than degrading.
+  - `f2_concurrent_writers_throughput` sampled each arm once, and its divisor
+    swung 36% on an idle machine; two real measurements minutes apart pair to
+    0.98×, under its own 1.0 falsification bar. The sheaf restriction comparison
+    averaged a batch at microsecond scale, letting one preemption smear across
+    every iteration. Both now take the best of N with the arms interleaved,
+    which is the sampling `cold_parse_perf_regression` has always used. Spread
+    went 36% -> 5% and 1-in-12 -> stable.
+
+- **Six `bit_name` interrupt bits resolved to `UNKNOWN` under mutation.**
+  `bit_names_resolve` asserted two of the eight and stopped, so deleting any of
+  the other six match arms changed nothing a test could see. The name is what an
+  operator reads out of a control-block dump to decide what a stuck agent is
+  waiting on. Replaced with the full table plus a guard that a constant added
+  without an arm fails rather than silently reading as `UNKNOWN`
+  (bead `ley-line-open-b23c41`).
+
+### Changed
+
+- **The worker process group is set via `posix_spawn` rather than
+  `pre_exec`.** `pre_exec` installs a closure, and std refuses `posix_spawn`
+  whenever a closure is present, forcing fork+exec and its CLOEXEC error pipe.
+  `Command::process_group(0)` carries the same request through
+  `POSIX_SPAWN_SETPGROUP`. The injected-`setpgid`-failure test is replaced by
+  `a_worker_lands_in_its_own_process_group`, which spawns and asks the OS which
+  group the child is in — the guarantee itself rather than a branch that cannot
+  fail in production.
+
+### Removed
+
+- **`libkrun::worker::execute_from_reader`**, which had zero callers. It
+  survived the mutation gate because it was unreachable; the worker binaries use
+  `execute_from_reader_with_events` and the native backend never had an
+  equivalent. A surviving mutant in dead code is a delete, not a test.
+
+
 ### Changed
 
 - **`nodes.parent_id` is derived, not stored.** A node's parent is its own `id`

@@ -1,6 +1,6 @@
 [package]
 name = "leyline-vcs"
-version = "0.18.2"
+version = "0.19.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 
@@ -35,7 +35,7 @@ rusqlite = { workspace = true, features = ["bundled", "serialize"], optional = t
 # Test helpers build a `nodes` table; they use the shipped DDL rather than a
 # hand-rolled mirror of it, which is how the derived `parent_id` column stayed
 # invisible to them until rows started taking NULL parents.
-leyline-schema = { path = "../../ll-core/schema", version = "0.18.2" }
+leyline-schema = { path = "../../ll-core/schema", version = "0.19.0" }
 
 [features]
 default = []

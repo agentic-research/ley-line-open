@@ -18,12 +18,12 @@ fn all_file_contents_bulk_query() -> Result<()> {
     let source = Connection::open_in_memory()?;
     create_schema(&source)?;
     source.execute_batch(
-        "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('a', '', 'a', 1, 0, 1000, NULL);
-         INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('a/b', 'a', 'b', 1, 0, 1000, NULL);
-         INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('a/b/c', 'a/b', 'c', 0, 5, 2000, 'hello');
-         INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('a/b/d', 'a/b', 'd', 0, 0, 3000, NULL);
-         INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('a/b/e', 'a/b', 'e', 0, 0, 4000, '');
-         INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('a/f', 'a', 'f', 0, 11, 5000, 'world hello');",
+        "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('a', 'a', 1, 0, 1000, NULL);
+         INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('a/b', 'b', 1, 0, 1000, NULL);
+         INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('a/b/c', 'c', 0, 5, 2000, 'hello');
+         INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('a/b/d', 'd', 0, 0, 3000, NULL);
+         INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('a/b/e', 'e', 0, 0, 4000, '');
+         INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('a/f', 'f', 0, 11, 5000, 'world hello');",
     )?;
     let data = source.serialize("main")?;
     let graph = SqliteGraph::from_bytes(data.as_ref())?;

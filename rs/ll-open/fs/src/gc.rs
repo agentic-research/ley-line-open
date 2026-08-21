@@ -421,8 +421,7 @@ mod tests {
         // unnoticed (bead `ley-line-open-f7966d`).
         leyline_schema::create_nodes_table(conn).unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO nodes (id, parent_id, name, kind, size, mtime, record) \
-             VALUES (?1, '', ?1, 0, ?2, ?3, ?4)",
+            "INSERT OR REPLACE INTO nodes (id, name, kind, size, mtime, record) VALUES (?1, ?1, 0, ?2, ?3, ?4)",
             rusqlite::params![id, content.len() as i64, mtime, content],
         )
         .unwrap();

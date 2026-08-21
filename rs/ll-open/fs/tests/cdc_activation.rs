@@ -8,27 +8,14 @@ use tempfile::TempDir;
 
 fn projection() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(
-        "CREATE TABLE nodes (
-            id TEXT PRIMARY KEY,
-            parent_id TEXT,
-            name TEXT NOT NULL,
-            kind INTEGER NOT NULL,
-            size INTEGER DEFAULT 0,
-            mtime INTEGER NOT NULL,
-            record TEXT
-        );",
-    )
-    .unwrap();
+    conn.execute_batch(leyline_schema::NODES_TABLE_DDL).unwrap();
     for (id, kind, record) in [
         ("a.rs", 0_i64, "fn a() {}\n"),
         ("empty.rs", 0_i64, ""),
         ("dir", 1_i64, ""),
     ] {
         conn.execute(
-            "INSERT INTO nodes
-             (id,parent_id,name,kind,size,mtime,record)
-             VALUES (?1,'',?1,?2,?3,7,?4)",
+            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES (?1, ?1, ?2, ?3, 7, ?4)",
             params![id, kind, record.len() as i64, record],
         )
         .unwrap();
@@ -246,9 +233,7 @@ fn activation_keyset_paging_does_not_skip_after_an_earlier_row_is_deleted() {
 fn activation_keyset_includes_an_empty_string_node_id() {
     let conn = projection();
     conn.execute(
-        "INSERT INTO nodes
-         (id,parent_id,name,kind,size,mtime,record)
-         VALUES ('','','',0,5,7,'empty')",
+        "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('', '', 0, 5, 7, 'empty')",
         [],
     )
     .unwrap();
@@ -272,9 +257,7 @@ fn activation_converges_when_a_concurrent_insert_sorts_before_the_cursor() {
             pages += 1;
             if pages == 1 {
                 conn.execute(
-                    "INSERT INTO nodes
-                     (id,parent_id,name,kind,size,mtime,record)
-                     VALUES ('0.rs','','0.rs',0,11,8,'fn zero(){}')",
+                    "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('0.rs', '0.rs', 0, 11, 8, 'fn zero(){}')",
                     [],
                 )
                 .unwrap();
@@ -387,8 +370,7 @@ fn canonical_projection() -> Connection {
 
 fn insert_leaf(conn: &Connection, id: &str, record: &str) {
     conn.execute(
-        "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) \
-         VALUES (?1, '', ?1, 0, ?2, 7, ?3)",
+        "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES (?1, ?1, 0, ?2, 7, ?3)",
         params![id, record.len() as i64, record],
     )
     .unwrap();
@@ -484,20 +466,12 @@ fn activation_commits_per_page_not_per_node() {
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     leyline_fs::chunked::create_chunked_content_schema(&conn).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE nodes (
-             id TEXT PRIMARY KEY, parent_id TEXT, name TEXT NOT NULL,
-             kind INTEGER NOT NULL, size INTEGER DEFAULT 0,
-             mtime INTEGER NOT NULL, record_id TEXT, record TEXT,
-             source_file TEXT);",
-    )
-    .unwrap();
+    conn.execute_batch(leyline_schema::NODES_TABLE_DDL).unwrap();
     const NODES: usize = 64;
     for i in 0..NODES {
         let body = format!("fn n{i}() {{}}");
         conn.execute(
-            "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) \
-             VALUES (?1, '', ?1, 0, ?2, 1, ?3)",
+            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES (?1, ?1, 0, ?2, 1, ?3)",
             rusqlite::params![format!("n{i}.rs"), body.len() as i64, body],
         )
         .unwrap();

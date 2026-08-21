@@ -17,23 +17,10 @@ fn seed_projection_file() -> (TempDir, std::path::PathBuf) {
     let temp = TempDir::new().unwrap();
     let db = temp.path().join("graph.db");
     let conn = Connection::open(&db).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE nodes (
-            id TEXT PRIMARY KEY,
-            parent_id TEXT,
-            name TEXT NOT NULL,
-            kind INTEGER NOT NULL,
-            size INTEGER DEFAULT 0,
-            mtime INTEGER NOT NULL,
-            record TEXT
-        );",
-    )
-    .unwrap();
+    conn.execute_batch(leyline_schema::NODES_TABLE_DDL).unwrap();
     for (id, record) in [("a.rs", "fn a() {}\n"), ("b.rs", "fn b() {}\n")] {
         conn.execute(
-            "INSERT INTO nodes
-             (id,parent_id,name,kind,size,mtime,record)
-             VALUES (?1,'',?1,0,?2,7,?3)",
+            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES (?1, ?1, 0, ?2, 7, ?3)",
             params![id, record.len() as i64, record],
         )
         .unwrap();

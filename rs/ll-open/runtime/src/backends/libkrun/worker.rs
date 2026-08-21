@@ -102,24 +102,15 @@ impl WorkerOptions {
     }
 }
 
-pub fn execute_from_reader(
-    options: WorkerOptions,
-    reader: impl Read,
-) -> Result<(), ExecutionError> {
-    let request: ExecutionRequest = serde_json::from_reader(reader).map_err(|error| {
-        ExecutionError::invalid(format!("invalid worker request JSON: {error}"))
-    })?;
-    execute(options, &request)
-}
-
 pub fn execute_from_reader_with_events(
     options: WorkerOptions,
     reader: impl Read,
     mut writer: impl Write,
 ) -> Result<(), ExecutionError> {
-    let request: ExecutionRequest = serde_json::from_reader(reader).map_err(|error| {
-        ExecutionError::invalid(format!("invalid worker request JSON: {error}"))
-    })?;
+    let request: ExecutionRequest =
+        crate::backends::process::read_request(reader).map_err(|error| {
+            ExecutionError::invalid(format!("invalid worker request JSON: {error}"))
+        })?;
     execute_with_ready(options, &request, |event| {
         serde_json::to_writer(&mut writer, event)
             .map_err(|error| ExecutionError::backend(format!("write worker event: {error}")))?;

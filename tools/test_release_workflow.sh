@@ -3,8 +3,10 @@ set -eu
 
 repo_root=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 workflow="$repo_root/.github/workflows/release.yml"
+postflight="$repo_root/tools/verify_public_release_remote.sh"
 
 test -f "$workflow"
+test -f "$postflight"
 
 if grep -q '^  create-release:' "$workflow"; then
     echo "release object must not be created before builds verify" >&2
@@ -46,5 +48,12 @@ if grep -q 'gh release' "$workflow"; then
     echo "workflow bypasses the tested Taskfile publication boundary" >&2
     exit 1
 fi
+
+# Binary-only releases keep the public schema module at SCHEMA_VERSION. Keep
+# this contract executable so a future refactor cannot silently resolve the
+# nested Go module at the binary release version again.
+grep -q '^schema_version=' "$postflight"
+grep -q 'SCHEMA_VERSION' "$postflight"
+grep -q 'go get .*@v\$schema_version' "$postflight"
 
 echo "release workflow has one post-build credentialed publisher"

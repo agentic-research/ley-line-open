@@ -156,10 +156,7 @@ impl TextSearchEngine for WitchcraftEngine {
         }
         let uuid = Self::node_uuid(node_id);
         let metadata = serde_json::json!({ "node_id": node_id }).to_string();
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| anyhow::anyhow!("witchcraft engine mutex poisoned"))?;
+        let mut inner = self.inner.lock();
         // `add_doc` is INSERT OR REPLACE on the uuid PK, so repeated
         // upserts of the same node_id correctly overwrite the row. To
         // keep `len()` exact across replace-by-id we probe first and
@@ -180,10 +177,7 @@ impl TextSearchEngine for WitchcraftEngine {
 
     fn remove(&self, node_id: &str) -> Result<()> {
         let uuid = Self::node_uuid(node_id);
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| anyhow::anyhow!("witchcraft engine mutex poisoned"))?;
+        let mut inner = self.inner.lock();
         // Probe so we decrement only when there was an actual row to
         // remove. Pre-fix `saturating_sub(1)` silently hid bugs where
         // a caller emit'd a stray remove against a never-upserted id —
@@ -216,10 +210,7 @@ impl TextSearchEngine for WitchcraftEngine {
         // `Mutex`. Punting until measured is the right call (premature
         // R/W split adds non-trivial dispatch complexity for no
         // observed contention).
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| anyhow::anyhow!("witchcraft engine mutex poisoned"))?;
+        let mut inner = self.inner.lock();
         if !inner.dirty {
             return Ok(());
         }
@@ -241,10 +232,7 @@ impl TextSearchEngine for WitchcraftEngine {
         if query.trim().is_empty() || k == 0 {
             return Ok(Vec::new());
         }
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| anyhow::anyhow!("witchcraft engine mutex poisoned"))?;
+        let mut inner = self.inner.lock();
         let Inner {
             ref db,
             ref embedder,
@@ -278,18 +266,12 @@ impl TextSearchEngine for WitchcraftEngine {
     }
 
     fn len(&self) -> Result<usize> {
-        let inner = self
-            .inner
-            .lock()
-            .map_err(|_| anyhow::anyhow!("witchcraft engine mutex poisoned"))?;
+        let inner = self.inner.lock();
         Ok(inner.count)
     }
 
     fn clear(&self) -> Result<()> {
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| anyhow::anyhow!("witchcraft engine mutex poisoned"))?;
+        let mut inner = self.inner.lock();
         inner.db.clear();
         inner.count = 0;
         inner.dirty = false;

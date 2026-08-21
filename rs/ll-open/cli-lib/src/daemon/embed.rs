@@ -431,19 +431,11 @@ mod tests {
     use super::*;
     use crate::daemon::vec_index::register_vec;
 
-    /// `nodes` table CREATE statement for embed-pass tests. Two tests
-    /// duplicated this verbatim before extraction; one source of truth
-    /// here so a future schema column change ripples to every test
-    /// that builds an in-memory living-db.
-    const NODES_SCHEMA: &str = "CREATE TABLE nodes (
-        id TEXT PRIMARY KEY,
-        parent_id TEXT,
-        name TEXT,
-        kind INTEGER,
-        size INTEGER,
-        mtime INTEGER,
-        record TEXT
-    );";
+    /// The real `nodes` DDL, not a copy of it. A local mirror is only a
+    /// source of truth for the tests that share it — this one drifted from
+    /// the shipped schema the moment `parent_id` became a derived column,
+    /// and nothing would have failed until a row silently took a NULL parent.
+    const NODES_SCHEMA: &str = leyline_schema::NODES_TABLE_DDL;
 
     /// Open an in-memory connection with the `nodes` table created and
     /// `vec0` extension registered. Replaces 2 byte-identical setup
@@ -620,12 +612,9 @@ mod tests {
     fn embedding_pass_zero_embedder_populates_index() -> Result<()> {
         let conn = fresh_conn_with_nodes()?;
         conn.execute_batch(
-            "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record)
-                VALUES ('src/a.go', '', 'a.go', 0, 12, 1, 'package main');
-            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record)
-                VALUES ('src/b.go', '', 'b.go', 0, 13, 2, 'package other');
-            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record)
-                VALUES ('src', '', 'src', 1, 0, 0, NULL);",
+            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('src/a.go', 'a.go', 0, 12, 1, 'package main');
+            INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('src/b.go', 'b.go', 0, 13, 2, 'package other');
+            INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('src', 'src', 1, 0, 0, NULL);",
         )?;
 
         let dim = 4;
@@ -651,9 +640,12 @@ mod tests {
     fn embedding_pass_scope_limits_files() -> Result<()> {
         let conn = fresh_conn_with_nodes()?;
         conn.execute_batch(
-            "INSERT INTO nodes VALUES ('a.go', '', 'a.go', 0, 1, 1, 'package a');
-            INSERT INTO nodes VALUES ('b.go', '', 'b.go', 0, 1, 1, 'package b');
-            INSERT INTO nodes VALUES ('c.go', '', 'c.go', 0, 1, 1, 'package c');",
+            // Columns named, not positional: a bare `VALUES (...)` is bound to
+            // the table's exact stored-column count, so it breaks whenever the
+            // shared DDL gains or loses one.
+            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('a.go', 'a.go', 0, 1, 1, 'package a');
+             INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('b.go', 'b.go', 0, 1, 1, 'package b');
+             INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('c.go', 'c.go', 0, 1, 1, 'package c');",
         )?;
 
         let index = Arc::new(VectorIndex::new(4, None)?);
@@ -783,7 +775,8 @@ mod tests {
         // 100 file rows so a full scan would clearly differ from index lookup.
         for i in 0..100 {
             conn.execute(
-                "INSERT INTO nodes VALUES (?1, '', ?2, 0, 1, 1, ?3)",
+                "INSERT INTO nodes (id, name, kind, size, mtime, record) \
+                 VALUES (?1, ?2, 0, 1, 1, ?3)",
                 rusqlite::params![
                     format!("f{i}.go"),
                     format!("f{i}.go"),

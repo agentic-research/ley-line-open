@@ -144,7 +144,7 @@ mod tests {
         create_schema(&conn).unwrap();
         // Insert one known node so the table exists but the queried
         // id doesn't match.
-        insert_node(&conn, "real_node", "", "real_node", 1, 0, 0, "").unwrap();
+        insert_node(&conn, "real_node", "real_node", 1, 0, 0, "").unwrap();
 
         let err = lookup_node(&conn, "missing_id").expect_err("must error on missing id");
         let msg = format!("{err:#}");

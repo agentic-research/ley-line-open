@@ -10,6 +10,40 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Changed
+
+- **`nodes.parent_id` is derived, not stored.** A node's parent is its own `id`
+  with the trailing `/<name>` removed, and both `id` and `name` are already on
+  the row, so the column was a third copy of what the row could compute. It is
+  now a VIRTUAL generated column. Measured on a 3,150,850-node arena: the
+  `nodes` table goes 1,577 MB -> 914 MB, a saving of 663 MB (-42%);
+  `idx_parent_name` is unchanged at 731 MB because the index still materialises
+  the value, which is why `WHERE parent_id = ?` is still an index seek. Verified
+  against the stored column on that arena before converting — 3,150,850 of
+  3,150,850 rows agree, 0 mismatches. Reads are unaffected, `SELECT *` included,
+  and the column keeps its declared position. Writers are not: an INSERT or
+  UPDATE naming `parent_id` is rejected at prepare time, which was 58 INSERT
+  sites here and is 10 non-test sites in mache (`mache-bc6ca3`). Legacy arenas
+  migrate in place on the next parse, rebuilding the table rather than ALTERing
+  it so a migrated arena is byte-identical to a fresh one, and refusing outright
+  if any stored parent disagrees with the derivation.
+  `_meta.projection_schema_version` advances to `projection-v4`
+  (bead `ley-line-open-17c271`).
+
+- **`node_defs` and `node_refs` carry their own span and grammar kind, so
+  resolving a definition no longer JOINs `_ast`.** `query_definitions` reached
+  into the 3.15M-row `_ast` table purely to recover position for a 337k-row
+  answer, and that join is why `_ast` had to be materialised eagerly. The range
+  now lives on the occurrence row — the shape SCIP uses, and the same
+  denormalisation `canonical_kind` already applies on this table to avoid a
+  JOIN through `node_content.kind`. Measured on a 2000-file slice: +2.2 MB on
+  the occurrence tables against a 209.5 MB `_ast` that becomes optional for the
+  primary query path, and `find_definition` returns complete answers with `_ast`
+  dropped entirely. NULL spans are preserved and meaningful: injected nodes
+  (`ley-line-open-c822a6`) have no `_ast` row and had no span under the old LEFT
+  JOIN either. `_meta.projection_schema_version` advances to `projection-v3`
+  (bead `ley-line-open-b4509b`).
+
 ### Fixed
 
 - **A microsecond wall-clock comparison was reddening CI ~8% of the time.**

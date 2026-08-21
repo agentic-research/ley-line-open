@@ -794,6 +794,19 @@ tasks:
       # one), so it is a scheduler race in the every-push gate and a real
       # signal here.
       - cargo test --release -p leyline-sheaf --test restriction_review_public_api
+      # WAL reader-pool throughput floor. Same shape again: the pool's
+      # CORRECTNESS properties — query_only on every checkout, writers
+      # serializing without corruption, exhaustion blocking rather than
+      # failing — are asserted on every push inside that test, and only the
+      # absolute reads-per-1.5s floor is gated here. It is 80k against a
+      # healthy ~120k, so roughly 1.5x of headroom on an absolute count of
+      # wall-clock work, which a loaded machine loses while the pool is
+      # behaving: 67389 reads against a 46359 mutex baseline is the pool
+      # winning 1.45x and failing the floor anyway. Its predecessor was a
+      # ratio-vs-mutex assertion, moved to an absolute floor because the
+      # divisor swung with scheduler noise; both flake, in opposite
+      # directions, so it belongs here rather than being retuned again.
+      - cargo test --release -p leyline-cli-lib --test wal_pool_concurrent_readers_daemon_test
 
   test:perf:topology:
     desc: Topology pre-pass cost gates (opt-in; tighter budgets than test:perf).

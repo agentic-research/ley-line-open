@@ -113,7 +113,8 @@ pub trait Graph: Send + Sync {
 /// ```sql
 /// CREATE TABLE nodes (
 ///     id TEXT PRIMARY KEY,
-///     parent_id TEXT,
+///     -- derived from id + name, not stored; see `leyline_schema::NODES_TABLE_DDL`
+///     parent_id TEXT GENERATED ALWAYS AS (...) VIRTUAL,
 ///     name TEXT NOT NULL,
 ///     kind INTEGER NOT NULL,   -- 0=file, 1=dir
 ///     size INTEGER DEFAULT 0,
@@ -648,8 +649,8 @@ impl Graph for SqliteGraphAdapter {
 
             let kind: i64 = if is_dir { 1 } else { 0 };
             guard.conn().execute(
-                "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES (?1, ?2, ?3, ?4, 0, ?5, NULL)",
-                rusqlite::params![id, parent_id, name, kind, now],
+                "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES (?1, ?2, ?3, 0, ?4, NULL)",
+                rusqlite::params![id, name, kind, now],
             )?;
             id
         };
@@ -1013,33 +1014,33 @@ impl Graph for SqliteGraphAdapter {
             let old_prefix = format!("{id}/");
             let new_prefix = format!("{new_id}/");
 
-            // Rename the node itself
+            // Rename the node itself. `parent_id` is derived from `id` and
+            // `name`, so it follows both rather than being assigned.
             guard.conn().execute(
-                "UPDATE nodes SET id = ?1, parent_id = ?2, name = ?3 WHERE id = ?4",
-                rusqlite::params![new_id, new_parent_id, new_name, id],
+                "UPDATE nodes SET id = ?1, name = ?2 WHERE id = ?3",
+                rusqlite::params![new_id, new_name, id],
             )?;
 
-            // Cascade to descendants
-            let descendants: Vec<(String, String)> = {
+            // Cascade to descendants. Rewriting the id prefix IS the whole
+            // rename: a child keeps its own `name`, and its parent is derived
+            // from the id it just got. What this loop used to do — read each
+            // child's stored parent, recompute it, and write it back — existed
+            // only to keep a copy in sync with the value it was copied from.
+            let descendants: Vec<String> = {
                 let mut stmt = guard
                     .conn()
-                    .prepare("SELECT id, parent_id FROM nodes WHERE id LIKE ?1")?;
+                    .prepare("SELECT id FROM nodes WHERE id LIKE ?1")?;
                 let rows = stmt.query_map(rusqlite::params![format!("{old_prefix}%")], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    row.get::<_, String>(0)
                 })?;
                 rows.collect::<std::result::Result<_, _>>()?
             };
 
-            for (old_child_id, old_child_parent) in descendants {
+            for old_child_id in descendants {
                 let new_child_id = format!("{new_prefix}{}", &old_child_id[old_prefix.len()..]);
-                let new_child_parent = if old_child_parent == id {
-                    new_id.clone()
-                } else {
-                    format!("{new_prefix}{}", &old_child_parent[old_prefix.len()..])
-                };
                 guard.conn().execute(
-                    "UPDATE nodes SET id = ?1, parent_id = ?2 WHERE id = ?3",
-                    rusqlite::params![new_child_id, new_child_parent, old_child_id],
+                    "UPDATE nodes SET id = ?1 WHERE id = ?2",
+                    rusqlite::params![new_child_id, old_child_id],
                 )?;
             }
 
@@ -1559,9 +1560,9 @@ mod tests {
         let source = Connection::open_in_memory()?;
         create_schema(&source)?;
         source.execute_batch(
-            "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('vulns', '', 'vulns', 1, 0, 1000, NULL);
-            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('vulns/CVE-2024-0001', 'vulns', 'CVE-2024-0001', 1, 0, 2000, NULL);
-            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('vulns/CVE-2024-0001/source', 'vulns/CVE-2024-0001', 'source', 0, 42, 3000, '{\"severity\":\"critical\"}');",
+            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('vulns', 'vulns', 1, 0, 1000, NULL);
+            INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('vulns/CVE-2024-0001', 'CVE-2024-0001', 1, 0, 2000, NULL);
+            INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('vulns/CVE-2024-0001/source', 'source', 0, 42, 3000, '{\"severity\":\"critical\"}');",
         )?;
 
         let data = source.serialize("main")?;
@@ -1608,8 +1609,8 @@ mod tests {
         let source = Connection::open_in_memory()?;
         create_schema(&source)?;
         source.execute_batch(
-            "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs', '', 'docs', 1, 0, 1000, NULL);
-            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs/readme', 'docs', 'readme', 0, 5, 2000, 'hello');",
+            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('docs', 'docs', 1, 0, 1000, NULL);
+            INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('docs/readme', 'readme', 0, 5, 2000, 'hello');",
         )?;
         let data = source.serialize("main")?;
         SqliteGraphAdapter::new_writable(data.as_ref())
@@ -1762,8 +1763,8 @@ mod tests {
         let source = Connection::open_in_memory()?;
         create_schema(&source)?;
         source.execute_batch(
-            "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs', '', 'docs', 1, 0, 1000, NULL);
-            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs/readme', 'docs', 'readme', 0, 5, 2000, 'hello');",
+            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('docs', 'docs', 1, 0, 1000, NULL);
+            INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('docs/readme', 'readme', 0, 5, 2000, 'hello');",
         )?;
         let db_bytes = source.serialize("main")?;
 
@@ -1795,9 +1796,9 @@ mod tests {
         let source = Connection::open_in_memory()?;
         create_schema(&source)?;
         source.execute_batch(
-            "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record_id, record) VALUES ('funcs', '', 'funcs', 1, 0, 1000, NULL, NULL);
-            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record_id, record) VALUES ('funcs/Validate', 'funcs', 'Validate', 1, 0, 2000, 'rec-1', NULL);
-            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record, source_file) VALUES ('funcs/Validate/source', 'funcs/Validate', 'source', 0, 18, 3000, 'func Validate(){}', 'validate.go');",
+            "INSERT INTO nodes (id, name, kind, size, mtime, record_id, record) VALUES ('funcs', 'funcs', 1, 0, 1000, NULL, NULL);
+            INSERT INTO nodes (id, name, kind, size, mtime, record_id, record) VALUES ('funcs/Validate', 'Validate', 1, 0, 2000, 'rec-1', NULL);
+            INSERT INTO nodes (id, name, kind, size, mtime, record, source_file) VALUES ('funcs/Validate/source', 'source', 0, 18, 3000, 'func Validate(){}', 'validate.go');",
         )?;
 
         let data = source.serialize("main")?;
@@ -1831,7 +1832,7 @@ mod tests {
         let source = Connection::open_in_memory()?;
         create_schema(&source)?;
         source.execute_batch(&format!(
-            "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('f', '', 'f', 0, 0, {go_mtime}, NULL);"
+            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('f', 'f', 0, 0, {go_mtime}, NULL);"
         ))?;
 
         let data = source.serialize("main")?;
@@ -1873,13 +1874,13 @@ mod tests {
         let source = Connection::open_in_memory()?;
         create_schema(&source)?;
         source.execute_batch(
-            "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('functions', '', 'functions', 1, 0, 1000, NULL);
-            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('functions/main', 'functions', 'main', 1, 0, 2000, NULL);
-            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('functions/main/source', 'functions/main', 'source', 0, 37, 3000, 'package main\n\nfunc main() {\n}\n');
-            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs', '', 'docs', 1, 0, 1000, NULL);
-            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('docs/readme.txt', 'docs', 'readme.txt', 0, 5, 2000, 'hello');
-            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('src', '', 'src', 1, 0, 1000, NULL);
-            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES ('src/main.go', 'src', 'main.go', 0, 37, 3000, 'package main\n\nfunc main() {\n}\n');",
+            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('functions', 'functions', 1, 0, 1000, NULL);
+            INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('functions/main', 'main', 1, 0, 2000, NULL);
+            INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('functions/main/source', 'source', 0, 37, 3000, 'package main\n\nfunc main() {\n}\n');
+            INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('docs', 'docs', 1, 0, 1000, NULL);
+            INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('docs/readme.txt', 'readme.txt', 0, 5, 2000, 'hello');
+            INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('src', 'src', 1, 0, 1000, NULL);
+            INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('src/main.go', 'main.go', 0, 37, 3000, 'package main\n\nfunc main() {\n}\n');",
         )?;
         let data = source.serialize("main")?;
         let mut adapter = SqliteGraphAdapter::new_writable(data.as_ref())?;
@@ -2675,8 +2676,7 @@ mod tests {
         let data = vec![b'x'; 256 * 1024];
         let record = String::from_utf8(data.clone())?;
         source.execute(
-            "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) \
-             VALUES ('docs/readme', 'docs', 'readme', 0, ?1, 1, ?2)",
+            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('docs/readme', 'readme', 0, ?1, 1, ?2)",
             rusqlite::params![i64::try_from(data.len())?, record],
         )?;
         crate::chunked::store_content_chunked(&source, "docs/readme", &data)?;
@@ -2733,8 +2733,7 @@ mod tests {
         create_schema(&source)?;
         let content = "verify-on-fault must serve exactly these bytes".to_string();
         source.execute(
-            "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) \
-             VALUES ('docs/readme', 'docs', 'readme', 0, ?1, 1, ?2)",
+            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('docs/readme', 'readme', 0, ?1, 1, ?2)",
             rusqlite::params![content.len() as i64, content],
         )?;
         let db_bytes = source.serialize("main")?;

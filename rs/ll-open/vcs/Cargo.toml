@@ -31,6 +31,12 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "macros"] }
 rusqlite = { workspace = true, features = ["bundled", "serialize"], optional = true }
 
+[dev-dependencies]
+# Test helpers build a `nodes` table; they use the shipped DDL rather than a
+# hand-rolled mirror of it, which is how the derived `parent_id` column stayed
+# invisible to them until rows started taking NULL parents.
+leyline-schema = { path = "../../ll-core/schema", version = "0.18.2" }
+
 [features]
 default = []
 sqlite = ["dep:rusqlite"]

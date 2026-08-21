@@ -480,14 +480,14 @@ fn test_inspect_node_lookup() {
     create_schema(&source_conn).expect("create schema");
     source_conn
         .execute(
-            "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params!["", "", "root", 1, 0, 1000, ""],
+            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["", "root", 1, 0, 1000, ""],
         )
         .expect("insert root node");
     source_conn
         .execute(
-            "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params!["main.go", "", "main.go", 0, 42, 2000, ""],
+            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["main.go", "main.go", 0, 42, 2000, ""],
         )
         .expect("insert file node");
 
@@ -2174,18 +2174,11 @@ async fn test_embed_queue_drainer_refreshes_index() {
     live_db
         .writer
         .lock()
-        .execute_batch(
-            "CREATE TABLE nodes (
-            id TEXT PRIMARY KEY,
-            parent_id TEXT,
-            name TEXT,
-            kind INTEGER,
-            size INTEGER,
-            mtime INTEGER,
-            record TEXT
-        );
-        INSERT INTO nodes VALUES ('a.go', '', 'a.go', 0, 9, 1, 'package a');",
-        )
+        .execute_batch(&format!(
+            "{}\n INSERT INTO nodes (id, name, kind, size, mtime, record) \
+                 VALUES ('a.go', 'a.go', 0, 9, 1, 'package a');",
+            leyline_schema::NODES_TABLE_DDL
+        ))
         .unwrap();
 
     let queue: embed::EmbedQueue = Arc::new(Mutex::new(std::collections::BinaryHeap::new()));

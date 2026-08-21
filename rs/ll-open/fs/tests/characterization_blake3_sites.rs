@@ -53,8 +53,7 @@ fn seed_db() -> Vec<u8> {
     let conn = Connection::open_in_memory().unwrap();
     create_schema(&conn).unwrap();
     conn.execute_batch(
-        "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, record) \
-         VALUES ('docs', '', 'docs', 1, 0, 1000, NULL);",
+        "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('docs', 'docs', 1, 0, 1000, NULL);",
     )
     .unwrap();
     conn.serialize("main").unwrap().to_vec()

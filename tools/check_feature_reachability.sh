@@ -96,42 +96,24 @@ fi
 # existing backlog.
 #
 #   <crate-dir>/<feature>   # bead — why
-not_shipping="
-ll-open/fs/verify
-ll-core/core/interrupt
-ll-core/schema-capnp/regen-fixtures
-ll-open/sheaf/test-spy
-ll-open/sign/host
-ll-open/sign/host-extras
-ll-open/text-search/engine-witchcraft
-ll-open/ts/pyproject
-ll-open/vcs/sqlite
-"
-# Ledger notes — why each of the above does not ship. Kept as prose beside the
-# list because a bare allowlist decays into "things we muted".
-#
-#   ll-open/fs/verify          ley-line-open-b6a4dd — verify-on-fault arena
-#                              serving, deliberately default-OFF: additive API
-#                              (VerifiedArena + with_verify_on_fault), nothing
-#                              degrades when compiled out. That is the whole
-#                              distinction from the splice entry this list used
-#                              to carry: splice DEGRADED when compiled out
-#                              (`flush_node` fell back to a bare `Ok(())`), so
-#                              it was a defect being recorded, not a knob. It
-#                              ships as of 918a75 and left this list. The flag
-#                              here flips into a shipping config in a later
-#                              bead; remove this line then.
-#   ll-open/ts/pyproject       ley-line-open-988b93 — NOT a grammar: a 349-line
-#                              dependency-graph projection (pyproject.toml ->
-#                              mountable /deps tree). Unwired too — nothing
-#                              calls project_pyproject. Dead in two ways.
-#   ll-core/core/interrupt     opt-in signal handling; consumers select it.
-#   schema-capnp/regen-fixtures  dev tooling — regenerates test fixtures.
-#   ll-open/sheaf/test-spy     declared test-only in its own manifest comment.
-#   ll-open/sign/host{,-extras}  ADR-0019 — interactive HOST signing lives
-#                              cloister-side; LLO ships verify-only.
-#   text-search/engine-witchcraft  engine selection, not built into the CLI.
-#   ll-open/vcs/sqlite         leyline-vcs is not a CLI dependency at all.
+# The rows and their prose live in tools/feature-ledger.txt, which
+# tools/mutants_diff.sh reads too — one file, so the two gates cannot drift
+# the way their private copies did (bead ley-line-open-cb1e29). A missing or
+# unparseable ledger fails closed here: an empty exemption list would fail
+# every not-shipping feature loudly, but the earlier we say WHY, the better.
+ledger="$repo_root/tools/feature-ledger.txt"
+if [ ! -f "$ledger" ]; then
+    echo "feature-reachability: $ledger is missing — there is no not-shipping" >&2
+    echo "ledger to consult, and every verdict below would be fabricated." >&2
+    exit 1
+fi
+not_shipping=$(awk '!/^[[:space:]]*(#|$)/ && $3 == "not-shipping" { print $1 "/" $2 }' "$ledger")
+if [ -z "$not_shipping" ]; then
+    echo "feature-reachability: parsed zero not-shipping rows from $ledger —" >&2
+    echo "the ledger regressed or the parse broke. Refusing to guess which." >&2
+    exit 1
+fi
+ships_untested=$(awk '!/^[[:space:]]*(#|$)/ && $3 == "ships-untested" { print $1 "/" $2 }' "$ledger")
 
 # Both sides of the grep -qx below must live in the same path universe.
 # cargo prints PHYSICAL manifest paths, while a plain `pwd` reports the
@@ -146,6 +128,23 @@ if ! printf '%s\n' "$reachable" | grep -q "^$cli_dir/"; then
     echo "path universes and every verdict below would be fabricated." >&2
     exit 1
 fi
+
+# A not-shipping row whose feature IS reachable is a stale ledger entry — the
+# feature started shipping and the record did not move. Before this check, a
+# stale row passed silently: the reachability loop below consults the ledger
+# only for features cargo did NOT resolve, so nothing ever read a stale one.
+for entry in $not_shipping; do
+    dir=${entry%/*}
+    feature=${entry##*/}
+    [ -d "$dir" ] || continue # claim 3 reports the missing-manifest case
+    abs=$(cd "$dir" && pwd -P)
+    if printf '%s\n' "$reachable" | grep -qx "$abs/$feature"; then
+        printf 'feature-ledger STALE: %s is recorded not-shipping, but a shipping configuration enables it\n' \
+            "$entry" >&2
+        printf '                      move the row to ships-optin (or drop it) in tools/feature-ledger.txt\n' >&2
+        failed=1
+    fi
+done
 
 for manifest in $(find . -name Cargo.toml -not -path '*/target/*' -not -path '*worktree*' | sort); do
     dir=$(cd "$(dirname "$manifest")" && pwd -P)
@@ -166,8 +165,8 @@ done
 if [ "$failed" -ne 0 ]; then
     printf '\nA feature no build enables is compiled out everywhere. A test that enables it\n' >&2
     printf 'proves a capability the shipped binary does not have. Either wire it into a\n' >&2
-    printf 'config in rs/ll-open/cli{,-lib}/Cargo.toml, or record it in the not-shipping\n' >&2
-    printf 'ledger in this script with a bead saying why.\n' >&2
+    printf 'config in rs/ll-open/cli{,-lib}/Cargo.toml, or record it as not-shipping in\n' >&2
+    printf 'tools/feature-ledger.txt with a bead saying why.\n' >&2
     exit 1
 fi
 
@@ -269,18 +268,11 @@ for feature in $cli_features; do
     printf '%s\n' $cli_defaults | grep -qx "$feature" && continue
     printf '%s\n' "$tested_explicit" | grep -qx "$feature" && continue
 
-    # Coverage ledger — shipping features with no ci-invoked test, each with a
-    # bead. Separate from the not-shipping ledger above: these DO ship, they
-    # are just unexercised, which is the worse of the two states.
-    #
-    #   cli-lib/mount   ley-line-open-aed167 — zero test files gated on it at
-    #                   any level. Two BUILD checks exist; neither proves a
-    #                   mount serves correct bytes. Compounds 918a75, where
-    #                   flush_node is a silent no-op so mount writes never
-    #                   reproject. Remove when a round-trip test lands.
-    case "$feature" in
-        mount) continue ;;
-    esac
+    # Coverage exemptions — shipping features with no ci-invoked test, the
+    # `ships-untested` rows of tools/feature-ledger.txt, each with a bead and
+    # its why. Separate from the not-shipping rows: these DO ship, they are
+    # just unexercised, which is the worse of the two states.
+    printf '%s\n' "$ships_untested" | grep -qx "ll-open/cli-lib/$feature" && continue
 
     printf 'feature-coverage FAILED: cli-lib/%s ships but no ci-invoked test enables it\n' \
         "$feature" >&2

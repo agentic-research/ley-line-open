@@ -48,6 +48,9 @@ leyline-hdc = { path = "../hdc" }
 # `leyline-sheaf` stays HDC- and parser-independent.
 leyline-ts = { path = "../ts", features = ["rust"] }
 tree-sitter = { workspace = true }
+# Shared wall-clock sampling for the perf gates (min-of-N, interleaved
+# arms) — the technique lives in one place; see that crate's docs.
+leyline-perf-sample = { path = "../perf-sample" }
 
 [[bench]]
 name = "git_replay_invalidation"

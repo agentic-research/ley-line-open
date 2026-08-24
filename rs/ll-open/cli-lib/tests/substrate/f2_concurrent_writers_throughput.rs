@@ -73,6 +73,7 @@ use std::time::Instant;
 
 use leyline_core::FsBlobStore;
 use leyline_core::substrate::BlobStore;
+use leyline_perf_sample::Sample;
 use tempfile::TempDir;
 
 /// Concurrent writer count (from decade §6 point 5: "N=10").
@@ -226,67 +227,76 @@ fn concurrent_writers_beat_serial_baseline() {
     // Same fsync count either way — the comparison is about
     // concurrency, not workload size.
     //
-    // BEST of `REPS`, arms INTERLEAVED. Two separate corrections, both
-    // needed:
+    // BEST of `REPS` with the arms INTERLEAVED — both rules live in
+    // `leyline-perf-sample` (see its crate docs for the full argument:
+    // min because load is strictly additive, interleaved because
+    // sequential arms attribute load drift to whichever arm ran during
+    // it — the error behind the bogus 0-vs-3 result in the
+    // `ley-line-open-cdd5d0` investigation).
     //
-    // Best-of, because load can only make a run SLOWER. The minimum
-    // elapsed is therefore the closest estimate of each shape's true cost,
-    // and a busy machine cannot push a minimum down — it can only fail to
-    // lower it. This is the technique `cold_parse_perf_regression` already
-    // uses (`walls_ms.iter().min()` over three runs); f2 took a single
-    // sample per arm and divided one by the other, so noise in EITHER
-    // landed directly on the ratio.
+    // What made this load-bearing HERE: measured on an IDLE machine, the
+    // serial divisor swung 141.7 -> 193.1 tx/s across three runs (36%)
+    // while the parallel arm held near 245. Pairing the fastest observed
+    // serial with the slowest observed parallel gives ratio = 189.5/193.1
+    // = 0.98x — below the 1.0 falsification bar, let alone the 1.1x gate,
+    // from two real measurements taken minutes apart with nothing else
+    // running. The ratio was reporting the scheduler, not the substrate.
     //
-    // Interleaved, because sampling the arms in sequence attributes any
-    // drift in machine load to whichever arm ran during it. That is not
-    // hypothetical here — it is the same error that produced a bogus
-    // 0-vs-3 result while investigating `ley-line-open-cdd5d0`, and the
-    // same one recorded on `ley-line-open-b4509b`.
-    //
-    // What made this load-bearing: measured on an IDLE machine, the serial
-    // divisor swung 141.7 -> 193.1 tx/s across three runs (36%) while the
-    // parallel arm held near 245. Pairing the fastest observed serial with
-    // the slowest observed parallel gives ratio = 189.5/193.1 = 0.98x —
-    // below the 1.0 falsification bar, let alone the 1.1x gate, from two
-    // real measurements taken minutes apart with nothing else running.
-    // The ratio was reporting the scheduler, not the substrate.
+    // The wall is `run_parallel`'s own elapsed (thread spawn through
+    // join), not one the helper measures around the closure, so per-rep
+    // setup like the prefix format stays outside the measurement.
     const REPS: usize = 3;
-    let mut serial: Option<(std::time::Duration, u64)> = None;
-    let mut parallel: Option<(std::time::Duration, u64)> = None;
-    for rep in 0..REPS {
-        let prefix = format!("run{rep}");
-        let s = run_parallel(
-            &root_serial,
-            1,
-            N_WRITERS_PARALLEL * BLOBS_PER_WRITER,
-            &prefix,
-        );
-        if serial.is_none_or(|(best, _)| s.0 < best) {
-            serial = Some(s);
-        }
-        let p = run_parallel(
-            &root_parallel,
-            N_WRITERS_PARALLEL,
-            BLOBS_PER_WRITER,
-            &prefix,
-        );
-        if parallel.is_none_or(|(best, _)| p.0 < best) {
-            parallel = Some(p);
-        }
-    }
-    let (serial_elapsed, serial_puts) = serial.expect("at least one rep");
-    let (parallel_elapsed, parallel_puts) = parallel.expect("at least one rep");
+    let (serial, parallel) = leyline_perf_sample::best_of_interleaved(
+        REPS,
+        |rep| {
+            let prefix = format!("run{rep}");
+            let (elapsed, puts) = run_parallel(
+                &root_serial,
+                1,
+                N_WRITERS_PARALLEL * BLOBS_PER_WRITER,
+                &prefix,
+            );
+            Sample {
+                wall: elapsed,
+                value: puts,
+            }
+        },
+        |rep| {
+            let prefix = format!("run{rep}");
+            let (elapsed, puts) = run_parallel(
+                &root_parallel,
+                N_WRITERS_PARALLEL,
+                BLOBS_PER_WRITER,
+                &prefix,
+            );
+            Sample {
+                wall: elapsed,
+                value: puts,
+            }
+        },
+    );
+    let (serial_elapsed, serial_puts) = (serial.wall(), *serial.value());
+    let (parallel_elapsed, parallel_puts) = (parallel.wall(), *parallel.value());
 
-    assert_eq!(
-        serial_puts,
-        (N_WRITERS_PARALLEL * BLOBS_PER_WRITER) as u64,
-        "F2 harness bug: serial baseline did not complete all puts"
-    );
-    assert_eq!(
-        parallel_puts,
-        (N_WRITERS_PARALLEL * BLOBS_PER_WRITER) as u64,
-        "F2 harness bug: parallel run did not complete all puts"
-    );
+    // EVERY rep must complete all puts, not just the best one: under
+    // best-of, a rep that silently did less work would also be the
+    // fastest, so checking only the winner would select for exactly the
+    // broken sample. (writer_loop panics on a failed put, so this is a
+    // belt against a future refactor that swallows that panic.)
+    for s in serial.samples() {
+        assert_eq!(
+            s.value,
+            (N_WRITERS_PARALLEL * BLOBS_PER_WRITER) as u64,
+            "F2 harness bug: serial baseline did not complete all puts"
+        );
+    }
+    for s in parallel.samples() {
+        assert_eq!(
+            s.value,
+            (N_WRITERS_PARALLEL * BLOBS_PER_WRITER) as u64,
+            "F2 harness bug: parallel run did not complete all puts"
+        );
+    }
 
     // Guard against a 0-time measurement (would divide by zero). If
     // the workload finished in less than a millisecond, the test is

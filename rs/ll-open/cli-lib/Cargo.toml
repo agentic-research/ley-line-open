@@ -140,6 +140,9 @@ bytemuck = { workspace = true, features = ["derive"] }
 # build sees `DETECT_VIOLATIONS_REACH_COUNT`. The production cdylib
 # does NOT pull this feature (release builds stay zero-cost).
 leyline-sheaf = { path = "../sheaf", features = ["test-spy"] }
+# Shared wall-clock sampling for the perf gates (min-of-N, interleaved
+# arms) — the technique lives in one place; see that crate's docs.
+leyline-perf-sample = { path = "../perf-sample" }
 # `tower::ServiceExt::oneshot` for the MCP auth middleware end-to-end
 # tests (daemon::auth::tests). Production uses tower transitively
 # through axum's middleware stack; this dev-dep exposes the trait

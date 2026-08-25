@@ -208,3 +208,12 @@ path = "tests/substrate/f4_diff_complexity.rs"
 [[test]]
 name = "f5_composition_seams"
 path = "tests/substrate/f5_composition_seams.rs"
+
+# harness = false: this file owns `main` so that, re-exec'd with
+# `--fake-ls`, the SAME binary becomes the scripted LSP server the test
+# drives the enrichment pass against — no libtest banners corrupting the
+# stdio framing. See the file header (bead ley-line-open-fb7d73).
+[[test]]
+name = "lsp_enrich_pipeline"
+path = "tests/lsp_enrich_pipeline.rs"
+harness = false

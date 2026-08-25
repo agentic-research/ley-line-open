@@ -4441,6 +4441,7 @@ dependencies = [
  "leyline-hdc",
  "leyline-lsp",
  "leyline-mcp-protocol-schema",
+ "leyline-perf-sample",
  "leyline-public-schema",
  "leyline-runtime",
  "leyline-schema",
@@ -4589,6 +4590,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "leyline-perf-sample"
+version = "0.19.0"
+
+[[package]]
 name = "leyline-public-schema"
 version = "0.19.0"
 dependencies = [
@@ -4669,6 +4674,7 @@ dependencies = [
  "anyhow",
  "leyline-core",
  "leyline-hdc",
+ "leyline-perf-sample",
  "leyline-ts",
  "log",
  "nalgebra",

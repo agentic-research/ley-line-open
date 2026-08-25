@@ -1,0 +1,11 @@
+[package]
+name = "leyline-perf-sample"
+version = "0.19.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Wall-clock sampling for perf gates: minimum-of-N with interleaved arms. Test-support only, never published."
+repository = "https://github.com/agentic-research/ley-line-open"
+# Test-support only, consumed as a path dev-dependency (same posture as
+# leyline-mcp-protocol-schema): cargo strips path-only dev-deps on publish,
+# so the published crates never reference this one.
+publish = false

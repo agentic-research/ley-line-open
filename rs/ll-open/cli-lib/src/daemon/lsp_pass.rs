@@ -622,11 +622,12 @@ async fn enrich_files_with_client(
             // Pre-fix the pass would race the indexer and write 25
             // skeleton _lsp rows with 0 hovers/defs/refs.
             //
-            // `await_ready` polls for `experimental/serverStatus
-            // quiescent: true` (rust-analyzer extension) or `$/progress`
-            // end for an indexing token. Servers that don't emit either
-            // hit the timeout — those calls were going to return empty
-            // anyway; the timeout caps the wait at the per-language
+            // `await_ready` polls for `experimental/serverStatus`
+            // quiescence (rust-analyzer extension) or a drained
+            // `$/progress` token set — structural signals, no title
+            // matching (bead ley-line-open-fb7d73). Servers that emit
+            // neither hit the timeout — those calls were going to return
+            // empty anyway; the timeout caps the wait at the per-language
             // cost. The handler skips the wait entirely when timeout = 0.
             let ready_timeout = ready_timeout_for_language(lang);
             if !ready_timeout.is_zero() {

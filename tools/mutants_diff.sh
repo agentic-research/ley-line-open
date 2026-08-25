@@ -345,12 +345,16 @@ fi
 if [ "$SCOPE" = all ] || [ "$SCOPE" = cli ]; then
   if package_changed_in_diff ll-open/cli-lib; then
     claim_package ll-open/cli-lib
+    # lsp_enrich_pipeline: kills the whole-function replacement mutants on
+    # `enrich_files_with_client` (four survived on the PR that added the
+    # test — nothing observed that function's counts or writes before it).
     run_slice integration \
         -C --lib \
         -C --test -C execution_client \
         -C --test -C execution_transport \
         -C --test -C cdc_activation_consumer_test \
         -C --test -C cdc_command_test \
+        -C --test -C lsp_enrich_pipeline \
         --package leyline-cli-lib --test-workspace=false
   fi
 fi

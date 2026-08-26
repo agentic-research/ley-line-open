@@ -189,9 +189,14 @@ fn native_cleanup_restores_guest_created_permissions() {
 #[test]
 fn cancel_kills_worker_and_removes_run_root() {
     let fixture = TempDir::new().expect("fixture");
+    // Long-lived fake workers `exec` their sleeper so the worker PID IS the
+    // sleeper — without exec, tail is a grandchild the backend's kill never
+    // reaches, and it leaks past the test run (bead rs-a1e8d0; the krun
+    // twin's rejection paths accumulated 1,869 orphans on a maintainer
+    // machine).
     let (backend, runs) = backend(
         &fixture,
-        "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\n/usr/bin/tail -f /dev/null\n",
+        "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\nexec /usr/bin/tail -f /dev/null\n",
     );
     backend.start(&request()).expect("worker readiness");
     assert_eq!(fs::read_dir(&runs).expect("runs").count(), 1);
@@ -211,7 +216,7 @@ fn backend_trait_cancel_delegates_and_drop_waits_for_cleanup() {
     let fixture = TempDir::new().expect("fixture");
     let (backend, runs) = backend(
         &fixture,
-        "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\n/usr/bin/tail -f /dev/null\n",
+        "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\nexec /usr/bin/tail -f /dev/null\n",
     );
     backend.start(&request()).expect("worker readiness");
     assert!(Backend::cancel(&backend, "native-run-01").expect("trait cancel"));

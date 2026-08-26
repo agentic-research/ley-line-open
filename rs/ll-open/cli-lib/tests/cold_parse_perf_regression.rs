@@ -142,8 +142,8 @@ fn count_rows(db_path: &Path) -> rusqlite::Result<u64> {
     Ok((nodes + ast) as u64)
 }
 
-#[tokio::test]
-async fn cold_parse_wall_within_budget_on_synthetic_go_corpus() {
+#[test]
+fn cold_parse_wall_within_budget_on_synthetic_go_corpus() {
     if !perf_gate_enabled() {
         eprintln!(
             "skipping cold-parse perf gate: {GATE_ENV} not set to '1'. \
@@ -176,9 +176,10 @@ async fn cold_parse_wall_within_budget_on_synthetic_go_corpus() {
     let db_dir = TempDir::new().expect("db tempdir");
     let corpus = build_corpus(corpus_root.path(), REPLICATION_COUNT).expect("build corpus");
 
-    // MIN of three cold runs, not one shot. Scheduler noise on a shared
-    // runner is strictly ADDITIVE, so the minimum approximates true
-    // capability while a real regression (un-batched inserts, dropped
+    // MIN of three cold runs, not one shot — the sampling rule lives in
+    // `leyline-perf-sample` (rule 1 of its crate docs): scheduler noise on
+    // a shared runner is strictly ADDITIVE, so the minimum approximates
+    // true capability while a real regression (un-batched inserts, dropped
     // BufWriter) lifts every run by multiples and still trips. Each run
     // parses into its own fresh db so all three stay cold; the corpus
     // build is shared and unmeasured.
@@ -186,9 +187,17 @@ async fn cold_parse_wall_within_budget_on_synthetic_go_corpus() {
     // This does NOT defend against the debug-vs-release mismatch that
     // actually failed CI — three debug runs are all ~10× over. The
     // `debug_assertions` skip above is what covers that.
-    let mut walls_ms: Vec<u128> = Vec::with_capacity(3);
-    let mut row_counts: Vec<u64> = Vec::with_capacity(3);
-    for i in 0..3 {
+    //
+    // The runtime is built once, outside the timed region, and mirrors
+    // `#[tokio::test]`'s current-thread default (this fn stopped being
+    // `#[tokio::test]` so the sync sampling helper can own the rep loop),
+    // keeping the measurement comparable with the module header's
+    // calibration baseline.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let runs = leyline_perf_sample::best_of(3, |i| {
         let db_path = db_dir.path().join(format!("perf-bench-{i}.db"));
         let cmd = leyline_cli_lib::Commands::Parse {
             source: corpus.clone(),
@@ -200,14 +209,18 @@ async fn cold_parse_wall_within_budget_on_synthetic_go_corpus() {
         // emits per-phase timings to stderr; we use the outer wall here
         // because it's what consumers actually observe (binary startup
         // time is measured separately in the bench script — see
-        // CHANGELOG v0.4.1).
-        let start = std::time::Instant::now();
-        leyline_cli_lib::run(cmd).await.expect("parse must succeed");
-        walls_ms.push(start.elapsed().as_millis());
-        row_counts.push(count_rows(&db_path).expect("count rows"));
-    }
+        // CHANGELOG v0.4.1). The row count is derived AFTER the timed
+        // region, so the COUNT queries never pollute the wall.
+        leyline_perf_sample::timed(|| {
+            rt.block_on(leyline_cli_lib::run(cmd))
+                .expect("parse must succeed")
+        })
+        .map(|()| count_rows(&db_path).expect("count rows"))
+    });
 
-    let wall_ms = *walls_ms.iter().min().expect("three runs");
+    let wall_ms = runs.wall().as_millis();
+    let walls_ms: Vec<u128> = runs.walls().iter().map(|w| w.as_millis()).collect();
+    let row_counts: Vec<u64> = runs.samples().iter().map(|s| s.value).collect();
     let row_count = row_counts[0];
     assert!(
         row_counts.iter().all(|&c| c == row_count),

@@ -33,14 +33,14 @@ pub struct LspClient {
     next_id: u64,
     /// Diagnostics received via notifications (server pushes these).
     pub diagnostics: Vec<(String, Vec<Diagnostic>)>,
-    /// Set when the server has signalled quiescence — either via
-    /// rust-analyzer's `experimental/serverStatus` notification with
-    /// `quiescent: true`, or via `$/progress` end for an indexing token
-    /// (any token whose title contains "indexing" / "loading" / "ready",
-    /// case-insensitive). `await_ready` polls this. Always-true for
-    /// servers that don't emit indexing signals — those callers should
-    /// pass `wait: false` instead of calling `await_ready` at all.
-    server_ready: bool,
+    /// Readiness derived from the protocol's own structure — `$/progress`
+    /// token begin/end pairing, and rust-analyzer's
+    /// `experimental/serverStatus` where offered. `await_ready` polls
+    /// this. Never flips for servers that emit no progress at all —
+    /// those callers should pass `wait: false` instead of calling
+    /// `await_ready` at all. See [`ReadinessTracker`] for the contract
+    /// (bead `ley-line-open-fb7d73`).
+    readiness: ReadinessTracker,
 }
 
 impl LspClient {
@@ -116,7 +116,7 @@ impl LspClient {
             rx,
             next_id: 1,
             diagnostics: Vec::new(),
-            server_ready: false,
+            readiness: ReadinessTracker::default(),
         };
 
         // Initialize handshake.
@@ -132,9 +132,10 @@ impl LspClient {
         //
         // `experimental.serverStatusNotification` — rust-analyzer-
         // specific notification that signals `quiescent: true` when
-        // the server is done indexing + analysis. Cheaper than waiting
-        // for `$/progress` (which we'd have to parse the title of to
-        // distinguish "Indexing" from "Discovering tests" etc.).
+        // the server is done indexing + analysis. Richer than
+        // `$/progress` (quiescence is one bit covering ALL of the
+        // server's work, with no per-token bookkeeping), so
+        // `ReadinessTracker` treats it as authoritative when offered.
         // Derive a workspace folder from rootUri. gopls (and many other
         // modern LSP servers) prefer `workspaceFolders` for module /
         // package detection — `rootUri` is the deprecated single-folder
@@ -465,41 +466,14 @@ impl LspClient {
                 }
             }
             "$/progress" => {
-                // Generic LSP work-done progress. Indexing/loading tokens
-                // signal ready when they emit `kind: "end"`. We don't
-                // track per-token state — any "end" of a recognized
-                // indexing-ish token flips the ready flag. False positives
-                // (a non-indexing token whose title matches "loading"
-                // ends early) are harmless: subsequent queries either
-                // succeed (server actually was ready) or return empty
-                // (caller falls back to per-symbol retry). Bead
-                // `ley-line-open-661727`.
-                if let Some(params) = &msg.params
-                    && let Some(value) = params.get("value")
-                    && let Some(kind) = value.get("kind").and_then(|v| v.as_str())
-                {
-                    match kind {
-                        "begin" => {
-                            if let Some(title) = value.get("title").and_then(|v| v.as_str())
-                                && is_readiness_token(title)
-                            {
-                                // Reset on begin in case a fresh indexing
-                                // cycle starts after we already flipped
-                                // ready (rust-analyzer reindexes on
-                                // Cargo.toml change).
-                                self.server_ready = false;
-                            }
-                        }
-                        "end" => {
-                            // Without per-token bookkeeping we can't tell
-                            // which token just ended. Conservative read:
-                            // any `end` flips ready true. The pass's
-                            // `await_ready` callers verify via subsequent
-                            // empty-results retry anyway.
-                            self.server_ready = true;
-                        }
-                        _ => {}
-                    }
+                // Generic LSP work-done progress, tracked per TOKEN — the
+                // protocol's own structure — never by matching the
+                // human-readable `title`, which is some upstream server's
+                // UI prose and renames without notice. See
+                // [`ReadinessTracker`]; beads `ley-line-open-661727`,
+                // `ley-line-open-fb7d73`.
+                if let Some(params) = &msg.params {
+                    self.readiness.on_progress(params);
                 }
             }
             "experimental/serverStatus" => {
@@ -507,13 +481,9 @@ impl LspClient {
                 // capability declared in `start`). When `quiescent: true`
                 // the server has finished its current analysis sweep —
                 // hover/definition/references are now backed by the
-                // resolved project model. This is strictly cheaper than
-                // parsing $/progress titles.
-                if let Some(params) = &msg.params
-                    && let Some(quiescent) = params.get("quiescent").and_then(|v| v.as_bool())
-                    && quiescent
-                {
-                    self.server_ready = true;
+                // resolved project model.
+                if let Some(params) = &msg.params {
+                    self.readiness.on_server_status(params);
                 }
             }
             _ => {}
@@ -521,13 +491,15 @@ impl LspClient {
     }
 
     /// Wait for the language server to signal readiness for semantic
-    /// queries (hover / definition / references). Polls
-    /// `server_ready` (flipped by `$/progress` indexing-token end and
-    /// rust-analyzer's `experimental/serverStatus quiescent: true`) up
-    /// to `timeout`. Returns `true` if ready signal arrived, `false`
-    /// on timeout. Callers should still issue queries on timeout — the
-    /// server may have skipped progress notifications (older language
-    /// servers, or one that doesn't index).
+    /// queries (hover / definition / references). Polls the
+    /// [`ReadinessTracker`] (fed by `$/progress` token lifecycles and
+    /// rust-analyzer's `experimental/serverStatus`) up to `timeout`,
+    /// with a bounded tick — poll-until-condition with a deadline, not
+    /// a sleep standing in for a signal. Returns `true` if the ready
+    /// state was reached, `false` on timeout. Callers should still
+    /// issue queries on timeout — the server may have skipped progress
+    /// notifications (older language servers, or one that doesn't
+    /// index).
     ///
     /// Bead `ley-line-open-661727`: documentSymbol is syntactic and
     /// returns immediately, but hover/def/refs need the workspace's
@@ -537,9 +509,9 @@ impl LspClient {
         let deadline = tokio::time::Instant::now() + timeout;
         let poll_interval = std::time::Duration::from_millis(50);
         loop {
-            // Drain pending messages (no waiting). Each tick may flip
-            // server_ready via $/progress or experimental/serverStatus —
-            // but only if we ANSWER the server's requests: gopls won't emit
+            // Drain pending messages (no waiting). Each tick may advance
+            // the readiness state via $/progress or experimental/serverStatus
+            // — but only if we ANSWER the server's requests: gopls won't emit
             // progress until its `window/workDoneProgress/create` request is
             // acked, so answering server→client requests here is what lets
             // the readiness signal arrive at all (mache-6584a0).
@@ -555,7 +527,7 @@ impl LspClient {
                     _ => {}
                 }
             }
-            if self.server_ready {
+            if self.readiness.is_ready() {
                 return true;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -565,27 +537,101 @@ impl LspClient {
         }
     }
 
-    /// Test-only: peek at the readiness flag. Production callers use
+    /// Test-only: peek at the readiness state. Production callers use
     /// `await_ready` which drains notifications first.
     #[cfg(test)]
     pub fn is_server_ready(&self) -> bool {
-        self.server_ready
+        self.readiness.is_ready()
     }
 }
 
-/// Recognize indexing-related `$/progress` titles. Conservative match
-/// on common substrings; case-insensitive. rust-analyzer uses
-/// `"rust-analyzer/Indexing"`, gopls uses `"setting up workspace"`,
-/// pyright uses `"Indexing"`. Match what's there empirically + don't
-/// over-match (a non-indexing token title containing "loading" would
-/// flip ready prematurely; the cost is one wasted retry, not
-/// correctness loss).
-fn is_readiness_token(title: &str) -> bool {
-    let t = title.to_ascii_lowercase();
-    t.contains("indexing")
-        || t.contains("loading")
-        || t.contains("workspace")
-        || t.contains("ready")
+/// Readiness derived from the LSP protocol's structure, not from any
+/// server's prose (bead `ley-line-open-fb7d73`).
+///
+/// The predecessor substring-matched `$/progress` titles against
+/// "indexing" / "loading" / "workspace" / "ready" — copies of
+/// rust-analyzer's, gopls's and pyright's UI strings, held without a
+/// contract. A patch-release rename breaks that silently: queries return
+/// empty and it reads as "cold index", not "our matcher stopped
+/// matching". It was also loose in the other direction: with no per-token
+/// bookkeeping, the FIRST `end` of any token flipped ready while other
+/// work was still in flight.
+///
+/// What the protocol itself guarantees is the token lifecycle: every
+/// work-done progress token emits `begin`, then `report`s, then exactly
+/// one `end`. So readiness is structural:
+///
+///   ready ⇔ at least one cycle has completed AND no begun token is
+///           still in flight
+///
+/// — for any token, under any title, in any language. A fresh `begin`
+/// (rust-analyzer reindexing on a Cargo.toml change) makes the state
+/// not-ready again without needing to recognize the token's name.
+///
+/// rust-analyzer's `experimental/serverStatus` is richer — `quiescent`
+/// is one bit covering all of the server's work — so when a server
+/// offers it at all, its latest value is authoritative over the
+/// progress-derived state. That notification is a negotiated capability
+/// (declared in `start`), not a UI string, so depending on it is
+/// depending on a contract.
+#[derive(Debug, Default)]
+struct ReadinessTracker {
+    /// Tokens with a `begin` and no `end` yet. LSP tokens are
+    /// `number | string`; the canonical JSON rendering keeps `1` and
+    /// `"1"` distinct, as the protocol does.
+    in_flight: std::collections::HashSet<String>,
+    /// At least one progress cycle has completed. An `end` for a token
+    /// whose `begin` we never saw still counts: it is structural
+    /// evidence of a completed cycle, and progress subscriptions can
+    /// race the first `begin`.
+    saw_cycle_end: bool,
+    /// Latest `experimental/serverStatus` quiescent value — `None`
+    /// until the server demonstrates it speaks that contract.
+    quiescent: Option<bool>,
+}
+
+impl ReadinessTracker {
+    /// Feed a `$/progress` notification's params.
+    fn on_progress(&mut self, params: &serde_json::Value) {
+        let Some(kind) = params
+            .get("value")
+            .and_then(|v| v.get("kind"))
+            .and_then(|k| k.as_str())
+        else {
+            return;
+        };
+        let token = params
+            .get("token")
+            .map(|t| t.to_string())
+            .unwrap_or_default();
+        match kind {
+            "begin" => {
+                self.in_flight.insert(token);
+            }
+            "end" => {
+                self.in_flight.remove(&token);
+                self.saw_cycle_end = true;
+            }
+            // "report" — the token is still in flight; nothing changes.
+            _ => {}
+        }
+    }
+
+    /// Feed an `experimental/serverStatus` notification's params.
+    fn on_server_status(&mut self, params: &serde_json::Value) {
+        if let Some(q) = params.get("quiescent").and_then(|v| v.as_bool()) {
+            self.quiescent = Some(q);
+        }
+    }
+
+    fn is_ready(&self) -> bool {
+        match self.quiescent {
+            // The server speaks the serverStatus contract: its word wins,
+            // in both directions.
+            Some(q) => q,
+            None => self.saw_cycle_end && self.in_flight.is_empty(),
+        }
+    }
 }
 
 /// Build the `result` payload for a server→client request we must answer.
@@ -658,26 +704,94 @@ async fn read_message<R: tokio::io::AsyncRead + Unpin>(
 mod tests {
     use super::*;
 
-    #[test]
-    fn is_readiness_token_matches_known_titles() {
-        // rust-analyzer
-        assert!(is_readiness_token("rust-analyzer/Indexing"));
-        assert!(is_readiness_token("Indexing"));
-        // pyright
-        assert!(is_readiness_token("Pyright: Indexing"));
-        // gopls
-        assert!(is_readiness_token("Setting up workspace"));
-        assert!(is_readiness_token("Loading packages"));
-        // generic
-        assert!(is_readiness_token("Server ready"));
+    /// Shorthand for a `$/progress` params object.
+    fn progress(token: serde_json::Value, kind: &str) -> serde_json::Value {
+        serde_json::json!({ "token": token, "value": { "kind": kind } })
     }
 
     #[test]
-    fn is_readiness_token_rejects_non_indexing_titles() {
-        // Common non-indexing progress titles.
-        assert!(!is_readiness_token("Run cargo test"));
-        assert!(!is_readiness_token("Diagnostics published"));
-        assert!(!is_readiness_token(""));
+    fn tracker_readiness_ignores_titles_entirely() {
+        // The regression this type exists to prevent: readiness used to
+        // substring-match progress titles against copies of upstream UI
+        // strings. A title no matcher has ever heard of must work
+        // identically — the token lifecycle is the contract, not the prose.
+        let mut t = ReadinessTracker::default();
+        t.on_progress(&serde_json::json!({
+            "token": 7,
+            "value": { "kind": "begin", "title": "Reticulating splines" }
+        }));
+        assert!(!t.is_ready(), "a begun token means work is in flight");
+        t.on_progress(&progress(serde_json::json!(7), "report"));
+        assert!(!t.is_ready(), "report keeps the token in flight");
+        t.on_progress(&progress(serde_json::json!(7), "end"));
+        assert!(t.is_ready(), "the cycle completed; no title was consulted");
+    }
+
+    #[test]
+    fn tracker_waits_for_every_in_flight_token() {
+        // The predecessor flipped ready on the FIRST end of any token,
+        // while other work was mid-flight — premature readiness that read
+        // as "cold index" downstream. All begun tokens must end.
+        let mut t = ReadinessTracker::default();
+        t.on_progress(&progress(serde_json::json!("a"), "begin"));
+        t.on_progress(&progress(serde_json::json!("b"), "begin"));
+        t.on_progress(&progress(serde_json::json!("a"), "end"));
+        assert!(!t.is_ready(), "token b is still in flight");
+        t.on_progress(&progress(serde_json::json!("b"), "end"));
+        assert!(t.is_ready());
+    }
+
+    #[test]
+    fn tracker_goes_unready_when_a_new_cycle_begins() {
+        // rust-analyzer reindexes on Cargo.toml change. The predecessor
+        // could only reset if the new token's TITLE matched its string
+        // list; structurally, any fresh begin means not-ready.
+        let mut t = ReadinessTracker::default();
+        t.on_progress(&progress(serde_json::json!(1), "begin"));
+        t.on_progress(&progress(serde_json::json!(1), "end"));
+        assert!(t.is_ready());
+        t.on_progress(&progress(serde_json::json!(2), "begin"));
+        assert!(!t.is_ready(), "a fresh cycle re-arms the wait");
+        t.on_progress(&progress(serde_json::json!(2), "end"));
+        assert!(t.is_ready());
+    }
+
+    #[test]
+    fn tracker_counts_an_end_whose_begin_was_missed() {
+        // Progress subscriptions can race the first begin; a lone end is
+        // still structural evidence of a completed cycle (and is what the
+        // predecessor's any-end behavior got right).
+        let mut t = ReadinessTracker::default();
+        t.on_progress(&progress(serde_json::json!("never-begun"), "end"));
+        assert!(t.is_ready());
+    }
+
+    #[test]
+    fn tracker_keeps_number_and_string_tokens_distinct() {
+        // LSP tokens are number | string; 1 and "1" are different tokens
+        // and an end for one must not retire the other.
+        let mut t = ReadinessTracker::default();
+        t.on_progress(&progress(serde_json::json!(1), "begin"));
+        t.on_progress(&progress(serde_json::json!("1"), "end"));
+        assert!(!t.is_ready(), "token 1 (number) is still in flight");
+    }
+
+    #[test]
+    fn server_status_is_authoritative_when_offered() {
+        // quiescent is one bit covering ALL server work — richer than
+        // token bookkeeping, and a negotiated capability rather than a UI
+        // string. Once a server demonstrates it speaks the contract, its
+        // word wins in both directions.
+        let mut t = ReadinessTracker::default();
+        // Progress fully drained, but the server says not quiescent.
+        t.on_progress(&progress(serde_json::json!(1), "begin"));
+        t.on_progress(&progress(serde_json::json!(1), "end"));
+        t.on_server_status(&serde_json::json!({ "quiescent": false }));
+        assert!(!t.is_ready(), "the server's own status outranks progress");
+        // And the reverse: quiescent true while a token is in flight.
+        t.on_progress(&progress(serde_json::json!(2), "begin"));
+        t.on_server_status(&serde_json::json!({ "quiescent": true }));
+        assert!(t.is_ready());
     }
 
     #[test]
@@ -736,7 +850,7 @@ mod tests {
                 rx,
                 next_id: 1,
                 diagnostics: Vec::new(),
-                server_ready: false,
+                readiness: ReadinessTracker::default(),
             },
             tx,
         )
@@ -758,20 +872,21 @@ mod tests {
         let was_ready = client
             .await_ready(std::time::Duration::from_millis(500))
             .await;
-        assert!(was_ready, "quiescent: true must flip server_ready");
+        assert!(was_ready, "quiescent: true must report ready");
         assert!(client.is_server_ready());
     }
 
     #[tokio::test]
-    async fn await_ready_returns_true_on_progress_end_for_indexing_token() {
+    async fn await_ready_returns_true_when_progress_drains() {
         let (mut client, tx) = fake_client_for_test();
-        // rust-analyzer-style $/progress lifecycle for an indexing token.
+        // A full $/progress lifecycle under a title nothing recognizes —
+        // readiness is the token pairing, not the prose.
         tx.send(Response {
             id: None,
             method: Some("$/progress".into()),
             params: Some(serde_json::json!({
                 "token": "rustAnalyzer/Indexing",
-                "value": {"kind": "begin", "title": "rust-analyzer/Indexing"}
+                "value": {"kind": "begin", "title": "Reticulating splines"}
             })),
             result: None,
             error: None,
@@ -793,7 +908,7 @@ mod tests {
         let was_ready = client
             .await_ready(std::time::Duration::from_millis(500))
             .await;
-        assert!(was_ready, "$/progress end must flip server_ready");
+        assert!(was_ready, "a drained progress cycle must report ready");
     }
 
     #[tokio::test]
@@ -826,6 +941,6 @@ mod tests {
         let was_ready = client
             .await_ready(std::time::Duration::from_millis(120))
             .await;
-        assert!(!was_ready, "quiescent: false must NOT flip server_ready");
+        assert!(!was_ready, "quiescent: false must NOT report ready");
     }
 }

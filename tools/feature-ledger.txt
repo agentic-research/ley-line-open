@@ -1,0 +1,130 @@
+# tools/feature-ledger.txt — the one record of what each non-default cargo
+# feature IS, read by the two gates that previously kept private, overlapping
+# copies of this fact (bead ley-line-open-cb1e29):
+#
+#   tools/check_feature_reachability.sh
+#       claim 1  exempts `not-shipping` rows from reachability, and FAILS a
+#                `not-shipping` row whose feature a shipping configuration
+#                does enable (stale row);
+#       claim 2  exempts `ships-untested` rows from test coverage;
+#       claim 3  compiles every `not-shipping` row with its test targets.
+#   tools/mutants_diff.sh
+#       enables each `mutants=enable` row's feature when the diff touches its
+#       package, so gated code COMPILES under mutation instead of producing
+#       phantom MISSED survivors; passes each `exclude-file:` path to
+#       cargo-mutants --exclude.
+#
+# The two lists used to drift independently — mutants_diff.sh knew three
+# features, this ledger's predecessor knew nine, they overlapped in two, and
+# nothing kept them in step. That drift class is how witchcraft.rs sat
+# uncompilable for five weeks while all 28 of its mutants reported MISSED.
+#
+# A feature belongs here the moment it is (a) unreachable from every shipping
+# configuration, (b) shipping but exercised by no ci-invoked test, or (c)
+# non-default and gating covered code in a generic-slice package. What does
+# NOT live here: default-enabled features (cargo resolves them, mutants
+# compiles them), and per-slice test configs (leyline-fs's cdc,splice,validate
+# invocation in mutants_diff.sh mirrors the Taskfile's mutants:fs targets —
+# a separate fact with a separate owner).
+#
+# Columns (whitespace-separated; `-` = none):
+#
+#   crate-dir  feature  disposition  mutants  bead
+#
+# disposition:
+#   ships-optin     reachable from a shipping configuration, just not the
+#                   default one. cargo tree verifies reachability in claim 1,
+#                   so a row that stops being true fails there on its own.
+#   not-shipping    reachable from NO shipping configuration. Claim 1 exempts
+#                   it, claim 1's staleness check fails it if that stops
+#                   being true, claim 3 keeps it compiling with tests.
+#   ships-untested  ships, but no ci-invoked test enables it — the worse of
+#                   the two states. Claim 2 exempts it until a test lands.
+#
+# mutants (applies to the GENERIC slice only; packages with their own slice —
+# fs, runtime, cli-lib, cli, schema-bridge — route features in that slice's
+# invocation instead):
+#   enable          mutants_diff.sh passes --features <feature> when the diff
+#                   touches this package.
+#   skip            no mutation feature-routing: a diff touching this gated
+#                   code will enumerate phantom MISSED survivors. Every skip
+#                   is an accepted hole and its row's note says why.
+#   exclude-file:<path>  the gated module is excluded from mutation entirely
+#                   via cargo-mutants --exclude.
+
+# Opt-in signal handling; consumers select it. mutants=enable: before the
+# feature was wired into the gate, all 25 of interrupt.rs's mutants reported
+# MISSED while testing nothing. This row is also mutants_diff.sh's positive
+# parse control — if it ever legitimately leaves the ledger, move that
+# control to another enable row.
+ll-core/core          interrupt          not-shipping    enable  -
+
+# Dev tooling — regenerates test fixtures; nothing user-facing gates on it.
+# mutants=skip: the gated paths run only during fixture regeneration.
+ll-core/schema-capnp  regen-fixtures     not-shipping    skip    -
+
+# ley-line-open-b6a4dd — verify-on-fault arena serving, deliberately
+# default-OFF: additive API (VerifiedArena + with_verify_on_fault), nothing
+# degrades when compiled out. That is the whole distinction from the splice
+# entry this ledger's predecessor carried: splice DEGRADED when compiled out
+# (flush_node fell back to a bare Ok(())), so it was a defect being recorded,
+# not a knob; it ships as of 918a75 and left the list. The flag here flips
+# into a shipping config in a later bead; move this row to ships-optin then.
+# mutants=skip: leyline-fs runs its own slice (cdc,splice,validate), which
+# does not carry verify — a hole bounded by claim 3's compile check.
+ll-open/fs            verify             not-shipping    skip    ley-line-open-b6a4dd
+
+# Declared test-only in its own manifest comment: an atomic reach counter for
+# ADR-0020 falsifiability gates. mutants=skip: the gated block is a counter
+# increment consumed only by tests that enable the feature.
+ll-open/sheaf         test-spy           not-shipping    skip    -
+
+# ADR-0019 — interactive HOST signing lives cloister-side; LLO ships
+# verify-only. mutants=skip: host paths want a keyring (libdbus on Linux)
+# the mutation environment does not carry.
+ll-open/sign          host               not-shipping    skip    -
+ll-open/sign          host-extras        not-shipping    skip    -
+
+# Reachable via the opt-in shipping configs, not default. mutants=enable:
+# before the feature was wired, root_signer.rs's 24 mutants were 24 MISSED;
+# with it on, its 23 tests catch 18 of the 20 viable mutants — strong tests
+# the gate had never run. The remainder are genuine gaps on
+# ley-line-open-b23c41, now visible rather than laundered into a false green.
+ll-open/sign          root-signer        ships-optin     enable  -
+
+# ley-line-open-b23c41 — engine selection, not built into the CLI, and
+# EXCLUDED from mutation rather than given its feature: the TextSearchEngine
+# impl (upsert, remove, finalize, search, len, clear) cannot be reached
+# without a live Embedder, and Embedder::new requires a T5 model directory
+# (tokenizer + safetensors) CI does not have. Enabling the feature makes the
+# gate honest and then permanently red — 7 surviving whole-method stubs no
+# CI-runnable test can kill. Excluding is the lesser evil ONLY because it is
+# written down here; without the feature the same 7 would be enumerated and
+# reported MISSED, the false-survivor reading the enable rows exist to end.
+# check_feature_reachability.sh claim 3 still compiles the module with its
+# tests, so it cannot rot the way it did between PR #210 and 2026-08-20.
+# Remove the exclusion when the engine's DB layer is separable from the
+# Embedder, or when CI carries the assets.
+ll-open/text-search   engine-witchcraft  not-shipping    exclude-file:ll-open/text-search/src/witchcraft.rs  ley-line-open-b23c41
+
+# Grammar for HCL, reachable via the opt-in shipping configs, not default.
+# mutants=enable so its gated parser code compiles under mutation.
+ll-open/ts            hcl                ships-optin     enable  -
+
+# ley-line-open-988b93 — NOT a grammar: a 349-line dependency-graph
+# projection (pyproject.toml -> mountable /deps tree). Unwired too — nothing
+# calls project_pyproject. Dead in two ways. mutants=enable: it was the entry
+# whose single phantom MISSED surfaced the whole feature-routing defect.
+ll-open/ts            pyproject          not-shipping    enable  ley-line-open-988b93
+
+# leyline-vcs is not a CLI dependency at all. mutants=skip: an accepted
+# hole — a diff touching sqlite-gated vcs code will enumerate phantoms until
+# someone routes the feature.
+ll-open/vcs           sqlite             not-shipping    skip    -
+
+# ley-line-open-aed167 — mount SHIPS but zero test files gate on it at any
+# level. Two BUILD checks exist; neither proves a mount serves correct bytes.
+# Compounds 918a75, where flush_node was a silent no-op so mount writes never
+# reprojected. Remove when a round-trip test lands. mutants=skip: cli-lib has
+# its own slice, which does not enable mount.
+ll-open/cli-lib       mount              ships-untested  skip    ley-line-open-aed167

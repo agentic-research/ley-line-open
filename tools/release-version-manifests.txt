@@ -15,6 +15,7 @@ rs/ll-open/envelope/Cargo.toml
 rs/ll-open/fs/Cargo.toml
 rs/ll-open/hdc/Cargo.toml
 rs/ll-open/lsp/Cargo.toml
+rs/ll-open/perf-sample/Cargo.toml
 rs/ll-open/runtime/Cargo.toml
 rs/ll-open/schema-bridge/Cargo.toml
 rs/ll-open/sheaf/Cargo.toml

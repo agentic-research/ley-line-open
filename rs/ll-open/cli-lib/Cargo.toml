@@ -140,6 +140,9 @@ bytemuck = { workspace = true, features = ["derive"] }
 # build sees `DETECT_VIOLATIONS_REACH_COUNT`. The production cdylib
 # does NOT pull this feature (release builds stay zero-cost).
 leyline-sheaf = { path = "../sheaf", features = ["test-spy"] }
+# Shared wall-clock sampling for the perf gates (min-of-N, interleaved
+# arms) — the technique lives in one place; see that crate's docs.
+leyline-perf-sample = { path = "../perf-sample" }
 # `tower::ServiceExt::oneshot` for the MCP auth middleware end-to-end
 # tests (daemon::auth::tests). Production uses tower transitively
 # through axum's middleware stack; this dev-dep exposes the trait
@@ -205,3 +208,12 @@ path = "tests/substrate/f4_diff_complexity.rs"
 [[test]]
 name = "f5_composition_seams"
 path = "tests/substrate/f5_composition_seams.rs"
+
+# harness = false: this file owns `main` so that, re-exec'd with
+# `--fake-ls`, the SAME binary becomes the scripted LSP server the test
+# drives the enrichment pass against — no libtest banners corrupting the
+# stdio framing. See the file header (bead ley-line-open-fb7d73).
+[[test]]
+name = "lsp_enrich_pipeline"
+path = "tests/lsp_enrich_pipeline.rs"
+harness = false

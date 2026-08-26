@@ -10,6 +10,58 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.19.1] — 2026-08-26
+
+### Fixed
+
+- **LSP readiness no longer depends on copies of other projects' prose.**
+  `await_ready` decided readiness by substring-matching `$/progress` titles
+  against "indexing" / "loading" / "workspace" / "ready" — rust-analyzer's,
+  gopls's, and pyright's UI strings, held without a contract, where a
+  patch-release rename upstream silently breaks readiness and reads as "cold
+  index". It was also loose in the opposite direction: with no per-token
+  bookkeeping, the FIRST `end` of any token flipped ready while other work
+  was still in flight, and rust-analyzer's `quiescent: false` was ignored
+  outright. Readiness is now derived from what the LSP spec itself
+  guarantees — the work-done-progress token lifecycle: ready ⇔ at least one
+  cycle completed AND no begun token still in flight, for any token under
+  any title, with `experimental/serverStatus` quiescence authoritative in
+  both directions when the server offers it. Falsified by dropping the
+  in-flight conjunct — three tests catch the premature-ready defect
+  (bead `ley-line-open-fb7d73`).
+
+- **The LSP enrichment loop got its first observer.** The diff-scoped
+  mutation gate proved `enrich_files_with_client` — open, poll symbols,
+  await readiness, probe, project into the `_lsp*` tables — could be stubbed
+  out entirely and nothing failed. `lsp_enrich_pipeline` (harness = false)
+  now drives the REAL pass against a scripted in-process LSP server (the
+  test binary re-exec'd via PATH symlink — a symlink, not a shell wrapper,
+  because macOS SIP strips `DYLD_*` across `/bin/sh` and the re-exec'd fake
+  dies in dyld under the workspace-unified feature set), asserting both the
+  reported counts and the written rows. All four surviving mutants die
+  (bead `ley-line-open-fb7d73`).
+
+### Changed
+
+- **The perf-sampling technique lives in one crate instead of three
+  copies.** `leyline-perf-sample` (publish = false, dev-dependency only)
+  owns min-of-N wall sampling with interleaved arms — minimum because
+  scheduler load is strictly additive, interleaving because sequential arms
+  attribute load drift to whichever arm ran during it. The cold-parse, F2
+  concurrent-writers, and sheaf-restriction gates all call it; the next
+  perf gate gets the technique by import instead of archaeology
+  (bead `ley-line-open-aae1c2`).
+
+- **One feature ledger instead of two lists that drift.**
+  `tools/feature-ledger.txt` is now the single record of every non-default
+  feature's disposition (ships-optin / not-shipping / ships-untested) and
+  its mutation-gate routing (enable / skip / exclude-file), with each row's
+  rationale beside it. `tools/mutants_diff.sh` and
+  `tools/check_feature_reachability.sh` both parse it, fail closed on a
+  missing or unparseable ledger, and claim 1 now fails a `not-shipping` row
+  whose feature a shipping configuration actually enables — stale rows
+  previously passed silently (bead `ley-line-open-cb1e29`).
+
 ## [0.19.0] — 2026-08-21
 
 ### Fixed

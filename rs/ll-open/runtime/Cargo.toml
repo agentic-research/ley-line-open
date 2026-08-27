@@ -26,3 +26,6 @@ thiserror = { workspace = true }
 [dev-dependencies]
 hex = { workspace = true }
 wait-timeout = "0.2"
+# `kill(pid, 0)` liveness probes for the grandchild-reaping regression test
+# (bead rs-a1e8d0).
+libc = { workspace = true }

@@ -661,3 +661,48 @@ fn every_libkrun_resource_is_required_independently() {
         );
     }
 }
+
+/// A rejection kill must reach the worker's DESCENDANTS, not just the
+/// worker. The fake forks its sleeper FIRST and reports the grandchild pid,
+/// so by the time readiness triggers the rejection the grandchild
+/// deterministically exists — a pid-targeted kill (instead of the group)
+/// fails this test. The in-flight-`fork()` escape this same bead exposed —
+/// the group sweep returning success while the leader's mid-fork child
+/// enrolls after enumeration — cannot be pinned deterministically from a
+/// shell; `terminate_process_group`'s kill → await-leader-exit → re-sweep
+/// closes it, verified by stress-running the originally-leaking script
+/// shapes 20× with zero leaks (bead rs-a1e8d0).
+#[test]
+fn rejection_kills_the_workers_grandchildren_too() {
+    let fixture = TempDir::new().expect("fixture");
+    let grandchild_pid_file = fixture.path().join("grandchild.pid");
+    let script = format!(
+        "#!/bin/sh\n/usr/bin/tail -f /dev/null &\nprintf '%s' \"$!\" > '{}'\nIFS= read -r _\nprintf '%s\\n' '{{\"type\":\"ready\",\"run_id\":\"some-other-run\"}}' >&2\nwait\n",
+        grandchild_pid_file.display()
+    );
+    let (backend, _ephemeral_root) = backend_with_worker(&fixture, &script);
+
+    backend
+        .start(&request())
+        .expect_err("readiness must bind to the requested run");
+
+    let raw = fs::read_to_string(&grandchild_pid_file).expect("grandchild pid file");
+    let grandchild: i32 = raw.trim().parse().expect("grandchild pid");
+    // Bounded spin until the grandchild is gone — `kill(pid, 0)` returns 0
+    // while the process (or its unreaped zombie, briefly) exists and ESRCH
+    // once it does not. The group kill lands in microseconds; the deadline
+    // only fails on a genuine miss. A spin, not a sleep: the wait is the
+    // probe interval, not a synchronization guess.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if unsafe { libc::kill(grandchild, 0) } != 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "grandchild {grandchild} of a rejected worker is still alive — the \
+             rejection kill did not reach the worker's descendants"
+        );
+        std::hint::spin_loop();
+    }
+}

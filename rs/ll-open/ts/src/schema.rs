@@ -2011,9 +2011,7 @@ mod tests {
             "DELETE FROM node_defs WHERE nid BETWEEN ?1 AND ?2",
         ] {
             let plan: Vec<String> = {
-                let mut stmt = conn
-                    .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-                    .unwrap();
+                let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
                 let rows = stmt
                     .query_map(params![a_lo, a_hi], |r| r.get::<_, String>(3))
                     .unwrap()

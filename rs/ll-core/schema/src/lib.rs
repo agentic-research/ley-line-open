@@ -1017,7 +1017,19 @@ mod tests {
         let dir_id = intern_dir_chain(&conn, "big").unwrap();
         let n_big = intern_name(&conn, "big").unwrap();
         let root_name = intern_name(&conn, "").unwrap();
-        insert_node(&conn, dir_nid(1), None, Some(root_name), None, 1, 0, 0, 1, "").unwrap();
+        insert_node(
+            &conn,
+            dir_nid(1),
+            None,
+            Some(root_name),
+            None,
+            1,
+            0,
+            0,
+            1,
+            "",
+        )
+        .unwrap();
         insert_node(
             &conn,
             dir_nid(dir_id),
@@ -1066,12 +1078,20 @@ mod tests {
         let total: i64 = conn
             .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
             .unwrap();
-        assert!(total >= 100_000, "fixture must hold ≥100k rows; got {total}");
+        assert!(
+            total >= 100_000,
+            "fixture must hold ≥100k rows; got {total}"
+        );
 
         // Snapshot a descendant's path pre-rename and a checksum over every
         // row EXCEPT the renamed dir's own presentation row.
         let sample = file_nid(lookup_file_id(&conn, "big/f42.go").unwrap().unwrap(), 500);
-        assert!(node_path(&conn, sample).unwrap().unwrap().starts_with("big/"));
+        assert!(
+            node_path(&conn, sample)
+                .unwrap()
+                .unwrap()
+                .starts_with("big/")
+        );
         let untouched_checksum = |conn: &Connection| -> (i64, i64) {
             conn.query_row(
                 "SELECT COUNT(*), COALESCE(SUM(nid * 31 + COALESCE(parent_nid, 0)), 0) \

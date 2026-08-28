@@ -225,8 +225,8 @@ impl EnrichmentPass for EmbeddingPass {
             }
             _ => {
                 let mut stmt = conn.prepare(base)?;
-                let rows = stmt
-                    .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+                let rows =
+                    stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
                 for row in rows {
                     rows_buf.push(row?);
                 }

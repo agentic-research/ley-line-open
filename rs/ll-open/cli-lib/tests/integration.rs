@@ -3359,6 +3359,10 @@ async fn daemon_protocol_gate_handlers_emit_required_keys() {
     {
         let guard = ctx.live_db.writer.lock();
         leyline_schema::create_schema(&guard).expect("nodes schema");
+        // `_ast`/`_source` too: token_map's injected-address rendering LEFT
+        // JOINs `_source` (it always exists in a real projection — created
+        // by the same parse that fills the refs tables).
+        leyline_ts::schema::create_ast_schema(&guard).expect("ast schema");
         guard
             .execute_batch(leyline_ts::schema::REFS_DDL)
             .expect("node_refs schema");

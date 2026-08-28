@@ -165,12 +165,17 @@ fn blobs_decode_as_ast_node_list() {
             nodes.len() > 0,
             "AstNodeList.nodes must be non-empty (every fixture file has ≥1 AST node)",
         );
-        // Every node has a stable, non-empty nodeId + sourceId.
+        // Phase A gate (bead ley-line-open-17c271): the locator must NOT be
+        // in the hashed preimage — nodeId is written empty so `blob_hash`
+        // is independent of the locator scheme. sourceId stays populated,
+        // which doubles as the positive control that we are decoding real
+        // node records, not vacuously-empty ones.
         for i in 0..nodes.len() {
             let n = nodes.get(i);
             assert!(
-                !n.get_node_id().unwrap().to_str().unwrap().is_empty(),
-                "AstNode.nodeId must be populated",
+                n.get_node_id().unwrap().to_str().unwrap().is_empty(),
+                "AstNode.nodeId must be EMPTY — a locator in the blob binds \
+                 blob_hash to the locator scheme (Phase A, ley-line-open-17c271)",
             );
             assert!(
                 !n.get_source_id().unwrap().to_str().unwrap().is_empty(),
@@ -309,11 +314,14 @@ fn f1_round_trip_integrity() {
         );
         let n = nodes.get(offset as u32);
 
-        // Byte-identical field-level comparison.
-        assert_eq!(
-            n.get_node_id().unwrap().to_str().unwrap(),
-            ast_node_id,
-            "F1: nodeId mismatch at node_id={ast_node_id}",
+        // Byte-identical field-level comparison. The row's identity in the
+        // blob is POSITIONAL (blob_ord) — nodeId is deliberately absent
+        // from the preimage (Phase A, ley-line-open-17c271), so the
+        // correspondence is pinned by ordinal + every remaining field.
+        assert!(
+            n.get_node_id().unwrap().to_str().unwrap().is_empty(),
+            "F1: blob nodeId must be empty at node_id={ast_node_id} — the \
+             locator may not re-enter the hashed preimage",
         );
         assert_eq!(
             n.get_source_id().unwrap().to_str().unwrap(),

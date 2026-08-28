@@ -2426,7 +2426,10 @@ fn serialize_ast_node_record(buf: &mut Vec<u8>, a: &AstEntry) -> Result<()> {
     let mut src = capnp::message::Builder::new_default();
     {
         let mut node: ast_node::Builder = src.init_root();
-        node.set_node_id(&a.node_id);
+        // Phase A of bead ley-line-open-17c271: the locator is EVICTED from
+        // every hashed preimage — same rule as the AstNodeList blob below,
+        // where the full rationale lives.
+        node.set_node_id("");
         node.set_source_id(&a.source_id);
         node.set_node_kind(&a.node_kind);
         let mut r = node.init_range();
@@ -2540,7 +2543,16 @@ fn serialize_ast_node_list_record(buf: &mut Vec<u8>, entries: &[AstEntry]) -> Re
         let mut list = list_root.init_nodes(n);
         for (i, a) in entries.iter().enumerate() {
             let mut node = list.reborrow().get(i as u32);
-            node.set_node_id(&a.node_id);
+            // Phase A of bead ley-line-open-17c271: the locator is EVICTED
+            // from every hashed preimage. A node's address inside the blob
+            // is its ordinal (`_ast_pointer.offset_in_blob` — the `i` of
+            // this very loop); the path-shaped id was write-only freight
+            // that bound `blob_hash` to the locator SCHEME, so re-keying
+            // the projection (Phase B) would have moved every blob hash
+            // and the Σ lineage with it. Emptied, not removed: persisted
+            // blobs pin capnp ordinals, so `nodeId @0` must keep its slot
+            // to keep old blobs decodable.
+            node.set_node_id("");
             node.set_source_id(&a.source_id);
             node.set_node_kind(&a.node_kind);
             let mut r = node.init_range();

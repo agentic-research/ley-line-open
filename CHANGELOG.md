@@ -10,6 +10,25 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Changed
+
+- **The locator left the hashed preimages** (Phase A of bead
+  `ley-line-open-17c271`). `AstNode.nodeId` is now written EMPTY in both
+  capnp preimages — the per-file `AstNodeList` blob behind
+  `capnp_blobs.blob_hash`, and the `<db>.ast.capnp` segment log folded into
+  the signed head. The field was write-only freight: nothing anywhere read
+  it back (a node's address inside a blob is its ordinal,
+  `_ast_pointer.offset_in_blob`), while its presence bound every blob hash
+  to the locator SCHEME — so re-keying the projection to integer node ids
+  (Phase B) would have moved every `blob_hash` and the Σ lineage with it.
+  The capnp field keeps its `@0` slot because persisted blobs pin ordinals;
+  the SQL projection's `_ast.node_id` is unchanged. Blob hashes and segment
+  roots change once, at the next parse generation — a lineage event, not a
+  compatibility break; `_meta.projection_schema_version` stays
+  `projection-v4` and the wire format stays v1. The identity end-state this
+  enables (file-scoped integer nids, projection-v5/v6) is designed and
+  gated on the bead.
+
 ## [0.19.1] — 2026-08-26
 
 ### Fixed

@@ -498,6 +498,7 @@ pub unsafe extern "C" fn leyline_query(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::fixtures::{put_dir, put_file};
     use leyline_schema::create_schema;
 
     /// Create a minimal SQLite database in memory, serialize it to bytes,
@@ -628,13 +629,21 @@ mod tests {
     fn make_test_ctx() -> (*mut LeylineCtx, rusqlite::Connection) {
         let source = Connection::open_in_memory().unwrap();
         create_schema(&source).unwrap();
-        source
-            .execute_batch(
-                "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('vulns', 'vulns', 1, 0, 1000, NULL);
-                INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('vulns/CVE-1', 'CVE-1', 0, 23, 2000, '{\"severity\":\"critical\"}');
-                INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('vulns/CVE-2', 'CVE-2', 0, 10, 3000, '{\"severity\":\"high\"}');",
-            )
-            .unwrap();
+        put_dir(&source, "vulns", 1000).unwrap();
+        put_file(
+            &source,
+            "vulns/CVE-1",
+            2000,
+            Some("{\"severity\":\"critical\"}"),
+        )
+        .unwrap();
+        put_file(
+            &source,
+            "vulns/CVE-2",
+            3000,
+            Some("{\"severity\":\"high\"}"),
+        )
+        .unwrap();
 
         let data = source.serialize("main").unwrap();
         let graph = SqliteGraph::from_bytes(data.as_ref()).unwrap();
@@ -737,34 +746,20 @@ mod tests {
     #[test]
     fn ffi_json_escaping() -> Result<()> {
         let source = Connection::open_in_memory().unwrap();
-        // Use schema helper, then parameterized inserts for special chars
         create_schema(&source).unwrap();
-        source
-            .execute_batch("INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('root', 'root', 1, 0, 1000, NULL);")
-            .unwrap();
+        put_dir(&source, "root", 1000).unwrap();
 
-        // Insert nodes with real special characters via params.
-        //
-        // The id is `root/{name}` rather than an unrelated slug: `parent_id` is
-        // derived as the id with its trailing `/{name}` removed, so a node whose
-        // name is not the last segment of its own id has no parent. That is the
-        // invariant every writer maintains by construction — `create_node`
-        // literally builds `format!("{parent}/{name}")` — and these rows now
-        // hold to it too. The special characters, which are what this test is
-        // actually about, are untouched.
+        // Nodes whose NAMES carry the characters JSON has to escape. Names
+        // are interned strings under projection-v5, so the only structural
+        // requirement is that each node hangs under `root`; the characters,
+        // which are what this test is about, pass through untouched.
         for (mtime, name) in [
             (2000, "line1\nline2"),
             (3000, "back\\slash"),
             (4000, "has\"quote"),
             (5000, "col1\tcol2"),
         ] {
-            source
-                .execute(
-                    "INSERT INTO nodes (id, name, kind, size, mtime, record) \
-                     VALUES (?1, ?2, 0, 0, ?3, NULL)",
-                    rusqlite::params![format!("root/{name}"), name, mtime],
-                )
-                .unwrap();
+            put_file(&source, &format!("root/{name}"), mtime, None).unwrap();
         }
 
         let data = source.serialize("main").unwrap();

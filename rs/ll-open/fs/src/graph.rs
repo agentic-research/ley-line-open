@@ -11,6 +11,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use leyline_core::mmap::{mmap_read, mmap_write};
 use leyline_core::{ArenaHeader, ContentAddressed, Controller};
+// Used only by `batch_splice`'s post-reproject invalidation, which needs both
+// features; importing it unconditionally would warn on leaner builds.
+#[cfg(all(feature = "cdc", feature = "splice"))]
+use rusqlite::OptionalExtension;
 
 use crate::SqliteGraph;
 
@@ -109,19 +113,30 @@ pub trait Graph: Send + Sync {
 
 /// Wraps [`SqliteGraph`] behind a `Mutex` to satisfy `Send + Sync`.
 ///
-/// Queries the optimized `nodes` table schema written by mache:
+/// Queries the `nodes` table schema defined by `leyline_schema` — since
+/// projection-v5 (bead `ley-line-open-17c271`) keyed on an integer `nid`
+/// rather than the node's ancestry path:
+///
 /// ```sql
 /// CREATE TABLE nodes (
-///     id TEXT PRIMARY KEY,
-///     -- derived from id + name, not stored; see `leyline_schema::NODES_TABLE_DDL`
-///     parent_id TEXT GENERATED ALWAYS AS (...) VIRTUAL,
-///     name TEXT NOT NULL,
-///     kind INTEGER NOT NULL,   -- 0=file, 1=dir
+///     nid INTEGER PRIMARY KEY,   -- (file_id << 24) | ordinal, or -dir_id
+///     parent_nid INTEGER,
+///     name_id INTEGER,           -- interned; NULL for AST rows
+///     kind_id INTEGER,           -- interned; NULL for directories
+///     kind INTEGER NOT NULL,     -- 0=file, 1=dir
+///     ord INTEGER NOT NULL,
 ///     size INTEGER DEFAULT 0,
 ///     mtime INTEGER NOT NULL,
-///     record JSON
+///     record TEXT
 /// );
 /// ```
+///
+/// **The [`Graph`] trait boundary keeps STRING ids.** Those ids are mount
+/// paths — the FUSE/NFS wire contract — and demoting the path from identity
+/// to display (ADR-0034 D6) is a storage change, not a protocol change. Every
+/// method therefore translates at the SQL layer: `resolve_path` on the way in,
+/// rendered names on the way out. Display names are NOT stored per AST row,
+/// so listings join `v_node_name`.
 pub struct SqliteGraphAdapter {
     writer: Mutex<SqliteGraph>,
     readers: ArrayQueue<(SqliteGraph, u64)>,
@@ -280,6 +295,15 @@ impl SqliteGraphAdapter {
     }
 
     /// Ensure the `_errors` table exists for storing validation errors.
+    ///
+    /// This table stays keyed by the DISPLAY PATH while the rest of the
+    /// projection moves to integer nids (projection-v5). It is not a
+    /// projection table — it is owned by this crate and read back by the
+    /// mount — and its rows must be able to name a path that has NO node:
+    /// `rename_node` records a validation failure against the DESTINATION
+    /// path precisely when it refuses to create it, so there is no nid to key
+    /// on. Re-keying would force either a fabricated nid or dropping that
+    /// diagnostic entirely.
     fn ensure_errors_table(&self) -> Result<()> {
         let guard = self.writer.lock();
         guard.conn().execute_batch(
@@ -347,10 +371,18 @@ impl SqliteGraphAdapter {
             let guard = self.writer.lock();
             let now = now_nanos();
 
+            // A write to a node the projection cannot resolve wrote nowhere
+            // pre-v5 too (`UPDATE ... WHERE id = ?` matched no row) but
+            // reported success. Name it instead: every caller reaches here
+            // through a lookup or a create, so an unresolvable id is a defect,
+            // not a condition to absorb.
+            let nid = leyline_schema::resolve_path(guard.conn(), id)?
+                .with_context(|| format!("write to unknown node '{id}'"))?;
+
             // Read existing content, patch in the new data
             let existing: Option<String> = guard
                 .conn()
-                .query_row("SELECT record FROM nodes WHERE id = ?1", [id], |row| {
+                .query_row("SELECT record FROM nodes WHERE nid = ?1", [nid], |row| {
                     row.get(0)
                 })
                 .ok()
@@ -360,7 +392,7 @@ impl SqliteGraphAdapter {
             #[cfg(feature = "cdc")]
             let old_len = content.len();
             #[cfg(feature = "cdc")]
-            let previous = crate::chunked::capture_chunked_content(guard.conn(), id)?;
+            let previous = crate::chunked::capture_chunked_content(guard.conn(), nid)?;
             let off = usize::try_from(offset).context("write offset exceeds usize")?;
             let write_end = off
                 .checked_add(data.len())
@@ -405,8 +437,8 @@ impl SqliteGraphAdapter {
                             guard
                                 .conn()
                                 .execute(
-                                    "UPDATE nodes SET record = ?1, size = ?2, mtime = ?3 WHERE id = ?4",
-                                    rusqlite::params![&old, old.len() as i64, now, id],
+                                    "UPDATE nodes SET record = ?1, size = ?2, mtime = ?3 WHERE nid = ?4",
+                                    rusqlite::params![&old, old.len() as i64, now, nid],
                                 )
                                 .ok();
                             log::info!("restored shadow copy for {id} after validation failure");
@@ -428,8 +460,8 @@ impl SqliteGraphAdapter {
             // Validation passed (or skipped) — commit the write
             let new_str = String::from_utf8_lossy(&content);
             guard.conn().execute(
-                "UPDATE nodes SET record = ?1, size = ?2, mtime = ?3 WHERE id = ?4",
-                rusqlite::params![new_str.as_ref(), content.len() as i64, now, id],
+                "UPDATE nodes SET record = ?1, size = ?2, mtime = ?3 WHERE nid = ?4",
+                rusqlite::params![new_str.as_ref(), content.len() as i64, now, nid],
             )?;
 
             // The edit coordinates were computed against `content` (the raw
@@ -463,7 +495,7 @@ impl SqliteGraphAdapter {
             #[cfg(feature = "cdc")]
             let refresh = match crate::chunked::refresh_chunked_content_after_edit(
                 guard.conn(),
-                id,
+                nid,
                 new_str.as_ref().as_bytes(),
                 previous,
                 edit,
@@ -490,7 +522,7 @@ impl SqliteGraphAdapter {
             {
                 let is_ast: bool = guard
                     .conn()
-                    .query_row("SELECT 1 FROM _ast WHERE node_id = ?1", [id], |_| Ok(true))
+                    .query_row("SELECT 1 FROM _ast WHERE nid = ?1", [nid], |_| Ok(true))
                     .unwrap_or(false);
                 if is_ast {
                     self.pending_splice.lock().insert(id.to_string());
@@ -502,8 +534,17 @@ impl SqliteGraphAdapter {
         Ok((data.len(), refresh))
     }
 
-    fn row_to_node(row: &rusqlite::Row<'_>) -> std::result::Result<Node, rusqlite::Error> {
-        let id: String = row.get("id")?;
+    /// Decode a `(name, kind, size, mtime)` row into a [`Node`] whose `id` is
+    /// the display path the caller addressed it by.
+    ///
+    /// The id is composed from the caller's own parent path rather than
+    /// re-derived from the row: `node_path` would walk the whole parent chain
+    /// per child, turning one listing into O(children x depth) queries for a
+    /// string the caller already holds the prefix of.
+    fn row_to_node(
+        row: &rusqlite::Row<'_>,
+        id: String,
+    ) -> std::result::Result<Node, rusqlite::Error> {
         let name: String = row.get("name")?;
         let kind: i64 = row.get("kind")?;
         let size: i64 = row.get("size")?;
@@ -515,6 +556,73 @@ impl SqliteGraphAdapter {
             size: size.max(0) as u64,
             mtime_nanos: mtime,
         })
+    }
+
+    /// Join a parent display path and a child name into the child's id.
+    /// An empty parent is the root, whose children are bare names.
+    fn join_id(parent_id: &str, name: &str) -> String {
+        if parent_id.is_empty() {
+            name.to_string()
+        } else {
+            format!("{parent_id}/{name}")
+        }
+    }
+
+    /// Delete `nid`'s `nodes` row and every row beneath it, replacing the
+    /// pre-v5 `DELETE ... WHERE id = ?1 OR id LIKE ?2` prefix cascade.
+    ///
+    /// The three descent shapes mirror
+    /// [`crate::chunked::invalidate_chunked_content_subtree`] — a directory
+    /// recurses `dirs`, a file root is one nid range, an interior AST node
+    /// recurses `parent_nid`. Interning rows in `dirs`/`files` are
+    /// deliberately NOT deleted: those tables are append-only, and reusing a
+    /// `file_id` would re-bind a dead file's whole nid range to an unrelated
+    /// path. A vacated row simply goes stale.
+    fn delete_subtree(conn: &rusqlite::Connection, nid: i64) -> Result<()> {
+        if let Some(dir_id) = leyline_schema::nid_dir_id(nid) {
+            // Every file interned under this directory or any below it, by
+            // nid range, plus the directory rows themselves.
+            const DESCENDANT_DIRS: &str = "WITH RECURSIVE sub(dir_id) AS ( \
+                     SELECT ?1 \
+                     UNION ALL \
+                     SELECT d.dir_id FROM dirs d JOIN sub s ON d.parent_dir_id = s.dir_id)";
+            conn.execute(
+                &format!(
+                    "DELETE FROM nodes WHERE nid >= 0 AND (nid >> 24) IN (\
+                     {DESCENDANT_DIRS} SELECT f.file_id FROM files f JOIN sub s ON f.dir_id = s.dir_id)"
+                ),
+                rusqlite::params![dir_id],
+            )?;
+            conn.execute(
+                &format!(
+                    "DELETE FROM nodes WHERE -nid IN ({DESCENDANT_DIRS} SELECT dir_id FROM sub)"
+                ),
+                rusqlite::params![dir_id],
+            )?;
+            return Ok(());
+        }
+        let ordinal =
+            leyline_schema::nid_ordinal(nid).context("non-negative nid has an ordinal")?;
+        if ordinal == 0 {
+            let file_id =
+                leyline_schema::nid_file_id(nid).context("non-negative nid has a file_id")?;
+            let (lo, hi) = leyline_schema::file_nid_range(file_id);
+            conn.execute(
+                "DELETE FROM nodes WHERE nid BETWEEN ?1 AND ?2",
+                rusqlite::params![lo, hi],
+            )?;
+            return Ok(());
+        }
+        conn.execute(
+            "DELETE FROM nodes WHERE nid IN ( \
+                 WITH RECURSIVE sub(nid) AS ( \
+                     SELECT ?1 \
+                     UNION ALL \
+                     SELECT n.nid FROM nodes n JOIN sub s ON n.parent_nid = s.nid) \
+                 SELECT nid FROM sub)",
+            rusqlite::params![nid],
+        )?;
+        Ok(())
     }
 }
 
@@ -531,10 +639,16 @@ impl Graph for SqliteGraphAdapter {
             }));
         }
         self.with_reader(|reader| {
-            let result = reader.conn().query_row(
-                "SELECT id, name, kind, size, mtime FROM nodes WHERE id = ?1",
-                [id],
-                Self::row_to_node,
+            let conn = reader.conn();
+            let Some(nid) = leyline_schema::resolve_path(conn, id)? else {
+                return Ok(None);
+            };
+            let result = conn.query_row(
+                "SELECT v.name AS name, n.kind, n.size, n.mtime \
+                   FROM nodes n JOIN v_node_name v ON v.nid = n.nid \
+                  WHERE n.nid = ?1",
+                [nid],
+                |row| Self::row_to_node(row, id.to_string()),
             );
             match result {
                 Ok(node) => Ok(Some(node)),
@@ -545,11 +659,23 @@ impl Graph for SqliteGraphAdapter {
     }
 
     fn lookup_child(&self, parent_id: &str, name: &str) -> Result<Option<Node>> {
+        // Resolving the JOINED path is the whole lookup: `resolve_path` walks
+        // `dirs`/`files` by interned name and falls through to the AST
+        // `{raw_kind}[_{k}]` scheme, which is exactly the child-by-name
+        // question. Doing it as `parent_nid = ? AND name = ?` would instead
+        // render every sibling's display name to compare one of them.
+        let id = Self::join_id(parent_id, name);
         self.with_reader(|reader| {
-            let result = reader.conn().query_row(
-                "SELECT id, name, kind, size, mtime FROM nodes WHERE parent_id = ?1 AND name = ?2",
-                rusqlite::params![parent_id, name],
-                Self::row_to_node,
+            let conn = reader.conn();
+            let Some(nid) = leyline_schema::resolve_path(conn, &id)? else {
+                return Ok(None);
+            };
+            let result = conn.query_row(
+                "SELECT v.name AS name, n.kind, n.size, n.mtime \
+                   FROM nodes n JOIN v_node_name v ON v.nid = n.nid \
+                  WHERE n.nid = ?1",
+                [nid],
+                |row| Self::row_to_node(row, id.clone()),
             );
             match result {
                 Ok(node) => Ok(Some(node)),
@@ -561,10 +687,21 @@ impl Graph for SqliteGraphAdapter {
 
     fn list_children(&self, parent_id: &str) -> Result<Vec<Node>> {
         self.with_reader(|reader| {
-            let mut stmt = reader.conn().prepare_cached(
-                "SELECT id, name, kind, size, mtime FROM nodes WHERE parent_id = ?1",
+            let conn = reader.conn();
+            // An unresolvable parent lists as empty — the same answer the
+            // pre-v5 `WHERE parent_id = ?` gave for an unknown id.
+            let Some(parent_nid) = leyline_schema::resolve_path(conn, parent_id)? else {
+                return Ok(Vec::new());
+            };
+            let mut stmt = conn.prepare_cached(
+                "SELECT v.name AS name, n.kind, n.size, n.mtime \
+                   FROM nodes n JOIN v_node_name v ON v.nid = n.nid \
+                  WHERE n.parent_nid = ?1 ORDER BY v.name",
             )?;
-            let rows = stmt.query_map([parent_id], Self::row_to_node)?;
+            let rows = stmt.query_map([parent_nid], |row| {
+                let name: String = row.get("name")?;
+                Self::row_to_node(row, Self::join_id(parent_id, &name))
+            })?;
             let mut children = Vec::new();
             for row in rows {
                 children.push(row?);
@@ -575,8 +712,14 @@ impl Graph for SqliteGraphAdapter {
 
     fn all_file_contents(&self) -> Result<Vec<(String, String)>> {
         self.with_reader(|reader| {
+            // `v_node_path` renders every row's path in one pass. This is the
+            // one caller that genuinely wants the whole mapping, which is the
+            // case the bulk view exists for — a per-row `node_path` here
+            // would re-walk the parent chain once per file.
             let mut stmt = reader.conn().prepare_cached(
-                "SELECT id, record FROM nodes WHERE kind = 0 AND record IS NOT NULL AND length(record) > 0",
+                "SELECT p.path, n.record \
+                   FROM nodes n JOIN v_node_path p ON p.nid = n.nid \
+                  WHERE n.kind = 0 AND n.record IS NOT NULL AND length(n.record) > 0",
             )?;
             let rows = stmt.query_map([], |row| {
                 let id: String = row.get(0)?;
@@ -603,15 +746,20 @@ impl Graph for SqliteGraphAdapter {
     /// cannot drift into different range semantics.
     fn read_content(&self, id: &str, buf: &mut [u8], offset: u64) -> Result<usize> {
         self.with_reader(|reader| {
+            // An unresolvable id reads as empty, matching the pre-v5 miss on
+            // `WHERE id = ?` — a read of a vanished node is not an error.
+            let Some(nid) = leyline_schema::resolve_path(reader.conn(), id)? else {
+                return Ok(0);
+            };
             #[cfg(feature = "cdc")]
             {
-                crate::chunked::read_content_at(reader.conn(), id, buf, offset)
+                crate::chunked::read_content_at(reader.conn(), nid, buf, offset)
             }
             #[cfg(not(feature = "cdc"))]
             {
                 let record: Option<String> = reader
                     .conn()
-                    .query_row("SELECT record FROM nodes WHERE id = ?1", [id], |row| {
+                    .query_row("SELECT record FROM nodes WHERE nid = ?1", [nid], |row| {
                         row.get(0)
                     })
                     .ok();
@@ -636,24 +784,54 @@ impl Graph for SqliteGraphAdapter {
             .map(|(written, _)| written)
     }
 
+    /// Create a mount-visible node, interning it into the projection's
+    /// `dirs`/`files` tables so it has a nid to be addressed by.
+    ///
+    /// Directories land in negative nid space (`-dir_id`); files take ordinal
+    /// 0 of their `file_id` range, which is also where a later parse would put
+    /// the file's AST root — so a created-then-parsed file keeps one identity.
     fn create_node(&self, parent_id: &str, name: &str, is_dir: bool) -> Result<String> {
-        let id = {
+        let id = Self::join_id(parent_id, name);
+        {
             let guard = self.writer.lock();
+            let conn = guard.conn();
             let now = now_nanos();
+            let name_id = leyline_schema::intern_name(conn, name)?;
 
-            let id = if parent_id.is_empty() {
-                name.to_string()
+            // `ensure_dir_nodes` interns the chain of its argument's PARENT
+            // and materializes a `nodes` row per link, so passing the new
+            // node's own path prepares its ancestry either way; the leaf it
+            // returns is this node's parent directory.
+            let parent_dir_id = leyline_schema::ensure_dir_nodes(conn, &id, now)?;
+            let parent_nid = leyline_schema::dir_nid(parent_dir_id);
+
+            let nid = if is_dir {
+                conn.execute(
+                    "INSERT OR IGNORE INTO dirs (parent_dir_id, name_id) VALUES (?1, ?2)",
+                    rusqlite::params![parent_dir_id, name_id],
+                )?;
+                let dir_id: i64 = conn.query_row(
+                    "SELECT dir_id FROM dirs WHERE parent_dir_id = ?1 AND name_id = ?2",
+                    rusqlite::params![parent_dir_id, name_id],
+                    |r| r.get(0),
+                )?;
+                leyline_schema::dir_nid(dir_id)
             } else {
-                format!("{}/{}", parent_id, name)
+                leyline_schema::file_nid(leyline_schema::ensure_file_id(conn, &id)?, 0)
             };
 
             let kind: i64 = if is_dir { 1 } else { 0 };
-            guard.conn().execute(
-                "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES (?1, ?2, ?3, 0, ?4, NULL)",
-                rusqlite::params![id, name, kind, now],
+            // Raw INSERT rather than `leyline_schema::insert_node`: that helper
+            // writes `record` as TEXT, and a fresh node's record must be NULL.
+            // The difference is load-bearing — CDC activation selects on
+            // `record IS NOT NULL`, so an empty string would enroll a
+            // never-written node.
+            conn.execute(
+                "INSERT INTO nodes (nid, parent_nid, name_id, kind, ord, size, mtime, record) \
+                 VALUES (?1, ?2, ?3, ?4, 0, 0, ?5, NULL)",
+                rusqlite::params![nid, parent_nid, name_id, kind, now],
             )?;
-            id
-        };
+        }
         self.refresh_readers()?;
         Ok(id)
     }
@@ -661,21 +839,26 @@ impl Graph for SqliteGraphAdapter {
     fn remove_node(&self, id: &str) -> Result<()> {
         {
             let guard = self.writer.lock();
-            // Delete the node and all descendants (cascading by prefix)
-            guard.conn().execute(
-                "DELETE FROM nodes WHERE id = ?1 OR id LIKE ?2",
-                rusqlite::params![id, format!("{id}/%")],
-            )?;
+            let conn = guard.conn();
+            // A remove of something that is not there is not an error — the
+            // pre-v5 `DELETE ... WHERE id = ?` deleted nothing and returned Ok.
+            let Some(nid) = leyline_schema::resolve_path(conn, id)? else {
+                return Ok(());
+            };
 
-            // The manifest is keyed by node_id with no FK to `nodes`, so
-            // deleting the row leaves it behind. Node ids are PATHS and paths
-            // get reused: create a file at the same path afterwards and the
-            // orphaned manifest is found by `has_chunked_content`, serving the
-            // DELETED file's bytes to a brand-new, never-written node. That is
-            // a cross-generation content leak, not just staleness. Cascade over
-            // descendants exactly as the DELETE above does.
+            // Invalidate BEFORE deleting. The manifest has no FK to `nodes`,
+            // so deleting the rows would leave it behind — and the subtree
+            // descent for an interior AST node walks `nodes.parent_nid`, which
+            // the delete would have already erased.
+            //
+            // The orphan is not merely stale: `files` is append-only, so a
+            // file re-created at this path re-binds to the same `file_id` and
+            // therefore the same nids, and `has_chunked_content` would serve
+            // the DELETED file's bytes to a brand-new, never-written node.
             #[cfg(feature = "cdc")]
-            crate::chunked::invalidate_chunked_content_subtree(guard.conn(), id)?;
+            crate::chunked::invalidate_chunked_content_subtree(conn, nid)?;
+
+            Self::delete_subtree(conn, nid)?;
         }
         self.refresh_readers()?;
         Ok(())
@@ -684,16 +867,19 @@ impl Graph for SqliteGraphAdapter {
     fn truncate(&self, id: &str) -> Result<()> {
         {
             let guard = self.writer.lock();
+            let conn = guard.conn();
             let now = now_nanos();
+            let Some(nid) = leyline_schema::resolve_path(conn, id)? else {
+                return Ok(());
+            };
 
             // Save shadow copy before truncating (for validation rollback)
             #[cfg(feature = "validate")]
             {
                 let lang = crate::validate::language_for_node(id, self.default_language.as_ref());
                 if lang.is_some() {
-                    let old_content: Option<String> = guard
-                        .conn()
-                        .query_row("SELECT record FROM nodes WHERE id = ?1", [id], |row| {
+                    let old_content: Option<String> = conn
+                        .query_row("SELECT record FROM nodes WHERE nid = ?1", [nid], |row| {
                             row.get(0)
                         })
                         .ok()
@@ -704,16 +890,16 @@ impl Graph for SqliteGraphAdapter {
                 }
             }
 
-            guard.conn().execute(
-                "UPDATE nodes SET record = NULL, size = 0, mtime = ?1 WHERE id = ?2",
-                rusqlite::params![now, id],
+            conn.execute(
+                "UPDATE nodes SET record = NULL, size = 0, mtime = ?1 WHERE nid = ?2",
+                rusqlite::params![now, nid],
             )?;
 
             // Without this, truncate is a silent NO-OP for chunk-backed nodes:
             // `record` becomes NULL but the manifest still describes the old
             // bytes, and the chunked read path keeps serving them.
             #[cfg(feature = "cdc")]
-            crate::chunked::invalidate_chunked_content(guard.conn(), id)?;
+            crate::chunked::invalidate_chunked_content(conn, nid)?;
         }
         self.refresh_readers()?;
         Ok(())
@@ -726,15 +912,20 @@ impl Graph for SqliteGraphAdapter {
                 return Ok(());
             }
             let guard = self.writer.lock();
+            let Some(nid) = leyline_schema::resolve_path(guard.conn(), id)? else {
+                return Ok(());
+            };
             let record: Option<String> = guard
                 .conn()
-                .query_row("SELECT record FROM nodes WHERE id = ?1", [id], |r| r.get(0))
+                .query_row("SELECT record FROM nodes WHERE nid = ?1", [nid], |r| {
+                    r.get(0)
+                })
                 .ok()
                 .flatten();
             let Some(text) = record.filter(|s| !s.is_empty()) else {
                 return Ok(());
             };
-            leyline_ts::splice::splice_and_reproject(guard.conn(), id, &text)?;
+            leyline_ts::splice::splice_and_reproject(guard.conn(), nid, &text)?;
 
             // Reproject rewrote `nodes.record` for the spliced node AND every
             // other node of the same source, from inside leyline-ts — which
@@ -743,21 +934,21 @@ impl Graph for SqliteGraphAdapter {
             // path would serve them without complaint. Invalidate so those
             // reads fall back to `record`: slower, but correct. Reads
             // re-chunk lazily on the next write through this crate.
+            //
+            // projection-v5 makes "every node of this source" a nid RANGE —
+            // one delete over the file's `(file_id << 24) | ordinal` span,
+            // replacing the pre-v5 `_ast` self-join that enumerated ids and
+            // invalidated them one at a time. The range holds across the
+            // reproject because `files` is append-only: the re-projected file
+            // re-binds to the same `file_id`.
             #[cfg(feature = "cdc")]
             {
-                let source_nodes: Vec<String> = {
-                    let mut stmt = guard.conn().prepare(
-                        "SELECT node_id FROM _ast WHERE source_id = \
-                         (SELECT source_id FROM _ast WHERE node_id = ?1)",
-                    )?;
-                    let rows = stmt.query_map([id], |r| r.get::<_, String>(0))?;
-                    rows.collect::<std::result::Result<_, _>>()?
-                };
-                for node in &source_nodes {
-                    crate::chunked::invalidate_chunked_content(guard.conn(), node)?;
-                }
-                // The spliced node itself may not be in _ast under this id.
-                crate::chunked::invalidate_chunked_content(guard.conn(), id)?;
+                let file_id = leyline_schema::nid_file_id(nid)
+                    .context("spliced node must be a file-scoped nid")?;
+                crate::chunked::invalidate_chunked_content_subtree(
+                    guard.conn(),
+                    leyline_schema::file_nid(file_id, 0),
+                )?;
             }
 
             // Only remove from pending on success — failed attempts retry on next flush
@@ -794,17 +985,28 @@ impl Graph for SqliteGraphAdapter {
         let mut ast_edits: Vec<AstEdit> = Vec::new();
 
         for (node_id, text) in edits {
-            let ast_info = conn.query_row(
-                "SELECT source_id, start_byte, end_byte FROM _ast WHERE node_id = ?1",
-                [node_id.as_str()],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, i64>(1)? as usize,
-                        r.get::<_, i64>(2)? as usize,
-                    ))
-                },
-            );
+            // A node id that does not resolve has no `_ast` row by
+            // construction, so it takes the non-AST arm below — the same
+            // place the pre-v5 `QueryReturnedNoRows` sent it.
+            let nid = leyline_schema::resolve_path(conn, node_id)?;
+            // projection-v5: `_ast` lost its `source_id` column — a node's
+            // source IS its file, `nid >> 24`, joined to `_source.file_id`.
+            let ast_info = match nid {
+                Some(nid) => conn.query_row(
+                    "SELECT s.id, a.start_byte, a.end_byte \
+                       FROM _ast a JOIN _source s ON s.file_id = (a.nid >> 24) \
+                      WHERE a.nid = ?1",
+                    [nid],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, i64>(1)? as usize,
+                            r.get::<_, i64>(2)? as usize,
+                        ))
+                    },
+                ),
+                None => Err(rusqlite::Error::QueryReturnedNoRows),
+            };
 
             match ast_info {
                 Ok((source_id, start, end)) => {
@@ -826,22 +1028,25 @@ impl Graph for SqliteGraphAdapter {
                     // manifest or the read path serves pre-splice bytes (update
                     // arm) or a deleted node's bytes to whatever reuses the
                     // path (delete arm).
+                    let Some(nid) = nid else {
+                        continue;
+                    };
                     match text {
                         Some(t) => {
                             conn.execute(
-                                "UPDATE nodes SET record = ?1, size = ?2, mtime = ?3 WHERE id = ?4",
-                                rusqlite::params![t, t.len() as i64, now, node_id],
+                                "UPDATE nodes SET record = ?1, size = ?2, mtime = ?3 WHERE nid = ?4",
+                                rusqlite::params![t, t.len() as i64, now, nid],
                             )?;
                             #[cfg(feature = "cdc")]
-                            crate::chunked::invalidate_chunked_content(conn, node_id)?;
+                            crate::chunked::invalidate_chunked_content(conn, nid)?;
                         }
                         None => {
-                            conn.execute(
-                                "DELETE FROM nodes WHERE id = ?1 OR id LIKE ?2",
-                                rusqlite::params![node_id, format!("{node_id}/%")],
-                            )?;
+                            // Invalidate first: the subtree descent for an
+                            // interior node reads `nodes.parent_nid`, which
+                            // the delete is about to erase.
                             #[cfg(feature = "cdc")]
-                            crate::chunked::invalidate_chunked_content_subtree(conn, node_id)?;
+                            crate::chunked::invalidate_chunked_content_subtree(conn, nid)?;
+                            Self::delete_subtree(conn, nid)?;
                         }
                     }
                 }
@@ -946,15 +1151,24 @@ impl Graph for SqliteGraphAdapter {
             // pre-splice bytes and the chunked read path would serve them.
             // Invalidate the whole source: reads fall back to `record` until
             // the next write refreshes them.
+            //
+            // "The whole source" is now one nid range — `_source.file_id`
+            // names the file, and every node of it lives in that file's span.
             #[cfg(feature = "cdc")]
             {
-                let mut stmt = conn.prepare("SELECT node_id FROM _ast WHERE source_id = ?1")?;
-                let node_ids: Vec<String> = stmt
-                    .query_map([&source_id], |r| r.get::<_, String>(0))?
-                    .collect::<std::result::Result<_, _>>()?;
-                drop(stmt);
-                for node in &node_ids {
-                    crate::chunked::invalidate_chunked_content(conn, node)?;
+                let file_id: Option<i64> = conn
+                    .query_row(
+                        "SELECT file_id FROM _source WHERE id = ?1",
+                        [&source_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                if let Some(file_id) = file_id {
+                    crate::chunked::invalidate_chunked_content_subtree(
+                        conn,
+                        leyline_schema::file_nid(file_id, 0),
+                    )?;
                 }
             }
         }
@@ -976,11 +1190,10 @@ impl Graph for SqliteGraphAdapter {
     fn rename_node(&self, id: &str, new_parent_id: &str, new_name: &str) -> Result<()> {
         {
             let guard = self.writer.lock();
-            let new_id = if new_parent_id.is_empty() {
-                new_name.to_string()
-            } else {
-                format!("{new_parent_id}/{new_name}")
-            };
+            let conn = guard.conn();
+            let new_id = Self::join_id(new_parent_id, new_name);
+            let old_nid = leyline_schema::resolve_path(conn, id)?
+                .with_context(|| format!("rename of unknown node '{id}'"))?;
 
             // Validate content against destination language (catches sed -i pattern:
             // write to temp file → rename over validated file)
@@ -989,11 +1202,12 @@ impl Graph for SqliteGraphAdapter {
                 let dest_lang =
                     crate::validate::language_for_node(&new_id, self.default_language.as_ref());
                 if let Some(lang) = dest_lang {
-                    let content: Option<String> = guard
-                        .conn()
-                        .query_row("SELECT record FROM nodes WHERE id = ?1", [id], |row| {
-                            row.get(0)
-                        })
+                    let content: Option<String> = conn
+                        .query_row(
+                            "SELECT record FROM nodes WHERE nid = ?1",
+                            [old_nid],
+                            |row| row.get(0),
+                        )
                         .ok()
                         .flatten();
                     if let Some(ref src) = content
@@ -1001,7 +1215,7 @@ impl Graph for SqliteGraphAdapter {
                         && let Err(e) = crate::validate::validate(src.as_bytes(), &lang)
                     {
                         let now = now_nanos();
-                        guard.conn().execute(
+                        conn.execute(
                             "INSERT OR REPLACE INTO _errors (node_id, line, col, message, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
                             rusqlite::params![&new_id, e.line, e.column, e.message, now],
                         ).ok();
@@ -1011,54 +1225,79 @@ impl Graph for SqliteGraphAdapter {
                 }
             }
 
-            let old_prefix = format!("{id}/");
-            let new_prefix = format!("{new_id}/");
-
-            // Rename the node itself. `parent_id` is derived from `id` and
-            // `name`, so it follows both rather than being assigned.
-            guard.conn().execute(
-                "UPDATE nodes SET id = ?1, name = ?2 WHERE id = ?3",
-                rusqlite::params![new_id, new_name, id],
-            )?;
-
-            // Cascade to descendants. Rewriting the id prefix IS the whole
-            // rename: a child keeps its own `name`, and its parent is derived
-            // from the id it just got. What this loop used to do — read each
-            // child's stored parent, recompute it, and write it back — existed
-            // only to keep a copy in sync with the value it was copied from.
-            let descendants: Vec<String> = {
-                let mut stmt = guard
-                    .conn()
-                    .prepare("SELECT id FROM nodes WHERE id LIKE ?1")?;
-                let rows = stmt.query_map(rusqlite::params![format!("{old_prefix}%")], |row| {
-                    row.get::<_, String>(0)
-                })?;
-                rows.collect::<std::result::Result<_, _>>()?
-            };
-
-            for old_child_id in descendants {
-                let new_child_id = format!("{new_prefix}{}", &old_child_id[old_prefix.len()..]);
-                guard.conn().execute(
-                    "UPDATE nodes SET id = ?1 WHERE id = ?2",
-                    rusqlite::params![new_child_id, old_child_id],
-                )?;
-            }
-
-            // `content_manifest.node_id` is a bare TEXT column with no FK to
-            // `nodes`, so renaming the row leaves the manifest keyed to the OLD
-            // id — orphaned on a path that may be reused (same leak as
-            // remove_node), while the NEW id has no manifest and would fall
-            // back to `record` anyway. Clear both sides.
+            // Clear both sides BEFORE moving rows. The manifest has no FK to
+            // `nodes`, so a move would leave it keyed to the vacated nids
+            // (orphaned on a path a later create can re-bind to — the same
+            // leak as `remove_node`), while the destination nids would carry
+            // whatever a previous occupant left. The subtree descent also
+            // reads `nodes`, which the move is about to rewrite.
             //
             // Invalidate rather than re-key: carrying the manifest across the
             // rename would preserve chunked reads (the content is unchanged),
-            // but re-keying onto an id that already has a manifest violates the
-            // (node_id, seq) primary key. Correctness first; re-keying with
+            // but re-keying onto a nid that already has a manifest violates
+            // the `(nid, seq)` primary key. Correctness first; re-keying with
             // conflict handling is an available optimization.
             #[cfg(feature = "cdc")]
             {
-                crate::chunked::invalidate_chunked_content_subtree(guard.conn(), id)?;
-                crate::chunked::invalidate_chunked_content_subtree(guard.conn(), &new_id)?;
+                crate::chunked::invalidate_chunked_content_subtree(conn, old_nid)?;
+                if let Some(dest) = leyline_schema::resolve_path(conn, &new_id)? {
+                    crate::chunked::invalidate_chunked_content_subtree(conn, dest)?;
+                }
+            }
+
+            let now = now_nanos();
+            let new_name_id = leyline_schema::intern_name(conn, new_name)?;
+            let new_parent_dir_id = leyline_schema::ensure_dir_nodes(conn, &new_id, now)?;
+            let new_parent_nid = leyline_schema::dir_nid(new_parent_dir_id);
+
+            if let Some(dir_id) = leyline_schema::nid_dir_id(old_nid) {
+                // THE projection-v5 payoff: a directory rename is two rows for
+                // a subtree of any size. Descendants reference the directory
+                // by id, not by path, so every path beneath it re-renders from
+                // the changed link — where pre-v5 this rewrote one TEXT id per
+                // descendant. `dirs` keeps its `UNIQUE(parent_dir_id,
+                // name_id)`, so renaming onto an occupied name still conflicts
+                // exactly as the pre-v5 primary key did.
+                conn.execute(
+                    "UPDATE dirs SET parent_dir_id = ?1, name_id = ?2 WHERE dir_id = ?3",
+                    rusqlite::params![new_parent_dir_id, new_name_id, dir_id],
+                )?;
+                conn.execute(
+                    "UPDATE nodes SET parent_nid = ?1, name_id = ?2 WHERE nid = ?3",
+                    rusqlite::params![new_parent_nid, new_name_id, old_nid],
+                )?;
+            } else {
+                // A file's identity IS `(dir_id, name_id)`, so a renamed file
+                // is a different `file_id` and therefore a different nid
+                // range. Move the whole range in one statement — the file's
+                // own row at ordinal 0 plus every AST node under it — keeping
+                // ordinals, and rebase the internal `parent_nid` links that
+                // pointed into the old range.
+                let old_file_id = leyline_schema::nid_file_id(old_nid)
+                    .context("a non-directory nid has a file_id")?;
+                let new_file_id = leyline_schema::ensure_file_id(conn, &new_id)?;
+                if new_file_id != old_file_id {
+                    let (old_lo, old_hi) = leyline_schema::file_nid_range(old_file_id);
+                    let new_lo = leyline_schema::file_nid(new_file_id, 0);
+                    conn.execute(
+                        "UPDATE nodes \
+                            SET nid = nid - ?1 + ?3, \
+                                parent_nid = CASE \
+                                    WHEN parent_nid BETWEEN ?1 AND ?2 \
+                                    THEN parent_nid - ?1 + ?3 \
+                                    ELSE parent_nid END \
+                          WHERE nid BETWEEN ?1 AND ?2",
+                        rusqlite::params![old_lo, old_hi, new_lo],
+                    )?;
+                }
+                conn.execute(
+                    "UPDATE nodes SET parent_nid = ?1, name_id = ?2 WHERE nid = ?3",
+                    rusqlite::params![
+                        new_parent_nid,
+                        new_name_id,
+                        leyline_schema::file_nid(new_file_id, 0)
+                    ],
+                )?;
             }
         }
         self.refresh_readers()?;
@@ -1483,9 +1722,95 @@ impl Graph for MemoryGraph {
     }
 }
 
+/// Fixture builders shared by this crate's tests.
+///
+/// A node's PATH is not stored under projection-v5, so a fixture has to
+/// intern the components that render it — which is more than an
+/// `INSERT INTO nodes` and is worth writing exactly once.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    // Which fixtures a build needs depends on its feature set; an
+    // unused one here is a feature combination, not dead weight.
+    #![allow(dead_code)]
+
+    use super::*;
+    use rusqlite::Connection;
+
+    /// The nid a display path resolves to. Tests that reach past the [`Graph`]
+    /// trait into the nid-keyed chunk layer translate here, exactly as the
+    /// trait methods do.
+    pub(crate) fn nid_of(conn: &Connection, path: &str) -> i64 {
+        leyline_schema::resolve_path(conn, path)
+            .unwrap()
+            .unwrap_or_else(|| panic!("fixture path {path:?} must resolve"))
+    }
+
+    /// Insert a directory node at `path`, interning its whole ancestry.
+    /// Returns its nid.
+    ///
+    /// The projection-v5 shape of what a fixture used to write as one
+    /// `INSERT INTO nodes (id, name, ...)`: a node's PATH is no longer stored,
+    /// so a fixture has to intern the components that render it.
+    pub(crate) fn put_dir(conn: &Connection, path: &str, mtime: i64) -> Result<i64> {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let name_id = leyline_schema::intern_name(conn, name)?;
+        let parent_dir_id = leyline_schema::ensure_dir_nodes(conn, path, mtime)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO dirs (parent_dir_id, name_id) VALUES (?1, ?2)",
+            rusqlite::params![parent_dir_id, name_id],
+        )?;
+        let dir_id: i64 = conn.query_row(
+            "SELECT dir_id FROM dirs WHERE parent_dir_id = ?1 AND name_id = ?2",
+            rusqlite::params![parent_dir_id, name_id],
+            |r| r.get(0),
+        )?;
+        let nid = leyline_schema::dir_nid(dir_id);
+        conn.execute(
+        "INSERT OR REPLACE INTO nodes (nid, parent_nid, name_id, kind, ord, size, mtime, record) \
+         VALUES (?1, ?2, ?3, 1, 0, 0, ?4, NULL)",
+        rusqlite::params![nid, leyline_schema::dir_nid(parent_dir_id), name_id, mtime],
+    )?;
+        Ok(nid)
+    }
+
+    /// Insert a file node at `path` carrying `record` (`None` writes a NULL
+    /// record, which is what an unwritten node has and what CDC activation
+    /// skips on). Returns its nid.
+    pub(crate) fn put_file(
+        conn: &Connection,
+        path: &str,
+        mtime: i64,
+        record: Option<&str>,
+    ) -> Result<i64> {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let name_id = leyline_schema::intern_name(conn, name)?;
+        let parent_dir_id = leyline_schema::ensure_dir_nodes(conn, path, mtime)?;
+        let file_id = leyline_schema::ensure_file_id(conn, path)?;
+        let nid = leyline_schema::file_nid(file_id, 0);
+        conn.execute(
+        "INSERT OR REPLACE INTO nodes (nid, parent_nid, name_id, kind, ord, size, mtime, record) \
+         VALUES (?1, ?2, ?3, 0, 0, ?4, ?5, ?6)",
+        rusqlite::params![
+            nid,
+            leyline_schema::dir_nid(parent_dir_id),
+            name_id,
+            record.map(|r| r.len() as i64).unwrap_or(0),
+            mtime,
+            record
+        ],
+    )?;
+        Ok(nid)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `nid_of` translates a display path for the nid-keyed chunk layer,
+    // which only the `cdc` tests reach into.
+    #[cfg(feature = "cdc")]
+    use crate::graph::fixtures::nid_of;
+    use crate::graph::fixtures::{put_dir, put_file};
     use leyline_schema::create_schema;
     use rusqlite::Connection;
 
@@ -1559,10 +1884,13 @@ mod tests {
     fn sqlite_adapter_round_trip() -> Result<()> {
         let source = Connection::open_in_memory()?;
         create_schema(&source)?;
-        source.execute_batch(
-            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('vulns', 'vulns', 1, 0, 1000, NULL);
-            INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('vulns/CVE-2024-0001', 'CVE-2024-0001', 1, 0, 2000, NULL);
-            INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('vulns/CVE-2024-0001/source', 'source', 0, 42, 3000, '{\"severity\":\"critical\"}');",
+        put_dir(&source, "vulns", 1000)?;
+        put_dir(&source, "vulns/CVE-2024-0001", 2000)?;
+        put_file(
+            &source,
+            "vulns/CVE-2024-0001/source",
+            3000,
+            Some("{\"severity\":\"critical\"}"),
         )?;
 
         let data = source.serialize("main")?;
@@ -1591,7 +1919,9 @@ mod tests {
         // Read file content (record column)
         let leaf = adapter.get_node("vulns/CVE-2024-0001/source")?.unwrap();
         assert!(!leaf.is_dir);
-        assert_eq!(leaf.size, 42);
+        // `size` tracks the record's byte length — the invariant every writer
+        // maintains and CDC activation refuses to proceed without.
+        assert_eq!(leaf.size, 23);
 
         let mut buf = [0u8; 256];
         let n = adapter.read_content("vulns/CVE-2024-0001/source", &mut buf, 0)?;
@@ -1608,10 +1938,8 @@ mod tests {
     fn writable_adapter() -> Result<SqliteGraphAdapter> {
         let source = Connection::open_in_memory()?;
         create_schema(&source)?;
-        source.execute_batch(
-            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('docs', 'docs', 1, 0, 1000, NULL);
-            INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('docs/readme', 'readme', 0, 5, 2000, 'hello');",
-        )?;
+        put_dir(&source, "docs", 1000)?;
+        put_file(&source, "docs/readme", 2000, Some("hello"))?;
         let data = source.serialize("main")?;
         SqliteGraphAdapter::new_writable(data.as_ref())
     }
@@ -1747,7 +2075,10 @@ mod tests {
         let arena_path = dir.path().join("test.arena");
 
         // Create control block with arena path set, zero root sentinel
-        let arena_size: u64 = 4096 + 32768 * 2;
+        // The projection carries its interning tables, indexes, and display
+        // views alongside `nodes`, so even a two-node fixture serializes past
+        // 32 KiB. Sized off the page count the schema actually needs.
+        let arena_size: u64 = 4096 + 131_072 * 2;
         let mut ctrl = Controller::open_or_create(&ctrl_path)?;
         ctrl.set_arena(arena_path.to_str().unwrap(), arena_size)?;
         let _mmap = leyline_core::layout::create_arena(&arena_path, arena_size)?;
@@ -1762,10 +2093,8 @@ mod tests {
         // Now publish real data
         let source = Connection::open_in_memory()?;
         create_schema(&source)?;
-        source.execute_batch(
-            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('docs', 'docs', 1, 0, 1000, NULL);
-            INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('docs/readme', 'readme', 0, 5, 2000, 'hello');",
-        )?;
+        put_dir(&source, "docs", 1000)?;
+        put_file(&source, "docs/readme", 2000, Some("hello"))?;
         let db_bytes = source.serialize("main")?;
 
         // Write db to arena
@@ -1795,10 +2124,23 @@ mod tests {
         // Verify SqliteGraphAdapter queries work with the full shared schema.
         let source = Connection::open_in_memory()?;
         create_schema(&source)?;
-        source.execute_batch(
-            "INSERT INTO nodes (id, name, kind, size, mtime, record_id, record) VALUES ('funcs', 'funcs', 1, 0, 1000, NULL, NULL);
-            INSERT INTO nodes (id, name, kind, size, mtime, record_id, record) VALUES ('funcs/Validate', 'Validate', 1, 0, 2000, 'rec-1', NULL);
-            INSERT INTO nodes (id, name, kind, size, mtime, record, source_file) VALUES ('funcs/Validate/source', 'source', 0, 18, 3000, 'func Validate(){}', 'validate.go');",
+        put_dir(&source, "funcs", 1000)?;
+        let validate = put_dir(&source, "funcs/Validate", 2000)?;
+        let sources = put_file(
+            &source,
+            "funcs/Validate/source",
+            3000,
+            Some("func Validate(){}"),
+        )?;
+        // The columns this test is about: mache's lazy-resolution flow writes
+        // both, ley-line's own writers leave both NULL.
+        source.execute(
+            "UPDATE nodes SET record_id = 'rec-1' WHERE nid = ?1",
+            [validate],
+        )?;
+        source.execute(
+            "UPDATE nodes SET source_file = 'validate.go' WHERE nid = ?1",
+            [sources],
         )?;
 
         let data = source.serialize("main")?;
@@ -1831,9 +2173,7 @@ mod tests {
 
         let source = Connection::open_in_memory()?;
         create_schema(&source)?;
-        source.execute_batch(&format!(
-            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('f', 'f', 0, 0, {go_mtime}, NULL);"
-        ))?;
+        put_file(&source, "f", go_mtime, None)?;
 
         let data = source.serialize("main")?;
         let graph = SqliteGraph::from_bytes(data.as_ref())?;
@@ -1873,15 +2213,14 @@ mod tests {
     fn writable_go_adapter() -> Result<SqliteGraphAdapter> {
         let source = Connection::open_in_memory()?;
         create_schema(&source)?;
-        source.execute_batch(
-            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('functions', 'functions', 1, 0, 1000, NULL);
-            INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('functions/main', 'main', 1, 0, 2000, NULL);
-            INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('functions/main/source', 'source', 0, 37, 3000, 'package main\n\nfunc main() {\n}\n');
-            INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('docs', 'docs', 1, 0, 1000, NULL);
-            INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('docs/readme.txt', 'readme.txt', 0, 5, 2000, 'hello');
-            INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('src', 'src', 1, 0, 1000, NULL);
-            INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('src/main.go', 'main.go', 0, 37, 3000, 'package main\n\nfunc main() {\n}\n');",
-        )?;
+        let go_src = "package main\n\nfunc main() {\n}\n";
+        put_dir(&source, "functions", 1000)?;
+        put_dir(&source, "functions/main", 2000)?;
+        put_file(&source, "functions/main/source", 3000, Some(go_src))?;
+        put_dir(&source, "docs", 1000)?;
+        put_file(&source, "docs/readme.txt", 2000, Some("hello"))?;
+        put_dir(&source, "src", 1000)?;
+        put_file(&source, "src/main.go", 3000, Some(go_src))?;
         let data = source.serialize("main")?;
         let mut adapter = SqliteGraphAdapter::new_writable(data.as_ref())?;
         let go_lang: tree_sitter::Language = tree_sitter_go::LANGUAGE.into();
@@ -2121,12 +2460,14 @@ mod tests {
         let html = b"<p>hello</p>";
         let adapter = writable_ast_adapter(html)?;
 
-        // The text leaf is at "element/text" in the projected tree
-        let node_id = "element/text";
+        // The text leaf is at "test.html/element/text" in the projected
+        // tree: a node's path is rooted at its source FILE, which is the
+        // node the parse hangs the AST root on.
+        let node_id = "test.html/element/text";
         let node = adapter.get_node(node_id)?;
         assert!(
             node.is_some(),
-            "element/text node should exist after HTML parse"
+            "test.html/element/text node should exist after HTML parse"
         );
 
         // Write new content to the node's record
@@ -2196,7 +2537,7 @@ mod tests {
         let html = b"<div>original</div>";
         let adapter = writable_ast_adapter(html)?;
 
-        let node_id = "element/text";
+        let node_id = "test.html/element/text";
 
         // Write broken HTML that produces syntax errors when spliced into source
         // <div>original</div> → <div><broken</div> → tree-sitter error
@@ -2256,15 +2597,22 @@ mod tests {
     #[cfg(all(feature = "splice", feature = "cdc"))]
     fn write_then_flush_serves_post_splice_bytes() -> Result<()> {
         let adapter = writable_ast_adapter(b"<p>hello</p>")?;
-        let node_id = "element/text";
+        let node_id = "test.html/element/text";
 
         // Give the arena chunk storage, then populate this node's manifest so
         // reads are genuinely being served from chunks before the splice.
         {
             let guard = adapter.writer.lock();
             crate::chunked::create_chunked_content_schema(guard.conn())?;
-            crate::chunked::store_content_chunked(guard.conn(), node_id, b"hello")?;
-            assert!(crate::chunked::has_chunked_content(guard.conn(), node_id)?);
+            crate::chunked::store_content_chunked(
+                guard.conn(),
+                nid_of(guard.conn(), node_id),
+                b"hello",
+            )?;
+            assert!(crate::chunked::has_chunked_content(
+                guard.conn(),
+                nid_of(guard.conn(), node_id)
+            )?);
         }
         adapter.refresh_readers()?;
 
@@ -2308,7 +2656,7 @@ mod tests {
 
         let guard = adapter.writer.lock();
         assert!(
-            crate::chunked::has_chunked_content(guard.conn(), "docs/readme")?,
+            crate::chunked::has_chunked_content(guard.conn(), nid_of(guard.conn(), "docs/readme"))?,
             "a write into a chunk-enabled arena must populate the manifest"
         );
         drop(guard);
@@ -2331,13 +2679,17 @@ mod tests {
     #[cfg(all(feature = "splice", feature = "cdc"))]
     fn batch_splice_does_not_leave_a_stale_chunk_manifest() -> Result<()> {
         let adapter = writable_ast_adapter(b"<p>hello</p>")?;
-        let node_id = "element/text";
+        let node_id = "test.html/element/text";
 
         {
             let guard = adapter.writer.lock();
             crate::chunked::create_chunked_content_schema(guard.conn())?;
             // Manifest describes the CURRENT content, "hello".
-            crate::chunked::store_content_chunked(guard.conn(), node_id, b"hello")?;
+            crate::chunked::store_content_chunked(
+                guard.conn(),
+                nid_of(guard.conn(), node_id),
+                b"hello",
+            )?;
         }
         adapter.refresh_readers()?;
 
@@ -2389,13 +2741,14 @@ mod tests {
         node_id: &str,
     ) -> Result<Vec<(Vec<u8>, usize, usize)>> {
         let guard = adapter.writer.lock();
+        let nid = nid_of(guard.conn(), node_id);
         let mut statement = guard.conn().prepare(
             "SELECT chunk_hash, byte_offset, byte_len
                FROM content_manifest
-              WHERE node_id = ?1
+              WHERE nid = ?1
               ORDER BY seq",
         )?;
-        let rows = statement.query_map([node_id], |row| {
+        let rows = statement.query_map([nid], |row| {
             Ok((
                 row.get(0)?,
                 row.get::<_, i64>(1)? as usize,
@@ -2482,7 +2835,11 @@ mod tests {
             let node_id = "docs/readme";
             if stale {
                 let guard = adapter.writer.lock();
-                crate::chunked::store_content_chunked(guard.conn(), node_id, b"hello")?;
+                crate::chunked::store_content_chunked(
+                    guard.conn(),
+                    nid_of(guard.conn(), node_id),
+                    b"hello",
+                )?;
                 // Staleness means the RECORD moved on (a foreign writer
                 // replacing the bytes bumps the generation via trigger) —
                 // same length on purpose: this is exactly the same-shape
@@ -2490,9 +2847,10 @@ mod tests {
                 // An mtime-only touch deliberately no longer invalidates —
                 // the generation witness keys on mutation, not metadata
                 // (ley-line-open-b82f56).
+                let nid = nid_of(guard.conn(), node_id);
                 guard
                     .conn()
-                    .execute("UPDATE nodes SET record = 'holla' WHERE id = ?1", [node_id])?;
+                    .execute("UPDATE nodes SET record = 'holla' WHERE nid = ?1", [nid])?;
             }
 
             let edit = b"XY";
@@ -2595,7 +2953,10 @@ mod tests {
 
         let guard = adapter.writer.lock();
         assert!(
-            !crate::chunked::has_chunked_content(guard.conn(), "docs/readme")?,
+            !crate::chunked::has_chunked_content(
+                guard.conn(),
+                nid_of(guard.conn(), "docs/readme")
+            )?,
             "descendant manifest survived removal of its parent directory"
         );
         Ok(())
@@ -2619,9 +2980,11 @@ mod tests {
             let guard = adapter.writer.lock();
             let is_ast: bool = guard
                 .conn()
-                .query_row("SELECT 1 FROM _ast WHERE node_id = ?1", [&plain], |_| {
-                    Ok(true)
-                })
+                .query_row(
+                    "SELECT 1 FROM _ast WHERE nid = ?1",
+                    [nid_of(guard.conn(), &plain)],
+                    |_| Ok(true),
+                )
                 .unwrap_or(false);
             assert!(!is_ast, "fixture must be a NON-AST node");
         }
@@ -2650,7 +3013,10 @@ mod tests {
 
         let guard = adapter.writer.lock();
         assert!(
-            !crate::chunked::has_chunked_content(guard.conn(), "docs/readme")?,
+            !crate::chunked::has_chunked_content(
+                guard.conn(),
+                nid_of(guard.conn(), "docs/readme")
+            )?,
             "manifest orphaned on the vacated path — a new file there would \
              read the pre-rename content"
         );
@@ -2675,11 +3041,8 @@ mod tests {
         crate::chunked::create_chunked_content_schema(&source)?;
         let data = vec![b'x'; 256 * 1024];
         let record = String::from_utf8(data.clone())?;
-        source.execute(
-            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('docs/readme', 'readme', 0, ?1, 1, ?2)",
-            rusqlite::params![i64::try_from(data.len())?, record],
-        )?;
-        crate::chunked::store_content_chunked(&source, "docs/readme", &data)?;
+        let nid = put_file(&source, "docs/readme", 1, Some(&record))?;
+        crate::chunked::store_content_chunked(&source, nid, &data)?;
         let db_bytes = source.serialize("main")?;
 
         let arena_size = 4096 + 1024 * 1024 * 2;
@@ -2698,8 +3061,8 @@ mod tests {
             let (hash, offset, mut bytes): (Vec<u8>, i64, Vec<u8>) = guard.conn().query_row(
                 "SELECT m.chunk_hash, m.byte_offset, c.chunk_bytes \
                    FROM content_manifest m JOIN content_chunks c USING (chunk_hash) \
-                  WHERE m.node_id = 'docs/readme' ORDER BY m.byte_offset LIMIT 1",
-                [],
+                  WHERE m.nid = ?1 ORDER BY m.byte_offset LIMIT 1",
+                [nid],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
             bytes[0] ^= 0xff;
@@ -2732,10 +3095,7 @@ mod tests {
         let source = Connection::open_in_memory()?;
         create_schema(&source)?;
         let content = "verify-on-fault must serve exactly these bytes".to_string();
-        source.execute(
-            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('docs/readme', 'readme', 0, ?1, 1, ?2)",
-            rusqlite::params![content.len() as i64, content],
-        )?;
+        put_file(&source, "docs/readme", 1, Some(&content))?;
         let db_bytes = source.serialize("main")?;
 
         let arena_path = dir.join("verified.arena");

@@ -913,11 +913,11 @@ mod tests {
             let staging = StagingGraph::new(live.clone())?;
 
             // Stage an edit to the text node
-            staging.write_content("element/text", b"world", 0)?;
+            staging.write_content("test.html/element/text", b"world", 0)?;
 
             // Verify staging has the edit
             let dirty = staging.dirty_nodes()?;
-            assert!(dirty.contains(&"element/text".to_string()));
+            assert!(dirty.contains(&"test.html/element/text".to_string()));
 
             // Commit — triggers batch splice on live
             staging.commit()?;
@@ -927,7 +927,7 @@ mod tests {
 
             // Live source is updated
             let mut buf = [0u8; 256];
-            let n = live.read_content("element/text", &mut buf, 0)?;
+            let n = live.read_content("test.html/element/text", &mut buf, 0)?;
             assert_eq!(&buf[..n], b"world");
 
             Ok(())
@@ -939,7 +939,7 @@ mod tests {
             let live = ast_adapter(b"<div><p>aaa</p><p>bbb</p></div>")?;
 
             // Find the text nodes (disambiguated siblings)
-            let children = live.list_children("element")?;
+            let children = live.list_children("test.html/element")?;
             let text_nodes: Vec<String> = children
                 .iter()
                 .flat_map(|c| {
@@ -996,9 +996,9 @@ mod tests {
             let staging = StagingGraph::new(live)?;
 
             // Stage an overlapping edit — edit both parent and child
-            // element contains element/text, so their byte ranges overlap
-            staging.write_content("element", b"<div>replaced</div>", 0)?;
-            staging.write_content("element/text", b"also replaced", 0)?;
+            // test.html/element contains .../text, so their byte ranges overlap
+            staging.write_content("test.html/element", b"<div>replaced</div>", 0)?;
+            staging.write_content("test.html/element/text", b"also replaced", 0)?;
 
             // Commit should fail (overlapping byte ranges)
             let result = staging.commit();

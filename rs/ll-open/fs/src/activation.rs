@@ -115,15 +115,15 @@ where
     let mut already_fresh_nodes = 0_u64;
     let mut processed_source_bytes = 0_u64;
     let mut visited_nodes = 0_u64;
-    let mut last_id = None;
+    let mut last_nid = None;
 
     loop {
-        let rows = query_activation_page(conn, last_id.as_deref(), batch_size)?;
+        let rows = query_activation_page(conn, last_nid, batch_size)?;
 
         if rows.is_empty() {
             break;
         }
-        last_id = rows.last().cloned();
+        last_nid = rows.last().copied();
 
         // One transaction per PAGE, not per node. The work per node is a small
         // read plus a manifest rewrite; the commit dominated it, so a
@@ -132,8 +132,8 @@ where
         // `batch_size` nodes, and re-activation is idempotent via AlreadyFresh.
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
             .context("begin CDC activation page transaction")?;
-        for node_id in rows {
-            match activate_node_in_tx(&tx, &node_id)? {
+        for nid in rows {
+            match activate_node_in_tx(&tx, nid)? {
                 NodeActivation::Gone => {}
                 NodeActivation::AlreadyFresh => {
                     visited_nodes = checked_increment(visited_nodes, "visited CDC node count")?;
@@ -204,7 +204,7 @@ where
         tx.commit()
             .context("commit CDC activation convergence check")?;
 
-        match activate_node(conn, &stale_node)? {
+        match activate_node(conn, stale_node)? {
             NodeActivation::Gone => continue,
             NodeActivation::AlreadyFresh => {
                 visited_nodes = checked_increment(visited_nodes, "visited CDC node count")?;
@@ -229,34 +229,36 @@ where
     }
 }
 
+/// One keyset page of eligible nodes, ordered by the projection's own key.
+///
+/// projection-v5: the cursor is the integer `nid`, so the page walk rides the
+/// PRIMARY KEY directly instead of ordering a TEXT ancestry path.
 fn query_activation_page(
     conn: &Connection,
-    last_id: Option<&str>,
+    last_nid: Option<i64>,
     batch_size: i64,
-) -> Result<Vec<String>> {
-    let (sql, cursor): (&str, Option<&str>) = match last_id {
-        Some(cursor) => (
-            "SELECT id
+) -> Result<Vec<i64>> {
+    let sql = match last_nid {
+        Some(_) => {
+            "SELECT nid
                FROM nodes
-              WHERE kind = 0 AND record IS NOT NULL AND id > ?1
-              ORDER BY id
-              LIMIT ?2",
-            Some(cursor),
-        ),
-        None => (
-            "SELECT id
+              WHERE kind = 0 AND record IS NOT NULL AND nid > ?1
+              ORDER BY nid
+              LIMIT ?2"
+        }
+        None => {
+            "SELECT nid
                FROM nodes
               WHERE kind = 0 AND record IS NOT NULL
-              ORDER BY id
-              LIMIT ?1",
-            None,
-        ),
+              ORDER BY nid
+              LIMIT ?1"
+        }
     };
     let mut stmt = conn.prepare(sql).context("prepare CDC activation page")?;
-    let mapped = if let Some(cursor) = cursor {
-        stmt.query_map(params![cursor, batch_size], read_node_id)
+    let mapped = if let Some(cursor) = last_nid {
+        stmt.query_map(params![cursor, batch_size], read_nid)
     } else {
-        stmt.query_map(params![batch_size], read_node_id)
+        stmt.query_map(params![batch_size], read_nid)
     }
     .context("query CDC activation page")?;
     mapped
@@ -264,23 +266,23 @@ fn query_activation_page(
         .context("decode CDC activation page")
 }
 
-fn read_node_id(row: &rusqlite::Row<'_>) -> rusqlite::Result<String> {
+fn read_nid(row: &rusqlite::Row<'_>) -> rusqlite::Result<i64> {
     row.get(0)
 }
 
-fn first_nonfresh_node(tx: &Transaction<'_>, batch_size: i64) -> Result<Option<String>> {
-    let mut last_id = None;
+fn first_nonfresh_node(tx: &Transaction<'_>, batch_size: i64) -> Result<Option<i64>> {
+    let mut last_nid = None;
     loop {
-        let rows = query_activation_page(tx, last_id.as_deref(), batch_size)?;
+        let rows = query_activation_page(tx, last_nid, batch_size)?;
         if rows.is_empty() {
             return Ok(None);
         }
-        last_id = rows.last().cloned();
-        for node_id in rows {
-            if !has_chunked_content_in_transaction(tx, &node_id)
-                .with_context(|| format!("verify final CDC freshness for node {node_id}"))?
+        last_nid = rows.last().copied();
+        for nid in rows {
+            if !has_chunked_content_in_transaction(tx, nid)
+                .with_context(|| format!("verify final CDC freshness for node {nid}"))?
             {
-                return Ok(Some(node_id));
+                return Ok(Some(nid));
             }
         }
     }
@@ -304,32 +306,32 @@ enum NodeActivation {
 /// uses [`activate_node`] for its single-node repairs. Neither begins nor
 /// commits — that is the caller's, so commit granularity is a policy decision
 /// rather than a property of this function.
-fn activate_node_in_tx(tx: &Transaction<'_>, node_id: &str) -> Result<NodeActivation> {
+fn activate_node_in_tx(tx: &Transaction<'_>, nid: i64) -> Result<NodeActivation> {
     let source: Option<(Vec<u8>, i64)> = tx
         .query_row(
             "SELECT CAST(record AS BLOB), size
                FROM nodes
-              WHERE id = ?1 AND kind = 0 AND record IS NOT NULL",
-            params![node_id],
+              WHERE nid = ?1 AND kind = 0 AND record IS NOT NULL",
+            params![nid],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
-        .with_context(|| format!("read authoritative CDC source for node {node_id}"))?;
+        .with_context(|| format!("read authoritative CDC source for node {nid}"))?;
     let Some((data, declared_size)) = source else {
         return Ok(NodeActivation::Gone);
     };
     ensure!(
         declared_size >= 0 && u64::try_from(declared_size).ok() == u64::try_from(data.len()).ok(),
-        "node {node_id} size {declared_size} does not match {} record bytes",
+        "node {nid} size {declared_size} does not match {} record bytes",
         data.len()
     );
-    if has_chunked_content_in_transaction(tx, node_id)
-        .with_context(|| format!("check CDC freshness for node {node_id}"))?
+    if has_chunked_content_in_transaction(tx, nid)
+        .with_context(|| format!("check CDC freshness for node {nid}"))?
     {
         return Ok(NodeActivation::AlreadyFresh);
     }
-    store_content_chunked_in_transaction(tx, node_id, &data)
-        .with_context(|| format!("activate CDC for node {node_id}"))?;
+    store_content_chunked_in_transaction(tx, nid, &data)
+        .with_context(|| format!("activate CDC for node {nid}"))?;
     Ok(NodeActivation::Populated {
         source_bytes: u64::try_from(data.len()).context("node length exceeds u64")?,
     })
@@ -337,12 +339,12 @@ fn activate_node_in_tx(tx: &Transaction<'_>, node_id: &str) -> Result<NodeActiva
 
 /// Activate a single node in its own transaction — the convergence loop's
 /// repair path, where one stale row is fixed at a time.
-fn activate_node(conn: &Connection, node_id: &str) -> Result<NodeActivation> {
+fn activate_node(conn: &Connection, nid: i64) -> Result<NodeActivation> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
-        .with_context(|| format!("begin CDC activation transaction for node {node_id}"))?;
-    let outcome = activate_node_in_tx(&tx, node_id)?;
+        .with_context(|| format!("begin CDC activation transaction for node {nid}"))?;
+    let outcome = activate_node_in_tx(&tx, nid)?;
     tx.commit()
-        .with_context(|| format!("commit CDC activation for node {node_id}"))?;
+        .with_context(|| format!("commit CDC activation for node {nid}"))?;
     Ok(outcome)
 }
 
@@ -365,7 +367,7 @@ fn validate_nodes_contract(conn: &Connection) -> Result<()> {
         .context("query nodes columns for CDC activation")?
         .collect::<rusqlite::Result<BTreeSet<_>>>()
         .context("decode nodes columns for CDC activation")?;
-    let required = ["id", "kind", "mtime", "record", "size"];
+    let required = ["kind", "mtime", "nid", "record", "size"];
     let missing = required
         .into_iter()
         .filter(|column| !actual.contains(*column))

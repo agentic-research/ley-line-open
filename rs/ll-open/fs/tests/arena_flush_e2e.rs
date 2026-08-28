@@ -11,14 +11,47 @@ use leyline_fs::graph::{Graph, HotSwapGraph, SqliteGraphAdapter};
 use leyline_schema::create_schema;
 
 /// Create a minimal nodes-table SQLite DB and return its serialized bytes.
+///
+/// A node's PATH is not stored under projection-v5, so seeding one means
+/// interning the components that render it: the directory chain in `dirs`,
+/// the file in `files`, and each name in `names`.
 fn seed_db() -> Vec<u8> {
     let conn = Connection::open_in_memory().unwrap();
     create_schema(&conn).unwrap();
-    conn.execute_batch(
-        "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('docs', 'docs', 1, 0, 1000, NULL);
-        INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('docs/readme', 'readme', 0, 5, 2000, 'hello');",
+
+    let docs_dir = leyline_schema::intern_dir_chain(&conn, "docs").unwrap();
+    let docs_name = leyline_schema::intern_name(&conn, "docs").unwrap();
+    leyline_schema::ensure_dir_nodes(&conn, "docs/readme", 1000).unwrap();
+    leyline_schema::insert_node(
+        &conn,
+        leyline_schema::dir_nid(docs_dir),
+        Some(leyline_schema::dir_nid(1)),
+        Some(docs_name),
+        None,
+        1,
+        0,
+        0,
+        1000,
+        "",
     )
     .unwrap();
+
+    let file_id = leyline_schema::ensure_file_id(&conn, "docs/readme").unwrap();
+    let readme_name = leyline_schema::intern_name(&conn, "readme").unwrap();
+    leyline_schema::insert_node(
+        &conn,
+        leyline_schema::file_nid(file_id, 0),
+        Some(leyline_schema::dir_nid(docs_dir)),
+        Some(readme_name),
+        None,
+        0,
+        0,
+        5,
+        2000,
+        "hello",
+    )
+    .unwrap();
+
     conn.serialize("main").unwrap().to_vec()
 }
 

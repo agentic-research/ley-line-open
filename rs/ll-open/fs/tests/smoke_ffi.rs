@@ -16,11 +16,43 @@ use tempfile::TempDir;
 fn create_test_arena(dir: &std::path::Path) -> Result<std::path::PathBuf> {
     let source = Connection::open_in_memory()?;
     create_schema(&source)?;
-    source.execute_batch(
-        "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('vulns', 'vulns', 1, 0, 1000, NULL);
-        INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('vulns/CVE-1', 'CVE-1', 0, 23, 2000, '{\"severity\":\"critical\"}');
-        INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('vulns/CVE-2', 'CVE-2', 0, 10, 3000, '{\"severity\":\"high\"}');",
+    // A node's PATH is not stored under projection-v5, so seeding means
+    // interning the components that render it rather than writing an id.
+    let dir_id = leyline_schema::intern_dir_chain(&source, "vulns")?;
+    let dir_name = leyline_schema::intern_name(&source, "vulns")?;
+    leyline_schema::ensure_dir_nodes(&source, "vulns/CVE-1", 1000)?;
+    leyline_schema::insert_node(
+        &source,
+        leyline_schema::dir_nid(dir_id),
+        Some(leyline_schema::dir_nid(1)),
+        Some(dir_name),
+        None,
+        1,
+        0,
+        0,
+        1000,
+        "",
     )?;
+    for (name, mtime, record) in [
+        ("CVE-1", 2000, "{\"severity\":\"critical\"}"),
+        ("CVE-2", 3000, "{\"severity\":\"high\"}"),
+    ] {
+        let path = format!("vulns/{name}");
+        let file_id = leyline_schema::ensure_file_id(&source, &path)?;
+        let name_id = leyline_schema::intern_name(&source, name)?;
+        leyline_schema::insert_node(
+            &source,
+            leyline_schema::file_nid(file_id, 0),
+            Some(leyline_schema::dir_nid(dir_id)),
+            Some(name_id),
+            None,
+            0,
+            0,
+            record.len() as i64,
+            mtime,
+            record,
+        )?;
+    }
     let serialized = source.serialize("main")?;
     let db_bytes = serialized.as_ref();
 

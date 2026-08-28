@@ -1491,15 +1491,11 @@ pub fn parse_into_conn(
                             .context("write AstNode capnp bytes")?;
                     }
 
-                    // Bead `ley-line-open-caf423`: every AST-derived node
-                    // carries its source file's `_source.id` as
-                    // `source_file`. The file's own row + every descendant
-                    // AST node share the same `source_file` (the
-                    // relative path). Directory nodes (created via
-                    // `collect_dirs`) intentionally leave `source_file` as
-                    // `None` — they don't belong to a single file.
                     // (nodes rows are pushed below, once `entry_by_id` is
-                    // built — their kind_id comes from the `_ast` entry.)
+                    // built — their kind_id comes from the `_ast` entry.
+                    // `source_file` is no longer written as of projection-v5:
+                    // a row's file is `nid >> 24`, which retired the caf423
+                    // per-row path column.)
 
                     // Merkle-AST content layer (post-order, children before
                     // parents). Cross-file dedup happens here in memory: only the

@@ -15,7 +15,58 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use leyline_schema::{create_schema, insert_node};
+use leyline_schema::create_schema;
+
+/// Intern one named tree node in directory nid space (projection-v5, bead
+/// `ley-line-open-17c271`): the pyproject projection is a tree of NAMED
+/// things — exactly what the `dirs` + `names` interning chain models, the
+/// same shape the standalone LSP tree uses. Idempotent per (parent, name);
+/// returns the node's `dir_id` (its nid is the negation).
+fn named_node(
+    conn: &Connection,
+    parent_dir_id: i64,
+    name: &str,
+    kind: i32,
+    size: i64,
+    mtime: i64,
+    record: &str,
+) -> Result<i64> {
+    let name_id = leyline_schema::intern_name(conn, name)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO dirs (parent_dir_id, name_id) VALUES (?1, ?2)",
+        rusqlite::params![parent_dir_id, name_id],
+    )?;
+    let dir_id: i64 = conn.query_row(
+        "SELECT dir_id FROM dirs WHERE parent_dir_id = ?1 AND name_id = ?2",
+        rusqlite::params![parent_dir_id, name_id],
+        |r| r.get(0),
+    )?;
+    conn.execute(
+        "INSERT OR REPLACE INTO nodes (nid, parent_nid, name_id, kind, ord, size, mtime, record) \
+         VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7)",
+        rusqlite::params![
+            leyline_schema::dir_nid(dir_id),
+            leyline_schema::dir_nid(parent_dir_id),
+            name_id,
+            kind,
+            size,
+            mtime,
+            record
+        ],
+    )?;
+    Ok(dir_id)
+}
+
+/// Make sure the root directory's presentation row exists (nid -1).
+fn ensure_root_node(conn: &Connection, mtime: i64) -> Result<()> {
+    let root_name = leyline_schema::intern_name(conn, "")?;
+    conn.execute(
+        "INSERT OR IGNORE INTO nodes (nid, parent_nid, name_id, kind, ord, mtime, record) \
+         VALUES (-1, NULL, ?1, 1, 0, ?2, '')",
+        rusqlite::params![root_name, mtime],
+    )?;
+    Ok(())
+}
 
 /// Parsed dependency with normalized name and version specifier.
 struct Dep {
@@ -59,68 +110,28 @@ pub fn project_pyproject_into(content: &str, conn: &Connection) -> Result<()> {
         .unwrap_or_default()
         .as_secs() as i64;
 
-    // Root directory
-    insert_node(conn, "", "", 1, 0, mtime, "")?;
+    // Root directory (dir_id 1, nid -1)
+    ensure_root_node(conn, mtime)?;
 
     // /project metadata
     if let Some(project) = doc.get("project").and_then(|v| v.as_table()) {
-        insert_node(conn, "project", "project", 1, 0, mtime, "")?;
+        let project_dir = named_node(conn, 1, "project", 1, 0, mtime, "")?;
 
-        if let Some(name) = project.get("name").and_then(|v| v.as_str()) {
-            insert_node(
-                conn,
-                "project/name",
-                "name",
-                0,
-                name.len() as i64,
-                mtime,
-                name,
-            )?;
-        }
-        if let Some(version) = project.get("version").and_then(|v| v.as_str()) {
-            insert_node(
-                conn,
-                "project/version",
-                "version",
-                0,
-                version.len() as i64,
-                mtime,
-                version,
-            )?;
-        }
-        if let Some(desc) = project.get("description").and_then(|v| v.as_str()) {
-            insert_node(
-                conn,
-                "project/description",
-                "description",
-                0,
-                desc.len() as i64,
-                mtime,
-                desc,
-            )?;
-        }
-        if let Some(rp) = project.get("requires-python").and_then(|v| v.as_str()) {
-            insert_node(
-                conn,
-                "project/requires-python",
-                "requires-python",
-                0,
-                rp.len() as i64,
-                mtime,
-                rp,
-            )?;
+        for key in ["name", "version", "description", "requires-python"] {
+            if let Some(val) = project.get(key).and_then(|v| v.as_str()) {
+                named_node(conn, project_dir, key, 0, val.len() as i64, mtime, val)?;
+            }
         }
 
         // /deps — project.dependencies
         if let Some(deps) = project.get("dependencies").and_then(|v| v.as_array()) {
-            insert_node(conn, "deps", "deps", 1, 0, mtime, "")?;
+            let deps_dir = named_node(conn, 1, "deps", 1, 0, mtime, "")?;
             for raw in deps {
                 if let Some(s) = raw.as_str() {
                     let dep = parse_dep(s).with_context(|| format!("parsing dep: {s}"))?;
-                    let id = format!("deps/{}", dep.name);
-                    insert_node(
+                    named_node(
                         conn,
-                        &id,
+                        deps_dir,
                         &dep.name,
                         0,
                         dep.version_spec.len() as i64,
@@ -135,17 +146,15 @@ pub fn project_pyproject_into(content: &str, conn: &Connection) -> Result<()> {
     // /dev — dependency-groups.dev
     if let Some(groups) = doc.get("dependency-groups").and_then(|v| v.as_table()) {
         for (group_name, entries) in groups {
-            let group_id = group_name.as_str();
-            insert_node(conn, group_id, group_id, 1, 0, mtime, "")?;
+            let group_dir = named_node(conn, 1, group_name, 1, 0, mtime, "")?;
             if let Some(arr) = entries.as_array() {
                 for raw in arr {
                     if let Some(s) = raw.as_str() {
                         let dep = parse_dep(s)
                             .with_context(|| format!("parsing {group_name} dep: {s}"))?;
-                        let id = format!("{group_id}/{}", dep.name);
-                        insert_node(
+                        named_node(
                             conn,
-                            &id,
+                            group_dir,
                             &dep.name,
                             0,
                             dep.version_spec.len() as i64,
@@ -164,19 +173,17 @@ pub fn project_pyproject_into(content: &str, conn: &Connection) -> Result<()> {
             .get("optional-dependencies")
             .and_then(|v| v.as_table())
         {
-            insert_node(conn, "optional", "optional", 1, 0, mtime, "")?;
+            let optional_dir = named_node(conn, 1, "optional", 1, 0, mtime, "")?;
             for (extra_name, entries) in opt {
-                let extra_id = format!("optional/{extra_name}");
-                insert_node(conn, &extra_id, extra_name, 1, 0, mtime, "")?;
+                let extra_dir = named_node(conn, optional_dir, extra_name, 1, 0, mtime, "")?;
                 if let Some(arr) = entries.as_array() {
                     for raw in arr {
                         if let Some(s) = raw.as_str() {
                             let dep = parse_dep(s)
                                 .with_context(|| format!("parsing optional dep: {s}"))?;
-                            let id = format!("{extra_id}/{}", dep.name);
-                            insert_node(
+                            named_node(
                                 conn,
-                                &id,
+                                extra_dir,
                                 &dep.name,
                                 0,
                                 dep.version_spec.len() as i64,
@@ -200,6 +207,30 @@ mod tests {
     use super::*;
 
     use std::io::Cursor;
+
+    /// Resolve a display path and read its record — the v5 read boundary.
+    fn record_at(conn: &Connection, path: &str) -> String {
+        let nid = leyline_schema::resolve_path(conn, path)
+            .unwrap()
+            .unwrap_or_else(|| panic!("path must resolve: {path:?}"));
+        conn.query_row("SELECT record FROM nodes WHERE nid = ?1", [nid], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
+    /// Direct-child count of a display path.
+    fn child_count(conn: &Connection, path: &str) -> i64 {
+        let nid = leyline_schema::resolve_path(conn, path)
+            .unwrap()
+            .unwrap_or_else(|| panic!("path must resolve: {path:?}"));
+        conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE parent_nid = ?1",
+            [nid],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
 
     const GEM_PYPROJECT: &str = r#"
 [project]
@@ -231,32 +262,9 @@ dev = [
         conn.deserialize_read_exact("main", Cursor::new(&bytes), bytes.len(), true)
             .unwrap();
 
-        let name: String = conn
-            .query_row(
-                "SELECT record FROM nodes WHERE id = 'project/name'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(name, "gem");
-
-        let version: String = conn
-            .query_row(
-                "SELECT record FROM nodes WHERE id = 'project/version'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(version, "0.1.0");
-
-        let rp: String = conn
-            .query_row(
-                "SELECT record FROM nodes WHERE id = 'project/requires-python'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(rp, ">=3.11");
+        assert_eq!(record_at(&conn, "project/name"), "gem");
+        assert_eq!(record_at(&conn, "project/version"), "0.1.0");
+        assert_eq!(record_at(&conn, "project/requires-python"), ">=3.11");
     }
 
     #[test]
@@ -267,34 +275,13 @@ dev = [
             .unwrap();
 
         // pyyaml → normalized name
-        let spec: String = conn
-            .query_row(
-                "SELECT record FROM nodes WHERE id = 'deps/pyyaml'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(spec, ">=6.0.2");
+        assert_eq!(record_at(&conn, "deps/pyyaml"), ">=6.0.2");
 
         // google-genai stays hyphenated (PEP 503 normalization)
-        let spec: String = conn
-            .query_row(
-                "SELECT record FROM nodes WHERE id = 'deps/google-genai'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(spec, ">=1.66.0");
+        assert_eq!(record_at(&conn, "deps/google-genai"), ">=1.66.0");
 
         // Count all deps
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM nodes WHERE parent_id = 'deps'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 8);
+        assert_eq!(child_count(&conn, "deps"), 8);
     }
 
     #[test]
@@ -304,14 +291,7 @@ dev = [
         conn.deserialize_read_exact("main", Cursor::new(&bytes), bytes.len(), true)
             .unwrap();
 
-        let spec: String = conn
-            .query_row(
-                "SELECT record FROM nodes WHERE id = 'dev/pytest'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(spec, ">=9.0.2");
+        assert_eq!(record_at(&conn, "dev/pytest"), ">=9.0.2");
     }
 
     #[test]
@@ -330,13 +310,6 @@ security = ["cryptography>=3.0", "pyopenssl>=21.0"]
         conn.deserialize_read_exact("main", Cursor::new(&bytes), bytes.len(), true)
             .unwrap();
 
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM nodes WHERE parent_id = 'optional/security'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(child_count(&conn, "optional/security"), 2);
     }
 }

@@ -42,10 +42,12 @@ fn produce_go_fixture_for_mache() {
     assert!(ast_count > 5, "should have AST byte-range entries");
     assert_eq!(src_count, 1, "one source file");
 
-    // Verify node_kind values that mache's ASTWalker queries
+    // Verify raw kinds that mache's ASTWalker queries (projection-v5:
+    // kinds are interned; the raw string sits in `kinds.raw_kind`).
     let fn_count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM _ast WHERE node_kind = 'function_declaration'",
+            "SELECT COUNT(*) FROM _ast a JOIN kinds k ON k.kind_id = a.kind_id \
+             WHERE k.raw_kind = 'function_declaration'",
             [],
             |r| r.get(0),
         )
@@ -57,7 +59,8 @@ fn produce_go_fixture_for_mache() {
 
     let id_count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM _ast WHERE node_kind = 'identifier'",
+            "SELECT COUNT(*) FROM _ast a JOIN kinds k ON k.kind_id = a.kind_id \
+             WHERE k.raw_kind = 'identifier'",
             [],
             |r| r.get(0),
         )

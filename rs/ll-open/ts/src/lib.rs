@@ -415,7 +415,8 @@ variable "region" {
         // the consumer (mache).
         let block_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _ast WHERE node_kind = 'block'",
+                "SELECT COUNT(*) FROM _ast a JOIN kinds k ON k.kind_id = a.kind_id \
+                 WHERE k.raw_kind = 'block'",
                 [],
                 |r| r.get(0),
             )
@@ -427,7 +428,8 @@ variable "region" {
 
         let attr_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _ast WHERE node_kind = 'attribute'",
+                "SELECT COUNT(*) FROM _ast a JOIN kinds k ON k.kind_id = a.kind_id \
+                 WHERE k.raw_kind = 'attribute'",
                 [],
                 |r| r.get(0),
             )
@@ -505,7 +507,8 @@ variable "region" {
 
         let error_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _ast WHERE node_kind = 'ERROR'",
+                "SELECT COUNT(*) FROM _ast a JOIN kinds k ON k.kind_id = a.kind_id \
+                 WHERE k.raw_kind = 'ERROR'",
                 [],
                 |r| r.get(0),
             )
@@ -528,7 +531,8 @@ variable "region" {
 
         let error_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _ast WHERE node_kind = 'ERROR'",
+                "SELECT COUNT(*) FROM _ast a JOIN kinds k ON k.kind_id = a.kind_id \
+                 WHERE k.raw_kind = 'ERROR'",
                 [],
                 |r| r.get(0),
             )

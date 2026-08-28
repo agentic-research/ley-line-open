@@ -17,11 +17,23 @@ fn seed_projection_file() -> (TempDir, std::path::PathBuf) {
     let temp = TempDir::new().unwrap();
     let db = temp.path().join("graph.db");
     let conn = Connection::open(&db).unwrap();
-    conn.execute_batch(leyline_schema::NODES_TABLE_DDL).unwrap();
-    for (id, record) in [("a.rs", "fn a() {}\n"), ("b.rs", "fn b() {}\n")] {
+    leyline_schema::create_schema(&conn).unwrap();
+    // Two leaf file nodes, minted the v5 way (kind 0, record = content —
+    // the mount-write shape CDC activation consumes).
+    for (rel, record) in [("a.rs", "fn a() {}\n"), ("b.rs", "fn b() {}\n")] {
+        let fid = leyline_schema::ensure_file_id(&conn, rel).unwrap();
+        let dir = leyline_schema::ensure_dir_nodes(&conn, rel, 7).unwrap();
+        let name_id = leyline_schema::intern_name(&conn, rel).unwrap();
         conn.execute(
-            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES (?1, ?1, 0, ?2, 7, ?3)",
-            params![id, record.len() as i64, record],
+            "INSERT OR REPLACE INTO nodes (nid, parent_nid, name_id, kind, ord, size, mtime, record) \
+             VALUES (?1, ?2, ?3, 0, 0, ?4, 7, ?5)",
+            params![
+                leyline_schema::file_nid(fid, 0),
+                leyline_schema::dir_nid(dir),
+                name_id,
+                record.len() as i64,
+                record
+            ],
         )
         .unwrap();
     }

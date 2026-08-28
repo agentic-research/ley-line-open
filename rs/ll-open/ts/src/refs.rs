@@ -123,40 +123,46 @@ pub enum ExtractedRef {
 /// Insert extracted refs into SQLite tables.
 ///
 /// Universal — works with output from any language extractor.
+///
+/// projection-v5 (bead `ley-line-open-17c271`): the occurrence tables key on
+/// integer nids, while `ExtractedRef` correlates by the extraction
+/// pipeline's per-file string ids. The PRODUCTION writer (`cmd_parse`)
+/// translates those strings to `(file_id << 24) | ordinal` nids at
+/// batch-insert time, where the file's pre-order ordinal assignment is in
+/// hand. This helper — exercised by the per-language extraction tests, which
+/// assert on tokens/qualifiers rather than ids — has no ordinal assignment
+/// to consult, so it interns each distinct id string via the arena's `names`
+/// table: stable per database, collision-free, and honest about being a
+/// correlation id rather than a real node address.
 pub fn insert_extracted_refs(
     conn: &rusqlite::Connection,
     refs: &[ExtractedRef],
 ) -> anyhow::Result<()> {
+    let mut nid_of = |id: &str| leyline_schema::intern_name(conn, id);
     for r in refs {
         match r {
             ExtractedRef::Def {
                 token,
                 node_id,
-                source_id,
+                source_id: _,
                 container_node_id,
                 canonical_kind,
-            } => crate::schema::insert_def(
-                conn,
-                token,
-                node_id,
-                source_id,
-                container_node_id.as_deref(),
-                *canonical_kind,
-            )?,
+            } => {
+                let nid = nid_of(node_id)?;
+                let container = container_node_id.as_deref().map(&mut nid_of).transpose()?;
+                crate::schema::insert_def(conn, token, nid, container, *canonical_kind)?
+            }
             ExtractedRef::Ref {
                 token,
                 node_id,
-                source_id,
+                source_id: _,
                 container_node_id,
                 qualifier,
-            } => crate::schema::insert_ref(
-                conn,
-                token,
-                node_id,
-                source_id,
-                container_node_id.as_deref(),
-                qualifier.as_deref(),
-            )?,
+            } => {
+                let nid = nid_of(node_id)?;
+                let container = container_node_id.as_deref().map(&mut nid_of).transpose()?;
+                crate::schema::insert_ref(conn, token, nid, container, qualifier.as_deref())?
+            }
             ExtractedRef::Import {
                 alias,
                 path,

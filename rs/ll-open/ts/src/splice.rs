@@ -13,41 +13,42 @@ use crate::project::project_ast_with_source;
 ///
 /// Reads the node's `start_byte`/`end_byte` from `_ast` and the original source
 /// from `_source`, then performs: `source[..start] + new_text + source[end..]`.
-pub fn splice(conn: &Connection, node_id: &str, new_text: &str) -> Result<Vec<u8>> {
+///
+/// projection-v5: keyed on the integer `nid`; the node's file is `nid >> 24`,
+/// joined to `_source.file_id`. Callers holding a display path resolve it
+/// first via [`crate::schema::resolve_path`].
+pub fn splice(conn: &Connection, nid: i64, new_text: &str) -> Result<Vec<u8>> {
     // Look up byte range from _ast
-    let (source_id, start_byte, end_byte): (String, usize, usize) = conn
+    let (start_byte, end_byte): (usize, usize) = conn
         .query_row(
-            "SELECT source_id, start_byte, end_byte FROM _ast WHERE node_id = ?1",
-            [node_id],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get::<_, i64>(1)? as usize,
-                    r.get::<_, i64>(2)? as usize,
-                ))
-            },
+            "SELECT start_byte, end_byte FROM _ast WHERE nid = ?1",
+            [nid],
+            |r| Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as usize)),
         )
-        .with_context(|| format!("node '{}' not found in _ast table", node_id))?;
+        .with_context(|| format!("node {nid} not found in _ast table"))?;
+    let file_id = leyline_schema::nid_file_id(nid)
+        .with_context(|| format!("node {nid} is a directory nid — nothing to splice"))?;
 
     // Read original source — inline content or from disk via path reference.
     let source: Vec<u8> = conn
         .query_row(
-            "SELECT content, path FROM _source WHERE id = ?1",
-            [&source_id],
+            "SELECT id, content, path FROM _source WHERE file_id = ?1",
+            [file_id],
             |r| {
-                let content: Option<Vec<u8>> = r.get(0)?;
-                let path: Option<String> = r.get(1)?;
-                Ok((content, path))
+                let id: String = r.get(0)?;
+                let content: Option<Vec<u8>> = r.get(1)?;
+                let path: Option<String> = r.get(2)?;
+                Ok((id, content, path))
             },
         )
-        .with_context(|| format!("source '{}' not found in _source table", source_id))
-        .and_then(|(content, path)| {
+        .with_context(|| format!("source for file_id {file_id} not found in _source table"))
+        .and_then(|(id, content, path)| {
             if let Some(c) = content {
                 Ok(c)
             } else if let Some(p) = path {
                 std::fs::read(&p).with_context(|| format!("read source file: {p}"))
             } else {
-                bail!("source '{}' has neither content nor path", source_id)
+                bail!("source '{id}' has neither content nor path")
             }
         })?;
 
@@ -149,21 +150,23 @@ pub fn reproject(
 ///
 /// Returns the modified source bytes on success. If the splice produces
 /// invalid syntax, the database is left unchanged.
-pub fn splice_and_reproject(conn: &Connection, node_id: &str, new_text: &str) -> Result<Vec<u8>> {
-    // Look up source metadata for reprojection
+pub fn splice_and_reproject(conn: &Connection, nid: i64, new_text: &str) -> Result<Vec<u8>> {
+    // Look up source metadata for reprojection. The `_ast` existence check
+    // rides on the JOIN: a nid with no `_ast` row fails here, before any
+    // bytes move.
     let (source_id, language_name): (String, String) = conn
         .query_row(
             "SELECT s.id, s.language FROM _source s \
-             JOIN _ast a ON a.source_id = s.id \
-             WHERE a.node_id = ?1",
-            [node_id],
+             JOIN _ast a ON (a.nid >> 24) = s.file_id \
+             WHERE a.nid = ?1",
+            [nid],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .with_context(|| format!("node '{}' not found in _ast/_source tables", node_id))?;
+        .with_context(|| format!("node {nid} not found in _ast/_source tables"))?;
 
     let language = crate::languages::TsLanguage::from_name(&language_name)?;
 
-    let new_source = splice(conn, node_id, new_text)?;
+    let new_source = splice(conn, nid, new_text)?;
     reproject(
         conn,
         &source_id,
@@ -202,7 +205,7 @@ pub fn reproject_source(conn: &Connection, source_id: &str, new_source: &[u8]) -
 ///
 /// Takes raw SQLite bytes (as produced by `parse`/`parse_with_source`),
 /// performs the splice + reproject, and returns new serialized bytes.
-pub fn splice_db_bytes(db_bytes: &[u8], node_id: &str, new_text: &str) -> Result<Vec<u8>> {
+pub fn splice_db_bytes(db_bytes: &[u8], node_path: &str, new_text: &str) -> Result<Vec<u8>> {
     use std::io::Cursor;
 
     let mut conn = Connection::open_in_memory()?;
@@ -210,7 +213,12 @@ pub fn splice_db_bytes(db_bytes: &[u8], node_id: &str, new_text: &str) -> Result
     conn.deserialize_read_exact("main", cursor, db_bytes.len(), true)
         .context("failed to deserialize .db bytes")?;
 
-    splice_and_reproject(&conn, node_id, new_text)?;
+    // projection-v5: the caller addresses the node by its DISPLAY path (the
+    // full rendered path, file segment included); the projection keys on
+    // integer nids, so resolve at this boundary.
+    let nid = crate::schema::resolve_path(&conn, node_path)?
+        .with_context(|| format!("node path {node_path:?} does not resolve in this projection"))?;
+    splice_and_reproject(&conn, nid, new_text)?;
 
     let data = conn.serialize("main")?;
     Ok(data.to_vec())
@@ -234,15 +242,26 @@ mod tests {
             .unwrap()
     }
 
-    fn get_record(conn: &Connection, id: &str) -> String {
-        conn.query_row("SELECT record FROM nodes WHERE id = ?1", [id], |r| r.get(0))
+    /// Resolve a display path to its nid — the v5 addressing boundary.
+    fn nid_of(conn: &Connection, path: &str) -> i64 {
+        crate::schema::resolve_path(conn, path)
             .unwrap()
+            .unwrap_or_else(|| panic!("path must resolve: {path:?}"))
     }
 
-    fn get_ast_range(conn: &Connection, node_id: &str) -> (i64, i64) {
+    fn get_record(conn: &Connection, path: &str) -> String {
+        let nid = nid_of(conn, path);
+        conn.query_row("SELECT record FROM nodes WHERE nid = ?1", [nid], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
+    fn get_ast_range(conn: &Connection, path: &str) -> (i64, i64) {
+        let nid = nid_of(conn, path);
         conn.query_row(
-            "SELECT start_byte, end_byte FROM _ast WHERE node_id = ?1",
-            [node_id],
+            "SELECT start_byte, end_byte FROM _ast WHERE nid = ?1",
+            [nid],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap()
@@ -262,21 +281,22 @@ mod tests {
     #[test]
     fn splice_replaces_byte_range() {
         let conn = setup_html(b"<p>Hello</p>");
-        // Root is "", children are "element", "element/text", etc.
-        let (start, end) = get_ast_range(&conn, "element/text");
+        // The file node is "test.html"; children render as
+        // "test.html/element", "test.html/element/text", etc.
+        let (start, end) = get_ast_range(&conn, "test.html/element/text");
         assert_eq!(start, 3);
         assert_eq!(end, 8);
 
-        let result = splice(&conn, "element/text", "World").unwrap();
+        let result = splice(&conn, nid_of(&conn, "test.html/element/text"), "World").unwrap();
         assert_eq!(result, b"<p>World</p>");
     }
 
     #[cfg(feature = "html")]
     #[test]
     fn splice_at_start() {
-        // The root node ("") spans the entire source
+        // The file's own node (ordinal 0, the AST root) spans the entire source
         let conn = setup_html(b"<p>Hi</p>");
-        let result = splice(&conn, "", "<div>New</div>").unwrap();
+        let result = splice(&conn, nid_of(&conn, "test.html"), "<div>New</div>").unwrap();
         assert_eq!(result, b"<div>New</div>");
     }
 
@@ -284,7 +304,12 @@ mod tests {
     #[test]
     fn splice_expand() {
         let conn = setup_html(b"<p>Hi</p>");
-        let result = splice(&conn, "element/text", "Hello World").unwrap();
+        let result = splice(
+            &conn,
+            nid_of(&conn, "test.html/element/text"),
+            "Hello World",
+        )
+        .unwrap();
         assert_eq!(result, b"<p>Hello World</p>");
     }
 
@@ -292,7 +317,7 @@ mod tests {
     #[test]
     fn splice_delete() {
         let conn = setup_html(b"<p>Hello</p>");
-        let result = splice(&conn, "element/text", "").unwrap();
+        let result = splice(&conn, nid_of(&conn, "test.html/element/text"), "").unwrap();
         assert_eq!(result, b"<p></p>");
     }
 
@@ -314,7 +339,7 @@ mod tests {
         assert_eq!(count_ast(&conn), ast_before);
 
         // Text node now has "World"
-        assert_eq!(get_record(&conn, "element/text"), "World");
+        assert_eq!(get_record(&conn, "test.html/element/text"), "World");
     }
 
     #[cfg(feature = "html")]
@@ -322,15 +347,17 @@ mod tests {
     fn splice_and_reproject_roundtrip() {
         let conn = setup_html(b"<p>Hello</p>");
 
-        let new_source = splice_and_reproject(&conn, "element/text", "Goodbye").unwrap();
+        let new_source =
+            splice_and_reproject(&conn, nid_of(&conn, "test.html/element/text"), "Goodbye")
+                .unwrap();
         assert_eq!(new_source, b"<p>Goodbye</p>");
 
         // DB reflects the change
         assert_eq!(get_source(&conn), b"<p>Goodbye</p>");
-        assert_eq!(get_record(&conn, "element/text"), "Goodbye");
+        assert_eq!(get_record(&conn, "test.html/element/text"), "Goodbye");
 
         // Byte ranges updated
-        let (start, end) = get_ast_range(&conn, "element/text");
+        let (start, end) = get_ast_range(&conn, "test.html/element/text");
         assert_eq!(start, 3);
         assert_eq!(end, 10); // 3 + len("Goodbye")
     }
@@ -340,16 +367,20 @@ mod tests {
     fn splice_syntax_error_rejected() {
         let conn = setup_html(b"<p>Hello</p>");
         let original_source = get_source(&conn);
-        let original_record = get_record(&conn, "element/text");
+        let original_record = get_record(&conn, "test.html/element/text");
 
         // Splice in something that produces a parse error.
         // tree-sitter HTML is very tolerant, so we test the mechanism:
         // if it errs, DB must be unchanged.
-        let result = splice_and_reproject(&conn, "element", "<div><p>unclosed");
+        let result = splice_and_reproject(
+            &conn,
+            nid_of(&conn, "test.html/element"),
+            "<div><p>unclosed",
+        );
 
         if result.is_err() {
             assert_eq!(get_source(&conn), original_source);
-            assert_eq!(get_record(&conn, "element/text"), original_record);
+            assert_eq!(get_record(&conn, "test.html/element/text"), original_record);
         }
         // If it succeeds (error-tolerant parser), that's also valid —
         // the syntax-error guard is most valuable for strict grammars.
@@ -359,7 +390,8 @@ mod tests {
     #[test]
     fn splice_nonexistent_node_fails() {
         let conn = setup_html(b"<p>Hello</p>");
-        let result = splice(&conn, "nonexistent/node", "text");
+        // A nid far outside any interned file's populated range.
+        let result = splice(&conn, 1 << 40, "text");
         assert!(result.is_err());
     }
 
@@ -369,12 +401,12 @@ mod tests {
         let conn = setup_html(b"<p>Hello</p>");
 
         // First splice
-        splice_and_reproject(&conn, "element/text", "World").unwrap();
+        splice_and_reproject(&conn, nid_of(&conn, "test.html/element/text"), "World").unwrap();
         assert_eq!(get_source(&conn), b"<p>World</p>");
 
         // Second splice on the updated tree
-        splice_and_reproject(&conn, "element/text", "Final").unwrap();
+        splice_and_reproject(&conn, nid_of(&conn, "test.html/element/text"), "Final").unwrap();
         assert_eq!(get_source(&conn), b"<p>Final</p>");
-        assert_eq!(get_record(&conn, "element/text"), "Final");
+        assert_eq!(get_record(&conn, "test.html/element/text"), "Final");
     }
 }

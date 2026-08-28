@@ -103,13 +103,31 @@ pub const IR_SCHEMA_VERSION: &str = "merkle-ast-v2";
 ///   does not list generated columns AT ALL (only `pragma_table_xinfo`
 ///   does), and the `sqlite_master` DDL text changes, so a byte-identical
 ///   pin needs re-pinning.
+/// - `projection-v5` — file-scoped integer nids (bead `ley-line-open-17c271`).
+///   Every node-keyed column re-types: `nodes.id`/`_ast.node_id`/
+///   `node_refs.node_id`/`node_defs.node_id`/`_lsp*.node_id` (TEXT ancestry
+///   paths) become integer `nid = (file_id << 24) | ordinal`, directories in
+///   negative space (`-dir_id`); `parent_id` → stored `parent_nid`;
+///   `container_node_id` → `container_nid`; `referrer_node_id` →
+///   `referrer_nid`; sibling `ord` stored. New interning tables `names`/
+///   `dirs`/`files`/`kinds`; `_source` gains `file_id`; `_ast` loses
+///   `source_id`/`node_kind`/`blob_ord` (file = `nid >> 24`, kind interned,
+///   blob ordinal = `nid & 0xFFFFFF`); `node_refs`/`node_defs` lose
+///   `source_id`; `_ast_blob` re-keys on `file_id`; `nodes` loses
+///   `name` (interned `name_id`; AST display names derive from kind + ord).
+///   Display paths are DERIVED: `v_node_path`/`v_node_name` views and the
+///   `node_path`/`resolve_path` resolvers in `leyline-schema`. A pre-v5
+///   arena is REFUSED at parse open (the projection is derived-only —
+///   rebuild by cold reparse), never migrated in place. The capnp wire
+///   surface is untouched: Phase A evicted the locator from every hashed
+///   preimage, which is what makes this a projection-only break.
 ///
 /// Bump on ANY table added or removed, or column added or removed. Two
 /// changes in flight at once need two numbers: v3 and v4 landed in the same
 /// window, and both first claimed v3 — a clean textual merge, because both
 /// wrote the same string, describing two different table shapes. A consumer
 /// reading that would have had no way to tell which one it held.
-pub const PROJECTION_SCHEMA_VERSION: &str = "projection-v4";
+pub const PROJECTION_SCHEMA_VERSION: &str = "projection-v5";
 
 pub const WIRE_FORMAT_MAJOR: u32 = 1;
 

@@ -1,20 +1,25 @@
 //! Core algorithm: walk a tree-sitter AST and project it into the `nodes` table.
 
-use std::collections::HashMap;
-
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use tree_sitter::{Language, Parser, TreeCursor};
 
-use crate::schema::{create_ast_schema, insert_ast, insert_node, insert_source};
+use crate::schema::{
+    create_ast_schema, ensure_dir_nodes, ensure_file_id, file_nid, insert_ast, insert_node,
+    insert_source, intern_kind,
+};
 
 /// Walk the tree-sitter AST and insert all named nodes into the database,
 /// storing source text and byte-range mappings for bidirectional splicing.
 ///
-/// - Named nodes with named children become directories (kind=1, empty record).
-/// - Named leaf nodes become files (kind=0, record = plain text from source).
+/// - Named nodes with named children become containers (kind=1, empty record).
+/// - Named leaf nodes become leaves (kind=0, record = plain text from source).
 /// - Anonymous nodes (punctuation, operators) are skipped.
-/// - Siblings with the same `kind()` get disambiguated: `element_0`, `element_1`, etc.
+/// - projection-v5 (bead `ley-line-open-17c271`): a node's key is
+///   `nid = (file_id << 24) | ordinal` (pre-order rank, ordinal 0 = the
+///   file's own node / AST root); `parent_nid` and `ord` (sibling index in
+///   source order) are stored; the display name derives from the interned
+///   kind + `ord` at read time (`node_path` / `v_node_path`).
 /// - Original source stored in `_source` table; byte ranges in `_ast` table.
 pub fn project_ast_with_source(
     content: &[u8],
@@ -25,8 +30,10 @@ pub fn project_ast_with_source(
 ) -> Result<()> {
     create_ast_schema(conn)?;
 
+    let file_id = ensure_file_id(conn, source_id)?;
+
     // Store original source
-    insert_source(conn, source_id, language_name, content)?;
+    insert_source(conn, source_id, language_name, content, file_id)?;
 
     let mut parser = Parser::new();
     parser
@@ -42,24 +49,54 @@ pub fn project_ast_with_source(
         .unwrap_or_default()
         .as_nanos() as i64;
 
-    // Insert root directory node
+    // Directory chain + the file's own node (ordinal 0, doubling as the AST
+    // root — same one-row identity the pre-v5 scheme gave `id = source_id`).
+    let dir_id = ensure_dir_nodes(conn, source_id, mtime)?;
+    let base = file_nid(file_id, 0);
+    let file_name = source_id
+        .rsplit_once('/')
+        .map(|(_, n)| n)
+        .unwrap_or(source_id);
+    let name_id = crate::schema::intern_name(conn, file_name)?;
+
     let root = tree.root_node();
-    insert_node(conn, "", "", 1, 0, mtime, "")?;
+    let root_kind_id = intern_kind(conn, language_name, root.kind())?;
+    conn.execute(
+        "INSERT OR REPLACE INTO nodes (nid, parent_nid, name_id, kind_id, kind, ord, size, mtime, record) \
+         VALUES (?1, ?2, ?3, ?4, 1, 0, 0, ?5, '')",
+        rusqlite::params![
+            base,
+            crate::schema::dir_nid(dir_id),
+            name_id,
+            root_kind_id,
+            mtime
+        ],
+    )?;
     insert_ast(
         conn,
-        "",
-        source_id,
-        root.kind(),
+        base,
+        root_kind_id,
         root.start_byte(),
         root.end_byte(),
         root.start_position().row,
         root.start_position().column,
         root.end_position().row,
         root.end_position().column,
+        None,
     )?;
 
     let mut cursor = root.walk();
-    walk_children(content, &mut cursor, "", mtime, conn, source_id)?;
+    let mut next_ordinal: i64 = 1;
+    walk_children(
+        content,
+        &mut cursor,
+        base,
+        base,
+        &mut next_ordinal,
+        mtime,
+        conn,
+        language_name,
+    )?;
 
     Ok(())
 }
@@ -69,27 +106,28 @@ pub fn project_ast(content: &[u8], language: Language, conn: &Connection) -> Res
     project_ast_with_source(content, language, conn, "_default", "unknown")
 }
 
-/// Recursively walk named children of the current cursor node.
+/// Recursively walk named children of the current cursor node, assigning
+/// pre-order ordinals within the file's nid range.
+#[allow(clippy::too_many_arguments)]
 fn walk_children(
     content: &[u8],
     cursor: &mut TreeCursor,
-    parent_id: &str,
+    base: i64,
+    parent_nid: i64,
+    next_ordinal: &mut i64,
     mtime: i64,
     conn: &Connection,
-    source_id: &str,
+    language_name: &str,
 ) -> Result<()> {
     let node = cursor.node();
 
-    // Collect named children and count kinds for disambiguation
+    // Collect named children in source order.
     let mut children = Vec::new();
-    let mut kind_counts: HashMap<&str, usize> = HashMap::new();
-
     let mut child_cursor = node.walk();
     if child_cursor.goto_first_child() {
         loop {
             let child = child_cursor.node();
             if child.is_named() {
-                *kind_counts.entry(child.kind()).or_insert(0) += 1;
                 children.push(child);
             }
             if !child_cursor.goto_next_sibling() {
@@ -98,53 +136,73 @@ fn walk_children(
         }
     }
 
-    // Track per-kind index for disambiguation
-    let mut kind_indices: HashMap<&str, usize> = HashMap::new();
-
-    for child in &children {
-        let kind = child.kind();
-        let needs_suffix = kind_counts[kind] > 1;
-
-        let name = if needs_suffix {
-            let idx = kind_indices.entry(kind).or_insert(0);
-            let n = format!("{kind}_{idx}");
-            *idx += 1;
-            n
-        } else {
-            kind.to_string()
-        };
-
-        let id = if parent_id.is_empty() {
-            name.clone()
-        } else {
-            format!("{parent_id}/{name}")
-        };
+    for (ord, child) in children.iter().enumerate() {
+        let ordinal = *next_ordinal;
+        *next_ordinal += 1;
+        anyhow::ensure!(
+            ordinal <= leyline_schema::NID_ORDINAL_MASK,
+            "file exceeds the 24-bit per-file ordinal space ({} nodes)",
+            leyline_schema::NID_ORDINAL_MASK + 1
+        );
+        let nid = base | ordinal;
+        let kind_id = intern_kind(conn, language_name, child.kind())?;
 
         let has_named_children = has_named_child(child);
 
-        // Insert _ast row for every named node (both dirs and leaves)
+        // Insert _ast row for every named node (both containers and leaves)
         insert_ast(
             conn,
-            &id,
-            source_id,
-            kind,
+            nid,
+            kind_id,
             child.start_byte(),
             child.end_byte(),
             child.start_position().row,
             child.start_position().column,
             child.end_position().row,
             child.end_position().column,
+            None,
         )?;
 
         if has_named_children {
-            // Directory node — empty record
-            insert_node(conn, &id, &name, 1, 0, mtime, "")?;
+            // Container node — empty record
+            insert_node(
+                conn,
+                nid,
+                Some(parent_nid),
+                None,
+                Some(kind_id),
+                1,
+                ord as i64,
+                0,
+                mtime,
+                "",
+            )?;
             let mut sub_cursor = child.walk();
-            walk_children(content, &mut sub_cursor, &id, mtime, conn, source_id)?;
+            walk_children(
+                content,
+                &mut sub_cursor,
+                base,
+                nid,
+                next_ordinal,
+                mtime,
+                conn,
+                language_name,
+            )?;
         } else {
-            // Leaf (file) node — record is plain text from source
+            // Leaf node — record is plain text from source
             let text = child.utf8_text(content).unwrap_or("");
-            insert_node(conn, &id, &name, 0, text.len() as i64, mtime, text)?;
+            insert_node(
+                conn,
+                nid,
+                Some(parent_nid),
+                None,
+                Some(kind_id),
+                0,
+                ord as i64,
+                text.len() as i64,
+                mtime,
+                text,
+            )?;
         }
     }
 
@@ -181,17 +239,30 @@ mod tests {
             .unwrap()
     }
 
-    fn get_node(conn: &Connection, id: &str) -> (String, i32, String) {
-        conn.query_row(
-            "SELECT name, kind, record FROM nodes WHERE id = ?1",
-            [id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .unwrap()
+    /// Resolve a rendered path to its row — the v5 read path: the display
+    /// string is derived, so the test drives `resolve_path` exactly as a
+    /// consumer would. Returns `(name, kind, record)`; the name is the
+    /// path's last segment (which is precisely what the pre-v5 stored
+    /// `name` column held).
+    fn get_node(conn: &Connection, path: &str) -> (String, i32, String) {
+        let nid = crate::schema::resolve_path(conn, path)
+            .unwrap()
+            .unwrap_or_else(|| panic!("path must resolve: {path:?}"));
+        let (kind, record): (i32, String) = conn
+            .query_row(
+                "SELECT kind, COALESCE(record, '') FROM nodes WHERE nid = ?1",
+                [nid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let name = path.rsplit_once('/').map(|(_, n)| n).unwrap_or(path);
+        (name.to_string(), kind, record)
     }
 
     fn all_ids(conn: &Connection) -> Vec<String> {
-        let mut stmt = conn.prepare("SELECT id FROM nodes ORDER BY id").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT path FROM v_node_path ORDER BY path")
+            .unwrap();
         stmt.query_map([], |r| r.get(0))
             .unwrap()
             .collect::<Result<Vec<String>, _>>()
@@ -254,7 +325,8 @@ mod tests {
         // Leaf "text" node record should be plain text, not JSON
         let record: String = conn
             .query_row(
-                "SELECT record FROM nodes WHERE name = 'text' AND kind = 0",
+                "SELECT record FROM nodes n JOIN kinds k USING (kind_id) \
+                 WHERE k.raw_kind = 'text' AND n.kind = 0",
                 [],
                 |r| r.get(0),
             )
@@ -272,7 +344,8 @@ mod tests {
         // Dir "element" node record should be empty
         let record: String = conn
             .query_row(
-                "SELECT record FROM nodes WHERE name = 'element' AND kind = 1",
+                "SELECT record FROM nodes n JOIN kinds k USING (kind_id) \
+                 WHERE k.raw_kind = 'element' AND n.kind = 1 LIMIT 1",
                 [],
                 |r| r.get(0),
             )
@@ -295,8 +368,9 @@ mod tests {
         // Check that a leaf node has correct byte range
         let (start_byte, end_byte): (i64, i64) = conn
             .query_row(
-                "SELECT start_byte, end_byte FROM _ast WHERE node_id = \
-                 (SELECT id FROM nodes WHERE name = 'text' AND kind = 0 LIMIT 1)",
+                "SELECT start_byte, end_byte FROM _ast WHERE nid = \
+                 (SELECT nid FROM nodes n JOIN kinds k USING (kind_id) \
+                  WHERE k.raw_kind = 'text' AND n.kind = 0 LIMIT 1)",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )

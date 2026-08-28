@@ -7,8 +7,8 @@
 //!    `CREATE TABLE` inside a Go string literal — marked by
 //!    `queries/go/injections.scm` (`@injection.content` +
 //!    `(#set! injection.language "sql")`, upstream tree-sitter
-//!    conventions) — produces a `node_defs` row whose `source_id` is
-//!    the HOST `.go` file and whose `container_node_id` is the host's
+//!    conventions) — produces a `node_defs` row whose nid lives in the
+//!    HOST `.go` file's range and whose `container_nid` is the host's
 //!    enclosing Go function. mache reads facts per-file; the injected
 //!    subtree has no file of its own.
 //!
@@ -19,11 +19,13 @@
 //!    re-hash a Go file that contains SQL. The off-switch is the
 //!    `LLO_DISABLE_INJECTIONS=1` falsification seam.
 //!
-//! 3. **Injected node identity is pinned.** Injected root node_id =
-//!    `{host_literal_node_id}#inj{k}`; descendants follow the host
-//!    fold's `{parent}/{kind}[_{idx}]` naming. `#` cannot occur in
-//!    host node_ids (they are path + grammar-kind derived), so the
-//!    scheme cannot collide.
+//! 3. **Injected node identity is pinned.** projection-v5 replaced the
+//!    pre-v5 `{host_literal_node_id}#inj{k}` string id: an injected
+//!    fact row carries a real nid in the host file's range whose
+//!    ordinal sits PAST the host's `_ast` count, in fold order, with no
+//!    `_ast` and no `nodes` row of its own. "Has no `_ast` row" IS the
+//!    v5 test for injectedness — the property the `#inj` infix used to
+//!    spell, now structural instead of lexical.
 //!
 //! 4. **Own-CA-root dedup.** The injected `create_table` subtree's
 //!    `node_hash` equals the hash the SAME statement bytes produce in
@@ -78,7 +80,7 @@ const SQL_STMT: &str = "CREATE TABLE users (id INTEGER, name TEXT)";
 
 /// Go fixture: one SQL def site (raw string) + one SQL ref site
 /// (interpreted string), both inside named functions so the
-/// container_node_id assertion has a target.
+/// container_nid assertion has a target.
 fn go_fixture() -> TempDir {
     let td = TempDir::new().unwrap();
     fs::write(
@@ -108,47 +110,69 @@ fn parse_pass(db_path: &Path, repo: &Path, lang: &str) -> cmd_parse::ParseResult
     cmd_parse::parse_into_conn(&conn, repo, Some(lang), None).unwrap()
 }
 
-/// (token, node_id, source_id, container_node_id, canonical_kind,
-/// hex(node_hash)) for every node_defs row, token-ordered.
-#[allow(clippy::type_complexity)]
-fn defs_rows(
-    db_path: &Path,
-) -> Vec<(
-    String,
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-)> {
+/// One `node_defs` row, projection-v5 shaped.
+struct DefRow {
+    token: String,
+    /// The def site's nid. Injected rows have no `_ast`/`nodes` row, so
+    /// this is the only handle on them.
+    nid: i64,
+    /// Rel path of the host file (`_source.id` via `nid >> 24`).
+    file: String,
+    /// Container rendered as its display path, `None` for a NULL container.
+    container: Option<String>,
+    canonical_kind: Option<String>,
+    node_hash: Option<String>,
+}
+
+/// Every node_defs row, token-ordered.
+///
+/// projection-v5: `source_id` is gone (the file is `nid >> 24`, joined
+/// through `_source.file_id`) and `container_node_id` is the integer
+/// `container_nid`, rendered here through `v_node_path` so the
+/// assertions stay path-shaped. The container LEFT JOIN is deliberate —
+/// a container can be NULL, and an injected container would have no
+/// path row at all.
+fn defs_rows(db_path: &Path) -> Vec<DefRow> {
     let conn = Connection::open(db_path).unwrap();
     let mut stmt = conn
         .prepare(
-            "SELECT token, node_id, source_id, container_node_id, canonical_kind, \
-             lower(hex(node_hash)) FROM node_defs ORDER BY token, node_id",
+            "SELECT d.token, d.nid, s.id, p.path, d.canonical_kind, \
+             lower(hex(d.node_hash)) \
+             FROM node_defs d \
+             JOIN _source s ON s.file_id = d.nid >> 24 \
+             LEFT JOIN v_node_path p ON p.nid = d.container_nid \
+             ORDER BY d.token, d.nid",
         )
         .unwrap();
     stmt.query_map([], |r| {
-        Ok((
-            r.get(0)?,
-            r.get(1)?,
-            r.get(2)?,
-            r.get(3)?,
-            r.get(4)?,
-            r.get(5)?,
-        ))
+        Ok(DefRow {
+            token: r.get(0)?,
+            nid: r.get(1)?,
+            file: r.get(2)?,
+            container: r.get(3)?,
+            canonical_kind: r.get(4)?,
+            node_hash: r.get(5)?,
+        })
     })
     .unwrap()
     .map(|r| r.unwrap())
     .collect()
 }
 
-/// Full host occurrence map: (node_id, hex(node_hash)) for every `_ast`
-/// row, node_id-ordered. THE host-structural-identity snapshot.
+/// Full host occurrence map: (display path, hex(node_hash)) for every
+/// `_ast` row, path-ordered. THE host-structural-identity snapshot.
+///
+/// Rendered through `v_node_path` rather than compared as raw nids: the
+/// on/off arenas are separate databases, so the pre-v5 path-shaped key
+/// is what makes the cross-db comparison meaningful.
 fn ast_hash_map(db_path: &Path) -> Vec<(String, String)> {
     let conn = Connection::open(db_path).unwrap();
     let mut stmt = conn
-        .prepare("SELECT node_id, lower(hex(node_hash)) FROM _ast ORDER BY node_id")
+        .prepare(
+            "SELECT p.path, lower(hex(a.node_hash)) FROM _ast a \
+             JOIN v_node_path p ON p.nid = a.nid \
+             ORDER BY p.path",
+        )
         .unwrap();
     stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
         .unwrap()
@@ -156,11 +180,24 @@ fn ast_hash_map(db_path: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Host node_id of the fixture's raw-string SQL literal, derived from
-/// the fold's path naming (every hop is the only named child of its
-/// kind, so no `_{idx}` suffixes appear).
-const LITERAL_NODE_ID: &str = "app.go/function_declaration_0/block/statement_list\
+/// Display path of the fixture's raw-string SQL literal — the host node
+/// the injection is anchored at. Every hop is the only named child of
+/// its kind, so no `_{idx}` suffixes appear. Under projection-v5 this is
+/// a path to `resolve_path`, not a stored id.
+const LITERAL_NODE_PATH: &str = "app.go/function_declaration_0/block/statement_list\
 /expression_statement/call_expression/argument_list/raw_string_literal";
+
+/// The count of `_ast` rows in `file_id`'s range — the first ordinal an
+/// injected node can occupy.
+fn ast_count(conn: &Connection, file_id: i64) -> i64 {
+    let (lo, hi) = leyline_ts::schema::file_nid_range(file_id);
+    conn.query_row(
+        "SELECT COUNT(*) FROM _ast WHERE nid BETWEEN ?1 AND ?2",
+        [lo, hi],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
 
 #[test]
 fn inj_sql_create_table_def_lands_on_host_file() {
@@ -175,34 +212,54 @@ fn inj_sql_create_table_def_lands_on_host_file() {
     parse_pass(&db_path, repo.path(), "go");
 
     let defs = defs_rows(&db_path);
-    let users: Vec<_> = defs.iter().filter(|d| d.0 == "users").collect();
+    let users: Vec<_> = defs.iter().filter(|d| d.token == "users").collect();
     assert_eq!(
         users.len(),
         1,
-        "exactly one injected `users` def expected; got {users:?}"
+        "exactly one injected `users` def expected; got {} rows",
+        users.len(),
     );
-    let (_, node_id, source_id, container, kind, node_hash) = users[0];
+    let users = users[0];
     assert_eq!(
-        source_id, "app.go",
-        "injected def must carry the HOST file as source_id (mache reads per-file)"
+        users.file, "app.go",
+        "injected def's nid must live in the HOST file's range (mache reads per-file)"
     );
     assert_eq!(
-        container.as_deref(),
+        users.container.as_deref(),
         Some("app.go/function_declaration_0"),
         "injected def must be contained by the host's enclosing Go function"
     );
     assert_eq!(
-        kind.as_deref(),
+        users.canonical_kind.as_deref(),
         Some("type"),
         "create_table maps to κ `type` (languages.rs SQL arm)"
     );
     assert!(
-        node_id.starts_with(&format!("{LITERAL_NODE_ID}#inj0/")),
-        "injected node_id must be rooted at the host literal's node_id + #inj0; got {node_id}"
+        users.node_hash.is_some(),
+        "injected def must carry its own content-addressed node_hash"
+    );
+
+    // The injection's anchor is still a real host node — the host
+    // literal resolves, and the injected fact takes an ordinal past the
+    // whole host AST rather than displacing any of it.
+    let conn = Connection::open(&db_path).unwrap();
+    assert!(
+        leyline_ts::schema::resolve_path(&conn, LITERAL_NODE_PATH)
+            .unwrap()
+            .is_some(),
+        "the host literal the injection anchors at must be a real `_ast` node"
+    );
+    let file_id = leyline_ts::schema::lookup_file_id(&conn, "app.go")
+        .unwrap()
+        .expect("app.go must be interned");
+    assert_eq!(
+        users.nid >> 24,
+        file_id,
+        "injected def's nid must be in app.go's range"
     );
     assert!(
-        node_hash.is_some(),
-        "injected def must carry its own content-addressed node_hash"
+        leyline_ts::schema::nid_ordinal(users.nid).unwrap() >= ast_count(&conn, file_id),
+        "injected ordinals come PAST the host's `_ast` count",
     );
 }
 
@@ -218,14 +275,17 @@ fn inj_sql_ref_site_lands_on_host_file() {
     parse_pass(&db_path, repo.path(), "go");
 
     let conn = Connection::open(&db_path).unwrap();
-    let (source_id, container): (String, Option<String>) = conn
+    let (file, container): (String, Option<String>) = conn
         .query_row(
-            "SELECT source_id, container_node_id FROM node_refs WHERE token = 'users'",
+            "SELECT s.id, p.path FROM node_refs r \
+             JOIN _source s ON s.file_id = r.nid >> 24 \
+             LEFT JOIN v_node_path p ON p.nid = r.container_nid \
+             WHERE r.token = 'users'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .expect("SELECT ... FROM users inside a Go string must emit a `users` ref");
-    assert_eq!(source_id, "app.go");
+    assert_eq!(file, "app.go");
     assert_eq!(
         container.as_deref(),
         Some("app.go/function_declaration_1"),
@@ -234,11 +294,18 @@ fn inj_sql_ref_site_lands_on_host_file() {
 }
 
 #[test]
-fn inj_injected_node_id_scheme_pinned() {
-    // Pin the exact injected node_id: root = host literal + `#inj0`,
-    // descendants follow the host fold's `{parent}/{kind}` naming over
-    // the INJECTED tree (program → statement → create_table; single
-    // named children, no `_{idx}` suffixes).
+fn inj_injected_nid_scheme_pinned() {
+    // projection-v5 replacement for the pre-v5
+    // `{host_literal}#inj0/statement/create_table` string pin: that id
+    // is not stored anywhere any more. What IS observable — and what the
+    // `#inj` infix was standing in for — is the nid's shape:
+    //
+    //   * it is in the host file's range (no file of its own),
+    //   * its ordinal is past the host's `_ast` count, in fold order,
+    //   * it has NO `_ast` row and NO `nodes` row, so it renders no path.
+    //
+    // The last one is the v5 test for "is this fact injected?", which
+    // consumers previously spelled `node_id LIKE '%#inj%'`.
     let _l = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let repo = go_fixture();
     let db_dir = TempDir::new().unwrap();
@@ -246,12 +313,50 @@ fn inj_injected_node_id_scheme_pinned() {
     parse_pass(&db_path, repo.path(), "go");
 
     let defs = defs_rows(&db_path);
-    let users: Vec<_> = defs.iter().filter(|d| d.0 == "users").collect();
-    assert_eq!(users.len(), 1, "expected one `users` def; got {users:?}");
+    let users: Vec<_> = defs.iter().filter(|d| d.token == "users").collect();
     assert_eq!(
-        users[0].1,
-        format!("{LITERAL_NODE_ID}#inj0/statement/create_table"),
-        "injected node_id scheme is pinned: change it only with a documented migration"
+        users.len(),
+        1,
+        "expected one `users` def; got {}",
+        users.len()
+    );
+    let nid = users[0].nid;
+
+    let conn = Connection::open(&db_path).unwrap();
+    let file_id = leyline_ts::schema::lookup_file_id(&conn, "app.go")
+        .unwrap()
+        .expect("app.go must be interned");
+    let (lo, hi) = leyline_ts::schema::file_nid_range(file_id);
+    assert!(
+        (lo..=hi).contains(&nid),
+        "injected nid {nid} must live in app.go's range [{lo}, {hi}]"
+    );
+
+    let host_ast = ast_count(&conn, file_id);
+    assert!(
+        leyline_ts::schema::nid_ordinal(nid).unwrap() >= host_ast,
+        "injected ordinal must come past the host's {host_ast} `_ast` nodes"
+    );
+
+    let has_ast: i64 = conn
+        .query_row("SELECT COUNT(*) FROM _ast WHERE nid = ?1", [nid], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let has_node: i64 = conn
+        .query_row("SELECT COUNT(*) FROM nodes WHERE nid = ?1", [nid], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        (has_ast, has_node),
+        (0, 0),
+        "an injected node has neither an `_ast` nor a `nodes` row — that absence IS its identity"
+    );
+    assert_eq!(
+        leyline_ts::schema::node_path(&conn, nid).unwrap(),
+        None,
+        "an injected nid renders no display path"
     );
 }
 
@@ -278,11 +383,11 @@ fn inj_host_node_hashes_independent_of_injection_pass() {
     // The toggle must actually toggle — otherwise the equality below
     // is vacuous.
     assert!(
-        defs_rows(&db_on).iter().any(|d| d.0 == "users"),
+        defs_rows(&db_on).iter().any(|d| d.token == "users"),
         "injection pass ON must produce the injected `users` def"
     );
     assert!(
-        !defs_rows(&db_off).iter().any(|d| d.0 == "users"),
+        !defs_rows(&db_off).iter().any(|d| d.token == "users"),
         "LLO_DISABLE_INJECTIONS=1 must suppress injected facts"
     );
 
@@ -291,7 +396,7 @@ fn inj_host_node_hashes_independent_of_injection_pass() {
     assert!(!on.is_empty(), "host _ast must not be empty");
     assert_eq!(
         on, off,
-        "host (node_id → node_hash) map must be byte-identical with the injection pass on vs off"
+        "host (path → node_hash) map must be byte-identical with the injection pass on vs off"
     );
 }
 
@@ -316,15 +421,15 @@ fn inj_own_ca_root_dedups_with_standalone_sql() {
 
     let host_hash = defs_rows(&host_db)
         .into_iter()
-        .find(|d| d.0 == "users")
+        .find(|d| d.token == "users")
         .expect("injected `users` def in host db")
-        .5
+        .node_hash
         .expect("injected def must carry node_hash");
     let standalone_hash = defs_rows(&sql_db)
         .into_iter()
-        .find(|d| d.0 == "users")
+        .find(|d| d.token == "users")
         .expect("standalone `users` def in sql db")
-        .5
+        .node_hash
         .expect("standalone def must carry node_hash");
     assert_eq!(
         host_hash, standalone_hash,
@@ -366,17 +471,21 @@ func notes() (string, string) {
     let db_path = db_dir.path().join("live.db");
     parse_pass(&db_path, td.path(), "go");
 
+    // projection-v5: an injected fact row is one whose nid has no `_ast`
+    // row — the structural form of the pre-v5 `node_id LIKE '%#inj%'`.
     let conn = Connection::open(&db_path).unwrap();
     let injected: i64 = conn
         .query_row(
-            "SELECT count(*) FROM node_refs WHERE node_id LIKE '%#inj%'",
+            "SELECT count(*) FROM node_refs r \
+             WHERE NOT EXISTS (SELECT 1 FROM _ast a WHERE a.nid = r.nid)",
             [],
             |r| r.get(0),
         )
         .unwrap();
     let injected_defs: i64 = conn
         .query_row(
-            "SELECT count(*) FROM node_defs WHERE node_id LIKE '%#inj%'",
+            "SELECT count(*) FROM node_defs d \
+             WHERE NOT EXISTS (SELECT 1 FROM _ast a WHERE a.nid = d.nid)",
             [],
             |r| r.get(0),
         )

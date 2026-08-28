@@ -17,9 +17,12 @@
 //!    mache's cross-language rules need to disambiguate methods on
 //!    different receivers.
 //!
-//! 3. **`nodes.source_file` empty.** The parse pipeline's `INSERT INTO
-//!    nodes` never populates the `source_file` column, so mache's cross-
-//!    language rules join on a null column and produce false positives.
+//! 3. **A node's source file is unrecoverable.** The parse pipeline's
+//!    `INSERT INTO nodes` never populated the `source_file` column, so
+//!    mache's cross-language rules joined on a null column and produced
+//!    false positives. projection-v5 answers the same need structurally
+//!    — a row's file is `nid >> 24` — and stops writing that column; see
+//!    `every_node_resolves_to_its_source_file`.
 //!
 //! The tests below use `parse_into_conn` end-to-end (not the pure
 //! `extract_refs` factory) so a regression anywhere along the pipeline
@@ -41,9 +44,25 @@ fn cold_parse(src_dir: &Path, lang: Option<&str>) -> Connection {
     conn
 }
 
-fn count_rows(conn: &Connection, sql: &str) -> i64 {
-    conn.query_row(sql, [], |r| r.get::<_, i64>(0))
-        .expect("count query")
+/// Count the rows of `table` that belong to `rel`.
+///
+/// projection-v5: `_ast` / `node_defs` / `node_refs` no longer carry a
+/// `source_id` column — a row's file is `nid >> 24`, so per-file scoping
+/// is a PRIMARY KEY range over the file's interned nid space instead of
+/// a string equality. Panics if `rel` was never interned: for every
+/// caller below that means the parse did not see the fixture at all,
+/// which is a louder failure than a count of 0.
+fn count_in_file(conn: &Connection, table: &str, rel: &str) -> i64 {
+    let file_id = leyline_ts::schema::lookup_file_id(conn, rel)
+        .expect("file_id lookup")
+        .unwrap_or_else(|| panic!("{rel} was never interned — the parse did not see it"));
+    let (lo, hi) = leyline_ts::schema::file_nid_range(file_id);
+    conn.query_row(
+        &format!("SELECT COUNT(*) FROM {table} WHERE nid BETWEEN ?1 AND ?2"),
+        [lo, hi],
+        |r| r.get::<_, i64>(0),
+    )
+    .expect("count query")
 }
 
 fn defs_tokens(conn: &Connection) -> Vec<String> {
@@ -74,29 +93,20 @@ fn python_files_produce_def_ref_rows() {
     let conn = cold_parse(dir.path(), Some("python"));
 
     // Sanity: the file did parse (else the failure below is misleading).
-    let ast_rows = count_rows(
-        &conn,
-        "SELECT COUNT(*) FROM _ast WHERE source_id = 'mod.py'",
-    );
+    let ast_rows = count_in_file(&conn, "_ast", "mod.py");
     assert!(
         ast_rows > 0,
         "Python file must produce _ast rows (parse pipeline sanity); got {ast_rows}"
     );
 
-    let def_rows = count_rows(
-        &conn,
-        "SELECT COUNT(*) FROM node_defs WHERE source_id = 'mod.py'",
-    );
+    let def_rows = count_in_file(&conn, "node_defs", "mod.py");
     assert!(
         def_rows > 0,
         "Python file must produce node_defs rows (foo, bar, C, method); got {def_rows}. \
          Symptom: extract_refs dispatcher has no Python arm."
     );
 
-    let ref_rows = count_rows(
-        &conn,
-        "SELECT COUNT(*) FROM node_refs WHERE source_id = 'mod.py'",
-    );
+    let ref_rows = count_in_file(&conn, "node_refs", "mod.py");
     assert!(
         ref_rows > 0,
         "Python file must produce node_refs rows (the foo() call); got {ref_rows}"
@@ -130,28 +140,19 @@ fn javascript_files_produce_def_ref_rows() {
 
     let conn = cold_parse(dir.path(), Some("javascript"));
 
-    let ast_rows = count_rows(
-        &conn,
-        "SELECT COUNT(*) FROM _ast WHERE source_id = 'mod.js'",
-    );
+    let ast_rows = count_in_file(&conn, "_ast", "mod.js");
     assert!(
         ast_rows > 0,
         "JS file must produce _ast rows (parse pipeline sanity); got {ast_rows}"
     );
 
-    let def_rows = count_rows(
-        &conn,
-        "SELECT COUNT(*) FROM node_defs WHERE source_id = 'mod.js'",
-    );
+    let def_rows = count_in_file(&conn, "node_defs", "mod.js");
     assert!(
         def_rows > 0,
         "JS file must produce node_defs rows (foo, bar, C); got {def_rows}"
     );
 
-    let ref_rows = count_rows(
-        &conn,
-        "SELECT COUNT(*) FROM node_refs WHERE source_id = 'mod.js'",
-    );
+    let ref_rows = count_in_file(&conn, "node_refs", "mod.js");
     assert!(
         ref_rows > 0,
         "JS file must produce node_refs rows (foo() call); got {ref_rows}"
@@ -193,29 +194,20 @@ fn typescript_files_produce_def_ref_rows() {
 
     let conn = cold_parse(dir.path(), Some("typescript"));
 
-    let ast_rows = count_rows(
-        &conn,
-        "SELECT COUNT(*) FROM _ast WHERE source_id = 'mod.ts'",
-    );
+    let ast_rows = count_in_file(&conn, "_ast", "mod.ts");
     assert!(
         ast_rows > 0,
         "TS file must produce _ast rows (parse pipeline sanity); got {ast_rows}"
     );
 
-    let def_rows = count_rows(
-        &conn,
-        "SELECT COUNT(*) FROM node_defs WHERE source_id = 'mod.ts'",
-    );
+    let def_rows = count_in_file(&conn, "node_defs", "mod.ts");
     assert!(
         def_rows > 0,
         "TS file must produce node_defs rows (foo, bar, C, method, Shape, Point); got {def_rows}. \
          Symptom: extract_refs dispatcher has no TypeScript arm."
     );
 
-    let ref_rows = count_rows(
-        &conn,
-        "SELECT COUNT(*) FROM node_refs WHERE source_id = 'mod.ts'",
-    );
+    let ref_rows = count_in_file(&conn, "node_refs", "mod.ts");
     assert!(
         ref_rows > 0,
         "TS file must produce node_refs rows (foo() and helper() calls); got {ref_rows}"
@@ -311,17 +303,23 @@ fn method_tokens_are_qualified_rust() {
     );
 }
 
-// ── Bug 3: nodes.source_file populated ──────────────────────────────────
+// ── Bug 3: every node resolves to its source file ───────────────────────
 
 #[test]
-fn nodes_source_file_is_populated() {
-    // The `nodes` INSERT in cmd_parse never populated `source_file`, so
-    // mache's cross-language rules that JOIN on `nodes.source_file`
-    // silently reduced to false positives. Pin: after a parse, every
-    // node that belongs to a source file (the file node itself or any
-    // AST descendant of it) MUST have `source_file` populated to that
-    // file's `_source.id`. Directory-only nodes (kind=1 with no
-    // source_id) may still be NULL.
+fn every_node_resolves_to_its_source_file() {
+    // Replaces `nodes_source_file_is_populated`. The original pinned
+    // `nodes.source_file` being written on every AST row, because mache's
+    // cross-language rules joined on it and a NULL column silently
+    // reduced them to false positives. projection-v5 deliberately stops
+    // writing that column (`cmd_parse`'s NodeBatch DDL comment: "a row's
+    // file is `nid >> 24`") — storing the path per row is exactly the
+    // locator freight v5 evicts.
+    //
+    // The consumer obligation survives in its structural form, and that
+    // is what this now pins: EVERY node row resolves to exactly one
+    // interned file, and the join key mache needs (`_source.file_id`) is
+    // populated so `nid >> 24` reaches the source row in one integer
+    // equality.
     let dir = TempDir::new().unwrap();
     fs::write(
         dir.path().join("main.go"),
@@ -331,39 +329,46 @@ fn nodes_source_file_is_populated() {
 
     let conn = cold_parse(dir.path(), Some("go"));
 
-    // File-owned nodes: id equals a `_source.id` OR is prefixed by one
-    // (id LIKE '<source_id>/%'). Every such node MUST carry the source
-    // file's path.
-    let unpopulated: i64 = conn
+    // Non-negative nids are file-owned; each must land on a real `files`
+    // row. (Negative nids are directories — they belong to no file, the
+    // v5 shape of the old "directory nodes may be NULL" carve-out.)
+    let unresolvable: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM nodes n \
-             WHERE EXISTS (SELECT 1 FROM _source s \
-                           WHERE n.id = s.id OR n.id LIKE s.id || '/%') \
-               AND (n.source_file IS NULL OR n.source_file = '')",
+             WHERE n.nid >= 0 \
+               AND NOT EXISTS (SELECT 1 FROM files f WHERE f.file_id = n.nid >> 24)",
             [],
             |r| r.get::<_, i64>(0),
         )
         .expect("count query");
-
     assert_eq!(
-        unpopulated, 0,
-        "every node in a parsed file must have source_file populated; \
-         {unpopulated} row(s) missing"
+        unresolvable, 0,
+        "every file-owned node must resolve to an interned file; \
+         {unresolvable} row(s) do not"
     );
 
-    // Concrete file-level pin: the root file node must carry its own
-    // path as source_file (mache uses this as the join key).
-    let file_source_file: Option<String> = conn
+    // And the join mache performs actually lands: `_source.file_id` is
+    // populated, so `nid >> 24` → `_source` recovers the rel path that
+    // `source_file` used to duplicate on every row.
+    let file_id = leyline_ts::schema::lookup_file_id(&conn, "main.go")
+        .unwrap()
+        .expect("main.go must be interned");
+    let (rel, joined): (String, i64) = conn
         .query_row(
-            "SELECT source_file FROM nodes WHERE id = 'main.go'",
-            [],
-            |r| r.get::<_, Option<String>>(0),
+            "SELECT s.id, COUNT(n.nid) FROM _source s \
+             JOIN nodes n ON n.nid >> 24 = s.file_id \
+             WHERE s.file_id = ?1",
+            [file_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .expect("main.go node must exist");
+        .expect("main.go's _source row must carry file_id");
     assert_eq!(
-        file_source_file.as_deref(),
-        Some("main.go"),
-        "file node's source_file must equal its own path"
+        rel, "main.go",
+        "the file's rel path is recovered by the join"
+    );
+    assert!(
+        joined > 1,
+        "the file node and its AST descendants must all join through file_id; got {joined}"
     );
 }
 
@@ -469,29 +474,20 @@ fn java_files_produce_def_ref_rows() {
 
     let conn = cold_parse(dir.path(), Some("java"));
 
-    let ast_rows = count_rows(
-        &conn,
-        "SELECT COUNT(*) FROM _ast WHERE source_id = 'Main.java'",
-    );
+    let ast_rows = count_in_file(&conn, "_ast", "Main.java");
     assert!(
         ast_rows > 0,
         "Java file must produce _ast rows (parse pipeline sanity); got {ast_rows}"
     );
 
-    let def_rows = count_rows(
-        &conn,
-        "SELECT COUNT(*) FROM node_defs WHERE source_id = 'Main.java'",
-    );
+    let def_rows = count_in_file(&conn, "node_defs", "Main.java");
     assert!(
         def_rows > 0,
         "Java file must produce node_defs rows (Main, foo, bar); got {def_rows}. \
          Symptom: extract_refs dispatcher has no Java arm."
     );
 
-    let ref_rows = count_rows(
-        &conn,
-        "SELECT COUNT(*) FROM node_refs WHERE source_id = 'Main.java'",
-    );
+    let ref_rows = count_in_file(&conn, "node_refs", "Main.java");
     assert!(
         ref_rows > 0,
         "Java file must produce node_refs rows (the foo() call); got {ref_rows}"
@@ -534,26 +530,20 @@ fn c_files_produce_def_ref_rows() {
 
     let conn = cold_parse(dir.path(), Some("c"));
 
-    let ast_rows = count_rows(&conn, "SELECT COUNT(*) FROM _ast WHERE source_id = 'mod.c'");
+    let ast_rows = count_in_file(&conn, "_ast", "mod.c");
     assert!(
         ast_rows > 0,
         "C file must produce _ast rows (parse pipeline sanity); got {ast_rows}"
     );
 
-    let def_rows = count_rows(
-        &conn,
-        "SELECT COUNT(*) FROM node_defs WHERE source_id = 'mod.c'",
-    );
+    let def_rows = count_in_file(&conn, "node_defs", "mod.c");
     assert!(
         def_rows > 0,
         "C file must produce node_defs rows (foo, bar, point); got {def_rows}. \
          Symptom: extract_refs dispatcher has no C arm."
     );
 
-    let ref_rows = count_rows(
-        &conn,
-        "SELECT COUNT(*) FROM node_refs WHERE source_id = 'mod.c'",
-    );
+    let ref_rows = count_in_file(&conn, "node_refs", "mod.c");
     assert!(
         ref_rows > 0,
         "C file must produce node_refs rows (the foo() call); got {ref_rows}"
@@ -593,29 +583,20 @@ fn cpp_files_produce_def_ref_rows() {
 
     let conn = cold_parse(dir.path(), Some("cpp"));
 
-    let ast_rows = count_rows(
-        &conn,
-        "SELECT COUNT(*) FROM _ast WHERE source_id = 'mod.cpp'",
-    );
+    let ast_rows = count_in_file(&conn, "_ast", "mod.cpp");
     assert!(
         ast_rows > 0,
         "C++ file must produce _ast rows (parse pipeline sanity); got {ast_rows}"
     );
 
-    let def_rows = count_rows(
-        &conn,
-        "SELECT COUNT(*) FROM node_defs WHERE source_id = 'mod.cpp'",
-    );
+    let def_rows = count_in_file(&conn, "node_defs", "mod.cpp");
     assert!(
         def_rows > 0,
         "C++ file must produce node_defs rows (Shape, area, draw, render); got {def_rows}. \
          Symptom: extract_refs dispatcher has no Cpp arm."
     );
 
-    let ref_rows = count_rows(
-        &conn,
-        "SELECT COUNT(*) FROM node_refs WHERE source_id = 'mod.cpp'",
-    );
+    let ref_rows = count_in_file(&conn, "node_refs", "mod.cpp");
     assert!(
         ref_rows > 0,
         "C++ file must produce node_refs rows (the s.draw() call); got {ref_rows}"
@@ -691,29 +672,20 @@ fn sql_files_produce_def_ref_rows() {
 
     let conn = cold_parse(dir.path(), Some("sql"));
 
-    let ast_rows = count_rows(
-        &conn,
-        "SELECT COUNT(*) FROM _ast WHERE source_id = 'schema.sql'",
-    );
+    let ast_rows = count_in_file(&conn, "_ast", "schema.sql");
     assert!(
         ast_rows > 0,
         "SQL file must produce _ast rows (parse pipeline sanity); got {ast_rows}"
     );
 
-    let def_rows = count_rows(
-        &conn,
-        "SELECT COUNT(*) FROM node_defs WHERE source_id = 'schema.sql'",
-    );
+    let def_rows = count_in_file(&conn, "node_defs", "schema.sql");
     assert!(
         def_rows > 0,
         "SQL file must produce node_defs rows (users, active, add_one); got {def_rows}. \
          Symptom: extract_refs dispatcher has no Sql arm."
     );
 
-    let ref_rows = count_rows(
-        &conn,
-        "SELECT COUNT(*) FROM node_refs WHERE source_id = 'schema.sql'",
-    );
+    let ref_rows = count_in_file(&conn, "node_refs", "schema.sql");
     assert!(
         ref_rows > 0,
         "SQL file must produce node_refs rows (FROM users, INSERT INTO users, add_one call); \
@@ -744,29 +716,20 @@ fn bash_files_produce_def_ref_rows() {
 
     let conn = cold_parse(dir.path(), Some("bash"));
 
-    let ast_rows = count_rows(
-        &conn,
-        "SELECT COUNT(*) FROM _ast WHERE source_id = 'deploy.sh'",
-    );
+    let ast_rows = count_in_file(&conn, "_ast", "deploy.sh");
     assert!(
         ast_rows > 0,
         "bash file must produce _ast rows (parse pipeline sanity); got {ast_rows}"
     );
 
-    let def_rows = count_rows(
-        &conn,
-        "SELECT COUNT(*) FROM node_defs WHERE source_id = 'deploy.sh'",
-    );
+    let def_rows = count_in_file(&conn, "node_defs", "deploy.sh");
     assert!(
         def_rows > 0,
         "bash file must produce node_defs rows (build, deploy); got {def_rows}. \
          Symptom: extract_refs dispatcher has no Bash arm."
     );
 
-    let ref_rows = count_rows(
-        &conn,
-        "SELECT COUNT(*) FROM node_refs WHERE source_id = 'deploy.sh'",
-    );
+    let ref_rows = count_in_file(&conn, "node_refs", "deploy.sh");
     assert!(
         ref_rows > 0,
         "bash file must produce node_refs rows (build + deploy call sites, make); got {ref_rows}"
@@ -799,13 +762,21 @@ fn bash_files_produce_def_ref_rows() {
 /// qualifier probe. Bare-token rows of qualified calls carry the
 /// receiver/selector text; qualified-token rows and genuinely bare
 /// calls carry NULL.
-fn refs_with_qualifier(conn: &Connection, source_id: &str) -> Vec<(String, Option<String>)> {
-    conn.prepare("SELECT token, qualifier FROM node_refs WHERE source_id = ?1 ORDER BY token")
-        .unwrap()
-        .query_map([source_id], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect()
+fn refs_with_qualifier(conn: &Connection, rel: &str) -> Vec<(String, Option<String>)> {
+    // projection-v5: scope by the file's nid range, not a `source_id`
+    // string equality — see `count_in_file`.
+    let file_id = leyline_ts::schema::lookup_file_id(conn, rel)
+        .expect("file_id lookup")
+        .unwrap_or_else(|| panic!("{rel} was never interned — the parse did not see it"));
+    let (lo, hi) = leyline_ts::schema::file_nid_range(file_id);
+    conn.prepare(
+        "SELECT token, qualifier FROM node_refs WHERE nid BETWEEN ?1 AND ?2 ORDER BY token",
+    )
+    .unwrap()
+    .query_map([lo, hi], |r| Ok((r.get(0)?, r.get(1)?)))
+    .unwrap()
+    .map(|r| r.unwrap())
+    .collect()
 }
 
 #[test]

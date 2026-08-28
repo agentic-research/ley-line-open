@@ -58,20 +58,26 @@ fn fixture_repo() -> TempDir {
     for (i, rel) in FIXTURE_FILES.iter().enumerate() {
         let path = td.path().join(rel);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        // Same-package files with distinct bodies: a couple of funcs each so
-        // every file contributes defs, refs, and a multi-node subtree.
+        // Same-package files with distinct bodies AND distinct node COUNTS
+        // (i extra one-liner funcs per file). Distinct counts matter: with
+        // equal per-file shapes, a permuted file_id assignment yields the
+        // SAME nid multiset — the interning/Σ checks would still catch it,
+        // but the nid comparison itself would be vacuous.
         let pkg = Path::new(rel)
             .parent()
             .and_then(|p| p.file_name())
             .and_then(|s| s.to_str())
             .filter(|s| !s.is_empty())
             .unwrap_or("main");
+        let extra: String = (0..i)
+            .map(|k| format!("\nfunc Pad{i}x{k}() int {{\n\treturn {k}\n}}\n"))
+            .collect();
         fs::write(
             &path,
             format!(
                 "package {pkg}\n\n\
                  func Fn{i}A(x int) int {{\n\treturn x + {i}\n}}\n\n\
-                 func Fn{i}B(s string) string {{\n\tif s == \"\" {{\n\t\treturn \"e{i}\"\n\t}}\n\treturn s\n}}\n"
+                 func Fn{i}B(s string) string {{\n\tif s == \"\" {{\n\t\treturn \"e{i}\"\n\t}}\n\treturn s\n}}\n{extra}"
             ),
         )
         .unwrap();
@@ -93,19 +99,26 @@ fn parse_cold(src: &Path, scope: Option<&[String]>) -> Snapshot {
     let conn = Connection::open(&db_path).unwrap();
     cmd_parse::parse_into_conn(&conn, src, Some("go"), scope).unwrap();
 
+    // projection-v5: the nid IS the identity (file in the high bits), and
+    // the interning tables are part of it — a shuffled discovery order that
+    // permuted file_id/dir_id/name_id assignment shows up in any of these.
     let ast = {
-        let mut stmt = conn
-            .prepare("SELECT node_id, source_id FROM _ast ORDER BY source_id, node_id")
-            .unwrap();
-        let rows: Vec<(String, String)> = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        let mut stmt = conn.prepare("SELECT nid FROM _ast ORDER BY nid").unwrap();
+        let rows: Vec<i64> = stmt
+            .query_map([], |r| r.get(0))
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
         rows
     };
     let nodes = {
-        let mut stmt = conn.prepare("SELECT id FROM nodes ORDER BY id").unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT nid || ':' || COALESCE(parent_nid, '') || ':' || \
+                 COALESCE(name_id, '') || ':' || COALESCE(kind_id, '') || ':' || ord \
+                 FROM nodes ORDER BY nid",
+            )
+            .unwrap();
         let rows: Vec<String> = stmt
             .query_map([], |r| r.get(0))
             .unwrap()
@@ -124,7 +137,7 @@ fn parse_cold(src: &Path, scope: Option<&[String]>) -> Snapshot {
 
 #[derive(PartialEq, Eq)]
 struct Snapshot {
-    ast: Vec<(String, String)>,
+    ast: Vec<i64>,
     nodes: Vec<String>,
     sigma_root: [u8; 32],
 }

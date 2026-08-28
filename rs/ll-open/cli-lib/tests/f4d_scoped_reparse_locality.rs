@@ -77,34 +77,36 @@ fn fixture_repo() -> TempDir {
 /// strings so the comparison is type- and schema-agnostic (the projection-v5
 /// re-key changes column types under this gate; the property must survive).
 fn file_rows(conn: &Connection, rel: &str) -> Vec<String> {
-    // (table, WHERE clause) — each clause is the file-scoping predicate the
-    // production delete path uses for that table today.
-    const LOCATED: &[(&str, &str)] = &[
-        ("nodes", "id = ?1 OR id LIKE ?1 || '/%'"),
-        ("_ast", "source_id = ?1"),
+    // Node-level tables scope by the file's nid range (the production
+    // predicate as of projection-v5); file-level tables stay TEXT-keyed.
+    // A never-interned path owns no node rows by construction.
+    let range = leyline_ts::schema::lookup_file_id(conn, rel)
+        .unwrap()
+        .map(leyline_ts::schema::file_nid_range);
+    let ranged: &[(&str, &str)] = &[
+        ("nodes", "nid BETWEEN ?1 AND ?2"),
+        ("_ast", "nid BETWEEN ?1 AND ?2"),
+        ("node_refs", "nid BETWEEN ?1 AND ?2"),
+        ("node_defs", "nid BETWEEN ?1 AND ?2"),
+        ("_ast_blob", "file_id BETWEEN (?1 >> 24) AND (?2 >> 24)"),
+    ];
+    let texty: &[(&str, &str)] = &[
         ("_source", "id = ?1"),
-        ("node_refs", "source_id = ?1"),
-        ("node_defs", "source_id = ?1"),
         ("_imports", "source_id = ?1"),
         ("_file_index", "path = ?1"),
-        ("_ast_blob", "source_id = ?1"),
     ];
-    let mut out = Vec::new();
-    for (table, clause) in LOCATED {
-        let exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name=?1",
-                [table],
-                |r| r.get(0),
-            )
-            .unwrap();
-        if !exists {
-            continue;
-        }
-        let sql = format!("SELECT * FROM {table} WHERE {clause}");
-        let mut stmt = conn.prepare(&sql).unwrap();
+    let table_exists = |table: &str| -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name=?1",
+            [table],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let dump = |sql: &str, params: &[&dyn rusqlite::ToSql], table: &str| -> Vec<String> {
+        let mut stmt = conn.prepare(sql).unwrap();
         let ncols = stmt.column_count();
-        let mut rows = stmt.query([rel]).unwrap();
+        let mut rows = stmt.query(params).unwrap();
         let mut table_rows: Vec<String> = Vec::new();
         while let Some(row) = rows.next().unwrap() {
             let mut cells: Vec<String> = Vec::with_capacity(ncols + 1);
@@ -121,7 +123,24 @@ fn file_rows(conn: &Connection, rel: &str) -> Vec<String> {
             table_rows.push(cells.join("|"));
         }
         table_rows.sort();
-        out.extend(table_rows);
+        table_rows
+    };
+    let mut out = Vec::new();
+    if let Some((lo, hi)) = range {
+        for (table, clause) in ranged {
+            if !table_exists(table) {
+                continue;
+            }
+            let sql = format!("SELECT * FROM {table} WHERE {clause}");
+            out.extend(dump(&sql, &[&lo, &hi], table));
+        }
+    }
+    for (table, clause) in texty {
+        if !table_exists(table) {
+            continue;
+        }
+        let sql = format!("SELECT * FROM {table} WHERE {clause}");
+        out.extend(dump(&sql, &[&rel], table));
     }
     out
 }

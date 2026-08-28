@@ -46,12 +46,20 @@ fn create_go_fixture() -> TempDir {
     dir
 }
 
-/// The `node_hash` of the (single) function_declaration in `source_id`.
-fn fn_hash(conn: &rusqlite::Connection, source_id: &str) -> Vec<u8> {
+/// The `node_hash` of the (single) function_declaration in `rel`.
+///
+/// projection-v5: `_ast` carries neither `source_id` nor `node_kind` —
+/// the file is the nid range and the raw kind is interned in `kinds`.
+fn fn_hash(conn: &rusqlite::Connection, rel: &str) -> Vec<u8> {
+    let file_id = leyline_ts::schema::lookup_file_id(conn, rel)
+        .expect("file_id lookup")
+        .unwrap_or_else(|| panic!("{rel} was never interned"));
+    let (lo, hi) = leyline_ts::schema::file_nid_range(file_id);
     conn.query_row(
-        "SELECT node_hash FROM _ast \
-         WHERE source_id = ?1 AND node_kind = 'function_declaration'",
-        [source_id],
+        "SELECT a.node_hash FROM _ast a \
+         JOIN kinds k ON k.kind_id = a.kind_id \
+         WHERE a.nid BETWEEN ?1 AND ?2 AND k.raw_kind = 'function_declaration'",
+        [lo, hi],
         |r| r.get(0),
     )
     .expect("function_declaration node must exist")
@@ -227,7 +235,9 @@ fn node_hash_folds_anonymous_operators_add_vs_sub_differ() {
 
     let hash_of = |conn: &rusqlite::Connection| -> Vec<u8> {
         conn.query_row(
-            "SELECT node_hash FROM _ast WHERE node_kind = 'binary_expression'",
+            "SELECT a.node_hash FROM _ast a \
+             JOIN kinds k ON k.kind_id = a.kind_id \
+             WHERE k.raw_kind = 'binary_expression'",
             [],
             |r| r.get(0),
         )
@@ -551,12 +561,17 @@ fn rust_defs_refs_and_unbound_flow_through_merkle() {
 
     // κ collapses Rust's function_item → function on the content row; raw_kind
     // is retained.
+    let lib_rs = leyline_ts::schema::lookup_file_id(&conn, "lib.rs")
+        .unwrap()
+        .expect("lib.rs must be interned");
+    let (lo, hi) = leyline_ts::schema::file_nid_range(lib_rs);
     let (kind, raw_kind): (String, String) = conn
         .query_row(
             "SELECT c.kind, c.raw_kind FROM _ast a \
              JOIN node_content c ON a.node_hash = c.node_hash \
-             WHERE a.source_id = 'lib.rs' AND a.node_kind = 'function_item'",
-            [],
+             JOIN kinds k ON k.kind_id = a.kind_id \
+             WHERE a.nid BETWEEN ?1 AND ?2 AND k.raw_kind = 'function_item'",
+            [lo, hi],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .expect("lib.rs must contribute an `add` function_item");

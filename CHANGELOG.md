@@ -12,6 +12,34 @@ context, scoping notes, and review history are recoverable.
 
 ### Changed
 
+- **projection-v5: file-scoped integer node ids** (Phase B of bead
+  `ley-line-open-17c271`). The SQL projection's node key is no longer the
+  node's own ancestry path — an O(depth) TEXT string that was ~72% of arena
+  bytes and made identical content cost 5.3× more at directory depth 96 —
+  but `nid = (file_id << 24) | ordinal` (pre-order rank; ordinal 0 is the
+  file's own node), with directories at `-dir_id`. `parent_nid` and the
+  source-order sibling `ord` are stored; names, directories, files, and
+  tree-sitter kinds are interned once in `names`/`dirs`/`files`/`kinds`
+  (append-only — a directory rename is ONE row, and `file_id`s are never
+  reused); the display path is derived (`v_node_path`/`v_node_name` views,
+  `node_path`/`resolve_path` resolvers). Every node-keyed column re-typed:
+  `_ast` lost `source_id`/`node_kind`/`blob_ord` (file = `nid >> 24`, kind
+  interned, blob ordinal = `nid & 0xFFFFFF`), `node_refs`/`node_defs` carry
+  `nid`/`container_nid`, `_lsp*` re-keyed with per-file scoping as a nid
+  range SEARCH (the pre-v5 prefix-LIKE planned as a full SCAN, and the
+  daemon's variant was unanchored — `remove.go` matched `remove.go.bak`),
+  `_ast_blob` re-keyed on `file_id`, `_source` gained `file_id`. The daemon
+  boundary still speaks display paths in and out (TABLE_CONTRACT §external
+  consumers), so MCP consumers see path strings as before; direct-SQL
+  consumers (mache, `mache-93e84b`) migrate with the projection. A pre-v5
+  arena is REFUSED at parse open and rebuilt by a cold reparse — the
+  projection is derived state, and the in-place `parent_id`/span/qualifier
+  ALTER migrations are gone with the shapes they patched. The capnp wire
+  surface is untouched (Phase A is what made that possible); the Σ segment
+  root does not move for identical content. Gates: shuffled-discovery
+  Σ+nid equality (F4c) and scoped-reparse bit-locality (F4d) landed
+  red-provable BEFORE this change; F4/F4b hold across it.
+
 - **The locator left the hashed preimages** (Phase A of bead
   `ley-line-open-17c271`). `AstNode.nodeId` is now written EMPTY in both
   capnp preimages — the per-file `AstNodeList` blob behind

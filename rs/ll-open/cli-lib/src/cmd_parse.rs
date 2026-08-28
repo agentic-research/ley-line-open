@@ -52,10 +52,9 @@ use leyline_ts::query_engine::QuerySet;
 use leyline_ts::refs::{ExtractedRef, current_extraction_epoch, extract_refs_resolved};
 use leyline_ts::schema::{
     create_ast_tables, create_index_schema, create_ir_indexes, create_ir_tables,
-    create_occurrence_span_columns, create_pointer_store_tables,
-    create_post_load_indexes_skip_unused, create_qualifier_column, create_query_blob_tables,
-    create_refs_tables, create_source_blobs_table, delete_file_rows, get_meta, read_file_index,
-    set_meta, sweep_orphaned_dirs,
+    create_pointer_store_tables, create_post_load_indexes_skip_unused, create_query_blob_tables,
+    create_refs_tables, create_source_blobs_table, delete_file_rows, ensure_dir_nodes,
+    ensure_file_id, file_nid, get_meta, read_file_index, set_meta, sweep_orphaned_dirs,
 };
 use rayon::prelude::*;
 use rusqlite::Connection;
@@ -398,39 +397,35 @@ macro_rules! batch_table {
 }
 
 batch_table! {
-    // `INSERT OR IGNORE`: file-level nodes (kind=0) are deleted per file
-    // via `delete_file_rows` before reparse, so they don't conflict.
-    // But dir nodes (kind=1) inserted by `collect_dirs` may exist from
-    // a prior parse — on incremental reparse, dirs survive across runs.
-    // `OR IGNORE` skips the dup-PK row in that case, matching the
-    // pre-9ccbc7 `INSERT OR IGNORE INTO nodes ... VALUES (?,?,?,1,...)`
-    // behavior `ensure_dirs` used. File/AST node rows still write
-    // their new values (no PK collision because their rows were just
-    // deleted). On cold parse there are no conflicts; `OR IGNORE`
-    // costs the same as plain `INSERT` (single B-tree insert).
+    // `INSERT OR IGNORE`: file-level nodes are deleted per file via
+    // `delete_file_rows` before reparse, so they don't conflict. But dir
+    // nodes (negative nids, from `collect_dirs`) may exist from a prior
+    // parse — on incremental reparse, dirs survive across runs. `OR
+    // IGNORE` skips the dup-PK row in that case. File/AST node rows still
+    // write their new values (no PK collision because their rows were
+    // just deleted).
     //
-    // `source_file` (bead `ley-line-open-caf423`): the shared
-    // `nodes.source_file` column carries the originating source file's
-    // path for every AST-derived row. Directory nodes (from
-    // `collect_dirs`) and the root '' node have no source file and pass
-    // `None`. Mache's cross-language rules JOIN on this column; pre-fix
-    // it was always NULL and the rules silently reduced to false
-    // positives.
+    // projection-v5 (bead `ley-line-open-17c271`): keyed on integer nids;
+    // `parent_nid` + `ord` stored; `name_id` interned for filesystem rows
+    // and NULL for AST rows (display derives from kind_id + ord);
+    // `source_file` is no longer written — a row's file is `nid >> 24`.
     NodeBatch, NodeRow,
-    "INSERT OR IGNORE INTO nodes (id, name, kind, size, mtime, record, source_file) VALUES ",
-    7,
-    push_fn: (id: String, name: String, kind: i32, size: i64, mtime: i64, record: String, source_file: Option<String>),
-    push_body: { NodeRow { id, name, kind, size, mtime, record, source_file } },
+    "INSERT OR IGNORE INTO nodes (nid, parent_nid, name_id, kind_id, kind, ord, size, mtime, record) VALUES ",
+    9,
+    push_fn: (nid: i64, parent_nid: Option<i64>, name_id: Option<i64>, kind_id: Option<i64>, kind: i32, ord: i64, size: i64, mtime: i64, record: String),
+    push_body: { NodeRow { nid, parent_nid, name_id, kind_id, kind, ord, size, mtime, record } },
     flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 7);
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 9);
         for r in chunk {
-            out.push(&r.id);
-            out.push(&r.name);
+            out.push(&r.nid);
+            out.push(&r.parent_nid);
+            out.push(&r.name_id);
+            out.push(&r.kind_id);
             out.push(&r.kind);
+            out.push(&r.ord);
             out.push(&r.size);
             out.push(&r.mtime);
             out.push(&r.record);
-            out.push(&r.source_file);
         }
         out
     },
@@ -443,17 +438,20 @@ batch_table! {
     // path pays a per-row PK lookup even when no conflict exists; on
     // the mache 765-file bench that's ~535K extra B-tree probes. See
     // bead `ley-line-open-cbbedf`.
+    //
+    // projection-v5: the nid IS (file_id << 24) | blob_ord — the pointer
+    // store's dense per-file ordinal moved into the key, so the
+    // `source_id`/`blob_ord` columns are gone and `node_kind` interned.
     AstBatch, AstRow,
-    "INSERT INTO _ast (node_id, source_id, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col, node_hash, blob_ord) VALUES ",
-    11,
-    push_fn: (node_id: String, source_id: String, node_kind: String, start_byte: i64, end_byte: i64, start_row: i64, start_col: i64, end_row: i64, end_col: i64, node_hash: Vec<u8>, blob_ord: i64),
-    push_body: { AstRow { node_id, source_id, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col, node_hash, blob_ord } },
+    "INSERT INTO _ast (nid, kind_id, start_byte, end_byte, start_row, start_col, end_row, end_col, node_hash) VALUES ",
+    9,
+    push_fn: (nid: i64, kind_id: i64, start_byte: i64, end_byte: i64, start_row: i64, start_col: i64, end_row: i64, end_col: i64, node_hash: Vec<u8>),
+    push_body: { AstRow { nid, kind_id, start_byte, end_byte, start_row, start_col, end_row, end_col, node_hash } },
     flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 11);
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 9);
         for r in chunk {
-            out.push(&r.node_id);
-            out.push(&r.source_id);
-            out.push(&r.node_kind);
+            out.push(&r.nid);
+            out.push(&r.kind_id);
             out.push(&r.start_byte);
             out.push(&r.end_byte);
             out.push(&r.start_row);
@@ -461,7 +459,6 @@ batch_table! {
             out.push(&r.end_row);
             out.push(&r.end_col);
             out.push(&r.node_hash);
-            out.push(&r.blob_ord);
         }
         out
     },
@@ -471,17 +468,18 @@ batch_table! {
     // Plain INSERT: same rationale as AstBatch — delete_file_rows
     // clears _source rows per file before reparse.
     SourceBatch, SourceRow,
-    "INSERT INTO _source (id, language, path, content_hash) VALUES ",
-    4,
-    push_fn: (id: String, language: String, path: String, content_hash: Vec<u8>),
-    push_body: { SourceRow { id, language, path, content_hash } },
+    "INSERT INTO _source (id, language, path, content_hash, file_id) VALUES ",
+    5,
+    push_fn: (id: String, language: String, path: String, content_hash: Vec<u8>, file_id: i64),
+    push_body: { SourceRow { id, language, path, content_hash, file_id } },
     flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 4);
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 5);
         for r in chunk {
             out.push(&r.id);
             out.push(&r.language);
             out.push(&r.path);
             out.push(&r.content_hash);
+            out.push(&r.file_id);
         }
         out
     },
@@ -560,17 +558,16 @@ batch_table! {
     // NULL on the qualified-token row and on genuinely bare calls.
     RefBatch, RefRow,
     "",
-    13,
-    push_fn: (token: String, node_id: String, source_id: String, node_hash: Option<Vec<u8>>, container_node_id: Option<String>, qualifier: Option<String>, node_kind: Option<String>, start_byte: Option<i64>, end_byte: Option<i64>, start_row: Option<i64>, start_col: Option<i64>, end_row: Option<i64>, end_col: Option<i64>),
-    push_body: { RefRow { token, node_id, source_id, node_hash, container_node_id, qualifier, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col } },
+    12,
+    push_fn: (token: String, nid: i64, node_hash: Option<Vec<u8>>, container_nid: Option<i64>, qualifier: Option<String>, node_kind: Option<String>, start_byte: Option<i64>, end_byte: Option<i64>, start_row: Option<i64>, start_col: Option<i64>, end_row: Option<i64>, end_col: Option<i64>),
+    push_body: { RefRow { token, nid, node_hash, container_nid, qualifier, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col } },
     flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 13);
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 12);
         for r in chunk {
             out.push(&r.token);
-            out.push(&r.node_id);
-            out.push(&r.source_id);
+            out.push(&r.nid);
             out.push(&r.node_hash);
-            out.push(&r.container_node_id);
+            out.push(&r.container_nid);
             out.push(&r.qualifier);
             out.push(&r.node_kind);
             out.push(&r.start_byte);
@@ -586,14 +583,13 @@ batch_table! {
 
 impl RefBatch {
     fn flush_batched_for(&mut self, conn: &Connection, prefix: &str) -> Result<()> {
-        flush_in_batches(conn, &mut self.rows, prefix, 13, |chunk| {
-            let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 13);
+        flush_in_batches(conn, &mut self.rows, prefix, 12, |chunk| {
+            let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 12);
             for r in chunk {
                 out.push(&r.token);
-                out.push(&r.node_id);
-                out.push(&r.source_id);
+                out.push(&r.nid);
                 out.push(&r.node_hash);
-                out.push(&r.container_node_id);
+                out.push(&r.container_nid);
                 out.push(&r.qualifier);
                 out.push(&r.node_kind);
                 out.push(&r.start_byte);
@@ -617,25 +613,23 @@ batch_table! {
     // container_node_id) shape as refs, plus `canonical_kind`.
     DefBatch, DefRow,
     "",
-    13,
+    12,
     push_fn: (
         token: String,
-        node_id: String,
-        source_id: String,
+        nid: i64,
         node_hash: Option<Vec<u8>>,
-        container_node_id: Option<String>,
+        container_nid: Option<i64>,
         canonical_kind: Option<&'static str>,
         node_kind: Option<String>, start_byte: Option<i64>, end_byte: Option<i64>, start_row: Option<i64>, start_col: Option<i64>, end_row: Option<i64>, end_col: Option<i64>
     ),
-    push_body: { DefRow { token, node_id, source_id, node_hash, container_node_id, canonical_kind, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col } },
+    push_body: { DefRow { token, nid, node_hash, container_nid, canonical_kind, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col } },
     flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 13);
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 12);
         for r in chunk {
             out.push(&r.token);
-            out.push(&r.node_id);
-            out.push(&r.source_id);
+            out.push(&r.nid);
             out.push(&r.node_hash);
-            out.push(&r.container_node_id);
+            out.push(&r.container_nid);
             out.push(&r.canonical_kind);
             out.push(&r.node_kind);
             out.push(&r.start_byte);
@@ -651,14 +645,13 @@ batch_table! {
 
 impl DefBatch {
     fn flush_batched_for(&mut self, conn: &Connection, prefix: &str) -> Result<()> {
-        flush_in_batches(conn, &mut self.rows, prefix, 13, |chunk| {
-            let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 13);
+        flush_in_batches(conn, &mut self.rows, prefix, 12, |chunk| {
+            let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 12);
             for r in chunk {
                 out.push(&r.token);
-                out.push(&r.node_id);
-                out.push(&r.source_id);
+                out.push(&r.nid);
                 out.push(&r.node_hash);
-                out.push(&r.container_node_id);
+                out.push(&r.container_nid);
                 out.push(&r.canonical_kind);
                 out.push(&r.node_kind);
                 out.push(&r.start_byte);
@@ -765,14 +758,14 @@ batch_table! {
     // index, and a kind derivable from `_ast.node_kind`. The offset now
     // rides on `_ast.blob_ord`, on the row it describes.
     AstBlobBatch, AstBlobRow,
-    "INSERT INTO _ast_blob (source_id, blob_hash) VALUES ",
+    "INSERT INTO _ast_blob (file_id, blob_hash) VALUES ",
     2,
-    push_fn: (source_id: String, blob_hash: Vec<u8>),
-    push_body: { AstBlobRow { source_id, blob_hash } },
+    push_fn: (file_id: i64, blob_hash: Vec<u8>),
+    push_body: { AstBlobRow { file_id, blob_hash } },
     flatten: |chunk| {
         let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 2);
         for r in chunk {
-            out.push(&r.source_id);
+            out.push(&r.file_id);
             out.push(&r.blob_hash);
         }
         out
@@ -784,6 +777,7 @@ batch_table! {
 // ---------------------------------------------------------------------------
 
 /// Result of a parse operation, including stats and changed file list.
+#[derive(Debug)]
 pub struct ParseResult {
     /// Number of files successfully parsed.
     pub parsed: u64,
@@ -916,6 +910,24 @@ pub fn parse_into_conn(
     // Check if tables already exist (incremental mode).
     let incremental = conn.prepare("SELECT 1 FROM _file_index LIMIT 1").is_ok();
 
+    // projection-v5 refuses a pre-v5 arena rather than migrating it: the
+    // projection is DERIVED-ONLY (no identity domain — TABLE_CONTRACT §1),
+    // so a stale arena is rebuilt by a cold reparse, never patched in
+    // place. Without this guard, `CREATE TABLE IF NOT EXISTS` would no-op
+    // against the old TEXT-keyed tables and the first INSERT would fail
+    // with a confusing "no column named nid".
+    if incremental
+        && let Ok(Some(stored)) = get_meta(conn, "projection_schema_version")
+        && stored != crate::daemon::version::PROJECTION_SCHEMA_VERSION
+    {
+        bail!(
+            "this arena was written by {stored}; this binary writes {}. The \
+             projection is derived state — delete the .db (and its sibling \
+             .capnp segment files keep their lineage) and reparse cold.",
+            crate::daemon::version::PROJECTION_SCHEMA_VERSION,
+        );
+    }
+
     // Tables only (no secondary indexes). At registry-repo scale the
     // bulk INSERT loop pays O(rows × indexes × log N) on B-tree
     // maintenance — the mache benchmark (764 files, 534k _ast rows)
@@ -924,20 +936,10 @@ pub fn parse_into_conn(
     // `create_post_load_indexes`. See bead `ley-line-open-9ccbc7`.
     create_ast_tables(conn)?;
     create_refs_tables(conn)?;
-    // Structural qualifier (bead `ley-line-open-4dde42`): additively ALTER
-    // legacy (≤ v0.7.8) node_refs shapes that predate the column. Must run
-    // after `create_refs_tables` (the ALTER target) and before the insert
-    // transaction — the extraction-epoch bump forces those arenas to
-    // re-derive facts, and the re-derive INSERT names the column.
-    create_qualifier_column(conn)?;
-    // projection-v3: the span columns the occurrence rows now carry. Must run
-    // before the insert transaction — the INSERT names them.
-    create_occurrence_span_columns(conn)?;
-    // Merkle-AST IR (ADR-0027): create node_content/node_child and stamp the
-    // additive node_hash column onto _ast/node_defs/node_refs. Must run after
-    // the occurrence tables exist (the ALTER targets) and before the insert
-    // transaction, so the node_hash FK → node_content is live when
-    // PRAGMA foreign_keys=ON enforces it below.
+    // Merkle-AST IR (ADR-0027): node_content/node_child. The occurrence
+    // tables' node_hash columns are in their base DDL as of projection-v5
+    // (the additive ALTER migrations are gone — a pre-v5 arena is refused
+    // at open, not patched).
     create_ir_tables(conn)?;
     // ADR-0026 Phase 1 dual-write (bead `ley-line-open-3e87ad`): the pointer-
     // store tables land alongside the row-projected schema. Both populated on
@@ -961,11 +963,9 @@ pub fn parse_into_conn(
         .unwrap_or_default()
         .as_nanos() as i64;
 
-    conn.execute(
-        "INSERT OR IGNORE INTO nodes (id, name, kind, size, mtime, record) \
-         VALUES ('', '', 1, 0, ?1, '')",
-        [mtime],
-    )?;
+    // Root directory presentation row (nid -1). `ensure_dir_nodes` with a
+    // root-level path seeds exactly the root.
+    ensure_dir_nodes(conn, "_", mtime)?;
 
     // ---- Classify files ----
 
@@ -1357,7 +1357,10 @@ pub fn parse_into_conn(
     let mut seen_content: HashSet<[u8; 32]> = HashSet::with_capacity(200_000);
     let mut seen_edge: HashSet<([u8; 32], i64)> = HashSet::with_capacity(450_000);
 
-    let mut dirs_created: HashSet<String> = HashSet::new();
+    // rel-path → leaf dir_id memo, so each file's dir chain hits SQL once.
+    let mut dir_cache: HashMap<String, i64> = HashMap::new();
+    // (lang, raw_kind) → kind_id memo for the interning below.
+    let mut kind_cache: HashMap<(String, String), i64> = HashMap::new();
     let mut changed_files: Vec<String> = Vec::new();
 
     // Buffer-fill and flush time, accumulated per chunk for the
@@ -1386,14 +1389,77 @@ pub fn parse_into_conn(
         for result in parsed_files {
             match result {
                 Ok(pf) => {
-                    let rel_path = Path::new(&pf.rel);
-                    collect_dirs(rel_path, &mut dirs_created, &mut nodes_buf, mtime);
+                    // ── projection-v5 minting (bead `ley-line-open-17c271`) ──
+                    //
+                    // The file's identity: `ensure_file_id` interns the rel
+                    // path append-only. On a cold parse this runs in sorted
+                    // work-list order (the `to_parse` sort above), so the
+                    // assignment is a function of the TREE, not of discovery
+                    // order (gate F4c); on a scoped reparse an existing file
+                    // re-binds to its persisted id and new files append,
+                    // leaving every other file's nids untouched (gates F4b/F4d).
+                    let file_id = ensure_file_id(conn, &pf.rel)?;
+                    let dir_id = match dir_cache.get(&pf.rel) {
+                        Some(d) => *d,
+                        None => {
+                            let d = ensure_dir_nodes(conn, &pf.rel, mtime)?;
+                            dir_cache.insert(pf.rel.clone(), d);
+                            d
+                        }
+                    };
+                    let base = file_nid(file_id, 0);
+
+                    // Ordinals: `ast_entries` is pre-order (root first), and
+                    // its index IS the pointer store's blob_ord — the nid's
+                    // low 24 bits are one and the same number. Injected
+                    // nodes (no `_ast`/`nodes` rows, fact rows only) take
+                    // the ordinals PAST the `_ast` count, in fold order.
+                    let total_ordinals = pf.ast_entries.len() + pf.injected_hashes.len();
+                    anyhow::ensure!(
+                        (total_ordinals as i64) <= leyline_schema::NID_ORDINAL_MASK,
+                        "{}: file exceeds the 24-bit per-file ordinal space \
+                         ({} nodes)",
+                        pf.rel,
+                        total_ordinals,
+                    );
+                    let mut nid_by_id: HashMap<&str, i64> = HashMap::with_capacity(total_ordinals);
+                    for (i, a) in pf.ast_entries.iter().enumerate() {
+                        nid_by_id.insert(a.node_id.as_str(), base | i as i64);
+                    }
+                    for (j, (id, _)) in pf.injected_hashes.iter().enumerate() {
+                        nid_by_id
+                            .entry(id.as_str())
+                            .or_insert(base | (pf.ast_entries.len() + j) as i64);
+                    }
+
+                    // parent_nid + sibling ord per entry, derived from the
+                    // ancestry-prefix id the fold builds (parents precede
+                    // children in pre-order, siblings keep source order).
+                    // The per-kind display rank derives from `ord` at read
+                    // time, reproducing the pre-v5 `{kind}[_{idx}]` names.
+                    let mut sib_next: HashMap<i64, i64> = HashMap::new();
+                    let mut placement: HashMap<&str, (i64, i64)> =
+                        HashMap::with_capacity(pf.ast_entries.len());
+                    for a in pf.ast_entries.iter().skip(1) {
+                        let parent_str = a
+                            .node_id
+                            .rsplit_once('/')
+                            .map(|(p, _)| p)
+                            .unwrap_or(pf.rel.as_str());
+                        let parent_nid = *nid_by_id.get(parent_str).with_context(|| {
+                            format!("{}: parent id {parent_str:?} unmapped", pf.rel)
+                        })?;
+                        let ord_slot = sib_next.entry(parent_nid).or_insert(0);
+                        placement.insert(a.node_id.as_str(), (parent_nid, *ord_slot));
+                        *ord_slot += 1;
+                    }
 
                     source_buf.push(
                         pf.rel.clone(),
                         pf.language.clone(),
                         pf.abs_path.clone(),
                         pf.content_hash.to_vec(),
+                        file_id,
                     );
 
                     // ADR-0028 dual-store (Phase 1, bead `ley-line-open-9e4416`).
@@ -1432,17 +1498,8 @@ pub fn parse_into_conn(
                     // relative path). Directory nodes (created via
                     // `collect_dirs`) intentionally leave `source_file` as
                     // `None` — they don't belong to a single file.
-                    for n in pf.nodes {
-                        nodes_buf.push(
-                            n.id,
-                            n.name,
-                            n.kind,
-                            n.size,
-                            mtime,
-                            n.record,
-                            Some(pf.rel.clone()),
-                        );
-                    }
+                    // (nodes rows are pushed below, once `entry_by_id` is
+                    // built — their kind_id comes from the `_ast` entry.)
 
                     // Merkle-AST content layer (post-order, children before
                     // parents). Cross-file dedup happens here in memory: only the
@@ -1507,16 +1564,76 @@ pub fn parse_into_conn(
                     }
                     let span_of = |id: &str| OccurrenceSpan::of(entry_by_id.get(id).copied());
 
-                    // `blob_ord` is this entry's index in the file's
+                    // Interning memo for this file's kinds.
+                    let lang = pf.language.clone();
+                    let mut kind_id_of = |conn: &Connection, raw_kind: &str| -> Result<i64> {
+                        if let Some(k) = kind_cache.get(&(lang.clone(), raw_kind.to_string())) {
+                            return Ok(*k);
+                        }
+                        let k = leyline_ts::schema::intern_kind(conn, &lang, raw_kind)?;
+                        kind_cache.insert((lang.clone(), raw_kind.to_string()), k);
+                        Ok(k)
+                    };
+
+                    // `nodes` rows: the file's own node (ordinal 0, parent =
+                    // its directory) and every AST node (parent + sibling
+                    // ord from `placement`; display name derives from
+                    // kind_id + ord at read time).
+                    let file_name = pf
+                        .rel
+                        .rsplit_once('/')
+                        .map(|(_, n)| n)
+                        .unwrap_or(pf.rel.as_str());
+                    let file_name_id = leyline_ts::schema::intern_name(conn, file_name)?;
+                    for n in &pf.nodes {
+                        let kind_id = match entry_by_id.get(n.id.as_str()) {
+                            Some(e) => Some(kind_id_of(conn, &e.node_kind)?),
+                            None => None,
+                        };
+                        if n.id == pf.rel {
+                            nodes_buf.push(
+                                base,
+                                Some(leyline_schema::dir_nid(dir_id)),
+                                Some(file_name_id),
+                                kind_id,
+                                n.kind,
+                                0,
+                                n.size,
+                                mtime,
+                                n.record.clone(),
+                            );
+                        } else {
+                            let nid = *nid_by_id.get(n.id.as_str()).with_context(|| {
+                                format!("{}: node id {:?} unmapped", pf.rel, n.id)
+                            })?;
+                            let (parent_nid, ord) =
+                                *placement.get(n.id.as_str()).with_context(|| {
+                                    format!("{}: node id {:?} unplaced", pf.rel, n.id)
+                                })?;
+                            nodes_buf.push(
+                                nid,
+                                Some(parent_nid),
+                                None,
+                                kind_id,
+                                n.kind,
+                                ord,
+                                n.size,
+                                mtime,
+                                n.record.clone(),
+                            );
+                        }
+                    }
+
+                    // `_ast` rows: the entry's index in the file's
                     // `AstNodeList.nodes` — the same `enumerate()` order
-                    // `serialize_ast_node_list_record` wrote. Carrying it on
-                    // the `_ast` row is what lets the pointer store be one row
-                    // per FILE rather than one per node (`ley-line-open-17c271`).
-                    for (blob_ord, a) in pf.ast_entries.iter().enumerate() {
+                    // `serialize_ast_node_list_record` wrote — IS the nid's
+                    // low 24 bits, so the pointer store's per-node ordinal
+                    // lives in the key (`ley-line-open-17c271`).
+                    for (ordinal, a) in pf.ast_entries.iter().enumerate() {
+                        let kind_id = kind_id_of(conn, &a.node_kind)?;
                         ast_buf.push(
-                            a.node_id.clone(),
-                            a.source_id.clone(),
-                            a.node_kind.clone(),
+                            base | ordinal as i64,
+                            kind_id,
                             a.start_byte as i64,
                             a.end_byte as i64,
                             a.start_row as i64,
@@ -1524,7 +1641,6 @@ pub fn parse_into_conn(
                             a.end_row as i64,
                             a.end_col as i64,
                             a.node_hash.to_vec(),
-                            blob_ord as i64,
                         );
                     }
 
@@ -1539,26 +1655,37 @@ pub fn parse_into_conn(
                     // Moved for the same reason as `source_blob_bytes` above:
                     // sole use, owned `pf`, by-value `push` (ley-line-open-cd052b).
                     blob_buf.push(pf.pointer_blob_hash.to_vec(), pf.pointer_blob_bytes);
-                    ast_blob_buf.push(pf.rel.clone(), pf.pointer_blob_hash.to_vec());
+                    ast_blob_buf.push(file_id, pf.pointer_blob_hash.to_vec());
 
-                    for r in pf.refs {
+                    // Fact rows translate the extraction pipeline's string
+                    // correlation ids to nids here, where the file's ordinal
+                    // assignment is in hand. Injected ids resolve through
+                    // the same map (they own the post-`_ast` ordinals).
+                    let nid_of = |id: &str| -> Result<i64> {
+                        nid_by_id
+                            .get(id)
+                            .copied()
+                            .with_context(|| format!("{}: fact id {id:?} unmapped", pf.rel))
+                    };
+                    for r in &pf.refs {
                         match r {
                             ExtractedRef::Ref {
                                 token,
                                 node_id,
-                                source_id,
+                                source_id: _,
                                 container_node_id,
                                 qualifier,
                             } => {
                                 let nh = hash_by_id.get(node_id.as_str()).map(|h| h.to_vec());
                                 let sp = span_of(node_id.as_str());
+                                let container_nid =
+                                    container_node_id.as_deref().map(&nid_of).transpose()?;
                                 refs_buf.push(
-                                    token,
-                                    node_id,
-                                    source_id,
+                                    token.clone(),
+                                    nid_of(node_id)?,
                                     nh,
-                                    container_node_id,
-                                    qualifier,
+                                    container_nid,
+                                    qualifier.clone(),
                                     sp.node_kind,
                                     sp.start_byte,
                                     sp.end_byte,
@@ -1571,19 +1698,20 @@ pub fn parse_into_conn(
                             ExtractedRef::Def {
                                 token,
                                 node_id,
-                                source_id,
+                                source_id: _,
                                 container_node_id,
                                 canonical_kind,
                             } => {
                                 let nh = hash_by_id.get(node_id.as_str()).map(|h| h.to_vec());
                                 let sp = span_of(node_id.as_str());
+                                let container_nid =
+                                    container_node_id.as_deref().map(&nid_of).transpose()?;
                                 defs_buf.push(
-                                    token,
-                                    node_id,
-                                    source_id,
+                                    token.clone(),
+                                    nid_of(node_id)?,
                                     nh,
-                                    container_node_id,
-                                    canonical_kind,
+                                    container_nid,
+                                    *canonical_kind,
                                     sp.node_kind,
                                     sp.start_byte,
                                     sp.end_byte,
@@ -1597,7 +1725,7 @@ pub fn parse_into_conn(
                                 alias,
                                 path,
                                 source_id,
-                            } => imports_buf.push(alias, path, source_id),
+                            } => imports_buf.push(alias.clone(), path.clone(), source_id.clone()),
                         }
                     }
 
@@ -1642,11 +1770,11 @@ pub fn parse_into_conn(
         source_buf.flush_batched(conn)?;
         refs_buf.flush_batched_for(
         conn,
-        "INSERT INTO node_refs (token, node_id, source_id, node_hash, container_node_id, qualifier, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col) VALUES ",
+        "INSERT INTO node_refs (token, nid, node_hash, container_nid, qualifier, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col) VALUES ",
     )?;
         defs_buf.flush_batched_for(
         conn,
-        "INSERT INTO node_defs (token, node_id, source_id, node_hash, container_node_id, canonical_kind, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col) VALUES ",
+        "INSERT INTO node_defs (token, nid, node_hash, container_nid, canonical_kind, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col) VALUES ",
     )?;
         imports_buf.flush_batched(conn)?;
         file_idx_buf.flush_batched(conn)?;
@@ -2460,68 +2588,9 @@ fn serialize_ast_node_record(buf: &mut Vec<u8>, a: &AstEntry) -> Result<()> {
 //
 // - `serialize_ast_node_list_record` — canonicalize a per-file
 //   `AstNodeList` capnp message. Blob content per ADR-0026 §2.1.
-// - `semantic_kind_tag` — Phase 1 tag encoding for `_ast_pointer.kind`.
-//   The ADR (§2.1) calls out "function, method, type, import" as the
-//   semantic surface; Phase 1 encodes the common tree-sitter kinds behind
-//   those categories so consumers can pre-filter without decoding the
-//   blob. The allowlist is intentionally small — Phase 2 refines against
-//   measured mache query patterns (ADR-0026 §2.2).
-
-/// Semantic-kind tag for `_ast_pointer.kind`. Load-bearing surface is
-/// small and deliberately conservative — Phase 1's contract is "if you
-/// want to filter by semantic surface without decoding the blob, these
-/// codes are stable across parse runs." Unknown / non-semantic kinds
-/// (identifiers, literals, statements, blocks, punctuation) collapse to
-/// `SEMANTIC_KIND_OTHER` and consumers fall back to blob decode.
-///
-/// Encoding kept as small integer constants (not an enum) so the wire
-/// story is dead-simple: `_ast_pointer.kind` is an `INTEGER`, values are
-/// documented here, Phase 2 extends by adding new tags at the tail.
-pub const SEMANTIC_KIND_OTHER: i64 = 0;
-/// Function-like: `function_declaration`, `function_definition`,
-/// `function_item`, `method_declaration`.
-pub const SEMANTIC_KIND_FUNCTION: i64 = 1;
-/// Method-like: `method_definition`, `method_signature_item`.
-pub const SEMANTIC_KIND_METHOD: i64 = 2;
-/// Type-like: struct/class/interface/type-alias/enum declarations.
-pub const SEMANTIC_KIND_TYPE: i64 = 3;
-/// Import-like: `import_declaration`, `import_statement`,
-/// `use_declaration`, `import_spec`.
-pub const SEMANTIC_KIND_IMPORT: i64 = 4;
-
-/// Map a tree-sitter node kind string to its semantic-kind tag. Phase 1
-/// covers the categories the ADR calls out (§2.1); Phase 2 refines the
-/// allowlist per measured mache query patterns (§2.2).
-pub fn semantic_kind_tag(node_kind: &str) -> i64 {
-    match node_kind {
-        // Function-like across Go / Rust / Python / JS / TS.
-        "function_declaration" | "function_definition" | "function_item" => SEMANTIC_KIND_FUNCTION,
-        // Method-like.
-        "method_declaration" | "method_definition" | "method_signature_item" => {
-            SEMANTIC_KIND_METHOD
-        }
-        // Type-like: struct / class / interface / enum / type alias.
-        "struct_item"
-        | "type_declaration"
-        | "type_alias"
-        | "type_alias_declaration"
-        | "type_alias_statement"
-        | "class_declaration"
-        | "class_definition"
-        | "interface_declaration"
-        | "enum_declaration"
-        | "enum_item"
-        | "trait_item"
-        | "impl_item" => SEMANTIC_KIND_TYPE,
-        // Import-like.
-        "import_declaration"
-        | "import_statement"
-        | "import_spec"
-        | "import_from_statement"
-        | "use_declaration" => SEMANTIC_KIND_IMPORT,
-        _ => SEMANTIC_KIND_OTHER,
-    }
-}
+// (`semantic_kind_tag` and the SEMANTIC_KIND_* tags are gone: they fed the
+// per-node `_ast_pointer.kind` column, whose table died in projection-v2 —
+// the fn had been orphaned since, with zero callers.)
 
 /// ADR-0026 §2.1 — serialize the per-file `AstNodeList` capnp message
 /// (canonical form) into `buf`. Emits ONE root message per file whose
@@ -3561,28 +3630,9 @@ fn fold_injected_node(
 /// idempotent for matching primary keys. The `OR IGNORE` here was
 /// defensive against the per-file loop re-inserting the same dir; the
 /// set membership check accomplishes the same.
-fn collect_dirs(rel: &Path, created: &mut HashSet<String>, nodes_buf: &mut NodeBatch, mtime: i64) {
-    let mut accumulated = String::new();
-    let components: Vec<_> = rel
-        .parent()
-        .into_iter()
-        .flat_map(|p| p.components())
-        .collect();
-
-    for comp in components {
-        let name = comp.as_os_str().to_string_lossy().into_owned();
-        if accumulated.is_empty() {
-            accumulated = name.clone();
-        } else {
-            accumulated = format!("{accumulated}/{name}");
-        }
-        if created.insert(accumulated.clone()) {
-            // Directory-only rows: `source_file` stays `None`. Only
-            // file nodes + their AST descendants carry the path.
-            nodes_buf.push(accumulated.clone(), name, 1, 0, mtime, String::new(), None);
-        }
-    }
-}
+// (The pre-v5 `collect_dirs` path builder is gone: directory rows are
+// interned + upserted through `leyline_schema::ensure_dir_nodes`, memoized
+// per file path in the insert loop's `dir_cache`.)
 
 /// True when the directory name should be excluded from the parse walk.
 /// Decoupled from `collect_files` so tests can assert membership without
@@ -3780,15 +3830,12 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         let _ = parse_into_conn(&conn, root, None, None).unwrap();
 
-        // Confirm the dir row exists after the cold parse.
-        let dir_before: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM nodes WHERE id = 'doomed' AND kind = 1",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(dir_before, 1, "doomed/ dir row must exist after cold parse");
+        // Confirm the dir row exists after the cold parse (v5: dirs are
+        // negative nids; resolve the display path to find it).
+        let doomed_nid = leyline_ts::schema::resolve_path(&conn, "doomed")
+            .unwrap()
+            .expect("doomed/ dir row must exist after cold parse");
+        assert!(doomed_nid < 0, "a directory resolves to a negative nid");
 
         // Remove the file AND its parent dir from disk, then reparse.
         std::fs::remove_file(root.join("doomed/a.go")).unwrap();
@@ -3799,8 +3846,8 @@ mod tests {
         // The sweep-runs path must fire and remove the now-orphaned dir.
         let dir_after: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM nodes WHERE id = 'doomed' AND kind = 1",
-                [],
+                "SELECT COUNT(*) FROM nodes WHERE nid = ?1",
+                [doomed_nid],
                 |r| r.get(0),
             )
             .unwrap();
@@ -4009,8 +4056,9 @@ mod tests {
         for table in ["node_defs", "node_refs"] {
             let sql = format!(
                 "SELECT COUNT(*) FROM {table} o \
-                 LEFT JOIN _ast a ON a.node_id = o.node_id AND a.source_id = o.source_id \
-                 WHERE o.node_kind IS NOT a.node_kind \
+                 LEFT JOIN _ast a ON a.nid = o.nid \
+                 LEFT JOIN kinds k ON k.kind_id = a.kind_id \
+                 WHERE o.node_kind IS NOT k.raw_kind \
                     OR o.start_byte IS NOT a.start_byte OR o.end_byte IS NOT a.end_byte \
                     OR o.start_row IS NOT a.start_row OR o.start_col IS NOT a.start_col \
                     OR o.end_row IS NOT a.end_row OR o.end_col IS NOT a.end_col"
@@ -4049,8 +4097,8 @@ mod tests {
         let no_ast_row: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM node_refs r \
-                 LEFT JOIN _ast a ON a.node_id = r.node_id AND a.source_id = r.source_id \
-                 WHERE a.node_id IS NULL",
+                 LEFT JOIN _ast a ON a.nid = r.nid \
+                 WHERE a.nid IS NULL",
                 [],
                 |r| r.get(0),
             )
@@ -4206,27 +4254,26 @@ mod tests {
             "distinct files must have distinct _source.id",
         );
 
-        // _ast(node_id, source_id, node_kind, ...) — pin: exactly one
-        // function_declaration per file AND it joins to the correct
-        // _source.id. If batched VALUES misaligned source_id across
-        // rows, the count for one file would be 0 and the other would
-        // be doubled.
-        let a_fn_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM _ast \
-                 WHERE node_kind = 'function_declaration' AND source_id = ?1",
-                [&a_source_id],
+        // _ast(nid, kind_id, ...) — pin: exactly one function_declaration
+        // per file (the nid range IS the file linkage). If batched VALUES
+        // misaligned nids across rows, the count for one file would be 0
+        // and the other would be doubled.
+        let fn_count_for = |rel: &str| -> i64 {
+            let (lo, hi) = leyline_ts::schema::file_nid_range(
+                leyline_ts::schema::lookup_file_id(&conn, rel)
+                    .unwrap()
+                    .unwrap(),
+            );
+            conn.query_row(
+                "SELECT COUNT(*) FROM _ast a JOIN kinds k ON k.kind_id = a.kind_id \
+                 WHERE k.raw_kind = 'function_declaration' AND a.nid BETWEEN ?1 AND ?2",
+                rusqlite::params![lo, hi],
                 |r| r.get(0),
             )
-            .unwrap();
-        let b_fn_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM _ast \
-                 WHERE node_kind = 'function_declaration' AND source_id = ?1",
-                [&b_source_id],
-                |r| r.get(0),
-            )
-            .unwrap();
+            .unwrap()
+        };
+        let a_fn_count: i64 = fn_count_for(&a_source_id);
+        let b_fn_count: i64 = fn_count_for(&b_source_id);
         assert_eq!(
             a_fn_count, 1,
             "a.go must contribute exactly 1 function_declaration via batched insert",
@@ -4234,6 +4281,58 @@ mod tests {
         assert_eq!(
             b_fn_count, 1,
             "b.go must contribute exactly 1 function_declaration via batched insert",
+        );
+    }
+
+    /// The projection version is stamped on every parse AND the literal is
+    /// pinned. Bead `ley-line-open-cbd3c9` records that v3/v4 both shipped
+    /// as blind bumps (no test named the string, so two in-flight changes
+    /// once claimed the same number). This is the non-blind pin: bumping
+    /// the constant without meaning it fails here; meaning it, you update
+    /// this literal in the same diff that documents the new shape in
+    /// `daemon/version.rs`.
+    #[test]
+    fn projection_schema_version_is_stamped_and_pinned() {
+        assert_eq!(
+            crate::daemon::version::PROJECTION_SCHEMA_VERSION,
+            "projection-v5",
+            "the projection version literal is pinned — see version.rs docs \
+             before changing it",
+        );
+
+        let td = TempDir::new().unwrap();
+        std::fs::write(td.path().join("v.go"), b"package v\n").unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        parse_into_conn(&conn, td.path(), Some("go"), None).unwrap();
+        assert_eq!(
+            get_meta(&conn, "projection_schema_version")
+                .unwrap()
+                .as_deref(),
+            Some("projection-v5"),
+            "every parse must stamp _meta.projection_schema_version",
+        );
+    }
+
+    /// A pre-v5 arena is refused at open with an actionable message, not
+    /// migrated and not silently clobbered.
+    #[test]
+    fn a_pre_v5_arena_is_refused_at_open() {
+        let td = TempDir::new().unwrap();
+        std::fs::write(td.path().join("v.go"), b"package v\n").unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        parse_into_conn(&conn, td.path(), Some("go"), None).unwrap();
+        // Forge a v4 stamp on an otherwise-live arena.
+        set_meta(&conn, "projection_schema_version", "projection-v4").unwrap();
+        let err = parse_into_conn(&conn, td.path(), Some("go"), None)
+            .expect_err("a projection-v4 arena must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("projection-v4") && msg.contains("projection-v5"),
+            "the refusal must name both versions; got: {msg}",
+        );
+        assert!(
+            msg.contains("reparse"),
+            "the refusal must tell the operator the remedy; got: {msg}",
         );
     }
 

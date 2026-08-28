@@ -75,29 +75,37 @@ pub fn cmd_inspect(
 
 /// Look up a node by ID and pretty-print its columns.
 fn lookup_node(conn: &Connection, id: &str) -> Result<()> {
-    let mut stmt =
-        conn.prepare("SELECT id, parent_id, name, kind, size FROM nodes WHERE id = ?1")?;
+    // The CLI addresses nodes by display path; the projection keys on
+    // integer nids (projection-v5). Resolve, then render back.
+    let Some(nid) = leyline_schema::resolve_path(conn, id)? else {
+        anyhow::bail!("node not found: {id}");
+    };
+    let mut stmt = conn.prepare("SELECT parent_nid, kind, size FROM nodes WHERE nid = ?1")?;
 
-    let exists = stmt.query_row([id], |row| {
-        let id: String = row.get(0)?;
-        let parent_id: String = row.get(1)?;
-        let name: String = row.get(2)?;
-        let kind: i64 = row.get(3)?;
-        let size: i64 = row.get(4)?;
-
-        let kind_label = if kind == 1 { "dir" } else { "file" };
-
-        println!("id:        {id}");
-        println!("parent_id: {parent_id}");
-        println!("name:      {name}");
-        println!("kind:      {kind} ({kind_label})");
-        println!("size:      {size}");
-
-        Ok(())
+    let exists = stmt.query_row([nid], |row| {
+        let parent_nid: Option<i64> = row.get(0)?;
+        let kind: i64 = row.get(1)?;
+        let size: i64 = row.get(2)?;
+        Ok((parent_nid, kind, size))
     });
 
     match exists {
-        Ok(()) => Ok(()),
+        Ok((parent_nid, kind, size)) => {
+            let parent_path = match parent_nid {
+                Some(p) => leyline_schema::node_path(conn, p)?.unwrap_or_default(),
+                None => String::new(),
+            };
+            let name = id.rsplit_once('/').map(|(_, n)| n).unwrap_or(id);
+            let kind_label = if kind == 1 { "dir" } else { "file" };
+
+            println!("id:        {id}");
+            println!("nid:       {nid}");
+            println!("parent_id: {parent_path}");
+            println!("name:      {name}");
+            println!("kind:      {kind} ({kind_label})");
+            println!("size:      {size}");
+            Ok(())
+        }
         Err(rusqlite::Error::QueryReturnedNoRows) => {
             anyhow::bail!("node not found: {id}");
         }
@@ -144,7 +152,8 @@ mod tests {
         create_schema(&conn).unwrap();
         // Insert one known node so the table exists but the queried
         // id doesn't match.
-        insert_node(&conn, "real_node", "real_node", 1, 0, 0, "").unwrap();
+        let name_id = leyline_schema::intern_name(&conn, "real_node").unwrap();
+        insert_node(&conn, 42, Some(-1), Some(name_id), None, 1, 0, 0, 0, "").unwrap();
 
         let err = lookup_node(&conn, "missing_id").expect_err("must error on missing id");
         let msg = format!("{err:#}");

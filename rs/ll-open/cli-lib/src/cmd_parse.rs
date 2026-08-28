@@ -873,6 +873,61 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
 /// set from the git watcher). When `Some`, only files in the scope are stat'd
 /// and reparsed, and only those paths are considered for deletion. When
 /// `None`, the entire `source` tree is walked.
+/// projection-v5 refuses a pre-v5 arena rather than migrating it: the
+/// projection is DERIVED-ONLY (no identity domain — TABLE_CONTRACT §1),
+/// so a stale arena is rebuilt by a cold reparse, never patched in
+/// place. Without this guard, `CREATE TABLE IF NOT EXISTS` would no-op
+/// against the old TEXT-keyed tables and the first INSERT would fail
+/// with a confusing "no column named nid".
+///
+/// Two detection layers (seam-audit COMMENT-1): the version label when
+/// present, AND a direct shape probe — arenas written before the
+/// `projection_schema_version` key existed carry no label at all, and
+/// the label check alone would wave them through. The shape probe also
+/// cannot false-refuse a crashed half-built v5 arena, because a v5
+/// `nodes` table always has the `nid` column from its first CREATE.
+///
+/// Called from the parse path AND from the daemon's warm-start branches
+/// (publication-audit F1): a serve-only daemon (`--source` unset) never
+/// parses, and without the open-time check it would publish a v4 image
+/// to the arena and serve ops that each die with per-op "no such column:
+/// nid" noise instead of this one actionable refusal.
+///
+/// A db with no `_file_index` has no projection to refuse — cold starts
+/// and fresh live dbs pass through.
+pub(crate) fn refuse_pre_v5_projection(conn: &Connection) -> Result<()> {
+    if conn.prepare("SELECT 1 FROM _file_index LIMIT 1").is_err() {
+        return Ok(());
+    }
+    if let Ok(Some(stored)) = get_meta(conn, "projection_schema_version")
+        && stored != crate::daemon::version::PROJECTION_SCHEMA_VERSION
+    {
+        bail!(
+            "this arena was written by {stored}; this binary writes {}. The \
+             projection is derived state — delete the .db (and its sibling \
+             .capnp segment files keep their lineage) and reparse cold.",
+            crate::daemon::version::PROJECTION_SCHEMA_VERSION,
+        );
+    }
+    let nodes_lacks_nid: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes') \
+             AND NOT EXISTS(SELECT 1 FROM pragma_table_info('nodes') WHERE name='nid')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if nodes_lacks_nid {
+        bail!(
+            "this arena's `nodes` table predates {} (no `nid` column — a \
+             pre-versioning legacy shape). The projection is derived state \
+             — delete the .db and reparse cold.",
+            crate::daemon::version::PROJECTION_SCHEMA_VERSION,
+        );
+    }
+    Ok(())
+}
+
 pub fn parse_into_conn(
     conn: &Connection,
     source: &Path,
@@ -913,47 +968,7 @@ pub fn parse_into_conn(
     // Check if tables already exist (incremental mode).
     let incremental = conn.prepare("SELECT 1 FROM _file_index LIMIT 1").is_ok();
 
-    // projection-v5 refuses a pre-v5 arena rather than migrating it: the
-    // projection is DERIVED-ONLY (no identity domain — TABLE_CONTRACT §1),
-    // so a stale arena is rebuilt by a cold reparse, never patched in
-    // place. Without this guard, `CREATE TABLE IF NOT EXISTS` would no-op
-    // against the old TEXT-keyed tables and the first INSERT would fail
-    // with a confusing "no column named nid".
-    //
-    // Two detection layers (seam-audit COMMENT-1): the version label when
-    // present, AND a direct shape probe — arenas written before the
-    // `projection_schema_version` key existed carry no label at all, and
-    // the label check alone would wave them through. The shape probe also
-    // cannot false-refuse a crashed half-built v5 arena, because a v5
-    // `nodes` table always has the `nid` column from its first CREATE.
-    if incremental {
-        if let Ok(Some(stored)) = get_meta(conn, "projection_schema_version")
-            && stored != crate::daemon::version::PROJECTION_SCHEMA_VERSION
-        {
-            bail!(
-                "this arena was written by {stored}; this binary writes {}. The \
-                 projection is derived state — delete the .db (and its sibling \
-                 .capnp segment files keep their lineage) and reparse cold.",
-                crate::daemon::version::PROJECTION_SCHEMA_VERSION,
-            );
-        }
-        let nodes_lacks_nid: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes') \
-                 AND NOT EXISTS(SELECT 1 FROM pragma_table_info('nodes') WHERE name='nid')",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(false);
-        if nodes_lacks_nid {
-            bail!(
-                "this arena's `nodes` table predates {} (no `nid` column — a \
-                 pre-versioning legacy shape). The projection is derived state \
-                 — delete the .db and reparse cold.",
-                crate::daemon::version::PROJECTION_SCHEMA_VERSION,
-            );
-        }
-    }
+    refuse_pre_v5_projection(conn)?;
 
     // Tables only (no secondary indexes). At registry-repo scale the
     // bulk INSERT loop pays O(rows × indexes × log N) on B-tree
@@ -1313,6 +1328,29 @@ pub fn parse_into_conn(
     conn.pragma_update(None, "foreign_keys", "ON")?;
 
     conn.execute_batch("BEGIN")?;
+
+    // Roll back on any bail between here and COMMIT. parse_into_conn runs
+    // on the daemon's long-lived writer connection and the watcher survives
+    // a failed parse; without this, an in-transaction error (ordinal-space
+    // overflow, parent-unmapped bail, constraint violation) leaves that
+    // connection inside the open transaction — every later reparse then
+    // fails at BEGIN until restart, and interim writer-connection writes
+    // silently join the zombie transaction (publication-audit F2, bead
+    // `ley-line-open-17c271`).
+    struct TxRollbackGuard<'c> {
+        conn: &'c Connection,
+        armed: bool,
+    }
+    impl Drop for TxRollbackGuard<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                // Best-effort: the original error is already propagating; a
+                // ROLLBACK failure here must not mask it.
+                let _ = self.conn.execute_batch("ROLLBACK");
+            }
+        }
+    }
+    let mut tx_guard = TxRollbackGuard { conn, armed: true };
 
     // Defer FK enforcement to COMMIT: with immediate FKs, every node_child /
     // _ast.node_hash insert probes node_content's BLOB PK synchronously (~880k
@@ -1841,6 +1879,7 @@ pub fn parse_into_conn(
     let sub_capnp_flush_end = std::time::Instant::now();
 
     conn.execute_batch("COMMIT")?;
+    tx_guard.armed = false;
     let sub_commit_end = std::time::Instant::now();
 
     // Merkle-AST IR (ADR-0027): count the UNRESOLVED reference targets —
@@ -1938,9 +1977,13 @@ pub fn parse_into_conn(
 
     // ---- Post-sweep ----
     //
-    // Skip orphaned-dir sweep on scoped passes: it would walk the full
-    // _file_index tree and incorrectly drop dirs whose other (out-of-scope)
-    // files weren't loaded into this run. Full-tree passes still run it.
+    // The sweep is nodes-driven (`nid < -1` with no children in `nodes`),
+    // so it is safe under scope: out-of-scope files keep their presentation
+    // rows, so their dirs always have children and cannot be dropped. The
+    // old `scope.is_none()` gate was inherited from the pre-v5 sweep that
+    // walked `_file_index`; keeping it left watcher-driven (scoped)
+    // deletions with phantom empty dir rows no later pass ever reaped
+    // (publication-audit F4, bead `ley-line-open-17c271`).
     //
     // Cold-parse fast-path: when no files were deleted this run, no dir
     // node can be orphaned — `ensure_dirs` only inserts dirs whose
@@ -1951,7 +1994,7 @@ pub fn parse_into_conn(
     // 535K-row nodes table without an `idx_kind` to accelerate it).
     // See bead `ley-line-open-cbbedf` Attack 3.
     let sweep_close_start = std::time::Instant::now();
-    if scope.is_none() && deleted > 0 {
+    if deleted > 0 {
         let swept = sweep_orphaned_dirs(conn)?;
         if swept > 0 {
             eprintln!("{swept} orphaned dirs removed");
@@ -3759,6 +3802,50 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_parse_leaves_the_connection_out_of_transaction() {
+        // Publication-audit F2 (bead `ley-line-open-17c271`): parse_into_conn
+        // runs on the daemon's long-lived writer connection. If the insert
+        // phase bails between BEGIN and COMMIT, the connection must NOT be
+        // left inside the open transaction — the daemon watcher survives the
+        // error and loops, so a poisoned connection turns one bad parse into
+        // "every later reparse fails at BEGIN until restart", with interim
+        // writer-connection writes silently joining the zombie transaction.
+        //
+        // Failure injection: `_ast` uses plain INSERT (delete_file_rows
+        // guarantees the range is clear on the honest path), so pre-seeding
+        // a row at the nid the next parse will mint (file_id 2, ordinal 0)
+        // makes the bulk flush fail with a PK conflict mid-transaction.
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        std::fs::write(root.join("a.go"), b"package m\n").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        parse_into_conn(&conn, root, None, None).unwrap();
+
+        // b.go will intern as file_id 2; ordinal 0 is its file node.
+        conn.execute(
+            "INSERT INTO _ast (nid, kind_id, start_byte, end_byte, start_row, start_col, end_row, end_col, node_hash) \
+             VALUES (?1, 1, 0, 0, 0, 0, 0, 0, NULL)",
+            [leyline_schema::file_nid(2, 0)],
+        )
+        .unwrap();
+        std::fs::write(root.join("b.go"), b"package m\nfunc B() {}\n").unwrap();
+
+        let err = parse_into_conn(&conn, root, None, None);
+        assert!(err.is_err(), "the seeded PK conflict must surface as Err");
+        assert!(
+            conn.is_autocommit(),
+            "a failed parse must roll its transaction back, not poison the \
+             writer connection with an open transaction",
+        );
+        // The connection stays usable: a fresh transaction opens cleanly.
+        conn.execute_batch("BEGIN; COMMIT;").expect(
+            "the writer connection must accept a new transaction after a \
+             failed parse",
+        );
+    }
+
+    #[test]
     fn parse_into_conn_skips_oversized_files() {
         // Scale-guard pin. parse_into_conn must skip files larger than
         // MAX_PARSE_FILE_SIZE rather than reading them into memory. A
@@ -3868,6 +3955,60 @@ mod tests {
             )
             .unwrap();
         assert_eq!(keep_present, 1);
+    }
+
+    #[test]
+    fn a_scoped_deletion_sweeps_the_orphaned_dir_row() {
+        // Publication-audit F4 (bead `ley-line-open-17c271`): the sweep was
+        // gated on `scope.is_none()`, a rationale inherited from the pre-v5
+        // sweep that walked `_file_index`. The v5 sweep is nodes-driven —
+        // out-of-scope files keep their presentation rows, so their dirs
+        // always have children and cannot be dropped by a scoped pass. The
+        // stale gate meant a watcher-driven (scoped) deletion left a phantom
+        // empty dir row that no later pass ever reaped.
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        std::fs::create_dir_all(root.join("doomed")).unwrap();
+        std::fs::create_dir_all(root.join("kept")).unwrap();
+        std::fs::write(root.join("doomed/a.go"), b"package m\n").unwrap();
+        std::fs::write(root.join("kept/b.go"), b"package m\n").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        parse_into_conn(&conn, root, None, None).unwrap();
+        let doomed_nid = leyline_ts::schema::resolve_path(&conn, "doomed")
+            .unwrap()
+            .expect("doomed/ dir row must exist after cold parse");
+
+        // Watcher-style event: the file vanishes, the pass is scoped to it.
+        std::fs::remove_file(root.join("doomed/a.go")).unwrap();
+        std::fs::remove_dir(root.join("doomed")).unwrap();
+        let scope = vec!["doomed/a.go".to_string()];
+        let r2 = parse_into_conn(&conn, root, None, Some(&scope)).unwrap();
+        assert_eq!(r2.deleted, 1, "the scoped pass must observe the deletion");
+
+        let dir_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE nid = ?1",
+                [doomed_nid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dir_after, 0,
+            "a scoped deletion must sweep the now-empty dir row — the \
+             nodes-driven sweep is safe under scope",
+        );
+
+        // The out-of-scope dir and its file survive untouched.
+        let kept: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE nid IN \
+                 (SELECT nid FROM v_node_path WHERE path IN ('kept', 'kept/b.go'))",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 2, "out-of-scope rows must survive the scoped sweep");
     }
 
     /// `node_refs` and `node_defs` are flushed through `flush_batched_for`,

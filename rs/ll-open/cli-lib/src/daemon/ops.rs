@@ -1070,26 +1070,46 @@ fn query_token_refs(conn: &Connection, token: &str, table: &str) -> Result<Vec<W
     let nids: Vec<i64> = stmt
         .query_map([token], |row| row.get(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(nids.into_iter().map(|nid| wire_ref_of(conn, nid)).collect())
+    nids.into_iter().map(|nid| wire_ref_of(conn, nid)).collect()
 }
 
 /// Render one nid to the wire's `(node_id, source_id)` display pair. An
 /// injected-node nid (no `nodes` row) renders as its decimal value — it
 /// never had a resolvable tree address, only a fact-row key.
-fn wire_ref_of(conn: &Connection, nid: i64) -> WireRef {
-    let node_id = leyline_schema::node_path(conn, nid)
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| nid.to_string());
+fn wire_ref_of(conn: &Connection, nid: i64) -> Result<WireRef> {
+    // A real render failure (SQL error) PROPAGATES — silently degrading to
+    // a fallback would produce well-formed wrong output with no error
+    // signal (seam-audit F3).
     let source_id = leyline_schema::nid_file_id(nid)
-        .and_then(|fid| {
-            conn.query_row("SELECT id FROM _source WHERE file_id = ?1", [fid], |r| {
-                r.get::<_, String>(0)
-            })
-            .ok()
+        .map(|fid| {
+            query_row_opt(
+                conn,
+                "SELECT id FROM _source WHERE file_id = ?1",
+                [fid],
+                |r| r.get::<_, String>(0),
+            )
         })
+        .transpose()?
+        .flatten()
         .unwrap_or_default();
-    WireRef { node_id, source_id }
+    // The legitimate no-row case is an injected-subtree occurrence (its
+    // ordinal lies past the host file's `_ast` count; it never had a
+    // resolvable tree address). Render it as an EXPLICIT file-anchored
+    // injected form — never a bare integer, which would share the display
+    // namespace with a file literally named that digit string and be
+    // indistinguishable as injected (seam-audit COMMENT-2). Bare decimal
+    // survives only for a nid whose file was never interned at all.
+    let node_id = match leyline_schema::node_path(conn, nid)? {
+        Some(path) => path,
+        None if !source_id.is_empty() => {
+            format!(
+                "{source_id}#inj@{}",
+                leyline_schema::nid_ordinal(nid).unwrap_or_default()
+            )
+        }
+        None => nid.to_string(),
+    };
+    Ok(WireRef { node_id, source_id })
 }
 
 /// Find callees of a node — the definitions of every token the node references.
@@ -1122,7 +1142,9 @@ fn op_find_callees(ctx: &DaemonContext, id: &str) -> Result<String> {
                 let nids: Vec<i64> = stmt
                     .query_map([nid], |row| row.get(0))?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
-                nids.into_iter().map(|n| wire_ref_of(conn, n)).collect()
+                nids.into_iter()
+                    .map(|n| wire_ref_of(conn, n))
+                    .collect::<Result<Vec<_>>>()?
             }
             None => Vec::new(),
         };
@@ -1165,12 +1187,17 @@ fn op_get_token_map(ctx: &DaemonContext, table: &str, op: TokenMapOp) -> Result<
         //
         // projection-v5: the wire keeps display paths. Bulk export is the
         // one place the recursive v_node_path view pays for itself — one
-        // whole-tree render amortized over every row. LEFT JOIN so
-        // injected-node occurrences (no `nodes` row) keep an address (their
-        // decimal nid).
+        // whole-tree render amortized over every row. LEFT JOINs so
+        // injected-node occurrences (no `nodes` row) keep an EXPLICIT
+        // file-anchored injected address — mirror of `wire_ref_of`.
         let sql = format!(
-            "SELECT DISTINCT t.token, COALESCE(p.path, CAST(t.nid AS TEXT)) \
-             FROM {table} t LEFT JOIN v_node_path p ON p.nid = t.nid \
+            "SELECT DISTINCT t.token, COALESCE( \
+                 p.path, \
+                 s.id || '#inj@' || (t.nid & 16777215), \
+                 CAST(t.nid AS TEXT)) \
+             FROM {table} t \
+             LEFT JOIN v_node_path p ON p.nid = t.nid \
+             LEFT JOIN _source s ON s.file_id = (t.nid >> 24) \
              ORDER BY 1, 2"
         );
         let mut stmt = conn.prepare_cached(&sql)?;
@@ -1439,7 +1466,7 @@ fn find_node_at_position(
            AND start_row <= ?3 AND end_row >= ?3 \
            AND (start_row < ?3 OR start_col <= ?4) \
            AND (end_row > ?3 OR end_col >= ?4) \
-         ORDER BY (end_byte - start_byte) ASC \
+         ORDER BY (end_byte - start_byte) ASC, nid ASC \
          LIMIT 1",
         rusqlite::params![lo, hi, line, col],
         |row| row.get::<_, i64>(0),
@@ -1889,14 +1916,16 @@ where
     let mut rows = stmt
         .query_map(rusqlite::params![lo, hi], mapper)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    // Wire contract: consumers address nodes by display path. Render each
-    // row's `nid` and surface it as `node_id` (keeping `nid` additively).
+    // Wire contract: consumers address nodes by display path, and EVERY row
+    // carries `node_id` (seam-audit F2 — v4 always had one; a strict decoder
+    // may reject its absence). An unrenderable nid falls back to its decimal
+    // form, matching `wire_ref_of`; a real render failure propagates.
     for v in &mut rows {
-        if let Some(nid) = v.get("nid").and_then(|n| n.as_i64())
-            && let Ok(Some(path)) = leyline_schema::node_path(conn, nid)
-            && let Some(obj) = v.as_object_mut()
-        {
-            obj.insert("node_id".to_string(), json!(path));
+        if let Some(nid) = v.get("nid").and_then(|n| n.as_i64()) {
+            let path = leyline_schema::node_path(conn, nid)?.unwrap_or_else(|| nid.to_string());
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("node_id".to_string(), json!(path));
+            }
         }
     }
     Ok(rows)
@@ -2575,8 +2604,8 @@ fn query_definitions(conn: &Connection, token: &str) -> Result<Vec<DefRow>> {
         .into_iter()
         .map(
             |(nid, node_kind, start_line, start_col, end_line, end_col, start_byte, end_byte)| {
-                let wire = wire_ref_of(conn, nid);
-                DefRow {
+                let wire = wire_ref_of(conn, nid)?;
+                Ok(DefRow {
                     node_id: wire.node_id,
                     source_id: wire.source_id,
                     node_kind: node_kind.unwrap_or_default(),
@@ -2586,10 +2615,10 @@ fn query_definitions(conn: &Connection, token: &str) -> Result<Vec<DefRow>> {
                     end_col: end_col.unwrap_or(0),
                     start_byte: start_byte.unwrap_or(0),
                     end_byte: end_byte.unwrap_or(0),
-                }
+                })
             },
         )
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     Ok(rows)
 }
 
@@ -2608,7 +2637,7 @@ fn query_callees(conn: &Connection, node_id: &str) -> Result<Vec<WireRef>> {
     let nids: Vec<i64> = stmt
         .query_map([nid], |row| row.get(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(nids.into_iter().map(|n| wire_ref_of(conn, n)).collect())
+    nids.into_iter().map(|n| wire_ref_of(conn, n)).collect()
 }
 
 /// Best-effort hover lookup via `_lsp` table. Returns None if no row
@@ -2745,7 +2774,7 @@ fn op_at_position(ctx: &std::sync::Arc<DaemonContext>, p: &LspPosition) -> Resul
               AND d.start_row <= ?3 AND d.end_row >= ?3 \
               AND (d.start_row < ?3 OR d.start_col <= ?4) \
               AND (d.end_row > ?3 OR d.end_col >= ?4) \
-            ORDER BY (d.end_byte - d.start_byte) ASC \
+            ORDER BY (d.end_byte - d.start_byte) ASC, d.nid ASC \
             LIMIT 1";
         let row: Option<(String, String)> =
             query_row_opt(conn, sql, rusqlite::params![lo, hi, line, col], |r| {
@@ -3053,7 +3082,7 @@ fn op_search_symbols(
         // collapses N raw kinds into ~5 categories).
         let mut out = String::new();
         for (token, nid, node_kind) in rows {
-            let wire = wire_ref_of(conn, nid);
+            let wire = wire_ref_of(conn, nid)?;
             let (node_id, source_id) = (wire.node_id, wire.source_id);
             let kind = classify_node_kind(&node_kind);
             if let Some(want) = kind_filter.as_deref()

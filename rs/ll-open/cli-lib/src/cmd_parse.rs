@@ -919,16 +919,40 @@ pub fn parse_into_conn(
     // place. Without this guard, `CREATE TABLE IF NOT EXISTS` would no-op
     // against the old TEXT-keyed tables and the first INSERT would fail
     // with a confusing "no column named nid".
-    if incremental
-        && let Ok(Some(stored)) = get_meta(conn, "projection_schema_version")
-        && stored != crate::daemon::version::PROJECTION_SCHEMA_VERSION
-    {
-        bail!(
-            "this arena was written by {stored}; this binary writes {}. The \
-             projection is derived state — delete the .db (and its sibling \
-             .capnp segment files keep their lineage) and reparse cold.",
-            crate::daemon::version::PROJECTION_SCHEMA_VERSION,
-        );
+    //
+    // Two detection layers (seam-audit COMMENT-1): the version label when
+    // present, AND a direct shape probe — arenas written before the
+    // `projection_schema_version` key existed carry no label at all, and
+    // the label check alone would wave them through. The shape probe also
+    // cannot false-refuse a crashed half-built v5 arena, because a v5
+    // `nodes` table always has the `nid` column from its first CREATE.
+    if incremental {
+        if let Ok(Some(stored)) = get_meta(conn, "projection_schema_version")
+            && stored != crate::daemon::version::PROJECTION_SCHEMA_VERSION
+        {
+            bail!(
+                "this arena was written by {stored}; this binary writes {}. The \
+                 projection is derived state — delete the .db (and its sibling \
+                 .capnp segment files keep their lineage) and reparse cold.",
+                crate::daemon::version::PROJECTION_SCHEMA_VERSION,
+            );
+        }
+        let nodes_lacks_nid: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes') \
+                 AND NOT EXISTS(SELECT 1 FROM pragma_table_info('nodes') WHERE name='nid')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        if nodes_lacks_nid {
+            bail!(
+                "this arena's `nodes` table predates {} (no `nid` column — a \
+                 pre-versioning legacy shape). The projection is derived state \
+                 — delete the .db and reparse cold.",
+                crate::daemon::version::PROJECTION_SCHEMA_VERSION,
+            );
+        }
     }
 
     // Tables only (no secondary indexes). At registry-repo scale the
@@ -4311,6 +4335,33 @@ mod tests {
         assert!(
             msg.contains("reparse"),
             "the refusal must tell the operator the remedy; got: {msg}",
+        );
+    }
+
+    /// Seam-audit COMMENT-1 closing test: an arena from BEFORE the
+    /// `projection_schema_version` key existed carries no label at all —
+    /// the label check alone waves it through and the parse then dies on
+    /// "no column named nid" AFTER mutating the arena. The shape probe
+    /// must refuse it up front.
+    #[test]
+    fn a_pre_versioning_legacy_arena_is_refused_at_open() {
+        let td = TempDir::new().unwrap();
+        std::fs::write(td.path().join("v.go"), b"package v\n").unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        // A minimal legacy-shaped arena: old TEXT-keyed nodes, an
+        // incremental marker (_file_index), and NO version key anywhere.
+        conn.execute_batch(
+            "CREATE TABLE nodes (id TEXT PRIMARY KEY, name TEXT, kind INTEGER, \
+                                 size INTEGER, mtime INTEGER, record TEXT);
+             CREATE TABLE _file_index (path TEXT PRIMARY KEY, mtime INTEGER, size INTEGER);",
+        )
+        .unwrap();
+        let err = parse_into_conn(&conn, td.path(), Some("go"), None)
+            .expect_err("a label-less legacy arena must be refused by the shape probe");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no `nid` column") && msg.contains("reparse"),
+            "the refusal must name the shape mismatch and the remedy; got: {msg}",
         );
     }
 

@@ -635,7 +635,7 @@ fn lookup_construct_node_id(
            AND (a.start_row < ?3 OR a.start_col <= ?4) \
            AND (a.end_row > ?3 OR a.end_col >= ?4) \
            AND k.raw_kind IN ({placeholders}) \
-         ORDER BY (a.end_byte - a.start_byte) ASC \
+         ORDER BY (a.end_byte - a.start_byte) ASC, a.nid ASC \
          LIMIT 1"
     );
 
@@ -810,7 +810,7 @@ fn lookup_referrer_node_id(
                AND start_row <= ?3 AND end_row >= ?3 \
                AND (start_row < ?3 OR start_col <= ?4) \
                AND (end_row > ?3 OR end_col >= ?4) \
-             ORDER BY (end_byte - start_byte) ASC \
+             ORDER BY (end_byte - start_byte) ASC, nid ASC \
              LIMIT 1",
             rusqlite::params![lo, hi, line, col],
             |r| r.get(0),
@@ -1228,7 +1228,7 @@ fn merge_symbol(
             "SELECT nid FROM _ast \
              WHERE start_row = ?1 AND start_col <= ?2 \
                AND end_row >= ?3 \
-             ORDER BY (end_byte - start_byte) ASC \
+             ORDER BY (end_byte - start_byte) ASC, nid ASC \
              LIMIT 1",
             params![
                 sym.selection_range.start.line,

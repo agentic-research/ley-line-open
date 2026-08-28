@@ -366,6 +366,10 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = cli ]; then
     # lsp_enrich_pipeline: kills the whole-function replacement mutants on
     # `enrich_files_with_client` (four survived on the PR that added the
     # test — nothing observed that function's counts or writes before it).
+    # pointer_store_dual_write_test: kills the blob-serializer stubs
+    # (`serialize_ast_node_list_record -> Ok(())` survived on the Phase A
+    # locator-eviction PR — the F1 gate that observes blob content lived
+    # only in this file, which the slice did not run).
     run_slice integration \
         -C --lib \
         -C --test -C execution_client \
@@ -373,6 +377,7 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = cli ]; then
         -C --test -C cdc_activation_consumer_test \
         -C --test -C cdc_command_test \
         -C --test -C lsp_enrich_pipeline \
+        -C --test -C pointer_store_dual_write_test \
         --package leyline-cli-lib --test-workspace=false
   fi
 fi

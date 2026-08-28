@@ -1799,25 +1799,12 @@ mod tests {
         );
     }
 
-    /// `has_column` is the idempotence guard for every additive ALTER in this
-    /// module: `create_ir_tables` uses it for `node_hash`, and
-    /// `create_pointer_store_tables` for `blob_ord`. Stubbing it to a constant
-    /// broke nothing that was tested — `Ok(true)` skips the ALTER so the column
-    /// never appears and every INSERT naming it fails at runtime, while
-    /// `Ok(false)` re-runs the ALTER on an existing column and errors on the
-    /// second parse. Surfaced as two surviving mutants on bead
-    /// `ley-line-open-17c271`.
-
-    /// `create_ir_tables` stamps the ADR-0027 `node_hash` column onto the three
-    /// occurrence tables that predate it. Nothing asserted that it did, so
-    /// inverting its idempotence guard survived mutation: with the `!` deleted
-    /// the ALTER runs only when the column ALREADY exists, so a fresh arena
-    /// never gets `node_hash` at all and every INSERT naming it fails at
-    /// runtime, while a reparse hits "duplicate column name".
-    ///
-    /// Sibling of `create_pointer_store_tables_builds_and_is_idempotent` — both
-    /// are additive migrations run on EVERY parse, and SQLite has no
-    /// `ADD COLUMN IF NOT EXISTS` (bead `ley-line-open-17c271`).
+    /// `create_ir_tables` builds the ADR-0027 content tables and the base
+    /// DDL's `node_hash` FK is enforceable. (The pre-v5 additive-ALTER
+    /// mutation story this doc used to tell — `has_column` guards, inverted
+    /// idempotence — died with the migrations themselves in projection-v5;
+    /// the surviving contract is table existence, idempotence, and a live
+    /// FK.)
     #[test]
     fn create_ir_tables_builds_content_tables_and_fk_holds() {
         let conn = Connection::open_in_memory().unwrap();
@@ -2012,12 +1999,10 @@ mod tests {
         ] {
             let plan: Vec<String> = {
                 let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-                let rows = stmt
-                    .query_map(params![a_lo, a_hi], |r| r.get::<_, String>(3))
+                stmt.query_map(params![a_lo, a_hi], |r| r.get::<_, String>(3))
                     .unwrap()
                     .map(|r| r.unwrap())
-                    .collect();
-                rows
+                    .collect()
             };
             let rendered = plan.join(" | ");
             assert!(

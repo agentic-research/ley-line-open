@@ -378,6 +378,7 @@ end
     ///   1. `parse_hcl` is reachable and returns non-empty serialized bytes
     ///   2. `_ast` rows are emitted for a representative `.tf` source
     ///   3. HCL-grammar productions (`block`, `attribute`) appear in node_kind
+    ///
     /// Together these prove mache-d5e158 can consume LLO's HCL `_ast` rows
     /// the same way it consumes Go rows today.
     #[cfg(feature = "hcl")]

@@ -1450,12 +1450,10 @@ mod tests {
                      ORDER BY p.path",
                 )
                 .unwrap();
-            let rows = stmt
-                .query_map([], |r| r.get::<_, String>(0))
+            stmt.query_map([], |r| r.get::<_, String>(0))
                 .unwrap()
                 .map(|r| r.unwrap())
-                .collect::<Vec<_>>();
-            rows
+                .collect::<Vec<_>>()
         };
 
         let forward = vec![

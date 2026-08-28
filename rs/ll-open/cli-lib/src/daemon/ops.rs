@@ -925,17 +925,15 @@ fn op_list_children(ctx: &DaemonContext, id: &str) -> Result<String> {
                      FROM nodes n JOIN v_node_name v ON v.nid = n.nid \
                      WHERE n.parent_nid = ?1 ORDER BY v.name",
                 )?;
-                let rows = stmt
-                    .query_map([parent_nid], |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, i32>(2)?,
-                            row.get::<_, i64>(3)?,
-                        ))
-                    })?
-                    .collect::<Result<_, _>>()?;
-                rows
+                stmt.query_map([parent_nid], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i32>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })?
+                .collect::<Result<_, _>>()?
             }
             None => Vec::new(),
         };
@@ -2549,7 +2547,7 @@ fn query_definitions(conn: &Connection, token: &str) -> Result<Vec<DefRow>> {
         FROM node_defs d \
         WHERE d.token = ?1";
     let mut stmt = conn.prepare_cached(sql)?;
-    let raw: Vec<(
+    type RawDefRow = (
         i64,
         Option<String>,
         Option<i32>,
@@ -2558,7 +2556,8 @@ fn query_definitions(conn: &Connection, token: &str) -> Result<Vec<DefRow>> {
         Option<i32>,
         Option<i64>,
         Option<i64>,
-    )> = stmt
+    );
+    let raw: Vec<RawDefRow> = stmt
         .query_map([token], |row| {
             Ok((
                 row.get(0)?,

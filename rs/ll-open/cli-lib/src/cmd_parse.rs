@@ -63,9 +63,12 @@ use rusqlite::Connection;
 // Data structures for parallel parse (no DB access)
 // ---------------------------------------------------------------------------
 
+// projection-v5: `ParsedNode` no longer carries a `name` — the display name
+// derives from the interned kind + sibling `ord` at read time, so the id
+// string (still built for per-file correlation) is the only locator-shaped
+// field the worker emits.
 struct ParsedNode {
     id: String,
-    name: String,
     kind: i32,
     size: i64,
     record: String,
@@ -2797,12 +2800,6 @@ pub(crate) fn parse_file_pure(
     let root = tree.root_node();
     let lang_name = language.name();
 
-    let file_name = source_id
-        .rsplit_once('/')
-        .map(|(_, n)| n)
-        .unwrap_or(source_id)
-        .to_string();
-
     let mut nodes = Vec::new();
     let mut ast_entries = Vec::new();
     let mut refs = Vec::new();
@@ -2828,7 +2825,6 @@ pub(crate) fn parse_file_pure(
     // File node.
     nodes.push(ParsedNode {
         id: source_id.to_string(),
-        name: file_name,
         kind: 1,
         size: 0,
         record: String::new(),
@@ -3250,7 +3246,6 @@ fn fold_children(
             if has_named_children {
                 nodes.push(ParsedNode {
                     id: id.clone(),
-                    name,
                     kind: 1,
                     size: 0,
                     record: String::new(),
@@ -3259,7 +3254,6 @@ fn fold_children(
                 let text = child.utf8_text(content).unwrap_or("");
                 nodes.push(ParsedNode {
                     id: id.clone(),
-                    name,
                     kind: 0,
                     size: text.len() as i64,
                     record: text.to_string(),
@@ -3614,18 +3608,6 @@ fn fold_injected_node(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Append directory-node rows (one per path component) to the nodes
-/// batch buffer. Deduplicates via the `created` set so a 50k-file
-/// registry repo with deeply-shared dir hierarchies doesn't emit
-/// duplicate `<prefix>` rows. The dir rows use `kind = 1` and empty
-/// `record`, matching the legacy `ensure_dirs` behavior (which did the
-/// same insert through `INSERT OR IGNORE`).
-///
-/// Why no `INSERT OR IGNORE`: nodes_buf already de-dupes via the
-/// `created` set, and `INSERT OR REPLACE` (used by nodes_buf below) is
-/// idempotent for matching primary keys. The `OR IGNORE` here was
-/// defensive against the per-file loop re-inserting the same dir; the
-/// set membership check accomplishes the same.
 // (The pre-v5 `collect_dirs` path builder is gone: directory rows are
 // interned + upserted through `leyline_schema::ensure_dir_nodes`, memoized
 // per file path in the insert loop's `dir_cache`.)
@@ -4002,19 +3984,6 @@ mod tests {
         assert_eq!(chunk_count_for(PARSE_CHUNK_FILES * 3), 3);
     }
 
-    /// `flush_in_batches` walks `i` forward one batch at a time and flushes a
-    /// short tail. Nothing exercised that walk: every existing test flushes
-    /// far fewer rows than one batch, so the loop body ran at most once and
-    /// its arithmetic was unobserved. Mutating `i + batch` to `i - batch`, or
-    /// `i += batch` to `i -= batch`, survived (bead `ley-line-open-17c271`).
-    ///
-    /// A silent failure here drops or duplicates rows at a batch boundary —
-    /// the projection would be wrong only on corpora large enough to cross
-    /// 3000 rows in a single table, which is every real one and no test one.
-    ///
-    /// Sized `BULK_BATCH_ROWS * 2 + 1` so the loop runs twice AND leaves a
-    /// one-row tail, covering both the full-batch path and the partial one.
-
     /// `node_defs` / `node_refs` now carry their own span and grammar kind, so
     /// `query_definitions` reads them directly instead of LEFT JOINing `_ast`.
     /// That join was the reason the 3.15M-row `_ast` table had to be
@@ -4109,6 +4078,19 @@ mod tests {
              the NULL-preservation half of the contract is untested"
         );
     }
+
+    /// `flush_in_batches` walks `i` forward one batch at a time and flushes a
+    /// short tail. Nothing exercised that walk: every existing test flushes
+    /// far fewer rows than one batch, so the loop body ran at most once and
+    /// its arithmetic was unobserved. Mutating `i + batch` to `i - batch`, or
+    /// `i += batch` to `i -= batch`, survived (bead `ley-line-open-17c271`).
+    ///
+    /// A silent failure here drops or duplicates rows at a batch boundary —
+    /// the projection would be wrong only on corpora large enough to cross
+    /// 3000 rows in a single table, which is every real one and no test one.
+    ///
+    /// Sized `BULK_BATCH_ROWS * 2 + 1` so the loop runs twice AND leaves a
+    /// one-row tail, covering both the full-batch path and the partial one.
     #[test]
     fn flush_in_batches_lands_every_row_across_batch_boundaries() {
         let conn = Connection::open_in_memory().unwrap();

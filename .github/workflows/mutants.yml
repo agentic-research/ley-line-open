@@ -51,7 +51,27 @@ jobs:
     # allowlist arm is ~17 min by its own accounting above, and a diff arm has
     # been seen at 14 min — so the ceiling is higher, but a ceiling still beats
     # the 6-hour default when a mutant build wedges.
-    timeout-minutes: 60
+    #
+    # Raised 60 -> 90 on the projection-v5 PR, which hit the old ceiling at
+    # 60m44s with the fs slice still unrun. Both slices that DID run were
+    # clean (generic 188 in 6m, cli-lib 106 in 49m, zero missed either side),
+    # so this was the guard firing on run LENGTH, not on a survivor. Two
+    # things drove it, one transient and one permanent:
+    #
+    #   * transient — the diff arm scales with how many functions the diff
+    #     touches, and a workspace-wide re-key touches hundreds. 106 cli-lib
+    #     mutants against the ~14-min arm this ceiling was sized for.
+    #   * permanent — the cli-lib slice now builds `--features vec`, without
+    #     which `daemon/embed.rs` compiles out and its mutants are reported
+    #     MISSED having tested nothing (see tools/mutants_diff.sh). That is
+    #     real coverage the gate previously did not have, and it costs roughly
+    #     18s -> 28s per mutant in build time.
+    #
+    # 90 leaves headroom for the fs slice (~10 min) plus runner variance. If a
+    # future diff arm approaches this too, the fix is to parallelise the three
+    # slices into a matrix rather than to keep lifting the ceiling — they are
+    # independent, and `mutants_diff.sh` already takes a scope argument.
+    timeout-minutes: 90
     steps:
       # SHA-pinned: actions/checkout@v6.0.2 (Node 24)
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd

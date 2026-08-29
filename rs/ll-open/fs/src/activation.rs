@@ -900,4 +900,153 @@ mod tests {
             "after activation the probe must report convergence"
         );
     }
+
+    /// The page walk's RESULT, asserted as an exact vector — not merely
+    /// "nonempty". A page that silently returns nothing (or one arbitrary
+    /// nid) makes activation report a converged, fully-activated arena while
+    /// having visited no rows at all, and every count in `ActivationReport`
+    /// stays self-consistently zero. So the three things the SQL actually
+    /// promises are pinned by value:
+    ///
+    ///   1. WHICH nids — eligible leaves only. A directory (`kind = 1`) and
+    ///      an unwritten leaf (`record IS NULL`) are both excluded, so the
+    ///      answer is a strict subset of the rows present.
+    ///   2. ORDER — ascending `nid`. projection-v5 rides the PRIMARY KEY, and
+    ///      the keyset cursor below is only correct if the page is sorted.
+    ///   3. The CURSOR and the LIMIT — `nid > last` resumes strictly after the
+    ///      previous page, and `LIMIT` truncates from the front of that order.
+    ///      Without both, the caller's loop either re-walks the same page
+    ///      forever or skips rows.
+    #[test]
+    fn the_activation_page_returns_the_eligible_nids_in_key_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        leyline_schema::create_schema(&conn).unwrap();
+        let dir = crate::graph::fixtures::put_dir(&conn, "pkg", 100).unwrap();
+        let first = crate::graph::fixtures::put_file(&conn, "pkg/a.rs", 100, Some("a")).unwrap();
+        let second = crate::graph::fixtures::put_file(&conn, "pkg/b.rs", 100, Some("bb")).unwrap();
+        // Eligible-looking but not: no record yet.
+        crate::graph::fixtures::put_file(&conn, "pkg/c.rs", 100, None).unwrap();
+        let third = crate::graph::fixtures::put_file(&conn, "pkg/d.rs", 100, Some("ddd")).unwrap();
+
+        // The fixture really does span both nid classes and more than one
+        // file, so "ordered by nid" is a claim with content.
+        assert!(dir < 0, "a directory nid is negative: {dir}");
+        assert!(
+            first < second && second < third,
+            "file nids ascend with file_id: {first} {second} {third}"
+        );
+
+        assert_eq!(
+            query_activation_page(&conn, None, 16).unwrap(),
+            vec![first, second, third],
+            "the first page is every eligible leaf, ascending — dirs and \
+             record-less nodes excluded"
+        );
+        assert_eq!(
+            query_activation_page(&conn, Some(first), 16).unwrap(),
+            vec![second, third],
+            "the cursor resumes strictly AFTER the last nid of the prior page"
+        );
+        assert_eq!(
+            query_activation_page(&conn, None, 2).unwrap(),
+            vec![first, second],
+            "the limit truncates the front of the key order"
+        );
+        assert_eq!(
+            query_activation_page(&conn, Some(third), 16).unwrap(),
+            Vec::<i64>::new(),
+            "a cursor past the last eligible nid ends the walk"
+        );
+    }
+
+    /// The convergence probe must name the STALE node, and only the stale
+    /// one. Two nodes, the FRESH one deliberately lower in nid order, so the
+    /// probe has to walk past a satisfied node to reach the unsatisfied one:
+    ///
+    /// - Returning `None` here would declare a half-activated arena complete,
+    ///   which is the whole failure this probe exists to catch.
+    /// - Returning the FRESH node instead (what dropping the `!` on the
+    ///   freshness check does) inverts the predicate: activation would then
+    ///   loop forever re-activating an already-fresh node while the stale one
+    ///   is never visited. `Some(fresh)` and `Some(stale)` are both "found
+    ///   something", so only the exact nid distinguishes them.
+    #[test]
+    fn the_convergence_probe_names_the_stale_node_not_the_fresh_one() {
+        let conn = Connection::open_in_memory().unwrap();
+        leyline_schema::create_schema(&conn).unwrap();
+        create_chunked_content_schema(&conn).unwrap();
+        let alpha = "a".repeat(9_000);
+        let beta = "b".repeat(9_000);
+        let fresh = crate::graph::fixtures::put_file(&conn, "a.rs", 100, Some(&alpha)).unwrap();
+        let stale = crate::graph::fixtures::put_file(&conn, "b.rs", 100, Some(&beta)).unwrap();
+        assert!(
+            fresh < stale,
+            "the fresh node must sort FIRST, so the probe has to skip it: {fresh} {stale}"
+        );
+
+        activate_node(&conn, fresh).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        assert!(
+            has_chunked_content_in_transaction(&tx, fresh).unwrap(),
+            "fixture precondition: the first node is genuinely fresh"
+        );
+        assert!(
+            !has_chunked_content_in_transaction(&tx, stale).unwrap(),
+            "fixture precondition: the second node is genuinely stale"
+        );
+        assert_eq!(
+            first_nonfresh_node(&tx, 16).unwrap(),
+            Some(stale),
+            "the probe must skip the fresh node and name the STALE nid"
+        );
+        drop(tx);
+
+        activate_node(&conn, stale).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        assert_eq!(
+            first_nonfresh_node(&tx, 16).unwrap(),
+            None,
+            "with every node fresh the probe must report convergence"
+        );
+    }
+
+    /// Activation's precondition check on `nodes`, asserted as a REFUSAL.
+    /// Skipping it does not fail loudly later — activation would walk a table
+    /// it has not established the shape of and take whatever SQL error falls
+    /// out, so the named contract message is the observable.
+    ///
+    /// Both failure modes, because they are different queries: the table
+    /// absent entirely, and the table present but missing columns activation
+    /// reads. The third case is the one that proves the check is not simply
+    /// always-refusing — the real schema passes.
+    #[test]
+    fn the_nodes_contract_refuses_a_missing_table_and_missing_columns() {
+        let absent = Connection::open_in_memory().unwrap();
+        let err = validate_nodes_contract(&absent).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("missing required nodes table for CDC activation"),
+            "must refuse a missing table by name: {err:#}"
+        );
+
+        let partial = Connection::open_in_memory().unwrap();
+        partial
+            .execute_batch(
+                "CREATE TABLE nodes (nid INTEGER PRIMARY KEY, kind INTEGER, mtime INTEGER)",
+            )
+            .unwrap();
+        let err = validate_nodes_contract(&partial).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("missing required nodes columns"),
+            "must refuse an incomplete table by name: {message}"
+        );
+        assert!(
+            message.contains("record") && message.contains("size"),
+            "the refusal must NAME the columns it needs: {message}"
+        );
+
+        let real = Connection::open_in_memory().unwrap();
+        leyline_schema::create_schema(&real).unwrap();
+        validate_nodes_contract(&real).expect("the canonical schema satisfies the contract");
+    }
 }

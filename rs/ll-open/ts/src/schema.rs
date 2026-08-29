@@ -2051,4 +2051,185 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1, "only the root dir row should remain");
     }
+
+    // ---------------------------------------------------------------------
+    // Schema-construction EFFECTS.
+    //
+    // Every `create_*` here returns `Result<()>`, so a test that only
+    // `.unwrap()`s the call observes nothing: a body replaced with `Ok(())`
+    // passes it. Each test below therefore starts from a BARE connection —
+    // no sibling `create_*` that would have made the tables anyway — and
+    // asserts the objects the function is responsible for actually landed.
+    // ---------------------------------------------------------------------
+
+    /// Whether `sqlite_master` holds an object of this type under this name.
+    fn has_object(conn: &Connection, kind: &str, name: &str) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = ?1 AND name = ?2",
+            params![kind, name],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn create_ast_tables_creates_every_table_the_ast_pass_writes_to() {
+        // Bare connection ON PURPOSE. The sibling `create_ast_schema` builds
+        // the same five tables, so a test that called it first would pass
+        // against a `create_ast_tables` that did nothing at all.
+        let conn = Connection::open_in_memory().unwrap();
+        for table in ["nodes", "_source", "node_content", "node_child", "_ast"] {
+            assert!(
+                !has_object(&conn, "table", table),
+                "precondition: {table} must not exist before the call",
+            );
+        }
+
+        create_ast_tables(&conn).unwrap();
+
+        for table in ["nodes", "_source", "node_content", "node_child", "_ast"] {
+            assert!(
+                has_object(&conn, "table", table),
+                "{table} MUST exist after create_ast_tables",
+            );
+        }
+
+        // Usable, not merely present: the bulk-load pass writes a source row
+        // and an `_ast` row through exactly these tables.
+        let file_id = ensure_file_id(&conn, "main.go").unwrap();
+        insert_source(&conn, "main.go", "go", b"package main\n", file_id).unwrap();
+        insert_ast(&conn, file_nid(file_id, 0), 1, 0, 13, 0, 0, 1, 0, None).unwrap();
+
+        // Idempotent — `cmd_parse` calls it once per invocation on a
+        // possibly-existing arena.
+        create_ast_tables(&conn).unwrap();
+    }
+
+    #[test]
+    fn insert_source_ref_writes_a_path_row_with_no_inline_content() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_tables(&conn).unwrap();
+
+        insert_source_ref(&conn, "pkg/main.go", "go", "/repo/pkg/main.go", 7).unwrap();
+
+        let (id, language, path, content, file_id): (
+            String,
+            String,
+            Option<String>,
+            Option<Vec<u8>>,
+            i64,
+        ) = conn
+            .query_row(
+                "SELECT id, language, path, content, file_id FROM _source",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(id, "pkg/main.go");
+        assert_eq!(language, "go");
+        assert_eq!(path.as_deref(), Some("/repo/pkg/main.go"));
+        assert_eq!(
+            content, None,
+            "reference mode stores NO inline content — consumers read from disk",
+        );
+        assert_eq!(
+            file_id, 7,
+            "the interned file id is what `nid >> 24` joins against",
+        );
+
+        // INSERT OR REPLACE: re-registering the same id updates in place.
+        insert_source_ref(&conn, "pkg/main.go", "go", "/elsewhere/main.go", 7).unwrap();
+        let (n, path): (i64, Option<String>) = conn
+            .query_row("SELECT COUNT(*), MAX(path) FROM _source", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(n, 1, "re-registration must replace, not duplicate");
+        assert_eq!(path.as_deref(), Some("/elsewhere/main.go"));
+    }
+
+    #[test]
+    fn create_ir_tables_creates_the_content_tables_on_a_bare_connection() {
+        // The companion test above this one
+        // (`create_ir_tables_builds_content_tables_and_fk_holds`) calls
+        // `create_ast_schema` first, which ALSO emits
+        // NODE_CONTENT_TABLE_DDL / NODE_CHILD_TABLE_DDL — so it cannot see
+        // the difference between this function working and doing nothing.
+        // This one starts bare, which is the only way to observe the effect.
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(!has_object(&conn, "table", "node_content"));
+        assert!(!has_object(&conn, "table", "node_child"));
+
+        create_ir_tables(&conn).unwrap();
+
+        assert!(
+            has_object(&conn, "table", "node_content"),
+            "node_content MUST exist after create_ir_tables",
+        );
+        assert!(
+            has_object(&conn, "table", "node_child"),
+            "node_child MUST exist after create_ir_tables",
+        );
+
+        // Usable: a content row and an edge referencing it both insert.
+        insert_test_node_content(&conn, &[0xABu8; 32]);
+        conn.execute(
+            "INSERT INTO node_child (parent_hash, ordinal, child_hash, field) \
+             VALUES (?1, 0, ?1, 'body')",
+            params![&[0xABu8; 32][..]],
+        )
+        .unwrap();
+
+        create_ir_tables(&conn).unwrap(); // idempotent
+    }
+
+    #[test]
+    fn create_post_load_indexes_skip_unused_creates_its_indexes_and_skips_idx_source_file() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_tables(&conn).unwrap();
+        create_refs_tables(&conn).unwrap();
+
+        // Tables only so far — the whole point of the post-load pass is that
+        // none of these exist during the bulk insert.
+        for index in [
+            "idx_parent_kind_ord",
+            "idx_refs_token",
+            "idx_refs_node",
+            "idx_refs_container",
+        ] {
+            assert!(
+                !has_object(&conn, "index", index),
+                "precondition: {index} must not exist before the post-load pass",
+            );
+        }
+        assert!(!has_object(&conn, "view", "v_node_path"));
+
+        create_post_load_indexes_skip_unused(&conn).unwrap();
+
+        for index in [
+            "idx_parent_kind_ord",
+            "idx_refs_token",
+            "idx_refs_node",
+            "idx_refs_container",
+        ] {
+            assert!(
+                has_object(&conn, "index", index),
+                "{index} MUST exist after create_post_load_indexes_skip_unused",
+            );
+        }
+        assert!(
+            has_object(&conn, "view", "v_node_path"),
+            "the display view lands post-COMMIT too",
+        );
+
+        // The "skip_unused" half of the contract (bead
+        // `ley-line-open-cbbedf` Attack 3): `idx_source_file` is the partial
+        // index ley-line never populates, and it must NOT be built here.
+        assert!(
+            !has_object(&conn, "index", "idx_source_file"),
+            "idx_source_file is the index this variant exists to skip",
+        );
+
+        create_post_load_indexes_skip_unused(&conn).unwrap(); // idempotent
+    }
 }

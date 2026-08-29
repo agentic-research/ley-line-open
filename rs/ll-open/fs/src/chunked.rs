@@ -2697,4 +2697,178 @@ mod tests {
             "next transaction did not observe the new coherent generation"
         );
     }
+
+    /// Is there a manifest row for this nid? The observable every subtree
+    /// invalidation test below asserts on, row by row.
+    fn manifest_present(conn: &Connection, nid: i64) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM content_manifest WHERE nid = ?1 LIMIT 1",
+            params![nid],
+            |_| Ok(true),
+        )
+        .optional()
+        .unwrap()
+        .unwrap_or(false)
+    }
+
+    /// A `nodes` row that exists only to be walked by `parent_nid` — an AST
+    /// node with no name and no path. It still carries a real record: the
+    /// chunk store refuses any nid whose `nodes` row it cannot capture a
+    /// freshness witness from.
+    fn put_ast_node(conn: &Connection, nid: i64, parent_nid: Option<i64>, record: &str) {
+        conn.execute(
+            "INSERT INTO nodes (nid, parent_nid, kind, ord, size, mtime, record) \
+             VALUES (?1, ?2, 0, 0, ?3, 0, ?4)",
+            params![nid, parent_nid, record.len() as i64, record],
+        )
+        .unwrap();
+    }
+
+    /// `tree_tables_present` is a THREE-table conjunction, and the count is
+    /// the whole of it. Answering `true` unconditionally sends a pure
+    /// content-addressed arena — manifests, no tree — down the subtree
+    /// descent, where "the subtree" is the file's entire nid range instead of
+    /// the single standalone node. So both halves are pinned: the predicate
+    /// itself over each partial schema, and the branch it selects.
+    #[test]
+    fn the_tree_table_probe_needs_all_three_and_gates_the_subtree_descent() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_chunked_content_schema(&conn).unwrap();
+        assert!(
+            !tree_tables_present(&conn).unwrap(),
+            "a pure content-addressed arena has no tree tables"
+        );
+        conn.execute_batch("CREATE TABLE nodes (nid INTEGER PRIMARY KEY)")
+            .unwrap();
+        assert!(
+            !tree_tables_present(&conn).unwrap(),
+            "one of three is not the tree"
+        );
+        conn.execute_batch("CREATE TABLE files (file_id INTEGER PRIMARY KEY)")
+            .unwrap();
+        assert!(
+            !tree_tables_present(&conn).unwrap(),
+            "two of three is not the tree — the descent JOINs all three"
+        );
+        conn.execute_batch("CREATE TABLE dirs (dir_id INTEGER PRIMARY KEY)")
+            .unwrap();
+        assert!(
+            tree_tables_present(&conn).unwrap(),
+            "all three present is the tree"
+        );
+
+        // The branch that probe selects, observed: with no tree tables, the
+        // single-row delete IS the whole subtree, so a co-resident nid in the
+        // SAME file range must survive. (A `true` answer would take the
+        // ordinal-0 range delete and reap it.)
+        let treeless = Connection::open_in_memory().unwrap();
+        create_chunked_content_schema(&treeless).unwrap();
+        let root = leyline_schema::file_nid(1, 0);
+        let neighbour = leyline_schema::file_nid(1, 9);
+        store_content_chunked(&treeless, root, &prng(0x7EE1, 20_000)).unwrap();
+        store_content_chunked(&treeless, neighbour, &prng(0x7EE2, 20_000)).unwrap();
+        invalidate_chunked_content_subtree(&treeless, root).unwrap();
+        assert!(
+            !manifest_present(&treeless, root),
+            "the named node's manifest is always invalidated"
+        );
+        assert!(
+            manifest_present(&treeless, neighbour),
+            "without tree tables there is no descendant relation — a same-range \
+             nid is a STANDALONE node, not a descendant"
+        );
+    }
+
+    /// The ordinal test picks between two structurally different descents,
+    /// and each reaches rows the other cannot:
+    ///
+    /// - **ordinal 0** (a file root) → the file's whole nid RANGE. It reaps
+    ///   every manifest in the range whether or not a `nodes` row still links
+    ///   it to the root — which is the point, because the caller may already
+    ///   have deleted those rows.
+    /// - **ordinal != 0** (an interior AST node) → recurse `nodes.parent_nid`.
+    ///   It reaps that node's descendants and MUST leave the file root and
+    ///   its unrelated siblings alone.
+    ///
+    /// Flipping the test swaps them, and both directions leak: the root case
+    /// then misses an unlinked in-range manifest (the cross-generation leak
+    /// this cascade exists to prevent), and the interior case over-deletes the
+    /// file root that was never asked for. One unlinked manifest row
+    /// (`orphan`) plus one root manifest make both visible.
+    #[test]
+    fn the_subtree_descent_splits_a_file_root_from_an_interior_node() {
+        // Build the same fixture twice — the first invalidation would
+        // otherwise consume the rows the second case needs.
+        let fixture = || {
+            let conn = Connection::open_in_memory().unwrap();
+            leyline_schema::create_schema(&conn).unwrap();
+            create_chunked_content_schema(&conn).unwrap();
+            // Each body is written twice — as the `nodes` record and as the
+            // chunked bytes — because the store refuses a nid whose record it
+            // cannot capture a matching freshness witness from.
+            let (root_body, other_body) = ("r".repeat(9_000), "o".repeat(9_000));
+            let (child_body, grand_body) = ("c".repeat(9_000), "g".repeat(9_000));
+            let root =
+                crate::graph::fixtures::put_file(&conn, "a.rs", 100, Some(&root_body)).unwrap();
+            let other =
+                crate::graph::fixtures::put_file(&conn, "b.rs", 100, Some(&other_body)).unwrap();
+            let file_id = leyline_schema::nid_file_id(root).unwrap();
+            let child = leyline_schema::file_nid(file_id, 3);
+            let grandchild = leyline_schema::file_nid(file_id, 4);
+            // In `a.rs`'s nid range, but reachable from the root only by the
+            // range — it has NO `nodes` row, so no `parent_nid` chain leads
+            // here. This is the row the two descents disagree about.
+            let orphan = leyline_schema::file_nid(file_id, 9);
+            put_ast_node(&conn, child, Some(root), &child_body);
+            put_ast_node(&conn, grandchild, Some(child), &grand_body);
+            for (nid, body) in [
+                (root, &root_body),
+                (other, &other_body),
+                (child, &child_body),
+                (grandchild, &grand_body),
+            ] {
+                store_content_chunked(&conn, nid, body.as_bytes()).unwrap();
+            }
+            store_content_chunked(&conn, orphan, &prng(0x0FA9, 9_000)).unwrap();
+            (conn, root, child, grandchild, orphan, other)
+        };
+
+        let (conn, root, child, grandchild, orphan, other) = fixture();
+        invalidate_chunked_content_subtree(&conn, root).unwrap();
+        for (nid, label) in [
+            (root, "the file root"),
+            (child, "a linked AST child"),
+            (grandchild, "a linked AST grandchild"),
+            (orphan, "an UNLINKED manifest inside the file's nid range"),
+        ] {
+            assert!(
+                !manifest_present(&conn, nid),
+                "invalidating a file root reaps its whole nid range: {label} survived"
+            );
+        }
+        assert!(
+            manifest_present(&conn, other),
+            "a different file is not in the range and must survive"
+        );
+
+        let (conn, root, child, grandchild, orphan, other) = fixture();
+        invalidate_chunked_content_subtree(&conn, child).unwrap();
+        assert!(
+            !manifest_present(&conn, child),
+            "the named interior node is invalidated"
+        );
+        assert!(
+            !manifest_present(&conn, grandchild),
+            "the parent_nid walk reaches its descendants"
+        );
+        assert!(
+            manifest_present(&conn, root),
+            "an interior node's subtree does NOT include the file root above it"
+        );
+        assert!(
+            manifest_present(&conn, orphan),
+            "nor an unlinked in-range nid that is not its descendant"
+        );
+        assert!(manifest_present(&conn, other), "nor another file entirely");
+    }
 }

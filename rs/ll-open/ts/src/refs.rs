@@ -3203,3 +3203,122 @@ mod bash_tests {
         );
     }
 }
+
+/// Storage-side tests for [`insert_extracted_refs`].
+///
+/// Deliberately NOT inside the `mod tests` above: that module is
+/// `#[cfg(feature = "go")]`, because every test in it drives a real Go
+/// parse. `insert_extracted_refs` is language-agnostic — it takes
+/// `&[ExtractedRef]` — so its contract can and must be pinned without any
+/// grammar feature enabled. Under the default feature set (no `go`) the
+/// gated module compiles out entirely and this function had no coverage at
+/// all.
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+    use crate::schema::{create_ast_schema, create_refs_schema};
+    use rusqlite::Connection;
+
+    #[test]
+    fn insert_extracted_refs_writes_defs_refs_and_imports() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_schema(&conn).unwrap();
+        create_refs_schema(&conn).unwrap();
+
+        let refs = vec![
+            ExtractedRef::Def {
+                token: "Add".to_string(),
+                node_id: "main.go/function_declaration_0".to_string(),
+                source_id: "main.go".to_string(),
+                container_node_id: None,
+                canonical_kind: Some("function"),
+            },
+            ExtractedRef::Ref {
+                token: "Println".to_string(),
+                node_id: "main.go/function_declaration_0/call_expression".to_string(),
+                source_id: "main.go".to_string(),
+                container_node_id: Some("main.go/function_declaration_0".to_string()),
+                qualifier: Some("fmt".to_string()),
+            },
+            ExtractedRef::Import {
+                alias: "fmt".to_string(),
+                path: "fmt".to_string(),
+                source_id: "main.go".to_string(),
+            },
+        ];
+
+        insert_extracted_refs(&conn, &refs).unwrap();
+
+        // Def row — token, nid, and the κ canonical kind all land.
+        let (def_token, def_nid, def_container, def_kind): (
+            String,
+            i64,
+            Option<i64>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT token, nid, container_nid, canonical_kind FROM node_defs",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(def_token, "Add");
+        assert_eq!(def_container, None, "a top-level def has no container");
+        assert_eq!(def_kind.as_deref(), Some("function"));
+
+        // Ref row — token, qualifier, and the container correlation.
+        let (ref_token, ref_nid, ref_container, qualifier): (
+            String,
+            i64,
+            Option<i64>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT token, nid, container_nid, qualifier FROM node_refs",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(ref_token, "Println");
+        assert_eq!(qualifier.as_deref(), Some("fmt"));
+
+        // The interning contract this helper documents: the SAME id string
+        // maps to the SAME nid (so `container_node_id` correlates back to the
+        // def's own row), and DISTINCT id strings map to distinct nids.
+        assert_eq!(
+            ref_container,
+            Some(def_nid),
+            "the ref's container id string must intern to the def's nid",
+        );
+        assert_ne!(
+            ref_nid, def_nid,
+            "distinct node_id strings must intern to distinct nids",
+        );
+
+        // Import row.
+        let (alias, path, source_id): (String, String, String) = conn
+            .query_row("SELECT alias, path, source_id FROM _imports", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(alias, "fmt");
+        assert_eq!(path, "fmt");
+        assert_eq!(source_id, "main.go");
+    }
+
+    #[test]
+    fn insert_extracted_refs_on_an_empty_slice_writes_nothing() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_schema(&conn).unwrap();
+        create_refs_schema(&conn).unwrap();
+
+        insert_extracted_refs(&conn, &[]).unwrap();
+
+        for table in ["node_defs", "node_refs", "_imports"] {
+            let n: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0, "{table} must stay empty for an empty batch");
+        }
+    }
+}

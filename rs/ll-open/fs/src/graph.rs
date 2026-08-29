@@ -3290,4 +3290,149 @@ mod tests {
         }
         Ok(())
     }
+
+    /// Does a `nodes` row still exist for this nid?
+    ///
+    /// Counts rather than reaching for `OptionalExtension::optional`: that
+    /// trait is imported under `#[cfg(all(feature = "cdc", feature =
+    /// "splice"))]` for `batch_splice`, so a helper that called `.optional()`
+    /// unconditionally would not compile under leaner feature sets — which is
+    /// what `lint:feature-reachability` checks for `ll-open/fs/verify`.
+    fn node_row_present(conn: &Connection, nid: i64) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE nid = ?1",
+            rusqlite::params![nid],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            > 0
+    }
+
+    /// An AST `nodes` row that exists only to be walked by `parent_nid`.
+    fn put_ast_node(conn: &Connection, nid: i64, parent_nid: Option<i64>) {
+        conn.execute(
+            "INSERT INTO nodes (nid, parent_nid, kind, ord, size, mtime, record) \
+             VALUES (?1, ?2, 0, 0, 0, 0, NULL)",
+            rusqlite::params![nid, parent_nid],
+        )
+        .unwrap();
+    }
+
+    /// `delete_subtree`'s ordinal test picks between two descents that reach
+    /// different rows, and it is the row-level difference — not "some rows
+    /// went away" — that says which one ran:
+    ///
+    /// - **ordinal 0** (a file root) → `DELETE ... WHERE nid BETWEEN lo AND hi`,
+    ///   the file's whole range. It reaps in-range rows whose `parent_nid`
+    ///   chain never reached the root, which a `parent_nid` recursion cannot.
+    /// - **ordinal != 0** (an interior AST node) → recurse `parent_nid`, which
+    ///   must NOT climb to the file root or touch unrelated in-range rows.
+    ///
+    /// Flipping the test swaps the two, and both directions are wrong in a way
+    /// this asserts: the root case would strand an unlinked in-range row (and
+    /// `files` is append-only, so that stranded row re-binds when the path is
+    /// re-created), and the interior case would delete the whole file when a
+    /// caller asked to remove one node inside it.
+    #[test]
+    fn delete_subtree_splits_a_file_root_from_an_interior_node() -> Result<()> {
+        let fixture = || -> Result<(Connection, i64, i64, i64, i64, i64)> {
+            let conn = Connection::open_in_memory()?;
+            create_schema(&conn)?;
+            let root = put_file(&conn, "a.rs", 100, Some("alpha"))?;
+            let other = put_file(&conn, "b.rs", 100, Some("beta"))?;
+            let file_id = leyline_schema::nid_file_id(root).unwrap();
+            let child = leyline_schema::file_nid(file_id, 3);
+            let grandchild = leyline_schema::file_nid(file_id, 4);
+            // Inside `a.rs`'s nid range, but no `parent_nid` chain leads here.
+            let orphan = leyline_schema::file_nid(file_id, 9);
+            put_ast_node(&conn, child, Some(root));
+            put_ast_node(&conn, grandchild, Some(child));
+            put_ast_node(&conn, orphan, None);
+            Ok((conn, root, child, grandchild, orphan, other))
+        };
+
+        let (conn, root, child, grandchild, orphan, other) = fixture()?;
+        SqliteGraphAdapter::delete_subtree(&conn, root)?;
+        for (nid, label) in [
+            (root, "the file root"),
+            (child, "a linked AST child"),
+            (grandchild, "a linked AST grandchild"),
+            (orphan, "an UNLINKED row inside the file's nid range"),
+        ] {
+            assert!(
+                !node_row_present(&conn, nid),
+                "deleting a file root reaps its whole nid range: {label} survived"
+            );
+        }
+        assert!(
+            node_row_present(&conn, other),
+            "a different file is outside the range and must survive"
+        );
+
+        let (conn, root, child, grandchild, orphan, other) = fixture()?;
+        SqliteGraphAdapter::delete_subtree(&conn, child)?;
+        assert!(
+            !node_row_present(&conn, child),
+            "the named interior node is deleted"
+        );
+        assert!(
+            !node_row_present(&conn, grandchild),
+            "the parent_nid walk reaches its descendants"
+        );
+        assert!(
+            node_row_present(&conn, root),
+            "an interior node's subtree does NOT include the file root above it"
+        );
+        assert!(
+            node_row_present(&conn, orphan),
+            "nor an unlinked in-range row that is not its descendant"
+        );
+        assert!(node_row_present(&conn, other), "nor another file entirely");
+        Ok(())
+    }
+
+    /// The bulk-read override, asserted as the EXACT set of pairs.
+    ///
+    /// This is the embedding pipeline's only view of the arena, and every
+    /// degenerate answer it could return is silently plausible: an empty Vec
+    /// reads as "nothing to embed" on a full tree, and a wrong path or wrong
+    /// body embeds the wrong text under the right name. Neither surfaces as an
+    /// error anywhere downstream, so the pairs themselves are the assertion —
+    /// rendered path AND record bytes, matched against what was written.
+    ///
+    /// The three exclusions are in the fixture rather than a separate case,
+    /// because each is a row the query must NOT return: a directory
+    /// (`kind = 0` filter), an unwritten leaf (`record IS NOT NULL`), and an
+    /// empty one (`length(record) > 0`).
+    #[test]
+    fn all_file_contents_returns_every_written_files_real_path_and_bytes() -> Result<()> {
+        let source = Connection::open_in_memory()?;
+        create_schema(&source)?;
+        put_dir(&source, "pkg", 1000)?;
+        put_dir(&source, "pkg/inner", 1000)?;
+        put_file(&source, "pkg/one.rs", 2000, Some("fn one() {}"))?;
+        put_file(&source, "pkg/inner/two.rs", 2000, Some("fn two() {}"))?;
+        put_file(&source, "top.rs", 2000, Some("fn top() {}"))?;
+        put_file(&source, "pkg/unwritten.rs", 2000, None)?;
+        put_file(&source, "pkg/empty.rs", 2000, Some(""))?;
+
+        let data = source.serialize("main")?;
+        let adapter = SqliteGraphAdapter::new(SqliteGraph::from_bytes(data.as_ref())?);
+
+        // The query has no ORDER BY — the SET of pairs is the contract, so
+        // sort before comparing rather than pinning a plan-dependent order.
+        let mut got = adapter.all_file_contents()?;
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("pkg/inner/two.rs".to_string(), "fn two() {}".to_string()),
+                ("pkg/one.rs".to_string(), "fn one() {}".to_string()),
+                ("top.rs".to_string(), "fn top() {}".to_string()),
+            ],
+            "every written leaf, by rendered path and record bytes — and \
+             nothing else: no directories, no unwritten or empty records"
+        );
+        Ok(())
+    }
 }

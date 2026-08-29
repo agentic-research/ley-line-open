@@ -6713,4 +6713,639 @@ mod tests {
         assert_eq!(err.2, "b");
         assert_eq!(err.3, 3);
     }
+
+    // ── projection-v5 LSP/render result pins ────────────────────────────
+    //
+    // Everything below asserts a function's RETURNED VALUE against a
+    // seeded v5 fixture rather than merely that the call succeeded. The
+    // ops in this section were reachable from higher-level tests that
+    // only checked `ok: true` / `is_some()`, so a body replaced wholesale
+    // by a constant went unnoticed.
+
+    /// `_lsp` DDL as leyline-lsp's enrichment pass creates it (mirror of
+    /// `leyline_lsp::project::LSP_DDL`). Tests build it by hand because
+    /// `create_ast_schema` deliberately does NOT — the `_lsp*` tables are
+    /// the enrichment pass's output, and their absence is the
+    /// "not enriched yet" signal `needs_enrich` / `query_hover_typed`
+    /// read.
+    const TEST_LSP_DDL: &str = "CREATE TABLE _lsp (\
+        nid INTEGER PRIMARY KEY, symbol_kind TEXT, detail TEXT, \
+        start_line INTEGER NOT NULL, start_col INTEGER NOT NULL, \
+        end_line INTEGER NOT NULL, end_col INTEGER NOT NULL, diagnostics TEXT);";
+
+    /// `_lsp_defs` DDL (mirror of `leyline_lsp::project::LSP_DEFS_DDL`).
+    const TEST_LSP_DEFS_DDL: &str = "CREATE TABLE _lsp_defs (\
+        nid INTEGER NOT NULL, def_token TEXT NOT NULL DEFAULT '', \
+        def_uri TEXT NOT NULL, def_start_line INTEGER NOT NULL, \
+        def_start_col INTEGER NOT NULL, def_end_line INTEGER NOT NULL, \
+        def_end_col INTEGER NOT NULL);";
+
+    /// A v5 projection holding `src/lib.rs` with two nested `_ast` nodes:
+    /// a `function_declaration` spanning rows 1..20 and an `identifier`
+    /// strictly inside it at row 3, cols 4..14. Position (3, 8) lies in
+    /// BOTH spans, so smallest-span-wins resolution must pick the
+    /// identifier. Returns `(conn, outer_nid, inner_nid)`.
+    fn nested_ast_fixture() -> (Connection, i64, i64) {
+        let conn = Connection::open_in_memory().unwrap();
+        leyline_ts::schema::create_ast_schema(&conn).unwrap();
+        let outer = seed_node(
+            &conn,
+            "src/lib.rs",
+            "function_declaration",
+            (0, 200, 1, 0, 20, 1),
+        );
+        let inner = seed_node(&conn, "src/lib.rs", "identifier", (40, 50, 3, 4, 3, 14));
+        (conn, outer, inner)
+    }
+
+    #[test]
+    fn wire_ref_of_renders_injected_nid_by_source_ownership() {
+        // `wire_ref_of`'s no-`nodes`-row arm forks on whether the nid's
+        // file interned a `_source` row. With one, the occurrence renders
+        // as the EXPLICIT file-anchored `{source_id}#inj@{ordinal}` form;
+        // without one there is nothing to anchor to, so it renders as the
+        // bare decimal nid. Both arms need pinning — a guard stuck open
+        // stamps a sourceless `#inj@` address, and a guard stuck shut (or
+        // inverted) collapses a real injected address to a bare integer
+        // that is indistinguishable from a file literally named that digit
+        // string (seam-audit COMMENT-2).
+        let conn = Connection::open_in_memory().unwrap();
+        let (base, _child) = mint_test_file(&conn, "a.go", "x");
+
+        // Injected occurrence: ordinal past the host file's `_ast` count,
+        // so no `nodes` row — but `a.go` DID intern `_source`.
+        let injected = base + 500;
+        let owned = wire_ref_of(&conn, injected).unwrap();
+        assert_eq!(
+            owned.node_id, "a.go#inj@500",
+            "an injected nid whose file owns a _source row must render the \
+             file-anchored injected form",
+        );
+        assert_eq!(owned.source_id, "a.go");
+
+        // A nid in a file_id range that was never interned: no `_source`
+        // row, so no anchor — bare decimal.
+        let orphan = leyline_schema::file_nid(4242, 7);
+        let unowned = wire_ref_of(&conn, orphan).unwrap();
+        assert_eq!(
+            unowned.node_id,
+            orphan.to_string(),
+            "a nid whose file was never interned must render as its decimal \
+             value, NOT as a `#inj@` address with an empty source",
+        );
+        assert!(
+            unowned.source_id.is_empty(),
+            "no _source row ⟹ empty source_id, got {:?}",
+            unowned.source_id,
+        );
+
+        // Control: a nid that DOES have a `nodes` row renders its path.
+        let real = wire_ref_of(&conn, base + 1).unwrap();
+        assert_eq!(real.node_id, "a.go/x");
+    }
+
+    #[test]
+    fn find_node_at_position_returns_smallest_enclosing_nid() {
+        // The whole point of the query is WHICH nid comes back: the
+        // smallest-span node containing the position, scoped to the
+        // requested file's nid range.
+        let (conn, outer, inner) = nested_ast_fixture();
+        assert_ne!(inner, outer, "fixture must seed two distinct nodes");
+
+        let hit = find_node_at_position(&conn, "src/lib.rs", 3, 8).unwrap();
+        assert_eq!(
+            hit,
+            Some(inner),
+            "position inside both spans must resolve to the smallest \
+             enclosing node ({inner}), not the enclosing function ({outer})",
+        );
+        // A v5 nid is `(file_id << 24) | ordinal`, so a real hit can never
+        // be one of the degenerate small constants.
+        assert!(
+            hit.unwrap() > leyline_schema::NID_ORDINAL_MASK,
+            "seeded nid must be a real file-scoped nid, got {hit:?}",
+        );
+
+        // A position outside every seeded span → no node.
+        assert_eq!(
+            find_node_at_position(&conn, "src/lib.rs", 99, 0).unwrap(),
+            None,
+            "row 99 encloses nothing",
+        );
+        // A file the arena never interned owns no nid range → no node.
+        assert_eq!(
+            find_node_at_position(&conn, "src/never-seen.rs", 3, 8).unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn needs_enrich_tracks_lsp_table_then_per_file_rows() {
+        // Both answers are load-bearing: a stuck-`true` re-queues
+        // enrichment for every already-enriched file, a stuck-`false`
+        // means lazy enrichment never fires at all.
+        let (conn, _outer, inner) = nested_ast_fixture();
+        assert!(
+            needs_enrich(&conn, "src/lib.rs"),
+            "a missing `_lsp` table must report needs-enrich",
+        );
+
+        conn.execute_batch(TEST_LSP_DDL).unwrap();
+        assert!(
+            needs_enrich(&conn, "src/lib.rs"),
+            "`_lsp` present but empty for this file must still report \
+             needs-enrich",
+        );
+
+        conn.execute(
+            "INSERT INTO _lsp VALUES (?1, 'function', 'fn main()', 3, 4, 3, 14, NULL)",
+            rusqlite::params![inner],
+        )
+        .unwrap();
+        assert!(
+            !needs_enrich(&conn, "src/lib.rs"),
+            "a file with `_lsp` rows in its nid range must NOT report \
+             needs-enrich — re-queuing it would re-run the language server \
+             on every query",
+        );
+        // Scoping check: another file's rows don't count as this file's.
+        assert!(
+            needs_enrich(&conn, "src/never-seen.rs"),
+            "an un-interned file owns no nid range ⟹ needs-enrich",
+        );
+    }
+
+    #[test]
+    fn lsp_hover_query_pairs_stored_text_with_display_path() {
+        // The returned pair IS the response body's `hover` / `node_id`
+        // fields, so both halves must be the real seeded values.
+        let (conn, _outer, inner) = nested_ast_fixture();
+        conn.execute_batch(
+            "CREATE TABLE _lsp_hover (nid INTEGER PRIMARY KEY, hover_text TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO _lsp_hover VALUES (?1, 'fn main() -> ()')",
+            rusqlite::params![inner],
+        )
+        .unwrap();
+
+        assert_eq!(
+            lsp_hover_query(&conn, "src/lib.rs", 3, 8).unwrap(),
+            Some((
+                "fn main() -> ()".to_string(),
+                "src/lib.rs/identifier".to_string(),
+            )),
+            "hover must pair the STORED text with the node's DISPLAY path",
+        );
+
+        // Position resolves to the enclosing function, which has no
+        // `_lsp_hover` row → a genuine miss, not a fabricated pair.
+        assert_eq!(
+            lsp_hover_query(&conn, "src/lib.rs", 1, 0).unwrap(),
+            None,
+            "a node without an `_lsp_hover` row must miss",
+        );
+        // Unknown file → no nid range → miss.
+        assert_eq!(lsp_hover_query(&conn, "src/nope.rs", 3, 8).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn op_lsp_position_returns_seeded_rows_for_the_node_at_position() {
+        // End-to-end body of `lsp_defs` / `lsp_refs`: resolve the node at
+        // (file, line, col), then hand back THAT node's 5-col rows under
+        // the caller's json key.
+        let (_dir, ctx) = setup();
+        {
+            let live = ctx.live_db.writer.lock();
+            let hit = seed_node(&live, "src/lib.rs", "identifier", (40, 50, 3, 4, 3, 14));
+            let elsewhere = seed_node(&live, "src/other.rs", "identifier", (0, 6, 1, 0, 1, 6));
+            live.execute_batch(TEST_LSP_DEFS_DDL).unwrap();
+            live.execute(
+                "INSERT INTO _lsp_defs \
+                 (nid, def_token, def_uri, def_start_line, def_start_col, \
+                  def_end_line, def_end_col) \
+                 VALUES (?1, 'Send', 'file:///w/pkg.go', 7, 2, 7, 6), \
+                        (?2, 'Other', 'file:///w/other.go', 1, 1, 1, 4)",
+                rusqlite::params![hit, elsewhere],
+            )
+            .unwrap();
+        }
+
+        let args = LspPosition {
+            file: "src/lib.rs".into(),
+            line: 3,
+            col: 8,
+        };
+        let body = op_lsp_position(&ctx, &args, "_lsp_defs", "def", "definitions").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("op_lsp_position must emit JSON; got {body:?} ({e})"));
+
+        assert_eq!(v["ok"], json!(true), "got {body}");
+        let defs = v["definitions"].as_array().expect("definitions array");
+        assert_eq!(
+            defs.len(),
+            1,
+            "only the row keyed on the node AT the position; got {defs:?}",
+        );
+        assert_eq!(defs[0]["uri"], json!("file:///w/pkg.go"));
+        assert_eq!(defs[0]["start_line"], json!(7));
+        assert_eq!(defs[0]["start_col"], json!(2));
+        assert_eq!(defs[0]["end_line"], json!(7));
+        assert_eq!(defs[0]["end_col"], json!(6));
+        assert!(
+            v.get("enriched").is_none(),
+            "a warm hit must not carry the `enriched` retry marker: {body}",
+        );
+    }
+
+    /// Seed `ctx`'s live db with an `_lsp` table covering two nodes in
+    /// `src/lib.rs` (one carrying diagnostics, one not) plus one node in
+    /// `src/other.rs` that must stay out of every file-scoped answer.
+    fn seed_lsp_symbols(ctx: &std::sync::Arc<DaemonContext>) {
+        let live = ctx.live_db.writer.lock();
+        let func = seed_node(
+            &live,
+            "src/lib.rs",
+            "function_declaration",
+            (0, 200, 1, 0, 20, 1),
+        );
+        let ident = seed_node(&live, "src/lib.rs", "identifier", (40, 50, 3, 4, 3, 14));
+        let other = seed_node(
+            &live,
+            "src/other.rs",
+            "function_declaration",
+            (0, 10, 1, 0, 2, 1),
+        );
+        live.execute_batch(TEST_LSP_DDL).unwrap();
+        live.execute(
+            "INSERT INTO _lsp VALUES \
+               (?1, 'function', 'fn main()', 1, 0, 20, 1, 'unused variable `x`'), \
+               (?2, 'variable', 'let x: u8',  3, 4,  3, 14, NULL), \
+               (?3, 'function', 'fn other()', 1, 0,  2, 1, 'other-file diagnostic')",
+            rusqlite::params![func, ident, other],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn op_lsp_symbols_returns_file_scoped_rows_with_display_paths() {
+        let (_dir, ctx) = setup();
+        seed_lsp_symbols(&ctx);
+
+        let body = op_lsp_symbols(
+            &ctx,
+            &LspFile {
+                file: "src/lib.rs".into(),
+            },
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("op_lsp_symbols must emit JSON; got {body:?} ({e})"));
+
+        assert_eq!(v["ok"], json!(true), "got {body}");
+        let syms = v["symbols"].as_array().expect("symbols array");
+        assert_eq!(
+            syms.len(),
+            2,
+            "both `src/lib.rs` rows and neither `src/other.rs` row; got {syms:?}",
+        );
+        let by_path: std::collections::HashMap<&str, &serde_json::Value> = syms
+            .iter()
+            .map(|r| (r["node_id"].as_str().expect("node_id string"), r))
+            .collect();
+
+        let func = by_path
+            .get("src/lib.rs/function_declaration")
+            .unwrap_or_else(|| panic!("missing function row in {syms:?}"));
+        assert_eq!(func["kind"], json!("function"));
+        assert_eq!(func["detail"], json!("fn main()"));
+        assert_eq!(func["start_line"], json!(1));
+        assert_eq!(func["start_col"], json!(0));
+        assert_eq!(func["end_line"], json!(20));
+        assert_eq!(func["end_col"], json!(1));
+
+        let ident = by_path
+            .get("src/lib.rs/identifier")
+            .unwrap_or_else(|| panic!("missing identifier row in {syms:?}"));
+        assert_eq!(ident["kind"], json!("variable"));
+        assert_eq!(ident["detail"], json!("let x: u8"));
+        assert_eq!(ident["start_line"], json!(3));
+
+        assert!(
+            !by_path.contains_key("src/other.rs/function_declaration"),
+            "another file's row leaked into the scoped answer: {syms:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn op_lsp_diagnostics_returns_only_rows_carrying_diagnostics() {
+        let (_dir, ctx) = setup();
+        seed_lsp_symbols(&ctx);
+
+        let body = op_lsp_diagnostics(
+            &ctx,
+            &LspFile {
+                file: "src/lib.rs".into(),
+            },
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("op_lsp_diagnostics must emit JSON; got {body:?} ({e})"));
+
+        assert_eq!(v["ok"], json!(true), "got {body}");
+        let diags = v["diagnostics"].as_array().expect("diagnostics array");
+        assert_eq!(
+            diags.len(),
+            1,
+            "the NULL-diagnostics row and the other file's row are both \
+             excluded; got {diags:?}",
+        );
+        assert_eq!(diags[0]["diagnostics"], json!("unused variable `x`"));
+        assert_eq!(
+            diags[0]["node_id"],
+            json!("src/lib.rs/function_declaration"),
+        );
+        assert_eq!(diags[0]["start_line"], json!(1));
+        assert_eq!(diags[0]["end_line"], json!(20));
+    }
+
+    #[test]
+    fn query_hover_typed_returns_detail_and_kind_for_the_resolved_node() {
+        // `hover_typed` is a sub-field of the `inspect_symbol` bundle; its
+        // CONTENT (signature + kind) is what clients read, so a null or
+        // absent bundle is a real regression.
+        let (conn, _outer, inner) = nested_ast_fixture();
+        assert_eq!(
+            query_hover_typed(&conn, "src/lib.rs/identifier").unwrap(),
+            None,
+            "no `_lsp` table yet ⟹ graceful miss",
+        );
+
+        conn.execute_batch(TEST_LSP_DDL).unwrap();
+        conn.execute(
+            "INSERT INTO _lsp VALUES (?1, 'function', 'func Send(x int) error', 3, 4, 3, 14, NULL)",
+            rusqlite::params![inner],
+        )
+        .unwrap();
+
+        let hover = query_hover_typed(&conn, "src/lib.rs/identifier")
+            .unwrap()
+            .expect("a node with an `_lsp` row must yield a hover bundle");
+        assert_eq!(
+            hover["signature"],
+            json!("func Send(x int) error"),
+            "signature comes from `_lsp.detail`; got {hover}",
+        );
+        assert_eq!(
+            hover["kind"],
+            json!("function"),
+            "kind comes from `_lsp.symbol_kind`; got {hover}",
+        );
+
+        // A display path that doesn't resolve → miss, not an empty bundle.
+        assert_eq!(
+            query_hover_typed(&conn, "src/lib.rs/no_such_kind").unwrap(),
+            None,
+        );
+    }
+
+    // ── projection-v5 wire-op body pins ─────────────────────────────────
+    //
+    // The four ops below each build a capnp response and serialize it to
+    // JSON. Higher-level coverage only ever checked that the required top
+    // level keys were present, so a body replaced wholesale by a constant
+    // string went unobserved. These tests parse the returned JSON and
+    // assert its ACTUAL contents against the seeded projection.
+
+    /// Parse an op's JSON response, naming the op in the panic so a body
+    /// that stopped emitting JSON at all is obvious.
+    fn parse_op_json(body: &str, op: &str) -> serde_json::Value {
+        serde_json::from_str(body)
+            .unwrap_or_else(|e| panic!("{op} must emit JSON; got {body:?} ({e})"))
+    }
+
+    /// Seed `ctx`'s live db with `src/lib.rs` (one `function_declaration`
+    /// AST child) and `src/other.rs`, stamping the AST child with a
+    /// distinctive `kind` / `size` / `record` so a node lookup has real
+    /// content to hand back. Returns the AST child's nid.
+    fn seed_two_file_tree(ctx: &std::sync::Arc<DaemonContext>) -> i64 {
+        let live = ctx.live_db.writer.lock();
+        let (_base, decl) = mint_test_file(&live, "src/lib.rs", "function_declaration");
+        mint_test_file(&live, "src/other.rs", "type_declaration");
+        live.execute(
+            "UPDATE nodes SET kind = 0, size = 4242, record = 'fn main() {}' WHERE nid = ?1",
+            rusqlite::params![decl],
+        )
+        .unwrap();
+        decl
+    }
+
+    #[tokio::test]
+    async fn op_list_children_returns_the_seeded_tree_at_each_level() {
+        // The listing IS the answer: which children, under which display
+        // paths, with which wire fields. All three levels of the fixture
+        // (root dir → dir → file) are walked because the op renders the
+        // child path differently for an empty parent.
+        let (_dir, ctx) = setup();
+        seed_two_file_tree(&ctx);
+
+        let roots = parse_op_json(&op_list_children(&ctx, "").unwrap(), "op_list_children");
+        assert_eq!(roots["ok"], json!(true), "got {roots}");
+        let rc = roots["children"].as_array().expect("children array");
+        assert_eq!(rc.len(), 1, "one interned root dir; got {rc:?}");
+        assert_eq!(rc[0]["id"], json!("src"), "empty parent ⟹ bare name");
+        assert_eq!(rc[0]["name"], json!("src"));
+        assert_eq!(rc[0]["parent_id"], json!(""));
+        assert_eq!(rc[0]["kind"], json!(1), "directory kind");
+
+        let dir = parse_op_json(&op_list_children(&ctx, "src").unwrap(), "op_list_children");
+        let dc = dir["children"].as_array().expect("children array");
+        assert_eq!(dc.len(), 2, "both seeded files; got {dc:?}");
+        assert_eq!(dc[0]["id"], json!("src/lib.rs"), "ordered by name");
+        assert_eq!(dc[0]["name"], json!("lib.rs"));
+        assert_eq!(dc[0]["parent_id"], json!("src"));
+        assert_eq!(dc[1]["id"], json!("src/other.rs"));
+
+        let file = parse_op_json(
+            &op_list_children(&ctx, "src/lib.rs").unwrap(),
+            "op_list_children",
+        );
+        let fc = file["children"].as_array().expect("children array");
+        assert_eq!(fc.len(), 1, "one AST child; got {fc:?}");
+        assert_eq!(fc[0]["id"], json!("src/lib.rs/function_declaration"));
+        assert_eq!(fc[0]["name"], json!("function_declaration"));
+        assert_eq!(fc[0]["parent_id"], json!("src/lib.rs"));
+        assert_eq!(fc[0]["size"], json!("4242"), "int64 renders as a string");
+        assert!(
+            fc[0].get("record").is_none(),
+            "listings deliberately omit `record` (PR #8); got {}",
+            fc[0],
+        );
+
+        // An unresolvable parent lists empty — the pre-v5 answer for an
+        // unknown id — rather than erroring.
+        let miss = parse_op_json(&op_list_children(&ctx, "nope").unwrap(), "op_list_children");
+        assert_eq!(miss["ok"], json!(true));
+        assert_eq!(miss["children"], json!([]), "got {miss}");
+    }
+
+    #[tokio::test]
+    async fn op_find_callees_returns_the_defs_its_node_references() {
+        // `find_callees(id)` = "what does this node reference?" — the
+        // node_refs ⋈ node_defs join, DISTINCT, rendered to wire pairs.
+        let (_dir, ctx) = setup();
+        {
+            let live = ctx.live_db.writer.lock();
+            let send_op = seed_node(
+                &live,
+                "pkg.go",
+                "function_declaration",
+                (100, 250, 5, 0, 15, 1),
+            );
+            let helper = seed_node(
+                &live,
+                "helper.go",
+                "function_declaration",
+                (0, 80, 1, 0, 8, 1),
+            );
+            let unused = seed_node(
+                &live,
+                "unused.go",
+                "function_declaration",
+                (0, 40, 1, 0, 4, 1),
+            );
+            live.execute(
+                "INSERT INTO node_defs (token, nid) VALUES ('Helper', ?1), ('Unused', ?2)",
+                rusqlite::params![helper, unused],
+            )
+            .unwrap();
+            // Two reference sites for the same token — the response is the
+            // SET of reachable definitions, not the multiset of sites.
+            live.execute(
+                "INSERT INTO node_refs (token, nid) VALUES ('Helper', ?1), ('Helper', ?1)",
+                rusqlite::params![send_op],
+            )
+            .unwrap();
+        }
+
+        let v = parse_op_json(
+            &op_find_callees(&ctx, "pkg.go/function_declaration").unwrap(),
+            "op_find_callees",
+        );
+        assert_eq!(v["ok"], json!(true), "got {v}");
+        let callees = v["callees"].as_array().expect("callees array");
+        assert_eq!(
+            callees.len(),
+            1,
+            "DISTINCT collapses the two ref sites, and `Unused` is defined \
+             but never referenced; got {callees:?}",
+        );
+        assert_eq!(
+            callees[0]["node_id"],
+            json!("helper.go/function_declaration"),
+        );
+        assert_eq!(callees[0]["source_id"], json!("helper.go"));
+
+        // An unresolvable input owns no refs → empty callees, as pre-v5.
+        let miss = parse_op_json(
+            &op_find_callees(&ctx, "nope.go/function_declaration").unwrap(),
+            "op_find_callees",
+        );
+        assert_eq!(miss["ok"], json!(true));
+        assert_eq!(miss["callees"], json!([]), "got {miss}");
+    }
+
+    #[tokio::test]
+    async fn op_get_token_map_groups_rendered_paths_under_each_token() {
+        // Bulk export: one entry per distinct token, node paths grouped
+        // and ordered under it. Both response variants (Refs / Defs) are
+        // exercised — they are separately-built capnp messages.
+        let (_dir, ctx) = setup();
+        {
+            let live = ctx.live_db.writer.lock();
+            let a = seed_node(&live, "a.go", "identifier", (0, 6, 1, 0, 1, 6));
+            let b = seed_node(&live, "b.go", "identifier", (0, 6, 1, 0, 1, 6));
+            // An injected occurrence: a fact-row key whose ordinal lies
+            // past `a.go`'s `_ast` count, so there is no `nodes` row and
+            // the COALESCE must fall to the file-anchored injected form.
+            let injected = leyline_schema::file_nid(leyline_schema::nid_file_id(a).unwrap(), 500);
+            live.execute(
+                "INSERT INTO node_refs (token, nid) VALUES \
+                 ('alpha', ?1), ('alpha', ?2), ('alpha', ?3), ('beta', ?1)",
+                rusqlite::params![a, b, injected],
+            )
+            .unwrap();
+            live.execute(
+                "INSERT INTO node_defs (token, nid) VALUES ('gamma', ?1)",
+                rusqlite::params![b],
+            )
+            .unwrap();
+        }
+
+        let refs = parse_op_json(
+            &op_get_token_map(&ctx, "node_refs", TokenMapOp::Refs).unwrap(),
+            "op_get_token_map",
+        );
+        assert_eq!(refs["ok"], json!(true), "got {refs}");
+        let entries = refs["entries"].as_array().expect("entries array");
+        assert_eq!(
+            entries.len(),
+            2,
+            "one entry per distinct token; got {entries:?}",
+        );
+        assert_eq!(entries[0]["token"], json!("alpha"));
+        assert_eq!(
+            entries[0]["node_ids"],
+            json!(["a.go#inj@500", "a.go/identifier", "b.go/identifier"]),
+            "paths grouped + ordered, with the injected occurrence carrying \
+             its explicit file-anchored address; got {entries:?}",
+        );
+        assert_eq!(entries[1]["token"], json!("beta"));
+        assert_eq!(entries[1]["node_ids"], json!(["a.go/identifier"]));
+
+        // The Defs branch builds a different capnp response type over the
+        // same grouping — it must read back the defs table, not the refs.
+        let defs = parse_op_json(
+            &op_get_token_map(&ctx, "node_defs", TokenMapOp::Defs).unwrap(),
+            "op_get_token_map",
+        );
+        assert_eq!(defs["ok"], json!(true), "got {defs}");
+        assert_eq!(
+            defs["entries"],
+            json!([{"token": "gamma", "node_ids": ["b.go/identifier"]}]),
+            "got {defs}",
+        );
+    }
+
+    #[tokio::test]
+    async fn op_get_node_returns_the_addressed_nodes_fields() {
+        // The node payload IS the answer, including the `record` blob
+        // that directory listings deliberately drop.
+        let (_dir, ctx) = setup();
+        seed_two_file_tree(&ctx);
+
+        let v = parse_op_json(
+            &op_get_node(&ctx, "src/lib.rs/function_declaration").unwrap(),
+            "op_get_node",
+        );
+        assert_eq!(v["ok"], json!(true), "got {v}");
+        let node = &v["node"];
+        assert!(node.is_object(), "expected a node payload in {v}");
+        assert_eq!(node["id"], json!("src/lib.rs/function_declaration"));
+        assert_eq!(
+            node["parent_id"],
+            json!("src/lib.rs"),
+            "parent/name split off the display path",
+        );
+        assert_eq!(node["name"], json!("function_declaration"));
+        assert_eq!(node["kind"], json!(0));
+        assert_eq!(node["size"], json!("4242"), "int64 renders as a string");
+        assert_eq!(node["record"], json!("fn main() {}"));
+
+        // An unresolvable id gets the shared not-found envelope.
+        let miss = parse_op_json(&op_get_node(&ctx, "nope.rs").unwrap(), "op_get_node");
+        assert_eq!(miss["ok"], json!(false), "got {miss}");
+        assert_eq!(miss["error"], json!("node 'nope.rs' not found"));
+    }
 }

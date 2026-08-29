@@ -665,6 +665,43 @@ mod tests {
         Ok(())
     }
 
+    /// An EMPTY changed-file list is not a scope: it falls through to the
+    /// full pass, exactly as `None` does. That is the direction of the
+    /// `Some(files) if !files.is_empty()` guard nothing observed before —
+    /// `embedding_pass_scope_limits_files` above only ever hands the guard a
+    /// NON-empty list, so a mutation replacing the guard with `true` was
+    /// invisible: it routes `Some(&[])` into the scoped arm, whose per-file
+    /// loop then iterates zero files and embeds nothing at all.
+    ///
+    /// The two tests together assert both branches, which is what the guard
+    /// needs — one of them alone leaves half of it unwitnessed.
+    #[test]
+    fn embedding_pass_empty_scope_runs_the_full_pass() -> Result<()> {
+        let conn = fresh_conn_with_nodes()?;
+        mint_leaf_file(&conn, "a.go", "package a")?;
+        mint_leaf_file(&conn, "b.go", "package b")?;
+        mint_leaf_file(&conn, "c.go", "package c")?;
+
+        let index = Arc::new(VectorIndex::new(4, None)?);
+        let pass = EmbeddingPass::new(index.clone(), Arc::new(ZeroEmbedder { dim: 4 }));
+        let empty: &[String] = &[];
+        let stats = pass.run(&conn, Path::new("/tmp"), Some(empty))?;
+
+        assert_eq!(
+            stats.files_processed, 3,
+            "an empty changed-file list must embed every file, as None does",
+        );
+        assert_eq!(stats.items_added, 3);
+        assert_eq!(index.len()?, 3);
+        for rel in ["a.go", "b.go", "c.go"] {
+            assert!(
+                index.get(rel)?.is_some(),
+                "{rel} must be embedded by the full pass",
+            );
+        }
+        Ok(())
+    }
+
     // ── FastEmbedder contract tests ────────────────────────────────────
     //
     // These are #[ignore] by default because the constructor downloads

@@ -645,4 +645,72 @@ mod tests {
             ids.len(),
         );
     }
+
+    #[cfg(feature = "html")]
+    #[test]
+    fn nids_are_exact_file_scoped_preorder_ordinals() {
+        // The projection-v5 key IS `(file_id << 24) | ordinal`. Every other
+        // test here reads through `resolve_path` / `v_node_path`, which are
+        // symmetric in the composition — they would agree with any layout the
+        // writer and reader happened to share. This one asserts the integers
+        // themselves, spelled as LITERALS so the expectation cannot be
+        // computed by the same expression it is checking.
+        let conn = open_mem();
+        project_ast_with_source(b"<p>Hi</p>", html_lang(), &conn, "a.html", "html").unwrap();
+
+        let file_id = crate::schema::lookup_file_id(&conn, "a.html")
+            .unwrap()
+            .expect("a.html must be interned");
+        assert_eq!(file_id, 1, "the first interned file takes file_id 1");
+
+        let mut stmt = conn.prepare("SELECT nid FROM _ast ORDER BY nid").unwrap();
+        let nids: Vec<i64> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<Vec<i64>, _>>()
+            .unwrap();
+        drop(stmt);
+
+        // 1 << 24 == 16_777_216. Ordinal 0 is the file's own node (the AST
+        // root); named children take a contiguous pre-order run after it.
+        assert_eq!(
+            nids[0], 16_777_216,
+            "the file's own node is ordinal 0 of file_id 1",
+        );
+        let expected: Vec<i64> = (0..nids.len() as i64).map(|o| 16_777_216 + o).collect();
+        assert_eq!(
+            nids, expected,
+            "nids must be a contiguous pre-order run inside file 1's range",
+        );
+
+        // File scoping: a second file starts a fresh ordinal run in ITS own
+        // range, 2 << 24 == 33_554_432. This is the property the whole re-key
+        // buys — `nid BETWEEN lo AND hi` is a per-file PK range scan.
+        project_ast_with_source(b"<p>Yo</p>", html_lang(), &conn, "b.html", "html").unwrap();
+        let b_file_id = crate::schema::lookup_file_id(&conn, "b.html")
+            .unwrap()
+            .expect("b.html must be interned");
+        assert_eq!(b_file_id, 2);
+        let b_min: i64 = conn
+            .query_row("SELECT MIN(nid) FROM _ast WHERE nid >= 33554432", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(b_min, 33_554_432, "b.html's root is ordinal 0 of file_id 2");
+
+        // a.html's rows are untouched by b.html's projection — the ranges do
+        // not overlap.
+        let a_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _ast WHERE nid BETWEEN 16777216 AND 33554431",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            a_count,
+            nids.len() as i64,
+            "a.html keeps exactly its own rows",
+        );
+    }
 }

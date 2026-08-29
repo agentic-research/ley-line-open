@@ -210,7 +210,14 @@ pub fn splice_db_bytes(db_bytes: &[u8], node_path: &str, new_text: &str) -> Resu
 
     let mut conn = Connection::open_in_memory()?;
     let cursor = Cursor::new(db_bytes);
-    conn.deserialize_read_exact("main", cursor, db_bytes.len(), true)
+    // `read_only = false`. The last argument is rusqlite's `read_only` flag,
+    // and passing `true` here made this function unable to do its job: a
+    // READONLY deserialize means `splice_and_reproject`'s very first DELETE
+    // fails with "attempt to write a readonly database", so every call
+    // returned Err. `false` selects FREEONCLOSE | RESIZEABLE, which is what a
+    // buffer we then rewrite and re-`serialize` needs — the reprojection can
+    // grow the image past its original page count.
+    conn.deserialize_read_exact("main", cursor, db_bytes.len(), false)
         .context("failed to deserialize .db bytes")?;
 
     // projection-v5: the caller addresses the node by its DISPLAY path (the
@@ -408,5 +415,80 @@ mod tests {
         splice_and_reproject(&conn, nid_of(&conn, "test.html/element/text"), "Final").unwrap();
         assert_eq!(get_source(&conn), b"<p>Final</p>");
         assert_eq!(get_record(&conn, "test.html/element/text"), "Final");
+    }
+
+    /// Reopen serialized bytes as a database — the only way to observe that
+    /// `splice_db_bytes` returned a real image rather than a plausible-looking
+    /// `Vec<u8>`.
+    #[cfg(feature = "html")]
+    fn reopen(bytes: &[u8]) -> Connection {
+        use std::io::Cursor;
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.deserialize_read_exact("main", Cursor::new(bytes), bytes.len(), true)
+            .expect("returned bytes must deserialize as a SQLite image");
+        conn
+    }
+
+    #[cfg(feature = "html")]
+    #[test]
+    fn splice_db_bytes_returns_a_reopenable_image_carrying_the_splice() {
+        // `splice_db_bytes` returns `Result<Vec<u8>>`, so a body replaced by
+        // `Ok(vec![])`, `Ok(vec![0])` or `Ok(vec![1])` is invisible to any
+        // caller that only unwraps it — or that checks `!is_empty()`. The
+        // assertions below are on the CONTENT of the image: its header magic,
+        // and the spliced state read back out of it through SQL.
+        let db = crate::parse_with_source(
+            b"<p>Hello</p>",
+            crate::languages::TsLanguage::Html,
+            "test.html",
+        )
+        .unwrap();
+
+        let out = splice_db_bytes(&db, "test.html/element/text", "World").unwrap();
+
+        // A serialized SQLite database opens with the format-3 magic and is
+        // at least one page long. `vec![]`, `vec![0]` and `vec![1]` all die
+        // on the length check; the magic pins that these are database bytes
+        // and not, say, the spliced source.
+        assert!(
+            out.len() >= 512,
+            "a serialized database is at least one page; got {} byte(s)",
+            out.len(),
+        );
+        assert_eq!(
+            &out[..16],
+            b"SQLite format 3\0",
+            "returned bytes must carry the SQLite header magic",
+        );
+
+        // The splice actually landed IN the returned image — not merely in
+        // some connection the function opened and dropped.
+        let spliced = reopen(&out);
+        assert_eq!(get_source(&spliced), b"<p>World</p>");
+        assert_eq!(get_record(&spliced, "test.html/element/text"), "World");
+        let (start, end) = get_ast_range(&spliced, "test.html/element/text");
+        assert_eq!((start, end), (3, 8), "byte range reprojected over 'World'");
+
+        // The input bytes are untouched — the function returns a new image.
+        let original = reopen(&db);
+        assert_eq!(get_source(&original), b"<p>Hello</p>");
+    }
+
+    #[cfg(feature = "html")]
+    #[test]
+    fn splice_db_bytes_rejects_a_path_that_does_not_resolve() {
+        // The other half of the contract: an unresolvable display path is an
+        // error, not an empty-but-Ok image.
+        let db = crate::parse_with_source(
+            b"<p>Hello</p>",
+            crate::languages::TsLanguage::Html,
+            "test.html",
+        )
+        .unwrap();
+        let err = splice_db_bytes(&db, "test.html/element/nope", "World").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("does not resolve"),
+            "unexpected error: {err:#}",
+        );
     }
 }

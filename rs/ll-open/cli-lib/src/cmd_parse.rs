@@ -873,6 +873,27 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
 /// set from the git watcher). When `Some`, only files in the scope are stat'd
 /// and reparsed, and only those paths are considered for deletion. When
 /// `None`, the entire `source` tree is walked.
+/// The ordinal an injected-subtree id takes within its host file.
+///
+/// projection-v5 lays a file's 24-bit ordinal space out in one order: the AST
+/// entries take `0..ast_entries` in pre-order (index == the pointer store's
+/// blob_ord), and injected-subtree ids — which carry fact rows but no
+/// `_ast`/`nodes` row — take the ordinals immediately after, in fold order.
+/// `j` therefore counts from the AST entry count, not from zero.
+fn injected_ordinal(ast_entries: usize, j: usize) -> usize {
+    ast_entries + j
+}
+
+/// Exclusive upper bound on the ordinals one parsed file will mint — the
+/// ordinal just past the last injected id.
+///
+/// The 24-bit bound check and the injected assignment must agree on the
+/// layout or a file could pass the check and then mint an ordinal outside its
+/// own range, so both read it from here.
+fn ordinal_space_needed(ast_entries: usize, injected: usize) -> usize {
+    injected_ordinal(ast_entries, injected)
+}
+
 /// projection-v5 refuses a pre-v5 arena rather than migrating it: the
 /// projection is DERIVED-ONLY (no identity domain — TABLE_CONTRACT §1),
 /// so a stale arena is rebuilt by a cold reparse, never patched in
@@ -1479,7 +1500,8 @@ pub fn parse_into_conn(
                     // low 24 bits are one and the same number. Injected
                     // nodes (no `_ast`/`nodes` rows, fact rows only) take
                     // the ordinals PAST the `_ast` count, in fold order.
-                    let total_ordinals = pf.ast_entries.len() + pf.injected_hashes.len();
+                    let total_ordinals =
+                        ordinal_space_needed(pf.ast_entries.len(), pf.injected_hashes.len());
                     anyhow::ensure!(
                         (total_ordinals as i64) <= leyline_schema::NID_ORDINAL_MASK,
                         "{}: file exceeds the 24-bit per-file ordinal space \
@@ -1494,7 +1516,7 @@ pub fn parse_into_conn(
                     for (j, (id, _)) in pf.injected_hashes.iter().enumerate() {
                         nid_by_id
                             .entry(id.as_str())
-                            .or_insert(base | (pf.ast_entries.len() + j) as i64);
+                            .or_insert(base | injected_ordinal(pf.ast_entries.len(), j) as i64);
                     }
 
                     // parent_nid + sibling ord per entry, derived from the
@@ -3955,6 +3977,140 @@ mod tests {
             )
             .unwrap();
         assert_eq!(keep_present, 1);
+    }
+
+    #[test]
+    fn the_ordinal_layout_puts_injected_ids_after_the_ast_entries() {
+        // projection-v5 lays a file's 24-bit ordinal space out in exactly one
+        // order, and TWO sites depend on that layout agreeing: the `ensure!`
+        // that refuses a file too big for the space, and the assignment that
+        // gives each injected-subtree id its ordinal. If they disagreed, a
+        // file could pass the bound check and then mint an ordinal outside
+        // its own nid range — a silent cross-file nid collision.
+        //
+        // Pinned as exact values, not as a relation: the arithmetic is the
+        // whole contract here.
+        assert_eq!(
+            injected_ordinal(3, 0),
+            3,
+            "the first injected id takes the ordinal right after the last AST entry",
+        );
+        assert_eq!(
+            injected_ordinal(3, 2),
+            5,
+            "injected ids run in fold order from the AST count",
+        );
+        assert_eq!(
+            ordinal_space_needed(3, 2),
+            5,
+            "the space a file needs is the ordinal just past its last injected id",
+        );
+        // A file with no injections needs exactly its AST count.
+        assert_eq!(ordinal_space_needed(7, 0), 7);
+        assert_eq!(injected_ordinal(0, 0), 0);
+    }
+
+    #[test]
+    fn sibling_ord_counts_up_from_zero_in_source_order() {
+        // `ord` is the stored sibling index that replaced pre-v5's
+        // lexicographic `ORDER BY name` (which sorted `_10` before `_2`).
+        // Its whole value is that consecutive siblings get 0, 1, 2 … in
+        // SOURCE order, so a listing can recover the file's real shape.
+        // Nothing observed the counter itself before this test.
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        std::fs::write(
+            root.join("m.go"),
+            b"package m\n\nfunc A() {}\nfunc B() {}\nfunc C() {}\nfunc D() {}\n",
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        parse_into_conn(&conn, root, None, None).unwrap();
+
+        // Every parent in the file's own nid space must hand its children a
+        // dense 0..k-1 run. A counter that decremented (or failed to advance)
+        // shows up here as negative or duplicated ords.
+        let mut stmt = conn
+            .prepare("SELECT parent_nid, ord FROM nodes WHERE nid > 0 AND parent_nid IS NOT NULL")
+            .unwrap();
+        let rows: Vec<(i64, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(!rows.is_empty(), "the fixture must produce parented nodes");
+
+        let mut by_parent: std::collections::HashMap<i64, Vec<i64>> =
+            std::collections::HashMap::new();
+        for (parent, ord) in rows {
+            by_parent.entry(parent).or_default().push(ord);
+        }
+        for (parent, mut ords) in by_parent {
+            ords.sort_unstable();
+            let expected: Vec<i64> = (0..ords.len() as i64).collect();
+            assert_eq!(
+                ords, expected,
+                "parent {parent}'s children must carry ord 0..k-1 with no gaps, \
+                 negatives or duplicates",
+            );
+        }
+    }
+
+    #[test]
+    fn a_parse_that_deleted_nothing_skips_the_orphan_dir_sweep() {
+        // Characterization of the cold-parse fast path (bead
+        // `ley-line-open-cbbedf` Attack 3): when no file was deleted this
+        // run, no dir node CAN have been orphaned by this run, so the
+        // full-scan sweep is pure overhead — ~500ms on the 765-file mache
+        // bench — and is skipped.
+        //
+        // The trade-off that buys is real and deliberate: a dir orphaned by
+        // some EARLIER event the sweep never saw (a crash between COMMIT and
+        // the sweep) is not reaped by a later clean pass. That residue is
+        // display-only, and this test pins the skip so the optimization
+        // cannot be quietly dropped — or quietly turned into an
+        // every-parse full scan.
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        std::fs::write(root.join("a.go"), b"package m\n").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        let r1 = parse_into_conn(&conn, root, None, None).unwrap();
+        assert_eq!(r1.deleted, 0, "a cold parse deletes nothing");
+
+        // Plant a childless dir row: exactly what a crash-interrupted sweep
+        // would leave behind. `ensure_dir_nodes` interns the chain and writes
+        // the dir presentation rows but mints no file node, so `ghost` has no
+        // children the moment it exists.
+        let orphan = leyline_schema::dir_nid(
+            leyline_schema::ensure_dir_nodes(&conn, "ghost/x.go", 0).unwrap(),
+        );
+        let planted: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes WHERE nid = ?1", [orphan], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            planted, 1,
+            "the orphan dir row must exist before the reparse"
+        );
+
+        // A second pass over the unchanged tree: nothing parsed, nothing
+        // deleted — so the sweep must not run.
+        let r2 = parse_into_conn(&conn, root, None, None).unwrap();
+        assert_eq!(r2.deleted, 0, "the reparse must observe no deletions");
+        let survived: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes WHERE nid = ?1", [orphan], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            survived, 1,
+            "with nothing deleted the sweep is skipped, so a pre-existing \
+             orphan dir survives — dropping the `deleted > 0` guard would turn \
+             every parse into a full nodes scan",
+        );
     }
 
     #[test]

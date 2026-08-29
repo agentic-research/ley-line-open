@@ -312,4 +312,54 @@ security = ["cryptography>=3.0", "pyopenssl>=21.0"]
 
         assert_eq!(child_count(&conn, "optional/security"), 2);
     }
+
+    #[test]
+    fn ensure_root_node_writes_the_root_presentation_row() {
+        // `ensure_root_node` returns `Result<()>`, so a body replaced by
+        // `Ok(())` is invisible to any caller that only unwraps it. The row
+        // at nid -1 IS the effect: it is the mount root every other node in
+        // the pyproject projection hangs beneath, so its absence is a tree
+        // with no reachable entry point.
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        ensure_root_node(&conn, 4242).unwrap();
+
+        let (parent_nid, kind, ord, mtime, record): (Option<i64>, i32, i64, i64, String) = conn
+            .query_row(
+                "SELECT parent_nid, kind, ord, mtime, record FROM nodes WHERE nid = -1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .expect("the root presentation row at nid -1 must exist");
+        assert_eq!(parent_nid, None, "the root has no parent");
+        assert_eq!(kind, 1, "the root is a directory");
+        assert_eq!(ord, 0);
+        assert_eq!(mtime, 4242, "the caller's mtime must reach the row");
+        assert_eq!(record, "");
+
+        // The interned name is the empty string — `resolve_path` renders the
+        // root as "" and every child path is relative to it.
+        let name: String = conn
+            .query_row(
+                "SELECT names.text FROM nodes JOIN names USING (name_id) WHERE nodes.nid = -1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "");
+
+        // INSERT OR IGNORE: a second call must not duplicate the row, and the
+        // first writer's mtime stands.
+        ensure_root_node(&conn, 9999).unwrap();
+        let (n, mtime): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(mtime) FROM nodes WHERE nid = -1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "the root row must not duplicate");
+        assert_eq!(mtime, 4242, "INSERT OR IGNORE: first writer wins");
+    }
 }

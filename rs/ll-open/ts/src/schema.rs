@@ -4,10 +4,9 @@
 //! AST-specific tables (`_source`, `_ast`) that enable bidirectional splicing.
 
 pub use leyline_schema::{
-    NODES_DDL, NODES_INDEXES_DDL, NODES_TABLE_DDL, create_nodes_indexes, create_nodes_table,
-    create_schema, dir_nid, ensure_dir_nodes, ensure_file_id, file_nid, file_nid_range,
-    insert_node, intern_kind, intern_name, lookup_file_id, nid_file_id, nid_ordinal, node_path,
-    resolve_path,
+    NODES_INDEXES_DDL, NODES_TABLE_DDL, create_nodes_indexes, create_nodes_table, create_schema,
+    dir_nid, ensure_dir_nodes, ensure_file_id, file_nid, file_nid_range, insert_node, intern_kind,
+    intern_name, lookup_file_id, nid_file_id, nid_ordinal, node_path, resolve_path,
 };
 
 use anyhow::Result;

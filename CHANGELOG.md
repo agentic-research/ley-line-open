@@ -57,6 +57,38 @@ context, scoping notes, and review history are recoverable.
   enables (file-scoped integer nids, projection-v5/v6) is designed and
   gated on the bead.
 
+### Removed
+
+- **`leyline_schema::NODES_DDL`** (bead `ley-line-open-b23c41`). The constant
+  was a hand-maintained copy of `INTERN_TABLES_DDL` + `NODES_TABLE_DDL` +
+  `NODES_INDEXES_DDL` — a second source of truth for the same SQL, which
+  projection-v5 had to re-sync by hand — and it was documented as materializing
+  the schema "in one batch" while omitting the display views. Post-v5 that made
+  it a loaded gun: a caller who reached for the one-batch constant got a schema
+  whose every path render fails with `no such table: v_node_name`. It had one
+  caller (`create_schema`, same module) and a re-export from `leyline-ts` with
+  no consumers. `create_schema` is now defined as the two-phase bulk path run
+  back to back (`create_nodes_table` then `create_nodes_indexes`), so there is
+  one source of truth and no way to obtain a viewless schema. Callers wanting
+  the raw DDL should use the three constants directly; callers wanting a usable
+  schema should call `create_schema`, which is what they already wanted.
+
+### Fixed
+
+- **`leyline-vcs`'s graph fixture built an unreadable schema** (Phase B of
+  `ley-line-open-17c271`). `writable_graph()` seeded from the removed
+  `NODES_DDL` alone, which under projection-v5 omits `v_node_name`; all three
+  tests that render a path failed. A regression introduced by Phase B that
+  reached a green PR — `task ci` runs `cargo test --workspace`, and the crate's
+  `sqlite` feature is off by default, so the code never compiled. Surfaced only
+  by `cargo test --workspace --all-features`; see `ley-line-open-b23c41` for
+  the argument that the mutation slices should build that configuration by
+  construction.
+
+- **`splice_db_bytes` always returned `Err`** in `leyline-ts`. The internal
+  `deserialize_read_exact` call passed `read_only = true`, so every splice
+  through this entry point failed. Pre-existing, unrelated to projection-v5.
+
 ## [0.19.1] — 2026-08-26
 
 ### Fixed

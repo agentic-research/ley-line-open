@@ -188,52 +188,6 @@ pub const NODES_INDEXES_DDL: &str = "\
 CREATE INDEX IF NOT EXISTS idx_parent_kind_ord ON nodes(parent_nid, kind_id, ord);
 CREATE INDEX IF NOT EXISTS idx_source_file ON nodes(source_file) WHERE source_file IS NOT NULL;";
 
-/// Combined interning + `nodes` table + index DDL. Preserves the pre-split
-/// contract for callers that want the schema fully materialized in one
-/// batch. Bulk-load callers (e.g. `cmd_parse`) instead call
-/// [`create_nodes_table`] (insert phase) and [`create_nodes_indexes`]
-/// (post-COMMIT) separately — see bead `ley-line-open-9ccbc7`.
-pub const NODES_DDL: &str = "\
-CREATE TABLE IF NOT EXISTS names (
-    name_id INTEGER PRIMARY KEY,
-    text TEXT NOT NULL UNIQUE
-);
-CREATE TABLE IF NOT EXISTS kinds (
-    kind_id INTEGER PRIMARY KEY,
-    lang TEXT NOT NULL,
-    raw_kind TEXT NOT NULL,
-    UNIQUE(lang, raw_kind)
-);
-CREATE TABLE IF NOT EXISTS dirs (
-    dir_id INTEGER PRIMARY KEY,
-    parent_dir_id INTEGER,
-    name_id INTEGER NOT NULL,
-    CHECK (dir_id = 1 OR parent_dir_id IS NOT NULL),
-    UNIQUE(parent_dir_id, name_id)
-);
-CREATE TABLE IF NOT EXISTS files (
-    file_id INTEGER PRIMARY KEY,
-    dir_id INTEGER NOT NULL,
-    name_id INTEGER NOT NULL,
-    UNIQUE(dir_id, name_id)
-);
-CREATE TABLE IF NOT EXISTS nodes (
-    nid INTEGER PRIMARY KEY,
-    parent_nid INTEGER,
-    name_id INTEGER,
-    kind_id INTEGER,
-    kind INTEGER NOT NULL,
-    ord INTEGER NOT NULL DEFAULT 0,
-    size INTEGER DEFAULT 0,
-    mtime INTEGER NOT NULL,
-    record_id TEXT,
-    record TEXT,
-    source_file TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_parent_kind_ord ON nodes(parent_nid, kind_id, ord);
--- Partial index: see `NODES_INDEXES_DDL` for rationale.
-CREATE INDEX IF NOT EXISTS idx_source_file ON nodes(source_file) WHERE source_file IS NOT NULL;";
-
 /// Bulk path renderer: `v_node_path(nid, path)` for every `nodes` row.
 ///
 /// The recursive member walks parents upward; the name of each hop comes
@@ -278,10 +232,16 @@ SELECT nid, path FROM walk WHERE cursor IS NULL;";
 
 /// Create the interning tables, the `nodes` table, its indexes, and the
 /// display views (idempotent), and seed the root directory.
+///
+/// Defined as the two-phase bulk path run back to back, rather than as its
+/// own DDL batch. The batch it replaced (`NODES_DDL`) was a hand-maintained
+/// copy of [`INTERN_TABLES_DDL`] + [`NODES_TABLE_DDL`] + [`NODES_INDEXES_DDL`]
+/// that omitted the display views, so a caller who reached for the
+/// "everything in one batch" constant got a schema whose readers all fail
+/// with "no such table: v_node_name" — see bead `ley-line-open-b23c41`.
 pub fn create_schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch(NODES_DDL)?;
-    conn.execute_batch(V_NODE_PATH_DDL)?;
-    ensure_root_dir(conn)?;
+    create_nodes_table(conn)?;
+    create_nodes_indexes(conn)?;
     Ok(())
 }
 

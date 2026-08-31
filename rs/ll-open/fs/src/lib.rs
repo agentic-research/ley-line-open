@@ -513,7 +513,7 @@ mod tests {
         )?;
 
         let data = source.serialize("main")?;
-        let bytes = data.as_ref();
+        let bytes: &[u8] = data.as_ref();
         assert!(!bytes.is_empty(), "serialized DB should not be empty");
 
         let graph = SqliteGraph::from_bytes(bytes)?;
@@ -582,7 +582,7 @@ mod tests {
              INSERT INTO results VALUES ('node-1', 'hello from buffer 1');",
         )?;
         let serialized = source.serialize("main")?;
-        let db_bytes = serialized.as_ref();
+        let db_bytes: &[u8] = serialized.as_ref();
 
         // Build a fake arena: 4096-byte header + two equal buffers
         let buf_size = db_bytes.len().max(4096);

@@ -113,17 +113,17 @@ CREATE TABLE IF NOT EXISTS content_chunks (
 /// none of it (see `blob_chunked` — existence is freshness there).
 const NODE_MANIFEST_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS content_manifest (
-    node_id    TEXT    NOT NULL,
+    nid        INTEGER NOT NULL,
     seq        INTEGER NOT NULL,
     chunk_hash BLOB    NOT NULL,
     byte_offset INTEGER NOT NULL,
     byte_len    INTEGER NOT NULL,
-    PRIMARY KEY (node_id, seq)
+    PRIMARY KEY (nid, seq)
 );
 
 -- The index that makes a range read a WHERE clause rather than a full scan.
 CREATE INDEX IF NOT EXISTS content_manifest_span
-    ON content_manifest(node_id, byte_offset);
+    ON content_manifest(nid, byte_offset);
 
 -- The index that makes reachability GC one lookup per distinct chunk instead
 -- of a full manifest scan per chunk.
@@ -146,7 +146,7 @@ CREATE INDEX IF NOT EXISTS content_manifest_chunk_hash
 -- `source_mtime` remains as a column for older readers but no longer enters
 -- the freshness predicate.
 CREATE TABLE IF NOT EXISTS content_manifest_meta (
-    node_id           TEXT PRIMARY KEY,
+    nid               INTEGER PRIMARY KEY,
     source_len        INTEGER NOT NULL,
     source_mtime      INTEGER,
     source_generation INTEGER NOT NULL DEFAULT -1
@@ -156,7 +156,7 @@ CREATE TABLE IF NOT EXISTS content_manifest_meta (
 -- row re-inserted) since this arena gained the CDC schema. Maintained by
 -- triggers, never by application code.
 CREATE TABLE IF NOT EXISTS content_generation (
-    node_id    TEXT PRIMARY KEY,
+    nid        INTEGER PRIMARY KEY,
     generation INTEGER NOT NULL DEFAULT 0
 );";
 
@@ -165,23 +165,27 @@ CREATE TABLE IF NOT EXISTS content_generation (
 /// arenas (some tests, non-graph use) do not have; applied wherever the
 /// witness is actually consulted — see [`ensure_generation_infra`].
 ///
-/// INSERT bumps too: a fresh row at a reused node id is the disclosure
-/// scenario (new file at an old path serving the previous occupant's
-/// bytes), and it must invalidate any manifest the old occupant left.
+/// INSERT bumps too: a fresh row at a reused nid is the disclosure scenario
+/// and it must invalidate any manifest the old occupant left. projection-v5
+/// narrows that scenario but does not remove it — `files` is append-only, so
+/// a nid range can never re-bind to an unrelated path, but deleting a file
+/// and re-creating it AT THE SAME PATH re-binds to the same `file_id` and
+/// therefore the same nid. The generation bump on the new row's INSERT is
+/// what makes the old occupant's manifest read stale.
 const GENERATION_TRIGGERS_DDL: &str = "\
 CREATE TRIGGER IF NOT EXISTS content_generation_on_update
 AFTER UPDATE OF record ON nodes
 WHEN new.record IS NOT old.record
 BEGIN
-    INSERT INTO content_generation(node_id, generation) VALUES (new.id, 1)
-    ON CONFLICT(node_id) DO UPDATE SET generation = generation + 1;
+    INSERT INTO content_generation(nid, generation) VALUES (new.nid, 1)
+    ON CONFLICT(nid) DO UPDATE SET generation = generation + 1;
 END;
 
 CREATE TRIGGER IF NOT EXISTS content_generation_on_insert
 AFTER INSERT ON nodes
 BEGIN
-    INSERT INTO content_generation(node_id, generation) VALUES (new.id, 1)
-    ON CONFLICT(node_id) DO UPDATE SET generation = generation + 1;
+    INSERT INTO content_generation(nid, generation) VALUES (new.nid, 1)
+    ON CONFLICT(nid) DO UPDATE SET generation = generation + 1;
 END;";
 
 /// The freshness witness, defined ONCE (types-friend F3 — the module already
@@ -198,7 +202,7 @@ pub(crate) const WITNESS_FRESH_PREDICATE: &str = "\
 m.source_len >= 0 \
 AND m.source_len = COALESCE(n.size, -1) \
 AND m.source_generation = COALESCE(\
-    (SELECT g.generation FROM content_generation g WHERE g.node_id = n.id), 0)";
+    (SELECT g.generation FROM content_generation g WHERE g.nid = n.nid), 0)";
 
 /// Create the chunk store + manifest tables (idempotent), migrate a
 /// pre-generation witness table, and install the generation triggers when
@@ -211,43 +215,28 @@ pub fn create_chunked_content_schema(conn: &Connection) -> Result<()> {
     ensure_generation_infra(conn)
 }
 
-/// Idempotently bring an arena's generation infrastructure current:
-/// - add `source_generation` to a pre-b82f56 witness table (DEFAULT -1, which
-///   matches no real generation, so every OLD manifest reads stale — the
-///   design's own degradation: slow-but-correct, then reaped by GC);
-/// - install the `nodes` triggers when `nodes` exists.
+/// Idempotently bring an arena's generation infrastructure current: create
+/// `content_generation` when absent, and install the `nodes` triggers when
+/// `nodes` exists.
 ///
 /// Called from schema creation, the manifest store path, and GC — any of
-/// which may be the first post-upgrade writer to touch an old arena. All
-/// statements are IF-NOT-EXISTS-shaped, and SQLite DDL is transactional, so
-/// a dry-run GC that runs this inside its rolled-back transaction stays
-/// non-mutating.
+/// which may be the first writer to touch an arena that has the chunk pool
+/// but not the witness. All statements are IF-NOT-EXISTS-shaped, and SQLite
+/// DDL is transactional, so a dry-run GC that runs this inside its
+/// rolled-back transaction stays non-mutating.
+///
+/// The pre-b82f56 `ALTER TABLE ... ADD COLUMN source_generation` shim is
+/// gone: projection-v5 re-keys every one of these tables on `nid`, so a
+/// pre-v5 arena is not upgradable in place and is not a supported input.
+/// The projection is derived — it is re-parsed, not migrated.
 pub(crate) fn ensure_generation_infra(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS content_generation (
-             node_id    TEXT PRIMARY KEY,
+             nid        INTEGER PRIMARY KEY,
              generation INTEGER NOT NULL DEFAULT 0
          );",
     )
     .context("create content_generation")?;
-
-    let has_generation_column: bool = conn
-        .query_row(
-            "SELECT 1 FROM pragma_table_info('content_manifest_meta') \
-              WHERE name = 'source_generation'",
-            [],
-            |_| Ok(true),
-        )
-        .optional()
-        .context("probe witness generation column")?
-        .unwrap_or(false);
-    if !has_generation_column {
-        conn.execute_batch(
-            "ALTER TABLE content_manifest_meta \
-             ADD COLUMN source_generation INTEGER NOT NULL DEFAULT -1;",
-        )
-        .context("migrate witness table to generations")?;
-    }
 
     let nodes_table: bool = conn
         .query_row(
@@ -354,19 +343,19 @@ fn chunk_schema_present(conn: &Connection) -> Result<bool> {
     .map(|present| present.unwrap_or(false))
 }
 
-/// Store `data` for `node_id` as content-defined chunks, replacing any existing
+/// Store `data` for `nid` as content-defined chunks, replacing any existing
 /// manifest. Chunk bytes are `INSERT OR IGNORE`d, so a chunk shared with another
 /// file (or an earlier version of this one) costs nothing. Returns the chunk
 /// count.
-pub fn store_content_chunked(conn: &Connection, node_id: &str, data: &[u8]) -> Result<usize> {
+pub fn store_content_chunked(conn: &Connection, nid: i64, data: &[u8]) -> Result<usize> {
     let chunks = leyline_cdc::chunk(data);
     let all = 0..chunks.len();
-    store_content_manifest(conn, node_id, data, &chunks, all)
+    store_content_manifest(conn, nid, data, &chunks, all)
 }
 
 fn store_content_manifest(
     conn: &Connection,
-    node_id: &str,
+    nid: i64,
     data: &[u8],
     chunks: &[leyline_cdc::Chunk],
     rehashed: std::ops::Range<usize>,
@@ -384,7 +373,7 @@ fn store_content_manifest(
     let tx = conn
         .unchecked_transaction()
         .context("begin chunked store transaction")?;
-    store_content_manifest_in_transaction(&tx, node_id, data, chunks, rehashed)?;
+    store_content_manifest_in_transaction(&tx, nid, data, chunks, rehashed)?;
     tx.commit().context("commit chunked store")?;
     Ok(chunks.len())
 }
@@ -396,12 +385,12 @@ fn store_content_manifest(
 /// use gap. The transaction is not committed here.
 pub(crate) fn store_content_chunked_in_transaction(
     tx: &Transaction<'_>,
-    node_id: &str,
+    nid: i64,
     data: &[u8],
 ) -> Result<usize> {
     let chunks = leyline_cdc::chunk(data);
     let all = 0..chunks.len();
-    store_content_manifest_in_transaction(tx, node_id, data, &chunks, all)?;
+    store_content_manifest_in_transaction(tx, nid, data, &chunks, all)?;
     Ok(chunks.len())
 }
 
@@ -426,7 +415,7 @@ pub(crate) fn store_content_chunked_in_transaction(
 /// shortcut for a NEW caller without walking that chain.
 fn store_content_manifest_in_transaction(
     tx: &Transaction<'_>,
-    node_id: &str,
+    nid: i64,
     data: &[u8],
     chunks: &[leyline_cdc::Chunk],
     rehashed: std::ops::Range<usize>,
@@ -436,15 +425,12 @@ fn store_content_manifest_in_transaction(
         "rehashed window {rehashed:?} does not lie within the {} manifest rows",
         chunks.len()
     );
-    tx.execute(
-        "DELETE FROM content_manifest WHERE node_id = ?1",
-        params![node_id],
-    )
-    .context("clear previous manifest")?;
+    tx.execute("DELETE FROM content_manifest WHERE nid = ?1", params![nid])
+        .context("clear previous manifest")?;
 
     let mut put_span = tx
         .prepare(
-            "INSERT INTO content_manifest (node_id, seq, chunk_hash, byte_offset, byte_len) \
+            "INSERT INTO content_manifest (nid, seq, chunk_hash, byte_offset, byte_len) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
         )
         .context("prepare manifest insert")?;
@@ -467,7 +453,7 @@ fn store_content_manifest_in_transaction(
         }
         put_span
             .execute(params![
-                node_id,
+                nid,
                 i64::try_from(seq).context("chunk sequence exceeds SQLite INTEGER")?,
                 c.hash.as_bytes().as_slice(),
                 i64::try_from(c.offset).context("chunk offset exceeds SQLite INTEGER")?,
@@ -507,8 +493,8 @@ fn store_content_manifest_in_transaction(
     let node_meta: Option<(Option<Vec<u8>>, Option<i64>, i64)> = if nodes_table {
         ensure_generation_infra(tx).context("ensure generation infra before store")?;
         tx.query_row(
-            "SELECT CAST(record AS BLOB), size, mtime FROM nodes WHERE id = ?1",
-            params![node_id],
+            "SELECT CAST(record AS BLOB), size, mtime FROM nodes WHERE nid = ?1",
+            params![nid],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()
@@ -519,7 +505,7 @@ fn store_content_manifest_in_transaction(
     if let Some((record, source_len, _)) = &node_meta {
         let (Some(record), Some(source_len)) = (record, source_len) else {
             anyhow::bail!(
-                "cannot chunk-store {node_id}: its nodes row has a NULL record \
+                "cannot chunk-store nid {nid}: its nodes row has a NULL record \
                  or size, so no freshness witness can be captured"
             );
         };
@@ -527,7 +513,7 @@ fn store_content_manifest_in_transaction(
             *source_len >= 0
                 && usize::try_from(*source_len).ok() == Some(data.len())
                 && record == data,
-            "authoritative node changed before chunk store for {node_id}"
+            "authoritative node changed before chunk store for nid {nid}"
         );
     }
     // The generation captured in the SAME transaction as the manifest —
@@ -536,17 +522,17 @@ fn store_content_manifest_in_transaction(
     let generation: i64 = tx
         .query_row(
             "SELECT COALESCE(\
-                 (SELECT generation FROM content_generation WHERE node_id = ?1), 0)",
-            params![node_id],
+                 (SELECT generation FROM content_generation WHERE nid = ?1), 0)",
+            params![nid],
             |r| r.get(0),
         )
         .context("read content generation")?;
     tx.execute(
         "INSERT OR REPLACE INTO content_manifest_meta \
-         (node_id, source_len, source_mtime, source_generation) \
+         (nid, source_len, source_mtime, source_generation) \
          VALUES (?1, ?2, ?3, ?4)",
         params![
-            node_id,
+            nid,
             i64::try_from(data.len()).context("source length exceeds SQLite INTEGER")?,
             node_meta.map(|(_, _, mtime)| mtime),
             generation
@@ -556,7 +542,7 @@ fn store_content_manifest_in_transaction(
     Ok(())
 }
 
-/// The overlap predicate, defined once. `?1` = node id, `?2` = range end,
+/// The overlap predicate, defined once. `?1` = nid, `?2` = range end,
 /// `?3` = range start, `?4` = the seek floor (see below). Every path that
 /// selects chunks for a range MUST use this string — a second hand-written
 /// copy is how an off-by-one slips in (a copy in a test drifts silently from
@@ -578,7 +564,7 @@ fn store_content_manifest_in_transaction(
 /// the weaker `>=` with a saturating subtraction keeps offset 0 included.
 /// It therefore cannot exclude an overlapping chunk — and the exactness test
 /// plus the fuzzer's oracle check that empirically, not just by argument.
-const OVERLAP_PREDICATE: &str = "node_id = ?1 AND byte_offset >= ?4 AND byte_offset < ?2 \
+const OVERLAP_PREDICATE: &str = "nid = ?1 AND byte_offset >= ?4 AND byte_offset < ?2 \
      AND (byte_offset + byte_len) > ?3";
 
 fn select_range_manifest_sql() -> String {
@@ -591,14 +577,14 @@ fn select_range_manifest_sql() -> String {
 }
 
 pub(crate) fn decode_manifest_chunk(
-    node_id: &str,
+    owner: &dyn std::fmt::Display,
     hash: Vec<u8>,
     offset: i64,
     len: i64,
 ) -> Result<leyline_cdc::Chunk> {
     ensure!(
         hash.len() == blake3::OUT_LEN,
-        "chunk manifest for {node_id} has a {}-byte hash",
+        "chunk manifest for {owner} has a {}-byte hash",
         hash.len()
     );
     let hash: [u8; blake3::OUT_LEN] = hash
@@ -618,14 +604,14 @@ pub(crate) fn sqlite_integer(value: usize, label: &str) -> Result<i64> {
 
 fn select_range_manifest(
     tx: &Transaction<'_>,
-    node_id: &str,
+    nid: i64,
     offset: usize,
     len: usize,
 ) -> Result<Option<leyline_cdc::SelectedRange>> {
     let source_len = tx
         .query_row(
-            "SELECT source_len FROM content_manifest_meta WHERE node_id = ?1",
-            params![node_id],
+            "SELECT source_len FROM content_manifest_meta WHERE nid = ?1",
+            params![nid],
             |row| row.get::<_, i64>(0),
         )
         .optional()
@@ -644,7 +630,7 @@ fn select_range_manifest(
     let rows = statement
         .query_map(
             params![
-                node_id,
+                nid,
                 sqlite_integer(wanted_end, "range end")?,
                 sqlite_integer(wanted_start, "range start")?,
                 seek_floor(wanted_start)?
@@ -662,17 +648,12 @@ fn select_range_manifest(
     let mut chunks = Vec::new();
     for row in rows {
         let (hash, chunk_offset, chunk_len) = row.context("decode range manifest row")?;
-        chunks.push(decode_manifest_chunk(
-            node_id,
-            hash,
-            chunk_offset,
-            chunk_len,
-        )?);
+        chunks.push(decode_manifest_chunk(&nid, hash, chunk_offset, chunk_len)?);
     }
     // Parse, don't validate: the returned type carries the selection
     // contract, and the cdc read performs no second pass (types-friend F5).
     let selected = leyline_cdc::SelectedRange::parse(chunks, source_len, wanted_start, wanted_end)
-        .with_context(|| format!("validate selected range manifest for {node_id}"))?;
+        .with_context(|| format!("validate selected range manifest for nid {nid}"))?;
     Ok(Some(selected))
 }
 
@@ -689,7 +670,7 @@ pub(crate) fn seek_floor(start: usize) -> Result<i64> {
 /// How many chunks a read of `len` bytes at `offset` would touch. This is the
 /// cost of the read, in chunks — the number the whole design exists to keep
 /// small. Uses [`OVERLAP_PREDICATE`], so it measures the shipped selection.
-pub fn chunks_touched(conn: &Connection, node_id: &str, offset: u64, len: usize) -> Result<usize> {
+pub fn chunks_touched(conn: &Connection, nid: i64, offset: u64, len: usize) -> Result<usize> {
     let start = usize::try_from(offset).context("range offset exceeds usize")?;
     let end = start.saturating_add(len);
     let sql = format!("SELECT COUNT(*) FROM content_manifest WHERE {OVERLAP_PREDICATE}");
@@ -697,7 +678,7 @@ pub fn chunks_touched(conn: &Connection, node_id: &str, offset: u64, len: usize)
         .query_row(
             &sql,
             params![
-                node_id,
+                nid,
                 sqlite_integer(end, "range end")?,
                 sqlite_integer(start, "range start")?,
                 seek_floor(start)?
@@ -708,7 +689,7 @@ pub fn chunks_touched(conn: &Connection, node_id: &str, offset: u64, len: usize)
     usize::try_from(n).context("negative touched chunk count")
 }
 
-/// Read `buf.len()` bytes at `offset` for `node_id`, touching **only** the
+/// Read `buf.len()` bytes at `offset` for `nid`, touching **only** the
 /// chunks whose span overlaps the request.
 ///
 /// **Deliberately not public.** This reads the manifest UNCHECKED — it does not
@@ -721,7 +702,7 @@ pub fn chunks_touched(conn: &Connection, node_id: &str, offset: u64, len: usize)
 #[cfg(test)]
 pub(crate) fn read_content_chunked(
     conn: &Connection,
-    node_id: &str,
+    nid: i64,
     buf: &mut [u8],
     offset: u64,
 ) -> Result<usize> {
@@ -732,7 +713,7 @@ pub(crate) fn read_content_chunked(
     let tx = conn
         .unchecked_transaction()
         .context("begin chunked range read transaction")?;
-    let written = read_content_chunked_in_transaction(&tx, node_id, buf, offset)?;
+    let written = read_content_chunked_in_transaction(&tx, nid, buf, offset)?;
     tx.commit()
         .context("commit chunked range read transaction")?;
     Ok(written)
@@ -740,14 +721,14 @@ pub(crate) fn read_content_chunked(
 
 fn read_content_chunked_in_transaction(
     tx: &Transaction<'_>,
-    node_id: &str,
+    nid: i64,
     buf: &mut [u8],
     offset: usize,
 ) -> Result<usize> {
     if buf.is_empty() {
         return Ok(0);
     }
-    let Some(selected) = select_range_manifest(tx, node_id, offset, buf.len())? else {
+    let Some(selected) = select_range_manifest(tx, nid, offset, buf.len())? else {
         return Ok(0);
     };
     let store = SqliteBlobStore { tx };
@@ -757,7 +738,7 @@ fn read_content_chunked_in_transaction(
     leyline_cdc::read_range_into(&selected, &store, buf).context("reconstruct SQLite chunk range")
 }
 
-/// Drop `node_id`'s chunk manifest, so subsequent reads fall back to
+/// Drop `nid`'s chunk manifest, so subsequent reads fall back to
 /// `nodes.record`.
 ///
 /// This is the safety valve for writers this crate does not control.
@@ -772,59 +753,120 @@ fn read_content_chunked_in_transaction(
 /// Chunk BYTES are deliberately left in `content_chunks`: they are
 /// content-addressed, so they cost nothing to keep and are immediately reused
 /// if the same content reappears. See the module docs on garbage collection.
-pub(crate) fn invalidate_chunked_content(conn: &Connection, node_id: &str) -> Result<()> {
-    // A foreign arena has no chunk tables at all — nothing to invalidate, and
-    // probing must not turn into an error on that path.
-    let table_present: bool = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='content_manifest'",
-            [],
-            |_| Ok(true),
-        )
-        .optional()
-        .context("probe for content_manifest")?
-        .unwrap_or(false);
-    if !table_present {
+pub(crate) fn invalidate_chunked_content(conn: &Connection, nid: i64) -> Result<()> {
+    if !manifest_table_present(conn)? {
         return Ok(());
     }
-    conn.execute(
-        "DELETE FROM content_manifest WHERE node_id = ?1",
-        params![node_id],
-    )
-    .context("invalidate chunk manifest")?;
+    conn.execute("DELETE FROM content_manifest WHERE nid = ?1", params![nid])
+        .context("invalidate chunk manifest")?;
     Ok(())
 }
 
-/// Invalidate `node_id` **and every descendant path** (`node_id/...`).
-///
-/// Node ids are paths, and the writers that delete or rename a node cascade
-/// over descendants with `id LIKE 'node_id/%'`. Invalidation has to cascade
-/// identically, or a child's manifest outlives its `nodes` row.
-///
-/// This is the cross-generation-leak guard: because ids are paths and paths
-/// get REUSED, an orphaned manifest is not merely stale — it is attached to
-/// whatever node is created at that path next, and `has_chunked_content` will
-/// happily serve the previous occupant's bytes to a brand-new file that was
-/// never written. Verified: without this, `write_content(p, "secret")` →
-/// `remove_node(p)` → `create_node(p)` → `read_content(p)` returns "secret".
-pub(crate) fn invalidate_chunked_content_subtree(conn: &Connection, node_id: &str) -> Result<()> {
-    let table_present: bool = conn
+/// A foreign arena has no chunk tables at all — nothing to invalidate, and
+/// probing must not turn into an error on that path.
+fn manifest_table_present(conn: &Connection) -> Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='content_manifest'",
+        [],
+        |_| Ok(true),
+    )
+    .optional()
+    .context("probe for content_manifest")
+    .map(|present| present.unwrap_or(false))
+}
+
+/// Does this arena carry the projection's tree tables — the ones a subtree
+/// descent walks?
+fn tree_tables_present(conn: &Connection) -> Result<bool> {
+    let n: i64 = conn
         .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='content_manifest'",
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' \
+               AND name IN ('nodes','dirs','files')",
             [],
-            |_| Ok(true),
+            |r| r.get(0),
         )
-        .optional()
-        .context("probe for content_manifest")?
-        .unwrap_or(false);
-    if !table_present {
+        .context("probe for projection tree tables")?;
+    Ok(n == 3)
+}
+
+/// Invalidate `nid` **and every node beneath it in the tree**.
+///
+/// The writers that delete or rename a node cascade over descendants, and
+/// invalidation has to cascade identically or a child's manifest outlives its
+/// `nodes` row. This is the cross-generation-leak guard: an orphaned manifest
+/// is not merely stale, it attaches to whatever node next occupies that nid,
+/// and `has_chunked_content` would serve the previous occupant's bytes to a
+/// brand-new file that was never written. Verified: without this,
+/// `write_content(p, "secret")` → `remove_node(p)` → `create_node(p)` →
+/// `read_content(p)` returns "secret".
+///
+/// projection-v5 narrows the hazard without removing it. `files` is
+/// append-only, so a nid range can never re-bind to an UNRELATED path the way
+/// a reused path-string id could; but a file deleted and re-created at the
+/// same path re-binds to the same `file_id`, hence the same nids, so the
+/// cascade is still load-bearing.
+///
+/// Three descent shapes, one per nid class — and never a prefix LIKE, which
+/// under the pre-v5 TEXT key both planned as a full scan and (being
+/// unanchored) over-matched siblings:
+///
+/// - **Directory** (`nid < 0`): every file interned beneath it, found by
+///   recursing `dirs.parent_dir_id` and mapping the reachable `files` rows to
+///   their nid ranges. `dirs`/`files` are append-only, so this is correct
+///   whether it runs before or after the caller deletes the `nodes` rows.
+/// - **File root** (ordinal 0): the file's whole nid range — a PRIMARY KEY
+///   range delete that also sweeps every AST node under it.
+/// - **Interior AST node**: recurse `nodes.parent_nid`. This is the one shape
+///   that reads `nodes`, so callers must invalidate BEFORE deleting rows.
+pub(crate) fn invalidate_chunked_content_subtree(conn: &Connection, nid: i64) -> Result<()> {
+    if !manifest_table_present(conn)? {
+        return Ok(());
+    }
+    // A pure content-addressed arena has manifests but no tree tables, so
+    // there is no descendant relation to walk — the node stands alone and
+    // the single-row delete IS the whole subtree. Probed explicitly rather
+    // than caught, so a real SQL fault still surfaces.
+    if !tree_tables_present(conn)? {
+        return invalidate_chunked_content(conn, nid);
+    }
+    if let Some(dir_id) = leyline_schema::nid_dir_id(nid) {
+        conn.execute(
+            "DELETE FROM content_manifest \
+              WHERE nid >= 0 AND (nid >> 24) IN ( \
+                    WITH RECURSIVE sub(dir_id) AS ( \
+                        SELECT ?1 \
+                        UNION ALL \
+                        SELECT d.dir_id FROM dirs d JOIN sub s ON d.parent_dir_id = s.dir_id \
+                    ) \
+                    SELECT f.file_id FROM files f JOIN sub s ON f.dir_id = s.dir_id)",
+            params![dir_id],
+        )
+        .context("invalidate chunk manifest for directory subtree")?;
+        return Ok(());
+    }
+    let ordinal = leyline_schema::nid_ordinal(nid).context("non-negative nid has an ordinal")?;
+    if ordinal == 0 {
+        let file_id = leyline_schema::nid_file_id(nid).context("non-negative nid has a file_id")?;
+        let (lo, hi) = leyline_schema::file_nid_range(file_id);
+        conn.execute(
+            "DELETE FROM content_manifest WHERE nid BETWEEN ?1 AND ?2",
+            params![lo, hi],
+        )
+        .context("invalidate chunk manifest for file range")?;
         return Ok(());
     }
     conn.execute(
-        "DELETE FROM content_manifest WHERE node_id = ?1 OR node_id LIKE ?2",
-        params![node_id, format!("{node_id}/%")],
+        "DELETE FROM content_manifest \
+          WHERE nid IN ( \
+                WITH RECURSIVE sub(nid) AS ( \
+                    SELECT ?1 \
+                    UNION ALL \
+                    SELECT n.nid FROM nodes n JOIN sub s ON n.parent_nid = s.nid \
+                ) \
+                SELECT nid FROM sub)",
+        params![nid],
     )
-    .context("invalidate chunk manifest subtree")?;
+    .context("invalidate chunk manifest for node subtree")?;
     Ok(())
 }
 
@@ -832,7 +874,7 @@ pub(crate) fn invalidate_chunked_content_subtree(conn: &Connection, node_id: &st
 /// authoritative `nodes` row.
 pub(crate) fn capture_chunked_content(
     conn: &Connection,
-    node_id: &str,
+    nid: i64,
 ) -> Result<Option<ChunkManifestSnapshot>> {
     if !chunk_schema_present(conn)? {
         return Ok(None);
@@ -851,10 +893,9 @@ pub(crate) fn capture_chunked_content(
         return Ok(None);
     }
 
-    // The generation-infra probe doubles as the migration gate: an arena
-    // whose chunk schema predates b82f56 has no content_generation table,
-    // and every witness on it must read stale (the -1 default) — which the
-    // early return models by refusing to capture.
+    // An arena with no `content_generation` table cannot witness freshness at
+    // all, so every manifest on it must read stale — which the early return
+    // models by refusing to capture.
     let generation_infra: bool = conn
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='content_generation'",
@@ -872,11 +913,11 @@ pub(crate) fn capture_chunked_content(
         .query_row(
             "SELECT meta.source_len, meta.source_generation, nodes.size,
                     COALESCE((SELECT g.generation FROM content_generation g
-                               WHERE g.node_id = nodes.id), 0)
+                               WHERE g.nid = nodes.nid), 0)
                FROM content_manifest_meta AS meta
-               JOIN nodes ON nodes.id = meta.node_id
-              WHERE meta.node_id = ?1",
-            params![node_id],
+               JOIN nodes ON nodes.nid = meta.nid
+              WHERE meta.nid = ?1",
+            params![nid],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
@@ -894,12 +935,12 @@ pub(crate) fn capture_chunked_content(
         .prepare(
             "SELECT chunk_hash, byte_offset, byte_len
                FROM content_manifest
-              WHERE node_id = ?1
+              WHERE nid = ?1
               ORDER BY seq",
         )
         .context("prepare chunk manifest snapshot")?;
     let rows = statement
-        .query_map(params![node_id], |row| {
+        .query_map(params![nid], |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, i64>(1)?,
@@ -911,7 +952,7 @@ pub(crate) fn capture_chunked_content(
     let mut chunks = Vec::new();
     for row in rows {
         let (hash, offset, len) = row.context("decode chunk manifest row")?;
-        chunks.push(decode_manifest_chunk(node_id, hash, offset, len)?);
+        chunks.push(decode_manifest_chunk(&nid, hash, offset, len)?);
     }
     if chunks.is_empty() {
         return Ok(None);
@@ -921,7 +962,7 @@ pub(crate) fn capture_chunked_content(
     for chunk in &chunks {
         anyhow::ensure!(
             chunk.offset == expected_offset,
-            "chunk manifest for {node_id} has a gap or overlap at {expected_offset}"
+            "chunk manifest for nid {nid} has a gap or overlap at {expected_offset}"
         );
         expected_offset = expected_offset
             .checked_add(chunk.len)
@@ -929,7 +970,7 @@ pub(crate) fn capture_chunked_content(
     }
     anyhow::ensure!(
         expected_offset == source_len,
-        "chunk manifest for {node_id} covers {expected_offset} bytes, expected {source_len}"
+        "chunk manifest for nid {nid} covers {expected_offset} bytes, expected {source_len}"
     );
 
     Ok(Some(ChunkManifestSnapshot { chunks, source_len }))
@@ -947,12 +988,12 @@ fn manifest_witness_is_fresh(
     source_len >= 0 && Some(source_len) == live_len && source_generation == live_generation
 }
 
-/// Refresh `node_id` after a known edit, but only if this arena already uses
+/// Refresh `nid` after a known edit, but only if this arena already uses
 /// chunk storage. A fresh previous manifest enables bounded incremental work;
 /// otherwise the authoritative bytes are chunked in full.
 pub(crate) fn refresh_chunked_content_after_edit(
     conn: &Connection,
-    node_id: &str,
+    nid: i64,
     data: &[u8],
     previous: Option<ChunkManifestSnapshot>,
     edit: leyline_cdc::Edit,
@@ -990,11 +1031,11 @@ pub(crate) fn refresh_chunked_content_after_edit(
             )
         }
     };
-    store_content_manifest(conn, node_id, data, &chunks, rehashed)?;
+    store_content_manifest(conn, nid, data, &chunks, rehashed)?;
     Ok(outcome)
 }
 
-/// Is chunk-backed content available AND provably fresh for `node_id`?
+/// Is chunk-backed content available AND provably fresh for `nid`?
 ///
 /// Three conditions, all required:
 /// 1. the arena has chunk tables at all (an arena written by another runtime —
@@ -1011,9 +1052,10 @@ pub(crate) fn refresh_chunked_content_after_edit(
 /// hand at each call site FAILED: an adversarial review found four writers
 /// (`truncate`, `remove_node`, `rename_node`, `batch_splice`'s non-AST arm)
 /// that left a live manifest behind. The worst was not staleness but
-/// disclosure: node ids are PATHS and paths get reused, so an orphaned manifest
-/// attaches to the next file created at that path — a brand-new, never-written
-/// file served a deleted file's bytes.
+/// disclosure: a file re-created at a deleted file's path re-binds to the
+/// same append-only `file_id`, hence the same nids, so an orphaned manifest
+/// attaches to it — a brand-new, never-written file served a deleted file's
+/// bytes.
 ///
 /// A missed invalidation must therefore degrade to slow-but-correct, never to
 /// silently-wrong. Comparing the witness against the live row does that: a
@@ -1028,14 +1070,10 @@ pub(crate) fn refresh_chunked_content_after_edit(
 ///
 /// A node with no `nodes` row is refused: there is nothing to prove freshness
 /// against, and that is exactly the vacated-path case a rename leaves behind.
-pub(crate) fn has_chunked_content_in_transaction(
-    tx: &Transaction<'_>,
-    node_id: &str,
-) -> Result<bool> {
-    // content_generation included: an arena whose chunk schema predates the
-    // generation witness (b82f56) reads as "no chunked content" — every read
-    // falls back to the record, slow-but-correct, until a store path
-    // migrates it.
+pub(crate) fn has_chunked_content_in_transaction(tx: &Transaction<'_>, nid: i64) -> Result<bool> {
+    // content_generation included: an arena with chunk tables but no
+    // generation witness reads as "no chunked content" — every read falls
+    // back to the record, slow-but-correct, until a store path creates it.
     let tables_present: i64 = tx
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' \
@@ -1057,11 +1095,11 @@ pub(crate) fn has_chunked_content_in_transaction(
     // when it is the live length of a fresh-looking witness.
     let sql = format!(
         "SELECT ({WITNESS_FRESH_PREDICATE}), COALESCE(n.size, -1) \
-           FROM content_manifest_meta m JOIN nodes n ON n.id = m.node_id \
-          WHERE m.node_id = ?1"
+           FROM content_manifest_meta m JOIN nodes n ON n.nid = m.nid \
+          WHERE m.nid = ?1"
     );
     let fresh: Option<(bool, i64)> = tx
-        .query_row(&sql, params![node_id], |r| {
+        .query_row(&sql, params![nid], |r| {
             Ok((r.get::<_, i64>(0)? != 0, r.get(1)?))
         })
         .optional()
@@ -1076,8 +1114,8 @@ pub(crate) fn has_chunked_content_in_transaction(
     // Witness matches; confirm the manifest actually has spans.
     let has_rows: bool = tx
         .query_row(
-            "SELECT 1 FROM content_manifest WHERE node_id = ?1 LIMIT 1",
-            params![node_id],
+            "SELECT 1 FROM content_manifest WHERE nid = ?1 LIMIT 1",
+            params![nid],
             |_| Ok(true),
         )
         .optional()
@@ -1086,11 +1124,11 @@ pub(crate) fn has_chunked_content_in_transaction(
     Ok(has_rows)
 }
 
-pub fn has_chunked_content(conn: &Connection, node_id: &str) -> Result<bool> {
+pub fn has_chunked_content(conn: &Connection, nid: i64) -> Result<bool> {
     let tx = conn
         .unchecked_transaction()
         .context("begin chunk freshness transaction")?;
-    let fresh = has_chunked_content_in_transaction(&tx, node_id)?;
+    let fresh = has_chunked_content_in_transaction(&tx, nid)?;
     tx.commit().context("commit chunk freshness transaction")?;
     Ok(fresh)
 }
@@ -1139,23 +1177,18 @@ pub fn read_source_counts() -> (u64, u64) {
 /// that works.
 ///
 /// Use [`read_content_at_traced`] when the caller needs to know which path ran.
-pub fn read_content_at(
-    conn: &Connection,
-    node_id: &str,
-    buf: &mut [u8],
-    offset: u64,
-) -> Result<usize> {
-    read_content_at_traced(conn, node_id, buf, offset).map(|(n, _)| n)
+pub fn read_content_at(conn: &Connection, nid: i64, buf: &mut [u8], offset: u64) -> Result<usize> {
+    read_content_at_traced(conn, nid, buf, offset).map(|(n, _)| n)
 }
 
 /// [`read_content_at`], additionally reporting which path served the read.
 pub fn read_content_at_traced(
     conn: &Connection,
-    node_id: &str,
+    nid: i64,
     buf: &mut [u8],
     offset: u64,
 ) -> Result<(usize, ContentSource)> {
-    read_content_at_traced_with_finish(conn, node_id, buf, offset, |tx| {
+    read_content_at_traced_with_finish(conn, nid, buf, offset, |tx| {
         tx.commit()
             .context("commit coherent content read transaction")
     })
@@ -1163,7 +1196,7 @@ pub fn read_content_at_traced(
 
 fn read_content_at_traced_with_finish<F>(
     conn: &Connection,
-    node_id: &str,
+    nid: i64,
     buf: &mut [u8],
     offset: u64,
     finish: F,
@@ -1179,14 +1212,14 @@ where
         .unchecked_transaction()
         .context("begin coherent content read transaction")?;
     let mut staged = vec![0; buf.len()];
-    let (n, source) = if has_chunked_content_in_transaction(&tx, node_id)? {
+    let (n, source) = if has_chunked_content_in_transaction(&tx, nid)? {
         (
-            read_content_chunked_in_transaction(&tx, node_id, &mut staged, offset)?,
+            read_content_chunked_in_transaction(&tx, nid, &mut staged, offset)?,
             ContentSource::Chunked,
         )
     } else {
         (
-            read_content_from_record_in_transaction(&tx, node_id, &mut staged, offset)?,
+            read_content_from_record_in_transaction(&tx, nid, &mut staged, offset)?,
             ContentSource::Record,
         )
     };
@@ -1212,14 +1245,14 @@ where
 /// [`read_content_at`], which picks correctly and reports which ran.
 fn read_content_from_record_in_transaction(
     tx: &Transaction<'_>,
-    node_id: &str,
+    nid: i64,
     buf: &mut [u8],
     offset: usize,
 ) -> Result<usize> {
     let record: Option<String> = tx
         .query_row(
-            "SELECT record FROM nodes WHERE id = ?1",
-            params![node_id],
+            "SELECT record FROM nodes WHERE nid = ?1",
+            params![nid],
             |row| row.get(0),
         )
         .optional()
@@ -1243,12 +1276,12 @@ fn checked_range_offset(offset: u64) -> Result<usize> {
     usize::try_from(offset).context("range offset exceeds usize")
 }
 
-/// Total byte length of `node_id`'s chunked content (manifest sum).
-pub fn chunked_content_len(conn: &Connection, node_id: &str) -> Result<usize> {
+/// Total byte length of `nid`'s chunked content (manifest sum).
+pub fn chunked_content_len(conn: &Connection, nid: i64) -> Result<usize> {
     let n: Option<i64> = conn
         .query_row(
-            "SELECT MAX(byte_offset + byte_len) FROM content_manifest WHERE node_id = ?1",
-            params![node_id],
+            "SELECT MAX(byte_offset + byte_len) FROM content_manifest WHERE nid = ?1",
+            params![nid],
             |r| r.get(0),
         )
         .context("content length")?;
@@ -1284,6 +1317,14 @@ mod tests {
         c
     }
 
+    /// These tests drive the chunk layer directly, where a nid is just the
+    /// manifest's key — there is no `nodes` row and no path to resolve. `n`
+    /// only needs to be distinct across nodes within the same test; it is
+    /// otherwise opaque.
+    fn node(n: i64) -> i64 {
+        leyline_schema::file_nid(n, 0)
+    }
+
     /// The store must NOT re-derive carried-over rows from `data` — that is
     /// the whole of ley-line-open-f8ebe7 (a small edit was hashing the entire
     /// file, O(file) instead of O(edit + resync window), while the stat that
@@ -1300,9 +1341,10 @@ mod tests {
     #[test]
     fn carried_rows_are_probed_not_rehashed_and_the_window_is_still_verified() {
         let conn = db();
+        let nid = node(1);
         let body = prng(0xF8EB_E700, 6 * MAX_CHUNK);
-        store_content_chunked(&conn, "n", &body).unwrap();
-        let snapshot = capture_manifest_rows(&conn, "n");
+        store_content_chunked(&conn, nid, &body).unwrap();
+        let snapshot = capture_manifest_rows(&conn, nid);
         assert!(
             snapshot.len() >= 4,
             "fixture must span several chunks; got {}",
@@ -1319,7 +1361,7 @@ mod tests {
         let tx = conn.unchecked_transaction().unwrap();
         store_content_manifest_in_transaction(
             &tx,
-            "n",
+            nid,
             &corrupted,
             &snapshot,
             window_start_row..snapshot.len(),
@@ -1331,7 +1373,7 @@ mod tests {
         // (The test-only unchecked reader — this fixture has no `nodes` row,
         // and the freshness gate is not what this test is about.)
         let mut out = vec![0u8; 64];
-        let n = read_content_chunked(&conn, "n", &mut out, 0).unwrap();
+        let n = read_content_chunked(&conn, nid, &mut out, 0).unwrap();
         assert_eq!(
             &out[..n],
             &body[..n],
@@ -1342,7 +1384,7 @@ mod tests {
         let tx = conn.unchecked_transaction().unwrap();
         let err = store_content_manifest_in_transaction(
             &tx,
-            "n",
+            nid,
             &corrupted,
             &snapshot,
             0..snapshot.len(),
@@ -1355,14 +1397,14 @@ mod tests {
     }
 
     /// Rows of the stored manifest for direct store-layer tests.
-    fn capture_manifest_rows(conn: &Connection, node_id: &str) -> Vec<leyline_cdc::Chunk> {
+    fn capture_manifest_rows(conn: &Connection, nid: i64) -> Vec<leyline_cdc::Chunk> {
         let mut stmt = conn
             .prepare(
                 "SELECT chunk_hash, byte_offset, byte_len FROM content_manifest \
-                 WHERE node_id = ?1 ORDER BY seq",
+                 WHERE nid = ?1 ORDER BY seq",
             )
             .unwrap();
-        stmt.query_map(params![node_id], |r| {
+        stmt.query_map(params![nid], |r| {
             Ok((
                 r.get::<_, Vec<u8>>(0)?,
                 r.get::<_, i64>(1)?,
@@ -1480,14 +1522,15 @@ mod tests {
     #[test]
     fn sqlite_blob_store_selector_returns_only_ordered_overlapping_spans() {
         let conn = db();
+        let nid = node(1);
         let data = prng(0x51ec7, MAX_CHUNK * 5);
-        store_content_chunked(&conn, "indexed", &data).unwrap();
+        store_content_chunked(&conn, nid, &data).unwrap();
         let offset = data.len() / 2;
         let len = 4096;
-        let expected = chunks_touched(&conn, "indexed", offset as u64, len).unwrap();
+        let expected = chunks_touched(&conn, nid, offset as u64, len).unwrap();
 
         let tx = conn.unchecked_transaction().unwrap();
-        let selected = select_range_manifest(&tx, "indexed", offset, len)
+        let selected = select_range_manifest(&tx, nid, offset, len)
             .unwrap()
             .unwrap();
 
@@ -1508,55 +1551,57 @@ mod tests {
     #[test]
     fn sqlite_blob_store_selector_rejects_invalid_integer_and_hash_rows() {
         let conn = db();
+        let nid = node(1);
         let bytes = b"selected bytes";
-        store_content_chunked(&conn, "bad", bytes).unwrap();
+        store_content_chunked(&conn, nid, bytes).unwrap();
         conn.execute(
-            "UPDATE content_manifest SET chunk_hash = ?1 WHERE node_id = 'bad'",
-            params![b"short hash"],
+            "UPDATE content_manifest SET chunk_hash = ?1 WHERE nid = ?2",
+            params![b"short hash".as_slice(), nid],
         )
         .unwrap();
         let tx = conn.unchecked_transaction().unwrap();
-        assert!(select_range_manifest(&tx, "bad", 0, bytes.len()).is_err());
+        assert!(select_range_manifest(&tx, nid, 0, bytes.len()).is_err());
         drop(tx);
 
         conn.execute(
-            "UPDATE content_manifest_meta SET source_len = -1 WHERE node_id = 'bad'",
-            [],
+            "UPDATE content_manifest_meta SET source_len = -1 WHERE nid = ?1",
+            params![nid],
         )
         .unwrap();
         let tx = conn.unchecked_transaction().unwrap();
-        assert!(select_range_manifest(&tx, "bad", 0, bytes.len()).is_err());
+        assert!(select_range_manifest(&tx, nid, 0, bytes.len()).is_err());
     }
 
     #[test]
     fn chunks_touched_rejects_offsets_outside_sqlite_integer() {
         let conn = db();
         let offset = u64::try_from(i64::MAX).unwrap() + 1;
-        assert!(chunks_touched(&conn, "n", offset, 1).is_err());
+        assert!(chunks_touched(&conn, node(1), offset, 1).is_err());
     }
 
     #[test]
     fn transaction_owned_store_writes_the_manifest_and_reports_chunk_count() {
         let conn = db();
+        let nid = node(1);
         let data = prng(0x5eed, MAX_CHUNK * 3);
         let expected_chunks = leyline_cdc::chunk(&data).len();
         assert!(expected_chunks > 1, "fixture must distinguish Ok(0)/Ok(1)");
 
         let tx =
             Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate).unwrap();
-        let stored = store_content_chunked_in_transaction(&tx, "large.bin", &data).unwrap();
+        let stored = store_content_chunked_in_transaction(&tx, nid, &data).unwrap();
 
         assert_eq!(stored, expected_chunks);
         let manifest_rows: i64 = tx
             .query_row(
-                "SELECT COUNT(*) FROM content_manifest WHERE node_id = 'large.bin'",
-                [],
+                "SELECT COUNT(*) FROM content_manifest WHERE nid = ?1",
+                params![nid],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(manifest_rows, expected_chunks as i64);
         let mut round_trip = vec![0_u8; data.len()];
-        let selected = select_range_manifest(&tx, "large.bin", 0, data.len())
+        let selected = select_range_manifest(&tx, nid, 0, data.len())
             .unwrap()
             .unwrap();
         let store = SqliteBlobStore { tx: &tx };
@@ -1571,30 +1616,37 @@ mod tests {
     #[test]
     fn fresh_empty_content_needs_a_witness_but_no_manifest_spans() {
         let conn = db();
-        conn.execute_batch(
-            "CREATE TABLE nodes (
-                id TEXT PRIMARY KEY,
-                kind INTEGER NOT NULL,
-                size INTEGER NOT NULL,
-                mtime INTEGER NOT NULL,
-                record TEXT
-             );
-             INSERT INTO nodes VALUES ('empty', 0, 0, 7, '');",
+        leyline_schema::create_schema(&conn).unwrap();
+        let fid = leyline_schema::ensure_file_id(&conn, "empty").unwrap();
+        let dir = leyline_schema::ensure_dir_nodes(&conn, "empty", 7).unwrap();
+        let nid = leyline_schema::file_nid(fid, 0);
+        let name_id = leyline_schema::intern_name(&conn, "empty").unwrap();
+        leyline_schema::insert_node(
+            &conn,
+            nid,
+            Some(leyline_schema::dir_nid(dir)),
+            Some(name_id),
+            None,
+            0,
+            0,
+            0,
+            7,
+            "",
         )
         .unwrap();
 
-        assert!(!has_chunked_content(&conn, "empty").unwrap());
-        assert_eq!(store_content_chunked(&conn, "empty", &[]).unwrap(), 0);
+        assert!(!has_chunked_content(&conn, nid).unwrap());
+        assert_eq!(store_content_chunked(&conn, nid, &[]).unwrap(), 0);
         let manifest_rows: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM content_manifest WHERE node_id = 'empty'",
-                [],
+                "SELECT COUNT(*) FROM content_manifest WHERE nid = ?1",
+                params![nid],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(manifest_rows, 0);
         assert!(
-            has_chunked_content(&conn, "empty").unwrap(),
+            has_chunked_content(&conn, nid).unwrap(),
             "a fresh zero-length witness is complete without impossible spans"
         );
     }
@@ -1631,18 +1683,19 @@ mod tests {
     fn witness_predicate_arms_agree() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE nodes (id TEXT PRIMARY KEY, size INTEGER);
+            "CREATE TABLE nodes (nid INTEGER PRIMARY KEY, size INTEGER);
              CREATE TABLE content_manifest_meta (
-                 node_id TEXT PRIMARY KEY,
+                 nid INTEGER PRIMARY KEY,
                  source_len INTEGER NOT NULL,
                  source_generation INTEGER NOT NULL
              );
              CREATE TABLE content_generation (
-                 node_id TEXT PRIMARY KEY,
+                 nid INTEGER PRIMARY KEY,
                  generation INTEGER NOT NULL
              );",
         )
         .unwrap();
+        let nid = node(1);
 
         // (source_len, source_generation, live_size, live_generation-row)
         let cases: &[(i64, i64, Option<i64>, Option<i64>)] = &[
@@ -1656,31 +1709,31 @@ mod tests {
         ];
         let sql = format!(
             "SELECT ({WITNESS_FRESH_PREDICATE}) \
-               FROM content_manifest_meta m JOIN nodes n ON n.id = m.node_id \
-              WHERE m.node_id = 'x'"
+               FROM content_manifest_meta m JOIN nodes n ON n.nid = m.nid \
+              WHERE m.nid = ?1"
         );
         for &(source_len, source_gen, live_size, live_gen_row) in cases {
             conn.execute_batch("DELETE FROM nodes; DELETE FROM content_manifest_meta; DELETE FROM content_generation;")
                 .unwrap();
             conn.execute(
-                "INSERT INTO nodes (id, size) VALUES ('x', ?1)",
-                params![live_size],
+                "INSERT INTO nodes (nid, size) VALUES (?1, ?2)",
+                params![nid, live_size],
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO content_manifest_meta VALUES ('x', ?1, ?2)",
-                params![source_len, source_gen],
+                "INSERT INTO content_manifest_meta VALUES (?1, ?2, ?3)",
+                params![nid, source_len, source_gen],
             )
             .unwrap();
             if let Some(g) = live_gen_row {
                 conn.execute(
-                    "INSERT INTO content_generation VALUES ('x', ?1)",
-                    params![g],
+                    "INSERT INTO content_generation VALUES (?1, ?2)",
+                    params![nid, g],
                 )
                 .unwrap();
             }
             let sql_verdict: bool = conn
-                .query_row(&sql, [], |r| Ok(r.get::<_, i64>(0)? != 0))
+                .query_row(&sql, params![nid], |r| Ok(r.get::<_, i64>(0)? != 0))
                 .unwrap();
             let rust_verdict = manifest_witness_is_fresh(
                 source_len,
@@ -1704,35 +1757,29 @@ mod tests {
     #[test]
     fn same_shape_replacement_by_a_foreign_writer_is_not_served_stale() {
         let conn = db();
-        conn.execute_batch(
-            "CREATE TABLE nodes (
-                 id TEXT PRIMARY KEY, record TEXT, size INTEGER, mtime INTEGER
-             );",
-        )
-        .unwrap();
+        leyline_schema::create_schema(&conn).unwrap();
         // Re-run schema creation now that nodes exists so triggers install.
         create_chunked_content_schema(&conn).unwrap();
 
         let old = "the first occupant's secret bytes".repeat(1000);
-        conn.execute(
-            "INSERT INTO nodes (id, record, size, mtime) VALUES ('n', ?1, ?2, 7)",
-            params![old, old.len() as i64],
-        )
-        .unwrap();
-        store_content_chunked(&conn, "n", old.as_bytes()).unwrap();
+        let nid = insert_node_record_with_mtime(&conn, "n", &old, 7);
+        store_content_chunked(&conn, nid, old.as_bytes()).unwrap();
         let tx = conn.unchecked_transaction().unwrap();
-        assert!(has_chunked_content_in_transaction(&tx, "n").unwrap());
+        assert!(has_chunked_content_in_transaction(&tx, nid).unwrap());
         tx.commit().unwrap();
 
         // Foreign writer: same length, same mtime, different bytes, raw SQL.
         let new = "the second occupant's public bytes".repeat(1000)[..old.len()].to_string();
         assert_eq!(new.len(), old.len());
-        conn.execute("UPDATE nodes SET record = ?1 WHERE id = 'n'", params![new])
-            .unwrap();
+        conn.execute(
+            "UPDATE nodes SET record = ?1 WHERE nid = ?2",
+            params![new, nid],
+        )
+        .unwrap();
 
         let tx = conn.unchecked_transaction().unwrap();
         assert!(
-            !has_chunked_content_in_transaction(&tx, "n").unwrap(),
+            !has_chunked_content_in_transaction(&tx, nid).unwrap(),
             "a same-shape replacement must invalidate the witness — the \
              generation trigger fires for writers that never heard of this \
              module"
@@ -1740,7 +1787,7 @@ mod tests {
         drop(tx);
 
         let mut buf = vec![0u8; 64];
-        let n = read_content_at(&conn, "n", &mut buf, 0).unwrap();
+        let n = read_content_at(&conn, nid, &mut buf, 0).unwrap();
         assert_eq!(
             &buf[..n],
             &new.as_bytes()[..n],
@@ -1797,12 +1844,12 @@ mod tests {
     /// Independent oracle: read the whole manifest into Rust and count the
     /// truly-overlapping spans. Deliberately NOT SQL — it must be able to
     /// disagree with [`OVERLAP_PREDICATE`], or it proves nothing about it.
-    fn expected_touched(conn: &Connection, node_id: &str, start: usize, len: usize) -> usize {
+    fn expected_touched(conn: &Connection, nid: i64, start: usize, len: usize) -> usize {
         let mut stmt = conn
-            .prepare("SELECT byte_offset, byte_len FROM content_manifest WHERE node_id = ?1")
+            .prepare("SELECT byte_offset, byte_len FROM content_manifest WHERE nid = ?1")
             .unwrap();
         let spans: Vec<(usize, usize)> = stmt
-            .query_map(params![node_id], |r| {
+            .query_map(params![nid], |r| {
                 Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as usize))
             })
             .unwrap()
@@ -1818,12 +1865,13 @@ mod tests {
     #[test]
     fn full_read_round_trips() {
         let conn = db();
+        let nid = node(1);
         let data = prng(1, 3_000_000);
-        store_content_chunked(&conn, "n1", &data).unwrap();
-        assert_eq!(chunked_content_len(&conn, "n1").unwrap(), data.len());
+        store_content_chunked(&conn, nid, &data).unwrap();
+        assert_eq!(chunked_content_len(&conn, nid).unwrap(), data.len());
 
         let mut buf = vec![0u8; data.len()];
-        let n = read_content_chunked(&conn, "n1", &mut buf, 0).unwrap();
+        let n = read_content_chunked(&conn, nid, &mut buf, 0).unwrap();
         assert_eq!(n, data.len());
         assert_eq!(buf, data);
     }
@@ -1831,8 +1879,9 @@ mod tests {
     #[test]
     fn range_reads_return_correct_bytes() {
         let conn = db();
+        let nid = node(1);
         let data = prng(2, 3_000_000);
-        store_content_chunked(&conn, "n1", &data).unwrap();
+        store_content_chunked(&conn, nid, &data).unwrap();
 
         for &(off, len) in &[
             (0usize, 100usize),
@@ -1841,7 +1890,7 @@ mod tests {
             (data.len() - 10, 10),
         ] {
             let mut buf = vec![0u8; len];
-            let n = read_content_chunked(&conn, "n1", &mut buf, off as u64).unwrap();
+            let n = read_content_chunked(&conn, nid, &mut buf, off as u64).unwrap();
             assert_eq!(&buf[..n], &data[off..off + n], "range ({off},{len})");
             assert_eq!(n, len.min(data.len() - off));
         }
@@ -1853,12 +1902,13 @@ mod tests {
     #[test]
     fn small_read_touches_only_overlapping_chunks() {
         let conn = db();
+        let nid = node(1);
         let data = prng(3, 8_000_000);
-        let total = store_content_chunked(&conn, "big", &data).unwrap();
+        let total = store_content_chunked(&conn, nid, &data).unwrap();
         assert!(total > 50, "need a many-chunk file, got {total}");
 
         let mid = data.len() / 2;
-        let touched = chunks_touched(&conn, "big", mid as u64, 4096).unwrap();
+        let touched = chunks_touched(&conn, nid, mid as u64, 4096).unwrap();
         assert!(
             touched <= 2,
             "a 4KiB read must touch <=2 of {total} chunks, touched {touched} — \
@@ -1866,15 +1916,13 @@ mod tests {
         );
 
         let tx = conn.unchecked_transaction().unwrap();
-        let selected = select_range_manifest(&tx, "big", mid, 4096)
-            .unwrap()
-            .unwrap();
+        let selected = select_range_manifest(&tx, nid, mid, 4096).unwrap().unwrap();
         let non_overlapping_hash: Vec<u8> = tx
             .query_row(
                 "SELECT chunk_hash FROM content_manifest \
-                  WHERE node_id = 'big' AND (byte_offset + byte_len) <= ?1 \
+                  WHERE nid = ?1 AND (byte_offset + byte_len) <= ?2 \
                   ORDER BY byte_offset LIMIT 1",
-                params![i64::try_from(mid).unwrap()],
+                params![nid, i64::try_from(mid).unwrap()],
                 |row| row.get(0),
             )
             .unwrap();
@@ -1899,19 +1947,20 @@ mod tests {
     #[test]
     fn read_content_chunked_does_not_fetch_a_corrupt_non_overlapping_blob() {
         let conn = db();
+        let nid = node(1);
         let data = prng(0xc0ffee, 2_000_000);
-        store_content_chunked(&conn, "scoped", &data).unwrap();
+        store_content_chunked(&conn, nid, &data).unwrap();
         let offset = data.len() / 2;
         let (hash, mut bytes): (Vec<u8>, Vec<u8>) = conn
             .query_row(
                 "SELECT manifest.chunk_hash, chunks.chunk_bytes \
                    FROM content_manifest AS manifest \
                    JOIN content_chunks AS chunks USING (chunk_hash) \
-                  WHERE manifest.node_id = 'scoped' \
-                    AND (manifest.byte_offset + manifest.byte_len) <= ?1 \
+                  WHERE manifest.nid = ?1 \
+                    AND (manifest.byte_offset + manifest.byte_len) <= ?2 \
                   ORDER BY manifest.byte_offset \
                   LIMIT 1",
-                params![i64::try_from(offset).unwrap()],
+                params![nid, i64::try_from(offset).unwrap()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
@@ -1923,7 +1972,7 @@ mod tests {
         .unwrap();
 
         let mut out = vec![0xa5; 4096];
-        let written = read_content_chunked(&conn, "scoped", &mut out, offset as u64).unwrap();
+        let written = read_content_chunked(&conn, nid, &mut out, offset as u64).unwrap();
 
         assert_eq!(written, out.len());
         assert_eq!(out, data[offset..offset + written]);
@@ -1937,17 +1986,16 @@ mod tests {
     #[test]
     fn overlap_predicate_selects_exactly_the_overlapping_spans() {
         let conn = db();
+        let nid = node(1);
         let data = prng(8, 4_000_000);
-        store_content_chunked(&conn, "n", &data).unwrap();
+        store_content_chunked(&conn, nid, &data).unwrap();
 
         // Every chunk boundary, plus interior and degenerate offsets.
         let mut stmt = conn
-            .prepare(
-                "SELECT byte_offset, byte_len FROM content_manifest WHERE node_id='n' ORDER BY seq",
-            )
+            .prepare("SELECT byte_offset, byte_len FROM content_manifest WHERE nid=?1 ORDER BY seq")
             .unwrap();
         let spans: Vec<(usize, usize)> = stmt
-            .query_map([], |r| {
+            .query_map(params![nid], |r| {
                 Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as usize))
             })
             .unwrap()
@@ -1966,8 +2014,8 @@ mod tests {
             if off + len > data.len() {
                 continue;
             }
-            let got = chunks_touched(&conn, "n", off as u64, len).unwrap();
-            let want = expected_touched(&conn, "n", off, len);
+            let got = chunks_touched(&conn, nid, off as u64, len).unwrap();
+            let want = expected_touched(&conn, nid, off, len);
             assert_eq!(got, want, "predicate over-/under-selects at ({off},{len})");
         }
     }
@@ -1983,8 +2031,8 @@ mod tests {
         a.extend_from_slice(&common);
         b.extend_from_slice(&common);
 
-        let na = store_content_chunked(&conn, "a", &a).unwrap();
-        let nb = store_content_chunked(&conn, "b", &b).unwrap();
+        let na = store_content_chunked(&conn, node(1), &a).unwrap();
+        let nb = store_content_chunked(&conn, node(2), &b).unwrap();
 
         let distinct: i64 = conn
             .query_row("SELECT COUNT(*) FROM content_chunks", [], |r| r.get(0))
@@ -2001,8 +2049,9 @@ mod tests {
     #[test]
     fn restore_replaces_manifest_and_reuses_chunks() {
         let conn = db();
+        let nid = node(1);
         let data = prng(7, 2_000_000);
-        store_content_chunked(&conn, "n", &data).unwrap();
+        store_content_chunked(&conn, nid, &data).unwrap();
         let before: i64 = conn
             .query_row("SELECT COUNT(*) FROM content_chunks", [], |r| r.get(0))
             .unwrap();
@@ -2010,12 +2059,12 @@ mod tests {
         let mut edited = data.clone();
         let mid = edited.len() / 2;
         edited.splice(mid..mid, [0xAA, 0xBB, 0xCC]);
-        store_content_chunked(&conn, "n", &edited).unwrap();
+        store_content_chunked(&conn, nid, &edited).unwrap();
 
         // Manifest reflects the new length exactly (old spans gone).
-        assert_eq!(chunked_content_len(&conn, "n").unwrap(), edited.len());
+        assert_eq!(chunked_content_len(&conn, nid).unwrap(), edited.len());
         let mut buf = vec![0u8; edited.len()];
-        read_content_chunked(&conn, "n", &mut buf, 0).unwrap();
+        read_content_chunked(&conn, nid, &mut buf, 0).unwrap();
         assert_eq!(buf, edited);
 
         // Boundary stability ⇒ the edit adds only a couple of chunks.
@@ -2049,7 +2098,7 @@ mod tests {
     /// reproducible from the assertion message alone.
     #[test]
     fn fuzz_chunked_reads_match_naive_slicing() {
-        const SEED: u64 = 0x5DEE_CE66_D_u64;
+        const SEED: u64 = 0x0005_DEEC_E66D_u64;
         const CASES: usize = 120;
         let mut rng = Rng(SEED);
 
@@ -2064,17 +2113,17 @@ mod tests {
                 _ => rng.below(2_000_000),
             };
             let data = shaped(&mut rng, len);
-            let node = format!("n{case}");
-            store_content_chunked(&conn, &node, &data).unwrap();
+            let nid = node(case as i64 + 1);
+            store_content_chunked(&conn, nid, &data).unwrap();
 
             // (1) the manifest tiles [0, len) exactly.
             let mut stmt = conn
                 .prepare(
-                    "SELECT byte_offset, byte_len FROM content_manifest                       WHERE node_id = ?1 ORDER BY seq",
+                    "SELECT byte_offset, byte_len FROM content_manifest                       WHERE nid = ?1 ORDER BY seq",
                 )
                 .unwrap();
             let spans: Vec<(usize, usize)> = stmt
-                .query_map(params![&node], |r| {
+                .query_map(params![nid], |r| {
                     Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as usize))
                 })
                 .unwrap()
@@ -2093,7 +2142,7 @@ mod tests {
                 data.len(),
                 "case {case} (seed {SEED:#x}): manifest does not cover the file"
             );
-            assert_eq!(chunked_content_len(&conn, &node).unwrap(), data.len());
+            assert_eq!(chunked_content_len(&conn, nid).unwrap(), data.len());
 
             // (2)(3)(4) probe ranges, including boundary-aligned and past-EOF.
             for probe in 0..12 {
@@ -2119,7 +2168,7 @@ mod tests {
                 }
 
                 let mut buf = vec![0xEEu8; want_len];
-                let n = read_content_chunked(&conn, &node, &mut buf, off as u64).unwrap();
+                let n = read_content_chunked(&conn, nid, &mut buf, off as u64).unwrap();
 
                 let expect = &data[off.min(data.len())..(off + want_len).min(data.len())];
                 assert_eq!(
@@ -2133,8 +2182,8 @@ mod tests {
                     "case {case} probe {probe} (seed {SEED:#x}): bytes differ at ({off},{want_len})"
                 );
 
-                let got = chunks_touched(&conn, &node, off as u64, want_len).unwrap();
-                let want = expected_touched(&conn, &node, off, want_len);
+                let got = chunks_touched(&conn, nid, off as u64, want_len).unwrap();
+                let want = expected_touched(&conn, nid, off, want_len);
                 assert_eq!(
                     got, want,
                     "case {case} probe {probe} (seed {SEED:#x}): selection is not exact at ({off},{want_len})"
@@ -2149,15 +2198,16 @@ mod tests {
     #[test]
     fn range_read_uses_the_span_index() {
         let conn = db();
+        let nid = node(1);
         let data = prng(9, 4_000_000);
-        store_content_chunked(&conn, "n", &data).unwrap();
+        store_content_chunked(&conn, nid, &data).unwrap();
         conn.execute_batch("ANALYZE").unwrap();
 
         let sql = format!("EXPLAIN QUERY PLAN {}", select_range_manifest_sql());
         let mut stmt = conn.prepare(&sql).unwrap();
         let plan: Vec<String> = stmt
             .query_map(
-                params!["n", 100_000i64, 90_000i64, seek_floor(90_000).unwrap()],
+                params![nid, 100_000i64, 90_000i64, seek_floor(90_000).unwrap()],
                 |r| r.get::<_, String>(3),
             )
             .unwrap()
@@ -2198,17 +2248,18 @@ mod tests {
     #[test]
     fn seek_floor_is_sound_and_tight() {
         let conn = db();
+        let nid = node(1);
         let data = prng(11, 6_000_000);
-        store_content_chunked(&conn, "n", &data).unwrap();
+        store_content_chunked(&conn, nid, &data).unwrap();
 
         let mut stmt = conn
             .prepare(
                 "SELECT byte_offset, byte_len FROM content_manifest \
-                  WHERE node_id = 'n' ORDER BY seq",
+                  WHERE nid = ?1 ORDER BY seq",
             )
             .unwrap();
         let spans: Vec<(usize, usize)> = stmt
-            .query_map([], |r| {
+            .query_map(params![nid], |r| {
                 Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as usize))
             })
             .unwrap()
@@ -2245,18 +2296,47 @@ mod tests {
         );
     }
 
-    /// Minimal `nodes` row so the record-fallback path has something to read.
-    fn insert_node_record(conn: &Connection, id: &str, content: &str) {
-        // The CANONICAL contract, not a hand-rolled copy. A fixture that
-        // declares its own `nodes` DDL drifts from what producers ship
-        // against — which is how `record JSON`'s NUMERIC affinity went
-        // unnoticed (bead `ley-line-open-f7966d`).
-        leyline_schema::create_nodes_table(conn).unwrap();
-        conn.execute(
-            "INSERT OR REPLACE INTO nodes (id, name, kind, size, mtime, record) VALUES (?1, ?1, 0, ?2, 1, ?3)",
-            params![id, content.len() as i64, content],
+    /// Minimal `nodes` row so the record-fallback path has something to
+    /// read. Returns the file's nid.
+    fn insert_node_record(conn: &Connection, rel_path: &str, content: &str) -> i64 {
+        insert_node_record_with_mtime(conn, rel_path, content, 1)
+    }
+
+    /// [`insert_node_record`], with an explicit `mtime` — several tests probe
+    /// generation-witness behavior that depends on the exact value.
+    ///
+    /// Builds the fixture through the CANONICAL contract, not a hand-rolled
+    /// copy: a fixture that declares its own `nodes` DDL drifts from what
+    /// producers ship against — which is how `record JSON`'s NUMERIC
+    /// affinity went unnoticed (bead `ley-line-open-f7966d`), and how a
+    /// fixture keyed on a TEXT `id` would drift from the v5 integer `nid`
+    /// this whole module is keyed on.
+    fn insert_node_record_with_mtime(
+        conn: &Connection,
+        rel_path: &str,
+        content: &str,
+        mtime: i64,
+    ) -> i64 {
+        leyline_schema::create_schema(conn).unwrap();
+        let file_id = leyline_schema::ensure_file_id(conn, rel_path).unwrap();
+        let dir_id = leyline_schema::ensure_dir_nodes(conn, rel_path, mtime).unwrap();
+        let nid = leyline_schema::file_nid(file_id, 0);
+        let name = rel_path.rsplit('/').next().unwrap_or(rel_path);
+        let name_id = leyline_schema::intern_name(conn, name).unwrap();
+        leyline_schema::insert_node(
+            conn,
+            nid,
+            Some(leyline_schema::dir_nid(dir_id)),
+            Some(name_id),
+            None,
+            0,
+            0,
+            content.len() as i64,
+            mtime,
+            content,
         )
         .unwrap();
+        nid
     }
 
     /// The two storage generations must be observationally identical: for the
@@ -2271,9 +2351,9 @@ mod tests {
             .map(|i| ((i * 7 % 26) as u8 + b'a') as char)
             .collect();
 
-        insert_node_record(&conn, "legacy", &content); // record only
-        insert_node_record(&conn, "modern", &content); // record AND manifest
-        store_content_chunked(&conn, "modern", content.as_bytes()).unwrap();
+        let legacy = insert_node_record(&conn, "legacy", &content); // record only
+        let modern = insert_node_record(&conn, "modern", &content); // record AND manifest
+        store_content_chunked(&conn, modern, content.as_bytes()).unwrap();
 
         for &(off, len) in &[
             (0usize, 100usize),
@@ -2282,9 +2362,9 @@ mod tests {
             (0, 40_000),
         ] {
             let mut a = vec![0u8; len];
-            let (na, sa) = read_content_at_traced(&conn, "legacy", &mut a, off as u64).unwrap();
+            let (na, sa) = read_content_at_traced(&conn, legacy, &mut a, off as u64).unwrap();
             let mut b = vec![0u8; len];
-            let (nb, sb) = read_content_at_traced(&conn, "modern", &mut b, off as u64).unwrap();
+            let (nb, sb) = read_content_at_traced(&conn, modern, &mut b, off as u64).unwrap();
 
             // The marker must show the paths genuinely differed...
             assert_eq!(
@@ -2310,12 +2390,12 @@ mod tests {
     #[test]
     fn foreign_arena_without_chunk_tables_falls_back_cleanly() {
         let conn = Connection::open_in_memory().unwrap(); // NOTE: no chunk schema
-        insert_node_record(&conn, "n", "hello world");
+        let nid = insert_node_record(&conn, "n", "hello world");
 
-        assert!(!has_chunked_content(&conn, "n").unwrap());
+        assert!(!has_chunked_content(&conn, nid).unwrap());
 
         let mut buf = vec![0u8; 5];
-        let (n, src) = read_content_at_traced(&conn, "n", &mut buf, 6).unwrap();
+        let (n, src) = read_content_at_traced(&conn, nid, &mut buf, 6).unwrap();
         assert_eq!(&buf[..n], b"world");
         assert_eq!(src, ContentSource::Record);
     }
@@ -2323,10 +2403,10 @@ mod tests {
     #[test]
     fn transaction_completion_error_does_not_mutate_the_destination() {
         let conn = Connection::open_in_memory().unwrap();
-        insert_node_record(&conn, "n", "hello world");
+        let nid = insert_node_record(&conn, "n", "hello world");
         let mut buf = [0xA5; 5];
 
-        let err = read_content_at_traced_with_finish(&conn, "n", &mut buf, 0, |_| {
+        let err = read_content_at_traced_with_finish(&conn, nid, &mut buf, 0, |_| {
             anyhow::bail!("injected transaction completion failure")
         })
         .unwrap_err();
@@ -2342,10 +2422,10 @@ mod tests {
     #[test]
     fn record_fallback_rejects_an_unrepresentable_offset_without_mutation() {
         let conn = Connection::open_in_memory().unwrap();
-        insert_node_record(&conn, "n", "hello world");
+        let nid = insert_node_record(&conn, "n", "hello world");
         let mut buf = [0xA5; 5];
 
-        let err = read_content_at_traced(&conn, "n", &mut buf, u64::MAX).unwrap_err();
+        let err = read_content_at_traced(&conn, nid, &mut buf, u64::MAX).unwrap_err();
 
         assert!(err.to_string().contains("range offset"), "{err:#}");
         assert_eq!(buf, [0xA5; 5]);
@@ -2356,14 +2436,14 @@ mod tests {
     #[test]
     fn read_source_counters_track_both_paths() {
         let conn = db();
-        insert_node_record(&conn, "r", "abcdefghij");
-        insert_node_record(&conn, "c", "abcdefghij");
-        store_content_chunked(&conn, "c", b"abcdefghij").unwrap();
+        let r_nid = insert_node_record(&conn, "r", "abcdefghij");
+        let c_nid = insert_node_record(&conn, "c", "abcdefghij");
+        store_content_chunked(&conn, c_nid, b"abcdefghij").unwrap();
 
         let (c0, r0) = read_source_counts();
         let mut buf = vec![0u8; 4];
-        read_content_at(&conn, "c", &mut buf, 0).unwrap();
-        read_content_at(&conn, "r", &mut buf, 0).unwrap();
+        read_content_at(&conn, c_nid, &mut buf, 0).unwrap();
+        read_content_at(&conn, r_nid, &mut buf, 0).unwrap();
         let (c1, r1) = read_source_counts();
 
         // `>=`, not `==`: these are process-global counters and the test
@@ -2390,11 +2470,11 @@ mod tests {
     #[test]
     fn an_unknown_writer_cannot_cause_stale_bytes_to_be_served() {
         let conn = db();
-        insert_node_record(&conn, "n", "original-content");
-        store_content_chunked(&conn, "n", b"original-content").unwrap();
+        let nid = insert_node_record(&conn, "n", "original-content");
+        store_content_chunked(&conn, nid, b"original-content").unwrap();
 
         let mut buf = vec![0u8; 64];
-        let (n, src) = read_content_at_traced(&conn, "n", &mut buf, 0).unwrap();
+        let (n, src) = read_content_at_traced(&conn, nid, &mut buf, 0).unwrap();
         assert_eq!(&buf[..n], b"original-content");
         assert_eq!(
             src,
@@ -2405,13 +2485,13 @@ mod tests {
         // A writer with no knowledge of chunk tables replaces the content.
         // Same shape as leyline-ts's reproject: update `record`, bump mtime.
         conn.execute(
-            "UPDATE nodes SET record = ?1, size = ?2, mtime = mtime + 1 WHERE id = 'n'",
-            params!["REPLACED-by-a-stranger", 21i64],
+            "UPDATE nodes SET record = ?1, size = ?2, mtime = mtime + 1 WHERE nid = ?3",
+            params!["REPLACED-by-a-stranger", 21i64, nid],
         )
         .unwrap();
 
         let mut buf = vec![0u8; 64];
-        let (n, src) = read_content_at_traced(&conn, "n", &mut buf, 0).unwrap();
+        let (n, src) = read_content_at_traced(&conn, nid, &mut buf, 0).unwrap();
         assert_eq!(
             &buf[..n],
             b"REPLACED-by-a-stranger",
@@ -2429,17 +2509,17 @@ mod tests {
     #[test]
     fn freshness_catches_an_equal_length_rewrite() {
         let conn = db();
-        insert_node_record(&conn, "n", "aaaaaaaa");
-        store_content_chunked(&conn, "n", b"aaaaaaaa").unwrap();
+        let nid = insert_node_record(&conn, "n", "aaaaaaaa");
+        store_content_chunked(&conn, nid, b"aaaaaaaa").unwrap();
 
         conn.execute(
-            "UPDATE nodes SET record = 'bbbbbbbb', mtime = mtime + 1 WHERE id = 'n'",
-            [],
+            "UPDATE nodes SET record = 'bbbbbbbb', mtime = mtime + 1 WHERE nid = ?1",
+            params![nid],
         )
         .unwrap();
 
         let mut buf = vec![0u8; 32];
-        let (n, src) = read_content_at_traced(&conn, "n", &mut buf, 0).unwrap();
+        let (n, src) = read_content_at_traced(&conn, nid, &mut buf, 0).unwrap();
         assert_eq!(
             &buf[..n],
             b"bbbbbbbb",
@@ -2448,10 +2528,10 @@ mod tests {
         assert_eq!(src, ContentSource::Record);
     }
 
-    fn manifest_rows(conn: &Connection, node_id: &str) -> i64 {
+    fn manifest_rows(conn: &Connection, nid: i64) -> i64 {
         conn.query_row(
-            "SELECT COUNT(*) FROM content_manifest WHERE node_id = ?1",
-            params![node_id],
+            "SELECT COUNT(*) FROM content_manifest WHERE nid = ?1",
+            params![nid],
             |r| r.get(0),
         )
         .unwrap()
@@ -2469,45 +2549,71 @@ mod tests {
     #[test]
     fn invalidation_actually_deletes_the_manifest_rows() {
         let conn = db();
-        insert_node_record(&conn, "n", "some content here");
-        store_content_chunked(&conn, "n", b"some content here").unwrap();
-        assert!(manifest_rows(&conn, "n") > 0, "precondition: rows exist");
+        let nid = insert_node_record(&conn, "n", "some content here");
+        store_content_chunked(&conn, nid, b"some content here").unwrap();
+        assert!(manifest_rows(&conn, nid) > 0, "precondition: rows exist");
 
-        invalidate_chunked_content(&conn, "n").unwrap();
+        invalidate_chunked_content(&conn, nid).unwrap();
         assert_eq!(
-            manifest_rows(&conn, "n"),
+            manifest_rows(&conn, nid),
             0,
             "invalidation left orphaned manifest rows behind"
         );
     }
 
-    /// The subtree variant must cascade exactly like the `id LIKE 'x/%'`
-    /// deletes it mirrors — a child's manifest outliving its parent is the
-    /// orphan case that grows unboundedly.
+    /// The directory cascade must reach every file beneath it, at any depth,
+    /// found by walking `dirs.parent_dir_id` — never by a string match. That
+    /// is what makes a sibling directory whose NAME merely shares a prefix
+    /// ("docsibling" vs "docs") safe from the cascade: under the pre-v5
+    /// scheme this was an `id LIKE 'x/%'` delete, which both planned as a
+    /// full scan and (being unanchored) could over-match exactly this
+    /// sibling; the v5 recursive-CTE walk over `dirs`/`files` cannot.
     #[test]
     fn subtree_invalidation_cascades_to_descendants() {
         let conn = db();
-        for id in ["docs", "docs/readme", "docs/deep/nested", "docsibling"] {
-            insert_node_record(&conn, id, "content");
-            store_content_chunked(&conn, id, b"content").unwrap();
-        }
+        leyline_schema::create_schema(&conn).unwrap();
 
-        invalidate_chunked_content_subtree(&conn, "docs").unwrap();
+        let store = |rel_path: &str| -> i64 {
+            let file_id = leyline_schema::ensure_file_id(&conn, rel_path).unwrap();
+            let dir_id = leyline_schema::ensure_dir_nodes(&conn, rel_path, 1).unwrap();
+            let nid = leyline_schema::file_nid(file_id, 0);
+            let name = rel_path.rsplit('/').next().unwrap();
+            let name_id = leyline_schema::intern_name(&conn, name).unwrap();
+            leyline_schema::insert_node(
+                &conn,
+                nid,
+                Some(leyline_schema::dir_nid(dir_id)),
+                Some(name_id),
+                None,
+                0,
+                0,
+                7,
+                1,
+                "content",
+            )
+            .unwrap();
+            store_content_chunked(&conn, nid, b"content").unwrap();
+            nid
+        };
 
-        assert_eq!(manifest_rows(&conn, "docs"), 0, "self not invalidated");
+        let readme = store("docs/readme.txt");
+        let nested = store("docs/deep/nested.txt");
+        let sibling = store("docsibling/file.txt");
+
+        let docs_nid = leyline_schema::resolve_path(&conn, "docs")
+            .unwrap()
+            .unwrap();
+        invalidate_chunked_content_subtree(&conn, docs_nid).unwrap();
+
+        assert_eq!(manifest_rows(&conn, readme), 0, "child not invalidated");
         assert_eq!(
-            manifest_rows(&conn, "docs/readme"),
-            0,
-            "child not invalidated"
-        );
-        assert_eq!(
-            manifest_rows(&conn, "docs/deep/nested"),
+            manifest_rows(&conn, nested),
             0,
             "grandchild not invalidated"
         );
         // Prefix-sibling must NOT be caught: "docs" must not match "docsibling".
         assert!(
-            manifest_rows(&conn, "docsibling") > 0,
+            manifest_rows(&conn, sibling) > 0,
             "cascade over-matched a prefix sibling"
         );
     }
@@ -2527,13 +2633,24 @@ mod tests {
         let old = vec![b'a'; 2_000_000];
         let new = vec![b'b'; old.len()];
         let old_record = String::from_utf8(old.clone()).unwrap();
-        reader
-            .execute(
-                "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('n', 'n', 0, ?1, 1, ?2)",
-                params![i64::try_from(old.len()).unwrap(), old_record],
-            )
-            .unwrap();
-        store_content_chunked(&reader, "n", &old).unwrap();
+        let file_id = leyline_schema::ensure_file_id(&reader, "n").unwrap();
+        let dir_id = leyline_schema::ensure_dir_nodes(&reader, "n", 1).unwrap();
+        let nid = leyline_schema::file_nid(file_id, 0);
+        let name_id = leyline_schema::intern_name(&reader, "n").unwrap();
+        leyline_schema::insert_node(
+            &reader,
+            nid,
+            Some(leyline_schema::dir_nid(dir_id)),
+            Some(name_id),
+            None,
+            0,
+            0,
+            i64::try_from(old.len()).unwrap(),
+            1,
+            &old_record,
+        )
+        .unwrap();
+        store_content_chunked(&reader, nid, &old).unwrap();
 
         let selected = Arc::new(Barrier::new(2));
         let committed = Arc::new(Barrier::new(2));
@@ -2546,22 +2663,22 @@ mod tests {
             writer_selected.wait();
             let new_record = String::from_utf8(new.clone()).unwrap();
             conn.execute(
-                "UPDATE nodes SET record = ?1, size = ?2, mtime = 2 WHERE id = 'n'",
-                params![new_record, i64::try_from(new.len()).unwrap()],
+                "UPDATE nodes SET record = ?1, size = ?2, mtime = 2 WHERE nid = ?3",
+                params![new_record, i64::try_from(new.len()).unwrap(), nid],
             )
             .unwrap();
-            store_content_chunked(&conn, "n", &new).unwrap();
+            store_content_chunked(&conn, nid, &new).unwrap();
             writer_committed.wait();
             new
         });
 
         let tx = reader.unchecked_transaction().unwrap();
-        assert!(has_chunked_content_in_transaction(&tx, "n").unwrap());
+        assert!(has_chunked_content_in_transaction(&tx, nid).unwrap());
         selected.wait();
         committed.wait();
         let mut old_out = vec![0xa5; 256 * 1024];
         let old_written =
-            read_content_chunked_in_transaction(&tx, "n", &mut old_out, 64 * 1024).unwrap();
+            read_content_chunked_in_transaction(&tx, nid, &mut old_out, 64 * 1024).unwrap();
         tx.commit().unwrap();
         let new = writer.join().unwrap();
         assert_eq!(
@@ -2572,12 +2689,186 @@ mod tests {
 
         let mut new_out = vec![0xa5; old_out.len()];
         let (new_written, source) =
-            read_content_at_traced(&reader, "n", &mut new_out, 64 * 1024).unwrap();
+            read_content_at_traced(&reader, nid, &mut new_out, 64 * 1024).unwrap();
         assert_eq!(source, ContentSource::Chunked);
         assert_eq!(
             &new_out[..new_written],
             &new[64 * 1024..64 * 1024 + new_written],
             "next transaction did not observe the new coherent generation"
         );
+    }
+
+    /// Is there a manifest row for this nid? The observable every subtree
+    /// invalidation test below asserts on, row by row.
+    fn manifest_present(conn: &Connection, nid: i64) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM content_manifest WHERE nid = ?1 LIMIT 1",
+            params![nid],
+            |_| Ok(true),
+        )
+        .optional()
+        .unwrap()
+        .unwrap_or(false)
+    }
+
+    /// A `nodes` row that exists only to be walked by `parent_nid` — an AST
+    /// node with no name and no path. It still carries a real record: the
+    /// chunk store refuses any nid whose `nodes` row it cannot capture a
+    /// freshness witness from.
+    fn put_ast_node(conn: &Connection, nid: i64, parent_nid: Option<i64>, record: &str) {
+        conn.execute(
+            "INSERT INTO nodes (nid, parent_nid, kind, ord, size, mtime, record) \
+             VALUES (?1, ?2, 0, 0, ?3, 0, ?4)",
+            params![nid, parent_nid, record.len() as i64, record],
+        )
+        .unwrap();
+    }
+
+    /// `tree_tables_present` is a THREE-table conjunction, and the count is
+    /// the whole of it. Answering `true` unconditionally sends a pure
+    /// content-addressed arena — manifests, no tree — down the subtree
+    /// descent, where "the subtree" is the file's entire nid range instead of
+    /// the single standalone node. So both halves are pinned: the predicate
+    /// itself over each partial schema, and the branch it selects.
+    #[test]
+    fn the_tree_table_probe_needs_all_three_and_gates_the_subtree_descent() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_chunked_content_schema(&conn).unwrap();
+        assert!(
+            !tree_tables_present(&conn).unwrap(),
+            "a pure content-addressed arena has no tree tables"
+        );
+        conn.execute_batch("CREATE TABLE nodes (nid INTEGER PRIMARY KEY)")
+            .unwrap();
+        assert!(
+            !tree_tables_present(&conn).unwrap(),
+            "one of three is not the tree"
+        );
+        conn.execute_batch("CREATE TABLE files (file_id INTEGER PRIMARY KEY)")
+            .unwrap();
+        assert!(
+            !tree_tables_present(&conn).unwrap(),
+            "two of three is not the tree — the descent JOINs all three"
+        );
+        conn.execute_batch("CREATE TABLE dirs (dir_id INTEGER PRIMARY KEY)")
+            .unwrap();
+        assert!(
+            tree_tables_present(&conn).unwrap(),
+            "all three present is the tree"
+        );
+
+        // The branch that probe selects, observed: with no tree tables, the
+        // single-row delete IS the whole subtree, so a co-resident nid in the
+        // SAME file range must survive. (A `true` answer would take the
+        // ordinal-0 range delete and reap it.)
+        let treeless = Connection::open_in_memory().unwrap();
+        create_chunked_content_schema(&treeless).unwrap();
+        let root = leyline_schema::file_nid(1, 0);
+        let neighbour = leyline_schema::file_nid(1, 9);
+        store_content_chunked(&treeless, root, &prng(0x7EE1, 20_000)).unwrap();
+        store_content_chunked(&treeless, neighbour, &prng(0x7EE2, 20_000)).unwrap();
+        invalidate_chunked_content_subtree(&treeless, root).unwrap();
+        assert!(
+            !manifest_present(&treeless, root),
+            "the named node's manifest is always invalidated"
+        );
+        assert!(
+            manifest_present(&treeless, neighbour),
+            "without tree tables there is no descendant relation — a same-range \
+             nid is a STANDALONE node, not a descendant"
+        );
+    }
+
+    /// The ordinal test picks between two structurally different descents,
+    /// and each reaches rows the other cannot:
+    ///
+    /// - **ordinal 0** (a file root) → the file's whole nid RANGE. It reaps
+    ///   every manifest in the range whether or not a `nodes` row still links
+    ///   it to the root — which is the point, because the caller may already
+    ///   have deleted those rows.
+    /// - **ordinal != 0** (an interior AST node) → recurse `nodes.parent_nid`.
+    ///   It reaps that node's descendants and MUST leave the file root and
+    ///   its unrelated siblings alone.
+    ///
+    /// Flipping the test swaps them, and both directions leak: the root case
+    /// then misses an unlinked in-range manifest (the cross-generation leak
+    /// this cascade exists to prevent), and the interior case over-deletes the
+    /// file root that was never asked for. One unlinked manifest row
+    /// (`orphan`) plus one root manifest make both visible.
+    #[test]
+    fn the_subtree_descent_splits_a_file_root_from_an_interior_node() {
+        // Build the same fixture twice — the first invalidation would
+        // otherwise consume the rows the second case needs.
+        let fixture = || {
+            let conn = Connection::open_in_memory().unwrap();
+            leyline_schema::create_schema(&conn).unwrap();
+            create_chunked_content_schema(&conn).unwrap();
+            // Each body is written twice — as the `nodes` record and as the
+            // chunked bytes — because the store refuses a nid whose record it
+            // cannot capture a matching freshness witness from.
+            let (root_body, other_body) = ("r".repeat(9_000), "o".repeat(9_000));
+            let (child_body, grand_body) = ("c".repeat(9_000), "g".repeat(9_000));
+            let root =
+                crate::graph::fixtures::put_file(&conn, "a.rs", 100, Some(&root_body)).unwrap();
+            let other =
+                crate::graph::fixtures::put_file(&conn, "b.rs", 100, Some(&other_body)).unwrap();
+            let file_id = leyline_schema::nid_file_id(root).unwrap();
+            let child = leyline_schema::file_nid(file_id, 3);
+            let grandchild = leyline_schema::file_nid(file_id, 4);
+            // In `a.rs`'s nid range, but reachable from the root only by the
+            // range — it has NO `nodes` row, so no `parent_nid` chain leads
+            // here. This is the row the two descents disagree about.
+            let orphan = leyline_schema::file_nid(file_id, 9);
+            put_ast_node(&conn, child, Some(root), &child_body);
+            put_ast_node(&conn, grandchild, Some(child), &grand_body);
+            for (nid, body) in [
+                (root, &root_body),
+                (other, &other_body),
+                (child, &child_body),
+                (grandchild, &grand_body),
+            ] {
+                store_content_chunked(&conn, nid, body.as_bytes()).unwrap();
+            }
+            store_content_chunked(&conn, orphan, &prng(0x0FA9, 9_000)).unwrap();
+            (conn, root, child, grandchild, orphan, other)
+        };
+
+        let (conn, root, child, grandchild, orphan, other) = fixture();
+        invalidate_chunked_content_subtree(&conn, root).unwrap();
+        for (nid, label) in [
+            (root, "the file root"),
+            (child, "a linked AST child"),
+            (grandchild, "a linked AST grandchild"),
+            (orphan, "an UNLINKED manifest inside the file's nid range"),
+        ] {
+            assert!(
+                !manifest_present(&conn, nid),
+                "invalidating a file root reaps its whole nid range: {label} survived"
+            );
+        }
+        assert!(
+            manifest_present(&conn, other),
+            "a different file is not in the range and must survive"
+        );
+
+        let (conn, root, child, grandchild, orphan, other) = fixture();
+        invalidate_chunked_content_subtree(&conn, child).unwrap();
+        assert!(
+            !manifest_present(&conn, child),
+            "the named interior node is invalidated"
+        );
+        assert!(
+            !manifest_present(&conn, grandchild),
+            "the parent_nid walk reaches its descendants"
+        );
+        assert!(
+            manifest_present(&conn, root),
+            "an interior node's subtree does NOT include the file root above it"
+        );
+        assert!(
+            manifest_present(&conn, orphan),
+            "nor an unlinked in-range nid that is not its descendant"
+        );
+        assert!(manifest_present(&conn, other), "nor another file entirely");
     }
 }

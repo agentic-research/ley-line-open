@@ -115,12 +115,23 @@ fn parse_pass(db_path: &Path, repo: &Path) -> cmd_parse::ParseResult {
 
 /// Order-insensitive snapshot of the derived def facts, injected rows
 /// included.
-fn defs_snapshot(db_path: &Path) -> Vec<(String, String)> {
+///
+/// projection-v5: the def site is `nid`, not a path-shaped `node_id`.
+/// The comparisons below are within ONE arena across reparses, where
+/// nids are stable (`files` is append-only and ordinals are the
+/// deterministic pre-order rank), so the integer is the sharper key —
+/// it catches a re-derivation that lands the same tokens at different
+/// nodes. `node_hash` rides along so injected rows, which have no
+/// `_ast` row to fall back on, still contribute content identity.
+fn defs_snapshot(db_path: &Path) -> Vec<(String, i64, Option<String>)> {
     let conn = Connection::open(db_path).unwrap();
     let mut stmt = conn
-        .prepare("SELECT token, node_id FROM node_defs ORDER BY token, node_id")
+        .prepare(
+            "SELECT token, nid, lower(hex(node_hash)) FROM node_defs \
+             ORDER BY token, nid",
+        )
         .unwrap();
-    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .unwrap()
         .map(|r| r.unwrap())
         .collect()
@@ -171,7 +182,7 @@ fn f7_injections_scm_change_forces_full_rederivation() {
     };
     let baseline = defs_snapshot(&db_path);
     assert!(
-        baseline.iter().any(|(t, _)| t == "users"),
+        baseline.iter().any(|(t, _, _)| t == "users"),
         "fixture must produce the injected `users` def; got {baseline:?}",
     );
 

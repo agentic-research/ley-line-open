@@ -22,9 +22,12 @@ fn activated_projection_publishes_chunked_4k_reads_to_a_real_arena() {
         leyline_cli_lib::cmd_parse::parse_into_conn(&conn, &source_dir, Some("json"), None)
             .unwrap();
     assert_eq!(parsed.parsed, 1);
-    let (node_id, authoritative): (String, Vec<u8>) = conn
+    // projection-v5: `nodes` is keyed on an integer nid, which is also
+    // what `chunked::read_content_at_traced` / `chunks_touched` address
+    // a node by — no path render is involved on this path at all.
+    let (nid, authoritative): (i64, Vec<u8>) = conn
         .query_row(
-            "SELECT id, CAST(record AS BLOB)
+            "SELECT nid, CAST(record AS BLOB)
                FROM nodes
               WHERE kind = 0 AND record IS NOT NULL
               ORDER BY length(record) DESC
@@ -59,12 +62,12 @@ fn activated_projection_publishes_chunked_4k_reads_to_a_real_arena() {
     let offset = authoritative.len() / 2;
     let mut actual = vec![0_u8; 4096];
     let (read, content_source) =
-        read_content_at_traced(graph.conn(), &node_id, &mut actual, offset as u64).unwrap();
+        read_content_at_traced(graph.conn(), nid, &mut actual, offset as u64).unwrap();
     assert_eq!(read, 4096);
     assert_eq!(actual, authoritative[offset..offset + 4096]);
     assert_eq!(content_source, ContentSource::Chunked);
 
-    let touched = chunks_touched(graph.conn(), &node_id, offset as u64, 4096).unwrap();
+    let touched = chunks_touched(graph.conn(), nid, offset as u64, 4096).unwrap();
     assert!(
         touched <= 2,
         "4 KiB range must touch at most two chunks, touched {touched}"
@@ -216,15 +219,20 @@ fn downstream_nodes_only_projection_survives_the_complete_cdc_lifecycle() {
         private_tables_before, 0,
         "the downstream producer starts without LLO-private content tables"
     );
-    let (node_id, mut model): (String, Vec<u8>) = conn
+    // The `Graph` surface stays path-addressed (it is the mount-visible
+    // presentation API and resolves through `resolve_path`), so this
+    // test needs both the display path — for `write_content` /
+    // `read_content` / `remove_node` — and the nid the row is keyed on.
+    let (node_path, nid, mut model): (String, i64, Vec<u8>) = conn
         .query_row(
-            "SELECT id, CAST(record AS BLOB)
-               FROM nodes
-              WHERE kind = 0 AND record IS NOT NULL
-              ORDER BY length(record) DESC
+            "SELECT p.path, n.nid, CAST(n.record AS BLOB)
+               FROM nodes n
+               JOIN v_node_path p ON p.nid = n.nid
+              WHERE n.kind = 0 AND n.record IS NOT NULL
+              ORDER BY length(n.record) DESC
               LIMIT 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
     drop(conn);
@@ -240,7 +248,7 @@ fn downstream_nodes_only_projection_survives_the_complete_cdc_lifecycle() {
     let edit_offset = model.len() / 2;
     let edit = b"CDC!";
     adapter
-        .write_content(&node_id, edit, edit_offset as u64)
+        .write_content(&node_path, edit, edit_offset as u64)
         .unwrap();
     model[edit_offset..edit_offset + edit.len()].copy_from_slice(edit);
 
@@ -249,7 +257,7 @@ fn downstream_nodes_only_projection_survives_the_complete_cdc_lifecycle() {
     let mut actual = vec![0_u8; 4096];
     let range_offset = edit_offset - 2048;
     let read = reopened_adapter
-        .read_content(&node_id, &mut actual, range_offset as u64)
+        .read_content(&node_path, &mut actual, range_offset as u64)
         .unwrap();
     assert_eq!(read, actual.len());
     assert_eq!(
@@ -258,7 +266,7 @@ fn downstream_nodes_only_projection_survives_the_complete_cdc_lifecycle() {
         "serialized/reopened consumer bytes must match the authoritative edit"
     );
 
-    reopened_adapter.remove_node(&node_id).unwrap();
+    reopened_adapter.remove_node(&node_path).unwrap();
     std::fs::write(&db_path, reopened_adapter.serialize().unwrap()).unwrap();
 
     let collected =
@@ -275,11 +283,9 @@ fn downstream_nodes_only_projection_survives_the_complete_cdc_lifecycle() {
 
     let final_conn = Connection::open(&db_path).unwrap();
     let removed: i64 = final_conn
-        .query_row(
-            "SELECT COUNT(*) FROM nodes WHERE id = ?1",
-            [&node_id],
-            |row| row.get(0),
-        )
+        .query_row("SELECT COUNT(*) FROM nodes WHERE nid = ?1", [nid], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(removed, 0);
 }

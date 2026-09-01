@@ -38,7 +38,6 @@
 //! a new design bead first.
 
 use anyhow::Result;
-use bytemuck;
 use memmap2::Mmap;
 use rusqlite::Connection;
 use std::fs::File;
@@ -52,8 +51,21 @@ use leyline_schema::create_schema;
 fn seed_db() -> Vec<u8> {
     let conn = Connection::open_in_memory().unwrap();
     create_schema(&conn).unwrap();
-    conn.execute_batch(
-        "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('docs', 'docs', 1, 0, 1000, NULL);",
+    // One directory node. A node's PATH is not stored under projection-v5, so
+    // it is interned in `dirs`/`names` and keyed by its negative nid.
+    let dir_id = leyline_schema::intern_dir_chain(&conn, "docs").unwrap();
+    let name_id = leyline_schema::intern_name(&conn, "docs").unwrap();
+    leyline_schema::insert_node(
+        &conn,
+        leyline_schema::dir_nid(dir_id),
+        Some(leyline_schema::dir_nid(1)),
+        Some(name_id),
+        None,
+        1,
+        0,
+        0,
+        1000,
+        "",
     )
     .unwrap();
     conn.serialize("main").unwrap().to_vec()

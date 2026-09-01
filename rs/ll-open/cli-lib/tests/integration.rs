@@ -353,12 +353,23 @@ async fn test_splice_modifies_node() {
         .await
         .expect("parse should succeed");
 
-    // Step 2: Find a node_id from the _ast table that we can splice.
+    // Step 2: Find a spliceable node. `leyline splice` takes a DISPLAY
+    // path (cmd_splice resolves it via `resolve_path`), which under
+    // projection-v5 is derived — so the `_ast` row is located by
+    // util.go's nid range + its interned kind, then rendered.
     let conn = rusqlite::Connection::open(&db_path).expect("open db");
+    let util_go = leyline_ts::schema::lookup_file_id(&conn, "util.go")
+        .unwrap()
+        .expect("util.go must be interned by the parse");
+    let (lo, hi) = leyline_ts::schema::file_nid_range(util_go);
     let node_id: String = conn
         .query_row(
-            "SELECT node_id FROM _ast WHERE source_id = 'util.go' AND node_kind = 'function_declaration' LIMIT 1",
-            [],
+            "SELECT p.path FROM _ast a \
+             JOIN kinds k ON k.kind_id = a.kind_id \
+             JOIN v_node_path p ON p.nid = a.nid \
+             WHERE a.nid BETWEEN ?1 AND ?2 AND k.raw_kind = 'function_declaration' \
+             LIMIT 1",
+            [lo, hi],
             |r| r.get(0),
         )
         .expect("find function_declaration node in _ast");
@@ -475,21 +486,32 @@ fn test_inspect_node_lookup() {
 
     let out_dir = TempDir::new().expect("create output dir");
 
-    // Step 1: Create an in-memory database with the nodes schema and a root node.
+    // Step 1: Create an in-memory database with the nodes schema, a root
+    // node and one file node.
+    //
+    // projection-v5: rows are minted through the interning helpers rather
+    // than INSERTed with a hand-written id. `ensure_dir_nodes` materializes
+    // the root directory's presentation row (negative nid), and the file
+    // takes ordinal 0 of its `file_id` range — the nid `resolve_path`
+    // hands back for the display path "main.go".
     let source_conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
     create_schema(&source_conn).expect("create schema");
-    source_conn
-        .execute(
-            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params!["", "root", 1, 0, 1000, ""],
-        )
-        .expect("insert root node");
-    source_conn
-        .execute(
-            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params!["main.go", "main.go", 0, 42, 2000, ""],
-        )
-        .expect("insert file node");
+    leyline_schema::ensure_dir_nodes(&source_conn, "main.go", 1000).expect("mint root dir node");
+    let file_id = leyline_schema::ensure_file_id(&source_conn, "main.go").expect("intern main.go");
+    let name_id = leyline_schema::intern_name(&source_conn, "main.go").expect("intern name");
+    leyline_schema::insert_node(
+        &source_conn,
+        leyline_schema::file_nid(file_id, 0),
+        Some(leyline_schema::dir_nid(1)),
+        Some(name_id),
+        None,
+        0,
+        0,
+        42,
+        2000,
+        "",
+    )
+    .expect("insert file node");
 
     let serialized = source_conn.serialize("main").expect("serialize db");
     let db_bytes = serialized.to_vec();
@@ -1048,10 +1070,16 @@ fn test_warm_start_crash_recovery() {
     // Verify we have more nodes for main.go after adding a function.
     // The file now has 2 functions (main + newFunc), so there should be
     // at least 2 function_declaration AST entries for main.go.
+    let (lo, hi) = leyline_ts::schema::file_nid_range(
+        leyline_ts::schema::lookup_file_id(&recovered, "main.go")
+            .unwrap()
+            .expect("main.go must be interned"),
+    );
     let func_count: i64 = recovered
         .query_row(
-            "SELECT COUNT(*) FROM _ast WHERE source_id = 'main.go' AND node_kind = 'function_declaration'",
-            [],
+            "SELECT COUNT(*) FROM _ast a JOIN kinds k ON k.kind_id = a.kind_id \
+             WHERE a.nid BETWEEN ?1 AND ?2 AND k.raw_kind = 'function_declaration'",
+            [lo, hi],
             |r| r.get(0),
         )
         .unwrap();
@@ -1845,11 +1873,16 @@ async fn test_incremental_deletion_cleans_lsp_orphans() {
     // schema directly + insert rows for both files. We use the same
     // shape as leyline_lsp::project::create_lsp_schema (no cross-crate
     // dep needed; the schema is a small constant string).
-    {
+    //
+    // projection-v5: the `_lsp*` tables key on the integer `nid` and
+    // carry NO file column — file scoping was a prefix-LIKE on the
+    // path-shaped node_id and is now a range predicate. The fixture
+    // therefore keys its rows on real nids inside each file's range.
+    let (keep_lo, keep_hi, remove_lo, remove_hi) = {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         conn.execute_batch(
             "CREATE TABLE _lsp (
-                node_id TEXT PRIMARY KEY,
+                nid INTEGER PRIMARY KEY,
                 symbol_kind TEXT,
                 detail TEXT,
                 start_line INTEGER NOT NULL,
@@ -1858,23 +1891,32 @@ async fn test_incremental_deletion_cleans_lsp_orphans() {
                 end_col INTEGER NOT NULL,
                 diagnostics TEXT
             );
-            CREATE TABLE _lsp_hover (node_id TEXT PRIMARY KEY, hover_text TEXT);",
+            CREATE TABLE _lsp_hover (nid INTEGER PRIMARY KEY, hover_text TEXT);",
+        )
+        .unwrap();
+        let range = |rel: &str| {
+            leyline_ts::schema::file_nid_range(
+                leyline_ts::schema::lookup_file_id(&conn, rel)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{rel} must be interned by the first parse")),
+            )
+        };
+        let (keep_lo, keep_hi) = range("keep.go");
+        let (remove_lo, remove_hi) = range("remove.go");
+        conn.execute(
+            "INSERT INTO _lsp (nid, symbol_kind, detail, start_line, start_col, end_line, end_col) \
+             VALUES (?1, 'function', 'k', 0, 0, 1, 0), \
+                    (?2, 'function', 'r', 0, 0, 1, 0)",
+            rusqlite::params![keep_lo + 1, remove_lo + 1],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO _lsp (node_id, symbol_kind, detail, start_line, start_col, end_line, end_col) \
-             VALUES ('keep.go/func', 'function', 'k', 0, 0, 1, 0), \
-                    ('remove.go/func', 'function', 'r', 0, 0, 1, 0)",
-            [],
+            "INSERT INTO _lsp_hover (nid, hover_text) VALUES (?1, 'k-doc'), (?2, 'r-doc')",
+            rusqlite::params![keep_lo + 1, remove_lo + 1],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO _lsp_hover (node_id, hover_text) VALUES \
-             ('keep.go/func', 'k-doc'), ('remove.go/func', 'r-doc')",
-            [],
-        )
-        .unwrap();
-    }
+        (keep_lo, keep_hi, remove_lo, remove_hi)
+    };
 
     // Delete the file from disk.
     std::fs::remove_file(src.path().join("remove.go")).unwrap();
@@ -1890,36 +1932,33 @@ async fn test_incremental_deletion_cleans_lsp_orphans() {
 
     let conn = rusqlite::Connection::open(&db_path).unwrap();
 
+    let count_in_range = |table: &str, lo: i64, hi: i64| -> i64 {
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE nid BETWEEN ?1 AND ?2"),
+            [lo, hi],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+
     // remove.go's _lsp rows: gone.
-    let remove_lsp: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM _lsp WHERE node_id LIKE 'remove.go%'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(remove_lsp, 0, "_lsp rows for remove.go must be cleaned up");
-    let remove_hover: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM _lsp_hover WHERE node_id LIKE 'remove.go%'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
     assert_eq!(
-        remove_hover, 0,
+        count_in_range("_lsp", remove_lo, remove_hi),
+        0,
+        "_lsp rows for remove.go must be cleaned up"
+    );
+    assert_eq!(
+        count_in_range("_lsp_hover", remove_lo, remove_hi),
+        0,
         "_lsp_hover rows for remove.go must be cleaned up",
     );
 
     // keep.go's _lsp rows: intact.
-    let keep_lsp: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM _lsp WHERE node_id LIKE 'keep.go%'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(keep_lsp, 1, "_lsp rows for keep.go must NOT be cleaned up");
+    assert_eq!(
+        count_in_range("_lsp", keep_lo, keep_hi),
+        1,
+        "_lsp rows for keep.go must NOT be cleaned up"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2081,15 +2120,19 @@ async fn test_refs_tables_match_mache_schema() {
         .unwrap();
     assert_eq!(nodes_exists, 1);
 
-    // Verify node_refs columns match mache's expected query pattern
-    // mache does: SELECT node_id FROM node_refs WHERE token = ?
+    // Verify node_refs columns match mache's expected query pattern.
+    // mache does: SELECT nid FROM node_refs WHERE token = ?, then scopes
+    // per file by the nid range. projection-v5 dropped `source_id` from
+    // the occurrence tables (`nid >> 24` IS the file) and re-keyed
+    // `node_id` → `nid` / `container_node_id` → `container_nid`;
+    // `_imports` keeps its path-shaped `source_id`.
     conn.execute(
-        "SELECT token, node_id, source_id FROM node_refs LIMIT 0",
+        "SELECT token, nid, container_nid FROM node_refs LIMIT 0",
         [],
     )
     .unwrap();
     conn.execute(
-        "SELECT token, node_id, source_id FROM node_defs LIMIT 0",
+        "SELECT token, nid, container_nid FROM node_defs LIMIT 0",
         [],
     )
     .unwrap();
@@ -2171,15 +2214,31 @@ async fn test_embed_queue_drainer_refreshes_index() {
 
     let live_db_path = ctrl_path.with_extension("live.db");
     let live_db = leyline_cli_lib::daemon::db_pool::LiveDb::open_fresh_for_test(&live_db_path);
-    live_db
-        .writer
-        .lock()
-        .execute_batch(&format!(
-            "{}\n INSERT INTO nodes (id, name, kind, size, mtime, record) \
-                 VALUES ('a.go', 'a.go', 0, 9, 1, 'package a');",
-            leyline_schema::NODES_TABLE_DDL
-        ))
+    {
+        // projection-v5: mint the file node through the interning
+        // helpers so `a.go` RESOLVES — the drain loop reaches the record
+        // via `query_node_record`, which turns the task's display path
+        // into a nid. A hand-written `INSERT INTO nodes (id, ...)` has no
+        // `files`/`dirs` rows behind it and would resolve to nothing.
+        let w = live_db.writer.lock();
+        leyline_schema::create_nodes_table(&w).unwrap();
+        leyline_schema::ensure_dir_nodes(&w, "a.go", 1).unwrap();
+        let file_id = leyline_schema::ensure_file_id(&w, "a.go").unwrap();
+        let name_id = leyline_schema::intern_name(&w, "a.go").unwrap();
+        leyline_schema::insert_node(
+            &w,
+            leyline_schema::file_nid(file_id, 0),
+            Some(leyline_schema::dir_nid(1)),
+            Some(name_id),
+            None,
+            0,
+            0,
+            9,
+            1,
+            "package a",
+        )
         .unwrap();
+    }
 
     let queue: embed::EmbedQueue = Arc::new(Mutex::new(std::collections::BinaryHeap::new()));
 
@@ -2410,16 +2469,29 @@ fn test_scoped_reparse_preserves_sibling_dir_nodes() {
     let conn = Connection::open_in_memory().unwrap();
     parse_into_conn(&conn, dir.path(), Some("go"), None).unwrap();
 
-    // Verify pkg/ dir node exists after cold parse.
-    let pkg_dir_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM nodes WHERE id = 'pkg' AND kind = 1",
-            [],
+    // projection-v5: the path is derived, so a node is located by
+    // resolving it to a nid first. `dirs`/`files` are append-only, so
+    // resolution survives a sweep that removes the presentation row —
+    // which is exactly what makes the count below the real assertion.
+    let nid_of = |rel: &str| -> i64 {
+        leyline_ts::schema::resolve_path(&conn, rel)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{rel} must be interned by the cold parse"))
+    };
+    let rows_at = |nid: i64, extra: &str| -> i64 {
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM nodes WHERE nid = ?1 {extra}"),
+            [nid],
             |r| r.get(0),
         )
-        .unwrap();
+        .unwrap()
+    };
+
+    // Verify pkg/ dir node exists after cold parse.
+    let pkg_nid = nid_of("pkg");
     assert_eq!(
-        pkg_dir_count, 1,
+        rows_at(pkg_nid, "AND kind = 1"),
+        1,
         "pkg/ dir node must exist after cold parse"
     );
 
@@ -2442,23 +2514,17 @@ fn test_scoped_reparse_preserves_sibling_dir_nodes() {
     // dirs ran during the scoped pass, it would have deleted pkg/
     // because b.go (the only other child) wasn't reloaded into the
     // scoped run's _file_index addition.
-    let pkg_after: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM nodes WHERE id = 'pkg' AND kind = 1",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(pkg_after, 1, "pkg/ dir node must survive scoped reparse");
+    assert_eq!(
+        rows_at(pkg_nid, "AND kind = 1"),
+        1,
+        "pkg/ dir node must survive scoped reparse"
+    );
     // And b.go's file row also.
-    let b_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM nodes WHERE id = 'pkg/b.go'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(b_count, 1, "pkg/b.go file row must survive scoped reparse");
+    assert_eq!(
+        rows_at(nid_of("pkg/b.go"), ""),
+        1,
+        "pkg/b.go file row must survive scoped reparse"
+    );
 }
 
 /// Verify scoped reparse handles a deleted file: vanished files in the scope
@@ -3293,6 +3359,10 @@ async fn daemon_protocol_gate_handlers_emit_required_keys() {
     {
         let guard = ctx.live_db.writer.lock();
         leyline_schema::create_schema(&guard).expect("nodes schema");
+        // `_ast`/`_source` too: token_map's injected-address rendering LEFT
+        // JOINs `_source` (it always exists in a real projection — created
+        // by the same parse that fills the refs tables).
+        leyline_ts::schema::create_ast_schema(&guard).expect("ast schema");
         guard
             .execute_batch(leyline_ts::schema::REFS_DDL)
             .expect("node_refs schema");

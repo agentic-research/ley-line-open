@@ -10,7 +10,7 @@
 
 use parking_lot::Mutex;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::BinaryHeap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -192,71 +192,60 @@ impl EnrichmentPass for EmbeddingPass {
     ) -> Result<EnrichmentStats> {
         let start = Instant::now();
 
-        // Push the scope filter into SQL when present. Without this,
-        // every scoped run (typical: 1–10 dirty files from the git
-        // watcher) full-scans the nodes table — at registry-repo scale
-        // (50k+ file nodes) that's 50000 rows scanned to find 10. With
-        // the IN clause SQLite uses the PRIMARY KEY on id directly.
-        //
-        // Above the SQLITE_MAX_VARIABLE_NUMBER limit (default 999) we
-        // fall back to the in-memory HashSet filter — chunking would
-        // require multiple round-trips for marginal benefit at that
-        // scope size.
-        const SQLITE_VAR_LIMIT: usize = 999;
-        let scope_in_sql = changed_files
-            .map(|s| !s.is_empty() && s.len() <= SQLITE_VAR_LIMIT)
-            .unwrap_or(false);
-        let scope_set: Option<HashSet<&str>> = changed_files
-            .filter(|s| !scope_in_sql && !s.is_empty())
-            .map(|s| s.iter().map(|p| p.as_str()).collect());
-
-        let base = "SELECT id, record FROM nodes \
+        // projection-v5 (bead `ley-line-open-17c271`): scope by each dirty
+        // file's nid range — one PRIMARY KEY range SEARCH per file, which
+        // both replaces the pre-v5 `id IN (...)` clause AND fixes it: that
+        // clause compared FILE rel paths against LEAF node ids, which never
+        // match (a file's own node is kind=1), so a scoped run silently
+        // embedded nothing. The vec-index key stays the node's DISPLAY path
+        // (the sidecar contract; the drain path resolves it back via
+        // `query_node_record`), rendered per row.
+        let base = "SELECT nid, record FROM nodes \
                     WHERE kind = 0 AND record IS NOT NULL AND record <> ''";
 
         let mut files_processed = 0u64;
         let mut items_added = 0u64;
 
-        let mut process_row = |id: String, content: String| -> Result<()> {
-            if content.is_empty() {
-                return Ok(());
+        let mut rows_buf: Vec<(i64, String)> = Vec::new();
+        match changed_files {
+            Some(files) if !files.is_empty() => {
+                let mut stmt = conn.prepare_cached(&format!("{base} AND nid BETWEEN ?1 AND ?2"))?;
+                for rel in files {
+                    let Some(fid) = leyline_ts::schema::lookup_file_id(conn, rel)? else {
+                        continue;
+                    };
+                    let (lo, hi) = leyline_ts::schema::file_nid_range(fid);
+                    let rows = stmt.query_map(rusqlite::params![lo, hi], |r| {
+                        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                    })?;
+                    for row in rows {
+                        rows_buf.push(row?);
+                    }
+                }
             }
+            _ => {
+                let mut stmt = conn.prepare(base)?;
+                let rows =
+                    stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+                for row in rows {
+                    rows_buf.push(row?);
+                }
+            }
+        }
+
+        for (nid, content) in rows_buf {
+            if content.is_empty() {
+                continue;
+            }
+            // An unrenderable nid (dangling row) has no stable sidecar key
+            // — skip rather than index under a meaningless address.
+            let Some(id) = leyline_ts::schema::node_path(conn, nid)? else {
+                continue;
+            };
             files_processed += 1;
             let vec = self.embedder.embed(&content)?;
             self.index.insert(&id, &vec)?;
             items_added += 1;
-            Ok(())
-        };
-
-        if scope_in_sql {
-            let changed =
-                changed_files.expect("scope_in_sql ⇒ changed_files is Some by construction");
-            let placeholders: Vec<&str> = changed.iter().map(|_| "?").collect();
-            let sql = format!("{base} AND id IN ({})", placeholders.join(","));
-            let mut stmt = conn.prepare(&sql)?;
-            let params: Vec<&dyn rusqlite::ToSql> =
-                changed.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-            let rows = stmt.query_map(params.as_slice(), |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?;
-            for row in rows {
-                let (id, content) = row?;
-                process_row(id, content)?;
-            }
-        } else {
-            // Full scan + optional in-memory scope filter (used when
-            // scope is None OR scope is too large for IN clause).
-            let mut stmt = conn.prepare(base)?;
-            let rows =
-                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-            for row in rows {
-                let (id, content) = row?;
-                if let Some(set) = &scope_set
-                    && !set.contains(id.as_str())
-                {
-                    continue;
-                }
-                process_row(id, content)?;
-            }
         }
 
         Ok(EnrichmentStats {
@@ -435,16 +424,36 @@ mod tests {
     /// source of truth for the tests that share it — this one drifted from
     /// the shipped schema the moment `parent_id` became a derived column,
     /// and nothing would have failed until a row silently took a NULL parent.
-    const NODES_SCHEMA: &str = leyline_schema::NODES_TABLE_DDL;
-
-    /// Open an in-memory connection with the `nodes` table created and
-    /// `vec0` extension registered. Replaces 2 byte-identical setup
-    /// sequences across embed-pass tests.
+    /// Open an in-memory connection with the v5 schema (nodes + interning)
+    /// created and the `vec0` extension registered. Replaces 2
+    /// byte-identical setup sequences across embed-pass tests.
     fn fresh_conn_with_nodes() -> Result<Connection> {
         register_vec();
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch(NODES_SCHEMA)?;
+        leyline_schema::create_schema(&conn)?;
         Ok(conn)
+    }
+
+    /// Mint one leaf FILE node (kind 0, record = content) the v5 way — the
+    /// shape the mount write path produces. Renders/scopes as `rel`.
+    fn mint_leaf_file(conn: &Connection, rel: &str, record: &str) -> Result<()> {
+        let fid = leyline_ts::schema::ensure_file_id(conn, rel)?;
+        let dir = leyline_ts::schema::ensure_dir_nodes(conn, rel, 1)?;
+        let fname = rel.rsplit_once('/').map(|(_, n)| n).unwrap_or(rel);
+        let name_id = leyline_ts::schema::intern_name(conn, fname)?;
+        leyline_ts::schema::insert_node(
+            conn,
+            leyline_ts::schema::file_nid(fid, 0),
+            Some(leyline_ts::schema::dir_nid(dir)),
+            Some(name_id),
+            None,
+            0,
+            0,
+            record.len() as i64,
+            1,
+            record,
+        )?;
+        Ok(())
     }
 
     #[test]
@@ -611,11 +620,8 @@ mod tests {
     #[test]
     fn embedding_pass_zero_embedder_populates_index() -> Result<()> {
         let conn = fresh_conn_with_nodes()?;
-        conn.execute_batch(
-            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('src/a.go', 'a.go', 0, 12, 1, 'package main');
-            INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('src/b.go', 'b.go', 0, 13, 2, 'package other');
-            INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('src', 'src', 1, 0, 0, NULL);",
-        )?;
+        mint_leaf_file(&conn, "src/a.go", "package main")?;
+        mint_leaf_file(&conn, "src/b.go", "package other")?;
 
         let dim = 4;
         let index = Arc::new(VectorIndex::new(dim, None)?);
@@ -639,14 +645,9 @@ mod tests {
     #[test]
     fn embedding_pass_scope_limits_files() -> Result<()> {
         let conn = fresh_conn_with_nodes()?;
-        conn.execute_batch(
-            // Columns named, not positional: a bare `VALUES (...)` is bound to
-            // the table's exact stored-column count, so it breaks whenever the
-            // shared DDL gains or loses one.
-            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('a.go', 'a.go', 0, 1, 1, 'package a');
-             INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('b.go', 'b.go', 0, 1, 1, 'package b');
-             INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('c.go', 'c.go', 0, 1, 1, 'package c');",
-        )?;
+        mint_leaf_file(&conn, "a.go", "package a")?;
+        mint_leaf_file(&conn, "b.go", "package b")?;
+        mint_leaf_file(&conn, "c.go", "package c")?;
 
         let index = Arc::new(VectorIndex::new(4, None)?);
         let pass = EmbeddingPass::new(index.clone(), Arc::new(ZeroEmbedder { dim: 4 }));
@@ -661,6 +662,43 @@ mod tests {
         assert!(index.get("a.go")?.is_some());
         assert!(index.get("c.go")?.is_some());
         assert!(index.get("b.go")?.is_none());
+        Ok(())
+    }
+
+    /// An EMPTY changed-file list is not a scope: it falls through to the
+    /// full pass, exactly as `None` does. That is the direction of the
+    /// `Some(files) if !files.is_empty()` guard nothing observed before —
+    /// `embedding_pass_scope_limits_files` above only ever hands the guard a
+    /// NON-empty list, so a mutation replacing the guard with `true` was
+    /// invisible: it routes `Some(&[])` into the scoped arm, whose per-file
+    /// loop then iterates zero files and embeds nothing at all.
+    ///
+    /// The two tests together assert both branches, which is what the guard
+    /// needs — one of them alone leaves half of it unwitnessed.
+    #[test]
+    fn embedding_pass_empty_scope_runs_the_full_pass() -> Result<()> {
+        let conn = fresh_conn_with_nodes()?;
+        mint_leaf_file(&conn, "a.go", "package a")?;
+        mint_leaf_file(&conn, "b.go", "package b")?;
+        mint_leaf_file(&conn, "c.go", "package c")?;
+
+        let index = Arc::new(VectorIndex::new(4, None)?);
+        let pass = EmbeddingPass::new(index.clone(), Arc::new(ZeroEmbedder { dim: 4 }));
+        let empty: &[String] = &[];
+        let stats = pass.run(&conn, Path::new("/tmp"), Some(empty))?;
+
+        assert_eq!(
+            stats.files_processed, 3,
+            "an empty changed-file list must embed every file, as None does",
+        );
+        assert_eq!(stats.items_added, 3);
+        assert_eq!(index.len()?, 3);
+        for rel in ["a.go", "b.go", "c.go"] {
+            assert!(
+                index.get(rel)?.is_some(),
+                "{rel} must be embedded by the full pass",
+            );
+        }
         Ok(())
     }
 
@@ -764,34 +802,26 @@ mod tests {
         Ok(())
     }
 
-    /// Scale pin: scope filter is pushed into SQL, not in-memory. At
-    /// registry-repo scale a typical scope is 1-10 dirty files in a
-    /// 50k-node table; full-scanning then filtering would scan 50k
-    /// rows for 5. EXPLAIN QUERY PLAN must show SQLite using the
-    /// PRIMARY KEY index for the IN clause path.
+    /// Scale pin: the scope filter is pushed into SQL as per-file nid
+    /// RANGES (projection-v5), not an in-memory filter. At registry-repo
+    /// scale a typical scope is 1-10 dirty files in a 50k-node table;
+    /// full-scanning then filtering would scan 50k rows for 5. EXPLAIN
+    /// QUERY PLAN must show a PRIMARY KEY range SEARCH.
     #[test]
     fn embedding_pass_scope_uses_primary_key_index() -> Result<()> {
         let conn = fresh_conn_with_nodes()?;
         // 100 file rows so a full scan would clearly differ from index lookup.
         for i in 0..100 {
-            conn.execute(
-                "INSERT INTO nodes (id, name, kind, size, mtime, record) \
-                 VALUES (?1, ?2, 0, 1, 1, ?3)",
-                rusqlite::params![
-                    format!("f{i}.go"),
-                    format!("f{i}.go"),
-                    format!("package f{i}")
-                ],
-            )?;
+            mint_leaf_file(&conn, &format!("f{i}.go"), &format!("package f{i}"))?;
         }
 
-        // Run a scoped embed pass — internal SQL goes through the IN
-        // clause path. We can't introspect the internal SQL directly,
-        // but EXPLAIN QUERY PLAN on the equivalent query does:
+        // The scoped embed pass runs one range query per dirty file. We
+        // can't introspect the internal SQL directly, but EXPLAIN QUERY
+        // PLAN on the equivalent query does:
         let plan: String = conn.query_row(
-            "EXPLAIN QUERY PLAN SELECT id, record FROM nodes \
+            "EXPLAIN QUERY PLAN SELECT nid, record FROM nodes \
                  WHERE kind = 0 AND record IS NOT NULL AND record <> '' \
-                 AND id IN ('f1.go', 'f2.go')",
+                 AND nid BETWEEN 16777216 AND 33554431",
             [],
             |r| r.get::<_, String>(3),
         )?;
@@ -799,9 +829,14 @@ mod tests {
             plan.to_lowercase().contains("primary key")
                 || plan.contains("USING INTEGER PRIMARY KEY")
                 || plan.contains("USING INDEX")
-                || plan.contains("USING ROWID SEARCH"),
-            "scoped IN clause must use the PRIMARY KEY index on id, \
+                || plan.contains("USING ROWID SEARCH")
+                || plan.contains("SEARCH"),
+            "the scoped range must SEARCH the integer PRIMARY KEY, \
              not full-scan; plan: {plan}",
+        );
+        assert!(
+            !plan.contains("SCAN"),
+            "the scoped range must not SCAN; plan: {plan}",
         );
 
         // Sanity: scoped run still produces the right items.

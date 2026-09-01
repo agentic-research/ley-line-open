@@ -1506,7 +1506,11 @@ mod tests {
     fn writable_graph() -> SqliteGraphAdapter {
         use rusqlite::Connection;
         let source = Connection::open_in_memory().unwrap();
-        source.execute_batch(leyline_schema::NODES_DDL).unwrap();
+        // `create_schema`, not a bare table DDL batch: projection-v5 interns
+        // names and derives display names through the `v_node_name` view, so
+        // the nodes table on its own is no longer a schema the graph adapter
+        // can read — every path render fails with "no such table: v_node_name".
+        leyline_schema::create_schema(&source).unwrap();
         let data = source.serialize("main").unwrap();
         SqliteGraphAdapter::new_writable(data.as_ref()).unwrap()
     }

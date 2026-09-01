@@ -4,8 +4,9 @@
 //! AST-specific tables (`_source`, `_ast`) that enable bidirectional splicing.
 
 pub use leyline_schema::{
-    NODES_DDL, NODES_INDEXES_DDL, NODES_TABLE_DDL, create_nodes_indexes, create_nodes_table,
-    create_schema, insert_node,
+    NODES_INDEXES_DDL, NODES_TABLE_DDL, create_nodes_indexes, create_nodes_table, create_schema,
+    dir_nid, ensure_dir_nodes, ensure_file_id, file_nid, file_nid_range, insert_node, intern_kind,
+    intern_name, lookup_file_id, nid_file_id, nid_ordinal, node_path, resolve_path,
 };
 
 use anyhow::Result;
@@ -23,7 +24,12 @@ CREATE TABLE IF NOT EXISTS _source (
     language TEXT NOT NULL,
     content BLOB,
     path TEXT,
-    content_hash BLOB
+    content_hash BLOB,
+    -- projection-v5 (bead `ley-line-open-17c271`): the file's interned id in
+    -- `files`. `nid >> 24` of any node row lands here directly, so joining a
+    -- node to its source content is one integer equality instead of a path
+    -- render. UNIQUE: one _source row per interned file.
+    file_id INTEGER UNIQUE
 );";
 
 /// DDL for the `_ast` table — table only, no indexes. Pairs with
@@ -31,34 +37,42 @@ CREATE TABLE IF NOT EXISTS _source (
 /// `ley-line-open-9ccbc7`).
 pub const AST_TABLE_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS _ast (
-    node_id TEXT PRIMARY KEY,
-    source_id TEXT NOT NULL,
-    node_kind TEXT NOT NULL,
+    nid INTEGER PRIMARY KEY,
+    kind_id INTEGER NOT NULL,
     start_byte INTEGER NOT NULL,
     end_byte INTEGER NOT NULL,
     start_row INTEGER NOT NULL,
     start_col INTEGER NOT NULL,
     end_row INTEGER NOT NULL,
-    end_col INTEGER NOT NULL
+    end_col INTEGER NOT NULL,
+    node_hash BLOB REFERENCES node_content(node_hash)
 );";
 
 /// DDL for the `_ast` indexes — deferred post-COMMIT for bulk-load.
-pub const AST_INDEXES_DDL: &str = "CREATE INDEX IF NOT EXISTS idx_ast_source ON _ast(source_id);";
+///
+/// projection-v5 has NO `_ast` secondary index for file scoping: a file's
+/// rows are `nid BETWEEN (file_id<<24) AND (file_id<<24)|0xFFFFFF`, a
+/// PRIMARY KEY range SEARCH. The pre-v5 `idx_ast_source` existed to serve
+/// `WHERE source_id = ?`, which the nid range replaces outright (and the
+/// TEXT PK's `sqlite_autoindex__ast_1` — 830 MB measured — vanishes with
+/// the rowid-aliased INTEGER PK). `idx_ast_node_hash` still lands
+/// post-COMMIT via [`create_ir_indexes`].
+pub const AST_INDEXES_DDL: &str =
+    "-- no _ast secondary indexes in projection-v5 (PK range scan scopes by file)";
 
 /// Combined `_ast` table + index DDL. Preserves the pre-split contract.
 pub const AST_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS _ast (
-    node_id TEXT PRIMARY KEY,
-    source_id TEXT NOT NULL,
-    node_kind TEXT NOT NULL,
+    nid INTEGER PRIMARY KEY,
+    kind_id INTEGER NOT NULL,
     start_byte INTEGER NOT NULL,
     end_byte INTEGER NOT NULL,
     start_row INTEGER NOT NULL,
     start_col INTEGER NOT NULL,
     end_row INTEGER NOT NULL,
-    end_col INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_ast_source ON _ast(source_id);";
+    end_col INTEGER NOT NULL,
+    node_hash BLOB REFERENCES node_content(node_hash)
+);";
 
 /// Create `nodes`, `_source`, and `_ast` tables + indexes (idempotent).
 ///
@@ -68,6 +82,11 @@ CREATE INDEX IF NOT EXISTS idx_ast_source ON _ast(source_id);";
 pub fn create_ast_schema(conn: &Connection) -> Result<()> {
     create_schema(conn)?;
     conn.execute_batch(SOURCE_DDL)?;
+    // projection-v5: the occurrence tables carry a `node_hash REFERENCES
+    // node_content(node_hash)` FK in their base DDL, so the content tables
+    // must exist BEFORE any referencing table is written to.
+    conn.execute_batch(NODE_CONTENT_TABLE_DDL)?;
+    conn.execute_batch(NODE_CHILD_TABLE_DDL)?;
     conn.execute_batch(AST_DDL)?;
     Ok(())
 }
@@ -77,6 +96,9 @@ pub fn create_ast_schema(conn: &Connection) -> Result<()> {
 pub fn create_ast_tables(conn: &Connection) -> Result<()> {
     create_nodes_table(conn)?;
     conn.execute_batch(SOURCE_DDL)?;
+    // FK-target ordering — see `create_ast_schema`.
+    conn.execute_batch(NODE_CONTENT_TABLE_DDL)?;
+    conn.execute_batch(NODE_CHILD_TABLE_DDL)?;
     conn.execute_batch(AST_TABLE_DDL)?;
     Ok(())
 }
@@ -90,20 +112,32 @@ pub fn create_ast_indexes(conn: &Connection) -> Result<()> {
 }
 
 /// Insert or replace a source row with inline content (single-file API).
-pub fn insert_source(conn: &Connection, id: &str, language: &str, content: &[u8]) -> Result<()> {
+pub fn insert_source(
+    conn: &Connection,
+    id: &str,
+    language: &str,
+    content: &[u8],
+    file_id: i64,
+) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO _source (id, language, content) VALUES (?1, ?2, ?3)",
-        params![id, language, content],
+        "INSERT OR REPLACE INTO _source (id, language, content, file_id) VALUES (?1, ?2, ?3, ?4)",
+        params![id, language, content, file_id],
     )?;
     Ok(())
 }
 
 /// Insert or replace a source row with a file path reference (multi-file CLI).
 /// No content BLOB is stored — consumers read from disk via `path`.
-pub fn insert_source_ref(conn: &Connection, id: &str, language: &str, path: &str) -> Result<()> {
+pub fn insert_source_ref(
+    conn: &Connection,
+    id: &str,
+    language: &str,
+    path: &str,
+    file_id: i64,
+) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO _source (id, language, path) VALUES (?1, ?2, ?3)",
-        params![id, language, path],
+        "INSERT OR REPLACE INTO _source (id, language, path, file_id) VALUES (?1, ?2, ?3, ?4)",
+        params![id, language, path, file_id],
     )?;
     Ok(())
 }
@@ -112,34 +146,34 @@ pub fn insert_source_ref(conn: &Connection, id: &str, language: &str, path: &str
 #[allow(clippy::too_many_arguments)]
 pub fn insert_ast(
     conn: &Connection,
-    node_id: &str,
-    source_id: &str,
-    node_kind: &str,
+    nid: i64,
+    kind_id: i64,
     start_byte: usize,
     end_byte: usize,
     start_row: usize,
     start_col: usize,
     end_row: usize,
     end_col: usize,
+    node_hash: Option<&[u8]>,
 ) -> Result<()> {
     // rusqlite 0.39 dropped the blanket `ToSql for usize` — bind through
     // `i64` instead. Tree-sitter byte/row/col indices fit comfortably in
     // `i64` (well under 2^63 even for pathological source files), so the
     // cast is lossless.
     conn.execute(
-        "INSERT OR REPLACE INTO _ast (node_id, source_id, node_kind, start_byte, end_byte, \
-         start_row, start_col, end_row, end_col) \
+        "INSERT OR REPLACE INTO _ast (nid, kind_id, start_byte, end_byte, \
+         start_row, start_col, end_row, end_col, node_hash) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
-            node_id,
-            source_id,
-            node_kind,
+            nid,
+            kind_id,
             start_byte as i64,
             end_byte as i64,
             start_row as i64,
             start_col as i64,
             end_row as i64,
             end_col as i64,
+            node_hash,
         ],
     )?;
     Ok(())
@@ -174,22 +208,21 @@ pub fn insert_ast(
 pub const REFS_TABLE_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS node_refs (
     token TEXT NOT NULL,
-    node_id TEXT NOT NULL,
-    source_id TEXT NOT NULL,
-    container_node_id TEXT,
+    -- projection-v5 (bead `ley-line-open-17c271`): integer nid of the
+    -- referencing site. `nid >> 24` is the file, so per-file scoping is a
+    -- range predicate — the pre-v5 `source_id` column is gone. Injected
+    -- nodes (bead `ley-line-open-c822a6`) occupy ordinals PAST their host
+    -- file's `_ast` count: real nids in the file's range with no `_ast` or
+    -- `nodes` row, exactly as their path-shaped ids had no rows before.
+    nid INTEGER NOT NULL,
+    container_nid INTEGER,
     -- ADR-0026-adjacent denormalisation (bead `ley-line-open-b4509b`): the
     -- occurrence's own source span and grammar kind, so resolving a
-    -- definition or a caller does not JOIN `_ast`. That join is why the
-    -- 3.15M-row `_ast` table has to be materialised eagerly for a 337k-row
-    -- answer; SCIP carries the range inline on the occurrence for the same
-    -- reason. Same shape as `canonical_kind` below, which already lives here
-    -- to avoid a JOIN through `node_content.kind`.
+    -- definition or a caller does not JOIN `_ast`. SCIP carries the range
+    -- inline on the occurrence for the same reason.
     --
-    -- NULLABLE, and NULL is meaningful: injected nodes (bead
-    -- `ley-line-open-c822a6`) have no `_ast` row, so they had no span under
-    -- the old LEFT JOIN either. Preserving NULL keeps their behaviour
-    -- byte-identical rather than inventing coordinates in the host file's
-    -- space.
+    -- NULLABLE, and NULL is meaningful: injected nodes have no `_ast` row,
+    -- so they had no span under the old LEFT JOIN either.
     node_kind TEXT,
     start_byte INTEGER,
     end_byte INTEGER,
@@ -197,38 +230,27 @@ CREATE TABLE IF NOT EXISTS node_refs (
     start_col INTEGER,
     end_row INTEGER,
     end_col INTEGER,
-    qualifier TEXT
+    qualifier TEXT,
+    node_hash BLOB REFERENCES node_content(node_hash)
 );";
 
 /// DDL for the `node_refs` indexes — deferred post-COMMIT.
 ///
-/// `idx_refs_container` accelerates `GROUP BY container_node_id` —
-/// mache's fan_out_skew query is a per-container aggregate over v_refs.
+/// `idx_refs_container` accelerates `GROUP BY container_nid` — mache's
+/// fan_out_skew query is a per-container aggregate over v_refs.
+/// `idx_refs_node` also serves the per-file delete: `WHERE nid BETWEEN ?1
+/// AND ?2` is a range SEARCH on it.
 pub const REFS_INDEXES_DDL: &str = "\
 CREATE INDEX IF NOT EXISTS idx_refs_token ON node_refs(token);
-CREATE INDEX IF NOT EXISTS idx_refs_node ON node_refs(node_id);
-CREATE INDEX IF NOT EXISTS idx_refs_container ON node_refs(container_node_id) WHERE container_node_id IS NOT NULL;";
+CREATE INDEX IF NOT EXISTS idx_refs_node ON node_refs(nid);
+CREATE INDEX IF NOT EXISTS idx_refs_container ON node_refs(container_nid) WHERE container_nid IS NOT NULL;";
 
 /// Combined `node_refs` table + index DDL.
 pub const REFS_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS node_refs (
     token TEXT NOT NULL,
-    node_id TEXT NOT NULL,
-    source_id TEXT NOT NULL,
-    container_node_id TEXT,
-    -- ADR-0026-adjacent denormalisation (bead `ley-line-open-b4509b`): the
-    -- occurrence's own source span and grammar kind, so resolving a
-    -- definition or a caller does not JOIN `_ast`. That join is why the
-    -- 3.15M-row `_ast` table has to be materialised eagerly for a 337k-row
-    -- answer; SCIP carries the range inline on the occurrence for the same
-    -- reason. Same shape as `canonical_kind` below, which already lives here
-    -- to avoid a JOIN through `node_content.kind`.
-    --
-    -- NULLABLE, and NULL is meaningful: injected nodes (bead
-    -- `ley-line-open-c822a6`) have no `_ast` row, so they had no span under
-    -- the old LEFT JOIN either. Preserving NULL keeps their behaviour
-    -- byte-identical rather than inventing coordinates in the host file's
-    -- space.
+    nid INTEGER NOT NULL,
+    container_nid INTEGER,
     node_kind TEXT,
     start_byte INTEGER,
     end_byte INTEGER,
@@ -236,11 +258,12 @@ CREATE TABLE IF NOT EXISTS node_refs (
     start_col INTEGER,
     end_row INTEGER,
     end_col INTEGER,
-    qualifier TEXT
+    qualifier TEXT,
+    node_hash BLOB REFERENCES node_content(node_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_refs_token ON node_refs(token);
-CREATE INDEX IF NOT EXISTS idx_refs_node ON node_refs(node_id);
-CREATE INDEX IF NOT EXISTS idx_refs_container ON node_refs(container_node_id) WHERE container_node_id IS NOT NULL;";
+CREATE INDEX IF NOT EXISTS idx_refs_node ON node_refs(nid);
+CREATE INDEX IF NOT EXISTS idx_refs_container ON node_refs(container_nid) WHERE container_nid IS NOT NULL;";
 
 /// DDL for the `node_defs` table — table only, no indexes.
 ///
@@ -261,22 +284,17 @@ CREATE INDEX IF NOT EXISTS idx_refs_container ON node_refs(container_node_id) WH
 pub const DEFS_TABLE_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS node_defs (
     token TEXT NOT NULL,
-    node_id TEXT NOT NULL,
-    source_id TEXT NOT NULL,
-    container_node_id TEXT,
+    -- projection-v5: integer nid of the defining site; see `REFS_TABLE_DDL`
+    -- for the scheme (file scoping by range, injected-node ordinals).
+    nid INTEGER NOT NULL,
+    container_nid INTEGER,
     -- ADR-0026-adjacent denormalisation (bead `ley-line-open-b4509b`): the
     -- occurrence's own source span and grammar kind, so resolving a
-    -- definition or a caller does not JOIN `_ast`. That join is why the
-    -- 3.15M-row `_ast` table has to be materialised eagerly for a 337k-row
-    -- answer; SCIP carries the range inline on the occurrence for the same
-    -- reason. Same shape as `canonical_kind` below, which already lives here
-    -- to avoid a JOIN through `node_content.kind`.
+    -- definition or a caller does not JOIN `_ast`. SCIP carries the range
+    -- inline on the occurrence for the same reason.
     --
-    -- NULLABLE, and NULL is meaningful: injected nodes (bead
-    -- `ley-line-open-c822a6`) have no `_ast` row, so they had no span under
-    -- the old LEFT JOIN either. Preserving NULL keeps their behaviour
-    -- byte-identical rather than inventing coordinates in the host file's
-    -- space.
+    -- NULLABLE, and NULL is meaningful: injected nodes have no `_ast` row,
+    -- so they had no span under the old LEFT JOIN either.
     node_kind TEXT,
     start_byte INTEGER,
     end_byte INTEGER,
@@ -284,7 +302,8 @@ CREATE TABLE IF NOT EXISTS node_defs (
     start_col INTEGER,
     end_row INTEGER,
     end_col INTEGER,
-    canonical_kind TEXT
+    canonical_kind TEXT,
+    node_hash BLOB REFERENCES node_content(node_hash)
 );";
 
 /// DDL for the `node_defs` indexes — deferred post-COMMIT.
@@ -294,29 +313,16 @@ CREATE TABLE IF NOT EXISTS node_defs (
 /// bearing dead-code/god-file query on the LLO projection.
 pub const DEFS_INDEXES_DDL: &str = "\
 CREATE INDEX IF NOT EXISTS idx_defs_token ON node_defs(token);
-CREATE INDEX IF NOT EXISTS idx_defs_container ON node_defs(container_node_id) WHERE container_node_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_defs_node ON node_defs(nid);
+CREATE INDEX IF NOT EXISTS idx_defs_container ON node_defs(container_nid) WHERE container_nid IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_defs_canonical_kind ON node_defs(canonical_kind) WHERE canonical_kind IS NOT NULL;";
 
 /// Combined `node_defs` table + index DDL.
 pub const DEFS_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS node_defs (
     token TEXT NOT NULL,
-    node_id TEXT NOT NULL,
-    source_id TEXT NOT NULL,
-    container_node_id TEXT,
-    -- ADR-0026-adjacent denormalisation (bead `ley-line-open-b4509b`): the
-    -- occurrence's own source span and grammar kind, so resolving a
-    -- definition or a caller does not JOIN `_ast`. That join is why the
-    -- 3.15M-row `_ast` table has to be materialised eagerly for a 337k-row
-    -- answer; SCIP carries the range inline on the occurrence for the same
-    -- reason. Same shape as `canonical_kind` below, which already lives here
-    -- to avoid a JOIN through `node_content.kind`.
-    --
-    -- NULLABLE, and NULL is meaningful: injected nodes (bead
-    -- `ley-line-open-c822a6`) have no `_ast` row, so they had no span under
-    -- the old LEFT JOIN either. Preserving NULL keeps their behaviour
-    -- byte-identical rather than inventing coordinates in the host file's
-    -- space.
+    nid INTEGER NOT NULL,
+    container_nid INTEGER,
     node_kind TEXT,
     start_byte INTEGER,
     end_byte INTEGER,
@@ -324,10 +330,12 @@ CREATE TABLE IF NOT EXISTS node_defs (
     start_col INTEGER,
     end_row INTEGER,
     end_col INTEGER,
-    canonical_kind TEXT
+    canonical_kind TEXT,
+    node_hash BLOB REFERENCES node_content(node_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_defs_token ON node_defs(token);
-CREATE INDEX IF NOT EXISTS idx_defs_container ON node_defs(container_node_id) WHERE container_node_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_defs_node ON node_defs(nid);
+CREATE INDEX IF NOT EXISTS idx_defs_container ON node_defs(container_nid) WHERE container_nid IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_defs_canonical_kind ON node_defs(canonical_kind) WHERE canonical_kind IS NOT NULL;";
 
 /// DDL for the `_imports` table — table only, no indexes.
@@ -407,39 +415,19 @@ CREATE TABLE IF NOT EXISTS node_child (
 pub const AST_NODE_HASH_INDEX_DDL: &str =
     "CREATE INDEX IF NOT EXISTS idx_ast_node_hash ON _ast(node_hash);";
 
-/// True when `table` already has `column`. SQLite has no
-/// `ADD COLUMN IF NOT EXISTS`, so the additive migrations probe
-/// `pragma_table_info` and only ALTER when the column is absent — which is
-/// what makes them idempotent across incremental reparses.
-fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
-    let n: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
-        [table, column],
-        |r| r.get(0),
-    )?;
-    Ok(n > 0)
-}
-
-/// Create the merkle-AST IR tables (`node_content`, `node_child`) and
-/// additively stamp a `node_hash` column onto the occurrence tables
-/// (`_ast`, `node_defs`, `node_refs`) that already exist. Idempotent: the
-/// `node_hash` ALTERs are gated on [`has_column`].
+/// Create the merkle-AST IR tables (`node_content`, `node_child`).
+/// Idempotent.
 ///
-/// Must be called AFTER `create_ast_tables` + `create_refs_tables` (the
-/// ALTER targets must exist) and BEFORE the insert transaction. The
-/// `node_hash` columns carry a `REFERENCES node_content(node_hash)` FK, so
-/// with `PRAGMA foreign_keys = ON` at write time a `node_hash` pointer that
-/// doesn't resolve to a real content row is a loud insert error.
+/// The occurrence tables' `node_hash` columns carry a
+/// `REFERENCES node_content(node_hash)` FK, so with `PRAGMA foreign_keys =
+/// ON` at write time a `node_hash` pointer that doesn't resolve to a real
+/// content row is a loud insert error.
 pub fn create_ir_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(NODE_CONTENT_TABLE_DDL)?;
     conn.execute_batch(NODE_CHILD_TABLE_DDL)?;
-    for table in ["_ast", "node_defs", "node_refs"] {
-        if !has_column(conn, table, "node_hash")? {
-            conn.execute_batch(&format!(
-                "ALTER TABLE {table} ADD COLUMN node_hash BLOB REFERENCES node_content(node_hash);"
-            ))?;
-        }
-    }
+    // projection-v5: `node_hash` sits in the base DDL of `_ast`,
+    // `node_defs`, and `node_refs` — the pre-v5 additive ALTERs are gone
+    // (a pre-v5 arena is refused at open, not migrated).
     Ok(())
 }
 
@@ -497,14 +485,13 @@ pub fn create_refs_indexes(conn: &Connection) -> Result<()> {
 pub fn insert_ref(
     conn: &Connection,
     token: &str,
-    node_id: &str,
-    source_id: &str,
-    container_node_id: Option<&str>,
+    nid: i64,
+    container_nid: Option<i64>,
     qualifier: Option<&str>,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO node_refs (token, node_id, source_id, container_node_id, qualifier) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![token, node_id, source_id, container_node_id, qualifier],
+        "INSERT INTO node_refs (token, nid, container_nid, qualifier) VALUES (?1, ?2, ?3, ?4)",
+        params![token, nid, container_nid, qualifier],
     )?;
     Ok(())
 }
@@ -524,132 +511,24 @@ pub fn insert_ref(
 pub fn insert_def(
     conn: &Connection,
     token: &str,
-    node_id: &str,
-    source_id: &str,
-    container_node_id: Option<&str>,
+    nid: i64,
+    container_nid: Option<i64>,
     canonical_kind: Option<&str>,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO node_defs (token, node_id, source_id, container_node_id, canonical_kind) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![token, node_id, source_id, container_node_id, canonical_kind],
+        "INSERT INTO node_defs (token, nid, container_nid, canonical_kind) VALUES (?1, ?2, ?3, ?4)",
+        params![token, nid, container_nid, canonical_kind],
     )?;
     Ok(())
 }
 
-/// True when `table` has a `container_node_id` column. Same pattern as
-/// `has_column` — SQLite has no `ADD COLUMN IF NOT EXISTS`,
-/// so the additive migration probes `pragma_table_info` and only ALTERs
-/// when the column is absent. Bead `ley-line-open-6e798d`.
-fn has_container_node_id_column(conn: &Connection, table: &str) -> Result<bool> {
-    let n: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = 'container_node_id'",
-        [table],
-        |r| r.get(0),
-    )?;
-    Ok(n > 0)
-}
-
-/// True when `table` has a `canonical_kind` column. Same additive-
-/// migration pattern as `has_container_node_id_column` — cross-repo
-/// mache-parity follow-up to `ley-line-open-6e798d`.
-fn has_canonical_kind_column(conn: &Connection, table: &str) -> Result<bool> {
-    let n: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = 'canonical_kind'",
-        [table],
-        |r| r.get(0),
-    )?;
-    Ok(n > 0)
-}
-
-/// Additively stamp a `canonical_kind TEXT` column onto `node_defs`
-/// when it's absent — idempotent. Fresh DBs created via `DEFS_DDL`
-/// already have the column; this migration only fires on legacy
-/// pre-canonical-kind shapes.
-pub fn create_canonical_kind_column(conn: &Connection) -> Result<()> {
-    if !has_canonical_kind_column(conn, "node_defs")? {
-        conn.execute_batch("ALTER TABLE node_defs ADD COLUMN canonical_kind TEXT;")?;
-    }
-    Ok(())
-}
-
-/// Additively stamp a `container_node_id TEXT` column onto `node_refs`
-/// and `node_defs` when it's absent — idempotent, safe on repeat call
-/// against a v0.7.4+ DB (bead `ley-line-open-6e798d`) and safe on a
-/// legacy pre-6e798d DB (adds the column with NULLs on existing rows).
-///
-/// Must be called AFTER `create_refs_tables` (the ALTER targets must
-/// exist). Fresh DBs created via `REFS_DDL` / `DEFS_DDL` already have
-/// the column; this migration only fires on legacy shapes.
-pub fn create_container_id_columns(conn: &Connection) -> Result<()> {
-    for table in ["node_refs", "node_defs"] {
-        if !has_container_node_id_column(conn, table)? {
-            conn.execute_batch(&format!(
-                "ALTER TABLE {table} ADD COLUMN container_node_id TEXT;"
-            ))?;
-        }
-    }
-    Ok(())
-}
-
-/// True when `table` has a `qualifier` column. Same additive-migration
-/// pattern as `has_container_node_id_column`. Bead `ley-line-open-4dde42`.
-fn has_qualifier_column(conn: &Connection, table: &str) -> Result<bool> {
-    let n: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = 'qualifier'",
-        [table],
-        |r| r.get(0),
-    )?;
-    Ok(n > 0)
-}
-
-/// Additively stamp a `qualifier TEXT` column onto `node_refs` when it's
-/// absent — idempotent. Fresh DBs created via `REFS_DDL` already have the
-/// column; this migration fires on legacy (≤ v0.7.8) shapes. Wired into
-/// `cmd_parse` schema setup: the extraction-epoch bump (3→4) forces those
-/// arenas to re-derive facts, and the re-derive INSERT names the column,
-/// so the ALTER must run before the insert transaction. `node_refs` only
-/// — defs keep their qualified form in the token dual-emit (bead
-/// `ley-line-open-4dde42` is scoped to refs).
-pub fn create_qualifier_column(conn: &Connection) -> Result<()> {
-    if !has_qualifier_column(conn, "node_refs")? {
-        conn.execute_batch("ALTER TABLE node_refs ADD COLUMN qualifier TEXT;")?;
-    }
-    Ok(())
-}
-
-/// Additively stamp the occurrence span columns onto `node_defs` / `node_refs`
-/// when absent — idempotent.
-///
-/// Fresh DBs get them from `REFS_DDL` / `DEFS_DDL`; this fires on any arena
-/// created before `projection-v3`. Same discipline, and same ordering
-/// requirement, as [`create_qualifier_column`]: `CREATE TABLE IF NOT EXISTS`
-/// is a no-op on an existing table, so without this an older arena keeps the
-/// narrow shape and the reparse INSERT — which names these columns — fails
-/// with "table node_refs has no column named node_kind". The ALTER therefore
-/// has to run before the insert transaction opens.
-///
-/// The columns are left NULL for rows already present. They are refilled for
-/// every row the reparse rewrites, and a NULL span already means "no `_ast`
-/// row" to every reader, so a partially-migrated arena degrades to the
-/// pre-v3 answer rather than to a wrong one.
-pub fn create_occurrence_span_columns(conn: &Connection) -> Result<()> {
-    for table in ["node_defs", "node_refs"] {
-        for (col, ty) in [
-            ("node_kind", "TEXT"),
-            ("start_byte", "INTEGER"),
-            ("end_byte", "INTEGER"),
-            ("start_row", "INTEGER"),
-            ("start_col", "INTEGER"),
-            ("end_row", "INTEGER"),
-            ("end_col", "INTEGER"),
-        ] {
-            if !has_column(conn, table, col)? {
-                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col} {ty};"))?;
-            }
-        }
-    }
-    Ok(())
-}
+// The pre-v5 additive-ALTER migrations (`create_canonical_kind_column`,
+// `create_container_id_columns`, `create_qualifier_column`,
+// `create_occurrence_span_columns`) are gone: projection-v5 re-keys the
+// occurrence tables outright, every column they stamped is in the base DDL,
+// and a pre-v5 arena is refused at open (`_meta.projection_schema_version`
+// mismatch) rather than migrated — the projection is derived-only, so a
+// stale arena is rebuilt by a cold reparse, never patched in place.
 
 /// Insert an import row.
 pub fn insert_import(conn: &Connection, alias: &str, path: &str, source_id: &str) -> Result<()> {
@@ -698,33 +577,31 @@ CREATE TABLE IF NOT EXISTS capnp_blobs (
 /// ~294 bytes per row to address a record of ~370 — the pointer was 80% the
 /// size of its referent — costing 927 MB plus an 830 MB shadow index for a
 /// mapping that is `blob(file)` plus an ordinal. Both survive here: the file
-/// keys this table, and the ordinal moves onto `_ast.blob_ord` (one small
-/// integer per row, ~6 MB) where the row it describes already lives.
+/// keys this table (by its interned `file_id` as of projection-v5), and the
+/// ordinal is the nid's low 24 bits — a node's index into its file's
+/// `AstNodeList.nodes` IS `nid & 0xFFFFFF`, stored nowhere.
 ///
 /// The ADR-0026 §6.F1 resolution capability is unchanged: any `_ast` row
-/// still resolves to its capnp record, via `source_id -> blob_hash` here and
-/// `blob_ord` as the index into that blob's `AstNodeList.nodes`.
+/// still resolves to its capnp record, via `nid >> 24 → blob_hash` here and
+/// `nid & 0xFFFFFF` as the index into that blob's `AstNodeList.nodes`.
 ///
 /// Bead `ley-line-open-17c271`.
 pub const AST_BLOB_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS _ast_blob (
-    source_id TEXT PRIMARY KEY,
+    file_id INTEGER PRIMARY KEY,
     blob_hash BLOB NOT NULL
 );";
 
 /// Create the pointer-store tables (idempotent). Must run alongside the
 /// existing row-projected schema; Phase 1 is dual-write.
 ///
-/// `_ast.blob_ord` is added by ALTER rather than sitting in `AST_TABLE_DDL`
-/// because it belongs to the pointer store, not to the row projection —
-/// same reasoning as the `node_hash` column in [`create_ir_tables`], and it
-/// keeps `_ast` correct for callers that never enable the pointer store.
+/// projection-v5 folds the pre-v5 `_ast.blob_ord` column into the key
+/// itself: a node's index into its file's `AstNodeList.nodes` IS its
+/// pre-order ordinal, i.e. `nid & 0xFFFFFF`. One dense `0..n-1` per file,
+/// defined once, stored nowhere.
 pub fn create_pointer_store_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(CAPNP_BLOBS_DDL)?;
     conn.execute_batch(AST_BLOB_DDL)?;
-    if !has_column(conn, "_ast", "blob_ord")? {
-        conn.execute_batch("ALTER TABLE _ast ADD COLUMN blob_ord INTEGER;")?;
-    }
     Ok(())
 }
 
@@ -1023,9 +900,13 @@ pub fn create_post_load_indexes(conn: &Connection) -> Result<()> {
 ///
 /// See bead `ley-line-open-cbbedf` Attack 3.
 pub fn create_post_load_indexes_skip_unused(conn: &Connection) -> Result<()> {
-    // Just `idx_parent_name` from the nodes-indexes pair — the second
-    // (`idx_source_file`) is the unused one we're skipping.
-    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_parent_name ON nodes(parent_id, name);")?;
+    // Just `idx_parent_kind_ord` from the nodes-indexes pair — the second
+    // (`idx_source_file`) is the unused one we're skipping. The display
+    // views land here too (post-COMMIT, zero insert-phase cost).
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_parent_kind_ord ON nodes(parent_nid, kind_id, ord);",
+    )?;
+    conn.execute_batch(leyline_schema::V_NODE_PATH_DDL)?;
     conn.execute_batch(AST_INDEXES_DDL)?;
     create_refs_indexes(conn)?;
     Ok(())
@@ -1093,33 +974,49 @@ pub fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
 /// accumulate at registry-repo scale across file churn). If LSP has
 /// never run, the tables don't exist and we skip.
 pub fn delete_file_rows(conn: &Connection, path: &str) -> Result<()> {
-    conn.execute(
-        "DELETE FROM nodes WHERE id = ?1 OR id LIKE ?1 || '/%'",
-        [path],
-    )?;
-    conn.execute("DELETE FROM _ast WHERE source_id = ?1", [path])?;
+    // projection-v5: node-level rows are scoped by the file's nid range — a
+    // PRIMARY KEY (or `nid`-index) range SEARCH, replacing the pre-v5
+    // prefix-LIKE that planned as a SCAN and could over-match on an
+    // unanchored prefix. A path the arena never interned owns no node rows,
+    // so only the file-level TEXT-keyed tables need touching in that case.
+    if let Some(file_id) = leyline_schema::lookup_file_id(conn, path)? {
+        let (lo, hi) = leyline_schema::file_nid_range(file_id);
+        conn.execute(
+            "DELETE FROM nodes WHERE nid BETWEEN ?1 AND ?2",
+            params![lo, hi],
+        )?;
+        conn.execute(
+            "DELETE FROM _ast WHERE nid BETWEEN ?1 AND ?2",
+            params![lo, hi],
+        )?;
+        conn.execute(
+            "DELETE FROM node_refs WHERE nid BETWEEN ?1 AND ?2",
+            params![lo, hi],
+        )?;
+        conn.execute(
+            "DELETE FROM node_defs WHERE nid BETWEEN ?1 AND ?2",
+            params![lo, hi],
+        )?;
+        // ADR-0026 pointer store (Phase 1 dual-write, bead
+        // `ley-line-open-3e87ad`). Skip cleanly when the tables don't exist —
+        // the pointer store is additive.
+        if pointer_store_present(conn) {
+            conn.execute("DELETE FROM _ast_blob WHERE file_id = ?1", [file_id])?;
+            // capnp_blobs is keyed on blob_hash (content-addressed). Orphaned
+            // blobs are ignored here — a Phase 2/3 GC sweep collects blobs no
+            // `_ast_blob` row references; reparse recreates via INSERT OR
+            // IGNORE, so nothing accumulates per file.
+        }
+        delete_lsp_rows_for_file(conn, lo, hi)?;
+        // The `files` interning row is deliberately NOT deleted: file_id
+        // assignment is append-only, so a re-created path re-binds to its
+        // old id and a dead id is never reused by an unrelated file.
+    }
     conn.execute("DELETE FROM _source WHERE id = ?1", [path])?;
-    conn.execute("DELETE FROM node_refs WHERE source_id = ?1", [path])?;
-    conn.execute("DELETE FROM node_defs WHERE source_id = ?1", [path])?;
     conn.execute("DELETE FROM _imports WHERE source_id = ?1", [path])?;
     conn.execute("DELETE FROM _file_index WHERE path = ?1", [path])?;
-    // ADR-0026 pointer store (Phase 1 dual-write, bead `ley-line-open-3e87ad`).
-    // Skip cleanly when the tables don't exist — the pointer store is additive
-    // and older databases may predate its creation.
-    if pointer_store_present(conn) {
-        conn.execute("DELETE FROM _ast_blob WHERE source_id = ?1", [path])?;
-        // capnp_blobs is keyed on blob_hash (content-addressed), not source_id.
-        // Orphaned blobs are ignored here — a Phase 2/3 GC sweep collects blobs
-        // no `_ast_blob` row references. Phase 1 dual-write recreates the
-        // blob row on reparse via `INSERT OR IGNORE`, so nothing accumulates
-        // per file (blobs dedup on identical file content).
-    }
     // ADR-0028 source_blobs (Phase 1 dual-store, bead `ley-line-open-9e4416`).
-    // Content-addressed, not source_id-keyed — same orphan discipline as
-    // capnp_blobs. `_source` is deleted above; source_blobs rows the deleted
-    // `_source.content_hash` pointed at may become orphaned but are cheap to
-    // leave (INSERT OR IGNORE dedups on reparse). Phase 2/3 GC collects orphans.
-    delete_lsp_rows_for_path(conn, path)?;
+    // Content-addressed — same orphan discipline as capnp_blobs.
     Ok(())
 }
 
@@ -1137,16 +1034,20 @@ fn pointer_store_present(conn: &Connection) -> bool {
     .unwrap_or(false)
 }
 
-/// Delete `_lsp*` rows whose `node_id` is in the deleted file's path
-/// namespace. Tables created by leyline-lsp's `create_lsp_schema` are
-/// optional; we discover their presence via `sqlite_master` and skip
-/// missing ones so callers that never enabled LSP enrichment pay
-/// nothing.
+/// Delete `_lsp*` rows in the deleted file's nid range. Tables created by
+/// leyline-lsp's `create_lsp_schema` are optional; we discover their
+/// presence via `sqlite_master` and skip missing ones so callers that never
+/// enabled LSP enrichment pay nothing.
+///
+/// projection-v5: the `_lsp*` tables carry NO file column — file scoping
+/// was prefix-LIKE on the path-shaped `node_id` and is now a range
+/// predicate on the integer `nid`, with no new column (bead
+/// `ley-line-open-17c271`).
 ///
 /// Without this cleanup, `_lsp*` rows accumulate at registry scale as
 /// files churn — every file deleted+reparsed leaves the prior LSP
-/// enrichment as orphans keyed by node_ids that no longer resolve.
-fn delete_lsp_rows_for_path(conn: &Connection, path: &str) -> Result<()> {
+/// enrichment as orphans keyed by nids that no longer resolve.
+fn delete_lsp_rows_for_file(conn: &Connection, lo: i64, hi: i64) -> Result<()> {
     // Feature-gated tables — skip cleanly when absent.
     const LSP_TABLES: &[&str] = &[
         "_lsp",
@@ -1166,23 +1067,23 @@ fn delete_lsp_rows_for_path(conn: &Connection, path: &str) -> Result<()> {
         if !exists {
             continue;
         }
-        // Both equal-match and prefix-match: the file's "root" node_id
-        // (the path itself) AND every descendant
-        // (`<path>/<ast_path>`).
-        let sql = format!("DELETE FROM {table} WHERE node_id = ?1 OR node_id LIKE ?1 || '/%'",);
-        conn.execute(&sql, [path])?;
+        let sql = format!("DELETE FROM {table} WHERE nid BETWEEN ?1 AND ?2");
+        conn.execute(&sql, params![lo, hi])?;
     }
     Ok(())
 }
 
-/// Remove directory nodes (kind = 1) that have no children, iterating until
-/// no more orphans remain. Returns the total number of rows removed.
+/// Remove directory nodes (negative nids) that have no remaining children,
+/// iterating until no more orphans remain. Returns the total number of rows
+/// removed. The `dirs` interning rows stay — like `files`, the dir-id
+/// assignment is append-only; this sweeps only the presentation rows in
+/// `nodes`.
 pub fn sweep_orphaned_dirs(conn: &Connection) -> Result<usize> {
     let mut total = 0;
     loop {
         let removed = conn.execute(
-            "DELETE FROM nodes WHERE kind = 1 AND id != '' \
-             AND id NOT IN (SELECT DISTINCT parent_id FROM nodes WHERE parent_id IS NOT NULL AND parent_id != '')",
+            "DELETE FROM nodes WHERE nid < -1 \
+             AND nid NOT IN (SELECT DISTINCT parent_nid FROM nodes WHERE parent_nid IS NOT NULL)",
             [],
         )?;
         if removed == 0 {
@@ -1203,24 +1104,9 @@ mod tests {
         create_ast_schema(&conn).unwrap();
         create_refs_schema(&conn).unwrap();
 
-        insert_ref(
-            &conn,
-            "Println",
-            "main.go/call_expression",
-            "main.go",
-            None,
-            None,
-        )
-        .unwrap();
-        insert_def(
-            &conn,
-            "Add",
-            "main.go/function_declaration",
-            "main.go",
-            None,
-            None,
-        )
-        .unwrap();
+        let file_id = ensure_file_id(&conn, "main.go").unwrap();
+        insert_ref(&conn, "Println", file_nid(file_id, 3), None, None).unwrap();
+        insert_def(&conn, "Add", file_nid(file_id, 1), None, None).unwrap();
         insert_import(&conn, "fmt", "fmt", "main.go").unwrap();
 
         let ref_count: i64 = conn
@@ -1343,6 +1229,51 @@ mod tests {
         );
     }
 
+    /// Mint a minimal two-row file (file node + one leaf) plus a ref and a
+    /// def, the v5 way. Returns the file's nid range.
+    fn mint_file(conn: &Connection, rel: &str, token: &str) -> (i64, i64) {
+        let file_id = ensure_file_id(conn, rel).unwrap();
+        let dir_id = ensure_dir_nodes(conn, rel, 1).unwrap();
+        let base = file_nid(file_id, 0);
+        let name = rel.rsplit_once('/').map(|(_, n)| n).unwrap_or(rel);
+        let name_id = intern_name(conn, name).unwrap();
+        let k_root = intern_kind(conn, "go", "source_file").unwrap();
+        let k_fn = intern_kind(conn, "go", "function_declaration").unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO nodes (nid, parent_nid, name_id, kind_id, kind, ord, mtime, record) \
+             VALUES (?1, ?2, ?3, ?4, 1, 0, 1, '')",
+            params![base, dir_nid(dir_id), name_id, k_root],
+        )
+        .unwrap();
+        insert_node(
+            conn,
+            base + 1,
+            Some(base),
+            None,
+            Some(k_fn),
+            0,
+            0,
+            4,
+            1,
+            "body",
+        )
+        .unwrap();
+        insert_source(conn, rel, "go", b"package x", file_id).unwrap();
+        insert_ref(conn, token, base + 1, None, None).unwrap();
+        insert_def(conn, token, base + 1, None, None).unwrap();
+        upsert_file_index(conn, rel, 100, 50).unwrap();
+        file_nid_range(file_id)
+    }
+
+    fn rows_in_range(conn: &Connection, table: &str, key: &str, lo: i64, hi: i64) -> i64 {
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE {key} BETWEEN ?1 AND ?2"),
+            params![lo, hi],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn delete_file_rows_cleans_all_tables() {
         let conn = Connection::open_in_memory().unwrap();
@@ -1351,45 +1282,21 @@ mod tests {
         create_index_schema(&conn).unwrap();
 
         // Two files
-        insert_node(&conn, "", "", 1, 0, 0, "").unwrap();
-        insert_node(&conn, "a.go", "a.go", 1, 0, 0, "").unwrap();
-        insert_node(&conn, "a.go/func", "func", 0, 10, 0, "body").unwrap();
-        insert_node(&conn, "b.go", "b.go", 1, 0, 0, "").unwrap();
-        insert_node(&conn, "b.go/func", "func", 0, 10, 0, "body").unwrap();
-        insert_source(&conn, "a.go", "go", b"package a").unwrap();
-        insert_source(&conn, "b.go", "go", b"package b").unwrap();
-        insert_ref(&conn, "Foo", "a.go/call", "a.go", None, None).unwrap();
-        insert_ref(&conn, "Bar", "b.go/call", "b.go", None, None).unwrap();
-        insert_def(&conn, "Foo", "a.go/func", "a.go", None, None).unwrap();
-        insert_def(&conn, "Bar", "b.go/func", "b.go", None, None).unwrap();
-        upsert_file_index(&conn, "a.go", 100, 50).unwrap();
-        upsert_file_index(&conn, "b.go", 200, 60).unwrap();
+        let (a_lo, a_hi) = mint_file(&conn, "a.go", "Foo");
+        let (b_lo, b_hi) = mint_file(&conn, "b.go", "Bar");
 
         delete_file_rows(&conn, "a.go").unwrap();
 
         // a.go gone
-        let a_nodes: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM nodes WHERE id = 'a.go' OR id LIKE 'a.go/%'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(a_nodes, 0);
+        assert_eq!(rows_in_range(&conn, "nodes", "nid", a_lo, a_hi), 0);
+        assert_eq!(rows_in_range(&conn, "node_refs", "nid", a_lo, a_hi), 0);
+        assert_eq!(rows_in_range(&conn, "node_defs", "nid", a_lo, a_hi), 0);
         let a_source: i64 = conn
             .query_row("SELECT COUNT(*) FROM _source WHERE id = 'a.go'", [], |r| {
                 r.get(0)
             })
             .unwrap();
         assert_eq!(a_source, 0);
-        let a_refs: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM node_refs WHERE source_id = 'a.go'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(a_refs, 0);
         let a_index: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM _file_index WHERE path = 'a.go'",
@@ -1400,22 +1307,12 @@ mod tests {
         assert_eq!(a_index, 0);
 
         // b.go intact
-        let b_nodes: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM nodes WHERE id = 'b.go' OR id LIKE 'b.go/%'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(b_nodes >= 2);
-        let b_refs: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM node_refs WHERE source_id = 'b.go'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(b_refs, 1);
+        assert_eq!(rows_in_range(&conn, "nodes", "nid", b_lo, b_hi), 2);
+        assert_eq!(rows_in_range(&conn, "node_refs", "nid", b_lo, b_hi), 1);
+
+        // The interning row survives deletion: a re-created a.go re-binds to
+        // its old file_id (append-only assignment, no id reuse).
+        assert!(lookup_file_id(&conn, "a.go").unwrap().is_some());
     }
 
     #[test]
@@ -1437,7 +1334,7 @@ mod tests {
         create_index_schema(&conn).unwrap();
         conn.execute_batch(
             "CREATE TABLE _lsp (
-                node_id TEXT PRIMARY KEY,
+                nid INTEGER PRIMARY KEY,
                 symbol_kind TEXT,
                 detail TEXT,
                 start_line INTEGER NOT NULL,
@@ -1446,67 +1343,57 @@ mod tests {
                 end_col INTEGER NOT NULL,
                 diagnostics TEXT
             );
-            CREATE TABLE _lsp_defs (node_id TEXT, def_uri TEXT, def_start_line INT, def_start_col INT, def_end_line INT, def_end_col INT);
-            CREATE TABLE _lsp_refs (node_id TEXT, ref_uri TEXT, ref_start_line INT, ref_start_col INT, ref_end_line INT, ref_end_col INT);
-            CREATE TABLE _lsp_hover (node_id TEXT PRIMARY KEY, hover_text TEXT);
-            CREATE TABLE _lsp_completions (node_id TEXT, label TEXT, kind TEXT, detail TEXT, documentation TEXT, sort_text TEXT);",
+            CREATE TABLE _lsp_defs (nid INTEGER, def_uri TEXT, def_start_line INT, def_start_col INT, def_end_line INT, def_end_col INT);
+            CREATE TABLE _lsp_refs (nid INTEGER, ref_uri TEXT, ref_start_line INT, ref_start_col INT, ref_end_line INT, ref_end_col INT);
+            CREATE TABLE _lsp_hover (nid INTEGER PRIMARY KEY, hover_text TEXT);
+            CREATE TABLE _lsp_completions (nid INTEGER, label TEXT, kind TEXT, detail TEXT, documentation TEXT, sort_text TEXT);",
         )
         .unwrap();
 
-        // Two files' worth of LSP rows. Use the file's own path as one
-        // of the node_ids and a descendant for the other.
+        let (a_lo, a_hi) = mint_file(&conn, "a.go", "Foo");
+        let (b_lo, b_hi) = mint_file(&conn, "b.go", "Bar");
+
+        // Two files' worth of LSP rows, keyed by nids in each file's range.
         conn.execute(
-            "INSERT INTO _lsp (node_id, symbol_kind, detail, start_line, start_col, end_line, end_col) \
-             VALUES ('a.go/func', 'function', 'a-detail', 0, 0, 1, 0), \
-                    ('b.go/func', 'function', 'b-detail', 0, 0, 1, 0)",
-            [],
+            "INSERT INTO _lsp (nid, symbol_kind, detail, start_line, start_col, end_line, end_col) \
+             VALUES (?1, 'function', 'a-detail', 0, 0, 1, 0), \
+                    (?2, 'function', 'b-detail', 0, 0, 1, 0)",
+            params![a_lo + 1, b_lo + 1],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO _lsp_hover (node_id, hover_text) VALUES ('a.go/func', 'a-hover'), ('b.go/func', 'b-hover')",
-            [],
+            "INSERT INTO _lsp_hover (nid, hover_text) VALUES (?1, 'a-hover'), (?2, 'b-hover')",
+            params![a_lo + 1, b_lo + 1],
         )
         .unwrap();
 
         // Pre-condition: a.go's LSP rows exist.
-        let a_pre: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM _lsp WHERE node_id LIKE 'a.go%'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(a_pre, 1, "pre-condition: a.go LSP row should exist");
+        assert_eq!(
+            rows_in_range(&conn, "_lsp", "nid", a_lo, a_hi),
+            1,
+            "pre-condition: a.go LSP row should exist"
+        );
 
         delete_file_rows(&conn, "a.go").unwrap();
 
         // a.go's LSP rows: gone.
-        let a_lsp: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM _lsp WHERE node_id LIKE 'a.go%'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(a_lsp, 0, "_lsp rows for a.go must be cleaned up");
-        let a_hover: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM _lsp_hover WHERE node_id LIKE 'a.go%'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(a_hover, 0, "_lsp_hover rows for a.go must be cleaned up");
+        assert_eq!(
+            rows_in_range(&conn, "_lsp", "nid", a_lo, a_hi),
+            0,
+            "_lsp rows for a.go must be cleaned up"
+        );
+        assert_eq!(
+            rows_in_range(&conn, "_lsp_hover", "nid", a_lo, a_hi),
+            0,
+            "_lsp_hover rows for a.go must be cleaned up"
+        );
 
         // b.go's LSP rows: intact.
-        let b_lsp: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM _lsp WHERE node_id LIKE 'b.go%'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(b_lsp, 1, "_lsp rows for b.go must NOT be cleaned up");
+        assert_eq!(
+            rows_in_range(&conn, "_lsp", "nid", b_lo, b_hi),
+            1,
+            "_lsp rows for b.go must NOT be cleaned up"
+        );
     }
 
     #[test]
@@ -1521,83 +1408,65 @@ mod tests {
         create_index_schema(&conn).unwrap();
         // Note: NO _lsp* tables created.
 
-        insert_node(&conn, "a.go", "a.go", 1, 0, 0, "").unwrap();
-        upsert_file_index(&conn, "a.go", 100, 50).unwrap();
+        let (a_lo, a_hi) = mint_file(&conn, "a.go", "Foo");
 
         // delete_file_rows must succeed even without _lsp* tables.
         delete_file_rows(&conn, "a.go").unwrap();
-        let a_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM nodes WHERE id = 'a.go'", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(a_count, 0);
+        assert_eq!(rows_in_range(&conn, "nodes", "nid", a_lo, a_hi), 0);
     }
 
     #[test]
-    fn delete_file_rows_does_not_match_prefix_siblings() {
-        // Scale-problem pin. The LIKE clause `id LIKE ?1 || '/%'` is
-        // designed to delete descendants of `?1` — but at registry
-        // scale (50k+ files) prefix-similar names are common. E.g.,
-        // "templates" and "templates_dir", or "a.go" and "a.go.bak".
-        // A refactor that simplified to `LIKE ?1 || '%'` (dropping
-        // the slash) would silently delete every file whose name
-        // starts with the same string. Pin via deliberately
-        // prefix-similar siblings.
+    fn delete_file_rows_does_not_touch_the_adjacent_range() {
+        // Range-boundary pin, the v5 descendant of the pre-v5
+        // prefix-sibling trap ("a" vs "ab" under an unanchored LIKE). Two
+        // CONSECUTIVE file_ids own adjacent nid ranges; an off-by-one in
+        // `file_nid_range` (`.. (file_id+1) << 24` inclusive instead of
+        // `.. base | 0xFFFFFF`) deletes the first row of the NEXT file.
+        // Plant that exact row: the second file's node at ordinal 0.
         let conn = Connection::open_in_memory().unwrap();
         create_ast_schema(&conn).unwrap();
         create_refs_schema(&conn).unwrap();
         create_index_schema(&conn).unwrap();
 
-        // "a" and "ab" — would collide under `LIKE 'a%'` but must NOT
-        // collide under `LIKE 'a/%'`.
-        insert_node(&conn, "a", "a", 1, 0, 0, "").unwrap();
-        insert_node(&conn, "a/sub", "sub", 0, 1, 0, "x").unwrap();
-        insert_node(&conn, "ab", "ab", 1, 0, 0, "").unwrap();
-        insert_node(&conn, "ab/sub", "sub", 0, 1, 0, "y").unwrap();
-
-        // Delete "a" — should remove "a" and "a/sub" only.
-        delete_file_rows(&conn, "a").unwrap();
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM nodes WHERE id IN ('ab', 'ab/sub')",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
+        let (a_lo, a_hi) = mint_file(&conn, "a.go", "Foo");
+        let (b_lo, b_hi) = mint_file(&conn, "b.go", "Bar");
         assert_eq!(
-            count, 2,
-            "prefix-similar `ab` siblings must survive deletion of `a`"
+            a_hi + 1,
+            b_lo,
+            "fixture: consecutive file_ids must own adjacent ranges, or this \
+             pin asserts nothing"
         );
-        let a_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM nodes WHERE id IN ('a', 'a/sub')",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(a_count, 0, "`a` and its descendants must be gone");
+
+        delete_file_rows(&conn, "a.go").unwrap();
+
+        assert_eq!(rows_in_range(&conn, "nodes", "nid", a_lo, a_hi), 0);
+        assert_eq!(
+            rows_in_range(&conn, "nodes", "nid", b_lo, b_hi),
+            2,
+            "the adjacent file's rows — its ordinal-0 node above all — must \
+             survive deletion of its neighbour"
+        );
     }
 
     #[test]
     fn ts_schema_creates_all_indexes() {
         // Scale-problem pin completing the index-existence triplet
-        // (leyline-schema ✓, leyline-lsp ✓, leyline-ts ←). Five
-        // indexes accelerate per-source AST lookup, ref/def token
-        // search, and per-source import enumeration. At registry-
-        // scale (helm/charts: 4.5k files, 629k _ast rows) idx_ast_
-        // source is the difference between O(N) full-scan and O(log
-        // N) point lookup per file. A refactor DROP'ing any silently
-        // degrades query latency on every populated db.
+        // (leyline-schema ✓, leyline-lsp ✓, leyline-ts ←). These
+        // indexes accelerate ref/def token search, per-file occurrence
+        // deletes (nid range on idx_refs_node/idx_defs_node), and
+        // per-source import enumeration. A refactor DROP'ing any
+        // silently degrades query latency on every populated db.
         let conn = Connection::open_in_memory().unwrap();
         create_ast_schema(&conn).unwrap();
         create_refs_schema(&conn).unwrap();
         create_index_schema(&conn).unwrap();
+        // projection-v5: no idx_ast_source — `_ast` file scoping is a PK
+        // range; idx_refs_node/idx_defs_node serve the per-file deletes.
         for index_name in [
-            "idx_ast_source",
             "idx_refs_token",
             "idx_refs_node",
             "idx_defs_token",
+            "idx_defs_node",
             "idx_imports_source",
         ] {
             let exists: bool = conn
@@ -1652,23 +1521,32 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         create_ast_schema(&conn).unwrap();
 
-        // Build a deeply-nested chain: ""→d0→d0/d1→...→d0/.../d29→file.
-        insert_node(&conn, "", "", 1, 0, 0, "").unwrap();
-        let mut current = String::new();
-        for i in 0..30 {
-            let parent = current.clone();
-            current = if i == 0 {
-                format!("d{i}")
-            } else {
-                format!("{current}/d{i}")
-            };
-            insert_node(&conn, &current, &format!("d{i}"), 1, 0, 0, "").unwrap();
-        }
-        let file_id = format!("{current}/leaf.go");
-        insert_node(&conn, &file_id, "leaf.go", 1, 0, 0, "").unwrap();
+        // Build a deeply-nested chain: root→d0→d0/d1→...→d0/.../d29→file.
+        let rel = (0..30)
+            .map(|i| format!("d{i}"))
+            .collect::<Vec<_>>()
+            .join("/")
+            + "/leaf.go";
+        let file_id = ensure_file_id(&conn, &rel).unwrap();
+        let dir_id = ensure_dir_nodes(&conn, &rel, 1).unwrap();
+        let base = file_nid(file_id, 0);
+        let name_id = intern_name(&conn, "leaf.go").unwrap();
+        insert_node(
+            &conn,
+            base,
+            Some(dir_nid(dir_id)),
+            Some(name_id),
+            None,
+            1,
+            0,
+            0,
+            1,
+            "",
+        )
+        .unwrap();
 
         // Delete the file — every dir in the chain is now orphaned.
-        conn.execute("DELETE FROM nodes WHERE id = ?1", [&file_id])
+        conn.execute("DELETE FROM nodes WHERE nid = ?1", [base])
             .unwrap();
 
         let removed = sweep_orphaned_dirs(&conn).unwrap();
@@ -1676,7 +1554,7 @@ mod tests {
         let remaining: i64 = conn
             .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(remaining, 1, "only root node should remain");
+        assert_eq!(remaining, 1, "only the root dir row should remain");
     }
 
     // ---------------------------------------------------------------------
@@ -1920,48 +1798,20 @@ mod tests {
         );
     }
 
-    /// `has_column` is the idempotence guard for every additive ALTER in this
-    /// module: `create_ir_tables` uses it for `node_hash`, and
-    /// `create_pointer_store_tables` for `blob_ord`. Stubbing it to a constant
-    /// broke nothing that was tested — `Ok(true)` skips the ALTER so the column
-    /// never appears and every INSERT naming it fails at runtime, while
-    /// `Ok(false)` re-runs the ALTER on an existing column and errors on the
-    /// second parse. Surfaced as two surviving mutants on bead
-    /// `ley-line-open-17c271`.
-
-    /// `create_ir_tables` stamps the ADR-0027 `node_hash` column onto the three
-    /// occurrence tables that predate it. Nothing asserted that it did, so
-    /// inverting its idempotence guard survived mutation: with the `!` deleted
-    /// the ALTER runs only when the column ALREADY exists, so a fresh arena
-    /// never gets `node_hash` at all and every INSERT naming it fails at
-    /// runtime, while a reparse hits "duplicate column name".
-    ///
-    /// Sibling of `create_pointer_store_tables_builds_and_is_idempotent` — both
-    /// are additive migrations run on EVERY parse, and SQLite has no
-    /// `ADD COLUMN IF NOT EXISTS` (bead `ley-line-open-17c271`).
+    /// `create_ir_tables` builds the ADR-0027 content tables and the base
+    /// DDL's `node_hash` FK is enforceable. (The pre-v5 additive-ALTER
+    /// mutation story this doc used to tell — `has_column` guards, inverted
+    /// idempotence — died with the migrations themselves in projection-v5;
+    /// the surviving contract is table existence, idempotence, and a live
+    /// FK.)
     #[test]
-    fn create_ir_tables_stamps_node_hash_and_is_idempotent() {
+    fn create_ir_tables_builds_content_tables_and_fk_holds() {
         let conn = Connection::open_in_memory().unwrap();
         create_ast_schema(&conn).unwrap();
         conn.execute_batch(DEFS_TABLE_DDL).unwrap();
         conn.execute_batch(REFS_TABLE_DDL).unwrap();
-
-        for table in ["_ast", "node_defs", "node_refs"] {
-            assert!(
-                !has_column(&conn, table, "node_hash").unwrap(),
-                "precondition: {table} has no node_hash before the migration"
-            );
-        }
-
         create_ir_tables(&conn).unwrap();
 
-        for table in ["_ast", "node_defs", "node_refs"] {
-            assert!(
-                has_column(&conn, table, "node_hash").unwrap(),
-                "{table} MUST carry node_hash after create_ir_tables — without it \
-                 every INSERT naming the column fails at runtime"
-            );
-        }
         for table in ["node_content", "node_child"] {
             let n: i64 = conn
                 .query_row(
@@ -1973,115 +1823,97 @@ mod tests {
             assert_eq!(n, 1, "{table} MUST exist after create_ir_tables");
         }
 
-        // Runs on every parse, so the second call must be a no-op rather than a
-        // "duplicate column name" error.
+        // Idempotent — runs on every parse.
         create_ir_tables(&conn).unwrap();
-        assert!(has_column(&conn, "_ast", "node_hash").unwrap());
+
+        // The base-DDL `node_hash` FK is enforceable: with foreign_keys ON, a
+        // pointer at a nonexistent content row is a loud insert error, and a
+        // resolving pointer succeeds.
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let dangling = conn.execute(
+            "INSERT INTO _ast (nid, kind_id, start_byte, end_byte, start_row, start_col, end_row, end_col, node_hash) \
+             VALUES (1, 1, 0, 1, 0, 0, 0, 1, X'00')",
+            [],
+        );
+        assert!(
+            dangling.is_err(),
+            "a node_hash with no node_content row must fail under FK enforcement"
+        );
+        insert_test_node_content(&conn, &[0u8; 32]);
+        conn.execute(
+            "INSERT INTO _ast (nid, kind_id, start_byte, end_byte, start_row, start_col, end_row, end_col, node_hash) \
+             VALUES (1, 1, 0, 1, 0, 0, 0, 1, ?1)",
+            params![[0u8; 32]],
+        )
+        .unwrap();
     }
 
-    /// **Every additive ALTER migration, gated as a class.**
+    /// **The v5 base DDL carries every occurrence column at birth.**
     ///
-    /// Each of these stamps a column onto a table that predates it, and each
-    /// has the same two failure modes: a body replaced by `Ok(())` (the column
-    /// never appears, and the next INSERT naming it fails at runtime), and an
-    /// inverted idempotence guard (the ALTER runs only when the column already
-    /// exists, so a fresh arena never gets it AND a reparse hits "duplicate
-    /// column name").
-    ///
-    /// Both modes survived mutation on THREE separate migrations in this
-    /// module — `create_ir_tables`, `create_pointer_store_tables`, and
-    /// `create_occurrence_span_columns` — because each was covered, when it was
-    /// covered at all, by a bespoke test written after the fact. Three
-    /// identical gaps is a class, not three accidents, so this gates the class:
-    /// a migration added later is covered by adding one line to the table
-    /// below, and an uncovered one shows up as a surviving mutant immediately.
-    ///
-    /// SQLite has no `ADD COLUMN IF NOT EXISTS`, and these run on EVERY parse,
-    /// so idempotence is not optional — it is the difference between a reparse
-    /// working and erroring.
+    /// Pre-v5, five additive ALTER migrations stamped these columns onto
+    /// legacy arenas, and each survived body-replaced-by-`Ok(())` mutation at
+    /// least once. projection-v5 removed the migrations outright — a pre-v5
+    /// arena is refused at open, not patched — so the surviving guarantee is
+    /// simpler and pinned here: the columns exist on a FRESH arena, which is
+    /// the only arena shape v5 code ever writes.
     #[test]
-    fn every_additive_migration_adds_its_columns_and_is_idempotent() {
-        type Migration = fn(&Connection) -> Result<()>;
-        let cases: &[(&str, Migration, &[(&str, &str)])] = &[
+    fn base_ddl_carries_every_occurrence_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_schema(&conn).unwrap();
+        create_refs_schema(&conn).unwrap();
+        for (table, cols) in [
             (
-                "create_ir_tables",
-                create_ir_tables,
+                "_ast",
+                &["nid", "kind_id", "start_byte", "end_col", "node_hash"][..],
+            ),
+            (
+                "node_defs",
                 &[
-                    ("_ast", "node_hash"),
-                    ("node_defs", "node_hash"),
-                    ("node_refs", "node_hash"),
-                ],
+                    "token",
+                    "nid",
+                    "container_nid",
+                    "node_kind",
+                    "start_byte",
+                    "end_col",
+                    "canonical_kind",
+                    "node_hash",
+                ][..],
             ),
             (
-                "create_canonical_kind_column",
-                create_canonical_kind_column,
-                &[("node_defs", "canonical_kind")],
-            ),
-            (
-                "create_container_id_columns",
-                create_container_id_columns,
+                "node_refs",
                 &[
-                    ("node_defs", "container_node_id"),
-                    ("node_refs", "container_node_id"),
-                ],
+                    "token",
+                    "nid",
+                    "container_nid",
+                    "node_kind",
+                    "start_byte",
+                    "end_col",
+                    "qualifier",
+                    "node_hash",
+                ][..],
             ),
-            (
-                "create_qualifier_column",
-                create_qualifier_column,
-                &[("node_refs", "qualifier")],
-            ),
-            (
-                "create_occurrence_span_columns",
-                create_occurrence_span_columns,
-                &[
-                    ("node_defs", "node_kind"),
-                    ("node_defs", "start_byte"),
-                    ("node_defs", "end_col"),
-                    ("node_refs", "node_kind"),
-                    ("node_refs", "start_byte"),
-                    ("node_refs", "end_col"),
-                ],
-            ),
-        ];
-
-        for (name, migrate, expected) in cases {
-            // A deliberately LEGACY-shaped arena: the narrow tables these
-            // migrations exist to widen. Building it from the current DDL would
-            // defeat the test, because the current DDL already has the columns.
-            let conn = Connection::open_in_memory().unwrap();
-            conn.execute_batch(
-                "CREATE TABLE _ast (node_id TEXT PRIMARY KEY, source_id TEXT NOT NULL, \
-                    node_kind TEXT NOT NULL, start_byte INTEGER, end_byte INTEGER, \
-                    start_row INTEGER, start_col INTEGER, end_row INTEGER, end_col INTEGER);
-                 CREATE TABLE node_defs (token TEXT NOT NULL, node_id TEXT NOT NULL, source_id TEXT NOT NULL);
-                 CREATE TABLE node_refs (token TEXT NOT NULL, node_id TEXT NOT NULL, source_id TEXT NOT NULL);",
-            )
-            .unwrap();
-
-            migrate(&conn).unwrap_or_else(|e| panic!("{name} must succeed on a legacy shape: {e}"));
-
-            for (table, col) in *expected {
+        ] {
+            for col in cols {
                 assert!(
                     has_column(&conn, table, col).unwrap(),
-                    "{name}: {table}.{col} MUST exist after the migration — without it \
-                     every INSERT naming the column fails at runtime"
-                );
-            }
-
-            // Runs on every parse. A second call must be a no-op, not
-            // "duplicate column name".
-            migrate(&conn).unwrap_or_else(|e| {
-                panic!("{name} MUST be idempotent — it runs on every parse: {e}")
-            });
-
-            for (table, col) in *expected {
-                assert!(
-                    has_column(&conn, table, col).unwrap(),
-                    "{name}: {table}.{col} vanished across a second run"
+                    "{table}.{col} MUST exist in the base DDL — every INSERT \
+                     naming it fails at runtime otherwise"
                 );
             }
         }
     }
+
+    /// Test-support probe (the production ALTER migrations that used it are
+    /// gone as of projection-v5).
+    fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+            [table, column],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     #[test]
     fn has_column_distinguishes_present_from_absent() {
         let conn = Connection::open_in_memory().unwrap();
@@ -2092,8 +1924,7 @@ mod tests {
         assert!(has_column(&conn, "t", "b").unwrap(), "column b is present");
         assert!(
             !has_column(&conn, "t", "nope").unwrap(),
-            "column `nope` is absent — a constant-true probe would skip the ALTER \
-             that adds it and every INSERT naming the column would then fail"
+            "column `nope` is absent"
         );
         assert!(
             !has_column(&conn, "t", "").unwrap(),
@@ -2102,13 +1933,11 @@ mod tests {
     }
 
     /// The ADR-0026 pointer store is `capnp_blobs` + the per-file `_ast_blob`
-    /// map + `_ast.blob_ord`. Nothing asserted the constructor actually built
-    /// them, so replacing its body with `Ok(())` passed — an arena would then
-    /// silently lack the resolution path entirely.
-    ///
-    /// Also pins idempotence: `create_pointer_store_tables` runs on every
-    /// parse, including reparses of an arena that already has `blob_ord`, and
-    /// SQLite has no `ADD COLUMN IF NOT EXISTS`.
+    /// map; the ordinal into a blob's `AstNodeList.nodes` is `nid & 0xFFFFFF`
+    /// as of projection-v5 (no stored column). Nothing asserted the
+    /// constructor actually built the tables, so replacing its body with
+    /// `Ok(())` passed — an arena would then silently lack the resolution
+    /// path entirely.
     #[test]
     fn create_pointer_store_tables_builds_and_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
@@ -2132,9 +1961,8 @@ mod tests {
             assert_eq!(n, 1, "{table} MUST exist after create_pointer_store_tables");
         }
         assert!(
-            has_column(&conn, "_ast", "blob_ord").unwrap(),
-            "_ast MUST carry blob_ord — it is how a row addresses its capnp record \
-             now that the map is per-file"
+            has_column(&conn, "_ast_blob", "file_id").unwrap(),
+            "_ast_blob keys on the interned file_id as of projection-v5"
         );
         assert!(
             pointer_store_present(&conn),
@@ -2143,21 +1971,75 @@ mod tests {
              and leaks a stale _ast_blob row on every reparse"
         );
 
-        // Second call must be a no-op, not an "duplicate column name" error.
+        // Second call must be a no-op.
         create_pointer_store_tables(&conn).unwrap();
-        assert!(has_column(&conn, "_ast", "blob_ord").unwrap());
     }
+
+    /// Review-gate 3 of the identity ladder (bead `ley-line-open-17c271`):
+    /// file-scoped deletes must plan as an index/PK range SEARCH, never a
+    /// SCAN. The pre-v5 prefix-LIKE (`node_id LIKE ?1 || '/%'`) planned as
+    /// a full SCAN on every one of these tables — no `case_sensitive_like`,
+    /// non-literal prefix — measured 1,370–2,000× slower than a PK seek.
+    #[test]
+    fn file_scoped_deletes_plan_as_search_not_scan() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_schema(&conn).unwrap();
+        create_refs_schema(&conn).unwrap();
+        create_index_schema(&conn).unwrap();
+        create_ast_indexes(&conn).unwrap();
+        create_refs_indexes(&conn).unwrap();
+        let (a_lo, a_hi) = mint_file(&conn, "a.go", "Foo");
+
+        for sql in [
+            "DELETE FROM nodes WHERE nid BETWEEN ?1 AND ?2",
+            "DELETE FROM _ast WHERE nid BETWEEN ?1 AND ?2",
+            "DELETE FROM node_refs WHERE nid BETWEEN ?1 AND ?2",
+            "DELETE FROM node_defs WHERE nid BETWEEN ?1 AND ?2",
+        ] {
+            let plan: Vec<String> = {
+                let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+                stmt.query_map(params![a_lo, a_hi], |r| r.get::<_, String>(3))
+                    .unwrap()
+                    .map(|r| r.unwrap())
+                    .collect()
+            };
+            let rendered = plan.join(" | ");
+            assert!(
+                rendered.contains("SEARCH"),
+                "{sql}: plan must SEARCH an index or the PK; got {rendered:?}"
+            );
+            assert!(
+                !rendered.contains("SCAN"),
+                "{sql}: plan must not SCAN the table; got {rendered:?}"
+            );
+        }
+    }
+
     #[test]
     fn sweep_orphaned_dirs_removes_empty_parents() {
         let conn = Connection::open_in_memory().unwrap();
         create_ast_schema(&conn).unwrap();
 
-        insert_node(&conn, "", "", 1, 0, 0, "").unwrap();
-        insert_node(&conn, "src", "src", 1, 0, 0, "").unwrap();
-        insert_node(&conn, "src/pkg", "pkg", 1, 0, 0, "").unwrap();
-        insert_node(&conn, "src/pkg/a.go", "a.go", 1, 0, 0, "").unwrap();
+        let rel = "src/pkg/a.go";
+        let file_id = ensure_file_id(&conn, rel).unwrap();
+        let dir_id = ensure_dir_nodes(&conn, rel, 1).unwrap();
+        let base = file_nid(file_id, 0);
+        let name_id = intern_name(&conn, "a.go").unwrap();
+        insert_node(
+            &conn,
+            base,
+            Some(dir_nid(dir_id)),
+            Some(name_id),
+            None,
+            1,
+            0,
+            0,
+            1,
+            "",
+        )
+        .unwrap();
 
-        conn.execute("DELETE FROM nodes WHERE id = 'src/pkg/a.go'", [])
+        conn.execute("DELETE FROM nodes WHERE nid = ?1", [base])
             .unwrap();
 
         let removed = sweep_orphaned_dirs(&conn).unwrap();
@@ -2166,6 +2048,187 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 1, "only root node should remain");
+        assert_eq!(count, 1, "only the root dir row should remain");
+    }
+
+    // ---------------------------------------------------------------------
+    // Schema-construction EFFECTS.
+    //
+    // Every `create_*` here returns `Result<()>`, so a test that only
+    // `.unwrap()`s the call observes nothing: a body replaced with `Ok(())`
+    // passes it. Each test below therefore starts from a BARE connection —
+    // no sibling `create_*` that would have made the tables anyway — and
+    // asserts the objects the function is responsible for actually landed.
+    // ---------------------------------------------------------------------
+
+    /// Whether `sqlite_master` holds an object of this type under this name.
+    fn has_object(conn: &Connection, kind: &str, name: &str) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = ?1 AND name = ?2",
+            params![kind, name],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn create_ast_tables_creates_every_table_the_ast_pass_writes_to() {
+        // Bare connection ON PURPOSE. The sibling `create_ast_schema` builds
+        // the same five tables, so a test that called it first would pass
+        // against a `create_ast_tables` that did nothing at all.
+        let conn = Connection::open_in_memory().unwrap();
+        for table in ["nodes", "_source", "node_content", "node_child", "_ast"] {
+            assert!(
+                !has_object(&conn, "table", table),
+                "precondition: {table} must not exist before the call",
+            );
+        }
+
+        create_ast_tables(&conn).unwrap();
+
+        for table in ["nodes", "_source", "node_content", "node_child", "_ast"] {
+            assert!(
+                has_object(&conn, "table", table),
+                "{table} MUST exist after create_ast_tables",
+            );
+        }
+
+        // Usable, not merely present: the bulk-load pass writes a source row
+        // and an `_ast` row through exactly these tables.
+        let file_id = ensure_file_id(&conn, "main.go").unwrap();
+        insert_source(&conn, "main.go", "go", b"package main\n", file_id).unwrap();
+        insert_ast(&conn, file_nid(file_id, 0), 1, 0, 13, 0, 0, 1, 0, None).unwrap();
+
+        // Idempotent — `cmd_parse` calls it once per invocation on a
+        // possibly-existing arena.
+        create_ast_tables(&conn).unwrap();
+    }
+
+    #[test]
+    fn insert_source_ref_writes_a_path_row_with_no_inline_content() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_tables(&conn).unwrap();
+
+        insert_source_ref(&conn, "pkg/main.go", "go", "/repo/pkg/main.go", 7).unwrap();
+
+        let (id, language, path, content, file_id): (
+            String,
+            String,
+            Option<String>,
+            Option<Vec<u8>>,
+            i64,
+        ) = conn
+            .query_row(
+                "SELECT id, language, path, content, file_id FROM _source",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(id, "pkg/main.go");
+        assert_eq!(language, "go");
+        assert_eq!(path.as_deref(), Some("/repo/pkg/main.go"));
+        assert_eq!(
+            content, None,
+            "reference mode stores NO inline content — consumers read from disk",
+        );
+        assert_eq!(
+            file_id, 7,
+            "the interned file id is what `nid >> 24` joins against",
+        );
+
+        // INSERT OR REPLACE: re-registering the same id updates in place.
+        insert_source_ref(&conn, "pkg/main.go", "go", "/elsewhere/main.go", 7).unwrap();
+        let (n, path): (i64, Option<String>) = conn
+            .query_row("SELECT COUNT(*), MAX(path) FROM _source", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(n, 1, "re-registration must replace, not duplicate");
+        assert_eq!(path.as_deref(), Some("/elsewhere/main.go"));
+    }
+
+    #[test]
+    fn create_ir_tables_creates_the_content_tables_on_a_bare_connection() {
+        // The companion test above this one
+        // (`create_ir_tables_builds_content_tables_and_fk_holds`) calls
+        // `create_ast_schema` first, which ALSO emits
+        // NODE_CONTENT_TABLE_DDL / NODE_CHILD_TABLE_DDL — so it cannot see
+        // the difference between this function working and doing nothing.
+        // This one starts bare, which is the only way to observe the effect.
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(!has_object(&conn, "table", "node_content"));
+        assert!(!has_object(&conn, "table", "node_child"));
+
+        create_ir_tables(&conn).unwrap();
+
+        assert!(
+            has_object(&conn, "table", "node_content"),
+            "node_content MUST exist after create_ir_tables",
+        );
+        assert!(
+            has_object(&conn, "table", "node_child"),
+            "node_child MUST exist after create_ir_tables",
+        );
+
+        // Usable: a content row and an edge referencing it both insert.
+        insert_test_node_content(&conn, &[0xABu8; 32]);
+        conn.execute(
+            "INSERT INTO node_child (parent_hash, ordinal, child_hash, field) \
+             VALUES (?1, 0, ?1, 'body')",
+            params![&[0xABu8; 32][..]],
+        )
+        .unwrap();
+
+        create_ir_tables(&conn).unwrap(); // idempotent
+    }
+
+    #[test]
+    fn create_post_load_indexes_skip_unused_creates_its_indexes_and_skips_idx_source_file() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_tables(&conn).unwrap();
+        create_refs_tables(&conn).unwrap();
+
+        // Tables only so far — the whole point of the post-load pass is that
+        // none of these exist during the bulk insert.
+        for index in [
+            "idx_parent_kind_ord",
+            "idx_refs_token",
+            "idx_refs_node",
+            "idx_refs_container",
+        ] {
+            assert!(
+                !has_object(&conn, "index", index),
+                "precondition: {index} must not exist before the post-load pass",
+            );
+        }
+        assert!(!has_object(&conn, "view", "v_node_path"));
+
+        create_post_load_indexes_skip_unused(&conn).unwrap();
+
+        for index in [
+            "idx_parent_kind_ord",
+            "idx_refs_token",
+            "idx_refs_node",
+            "idx_refs_container",
+        ] {
+            assert!(
+                has_object(&conn, "index", index),
+                "{index} MUST exist after create_post_load_indexes_skip_unused",
+            );
+        }
+        assert!(
+            has_object(&conn, "view", "v_node_path"),
+            "the display view lands post-COMMIT too",
+        );
+
+        // The "skip_unused" half of the contract (bead
+        // `ley-line-open-cbbedf` Attack 3): `idx_source_file` is the partial
+        // index ley-line never populates, and it must NOT be built here.
+        assert!(
+            !has_object(&conn, "index", "idx_source_file"),
+            "idx_source_file is the index this variant exists to skip",
+        );
+
+        create_post_load_indexes_skip_unused(&conn).unwrap(); // idempotent
     }
 }

@@ -25,7 +25,9 @@
 //! payload is only one of five objects CDC adds: `content_chunks`,
 //! `content_manifest`, `content_manifest_meta`, and two indexes over the
 //! manifest. Every manifest and witness row repeats `node_id`, which in this
-//! projection is a full AST path. `cdc_bytes_per_content_byte` is therefore
+//! projection is an integer nid — one 8-byte key, where the pre-v5 schema
+//! measured below repeated the node's full AST path on every row.
+//! `cdc_bytes_per_content_byte` is therefore
 //! printed as the headline cost — total arena growth divided by the content
 //! CDC was asked to index — and `record_max` / `records_over_min_chunk` are
 //! printed next to it so a reader can see whether content-defined chunking
@@ -55,7 +57,13 @@
 //! | rosary  | 541f55b |   283 |    4,246,328 |    208,195 |  2,092,662 |    4,347 |
 //! | LLO rs/ | 05a6cbf |   354 |    5,425,395 |    254,472 |  2,037,652 |    3,270 |
 //!
-//! ### F4c — storage bound
+//! ### F4c — storage bound (measured PRE-v5)
+//!
+//! These figures were taken against the pre-v5 schema, where `nodes.id` and
+//! every reference to it was the node's full ancestry path. They are what
+//! motivated projection-v5 (bead `ley-line-open-17c271`) and are kept
+//! verbatim as the before-measurement; re-running this harness now reports
+//! the after.
 //!
 //! | corpus  | arena without CDC | arena with CDC | ratio  | growth      | growth / content byte |
 //! |---------|------------------:|---------------:|-------:|------------:|----------------------:|
@@ -73,8 +81,9 @@
 //! PK autoindex 73.3 MB, `content_manifest`'s PK autoindex 72.7 MB,
 //! `content_manifest_span` 72.7 MB, `content_manifest_chunk_hash` 15.8 MB —
 //! and `content_chunks`, the actual payload, **3.8 MB**. Chunk bytes are
-//! 0.48% / 0.56% / 0.31% of what CDC costs. The other 99.5% is `node_id`
-//! repeated across two tables and four indexes.
+//! 0.48% / 0.56% / 0.31% of what CDC costs. The other 99.5% was the node's
+//! path repeated across two tables and four indexes — which is precisely the
+//! freight projection-v5 evicted by keying on an integer nid instead.
 //!
 //! ### F5c — measured dedup
 //!
@@ -114,11 +123,14 @@
 //! covering the whole record and the GearHash never rolls. Content-defined
 //! chunking is not being exercised at all. What is measured is a
 //! hash-addressed intern table over ~10-byte AST tokens (mean 9.8 on mache),
-//! keyed by a 32-byte BLAKE3 and indexed by a node path that averages 176
-//! bytes. `node_id_bytes / record_bytes` is 19.8 on LLO and 14.8 on rosary:
-//! the address is an order of magnitude larger than the thing addressed, and
-//! it is stored in `content_manifest`, in `content_manifest_meta`, and in
-//! four index B-trees over them.
+//! keyed by a 32-byte BLAKE3 and — pre-v5 — indexed by a node path that
+//! averaged 176 bytes. Path bytes per content byte measured 19.8 on LLO and
+//! 14.8 on rosary: the address was an order of magnitude larger than the
+//! thing addressed, and it was stored in `content_manifest`, in
+//! `content_manifest_meta`, and in four index B-trees over them. Under
+//! projection-v5 each of those carries an 8-byte nid instead, and the path
+//! vocabulary is interned once in `names` — which is what `locator_bytes`
+//! now reports.
 //!
 //! ### Counterfactual — the target ADR-0028 names
 //!
@@ -188,7 +200,16 @@ struct Census {
     record_bytes: u64,
     record_max: u64,
     records_over_min_chunk: u64,
-    node_id_bytes: u64,
+    /// Total bytes of path material the projection stores, across the whole
+    /// arena.
+    ///
+    /// Under projection-v5 that is the interned vocabulary in `names` and
+    /// nothing else: a node is keyed by an integer nid, and its path is
+    /// rendered from the `dirs`/`files` chain at read time rather than
+    /// repeated per row. This is the number the pre-v5 measurement below
+    /// reported as `node_id_bytes` — 19.8 bytes of path per byte of content
+    /// on LLO — and the reason the key was changed.
+    locator_bytes: u64,
     /// Rows whose `nodes.size` disagrees with `length(CAST(record AS BLOB))`.
     ///
     /// Non-zero on every real projection measured so far, because `nodes.record`
@@ -272,9 +293,9 @@ fn report_census(census: &Census, baseline_bytes: u64) {
         census.records_over_min_chunk,
     );
     println!(
-        "  node_id_bytes={} ({:.1} bytes of path per byte of content)",
-        census.node_id_bytes,
-        census.node_id_bytes as f64 / census.record_bytes.max(1) as f64,
+        "  locator_bytes={} ({:.2} bytes of interned path per byte of content)",
+        census.locator_bytes,
+        census.locator_bytes as f64 / census.record_bytes.max(1) as f64,
     );
     if census.records_over_min_chunk == 0 {
         println!(
@@ -510,11 +531,7 @@ fn census(conn: &Connection) -> Result<Census> {
               WHERE kind = 0 AND record IS NOT NULL",
         )?,
         records_over_min_chunk: 0,
-        node_id_bytes: scalar(
-            conn,
-            "SELECT COALESCE(SUM(length(id)), 0) FROM nodes \
-              WHERE kind = 0 AND record IS NOT NULL",
-        )?,
+        locator_bytes: scalar(conn, "SELECT COALESCE(SUM(length(text)), 0) FROM names")?,
         size_witness_mismatch: scalar(
             conn,
             "SELECT COUNT(*) FROM nodes WHERE kind = 0 AND record IS NOT NULL \

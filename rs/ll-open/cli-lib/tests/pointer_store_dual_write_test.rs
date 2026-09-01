@@ -205,47 +205,39 @@ fn f1_round_trip_integrity() {
     let conn = Connection::open_in_memory().unwrap();
     parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
 
-    // 1. Resolvability: every `_ast` row must reach a blob. The map is now
-    //    one row per FILE (`_ast_blob`) rather than one per node, so the
-    //    old row-count parity check is expressed as "nothing fails to
-    //    resolve" — which is the property parity was standing in for.
+    // 1. Resolvability: every `_ast` row must reach a blob. The map is one
+    //    row per FILE (`_ast_blob`, keyed on file_id = nid >> 24 as of
+    //    projection-v5), so the old row-count parity check is expressed as
+    //    "nothing fails to resolve" — the property parity stood in for.
     let unmatched: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM _ast a \
-             LEFT JOIN _ast_blob b ON b.source_id = a.source_id \
-             WHERE b.source_id IS NULL",
+             LEFT JOIN _ast_blob b ON b.file_id = (a.nid >> 24) \
+             WHERE b.file_id IS NULL",
             [],
             |r| r.get(0),
         )
         .unwrap();
     assert_eq!(
         unmatched, 0,
-        "F1: every _ast.source_id MUST resolve to an _ast_blob row",
+        "F1: every _ast nid's file MUST resolve to an _ast_blob row",
     );
-
-    // `blob_ord` must be populated — a NULL would silently index node 0.
-    let null_ords: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM _ast WHERE blob_ord IS NULL",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(null_ords, 0, "F1: every _ast row MUST carry a blob_ord");
 
     // 1b. The ordinal is only a valid substitute for a per-node pointer row
     //     if it is DENSE per file: 0..n-1, no gaps, no duplicates. That was
     //     an empirical observation about the old `offset_in_blob` column
-    //     (measured 8000/8000 files on a kibana slice); collapsing the
-    //     pointer table to one row per file makes the codebase DEPEND on it,
-    //     so it is asserted here rather than assumed (ley-line-open-17c271).
+    //     (measured 8000/8000 files on a kibana slice); projection-v5 moves
+    //     the ordinal INTO the key (`nid & 0xFFFFFF`), so the codebase
+    //     depends on it — asserted here rather than assumed
+    //     (ley-line-open-17c271). NULL is unrepresentable now: the ordinal
+    //     is part of a NOT NULL PRIMARY KEY.
     let non_dense: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM ( \
-               SELECT source_id FROM _ast GROUP BY source_id \
-               HAVING MIN(blob_ord) <> 0 \
-                   OR MAX(blob_ord) <> COUNT(*) - 1 \
-                   OR COUNT(DISTINCT blob_ord) <> COUNT(*) \
+               SELECT nid >> 24 FROM _ast GROUP BY nid >> 24 \
+               HAVING MIN(nid & 16777215) <> 0 \
+                   OR MAX(nid & 16777215) <> COUNT(*) - 1 \
+                   OR COUNT(DISTINCT nid & 16777215) <> COUNT(*) \
              )",
             [],
             |r| r.get(0),
@@ -253,8 +245,8 @@ fn f1_round_trip_integrity() {
         .unwrap();
     assert_eq!(
         non_dense, 0,
-        "F1: blob_ord MUST be a dense 0..n-1 per file — the per-file blob map \
-         cannot address a node otherwise",
+        "F1: the nid ordinal MUST be a dense 0..n-1 per file — the per-file \
+         blob map cannot address a node otherwise",
     );
 
     // 2. Cache all blobs in memory keyed by blob_hash, decoded as
@@ -278,16 +270,19 @@ fn f1_round_trip_integrity() {
     //    `offset_in_blob` and compare field-by-field.
     let mut stmt = conn
         .prepare(
-            "SELECT a.node_id, a.source_id, a.node_kind, \
+            "SELECT a.nid, s.id, k.raw_kind, \
                     a.start_byte, a.end_byte, a.start_row, a.start_col, a.end_row, a.end_col, \
-                    b.blob_hash, a.blob_ord \
-             FROM _ast a JOIN _ast_blob b ON b.source_id = a.source_id",
+                    b.blob_hash, a.nid & 16777215 \
+             FROM _ast a \
+             JOIN _ast_blob b ON b.file_id = (a.nid >> 24) \
+             JOIN _source s ON s.file_id = (a.nid >> 24) \
+             JOIN kinds k ON k.kind_id = a.kind_id",
         )
         .unwrap();
     let mut rows = stmt.query([]).unwrap();
     let mut checked = 0usize;
     while let Some(row) = rows.next().unwrap() {
-        let ast_node_id: String = row.get(0).unwrap();
+        let ast_node_id: i64 = row.get(0).unwrap();
         let ast_source_id: String = row.get(1).unwrap();
         let ast_node_kind: String = row.get(2).unwrap();
         let ast_start_byte: i64 = row.get(3).unwrap();

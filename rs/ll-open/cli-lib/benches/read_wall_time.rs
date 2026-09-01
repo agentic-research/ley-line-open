@@ -23,7 +23,7 @@
 //! | `get_overview`    | list_children(id="") — roots scan   | get_overview     |
 //! | `find_definition` | node_defs WHERE token = ?           | find_definition  |
 //! | `find_callers`    | node_refs WHERE token = ?           | find_callers     |
-//! | `search`          | _ast WHERE node_kind = ? scan        | search           |
+//! | `search`          | _ast ⋈ kinds WHERE raw_kind = ? scan | search           |
 //!
 //! Each shape runs N=10 000 iterations against an on-disk WAL SQLite db
 //! seeded from the same 5-file Go fixture as
@@ -257,26 +257,21 @@ where
 // ── Shapes ─────────────────────────────────────────────────────────────
 
 /// `get_overview` — the root children listing that mache uses for its
-/// top-level overview surface. Same SQL as `op_list_children("")`:
-/// `SELECT id, parent_id, name, kind, size FROM nodes WHERE parent_id = ?
-///  ORDER BY name`.
+/// top-level overview surface. Same SQL as `op_list_children("")` as of
+/// projection-v5: children of the root nid with names joined from
+/// `v_node_name`, ordered by rendered name.
 fn bench_get_overview(conn: &Connection, iters: usize) -> ShapeResult {
     let mut stmt = conn
         .prepare_cached(
-            "SELECT id, parent_id, name, kind, size \
-             FROM nodes WHERE parent_id = ?1 ORDER BY name",
+            "SELECT n.nid, v.name, n.kind, n.size \
+             FROM nodes n JOIN v_node_name v ON v.nid = n.nid \
+             WHERE n.parent_nid = -1 ORDER BY v.name",
         )
         .unwrap();
     measure_shape("get_overview", conn, iters, |_| {
-        let rows: Vec<(String, String, String, i32, i64)> = stmt
-            .query_map([""], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
+        let rows: Vec<(i64, String, i32, i64)> = stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })
             .unwrap()
             .collect::<Result<_, _>>()
@@ -293,11 +288,11 @@ fn bench_get_overview(conn: &Connection, iters: usize) -> ShapeResult {
 /// bound at execute time; same SQL as `query_token_refs(..., "node_defs")`.
 fn bench_find_definition(conn: &Connection, iters: usize, token: &str) -> ShapeResult {
     let mut stmt = conn
-        .prepare_cached("SELECT node_id, source_id FROM node_defs WHERE token = ?1")
+        .prepare_cached("SELECT nid FROM node_defs WHERE token = ?1")
         .unwrap();
     measure_shape("find_definition", conn, iters, |_| {
-        let rows: Vec<(String, String)> = stmt
-            .query_map([token], |row| Ok((row.get(0)?, row.get(1)?)))
+        let rows: Vec<i64> = stmt
+            .query_map([token], |row| row.get(0))
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
@@ -310,11 +305,11 @@ fn bench_find_definition(conn: &Connection, iters: usize, token: &str) -> ShapeR
 /// the refs table.
 fn bench_find_callers(conn: &Connection, iters: usize, token: &str) -> ShapeResult {
     let mut stmt = conn
-        .prepare_cached("SELECT node_id, source_id FROM node_refs WHERE token = ?1")
+        .prepare_cached("SELECT nid FROM node_refs WHERE token = ?1")
         .unwrap();
     measure_shape("find_callers", conn, iters, |_| {
-        let rows: Vec<(String, String)> = stmt
-            .query_map([token], |row| Ok((row.get(0)?, row.get(1)?)))
+        let rows: Vec<i64> = stmt
+            .query_map([token], |row| row.get(0))
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
@@ -330,12 +325,15 @@ fn bench_find_callers(conn: &Connection, iters: usize, token: &str) -> ShapeResu
 /// store's answer is for "search", it has to beat THIS wall-time by 2×.
 fn bench_search(conn: &Connection, iters: usize) -> ShapeResult {
     let mut stmt = conn
-        .prepare_cached("SELECT node_id, source_id, node_kind FROM _ast WHERE node_kind = ?1")
+        .prepare_cached(
+            "SELECT a.nid, k.raw_kind FROM _ast a \
+             JOIN kinds k ON k.kind_id = a.kind_id WHERE k.raw_kind = ?1",
+        )
         .unwrap();
     measure_shape("search", conn, iters, |_| {
-        let rows: Vec<(String, String, String)> = stmt
+        let rows: Vec<(i64, String)> = stmt
             .query_map(["function_declaration"], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                Ok((row.get(0)?, row.get(1)?))
             })
             .unwrap()
             .collect::<Result<_, _>>()

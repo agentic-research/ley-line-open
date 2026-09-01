@@ -503,9 +503,7 @@ mod tests {
         file.write_all(&(buf_size + 1).to_ne_bytes()).unwrap();
         file.flush().unwrap();
 
-        let err = VerifiedArena::open(&ctrl)
-            .err()
-            .expect("oversized data_size must be refused");
+        let err = VerifiedArena::open(&ctrl).expect_err("oversized data_size must be refused");
         assert!(err.to_string().contains("Header corruption"), "{err:#}");
     }
 

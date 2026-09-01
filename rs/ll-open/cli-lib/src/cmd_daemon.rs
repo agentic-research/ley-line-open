@@ -963,6 +963,10 @@ fn init_living_db(
         if let Some(source_dir) = source {
             verify_source_root_matches(&conn, source_dir).context("warm start (live-db)")?;
         }
+        // Unconditional — a serve-only daemon (`--source` unset) never
+        // parses, so this is its only shot at the pre-v5 refusal gate
+        // (publication-audit F1, bead `ley-line-open-17c271`).
+        crate::cmd_parse::refuse_pre_v5_projection(&conn).context("warm start (live-db)")?;
         eprintln!("warm start from {}", live_db_path.display());
         if let Some(source_dir) = source {
             run_initial_parse(&conn, source_dir, language, "incremental reparse")?;
@@ -997,6 +1001,8 @@ fn init_living_db(
         if let Some(source_dir) = source {
             verify_source_root_matches(&conn, source_dir).context("warm start (arena)")?;
         }
+        // Same F1 rationale as the live-db warm-start branch above.
+        crate::cmd_parse::refuse_pre_v5_projection(&conn).context("warm start (arena)")?;
         eprintln!("warm start from arena → {}", live_db_path.display());
         if let Some(source_dir) = source {
             run_initial_parse(&conn, source_dir, language, "incremental reparse")?;
@@ -2520,6 +2526,56 @@ mod tests {
             .query_row("SELECT id FROM sentinel", [], |r| r.get(0))
             .expect("warm start must preserve sentinel row");
         assert_eq!(sentinel, 42, "warm start must reopen existing live.db");
+    }
+
+    #[test]
+    fn a_serve_only_warm_start_refuses_a_pre_v5_live_db() {
+        // Publication-audit F1 (bead `ley-line-open-17c271`): the pre-v5
+        // refusal gate lived only inside the parse path, and
+        // run_initial_parse is gated on `--source`. A serve-only daemon
+        // (source = None) warm-starting over a v4 live db therefore never
+        // hit the gate — it published the v4 image to the arena and served
+        // ops that each died with per-op "no such column: nid" noise
+        // instead of the one actionable refusal at open.
+        let dir = TempDir::new().unwrap();
+        let ctrl_path = dir.path().join("v4warm.ctrl");
+        let live_db = live_db_path_for(&ctrl_path);
+
+        // Cold start, then shape the live db as a v4 projection: the
+        // version label, the `_file_index` probe target, and the
+        // TEXT-keyed `nodes` (no `nid` column).
+        {
+            let conn = init_living_db(&ctrl_path, &live_db, None, None, false).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO _meta VALUES ('projection_schema_version', 'projection-v4');
+                 CREATE TABLE _file_index (path TEXT PRIMARY KEY, mtime INTEGER, size INTEGER);
+                 CREATE TABLE nodes (id TEXT PRIMARY KEY, name TEXT, kind INTEGER);",
+            )
+            .unwrap();
+            drop(conn);
+        }
+
+        // Make the controller non-fresh so re-init takes the warm path.
+        {
+            let mut c = leyline_core::Controller::open_or_create(&ctrl_path).unwrap();
+            let fake_arena = dir.path().join("v4warm.arena");
+            let _ = leyline_core::create_arena(&fake_arena, 64 * 1024).unwrap();
+            let mut root = [0u8; 32];
+            root[0] = 0xCD;
+            c.set_arena_with_root(&fake_arena.to_string_lossy(), 64 * 1024, root)
+                .unwrap();
+            drop(c);
+        }
+
+        // Serve-only warm start (source = None) must refuse at open.
+        let err = init_living_db(&ctrl_path, &live_db, None, None, false)
+            .expect_err("a serve-only warm start over a v4 live db must refuse at open");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("projection-v4") || msg.contains("nid"),
+            "the refusal must name the version mismatch, got: {msg}",
+        );
     }
 
     #[test]

@@ -104,7 +104,7 @@ fn parse_repo_and_count(td: &TempDir) -> RowCounts {
         content: count(&conn, "SELECT COUNT(*) FROM node_content"),
         refs_with_container: count(
             &conn,
-            "SELECT COUNT(*) FROM node_refs WHERE container_node_id IS NOT NULL",
+            "SELECT COUNT(*) FROM node_refs WHERE container_nid IS NOT NULL",
         ),
     }
 }
@@ -162,12 +162,12 @@ fn f4_deterministic_container_node_ids_across_parses() {
     let conn_b = Connection::open_in_memory().unwrap();
     cmd_parse::parse_into_conn(&conn_b, td.path(), Some("go"), None).unwrap();
 
-    let query = "SELECT container_node_id, token, COUNT(*) \
+    let query = "SELECT container_nid, token, COUNT(*) \
                  FROM node_refs \
-                 WHERE container_node_id IS NOT NULL \
-                 GROUP BY container_node_id, token \
-                 ORDER BY container_node_id, token";
-    let read = |c: &Connection| -> Vec<(String, String, i64)> {
+                 WHERE container_nid IS NOT NULL \
+                 GROUP BY container_nid, token \
+                 ORDER BY container_nid, token";
+    let read = |c: &Connection| -> Vec<(i64, String, i64)> {
         let mut stmt = c.prepare(query).unwrap();
         stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .unwrap()
@@ -192,17 +192,24 @@ fn f4_deterministic_container_node_ids_across_parses() {
 /// that renumbers every node still produces identical counts, so those gates
 /// stay green while every stored reference silently rebinds to a different
 /// node.
-fn identity_snapshot(conn: &Connection) -> Vec<(String, String)> {
-    let mut stmt = conn
-        .prepare("SELECT node_id, source_id FROM _ast ORDER BY source_id, node_id")
-        .unwrap();
-    let mut out: Vec<(String, String)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+fn identity_snapshot(conn: &Connection) -> Vec<i64> {
+    // projection-v5: the nid IS the identity, and it encodes the file in
+    // its high bits — one integer carries what (node_id, source_id) did.
+    let mut stmt = conn.prepare("SELECT nid FROM _ast ORDER BY nid").unwrap();
+    let out: Vec<i64> = stmt
+        .query_map([], |r| r.get(0))
         .unwrap()
         .map(|r| r.unwrap())
         .collect();
-    out.sort();
     out
+}
+
+/// The nid range a file owns, for scoping a snapshot to one file.
+fn file_range(conn: &Connection, rel: &str) -> (i64, i64) {
+    let file_id = leyline_ts::schema::lookup_file_id(conn, rel)
+        .unwrap()
+        .unwrap_or_else(|| panic!("{rel} must be interned"));
+    leyline_ts::schema::file_nid_range(file_id)
 }
 
 /// **A scoped reparse of one file must not disturb the identity of any other
@@ -255,9 +262,10 @@ fn f4b_scoped_reparse_preserves_identities_of_untouched_files() {
     let conn = Connection::open_in_memory().unwrap();
     cmd_parse::parse_into_conn(&conn, td.path(), Some("go"), None).unwrap();
 
-    let before: Vec<(String, String)> = identity_snapshot(&conn)
+    let (b_lo, b_hi) = file_range(&conn, "b.go");
+    let before: Vec<i64> = identity_snapshot(&conn)
         .into_iter()
-        .filter(|(_, src)| src.ends_with("b.go"))
+        .filter(|nid| (b_lo..=b_hi).contains(nid))
         .collect();
     assert!(
         !before.is_empty(),
@@ -275,9 +283,9 @@ fn f4b_scoped_reparse_preserves_identities_of_untouched_files() {
     // Scoped reparse: only a.go, exactly as the git watcher drives it.
     cmd_parse::parse_into_conn(&conn, td.path(), Some("go"), Some(&["a.go".to_string()])).unwrap();
 
-    let after: Vec<(String, String)> = identity_snapshot(&conn)
+    let after: Vec<i64> = identity_snapshot(&conn)
         .into_iter()
-        .filter(|(_, src)| src.ends_with("b.go"))
+        .filter(|nid| (b_lo..=b_hi).contains(nid))
         .collect();
 
     assert_eq!(

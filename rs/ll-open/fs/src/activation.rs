@@ -115,15 +115,15 @@ where
     let mut already_fresh_nodes = 0_u64;
     let mut processed_source_bytes = 0_u64;
     let mut visited_nodes = 0_u64;
-    let mut last_id = None;
+    let mut last_nid = None;
 
     loop {
-        let rows = query_activation_page(conn, last_id.as_deref(), batch_size)?;
+        let rows = query_activation_page(conn, last_nid, batch_size)?;
 
         if rows.is_empty() {
             break;
         }
-        last_id = rows.last().cloned();
+        last_nid = rows.last().copied();
 
         // One transaction per PAGE, not per node. The work per node is a small
         // read plus a manifest rewrite; the commit dominated it, so a
@@ -132,8 +132,8 @@ where
         // `batch_size` nodes, and re-activation is idempotent via AlreadyFresh.
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
             .context("begin CDC activation page transaction")?;
-        for node_id in rows {
-            match activate_node_in_tx(&tx, &node_id)? {
+        for nid in rows {
+            match activate_node_in_tx(&tx, nid)? {
                 NodeActivation::Gone => {}
                 NodeActivation::AlreadyFresh => {
                     visited_nodes = checked_increment(visited_nodes, "visited CDC node count")?;
@@ -204,7 +204,7 @@ where
         tx.commit()
             .context("commit CDC activation convergence check")?;
 
-        match activate_node(conn, &stale_node)? {
+        match activate_node(conn, stale_node)? {
             NodeActivation::Gone => continue,
             NodeActivation::AlreadyFresh => {
                 visited_nodes = checked_increment(visited_nodes, "visited CDC node count")?;
@@ -229,34 +229,36 @@ where
     }
 }
 
+/// One keyset page of eligible nodes, ordered by the projection's own key.
+///
+/// projection-v5: the cursor is the integer `nid`, so the page walk rides the
+/// PRIMARY KEY directly instead of ordering a TEXT ancestry path.
 fn query_activation_page(
     conn: &Connection,
-    last_id: Option<&str>,
+    last_nid: Option<i64>,
     batch_size: i64,
-) -> Result<Vec<String>> {
-    let (sql, cursor): (&str, Option<&str>) = match last_id {
-        Some(cursor) => (
-            "SELECT id
+) -> Result<Vec<i64>> {
+    let sql = match last_nid {
+        Some(_) => {
+            "SELECT nid
                FROM nodes
-              WHERE kind = 0 AND record IS NOT NULL AND id > ?1
-              ORDER BY id
-              LIMIT ?2",
-            Some(cursor),
-        ),
-        None => (
-            "SELECT id
+              WHERE kind = 0 AND record IS NOT NULL AND nid > ?1
+              ORDER BY nid
+              LIMIT ?2"
+        }
+        None => {
+            "SELECT nid
                FROM nodes
               WHERE kind = 0 AND record IS NOT NULL
-              ORDER BY id
-              LIMIT ?1",
-            None,
-        ),
+              ORDER BY nid
+              LIMIT ?1"
+        }
     };
     let mut stmt = conn.prepare(sql).context("prepare CDC activation page")?;
-    let mapped = if let Some(cursor) = cursor {
-        stmt.query_map(params![cursor, batch_size], read_node_id)
+    let mapped = if let Some(cursor) = last_nid {
+        stmt.query_map(params![cursor, batch_size], read_nid)
     } else {
-        stmt.query_map(params![batch_size], read_node_id)
+        stmt.query_map(params![batch_size], read_nid)
     }
     .context("query CDC activation page")?;
     mapped
@@ -264,23 +266,23 @@ fn query_activation_page(
         .context("decode CDC activation page")
 }
 
-fn read_node_id(row: &rusqlite::Row<'_>) -> rusqlite::Result<String> {
+fn read_nid(row: &rusqlite::Row<'_>) -> rusqlite::Result<i64> {
     row.get(0)
 }
 
-fn first_nonfresh_node(tx: &Transaction<'_>, batch_size: i64) -> Result<Option<String>> {
-    let mut last_id = None;
+fn first_nonfresh_node(tx: &Transaction<'_>, batch_size: i64) -> Result<Option<i64>> {
+    let mut last_nid = None;
     loop {
-        let rows = query_activation_page(tx, last_id.as_deref(), batch_size)?;
+        let rows = query_activation_page(tx, last_nid, batch_size)?;
         if rows.is_empty() {
             return Ok(None);
         }
-        last_id = rows.last().cloned();
-        for node_id in rows {
-            if !has_chunked_content_in_transaction(tx, &node_id)
-                .with_context(|| format!("verify final CDC freshness for node {node_id}"))?
+        last_nid = rows.last().copied();
+        for nid in rows {
+            if !has_chunked_content_in_transaction(tx, nid)
+                .with_context(|| format!("verify final CDC freshness for node {nid}"))?
             {
-                return Ok(Some(node_id));
+                return Ok(Some(nid));
             }
         }
     }
@@ -304,32 +306,32 @@ enum NodeActivation {
 /// uses [`activate_node`] for its single-node repairs. Neither begins nor
 /// commits — that is the caller's, so commit granularity is a policy decision
 /// rather than a property of this function.
-fn activate_node_in_tx(tx: &Transaction<'_>, node_id: &str) -> Result<NodeActivation> {
+fn activate_node_in_tx(tx: &Transaction<'_>, nid: i64) -> Result<NodeActivation> {
     let source: Option<(Vec<u8>, i64)> = tx
         .query_row(
             "SELECT CAST(record AS BLOB), size
                FROM nodes
-              WHERE id = ?1 AND kind = 0 AND record IS NOT NULL",
-            params![node_id],
+              WHERE nid = ?1 AND kind = 0 AND record IS NOT NULL",
+            params![nid],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
-        .with_context(|| format!("read authoritative CDC source for node {node_id}"))?;
+        .with_context(|| format!("read authoritative CDC source for node {nid}"))?;
     let Some((data, declared_size)) = source else {
         return Ok(NodeActivation::Gone);
     };
     ensure!(
         declared_size >= 0 && u64::try_from(declared_size).ok() == u64::try_from(data.len()).ok(),
-        "node {node_id} size {declared_size} does not match {} record bytes",
+        "node {nid} size {declared_size} does not match {} record bytes",
         data.len()
     );
-    if has_chunked_content_in_transaction(tx, node_id)
-        .with_context(|| format!("check CDC freshness for node {node_id}"))?
+    if has_chunked_content_in_transaction(tx, nid)
+        .with_context(|| format!("check CDC freshness for node {nid}"))?
     {
         return Ok(NodeActivation::AlreadyFresh);
     }
-    store_content_chunked_in_transaction(tx, node_id, &data)
-        .with_context(|| format!("activate CDC for node {node_id}"))?;
+    store_content_chunked_in_transaction(tx, nid, &data)
+        .with_context(|| format!("activate CDC for node {nid}"))?;
     Ok(NodeActivation::Populated {
         source_bytes: u64::try_from(data.len()).context("node length exceeds u64")?,
     })
@@ -337,12 +339,12 @@ fn activate_node_in_tx(tx: &Transaction<'_>, node_id: &str) -> Result<NodeActiva
 
 /// Activate a single node in its own transaction — the convergence loop's
 /// repair path, where one stale row is fixed at a time.
-fn activate_node(conn: &Connection, node_id: &str) -> Result<NodeActivation> {
+fn activate_node(conn: &Connection, nid: i64) -> Result<NodeActivation> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
-        .with_context(|| format!("begin CDC activation transaction for node {node_id}"))?;
-    let outcome = activate_node_in_tx(&tx, node_id)?;
+        .with_context(|| format!("begin CDC activation transaction for node {nid}"))?;
+    let outcome = activate_node_in_tx(&tx, nid)?;
     tx.commit()
-        .with_context(|| format!("commit CDC activation for node {node_id}"))?;
+        .with_context(|| format!("commit CDC activation for node {nid}"))?;
     Ok(outcome)
 }
 
@@ -365,7 +367,7 @@ fn validate_nodes_contract(conn: &Connection) -> Result<()> {
         .context("query nodes columns for CDC activation")?
         .collect::<rusqlite::Result<BTreeSet<_>>>()
         .context("decode nodes columns for CDC activation")?;
-    let required = ["id", "kind", "mtime", "record", "size"];
+    let required = ["kind", "mtime", "nid", "record", "size"];
     let missing = required
         .into_iter()
         .filter(|column| !actual.contains(*column))
@@ -897,5 +899,154 @@ mod tests {
             None,
             "after activation the probe must report convergence"
         );
+    }
+
+    /// The page walk's RESULT, asserted as an exact vector — not merely
+    /// "nonempty". A page that silently returns nothing (or one arbitrary
+    /// nid) makes activation report a converged, fully-activated arena while
+    /// having visited no rows at all, and every count in `ActivationReport`
+    /// stays self-consistently zero. So the three things the SQL actually
+    /// promises are pinned by value:
+    ///
+    ///   1. WHICH nids — eligible leaves only. A directory (`kind = 1`) and
+    ///      an unwritten leaf (`record IS NULL`) are both excluded, so the
+    ///      answer is a strict subset of the rows present.
+    ///   2. ORDER — ascending `nid`. projection-v5 rides the PRIMARY KEY, and
+    ///      the keyset cursor below is only correct if the page is sorted.
+    ///   3. The CURSOR and the LIMIT — `nid > last` resumes strictly after the
+    ///      previous page, and `LIMIT` truncates from the front of that order.
+    ///      Without both, the caller's loop either re-walks the same page
+    ///      forever or skips rows.
+    #[test]
+    fn the_activation_page_returns_the_eligible_nids_in_key_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        leyline_schema::create_schema(&conn).unwrap();
+        let dir = crate::graph::fixtures::put_dir(&conn, "pkg", 100).unwrap();
+        let first = crate::graph::fixtures::put_file(&conn, "pkg/a.rs", 100, Some("a")).unwrap();
+        let second = crate::graph::fixtures::put_file(&conn, "pkg/b.rs", 100, Some("bb")).unwrap();
+        // Eligible-looking but not: no record yet.
+        crate::graph::fixtures::put_file(&conn, "pkg/c.rs", 100, None).unwrap();
+        let third = crate::graph::fixtures::put_file(&conn, "pkg/d.rs", 100, Some("ddd")).unwrap();
+
+        // The fixture really does span both nid classes and more than one
+        // file, so "ordered by nid" is a claim with content.
+        assert!(dir < 0, "a directory nid is negative: {dir}");
+        assert!(
+            first < second && second < third,
+            "file nids ascend with file_id: {first} {second} {third}"
+        );
+
+        assert_eq!(
+            query_activation_page(&conn, None, 16).unwrap(),
+            vec![first, second, third],
+            "the first page is every eligible leaf, ascending — dirs and \
+             record-less nodes excluded"
+        );
+        assert_eq!(
+            query_activation_page(&conn, Some(first), 16).unwrap(),
+            vec![second, third],
+            "the cursor resumes strictly AFTER the last nid of the prior page"
+        );
+        assert_eq!(
+            query_activation_page(&conn, None, 2).unwrap(),
+            vec![first, second],
+            "the limit truncates the front of the key order"
+        );
+        assert_eq!(
+            query_activation_page(&conn, Some(third), 16).unwrap(),
+            Vec::<i64>::new(),
+            "a cursor past the last eligible nid ends the walk"
+        );
+    }
+
+    /// The convergence probe must name the STALE node, and only the stale
+    /// one. Two nodes, the FRESH one deliberately lower in nid order, so the
+    /// probe has to walk past a satisfied node to reach the unsatisfied one:
+    ///
+    /// - Returning `None` here would declare a half-activated arena complete,
+    ///   which is the whole failure this probe exists to catch.
+    /// - Returning the FRESH node instead (what dropping the `!` on the
+    ///   freshness check does) inverts the predicate: activation would then
+    ///   loop forever re-activating an already-fresh node while the stale one
+    ///   is never visited. `Some(fresh)` and `Some(stale)` are both "found
+    ///   something", so only the exact nid distinguishes them.
+    #[test]
+    fn the_convergence_probe_names_the_stale_node_not_the_fresh_one() {
+        let conn = Connection::open_in_memory().unwrap();
+        leyline_schema::create_schema(&conn).unwrap();
+        create_chunked_content_schema(&conn).unwrap();
+        let alpha = "a".repeat(9_000);
+        let beta = "b".repeat(9_000);
+        let fresh = crate::graph::fixtures::put_file(&conn, "a.rs", 100, Some(&alpha)).unwrap();
+        let stale = crate::graph::fixtures::put_file(&conn, "b.rs", 100, Some(&beta)).unwrap();
+        assert!(
+            fresh < stale,
+            "the fresh node must sort FIRST, so the probe has to skip it: {fresh} {stale}"
+        );
+
+        activate_node(&conn, fresh).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        assert!(
+            has_chunked_content_in_transaction(&tx, fresh).unwrap(),
+            "fixture precondition: the first node is genuinely fresh"
+        );
+        assert!(
+            !has_chunked_content_in_transaction(&tx, stale).unwrap(),
+            "fixture precondition: the second node is genuinely stale"
+        );
+        assert_eq!(
+            first_nonfresh_node(&tx, 16).unwrap(),
+            Some(stale),
+            "the probe must skip the fresh node and name the STALE nid"
+        );
+        drop(tx);
+
+        activate_node(&conn, stale).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        assert_eq!(
+            first_nonfresh_node(&tx, 16).unwrap(),
+            None,
+            "with every node fresh the probe must report convergence"
+        );
+    }
+
+    /// Activation's precondition check on `nodes`, asserted as a REFUSAL.
+    /// Skipping it does not fail loudly later — activation would walk a table
+    /// it has not established the shape of and take whatever SQL error falls
+    /// out, so the named contract message is the observable.
+    ///
+    /// Both failure modes, because they are different queries: the table
+    /// absent entirely, and the table present but missing columns activation
+    /// reads. The third case is the one that proves the check is not simply
+    /// always-refusing — the real schema passes.
+    #[test]
+    fn the_nodes_contract_refuses_a_missing_table_and_missing_columns() {
+        let absent = Connection::open_in_memory().unwrap();
+        let err = validate_nodes_contract(&absent).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("missing required nodes table for CDC activation"),
+            "must refuse a missing table by name: {err:#}"
+        );
+
+        let partial = Connection::open_in_memory().unwrap();
+        partial
+            .execute_batch(
+                "CREATE TABLE nodes (nid INTEGER PRIMARY KEY, kind INTEGER, mtime INTEGER)",
+            )
+            .unwrap();
+        let err = validate_nodes_contract(&partial).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("missing required nodes columns"),
+            "must refuse an incomplete table by name: {message}"
+        );
+        assert!(
+            message.contains("record") && message.contains("size"),
+            "the refusal must NAME the columns it needs: {message}"
+        );
+
+        let real = Connection::open_in_memory().unwrap();
+        leyline_schema::create_schema(&real).unwrap();
+        validate_nodes_contract(&real).expect("the canonical schema satisfies the contract");
     }
 }

@@ -73,13 +73,42 @@ pub(super) fn configure_process_group(command: &mut Command) {
 }
 
 pub(super) fn terminate_process_group(pid: u32) {
-    // SAFETY: `pid` came directly from a live Child. A negative pid addresses
-    // the process group established before exec; the direct-pid fallback
-    // still reaps a worker if group setup failed at the OS boundary.
+    // Sweep, wait for the leader to actually die, sweep again.
+    //
+    // One `kill(-pgid, SIGKILL)` is not enough, and DETERMINISTICALLY so
+    // when the leader is inside an in-flight `fork()`: SIGKILL is delivered
+    // at kernel exit, so the fork COMPLETES first — its child is enrolled
+    // in the group only then, after every immediate re-sweep has already
+    // enumerated members and returned "success". That is how a rejected
+    // worker's just-forked grandchild survived the sweep every single run,
+    // and how 1,869 of them accumulated on a maintainer machine over 18
+    // days (bead rs-a1e8d0; SIGSTOP-first was tried and falsified — the
+    // stop posts into the same in-flight-fork window).
+    //
+    // `await_exit_without_reaping` is what makes the second sweep both
+    // meaningful and safe: a dead leader can no longer fork, so everything
+    // it created is enrolled by the time its exit is observable, and its
+    // unreaped zombie keeps the pgid allocated so the re-sweep cannot land
+    // on a recycled group. If the wait fails (leader already reaped
+    // elsewhere), the re-sweep is SKIPPED for exactly that reason.
+    //
+    // Best-effort beyond one generation by design: a descendant that is
+    // itself mid-fork during the second sweep has the same escape, and
+    // chasing it without a process freezer is unbounded. An adversarial
+    // forker is the microVM/vsock confinement boundary's problem, not this
+    // function's; this closes the honest-worker window that was leaking.
+    //
+    // SAFETY: `pid` came directly from a live Child. A negative pid
+    // addresses the process group established before exec; the direct-pid
+    // fallback still reaps a worker if group setup failed at the OS
+    // boundary.
     unsafe {
         let process_group = -(pid as libc::pid_t);
         if libc::kill(process_group, libc::SIGKILL) == -1 {
             let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+        if await_exit_without_reaping(pid).is_ok() {
+            let _ = libc::kill(process_group, libc::SIGKILL);
         }
     }
 }

@@ -319,6 +319,11 @@ impl EnrichmentPass for TreeSitterPass {
             "node_defs",
             "_imports",
             "_file_index",
+            // projection-v5 interning tables (bead ley-line-open-17c271).
+            "names",
+            "dirs",
+            "files",
+            "kinds",
         ]
     }
 
@@ -483,6 +488,10 @@ mod tests {
                 "node_defs",
                 "_imports",
                 "_file_index",
+                "names",
+                "dirs",
+                "files",
+                "kinds",
             ],
         );
     }

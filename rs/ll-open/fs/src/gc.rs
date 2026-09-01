@@ -68,10 +68,9 @@ pub fn collect_unreachable_chunks(conn: &Connection, options: GcOptions) -> Resu
         .context("begin CDC reachability GC transaction")?;
     // Both per-target manifest schemas, idempotent inside this transaction —
     // a projection activated for only ONE target still needs both tables to
-    // exist for the predicates below to reference, and a pre-b82f56 arena
-    // being GC'd for the first time post-upgrade migrates its witness
-    // infrastructure here. A dry run's rollback keeps all of it
-    // non-mutating.
+    // exist for the predicates below to reference, and an arena with the
+    // chunk pool but no witness table gains one here. A dry run's rollback
+    // keeps all of it non-mutating.
     crate::chunked::create_chunked_content_schema(&tx)
         .context("ensure node manifest schema before GC")?;
     crate::blob_chunked::ensure_blob_manifest_infra(&tx)
@@ -168,7 +167,7 @@ pub fn collect_unreachable_chunks(conn: &Connection, options: GcOptions) -> Resu
 /// One predicate covers all three ways that happens, which is why it is
 /// written once and applied to both tables:
 ///
-/// * the node is gone — the join finds nothing (path reuse after
+/// * the node is gone — the join finds nothing (nid reuse after
 ///   `remove_node`/`rename_node`, the cross-generation leak from `0330c7`);
 /// * the witness disagrees — `(size, mtime)` moved on behind this crate;
 /// * the witness row is missing entirely — spans with no meta row.
@@ -188,8 +187,8 @@ fn dead_manifest_predicate(table: &str) -> String {
         "NOT EXISTS (
              SELECT 1
                FROM content_manifest_meta AS m
-               JOIN nodes AS n ON n.id = m.node_id
-              WHERE m.node_id = {table}.node_id
+               JOIN nodes AS n ON n.nid = m.nid
+              WHERE m.nid = {table}.nid
                 AND {}
          )",
         crate::chunked::WITNESS_FRESH_PREDICATE
@@ -339,7 +338,7 @@ fn validate_gc_schema(conn: &Connection) -> Result<()> {
         validate_table_columns(
             conn,
             "content_manifest",
-            &["node_id", "seq", "chunk_hash", "byte_offset", "byte_len"],
+            &["nid", "seq", "chunk_hash", "byte_offset", "byte_len"],
         )?;
     }
     if blob_manifest {
@@ -413,33 +412,57 @@ mod tests {
             .unwrap()
     }
 
-    /// A `nodes` table plus one row, so manifest freshness is evaluable.
-    fn insert_node(conn: &Connection, id: &str, content: &str, mtime: i64) {
+    /// A nid for a node this file never gives a `nodes` row. These tests
+    /// exercise the chunk pool and its reachability, where a nid is nothing
+    /// but the manifest's key.
+    fn node(file_id: i64) -> i64 {
+        leyline_schema::file_nid(file_id, 0)
+    }
+
+    /// A `nodes` row for `path`, so manifest freshness is evaluable. Returns
+    /// the nid the projection assigned it.
+    fn insert_node_row(conn: &Connection, path: &str, content: &str, mtime: i64) -> i64 {
         // The CANONICAL contract, not a hand-rolled copy. A fixture that
         // declares its own `nodes` DDL drifts from what producers ship
         // against — which is how `record JSON`'s NUMERIC affinity went
         // unnoticed (bead `ley-line-open-f7966d`).
-        leyline_schema::create_nodes_table(conn).unwrap();
-        conn.execute(
-            "INSERT OR REPLACE INTO nodes (id, name, kind, size, mtime, record) VALUES (?1, ?1, 0, ?2, ?3, ?4)",
-            rusqlite::params![id, content.len() as i64, mtime, content],
+        leyline_schema::create_schema(conn).unwrap();
+        let file_id = leyline_schema::ensure_file_id(conn, path).unwrap();
+        let dir_id = leyline_schema::ensure_dir_nodes(conn, path, mtime).unwrap();
+        let name = path.rsplit('/').next().unwrap();
+        let name_id = leyline_schema::intern_name(conn, name).unwrap();
+        let nid = leyline_schema::file_nid(file_id, 0);
+        leyline_schema::insert_node(
+            conn,
+            nid,
+            Some(leyline_schema::dir_nid(dir_id)),
+            Some(name_id),
+            None,
+            0,
+            0,
+            content.len() as i64,
+            mtime,
+            content,
         )
         .unwrap();
+        nid
     }
 
-    fn count_manifest_rows(conn: &Connection, node_id: &str) -> i64 {
+    fn count_manifest_rows(conn: &Connection, nid: i64) -> i64 {
         conn.query_row(
-            "SELECT COUNT(*) FROM content_manifest WHERE node_id = ?1",
-            rusqlite::params![node_id],
+            "SELECT COUNT(*) FROM content_manifest WHERE nid = ?1",
+            rusqlite::params![nid],
             |row| row.get(0),
         )
         .unwrap()
     }
 
-    /// Node ids are PATHS and paths get reused. A manifest whose node is gone
-    /// is refused by every read (the freshness witness has nothing to join
-    /// against) yet still references its chunks — so reachability GC sees them
-    /// as live and reclaims nothing, forever.
+    /// A manifest whose node is gone is refused by every read (the freshness
+    /// witness has nothing to join against) yet still references its chunks —
+    /// so reachability GC sees them as live and reclaims nothing, forever.
+    /// `files` being append-only means the vacated nid is handed straight back
+    /// to whatever is created at that path next, so the orphan is reachable
+    /// again rather than merely wasted.
     ///
     /// Bead `ley-line-open-b5e56f`. This is the hygiene half of `0330c7`:
     /// correctness degrades safely, storage does not.
@@ -447,18 +470,18 @@ mod tests {
     fn gc_reaps_manifests_whose_node_is_gone() {
         let conn = db();
         let data = vec![b'x'; 40_000];
-        insert_node(&conn, "n", std::str::from_utf8(&data).unwrap(), 1);
-        store_content_chunked(&conn, "n", &data).unwrap();
+        let nid = insert_node_row(&conn, "n", std::str::from_utf8(&data).unwrap(), 1);
+        store_content_chunked(&conn, nid, &data).unwrap();
         assert!(count_chunks(&conn) > 0, "precondition: chunks stored");
 
-        // Removed out of band — exactly the path-reuse orphan from 0330c7.
-        conn.execute("DELETE FROM nodes WHERE id = 'n'", [])
+        // Removed out of band — exactly the nid-reuse orphan from 0330c7.
+        conn.execute("DELETE FROM nodes WHERE nid = ?1", [nid])
             .unwrap();
 
         collect_unreachable_chunks(&conn, GcOptions::default()).unwrap();
 
         assert_eq!(
-            count_manifest_rows(&conn, "n"),
+            count_manifest_rows(&conn, nid),
             0,
             "a manifest whose node is gone must be reaped"
         );
@@ -528,20 +551,20 @@ mod tests {
     fn gc_reaps_manifests_with_a_stale_witness() {
         let conn = db();
         let data = vec![b'y'; 40_000];
-        insert_node(&conn, "n", std::str::from_utf8(&data).unwrap(), 1);
-        store_content_chunked(&conn, "n", &data).unwrap();
+        let nid = insert_node_row(&conn, "n", std::str::from_utf8(&data).unwrap(), 1);
+        store_content_chunked(&conn, nid, &data).unwrap();
 
         // Record moved on behind this crate's back: size and mtime both shift.
         conn.execute(
-            "UPDATE nodes SET record = 'zzz', size = 3, mtime = 999 WHERE id = 'n'",
-            [],
+            "UPDATE nodes SET record = 'zzz', size = 3, mtime = 999 WHERE nid = ?1",
+            [nid],
         )
         .unwrap();
 
         collect_unreachable_chunks(&conn, GcOptions::default()).unwrap();
 
         assert_eq!(
-            count_manifest_rows(&conn, "n"),
+            count_manifest_rows(&conn, nid),
             0,
             "a stale manifest must be reaped"
         );
@@ -554,16 +577,16 @@ mod tests {
     fn gc_preserves_fresh_manifests_and_their_chunks() {
         let conn = db();
         let data = vec![b'z'; 40_000];
-        insert_node(&conn, "n", std::str::from_utf8(&data).unwrap(), 1);
-        store_content_chunked(&conn, "n", &data).unwrap();
+        let nid = insert_node_row(&conn, "n", std::str::from_utf8(&data).unwrap(), 1);
+        store_content_chunked(&conn, nid, &data).unwrap();
         let before = count_chunks(&conn);
 
         collect_unreachable_chunks(&conn, GcOptions::default()).unwrap();
 
-        assert!(count_manifest_rows(&conn, "n") > 0, "fresh manifest kept");
+        assert!(count_manifest_rows(&conn, nid) > 0, "fresh manifest kept");
         assert_eq!(count_chunks(&conn), before, "fresh chunks kept");
         let mut buf = vec![0u8; data.len()];
-        let n = read_content_chunked(&conn, "n", &mut buf, 0).unwrap();
+        let n = read_content_chunked(&conn, nid, &mut buf, 0).unwrap();
         assert_eq!(n, data.len());
         assert_eq!(buf, data, "and the content still reads back");
     }
@@ -572,8 +595,8 @@ mod tests {
     fn dry_run_accounts_for_unreachable_chunks_without_mutating() {
         let conn = db();
         let data = vec![0x5a; 128 * 1024];
-        store_content_chunked(&conn, "removed", &data).unwrap();
-        invalidate_chunked_content(&conn, "removed").unwrap();
+        store_content_chunked(&conn, node(2), &data).unwrap();
+        invalidate_chunked_content(&conn, node(2)).unwrap();
         let before = count_chunks(&conn);
         assert!(before > 0);
 
@@ -593,10 +616,10 @@ mod tests {
     fn collection_preserves_shared_chunks_until_the_final_manifest_is_gone() {
         let conn = db();
         let data = vec![0x33; 96 * 1024];
-        store_content_chunked(&conn, "live", &data).unwrap();
-        store_content_chunked(&conn, "removed", &data).unwrap();
+        store_content_chunked(&conn, node(1), &data).unwrap();
+        store_content_chunked(&conn, node(2), &data).unwrap();
         let shared_rows = count_chunks(&conn);
-        invalidate_chunked_content(&conn, "removed").unwrap();
+        invalidate_chunked_content(&conn, node(2)).unwrap();
 
         let first = collect_unreachable_chunks(&conn, GcOptions::default()).unwrap();
 
@@ -605,12 +628,12 @@ mod tests {
         assert_eq!(count_chunks(&conn), shared_rows);
         let mut round_trip = vec![0_u8; data.len()];
         assert_eq!(
-            read_content_chunked(&conn, "live", &mut round_trip, 0).unwrap(),
+            read_content_chunked(&conn, node(1), &mut round_trip, 0).unwrap(),
             data.len()
         );
         assert_eq!(round_trip, data);
 
-        invalidate_chunked_content(&conn, "live").unwrap();
+        invalidate_chunked_content(&conn, node(1)).unwrap();
         let second = collect_unreachable_chunks(&conn, GcOptions::default()).unwrap();
         assert_eq!(second.deleted_chunk_rows, shared_rows as u64);
         assert_eq!(second.deleted_chunk_bytes, second.before_chunk_bytes);
@@ -623,9 +646,9 @@ mod tests {
         let conn = db();
         let live = vec![0x11; 96 * 1024];
         let removed = vec![0x77; 96 * 1024];
-        store_content_chunked(&conn, "live", &live).unwrap();
-        store_content_chunked(&conn, "removed", &removed).unwrap();
-        invalidate_chunked_content(&conn, "removed").unwrap();
+        store_content_chunked(&conn, node(1), &live).unwrap();
+        store_content_chunked(&conn, node(2), &removed).unwrap();
+        invalidate_chunked_content(&conn, node(2)).unwrap();
 
         let report = collect_unreachable_chunks(&conn, GcOptions::default()).unwrap();
 
@@ -641,7 +664,7 @@ mod tests {
         );
         let mut round_trip = vec![0_u8; live.len()];
         assert_eq!(
-            read_content_chunked(&conn, "live", &mut round_trip, 0).unwrap(),
+            read_content_chunked(&conn, node(1), &mut round_trip, 0).unwrap(),
             live.len()
         );
         assert_eq!(round_trip, live);
@@ -650,8 +673,8 @@ mod tests {
     #[test]
     fn collection_is_idempotent_and_reports_deterministic_zeroes() {
         let conn = db();
-        store_content_chunked(&conn, "removed", b"historical").unwrap();
-        invalidate_chunked_content(&conn, "removed").unwrap();
+        store_content_chunked(&conn, node(2), b"historical").unwrap();
+        invalidate_chunked_content(&conn, node(2)).unwrap();
 
         let first = collect_unreachable_chunks(&conn, GcOptions::default()).unwrap();
         let second = collect_unreachable_chunks(&conn, GcOptions::default()).unwrap();
@@ -670,8 +693,8 @@ mod tests {
     #[test]
     fn failed_collection_rolls_back_every_chunk() {
         let conn = db();
-        store_content_chunked(&conn, "removed", b"historical").unwrap();
-        invalidate_chunked_content(&conn, "removed").unwrap();
+        store_content_chunked(&conn, node(2), b"historical").unwrap();
+        invalidate_chunked_content(&conn, node(2)).unwrap();
         let before = count_chunks(&conn);
         conn.execute_batch(
             "CREATE TRIGGER fail_gc BEFORE DELETE ON content_chunks
@@ -711,7 +734,7 @@ mod tests {
     #[test]
     fn collection_installs_and_uses_the_manifest_hash_index() {
         let conn = db();
-        store_content_chunked(&conn, "live", b"still reachable").unwrap();
+        store_content_chunked(&conn, node(1), b"still reachable").unwrap();
         conn.execute("DROP INDEX content_manifest_chunk_hash", [])
             .unwrap();
 
@@ -744,7 +767,7 @@ mod tests {
     #[test]
     fn dry_run_rolls_back_the_legacy_projection_index_migration() {
         let conn = db();
-        store_content_chunked(&conn, "live", b"still reachable").unwrap();
+        store_content_chunked(&conn, node(1), b"still reachable").unwrap();
         conn.execute("DROP INDEX content_manifest_chunk_hash", [])
             .unwrap();
 

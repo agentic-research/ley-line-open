@@ -18,9 +18,14 @@ $Go.import("github.com/agentic-research/ley-line-open/clients/go/leyline-schema/
 using Common = import "common.capnp";
 
 struct AstNode {
-  # Stable per-parse-run node identifier — path-shaped, e.g.
-  # `pkg/auth.go/function_declaration/block/statement_list/...`.
-  # Matches `_ast.node_id` in the SQL projection.
+  # RETIRED (written empty since Phase A of bead ley-line-open-17c271).
+  # The slot is kept because persisted `capnp_blobs` pin capnp ordinals —
+  # removing @0 would renumber the struct and break decoding of every
+  # stored blob. A node's address inside an `AstNodeList` is its ordinal
+  # (`_ast_pointer.offset_in_blob`); the SQL projection's `_ast.node_id`
+  # remains the queryable locator. Keeping the locator OUT of the hashed
+  # preimage is what lets the projection re-key (integer nids, Phase B)
+  # without moving every `blob_hash`.
   nodeId @0 :Text;
 
   # The `_source.id` (relative path) the node belongs to.

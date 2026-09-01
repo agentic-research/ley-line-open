@@ -29,10 +29,30 @@ fn request() -> ExecutionRequest {
     }
 }
 
+/// Publish an executable fixture at `path` by `rename`, never by writing in place.
+///
+/// `exec` fails with `ETXTBSY` ("Text file busy") when ANY process holds the
+/// target open for writing. libtest runs these tests on parallel threads and the
+/// runtime forks children, so one test's still-open `fs::write` handle can be
+/// inherited by another test's `fork()`, and an `exec` landing in that window
+/// dies. `O_CLOEXEC` does not save us: it fires AT exec, which is the very call
+/// that fails.
+///
+/// Writing to a scratch name and renaming means the path the backend execs
+/// always names an inode no process has ever opened for writing — the race is
+/// removed rather than narrowed. Same family as the `kill(-pgid)`-vs-`fork()`
+/// race fixed in #374 (bead `ley-line-open-cdfaf4`).
+fn publish_executable(path: &std::path::Path, body: &str) {
+    let name = path.file_name().expect("fixture path names a file");
+    let staging = path.with_file_name(format!("{}.staging", name.to_string_lossy()));
+    fs::write(&staging, body).expect("worker fixture");
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o755)).expect("worker mode");
+    fs::rename(&staging, path).expect("publish worker fixture");
+}
+
 fn backend(fixture: &TempDir, worker_body: &str) -> (NativeWorkerBackend, std::path::PathBuf) {
     let worker = fixture.path().join("leyline-native-worker");
-    fs::write(&worker, worker_body).expect("worker fixture");
-    fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("worker mode");
+    publish_executable(&worker, worker_body);
     let cas_root = fixture.path().join("cas");
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&cas_root).expect("CAS root");
@@ -189,9 +209,14 @@ fn native_cleanup_restores_guest_created_permissions() {
 #[test]
 fn cancel_kills_worker_and_removes_run_root() {
     let fixture = TempDir::new().expect("fixture");
+    // Long-lived fake workers `exec` their sleeper so the worker PID IS the
+    // sleeper — without exec, tail is a grandchild the backend's kill never
+    // reaches, and it leaks past the test run (bead rs-a1e8d0; the krun
+    // twin's rejection paths accumulated 1,869 orphans on a maintainer
+    // machine).
     let (backend, runs) = backend(
         &fixture,
-        "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\n/usr/bin/tail -f /dev/null\n",
+        "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\nexec /usr/bin/tail -f /dev/null\n",
     );
     backend.start(&request()).expect("worker readiness");
     assert_eq!(fs::read_dir(&runs).expect("runs").count(), 1);
@@ -211,7 +236,7 @@ fn backend_trait_cancel_delegates_and_drop_waits_for_cleanup() {
     let fixture = TempDir::new().expect("fixture");
     let (backend, runs) = backend(
         &fixture,
-        "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\n/usr/bin/tail -f /dev/null\n",
+        "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\nexec /usr/bin/tail -f /dev/null\n",
     );
     backend.start(&request()).expect("worker readiness");
     assert!(Backend::cancel(&backend, "native-run-01").expect("trait cancel"));

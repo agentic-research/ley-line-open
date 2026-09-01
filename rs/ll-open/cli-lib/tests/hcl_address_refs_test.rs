@@ -64,24 +64,27 @@ terraform {
         .deserialize_read_exact("main", Cursor::new(&bytes), bytes.len(), true)
         .unwrap();
 
+    // projection-v5: `node_refs.source_id` is gone — a ref's file is
+    // `nid >> 24`, so the file assertion is a range check against the
+    // interned `file_id` of main.tf, and the `_ast` linkage is a
+    // PRIMARY KEY equality on nid instead of the (node_id, source_id) pair.
+    let file_id = leyline_ts::schema::lookup_file_id(&artifact, "main.tf")
+        .unwrap()
+        .expect("main.tf must be interned by the parse");
+    let (lo, hi) = leyline_ts::schema::file_nid_range(file_id);
+
     let mut stmt = artifact
         .prepare(
-            "SELECT r.token, r.node_id, r.source_id, r.container_node_id, a.node_kind
+            "SELECT r.token, r.nid, r.container_nid, k.raw_kind
              FROM node_refs AS r
-             JOIN _ast AS a
-               ON a.node_id = r.node_id AND a.source_id = r.source_id
+             JOIN _ast AS a ON a.nid = r.nid
+             JOIN kinds AS k ON k.kind_id = a.kind_id
              ORDER BY r.token",
         )
         .unwrap();
-    let rows: Vec<(String, String, String, Option<String>, String)> = stmt
+    let rows: Vec<(String, i64, Option<i64>, String)> = stmt
         .query_map([], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })
         .unwrap()
         .map(|row| row.unwrap())
@@ -96,10 +99,12 @@ terraform {
             "mod:github.com/example/terraform-app//modules/service?ref=v1.2.3",
         ]
     );
-    for (_, node_id, source_id, container_node_id, node_kind) in rows {
-        assert!(!node_id.is_empty(), "node_refs.node_id must be populated");
-        assert_eq!(source_id, "main.tf");
-        assert_eq!(container_node_id, None);
+    for (token, nid, container_nid, node_kind) in rows {
+        assert!(
+            (lo..=hi).contains(&nid),
+            "{token}: node_refs.nid must live in main.tf's nid range"
+        );
+        assert_eq!(container_nid, None);
         assert_eq!(node_kind, "block");
     }
 }

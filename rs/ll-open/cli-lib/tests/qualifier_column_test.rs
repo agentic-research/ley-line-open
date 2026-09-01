@@ -32,9 +32,9 @@ use tempfile::TempDir;
 
 /// Parse a Go source snippet through the full `parse_into_conn`
 /// pipeline (same harness as `container_node_id_test.rs`).
-fn parse_go_to_conn(source: &str, source_id: &str) -> Connection {
+fn parse_go_to_conn(source: &str, rel: &str) -> Connection {
     let td = TempDir::new().unwrap();
-    fs::write(td.path().join(source_id), source).unwrap();
+    fs::write(td.path().join(rel), source).unwrap();
     let conn = Connection::open_in_memory().unwrap();
     cmd_parse::parse_into_conn(&conn, td.path(), Some("go"), None).unwrap();
     conn
@@ -99,10 +99,14 @@ func f() {
 }
 ";
     let conn = parse_go_to_conn(source, "main.go");
+    // projection-v5: node_refs has no `source_id`. A ref's file is
+    // `nid >> 24`, which lands on `_source.file_id`; `_source.id` is the
+    // rel path `_imports.source_id` still carries.
     let resolved: String = conn
         .query_row(
             "SELECT i.path FROM node_refs r \
-             JOIN _imports i ON i.alias = r.qualifier AND i.source_id = r.source_id \
+             JOIN _source s ON s.file_id = r.nid >> 24 \
+             JOIN _imports i ON i.alias = r.qualifier AND i.source_id = s.id \
              WHERE r.token = 'Fatalf'",
             [],
             |r| r.get(0),
@@ -112,38 +116,42 @@ func f() {
 }
 
 #[test]
-fn legacy_arena_gains_qualifier_column_on_reparse() {
-    // Upgrade path: an arena created by a pre-qualifier binary has a
-    // node_refs table WITHOUT the column. The epoch bump (3→4) forces
-    // fact re-derivation, and the INSERT names the qualifier column —
-    // so parse_into_conn must additively ALTER the legacy shape first
-    // (create_qualifier_column), not fail loudly on the old table.
+fn qualifier_is_in_the_base_ddl_not_an_additive_alter() {
+    // Replaces `legacy_arena_gains_qualifier_column_on_reparse`, whose
+    // premise (a pre-qualifier arena is migrated in place by
+    // `create_qualifier_column`'s additive ALTER) died with projection-v5:
+    // the ALTER migrations are gone and a pre-v5 arena is REFUSED at open,
+    // not patched (`cmd_parse::tests::a_pre_v5_arena_is_refused_at_open`).
+    // The surviving obligation is that the column ships in the base DDL,
+    // so `create_refs_tables` alone — no migration step — yields a
+    // node_refs that a qualifier-writing INSERT can target.
+    let conn = Connection::open_in_memory().unwrap();
+    leyline_ts::schema::create_refs_tables(&conn).unwrap();
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('node_refs') WHERE name = 'qualifier'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        n, 1,
+        "node_refs must carry `qualifier` straight from REFS_TABLE_DDL"
+    );
+
+    // And a cold parse into that same arena populates it.
     let td = TempDir::new().unwrap();
     fs::write(
         td.path().join("main.go"),
         "package main\n\nimport \"fmt\"\n\nfunc f() {\n\tfmt.Println(1)\n}\n",
     )
     .unwrap();
-
-    let conn = Connection::open_in_memory().unwrap();
-    // v0.7.8-shaped node_refs: no qualifier column.
-    conn.execute_batch(
-        "CREATE TABLE node_refs (
-            token TEXT NOT NULL,
-            node_id TEXT NOT NULL,
-            source_id TEXT NOT NULL,
-            container_node_id TEXT
-        );",
-    )
-    .unwrap();
-
-    cmd_parse::parse_into_conn(&conn, td.path(), Some("go"), None)
-        .expect("parse over a legacy-shaped arena must succeed (additive ALTER)");
+    cmd_parse::parse_into_conn(&conn, td.path(), Some("go"), None).unwrap();
 
     let refs = refs_with_qualifier(&conn);
     assert!(
         refs.contains(&("Println".to_string(), Some("fmt".to_string()))),
-        "migrated arena must populate qualifier on fresh rows; got {refs:?}"
+        "fresh rows must populate qualifier; got {refs:?}"
     );
 }
 

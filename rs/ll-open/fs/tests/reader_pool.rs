@@ -16,17 +16,52 @@ use leyline_fs::SqliteGraph;
 use leyline_fs::graph::{Graph, SqliteGraphAdapter};
 use leyline_schema::create_schema;
 
-/// Seed SQL for the common 3-node test dataset.
-const SEED_DATA: &str = "\
-    INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('docs', 'docs', 1, 0, 1000, NULL);
-    INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('docs/readme', 'readme', 0, 5, 2000, 'hello');
-    INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('docs/notes', 'notes', 0, 5, 3000, 'world');";
+/// Seed the common 3-node dataset: `docs/` holding `readme` and `notes`.
+///
+/// A node's PATH is not stored under projection-v5, so seeding means
+/// interning the components that render it rather than writing an id column.
+fn seed(conn: &Connection) {
+    let dir_id = leyline_schema::intern_dir_chain(conn, "docs").unwrap();
+    let dir_name = leyline_schema::intern_name(conn, "docs").unwrap();
+    leyline_schema::ensure_dir_nodes(conn, "docs/readme", 1000).unwrap();
+    leyline_schema::insert_node(
+        conn,
+        leyline_schema::dir_nid(dir_id),
+        Some(leyline_schema::dir_nid(1)),
+        Some(dir_name),
+        None,
+        1,
+        0,
+        0,
+        1000,
+        "",
+    )
+    .unwrap();
+    for (name, mtime, record) in [("readme", 2000, "hello"), ("notes", 3000, "world")] {
+        let path = format!("docs/{name}");
+        let file_id = leyline_schema::ensure_file_id(conn, &path).unwrap();
+        let name_id = leyline_schema::intern_name(conn, name).unwrap();
+        leyline_schema::insert_node(
+            conn,
+            leyline_schema::file_nid(file_id, 0),
+            Some(leyline_schema::dir_nid(dir_id)),
+            Some(name_id),
+            None,
+            0,
+            0,
+            record.len() as i64,
+            mtime,
+            record,
+        )
+        .unwrap();
+    }
+}
 
 /// Create a writable adapter seeded with test data.
 fn test_adapter() -> SqliteGraphAdapter {
     let source = Connection::open_in_memory().unwrap();
     create_schema(&source).unwrap();
-    source.execute_batch(SEED_DATA).unwrap();
+    seed(&source);
     let data = source.serialize("main").unwrap();
     SqliteGraphAdapter::new_writable(data.as_ref()).unwrap()
 }
@@ -35,7 +70,7 @@ fn test_adapter() -> SqliteGraphAdapter {
 fn test_adapter_with_pool(pool_size: usize) -> SqliteGraphAdapter {
     let source = Connection::open_in_memory().unwrap();
     create_schema(&source).unwrap();
-    source.execute_batch(SEED_DATA).unwrap();
+    seed(&source);
     let data = source.serialize("main").unwrap();
     let graph = SqliteGraph::from_bytes(data.as_ref()).unwrap();
     SqliteGraphAdapter::new_with_pool_size(graph, pool_size)

@@ -7,6 +7,12 @@ use anyhow::{Context, Result};
 use leyline_core::{ArenaHeader, ContentAddressed, Controller, create_arena, write_to_arena};
 
 /// CLI entry point: read the .db from disk, then delegate to [`load_into_arena`].
+///
+/// TRANSPORT, deliberately version-blind: this publishes whatever bytes it
+/// is handed and advances `current_root` over them — that root commits to
+/// BYTES, not to projection-shape validity. A pre-v5 image loads silently
+/// here and fails loudly per-op downstream; the shape gate lives at parse
+/// open, not in transport (projection-v5 seam audit, NOTE-1).
 pub fn cmd_load(db: &Path, control: &Path) -> Result<()> {
     let db_bytes = fs::read(db).with_context(|| format!("read {}", db.display()))?;
     load_into_arena(control, &db_bytes)?;

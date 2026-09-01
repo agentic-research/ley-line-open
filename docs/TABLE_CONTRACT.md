@@ -64,16 +64,19 @@ columns exist. Its measured dependencies, as of `mache-93e84b`:
 
 - `node_id` is rendered to agents through MCP (`find_definition`, `get_impact`,
   `get_dataflow`). Any change to its shape must retain a way to reconstruct the
-  displayed path.
-- `parent_id` has ~50 non-test references, dominated by `WHERE parent_id = ?` —
-  direct-child listing, which backs every `list_directory`. Depth-1 is NOT
-  derivable from byte spans, so this cannot become an inferred relation. It IS
-  derivable from the row itself, and as of `projection-v4` it is: a VIRTUAL
-  generated column over `id` and `name`. Every read above is unchanged,
-  including the index seek. Writes are not — mache names `parent_id` in 10
-  non-test INSERTs, and SQLite now rejects those at prepare time
-  (`mache-bc6ca3`). `pragma_table_info` also stops listing the column;
-  only `pragma_table_xinfo` shows a generated column.
+  displayed path. `projection-v5` honors this at the DAEMON boundary: ops keep
+  accepting and emitting display-path strings, resolved/rendered via
+  `resolve_path`/`node_path`; only the stored key changed. mache's DIRECT SQL
+  reads (~900 sites, `mache-93e84b`) migrate with the projection: `parent_id`
+  → `parent_nid`, `ORDER BY name` → `ORDER BY ord` (fixes the live ≥10-sibling
+  ordering bug), the prefix-LIKE ancestry scan
+  (`internal/smells/smell_incremental.go:245`) → span containment, and
+  `internal/fixturedb` regenerates against the v5 DDL.
+- `parent_id` direct-child listing (`WHERE parent_id = ?`, backing every
+  `list_directory`) becomes `WHERE parent_nid = ?` with names joined from
+  `v_node_name`. Depth-1 is still a stored relation — `parent_nid` is a real
+  column as of `projection-v5` (the v4 derived-from-id trick is meaningless
+  for an integer key).
 - `internal/fixturedb/schema_leyline.go` pins this DDL byte-identically and has
   a conformance test, so any column change here surfaces there as drift at
   whatever release mache re-pins to.
@@ -84,13 +87,26 @@ columns exist. Its measured dependencies, as of `mache-93e84b`:
 
 Produced by `parse_into_conn`. Always present.
 
+As of `projection-v5` (bead `ley-line-open-17c271`) the node key is a
+file-scoped integer: `nid = (file_id << 24) | ordinal` for files (ordinal 0 =
+the file's own node, the AST root) and their AST nodes; `nid = -dir_id` for
+directories. `ordinal` is the pre-order rank within the file's parse — the
+same dense `0..n-1` the pointer store addresses blobs with, so
+`nid & 0xFFFFFF` IS the blob index. Per-file scoping everywhere is
+`nid BETWEEN (file_id<<24) AND (file_id<<24)|0xFFFFFF` — a PK range SEARCH,
+never a prefix-LIKE. Display paths are DERIVED: `v_node_path`/`v_node_name`
+(bulk views) and `node_path`/`resolve_path` (point resolvers, in
+`leyline-schema`). A pre-v5 arena is refused at parse open and rebuilt cold;
+the projection is derived-only, so no in-place migration exists.
+
 | Table | Purpose |
 |-------|---------|
-| `nodes` | Hierarchical node tree (id, name, kind, size, record; `parent_id` derived from id+name, not stored) |
-| `_ast` | AST positions (node_id → source_id, node_kind, byte/row/col ranges) |
-| `_source` | Source file metadata (id → language, abs path) |
-| `node_refs` | Token references (token → node_id, source_id, node_hash, container_node_id, qualifier, and since `projection-v3` the occurrence's own `node_kind` + `start_byte`/`end_byte`/`start_row`/`start_col`/`end_row`/`end_col`). `qualifier` (v0.7.9, bead `ley-line-open-4dde42`) = receiver/selector text on the BARE-token row of a qualified call's dual-emit pair (`fmt.Println(..)` → the `Println` row carries `'fmt'`); NULL on the qualified-token row and on bare calls — one row per qualified call site carries the structural (name, qualifier) pair. |
-| `node_defs` | Token definitions (token → node_id, source_id, node_hash, container_node_id, canonical_kind, and since `projection-v3` the occurrence's own `node_kind` + span columns as on `node_refs`). The span is carried here rather than JOINed from `_ast` — SCIP's `Occurrence` shape — which is what lets `find_definition` answer without touching the 3.15M-row AST table (bead `ley-line-open-b4509b`). NULL span means the locator has no `_ast` row (injected nodes), exactly as the prior LEFT JOIN yielded. No `qualifier` column — qualified defs stay token-only dual-emits (`Server.Validate` + `Validate`). |
+| `names` / `dirs` / `files` / `kinds` | Interning tables (`projection-v5`). Every path component, directory link, file, and tree-sitter kind stored ONCE; all four are append-only — rows are never deleted or renumbered, which is what makes `file_id` reuse impossible and a directory rename a ONE-row `UPDATE dirs SET name_id`. `dirs.dir_id = 1` is the root ("", parent NULL). |
+| `nodes` | Hierarchical node tree (nid, parent_nid, name_id, kind_id, kind, ord, size, mtime, record). `name_id` interned for filesystem rows, NULL for AST rows — an AST node's display name derives from its kind + per-kind rank among siblings by `ord` (`{raw_kind}[_{k}]`, the pre-v5 `needs_suffix` scheme, now computed at read time). `ord` is the sibling index in SOURCE order — `ORDER BY ord` is the correct sibling ordering (`ORDER BY name` put `_10` before `_2`). |
+| `_ast` | AST positions (nid → kind_id, byte/row/col ranges, node_hash). No `source_id` (the file is `nid >> 24`), no `blob_ord` (the ordinal is `nid & 0xFFFFFF`). |
+| `_source` | Source file metadata (id → language, abs path, `file_id` — the interned integer that keys every node row's high bits) |
+| `node_refs` | Token references (token → nid, node_hash, container_nid, qualifier, and since `projection-v3` the occurrence's own `node_kind` + `start_byte`/`end_byte`/`start_row`/`start_col`/`end_row`/`end_col`). `qualifier` (v0.7.9, bead `ley-line-open-4dde42`) = receiver/selector text on the BARE-token row of a qualified call's dual-emit pair (`fmt.Println(..)` → the `Println` row carries `'fmt'`); NULL on the qualified-token row and on bare calls. Injected-subtree occurrences carry real nids past their host file's `_ast` count — fact-row keys with no `nodes`/`_ast` row, exactly as their path-shaped ids had no rows before. |
+| `node_defs` | Token definitions (token → nid, node_hash, container_nid, canonical_kind, and since `projection-v3` the occurrence's own `node_kind` + span columns as on `node_refs`). The span is carried here rather than JOINed from `_ast` — SCIP's `Occurrence` shape (bead `ley-line-open-b4509b`). NULL span means the locator has no `_ast` row (injected nodes). No `qualifier` column. |
 | `_imports` | Import statements (alias, path, source_id) |
 | `_file_index` | Incremental parse index (path → mtime, size) |
 | `_meta` | Key-value metadata (source_root, parse_time, version vectors) |
@@ -107,7 +123,7 @@ Produced by `parse_into_conn`. Always present.
 | Table | Purpose |
 |-------|---------|
 | `capnp_blobs` | Content-addressed blob store — `blob_hash BLOB PRIMARY KEY`, `blob_bytes BLOB`. |
-| `_ast_blob` | File-to-blob map — `source_id TEXT PRIMARY KEY`, `blob_hash BLOB`. ONE row per source file. Replaced the row-per-AstNode `_ast_pointer` in `projection-v2` (bead `ley-line-open-17c271`): that table carried a node_id and source_id already on the `_ast` row, a blob_hash with only 8000 distinct values across 3.15M rows, and an offset that was provably the dense array index — ~294 bytes to address a ~370-byte record. The offset now rides on `_ast.blob_ord`; resolution is `source_id → blob_hash`, indexed at `blob_ord`. |
+| `_ast_blob` | File-to-blob map — `file_id INTEGER PRIMARY KEY` (as of `projection-v5`), `blob_hash BLOB`. ONE row per source file. Replaced the row-per-AstNode `_ast_pointer` in `projection-v2` (bead `ley-line-open-17c271`): that table carried a node_id and source_id already on the `_ast` row, a blob_hash with only 8000 distinct values across 3.15M rows, and an offset that was provably the dense array index — ~294 bytes to address a ~370-byte record. Resolution is `nid >> 24 → blob_hash`, indexed at `nid & 0xFFFFFF`. |
 
 **Source blobs** (added v0.6.0 per ADR-0028 Phase 1 dual-store):
 
@@ -173,7 +189,8 @@ database** (not the living db) because `vec0` virtual tables cannot survive
 | `_dfg*` | analysis-substrate DFG layer (T2 of `analysis-substrate` decade; not yet shipped) |
 | `_taint*` | analysis-substrate taint fixpoint (T3 of `analysis-substrate` decade; not yet shipped) |
 | `node_content` / `node_child` | ADR-0027 merkle-AST IR (base; no prefix) |
-| `_ast_pointer` / `capnp_blobs` | ADR-0026 pointer store (base; no prefix on blobs) |
+| `_ast_blob` / `capnp_blobs` | ADR-0026 pointer store (base; no prefix on blobs) |
+| `names` / `dirs` / `files` / `kinds` | projection-v5 interning tables (base; no prefix) |
 | `source_blobs` | ADR-0028 content-addressed source (base; no prefix) |
 | `content_chunks` / `content_manifest` / `content_manifest_meta` | CDC derived chunk cache — private, not part of the SQL projection ABI |
 

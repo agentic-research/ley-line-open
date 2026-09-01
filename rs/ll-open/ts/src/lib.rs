@@ -157,10 +157,12 @@ mod tests {
         conn.deserialize_read_exact("main", cursor, bytes.len(), true)
             .unwrap();
 
-        // Verify all expected columns exist by querying them
-        let row: (String, String, String, i32, i64, i64, String) = conn
+        // Verify all expected projection-v5 columns exist by querying them
+        // on the root directory row (nid -1).
+        let row: (i64, Option<i64>, Option<i64>, i32, i64, i64, i64, String) = conn
             .query_row(
-                "SELECT id, parent_id, name, kind, size, mtime, record FROM nodes LIMIT 1",
+                "SELECT nid, parent_nid, name_id, kind, ord, size, mtime, record \
+                 FROM nodes WHERE nid = -1",
                 [],
                 |r| {
                     Ok((
@@ -171,14 +173,23 @@ mod tests {
                         r.get(4)?,
                         r.get(5)?,
                         r.get(6)?,
+                        r.get(7)?,
                     ))
                 },
             )
             .unwrap();
 
-        // Root node
-        assert_eq!(row.0, ""); // id
-        assert_eq!(row.3, 1); // kind = dir
+        // Root directory node: negative nid, no parent, kind = dir.
+        assert_eq!(row.0, -1);
+        assert_eq!(row.1, None);
+        assert_eq!(row.3, 1);
+
+        // The root renders as "" and the derived display path round-trips.
+        assert_eq!(
+            leyline_schema::node_path(&conn, -1).unwrap().unwrap(),
+            "",
+            "root dir must render as the empty path"
+        );
     }
 
     #[cfg(feature = "html")]
@@ -367,6 +378,7 @@ end
     ///   1. `parse_hcl` is reachable and returns non-empty serialized bytes
     ///   2. `_ast` rows are emitted for a representative `.tf` source
     ///   3. HCL-grammar productions (`block`, `attribute`) appear in node_kind
+    ///
     /// Together these prove mache-d5e158 can consume LLO's HCL `_ast` rows
     /// the same way it consumes Go rows today.
     #[cfg(feature = "hcl")]
@@ -403,7 +415,8 @@ variable "region" {
         // the consumer (mache).
         let block_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _ast WHERE node_kind = 'block'",
+                "SELECT COUNT(*) FROM _ast a JOIN kinds k ON k.kind_id = a.kind_id \
+                 WHERE k.raw_kind = 'block'",
                 [],
                 |r| r.get(0),
             )
@@ -415,7 +428,8 @@ variable "region" {
 
         let attr_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _ast WHERE node_kind = 'attribute'",
+                "SELECT COUNT(*) FROM _ast a JOIN kinds k ON k.kind_id = a.kind_id \
+                 WHERE k.raw_kind = 'attribute'",
                 [],
                 |r| r.get(0),
             )
@@ -493,7 +507,8 @@ variable "region" {
 
         let error_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _ast WHERE node_kind = 'ERROR'",
+                "SELECT COUNT(*) FROM _ast a JOIN kinds k ON k.kind_id = a.kind_id \
+                 WHERE k.raw_kind = 'ERROR'",
                 [],
                 |r| r.get(0),
             )
@@ -516,7 +531,8 @@ variable "region" {
 
         let error_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _ast WHERE node_kind = 'ERROR'",
+                "SELECT COUNT(*) FROM _ast a JOIN kinds k ON k.kind_id = a.kind_id \
+                 WHERE k.raw_kind = 'ERROR'",
                 [],
                 |r| r.get(0),
             )

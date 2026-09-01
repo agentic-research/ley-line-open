@@ -14,9 +14,9 @@
 //!
 //! 1. **Doc-symbol citations land in `node_refs` on the host file.**
 //!    A paragraph citing `` `PartitionSpec::address` `` and
-//!    `` `render` `` produces two ref rows whose `source_id` is the
-//!    `.md` file, with the backtick delimiters stripped from the
-//!    token.
+//!    `` `render` `` produces two ref rows whose nids live in the `.md`
+//!    file's range (projection-v5's replacement for the `source_id`
+//!    column), with the backtick delimiters stripped from the token.
 //! 2. **The refs channel, not `_ast`.** Injected subtrees emit no
 //!    `_ast` rows by design (`fold_injected` doc comment) — the host's
 //!    `_ast` keeps its block-grammar shape (`inline` stays opaque,
@@ -95,12 +95,22 @@ fn parse_pass(db_path: &Path, repo: &Path) {
     cmd_parse::parse_into_conn(&conn, repo, Some("markdown"), None).unwrap();
 }
 
-/// Every `node_refs` token for the fixture, token-ordered, with its
-/// source_id.
+/// Every `node_refs` token for the fixture, token-ordered, with the rel
+/// path of its host file.
+///
+/// projection-v5: `node_refs.source_id` is gone. A ref's file is
+/// `nid >> 24`, the interned `file_id`, which `_source.file_id` carries —
+/// and `_source.id` is the rel path the pre-v5 column held. The join
+/// works for injected refs too: they carry a real nid in the host file's
+/// range (past its `_ast` count) even though no `_ast`/`nodes` row exists.
 fn ref_rows(db_path: &Path) -> Vec<(String, String)> {
     let conn = Connection::open(db_path).unwrap();
     let mut stmt = conn
-        .prepare("SELECT token, source_id FROM node_refs ORDER BY token")
+        .prepare(
+            "SELECT r.token, s.id FROM node_refs r \
+             JOIN _source s ON s.file_id = r.nid >> 24 \
+             ORDER BY r.token",
+        )
         .unwrap();
     stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
         .unwrap()
@@ -108,12 +118,20 @@ fn ref_rows(db_path: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Full host occurrence map: (node_id, hex(node_hash)) for every `_ast`
-/// row, node_id-ordered. THE host-structural-identity snapshot.
+/// Full host occurrence map: (display path, hex(node_hash)) for every
+/// `_ast` row, path-ordered. THE host-structural-identity snapshot.
+///
+/// Rendered through `v_node_path` rather than compared as raw nids: the
+/// two arenas are separate databases, so the pre-v5 path-shaped key is
+/// what makes the cross-db comparison meaningful.
 fn ast_hash_map(db_path: &Path) -> Vec<(String, String)> {
     let conn = Connection::open(db_path).unwrap();
     let mut stmt = conn
-        .prepare("SELECT node_id, lower(hex(node_hash)) FROM _ast ORDER BY node_id")
+        .prepare(
+            "SELECT p.path, lower(hex(a.node_hash)) FROM _ast a \
+             JOIN v_node_path p ON p.nid = a.nid \
+             ORDER BY p.path",
+        )
         .unwrap();
     stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
         .unwrap()
@@ -207,8 +225,13 @@ fn md_host_hashes_independent_of_injection_pass() {
         parse_pass(&off_db, repo.path());
     }
 
+    let on_map = ast_hash_map(&on_db);
+    assert!(
+        !on_map.is_empty(),
+        "the host occurrence map must be non-empty, or the comparison below asserts nothing"
+    );
     assert_eq!(
-        ast_hash_map(&on_db),
+        on_map,
         ast_hash_map(&off_db),
         "host _ast occurrence map must be byte-identical with injections on vs off"
     );

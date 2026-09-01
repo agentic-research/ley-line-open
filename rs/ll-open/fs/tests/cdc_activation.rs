@@ -6,20 +6,61 @@ use leyline_fs::activation::{
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
 
+/// Insert an eligible file leaf at `path` (kind 0, non-NULL record) and
+/// return the nid the projection assigned it.
+fn leaf(conn: &Connection, path: &str, record: &str, mtime: i64) -> i64 {
+    let file_id = leyline_schema::ensure_file_id(conn, path).unwrap();
+    let dir_id = leyline_schema::ensure_dir_nodes(conn, path, mtime).unwrap();
+    let name_id = leyline_schema::intern_name(conn, path.rsplit('/').next().unwrap()).unwrap();
+    let nid = leyline_schema::file_nid(file_id, 0);
+    leyline_schema::insert_node(
+        conn,
+        nid,
+        Some(leyline_schema::dir_nid(dir_id)),
+        Some(name_id),
+        None,
+        0,
+        0,
+        record.len() as i64,
+        mtime,
+        record,
+    )
+    .unwrap();
+    nid
+}
+
+/// The nid of an already-inserted display path.
+fn nid_of(conn: &Connection, path: &str) -> i64 {
+    leyline_schema::resolve_path(conn, path)
+        .unwrap()
+        .unwrap_or_else(|| panic!("fixture path {path:?} must resolve"))
+}
+
+/// Two eligible leaves plus one directory, which activation must skip.
+///
+/// `a.rs` is interned first, so it holds `file_id` 1 and therefore the
+/// LOWEST nid in the arena — the keyset paging tests below lean on that.
 fn projection() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(leyline_schema::NODES_TABLE_DDL).unwrap();
-    for (id, kind, record) in [
-        ("a.rs", 0_i64, "fn a() {}\n"),
-        ("empty.rs", 0_i64, ""),
-        ("dir", 1_i64, ""),
-    ] {
-        conn.execute(
-            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES (?1, ?1, ?2, ?3, 7, ?4)",
-            params![id, kind, record.len() as i64, record],
-        )
-        .unwrap();
-    }
+    leyline_schema::create_nodes_table(&conn).unwrap();
+    leaf(&conn, "a.rs", "fn a() {}\n", 7);
+    leaf(&conn, "empty.rs", "", 7);
+    // A directory: negative nid, kind 1, so it fails the `kind = 0` filter.
+    let dir_id = leyline_schema::intern_dir_chain(&conn, "dir").unwrap();
+    let dir_name = leyline_schema::intern_name(&conn, "dir").unwrap();
+    leyline_schema::insert_node(
+        &conn,
+        leyline_schema::dir_nid(dir_id),
+        Some(leyline_schema::dir_nid(1)),
+        Some(dir_name),
+        None,
+        1,
+        0,
+        0,
+        7,
+        "",
+    )
+    .unwrap();
     conn
 }
 
@@ -64,7 +105,7 @@ fn activation_names_missing_nodes_columns_before_mutating() {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(
         "CREATE TABLE nodes (
-            id TEXT PRIMARY KEY,
+            nid INTEGER PRIMARY KEY,
             kind INTEGER NOT NULL,
             size INTEGER NOT NULL,
             record TEXT
@@ -118,20 +159,21 @@ fn activation_rejects_an_unrepresentable_batch_size_before_mutating() {
 #[test]
 fn activation_resumes_after_a_per_node_failure() {
     let conn = projection();
+    let empty = nid_of(&conn, "empty.rs");
     leyline_fs::chunked::create_chunked_content_schema(&conn).unwrap();
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         "CREATE TRIGGER fail_second BEFORE INSERT ON content_manifest_meta
-         WHEN NEW.node_id = 'empty.rs'
-         BEGIN SELECT RAISE(ABORT, 'injected activation failure'); END;",
-    )
+         WHEN NEW.nid = {empty}
+         BEGIN SELECT RAISE(ABORT, 'injected activation failure'); END;"
+    ))
     .unwrap();
 
     let error = activate_chunked_content(&conn, ActivationOptions { batch_size: 1 }).unwrap_err();
     assert!(
-        format!("{error:#}").contains("empty.rs"),
+        format!("{error:#}").contains(&empty.to_string()),
         "failing node must be named: {error:#}"
     );
-    assert!(leyline_fs::chunked::has_chunked_content(&conn, "a.rs").unwrap());
+    assert!(leyline_fs::chunked::has_chunked_content(&conn, nid_of(&conn, "a.rs")).unwrap());
 
     conn.execute_batch("DROP TRIGGER fail_second").unwrap();
     let resumed = activate_chunked_content(&conn, ActivationOptions { batch_size: 1 }).unwrap();
@@ -145,8 +187,8 @@ fn activation_rebuilds_a_stale_manifest_from_authoritative_record() {
     activate_chunked_content(&conn, ActivationOptions::default()).unwrap();
     conn.execute(
         "UPDATE nodes SET record = 'fn changed() {}', size = 15, mtime = 8
-         WHERE id = 'a.rs'",
-        [],
+         WHERE nid = ?1",
+        [nid_of(&conn, "a.rs")],
     )
     .unwrap();
 
@@ -159,12 +201,16 @@ fn activation_rebuilds_a_stale_manifest_from_authoritative_record() {
 #[test]
 fn activation_rejects_a_record_whose_size_witness_is_inconsistent() {
     let conn = projection();
-    conn.execute("UPDATE nodes SET size = 999 WHERE id = 'a.rs'", [])
+    let a = nid_of(&conn, "a.rs");
+    conn.execute("UPDATE nodes SET size = 999 WHERE nid = ?1", [a])
         .unwrap();
 
     let error = activate_chunked_content(&conn, ActivationOptions::default()).unwrap_err();
     let message = format!("{error:#}");
-    assert!(message.contains("a.rs"), "error must name node: {message}");
+    assert!(
+        message.contains(&a.to_string()),
+        "error must name node: {message}"
+    );
     assert!(
         message.contains("size 999") && message.contains("10 record bytes"),
         "error must name both conflicting lengths: {message}"
@@ -209,12 +255,14 @@ fn activation_reports_bounded_deterministic_progress() {
 #[test]
 fn activation_keyset_paging_does_not_skip_after_an_earlier_row_is_deleted() {
     let conn = projection();
+    let a = nid_of(&conn, "a.rs");
+    let empty = nid_of(&conn, "empty.rs");
     let mut pages = 0;
     let report =
         activate_chunked_content_with_progress(&conn, ActivationOptions { batch_size: 1 }, |_| {
             pages += 1;
             if pages == 1 {
-                conn.execute("DELETE FROM nodes WHERE id = 'a.rs'", [])
+                conn.execute("DELETE FROM nodes WHERE nid = ?1", [a])
                     .unwrap();
             }
         })
@@ -224,41 +272,80 @@ fn activation_keyset_paging_does_not_skip_after_an_earlier_row_is_deleted() {
     assert_eq!(report.eligible_nodes, 1);
     assert_eq!(report.populated_nodes, 2);
     assert!(
-        leyline_fs::chunked::has_chunked_content(&conn, "empty.rs").unwrap(),
+        leyline_fs::chunked::has_chunked_content(&conn, empty).unwrap(),
         "removing a processed row must not shift the next row behind an OFFSET"
     );
 }
 
+/// The keyset cursor is `Option<i64>`, and `None` means "no cursor yet" — NOT
+/// "cursor at the smallest key". The pre-v5 shape of this trap was an empty
+/// STRING id, indistinguishable from an absent cursor to anything that tested
+/// emptiness instead of `Option`; the v5 shape is the arena's LOWEST nid,
+/// which a cursor conflating the two would either skip or re-visit forever.
+///
+/// `a.rs` holds `file_id` 1 and ordinal 0, so its nid is the smallest any
+/// node in this arena can have.
 #[test]
-fn activation_keyset_includes_an_empty_string_node_id() {
+fn activation_keyset_visits_the_lowest_nid_exactly_once() {
     let conn = projection();
-    conn.execute(
-        "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('', '', 0, 5, 7, 'empty')",
-        [],
-    )
-    .unwrap();
+    let lowest = nid_of(&conn, "a.rs");
+    assert_eq!(
+        lowest,
+        leyline_schema::file_nid(1, 0),
+        "fixture must put a.rs at the arena's minimum nid"
+    );
 
-    let report = activate_chunked_content(&conn, ActivationOptions { batch_size: 1 }).unwrap();
+    let mut visited = Vec::new();
+    let report =
+        activate_chunked_content_with_progress(&conn, ActivationOptions { batch_size: 1 }, |u| {
+            visited.push(u.visited_nodes)
+        })
+        .unwrap();
 
-    assert_eq!(report.eligible_nodes, 3);
-    assert_eq!(report.populated_nodes, 3);
+    assert_eq!(report.eligible_nodes, 2);
+    assert_eq!(report.populated_nodes, 2);
+    assert_eq!(visited, vec![1, 2], "each node visited exactly once");
     assert!(
-        leyline_fs::chunked::has_chunked_content(&conn, "").unwrap(),
-        "an empty string is a valid keyset value, not an absent cursor"
+        leyline_fs::chunked::has_chunked_content(&conn, lowest).unwrap(),
+        "the minimum nid is a valid keyset value, not an absent cursor"
     );
 }
 
+/// A row that appears BEHIND the keyset cursor is invisible to the paging
+/// loop, so only the convergence pass can catch it — and it must, or
+/// activation reports success over a stale manifest.
+///
+/// Under v5 that row is an AST node of an ALREADY-PAGED file: nids are
+/// file-scoped, so `a.rs`'s ordinal 5 sits inside file 1's range and
+/// therefore below the cursor once paging has moved on to file 2. A newly
+/// interned FILE could not reproduce this — `files` is append-only, so its
+/// `file_id` and hence its nid always sort after everything already there.
 #[test]
 fn activation_converges_when_a_concurrent_insert_sorts_before_the_cursor() {
     let conn = projection();
+    let latecomer = leyline_schema::file_nid(1, 5);
+    assert!(
+        latecomer < nid_of(&conn, "empty.rs"),
+        "the injected row must sort behind the final cursor"
+    );
+
     let mut pages = 0;
     let report =
         activate_chunked_content_with_progress(&conn, ActivationOptions { batch_size: 1 }, |_| {
             pages += 1;
-            if pages == 1 {
-                conn.execute(
-                    "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('0.rs', '0.rs', 0, 11, 8, 'fn zero(){}')",
-                    [],
+            if pages == 2 {
+                let body = "fn zero(){}";
+                leyline_schema::insert_node(
+                    &conn,
+                    latecomer,
+                    Some(nid_of(&conn, "a.rs")),
+                    None,
+                    None,
+                    0,
+                    5,
+                    body.len() as i64,
+                    8,
+                    body,
                 )
                 .unwrap();
             }
@@ -268,7 +355,7 @@ fn activation_converges_when_a_concurrent_insert_sorts_before_the_cursor() {
     assert_eq!(report.eligible_nodes, 3);
     assert_eq!(report.populated_nodes, 3);
     assert!(
-        leyline_fs::chunked::has_chunked_content(&conn, "0.rs").unwrap(),
+        leyline_fs::chunked::has_chunked_content(&conn, latecomer).unwrap(),
         "activation must not report success with an inserted eligible row stale"
     );
 }
@@ -278,53 +365,43 @@ fn stale_caller_bytes_cannot_be_paired_with_a_new_authoritative_witness() {
     let temp = TempDir::new().unwrap();
     let db = temp.path().join("projection.db");
     let reader = Connection::open(&db).unwrap();
-    reader
-        .execute_batch(
-            "PRAGMA journal_mode = WAL;
-             CREATE TABLE nodes (
-                id TEXT PRIMARY KEY,
-                kind INTEGER NOT NULL,
-                size INTEGER NOT NULL,
-                mtime INTEGER NOT NULL,
-                record TEXT
-             );
-             INSERT INTO nodes VALUES ('a.rs', 0, 10, 7, 'fn a() {}\n');",
-        )
-        .unwrap();
+    reader.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+    leyline_schema::create_nodes_table(&reader).unwrap();
+    let a = leaf(&reader, "a.rs", "fn a() {}\n", 7);
     leyline_fs::chunked::create_chunked_content_schema(&reader).unwrap();
     let old_bytes: Vec<u8> = reader
         .query_row(
-            "SELECT CAST(record AS BLOB) FROM nodes WHERE id = 'a.rs'",
-            [],
+            "SELECT CAST(record AS BLOB) FROM nodes WHERE nid = ?1",
+            [a],
             |row| row.get(0),
         )
         .unwrap();
-    leyline_fs::chunked::store_content_chunked(&reader, "a.rs", &old_bytes).unwrap();
+    leyline_fs::chunked::store_content_chunked(&reader, a, &old_bytes).unwrap();
 
     let writer = Connection::open(&db).unwrap();
     writer
         .execute(
             "UPDATE nodes
                 SET record = 'fn b() {}\n', mtime = 8
-              WHERE id = 'a.rs'",
-            [],
+              WHERE nid = ?1",
+            [a],
         )
         .unwrap();
 
-    let error = leyline_fs::chunked::store_content_chunked(&reader, "a.rs", &old_bytes)
+    let error = leyline_fs::chunked::store_content_chunked(&reader, a, &old_bytes)
         .expect_err("stale caller bytes must not receive the new row witness");
     assert!(
         format!("{error:#}").contains("authoritative node changed"),
         "unexpected error: {error:#}"
     );
     assert!(
-        !leyline_fs::chunked::has_chunked_content(&reader, "a.rs").unwrap(),
+        !leyline_fs::chunked::has_chunked_content(&reader, a).unwrap(),
         "a rejected stale store must never look fresh"
     );
     let preserved_witness: i64 = reader
         .query_row(
-            "SELECT source_mtime FROM content_manifest_meta WHERE node_id = 'a.rs'",
-            [],
+            "SELECT source_mtime FROM content_manifest_meta WHERE nid = ?1",
+            [a],
             |row| row.get(0),
         )
         .unwrap();
@@ -368,12 +445,26 @@ fn canonical_projection() -> Connection {
     conn
 }
 
-fn insert_leaf(conn: &Connection, id: &str, record: &str) {
-    conn.execute(
-        "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES (?1, ?1, 0, ?2, 7, ?3)",
-        params![id, record.len() as i64, record],
+/// An AST leaf under `file`, at `ordinal` within that file's nid range —
+/// the shape a real parse writes, and the shape these records come from.
+fn insert_leaf(conn: &Connection, file: &str, ordinal: i64, record: &str) -> i64 {
+    let file_id = leyline_schema::ensure_file_id(conn, file).unwrap();
+    leyline_schema::ensure_dir_nodes(conn, file, 7).unwrap();
+    let nid = leyline_schema::file_nid(file_id, ordinal);
+    leyline_schema::insert_node(
+        conn,
+        nid,
+        Some(leyline_schema::file_nid(file_id, 0)),
+        None,
+        None,
+        0,
+        ordinal,
+        record.len() as i64,
+        7,
+        record,
     )
     .unwrap();
+    nid
 }
 
 /// What the contract is supposed to guarantee, held here as executable
@@ -391,9 +482,9 @@ fn insert_leaf(conn: &Connection, id: &str, record: &str) {
 #[test]
 fn activation_survives_the_canonical_nodes_contract() {
     let conn = canonical_projection();
-    insert_leaf(&conn, "a.rs/fn/body/int_literal", "007");
-    insert_leaf(&conn, "README.md/list/list_item_0/list_marker_dot", "1. ");
-    insert_leaf(&conn, "a.rs/fn/name", "main");
+    insert_leaf(&conn, "a.rs", 1, "007");
+    insert_leaf(&conn, "README.md", 1, "1. ");
+    insert_leaf(&conn, "a.rs", 2, "main");
 
     let report = activate_chunked_content(&conn, ActivationOptions::default()).unwrap();
 
@@ -410,9 +501,9 @@ fn activation_survives_the_canonical_nodes_contract() {
 #[test]
 fn canonical_nodes_contract_stores_numeric_tokens_verbatim() {
     let conn = canonical_projection();
-    insert_leaf(&conn, "a.rs/fn/name", "main");
-    insert_leaf(&conn, "a.rs/fn/body/int_literal", "007");
-    insert_leaf(&conn, "README.md/list/list_item_0/list_marker_dot", "1. ");
+    let name = insert_leaf(&conn, "a.rs", 1, "main");
+    let int_literal = insert_leaf(&conn, "a.rs", 2, "007");
+    let marker = insert_leaf(&conn, "README.md", 1, "1. ");
 
     let coerced: i64 = conn
         .query_row(
@@ -427,19 +518,22 @@ fn canonical_nodes_contract_stores_numeric_tokens_verbatim() {
          column's declared type has drifted back to a NUMERIC-affinity name"
     );
 
-    for (id, expected) in [
-        ("a.rs/fn/body/int_literal", &b"007"[..]),
-        ("README.md/list/list_item_0/list_marker_dot", &b"1. "[..]),
-        ("a.rs/fn/name", &b"main"[..]),
+    for (nid, expected) in [
+        (int_literal, &b"007"[..]),
+        (marker, &b"1. "[..]),
+        (name, &b"main"[..]),
     ] {
         let stored: Vec<u8> = conn
             .query_row(
-                "SELECT CAST(record AS BLOB) FROM nodes WHERE id = ?1",
-                params![id],
+                "SELECT CAST(record AS BLOB) FROM nodes WHERE nid = ?1",
+                params![nid],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(stored, expected, "record for {id} must round-trip verbatim");
+        assert_eq!(
+            stored, expected,
+            "record for nid {nid} must round-trip verbatim"
+        );
     }
 
     // And the size witness now agrees, so activation completes rather than
@@ -466,15 +560,11 @@ fn activation_commits_per_page_not_per_node() {
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     leyline_fs::chunked::create_chunked_content_schema(&conn).unwrap();
-    conn.execute_batch(leyline_schema::NODES_TABLE_DDL).unwrap();
+    leyline_schema::create_nodes_table(&conn).unwrap();
     const NODES: usize = 64;
     for i in 0..NODES {
         let body = format!("fn n{i}() {{}}");
-        conn.execute(
-            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES (?1, ?1, 0, ?2, 1, ?3)",
-            rusqlite::params![format!("n{i}.rs"), body.len() as i64, body],
-        )
-        .unwrap();
+        leaf(&conn, &format!("n{i}.rs"), &body, 1);
     }
 
     let commits = Arc::new(AtomicUsize::new(0));
@@ -482,7 +572,8 @@ fn activation_commits_per_page_not_per_node() {
     conn.commit_hook(Some(move || {
         counter.fetch_add(1, Ordering::SeqCst);
         false
-    }));
+    }))
+    .expect("commit hook must install, or this test counts nothing");
 
     let report = leyline_fs::activation::activate_chunked_content(
         &conn,

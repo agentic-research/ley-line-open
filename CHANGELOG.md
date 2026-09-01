@@ -10,6 +10,85 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Changed
+
+- **projection-v5: file-scoped integer node ids** (Phase B of bead
+  `ley-line-open-17c271`). The SQL projection's node key is no longer the
+  node's own ancestry path — an O(depth) TEXT string that was ~72% of arena
+  bytes and made identical content cost 5.3× more at directory depth 96 —
+  but `nid = (file_id << 24) | ordinal` (pre-order rank; ordinal 0 is the
+  file's own node), with directories at `-dir_id`. `parent_nid` and the
+  source-order sibling `ord` are stored; names, directories, files, and
+  tree-sitter kinds are interned once in `names`/`dirs`/`files`/`kinds`
+  (append-only — a directory rename is ONE row, and `file_id`s are never
+  reused); the display path is derived (`v_node_path`/`v_node_name` views,
+  `node_path`/`resolve_path` resolvers). Every node-keyed column re-typed:
+  `_ast` lost `source_id`/`node_kind`/`blob_ord` (file = `nid >> 24`, kind
+  interned, blob ordinal = `nid & 0xFFFFFF`), `node_refs`/`node_defs` carry
+  `nid`/`container_nid`, `_lsp*` re-keyed with per-file scoping as a nid
+  range SEARCH (the pre-v5 prefix-LIKE planned as a full SCAN, and the
+  daemon's variant was unanchored — `remove.go` matched `remove.go.bak`),
+  `_ast_blob` re-keyed on `file_id`, `_source` gained `file_id`. The daemon
+  boundary still speaks display paths in and out (TABLE_CONTRACT §external
+  consumers), so MCP consumers see path strings as before; direct-SQL
+  consumers (mache, `mache-93e84b`) migrate with the projection. A pre-v5
+  arena is REFUSED at parse open and rebuilt by a cold reparse — the
+  projection is derived state, and the in-place `parent_id`/span/qualifier
+  ALTER migrations are gone with the shapes they patched. The capnp wire
+  surface is untouched (Phase A is what made that possible); the Σ segment
+  root does not move for identical content. Gates: shuffled-discovery
+  Σ+nid equality (F4c) and scoped-reparse bit-locality (F4d) landed
+  red-provable BEFORE this change; F4/F4b hold across it.
+
+- **The locator left the hashed preimages** (Phase A of bead
+  `ley-line-open-17c271`). `AstNode.nodeId` is now written EMPTY in both
+  capnp preimages — the per-file `AstNodeList` blob behind
+  `capnp_blobs.blob_hash`, and the `<db>.ast.capnp` segment log folded into
+  the signed head. The field was write-only freight: nothing anywhere read
+  it back (a node's address inside a blob is its ordinal,
+  `_ast_pointer.offset_in_blob`), while its presence bound every blob hash
+  to the locator SCHEME — so re-keying the projection to integer node ids
+  (Phase B) would have moved every `blob_hash` and the Σ lineage with it.
+  The capnp field keeps its `@0` slot because persisted blobs pin ordinals;
+  the SQL projection's `_ast.node_id` is unchanged. Blob hashes and segment
+  roots change once, at the next parse generation — a lineage event, not a
+  compatibility break; `_meta.projection_schema_version` stays
+  `projection-v4` and the wire format stays v1. The identity end-state this
+  enables (file-scoped integer nids, projection-v5/v6) is designed and
+  gated on the bead.
+
+### Removed
+
+- **`leyline_schema::NODES_DDL`** (bead `ley-line-open-b23c41`). The constant
+  was a hand-maintained copy of `INTERN_TABLES_DDL` + `NODES_TABLE_DDL` +
+  `NODES_INDEXES_DDL` — a second source of truth for the same SQL, which
+  projection-v5 had to re-sync by hand — and it was documented as materializing
+  the schema "in one batch" while omitting the display views. Post-v5 that made
+  it a loaded gun: a caller who reached for the one-batch constant got a schema
+  whose every path render fails with `no such table: v_node_name`. It had one
+  caller (`create_schema`, same module) and a re-export from `leyline-ts` with
+  no consumers. `create_schema` is now defined as the two-phase bulk path run
+  back to back (`create_nodes_table` then `create_nodes_indexes`), so there is
+  one source of truth and no way to obtain a viewless schema. Callers wanting
+  the raw DDL should use the three constants directly; callers wanting a usable
+  schema should call `create_schema`, which is what they already wanted.
+
+### Fixed
+
+- **`leyline-vcs`'s graph fixture built an unreadable schema** (Phase B of
+  `ley-line-open-17c271`). `writable_graph()` seeded from the removed
+  `NODES_DDL` alone, which under projection-v5 omits `v_node_name`; all three
+  tests that render a path failed. A regression introduced by Phase B that
+  reached a green PR — `task ci` runs `cargo test --workspace`, and the crate's
+  `sqlite` feature is off by default, so the code never compiled. Surfaced only
+  by `cargo test --workspace --all-features`; see `ley-line-open-b23c41` for
+  the argument that the mutation slices should build that configuration by
+  construction.
+
+- **`splice_db_bytes` always returned `Err`** in `leyline-ts`. The internal
+  `deserialize_read_exact` call passed `read_only = true`, so every splice
+  through this entry point failed. Pre-existing, unrelated to projection-v5.
+
 ## [0.19.1] — 2026-08-26
 
 ### Fixed

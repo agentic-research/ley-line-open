@@ -363,16 +363,51 @@ fi
 if [ "$SCOPE" = all ] || [ "$SCOPE" = cli ]; then
   if package_changed_in_diff ll-open/cli-lib; then
     claim_package ll-open/cli-lib
+    # `--features vec`: WITHOUT it this slice is blind to `daemon/embed.rs`.
+    # `daemon/mod.rs` gates `pub mod embed;` behind `#[cfg(feature = "vec")]`
+    # and `vec` is not in cli-lib's defaults, so a default-features run
+    # compiles the module OUT — while cargo-mutants, which parses with syn and
+    # does not evaluate cfgs, still enumerates every mutant inside it. Each one
+    # then "builds" in 0s, every test trivially passes, and it is reported
+    # MISSED: a phantom survivor on healthy code, indistinguishable in the log
+    # from a real missing assertion. The projection-v5 PR surfaced six of them.
+    #
+    # This is the same hazard the generic slice's feature block above documents
+    # — the difference is that the generic slice learned it from
+    # tools/feature-ledger.txt and THIS slice never did, because the ledger
+    # only feeds the generic run and the generic run excludes cli-lib. A ledger
+    # row alone therefore cannot fix it; the feature has to be named here.
+    #
+    # Measured: `embed.rs:193` reports "1 missed ... 0s build" under default
+    # features and "3 caught" with `--features vec`; `cargo test -p
+    # leyline-cli-lib --lib embedding_pass` runs 0 tests by default and 5 with
+    # it. The whole binary set below compiles with the feature and its deps are
+    # already in Cargo.lock, so this costs a longer link, not a download.
+    #
     # lsp_enrich_pipeline: kills the whole-function replacement mutants on
     # `enrich_files_with_client` (four survived on the PR that added the
     # test — nothing observed that function's counts or writes before it).
+    # pointer_store_dual_write_test: kills the blob-serializer stubs
+    # (`serialize_ast_node_list_record -> Ok(())` survived on the Phase A
+    # locator-eviction PR — the F1 gate that observes blob content lived
+    # only in this file, which the slice did not run).
+    # injection_extraction_test: the only tests that observe an INJECTED
+    # subtree's nid. `inj_injected_nid_scheme_pinned` asserts the injected nid
+    # lands in its host file's range, which is what kills `base | ordinal`
+    # mutated to `base & ordinal` — `base`'s low 24 bits are zero, so `&`
+    # collapses every injected nid to 0 and the fact rows leave the host's
+    # range entirely. Verified before routing: the mutation leaves the lib
+    # suite green and fails five tests in this binary.
     run_slice integration \
+        --features vec \
         -C --lib \
         -C --test -C execution_client \
         -C --test -C execution_transport \
         -C --test -C cdc_activation_consumer_test \
         -C --test -C cdc_command_test \
         -C --test -C lsp_enrich_pipeline \
+        -C --test -C pointer_store_dual_write_test \
+        -C --test -C injection_extraction_test \
         --package leyline-cli-lib --test-workspace=false
   fi
 fi

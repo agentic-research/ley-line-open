@@ -67,6 +67,27 @@ fn blob_manifest_rows(conn: &Connection, blob_hash: Hash) -> i64 {
     .unwrap()
 }
 
+/// Seed one eligible file leaf at `path`. A node's PATH is not stored under
+/// projection-v5, so this interns the components that render it.
+fn insert_node_leaf(conn: &Connection, path: &str, record: &str) {
+    let file_id = leyline_schema::ensure_file_id(conn, path).unwrap();
+    let dir_id = leyline_schema::ensure_dir_nodes(conn, path, 7).unwrap();
+    let name_id = leyline_schema::intern_name(conn, path).unwrap();
+    leyline_schema::insert_node(
+        conn,
+        leyline_schema::file_nid(file_id, 0),
+        Some(leyline_schema::dir_nid(dir_id)),
+        Some(name_id),
+        None,
+        0,
+        0,
+        record.len() as i64,
+        7,
+        record,
+    )
+    .unwrap();
+}
+
 #[test]
 fn sub_floor_blobs_are_skipped_not_manifested() {
     let conn = blob_db();
@@ -177,12 +198,7 @@ fn identical_content_in_nodes_and_source_blobs_shares_one_chunk_pool() {
     // Baseline: the nodes target alone.
     let nodes_only = Connection::open_in_memory().unwrap();
     leyline_schema::create_nodes_table(&nodes_only).unwrap();
-    nodes_only
-        .execute(
-            "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('f.txt', 'f.txt', 0, ?1, 7, ?2)",
-            params![content.len() as i64, text],
-        )
-        .unwrap();
+    insert_node_leaf(&nodes_only, "f.txt", text);
     activate_chunked_content(&nodes_only, ActivationOptions::default()).unwrap();
     let single_target_chunks = count(&nodes_only, "SELECT COUNT(*) FROM content_chunks");
     assert!(single_target_chunks > 0);
@@ -191,11 +207,7 @@ fn identical_content_in_nodes_and_source_blobs_shares_one_chunk_pool() {
     let dual = Connection::open_in_memory().unwrap();
     leyline_schema::create_nodes_table(&dual).unwrap();
     leyline_ts::schema::create_source_blobs_table(&dual).unwrap();
-    dual.execute(
-        "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('f.txt', 'f.txt', 0, ?1, 7, ?2)",
-        params![content.len() as i64, text],
-    )
-    .unwrap();
+    insert_node_leaf(&dual, "f.txt", text);
     insert_blob(&dual, &content);
     let node_report = activate_chunked_content(&dual, ActivationOptions::default()).unwrap();
     let blob_report = activate_chunked_source_blobs(&dual, ActivationOptions::default()).unwrap();
@@ -244,11 +256,7 @@ fn switching_targets_reports_the_abandoned_index_as_stranded() {
     leyline_ts::schema::create_source_blobs_table(&conn).unwrap();
 
     let text = "abcdefghij".repeat(1024);
-    conn.execute(
-        "INSERT INTO nodes (id, name, kind, size, mtime, record) VALUES ('f.txt', 'f.txt', 0, ?1, 7, ?2)",
-        params![text.len() as i64, text],
-    )
-    .unwrap();
+    insert_node_leaf(&conn, "f.txt", &text);
     insert_blob(&conn, text.as_bytes());
 
     // 1. nodes only — source_blobs was never activated, blob_manifest does

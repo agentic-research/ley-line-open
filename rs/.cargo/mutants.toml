@@ -72,6 +72,49 @@ exclude_re = [
     # baked-in number would lose the `files × rows_per_file` shape that says
     # why the number is what it is.
     'cmd_parse\.rs.*replace \* with (\+|/) in parse_into_conn',
+
+    # projection-v5 nid composition: `base | ordinal`, mutated to `base ^
+    # ordinal`, at each of the three sites that mint a nid in the insert loop
+    # (the `nid_by_id` map for AST entries, the same map for injected-subtree
+    # ids, and the `_ast` row push).
+    #
+    # This is the `WEXITED | WNOWAIT` case above, with the disjointness
+    # enforced in the function itself rather than inherited from libc. `base`
+    # is `file_nid(file_id, 0)` == `file_id << NID_ORDINAL_BITS`, so its low 24
+    # bits are all zero by construction, and the `ensure!` four lines above the
+    # first site rejects the file outright unless every ordinal it is about to
+    # mint fits in `NID_ORDINAL_MASK` (2^24 - 1). For operands with no bits in
+    # common `a | b` and `a ^ b` are the identical integer, so the mutated
+    # program mints the same nids, writes the same rows, and folds to the same
+    # Σ root. There is no observable difference to assert on.
+    #
+    # This is NOT "inconvenient to test". A test that could distinguish them
+    # would need an ordinal whose bits reach into the file_id field — exactly
+    # the state the `ensure!` exists to make unreachable, and constructing it
+    # would be asserting that nids may collide across files.
+    #
+    # Restructuring does not remove it. Minting through
+    # `leyline_schema::file_nid` only relocates the same `|` into that
+    # function, where the same disjointness (stated there as a `debug_assert!`)
+    # makes it equally equivalent — and it would add a call plus two debug
+    # assertions to the per-node insert loop that `cold_parse_perf_regression`
+    # measures.
+    #
+    # The sibling mutation `| -> &` is NOT listed: it is a real behavioural
+    # change (it clears the file_id field) and is killed by
+    # `injected_ids_take_the_ordinals_after_the_ast_entries`.
+    'cmd_parse\.rs.*replace \| with \^ in parse_into_conn',
+
+    # The same nid composition in the standalone projector's walk:
+    # `let nid = base | ordinal`, with `base = file_nid(file_id, 0)` and the
+    # `ensure!` on the two lines above bounding `ordinal` by
+    # `NID_ORDINAL_MASK`. Identical argument to the `parse_into_conn` entry
+    # directly above — disjoint bit fields make `|` and `^` the same integer,
+    # so the mutant mints the same nids. The sibling `| -> &` mutation is a
+    # real behavioural change and is NOT excluded.
+    # (`/project\.rs`, anchored on the separator, so this cannot also swallow
+    # a mutant in the neighbouring `pyproject.rs`.)
+    '/project\.rs.*replace \| with \^ in walk_children',
     # `verify_head`'s `kid_hit` fast path, mutated two ways: `delete !` on
     # `!kid.is_empty()`, and `==` -> `!=` on the canonical-kid comparison.
     #

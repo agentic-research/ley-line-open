@@ -940,6 +940,16 @@ tasks:
     cmds:
       - sh tools/check_feature_reachability.sh .
 
+  # Pairs with lint:feature-reachability, which asks whether gated code COMPILES
+  # somewhere. This asks the different question that gate cannot: whether the
+  # mutation slice that reaches a gated module actually compiles it, or honestly
+  # excludes it. A module that is enumerated but compiled out reports MISSED
+  # having tested nothing (bead `ley-line-open-b23c41`).
+  lint:mutants-cfg-coverage:
+    desc: Every cfg-gated module is compiled by its mutation slice or excluded from it
+    cmds:
+      - sh tools/check_mutants_cfg_coverage.sh
+
   # --------------------------------------------------------------------------
   # Smell-rule gate (workspace deps drift + unsafe/unwrap invariants).
   # Mache-shaped: `smell-projector` walks `rs/`, projects Cargo.toml
@@ -1532,6 +1542,7 @@ tasks:
       - task: lint:architecture-vocabulary
       - task: lint:doc-claims
       - task: lint:feature-reachability
+      - task: lint:mutants-cfg-coverage
       - task: readme:version-check
       - task: schema:version-check
       - task: check

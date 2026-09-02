@@ -171,5 +171,38 @@ if MUTANTS_GENERIC_EXCLUDES='ll-open/orphan' \
     exit 1
 fi
 
+# The fs slice is the ONLY one that passes `--no-default-features`, which makes
+# it the only place the ledger's standing exemption for default-enabled features
+# ("cargo resolves them, mutants compiles them") is false. `fuse` and `nfs` ARE
+# in leyline-fs's default set, so the ledger correctly declines to carry them —
+# but this slice's own flags compile `fuse.rs` and `nfs.rs` out, while
+# cargo-mutants (which parses with syn and never evaluates cfg) still enumerates
+# every mutant inside them. Each then builds in 0s, every test trivially passes,
+# and it reports MISSED: a phantom survivor on healthy code.
+#
+# A slice that opts out of default features owes an exclusion for what that
+# choice removes. Their missing tests are a real gap owned by
+# `ley-line-open-aed167`, so exclusion is the honest move here rather than
+# enabling the features and reddening the gate on a coverage debt this gate did
+# not incur.
+: > "$log"
+cat > "$fixture_dir/fs-mount.diff" <<'DIFF'
+diff --git a/ll-open/fs/src/fuse.rs b/ll-open/fs/src/fuse.rs
+--- a/ll-open/fs/src/fuse.rs
++++ b/ll-open/fs/src/fuse.rs
+@@ -1 +1 @@
+-old
++new
+DIFF
+PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/fs-mount.diff"
+assert_call 'mutants .*--package leyline-fs .*--exclude ll-open/fs/src/fuse\.rs' \
+    'fs slice excludes the fuse module its --no-default-features compiles out'
+assert_call 'mutants .*--package leyline-fs .*--exclude ll-open/fs/src/nfs\.rs' \
+    'fs slice excludes the nfs module its --no-default-features compiles out'
+assert_call 'mutants .*--package leyline-fs .*--exclude ll-open/fs/src/verified\.rs' \
+    'fs slice excludes the verify module its feature set compiles out'
+
 echo 'diff mutation fixture proved package-specific integration-test routing'
 echo 'diff mutation fixture proved excluded packages must be claimed by a slice'
+echo 'diff mutation fixture proved the fs slice excludes what it compiles out'

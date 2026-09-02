@@ -414,8 +414,33 @@ fi
 
 if [ "$SCOPE" = all ] && package_changed_in_diff ll-open/fs; then
     claim_package ll-open/fs
+    # This is the ONLY slice that passes `--no-default-features`, which makes it
+    # the only place tools/feature-ledger.txt's standing exemption for
+    # default-enabled features ("cargo resolves them, mutants compiles them") is
+    # false. `fuse` and `nfs` ARE in leyline-fs's default set, so the ledger is
+    # right not to carry them — but these flags compile `fuse.rs`, `nfs.rs` and
+    # `verified.rs` out, while cargo-mutants parses with syn, never evaluates
+    # cfg, and enumerates every mutant inside them anyway. Each then builds in
+    # 0s, every test trivially passes, and it is reported MISSED: a phantom
+    # survivor on healthy code, indistinguishable in the log from a real missing
+    # assertion (bead `ley-line-open-b23c41`).
+    #
+    # A slice that opts out of default features owes an exclusion for what that
+    # choice removes — the exclusions below are not a policy about mount, they
+    # are this invocation being consistent with itself. Enabling the features
+    # instead would be worse: `ley-line-open-aed167` records that mount ships
+    # with no tests at any level, so the phantoms would become REAL survivors
+    # and redden every mount PR over a coverage debt this gate did not incur.
+    # `verified` is the same shape (`ley-line-open-b6a4dd`).
+    #
+    # Kept in step by tools/check_mutants_cfg_coverage.sh, which fails if a
+    # cfg-gated module is neither enabled by its slice nor excluded here. That
+    # guard is load-bearing: enumerating this list BY HAND missed `verified.rs`.
     run_slice lib --package leyline-fs --test-workspace=false \
-        --no-default-features --features cdc,splice,validate
+        --no-default-features --features cdc,splice,validate \
+        --exclude 'll-open/fs/src/fuse.rs' \
+        --exclude 'll-open/fs/src/nfs.rs' \
+        --exclude 'll-open/fs/src/verified.rs'
 fi
 
 # `ll-open/cli` is the thin clap binary: its only mutant is `replace main`,

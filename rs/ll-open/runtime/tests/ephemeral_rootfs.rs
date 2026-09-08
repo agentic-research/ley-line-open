@@ -10,6 +10,8 @@ use leyline_runtime::backends::libkrun::volume::{
 };
 use tempfile::TempDir;
 
+mod common;
+
 fn rootfs_fixture(parent: &Path) -> ResolvedRootfs {
     let content = b"probe-v1";
     let content_digest = blake3::hash(content).to_hex().to_string();
@@ -37,6 +39,7 @@ fn rootfs_fixture(parent: &Path) -> ResolvedRootfs {
 
 #[test]
 fn guest_writes_are_isolated_from_the_immutable_cas_root() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     let source = rootfs_fixture(fixture.path());
     let destination = fixture.path().join("run-root");
@@ -95,6 +98,7 @@ fn guest_writes_are_isolated_from_the_immutable_cas_root() {
 
 #[test]
 fn copied_bytes_are_reverified_against_the_requested_identity() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     let source = rootfs_fixture(fixture.path());
     fs::write(source.canonical_path.join("usr/bin/probe"), b"tampered")
@@ -115,6 +119,7 @@ fn copied_bytes_are_reverified_against_the_requested_identity() {
 
 #[test]
 fn destination_tampering_is_rejected_before_vm_entry() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     let source = rootfs_fixture(fixture.path());
     let destination = fixture.path().join("run-root");
@@ -140,6 +145,7 @@ fn destination_tampering_is_rejected_before_vm_entry() {
 
 #[test]
 fn materializer_rejects_symlinks_even_when_given_a_pre_resolved_path() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     let source = rootfs_fixture(fixture.path());
     symlink(
@@ -161,6 +167,7 @@ fn materializer_rejects_symlinks_even_when_given_a_pre_resolved_path() {
 
 #[test]
 fn materializer_requires_an_empty_destination() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     let source = rootfs_fixture(fixture.path());
     let destination = fixture.path().join("run-root");
@@ -180,6 +187,7 @@ fn materializer_requires_an_empty_destination() {
 
 #[test]
 fn materializer_rejects_special_files_without_blocking() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     let source = rootfs_fixture(fixture.path());
     let fifo = source.canonical_path.join("guest.fifo");

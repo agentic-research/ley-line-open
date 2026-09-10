@@ -1674,6 +1674,14 @@ pub fn parse_into_conn(
                             None => None,
                         };
                         if n.id == pf.rel {
+                            // `pf.file_mtime`, not the parse-run `mtime`. A mount
+                            // fills atime/mtime/ctime/crtime from this column
+                            // (`fs/src/fuse.rs:55-68`), so stamping every row with
+                            // the parse time gave a whole tree one timestamp and
+                            // defeated every make-style staleness check
+                            // (bead `ley-line-open-ca51fa`). Directory rows keep
+                            // the parse-run value — they have no filesystem mtime
+                            // of their own in this projection.
                             nodes_buf.push(
                                 base,
                                 Some(leyline_schema::dir_nid(dir_id)),
@@ -1682,7 +1690,7 @@ pub fn parse_into_conn(
                                 n.kind,
                                 0,
                                 n.size,
-                                mtime,
+                                pf.file_mtime,
                                 n.record.clone(),
                             );
                         } else {
@@ -2912,10 +2920,17 @@ pub(crate) fn parse_file_pure(
     };
 
     // File node.
+    //
+    // `size` is the file's BYTE LENGTH, not 0. A mount returns this straight
+    // out of `getattr` (`fs/src/fuse.rs:52` -> `st_size`), so a 0 here makes
+    // every file on a mounted arena stat as empty — and `cat`, `wc`, `rsync`,
+    // editors and most build systems believe `st_size` before they read
+    // (bead `ley-line-open-ca51fa`). AST node rows carry their span length in
+    // the same column; only the file's own row was left at 0.
     nodes.push(ParsedNode {
         id: source_id.to_string(),
         kind: 1,
-        size: 0,
+        size: file_size,
         record: String::new(),
     });
 
@@ -3821,6 +3836,47 @@ mod tests {
                 "is_bloat_dir(`{name}`) must be false, but matched",
             );
         }
+    }
+
+    /// A mount reports `nodes.size` straight into `getattr` (`fs/src/fuse.rs:52`)
+    /// and `nodes.mtime` into all four timestamps. Both were unpopulated for file
+    /// rows — every file stat'd as 0 bytes at the parse time — while the real
+    /// values sat in `_file_index` (bead `ley-line-open-ca51fa`).
+    #[test]
+    fn a_file_row_carries_its_filesystem_size_and_mtime() {
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        let body = b"package m\nfunc A() {}\n";
+        std::fs::write(root.join("a.go"), body).unwrap();
+        let want_mtime = std::fs::metadata(root.join("a.go"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+
+        let conn = Connection::open_in_memory().unwrap();
+        parse_into_conn(&conn, root, None, None).unwrap();
+
+        // The file's own node is ordinal 0 of its file_id range.
+        let (size, mtime): (i64, i64) = conn
+            .query_row(
+                "SELECT size, mtime FROM nodes WHERE nid > 0 AND (nid & 16777215) = 0",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            size,
+            body.len() as i64,
+            "file row size must be the file's byte length, not 0 — a mount stats this"
+        );
+        assert_eq!(
+            mtime, want_mtime,
+            "file row mtime must be the filesystem mtime, not the parse time"
+        );
     }
 
     #[test]

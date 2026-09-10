@@ -24,6 +24,15 @@ context, scoping notes, and review history are recoverable.
   runs in `list-scopes`, the one place the whole picture exists. `task ci`'s
   ceiling moves 30 → 45: steady state measured ~25 min with a 24% spread on
   one commit, so the old 17% headroom was smaller than the variance.
+  The first promotion through the matrix (#386) then found the planner and
+  the leg disagreeing on what work is: `plan` emits a scope for any Rust
+  change in its package, cargo-mutants never enumerates integration tests,
+  and a diff touching `ll-open/runtime` only under `tests/` failed the
+  runtime leg as MISCONFIGURED. A scoped leg that enumerates nothing from
+  its package now makes the distinction the whole-diff check already made:
+  paths that do not resolve are MISCONFIGURED; paths that resolve with
+  nothing mutable report NO MUTABLE LINES and exit 0, labelled as not a
+  pass. `tools/test_mutants_diff.sh` pins both branches.
 
 - **The fs mutation slice excludes what it compiles out, and a guard keeps
   it that way** (bead `ley-line-open-b23c41`). cargo-mutants never evaluates

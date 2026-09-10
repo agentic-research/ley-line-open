@@ -192,23 +192,29 @@ fi
 listing=$(cargo mutants --in-diff "$DIFF" --list 2>&1 || true)
 n=$(printf '%s\n' "$listing" | grep -cE '^[^ ].*:[0-9]+:[0-9]+:' || true)
 
-if [ "${n:-0}" -eq 0 ]; then
-    # Zero mutants from a Rust-touching diff has two causes that need opposite
-    # responses, and the difference is not visible in cargo-mutants' output —
-    # it prints "No mutants to filter" for both.
-    #
-    #   1. The paths do not resolve. This is the trap: a diff generated from
-    #      the repo root carries `b/rs/ll-core/...`, matches nothing, and the
-    #      naive implementation exits 0 forever.
-    #   2. The paths resolve fine and the changed lines simply hold nothing
-    #      mutable — a `#[cfg(test)] mod tests` edit, a doc comment, a `use`.
-    #      Nothing to mutate is the correct answer here, not a failure.
-    #
-    # Deciding between them by asking the filesystem tests the actual claim the
-    # error message makes ("your paths are not workspace-relative") rather than
-    # a proxy for it. This script's cwd IS the cargo-mutants working directory,
-    # so a workspace-relative path is exactly one that resolves from here.
-    changed=$(sed -n 's|^+++ b/\(.*\.rs\)$|\1|p' "$DIFF")
+# Zero mutants from a Rust-touching diff has two causes that need opposite
+# responses, and the difference is not visible in cargo-mutants' output — it
+# prints "No mutants to filter" for both.
+#
+#   1. The paths do not resolve. This is the trap: a diff generated from the
+#      repo root carries `b/rs/ll-core/...`, matches nothing, and the naive
+#      implementation exits 0 forever.
+#   2. The paths resolve fine and the changed lines simply hold nothing
+#      mutable — a `#[cfg(test)] mod tests` edit, a doc comment, a `use`, an
+#      integration test under `tests/`. Nothing to mutate is the correct
+#      answer here, not a failure.
+#
+# Deciding between them by asking the filesystem tests the actual claim the
+# error message makes ("your paths are not workspace-relative") rather than a
+# proxy for it. This script's cwd IS the cargo-mutants working directory, so a
+# workspace-relative path is exactly one that resolves from here.
+#
+# Sets `resolved` (a count) and `unresolved` (a newline-terminated list) for
+# the diff's changed Rust files whose path begins with $1 — pass '' for all of
+# them. The whole-diff check and the per-scope check below ask the same
+# question of different subsets, so they share the one answer.
+resolve_changed_paths() {
+    changed=$(sed -n "s|^+++ b/\($1.*\.rs\)\$|\1|p" "$DIFF")
     resolved=0
     unresolved=""
     # Here-doc rather than a pipe: a pipeline would run this loop in a subshell
@@ -225,6 +231,10 @@ if [ "${n:-0}" -eq 0 ]; then
     done <<EOF
 $changed
 EOF
+}
+
+if [ "${n:-0}" -eq 0 ]; then
+    resolve_changed_paths ''
 
     if [ "$resolved" -eq 0 ]; then
         {
@@ -256,12 +266,40 @@ if [ "$SCOPE" != all ] && [ "$SCOPE" != generic ]; then
     scope_pattern=$(packages_in_scope "$SCOPE" | tr ' ' '|' | sed 's/|$//')
     scope_n=$(printf '%s\n' "$listing" | grep -cE "^($scope_pattern)/.*:[0-9]+:[0-9]+:" || true)
     if [ "${scope_n:-0}" -eq 0 ]; then
-        {
-            echo "MISCONFIGURED: mutation scope '$SCOPE' enumerated zero candidates"
-            echo "               from that package. Mutants in another changed package"
-            echo "               cannot make this focused run pass."
-        } >&2
-        exit 1
+        # The same two causes as the whole-diff check, asked of this scope's
+        # packages alone. Another package's mutants say nothing about them:
+        # the planner emits a scope for ANY Rust change in its package, and
+        # cargo-mutants never enumerates integration tests, so a diff that
+        # touches ll-open/runtime only under tests/ reaches here with the
+        # whole-diff count above zero. That is what the first integration ->
+        # main promotion through the matrix hit (ley-line-open-908b68), and
+        # it is case 2, not a misconfiguration.
+        scope_resolved=0
+        scope_unresolved=""
+        for owned in $(packages_in_scope "$SCOPE"); do
+            resolve_changed_paths "$owned/"
+            scope_resolved=$((scope_resolved + resolved))
+            scope_unresolved="$scope_unresolved$unresolved"
+        done
+        if [ "$scope_resolved" -eq 0 ]; then
+            {
+                echo "MISCONFIGURED: mutation scope '$SCOPE' enumerated zero candidates"
+                echo "               from its package(s), and none of the diff's paths"
+                echo "               there resolve from $(pwd) — where cargo mutants"
+                echo "               runs. Mutants in another changed package cannot"
+                echo "               make this focused run pass."
+                echo "               Regenerate with: git diff --relative=rs"
+                echo "--- unresolved paths ---"
+                printf '%s' "$scope_unresolved" | sed 's/^/    /'
+            } >&2
+            exit 1
+        fi
+        echo "NO MUTABLE LINES: scope '$SCOPE' — the diff's $scope_resolved Rust file(s)"
+        echo "                  in its package(s) resolve, but the lines it changes"
+        echo "                  hold nothing cargo-mutants can mutate — integration"
+        echo "                  tests, test modules, comments or imports. This is"
+        echo "                  NOT a pass; no mutation testing ran in this scope."
+        exit 0
     fi
 fi
 

@@ -18,7 +18,7 @@ printf '%s\n' "$*" >> "$MUTANTS_FIXTURE_LOG"
 case " $* " in
   *" --list "*)
     case "$*" in
-      *cli-mutants-only.diff*)
+      *cli-mutants-only.diff*|*runtime-tests-only.diff*)
         printf '%s\n' 'll-open/cli-lib/src/daemon/client.rs:65:9: fixture mutant'
         ;;
       *)
@@ -104,10 +104,69 @@ if PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
     exit 1
 fi
 
+# A scoped leg that enumerates nothing from its own package has two causes
+# that need opposite responses, exactly as the global check does: the paths do
+# not resolve (the diff was generated from the wrong directory — MISCONFIGURED,
+# whatever another package enumerated), or they resolve and the changed lines
+# hold nothing cargo-mutants can mutate. Run from the repo root, where
+# `ll-open/runtime/...` resolves to nothing, this is the first case.
 cp "$fixture_dir/pr.diff" "$fixture_dir/cli-mutants-only.diff"
 if PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
   "$repo_root/tools/mutants_diff.sh" "$fixture_dir/cli-mutants-only.diff" runtime; then
     echo 'runtime-only scope falsely passed when only the changed CLI package had mutants' >&2
+    exit 1
+fi
+
+# The second case is what the first integration -> main promotion through the
+# matrix hit (PR #386, ley-line-open-908b68): the diff changed ll-open/runtime
+# only under tests/, the planner emitted the runtime scope because a Rust file
+# in the package changed, and the leg reported MISCONFIGURED because
+# cargo-mutants never enumerates integration tests. Run from a directory where
+# the package's changed file resolves, the leg must report that nothing was
+# mutable and exit 0 — nothing ran, and the message must not call it a pass.
+cat > "$fixture_dir/runtime-tests-only.diff" <<'DIFF'
+diff --git a/ll-open/runtime/tests/common/mod.rs b/ll-open/runtime/tests/common/mod.rs
+--- a/ll-open/runtime/tests/common/mod.rs
++++ b/ll-open/runtime/tests/common/mod.rs
+@@ -1 +1 @@
+-old
++new
+diff --git a/ll-open/cli-lib/src/daemon/client.rs b/ll-open/cli-lib/src/daemon/client.rs
+--- a/ll-open/cli-lib/src/daemon/client.rs
++++ b/ll-open/cli-lib/src/daemon/client.rs
+@@ -1 +1 @@
+-old
++new
+DIFF
+mkdir -p "$fixture_dir/ll-open/runtime/tests/common"
+: > "$fixture_dir/ll-open/runtime/tests/common/mod.rs"
+: > "$log"
+out=$(
+    cd "$fixture_dir"
+    PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
+      "$repo_root/tools/mutants_diff.sh" "$fixture_dir/runtime-tests-only.diff" runtime
+) || {
+    echo 'runtime scope failed a diff whose runtime changes are integration tests only' >&2
+    exit 1
+}
+case "$out" in
+    *"NO MUTABLE LINES"*"runtime"*) ;;
+    *)
+        echo 'runtime scope exited 0 on a tests-only diff without saying nothing was mutable' >&2
+        printf '%s\n' "$out" >&2
+        exit 1
+        ;;
+esac
+if grep -E -- '--package leyline-runtime' "$log" >/dev/null; then
+    echo 'runtime scope ran a mutation slice on a diff with nothing to mutate' >&2
+    exit 1
+fi
+
+# Same diff, but the runtime path does not resolve from here: the tests-only
+# outcome must not have loosened the path check.
+if PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/runtime-tests-only.diff" runtime 2>/dev/null; then
+    echo 'runtime scope passed a diff whose runtime path does not resolve' >&2
     exit 1
 fi
 
@@ -245,6 +304,12 @@ diff --git a/ll-open/cli/src/main.rs b/ll-open/cli/src/main.rs
 +++ b/ll-open/cli/src/main.rs
 DIFF
 plan_is "$fixture_dir/plan-cli-binary.diff" 'cli'
+
+# The planner emits a scope for ANY Rust change in its package, tests included.
+# It runs no cargo, so it cannot know what will enumerate; the leg asks
+# cargo-mutants and reports NO MUTABLE LINES when the answer is nothing. One
+# authority on mutability, not a second rule here that could drift from it.
+plan_is "$fixture_dir/runtime-tests-only.diff" 'runtime cli'
 
 # THE case a hand-copied package list got wrong: a package the generic slice
 # excludes and no scope owns. Serially this is caught by

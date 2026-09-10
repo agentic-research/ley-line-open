@@ -12,6 +12,35 @@ context, scoping notes, and review history are recoverable.
 
 ### Changed
 
+- **The mutation slices run as a matrix, and `task ci` gets a ceiling sized
+  against its variance** (bead `ley-line-open-908b68`). The promotion gate
+  ran 80m16s against a 90-minute ceiling. `plan` (no cargo, seconds) emits
+  only the scopes with work; the allowlist arm and one leg per scope run
+  concurrently, and the aggregate keeps the name branch protection requires
+  and fails closed on every non-success upstream result. Wall clock becomes
+  max(allowlist, slowest leg). Scope→package ownership lives in ONE table
+  (`MUTATION_SCOPE_PACKAGES`) that the excludes, the enumeration prefix,
+  scope validation and the planner all derive from; the pairing assertion
+  runs in `list-scopes`, the one place the whole picture exists. `task ci`'s
+  ceiling moves 30 → 45: steady state measured ~25 min with a 24% spread on
+  one commit, so the old 17% headroom was smaller than the variance.
+
+- **The fs mutation slice excludes what it compiles out, and a guard keeps
+  it that way** (bead `ley-line-open-b23c41`). cargo-mutants never evaluates
+  `cfg`, so `fuse.rs`, `nfs.rs` and `verified.rs` were enumerated but never
+  compiled under the slice's `--no-default-features` — a phantom MISSED on
+  healthy code, indistinguishable in a log from a missing assertion.
+  `lint:mutants-cfg-coverage` now fails when a cfg-gated module is neither
+  enabled by its slice nor excluded from it.
+
+- **`node_child` is documented as not droppable** (bead
+  `ley-line-open-87ff3a`). Its `field` column is the ONLY place a
+  tree-sitter field name survives — `trait:` vs `type:` under `impl_item`,
+  Go's `receiver:`, Python's `bases:` — which is what mache needs to name
+  `AdaptiveRepair.default` instead of `Default.default`. TABLE_CONTRACT now
+  carries the join and its two measured traps (do not join on ordinal;
+  `(parent_hash, child_hash)` is not a key). No schema change.
+
 - **projection-v5: file-scoped integer node ids** (Phase B of bead
   `ley-line-open-17c271`). The SQL projection's node key is no longer the
   node's own ancestry path — an O(depth) TEXT string that was ~72% of arena
@@ -74,6 +103,47 @@ context, scoping notes, and review history are recoverable.
   schema should call `create_schema`, which is what they already wanted.
 
 ### Fixed
+
+- **A mounted arena reported every file as 0 bytes at one timestamp** (bead
+  `ley-line-open-ca51fa`, P0). `fuse.rs` serves `nodes.size` as `st_size`
+  and `nodes.mtime` as all four timestamps, and neither column was populated
+  for file rows: `parse_file_pure` hardcoded `size: 0` while receiving
+  `file_size`, and the writer stamped every row with one parse-run `now()`
+  while the file's mtime sat on the same struct. Measured on a 460-file
+  parse: 460/460 file rows at size 0 and one distinct mtime before; 0/460
+  and 460 distinct after, agreeing 460/460 with `_file_index`. A 0 stat is
+  not cosmetic — `cat`, `wc`, `rsync`, editors and build systems consult
+  `st_size` before or instead of reading, so the mount presented a tree of
+  empty files, and uniform mtimes defeated every make-style staleness
+  check. Undetected because mount ships with no tests at any level
+  (`ley-line-open-aed167`). Write-side only: an arena parsed before this
+  keeps its 0-byte rows for every file not reparsed since, because the
+  freshness gate skips unchanged files. `leyline daemon --reset-arena`
+  (or removing the arena) rebuilds it with real stats.
+
+- **A touched-but-identical file is no longer reparsed** (bead
+  `ley-line-open-8f37c4`). The parse freshness gate compared `(mtime, size)`
+  only, so a `touch`, a git checkout, a CI fetch or an editor
+  save-with-no-edit reparsed and reprojected a file to reproduce byte for
+  byte what was already stored — 825 ms for one file (parse 177, insert
+  625), now 29 ms. `_source.content_hash` was already written for every
+  projected file on the locked σ surface and never consulted; it is now the
+  authority whenever the stat pair disagrees, and a fully-unchanged tree
+  pays nothing for it (53 ms vs 65 ms before). This is `ley-line-open-b82f56`'s
+  conclusion — a freshness witness is a mutation identity, not a stat pair —
+  applied to the parse path. Retiring `_file_index`, now redundant with
+  `nodes` and `_source`, is the next change on the bead.
+
+- **The runtime's fixture-writing test suites serialize** (bead
+  `ley-line-open-cdfaf4`). Seven test binaries write an executable fixture
+  and spawn it; with tests running in parallel, another thread's `fork`
+  inherits the write descriptor and the exec sees `ETXTBSY` ("Text file
+  busy"). #378's claim that publishing the fixture by `rename` closed this
+  was false — `rename(2)` preserves the inode, and the race is (a write fd
+  open) × (any other thread's fork) — and is retracted. Every such suite
+  now takes one per-binary lock from `tests/common/mod.rs`; the unit of
+  risk is the binary, because descriptors are inherited within one process
+  and cargo runs each test binary as its own.
 
 - **`leyline-vcs`'s graph fixture built an unreadable schema** (Phase B of
   `ley-line-open-17c271`). `writable_graph()` seeded from the removed

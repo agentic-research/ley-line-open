@@ -203,6 +203,85 @@ assert_call 'mutants .*--package leyline-fs .*--exclude ll-open/fs/src/nfs\.rs' 
 assert_call 'mutants .*--package leyline-fs .*--exclude ll-open/fs/src/verified\.rs' \
     'fs slice excludes the verify module its feature set compiles out'
 
+# --------------------------------------------------------------------------
+# `list-scopes`: the plan the CI matrix is built from. Runs no cargo.
+# --------------------------------------------------------------------------
+
+plan_is() {
+    got=$(PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
+        "$repo_root/tools/mutants_diff.sh" "$1" list-scopes | tr '\n' ' ' | sed 's/ $//')
+    if [ "$got" != "$2" ]; then
+        echo "plan for $1: expected '$2', got '$got'" >&2
+        exit 1
+    fi
+}
+
+# A diff touching an owned package and an unowned one plans both legs.
+cat > "$fixture_dir/plan-mixed.diff" <<'DIFF'
+diff --git a/ll-open/runtime/src/authorization.rs b/ll-open/runtime/src/authorization.rs
+--- a/ll-open/runtime/src/authorization.rs
++++ b/ll-open/runtime/src/authorization.rs
+diff --git a/ll-core/core/src/partition.rs b/ll-core/core/src/partition.rs
+--- a/ll-core/core/src/partition.rs
++++ b/ll-core/core/src/partition.rs
+DIFF
+plan_is "$fixture_dir/plan-mixed.diff" 'generic runtime'
+
+# A diff confined to owned packages must NOT plan the generic leg — that leg
+# would enumerate nothing and the whole point is to stop paying for it.
+cat > "$fixture_dir/plan-owned-only.diff" <<'DIFF'
+diff --git a/ll-open/fs/src/graph.rs b/ll-open/fs/src/graph.rs
+--- a/ll-open/fs/src/graph.rs
++++ b/ll-open/fs/src/graph.rs
+DIFF
+plan_is "$fixture_dir/plan-owned-only.diff" 'fs'
+
+# ll-open/cli has no slice of its own; it is claimed inside the cli scope, so a
+# cli-binary-only diff must still plan `cli` or the pairing assertion below
+# would have nothing to satisfy it.
+cat > "$fixture_dir/plan-cli-binary.diff" <<'DIFF'
+diff --git a/ll-open/cli/src/main.rs b/ll-open/cli/src/main.rs
+--- a/ll-open/cli/src/main.rs
++++ b/ll-open/cli/src/main.rs
+DIFF
+plan_is "$fixture_dir/plan-cli-binary.diff" 'cli'
+
+# THE case a hand-copied package list got wrong: a package the generic slice
+# excludes and no scope owns. Serially this is caught by
+# assert_excluded_packages_were_covered; split across matrix legs that check is
+# vacuous in every leg, so planning must catch it or the gate reports green
+# from a matrix of skipped legs.
+cat > "$fixture_dir/plan-orphan.diff" <<'DIFF'
+diff --git a/ll-open/orphan/src/lib.rs b/ll-open/orphan/src/lib.rs
+--- a/ll-open/orphan/src/lib.rs
++++ b/ll-open/orphan/src/lib.rs
+DIFF
+if MUTANTS_GENERIC_EXCLUDES='ll-open/orphan' \
+   PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
+   "$repo_root/tools/mutants_diff.sh" "$fixture_dir/plan-orphan.diff" list-scopes; then
+    echo 'planner emitted a matrix that would skip an unowned package' >&2
+    exit 1
+fi
+
+# An unknown scope must be rejected, and the message must name the valid set —
+# the set is derived from the table, so a new slice cannot forget to appear.
+if PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
+   "$repo_root/tools/mutants_diff.sh" "$fixture_dir/plan-mixed.diff" nonsense 2>/dev/null; then
+    echo 'an unknown mutation scope was accepted' >&2
+    exit 1
+fi
+
+# The generic scope runs the lib-only slice and no package slice.
+: > "$log"
+PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/pr.diff" generic
+assert_call 'mutants .* -C --lib .*--exclude ll-open/runtime/\*\*' \
+    'generic scope runs the lib-only slice'
+if grep -E -- '--package leyline-runtime|--package leyline-cli-lib' "$log" >/dev/null; then
+    echo 'generic scope invoked a package slice' >&2
+    exit 1
+fi
+
 echo 'diff mutation fixture proved package-specific integration-test routing'
 echo 'diff mutation fixture proved excluded packages must be claimed by a slice'
 echo 'diff mutation fixture proved the fs slice excludes what it compiles out'

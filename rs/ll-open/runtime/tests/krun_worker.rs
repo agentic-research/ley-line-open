@@ -9,6 +9,8 @@ use leyline_runtime::backends::libkrun::worker::{WorkerEvent, WorkerOptions};
 use leyline_runtime::{DigestRef, ErrorCode, ExecutionRequest, ResourceLimits};
 use tempfile::TempDir;
 
+mod common;
+
 fn request_fixture(cas: &TempDir) -> ExecutionRequest {
     let content = b"probe-v1";
     let content_digest = blake3::hash(content).to_hex().to_string();
@@ -46,6 +48,7 @@ fn request_fixture(cas: &TempDir) -> ExecutionRequest {
 
 #[test]
 fn first_party_worker_never_falls_back_to_the_krunvm_cli() {
+    let _serial = common::serial();
     // Catches a regression to Cloister's old shell-wrapper architecture. A
     // PATH trap makes this behavioral rather than a source-text assertion.
     let cas = TempDir::new().expect("CAS");
@@ -103,6 +106,7 @@ fn first_party_worker_never_falls_back_to_the_krunvm_cli() {
 
 #[test]
 fn worker_options_require_an_explicit_run_root() {
+    let _serial = common::serial();
     let error = WorkerOptions::parse([
         OsString::from("--cas-root"),
         OsString::from("/cas"),

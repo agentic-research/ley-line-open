@@ -10,6 +10,8 @@ use leyline_runtime::{
 };
 use tempfile::TempDir;
 
+mod common;
+
 fn run_root_count(path: &std::path::Path) -> usize {
     fs::read_dir(path).expect("enumerate run roots").count()
 }
@@ -66,6 +68,7 @@ fn backend_with_worker(
 
 #[test]
 fn backend_spawns_the_explicit_first_party_worker_and_waits_for_ready() {
+    let _serial = common::serial();
     // Catches reporting a run as started before the confined worker has
     // prepared libkrun, and catches PATH-based backend selection.
     let fixture = TempDir::new().expect("fixture");
@@ -120,6 +123,7 @@ fn backend_spawns_the_explicit_first_party_worker_and_waits_for_ready() {
 
 #[test]
 fn backend_removes_the_run_root_when_a_worker_exits() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     let worker = fixture.path().join("leyline-krun-worker");
     fs::write(
@@ -164,6 +168,7 @@ fn backend_removes_the_run_root_when_a_worker_exits() {
 
 #[test]
 fn backend_reports_a_nonzero_worker_exit_as_failed() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     let (backend, ephemeral_root) = backend_with_worker(
         &fixture,
@@ -185,6 +190,7 @@ fn backend_reports_a_nonzero_worker_exit_as_failed() {
 
 #[test]
 fn backend_cancel_terminates_the_worker_and_removes_its_run_root() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     let worker = fixture.path().join("leyline-krun-worker");
     fs::write(
@@ -220,6 +226,7 @@ fn backend_cancel_terminates_the_worker_and_removes_its_run_root() {
 
 #[test]
 fn backend_enforces_the_wall_clock_limit_and_cleans_up() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     let worker = fixture.path().join("leyline-krun-worker");
     fs::write(
@@ -264,6 +271,7 @@ fn backend_enforces_the_wall_clock_limit_and_cleans_up() {
 
 #[test]
 fn backend_cleanup_handles_guest_created_restrictive_directories() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     let worker = fixture.path().join("leyline-krun-worker");
     fs::write(
@@ -308,6 +316,7 @@ fn backend_cleanup_handles_guest_created_restrictive_directories() {
 
 #[test]
 fn failed_start_removes_a_restrictive_worker_created_run_root() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     let worker = fixture.path().join("leyline-krun-worker");
     fs::write(
@@ -350,6 +359,7 @@ printf '%s\n' '{"type":"failed","error":{"code":"backend-failed","retryable":fal
 
 #[test]
 fn backend_rejects_a_duplicate_run_id_without_replacing_the_live_worker() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     let worker = fixture.path().join("leyline-krun-worker");
     fs::write(
@@ -385,6 +395,7 @@ fn backend_rejects_a_duplicate_run_id_without_replacing_the_live_worker() {
 
 #[test]
 fn concurrent_starts_reserve_a_run_id_before_spawning() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     let worker = fixture.path().join("leyline-krun-worker");
     fs::write(
@@ -448,6 +459,7 @@ fn concurrent_starts_reserve_a_run_id_before_spawning() {
 /// true when the bug existed.
 #[test]
 fn the_hijack_opt_in_reaches_the_worker_and_is_absent_by_default() {
+    let _serial = common::serial();
     for hijack in [false, true] {
         let fixture = TempDir::new().expect("fixture");
         let argv_log = fixture.path().join("argv");
@@ -504,6 +516,7 @@ fn the_hijack_opt_in_reaches_the_worker_and_is_absent_by_default() {
 /// backend compared the attested policy to the authorized one at all.
 #[test]
 fn a_worker_attesting_an_unauthorized_policy_never_reaches_running() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     // Well-formed readiness, correct run id, wrong policy.
     let (backend, ephemeral_root) = backend_with_worker(
@@ -538,6 +551,7 @@ fn a_worker_attesting_an_unauthorized_policy_never_reaches_running() {
 /// than a security hole — the kind that shows up as "it worked last release".
 #[test]
 fn a_grant_authorizing_no_policy_does_not_constrain_what_the_worker_attests() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     let (backend, _ephemeral_root) = backend_with_worker(
         &fixture,
@@ -557,6 +571,7 @@ fn a_grant_authorizing_no_policy_does_not_constrain_what_the_worker_attests() {
 /// whose confinement digest was checked against the wrong request.
 #[test]
 fn readiness_announcing_another_run_is_rejected() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     let (backend, ephemeral_root) = backend_with_worker(
         &fixture,
@@ -587,6 +602,7 @@ fn readiness_announcing_another_run_is_rejected() {
 /// conjunction.
 #[test]
 fn every_libkrun_resource_is_required_independently() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     let worker = fixture.path().join("worker");
     let cas_root = fixture.path().join("cas");
@@ -674,6 +690,7 @@ fn every_libkrun_resource_is_required_independently() {
 /// shapes 20× with zero leaks (bead rs-a1e8d0).
 #[test]
 fn rejection_kills_the_workers_grandchildren_too() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     let grandchild_pid_file = fixture.path().join("grandchild.pid");
     let script = format!(

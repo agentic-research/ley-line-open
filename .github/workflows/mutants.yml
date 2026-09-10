@@ -37,91 +37,55 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# The slices are independent and were always parallelisable; running them as one
+# serial job is what put this gate at 80m16s against a 90-minute ceiling — 11%
+# headroom, thinner than the run-to-run variance that cancelled `task ci` twice
+# on 2026-09-01 (`ley-line-open-908b68`). The comment below used to say the fix
+# was a matrix "if a future diff arm approaches this too". It did, so this is it.
+#
+# Shape: `plan` decides what has work (no cargo, seconds), then the allowlist arm
+# and one leg per diff scope run CONCURRENTLY, and `mutants` aggregates them
+# under the name branch protection already requires. Wall clock becomes
+# max(allowlist, slowest leg) instead of allowlist + sum(every leg).
 jobs:
-  mutants:
-    # Named for WHAT IT COVERS, not for the command it runs. It previously read
-    # `cargo mutants (task mutants)`, which on a PR touching both Taskfile.yml
-    # and unrelated source rendered as an unqualified green — a reader
-    # reasonably concluded the PR's new logic survived mutation testing, when
-    # the run had covered the CDC allowlist and nothing the PR changed
-    # (`ley-line-open-085dff`).
-    name: cargo mutants (allowlist + this PR's diff)
+  # Cheap, cargo-free planning. Emits the scopes with work, so the matrix has a
+  # leg only where there is something to mutate — a fixed five-leg matrix would
+  # red four legs on most PRs, because a scoped run that matches nothing is a
+  # deliberate hard MISCONFIGURED (`task mutants:diff cli` typed by hand must
+  # not pass having mutated nothing).
+  #
+  # The pairing assertion — every package the generic slice excludes is owned by
+  # some scope — lives inside `list-scopes` for the same reason. Split across
+  # legs it would be vacuous in each, and a package owned by nobody would
+  # surface as a green matrix of skipped legs.
+  plan:
+    name: plan mutation scopes
     runs-on: ubuntu-latest
-    # Same reasoning as ci.yml. This job legitimately runs longer — the
-    # allowlist arm is ~17 min by its own accounting above, and a diff arm has
-    # been seen at 14 min — so the ceiling is higher, but a ceiling still beats
-    # the 6-hour default when a mutant build wedges.
-    #
-    # Raised 60 -> 90 on the projection-v5 PR, which hit the old ceiling at
-    # 60m44s with the fs slice still unrun. Both slices that DID run were
-    # clean (generic 188 in 6m, cli-lib 106 in 49m, zero missed either side),
-    # so this was the guard firing on run LENGTH, not on a survivor. Two
-    # things drove it, one transient and one permanent:
-    #
-    #   * transient — the diff arm scales with how many functions the diff
-    #     touches, and a workspace-wide re-key touches hundreds. 106 cli-lib
-    #     mutants against the ~14-min arm this ceiling was sized for.
-    #   * permanent — the cli-lib slice now builds `--features vec`, without
-    #     which `daemon/embed.rs` compiles out and its mutants are reported
-    #     MISSED having tested nothing (see tools/mutants_diff.sh). That is
-    #     real coverage the gate previously did not have, and it costs roughly
-    #     18s -> 28s per mutant in build time.
-    #
-    # 90 leaves headroom for the fs slice (~10 min) plus runner variance. If a
-    # future diff arm approaches this too, the fix is to parallelise the three
-    # slices into a matrix rather than to keep lifting the ceiling — they are
-    # independent, and `mutants_diff.sh` already takes a scope argument.
-    timeout-minutes: 90
+    timeout-minutes: 10
+    outputs:
+      scopes: ${{ steps.plan.outputs.scopes }}
+      any: ${{ steps.plan.outputs.any }}
+      allowlist: ${{ steps.scope.outputs.allowlist }}
     steps:
       # SHA-pinned: actions/checkout@v6.0.2 (Node 24)
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          # The diff-scoped run needs the merge base, which a depth-1 checkout
-          # does not have. Without this, the diff comes out empty and
-          # `mutants:diff` reports SKIPPED — green, having tested nothing.
           fetch-depth: 0
-      # SHA-pinned: dtolnay/rust-toolchain. Same nightly pin as ci.yml
-      # (bead ley-line-open-75444d) so a mutant run can't fail for a
-      # toolchain reason CI wouldn't also hit.
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
-        with:
-          toolchain: 1.97.1  # must equal rust-toolchain.toml (task lint:toolchain-parity)
-
-      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0
-        with:
-          workspaces: rs
 
       - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611
         with:
-          # Exact, not `3.x`: a floating minor means the runner can pick up a
-          # new go-task whose behaviour differs from the one developers have,
-          # which is the same class of drift rust-toolchain.toml exists to
-          # close. Bump deliberately, together with local installs.
           version: 3.49.1
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # System deps (libfuse for fuser, capnproto + libcapnp-dev for schema
-      # build.rs, libdbus-1-dev for keyring) live in Taskfile deps:ci —
-      # single source across ci.yml/release.yml/release-dryrun.yml/
-      # leyline-schema-go.yml/mutants.yml, enforced by
-      # `task lint:workflow-parity` (bead ley-line-open-e9e5b5). Without this
-      # the diff-scoped BASELINE build fails on any diff touching leyline-fs:
-      # the scratch build compiles fuser, and the runner never installed
-      # libfuse.
-      - name: Install system deps
-        run: task deps:ci
+      - name: Generate workspace-relative diff
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
+          git diff --relative=rs "$BASE_SHA...$HEAD_SHA" -- rs/ > /tmp/pr.diff
+          wc -l < /tmp/pr.diff
 
-      # Installed from source rather than via a prebuilt-binary action: every
-      # other action here is SHA-pinned against a commit verified in-repo, and
-      # adding an unvetted third-party action to save ~2 min isn't a trade this
-      # repo makes. --locked so the build can't drift with a transitive bump.
-      # Single-sourced in Taskfile deps:cargo-mutants (bead ley-line-open-2bea72).
-      - name: Install cargo-mutants
-        run: task deps:cargo-mutants
-
-      # Which of the two runs are warranted for THIS PR. Computed from the diff
-      # rather than from a paths filter, because the workflow-level filter is
-      # now deliberately broad and the two runs answer different questions.
       - name: Decide which runs apply
         id: scope
         env:
@@ -131,53 +95,6 @@ jobs:
         run: |
           set -eu
           changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
-          # The allowlist run is ~17 min (measured 2026-08-05; the three "~7
-          # min" figures this file reasoned from were 2.4x low, so the guard
-          # was more load-bearing than its own comments claimed). It fires
-          # only when the modules it
-          # covers changed, OR when the task definitions themselves changed —
-          # editing `mutants:*` should re-verify the gate still runs, which is
-          # the reason Taskfile.yml is a trigger at all.
-          #
-          # tools/mutants_diff.sh is in this list for exactly that reason: the
-          # gate's logic MOVED there, out of the Taskfile, so shellcheck could
-          # read it. Leaving it out meant a change to the gate itself no longer
-          # re-verified the gate — the trigger kept pointing at the file the
-          # logic used to live in.
-          # `cdc/` is matched as its RUST SOURCES, not as a directory prefix.
-          # Written bare it also matched `rs/ll-open/cdc/Cargo.toml`, so every
-          # release fired the 17-minute allowlist run: a version bump touches
-          # 20 manifests, one of them cdc's. Measured on chore/release-0.17.0,
-          # where the same job reported `task mutants (allowlist) 17m` beside
-          # `task mutants:diff (this PR) — nothing to mutate`. Seventeen
-          # minutes covering nothing the PR changed, on the one hop that is
-          # actually on the release critical path (vigil, `ley-line-open-f951a9`).
-          #
-          # This removes no coverage. The other three entries are already exact
-          # `.rs` paths, so a change to `fs/Cargo.toml` or `core/Cargo.toml`
-          # has never triggered them either — the fix makes cdc consistent with
-          # the rest rather than carving an exception. What a manifest-only
-          # change to cdc still gets is `mutants:diff`, which covers whatever
-          # the PR actually touched.
-          # Tiered by target, same axis ci.yml already tiers `task ci` on
-          # (`github.base_ref`) — not by a separate concept. A feature PR
-          # lands on `integration` constantly; the allowlist's own 17 minutes
-          # is the cost of running it on every one of those, for coverage that
-          # `mutants:diff` already gives per-PR and the promotion gate gives
-          # again, accumulated, before anything reaches `main`. Reserving it
-          # for `integration` -> `main` PRs means it still runs before every
-          # release — main's own diff against `integration` naturally spans
-          # everything a promotion bundles — while dev flow on `integration`
-          # keeps just the diff-scoped run.
-          #
-          # Traded away deliberately, not accidentally: a feature PR that
-          # introduces a real survivor in an allowlisted module won't see it
-          # until the PROMOTION PR, which usually bundles several feature
-          # PRs — worse attribution than catching it at the PR that caused
-          # it. Accepted for now because the alternative (paying 17 minutes
-          # on every feature PR) was the thing making dev flow painful; if
-          # attribution turns out to matter more than the wait, this is the
-          # line to revert.
           if [ "$BASE_REF" = "main" ] && printf '%s\n' "$changed" | grep -qE \
             '^(rs/ll-open/cdc/.*\.rs$|rs/ll-open/fs/src/(chunked|gc)\.rs|rs/ll-core/core/src/partition\.rs|Taskfile\.yml|tools/mutants_diff\.sh|\.github/workflows/mutants\.yml)'; then
             echo "allowlist=true" >> "$GITHUB_OUTPUT"
@@ -189,23 +106,123 @@ jobs:
             echo "::notice::allowlist run skipped — this PR touches none of the covered modules"
           fi
 
-      # Full coverage of the modules carrying falsifiable claims. Answers "do
-      # the tests for THOSE modules still bite?"
-      - name: task mutants (allowlist)
-        if: steps.scope.outputs.allowlist == 'true'
-        run: task mutants
+      # `list-scopes` runs no cargo, so this needs neither the toolchain nor
+      # cargo-mutants. It fails loudly when a changed package is owned by no
+      # scope; that failure must stop the whole workflow rather than yield an
+      # empty matrix, which `set -eu` gives us.
+      - name: Plan the diff scopes
+        id: plan
+        run: |
+          set -eu
+          # `--silent` rather than filtering task's command echo with a grep
+          # for the scope names. That grep would be a FIFTH copy of the list
+          # MUTATION_SCOPE_PACKAGES exists to be the only copy of, and it would
+          # fail open: a scope added to the table but missing from the pattern
+          # would be silently dropped from the matrix, and the leg that should
+          # have mutated it would never run.
+          scopes=$(task --silent mutants:diff DIFF=/tmp/pr.diff MUTANTS_SCOPE=list-scopes)
+          if [ -z "$scopes" ]; then
+            echo "any=false" >> "$GITHUB_OUTPUT"
+            echo 'scopes=[]' >> "$GITHUB_OUTPUT"
+            echo "::notice::no mutation scope has work for this diff"
+            exit 0
+          fi
+          echo "any=true" >> "$GITHUB_OUTPUT"
+          json=$(printf '%s\n' "$scopes" | jq -R . | jq -sc .)
+          echo "scopes=$json" >> "$GITHUB_OUTPUT"
+          echo "::notice::mutation scopes for this diff: $(printf '%s' "$scopes" | tr '\n' ' ')"
 
-      # The diff: coverage of what THIS PR changed. Answers the question the
-      # allowlist cannot, and costs time proportional to the diff rather than
-      # to the codebase (a whole-workspace run enumerates 5806 mutants).
-      #
+  # Full coverage of the modules carrying falsifiable claims. Answers "do the
+  # tests for THOSE modules still bite?" Now a sibling of the diff legs rather
+  # than a step before them, so its ~17 minutes stop being added to theirs.
+  allowlist:
+    name: cargo mutants (allowlist)
+    needs: plan
+    if: needs.plan.outputs.allowlist == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      # SHA-pinned: actions/checkout@v6.0.2 (Node 24)
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: 1.97.1  # must equal rust-toolchain.toml (task lint:toolchain-parity)
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0
+        with:
+          workspaces: rs
+      - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611
+        with:
+          version: 3.49.1
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install system deps
+        run: task deps:ci
+      - name: Install cargo-mutants
+        run: task deps:cargo-mutants
+      - name: task mutants (allowlist)
+        run: task mutants
+      - name: Upload mutants report
+        if: always()
+        # SHA-pinned: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mutants-report-allowlist
+          path: rs/mutants.out/
+          if-no-files-found: ignore
+
+  # One leg per scope with work. `fail-fast: false` so a survivor in one slice
+  # does not cancel the others — the report from every slice is the point, and
+  # cancelling siblings would hide whether the failure was isolated.
+  #
+  # 60, not 90: this ceiling now bounds ONE slice rather than the whole gate.
+  # The worst single slice measured is cli-lib at 49 min on the projection-v5
+  # PR (106 mutants, `--features vec`), so 60 leaves ~20% headroom on the
+  # slowest known leg — where the old 90 left 11% on the serial total. If a
+  # single slice ever approaches this, the next move is splitting THAT slice,
+  # not lifting the number: a slice too slow to fit is a slice doing too much.
+  diff:
+    name: cargo mutants (${{ matrix.scope }})
+    needs: plan
+    if: needs.plan.outputs.any == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        scope: ${{ fromJSON(needs.plan.outputs.scopes) }}
+    steps:
+      # SHA-pinned: actions/checkout@v6.0.2 (Node 24)
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          # The diff-scoped run needs the merge base, which a depth-1 checkout
+          # does not have. Without this, the diff comes out empty and
+          # `mutants:diff` reports SKIPPED — green, having tested nothing.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: 1.97.1  # must equal rust-toolchain.toml (task lint:toolchain-parity)
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0
+        with:
+          workspaces: rs
+          # Legs share a cache key by default and would race writing it. Keyed
+          # per scope so each leg reuses its own warm target dir instead.
+          key: mutants-${{ matrix.scope }}
+      - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611
+        with:
+          version: 3.49.1
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install system deps
+        run: task deps:ci
+      - name: Install cargo-mutants
+        run: task deps:cargo-mutants
+
       # `--relative=rs` is load-bearing. cargo-mutants runs in `rs/`, so the
       # diff's paths must be workspace-relative (`a/ll-core/...`). A diff made
       # from the repo root carries `a/rs/ll-core/...`, matches nothing, prints
       # "No mutants to filter" and EXITS 0 — a permanently green check that
-      # tests nothing, from a path prefix. `task mutants:diff` detects that
-      # case and fails rather than passing; this line is what keeps it from
-      # having to.
+      # tests nothing, from a path prefix. Regenerated per leg because each
+      # matrix leg is a fresh runner with its own checkout.
       - name: Generate workspace-relative diff
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -215,16 +232,52 @@ jobs:
           git diff --relative=rs "$BASE_SHA...$HEAD_SHA" -- rs/ > /tmp/pr.diff
           wc -l < /tmp/pr.diff
 
-      - name: task mutants:diff (this PR)
-        run: task mutants:diff DIFF=/tmp/pr.diff
+      - name: task mutants:diff (${{ matrix.scope }})
+        run: task mutants:diff DIFF=/tmp/pr.diff MUTANTS_SCOPE=${{ matrix.scope }}
 
-      # The report says which mutants survived and where — far more useful
-      # than the exit code when this job goes red.
       - name: Upload mutants report
         if: always()
         # SHA-pinned: actions/upload-artifact@v4
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: mutants-report
+          name: mutants-report-${{ matrix.scope }}
           path: rs/mutants.out/
           if-no-files-found: ignore
+
+  # Stable aggregate. Branch protection requires THIS name, and matrix leg names
+  # vary with the plan, so the required check cannot be a leg. It must also fail
+  # closed: `needs` alone would let a skipped or cancelled upstream job pass, so
+  # every non-success result is checked explicitly.
+  mutants:
+    # Named for WHAT IT COVERS, not for the command it runs. It previously read
+    # `cargo mutants (task mutants)`, which on a PR touching both Taskfile.yml
+    # and unrelated source rendered as an unqualified green — a reader
+    # reasonably concluded the PR's new logic survived mutation testing, when
+    # the run had covered the CDC allowlist and nothing the PR changed
+    # (`ley-line-open-085dff`).
+    name: cargo mutants (allowlist + this PR's diff)
+    needs: [plan, allowlist, diff]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every mutation job to have succeeded or been legitimately skipped
+        env:
+          PLAN: ${{ needs.plan.result }}
+          ALLOWLIST: ${{ needs.allowlist.result }}
+          DIFF: ${{ needs.diff.result }}
+        run: |
+          set -eu
+          echo "plan=$PLAN allowlist=$ALLOWLIST diff=$DIFF"
+          # `plan` must actually have run: it carries the pairing assertion.
+          if [ "$PLAN" != success ]; then
+            echo "planning failed — no mutation coverage was decided" >&2
+            exit 1
+          fi
+          for result in "$ALLOWLIST" "$DIFF"; do
+            case "$result" in
+              success|skipped) ;;
+              *) echo "a mutation job reported '$result'" >&2; exit 1 ;;
+            esac
+          done
+          echo "every applicable mutation slice passed"

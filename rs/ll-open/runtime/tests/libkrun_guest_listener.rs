@@ -37,6 +37,8 @@ use std::time::{Duration, Instant};
 use leyline_runtime::{DigestRef, ExecutionRequest, ResourceLimits};
 use tempfile::TempDir;
 
+mod common;
+
 /// The port the guest binds. Above 1024 so `confinement/v1` §4 would permit
 /// declaring it, and not a port anything else here uses.
 const GUEST_PORT: u16 = 17536;
@@ -65,6 +67,7 @@ fn hypervisor_or_skip() -> Option<(std::ffi::OsString, std::path::PathBuf)> {
 
 #[test]
 fn a_guest_listener_nothing_declared_is_not_reachable_from_the_host() {
+    let _serial = common::serial();
     probe_listener_exposure(false);
 }
 
@@ -82,6 +85,7 @@ fn a_guest_listener_nothing_declared_is_not_reachable_from_the_host() {
 /// covered the default would let someone delete it as dead code.
 #[test]
 fn hijacked_guest_sockets_are_still_not_published_without_a_port_map() {
+    let _serial = common::serial();
     probe_listener_exposure(true);
 }
 

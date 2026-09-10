@@ -79,4 +79,24 @@ printf '      - name: sneak a cargo install back in\n        run: cargo install 
     >> "$tmp_dir/workflows/release-dryrun.yml"
 expect_fail "inline cargo install reintroduced in release-dryrun.yml"
 
+# mutants.yml names, in its allowlist regex, the files whose change must run
+# the allowlist arm. A file named there but absent from the workflow's own
+# `paths:` filter never starts the workflow — the regex entry is dead. #387
+# changed tools/mutants_diff.sh, the script the plan job runs, and no mutants
+# workflow ran on the PR (ley-line-open-908b68). Both directions of that drift
+# must fail: a path dropped from the filter, and a file added to the regex
+# without being added to the filter.
+reset_fixture
+grep -v "^      - 'tools/mutants_diff.sh'" "$tmp_dir/workflows/mutants.yml" > "$tmp_dir/m" \
+    && mv "$tmp_dir/m" "$tmp_dir/workflows/mutants.yml"
+expect_fail "tools/mutants_diff.sh dropped from mutants.yml paths: filter"
+
+reset_fixture
+sed 's/|tools\/mutants_diff\\\.sh|/|tools\/mutants_diff\\.sh|tools\/sneaked\\.sh|/' \
+    "$tmp_dir/workflows/mutants.yml" > "$tmp_dir/m" \
+    && mv "$tmp_dir/m" "$tmp_dir/workflows/mutants.yml"
+grep -q 'tools/sneaked' "$tmp_dir/workflows/mutants.yml" \
+    || { echo "fixture: the regex mutation did not apply" >&2; exit 1; }
+expect_fail "tools/sneaked.sh added to the allowlist regex but not to paths:"
+
 echo "workflow-parity fixture proved the gate fails on every drift it guards against"

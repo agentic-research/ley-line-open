@@ -49,13 +49,57 @@ workspace are invisible to them. Re-derive rather than trust when it matters.
 | `node_defs` / `node_refs` | 32 | The symbol layer. Also the agent-facing one: `find_definition` returns `node_id` STRINGS straight through MCP, so these ids are user-visible output, not an internal key. |
 | `source_blobs` | 11 | |
 | `node_content` | **0** | No SELECT anywhere. Survives as the FK target of `node_defs`/`node_refs.node_hash`. |
-| `node_child` | **0** | No SELECT, and nothing FKs into it. 3.41M rows / 405 MB on an 8000-file arena. |
+| `node_child` | **0** | No SELECT, and nothing FKs into it. 3.41M rows / 405 MB on an 8000-file arena. **Do not treat as droppable**: its `field` column is the ONLY place a tree-sitter field name survives, and mache needs it (`ley-line-open-87ff3a`). See "Recovering a node's tree-sitter field" below. |
 | `capnp_blobs` | **0** | No SELECT. Load-bearing only for the ADR-0026 §6.F1 resolution capability via `_ast_blob`. |
 | `_ast_blob` | **0** | Same — written and gated by F1, not queried. |
 
 A zero here means "nothing in this workspace SELECTs it", which is not the same
 as "safe to delete": three of the four zeros are load-bearing for an FK or an
 ADR-stated capability. It does mean the row count is not being paid for a query.
+
+`node_child` was the fourth — the one zero with no stated justification, and so
+the obvious thing to delete when someone goes looking for row count. It now has
+one: it is the sole carrier of tree-sitter field names, which nothing in this
+workspace reads and an external consumer cannot reconstruct without it. That is
+exactly the failure mode this table exists to prevent, arrived at from the other
+direction — a reader count of zero measured INSIDE the workspace said "free to
+drop" about the answer to a P1 request from outside it.
+
+### Recovering a node's tree-sitter field
+
+Tree-sitter distinguishes some children by FIELD rather than by kind. Rust's
+`impl_item` is the motivating case: `impl Trait for Type` has two
+`type_identifier` children, one under `trait:` and one under `type:`. Neither
+node kind nor document order separates them, and `_ast` carries no field column
+— so a consumer naming a method by its receiver gets the TRAIT for every trait
+impl unless it reads the field.
+
+`node_child.field` carries it, for every grammar. It is captured as
+`TreeCursor::field_name()` in `cmd_parse.rs` and written with the edge, so it is
+not Rust-specific: Go's `receiver:`, Python's `bases:` and TypeScript's
+`implements:` all land the same way.
+
+Join on the HASHES, scoped by the parent:
+
+```sql
+SELECT nc.field
+  FROM node_child nc
+ WHERE nc.parent_hash = :parent_node_hash
+   AND nc.child_hash  = :child_node_hash;
+```
+
+Two rules, both measured on a 460-file Rust arena at `projection-v5`:
+
+1. **Never join on ordinal.** `nodes.ord` counts NAMED children only and is
+   dense (0, 1, 2); `node_child.ordinal` counts ALL children including unnamed
+   tokens such as `impl` and `for` (1, 3, 4). They do not correspond.
+2. **`(parent_hash, child_hash)` is not a key.** A parent holding two
+   identical-content children in different roles maps to more than one field:
+   30 such pairs out of 204 947 (0.015%). For `impl_item` it is **zero** —
+   Rust puts traits and types in one namespace, so `impl Foo for Foo` cannot
+   exist — but a grammar that commonly repeats identical children under
+   different fields would have a higher rate. Measure before relying on it as a
+   general per-node lookup.
 
 ### Known external consumers
 

@@ -24,10 +24,161 @@ set -eu
 DIFF=${1:?usage: mutants_diff.sh <diff-file>}
 SCOPE=${2:-all}
 test -f "$DIFF" || { echo "DIFF file not found: $DIFF" >&2; exit 1; }
+
+# THE record of which mutation scope owns which workspace package.
+#
+# One table, because this fact previously lived in four places that could drift
+# apart: the generic slice's exclude list, the scope->prefix map inside the
+# enumeration check, the per-slice `[ "$SCOPE" = ... ]` guards, and (once the
+# matrix arrived) a planner deciding which scopes to emit. A prototype planner
+# built against a hand-copied fifth list PASSED a case it should have failed —
+# a package excluded from the generic slice and owned by no scope — which is the
+# same drift class `ley-line-open-cb1e29` collapsed the feature ledger to fix.
+#
+# Format: `<scope>=<package>[,<package>...]`. Everything below derives from it.
+MUTATION_SCOPE_PACKAGES='fs=ll-open/fs runtime=ll-open/runtime cli=ll-open/cli-lib,ll-open/cli schema-bridge=ll-open/schema-bridge'
+
+# Every package owned by SOME package slice — i.e. exactly what the generic
+# slice must exclude. Each MUST be claimed by a slice of its own below. A
+# package excluded here and covered nowhere would let a diff touching only that
+# package enumerate mutants (so the MISCONFIGURED check above passes), run the
+# generic slice that skips it, match no other slice, and exit 0 having evaluated
+# nothing — the exact false green this script exists to prevent.
+# Overridable ONLY so tools/test_mutants_diff.sh can prove the pairing check
+# actually fires; production callers must never set it.
+derive_generic_excludes() {
+    for entry in $MUTATION_SCOPE_PACKAGES; do
+        printf '%s ' "${entry#*=}" | tr ',' ' '
+    done
+}
+GENERIC_EXCLUDES=${MUTANTS_GENERIC_EXCLUDES:-$(derive_generic_excludes)}
+
+# Which scope owns a package, or empty if none does.
+scope_owning_package() {
+    for entry in $MUTATION_SCOPE_PACKAGES; do
+        for owned in $(printf '%s' "${entry#*=}" | tr ',' ' '); do
+            if [ "$owned" = "$1" ]; then
+                printf '%s' "${entry%%=*}"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# The packages a scope owns, or empty for `generic` (which owns the complement).
+packages_in_scope() {
+    for entry in $MUTATION_SCOPE_PACKAGES; do
+        if [ "${entry%%=*}" = "$1" ]; then
+            printf '%s' "${entry#*=}" | tr ',' ' '
+            return 0
+        fi
+    done
+    return 1
+}
+
+package_changed_in_diff() {
+    grep -qE "^--- a/$1/.*\.rs\$|^\+\+\+ b/$1/.*\.rs\$" "$DIFF"
+}
+
+# Valid scopes derive from MUTATION_SCOPE_PACKAGES rather than a literal list, so
+# adding a scope to the table is the only edit a new slice needs. `generic` owns
+# the complement of the table; `all` runs everything, which is what a human
+# typing `task mutants:diff` gets; `list-scopes` prints a plan and exits.
+#
+# Initialised BEFORE the loop: under `set -u` an unknown scope would otherwise
+# read an unset variable and abort with "unbound variable" instead of the
+# message below that names the valid set.
+SCOPE_IS_VALID=no
+for entry in $MUTATION_SCOPE_PACKAGES; do
+    if [ "$SCOPE" = "${entry%%=*}" ]; then SCOPE_IS_VALID=yes; fi
+done
 case "$SCOPE" in
-    all|runtime|cli) ;;
-    *) echo "unknown mutation scope: $SCOPE (expected all, runtime, or cli)" >&2; exit 1 ;;
+    all|generic|list-scopes) SCOPE_IS_VALID=yes ;;
 esac
+if [ "$SCOPE_IS_VALID" != yes ]; then
+    {
+        echo "unknown mutation scope: $SCOPE"
+        printf 'expected one of: all generic list-scopes'
+        for entry in $MUTATION_SCOPE_PACKAGES; do printf ' %s' "${entry%%=*}"; done
+        printf '\n'
+    } >&2
+    exit 1
+fi
+
+# `list-scopes` prints the scopes that have work for this diff, one per line,
+# and exits. It runs no cargo and takes milliseconds.
+#
+# It exists so .github/workflows/mutants.yml can build a DYNAMIC matrix. The
+# slices are independent, but running them as one serial job put the promotion
+# gate at 80m16s against a 90-minute ceiling — 11% headroom, thinner than the
+# run-to-run variance that cancelled `task ci` twice the same day
+# (`ley-line-open-908b68`). Lifting the ceiling again only moves the cliff.
+#
+# Dynamic rather than a fixed five-leg matrix because a scoped run that matches
+# nothing is a deliberate hard MISCONFIGURED below: `task mutants:diff cli`
+# typed by hand must not pass having mutated nothing. Emitting only the scopes
+# with work preserves that strictness instead of loosening it to suit CI.
+if [ "$SCOPE" = list-scopes ]; then
+    # The generic slice owns the COMPLEMENT of the table, so it has work
+    # whenever the diff touches Rust outside every owned package. Built from
+    # GENERIC_EXCLUDES so it cannot disagree with what the slice excludes.
+    # Built by accumulation, not `tr ' ' '|'`: the exclude list carries a
+    # trailing space, which `tr` turns into an empty final alternative and grep
+    # rejects with "empty (sub)expression".
+    generic_pattern=''
+    for package in $GENERIC_EXCLUDES; do
+        generic_pattern="${generic_pattern:+$generic_pattern|}$package"
+    done
+    plan=''
+    if grep -E '^(---|\+\+\+) [ab]/.*\.rs$' "$DIFF" \
+        | grep -qvE "[ab]/($generic_pattern)/"; then
+        plan='generic'
+    fi
+    for entry in $MUTATION_SCOPE_PACKAGES; do
+        scope=${entry%%=*}
+        for owned in $(printf '%s' "${entry#*=}" | tr ',' ' '); do
+            if package_changed_in_diff "$owned"; then
+                case " $plan " in
+                    *" $scope "*) ;;
+                    *) plan="${plan:+$plan }$scope" ;;
+                esac
+            fi
+        done
+    done
+
+    # The pairing guarantee, asserted HERE because no single matrix leg can see
+    # it. Run serially, `assert_excluded_packages_were_covered` catches a
+    # package the generic slice excludes and no slice claims. Split across legs,
+    # each leg knows only its own scope, so that check is vacuous in every one
+    # of them — and a package owned by nobody surfaces as a green matrix of
+    # skipped legs, the precise false green this script exists to prevent.
+    # Planning is the one place the whole picture exists.
+    for package in $GENERIC_EXCLUDES; do
+        package_changed_in_diff "$package" || continue
+        owner=$(scope_owning_package "$package" || true)
+        # `-n` guard first. An unowned package yields an EMPTY owner, and an
+        # empty needle matches the plan string unconditionally — so without
+        # this the assertion silently `continue`s on exactly the case it exists
+        # to catch. That is the bug shape that let an earlier prototype of this
+        # planner pass an unowned package.
+        if [ -n "$owner" ]; then
+            case " $plan " in
+                *" $owner "*) continue ;;
+            esac
+        fi
+        {
+            echo "MISCONFIGURED: the diff changes $package, which the generic"
+            echo "               slice excludes and no mutation scope owns."
+            echo "               A matrix built from this plan would skip it and"
+            echo "               report green having mutated nothing."
+        } >&2
+        exit 1
+    done
+
+    for scope in $plan; do echo "$scope"; done
+    exit 0
+fi
 
 # Decided from the diff itself, not from cargo-mutants' output, so "did this
 # change Rust?" and "did enumeration work?" stay independent questions. Folding
@@ -41,23 +192,29 @@ fi
 listing=$(cargo mutants --in-diff "$DIFF" --list 2>&1 || true)
 n=$(printf '%s\n' "$listing" | grep -cE '^[^ ].*:[0-9]+:[0-9]+:' || true)
 
-if [ "${n:-0}" -eq 0 ]; then
-    # Zero mutants from a Rust-touching diff has two causes that need opposite
-    # responses, and the difference is not visible in cargo-mutants' output —
-    # it prints "No mutants to filter" for both.
-    #
-    #   1. The paths do not resolve. This is the trap: a diff generated from
-    #      the repo root carries `b/rs/ll-core/...`, matches nothing, and the
-    #      naive implementation exits 0 forever.
-    #   2. The paths resolve fine and the changed lines simply hold nothing
-    #      mutable — a `#[cfg(test)] mod tests` edit, a doc comment, a `use`.
-    #      Nothing to mutate is the correct answer here, not a failure.
-    #
-    # Deciding between them by asking the filesystem tests the actual claim the
-    # error message makes ("your paths are not workspace-relative") rather than
-    # a proxy for it. This script's cwd IS the cargo-mutants working directory,
-    # so a workspace-relative path is exactly one that resolves from here.
-    changed=$(sed -n 's|^+++ b/\(.*\.rs\)$|\1|p' "$DIFF")
+# Zero mutants from a Rust-touching diff has two causes that need opposite
+# responses, and the difference is not visible in cargo-mutants' output — it
+# prints "No mutants to filter" for both.
+#
+#   1. The paths do not resolve. This is the trap: a diff generated from the
+#      repo root carries `b/rs/ll-core/...`, matches nothing, and the naive
+#      implementation exits 0 forever.
+#   2. The paths resolve fine and the changed lines simply hold nothing
+#      mutable — a `#[cfg(test)] mod tests` edit, a doc comment, a `use`, an
+#      integration test under `tests/`. Nothing to mutate is the correct
+#      answer here, not a failure.
+#
+# Deciding between them by asking the filesystem tests the actual claim the
+# error message makes ("your paths are not workspace-relative") rather than a
+# proxy for it. This script's cwd IS the cargo-mutants working directory, so a
+# workspace-relative path is exactly one that resolves from here.
+#
+# Sets `resolved` (a count) and `unresolved` (a newline-terminated list) for
+# the diff's changed Rust files whose path begins with $1 — pass '' for all of
+# them. The whole-diff check and the per-scope check below ask the same
+# question of different subsets, so they share the one answer.
+resolve_changed_paths() {
+    changed=$(sed -n "s|^+++ b/\($1.*\.rs\)\$|\1|p" "$DIFF")
     resolved=0
     unresolved=""
     # Here-doc rather than a pipe: a pipeline would run this loop in a subshell
@@ -74,6 +231,10 @@ if [ "${n:-0}" -eq 0 ]; then
     done <<EOF
 $changed
 EOF
+}
+
+if [ "${n:-0}" -eq 0 ]; then
+    resolve_changed_paths ''
 
     if [ "$resolved" -eq 0 ]; then
         {
@@ -98,19 +259,47 @@ EOF
     exit 0
 fi
 
-if [ "$SCOPE" != all ]; then
-    case "$SCOPE" in
-        runtime) scope_prefix='ll-open/runtime' ;;
-        cli) scope_prefix='ll-open/cli-lib' ;;
-    esac
-    scope_n=$(printf '%s\n' "$listing" | grep -cE "^$scope_prefix/.*:[0-9]+:[0-9]+:" || true)
+if [ "$SCOPE" != all ] && [ "$SCOPE" != generic ]; then
+    # Derived from MUTATION_SCOPE_PACKAGES, not a second hand-written map. `cli`
+    # owns two packages, so match either — a cli-only diff enumerating mutants
+    # in ll-open/cli alone is still work this scope did.
+    scope_pattern=$(packages_in_scope "$SCOPE" | tr ' ' '|' | sed 's/|$//')
+    scope_n=$(printf '%s\n' "$listing" | grep -cE "^($scope_pattern)/.*:[0-9]+:[0-9]+:" || true)
     if [ "${scope_n:-0}" -eq 0 ]; then
-        {
-            echo "MISCONFIGURED: mutation scope '$SCOPE' enumerated zero candidates"
-            echo "               from that package. Mutants in another changed package"
-            echo "               cannot make this focused run pass."
-        } >&2
-        exit 1
+        # The same two causes as the whole-diff check, asked of this scope's
+        # packages alone. Another package's mutants say nothing about them:
+        # the planner emits a scope for ANY Rust change in its package, and
+        # cargo-mutants never enumerates integration tests, so a diff that
+        # touches ll-open/runtime only under tests/ reaches here with the
+        # whole-diff count above zero. That is what the first integration ->
+        # main promotion through the matrix hit (ley-line-open-908b68), and
+        # it is case 2, not a misconfiguration.
+        scope_resolved=0
+        scope_unresolved=""
+        for owned in $(packages_in_scope "$SCOPE"); do
+            resolve_changed_paths "$owned/"
+            scope_resolved=$((scope_resolved + resolved))
+            scope_unresolved="$scope_unresolved$unresolved"
+        done
+        if [ "$scope_resolved" -eq 0 ]; then
+            {
+                echo "MISCONFIGURED: mutation scope '$SCOPE' enumerated zero candidates"
+                echo "               from its package(s), and none of the diff's paths"
+                echo "               there resolve from $(pwd) — where cargo mutants"
+                echo "               runs. Mutants in another changed package cannot"
+                echo "               make this focused run pass."
+                echo "               Regenerate with: git diff --relative=rs"
+                echo "--- unresolved paths ---"
+                printf '%s' "$scope_unresolved" | sed 's/^/    /'
+            } >&2
+            exit 1
+        fi
+        echo "NO MUTABLE LINES: scope '$SCOPE' — the diff's $scope_resolved Rust file(s)"
+        echo "                  in its package(s) resolve, but the lines it changes"
+        echo "                  hold nothing cargo-mutants can mutate — integration"
+        echo "                  tests, test modules, comments or imports. This is"
+        echo "                  NOT a pass; no mutation testing ran in this scope."
+        exit 0
     fi
 fi
 
@@ -136,26 +325,13 @@ echo "mutating $n candidate(s) from the diff"
 # Exit 4 is not "a mutant survived" — it is "the baseline suite failed in the
 # scratch tree", so nothing was tested. They need opposite fixes: one is a
 # missing test, the other is a test that cannot run here.
-# Packages the generic slice excludes. Each MUST be claimed by a slice of its
-# own below. A package that is excluded here and covered nowhere would let a
-# diff touching only that package enumerate mutants (so the MISCONFIGURED
-# check above passes), run the generic slice that skips it, match no other
-# slice, and exit 0 having evaluated nothing — the exact false green this
-# script exists to prevent. `assert_excluded_packages_were_covered` enforces
-# the pairing instead of trusting whoever edits the exclude list next.
-# Overridable ONLY so tools/test_mutants_diff.sh can prove the pairing check
-# actually fires; production callers must never set it.
-GENERIC_EXCLUDES=${MUTANTS_GENERIC_EXCLUDES:-'ll-open/fs ll-open/runtime ll-open/cli-lib ll-open/cli ll-open/schema-bridge'}
+
 
 overall=0
 ran_slice=0
 covered_packages=''
 claim_package() {
     covered_packages="$covered_packages $1"
-}
-
-package_changed_in_diff() {
-    grep -qE "^--- a/$1/.*\.rs\$|^\+\+\+ b/$1/.*\.rs\$" "$DIFF"
 }
 
 assert_excluded_packages_were_covered() {
@@ -242,7 +418,7 @@ run_slice() {
 # `mutants:fs`/`mutants:fs-gc`. If another crate ever hides covered code
 # behind non-default features, it needs the same routing — a default-features
 # run structurally cannot test it.
-if [ "$SCOPE" = all ]; then
+if [ "$SCOPE" = all ] || [ "$SCOPE" = generic ]; then
     # cargo-mutants selects only the packages the diff touches, and cargo
     # REJECTS a `--features` name that none of the selected packages declares.
     # A STATIC list is therefore wrong, and was already wrong before these
@@ -348,7 +524,7 @@ fi
 #
 # `--test-workspace=false` keeps that from costing anything: the crate's own
 # suite is what runs, so no other crate's tests can break this baseline.
-if [ "$SCOPE" = all ] && package_changed_in_diff ll-open/schema-bridge; then
+if { [ "$SCOPE" = all ] || [ "$SCOPE" = schema-bridge ]; } && package_changed_in_diff ll-open/schema-bridge; then
     claim_package ll-open/schema-bridge
     run_slice integration --package leyline-schema-bridge --test-workspace=false
 fi
@@ -412,10 +588,35 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = cli ]; then
   fi
 fi
 
-if [ "$SCOPE" = all ] && package_changed_in_diff ll-open/fs; then
+if { [ "$SCOPE" = all ] || [ "$SCOPE" = fs ]; } && package_changed_in_diff ll-open/fs; then
     claim_package ll-open/fs
+    # This is the ONLY slice that passes `--no-default-features`, which makes it
+    # the only place tools/feature-ledger.txt's standing exemption for
+    # default-enabled features ("cargo resolves them, mutants compiles them") is
+    # false. `fuse` and `nfs` ARE in leyline-fs's default set, so the ledger is
+    # right not to carry them — but these flags compile `fuse.rs`, `nfs.rs` and
+    # `verified.rs` out, while cargo-mutants parses with syn, never evaluates
+    # cfg, and enumerates every mutant inside them anyway. Each then builds in
+    # 0s, every test trivially passes, and it is reported MISSED: a phantom
+    # survivor on healthy code, indistinguishable in the log from a real missing
+    # assertion (bead `ley-line-open-b23c41`).
+    #
+    # A slice that opts out of default features owes an exclusion for what that
+    # choice removes — the exclusions below are not a policy about mount, they
+    # are this invocation being consistent with itself. Enabling the features
+    # instead would be worse: `ley-line-open-aed167` records that mount ships
+    # with no tests at any level, so the phantoms would become REAL survivors
+    # and redden every mount PR over a coverage debt this gate did not incur.
+    # `verified` is the same shape (`ley-line-open-b6a4dd`).
+    #
+    # Kept in step by tools/check_mutants_cfg_coverage.sh, which fails if a
+    # cfg-gated module is neither enabled by its slice nor excluded here. That
+    # guard is load-bearing: enumerating this list BY HAND missed `verified.rs`.
     run_slice lib --package leyline-fs --test-workspace=false \
-        --no-default-features --features cdc,splice,validate
+        --no-default-features --features cdc,splice,validate \
+        --exclude 'll-open/fs/src/fuse.rs' \
+        --exclude 'll-open/fs/src/nfs.rs' \
+        --exclude 'll-open/fs/src/verified.rs'
 fi
 
 # `ll-open/cli` is the thin clap binary: its only mutant is `replace main`,

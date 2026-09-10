@@ -1038,6 +1038,21 @@ pub fn parse_into_conn(
         HashMap::new()
     };
 
+    // The mutation identity for each already-projected file, read once per pass
+    // alongside the stat index. Consulted only when the stat pair MOVED, so a
+    // fully-unchanged tree never pays for it (bead `ley-line-open-8f37c4`).
+    // `_source.id` is the file's rel path — the same key `old_index` uses.
+    let old_hashes: HashMap<String, Vec<u8>> = if incremental {
+        let mut stmt =
+            conn.prepare("SELECT id, content_hash FROM _source WHERE content_hash IS NOT NULL")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        rows.collect::<std::result::Result<HashMap<_, _>, _>>()?
+    } else {
+        HashMap::new()
+    };
+
     // Extraction-rules provenance (bead `ley-line-open-20988a`).
     // Derived facts (node_defs/node_refs/_imports) are keyed on
     // node_hash — a fold over source bytes — so a rules change with
@@ -1155,10 +1170,43 @@ pub fn parse_into_conn(
             .as_nanos() as i64;
         let file_size = meta.len() as i64;
 
+        // Fast path: the stat pair agrees, so the bytes are almost certainly
+        // unchanged and we skip without reading. `mtime` here is NANOSECOND
+        // resolution, which is what makes a stat pair usable at all — the
+        // false-negative this would otherwise carry (same tick, same size,
+        // different bytes) needs two writes inside one nanosecond.
         if epoch_current
             && let Some(&(old_m, old_s)) = old_index.get(&rel_str)
             && file_mtime == old_m
             && file_size == old_s
+        {
+            unchanged += 1;
+            continue;
+        }
+
+        // Slow path: the stat pair MOVED, which is not the same as the content
+        // changing. `touch`, `git checkout`, a CI fetch, and an editor
+        // save-with-no-edit all rewrite mtime while leaving bytes identical —
+        // and reprojecting an identical file costs a full parse + insert
+        // (measured 825ms on a 460-file tree) to reproduce byte-for-byte what
+        // is already stored.
+        //
+        // `_source.content_hash` is the mutation identity and is already
+        // populated for every projected file, so ask it before doing the work.
+        // The read costs ~0.04ms per file against the ~1.8ms parse + insert it
+        // avoids, and it is paid ONLY by files whose stat moved.
+        //
+        // This is `ley-line-open-b82f56`'s conclusion — a freshness witness must
+        // be a mutation identity, not a stat pair — applied to the parse path,
+        // which never adopted it (bead `ley-line-open-8f37c4`).
+        // σ through the one content-address surface (`ContentAddressed::hash`),
+        // never inline blake3 — the same path `_source.content_hash` was
+        // written on, enforced by `lint:blake3`. Comparing against a hash
+        // computed any other way would be a silent mismatch.
+        if epoch_current
+            && let Some(stored_hash) = old_hashes.get(&rel_str)
+            && let Ok(bytes) = std::fs::read(path)
+            && bytes.hash().as_bytes()[..] == stored_hash[..]
         {
             unchanged += 1;
             continue;
@@ -1674,6 +1722,14 @@ pub fn parse_into_conn(
                             None => None,
                         };
                         if n.id == pf.rel {
+                            // `pf.file_mtime`, not the parse-run `mtime`. A mount
+                            // fills atime/mtime/ctime/crtime from this column
+                            // (`fs/src/fuse.rs:55-68`), so stamping every row with
+                            // the parse time gave a whole tree one timestamp and
+                            // defeated every make-style staleness check
+                            // (bead `ley-line-open-ca51fa`). Directory rows keep
+                            // the parse-run value — they have no filesystem mtime
+                            // of their own in this projection.
                             nodes_buf.push(
                                 base,
                                 Some(leyline_schema::dir_nid(dir_id)),
@@ -1682,7 +1738,7 @@ pub fn parse_into_conn(
                                 n.kind,
                                 0,
                                 n.size,
-                                mtime,
+                                pf.file_mtime,
                                 n.record.clone(),
                             );
                         } else {
@@ -2912,10 +2968,17 @@ pub(crate) fn parse_file_pure(
     };
 
     // File node.
+    //
+    // `size` is the file's BYTE LENGTH, not 0. A mount returns this straight
+    // out of `getattr` (`fs/src/fuse.rs:52` -> `st_size`), so a 0 here makes
+    // every file on a mounted arena stat as empty — and `cat`, `wc`, `rsync`,
+    // editors and most build systems believe `st_size` before they read
+    // (bead `ley-line-open-ca51fa`). AST node rows carry their span length in
+    // the same column; only the file's own row was left at 0.
     nodes.push(ParsedNode {
         id: source_id.to_string(),
         kind: 1,
-        size: 0,
+        size: file_size,
         record: String::new(),
     });
 
@@ -3821,6 +3884,85 @@ mod tests {
                 "is_bloat_dir(`{name}`) must be false, but matched",
             );
         }
+    }
+
+    /// Freshness must be a mutation identity, not a stat pair — the conclusion
+    /// `ley-line-open-b82f56` reached for CDC and this path never adopted.
+    /// A `touch` moves mtime while the bytes are identical, and the projection
+    /// that results is byte-for-byte what is already stored, so reparsing it is
+    /// pure waste (measured: 825ms on a 460-file tree). Bead
+    /// `ley-line-open-8f37c4`.
+    #[test]
+    fn a_touched_but_byte_identical_file_is_not_reprojected() {
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        std::fs::write(root.join("a.go"), b"package m\nfunc A() {}\n").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        let first = parse_into_conn(&conn, root, None, None).unwrap();
+        assert_eq!(first.parsed, 1, "first parse must do the work");
+
+        // Move mtime without touching a byte, and WITHOUT sleeping. A sleep
+        // here would be a timing-dependent test — the exact shape the
+        // `sleep_in_tests` smell rule exists to reject, and the shape that
+        // produced this session's ETXTBSY flake. `File::set_times` states the
+        // new mtime outright, so the test is deterministic and instant.
+        let f = std::fs::File::options()
+            .write(true)
+            .open(root.join("a.go"))
+            .unwrap();
+        let moved = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        f.set_times(std::fs::FileTimes::new().set_modified(moved))
+            .unwrap();
+        drop(f);
+
+        let second = parse_into_conn(&conn, root, None, None).unwrap();
+        assert_eq!(
+            second.parsed, 0,
+            "identical content must not be reprojected merely because mtime moved"
+        );
+        assert_eq!(second.unchanged, 1, "it must be counted as unchanged");
+    }
+
+    /// A mount reports `nodes.size` straight into `getattr` (`fs/src/fuse.rs:52`)
+    /// and `nodes.mtime` into all four timestamps. Both were unpopulated for file
+    /// rows — every file stat'd as 0 bytes at the parse time — while the real
+    /// values sat in `_file_index` (bead `ley-line-open-ca51fa`).
+    #[test]
+    fn a_file_row_carries_its_filesystem_size_and_mtime() {
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        let body = b"package m\nfunc A() {}\n";
+        std::fs::write(root.join("a.go"), body).unwrap();
+        let want_mtime = std::fs::metadata(root.join("a.go"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+
+        let conn = Connection::open_in_memory().unwrap();
+        parse_into_conn(&conn, root, None, None).unwrap();
+
+        // The file's own node is ordinal 0 of its file_id range.
+        let (size, mtime): (i64, i64) = conn
+            .query_row(
+                "SELECT size, mtime FROM nodes WHERE nid > 0 AND (nid & 16777215) = 0",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            size,
+            body.len() as i64,
+            "file row size must be the file's byte length, not 0 — a mount stats this"
+        );
+        assert_eq!(
+            mtime, want_mtime,
+            "file row mtime must be the filesystem mtime, not the parse time"
+        );
     }
 
     #[test]

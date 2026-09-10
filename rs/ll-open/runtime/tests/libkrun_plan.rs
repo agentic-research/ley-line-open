@@ -7,6 +7,8 @@ use leyline_runtime::backends::libkrun::plan::{DirectoryRootfsResolver, compile_
 use leyline_runtime::{DigestRef, ErrorCode, ExecutionRequest, ResourceLimits};
 use tempfile::TempDir;
 
+mod common;
+
 struct RootfsFixture {
     _cas: TempDir,
     request: ExecutionRequest,
@@ -55,6 +57,7 @@ fn rootfs_fixture() -> RootfsFixture {
 
 #[test]
 fn compiles_only_a_manifest_verified_content_addressed_rootfs() {
+    let _serial = common::serial();
     // Catches a resolver accepting a caller-selected host path or failing to
     // bind the materialized rootfs bytes to the requested content identity.
     let fixture = rootfs_fixture();
@@ -83,6 +86,7 @@ fn compiles_only_a_manifest_verified_content_addressed_rootfs() {
 
 #[test]
 fn modified_rootfs_content_is_rejected_before_vm_preparation() {
+    let _serial = common::serial();
     // Catches a mutable directory retaining a once-valid manifest identity.
     let fixture = rootfs_fixture();
     fs::write(&fixture.executable, b"modified-after-resolution").expect("mutate fixture");
@@ -96,6 +100,7 @@ fn modified_rootfs_content_is_rejected_before_vm_preparation() {
 
 #[test]
 fn argument_with_interior_nul_is_rejected_before_ffi() {
+    let _serial = common::serial();
     // Catches truncation when Rust strings cross the C ABI.
     let mut fixture = rootfs_fixture();
     fixture.request.arguments.push("bad\0suffix".into());
@@ -109,6 +114,7 @@ fn argument_with_interior_nul_is_rejected_before_ffi() {
 
 #[test]
 fn unlisted_rootfs_file_invalidates_the_content_identity() {
+    let _serial = common::serial();
     // Catches a verifier authenticating listed files while silently exposing
     // additional mutable files to the guest.
     let fixture = rootfs_fixture();
@@ -128,6 +134,7 @@ fn unlisted_rootfs_file_invalidates_the_content_identity() {
 
 #[test]
 fn rootfs_symlink_is_rejected_even_when_its_target_bytes_match() {
+    let _serial = common::serial();
     // Catches host namespace indirection introduced after content
     // verification.
     let fixture = rootfs_fixture();

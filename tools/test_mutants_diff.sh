@@ -18,7 +18,7 @@ printf '%s\n' "$*" >> "$MUTANTS_FIXTURE_LOG"
 case " $* " in
   *" --list "*)
     case "$*" in
-      *cli-mutants-only.diff*)
+      *cli-mutants-only.diff*|*runtime-tests-only.diff*)
         printf '%s\n' 'll-open/cli-lib/src/daemon/client.rs:65:9: fixture mutant'
         ;;
       *)
@@ -104,10 +104,69 @@ if PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
     exit 1
 fi
 
+# A scoped leg that enumerates nothing from its own package has two causes
+# that need opposite responses, exactly as the global check does: the paths do
+# not resolve (the diff was generated from the wrong directory — MISCONFIGURED,
+# whatever another package enumerated), or they resolve and the changed lines
+# hold nothing cargo-mutants can mutate. Run from the repo root, where
+# `ll-open/runtime/...` resolves to nothing, this is the first case.
 cp "$fixture_dir/pr.diff" "$fixture_dir/cli-mutants-only.diff"
 if PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
   "$repo_root/tools/mutants_diff.sh" "$fixture_dir/cli-mutants-only.diff" runtime; then
     echo 'runtime-only scope falsely passed when only the changed CLI package had mutants' >&2
+    exit 1
+fi
+
+# The second case is what the first integration -> main promotion through the
+# matrix hit (PR #386, ley-line-open-908b68): the diff changed ll-open/runtime
+# only under tests/, the planner emitted the runtime scope because a Rust file
+# in the package changed, and the leg reported MISCONFIGURED because
+# cargo-mutants never enumerates integration tests. Run from a directory where
+# the package's changed file resolves, the leg must report that nothing was
+# mutable and exit 0 — nothing ran, and the message must not call it a pass.
+cat > "$fixture_dir/runtime-tests-only.diff" <<'DIFF'
+diff --git a/ll-open/runtime/tests/common/mod.rs b/ll-open/runtime/tests/common/mod.rs
+--- a/ll-open/runtime/tests/common/mod.rs
++++ b/ll-open/runtime/tests/common/mod.rs
+@@ -1 +1 @@
+-old
++new
+diff --git a/ll-open/cli-lib/src/daemon/client.rs b/ll-open/cli-lib/src/daemon/client.rs
+--- a/ll-open/cli-lib/src/daemon/client.rs
++++ b/ll-open/cli-lib/src/daemon/client.rs
+@@ -1 +1 @@
+-old
++new
+DIFF
+mkdir -p "$fixture_dir/ll-open/runtime/tests/common"
+: > "$fixture_dir/ll-open/runtime/tests/common/mod.rs"
+: > "$log"
+out=$(
+    cd "$fixture_dir"
+    PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
+      "$repo_root/tools/mutants_diff.sh" "$fixture_dir/runtime-tests-only.diff" runtime
+) || {
+    echo 'runtime scope failed a diff whose runtime changes are integration tests only' >&2
+    exit 1
+}
+case "$out" in
+    *"NO MUTABLE LINES"*"runtime"*) ;;
+    *)
+        echo 'runtime scope exited 0 on a tests-only diff without saying nothing was mutable' >&2
+        printf '%s\n' "$out" >&2
+        exit 1
+        ;;
+esac
+if grep -E -- '--package leyline-runtime' "$log" >/dev/null; then
+    echo 'runtime scope ran a mutation slice on a diff with nothing to mutate' >&2
+    exit 1
+fi
+
+# Same diff, but the runtime path does not resolve from here: the tests-only
+# outcome must not have loosened the path check.
+if PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/runtime-tests-only.diff" runtime 2>/dev/null; then
+    echo 'runtime scope passed a diff whose runtime path does not resolve' >&2
     exit 1
 fi
 
@@ -171,5 +230,123 @@ if MUTANTS_GENERIC_EXCLUDES='ll-open/orphan' \
     exit 1
 fi
 
+# The fs slice is the ONLY one that passes `--no-default-features`, which makes
+# it the only place the ledger's standing exemption for default-enabled features
+# ("cargo resolves them, mutants compiles them") is false. `fuse` and `nfs` ARE
+# in leyline-fs's default set, so the ledger correctly declines to carry them —
+# but this slice's own flags compile `fuse.rs` and `nfs.rs` out, while
+# cargo-mutants (which parses with syn and never evaluates cfg) still enumerates
+# every mutant inside them. Each then builds in 0s, every test trivially passes,
+# and it reports MISSED: a phantom survivor on healthy code.
+#
+# A slice that opts out of default features owes an exclusion for what that
+# choice removes. Their missing tests are a real gap owned by
+# `ley-line-open-aed167`, so exclusion is the honest move here rather than
+# enabling the features and reddening the gate on a coverage debt this gate did
+# not incur.
+: > "$log"
+cat > "$fixture_dir/fs-mount.diff" <<'DIFF'
+diff --git a/ll-open/fs/src/fuse.rs b/ll-open/fs/src/fuse.rs
+--- a/ll-open/fs/src/fuse.rs
++++ b/ll-open/fs/src/fuse.rs
+@@ -1 +1 @@
+-old
++new
+DIFF
+PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/fs-mount.diff"
+assert_call 'mutants .*--package leyline-fs .*--exclude ll-open/fs/src/fuse\.rs' \
+    'fs slice excludes the fuse module its --no-default-features compiles out'
+assert_call 'mutants .*--package leyline-fs .*--exclude ll-open/fs/src/nfs\.rs' \
+    'fs slice excludes the nfs module its --no-default-features compiles out'
+assert_call 'mutants .*--package leyline-fs .*--exclude ll-open/fs/src/verified\.rs' \
+    'fs slice excludes the verify module its feature set compiles out'
+
+# --------------------------------------------------------------------------
+# `list-scopes`: the plan the CI matrix is built from. Runs no cargo.
+# --------------------------------------------------------------------------
+
+plan_is() {
+    got=$(PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
+        "$repo_root/tools/mutants_diff.sh" "$1" list-scopes | tr '\n' ' ' | sed 's/ $//')
+    if [ "$got" != "$2" ]; then
+        echo "plan for $1: expected '$2', got '$got'" >&2
+        exit 1
+    fi
+}
+
+# A diff touching an owned package and an unowned one plans both legs.
+cat > "$fixture_dir/plan-mixed.diff" <<'DIFF'
+diff --git a/ll-open/runtime/src/authorization.rs b/ll-open/runtime/src/authorization.rs
+--- a/ll-open/runtime/src/authorization.rs
++++ b/ll-open/runtime/src/authorization.rs
+diff --git a/ll-core/core/src/partition.rs b/ll-core/core/src/partition.rs
+--- a/ll-core/core/src/partition.rs
++++ b/ll-core/core/src/partition.rs
+DIFF
+plan_is "$fixture_dir/plan-mixed.diff" 'generic runtime'
+
+# A diff confined to owned packages must NOT plan the generic leg — that leg
+# would enumerate nothing and the whole point is to stop paying for it.
+cat > "$fixture_dir/plan-owned-only.diff" <<'DIFF'
+diff --git a/ll-open/fs/src/graph.rs b/ll-open/fs/src/graph.rs
+--- a/ll-open/fs/src/graph.rs
++++ b/ll-open/fs/src/graph.rs
+DIFF
+plan_is "$fixture_dir/plan-owned-only.diff" 'fs'
+
+# ll-open/cli has no slice of its own; it is claimed inside the cli scope, so a
+# cli-binary-only diff must still plan `cli` or the pairing assertion below
+# would have nothing to satisfy it.
+cat > "$fixture_dir/plan-cli-binary.diff" <<'DIFF'
+diff --git a/ll-open/cli/src/main.rs b/ll-open/cli/src/main.rs
+--- a/ll-open/cli/src/main.rs
++++ b/ll-open/cli/src/main.rs
+DIFF
+plan_is "$fixture_dir/plan-cli-binary.diff" 'cli'
+
+# The planner emits a scope for ANY Rust change in its package, tests included.
+# It runs no cargo, so it cannot know what will enumerate; the leg asks
+# cargo-mutants and reports NO MUTABLE LINES when the answer is nothing. One
+# authority on mutability, not a second rule here that could drift from it.
+plan_is "$fixture_dir/runtime-tests-only.diff" 'runtime cli'
+
+# THE case a hand-copied package list got wrong: a package the generic slice
+# excludes and no scope owns. Serially this is caught by
+# assert_excluded_packages_were_covered; split across matrix legs that check is
+# vacuous in every leg, so planning must catch it or the gate reports green
+# from a matrix of skipped legs.
+cat > "$fixture_dir/plan-orphan.diff" <<'DIFF'
+diff --git a/ll-open/orphan/src/lib.rs b/ll-open/orphan/src/lib.rs
+--- a/ll-open/orphan/src/lib.rs
++++ b/ll-open/orphan/src/lib.rs
+DIFF
+if MUTANTS_GENERIC_EXCLUDES='ll-open/orphan' \
+   PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
+   "$repo_root/tools/mutants_diff.sh" "$fixture_dir/plan-orphan.diff" list-scopes; then
+    echo 'planner emitted a matrix that would skip an unowned package' >&2
+    exit 1
+fi
+
+# An unknown scope must be rejected, and the message must name the valid set —
+# the set is derived from the table, so a new slice cannot forget to appear.
+if PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
+   "$repo_root/tools/mutants_diff.sh" "$fixture_dir/plan-mixed.diff" nonsense 2>/dev/null; then
+    echo 'an unknown mutation scope was accepted' >&2
+    exit 1
+fi
+
+# The generic scope runs the lib-only slice and no package slice.
+: > "$log"
+PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/pr.diff" generic
+assert_call 'mutants .* -C --lib .*--exclude ll-open/runtime/\*\*' \
+    'generic scope runs the lib-only slice'
+if grep -E -- '--package leyline-runtime|--package leyline-cli-lib' "$log" >/dev/null; then
+    echo 'generic scope invoked a package slice' >&2
+    exit 1
+fi
+
 echo 'diff mutation fixture proved package-specific integration-test routing'
 echo 'diff mutation fixture proved excluded packages must be claimed by a slice'
+echo 'diff mutation fixture proved the fs slice excludes what it compiles out'

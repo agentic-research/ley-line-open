@@ -24,6 +24,9 @@
 #   4. Every arduino/setup-task pin is exact and identical across ALL
 #      workflows — a floating or divergent go-task version is the same class
 #      of drift rust-toolchain.toml exists to close.
+#   5. Every literal file mutants.yml's allowlist regex names is also in its
+#      `paths:` filter — a file that cannot start the workflow cannot
+#      trigger an arm of it (ley-line-open-908b68).
 #
 # WORKFLOWS_DIR is overridable so tools/test_workflow_parity.sh can prove each
 # rule fails on the mutation it guards against, not just that this file exists.
@@ -111,10 +114,49 @@ if [ -n "$pins" ]; then
     esac
 fi
 
+# --- Rule 5: mutants.yml's allowlist regex is covered by its paths: filter --
+# The workflow decides the allowlist arm from a regex over the changed files.
+# A file named in that regex but absent from `on.pull_request.paths` never
+# starts the workflow, so the regex entry is dead: #387 changed
+# tools/mutants_diff.sh — the script the plan job runs — and no mutants
+# workflow ran on the PR (ley-line-open-908b68). Every literal (non-rs/)
+# file in the regex must appear verbatim in the filter. rs/ files are covered
+# by the `rs/**` glob and are not literals to compare; a nested group such as
+# `(chunked|gc)` is collapsed before the split so its `|` is not an entry
+# boundary.
+mw="$dir/mutants.yml"
+if [ -f "$mw" ]; then
+    regex_files=$(
+        grep -oE "'\^\([^']*\)'" "$mw" |
+            sed "s/^'^(//; s/)'\$//; s/([^)]*)/GROUP/g" | tr '|' '\n' |
+            sed 's/\\\././g' | grep -v '^rs/' || true
+    )
+    filter_files=$(
+        awk '
+            /^    paths:/ { infilter = 1; next }
+            infilter && /^      #/ { next }
+            infilter && !/^      - / { exit }
+            infilter { sub(/^      - /, ""); gsub(/\x27/, ""); print }
+        ' "$mw"
+    )
+    missing=$(
+        printf '%s\n' "$regex_files" | while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            printf '%s\n' "$filter_files" | grep -qxF "$f" || echo "$f"
+        done
+    )
+    if [ -n "$missing" ]; then
+        echo "workflow-parity: $mw names these files in its allowlist regex but its" >&2
+        echo "paths: filter never starts the workflow when they change:" >&2
+        printf '%s\n' "$missing" | sed 's/^/    /' >&2
+        fail=1
+    fi
+fi
+
 if [ "$fail" != 0 ]; then
     echo "--- fix: install commands belong in Taskfile deps:* targets; the release" >&2
     echo "pair must call them from every job that compiles; setup-task pins must" >&2
     echo "be exact and shared. See bead ley-line-open-2bea72." >&2
     exit 1
 fi
-echo "workflow parity OK — no inline installs, release pair calls deps targets, setup-task pins agree"
+echo "workflow parity OK — no inline installs, release pair calls deps targets, setup-task pins agree, mutants.yml filter covers its regex"

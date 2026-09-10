@@ -7,6 +7,8 @@ use leyline_runtime::backends::native_backend::{NativeWorkerBackend, NativeWorke
 use leyline_runtime::{Backend, BackendClass, DigestRef, ExecutionRequest, ResourceLimits};
 use tempfile::TempDir;
 
+mod common;
+
 fn request() -> ExecutionRequest {
     ExecutionRequest {
         run_id: "native-run-01".into(),
@@ -29,25 +31,9 @@ fn request() -> ExecutionRequest {
     }
 }
 
-/// Publish an executable fixture at `path` by `rename`, never by writing in place.
-///
-/// `exec` fails with `ETXTBSY` ("Text file busy") when ANY process holds the
-/// target open for writing. libtest runs these tests on parallel threads and the
-/// runtime forks children, so one test's still-open `fs::write` handle can be
-/// inherited by another test's `fork()`, and an `exec` landing in that window
-/// dies. `O_CLOEXEC` does not save us: it fires AT exec, which is the very call
-/// that fails.
-///
-/// Writing to a scratch name and renaming means the path the backend execs
-/// always names an inode no process has ever opened for writing — the race is
-/// removed rather than narrowed. Same family as the `kill(-pgid)`-vs-`fork()`
-/// race fixed in #374 (bead `ley-line-open-cdfaf4`).
 fn publish_executable(path: &std::path::Path, body: &str) {
-    let name = path.file_name().expect("fixture path names a file");
-    let staging = path.with_file_name(format!("{}.staging", name.to_string_lossy()));
-    fs::write(&staging, body).expect("worker fixture");
-    fs::set_permissions(&staging, fs::Permissions::from_mode(0o755)).expect("worker mode");
-    fs::rename(&staging, path).expect("publish worker fixture");
+    fs::write(path, body).expect("worker fixture");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("worker mode");
 }
 
 fn backend(fixture: &TempDir, worker_body: &str) -> (NativeWorkerBackend, std::path::PathBuf) {
@@ -72,6 +58,7 @@ fn backend(fixture: &TempDir, worker_body: &str) -> (NativeWorkerBackend, std::p
 
 #[test]
 fn capabilities_are_native_and_fail_closed_when_resources_are_missing() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     let backend = NativeWorkerBackend::new(NativeWorkerConfig {
         worker: fixture.path().join("missing-worker"),
@@ -88,6 +75,7 @@ fn capabilities_are_native_and_fail_closed_when_resources_are_missing() {
 
 #[test]
 fn every_native_resource_is_required_independently() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     let worker = fixture.path().join("worker");
     let cas_root = fixture.path().join("cas");
@@ -139,6 +127,7 @@ fn every_native_resource_is_required_independently() {
 
 #[test]
 fn worker_exit_is_observable_and_run_root_is_removed() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     let (backend, runs) = backend(
         &fixture,
@@ -157,6 +146,7 @@ fn worker_exit_is_observable_and_run_root_is_removed() {
 
 #[test]
 fn failed_worker_is_reported_and_cleaned() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     let (backend, runs) = backend(
         &fixture,
@@ -180,6 +170,7 @@ fn failed_worker_is_reported_and_cleaned() {
 
 #[test]
 fn readiness_for_another_run_is_rejected_and_cleaned() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     let (backend, runs) = backend(
         &fixture,
@@ -194,6 +185,7 @@ fn readiness_for_another_run_is_rejected_and_cleaned() {
 
 #[test]
 fn native_cleanup_restores_guest_created_permissions() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     let (backend, runs) = backend(
         &fixture,
@@ -208,6 +200,7 @@ fn native_cleanup_restores_guest_created_permissions() {
 
 #[test]
 fn cancel_kills_worker_and_removes_run_root() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     // Long-lived fake workers `exec` their sleeper so the worker PID IS the
     // sleeper — without exec, tail is a grandchild the backend's kill never
@@ -233,6 +226,7 @@ fn cancel_kills_worker_and_removes_run_root() {
 
 #[test]
 fn backend_trait_cancel_delegates_and_drop_waits_for_cleanup() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     let (backend, runs) = backend(
         &fixture,
@@ -263,6 +257,7 @@ fn backend_trait_cancel_delegates_and_drop_waits_for_cleanup() {
 /// reports a policy nobody authorized.
 #[test]
 fn a_worker_attesting_an_unauthorized_policy_never_reaches_running() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     // Well-formed readiness, correct run id, wrong policy.
     let (backend, _root) = backend(
@@ -300,6 +295,7 @@ sleep 30
 /// security hole — the kind that surfaces as "it worked last release".
 #[test]
 fn a_grant_authorizing_no_policy_does_not_constrain_what_the_worker_attests() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     let (backend, _runs) = backend(
         &fixture,
@@ -330,6 +326,7 @@ sleep 30
 /// policy the grant authorized starts, and reaches `Running`.
 #[test]
 fn a_worker_attesting_the_authorized_policy_starts() {
+    let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
     let authorized = format!("blake3-256:{}", "d".repeat(64));
     let (backend, _runs) = backend(

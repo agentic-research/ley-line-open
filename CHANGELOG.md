@@ -116,7 +116,10 @@ context, scoping notes, and review history are recoverable.
   `st_size` before or instead of reading, so the mount presented a tree of
   empty files, and uniform mtimes defeated every make-style staleness
   check. Undetected because mount ships with no tests at any level
-  (`ley-line-open-aed167`).
+  (`ley-line-open-aed167`). Write-side only: an arena parsed before this
+  keeps its 0-byte rows for every file not reparsed since, because the
+  freshness gate skips unchanged files. `leyline daemon --reset-arena`
+  (or removing the arena) rebuilds it with real stats.
 
 - **A touched-but-identical file is no longer reparsed** (bead
   `ley-line-open-8f37c4`). The parse freshness gate compared `(mtime, size)`

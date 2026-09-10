@@ -10,6 +10,8 @@ use leyline_runtime::{DigestRef, ExecutionRequest, ResourceLimits};
 use tempfile::TempDir;
 use wait_timeout::ChildExt;
 
+mod common;
+
 /// Resolve the hypervisor this test needs, or report that it did not run.
 ///
 /// Previously the test carried a bare `#[ignore]`, which meant it ran NOWHERE —
@@ -62,6 +64,7 @@ fn hypervisor_or_skip() -> Option<(std::ffi::OsString, std::path::PathBuf)> {
 
 #[test]
 fn guest_writes_the_ephemeral_root_without_mutating_cas() {
+    let _serial = common::serial();
     let Some((libkrun, libkrunfw)) = hypervisor_or_skip() else {
         return;
     };

@@ -32,6 +32,10 @@ on:
       - 'rs/**'
       - 'Taskfile.yml'
       - '.github/workflows/mutants.yml'
+      # The plan job and every leg run this script; a change to it is a
+      # change to the gate. tools/lint_workflow_parity.sh (rule 5) keeps this
+      # list a superset of the allowlist regex below.
+      - 'tools/mutants_diff.sh'
   workflow_dispatch:
 
 env:

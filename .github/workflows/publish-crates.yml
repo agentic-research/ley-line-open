@@ -73,6 +73,24 @@ jobs:
         with:
           toolchain: 1.97.1 # must equal rust-toolchain.toml (task lint:toolchain-parity)
 
+      # SHA-pinned: arduino/setup-task@v2.0.0, the same pin ci.yml and
+      # mutants.yml carry. Without it the next step invokes `task` on a runner
+      # that has never installed it: the v0.19.0 tag failed here with
+      # `task: command not found` and exit 127, about a second in, having never
+      # reached crates.io at all (bead ley-line-open-f88cb5).
+      #
+      # The failure looked like a credentials or Trusted Publishing problem and
+      # was not one — the job died before authenticating, which is exactly the
+      # confusion a missing install step buys at release time.
+      - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611
+        with:
+          # Exact, matching ci.yml — a floating `3.x` lets the runner pick up a
+          # go-task whose behaviour differs from the one developers have, which
+          # is the drift `task lint:workflow-parity` exists to close. Bump this
+          # together with the other workflows, never on its own.
+          version: 3.49.1
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       # libfuse for fuser (leyline-fs), capnproto + libcapnp-dev for
       # schema build.rs (leyline-public-schema, leyline-schema-capnp),
       # libdbus-1-dev for keyring (leyline-sign) — `cargo publish`'s local

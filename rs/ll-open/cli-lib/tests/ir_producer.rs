@@ -619,3 +619,84 @@ fn rust_defs_refs_and_unbound_flow_through_merkle() {
         "the undefined `missing` call is an unbound reference"
     );
 }
+
+// ── 6. field recovery: `impl Trait for Type` ──────────────────────────────
+//
+// `impl Greet for Robot` has two `type_identifier` children. Neither node
+// kind nor document order separates them; only `node_child.field` does
+// (TABLE_CONTRACT "field recovery", ley-line-open-87ff3a). A consumer that
+// cannot read the field names every trait method by its trait. This pins the
+// join exactly as the contract writes it, so dropping the column, or writing
+// NULL into it for impl_item children, is red here.
+
+#[test]
+fn impl_item_trait_and_type_children_are_separable_only_by_field() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("lib.rs"),
+        b"trait Greet {\n    fn hi(&self);\n}\nstruct Robot;\n\
+          impl Greet for Robot {\n    fn hi(&self) {}\n}\n",
+    )
+    .unwrap();
+    let conn = cold_parse_rust(dir.path());
+
+    // The fixture has exactly one impl_item; its content hash is the join key.
+    let impl_hash: Vec<u8> = conn
+        .query_row(
+            "SELECT a.node_hash FROM _ast a \
+             JOIN kinds k ON k.kind_id = a.kind_id \
+             WHERE k.raw_kind = 'impl_item'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("the impl_item node must exist");
+
+    // The contract's join (parent_hash → node_child.field), plus the child's
+    // content so the assertion names what was recovered.
+    let mut stmt = conn
+        .prepare(
+            "SELECT nc.field, c.raw_kind, c.token FROM node_child nc \
+             JOIN node_content c ON c.node_hash = nc.child_hash \
+             WHERE nc.parent_hash = ?1 AND nc.field IN ('trait', 'type') \
+             ORDER BY nc.ordinal",
+        )
+        .unwrap();
+    let rows: Vec<(String, String, Option<String>)> = stmt
+        .query_map([&impl_hash], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "trait".into(),
+                "type_identifier".into(),
+                Some("Greet".into())
+            ),
+            (
+                "type".into(),
+                "type_identifier".into(),
+                Some("Robot".into())
+            ),
+        ],
+        "impl_item exposes exactly one trait: child and one type: child, \
+         and the trait row names the trait"
+    );
+
+    // Why the column exists: both children share a raw_kind, so a kind filter
+    // returns two rows it cannot tell apart.
+    let same_kind: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM node_child nc \
+             JOIN node_content c ON c.node_hash = nc.child_hash \
+             WHERE nc.parent_hash = ?1 AND c.raw_kind = 'type_identifier'",
+            [&impl_hash],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        same_kind, 2,
+        "both impl_item children are type_identifier; only field separates them"
+    );
+}

@@ -137,6 +137,15 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **A FUSE mount could not mount on a stock Linux** (bead
+  `ley-line-open-aed167`). `mount_fuse` passed `auto_unmount`, which libfuse 2
+  implements by having `fusermount` add `allow_other` — refused unless
+  `/etc/fuse.conf` sets `user_allow_other`, so `leyline serve --backend fuse`
+  failed with "option allow_other only allowed if 'user_allow_other' is set"
+  before serving a byte. Found the first time the mount ran under a test, on
+  the CI runner (libfuse 2.9.9 from `deps:ci`). The option is gone; the
+  session handle `mount_fuse` returns already unmounts on drop, which is the
+  lifetime the daemon and the test both hold it for.
 - **A mounted arena reported every file as 0 bytes at one timestamp** (bead
   `ley-line-open-ca51fa`, P0). `fuse.rs` serves `nodes.size` as `st_size`
   and `nodes.mtime` as all four timestamps, and neither column was populated

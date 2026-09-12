@@ -510,16 +510,23 @@ impl Filesystem for LeylineFuse {
 }
 
 /// Mount the FUSE filesystem in the background. Returns a session handle
-/// that unmounts automatically when dropped.
+/// that unmounts when dropped — hold it for as long as the mount should
+/// live.
+///
+/// No `auto_unmount`: on libfuse 2 that option is implemented by
+/// `fusermount` adding `allow_other`, which a stock Linux refuses unless
+/// `/etc/fuse.conf` sets `user_allow_other`, so every mount failed with
+/// "option allow_other only allowed if 'user_allow_other' is set" before
+/// serving a byte (found by `cli-lib/tests/mount_round_trip.rs`, bead
+/// ley-line-open-aed167). The session's `Drop` is the unmount; a process
+/// that dies without dropping it leaves the mountpoint for `fusermount -u`,
+/// the same trade every unprivileged FUSE mount makes.
 pub fn mount_fuse(
     graph: Arc<dyn Graph>,
     mountpoint: &Path,
 ) -> anyhow::Result<fuser::BackgroundSession> {
     let fs = LeylineFuse::new(graph);
-    let options = vec![
-        MountOption::FSName("leyline".into()),
-        MountOption::AutoUnmount,
-    ];
+    let options = vec![MountOption::FSName("leyline".into())];
     let session = fuser::spawn_mount2(fs, mountpoint, &options)?;
     Ok(session)
 }

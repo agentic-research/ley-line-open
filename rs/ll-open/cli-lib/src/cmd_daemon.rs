@@ -1954,7 +1954,7 @@ fn git_dirty_files(dir: &Path) -> Result<std::collections::HashSet<String>> {
     //   entry N:   "RX newpath\0"  (status, space, NEW path)
     //   entry N+1: "oldpath\0"     (BARE old path, no status prefix)
     // We want the new path in the dirty set; the old path's removal
-    // is already handled by the _file_index diff downstream.
+    // is already handled by the file-stat diff downstream.
     //
     // The state machine: walk entries in order. If we see a status
     // entry with code R or C, the NEXT non-empty entry is the rename
@@ -2154,7 +2154,7 @@ mod tests {
         // The parser detects status code R/C in entry1 and skips
         // entry2 as the rename-source. The dirty set should contain
         // ONLY the new path. (Old-path removal is handled downstream
-        // by the _file_index diff during reparse.)
+        // by the file-stat diff during reparse.)
         let dir = TempDir::new().unwrap();
         std::process::Command::new("git")
             .args(["init", "-q"])
@@ -2193,7 +2193,7 @@ mod tests {
             dirty.contains("new.go"),
             "new path must be in dirty set, got {dirty:?}"
         );
-        // The old path's removal is handled by _file_index diff
+        // The old path's removal is handled by the file-stat diff
         // during reparse; the dirty set should NOT carry it (and
         // certainly not the truncated ".go" phantom).
         assert!(
@@ -2542,14 +2542,14 @@ mod tests {
         let live_db = live_db_path_for(&ctrl_path);
 
         // Cold start, then shape the live db as a v4 projection: the
-        // version label, the `_file_index` probe target, and the
+        // version label, the `_source` probe target, and the
         // TEXT-keyed `nodes` (no `nid` column).
         {
             let conn = init_living_db(&ctrl_path, &live_db, None, None, false).unwrap();
             conn.execute_batch(
                 "CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                  INSERT INTO _meta VALUES ('projection_schema_version', 'projection-v4');
-                 CREATE TABLE _file_index (path TEXT PRIMARY KEY, mtime INTEGER, size INTEGER);
+                 CREATE TABLE _source (id TEXT PRIMARY KEY, language TEXT, path TEXT);
                  CREATE TABLE nodes (id TEXT PRIMARY KEY, name TEXT, kind INTEGER);",
             )
             .unwrap();

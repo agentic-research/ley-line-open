@@ -54,7 +54,7 @@ use leyline_ts::schema::{
     create_ast_tables, create_index_schema, create_ir_indexes, create_ir_tables,
     create_pointer_store_tables, create_post_load_indexes_skip_unused, create_query_blob_tables,
     create_refs_tables, create_source_blobs_table, delete_file_rows, ensure_dir_nodes,
-    ensure_file_id, file_nid, get_meta, read_file_index, set_meta, sweep_orphaned_dirs,
+    ensure_file_id, file_nid, get_meta, read_file_stats, set_meta, sweep_orphaned_dirs,
 };
 use rayon::prelude::*;
 use rusqlite::Connection;
@@ -124,7 +124,6 @@ pub(crate) struct ParsedFile {
     /// `node_child` rows for this file's unique internal nodes.
     node_children: Vec<ChildRow>,
     file_mtime: i64,
-    file_size: i64,
     /// BLAKE3-32 of the file bytes. Computed in the rayon worker from the
     /// same `content` slice tree-sitter parsed, so it costs one extra hash
     /// pass over already-in-cache bytes. Populates `_source.contentHash`
@@ -689,25 +688,6 @@ batch_table! {
 }
 
 batch_table! {
-    // Plain INSERT: same rationale as AstBatch — delete_file_rows
-    // clears _file_index rows per file before reparse.
-    FileIdxBatch, FileIdxRow,
-    "INSERT INTO _file_index (path, mtime, size) VALUES ",
-    3,
-    push_fn: (path: String, mtime: i64, size: i64),
-    push_body: { FileIdxRow { path, mtime, size } },
-    flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 3);
-        for r in chunk {
-            out.push(&r.path);
-            out.push(&r.mtime);
-            out.push(&r.size);
-        }
-        out
-    },
-}
-
-batch_table! {
     // ADR-0026 pointer-store blob rows (bead `ley-line-open-3e87ad`).
     // `INSERT OR IGNORE` on the `blob_hash` PK == intrinsic dedup: two
     // files with byte-identical AstNodeList canonical bytes share one blob.
@@ -914,10 +894,12 @@ fn ordinal_space_needed(ast_entries: usize, injected: usize) -> usize {
 /// to the arena and serve ops that each die with per-op "no such column:
 /// nid" noise instead of this one actionable refusal.
 ///
-/// A db with no `_file_index` has no projection to refuse — cold starts
-/// and fresh live dbs pass through.
+/// A db with no `_source` has no projection to refuse — cold starts and
+/// fresh live dbs pass through. (`_source` is the file registry every
+/// projection since v1 carries; `_file_index`, the previous probe target,
+/// left the projection in v6 — bead `ley-line-open-8f37c4`.)
 pub(crate) fn refuse_pre_v5_projection(conn: &Connection) -> Result<()> {
-    if conn.prepare("SELECT 1 FROM _file_index LIMIT 1").is_err() {
+    if conn.prepare("SELECT 1 FROM _source LIMIT 1").is_err() {
         return Ok(());
     }
     if let Ok(Some(stored)) = get_meta(conn, "projection_schema_version")
@@ -987,7 +969,7 @@ pub fn parse_into_conn(
     };
 
     // Check if tables already exist (incremental mode).
-    let incremental = conn.prepare("SELECT 1 FROM _file_index LIMIT 1").is_ok();
+    let incremental = conn.prepare("SELECT 1 FROM _source LIMIT 1").is_ok();
 
     refuse_pre_v5_projection(conn)?;
 
@@ -1033,7 +1015,7 @@ pub fn parse_into_conn(
     // ---- Classify files ----
 
     let old_index = if incremental {
-        read_file_index(conn)?
+        read_file_stats(conn)?
     } else {
         HashMap::new()
     };
@@ -1457,7 +1439,6 @@ pub fn parse_into_conn(
     let mut defs_buf: DefBatch = DefBatch::with_capacity(3_000);
     let mut imports_buf: ImportBatch = ImportBatch::with_capacity(2_000);
     let mut source_buf: SourceBatch = SourceBatch::with_capacity(chunk_files);
-    let mut file_idx_buf: FileIdxBatch = FileIdxBatch::with_capacity(chunk_files);
 
     // ADR-0026 pointer store (Phase 1 dual-write, bead `ley-line-open-3e87ad`).
     // One `capnp_blobs` row per file; one `_ast_pointer` row per AstEntry
@@ -1868,7 +1849,6 @@ pub fn parse_into_conn(
                         }
                     }
 
-                    file_idx_buf.push(pf.rel.clone(), pf.file_mtime, pf.file_size);
                     changed_files.push(pf.rel);
                     parsed += 1;
                 }
@@ -1916,7 +1896,6 @@ pub fn parse_into_conn(
         "INSERT INTO node_defs (token, nid, node_hash, container_nid, canonical_kind, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col) VALUES ",
     )?;
         imports_buf.flush_batched(conn)?;
-        file_idx_buf.flush_batched(conn)?;
         // ADR-0026 pointer-store dual-write (bead `ley-line-open-3e87ad`). Flush
         // blobs BEFORE the pointer rows so an implementation that later adds a FK
         // on `_ast_pointer.blob_hash → capnp_blobs.blob_hash` finds every referent
@@ -3092,7 +3071,6 @@ pub(crate) fn parse_file_pure(
         node_contents,
         node_children,
         file_mtime,
-        file_size,
         content_hash,
         source_capnp_bytes,
         ast_capnp_bytes,
@@ -3147,9 +3125,9 @@ pub(crate) fn parse_to_ast_json(
     source_id: &str,
 ) -> Result<serde_json::Value> {
     // file_mtime + file_size default to 0 for in-memory buffers —
-    // they're metadata for the file-index row, which callers of
-    // parse_to_ast_json don't populate (no `_file_index` in the
-    // JSON response shape).
+    // they're the file row's stat pair, which callers of
+    // parse_to_ast_json don't populate (no file row in the JSON
+    // response shape).
     // No arena connection here (in-memory validate path), so no overrides can
     // apply — the compiled defaults are the effective query set.
     // This path holds only a borrow, so it owes the copy `parse_file_pure`
@@ -4048,7 +4026,7 @@ mod tests {
         // Sanity: the small file's nodes are present, huge.go's are absent.
         let small_present: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _file_index WHERE path = 'small.go'",
+                "SELECT COUNT(*) FROM _source WHERE id = 'small.go'",
                 [],
                 |r| r.get(0),
             )
@@ -4056,7 +4034,7 @@ mod tests {
         assert_eq!(small_present, 1);
         let huge_present: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _file_index WHERE path = 'huge.go'",
+                "SELECT COUNT(*) FROM _source WHERE id = 'huge.go'",
                 [],
                 |r| r.get(0),
             )
@@ -4113,7 +4091,7 @@ mod tests {
         // Sanity: keep.go's file row survives.
         let keep_present: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _file_index WHERE path = 'keep.go'",
+                "SELECT COUNT(*) FROM _source WHERE id = 'keep.go'",
                 [],
                 |r| r.get(0),
             )
@@ -4736,7 +4714,7 @@ mod tests {
     fn projection_schema_version_is_stamped_and_pinned() {
         assert_eq!(
             crate::daemon::version::PROJECTION_SCHEMA_VERSION,
-            "projection-v5",
+            "projection-v6",
             "the projection version literal is pinned — see version.rs docs \
              before changing it",
         );
@@ -4749,7 +4727,7 @@ mod tests {
             get_meta(&conn, "projection_schema_version")
                 .unwrap()
                 .as_deref(),
-            Some("projection-v5"),
+            Some("projection-v6"),
             "every parse must stamp _meta.projection_schema_version",
         );
     }
@@ -4768,7 +4746,7 @@ mod tests {
             .expect_err("a projection-v4 arena must be refused");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("projection-v4") && msg.contains("projection-v5"),
+            msg.contains("projection-v4") && msg.contains("projection-v6"),
             "the refusal must name both versions; got: {msg}",
         );
         assert!(
@@ -4787,12 +4765,12 @@ mod tests {
         let td = TempDir::new().unwrap();
         std::fs::write(td.path().join("v.go"), b"package v\n").unwrap();
         let conn = Connection::open_in_memory().unwrap();
-        // A minimal legacy-shaped arena: old TEXT-keyed nodes, an
-        // incremental marker (_file_index), and NO version key anywhere.
+        // A minimal legacy-shaped arena: old TEXT-keyed nodes, the file
+        // registry the probe keys on (_source), and NO version key anywhere.
         conn.execute_batch(
             "CREATE TABLE nodes (id TEXT PRIMARY KEY, name TEXT, kind INTEGER, \
                                  size INTEGER, mtime INTEGER, record TEXT);
-             CREATE TABLE _file_index (path TEXT PRIMARY KEY, mtime INTEGER, size INTEGER);",
+             CREATE TABLE _source (id TEXT PRIMARY KEY, language TEXT, path TEXT);",
         )
         .unwrap();
         let err = parse_into_conn(&conn, td.path(), Some("go"), None)

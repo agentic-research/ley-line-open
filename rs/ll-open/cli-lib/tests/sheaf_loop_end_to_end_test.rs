@@ -27,7 +27,7 @@
 //! `SheafSubscriber`) depends on. Specifically:
 //!
 //! 1. Real `parse_into_conn` runs (not mocked): schema created,
-//!    files parsed, `_file_index` populated.
+//!    files parsed, file rows stamped with their stat pairs.
 //! 2. Real `ComplexBuildPass` runs (not mocked): `SheafState.cache` is
 //!    populated with a non-empty `CellComplex` derived from seeded
 //!    observation rows — so `region_ids` on the wire is non-empty and
@@ -263,7 +263,7 @@ async fn file_change_drives_fine_grained_sheaf_invalidate_end_to_end() {
     std::fs::create_dir_all(&source_dir).expect("mkdir src");
 
     // Two parseable Rust files so `parse_into_conn` has a non-trivial
-    // tree to walk and `_file_index` has an mtime baseline the scoped
+    // tree to walk and the file rows carry an mtime baseline the scoped
     // reparse can diff against.
     let foo_path = source_dir.join("foo.rs");
     let bar_path = source_dir.join("bar.rs");
@@ -272,7 +272,7 @@ async fn file_change_drives_fine_grained_sheaf_invalidate_end_to_end() {
 
     let (ctx, router) = build_full_ctx(dir.path(), source_dir.clone());
 
-    // Initial parse populates `_file_index` + `nodes` so the later
+    // Initial parse populates `_source` + `nodes` so the later
     // scoped reparse detects the modification (rather than treating
     // foo.rs as a first-time add and skipping the mtime diff branch).
     // Mirrors the daemon's cold-start parse before `git_watch_loop`

@@ -152,7 +152,6 @@ the projection is derived-only, so no in-place migration exists.
 | `node_refs` | Token references (token → nid, node_hash, container_nid, qualifier, and since `projection-v3` the occurrence's own `node_kind` + `start_byte`/`end_byte`/`start_row`/`start_col`/`end_row`/`end_col`). `qualifier` (v0.7.9, bead `ley-line-open-4dde42`) = receiver/selector text on the BARE-token row of a qualified call's dual-emit pair (`fmt.Println(..)` → the `Println` row carries `'fmt'`); NULL on the qualified-token row and on bare calls. Injected-subtree occurrences carry real nids past their host file's `_ast` count — fact-row keys with no `nodes`/`_ast` row, exactly as their path-shaped ids had no rows before. |
 | `node_defs` | Token definitions (token → nid, node_hash, container_nid, canonical_kind, and since `projection-v3` the occurrence's own `node_kind` + span columns as on `node_refs`). The span is carried here rather than JOINed from `_ast` — SCIP's `Occurrence` shape (bead `ley-line-open-b4509b`). NULL span means the locator has no `_ast` row (injected nodes). No `qualifier` column. |
 | `_imports` | Import statements (alias, path, source_id) |
-| `_file_index` | Incremental parse index (path → mtime, size) |
 | `_meta` | Key-value metadata (source_root, parse_time, version vectors) |
 
 **Merkle-AST IR** (added v0.6.0 per ADR-0027):

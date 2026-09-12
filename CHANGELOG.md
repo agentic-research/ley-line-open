@@ -12,6 +12,16 @@ context, scoping notes, and review history are recoverable.
 
 ### Added
 
+- **The cfg-coverage gate is proven red** (bead `ley-line-open-b23c41`).
+  `tools/check_mutants_cfg_coverage.sh` — the guard against phantom MISSED
+  mutants in `#[cfg(feature)]` modules a slice compiles out — shipped in
+  #379 without a fixture that watches it fail, and its first version had been
+  a silent no-op. `tools/test_mutants_cfg_coverage.sh` now runs the real lint
+  against a copy of the real inputs with one edit each: a gated module added
+  without an exclude (red), the same module enabled (green), excluded
+  (green), an existing exclude deleted (red), and a slice naming a package
+  with no manifest (red, fail closed). It runs in the `ci` chain as
+  `lint:mutants-cfg-coverage:fixture-test`.
 - **The mount is tested through the kernel** (bead `ley-line-open-aed167`).
   `mount` shipped via `task install:full+mount` with zero tests at any level;
   two build checks proved the backends link and nothing ever read a byte
@@ -121,6 +131,19 @@ context, scoping notes, and review history are recoverable.
 
 ### Removed
 
+- **`_file_index` leaves the projection; `projection-v5` → `projection-v6`**
+  (bead `ley-line-open-8f37c4`). The table held `(path, mtime, size)` for the
+  incremental-reparse stat prefilter — a second copy of what the file's own
+  `nodes` row carries since #381 (`size`, `mtime`, stamped from the
+  filesystem) keyed by `_source.file_id`. The prefilter now reads that join
+  (`leyline_ts::schema::read_file_stats`); `upsert_file_index`,
+  `read_file_index` and `FILE_INDEX_DDL` are gone; the "a projection exists
+  here" probe that gated incremental mode and the pre-v5 refusal moves to
+  `_source`. A v5 arena is refused at parse open with the usual reparse
+  message. mache reads neither table and warns, not refuses, on a
+  projection label it has not been checked against, so its readers are
+  unaffected. #385's freshness tests (touch without edit skips; unchanged
+  tree pays no hashing) run unchanged against the new source of the pair.
 - **`leyline_schema::NODES_DDL`** (bead `ley-line-open-b23c41`). The constant
   was a hand-maintained copy of `INTERN_TABLES_DDL` + `NODES_TABLE_DDL` +
   `NODES_INDEXES_DDL` — a second source of truth for the same SQL, which

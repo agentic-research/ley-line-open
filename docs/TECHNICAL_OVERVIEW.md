@@ -14,7 +14,7 @@ The project has three layers:
 1. **Storage and publication** maintain SQLite snapshots, content hashes,
    arenas, generations, and reader-safe publication.
 2. **Projection** parses and enriches source files, then materializes tables
-   such as `nodes`, `_ast`, `_source`, and `_file_index`.
+   such as `nodes`, `_ast`, and `_source`.
 3. **Consumer APIs** expose queries over the daemon and typed cross-language
    records. Mache is the primary Go consumer; other runtimes use the same
    durable contracts.

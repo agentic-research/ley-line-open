@@ -31,7 +31,7 @@ use tempfile::TempDir;
 
 /// Set up a connection with the base ley-line-open schema present
 /// (nodes / _ast / _source / node_refs / node_defs / _imports /
-/// _file_index / _meta) so the test can round-trip
+/// _meta) so the test can round-trip
 /// `_meta.source_root`.
 fn schema_conn() -> Connection {
     let conn = Connection::open_in_memory().unwrap();

@@ -173,26 +173,16 @@ fn write_empty_go_func(dir: &Path, file: &str, pkg: &str, fn_name: &str) {
     fs::write(dir.join(file), content).expect("write go fixture");
 }
 
-/// Snapshot the `_file_index` table into `{path -> (mtime, size)}`.
-/// Used by reparse-scope tests to compare before/after states — four
-/// sites previously inlined this 8-line query+decode chain. Future
-/// schema changes (e.g. adding hash column to _file_index) are now
-/// one site, not four.
+/// Snapshot every projected file's stat pair into `{path -> (mtime, size)}`
+/// — the same read the incremental prefilter makes (projection-v6: the pair
+/// lives on the file's `nodes` row behind `_source.file_id`, bead
+/// `ley-line-open-8f37c4`). Used by reparse-scope tests to compare
+/// before/after states at one site.
 #[allow(dead_code)]
 fn file_index_snapshot(
     conn: &rusqlite::Connection,
 ) -> std::collections::HashMap<String, (i64, i64)> {
-    conn.prepare("SELECT path, mtime, size FROM _file_index")
-        .unwrap()
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?),
-            ))
-        })
-        .unwrap()
-        .filter_map(Result::ok)
-        .collect()
+    leyline_ts::schema::read_file_stats(conn).unwrap()
 }
 
 /// Cold-parse a Go source directory into a fresh `:memory:` Connection.
@@ -1688,7 +1678,7 @@ async fn test_incremental_skip_unchanged() {
     assert_eq!(defs_first, defs_second, "no changes = same data");
 
     let index_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM _file_index", [], |r| r.get(0))
+        .query_row("SELECT COUNT(*) FROM _source", [], |r| r.get(0))
         .unwrap();
     assert_eq!(index_count, 2);
 }
@@ -1832,7 +1822,7 @@ async fn test_incremental_deleted_file() {
         .unwrap();
     assert_eq!(keep_def, 1, "Keep should still exist");
     let index_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM _file_index", [], |r| r.get(0))
+        .query_row("SELECT COUNT(*) FROM _source", [], |r| r.get(0))
         .unwrap();
     assert_eq!(index_count, 1);
 }
@@ -2403,7 +2393,7 @@ async fn test_status_reports_phase_and_enrichment() {
 ///
 /// Cold-parse three Go files into an in-memory db. Modify file A on disk.
 /// Call `parse_into_conn` with `scope=Some(&["a.go"])`. Confirm:
-///   - file A's _file_index row reflects the new mtime/size.
+///   - file A's stat pair (its `nodes` row) reflects the new mtime/size.
 ///   - files B and C are untouched (mtime/size match the cold-parse values).
 ///   - the scoped pass parses 1 (the others were never visited).
 #[test]
@@ -2449,7 +2439,7 @@ fn test_scoped_reparse_only_touches_scoped_files() {
 }
 
 /// Scoped reparse must NOT trigger sweep_orphaned_dirs — that sweep
-/// walks the full _file_index and would incorrectly drop dir nodes
+/// walks every projected file and would incorrectly drop dir nodes
 /// whose out-of-scope file siblings weren't reloaded into this run.
 /// At registry scale (50k+ files, 5 dirty), the sweep would catastrophic
 /// ally delete dir nodes whose only file in this scoped pass was the
@@ -2513,7 +2503,7 @@ fn test_scoped_reparse_preserves_sibling_dir_nodes() {
     // Critical pin: pkg/ dir node must STILL exist. If sweep_orphaned_
     // dirs ran during the scoped pass, it would have deleted pkg/
     // because b.go (the only other child) wasn't reloaded into the
-    // scoped run's _file_index addition.
+    // scoped run's file-row additions.
     assert_eq!(
         rows_at(pkg_nid, "AND kind = 1"),
         1,
@@ -2549,11 +2539,11 @@ fn test_scoped_reparse_handles_deletion_in_scope() {
     assert_eq!(r2.deleted, 1);
 
     let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM _file_index", [], |r| r.get(0))
+        .query_row("SELECT COUNT(*) FROM _source", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(count, 1, "only b.go should remain in _file_index");
+    assert_eq!(count, 1, "only b.go should remain in _source");
     let remaining: String = conn
-        .query_row("SELECT path FROM _file_index", [], |r| r.get(0))
+        .query_row("SELECT id FROM _source", [], |r| r.get(0))
         .unwrap();
     assert_eq!(remaining, "b.go");
 }
@@ -2575,7 +2565,7 @@ async fn test_op_reparse_accepts_single_file_source() {
     let (_arena, ctrl_path) = fresh_arena(dir.path());
     let live_db_path = ctrl_path.with_extension("live.db");
 
-    // Cold-parse so _file_index is populated, into a LiveDb (pool +
+    // Cold-parse so the file rows carry their stat pairs, into a LiveDb (pool +
     // writer) so the daemon context can consume it.
     let live_db = cold_parse_go_live_db(&live_db_path, src.path());
     let snapshot = {
@@ -2622,7 +2612,7 @@ async fn test_op_reparse_accepts_single_file_source() {
     let names: Vec<&str> = changed.iter().filter_map(|v| v.as_str()).collect();
     assert_eq!(names, vec!["a.go"], "scope should be exactly [a.go]");
 
-    // Verify b.go was NOT touched (its mtime/size in _file_index is unchanged).
+    // Verify b.go was NOT touched (its file row's mtime/size is unchanged).
     let after = file_index_snapshot(&ctx.live_db.writer.lock());
     assert_eq!(
         after.get("b.go"),
@@ -3206,7 +3196,7 @@ async fn test_op_reparse_snapshot_race_publishes_well_formed_root() {
         .unwrap();
     drop(ctrl);
 
-    // Cold-parse so _file_index is populated and reparse calls have
+    // Cold-parse so the file rows carry their stat pairs and reparse calls have
     // something to diff against.
     let live_db = cold_parse_go_live_db(&live_db_path, src.path());
 

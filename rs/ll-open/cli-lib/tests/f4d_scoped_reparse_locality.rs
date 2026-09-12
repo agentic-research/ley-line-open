@@ -7,7 +7,7 @@
 //! Reparsing (or deleting) file X through the scoped path touches only rows
 //! that belong to X. For every other file, every row in every located table —
 //! `nodes`, `_ast`, `_source`, `node_refs`, `node_defs`, `_imports`,
-//! `_file_index`, `_ast_blob` — is byte-for-byte unchanged: same identities,
+//! `_ast_blob` — is byte-for-byte unchanged: same identities,
 //! same spans, same hashes, same mtimes.
 //!
 //! ## How this differs from F4b
@@ -90,11 +90,7 @@ fn file_rows(conn: &Connection, rel: &str) -> Vec<String> {
         ("node_defs", "nid BETWEEN ?1 AND ?2"),
         ("_ast_blob", "file_id BETWEEN (?1 >> 24) AND (?2 >> 24)"),
     ];
-    let texty: &[(&str, &str)] = &[
-        ("_source", "id = ?1"),
-        ("_imports", "source_id = ?1"),
-        ("_file_index", "path = ?1"),
-    ];
+    let texty: &[(&str, &str)] = &[("_source", "id = ?1"), ("_imports", "source_id = ?1")];
     let table_exists = |table: &str| -> bool {
         conn.query_row(
             "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name=?1",

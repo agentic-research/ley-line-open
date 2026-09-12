@@ -848,16 +848,8 @@ pub fn create_cfg_schema(conn: &Connection) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// File-index & meta tables (incremental reparse)
+// Meta table (parse metadata) and the incremental-reparse stat index
 // ---------------------------------------------------------------------------
-
-/// DDL for the `_file_index` table — tracks file mtime/size for incremental reparse.
-pub const FILE_INDEX_DDL: &str = "\
-CREATE TABLE IF NOT EXISTS _file_index (
-    path TEXT PRIMARY KEY,
-    mtime INTEGER NOT NULL,
-    size INTEGER NOT NULL
-);";
 
 /// DDL for the `_meta` table — key/value store for parse metadata.
 pub const META_DDL: &str = "\
@@ -866,10 +858,15 @@ CREATE TABLE IF NOT EXISTS _meta (
     value TEXT NOT NULL
 );";
 
-/// Create `_file_index` and `_meta` tables (idempotent). Neither table
-/// has secondary indexes — PRIMARY KEY suffices for both.
+/// Create the `_meta` table (idempotent). No secondary index — the PRIMARY
+/// KEY suffices.
+///
+/// projection-v6 (bead `ley-line-open-8f37c4`): `_file_index` is gone. It
+/// held `(path, mtime, size)` for the incremental-reparse stat prefilter,
+/// which the projection already carries on the file's own `nodes` row
+/// (`size`, `mtime`, stamped from the filesystem since #381) keyed by
+/// `_source.file_id`. [`read_file_stats`] reads that join.
 pub fn create_index_schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch(FILE_INDEX_DDL)?;
     conn.execute_batch(META_DDL)?;
     Ok(())
 }
@@ -912,18 +909,21 @@ pub fn create_post_load_indexes_skip_unused(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Insert or replace a file-index row.
-pub fn upsert_file_index(conn: &Connection, path: &str, mtime: i64, size: i64) -> Result<()> {
-    conn.execute(
-        "INSERT OR REPLACE INTO _file_index (path, mtime, size) VALUES (?1, ?2, ?3)",
-        params![path, mtime, size],
+/// Read every projected file's `(mtime_ns, size)` keyed by its rel path —
+/// the stat pair the incremental-reparse prefilter compares against the
+/// filesystem (bead `ley-line-open-8f37c4`).
+///
+/// The pair lives on the file's own `nodes` row (ordinal 0 of its
+/// `file_id` range), stamped from the filesystem at parse time (#381);
+/// `_source.id` is the rel path and `_source.file_id` names the row. A
+/// `_source` row whose file node is missing has no stat pair and is
+/// absent from the map, so it reparses — the honest answer for a
+/// half-written file.
+pub fn read_file_stats(conn: &Connection) -> Result<std::collections::HashMap<String, (i64, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.id, n.mtime, n.size FROM _source s \
+         JOIN nodes n ON n.nid = (s.file_id << 24)",
     )?;
-    Ok(())
-}
-
-/// Read the full file index into a HashMap.
-pub fn read_file_index(conn: &Connection) -> Result<std::collections::HashMap<String, (i64, i64)>> {
-    let mut stmt = conn.prepare("SELECT path, mtime, size FROM _file_index")?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -1014,7 +1014,6 @@ pub fn delete_file_rows(conn: &Connection, path: &str) -> Result<()> {
     }
     conn.execute("DELETE FROM _source WHERE id = ?1", [path])?;
     conn.execute("DELETE FROM _imports WHERE source_id = ?1", [path])?;
-    conn.execute("DELETE FROM _file_index WHERE path = ?1", [path])?;
     // ADR-0028 source_blobs (Phase 1 dual-store, bead `ley-line-open-9e4416`).
     // Content-addressed — same orphan discipline as capnp_blobs.
     Ok(())
@@ -1124,24 +1123,59 @@ mod tests {
     }
 
     #[test]
-    fn file_index_roundtrip() {
+    fn file_stats_come_from_the_file_row() {
+        // projection-v6: the incremental prefilter's stat pair is the file
+        // row's own (mtime, size), keyed through _source.file_id. A _source
+        // row with no file node has no pair and is absent, so it reparses.
         let conn = Connection::open_in_memory().unwrap();
         create_ast_schema(&conn).unwrap();
         create_refs_schema(&conn).unwrap();
         create_index_schema(&conn).unwrap();
 
-        upsert_file_index(&conn, "main.go", 1000, 500).unwrap();
-        upsert_file_index(&conn, "util.go", 2000, 300).unwrap();
+        let main_id = ensure_file_id(&conn, "main.go").unwrap();
+        insert_source(&conn, "main.go", "go", b"package main", main_id).unwrap();
+        insert_node(
+            &conn,
+            file_nid(main_id, 0),
+            None,
+            None,
+            None,
+            1,
+            0,
+            500,
+            1000,
+            "",
+        )
+        .unwrap();
 
-        let index = read_file_index(&conn).unwrap();
-        assert_eq!(index.len(), 2);
-        assert_eq!(index["main.go"], (1000, 500));
-        assert_eq!(index["util.go"], (2000, 300));
+        let util_id = ensure_file_id(&conn, "util.go").unwrap();
+        insert_source(&conn, "util.go", "go", b"package util", util_id).unwrap();
+        insert_node(
+            &conn,
+            file_nid(util_id, 0),
+            None,
+            None,
+            None,
+            1,
+            0,
+            300,
+            2000,
+            "",
+        )
+        .unwrap();
 
-        // Upsert overwrites
-        upsert_file_index(&conn, "main.go", 3000, 600).unwrap();
-        let index = read_file_index(&conn).unwrap();
-        assert_eq!(index["main.go"], (3000, 600));
+        let orphan_id = ensure_file_id(&conn, "half.go").unwrap();
+        insert_source(&conn, "half.go", "go", b"package half", orphan_id).unwrap();
+
+        let stats = read_file_stats(&conn).unwrap();
+        assert_eq!(
+            stats.len(),
+            2,
+            "a _source row without its file node has no stat pair"
+        );
+        assert_eq!(stats["main.go"], (1000, 500));
+        assert_eq!(stats["util.go"], (2000, 300));
+        assert!(!stats.contains_key("half.go"));
     }
 
     #[test]
@@ -1261,7 +1295,6 @@ mod tests {
         insert_source(conn, rel, "go", b"package x", file_id).unwrap();
         insert_ref(conn, token, base + 1, None, None).unwrap();
         insert_def(conn, token, base + 1, None, None).unwrap();
-        upsert_file_index(conn, rel, 100, 50).unwrap();
         file_nid_range(file_id)
     }
 
@@ -1297,14 +1330,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(a_source, 0);
-        let a_index: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM _file_index WHERE path = 'a.go'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(a_index, 0);
+        assert!(
+            !read_file_stats(&conn).unwrap().contains_key("a.go"),
+            "a deleted file has no stat pair for the incremental prefilter"
+        );
 
         // b.go intact
         assert_eq!(rows_in_range(&conn, "nodes", "nid", b_lo, b_hi), 2);
@@ -1481,25 +1510,39 @@ mod tests {
     }
 
     #[test]
-    fn read_file_index_handles_thousand_entries() {
-        // Scale-problem pin. read_file_index loads ALL _file_index
-        // rows into a HashMap at once — at 50k files (a registry-
+    fn read_file_stats_handles_thousand_entries() {
+        // Scale-problem pin. read_file_stats loads EVERY projected file's
+        // stat pair into a HashMap at once — at 50k files (a registry-
         // sized repo) this is ~3 MB held in memory per call. The
-        // existing roundtrip test covers 2 entries, which can't catch
-        // a refactor that introduced a LIMIT, an early break, or a
-        // chunked read that silently dropped the tail. Pin: 1000
-        // entries round-trip identity (a refactor stopping at
-        // SQLite's default page-size boundary would catch here).
+        // two-entry test above can't catch a refactor that introduced a
+        // LIMIT, an early break, or a chunked read that silently dropped
+        // the tail. Pin: 1000 entries round-trip identity (a refactor
+        // stopping at SQLite's default page-size boundary would catch here).
         let conn = Connection::open_in_memory().unwrap();
         create_ast_schema(&conn).unwrap();
         create_refs_schema(&conn).unwrap();
         create_index_schema(&conn).unwrap();
 
         for i in 0..1000 {
-            upsert_file_index(&conn, &format!("path/{i:04}.go"), i as i64, (i * 7) as i64).unwrap();
+            let rel = format!("path/{i:04}.go");
+            let file_id = ensure_file_id(&conn, &rel).unwrap();
+            insert_source(&conn, &rel, "go", b"package p", file_id).unwrap();
+            insert_node(
+                &conn,
+                file_nid(file_id, 0),
+                None,
+                None,
+                None,
+                1,
+                0,
+                (i * 7) as i64,
+                i as i64,
+                "",
+            )
+            .unwrap();
         }
 
-        let index = read_file_index(&conn).unwrap();
+        let index = read_file_stats(&conn).unwrap();
         assert_eq!(index.len(), 1000, "must read every row, no truncation");
         // Spot-check the first, middle, and last entries.
         assert_eq!(index["path/0000.go"], (0, 0));

@@ -121,13 +121,20 @@ pub const IR_SCHEMA_VERSION: &str = "merkle-ast-v2";
 ///   rebuild by cold reparse), never migrated in place. The capnp wire
 ///   surface is untouched: Phase A evicted the locator from every hashed
 ///   preimage, which is what makes this a projection-only break.
+/// - `projection-v6` — `_file_index` removed (bead `ley-line-open-8f37c4`).
+///   Its `(path, mtime, size)` was a second copy of the file row's own
+///   `nodes.size`/`nodes.mtime` (stamped from the filesystem since #381)
+///   keyed by `_source.file_id`; the incremental-reparse prefilter reads
+///   that join (`leyline_ts::schema::read_file_stats`). The "a projection
+///   exists here" probe moves from `_file_index` to `_source`. Nothing else
+///   changes; a v5 arena is refused at parse open like every earlier shape.
 ///
 /// Bump on ANY table added or removed, or column added or removed. Two
 /// changes in flight at once need two numbers: v3 and v4 landed in the same
 /// window, and both first claimed v3 — a clean textual merge, because both
 /// wrote the same string, describing two different table shapes. A consumer
 /// reading that would have had no way to tell which one it held.
-pub const PROJECTION_SCHEMA_VERSION: &str = "projection-v5";
+pub const PROJECTION_SCHEMA_VERSION: &str = "projection-v6";
 
 pub const WIRE_FORMAT_MAJOR: u32 = 1;
 

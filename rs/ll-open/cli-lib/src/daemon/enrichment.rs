@@ -318,7 +318,6 @@ impl EnrichmentPass for TreeSitterPass {
             "node_refs",
             "node_defs",
             "_imports",
-            "_file_index",
             // projection-v5 interning tables (bead ley-line-open-17c271).
             "names",
             "dirs",
@@ -336,7 +335,7 @@ impl EnrichmentPass for TreeSitterPass {
         let start = Instant::now();
         // Forward `changed_files` as the parse scope. When the caller knows
         // which files changed (e.g. lazy LSP enrichment), we skip the full
-        // tree walk; otherwise parse_into_conn does its own _file_index diff.
+        // tree walk; otherwise parse_into_conn does its own file-stat diff.
         let result = crate::cmd_parse::parse_into_conn(conn, source_dir, None, changed_files)?;
 
         Ok(EnrichmentStats {
@@ -487,7 +486,6 @@ mod tests {
                 "node_refs",
                 "node_defs",
                 "_imports",
-                "_file_index",
                 "names",
                 "dirs",
                 "files",

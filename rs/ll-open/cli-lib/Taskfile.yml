@@ -37,6 +37,16 @@ tasks:
     cmds:
       - cargo test -p leyline-cli-lib --features text-search
 
+  test:mount:
+    desc: |
+      Tests for the `mount` feature (FUSE/NFS) — ships in install:full+mount.
+      Mounts a parsed projection over FUSE and reads it back (bead
+      ley-line-open-aed167). Needs libfuse (Linux, from deps:ci) or fuse-t
+      (macOS) at RUN time, not only at link time; there is no skip path.
+    dir: '{{.TASKFILE_DIR}}/../..'
+    cmds:
+      - cargo test -p leyline-cli-lib --features mount --test mount_round_trip
+
   test:cdc-activation:
     desc: CDC activation + the disabled-build counterpart — both halves of the cdc feature gate
     dir: '{{.TASKFILE_DIR}}/../..'

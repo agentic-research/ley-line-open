@@ -10,6 +10,24 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Added
+
+- **The mount is tested through the kernel** (bead `ley-line-open-aed167`).
+  `mount` shipped via `task install:full+mount` with zero tests at any level;
+  two build checks proved the backends link and nothing ever read a byte
+  through a mounted projection. `rs/ll-open/cli-lib/tests/mount_round_trip.rs`
+  parses a fixture, mounts it over FUSE the way the daemon does, and asserts
+  what `read(2)` and `stat(2)` return: a leaf's bytes equal the graph's
+  `read_content` and the source token, and the source file's entry carries
+  the file's own mtime (proven red by stamping the parse time instead). It
+  runs in the `ci` chain as `cli-lib:test:mount`; the `cli-lib/mount`
+  `ships-untested` ledger row is gone. What the test established about the
+  presentation, now written down: a source file is a DIRECTORY of its syntax
+  nodes and the leaves are the files, so no entry serves a source file's
+  whole bytes, and FUSE reports the file row's size as 4096 like any
+  directory — `nodes.size` on that row (#381, `ley-line-open-ca51fa`) never
+  reaches a `stat` through the mount; only its mtime does.
+
 ### Changed
 
 - **The mutation slices run as a matrix, and `task ci` gets a ceiling sized

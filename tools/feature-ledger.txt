@@ -127,4 +127,3 @@ ll-open/vcs           sqlite             not-shipping    skip    -
 # Compounds 918a75, where flush_node was a silent no-op so mount writes never
 # reprojected. Remove when a round-trip test lands. mutants=skip: cli-lib has
 # its own slice, which does not enable mount.
-ll-open/cli-lib       mount              ships-untested  skip    ley-line-open-aed167

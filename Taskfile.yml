@@ -417,6 +417,11 @@ tasks:
     cmds:
       - sh tools/test_workflow_parity.sh
 
+  lint:mutants-cfg-coverage:fixture-test:
+    desc: Prove the cfg-coverage gate goes red on a gated module its slice neither enables nor excludes (b23c41)
+    cmds:
+      - sh tools/test_mutants_cfg_coverage.sh
+
   mutants:diff:fixture-test:
     desc: Prove diff mutation routing runs the tests that observe each changed surface
     cmds:
@@ -1526,6 +1531,7 @@ tasks:
       - task: lint:cache-contract
       - task: ci:attestation:fixture-test
       - task: ci:workflow-parity:fixture-test
+      - task: lint:mutants-cfg-coverage:fixture-test
       - task: mutants:diff:fixture-test
       - task: taskfile:anchors:fixture-test
       - task: release:artifacts:fixture-test

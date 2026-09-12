@@ -12,6 +12,16 @@ context, scoping notes, and review history are recoverable.
 
 ### Added
 
+- **The cfg-coverage gate is proven red** (bead `ley-line-open-b23c41`).
+  `tools/check_mutants_cfg_coverage.sh` — the guard against phantom MISSED
+  mutants in `#[cfg(feature)]` modules a slice compiles out — shipped in
+  #379 without a fixture that watches it fail, and its first version had been
+  a silent no-op. `tools/test_mutants_cfg_coverage.sh` now runs the real lint
+  against a copy of the real inputs with one edit each: a gated module added
+  without an exclude (red), the same module enabled (green), excluded
+  (green), an existing exclude deleted (red), and a slice naming a package
+  with no manifest (red, fail closed). It runs in the `ci` chain as
+  `lint:mutants-cfg-coverage:fixture-test`.
 - **The mount is tested through the kernel** (bead `ley-line-open-aed167`).
   `mount` shipped via `task install:full+mount` with zero tests at any level;
   two build checks proved the backends link and nothing ever read a byte

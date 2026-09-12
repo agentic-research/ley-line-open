@@ -10,6 +10,24 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Added
+
+- **The mount is tested through the kernel** (bead `ley-line-open-aed167`).
+  `mount` shipped via `task install:full+mount` with zero tests at any level;
+  two build checks proved the backends link and nothing ever read a byte
+  through a mounted projection. `rs/ll-open/cli-lib/tests/mount_round_trip.rs`
+  parses a fixture, mounts it over FUSE the way the daemon does, and asserts
+  what `read(2)` and `stat(2)` return: a leaf's bytes equal the graph's
+  `read_content` and the source token, and the source file's entry carries
+  the file's own mtime (proven red by stamping the parse time instead). It
+  runs in the `ci` chain as `cli-lib:test:mount`; the `cli-lib/mount`
+  `ships-untested` ledger row is gone. What the test established about the
+  presentation, now written down: a source file is a DIRECTORY of its syntax
+  nodes and the leaves are the files, so no entry serves a source file's
+  whole bytes, and FUSE reports the file row's size as 4096 like any
+  directory — `nodes.size` on that row (#381, `ley-line-open-ca51fa`) never
+  reaches a `stat` through the mount; only its mtime does.
+
 ### Changed
 
 - **The mutation slices run as a matrix, and `task ci` gets a ceiling sized
@@ -119,6 +137,15 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **A FUSE mount could not mount on a stock Linux** (bead
+  `ley-line-open-aed167`). `mount_fuse` passed `auto_unmount`, which libfuse 2
+  implements by having `fusermount` add `allow_other` — refused unless
+  `/etc/fuse.conf` sets `user_allow_other`, so `leyline serve --backend fuse`
+  failed with "option allow_other only allowed if 'user_allow_other' is set"
+  before serving a byte. Found the first time the mount ran under a test, on
+  the CI runner (libfuse 2.9.9 from `deps:ci`). The option is gone; the
+  session handle `mount_fuse` returns already unmounts on drop, which is the
+  lifetime the daemon and the test both hold it for.
 - **A mounted arena reported every file as 0 bytes at one timestamp** (bead
   `ley-line-open-ca51fa`, P0). `fuse.rs` serves `nodes.size` as `st_size`
   and `nodes.mtime` as all four timestamps, and neither column was populated

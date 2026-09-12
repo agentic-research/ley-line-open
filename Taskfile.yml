@@ -1554,6 +1554,7 @@ tasks:
       - task: cli-lib:test:cdc-activation
       - task: cli-lib:test:vec
       - task: cli-lib:test:text-search
+      - task: cli-lib:test:mount
       - task: tier:isolation
       - task: check:all-features
       - task: test

@@ -470,6 +470,53 @@ mod tests {
     }
 
     #[test]
+    fn tree_sitter_pass_run_parses_the_tree_and_forwards_the_scope() {
+        // The base pass is `parse_into_conn` behind the trait. Nothing
+        // observed that it actually ran: a `run` stubbed to
+        // `Ok(Default::default())` survived the cli mutation slice on the
+        // projection-v6 PR (bead ley-line-open-8f37c4). Pin both halves of
+        // its contract — the parse lands in the connection, and the stats
+        // report what was parsed — plus the scope forwarding that lazy
+        // enrichment relies on.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("main.go"),
+            b"package main\n\nfunc main() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("util.go"),
+            b"package main\n\nfunc add(a, b int) int { return a + b }\n",
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+
+        let stats = TreeSitterPass.run(&conn, dir.path(), None).unwrap();
+        assert_eq!(stats.pass_name, "tree-sitter");
+        assert_eq!(stats.files_processed, 2, "a cold run parses every file");
+        assert_eq!(stats.items_added, 2);
+        let sources: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _source", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sources, 2, "the parse must land in the connection");
+
+        // Scoped: only the named file is reparsed, so a stub that ignores
+        // `changed_files` (or one that never parses) reports the wrong count.
+        std::fs::write(
+            dir.path().join("util.go"),
+            b"package main\n\nfunc add(a, b int) int { return b + a }\n",
+        )
+        .unwrap();
+        let scoped = TreeSitterPass
+            .run(&conn, dir.path(), Some(&["util.go".to_string()]))
+            .unwrap();
+        assert_eq!(
+            scoped.files_processed, 1,
+            "the scope is forwarded to the parse"
+        );
+    }
+
+    #[test]
     fn tree_sitter_pass_trait_metadata_pin() {
         // The base TreeSitterPass advertises name="tree-sitter" — the
         // string EmbeddingPass + LspEnrichmentPass.depends_on cite.

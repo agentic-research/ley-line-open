@@ -160,6 +160,29 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **A splice wiped every other file in the arena** (bead
+  `ley-line-open-2b6444`). `reproject` cleared `nodes`, `_ast` and `_source`
+  for the whole arena before re-projecting the one edited file, and reached
+  users through the shipped `leyline splice` command (and every mount write,
+  once `splice` ships). It now removes only that file's rows, through the
+  one owner below, re-projects into the file's existing nid range, and keeps
+  the daemon's `_source` shape (the absolute `path` carried across, a fresh
+  `content_hash`). Proven on a two-file arena parsed by the real parser.
+- **A mount `rm` or `mv` moved or dropped `nodes` alone** (bead
+  `ley-line-open-af3817`). `_ast`, `node_refs`, `node_defs`, `_lsp*`,
+  `_ast_blob`, `_source` and `_imports` kept pointing at the dead or old nid
+  range, so a renamed file's joins went empty and a removed file kept
+  answering definitions. Both now go through `leyline_schema`'s
+  `delete_file_rows` / `move_file_rows`, and a directory rename rewrites the
+  rel-path columns of every file beneath it.
+- **"A file's rows" has one owner**: `leyline_schema::FILE_KEYED_TABLES`
+  lists every table keyed by a file and how (nid range with its extra nid
+  columns, `file_id`, or rel-path column); `delete_file_rows`,
+  `delete_file_rows_by_id`, `move_file_rows` and
+  `refresh_source_paths_under_dir` iterate it. `leyline_ts::schema::
+  delete_file_rows` delegates; its private LSP-table list and the
+  `_ast_blob` probe are gone. Every crate above reaches the owner without a
+  feature flag, which is what the mount lacked.
 - **A FUSE mount could not mount on a stock Linux** (bead
   `ley-line-open-aed167`). `mount_fuse` passed `auto_unmount`, which libfuse 2
   implements by having `fusermount` add `allow_other` — refused unless

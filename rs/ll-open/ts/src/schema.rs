@@ -974,102 +974,13 @@ pub fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
 /// accumulate at registry-repo scale across file churn). If LSP has
 /// never run, the tables don't exist and we skip.
 pub fn delete_file_rows(conn: &Connection, path: &str) -> Result<()> {
-    // projection-v5: node-level rows are scoped by the file's nid range — a
-    // PRIMARY KEY (or `nid`-index) range SEARCH, replacing the pre-v5
-    // prefix-LIKE that planned as a SCAN and could over-match on an
-    // unanchored prefix. A path the arena never interned owns no node rows,
-    // so only the file-level TEXT-keyed tables need touching in that case.
-    if let Some(file_id) = leyline_schema::lookup_file_id(conn, path)? {
-        let (lo, hi) = leyline_schema::file_nid_range(file_id);
-        conn.execute(
-            "DELETE FROM nodes WHERE nid BETWEEN ?1 AND ?2",
-            params![lo, hi],
-        )?;
-        conn.execute(
-            "DELETE FROM _ast WHERE nid BETWEEN ?1 AND ?2",
-            params![lo, hi],
-        )?;
-        conn.execute(
-            "DELETE FROM node_refs WHERE nid BETWEEN ?1 AND ?2",
-            params![lo, hi],
-        )?;
-        conn.execute(
-            "DELETE FROM node_defs WHERE nid BETWEEN ?1 AND ?2",
-            params![lo, hi],
-        )?;
-        // ADR-0026 pointer store (Phase 1 dual-write, bead
-        // `ley-line-open-3e87ad`). Skip cleanly when the tables don't exist —
-        // the pointer store is additive.
-        if pointer_store_present(conn) {
-            conn.execute("DELETE FROM _ast_blob WHERE file_id = ?1", [file_id])?;
-            // capnp_blobs is keyed on blob_hash (content-addressed). Orphaned
-            // blobs are ignored here — a Phase 2/3 GC sweep collects blobs no
-            // `_ast_blob` row references; reparse recreates via INSERT OR
-            // IGNORE, so nothing accumulates per file.
-        }
-        delete_lsp_rows_for_file(conn, lo, hi)?;
-        // The `files` interning row is deliberately NOT deleted: file_id
-        // assignment is append-only, so a re-created path re-binds to its
-        // old id and a dead id is never reused by an unrelated file.
-    }
-    conn.execute("DELETE FROM _source WHERE id = ?1", [path])?;
-    conn.execute("DELETE FROM _imports WHERE source_id = ?1", [path])?;
-    // ADR-0028 source_blobs (Phase 1 dual-store, bead `ley-line-open-9e4416`).
-    // Content-addressed — same orphan discipline as capnp_blobs.
-    Ok(())
-}
-
-/// True when the pointer-store tables (`_ast_blob`) exist on this
-/// connection. Additive-schema guard for `delete_file_rows`: older
-/// databases predate the pointer store, and legacy paths that call
-/// `delete_file_rows` without first running `create_pointer_store_tables`
-/// must not error on the missing table.
-fn pointer_store_present(conn: &Connection) -> bool {
-    conn.query_row(
-        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='_ast_blob'",
-        [],
-        |r| r.get::<_, bool>(0),
-    )
-    .unwrap_or(false)
-}
-
-/// Delete `_lsp*` rows in the deleted file's nid range. Tables created by
-/// leyline-lsp's `create_lsp_schema` are optional; we discover their
-/// presence via `sqlite_master` and skip missing ones so callers that never
-/// enabled LSP enrichment pay nothing.
-///
-/// projection-v5: the `_lsp*` tables carry NO file column — file scoping
-/// was prefix-LIKE on the path-shaped `node_id` and is now a range
-/// predicate on the integer `nid`, with no new column (bead
-/// `ley-line-open-17c271`).
-///
-/// Without this cleanup, `_lsp*` rows accumulate at registry scale as
-/// files churn — every file deleted+reparsed leaves the prior LSP
-/// enrichment as orphans keyed by nids that no longer resolve.
-fn delete_lsp_rows_for_file(conn: &Connection, lo: i64, hi: i64) -> Result<()> {
-    // Feature-gated tables — skip cleanly when absent.
-    const LSP_TABLES: &[&str] = &[
-        "_lsp",
-        "_lsp_defs",
-        "_lsp_refs",
-        "_lsp_hover",
-        "_lsp_completions",
-    ];
-    for table in LSP_TABLES {
-        let exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name=?1",
-                [table],
-                |r| r.get(0),
-            )
-            .unwrap_or(false);
-        if !exists {
-            continue;
-        }
-        let sql = format!("DELETE FROM {table} WHERE nid BETWEEN ?1 AND ?2");
-        conn.execute(&sql, params![lo, hi])?;
-    }
-    Ok(())
+    // The table list and the operation live in `leyline_schema`
+    // (`FILE_KEYED_TABLES`), which every crate above can reach without a
+    // feature flag — the mount's `rm`/`mv` and `reproject` used to keep
+    // their own shorter lists (beads `ley-line-open-af3817`, `2b6444`).
+    // Content-addressed stores (`capnp_blobs`, `source_blobs`) are not
+    // per-file and are left to the GC sweep, as before.
+    leyline_schema::delete_file_rows(conn, path)
 }
 
 /// Remove directory nodes (negative nids) that have no remaining children,
@@ -1987,7 +1898,7 @@ mod tests {
         create_ast_schema(&conn).unwrap();
 
         assert!(
-            !pointer_store_present(&conn),
+            !leyline_schema::table_exists(&conn, "_ast_blob").unwrap(),
             "precondition: the pointer store does not exist yet"
         );
 
@@ -2008,10 +1919,10 @@ mod tests {
             "_ast_blob keys on the interned file_id as of projection-v5"
         );
         assert!(
-            pointer_store_present(&conn),
-            "pointer_store_present MUST report the store it just built; a \
-             constant-false gates the per-file delete in delete_file_rows off \
-             and leaks a stale _ast_blob row on every reparse"
+            leyline_schema::table_exists(&conn, "_ast_blob").unwrap(),
+            "the probe delete_file_rows keys the _ast_blob delete on MUST \
+             report the store just built; a constant-false gates that delete \
+             off and leaks a stale _ast_blob row on every reparse"
         );
 
         // Second call must be a no-op.

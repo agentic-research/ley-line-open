@@ -4,7 +4,7 @@
 //! handles the byte-level splicing back into the original source.
 
 use anyhow::{Context, Result, bail};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use tree_sitter::{Language, Parser};
 
 use crate::project::project_ast_with_source;
@@ -123,13 +123,34 @@ pub fn reproject(
     conn.execute_batch("BEGIN")?;
 
     let result = (|| -> Result<()> {
-        // Clear existing data
-        conn.execute("DELETE FROM nodes", [])?;
-        conn.execute("DELETE FROM _ast", [])?;
-        conn.execute("DELETE FROM _source", [])?;
+        // Clear THIS file's rows — every table that carries them, through the
+        // one owner. This used to be three table-wide DELETEs, which wiped
+        // every other file in the arena on each splice and reached users
+        // through `leyline splice` (bead `ley-line-open-2b6444`).
+        //
+        // The daemon's `_source` row carries the absolute `path` and the
+        // BLAKE3 `content_hash` of the file bytes; the single-file projector
+        // below writes the ts shape (`content`) instead, so carry the path
+        // across and re-derive the hash from the bytes just projected.
+        let abs_path: Option<String> = conn
+            .query_row("SELECT path FROM _source WHERE id = ?1", [source_id], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .flatten();
+        leyline_schema::delete_file_rows(conn, source_id)?;
 
-        // Re-project from scratch
+        // Re-project this file from the spliced bytes.
         project_ast_with_source(new_source, language, conn, source_id, language_name)?;
+
+        let content_hash: [u8; 32] = {
+            use leyline_core::substrate::ContentAddressed;
+            *new_source.hash().as_bytes()
+        };
+        conn.execute(
+            "UPDATE _source SET path = ?1, content_hash = ?2 WHERE id = ?3",
+            rusqlite::params![abs_path, content_hash.as_slice(), source_id],
+        )?;
 
         Ok(())
     })();
@@ -326,6 +347,77 @@ mod tests {
         let conn = setup_html(b"<p>Hello</p>");
         let result = splice(&conn, nid_of(&conn, "test.html/element/text"), "").unwrap();
         assert_eq!(result, b"<p></p>");
+    }
+
+    #[cfg(feature = "html")]
+    #[test]
+    fn reproject_touches_only_the_spliced_file() {
+        // reproject used to run DELETE FROM nodes / _ast / _source for the
+        // WHOLE arena before re-projecting one file, so any splice wiped
+        // every other file (bead ley-line-open-2b6444). Every splice test
+        // seeded a single file, which is why nothing saw it.
+        let conn = Connection::open_in_memory().unwrap();
+        let html = crate::languages::TsLanguage::Html;
+        for (rel, src) in [
+            ("a.html", b"<p>alpha</p>".as_slice()),
+            ("b.html", b"<p>beta</p>".as_slice()),
+        ] {
+            project_ast_with_source(src, html.ts_language(), &conn, rel, "html").unwrap();
+        }
+        let count = |table: &str, rel: &str| -> i64 {
+            let file_id = crate::schema::lookup_file_id(&conn, rel).unwrap().unwrap();
+            let (lo, hi) = crate::schema::file_nid_range(file_id);
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE nid BETWEEN ?1 AND ?2"),
+                rusqlite::params![lo, hi],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let b_nodes = count("nodes", "b.html");
+        let b_ast = count("_ast", "b.html");
+        assert!(b_ast > 0, "fixture must project b.html");
+        let a_file_id = crate::schema::lookup_file_id(&conn, "a.html")
+            .unwrap()
+            .unwrap();
+
+        splice_and_reproject(&conn, nid_of(&conn, "a.html/element/text"), "ALPHA").unwrap();
+
+        assert_eq!(
+            count("nodes", "b.html"),
+            b_nodes,
+            "b.html's nodes must survive a's splice"
+        );
+        assert_eq!(
+            count("_ast", "b.html"),
+            b_ast,
+            "b.html's _ast must survive a's splice"
+        );
+        let b_source: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _source WHERE id = 'b.html'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(b_source, 1, "b.html's _source row must survive a's splice");
+        assert_eq!(
+            crate::schema::lookup_file_id(&conn, "a.html").unwrap(),
+            Some(a_file_id),
+            "the spliced file keeps its file_id, so its nid range is stable"
+        );
+        assert!(
+            count("_ast", "a.html") > 0,
+            "a.html is re-projected into its own range"
+        );
+        let text: String = conn
+            .query_row(
+                "SELECT record FROM nodes WHERE nid = ?1",
+                [nid_of(&conn, "a.html/element/text")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(text, "ALPHA");
     }
 
     #[cfg(feature = "html")]

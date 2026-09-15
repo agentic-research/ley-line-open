@@ -429,27 +429,35 @@ impl EnrichmentPass for LspEnrichmentPass {
     }
 }
 
+/// Whether a scope of `scope_len` rel paths fits one `WHERE id IN (...)`
+/// statement: one bound parameter per path, against the ceiling the whole
+/// workspace shares (`leyline_schema::SQLITE_MAX_BOUND_PARAMS`). This file
+/// used to carry its own ceiling of 999 — the pre-3.32 SQLite default —
+/// which sent every 1 000-to-32 766-file scope down the full-scan fallback
+/// for no reason (bead `ley-line-open-35fc5e`).
+fn in_clause_fits(scope_len: usize) -> bool {
+    scope_len <= leyline_schema::SQLITE_MAX_BOUND_PARAMS
+}
+
 /// Collect files to enrich from the _source table.
 ///
 /// Scoped runs use a single `WHERE id IN (?, ?, ...)` query rather
 /// than N+1 individual lookups: at registry-repo scale (typical dirty
 /// set 1-10 files in a 50k-row _source table) the loop-and-query
-/// approach paid round-trip cost per file. Above SQLITE_VAR_LIMIT=999
-/// we fall back to an in-memory filter — chunking would require
+/// approach paid round-trip cost per file. Above the bound-parameter
+/// ceiling we fall back to an in-memory filter — chunking would require
 /// multiple round-trips for marginal gain at that scope size.
 fn collect_enrichment_targets(
     conn: &Connection,
     changed_files: Option<&[String]>,
 ) -> Result<Vec<(String, String)>> {
-    const SQLITE_VAR_LIMIT: usize = 999;
-
     match changed_files {
         // Empty scope → no files to enrich (avoid building "WHERE id IN ()"
         // which is a SQL syntax error).
         Some([]) => Ok(Vec::new()),
 
         // Small scope → push into IN clause; SQLite uses _source.id PK.
-        Some(rels) if rels.len() <= SQLITE_VAR_LIMIT => {
+        Some(rels) if in_clause_fits(rels.len()) => {
             let placeholders: Vec<&str> = rels.iter().map(|_| "?").collect();
             let sql = format!(
                 "SELECT id, language FROM _source WHERE id IN ({})",
@@ -466,8 +474,9 @@ fn collect_enrichment_targets(
         }
 
         // Huge scope → full scan + in-memory filter. Rare; typical dirty
-        // sets are 1-10 files. Above 999 we'd need to chunk the IN clause,
-        // which buys nothing over a single full scan + HashSet at this size.
+        // sets are 1-10 files. Above the ceiling we'd need to chunk the IN
+        // clause, which buys nothing over a single full scan + HashSet at
+        // this size.
         Some(rels) => {
             let scope: std::collections::HashSet<&str> = rels.iter().map(String::as_str).collect();
             let mut stmt = conn.prepare("SELECT id, language FROM _source")?;
@@ -744,6 +753,17 @@ mod tests {
     /// Pin the per-language composition for the three load-bearing
     /// languages (rust, go, python) so a refactor that drops the
     /// dynamic computation surfaces here.
+    #[test]
+    fn scoped_enrichment_uses_the_in_clause_up_to_the_shared_ceiling() {
+        // The IN-clause path is chosen against the workspace ceiling, not a
+        // private one: 1 500 files used to take the full-scan fallback
+        // because this file said 999 (bead ley-line-open-35fc5e).
+        assert!(in_clause_fits(1));
+        assert!(in_clause_fits(1_500));
+        assert!(in_clause_fits(leyline_schema::SQLITE_MAX_BOUND_PARAMS));
+        assert!(!in_clause_fits(leyline_schema::SQLITE_MAX_BOUND_PARAMS + 1));
+    }
+
     #[test]
     fn pass_file_timeout_exceeds_readiness_wait_per_language() {
         for lang in ["rust", "go", "python", "typescript", "java", "zig"] {

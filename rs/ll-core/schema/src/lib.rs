@@ -54,6 +54,17 @@ pub const NID_ORDINAL_BITS: u32 = 24;
 /// than let ordinals bleed into the next file's range.
 pub const NID_ORDINAL_MASK: i64 = (1 << NID_ORDINAL_BITS) - 1;
 
+/// SQLite's bound-parameter ceiling (`SQLITE_MAX_VARIABLE_NUMBER`, 32766
+/// since 3.32; the bundled build keeps that default). Exceeding it is a
+/// RUNTIME error ("too many SQL variables"), so neither the compiler nor
+/// review catches it. One definition, here, for every crate that sizes an
+/// `IN (...)` list or a multi-row INSERT: it used to be two constants with
+/// two values (32 766 in cmd_parse, 999 in lsp_pass), and the smaller one
+/// sent every 1 000-to-32 766-file enrichment scope down a full-scan
+/// fallback for no reason (bead `ley-line-open-35fc5e`). The test below
+/// pins it against the SQLite this workspace actually links.
+pub const SQLITE_MAX_BOUND_PARAMS: usize = 32_766;
+
 /// The nid of `ordinal` within `file_id`'s range. `ordinal` 0 is the file's
 /// own node (the AST root).
 #[inline]
@@ -647,6 +658,29 @@ mod tests {
     }
 
     // ── nid scheme ─────────────────────────────────────────────────────
+
+    #[test]
+    fn bound_param_ceiling_is_the_linked_sqlite_s_ceiling() {
+        // The constant is only true of the SQLite this workspace links. Prove
+        // it against that library, not against a comment: a statement with
+        // exactly SQLITE_MAX_BOUND_PARAMS placeholders prepares, one more is
+        // refused with "too many SQL variables". A bumped or down-tuned
+        // bundled build moves this test, which is the point.
+        let conn = mem();
+        let sql = |n: usize| {
+            let marks = std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",");
+            format!("SELECT 1 WHERE 1 IN ({marks})")
+        };
+        conn.prepare(&sql(SQLITE_MAX_BOUND_PARAMS))
+            .expect("SQLITE_MAX_BOUND_PARAMS placeholders must prepare");
+        let err = conn
+            .prepare(&sql(SQLITE_MAX_BOUND_PARAMS + 1))
+            .expect_err("one placeholder past the ceiling must be refused");
+        assert!(
+            err.to_string().contains("too many SQL variables"),
+            "unexpected refusal: {err}"
+        );
+    }
 
     #[test]
     fn nid_scheme_round_trips_and_partitions() {

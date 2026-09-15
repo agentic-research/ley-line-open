@@ -1091,14 +1091,13 @@ impl Graph for SqliteGraphAdapter {
             // Sort by start_byte DESC (bottom-up: splice later offsets first)
             group.sort_by_key(|a| std::cmp::Reverse(a.start_byte));
 
-            // Read original source
-            let source: Vec<u8> = conn
-                .query_row(
-                    "SELECT content FROM _source WHERE id = ?1",
-                    [&source_id],
-                    |r| r.get(0),
-                )
+            // Read original source through the one reader that knows where
+            // this arena keeps a file's bytes — `_source.content` is NULL on
+            // every daemon-parsed arena, so reading it here failed on exactly
+            // the arenas a mount serves (bead `ley-line-open-af4539`).
+            let file_id = leyline_schema::lookup_file_id(conn, &source_id)?
                 .with_context(|| format!("source '{source_id}' not found"))?;
+            let source = leyline_ts::splice::source_bytes(conn, file_id)?;
 
             // Apply splices bottom-up, tracking each edit's post-splice byte range
             struct SpliceRange {

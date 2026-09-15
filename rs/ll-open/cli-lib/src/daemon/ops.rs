@@ -328,11 +328,38 @@ const NID_FOR_FILE: &str = "nid BETWEEN ?1 AND ?2";
 /// The nid range of `file` (a rel path), or `None` when the arena has never
 /// interned it — in which case it owns no rows and per-file queries answer
 /// empty.
-fn file_range_params(conn: &Connection, file: &str) -> Option<(i64, i64)> {
-    leyline_ts::schema::lookup_file_id(conn, file)
-        .ok()
-        .flatten()
-        .map(leyline_ts::schema::file_nid_range)
+fn file_range_params(conn: &Connection, file: &str) -> Result<Option<(i64, i64)>> {
+    // A lookup that cannot run is an error, not "the file owns no rows" —
+    // folding it into `None` made a broken connection indistinguishable from
+    // an unknown file (bead `ley-line-open-af4539`).
+    Ok(leyline_ts::schema::lookup_file_id(conn, file)?.map(leyline_ts::schema::file_nid_range))
+}
+
+/// Turn the file key a client sent — a `file://` URI, an absolute path, or a
+/// rel path — into the rel path the projection keys on (`_source.id`,
+/// `files` via `lookup_file_id`, the lazy-enrich scope). One owner for the
+/// three shapes (bead `ley-line-open-af4539`): the scheme is stripped here,
+/// an absolute path is made relative to the tracked source root, and an
+/// absolute path outside that root — or with no root to relate it to — is
+/// an error the caller can report, not an empty answer.
+fn resolve_file_key(source_dir: Option<&Path>, key: &str) -> Result<String> {
+    let path = normalize_file_uri(key);
+    if !Path::new(path).is_absolute() {
+        return Ok(path.to_string());
+    }
+    let Some(root) = source_dir else {
+        anyhow::bail!(
+            "file key {key:?} is an absolute path but this daemon tracks no source root; \
+             pass a path relative to the arena"
+        );
+    };
+    let rel = Path::new(path).strip_prefix(root).with_context(|| {
+        format!(
+            "file key {key:?} is outside the tracked source root {}",
+            root.display()
+        )
+    })?;
+    Ok(rel.to_string_lossy().into_owned())
 }
 
 /// Helper for `_lsp_defs` / `_lsp_refs` queries. Both share the
@@ -630,15 +657,8 @@ fn op_reparse(
             .cloned();
         match project_root {
             Some(root) => {
-                let rel = source_path
-                    .strip_prefix(&root)
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| {
-                        source_path
-                            .file_name()
-                            .map(|f| f.to_string_lossy().to_string())
-                            .unwrap_or_default()
-                    });
+                // `starts_with` above guarantees the resolver succeeds.
+                let rel = resolve_file_key(Some(&root), &source_arg)?;
                 (root, Some(vec![rel]))
             }
             None => {
@@ -1455,7 +1475,7 @@ fn find_node_at_position(
     line: u32,
     col: u32,
 ) -> Result<Option<i64>> {
-    let Some((lo, hi)) = file_range_params(conn, file) else {
+    let Some((lo, hi)) = file_range_params(conn, file)? else {
         return Ok(None);
     };
     // Find the most specific (smallest range) AST node containing this position.
@@ -1578,7 +1598,7 @@ pub(crate) fn query_node_record(conn: &Connection, id: &str) -> Result<Option<St
 /// `try_enrich_file` from within a `with_live_db` closure, causing a
 /// self-deadlock on `parking_lot::Mutex<Connection>` (which doesn't
 /// support reentrant locking).
-fn needs_enrich(conn: &Connection, file: &str) -> bool {
+fn needs_enrich(conn: &Connection, file: &str) -> Result<bool> {
     // _lsp table absent ⟹ definitely needs enrich.
     let table_exists: bool = conn
         .query_row(
@@ -1589,12 +1609,14 @@ fn needs_enrich(conn: &Connection, file: &str) -> bool {
         .unwrap_or(false);
 
     if !table_exists {
-        return true;
+        return Ok(true);
     }
 
-    // _lsp present, check if file has any rows.
-    let Some((lo, hi)) = file_range_params(conn, file) else {
-        return true;
+    // _lsp present, check if file has any rows. A lookup that cannot run
+    // propagates: answering "needs enrich" on a broken connection would fire
+    // re-enrichment as the not-enriched signal (bead `ley-line-open-af4539`).
+    let Some((lo, hi)) = file_range_params(conn, file)? else {
+        return Ok(true);
     };
     let has_data: bool = conn
         .query_row(
@@ -1604,7 +1626,7 @@ fn needs_enrich(conn: &Connection, file: &str) -> bool {
         )
         .unwrap_or(false);
 
-    !has_data
+    Ok(!has_data)
 }
 
 /// Queue lazy LSP enrichment for a single file on a background task.
@@ -1718,7 +1740,7 @@ fn try_enrich_file(ctx: &std::sync::Arc<DaemonContext>, file: &str) -> bool {
 
 /// Hover info at a position. Auto-enriches if no data exists.
 fn op_lsp_hover(ctx: &std::sync::Arc<DaemonContext>, args: &LspPosition) -> Result<String> {
-    let file = normalize_file_uri(&args.file).to_string();
+    let file = resolve_file_key(ctx.source_dir.as_deref(), &args.file)?;
     let line = args.line;
     let col = args.col;
     let (result, enriched) = with_lazy_enrich_retry(
@@ -1778,7 +1800,7 @@ where
 
     // Step 1: read-only check whether enrichment is needed. Lock held only
     // for the check, not for the enrichment work.
-    let needs = ctx.with_read(|conn| Ok(needs_enrich(conn, file)))?;
+    let needs = ctx.with_read(|conn| needs_enrich(conn, file))?;
     if !needs {
         // _lsp data exists for this file; the empty-result is real, not
         // a missing-enrichment artifact. Return as-is.
@@ -1849,7 +1871,7 @@ fn op_lsp_position(
     col_prefix: &str,
     json_key: &str,
 ) -> Result<String> {
-    let file = normalize_file_uri(&args.file).to_string();
+    let file = resolve_file_key(ctx.source_dir.as_deref(), &args.file)?;
     let line = args.line;
     let col = args.col;
     let (rows, enriched) = with_lazy_enrich_retry(
@@ -1909,7 +1931,7 @@ where
     }
     // A file the arena never interned owns no nid range — same "not
     // enriched yet" empty answer as a missing table.
-    let Some((lo, hi)) = file_range_params(conn, file) else {
+    let Some((lo, hi)) = file_range_params(conn, file)? else {
         return Ok(vec![]);
     };
     let mut stmt = conn.prepare_cached(sql)?;
@@ -1933,7 +1955,8 @@ where
 
 /// Document symbols for a file.
 fn op_lsp_symbols(ctx: &DaemonContext, args: &LspFile) -> Result<String> {
-    let file = normalize_file_uri(&args.file);
+    let file_rel = resolve_file_key(ctx.source_dir.as_deref(), &args.file)?;
+    let file = file_rel.as_str();
     let sql = format!(
         "SELECT nid, symbol_kind, detail, start_line, start_col, end_line, end_col \
          FROM _lsp WHERE {NID_FOR_FILE}"
@@ -1956,7 +1979,8 @@ fn op_lsp_symbols(ctx: &DaemonContext, args: &LspFile) -> Result<String> {
 
 /// Diagnostics for a file.
 fn op_lsp_diagnostics(ctx: &DaemonContext, args: &LspFile) -> Result<String> {
-    let file = normalize_file_uri(&args.file);
+    let file_rel = resolve_file_key(ctx.source_dir.as_deref(), &args.file)?;
+    let file = file_rel.as_str();
     let sql = format!(
         "SELECT nid, diagnostics, start_line, start_col, end_line, end_col \
          FROM _lsp WHERE {NID_FOR_FILE} \
@@ -2749,7 +2773,7 @@ fn classify_node_kind(node_kind: &str) -> &'static str {
 /// shape is intentional: a position without a definition is a
 /// legitimate query result, not an error.
 fn op_at_position(ctx: &std::sync::Arc<DaemonContext>, p: &LspPosition) -> Result<String> {
-    let file = normalize_file_uri(&p.file).to_string();
+    let file = resolve_file_key(ctx.source_dir.as_deref(), &p.file)?;
     let line = p.line;
     let col = p.col;
     ctx.with_read(|conn| {
@@ -2758,7 +2782,7 @@ fn op_at_position(ctx: &std::sync::Arc<DaemonContext>, p: &LspPosition) -> Resul
         // skipping the intermediate node_id resolution step that
         // `find_node_at_position` (the LSP-hover internal helper)
         // would otherwise force.
-        let Some((lo, hi)) = file_range_params(conn, &file) else {
+        let Some((lo, hi)) = file_range_params(conn, &file)? else {
             return Ok(json!({
                 "ok": true,
                 "symbol_id": serde_json::Value::Null,
@@ -3467,6 +3491,38 @@ mod tests {
     // ── Helper unit tests ───────────────────────────────────────────────
 
     #[test]
+    fn resolve_file_key_maps_every_shape_onto_the_rel_path() {
+        // The three shapes a client sends resolve to the one key the
+        // projection uses (bead ley-line-open-af4539). A file:///abs/path
+        // used to be scheme-stripped and fed to the rel-path lookup, so it
+        // answered empty.
+        let root = Path::new("/repo/root");
+        assert_eq!(
+            resolve_file_key(Some(root), "src/lib.rs").unwrap(),
+            "src/lib.rs"
+        );
+        assert_eq!(
+            resolve_file_key(Some(root), "/repo/root/src/lib.rs").unwrap(),
+            "src/lib.rs"
+        );
+        assert_eq!(
+            resolve_file_key(Some(root), "file:///repo/root/src/lib.rs").unwrap(),
+            "src/lib.rs"
+        );
+        // Outside the root, or with no root: an error a caller can report,
+        // never an empty answer.
+        let err = resolve_file_key(Some(root), "file:///elsewhere/x.rs").unwrap_err();
+        assert!(
+            err.to_string().contains("outside the tracked source root"),
+            "{err}"
+        );
+        let err = resolve_file_key(None, "/repo/root/src/lib.rs").unwrap_err();
+        assert!(err.to_string().contains("tracks no source root"), "{err}");
+        // Relative keys never need a root.
+        assert_eq!(resolve_file_key(None, "src/lib.rs").unwrap(), "src/lib.rs");
+    }
+
+    #[test]
     fn normalize_file_uri_strips_prefix() {
         assert_eq!(normalize_file_uri("file:///abs/foo.rs"), "/abs/foo.rs");
     }
@@ -3893,6 +3949,19 @@ mod tests {
     fn setup_with_ext(
         ext: Arc<dyn crate::daemon::DaemonExt>,
     ) -> (TempDir, std::sync::Arc<DaemonContext>) {
+        setup_full(ext, false)
+    }
+
+    /// A context whose `source_dir` is the temp dir itself, so absolute
+    /// and `file://` keys under it resolve to arena-relative paths.
+    fn setup_rooted() -> (TempDir, std::sync::Arc<DaemonContext>) {
+        setup_full(Arc::new(crate::daemon::NoExt), true)
+    }
+
+    fn setup_full(
+        ext: Arc<dyn crate::daemon::DaemonExt>,
+        rooted: bool,
+    ) -> (TempDir, std::sync::Arc<DaemonContext>) {
         let dir = TempDir::new().unwrap();
         let arena_path = dir.path().join("test.arena");
         let ctrl_path = dir.path().join("test.ctrl");
@@ -3930,7 +3999,7 @@ mod tests {
             router: crate::daemon::EventRouter::new(16),
             live_db,
             enrich_inflight: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
-            source_dir: None,
+            source_dir: rooted.then(|| dir.path().to_path_buf()),
             lang_filter: None,
             enrichment_passes: vec![],
             state: Arc::new(RwLock::new(crate::daemon::DaemonState::initializing())),
@@ -6846,13 +6915,13 @@ mod tests {
         // means lazy enrichment never fires at all.
         let (conn, _outer, inner) = nested_ast_fixture();
         assert!(
-            needs_enrich(&conn, "src/lib.rs"),
+            needs_enrich(&conn, "src/lib.rs").unwrap(),
             "a missing `_lsp` table must report needs-enrich",
         );
 
         conn.execute_batch(TEST_LSP_DDL).unwrap();
         assert!(
-            needs_enrich(&conn, "src/lib.rs"),
+            needs_enrich(&conn, "src/lib.rs").unwrap(),
             "`_lsp` present but empty for this file must still report \
              needs-enrich",
         );
@@ -6863,14 +6932,14 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !needs_enrich(&conn, "src/lib.rs"),
+            !needs_enrich(&conn, "src/lib.rs").unwrap(),
             "a file with `_lsp` rows in its nid range must NOT report \
              needs-enrich — re-queuing it would re-run the language server \
              on every query",
         );
         // Scoping check: another file's rows don't count as this file's.
         assert!(
-            needs_enrich(&conn, "src/never-seen.rs"),
+            needs_enrich(&conn, "src/never-seen.rs").unwrap(),
             "an un-interned file owns no nid range ⟹ needs-enrich",
         );
     }
@@ -7035,6 +7104,51 @@ mod tests {
         assert!(
             !by_path.contains_key("src/other.rs/function_declaration"),
             "another file's row leaked into the scoped answer: {syms:?}",
+        );
+    }
+
+    /// A `file://<root>/src/lib.rs` key answers the same rows as
+    /// `src/lib.rs` (bead ley-line-open-af4539). Before the resolver the
+    /// scheme was stripped and the still-absolute path fed to the rel-path
+    /// lookup, so every editor-shaped request answered `symbols: []`,
+    /// indistinguishable from an unknown file.
+    #[tokio::test]
+    async fn op_lsp_symbols_answers_a_file_uri_like_the_rel_path() {
+        let (dir, ctx) = setup_rooted();
+        seed_lsp_symbols(&ctx);
+
+        let rows_for = |file: String| -> Vec<serde_json::Value> {
+            let body = op_lsp_symbols(&ctx, &LspFile { file }).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["ok"], json!(true), "got {body}");
+            v["symbols"].as_array().expect("symbols array").clone()
+        };
+        let by_rel = rows_for("src/lib.rs".into());
+        assert_eq!(by_rel.len(), 2, "fixture: {by_rel:?}");
+
+        let abs = dir.path().join("src/lib.rs");
+        let by_uri = rows_for(format!("file://{}", abs.display()));
+        assert_eq!(
+            by_uri, by_rel,
+            "a file:// URI must answer like the rel path"
+        );
+        let by_abs = rows_for(abs.to_string_lossy().into_owned());
+        assert_eq!(
+            by_abs, by_rel,
+            "an absolute path must answer like the rel path"
+        );
+
+        // Outside the root is an error the client sees, not an empty answer.
+        let err = op_lsp_symbols(
+            &ctx,
+            &LspFile {
+                file: "file:///elsewhere/src/lib.rs".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("outside the tracked source root"),
+            "{err}"
         );
     }
 

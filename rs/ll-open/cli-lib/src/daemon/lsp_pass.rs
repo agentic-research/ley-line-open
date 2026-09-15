@@ -439,6 +439,32 @@ fn in_clause_fits(scope_len: usize) -> bool {
     scope_len <= leyline_schema::SQLITE_MAX_BOUND_PARAMS
 }
 
+/// How `collect_enrichment_targets` will read `_source` for a scope. Pure,
+/// so the choice is testable on its own: the IN-clause and scan branches
+/// return the same rows, and only the plan tells them apart — which is
+/// exactly what the mutation gate could not observe while the choice lived
+/// in a match guard.
+#[derive(Debug, PartialEq, Eq)]
+enum TargetPlan {
+    /// `Some([])`: nothing to enrich, and `WHERE id IN ()` is a syntax error.
+    Empty,
+    /// One `WHERE id IN (?, ?, ...)` lookup on the `_source.id` primary key.
+    InClause,
+    /// Scope too wide for one statement: scan `_source` and filter in memory.
+    ScanAndFilter,
+    /// `None`: every file in `_source`.
+    All,
+}
+
+fn enrichment_target_plan(changed_files: Option<&[String]>) -> TargetPlan {
+    match changed_files {
+        Some([]) => TargetPlan::Empty,
+        Some(rels) if in_clause_fits(rels.len()) => TargetPlan::InClause,
+        Some(_) => TargetPlan::ScanAndFilter,
+        None => TargetPlan::All,
+    }
+}
+
 /// Collect files to enrich from the _source table.
 ///
 /// Scoped runs use a single `WHERE id IN (?, ?, ...)` query rather
@@ -451,13 +477,13 @@ fn collect_enrichment_targets(
     conn: &Connection,
     changed_files: Option<&[String]>,
 ) -> Result<Vec<(String, String)>> {
-    match changed_files {
+    match (enrichment_target_plan(changed_files), changed_files) {
         // Empty scope → no files to enrich (avoid building "WHERE id IN ()"
         // which is a SQL syntax error).
-        Some([]) => Ok(Vec::new()),
+        (TargetPlan::Empty, _) => Ok(Vec::new()),
 
         // Small scope → push into IN clause; SQLite uses _source.id PK.
-        Some(rels) if in_clause_fits(rels.len()) => {
+        (TargetPlan::InClause, Some(rels)) => {
             let placeholders: Vec<&str> = rels.iter().map(|_| "?").collect();
             let sql = format!(
                 "SELECT id, language FROM _source WHERE id IN ({})",
@@ -477,7 +503,7 @@ fn collect_enrichment_targets(
         // sets are 1-10 files. Above the ceiling we'd need to chunk the IN
         // clause, which buys nothing over a single full scan + HashSet at
         // this size.
-        Some(rels) => {
+        (TargetPlan::ScanAndFilter, Some(rels)) => {
             let scope: std::collections::HashSet<&str> = rels.iter().map(String::as_str).collect();
             let mut stmt = conn.prepare("SELECT id, language FROM _source")?;
             let rows = stmt.query_map([], |row| {
@@ -494,7 +520,7 @@ fn collect_enrichment_targets(
         }
 
         // No scope → enrich every file in _source.
-        None => {
+        (TargetPlan::All, None) => {
             let mut stmt = conn.prepare("SELECT id, language FROM _source")?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -502,6 +528,14 @@ fn collect_enrichment_targets(
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(Into::into)
         }
+
+        // The plan is a function of `changed_files`, so every other pairing
+        // is unrepresentable; the match is exhaustive over the tuple only to
+        // keep the compiler, not the reader, honest.
+        (plan, scope) => unreachable!(
+            "enrichment_target_plan returned {plan:?} for scope {:?}",
+            scope.map(<[String]>::len)
+        ),
     }
 }
 
@@ -757,11 +791,31 @@ mod tests {
     fn scoped_enrichment_uses_the_in_clause_up_to_the_shared_ceiling() {
         // The IN-clause path is chosen against the workspace ceiling, not a
         // private one: 1 500 files used to take the full-scan fallback
-        // because this file said 999 (bead ley-line-open-35fc5e).
-        assert!(in_clause_fits(1));
-        assert!(in_clause_fits(1_500));
-        assert!(in_clause_fits(leyline_schema::SQLITE_MAX_BOUND_PARAMS));
-        assert!(!in_clause_fits(leyline_schema::SQLITE_MAX_BOUND_PARAMS + 1));
+        // because this file said 999 (bead ley-line-open-35fc5e). The plan
+        // is asserted, not the rows — both branches return the same rows,
+        // so only the plan observes the choice (the mutation gate proved a
+        // guard-only version unobservable: `true`/`false` both survived).
+        let scope = |n: usize| -> Vec<String> { (0..n).map(|i| format!("f{i}.go")).collect() };
+        let ceiling = leyline_schema::SQLITE_MAX_BOUND_PARAMS;
+
+        assert_eq!(enrichment_target_plan(None), TargetPlan::All);
+        assert_eq!(enrichment_target_plan(Some(&[])), TargetPlan::Empty);
+        assert_eq!(
+            enrichment_target_plan(Some(&scope(1))),
+            TargetPlan::InClause
+        );
+        assert_eq!(
+            enrichment_target_plan(Some(&scope(1_500))),
+            TargetPlan::InClause
+        );
+        assert_eq!(
+            enrichment_target_plan(Some(&scope(ceiling))),
+            TargetPlan::InClause
+        );
+        assert_eq!(
+            enrichment_target_plan(Some(&scope(ceiling + 1))),
+            TargetPlan::ScanAndFilter
+        );
     }
 
     #[test]

@@ -183,6 +183,16 @@ context, scoping notes, and review history are recoverable.
   delete_file_rows` delegates; its private LSP-table list and the
   `_ast_blob` probe are gone. Every crate above reaches the owner without a
   feature flag, which is what the mount lacked.
+- **Scoped LSP enrichment took a full `_source` scan for any scope over 999
+  files** (bead `ley-line-open-35fc5e`). `lsp_pass.rs` carried its own
+  bound-parameter ceiling of 999 — the pre-3.32 SQLite default — while
+  `cmd_parse.rs` carried the real one, 32 766; a changed-files scope of
+  1 000 to 32 766 paths therefore abandoned the `WHERE id IN (...)` lookup
+  and filtered a scan of every row in Rust. One constant now lives in
+  `leyline_schema::SQLITE_MAX_BOUND_PARAMS`, both callers use it, and a
+  leyline-schema test pins it against the SQLite the workspace links: that
+  many placeholders prepare, one more is refused with "too many SQL
+  variables". Found by the 2026-09-15 duplication review.
 - **A FUSE mount could not mount on a stock Linux** (bead
   `ley-line-open-aed167`). `mount_fuse` passed `auto_unmount`, which libfuse 2
   implements by having `fusermount` add `allow_other` — refused unless

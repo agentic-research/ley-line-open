@@ -7028,6 +7028,51 @@ mod tests {
         );
     }
 
+    /// End-to-end body of `lsp_hover`: the seeded hover text and the node's
+    /// display path come back under `hover` / `node_id`, for the rel key
+    /// and for the `file://` key alike (bead ley-line-open-af4539). Pins
+    /// the op's output, not just `lsp_hover_query`'s pair.
+    #[tokio::test]
+    async fn op_lsp_hover_returns_the_seeded_hover_for_rel_and_uri_keys() {
+        let (dir, ctx) = setup_rooted();
+        {
+            let live = ctx.live_db.writer.lock();
+            let hit = seed_node(&live, "src/lib.rs", "identifier", (40, 50, 3, 4, 3, 14));
+            live.execute_batch(
+                "CREATE TABLE _lsp_hover (nid INTEGER PRIMARY KEY, hover_text TEXT NOT NULL);",
+            )
+            .unwrap();
+            live.execute(
+                "INSERT INTO _lsp_hover VALUES (?1, 'fn main() -> ()')",
+                rusqlite::params![hit],
+            )
+            .unwrap();
+        }
+
+        let uri = format!("file://{}", dir.path().join("src/lib.rs").display());
+        for file in ["src/lib.rs".to_string(), uri] {
+            let args = LspPosition {
+                file: file.clone(),
+                line: 3,
+                col: 8,
+            };
+            let body = op_lsp_hover(&ctx, &args).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&body)
+                .unwrap_or_else(|e| panic!("op_lsp_hover must emit JSON; got {body:?} ({e})"));
+            assert_eq!(v["ok"], json!(true), "{file}: got {body}");
+            assert_eq!(v["hover"], json!("fn main() -> ()"), "{file}: got {body}");
+            assert_eq!(
+                v["node_id"],
+                json!("src/lib.rs/identifier"),
+                "{file}: got {body}"
+            );
+            assert!(
+                v.get("enriched").is_none(),
+                "{file}: a warm hit must not carry the `enriched` retry marker: {body}",
+            );
+        }
+    }
+
     /// Seed `ctx`'s live db with an `_lsp` table covering two nodes in
     /// `src/lib.rs` (one carrying diagnostics, one not) plus one node in
     /// `src/other.rs` that must stay out of every file-scoped answer.

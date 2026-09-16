@@ -160,6 +160,64 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **`task ci` failed on a machine with a global commit-msg hook** (bead
+  `ley-line-open-d1697b`). The attestation and release-tag fixtures commit
+  in throwaway repos with plain `git commit`, so a global `core.hooksPath`
+  whose commit-msg hook enforces a message policy (rosary installs one)
+  rejected `git commit -m fixture` and the gate died before any Rust ran;
+  the same hook then failed the daemon watcher tests, which commit through
+  a Rust helper. Every committing fixture, shell and Rust, now pins
+  `core.hooksPath` to `/dev/null` for its own git, and a new fixture test
+  runs each of them under a hostile global hook to keep it that way.
+- **A splice wiped every other file in the arena** (bead
+  `ley-line-open-2b6444`). `reproject` cleared `nodes`, `_ast` and `_source`
+  for the whole arena before re-projecting the one edited file, and reached
+  users through the shipped `leyline splice` command (and every mount write,
+  once `splice` ships). It now removes only that file's rows, through the
+  one owner below, re-projects into the file's existing nid range, and keeps
+  the daemon's `_source` shape (the absolute `path` carried across, a fresh
+  `content_hash`). Proven on a two-file arena parsed by the real parser.
+- **A mount `rm` or `mv` moved or dropped `nodes` alone** (bead
+  `ley-line-open-af3817`). `_ast`, `node_refs`, `node_defs`, `_lsp*`,
+  `_ast_blob`, `_source` and `_imports` kept pointing at the dead or old nid
+  range, so a renamed file's joins went empty and a removed file kept
+  answering definitions. Both now go through `leyline_schema`'s
+  `delete_file_rows` / `move_file_rows`, and a directory rename rewrites the
+  rel-path columns of every file beneath it.
+- **"A file's rows" has one owner**: `leyline_schema::FILE_KEYED_TABLES`
+  lists every table keyed by a file and how (nid range with its extra nid
+  columns, `file_id`, or rel-path column); `delete_file_rows`,
+  `delete_file_rows_by_id`, `move_file_rows` and
+  `refresh_source_paths_under_dir` iterate it. `leyline_ts::schema::
+  delete_file_rows` delegates; its private LSP-table list and the
+  `_ast_blob` probe are gone. Every crate above reaches the owner without a
+  feature flag, which is what the mount lacked.
+- **"Which file?" has one resolver and one byte reader** (bead
+  `ley-line-open-af4539`). A daemon LSP request keyed by `file:///abs/path`
+  had only its scheme stripped, so the still-absolute path went to the
+  rel-path lookup and `lsp_symbols` / `lsp_diagnostics` / `lsp_hover` /
+  definitions / references answered empty, indistinguishable from an unknown
+  file. `resolve_file_key` now turns a `file://` URI, an absolute path or a
+  rel path into the arena's rel path (an absolute path outside the tracked
+  root is an error the client sees), every file-keyed op uses it, and the
+  single-file `parse` op derives its scope through it too. A SQL error in the
+  file lookup is now an error, not a "no such file". Separately, a mount
+  write (`batch_splice`) read `_source.content`, which the parser never
+  writes (it stores the bytes in `source_blobs` behind `_source.content_hash`),
+  so every write to a daemon-parsed arena failed with "source not found".
+  `leyline_ts::splice::source_bytes` is the one reader — inline content, then
+  the blob, then the path — and both `splice` and `batch_splice` go through
+  it. Proven on a parser-built arena with the file deleted from disk.
+- **Scoped LSP enrichment took a full `_source` scan for any scope over 999
+  files** (bead `ley-line-open-35fc5e`). `lsp_pass.rs` carried its own
+  bound-parameter ceiling of 999 — the pre-3.32 SQLite default — while
+  `cmd_parse.rs` carried the real one, 32 766; a changed-files scope of
+  1 000 to 32 766 paths therefore abandoned the `WHERE id IN (...)` lookup
+  and filtered a scan of every row in Rust. One constant now lives in
+  `leyline_schema::SQLITE_MAX_BOUND_PARAMS`, both callers use it, and a
+  leyline-schema test pins it against the SQLite the workspace links: that
+  many placeholders prepare, one more is refused with "too many SQL
+  variables". Found by the 2026-09-15 duplication review.
 - **A FUSE mount could not mount on a stock Linux** (bead
   `ley-line-open-aed167`). `mount_fuse` passed `auto_unmount`, which libfuse 2
   implements by having `fusermount` add `allow_other` — refused unless

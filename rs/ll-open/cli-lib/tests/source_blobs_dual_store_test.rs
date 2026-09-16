@@ -408,6 +408,8 @@ fn f_git_git_blob_compat() {
         String::from_utf8(out.stdout).unwrap()
     };
     git(&["init", "-q", "-b", "main"]);
+    // No developer hooks in the fixture (bead ley-line-open-d1697b).
+    git(&["config", "core.hooksPath", "/dev/null"]);
     git(&["add", "main.go"]);
     git(&["commit", "-q", "-m", "seed"]);
 

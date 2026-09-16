@@ -1,6 +1,14 @@
 #!/bin/sh
 set -eu
 
+# The fixture's git runs no developer hooks. A global `core.hooksPath`
+# whose commit-msg hook enforces a message policy rejected
+# `git commit -m fixture` and failed task ci before any Rust ran (bead
+# ley-line-open-d1697b). `pre_push_ci.sh` is invoked directly below, never
+# through git's hook lookup, so this disables nothing the fixture proves.
+GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null
+export GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+
 repo_root=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/leyline-ci-attestation.XXXXXX")
 trap 'rm -rf "$tmp_dir"' 0 1 2 15

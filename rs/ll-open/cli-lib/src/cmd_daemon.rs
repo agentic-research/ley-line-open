@@ -2173,6 +2173,8 @@ mod tests {
                 "user.email=t@t",
                 "-c",
                 "user.name=t",
+                "-c",
+                "core.hooksPath=/dev/null",
                 "commit",
                 "-m",
                 "init",
@@ -2237,6 +2239,8 @@ mod tests {
                 "user.email=t@t",
                 "-c",
                 "user.name=t",
+                "-c",
+                "core.hooksPath=/dev/null",
                 "commit",
                 "-q",
                 "-m",
@@ -2283,6 +2287,8 @@ mod tests {
                 "user.email=t@t",
                 "-c",
                 "user.name=t",
+                "-c",
+                "core.hooksPath=/dev/null",
                 "commit",
                 "--allow-empty",
                 "-q",
@@ -2803,6 +2809,11 @@ mod tests {
         );
         sh(dir.path(), &["git", "config", "user.name", "test"]);
         sh(dir.path(), &["git", "config", "commit.gpgsign", "false"]);
+        // The fixture's git runs no developer hooks (bead ley-line-open-d1697b).
+        sh(
+            dir.path(),
+            &["git", "config", "core.hooksPath", "/dev/null"],
+        );
         std::fs::write(dir.path().join("a.go"), "package m\n\nfunc A() {}\n").unwrap();
         sh(dir.path(), &["git", "add", "."]);
         sh(dir.path(), &["git", "commit", "-q", "-m", "init"]);

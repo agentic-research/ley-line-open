@@ -906,10 +906,13 @@ async fn test_mcp_http_tools_list_and_status_call() {
     //    error. This matches `lsp_defs` / `lsp_refs` behavior on the
     //    same pre-enrichment state. Behavioral asymmetry between op
     //    families was caught + fixed by iter-35 adversarial review.
+    //    The key is arena-relative: this daemon tracks no source root,
+    //    so an absolute path is an error the client sees (bead
+    //    ley-line-open-af4539), not an empty answer.
     let lsp = mcp_post(
         port,
         r#"{"jsonrpc":"2.0","id":4,"method":"tools/call",
-            "params":{"name":"lsp_diagnostics","arguments":{"file":"/tmp/no.rs"}}}"#,
+            "params":{"name":"lsp_diagnostics","arguments":{"file":"no.rs"}}}"#,
     )
     .await;
     assert_eq!(

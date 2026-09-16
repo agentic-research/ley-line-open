@@ -119,6 +119,8 @@ fn synth_repo(size_mb: usize, tmp: &Path) -> PathBuf {
     git(&repo, &["config", "user.email", "test@adr-0029.local"]);
     git(&repo, &["config", "user.name", "adr-0029 baseline"]);
     git(&repo, &["config", "commit.gpgsign", "false"]);
+    // No developer hooks in the fixture (bead ley-line-open-d1697b).
+    git(&repo, &["config", "core.hooksPath", "/dev/null"]);
     // Disable auto-CRLF and other line-ending games — F5w's diff hash
     // depends on byte-exact output.
     git(&repo, &["config", "core.autocrlf", "false"]);
@@ -397,6 +399,8 @@ fn measure_f5w() -> F5wResult {
     git(&repo, &["config", "user.email", "test@adr-0029.local"]);
     git(&repo, &["config", "user.name", "adr-0029 baseline"]);
     git(&repo, &["config", "commit.gpgsign", "false"]);
+    // No developer hooks in the fixture (bead ley-line-open-d1697b).
+    git(&repo, &["config", "core.hooksPath", "/dev/null"]);
     git(&repo, &["config", "core.autocrlf", "false"]);
 
     fs::write(repo.join("src.rs"), F5W_ORIGINAL).unwrap();

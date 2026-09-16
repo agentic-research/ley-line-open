@@ -54,6 +54,17 @@ pub const NID_ORDINAL_BITS: u32 = 24;
 /// than let ordinals bleed into the next file's range.
 pub const NID_ORDINAL_MASK: i64 = (1 << NID_ORDINAL_BITS) - 1;
 
+/// SQLite's bound-parameter ceiling (`SQLITE_MAX_VARIABLE_NUMBER`, 32766
+/// since 3.32; the bundled build keeps that default). Exceeding it is a
+/// RUNTIME error ("too many SQL variables"), so neither the compiler nor
+/// review catches it. One definition, here, for every crate that sizes an
+/// `IN (...)` list or a multi-row INSERT: it used to be two constants with
+/// two values (32 766 in cmd_parse, 999 in lsp_pass), and the smaller one
+/// sent every 1 000-to-32 766-file enrichment scope down a full-scan
+/// fallback for no reason (bead `ley-line-open-35fc5e`). The test below
+/// pins it against the SQLite this workspace actually links.
+pub const SQLITE_MAX_BOUND_PARAMS: usize = 32_766;
+
 /// The nid of `ordinal` within `file_id`'s range. `ordinal` 0 is the file's
 /// own node (the AST root).
 #[inline]
@@ -636,6 +647,275 @@ fn resolve_ast_segment(conn: &Connection, parent_nid: i64, segment: &str) -> Res
     .map_err(Into::into)
 }
 
+// ---------------------------------------------------------------------------
+// File-keyed rows: the one owner of "delete a file's rows" and "move them"
+// ---------------------------------------------------------------------------
+//
+// Three modules used to decide what "a file's rows" are: `leyline-ts`'s
+// `delete_file_rows` knew the full list, `leyline-fs`'s mount `rm`/`mv`
+// touched `nodes` alone (leaving `_ast`, `node_refs`, `node_defs`, `_lsp*`
+// and `_ast_blob` pointing at the dead or old nid range), and `reproject`
+// cleared three tables for the WHOLE arena before re-projecting one file
+// (beads `ley-line-open-af3817`, `ley-line-open-2b6444`). This crate owns
+// the nid encoding, every crate above depends on it without a feature
+// flag, so the list and both operations live here.
+
+/// How a projection table is keyed by a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileKey {
+    /// Rows whose `nid` lies in the file's range. `extra_nid_columns` are
+    /// further nid columns that point into the same file and move with it
+    /// (`parent_nid`, `container_nid`, `referrer_nid`); each is shifted only
+    /// where it lies in the range, because it may also point elsewhere.
+    NidRange {
+        extra_nid_columns: &'static [&'static str],
+    },
+    /// Rows carrying the file's `file_id`.
+    FileId,
+    /// Rows carrying the file's rel path in a TEXT column.
+    SourcePath { column: &'static str },
+}
+
+/// One projection table keyed by a file.
+#[derive(Debug, Clone, Copy)]
+pub struct FileKeyedTable {
+    pub name: &'static str,
+    pub key: FileKey,
+}
+
+const fn keyed(name: &'static str, key: FileKey) -> FileKeyedTable {
+    FileKeyedTable { name, key }
+}
+
+const fn by_nid(name: &'static str, extra_nid_columns: &'static [&'static str]) -> FileKeyedTable {
+    keyed(name, FileKey::NidRange { extra_nid_columns })
+}
+
+/// Every table whose rows belong to a file, with how. The parser, the
+/// mount, the LSP pass and the pointer store all write into this set; a
+/// table missing from it is a row that outlives its file. Which tables
+/// exist depends on which writer built the arena (the single-file
+/// projector creates neither `node_refs` nor `_imports`; the LSP pass and
+/// the pointer store are optional), so every entry is probed and an absent
+/// table is simply one with no rows to touch — the probe's own failure is
+/// still an error.
+pub const FILE_KEYED_TABLES: &[FileKeyedTable] = &[
+    by_nid("nodes", &["parent_nid"]),
+    by_nid("_ast", &[]),
+    by_nid("node_refs", &["container_nid"]),
+    by_nid("node_defs", &["container_nid"]),
+    // ADR-0026 pointer store: additive, older arenas predate it.
+    keyed("_ast_blob", FileKey::FileId),
+    // LSP enrichment tables exist only once the pass has run.
+    by_nid("_lsp", &[]),
+    by_nid("_lsp_defs", &[]),
+    // `_lsp_refs.nid` is the TARGET definition (any file); `referrer_nid`
+    // is the site. Each column is keyed on its own.
+    by_nid("_lsp_refs", &["referrer_nid"]),
+    by_nid("_lsp_hover", &[]),
+    by_nid("_lsp_completions", &[]),
+    keyed("_source", FileKey::SourcePath { column: "id" }),
+    keyed(
+        "_imports",
+        FileKey::SourcePath {
+            column: "source_id",
+        },
+    ),
+    // CFG projection (`cfg` feature): keyed by rel path.
+    keyed(
+        "_cfg",
+        FileKey::SourcePath {
+            column: "source_id",
+        },
+    ),
+];
+
+/// Whether `name` exists as a table on this connection. Returns the
+/// error instead of folding it into `false`: a probe that cannot run is
+/// not evidence of absence, and the callers that want "treat as absent"
+/// say so at the call site.
+pub fn table_exists(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [name],
+        |r| r.get(0),
+    )
+}
+
+/// The tables in [`FILE_KEYED_TABLES`] that exist on `conn`.
+fn present_file_keyed_tables(conn: &Connection) -> Result<Vec<&'static FileKeyedTable>> {
+    let mut out = Vec::with_capacity(FILE_KEYED_TABLES.len());
+    for t in FILE_KEYED_TABLES {
+        if table_exists(conn, t.name)? {
+            out.push(t);
+        }
+    }
+    Ok(out)
+}
+
+/// Delete every row that belongs to the file at `rel_path`, in every table
+/// that carries one. Node-level tables are cleared by nid range (a primary
+/// key range SEARCH); path-keyed tables by the rel path. A path the arena
+/// never interned owns no node rows, so only the path-keyed tables are
+/// touched. The `files` interning row is deliberately kept: file_id
+/// assignment is append-only, so a re-created path re-binds to its old id
+/// and a dead id is never reused by an unrelated file.
+pub fn delete_file_rows(conn: &Connection, rel_path: &str) -> Result<()> {
+    let file_id = lookup_file_id(conn, rel_path)?;
+    delete_file_rows_keyed(conn, file_id, rel_path)
+}
+
+/// [`delete_file_rows`] addressed by `file_id`, for callers that hold a
+/// nid rather than a path (the mount's `rm` of a file or a directory
+/// subtree). The rel path the path-keyed tables need is read from
+/// `_source`, falling back to the tree; a file with neither owns no
+/// path-keyed rows.
+pub fn delete_file_rows_by_id(conn: &Connection, file_id: i64) -> Result<()> {
+    let rel_path = match source_rel_path(conn, file_id)? {
+        Some(p) => Some(p),
+        None => node_path(conn, file_nid(file_id, 0))?,
+    };
+    delete_file_rows_keyed(conn, Some(file_id), rel_path.as_deref().unwrap_or(""))
+}
+
+/// The rel path `_source` records for `file_id`, or `None` when the arena
+/// has no `_source` table (a `nodes`-only mount fixture) or no row.
+fn source_rel_path(conn: &Connection, file_id: i64) -> Result<Option<String>> {
+    if !table_exists(conn, "_source")? {
+        return Ok(None);
+    }
+    Ok(conn
+        .query_row(
+            "SELECT id FROM _source WHERE file_id = ?1",
+            [file_id],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+fn delete_file_rows_keyed(conn: &Connection, file_id: Option<i64>, rel_path: &str) -> Result<()> {
+    for t in present_file_keyed_tables(conn)? {
+        match (t.key, file_id) {
+            (FileKey::NidRange { .. }, Some(file_id)) => {
+                let (lo, hi) = file_nid_range(file_id);
+                conn.execute(
+                    &format!("DELETE FROM {} WHERE nid BETWEEN ?1 AND ?2", t.name),
+                    params![lo, hi],
+                )?;
+            }
+            (FileKey::FileId, Some(file_id)) => {
+                conn.execute(
+                    &format!("DELETE FROM {} WHERE file_id = ?1", t.name),
+                    [file_id],
+                )?;
+            }
+            (FileKey::SourcePath { column }, _) => {
+                conn.execute(
+                    &format!("DELETE FROM {} WHERE {column} = ?1", t.name),
+                    [rel_path],
+                )?;
+            }
+            (FileKey::NidRange { .. } | FileKey::FileId, None) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Re-key every row of the file at `old_rel` onto the file at `new_rel`,
+/// interning `new_rel` if it is new, and return the new `file_id`. Every
+/// nid column in [`FILE_KEYED_TABLES`] that lies in the old range moves
+/// to the same ordinal in the new range; `file_id` and rel-path columns
+/// are rewritten. The file node's own `parent_nid`/`name_id` are the
+/// caller's (the mount knows the destination directory).
+pub fn move_file_rows(conn: &Connection, old_rel: &str, new_rel: &str) -> Result<i64> {
+    let old_file_id = lookup_file_id(conn, old_rel)?
+        .with_context(|| format!("move of a file the arena never interned: {old_rel}"))?;
+    let new_file_id = ensure_file_id(conn, new_rel)?;
+    if new_file_id == old_file_id {
+        return Ok(new_file_id);
+    }
+    let (lo, hi) = file_nid_range(old_file_id);
+    let (new_lo, _) = file_nid_range(new_file_id);
+    for t in present_file_keyed_tables(conn)? {
+        match t.key {
+            FileKey::NidRange { extra_nid_columns } => {
+                // The new range is a fresh file_id's, so it is empty and the
+                // primary-key rewrite cannot collide.
+                for column in std::iter::once(&"nid").chain(extra_nid_columns.iter()) {
+                    conn.execute(
+                        &format!(
+                            "UPDATE {} SET {column} = {column} - ?1 + ?3 \
+                             WHERE {column} BETWEEN ?1 AND ?2",
+                            t.name
+                        ),
+                        params![lo, hi, new_lo],
+                    )?;
+                }
+            }
+            FileKey::FileId => {
+                conn.execute(
+                    &format!("UPDATE {} SET file_id = ?1 WHERE file_id = ?2", t.name),
+                    params![new_file_id, old_file_id],
+                )?;
+            }
+            FileKey::SourcePath { column } => {
+                conn.execute(
+                    &format!("UPDATE {} SET {column} = ?1 WHERE {column} = ?2", t.name),
+                    params![new_rel, old_rel],
+                )?;
+            }
+        }
+    }
+    Ok(new_file_id)
+}
+
+/// After a directory is re-parented or renamed in `dirs`, rewrite the
+/// rel-path columns of every file beneath it to the path the tree now
+/// spells. Node rows need nothing: a file's nid range is its `file_id`,
+/// which a directory move does not change.
+pub fn refresh_source_paths_under_dir(conn: &Connection, dir_id: i64) -> Result<()> {
+    if !table_exists(conn, "_source")? {
+        // A nodes-only arena (mount fixtures, pre-parse live dbs) has no
+        // rel-path columns to keep in step.
+        return Ok(());
+    }
+    let mut stmt = conn.prepare(
+        "WITH RECURSIVE sub(dir_id) AS ( \
+             SELECT ?1 \
+             UNION ALL \
+             SELECT d.dir_id FROM dirs d JOIN sub s ON d.parent_dir_id = s.dir_id) \
+         SELECT f.file_id FROM files f JOIN sub s ON f.dir_id = s.dir_id",
+    )?;
+    let file_ids: Vec<i64> = stmt
+        .query_map([dir_id], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let path_tables: Vec<&FileKeyedTable> = present_file_keyed_tables(conn)?
+        .into_iter()
+        .filter(|t| matches!(t.key, FileKey::SourcePath { .. }))
+        .collect();
+    for file_id in file_ids {
+        let Some(new_rel) = node_path(conn, file_nid(file_id, 0))? else {
+            continue;
+        };
+        let Some(old_rel) = source_rel_path(conn, file_id)? else {
+            continue;
+        };
+        if old_rel == new_rel {
+            continue;
+        }
+        for t in &path_tables {
+            let FileKey::SourcePath { column } = t.key else {
+                unreachable!("filtered to SourcePath above");
+            };
+            conn.execute(
+                &format!("UPDATE {} SET {column} = ?1 WHERE {column} = ?2", t.name),
+                params![new_rel, old_rel],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,6 +927,29 @@ mod tests {
     }
 
     // ── nid scheme ─────────────────────────────────────────────────────
+
+    #[test]
+    fn bound_param_ceiling_is_the_linked_sqlite_s_ceiling() {
+        // The constant is only true of the SQLite this workspace links. Prove
+        // it against that library, not against a comment: a statement with
+        // exactly SQLITE_MAX_BOUND_PARAMS placeholders prepares, one more is
+        // refused with "too many SQL variables". A bumped or down-tuned
+        // bundled build moves this test, which is the point.
+        let conn = mem();
+        let sql = |n: usize| {
+            let marks = std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",");
+            format!("SELECT 1 WHERE 1 IN ({marks})")
+        };
+        conn.prepare(&sql(SQLITE_MAX_BOUND_PARAMS))
+            .expect("SQLITE_MAX_BOUND_PARAMS placeholders must prepare");
+        let err = conn
+            .prepare(&sql(SQLITE_MAX_BOUND_PARAMS + 1))
+            .expect_err("one placeholder past the ceiling must be refused");
+        assert!(
+            err.to_string().contains("too many SQL variables"),
+            "unexpected refusal: {err}"
+        );
+    }
 
     #[test]
     fn nid_scheme_round_trips_and_partitions() {

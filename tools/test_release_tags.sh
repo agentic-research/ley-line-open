@@ -1,6 +1,12 @@
 #!/bin/sh
 set -eu
 
+# The fixture's git runs no developer hooks: a global `core.hooksPath`
+# with a commit-msg policy must not reject `git commit -m seed` (bead
+# ley-line-open-d1697b).
+GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null
+export GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+
 repo_root=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/leyline-release-tags.XXXXXX")
 trap 'rm -rf "$tmp_dir"' 0 1 2 15

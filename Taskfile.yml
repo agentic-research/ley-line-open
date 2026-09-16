@@ -412,6 +412,11 @@ tasks:
     cmds:
       - tools/test_ci_attestation.sh
 
+  ci:fixture-hooks:fixture-test:
+    desc: Prove every committing fixture ignores the developer's global git hooks
+    cmds:
+      - tools/test_fixture_hooks.sh
+
   ci:workflow-parity:fixture-test:
     desc: Prove the parity gate fails on each drift it exists to catch
     cmds:
@@ -1530,6 +1535,7 @@ tasks:
       - task: lint:workflow-parity
       - task: lint:cache-contract
       - task: ci:attestation:fixture-test
+      - task: ci:fixture-hooks:fixture-test
       - task: ci:workflow-parity:fixture-test
       - task: lint:mutants-cfg-coverage:fixture-test
       - task: mutants:diff:fixture-test

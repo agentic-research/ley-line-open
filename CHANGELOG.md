@@ -164,10 +164,11 @@ context, scoping notes, and review history are recoverable.
   `ley-line-open-d1697b`). The attestation and release-tag fixtures commit
   in throwaway repos with plain `git commit`, so a global `core.hooksPath`
   whose commit-msg hook enforces a message policy (rosary installs one)
-  rejected `git commit -m fixture` and the gate died before any Rust ran.
-  Both fixtures now pin `core.hooksPath` to `/dev/null` for their own git,
-  and a new fixture test runs every committing fixture under a hostile
-  global hook to keep it that way.
+  rejected `git commit -m fixture` and the gate died before any Rust ran;
+  the same hook then failed the daemon watcher tests, which commit through
+  a Rust helper. Every committing fixture, shell and Rust, now pins
+  `core.hooksPath` to `/dev/null` for its own git, and a new fixture test
+  runs each of them under a hostile global hook to keep it that way.
 - **A splice wiped every other file in the arena** (bead
   `ley-line-open-2b6444`). `reproject` cleared `nodes`, `_ast` and `_source`
   for the whole arena before re-projecting the one edited file, and reached

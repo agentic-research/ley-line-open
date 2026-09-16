@@ -25,6 +25,12 @@ tasks:
     cmds:
       - cargo test -p leyline-cli-lib
 
+  test:hostile-hooks:
+    desc: Prove the cli-lib tests that commit in throwaway repos ignore the developer's global git hooks
+    dir: '{{.TASKFILE_DIR}}/../../..'
+    cmds:
+      - tools/test_fixture_hooks.sh --rust
+
   test:vec:
     desc: Tests for the `vec` feature (sqlite-vec + fastembed) — ships in install:full
     dir: '{{.TASKFILE_DIR}}/../..'

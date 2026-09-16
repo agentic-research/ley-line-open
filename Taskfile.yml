@@ -1570,6 +1570,7 @@ tasks:
       - task: tier:isolation
       - task: check:all-features
       - task: test
+      - task: cli-lib:test:hostile-hooks
       - task: sign:host:build
       - task: sign:host:test
       - task: compat:check

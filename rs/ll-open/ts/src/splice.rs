@@ -29,28 +29,7 @@ pub fn splice(conn: &Connection, nid: i64, new_text: &str) -> Result<Vec<u8>> {
     let file_id = leyline_schema::nid_file_id(nid)
         .with_context(|| format!("node {nid} is a directory nid — nothing to splice"))?;
 
-    // Read original source — inline content or from disk via path reference.
-    let source: Vec<u8> = conn
-        .query_row(
-            "SELECT id, content, path FROM _source WHERE file_id = ?1",
-            [file_id],
-            |r| {
-                let id: String = r.get(0)?;
-                let content: Option<Vec<u8>> = r.get(1)?;
-                let path: Option<String> = r.get(2)?;
-                Ok((id, content, path))
-            },
-        )
-        .with_context(|| format!("source for file_id {file_id} not found in _source table"))
-        .and_then(|(id, content, path)| {
-            if let Some(c) = content {
-                Ok(c)
-            } else if let Some(p) = path {
-                std::fs::read(&p).with_context(|| format!("read source file: {p}"))
-            } else {
-                bail!("source '{id}' has neither content nor path")
-            }
-        })?;
+    let source = source_bytes(conn, file_id)?;
 
     if start_byte > source.len() || end_byte > source.len() || start_byte > end_byte {
         bail!(
@@ -68,6 +47,71 @@ pub fn splice(conn: &Connection, nid: i64, new_text: &str) -> Result<Vec<u8>> {
     result.extend_from_slice(&source[end_byte..]);
 
     Ok(result)
+}
+
+/// The bytes of the file `file_id` names, wherever this arena keeps them.
+///
+/// Three writers put a file's bytes in three places, and until this there
+/// were three readers to match (bead `ley-line-open-af4539`): the
+/// single-file projector stores them in `_source.content`; the daemon's
+/// parse stores the absolute `path` plus a `content_hash` that keys the
+/// bytes in `source_blobs` (ADR-0028) — and `_source.content` is NULL on
+/// every daemon arena, which is why the mount's `batch_splice` failed on
+/// them. One reader, in that order: inline content, the blob store by
+/// hash, the file on disk. A chunk-activated blob store (bytes moved into
+/// chunks by `leyline-fs`) is reported as such rather than read wrongly.
+pub fn source_bytes(conn: &Connection, file_id: i64) -> Result<Vec<u8>> {
+    /// The `_source` columns a file's bytes can live behind.
+    struct SourceRow {
+        id: String,
+        content: Option<Vec<u8>>,
+        path: Option<String>,
+        content_hash: Option<Vec<u8>>,
+    }
+    let SourceRow {
+        id,
+        content,
+        path,
+        content_hash,
+    } = conn
+        .query_row(
+            "SELECT id, content, path, content_hash FROM _source WHERE file_id = ?1",
+            [file_id],
+            |r| {
+                Ok(SourceRow {
+                    id: r.get(0)?,
+                    content: r.get(1)?,
+                    path: r.get(2)?,
+                    content_hash: r.get(3)?,
+                })
+            },
+        )
+        .with_context(|| format!("source for file_id {file_id} not found in _source table"))?;
+    if let Some(c) = content {
+        return Ok(c);
+    }
+    if let Some(hash) = content_hash
+        && leyline_schema::table_exists(conn, "source_blobs")?
+    {
+        let blob: Option<Option<Vec<u8>>> = conn
+            .query_row(
+                "SELECT blob_bytes FROM source_blobs WHERE blob_hash = ?1",
+                [&hash],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match blob {
+            Some(Some(bytes)) => return Ok(bytes),
+            Some(None) => bail!(
+                "source '{id}' is chunk-activated in source_blobs; read it through leyline-fs"
+            ),
+            None => {}
+        }
+    }
+    if let Some(p) = path {
+        return std::fs::read(&p).with_context(|| format!("read source file: {p}"));
+    }
+    bail!("source '{id}' has neither inline content, a blob, nor a path")
 }
 
 /// Re-parse modified source and update all tables (`_source`, `_ast`, `nodes`) atomically.

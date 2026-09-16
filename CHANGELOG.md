@@ -192,6 +192,22 @@ context, scoping notes, and review history are recoverable.
   delete_file_rows` delegates; its private LSP-table list and the
   `_ast_blob` probe are gone. Every crate above reaches the owner without a
   feature flag, which is what the mount lacked.
+- **"Which file?" has one resolver and one byte reader** (bead
+  `ley-line-open-af4539`). A daemon LSP request keyed by `file:///abs/path`
+  had only its scheme stripped, so the still-absolute path went to the
+  rel-path lookup and `lsp_symbols` / `lsp_diagnostics` / `lsp_hover` /
+  definitions / references answered empty, indistinguishable from an unknown
+  file. `resolve_file_key` now turns a `file://` URI, an absolute path or a
+  rel path into the arena's rel path (an absolute path outside the tracked
+  root is an error the client sees), every file-keyed op uses it, and the
+  single-file `parse` op derives its scope through it too. A SQL error in the
+  file lookup is now an error, not a "no such file". Separately, a mount
+  write (`batch_splice`) read `_source.content`, which the parser never
+  writes (it stores the bytes in `source_blobs` behind `_source.content_hash`),
+  so every write to a daemon-parsed arena failed with "source not found".
+  `leyline_ts::splice::source_bytes` is the one reader — inline content, then
+  the blob, then the path — and both `splice` and `batch_splice` go through
+  it. Proven on a parser-built arena with the file deleted from disk.
 - **Scoped LSP enrichment took a full `_source` scan for any scope over 999
   files** (bead `ley-line-open-35fc5e`). `lsp_pass.rs` carried its own
   bound-parameter ceiling of 999 — the pre-3.32 SQLite default — while

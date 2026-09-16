@@ -580,19 +580,25 @@ impl SqliteGraphAdapter {
     /// path. A vacated row simply goes stale.
     fn delete_subtree(conn: &rusqlite::Connection, nid: i64) -> Result<()> {
         if let Some(dir_id) = leyline_schema::nid_dir_id(nid) {
-            // Every file interned under this directory or any below it, by
-            // nid range, plus the directory rows themselves.
+            // Every file interned under this directory or any below it goes
+            // through the one owner of a file's rows — `_ast`, `node_refs`,
+            // `node_defs`, `_lsp*`, `_ast_blob`, `_source`, `_imports` and
+            // `nodes` alike (this used to clear `nodes` only: bead
+            // `ley-line-open-af3817`) — then the directory rows themselves.
             const DESCENDANT_DIRS: &str = "WITH RECURSIVE sub(dir_id) AS ( \
                      SELECT ?1 \
                      UNION ALL \
                      SELECT d.dir_id FROM dirs d JOIN sub s ON d.parent_dir_id = s.dir_id)";
-            conn.execute(
-                &format!(
-                    "DELETE FROM nodes WHERE nid >= 0 AND (nid >> 24) IN (\
-                     {DESCENDANT_DIRS} SELECT f.file_id FROM files f JOIN sub s ON f.dir_id = s.dir_id)"
-                ),
-                rusqlite::params![dir_id],
-            )?;
+            let file_ids: Vec<i64> = {
+                let mut stmt = conn.prepare(&format!(
+                    "{DESCENDANT_DIRS} SELECT f.file_id FROM files f JOIN sub s ON f.dir_id = s.dir_id"
+                ))?;
+                let rows = stmt.query_map(rusqlite::params![dir_id], |r| r.get(0))?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            for file_id in file_ids {
+                leyline_schema::delete_file_rows_by_id(conn, file_id)?;
+            }
             conn.execute(
                 &format!(
                     "DELETE FROM nodes WHERE -nid IN ({DESCENDANT_DIRS} SELECT dir_id FROM sub)"
@@ -606,11 +612,7 @@ impl SqliteGraphAdapter {
         if ordinal == 0 {
             let file_id =
                 leyline_schema::nid_file_id(nid).context("non-negative nid has a file_id")?;
-            let (lo, hi) = leyline_schema::file_nid_range(file_id);
-            conn.execute(
-                "DELETE FROM nodes WHERE nid BETWEEN ?1 AND ?2",
-                rusqlite::params![lo, hi],
-            )?;
+            leyline_schema::delete_file_rows_by_id(conn, file_id)?;
             return Ok(());
         }
         conn.execute(
@@ -1266,6 +1268,11 @@ impl Graph for SqliteGraphAdapter {
                     "UPDATE nodes SET parent_nid = ?1, name_id = ?2 WHERE nid = ?3",
                     rusqlite::params![new_parent_nid, new_name_id, old_nid],
                 )?;
+                // Files beneath the moved directory keep their file_ids (and
+                // so their nid ranges), but `_source.id` / `_imports.source_id`
+                // spell the rel path and must follow the tree (bead
+                // `ley-line-open-af3817`).
+                leyline_schema::refresh_source_paths_under_dir(conn, dir_id)?;
             } else {
                 // A file's identity IS `(dir_id, name_id)`, so a renamed file
                 // is a different `file_id` and therefore a different nid
@@ -1273,23 +1280,13 @@ impl Graph for SqliteGraphAdapter {
                 // own row at ordinal 0 plus every AST node under it — keeping
                 // ordinals, and rebase the internal `parent_nid` links that
                 // pointed into the old range.
-                let old_file_id = leyline_schema::nid_file_id(old_nid)
-                    .context("a non-directory nid has a file_id")?;
-                let new_file_id = leyline_schema::ensure_file_id(conn, &new_id)?;
-                if new_file_id != old_file_id {
-                    let (old_lo, old_hi) = leyline_schema::file_nid_range(old_file_id);
-                    let new_lo = leyline_schema::file_nid(new_file_id, 0);
-                    conn.execute(
-                        "UPDATE nodes \
-                            SET nid = nid - ?1 + ?3, \
-                                parent_nid = CASE \
-                                    WHEN parent_nid BETWEEN ?1 AND ?2 \
-                                    THEN parent_nid - ?1 + ?3 \
-                                    ELSE parent_nid END \
-                          WHERE nid BETWEEN ?1 AND ?2",
-                        rusqlite::params![old_lo, old_hi, new_lo],
-                    )?;
-                }
+                // Every table that carries the file's rows moves with it —
+                // `_ast`, `node_refs`, `node_defs`, `_lsp*`, `_ast_blob`,
+                // `_source`, `_imports` — through the one owner in
+                // `leyline_schema`. This used to move `nodes` alone and leave
+                // the rest pointing at the old range (bead
+                // `ley-line-open-af3817`).
+                let new_file_id = leyline_schema::move_file_rows(conn, id, &new_id)?;
                 conn.execute(
                     "UPDATE nodes SET parent_nid = ?1, name_id = ?2 WHERE nid = ?3",
                     rusqlite::params![
@@ -2440,6 +2437,120 @@ mod tests {
         let n = adapter.read_content("src/main.go", &mut buf, 0)?;
         assert_eq!(&buf[..n], valid);
 
+        Ok(())
+    }
+
+    /// Two HTML files projected into one arena, as a writable adapter. The
+    /// mount's `rm`/`mv` used to touch `nodes` alone (bead
+    /// `ley-line-open-af3817`); these fixtures let the tests read every
+    /// other file-keyed table through the writer.
+    fn two_file_adapter() -> Result<SqliteGraphAdapter> {
+        let conn = rusqlite::Connection::open_in_memory()?;
+        let html = leyline_ts::languages::TsLanguage::Html;
+        for (rel, src) in [
+            ("a.html", b"<p>alpha</p>".as_slice()),
+            ("b.html", b"<p>beta</p>".as_slice()),
+        ] {
+            leyline_ts::project::project_ast_with_source(
+                src,
+                html.ts_language(),
+                &conn,
+                rel,
+                "html",
+            )?;
+        }
+        let bytes = conn.serialize("main")?;
+        SqliteGraphAdapter::new_writable(bytes.as_ref())
+    }
+
+    fn rows_in_file_range(adapter: &SqliteGraphAdapter, table: &str, rel: &str) -> i64 {
+        let guard = adapter.writer.lock();
+        let conn = guard.conn();
+        let Some(file_id) = leyline_schema::lookup_file_id(conn, rel).unwrap() else {
+            return 0;
+        };
+        let (lo, hi) = leyline_schema::file_nid_range(file_id);
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE nid BETWEEN ?1 AND ?2"),
+            rusqlite::params![lo, hi],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn source_rows(adapter: &SqliteGraphAdapter, rel: &str) -> i64 {
+        let guard = adapter.writer.lock();
+        guard
+            .conn()
+            .query_row("SELECT COUNT(*) FROM _source WHERE id = ?1", [rel], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn remove_node_clears_every_table_of_the_file_and_no_other() -> Result<()> {
+        let adapter = two_file_adapter()?;
+        let b_ast_before = rows_in_file_range(&adapter, "_ast", "b.html");
+        assert!(
+            b_ast_before > 0,
+            "fixture must project _ast rows for b.html"
+        );
+        assert!(rows_in_file_range(&adapter, "_ast", "a.html") > 0);
+
+        adapter.remove_node("a.html")?;
+
+        assert_eq!(rows_in_file_range(&adapter, "nodes", "a.html"), 0);
+        assert_eq!(
+            rows_in_file_range(&adapter, "_ast", "a.html"),
+            0,
+            "a removed file's _ast rows must go with its nodes rows"
+        );
+        assert_eq!(
+            source_rows(&adapter, "a.html"),
+            0,
+            "_source row must go too"
+        );
+        assert_eq!(rows_in_file_range(&adapter, "_ast", "b.html"), b_ast_before);
+        assert_eq!(source_rows(&adapter, "b.html"), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn rename_node_moves_every_table_of_the_file_into_the_new_range() -> Result<()> {
+        let adapter = two_file_adapter()?;
+        let a_ast_before = rows_in_file_range(&adapter, "_ast", "a.html");
+        let a_nodes_before = rows_in_file_range(&adapter, "nodes", "a.html");
+        let b_ast_before = rows_in_file_range(&adapter, "_ast", "b.html");
+        assert!(a_ast_before > 0);
+
+        adapter.rename_node("a.html", "", "c.html")?;
+
+        assert_eq!(
+            rows_in_file_range(&adapter, "_ast", "c.html"),
+            a_ast_before,
+            "_ast rows must follow the file into its new nid range"
+        );
+        assert_eq!(
+            rows_in_file_range(&adapter, "nodes", "c.html"),
+            a_nodes_before
+        );
+        assert_eq!(
+            rows_in_file_range(&adapter, "_ast", "a.html"),
+            0,
+            "nothing may stay behind in the old range"
+        );
+        assert_eq!(
+            source_rows(&adapter, "c.html"),
+            1,
+            "_source.id must be rewritten"
+        );
+        assert_eq!(source_rows(&adapter, "a.html"), 0);
+        assert_eq!(rows_in_file_range(&adapter, "_ast", "b.html"), b_ast_before);
+        // The renamed file still reads through the graph under its new path.
+        let mut buf = [0u8; 32];
+        let n = adapter.read_content("c.html/element/text", &mut buf, 0)?;
+        assert_eq!(&buf[..n], b"alpha");
         Ok(())
     }
 

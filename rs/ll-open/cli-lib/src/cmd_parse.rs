@@ -198,10 +198,10 @@ struct ExtractCtx<'a> {
 /// `SQLITE_MAX_VARIABLE_NUMBER` at SQLite build time.
 const BULK_BATCH_ROWS: usize = 3000;
 
-/// SQLite's bound-parameter ceiling (`SQLITE_MAX_VARIABLE_NUMBER`, 32766
-/// since 3.32). Exceeding it is a RUNTIME error, so neither the compiler nor
-/// review catches it.
-const SQLITE_MAX_BOUND_PARAMS: usize = 32_766;
+/// The ceiling lives in `leyline_schema` so there is one value for every
+/// crate that sizes an `IN (...)` list or a multi-row INSERT (bead
+/// `ley-line-open-35fc5e`).
+use leyline_schema::SQLITE_MAX_BOUND_PARAMS;
 
 /// Rows per multi-row INSERT for a table of `cols` columns.
 ///

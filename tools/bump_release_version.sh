@@ -160,7 +160,7 @@ echo "bumped $readme" >&2
 arch=docs/ARCHITECTURE.md
 sed -i.bak \
     -e "s/| LLO version | v$old_version |/| LLO version | v$new_version |/" \
-    -e "s/produces \`ley-line-open:v$old_version\`/produces \`ley-line-open:v$new_version\`/" \
+    -e "s/produces \`localhost\/leyline:v$old_version\`/produces \`localhost\/leyline:v$new_version\`/" \
     -e "s/to \`ghcr.io\/agentic-research\/ley-line-open:v$old_version\` with a/to \`ghcr.io\/agentic-research\/ley-line-open:v$new_version\` with a/" \
     -e "s/v$old_version is its tested compatibility point/v$new_version is its tested compatibility point/" \
     "$arch"

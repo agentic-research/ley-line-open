@@ -10,6 +10,15 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.20.0] — 2026-09-17
+
+The projection is **v6** (v0.19.1 shipped v4): node ids are file-scoped
+integers, `nid = (file_id << 24) | ordinal`, directories negative, and
+`_file_index` is gone. A v0.20.0 binary refuses a v4/v5 arena at parse open
+and asks for a cold reparse; there is no in-place migration. Consumers that
+join by `nid >> 24` reach the file row directly. mache warns on the new
+label and reads none of the removed tables.
+
 ### Added
 
 - **The cfg-coverage gate is proven red** (bead `ley-line-open-b23c41`).
@@ -117,12 +126,13 @@ context, scoping notes, and review history are recoverable.
   capnp preimages — the per-file `AstNodeList` blob behind
   `capnp_blobs.blob_hash`, and the `<db>.ast.capnp` segment log folded into
   the signed head. The field was write-only freight: nothing anywhere read
-  it back (a node's address inside a blob is its ordinal,
-  `_ast_pointer.offset_in_blob`), while its presence bound every blob hash
-  to the locator SCHEME — so re-keying the projection to integer node ids
-  (Phase B) would have moved every `blob_hash` and the Σ lineage with it.
-  The capnp field keeps its `@0` slot because persisted blobs pin ordinals;
-  the SQL projection's `_ast.node_id` is unchanged. Blob hashes and segment
+  it back (a node's address inside a blob is its ordinal — in v6 the low
+  24 bits of `_ast.nid`, with `_ast_blob.file_id` naming the blob), while
+  its presence bound every blob hash to the locator SCHEME — so re-keying
+  the projection to integer node ids (Phase B) would have moved every
+  `blob_hash` and the Σ lineage with it. The capnp field keeps its `@0`
+  slot because persisted blobs pin ordinals; the SQL projection's node key
+  was untouched by this phase. Blob hashes and segment
   roots change once, at the next parse generation — a lineage event, not a
   compatibility break; `_meta.projection_schema_version` stays
   `projection-v4` and the wire format stays v1. The identity end-state this
@@ -160,6 +170,36 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **A rejected execution worker leaked its children** (bead `rs-a1e8d0`,
+  #373, #374). `kill(-pgid, SIGKILL)` is not atomic against a leader inside
+  an in-flight `fork()`: the kernel enrolls the child in the group after the
+  sweep has enumerated members, so a worker rejected on the readiness path
+  could leave a grandchild running. `terminate_process_group` now sweeps,
+  waits for the leader to exit without reaping it (a dead leader cannot fork
+  and its zombie keeps the pgid from recycling), then sweeps again. The
+  runtime's fake workers `exec` their sleeper so the kill reaches the real
+  process on every path; the two tests that had leaked one process each for
+  18 days leak none across repeated full runs.
+- **`publish-crates.yml` died at `task: command not found`** (bead
+  `ley-line-open-f88cb5`, #388). The workflow invoked `task deps:ci` on a
+  runner that had never installed Task, so the v0.19.0 tag failed about a
+  second in, before reaching crates.io. It now installs Task at the same
+  pinned action and version every other workflow carries, and the
+  workflow-parity gate keeps the pin identical. Whether Trusted Publishing
+  then authenticates is a publish attempt, not a CI question; crates.io
+  publication is still manual by decision.
+- **The docs caught up with projection-v6 and the release surface.**
+  `rs/ll-core/schema/README.md` — the crate ARCHITECTURE names as the
+  canonical SQLite contract — still documented the pre-v5 `nodes.id TEXT`
+  schema, a stored `parent_id`/`name`, an eight-argument `insert_node` and
+  `_file_index`; it now describes the integer-nid tables, the interning
+  tables, the display views and the file-row owner. `GETTING-STARTED.md`
+  no longer lists `_file_index`, and its distribution status matches the
+  tag workflow (32 named assets plus `SHA256SUMS`, the multi-arch OCI
+  image published to ghcr with an attestation, crates.io manual by
+  decision). README and ARCHITECTURE stop saying the image is built with
+  krust; it is `cargo zigbuild`. Found by the pre-tag review of this
+  release.
 - **`task ci` failed on a machine with a global commit-msg hook** (bead
   `ley-line-open-d1697b`). The attestation and release-tag fixtures commit
   in throwaway repos with plain `git commit`, so a global `core.hooksPath`
@@ -234,12 +274,15 @@ context, scoping notes, and review history are recoverable.
   `file_size`, and the writer stamped every row with one parse-run `now()`
   while the file's mtime sat on the same struct. Measured on a 460-file
   parse: 460/460 file rows at size 0 and one distinct mtime before; 0/460
-  and 460 distinct after, agreeing 460/460 with `_file_index`. A 0 stat is
-  not cosmetic — `cat`, `wc`, `rsync`, editors and build systems consult
-  `st_size` before or instead of reading, so the mount presented a tree of
-  empty files, and uniform mtimes defeated every make-style staleness
-  check. Undetected because mount ships with no tests at any level
-  (`ley-line-open-aed167`). Write-side only: an arena parsed before this
+  and 460 distinct after, agreeing 460/460 with the file index of the day.
+  What a mount actually showed: a source file is presented as a directory
+  of its syntax nodes, so FUSE reports its size as 4096 like any directory
+  and `nodes.size` on that row never reaches `stat(2)` — the mount-visible
+  defect was the timestamp, one parse-run `mtime` on every entry, which
+  defeated every make-style staleness check; the size was wrong in the SQL
+  rows and in every query that read them. Established by the kernel-level
+  test that #391 added (`ley-line-open-aed167`), which is also what pinned
+  the mtime. Write-side only: an arena parsed before this
   keeps its 0-byte rows for every file not reparsed since, because the
   freshness gate skips unchanged files. `leyline daemon --reset-arena`
   (or removing the arena) rebuilds it with real stats.

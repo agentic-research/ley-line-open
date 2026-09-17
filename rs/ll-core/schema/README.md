@@ -45,8 +45,6 @@ and `NID_ORDINAL_MASK`.
   `refresh_source_paths_under_dir` iterate it. A splice, a mount `rm` or
   `mv`, and a scoped reparse all go through these; `table_exists` probes
   the optional sidecars.
-- **`set_meta` / `get_meta`** — `_meta` key/value accessors. `get_meta`
-  returns `Ok(None)` for a missing key and propagates SQL errors.
 - **`SQLITE_MAX_BOUND_PARAMS`** — the one bound-parameter ceiling every
   `IN (...)` builder in the workspace uses (32 766, pinned against the
   linked SQLite by a test).
@@ -94,5 +92,7 @@ adds `_ast`, `_ast_blob`, `_source`, `node_refs`, `node_defs`, `_imports`
 and `_cfg`; `leyline-lsp` adds `_lsp`, `_lsp_defs`, `_lsp_refs`,
 `_lsp_hover` and `_lsp_completions`. All of them key by `nid`, `file_id`
 or the file's relative path — exactly the three shapes `FILE_KEYED_TABLES`
-enumerates. `_meta.projection_schema_version` is `projection-v6`; a binary
-refuses an older label at parse open and asks for a cold reparse.
+enumerates. The `_meta` table and its `set_meta` / `get_meta` accessors
+live in `leyline-ts`, not here. `_meta.projection_schema_version` is
+`projection-v6`; a binary refuses an older label at parse open and asks
+for a cold reparse.

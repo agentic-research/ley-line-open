@@ -199,7 +199,7 @@ dependency and build a build-tool from source — which meant a fix could be
 ## OCI image
 
 `task image` builds a local distroless OCI image tagged
-`localhost/leyline:v0.20.0` (equivalently `ley-line-open:v0.20.0`). It uses
+`localhost/leyline:v0.20.0`. It uses
 `cargo zigbuild` for the static musl binary
 and `cgr.dev/chainguard/static:latest` as the runtime base.
 

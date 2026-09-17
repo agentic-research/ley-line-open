@@ -10,6 +10,15 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.20.0] — 2026-09-17
+
+The projection is **v6** (v0.19.1 shipped v4): node ids are file-scoped
+integers, `nid = (file_id << 24) | ordinal`, directories negative, and
+`_file_index` is gone. A v0.20.0 binary refuses a v4/v5 arena at parse open
+and asks for a cold reparse; there is no in-place migration. Consumers that
+join by `nid >> 24` reach the file row directly. mache warns on the new
+label and reads none of the removed tables.
+
 ### Added
 
 - **The cfg-coverage gate is proven red** (bead `ley-line-open-b23c41`).
@@ -160,6 +169,24 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **A rejected execution worker leaked its children** (bead `rs-a1e8d0`,
+  #373, #374). `kill(-pgid, SIGKILL)` is not atomic against a leader inside
+  an in-flight `fork()`: the kernel enrolls the child in the group after the
+  sweep has enumerated members, so a worker rejected on the readiness path
+  could leave a grandchild running. `terminate_process_group` now sweeps,
+  waits for the leader to exit without reaping it (a dead leader cannot fork
+  and its zombie keeps the pgid from recycling), then sweeps again. The
+  runtime's fake workers `exec` their sleeper so the kill reaches the real
+  process on every path; the two tests that had leaked one process each for
+  18 days leak none across repeated full runs.
+- **`publish-crates.yml` died at `task: command not found`** (bead
+  `ley-line-open-f88cb5`, #388). The workflow invoked `task deps:ci` on a
+  runner that had never installed Task, so the v0.19.0 tag failed about a
+  second in, before reaching crates.io. It now installs Task at the same
+  pinned action and version every other workflow carries, and the
+  workflow-parity gate keeps the pin identical. Whether Trusted Publishing
+  then authenticates is a publish attempt, not a CI question; crates.io
+  publication is still manual by decision.
 - **`task ci` failed on a machine with a global commit-msg hook** (bead
   `ley-line-open-d1697b`). The attestation and release-tag fixtures commit
   in throwaway repos with plain `git commit`, so a global `core.hooksPath`

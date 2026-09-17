@@ -200,7 +200,7 @@ dependency and build a build-tool from source — which meant a fix could be
 
 `task image` builds a local distroless OCI image tagged
 `localhost/leyline:v0.20.0` (equivalently `ley-line-open:v0.20.0`). It uses
-krust/cargo-zigbuild for the static binary
+`cargo zigbuild` for the static musl binary
 and `cgr.dev/chainguard/static:latest` as the runtime base.
 
 Pushing a `v*` tag publishes the multi-arch image (linux/amd64 + linux/arm64)

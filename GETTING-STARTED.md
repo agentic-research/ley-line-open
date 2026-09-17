@@ -88,7 +88,7 @@ Runtime deps:
 
 ```bash
 leyline parse ./path/to/your/code -o /tmp/my-code.db
-# → SQLite db with nodes / _ast / _source / _file_index populated
+# → SQLite db with nodes / _ast / _source (and the interning tables) populated
 ```
 
 `-l <lang>` filters to a single language (`go`, `rust`, `python`, `proto`, `hcl`, ...). The default parses every recognized file extension. Built-in languages: html, markdown, json, yaml, go, python, elixir, hcl/terraform, rust, protobuf, javascript, typescript.
@@ -191,7 +191,7 @@ Work tracking lives in `.beads/beads.db` (Dolt-backed via [rsry](https://github.
 
 ## Project arc
 
-LLO is the open-source data-plane substrate extracted from the private `ley-line` repo (mid-2026). Mache (Go) is the primary consumer; cloister (TypeScript on workerd) consumes via Cap'n Proto FFI; future control-room (Swift) is on the same FFI path. Σ — the Merkle-CAS substrate — is the unifying primitive: BLAKE3-rooted content-addressed bytes that every consumer reads, all SQL projections (`nodes`, `_ast`, `_source`, `_file_index`) derived from it.
+LLO is the open-source data-plane substrate extracted from the private `ley-line` repo (mid-2026). Mache (Go) is the primary consumer; cloister (TypeScript on workerd) consumes via Cap'n Proto FFI; future control-room (Swift) is on the same FFI path. Σ — the Merkle-CAS substrate — is the unifying primitive: BLAKE3-rooted content-addressed bytes that every consumer reads, all SQL projections (`nodes`, `_ast`, `_source`, `_ast_blob`, …) derived from it.
 
 Where to read next:
 
@@ -204,12 +204,12 @@ Where to read next:
 
 ## Distribution status (the honest version)
 
-- **GitHub releases** (primary channel, actively used): cut on every `v*` tag via [.github/workflows/release.yml](.github/workflows/release.yml). Each release attaches the same 8-asset matrix: 4 `leyline-{darwin,linux}-{amd64,arm64}` binaries (default features — `lsp` + `validate` + `hdc`, no mount) + 3 `libleyline_fs-*.a` FFI staticlibs + `leyline_fs.h`. Latest at [releases/latest](https://github.com/agentic-research/ley-line-open/releases/latest). Mache's auto-downloader pulls `leyline-{GOOS}-{GOARCH}` from `/releases/latest/download/` — that's the load-bearing consumer path.
-- **Distroless OCI image**: `task image` builds `ley-line-open:<VERSION>` locally (~20 MB, headless MCP daemon on `:8384`) via krust+docker. **Not auto-published** to a registry today — the `ghcr.io/agentic-research/ley-line-open:VER` references in `README.md` / `server.json` describe the tag the local build produces, not a pushed image. A container-deploy consumer builds it themselves. Auto-push to ghcr on tag is open work.
+- **GitHub releases** (primary channel, actively used): cut on every `v*` tag via [.github/workflows/release.yml](.github/workflows/release.yml). Each release attaches the 32 assets named in [tools/release-assets.txt](tools/release-assets.txt) plus `SHA256SUMS`: 4 `leyline-{darwin,linux}-{amd64,arm64}` binaries (default features — `lsp` + `validate` + `hdc` + `cdc`; no `vec`, no mount), 4 `leyline-mcp-descriptor-*`, 16 `capnpc-schema-bridge-{go,jsonschema,tooldefs,zod}-*` generators, 3 `libleyline_fs-*.a` FFI staticlibs + `leyline_fs.h`, 3 wasm modules (`leyline_sign`, `leyline_cas_ffi`, `leyline_envelope`) and `execution.tools.json`. The workflow verifies the published set against that list before it reports success. Latest at [releases/latest](https://github.com/agentic-research/ley-line-open/releases/latest). Mache's auto-downloader pulls `leyline-{GOOS}-{GOARCH}` from `/releases/latest/download/` — that's the load-bearing consumer path.
+- **Distroless OCI image**: `task image` builds `localhost/leyline:v<VERSION>` locally (~20 MB, headless MCP daemon on `:8384`) via `cargo zigbuild` static musl. A `v*` tag also publishes the multi-arch image (linux/amd64 + linux/arm64) to `ghcr.io/agentic-research/ley-line-open:vVERSION` with a build-provenance attestation, which is what `server.json` advertises.
 - **Homebrew**: legacy `homebrew-tap/Formula/leyline.rb` exists but points at the pre-LLO-extraction private repo (v0.2.0, private URLs, `license :cannot_represent`). Not actively maintained; the tap source (`kiln`) has been archived. **Don't `brew install`** today; use the binary-download install above.
-- **crates.io**: LLO is a workspace of internal crates, not published individually. Consumers link to the binary or the FFI staticlib, not the source crates.
+- **crates.io**: [.github/workflows/publish-crates.yml](.github/workflows/publish-crates.yml) runs on every `v*` tag, but publication is manual by decision until Trusted Publishing is set up on the crates.io side, so that workflow is expected to fail at authentication. Consumers link to the binary or the FFI staticlib, not the source crates.
 
-Open distribution work: homebrew formula update, ghcr auto-push on tag. Pick this up if you want LLO to install via package-manager UX.
+Open distribution work: homebrew formula update, crates.io Trusted Publishing. Pick this up if you want LLO to install via package-manager UX.
 
 ---
 

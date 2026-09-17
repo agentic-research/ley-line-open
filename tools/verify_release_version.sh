@@ -127,7 +127,7 @@ assert_current() {
 }
 
 assert_current README.md "the current release" "The current release is \`v$version\`"
-assert_current docs/ARCHITECTURE.md "the OCI image tag" "produces \`ley-line-open:v$version\`"
+assert_current docs/ARCHITECTURE.md "the OCI image tag" "produces \`localhost/leyline:v$version\`"
 assert_current docs/ARCHITECTURE.md "the Go client compatibility point" \
     "v$version is its tested compatibility point"
 

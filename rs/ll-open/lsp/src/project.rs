@@ -1840,6 +1840,119 @@ mod tests {
         );
     }
 
+    /// The two `_source.path` lookups answer the row's OWN ids — not the
+    /// first row's, not a constant — and `None` for a path the projection
+    /// does not hold.
+    #[test]
+    fn path_lookups_answer_the_matching_source_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _source (id TEXT PRIMARY KEY, language TEXT, path TEXT, file_id INTEGER UNIQUE);
+             INSERT INTO _source VALUES ('src/a.go', 'go', '/w/src/a.go', 7);
+             INSERT INTO _source VALUES ('src/b.go', 'go', '/w/src/b.go', 9);",
+        )
+        .unwrap();
+        assert_eq!(file_id_for_path(&conn, "/w/src/a.go"), Some(7));
+        assert_eq!(file_id_for_path(&conn, "/w/src/b.go"), Some(9));
+        assert_eq!(file_id_for_path(&conn, "/w/src/c.go"), None);
+        assert_eq!(
+            source_id_for_path(&conn, "/w/src/a.go").as_deref(),
+            Some("src/a.go")
+        );
+        assert_eq!(
+            source_id_for_path(&conn, "/w/src/b.go").as_deref(),
+            Some("src/b.go")
+        );
+        assert_eq!(source_id_for_path(&conn, "/w/src/c.go"), None);
+    }
+
+    /// The matched count includes matched CHILDREN: a parent symbol with one
+    /// matching child reports 2, and both rows land on their own nodes.
+    #[test]
+    fn merge_counts_matched_children() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _ast (
+                nid INTEGER PRIMARY KEY,
+                kind_id INTEGER NOT NULL,
+                start_byte INTEGER NOT NULL,
+                end_byte INTEGER NOT NULL,
+                start_row INTEGER NOT NULL,
+                start_col INTEGER NOT NULL,
+                end_row INTEGER NOT NULL,
+                end_col INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        let file_id = leyline_schema::ensure_file_id(&conn, "test.py").unwrap();
+        let base = leyline_schema::file_nid(file_id, 0);
+        let k_class = leyline_schema::intern_kind(&conn, "python", "class_definition").unwrap();
+        let k_fn = leyline_schema::intern_kind(&conn, "python", "function_definition").unwrap();
+        let name_id = leyline_schema::intern_name(&conn, "test.py").unwrap();
+        insert_node(&conn, base, Some(-1), Some(name_id), None, 1, 0, 0, 0, "").unwrap();
+        insert_node(
+            &conn,
+            base + 1,
+            Some(base),
+            None,
+            Some(k_class),
+            1,
+            0,
+            0,
+            0,
+            "",
+        )
+        .unwrap();
+        insert_node(
+            &conn,
+            base + 2,
+            Some(base + 1),
+            None,
+            Some(k_fn),
+            1,
+            0,
+            0,
+            0,
+            "",
+        )
+        .unwrap();
+        // The class spans rows 5-20; its method spans rows 8-12. make_symbol
+        // puts each selection range at column 4 of its start row.
+        conn.execute(
+            "INSERT INTO _ast VALUES (?1, ?2, 100, 500, 5, 0, 20, 0), (?3, ?4, 200, 300, 8, 0, 12, 0)",
+            params![base + 1, k_class, base + 2, k_fn],
+        )
+        .unwrap();
+
+        let method = make_symbol("run", SymbolKind::METHOD, 8, 12, vec![]);
+        let symbols = vec![make_symbol(
+            "Worker",
+            SymbolKind::CLASS,
+            5,
+            20,
+            vec![method],
+        )];
+        let matched = merge_lsp_into_ast(&symbols, &[], &conn, "test.py").unwrap();
+        assert_eq!(matched, 2, "the parent and its child both matched");
+        let rows: Vec<(i64, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT nid, symbol_kind FROM _lsp ORDER BY nid")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            rows,
+            vec![
+                (base + 1, "class".to_string()),
+                (base + 2, "method".to_string())
+            ]
+        );
+    }
+
     #[test]
     fn project_definitions_table() {
         let conn = Connection::open_in_memory().unwrap();

@@ -676,7 +676,11 @@ fn resolve_ast_segment(conn: &Connection, parent_nid: i64, segment: &str) -> Res
     if rank_str.is_empty() || !rank_str.bytes().all(|b| b.is_ascii_digit()) {
         return Ok(None);
     }
-    let rank: i64 = rank_str.parse().unwrap_or(-1);
+    // All digits, but possibly more than an i64 holds: that names no
+    // sibling, so it resolves to nothing rather than to an OFFSET fallback.
+    let Ok(rank) = rank_str.parse::<i64>() else {
+        return Ok(None);
+    };
     conn.prepare_cached(
         "SELECT n.nid FROM nodes n JOIN kinds k ON k.kind_id = n.kind_id \
          WHERE n.parent_nid = ?1 AND k.raw_kind = ?2 \
@@ -1235,6 +1239,33 @@ mod tests {
         assert_eq!(
             renderer.path(&conn, nids[0]).unwrap(),
             node_path(&conn, nids[0]).unwrap()
+        );
+    }
+
+    /// A rank suffix that is all digits but overflows i64 names no sibling:
+    /// it resolves to `None`, not to whatever `OFFSET` makes of a fallback
+    /// value.
+    #[test]
+    fn resolve_path_rejects_an_overflowing_rank() {
+        let (conn, _) = display_fixture();
+        assert!(
+            resolve_path(&conn, "src/a.go/function_declaration/identifier_1")
+                .unwrap()
+                .is_some(),
+            "fixture: the suffixed identifier resolves"
+        );
+        assert_eq!(
+            resolve_path(
+                &conn,
+                "src/a.go/function_declaration/identifier_99999999999999999999"
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_path(&conn, "src/a.go/function_declaration/identifier_7").unwrap(),
+            None,
+            "an in-range rank past the last sibling resolves to nothing too"
         );
     }
 

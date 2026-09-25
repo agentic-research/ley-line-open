@@ -24,6 +24,23 @@ context, scoping notes, and review history are recoverable.
   74 ms and 22 MB → 17 MB; 5 000 files 4.76 s → 0.75 s and 42 MB → 26 MB —
   linear in the export's rows instead of in the arena. The per-token
   ordering of paths on the wire is unchanged.
+- **LSP symbols attached to another file's node on multi-file arenas**
+  (bead `ley-line-open-2b7066`). `merge_symbol` resolved a symbol's
+  position against `_ast` with no file predicate, so on any arena with more
+  than one file a symbol at a common position (`package main` at 0:0, `func
+  main` at row 2) keyed on whichever file's node had the smallest nid, and
+  the last file enriched overwrote the others' `_lsp` rows. There is now one
+  position→node resolver in `leyline-lsp`, `ast_node_at(conn, file_id, row,
+  col, kinds)`, scoped by the file's nid range (a primary-key range search);
+  the symbol merge and both binding-record lookups go through it, and
+  `merge_lsp_into_ast` takes the source id (`_source.id`, the arena-relative
+  path). With an AST present, a file the projection does not hold is an
+  error ("parse it before merging LSP data") instead of a graft onto the
+  wrong node; a standalone LSP db with no AST keeps its synthetic
+  addresses. `leyline lsp --merge-db` resolves the source id from
+  `_source.path`. Symbols now
+  key on the node at their selection range (the name identifier) rather
+  than the smallest token starting on that row.
 
 ## [0.20.0] — 2026-09-17
 

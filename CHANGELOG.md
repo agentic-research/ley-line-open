@@ -10,6 +10,21 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The token-map export rendered every node's path in the arena** (bead
+  `ley-line-open-c6be90`). `get_refs_map` / `get_defs_map` joined the
+  recursive `v_node_path` view; SQLite cannot push the join key into a
+  recursive anchor, so any export, however small, materialised the display
+  path of every node in the arena and built a temporary index over it. The
+  export now selects `(token, nid)` and renders paths in Rust through
+  `leyline_schema::PathRenderer`, a memoised ancestor walk that names each
+  distinct node and each ancestor once. Measured on a synthetic Go corpus
+  (one refs-map call, SQLite memory high-water mark): 500 files 421 ms →
+  74 ms and 22 MB → 17 MB; 5 000 files 4.76 s → 0.75 s and 42 MB → 26 MB —
+  linear in the export's rows instead of in the arena. The per-token
+  ordering of paths on the wire is unchanged.
+
 ## [0.20.0] — 2026-09-17
 
 The projection is **v6** (v0.19.1 shipped v4): node ids are file-scoped

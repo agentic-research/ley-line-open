@@ -317,7 +317,7 @@ pub fn merge_lsp_into_ast(
     symbols: &[DocumentSymbol],
     diagnostics: &[Diagnostic],
     conn: &Connection,
-    file_id: i64,
+    source_id: &str,
 ) -> Result<usize> {
     // Ensure _lsp table exists
     conn.execute_batch(LSP_DDL)?;
@@ -329,9 +329,21 @@ pub fn merge_lsp_into_ast(
         .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
         .unwrap_or(0)
         > 0;
+    // With an AST to attach to, symbols attach to THIS file's nodes only
+    // (bead ley-line-open-2b7066) — so the file must be in the projection.
+    // Without one (a standalone LSP db) there is nothing to scope.
+    let file_id = if has_ast {
+        Some(
+            leyline_schema::lookup_file_id(conn, source_id)?.with_context(|| {
+                format!("{source_id} is not in the projection; parse it before merging LSP data")
+            })?,
+        )
+    } else {
+        None
+    };
 
     for sym in symbols {
-        matched += merge_symbol(conn, sym, has_ast, diagnostics, file_id)?;
+        matched += merge_symbol(conn, sym, file_id, diagnostics)?;
     }
 
     // Insert diagnostics that didn't match any symbol. Their synthetic
@@ -754,9 +766,20 @@ fn extract_token_at_range(source: &str, range: &protocol::Range) -> Option<Strin
 /// JOIN at query time.
 /// The interned file id behind a `_source.path` (the absolute path the
 /// parser recorded), or `None` when the projection does not hold the file.
-pub fn file_id_for_path(conn: &Connection, abs_path: &str) -> Option<i64> {
+fn file_id_for_path(conn: &Connection, abs_path: &str) -> Option<i64> {
     conn.query_row(
         "SELECT file_id FROM _source WHERE path = ?1 LIMIT 1",
+        [abs_path],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
+/// The `_source.id` (the arena-relative path) behind a `_source.path`, or
+/// `None` when the projection does not hold the file.
+pub fn source_id_for_path(conn: &Connection, abs_path: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT id FROM _source WHERE path = ?1 LIMIT 1",
         [abs_path],
         |r| r.get(0),
     )
@@ -1220,9 +1243,8 @@ fn walk_symbol(
 fn merge_symbol(
     conn: &Connection,
     sym: &DocumentSymbol,
-    has_ast: bool,
+    file_id: Option<i64>,
     diagnostics: &[Diagnostic],
-    file_id: i64,
 ) -> Result<usize> {
     let kind_name = protocol::symbol_kind_name(sym.kind);
     let detail = sym.detail.as_deref().unwrap_or("");
@@ -1231,8 +1253,9 @@ fn merge_symbol(
     // The AST node the symbol names: the smallest node of THIS file
     // enclosing the selection range's start (the name identifier). Scoped
     // by file, because every Go file has `package main` at 0:0 and most
-    // have `func main` at row 2 (bead ley-line-open-2b7066).
-    let ast_nid: Option<i64> = if has_ast {
+    // have `func main` at row 2 (bead ley-line-open-2b7066). `None` means
+    // the db has no AST at all.
+    let ast_nid: Option<i64> = file_id.and_then(|file_id| {
         ast_node_at(
             conn,
             file_id,
@@ -1240,9 +1263,7 @@ fn merge_symbol(
             i64::from(sym.selection_range.start.character),
             &[],
         )
-    } else {
-        None
-    };
+    });
 
     let effective_nid = match ast_nid {
         Some(nid) => {
@@ -1300,7 +1321,7 @@ fn merge_symbol(
     // Recurse into children
     if let Some(children) = &sym.children {
         for child in children {
-            matched += merge_symbol(conn, child, has_ast, diagnostics, file_id)?;
+            matched += merge_symbol(conn, child, file_id, diagnostics)?;
         }
     }
 
@@ -1700,7 +1721,7 @@ mod tests {
         )];
         let diags = vec![make_diag("unused import", DiagnosticSeverity::WARNING, 8)];
 
-        let matched = merge_lsp_into_ast(&symbols, &diags, &conn, file_id).unwrap();
+        let matched = merge_lsp_into_ast(&symbols, &diags, &conn, "test.py").unwrap();
         assert_eq!(matched, 1);
 
         let (nid, kind): (i64, String) = conn
@@ -1795,7 +1816,7 @@ mod tests {
         let (b_lo, b_hi) = leyline_schema::file_nid_range(b_file_id);
 
         let symbols = vec![make_symbol("main", SymbolKind::FUNCTION, 2, 4, vec![])];
-        let matched = merge_lsp_into_ast(&symbols, &[], &conn, b_file_id).unwrap();
+        let matched = merge_lsp_into_ast(&symbols, &[], &conn, "b.go").unwrap();
         assert_eq!(matched, 1);
 
         let nids: Vec<i64> = {

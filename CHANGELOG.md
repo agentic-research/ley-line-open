@@ -21,10 +21,12 @@ context, scoping notes, and review history are recoverable.
   position→node resolver in `leyline-lsp`, `ast_node_at(conn, file_id, row,
   col, kinds)`, scoped by the file's nid range (a primary-key range search);
   the symbol merge and both binding-record lookups go through it, and
-  `merge_lsp_into_ast` takes the file id. The daemon pass resolves it from
-  the file's relative path and skips a file the projection does not hold;
-  `leyline lsp --merge-db` resolves it from `_source.path` and errors if the
-  file was never parsed instead of grafting onto the wrong node. Symbols now
+  `merge_lsp_into_ast` takes the source id (`_source.id`, the arena-relative
+  path). With an AST present, a file the projection does not hold is an
+  error ("parse it before merging LSP data") instead of a graft onto the
+  wrong node; a standalone LSP db with no AST keeps its synthetic
+  addresses. `leyline lsp --merge-db` resolves the source id from
+  `_source.path`. Symbols now
   key on the node at their selection range (the name identifier) rather
   than the smallest token starting on that row.
 

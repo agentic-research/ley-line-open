@@ -718,14 +718,9 @@ async fn enrich_files_with_client(
                 .collect();
 
             // Merge symbols into AST nodes, scoped to this file's nid range
-            // (bead ley-line-open-2b7066). A file the projection does not
-            // hold has no nodes to attach to; say so and move on.
-            let Some(file_id) = leyline_schema::lookup_file_id(conn, rel)? else {
-                log::warn!("lsp_pass: {rel} is not in the projection; skipping its symbols");
-                return Ok((0, 0));
-            };
+            // (bead ley-line-open-2b7066).
             let matched =
-                leyline_lsp::project::merge_lsp_into_ast(&symbols, &diagnostics, conn, file_id)?;
+                leyline_lsp::project::merge_lsp_into_ast(&symbols, &diagnostics, conn, rel)?;
 
             // capnp BindingRecord dual-write target (bead
             // `ley-line-open-cdcae2`) — sit next to

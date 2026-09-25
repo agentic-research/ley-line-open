@@ -513,6 +513,56 @@ fn node_display_name(conn: &Connection, nid: i64) -> Result<Option<String>> {
     }
 }
 
+/// Memoised nid → display path renderer for bulk exports.
+///
+/// Renders each node's path once and each ANCESTOR once, whatever the
+/// number of rows that share it: a path is its parent's memoised path plus
+/// the node's own display name, so an export over a whole arena costs one
+/// name lookup per distinct node and no per-row tree walk. This is the bulk
+/// counterpart of [`node_path`]; the `v_node_path` view is not — a
+/// recursive view cannot take the caller's row set as its anchor, so
+/// joining it renders every node in the arena and materialises the result
+/// (bead `ley-line-open-c6be90`).
+#[derive(Default)]
+pub struct PathRenderer {
+    paths: std::collections::HashMap<i64, Option<String>>,
+}
+
+impl PathRenderer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The display path of `nid`, or `None` when `nid` (or an ancestor) has
+    /// no `nodes` row. Memoised for every nid it visits.
+    pub fn path(&mut self, conn: &Connection, nid: i64) -> Result<Option<String>> {
+        if let Some(hit) = self.paths.get(&nid) {
+            return Ok(hit.clone());
+        }
+        let Some(name) = node_display_name(conn, nid)? else {
+            self.paths.insert(nid, None);
+            return Ok(None);
+        };
+        let parent: Option<i64> = conn
+            .prepare_cached("SELECT parent_nid FROM nodes WHERE nid = ?1")?
+            .query_row([nid], |r| r.get::<_, Option<i64>>(0))
+            .optional()?
+            .flatten();
+        // Only the root directory has an empty name, and it has no parent,
+        // so a child's name is never empty here.
+        let rendered = match parent {
+            None => Some(name),
+            Some(parent) => match self.path(conn, parent)? {
+                None => None,
+                Some(prefix) if prefix.is_empty() => Some(name),
+                Some(prefix) => Some(format!("{prefix}/{name}")),
+            },
+        };
+        self.paths.insert(nid, rendered.clone());
+        Ok(rendered)
+    }
+}
+
 /// Render a nid's full display path (`""` for the root directory), walking
 /// `parent_nid` upward. Point-lookup counterpart of [`V_NODE_PATH_DDL`].
 pub fn node_path(conn: &Connection, nid: i64) -> Result<Option<String>> {
@@ -1150,6 +1200,41 @@ mod tests {
         assert_eq!(
             node_path(&conn, base + 3).unwrap().unwrap(),
             "src/a.go/function_declaration/identifier_1"
+        );
+    }
+
+    /// The memoised bulk renderer and the point renderer agree on every
+    /// row, in any visiting order, and a nid with no row renders `None`
+    /// without poisoning the memo of its neighbours.
+    #[test]
+    fn path_renderer_matches_node_path_for_every_row() {
+        let (conn, _) = display_fixture();
+        let mut nids: Vec<i64> = {
+            let mut stmt = conn.prepare("SELECT nid FROM nodes").unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert!(nids.len() >= 6, "fixture must produce rows");
+        // Deepest first, so the memo is filled bottom-up on the first
+        // visit and hit top-down afterwards.
+        nids.sort_unstable_by_key(|n| std::cmp::Reverse(*n));
+        let mut renderer = PathRenderer::new();
+        for pass in 0..2 {
+            for &nid in &nids {
+                assert_eq!(
+                    renderer.path(&conn, nid).unwrap(),
+                    node_path(&conn, nid).unwrap(),
+                    "pass {pass}: nid {nid}"
+                );
+            }
+        }
+        let ghost = file_nid(1, 999_999);
+        assert_eq!(renderer.path(&conn, ghost).unwrap(), None);
+        assert_eq!(
+            renderer.path(&conn, nids[0]).unwrap(),
+            node_path(&conn, nids[0]).unwrap()
         );
     }
 

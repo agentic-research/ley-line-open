@@ -23,6 +23,18 @@ context, scoping notes, and review history are recoverable.
   segment compiled 10–15 statements before, none now. The quadratic
   per-kind sibling rank in `v_node_name` (clause 1) needs a stored column
   and waits on the projection-v7 decision.
+- **The token-map export rendered every node's path in the arena** (bead
+  `ley-line-open-c6be90`). `get_refs_map` / `get_defs_map` joined the
+  recursive `v_node_path` view; SQLite cannot push the join key into a
+  recursive anchor, so any export, however small, materialised the display
+  path of every node in the arena and built a temporary index over it. The
+  export now selects `(token, nid)` and renders paths in Rust through
+  `leyline_schema::PathRenderer`, a memoised ancestor walk that names each
+  distinct node and each ancestor once. Measured on a synthetic Go corpus
+  (one refs-map call, SQLite memory high-water mark): 500 files 421 ms →
+  74 ms and 22 MB → 17 MB; 5 000 files 4.76 s → 0.75 s and 42 MB → 26 MB —
+  linear in the export's rows instead of in the arena. The per-token
+  ordering of paths on the wire is unchanged.
 - **LSP symbols attached to another file's node on multi-file arenas**
   (bead `ley-line-open-2b7066`). `merge_symbol` resolved a symbol's
   position against `_ast` with no file predicate, so on any arena with more

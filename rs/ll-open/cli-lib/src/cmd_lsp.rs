@@ -146,7 +146,17 @@ pub async fn cmd_lsp(
         conn.deserialize_read_exact("main", Cursor::new(&db_bytes), db_bytes.len(), false)
             .context("deserialize existing database")?;
 
-        let matched = project::merge_lsp_into_ast(&symbols, &diagnostics, &conn)?;
+        // Symbols attach to THIS file's nodes only (bead
+        // ley-line-open-2b7066); the projection must already hold it.
+        let file_id =
+            project::file_id_for_path(&conn, &input.to_string_lossy()).with_context(|| {
+                format!(
+                    "{} is not in {}; parse it before merging LSP data",
+                    input.display(),
+                    db_path.display()
+                )
+            })?;
+        let matched = project::merge_lsp_into_ast(&symbols, &diagnostics, &conn, file_id)?;
         eprintln!("{matched} symbols matched to AST nodes");
         conn
     } else {

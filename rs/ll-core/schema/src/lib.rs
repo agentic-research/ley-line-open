@@ -553,12 +553,13 @@ impl PathRenderer {
             .query_row([nid], |r| r.get::<_, Option<i64>>(0))
             .optional()?
             .flatten();
+        // Only the root directory has an empty name, and it has no parent,
+        // so a child's name is never empty here.
         let rendered = match parent {
             None => Some(name),
             Some(parent) => match self.path(conn, parent)? {
                 None => None,
                 Some(prefix) if prefix.is_empty() => Some(name),
-                Some(prefix) if name.is_empty() => Some(prefix),
                 Some(prefix) => Some(format!("{prefix}/{name}")),
             },
         };

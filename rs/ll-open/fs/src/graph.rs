@@ -1318,6 +1318,13 @@ pub struct HotSwapGraph {
     inner: RwLock<Arc<dyn Graph>>,
     control_path: PathBuf,
     last_root: Mutex<[u8; 32]>,
+    /// The control file, mapped once for the life of the graph. Every read
+    /// op polls `current_root` through it; opening, statting and mapping the
+    /// file per op was the largest fixed cost of a FUSE `getattr` (bead
+    /// `ley-line-open-c6cbb4`). Writers still open their own `Controller`
+    /// to publish — the mapping is shared memory, so a publish through any
+    /// handle is visible here.
+    controller: Mutex<Controller>,
     writable: bool,
     /// Default tree-sitter language for extensionless files (e.g. `source`).
     #[cfg(feature = "validate")]
@@ -1352,6 +1359,7 @@ impl HotSwapGraph {
             inner: RwLock::new(initial_graph),
             control_path,
             last_root: Mutex::new(root),
+            controller: Mutex::new(ctrl),
             writable: false,
             #[cfg(feature = "validate")]
             default_language: None,
@@ -1533,8 +1541,7 @@ impl HotSwapGraph {
     /// last poll). Different root → reload via `from_arena` (which
     /// internally verifies BLAKE3 — see T2.3).
     fn maybe_swap(&self) -> Result<Arc<dyn Graph>> {
-        let ctrl = Controller::open_or_create(&self.control_path)?;
-        let current_root = ctrl.current_root();
+        let current_root = self.controller.lock().current_root();
         let cached_root = *self.last_root.lock();
 
         if current_root != cached_root {

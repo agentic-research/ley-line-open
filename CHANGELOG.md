@@ -12,6 +12,17 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **Every mount op re-opened the control file and re-compiled its path
+  lookups** (bead `ley-line-open-c6cbb4`, clauses 2 and 3). `HotSwapGraph`
+  polled `current_root` by opening, statting and mapping the control file
+  on every FUSE/NFS op; it now keeps the mapping for its lifetime and reads
+  the root through it (a publish through any other handle is shared
+  memory, so it is still seen). `resolve_path`, `resolve_ast_segment`,
+  `node_display_name` and `node_path` prepare every statement through the
+  connection's statement cache; an op that resolved a path segment by
+  segment compiled 10–15 statements before, none now. The quadratic
+  per-kind sibling rank in `v_node_name` (clause 1) needs a stored column
+  and waits on the projection-v7 decision.
 - **LSP symbols attached to another file's node on multi-file arenas**
   (bead `ley-line-open-2b7066`). `merge_symbol` resolved a symbol's
   position against `_ast` with no file predicate, so on any arena with more

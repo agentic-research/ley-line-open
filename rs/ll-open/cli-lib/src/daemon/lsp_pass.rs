@@ -717,8 +717,10 @@ async fn enrich_files_with_client(
                 .flat_map(|(_, diags)| diags.clone())
                 .collect();
 
-            // Merge symbols into AST nodes.
-            let matched = leyline_lsp::project::merge_lsp_into_ast(&symbols, &diagnostics, conn)?;
+            // Merge symbols into AST nodes, scoped to this file's nid range
+            // (bead ley-line-open-2b7066).
+            let matched =
+                leyline_lsp::project::merge_lsp_into_ast(&symbols, &diagnostics, conn, rel)?;
 
             // capnp BindingRecord dual-write target (bead
             // `ley-line-open-cdcae2`) — sit next to

@@ -317,6 +317,7 @@ pub fn merge_lsp_into_ast(
     symbols: &[DocumentSymbol],
     diagnostics: &[Diagnostic],
     conn: &Connection,
+    source_id: &str,
 ) -> Result<usize> {
     // Ensure _lsp table exists
     conn.execute_batch(LSP_DDL)?;
@@ -328,9 +329,21 @@ pub fn merge_lsp_into_ast(
         .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
         .unwrap_or(0)
         > 0;
+    // With an AST to attach to, symbols attach to THIS file's nodes only
+    // (bead ley-line-open-2b7066) — so the file must be in the projection.
+    // Without one (a standalone LSP db) there is nothing to scope.
+    let file_id = if has_ast {
+        Some(
+            leyline_schema::lookup_file_id(conn, source_id)?.with_context(|| {
+                format!("{source_id} is not in the projection; parse it before merging LSP data")
+            })?,
+        )
+    } else {
+        None
+    };
 
     for sym in symbols {
-        matched += merge_symbol(conn, sym, has_ast, diagnostics)?;
+        matched += merge_symbol(conn, sym, file_id, diagnostics)?;
     }
 
     // Insert diagnostics that didn't match any symbol. Their synthetic
@@ -608,47 +621,17 @@ fn lookup_construct_node_id(
     let abs_path = ref_uri.strip_prefix("file://").unwrap_or(ref_uri);
     // projection-v5: `_source.file_id` bounds the file's nid range, so the
     // span search is a PK range SEARCH instead of a source_id scan.
-    let file_id: i64 = conn
-        .query_row(
-            "SELECT file_id FROM _source WHERE path = ?1 LIMIT 1",
-            [abs_path],
-            |r| r.get(0),
-        )
-        .ok()?;
-    let (lo, hi) = leyline_schema::file_nid_range(file_id);
-
-    let line = range.start.line as i64;
-    let col = range.start.character as i64;
-
-    // Build the SQL `IN (...)` placeholders from CONSTRUCT_KINDS at
-    // call time — keeping the kind list in one place (the const
-    // above) avoids drift between the schema's documented set and the
-    // SQL filter.
-    let placeholders = (0..CONSTRUCT_KINDS.len())
-        .map(|i| format!("?{}", i + 5))
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT a.nid FROM _ast a JOIN kinds k ON k.kind_id = a.kind_id \
-         WHERE a.nid BETWEEN ?1 AND ?2 \
-           AND a.start_row <= ?3 AND a.end_row >= ?3 \
-           AND (a.start_row < ?3 OR a.start_col <= ?4) \
-           AND (a.end_row > ?3 OR a.end_col >= ?4) \
-           AND k.raw_kind IN ({placeholders}) \
-         ORDER BY (a.end_byte - a.start_byte) ASC, a.nid ASC \
-         LIMIT 1"
-    );
-
-    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
-        vec![Box::new(lo), Box::new(hi), Box::new(line), Box::new(col)];
-    for kind in CONSTRUCT_KINDS {
-        params_vec.push(Box::new(*kind));
-    }
-    let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
-
-    let nid: i64 = conn
-        .query_row(&sql, params_refs.as_slice(), |r| r.get(0))
-        .ok()?;
+    let file_id = file_id_for_path(conn, abs_path)?;
+    // Smallest enclosing node of a construct kind — the kind list stays in
+    // one place (CONSTRUCT_KINDS) so the schema's documented set and the
+    // SQL filter cannot drift.
+    let nid = ast_node_at(
+        conn,
+        file_id,
+        i64::from(range.start.line),
+        i64::from(range.start.character),
+        CONSTRUCT_KINDS,
+    )?;
     // The BindingRecord wire contract carries the node's DISPLAY path (a
     // Text field, path-shaped since T8.2) — render it; the integer key
     // stays projection-internal.
@@ -781,6 +764,67 @@ fn extract_token_at_range(source: &str, range: &protocol::Range) -> Option<Strin
 /// where `path` is the absolute path. ADR-0013 Step 1's "byte-range
 /// join at write time" — done once here so consumers don't need to
 /// JOIN at query time.
+/// The interned file id behind a `_source.path` (the absolute path the
+/// parser recorded), or `None` when the projection does not hold the file.
+fn file_id_for_path(conn: &Connection, abs_path: &str) -> Option<i64> {
+    conn.query_row(
+        "SELECT file_id FROM _source WHERE path = ?1 LIMIT 1",
+        [abs_path],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
+/// The `_source.id` (the arena-relative path) behind a `_source.path`, or
+/// `None` when the projection does not hold the file.
+pub fn source_id_for_path(conn: &Connection, abs_path: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT id FROM _source WHERE path = ?1 LIMIT 1",
+        [abs_path],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
+/// The smallest AST node of `file_id` enclosing `(row, col)`, optionally
+/// restricted to the tree-sitter kinds in `kinds` (empty = any kind).
+///
+/// The ONE position→node resolver in this module (bead
+/// ley-line-open-2b7066). Every lookup that turns an LSP position into a
+/// node goes through it, so every lookup is scoped by the file's nid
+/// range — a PRIMARY KEY range SEARCH under projection-v5 — and none can
+/// answer another file's node at the same row and column.
+fn ast_node_at(conn: &Connection, file_id: i64, row: i64, col: i64, kinds: &[&str]) -> Option<i64> {
+    let (lo, hi) = leyline_schema::file_nid_range(file_id);
+    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
+        vec![Box::new(lo), Box::new(hi), Box::new(row), Box::new(col)];
+    let kind_filter = if kinds.is_empty() {
+        String::new()
+    } else {
+        let placeholders = (0..kinds.len())
+            .map(|i| format!("?{}", i + 5))
+            .collect::<Vec<_>>()
+            .join(",");
+        for k in kinds {
+            params_vec.push(Box::new((*k).to_string()));
+        }
+        format!("AND a.kind_id IN (SELECT kind_id FROM kinds WHERE raw_kind IN ({placeholders})) ")
+    };
+    let sql = format!(
+        "SELECT a.nid FROM _ast a \
+         WHERE a.nid BETWEEN ?1 AND ?2 \
+           AND a.start_row <= ?3 AND a.end_row >= ?3 \
+           AND (a.start_row < ?3 OR a.start_col <= ?4) \
+           AND (a.end_row > ?3 OR a.end_col >= ?4) \
+           {kind_filter}\
+         ORDER BY (a.end_byte - a.start_byte) ASC, a.nid ASC \
+         LIMIT 1"
+    );
+    let params_ref: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+    conn.query_row(&sql, params_ref.as_slice(), |r| r.get(0))
+        .ok()
+}
+
 fn lookup_referrer_node_id(
     conn: &Connection,
     ref_uri: &str,
@@ -791,31 +835,15 @@ fn lookup_referrer_node_id(
 
     // projection-v5: `_source.file_id` bounds the file's nid range — the
     // span search below is a PRIMARY KEY range SEARCH.
-    let file_id: i64 = conn
-        .query_row(
-            "SELECT file_id FROM _source WHERE path = ?1 LIMIT 1",
-            [abs_path],
-            |r| r.get(0),
-        )
-        .ok()?;
-    let (lo, hi) = leyline_schema::file_nid_range(file_id);
-
-    // Smallest AST node enclosing (line, col).
-    let line = range.start.line as i64;
-    let col = range.start.character as i64;
-    let nid: i64 = conn
-        .query_row(
-            "SELECT nid FROM _ast \
-             WHERE nid BETWEEN ?1 AND ?2 \
-               AND start_row <= ?3 AND end_row >= ?3 \
-               AND (start_row < ?3 OR start_col <= ?4) \
-               AND (end_row > ?3 OR end_col >= ?4) \
-             ORDER BY (end_byte - start_byte) ASC, nid ASC \
-             LIMIT 1",
-            rusqlite::params![lo, hi, line, col],
-            |r| r.get(0),
-        )
-        .ok()?;
+    let file_id = file_id_for_path(conn, abs_path)?;
+    // Smallest AST node of this file enclosing (line, col).
+    let nid = ast_node_at(
+        conn,
+        file_id,
+        i64::from(range.start.line),
+        i64::from(range.start.character),
+        &[],
+    )?;
     // Wire contract: the BindingRecord's refSiteNodeId is a display path.
     leyline_schema::node_path(conn, nid).ok().flatten()
 }
@@ -1215,32 +1243,27 @@ fn walk_symbol(
 fn merge_symbol(
     conn: &Connection,
     sym: &DocumentSymbol,
-    has_ast: bool,
+    file_id: Option<i64>,
     diagnostics: &[Diagnostic],
 ) -> Result<usize> {
     let kind_name = protocol::symbol_kind_name(sym.kind);
     let detail = sym.detail.as_deref().unwrap_or("");
     let mut matched = 0;
 
-    // Try to find matching AST node by line range
-    let ast_nid: Option<i64> = if has_ast {
-        conn.query_row(
-            "SELECT nid FROM _ast \
-             WHERE start_row = ?1 AND start_col <= ?2 \
-               AND end_row >= ?3 \
-             ORDER BY (end_byte - start_byte) ASC, nid ASC \
-             LIMIT 1",
-            params![
-                sym.selection_range.start.line,
-                sym.selection_range.start.character,
-                sym.selection_range.end.line,
-            ],
-            |r| r.get(0),
+    // The AST node the symbol names: the smallest node of THIS file
+    // enclosing the selection range's start (the name identifier). Scoped
+    // by file, because every Go file has `package main` at 0:0 and most
+    // have `func main` at row 2 (bead ley-line-open-2b7066). `None` means
+    // the db has no AST at all.
+    let ast_nid: Option<i64> = file_id.and_then(|file_id| {
+        ast_node_at(
+            conn,
+            file_id,
+            i64::from(sym.selection_range.start.line),
+            i64::from(sym.selection_range.start.character),
+            &[],
         )
-        .ok()
-    } else {
-        None
-    };
+    });
 
     let effective_nid = match ast_nid {
         Some(nid) => {
@@ -1298,7 +1321,7 @@ fn merge_symbol(
     // Recurse into children
     if let Some(children) = &sym.children {
         for child in children {
-            matched += merge_symbol(conn, child, has_ast, diagnostics)?;
+            matched += merge_symbol(conn, child, file_id, diagnostics)?;
         }
     }
 
@@ -1698,7 +1721,7 @@ mod tests {
         )];
         let diags = vec![make_diag("unused import", DiagnosticSeverity::WARNING, 8)];
 
-        let matched = merge_lsp_into_ast(&symbols, &diags, &conn).unwrap();
+        let matched = merge_lsp_into_ast(&symbols, &diags, &conn, "test.py").unwrap();
         assert_eq!(matched, 1);
 
         let (nid, kind): (i64, String) = conn
@@ -1720,6 +1743,214 @@ mod tests {
             .unwrap();
         assert!(diag_json.is_some());
         assert!(diag_json.unwrap().contains("unused import"));
+    }
+
+    /// Two files with a node at the same position (every Go file has
+    /// `package main` at 0:0 and most have `func main` at row 2): the
+    /// symbols merged for the SECOND file must key on that file's nodes,
+    /// never on the first file's (bead ley-line-open-2b7066). Before the
+    /// file scope, the position lookup answered the smallest nid in the
+    /// whole arena, so b.go's symbols overwrote a.go's `_lsp` rows.
+    #[test]
+    fn merge_scopes_symbol_positions_to_the_merged_file() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _ast (
+                nid INTEGER PRIMARY KEY,
+                kind_id INTEGER NOT NULL,
+                start_byte INTEGER NOT NULL,
+                end_byte INTEGER NOT NULL,
+                start_row INTEGER NOT NULL,
+                start_col INTEGER NOT NULL,
+                end_row INTEGER NOT NULL,
+                end_col INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        let k_fn = leyline_schema::intern_kind(&conn, "go", "function_declaration").unwrap();
+        let k_id = leyline_schema::intern_kind(&conn, "go", "identifier").unwrap();
+        // Identical shapes in both files: a declaration spanning rows 2-4
+        // and its name identifier at 2:4-2:8 (where make_symbol puts the
+        // selection range).
+        let mut ids = Vec::new();
+        for rel in ["a.go", "b.go"] {
+            let file_id = leyline_schema::ensure_file_id(&conn, rel).unwrap();
+            let base = leyline_schema::file_nid(file_id, 0);
+            let name_id = leyline_schema::intern_name(&conn, rel).unwrap();
+            insert_node(&conn, base, Some(-1), Some(name_id), None, 1, 0, 0, 0, "").unwrap();
+            insert_node(
+                &conn,
+                base + 1,
+                Some(base),
+                None,
+                Some(k_fn),
+                1,
+                0,
+                0,
+                0,
+                "",
+            )
+            .unwrap();
+            insert_node(
+                &conn,
+                base + 2,
+                Some(base + 1),
+                None,
+                Some(k_id),
+                1,
+                1,
+                0,
+                0,
+                "",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO _ast VALUES (?1, ?2, 20, 60, 2, 0, 4, 1), (?3, ?4, 25, 29, 2, 4, 2, 8)",
+                params![base + 1, k_fn, base + 2, k_id],
+            )
+            .unwrap();
+            ids.push(file_id);
+        }
+        let b_file_id = ids[1];
+        let (b_lo, b_hi) = leyline_schema::file_nid_range(b_file_id);
+
+        let symbols = vec![make_symbol("main", SymbolKind::FUNCTION, 2, 4, vec![])];
+        let matched = merge_lsp_into_ast(&symbols, &[], &conn, "b.go").unwrap();
+        assert_eq!(matched, 1);
+
+        let nids: Vec<i64> = {
+            let mut stmt = conn.prepare("SELECT nid FROM _lsp ORDER BY nid").unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert!(
+            !nids.is_empty() && nids.iter().all(|n| (b_lo..=b_hi).contains(n)),
+            "every _lsp row written for b.go must key inside b.go's nid range \
+             {b_lo}..={b_hi}; got {nids:?}"
+        );
+        // And on the node the symbol names: the identifier at the selection
+        // range, the smallest node enclosing that position.
+        assert_eq!(
+            nids,
+            vec![leyline_schema::file_nid(b_file_id, 2)],
+            "the symbol keys on b.go's identifier node"
+        );
+    }
+
+    /// The two `_source.path` lookups answer the row's OWN ids — not the
+    /// first row's, not a constant — and `None` for a path the projection
+    /// does not hold.
+    #[test]
+    fn path_lookups_answer_the_matching_source_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _source (id TEXT PRIMARY KEY, language TEXT, path TEXT, file_id INTEGER UNIQUE);
+             INSERT INTO _source VALUES ('src/a.go', 'go', '/w/src/a.go', 7);
+             INSERT INTO _source VALUES ('src/b.go', 'go', '/w/src/b.go', 9);",
+        )
+        .unwrap();
+        assert_eq!(file_id_for_path(&conn, "/w/src/a.go"), Some(7));
+        assert_eq!(file_id_for_path(&conn, "/w/src/b.go"), Some(9));
+        assert_eq!(file_id_for_path(&conn, "/w/src/c.go"), None);
+        assert_eq!(
+            source_id_for_path(&conn, "/w/src/a.go").as_deref(),
+            Some("src/a.go")
+        );
+        assert_eq!(
+            source_id_for_path(&conn, "/w/src/b.go").as_deref(),
+            Some("src/b.go")
+        );
+        assert_eq!(source_id_for_path(&conn, "/w/src/c.go"), None);
+    }
+
+    /// The matched count includes matched CHILDREN: a parent symbol with one
+    /// matching child reports 2, and both rows land on their own nodes.
+    #[test]
+    fn merge_counts_matched_children() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _ast (
+                nid INTEGER PRIMARY KEY,
+                kind_id INTEGER NOT NULL,
+                start_byte INTEGER NOT NULL,
+                end_byte INTEGER NOT NULL,
+                start_row INTEGER NOT NULL,
+                start_col INTEGER NOT NULL,
+                end_row INTEGER NOT NULL,
+                end_col INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        let file_id = leyline_schema::ensure_file_id(&conn, "test.py").unwrap();
+        let base = leyline_schema::file_nid(file_id, 0);
+        let k_class = leyline_schema::intern_kind(&conn, "python", "class_definition").unwrap();
+        let k_fn = leyline_schema::intern_kind(&conn, "python", "function_definition").unwrap();
+        let name_id = leyline_schema::intern_name(&conn, "test.py").unwrap();
+        insert_node(&conn, base, Some(-1), Some(name_id), None, 1, 0, 0, 0, "").unwrap();
+        insert_node(
+            &conn,
+            base + 1,
+            Some(base),
+            None,
+            Some(k_class),
+            1,
+            0,
+            0,
+            0,
+            "",
+        )
+        .unwrap();
+        insert_node(
+            &conn,
+            base + 2,
+            Some(base + 1),
+            None,
+            Some(k_fn),
+            1,
+            0,
+            0,
+            0,
+            "",
+        )
+        .unwrap();
+        // The class spans rows 5-20; its method spans rows 8-12. make_symbol
+        // puts each selection range at column 4 of its start row.
+        conn.execute(
+            "INSERT INTO _ast VALUES (?1, ?2, 100, 500, 5, 0, 20, 0), (?3, ?4, 200, 300, 8, 0, 12, 0)",
+            params![base + 1, k_class, base + 2, k_fn],
+        )
+        .unwrap();
+
+        let method = make_symbol("run", SymbolKind::METHOD, 8, 12, vec![]);
+        let symbols = vec![make_symbol(
+            "Worker",
+            SymbolKind::CLASS,
+            5,
+            20,
+            vec![method],
+        )];
+        let matched = merge_lsp_into_ast(&symbols, &[], &conn, "test.py").unwrap();
+        assert_eq!(matched, 2, "the parent and its child both matched");
+        let rows: Vec<(i64, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT nid, symbol_kind FROM _lsp ORDER BY nid")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            rows,
+            vec![
+                (base + 1, "class".to_string()),
+                (base + 2, "method".to_string())
+            ]
+        );
     }
 
     #[test]

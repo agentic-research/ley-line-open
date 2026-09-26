@@ -1202,54 +1202,77 @@ fn op_get_token_map(ctx: &DaemonContext, table: &str, op: TokenMapOp) -> Result<
         // from multiple sites would emit duplicate node_ids without this.
         // Downstream graph-wide consumers (community detection, architecture
         // diagrams) expect each (token → node_id) edge once.
-        // TODO(perf): if a single response grows large on a registry-scale
-        // db, stream rows instead of materializing the full Vec into memory.
         //
-        // projection-v5: the wire keeps display paths. Bulk export is the
-        // one place the recursive v_node_path view pays for itself — one
-        // whole-tree render amortized over every row. LEFT JOINs so
-        // injected-node occurrences (no `nodes` row) keep an EXPLICIT
-        // file-anchored injected address — mirror of `wire_ref_of`.
-        let sql = format!(
-            "SELECT DISTINCT t.token, COALESCE( \
-                 p.path, \
-                 s.id || '#inj@' || (t.nid & 16777215), \
-                 CAST(t.nid AS TEXT)) \
-             FROM {table} t \
-             LEFT JOIN v_node_path p ON p.nid = t.nid \
-             LEFT JOIN _source s ON s.file_id = (t.nid >> 24) \
-             ORDER BY 1, 2"
-        );
+        // projection-v5: the wire keeps display paths, rendered here in
+        // Rust once per distinct nid through a memoised ancestor walk
+        // (bead `ley-line-open-c6be90`). The recursive `v_node_path` view
+        // is NOT joined: SQLite cannot push `p.nid = t.nid` into a
+        // recursive anchor, so that join rendered and materialised the path
+        // of every node in the arena for any export, however small. An
+        // occurrence with no `nodes` row (an injected subtree) keeps an
+        // EXPLICIT file-anchored address — mirror of `wire_ref_of`.
+        let sql = format!("SELECT DISTINCT token, nid FROM {table} ORDER BY 1, 2");
         let mut stmt = conn.prepare_cached(&sql)?;
-        let pairs: Vec<(String, String)> = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+
+        let mut paths = leyline_schema::PathRenderer::new();
+        let mut source_ids: std::collections::HashMap<i64, Option<String>> =
+            std::collections::HashMap::new();
+        let mut render = |conn: &Connection, nid: i64| -> Result<String> {
+            if let Some(path) = paths.path(conn, nid)? {
+                return Ok(path);
+            }
+            let file_id = leyline_schema::nid_file_id(nid);
+            let source_id = match file_id {
+                Some(fid) => match source_ids.entry(fid) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
+                    std::collections::hash_map::Entry::Vacant(e) => e
+                        .insert(query_row_opt(
+                            conn,
+                            "SELECT id FROM _source WHERE file_id = ?1",
+                            [fid],
+                            |r| r.get::<_, String>(0),
+                        )?)
+                        .clone(),
+                },
+                None => None,
+            };
+            Ok(match source_id {
+                Some(sid) => format!(
+                    "{sid}#inj@{}",
+                    leyline_schema::nid_ordinal(nid).unwrap_or_default()
+                ),
+                None => nid.to_string(),
+            })
+        };
 
         // Group by token in a single linear pass — the ORDER BY token
-        // above means same-token rows are contiguous, so we just track
-        // the current token and flush when it changes.
+        // above means same-token rows are contiguous — and order each
+        // token's paths, which is the order the SQL used to hand back.
         let mut entries: Vec<TokenMapEntry> = Vec::new();
         let mut current_token: Option<String> = None;
         let mut current_node_ids: Vec<String> = Vec::new();
-        for (token, node_id) in pairs {
+        let flush = |token: String, mut ids: Vec<String>, entries: &mut Vec<TokenMapEntry>| {
+            ids.sort_unstable();
+            entries.push(TokenMapEntry {
+                token,
+                node_ids: ids,
+            });
+        };
+        for row in rows {
+            let (token, nid) = row?;
             if Some(&token) != current_token.as_ref() {
                 if let Some(tok) = current_token.take() {
-                    entries.push(TokenMapEntry {
-                        token: tok,
-                        node_ids: std::mem::take(&mut current_node_ids),
-                    });
+                    flush(tok, std::mem::take(&mut current_node_ids), &mut entries);
                 }
                 current_token = Some(token);
             }
-            current_node_ids.push(node_id);
+            current_node_ids.push(render(conn, nid)?);
         }
         if let Some(tok) = current_token {
-            entries.push(TokenMapEntry {
-                token: tok,
-                node_ids: current_node_ids,
-            });
+            flush(tok, current_node_ids, &mut entries);
         }
 
         // Build + emit JSON inside the matching branch so the
@@ -7413,6 +7436,81 @@ mod tests {
         );
         assert_eq!(miss["ok"], json!(true));
         assert_eq!(miss["callees"], json!([]), "got {miss}");
+    }
+
+    /// Measurement for bead ley-line-open-c6be90, not a gate: parse a
+    /// synthetic Go corpus of `LEYLINE_TOKEN_MAP_COPIES` × 4 files into the
+    /// live db and time one refs-map export, reporting wall time and the
+    /// SQLite memory high-water mark. Run with
+    /// `LEYLINE_TOKEN_MAP_COPIES=125 cargo test -p leyline-cli-lib --lib
+    /// token_map_export_cost -- --ignored --nocapture` (500 files) and
+    /// `=1250` (5 000 files); the numbers are recorded on the bead.
+    #[tokio::test]
+    #[ignore = "measurement, not a gate; needs LEYLINE_TOKEN_MAP_COPIES"]
+    async fn token_map_export_cost() {
+        let copies: usize = std::env::var("LEYLINE_TOKEN_MAP_COPIES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(125);
+        let seed_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/topology/handcrafted/go");
+        let corpus = TempDir::new().unwrap();
+        let seeds: Vec<std::path::PathBuf> = std::fs::read_dir(&seed_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("go"))
+            .collect();
+        for i in 0..copies {
+            let pkg = corpus.path().join(format!("pkg_{i:04}"));
+            std::fs::create_dir(&pkg).unwrap();
+            for s in &seeds {
+                std::fs::copy(s, pkg.join(s.file_name().unwrap())).unwrap();
+            }
+        }
+        let (_dir, ctx) = setup();
+        {
+            let live = ctx.live_db.writer.lock();
+            crate::cmd_parse::parse_into_conn(&live, corpus.path(), Some("go"), None)
+                .expect("parse corpus");
+        }
+        let (files, refs): (i64, i64) = ctx
+            .with_read(|conn| {
+                Ok((
+                    conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?,
+                    conn.query_row("SELECT COUNT(*) FROM node_refs", [], |r| r.get(0))?,
+                ))
+            })
+            .unwrap();
+        // Reset the high-water mark so the export's own allocation shows.
+        unsafe {
+            let mut cur = 0i64;
+            let mut hi = 0i64;
+            rusqlite::ffi::sqlite3_status64(
+                rusqlite::ffi::SQLITE_STATUS_MEMORY_USED,
+                &mut cur,
+                &mut hi,
+                1,
+            );
+        }
+        let t0 = std::time::Instant::now();
+        let body = op_get_token_map(&ctx, "node_refs", TokenMapOp::Refs).unwrap();
+        let wall = t0.elapsed();
+        let mut cur = 0i64;
+        let mut hi = 0i64;
+        unsafe {
+            rusqlite::ffi::sqlite3_status64(
+                rusqlite::ffi::SQLITE_STATUS_MEMORY_USED,
+                &mut cur,
+                &mut hi,
+                0,
+            );
+        }
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        eprintln!(
+            "token_map_export_cost: files={files} node_refs={refs} entries={} wall={wall:?} sqlite_highwater={hi} bytes",
+            v["entries"].as_array().map(|a| a.len()).unwrap_or(0)
+        );
     }
 
     #[tokio::test]

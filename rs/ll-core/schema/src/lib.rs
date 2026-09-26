@@ -475,46 +475,91 @@ pub fn insert_node(
 /// rank among same-kind siblings ordered by `ord`, 0-based).
 fn node_display_name(conn: &Connection, nid: i64) -> Result<Option<String>> {
     type NodeNameRow = (Option<i64>, Option<i64>, Option<i64>, i64);
+    // Every statement here is prepared through the connection's statement
+    // cache: a FUSE op resolves a path segment by segment and renders names
+    // hop by hop, so an uncached prepare per call compiled 10-15 statements
+    // per `getattr` (bead `ley-line-open-c6cbb4`).
     let row: Option<NodeNameRow> = conn
-        .query_row(
-            "SELECT parent_nid, name_id, kind_id, ord FROM nodes WHERE nid = ?1",
-            [nid],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
+        .prepare_cached("SELECT parent_nid, name_id, kind_id, ord FROM nodes WHERE nid = ?1")?
+        .query_row([nid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
         .optional()?;
     let Some((parent_nid, name_id, kind_id, ord)) = row else {
         return Ok(None);
     };
     if let Some(name_id) = name_id {
-        let text: String = conn.query_row(
-            "SELECT text FROM names WHERE name_id = ?1",
-            [name_id],
-            |r| r.get(0),
-        )?;
+        let text: String = conn
+            .prepare_cached("SELECT text FROM names WHERE name_id = ?1")?
+            .query_row([name_id], |r| r.get(0))?;
         return Ok(Some(text));
     }
     let Some(kind_id) = kind_id else {
         bail!("nodes row {nid} has neither name_id nor kind_id");
     };
-    let raw_kind: String = conn.query_row(
-        "SELECT raw_kind FROM kinds WHERE kind_id = ?1",
-        [kind_id],
-        |r| r.get(0),
-    )?;
-    let same_kind: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM nodes WHERE parent_nid IS ?1 AND kind_id = ?2",
-        params![parent_nid, kind_id],
-        |r| r.get(0),
-    )?;
+    let raw_kind: String = conn
+        .prepare_cached("SELECT raw_kind FROM kinds WHERE kind_id = ?1")?
+        .query_row([kind_id], |r| r.get(0))?;
+    let same_kind: i64 = conn
+        .prepare_cached("SELECT COUNT(*) FROM nodes WHERE parent_nid IS ?1 AND kind_id = ?2")?
+        .query_row(params![parent_nid, kind_id], |r| r.get(0))?;
     if same_kind > 1 {
-        let rank: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM nodes WHERE parent_nid IS ?1 AND kind_id = ?2 AND ord < ?3",
-            params![parent_nid, kind_id, ord],
-            |r| r.get(0),
-        )?;
+        let rank: i64 = conn
+            .prepare_cached(
+                "SELECT COUNT(*) FROM nodes WHERE parent_nid IS ?1 AND kind_id = ?2 AND ord < ?3",
+            )?
+            .query_row(params![parent_nid, kind_id, ord], |r| r.get(0))?;
         Ok(Some(format!("{raw_kind}_{rank}")))
     } else {
         Ok(Some(raw_kind))
+    }
+}
+
+/// Memoised nid → display path renderer for bulk exports.
+///
+/// Renders each node's path once and each ANCESTOR once, whatever the
+/// number of rows that share it: a path is its parent's memoised path plus
+/// the node's own display name, so an export over a whole arena costs one
+/// name lookup per distinct node and no per-row tree walk. This is the bulk
+/// counterpart of [`node_path`]; the `v_node_path` view is not — a
+/// recursive view cannot take the caller's row set as its anchor, so
+/// joining it renders every node in the arena and materialises the result
+/// (bead `ley-line-open-c6be90`).
+#[derive(Default)]
+pub struct PathRenderer {
+    paths: std::collections::HashMap<i64, Option<String>>,
+}
+
+impl PathRenderer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The display path of `nid`, or `None` when `nid` (or an ancestor) has
+    /// no `nodes` row. Memoised for every nid it visits.
+    pub fn path(&mut self, conn: &Connection, nid: i64) -> Result<Option<String>> {
+        if let Some(hit) = self.paths.get(&nid) {
+            return Ok(hit.clone());
+        }
+        let Some(name) = node_display_name(conn, nid)? else {
+            self.paths.insert(nid, None);
+            return Ok(None);
+        };
+        let parent: Option<i64> = conn
+            .prepare_cached("SELECT parent_nid FROM nodes WHERE nid = ?1")?
+            .query_row([nid], |r| r.get::<_, Option<i64>>(0))
+            .optional()?
+            .flatten();
+        // Only the root directory has an empty name, and it has no parent,
+        // so a child's name is never empty here.
+        let rendered = match parent {
+            None => Some(name),
+            Some(parent) => match self.path(conn, parent)? {
+                None => None,
+                Some(prefix) if prefix.is_empty() => Some(name),
+                Some(prefix) => Some(format!("{prefix}/{name}")),
+            },
+        };
+        self.paths.insert(nid, rendered.clone());
+        Ok(rendered)
     }
 }
 
@@ -532,9 +577,8 @@ pub fn node_path(conn: &Connection, nid: i64) -> Result<Option<String>> {
             segments.push(name);
         }
         cursor = conn
-            .query_row("SELECT parent_nid FROM nodes WHERE nid = ?1", [cur], |r| {
-                r.get::<_, Option<i64>>(0)
-            })
+            .prepare_cached("SELECT parent_nid FROM nodes WHERE nid = ?1")?
+            .query_row([cur], |r| r.get::<_, Option<i64>>(0))
             .optional()?
             .flatten();
     }
@@ -563,12 +607,11 @@ pub fn resolve_path(conn: &Connection, path: &str) -> Result<Option<i64>> {
         let comp = comps[i];
         // A file at the current level?
         let file: Option<i64> = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT f.file_id FROM files f JOIN names n ON n.name_id = f.name_id \
                  WHERE f.dir_id = ?1 AND n.text = ?2",
-                params![dir_id, comp],
-                |r| r.get(0),
-            )
+            )?
+            .query_row(params![dir_id, comp], |r| r.get(0))
             .optional()?;
         if let Some(file_id) = file {
             node = Some(file_nid(file_id, 0));
@@ -577,12 +620,11 @@ pub fn resolve_path(conn: &Connection, path: &str) -> Result<Option<i64>> {
         }
         // A subdirectory?
         let sub: Option<i64> = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT d.dir_id FROM dirs d JOIN names n ON n.name_id = d.name_id \
                  WHERE d.parent_dir_id = ?1 AND n.text = ?2",
-                params![dir_id, comp],
-                |r| r.get(0),
-            )
+            )?
+            .query_row(params![dir_id, comp], |r| r.get(0))
             .optional()?;
         match sub {
             Some(d) => {
@@ -614,13 +656,12 @@ fn resolve_ast_segment(conn: &Connection, parent_nid: i64, segment: &str) -> Res
     // (the writer only renders the bare kind in that case — a bare kind with
     // multiple children cannot be a rendered name, so it is not a match).
     let singleton: Option<i64> = conn
-        .query_row(
+        .prepare_cached(
             "SELECT CASE WHEN COUNT(*) = 1 THEN MIN(n.nid) END \
              FROM nodes n JOIN kinds k ON k.kind_id = n.kind_id \
              WHERE n.parent_nid = ?1 AND k.raw_kind = ?2",
-            params![parent_nid, segment],
-            |r| r.get(0),
-        )
+        )?
+        .query_row(params![parent_nid, segment], |r| r.get(0))
         .optional()?
         .flatten();
     if let Some(nid) = singleton {
@@ -635,14 +676,17 @@ fn resolve_ast_segment(conn: &Connection, parent_nid: i64, segment: &str) -> Res
     if rank_str.is_empty() || !rank_str.bytes().all(|b| b.is_ascii_digit()) {
         return Ok(None);
     }
-    let rank: i64 = rank_str.parse().unwrap_or(-1);
-    conn.query_row(
+    // All digits, but possibly more than an i64 holds: that names no
+    // sibling, so it resolves to nothing rather than to an OFFSET fallback.
+    let Ok(rank) = rank_str.parse::<i64>() else {
+        return Ok(None);
+    };
+    conn.prepare_cached(
         "SELECT n.nid FROM nodes n JOIN kinds k ON k.kind_id = n.kind_id \
          WHERE n.parent_nid = ?1 AND k.raw_kind = ?2 \
          ORDER BY n.ord LIMIT 1 OFFSET ?3",
-        params![parent_nid, kind, rank],
-        |r| r.get(0),
-    )
+    )?
+    .query_row(params![parent_nid, kind, rank], |r| r.get(0))
     .optional()
     .map_err(Into::into)
 }
@@ -1160,6 +1204,68 @@ mod tests {
         assert_eq!(
             node_path(&conn, base + 3).unwrap().unwrap(),
             "src/a.go/function_declaration/identifier_1"
+        );
+    }
+
+    /// The memoised bulk renderer and the point renderer agree on every
+    /// row, in any visiting order, and a nid with no row renders `None`
+    /// without poisoning the memo of its neighbours.
+    #[test]
+    fn path_renderer_matches_node_path_for_every_row() {
+        let (conn, _) = display_fixture();
+        let mut nids: Vec<i64> = {
+            let mut stmt = conn.prepare("SELECT nid FROM nodes").unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert!(nids.len() >= 6, "fixture must produce rows");
+        // Deepest first, so the memo is filled bottom-up on the first
+        // visit and hit top-down afterwards.
+        nids.sort_unstable_by_key(|n| std::cmp::Reverse(*n));
+        let mut renderer = PathRenderer::new();
+        for pass in 0..2 {
+            for &nid in &nids {
+                assert_eq!(
+                    renderer.path(&conn, nid).unwrap(),
+                    node_path(&conn, nid).unwrap(),
+                    "pass {pass}: nid {nid}"
+                );
+            }
+        }
+        let ghost = file_nid(1, 999_999);
+        assert_eq!(renderer.path(&conn, ghost).unwrap(), None);
+        assert_eq!(
+            renderer.path(&conn, nids[0]).unwrap(),
+            node_path(&conn, nids[0]).unwrap()
+        );
+    }
+
+    /// A rank suffix that is all digits but overflows i64 names no sibling:
+    /// it resolves to `None`, not to whatever `OFFSET` makes of a fallback
+    /// value.
+    #[test]
+    fn resolve_path_rejects_an_overflowing_rank() {
+        let (conn, _) = display_fixture();
+        assert!(
+            resolve_path(&conn, "src/a.go/function_declaration/identifier_1")
+                .unwrap()
+                .is_some(),
+            "fixture: the suffixed identifier resolves"
+        );
+        assert_eq!(
+            resolve_path(
+                &conn,
+                "src/a.go/function_declaration/identifier_99999999999999999999"
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_path(&conn, "src/a.go/function_declaration/identifier_7").unwrap(),
+            None,
+            "an in-range rank past the last sibling resolves to nothing too"
         );
     }
 

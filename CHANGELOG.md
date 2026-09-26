@@ -10,6 +10,49 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Every mount op re-opened the control file and re-compiled its path
+  lookups** (bead `ley-line-open-c6cbb4`, clauses 2 and 3). `HotSwapGraph`
+  polled `current_root` by opening, statting and mapping the control file
+  on every FUSE/NFS op; it now keeps the mapping for its lifetime and reads
+  the root through it (a publish through any other handle is shared
+  memory, so it is still seen). `resolve_path`, `resolve_ast_segment`,
+  `node_display_name` and `node_path` prepare every statement through the
+  connection's statement cache; an op that resolved a path segment by
+  segment compiled 10–15 statements before, none now. The quadratic
+  per-kind sibling rank in `v_node_name` (clause 1) needs a stored column
+  and waits on the projection-v7 decision.
+- **The token-map export rendered every node's path in the arena** (bead
+  `ley-line-open-c6be90`). `get_refs_map` / `get_defs_map` joined the
+  recursive `v_node_path` view; SQLite cannot push the join key into a
+  recursive anchor, so any export, however small, materialised the display
+  path of every node in the arena and built a temporary index over it. The
+  export now selects `(token, nid)` and renders paths in Rust through
+  `leyline_schema::PathRenderer`, a memoised ancestor walk that names each
+  distinct node and each ancestor once. Measured on a synthetic Go corpus
+  (one refs-map call, SQLite memory high-water mark): 500 files 421 ms →
+  74 ms and 22 MB → 17 MB; 5 000 files 4.76 s → 0.75 s and 42 MB → 26 MB —
+  linear in the export's rows instead of in the arena. The per-token
+  ordering of paths on the wire is unchanged.
+- **LSP symbols attached to another file's node on multi-file arenas**
+  (bead `ley-line-open-2b7066`). `merge_symbol` resolved a symbol's
+  position against `_ast` with no file predicate, so on any arena with more
+  than one file a symbol at a common position (`package main` at 0:0, `func
+  main` at row 2) keyed on whichever file's node had the smallest nid, and
+  the last file enriched overwrote the others' `_lsp` rows. There is now one
+  position→node resolver in `leyline-lsp`, `ast_node_at(conn, file_id, row,
+  col, kinds)`, scoped by the file's nid range (a primary-key range search);
+  the symbol merge and both binding-record lookups go through it, and
+  `merge_lsp_into_ast` takes the source id (`_source.id`, the arena-relative
+  path). With an AST present, a file the projection does not hold is an
+  error ("parse it before merging LSP data") instead of a graft onto the
+  wrong node; a standalone LSP db with no AST keeps its synthetic
+  addresses. `leyline lsp --merge-db` resolves the source id from
+  `_source.path`. Symbols now
+  key on the node at their selection range (the name identifier) rather
+  than the smallest token starting on that row.
+
 ## [0.20.0] — 2026-09-17
 
 The projection is **v6** (v0.19.1 shipped v4): node ids are file-scoped

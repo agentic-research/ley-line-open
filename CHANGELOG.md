@@ -12,6 +12,16 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **The mount test could hang `task ci` forever** (bead
+  `ley-line-open-667b3b`). A read or stat on a FUSE mount whose fuse-t
+  server has stopped answering never returns, so the test's between-call
+  deadline could not end it, and a killed run left the mount and its
+  server behind for the next run to trip on. Every kernel-facing call now
+  runs under a deadline enforced from outside the syscall; on timeout, or
+  on any failed assertion, the test kills the server, force-unmounts, and
+  fails with a diagnosis naming the mountpoint and the pids. A falsifier
+  (`LEYLINE_MOUNT_WEDGE=1`) stops the server with SIGSTOP and observes the
+  diagnosed failure within the deadline with nothing left mounted.
 - **Every mount op re-opened the control file and re-compiled its path
   lookups** (bead `ley-line-open-c6cbb4`, clauses 2 and 3). `HotSwapGraph`
   polled `current_root` by opening, statting and mapping the control file

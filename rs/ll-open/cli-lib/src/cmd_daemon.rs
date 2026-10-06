@@ -1350,8 +1350,8 @@ pub fn snapshot_to_arena(conn: &rusqlite::Connection, ctrl_path: &Path) -> Resul
     // advance). Fresh-opening readers see arena_size = new_size; file
     // is already at new_size from step 1 so the advertised size is
     // safe to mmap. Polling readers don't refresh because current_root
-    // is preserved (set_arena bumps the sync atom but keeps the root
-    // bytes unchanged — readers compare roots, not the atom). Failure
+    // is preserved (set_arena publishes under the seqlock but keeps the
+    // root bytes unchanged — readers compare roots, not the sequence). Failure
     // here MUST abort the snapshot — see invariant 3.
     if new_size != arena_size {
         eprintln!(

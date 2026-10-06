@@ -343,6 +343,17 @@ impl Controller {
         Ok(())
     }
 
+    /// **Test-only, unsynchronized root view**: the root bytes as they
+    /// sit in the mapping right now, ignoring the seqlock. Lets a test
+    /// prove that a writer held mid-publish really has left a torn root
+    /// behind, which is what the seqlock reader must hide.
+    #[cfg(test)]
+    fn unsynchronized_root(&self) -> [u8; 32] {
+        let mut out = [0u8; CURRENT_ROOT_LEN];
+        self.volatile_copy_out(OFF_CURRENT_ROOT, &mut out);
+        out
+    }
+
     /// **Re-advertise without publishing new content.** Writes path
     /// and size to the control block under the seqlock but **preserves
     /// the existing `current_root` unchanged**. Used for the snapshot's
@@ -561,6 +572,7 @@ mod tests {
         let mut writer = Controller::open_or_create(&path).unwrap();
         writer.set_arena_with_root("/tmp/a", 1, ROOT_A).unwrap();
         let reader = Controller::open_or_create(&path).unwrap();
+        let probe = Controller::open_or_create(&path).unwrap();
 
         let attempts = Arc::new(AtomicU64::new(0));
         let completed = Arc::new(AtomicU64::new(0));
@@ -587,10 +599,33 @@ mod tests {
 
         const PUBLISHES: u64 = 16;
         for i in 0..PUBLISHES {
-            let root = if i.is_multiple_of(2) { ROOT_B } else { ROOT_A };
+            let (root, prev) = if i.is_multiple_of(2) {
+                (ROOT_B, ROOT_A)
+            } else {
+                (ROOT_A, ROOT_B)
+            };
             let (attempts, completed) = (attempts.clone(), completed.clone());
             writer
                 .set_arena_with_root_hooked("/tmp/a", 1, root, &mut || {
+                    // The mapping really is torn at this point: new first
+                    // half, old second half. This is the state the seqlock
+                    // reader must never hand out.
+                    let raw = probe.unsynchronized_root();
+                    assert_ne!(
+                        raw, prev,
+                        "hook must sit after some of the new root was written"
+                    );
+                    assert_ne!(
+                        raw, root,
+                        "hook must sit before the whole new root was written"
+                    );
+                    let half = CURRENT_ROOT_LEN / 2;
+                    assert_eq!(raw[..half], root[..half], "hook sits after the first half");
+                    assert_eq!(
+                        raw[half..],
+                        prev[half..],
+                        "hook sits before the second half"
+                    );
                     // Hold the half-written root until a read that STARTED
                     // during the hold has either finished (old protocol:
                     // it finished torn) or is still waiting on us (seqlock:
@@ -624,6 +659,24 @@ mod tests {
             completed.load(Ordering::Acquire) >= PUBLISHES,
             "the reader must have read across every publish"
         );
+    }
+
+    /// A shorter path published over a longer one must read back exactly:
+    /// the null terminator has to land right after the new path, not
+    /// anywhere else in the 256-byte region.
+    #[test]
+    fn a_shorter_path_published_over_a_longer_one_reads_back_exactly() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("paths.ctrl");
+        let mut ctrl = Controller::open_or_create(&path).unwrap();
+        ctrl.set_arena("/arena/with/a/rather/long/path.db", 7)
+            .unwrap();
+        assert_eq!(ctrl.arena_path(), "/arena/with/a/rather/long/path.db");
+        ctrl.set_arena("/short", 7).unwrap();
+        assert_eq!(ctrl.arena_path(), "/short");
+        ctrl.set_arena_with_root("/mid/len.db", 7, ROOT_A).unwrap();
+        assert_eq!(ctrl.arena_path(), "/mid/len.db");
+        assert_eq!(ctrl.current_root(), ROOT_A);
     }
 
     /// The acceptance stress: at least 10^5 reads concurrent with a

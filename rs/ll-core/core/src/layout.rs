@@ -314,7 +314,7 @@ mod tests {
         assert_eq!(
             ArenaHeader::VERSION,
             2,
-            "T2.4: ArenaHeader VERSION must be 2 (paired with control::VERSION=2)"
+            "T2.4: ArenaHeader VERSION must be 2 (the arena layout did not change with control::VERSION=3)"
         );
     }
 

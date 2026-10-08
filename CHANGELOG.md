@@ -10,8 +10,43 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: the control block is published under a seqlock; `.ctrl`
+  VERSION 2 → 3** (bead `ley-line-open-49a1ef`). The V2 writer stored the
+  296-byte payload (arena path, size, `current_root`) and then bumped the
+  counter at `[8..16]` once, so a reader that overlapped a publish could
+  copy half of the old root and half of the new one and had no way to
+  tell. The V3 writer increments the counter to odd (AcqRel) before the
+  first payload byte and to even (Release) after the last; the reader
+  loads the counter, retries while it is odd, copies the payload with
+  volatile loads, fences (Acquire), reloads the counter and keeps the copy
+  only when the two loads agree. `current_root`, `arena_path` and
+  `arena_size` each return one whole published value. `open_or_create`
+  rejects a V2 file with an error naming both versions; the layout
+  (offsets, magic, 4096 bytes) is unchanged, only the counter's meaning
+  is. Every process sharing a control block must move together: mache's
+  `internal/control` reader pins `Version = 2` and must adopt the seqlock
+  read loop (odd → retry; before ≠ after → retry) alongside the version
+  bump. Closing tests: `a_reader_overlapping_a_publish_never_sees_a_torn_root`
+  holds the writer between the two halves of its root write until a read
+  that started during the hold has resolved, which the V2 protocol fails
+  deterministically; `concurrent_publish_stress_yields_only_published_roots`
+  performs 10^5 reads against a publishing writer and accepts zero
+  never-published roots.
+
 ### Fixed
 
+- **The mount test could hang `task ci` forever** (bead
+  `ley-line-open-667b3b`). A read or stat on a FUSE mount whose fuse-t
+  server has stopped answering never returns, so the test's between-call
+  deadline could not end it, and a killed run left the mount and its
+  server behind for the next run to trip on. Every kernel-facing call now
+  runs under a deadline enforced from outside the syscall; on timeout, or
+  on any failed assertion, the test kills the server, force-unmounts, and
+  fails with a diagnosis naming the mountpoint and the pids. A falsifier
+  (`LEYLINE_MOUNT_WEDGE=1`) stops the server with SIGSTOP and observes the
+  diagnosed failure within the deadline with nothing left mounted.
 - **Every mount op re-opened the control file and re-compiled its path
   lookups** (bead `ley-line-open-c6cbb4`, clauses 2 and 3). `HotSwapGraph`
   polled `current_root` by opening, statting and mapping the control file

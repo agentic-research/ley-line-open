@@ -80,7 +80,7 @@ Content-addressed storage and snapshot primitives used by the other crates.
 
 | Crate | Purpose | Key types |
 |---|---|---|
-| `leyline-core` | Arena primitives. mmap'd files + control block + generation counter for hot-reload. `ContentAddressed` trait = the σ substrate entry point (BLAKE3-locked per Σ §3.4) | `ArenaHeader`, `Controller`, `ContentAddressed`, `Hash` |
+| `leyline-core` | Arena primitives. mmap'd files + control block (v3, published under a seqlock; readers poll `current_root` for hot-reload). `ContentAddressed` trait = the σ substrate entry point (BLAKE3-locked per Σ §3.4) | `ArenaHeader`, `Controller`, `ContentAddressed`, `Hash` |
 | `leyline-schema` | Shared SQLite schema for the `nodes` table + indexes | `create_schema`, `insert_node` |
 | `leyline-public-schema` | Capnp wire schema for the daemon UDS + MCP transport. Source of truth for every base op's request/response shape with `$Json.name` annotations for camel↔snake | `capnp/daemon.capnp` |
 | `leyline-schema-capnp` | Capnp schemas for the Σ event log (`AstNode`, `SourceFile`, `BindingRecord`, `Head`, `AstNodeList`). Decade `ley-line-open-9d30ac` | Generated Rust bindings |

@@ -1,26 +1,42 @@
-//! Control block for content-addressed Σ substrate identity (T2.4 V2).
+//! Control block for content-addressed Σ substrate identity (V3).
 //!
 //! A 4096-byte memory-mapped file naming the currently-active arena.
 //! Substrate identity is `current_root` — BLAKE3 over the live arena
 //! payload. Polling readers compare `current_root()` for change
-//! detection; an atomic Acquire-load on a private sync counter fences
-//! the byte reads against the writer's Release-store inside
-//! `set_arena*`.
+//! detection.
 //!
-//! Layout (matches Go `internal/control/control.go` post-T2.4):
+//! Layout (matches Go `internal/control/control.go`):
 //!   [0..4]     Magic: 0x4C455943 ('LEYC')
-//!   [4..8]     Version: u32 (must be 2)
-//!   [8..16]    Sync atom: AtomicU64 (private — Acquire/Release fence;
-//!                                    formerly the V1 `generation` field)
+//!   [4..8]     Version: u32 (must be 3)
+//!   [8..16]    Sequence: AtomicU64 seqlock counter (private; odd while
+//!                                    a publish is in progress, even at
+//!                                    rest; formerly the V1 `generation`)
 //!   [16..272]  ArenaPath: [u8; 256] (null-terminated)
 //!   [272..280] ArenaSize: u64
 //!   [280..320] Interrupt fields (feature = "interrupt"; reserved otherwise)
 //!   [320..352] CurrentRoot: [u8; 32]  — Σ root pointer
 //!   [352..4096] Padding
 //!
-//! V1 (pre-T2.4) exposed `generation` as a public counter; V2 removes
-//! that surface entirely. Old binaries reading new files (or vice
-//! versa) hit the explicit VERSION-mismatch error in `open_or_create`.
+//! # Publication protocol (seqlock)
+//!
+//! The payload (path, size, root) is 296 bytes; no hardware writes it
+//! atomically, so a reader that overlaps a publish could otherwise copy
+//! half of the old root and half of the new one. V3 makes the overlap
+//! detectable:
+//!
+//! - The writer increments the sequence to ODD (AcqRel) before touching
+//!   the payload and to EVEN (Release) after the last payload byte.
+//! - The reader loads the sequence (Acquire); if it is odd a publish is
+//!   in flight and it yields and retries. It copies the payload, issues
+//!   an Acquire fence, reloads the sequence, and accepts the copy only
+//!   when the two loads are equal. Any publish that began or ended during
+//!   the copy changes the sequence, so a torn copy is always rejected.
+//!
+//! V2 (T2.4) wrote the payload and then bumped the counter once; a
+//! reader could not tell an in-flight publish from a finished one. V1
+//! exposed `generation` as a public counter. Old binaries reading new
+//! files (or vice versa) hit the explicit VERSION-mismatch error in
+//! `open_or_create`.
 
 use std::fs::OpenOptions;
 use std::path::Path;
@@ -29,6 +45,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::mmap::mmap_write;
 use anyhow::{Context, Result, bail};
 use memmap2::MmapMut;
+
+/// One consistent copy of the control block payload, as the seqlock
+/// reader hands it out (see `Controller::snapshot`).
+struct Snapshot {
+    path: [u8; ARENA_PATH_LEN],
+    size: [u8; 8],
+    root: [u8; CURRENT_ROOT_LEN],
+}
 
 /// Control block size: one page.
 pub const CONTROL_SIZE: usize = 4096;
@@ -39,19 +63,20 @@ pub const MAGIC: u32 = 0x4C455943;
 /// **T2.4 — Σ content-addressed substrate, breaking version 2.**
 ///
 /// V1 (pre-T2.4) exposed `generation: u64` as the public substrate
-/// identity. V2 removes generation from the public API entirely;
+/// identity. V2 removed generation from the public API;
 /// `current_root` (BLAKE3 of arena bytes) IS the substrate identity.
-/// The byte slot at `OFF_GENERATION` is preserved as a *private*
-/// monotone sync counter — readers Acquire-load it inside
-/// `current_root()` to fence the subsequent byte reads, and writers
-/// Release-store it inside `set_arena*` to publish prior plain stores.
-/// Callers cannot access this counter; all polling is by root.
+/// V3 turns the private counter at `OFF_GENERATION` into a seqlock
+/// sequence: odd while `set_arena*` is writing the payload, even at
+/// rest. Readers retry while it is odd or when it changes under them,
+/// so a read never returns a half-published root (see the module
+/// docs). Callers cannot access this counter; all polling is by root.
 ///
-/// Bumping VERSION 1 → 2 means old `.ctrl` files are rejected by new
-/// binaries and vice versa. This is a deliberate breakpoint pairing
-/// with mache's CGO-elimination cutover (decade `9d30ac` T2,
-/// epic `mache-36d961`). Coordinate releases.
-pub const VERSION: u32 = 2;
+/// Every VERSION bump means old `.ctrl` files are rejected by new
+/// binaries and vice versa. 2 → 3 is a deliberate breakpoint: the V2
+/// reader cannot detect an in-flight publish, and a V3 reader must not
+/// trust a V2 writer that never marks one. Coordinate with mache's
+/// `internal/control` reader (bead ley-line-open-49a1ef).
+pub const VERSION: u32 = 3;
 
 // Field offsets (matching Go's #[repr(C)] layout)
 const OFF_MAGIC: usize = 0;
@@ -79,15 +104,14 @@ const OFF_PAYLOAD_LEN: usize = 312;
 const OFF_CURRENT_ROOT: usize = 320;
 const CURRENT_ROOT_LEN: usize = 32;
 
-// Compile-time invariant: the sync atom slot must be 8-byte aligned for
-// the AtomicU64 cast in sync_counter_acquire / bump_sync_counter_release
-// to be sound. mmap is page-aligned, so any 8-byte-aligned offset within
+// Compile-time invariant: the sequence slot must be 8-byte aligned for
+// the AtomicU64 cast in `Controller::sequence` to be sound. mmap is page-aligned, so any 8-byte-aligned offset within
 // it gives an 8-byte-aligned pointer. If a future field reorder violates
 // this, the cast becomes UB on architectures requiring naturally-aligned
 // atomics (e.g. aarch64 LSE) — fail compilation instead.
 const _: () = assert!(
     OFF_GENERATION.is_multiple_of(8),
-    "sync atom must be 8-byte aligned"
+    "seqlock sequence must be 8-byte aligned"
 );
 const _: () = assert!(
     OFF_ARENA_SIZE.is_multiple_of(8),
@@ -136,10 +160,10 @@ impl Controller {
         } else if existing_magic != MAGIC {
             bail!("invalid control block magic: 0x{:08X}", existing_magic);
         } else {
-            // VERSION mismatch is a hard error. V1 controllers
-            // exposed a public `generation` API that v0.2.0 removed;
-            // reading a V1 file as V2 (or vice versa) would silently
-            // misinterpret the sync atom slot — refuse explicitly.
+            // VERSION mismatch is a hard error. Each version changes
+            // what the counter at [8..16] means (V1 public generation,
+            // V2 publish-then-bump, V3 seqlock); reading one as another
+            // would silently misinterpret it — refuse explicitly.
             let existing_version = u32::from_ne_bytes(
                 mmap[OFF_VERSION..OFF_VERSION + 4]
                     .try_into()
@@ -148,9 +172,10 @@ impl Controller {
             if existing_version != VERSION {
                 bail!(
                     "control block VERSION mismatch: file has v{}, this binary expects v{}. \
-                     LLO v0.2.0 removed the V1 `generation` field from the public API; \
-                     old binaries cannot read new files and vice versa. Coordinate LLO + \
-                     mache release cutover (LLO v0.2.0 + mache v0.8.0 ship together).",
+                     v3 publishes the control block under a seqlock (odd sequence while a \
+                     publish is in flight); older readers cannot detect an in-flight publish \
+                     and older writers never mark one, so the versions do not interoperate. \
+                     Upgrade every leyline and mache process sharing this control block.",
                     existing_version,
                     VERSION
                 );
@@ -205,55 +230,103 @@ impl Controller {
         unsafe { &*ptr }
     }
 
-    /// **T2.4 internal sync atom — Acquire load.** Not exposed in the
-    /// public API. Pairs with the writer's Release-store inside
-    /// `set_arena*` to fence the plain byte reads of `current_root`,
-    /// `arena_path`, and `arena_size`. Public callers compare
-    /// `current_root()` for identity / change detection.
-    fn sync_counter_acquire(&self) -> u64 {
-        self.atomic_at(OFF_GENERATION).load(Ordering::Acquire)
+    /// The seqlock sequence (see the module docs). Not exposed in the
+    /// public API; public callers compare `current_root()` for identity
+    /// and change detection.
+    fn sequence(&self) -> &AtomicU64 {
+        self.atomic_at(OFF_GENERATION)
+    }
+
+    /// Copy `dst.len()` payload bytes starting at `offset` out of the
+    /// mapping with volatile loads. The writer may be storing into the
+    /// same bytes from another thread or process; the seqlock around
+    /// this copy decides whether the result is kept, and the volatile
+    /// loads keep the compiler from caching or splitting the copy in
+    /// ways the sequence check could not see.
+    fn volatile_copy_out(&self, offset: usize, dst: &mut [u8]) {
+        assert!(offset + dst.len() <= self.mmap.len());
+        let src = self.mmap[offset..].as_ptr();
+        for (i, slot) in dst.iter_mut().enumerate() {
+            // SAFETY: `offset + i < mmap.len()` by the assertion above,
+            // and the mapping outlives `&self`.
+            *slot = unsafe { std::ptr::read_volatile(src.add(i)) };
+        }
+    }
+
+    /// Store `src` into the mapping at `offset` with volatile stores.
+    /// Counterpart of `volatile_copy_out`; called only between
+    /// `seq_begin` and `seq_end`.
+    fn volatile_copy_in(&mut self, offset: usize, src: &[u8]) {
+        assert!(offset + src.len() <= self.mmap.len());
+        let dst = self.mmap[offset..].as_mut_ptr();
+        for (i, &byte) in src.iter().enumerate() {
+            // SAFETY: `offset + i < mmap.len()` by the assertion above,
+            // and `&mut self` gives exclusive access to the mapping
+            // within this process.
+            unsafe { std::ptr::write_volatile(dst.add(i), byte) };
+        }
+    }
+
+    /// A consistent copy of the published payload: `(path, size, root)`
+    /// exactly as some single `set_arena*` call left them.
+    ///
+    /// Seqlock read side: load the sequence (Acquire); retry while it is
+    /// odd (a publish is in flight); copy the payload; Acquire fence;
+    /// reload the sequence; keep the copy only if the sequence did not
+    /// move. A writer that began or finished a publish during the copy
+    /// changed the sequence, so a torn copy never escapes.
+    fn snapshot(&self) -> Snapshot {
+        let seq = self.sequence();
+        loop {
+            let before = seq.load(Ordering::Acquire);
+            if before & 1 == 1 {
+                std::thread::yield_now();
+                continue;
+            }
+            let mut snap = Snapshot {
+                path: [0u8; ARENA_PATH_LEN],
+                size: [0u8; 8],
+                root: [0u8; CURRENT_ROOT_LEN],
+            };
+            self.volatile_copy_out(OFF_ARENA_PATH, &mut snap.path);
+            self.volatile_copy_out(OFF_ARENA_SIZE, &mut snap.size);
+            self.volatile_copy_out(OFF_CURRENT_ROOT, &mut snap.root);
+            std::sync::atomic::fence(Ordering::Acquire);
+            let after = seq.load(Ordering::Relaxed);
+            if before == after {
+                return snap;
+            }
+        }
     }
 
     /// Get the path to the currently active arena.
     pub fn arena_path(&self) -> String {
-        let bytes = &self.mmap[OFF_ARENA_PATH..OFF_ARENA_PATH + ARENA_PATH_LEN];
+        let bytes = self.snapshot().path;
         let end = bytes.iter().position(|&b| b == 0).unwrap_or(ARENA_PATH_LEN);
         String::from_utf8_lossy(&bytes[..end]).to_string()
     }
 
     /// Get the size of the currently active arena.
     pub fn arena_size(&self) -> u64 {
-        u64::from_ne_bytes(
-            self.mmap[OFF_ARENA_SIZE..OFF_ARENA_SIZE + 8]
-                .try_into()
-                .expect("8-byte slice ⇒ [u8; 8]"),
-        )
+        u64::from_ne_bytes(self.snapshot().size)
     }
 
     /// Read the current arena root (Σ root pointer).
     ///
-    /// **T2.4: this is the substrate's primary identity field.**
+    /// **This is the substrate's primary identity field.**
     /// Returns `[0u8; 32]` — the zero sentinel — when no root has
     /// been published yet (fresh control file). Callers comparing
     /// roots for change detection (e.g. HotSwapGraph polling) treat
     /// `current_root() != cached_root` as a publish event.
     ///
-    /// Internally Acquire-loads the private sync counter, fencing
-    /// the plain byte reads of `current_root` against the writer's
-    /// Release-store inside `set_arena*`. **The Acquire is per-call:**
-    /// it pairs with the Release for the bytes read inside this
-    /// method only. Subsequent calls to `arena_path()` / `arena_size()`
-    /// are NOT fenced relative to a concurrent writer; under polling
-    /// the safe pattern is to dispatch on root change, then re-open a
-    /// fresh `Controller` (single mmap snapshot of the file). See
-    /// `HotSwapGraph::maybe_swap` for the reference impl.
+    /// The returned root is always one that some `set_arena_with_root`
+    /// call published in full (seqlock, see the module docs). **The
+    /// consistency is per-call:** a following `arena_path()` or
+    /// `arena_size()` is its own snapshot and may already reflect a
+    /// later publish. See `HotSwapGraph::maybe_swap` for the reference
+    /// polling implementation.
     pub fn current_root(&self) -> [u8; 32] {
-        // Acquire fence on the internal sync counter. Any prior
-        // writer-Release-store happens-before the byte reads below.
-        let _ = self.sync_counter_acquire();
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&self.mmap[OFF_CURRENT_ROOT..OFF_CURRENT_ROOT + CURRENT_ROOT_LEN]);
-        out
+        self.snapshot().root
     }
 
     /// **Test-only, unfenced root setter** (gated `#[cfg(test)]`).
@@ -270,11 +343,21 @@ impl Controller {
         Ok(())
     }
 
-    /// **T2.4: re-advertise without publishing new content.** Writes
-    /// path and size to the control block, increments the internal
-    /// sync counter via Release-store, but **preserves the existing
-    /// `current_root` unchanged**. Used for the snapshot's step-2
-    /// re-advertisement (file grow without commit) and for test
+    /// **Test-only, unsynchronized root view**: the root bytes as they
+    /// sit in the mapping right now, ignoring the seqlock. Lets a test
+    /// prove that a writer held mid-publish really has left a torn root
+    /// behind, which is what the seqlock reader must hide.
+    #[cfg(test)]
+    fn unsynchronized_root(&self) -> [u8; 32] {
+        let mut out = [0u8; CURRENT_ROOT_LEN];
+        self.volatile_copy_out(OFF_CURRENT_ROOT, &mut out);
+        out
+    }
+
+    /// **Re-advertise without publishing new content.** Writes path
+    /// and size to the control block under the seqlock but **preserves
+    /// the existing `current_root` unchanged**. Used for the snapshot's
+    /// step-2 re-advertisement (file grow without commit) and for test
     /// fixtures that don't need a published root.
     ///
     /// Polling readers (HotSwapGraph) compare `current_root` to
@@ -292,19 +375,9 @@ impl Controller {
             );
         }
 
-        // Write path (null-terminated)
-        self.mmap[OFF_ARENA_PATH..OFF_ARENA_PATH + path.len()].copy_from_slice(path.as_bytes());
-        self.mmap[OFF_ARENA_PATH + path.len()] = 0;
-
-        // Write size
-        self.mmap[OFF_ARENA_SIZE..OFF_ARENA_SIZE + 8].copy_from_slice(&size.to_ne_bytes());
-
-        // Bump the internal sync counter via Release-store. Readers
-        // doing Acquire-load on the counter see all prior writes
-        // (path, size). current_root is *not* modified here. The
-        // Release-store itself is the ordering — no separate fence
-        // needed.
-        self.bump_sync_counter_release();
+        self.seq_begin();
+        self.write_path_and_size(path, size);
+        self.seq_end();
 
         // Flush to disk
         self.mmap.flush().context("flush control block")?;
@@ -312,22 +385,37 @@ impl Controller {
         Ok(())
     }
 
-    /// Internal: atomically increment the sync counter and publish
-    /// via Release ordering. Pairs with `sync_counter_acquire`.
+    /// Payload writes shared by `set_arena*`. Caller holds the seqlock
+    /// (sequence odd). `path.len() < ARENA_PATH_LEN` is checked by the
+    /// callers before they take the lock, so a bail never leaves the
+    /// sequence odd.
+    fn write_path_and_size(&mut self, path: &str, size: u64) {
+        // Path, null-terminated.
+        self.volatile_copy_in(OFF_ARENA_PATH, path.as_bytes());
+        self.volatile_copy_in(OFF_ARENA_PATH + path.len(), &[0]);
+        self.volatile_copy_in(OFF_ARENA_SIZE, &size.to_ne_bytes());
+    }
+
+    /// Seqlock write side, entry: sequence even → odd. AcqRel so the
+    /// payload stores that follow cannot be reordered before the mark;
+    /// a reader that sees the odd value knows a publish is in flight.
     ///
-    /// Uses `fetch_add(1, Release)` rather than load-modify-store so
-    /// concurrent writers (cross-process publishers — exactly what
-    /// mmap-backed control blocks enable) cannot lose increments.
-    /// The substrate's intended invariant is single-writer per
-    /// `(path, size, root)` advance, but the underlying byte slot is
-    /// process-shared and we should not rely on the invariant for
-    /// soundness of the counter itself. Release ordering still gives
-    /// the happens-before pair with `sync_counter_acquire` for the
-    /// plain byte writes preceding this call.
-    fn bump_sync_counter_release(&mut self) {
-        let _ = self
-            .atomic_at(OFF_GENERATION)
-            .fetch_add(1, Ordering::Release);
+    /// `fetch_add` rather than load-modify-store so concurrent writers
+    /// (cross-process publishers — exactly what mmap-backed control
+    /// blocks enable) cannot lose increments. The substrate's intended
+    /// invariant is a single writer per `(path, size, root)` advance;
+    /// the counter's soundness does not rely on it.
+    fn seq_begin(&mut self) {
+        let prev = self.sequence().fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(prev & 1, 0, "seq_begin: a publish was already in flight");
+    }
+
+    /// Seqlock write side, exit: sequence odd → even. Release publishes
+    /// every payload store before it to a reader whose Acquire fence
+    /// follows its copy.
+    fn seq_end(&mut self) {
+        let prev = self.sequence().fetch_add(1, Ordering::Release);
+        debug_assert_eq!(prev & 1, 1, "seq_end: no publish was in flight");
     }
 
     /// **T2.4: atomic publish of (path, size, current_root) under a
@@ -360,6 +448,22 @@ impl Controller {
         size: u64,
         current_root: [u8; 32],
     ) -> Result<()> {
+        self.set_arena_with_root_hooked(path, size, current_root, &mut || {})
+    }
+
+    /// `set_arena_with_root` with a seam between the two halves of the
+    /// root write. Production passes a no-op; the concurrent-publish test
+    /// uses it to hold the writer mid-root so a reader is GUARANTEED to
+    /// overlap the write — the race the protocol must make unobservable,
+    /// made deterministic instead of probabilistic (bead
+    /// ley-line-open-49a1ef).
+    fn set_arena_with_root_hooked(
+        &mut self,
+        path: &str,
+        size: u64,
+        current_root: [u8; 32],
+        mid_root: &mut dyn FnMut(),
+    ) -> Result<()> {
         if path.len() >= ARENA_PATH_LEN {
             bail!(
                 "arena path too long (max {} bytes, got {})",
@@ -368,24 +472,13 @@ impl Controller {
             );
         }
 
-        // Write path (null-terminated)
-        self.mmap[OFF_ARENA_PATH..OFF_ARENA_PATH + path.len()].copy_from_slice(path.as_bytes());
-        self.mmap[OFF_ARENA_PATH + path.len()] = 0;
-
-        // Write size
-        self.mmap[OFF_ARENA_SIZE..OFF_ARENA_SIZE + 8].copy_from_slice(&size.to_ne_bytes());
-
-        // T2.2: Write current_root BEFORE the Release-store of
-        // sync counter. Plain byte copy; the Release publishes it.
-        self.mmap[OFF_CURRENT_ROOT..OFF_CURRENT_ROOT + CURRENT_ROOT_LEN]
-            .copy_from_slice(&current_root);
-
-        // T2.4: bump the internal sync counter via Release-store.
-        // The Release-store itself fences the prior plain byte writes
-        // (path, size, current_root) — readers doing the paired
-        // Acquire-load inside `current_root()` see them all. No
-        // separate hardware fence needed.
-        self.bump_sync_counter_release();
+        self.seq_begin();
+        self.write_path_and_size(path, size);
+        let half = CURRENT_ROOT_LEN / 2;
+        self.volatile_copy_in(OFF_CURRENT_ROOT, &current_root[..half]);
+        mid_root();
+        self.volatile_copy_in(OFF_CURRENT_ROOT + half, &current_root[half..]);
+        self.seq_end();
 
         // Flush to disk
         self.mmap.flush().context("flush control block")?;
@@ -457,7 +550,179 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
     use tempfile::tempdir;
+
+    const ROOT_A: [u8; 32] = [0x11; 32];
+    const ROOT_B: [u8; 32] = [0x22; 32];
+
+    /// The falsifier mache's reader could not pass against the old
+    /// write-then-bump protocol (bead ley-line-open-49a1ef): a reader that
+    /// overlaps a publish must never see a root that was never published.
+    /// The writer is held between the two halves of its root write until
+    /// a reader has started a read during the hold, so the overlap is
+    /// certain rather than one-in-five-hundred. With write-then-bump the
+    /// reader returns half of A and half of B; with the seqlock it waits
+    /// out the odd counter and returns a whole root.
+    #[test]
+    fn a_reader_overlapping_a_publish_never_sees_a_torn_root() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("seq.ctrl");
+        let mut writer = Controller::open_or_create(&path).unwrap();
+        writer.set_arena_with_root("/tmp/a", 1, ROOT_A).unwrap();
+        let reader = Controller::open_or_create(&path).unwrap();
+        let probe = Controller::open_or_create(&path).unwrap();
+
+        let attempts = Arc::new(AtomicU64::new(0));
+        let completed = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let torn = Arc::new(AtomicU64::new(0));
+        let reader_thread = {
+            let (attempts, completed, stop, torn) = (
+                attempts.clone(),
+                completed.clone(),
+                stop.clone(),
+                torn.clone(),
+            );
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    attempts.fetch_add(1, Ordering::AcqRel);
+                    let root = reader.current_root();
+                    if root != ROOT_A && root != ROOT_B {
+                        torn.fetch_add(1, Ordering::AcqRel);
+                    }
+                    completed.fetch_add(1, Ordering::AcqRel);
+                }
+            })
+        };
+
+        const PUBLISHES: u64 = 16;
+        for i in 0..PUBLISHES {
+            let (root, prev) = if i.is_multiple_of(2) {
+                (ROOT_B, ROOT_A)
+            } else {
+                (ROOT_A, ROOT_B)
+            };
+            let (attempts, completed) = (attempts.clone(), completed.clone());
+            writer
+                .set_arena_with_root_hooked("/tmp/a", 1, root, &mut || {
+                    // The mapping really is torn at this point: new first
+                    // half, old second half. This is the state the seqlock
+                    // reader must never hand out.
+                    let raw = probe.unsynchronized_root();
+                    assert_ne!(
+                        raw, prev,
+                        "hook must sit after some of the new root was written"
+                    );
+                    assert_ne!(
+                        raw, root,
+                        "hook must sit before the whole new root was written"
+                    );
+                    let half = CURRENT_ROOT_LEN / 2;
+                    assert_eq!(raw[..half], root[..half], "hook sits after the first half");
+                    assert_eq!(
+                        raw[half..],
+                        prev[half..],
+                        "hook sits before the second half"
+                    );
+                    // Hold the half-written root until a read that STARTED
+                    // during the hold has either finished (old protocol:
+                    // it finished torn) or is still waiting on us (seqlock:
+                    // it spins on the odd counter), bounded so neither
+                    // outcome can hang the test.
+                    let started = attempts.load(Ordering::Acquire);
+                    let done = completed.load(Ordering::Acquire);
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+                    while attempts.load(Ordering::Acquire) <= started
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::yield_now();
+                    }
+                    while completed.load(Ordering::Acquire) <= done
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::yield_now();
+                    }
+                })
+                .unwrap();
+        }
+        stop.store(true, Ordering::Release);
+        reader_thread.join().unwrap();
+
+        assert_eq!(
+            torn.load(Ordering::Acquire),
+            0,
+            "a reader overlapping a publish observed a root that was never published"
+        );
+        assert!(
+            completed.load(Ordering::Acquire) >= PUBLISHES,
+            "the reader must have read across every publish"
+        );
+    }
+
+    /// A shorter path published over a longer one must read back exactly:
+    /// the null terminator has to land right after the new path, not
+    /// anywhere else in the 256-byte region.
+    #[test]
+    fn a_shorter_path_published_over_a_longer_one_reads_back_exactly() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("paths.ctrl");
+        let mut ctrl = Controller::open_or_create(&path).unwrap();
+        ctrl.set_arena("/arena/with/a/rather/long/path.db", 7)
+            .unwrap();
+        assert_eq!(ctrl.arena_path(), "/arena/with/a/rather/long/path.db");
+        ctrl.set_arena("/short", 7).unwrap();
+        assert_eq!(ctrl.arena_path(), "/short");
+        ctrl.set_arena_with_root("/mid/len.db", 7, ROOT_A).unwrap();
+        assert_eq!(ctrl.arena_path(), "/mid/len.db");
+        assert_eq!(ctrl.current_root(), ROOT_A);
+    }
+
+    /// The acceptance stress: at least 10^5 reads concurrent with a
+    /// publishing writer, zero never-published roots.
+    #[test]
+    fn concurrent_publish_stress_yields_only_published_roots() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("stress.ctrl");
+        let mut writer = Controller::open_or_create(&path).unwrap();
+        writer.set_arena_with_root("/tmp/a", 1, ROOT_A).unwrap();
+        let reader = Controller::open_or_create(&path).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let published = Arc::new(AtomicU64::new(0));
+        let writer_thread = {
+            let (stop, published) = (stop.clone(), published.clone());
+            std::thread::spawn(move || {
+                let mut i = 0u64;
+                while !stop.load(Ordering::Acquire) {
+                    let root = if i.is_multiple_of(2) { ROOT_B } else { ROOT_A };
+                    writer.set_arena_with_root("/tmp/a", 1, root).unwrap();
+                    i += 1;
+                    published.store(i, Ordering::Release);
+                }
+            })
+        };
+        // Read until both bounds hold: at least 10^5 reads, and enough
+        // publishes behind them that the reads overlapped real writes
+        // (each publish also flushes the mapping, so the writer is far
+        // slower than the reader).
+        const MIN_READS: u64 = 100_000;
+        const MIN_PUBLISHES: u64 = 8;
+        let (mut reads, mut torn) = (0u64, 0u64);
+        while reads < MIN_READS || published.load(Ordering::Acquire) < MIN_PUBLISHES {
+            let root = reader.current_root();
+            if root != ROOT_A && root != ROOT_B {
+                torn += 1;
+            }
+            reads += 1;
+        }
+        stop.store(true, Ordering::Release);
+        writer_thread.join().unwrap();
+        assert_eq!(
+            torn, 0,
+            "{torn} of {reads} reads returned a never-published root"
+        );
+    }
 
     #[test]
     fn test_create_and_read() {
@@ -662,8 +927,8 @@ mod tests {
         let bytes = MAGIC.to_be_bytes();
         assert_eq!(bytes, *b"LEYC", "MAGIC bytes must spell 'LEYC'");
         assert_eq!(
-            VERSION, 2,
-            "T2.4: VERSION must be 2 (breaking — generation removed from public API)"
+            VERSION, 3,
+            "VERSION must be 3 (breaking — seqlock publication, bead ley-line-open-49a1ef)"
         );
         // Distinct from the arena's MAGIC ("LEY0"). A tool reading
         // either header dispatches on the magic to pick the parser.
@@ -875,29 +1140,33 @@ mod tests {
         );
     }
 
-    /// T2.4: VERSION mismatch on existing .ctrl is a hard error. Old
-    /// V1 controllers (pre-T2.4) cannot be read by new V2 binaries —
-    /// the breaking-change discipline ADR-0014-style.
+    /// VERSION mismatch on an existing .ctrl is a hard error. A V2
+    /// file (write-then-bump, no in-flight marker) must not be read by
+    /// a V3 seqlock binary, and the error must name both versions.
     #[test]
     fn open_rejects_mismatched_version() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("v1-old.ctrl");
+        for old in [1u32, 2] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join(format!("v{old}-old.ctrl"));
 
-        // Hand-write a fake V1 control block: correct MAGIC, version=1.
-        let mut buf = vec![0u8; CONTROL_SIZE];
-        buf[OFF_MAGIC..OFF_MAGIC + 4].copy_from_slice(&MAGIC.to_ne_bytes());
-        buf[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&1u32.to_ne_bytes());
-        std::fs::write(&path, &buf).unwrap();
+            // Hand-write an old control block: correct MAGIC, old version.
+            let mut buf = vec![0u8; CONTROL_SIZE];
+            buf[OFF_MAGIC..OFF_MAGIC + 4].copy_from_slice(&MAGIC.to_ne_bytes());
+            buf[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&old.to_ne_bytes());
+            std::fs::write(&path, &buf).unwrap();
 
-        let result = Controller::open_or_create(&path);
-        let err = match result {
-            Ok(_) => panic!("expected VERSION mismatch error"),
-            Err(e) => e,
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("VERSION mismatch") && msg.contains("v1") && msg.contains("v2"),
-            "T2.4 error must clearly identify the V1→V2 breaking change (got: {msg})",
-        );
+            let result = Controller::open_or_create(&path);
+            let err = match result {
+                Ok(_) => panic!("expected VERSION mismatch error for v{old}"),
+                Err(e) => e,
+            };
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("VERSION mismatch")
+                    && msg.contains(&format!("file has v{old}"))
+                    && msg.contains("expects v3"),
+                "error must name the file's v{old} and the binary's v3 (got: {msg})",
+            );
+        }
     }
 }

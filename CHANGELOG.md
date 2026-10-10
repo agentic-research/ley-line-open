@@ -10,6 +10,23 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Added
+
+- **ADR-0040 — The write boundary: source and manifest are the data, the
+  arena is a cache** (`docs/adr/0040-the-write-boundary.md`, review bead
+  `ley-line-open-e79c0f`). One SQLite arena was serving two products, a
+  regenerable index for mache and the system of record for mount, splice and
+  cloister edits, and every root tried to name both. The ADR models the fix
+  as rings applied to bytes: ring 0 is `source_blobs` plus a manifest with one
+  writer and a scheme-tagged `treeRoot` beside the run receipt `Head.rootHash`;
+  ring 1 is the arena as a derived, rebuildable cache; ring 2 is a workload
+  holding a slice grant whose writes cross one checked API. Decisions D1–D7,
+  falsifiers F1–F7, and the sequencing (v0.20.1 first, then `treeRoot`, the
+  mount through the WAL pool, the one write API, projection-v7 with one AST
+  copy, `derived_from` and rebuild, then the publication ADR with control
+  block v4 in lockstep with mache). Work beads `f2df7f`, `f2ee9f`, `f2ffbd`,
+  `f30fdf`, `f31efd`, `d70f99`. Proposed; no behavior changes in this entry.
+
 ## [0.20.1] — 2026-10-10
 
 Patch release with one breaking change for control-block consumers: the

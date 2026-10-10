@@ -161,6 +161,17 @@ pub enum TsLanguage {
     Lua,
 }
 
+/// Scheme tag of [`TsLanguage::grammar_digest`]'s fold. Protocol-visible:
+/// changing the entry shape or these tags is a `v2`, not an edit.
+pub const GRAMMAR_DIGEST_SCHEME: &str = "leyline/grammar-digest/v1";
+/// Entry framing (`b`) in the grammar digest: what kind of surface item the
+/// entry is. Plain constants, no bit packing, so every value is a distinct
+/// literal a known-answer test can pin.
+pub const GRAMMAR_ENTRY_ANONYMOUS_KIND: u64 = 0;
+pub const GRAMMAR_ENTRY_NAMED_KIND: u64 = 1;
+pub const GRAMMAR_ENTRY_FIELD: u64 = 2;
+pub const GRAMMAR_ENTRY_ABI: u64 = 3;
+
 impl TsLanguage {
     /// Every grammar compiled into this binary, in declaration order. The
     /// list is the enum spelled out once more because the enum is
@@ -243,9 +254,6 @@ impl TsLanguage {
     /// substrate and σ stays inside `leyline-core`.
     pub fn grammar_digest(self) -> leyline_core::Hash {
         use leyline_core::{ContentAddressed, Domain, Entry, Hash, PartitionSpec};
-        const KIND: u64 = 0;
-        const FIELD: u64 = 1;
-        const ABI: u64 = 2;
         let lang = self.ts_language();
         let mut entries = Vec::with_capacity(lang.node_kind_count() + lang.field_count() + 2);
         // `a` = the entry's position in the ordered surface; `b` = its tag
@@ -256,7 +264,11 @@ impl TsLanguage {
             entries.push(Entry {
                 addr: kind.as_bytes().hash(),
                 a: id as u64,
-                b: (KIND << 1) | u64::from(lang.node_kind_is_named(id as u16)),
+                b: if lang.node_kind_is_named(id as u16) {
+                    GRAMMAR_ENTRY_NAMED_KIND
+                } else {
+                    GRAMMAR_ENTRY_ANONYMOUS_KIND
+                },
             });
         }
         // Field ids are 1-based; id 0 is "no field" and is skipped.
@@ -265,17 +277,17 @@ impl TsLanguage {
             entries.push(Entry {
                 addr: field.as_bytes().hash(),
                 a: id as u64,
-                b: FIELD << 1,
+                b: GRAMMAR_ENTRY_FIELD,
             });
         }
         entries.push(Entry {
             addr: Hash::ZERO,
             a: lang.abi_version() as u64,
-            b: ABI << 1,
+            b: GRAMMAR_ENTRY_ABI,
         });
         PartitionSpec {
             domain: Domain::ByteStream,
-            scheme: "leyline/grammar-digest/v1".to_string(),
+            scheme: GRAMMAR_DIGEST_SCHEME.to_string(),
             params: self.name().as_bytes().to_vec(),
             canon_version: 1,
         }
@@ -910,6 +922,73 @@ mod grammar_identity_tests {
                 );
             }
         }
+    }
+
+    /// The digest is exactly the declared fold: an independent reconstruction
+    /// from the grammar's surface, entry by entry with literal framing, must
+    /// reproduce it. Catches any drift in the entry shape, the framing tags,
+    /// the params or the scheme — none of which the stability test can see.
+    #[test]
+    fn grammar_digest_is_the_declared_fold_over_the_surface() {
+        use leyline_core::{ContentAddressed, Domain, Entry, Hash, PartitionSpec};
+        let which = TsLanguage::all()[0];
+        let lang = which.ts_language();
+        let mut entries = Vec::new();
+        for id in 0..lang.node_kind_count() {
+            entries.push(Entry {
+                addr: lang
+                    .node_kind_for_id(id as u16)
+                    .unwrap_or("")
+                    .as_bytes()
+                    .hash(),
+                a: id as u64,
+                b: if lang.node_kind_is_named(id as u16) {
+                    1
+                } else {
+                    0
+                },
+            });
+        }
+        for id in 1..=lang.field_count() {
+            entries.push(Entry {
+                addr: lang
+                    .field_name_for_id(id as u16)
+                    .unwrap_or("")
+                    .as_bytes()
+                    .hash(),
+                a: id as u64,
+                b: 2,
+            });
+        }
+        entries.push(Entry {
+            addr: Hash::ZERO,
+            a: lang.abi_version() as u64,
+            b: 3,
+        });
+        let expected = PartitionSpec {
+            domain: Domain::ByteStream,
+            scheme: "leyline/grammar-digest/v1".to_string(),
+            params: which.name().as_bytes().to_vec(),
+            canon_version: 1,
+        }
+        .address(&entries);
+        assert_eq!(which.grammar_digest(), expected);
+        // The named flag is load-bearing: flipping one kind's flag in the
+        // reconstruction must move the address.
+        assert!(entries.iter().any(|e| e.b == 1) && entries.iter().any(|e| e.b == 0));
+        let mut flipped = entries.clone();
+        let i = flipped.iter().position(|e| e.b == 1).unwrap();
+        flipped[i].b = 0;
+        assert_ne!(
+            PartitionSpec {
+                domain: Domain::ByteStream,
+                scheme: "leyline/grammar-digest/v1".to_string(),
+                params: which.name().as_bytes().to_vec(),
+                canon_version: 1,
+            }
+            .address(&flipped),
+            expected
+        );
     }
 
     /// The grammar digest is a function of the compiled grammar: stable

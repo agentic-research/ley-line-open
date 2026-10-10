@@ -326,6 +326,89 @@ mod tests {
         }
     }
 
+    /// `treeRoot` is exactly the declared fold: an independent reconstruction
+    /// with literal framing (`2i` for the path entry, `2i+1` for the content
+    /// entry, `i` the rank in path order, `parserId` as params) reproduces it.
+    #[test]
+    fn tree_root_is_the_declared_fold() {
+        let p = inputs().parser_id();
+        let leaves = [leaf("b.go", 2), leaf("a.go", 1), leaf("c/d.go", 3)];
+        let expected = PartitionSpec {
+            domain: Domain::RowSet,
+            scheme: "leyline/tree-root/v1".to_string(),
+            params: p.as_bytes().to_vec(),
+            canon_version: 1,
+        }
+        .address(&[
+            Entry {
+                addr: b"a.go".hash(),
+                a: 0,
+                b: 4,
+            },
+            Entry {
+                addr: Hash::from_bytes([1; 32]),
+                a: 1,
+                b: 0,
+            },
+            Entry {
+                addr: b"b.go".hash(),
+                a: 2,
+                b: 4,
+            },
+            Entry {
+                addr: Hash::from_bytes([2; 32]),
+                a: 3,
+                b: 0,
+            },
+            Entry {
+                addr: b"c/d.go".hash(),
+                a: 4,
+                b: 6,
+            },
+            Entry {
+                addr: Hash::from_bytes([3; 32]),
+                a: 5,
+                b: 0,
+            },
+        ]);
+        assert_eq!(tree_root_of(&leaves, p), expected);
+    }
+
+    /// `parserId` is exactly the declared fold over its six input kinds.
+    #[test]
+    fn parser_id_is_the_declared_fold() {
+        let i = inputs();
+        let scalar = |kind: u64, v: &str| Entry {
+            addr: v.as_bytes().hash(),
+            a: kind,
+            b: v.len() as u64,
+        };
+        let expected = PartitionSpec {
+            domain: Domain::RowSet,
+            scheme: "leyline/parser-id/v1".to_string(),
+            params: Vec::new(),
+            canon_version: 1,
+        }
+        .address(&[
+            scalar(0, "merkle-ast-v2"),
+            scalar(1, "projection-v6"),
+            scalar(2, "5"),
+            scalar(3, "inj"),
+            scalar(4, "qse"),
+            Entry {
+                addr: Hash::from_bytes([1; 32]),
+                a: 5,
+                b: 2,
+            },
+            Entry {
+                addr: Hash::from_bytes([2; 32]),
+                a: 5,
+                b: 4,
+            },
+        ]);
+        assert_eq!(i.parser_id(), expected);
+    }
+
     #[test]
     fn tree_root_is_independent_of_leaf_enumeration_order() {
         let p = inputs().parser_id();

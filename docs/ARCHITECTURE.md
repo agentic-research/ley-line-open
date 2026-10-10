@@ -370,6 +370,7 @@ Architectural decisions that shape LLO today:
 | [ADR-0037](adr/0037-naming-the-proxy-channel.md) | Naming the proxy channel — `confinement/v1` assumes an egress path it cannot express | Accepted (shipped in the release that landed it) |
 | [ADR-0038](adr/0038-host-side-subscription-credential-ingress.md) | Host-side subscription credential ingress: proxy/vault custody without exposing tokens to confined harnesses | Proposed |
 | [ADR-0039](adr/0039-multi-vector-retrieval-over-cas.md) | Multi-vector retrieval over CAS — kernel-delegated caching instead of a bespoke index | Proposed — falsification ladder has not run; no implementation exists |
+| [ADR-0040](adr/0040-the-write-boundary.md) | The write boundary — source and manifest are the data, the arena is a cache; one write API for mount, splice and cloister; `treeRoot` beside `Head.rootHash` | Proposed — seven shipped bugs it explains are filed (`192018`, `0c80c7`, `143002`, `0d3b72`, `143f17`, `0c8ee7`, `1eefe3`); no implementation exists |
 
 ADRs 0017-0019 are cloister-side and live in `~/remotes/art/cloister/docs/adr/`. Mache's ADR-0024 (`incremental-dataflow-taint-as-substrate-queries`) is a separate document in the mache repo whose producer-side lives in LLO's `analysis-substrate` decade — see the decade doc for the mapping.
 

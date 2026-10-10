@@ -558,7 +558,7 @@ pub async fn run_daemon_with_options(
     state.write().phase = DaemonPhase::Ready;
 
     let sock_path = ctrl_path.with_extension("sock");
-    crate::daemon::socket::spawn(ctx.clone(), sock_path.clone(), options.discovery);
+    crate::daemon::socket::spawn(ctx.clone(), sock_path.clone(), options.discovery)?;
     eprintln!("daemon socket at {}", sock_path.display());
 
     // Optional MCP HTTP transport — feeds cloister gateway / any MCP client.

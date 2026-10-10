@@ -76,28 +76,72 @@ impl SocketDiscovery {
 /// other uid can traverse to it at any point, then atomically renamed into
 /// place. Renaming a bound unix socket keeps the listener valid: the binding
 /// belongs to the inode, not to the directory entry that names it.
-fn bind_owner_only(sock_path: &std::path::Path) -> UnixListener {
+///
+/// The staged path must fit `sun_path` too, not just the final one: on macOS
+/// `sun_path` is 104 bytes and a `HOME` under `TMPDIR` (`/var/folders/…`)
+/// leaves little room. The staging name is therefore as short as the final
+/// socket's own name allows (`.s<pid>/s`), and a staged path that still does
+/// not fit is an error naming both paths, never a panic. Every failure is
+/// returned so the daemon's caller sees the reason instead of exit 101, and
+/// the staging directory is removed on every path out.
+fn bind_owner_only(sock_path: &std::path::Path) -> anyhow::Result<UnixListener> {
+    use anyhow::Context;
     let parent = sock_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
-    let staging = parent.join(format!(".leyline-sock-stage-{}", std::process::id()));
+    let staging = parent.join(format!(".s{}", std::process::id()));
+    let staged_path = staging.join("s");
+    let staged_len = staged_path.as_os_str().len();
+    if staged_len >= SUN_PATH_MAX {
+        anyhow::bail!(
+            "cannot bind the daemon socket: the staging path {} is {staged_len} bytes, \
+             over the {}-byte unix socket path limit (final socket {}). Use a shorter \
+             --control path or HOME.",
+            staged_path.display(),
+            SUN_PATH_MAX - 1,
+            sock_path.display()
+        );
+    }
     // A staging directory left by a previous process with this pid would
     // otherwise fail the create below.
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::DirBuilder::new()
         .mode(0o700)
         .create(&staging)
-        .expect("create private staging directory for UDS bind");
+        .with_context(|| format!("create private staging directory {}", staging.display()))?;
 
-    let staged_path = staging.join("socket");
-    let listener = UnixListener::bind(&staged_path).expect("bind UDS socket");
-    std::fs::set_permissions(&staged_path, std::fs::Permissions::from_mode(0o600))
-        .expect("restrict UDS socket to owner-only permissions");
-    std::fs::rename(&staged_path, sock_path).expect("publish UDS socket");
-    let _ = std::fs::remove_dir(&staging);
-    listener
+    let bound = (|| -> anyhow::Result<UnixListener> {
+        let listener = UnixListener::bind(&staged_path)
+            .with_context(|| format!("bind UDS socket at {}", staged_path.display()))?;
+        std::fs::set_permissions(&staged_path, std::fs::Permissions::from_mode(0o600))
+            .context("restrict UDS socket to owner-only permissions")?;
+        std::fs::rename(&staged_path, sock_path)
+            .with_context(|| format!("publish UDS socket at {}", sock_path.display()))?;
+        Ok(listener)
+    })();
+    let _ = std::fs::remove_dir_all(&staging);
+    bound
 }
+
+/// `sizeof(sockaddr_un.sun_path)`: 104 on macOS and the BSDs, 108 on Linux.
+/// A path must be strictly shorter (room for the NUL).
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+const SUN_PATH_MAX: usize = 104;
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+)))]
+const SUN_PATH_MAX: usize = 108;
 
 /// Spawn the UDS socket listener as a background tokio task.
 ///
@@ -107,8 +151,13 @@ fn bind_owner_only(sock_path: &std::path::Path) -> UnixListener {
 /// 4. Spawns a tokio task per connection.
 /// 5. Each connection reads line-delimited JSON, dispatches, writes response.
 ///
-/// Returns the socket path. The listener runs in the background.
-pub fn spawn(ctx: Arc<DaemonContext>, sock_path: PathBuf, discovery: SocketDiscovery) -> PathBuf {
+/// Returns the socket path. The listener runs in the background. Fails, rather
+/// than panicking, when the socket cannot be bound (see [`bind_owner_only`]).
+pub fn spawn(
+    ctx: Arc<DaemonContext>,
+    sock_path: PathBuf,
+    discovery: SocketDiscovery,
+) -> anyhow::Result<PathBuf> {
     // Remove any stale socket left from a previous run.
     remove_file_best_effort(&sock_path, "stale socket");
 
@@ -116,7 +165,7 @@ pub fn spawn(ctx: Arc<DaemonContext>, sock_path: PathBuf, discovery: SocketDisco
     // a filesystem capability: the path itself grants access to every daemon
     // operation, so it is never reachable under inherited permissions, even
     // briefly. MCP's UDS transport applies the same owner-only boundary.
-    let listener = bind_owner_only(&sock_path);
+    let listener = bind_owner_only(&sock_path)?;
 
     // Publish this daemon's own discovery symlink. Skipped when the socket
     // already IS that path (avoids a self-referencing symlink) and when the
@@ -164,7 +213,7 @@ pub fn spawn(ctx: Arc<DaemonContext>, sock_path: PathBuf, discovery: SocketDisco
         }
     });
 
-    path
+    Ok(path)
 }
 
 /// Bound on the writer-task's outbound queue. Op responses and pushed
@@ -501,7 +550,8 @@ mod tests {
             test_context(dir.path()),
             socket.clone(),
             SocketDiscovery::Unpublished,
-        );
+        )
+        .unwrap();
 
         assert_eq!(returned, socket);
         assert!(returned.exists(), "spawn must bind synchronously");
@@ -513,5 +563,67 @@ mod tests {
         tokio::net::UnixStream::connect(&returned)
             .await
             .expect("bound listener must accept immediately");
+    }
+
+    /// A directory nested under `base` so that `<dir>/<name>` is exactly
+    /// `total` bytes.
+    fn dir_for_socket_len(base: &std::path::Path, name: &str, total: usize) -> PathBuf {
+        let fixed = base.as_os_str().len() + 1 + 1 + name.len(); // base / pad / name
+        assert!(total > fixed, "temp dir too long for this test");
+        let dir = base.join("p".repeat(total - fixed));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Reported by mache's release parity run: with HOME under macOS TMPDIR
+    /// the final socket fit `sun_path` but the old staging path
+    /// (`.leyline-sock-stage-<pid>/socket`, 27 bytes longer) did not, and the
+    /// daemon panicked with exit 101. A socket whose final path fits must
+    /// bind.
+    #[tokio::test]
+    async fn spawn_binds_when_the_final_path_fits_near_the_limit() {
+        let base = TempDir::new().unwrap();
+        let name = "control.sock";
+        let dir = dir_for_socket_len(base.path(), name, SUN_PATH_MAX - 4);
+        let socket = dir.join(name);
+        let returned = spawn(
+            test_context(base.path()),
+            socket.clone(),
+            SocketDiscovery::Unpublished,
+        )
+        .expect("a socket path under the limit must bind");
+        assert_eq!(returned, socket);
+        tokio::net::UnixStream::connect(&returned).await.unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".s"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the staging directory must be removed"
+        );
+    }
+
+    /// A path that cannot fit is an error naming the limit, not a panic, and
+    /// leaves no staging directory behind.
+    #[tokio::test]
+    async fn spawn_reports_an_over_long_socket_path_instead_of_panicking() {
+        let base = TempDir::new().unwrap();
+        let name = "control.sock";
+        let dir = dir_for_socket_len(base.path(), name, SUN_PATH_MAX + 20);
+        let err = spawn(
+            test_context(base.path()),
+            dir.join(name),
+            SocketDiscovery::Unpublished,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unix socket path limit"), "{err}");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "nothing left behind"
+        );
     }
 }

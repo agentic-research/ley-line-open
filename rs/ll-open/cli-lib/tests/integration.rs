@@ -113,7 +113,8 @@ async fn spawn_test_socket(
         ctx,
         sock_path,
         leyline_cli_lib::daemon::socket::SocketDiscovery::Unpublished,
-    );
+    )
+    .expect("bind daemon socket");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

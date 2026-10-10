@@ -5409,6 +5409,30 @@ mod tests {
         assert!(err.contains("no treeRoot"), "{err}");
     }
 
+    /// The env wrapper reads `LLO_TRUSTED_QUERY_HASHES` and nothing else.
+    /// The process environment is global, so the variable is set under a
+    /// lock and restored; no other test in this binary sets it.
+    #[test]
+    fn trusted_query_hashes_from_env_reads_the_variable() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _l = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const KEY: &str = "LLO_TRUSTED_QUERY_HASHES";
+        let prev = std::env::var(KEY).ok();
+        // SAFETY: held under ENV_LOCK; this is the only writer of KEY in the
+        // lib test binary, and the value is restored below.
+        unsafe { std::env::set_var(KEY, " ABC, def ,,") };
+        let got = trusted_query_hashes_from_env();
+        unsafe { std::env::remove_var(KEY) };
+        let empty = trusted_query_hashes_from_env();
+        if let Some(p) = prev {
+            unsafe { std::env::set_var(KEY, p) };
+        }
+        let want: std::collections::HashSet<String> =
+            ["abc", "def"].into_iter().map(String::from).collect();
+        assert_eq!(got, want);
+        assert!(empty.is_empty());
+    }
+
     #[test]
     fn trusted_query_hashes_parse_trims_lowercases_and_drops_empties() {
         let got = parse_trusted_query_hashes(Some(" ABC, def ,,Ghi "));

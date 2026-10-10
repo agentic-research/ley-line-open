@@ -2073,6 +2073,82 @@ mod tests {
         SqliteGraphAdapter::new_writable(data.as_ref())
     }
 
+    fn pooled_readers(adapter: &SqliteGraphAdapter) -> usize {
+        match &adapter.backing {
+            Backing::Image(pool) => pool.readers.len(),
+            Backing::Live(_) => 0,
+        }
+    }
+
+    /// The image pool's generation discipline: a current reader goes back to
+    /// the pool after a read (the pool stays full); after a write, stale
+    /// readers are discarded so the next read sees the write.
+    #[test]
+    fn image_pool_reuses_current_readers_and_discards_stale_ones() -> Result<()> {
+        let adapter = writable_adapter()?;
+        let full = pooled_readers(&adapter);
+        assert!(full >= 2);
+        let mut buf = [0u8; 16];
+        let n = adapter.read_content("docs/readme", &mut buf, 0)?;
+        assert_eq!(&buf[..n], b"hello");
+        assert_eq!(
+            pooled_readers(&adapter),
+            full,
+            "a current reader returns to the pool"
+        );
+
+        adapter.write_content("docs/readme", b"HELLO", 0)?;
+        let n = adapter.read_content("docs/readme", &mut buf, 0)?;
+        assert_eq!(&buf[..n], b"HELLO", "a read after a write sees the write");
+        Ok(())
+    }
+
+    /// A [`LiveSource`] over one in-memory connection that counts publishes.
+    struct CountingSource {
+        conn: Mutex<Connection>,
+        publishes: AtomicU64,
+    }
+
+    impl LiveSource for CountingSource {
+        fn reader(&self) -> Result<Box<dyn std::ops::Deref<Target = Connection> + '_>> {
+            Ok(Box::new(self.conn.lock()))
+        }
+        fn writer(&self) -> Box<dyn std::ops::DerefMut<Target = Connection> + '_> {
+            Box::new(self.conn.lock())
+        }
+        fn publish(&self) -> Result<()> {
+            self.publishes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A live adapter reads and writes its source's connection and publishes
+    /// through it; an image adapter does not own an arena and refuses.
+    #[test]
+    fn live_adapter_flush_publishes_through_its_source() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_schema(&conn)?;
+        put_dir(&conn, "docs", 1000)?;
+        put_file(&conn, "docs/readme", 2000, Some("hello"))?;
+        let source = Arc::new(CountingSource {
+            conn: Mutex::new(conn),
+            publishes: AtomicU64::new(0),
+        });
+        let adapter = SqliteGraphAdapter::live(source.clone())?;
+        let mut buf = [0u8; 16];
+        let n = adapter.read_content("docs/readme", &mut buf, 0)?;
+        assert_eq!(&buf[..n], b"hello");
+        adapter.write_content("docs/readme", b"HELLO", 0)?;
+        let n = adapter.read_content("docs/readme", &mut buf, 0)?;
+        assert_eq!(&buf[..n], b"HELLO");
+        assert_eq!(source.publishes.load(Ordering::SeqCst), 0);
+        adapter.flush_to_arena()?;
+        assert_eq!(source.publishes.load(Ordering::SeqCst), 1);
+
+        assert!(writable_adapter()?.flush_to_arena().is_err());
+        Ok(())
+    }
+
     #[test]
     fn write_content_updates_record() -> Result<()> {
         let adapter = writable_adapter()?;

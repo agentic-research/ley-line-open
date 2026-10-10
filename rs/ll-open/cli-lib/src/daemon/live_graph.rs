@@ -54,3 +54,48 @@ impl LiveSource for LiveDbSource {
             .with_write(|conn| crate::cmd_daemon::snapshot_to_arena(conn, &self.ctx.ctrl_path))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `publish` is the daemon's snapshot: after it, the control block names
+    /// the live database's image, so out-of-process readers see the write.
+    #[tokio::test]
+    async fn publish_advances_the_published_root_to_the_live_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = crate::daemon::socket::tests::test_context(dir.path());
+        ctx.with_write(|conn| {
+            conn.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")?;
+            Ok(())
+        })
+        .unwrap();
+        let root = || {
+            leyline_core::Controller::open_or_create(&ctx.ctrl_path)
+                .unwrap()
+                .current_root()
+        };
+        let before = root();
+        let source = LiveDbSource::new(ctx.clone());
+        source.publish().unwrap();
+        let after = root();
+        assert_ne!(after, before, "publish must advance current_root");
+        assert_ne!(after, [0u8; 32]);
+
+        // The source's reader sees the live db, and its writer is the daemon's.
+        let n: i64 = source
+            .reader()
+            .unwrap()
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        source
+            .writer()
+            .execute("INSERT INTO t VALUES (2)", [])
+            .unwrap();
+        let n: i64 = ctx
+            .with_read(|c| Ok(c.query_row("SELECT count(*) FROM t", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+}

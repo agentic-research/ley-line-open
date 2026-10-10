@@ -43,6 +43,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use leyline_fs::graph::{Graph, SqliteGraphAdapter};
 use tempfile::TempDir;
 
+mod common;
+
 /// 2001-09-09T01:46:40Z — exact to the second and a value no clock produces
 /// during a test run.
 const PINNED_MTIME_SECS: u64 = 1_000_000_000;
@@ -280,6 +282,126 @@ fn a_mounted_projection_serves_its_leaves_and_stats_its_files() {
         PINNED_MTIME_SECS,
         "st_mtime of the source file's entry must be the file's filesystem mtime, \
          not the parse time"
+    );
+}
+
+/// Write `data` to `rel` through the mount (truncate, write, fsync), under
+/// the kernel deadline. The fsync is what makes the mount publish.
+fn write_through_mount(mount: &Path, rel: &str, data: &'static [u8]) {
+    let path = mount.join(rel);
+    with_kernel_deadline("write", mount, move || {
+        use std::io::Write;
+        let mut f = fs::File::options()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap_or_else(|e| panic!("open {} for write: {e}", path.display()));
+        f.write_all(data)
+            .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+        f.sync_all()
+            .unwrap_or_else(|e| panic!("fsync {}: {e}", path.display()));
+    })
+}
+
+/// The leaf's `nodes.record` as the daemon's own readers see it.
+fn leaf_record(conn: &rusqlite::Connection) -> Vec<u8> {
+    let nid = leyline_schema::resolve_path(conn, LEAF)
+        .expect("resolve leaf")
+        .expect("leaf must exist");
+    let record: String = conn
+        .query_row("SELECT record FROM nodes WHERE nid = ?1", [nid], |r| {
+            r.get(0)
+        })
+        .expect("leaf record");
+    record.into_bytes()
+}
+
+/// ADR-0040 D4, falsifier F2 (bead `ley-line-open-f2ee9f`; closes bead
+/// `192018`): a write through the daemon's mount is durable. Before D4 the
+/// mount edited a private copy of the arena and published from it, so the
+/// daemon's next snapshot of `live.db` republished the old bytes, the mount
+/// hot-swapped onto them and the edit was gone; a restart warm-started
+/// without it. Now the mount writes through the daemon's single writer into
+/// `live.db`, so after a reparse of ANOTHER file the edit is still what the
+/// mount, the daemon's readers and a cold reopen of `live.db` all return.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mount_write_survives_a_reparse_of_another_file_and_a_restart() {
+    let src = create_fixture();
+    fs::write(
+        src.path().join("other.go"),
+        b"package main\n\nfunc other() int { return 1 }\n",
+    )
+    .expect("write other.go");
+
+    let home = TempDir::new().expect("daemon dir");
+    let ctx = common::daemon_context(home.path());
+    let live_db_path = ctx.ctrl_path.with_extension("live.db");
+    ctx.with_write(|conn| {
+        leyline_cli_lib::cmd_parse::parse_into_conn(conn, src.path(), Some("go"), None).map(|_| ())
+    })
+    .expect("cold parse into live.db");
+
+    let source = Arc::new(leyline_cli_lib::daemon::live_graph::LiveDbSource::new(
+        ctx.clone(),
+    ));
+    let graph: Arc<dyn Graph> =
+        Arc::new(SqliteGraphAdapter::live(source).expect("live-backed adapter"));
+    let mount_dir = TempDir::new().expect("create mountpoint");
+    let session =
+        leyline_fs::fuse::mount_fuse(graph, mount_dir.path()).expect("mount the live db over FUSE");
+    let _guard = MountGuard {
+        mount: mount_dir.path().to_path_buf(),
+    };
+    assert_eq!(
+        read_through_mount(mount_dir.path(), LEAF),
+        LEAF_TOKEN,
+        "baseline: the mount serves the parsed token"
+    );
+
+    const EDITED: &[u8] = b"edited";
+    write_through_mount(mount_dir.path(), LEAF, EDITED);
+    assert_eq!(
+        read_through_mount(mount_dir.path(), LEAF),
+        EDITED,
+        "the mount reads back its own write"
+    );
+
+    // The daemon reparses a DIFFERENT file and republishes, which is exactly
+    // the sequence that used to drop the edit.
+    ctx.with_write(|conn| {
+        leyline_cli_lib::cmd_parse::parse_into_conn(
+            conn,
+            src.path(),
+            Some("go"),
+            Some(&["other.go".to_string()]),
+        )
+        .map(|_| ())
+    })
+    .expect("scoped reparse of other.go");
+    ctx.with_write(|conn| leyline_cli_lib::cmd_daemon::snapshot_to_arena(conn, &ctx.ctrl_path))
+        .expect("snapshot after the reparse");
+
+    assert_eq!(
+        read_through_mount(mount_dir.path(), LEAF),
+        EDITED,
+        "the edit survives a reparse of another file and a snapshot"
+    );
+    let via_daemon = ctx
+        .with_read(|conn| Ok(leaf_record(conn)))
+        .expect("daemon read");
+    assert_eq!(
+        via_daemon, EDITED,
+        "the daemon's own readers see the mount's write"
+    );
+
+    // Restart: unmount, drop the daemon context, reopen live.db cold.
+    drop(session);
+    drop(ctx);
+    let conn = rusqlite::Connection::open(&live_db_path).expect("reopen live.db");
+    assert_eq!(
+        leaf_record(&conn),
+        EDITED,
+        "a cold reopen of live.db still holds the mount's write"
     );
 }
 

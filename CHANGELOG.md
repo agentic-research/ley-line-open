@@ -27,6 +27,29 @@ context, scoping notes, and review history are recoverable.
   block v4 in lockstep with mache). Work beads `f2df7f`, `f2ee9f`, `f2ffbd`,
   `f30fdf`, `f31efd`, `d70f99`. Proposed; no behavior changes in this entry.
 
+### Fixed
+
+- **A write through the daemon's mount is durable; the mount reads `live.db`
+  through the daemon's reader pool instead of a private copy** (ADR-0040 D4,
+  bead `ley-line-open-f2ee9f`; closes `192018`). `leyline daemon --mount`
+  built a `HotSwapGraph` over a deserialised copy of the arena: a FUSE write
+  edited that copy and `fsync` published it from there, `live.db` never saw
+  the edit, the daemon's next snapshot republished `live.db`, the mount
+  hot-swapped onto it and the edit was gone; a restart warm-started without
+  it. Serving the mount from the copy also cost four image-sized copies per
+  save (bead `af6c9d`) and a full reserialise per write (bead `af79bb`).
+  `SqliteGraphAdapter` now has two backings: the image pool it always had,
+  and a `LiveSource` that hands out pooled read connections and the owner's
+  single writer. The daemon's mount uses `LiveDbSource` over its own
+  `live_db`: reads are the WAL's committed state with zero copies, writes go
+  through the one writer every daemon op uses, and `fsync` publishes through
+  `snapshot_to_arena`. `HotSwapGraph` is unchanged for `leyline serve` and
+  other out-of-process arena readers. Falsifier
+  `a_mount_write_survives_a_reparse_of_another_file_and_a_restart`: write
+  through the mount, reparse a different file, snapshot, read back through
+  the mount and the daemon's readers, drop everything, reopen `live.db`
+  cold; every read returns the written bytes.
+
 ## [0.20.1] — 2026-10-10
 
 Patch release with one breaking change for control-block consumers: the

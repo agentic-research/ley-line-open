@@ -19,6 +19,7 @@ pub mod hdc_enrich;
 #[cfg(feature = "hdc")]
 pub mod hdc_pass;
 #[cfg(feature = "lsp")]
+pub mod live_graph;
 pub mod lsp_pass;
 pub mod mcp;
 pub mod observation_schema;

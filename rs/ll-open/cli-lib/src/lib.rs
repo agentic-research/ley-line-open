@@ -20,6 +20,7 @@ pub mod cmd_serve;
 pub mod cmd_splice;
 pub mod daemon;
 pub mod topology_pass;
+pub mod tree_root;
 pub mod walk;
 
 use std::path::PathBuf;
@@ -183,6 +184,15 @@ pub enum Commands {
         /// Arbitrary SQL query. If provided, runs this instead of node lookup.
         #[arg(long)]
         query: Option<String>,
+    },
+
+    /// Recompute `treeRoot` and `parserId` from a parsed .db and compare them
+    /// to its sibling head.capnp (ADR-0040 D1). Exits non-zero on mismatch,
+    /// on a head written before the fields existed, or on an unreadable head.
+    VerifyHead {
+        /// Path to the parsed SQLite database (the head is `<db>.head.capnp`
+        /// beside it).
+        db: PathBuf,
     },
 
     /// Edit an AST node's text in a .db file (splice + reproject).
@@ -411,6 +421,7 @@ pub async fn run(cmd: Commands) -> Result<()> {
             control_path,
             query,
         } => cmd_inspect::cmd_inspect(&id, &arena, control_path.as_deref(), query.as_deref()),
+        Commands::VerifyHead { db } => tree_root::cmd_verify_head(&db),
         Commands::Load { db, control } => cmd_load::cmd_load(&db, &control),
         Commands::Cdc { command } => {
             #[cfg(feature = "cdc")]

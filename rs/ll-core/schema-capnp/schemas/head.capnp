@@ -74,4 +74,32 @@ struct Head {
   # when unsigned. Additive field (ADR-0014 §1): unset does not change
   # canonical bytes.
   signerKid @6 :Data;
+
+  # ADR-0040 D1 — the tree identity, beside the run receipt above.
+  #
+  # `rootHash` names the segments ONE RUN wrote (truncated per run, so an
+  # incremental parse's root covers only the files it re-parsed, and the
+  # source record carries absolute paths and mtimes). `treeRoot` names the
+  # TREE: a tagged fold (scheme `leyline/tree-root/v1`, `PartitionSpec`
+  # RowSet domain) over every `_source` row as `(BLAKE3(relative path), 2i,
+  # len)` and `(content_hash, 2i+1, 0)` with `i` the rank in path order,
+  # with `parserId` as the spec's params. Computed after COMMIT from the
+  # whole `_source` table, so it is the same for a cold parse, an
+  # incremental parse, a scoped reparse, a second directory, and a touched
+  # mtime, and differs when one byte of one file differs. Anyone holding
+  # the arena recomputes it (`leyline verify-head`); a mismatch is refused.
+  #
+  # Additive per ADR-0014 §1: a head that does not set these fields has the
+  # same canonical bytes as before they existed. Empty = not stamped
+  # (written by a pre-ADR-0040 producer).
+  treeRoot @7 :Common.Hash;
+
+  # ADR-0040 D1 — the identity of the derivation `treeRoot` was computed
+  # under: a tagged fold (scheme `leyline/parser-id/v1`) over the IR schema
+  # version, the projection schema version, the extraction, injection and
+  # query-set epochs (the last covers arena-resident query overrides by
+  # content hash), and every compiled grammar's node-kind and field tables.
+  # Two arenas with the same source under different `parserId`s are
+  # different derivations and must not share derived caches.
+  parserId @8 :Common.Hash;
 }

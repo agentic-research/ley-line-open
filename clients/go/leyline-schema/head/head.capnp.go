@@ -15,12 +15,12 @@ type Head capnp.Struct
 const Head_TypeID = 0xbc8eed64e8f5bae7
 
 func NewHead(s *capnp.Segment) (Head, error) {
-	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 24, PointerCount: 4})
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 24, PointerCount: 6})
 	return Head(st), err
 }
 
 func NewRootHead(s *capnp.Segment) (Head, error) {
-	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 24, PointerCount: 4})
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 24, PointerCount: 6})
 	return Head(st), err
 }
 
@@ -154,12 +154,60 @@ func (s Head) SetSignerKid(v []byte) error {
 	return capnp.Struct(s).SetData(3, v)
 }
 
+func (s Head) TreeRoot() (common.Hash, error) {
+	p, err := capnp.Struct(s).Ptr(4)
+	return common.Hash(p.Struct()), err
+}
+
+func (s Head) HasTreeRoot() bool {
+	return capnp.Struct(s).HasPtr(4)
+}
+
+func (s Head) SetTreeRoot(v common.Hash) error {
+	return capnp.Struct(s).SetPtr(4, capnp.Struct(v).ToPtr())
+}
+
+// NewTreeRoot sets the treeRoot field to a newly
+// allocated common.Hash struct, preferring placement in s's segment.
+func (s Head) NewTreeRoot() (common.Hash, error) {
+	ss, err := common.NewHash(capnp.Struct(s).Segment())
+	if err != nil {
+		return common.Hash{}, err
+	}
+	err = capnp.Struct(s).SetPtr(4, capnp.Struct(ss).ToPtr())
+	return ss, err
+}
+
+func (s Head) ParserId() (common.Hash, error) {
+	p, err := capnp.Struct(s).Ptr(5)
+	return common.Hash(p.Struct()), err
+}
+
+func (s Head) HasParserId() bool {
+	return capnp.Struct(s).HasPtr(5)
+}
+
+func (s Head) SetParserId(v common.Hash) error {
+	return capnp.Struct(s).SetPtr(5, capnp.Struct(v).ToPtr())
+}
+
+// NewParserId sets the parserId field to a newly
+// allocated common.Hash struct, preferring placement in s's segment.
+func (s Head) NewParserId() (common.Hash, error) {
+	ss, err := common.NewHash(capnp.Struct(s).Segment())
+	if err != nil {
+		return common.Hash{}, err
+	}
+	err = capnp.Struct(s).SetPtr(5, capnp.Struct(ss).ToPtr())
+	return ss, err
+}
+
 // Head_List is a list of Head.
 type Head_List = capnp.StructList[Head]
 
 // NewHead creates a new list of Head.
 func NewHead_List(s *capnp.Segment, sz int32) (Head_List, error) {
-	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 24, PointerCount: 4}, sz)
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 24, PointerCount: 6}, sz)
 	return capnp.StructList[Head](l), err
 }
 
@@ -176,28 +224,36 @@ func (p Head_Future) RootHash() common.Hash_Future {
 func (p Head_Future) ParentHash() common.Hash_Future {
 	return common.Hash_Future{Future: p.Future.Field(1, nil)}
 }
+func (p Head_Future) TreeRoot() common.Hash_Future {
+	return common.Hash_Future{Future: p.Future.Field(4, nil)}
+}
+func (p Head_Future) ParserId() common.Hash_Future {
+	return common.Hash_Future{Future: p.Future.Field(5, nil)}
+}
 
-const schema_c7c7ada1403b9f78 = "x\xdal\xc9\xbfK\x1bQ\x00\x07\xf0\xef\xf7\xbd\xbb\x84" +
-	"\xb4\x84\xe4\x91\x1b\x93\xa1c\x97B\xe9\xd6.\xa1\x85\x12" +
-	"\xda\xc5\xe7\xe8\xf6\xcc=r\x11|\x17\xee.\xa0\xab\x7f" +
-	"\x80Y\xdc\xc5?\xc0M\x17\x89\xe0\xa0DD\xc1A\xc1" +
-	"A\xc1A1\x83\x82\x8b\xf3\xc9\x81?\x16\xd7\xcf\xa7>" +
-	"i{\xdf\xab\xb1\x80\xd0M\xbf\x94\xdf\xed<M\xc3\x87" +
-	"\xd51\xf4g\xca|i\xfdW{cs2\x81\xef\x95" +
-	"\x81F\x8b+\x8d/,\x03?Z\x1c\x11\x7f\xf2\xc8\x9a" +
-	"\xf0[\xd7\x0c\xe8\x06?;\xd6\x84\x98!uSz\x80" +
-	"G@m\xff\x03\xf4\x96\xa4\xde\x13Td\xc0\x02w\xe7" +
-	"\x00=\x96\xd4\x87\x82\x14\x01\x05\xa0\x0e\x0a\xdb\x97\xd4\xa7" +
-	"\x82J2\xa0\x04\xd4\xc9\x02\xa0\x8f%\xf5\x85\xa0\xf2D" +
-	"@\x0fP\xe7\x05\x9eI\xeakA\xe5\x8b\x80>\xa0\xae" +
-	"f\x01})\xa9\xa7\x82\xaa$\x03\x96\x00u[\xe0\x8d" +
-	"\xa4~\x14\xcc\x938\xce:&\x8d\x00\xb0\x9e\x1f}\xfd" +
-	"4\x8a\xd6\xbc{\x80\xac\x83\xf9\xc0$\xd6e\x1d\x03\x99" +
-	"F\x1ft\xcf:\x9b\x98\xac\x0f\x19;V X\x01\xf3" +
-	"\xd4\xf6\x16\xad\xcb~\xa3\xb6\x9c\xd9\xf4\x8d\x87n>\x1e" +
-	"\xba\xf0/j\xa6\x9b\xbds\xda\xef9\x93\x0d\x13\xd0\xb2" +
-	"\x0a\xc1\xea\x8b\xd9\xe4\x7f\x1f\x0c_\xed9\x00\x00\xff\xff" +
-	"\xba\xe0_\xf2"
+const schema_c7c7ada1403b9f78 = "x\xdat\xcf\xb1j\x14A\x00\xc6\xf1\xef\x9b\x99\xdd\xbb" +
+	"\xa8Kv\xd9\x11,\x12P\x88\xa0\xa0\xa2\xd8\x886A" +
+	"A\xce\xd8\xb8\xb7\x9d\xdd\x98\x1dnOp\xf6\xd8\x9d\x03" +
+	"m}\x00m\xec\xc5\x07\xf0\x05\xc4>\xe0\x8b\xc4\"\xe9" +
+	"\x0cX(#s\xc8\xd9\x9c\xed\xefk\xfe_~\xbc\xaf" +
+	"\xeed\x9d\x80\xa8v\x924\x1c\x7f9\xfb\xde\x9c\xbe\xfb" +
+	"\x8a\xea<ex\xfd\xf1\xc1\xfe\xa7\xcfGGH\xd2\x11" +
+	"P\xee\xf2my\x85#\xe0\xee.\x03\xf1(\xb4\xd64" +
+	"\xb7\x0e\xcd\x82nq\x7fbM\x83gd\xb5'\x15\xa0" +
+	"\x08\x14\xa7\x07@u\"Y\xfd\x14,H\xcd\x88g\xcf" +
+	"\x81\xea\x87\xe4\x94\x82\x14\x9a\x02(~G\xfb%Y\x8f" +
+	")XHjJ\xa0L\xf8\x12\xa8\x15%\xeb<\xba\x12" +
+	"\x9a\x0a(\xb3\x95_\x88~)z\"4\x13\xa0\xbc\xc8" +
+	")P\xeb\xe8\x97\xa3\xa7R3]eG\xdf\x89~-" +
+	"\xfaH\xe9x\xa2\xbc\xca\x03\xa0\xde\x8b~;\xfa8\xd1" +
+	"\x1c\x03\xe5\xcd\x95\xdf\x88~\x8f\x82\xa1\xef:?1C" +
+	"\x0b\x80y\xf8v\xfd\xdc\xfb\xf6\x83:\x01\xc8\x1c\x0c\x0b" +
+	"\xd3[\xe7'\x06rh7\xcc3\xeblo\xfc\x1c\xb2" +
+	"s\xdc\x82\xe0\x16\x18\x06;{e\x9d\x7f\x88\xed7\xde" +
+	"\x0ek^\xba\x17\xdd\xd25\x8f\xb1m\x0e\xfd?\x1e\xe6" +
+	"3g\xfc\xb2\x07-3\x08f\x7f\xcd\xf6O\xe7`\xb3" +
+	"6\xdf[;\xed:\xff\xdf\xce\xc1\xf6O\x9a\x8d\xeb\x9f" +
+	"\x00\x00\x00\xff\xffM\x0el\xa6"
 
 func RegisterSchema(reg *schemas.Registry) {
 	reg.Register(&schemas.Schema{

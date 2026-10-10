@@ -161,6 +161,26 @@ fn meta(db_path: &Path, key: &str) -> Option<String> {
     leyline_ts::schema::get_meta(&conn, key).unwrap()
 }
 
+/// The allowlist the parse and `leyline verify-head` share is read from the
+/// environment exactly as documented: comma-separated, trimmed, lowercased,
+/// empties dropped, unset is empty (ADR-0040 D1 made the reader shared, so
+/// it is observed here under the env lock).
+#[test]
+fn trusted_query_hashes_from_env_reads_the_documented_shape() {
+    let _l = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let _g = EnvGuard::set("LLO_TRUSTED_QUERY_HASHES", " ABC, def ,,");
+        let got = leyline_cli_lib::cmd_parse::trusted_query_hashes_from_env();
+        let want: std::collections::HashSet<String> =
+            ["abc", "def"].into_iter().map(String::from).collect();
+        assert_eq!(got, want);
+    }
+    {
+        let _g = EnvGuard::set("LLO_TRUSTED_QUERY_HASHES", "");
+        assert!(leyline_cli_lib::cmd_parse::trusted_query_hashes_from_env().is_empty());
+    }
+}
+
 // ── (a) allowlisted arena blob overrides the compiled default ──────────
 
 #[test]

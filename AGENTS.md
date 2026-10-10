@@ -34,13 +34,15 @@ Do not use “root,” “hash,” or “identity” without naming the domain a
 | Name | Authoritative for | Construction | Status |
 | --- | --- | --- | --- |
 | `Controller.current_root` | One exact serialized SQLite arena snapshot | BLAKE3 over the complete serialized byte image | Shipped |
-| `Head.rootHash` | The Cap'n Proto segments produced by one parse run | Tagged fold over canonical segment addresses | Shipped |
+| `Head.rootHash` | The Cap'n Proto segments produced by one parse run (a run receipt: truncated per run, carries absolute paths and mtimes) | Tagged fold over canonical segment addresses | Shipped |
+| `Head.treeRoot` | The source tree: every `_source` row as (relative path, content hash), under one `parserId` | Tagged fold `leyline/tree-root/v1` over the committed `_source` table, `parserId` as params; recomputed by `leyline verify-head` | Shipped (ADR-0040 D1) |
+| `Head.parserId` | The derivation `treeRoot` was computed under | Tagged fold `leyline/parser-id/v1` over IR and projection schema versions, extraction/injection/query-set epochs, and every compiled grammar's digest | Shipped (ADR-0040 D1) |
 | Blob hash | One content-addressed blob or CDC payload | BLAKE3 over that payload | Shipped |
 | SQL projection ABI | Consumer-visible relational shape and behavior | Tables, columns, constraints, semantics, fixtures | Shipped; not an identity domain |
 | `manifestRoot` | CDC transport/dedup structure | Defined by ADR-0032 | Proposed only |
 | `logicalRoot` | Derived-view validity | Defined by ADR-0032 | Proposed only |
 
-`current_root`, `Head.rootHash`, and blob hashes do not name the same bytes and are not interchangeable. Proposed identities must not appear in shipped APIs, documentation, or tests as though they already govern authority.
+`current_root`, `Head.rootHash`, `Head.treeRoot`, and blob hashes do not name the same bytes and are not interchangeable; `treeRoot` is the only one of them that names a source tree. Proposed identities must not appear in shipped APIs, documentation, or tests as though they already govern authority.
 
 ## Change Discipline
 

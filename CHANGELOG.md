@@ -27,6 +27,43 @@ context, scoping notes, and review history are recoverable.
   block v4 in lockstep with mache). Work beads `f2df7f`, `f2ee9f`, `f2ffbd`,
   `f30fdf`, `f31efd`, `d70f99`. Proposed; no behavior changes in this entry.
 
+- **`Head.treeRoot` and `Head.parserId`: the tree identity beside the run
+  receipt** (ADR-0040 D1, bead `ley-line-open-f2df7f`). `Head.rootHash` folds
+  over the capnp segments one run wrote; the segment files are truncated per
+  run and unchanged files emit nothing, so an incremental parse's root covers
+  only the re-parsed files (bead `0c80c7`), and the source record carries the
+  absolute path, mtime and size, so the same bytes in another directory hash
+  differently (bead `143002`). It stays what it is: a run receipt. `treeRoot`
+  is a tagged fold (`leyline/tree-root/v1`) over every `_source` row as
+  (relative path, content hash), computed after COMMIT from the whole table,
+  with `parserId` as its params; a cold parse, an incremental parse, a scoped
+  reparse, a second directory and a touched mtime of the same bytes yield one
+  `treeRoot`, and one changed byte changes it. `parserId` is a tagged fold
+  (`leyline/parser-id/v1`) over the IR and projection schema versions, the
+  extraction, injection and query-set epochs, and every compiled grammar's
+  node-kind and field tables (`TsLanguage::all`, `TsLanguage::grammar_digest`),
+  so two arenas with the same source under different derivations never share
+  a cache key. Both are additive `Head` fields (ADR-0014 §1; Go bindings
+  regenerated); a head written before them reads as not stamped. New command
+  `leyline verify-head <db>` recomputes both from the arena and exits non-zero
+  on a mismatch, a pre-ADR-0040 head, or an unreadable head. Because the
+  public Go schema module changed, `SCHEMA_VERSION` moves 0.18.1 → 0.20.1;
+  the matching `clients/go/leyline-schema` tag is published by the next
+  release's tag step (the release gate's "schema bumps with this release"
+  state). Consumers pinned to `v0.18.1` keep working: the fields are
+  additive and a `Head` without them reads as before.
+
+### Fixed
+
+- **A truncated or unreadable `head.capnp` no longer restarts the signed chain
+  at generation 1** (bead `ley-line-open-0c8ee7`). `read_head_for_chain`
+  returned "no parent, generation 1" on any read, framing or decode error
+  before the trust check ran, so deleting or truncating the head silently
+  re-rooted the chain even with `LEYLINE_HEAD_REQUIRE_SIGNATURE` set. Only a
+  head that does not exist starts a chain now; an existing head that cannot be
+  read fails the parse with an error that names the refusal, and the head is
+  not rewritten. Deleting the file is the deliberate way to start over.
+
 ## [0.20.1] — 2026-10-10
 
 Patch release with one breaking change for control-block consumers: the

@@ -2097,9 +2097,24 @@ mod tests {
             "a current reader returns to the pool"
         );
 
+        let old_bytes = adapter.serialize()?;
         adapter.write_content("docs/readme", b"HELLO", 0)?;
         let n = adapter.read_content("docs/readme", &mut buf, 0)?;
         assert_eq!(&buf[..n], b"HELLO", "a read after a write sees the write");
+
+        // A reader checked out across a write can land back in the pool with
+        // the old generation (the push races the refresh). Plant one: the
+        // next read must discard it, not serve the pre-write bytes.
+        let Backing::Image(pool) = &adapter.backing else {
+            unreachable!("writable_adapter is image-backed")
+        };
+        while pool.readers.pop().is_some() {}
+        let stale_gen = pool.reader_gen.load(Ordering::Acquire) - 1;
+        let _ = pool
+            .readers
+            .push((SqliteGraph::from_bytes(&old_bytes)?, stale_gen));
+        let n = adapter.read_content("docs/readme", &mut buf, 0)?;
+        assert_eq!(&buf[..n], b"HELLO", "a stale pooled reader is discarded");
         Ok(())
     }
 

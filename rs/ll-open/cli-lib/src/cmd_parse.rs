@@ -1064,16 +1064,7 @@ pub fn parse_into_conn(
     // not be able to self-trust a blob. An untrusted/corrupt override is ignored
     // with exactly one stderr line (compiled fallback); a trusted-but-malformed
     // one fails the whole pass loud.
-    let trusted_hashes: std::collections::HashSet<String> =
-        std::env::var("LLO_TRUSTED_QUERY_HASHES")
-            .ok()
-            .map(|s| {
-                s.split(',')
-                    .map(|h| h.trim().to_ascii_lowercase())
-                    .filter(|h| !h.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
+    let trusted_hashes = trusted_query_hashes_from_env();
     let resolution = leyline_ts::query_engine::resolve_query_set(conn, &trusted_hashes)?;
     for w in &resolution.warnings {
         eprintln!("warn: {w}");
@@ -1979,8 +1970,16 @@ pub fn parse_into_conn(
             _ => None,
         }
     };
+    // ADR-0040 D1: the tree identity and the derivation identity, folded from
+    // the COMMITTED `_source` table — the whole corpus, not this run's delta —
+    // on the main thread where the connection is. The head writer stays pure
+    // filesystem work and just stamps them.
+    let parser_id = crate::tree_root::ParserInputs::current(&query_set).parser_id();
+    let tree_root = crate::tree_root::tree_root(conn, parser_id)?;
     let head_handle = db_path_for_head.map(|p| {
-        std::thread::spawn(move || -> Result<()> { write_head_for_path(&p, unbound_facts) })
+        std::thread::spawn(move || -> Result<()> {
+            write_head_for_path(&p, unbound_facts, tree_root, parser_id)
+        })
     });
 
     // Build secondary indexes in one pass now that all rows are
@@ -2111,15 +2110,30 @@ pub fn parse_into_conn(
 
     // Σ root advance (bead `ley-line-open-ce55b1`) — join the worker
     // thread spawned right after COMMIT to overlap head-write FS work
-    // with post-COMMIT index creation. Best-effort: a head-write
-    // failure logs and doesn't fail the parse. `:memory:` connections
-    // skipped (no head_handle in that case).
+    // with post-COMMIT index creation. `:memory:` connections skipped (no
+    // head_handle in that case).
+    //
+    // A head-write failure fails the parse (bead `ley-line-open-0c8ee7`).
+    // It used to log and return Ok: the rows are committed, so the parse
+    // "worked". But the head is what names what was committed — the run
+    // receipt, and since ADR-0040 D1 the tree identity — and a parse whose
+    // head could not be advanced (a corrupt existing head the chain refuses
+    // to re-root over, an unwritable sidecar, a signing-key error) must say
+    // so, not advertise a head that still describes the previous tree. The
+    // rows stay committed either way; the error tells the caller the arena
+    // and its head disagree until the cause is fixed.
     let head_write_start = std::time::Instant::now();
     if let Some(h) = head_handle {
         match h.join() {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => log::warn!("Σ head-write failed (parse otherwise OK): {e:#}"),
-            Err(_) => log::warn!("Σ head-write thread panicked (parse otherwise OK)"),
+            Ok(Err(e)) => {
+                return Err(e.context(
+                    "Σ head write after a committed parse failed; the rows are committed but the head was not advanced",
+                ));
+            }
+            Err(_) => anyhow::bail!(
+                "Σ head-write thread panicked after a committed parse; the rows are committed but the head was not advanced"
+            ),
         }
     }
     let head_write_elapsed = head_write_start.elapsed();
@@ -2352,35 +2366,78 @@ fn hash_canonical_stream_slow(
     Ok(total)
 }
 
+/// The path of the head beside a parsed db: `foo.db` → `foo.head.capnp`.
+pub fn head_path_for(db_path: &Path) -> PathBuf {
+    with_extension(db_path, "head.capnp")
+}
+
+/// The operator's trusted query-override allowlist, `LLO_TRUSTED_QUERY_HASHES`:
+/// comma-separated BLAKE3 hex. Operator-controlled via env — the arena writer
+/// must not be able to self-trust a blob. Shared by the parse and by
+/// `leyline verify-head`, which must resolve the same effective query set to
+/// recompute the same `parserId`.
+pub fn trusted_query_hashes_from_env() -> std::collections::HashSet<String> {
+    std::env::var("LLO_TRUSTED_QUERY_HASHES")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|h| h.trim().to_ascii_lowercase())
+                .filter(|h| !h.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// T8.5: read the existing `${db}.head.capnp`, returning the chain
 /// state. Returns `(parentHash, generation)` where parentHash is the
 /// previous root (zero if no Head exists yet) and generation is the
 /// next monotonic counter value (1 if no Head exists yet).
+///
+/// Fails closed (bead `ley-line-open-0c8ee7`): only a head that does not
+/// exist starts a chain. A head that exists but cannot be read, framed or
+/// decoded is an error, never a silent restart at generation 1 — a signed
+/// chain whose head file was truncated must not be re-rooted by the next
+/// parse. Deleting the file is the deliberate way to start over.
 fn read_head_for_chain(head_path: &Path) -> Result<([u8; 32], u64)> {
     use leyline_schema_capnp::head_capnp::head;
 
     let bytes = match std::fs::read(head_path) {
         Ok(b) => b,
-        Err(_) => return Ok(([0u8; 32], 1)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(([0u8; 32], 1)),
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "head at {} exists but cannot be read; refusing to restart the chain (delete it to start over)",
+                    head_path.display()
+                )
+            });
+        }
     };
     let mut slice: &[u8] = &bytes;
-    let msg = match capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new())
-    {
-        Ok(m) => m,
-        Err(_) => return Ok(([0u8; 32], 1)),
-    };
-    let h: head::Reader = match msg.get_root() {
-        Ok(h) => h,
-        Err(_) => return Ok(([0u8; 32], 1)),
-    };
-    let prev_root = match h.get_root_hash() {
-        Ok(rh) => rh
-            .get_bytes()
-            .ok()
-            .and_then(|b| <[u8; 32]>::try_from(b).ok())
-            .unwrap_or([0u8; 32]),
-        Err(_) => [0u8; 32],
-    };
+    let msg = capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new())
+        .with_context(|| {
+            format!(
+                "head at {} is not a readable capnp message; refusing to restart the chain (delete it to start over)",
+                head_path.display()
+            )
+        })?;
+    let h: head::Reader = msg.get_root().with_context(|| {
+        format!(
+            "head at {} has no Head root; refusing to restart the chain",
+            head_path.display()
+        )
+    })?;
+    let prev_root: [u8; 32] = h
+        .get_root_hash()
+        .and_then(|rh| rh.get_bytes())
+        .with_context(|| format!("head at {} has no rootHash", head_path.display()))?
+        .try_into()
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "head at {} has a rootHash that is not 32 bytes",
+                head_path.display()
+            )
+        })?;
     let prev_gen = h.get_generation();
 
     // S2: verify before adopting this head as chain state. Only runs when the
@@ -2488,9 +2545,14 @@ fn head_signer_from_env() -> Result<Option<leyline_sign::root_signer::Ed25519Roo
 /// no SQLite handle required, so a parent caller can dispatch this on
 /// a worker thread that runs concurrently with post-COMMIT SQLite work
 /// (e.g. `create_post_load_indexes`). See bead `ley-line-open-cbbedf`.
-fn write_head_for_path(db_path: &Path, unbound_facts: u64) -> Result<()> {
+fn write_head_for_path(
+    db_path: &Path,
+    unbound_facts: u64,
+    tree_root: leyline_core::Hash,
+    parser_id: leyline_core::Hash,
+) -> Result<()> {
     let (root, segment_bytes) = hash_segment_files(db_path)?;
-    let head_path = with_extension(db_path, "head.capnp");
+    let head_path = head_path_for(db_path);
     let (parent, generation) = read_head_for_chain(&head_path)?;
 
     use leyline_schema_capnp::head_capnp::head;
@@ -2504,6 +2566,14 @@ fn write_head_for_path(db_path: &Path, unbound_facts: u64) -> Result<()> {
         h.set_unbound_facts(unbound_facts);
         h.reborrow().init_root_hash().set_bytes(&root);
         h.reborrow().init_parent_hash().set_bytes(&parent);
+        // ADR-0040 D1: the tree identity and its derivation identity, computed
+        // by the caller from the committed `_source` table (see `tree_root`).
+        h.reborrow()
+            .init_tree_root()
+            .set_bytes(tree_root.as_bytes());
+        h.reborrow()
+            .init_parser_id()
+            .set_bytes(parser_id.as_bytes());
 
         // S1: sign the head when a signing key is configured. The signature
         // covers the canonical head digest — BLAKE3(generation ‖ root ‖
@@ -2568,7 +2638,13 @@ fn write_head_after_parse(conn: &Connection) -> Result<()> {
         )
         .map(|n| n as u64)
         .unwrap_or(0);
-    write_head_for_path(&db_path, unbound_facts)
+    // ADR-0040 D1: same tree and derivation identities `parse_into_conn`
+    // stamps, resolved from this connection's arena.
+    let resolution =
+        leyline_ts::query_engine::resolve_query_set(conn, &trusted_query_hashes_from_env())?;
+    let parser_id = crate::tree_root::ParserInputs::current(&resolution.query_set).parser_id();
+    let tree_root = crate::tree_root::tree_root(conn, parser_id)?;
+    write_head_for_path(&db_path, unbound_facts, tree_root, parser_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -5055,7 +5131,7 @@ mod tests {
         // SAFETY: edition-2024 env mutation, serialized against every other
         // test that touches the head signing/trust vars by the `serial` label.
         unsafe { std::env::set_var("LEYLINE_HEAD_SIGNING_KEY", &hex) };
-        let wrote = write_head_for_path(&db, 0);
+        let wrote = write_head_for_path(&db, 0, leyline_core::Hash::ZERO, leyline_core::Hash::ZERO);
         unsafe { std::env::remove_var("LEYLINE_HEAD_SIGNING_KEY") };
         wrote.expect("write signed head");
 
@@ -5157,7 +5233,7 @@ mod tests {
 
         // SAFETY: serialized by the `serial` label above.
         unsafe { std::env::set_var("LEYLINE_HEAD_SIGNING_KEY", &sk_hex) };
-        let wrote = write_head_for_path(&db, 0);
+        let wrote = write_head_for_path(&db, 0, leyline_core::Hash::ZERO, leyline_core::Hash::ZERO);
         unsafe { std::env::remove_var("LEYLINE_HEAD_SIGNING_KEY") };
         wrote.expect("write signed head");
 
@@ -5187,9 +5263,211 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("unsigned.db");
         std::fs::write(&db, b"").unwrap();
-        write_head_for_path(&db, 0).expect("write unsigned head");
+        write_head_for_path(&db, 0, leyline_core::Hash::ZERO, leyline_core::Hash::ZERO)
+            .expect("write unsigned head");
         let got = read_head_for_chain(&with_extension(&db, "head.capnp"));
         assert!(got.is_ok(), "unsigned head must still read: {got:?}");
+    }
+
+    /// Reads `(rootHash, treeRoot, parserId)` from the head beside `db`.
+    fn read_head_roots(db: &Path) -> ([u8; 32], [u8; 32], [u8; 32]) {
+        use leyline_schema_capnp::head_capnp::head;
+        let bytes = std::fs::read(head_path_for(db)).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let msg = capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new())
+            .unwrap();
+        let h: head::Reader = msg.get_root().unwrap();
+        let get = |r: capnp::Result<&[u8]>| -> [u8; 32] {
+            r.ok()
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                .unwrap_or([0u8; 32])
+        };
+        (
+            get(h.get_root_hash().and_then(|x| x.get_bytes())),
+            get(h.get_tree_root().and_then(|x| x.get_bytes())),
+            get(h.get_parser_id().and_then(|x| x.get_bytes())),
+        )
+    }
+
+    fn parse_dir(db: &Path, src: &Path, scope: Option<&[String]>) {
+        let conn = Connection::open(db).unwrap();
+        parse_into_conn(&conn, src, None, scope).unwrap();
+    }
+
+    /// ADR-0040 D1, falsifier F1 (bead `ley-line-open-f2df7f`): `treeRoot`
+    /// names the tree and `rootHash` names the run. Four parses of the same
+    /// bytes — a second directory, a touched mtime, a no-op rerun, a scoped
+    /// reparse — yield one `treeRoot`; one changed byte changes it. The same
+    /// test records the two shipped `rootHash` facts it replaces: the run
+    /// receipt moves with the directory (bead `143002`) and with the set of
+    /// files a run re-parsed (bead `0c80c7`).
+    #[test]
+    fn tree_root_names_the_tree_and_root_hash_names_the_run() {
+        let td = TempDir::new().unwrap();
+        let write_tree = |dir: &Path| {
+            std::fs::create_dir_all(dir.join("pkg")).unwrap();
+            std::fs::write(dir.join("a.go"), b"package m\n\nfunc Foo() {}\n").unwrap();
+            std::fs::write(dir.join("pkg/b.go"), b"package pkg\n\nfunc Bar() {}\n").unwrap();
+        };
+
+        // Cold parse of tree A.
+        let src_a = td.path().join("a");
+        write_tree(&src_a);
+        let db_a = td.path().join("a.db");
+        parse_dir(&db_a, &src_a, None);
+        let (root_1, tree_1, parser_1) = read_head_roots(&db_a);
+        assert_ne!(tree_1, [0u8; 32], "treeRoot must be stamped");
+        assert_ne!(parser_1, [0u8; 32], "parserId must be stamped");
+        assert_ne!(
+            tree_1, root_1,
+            "treeRoot and rootHash are different domains"
+        );
+
+        // The same bytes in a second directory.
+        let src_b = td.path().join("b");
+        write_tree(&src_b);
+        let db_b = td.path().join("b.db");
+        parse_dir(&db_b, &src_b, None);
+        let (root_2, tree_2, parser_2) = read_head_roots(&db_b);
+        assert_eq!(
+            tree_2, tree_1,
+            "treeRoot is the same for the same bytes elsewhere"
+        );
+        assert_eq!(parser_2, parser_1, "parserId is a function of the binary");
+        assert_ne!(
+            root_2, root_1,
+            "rootHash commits to the absolute path (bead 143002); recorded, not endorsed"
+        );
+
+        // A touched mtime, identical bytes.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(src_a.join("pkg/b.go"))
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        parse_dir(&db_a, &src_a, None);
+        let (_, tree_3, _) = read_head_roots(&db_a);
+        assert_eq!(tree_3, tree_1, "a touched mtime does not move treeRoot");
+
+        // A no-op rerun.
+        parse_dir(&db_a, &src_a, None);
+        let (root_4, tree_4, _) = read_head_roots(&db_a);
+        assert_eq!(tree_4, tree_1, "a no-op rerun does not move treeRoot");
+        assert_ne!(
+            root_4, root_1,
+            "rootHash of a no-op rerun covers no files (bead 0c80c7); recorded, not endorsed"
+        );
+
+        // A scoped reparse of one file.
+        parse_dir(&db_a, &src_a, Some(&["pkg/b.go".to_string()]));
+        let (_, tree_5, _) = read_head_roots(&db_a);
+        assert_eq!(
+            tree_5, tree_1,
+            "a scoped reparse still names the whole tree"
+        );
+
+        // Discovery order: the scope list reversed.
+        parse_dir(
+            &db_a,
+            &src_a,
+            Some(&["pkg/b.go".to_string(), "a.go".to_string()]),
+        );
+        let (_, tree_6, _) = read_head_roots(&db_a);
+        assert_eq!(tree_6, tree_1, "discovery order is not identity");
+
+        // One changed byte.
+        std::fs::write(src_a.join("pkg/b.go"), b"package pkg\n\nfunc Baz() {}\n").unwrap();
+        parse_dir(&db_a, &src_a, None);
+        let (_, tree_7, parser_7) = read_head_roots(&db_a);
+        assert_ne!(tree_7, tree_1, "one changed byte moves treeRoot");
+        assert_eq!(parser_7, parser_1, "the derivation did not change");
+
+        // The verifier agrees with the head it just wrote, and disagrees once
+        // the source set changes under it.
+        assert!(matches!(
+            crate::tree_root::verify(&db_a).unwrap(),
+            crate::tree_root::Verification::Valid { .. }
+        ));
+        {
+            let conn = Connection::open(&db_a).unwrap();
+            conn.execute(
+                "UPDATE _source SET content_hash = zeroblob(32) WHERE id = 'a.go'",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            crate::tree_root::verify(&db_a).unwrap(),
+            crate::tree_root::Verification::TreeRootMismatch { .. }
+        ));
+    }
+
+    /// A head written before ADR-0040 carries neither field; the verifier
+    /// says so instead of calling it valid.
+    #[test]
+    fn verify_reports_a_head_without_tree_root_as_not_stamped() {
+        let td = TempDir::new().unwrap();
+        let src = td.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("a.go"), b"package m\n").unwrap();
+        let db = td.path().join("out.db");
+        parse_dir(&db, &src, None);
+        // Rewrite the head with the pre-ADR-0040 field set only.
+        use leyline_schema_capnp::head_capnp::head;
+        let mut src_msg = capnp::message::Builder::new_default();
+        {
+            let mut h: head::Builder = src_msg.init_root();
+            h.set_generation(1);
+            h.reborrow().init_root_hash().set_bytes(&[7u8; 32]);
+            h.reborrow().init_parent_hash().set_bytes(&[0u8; 32]);
+        }
+        let mut f = std::fs::File::create(head_path_for(&db)).unwrap();
+        leyline_schema_capnp::canonical::write_canonical_message::<head::Owned, _>(
+            &src_msg, &mut f,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::tree_root::verify(&db).unwrap(),
+            crate::tree_root::Verification::NotStamped
+        );
+    }
+
+    /// Bead `ley-line-open-0c8ee7`: an unreadable head fails the parse
+    /// instead of silently restarting the chain at generation 1. A missing
+    /// head still starts a chain.
+    #[test]
+    fn a_truncated_head_fails_the_parse_instead_of_restarting_the_chain() {
+        let td = TempDir::new().unwrap();
+        let src = td.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("a.go"), b"package m\n").unwrap();
+        let db = td.path().join("out.db");
+        parse_dir(&db, &src, None);
+        let head = head_path_for(&db);
+        let bytes = std::fs::read(&head).unwrap();
+        let truncated = bytes[..bytes.len() / 2].to_vec();
+        std::fs::write(&head, &truncated).unwrap();
+
+        let conn = Connection::open(&db).unwrap();
+        let err = parse_into_conn(&conn, &src, None, None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("refusing to restart the chain"),
+            "the error must name the refusal: {msg}"
+        );
+        assert_eq!(
+            std::fs::read(&head).unwrap(),
+            truncated,
+            "a refused parse must not rewrite the head"
+        );
+
+        // Deleting the head is the deliberate restart.
+        std::fs::remove_file(&head).unwrap();
+        parse_into_conn(&conn, &src, None, None).unwrap();
+        let (root, _, _) = read_head_roots(&db);
+        assert_ne!(root, [0u8; 32]);
     }
 
     #[test]

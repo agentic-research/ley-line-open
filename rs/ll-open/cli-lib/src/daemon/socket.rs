@@ -396,7 +396,7 @@ async fn dispatch(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use parking_lot::{Mutex, RwLock};
     use std::sync::Arc;
@@ -442,7 +442,10 @@ mod tests {
         assert!(nested.exists());
     }
 
-    fn test_context(dir: &std::path::Path) -> Arc<DaemonContext> {
+    /// A daemon context over a fresh arena and WAL live db in `dir`. Needs a
+    /// tokio runtime (the event router spawns its dispatch task). Shared with
+    /// other daemon modules' tests.
+    pub(crate) fn test_context(dir: &std::path::Path) -> Arc<DaemonContext> {
         let arena_path = dir.join("socket.arena");
         let ctrl_path = dir.join("socket.ctrl");
         let _mmap = leyline_core::create_arena(&arena_path, 2 * 1024 * 1024).unwrap();

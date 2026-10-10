@@ -46,7 +46,12 @@ context, scoping notes, and review history are recoverable.
   a cache key. Both are additive `Head` fields (ADR-0014 §1; Go bindings
   regenerated); a head written before them reads as not stamped. New command
   `leyline verify-head <db>` recomputes both from the arena and exits non-zero
-  on a mismatch, a pre-ADR-0040 head, or an unreadable head.
+  on a mismatch, a pre-ADR-0040 head, or an unreadable head. Because the
+  public Go schema module changed, `SCHEMA_VERSION` moves 0.18.1 → 0.20.1;
+  the matching `clients/go/leyline-schema` tag is published by the next
+  release's tag step (the release gate's "schema bumps with this release"
+  state). Consumers pinned to `v0.18.1` keep working: the fields are
+  additive and a `Head` without them reads as before.
 
 ### Fixed
 

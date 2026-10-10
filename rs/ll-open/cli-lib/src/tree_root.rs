@@ -228,11 +228,8 @@ pub fn verify(db_path: &Path) -> Result<Verification> {
         return Ok(Verification::NotStamped);
     };
 
-    let conn = Connection::open_with_flags(
-        db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .with_context(|| format!("open {} read-only", db_path.display()))?;
+    let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("open {} read-only", db_path.display()))?;
     let trusted = crate::cmd_parse::trusted_query_hashes_from_env();
     let resolution = leyline_ts::query_engine::resolve_query_set(&conn, &trusted)?;
     let recomputed_parser = ParserInputs::current(&resolution.query_set).parser_id();

@@ -1913,7 +1913,7 @@ pub fn parse_into_conn(
         insert_profile_enabled_from(std::env::var("LEYLINE_PROFILE").ok().as_deref());
 
     // Flush the capnp dual-write `BufWriter`s before COMMIT and before
-    // `write_head_after_parse` reads the segments for hashing —
+    // `write_head_for_path` reads the segments for hashing —
     // otherwise the buffered tail would be invisible to the Σ root
     // computation, yielding a hash that disagrees with the on-disk
     // bytes once the writer is dropped. Drop after flush so the file
@@ -2377,15 +2377,20 @@ pub fn head_path_for(db_path: &Path) -> PathBuf {
 /// `leyline verify-head`, which must resolve the same effective query set to
 /// recompute the same `parserId`.
 pub fn trusted_query_hashes_from_env() -> std::collections::HashSet<String> {
-    std::env::var("LLO_TRUSTED_QUERY_HASHES")
-        .ok()
-        .map(|s| {
-            s.split(',')
-                .map(|h| h.trim().to_ascii_lowercase())
-                .filter(|h| !h.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
+    parse_trusted_query_hashes(std::env::var("LLO_TRUSTED_QUERY_HASHES").ok().as_deref())
+}
+
+/// The allowlist's parse: comma-separated, trimmed, lowercased, empties
+/// dropped; unset is empty. Pure, so it is testable without the process
+/// environment.
+pub fn parse_trusted_query_hashes(raw: Option<&str>) -> std::collections::HashSet<String> {
+    raw.map(|s| {
+        s.split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// T8.5: read the existing `${db}.head.capnp`, returning the chain
@@ -2610,41 +2615,6 @@ fn write_head_for_path(
     leyline_schema_capnp::canonical::write_canonical_message::<head::Owned, _>(&src, &mut f)
         .context("write Head capnp record")?;
     Ok(())
-}
-
-/// T8.5: thin wrapper around `write_head_for_path` that pulls the
-/// db_path from a SQLite connection. Skips when the connection isn't
-/// file-backed (`:memory:`) — same gating as T8.3's snapshot writers.
-/// Kept for callers that don't have the path on hand and don't need
-/// the parallel-dispatch shape that `parse_into_conn` uses internally.
-#[allow(dead_code)]
-fn write_head_after_parse(conn: &Connection) -> Result<()> {
-    let row: rusqlite::Result<String> = conn.query_row(
-        "SELECT file FROM pragma_database_list WHERE name = 'main' LIMIT 1",
-        [],
-        |r| r.get(0),
-    );
-    let db_path = match row {
-        Ok(s) if !s.is_empty() => std::path::PathBuf::from(s),
-        _ => return Ok(()),
-    };
-    // Mirror parse_into_conn: derive the IR unbound-fact count from the db —
-    // node_refs whose token matches no node_defs token (ADR-0027).
-    let unbound_facts: u64 = conn
-        .query_row(
-            "SELECT count(*) FROM node_refs WHERE token NOT IN (SELECT token FROM node_defs)",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .map(|n| n as u64)
-        .unwrap_or(0);
-    // ADR-0040 D1: same tree and derivation identities `parse_into_conn`
-    // stamps, resolved from this connection's arena.
-    let resolution =
-        leyline_ts::query_engine::resolve_query_set(conn, &trusted_query_hashes_from_env())?;
-    let parser_id = crate::tree_root::ParserInputs::current(&resolution.query_set).parser_id();
-    let tree_root = crate::tree_root::tree_root(conn, parser_id)?;
-    write_head_for_path(&db_path, unbound_facts, tree_root, parser_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -5414,6 +5384,7 @@ mod tests {
         std::fs::write(src.join("a.go"), b"package m\n").unwrap();
         let db = td.path().join("out.db");
         parse_dir(&db, &src, None);
+        crate::tree_root::cmd_verify_head(&db).expect("a freshly parsed arena verifies");
         // Rewrite the head with the pre-ADR-0040 field set only.
         use leyline_schema_capnp::head_capnp::head;
         let mut src_msg = capnp::message::Builder::new_default();
@@ -5431,6 +5402,53 @@ mod tests {
         assert_eq!(
             crate::tree_root::verify(&db).unwrap(),
             crate::tree_root::Verification::NotStamped
+        );
+        let err = crate::tree_root::cmd_verify_head(&db)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no treeRoot"), "{err}");
+    }
+
+    #[test]
+    fn trusted_query_hashes_parse_trims_lowercases_and_drops_empties() {
+        let got = parse_trusted_query_hashes(Some(" ABC, def ,,Ghi "));
+        let want: std::collections::HashSet<String> = ["abc", "def", "ghi"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(got, want);
+        assert!(parse_trusted_query_hashes(None).is_empty());
+        assert!(parse_trusted_query_hashes(Some("")).is_empty());
+        assert!(parse_trusted_query_hashes(Some(" , ")).is_empty());
+    }
+
+    /// Bead `ley-line-open-0c8ee7`, the other refusal: a head that exists
+    /// but cannot be opened (permissions) is not "no head"; only NotFound
+    /// starts a chain.
+    #[cfg(unix)]
+    #[test]
+    fn an_unopenable_head_fails_the_parse_instead_of_restarting_the_chain() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let src = td.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("a.go"), b"package m\n").unwrap();
+        let db = td.path().join("out.db");
+        parse_dir(&db, &src, None);
+        let head = head_path_for(&db);
+        std::fs::set_permissions(&head, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&head).is_ok() {
+            // root reads anything; the refusal cannot be observed here.
+            std::fs::set_permissions(&head, std::fs::Permissions::from_mode(0o644)).unwrap();
+            return;
+        }
+        let conn = Connection::open(&db).unwrap();
+        let err = parse_into_conn(&conn, &src, None, None).unwrap_err();
+        std::fs::set_permissions(&head, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cannot be read") && msg.contains("refusing to restart the chain"),
+            "{msg}"
         );
     }
 

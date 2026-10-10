@@ -44,6 +44,20 @@ context, scoping notes, and review history are recoverable.
   read fails the parse with an error that names the refusal, and the head is
   not rewritten. Deleting the file is the deliberate way to start over.
 
+## [0.20.1] — 2026-10-10
+
+Patch release with one breaking change for control-block consumers: the
+arena control block is published under a seqlock and `.ctrl` VERSION moves
+2 → 3, so a reader can no longer observe a half-written root. Every process
+that shares a control block must move together; mache's `internal/control`
+reader pins `Version = 2` and must bump to 3 and adopt the seqlock read loop
+(load the sequence; if odd, retry; copy path, size and root; reload; accept
+only if both loads agree). A v2 reader refuses a v3 control file by name
+rather than mis-reading it. The projection stays `projection-v6`; the wire
+stays v1. The remaining entries are the fixes that landed on `integration`
+after v0.20.0: scoped LSP symbol positions, the token-map export cost, the
+mount's control mmap and cached path lookups, and the mount test's deadline.
+
 ### Changed
 
 - **BREAKING: the control block is published under a seqlock; `.ctrl`

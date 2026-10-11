@@ -237,10 +237,17 @@ os.write(fd, b"util")
 os.fsync(fd)
 os.close(fd)
 ' "$W/mnt/$LEAF"
-    expect_eq "$(op '{"op":"query","sql":"SELECT b.blob_bytes FROM _source s JOIN source_blobs b ON b.blob_hash = s.content_hash WHERE s.id = '"'"'util.go'"'"'"}' | field rows 0 blob_bytes)" \
-        "$(printf 'package util\n\nfunc add(a, b int) int {\n\treturn a + b\n}\n' | od -An -tx1 | tr -d ' \n')" \
-        "util.go's stored bytes after the mount write"
+    # The mount serves the staged bytes at once; the NFS server commits them
+    # through the one write path after its writes go quiet (nfs::Staged,
+    # ~200 ms), so the stored source is waited for, not read immediately.
     within_deadline "read back through the mount" sh -c "test \"\$(cat '$W/mnt/$LEAF')\" = util"
+    want_hex=$(printf 'package util\n\nfunc add(a, b int) int {\n\treturn a + b\n}\n' | od -An -tx1 | tr -d ' \n')
+    stored_hex() {
+        op '{"op":"query","sql":"SELECT b.blob_bytes FROM _source s JOIN source_blobs b ON b.blob_hash = s.content_hash WHERE s.id = '"'"'util.go'"'"'"}' |
+            field rows 0 blob_bytes
+    }
+    stored_is_written() { [ "$(stored_hex)" = "$want_hex" ]; }
+    wait_for "util.go's stored bytes to become the mount write" stored_is_written
     stop_daemon
     wait_for "the mount to detach" sh -c "! mount | grep -qF '$W/mnt'"
     step "mount: a write through the mount is stored, served back, and the mount detaches on SIGTERM"

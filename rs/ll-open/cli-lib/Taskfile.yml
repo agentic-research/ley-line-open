@@ -53,6 +53,44 @@ tasks:
     cmds:
       - cargo test -p leyline-cli-lib --features mount --test mount_round_trip
 
+  # The binary, end to end: tools/cli_smoke.sh runs parse, verify-head,
+  # splice, and the daemon's socket ops and SIGTERM shutdown on a fixture
+  # tree. `smoke` builds what release.yml ships (default features);
+  # `smoke:mount` adds the mount and a write through it. `smoke:bin` runs the
+  # script on an already-built binary — release.yml calls it per target.
+  # `smoke:dev` is the `ci` gate: debug builds, both modes, on every PR and
+  # every local `task ci` — the same runners `test:mount` already mounts on.
+  smoke:dev:
+    desc: Debug-build the CLI and smoke it end to end, default features then with the mount (the `ci` gate)
+    dir: '{{.TASKFILE_DIR}}/../..'
+    cmds:
+      - cargo build -p leyline-cli
+      - ../tools/cli_smoke.sh target/debug/leyline
+      - cargo build -p leyline-cli --features mount
+      - ../tools/cli_smoke.sh target/debug/leyline --mount
+
+  smoke:
+    desc: Build the release CLI with default features and smoke it end to end
+    dir: '{{.TASKFILE_DIR}}/../..'
+    cmds:
+      - cargo build --release -p leyline-cli
+      - ../tools/cli_smoke.sh target/release/leyline
+
+  smoke:mount:
+    desc: Build the release CLI with `mount` and smoke it, including a write through the mount (needs FUSE/fuse-t)
+    dir: '{{.TASKFILE_DIR}}/../..'
+    cmds:
+      - cargo build --release -p leyline-cli --features mount
+      - ../tools/cli_smoke.sh target/release/leyline --mount
+
+  smoke:bin:
+    desc: Smoke an already-built leyline binary (BIN, relative to the repo root)
+    requires:
+      vars: [BIN]
+    dir: '{{.TASKFILE_DIR}}/../../..'
+    cmds:
+      - tools/cli_smoke.sh "{{.BIN}}"
+
   test:cdc-activation:
     desc: CDC activation + the disabled-build counterpart — both halves of the cdc feature gate
     dir: '{{.TASKFILE_DIR}}/../..'

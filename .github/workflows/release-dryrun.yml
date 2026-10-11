@@ -20,6 +20,8 @@ on:
       - 'Taskfile.yml'
       - 'image.Dockerfile'
       - 'tools/stage_release_artifacts.sh'
+      - 'tools/cli_smoke.sh'
+      - 'rs/ll-open/cli-lib/Taskfile.yml'
       - 'tools/prepare_public_release.sh'
       - 'tools/verify_public_release.sh'
       - 'tools/release-assets.txt'
@@ -94,6 +96,9 @@ jobs:
         env:
           BUILD_TARGET: x86_64-unknown-linux-gnu
         run: task release:target
+
+      - name: Smoke the built binary
+        run: task cli-lib:smoke:bin BIN=rs/target/x86_64-unknown-linux-gnu/release/leyline
 
       - name: Build generator binaries
         env:

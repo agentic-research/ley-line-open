@@ -475,11 +475,21 @@ tasks:
         "{{.VERSION}}"
         "{{.EXPECTED_COMMIT}}"
 
+  # The local half of a release: the binary this tree builds must pass the
+  # end-to-end smoke, mount included, before a tag exists. release.yml smokes
+  # each native target again on its own runner (mount excluded there).
+  release:smoke:
+    desc: Smoke the CLI this tree builds — default features, then with the mount
+    cmds:
+      - task: cli-lib:smoke
+      - task: cli-lib:smoke:mount
+
   release:publish:
-    desc: Atomically tag, wait for release CI, and verify public vVERSION
+    desc: Smoke the CLI, then atomically tag, wait for release CI, and verify public vVERSION
     requires:
       vars: [VERSION]
     cmds:
+      - task: release:smoke
       - tools/release_publish.sh "{{.VERSION}}"
 
   check:all-features:
@@ -1567,6 +1577,7 @@ tasks:
       - task: cli-lib:test:vec
       - task: cli-lib:test:text-search
       - task: cli-lib:test:mount
+      - task: cli-lib:smoke:dev
       - task: tier:isolation
       - task: check:all-features
       - task: test

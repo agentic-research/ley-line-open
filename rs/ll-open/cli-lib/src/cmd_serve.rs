@@ -182,30 +182,81 @@ pub async fn cmd_serve(
     Ok(())
 }
 
-/// Wait for Ctrl+C or an optional timeout, whichever comes first.
+/// What ended a [`ShutdownSignals::wait`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shutdown {
+    Interrupt,
+    Terminate,
+    Timeout,
+}
+
+/// The signals that stop a long-running command: Ctrl+C (SIGINT) and, on
+/// unix, SIGTERM — what `docker stop`, launchd and systemd send. Installed
+/// up front so a failure to register is an error, not a wait that can never
+/// end on that signal.
+pub struct ShutdownSignals {
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl ShutdownSignals {
+    pub fn install() -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                interrupt: signal(SignalKind::interrupt()).context("install the SIGINT handler")?,
+                terminate: signal(SignalKind::terminate()).context("install the SIGTERM handler")?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {})
+        }
+    }
+
+    /// Wait for a signal or the optional timeout, whichever comes first.
+    pub async fn wait(&mut self, timeout: Option<Duration>) -> Shutdown {
+        let timer = async {
+            match timeout {
+                Some(dur) => tokio::time::sleep(dur).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.interrupt.recv() => Shutdown::Interrupt,
+                _ = self.terminate.recv() => Shutdown::Terminate,
+                _ = timer => Shutdown::Timeout,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => Shutdown::Interrupt,
+                _ = timer => Shutdown::Timeout,
+            }
+        }
+    }
+}
+
+/// Wait for Ctrl+C, SIGTERM or an optional timeout, whichever comes first.
 pub async fn wait_for_shutdown(timeout: Option<&str>) -> Result<()> {
     let timeout_dur = match timeout {
         Some(s) => Some(parse_duration(s)?),
         None => None,
     };
+    let mut signals = ShutdownSignals::install()?;
 
     eprintln!("press Ctrl+C to stop");
 
-    match timeout_dur {
-        Some(dur) => {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    eprintln!("\nreceived Ctrl+C, shutting down");
-                }
-                _ = tokio::time::sleep(dur) => {
-                    eprintln!("timeout reached, shutting down");
-                }
-            }
-        }
-        None => {
-            tokio::signal::ctrl_c().await?;
-            eprintln!("\nreceived Ctrl+C, shutting down");
-        }
+    match signals.wait(timeout_dur).await {
+        Shutdown::Interrupt => eprintln!("\nreceived Ctrl+C, shutting down"),
+        Shutdown::Terminate => eprintln!("received SIGTERM, shutting down"),
+        Shutdown::Timeout => eprintln!("timeout reached, shutting down"),
     }
 
     Ok(())
@@ -243,6 +294,34 @@ mod tests {
             mount.is_dir(),
             "the mountpoint is created before the backend is chosen"
         );
+    }
+
+    /// The timeout ends the wait, and SIGTERM — what `docker stop`, launchd
+    /// and systemd send — ends it the way Ctrl+C does, so the caller's
+    /// graceful shutdown runs. Before, only Ctrl+C was handled and SIGTERM
+    /// killed the process outright, leaving the socket, the arena lock and
+    /// any mount behind. One test, in this order: a process-wide SIGTERM
+    /// reaches every installed listener, so a separate timeout test running
+    /// alongside would see it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_timeout_or_sigterm_ends_the_wait() {
+        let mut signals = ShutdownSignals::install().expect("install shutdown signals");
+        let which = tokio::time::timeout(
+            Duration::from_secs(5),
+            signals.wait(Some(Duration::from_millis(10))),
+        )
+        .await
+        .expect("a 10ms timeout must end the wait");
+        assert_eq!(which, Shutdown::Timeout);
+
+        // SAFETY: kill(2) on our own pid; the handler installed above
+        // replaces SIGTERM's default action, so the process survives.
+        assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGTERM) }, 0);
+        let which = tokio::time::timeout(Duration::from_secs(5), signals.wait(None))
+            .await
+            .expect("SIGTERM must end the wait");
+        assert_eq!(which, Shutdown::Terminate);
     }
 
     #[test]

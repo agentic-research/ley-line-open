@@ -53,7 +53,47 @@ context, scoping notes, and review history are recoverable.
   state). Consumers pinned to `v0.18.1` keep working: the fields are
   additive and a `Head` without them reads as before.
 
+- **Release smoke: the built binary runs end to end before a tag** (bead
+  `ley-line-open-7c6b7e`). `tools/cli_smoke.sh` drives one `leyline` binary on
+  a two-language fixture: `--version`, `parse` (every source in
+  `source_blobs`, every `_ast` row hashed), `verify-head`, a `splice` that is
+  stored and restamps the head, a syntax-breaking `splice` that leaves the
+  database byte-identical, the over-long socket path error, the daemon's
+  `status`, `leyline_version` and `query` ops, and SIGTERM shutdown; with
+  `--mount`, a write through the mount that is stored, read back, and the
+  mount detaching on SIGTERM. Tasks `cli-lib:smoke`, `cli-lib:smoke:mount`
+  and `cli-lib:smoke:bin`; root `release:smoke` runs both builds, and
+  `release:publish` runs it before tagging. `release.yml` smokes each
+  natively built target and the release dry-run smokes its build. Its first
+  run found the three defects below.
+
 ### Fixed
+
+- **The daemon's `query` op answered every non-text value with `""`** (bead
+  `ley-line-open-7854b8`). Each column was read as a Rust `String` with the
+  error defaulted away, and only SQLite TEXT converts, so `SELECT count(*)`
+  returned `""`, and so did every integer, real, NULL and blob. Values are
+  now rendered by storage class as the wire text the schema (`values:
+  List(Text)`) and the protocol fixture (`SELECT 1` → `"1"`) declare:
+  integers and reals in decimal, text as itself, blobs as lowercase hex, and
+  NULL as JSON `null`, distinct from the empty string.
+
+- **SIGTERM now shuts the daemon and `serve` down gracefully** (bead
+  `ley-line-open-7a9498`). Only Ctrl+C was handled; SIGTERM — what `docker
+  stop`, launchd and systemd send, and the OCI image runs the daemon — killed
+  the process with status 143, skipping the final snapshot and leaving the
+  socket, the arena lock and owner files, and any mount behind.
+  `ShutdownSignals` installs SIGINT and SIGTERM handlers up front, failing if
+  either cannot be registered, and both end the wait.
+
+- **macOS mount builds launch** (bead `ley-line-open-b7ab7f`). A binary built
+  with `mount` (`task install:full+mount`, `release:mount`) linked
+  `@rpath/libfuse-t.dylib` with no rpath, so dyld refused to start it for any
+  command. fuser links fuse-t through the `pkg-config` crate, which drops the
+  `-Wl,-rpath` that `rs/pkgconfig/fuse.pc` declares; `cargo test` hid it by
+  exporting the link search path to dyld. `leyline-cli`'s build script now
+  adds fuse-t's library directory to the binary's rpath on macOS mount
+  builds.
 
 - **BREAKING: one write path; a written file is stored and projected exactly
   as a cold parse of its bytes** (ADR-0040 D3, beads `ley-line-open-f2ffbd`,

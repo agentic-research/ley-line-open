@@ -64,6 +64,19 @@ context, scoping notes, and review history are recoverable.
   read fails the parse with an error that names the refusal, and the head is
   not rewritten. Deleting the file is the deliberate way to start over.
 
+- **`leyline daemon` no longer panics when its socket's staging path is too
+  long for `sun_path`** (bead `ley-line-open-d923b7`, reported by mache's
+  release parity run). The owner-only bind staged the socket at
+  `<dir>/.leyline-sock-stage-<pid>/socket`, about 27 bytes longer than the
+  final `<dir>/default.sock`; with `HOME` under macOS `TMPDIR` the final path
+  fit the 104-byte limit and the staged one did not, so the daemon panicked
+  with exit 101 and left the staging directory behind. The staging name is
+  now `.s<pid>/s`, no longer than the final socket's own name; a staged path
+  that still does not fit is an error naming the limit and both paths; every
+  bind failure is returned through `socket::spawn` and the daemon instead of
+  panicking, and the staging directory is removed on every path out.
+  `socket::spawn` now returns `anyhow::Result<PathBuf>`.
+
 - **A write through the daemon's mount is durable; the mount reads `live.db`
   through the daemon's reader pool instead of a private copy** (ADR-0040 D4,
   bead `ley-line-open-f2ee9f`; closes `192018`). `leyline daemon --mount`

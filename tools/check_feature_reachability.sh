@@ -305,8 +305,16 @@ fi
 # missing test.
 #
 # Not-shipping describes what USERS get. It is not permission for the tree to
-# stop building. `--lib --no-run` compiles the test targets too, which is what
-# catches a break confined to `#[cfg(test)]`.
+# stop building. `--lib --tests` type-checks the lib's test target too, which
+# is what catches a break confined to `#[cfg(test)]`.
+#
+# `cargo check`, not `cargo test --no-run` (bead ley-line-open-0988f0): the
+# question is "does it still compile", and check answers it without codegen
+# or linking. Proven on 2026-10-11 by planting a type error in a
+# `#[cfg(feature = "sqlite")]` test in ll-open/vcs: `check --lib --tests`
+# failed with E0308; `check --lib` alone did not. As `test --no-run`, this
+# loop made the lint the second-slowest step of `task ci` (297 s of 26.7 min
+# in CI run 38162088279), cold-building nine configurations nothing reused.
 for entry in $not_shipping; do
     dir=${entry%/*}
     feature=${entry##*/}
@@ -323,10 +331,10 @@ for entry in $not_shipping; do
         failed=1
         continue
     fi
-    if ! cargo test --package "$pkg" --features "$feature" --lib --no-run >/dev/null 2>&1; then
+    if ! cargo check --package "$pkg" --features "$feature" --lib --tests >/dev/null 2>&1; then
         printf 'feature-rot FAILED: %s/%s is on the not-shipping ledger and no longer COMPILES\n' \
             "$dir" "$feature" >&2
-        printf '                    reproduce: cargo test --package %s --features %s --lib\n' \
+        printf '                    reproduce: cargo check --package %s --features %s --lib --tests\n' \
             "$pkg" "$feature" >&2
         failed=1
     fi

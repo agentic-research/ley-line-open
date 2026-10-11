@@ -1,7 +1,12 @@
 name: CI
 on:
+  # `integration` as well as `main` (bead ley-line-open-0988f0): a push run is
+  # the only run that can SAVE a cache entry other runs can read. A PR run's
+  # cache scope is its own ref plus its base branch and `main`; with no push
+  # runs on `integration`, every PR into it restored the one frozen `main`
+  # entry. The push run also re-verifies the squashed merge result.
   push:
-    branches: [main]
+    branches: [main, integration]
   pull_request:
 
 env:
@@ -10,7 +15,10 @@ env:
   # intentionally retain sccache's platform-default cache so compiler outputs
   # remain reusable across sibling repositories/worktrees.
   SCCACHE_DIR: ${{ github.workspace }}/.cache/sccache
-  SCCACHE_CACHE_SIZE: 2G
+  # Sized to hold one whole `task ci` run (bead ley-line-open-0988f0). At 2G
+  # the cache was full by mid-run and LRU-evicted the run's own early
+  # artifacts: Rust hit rate 3 of 2198 compiles (0.1%) in run 38162088279.
+  SCCACHE_CACHE_SIZE: 6G
 
 # CI is the same gate as local dev: every step delegates to a Taskfile
 # entry. If a check isn't reachable via `task <name>`, it doesn't belong
@@ -131,13 +139,23 @@ jobs:
       # Compiler outputs use the same Taskfile-managed sccache path locally
       # and on runners. The Taskfile pins + verifies the executable; this
       # action only restores its content-addressed data.
+      #
+      # Restore and save are separate steps (bead ley-line-open-0988f0). The
+      # key used to be one per lockfile, and actions/cache skips its save on
+      # an exact-key restore, so the first entry for a lockfile was the only
+      # one ever written: every later run restored that same snapshot. Now
+      # every push run saves its own entry (run id + attempt) and every run
+      # restores the newest entry for its lockfile, falling back to any
+      # entry. PR runs restore only: a PR-scoped entry is readable by that PR
+      # alone, and at several GB each it would evict the shared ones.
       # SHA-pinned: actions/cache@v6.1.0 (Node 24).
       - name: Restore sccache compiler cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: .cache/sccache
-          key: sccache-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('rs/Cargo.lock') }}
+          key: sccache-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('rs/Cargo.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
+            sccache-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('rs/Cargo.lock') }}-
             sccache-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-
 
       - name: Install pinned sccache through Taskfile
@@ -152,6 +170,17 @@ jobs:
       - name: Report sccache statistics
         if: always()
         run: task cache:sccache:stats
+
+      # Saved BEFORE test:perf, so the entry holds what `task ci` compiled
+      # (the dev/test artifacts every PR run needs) rather than ending on the
+      # release-profile build, which used to fill the capped cache last.
+      # Push runs only; see the restore step.
+      - name: Save sccache compiler cache
+        if: ${{ !cancelled() && github.event_name == 'push' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .cache/sccache
+          key: sccache-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('rs/Cargo.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       # Perf regression gate — the release-profile build adds ~90-120s, so a
       # PR targeting `integration` does not pay it. A PR targeting `main` does:

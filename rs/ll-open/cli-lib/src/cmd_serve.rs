@@ -122,7 +122,10 @@ pub fn mount_nfs_cmd(port: u16, mountpoint: &Path) -> Result<NfsMount> {
     if !status.success() {
         anyhow::bail!("NFS mount failed with exit code {:?}", status.code());
     }
-    Ok(NfsMount { path: mount_path })
+    Ok(NfsMount {
+        path: mount_path,
+        unmount: unmount_nfs,
+    })
 }
 
 #[cfg(feature = "mount")]
@@ -185,12 +188,14 @@ pub enum Mounted {
 #[cfg(feature = "mount")]
 pub struct NfsMount {
     path: PathBuf,
+    /// [`unmount_nfs`] in every real mount; a test substitutes a recorder.
+    unmount: fn(&Path) -> Result<()>,
 }
 
 #[cfg(feature = "mount")]
 impl Drop for NfsMount {
     fn drop(&mut self) {
-        if let Err(e) = unmount_nfs(&self.path) {
+        if let Err(e) = (self.unmount)(&self.path) {
             eprintln!("warn: {e:#}");
         }
     }
@@ -358,6 +363,41 @@ mod tests {
 
     /// Unmounting a directory nothing is mounted on fails, naming it, after
     /// both `umount` and `umount -f` refuse — it does not report success.
+    /// Tests that install the process-wide signal handlers run one at a time:
+    /// the SIGTERM test signals the whole process, which would end another
+    /// test's wait early.
+    static SIGNAL_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Dropping an NFS mount unmounts its own path — the daemon and `serve`
+    /// rely on the drop alone to leave no mount behind.
+    #[cfg(feature = "mount")]
+    #[test]
+    fn dropping_an_nfs_mount_unmounts_its_path() {
+        use std::sync::Mutex;
+        static UNMOUNTED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+        fn record(path: &Path) -> Result<()> {
+            UNMOUNTED.lock().unwrap().push(path.to_path_buf());
+            Ok(())
+        }
+        let path = PathBuf::from("/nonexistent/leyline-test-mount");
+        drop(NfsMount {
+            path: path.clone(),
+            unmount: record,
+        });
+        assert_eq!(*UNMOUNTED.lock().unwrap(), vec![path]);
+    }
+
+    /// A timeout that does not parse is refused before anything waits, and a
+    /// valid one is waited out rather than returning at once.
+    #[tokio::test]
+    async fn wait_for_shutdown_refuses_a_bad_timeout_and_waits_out_a_good_one() {
+        let _serial = SIGNAL_TESTS.lock().await;
+        assert!(wait_for_shutdown(Some("soon")).await.is_err());
+        let started = std::time::Instant::now();
+        wait_for_shutdown(Some("1")).await.unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(1));
+    }
+
     #[cfg(feature = "mount")]
     #[test]
     fn unmounting_what_is_not_mounted_is_an_error() {
@@ -390,6 +430,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn the_timeout_or_sigterm_ends_the_wait() {
+        let _serial = SIGNAL_TESTS.lock().await;
         let mut signals = ShutdownSignals::install().expect("install shutdown signals");
         let which = tokio::time::timeout(
             Duration::from_secs(5),

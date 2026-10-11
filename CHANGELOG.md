@@ -89,6 +89,36 @@ context, scoping notes, and review history are recoverable.
   from the gate by name and tracked as bead `ley-line-open-b5d354` for the
   projection-v7 break.
 
+### Changed
+
+- **CI's compiler cache is refreshed every run and holds a whole `task ci`**
+  (bead `ley-line-open-0988f0`). In run 38162088279, test binaries ran for
+  about 2 of 26.7 minutes; the rest was compilation, and sccache hit 3 of
+  2,198 Rust compiles (0.1%). Two causes:
+  - **The cache was frozen.** Its key was one per `Cargo.lock`, and
+    `actions/cache` skips the save after an exact-key restore. CI only ran
+    on push to `main`, so PRs into `integration` restored the one `main`
+    entry ever written for the lockfile, which was saved after `test:perf`
+    and held mostly release-profile artifacts.
+  - **The cap was too small.** At `SCCACHE_CACHE_SIZE: 2G` the cache filled
+    mid-run and evicted the run's own artifacts.
+
+  Now ci.yml also runs on push to `integration`. Restore and save are
+  separate steps. Push runs save a fresh entry, keyed by run id and taken
+  before `test:perf`; PR runs restore the newest one without spending the
+  Actions cache budget. The cap is 6G. `lint:cache-contract` asserts the
+  per-run key and the push-only save.
+- **`lint:feature-reachability` type-checks instead of building.** Its
+  not-shipping rows now run `cargo check --lib --tests`, not
+  `cargo test --lib --no-run`, which still catches a break confined to
+  `#[cfg(test)]` (proven by planting one). The lint now runs after `check`
+  so it reuses that step's dependency metadata. It was the second-slowest
+  CI step (297 s).
+- **`cli-lib:test:vec` and `cli-lib:test:text-search` are one task**,
+  `cli-lib:test:search` (`--features vec,text-search`). Nothing is gated on
+  either feature being absent, and `install:full` ships them together. They
+  were two full rebuilds of `leyline-cli-lib`.
+
 ### Fixed
 
 - **An NFS write is committed once, whole, not once per chunk** (bead

@@ -77,7 +77,7 @@ context, scoping notes, and review history are recoverable.
   `release:publish` runs it before tagging. `release.yml` smokes each
   natively built target and the release dry-run smokes its build, and
   `cli-lib:smoke:dev` (debug builds, both modes) runs in `task ci` on every
-  PR. Its first run found the four defects below.
+  PR. Its first runs found the five defects below.
 
 ### Fixed
 
@@ -88,6 +88,17 @@ context, scoping notes, and review history are recoverable.
   ADR-0040 D3 a write through it reaches the arena, so any host that could
   reach the port could read the projected tree and write to it. Both now
   listen on `127.0.0.1` through one `cmd_serve::nfs_listen_addr`.
+
+- **`daemon --mount` keeps its mount while it serves and releases it on
+  exit** (bead `ley-line-open-8fbf58`). The daemon bound its FUSE session
+  inside the match arm that created it, so the session dropped — and
+  unmounted — as soon as the arm ended: on Linux, where FUSE is the default,
+  the mount served nothing past startup. On NFS nothing ever ran `umount`,
+  so the daemon and `serve` exited leaving the kernel holding a mount whose
+  server was gone, and any access to it hung. One `cmd_serve::mount_backend`
+  now mounts for both commands and returns a guard (the FUSE session, or an
+  NFS mount whose drop runs `umount`, then `umount -f`); the daemon holds it
+  until shutdown and drops it before the final snapshot.
 
 - **The daemon's `query` op answered every non-text value with `""`** (bead
   `ley-line-open-7854b8`). Each column was read as a Rust `String` with the

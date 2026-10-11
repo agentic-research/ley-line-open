@@ -92,9 +92,10 @@ pub fn nfs_listen_addr(port: u16) -> String {
     format!("127.0.0.1:{port}")
 }
 
-/// Shell out to mount_nfs (macOS) or mount.nfs (Linux) to mount the NFS export.
+/// Shell out to mount_nfs (macOS) or mount.nfs (Linux) to mount the NFS
+/// export; the returned guard unmounts it when dropped.
 #[cfg(feature = "mount")]
-pub fn mount_nfs_cmd(port: u16, mountpoint: &Path) -> Result<()> {
+pub fn mount_nfs_cmd(port: u16, mountpoint: &Path) -> Result<NfsMount> {
     std::fs::create_dir_all(mountpoint)
         .with_context(|| format!("create mountpoint {}", mountpoint.display()))?;
 
@@ -121,7 +122,7 @@ pub fn mount_nfs_cmd(port: u16, mountpoint: &Path) -> Result<()> {
     if !status.success() {
         anyhow::bail!("NFS mount failed with exit code {:?}", status.code());
     }
-    Ok(())
+    Ok(NfsMount { path: mount_path })
 }
 
 #[cfg(feature = "mount")]
@@ -162,31 +163,82 @@ pub async fn cmd_serve(
 
     let graph: Arc<dyn leyline_fs::graph::Graph> = Arc::new(graph);
 
-    // Mount.
+    let mounted = mount_backend(graph, mount, backend, nfs_port).await?;
+    wait_for_shutdown(timeout).await?;
+    drop(mounted);
+
+    Ok(())
+}
+
+/// A mount this process holds while it serves. Dropping it unmounts: the
+/// FUSE session's own drop, or `umount` for an NFS mount. Held for the whole
+/// serve; before, the daemon dropped its FUSE session at the end of the arm
+/// that created it, and nothing ever unmounted NFS, so the daemon exited
+/// leaving the kernel holding a mount whose server was gone.
+#[cfg(feature = "mount")]
+pub enum Mounted {
+    Nfs(NfsMount),
+    Fuse(leyline_fs::fuse::FuseSession),
+}
+
+/// An NFS mount this process made; dropping it unmounts.
+#[cfg(feature = "mount")]
+pub struct NfsMount {
+    path: PathBuf,
+}
+
+#[cfg(feature = "mount")]
+impl Drop for NfsMount {
+    fn drop(&mut self) {
+        if let Err(e) = unmount_nfs(&self.path) {
+            eprintln!("warn: {e:#}");
+        }
+    }
+}
+
+/// Unmount an NFS mount: `umount`, then `umount -f` if the first refuses.
+#[cfg(feature = "mount")]
+pub fn unmount_nfs(path: &Path) -> Result<()> {
+    for args in [&[][..], &["-f"][..]] {
+        let status = std::process::Command::new("umount")
+            .args(args)
+            .arg(path)
+            .status()
+            .context("spawn umount")?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("could not unmount {}", path.display())
+}
+
+/// Mount `graph` at `mount` on `backend` ("nfs" or "fuse") and return the
+/// guard that unmounts it.
+#[cfg(feature = "mount")]
+pub async fn mount_backend(
+    graph: Arc<dyn leyline_fs::graph::Graph>,
+    mount: &Path,
+    backend: &str,
+    nfs_port: u16,
+) -> Result<Mounted> {
     std::fs::create_dir_all(mount)
         .with_context(|| format!("create mountpoint {}", mount.display()))?;
-
     match backend {
         "nfs" => {
             let listen_addr = nfs_listen_addr(nfs_port);
-            let (port, _handle) = leyline_fs::nfs::serve_nfs(graph, &listen_addr).await?;
+            let (port, _server) = leyline_fs::nfs::serve_nfs(graph, &listen_addr).await?;
             eprintln!("NFS server listening on port {port}");
-
-            mount_nfs_cmd(port, mount)?;
+            let mounted = mount_nfs_cmd(port, mount)?;
             eprintln!("mounted at {}", mount.display());
-
-            wait_for_shutdown(timeout).await?;
+            Ok(Mounted::Nfs(mounted))
         }
         "fuse" => {
-            let _session = leyline_fs::fuse::mount_fuse(graph, mount)?;
+            let session = leyline_fs::fuse::mount_fuse(graph, mount)?;
             eprintln!("FUSE mounted at {}", mount.display());
-
-            wait_for_shutdown(timeout).await?;
+            Ok(Mounted::Fuse(session))
         }
         other => anyhow::bail!("unknown backend: {other} (expected 'nfs' or 'fuse')"),
     }
-
-    Ok(())
 }
 
 /// What ended a [`ShutdownSignals::wait`].
@@ -301,6 +353,19 @@ mod tests {
         assert!(
             mount.is_dir(),
             "the mountpoint is created before the backend is chosen"
+        );
+    }
+
+    /// Unmounting a directory nothing is mounted on fails, naming it, after
+    /// both `umount` and `umount -f` refuse — it does not report success.
+    #[cfg(feature = "mount")]
+    #[test]
+    fn unmounting_what_is_not_mounted_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = unmount_nfs(dir.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains(&dir.path().display().to_string()),
+            "{err:#}"
         );
     }
 

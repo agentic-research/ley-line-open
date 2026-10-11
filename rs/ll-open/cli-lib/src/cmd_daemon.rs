@@ -656,8 +656,10 @@ pub async fn run_daemon_with_options(
     };
 
     // 7. Mount (optional — omit --mount for headless mode).
+    // The guard lives until shutdown, which drops it — unmounting — before
+    // the final snapshot.
     #[cfg(feature = "mount")]
-    if let Some(mount_path) = mount {
+    let mounted = if let Some(mount_path) = mount {
         // ADR-0040 D4 (bead `ley-line-open-f2ee9f`): the in-process mount
         // reads `live.db` through the daemon's reader pool and writes through
         // its single writer. It is not a private copy of the arena, so a
@@ -680,26 +682,11 @@ pub async fn run_daemon_with_options(
         }
         let graph: Arc<dyn leyline_fs::graph::Graph> = Arc::new(graph);
 
-        std::fs::create_dir_all(mount_path)
-            .with_context(|| format!("create mountpoint {}", mount_path.display()))?;
-
-        match backend {
-            "nfs" => {
-                let listen_addr = cmd_serve::nfs_listen_addr(nfs_port);
-                let (port, _handle) = leyline_fs::nfs::serve_nfs(graph, &listen_addr).await?;
-                eprintln!("NFS server listening on port {port}");
-                cmd_serve::mount_nfs_cmd(port, mount_path)?;
-                eprintln!("mounted at {}", mount_path.display());
-            }
-            "fuse" => {
-                let _session = leyline_fs::fuse::mount_fuse(graph, mount_path)?;
-                eprintln!("FUSE mounted at {}", mount_path.display());
-            }
-            other => anyhow::bail!("unknown backend: {other} (expected 'nfs' or 'fuse')"),
-        }
+        Some(cmd_serve::mount_backend(graph, mount_path, backend, nfs_port).await?)
     } else {
         eprintln!("headless mode (no mount)");
-    }
+        None
+    };
     #[cfg(not(feature = "mount"))]
     {
         let _ = (mount, backend, nfs_port);
@@ -789,7 +776,9 @@ pub async fn run_daemon_with_options(
     // 11. Wait for shutdown.
     cmd_serve::wait_for_shutdown(timeout).await?;
 
-    // 12. Graceful shutdown: final snapshot + cleanup.
+    // 12. Graceful shutdown: unmount, final snapshot, cleanup.
+    #[cfg(feature = "mount")]
+    drop(mounted);
     {
         let guard = ctx.live_db.writer.lock();
         if let Err(e) = snapshot_to_arena(&guard, &ctrl_path) {

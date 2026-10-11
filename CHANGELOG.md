@@ -91,6 +91,50 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **An NFS write is committed once, whole, not once per chunk** (bead
+  `ley-line-open-b6d217`). NFSv3 has no close, and nfsserve hands the server
+  neither COMMIT nor a last-chunk mark, so `LeylineNfs::write` spliced every
+  WRITE RPC as it arrived: a client writing a file as SETATTR(size), WRITE,
+  WRITE published each torn intermediate state (`<p>wor</p>` on the way to
+  `<p>world</p>`), re-projected the file once per chunk, and refused chunks
+  whose partial bytes did not parse. A WRITE now stages its bytes in the
+  node's record (reads of the node see them at once) and the staged nodes
+  are committed through the one write path when writes have been quiet for
+  200 ms (hf-mount's debounced flush), before any create, remove, rename or
+  mkdir, and when the server is dropped. SETATTR to a nonzero size now
+  truncates (or zero-extends) to that size; it was ignored and reported as
+  done. Covered by in-process tests that replay a client's RPC sequence
+  against the real SQLite graph (`nfs::tests::write_sequences`, run by
+  `fs:test:cdc`, which now enables `nfs`).
+
+- **A write to a token of a parsed file is no longer validated as a whole
+  file** (bead `ley-line-open-b6d217`). With a default language set (the
+  daemon's `--language`), a mount write to an AST leaf — which has no file
+  extension — was parsed alone as a file of that language and refused:
+  `util`, a Go package name, is not a Go file. A node inside a parsed file
+  is a fragment, and the write path already validates the whole spliced
+  file when it lands (ADR-0040 D3); standalone records keep their
+  validation.
+
+- **The macOS mount tests no longer fail in streaks** (bead
+  `ley-line-open-e5c8be`). fuse-t serves each mount through a `go-nfsv4`
+  server that listens on 127.0.0.1:52100 (52101 if taken), does not exit
+  when its mount is unmounted, and lives until its mounting process exits —
+  then takes seconds more to go. So each run's servers were still exiting
+  when the next run mounted, and fuse-t's log showed the failing mount every
+  time was the one reusing 52100 the second the previous 52100 server died:
+  reads failed with EIO and the FUSE channel closed under the session
+  ("Short read of FUSE request header (0 < 40)"). A failed run's server,
+  killed at the deadline, failed the next, hence streaks. fuse-t 1.2.1 cannot
+  be moved off the port (`listen_addr` moves the server but not the port it
+  mounts). `mount_round_trip` now waits for attachment through the mount
+  table instead of spinning reads under the mount, stops each mount's
+  server once its session has unmounted, clears stale servers a crashed run
+  left (orphaned, serving a test temp dir — nothing else's), surfaces a
+  failed call as itself rather than as a wedge, and prints the mount's own
+  warnings and errors. Unchanged integration on a clean host: 5 passes then
+  5 failures in a row; with these changes 10 of 10.
+
 - **BREAKING: one write path; a written file is stored and projected exactly
   as a cold parse of its bytes** (ADR-0040 D3, beads `ley-line-open-f2ffbd`,
   `0d3b72`, `143f17`). Three writers changed a file's bytes in an arena and

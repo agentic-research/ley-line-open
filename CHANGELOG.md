@@ -121,6 +121,12 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **SECURITY: rustls 0.23.40 → 0.23.45** (bead `ley-line-open-4108fe`,
+  GHSA-2mjx-qc3c-rqvc, Dependabot alert #3). Versions from 0.23.13 up to
+  0.23.45 accept TLS 1.3 handshake messages across encryption-level
+  boundaries. rustls is a transitive dependency; `rs/Cargo.lock` now pins the
+  patched release (and rustls-webpki 0.103.13 → 0.103.15 with it).
+
 - **An NFS write is committed once, whole, not once per chunk** (bead
   `ley-line-open-b6d217`). NFSv3 has no close, and nfsserve hands the server
   neither COMMIT nor a last-chunk mark, so `LeylineNfs::write` spliced every

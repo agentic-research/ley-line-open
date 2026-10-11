@@ -184,6 +184,19 @@ only; `file_id` is applied at projection time; F3 and F5 compare row images modu
 (equivalently, with nids rewritten to `(relative path, ordinal)`). `file_id` is not derived from a
 path hash: with 39 usable bits, birthday collisions are expected around a million files.
 
+As implemented (`f31efd`, `cli-lib/src/cmd_rebuild.rs`): `derived_from` is one `_meta` value,
+`<treeRoot hex> <parserId hex> <projection_schema_version>`, stamped by every parse including a
+scoped pass and a D3 write. `leyline rebuild <from> <into> [--path P]...` refuses an arena with no
+stamp, a `_source` set that no longer folds to the stamped `treeRoot`, and a stamped `parserId`
+other than this binary's: rebuilding under another parser is a re-derivation, not a
+reproduction, and is left to `leyline parse`. The gate also renders the other interned ids
+(`name_id`, `kind_id`, dir nids) as what they name, and restricts the content-addressed stores
+(`source_blobs`, `capnp_blobs`, `node_content`, `node_child`) to what the projection reaches,
+since a write leaves the replaced bytes and subtrees behind. It found two more non-functions:
+`node_content.lang` and `node_content.raw_kind` are outside the `node_hash` preimage, so
+`INSERT OR IGNORE` keeps the first file's value and a write leaves a stale one. They are excluded by
+name and fixed in projection-v7 (`b5d354`).
+
 ### D7 — Publication stays as it is until the write boundary exists
 
 Replacing image publication with in-place WAL updates and reader reopen changes the authority-
@@ -218,9 +231,9 @@ Each is a test that fails on `main` today or would fail if the decision were wro
 |---|---|---|
 | F1 | `treeRoot` is a tree identity | four parses of the same bytes — a second directory, touched mtimes, shuffled discovery order (f4c), one no-op scoped reparse — yield one `treeRoot`; `rootHash` differs across them today (`0c80c7`, `143002`) |
 | F2 | a write is durable at the boundary | daemon with mount: write through the mount, fsync, reparse another file, read back through the mount and the socket, restart, read again; all return the written bytes (`192018`) |
-| F3 | the projection is rebuildable after writes | cold parse, N writes through D3, `leyline rebuild` into a fresh arena; the logical row sets agree and so do `treeRoot` and `derived_from` (`143f17`, `0d3b72`) |
+| F3 | the projection is rebuildable after writes | cold parse, N writes through D3, `leyline rebuild` into a fresh arena; the logical row sets agree and so do `treeRoot` and `derived_from` (`143f17`, `0d3b72`). Closed by `cmd_rebuild::tests::a_rebuild_after_writes_reproduces_the_written_arena` (`f31efd`) |
 | F4 | content keys are location-free | two arenas containing a byte-identical file share that file's `(sourceHash, parserId)` derivation and its `node_hash` set; today `capnp_blobs` holds two blobs (F4 of the identity review) |
-| F5 | a sub-manifest transports | a sub-manifest of N paths plus their blobs, parsed on a clean machine, produces the same N file-local row images the full arena holds for those files, compared modulo `file_id` (D6) |
+| F5 | a sub-manifest transports | a sub-manifest of N paths plus their blobs, parsed on a clean machine, produces the same N file-local row images the full arena holds for those files, compared modulo `file_id` (D6). Closed by `cmd_rebuild::tests::a_sub_manifest_rebuild_matches_the_full_arenas_files`, with the source tree deleted in `a_rebuild_needs_no_source_tree` (`f31efd`) |
 | F6 | the grant is enforced | a write to a path outside the grant is refused with no side effect on ring 0 or ring 1 |
 | F7 | the head chain fails closed | with signatures required, a truncated `head.capnp` makes the parse error and write nothing (`0c8ee7`) |
 

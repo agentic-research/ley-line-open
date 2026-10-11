@@ -685,7 +685,7 @@ pub async fn run_daemon_with_options(
 
         match backend {
             "nfs" => {
-                let listen_addr = format!("0.0.0.0:{nfs_port}");
+                let listen_addr = cmd_serve::nfs_listen_addr(nfs_port);
                 let (port, _handle) = leyline_fs::nfs::serve_nfs(graph, &listen_addr).await?;
                 eprintln!("NFS server listening on port {port}");
                 cmd_serve::mount_nfs_cmd(port, mount_path)?;

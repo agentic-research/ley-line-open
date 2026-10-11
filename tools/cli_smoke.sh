@@ -204,9 +204,10 @@ step "daemon: an over-long socket path is refused with the limit named"
 
 # --- daemon: headless --------------------------------------------------------
 # PATH holds only the system dirs so the daemon does not find and spawn a
-# developer's mache.
+# developer's mache; sbin stays on it for mount_nfs (the macOS default
+# backend) and fusermount.
 start_daemon() {
-    env PATH=/usr/bin:/bin "$BIN" daemon --arena "$W/d/a.arena" --control "$W/d/a.ctrl" \
+    env PATH=/usr/bin:/bin:/usr/sbin:/sbin "$BIN" daemon --arena "$W/d/a.arena" --control "$W/d/a.ctrl" \
         --source "$W/src" --timeout 300s "$@" >"$W/d/log" 2>&1 &
     DPID=$!
     wait_for "the daemon socket" test -S "$W/d/a.sock"

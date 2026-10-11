@@ -85,6 +85,13 @@ pub fn setup_arena(arena: &Path, arena_size: u64, control: Option<&Path>) -> Res
     Ok(ctrl_path)
 }
 
+/// Where the NFS export listens: loopback, on `port` (0 picks one). The export
+/// is unauthenticated and writable, and [`mount_nfs_cmd`] reaches it at
+/// 127.0.0.1, so nothing off this host has a reason to reach it.
+pub fn nfs_listen_addr(port: u16) -> String {
+    format!("127.0.0.1:{port}")
+}
+
 /// Shell out to mount_nfs (macOS) or mount.nfs (Linux) to mount the NFS export.
 #[cfg(feature = "mount")]
 pub fn mount_nfs_cmd(port: u16, mountpoint: &Path) -> Result<()> {
@@ -161,7 +168,7 @@ pub async fn cmd_serve(
 
     match backend {
         "nfs" => {
-            let listen_addr = format!("0.0.0.0:{nfs_port}");
+            let listen_addr = nfs_listen_addr(nfs_port);
             let (port, _handle) = leyline_fs::nfs::serve_nfs(graph, &listen_addr).await?;
             eprintln!("NFS server listening on port {port}");
 
@@ -294,6 +301,17 @@ mod tests {
             mount.is_dir(),
             "the mountpoint is created before the backend is chosen"
         );
+    }
+
+    /// The NFS export is unauthenticated and writable, and the mount reaches
+    /// it at 127.0.0.1, so it listens on loopback only. It listened on
+    /// 0.0.0.0, serving the arena — and since ADR-0040 D3 writes into it —
+    /// to every host that could reach the port.
+    #[test]
+    fn the_nfs_export_listens_on_loopback_only() {
+        let addr: std::net::SocketAddr = nfs_listen_addr(2049).parse().unwrap();
+        assert!(addr.ip().is_loopback(), "{addr}");
+        assert_eq!(addr.port(), 2049);
     }
 
     /// The timeout ends the wait, and SIGTERM — what `docker stop`, launchd

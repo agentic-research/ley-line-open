@@ -432,6 +432,16 @@ tasks:
     cmds:
       - sh tools/test_mutants_diff.sh
 
+  index:clones:
+    desc: Report exact structural clones (functions sharing an _ast.node_hash) in rs/, ranked by lines x copies. OUT=<file> writes the report to a file (6e9f79)
+    cmds:
+      - sh tools/clone_index.sh {{if .OUT}}--out "{{.OUT}}"{{end}} rs
+
+  index:clones:fixture-test:
+    desc: Prove the clone index groups exact copies and leaves renamed and nested copies out (6e9f79)
+    cmds:
+      - sh tools/test_clone_index.sh
+
   schema:consumer-fixture-test:
     desc: Compile the Apache daemon/wire API from an external Go module
     cmds:
@@ -1581,6 +1591,9 @@ tasks:
       - task: tier:isolation
       - task: check:all-features
       - task: test
+      # After `test`: the fixture parses with the debug leyline binary that
+      # `test` has already built.
+      - task: index:clones:fixture-test
       - task: cli-lib:test:hostile-hooks
       - task: sign:host:build
       - task: sign:host:test

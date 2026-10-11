@@ -12,6 +12,17 @@ context, scoping notes, and review history are recoverable.
 
 ### Added
 
+- **`task index:clones` reports exact structural clones** (`tools/clone_index.sh`,
+  bead `ley-line-open-6e9f79`, tier 1). It parses `rs/` into a scratch arena
+  and groups every `function_item` by `_ast.node_hash`, so a group is a set of
+  functions that are the same tree token for token. A copy nested inside
+  another reported copy is not counted twice. Groups are ranked by lines x
+  copies; `OUT=<file>` writes the markdown report to a file. On this tree it
+  finds 44 groups of 6+ lines and 781 duplicated lines. Renamed copies
+  (tier 2) and the concept-to-sites map (tier 3) are not part of it.
+  `task index:clones:fixture-test` runs in `task ci` and proves an exact pair
+  groups while a renamed copy and a nested copy do not.
+
 - **ADR-0040 — The write boundary: source and manifest are the data, the
   arena is a cache** (`docs/adr/0040-the-write-boundary.md`, review bead
   `ley-line-open-e79c0f`). One SQLite arena was serving two products, a
@@ -64,10 +75,19 @@ context, scoping notes, and review history are recoverable.
   mount detaching on SIGTERM. Tasks `cli-lib:smoke`, `cli-lib:smoke:mount`
   and `cli-lib:smoke:bin`; root `release:smoke` runs both builds, and
   `release:publish` runs it before tagging. `release.yml` smokes each
-  natively built target and the release dry-run smokes its build. Its first
-  run found the three defects below.
+  natively built target and the release dry-run smokes its build, and
+  `cli-lib:smoke:dev` (debug builds, both modes) runs in `task ci` on every
+  PR. Its first run found the four defects below.
 
 ### Fixed
+
+- **SECURITY: the NFS export listens on loopback only** (bead
+  `ley-line-open-95d08b`). `daemon --mount` and `serve` with the NFS backend
+  (the macOS default) listened on `0.0.0.0`, though the mount itself
+  connects to `127.0.0.1`. The export has no authentication, and since
+  ADR-0040 D3 a write through it reaches the arena, so any host that could
+  reach the port could read the projected tree and write to it. Both now
+  listen on `127.0.0.1` through one `cmd_serve::nfs_listen_addr`.
 
 - **The daemon's `query` op answered every non-text value with `""`** (bead
   `ley-line-open-7854b8`). Each column was read as a Rust `String` with the

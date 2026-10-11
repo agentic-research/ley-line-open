@@ -64,6 +64,23 @@ context, scoping notes, and review history are recoverable.
   state). Consumers pinned to `v0.18.1` keep working: the fields are
   additive and a `Head` without them reads as before.
 
+- **Release smoke: the built binary runs end to end before a tag** (bead
+  `ley-line-open-7c6b7e`). `tools/cli_smoke.sh` drives one `leyline` binary on
+  a two-language fixture: `--version`, `parse` (every source in
+  `source_blobs`, every `_ast` row hashed), `verify-head`, a `splice` that is
+  stored and restamps the head, a syntax-breaking `splice` that leaves the
+  database byte-identical, the over-long socket path error, the daemon's
+  `status`, `leyline_version` and `query` ops, and SIGTERM shutdown; with
+  `--mount`, a write through the mount that is stored, read back, and the
+  mount detaching on SIGTERM. Tasks `cli-lib:smoke`, `cli-lib:smoke:mount`
+  and `cli-lib:smoke:bin`. `cli-lib:smoke:dev` runs in `task ci` on every
+  PR: one debug build with `mount`, smoked headless and mounted (the smoke
+  takes about a second; the build is the cost). Root `release:smoke` smokes
+  the shipped release build and `release:publish` runs it before tagging;
+  `release.yml` smokes each natively built target and the release dry-run
+  smokes its build. Its first runs found the five defects below.
+
+||||||| 4ae0f3a
 - **`_meta.derived_from` and `leyline rebuild`: the arena says what it was
   derived from, and is rebuilt from it** (ADR-0040 D6, bead
   `ley-line-open-f31efd`). Every parse, including a scoped pass and a write
@@ -121,6 +138,52 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **SECURITY: the NFS export listens on loopback only** (bead
+  `ley-line-open-95d08b`). `daemon --mount` and `serve` with the NFS backend
+  (the macOS default) listened on `0.0.0.0`, though the mount itself
+  connects to `127.0.0.1`. The export has no authentication, and since
+  ADR-0040 D3 a write through it reaches the arena, so any host that could
+  reach the port could read the projected tree and write to it. Both now
+  listen on `127.0.0.1` through one `cmd_serve::nfs_listen_addr`.
+
+- **`daemon --mount` keeps its mount while it serves and releases it on
+  exit** (bead `ley-line-open-8fbf58`). The daemon bound its FUSE session
+  inside the match arm that created it, so the session dropped — and
+  unmounted — as soon as the arm ended: on Linux, where FUSE is the default,
+  the mount served nothing past startup. On NFS nothing ever ran `umount`,
+  so the daemon and `serve` exited leaving the kernel holding a mount whose
+  server was gone, and any access to it hung. One `cmd_serve::mount_backend`
+  now mounts for both commands and returns a guard (the FUSE session, or an
+  NFS mount whose drop runs `umount`, then `umount -f`); the daemon holds it
+  until shutdown and drops it before the final snapshot.
+
+- **The daemon's `query` op answered every non-text value with `""`** (bead
+  `ley-line-open-7854b8`). Each column was read as a Rust `String` with the
+  error defaulted away, and only SQLite TEXT converts, so `SELECT count(*)`
+  returned `""`, and so did every integer, real, NULL and blob. Values are
+  now rendered by storage class as the wire text the schema (`values:
+  List(Text)`) and the protocol fixture (`SELECT 1` → `"1"`) declare:
+  integers and reals in decimal, text as itself, blobs as lowercase hex, and
+  NULL as JSON `null`, distinct from the empty string.
+
+- **SIGTERM now shuts the daemon and `serve` down gracefully** (bead
+  `ley-line-open-7a9498`). Only Ctrl+C was handled; SIGTERM — what `docker
+  stop`, launchd and systemd send, and the OCI image runs the daemon — killed
+  the process with status 143, skipping the final snapshot and leaving the
+  socket, the arena lock and owner files, and any mount behind.
+  `ShutdownSignals` installs SIGINT and SIGTERM handlers up front, failing if
+  either cannot be registered, and both end the wait.
+
+- **macOS mount builds launch** (bead `ley-line-open-b7ab7f`). A binary built
+  with `mount` (`task install:full+mount`, `release:mount`) linked
+  `@rpath/libfuse-t.dylib` with no rpath, so dyld refused to start it for any
+  command. fuser links fuse-t through the `pkg-config` crate, which drops the
+  `-Wl,-rpath` that `rs/pkgconfig/fuse.pc` declares; `cargo test` hid it by
+  exporting the link search path to dyld. `leyline-cli`'s build script now
+  adds fuse-t's library directory to the binary's rpath on macOS mount
+  builds.
+
+||||||| 4ae0f3a
 - **An NFS write is committed once, whole, not once per chunk** (bead
   `ley-line-open-b6d217`). NFSv3 has no close, and nfsserve hands the server
   neither COMMIT nor a last-chunk mark, so `LeylineNfs::write` spliced every

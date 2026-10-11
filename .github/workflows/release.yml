@@ -159,6 +159,15 @@ jobs:
           BUILD_TARGET: ${{ matrix.target }}
         run: task release:target
 
+      # Run the binary just built end to end (tools/cli_smoke.sh). Skipped
+      # only for the darwin-amd64 cross-compile, which this arm64 runner does
+      # not execute natively.
+      - name: Smoke the built binary
+        if: matrix.target != 'x86_64-apple-darwin'
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: task cli-lib:smoke:bin BIN="rs/target/$BUILD_TARGET/release/leyline"
+
       # ---- FFI staticlib (consumed by mache's release build) ----
       # mache links `libleyline_fs-<os>-<arch>.a` + `leyline_fs.h` to build
       # its NFS-backed binaries (mache-55d3e1 / ley-line-open-c33b9a). Built

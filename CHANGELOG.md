@@ -138,6 +138,13 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **SECURITY: rustls 0.23.40 → 0.23.45** (bead `ley-line-open-4108fe`,
+  GHSA-2mjx-qc3c-rqvc, Dependabot alert #3). Versions from 0.23.13 up to
+  0.23.45 accept TLS 1.3 handshake messages across encryption-level
+  boundaries. rustls is a transitive dependency; `rs/Cargo.lock` now pins the
+  patched release (and rustls-webpki 0.103.13 → 0.103.15 with it).
+
+||||||| 5f45ea3
 - **SECURITY: the NFS export listens on loopback only** (bead
   `ley-line-open-95d08b`). `daemon --mount` and `serve` with the NFS backend
   (the macOS default) listened on `0.0.0.0`, though the mount itself

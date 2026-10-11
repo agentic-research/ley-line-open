@@ -79,7 +79,17 @@ fn projection_graph(src: &Path) -> Arc<dyn Graph> {
     leyline_cli_lib::cmd_parse::parse_into_conn(&conn, src, Some("go"), None)
         .expect("cold parse fixture");
     let image = conn.serialize("main").expect("serialize projection");
-    Arc::new(SqliteGraphAdapter::new_writable(image.as_ref()).expect("graph from projection image"))
+    let mut adapter =
+        SqliteGraphAdapter::new_writable(image.as_ref()).expect("graph from projection image");
+    adapter.set_source_writer(mount_writer());
+    Arc::new(adapter)
+}
+
+/// The one write path (ADR-0040 D3), as the daemon and `serve` install it.
+fn mount_writer() -> Arc<dyn leyline_fs::graph::SourceWriter> {
+    Arc::new(leyline_cli_lib::source_write::MountWriter {
+        grant: leyline_cli_lib::source_write::Grant::Whole,
+    })
 }
 
 /// How long the mount may take to start serving once `mount_fuse` returns
@@ -344,8 +354,9 @@ async fn a_mount_write_survives_a_reparse_of_another_file_and_a_restart() {
     let source = Arc::new(leyline_cli_lib::daemon::live_graph::LiveDbSource::new(
         ctx.clone(),
     ));
-    let graph: Arc<dyn Graph> =
-        Arc::new(SqliteGraphAdapter::live(source).expect("live-backed adapter"));
+    let mut adapter = SqliteGraphAdapter::live(source).expect("live-backed adapter");
+    adapter.set_source_writer(mount_writer());
+    let graph: Arc<dyn Graph> = Arc::new(adapter);
     let mount_dir = TempDir::new().expect("create mountpoint");
     let session =
         leyline_fs::fuse::mount_fuse(graph, mount_dir.path()).expect("mount the live db over FUSE");

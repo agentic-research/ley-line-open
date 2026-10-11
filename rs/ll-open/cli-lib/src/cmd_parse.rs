@@ -772,6 +772,17 @@ pub struct ParseResult {
     pub errors: u64,
     /// Relative paths of files that were actually parsed (not skipped).
     pub changed_files: Vec<String>,
+    /// ADR-0040 D1: the arena's `treeRoot` after this pass, folded from the
+    /// committed `_source` set.
+    pub tree_root: leyline_core::Hash,
+}
+
+/// ADR-0040 D3: one file's new bytes, handed to the parse in place of the
+/// file on disk. Built only by [`crate::source_write::write`].
+pub(crate) struct WrittenFile {
+    /// The file's `_source.id`: its path relative to the tree root.
+    pub rel: String,
+    pub bytes: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -937,6 +948,31 @@ pub fn parse_into_conn(
     lang_filter: Option<&str>,
     scope: Option<&[String]>,
 ) -> Result<ParseResult> {
+    parse_into_conn_with(conn, source, lang_filter, scope, None)
+}
+
+/// Project one written file through the cold parse (ADR-0040 D3). The pass is
+/// scoped to that file and reads its bytes from `written`, never from disk;
+/// a written file that fails to parse rolls the whole pass back.
+pub(crate) fn parse_written_file(
+    conn: &Connection,
+    source: &Path,
+    written: WrittenFile,
+) -> Result<ParseResult> {
+    let scope = [written.rel.clone()];
+    parse_into_conn_with(conn, source, None, Some(&scope), Some(&written))
+}
+
+fn parse_into_conn_with(
+    conn: &Connection,
+    source: &Path,
+    lang_filter: Option<&str>,
+    scope: Option<&[String]>,
+    written: Option<&WrittenFile>,
+) -> Result<ParseResult> {
+    // The written file's bytes, if `rel` is the written file.
+    let written_bytes =
+        |rel: &str| -> Option<&Vec<u8>> { written.filter(|w| w.rel == rel).map(|w| &w.bytes) };
     if !source.is_dir() {
         bail!("{} is not a directory", source.display());
     }
@@ -953,7 +989,7 @@ pub fn parse_into_conn(
         let mut v: Vec<PathBuf> = Vec::with_capacity(scope.len());
         for rel in scope {
             let abs = source.join(rel);
-            if abs.exists() {
+            if abs.exists() || written_bytes(rel).is_some() {
                 v.push(abs);
             }
         }
@@ -1134,14 +1170,23 @@ pub fn parse_into_conn(
         let rel = path.strip_prefix(source).unwrap_or(path);
         let rel_str = rel.to_string_lossy().to_string();
 
-        let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
-        let file_mtime = meta
-            .modified()
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as i64;
-        let file_size = meta.len() as i64;
+        // A written file has no stat pair: its mtime is the write's, its size
+        // the written bytes'.
+        let written_here = written_bytes(&rel_str);
+        let (file_mtime, file_size) = match written_here {
+            Some(bytes) => (mtime, bytes.len() as i64),
+            None => {
+                let meta =
+                    std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+                let file_mtime = meta
+                    .modified()
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as i64;
+                (file_mtime, meta.len() as i64)
+            }
+        };
 
         // Fast path: the stat pair agrees, so the bytes are almost certainly
         // unchanged and we skip without reading. `mtime` here is NANOSECOND
@@ -1178,7 +1223,10 @@ pub fn parse_into_conn(
         // computed any other way would be a silent mismatch.
         if epoch_current
             && let Some(stored_hash) = old_hashes.get(&rel_str)
-            && let Ok(bytes) = std::fs::read(path)
+            && let Some(bytes) = match written_here {
+                Some(b) => Some(b.clone()),
+                None => std::fs::read(path).ok(),
+            }
             && bytes.hash().as_bytes()[..] == stored_hash[..]
         {
             unchanged += 1;
@@ -1191,6 +1239,12 @@ pub fn parse_into_conn(
         // the worker or take many minutes producing nodes that have no
         // semantic value anyway.
         if file_size > MAX_PARSE_FILE_SIZE {
+            if written_here.is_some() {
+                bail!(
+                    "written file {rel_str}: size {file_size} bytes exceeds \
+                     MAX_PARSE_FILE_SIZE ({MAX_PARSE_FILE_SIZE} bytes)"
+                );
+            }
             log::warn!(
                 "skip {rel_str}: size {file_size} bytes exceeds MAX_PARSE_FILE_SIZE \
                  ({MAX_PARSE_FILE_SIZE} bytes)",
@@ -1201,6 +1255,45 @@ pub fn parse_into_conn(
 
         to_parse.push((rel_str, path.clone(), lang, file_mtime, file_size));
     }
+
+    // Unified code-fact IR (ADR-0027): enforce `fact_edges` FK endpoints at
+    // write time so a dangling edge is a loud insert error, not a silently-
+    // zeroed downstream JOIN (the be6136 lesson). `foreign_keys` is a
+    // per-connection, no-op-inside-a-transaction pragma, so it must be set
+    // before BEGIN. Set here in `parse_into_conn` (not `cmd_parse`) so the
+    // in-memory test path gets it too. Only `fact_edges` has FKs; the other
+    // tables predate this and are unaffected, including the delete_file_rows
+    // sweep below (it touches no FK relationship).
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+
+    // The transaction opens BEFORE the stale-row sweep, so a pass that fails
+    // after deleting a file's rows restores them instead of committing the
+    // deletion alone. A written file (ADR-0040 D3) depends on this: a write
+    // that does not project leaves the arena as it was.
+    conn.execute_batch("BEGIN")?;
+
+    // Roll back on any bail between here and COMMIT. parse_into_conn runs
+    // on the daemon's long-lived writer connection and the watcher survives
+    // a failed parse; without this, an in-transaction error (ordinal-space
+    // overflow, parent-unmapped bail, constraint violation) leaves that
+    // connection inside the open transaction — every later reparse then
+    // fails at BEGIN until restart, and interim writer-connection writes
+    // silently join the zombie transaction (publication-audit F2, bead
+    // `ley-line-open-17c271`).
+    struct TxRollbackGuard<'c> {
+        conn: &'c Connection,
+        armed: bool,
+    }
+    impl Drop for TxRollbackGuard<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                // Best-effort: the original error is already propagating; a
+                // ROLLBACK failure here must not mask it.
+                let _ = self.conn.execute_batch("ROLLBACK");
+            }
+        }
+    }
+    let mut tx_guard = TxRollbackGuard { conn, armed: true };
 
     // ---- Delete stale rows ----
 
@@ -1297,8 +1390,11 @@ pub fn parse_into_conn(
         chunk
             .par_iter()
             .map(|(rel, abs_path, lang, file_mtime, file_size)| {
-                let content = std::fs::read(abs_path)
-                    .with_context(|| format!("read {}", abs_path.display()))?;
+                let content = match written_bytes(rel) {
+                    Some(bytes) => bytes.clone(),
+                    None => std::fs::read(abs_path)
+                        .with_context(|| format!("read {}", abs_path.display()))?,
+                };
 
                 // Skip binary files (null byte in first 8KB — same heuristic as git).
                 let check_len = content.len().min(8192);
@@ -1358,41 +1454,6 @@ pub fn parse_into_conn(
     let insert_start = std::time::Instant::now();
     let mut parsed = 0u64;
     let mut errors = 0u64;
-
-    // Unified code-fact IR (ADR-0027): enforce `fact_edges` FK endpoints at
-    // write time so a dangling edge is a loud insert error, not a silently-
-    // zeroed downstream JOIN (the be6136 lesson). `foreign_keys` is a
-    // per-connection, no-op-inside-a-transaction pragma, so it must be set
-    // before BEGIN. Set here in `parse_into_conn` (not `cmd_parse`) so the
-    // in-memory test path gets it too. Only `fact_edges` has FKs; the other
-    // tables predate this and are unaffected, including the delete_file_rows
-    // sweep above (it touches no FK relationship).
-    conn.pragma_update(None, "foreign_keys", "ON")?;
-
-    conn.execute_batch("BEGIN")?;
-
-    // Roll back on any bail between here and COMMIT. parse_into_conn runs
-    // on the daemon's long-lived writer connection and the watcher survives
-    // a failed parse; without this, an in-transaction error (ordinal-space
-    // overflow, parent-unmapped bail, constraint violation) leaves that
-    // connection inside the open transaction — every later reparse then
-    // fails at BEGIN until restart, and interim writer-connection writes
-    // silently join the zombie transaction (publication-audit F2, bead
-    // `ley-line-open-17c271`).
-    struct TxRollbackGuard<'c> {
-        conn: &'c Connection,
-        armed: bool,
-    }
-    impl Drop for TxRollbackGuard<'_> {
-        fn drop(&mut self) {
-            if self.armed {
-                // Best-effort: the original error is already propagating; a
-                // ROLLBACK failure here must not mask it.
-                let _ = self.conn.execute_batch("ROLLBACK");
-            }
-        }
-    }
-    let mut tx_guard = TxRollbackGuard { conn, armed: true };
 
     // Defer FK enforcement to COMMIT: with immediate FKs, every node_child /
     // _ast.node_hash insert probes node_content's BLOB PK synchronously (~880k
@@ -1843,6 +1904,10 @@ pub fn parse_into_conn(
                     changed_files.push(pf.rel);
                     parsed += 1;
                 }
+                // A written file that does not parse is the write failing,
+                // not a file left out of the tree: the rollback guard
+                // restores its rows.
+                Err(e) if written.is_some() => return Err(e),
                 Err(e) => {
                     eprintln!("warn: {e:#}");
                     errors += 1;
@@ -2177,6 +2242,7 @@ pub fn parse_into_conn(
         deleted,
         errors: errors + oversized,
         changed_files,
+        tree_root,
     })
 }
 

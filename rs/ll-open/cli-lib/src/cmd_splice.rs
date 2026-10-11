@@ -10,9 +10,21 @@ pub fn cmd_splice(db: &Path, node: &str, text: &str) -> Result<()> {
     // integer nids (projection-v5) — resolve at this boundary.
     let nid = leyline_ts::schema::resolve_path(&conn, node)?
         .with_context(|| format!("node path {node:?} does not resolve in this projection"))?;
-    let new_source = leyline_ts::splice::splice_and_reproject(&conn, nid, text)?;
+    let new_source = leyline_ts::splice::splice(&conn, nid, text)?;
+    let file_id = leyline_schema::nid_file_id(nid)
+        .with_context(|| format!("node path {node:?} names a directory"))?;
+    let rel: String = conn
+        .query_row(
+            "SELECT id FROM _source WHERE file_id = ?1",
+            [file_id],
+            |r| r.get(0),
+        )
+        .with_context(|| format!("node path {node:?} has no source file"))?;
+    let len = new_source.len();
+    // ADR-0040 D3: the caller names the database, so it holds the whole grant.
+    crate::source_write::write(&conn, &crate::source_write::Grant::Whole, &rel, new_source)?;
     drop(conn);
-    log::info!("Spliced '{}': source {} bytes", node, new_source.len());
+    log::info!("Spliced '{node}': source {len} bytes");
     Ok(())
 }
 
@@ -21,25 +33,27 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
 
-    /// Project `<p>Hello</p>` into a fresh on-disk projection at `db`.
-    fn project_html(db: &Path, src: &[u8]) -> Result<()> {
+    /// Cold-parse a tree holding `test.html` = `src` into a fresh on-disk
+    /// projection at `db`. The returned directory is the tree root the
+    /// arena records, so it must outlive the test.
+    fn project_html(db: &Path, src: &[u8]) -> Result<tempfile::TempDir> {
+        let tree = tempfile::tempdir()?;
+        std::fs::write(tree.path().join("test.html"), src)?;
         let conn = Connection::open(db)?;
-        let lang = leyline_ts::languages::TsLanguage::from_name("html")?;
-        leyline_ts::project::project_ast_with_source(
-            src,
-            lang.ts_language(),
-            &conn,
-            "test.html",
-            "html",
-        )?;
-        Ok(())
+        crate::cmd_parse::parse_into_conn(&conn, tree.path(), None, None)?;
+        Ok(tree)
     }
 
     /// Re-open the file from scratch, so what is asserted is what was
     /// COMMITTED to disk rather than what some still-open handle believes.
     fn read_source(db: &Path) -> Result<Vec<u8>> {
         let conn = Connection::open(db)?;
-        Ok(conn.query_row("SELECT content FROM _source LIMIT 1", [], |r| r.get(0))?)
+        let file_id: i64 = conn.query_row(
+            "SELECT file_id FROM _source WHERE id = 'test.html'",
+            [],
+            |r| r.get(0),
+        )?;
+        leyline_ts::splice::source_bytes(&conn, file_id)
     }
 
     fn read_record(db: &Path, path: &str) -> Result<String> {
@@ -65,7 +79,7 @@ mod tests {
     fn cmd_splice_rewrites_the_source_and_reprojects_on_disk() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let db = dir.path().join("proj.db");
-        project_html(&db, b"<p>Hello</p>")?;
+        let _tree = project_html(&db, b"<p>Hello</p>")?;
 
         // Pre-state, so a passing assertion below cannot be the state the
         // projection already had.
@@ -94,7 +108,7 @@ mod tests {
     fn cmd_splice_rejects_a_path_that_does_not_resolve() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let db = dir.path().join("proj.db");
-        project_html(&db, b"<p>Hello</p>")?;
+        let _tree = project_html(&db, b"<p>Hello</p>")?;
 
         let err = cmd_splice(&db, "test.html/no/such/node", "World")
             .expect_err("an unresolvable display path must not splice");

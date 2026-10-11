@@ -377,15 +377,12 @@ async fn test_splice_modifies_node() {
         .await
         .expect("splice should succeed");
 
-    // Step 4: Verify the source changed in the database.
+    // Step 4: Verify the source changed in the database. The write path
+    // stores the bytes in `source_blobs` under `_source.content_hash`
+    // (ADR-0040 D3), so read them through the one byte reader.
     let conn = rusqlite::Connection::open(&db_path).expect("open db after splice");
-    let source: Vec<u8> = conn
-        .query_row(
-            "SELECT content FROM _source WHERE id = 'util.go'",
-            [],
-            |r| r.get(0),
-        )
-        .expect("read _source after splice");
+    let source =
+        leyline_ts::splice::source_bytes(&conn, util_go).expect("read util.go after splice");
     let source_str = String::from_utf8(source).expect("source should be valid UTF-8");
     assert!(
         source_str.contains("return a * b"),

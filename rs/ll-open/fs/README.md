@@ -15,6 +15,6 @@ Filesystem presentation — mounts the arena as NFS or FUSE.
 ## Feature flags
 
 - `validate` (default), `fuse` (default), `nfs` (default) — see `Cargo.toml` for dependency mapping.
-- `splice` — FUSE write-back triggers `splice_and_reproject` for AST-tracked nodes.
+- `splice` — FUSE write-back to an AST-tracked node splices the edit into its file and hands the file's new bytes to the installed `SourceWriter` (ADR-0040 D3's one write path, implemented by `leyline-cli-lib`); with none installed the edit is refused.
 
 The `VectorIndex` sidecar previously lived here under a `vec` feature; it's now part of `leyline-cli-lib`'s daemon module so vectors live next to the `EmbeddingPass` framework that produces them.

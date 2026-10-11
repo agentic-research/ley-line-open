@@ -903,7 +903,8 @@ mod tests {
                 leyline_ts::languages::TsLanguage::Html,
                 "test.html",
             )?;
-            let adapter = SqliteGraphAdapter::new_writable(&db_bytes)?;
+            let mut adapter = SqliteGraphAdapter::new_writable(&db_bytes)?;
+            adapter.set_source_writer(Arc::new(crate::graph::fixtures::ProjectingWriter));
             Ok(Arc::new(adapter))
         }
 

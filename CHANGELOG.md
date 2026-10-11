@@ -55,6 +55,32 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **BREAKING: one write path; a written file is stored and projected exactly
+  as a cold parse of its bytes** (ADR-0040 D3, beads `ley-line-open-f2ffbd`,
+  `0d3b72`, `143f17`). Three writers changed a file's bytes in an arena and
+  each left it inconsistent: the splice re-projection set
+  `_source.content_hash` to a hash with no `source_blobs` row, wrote `_ast`
+  with `node_hash` NULL and no `node_content`, `node_child` or `_ast_blob`
+  rows, and the byte reader fell back to the unverified file on disk.
+  `leyline_cli_lib::source_write::write(grant, path, bytes)` is now the only
+  writer: it refuses a path outside the grant (`Grant::Paths`, ADR-0029's
+  sub-manifest) or one the arena does not hold, refuses bytes that do not
+  parse, then hands the bytes to the cold parse as that one file's content,
+  so the bytes land in `source_blobs`, every IR row a cold parse writes is
+  written, and `treeRoot` is recomputed and stamped. `leyline splice`, the
+  daemon's mount and `leyline serve`'s mount all call it; `leyline-fs`
+  computes an edit's bytes and hands them to an installed
+  `graph::SourceWriter`, and refuses the edit when none is installed.
+  `leyline_ts::splice::source_bytes` verifies the bytes against
+  `content_hash`, fails closed on a hash with no blob, and no longer reads
+  the disk. The cold parse opens its transaction before the stale-row sweep,
+  so a pass that fails restores the rows it deleted. Removed:
+  `leyline_ts::splice::{reproject, reproject_source, splice_and_reproject,
+  splice_db_bytes}`. A written file's bytes live in the arena only; a later
+  full-tree parse that reads the file from disk replaces them. The cli-lib
+  mutation slice now builds with `mount` as well as `vec`, so mount-gated code
+  (`cmd_serve`, the mount's writer) is mutated in a build that compiles it.
+
 - **A truncated or unreadable `head.capnp` no longer restarts the signed chain
   at generation 1** (bead `ley-line-open-0c8ee7`). `read_head_for_chain`
   returned "no parent, generation 1" on any read, framing or decode error

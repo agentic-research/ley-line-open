@@ -163,6 +163,19 @@ pub trait LiveSource: Send + Sync {
     fn publish(&self) -> Result<()>;
 }
 
+/// The one write path (ADR-0040 D3, bead `ley-line-open-f2ffbd`) that a
+/// mount hands an edited file's new bytes to. `leyline-fs` computes the
+/// bytes of a node edit and nothing else: storing them, re-projecting the
+/// file through the cold parse and recomputing `treeRoot` belong to the
+/// implementor (`leyline_cli_lib::source_write`), which owns the parse.
+/// The grant is the implementor's too.
+#[cfg(feature = "splice")]
+pub trait SourceWriter: Send + Sync {
+    /// Write `bytes` as the content of the file whose `_source.id` is
+    /// `source_id`, on `conn` — the adapter's writer connection.
+    fn write(&self, conn: &Connection, source_id: &str, bytes: Vec<u8>) -> Result<()>;
+}
+
 /// A private in-memory copy of an arena image: one writer, a pool of
 /// deserialised readers refreshed from the writer's bytes after each write.
 /// What `leyline serve`, FFI and tests use.
@@ -210,6 +223,10 @@ pub struct SqliteGraphAdapter {
     /// Nodes with pending splice (write accumulated, splice fires on flush).
     #[cfg(feature = "splice")]
     pending_splice: Mutex<HashSet<String>>,
+    /// Where an edit to a parsed file goes. Without one, such an edit is
+    /// refused rather than reported as done.
+    #[cfg(feature = "splice")]
+    source_writer: Option<Arc<dyn SourceWriter>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,7 +284,24 @@ impl SqliteGraphAdapter {
             shadow: Mutex::new(HashMap::new()),
             #[cfg(feature = "splice")]
             pending_splice: Mutex::new(HashSet::new()),
+            #[cfg(feature = "splice")]
+            source_writer: None,
         }
+    }
+
+    /// Route edits to parsed files through `writer` (ADR-0040 D3).
+    #[cfg(feature = "splice")]
+    pub fn set_source_writer(&mut self, writer: Arc<dyn SourceWriter>) {
+        self.source_writer = Some(writer);
+    }
+
+    /// Hand a file's new bytes to the source writer, or refuse.
+    #[cfg(feature = "splice")]
+    fn write_source(&self, conn: &Connection, source_id: &str, bytes: Vec<u8>) -> Result<()> {
+        let writer = self.source_writer.as_ref().with_context(|| {
+            format!("edit to '{source_id}' refused: this mount has no source writer")
+        })?;
+        writer.write(conn, source_id, bytes)
     }
 
     /// An adapter over somebody else's live database (ADR-0040 D4): reads
@@ -1043,31 +1077,34 @@ impl Graph for SqliteGraphAdapter {
             let Some(text) = record.filter(|s| !s.is_empty()) else {
                 return Ok(());
             };
-            leyline_ts::splice::splice_and_reproject(guard.conn(), nid, &text)?;
+            let bytes = leyline_ts::splice::splice(guard.conn(), nid, &text)?;
+            let file_id = leyline_schema::nid_file_id(nid)
+                .context("spliced node must be a file-scoped nid")?;
+            let source_id: String = guard.conn().query_row(
+                "SELECT id FROM _source WHERE file_id = ?1",
+                [file_id],
+                |r| r.get(0),
+            )?;
+            self.write_source(guard.conn(), &source_id, bytes)?;
 
-            // Reproject rewrote `nodes.record` for the spliced node AND every
-            // other node of the same source, from inside leyline-ts — which
-            // knows nothing about chunk tables. Any manifest still on those
-            // nodes now describes the PRE-splice bytes, and the chunked read
-            // path would serve them without complaint. Invalidate so those
-            // reads fall back to `record`: slower, but correct. Reads
-            // re-chunk lazily on the next write through this crate.
+            // The write re-projected the spliced node AND every other node
+            // of the same source, through the cold parse — which knows
+            // nothing about chunk tables. Any manifest still on those nodes
+            // now describes the PRE-splice bytes, and the chunked read path
+            // would serve them without complaint. Invalidate so those reads
+            // fall back to `record`: slower, but correct. Reads re-chunk
+            // lazily on the next write through this crate.
             //
             // projection-v5 makes "every node of this source" a nid RANGE —
-            // one delete over the file's `(file_id << 24) | ordinal` span,
-            // replacing the pre-v5 `_ast` self-join that enumerated ids and
-            // invalidated them one at a time. The range holds across the
-            // reproject because `files` is append-only: the re-projected file
-            // re-binds to the same `file_id`.
+            // one delete over the file's `(file_id << 24) | ordinal` span.
+            // The range holds across the re-projection because `files` is
+            // append-only: the re-projected file re-binds to the same
+            // `file_id`.
             #[cfg(feature = "cdc")]
-            {
-                let file_id = leyline_schema::nid_file_id(nid)
-                    .context("spliced node must be a file-scoped nid")?;
-                crate::chunked::invalidate_chunked_content_subtree(
-                    guard.conn(),
-                    leyline_schema::file_nid(file_id, 0),
-                )?;
-            }
+            crate::chunked::invalidate_chunked_content_subtree(
+                guard.conn(),
+                leyline_schema::file_nid(file_id, 0),
+            )?;
 
             // Only remove from pending on success — failed attempts retry on next flush
             self.pending_splice.lock().remove(id);
@@ -1239,11 +1276,11 @@ impl Graph for SqliteGraphAdapter {
                 modified = result;
             }
 
-            // Validate + reproject (looks up language from _source internally)
-            leyline_ts::splice::reproject_source(conn, &source_id, &modified).map_err(|e| {
+            // The one write path validates, stores and re-projects.
+            self.write_source(conn, &source_id, modified).map_err(|e| {
                 // Attempt to attribute the error to a specific node
-                let msg = e.to_string();
-                // Parse "error at byte N..M" from reproject error
+                let msg = format!("{e:#}");
+                // Parse "error at byte N..M" from the syntax check
                 if let Some(pos) = msg.find("error at byte ") {
                     let rest = &msg[pos + 14..];
                     if let Some(dot_pos) = rest.find("..")
@@ -1252,18 +1289,25 @@ impl Graph for SqliteGraphAdapter {
                         // Find which edit's post-splice range contains the error byte
                         for r in &ranges {
                             if err_byte >= r.start && err_byte < r.end {
-                                return anyhow::anyhow!("{e} (attributed to node '{}')", r.node_id);
+                                return anyhow::anyhow!(
+                                    "{e:#} (attributed to node '{}')",
+                                    r.node_id
+                                );
                             }
                         }
                     }
                 }
                 // No attribution possible — list all nodes in the group
                 let node_ids: Vec<&str> = group.iter().map(|e| e.node_id.as_str()).collect();
-                anyhow::anyhow!("{e} (source '{}', edited nodes: {:?})", source_id, node_ids)
+                anyhow::anyhow!(
+                    "{e:#} (source '{}', edited nodes: {:?})",
+                    source_id,
+                    node_ids
+                )
             })?;
 
-            // Reproject rewrote `nodes.record` for EVERY node of this source
-            // from inside leyline-ts. Unlike the `write_content` path, nothing
+            // The write rewrote `nodes.record` for EVERY node of this source
+            // through the cold parse. Unlike the `write_content` path, nothing
             // here re-chunks, so any manifest on those nodes now describes
             // pre-splice bytes and the chunked read path would serve them.
             // Invalidate the whole source: reads fall back to `record` until
@@ -1452,6 +1496,9 @@ pub struct HotSwapGraph {
     /// handle is visible here.
     controller: Mutex<Controller>,
     writable: bool,
+    /// Handed to every writable adapter this graph builds (ADR-0040 D3).
+    #[cfg(feature = "splice")]
+    source_writer: Option<Arc<dyn SourceWriter>>,
     /// Default tree-sitter language for extensionless files (e.g. `source`).
     #[cfg(feature = "validate")]
     default_language: Option<tree_sitter::Language>,
@@ -1487,6 +1534,8 @@ impl HotSwapGraph {
             last_root: Mutex::new(root),
             controller: Mutex::new(ctrl),
             writable: false,
+            #[cfg(feature = "splice")]
+            source_writer: None,
             #[cfg(feature = "validate")]
             default_language: None,
             #[cfg(feature = "verify")]
@@ -1546,6 +1595,19 @@ impl HotSwapGraph {
         self
     }
 
+    /// Route edits to parsed files through `writer` (ADR-0040 D3). Re-opens
+    /// the inner graph if it is already loaded writable, so the writer
+    /// reaches the adapter serving now.
+    #[cfg(feature = "splice")]
+    pub fn with_source_writer(mut self, writer: Arc<dyn SourceWriter>) -> Result<Self> {
+        self.source_writer = Some(writer);
+        if self.writable && *self.last_root.lock() != [0u8; 32] {
+            let new_graph = self.build_adapter(&self.control_path)?;
+            *self.inner.write() = new_graph;
+        }
+        Ok(self)
+    }
+
     /// Build an adapter for the current root.
     fn build_adapter(&self, control_path: &Path) -> Result<Arc<dyn Graph>> {
         #[cfg(feature = "verify")]
@@ -1556,24 +1618,31 @@ impl HotSwapGraph {
             } else {
                 SqliteGraphAdapter::from_arena_verified(control_path)?
             };
-            #[cfg(feature = "validate")]
-            if self.writable
-                && let Some(ref lang) = self.default_language
-            {
-                adapter.set_default_language(lang.clone());
+            if self.writable {
+                self.configure_writable(&mut adapter);
             }
             return Ok(Arc::new(adapter));
         }
         if self.writable {
-            #[allow(unused_mut)]
             let mut adapter = SqliteGraphAdapter::from_arena_writable(control_path)?;
-            #[cfg(feature = "validate")]
-            if let Some(ref lang) = self.default_language {
-                adapter.set_default_language(lang.clone());
-            }
+            self.configure_writable(&mut adapter);
             Ok(Arc::new(adapter))
         } else {
             Ok(Arc::new(SqliteGraphAdapter::from_arena(control_path)?))
+        }
+    }
+
+    /// What every writable adapter this graph builds carries: the default
+    /// validation language and the source writer.
+    #[allow(unused_variables)]
+    fn configure_writable(&self, adapter: &mut SqliteGraphAdapter) {
+        #[cfg(feature = "validate")]
+        if let Some(ref lang) = self.default_language {
+            adapter.set_default_language(lang.clone());
+        }
+        #[cfg(feature = "splice")]
+        if let Some(ref writer) = self.source_writer {
+            adapter.set_source_writer(writer.clone());
         }
     }
 
@@ -1864,6 +1933,38 @@ pub(crate) mod fixtures {
 
     use super::*;
     use rusqlite::Connection;
+
+    /// Stands in for `leyline_cli_lib::source_write`, which owns the cold
+    /// parse and is out of this crate's reach: re-projects the written file
+    /// through the single-file projector these fixtures were built with.
+    /// What it lets a test observe is the adapter's half of an edit — the
+    /// bytes it computes, the source it names, the state it clears and the
+    /// manifests it invalidates. The write path itself is tested in
+    /// `leyline-cli-lib`.
+    #[cfg(feature = "splice")]
+    pub(crate) struct ProjectingWriter;
+
+    #[cfg(feature = "splice")]
+    impl SourceWriter for ProjectingWriter {
+        fn write(&self, conn: &Connection, source_id: &str, bytes: Vec<u8>) -> Result<()> {
+            let language: String = conn.query_row(
+                "SELECT language FROM _source WHERE id = ?1",
+                [source_id],
+                |r| r.get(0),
+            )?;
+            let lang = leyline_ts::languages::TsLanguage::from_name(&language)?;
+            leyline_ts::splice::check_syntax(&bytes, lang.ts_language())?;
+            leyline_schema::delete_file_rows(conn, source_id)?;
+            leyline_ts::project::project_ast_with_source(
+                &bytes,
+                lang.ts_language(),
+                conn,
+                source_id,
+                &language,
+            )?;
+            Ok(())
+        }
+    }
 
     /// The nid a display path resolves to. Tests that reach past the [`Graph`]
     /// trait into the nid-keyed chunk layer translate here, exactly as the
@@ -2785,7 +2886,202 @@ mod tests {
             leyline_ts::languages::TsLanguage::Html,
             "test.html",
         )?;
-        SqliteGraphAdapter::new_writable(&db_bytes)
+        #[allow(unused_mut)]
+        let mut adapter = SqliteGraphAdapter::new_writable(&db_bytes)?;
+        #[cfg(feature = "splice")]
+        adapter.set_source_writer(Arc::new(super::fixtures::ProjectingWriter));
+        Ok(adapter)
+    }
+
+    /// Records what the adapter hands the write path, and writes nothing.
+    #[cfg(feature = "splice")]
+    #[derive(Default)]
+    struct RecordingWriter {
+        writes: Mutex<Vec<(String, Vec<u8>)>>,
+    }
+
+    #[cfg(feature = "splice")]
+    impl SourceWriter for RecordingWriter {
+        fn write(&self, _conn: &Connection, source_id: &str, bytes: Vec<u8>) -> Result<()> {
+            self.writes.lock().push((source_id.to_string(), bytes));
+            Ok(())
+        }
+    }
+
+    /// ADR-0040 D3: the mount computes the whole file's new bytes and hands
+    /// them, with the file's `_source.id`, to the one write path — from a
+    /// flush and from a batch splice alike.
+    #[test]
+    #[cfg(feature = "splice")]
+    fn an_edit_hands_the_whole_spliced_file_to_the_source_writer() -> Result<()> {
+        let db_bytes = leyline_ts::parse_with_source(
+            b"<p>hello</p>\n<!-- kept -->\n",
+            leyline_ts::languages::TsLanguage::Html,
+            "test.html",
+        )?;
+        let mut adapter = SqliteGraphAdapter::new_writable(&db_bytes)?;
+        let writer = Arc::new(RecordingWriter::default());
+        adapter.set_source_writer(writer.clone());
+        let node_id = "test.html/element/text";
+
+        adapter.write_content(node_id, b"world", 0)?;
+        adapter.flush_node(node_id)?;
+        assert_eq!(
+            writer.writes.lock().as_slice(),
+            [(
+                "test.html".to_string(),
+                b"<p>world</p>\n<!-- kept -->\n".to_vec()
+            )],
+        );
+        assert!(!adapter.pending_splice.lock().contains(node_id));
+
+        writer.writes.lock().clear();
+        adapter.batch_splice(&[(node_id.to_string(), Some("hi".to_string()))])?;
+        assert_eq!(
+            writer.writes.lock().as_slice(),
+            [(
+                "test.html".to_string(),
+                b"<p>hi</p>\n<!-- kept -->\n".to_vec()
+            )],
+        );
+        Ok(())
+    }
+
+    /// With no source writer, an edit to a parsed file is refused rather
+    /// than reported as done, and the flush stays pending.
+    #[test]
+    #[cfg(feature = "splice")]
+    fn an_edit_with_no_source_writer_is_refused_and_stays_pending() -> Result<()> {
+        let db_bytes = leyline_ts::parse_with_source(
+            b"<p>hello</p>",
+            leyline_ts::languages::TsLanguage::Html,
+            "test.html",
+        )?;
+        let adapter = SqliteGraphAdapter::new_writable(&db_bytes)?;
+        let node_id = "test.html/element/text";
+
+        adapter.write_content(node_id, b"world", 0)?;
+        let err = adapter.flush_node(node_id).unwrap_err();
+        assert!(format!("{err:#}").contains("no source writer"), "{err:#}");
+        assert!(adapter.pending_splice.lock().contains(node_id));
+
+        let err = adapter
+            .batch_splice(&[(node_id.to_string(), Some("x".to_string()))])
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("no source writer"), "{err:#}");
+        Ok(())
+    }
+
+    /// Refuses every write with a syntax error at a fixed byte, the way the
+    /// write path reports one.
+    #[cfg(feature = "splice")]
+    struct SyntaxErrorAt(usize);
+
+    #[cfg(feature = "splice")]
+    impl SourceWriter for SyntaxErrorAt {
+        fn write(&self, _conn: &Connection, _source_id: &str, _bytes: Vec<u8>) -> Result<()> {
+            anyhow::bail!(
+                "modified source has syntax errors (error at byte {}..{}, line 1)",
+                self.0,
+                self.0 + 1
+            )
+        }
+    }
+
+    /// A batch splice names the edited node whose post-splice byte range
+    /// holds the syntax error, and only that node: `hello` -> `world` at
+    /// byte 3 occupies `[3, 8)`.
+    #[test]
+    #[cfg(feature = "splice")]
+    fn a_batch_splice_error_is_attributed_to_the_node_whose_range_holds_it() -> Result<()> {
+        let node_id = "test.html/element/text";
+        let attributed = |err_byte: usize| -> Result<bool> {
+            let db_bytes = leyline_ts::parse_with_source(
+                b"<p>hello</p>",
+                leyline_ts::languages::TsLanguage::Html,
+                "test.html",
+            )?;
+            let mut adapter = SqliteGraphAdapter::new_writable(&db_bytes)?;
+            adapter.set_source_writer(Arc::new(SyntaxErrorAt(err_byte)));
+            let err = adapter
+                .batch_splice(&[(node_id.to_string(), Some("world".to_string()))])
+                .unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("syntax errors"), "{msg}");
+            Ok(msg.contains(&format!("attributed to node '{node_id}'")))
+        };
+        assert!(attributed(3)?, "the range's first byte");
+        assert!(attributed(5)?, "inside the range");
+        assert!(!attributed(1)?, "before the range");
+        assert!(!attributed(8)?, "the range's end is exclusive");
+        Ok(())
+    }
+
+    /// Publish an HTML file's single-file projection as an arena, returning
+    /// the control path.
+    #[cfg(feature = "splice")]
+    fn publish_html_arena(dir: &Path) -> Result<PathBuf> {
+        let db_bytes = leyline_ts::parse_with_source(
+            b"<p>hello</p>",
+            leyline_ts::languages::TsLanguage::Html,
+            "test.html",
+        )?;
+        let arena_path = dir.join("splice.arena");
+        let ctrl_path = dir.join("splice.ctrl");
+        let arena_size = 4096 + 2 * 1024 * 1024;
+        let mut mmap = leyline_core::layout::create_arena(&arena_path, arena_size)?;
+        leyline_core::layout::write_to_arena(&mut mmap, &db_bytes)?;
+        let root: [u8; 32] = blake3::hash(&db_bytes).into();
+        Controller::open_or_create(&ctrl_path)?.set_arena_with_root(
+            arena_path.to_str().unwrap(),
+            arena_size,
+            root,
+        )?;
+        Ok(ctrl_path)
+    }
+
+    /// `leyline serve`'s graph hands its source writer to the writable
+    /// adapter it is already serving, and to the ones it builds later.
+    #[test]
+    #[cfg(feature = "splice")]
+    fn a_hot_swap_graph_routes_edits_to_its_source_writer() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let ctrl = publish_html_arena(dir.path())?;
+        let writer = Arc::new(RecordingWriter::default());
+        let graph = HotSwapGraph::new(ctrl)?
+            .with_writable()
+            .with_source_writer(writer.clone())?;
+        let node_id = "test.html/element/text";
+
+        graph.write_content(node_id, b"world", 0)?;
+        graph.flush_node(node_id)?;
+        assert_eq!(
+            writer.writes.lock().as_slice(),
+            [("test.html".to_string(), b"<p>world</p>".to_vec())],
+        );
+        Ok(())
+    }
+
+    /// Before anything is published there is no adapter to hand the writer
+    /// to: the graph keeps serving the empty tree rather than loading one.
+    #[test]
+    #[cfg(feature = "splice")]
+    fn a_source_writer_on_an_unpublished_arena_keeps_the_empty_tree() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let ctrl_path = dir.path().join("empty.ctrl");
+        let arena_path = dir.path().join("empty.arena");
+        let arena_size: u64 = 4096 + 131_072 * 2;
+        Controller::open_or_create(&ctrl_path)?
+            .set_arena(arena_path.to_str().unwrap(), arena_size)?;
+        let _mmap = leyline_core::layout::create_arena(&arena_path, arena_size)?;
+
+        let graph = HotSwapGraph::new(ctrl_path)?
+            .with_writable()
+            .with_source_writer(Arc::new(RecordingWriter::default()))?;
+        let root = graph.get_node("")?.expect("the empty tree has a root");
+        assert!(root.is_dir);
+        assert!(graph.list_children("")?.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -2813,7 +3109,7 @@ mod tests {
             "node should be marked for pending splice"
         );
 
-        // Flush triggers splice_and_reproject
+        // Flush splices and hands the file to the source writer
         adapter.flush_node(node_id)?;
 
         // Pending splice should be cleared
@@ -2925,7 +3221,7 @@ mod tests {
     /// stale by the time it is read. Verified by removing the invalidation:
     /// still green. The genuine staleness case is
     /// `batch_splice_does_not_leave_a_stale_chunk_manifest`, which reaches
-    /// `reproject_source` without any `write_content` refresh in front of it.
+    /// the source writer without any `write_content` refresh in front of it.
     /// Kept as a path-integration check, not as the staleness falsifier.
     #[test]
     #[cfg(all(feature = "splice", feature = "cdc"))]
@@ -3001,7 +3297,7 @@ mod tests {
         Ok(())
     }
 
-    /// `batch_splice` (the ADR-007 commit path) calls `reproject_source`
+    /// `batch_splice` (the ADR-007 commit path) calls the source writer
     /// DIRECTLY — it never goes through `write_content`, so nothing re-chunks.
     /// A manifest populated before the splice therefore describes pre-splice
     /// bytes, and the chunked read path would serve them: correct-looking

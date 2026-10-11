@@ -19,6 +19,7 @@ pub mod cmd_self;
 pub mod cmd_serve;
 pub mod cmd_splice;
 pub mod daemon;
+pub mod source_write;
 pub mod topology_pass;
 pub mod tree_root;
 pub mod walk;

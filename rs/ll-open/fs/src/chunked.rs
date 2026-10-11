@@ -742,9 +742,9 @@ fn read_content_chunked_in_transaction(
 /// `nodes.record`.
 ///
 /// This is the safety valve for writers this crate does not control.
-/// `leyline-ts`'s splice/reproject updates `nodes.record` directly (see
-/// `leyline_ts::splice::reproject_source`), and it knows nothing about chunk
-/// tables. A manifest left behind after such a write describes the OLD
+/// The one write path (ADR-0040 D3, [`crate::graph::SourceWriter`])
+/// re-projects an edited file through the cold parse, which rewrites
+/// `nodes.record` directly and knows nothing about chunk tables. A manifest left behind after such a write describes the OLD
 /// content, and `read_content_chunked` would serve those stale bytes happily —
 /// silently wrong data, the worst outcome available. Invalidating is cheap and
 /// degrades to the slow-but-correct path; repopulating is the caller's choice

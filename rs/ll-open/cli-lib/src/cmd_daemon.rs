@@ -668,6 +668,11 @@ pub async fn run_daemon_with_options(
         // the mount's `fsync` publishes through `snapshot_to_arena`.
         let source = Arc::new(crate::daemon::live_graph::LiveDbSource::new(ctx.clone()));
         let mut graph = leyline_fs::graph::SqliteGraphAdapter::live(source)?;
+        // ADR-0040 D3: an edit to a parsed file goes through the one write
+        // path. The daemon owns its tree, so the mount holds the whole grant.
+        graph.set_source_writer(Arc::new(crate::source_write::MountWriter {
+            grant: crate::source_write::Grant::Whole,
+        }));
         if let Some(lang_ext) = language {
             let ts_lang = leyline_fs::validate::language_for_extension(lang_ext)
                 .with_context(|| format!("unsupported language: {lang_ext}"))?;

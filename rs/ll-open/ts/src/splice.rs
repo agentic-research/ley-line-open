@@ -1,18 +1,20 @@
-//! Bidirectional AST splice: write to a node → splice into source → re-parse.
+//! AST splice: the byte arithmetic of an edit to one node, and the one
+//! reader of a file's bytes.
 //!
-//! Enables LLMs to edit individual AST nodes via mounted files while ley-line
-//! handles the byte-level splicing back into the original source.
+//! A write to a node is `source[..start] + new_text + source[end..]`. What
+//! happens to those bytes next — the blob store, the manifest, the
+//! re-projection, `treeRoot` — is ADR-0040 D3's one write path
+//! (`leyline_cli_lib::source_write::write`), which every writer calls. This
+//! module never writes the arena.
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension};
 use tree_sitter::{Language, Parser};
 
-use crate::project::project_ast_with_source;
-
 /// Splice new text into a node's byte range, returning the modified source bytes.
 ///
 /// Reads the node's `start_byte`/`end_byte` from `_ast` and the original source
-/// from `_source`, then performs: `source[..start] + new_text + source[end..]`.
+/// through [`source_bytes`], then performs: `source[..start] + new_text + source[end..]`.
 ///
 /// projection-v5: keyed on the integer `nid`; the node's file is `nid >> 24`,
 /// joined to `_source.file_id`. Callers holding a display path resolve it
@@ -49,259 +51,141 @@ pub fn splice(conn: &Connection, nid: i64, new_text: &str) -> Result<Vec<u8>> {
     Ok(result)
 }
 
-/// The bytes of the file `file_id` names, wherever this arena keeps them.
+/// The bytes of the file `file_id` names, verified against its
+/// `_source.content_hash`.
 ///
-/// Three writers put a file's bytes in three places, and until this there
-/// were three readers to match (bead `ley-line-open-af4539`): the
-/// single-file projector stores them in `_source.content`; the daemon's
-/// parse stores the absolute `path` plus a `content_hash` that keys the
-/// bytes in `source_blobs` (ADR-0028) — and `_source.content` is NULL on
-/// every daemon arena, which is why the mount's `batch_splice` failed on
-/// them. One reader, in that order: inline content, the blob store by
-/// hash, the file on disk. A chunk-activated blob store (bytes moved into
-/// chunks by `leyline-fs`) is reported as such rather than read wrongly.
+/// Two homes, read in this order: inline `_source.content` (the single-file
+/// projector's shape), then `source_blobs` under `content_hash` (ADR-0028,
+/// every cold-parsed and every written file). When the row carries a hash,
+/// the bytes returned are the bytes it names or an error: a hash with no
+/// blob row fails closed (bead `ley-line-open-0d3b72`), and bytes that do
+/// not hash to it are refused. The file on disk is never read — it is the
+/// working tree, not the arena's record of the file. A chunk-activated blob
+/// (bytes moved into chunks by `leyline-fs`) is reported as such rather than
+/// read wrongly.
 pub fn source_bytes(conn: &Connection, file_id: i64) -> Result<Vec<u8>> {
     /// The `_source` columns a file's bytes can live behind.
     struct SourceRow {
         id: String,
         content: Option<Vec<u8>>,
-        path: Option<String>,
         content_hash: Option<Vec<u8>>,
     }
     let SourceRow {
         id,
         content,
-        path,
         content_hash,
     } = conn
         .query_row(
-            "SELECT id, content, path, content_hash FROM _source WHERE file_id = ?1",
+            "SELECT id, content, content_hash FROM _source WHERE file_id = ?1",
             [file_id],
             |r| {
                 Ok(SourceRow {
                     id: r.get(0)?,
                     content: r.get(1)?,
-                    path: r.get(2)?,
-                    content_hash: r.get(3)?,
+                    content_hash: r.get(2)?,
                 })
             },
         )
         .with_context(|| format!("source for file_id {file_id} not found in _source table"))?;
-    if let Some(c) = content {
-        return Ok(c);
-    }
-    if let Some(hash) = content_hash
-        && leyline_schema::table_exists(conn, "source_blobs")?
-    {
-        let blob: Option<Option<Vec<u8>>> = conn
-            .query_row(
-                "SELECT blob_bytes FROM source_blobs WHERE blob_hash = ?1",
-                [&hash],
-                |r| r.get(0),
-            )
-            .optional()?;
-        match blob {
-            Some(Some(bytes)) => return Ok(bytes),
-            Some(None) => bail!(
-                "source '{id}' is chunk-activated in source_blobs; read it through leyline-fs"
-            ),
-            None => {}
+    let bytes = match (content, &content_hash) {
+        (Some(c), _) => c,
+        (None, Some(hash)) => {
+            let blob: Option<Option<Vec<u8>>> =
+                if leyline_schema::table_exists(conn, "source_blobs")? {
+                    conn.query_row(
+                        "SELECT blob_bytes FROM source_blobs WHERE blob_hash = ?1",
+                        [hash],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                } else {
+                    None
+                };
+            match blob {
+                Some(Some(bytes)) => bytes,
+                Some(None) => bail!(
+                    "source '{id}' is chunk-activated in source_blobs; read it through leyline-fs"
+                ),
+                None => bail!(
+                    "source '{id}' names content hash {} but source_blobs holds no such blob",
+                    hex_of(hash)
+                ),
+            }
+        }
+        (None, None) => bail!("source '{id}' has neither inline content nor a content hash"),
+    };
+    if let Some(hash) = content_hash {
+        let actual = {
+            use leyline_core::substrate::ContentAddressed;
+            *bytes.hash().as_bytes()
+        };
+        if actual[..] != hash[..] {
+            bail!(
+                "source '{id}': stored bytes hash to {} but _source.content_hash is {}",
+                hex_of(&actual),
+                hex_of(&hash)
+            );
         }
     }
-    if let Some(p) = path {
-        return std::fs::read(&p).with_context(|| format!("read source file: {p}"));
-    }
-    bail!("source '{id}' has neither inline content, a blob, nor a path")
+    Ok(bytes)
 }
 
-/// Re-parse modified source and update all tables (`_source`, `_ast`, `nodes`) atomically.
-///
-/// Validates that the new source parses without errors before committing changes.
-/// Runs inside a SQLite transaction — rolls back on failure.
-pub fn reproject(
-    conn: &Connection,
-    source_id: &str,
-    new_source: &[u8],
-    language: Language,
-    language_name: &str,
-) -> Result<()> {
-    // Validate: parse must succeed without errors
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Refuse `source` if it does not parse cleanly in `language`, naming the
+/// first error or missing node. A write through a mount lands one edit at a
+/// time; an edit that leaves the file unparseable is rejected rather than
+/// projected.
+pub fn check_syntax(source: &[u8], language: Language) -> Result<()> {
     let mut parser = Parser::new();
     parser
         .set_language(&language)
         .context("failed to set tree-sitter language")?;
     let tree = parser
-        .parse(new_source, None)
+        .parse(source, None)
         .context("tree-sitter parse returned None")?;
-    if tree.root_node().has_error() {
-        // Find the first ERROR node and report its byte range
-        let mut cursor = tree.walk();
-        let mut error_info = String::new();
-        'walk: loop {
-            if cursor.node().is_error() || cursor.node().is_missing() {
-                let node = cursor.node();
-                error_info = format!(
-                    " (error at byte {}..{}, line {})",
-                    node.start_byte(),
-                    node.end_byte(),
-                    node.start_position().row + 1,
-                );
+    if !tree.root_node().has_error() {
+        return Ok(());
+    }
+    // Find the first ERROR node and report its byte range
+    let mut cursor = tree.walk();
+    let mut error_info = String::new();
+    'walk: loop {
+        if cursor.node().is_error() || cursor.node().is_missing() {
+            let node = cursor.node();
+            error_info = format!(
+                " (error at byte {}..{}, line {})",
+                node.start_byte(),
+                node.end_byte(),
+                node.start_position().row + 1,
+            );
+            break 'walk;
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
                 break 'walk;
             }
-            if cursor.goto_first_child() {
-                continue;
-            }
-            loop {
-                if cursor.goto_next_sibling() {
-                    break;
-                }
-                if !cursor.goto_parent() {
-                    break 'walk;
-                }
-            }
-        }
-        bail!("modified source has syntax errors{error_info} — splice rejected");
-    }
-
-    // Atomic update inside a transaction
-    conn.execute_batch("BEGIN")?;
-
-    let result = (|| -> Result<()> {
-        // Clear THIS file's rows — every table that carries them, through the
-        // one owner. This used to be three table-wide DELETEs, which wiped
-        // every other file in the arena on each splice and reached users
-        // through `leyline splice` (bead `ley-line-open-2b6444`).
-        //
-        // The daemon's `_source` row carries the absolute `path` and the
-        // BLAKE3 `content_hash` of the file bytes; the single-file projector
-        // below writes the ts shape (`content`) instead, so carry the path
-        // across and re-derive the hash from the bytes just projected.
-        let abs_path: Option<String> = conn
-            .query_row("SELECT path FROM _source WHERE id = ?1", [source_id], |r| {
-                r.get(0)
-            })
-            .optional()?
-            .flatten();
-        leyline_schema::delete_file_rows(conn, source_id)?;
-
-        // Re-project this file from the spliced bytes.
-        project_ast_with_source(new_source, language, conn, source_id, language_name)?;
-
-        let content_hash: [u8; 32] = {
-            use leyline_core::substrate::ContentAddressed;
-            *new_source.hash().as_bytes()
-        };
-        conn.execute(
-            "UPDATE _source SET path = ?1, content_hash = ?2 WHERE id = ?3",
-            rusqlite::params![abs_path, content_hash.as_slice(), source_id],
-        )?;
-
-        Ok(())
-    })();
-
-    match result {
-        Ok(()) => {
-            conn.execute_batch("COMMIT")?;
-            Ok(())
-        }
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            Err(e)
         }
     }
-}
-
-/// Splice new text into a node, validate, and reproject in one call.
-///
-/// Returns the modified source bytes on success. If the splice produces
-/// invalid syntax, the database is left unchanged.
-pub fn splice_and_reproject(conn: &Connection, nid: i64, new_text: &str) -> Result<Vec<u8>> {
-    // Look up source metadata for reprojection. The `_ast` existence check
-    // rides on the JOIN: a nid with no `_ast` row fails here, before any
-    // bytes move.
-    let (source_id, language_name): (String, String) = conn
-        .query_row(
-            "SELECT s.id, s.language FROM _source s \
-             JOIN _ast a ON (a.nid >> 24) = s.file_id \
-             WHERE a.nid = ?1",
-            [nid],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .with_context(|| format!("node {nid} not found in _ast/_source tables"))?;
-
-    let language = crate::languages::TsLanguage::from_name(&language_name)?;
-
-    let new_source = splice(conn, nid, new_text)?;
-    reproject(
-        conn,
-        &source_id,
-        &new_source,
-        language.ts_language(),
-        &language_name,
-    )?;
-
-    Ok(new_source)
-}
-
-/// Validate and reproject a source by ID, looking up the language from `_source`.
-///
-/// Used by batch splice — the caller provides pre-computed source bytes,
-/// and this function handles language lookup, validation, and reprojection.
-pub fn reproject_source(conn: &Connection, source_id: &str, new_source: &[u8]) -> Result<()> {
-    let language_name: String = conn
-        .query_row(
-            "SELECT language FROM _source WHERE id = ?1",
-            [source_id],
-            |r| r.get(0),
-        )
-        .with_context(|| format!("source '{}' not found in _source table", source_id))?;
-
-    let language = crate::languages::TsLanguage::from_name(&language_name)?;
-    reproject(
-        conn,
-        source_id,
-        new_source,
-        language.ts_language(),
-        &language_name,
-    )
-}
-
-/// High-level: splice a serialized .db, returning updated serialized bytes.
-///
-/// Takes raw SQLite bytes (as produced by `parse`/`parse_with_source`),
-/// performs the splice + reproject, and returns new serialized bytes.
-pub fn splice_db_bytes(db_bytes: &[u8], node_path: &str, new_text: &str) -> Result<Vec<u8>> {
-    use std::io::Cursor;
-
-    let mut conn = Connection::open_in_memory()?;
-    let cursor = Cursor::new(db_bytes);
-    // `read_only = false`. The last argument is rusqlite's `read_only` flag,
-    // and passing `true` here made this function unable to do its job: a
-    // READONLY deserialize means `splice_and_reproject`'s very first DELETE
-    // fails with "attempt to write a readonly database", so every call
-    // returned Err. `false` selects FREEONCLOSE | RESIZEABLE, which is what a
-    // buffer we then rewrite and re-`serialize` needs — the reprojection can
-    // grow the image past its original page count.
-    conn.deserialize_read_exact("main", cursor, db_bytes.len(), false)
-        .context("failed to deserialize .db bytes")?;
-
-    // projection-v5: the caller addresses the node by its DISPLAY path (the
-    // full rendered path, file segment included); the projection keys on
-    // integer nids, so resolve at this boundary.
-    let nid = crate::schema::resolve_path(&conn, node_path)?
-        .with_context(|| format!("node path {node_path:?} does not resolve in this projection"))?;
-    splice_and_reproject(&conn, nid, new_text)?;
-
-    let data = conn.serialize("main")?;
-    Ok(data.to_vec())
+    bail!("modified source has syntax errors{error_info} — splice rejected")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "html")]
     use crate::project::project_ast_with_source;
     use rusqlite::Connection;
 
+    #[cfg(feature = "html")]
     fn setup_html(src: &[u8]) -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         let lang: Language = tree_sitter_html::LANGUAGE.into();
@@ -309,26 +193,15 @@ mod tests {
         conn
     }
 
-    fn get_source(conn: &Connection) -> Vec<u8> {
-        conn.query_row("SELECT content FROM _source LIMIT 1", [], |r| r.get(0))
-            .unwrap()
-    }
-
     /// Resolve a display path to its nid — the v5 addressing boundary.
+    #[cfg(feature = "html")]
     fn nid_of(conn: &Connection, path: &str) -> i64 {
         crate::schema::resolve_path(conn, path)
             .unwrap()
             .unwrap_or_else(|| panic!("path must resolve: {path:?}"))
     }
 
-    fn get_record(conn: &Connection, path: &str) -> String {
-        let nid = nid_of(conn, path);
-        conn.query_row("SELECT record FROM nodes WHERE nid = ?1", [nid], |r| {
-            r.get(0)
-        })
-        .unwrap()
-    }
-
+    #[cfg(feature = "html")]
     fn get_ast_range(conn: &Connection, path: &str) -> (i64, i64) {
         let nid = nid_of(conn, path);
         conn.query_row(
@@ -337,16 +210,6 @@ mod tests {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap()
-    }
-
-    fn count_nodes(conn: &Connection) -> i64 {
-        conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
-            .unwrap()
-    }
-
-    fn count_ast(conn: &Connection) -> i64 {
-        conn.query_row("SELECT COUNT(*) FROM _ast", [], |r| r.get(0))
-            .unwrap()
     }
 
     #[cfg(feature = "html")]
@@ -395,142 +258,6 @@ mod tests {
 
     #[cfg(feature = "html")]
     #[test]
-    fn reproject_touches_only_the_spliced_file() {
-        // reproject used to run DELETE FROM nodes / _ast / _source for the
-        // WHOLE arena before re-projecting one file, so any splice wiped
-        // every other file (bead ley-line-open-2b6444). Every splice test
-        // seeded a single file, which is why nothing saw it.
-        let conn = Connection::open_in_memory().unwrap();
-        let html = crate::languages::TsLanguage::Html;
-        for (rel, src) in [
-            ("a.html", b"<p>alpha</p>".as_slice()),
-            ("b.html", b"<p>beta</p>".as_slice()),
-        ] {
-            project_ast_with_source(src, html.ts_language(), &conn, rel, "html").unwrap();
-        }
-        let count = |table: &str, rel: &str| -> i64 {
-            let file_id = crate::schema::lookup_file_id(&conn, rel).unwrap().unwrap();
-            let (lo, hi) = crate::schema::file_nid_range(file_id);
-            conn.query_row(
-                &format!("SELECT COUNT(*) FROM {table} WHERE nid BETWEEN ?1 AND ?2"),
-                rusqlite::params![lo, hi],
-                |r| r.get(0),
-            )
-            .unwrap()
-        };
-        let b_nodes = count("nodes", "b.html");
-        let b_ast = count("_ast", "b.html");
-        assert!(b_ast > 0, "fixture must project b.html");
-        let a_file_id = crate::schema::lookup_file_id(&conn, "a.html")
-            .unwrap()
-            .unwrap();
-
-        splice_and_reproject(&conn, nid_of(&conn, "a.html/element/text"), "ALPHA").unwrap();
-
-        assert_eq!(
-            count("nodes", "b.html"),
-            b_nodes,
-            "b.html's nodes must survive a's splice"
-        );
-        assert_eq!(
-            count("_ast", "b.html"),
-            b_ast,
-            "b.html's _ast must survive a's splice"
-        );
-        let b_source: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM _source WHERE id = 'b.html'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(b_source, 1, "b.html's _source row must survive a's splice");
-        assert_eq!(
-            crate::schema::lookup_file_id(&conn, "a.html").unwrap(),
-            Some(a_file_id),
-            "the spliced file keeps its file_id, so its nid range is stable"
-        );
-        assert!(
-            count("_ast", "a.html") > 0,
-            "a.html is re-projected into its own range"
-        );
-        let text: String = conn
-            .query_row(
-                "SELECT record FROM nodes WHERE nid = ?1",
-                [nid_of(&conn, "a.html/element/text")],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(text, "ALPHA");
-    }
-
-    #[cfg(feature = "html")]
-    #[test]
-    fn reproject_updates_all_tables() {
-        let conn = setup_html(b"<p>Hello</p>");
-        let nodes_before = count_nodes(&conn);
-        let ast_before = count_ast(&conn);
-
-        let lang: Language = tree_sitter_html::LANGUAGE.into();
-        reproject(&conn, "test.html", b"<p>World</p>", lang, "html").unwrap();
-
-        // Source updated
-        assert_eq!(get_source(&conn), b"<p>World</p>");
-
-        // nodes and _ast refreshed (same structure, so same counts)
-        assert_eq!(count_nodes(&conn), nodes_before);
-        assert_eq!(count_ast(&conn), ast_before);
-
-        // Text node now has "World"
-        assert_eq!(get_record(&conn, "test.html/element/text"), "World");
-    }
-
-    #[cfg(feature = "html")]
-    #[test]
-    fn splice_and_reproject_roundtrip() {
-        let conn = setup_html(b"<p>Hello</p>");
-
-        let new_source =
-            splice_and_reproject(&conn, nid_of(&conn, "test.html/element/text"), "Goodbye")
-                .unwrap();
-        assert_eq!(new_source, b"<p>Goodbye</p>");
-
-        // DB reflects the change
-        assert_eq!(get_source(&conn), b"<p>Goodbye</p>");
-        assert_eq!(get_record(&conn, "test.html/element/text"), "Goodbye");
-
-        // Byte ranges updated
-        let (start, end) = get_ast_range(&conn, "test.html/element/text");
-        assert_eq!(start, 3);
-        assert_eq!(end, 10); // 3 + len("Goodbye")
-    }
-
-    #[cfg(feature = "html")]
-    #[test]
-    fn splice_syntax_error_rejected() {
-        let conn = setup_html(b"<p>Hello</p>");
-        let original_source = get_source(&conn);
-        let original_record = get_record(&conn, "test.html/element/text");
-
-        // Splice in something that produces a parse error.
-        // tree-sitter HTML is very tolerant, so we test the mechanism:
-        // if it errs, DB must be unchanged.
-        let result = splice_and_reproject(
-            &conn,
-            nid_of(&conn, "test.html/element"),
-            "<div><p>unclosed",
-        );
-
-        if result.is_err() {
-            assert_eq!(get_source(&conn), original_source);
-            assert_eq!(get_record(&conn, "test.html/element/text"), original_record);
-        }
-        // If it succeeds (error-tolerant parser), that's also valid —
-        // the syntax-error guard is most valuable for strict grammars.
-    }
-
-    #[cfg(feature = "html")]
-    #[test]
     fn splice_nonexistent_node_fails() {
         let conn = setup_html(b"<p>Hello</p>");
         // A nid far outside any interned file's populated range.
@@ -538,93 +265,107 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[cfg(feature = "html")]
+    #[cfg(feature = "json")]
     #[test]
-    fn multiple_splices_compose() {
-        let conn = setup_html(b"<p>Hello</p>");
-
-        // First splice
-        splice_and_reproject(&conn, nid_of(&conn, "test.html/element/text"), "World").unwrap();
-        assert_eq!(get_source(&conn), b"<p>World</p>");
-
-        // Second splice on the updated tree
-        splice_and_reproject(&conn, nid_of(&conn, "test.html/element/text"), "Final").unwrap();
-        assert_eq!(get_source(&conn), b"<p>Final</p>");
-        assert_eq!(get_record(&conn, "test.html/element/text"), "Final");
+    fn check_syntax_accepts_clean_source_and_names_the_first_error() {
+        let json = crate::languages::TsLanguage::Json.ts_language();
+        check_syntax(br#"{"a": 1}"#, json.clone()).unwrap();
+        let err = check_syntax(b"{\"a\": 1,\n \"b\": }", json).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("syntax errors"), "{msg}");
+        assert!(msg.contains("line 2"), "the error names its line: {msg}");
     }
 
-    /// Reopen serialized bytes as a database — the only way to observe that
-    /// `splice_db_bytes` returned a real image rather than a plausible-looking
-    /// `Vec<u8>`.
-    #[cfg(feature = "html")]
-    fn reopen(bytes: &[u8]) -> Connection {
-        use std::io::Cursor;
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.deserialize_read_exact("main", Cursor::new(bytes), bytes.len(), true)
-            .expect("returned bytes must deserialize as a SQLite image");
+    /// A `_source` row in the cold parse's shape: no inline content, a
+    /// content hash keying `source_blobs`.
+    fn blob_arena(hash: &[u8], blob: Option<&[u8]>) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::schema::create_ast_tables(&conn).unwrap();
+        crate::schema::create_source_blobs_table(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO _source (id, language, path, content_hash, file_id) \
+             VALUES ('a.go', 'go', '/nonexistent/a.go', ?1, 7)",
+            [hash],
+        )
+        .unwrap();
+        if let Some(b) = blob {
+            conn.execute(
+                "INSERT INTO source_blobs (blob_hash, blob_bytes) VALUES (?1, ?2)",
+                rusqlite::params![hash, b],
+            )
+            .unwrap();
+        }
         conn
     }
 
-    #[cfg(feature = "html")]
-    #[test]
-    fn splice_db_bytes_returns_a_reopenable_image_carrying_the_splice() {
-        // `splice_db_bytes` returns `Result<Vec<u8>>`, so a body replaced by
-        // `Ok(vec![])`, `Ok(vec![0])` or `Ok(vec![1])` is invisible to any
-        // caller that only unwraps it — or that checks `!is_empty()`. The
-        // assertions below are on the CONTENT of the image: its header magic,
-        // and the spliced state read back out of it through SQL.
-        let db = crate::parse_with_source(
-            b"<p>Hello</p>",
-            crate::languages::TsLanguage::Html,
-            "test.html",
-        )
-        .unwrap();
-
-        let out = splice_db_bytes(&db, "test.html/element/text", "World").unwrap();
-
-        // A serialized SQLite database opens with the format-3 magic and is
-        // at least one page long. `vec![]`, `vec![0]` and `vec![1]` all die
-        // on the length check; the magic pins that these are database bytes
-        // and not, say, the spliced source.
-        assert!(
-            out.len() >= 512,
-            "a serialized database is at least one page; got {} byte(s)",
-            out.len(),
-        );
-        assert_eq!(
-            &out[..16],
-            b"SQLite format 3\0",
-            "returned bytes must carry the SQLite header magic",
-        );
-
-        // The splice actually landed IN the returned image — not merely in
-        // some connection the function opened and dropped.
-        let spliced = reopen(&out);
-        assert_eq!(get_source(&spliced), b"<p>World</p>");
-        assert_eq!(get_record(&spliced, "test.html/element/text"), "World");
-        let (start, end) = get_ast_range(&spliced, "test.html/element/text");
-        assert_eq!((start, end), (3, 8), "byte range reprojected over 'World'");
-
-        // The input bytes are untouched — the function returns a new image.
-        let original = reopen(&db);
-        assert_eq!(get_source(&original), b"<p>Hello</p>");
+    fn hash_of(bytes: &[u8]) -> Vec<u8> {
+        use leyline_core::substrate::ContentAddressed;
+        bytes.hash().as_bytes().to_vec()
     }
 
-    #[cfg(feature = "html")]
     #[test]
-    fn splice_db_bytes_rejects_a_path_that_does_not_resolve() {
-        // The other half of the contract: an unresolvable display path is an
-        // error, not an empty-but-Ok image.
-        let db = crate::parse_with_source(
-            b"<p>Hello</p>",
-            crate::languages::TsLanguage::Html,
-            "test.html",
+    fn source_bytes_reads_the_blob_its_hash_names() {
+        let h = hash_of(b"package a\n");
+        let conn = blob_arena(&h, Some(b"package a\n"));
+        assert_eq!(source_bytes(&conn, 7).unwrap(), b"package a\n");
+    }
+
+    /// Bead `0d3b72`: a hash with no blob row is an error, never a fall
+    /// through to the file on disk.
+    #[test]
+    fn source_bytes_fails_closed_on_a_hash_with_no_blob() {
+        let h = hash_of(b"package a\n");
+        let conn = blob_arena(&h, None);
+        let msg = format!("{:#}", source_bytes(&conn, 7).unwrap_err());
+        assert!(msg.contains("holds no such blob"), "{msg}");
+        assert!(msg.contains(&hex_of(&h)), "the error names the hash: {msg}");
+    }
+
+    #[test]
+    fn source_bytes_refuses_a_blob_that_does_not_hash_to_its_key() {
+        let key = hash_of(b"package a\n");
+        let conn = blob_arena(&key, Some(b"package b\n"));
+        let msg = format!("{:#}", source_bytes(&conn, 7).unwrap_err());
+        assert!(msg.contains("hash to"), "{msg}");
+        assert!(msg.contains(&hex_of(&key)), "names the key: {msg}");
+        assert!(
+            msg.contains(&hex_of(&hash_of(b"package b\n"))),
+            "names the bytes' hash: {msg}"
+        );
+    }
+
+    #[test]
+    fn hex_of_is_lowercase_two_digits_per_byte() {
+        assert_eq!(hex_of(&[0x00, 0x0a, 0xff]), "000aff");
+    }
+
+    #[test]
+    fn source_bytes_verifies_inline_content_against_a_stored_hash() {
+        let conn = blob_arena(&hash_of(b"package a\n"), None);
+        conn.execute("UPDATE _source SET content = X'00' WHERE file_id = 7", [])
+            .unwrap();
+        let err = source_bytes(&conn, 7).unwrap_err();
+        assert!(format!("{err:#}").contains("hash to"), "{err:#}");
+        conn.execute(
+            "UPDATE _source SET content = ?1 WHERE file_id = 7",
+            [b"package a\n".as_slice()],
         )
         .unwrap();
-        let err = splice_db_bytes(&db, "test.html/element/nope", "World").unwrap_err();
-        assert!(
-            format!("{err:#}").contains("does not resolve"),
-            "unexpected error: {err:#}",
-        );
+        assert_eq!(source_bytes(&conn, 7).unwrap(), b"package a\n");
+    }
+
+    #[test]
+    fn source_bytes_reads_inline_content_with_no_hash_and_refuses_a_row_with_neither() {
+        let conn = blob_arena(&hash_of(b"x"), None);
+        conn.execute(
+            "UPDATE _source SET content = X'41', content_hash = NULL WHERE file_id = 7",
+            [],
+        )
+        .unwrap();
+        assert_eq!(source_bytes(&conn, 7).unwrap(), b"A");
+        conn.execute("UPDATE _source SET content = NULL WHERE file_id = 7", [])
+            .unwrap();
+        let err = source_bytes(&conn, 7).unwrap_err();
+        assert!(format!("{err:#}").contains("neither"), "{err:#}");
     }
 }

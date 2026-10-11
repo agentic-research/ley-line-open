@@ -68,16 +68,21 @@ fn splicing_one_file_leaves_the_other_file_untouched() {
         "the parser records the absolute path"
     );
 
-    // Splice the whole of a.go (its file node spans the entire source).
+    // Splice the whole of a.go (its file node spans the entire source) and
+    // write it through the one write path (ADR-0040 D3).
     let a_root = leyline_schema::file_nid(a_file_id, 0);
     let new_source = b"package main\n\nfunc alpha() int {\n\treturn 42\n}\n";
-    let spliced = leyline_ts::splice::splice_and_reproject(
-        &conn,
-        a_root,
-        std::str::from_utf8(new_source).unwrap(),
-    )
-    .expect("splice a.go");
+    let spliced =
+        leyline_ts::splice::splice(&conn, a_root, std::str::from_utf8(new_source).unwrap())
+            .expect("splice a.go");
     assert_eq!(spliced, new_source);
+    leyline_cli_lib::source_write::write(
+        &conn,
+        &leyline_cli_lib::source_write::Grant::Whole,
+        "a.go",
+        spliced,
+    )
+    .expect("write a.go");
 
     for (table, before) in &b_before {
         assert_eq!(

@@ -73,11 +73,12 @@ context, scoping notes, and review history are recoverable.
   `status`, `leyline_version` and `query` ops, and SIGTERM shutdown; with
   `--mount`, a write through the mount that is stored, read back, and the
   mount detaching on SIGTERM. Tasks `cli-lib:smoke`, `cli-lib:smoke:mount`
-  and `cli-lib:smoke:bin`; root `release:smoke` runs both builds, and
-  `release:publish` runs it before tagging. `release.yml` smokes each
-  natively built target and the release dry-run smokes its build, and
-  `cli-lib:smoke:dev` (debug builds, both modes) runs in `task ci` on every
-  PR. Its first runs found the five defects below.
+  and `cli-lib:smoke:bin`. `cli-lib:smoke:dev` runs in `task ci` on every
+  PR: one debug build with `mount`, smoked headless and mounted (the smoke
+  takes about a second; the build is the cost). Root `release:smoke` smokes
+  the shipped release build and `release:publish` runs it before tagging;
+  `release.yml` smokes each natively built target and the release dry-run
+  smokes its build. Its first runs found the five defects below.
 
 ### Fixed
 

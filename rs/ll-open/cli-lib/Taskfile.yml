@@ -58,15 +58,18 @@ tasks:
   # tree. `smoke` builds what release.yml ships (default features);
   # `smoke:mount` adds the mount and a write through it. `smoke:bin` runs the
   # script on an already-built binary — release.yml calls it per target.
-  # `smoke:dev` is the `ci` gate: debug builds, both modes, on every PR and
-  # every local `task ci` — the same runners `test:mount` already mounts on.
+  # `smoke:dev` is the `ci` gate on every PR and every local `task ci`, on
+  # the same runners `test:mount` already mounts on. ONE debug build, with
+  # `mount`, runs both passes: every headless command is the same code in a
+  # mount build, and a second build with the features flipped recompiled
+  # cli-lib, leyline-fs and the binary for no extra coverage. The smoke
+  # itself takes about a second; the build is the cost.
   smoke:dev:
-    desc: Debug-build the CLI and smoke it end to end, default features then with the mount (the `ci` gate)
+    desc: Debug-build the CLI with `mount` once and smoke it end to end, headless then mounted (the `ci` gate)
     dir: '{{.TASKFILE_DIR}}/../..'
     cmds:
-      - cargo build -p leyline-cli
-      - ../tools/cli_smoke.sh target/debug/leyline
       - cargo build -p leyline-cli --features mount
+      - ../tools/cli_smoke.sh target/debug/leyline
       - ../tools/cli_smoke.sh target/debug/leyline --mount
 
   smoke:

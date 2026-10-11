@@ -6,7 +6,7 @@
 //! - **Parallel**: tree-sitter parsing runs on all cores via rayon.
 //! - **Batched**: all inserts happen in a single SQLite transaction.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -785,6 +785,24 @@ pub(crate) struct WrittenFile {
     pub bytes: Vec<u8>,
 }
 
+/// Bytes a pass reads from memory instead of from disk.
+enum InMemory<'a> {
+    /// ADR-0040 D3: one written file; the rest of the tree is untouched.
+    Written(&'a WrittenFile),
+    /// ADR-0040 D6: the whole tree, keyed by `_source.id`, read from
+    /// `source_blobs` by `leyline rebuild`. No file is read from disk.
+    Tree(&'a BTreeMap<String, Vec<u8>>),
+}
+
+impl InMemory<'_> {
+    fn bytes(&self, rel: &str) -> Option<&Vec<u8>> {
+        match self {
+            InMemory::Written(w) => (w.rel == rel).then_some(&w.bytes),
+            InMemory::Tree(files) => files.get(rel),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
@@ -960,7 +978,26 @@ pub(crate) fn parse_written_file(
     written: WrittenFile,
 ) -> Result<ParseResult> {
     let scope = [written.rel.clone()];
-    parse_into_conn_with(conn, source, None, Some(&scope), Some(&written))
+    parse_into_conn_with(
+        conn,
+        source,
+        None,
+        Some(&scope),
+        Some(InMemory::Written(&written)),
+    )
+}
+
+/// Project a whole tree whose bytes are `files` (`_source.id` → bytes)
+/// through the cold parse, as if `source` held exactly those files
+/// (ADR-0040 D6). Nothing is read from disk and `source` need not exist; it
+/// only names the root the `_source.path` column is rendered under. Any
+/// file that fails to parse fails the pass.
+pub(crate) fn parse_tree_from_memory(
+    conn: &Connection,
+    source: &Path,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> Result<ParseResult> {
+    parse_into_conn_with(conn, source, None, None, Some(InMemory::Tree(files)))
 }
 
 fn parse_into_conn_with(
@@ -968,12 +1005,15 @@ fn parse_into_conn_with(
     source: &Path,
     lang_filter: Option<&str>,
     scope: Option<&[String]>,
-    written: Option<&WrittenFile>,
+    memory: Option<InMemory<'_>>,
 ) -> Result<ParseResult> {
-    // The written file's bytes, if `rel` is the written file.
-    let written_bytes =
-        |rel: &str| -> Option<&Vec<u8>> { written.filter(|w| w.rel == rel).map(|w| &w.bytes) };
-    if !source.is_dir() {
+    // The bytes of `rel`, when this pass reads it from memory.
+    let written_bytes = |rel: &str| -> Option<&Vec<u8>> { memory.as_ref()?.bytes(rel) };
+    let tree_in_memory = match &memory {
+        Some(InMemory::Tree(files)) => Some(*files),
+        _ => None,
+    };
+    if tree_in_memory.is_none() && !source.is_dir() {
         bail!("{} is not a directory", source.display());
     }
 
@@ -994,6 +1034,9 @@ fn parse_into_conn_with(
             }
         }
         v
+    } else if let Some(files) = tree_in_memory {
+        // The tree is exactly the in-memory set.
+        files.keys().map(|rel| source.join(rel)).collect()
     } else {
         // Full-tree walk — collect_files doesn't know the file count up
         // front (no cheap way without a pre-pass), so the inner Vec
@@ -1904,10 +1947,10 @@ fn parse_into_conn_with(
                     changed_files.push(pf.rel);
                     parsed += 1;
                 }
-                // A written file that does not parse is the write failing,
-                // not a file left out of the tree: the rollback guard
-                // restores its rows.
-                Err(e) if written.is_some() => return Err(e),
+                // A file read from memory that does not parse is the write
+                // or the rebuild failing, not a file left out of the tree:
+                // the rollback guard restores the arena.
+                Err(e) if memory.is_some() => return Err(e),
                 Err(e) => {
                     eprintln!("warn: {e:#}");
                     errors += 1;
@@ -2145,6 +2188,19 @@ fn parse_into_conn_with(
         conn,
         "projection_schema_version",
         crate::daemon::version::PROJECTION_SCHEMA_VERSION,
+    )?;
+    // ADR-0040 D6: what this projection was derived from — the whole tree,
+    // so a scoped pass stamps it too.
+    set_meta(
+        conn,
+        crate::tree_root::DERIVED_FROM_KEY,
+        &crate::tree_root::DerivedFrom {
+            tree_root,
+            parser_id,
+            projection_schema_version: crate::daemon::version::PROJECTION_SCHEMA_VERSION
+                .to_string(),
+        }
+        .to_meta(),
     )?;
     // Stamp the extraction epoch only on full-tree passes. A scoped
     // pass reparses just the dirty set; stamping the binary's epoch

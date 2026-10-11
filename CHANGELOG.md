@@ -53,6 +53,31 @@ context, scoping notes, and review history are recoverable.
   state). Consumers pinned to `v0.18.1` keep working: the fields are
   additive and a `Head` without them reads as before.
 
+- **`_meta.derived_from` and `leyline rebuild`: the arena says what it was
+  derived from, and is rebuilt from it** (ADR-0040 D6, bead
+  `ley-line-open-f31efd`). Every parse, including a scoped pass and a write
+  through the one write path, stamps `_meta.derived_from` as
+  `<treeRoot hex> <parserId hex> <projection_schema_version>`, the same
+  `treeRoot` and `parserId` the head carries. New command `leyline rebuild
+  <from.db> <into.db> [--path P]...` reads ring 0 alone (the `_source`
+  manifest and `source_blobs`, through the fail-closed `source_bytes`) and
+  projects it into a new arena through the cold parse, reading nothing from
+  disk; the source tree need not exist. It refuses an arena with no
+  `derived_from`, one whose `_source` set no longer folds to the stamped
+  `treeRoot`, one stamped with another `parserId` (a different derivation:
+  reparse the tree with this binary instead), a missing or mismatched blob,
+  a file that no longer parses, and a target that already exists. A whole
+  rebuild must land the stamped `treeRoot`; `--path` rebuilds a
+  sub-manifest. Arena-resident query overrides are carried, since they are
+  a `parserId` input. Tests close F3 as stated (cold parse, writes, rebuild
+  into a fresh arena: the logical row sets, `treeRoot` and `derived_from`
+  agree) and F5 (a sub-manifest rebuild matches the full arena's file images
+  modulo `file_id`). The gate found that `node_content.lang` and
+  `node_content.raw_kind` are not functions of `node_hash` (first writer
+  wins, and a write leaves the replaced value behind); they are excluded
+  from the gate by name and tracked as bead `ley-line-open-b5d354` for the
+  projection-v7 break.
+
 ### Fixed
 
 - **BREAKING: one write path; a written file is stored and projected exactly

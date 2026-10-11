@@ -15,6 +15,7 @@ pub mod cmd_load;
 #[cfg(feature = "lsp")]
 pub mod cmd_lsp;
 pub mod cmd_parse;
+pub mod cmd_rebuild;
 pub mod cmd_self;
 pub mod cmd_serve;
 pub mod cmd_splice;
@@ -194,6 +195,23 @@ pub enum Commands {
         /// Path to the parsed SQLite database (the head is `<db>.head.capnp`
         /// beside it).
         db: PathBuf,
+    },
+
+    /// Rebuild a parsed .db's projection into a new .db from its
+    /// `source_blobs` and `_source` manifest alone, reading nothing from disk
+    /// (ADR-0040 D6). Refuses an arena whose `derived_from` names another
+    /// parser or another tree.
+    Rebuild {
+        /// The parsed .db to rebuild from (opened read-only).
+        from: PathBuf,
+
+        /// The new .db to write; must not exist.
+        into: PathBuf,
+
+        /// Rebuild only these files (`_source.id`, repeatable): a
+        /// sub-manifest. Default: every file.
+        #[arg(long = "path")]
+        paths: Vec<String>,
     },
 
     /// Edit an AST node's text in a .db file (splice + reproject).
@@ -423,6 +441,7 @@ pub async fn run(cmd: Commands) -> Result<()> {
             query,
         } => cmd_inspect::cmd_inspect(&id, &arena, control_path.as_deref(), query.as_deref()),
         Commands::VerifyHead { db } => tree_root::cmd_verify_head(&db),
+        Commands::Rebuild { from, into, paths } => cmd_rebuild::cmd_rebuild(&from, &into, paths),
         Commands::Load { db, control } => cmd_load::cmd_load(&db, &control),
         Commands::Cdc { command } => {
             #[cfg(feature = "cdc")]

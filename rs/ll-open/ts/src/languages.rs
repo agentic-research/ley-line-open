@@ -161,7 +161,139 @@ pub enum TsLanguage {
     Lua,
 }
 
+/// Scheme tag of [`TsLanguage::grammar_digest`]'s fold. Protocol-visible:
+/// changing the entry shape or these tags is a `v2`, not an edit.
+pub const GRAMMAR_DIGEST_SCHEME: &str = "leyline/grammar-digest/v1";
+/// Entry framing (`b`) in the grammar digest: what kind of surface item the
+/// entry is. Plain constants, no bit packing, so every value is a distinct
+/// literal a known-answer test can pin.
+pub const GRAMMAR_ENTRY_ANONYMOUS_KIND: u64 = 0;
+pub const GRAMMAR_ENTRY_NAMED_KIND: u64 = 1;
+pub const GRAMMAR_ENTRY_FIELD: u64 = 2;
+pub const GRAMMAR_ENTRY_ABI: u64 = 3;
+
 impl TsLanguage {
+    /// Every grammar compiled into this binary, in declaration order. The
+    /// list is the enum spelled out once more because the enum is
+    /// feature-gated per variant and nothing else enumerates it; a variant
+    /// added without a line here is caught by `all_lists_every_variant`.
+    pub fn all() -> Vec<TsLanguage> {
+        vec![
+            #[cfg(feature = "html")]
+            TsLanguage::Html,
+            #[cfg(feature = "markdown")]
+            TsLanguage::Markdown,
+            #[cfg(feature = "markdown")]
+            TsLanguage::MarkdownInline,
+            #[cfg(feature = "json")]
+            TsLanguage::Json,
+            #[cfg(feature = "yaml")]
+            TsLanguage::Yaml,
+            #[cfg(feature = "go")]
+            TsLanguage::Go,
+            #[cfg(feature = "python")]
+            TsLanguage::Python,
+            #[cfg(feature = "elixir")]
+            TsLanguage::Elixir,
+            #[cfg(feature = "hcl")]
+            TsLanguage::Hcl,
+            #[cfg(feature = "rust")]
+            TsLanguage::Rust,
+            #[cfg(feature = "proto")]
+            TsLanguage::Proto,
+            #[cfg(feature = "javascript")]
+            TsLanguage::JavaScript,
+            #[cfg(feature = "typescript")]
+            TsLanguage::TypeScript,
+            #[cfg(feature = "sql")]
+            TsLanguage::Sql,
+            #[cfg(feature = "bash")]
+            TsLanguage::Bash,
+            #[cfg(feature = "java")]
+            TsLanguage::Java,
+            #[cfg(feature = "c")]
+            TsLanguage::C,
+            #[cfg(feature = "cpp")]
+            TsLanguage::Cpp,
+            #[cfg(feature = "toml")]
+            TsLanguage::Toml,
+            #[cfg(feature = "dockerfile")]
+            TsLanguage::Dockerfile,
+            #[cfg(feature = "ruby")]
+            TsLanguage::Ruby,
+            #[cfg(feature = "php")]
+            TsLanguage::Php,
+            #[cfg(feature = "kotlin")]
+            TsLanguage::Kotlin,
+            #[cfg(feature = "swift")]
+            TsLanguage::Swift,
+            #[cfg(feature = "scala")]
+            TsLanguage::Scala,
+            #[cfg(feature = "csharp")]
+            TsLanguage::CSharp,
+            #[cfg(feature = "css")]
+            TsLanguage::Css,
+            #[cfg(feature = "groovy")]
+            TsLanguage::Groovy,
+            #[cfg(feature = "lua")]
+            TsLanguage::Lua,
+        ]
+    }
+
+    /// The content identity of this grammar's surface: its name, ABI
+    /// version, every node kind (with its named/anonymous flag) and every
+    /// field name, in id order. Two grammar builds that project the same
+    /// source identically have the same digest; a grammar bump that adds,
+    /// renames or re-flags a kind or a field moves it. Feeds `parserId`
+    /// (ADR-0040 D1).
+    ///
+    /// A `PartitionSpec` fold (ADR-0032 D2) rather than a bare hash: the
+    /// scheme tag is bound into the digest, the grammar name is the spec's
+    /// params, and each kind and field is one framed entry, so the surface
+    /// is a declared decomposition like every other address in the
+    /// substrate and σ stays inside `leyline-core`.
+    pub fn grammar_digest(self) -> leyline_core::Hash {
+        use leyline_core::{ContentAddressed, Domain, Entry, Hash, PartitionSpec};
+        let lang = self.ts_language();
+        let mut entries = Vec::with_capacity(lang.node_kind_count() + lang.field_count() + 2);
+        // `a` = the entry's position in the ordered surface; `b` = its tag
+        // and flag, so a kind and a field with the same name and id stay
+        // distinct and the named/anonymous bit is committed.
+        for id in 0..lang.node_kind_count() {
+            let kind = lang.node_kind_for_id(id as u16).unwrap_or("");
+            entries.push(Entry {
+                addr: kind.as_bytes().hash(),
+                a: id as u64,
+                b: if lang.node_kind_is_named(id as u16) {
+                    GRAMMAR_ENTRY_NAMED_KIND
+                } else {
+                    GRAMMAR_ENTRY_ANONYMOUS_KIND
+                },
+            });
+        }
+        // Field ids are 1-based; id 0 is "no field" and is skipped.
+        for id in 1..=lang.field_count() {
+            let field = lang.field_name_for_id(id as u16).unwrap_or("");
+            entries.push(Entry {
+                addr: field.as_bytes().hash(),
+                a: id as u64,
+                b: GRAMMAR_ENTRY_FIELD,
+            });
+        }
+        entries.push(Entry {
+            addr: Hash::ZERO,
+            a: lang.abi_version() as u64,
+            b: GRAMMAR_ENTRY_ABI,
+        });
+        PartitionSpec {
+            domain: Domain::ByteStream,
+            scheme: GRAMMAR_DIGEST_SCHEME.to_string(),
+            params: self.name().as_bytes().to_vec(),
+            canon_version: 1,
+        }
+        .address(&entries)
+    }
+
     /// Get the tree-sitter `Language` object for parsing.
     pub fn ts_language(self) -> Language {
         match self {
@@ -730,6 +862,151 @@ impl TsLanguage {
             #[cfg(feature = "lua")]
             "lua" => Some(TsLanguage::Lua),
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod grammar_identity_tests {
+    use super::*;
+
+    /// `all()` is the enum spelled out once more. Every member round-trips
+    /// through its own name, no member appears twice, and every language the
+    /// detection registry can name is a member — so a variant added without a
+    /// line in `all()` is caught here as soon as any spelling reaches it.
+    #[test]
+    fn all_round_trips_names_has_no_duplicates_and_covers_the_registry() {
+        let all = TsLanguage::all();
+        assert!(!all.is_empty());
+        let mut names: Vec<&str> = all.iter().map(|l| l.name()).collect();
+        for (lang, name) in all.iter().zip(names.iter()) {
+            assert_eq!(TsLanguage::from_name(name).unwrap(), *lang, "{name}");
+        }
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), all.len(), "a language is listed twice");
+        for spelling in [
+            "go",
+            "rust",
+            "python",
+            "typescript",
+            "javascript",
+            "json",
+            "yaml",
+            "toml",
+            "sql",
+            "bash",
+            "java",
+            "c",
+            "cpp",
+            "ruby",
+            "php",
+            "kotlin",
+            "swift",
+            "scala",
+            "csharp",
+            "css",
+            "html",
+            "markdown",
+            "dockerfile",
+            "lua",
+            "groovy",
+            "hcl",
+            "proto",
+            "elixir",
+        ] {
+            if let Ok(lang) = TsLanguage::from_name(spelling) {
+                assert!(
+                    all.contains(&lang),
+                    "{spelling} resolves but is missing from all()"
+                );
+            }
+        }
+    }
+
+    /// The digest is exactly the declared fold: an independent reconstruction
+    /// from the grammar's surface, entry by entry with literal framing, must
+    /// reproduce it. Catches any drift in the entry shape, the framing tags,
+    /// the params or the scheme — none of which the stability test can see.
+    #[test]
+    fn grammar_digest_is_the_declared_fold_over_the_surface() {
+        use leyline_core::{ContentAddressed, Domain, Entry, Hash, PartitionSpec};
+        let which = TsLanguage::all()[0];
+        let lang = which.ts_language();
+        let mut entries = Vec::new();
+        for id in 0..lang.node_kind_count() {
+            entries.push(Entry {
+                addr: lang
+                    .node_kind_for_id(id as u16)
+                    .unwrap_or("")
+                    .as_bytes()
+                    .hash(),
+                a: id as u64,
+                b: if lang.node_kind_is_named(id as u16) {
+                    1
+                } else {
+                    0
+                },
+            });
+        }
+        for id in 1..=lang.field_count() {
+            entries.push(Entry {
+                addr: lang
+                    .field_name_for_id(id as u16)
+                    .unwrap_or("")
+                    .as_bytes()
+                    .hash(),
+                a: id as u64,
+                b: 2,
+            });
+        }
+        entries.push(Entry {
+            addr: Hash::ZERO,
+            a: lang.abi_version() as u64,
+            b: 3,
+        });
+        let expected = PartitionSpec {
+            domain: Domain::ByteStream,
+            scheme: "leyline/grammar-digest/v1".to_string(),
+            params: which.name().as_bytes().to_vec(),
+            canon_version: 1,
+        }
+        .address(&entries);
+        assert_eq!(which.grammar_digest(), expected);
+        // The named flag is load-bearing: flipping one kind's flag in the
+        // reconstruction must move the address.
+        assert!(entries.iter().any(|e| e.b == 1) && entries.iter().any(|e| e.b == 0));
+        let mut flipped = entries.clone();
+        let i = flipped.iter().position(|e| e.b == 1).unwrap();
+        flipped[i].b = 0;
+        assert_ne!(
+            PartitionSpec {
+                domain: Domain::ByteStream,
+                scheme: "leyline/grammar-digest/v1".to_string(),
+                params: which.name().as_bytes().to_vec(),
+                canon_version: 1,
+            }
+            .address(&flipped),
+            expected
+        );
+    }
+
+    /// The grammar digest is a function of the compiled grammar: stable
+    /// across calls, distinct across grammars, and never the zero hash.
+    #[test]
+    fn grammar_digest_is_stable_and_distinguishes_grammars() {
+        let all = TsLanguage::all();
+        let mut seen = std::collections::HashSet::new();
+        for lang in &all {
+            let d1 = lang.grammar_digest();
+            let d2 = lang.grammar_digest();
+            assert_eq!(d1, d2, "{} digest is not stable", lang.name());
+            assert_ne!(d1, leyline_core::Hash::ZERO, "{}", lang.name());
+            assert!(
+                seen.insert(d1),
+                "{} shares a digest with another grammar",
+                lang.name()
+            );
         }
     }
 }

@@ -39,7 +39,9 @@ impossibility results (A)–(D) forbid it.
 | Term | What it names | Status |
 |---|---|---|
 | **SQLite arena snapshot root** (`Controller.current_root`) | integrity of one serialized byte image | shipped — `rs/ll-open/cli-lib/src/cmd_daemon.rs:1263-1266` |
-| **Cap'n Proto segment root** (`Head.rootHash`) | which parse run produced these segments | shipped — `rs/ll-open/cli-lib/src/cmd_parse.rs:1783-1790` |
+| **Cap'n Proto segment root** (`Head.rootHash`) | which parse run produced these segments (a run receipt: truncated per run, commits to absolute paths and mtimes) | shipped — `rs/ll-open/cli-lib/src/cmd_parse.rs` `hash_segment_files` |
+| **tree root** (`Head.treeRoot`) | the source tree: every `_source` row as (relative path, content hash) under one `parserId`; the same for a cold, incremental, scoped or relocated parse of the same bytes | shipped — `rs/ll-open/cli-lib/src/tree_root.rs`, ADR-0040 D1; verified by `leyline verify-head` |
+| **parser identity** (`Head.parserId`) | the derivation `treeRoot` was computed under: IR and projection schema versions, extraction/injection/query-set epochs, every compiled grammar's digest | shipped — `rs/ll-open/cli-lib/src/tree_root.rs`, ADR-0040 D1 |
 | **blob hash** | one CDC/CAS payload | shipped — `rs/ll-core/core/src/substrate.rs:167-179` |
 | **SQL projection ABI** | the queryable tables, columns, and indexes | shipped — a contract, **not** an identity domain; see §D4 below |
 | `manifestRoot` | which regions changed; transport units | **proposed only.** ADR-0032 §D3; no implementation in `rs/` |
@@ -168,6 +170,7 @@ an identity domain at all:
 |---|---|---|---|---|
 | **SQLite arena snapshot root** — `Controller.current_root` | the exact byte image of one snapshot | nothing | anything about logical content | BLAKE3 over the whole serialized buffer, checked before deserialization |
 | **Cap'n Proto segment root** — `Head.rootHash` | that a given parse run produced these segments | the segment bytes it folds over | to name the same thing as `current_root` | canonical-encoding fixtures + tagged fold |
+| **tree root** — `Head.treeRoot` | the source tree's (relative path, content hash) set under one `parserId` | `_source` rows and `source_blobs`; `parserId` | anything about derived rows, bytes on disk, or the run that wrote the segments | `leyline verify-head` recomputes it from the arena and refuses on mismatch |
 | **blob hash** | one CDC/CAS payload | the snapshot that contains it | to be a root for anything | `BlobStore::get` verify-on-read |
 | **SQL projection ABI** | queryable tables, columns, and indexes | none of the above | **to be "the substrate"; to have a root** | schema + cross-runtime query fixtures |
 
@@ -370,6 +373,7 @@ Architectural decisions that shape LLO today:
 | [ADR-0037](adr/0037-naming-the-proxy-channel.md) | Naming the proxy channel — `confinement/v1` assumes an egress path it cannot express | Accepted (shipped in the release that landed it) |
 | [ADR-0038](adr/0038-host-side-subscription-credential-ingress.md) | Host-side subscription credential ingress: proxy/vault custody without exposing tokens to confined harnesses | Proposed |
 | [ADR-0039](adr/0039-multi-vector-retrieval-over-cas.md) | Multi-vector retrieval over CAS — kernel-delegated caching instead of a bespoke index | Proposed — falsification ladder has not run; no implementation exists |
+| [ADR-0040](adr/0040-the-write-boundary.md) | The write boundary — source and manifest are the data, the arena is a cache; one write API for mount, splice and cloister; `treeRoot` beside `Head.rootHash` | Proposed — seven shipped bugs it explains are filed (`192018`, `0c80c7`, `143002`, `0d3b72`, `143f17`, `0c8ee7`, `1eefe3`); no implementation exists |
 
 ADRs 0017-0019 are cloister-side and live in `~/remotes/art/cloister/docs/adr/`. Mache's ADR-0024 (`incremental-dataflow-taint-as-substrate-queries`) is a separate document in the mache repo whose producer-side lives in LLO's `analysis-substrate` decade — see the decade doc for the mapping.
 

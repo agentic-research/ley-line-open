@@ -10,8 +10,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use leyline_core::ContentAddressed;
-#[cfg(feature = "mount")]
-use leyline_fs::graph::HotSwapGraph;
 
 use crate::cmd_serve;
 use crate::daemon::{
@@ -558,7 +556,7 @@ pub async fn run_daemon_with_options(
     state.write().phase = DaemonPhase::Ready;
 
     let sock_path = ctrl_path.with_extension("sock");
-    crate::daemon::socket::spawn(ctx.clone(), sock_path.clone(), options.discovery);
+    crate::daemon::socket::spawn(ctx.clone(), sock_path.clone(), options.discovery)?;
     eprintln!("daemon socket at {}", sock_path.display());
 
     // Optional MCP HTTP transport — feeds cloister gateway / any MCP client.
@@ -660,14 +658,21 @@ pub async fn run_daemon_with_options(
     // 7. Mount (optional — omit --mount for headless mode).
     #[cfg(feature = "mount")]
     if let Some(mount_path) = mount {
-        let graph = HotSwapGraph::new(ctrl_path.clone())?;
-        let graph = if let Some(lang_ext) = language {
+        // ADR-0040 D4 (bead `ley-line-open-f2ee9f`): the in-process mount
+        // reads `live.db` through the daemon's reader pool and writes through
+        // its single writer. It is not a private copy of the arena, so a
+        // mount write is durable the moment it commits and a reparse of
+        // another file cannot drop it (bead `192018`), and no image is
+        // deserialised to serve it (bead `af6c9d`). The arena and
+        // `current_root` remain the publication for out-of-process consumers;
+        // the mount's `fsync` publishes through `snapshot_to_arena`.
+        let source = Arc::new(crate::daemon::live_graph::LiveDbSource::new(ctx.clone()));
+        let mut graph = leyline_fs::graph::SqliteGraphAdapter::live(source)?;
+        if let Some(lang_ext) = language {
             let ts_lang = leyline_fs::validate::language_for_extension(lang_ext)
                 .with_context(|| format!("unsupported language: {lang_ext}"))?;
-            graph.with_validation(Some(ts_lang))
-        } else {
-            graph.with_writable()
-        };
+            graph.set_default_language(ts_lang);
+        }
         let graph: Arc<dyn leyline_fs::graph::Graph> = Arc::new(graph);
 
         std::fs::create_dir_all(mount_path)

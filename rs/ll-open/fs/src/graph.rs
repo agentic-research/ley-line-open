@@ -17,6 +17,7 @@ use leyline_core::{ArenaHeader, ContentAddressed, Controller};
 use rusqlite::OptionalExtension;
 
 use crate::SqliteGraph;
+use rusqlite::Connection;
 
 /// A node in the filesystem tree (maps 1:1 to a row in the `nodes` table).
 #[derive(Debug, Clone)]
@@ -137,13 +138,68 @@ pub trait Graph: Send + Sync {
 /// method therefore translates at the SQL layer: `resolve_path` on the way in,
 /// rendered names on the way out. Display names are NOT stored per AST row,
 /// so listings join `v_node_name`.
-pub struct SqliteGraphAdapter {
+/// Where an adapter's connections come from when it is NOT a private copy
+/// of an arena image: a live, file-backed WAL database owned by someone else
+/// (the daemon), which hands out pooled read connections and its single
+/// writer, and publishes on request.
+///
+/// ADR-0040 D4 (bead `ley-line-open-f2ee9f`). The daemon's in-process mount
+/// used to deserialise its own copy of the arena and publish from that copy,
+/// so a mount write never reached `live.db` and was dropped on the next
+/// snapshot (bead `192018`), and every save cost four image-sized copies on
+/// the reader side (bead `af6c9d`). Through this trait the mount reads what
+/// the daemon's socket readers read, with zero copies, and writes through
+/// the one writer the daemon's own ops use, so SQLite's WAL is the only
+/// consistency mechanism and there is one writer per arena.
+///
+/// Object-safe on purpose: `leyline-fs` does not know the pool type.
+pub trait LiveSource: Send + Sync {
+    /// A read connection. Pooled; `query_only` is the implementor's business.
+    fn reader(&self) -> Result<Box<dyn std::ops::Deref<Target = Connection> + '_>>;
+    /// THE write connection, exclusively, for the guard's lifetime.
+    fn writer(&self) -> Box<dyn std::ops::DerefMut<Target = Connection> + '_>;
+    /// Publish the live database to out-of-process consumers (the arena and
+    /// its control block). Called from the mount's `fsync`.
+    fn publish(&self) -> Result<()>;
+}
+
+/// A private in-memory copy of an arena image: one writer, a pool of
+/// deserialised readers refreshed from the writer's bytes after each write.
+/// What `leyline serve`, FFI and tests use.
+struct ImagePool {
     writer: Mutex<SqliteGraph>,
     readers: ArrayQueue<(SqliteGraph, u64)>,
     /// Cached serialized bytes for creating new readers on pool exhaustion.
     reader_bytes: Mutex<Vec<u8>>,
     /// Bumped on each write; readers stamped with stale generations are dropped.
     reader_gen: AtomicU64,
+}
+
+/// The adapter's connection backing.
+enum Backing {
+    /// See [`ImagePool`].
+    Image(Box<ImagePool>),
+    /// Somebody else's live database (see [`LiveSource`]).
+    Live(Arc<dyn LiveSource>),
+}
+
+/// Exclusive access to the writer connection, whichever backing holds it.
+pub(crate) enum WriterGuard<'a> {
+    Image(parking_lot::MutexGuard<'a, SqliteGraph>),
+    Live(Box<dyn std::ops::DerefMut<Target = Connection> + 'a>),
+}
+
+impl WriterGuard<'_> {
+    pub(crate) fn conn(&self) -> &Connection {
+        match self {
+            WriterGuard::Image(g) => g.conn(),
+            WriterGuard::Live(b) => b,
+        }
+    }
+}
+
+pub struct SqliteGraphAdapter {
+    backing: Backing,
     /// Default tree-sitter language for extensionless files (e.g. `source`).
     #[cfg(feature = "validate")]
     default_language: Option<tree_sitter::Language>,
@@ -194,17 +250,42 @@ impl SqliteGraphAdapter {
                 let _ = readers.push((reader, 0));
             }
         }
-        Self {
+        Self::with_backing(Backing::Image(Box::new(ImagePool {
             writer: Mutex::new(graph),
             readers,
             reader_bytes: Mutex::new(bytes),
             reader_gen: AtomicU64::new(0),
+        })))
+    }
+
+    fn with_backing(backing: Backing) -> Self {
+        Self {
+            backing,
             #[cfg(feature = "validate")]
             default_language: None,
             #[cfg(feature = "validate")]
             shadow: Mutex::new(HashMap::new()),
             #[cfg(feature = "splice")]
             pending_splice: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// An adapter over somebody else's live database (ADR-0040 D4): reads
+    /// come from `source.reader()`, writes go through `source.writer()`, and
+    /// `fsync` publishes through `source.publish()`. No bytes are copied
+    /// to build it, and no reader pool is refreshed after a write: SQLite's
+    /// WAL gives every later read the committed state.
+    pub fn live(source: Arc<dyn LiveSource>) -> Result<Self> {
+        let adapter = Self::with_backing(Backing::Live(source));
+        adapter.ensure_errors_table()?;
+        Ok(adapter)
+    }
+
+    /// Exclusive access to the writer connection.
+    fn writer_guard(&self) -> WriterGuard<'_> {
+        match &self.backing {
+            Backing::Image(pool) => WriterGuard::Image(pool.writer.lock()),
+            Backing::Live(source) => WriterGuard::Live(source.writer()),
         }
     }
 
@@ -305,7 +386,7 @@ impl SqliteGraphAdapter {
     /// on. Re-keying would force either a fabricated nid or dropping that
     /// diagnostic entirely.
     fn ensure_errors_table(&self) -> Result<()> {
-        let guard = self.writer.lock();
+        let guard = self.writer_guard();
         guard.conn().execute_batch(
             "CREATE TABLE IF NOT EXISTS _errors (
                 node_id   TEXT PRIMARY KEY,
@@ -318,47 +399,86 @@ impl SqliteGraphAdapter {
         Ok(())
     }
 
-    /// Serialize the current in-memory DB for arena flush.
+    /// Serialize the current DB image for arena flush. For a live backing this
+    /// is one `sqlite3_serialize` of the live database under the writer lock:
+    /// the image publication path, not the read path.
     pub fn serialize(&self) -> Result<Vec<u8>> {
-        let guard = self.writer.lock();
-        guard.serialize()
+        match &self.backing {
+            Backing::Image(pool) => pool.writer.lock().serialize(),
+            Backing::Live(source) => {
+                let guard = source.writer();
+                let data = guard.serialize("main")?;
+                Ok(data.to_vec())
+            }
+        }
     }
 
-    /// Borrow a reader from the pool, or create one on the fly.
-    /// Readers stamped with a stale generation are discarded on pop.
+    /// Run `f` against a read connection.
+    ///
+    /// Image backing: borrow a reader from the pool, or create one on the fly;
+    /// readers stamped with a stale generation are discarded on pop. Live
+    /// backing: a pooled connection to the live database; nothing to refresh,
+    /// the WAL serves the committed state.
     fn with_reader<F, R>(&self, f: F) -> Result<R>
     where
-        F: FnOnce(&SqliteGraph) -> Result<R>,
+        F: FnOnce(&Connection) -> Result<R>,
     {
-        let current_gen = self.reader_gen.load(Ordering::Acquire);
-        let (reader, rgen) = loop {
-            match self.readers.pop() {
-                Some((r, g)) if g == current_gen => break (r, current_gen),
-                Some(_) => continue, // discard stale reader
-                None => {
-                    let bytes = self.reader_bytes.lock();
-                    break (SqliteGraph::from_bytes(&bytes)?, current_gen);
+        match &self.backing {
+            Backing::Image(pool) => {
+                let ImagePool {
+                    readers,
+                    reader_bytes,
+                    reader_gen,
+                    ..
+                } = &**pool;
+                let current_gen = reader_gen.load(Ordering::Acquire);
+                let (reader, rgen) = loop {
+                    match readers.pop() {
+                        Some((r, g)) if g == current_gen => break (r, current_gen),
+                        Some(_) => continue, // discard stale reader
+                        None => {
+                            let bytes = reader_bytes.lock();
+                            break (SqliteGraph::from_bytes(&bytes)?, current_gen);
+                        }
+                    }
+                };
+                let result = f(reader.conn());
+                // Only return to pool if still current generation
+                if rgen == reader_gen.load(Ordering::Acquire) {
+                    let _ = readers.push((reader, rgen));
                 }
+                result
             }
-        };
-        let result = f(&reader);
-        // Only return to pool if still current generation
-        if rgen == self.reader_gen.load(Ordering::Acquire) {
-            let _ = self.readers.push((reader, rgen));
+            Backing::Live(source) => {
+                let conn = source.reader()?;
+                f(&conn)
+            }
         }
-        result
     }
 
-    /// After a write, bump generation and update cached bytes so new readers
-    /// see the mutation. Stale readers are discarded lazily by `with_reader`.
+    /// After a write on the image backing, bump the generation and update the
+    /// cached bytes so new readers see the mutation; stale readers are
+    /// discarded lazily by `with_reader`. A no-op on the live backing: the
+    /// write is committed in the WAL and every later read sees it.
     fn refresh_readers(&self) -> Result<()> {
-        let writer = self.writer.lock();
-        let bytes = writer.serialize()?;
-        self.reader_gen.fetch_add(1, Ordering::Release);
-        // Drain is best-effort; stale stragglers are caught by generation check
-        while self.readers.pop().is_some() {}
-        *self.reader_bytes.lock() = bytes;
-        Ok(())
+        match &self.backing {
+            Backing::Image(pool) => {
+                let ImagePool {
+                    writer,
+                    readers,
+                    reader_bytes,
+                    reader_gen,
+                } = &**pool;
+                let writer = writer.lock();
+                let bytes = writer.serialize()?;
+                reader_gen.fetch_add(1, Ordering::Release);
+                // Drain is best-effort; stale stragglers are caught by generation check
+                while readers.pop().is_some() {}
+                *reader_bytes.lock() = bytes;
+                Ok(())
+            }
+            Backing::Live(_) => Ok(()),
+        }
     }
 
     fn write_content_traced(
@@ -368,7 +488,7 @@ impl SqliteGraphAdapter {
         offset: u64,
     ) -> Result<(usize, WriteRefreshOutcome)> {
         let refresh = {
-            let guard = self.writer.lock();
+            let guard = self.writer_guard();
             let now = now_nanos();
 
             // A write to a node the projection cannot resolve wrote nowhere
@@ -640,8 +760,7 @@ impl Graph for SqliteGraphAdapter {
                 mtime_nanos: 0,
             }));
         }
-        self.with_reader(|reader| {
-            let conn = reader.conn();
+        self.with_reader(|conn| {
             let Some(nid) = leyline_schema::resolve_path(conn, id)? else {
                 return Ok(None);
             };
@@ -667,8 +786,7 @@ impl Graph for SqliteGraphAdapter {
         // question. Doing it as `parent_nid = ? AND name = ?` would instead
         // render every sibling's display name to compare one of them.
         let id = Self::join_id(parent_id, name);
-        self.with_reader(|reader| {
-            let conn = reader.conn();
+        self.with_reader(|conn| {
             let Some(nid) = leyline_schema::resolve_path(conn, &id)? else {
                 return Ok(None);
             };
@@ -688,8 +806,7 @@ impl Graph for SqliteGraphAdapter {
     }
 
     fn list_children(&self, parent_id: &str) -> Result<Vec<Node>> {
-        self.with_reader(|reader| {
-            let conn = reader.conn();
+        self.with_reader(|conn| {
             // An unresolvable parent lists as empty — the same answer the
             // pre-v5 `WHERE parent_id = ?` gave for an unknown id.
             let Some(parent_nid) = leyline_schema::resolve_path(conn, parent_id)? else {
@@ -718,7 +835,7 @@ impl Graph for SqliteGraphAdapter {
             // one caller that genuinely wants the whole mapping, which is the
             // case the bulk view exists for — a per-row `node_path` here
             // would re-walk the parent chain once per file.
-            let mut stmt = reader.conn().prepare_cached(
+            let mut stmt = reader.prepare_cached(
                 "SELECT p.path, n.record \
                    FROM nodes n JOIN v_node_path p ON p.nid = n.nid \
                   WHERE n.kind = 0 AND n.record IS NOT NULL AND length(n.record) > 0",
@@ -750,17 +867,16 @@ impl Graph for SqliteGraphAdapter {
         self.with_reader(|reader| {
             // An unresolvable id reads as empty, matching the pre-v5 miss on
             // `WHERE id = ?` — a read of a vanished node is not an error.
-            let Some(nid) = leyline_schema::resolve_path(reader.conn(), id)? else {
+            let Some(nid) = leyline_schema::resolve_path(reader, id)? else {
                 return Ok(0);
             };
             #[cfg(feature = "cdc")]
             {
-                crate::chunked::read_content_at(reader.conn(), nid, buf, offset)
+                crate::chunked::read_content_at(reader, nid, buf, offset)
             }
             #[cfg(not(feature = "cdc"))]
             {
                 let record: Option<String> = reader
-                    .conn()
                     .query_row("SELECT record FROM nodes WHERE nid = ?1", [nid], |row| {
                         row.get(0)
                     })
@@ -795,7 +911,7 @@ impl Graph for SqliteGraphAdapter {
     fn create_node(&self, parent_id: &str, name: &str, is_dir: bool) -> Result<String> {
         let id = Self::join_id(parent_id, name);
         {
-            let guard = self.writer.lock();
+            let guard = self.writer_guard();
             let conn = guard.conn();
             let now = now_nanos();
             let name_id = leyline_schema::intern_name(conn, name)?;
@@ -840,7 +956,7 @@ impl Graph for SqliteGraphAdapter {
 
     fn remove_node(&self, id: &str) -> Result<()> {
         {
-            let guard = self.writer.lock();
+            let guard = self.writer_guard();
             let conn = guard.conn();
             // A remove of something that is not there is not an error — the
             // pre-v5 `DELETE ... WHERE id = ?` deleted nothing and returned Ok.
@@ -868,7 +984,7 @@ impl Graph for SqliteGraphAdapter {
 
     fn truncate(&self, id: &str) -> Result<()> {
         {
-            let guard = self.writer.lock();
+            let guard = self.writer_guard();
             let conn = guard.conn();
             let now = now_nanos();
             let Some(nid) = leyline_schema::resolve_path(conn, id)? else {
@@ -913,7 +1029,7 @@ impl Graph for SqliteGraphAdapter {
             if !self.pending_splice.lock().contains(id) {
                 return Ok(());
             }
-            let guard = self.writer.lock();
+            let guard = self.writer_guard();
             let Some(nid) = leyline_schema::resolve_path(guard.conn(), id)? else {
                 return Ok(());
             };
@@ -971,7 +1087,7 @@ impl Graph for SqliteGraphAdapter {
             return Ok(());
         }
 
-        let guard = self.writer.lock();
+        let guard = self.writer_guard();
         let conn = guard.conn();
         let now = now_nanos();
 
@@ -1188,9 +1304,19 @@ impl Graph for SqliteGraphAdapter {
         self.serialize()
     }
 
+    /// Live backing: publish the live database through its owner (the
+    /// daemon's snapshot). Image backing: this adapter does not own an arena;
+    /// `HotSwapGraph::flush_to_arena` does that for image-backed mounts.
+    fn flush_to_arena(&self) -> Result<()> {
+        match &self.backing {
+            Backing::Live(source) => source.publish(),
+            Backing::Image(_) => anyhow::bail!("graph does not support arena flush"),
+        }
+    }
+
     fn rename_node(&self, id: &str, new_parent_id: &str, new_name: &str) -> Result<()> {
         {
-            let guard = self.writer.lock();
+            let guard = self.writer_guard();
             let conn = guard.conn();
             let new_id = Self::join_id(new_parent_id, new_name);
             let old_nid = leyline_schema::resolve_path(conn, id)?
@@ -1947,6 +2073,97 @@ mod tests {
         SqliteGraphAdapter::new_writable(data.as_ref())
     }
 
+    fn pooled_readers(adapter: &SqliteGraphAdapter) -> usize {
+        match &adapter.backing {
+            Backing::Image(pool) => pool.readers.len(),
+            Backing::Live(_) => 0,
+        }
+    }
+
+    /// The image pool's generation discipline: a current reader goes back to
+    /// the pool after a read (the pool stays full); after a write, stale
+    /// readers are discarded so the next read sees the write.
+    #[test]
+    fn image_pool_reuses_current_readers_and_discards_stale_ones() -> Result<()> {
+        let adapter = writable_adapter()?;
+        let full = pooled_readers(&adapter);
+        assert!(full >= 2);
+        let mut buf = [0u8; 16];
+        let n = adapter.read_content("docs/readme", &mut buf, 0)?;
+        assert_eq!(&buf[..n], b"hello");
+        assert_eq!(
+            pooled_readers(&adapter),
+            full,
+            "a current reader returns to the pool"
+        );
+
+        let old_bytes = adapter.serialize()?;
+        adapter.write_content("docs/readme", b"HELLO", 0)?;
+        let n = adapter.read_content("docs/readme", &mut buf, 0)?;
+        assert_eq!(&buf[..n], b"HELLO", "a read after a write sees the write");
+
+        // A reader checked out across a write can land back in the pool with
+        // the old generation (the push races the refresh). Plant one: the
+        // next read must discard it, not serve the pre-write bytes.
+        let Backing::Image(pool) = &adapter.backing else {
+            unreachable!("writable_adapter is image-backed")
+        };
+        while pool.readers.pop().is_some() {}
+        let stale_gen = pool.reader_gen.load(Ordering::Acquire) - 1;
+        let _ = pool
+            .readers
+            .push((SqliteGraph::from_bytes(&old_bytes)?, stale_gen));
+        let n = adapter.read_content("docs/readme", &mut buf, 0)?;
+        assert_eq!(&buf[..n], b"HELLO", "a stale pooled reader is discarded");
+        Ok(())
+    }
+
+    /// A [`LiveSource`] over one in-memory connection that counts publishes.
+    struct CountingSource {
+        conn: Mutex<Connection>,
+        publishes: AtomicU64,
+    }
+
+    impl LiveSource for CountingSource {
+        fn reader(&self) -> Result<Box<dyn std::ops::Deref<Target = Connection> + '_>> {
+            Ok(Box::new(self.conn.lock()))
+        }
+        fn writer(&self) -> Box<dyn std::ops::DerefMut<Target = Connection> + '_> {
+            Box::new(self.conn.lock())
+        }
+        fn publish(&self) -> Result<()> {
+            self.publishes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A live adapter reads and writes its source's connection and publishes
+    /// through it; an image adapter does not own an arena and refuses.
+    #[test]
+    fn live_adapter_flush_publishes_through_its_source() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_schema(&conn)?;
+        put_dir(&conn, "docs", 1000)?;
+        put_file(&conn, "docs/readme", 2000, Some("hello"))?;
+        let source = Arc::new(CountingSource {
+            conn: Mutex::new(conn),
+            publishes: AtomicU64::new(0),
+        });
+        let adapter = SqliteGraphAdapter::live(source.clone())?;
+        let mut buf = [0u8; 16];
+        let n = adapter.read_content("docs/readme", &mut buf, 0)?;
+        assert_eq!(&buf[..n], b"hello");
+        adapter.write_content("docs/readme", b"HELLO", 0)?;
+        let n = adapter.read_content("docs/readme", &mut buf, 0)?;
+        assert_eq!(&buf[..n], b"HELLO");
+        assert_eq!(source.publishes.load(Ordering::SeqCst), 0);
+        adapter.flush_to_arena()?;
+        assert_eq!(source.publishes.load(Ordering::SeqCst), 1);
+
+        assert!(writable_adapter()?.flush_to_arena().is_err());
+        Ok(())
+    }
+
     #[test]
     fn write_content_updates_record() -> Result<()> {
         let adapter = writable_adapter()?;
@@ -2246,7 +2463,7 @@ mod tests {
         assert_eq!(&buf[..n], valid.as_slice());
 
         // Verify no error stored
-        let guard = adapter.writer.lock();
+        let guard = adapter.writer_guard();
         let count: i64 = guard.conn().query_row(
             "SELECT COUNT(*) FROM _errors WHERE node_id = ?1",
             ["functions/main/source"],
@@ -2277,7 +2494,7 @@ mod tests {
         );
 
         // Verify structured error stored in _errors table
-        let guard = adapter.writer.lock();
+        let guard = adapter.writer_guard();
         let (line, _col, message): (i64, i64, String) = guard.conn().query_row(
             "SELECT line, col, message FROM _errors WHERE node_id = ?1",
             ["functions/main/source"],
@@ -2291,7 +2508,7 @@ mod tests {
         let valid = b"package main\n\nfunc main() {\n}\n";
         adapter.write_content("functions/main/source", valid, 0)?;
 
-        let guard = adapter.writer.lock();
+        let guard = adapter.writer_guard();
         let count: i64 = guard.conn().query_row(
             "SELECT COUNT(*) FROM _errors WHERE node_id = ?1",
             ["functions/main/source"],
@@ -2470,7 +2687,7 @@ mod tests {
     }
 
     fn rows_in_file_range(adapter: &SqliteGraphAdapter, table: &str, rel: &str) -> i64 {
-        let guard = adapter.writer.lock();
+        let guard = adapter.writer_guard();
         let conn = guard.conn();
         let Some(file_id) = leyline_schema::lookup_file_id(conn, rel).unwrap() else {
             return 0;
@@ -2485,7 +2702,7 @@ mod tests {
     }
 
     fn source_rows(adapter: &SqliteGraphAdapter, rel: &str) -> i64 {
-        let guard = adapter.writer.lock();
+        let guard = adapter.writer_guard();
         guard
             .conn()
             .query_row("SELECT COUNT(*) FROM _source WHERE id = ?1", [rel], |r| {
@@ -2606,7 +2823,7 @@ mod tests {
         );
 
         // Source should be updated
-        let guard = adapter.writer.lock();
+        let guard = adapter.writer_guard();
         let source: Vec<u8> = guard.conn().query_row(
             "SELECT content FROM _source WHERE id = 'test.html'",
             [],
@@ -2685,7 +2902,7 @@ mod tests {
         );
 
         // Verify source updated
-        let guard = adapter.writer.lock();
+        let guard = adapter.writer_guard();
         let source: Vec<u8> = guard.conn().query_row(
             "SELECT content FROM _source WHERE id = 'test.html'",
             [],
@@ -2719,7 +2936,7 @@ mod tests {
         // Give the arena chunk storage, then populate this node's manifest so
         // reads are genuinely being served from chunks before the splice.
         {
-            let guard = adapter.writer.lock();
+            let guard = adapter.writer_guard();
             crate::chunked::create_chunked_content_schema(guard.conn())?;
             crate::chunked::store_content_chunked(
                 guard.conn(),
@@ -2764,14 +2981,14 @@ mod tests {
     fn write_refreshes_the_chunk_manifest() -> Result<()> {
         let adapter = writable_adapter()?;
         {
-            let guard = adapter.writer.lock();
+            let guard = adapter.writer_guard();
             crate::chunked::create_chunked_content_schema(guard.conn())?;
         }
 
         let body = "x".repeat(300_000);
         adapter.write_content("docs/readme", body.as_bytes(), 0)?;
 
-        let guard = adapter.writer.lock();
+        let guard = adapter.writer_guard();
         assert!(
             crate::chunked::has_chunked_content(guard.conn(), nid_of(guard.conn(), "docs/readme"))?,
             "a write into a chunk-enabled arena must populate the manifest"
@@ -2799,7 +3016,7 @@ mod tests {
         let node_id = "test.html/element/text";
 
         {
-            let guard = adapter.writer.lock();
+            let guard = adapter.writer_guard();
             crate::chunked::create_chunked_content_schema(guard.conn())?;
             // Manifest describes the CURRENT content, "hello".
             crate::chunked::store_content_chunked(
@@ -2833,7 +3050,7 @@ mod tests {
     fn chunked_adapter() -> Result<SqliteGraphAdapter> {
         let adapter = writable_adapter()?;
         {
-            let guard = adapter.writer.lock();
+            let guard = adapter.writer_guard();
             crate::chunked::create_chunked_content_schema(guard.conn())?;
         }
         Ok(adapter)
@@ -2857,7 +3074,7 @@ mod tests {
         adapter: &SqliteGraphAdapter,
         node_id: &str,
     ) -> Result<Vec<(Vec<u8>, usize, usize)>> {
-        let guard = adapter.writer.lock();
+        let guard = adapter.writer_guard();
         let nid = nid_of(guard.conn(), node_id);
         let mut statement = guard.conn().prepare(
             "SELECT chunk_hash, byte_offset, byte_len
@@ -2951,7 +3168,7 @@ mod tests {
             let adapter = chunked_adapter()?;
             let node_id = "docs/readme";
             if stale {
-                let guard = adapter.writer.lock();
+                let guard = adapter.writer_guard();
                 crate::chunked::store_content_chunked(
                     guard.conn(),
                     nid_of(guard.conn(), node_id),
@@ -2993,7 +3210,7 @@ mod tests {
         let (_, outcome) = adapter.write_content_traced("docs/readme", b"XY", 1)?;
         assert_eq!(outcome, WriteRefreshOutcome::Skipped);
 
-        let guard = adapter.writer.lock();
+        let guard = adapter.writer_guard();
         let chunk_tables: i64 = guard.conn().query_row(
             "SELECT count(*) FROM sqlite_master
               WHERE type = 'table'
@@ -3068,7 +3285,7 @@ mod tests {
 
         adapter.remove_node("docs")?;
 
-        let guard = adapter.writer.lock();
+        let guard = adapter.writer_guard();
         assert!(
             !crate::chunked::has_chunked_content(
                 guard.conn(),
@@ -3087,14 +3304,14 @@ mod tests {
     fn batch_splice_plain_node_arm_invalidates() -> Result<()> {
         let adapter = writable_ast_adapter(b"<p>hello</p>")?;
         {
-            let guard = adapter.writer.lock();
+            let guard = adapter.writer_guard();
             crate::chunked::create_chunked_content_schema(guard.conn())?;
         }
         // A node with no `_ast` row.
         let plain = adapter.create_node("", "plain.txt", false)?;
         adapter.write_content(&plain, b"world", 0)?;
         {
-            let guard = adapter.writer.lock();
+            let guard = adapter.writer_guard();
             let is_ast: bool = guard
                 .conn()
                 .query_row(
@@ -3128,7 +3345,7 @@ mod tests {
         adapter.write_content("docs/readme", b"pre-rename-bytes", 0)?;
         adapter.rename_node("docs/readme", "docs", "moved")?;
 
-        let guard = adapter.writer.lock();
+        let guard = adapter.writer_guard();
         assert!(
             !crate::chunked::has_chunked_content(
                 guard.conn(),
@@ -3174,7 +3391,7 @@ mod tests {
 
         let adapter = SqliteGraphAdapter::from_arena_writable(&ctrl_path)?;
         let offset = {
-            let guard = adapter.writer.lock();
+            let guard = adapter.writer_guard();
             let (hash, offset, mut bytes): (Vec<u8>, i64, Vec<u8>) = guard.conn().query_row(
                 "SELECT m.chunk_hash, m.byte_offset, c.chunk_bytes \
                    FROM content_manifest m JOIN content_chunks c USING (chunk_hash) \

@@ -10,6 +10,94 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Added
+
+- **ADR-0040 — The write boundary: source and manifest are the data, the
+  arena is a cache** (`docs/adr/0040-the-write-boundary.md`, review bead
+  `ley-line-open-e79c0f`). One SQLite arena was serving two products, a
+  regenerable index for mache and the system of record for mount, splice and
+  cloister edits, and every root tried to name both. The ADR models the fix
+  as rings applied to bytes: ring 0 is `source_blobs` plus a manifest with one
+  writer and a scheme-tagged `treeRoot` beside the run receipt `Head.rootHash`;
+  ring 1 is the arena as a derived, rebuildable cache; ring 2 is a workload
+  holding a slice grant whose writes cross one checked API. Decisions D1–D7,
+  falsifiers F1–F7, and the sequencing (v0.20.1 first, then `treeRoot`, the
+  mount through the WAL pool, the one write API, projection-v7 with one AST
+  copy, `derived_from` and rebuild, then the publication ADR with control
+  block v4 in lockstep with mache). Work beads `f2df7f`, `f2ee9f`, `f2ffbd`,
+  `f30fdf`, `f31efd`, `d70f99`. Proposed; no behavior changes in this entry.
+
+- **`Head.treeRoot` and `Head.parserId`: the tree identity beside the run
+  receipt** (ADR-0040 D1, bead `ley-line-open-f2df7f`). `Head.rootHash` folds
+  over the capnp segments one run wrote; the segment files are truncated per
+  run and unchanged files emit nothing, so an incremental parse's root covers
+  only the re-parsed files (bead `0c80c7`), and the source record carries the
+  absolute path, mtime and size, so the same bytes in another directory hash
+  differently (bead `143002`). It stays what it is: a run receipt. `treeRoot`
+  is a tagged fold (`leyline/tree-root/v1`) over every `_source` row as
+  (relative path, content hash), computed after COMMIT from the whole table,
+  with `parserId` as its params; a cold parse, an incremental parse, a scoped
+  reparse, a second directory and a touched mtime of the same bytes yield one
+  `treeRoot`, and one changed byte changes it. `parserId` is a tagged fold
+  (`leyline/parser-id/v1`) over the IR and projection schema versions, the
+  extraction, injection and query-set epochs, and every compiled grammar's
+  node-kind and field tables (`TsLanguage::all`, `TsLanguage::grammar_digest`),
+  so two arenas with the same source under different derivations never share
+  a cache key. Both are additive `Head` fields (ADR-0014 §1; Go bindings
+  regenerated); a head written before them reads as not stamped. New command
+  `leyline verify-head <db>` recomputes both from the arena and exits non-zero
+  on a mismatch, a pre-ADR-0040 head, or an unreadable head. Because the
+  public Go schema module changed, `SCHEMA_VERSION` moves 0.18.1 → 0.20.1;
+  the matching `clients/go/leyline-schema` tag is published by the next
+  release's tag step (the release gate's "schema bumps with this release"
+  state). Consumers pinned to `v0.18.1` keep working: the fields are
+  additive and a `Head` without them reads as before.
+
+### Fixed
+
+- **A truncated or unreadable `head.capnp` no longer restarts the signed chain
+  at generation 1** (bead `ley-line-open-0c8ee7`). `read_head_for_chain`
+  returned "no parent, generation 1" on any read, framing or decode error
+  before the trust check ran, so deleting or truncating the head silently
+  re-rooted the chain even with `LEYLINE_HEAD_REQUIRE_SIGNATURE` set. Only a
+  head that does not exist starts a chain now; an existing head that cannot be
+  read fails the parse with an error that names the refusal, and the head is
+  not rewritten. Deleting the file is the deliberate way to start over.
+
+- **`leyline daemon` no longer panics when its socket's staging path is too
+  long for `sun_path`** (bead `ley-line-open-d923b7`, reported by mache's
+  release parity run). The owner-only bind staged the socket at
+  `<dir>/.leyline-sock-stage-<pid>/socket`, about 27 bytes longer than the
+  final `<dir>/default.sock`; with `HOME` under macOS `TMPDIR` the final path
+  fit the 104-byte limit and the staged one did not, so the daemon panicked
+  with exit 101 and left the staging directory behind. The staging name is
+  now `.s<pid>/s`, no longer than the final socket's own name; a staged path
+  that still does not fit is an error naming the limit and both paths; every
+  bind failure is returned through `socket::spawn` and the daemon instead of
+  panicking, and the staging directory is removed on every path out.
+  `socket::spawn` now returns `anyhow::Result<PathBuf>`.
+
+- **A write through the daemon's mount is durable; the mount reads `live.db`
+  through the daemon's reader pool instead of a private copy** (ADR-0040 D4,
+  bead `ley-line-open-f2ee9f`; closes `192018`). `leyline daemon --mount`
+  built a `HotSwapGraph` over a deserialised copy of the arena: a FUSE write
+  edited that copy and `fsync` published it from there, `live.db` never saw
+  the edit, the daemon's next snapshot republished `live.db`, the mount
+  hot-swapped onto it and the edit was gone; a restart warm-started without
+  it. Serving the mount from the copy also cost four image-sized copies per
+  save (bead `af6c9d`) and a full reserialise per write (bead `af79bb`).
+  `SqliteGraphAdapter` now has two backings: the image pool it always had,
+  and a `LiveSource` that hands out pooled read connections and the owner's
+  single writer. The daemon's mount uses `LiveDbSource` over its own
+  `live_db`: reads are the WAL's committed state with zero copies, writes go
+  through the one writer every daemon op uses, and `fsync` publishes through
+  `snapshot_to_arena`. `HotSwapGraph` is unchanged for `leyline serve` and
+  other out-of-process arena readers. Falsifier
+  `a_mount_write_survives_a_reparse_of_another_file_and_a_restart`: write
+  through the mount, reparse a different file, snapshot, read back through
+  the mount and the daemon's readers, drop everything, reopen `live.db`
+  cold; every read returns the written bytes.
+
 ## [0.20.1] — 2026-10-10
 
 Patch release with one breaking change for control-block consumers: the

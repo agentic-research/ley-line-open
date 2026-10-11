@@ -560,6 +560,13 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = cli ]; then
     # it. The whole binary set below compiles with the feature and its deps are
     # already in Cargo.lock, so this costs a longer link, not a download.
     #
+    # `mount`, for the same reason: `cmd_serve` and the mount's source writer
+    # (`source_write::MountWriter`) are behind it, and the one-write-path PR
+    # (`ley-line-open-f2ffbd`) reported both as 0s-build MISSED under `vec`
+    # alone. It links libfuse (deps:ci installs libfuse-dev; the Taskfile's
+    # PKG_CONFIG_PATH finds fuse-t on macOS) and mounts nothing: the lib
+    # tests it adds stop before a mount.
+    #
     # lsp_enrich_pipeline: kills the whole-function replacement mutants on
     # `enrich_files_with_client` (four survived on the PR that added the
     # test — nothing observed that function's counts or writes before it).
@@ -575,7 +582,7 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = cli ]; then
     # range entirely. Verified before routing: the mutation leaves the lib
     # suite green and fails five tests in this binary.
     run_slice integration \
-        --features vec \
+        --features vec,mount \
         -C --lib \
         -C --test -C execution_client \
         -C --test -C execution_transport \

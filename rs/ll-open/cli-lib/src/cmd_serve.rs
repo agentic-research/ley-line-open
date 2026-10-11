@@ -136,8 +136,13 @@ pub async fn cmd_serve(
     // Set up arena and controller.
     let ctrl_path = setup_arena(arena, arena_bytes, control)?;
 
-    // Build the HotSwapGraph.
-    let graph = HotSwapGraph::new(ctrl_path)?;
+    // Build the HotSwapGraph. An edit to a parsed file goes through the one
+    // write path (ADR-0040 D3); `serve` owns its arena, so the whole grant.
+    let graph = HotSwapGraph::new(ctrl_path)?.with_source_writer(Arc::new(
+        crate::source_write::MountWriter {
+            grant: crate::source_write::Grant::Whole,
+        },
+    ))?;
 
     // Optionally enable validation with the requested language.
     let graph = if let Some(lang_ext) = language {
@@ -209,6 +214,36 @@ pub async fn wait_for_shutdown(timeout: Option<&str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Everything `serve` does before it mounts — arena, control block,
+    /// graph with its source writer, mountpoint — runs, and an unknown
+    /// backend is then refused by name rather than served.
+    #[cfg(feature = "mount")]
+    #[tokio::test]
+    async fn serve_builds_its_graph_then_refuses_an_unknown_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let mount = dir.path().join("mnt");
+        let err = cmd_serve(
+            &dir.path().join("a.arena"),
+            1,
+            None,
+            &mount,
+            "carrier-pigeon",
+            0,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unknown backend: carrier-pigeon"),
+            "{err:#}"
+        );
+        assert!(
+            mount.is_dir(),
+            "the mountpoint is created before the backend is chosen"
+        );
+    }
 
     #[test]
     fn parse_duration_seconds() {

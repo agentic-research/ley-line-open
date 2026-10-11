@@ -12,6 +12,17 @@ context, scoping notes, and review history are recoverable.
 
 ### Added
 
+- **`task index:clones` reports exact structural clones** (`tools/clone_index.sh`,
+  bead `ley-line-open-6e9f79`, tier 1). It parses `rs/` into a scratch arena
+  and groups every `function_item` by `_ast.node_hash`, so a group is a set of
+  functions that are the same tree token for token. A copy nested inside
+  another reported copy is not counted twice. Groups are ranked by lines x
+  copies; `OUT=<file>` writes the markdown report to a file. On this tree it
+  finds 44 groups of 6+ lines and 781 duplicated lines. Renamed copies
+  (tier 2) and the concept-to-sites map (tier 3) are not part of it.
+  `task index:clones:fixture-test` runs in `task ci` and proves an exact pair
+  groups while a renamed copy and a nested copy do not.
+
 - **ADR-0040 — The write boundary: source and manifest are the data, the
   arena is a cache** (`docs/adr/0040-the-write-boundary.md`, review bead
   `ley-line-open-e79c0f`). One SQLite arena was serving two products, a

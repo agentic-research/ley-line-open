@@ -10,34 +10,38 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
-### Fixed
+## [0.20.2] — 2026-10-11
 
-- **The mount tests mount what the daemon mounts, and an NFS unmount
-  commits the last write** (bead `ley-line-open-a384f4`). On macOS
-  `mount_round_trip` mounted over FUSE through fuse-t, which the daemon does
-  not use there (its macOS default is our NFS server), so the shipped macOS
-  mount went untested by it and every flake it had was fuse-t's: each
-  fuse-t server listened on port 52100 and outlived its unmount by seconds,
-  and the next mount collided with it. The tests now mount through
-  `cmd_serve::mount_backend` on `default_backend()` with an ephemeral NFS
-  port; the fuse-t process handling (pid scans, orphan reaping) is gone, and
-  the wedge falsifier wedges an in-process graph instead of SIGSTOPping a
-  fuse-t server. `serve_nfs` now returns an `NfsServer` that the mount
-  guard owns: dropping the guard unmounts, then stops the server and
-  commits its staged writes before returning. Before, the server task was
-  detached, so a write in its last 200 ms idle window was not in the
-  daemon's final snapshot.
+Patch release: the first rungs of ADR-0040 (the write boundary), a security
+fix to the mount, and the defects found by running the built binary end to
+end. The projection stays `projection-v6`, the wire stays v1, and the
+control block stays VERSION 3. `SCHEMA_VERSION` moves to 0.20.2 because
+`Head` gains two additive fields; the matching
+`clients/go/leyline-schema/v0.20.2` tag is published with this release.
 
-- **A macOS mount reports a source file's own mtime** (bead
-  `ley-line-open-ca51fa`'s NFS half, found by the test above on its first
-  NFS run). The NFS server reported the current time for every directory,
-  so `stat` on a source file's entry never showed the file's mtime on
-  macOS; FUSE was fixed and NFS never was. It reports the current time only
-  for directories whose stored mtime does not move with their entries (the
-  root and structural directories, whose cached listings an NFSv3 client
-  would otherwise reuse), and the stored mtime for the rest. The new
-  `Graph::mtime_tracks_entries` says which: in the SQL projection, every
-  node of a parsed file (nid >= 0).
+- **Identity (D1).** `Head.treeRoot` and `Head.parserId` name the parsed
+  tree and the derivation that produced it, independent of run, directory
+  and mtime; `leyline verify-head` recomputes both.
+- **One write path (D3).** Every write — `leyline splice`, the daemon's
+  mount, `leyline serve`'s mount — stores the bytes in `source_blobs` and
+  re-projects the file exactly as a cold parse would. BREAKING for library
+  callers: the `leyline_ts::splice` re-projection functions are removed.
+- **Rebuild (D6).** The arena records `_meta.derived_from`, and
+  `leyline rebuild` reproduces an arena from `source_blobs` alone.
+- **Mount.** The daemon's mount reads and writes `live.db` directly (D4),
+  holds its mount while serving and releases it on exit, commits an NFS
+  write once, whole, and — SECURITY — listens for NFS on loopback only
+  (it listened on `0.0.0.0`, unauthenticated and writable). Unmounting
+  commits the last NFS write, a macOS mount reports a source file's own
+  mtime, and the mount tests mount the daemon's own backend (our NFS
+  server on macOS, not fuse-t).
+- **Daemon.** SIGTERM shuts it down gracefully; the `query` op returns
+  integers, reals, NULLs and blobs instead of `""`; an over-long socket
+  path is an error instead of a panic.
+- **SECURITY:** rustls 0.23.45 (GHSA-2mjx-qc3c-rqvc).
+- **Release and CI.** The built binary is smoked end to end in every
+  `task ci` and before every tag; CI's compiler cache now hits (0.1% →
+  100% Rust hits, about 21 → 10 minutes).
 
 ### Added
 
@@ -166,6 +170,33 @@ context, scoping notes, and review history are recoverable.
   were two full rebuilds of `leyline-cli-lib`.
 
 ### Fixed
+
+- **The mount tests mount what the daemon mounts, and an NFS unmount
+  commits the last write** (bead `ley-line-open-a384f4`). On macOS
+  `mount_round_trip` mounted over FUSE through fuse-t, which the daemon does
+  not use there (its macOS default is our NFS server), so the shipped macOS
+  mount went untested by it and every flake it had was fuse-t's: each
+  fuse-t server listened on port 52100 and outlived its unmount by seconds,
+  and the next mount collided with it. The tests now mount through
+  `cmd_serve::mount_backend` on `default_backend()` with an ephemeral NFS
+  port; the fuse-t process handling (pid scans, orphan reaping) is gone, and
+  the wedge falsifier wedges an in-process graph instead of SIGSTOPping a
+  fuse-t server. `serve_nfs` now returns an `NfsServer` that the mount
+  guard owns: dropping the guard unmounts, then stops the server and
+  commits its staged writes before returning. Before, the server task was
+  detached, so a write in its last 200 ms idle window was not in the
+  daemon's final snapshot.
+
+- **A macOS mount reports a source file's own mtime** (bead
+  `ley-line-open-ca51fa`'s NFS half, found by the test above on its first
+  NFS run). The NFS server reported the current time for every directory,
+  so `stat` on a source file's entry never showed the file's mtime on
+  macOS; FUSE was fixed and NFS never was. It reports the current time only
+  for directories whose stored mtime does not move with their entries (the
+  root and structural directories, whose cached listings an NFSv3 client
+  would otherwise reuse), and the stored mtime for the rest. The new
+  `Graph::mtime_tracks_entries` says which: in the SQL projection, every
+  node of a parsed file (nid >= 0).
 
 - **SECURITY: rustls 0.23.40 → 0.23.45** (bead `ley-line-open-4108fe`,
   GHSA-2mjx-qc3c-rqvc, Dependabot alert #3). Versions from 0.23.13 up to

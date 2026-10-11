@@ -339,6 +339,33 @@ impl SqliteGraphAdapter {
         self.default_language = Some(lang);
     }
 
+    /// The language a write to `id` (at `nid`) is validated against on its
+    /// own, if any. A node of a parsed file — its nid in the range of a file
+    /// with a `_source` row — has none: it is a fragment, and the write path
+    /// validates the whole spliced file when it lands (ADR-0040 D3). Parsing
+    /// the fragment alone as a file refused legitimate edits (a Go package
+    /// name is not a Go file).
+    #[cfg(feature = "validate")]
+    fn standalone_language(
+        &self,
+        conn: &Connection,
+        id: &str,
+        nid: i64,
+    ) -> Option<tree_sitter::Language> {
+        let in_parsed_file = leyline_schema::nid_file_id(nid).is_some_and(|file_id| {
+            conn.query_row(
+                "SELECT 1 FROM _source WHERE file_id = ?1",
+                [file_id],
+                |_| Ok(()),
+            )
+            .is_ok()
+        });
+        if in_parsed_file {
+            return None;
+        }
+        crate::validate::language_for_node(id, self.default_language.as_ref())
+    }
+
     /// Create a writable adapter from raw bytes (for FUSE write-back).
     pub fn new_writable(data: &[u8]) -> Result<Self> {
         let graph = SqliteGraph::from_bytes_writable(data)?;
@@ -566,7 +593,7 @@ impl SqliteGraphAdapter {
             // Flash-clear pattern: always clear stale error first, then validate.
             #[cfg(feature = "validate")]
             {
-                let lang = crate::validate::language_for_node(id, self.default_language.as_ref());
+                let lang = self.standalone_language(guard.conn(), id, nid);
                 if let Some(lang) = lang {
                     // Flash clear: remove any previous error for this node
                     guard
@@ -1028,7 +1055,7 @@ impl Graph for SqliteGraphAdapter {
             // Save shadow copy before truncating (for validation rollback)
             #[cfg(feature = "validate")]
             {
-                let lang = crate::validate::language_for_node(id, self.default_language.as_ref());
+                let lang = self.standalone_language(conn, id, nid);
                 if lang.is_some() {
                     let old_content: Option<String> = conn
                         .query_row("SELECT record FROM nodes WHERE nid = ?1", [nid], |row| {
@@ -2650,6 +2677,54 @@ mod tests {
             "extensionless file should be validated via fallback"
         );
 
+        Ok(())
+    }
+
+    /// The first leaf under `id` whose content is `token`.
+    #[cfg(feature = "validate")]
+    fn leaf_holding(adapter: &SqliteGraphAdapter, id: &str, token: &[u8]) -> Option<String> {
+        for child in adapter.list_children(id).ok()? {
+            if child.is_dir {
+                if let Some(found) = leaf_holding(adapter, &child.id, token) {
+                    return Some(found);
+                }
+            } else {
+                let mut buf = vec![0u8; token.len() + 1];
+                if adapter.read_content(&child.id, &mut buf, 0).ok()? == token.len()
+                    && buf.starts_with(token)
+                {
+                    return Some(child.id);
+                }
+            }
+        }
+        None
+    }
+
+    /// A node of a parsed file is a fragment of that file, not a file: the
+    /// write path validates the whole spliced file (ADR-0040 D3), so the
+    /// fallback language does not validate the fragment alone. Before, with
+    /// a default language set (the daemon's `--language go`), a token write
+    /// was parsed as a whole Go file and refused — `util`, a Go package
+    /// name, is not a Go file. A JSON file stands in for the parsed file
+    /// (this crate's parser carries no Go grammar); its token `2` is no more
+    /// a Go file than `util` is. A standalone record
+    /// (`functions/main/source` above) still validates.
+    #[cfg(feature = "validate")]
+    #[test]
+    fn a_token_of_a_parsed_file_is_not_validated_alone() -> Result<()> {
+        let db_bytes = leyline_ts::parse_with_source(
+            b"{\"a\": 1}\n",
+            leyline_ts::languages::TsLanguage::Json,
+            "x.json",
+        )?;
+        let mut adapter = SqliteGraphAdapter::new_writable(&db_bytes)?;
+        adapter.set_default_language(tree_sitter_go::LANGUAGE.into());
+        let leaf = leaf_holding(&adapter, "x.json", b"1").expect("the number's leaf");
+
+        adapter.write_content(&leaf, b"2", 0)?;
+        let mut buf = [0u8; 4];
+        let n = adapter.read_content(&leaf, &mut buf, 0)?;
+        assert_eq!(&buf[..n], b"2");
         Ok(())
     }
 

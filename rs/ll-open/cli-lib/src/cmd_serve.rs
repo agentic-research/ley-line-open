@@ -215,7 +215,8 @@ impl ShutdownSignals {
             use tokio::signal::unix::{SignalKind, signal};
             Ok(Self {
                 interrupt: signal(SignalKind::interrupt()).context("install the SIGINT handler")?,
-                terminate: signal(SignalKind::terminate()).context("install the SIGTERM handler")?,
+                terminate: signal(SignalKind::terminate())
+                    .context("install the SIGTERM handler")?,
             })
         }
         #[cfg(not(unix))]

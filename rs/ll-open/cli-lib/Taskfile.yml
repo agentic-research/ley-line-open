@@ -3,7 +3,7 @@ version: '3'
 # Crate-scoped tasks for `leyline-cli-lib`.
 #
 # Included by the root Taskfile under the `cli-lib:` namespace, so these run as
-# `task cli-lib:test:vec`. Tasks belong beside the crate they exercise; the root
+# `task cli-lib:test:search`. Tasks belong beside the crate they exercise; the root
 # Taskfile carries only repo-wide orchestration.
 #
 # `dir:` is set per task rather than at file level because these shell out to
@@ -31,17 +31,18 @@ tasks:
     cmds:
       - tools/test_fixture_hooks.sh --rust
 
-  test:vec:
-    desc: Tests for the `vec` feature (sqlite-vec + fastembed) — ships in install:full
+  # One run for both search features (bead ley-line-open-0988f0). They were
+  # two tasks, each a full rebuild of cli-lib under its own feature set
+  # (145 s + 53 s of compile in CI run 38162088279). Nothing in the tree is
+  # gated on either being ABSENT (no `not(feature = "vec")` or
+  # `not(feature = "text-search")`), `install:full` ships them together, and
+  # the coverage half of tools/check_feature_reachability.sh splits
+  # `--features` on commas, so both still count as tested.
+  test:search:
+    desc: Tests for the `vec` (sqlite-vec + fastembed) and `text-search` features together, as install:full ships them
     dir: '{{.TASKFILE_DIR}}/../..'
     cmds:
-      - cargo test -p leyline-cli-lib --features vec
-
-  test:text-search:
-    desc: Tests for the `text-search` feature (witchcraft) — ships in install:full
-    dir: '{{.TASKFILE_DIR}}/../..'
-    cmds:
-      - cargo test -p leyline-cli-lib --features text-search
+      - cargo test -p leyline-cli-lib --features vec,text-search
 
   test:mount:
     desc: |

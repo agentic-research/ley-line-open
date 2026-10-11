@@ -191,6 +191,61 @@ pub fn tree_root(conn: &Connection, parser_id: Hash) -> Result<Hash> {
     Ok(tree_root_of(&source_leaves(conn)?, parser_id))
 }
 
+/// The `_meta` key [`DerivedFrom`] is stored under.
+pub const DERIVED_FROM_KEY: &str = "derived_from";
+
+/// ADR-0040 D6: what an arena's projection was derived from. Every parse
+/// stamps it into `_meta` beside the head; a consumer that trusts a
+/// transported arena compares it to the `treeRoot` it holds, and `leyline
+/// rebuild` reproduces the projection from it.
+///
+/// Stored as one `_meta` value, `<treeRoot hex> <parserId hex>
+/// <projection_schema_version>`, so the three fields are never read from
+/// different parses.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DerivedFrom {
+    pub tree_root: Hash,
+    pub parser_id: Hash,
+    pub projection_schema_version: String,
+}
+
+impl DerivedFrom {
+    pub fn to_meta(&self) -> String {
+        format!(
+            "{} {} {}",
+            self.tree_root, self.parser_id, self.projection_schema_version
+        )
+    }
+
+    pub fn from_meta(value: &str) -> Result<Self> {
+        let fields: Vec<&str> = value.split(' ').collect();
+        let [tree_root, parser_id, projection_schema_version] = fields[..] else {
+            bail!("_meta.{DERIVED_FROM_KEY} {value:?} is not three space-separated fields");
+        };
+        let hash = |name: &str, hex_str: &str| -> Result<Hash> {
+            let bytes: [u8; 32] = hex::decode(hex_str)
+                .ok()
+                .and_then(|b| b.try_into().ok())
+                .with_context(|| {
+                    format!("_meta.{DERIVED_FROM_KEY} {name} {hex_str:?} is not 32 hex bytes")
+                })?;
+            Ok(Hash::from_bytes(bytes))
+        };
+        Ok(Self {
+            tree_root: hash("treeRoot", tree_root)?,
+            parser_id: hash("parserId", parser_id)?,
+            projection_schema_version: projection_schema_version.to_string(),
+        })
+    }
+
+    /// The arena's stamp, or `None` for an arena parsed before ADR-0040 D6.
+    pub fn read(conn: &Connection) -> Result<Option<Self>> {
+        leyline_ts::schema::get_meta(conn, DERIVED_FROM_KEY)?
+            .map(|v| Self::from_meta(&v))
+            .transpose()
+    }
+}
+
 /// What `verify` found.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Verification {

@@ -10,6 +10,20 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`task release:publish` waits out the release run without exhausting
+  the GitHub API quota** (bead `ley-line-open-b53aec`). It watched the run
+  with `gh run watch`, which re-fetches every job each 3 s; publishing
+  v0.20.3 hit `HTTP 403: API rate limit exceeded` while the release run was
+  still building, so the task failed on a release that then succeeded. It
+  now asks for the run's status once per `RELEASE_POLL_SECONDS` (30 s),
+  retries a failed query (`RELEASE_RETRY_ATTEMPTS`, 5, at
+  `RELEASE_RETRY_DELAY_SECONDS`, 60 s), fails on any conclusion but
+  success, and gives up after `RELEASE_MAX_POLLS` (120). `tools/tag_release.sh`
+  now says why it refuses a checkout other than `main` instead of exiting 1
+  silently.
+
 ## [0.20.3] — 2026-10-12
 
 Patch release: a write through an NFS mount is in the stored source when

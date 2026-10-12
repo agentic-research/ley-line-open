@@ -11,13 +11,14 @@
 //! projection's tree. A source file is a DIRECTORY whose children are its
 //! syntax nodes (`util.go/package_clause/…`); the leaves are regular files
 //! whose bytes are the token text in `nodes.record`. There is no entry that
-//! serves a source file's whole bytes — FUSE reports the file row as a
-//! directory of size 4096 (`fuse.rs::node_to_attr`), so `nodes.size` on that
-//! row is unobservable through the mount and only its mtime reaches `stat`.
+//! serves a source file's whole bytes — the file row is presented as a
+//! directory, so `nodes.size` on that row is unobservable through the mount
+//! and only its mtime reaches `stat`.
 //!
-//! This test parses a fixture, mounts it over FUSE the way the daemon does
-//! (`SqliteGraphAdapter` under `Arc<dyn Graph>` handed to `mount_fuse`), and
-//! asserts what the kernel hands back:
+//! This test parses a fixture and mounts it exactly as the daemon does:
+//! `cmd_serve::mount_backend` on the platform's default backend — our NFS
+//! server under the kernel's `mount_nfs` on macOS, FUSE on Linux. It asserts
+//! what the kernel hands back:
 //!
 //!   1. the bytes of a leaf read through the mount equal the graph's own
 //!      `read_content` for that node AND equal the token in the source;
@@ -25,22 +26,29 @@
 //!      file's filesystem mtime — ca51fa's observable half. Reverting #381's
 //!      `cmd_parse.rs` stamp (`mtime: now()`) fails this.
 //!
+//! On macOS these tests mounted over FUSE through fuse-t, a backend the
+//! daemon does not use there, and every flake they had was fuse-t's: its
+//! per-mount server always listened on port 52100 and outlived the unmount
+//! by seconds, so the next mount collided with it (bead
+//! ley-line-open-a384f4). The shipped macOS mount went untested by them.
+//!
 //! The fixture's mtime is pinned to a fixed past instant so that a writer
 //! stamping "now" cannot pass by sharing the second. There is no skip path:
-//! a runner without FUSE fails, because a gate that silently passes where it
-//! cannot run is the vacuous pass the feature-reachability gate exists to
-//! prevent.
+//! a runner that cannot mount fails, because a gate that silently passes
+//! where it cannot run is the vacuous pass the feature-reachability gate
+//! exists to prevent.
 
 #![cfg(feature = "mount")]
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use leyline_fs::graph::{Graph, SqliteGraphAdapter};
+use leyline_cli_lib::cmd_serve::{Mounted, default_backend, mount_backend};
+use leyline_fs::graph::{Graph, Node, SqliteGraphAdapter};
 use tempfile::TempDir;
 
 mod common;
@@ -72,9 +80,9 @@ fn create_fixture() -> TempDir {
     dir
 }
 
-/// Parse `src` into a projection and hand it back as the graph the daemon
-/// mounts: a writable adapter over the serialized SQLite image.
-fn projection_graph(src: &Path) -> Arc<dyn Graph> {
+/// Parse `src` into a projection and hand it back as a graph to mount: a
+/// writable adapter over the serialized SQLite image.
+fn projection_graph(src: &Path) -> SqliteGraphAdapter {
     let conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
     leyline_cli_lib::cmd_parse::parse_into_conn(&conn, src, Some("go"), None)
         .expect("cold parse fixture");
@@ -82,7 +90,7 @@ fn projection_graph(src: &Path) -> Arc<dyn Graph> {
     let mut adapter =
         SqliteGraphAdapter::new_writable(image.as_ref()).expect("graph from projection image");
     adapter.set_source_writer(mount_writer());
-    Arc::new(adapter)
+    adapter
 }
 
 /// The one write path (ADR-0040 D3), as the daemon and `serve` install it.
@@ -92,8 +100,8 @@ fn mount_writer() -> Arc<dyn leyline_fs::graph::SourceWriter> {
     })
 }
 
-/// How long the mount may take to start serving once `mount_fuse` returns
-/// (the attach is asynchronous on fuse-t).
+/// How long the mount may take to appear in the mount table once
+/// `mount_backend` returns (a FUSE attach is asynchronous).
 const ATTACH_DEADLINE: Duration = Duration::from_secs(10);
 
 /// How long ONE kernel-facing call may block before the mount is declared
@@ -103,11 +111,17 @@ const ATTACH_DEADLINE: Duration = Duration::from_secs(10);
 /// outside the call (bead ley-line-open-667b3b).
 const KERNEL_OP_DEADLINE: Duration = Duration::from_secs(30);
 
+/// How long a write through the mount may take to reach `live.db`. The NFS
+/// server commits a write once writes have been quiet for `COMMIT_IDLE`
+/// (200 ms), because nfsserve gives it no COMMIT to commit on (bead
+/// ley-line-open-3c4893); FUSE commits on the fsync itself.
+const COMMIT_DEADLINE: Duration = Duration::from_secs(10);
+
 /// Run a kernel-facing filesystem call on its own thread and wait for it
-/// with a deadline. On timeout the mount is torn down (its server killed,
-/// the mountpoint force-unmounted) and the test fails with a diagnosis
-/// naming the mount and the server, instead of hanging `task ci` until
-/// someone notices. The blocked thread is released by the unmount.
+/// with a deadline. On timeout the mountpoint is force-unmounted and the
+/// test fails with a diagnosis naming the mount, instead of hanging
+/// `task ci` until someone notices. The blocked thread is released by the
+/// unmount.
 fn with_kernel_deadline<T: Send + 'static>(
     what: &str,
     mount: &Path,
@@ -126,43 +140,20 @@ fn with_kernel_deadline<T: Send + 'static>(
                 .expect_err("a call that sent nothing and ended has panicked"),
         ),
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            let diagnosis = teardown_mount(mount);
+            let diagnosis = force_unmount(mount);
             panic!(
                 "{what} on the mount at {} did not return within {KERNEL_OP_DEADLINE:?}: \
-                 the FUSE mount is wedged. {diagnosis}",
+                 the mount is wedged. {diagnosis}",
                 mount.display()
             );
         }
     }
 }
 
-/// fuse-t serves each mount through a `go-nfsv4 <mountpoint>` process; its
-/// pids, if any, by exact mountpoint match.
-fn fuse_server_pids(mount: &Path) -> Vec<u32> {
-    let pattern = format!("go-nfsv4 {}", mount.display());
-    Command::new("pgrep")
-        .args(["-f", &pattern])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter_map(|l| l.trim().parse().ok())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Kill the mount's server and force-unmount the mountpoint, so a failed
-/// or killed run leaves nothing for the next run to trip on. Returns a
-/// diagnosis line for the failure message. Idempotent: nothing to kill and
+/// Force-unmount the mountpoint, so a failed or wedged run leaves nothing
+/// mounted. Returns a diagnosis line for the failure message. Idempotent:
 /// nothing mounted is a no-op.
-fn teardown_mount(mount: &Path) -> String {
-    let pids = fuse_server_pids(mount);
-    for pid in &pids {
-        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
-    }
+fn force_unmount(mount: &Path) -> String {
     let unmount = if cfg!(target_os = "macos") {
         Command::new("umount")
             .args(["-f", &mount.display().to_string()])
@@ -173,7 +164,7 @@ fn teardown_mount(mount: &Path) -> String {
             .output()
     };
     let unmount = match unmount {
-        Ok(o) if o.status.success() => "unmounted".to_string(),
+        Ok(o) if o.status.success() => "force-unmounted".to_string(),
         Ok(o) => format!(
             "unmount exited {}: {}",
             o.status,
@@ -181,10 +172,7 @@ fn teardown_mount(mount: &Path) -> String {
         ),
         Err(e) => format!("unmount could not run: {e}"),
     };
-    format!(
-        "mountpoint {}; fuse-t server pid(s) {pids:?} killed; {unmount}.",
-        mount.display()
-    )
+    format!("mountpoint {}: {unmount}.", mount.display())
 }
 
 /// Whether the kernel's mount table names `mount` (canonical path) as a
@@ -218,15 +206,12 @@ fn is_mounted(mount: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Wait until `mount` is attached. `mount_fuse` returns before the attach
-/// completes on fuse-t (it is asynchronous). This used to be found by
-/// spinning `read(2)` on a path under the mount until it succeeded — a
-/// lookup storm against the mountpoint for the whole attach, which on
-/// fuse-t intermittently left the path failing with EIO for the rest of the
-/// test (bead ley-line-open-e5c8be). Now the mount table is polled instead
-/// (hf-mount's readiness check), yielding between polls, never sleeping
-/// (`sleep_in_tests`). `mount` must be canonical: the table holds the
-/// resolved path (`/private/var/...` on macOS).
+/// Wait until `mount` is in the mount table, polling the table (hf-mount's
+/// readiness check) rather than the filesystem, yielding between polls and
+/// never sleeping (`sleep_in_tests`). `mount_nfs` returns attached; a FUSE
+/// attach completes after `mount_backend` returns. `mount` must be
+/// canonical: the table holds the resolved path (`/private/var/...` on
+/// macOS).
 fn wait_until_mounted(mount: &Path) {
     let m = mount.to_path_buf();
     with_kernel_deadline("mount-table poll", mount, move || {
@@ -267,162 +252,55 @@ fn init_log() {
     }
 }
 
-/// Whether `pid` is still running. libfuse-t spawns each mount's fuse-t
-/// server as a child of this process and never reaps it, so an exited
-/// server stays a zombie that `kill(pid, 0)` still finds: reap our own
-/// children with `waitpid(WNOHANG)`, and probe anyone else's with
-/// `kill(pid, 0)`.
-fn alive(pid: u32) -> bool {
-    let pid = pid as libc::pid_t;
-    let mut status = 0;
-    // SAFETY: waitpid with WNOHANG only reaps `pid` if it is our exited
-    // child; `status` is a valid out-pointer.
-    match unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } {
-        0 => true,
-        r if r == pid => false,
-        // Not our child (ECHILD): ask whether it exists at all.
-        // SAFETY: kill(2) with signal 0 only checks existence.
-        _ => unsafe { libc::kill(pid, 0) == 0 },
-    }
-}
-
-/// Wait until every pid in `pids` has exited, polling with `kill(pid, 0)`
-/// and yielding between polls. Past `ATTACH_DEADLINE` the survivors are
-/// killed and the wait fails, naming `what`.
-fn wait_for_exit(pids: &[u32], what: &str) {
-    let deadline = Instant::now() + ATTACH_DEADLINE;
-    while pids.iter().any(|&p| alive(p)) {
-        if Instant::now() >= deadline {
-            let left: Vec<u32> = pids.iter().copied().filter(|&p| alive(p)).collect();
-            for pid in &left {
-                let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
-            }
-            let msg = format!("{what} {left:?} still running after {ATTACH_DEADLINE:?}; killed");
-            if std::thread::panicking() {
-                eprintln!("mount_round_trip: {msg}");
-                return;
-            }
-            panic!("{msg}");
-        }
-        std::thread::yield_now();
-    }
-}
-
-/// fuse-t servers left by an earlier run of these tests: orphaned (their
-/// mounting process is gone, so they were re-parented to pid 1) and serving
-/// a `TempDir` mountpoint under the system temp dir. Nothing else's servers
-/// match, so a developer's own fuse-t mounts are never touched.
-fn stale_test_servers() -> Vec<u32> {
-    let tmp = std::env::temp_dir()
-        .canonicalize()
-        .unwrap_or_else(|_| std::env::temp_dir());
-    let prefix = format!("go-nfsv4 {}/.tmp", tmp.display());
-    let pids: Vec<u32> = Command::new("pgrep")
-        .args(["-f", &prefix])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter_map(|l| l.trim().parse().ok())
-                .collect()
-        })
-        .unwrap_or_default();
-    pids.into_iter()
-        .filter(|pid| {
-            Command::new("ps")
-                .args(["-o", "ppid=", "-p", &pid.to_string()])
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
-                .unwrap_or(false)
-        })
-        .collect()
-}
-
-/// SIGKILL each pid, then wait until each has exited (reaping our own).
-fn stop_servers(pids: &[u32], what: &str) {
-    for &pid in pids {
-        // SAFETY: kill(2) on a fuse-t server pid this test owns or has
-        // identified as a stale test server; no memory is involved.
-        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-    }
-    wait_for_exit(pids, what);
-}
-
-/// A FUSE mount made by a test, attached before it is returned.
-///
-/// fuse-t serves each mount through its own `go-nfsv4` server, and every
-/// such server listens on 127.0.0.1:52100 unless that is taken (then 52101).
-/// A mount made while an earlier 52100 server is still exiting — the one
-/// that served the previous test, or the previous run, whose process has
-/// just ended — reuses the address and port of a server that is dying, and
-/// fuse-t's log showed that mount failing every time: reads returned EIO and
-/// the server closed the FUSE channel under the session ("Short read of
-/// FUSE request header (0 < 40)"). A failed run made it worse: its server,
-/// killed at the deadline, failed the next run too. That was the macOS
-/// mount-test flake (bead ley-line-open-e5c8be). fuse-t 1.2.1 cannot be
-/// given another port: its `listen_addr` option moves the server but not
-/// the port the kernel is told to mount. And a server does not exit when
-/// its mount is unmounted: it lives until its mounting process exits, then
-/// takes seconds more to go, so one run's servers were still exiting as the
-/// next run's mounts came up. So a `TestMount` stops its own server once its
-/// session has unmounted (it serves nothing by then), and before mounting
-/// clears any stale server an earlier, crashed run left behind
-/// ([`stale_test_servers`]). On a panic it first tears the mount down
-/// (kills the server, force-unmounts), so a failed assertion cannot strand
-/// a mount and its server.
-struct TestMount<S> {
-    session: Option<S>,
-    servers: Vec<u32>,
+/// A mount made by a test the way the daemon makes one, attached before it
+/// is returned. Unmounting drops the daemon's own guard ([`Mounted`]); on a
+/// panic the mountpoint is first force-unmounted, so a failed assertion
+/// cannot strand a mount.
+struct TestMount {
+    mounted: Option<Mounted>,
     path: PathBuf,
     _dir: TempDir,
 }
 
-impl TestMount<()> {
-    fn new(graph: Arc<dyn Graph>) -> TestMount<impl Sized> {
+impl TestMount {
+    async fn new(graph: Arc<dyn Graph>) -> TestMount {
         init_log();
-        stop_servers(&stale_test_servers(), "stale fuse-t test server(s)");
         let dir = TempDir::new().expect("create mountpoint");
         let path = dir.path().canonicalize().expect("canonical mountpoint");
-        let session = leyline_fs::fuse::mount_fuse(graph, &path).expect("mount over FUSE");
+        // Port 0: the NFS server takes a free port, so no mount can collide
+        // with another's server.
+        let mounted = mount_backend(graph, &path, &default_backend(), 0)
+            .await
+            .unwrap_or_else(|e| panic!("mount on {}: {e:#}", default_backend()));
         wait_until_mounted(&path);
         TestMount {
-            session: Some(session),
-            servers: fuse_server_pids(&path),
+            mounted: Some(mounted),
             path,
             _dir: dir,
         }
     }
-}
 
-impl<S> TestMount<S> {
     fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Unmount (the session's drop), then stop the mount's fuse-t server,
-    /// which would otherwise outlive the mount until this process exits.
+    /// Unmount through the daemon's guard.
     fn unmount(&mut self) {
-        if let Some(session) = self.session.take() {
-            drop(session);
-            stop_servers(&std::mem::take(&mut self.servers), "fuse-t server");
-        }
+        drop(self.mounted.take());
     }
 }
 
-impl<S> Drop for TestMount<S> {
+impl Drop for TestMount {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            let diagnosis = teardown_mount(&self.path);
+            let diagnosis = force_unmount(&self.path);
             eprintln!("mount_round_trip: cleaned up after a failure: {diagnosis}");
         }
         self.unmount();
     }
 }
 
-/// Read `rel` through an attached mount (see [`wait_until_mounted`]), once,
-/// under the kernel deadline.
+/// Read `rel` through an attached mount, once, under the kernel deadline.
 fn read_through_mount(mount: &Path, rel: &str) -> Vec<u8> {
     let path = mount.join(rel);
     with_kernel_deadline("read", mount, move || {
@@ -442,10 +320,10 @@ fn secs(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH).expect("post-epoch").as_secs()
 }
 
-#[test]
-fn a_mounted_projection_serves_its_leaves_and_stats_its_files() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mounted_projection_serves_its_leaves_and_stats_its_files() {
     let src = create_fixture();
-    let graph = projection_graph(src.path());
+    let graph: Arc<dyn Graph> = Arc::new(projection_graph(src.path()));
 
     // What the graph says the leaf holds — the daemon's `read_content` op
     // reads exactly this. The mount must agree with it byte for byte.
@@ -459,7 +337,7 @@ fn a_mounted_projection_serves_its_leaves_and_stats_its_files() {
         "read_content on {LEAF} must return the source token"
     );
 
-    let mounted = TestMount::new(graph);
+    let mounted = TestMount::new(graph).await;
     let mount = mounted.path().to_path_buf();
 
     // 1. Bytes through the kernel.
@@ -496,7 +374,7 @@ fn a_mounted_projection_serves_its_leaves_and_stats_its_files() {
 }
 
 /// Write `data` to `rel` through the mount (truncate, write, fsync), under
-/// the kernel deadline. The fsync is what makes the mount publish.
+/// the kernel deadline.
 fn write_through_mount(mount: &Path, rel: &str, data: &'static [u8]) {
     let path = mount.join(rel);
     with_kernel_deadline("write", mount, move || {
@@ -557,7 +435,7 @@ async fn a_mount_write_survives_a_reparse_of_another_file_and_a_restart() {
     let mut adapter = SqliteGraphAdapter::live(source).expect("live-backed adapter");
     adapter.set_source_writer(mount_writer());
     let graph: Arc<dyn Graph> = Arc::new(adapter);
-    let mut mounted = TestMount::new(graph);
+    let mut mounted = TestMount::new(graph).await;
     let mount = mounted.path().to_path_buf();
     assert_eq!(
         read_through_mount(&mount, LEAF),
@@ -572,6 +450,24 @@ async fn a_mount_write_survives_a_reparse_of_another_file_and_a_restart() {
         EDITED,
         "the mount reads back its own write"
     );
+
+    // The write reaches the daemon's own readers once it commits.
+    let deadline = Instant::now() + COMMIT_DEADLINE;
+    loop {
+        let via_daemon = ctx
+            .with_read(|conn| Ok(leaf_record(conn)))
+            .expect("daemon read");
+        if via_daemon == EDITED {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the daemon's readers never saw the mount's write within \
+             {COMMIT_DEADLINE:?}; they read {:?}",
+            String::from_utf8_lossy(&via_daemon)
+        );
+        tokio::task::yield_now().await;
+    }
 
     // The daemon reparses a DIFFERENT file and republishes, which is exactly
     // the sequence that used to drop the edit.
@@ -598,7 +494,7 @@ async fn a_mount_write_survives_a_reparse_of_another_file_and_a_restart() {
         .expect("daemon read");
     assert_eq!(
         via_daemon, EDITED,
-        "the daemon's own readers see the mount's write"
+        "the daemon's readers still see the mount's write after the reparse"
     );
 
     // Restart: unmount, drop the daemon context, reopen live.db cold.
@@ -612,40 +508,65 @@ async fn a_mount_write_survives_a_reparse_of_another_file_and_a_restart() {
     );
 }
 
-/// The falsifier for the kernel deadline (bead ley-line-open-667b3b), run by
-/// hand on a fuse-t machine: `LEYLINE_MOUNT_WEDGE=1 cargo test -p
-/// leyline-cli-lib --features mount --test mount_round_trip -- --ignored
-/// --nocapture`. It mounts, stops the fuse-t server with SIGSTOP so every
-/// kernel call blocks, and asserts the read fails within the deadline with
-/// the diagnosis — and that afterwards nothing is mounted and no server is
-/// left. Without the deadline this test, like the gate, never finishes.
-#[test]
-#[ignore = "falsifier; needs fuse-t and LEYLINE_MOUNT_WEDGE=1"]
-fn a_wedged_mount_fails_within_the_deadline_and_cleans_up() {
+/// A graph that serves `inner` until it is wedged, then blocks every
+/// content read until it is released — a server that has stopped
+/// answering, in this process, on either backend.
+struct Wedge {
+    inner: SqliteGraphAdapter,
+    wedged: Mutex<bool>,
+    released: Condvar,
+}
+
+impl Wedge {
+    fn set(&self, wedged: bool) {
+        *self.wedged.lock().unwrap() = wedged;
+        self.released.notify_all();
+    }
+}
+
+impl Graph for Wedge {
+    fn get_node(&self, id: &str) -> anyhow::Result<Option<Node>> {
+        self.inner.get_node(id)
+    }
+    fn lookup_child(&self, parent_id: &str, name: &str) -> anyhow::Result<Option<Node>> {
+        self.inner.lookup_child(parent_id, name)
+    }
+    fn list_children(&self, parent_id: &str) -> anyhow::Result<Vec<Node>> {
+        self.inner.list_children(parent_id)
+    }
+    fn read_content(&self, id: &str, buf: &mut [u8], offset: u64) -> anyhow::Result<usize> {
+        let mut wedged = self.wedged.lock().unwrap();
+        while *wedged {
+            wedged = self.released.wait(wedged).unwrap();
+        }
+        drop(wedged);
+        self.inner.read_content(id, buf, offset)
+    }
+}
+
+/// The falsifier for the kernel deadline (bead ley-line-open-667b3b), run
+/// by hand: `LEYLINE_MOUNT_WEDGE=1 cargo test -p leyline-cli-lib --features
+/// mount --test mount_round_trip -- --ignored --nocapture`. It mounts,
+/// wedges the server so the kernel's read waits on it forever, and asserts
+/// the read fails within the deadline with the diagnosis — and that
+/// afterwards nothing is mounted. Without the deadline this test, like the
+/// gate, never finishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "falsifier; takes the full kernel deadline; needs LEYLINE_MOUNT_WEDGE=1"]
+async fn a_wedged_mount_fails_within_the_deadline_and_cleans_up() {
     if std::env::var_os("LEYLINE_MOUNT_WEDGE").is_none() {
         panic!("set LEYLINE_MOUNT_WEDGE=1 to run the wedge falsifier");
     }
     let src = create_fixture();
-    let graph = projection_graph(src.path());
-    // Attached before it is wedged.
-    let mounted = TestMount::new(graph);
+    let wedge = Arc::new(Wedge {
+        inner: projection_graph(src.path()),
+        wedged: Mutex::new(false),
+        released: Condvar::new(),
+    });
+    let mut mounted = TestMount::new(wedge.clone()).await;
     let mount = mounted.path().to_path_buf();
-    let _ = read_through_mount(&mount, LEAF);
-    let pids = fuse_server_pids(&mount);
-    assert!(
-        !pids.is_empty(),
-        "fuse-t server for {} not found",
-        mount.display()
-    );
-    for pid in &pids {
-        assert!(
-            Command::new("kill")
-                .args(["-STOP", &pid.to_string()])
-                .status()
-                .expect("kill -STOP")
-                .success()
-        );
-    }
+    // The leaf is not read before the wedge, so no client cache can answer.
+    wedge.set(true);
 
     let started = Instant::now();
     let outcome = std::panic::catch_unwind(|| read_through_mount(&mount, LEAF));
@@ -655,10 +576,10 @@ fn a_wedged_mount_fails_within_the_deadline_and_cleans_up() {
             .downcast_ref::<String>()
             .cloned()
             .unwrap_or_else(|| "<non-string panic>".to_string()),
-        Ok(bytes) => panic!("a wedged mount served {bytes:?}; the server was not stopped"),
+        Ok(bytes) => panic!("a wedged mount served {bytes:?}; the server was not wedged"),
     };
     assert!(
-        msg.contains("did not return within") && msg.contains("killed"),
+        msg.contains("did not return within") && msg.contains("force-unmounted"),
         "the failure must carry the diagnosis; got: {msg}"
     );
     assert!(
@@ -666,9 +587,11 @@ fn a_wedged_mount_fails_within_the_deadline_and_cleans_up() {
         "failed after {elapsed:?}, past the deadline"
     );
     assert!(
-        fuse_server_pids(&mount).is_empty(),
-        "the wedged server must be gone after teardown"
+        !is_mounted(&mount),
+        "the wedged mount must be gone after the teardown"
     );
-    // The session's Drop must return now that the mount is gone.
-    drop(mounted);
+    // Release the server's blocked read, then drop the guard: its unmount
+    // finds nothing mounted and the drop returns.
+    wedge.set(false);
+    mounted.unmount();
 }

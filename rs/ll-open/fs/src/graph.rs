@@ -2494,6 +2494,47 @@ mod tests {
         Ok(())
     }
 
+    /// Whose mtime moves with its entries (`mtime_tracks_entries`, which
+    /// decides what mtime NFS may report): in the projection a parsed
+    /// file's nodes do; a structural directory, the synthetic root and a
+    /// path that names nothing do not, and neither does a graph that does
+    /// not say (the default). The hot-swapping graph answers for the
+    /// adapter it is serving.
+    #[test]
+    fn only_a_parsed_files_nodes_have_mtimes_that_track_their_entries() -> Result<()> {
+        let adapter = writable_adapter()?;
+        assert!(
+            adapter.mtime_tracks_entries("docs/readme")?,
+            "a file's node"
+        );
+        assert!(!adapter.mtime_tracks_entries("docs")?, "a structural dir");
+        assert!(!adapter.mtime_tracks_entries("")?, "the root");
+        assert!(!adapter.mtime_tracks_entries("nope")?, "nothing");
+        assert!(!MemoryGraph::new().mtime_tracks_entries("docs/readme")?);
+
+        let dir = tempfile::tempdir()?;
+        let ctrl_path = dir.path().join("test.ctrl");
+        let arena_path = dir.path().join("test.arena");
+        let arena_size: u64 = 4096 + 131_072 * 2;
+        let source = Connection::open_in_memory()?;
+        create_schema(&source)?;
+        put_dir(&source, "docs", 1000)?;
+        put_file(&source, "docs/readme", 2000, Some("hello"))?;
+        let db_bytes = source.serialize("main")?;
+        let mut mmap = leyline_core::layout::create_arena(&arena_path, arena_size)?;
+        leyline_core::layout::write_to_arena(&mut mmap, db_bytes.as_ref())?;
+        let root: [u8; 32] = blake3::hash(db_bytes.as_ref()).into();
+        Controller::open_or_create(&ctrl_path)?.set_arena_with_root(
+            arena_path.to_str().unwrap(),
+            arena_size,
+            root,
+        )?;
+        let graph = HotSwapGraph::new(ctrl_path)?;
+        assert!(graph.mtime_tracks_entries("docs/readme")?, "a file's node");
+        assert!(!graph.mtime_tracks_entries("docs")?, "a structural dir");
+        Ok(())
+    }
+
     #[test]
     fn extra_columns_safe() -> Result<()> {
         // Mache's nodes table has `record_id TEXT` and `source_file TEXT` columns.

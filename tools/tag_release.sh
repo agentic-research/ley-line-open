@@ -20,7 +20,11 @@ cd "$repo_root"
 "$verify_version_bin" "$version" >&2
 "$git_bin" diff --quiet
 "$git_bin" diff --cached --quiet
-test "$("$git_bin" branch --show-current)" = "main"
+branch=$("$git_bin" branch --show-current)
+if [ "$branch" != "main" ]; then
+    echo "release tags are cut from a main checkout, not '${branch:-detached HEAD}'" >&2
+    exit 1
+fi
 
 "$git_bin" fetch origin main --tags
 head_commit=$("$git_bin" rev-parse HEAD)

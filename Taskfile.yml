@@ -5,7 +5,7 @@ version: '3'
 
 # Crate-scoped tasks live beside the crate they exercise; this file keeps only
 # repo-wide orchestration. Included tasks are namespaced by their key, so
-# `cli-lib:test:vec` runs the `test:vec` task in rs/ll-open/cli-lib/Taskfile.yml.
+# `cli-lib:test:search` runs the `test:search` task in rs/ll-open/cli-lib/Taskfile.yml.
 #
 # `tools/check_feature_reachability.sh` discovers ci-invoked `cargo test
 # --features` lines via `task --summary`, which follows these includes. It does
@@ -132,8 +132,14 @@ tasks:
         test -f .cargo/config.toml
         grep -q 'link-arg=-Wl,--threads=2' .cargo/config.toml
         grep -q 'task cache:sccache:install' .github/workflows/ci.yml
-        grep -q 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' .github/workflows/ci.yml
+        grep -q 'actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' .github/workflows/ci.yml
+        grep -q 'actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' .github/workflows/ci.yml
         grep -q 'path: .cache/sccache' .github/workflows/ci.yml
+        # The sccache entry must be refreshed per run, not frozen per lockfile
+        # (bead ley-line-open-0988f0): the save key carries the run id, and
+        # only push runs save.
+        grep -Eq "^          key: sccache-.*hashFiles\('rs/Cargo.lock'\) \}\}-\\$\{\{ github.run_id \}\}" .github/workflows/ci.yml
+        grep -q "github.event_name == 'push'" .github/workflows/ci.yml
         grep -Eq '^  SCCACHE_DIR: .*github\.workspace.*/\.cache/sccache$' .github/workflows/ci.yml
         grep -q 'task cache:sccache:stats' .github/workflows/ci.yml
         if grep -Eq 'run:.*cargo (build|test|clippy)' .github/workflows/ci.yml; then
@@ -432,6 +438,16 @@ tasks:
     cmds:
       - sh tools/test_mutants_diff.sh
 
+  index:clones:
+    desc: Report exact structural clones (functions sharing an _ast.node_hash) in rs/, ranked by lines x copies. OUT=<file> writes the report to a file (6e9f79)
+    cmds:
+      - sh tools/clone_index.sh {{if .OUT}}--out "{{.OUT}}"{{end}} rs
+
+  index:clones:fixture-test:
+    desc: Prove the clone index groups exact copies and leaves renamed and nested copies out (6e9f79)
+    cmds:
+      - sh tools/test_clone_index.sh
+
   schema:consumer-fixture-test:
     desc: Compile the Apache daemon/wire API from an external Go module
     cmds:
@@ -475,11 +491,21 @@ tasks:
         "{{.VERSION}}"
         "{{.EXPECTED_COMMIT}}"
 
+  # The local half of a release: the binary that ships (release profile,
+  # default features) must pass the end-to-end smoke before a tag exists.
+  # The mount passes run on every PR through `cli-lib:smoke:dev` in `ci`;
+  # release.yml smokes each native target again on its own runner.
+  release:smoke:
+    desc: Smoke the release CLI this tree builds, as it ships (default features)
+    cmds:
+      - task: cli-lib:smoke
+
   release:publish:
-    desc: Atomically tag, wait for release CI, and verify public vVERSION
+    desc: Smoke the CLI, then atomically tag, wait for release CI, and verify public vVERSION
     requires:
       vars: [VERSION]
     cmds:
+      - task: release:smoke
       - tools/release_publish.sh "{{.VERSION}}"
 
   check:all-features:
@@ -1553,23 +1579,30 @@ tasks:
       - task: lint:blake3
       - task: lint:architecture-vocabulary
       - task: lint:doc-claims
-      - task: lint:feature-reachability
       - task: lint:mutants-cfg-coverage
       - task: readme:version-check
       - task: schema:version-check
       - task: check
+      # After `check`, not among the compile-free lints above (bead
+      # ley-line-open-0988f0): it type-checks nine not-shipping feature
+      # configurations, and running first it built every dependency cold.
+      # Here it reuses the dependency metadata `check` just produced.
+      - task: lint:feature-reachability
       - task: clippy
       - task: smells
       - task: fs:build:static
       - task: fs:build:nfs-isolated
       - task: fs:test:cdc
       - task: cli-lib:test:cdc-activation
-      - task: cli-lib:test:vec
-      - task: cli-lib:test:text-search
+      - task: cli-lib:test:search
       - task: cli-lib:test:mount
+      - task: cli-lib:smoke:dev
       - task: tier:isolation
       - task: check:all-features
       - task: test
+      # After `test`: the fixture parses with the debug leyline binary that
+      # `test` has already built.
+      - task: index:clones:fixture-test
       - task: cli-lib:test:hostile-hooks
       - task: sign:host:build
       - task: sign:host:test

@@ -10,7 +10,51 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.20.2] — 2026-10-11
+
+Patch release: the first rungs of ADR-0040 (the write boundary), a security
+fix to the mount, and the defects found by running the built binary end to
+end. The projection stays `projection-v6`, the wire stays v1, and the
+control block stays VERSION 3. `SCHEMA_VERSION` moves to 0.20.2 because
+`Head` gains two additive fields; the matching
+`clients/go/leyline-schema/v0.20.2` tag is published with this release.
+
+- **Identity (D1).** `Head.treeRoot` and `Head.parserId` name the parsed
+  tree and the derivation that produced it, independent of run, directory
+  and mtime; `leyline verify-head` recomputes both.
+- **One write path (D3).** Every write — `leyline splice`, the daemon's
+  mount, `leyline serve`'s mount — stores the bytes in `source_blobs` and
+  re-projects the file exactly as a cold parse would. BREAKING for library
+  callers: the `leyline_ts::splice` re-projection functions are removed.
+- **Rebuild (D6).** The arena records `_meta.derived_from`, and
+  `leyline rebuild` reproduces an arena from `source_blobs` alone.
+- **Mount.** The daemon's mount reads and writes `live.db` directly (D4),
+  holds its mount while serving and releases it on exit, commits an NFS
+  write once, whole, and — SECURITY — listens for NFS on loopback only
+  (it listened on `0.0.0.0`, unauthenticated and writable). Unmounting
+  commits the last NFS write, a macOS mount reports a source file's own
+  mtime, and the mount tests mount the daemon's own backend (our NFS
+  server on macOS, not fuse-t).
+- **Daemon.** SIGTERM shuts it down gracefully; the `query` op returns
+  integers, reals, NULLs and blobs instead of `""`; an over-long socket
+  path is an error instead of a panic.
+- **SECURITY:** rustls 0.23.45 (GHSA-2mjx-qc3c-rqvc).
+- **Release and CI.** The built binary is smoked end to end in every
+  `task ci` and before every tag; CI's compiler cache now hits (0.1% →
+  100% Rust hits, about 21 → 10 minutes).
+
 ### Added
+
+- **`task index:clones` reports exact structural clones** (`tools/clone_index.sh`,
+  bead `ley-line-open-6e9f79`, tier 1). It parses `rs/` into a scratch arena
+  and groups every `function_item` by `_ast.node_hash`, so a group is a set of
+  functions that are the same tree token for token. A copy nested inside
+  another reported copy is not counted twice. Groups are ranked by lines x
+  copies; `OUT=<file>` writes the markdown report to a file. On this tree it
+  finds 44 groups of 6+ lines and 781 duplicated lines. Renamed copies
+  (tier 2) and the concept-to-sites map (tier 3) are not part of it.
+  `task index:clones:fixture-test` runs in `task ci` and proves an exact pair
+  groups while a renamed copy and a nested copy do not.
 
 - **ADR-0040 — The write boundary: source and manifest are the data, the
   arena is a cache** (`docs/adr/0040-the-write-boundary.md`, review bead
@@ -53,7 +97,203 @@ context, scoping notes, and review history are recoverable.
   state). Consumers pinned to `v0.18.1` keep working: the fields are
   additive and a `Head` without them reads as before.
 
+- **Release smoke: the built binary runs end to end before a tag** (bead
+  `ley-line-open-7c6b7e`). `tools/cli_smoke.sh` drives one `leyline` binary on
+  a two-language fixture: `--version`, `parse` (every source in
+  `source_blobs`, every `_ast` row hashed), `verify-head`, a `splice` that is
+  stored and restamps the head, a syntax-breaking `splice` that leaves the
+  database byte-identical, the over-long socket path error, the daemon's
+  `status`, `leyline_version` and `query` ops, and SIGTERM shutdown; with
+  `--mount`, a write through the mount that is stored, read back, and the
+  mount detaching on SIGTERM. Tasks `cli-lib:smoke`, `cli-lib:smoke:mount`
+  and `cli-lib:smoke:bin`. `cli-lib:smoke:dev` runs in `task ci` on every
+  PR: one debug build with `mount`, smoked headless and mounted (the smoke
+  takes about a second; the build is the cost). Root `release:smoke` smokes
+  the shipped release build and `release:publish` runs it before tagging;
+  `release.yml` smokes each natively built target and the release dry-run
+  smokes its build. Its first runs found the five defects below.
+
+||||||| 4ae0f3a
+- **`_meta.derived_from` and `leyline rebuild`: the arena says what it was
+  derived from, and is rebuilt from it** (ADR-0040 D6, bead
+  `ley-line-open-f31efd`). Every parse, including a scoped pass and a write
+  through the one write path, stamps `_meta.derived_from` as
+  `<treeRoot hex> <parserId hex> <projection_schema_version>`, the same
+  `treeRoot` and `parserId` the head carries. New command `leyline rebuild
+  <from.db> <into.db> [--path P]...` reads ring 0 alone (the `_source`
+  manifest and `source_blobs`, through the fail-closed `source_bytes`) and
+  projects it into a new arena through the cold parse, reading nothing from
+  disk; the source tree need not exist. It refuses an arena with no
+  `derived_from`, one whose `_source` set no longer folds to the stamped
+  `treeRoot`, one stamped with another `parserId` (a different derivation:
+  reparse the tree with this binary instead), a missing or mismatched blob,
+  a file that no longer parses, and a target that already exists. A whole
+  rebuild must land the stamped `treeRoot`; `--path` rebuilds a
+  sub-manifest. Arena-resident query overrides are carried, since they are
+  a `parserId` input. Tests close F3 as stated (cold parse, writes, rebuild
+  into a fresh arena: the logical row sets, `treeRoot` and `derived_from`
+  agree) and F5 (a sub-manifest rebuild matches the full arena's file images
+  modulo `file_id`). The gate found that `node_content.lang` and
+  `node_content.raw_kind` are not functions of `node_hash` (first writer
+  wins, and a write leaves the replaced value behind); they are excluded
+  from the gate by name and tracked as bead `ley-line-open-b5d354` for the
+  projection-v7 break.
+
+### Changed
+
+- **CI's compiler cache is refreshed every run and holds a whole `task ci`**
+  (bead `ley-line-open-0988f0`). In run 38162088279, test binaries ran for
+  about 2 of 26.7 minutes; the rest was compilation, and sccache hit 3 of
+  2,198 Rust compiles (0.1%). Two causes:
+  - **The cache was frozen.** Its key was one per `Cargo.lock`, and
+    `actions/cache` skips the save after an exact-key restore. CI only ran
+    on push to `main`, so PRs into `integration` restored the one `main`
+    entry ever written for the lockfile, which was saved after `test:perf`
+    and held mostly release-profile artifacts.
+  - **The cap was too small.** At `SCCACHE_CACHE_SIZE: 2G` the cache filled
+    mid-run and evicted the run's own artifacts.
+
+  Now ci.yml also runs on push to `integration`. Restore and save are
+  separate steps. Push runs save a fresh entry, keyed by run id and taken
+  before `test:perf`; PR runs restore the newest one without spending the
+  Actions cache budget. The cap is 6G. `lint:cache-contract` asserts the
+  per-run key and the push-only save.
+- **`lint:feature-reachability` type-checks instead of building.** Its
+  not-shipping rows now run `cargo check --lib --tests`, not
+  `cargo test --lib --no-run`, which still catches a break confined to
+  `#[cfg(test)]` (proven by planting one). The lint now runs after `check`
+  so it reuses that step's dependency metadata. It was the second-slowest
+  CI step (297 s).
+- **`cli-lib:test:vec` and `cli-lib:test:text-search` are one task**,
+  `cli-lib:test:search` (`--features vec,text-search`). Nothing is gated on
+  either feature being absent, and `install:full` ships them together. They
+  were two full rebuilds of `leyline-cli-lib`.
+
 ### Fixed
+
+- **The mount tests mount what the daemon mounts, and an NFS unmount
+  commits the last write** (bead `ley-line-open-a384f4`). On macOS
+  `mount_round_trip` mounted over FUSE through fuse-t, which the daemon does
+  not use there (its macOS default is our NFS server), so the shipped macOS
+  mount went untested by it and every flake it had was fuse-t's: each
+  fuse-t server listened on port 52100 and outlived its unmount by seconds,
+  and the next mount collided with it. The tests now mount through
+  `cmd_serve::mount_backend` on `default_backend()` with an ephemeral NFS
+  port; the fuse-t process handling (pid scans, orphan reaping) is gone, and
+  the wedge falsifier wedges an in-process graph instead of SIGSTOPping a
+  fuse-t server. `serve_nfs` now returns an `NfsServer` that the mount
+  guard owns: dropping the guard unmounts, then stops the server and
+  commits its staged writes before returning. Before, the server task was
+  detached, so a write in its last 200 ms idle window was not in the
+  daemon's final snapshot.
+
+- **A macOS mount reports a source file's own mtime** (bead
+  `ley-line-open-ca51fa`'s NFS half, found by the test above on its first
+  NFS run). The NFS server reported the current time for every directory,
+  so `stat` on a source file's entry never showed the file's mtime on
+  macOS; FUSE was fixed and NFS never was. It reports the current time only
+  for directories whose stored mtime does not move with their entries (the
+  root and structural directories, whose cached listings an NFSv3 client
+  would otherwise reuse), and the stored mtime for the rest. The new
+  `Graph::mtime_tracks_entries` says which: in the SQL projection, every
+  node of a parsed file (nid >= 0).
+
+- **SECURITY: rustls 0.23.40 → 0.23.45** (bead `ley-line-open-4108fe`,
+  GHSA-2mjx-qc3c-rqvc, Dependabot alert #3). Versions from 0.23.13 up to
+  0.23.45 accept TLS 1.3 handshake messages across encryption-level
+  boundaries. rustls is a transitive dependency; `rs/Cargo.lock` now pins the
+  patched release (and rustls-webpki 0.103.13 → 0.103.15 with it).
+
+||||||| 5f45ea3
+- **SECURITY: the NFS export listens on loopback only** (bead
+  `ley-line-open-95d08b`). `daemon --mount` and `serve` with the NFS backend
+  (the macOS default) listened on `0.0.0.0`, though the mount itself
+  connects to `127.0.0.1`. The export has no authentication, and since
+  ADR-0040 D3 a write through it reaches the arena, so any host that could
+  reach the port could read the projected tree and write to it. Both now
+  listen on `127.0.0.1` through one `cmd_serve::nfs_listen_addr`.
+
+- **`daemon --mount` keeps its mount while it serves and releases it on
+  exit** (bead `ley-line-open-8fbf58`). The daemon bound its FUSE session
+  inside the match arm that created it, so the session dropped — and
+  unmounted — as soon as the arm ended: on Linux, where FUSE is the default,
+  the mount served nothing past startup. On NFS nothing ever ran `umount`,
+  so the daemon and `serve` exited leaving the kernel holding a mount whose
+  server was gone, and any access to it hung. One `cmd_serve::mount_backend`
+  now mounts for both commands and returns a guard (the FUSE session, or an
+  NFS mount whose drop runs `umount`, then `umount -f`); the daemon holds it
+  until shutdown and drops it before the final snapshot.
+
+- **The daemon's `query` op answered every non-text value with `""`** (bead
+  `ley-line-open-7854b8`). Each column was read as a Rust `String` with the
+  error defaulted away, and only SQLite TEXT converts, so `SELECT count(*)`
+  returned `""`, and so did every integer, real, NULL and blob. Values are
+  now rendered by storage class as the wire text the schema (`values:
+  List(Text)`) and the protocol fixture (`SELECT 1` → `"1"`) declare:
+  integers and reals in decimal, text as itself, blobs as lowercase hex, and
+  NULL as JSON `null`, distinct from the empty string.
+
+- **SIGTERM now shuts the daemon and `serve` down gracefully** (bead
+  `ley-line-open-7a9498`). Only Ctrl+C was handled; SIGTERM — what `docker
+  stop`, launchd and systemd send, and the OCI image runs the daemon — killed
+  the process with status 143, skipping the final snapshot and leaving the
+  socket, the arena lock and owner files, and any mount behind.
+  `ShutdownSignals` installs SIGINT and SIGTERM handlers up front, failing if
+  either cannot be registered, and both end the wait.
+
+- **macOS mount builds launch** (bead `ley-line-open-b7ab7f`). A binary built
+  with `mount` (`task install:full+mount`, `release:mount`) linked
+  `@rpath/libfuse-t.dylib` with no rpath, so dyld refused to start it for any
+  command. fuser links fuse-t through the `pkg-config` crate, which drops the
+  `-Wl,-rpath` that `rs/pkgconfig/fuse.pc` declares; `cargo test` hid it by
+  exporting the link search path to dyld. `leyline-cli`'s build script now
+  adds fuse-t's library directory to the binary's rpath on macOS mount
+  builds.
+
+||||||| 4ae0f3a
+- **An NFS write is committed once, whole, not once per chunk** (bead
+  `ley-line-open-b6d217`). NFSv3 has no close, and nfsserve hands the server
+  neither COMMIT nor a last-chunk mark, so `LeylineNfs::write` spliced every
+  WRITE RPC as it arrived: a client writing a file as SETATTR(size), WRITE,
+  WRITE published each torn intermediate state (`<p>wor</p>` on the way to
+  `<p>world</p>`), re-projected the file once per chunk, and refused chunks
+  whose partial bytes did not parse. A WRITE now stages its bytes in the
+  node's record (reads of the node see them at once) and the staged nodes
+  are committed through the one write path when writes have been quiet for
+  200 ms (hf-mount's debounced flush), before any create, remove, rename or
+  mkdir, and when the server is dropped. SETATTR to a nonzero size now
+  truncates (or zero-extends) to that size; it was ignored and reported as
+  done. Covered by in-process tests that replay a client's RPC sequence
+  against the real SQLite graph (`nfs::tests::write_sequences`, run by
+  `fs:test:cdc`, which now enables `nfs`).
+
+- **A write to a token of a parsed file is no longer validated as a whole
+  file** (bead `ley-line-open-b6d217`). With a default language set (the
+  daemon's `--language`), a mount write to an AST leaf — which has no file
+  extension — was parsed alone as a file of that language and refused:
+  `util`, a Go package name, is not a Go file. A node inside a parsed file
+  is a fragment, and the write path already validates the whole spliced
+  file when it lands (ADR-0040 D3); standalone records keep their
+  validation.
+
+- **The macOS mount tests no longer fail in streaks** (bead
+  `ley-line-open-e5c8be`). fuse-t serves each mount through a `go-nfsv4`
+  server that listens on 127.0.0.1:52100 (52101 if taken), does not exit
+  when its mount is unmounted, and lives until its mounting process exits —
+  then takes seconds more to go. So each run's servers were still exiting
+  when the next run mounted, and fuse-t's log showed the failing mount every
+  time was the one reusing 52100 the second the previous 52100 server died:
+  reads failed with EIO and the FUSE channel closed under the session
+  ("Short read of FUSE request header (0 < 40)"). A failed run's server,
+  killed at the deadline, failed the next, hence streaks. fuse-t 1.2.1 cannot
+  be moved off the port (`listen_addr` moves the server but not the port it
+  mounts). `mount_round_trip` now waits for attachment through the mount
+  table instead of spinning reads under the mount, stops each mount's
+  server once its session has unmounted, clears stale servers a crashed run
+  left (orphaned, serving a test temp dir — nothing else's), surfaces a
+  failed call as itself rather than as a wedge, and prints the mount's own
+  warnings and errors. Unchanged integration on a clean host: 5 passes then
+  5 failures in a row; with these changes 10 of 10.
 
 - **BREAKING: one write path; a written file is stored and projected exactly
   as a cold parse of its bytes** (ADR-0040 D3, beads `ley-line-open-f2ffbd`,

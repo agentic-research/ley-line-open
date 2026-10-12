@@ -3,7 +3,7 @@ version: '3'
 # Crate-scoped tasks for `leyline-cli-lib`.
 #
 # Included by the root Taskfile under the `cli-lib:` namespace, so these run as
-# `task cli-lib:test:vec`. Tasks belong beside the crate they exercise; the root
+# `task cli-lib:test:search`. Tasks belong beside the crate they exercise; the root
 # Taskfile carries only repo-wide orchestration.
 #
 # `dir:` is set per task rather than at file level because these shell out to
@@ -31,27 +31,70 @@ tasks:
     cmds:
       - tools/test_fixture_hooks.sh --rust
 
-  test:vec:
-    desc: Tests for the `vec` feature (sqlite-vec + fastembed) — ships in install:full
+  # One run for both search features (bead ley-line-open-0988f0). They were
+  # two tasks, each a full rebuild of cli-lib under its own feature set
+  # (145 s + 53 s of compile in CI run 38162088279). Nothing in the tree is
+  # gated on either being ABSENT (no `not(feature = "vec")` or
+  # `not(feature = "text-search")`), `install:full` ships them together, and
+  # the coverage half of tools/check_feature_reachability.sh splits
+  # `--features` on commas, so both still count as tested.
+  test:search:
+    desc: Tests for the `vec` (sqlite-vec + fastembed) and `text-search` features together, as install:full ships them
     dir: '{{.TASKFILE_DIR}}/../..'
     cmds:
-      - cargo test -p leyline-cli-lib --features vec
-
-  test:text-search:
-    desc: Tests for the `text-search` feature (witchcraft) — ships in install:full
-    dir: '{{.TASKFILE_DIR}}/../..'
-    cmds:
-      - cargo test -p leyline-cli-lib --features text-search
+      - cargo test -p leyline-cli-lib --features vec,text-search
 
   test:mount:
     desc: |
       Tests for the `mount` feature (FUSE/NFS) — ships in install:full+mount.
-      Mounts a parsed projection over FUSE and reads it back (bead
-      ley-line-open-aed167). Needs libfuse (Linux, from deps:ci) or fuse-t
-      (macOS) at RUN time, not only at link time; there is no skip path.
+      Mounts a parsed projection the way the daemon does, on the platform's
+      default backend, and reads and writes it back (bead
+      ley-line-open-aed167): our NFS server under mount_nfs on macOS, FUSE on
+      Linux (libfuse from deps:ci at RUN time). There is no skip path.
     dir: '{{.TASKFILE_DIR}}/../..'
     cmds:
       - cargo test -p leyline-cli-lib --features mount --test mount_round_trip
+
+  # The binary, end to end: tools/cli_smoke.sh runs parse, verify-head,
+  # splice, and the daemon's socket ops and SIGTERM shutdown on a fixture
+  # tree. `smoke` builds what release.yml ships (default features);
+  # `smoke:mount` adds the mount and a write through it. `smoke:bin` runs the
+  # script on an already-built binary — release.yml calls it per target.
+  # `smoke:dev` is the `ci` gate on every PR and every local `task ci`, on
+  # the same runners `test:mount` already mounts on. ONE debug build, with
+  # `mount`, runs both passes: every headless command is the same code in a
+  # mount build, and a second build with the features flipped recompiled
+  # cli-lib, leyline-fs and the binary for no extra coverage. The smoke
+  # itself takes about a second; the build is the cost.
+  smoke:dev:
+    desc: Debug-build the CLI with `mount` once and smoke it end to end, headless then mounted (the `ci` gate)
+    dir: '{{.TASKFILE_DIR}}/../..'
+    cmds:
+      - cargo build -p leyline-cli --features mount
+      - ../tools/cli_smoke.sh target/debug/leyline
+      - ../tools/cli_smoke.sh target/debug/leyline --mount
+
+  smoke:
+    desc: Build the release CLI with default features and smoke it end to end
+    dir: '{{.TASKFILE_DIR}}/../..'
+    cmds:
+      - cargo build --release -p leyline-cli
+      - ../tools/cli_smoke.sh target/release/leyline
+
+  smoke:mount:
+    desc: Build the release CLI with `mount` and smoke it, including a write through the mount (needs FUSE/fuse-t)
+    dir: '{{.TASKFILE_DIR}}/../..'
+    cmds:
+      - cargo build --release -p leyline-cli --features mount
+      - ../tools/cli_smoke.sh target/release/leyline --mount
+
+  smoke:bin:
+    desc: Smoke an already-built leyline binary (BIN, relative to the repo root)
+    requires:
+      vars: [BIN]
+    dir: '{{.TASKFILE_DIR}}/../../..'
+    cmds:
+      - tools/cli_smoke.sh "{{.BIN}}"
 
   test:cdc-activation:
     desc: CDC activation + the disabled-build counterpart — both halves of the cdc feature gate

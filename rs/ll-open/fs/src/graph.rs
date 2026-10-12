@@ -69,6 +69,15 @@ pub trait Graph: Send + Sync {
         Ok(out)
     }
 
+    /// Whether directory `id`'s mtime moves every time its entries change.
+    /// An NFSv3 client keeps a cached listing for as long as the directory's
+    /// mtime is unchanged, so a server may report a directory's stored mtime
+    /// only when this holds; otherwise it must report a moving one. Default:
+    /// no.
+    fn mtime_tracks_entries(&self, _id: &str) -> Result<bool> {
+        Ok(false)
+    }
+
     fn write_content(&self, _id: &str, _data: &[u8], _offset: u64) -> Result<usize> {
         anyhow::bail!("read-only filesystem")
     }
@@ -339,6 +348,33 @@ impl SqliteGraphAdapter {
         self.default_language = Some(lang);
     }
 
+    /// The language a write to `id` (at `nid`) is validated against on its
+    /// own, if any. A node of a parsed file — its nid in the range of a file
+    /// with a `_source` row — has none: it is a fragment, and the write path
+    /// validates the whole spliced file when it lands (ADR-0040 D3). Parsing
+    /// the fragment alone as a file refused legitimate edits (a Go package
+    /// name is not a Go file).
+    #[cfg(feature = "validate")]
+    fn standalone_language(
+        &self,
+        conn: &Connection,
+        id: &str,
+        nid: i64,
+    ) -> Option<tree_sitter::Language> {
+        let in_parsed_file = leyline_schema::nid_file_id(nid).is_some_and(|file_id| {
+            conn.query_row(
+                "SELECT 1 FROM _source WHERE file_id = ?1",
+                [file_id],
+                |_| Ok(()),
+            )
+            .is_ok()
+        });
+        if in_parsed_file {
+            return None;
+        }
+        crate::validate::language_for_node(id, self.default_language.as_ref())
+    }
+
     /// Create a writable adapter from raw bytes (for FUSE write-back).
     pub fn new_writable(data: &[u8]) -> Result<Self> {
         let graph = SqliteGraph::from_bytes_writable(data)?;
@@ -566,7 +602,7 @@ impl SqliteGraphAdapter {
             // Flash-clear pattern: always clear stale error first, then validate.
             #[cfg(feature = "validate")]
             {
-                let lang = crate::validate::language_for_node(id, self.default_language.as_ref());
+                let lang = self.standalone_language(guard.conn(), id, nid);
                 if let Some(lang) = lang {
                     // Flash clear: remove any previous error for this node
                     guard
@@ -813,6 +849,21 @@ impl Graph for SqliteGraphAdapter {
         })
     }
 
+    /// A node of a parsed file (nid >= 0: the file row and its syntax
+    /// nodes) is rewritten, every row with a new mtime, whenever the file is
+    /// reparsed or written, and that is the only way its entries change. A
+    /// structural directory (negative nid) keeps the mtime of the parse that
+    /// created it while files come and go under it (`ensure_dir_nodes`), and
+    /// the root has none.
+    fn mtime_tracks_entries(&self, id: &str) -> Result<bool> {
+        if id.is_empty() {
+            return Ok(false);
+        }
+        self.with_reader(|conn| {
+            Ok(leyline_schema::resolve_path(conn, id)?.is_some_and(|nid| nid >= 0))
+        })
+    }
+
     fn lookup_child(&self, parent_id: &str, name: &str) -> Result<Option<Node>> {
         // Resolving the JOINED path is the whole lookup: `resolve_path` walks
         // `dirs`/`files` by interned name and falls through to the AST
@@ -1028,7 +1079,7 @@ impl Graph for SqliteGraphAdapter {
             // Save shadow copy before truncating (for validation rollback)
             #[cfg(feature = "validate")]
             {
-                let lang = crate::validate::language_for_node(id, self.default_language.as_ref());
+                let lang = self.standalone_language(conn, id, nid);
                 if lang.is_some() {
                     let old_content: Option<String> = conn
                         .query_row("SELECT record FROM nodes WHERE nid = ?1", [nid], |row| {
@@ -1783,6 +1834,10 @@ impl Graph for HotSwapGraph {
         self.maybe_swap()?.read_content(id, buf, offset)
     }
 
+    fn mtime_tracks_entries(&self, id: &str) -> Result<bool> {
+        self.maybe_swap()?.mtime_tracks_entries(id)
+    }
+
     fn write_content(&self, id: &str, data: &[u8], offset: u64) -> Result<usize> {
         self.maybe_swap()?.write_content(id, data, offset)
     }
@@ -2439,6 +2494,47 @@ mod tests {
         Ok(())
     }
 
+    /// Whose mtime moves with its entries (`mtime_tracks_entries`, which
+    /// decides what mtime NFS may report): in the projection a parsed
+    /// file's nodes do; a structural directory, the synthetic root and a
+    /// path that names nothing do not, and neither does a graph that does
+    /// not say (the default). The hot-swapping graph answers for the
+    /// adapter it is serving.
+    #[test]
+    fn only_a_parsed_files_nodes_have_mtimes_that_track_their_entries() -> Result<()> {
+        let adapter = writable_adapter()?;
+        assert!(
+            adapter.mtime_tracks_entries("docs/readme")?,
+            "a file's node"
+        );
+        assert!(!adapter.mtime_tracks_entries("docs")?, "a structural dir");
+        assert!(!adapter.mtime_tracks_entries("")?, "the root");
+        assert!(!adapter.mtime_tracks_entries("nope")?, "nothing");
+        assert!(!MemoryGraph::new().mtime_tracks_entries("docs/readme")?);
+
+        let dir = tempfile::tempdir()?;
+        let ctrl_path = dir.path().join("test.ctrl");
+        let arena_path = dir.path().join("test.arena");
+        let arena_size: u64 = 4096 + 131_072 * 2;
+        let source = Connection::open_in_memory()?;
+        create_schema(&source)?;
+        put_dir(&source, "docs", 1000)?;
+        put_file(&source, "docs/readme", 2000, Some("hello"))?;
+        let db_bytes = source.serialize("main")?;
+        let mut mmap = leyline_core::layout::create_arena(&arena_path, arena_size)?;
+        leyline_core::layout::write_to_arena(&mut mmap, db_bytes.as_ref())?;
+        let root: [u8; 32] = blake3::hash(db_bytes.as_ref()).into();
+        Controller::open_or_create(&ctrl_path)?.set_arena_with_root(
+            arena_path.to_str().unwrap(),
+            arena_size,
+            root,
+        )?;
+        let graph = HotSwapGraph::new(ctrl_path)?;
+        assert!(graph.mtime_tracks_entries("docs/readme")?, "a file's node");
+        assert!(!graph.mtime_tracks_entries("docs")?, "a structural dir");
+        Ok(())
+    }
+
     #[test]
     fn extra_columns_safe() -> Result<()> {
         // Mache's nodes table has `record_id TEXT` and `source_file TEXT` columns.
@@ -2650,6 +2746,54 @@ mod tests {
             "extensionless file should be validated via fallback"
         );
 
+        Ok(())
+    }
+
+    /// The first leaf under `id` whose content is `token`.
+    #[cfg(feature = "validate")]
+    fn leaf_holding(adapter: &SqliteGraphAdapter, id: &str, token: &[u8]) -> Option<String> {
+        for child in adapter.list_children(id).ok()? {
+            if child.is_dir {
+                if let Some(found) = leaf_holding(adapter, &child.id, token) {
+                    return Some(found);
+                }
+            } else {
+                let mut buf = vec![0u8; token.len() + 1];
+                if adapter.read_content(&child.id, &mut buf, 0).ok()? == token.len()
+                    && buf.starts_with(token)
+                {
+                    return Some(child.id);
+                }
+            }
+        }
+        None
+    }
+
+    /// A node of a parsed file is a fragment of that file, not a file: the
+    /// write path validates the whole spliced file (ADR-0040 D3), so the
+    /// fallback language does not validate the fragment alone. Before, with
+    /// a default language set (the daemon's `--language go`), a token write
+    /// was parsed as a whole Go file and refused — `util`, a Go package
+    /// name, is not a Go file. A JSON file stands in for the parsed file
+    /// (this crate's parser carries no Go grammar); its token `2` is no more
+    /// a Go file than `util` is. A standalone record
+    /// (`functions/main/source` above) still validates.
+    #[cfg(feature = "validate")]
+    #[test]
+    fn a_token_of_a_parsed_file_is_not_validated_alone() -> Result<()> {
+        let db_bytes = leyline_ts::parse_with_source(
+            b"{\"a\": 1}\n",
+            leyline_ts::languages::TsLanguage::Json,
+            "x.json",
+        )?;
+        let mut adapter = SqliteGraphAdapter::new_writable(&db_bytes)?;
+        adapter.set_default_language(tree_sitter_go::LANGUAGE.into());
+        let leaf = leaf_holding(&adapter, "x.json", b"1").expect("the number's leaf");
+
+        adapter.write_content(&leaf, b"2", 0)?;
+        let mut buf = [0u8; 4];
+        let n = adapter.read_content(&leaf, &mut buf, 0)?;
+        assert_eq!(&buf[..n], b"2");
         Ok(())
     }
 

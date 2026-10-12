@@ -4,14 +4,84 @@ use nfsserve::nfs::*;
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const ROOT_FILEID: fileid3 = 1;
 
+/// How long writes to the mount must be quiet before staged writes are
+/// committed (spliced into their files through the write path).
+pub const COMMIT_IDLE: Duration = Duration::from_millis(200);
+
+/// How often the server checks for an idle stream of writes.
+const COMMIT_TICK: Duration = Duration::from_millis(50);
+
+/// Writes received but not yet committed. NFSv3 has no close: a client
+/// writes a file as SETATTR(size) then one WRITE per chunk, and nfsserve
+/// hands the trait neither COMMIT nor anything that marks the last chunk.
+/// Splicing each WRITE as it arrived (as this server did) published every
+/// torn intermediate state of a multi-chunk write — re-projecting the file
+/// once per chunk, and refusing chunks whose partial bytes did not parse.
+/// Instead a WRITE stages its bytes in the node's record (reads of that node
+/// already see them) and names the node here; the staged nodes are committed
+/// once writes have been quiet for [`COMMIT_IDLE`] (hf-mount's debounced
+/// flush), before any operation that changes the tree's shape, and when the
+/// server is dropped.
+pub struct Staged {
+    graph: Arc<dyn Graph>,
+    ids: Mutex<HashSet<String>>,
+    last_write: Mutex<Option<Instant>>,
+}
+
+impl Staged {
+    fn new(graph: Arc<dyn Graph>) -> Self {
+        Self {
+            graph,
+            ids: Mutex::new(HashSet::new()),
+            last_write: Mutex::new(None),
+        }
+    }
+
+    fn stage(&self, id: &str, now: Instant) {
+        self.ids.lock().insert(id.to_string());
+        *self.last_write.lock() = Some(now);
+    }
+
+    /// Commit every staged node through the graph's flush (the one write
+    /// path). A node whose staged bytes do not make a valid file is logged
+    /// and left with its write unapplied to the source, as a refused flush
+    /// always has been.
+    pub fn commit(&self) {
+        let ids: Vec<String> = self.ids.lock().drain().collect();
+        *self.last_write.lock() = None;
+        for id in ids {
+            if let Err(e) = self.graph.flush_node(&id) {
+                log::warn!("NFS commit of {id} refused: {e:#}");
+            }
+        }
+    }
+
+    /// Commit if the last write was at least `idle` before `now`. Returns
+    /// whether it committed.
+    pub fn commit_if_idle(&self, now: Instant, idle: Duration) -> bool {
+        let quiet = matches!(*self.last_write.lock(), Some(t) if now.duration_since(t) >= idle);
+        if quiet {
+            self.commit();
+        }
+        quiet
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        self.commit();
+    }
+}
+
 pub struct LeylineNfs {
     graph: Arc<dyn Graph>,
+    staged: Arc<Staged>,
     ino_to_id: Mutex<HashMap<u64, String>>,
     id_to_ino: Mutex<HashMap<String, u64>>,
     next_ino: Mutex<u64>,
@@ -24,11 +94,17 @@ impl LeylineNfs {
         ino_to_id.insert(ROOT_FILEID, String::new());
         id_to_ino.insert(String::new(), ROOT_FILEID);
         Self {
+            staged: Arc::new(Staged::new(graph.clone())),
             graph,
             ino_to_id: Mutex::new(ino_to_id),
             id_to_ino: Mutex::new(id_to_ino),
             next_ino: Mutex::new(ROOT_FILEID + 1),
         }
+    }
+
+    /// The server's staged writes, shared with its idle committer.
+    pub fn staged(&self) -> Arc<Staged> {
+        self.staged.clone()
     }
 
     fn ensure_ino(&self, id: &str) -> u64 {
@@ -59,10 +135,24 @@ impl LeylineNfs {
             (ftype3::NF3REG, 0o644, node.size)
         };
 
-        // Directories use dynamic mtime so the NFS client always invalidates
-        // its readdir cache. Without this, the synthetic root (mtime=0) causes
-        // stale empty listings after data is loaded or reverted.
-        let mtime = if node.is_dir {
+        // An NFSv3 client reuses a cached listing while the directory's mtime
+        // is unchanged, so a directory whose stored mtime does not move with
+        // its entries — the synthetic root (mtime 0), a structural directory
+        // — reports the current time, and the client always relists it. A
+        // directory whose mtime does move with them — a source file's entry —
+        // reports its own, which is the file's mtime (bead ca51fa). Reporting
+        // the current time for those too hid the file's mtime from every
+        // macOS mount. A failed check takes the moving mtime: a stale listing
+        // is worse than a wrong timestamp.
+        let moving = node.is_dir
+            && !self
+                .graph
+                .mtime_tracks_entries(&node.id)
+                .unwrap_or_else(|e| {
+                    log::warn!("mtime check for {}: {e:#}", node.id);
+                    false
+                });
+        let mtime = if moving {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default();
@@ -180,14 +270,34 @@ impl NFSFileSystem for LeylineNfs {
         Ok(self.node_to_fattr3(id, &node))
     }
 
+    /// A size change truncates to that size and is staged like a write (it
+    /// is the first RPC of a truncating write). Mode, owner and times are
+    /// derived from the projection, not stored, so changes to them are
+    /// accepted and have no effect.
     async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
         let node_id = self.resolve_id(id)?;
 
-        // Only handle truncate (size = 0)
-        if let set_size3::size(0) = setattr.size {
+        if let set_size3::size(size) = setattr.size {
+            let keep = usize::try_from(size).map_err(|_| nfsstat3::NFS3ERR_FBIG)?;
+            let mut kept = vec![0u8; keep];
+            let n = if keep == 0 {
+                0
+            } else {
+                self.graph
+                    .read_content(&node_id, &mut kept, 0)
+                    .map_err(|_| nfsstat3::NFS3ERR_IO)?
+            };
+            // Growing zero-fills, as POSIX truncate does.
+            kept[n..].fill(0);
             self.graph
                 .truncate(&node_id)
                 .map_err(|_| nfsstat3::NFS3ERR_ROFS)?;
+            if keep > 0 {
+                self.graph
+                    .write_content(&node_id, &kept, 0)
+                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            }
+            self.staged.stage(&node_id, Instant::now());
         }
 
         // Re-fetch updated attrs
@@ -216,16 +326,13 @@ impl NFSFileSystem for LeylineNfs {
         Ok((buf, eof))
     }
 
+    /// Stage the chunk; [`Staged`] commits the whole write once it is done.
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
         let node_id = self.resolve_id(id)?;
         self.graph
             .write_content(&node_id, data, offset)
             .map_err(|_| nfsstat3::NFS3ERR_IO)?;
-
-        // Best-effort splice — NFS has no per-file close/flush
-        if let Err(e) = self.graph.flush_node(&node_id) {
-            log::debug!("NFS splice deferred for {node_id}: {e}");
-        }
+        self.staged.stage(&node_id, Instant::now());
 
         let node = self
             .graph
@@ -241,6 +348,7 @@ impl NFSFileSystem for LeylineNfs {
         filename: &filename3,
         _attr: sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
+        self.staged.commit();
         let parent_id = self.resolve_id(dirid)?;
         let name = std::str::from_utf8(filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
 
@@ -257,6 +365,7 @@ impl NFSFileSystem for LeylineNfs {
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
+        self.staged.commit();
         let parent_id = self.resolve_id(dirid)?;
         let name = std::str::from_utf8(filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
 
@@ -277,6 +386,7 @@ impl NFSFileSystem for LeylineNfs {
         dirid: fileid3,
         dirname: &filename3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
+        self.staged.commit();
         let parent_id = self.resolve_id(dirid)?;
         let name = std::str::from_utf8(dirname).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
 
@@ -289,6 +399,7 @@ impl NFSFileSystem for LeylineNfs {
     }
 
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
+        self.staged.commit();
         let parent_id = self.resolve_id(dirid)?;
         let name = std::str::from_utf8(filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
 
@@ -317,6 +428,7 @@ impl NFSFileSystem for LeylineNfs {
         to_dirid: fileid3,
         to_filename: &filename3,
     ) -> Result<(), nfsstat3> {
+        self.staged.commit();
         let from_parent = self.resolve_id(from_dirid)?;
         let to_parent = self.resolve_id(to_dirid)?;
         let from_name = std::str::from_utf8(from_filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
@@ -404,22 +516,60 @@ impl NFSFileSystem for LeylineNfs {
     }
 }
 
+/// A running NFS server. Dropping it stops the server and commits every
+/// staged write before the drop returns, so whoever drops it — the mount
+/// guard, after unmounting — can publish knowing the last write is in.
+/// Before, the server task was detached: unmount returned with a write
+/// still inside the idle window, the daemon's final snapshot missed it, and
+/// it committed whenever the runtime happened to drop the task.
+pub struct NfsServer {
+    port: u16,
+    staged: Arc<Staged>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl NfsServer {
+    /// The port the server bound (the one asked for, or the one picked for 0).
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+impl Drop for NfsServer {
+    fn drop(&mut self) {
+        self.task.abort();
+        self.staged.commit();
+    }
+}
+
 /// Start an NFS server on the given address, serving the provided graph.
-/// Returns the actual port the server bound to.
-/// The server runs in the background until the returned handle is dropped/aborted.
-pub async fn serve_nfs(
-    graph: Arc<dyn Graph>,
-    listen_addr: &str,
-) -> anyhow::Result<(u16, tokio::task::JoinHandle<()>)> {
+/// The server runs in the background until the returned [`NfsServer`] is
+/// dropped.
+pub async fn serve_nfs(graph: Arc<dyn Graph>, listen_addr: &str) -> anyhow::Result<NfsServer> {
     let fs = LeylineNfs::new(graph);
+    let staged = fs.staged();
     let listener = NFSTcpListener::bind(listen_addr, fs).await?;
     let port = listener.get_listen_port();
-    let handle = tokio::spawn(async move {
-        if let Err(e) = listener.handle_forever().await {
-            log::error!("NFS server error: {e}");
+    let idle = staged.clone();
+    let task = tokio::spawn(async move {
+        // The idle committer runs beside the server and ends with it.
+        let committer = async {
+            let mut tick = tokio::time::interval(COMMIT_TICK);
+            loop {
+                tick.tick().await;
+                idle.commit_if_idle(Instant::now(), COMMIT_IDLE);
+            }
+        };
+        tokio::select! {
+            served = listener.handle_forever() => {
+                if let Err(e) = served {
+                    log::error!("NFS server error: {e}");
+                }
+            }
+            () = committer => {}
         }
     });
-    Ok((port, handle))
+    Ok(NfsServer { port, staged, task })
 }
 
 #[cfg(test)]
@@ -580,5 +730,276 @@ mod tests {
             .unwrap();
         let parent_ino = nfs.lookup(docs_ino, &b"..".to_vec().into()).await.unwrap();
         assert_eq!(parent_ino, ROOT_FILEID);
+    }
+
+    // ---- Write sequences, replayed as a client sends them (bead b6d217) ----
+    //
+    // The NFSFileSystem methods called in-process, in the order a client's
+    // RPCs arrive (hf-mount's `NFSAdapter` tests are the model), over the real
+    // SQLite graph with a source writer installed. No kernel, no timers: the
+    // idle commit is driven with explicit instants.
+
+    #[cfg(feature = "splice")]
+    mod write_sequences {
+        use super::*;
+        use crate::graph::SourceWriter;
+        use crate::graph::SqliteGraphAdapter;
+        use crate::graph::fixtures::ProjectingWriter;
+        use rusqlite::Connection;
+
+        /// Records every file the commit hands the write path, then projects
+        /// it as the real writer would.
+        #[derive(Default)]
+        struct Recorder {
+            writes: Mutex<Vec<Vec<u8>>>,
+        }
+
+        impl SourceWriter for Recorder {
+            fn write(
+                &self,
+                conn: &Connection,
+                source_id: &str,
+                bytes: Vec<u8>,
+            ) -> anyhow::Result<()> {
+                self.writes.lock().push(bytes.clone());
+                ProjectingWriter.write(conn, source_id, bytes)
+            }
+        }
+
+        fn html_nfs() -> (LeylineNfs, Arc<Recorder>) {
+            let db = leyline_ts::parse_with_source(
+                b"<p>hello</p>\n",
+                leyline_ts::languages::TsLanguage::Html,
+                "test.html",
+            )
+            .unwrap();
+            let mut adapter = SqliteGraphAdapter::new_writable(&db).unwrap();
+            let recorder = Arc::new(Recorder::default());
+            adapter.set_source_writer(recorder.clone());
+            (LeylineNfs::new(Arc::new(adapter)), recorder)
+        }
+
+        /// The `<p>`'s text leaf, looked up one component at a time as a
+        /// client walks a path.
+        async fn text_leaf(nfs: &LeylineNfs) -> fileid3 {
+            let mut ino = ROOT_FILEID;
+            for name in ["test.html", "element", "text"] {
+                ino = nfs
+                    .lookup(ino, &name.as_bytes().to_vec().into())
+                    .await
+                    .unwrap();
+            }
+            ino
+        }
+
+        fn size(k: u64) -> sattr3 {
+            sattr3 {
+                size: set_size3::size(k),
+                ..sattr3::default()
+            }
+        }
+
+        async fn read_all(nfs: &LeylineNfs, ino: fileid3) -> Vec<u8> {
+            nfs.read(ino, 0, 4096).await.unwrap().0
+        }
+
+        /// Committing as if the idle window had passed.
+        fn commit_now(nfs: &LeylineNfs) -> bool {
+            nfs.staged()
+                .commit_if_idle(Instant::now() + COMMIT_IDLE, COMMIT_IDLE)
+        }
+
+        /// A truncating write in two chunks — SETATTR(size 0), WRITE, WRITE —
+        /// reaches the write path once, whole. Before, each WRITE spliced
+        /// what it had so far, so `<p>wor</p>` was published on the way to
+        /// `<p>world</p>`.
+        #[tokio::test]
+        async fn a_multi_chunk_write_is_committed_once_whole() {
+            let (nfs, recorder) = html_nfs();
+            let ino = text_leaf(&nfs).await;
+            nfs.getattr(ino).await.unwrap();
+            nfs.setattr(ino, size(0)).await.unwrap();
+            nfs.write(ino, 0, b"wor").await.unwrap();
+            assert!(
+                recorder.writes.lock().is_empty(),
+                "a first chunk is not a file"
+            );
+            let attr = nfs.write(ino, 3, b"ld").await.unwrap();
+            assert_eq!(attr.size, 5);
+            assert_eq!(
+                read_all(&nfs, ino).await,
+                b"world",
+                "reads see staged bytes"
+            );
+            assert!(
+                recorder.writes.lock().is_empty(),
+                "nothing commits mid-stream"
+            );
+
+            assert!(commit_now(&nfs));
+            assert_eq!(*recorder.writes.lock(), vec![b"<p>world</p>\n".to_vec()]);
+            assert_eq!(read_all(&nfs, text_leaf(&nfs).await).await, b"world");
+        }
+
+        /// Before the idle window has passed there is nothing to commit
+        /// yet; with no write staged there is nothing to commit at all.
+        #[tokio::test]
+        async fn the_idle_commit_waits_for_quiet() {
+            let (nfs, recorder) = html_nfs();
+            assert!(!commit_now(&nfs), "nothing staged");
+            let ino = text_leaf(&nfs).await;
+            nfs.write(ino, 0, b"HELLO").await.unwrap();
+            assert!(
+                !nfs.staged()
+                    .commit_if_idle(Instant::now(), Duration::from_secs(3600))
+            );
+            assert!(recorder.writes.lock().is_empty());
+            assert!(commit_now(&nfs));
+            assert_eq!(recorder.writes.lock().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_read_before_the_write_does_not_disturb_it() {
+            let (nfs, recorder) = html_nfs();
+            let ino = text_leaf(&nfs).await;
+            assert_eq!(read_all(&nfs, ino).await, b"hello");
+            nfs.setattr(ino, size(0)).await.unwrap();
+            nfs.write(ino, 0, b"bye").await.unwrap();
+            assert!(commit_now(&nfs));
+            assert_eq!(*recorder.writes.lock(), vec![b"<p>bye</p>\n".to_vec()]);
+        }
+
+        /// SETATTR to a nonzero size truncates to that size. Before, every
+        /// size but 0 was ignored and reported as done.
+        #[tokio::test]
+        async fn a_nonzero_truncate_keeps_that_many_bytes() {
+            let (nfs, recorder) = html_nfs();
+            let ino = text_leaf(&nfs).await;
+            let attr = nfs.setattr(ino, size(2)).await.unwrap();
+            assert_eq!(attr.size, 2);
+            assert_eq!(read_all(&nfs, ino).await, b"he");
+            assert!(commit_now(&nfs));
+            assert_eq!(*recorder.writes.lock(), vec![b"<p>he</p>\n".to_vec()]);
+        }
+
+        /// A write past the end zero-fills the gap, as POSIX does.
+        #[tokio::test]
+        async fn a_write_past_the_end_zero_fills() {
+            let (nfs, recorder) = html_nfs();
+            let ino = text_leaf(&nfs).await;
+            nfs.write(ino, 7, b"x").await.unwrap();
+            assert_eq!(read_all(&nfs, ino).await, b"hello\0\0x");
+            commit_now(&nfs);
+            assert_eq!(
+                *recorder.writes.lock(),
+                vec![b"<p>hello\0\0x</p>\n".to_vec()]
+            );
+        }
+
+        /// An operation that changes the tree's shape commits staged writes
+        /// first, so it never runs against a half-applied file.
+        #[tokio::test]
+        async fn a_structural_operation_commits_staged_writes_first() {
+            let (nfs, recorder) = html_nfs();
+            let ino = text_leaf(&nfs).await;
+            nfs.setattr(ino, size(0)).await.unwrap();
+            nfs.write(ino, 0, b"world").await.unwrap();
+            nfs.mkdir(ROOT_FILEID, &b"newdir".to_vec().into())
+                .await
+                .unwrap();
+            assert_eq!(*recorder.writes.lock(), vec![b"<p>world</p>\n".to_vec()]);
+        }
+
+        /// Dropping the server commits what is staged; a shutdown inside the
+        /// idle window does not lose the write.
+        #[tokio::test]
+        async fn dropping_the_server_commits_staged_writes() {
+            let (nfs, recorder) = html_nfs();
+            let ino = text_leaf(&nfs).await;
+            nfs.setattr(ino, size(0)).await.unwrap();
+            nfs.write(ino, 0, b"world").await.unwrap();
+            drop(nfs);
+            assert_eq!(*recorder.writes.lock(), vec![b"<p>world</p>\n".to_vec()]);
+        }
+
+        /// A source file's entry reports the file's stored mtime (bead
+        /// ca51fa); the structural directory above it and the root, whose
+        /// stored mtimes do not move with their entries, report the current
+        /// time so the client relists them. Before, every directory reported
+        /// the current time, the source file's entry included.
+        #[tokio::test]
+        async fn a_source_file_reports_its_mtime_and_the_directories_above_it_move() {
+            let db = leyline_ts::parse_with_source(
+                b"<p>hello</p>\n",
+                leyline_ts::languages::TsLanguage::Html,
+                "web/test.html",
+            )
+            .unwrap();
+            let graph: Arc<dyn Graph> = Arc::new(SqliteGraphAdapter::new_writable(&db).unwrap());
+            let stored = graph.get_node("web/test.html").unwrap().unwrap();
+            assert!(stored.is_dir, "a source file's entry is a directory");
+            let nfs = LeylineNfs::new(graph);
+            let web = nfs
+                .lookup(ROOT_FILEID, &b"web".to_vec().into())
+                .await
+                .unwrap();
+            let file = nfs
+                .lookup(web, &b"test.html".to_vec().into())
+                .await
+                .unwrap();
+            let before = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as u32;
+
+            let file_attr = nfs.getattr(file).await.unwrap();
+            assert_eq!(
+                (file_attr.mtime.seconds, file_attr.mtime.nseconds),
+                (
+                    (stored.mtime_nanos / 1_000_000_000) as u32,
+                    (stored.mtime_nanos % 1_000_000_000) as u32
+                ),
+                "the source file's entry reports the file's own mtime"
+            );
+            for (name, ino) in [("root", ROOT_FILEID), ("web", web)] {
+                let attr = nfs.getattr(ino).await.unwrap();
+                assert!(
+                    attr.mtime.seconds >= before,
+                    "{name} reports the current time, got {}",
+                    attr.mtime.seconds
+                );
+            }
+        }
+
+        /// Dropping a running server commits its staged writes before the
+        /// drop returns, not whenever the runtime later drops the task. On
+        /// this single-threaded runtime the server task has not run once by
+        /// the drop, so only the drop itself can have committed.
+        #[tokio::test]
+        async fn dropping_a_running_server_commits_before_it_returns() {
+            let db = leyline_ts::parse_with_source(
+                b"<p>hello</p>\n",
+                leyline_ts::languages::TsLanguage::Html,
+                "test.html",
+            )
+            .unwrap();
+            let mut adapter = SqliteGraphAdapter::new_writable(&db).unwrap();
+            let recorder = Arc::new(Recorder::default());
+            adapter.set_source_writer(recorder.clone());
+            let graph: Arc<dyn Graph> = Arc::new(adapter);
+            let leaf = "test.html/element/text";
+            graph.truncate(leaf).unwrap();
+            graph.write_content(leaf, b"world", 0).unwrap();
+
+            let server = serve_nfs(graph, "127.0.0.1:0").await.unwrap();
+            assert_ne!(
+                server.port(),
+                0,
+                "port 0 asks for one; the bound one is reported"
+            );
+            server.staged.stage(leaf, Instant::now());
+            drop(server);
+            assert_eq!(*recorder.writes.lock(), vec![b"<p>world</p>\n".to_vec()]);
+        }
     }
 }

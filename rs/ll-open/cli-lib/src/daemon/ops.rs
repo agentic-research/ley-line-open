@@ -859,6 +859,22 @@ impl Drop for ReadProfileTimer {
 /// not provided). Sets `truncated: true` in the response when the cap is
 /// hit, so callers can paginate via `LIMIT/OFFSET` in the SQL itself if
 /// they need everything.
+/// One SQLite value as the `query` op's wire text (schema: `values:
+/// List(Text)`; fixture `daemon-protocol.json` answers `SELECT 1` with
+/// `"1"`): an integer or real in decimal, text as itself, a blob as
+/// lowercase hex, and NULL as JSON null so it stays distinct from the empty
+/// string.
+fn sql_value_to_json(value: rusqlite::types::ValueRef<'_>) -> serde_json::Value {
+    use rusqlite::types::ValueRef;
+    match value {
+        ValueRef::Null => serde_json::Value::Null,
+        ValueRef::Integer(i) => json!(i.to_string()),
+        ValueRef::Real(r) => json!(r.to_string()),
+        ValueRef::Text(t) => json!(String::from_utf8_lossy(t)),
+        ValueRef::Blob(b) => json!(hex::encode(b)),
+    }
+}
+
 fn op_query(ctx: &DaemonContext, sql: &str, limit: Option<usize>) -> Result<String> {
     let limit = limit.unwrap_or(OP_QUERY_DEFAULT_ROW_LIMIT);
     // ADR-0026 Phase 2.0 (bead `ley-line-open-335d34`): profile the
@@ -896,8 +912,7 @@ fn op_query(ctx: &DaemonContext, sql: &str, limit: Option<usize>) -> Result<Stri
             }
             let mut obj = serde_json::Map::new();
             for (i, col) in headers.iter().enumerate() {
-                let val: String = row.get::<_, String>(i).unwrap_or_default();
-                obj.insert(col.clone(), serde_json::Value::String(val));
+                obj.insert(col.clone(), sql_value_to_json(row.get_ref(i)?));
             }
             rows_out.push(serde_json::Value::Object(obj));
         }
@@ -4478,6 +4493,28 @@ mod tests {
         assert!(
             parsed.get("limit").is_none(),
             "under-limit response must omit `limit` field, got {parsed}",
+        );
+    }
+
+    /// Each value comes back as its wire text: an integer or real in decimal,
+    /// NULL as null, a blob as lowercase hex, text as itself. Before, every
+    /// non-text value was the empty string, so `SELECT count(*)` answered
+    /// `""`.
+    #[tokio::test]
+    async fn op_query_returns_each_value_with_its_sqlite_type() {
+        let (_dir, ctx) = setup();
+        let result = handle_base_op_legacy(
+            &ctx,
+            "query",
+            &json!({"sql": "SELECT 42 AS i, -1.5 AS r, NULL AS z, x'00ff' AS b, 't' AS t, \
+                            1e999 AS inf, -1e999 AS ninf"}),
+        )
+        .expect("op_query must dispatch");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            parsed["rows"],
+            json!([{"i": "42", "r": "-1.5", "z": null, "b": "00ff", "t": "t",
+                    "inf": "inf", "ninf": "-inf"}]),
         );
     }
 

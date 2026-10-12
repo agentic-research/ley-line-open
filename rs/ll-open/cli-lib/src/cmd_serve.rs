@@ -85,9 +85,19 @@ pub fn setup_arena(arena: &Path, arena_size: u64, control: Option<&Path>) -> Res
     Ok(ctrl_path)
 }
 
-/// Shell out to mount_nfs (macOS) or mount.nfs (Linux) to mount the NFS export.
+/// Where the NFS export listens: loopback, on `port` (0 picks one). The export
+/// is unauthenticated and writable, and [`mount_nfs_cmd`] reaches it at
+/// 127.0.0.1, so nothing off this host has a reason to reach it.
+pub fn nfs_listen_addr(port: u16) -> String {
+    format!("127.0.0.1:{port}")
+}
+
+/// Shell out to mount_nfs (macOS) or mount.nfs (Linux) to mount `server`'s
+/// export; the returned guard owns the server, and dropping it unmounts and
+/// then stops the server.
 #[cfg(feature = "mount")]
-pub fn mount_nfs_cmd(port: u16, mountpoint: &Path) -> Result<()> {
+pub fn mount_nfs_cmd(server: leyline_fs::nfs::NfsServer, mountpoint: &Path) -> Result<NfsMount> {
+    let port = server.port();
     std::fs::create_dir_all(mountpoint)
         .with_context(|| format!("create mountpoint {}", mountpoint.display()))?;
 
@@ -114,7 +124,11 @@ pub fn mount_nfs_cmd(port: u16, mountpoint: &Path) -> Result<()> {
     if !status.success() {
         anyhow::bail!("NFS mount failed with exit code {:?}", status.code());
     }
-    Ok(())
+    Ok(NfsMount {
+        path: mount_path,
+        unmount: unmount_nfs,
+        _server: server,
+    })
 }
 
 #[cfg(feature = "mount")]
@@ -155,57 +169,167 @@ pub async fn cmd_serve(
 
     let graph: Arc<dyn leyline_fs::graph::Graph> = Arc::new(graph);
 
-    // Mount.
-    std::fs::create_dir_all(mount)
-        .with_context(|| format!("create mountpoint {}", mount.display()))?;
-
-    match backend {
-        "nfs" => {
-            let listen_addr = format!("0.0.0.0:{nfs_port}");
-            let (port, _handle) = leyline_fs::nfs::serve_nfs(graph, &listen_addr).await?;
-            eprintln!("NFS server listening on port {port}");
-
-            mount_nfs_cmd(port, mount)?;
-            eprintln!("mounted at {}", mount.display());
-
-            wait_for_shutdown(timeout).await?;
-        }
-        "fuse" => {
-            let _session = leyline_fs::fuse::mount_fuse(graph, mount)?;
-            eprintln!("FUSE mounted at {}", mount.display());
-
-            wait_for_shutdown(timeout).await?;
-        }
-        other => anyhow::bail!("unknown backend: {other} (expected 'nfs' or 'fuse')"),
-    }
+    let mounted = mount_backend(graph, mount, backend, nfs_port).await?;
+    wait_for_shutdown(timeout).await?;
+    drop(mounted);
 
     Ok(())
 }
 
-/// Wait for Ctrl+C or an optional timeout, whichever comes first.
+/// A mount this process holds while it serves. Dropping it unmounts: the
+/// FUSE session's own drop, or `umount` for an NFS mount. Held for the whole
+/// serve; before, the daemon dropped its FUSE session at the end of the arm
+/// that created it, and nothing ever unmounted NFS, so the daemon exited
+/// leaving the kernel holding a mount whose server was gone.
+#[cfg(feature = "mount")]
+pub enum Mounted {
+    Nfs(NfsMount),
+    Fuse(leyline_fs::fuse::FuseSession),
+}
+
+/// An NFS mount this process made and the server behind it. Dropping it
+/// unmounts — the kernel flushes the client's last writes to the server —
+/// and then drops the server, which commits them before the drop returns.
+/// So the daemon's final snapshot, taken after this drop, holds every write.
+#[cfg(feature = "mount")]
+pub struct NfsMount {
+    path: PathBuf,
+    /// [`unmount_nfs`] in every real mount; a test substitutes a recorder.
+    unmount: fn(&Path) -> Result<()>,
+    /// Dropped after `Drop::drop` has unmounted (fields drop after it).
+    _server: leyline_fs::nfs::NfsServer,
+}
+
+#[cfg(feature = "mount")]
+impl Drop for NfsMount {
+    fn drop(&mut self) {
+        if let Err(e) = (self.unmount)(&self.path) {
+            eprintln!("warn: {e:#}");
+        }
+    }
+}
+
+/// Unmount an NFS mount: `umount`, then `umount -f` if the first refuses.
+#[cfg(feature = "mount")]
+pub fn unmount_nfs(path: &Path) -> Result<()> {
+    for args in [&[][..], &["-f"][..]] {
+        let status = std::process::Command::new("umount")
+            .args(args)
+            .arg(path)
+            .status()
+            .context("spawn umount")?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("could not unmount {}", path.display())
+}
+
+/// Mount `graph` at `mount` on `backend` ("nfs" or "fuse") and return the
+/// guard that unmounts it.
+#[cfg(feature = "mount")]
+pub async fn mount_backend(
+    graph: Arc<dyn leyline_fs::graph::Graph>,
+    mount: &Path,
+    backend: &str,
+    nfs_port: u16,
+) -> Result<Mounted> {
+    std::fs::create_dir_all(mount)
+        .with_context(|| format!("create mountpoint {}", mount.display()))?;
+    match backend {
+        "nfs" => {
+            let listen_addr = nfs_listen_addr(nfs_port);
+            let server = leyline_fs::nfs::serve_nfs(graph, &listen_addr).await?;
+            eprintln!("NFS server listening on port {}", server.port());
+            let mounted = mount_nfs_cmd(server, mount)?;
+            eprintln!("mounted at {}", mount.display());
+            Ok(Mounted::Nfs(mounted))
+        }
+        "fuse" => {
+            let session = leyline_fs::fuse::mount_fuse(graph, mount)?;
+            eprintln!("FUSE mounted at {}", mount.display());
+            Ok(Mounted::Fuse(session))
+        }
+        other => anyhow::bail!("unknown backend: {other} (expected 'nfs' or 'fuse')"),
+    }
+}
+
+/// What ended a [`ShutdownSignals::wait`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shutdown {
+    Interrupt,
+    Terminate,
+    Timeout,
+}
+
+/// The signals that stop a long-running command: Ctrl+C (SIGINT) and, on
+/// unix, SIGTERM — what `docker stop`, launchd and systemd send. Installed
+/// up front so a failure to register is an error, not a wait that can never
+/// end on that signal.
+pub struct ShutdownSignals {
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl ShutdownSignals {
+    pub fn install() -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                interrupt: signal(SignalKind::interrupt()).context("install the SIGINT handler")?,
+                terminate: signal(SignalKind::terminate())
+                    .context("install the SIGTERM handler")?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {})
+        }
+    }
+
+    /// Wait for a signal or the optional timeout, whichever comes first.
+    pub async fn wait(&mut self, timeout: Option<Duration>) -> Shutdown {
+        let timer = async {
+            match timeout {
+                Some(dur) => tokio::time::sleep(dur).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.interrupt.recv() => Shutdown::Interrupt,
+                _ = self.terminate.recv() => Shutdown::Terminate,
+                _ = timer => Shutdown::Timeout,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => Shutdown::Interrupt,
+                _ = timer => Shutdown::Timeout,
+            }
+        }
+    }
+}
+
+/// Wait for Ctrl+C, SIGTERM or an optional timeout, whichever comes first.
 pub async fn wait_for_shutdown(timeout: Option<&str>) -> Result<()> {
     let timeout_dur = match timeout {
         Some(s) => Some(parse_duration(s)?),
         None => None,
     };
+    let mut signals = ShutdownSignals::install()?;
 
     eprintln!("press Ctrl+C to stop");
 
-    match timeout_dur {
-        Some(dur) => {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    eprintln!("\nreceived Ctrl+C, shutting down");
-                }
-                _ = tokio::time::sleep(dur) => {
-                    eprintln!("timeout reached, shutting down");
-                }
-            }
-        }
-        None => {
-            tokio::signal::ctrl_c().await?;
-            eprintln!("\nreceived Ctrl+C, shutting down");
-        }
+    match signals.wait(timeout_dur).await {
+        Shutdown::Interrupt => eprintln!("\nreceived Ctrl+C, shutting down"),
+        Shutdown::Terminate => eprintln!("received SIGTERM, shutting down"),
+        Shutdown::Timeout => eprintln!("timeout reached, shutting down"),
     }
 
     Ok(())
@@ -243,6 +367,99 @@ mod tests {
             mount.is_dir(),
             "the mountpoint is created before the backend is chosen"
         );
+    }
+
+    /// Unmounting a directory nothing is mounted on fails, naming it, after
+    /// both `umount` and `umount -f` refuse — it does not report success.
+    /// Tests that install the process-wide signal handlers run one at a time:
+    /// the SIGTERM test signals the whole process, which would end another
+    /// test's wait early.
+    static SIGNAL_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Dropping an NFS mount unmounts its own path — the daemon and `serve`
+    /// rely on the drop alone to leave no mount behind.
+    #[cfg(feature = "mount")]
+    #[tokio::test]
+    async fn dropping_an_nfs_mount_unmounts_its_path() {
+        use std::sync::Mutex;
+        static UNMOUNTED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+        fn record(path: &Path) -> Result<()> {
+            UNMOUNTED.lock().unwrap().push(path.to_path_buf());
+            Ok(())
+        }
+        let graph = Arc::new(leyline_fs::graph::MemoryGraph::new());
+        let server = leyline_fs::nfs::serve_nfs(graph, &nfs_listen_addr(0))
+            .await
+            .unwrap();
+        let path = PathBuf::from("/nonexistent/leyline-test-mount");
+        drop(NfsMount {
+            path: path.clone(),
+            unmount: record,
+            _server: server,
+        });
+        assert_eq!(*UNMOUNTED.lock().unwrap(), vec![path]);
+    }
+
+    /// A timeout that does not parse is refused before anything waits, and a
+    /// valid one is waited out rather than returning at once.
+    #[tokio::test]
+    async fn wait_for_shutdown_refuses_a_bad_timeout_and_waits_out_a_good_one() {
+        let _serial = SIGNAL_TESTS.lock().await;
+        assert!(wait_for_shutdown(Some("soon")).await.is_err());
+        let started = std::time::Instant::now();
+        wait_for_shutdown(Some("1")).await.unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(1));
+    }
+
+    #[cfg(feature = "mount")]
+    #[test]
+    fn unmounting_what_is_not_mounted_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = unmount_nfs(dir.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains(&dir.path().display().to_string()),
+            "{err:#}"
+        );
+    }
+
+    /// The NFS export is unauthenticated and writable, and the mount reaches
+    /// it at 127.0.0.1, so it listens on loopback only. It listened on
+    /// 0.0.0.0, serving the arena — and since ADR-0040 D3 writes into it —
+    /// to every host that could reach the port.
+    #[test]
+    fn the_nfs_export_listens_on_loopback_only() {
+        let addr: std::net::SocketAddr = nfs_listen_addr(2049).parse().unwrap();
+        assert!(addr.ip().is_loopback(), "{addr}");
+        assert_eq!(addr.port(), 2049);
+    }
+
+    /// The timeout ends the wait, and SIGTERM — what `docker stop`, launchd
+    /// and systemd send — ends it the way Ctrl+C does, so the caller's
+    /// graceful shutdown runs. Before, only Ctrl+C was handled and SIGTERM
+    /// killed the process outright, leaving the socket, the arena lock and
+    /// any mount behind. One test, in this order: a process-wide SIGTERM
+    /// reaches every installed listener, so a separate timeout test running
+    /// alongside would see it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_timeout_or_sigterm_ends_the_wait() {
+        let _serial = SIGNAL_TESTS.lock().await;
+        let mut signals = ShutdownSignals::install().expect("install shutdown signals");
+        let which = tokio::time::timeout(
+            Duration::from_secs(5),
+            signals.wait(Some(Duration::from_millis(10))),
+        )
+        .await
+        .expect("a 10ms timeout must end the wait");
+        assert_eq!(which, Shutdown::Timeout);
+
+        // SAFETY: kill(2) on our own pid; the handler installed above
+        // replaces SIGTERM's default action, so the process survives.
+        assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGTERM) }, 0);
+        let which = tokio::time::timeout(Duration::from_secs(5), signals.wait(None))
+            .await
+            .expect("SIGTERM must end the wait");
+        assert_eq!(which, Shutdown::Terminate);
     }
 
     #[test]

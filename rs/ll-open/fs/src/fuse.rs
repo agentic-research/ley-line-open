@@ -509,6 +509,9 @@ impl Filesystem for LeylineFuse {
     }
 }
 
+/// A mounted FUSE session; dropping it unmounts.
+pub type FuseSession = fuser::BackgroundSession;
+
 /// Mount the FUSE filesystem in the background. Returns a session handle
 /// that unmounts when dropped — hold it for as long as the mount should
 /// live.
@@ -521,10 +524,7 @@ impl Filesystem for LeylineFuse {
 /// ley-line-open-aed167). The session's `Drop` is the unmount; a process
 /// that dies without dropping it leaves the mountpoint for `fusermount -u`,
 /// the same trade every unprivileged FUSE mount makes.
-pub fn mount_fuse(
-    graph: Arc<dyn Graph>,
-    mountpoint: &Path,
-) -> anyhow::Result<fuser::BackgroundSession> {
+pub fn mount_fuse(graph: Arc<dyn Graph>, mountpoint: &Path) -> anyhow::Result<FuseSession> {
     let fs = LeylineFuse::new(graph);
     let options = vec![MountOption::FSName("leyline".into())];
     let session = fuser::spawn_mount2(fs, mountpoint, &options)?;

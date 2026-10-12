@@ -10,6 +10,13 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.20.3] — 2026-10-12
+
+Patch release: a write through an NFS mount is in the stored source when
+its fsync or close returns. The projection stays `projection-v6`, the wire
+stays v1, the control block stays VERSION 3, and `SCHEMA_VERSION` stays
+0.20.2 (no `clients/go/leyline-schema` change, so no new schema tag).
+
 ### Fixed
 
 - **An NFS mount write is in the stored source when its fsync or close

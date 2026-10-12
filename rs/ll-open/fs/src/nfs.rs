@@ -4,57 +4,82 @@ use nfsserve::nfs::*;
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const ROOT_FILEID: fileid3 = 1;
 
-/// How long writes to the mount must be quiet before staged writes are
-/// committed (spliced into their files through the write path).
+/// How long a truncate must stand with no write after it before it is
+/// committed (spliced into its file through the write path).
 pub const COMMIT_IDLE: Duration = Duration::from_millis(200);
 
-/// How often the server checks for an idle stream of writes.
+/// How often the server checks for a standing truncate.
 const COMMIT_TICK: Duration = Duration::from_millis(50);
 
-/// Writes received but not yet committed. NFSv3 has no close: a client
-/// writes a file as SETATTR(size) then one WRITE per chunk, and nfsserve
-/// hands the trait neither COMMIT nor anything that marks the last chunk.
-/// Splicing each WRITE as it arrived (as this server did) published every
-/// torn intermediate state of a multi-chunk write — re-projecting the file
-/// once per chunk, and refusing chunks whose partial bytes did not parse.
-/// Instead a WRITE stages its bytes in the node's record (reads of that node
-/// already see them) and names the node here; the staged nodes are committed
-/// once writes have been quiet for [`COMMIT_IDLE`] (hf-mount's debounced
-/// flush), before any operation that changes the tree's shape, and when the
-/// server is dropped.
+/// Changes received but not yet committed. A client writes a file as
+/// SETATTR(size), one UNSTABLE WRITE per chunk, then COMMIT at fsync or
+/// close. Splicing each chunk as it arrived published every torn
+/// intermediate state of a multi-chunk write and refused chunks whose
+/// partial bytes did not parse, so a change stages its bytes in the node's
+/// record (reads of that node already see them) and names the node here.
+///
+/// A written node is committed by the client's COMMIT for it. A truncated
+/// node with no write after it has no COMMIT coming — `: > f` sends SETATTR
+/// alone — so it is committed once it has stood for [`COMMIT_IDLE`]; a
+/// write after the truncate makes the COMMIT its commit. Both are committed
+/// before any operation that changes the tree's shape, and when the server
+/// is dropped.
 pub struct Staged {
     graph: Arc<dyn Graph>,
-    ids: Mutex<HashSet<String>>,
-    last_write: Mutex<Option<Instant>>,
+    nodes: Mutex<HashMap<String, Stage>>,
+}
+
+/// What a staged node is waiting for.
+#[derive(Clone, Copy)]
+enum Stage {
+    /// Written: the client's COMMIT.
+    Written,
+    /// Truncated at this instant, with no write since: the idle window.
+    Truncated(Instant),
 }
 
 impl Staged {
     fn new(graph: Arc<dyn Graph>) -> Self {
         Self {
             graph,
-            ids: Mutex::new(HashSet::new()),
-            last_write: Mutex::new(None),
+            nodes: Mutex::new(HashMap::new()),
         }
     }
 
-    fn stage(&self, id: &str, now: Instant) {
-        self.ids.lock().insert(id.to_string());
-        *self.last_write.lock() = Some(now);
+    /// A truncate of a node already written waits, with the write, for its
+    /// COMMIT.
+    fn stage_truncate(&self, id: &str, now: Instant) {
+        self.nodes
+            .lock()
+            .entry(id.to_string())
+            .or_insert(Stage::Truncated(now));
     }
 
-    /// Commit every staged node through the graph's flush (the one write
-    /// path). A node whose staged bytes do not make a valid file is logged
-    /// and left with its write unapplied to the source, as a refused flush
-    /// always has been.
+    fn stage_write(&self, id: &str) {
+        self.nodes.lock().insert(id.to_string(), Stage::Written);
+    }
+
+    /// Commit one node through the graph's flush (the one write path), if
+    /// it has anything staged. A refused flush is returned: the node's
+    /// bytes stay in its record, unapplied to the source.
+    fn commit_node(&self, id: &str) -> anyhow::Result<()> {
+        let staged = self.nodes.lock().remove(id).is_some();
+        if staged {
+            self.graph.flush_node(id)?;
+        }
+        Ok(())
+    }
+
+    /// Commit every staged node. One whose staged bytes do not make a valid
+    /// file is logged and left with its change unapplied to the source.
     pub fn commit(&self) {
-        let ids: Vec<String> = self.ids.lock().drain().collect();
-        *self.last_write.lock() = None;
+        let ids: Vec<String> = self.nodes.lock().drain().map(|(id, _)| id).collect();
         for id in ids {
             if let Err(e) = self.graph.flush_node(&id) {
                 log::warn!("NFS commit of {id} refused: {e:#}");
@@ -62,14 +87,29 @@ impl Staged {
         }
     }
 
-    /// Commit if the last write was at least `idle` before `now`. Returns
-    /// whether it committed.
+    /// Commit every truncate that has stood for `idle` before `now`.
+    /// Returns whether it committed any.
     pub fn commit_if_idle(&self, now: Instant, idle: Duration) -> bool {
-        let quiet = matches!(*self.last_write.lock(), Some(t) if now.duration_since(t) >= idle);
-        if quiet {
-            self.commit();
+        let due: Vec<String> = {
+            let mut nodes = self.nodes.lock();
+            let due: Vec<String> = nodes
+                .iter()
+                .filter(|(_, stage)| {
+                    matches!(stage, Stage::Truncated(t) if now.duration_since(*t) >= idle)
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &due {
+                nodes.remove(id);
+            }
+            due
+        };
+        for id in &due {
+            if let Err(e) = self.graph.flush_node(id) {
+                log::warn!("NFS commit of {id} refused: {e:#}");
+            }
         }
-        quiet
+        !due.is_empty()
     }
 }
 
@@ -297,7 +337,7 @@ impl NFSFileSystem for LeylineNfs {
                     .write_content(&node_id, &kept, 0)
                     .map_err(|_| nfsstat3::NFS3ERR_IO)?;
             }
-            self.staged.stage(&node_id, Instant::now());
+            self.staged.stage_truncate(&node_id, Instant::now());
         }
 
         // Re-fetch updated attrs
@@ -326,20 +366,48 @@ impl NFSFileSystem for LeylineNfs {
         Ok((buf, eof))
     }
 
-    /// Stage the chunk; [`Staged`] commits the whole write once it is done.
+    /// An UNSTABLE write: the server's WRITE calls [`Self::write_stable`].
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
+        Ok(self.write_stable(id, offset, data, false).await?.0)
+    }
+
+    /// Stage the chunk. An UNSTABLE write is answered UNSTABLE and waits for
+    /// the client's COMMIT; a FILE_SYNC or DATA_SYNC write is committed
+    /// before it is answered. A refused commit fails the write.
+    async fn write_stable(
+        &self,
+        id: fileid3,
+        offset: u64,
+        data: &[u8],
+        stable: bool,
+    ) -> Result<(fattr3, bool), nfsstat3> {
         let node_id = self.resolve_id(id)?;
         self.graph
             .write_content(&node_id, data, offset)
             .map_err(|_| nfsstat3::NFS3ERR_IO)?;
-        self.staged.stage(&node_id, Instant::now());
+        self.staged.stage_write(&node_id);
+        if stable {
+            self.commit(id, 0, 0).await?;
+        }
 
         let node = self
             .graph
             .get_node(&node_id)
             .map_err(|_| nfsstat3::NFS3ERR_IO)?
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
-        Ok(self.node_to_fattr3(id, &node))
+        Ok((self.node_to_fattr3(id, &node), stable))
+    }
+
+    /// The client's COMMIT (at fsync or close): splice the node's staged
+    /// bytes into its file. The whole node is committed whatever range is
+    /// named, since a file is spliced whole. A refused splice is an I/O
+    /// error, so the fsync or close reports it.
+    async fn commit(&self, id: fileid3, _offset: u64, _count: u32) -> Result<(), nfsstat3> {
+        let node_id = self.resolve_id(id)?;
+        self.staged.commit_node(&node_id).map_err(|e| {
+            log::warn!("NFS commit of {node_id} refused: {e:#}");
+            nfsstat3::NFS3ERR_IO
+        })
     }
 
     async fn create(
@@ -803,59 +871,101 @@ mod tests {
             nfs.read(ino, 0, 4096).await.unwrap().0
         }
 
-        /// Committing as if the idle window had passed.
+        /// Committing truncates as if the idle window had passed.
         fn commit_now(nfs: &LeylineNfs) -> bool {
             nfs.staged()
                 .commit_if_idle(Instant::now() + COMMIT_IDLE, COMMIT_IDLE)
         }
 
-        /// A truncating write in two chunks — SETATTR(size 0), WRITE, WRITE —
-        /// reaches the write path once, whole. Before, each WRITE spliced
-        /// what it had so far, so `<p>wor</p>` was published on the way to
-        /// `<p>world</p>`.
+        /// A truncating write in two UNSTABLE chunks — SETATTR(size 0),
+        /// WRITE, WRITE, COMMIT — reaches the write path once, whole, at the
+        /// COMMIT, and the idle window does not commit it first. Before, the
+        /// server answered every WRITE FILE_SYNC, had no COMMIT, and spliced
+        /// on a 200 ms quiet timer (bead 3c4893).
         #[tokio::test]
-        async fn a_multi_chunk_write_is_committed_once_whole() {
+        async fn unstable_writes_commit_once_whole_at_the_commit() {
             let (nfs, recorder) = html_nfs();
             let ino = text_leaf(&nfs).await;
             nfs.getattr(ino).await.unwrap();
             nfs.setattr(ino, size(0)).await.unwrap();
-            nfs.write(ino, 0, b"wor").await.unwrap();
-            assert!(
-                recorder.writes.lock().is_empty(),
-                "a first chunk is not a file"
-            );
-            let attr = nfs.write(ino, 3, b"ld").await.unwrap();
+            let (_, stable) = nfs.write_stable(ino, 0, b"wor", false).await.unwrap();
+            assert!(!stable, "an unstable write is answered UNSTABLE");
+            let (attr, _) = nfs.write_stable(ino, 3, b"ld", false).await.unwrap();
             assert_eq!(attr.size, 5);
             assert_eq!(
                 read_all(&nfs, ino).await,
                 b"world",
                 "reads see staged bytes"
             );
+            assert!(!commit_now(&nfs), "the idle window leaves a write alone");
             assert!(
                 recorder.writes.lock().is_empty(),
-                "nothing commits mid-stream"
+                "nothing commits before the COMMIT"
             );
 
-            assert!(commit_now(&nfs));
+            nfs.commit(ino, 0, 0).await.unwrap();
             assert_eq!(*recorder.writes.lock(), vec![b"<p>world</p>\n".to_vec()]);
             assert_eq!(read_all(&nfs, text_leaf(&nfs).await).await, b"world");
+            nfs.commit(ino, 0, 0).await.unwrap();
+            assert_eq!(
+                recorder.writes.lock().len(),
+                1,
+                "a second COMMIT has nothing to commit"
+            );
         }
 
-        /// Before the idle window has passed there is nothing to commit
-        /// yet; with no write staged there is nothing to commit at all.
+        /// A FILE_SYNC write is committed before it is answered, and is
+        /// answered FILE_SYNC.
         #[tokio::test]
-        async fn the_idle_commit_waits_for_quiet() {
+        async fn a_file_sync_write_commits_before_it_returns() {
+            let (nfs, recorder) = html_nfs();
+            let ino = text_leaf(&nfs).await;
+            nfs.setattr(ino, size(0)).await.unwrap();
+            let (_, stable) = nfs.write_stable(ino, 0, b"bye", true).await.unwrap();
+            assert!(stable, "a committed write is answered FILE_SYNC");
+            assert_eq!(*recorder.writes.lock(), vec![b"<p>bye</p>\n".to_vec()]);
+        }
+
+        /// A COMMIT the write path refuses fails, so the client's fsync or
+        /// close reports the error instead of claiming the bytes are kept.
+        #[tokio::test]
+        async fn a_refused_commit_fails() {
+            let db = leyline_ts::parse_with_source(
+                b"<p>hello</p>\n",
+                leyline_ts::languages::TsLanguage::Html,
+                "test.html",
+            )
+            .unwrap();
+            // No source writer: every edit to a parsed file is refused.
+            let nfs = LeylineNfs::new(Arc::new(SqliteGraphAdapter::new_writable(&db).unwrap()));
+            let ino = text_leaf(&nfs).await;
+            nfs.write_stable(ino, 0, b"HELLO", false).await.unwrap();
+            assert!(matches!(
+                nfs.commit(ino, 0, 0).await,
+                Err(nfsstat3::NFS3ERR_IO)
+            ));
+            assert!(matches!(
+                nfs.write_stable(ino, 0, b"HELLO", true).await,
+                Err(nfsstat3::NFS3ERR_IO)
+            ));
+        }
+
+        /// A truncate with no write after it — `: > f` sends SETATTR alone,
+        /// and no COMMIT follows — commits once the idle window has passed,
+        /// and not before.
+        #[tokio::test]
+        async fn a_bare_truncate_commits_after_the_idle_window() {
             let (nfs, recorder) = html_nfs();
             assert!(!commit_now(&nfs), "nothing staged");
             let ino = text_leaf(&nfs).await;
-            nfs.write(ino, 0, b"HELLO").await.unwrap();
+            nfs.setattr(ino, size(3)).await.unwrap();
             assert!(
                 !nfs.staged()
                     .commit_if_idle(Instant::now(), Duration::from_secs(3600))
             );
             assert!(recorder.writes.lock().is_empty());
             assert!(commit_now(&nfs));
-            assert_eq!(recorder.writes.lock().len(), 1);
+            assert_eq!(*recorder.writes.lock(), vec![b"<p>hel</p>\n".to_vec()]);
         }
 
         #[tokio::test]
@@ -865,7 +975,7 @@ mod tests {
             assert_eq!(read_all(&nfs, ino).await, b"hello");
             nfs.setattr(ino, size(0)).await.unwrap();
             nfs.write(ino, 0, b"bye").await.unwrap();
-            assert!(commit_now(&nfs));
+            nfs.commit(ino, 0, 0).await.unwrap();
             assert_eq!(*recorder.writes.lock(), vec![b"<p>bye</p>\n".to_vec()]);
         }
 
@@ -889,7 +999,12 @@ mod tests {
             let ino = text_leaf(&nfs).await;
             nfs.write(ino, 7, b"x").await.unwrap();
             assert_eq!(read_all(&nfs, ino).await, b"hello\0\0x");
-            commit_now(&nfs);
+            // The zero-filled file reaches the write path, which refuses
+            // HTML with NULs in it; the COMMIT reports that refusal.
+            assert!(matches!(
+                nfs.commit(ino, 0, 0).await,
+                Err(nfsstat3::NFS3ERR_IO)
+            ));
             assert_eq!(
                 *recorder.writes.lock(),
                 vec![b"<p>hello\0\0x</p>\n".to_vec()]
@@ -997,7 +1112,7 @@ mod tests {
                 0,
                 "port 0 asks for one; the bound one is reported"
             );
-            server.staged.stage(leaf, Instant::now());
+            server.staged.stage_write(leaf);
             drop(server);
             assert_eq!(*recorder.writes.lock(), vec![b"<p>world</p>\n".to_vec()]);
         }

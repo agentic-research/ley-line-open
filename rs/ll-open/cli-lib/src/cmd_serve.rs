@@ -587,7 +587,7 @@ mod tests {
         // Tightening pin. The platform-specific choice is load-bearing
         // for daemon DX: on macOS, FUSE requires macFUSE/osxfuse which
         // is third-party and often unavailable, so the daemon defaults
-        // to NFS via the `nfsserve` crate. On Linux/BSD, FUSE is the
+        // to NFS via the `nessie-nfsserve` crate. On Linux/BSD, FUSE is the
         // standard. A refactor that flipped the cfg or removed the
         // platform branch would silently break daemon mount UX. Pin
         // platform-specific defaults so a typo (e.g. swapping the

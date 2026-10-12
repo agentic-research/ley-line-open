@@ -63,7 +63,13 @@ log = { workspace = true }
 rusqlite = { workspace = true, features = ["bundled", "serialize"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-nfsserve = { version = "0.10", optional = true }
+# nfsserve 0.11.0 plus a COMMIT procedure, a WRITE that reports the stability
+# it achieved, and AUTH_UNIX credentials (bead 3c4893). Upstream nfsserve
+# answers every WRITE FILE_SYNC and has no COMMIT, so a server cannot tell
+# when a client's write is finished. Pinned exactly: the fork has one
+# publisher, and its diff against upstream 0.11.0 was read before it was
+# taken; a new version gets the same reading.
+nfsserve = { package = "nessie-nfsserve", version = "=0.3.1", optional = true }
 crossbeam-queue = "0.3"
 async-trait = "0.1"
 # `time` + `macros`: the NFS server's idle committer (`nfs::Staged`).

@@ -4,7 +4,7 @@ use nfsserve::nfs::*;
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -32,35 +32,44 @@ const COMMIT_TICK: Duration = Duration::from_millis(50);
 /// is dropped.
 pub struct Staged {
     graph: Arc<dyn Graph>,
-    written: Mutex<HashSet<String>>,
-    truncated: Mutex<HashMap<String, Instant>>,
+    nodes: Mutex<HashMap<String, Stage>>,
+}
+
+/// What a staged node is waiting for.
+#[derive(Clone, Copy)]
+enum Stage {
+    /// Written: the client's COMMIT.
+    Written,
+    /// Truncated at this instant, with no write since: the idle window.
+    Truncated(Instant),
 }
 
 impl Staged {
     fn new(graph: Arc<dyn Graph>) -> Self {
         Self {
             graph,
-            written: Mutex::new(HashSet::new()),
-            truncated: Mutex::new(HashMap::new()),
+            nodes: Mutex::new(HashMap::new()),
         }
     }
 
+    /// A truncate of a node already written waits, with the write, for its
+    /// COMMIT.
     fn stage_truncate(&self, id: &str, now: Instant) {
-        if !self.written.lock().contains(id) {
-            self.truncated.lock().insert(id.to_string(), now);
-        }
+        self.nodes
+            .lock()
+            .entry(id.to_string())
+            .or_insert(Stage::Truncated(now));
     }
 
     fn stage_write(&self, id: &str) {
-        self.truncated.lock().remove(id);
-        self.written.lock().insert(id.to_string());
+        self.nodes.lock().insert(id.to_string(), Stage::Written);
     }
 
     /// Commit one node through the graph's flush (the one write path), if
     /// it has anything staged. A refused flush is returned: the node's
     /// bytes stay in its record, unapplied to the source.
     fn commit_node(&self, id: &str) -> anyhow::Result<()> {
-        let staged = self.written.lock().remove(id) | self.truncated.lock().remove(id).is_some();
+        let staged = self.nodes.lock().remove(id).is_some();
         if staged {
             self.graph.flush_node(id)?;
         }
@@ -70,8 +79,7 @@ impl Staged {
     /// Commit every staged node. One whose staged bytes do not make a valid
     /// file is logged and left with its change unapplied to the source.
     pub fn commit(&self) {
-        let mut ids: Vec<String> = self.written.lock().drain().collect();
-        ids.extend(self.truncated.lock().drain().map(|(id, _)| id));
+        let ids: Vec<String> = self.nodes.lock().drain().map(|(id, _)| id).collect();
         for id in ids {
             if let Err(e) = self.graph.flush_node(&id) {
                 log::warn!("NFS commit of {id} refused: {e:#}");
@@ -83,14 +91,16 @@ impl Staged {
     /// Returns whether it committed any.
     pub fn commit_if_idle(&self, now: Instant, idle: Duration) -> bool {
         let due: Vec<String> = {
-            let mut truncated = self.truncated.lock();
-            let due: Vec<String> = truncated
+            let mut nodes = self.nodes.lock();
+            let due: Vec<String> = nodes
                 .iter()
-                .filter(|(_, t)| now.duration_since(**t) >= idle)
+                .filter(|(_, stage)| {
+                    matches!(stage, Stage::Truncated(t) if now.duration_since(*t) >= idle)
+                })
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in &due {
-                truncated.remove(id);
+                nodes.remove(id);
             }
             due
         };

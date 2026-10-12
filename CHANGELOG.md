@@ -10,6 +10,30 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.20.3] — 2026-10-12
+
+Patch release: a write through an NFS mount is in the stored source when
+its fsync or close returns. The projection stays `projection-v6`, the wire
+stays v1, the control block stays VERSION 3, and `SCHEMA_VERSION` stays
+0.20.2 (no `clients/go/leyline-schema` change, so no new schema tag).
+
+### Fixed
+
+- **An NFS mount write is in the stored source when its fsync or close
+  returns** (bead `ley-line-open-3c4893`). The NFS server answered every
+  WRITE `FILE_SYNC` and had no COMMIT, so it spliced a write into its file
+  200 ms after writes went quiet: fsync returned before `source_blobs` held
+  the bytes, a slow multi-chunk writer could be spliced mid-stream, and a
+  refused splice was only logged. A WRITE is now answered `UNSTABLE` and
+  spliced at the client's COMMIT (sent at fsync and close), a `FILE_SYNC`
+  WRITE is spliced before it is answered, and a refused splice fails the
+  COMMIT or WRITE with `EIO`. A truncate with no write after it (`: > f`
+  sends no COMMIT) is still spliced after 200 ms. The NFS layer is now
+  `nessie-nfsserve` 0.3.1, a fork of `nfsserve` 0.11.0 that adds COMMIT
+  and stability-aware WRITE replies; it replaces `nfsserve` 0.10.2. The
+  release smoke and the mount test read the stored source straight after
+  the fsync instead of waiting for it.
+
 ## [0.20.2] — 2026-10-11
 
 Patch release: the first rungs of ADR-0040 (the write boundary), a security

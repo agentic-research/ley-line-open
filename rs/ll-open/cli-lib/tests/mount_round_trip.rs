@@ -111,12 +111,6 @@ const ATTACH_DEADLINE: Duration = Duration::from_secs(10);
 /// outside the call (bead ley-line-open-667b3b).
 const KERNEL_OP_DEADLINE: Duration = Duration::from_secs(30);
 
-/// How long a write through the mount may take to reach `live.db`. The NFS
-/// server commits a write once writes have been quiet for `COMMIT_IDLE`
-/// (200 ms), because nfsserve gives it no COMMIT to commit on (bead
-/// ley-line-open-3c4893); FUSE commits on the fsync itself.
-const COMMIT_DEADLINE: Duration = Duration::from_secs(10);
-
 /// Run a kernel-facing filesystem call on its own thread and wait for it
 /// with a deadline. On timeout the mountpoint is force-unmounted and the
 /// test fails with a diagnosis naming the mount, instead of hanging
@@ -404,6 +398,22 @@ fn leaf_record(conn: &rusqlite::Connection) -> Vec<u8> {
     record.into_bytes()
 }
 
+/// `util.go`'s stored source bytes (`source_blobs`, ADR-0040's ring 0) as
+/// the daemon's own readers see them. Unlike the leaf's record, which a
+/// write updates at once, these change only when the write is committed.
+fn stored_source(conn: &rusqlite::Connection) -> String {
+    let bytes: Vec<u8> = conn
+        .query_row(
+            "SELECT b.blob_bytes FROM _source s \
+             JOIN source_blobs b ON b.blob_hash = s.content_hash \
+             WHERE s.id = 'util.go'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("util.go's stored source");
+    String::from_utf8(bytes).expect("util.go is UTF-8")
+}
+
 /// ADR-0040 D4, falsifier F2 (bead `ley-line-open-f2ee9f`; closes bead
 /// `192018`): a write through the daemon's mount is durable. Before D4 the
 /// mount edited a private copy of the arena and published from it, so the
@@ -451,23 +461,22 @@ async fn a_mount_write_survives_a_reparse_of_another_file_and_a_restart() {
         "the mount reads back its own write"
     );
 
-    // The write reaches the daemon's own readers once it commits.
-    let deadline = Instant::now() + COMMIT_DEADLINE;
-    loop {
-        let via_daemon = ctx
-            .with_read(|conn| Ok(leaf_record(conn)))
-            .expect("daemon read");
-        if via_daemon == EDITED {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the daemon's readers never saw the mount's write within \
-             {COMMIT_DEADLINE:?}; they read {:?}",
-            String::from_utf8_lossy(&via_daemon)
-        );
-        tokio::task::yield_now().await;
-    }
+    // The fsync committed the write (NFS: the client's COMMIT; FUSE: the
+    // fsync itself), so when it returns the daemon's readers see the edit
+    // in the leaf and in the stored source. Before bead 3c4893 the NFS
+    // server committed 200 ms after writes went quiet, and this waited.
+    let (record, source) = ctx
+        .with_read(|conn| Ok((leaf_record(conn), stored_source(conn))))
+        .expect("daemon read");
+    assert_eq!(
+        String::from_utf8_lossy(&record),
+        String::from_utf8_lossy(EDITED),
+        "the daemon's readers see the mount's write"
+    );
+    assert!(
+        source.starts_with("package edited\n"),
+        "the stored source holds the write once its fsync returns; it is {source:?}"
+    );
 
     // The daemon reparses a DIFFERENT file and republishes, which is exactly
     // the sequence that used to drop the edit.

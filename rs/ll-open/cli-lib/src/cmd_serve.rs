@@ -92,10 +92,12 @@ pub fn nfs_listen_addr(port: u16) -> String {
     format!("127.0.0.1:{port}")
 }
 
-/// Shell out to mount_nfs (macOS) or mount.nfs (Linux) to mount the NFS
-/// export; the returned guard unmounts it when dropped.
+/// Shell out to mount_nfs (macOS) or mount.nfs (Linux) to mount `server`'s
+/// export; the returned guard owns the server, and dropping it unmounts and
+/// then stops the server.
 #[cfg(feature = "mount")]
-pub fn mount_nfs_cmd(port: u16, mountpoint: &Path) -> Result<NfsMount> {
+pub fn mount_nfs_cmd(server: leyline_fs::nfs::NfsServer, mountpoint: &Path) -> Result<NfsMount> {
+    let port = server.port();
     std::fs::create_dir_all(mountpoint)
         .with_context(|| format!("create mountpoint {}", mountpoint.display()))?;
 
@@ -125,6 +127,7 @@ pub fn mount_nfs_cmd(port: u16, mountpoint: &Path) -> Result<NfsMount> {
     Ok(NfsMount {
         path: mount_path,
         unmount: unmount_nfs,
+        _server: server,
     })
 }
 
@@ -184,12 +187,17 @@ pub enum Mounted {
     Fuse(leyline_fs::fuse::FuseSession),
 }
 
-/// An NFS mount this process made; dropping it unmounts.
+/// An NFS mount this process made and the server behind it. Dropping it
+/// unmounts — the kernel flushes the client's last writes to the server —
+/// and then drops the server, which commits them before the drop returns.
+/// So the daemon's final snapshot, taken after this drop, holds every write.
 #[cfg(feature = "mount")]
 pub struct NfsMount {
     path: PathBuf,
     /// [`unmount_nfs`] in every real mount; a test substitutes a recorder.
     unmount: fn(&Path) -> Result<()>,
+    /// Dropped after `Drop::drop` has unmounted (fields drop after it).
+    _server: leyline_fs::nfs::NfsServer,
 }
 
 #[cfg(feature = "mount")]
@@ -231,9 +239,9 @@ pub async fn mount_backend(
     match backend {
         "nfs" => {
             let listen_addr = nfs_listen_addr(nfs_port);
-            let (port, _server) = leyline_fs::nfs::serve_nfs(graph, &listen_addr).await?;
-            eprintln!("NFS server listening on port {port}");
-            let mounted = mount_nfs_cmd(port, mount)?;
+            let server = leyline_fs::nfs::serve_nfs(graph, &listen_addr).await?;
+            eprintln!("NFS server listening on port {}", server.port());
+            let mounted = mount_nfs_cmd(server, mount)?;
             eprintln!("mounted at {}", mount.display());
             Ok(Mounted::Nfs(mounted))
         }
@@ -371,18 +379,23 @@ mod tests {
     /// Dropping an NFS mount unmounts its own path — the daemon and `serve`
     /// rely on the drop alone to leave no mount behind.
     #[cfg(feature = "mount")]
-    #[test]
-    fn dropping_an_nfs_mount_unmounts_its_path() {
+    #[tokio::test]
+    async fn dropping_an_nfs_mount_unmounts_its_path() {
         use std::sync::Mutex;
         static UNMOUNTED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
         fn record(path: &Path) -> Result<()> {
             UNMOUNTED.lock().unwrap().push(path.to_path_buf());
             Ok(())
         }
+        let graph = Arc::new(leyline_fs::graph::MemoryGraph::new());
+        let server = leyline_fs::nfs::serve_nfs(graph, &nfs_listen_addr(0))
+            .await
+            .unwrap();
         let path = PathBuf::from("/nonexistent/leyline-test-mount");
         drop(NfsMount {
             path: path.clone(),
             unmount: record,
+            _server: server,
         });
         assert_eq!(*UNMOUNTED.lock().unwrap(), vec![path]);
     }

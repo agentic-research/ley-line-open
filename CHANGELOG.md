@@ -10,6 +10,35 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The mount tests mount what the daemon mounts, and an NFS unmount
+  commits the last write** (bead `ley-line-open-a384f4`). On macOS
+  `mount_round_trip` mounted over FUSE through fuse-t, which the daemon does
+  not use there (its macOS default is our NFS server), so the shipped macOS
+  mount went untested by it and every flake it had was fuse-t's: each
+  fuse-t server listened on port 52100 and outlived its unmount by seconds,
+  and the next mount collided with it. The tests now mount through
+  `cmd_serve::mount_backend` on `default_backend()` with an ephemeral NFS
+  port; the fuse-t process handling (pid scans, orphan reaping) is gone, and
+  the wedge falsifier wedges an in-process graph instead of SIGSTOPping a
+  fuse-t server. `serve_nfs` now returns an `NfsServer` that the mount
+  guard owns: dropping the guard unmounts, then stops the server and
+  commits its staged writes before returning. Before, the server task was
+  detached, so a write in its last 200 ms idle window was not in the
+  daemon's final snapshot.
+
+- **A macOS mount reports a source file's own mtime** (bead
+  `ley-line-open-ca51fa`'s NFS half, found by the test above on its first
+  NFS run). The NFS server reported the current time for every directory,
+  so `stat` on a source file's entry never showed the file's mtime on
+  macOS; FUSE was fixed and NFS never was. It reports the current time only
+  for directories whose stored mtime does not move with their entries (the
+  root and structural directories, whose cached listings an NFSv3 client
+  would otherwise reuse), and the stored mtime for the rest. The new
+  `Graph::mtime_tracks_entries` says which: in the SQL projection, every
+  node of a parsed file (nid >= 0).
+
 ### Added
 
 - **`task index:clones` reports exact structural clones** (`tools/clone_index.sh`,

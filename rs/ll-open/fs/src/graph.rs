@@ -69,6 +69,15 @@ pub trait Graph: Send + Sync {
         Ok(out)
     }
 
+    /// Whether directory `id`'s mtime moves every time its entries change.
+    /// An NFSv3 client keeps a cached listing for as long as the directory's
+    /// mtime is unchanged, so a server may report a directory's stored mtime
+    /// only when this holds; otherwise it must report a moving one. Default:
+    /// no.
+    fn mtime_tracks_entries(&self, _id: &str) -> Result<bool> {
+        Ok(false)
+    }
+
     fn write_content(&self, _id: &str, _data: &[u8], _offset: u64) -> Result<usize> {
         anyhow::bail!("read-only filesystem")
     }
@@ -837,6 +846,21 @@ impl Graph for SqliteGraphAdapter {
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
                 Err(e) => Err(e.into()),
             }
+        })
+    }
+
+    /// A node of a parsed file (nid >= 0: the file row and its syntax
+    /// nodes) is rewritten, every row with a new mtime, whenever the file is
+    /// reparsed or written, and that is the only way its entries change. A
+    /// structural directory (negative nid) keeps the mtime of the parse that
+    /// created it while files come and go under it (`ensure_dir_nodes`), and
+    /// the root has none.
+    fn mtime_tracks_entries(&self, id: &str) -> Result<bool> {
+        if id.is_empty() {
+            return Ok(false);
+        }
+        self.with_reader(|conn| {
+            Ok(leyline_schema::resolve_path(conn, id)?.is_some_and(|nid| nid >= 0))
         })
     }
 
@@ -1808,6 +1832,10 @@ impl Graph for HotSwapGraph {
 
     fn read_content(&self, id: &str, buf: &mut [u8], offset: u64) -> Result<usize> {
         self.maybe_swap()?.read_content(id, buf, offset)
+    }
+
+    fn mtime_tracks_entries(&self, id: &str) -> Result<bool> {
+        self.maybe_swap()?.mtime_tracks_entries(id)
     }
 
     fn write_content(&self, id: &str, data: &[u8], offset: u64) -> Result<usize> {

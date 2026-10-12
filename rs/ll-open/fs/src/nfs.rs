@@ -135,10 +135,24 @@ impl LeylineNfs {
             (ftype3::NF3REG, 0o644, node.size)
         };
 
-        // Directories use dynamic mtime so the NFS client always invalidates
-        // its readdir cache. Without this, the synthetic root (mtime=0) causes
-        // stale empty listings after data is loaded or reverted.
-        let mtime = if node.is_dir {
+        // An NFSv3 client reuses a cached listing while the directory's mtime
+        // is unchanged, so a directory whose stored mtime does not move with
+        // its entries — the synthetic root (mtime 0), a structural directory
+        // — reports the current time, and the client always relists it. A
+        // directory whose mtime does move with them — a source file's entry —
+        // reports its own, which is the file's mtime (bead ca51fa). Reporting
+        // the current time for those too hid the file's mtime from every
+        // macOS mount. A failed check takes the moving mtime: a stale listing
+        // is worse than a wrong timestamp.
+        let moving = node.is_dir
+            && !self
+                .graph
+                .mtime_tracks_entries(&node.id)
+                .unwrap_or_else(|e| {
+                    log::warn!("mtime check for {}: {e:#}", node.id);
+                    false
+                });
+        let mtime = if moving {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default();
@@ -502,24 +516,48 @@ impl NFSFileSystem for LeylineNfs {
     }
 }
 
+/// A running NFS server. Dropping it stops the server and commits every
+/// staged write before the drop returns, so whoever drops it — the mount
+/// guard, after unmounting — can publish knowing the last write is in.
+/// Before, the server task was detached: unmount returned with a write
+/// still inside the idle window, the daemon's final snapshot missed it, and
+/// it committed whenever the runtime happened to drop the task.
+pub struct NfsServer {
+    port: u16,
+    staged: Arc<Staged>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl NfsServer {
+    /// The port the server bound (the one asked for, or the one picked for 0).
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+impl Drop for NfsServer {
+    fn drop(&mut self) {
+        self.task.abort();
+        self.staged.commit();
+    }
+}
+
 /// Start an NFS server on the given address, serving the provided graph.
-/// Returns the actual port the server bound to.
-/// The server runs in the background until the returned handle is dropped/aborted.
-pub async fn serve_nfs(
-    graph: Arc<dyn Graph>,
-    listen_addr: &str,
-) -> anyhow::Result<(u16, tokio::task::JoinHandle<()>)> {
+/// The server runs in the background until the returned [`NfsServer`] is
+/// dropped.
+pub async fn serve_nfs(graph: Arc<dyn Graph>, listen_addr: &str) -> anyhow::Result<NfsServer> {
     let fs = LeylineNfs::new(graph);
     let staged = fs.staged();
     let listener = NFSTcpListener::bind(listen_addr, fs).await?;
     let port = listener.get_listen_port();
-    let handle = tokio::spawn(async move {
+    let idle = staged.clone();
+    let task = tokio::spawn(async move {
         // The idle committer runs beside the server and ends with it.
         let committer = async {
             let mut tick = tokio::time::interval(COMMIT_TICK);
             loop {
                 tick.tick().await;
-                staged.commit_if_idle(Instant::now(), COMMIT_IDLE);
+                idle.commit_if_idle(Instant::now(), COMMIT_IDLE);
             }
         };
         tokio::select! {
@@ -531,7 +569,7 @@ pub async fn serve_nfs(
             () = committer => {}
         }
     });
-    Ok((port, handle))
+    Ok(NfsServer { port, staged, task })
 }
 
 #[cfg(test)]
@@ -881,6 +919,86 @@ mod tests {
             nfs.setattr(ino, size(0)).await.unwrap();
             nfs.write(ino, 0, b"world").await.unwrap();
             drop(nfs);
+            assert_eq!(*recorder.writes.lock(), vec![b"<p>world</p>\n".to_vec()]);
+        }
+
+        /// A source file's entry reports the file's stored mtime (bead
+        /// ca51fa); the structural directory above it and the root, whose
+        /// stored mtimes do not move with their entries, report the current
+        /// time so the client relists them. Before, every directory reported
+        /// the current time, the source file's entry included.
+        #[tokio::test]
+        async fn a_source_file_reports_its_mtime_and_the_directories_above_it_move() {
+            let db = leyline_ts::parse_with_source(
+                b"<p>hello</p>\n",
+                leyline_ts::languages::TsLanguage::Html,
+                "web/test.html",
+            )
+            .unwrap();
+            let graph: Arc<dyn Graph> = Arc::new(SqliteGraphAdapter::new_writable(&db).unwrap());
+            let stored = graph.get_node("web/test.html").unwrap().unwrap();
+            assert!(stored.is_dir, "a source file's entry is a directory");
+            let nfs = LeylineNfs::new(graph);
+            let web = nfs
+                .lookup(ROOT_FILEID, &b"web".to_vec().into())
+                .await
+                .unwrap();
+            let file = nfs
+                .lookup(web, &b"test.html".to_vec().into())
+                .await
+                .unwrap();
+            let before = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as u32;
+
+            let file_attr = nfs.getattr(file).await.unwrap();
+            assert_eq!(
+                (file_attr.mtime.seconds, file_attr.mtime.nseconds),
+                (
+                    (stored.mtime_nanos / 1_000_000_000) as u32,
+                    (stored.mtime_nanos % 1_000_000_000) as u32
+                ),
+                "the source file's entry reports the file's own mtime"
+            );
+            for (name, ino) in [("root", ROOT_FILEID), ("web", web)] {
+                let attr = nfs.getattr(ino).await.unwrap();
+                assert!(
+                    attr.mtime.seconds >= before,
+                    "{name} reports the current time, got {}",
+                    attr.mtime.seconds
+                );
+            }
+        }
+
+        /// Dropping a running server commits its staged writes before the
+        /// drop returns, not whenever the runtime later drops the task. On
+        /// this single-threaded runtime the server task has not run once by
+        /// the drop, so only the drop itself can have committed.
+        #[tokio::test]
+        async fn dropping_a_running_server_commits_before_it_returns() {
+            let db = leyline_ts::parse_with_source(
+                b"<p>hello</p>\n",
+                leyline_ts::languages::TsLanguage::Html,
+                "test.html",
+            )
+            .unwrap();
+            let mut adapter = SqliteGraphAdapter::new_writable(&db).unwrap();
+            let recorder = Arc::new(Recorder::default());
+            adapter.set_source_writer(recorder.clone());
+            let graph: Arc<dyn Graph> = Arc::new(adapter);
+            let leaf = "test.html/element/text";
+            graph.truncate(leaf).unwrap();
+            graph.write_content(leaf, b"world", 0).unwrap();
+
+            let server = serve_nfs(graph, "127.0.0.1:0").await.unwrap();
+            assert_ne!(
+                server.port(),
+                0,
+                "port 0 asks for one; the bound one is reported"
+            );
+            server.staged.stage(leaf, Instant::now());
+            drop(server);
             assert_eq!(*recorder.writes.lock(), vec![b"<p>world</p>\n".to_vec()]);
         }
     }

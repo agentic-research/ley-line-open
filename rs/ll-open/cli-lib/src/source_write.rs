@@ -1,9 +1,13 @@
-//! ADR-0040 D3 — the one write path (bead `ley-line-open-f2ffbd`).
+//! ADR-0040 D3 — the one write path (bead `ley-line-open-f2ffbd`), and the
+//! proposal it is the one-file case of (ADR-0041 P1-P2).
 //!
-//! `write(grant, path, bytes)` is the only way a file's bytes change in an
-//! arena. It refuses a path outside the grant before touching anything, then
-//! hands the bytes to the cold parse as that one file's content, so the
-//! write lands exactly what a cold parse of the same bytes lands:
+//! `propose(grant, writes)` is the only way a file's bytes change in an
+//! arena; `write(grant, path, bytes)` is its one-file, unchecked case. A
+//! proposal is refused whole before anything is touched when a path is
+//! outside the grant, a file moved since its author read it (its
+//! [`Base`]), or a file does not parse; otherwise every file is handed to
+//! the cold parse in one pass and one transaction, so the proposal lands
+//! exactly what a cold parse of the same bytes lands:
 //!
 //! - the bytes in `source_blobs` under their hash, and `_source.content_hash`
 //!   naming that row (bead `0d3b72`);
@@ -57,51 +61,162 @@ pub struct Written {
     pub tree_root: Hash,
 }
 
-/// Write `bytes` as the content of the file `path` names.
-///
-/// Refused, with no change to the arena, when `path` is outside `grant`,
-/// when no `_source` row names it, when the arena does not record where the
-/// file's tree is rooted, or when the bytes do not parse cleanly in the
-/// file's language. Any failure inside the projection rolls the whole write
-/// back.
-pub fn write(conn: &Connection, grant: &Grant, path: &str, bytes: Vec<u8>) -> Result<Written> {
-    if !grant.covers(path) {
-        bail!("write to '{path}' refused: the path is outside the grant");
-    }
-    let (language, abs_path): (String, Option<String>) = conn
-        .query_row(
-            "SELECT language, path FROM _source WHERE id = ?1",
-            [path],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?
-        .with_context(|| format!("write to '{path}' refused: no such file in this arena"))?;
-    let abs_path = abs_path.with_context(|| {
-        format!(
-            "write to '{path}' refused: the arena records no tree root for it \
-             (it was not produced by `leyline parse` or the daemon)"
-        )
-    })?;
-    let root = tree_root_dir(Path::new(&abs_path), path)?;
-    let lang = leyline_ts::languages::TsLanguage::from_name(&language)?;
-    leyline_ts::splice::check_syntax(&bytes, lang.ts_language())
-        .with_context(|| format!("write to '{path}' refused"))?;
+/// What a proposal's author read of a file, checked before the proposal is
+/// applied (ADR-0041 P2).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Base {
+    /// No check: the write replaces whatever the file holds. What a writer
+    /// that read nothing first (a splice of known bytes) uses.
+    Any,
+    /// The `source_blobs` hash of the file's bytes when the author read
+    /// them. The proposal is refused unless the file still holds them.
+    Blob(Hash),
+}
 
-    let source_blob_hash = {
-        use leyline_core::ContentAddressed;
-        bytes.as_slice().hash()
-    };
-    let result = crate::cmd_parse::parse_written_file(
+/// One file a proposal writes: its `_source.id`, the base its author read,
+/// and its new bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Proposed {
+    pub path: String,
+    pub base: Base,
+    pub bytes: Vec<u8>,
+}
+
+/// A proposal refused because a file it writes moved since its author read
+/// it. Typed so a caller can map it to `ESTALE`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Stale {
+    pub path: String,
+    /// The blob the author read.
+    pub expected: Hash,
+    /// The blob the file holds now.
+    pub current: Hash,
+}
+
+impl std::fmt::Display for Stale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "proposal refused: '{}' moved since it was read (read blob {}, now {})",
+            self.path, self.expected, self.current
+        )
+    }
+}
+
+impl std::error::Error for Stale {}
+
+/// What an accepted proposal produced.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Accepted {
+    /// Each written path's new `source_blobs` key, now its `_source.content_hash`.
+    pub blobs: std::collections::BTreeMap<String, Hash>,
+    /// The arena's `treeRoot` after the proposal.
+    pub tree_root: Hash,
+}
+
+/// Apply `writes` as one change: every file lands, in one transaction, or
+/// none does (ADR-0041 P1).
+///
+/// Refused, with no change to the arena, when any path is outside `grant`,
+/// names no `_source` row, or appears twice; when the arena does not record
+/// where a file's tree is rooted, or the files are under different roots;
+/// when any base no longer matches the file ([`Stale`]); or when any file's
+/// bytes do not parse cleanly in its language. Any failure inside the
+/// projection rolls the whole proposal back.
+///
+/// Bases are checked before the projection's transaction opens, on the
+/// writer's connection. They hold against every other writer because the
+/// arena has one writer: the daemon's writer lock, or the one process that
+/// owns a file-backed database.
+pub fn propose(conn: &Connection, grant: &Grant, writes: Vec<Proposed>) -> Result<Accepted> {
+    use leyline_core::ContentAddressed;
+    if writes.is_empty() {
+        bail!("proposal refused: it writes nothing");
+    }
+    for w in &writes {
+        if !grant.covers(&w.path) {
+            bail!(
+                "write to '{}' refused: the path is outside the grant",
+                w.path
+            );
+        }
+    }
+
+    let mut root: Option<PathBuf> = None;
+    let mut files = std::collections::BTreeMap::new();
+    let mut blobs = std::collections::BTreeMap::new();
+    for w in writes {
+        let path = w.path;
+        let (language, abs_path, held): (String, Option<String>, Option<Vec<u8>>) = conn
+            .query_row(
+                "SELECT language, path, content_hash FROM _source WHERE id = ?1",
+                [&path],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?
+            .with_context(|| format!("write to '{path}' refused: no such file in this arena"))?;
+        if let Base::Blob(expected) = w.base {
+            let current = held
+                .and_then(|h| <[u8; 32]>::try_from(h).ok())
+                .map(Hash::from_bytes)
+                .unwrap_or(Hash::ZERO);
+            if current != expected {
+                return Err(Stale {
+                    path,
+                    expected,
+                    current,
+                }
+                .into());
+            }
+        }
+        let abs_path = abs_path.with_context(|| {
+            format!(
+                "write to '{path}' refused: the arena records no tree root for it \
+                 (it was not produced by `leyline parse` or the daemon)"
+            )
+        })?;
+        let file_root = tree_root_dir(Path::new(&abs_path), &path)?;
+        match &root {
+            None => root = Some(file_root),
+            Some(r) if *r != file_root => bail!(
+                "proposal refused: '{path}' is under {}, not the proposal's tree {}",
+                file_root.display(),
+                r.display()
+            ),
+            Some(_) => {}
+        }
+        let lang = leyline_ts::languages::TsLanguage::from_name(&language)?;
+        leyline_ts::splice::check_syntax(&w.bytes, lang.ts_language())
+            .with_context(|| format!("write to '{path}' refused"))?;
+        blobs.insert(path.clone(), w.bytes.as_slice().hash());
+        if files.insert(path.clone(), w.bytes).is_some() {
+            bail!("proposal refused: it writes '{path}' twice");
+        }
+    }
+
+    let root = root.expect("a non-empty proposal names a root");
+    let result = crate::cmd_parse::parse_written_files(conn, &root, &files)?;
+    Ok(Accepted {
+        blobs,
+        tree_root: result.tree_root,
+    })
+}
+
+/// Write `bytes` as the content of the file `path` names, whatever it holds:
+/// a one-file [`propose`] with [`Base::Any`].
+pub fn write(conn: &Connection, grant: &Grant, path: &str, bytes: Vec<u8>) -> Result<Written> {
+    let accepted = propose(
         conn,
-        &root,
-        crate::cmd_parse::WrittenFile {
-            rel: path.to_string(),
+        grant,
+        vec![Proposed {
+            path: path.to_string(),
+            base: Base::Any,
             bytes,
-        },
+        }],
     )?;
     Ok(Written {
-        source_blob_hash,
-        tree_root: result.tree_root,
+        source_blob_hash: accepted.blobs[path],
+        tree_root: accepted.tree_root,
     })
 }
 
@@ -423,13 +538,13 @@ mod tests {
     fn a_written_file_the_cold_parse_refuses_rolls_back_and_keeps_the_file() {
         let a = arena(&[("a.go", A), ("b.go", B)]);
         let before = image(&a.conn, "a.go");
-        let err = crate::cmd_parse::parse_written_file(
+        let err = crate::cmd_parse::parse_written_files(
             &a.conn,
             a._src.path(),
-            crate::cmd_parse::WrittenFile {
-                rel: "a.go".to_string(),
-                bytes: b"package a\n\n// \0\n".to_vec(),
-            },
+            &std::collections::BTreeMap::from([(
+                "a.go".to_string(),
+                b"package a\n\n// \0\n".to_vec(),
+            )]),
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("binary file"), "{err:#}");
@@ -470,6 +585,118 @@ mod tests {
         assert_eq!(
             leyline_ts::splice::source_bytes(&a.conn, file_id(&a.conn, "a.go")).unwrap(),
             A.as_bytes(),
+        );
+    }
+
+    const B2: &str = "package a\n\nfunc C() string { return \"see\" }\n";
+
+    fn proposed(path: &str, base: Base, text: &str) -> Proposed {
+        Proposed {
+            path: path.to_string(),
+            base,
+            bytes: text.as_bytes().to_vec(),
+        }
+    }
+
+    fn blob(text: &str) -> Base {
+        Base::Blob(text.as_bytes().hash())
+    }
+
+    /// A proposal lands every file it names in one pass, exactly as a cold
+    /// parse of the resulting tree.
+    #[test]
+    fn a_proposal_lands_all_its_files_as_a_cold_parse() {
+        let a = arena(&[("a.go", A), ("b.go", B)]);
+        let w = propose(
+            &a.conn,
+            &Grant::Whole,
+            vec![proposed("a.go", blob(A), A2), proposed("b.go", blob(B), B2)],
+        )
+        .unwrap();
+        let cold = arena(&[("a.go", A2), ("b.go", B2)]);
+        assert_eq!(image(&a.conn, "a.go"), image(&cold.conn, "a.go"));
+        assert_eq!(image(&a.conn, "b.go"), image(&cold.conn, "b.go"));
+        let crate::tree_root::Verification::Valid {
+            tree_root: cold_root,
+            ..
+        } = crate::tree_root::verify(&cold.db).unwrap()
+        else {
+            panic!("a cold parse stamps a valid head");
+        };
+        assert_eq!(w.tree_root, cold_root);
+    }
+
+    /// A proposal is applied whole or not at all: one file that does not
+    /// parse refuses the others.
+    #[test]
+    fn a_proposal_with_one_invalid_file_changes_nothing() {
+        let a = arena(&[("a.go", A), ("b.go", B)]);
+        let before = whole_image(&a.conn);
+        let err = propose(
+            &a.conn,
+            &Grant::Whole,
+            vec![
+                proposed("a.go", blob(A), A2),
+                proposed("b.go", blob(B), "package a\nfunc ("),
+            ],
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("b.go"), "{err:#}");
+        assert!(
+            whole_image(&a.conn) == before,
+            "nothing of the proposal lands"
+        );
+    }
+
+    /// A base is the blob its author read. When the file has moved since,
+    /// the proposal is refused, says which file moved and to what, and
+    /// changes nothing: a stale overwrite never wins.
+    #[test]
+    fn a_stale_base_is_refused_and_names_what_moved() {
+        let a = arena(&[("a.go", A), ("b.go", B)]);
+        write(&a.conn, &Grant::Whole, "a.go", A2.as_bytes().to_vec()).unwrap();
+        let before = whole_image(&a.conn);
+
+        let err = propose(
+            &a.conn,
+            &Grant::Whole,
+            vec![
+                proposed("a.go", blob(A), "package a\n\nfunc A() int { return 3 }\n"),
+                proposed("b.go", blob(B), B2),
+            ],
+        )
+        .unwrap_err();
+        let stale = err.downcast_ref::<Stale>().expect("a typed stale refusal");
+        assert_eq!(
+            stale,
+            &Stale {
+                path: "a.go".to_string(),
+                expected: A.as_bytes().hash(),
+                current: A2.as_bytes().hash(),
+            }
+        );
+        assert!(
+            whole_image(&a.conn) == before,
+            "nothing of the proposal lands"
+        );
+    }
+
+    /// Every path of a proposal must be inside the grant, or none lands.
+    #[test]
+    fn a_proposal_reaching_outside_its_grant_changes_nothing() {
+        let a = arena(&[("a.go", A), ("b.go", B)]);
+        let before = whole_image(&a.conn);
+        let grant = Grant::Paths(BTreeSet::from(["a.go".to_string()]));
+        let err = propose(
+            &a.conn,
+            &grant,
+            vec![proposed("a.go", blob(A), A2), proposed("b.go", blob(B), B2)],
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("outside the grant"), "{err:#}");
+        assert!(
+            whole_image(&a.conn) == before,
+            "nothing of the proposal lands"
         );
     }
 

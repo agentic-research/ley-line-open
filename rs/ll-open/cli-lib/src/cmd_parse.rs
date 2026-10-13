@@ -777,18 +777,12 @@ pub struct ParseResult {
     pub tree_root: leyline_core::Hash,
 }
 
-/// ADR-0040 D3: one file's new bytes, handed to the parse in place of the
-/// file on disk. Built only by [`crate::source_write::write`].
-pub(crate) struct WrittenFile {
-    /// The file's `_source.id`: its path relative to the tree root.
-    pub rel: String,
-    pub bytes: Vec<u8>,
-}
-
 /// Bytes a pass reads from memory instead of from disk.
 enum InMemory<'a> {
-    /// ADR-0040 D3: one written file; the rest of the tree is untouched.
-    Written(&'a WrittenFile),
+    /// ADR-0040 D3: the files one proposal writes, keyed by `_source.id`;
+    /// the rest of the tree is untouched. Built only by
+    /// [`crate::source_write::propose`].
+    Written(&'a BTreeMap<String, Vec<u8>>),
     /// ADR-0040 D6: the whole tree, keyed by `_source.id`, read from
     /// `source_blobs` by `leyline rebuild`. No file is read from disk.
     Tree(&'a BTreeMap<String, Vec<u8>>),
@@ -797,8 +791,7 @@ enum InMemory<'a> {
 impl InMemory<'_> {
     fn bytes(&self, rel: &str) -> Option<&Vec<u8>> {
         match self {
-            InMemory::Written(w) => (w.rel == rel).then_some(&w.bytes),
-            InMemory::Tree(files) => files.get(rel),
+            InMemory::Written(files) | InMemory::Tree(files) => files.get(rel),
         }
     }
 }
@@ -969,21 +962,22 @@ pub fn parse_into_conn(
     parse_into_conn_with(conn, source, lang_filter, scope, None)
 }
 
-/// Project one written file through the cold parse (ADR-0040 D3). The pass is
-/// scoped to that file and reads its bytes from `written`, never from disk;
-/// a written file that fails to parse rolls the whole pass back.
-pub(crate) fn parse_written_file(
+/// Project written files through the cold parse (ADR-0040 D3), in one pass
+/// and one transaction. The pass is scoped to `written`'s paths and reads
+/// their bytes from it, never from disk; any written file that fails to
+/// parse rolls the whole pass back.
+pub(crate) fn parse_written_files(
     conn: &Connection,
     source: &Path,
-    written: WrittenFile,
+    written: &BTreeMap<String, Vec<u8>>,
 ) -> Result<ParseResult> {
-    let scope = [written.rel.clone()];
+    let scope: Vec<String> = written.keys().cloned().collect();
     parse_into_conn_with(
         conn,
         source,
         None,
         Some(&scope),
-        Some(InMemory::Written(&written)),
+        Some(InMemory::Written(written)),
     )
 }
 

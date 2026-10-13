@@ -10,6 +10,18 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Added
+
+- **Proposals: several files written as one change, refused if any moved
+  since it was read** (bead `ley-line-open-d25ec4`; ADR-0041 draft P1-P2).
+  `source_write::propose(grant, writes)` takes each file's path, the blob
+  hash its author read (`Base::Blob`, or `Base::Any` for no check) and its
+  new bytes. It is refused whole, with nothing changed, when a path is
+  outside the grant, a file no longer holds the blob its author read
+  (a typed `Stale` naming the path and both hashes), a file does not
+  parse, or a path repeats; otherwise every file lands in one parse pass
+  and one transaction. `write` is now its one-file, unchecked case.
+
 ### Fixed
 
 - **A parse or write is one transaction, including its `_meta` stamps**

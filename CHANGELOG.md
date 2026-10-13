@@ -25,6 +25,20 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **The WAL reader-pool latency gate no longer fails a healthy pool on a
+  loaded machine** (bead `ley-line-open-7c88ec`).
+  `concurrent_readers_beat_pre_15b_mutex_shape` required p99 read
+  latency under 10 ms and failed at 10.14 ms while the pool beat the
+  mutex baseline 1.45x with every reader checked out at once. The gate
+  guards against a fall back to DELETE-journal latency (120–250 ms p99);
+  it is now 50 ms. Readers serializing on a lock stays caught by the
+  test's structural checkout assertion. The control block's torn-root
+  test (`a_reader_overlapping_a_publish_never_sees_a_torn_root`) asserted
+  one completed read per publish, which a correct seqlock does not give
+  (one spinning read can span several publishes) and a starved reader
+  missed; it now asserts that a read was in flight during every
+  half-written root, waiting up to 5 s for the reader to run.
+
 - **A mount write acknowledged at fsync is on disk, not only in the page
   cache** (bead `ley-line-open-0a9931`). `live.db` ran WAL with
   `synchronous=NORMAL`, which does not sync the WAL on COMMIT, so the

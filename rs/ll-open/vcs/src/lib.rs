@@ -1349,6 +1349,10 @@ impl Graph for VersionedGraph {
         Ok(())
     }
 
+    fn note_base(&self, id: &str) -> Result<()> {
+        self.inner.note_base(id)
+    }
+
     fn flush_node(&self, id: &str) -> Result<()> {
         self.inner.flush_node(id)?;
         let _ = self.tx.send(WriteEvent::ContentChanged(id.to_string()));

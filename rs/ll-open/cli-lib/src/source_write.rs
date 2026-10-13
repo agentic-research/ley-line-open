@@ -230,8 +230,33 @@ pub struct MountWriter {
 
 #[cfg(feature = "mount")]
 impl leyline_fs::graph::SourceWriter for MountWriter {
-    fn write(&self, conn: &Connection, source_id: &str, bytes: Vec<u8>) -> Result<()> {
-        write(conn, &self.grant, source_id, bytes).map(|_| ())
+    /// A one-file [`propose`] against the base the mount took when the edit
+    /// began; a file that moved since is refused with the mount's
+    /// [`leyline_fs::graph::StaleWrite`].
+    fn write(
+        &self,
+        conn: &Connection,
+        source_id: &str,
+        bytes: Vec<u8>,
+        base: Option<Hash>,
+    ) -> Result<()> {
+        let proposed = Proposed {
+            path: source_id.to_string(),
+            base: base.map_or(Base::Any, Base::Blob),
+            bytes,
+        };
+        match propose(conn, &self.grant, vec![proposed]) {
+            Ok(_) => Ok(()),
+            Err(err) => match err.downcast::<Stale>() {
+                Ok(stale) => Err(leyline_fs::graph::StaleWrite {
+                    source_id: stale.path,
+                    expected: stale.expected,
+                    current: stale.current,
+                }
+                .into()),
+                Err(other) => Err(other),
+            },
+        }
     }
 }
 
@@ -770,7 +795,7 @@ mod tests {
             grant: Grant::Paths(BTreeSet::from(["b.go".to_string()])),
         };
         let err = narrow
-            .write(&a.conn, "a.go", A2.as_bytes().to_vec())
+            .write(&a.conn, "a.go", A2.as_bytes().to_vec(), None)
             .unwrap_err();
         assert!(format!("{err:#}").contains("outside the grant"), "{err:#}");
 
@@ -778,11 +803,48 @@ mod tests {
             grant: Grant::Whole,
         };
         whole
-            .write(&a.conn, "a.go", A2.as_bytes().to_vec())
+            .write(&a.conn, "a.go", A2.as_bytes().to_vec(), None)
             .unwrap();
         assert_eq!(
             leyline_ts::splice::source_bytes(&a.conn, file_id(&a.conn, "a.go")).unwrap(),
             A2.as_bytes(),
+        );
+    }
+
+    /// The mount's writer checks the base the mount hands it, and answers a
+    /// file that moved with the mount's own stale refusal, so the mount can
+    /// reply `ESTALE`.
+    #[cfg(feature = "mount")]
+    #[test]
+    fn the_mount_writer_refuses_a_moved_file_as_stale() {
+        use leyline_fs::graph::{SourceWriter, StaleWrite};
+        let a = arena(&[("a.go", A), ("b.go", B)]);
+        let writer = MountWriter {
+            grant: Grant::Whole,
+        };
+        writer
+            .write(
+                &a.conn,
+                "a.go",
+                A2.as_bytes().to_vec(),
+                Some(A.as_bytes().hash()),
+            )
+            .unwrap();
+        let err = writer
+            .write(
+                &a.conn,
+                "a.go",
+                b"package a\n\nfunc A() int { return 9 }\n".to_vec(),
+                Some(A.as_bytes().hash()),
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<StaleWrite>(),
+            Some(&StaleWrite {
+                source_id: "a.go".to_string(),
+                expected: A.as_bytes().hash(),
+                current: A2.as_bytes().hash(),
+            })
         );
     }
 

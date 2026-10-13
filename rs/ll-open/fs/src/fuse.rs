@@ -207,7 +207,15 @@ impl Filesystem for LeylineFuse {
         }
     }
 
-    fn open(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
+    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        // Opening for writing takes the edit's base (ADR-0041 P2), so a
+        // change that lands while the file is open is refused at flush.
+        if flags & libc::O_ACCMODE != libc::O_RDONLY
+            && let Some(id) = self.ino_to_id.get(&ino)
+            && let Err(e) = self.graph.note_base(id)
+        {
+            log::warn!("open({id}): taking the edit's base failed: {e:#}");
+        }
         reply.opened(0, 0);
     }
 
@@ -253,8 +261,8 @@ impl Filesystem for LeylineFuse {
         match self.graph.flush_node(&id) {
             Ok(()) => reply.ok(),
             Err(e) => {
-                log::warn!("flush_node failed for {id}: {e}");
-                reply.error(libc::EIO);
+                log::warn!("flush_node failed for {id}: {e:#}");
+                reply.error(flush_errno(&e));
             }
         }
     }
@@ -267,11 +275,14 @@ impl Filesystem for LeylineFuse {
         _datasync: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        // Per-node flush first
+        // Per-node flush first. A refused edit fails the fsync: the client
+        // must not be told the write is durable when it was discarded.
         if let Some(id) = self.ino_to_id.get(&ino).cloned()
             && let Err(e) = self.graph.flush_node(&id)
         {
-            log::warn!("fsync flush_node failed for {id}: {e}");
+            log::warn!("fsync flush_node failed for {id}: {e:#}");
+            reply.error(flush_errno(&e));
+            return;
         }
         // Then persist to arena (durable)
         match self.graph.flush_to_arena() {
@@ -531,10 +542,37 @@ pub fn mount_fuse(graph: Arc<dyn Graph>, mountpoint: &Path) -> anyhow::Result<Fu
     Ok(session)
 }
 
+/// The errno a refused flush answers: `ESTALE` when the file moved since
+/// the edit began (ADR-0041 P2), `EIO` for any other refusal.
+fn flush_errno(err: &anyhow::Error) -> i32 {
+    if err.downcast_ref::<crate::graph::StaleWrite>().is_some() {
+        libc::ESTALE
+    } else {
+        libc::EIO
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::graph::MemoryGraph;
+
+    /// A stale refusal reaches the client as `ESTALE`, wrapped in context or
+    /// not; every other refusal as `EIO`.
+    #[test]
+    fn a_stale_refusal_answers_estale_and_others_eio() {
+        let stale = || crate::graph::StaleWrite {
+            source_id: "a.go".to_string(),
+            expected: leyline_core::Hash::ZERO,
+            current: leyline_core::Hash::ZERO,
+        };
+        assert_eq!(flush_errno(&anyhow::Error::new(stale())), libc::ESTALE);
+        assert_eq!(
+            flush_errno(&anyhow::Error::new(stale()).context("flush")),
+            libc::ESTALE
+        );
+        assert_eq!(flush_errno(&anyhow::anyhow!("syntax errors")), libc::EIO);
+    }
 
     fn test_graph() -> Arc<dyn Graph> {
         let mut g = MemoryGraph::new();

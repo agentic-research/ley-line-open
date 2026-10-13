@@ -12,6 +12,26 @@ context, scoping notes, and review history are recoverable.
 
 ### Added
 
+- **A mount edit is refused with `ESTALE` when its file moved since the
+  edit began, and a refused edit is discarded** (bead
+  `ley-line-open-843e03`). The mount takes an edit's base — the hash of
+  the file's stored bytes — when the file is opened for writing (FUSE) or
+  at the first write after the last flush (NFS), and proposes the edit
+  against it. A file changed by someone else in between is refused:
+  FUSE answers `ESTALE`, NFS an I/O error. Any refused edit, stale or
+  invalid, is now discarded rather than left behind: the node reads as
+  the stored file again and the reason is recorded in `_errors`.
+  `SourceWriter::write` takes the base; `Graph::note_base` is new;
+  `leyline_fs::graph::StaleWrite` is the typed refusal. A client that
+  reads, closes and reopens a file to write takes its base at the reopen;
+  for a check against what an agent read, use the daemon's `propose`.
+
+### Fixed
+
+- **FUSE `fsync` reports a refused edit** (bead `ley-line-open-843e03`).
+  It logged a failed flush and returned success when publishing worked,
+  so a client was told a discarded write was durable.
+
 - **Proposals: several files written as one change, refused if any moved
   since it was read** (bead `ley-line-open-d25ec4`; ADR-0041 draft P1-P2).
   `source_write::propose(grant, writes)` takes each file's path, the blob

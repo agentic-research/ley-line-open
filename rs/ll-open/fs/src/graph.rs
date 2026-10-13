@@ -11,9 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use leyline_core::mmap::{mmap_read, mmap_write};
 use leyline_core::{ArenaHeader, ContentAddressed, Controller};
-// Used only by `batch_splice`'s post-reproject invalidation, which needs both
-// features; importing it unconditionally would warn on leaner builds.
-#[cfg(all(feature = "cdc", feature = "splice"))]
+// Used by the splice path (an edit's base, `batch_splice`'s invalidation);
+// importing it unconditionally would warn on leaner builds.
+#[cfg(feature = "splice")]
 use rusqlite::OptionalExtension;
 
 use crate::SqliteGraph;
@@ -92,6 +92,14 @@ pub trait Graph: Send + Sync {
     }
     fn rename_node(&self, _id: &str, _new_parent_id: &str, _new_name: &str) -> Result<()> {
         anyhow::bail!("read-only filesystem")
+    }
+
+    /// Take the base an edit to node `id` is made against: the hash of its
+    /// file's bytes now (ADR-0041 P2). A mount calls it when a file is opened
+    /// for writing, so a change that lands while it is open is caught at
+    /// flush; the first write takes it otherwise. Default no-op.
+    fn note_base(&self, _id: &str) -> Result<()> {
+        Ok(())
     }
 
     /// Flush pending splice for a node (called on FUSE flush/NFS write completion).
@@ -181,9 +189,42 @@ pub trait LiveSource: Send + Sync {
 #[cfg(feature = "splice")]
 pub trait SourceWriter: Send + Sync {
     /// Write `bytes` as the content of the file whose `_source.id` is
-    /// `source_id`, on `conn` — the adapter's writer connection.
-    fn write(&self, conn: &Connection, source_id: &str, bytes: Vec<u8>) -> Result<()>;
+    /// `source_id`, on `conn` — the adapter's writer connection. `base` is
+    /// the hash of the file's bytes the edit was made against (ADR-0041
+    /// P2); when it is set and the file no longer holds those bytes, the
+    /// write is refused with [`StaleWrite`]. `None` writes unconditionally.
+    fn write(
+        &self,
+        conn: &Connection,
+        source_id: &str,
+        bytes: Vec<u8>,
+        base: Option<leyline_core::Hash>,
+    ) -> Result<()>;
 }
+
+/// A mount edit refused because its file moved since the edit began: the
+/// file no longer holds the bytes the edit was made against. A mount answers
+/// it with `ESTALE` rather than a generic I/O error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StaleWrite {
+    pub source_id: String,
+    /// The hash of the bytes the edit was made against.
+    pub expected: leyline_core::Hash,
+    /// The hash of the bytes the file holds now.
+    pub current: leyline_core::Hash,
+}
+
+impl std::fmt::Display for StaleWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "edit to '{}' refused: the file moved since the edit began (edited {}, now {})",
+            self.source_id, self.expected, self.current
+        )
+    }
+}
+
+impl std::error::Error for StaleWrite {}
 
 /// A private in-memory copy of an arena image: one writer, a pool of
 /// deserialised readers refreshed from the writer's bytes after each write.
@@ -232,6 +273,13 @@ pub struct SqliteGraphAdapter {
     /// Nodes with pending splice (write accumulated, splice fires on flush).
     #[cfg(feature = "splice")]
     pending_splice: Mutex<HashSet<String>>,
+    /// The base of each file with an edit in progress, keyed by
+    /// `_source.id`: the hash of its bytes before the edit's first write
+    /// (ADR-0041 P2). Taken by `note_base` or the first `write_content`,
+    /// handed to the source writer on flush, and dropped when the flush
+    /// lands or is refused.
+    #[cfg(feature = "splice")]
+    bases: Mutex<HashMap<String, leyline_core::Hash>>,
     /// Where an edit to a parsed file goes. Without one, such an edit is
     /// refused rather than reported as done.
     #[cfg(feature = "splice")]
@@ -294,6 +342,8 @@ impl SqliteGraphAdapter {
             #[cfg(feature = "splice")]
             pending_splice: Mutex::new(HashSet::new()),
             #[cfg(feature = "splice")]
+            bases: Mutex::new(HashMap::new()),
+            #[cfg(feature = "splice")]
             source_writer: None,
         }
     }
@@ -306,11 +356,111 @@ impl SqliteGraphAdapter {
 
     /// Hand a file's new bytes to the source writer, or refuse.
     #[cfg(feature = "splice")]
-    fn write_source(&self, conn: &Connection, source_id: &str, bytes: Vec<u8>) -> Result<()> {
+    fn write_source(
+        &self,
+        conn: &Connection,
+        source_id: &str,
+        bytes: Vec<u8>,
+        base: Option<leyline_core::Hash>,
+    ) -> Result<()> {
         let writer = self.source_writer.as_ref().with_context(|| {
             format!("edit to '{source_id}' refused: this mount has no source writer")
         })?;
-        writer.write(conn, source_id, bytes)
+        writer.write(conn, source_id, bytes, base)
+    }
+
+    /// The `file_id` and `_source.id` of the parsed file `nid` belongs to, or
+    /// `None` for a node outside any parsed file.
+    #[cfg(feature = "splice")]
+    fn source_of(conn: &Connection, nid: i64) -> Result<Option<(i64, String)>> {
+        let Some(file_id) = leyline_schema::nid_file_id(nid) else {
+            return Ok(None);
+        };
+        let has_sources: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_source')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has_sources {
+            return Ok(None);
+        }
+        let source_id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM _source WHERE file_id = ?1",
+                [file_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(source_id.map(|s| (file_id, s)))
+    }
+
+    /// Discard a refused edit to `file_id`: re-project the stored file so the
+    /// edited records read as it again, drop every pending edit and the base
+    /// of that file, and record `refused` in `_errors` for `node_id`. Best
+    /// effort: a failure here is logged, since the refusal is what the caller
+    /// must see.
+    #[cfg(feature = "splice")]
+    fn restore_file(
+        &self,
+        conn: &Connection,
+        node_id: &str,
+        file_id: i64,
+        source_id: &str,
+        refused: &anyhow::Error,
+    ) {
+        self.bases.lock().remove(source_id);
+        self.pending_splice.lock().retain(|pending| {
+            leyline_schema::resolve_path(conn, pending)
+                .ok()
+                .flatten()
+                .and_then(leyline_schema::nid_file_id)
+                != Some(file_id)
+        });
+        let restored = leyline_ts::splice::source_bytes(conn, file_id)
+            .and_then(|stored| self.write_source(conn, source_id, stored, None));
+        if let Err(e) = restored {
+            log::warn!("restoring '{source_id}' after a refused edit failed: {e:#}");
+        }
+        #[cfg(feature = "cdc")]
+        if let Err(e) = crate::chunked::invalidate_chunked_content_subtree(
+            conn,
+            leyline_schema::file_nid(file_id, 0),
+        ) {
+            log::warn!("invalidating '{source_id}' chunks after a refused edit failed: {e:#}");
+        }
+        if let Err(e) = conn.execute(
+            "INSERT OR REPLACE INTO _errors (node_id, line, col, message, timestamp) \
+             VALUES (?1, 0, 0, ?2, ?3)",
+            rusqlite::params![node_id, format!("{refused:#}"), now_nanos()],
+        ) {
+            log::warn!("recording the refusal of '{node_id}' failed: {e:#}");
+        }
+    }
+
+    /// Record the base of `nid`'s file — the hash of its stored bytes — if
+    /// no edit to it is in progress. Hashes the file once per edit, not once
+    /// per write.
+    #[cfg(feature = "splice")]
+    fn take_base(&self, conn: &Connection, nid: i64) -> Result<()> {
+        let Some((file_id, source_id)) = Self::source_of(conn, nid)? else {
+            return Ok(());
+        };
+        if self.bases.lock().contains_key(&source_id) {
+            return Ok(());
+        }
+        // A file whose stored bytes cannot be read has no base to check:
+        // the edit goes ahead unchecked, as it did before bases, and the
+        // write path reports whatever is wrong with the file.
+        match leyline_ts::splice::source_bytes(conn, file_id) {
+            Ok(stored) => {
+                self.bases
+                    .lock()
+                    .entry(source_id)
+                    .or_insert(stored.as_slice().hash());
+            }
+            Err(e) => log::debug!("no base for '{source_id}': {e:#}"),
+        }
+        Ok(())
     }
 
     /// An adapter over somebody else's live database (ADR-0040 D4): reads
@@ -568,6 +718,10 @@ impl SqliteGraphAdapter {
             // not a condition to absorb.
             let nid = leyline_schema::resolve_path(guard.conn(), id)?
                 .with_context(|| format!("write to unknown node '{id}'"))?;
+
+            // The edit's base is the file before its first write.
+            #[cfg(feature = "splice")]
+            self.take_base(guard.conn(), nid)?;
 
             // Read existing content, patch in the new data
             let existing: Option<String> = guard
@@ -1108,6 +1262,18 @@ impl Graph for SqliteGraphAdapter {
         Ok(())
     }
 
+    fn note_base(&self, id: &str) -> Result<()> {
+        #[cfg(feature = "splice")]
+        {
+            let guard = self.writer_guard();
+            if let Some(nid) = leyline_schema::resolve_path(guard.conn(), id)? {
+                self.take_base(guard.conn(), nid)?;
+            }
+        }
+        let _ = id;
+        Ok(())
+    }
+
     fn flush_node(&self, id: &str) -> Result<()> {
         #[cfg(feature = "splice")]
         {
@@ -1136,7 +1302,24 @@ impl Graph for SqliteGraphAdapter {
                 [file_id],
                 |r| r.get(0),
             )?;
-            self.write_source(guard.conn(), &source_id, bytes)?;
+            let base = self.bases.lock().get(&source_id).copied();
+            if self.source_writer.is_none() {
+                // Nothing could restore the file either: the edit stays
+                // pending and the refusal says why.
+                return self.write_source(guard.conn(), &source_id, bytes, base);
+            }
+            if let Err(refused) = self.write_source(guard.conn(), &source_id, bytes, base) {
+                // A refused edit is discarded, not left behind: the edited
+                // records go back to what the stored file projects to, every
+                // pending edit to that file is dropped with it, and the
+                // reason is recorded for the node. The refusal stands even
+                // if the restore fails.
+                self.restore_file(guard.conn(), id, file_id, &source_id, &refused);
+                drop(guard);
+                self.refresh_readers()?;
+                return Err(refused);
+            }
+            self.bases.lock().remove(&source_id);
 
             // The write re-projected the spliced node AND every other node
             // of the same source, through the cold parse — which knows
@@ -1327,35 +1510,38 @@ impl Graph for SqliteGraphAdapter {
                 modified = result;
             }
 
-            // The one write path validates, stores and re-projects.
-            self.write_source(conn, &source_id, modified).map_err(|e| {
-                // Attempt to attribute the error to a specific node
-                let msg = format!("{e:#}");
-                // Parse "error at byte N..M" from the syntax check
-                if let Some(pos) = msg.find("error at byte ") {
-                    let rest = &msg[pos + 14..];
-                    if let Some(dot_pos) = rest.find("..")
-                        && let Ok(err_byte) = rest[..dot_pos].parse::<usize>()
-                    {
-                        // Find which edit's post-splice range contains the error byte
-                        for r in &ranges {
-                            if err_byte >= r.start && err_byte < r.end {
-                                return anyhow::anyhow!(
-                                    "{e:#} (attributed to node '{}')",
-                                    r.node_id
-                                );
+            // The one write path validates, stores and re-projects. A batch
+            // splice is applied against the file as it is now: the staging
+            // overlay records no base yet.
+            self.write_source(conn, &source_id, modified, None)
+                .map_err(|e| {
+                    // Attempt to attribute the error to a specific node
+                    let msg = format!("{e:#}");
+                    // Parse "error at byte N..M" from the syntax check
+                    if let Some(pos) = msg.find("error at byte ") {
+                        let rest = &msg[pos + 14..];
+                        if let Some(dot_pos) = rest.find("..")
+                            && let Ok(err_byte) = rest[..dot_pos].parse::<usize>()
+                        {
+                            // Find which edit's post-splice range contains the error byte
+                            for r in &ranges {
+                                if err_byte >= r.start && err_byte < r.end {
+                                    return anyhow::anyhow!(
+                                        "{e:#} (attributed to node '{}')",
+                                        r.node_id
+                                    );
+                                }
                             }
                         }
                     }
-                }
-                // No attribution possible — list all nodes in the group
-                let node_ids: Vec<&str> = group.iter().map(|e| e.node_id.as_str()).collect();
-                anyhow::anyhow!(
-                    "{e:#} (source '{}', edited nodes: {:?})",
-                    source_id,
-                    node_ids
-                )
-            })?;
+                    // No attribution possible — list all nodes in the group
+                    let node_ids: Vec<&str> = group.iter().map(|e| e.node_id.as_str()).collect();
+                    anyhow::anyhow!(
+                        "{e:#} (source '{}', edited nodes: {:?})",
+                        source_id,
+                        node_ids
+                    )
+                })?;
 
             // The write rewrote `nodes.record` for EVERY node of this source
             // through the cold parse. Unlike the `write_content` path, nothing
@@ -1858,6 +2044,10 @@ impl Graph for HotSwapGraph {
         self.maybe_swap()?.rename_node(id, new_parent_id, new_name)
     }
 
+    fn note_base(&self, id: &str) -> Result<()> {
+        self.maybe_swap()?.note_base(id)
+    }
+
     fn flush_node(&self, id: &str) -> Result<()> {
         self.maybe_swap()?.flush_node(id)
     }
@@ -2001,7 +2191,13 @@ pub(crate) mod fixtures {
 
     #[cfg(feature = "splice")]
     impl SourceWriter for ProjectingWriter {
-        fn write(&self, conn: &Connection, source_id: &str, bytes: Vec<u8>) -> Result<()> {
+        fn write(
+            &self,
+            conn: &Connection,
+            source_id: &str,
+            bytes: Vec<u8>,
+            _base: Option<leyline_core::Hash>,
+        ) -> Result<()> {
             let language: String = conn.query_row(
                 "SELECT language FROM _source WHERE id = ?1",
                 [source_id],
@@ -3046,7 +3242,13 @@ mod tests {
 
     #[cfg(feature = "splice")]
     impl SourceWriter for RecordingWriter {
-        fn write(&self, _conn: &Connection, source_id: &str, bytes: Vec<u8>) -> Result<()> {
+        fn write(
+            &self,
+            _conn: &Connection,
+            source_id: &str,
+            bytes: Vec<u8>,
+            _base: Option<leyline_core::Hash>,
+        ) -> Result<()> {
             self.writes.lock().push((source_id.to_string(), bytes));
             Ok(())
         }
@@ -3116,6 +3318,109 @@ mod tests {
         Ok(())
     }
 
+    /// Records the base each write names; with `refuse`, refuses as stale
+    /// any write that names one, the way the write path refuses a file that
+    /// moved, and projects the rest.
+    #[cfg(feature = "splice")]
+    #[derive(Default)]
+    struct BaseCheckingWriter {
+        bases: Mutex<Vec<Option<leyline_core::Hash>>>,
+        refuse: bool,
+    }
+
+    #[cfg(feature = "splice")]
+    impl SourceWriter for BaseCheckingWriter {
+        fn write(
+            &self,
+            conn: &Connection,
+            source_id: &str,
+            bytes: Vec<u8>,
+            base: Option<leyline_core::Hash>,
+        ) -> Result<()> {
+            self.bases.lock().push(base);
+            if let (true, Some(expected)) = (self.refuse, base) {
+                return Err(StaleWrite {
+                    source_id: source_id.to_string(),
+                    expected,
+                    current: leyline_core::Hash::ZERO,
+                }
+                .into());
+            }
+            super::fixtures::ProjectingWriter.write(conn, source_id, bytes, base)
+        }
+    }
+
+    fn hash_of(bytes: &[u8]) -> leyline_core::Hash {
+        bytes.hash()
+    }
+
+    /// ADR-0041 P2 through the mount: an edit hands the write path the hash
+    /// of the file as it was before the edit's first write, so a change
+    /// that lands in between is caught. After a flush the next edit takes a
+    /// fresh base.
+    #[test]
+    #[cfg(feature = "splice")]
+    fn an_edit_names_the_file_it_was_made_against() -> Result<()> {
+        let db_bytes = leyline_ts::parse_with_source(
+            b"<p>hello</p>",
+            leyline_ts::languages::TsLanguage::Html,
+            "test.html",
+        )?;
+        let mut adapter = SqliteGraphAdapter::new_writable(&db_bytes)?;
+        let writer = Arc::new(BaseCheckingWriter::default());
+        adapter.set_source_writer(writer.clone());
+        let node_id = "test.html/element/text";
+
+        adapter.write_content(node_id, b"world", 0)?;
+        adapter.flush_node(node_id)?;
+        adapter.write_content(node_id, b"again", 0)?;
+        adapter.flush_node(node_id)?;
+        assert_eq!(
+            writer.bases.lock().as_slice(),
+            [
+                Some(hash_of(b"<p>hello</p>")),
+                Some(hash_of(b"<p>world</p>"))
+            ],
+        );
+        Ok(())
+    }
+
+    /// A refused edit is discarded, not left behind: the node reads as the
+    /// stored file again, nothing stays pending, the refusal is typed as
+    /// stale for the mount to answer `ESTALE`, and its reason is recorded
+    /// in `_errors` for the node.
+    #[test]
+    #[cfg(feature = "splice")]
+    fn a_refused_edit_restores_the_node_and_reports_stale() -> Result<()> {
+        let db_bytes = leyline_ts::parse_with_source(
+            b"<p>hello</p>",
+            leyline_ts::languages::TsLanguage::Html,
+            "test.html",
+        )?;
+        let mut adapter = SqliteGraphAdapter::new_writable(&db_bytes)?;
+        adapter.set_source_writer(Arc::new(BaseCheckingWriter {
+            refuse: true,
+            ..Default::default()
+        }));
+        let node_id = "test.html/element/text";
+
+        adapter.write_content(node_id, b"world", 0)?;
+        let err = adapter.flush_node(node_id).unwrap_err();
+        assert!(err.downcast_ref::<StaleWrite>().is_some(), "{err:#}");
+
+        let mut buf = [0u8; 16];
+        let n = adapter.read_content(node_id, &mut buf, 0)?;
+        assert_eq!(&buf[..n], b"hello", "the refused edit is discarded");
+        assert!(!adapter.pending_splice.lock().contains(node_id));
+        let recorded: String = adapter.writer_guard().conn().query_row(
+            "SELECT message FROM _errors WHERE node_id = ?1",
+            [node_id],
+            |r| r.get(0),
+        )?;
+        assert!(recorded.contains("moved"), "{recorded}");
+        Ok(())
+    }
+
     /// Refuses every write with a syntax error at a fixed byte, the way the
     /// write path reports one.
     #[cfg(feature = "splice")]
@@ -3123,7 +3428,13 @@ mod tests {
 
     #[cfg(feature = "splice")]
     impl SourceWriter for SyntaxErrorAt {
-        fn write(&self, _conn: &Connection, _source_id: &str, _bytes: Vec<u8>) -> Result<()> {
+        fn write(
+            &self,
+            _conn: &Connection,
+            _source_id: &str,
+            _bytes: Vec<u8>,
+            _base: Option<leyline_core::Hash>,
+        ) -> Result<()> {
             anyhow::bail!(
                 "modified source has syntax errors (error at byte {}..{}, line 1)",
                 self.0,
@@ -3321,11 +3632,15 @@ mod tests {
         // Flush should fail (syntax error) but not panic
         let result = adapter.flush_node(node_id);
         if result.is_err() {
-            // Node should still be pending for retry
+            // A refused edit is discarded: nothing stays pending and the
+            // node reads as the stored file again.
             assert!(
-                adapter.pending_splice.lock().contains(node_id),
-                "failed flush should keep node pending"
+                !adapter.pending_splice.lock().contains(node_id),
+                "a refused flush drops the edit"
             );
+            let mut buf = [0u8; 64];
+            let n = adapter.read_content(node_id, &mut buf, 0)?;
+            assert_eq!(&buf[..n], b"original");
         }
         // Note: tree-sitter may be lenient with HTML — if it passes, that's OK too.
 

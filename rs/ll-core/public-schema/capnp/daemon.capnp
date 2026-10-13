@@ -274,6 +274,61 @@ struct ReadContentResponse {
   error   @2 :Text;
 }
 
+# A whole source file by its path relative to the tree root (`_source.id`),
+# with the blob hash a later `propose` names as its base (ADR-0041 P2).
+struct ReadSourceRequest {
+  path @0 :Text;
+}
+
+struct ReadSourceResponse {
+  ok       @0 :Bool;
+  content  @1 :Text;
+  # BLAKE3 of `content`'s bytes, 64 hex chars: the `source_blobs` key.
+  blobHash @2 :Text  $Json.name("blob_hash");
+  # The arena's treeRoot (ADR-0040 D1) the file was read under, 64 hex chars.
+  treeRoot @3 :Text  $Json.name("tree_root");
+  error    @4 :Text;
+}
+
+# One file of a proposal: its path, the blob hash its author read (empty:
+# no check), and its new content.
+struct ProposedWrite {
+  path    @0 :Text;
+  base    @1 :Text;
+  content @2 :Text;
+}
+
+# Several files written as one change, applied whole or refused whole
+# (ADR-0041 P1).
+struct ProposeRequest {
+  writes @0 :List(ProposedWrite);
+}
+
+struct PathHash {
+  path     @0 :Text;
+  blobHash @1 :Text  $Json.name("blob_hash");
+}
+
+# Why a proposal was refused when a file moved since its author read it.
+struct StaleRefusal {
+  path     @0 :Text;
+  # The blob the author read.
+  expected @1 :Text;
+  # The blob the file holds now.
+  current  @2 :Text;
+}
+
+struct ProposeResponse {
+  ok       @0 :Bool;
+  # The arena's treeRoot after the proposal (ok only).
+  treeRoot @1 :Text  $Json.name("tree_root");
+  # Each written path's new blob hash (ok only).
+  blobs    @2 :List(PathHash);
+  # Set when the proposal was refused because a base moved.
+  stale    @3 :StaleRefusal;
+  error    @4 :Text;
+}
+
 struct FindCallersRequest {
   token @0 :Text;
 }

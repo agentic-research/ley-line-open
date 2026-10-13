@@ -10,6 +10,19 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Documentation
+
+- **ADR-0041 (publication) and ADR-0042 (proposals), both Proposed**
+  (bead `ley-line-open-d70f99`; ADR-0040 D7). ADR-0042: a write names
+  the bytes its author read and is applied whole or refused whole —
+  file bases, the daemon's `read_source`/`propose` and the mount's
+  `ESTALE` are implemented; node bases and the closure check are open.
+  ADR-0041: publication becomes immutable snapshot files of whole
+  proposals under control block v4 with `(epoch, seq)` and one
+  producer; `current_root` is retired for `treeRoot`; transport carries
+  what proposals carry. ADR-0040's D7 points to both, and its citation
+  of cloister ADR-0013/0030 is corrected.
+
 ### Fixed
 
 - **Growing the arena no longer overwrites the published image**

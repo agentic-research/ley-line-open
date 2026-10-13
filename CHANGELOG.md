@@ -16,12 +16,25 @@ context, scoping notes, and review history are recoverable.
   (bead `ley-line-open-0a8c14`). It left the seqlock counter odd: readers
   spun forever, and the next publish turned the counter even before
   writing, so readers could copy that publish half-written. A publish now
-  holds an exclusive lock on the control file; a publish that finds the
-  counter already odd keeps it odd and ends even over a whole payload. A
-  reader that sees the counter stuck odd for a second with no publisher
-  holding the lock answers the zero root ("nothing published"), which
-  every consumer refuses to load data under, instead of hanging or
-  returning a torn root.
+  holds an exclusive lock on the control file for as long as the counter
+  is odd; a publish that finds the counter already odd keeps it odd and
+  ends even over a whole payload. A reader that finds the counter odd and
+  the lock free answers the zero root ("nothing published"), which every
+  consumer refuses to load data under, instead of hanging or returning a
+  torn root. The lock decides, not a clock, so a publisher built before
+  this release, which takes no lock, reads as dead while its counter is
+  odd: move every process that publishes to one control block (the
+  ley-line receiver through its `leyline_core` pin) to this release
+  together.
+
+- **Tests wait on events, not time.** The control block tests hold a
+  publish until the reader reports it has found the publish lock held,
+  and the writer-monotonicity test advances when the reader reports a
+  read, instead of sleeping or polling a deadline. The WAL reader pool's
+  p99 latency budget joins its throughput floor in the perf tier
+  (`LLO_PERF_GATES=1`): both measured the machine as much as the pool,
+  and `task ci` keeps the structural assertion that readers are checked
+  out concurrently.
 
 ### Added
 

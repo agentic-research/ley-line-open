@@ -1801,6 +1801,52 @@ mod tests {
         assert_eq!(&buf[..n], b"package main");
     }
 
+    /// A graph that records the ids `note_base` is called with.
+    struct NoteRecorder {
+        inner: MemoryGraph,
+        noted: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Graph for NoteRecorder {
+        fn get_node(&self, id: &str) -> Result<Option<Node>> {
+            self.inner.get_node(id)
+        }
+        fn lookup_child(&self, parent_id: &str, name: &str) -> Result<Option<Node>> {
+            self.inner.lookup_child(parent_id, name)
+        }
+        fn list_children(&self, parent_id: &str) -> Result<Vec<Node>> {
+            self.inner.list_children(parent_id)
+        }
+        fn read_content(&self, id: &str, buf: &mut [u8], offset: u64) -> Result<usize> {
+            self.inner.read_content(id, buf, offset)
+        }
+        fn note_base(&self, id: &str) -> Result<()> {
+            self.noted.lock().unwrap().push(id.to_string());
+            Ok(())
+        }
+    }
+
+    /// The versioned graph passes an open-for-writing's base request to the
+    /// graph it wraps, so a mount over it still catches a file that moved
+    /// while it was open (ADR-0042 P2).
+    #[test]
+    fn versioned_graph_passes_note_base_through() {
+        let recorder = Arc::new(NoteRecorder {
+            inner: MemoryGraph::new(),
+            noted: std::sync::Mutex::new(Vec::new()),
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let jj_dir = tempfile::tempdir().unwrap();
+        let jj = JjIntegration::init(jj_dir.path()).unwrap();
+        let vg = VersionedGraph::new(recorder.clone(), tx, Arc::new(Mutex::new(jj))).unwrap();
+
+        vg.note_base("src/main.go").unwrap();
+        assert_eq!(
+            *recorder.noted.lock().unwrap(),
+            vec!["src/main.go".to_string()]
+        );
+    }
+
     #[test]
     fn versioned_graph_injects_leyline_dir() {
         let mut g = MemoryGraph::new();

@@ -35,18 +35,6 @@ context, scoping notes, and review history are recoverable.
   parse, or a path repeats; otherwise every file lands in one parse pass
   and one transaction. `write` is now its one-file, unchecked case.
 
-### Added
-
-- **Proposals: several files written as one change, refused if any moved
-  since it was read** (bead `ley-line-open-d25ec4`; ADR-0041 draft P1-P2).
-  `source_write::propose(grant, writes)` takes each file's path, the blob
-  hash its author read (`Base::Blob`, or `Base::Any` for no check) and its
-  new bytes. It is refused whole, with nothing changed, when a path is
-  outside the grant, a file no longer holds the blob its author read
-  (a typed `Stale` naming the path and both hashes), a file does not
-  parse, or a path repeats; otherwise every file lands in one parse pass
-  and one transaction. `write` is now its one-file, unchecked case.
-
 ### Documentation
 
 - **ADR-0041 (publication) and ADR-0042 (proposals), both Proposed**
@@ -61,15 +49,6 @@ context, scoping notes, and review history are recoverable.
   of cloister ADR-0013/0030 is corrected.
 
 ### Fixed
-
-- **A parse or write is one transaction, including its `_meta` stamps**
-  (bead `ley-line-open-1360fd`). The pass committed its rows, then swept
-  orphaned directories and stamped `_meta` (`derived_from` among them)
-  as separate commits, so the mount and socket readers, which read
-  `live.db` through the WAL pool, saw the new `_source` under the old
-  `derived_from`, and a failure while stamping left the two disagreeing
-  for good. COMMIT now follows the sweep and the stamps; only the index
-  builds, which change no query result, and the head write run after it.
 
 - **A parse or write is one transaction, including its `_meta` stamps**
   (bead `ley-line-open-1360fd`). The pass committed its rows, then swept

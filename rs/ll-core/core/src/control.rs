@@ -118,9 +118,41 @@ const _: () = assert!(
     "ArenaSize must be 8-byte aligned"
 );
 
+/// How long a sequence may stay odd before a reader asks whether its
+/// publisher is still alive. A publish holds the counter odd for a few
+/// microseconds; one stuck for this long belongs to a publisher that is
+/// dead or stalled, and only the absence of the publish lock tells the two
+/// apart (bead ley-line-open-0a8c14).
+pub const STALE_PUBLISH_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Controller manages a memory-mapped control file.
 pub struct Controller {
     mmap: MmapMut,
+    /// The control file. A publish holds an exclusive lock on it from
+    /// `seq_begin` to `seq_end`, so a reader facing a counter stuck odd can
+    /// tell a live publisher (lock held) from a dead one (the kernel
+    /// released its lock when it died).
+    file: std::fs::File,
+}
+
+/// Holds the publish lock for one publish and releases it on drop, so a
+/// publish that panics mid-way still releases it.
+struct PublishLock(std::fs::File);
+
+impl PublishLock {
+    fn take(file: &std::fs::File) -> Result<Self> {
+        let handle = file.try_clone().context("clone the control file handle")?;
+        handle
+            .lock()
+            .context("take the control block's publish lock")?;
+        Ok(PublishLock(handle))
+    }
+}
+
+impl Drop for PublishLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 impl Controller {
@@ -182,7 +214,7 @@ impl Controller {
             }
         }
 
-        Ok(Controller { mmap })
+        Ok(Controller { mmap, file })
     }
 
     /// Reference the `AtomicU64` embedded in the mapped control block
@@ -275,27 +307,71 @@ impl Controller {
     /// reload the sequence; keep the copy only if the sequence did not
     /// move. A writer that began or finished a publish during the copy
     /// changed the sequence, so a torn copy never escapes.
+    ///
+    /// A counter stuck odd for [`STALE_PUBLISH_AFTER`] with no publisher
+    /// holding the publish lock was left by a publisher that died
+    /// mid-publish (bead ley-line-open-0a8c14). The payload may be torn, so
+    /// the root is reported as the zero sentinel ("nothing published"),
+    /// which every consumer refuses to load data under; the path and size
+    /// are returned as that publisher left them, so a restarted publisher
+    /// can read its arena path and publish, which repairs the counter.
     fn snapshot(&self) -> Snapshot {
         let seq = self.sequence();
+        let mut odd_since: Option<(u64, std::time::Instant)> = None;
         loop {
             let before = seq.load(Ordering::Acquire);
             if before & 1 == 1 {
+                match odd_since {
+                    Some((value, since)) if value == before => {
+                        if since.elapsed() >= STALE_PUBLISH_AFTER {
+                            if self.publisher_is_dead(before) {
+                                let mut snap = self.copy_payload();
+                                snap.root = [0u8; CURRENT_ROOT_LEN];
+                                return snap;
+                            }
+                            odd_since = Some((before, std::time::Instant::now()));
+                        }
+                    }
+                    _ => odd_since = Some((before, std::time::Instant::now())),
+                }
                 std::thread::yield_now();
                 continue;
             }
-            let mut snap = Snapshot {
-                path: [0u8; ARENA_PATH_LEN],
-                size: [0u8; 8],
-                root: [0u8; CURRENT_ROOT_LEN],
-            };
-            self.volatile_copy_out(OFF_ARENA_PATH, &mut snap.path);
-            self.volatile_copy_out(OFF_ARENA_SIZE, &mut snap.size);
-            self.volatile_copy_out(OFF_CURRENT_ROOT, &mut snap.root);
+            odd_since = None;
+            let snap = self.copy_payload();
             std::sync::atomic::fence(Ordering::Acquire);
             let after = seq.load(Ordering::Relaxed);
             if before == after {
                 return snap;
             }
+        }
+    }
+
+    /// A copy of the payload as it stands, consistent or not.
+    fn copy_payload(&self) -> Snapshot {
+        let mut snap = Snapshot {
+            path: [0u8; ARENA_PATH_LEN],
+            size: [0u8; 8],
+            root: [0u8; CURRENT_ROOT_LEN],
+        };
+        self.volatile_copy_out(OFF_ARENA_PATH, &mut snap.path);
+        self.volatile_copy_out(OFF_ARENA_SIZE, &mut snap.size);
+        self.volatile_copy_out(OFF_CURRENT_ROOT, &mut snap.root);
+        snap
+    }
+
+    /// Whether the counter stuck at `odd` belongs to a publisher that is
+    /// gone: no one holds the publish lock and the counter has not moved
+    /// since. A held lock, a failed probe, or a counter that moved all say
+    /// "keep waiting".
+    fn publisher_is_dead(&self, odd: u64) -> bool {
+        match self.file.try_lock_shared() {
+            Ok(()) => {
+                let unmoved = self.sequence().load(Ordering::Acquire) == odd;
+                let _ = self.file.unlock();
+                unmoved
+            }
+            Err(_) => false,
         }
     }
 
@@ -375,6 +451,7 @@ impl Controller {
             );
         }
 
+        let _lock = PublishLock::take(&self.file)?;
         self.seq_begin();
         self.write_path_and_size(path, size);
         self.seq_end();
@@ -405,9 +482,30 @@ impl Controller {
     /// blocks enable) cannot lose increments. The substrate's intended
     /// invariant is a single writer per `(path, size, root)` advance;
     /// the counter's soundness does not rely on it.
+    ///
+    /// Called with the publish lock held. A counter that is already odd
+    /// then cannot belong to a live publish: it was left by a publisher
+    /// that died mid-publish (bead ley-line-open-0a8c14). It stays odd —
+    /// turning it even would let readers copy this publish half-written —
+    /// and this publish's `seq_end` makes it even over a whole payload.
     fn seq_begin(&mut self) {
-        let prev = self.sequence().fetch_add(1, Ordering::AcqRel);
-        debug_assert_eq!(prev & 1, 0, "seq_begin: a publish was already in flight");
+        let seq = self.sequence();
+        let mut current = seq.load(Ordering::Acquire);
+        loop {
+            if current & 1 == 1 {
+                std::sync::atomic::fence(Ordering::AcqRel);
+                return;
+            }
+            match seq.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// Seqlock write side, exit: sequence odd → even. Release publishes
@@ -472,6 +570,7 @@ impl Controller {
             );
         }
 
+        let _lock = PublishLock::take(&self.file)?;
         self.seq_begin();
         self.write_path_and_size(path, size);
         let half = CURRENT_ROOT_LEN / 2;
@@ -556,6 +655,90 @@ mod tests {
 
     const ROOT_A: [u8; 32] = [0x11; 32];
     const ROOT_B: [u8; 32] = [0x22; 32];
+
+    /// Leave the control block as a publisher killed mid-publish leaves
+    /// it: sequence odd, half of a new root written, no lock held.
+    fn die_mid_publish(c: &mut Controller) {
+        c.sequence().fetch_add(1, Ordering::AcqRel);
+        c.volatile_copy_in(OFF_CURRENT_ROOT, &ROOT_B[..CURRENT_ROOT_LEN / 2]);
+    }
+
+    /// Bead ley-line-open-0a8c14: the next publish after a dead publisher
+    /// restores parity without exposing the torn root. Before, `seq_begin`
+    /// turned the stuck odd counter even, so the new publish ran with the
+    /// counter even and readers could copy it half-written.
+    #[test]
+    fn a_publish_after_a_dead_publisher_restores_parity() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("dead.ctrl");
+        let mut writer = Controller::open_or_create(&path).unwrap();
+        writer.set_arena_with_root("/tmp/a", 1, ROOT_A).unwrap();
+        die_mid_publish(&mut writer);
+
+        let mut restarted = Controller::open_or_create(&path).unwrap();
+        let mut odd_during_payload = false;
+        restarted
+            .set_arena_with_root_hooked("/tmp/a", 1, ROOT_B, &mut || {
+                odd_during_payload = writer.sequence().load(Ordering::Acquire) & 1 == 1;
+            })
+            .unwrap();
+        assert!(
+            odd_during_payload,
+            "the counter must be odd while the payload is written"
+        );
+        assert_eq!(writer.sequence().load(Ordering::Acquire) & 1, 0);
+        assert_eq!(
+            Controller::open_or_create(&path).unwrap().current_root(),
+            ROOT_B
+        );
+    }
+
+    /// Bead ley-line-open-0a8c14: a reader facing a publisher that died
+    /// mid-publish does not spin forever and does not hand out the torn
+    /// root; it answers the zero sentinel ("nothing published"), which
+    /// every consumer already refuses to load data under.
+    #[test]
+    fn a_reader_facing_a_dead_publisher_answers_nothing_published() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("dead.ctrl");
+        let mut writer = Controller::open_or_create(&path).unwrap();
+        writer.set_arena_with_root("/tmp/a", 1, ROOT_A).unwrap();
+        die_mid_publish(&mut writer);
+
+        let reader = Controller::open_or_create(&path).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(reader.current_root()).unwrap());
+        let root = rx
+            .recv_timeout(STALE_PUBLISH_AFTER + std::time::Duration::from_secs(5))
+            .expect("a reader must not spin forever on a dead publisher");
+        assert_eq!(root, [0u8; 32], "neither the old nor a torn root");
+    }
+
+    /// A publisher that is alive but slow is not taken for dead: a reader
+    /// waits it out, however long it holds, and gets the whole new root.
+    #[test]
+    fn a_slow_live_publisher_is_waited_out() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("slow.ctrl");
+        let mut writer = Controller::open_or_create(&path).unwrap();
+        writer.set_arena_with_root("/tmp/a", 1, ROOT_A).unwrap();
+        let reader = Controller::open_or_create(&path).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        writer
+            .set_arena_with_root_hooked("/tmp/a", 1, ROOT_B, &mut || {
+                let tx = tx.clone();
+                let reader = Controller::open_or_create(&path).unwrap();
+                std::thread::spawn(move || tx.send(reader.current_root()).unwrap());
+                std::thread::sleep(STALE_PUBLISH_AFTER + std::time::Duration::from_millis(500));
+            })
+            .unwrap();
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            ROOT_B
+        );
+        assert_eq!(reader.current_root(), ROOT_B);
+    }
 
     /// The falsifier mache's reader could not pass against the old
     /// write-then-bump protocol (bead ley-line-open-49a1ef): a reader that

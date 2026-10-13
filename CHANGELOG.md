@@ -10,6 +10,19 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A publisher killed mid-publish no longer wedges the control block**
+  (bead `ley-line-open-0a8c14`). It left the seqlock counter odd: readers
+  spun forever, and the next publish turned the counter even before
+  writing, so readers could copy that publish half-written. A publish now
+  holds an exclusive lock on the control file; a publish that finds the
+  counter already odd keeps it odd and ends even over a whole payload. A
+  reader that sees the counter stuck odd for a second with no publisher
+  holding the lock answers the zero root ("nothing published"), which
+  every consumer refuses to load data under, instead of hanging or
+  returning a torn root.
+
 ### Added
 
 - **A mount edit is refused with `ESTALE` when its file moved since the

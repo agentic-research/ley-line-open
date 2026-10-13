@@ -828,9 +828,10 @@ mod tests {
                 conn: &Connection,
                 source_id: &str,
                 bytes: Vec<u8>,
+                base: Option<leyline_core::Hash>,
             ) -> anyhow::Result<()> {
                 self.writes.lock().push(bytes.clone());
-                ProjectingWriter.write(conn, source_id, bytes)
+                ProjectingWriter.write(conn, source_id, bytes, base)
             }
         }
 
@@ -1000,15 +1001,18 @@ mod tests {
             nfs.write(ino, 7, b"x").await.unwrap();
             assert_eq!(read_all(&nfs, ino).await, b"hello\0\0x");
             // The zero-filled file reaches the write path, which refuses
-            // HTML with NULs in it; the COMMIT reports that refusal.
+            // HTML with NULs in it; the COMMIT reports that refusal. The
+            // refused edit is discarded: the stored file is projected again,
+            // so the leaf reads as it did before the write.
             assert!(matches!(
                 nfs.commit(ino, 0, 0).await,
                 Err(nfsstat3::NFS3ERR_IO)
             ));
             assert_eq!(
                 *recorder.writes.lock(),
-                vec![b"<p>hello\0\0x</p>\n".to_vec()]
+                vec![b"<p>hello\0\0x</p>\n".to_vec(), b"<p>hello</p>\n".to_vec()]
             );
+            assert_eq!(read_all(&nfs, ino).await, b"hello");
         }
 
         /// An operation that changes the tree's shape commits staged writes

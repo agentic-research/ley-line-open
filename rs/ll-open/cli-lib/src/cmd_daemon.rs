@@ -1296,32 +1296,27 @@ pub fn try_snapshot_or_log(
 /// **Ordering contract** (load-bearing — see closed-source ley-line
 /// ADR-001 §5 "Demand-Paged Strategy" + ADR-012 sync sequence):
 ///
-/// The dual `set_arena` calls below mirror the network manifest-
-/// then-data wire protocol. The first call is the local single-host
-/// analog of the QUIC reliable-stream manifest publish; the second is
-/// the atomic CAS commit point. Three invariants must hold:
+/// The image is written first and advertised once, by the final
+/// `set_arena_with_root`. Three invariants must hold:
 ///
 /// 1. **File grown BEFORE size advertised.** A fresh-opening reader
 ///    that fetches `ctrl.arena_size()` and tries to mmap that many
-///    bytes must never see `arena_size > file_size`. Therefore
-///    `create_arena` (which calls `set_len`) precedes the early
-///    `set_arena`. Reversing this order produces torn reads in
-///    cross-process consumers (ADR-fixed bug ley-line-open-609d6a).
+///    bytes must never see `arena_size > file_size`. A growing snapshot
+///    renames a full-size arena into place before the new size is
+///    published (ley-line-open-609d6a).
 ///
-/// 2. **`current_root` advance is the publish point (T2.4).** Polling
+/// 2. **The published image is never written.** The new image goes into
+///    the inactive buffer of the same arena, or, when the arena grows,
+///    into a new arena renamed over the old one, so a reader holding
+///    the old one keeps the bytes it verified. Growing in place moved
+///    buffer B under its readers (ley-line-open-5a0f07).
+///
+/// 3. **`current_root` advance is the publish point (T2.4).** Polling
 ///    readers (HotSwapGraph) compare `current_root`; they don't refresh
-///    until it changes. The early `set_arena` preserves `current_root`
-///    so readers stay on the old buffer until data is fully written.
-///    The final `set_arena_with_root` advances the root, making the
-///    new buffer visible. (Pre-T2.4 this rotated on `generation`; the
-///    sync counter is now a private fence atom only.)
-///
-/// 3. **Advertisement errors abort the snapshot.** If the early
-///    `set_arena` fails, a partially-grown file may be on disk with
-///    the controller state half-published. Propagate the error;
+///    until it changes. `set_arena_with_root` advances size and root
+///    together under the seqlock. Its error aborts the snapshot;
 ///    callers (snapshot_or_log) move the daemon into Error phase so
-///    operators see it. Silently continuing is the original bug
-///    described in ley-line-open-609d6a.
+///    operators see it.
 pub fn snapshot_to_arena(conn: &rusqlite::Connection, ctrl_path: &Path) -> Result<()> {
     let db_bytes = conn.serialize("main").context("serialize living db")?;
 
@@ -1345,36 +1340,31 @@ pub fn snapshot_to_arena(conn: &rusqlite::Connection, ctrl_path: &Path) -> Resul
         );
     }
 
-    // Step 1: grow the file (no-op if new_size == arena_size). Must
-    // precede advertisement — see ordering invariant 1.
-    let mut mmap =
-        leyline_core::create_arena(Path::new(&arena_path), new_size).context("open arena file")?;
-
-    // Step 2: advertise new size to controller via set_arena (no root
-    // advance). Fresh-opening readers see arena_size = new_size; file
-    // is already at new_size from step 1 so the advertised size is
-    // safe to mmap. Polling readers don't refresh because current_root
-    // is preserved (set_arena publishes under the seqlock but keeps the
-    // root bytes unchanged — readers compare roots, not the sequence). Failure
-    // here MUST abort the snapshot — see invariant 3.
-    if new_size != arena_size {
+    if new_size == arena_size {
+        // Step 1: write into the inactive buffer. ArenaHeader.active_buffer
+        // is unchanged; the old buffer remains the readable one until the
+        // header flips at the end of the write.
+        let mut mmap = leyline_core::create_arena(Path::new(&arena_path), new_size)
+            .context("open arena file")?;
+        leyline_core::write_to_arena(&mut mmap, &db_bytes).context("write to arena")?;
+    } else {
+        // Step 1, growing: never in place. Buffer offsets derive from the
+        // file length, so a longer file moves buffer B under the image a
+        // reader verified (`ley-line-open-5a0f07`). The grown arena is
+        // built beside the old one and renamed over it; readers that
+        // opened the old arena keep its inode. The file at the path is
+        // full size before the new size is advertised below (invariant 1).
         eprintln!(
             "auto-sizing arena: {}MB → {}MB (db is {}MB)",
             arena_size / (1024 * 1024),
             new_size / (1024 * 1024),
             db_bytes.len() / (1024 * 1024),
         );
-        // T2.4: re-advertise (size grow) preserves current_root.
-        // No publish here — readers don't see "change."
-        ctrl.set_arena(&arena_path, new_size)
-            .context("advertise new arena size before write")?;
+        leyline_core::write_grown_arena(Path::new(&arena_path), new_size, &db_bytes)
+            .context("write grown arena")?;
     }
 
-    // Step 3: write into the inactive buffer. ArenaHeader.active_buffer
-    // is unchanged; old buffer remains the readable one until step 4.
-    leyline_core::write_to_arena(&mut mmap, &db_bytes).context("write to arena")?;
-
-    // Step 4: atomic publish — write current_root under Release-ordering
+    // Step 2: atomic publish — write current_root under Release-ordering
     // (T2.2 + T2.4). Polling readers see current_root change, refresh,
     // observe (new_size, new active_buffer, new current_root).
     // current_root = σ(serialized db bytes) via the substrate's
@@ -2650,6 +2640,78 @@ mod tests {
             .query_row("SELECT count(*) FROM snap_rows", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 3, "live db must remain queryable after snapshot");
+    }
+
+    /// `ley-line-open-5a0f07`: growing the arena must not touch the
+    /// published image. Buffer offsets derive from the file length
+    /// (`ArenaHeader::buffer_size`), so growing the file in place while
+    /// buffer B is active moved B's offset and the pending write into A
+    /// overwrote the image a reader had already verified, before the new
+    /// root published. A reader holding the arena open across a growing
+    /// snapshot must still read the bytes it verified.
+    #[test]
+    fn a_growing_snapshot_leaves_the_published_image_intact() {
+        use std::os::unix::fs::FileExt;
+
+        let dir = TempDir::new().unwrap();
+        let arena_path = dir.path().join("grow.arena");
+        let ctrl_path = dir.path().join("grow.ctrl");
+        let live_db_path = live_db_path_for(&ctrl_path);
+        let small = 2 * 1024 * 1024;
+        let _mmap = leyline_core::create_arena(&arena_path, small).unwrap();
+        leyline_core::Controller::open_or_create(&ctrl_path)
+            .unwrap()
+            .set_arena(&arena_path.to_string_lossy(), small)
+            .unwrap();
+
+        let conn = init_living_db(&ctrl_path, &live_db_path, None, None, false).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE grow_rows (id INTEGER PRIMARY KEY, payload BLOB);
+             INSERT INTO grow_rows (payload) VALUES (x'01');",
+        )
+        .unwrap();
+        snapshot_to_arena(&conn, &ctrl_path).unwrap();
+
+        // The first snapshot lands in buffer B: the case that moves.
+        let published_root = leyline_core::Controller::open_or_create(&ctrl_path)
+            .unwrap()
+            .current_root();
+        let reader = std::fs::File::open(&arena_path).unwrap();
+        let mut header_bytes = [0u8; std::mem::size_of::<leyline_core::ArenaHeader>()];
+        reader.read_exact_at(&mut header_bytes, 0).unwrap();
+        let header: leyline_core::ArenaHeader = *bytemuck::from_bytes(&header_bytes);
+        assert_eq!(
+            header.active_buffer, 1,
+            "the published image must sit in buffer B"
+        );
+        let offset = header.validate_header(small).unwrap();
+
+        // Enough rows that the next snapshot must grow the arena.
+        conn.execute(
+            "INSERT INTO grow_rows (payload) SELECT zeroblob(4096) FROM
+             (WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 600)
+              SELECT i FROM n)",
+            [],
+        )
+        .unwrap();
+        snapshot_to_arena(&conn, &ctrl_path).unwrap();
+        let grown = leyline_core::Controller::open_or_create(&ctrl_path).unwrap();
+        assert!(
+            grown.arena_size() > small,
+            "the second snapshot must grow the arena"
+        );
+        assert_ne!(grown.current_root(), published_root);
+
+        let mut image = vec![0u8; header.data_size as usize];
+        reader.read_exact_at(&mut image, offset).unwrap();
+        assert_eq!(
+            *blake3::hash(&image).as_bytes(),
+            published_root,
+            "a reader that opened the arena before the growth must still read the image it verified",
+        );
+
+        // And a fresh reader opens the grown arena under the new root.
+        leyline_fs::SqliteGraph::from_arena(&ctrl_path).expect("open the grown arena");
     }
 
     /// `ley-line-open-e37e03`, filed by mache: `--reset-arena` ALWAYS

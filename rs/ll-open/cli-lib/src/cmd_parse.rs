@@ -2034,9 +2034,11 @@ fn parse_into_conn_with(
     }
     let sub_capnp_flush_end = std::time::Instant::now();
 
-    conn.execute_batch("COMMIT")?;
-    tx_guard.armed = false;
-    let sub_commit_end = std::time::Instant::now();
+    // The transaction stays open through the sweep and the `_meta` stamps
+    // below: a write is one transaction, so a reader of the WAL never sees
+    // the new rows under the old `derived_from`, and a failure anywhere
+    // before COMMIT rolls the whole pass back. Only the index builds, which
+    // change no query result, and the head write run after COMMIT.
 
     // Merkle-AST IR (ADR-0027): count the UNRESOLVED reference targets —
     // node_refs rows whose token matches no node_defs token (a builtin, an
@@ -2046,9 +2048,10 @@ fn parse_into_conn_with(
     // it always resolved to a `src`, and the producer never emitted `calls`,
     // so the old count reduced to "references with no matching def token".
     // Recorded in the Head as a binding-fidelity ratchet (W5 asserts it
-    // stays <= baseline). Queried on the main thread here — after COMMIT but
-    // before the head thread is spawned and before `create_post_load_indexes`
-    // runs — so no second connection contends for the db lock. Whole-db
+    // stays <= baseline). Queried on the main thread here — inside the
+    // transaction, before the head thread is spawned and before
+    // `create_post_load_indexes` runs — so no second connection contends for
+    // the db lock. Whole-db
     // count, so it stays correct if a later run reparses only part of the tree.
     let unbound_facts: u64 = conn
         .query_row(
@@ -2079,65 +2082,11 @@ fn parse_into_conn_with(
         }
     };
     // ADR-0040 D1: the tree identity and the derivation identity, folded from
-    // the COMMITTED `_source` table — the whole corpus, not this run's delta —
-    // on the main thread where the connection is. The head writer stays pure
-    // filesystem work and just stamps them.
+    // `_source` inside the transaction — the whole corpus, not this run's
+    // delta — on the main thread where the connection is. The head writer
+    // stays pure filesystem work and just stamps them, after COMMIT.
     let parser_id = crate::tree_root::ParserInputs::current(&query_set).parser_id();
     let tree_root = crate::tree_root::tree_root(conn, parser_id)?;
-    let head_handle = db_path_for_head.map(|p| {
-        std::thread::spawn(move || -> Result<()> {
-            write_head_for_path(&p, unbound_facts, tree_root, parser_id)
-        })
-    });
-
-    // Build secondary indexes in one pass now that all rows are
-    // landed. SQLite materializes each index by a single sorted scan
-    // (~O(rows · log rows)) which is roughly an order of magnitude
-    // cheaper than incremental per-row B-tree maintenance during the
-    // INSERT loop. Idempotent (`IF NOT EXISTS`) so the incremental-
-    // reparse path (where indexes already exist from the prior run)
-    // is a no-op. See bead `ley-line-open-9ccbc7`.
-    //
-    // `idx_source_file` is intentionally excluded from this hot path —
-    // it's a partial index whose predicate (`source_file IS NOT NULL`)
-    // is false for every ley-line-produced row (only mache populates
-    // `source_file`). Building it on cold parse still costs a full
-    // 535K-row scan (~45 ms on the mache bench) even though the
-    // resulting index is empty; the mache flow paths build their own
-    // schema with the indexes mache needs, so skipping here is safe.
-    // See bead `ley-line-open-cbbedf` Attack 3.
-    create_post_load_indexes_skip_unused(conn)?;
-    // Unified code-fact IR (ADR-0027): the `symbols`/`fact_edges` traversal
-    // indexes (idx_symbols_node/kind, idx_edges_src/dst) are deferred to here
-    // — same rationale as the other post-load indexes: one sorted scan per
-    // index is cheaper than incremental B-tree maintenance during the insert.
-    // The UNIQUE symbol_id index the FK targets was built earlier (pre-insert)
-    // by create_ir_tables and is not rebuilt here.
-    create_ir_indexes(conn)?;
-    let sub_index_end = std::time::Instant::now();
-
-    let insert_elapsed = insert_start.elapsed();
-
-    if profile_insert {
-        // buffer / sql_flush are summed across chunks; the rest still bracket
-        // single contiguous spans after the chunk loop.
-        let buf_ms = buffer_elapsed.as_millis();
-        let flush_ms = flush_elapsed.as_millis();
-        let capnp_ms = sub_capnp_flush_end
-            .duration_since(sub_chunks_end)
-            .as_millis();
-        let commit_ms = sub_commit_end
-            .duration_since(sub_capnp_flush_end)
-            .as_millis();
-        let index_ms = sub_index_end.duration_since(sub_commit_end).as_millis();
-        eprintln!(
-            "  insert-detail: buffer+capnp_write={buf_ms}ms \
-             sql_flush={flush_ms}ms capnp_flush={capnp_ms}ms \
-             commit={commit_ms}ms index_build={index_ms}ms \
-             chunks={} chunk_files={PARSE_CHUNK_FILES}",
-            chunk_count_for(to_parse.len())
-        );
-    }
 
     // ---- Post-sweep ----
     //
@@ -2228,6 +2177,67 @@ fn parse_into_conn_with(
         }
     }
     let sweep_close_elapsed = sweep_close_start.elapsed();
+
+    conn.execute_batch("COMMIT")?;
+    tx_guard.armed = false;
+    let sub_commit_end = std::time::Instant::now();
+
+    let head_handle = db_path_for_head.map(|p| {
+        std::thread::spawn(move || -> Result<()> {
+            write_head_for_path(&p, unbound_facts, tree_root, parser_id)
+        })
+    });
+
+    // Build secondary indexes in one pass now that all rows are
+    // landed. SQLite materializes each index by a single sorted scan
+    // (~O(rows · log rows)) which is roughly an order of magnitude
+    // cheaper than incremental per-row B-tree maintenance during the
+    // INSERT loop. Idempotent (`IF NOT EXISTS`) so the incremental-
+    // reparse path (where indexes already exist from the prior run)
+    // is a no-op. An index changes no query result, so building it after
+    // COMMIT does not split the write. See bead `ley-line-open-9ccbc7`.
+    //
+    // `idx_source_file` is intentionally excluded from this hot path —
+    // it's a partial index whose predicate (`source_file IS NOT NULL`)
+    // is false for every ley-line-produced row (only mache populates
+    // `source_file`). Building it on cold parse still costs a full
+    // 535K-row scan (~45 ms on the mache bench) even though the
+    // resulting index is empty; the mache flow paths build their own
+    // schema with the indexes mache needs, so skipping here is safe.
+    // See bead `ley-line-open-cbbedf` Attack 3.
+    create_post_load_indexes_skip_unused(conn)?;
+    // Unified code-fact IR (ADR-0027): the `symbols`/`fact_edges` traversal
+    // indexes (idx_symbols_node/kind, idx_edges_src/dst) are deferred to here
+    // — same rationale as the other post-load indexes: one sorted scan per
+    // index is cheaper than incremental B-tree maintenance during the insert.
+    // The UNIQUE symbol_id index the FK targets was built earlier (pre-insert)
+    // by create_ir_tables and is not rebuilt here.
+    create_ir_indexes(conn)?;
+    let sub_index_end = std::time::Instant::now();
+
+    let insert_elapsed = insert_start.elapsed();
+
+    if profile_insert {
+        // buffer / sql_flush are summed across chunks; the rest still bracket
+        // single contiguous spans after the chunk loop. `commit` now spans
+        // the sweep and the `_meta` stamps, which run inside the transaction.
+        let buf_ms = buffer_elapsed.as_millis();
+        let flush_ms = flush_elapsed.as_millis();
+        let capnp_ms = sub_capnp_flush_end
+            .duration_since(sub_chunks_end)
+            .as_millis();
+        let commit_ms = sub_commit_end
+            .duration_since(sub_capnp_flush_end)
+            .as_millis();
+        let index_ms = sub_index_end.duration_since(sub_commit_end).as_millis();
+        eprintln!(
+            "  insert-detail: buffer+capnp_write={buf_ms}ms \
+             sql_flush={flush_ms}ms capnp_flush={capnp_ms}ms \
+             commit={commit_ms}ms index_build={index_ms}ms \
+             chunks={} chunk_files={PARSE_CHUNK_FILES}",
+            chunk_count_for(to_parse.len())
+        );
+    }
 
     // Σ root advance (bead `ley-line-open-ce55b1`) — join the worker
     // thread spawned right after COMMIT to overlap head-write FS work

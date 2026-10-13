@@ -217,6 +217,72 @@ pub fn create_arena(path: &std::path::Path, arena_size: u64) -> Result<MmapMut> 
     Ok(mmap)
 }
 
+/// Write `data` into a new arena of `arena_size` bytes and rename it over
+/// `path`, leaving the arena that was there untouched.
+///
+/// Growing an arena in place is unsound: buffer offsets derive from the
+/// file length ([`ArenaHeader::buffer_size`]), so a longer file moves
+/// buffer B, and the pending write into A covers where B's published
+/// image was (`ley-line-open-5a0f07`). The new arena is built beside the
+/// old one, fsynced, and renamed into place; a reader that opened the
+/// old arena keeps its inode and the image it verified. The header's
+/// `sequence` continues from the old arena's.
+pub fn write_grown_arena(path: &std::path::Path, arena_size: u64, data: &[u8]) -> Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::Read;
+    let mut header_bytes = [0u8; std::mem::size_of::<ArenaHeader>()];
+    let sequence = match std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut header_bytes))
+    {
+        Ok(()) => {
+            let header: ArenaHeader = *bytemuck::from_bytes(&header_bytes);
+            if header.magic == ArenaHeader::MAGIC {
+                header.sequence
+            } else {
+                0
+            }
+        }
+        Err(_) => 0,
+    };
+    let mut tmp_name = path.as_os_str().to_owned();
+    tmp_name.push(".grow");
+    let tmp = std::path::PathBuf::from(tmp_name);
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)
+        .context("create grown arena")?;
+    file.set_len(arena_size).context("size grown arena")?;
+    let mut mmap = crate::mmap::mmap_write(&file)?;
+    let header = ArenaHeader {
+        magic: ArenaHeader::MAGIC,
+        version: ArenaHeader::VERSION,
+        active_buffer: 0,
+        padding: [0; 2],
+        sequence,
+        data_size: 0,
+    };
+    let header_bytes = bytemuck::bytes_of(&header);
+    mmap[..header_bytes.len()].copy_from_slice(header_bytes);
+    write_to_arena(&mut mmap, data)?;
+    drop(mmap);
+    file.sync_all().context("fsync grown arena")?;
+    std::fs::rename(&tmp, path).context("rename grown arena into place")?;
+    if let Some(dir) = path.parent() {
+        let dir = if dir.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            dir
+        };
+        std::fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .context("fsync arena directory")?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,6 +390,44 @@ mod tests {
         assert_eq!(ArenaHeader::buffer_size(4096 + 4096 * 2), 4096);
         assert_eq!(ArenaHeader::buffer_size(4096 + 65536 * 2), 65536);
         assert_eq!(ArenaHeader::buffer_size(4096 + 1024 * 2), 1024);
+    }
+
+    #[test]
+    fn write_grown_arena_replaces_the_file_and_keeps_the_old_one_whole() {
+        use std::io::Read;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("g.arena");
+        let small = 4096 + 4096 * 2;
+        let mut mmap = create_arena(&path, small).unwrap();
+        write_to_arena(&mut mmap, b"first").unwrap();
+        drop(mmap);
+        let mut held = std::fs::File::open(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        write_grown_arena(&path, 4096 + 8192 * 2, b"second, larger").unwrap();
+
+        let mut old = Vec::new();
+        held.read_to_end(&mut old).unwrap();
+        assert_eq!(old, before, "the arena a reader holds is not written");
+
+        let grown = std::fs::read(&path).unwrap();
+        assert_eq!(grown.len() as u64, 4096 + 8192 * 2);
+        let header: ArenaHeader =
+            *bytemuck::from_bytes(&grown[..std::mem::size_of::<ArenaHeader>()]);
+        assert_eq!(
+            header.sequence, 2,
+            "the sequence continues from the old arena"
+        );
+        let offset = header.validate_header(grown.len() as u64).unwrap() as usize;
+        assert_eq!(
+            &grown[offset..offset + header.data_size as usize],
+            b"second, larger"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "no temporary arena is left beside it"
+        );
     }
 
     #[test]

@@ -19,7 +19,12 @@ context, scoping notes, and review history are recoverable.
   mutex baseline 1.45x with every reader checked out at once. The gate
   guards against a fall back to DELETE-journal latency (120–250 ms p99);
   it is now 50 ms. Readers serializing on a lock stays caught by the
-  test's structural checkout assertion.
+  test's structural checkout assertion. The control block's torn-root
+  test (`a_reader_overlapping_a_publish_never_sees_a_torn_root`) asserted
+  one completed read per publish, which a correct seqlock does not give
+  (one spinning read can span several publishes) and a starved reader
+  missed; it now asserts that a read was in flight during every
+  half-written root, waiting up to 5 s for the reader to run.
 
 - **`task release:publish` waits out the release run without exhausting
   the GitHub API quota** (bead `ley-line-open-b53aec`). It watched the run

@@ -679,6 +679,41 @@ mod tests {
             whole_image(&a.conn) == before,
             "nothing of the proposal lands"
         );
+        let message = err.to_string();
+        assert!(
+            message.contains("'a.go' moved since it was read")
+                && message.contains(&A.as_bytes().hash().to_string())
+                && message.contains(&A2.as_bytes().hash().to_string()),
+            "the refusal names the file and both blobs: {message}"
+        );
+    }
+
+    /// One proposal is one tree: files recorded under different roots are
+    /// refused together, since one pass projects one tree.
+    #[test]
+    fn a_proposal_spanning_two_trees_is_refused() {
+        let a = arena(&[("a.go", A), ("b.go", B)]);
+        a.conn
+            .execute(
+                "UPDATE _source SET path = '/elsewhere/b.go' WHERE id = 'b.go'",
+                [],
+            )
+            .unwrap();
+        let before = whole_image(&a.conn);
+        let err = propose(
+            &a.conn,
+            &Grant::Whole,
+            vec![proposed("a.go", blob(A), A2), proposed("b.go", blob(B), B2)],
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not the proposal's tree"),
+            "{err:#}"
+        );
+        assert!(
+            whole_image(&a.conn) == before,
+            "nothing of the proposal lands"
+        );
     }
 
     /// Every path of a proposal must be inside the grant, or none lands.

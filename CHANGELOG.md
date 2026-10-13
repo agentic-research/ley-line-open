@@ -10,6 +10,19 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.20.4] — 2026-10-13
+
+Proposals and write safety. A write can now name the bytes its author
+read and is refused, with nothing changed, when the file moved since
+(ADR-0042): over the daemon (`read_source` / `propose`, also MCP tools)
+and through the mount (`ESTALE`). A write is one SQLite transaction and
+is synced before it is acknowledged; a refused mount edit is discarded,
+not left behind; growing the arena no longer overwrites the published
+image. The daemon wire gains two additive ops, so `SCHEMA_VERSION` moves
+to 0.20.4 with a new `clients/go/leyline-schema` tag. The projection
+stays `projection-v6`, the wire stays v1 and the control block stays
+VERSION 3 (control block v4 is ADR-0041, not yet implemented).
+
 ### Added
 
 - **A mount edit is refused with `ESTALE` when its file moved since the

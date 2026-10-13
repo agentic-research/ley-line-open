@@ -10,6 +10,19 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Documentation
+
+- **ADR-0041 (publication) and ADR-0042 (proposals), both Proposed**
+  (bead `ley-line-open-d70f99`; ADR-0040 D7). ADR-0042: a write names
+  the bytes its author read and is applied whole or refused whole —
+  file bases, the daemon's `read_source`/`propose` and the mount's
+  `ESTALE` are implemented; node bases and the closure check are open.
+  ADR-0041: publication becomes immutable snapshot files of whole
+  proposals under control block v4 with `(epoch, seq)` and one
+  producer; `current_root` is retired for `treeRoot`; transport carries
+  what proposals carry. ADR-0040's D7 points to both, and its citation
+  of cloister ADR-0013/0030 is corrected.
+
 ### Fixed
 
 - **The WAL reader-pool latency gate no longer fails a healthy pool on a
@@ -25,6 +38,36 @@ context, scoping notes, and review history are recoverable.
   (one spinning read can span several publishes) and a starved reader
   missed; it now asserts that a read was in flight during every
   half-written root, waiting up to 5 s for the reader to run.
+
+- **A mount write acknowledged at fsync is on disk, not only in the page
+  cache** (bead `ley-line-open-0a9931`). `live.db` ran WAL with
+  `synchronous=NORMAL`, which does not sync the WAL on COMMIT, so the
+  write v0.20.3 reports as stored when the client's fsync, close or NFS
+  COMMIT returns survived a daemon crash but could be lost on power loss
+  or an OS crash. The writer now runs `synchronous=FULL`: one WAL sync
+  per write transaction. The guarantee is `fsync(2)`'s; on macOS that
+  does not reach past the drive's cache (`F_FULLFSYNC` is not set).
+
+- **A parse or write is one transaction, including its `_meta` stamps**
+  (bead `ley-line-open-1360fd`). The pass committed its rows, then swept
+  orphaned directories and stamped `_meta` (`derived_from` among them)
+  as separate commits, so the mount and socket readers, which read
+  `live.db` through the WAL pool, saw the new `_source` under the old
+  `derived_from`, and a failure while stamping left the two disagreeing
+  for good. COMMIT now follows the sweep and the stamps; only the index
+  builds, which change no query result, and the head write run after it.
+
+- **Growing the arena no longer overwrites the published image**
+  (bead `ley-line-open-5a0f07`). Buffer offsets derive from the arena's
+  file length, so when a snapshot grew the file in place while buffer B
+  held the published image, B moved and the write into A covered the
+  image readers had verified, before the new root published. A reader
+  without the root check (the warm-start fallback) or a crash mid-write
+  could lose both images. A growing snapshot now builds the larger arena
+  beside the old one (`leyline_core::write_grown_arena`), fsyncs it and
+  renames it into place, and advertises the new size together with the
+  new root; a reader holding the old arena keeps reading what it
+  verified.
 
 - **`task release:publish` waits out the release run without exhausting
   the GitHub API quota** (bead `ley-line-open-b53aec`). It watched the run

@@ -199,6 +199,11 @@ name and fixed in projection-v7 (`b5d354`).
 
 ### D7 — Publication stays as it is until the write boundary exists
 
+*Decided in ADR-0041 (publication) and ADR-0042 (proposals). ADR-0042 also corrects this ADR's citation of
+cloister ADR-0013 and ADR-0030: those govern credential slices and process isolation, not code; the
+grant that scopes a code write is execution/v1's `WorkspaceGrant`, with policy under cloister
+ADR-0046 and ADR-0049. The text below is the brief ADR-0041 started from.*
+
 Replacing image publication with in-place WAL updates and reader reopen changes the authority-
 making operation to the WAL commit and turns the control block into a notification. That needs a
 declared replacement for `current_root` (an epoch plus commit sequence), a v4 control block, a

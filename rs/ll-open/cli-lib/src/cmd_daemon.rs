@@ -821,9 +821,14 @@ pub fn live_db_path_for(ctrl_path: &Path) -> std::path::PathBuf {
 ///
 /// - `journal_mode = WAL` — the win. Readers and one writer make
 ///   progress concurrently; DELETE-journal serializes both.
-/// - `synchronous = NORMAL` — standard WAL pairing. `FULL` is
-///   overkill for WAL durability semantics; `OFF` would trade
-///   crash safety for throughput we already have.
+/// - `synchronous = FULL` — every COMMIT syncs the WAL before it
+///   returns. `live.db` is where a mount write, a splice and a confined
+///   run's write live (ADR-0040), and the mount acknowledges a write at
+///   the client's fsync or NFS COMMIT; under `NORMAL` that write
+///   survived a process crash but not a power loss or OS crash (bead
+///   `ley-line-open-0a9931`). The guarantee is `fsync(2)`'s: on macOS
+///   that reaches the drive, not past its cache (`F_FULLFSYNC`, SQLite's
+///   `fullfsync`, is not set).
 /// - `wal_autocheckpoint = 1000` — checkpoint every ~1000 pages
 ///   (~4 MiB at default 4KB page size). Keeps the WAL from
 ///   growing unbounded on a write-heavy daemon; ensures the
@@ -840,8 +845,8 @@ fn configure_wal(conn: &rusqlite::Connection) -> Result<()> {
              `:memory:` connections silently ignore the pragma."
         );
     }
-    conn.pragma_update(None, "synchronous", "NORMAL")
-        .context("set PRAGMA synchronous=NORMAL")?;
+    conn.pragma_update(None, "synchronous", "FULL")
+        .context("set PRAGMA synchronous=FULL")?;
     conn.pragma_update(None, "wal_autocheckpoint", 1000i64)
         .context("set PRAGMA wal_autocheckpoint=1000")?;
     Ok(())
@@ -2383,8 +2388,11 @@ mod tests {
         let synchronous: i64 = conn
             .query_row("PRAGMA synchronous", [], |r| r.get(0))
             .unwrap();
-        // synchronous=NORMAL is the numeric value 1.
-        assert_eq!(synchronous, 1, "synchronous must be NORMAL (=1)");
+        // synchronous=FULL is the numeric value 2: every COMMIT syncs the
+        // WAL before it returns, so a write acknowledged to a mount client
+        // at fsync or NFS COMMIT is on disk, not only in the page cache
+        // (bead ley-line-open-0a9931).
+        assert_eq!(synchronous, 2, "synchronous must be FULL (=2)");
         let autocheckpoint: i64 = conn
             .query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))
             .unwrap();

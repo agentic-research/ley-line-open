@@ -3422,6 +3422,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "splice")]
     fn hash_of(bytes: &[u8]) -> leyline_core::Hash {
         bytes.hash()
     }

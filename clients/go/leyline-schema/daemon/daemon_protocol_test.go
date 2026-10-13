@@ -177,6 +177,33 @@ type readContentResponse struct {
 	Error   *string `json:"error,omitempty"`
 }
 
+type readSourceResponse struct {
+	OK       *bool   `json:"ok"`
+	Content  *string `json:"content,omitempty"`
+	BlobHash *string `json:"blob_hash,omitempty"`
+	TreeRoot *string `json:"tree_root,omitempty"`
+	Error    *string `json:"error,omitempty"`
+}
+
+type pathHash struct {
+	Path     string `json:"path"`
+	BlobHash string `json:"blob_hash"`
+}
+
+type staleRefusal struct {
+	Path     string `json:"path"`
+	Expected string `json:"expected"`
+	Current  string `json:"current"`
+}
+
+type proposeResponse struct {
+	OK       *bool         `json:"ok"`
+	TreeRoot *string       `json:"tree_root,omitempty"`
+	Blobs    []pathHash    `json:"blobs,omitempty"`
+	Stale    *staleRefusal `json:"stale,omitempty"`
+	Error    *string       `json:"error,omitempty"`
+}
+
 type listChildrenResponse struct {
 	OK       *bool  `json:"ok"`
 	Children []node `json:"children"`
@@ -306,6 +333,10 @@ func decoderFor(name string) func([]byte) error {
 		return func(b []byte) error { var v snapshotResponse; return strictUnmarshal(b, &v) }
 	case "ReadContentResponse":
 		return func(b []byte) error { var v readContentResponse; return strictUnmarshal(b, &v) }
+	case "ReadSourceResponse":
+		return func(b []byte) error { var v readSourceResponse; return strictUnmarshal(b, &v) }
+	case "ProposeResponse":
+		return func(b []byte) error { var v proposeResponse; return strictUnmarshal(b, &v) }
 	case "ListChildrenResponse":
 		return func(b []byte) error { var v listChildrenResponse; return strictUnmarshal(b, &v) }
 	case "GetNodeResponse":

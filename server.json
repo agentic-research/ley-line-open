@@ -44,6 +44,13 @@
           ]
         },
         {
+          "name": "write",
+          "advertisedPrefix": "",
+          "upstreamNames": [
+            "propose"
+          ]
+        },
+        {
           "name": "sheaf",
           "advertisedPrefix": "sheaf_",
           "upstreamNames": [
@@ -62,6 +69,7 @@
             "query",
             "list_children",
             "read_content",
+            "read_source",
             "find_callers",
             "find_defs",
             "find_callees",

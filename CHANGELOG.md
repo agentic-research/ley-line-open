@@ -12,6 +12,18 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **Growing the arena no longer overwrites the published image**
+  (bead `ley-line-open-5a0f07`). Buffer offsets derive from the arena's
+  file length, so when a snapshot grew the file in place while buffer B
+  held the published image, B moved and the write into A covered the
+  image readers had verified, before the new root published. A reader
+  without the root check (the warm-start fallback) or a crash mid-write
+  could lose both images. A growing snapshot now builds the larger arena
+  beside the old one (`leyline_core::write_grown_arena`), fsyncs it and
+  renames it into place, and advertises the new size together with the
+  new root; a reader holding the old arena keeps reading what it
+  verified.
+
 - **`task release:publish` waits out the release run without exhausting
   the GitHub API quota** (bead `ley-line-open-b53aec`). It watched the run
   with `gh run watch`, which re-fetches every job each 3 s; publishing

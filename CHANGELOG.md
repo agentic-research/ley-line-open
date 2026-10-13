@@ -12,6 +12,15 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **A parse or write is one transaction, including its `_meta` stamps**
+  (bead `ley-line-open-1360fd`). The pass committed its rows, then swept
+  orphaned directories and stamped `_meta` (`derived_from` among them)
+  as separate commits, so the mount and socket readers, which read
+  `live.db` through the WAL pool, saw the new `_source` under the old
+  `derived_from`, and a failure while stamping left the two disagreeing
+  for good. COMMIT now follows the sweep and the stamps; only the index
+  builds, which change no query result, and the head write run after it.
+
 - **`task release:publish` waits out the release run without exhausting
   the GitHub API quota** (bead `ley-line-open-b53aec`). It watched the run
   with `gh run watch`, which re-fetches every job each 3 s; publishing

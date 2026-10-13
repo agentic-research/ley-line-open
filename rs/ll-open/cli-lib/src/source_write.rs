@@ -440,6 +440,39 @@ mod tests {
         );
     }
 
+    /// A write is one transaction: its rows, the sweep and the `_meta`
+    /// stamps (`derived_from` among them) commit together or not at all.
+    /// The stamps used to run after `COMMIT`, so a reader of the WAL saw
+    /// the new `_source` under the old `derived_from`, and a failure while
+    /// stamping left them disagreeing for good. The failure is injected
+    /// with a trigger on the `derived_from` stamp, the last step.
+    #[test]
+    fn a_write_that_fails_after_its_rows_leaves_the_arena_unchanged() {
+        let a = arena(&[("a.go", A), ("b.go", B)]);
+        a.conn
+            .execute_batch(
+                "CREATE TRIGGER refuse_derived_from BEFORE INSERT ON _meta
+                   WHEN NEW.key = 'derived_from'
+                 BEGIN SELECT RAISE(ABORT, 'injected stamp failure'); END;",
+            )
+            .unwrap();
+        let before = whole_image(&a.conn);
+
+        let err = write(&a.conn, &Grant::Whole, "a.go", A2.as_bytes().to_vec()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("injected stamp failure"),
+            "{err:#}"
+        );
+        assert!(
+            whole_image(&a.conn) == before,
+            "nothing of a failed write is committed"
+        );
+        assert_eq!(
+            leyline_ts::splice::source_bytes(&a.conn, file_id(&a.conn, "a.go")).unwrap(),
+            A.as_bytes(),
+        );
+    }
+
     #[test]
     fn a_write_to_a_file_the_arena_does_not_hold_is_refused() {
         let a = arena(&[("a.go", A)]);

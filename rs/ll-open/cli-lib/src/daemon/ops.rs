@@ -14,7 +14,8 @@ use serde_json::json;
 use super::wire::ValidateRequest;
 use super::wire::{
     AgreementRequest, BASE_OP_NAMES, BaseRequest, InspectNeighborhoodRequest, InspectSymbolRequest,
-    LspFile, LspPosition, Ref as WireRef, SearchSymbolsRequest, TokenMapEntry,
+    LspFile, LspPosition, ProposeRequest, ReadSourceRequest, Ref as WireRef, SearchSymbolsRequest,
+    TokenMapEntry,
 };
 #[cfg(feature = "hdc")]
 use super::wire::{HdcCalibrateRequest, HdcDensityRequest, HdcSearchRequest};
@@ -31,7 +32,8 @@ use super::{DaemonContext, DaemonPhase};
 ///
 /// Single source of truth — `daemon::socket` reads this via
 /// `is_state_changing()` rather than maintaining a parallel list.
-pub(crate) const STATE_CHANGING_OPS: &[&str] = &["load", "reparse", "flush", "snapshot", "enrich"];
+pub(crate) const STATE_CHANGING_OPS: &[&str] =
+    &["load", "reparse", "flush", "snapshot", "enrich", "propose"];
 
 /// Whether an op name belongs to `STATE_CHANGING_OPS`. Used by the UDS
 /// dispatch loop to decide if the op deserves a follow-up event.
@@ -132,6 +134,8 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
         BaseRequest::ListRoots => op_list_children(ctx, ""),
         BaseRequest::ListChildren { id } => op_list_children(ctx, id.as_deref().unwrap_or("")),
         BaseRequest::ReadContent { id } => op_read_content(ctx, &id),
+        BaseRequest::ReadSource(r) => op_read_source(ctx, &r),
+        BaseRequest::Propose(r) => op_propose(ctx, r),
         BaseRequest::FindCallers { token } => op_find_callers(ctx, &token),
         BaseRequest::FindCallees { id } => op_find_callees(ctx, &id),
         BaseRequest::FindDefs { token } => op_find_defs(ctx, &token),
@@ -1036,6 +1040,112 @@ fn op_read_content(ctx: &DaemonContext, id: &str) -> Result<String> {
         }
         None => Ok(node_not_found_response(id)),
     })
+}
+
+/// A whole source file by its `_source.id`, with its blob hash and the
+/// arena's `treeRoot`, read in one transaction so the three agree. The blob
+/// hash is the base a later `propose` names (ADR-0041 P2).
+fn op_read_source(ctx: &DaemonContext, req: &ReadSourceRequest) -> Result<String> {
+    use leyline_core::ContentAddressed;
+    use rusqlite::OptionalExtension;
+    let path = req.path.as_str();
+    ctx.with_read(|conn| {
+        conn.execute_batch("BEGIN")?;
+        let read = (|| -> Result<(String, leyline_core::Hash, Option<leyline_core::Hash>)> {
+            let bytes: Vec<u8> = conn
+                .query_row(
+                    "SELECT b.blob_bytes FROM _source s \
+                       JOIN source_blobs b ON b.blob_hash = s.content_hash \
+                      WHERE s.id = ?1",
+                    [path],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .with_context(|| format!("read_source: no stored source for '{path}'"))?;
+            let tree_root = crate::tree_root::DerivedFrom::read(conn)?.map(|d| d.tree_root);
+            let blob_hash = bytes.as_slice().hash();
+            let content = String::from_utf8(bytes)
+                .with_context(|| format!("read_source: '{path}' is not UTF-8"))?;
+            Ok((content, blob_hash, tree_root))
+        })();
+        conn.execute_batch("COMMIT")?;
+        let (content, blob_hash, tree_root) = read?;
+
+        let mut builder = capnp::message::Builder::new_default();
+        let mut root: leyline_public_schema::daemon_capnp::read_source_response::Builder =
+            builder.init_root();
+        root.set_ok(true);
+        root.set_content(&content);
+        root.set_blob_hash(blob_hash.to_string());
+        if let Some(t) = tree_root {
+            root.set_tree_root(t.to_string());
+        }
+        let reader = builder
+            .get_root_as_reader::<leyline_public_schema::daemon_capnp::read_source_response::Reader>()?;
+        Ok(capnp_json::to_json(reader)?)
+    })
+}
+
+/// Several files written as one change through the daemon's single writer
+/// (ADR-0041 P1): applied whole, or refused whole. A refusal because a file
+/// moved since its author read it carries `stale`, naming the file and both
+/// blob hashes. An accepted proposal is published so out-of-process readers
+/// see it.
+fn op_propose(ctx: &DaemonContext, req: ProposeRequest) -> Result<String> {
+    use crate::source_write::{Base, Grant, Proposed, Stale};
+    let mut writes = Vec::with_capacity(req.writes.len());
+    for w in req.writes {
+        let base = if w.base.is_empty() {
+            Base::Any
+        } else {
+            let bytes: [u8; 32] = hex::decode(&w.base)
+                .ok()
+                .and_then(|b| b.try_into().ok())
+                .with_context(|| {
+                    format!(
+                        "propose: the base for '{}' is not a 64-hex-char blob hash",
+                        w.path
+                    )
+                })?;
+            Base::Blob(leyline_core::Hash::from_bytes(bytes))
+        };
+        writes.push(Proposed {
+            path: w.path,
+            base,
+            bytes: w.content.into_bytes(),
+        });
+    }
+
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root: leyline_public_schema::daemon_capnp::propose_response::Builder =
+        builder.init_root();
+    match ctx.with_write(|conn| crate::source_write::propose(conn, &Grant::Whole, writes)) {
+        Ok(accepted) => {
+            snapshot_living_db(ctx)?;
+            root.set_ok(true);
+            root.set_tree_root(accepted.tree_root.to_string());
+            let mut blobs = root.init_blobs(accepted.blobs.len() as u32);
+            for (i, (path, hash)) in accepted.blobs.iter().enumerate() {
+                let mut b = blobs.reborrow().get(i as u32);
+                b.set_path(path);
+                b.set_blob_hash(hash.to_string());
+            }
+        }
+        Err(err) => {
+            let Some(stale) = err.downcast_ref::<Stale>() else {
+                return Err(err);
+            };
+            root.set_ok(false);
+            root.set_error(stale.to_string());
+            let mut s = root.init_stale();
+            s.set_path(&stale.path);
+            s.set_expected(stale.expected.to_string());
+            s.set_current(stale.current.to_string());
+        }
+    }
+    let reader = builder
+        .get_root_as_reader::<leyline_public_schema::daemon_capnp::propose_response::Reader>()?;
+    Ok(capnp_json::to_json(reader)?)
 }
 
 /// Find callers of a token (queries node_refs).
@@ -3654,7 +3764,7 @@ mod tests {
         let mut actual: Vec<&str> = STATE_CHANGING_OPS.to_vec();
         actual.sort();
         let expected: Vec<&str> = {
-            let mut v = vec!["load", "reparse", "flush", "snapshot", "enrich"];
+            let mut v = vec!["load", "reparse", "flush", "snapshot", "enrich", "propose"];
             v.sort();
             v
         };
@@ -3677,6 +3787,7 @@ mod tests {
             "list_children",
             "list_roots",
             "read_content",
+            "read_source",
             "find_callers",
             "find_callees",
             "find_defs",
@@ -3992,6 +4103,135 @@ mod tests {
 
     /// A context whose `source_dir` is the temp dir itself, so absolute
     /// and `file://` keys under it resolve to arena-relative paths.
+    const PROPOSE_A: &str = "package a\n\nfunc A() int { return 1 }\n";
+    const PROPOSE_A2: &str = "package a\n\nfunc A() int { return 2 }\n";
+    const PROPOSE_A3: &str = "package a\n\nfunc A() int { return 3 }\n";
+    const PROPOSE_B: &str = "package a\n\nfunc C() string { return \"c\" }\n";
+    const PROPOSE_B2: &str = "package a\n\nfunc C() string { return \"see\" }\n";
+
+    /// A daemon whose live db holds a cold parse of `a.go` and `b.go`.
+    fn setup_parsed() -> (TempDir, std::sync::Arc<DaemonContext>) {
+        let (dir, ctx) = setup();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.go"), PROPOSE_A).unwrap();
+        std::fs::write(src.join("b.go"), PROPOSE_B).unwrap();
+        ctx.with_write(|conn| crate::cmd_parse::parse_into_conn(conn, &src, None, None))
+            .unwrap();
+        (dir, ctx)
+    }
+
+    fn call(ctx: &std::sync::Arc<DaemonContext>, request: serde_json::Value) -> serde_json::Value {
+        let out = handle_base_op_value(ctx, request).expect("a known op answers");
+        serde_json::from_str(&out).unwrap()
+    }
+
+    fn hex_hash(text: &str) -> String {
+        use leyline_core::ContentAddressed;
+        text.as_bytes().hash().to_string()
+    }
+
+    #[tokio::test]
+    async fn read_source_returns_the_file_with_its_blob_hash_and_tree_root() {
+        let (_dir, ctx) = setup_parsed();
+        let r = call(
+            &ctx,
+            serde_json::json!({"op": "read_source", "path": "a.go"}),
+        );
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(r["content"], PROPOSE_A);
+        assert_eq!(r["blob_hash"], hex_hash(PROPOSE_A));
+        let stamped = ctx
+            .with_read(|conn| crate::tree_root::DerivedFrom::read(conn))
+            .unwrap()
+            .expect("a parse stamps derived_from");
+        assert_eq!(r["tree_root"], stamped.tree_root.to_string());
+
+        let missing = call(
+            &ctx,
+            serde_json::json!({"op": "read_source", "path": "nope.go"}),
+        );
+        assert_eq!(missing["ok"], false, "{missing}");
+    }
+
+    /// The round trip an agent makes: read, propose against what it read,
+    /// and be refused when someone else's change landed in between.
+    #[tokio::test]
+    async fn propose_applies_against_what_was_read_and_refuses_a_stale_base() {
+        let (_dir, ctx) = setup_parsed();
+        let read = call(
+            &ctx,
+            serde_json::json!({"op": "read_source", "path": "a.go"}),
+        );
+        let base_a = read["blob_hash"].as_str().unwrap().to_string();
+
+        let accepted = call(
+            &ctx,
+            serde_json::json!({"op": "propose", "writes": [
+                {"path": "a.go", "base": base_a, "content": PROPOSE_A2},
+                {"path": "b.go", "base": hex_hash(PROPOSE_B), "content": PROPOSE_B2},
+            ]}),
+        );
+        assert_eq!(accepted["ok"], true, "{accepted}");
+        let after = call(
+            &ctx,
+            serde_json::json!({"op": "read_source", "path": "a.go"}),
+        );
+        assert_eq!(after["content"], PROPOSE_A2);
+        assert_eq!(accepted["tree_root"], after["tree_root"]);
+        let blobs = accepted["blobs"].as_array().unwrap();
+        assert!(
+            blobs.contains(&serde_json::json!({"path": "a.go", "blob_hash": hex_hash(PROPOSE_A2)}))
+        );
+        assert!(
+            blobs.contains(&serde_json::json!({"path": "b.go", "blob_hash": hex_hash(PROPOSE_B2)}))
+        );
+
+        // A second author still holding the first read is refused.
+        let stale = call(
+            &ctx,
+            serde_json::json!({"op": "propose", "writes": [
+                {"path": "a.go", "base": base_a, "content": PROPOSE_A3},
+            ]}),
+        );
+        assert_eq!(stale["ok"], false, "{stale}");
+        assert_eq!(
+            stale["stale"],
+            serde_json::json!({
+                "path": "a.go",
+                "expected": hex_hash(PROPOSE_A),
+                "current": hex_hash(PROPOSE_A2),
+            })
+        );
+        assert!(
+            stale["error"]
+                .as_str()
+                .unwrap()
+                .contains("moved since it was read")
+        );
+        let unchanged = call(
+            &ctx,
+            serde_json::json!({"op": "read_source", "path": "a.go"}),
+        );
+        assert_eq!(
+            unchanged["content"], PROPOSE_A2,
+            "a refused proposal changes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn propose_refuses_a_base_that_is_not_a_blob_hash() {
+        let (_dir, ctx) = setup_parsed();
+        let r = call(
+            &ctx,
+            serde_json::json!({"op": "propose", "writes": [
+                {"path": "a.go", "base": "not-hex", "content": PROPOSE_A2},
+            ]}),
+        );
+        assert_eq!(r["ok"], false, "{r}");
+        assert!(r["error"].as_str().unwrap().contains("base"), "{r}");
+    }
+
     fn setup_rooted() -> (TempDir, std::sync::Arc<DaemonContext>) {
         setup_full(Arc::new(crate::daemon::NoExt), true)
     }

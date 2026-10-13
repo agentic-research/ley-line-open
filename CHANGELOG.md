@@ -12,6 +12,19 @@ context, scoping notes, and review history are recoverable.
 
 ### Added
 
+- **Daemon ops `read_source` and `propose`: write source files over the
+  socket and MCP, refused if they moved since you read them** (bead
+  `ley-line-open-609525`). `read_source {path}` returns a file's
+  content, its `blob_hash` and the arena's `tree_root`, read together.
+  `propose {writes: [{path, base, content}]}` applies the writes as one
+  change on the daemon's single writer and publishes it; when a file
+  moved since its `base` was read, nothing is written and the response
+  carries `stale {path, expected, current}`. Both are MCP tools;
+  `propose` is in its own cloister group, `write`, so a policy can grant
+  reads without writes, and it emits `daemon.propose`. The capnp
+  additions are additive; `SCHEMA_VERSION` moves to 0.20.3 and the Go
+  bindings are regenerated.
+
 - **Proposals: several files written as one change, refused if any moved
   since it was read** (bead `ley-line-open-d25ec4`; ADR-0041 draft P1-P2).
   `source_write::propose(grant, writes)` takes each file's path, the blob

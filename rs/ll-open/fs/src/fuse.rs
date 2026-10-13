@@ -210,7 +210,7 @@ impl Filesystem for LeylineFuse {
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         // Opening for writing takes the edit's base (ADR-0041 P2), so a
         // change that lands while the file is open is refused at flush.
-        if flags & libc::O_ACCMODE != libc::O_RDONLY
+        if opens_for_writing(flags)
             && let Some(id) = self.ino_to_id.get(&ino)
             && let Err(e) = self.graph.note_base(id)
         {
@@ -542,6 +542,11 @@ pub fn mount_fuse(graph: Arc<dyn Graph>, mountpoint: &Path) -> anyhow::Result<Fu
     Ok(session)
 }
 
+/// Whether `open(2)` flags ask for write access (`O_WRONLY` or `O_RDWR`).
+fn opens_for_writing(flags: i32) -> bool {
+    flags & libc::O_ACCMODE != libc::O_RDONLY
+}
+
 /// The errno a refused flush answers: `ESTALE` when the file moved since
 /// the edit began (ADR-0041 P2), `EIO` for any other refusal.
 fn flush_errno(err: &anyhow::Error) -> i32 {
@@ -556,6 +561,15 @@ fn flush_errno(err: &anyhow::Error) -> i32 {
 mod tests {
     use super::*;
     use crate::graph::MemoryGraph;
+
+    #[test]
+    fn write_access_is_read_from_the_access_mode_bits() {
+        assert!(!opens_for_writing(libc::O_RDONLY));
+        assert!(opens_for_writing(libc::O_WRONLY));
+        assert!(opens_for_writing(libc::O_RDWR));
+        assert!(opens_for_writing(libc::O_WRONLY | libc::O_TRUNC));
+        assert!(!opens_for_writing(libc::O_RDONLY | libc::O_NONBLOCK));
+    }
 
     /// A stale refusal reaches the client as `ESTALE`, wrapped in context or
     /// not; every other refusal as `EIO`.

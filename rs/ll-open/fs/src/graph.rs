@@ -3385,6 +3385,45 @@ mod tests {
         Ok(())
     }
 
+    /// Opening for writing takes the base (`note_base`): a change that lands
+    /// after the open and before the first write is caught at flush, because
+    /// the flush names the file as it was at the open, not at the write. The
+    /// change here is a batch splice, which writes with no base of its own.
+    #[test]
+    #[cfg(feature = "splice")]
+    fn opening_for_writing_takes_the_base() -> Result<()> {
+        fn check(graph: &dyn Graph, writer: &BaseCheckingWriter) -> Result<()> {
+            let node_id = "test.html/element/text";
+            graph.note_base(node_id)?;
+            graph.batch_splice(&[(node_id.to_string(), Some("other".to_string()))])?;
+            graph.write_content(node_id, b"world", 0)?;
+            graph.flush_node(node_id)?;
+            assert_eq!(
+                writer.bases.lock().last(),
+                Some(&Some(hash_of(b"<p>hello</p>"))),
+                "the flush names the file as it was when it was opened",
+            );
+            Ok(())
+        }
+
+        let db_bytes = leyline_ts::parse_with_source(
+            b"<p>hello</p>",
+            leyline_ts::languages::TsLanguage::Html,
+            "test.html",
+        )?;
+        let mut adapter = SqliteGraphAdapter::new_writable(&db_bytes)?;
+        let writer = Arc::new(BaseCheckingWriter::default());
+        adapter.set_source_writer(writer.clone());
+        check(&adapter, &writer)?;
+
+        let dir = tempfile::tempdir()?;
+        let writer = Arc::new(BaseCheckingWriter::default());
+        let graph = HotSwapGraph::new(publish_html_arena(dir.path())?)?
+            .with_writable()
+            .with_source_writer(writer.clone())?;
+        check(&graph, &writer)
+    }
+
     /// A refused edit is discarded, not left behind: the node reads as the
     /// stored file again, nothing stays pending, the refusal is typed as
     /// stale for the mount to answer `ESTALE`, and its reason is recorded

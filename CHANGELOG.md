@@ -51,6 +51,10 @@ context, scoping notes, and review history are recoverable.
 
 ### Documentation
 
+- **Three leftover merge markers removed from this file.** Bare
+  `||||||| <commit>` lines from an earlier conflict resolution sat in the
+  0.20.2 and 0.20.3 sections; the entries around them are unchanged.
+
 - **ADR-0041 (publication) and ADR-0042 (proposals), both Proposed**
   (bead `ley-line-open-d70f99`; ADR-0040 D7). ADR-0042: a write names
   the bytes its author read and is applied whole or refused whole —
@@ -251,7 +255,6 @@ control block stays VERSION 3. `SCHEMA_VERSION` moves to 0.20.2 because
   `release.yml` smokes each natively built target and the release dry-run
   smokes its build. Its first runs found the five defects below.
 
-||||||| 4ae0f3a
 - **`_meta.derived_from` and `leyline rebuild`: the arena says what it was
   derived from, and is rebuilt from it** (ADR-0040 D6, bead
   `ley-line-open-f31efd`). Every parse, including a scoped pass and a write
@@ -342,7 +345,6 @@ control block stays VERSION 3. `SCHEMA_VERSION` moves to 0.20.2 because
   boundaries. rustls is a transitive dependency; `rs/Cargo.lock` now pins the
   patched release (and rustls-webpki 0.103.13 → 0.103.15 with it).
 
-||||||| 5f45ea3
 - **SECURITY: the NFS export listens on loopback only** (bead
   `ley-line-open-95d08b`). `daemon --mount` and `serve` with the NFS backend
   (the macOS default) listened on `0.0.0.0`, though the mount itself
@@ -388,7 +390,6 @@ control block stays VERSION 3. `SCHEMA_VERSION` moves to 0.20.2 because
   adds fuse-t's library directory to the binary's rpath on macOS mount
   builds.
 
-||||||| 4ae0f3a
 - **An NFS write is committed once, whole, not once per chunk** (bead
   `ley-line-open-b6d217`). NFSv3 has no close, and nfsserve hands the server
   neither COMMIT nor a last-chunk mark, so `LeylineNfs::write` spliced every

@@ -12,6 +12,15 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **The WAL reader-pool latency gate no longer fails a healthy pool on a
+  loaded machine** (bead `ley-line-open-7c88ec`).
+  `concurrent_readers_beat_pre_15b_mutex_shape` required p99 read
+  latency under 10 ms and failed at 10.14 ms while the pool beat the
+  mutex baseline 1.45x with every reader checked out at once. The gate
+  guards against a fall back to DELETE-journal latency (120–250 ms p99);
+  it is now 50 ms. Readers serializing on a lock stays caught by the
+  test's structural checkout assertion.
+
 - **`task release:publish` waits out the release run without exhausting
   the GitHub API quota** (bead `ley-line-open-b53aec`). It watched the run
   with `gh run watch`, which re-fetches every job each 3 s; publishing

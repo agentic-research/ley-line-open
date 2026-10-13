@@ -25,6 +25,15 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **A mount write acknowledged at fsync is on disk, not only in the page
+  cache** (bead `ley-line-open-0a9931`). `live.db` ran WAL with
+  `synchronous=NORMAL`, which does not sync the WAL on COMMIT, so the
+  write v0.20.3 reports as stored when the client's fsync, close or NFS
+  COMMIT returns survived a daemon crash but could be lost on power loss
+  or an OS crash. The writer now runs `synchronous=FULL`: one WAL sync
+  per write transaction. The guarantee is `fsync(2)`'s; on macOS that
+  does not reach past the drive's cache (`F_FULLFSYNC` is not set).
+
 - **A parse or write is one transaction, including its `_meta` stamps**
   (bead `ley-line-open-1360fd`). The pass committed its rows, then swept
   orphaned directories and stamped `_meta` (`derived_from` among them)

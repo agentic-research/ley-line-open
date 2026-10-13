@@ -359,16 +359,19 @@ fn concurrent_readers_beat_pre_15b_mutex_shape() {
          shape cannot exceed 1 by construction."
     );
 
-    // Assertion 1: p99 read latency < 10 ms.
+    // Assertion 1: p99 read latency < 50 ms.
     //
-    // The empirical bench measured 290–375 µs on Apple Silicon. GHA
-    // runners are noisier; 10 ms leaves ~30× headroom while still
-    // catching a regression to DELETE-journal levels (120–250 ms p99
-    // baseline). If this flakes in CI, the bead documents relaxing
-    // to 50 ms — still order-of-magnitude below the baseline.
+    // The empirical bench measured 290–375 µs on Apple Silicon. The gate
+    // exists to catch a regression to DELETE-journal levels (120–250 ms
+    // p99); readers serializing on a lock is caught by the structural
+    // max-checkouts assertion above, without timing. It was 10 ms until a
+    // loaded machine measured pool_p99 = 10.14 ms (max 62 ms) while the pool
+    // beat the mutex baseline 1.45x with 10 of 10 readers checked out at
+    // once (bead ley-line-open-7c88ec): a healthy pool, failed by the clock.
+    // 50 ms is 2.4x below the DELETE-journal floor it guards.
     assert!(
-        pool_p99 < Duration::from_millis(10),
-        "p99 read latency exceeded 10ms — WAL 15b's concurrent-reader win \
+        pool_p99 < Duration::from_millis(50),
+        "p99 read latency exceeded 50ms — WAL 15b's concurrent-reader win \
          has regressed. Got pool_p99={pool_p99:?}, max={pool_max:?}. \
          Empirical baseline (docs/research/2026-05-08-workerd-wal-sqlite-experiment.md): \
          WAL@N=10 p99 = 290–375 µs; DELETE-journal p99 = 120–250 ms.",
@@ -400,10 +403,10 @@ fn concurrent_readers_beat_pre_15b_mutex_shape() {
     // The numbers are printed unconditionally above, so the signal stays
     // visible in every CI log; only `task test:perf` fails on it.
     //
-    // What is NOT gated: assertion 1's p99 latency, which carries ~30x of
-    // headroom against the DELETE-journal baseline it exists to catch and has
-    // never been observed flaking. Gating a budget with real headroom would
-    // give up signal for nothing.
+    // What is NOT moved behind the gate: assertion 1's p99 latency, which
+    // keeps 2.4x of headroom below the DELETE-journal floor it exists to
+    // catch. Gating a budget with real headroom would give up signal for
+    // nothing.
     let gate_enabled = perf_gate_enabled();
     eprintln!(
         "  throughput floor gate: enabled={gate_enabled} (LLO_PERF_GATES=1), \

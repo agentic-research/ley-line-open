@@ -598,13 +598,19 @@ mod tests {
         };
 
         const PUBLISHES: u64 = 16;
+        // Holds during which a read was in flight: what makes the test a
+        // test. Counted rather than inferred from completed reads, because
+        // one read spinning under the seqlock can span several back-to-back
+        // publishes (bead ley-line-open-7c88ec).
+        let overlapped = Arc::new(AtomicU64::new(0));
         for i in 0..PUBLISHES {
             let (root, prev) = if i.is_multiple_of(2) {
                 (ROOT_B, ROOT_A)
             } else {
                 (ROOT_A, ROOT_B)
             };
-            let (attempts, completed) = (attempts.clone(), completed.clone());
+            let (attempts, completed, overlapped) =
+                (attempts.clone(), completed.clone(), overlapped.clone());
             writer
                 .set_arena_with_root_hooked("/tmp/a", 1, root, &mut || {
                     // The mapping really is torn at this point: new first
@@ -631,16 +637,32 @@ mod tests {
                     // it finished torn) or is still waiting on us (seqlock:
                     // it spins on the odd counter), bounded so neither
                     // outcome can hang the test.
-                    let started = attempts.load(Ordering::Acquire);
+                    //
+                    // The two waits have separate bounds. The first waits
+                    // for a read to be in flight during the hold — started
+                    // and not finished, which under the seqlock is the
+                    // reader spinning on the odd counter. It ends as soon as
+                    // the reader thread runs, so its bound only matters on
+                    // a starved machine, where 50 ms let publishes pass with
+                    // no read overlapping them (bead ley-line-open-7c88ec).
+                    // The second waits for that read to finish, which the
+                    // seqlock forbids during the hold, so it runs out its
+                    // bound on every publish and stays short.
                     let done = completed.load(Ordering::Acquire);
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
-                    while attempts.load(Ordering::Acquire) <= started
-                        && std::time::Instant::now() < deadline
+                    let start_deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while attempts.load(Ordering::Acquire) <= completed.load(Ordering::Acquire)
+                        && std::time::Instant::now() < start_deadline
                     {
                         std::thread::yield_now();
                     }
+                    if attempts.load(Ordering::Acquire) > completed.load(Ordering::Acquire) {
+                        overlapped.fetch_add(1, Ordering::AcqRel);
+                    }
+                    let finish_deadline =
+                        std::time::Instant::now() + std::time::Duration::from_millis(50);
                     while completed.load(Ordering::Acquire) <= done
-                        && std::time::Instant::now() < deadline
+                        && std::time::Instant::now() < finish_deadline
                     {
                         std::thread::yield_now();
                     }
@@ -655,9 +677,14 @@ mod tests {
             0,
             "a reader overlapping a publish observed a root that was never published"
         );
+        assert_eq!(
+            overlapped.load(Ordering::Acquire),
+            PUBLISHES,
+            "a read must have been in flight during every half-written root"
+        );
         assert!(
-            completed.load(Ordering::Acquire) >= PUBLISHES,
-            "the reader must have read across every publish"
+            completed.load(Ordering::Acquire) >= 1,
+            "the reader must have returned a root to check"
         );
     }
 

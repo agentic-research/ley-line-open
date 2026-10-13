@@ -10,6 +10,137 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.20.4] — 2026-10-13
+
+Proposals and write safety. A write can now name the bytes its author
+read and is refused, with nothing changed, when the file moved since
+(ADR-0042): over the daemon (`read_source` / `propose`, also MCP tools)
+and through the mount (`ESTALE`). A write is one SQLite transaction and
+is synced before it is acknowledged; a refused mount edit is discarded,
+not left behind; growing the arena no longer overwrites the published
+image. The daemon wire gains two additive ops, so `SCHEMA_VERSION` moves
+to 0.20.4 with a new `clients/go/leyline-schema` tag. The projection
+stays `projection-v6`, the wire stays v1 and the control block stays
+VERSION 3 (control block v4 is ADR-0041, not yet implemented).
+
+### Added
+
+- **A mount edit is refused with `ESTALE` when its file moved since the
+  edit began, and a refused edit is discarded** (bead
+  `ley-line-open-843e03`). The mount takes an edit's base — the hash of
+  the file's stored bytes — when the file is opened for writing (FUSE) or
+  at the first write after the last flush (NFS), and proposes the edit
+  against it. A file changed by someone else in between is refused:
+  FUSE answers `ESTALE`, NFS an I/O error. Any refused edit, stale or
+  invalid, is now discarded rather than left behind: the node reads as
+  the stored file again and the reason is recorded in `_errors`.
+  `SourceWriter::write` takes the base; `Graph::note_base` is new;
+  `leyline_fs::graph::StaleWrite` is the typed refusal. A client that
+  reads, closes and reopens a file to write takes its base at the reopen;
+  for a check against what an agent read, use the daemon's `propose`.
+
+- **Daemon ops `read_source` and `propose`: write source files over the
+  socket and MCP, refused if they moved since you read them** (bead
+  `ley-line-open-609525`). `read_source {path}` returns a file's
+  content, its `blob_hash` and the arena's `tree_root`, read together.
+  `propose {writes: [{path, base, content}]}` applies the writes as one
+  change on the daemon's single writer and publishes it; when a file
+  moved since its `base` was read, nothing is written and the response
+  carries `stale {path, expected, current}`. Both are MCP tools;
+  `propose` is in its own cloister group, `write`, so a policy can grant
+  reads without writes, and it emits `daemon.propose`. The capnp
+  additions are additive; `SCHEMA_VERSION` moves to 0.20.3 and the Go
+  bindings are regenerated.
+
+- **Proposals: several files written as one change, refused if any moved
+  since it was read** (bead `ley-line-open-d25ec4`; ADR-0041 draft P1-P2).
+  `source_write::propose(grant, writes)` takes each file's path, the blob
+  hash its author read (`Base::Blob`, or `Base::Any` for no check) and its
+  new bytes. It is refused whole, with nothing changed, when a path is
+  outside the grant, a file no longer holds the blob its author read
+  (a typed `Stale` naming the path and both hashes), a file does not
+  parse, or a path repeats; otherwise every file lands in one parse pass
+  and one transaction. `write` is now its one-file, unchecked case.
+
+### Documentation
+
+- **Three leftover merge markers removed from this file.** Bare
+  `||||||| <commit>` lines from an earlier conflict resolution sat in the
+  0.20.2 and 0.20.3 sections; the entries around them are unchanged.
+
+- **ADR-0041 (publication) and ADR-0042 (proposals), both Proposed**
+  (bead `ley-line-open-d70f99`; ADR-0040 D7). ADR-0042: a write names
+  the bytes its author read and is applied whole or refused whole —
+  file bases, the daemon's `read_source`/`propose` and the mount's
+  `ESTALE` are implemented; node bases and the closure check are open.
+  ADR-0041: publication becomes immutable snapshot files of whole
+  proposals under control block v4 with `(epoch, seq)` and one
+  producer; `current_root` is retired for `treeRoot`; transport carries
+  what proposals carry. ADR-0040's D7 points to both, and its citation
+  of cloister ADR-0013/0030 is corrected.
+
+### Fixed
+
+- **FUSE `fsync` reports a refused edit** (bead `ley-line-open-843e03`).
+  It logged a failed flush and returned success when publishing worked,
+  so a client was told a discarded write was durable.
+
+- **A parse or write is one transaction, including its `_meta` stamps**
+  (bead `ley-line-open-1360fd`). The pass committed its rows, then swept
+  orphaned directories and stamped `_meta` (`derived_from` among them)
+  as separate commits, so the mount and socket readers, which read
+  `live.db` through the WAL pool, saw the new `_source` under the old
+  `derived_from`, and a failure while stamping left the two disagreeing
+  for good. COMMIT now follows the sweep and the stamps; only the index
+  builds, which change no query result, and the head write run after it.
+
+- **The WAL reader-pool latency gate no longer fails a healthy pool on a
+  loaded machine** (bead `ley-line-open-7c88ec`).
+  `concurrent_readers_beat_pre_15b_mutex_shape` required p99 read
+  latency under 10 ms and failed at 10.14 ms while the pool beat the
+  mutex baseline 1.45x with every reader checked out at once. The gate
+  guards against a fall back to DELETE-journal latency (120–250 ms p99);
+  it is now 50 ms. Readers serializing on a lock stays caught by the
+  test's structural checkout assertion. The control block's torn-root
+  test (`a_reader_overlapping_a_publish_never_sees_a_torn_root`) asserted
+  one completed read per publish, which a correct seqlock does not give
+  (one spinning read can span several publishes) and a starved reader
+  missed; it now asserts that a read was in flight during every
+  half-written root, waiting up to 5 s for the reader to run.
+
+- **A mount write acknowledged at fsync is on disk, not only in the page
+  cache** (bead `ley-line-open-0a9931`). `live.db` ran WAL with
+  `synchronous=NORMAL`, which does not sync the WAL on COMMIT, so the
+  write v0.20.3 reports as stored when the client's fsync, close or NFS
+  COMMIT returns survived a daemon crash but could be lost on power loss
+  or an OS crash. The writer now runs `synchronous=FULL`: one WAL sync
+  per write transaction. The guarantee is `fsync(2)`'s; on macOS that
+  does not reach past the drive's cache (`F_FULLFSYNC` is not set).
+
+- **Growing the arena no longer overwrites the published image**
+  (bead `ley-line-open-5a0f07`). Buffer offsets derive from the arena's
+  file length, so when a snapshot grew the file in place while buffer B
+  held the published image, B moved and the write into A covered the
+  image readers had verified, before the new root published. A reader
+  without the root check (the warm-start fallback) or a crash mid-write
+  could lose both images. A growing snapshot now builds the larger arena
+  beside the old one (`leyline_core::write_grown_arena`), fsyncs it and
+  renames it into place, and advertises the new size together with the
+  new root; a reader holding the old arena keeps reading what it
+  verified.
+
+- **`task release:publish` waits out the release run without exhausting
+  the GitHub API quota** (bead `ley-line-open-b53aec`). It watched the run
+  with `gh run watch`, which re-fetches every job each 3 s; publishing
+  v0.20.3 hit `HTTP 403: API rate limit exceeded` while the release run was
+  still building, so the task failed on a release that then succeeded. It
+  now asks for the run's status once per `RELEASE_POLL_SECONDS` (30 s),
+  retries a failed query (`RELEASE_RETRY_ATTEMPTS`, 5, at
+  `RELEASE_RETRY_DELAY_SECONDS`, 60 s), fails on any conclusion but
+  success, and gives up after `RELEASE_MAX_POLLS` (120). `tools/tag_release.sh`
+  now says why it refuses a checkout other than `main` instead of exiting 1
+  silently.
+
 ## [0.20.3] — 2026-10-12
 
 Patch release: a write through an NFS mount is in the stored source when
@@ -137,7 +268,6 @@ control block stays VERSION 3. `SCHEMA_VERSION` moves to 0.20.2 because
   `release.yml` smokes each natively built target and the release dry-run
   smokes its build. Its first runs found the five defects below.
 
-||||||| 4ae0f3a
 - **`_meta.derived_from` and `leyline rebuild`: the arena says what it was
   derived from, and is rebuilt from it** (ADR-0040 D6, bead
   `ley-line-open-f31efd`). Every parse, including a scoped pass and a write
@@ -228,7 +358,6 @@ control block stays VERSION 3. `SCHEMA_VERSION` moves to 0.20.2 because
   boundaries. rustls is a transitive dependency; `rs/Cargo.lock` now pins the
   patched release (and rustls-webpki 0.103.13 → 0.103.15 with it).
 
-||||||| 5f45ea3
 - **SECURITY: the NFS export listens on loopback only** (bead
   `ley-line-open-95d08b`). `daemon --mount` and `serve` with the NFS backend
   (the macOS default) listened on `0.0.0.0`, though the mount itself
@@ -274,7 +403,6 @@ control block stays VERSION 3. `SCHEMA_VERSION` moves to 0.20.2 because
   adds fuse-t's library directory to the binary's rpath on macOS mount
   builds.
 
-||||||| 4ae0f3a
 - **An NFS write is committed once, whole, not once per chunk** (bead
   `ley-line-open-b6d217`). NFSv3 has no close, and nfsserve hands the server
   neither COMMIT nor a last-chunk mark, so `LeylineNfs::write` spliced every

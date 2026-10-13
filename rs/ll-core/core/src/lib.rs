@@ -12,6 +12,6 @@ pub mod substrate;
 pub use blob_store::{FsBlobStore, MemBlobStore};
 pub use control::Controller;
 pub use head_digest::head_digest;
-pub use layout::{ArenaHeader, create_arena, write_to_arena};
+pub use layout::{ArenaHeader, create_arena, write_grown_arena, write_to_arena};
 pub use partition::{Domain, Entry, PartitionSpec};
 pub use substrate::{BlobStore, ContentAddressed, Hash, RootPointer, RootSigner};

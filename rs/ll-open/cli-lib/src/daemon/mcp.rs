@@ -186,6 +186,44 @@ pub fn tool_registry() -> Vec<McpTool> {
             }),
         },
         McpTool {
+            name: "read_source",
+            description: "Read a whole source file by its path relative to the tree root. \
+                          Returns its content, `blob_hash` (pass it as the `base` of a later \
+                          `propose`) and the arena's `tree_root`.",
+            schema: json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+        },
+        McpTool {
+            name: "propose",
+            description: "Write several source files as one change: applied whole, or refused \
+                          whole. Give each write the `blob_hash` you read from `read_source` as \
+                          its `base`; if any file moved since, nothing is written and `stale` \
+                          names the file and its current blob hash, so you can re-read and \
+                          retry. An empty `base` writes without a check.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "writes": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "base": {"type": "string"},
+                                "content": {"type": "string"}
+                            },
+                            "required": ["path", "content"]
+                        }
+                    }
+                },
+                "required": ["writes"]
+            }),
+        },
+        McpTool {
             name: "find_callers",
             description: "Find references of a token (queries node_refs).",
             schema: json!({
@@ -564,6 +602,13 @@ pub fn cloister_groups() -> Vec<CloisterGroupDecl> {
             advertised_prefix: "",
             upstream_names: vec!["status", "snapshot", "reparse", "enrich"],
         },
+        // Write — the one op that changes source bytes (ADR-0041 P1), in its
+        // own group so a policy can grant reads without writes.
+        CloisterGroupDecl {
+            name: "write",
+            advertised_prefix: "",
+            upstream_names: vec!["propose"],
+        },
         // Sheaf cache — every tool carries the `sheaf_` prefix.
         CloisterGroupDecl {
             name: "sheaf",
@@ -586,6 +631,7 @@ pub fn cloister_groups() -> Vec<CloisterGroupDecl> {
                 "query",
                 "list_children",
                 "read_content",
+                "read_source",
                 "find_callers",
                 "find_defs",
                 "find_callees",

@@ -8,7 +8,7 @@ Canonical architecture overview for ley-line-open (LLO). Companion to the [root 
 
 | Field | Value |
 |---|---|
-| LLO version | v0.20.3 |
+| LLO version | v0.20.4 |
 | Last verified | 2026-07-27 |
 | Authority model | [ADR-0032](adr/0032-declared-decompositions.md) §D4 — see [Authority model](#authority-model) |
 | Source of truth files | `rs/ll-core/`, `rs/ll-open/`, `rs/ll-open/cli-lib/src/daemon/`, `docs/adr/*.md`, `docs/decades/*.md`, `CHANGELOG.md` |
@@ -373,7 +373,9 @@ Architectural decisions that shape LLO today:
 | [ADR-0037](adr/0037-naming-the-proxy-channel.md) | Naming the proxy channel — `confinement/v1` assumes an egress path it cannot express | Accepted (shipped in the release that landed it) |
 | [ADR-0038](adr/0038-host-side-subscription-credential-ingress.md) | Host-side subscription credential ingress: proxy/vault custody without exposing tokens to confined harnesses | Proposed |
 | [ADR-0039](adr/0039-multi-vector-retrieval-over-cas.md) | Multi-vector retrieval over CAS — kernel-delegated caching instead of a bespoke index | Proposed — falsification ladder has not run; no implementation exists |
-| [ADR-0040](adr/0040-the-write-boundary.md) | The write boundary — source and manifest are the data, the arena is a cache; one write API for mount, splice and cloister; `treeRoot` beside `Head.rootHash` | Proposed — seven shipped bugs it explains are filed (`192018`, `0c80c7`, `143002`, `0d3b72`, `143f17`, `0c8ee7`, `1eefe3`); no implementation exists |
+| [ADR-0040](adr/0040-the-write-boundary.md) | The write boundary — source and manifest are the data, the arena is a cache; one write API for mount, splice and cloister; `treeRoot` beside `Head.rootHash` | Proposed — D1, D3, D4 and D6 shipped (v0.20.2); D5 open; D7 is ADR-0041 |
+| [ADR-0041](adr/0041-publication-snapshots.md) | Publication — immutable snapshot files of whole proposals under control block v4 with `(epoch, seq)`; `current_root` retired for `treeRoot`; one producer; transport carries what proposals carry | Proposed — no implementation exists |
+| [ADR-0042](adr/0042-proposals.md) | Proposals — a write names the bytes its author read and is applied whole or refused whole; file bases, daemon `read_source`/`propose`, mount `ESTALE`; node bases and the closure check open | Proposed — file bases, one-transaction writes, durable acknowledgement, daemon ops and mount bases implemented (#437-#440, `843e03`) |
 
 ADRs 0017-0019 are cloister-side and live in `~/remotes/art/cloister/docs/adr/`. Mache's ADR-0024 (`incremental-dataflow-taint-as-substrate-queries`) is a separate document in the mache repo whose producer-side lives in LLO's `analysis-substrate` decade — see the decade doc for the mapping.
 
@@ -386,9 +388,9 @@ ADRs 0017-0019 are cloister-side and live in `~/remotes/art/cloister/docs/adr/`.
 | `leyline` binary (default features) | `task build` (debug, headless) / `task release` (release, headless) / `task install` (release + codesign + install to `~/.local/bin`). Default features are `lsp` + `validate` + `hdc` + `cdc` — the structural-analysis core plus explicit CDC activation |
 | `leyline` binary (recommended for downstream consumers) | `task install:full` — `--features all` (adds `vec` + `text-search`). Portable — no libfuse-t/libfuse runtime dep |
 | `leyline` binary (everything including mount) | `task install:full+mount` — `--features full`. Requires libfuse-t (macOS `brew install fuse-t`) or libfuse (Linux `apt install libfuse-dev`) at runtime |
-| Distroless OCI image | `task image` — produces `localhost/leyline:v0.20.3` (~20 MB) via `cargo zigbuild` static musl; image default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0`. A `v*` tag publishes the multi-arch image to `ghcr.io/agentic-research/ley-line-open:v0.20.3` with a build-provenance attestation; the tag is `v`-prefixed to match `server.json`'s `packages[0].version`, which is the string cloister derives `<identifier>:<version>` from |
+| Distroless OCI image | `task image` — produces `localhost/leyline:v0.20.4` (~20 MB) via `cargo zigbuild` static musl; image default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0`. A `v*` tag publishes the multi-arch image to `ghcr.io/agentic-research/ley-line-open:v0.20.4` with a build-provenance attestation; the tag is `v`-prefixed to match `server.json`'s `packages[0].version`, which is the string cloister derives `<identifier>:<version>` from |
 | FFI staticlibs + header | `task release:fs-static:target` — builds the mache-facing `leyline-fs` staticlib with explicit CDC support and publishes it as a verified GitHub release artifact (linux amd64/arm64 + darwin arm64; macOS amd64 staticlib currently absent) |
-| Go schema client | `clients/go/leyline-schema` — Apache-2.0 nested Go module; `daemon/wire` is the canonical typed JSON consumer API and v0.20.3 is its tested compatibility point |
+| Go schema client | `clients/go/leyline-schema` — Apache-2.0 nested Go module; `daemon/wire` is the canonical typed JSON consumer API and v0.20.4 is its tested compatibility point |
 
 Release flow is on-tag-push: `task readme:version-check` gates README version-pin drift in CI (mirroring the `compat:check` + `gen:server-json:check` pattern). See [README.md § Install and build](../README.md#install-and-build) for the recommended install path per user type.
 

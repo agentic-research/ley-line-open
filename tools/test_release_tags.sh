@@ -107,4 +107,17 @@ expect_failure wrong-commit \
     env REPO_ROOT="$work" VERIFY_VERSION_BIN=true \
     "$repo_root/tools/tag_release.sh" 0.10.4
 
+# A detached HEAD at origin/main is refused, with the reason named, and
+# pushes no tag.
+work=$(new_fixture detached)
+git -C "$work" checkout -q --detach
+if detached_err=$(REPO_ROOT="$work" VERIFY_VERSION_BIN=true \
+    "$repo_root/tools/tag_release.sh" 0.10.4 2>&1 >/dev/null)
+then
+    echo "detached-head unexpectedly succeeded" >&2
+    exit 1
+fi
+printf '%s\n' "$detached_err" | grep -q "not 'detached HEAD'"
+test -z "$(git -C "$work" ls-remote origin refs/tags/v0.10.4)"
+
 echo "release tag fixture proved atomic, idempotent, and fail-closed rules"

@@ -10,6 +10,22 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Fixed
+
+- **An unflushed mount edit no longer reaches the database, so a snapshot
+  never publishes half an edit** (beads `ley-line-open-5d8246`,
+  `ley-line-open-5d925d`). A write to a node of a parsed file used to
+  update `nodes.record` at once, outside any proposal. Any publish before
+  the flush (another file's `fsync`, a `propose`, a reparse) handed
+  out-of-process readers half-written text beside the old source, and
+  after a restart the text stayed, because a reparse skips a file whose
+  stored hash has not changed. Pending bytes now stay in the mount until
+  the flush lands them through the source writer; reads and sizes of the
+  node see them. A refused edit is dropped from the mount and leaves
+  nothing to restore: before, the restore re-proposed the stored bytes,
+  the parse skipped the file as unchanged, and the refused text stayed in
+  the node and was published.
+
 ## [0.20.4] — 2026-10-13
 
 Proposals and write safety. A write can now name the bytes its author

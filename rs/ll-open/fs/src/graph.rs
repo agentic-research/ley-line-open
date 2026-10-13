@@ -298,9 +298,7 @@ fn patch(content: &mut Vec<u8>, data: &[u8], offset: u64) -> Result<()> {
     let end = off
         .checked_add(data.len())
         .context("write offset + length overflow")?;
-    if end > content.len() {
-        content.resize(end, 0);
-    }
+    content.resize(content.len().max(end), 0);
     content[off..end].copy_from_slice(data);
     Ok(())
 }
@@ -479,10 +477,13 @@ impl SqliteGraphAdapter {
     }
 
     /// `node` as the reader sees it: sized as its pending edit, if any.
-    fn with_pending(&self, mut node: Node) -> Node {
+    fn with_pending(&self, node: Node) -> Node {
         #[cfg(feature = "splice")]
-        if let Some(content) = self.pending.lock().get(&node.id) {
-            node.size = content.len() as u64;
+        if let Some(size) = self.pending.lock().get(&node.id).map(Vec::len) {
+            return Node {
+                size: size as u64,
+                ..node
+            };
         }
         node
     }
@@ -3530,6 +3531,13 @@ mod tests {
         let mut buf = [0u8; 16];
         let n = adapter.read_content(node_id, &mut buf, 0)?;
         assert_eq!(&buf[..n], b"worlds", "the node reads as the edit so far");
+        let n = adapter.read_content(node_id, &mut buf, 2)?;
+        assert_eq!(&buf[..n], b"rlds", "a read at an offset");
+        assert_eq!(
+            adapter.read_content(node_id, &mut buf, 6)?,
+            0,
+            "past the end"
+        );
         assert_eq!(adapter.get_node(node_id)?.unwrap().size, 6);
         let listed = adapter.list_children("test.html/element")?;
         let text = listed.iter().find(|n| n.id == node_id).unwrap();
@@ -3537,6 +3545,33 @@ mod tests {
 
         adapter.flush_node(node_id)?;
         assert_eq!(stored(&adapter)?, "worlds", "the flush lands the edit");
+        Ok(())
+    }
+
+    /// Removing a node drops the edits in progress to it and to the nodes
+    /// beneath it, which have nowhere to land, and keeps every other.
+    #[test]
+    #[cfg(feature = "splice")]
+    fn removing_a_node_drops_the_edits_beneath_it() -> Result<()> {
+        let db_bytes = leyline_ts::parse_with_source(
+            b"<p>hello</p>",
+            leyline_ts::languages::TsLanguage::Html,
+            "test.html",
+        )?;
+        let mut adapter = SqliteGraphAdapter::new_writable(&db_bytes)?;
+        adapter.set_source_writer(Arc::new(BaseCheckingWriter::default()));
+        let tag = "test.html/element/start_tag";
+        let tag_name = "test.html/element/start_tag/tag_name";
+        let text = "test.html/element/text";
+        adapter.write_content(tag, b"<q>", 0)?;
+        adapter.write_content(tag_name, b"q", 0)?;
+        adapter.write_content(text, b"world", 0)?;
+
+        adapter.remove_node(tag)?;
+        let pending = adapter.pending.lock();
+        assert!(!pending.contains_key(tag), "the removed node's edit");
+        assert!(!pending.contains_key(tag_name), "an edit beneath it");
+        assert!(pending.contains_key(text), "an edit elsewhere stays");
         Ok(())
     }
 

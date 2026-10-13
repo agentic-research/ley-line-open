@@ -1,0 +1,145 @@
+# ADR-0042 — Proposals: a write is checked against what its author read, and applied whole or refused
+
+**Status:** Proposed (2026-10-12); P1, P2 (file bases), the daemon ops and the mount's file bases
+are implemented on the PRs listed under "Shipped so far"
+**Bead:** `ley-line-open-d70f99` (design); implementation beads below
+**Related:**
+
+- ADR-0040 (the write boundary; D3's one write path is the one-file case of a proposal)
+- ADR-0041 (publication — snapshots show whole proposals; split from this ADR)
+- ADR-0034 (`node_hash`, and its amendment on twin constructs)
+- ADR-0031 (restriction-addressed keys — Proposed; P3 depends on it)
+- `schema-spec/execution/v1` (`WorkspaceGrant { graphRoot, expectedGeneration, operations }`)
+- cloister ADR-0046 (mediated capabilities), ADR-0049 (host runtime and mediator) — policy stays in
+  cloister; this ADR is mechanism
+
+ADR-0040 cites cloister ADR-0013 and ADR-0030 as the model for slice grants. Those govern credential
+slices in the vault and process isolation; they confer no authority over code. The grant that
+scopes a code write is execution/v1's `WorkspaceGrant`, verified in LLO, with policy authored in
+cloister under ADR-0046 and ADR-0049.
+
+______________________________________________________________________
+
+## Thesis
+
+> Many agents write to one codebase. Without a check, each write lands as soon as it is made: the
+> last writer wins, a stale overwrite is silent, and a change that spans files lands one file at a
+> time. A **proposal** is the step between a change and its application: it names the bytes its
+> author saw, and the one write boundary applies it whole or refuses it whole.
+
+rosary does the pessimistic, file-grained form today: required scopes, a pre-dispatch overlap check,
+one agent per repository, a worktree each, a pull request to merge. Proposals are the optimistic,
+fine-grained form — two agents may share a file; a real conflict is refused when it happens.
+
+______________________________________________________________________
+
+## Decision
+
+### P1 — A proposal is the unit of change, and one SQLite transaction
+
+```
+propose(grant, writes) -> Accepted { blobs, tree_root } | Refused
+
+writes = [ Proposed { path, base, bytes } ]
+base   = Any | Blob(hash of the bytes the author read)
+```
+
+The single writer refuses a proposal before touching anything when a path is outside the grant, a
+base no longer matches, a file does not parse, a path repeats, or the files are under different
+roots. Otherwise it applies every file in one parse pass and one SQLite transaction, which includes
+the sweep and the `_meta` stamps (`derived_from`). Only `CREATE INDEX IF NOT EXISTS`, which changes
+no query result, and the head write run after `COMMIT`. A proposal is acknowledged only after its
+WAL frames are synced (`synchronous=FULL`). D3's `write(grant, path, bytes)` is the one-file
+`Base::Any` case.
+
+### P2 — Bases are compare-and-swap over the bytes the write replaces
+
+- **File** (implemented) — the file's current `source_blobs` hash must equal the base. This is HTTP
+  `If-Match` with a content hash as the entity tag. A refusal is typed (`Stale { path, expected,
+  current }`).
+- **Node** (not implemented) — `base = (file_blob, locator, span_hash)`: the file blob the author
+  read, the node's locator there, and BLAKE3 of the node's exact byte span. The writer re-resolves
+  the locator into the current file and refuses unless it resolves to exactly one node whose span
+  hashes to `span_hash`; the replacement is spliced into the current bytes and syntax-checked.
+  `node_hash` is not a base: it excludes comments, whitespace, sibling attributes and non-UTF-8 leaf
+  bytes (ADR-0034 D4; `cli-lib/tests/ir_producer.rs:254`), so a stale edit would overwrite a
+  concurrent comment or attribute change. Twin constructs (same kind, name and `node_hash`,
+  distinguished only by an attribute such as `#[cfg]`) have no stable locator (ADR-0034 amendment):
+  ambiguity is refused. The locator rule needs its own specification and tests before node bases
+  ship.
+- **Coarse** (not implemented) — a proposal naming no finer base is refused unless the current
+  `treeRoot` equals the grant's `graphRoot`. `expectedGeneration` is defined by ADR-0041's per-
+  proposal `(epoch, seq)`.
+
+There is no merge: a conflict is refused and named; resolving it is the proposer's job.
+
+### P3 — The closure check (extension; depends on ADR-0031)
+
+A proposal may carry restriction-addressed keys (ADR-0031) for cross-file facts its author relied
+on; the writer refuses if any changed. The only key family today is call-target resolution
+(`sheaf/src/restriction_cache.rs:197-250`, test-only, not persisted, no scheme tag), which catches a
+rename of a called function and not a signature or body change. P3 ships only after ADR-0031 is
+accepted with persisted, scheme-tagged keys, and claims per key family only what it covers.
+
+### P4 — How a proposal begins and ends
+
+- **Explicit, over the daemon** (implemented) — `read_source {path}` returns content, `blob_hash`
+  and `tree_root`; `propose {writes: [{path, base, content}]}` answers `stale {path, expected,
+  current}` on a moved base. Both are MCP tools; `propose` is in its own cloister group, `write`.
+  This is the only form that checks against what an agent actually read.
+- **Implicit, through the mount** (implemented for files) — an edit's base is the file's stored
+  bytes when it is opened for writing (FUSE) or at the first write after the last flush (NFS). A
+  stale flush is refused: FUSE `ESTALE`, NFS an I/O error (`NFS3ERR_STALE` means a dead file handle
+  to the client). POSIX writes do not say what the client read, so a client that reads, closes and
+  reopens to write takes its base at the reopen.
+- **Explicit, through the mount** (not implemented) — `.staging/` (in `leyline-vcs`, unmounted
+  today) served by the mount; writes under it record bases at first read; `.commit` proposes them.
+- **Lifecycle points** (not implemented) — a jj or git commit, the end of a confined run (cloister's
+  overlay upper layer is the proposal, its lower layer the snapshot it read).
+
+### P5 — A refusal is visible and discarded
+
+A refused proposal is never reported as success. Through the mount, the refused edit is discarded
+(owner decision, 2026-10-12): the stored file is re-projected so the node reads as it, the file's
+pending edits are dropped, and the reason is recorded in `_errors` for the node. FUSE `fsync`
+returns the refusal instead of reporting success. mache's draft-on-invalid behaviour remains mache's
+choice as a client.
+
+______________________________________________________________________
+
+## Shipped so far
+
+| Slice | Bead | PR |
+|---|---|---|
+| a write is one transaction, stamps included | `1360fd` | #437 |
+| acknowledged writes are synced | `0a9931` | #438 |
+| `propose` with file bases, typed `Stale` | `d25ec4` | #439 |
+| daemon `read_source` / `propose`, MCP, schema 0.20.3 | `609525` | #440 |
+| mount bases, `ESTALE`, refused edits discarded, fsync reports refusals | `843e03` | — |
+
+## Falsifiers
+
+| # | Claim | Test |
+|---|---|---|
+| G1 | a proposal is atomic | three files, one invalid: nothing lands (`a_proposal_with_one_invalid_file_changes_nothing`); a failure at the `derived_from` stamp leaves the image byte-identical (`a_write_that_fails_after_its_rows_leaves_the_arena_unchanged`) |
+| G2 | a stale file base is refused | `a_stale_base_is_refused_and_names_what_moved`; over the daemon, `propose_applies_against_what_was_read_and_refuses_a_stale_base` |
+| G3 | the mount refuses a moved file | `a_refused_edit_restores_the_node_and_reports_stale`, `the_mount_writer_refuses_a_moved_file_as_stale`, `a_stale_refusal_answers_estale_and_others_eio` |
+| G4 | node bases allow disjoint edits | (open) two node-based proposals on different functions of one file both land |
+| G5 | node bases cover trivia | (open) a comment edit inside F refuses a stale node base on F |
+| G6 | twins refuse rather than misdirect | (open) `#[cfg]` twins after an ordinal shift |
+| G7 | closure check | (after ADR-0031) a rename refuses a call added against the old name |
+
+## Prior art
+
+Compare-and-swap on an entity tag is HTTP `If-Match`. Per-definition versioning goes back to
+ENVY/Developer and Monticello; Darcs and Pijul detect conflicts when a patch is applied; Unison
+content-addresses definitions in its own language; structural merge tools (mergiraf,
+SemanticMerge, IntelliMerge, Spork) merge after the fact. What this ADR adds is conflict decided at
+a live filesystem and socket boundary between concurrent agents, over existing many-language code
+projected by tree-sitter. A prior-art search is owed before the claim is made outside this
+repository.
+
+## Non-goals
+
+- Merging.
+- Authorisation policy: grants are issued by cloister and verified by LLO.

@@ -48,6 +48,7 @@ use memmap2::MmapMut;
 
 /// One consistent copy of the control block payload, as the seqlock
 /// reader hands it out (see `Controller::snapshot`).
+#[derive(Clone, Copy)]
 struct Snapshot {
     path: [u8; ARENA_PATH_LEN],
     size: [u8; 8],
@@ -126,6 +127,9 @@ pub struct Controller {
     /// tell a live publisher (lock held) from a dead one (the kernel
     /// released its lock when it died).
     file: std::fs::File,
+    /// The last consistent snapshot this handle read: what it answers when
+    /// the publish it faces will never finish (see `snapshot`).
+    last: std::sync::Mutex<Option<Snapshot>>,
     /// How many times this reader found the publish lock held while the
     /// counter was odd — the event a test waits on to know a reader is
     /// waiting out a publish, instead of guessing with a clock.
@@ -215,6 +219,7 @@ impl Controller {
         Ok(Controller {
             mmap,
             file,
+            last: std::sync::Mutex::new(None),
             #[cfg(test)]
             held_probes: std::sync::Arc::new(AtomicU64::new(0)),
         })
@@ -313,23 +318,28 @@ impl Controller {
     ///
     /// A publisher holds the publish lock for as long as the counter is
     /// odd, so an odd counter whose lock a reader can take, and which does
-    /// not move while the reader holds it, was left by a publisher that died
-    /// mid-publish (bead ley-line-open-0a8c14). The payload may be torn, so
-    /// the root is reported as the zero sentinel ("nothing published"),
-    /// which every consumer refuses to load data under; the path and size
-    /// are returned as that publisher left them, so a restarted publisher
-    /// can read its arena path and publish, which repairs the counter. The
-    /// lock decides this, not a clock: a publisher built before the publish
-    /// lock holds none and reads as dead while its counter is odd.
+    /// not move while the reader holds it, belongs to a publish that will
+    /// not finish: its publisher died mid-publish (bead
+    /// ley-line-open-0a8c14), or publishes without the lock. The payload
+    /// may be torn, so it is never handed out as published. A handle that
+    /// has read a consistent snapshot answers that one again: the arena it
+    /// names is stale for the moment, not empty. A handle that has read none
+    /// answers the root as the zero sentinel ("nothing published"), which
+    /// every consumer refuses to load data under, with the path and size as
+    /// they stand, copied under the lock, so a restarted publisher can read
+    /// its arena path and publish, which repairs the counter. The lock
+    /// decides all of this, not a clock.
     fn snapshot(&self) -> Snapshot {
         let seq = self.sequence();
         loop {
             let before = seq.load(Ordering::Acquire);
             if before & 1 == 1 {
-                if self.publisher_is_dead(before) {
-                    let mut snap = self.copy_payload();
-                    snap.root = [0u8; CURRENT_ROOT_LEN];
-                    return snap;
+                if let Some(abandoned) = self.abandoned_payload(before) {
+                    let last = *self.last.lock().unwrap_or_else(|e| e.into_inner());
+                    return last.unwrap_or(Snapshot {
+                        root: [0u8; CURRENT_ROOT_LEN],
+                        ..abandoned
+                    });
                 }
                 std::thread::yield_now();
                 continue;
@@ -338,6 +348,7 @@ impl Controller {
             std::sync::atomic::fence(Ordering::Acquire);
             let after = seq.load(Ordering::Relaxed);
             if before == after {
+                *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Some(snap);
                 return snap;
             }
         }
@@ -356,24 +367,26 @@ impl Controller {
         snap
     }
 
-    /// Whether the counter at `odd` belongs to a publisher that is gone: no
-    /// one holds the publish lock, and the counter has not moved while this
-    /// reader holds it shared (which keeps a new publish from starting). A
-    /// held lock, a failed probe, or a counter that moved all say "keep
-    /// waiting".
-    fn publisher_is_dead(&self, odd: u64) -> bool {
+    /// The payload as it stands, if the counter at `odd` belongs to a
+    /// publish that will not finish: no one holds the publish lock, and the
+    /// counter has not moved while this reader holds it shared, which keeps
+    /// a new publish from starting. The copy is taken under that lock, so
+    /// no publisher writes it meanwhile. A held lock, a failed probe, or a
+    /// counter that moved all say "keep waiting" (`None`).
+    fn abandoned_payload(&self, odd: u64) -> Option<Snapshot> {
         match self.file.try_lock_shared() {
             Ok(()) => {
                 let unmoved = self.sequence().load(Ordering::Acquire) == odd;
+                let payload = unmoved.then(|| self.copy_payload());
                 let _ = self.file.unlock();
-                unmoved
+                payload
             }
             Err(std::fs::TryLockError::WouldBlock) => {
                 #[cfg(test)]
                 self.held_probes.fetch_add(1, Ordering::AcqRel);
-                false
+                None
             }
-            Err(_) => false,
+            Err(_) => None,
         }
     }
 
@@ -479,11 +492,11 @@ impl Controller {
     /// payload stores that follow cannot be reordered before the mark;
     /// a reader that sees the odd value knows a publish is in flight.
     ///
-    /// `fetch_add` rather than load-modify-store so concurrent writers
-    /// (cross-process publishers — exactly what mmap-backed control
-    /// blocks enable) cannot lose increments. The substrate's intended
-    /// invariant is a single writer per `(path, size, root)` advance;
-    /// the counter's soundness does not rely on it.
+    /// Every publisher, in any process or runtime, must hold the publish
+    /// lock while the counter is odd: the lock is what serialises
+    /// publishers and what tells a reader a live publish from an abandoned
+    /// one. A publisher that skips it can be overlapped by another, and its
+    /// odd counter reads as abandoned.
     ///
     /// Called with the publish lock held. A counter that is already odd
     /// then cannot belong to a live publish: it was left by a publisher
@@ -721,6 +734,25 @@ mod tests {
             "/tmp/a",
             "the path a restart needs survives"
         );
+    }
+
+    /// A reader that has seen a consistent root keeps answering it when it
+    /// meets an odd counter nobody holds the lock for: a publisher that died
+    /// mid-publish, or one that publishes without the lock. Its graph goes
+    /// stale for the moment instead of empty, and never torn.
+    #[test]
+    fn a_reader_facing_a_dead_publisher_keeps_its_last_root() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("dead.ctrl");
+        let mut writer = Controller::open_or_create(&path).unwrap();
+        writer.set_arena_with_root("/tmp/a", 1, ROOT_A).unwrap();
+
+        let reader = Controller::open_or_create(&path).unwrap();
+        assert_eq!(reader.current_root(), ROOT_A);
+        die_mid_publish(&mut writer);
+        assert_eq!(reader.current_root(), ROOT_A, "the last root it saw");
+        assert_eq!(reader.arena_path(), "/tmp/a");
+        assert_eq!(reader.arena_size(), 1);
     }
 
     /// A publisher that is alive is not taken for dead, however long it

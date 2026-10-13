@@ -19,13 +19,18 @@ context, scoping notes, and review history are recoverable.
   holds an exclusive lock on the control file for as long as the counter
   is odd; a publish that finds the counter already odd keeps it odd and
   ends even over a whole payload. A reader that finds the counter odd and
-  the lock free answers the zero root ("nothing published"), which every
-  consumer refuses to load data under, instead of hanging or returning a
-  torn root. The lock decides, not a clock, so a publisher built before
-  this release, which takes no lock, reads as dead while its counter is
-  odd: move every process that publishes to one control block (the
-  ley-line receiver through its `leyline_core` pin) to this release
-  together.
+  the lock free, unmoved while it holds the lock shared, knows that
+  publish will not finish. It answers the last consistent snapshot its
+  handle read, so a polling mount stays on its current arena; a handle
+  that has read none answers the zero root ("nothing published"), which
+  every consumer refuses to load data under, with the path and size
+  copied under the lock. It never hangs and never returns a torn root.
+  Every publisher must take the lock: one that does not (a publisher
+  built before this release, or mache before its matching release) can
+  be overlapped by another publisher, and readers treat its odd counter
+  as abandoned. Move every process that publishes to one control block
+  (mache, and the ley-line receiver through its `leyline_core` pin) to
+  this release together.
 
 - **Tests wait on events, not time.** The control block tests hold a
   publish until the reader reports it has found the publish lock held,

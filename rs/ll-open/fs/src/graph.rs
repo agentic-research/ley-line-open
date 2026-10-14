@@ -4321,6 +4321,12 @@ mod tests {
         graph.write_content_as(A, TEXT, b"xx", 0)?;
         graph.release(A)?;
         assert_eq!(read_as(&graph, A, TEXT)?, b"hi");
+
+        // An NFS READ's base reaches the adapter too: the file moves after
+        // it, and the mount's write is refused.
+        graph.note_read(TEXT)?;
+        graph.batch_splice(&[(TEXT.to_string(), Some("moved".to_string()))])?;
+        assert!(is_stale(graph.write_content(TEXT, b"late", 0).map(drop)));
         Ok(())
     }
 

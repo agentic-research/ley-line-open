@@ -1,4 +1,4 @@
-use crate::graph::{Graph, Node};
+use crate::graph::{Graph, MOUNT_HANDLE, Node};
 use fuser::{
     FUSE_ROOT_ID, FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData,
     ReplyDirectory, ReplyEntry, ReplyOpen, ReplyWrite, Request,
@@ -17,6 +17,10 @@ pub struct LeylineFuse {
     ino_to_id: HashMap<u64, String>,
     id_to_ino: HashMap<String, u64>,
     next_ino: u64,
+    /// The handle the next open gets. Every open is its own handle, so
+    /// each edit is checked against the bytes its own open read; it starts
+    /// past [`MOUNT_HANDLE`], which no open uses.
+    next_fh: u64,
 }
 
 impl LeylineFuse {
@@ -31,7 +35,34 @@ impl LeylineFuse {
             ino_to_id,
             id_to_ino,
             next_ino: FUSE_ROOT_ID + 1,
+            next_fh: MOUNT_HANDLE + 1,
         }
+    }
+
+    /// Open `ino` with `flags`: allocate the open's handle, and take the
+    /// base of an open for writing (ADR-0042 P2), so a change that lands
+    /// while the file is open is refused at the handle's flush.
+    fn open_handle(&mut self, ino: u64, flags: i32) -> u64 {
+        let fh = self.next_fh;
+        self.next_fh += 1;
+        if opens_for_writing(flags)
+            && let Some(id) = self.ino_to_id.get(&ino)
+            && let Err(e) = self.graph.note_base_as(fh, id)
+        {
+            log::warn!("open({id}): taking the edit's base failed: {e:#}");
+        }
+        fh
+    }
+
+    /// Land handle `fh`'s edit to `ino`; a refusal is the errno to answer.
+    fn flush_handle(&self, ino: u64, fh: u64) -> Result<(), i32> {
+        let Some(id) = self.ino_to_id.get(&ino) else {
+            return Err(libc::ENOENT);
+        };
+        self.graph.flush_node_as(fh, id).map_err(|e| {
+            log::warn!("flush of {id} through handle {fh} failed: {e:#}");
+            flush_errno(&e)
+        })
     }
 
     fn ensure_inode(&mut self, id: &str) -> u64 {
@@ -185,7 +216,7 @@ impl Filesystem for LeylineFuse {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         size: u32,
         _flags: i32,
@@ -198,7 +229,7 @@ impl Filesystem for LeylineFuse {
         };
 
         let mut buf = vec![0u8; size as usize];
-        match self.graph.read_content(&id, &mut buf, offset as u64) {
+        match self.graph.read_content_as(fh, &id, &mut buf, offset as u64) {
             Ok(n) => reply.data(&buf[..n]),
             Err(e) => {
                 log::error!("read({id}): {e}");
@@ -208,15 +239,24 @@ impl Filesystem for LeylineFuse {
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        // Opening for writing takes the edit's base (ADR-0041 P2), so a
-        // change that lands while the file is open is refused at flush.
-        if opens_for_writing(flags)
-            && let Some(id) = self.ino_to_id.get(&ino)
-            && let Err(e) = self.graph.note_base(id)
-        {
-            log::warn!("open({id}): taking the edit's base failed: {e:#}");
+        let fh = self.open_handle(ino, flags);
+        reply.opened(fh, 0);
+    }
+
+    fn release(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        if let Err(e) = self.graph.release(fh) {
+            log::warn!("release of handle {fh} failed: {e:#}");
         }
-        reply.opened(0, 0);
+        reply.ok();
     }
 
     fn opendir(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
@@ -227,7 +267,7 @@ impl Filesystem for LeylineFuse {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         data: &[u8],
         _write_flags: u32,
@@ -240,7 +280,7 @@ impl Filesystem for LeylineFuse {
             return;
         };
 
-        match self.graph.write_content(&id, data, offset as u64) {
+        match self.graph.write_content_as(fh, &id, data, offset as u64) {
             Ok(n) => reply.written(n as u32),
             Err(_) => reply.error(libc::EROFS),
         }
@@ -250,20 +290,13 @@ impl Filesystem for LeylineFuse {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         _lock_owner: u64,
         reply: fuser::ReplyEmpty,
     ) {
-        let Some(id) = self.ino_to_id.get(&ino).cloned() else {
-            reply.error(libc::ENOENT);
-            return;
-        };
-        match self.graph.flush_node(&id) {
+        match self.flush_handle(ino, fh) {
             Ok(()) => reply.ok(),
-            Err(e) => {
-                log::warn!("flush_node failed for {id}: {e:#}");
-                reply.error(flush_errno(&e));
-            }
+            Err(errno) => reply.error(errno),
         }
     }
 
@@ -271,17 +304,16 @@ impl Filesystem for LeylineFuse {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         _datasync: bool,
         reply: fuser::ReplyEmpty,
     ) {
         // Per-node flush first. A refused edit fails the fsync: the client
         // must not be told the write is durable when it was discarded.
-        if let Some(id) = self.ino_to_id.get(&ino).cloned()
-            && let Err(e) = self.graph.flush_node(&id)
+        if let Err(errno) = self.flush_handle(ino, fh)
+            && errno != libc::ENOENT
         {
-            log::warn!("fsync flush_node failed for {id}: {e:#}");
-            reply.error(flush_errno(&e));
+            reply.error(errno);
             return;
         }
         // Then persist to arena (durable)
@@ -305,7 +337,7 @@ impl Filesystem for LeylineFuse {
         _atime: Option<fuser::TimeOrNow>,
         _mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<SystemTime>,
-        _fh: Option<u64>,
+        fh: Option<u64>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
@@ -317,8 +349,13 @@ impl Filesystem for LeylineFuse {
             return;
         };
 
+        // A truncate through an open file (`ftruncate`, `O_TRUNC`) is that
+        // handle's edit; one by path is the mount handle's.
         if let Some(0) = size
-            && self.graph.truncate(&id).is_err()
+            && self
+                .graph
+                .truncate_as(fh.unwrap_or(MOUNT_HANDLE), &id)
+                .is_err()
         {
             reply.error(libc::EROFS);
             return;
@@ -372,7 +409,8 @@ impl Filesystem for LeylineFuse {
                         .as_nanos() as i64,
                 };
                 let attr = self.node_to_attr(ino, &node);
-                reply.created(&TTL, &attr, 0, 0, 0);
+                let fh = self.open_handle(ino, libc::O_WRONLY);
+                reply.created(&TTL, &attr, 0, fh, 0);
             }
             Err(_) => reply.error(libc::EROFS),
         }
@@ -548,7 +586,7 @@ fn opens_for_writing(flags: i32) -> bool {
 }
 
 /// The errno a refused flush answers: `ESTALE` when the file moved since
-/// the edit began (ADR-0041 P2), `EIO` for any other refusal.
+/// the edit began (ADR-0042 P2), `EIO` for any other refusal.
 fn flush_errno(err: &anyhow::Error) -> i32 {
     if err.downcast_ref::<crate::graph::StaleWrite>().is_some() {
         libc::ESTALE
@@ -586,6 +624,52 @@ mod tests {
             libc::ESTALE
         );
         assert_eq!(flush_errno(&anyhow::anyhow!("syntax errors")), libc::EIO);
+    }
+
+    /// Each open is its own handle and edits against its own base (bead
+    /// `ley-line-open-5da276`): two opens of one file get distinct handles,
+    /// each reads its own edit, and once one handle's edit lands the
+    /// other's flush answers `ESTALE` instead of success. Before, every open
+    /// was handle 0, so the second edit took the first's file as its base
+    /// and landed over bytes its writer never read.
+    #[test]
+    #[cfg(feature = "splice")]
+    fn two_opens_edit_against_their_own_bases() {
+        let db = leyline_ts::parse_with_source(
+            b"<p>hello</p>",
+            leyline_ts::languages::TsLanguage::Html,
+            "test.html",
+        )
+        .unwrap();
+        let mut adapter = crate::graph::SqliteGraphAdapter::new_writable(&db).unwrap();
+        adapter.set_source_writer(Arc::new(crate::graph::fixtures::CheckingWriter));
+        let mut fs = LeylineFuse::new(Arc::new(adapter));
+        let ino = fs.ensure_inode("test.html/element/text");
+        let read = |fs: &LeylineFuse, fh: u64| {
+            let mut buf = [0u8; 64];
+            let n = fs
+                .graph
+                .read_content_as(fh, "test.html/element/text", &mut buf, 0)
+                .unwrap();
+            buf[..n].to_vec()
+        };
+
+        let a = fs.open_handle(ino, libc::O_RDWR);
+        let b = fs.open_handle(ino, libc::O_WRONLY);
+        assert_ne!(a, b, "each open is its own handle");
+        assert!(a != MOUNT_HANDLE && b != MOUNT_HANDLE);
+        fs.graph
+            .write_content_as(a, "test.html/element/text", b"world", 0)
+            .unwrap();
+        assert_eq!(read(&fs, a), b"world");
+        assert_eq!(read(&fs, b), b"hello");
+        assert_eq!(fs.flush_handle(ino, a), Ok(()));
+        fs.graph
+            .write_content_as(b, "test.html/element/text", b"there", 0)
+            .unwrap();
+        assert_eq!(fs.flush_handle(ino, b), Err(libc::ESTALE));
+        assert_eq!(read(&fs, MOUNT_HANDLE), b"world");
+        assert_eq!(fs.flush_handle(ino + 1, a), Err(libc::ENOENT));
     }
 
     fn test_graph() -> Arc<dyn Graph> {

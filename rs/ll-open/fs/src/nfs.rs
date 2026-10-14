@@ -1027,6 +1027,19 @@ mod tests {
             assert_eq!(*recorder.writes.lock(), vec![b"<p>hel</p>\n".to_vec()]);
         }
 
+        /// `: > f`, a SETATTR to size 0 alone, commits the empty node once
+        /// the idle window has passed (bead `ley-line-open-8a26d8`).
+        /// Before, the commit of an empty edit returned success without
+        /// landing, and the empty edit stayed staged in the mount.
+        #[tokio::test]
+        async fn a_bare_truncate_to_empty_commits() {
+            let (nfs, recorder) = html_nfs();
+            let ino = text_leaf(&nfs).await;
+            nfs.setattr(ino, size(0)).await.unwrap();
+            assert!(commit_now(&nfs));
+            assert_eq!(*recorder.writes.lock(), vec![b"<p></p>\n".to_vec()]);
+        }
+
         #[tokio::test]
         async fn a_read_before_the_write_does_not_disturb_it() {
             let (nfs, recorder) = html_nfs();

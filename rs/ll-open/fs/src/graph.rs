@@ -1565,9 +1565,9 @@ impl Graph for SqliteGraphAdapter {
             let Some(nid) = leyline_schema::resolve_path(guard.conn(), id)? else {
                 return Ok(());
             };
-            if content.is_empty() {
-                return Ok(());
-            }
+            // An edit that empties the node lands like any other (bead
+            // `ley-line-open-8a26d8`): the write path refuses it if the
+            // file it makes does not parse.
             let text = String::from_utf8_lossy(&content);
             let bytes = leyline_ts::splice::splice(guard.conn(), nid, &text)?;
             let file_id = leyline_schema::nid_file_id(nid)
@@ -4122,6 +4122,22 @@ mod tests {
         adapter.write_content(x, b"later", 0)?;
         adapter.flush_node(x)?;
         assert_eq!(read_as(&adapter, MOUNT_HANDLE, x)?, b"later");
+        Ok(())
+    }
+
+    /// An edit that empties a node lands at its flush like any other, and
+    /// leaves nothing pending (bead `ley-line-open-8a26d8`). Before, an
+    /// empty edit's flush returned success without landing and the empty
+    /// edit stayed pending, so the node read and sized as empty through
+    /// the mount while the stored file still held its text.
+    #[test]
+    #[cfg(feature = "splice")]
+    fn an_edit_that_empties_a_node_lands_at_its_flush() -> Result<()> {
+        let adapter = checked_adapter(b"<p>hello</p>")?;
+        adapter.truncate(TEXT)?;
+        adapter.flush_node(TEXT)?;
+        assert!(adapter.pending.lock().is_empty(), "nothing stays pending");
+        assert_eq!(read_as(&adapter, B, TEXT)?, b"", "the stored file moved");
         Ok(())
     }
 

@@ -21,6 +21,9 @@ pub struct LeylineFuse {
     /// each edit is checked against the bytes its own open read; it starts
     /// past [`MOUNT_HANDLE`], which no open uses.
     next_fh: u64,
+    /// The handles open for writing on each inode, which a truncate naming
+    /// no handle applies to.
+    writers: HashMap<u64, Vec<u64>>,
 }
 
 impl LeylineFuse {
@@ -36,22 +39,92 @@ impl LeylineFuse {
             id_to_ino,
             next_ino: FUSE_ROOT_ID + 1,
             next_fh: MOUNT_HANDLE + 1,
+            writers: HashMap::new(),
         }
     }
 
     /// Open `ino` with `flags`: allocate the open's handle, and take the
     /// base of an open for writing (ADR-0042 P2), so a change that lands
     /// while the file is open is refused at the handle's flush.
-    fn open_handle(&mut self, ino: u64, flags: i32) -> u64 {
+    ///
+    /// `O_TRUNC` reaches the open only when the kernel granted
+    /// `FUSE_ATOMIC_O_TRUNC` (`init` asks for it); the truncate is then the
+    /// new handle's own edit.
+    fn open_handle(&mut self, ino: u64, flags: i32) -> Result<u64, i32> {
         let fh = self.next_fh;
         self.next_fh += 1;
-        if opens_for_writing(flags)
-            && let Some(id) = self.ino_to_id.get(&ino)
-            && let Err(e) = self.graph.note_base_as(fh, id)
-        {
+        if !opens_for_writing(flags) {
+            return Ok(fh);
+        }
+        let Some(id) = self.ino_to_id.get(&ino).cloned() else {
+            return Ok(fh);
+        };
+        if let Err(e) = self.graph.note_base_as(fh, &id) {
             log::warn!("open({id}): taking the edit's base failed: {e:#}");
         }
-        fh
+        if flags & libc::O_TRUNC != 0
+            && let Err(e) = self.graph.truncate_as(fh, &id)
+        {
+            log::warn!("open({id}): truncating failed: {e:#}");
+            self.release_handle(ino, fh);
+            return Err(libc::EROFS);
+        }
+        self.writers.entry(ino).or_default().push(fh);
+        Ok(fh)
+    }
+
+    /// Truncate `ino` to empty; a refusal is the errno to answer.
+    ///
+    /// Through handle `fh` when the kernel names one (`ftruncate`). A
+    /// truncate naming none is the edit of every handle open for writing
+    /// on `ino`: a Linux kernel without `FUSE_ATOMIC_O_TRUNC` sends
+    /// `open(O_TRUNC)` as OPEN, then a SETATTR that names no handle. With
+    /// no handle open for writing (`truncate(2)` by path) it is complete
+    /// when it returns: it lands through the write path at once, and
+    /// leaves no edit behind to hide the stored bytes.
+    fn truncate_handle(&self, ino: u64, fh: Option<u64>) -> Result<(), i32> {
+        let Some(id) = self.ino_to_id.get(&ino) else {
+            return Err(libc::ENOENT);
+        };
+        let open: &[u64] = match fh {
+            Some(ref fh) => std::slice::from_ref(fh),
+            None => self.writers.get(&ino).map_or(&[], Vec::as_slice),
+        };
+        if !open.is_empty() {
+            for &fh in open {
+                self.graph.truncate_as(fh, id).map_err(|_| libc::EROFS)?;
+            }
+            return Ok(());
+        }
+        let landed = self
+            .graph
+            .truncate_as(MOUNT_HANDLE, id)
+            .map_err(|_| libc::EROFS)
+            .and_then(|()| {
+                self.graph.flush_node_as(MOUNT_HANDLE, id).map_err(|e| {
+                    log::warn!("truncate of {id} failed: {e:#}");
+                    flush_errno(&e)
+                })
+            });
+        // A truncate is the only edit FUSE makes as the mount handle, and
+        // it is over: refused or landed, nothing of it stays.
+        if let Err(e) = self.graph.release(MOUNT_HANDLE) {
+            log::warn!("dropping the truncate of {id} failed: {e:#}");
+        }
+        landed
+    }
+
+    /// The open `fh` of `ino` is closed: drop its edit and base.
+    fn release_handle(&mut self, ino: u64, fh: u64) {
+        if let Some(open) = self.writers.get_mut(&ino) {
+            open.retain(|&w| w != fh);
+            if open.is_empty() {
+                self.writers.remove(&ino);
+            }
+        }
+        if let Err(e) = self.graph.release(fh) {
+            log::warn!("release of handle {fh} failed: {e:#}");
+        }
     }
 
     /// Land handle `fh`'s edit to `ino`; a refusal is the errno to answer.
@@ -114,6 +187,21 @@ impl LeylineFuse {
 }
 
 impl Filesystem for LeylineFuse {
+    /// Ask for `FUSE_ATOMIC_O_TRUNC`, so `open(O_TRUNC)` arrives as one
+    /// OPEN carrying `O_TRUNC` and its truncate is that open's edit. A
+    /// kernel that refuses sends a SETATTR naming no handle instead, which
+    /// [`Self::truncate_handle`] gives to the handles open for writing.
+    fn init(
+        &mut self,
+        _req: &Request<'_>,
+        config: &mut fuser::KernelConfig,
+    ) -> Result<(), libc::c_int> {
+        if let Err(missing) = config.add_capabilities(fuser::consts::FUSE_ATOMIC_O_TRUNC) {
+            log::info!("kernel lacks FUSE capabilities {missing:#x}: O_TRUNC arrives as SETATTR");
+        }
+        Ok(())
+    }
+
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let Some(parent_id) = self.ino_to_id.get(&parent).cloned() else {
             reply.error(libc::ENOENT);
@@ -239,23 +327,23 @@ impl Filesystem for LeylineFuse {
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        let fh = self.open_handle(ino, flags);
-        reply.opened(fh, 0);
+        match self.open_handle(ino, flags) {
+            Ok(fh) => reply.opened(fh, 0),
+            Err(errno) => reply.error(errno),
+        }
     }
 
     fn release(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
+        ino: u64,
         fh: u64,
         _flags: i32,
         _lock_owner: Option<u64>,
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        if let Err(e) = self.graph.release(fh) {
-            log::warn!("release of handle {fh} failed: {e:#}");
-        }
+        self.release_handle(ino, fh);
         reply.ok();
     }
 
@@ -349,15 +437,10 @@ impl Filesystem for LeylineFuse {
             return;
         };
 
-        // A truncate through an open file (`ftruncate`, `O_TRUNC`) is that
-        // handle's edit; one by path is the mount handle's.
         if let Some(0) = size
-            && self
-                .graph
-                .truncate_as(fh.unwrap_or(MOUNT_HANDLE), &id)
-                .is_err()
+            && let Err(errno) = self.truncate_handle(ino, fh)
         {
-            reply.error(libc::EROFS);
+            reply.error(errno);
             return;
         }
 
@@ -409,8 +492,10 @@ impl Filesystem for LeylineFuse {
                         .as_nanos() as i64,
                 };
                 let attr = self.node_to_attr(ino, &node);
-                let fh = self.open_handle(ino, libc::O_WRONLY);
-                reply.created(&TTL, &attr, 0, fh, 0);
+                match self.open_handle(ino, libc::O_WRONLY) {
+                    Ok(fh) => reply.created(&TTL, &attr, 0, fh, 0),
+                    Err(errno) => reply.error(errno),
+                }
             }
             Err(_) => reply.error(libc::EROFS),
         }
@@ -654,8 +739,8 @@ mod tests {
             buf[..n].to_vec()
         };
 
-        let a = fs.open_handle(ino, libc::O_RDWR);
-        let b = fs.open_handle(ino, libc::O_WRONLY);
+        let a = fs.open_handle(ino, libc::O_RDWR).unwrap();
+        let b = fs.open_handle(ino, libc::O_WRONLY).unwrap();
         assert_ne!(a, b, "each open is its own handle");
         assert!(a != MOUNT_HANDLE && b != MOUNT_HANDLE);
         fs.graph
@@ -670,6 +755,83 @@ mod tests {
         assert_eq!(fs.flush_handle(ino, b), Err(libc::ESTALE));
         assert_eq!(read(&fs, MOUNT_HANDLE), b"world");
         assert_eq!(fs.flush_handle(ino + 1, a), Err(libc::ENOENT));
+    }
+
+    #[cfg(feature = "splice")]
+    const LEAF: &str = "test.html/element/text";
+
+    /// A mount over `<p>hello</p>` whose write path checks bases, and the
+    /// `<p>`'s text leaf.
+    #[cfg(feature = "splice")]
+    fn html_fuse() -> (LeylineFuse, u64) {
+        let db = leyline_ts::parse_with_source(
+            b"<p>hello</p>",
+            leyline_ts::languages::TsLanguage::Html,
+            "test.html",
+        )
+        .unwrap();
+        let mut adapter = crate::graph::SqliteGraphAdapter::new_writable(&db).unwrap();
+        adapter.set_source_writer(Arc::new(crate::graph::fixtures::CheckingWriter));
+        let mut fs = LeylineFuse::new(Arc::new(adapter));
+        let ino = fs.ensure_inode(LEAF);
+        (fs, ino)
+    }
+
+    /// What a read through `fh` returns, and the size a stat reports.
+    #[cfg(feature = "splice")]
+    fn seen(fs: &LeylineFuse, fh: u64) -> (Vec<u8>, u64) {
+        let mut buf = [0u8; 64];
+        let n = fs.graph.read_content_as(fh, LEAF, &mut buf, 0).unwrap();
+        let size = fs.graph.get_node(LEAF).unwrap().map_or(0, |n| n.size);
+        (buf[..n].to_vec(), size)
+    }
+
+    /// `open(O_TRUNC)`, write, fsync, close, as a kernel that hands
+    /// `O_TRUNC` to the open (`FUSE_ATOMIC_O_TRUNC`, which `init` asks
+    /// for) sends it: the open truncates its own handle's edit, and the
+    /// write lands alone and reads back. Before, the open ignored
+    /// `O_TRUNC` and the write landed over the old text (`hillo`).
+    #[test]
+    #[cfg(feature = "splice")]
+    fn an_open_with_o_trunc_truncates_its_own_edit() {
+        let (mut fs, ino) = html_fuse();
+        let fh = fs.open_handle(ino, libc::O_WRONLY | libc::O_TRUNC).unwrap();
+        fs.graph.write_content_as(fh, LEAF, b"hi", 0).unwrap();
+        assert_eq!(fs.flush_handle(ino, fh), Ok(()));
+        fs.release_handle(ino, fh);
+        assert_eq!(seen(&fs, MOUNT_HANDLE), (b"hi".to_vec(), 2));
+    }
+
+    /// The same, as a Linux kernel without `FUSE_ATOMIC_O_TRUNC` sends it:
+    /// OPEN, then SETATTR(size 0) naming no handle, then WRITE, FSYNC,
+    /// RELEASE. The truncate is the open writer's, so the write lands alone
+    /// and reads back. Before, the truncate became an edit of the mount
+    /// handle that nothing flushed: the write landed over the old text and
+    /// a stat reported size 0, so the read-back was empty (PR #453's Linux
+    /// `mount_round_trip` failure).
+    #[test]
+    #[cfg(feature = "splice")]
+    fn a_truncate_naming_no_handle_after_an_open_is_the_open_writers() {
+        let (mut fs, ino) = html_fuse();
+        let fh = fs.open_handle(ino, libc::O_WRONLY).unwrap();
+        assert_eq!(fs.truncate_handle(ino, None), Ok(()));
+        fs.graph.write_content_as(fh, LEAF, b"hi", 0).unwrap();
+        assert_eq!(fs.flush_handle(ino, fh), Ok(()));
+        fs.release_handle(ino, fh);
+        assert_eq!(seen(&fs, MOUNT_HANDLE), (b"hi".to_vec(), 2));
+    }
+
+    /// A truncate by path with no file open is complete when it returns:
+    /// it lands, every reader sees it, and no edit is left behind to hide
+    /// the stored bytes. Before, it stayed an unflushed edit of the mount
+    /// handle: other handles read `hello` while a stat reported size 0.
+    #[test]
+    #[cfg(feature = "splice")]
+    fn a_truncate_by_path_lands_at_once() {
+        let (fs, ino) = html_fuse();
+        assert_eq!(fs.truncate_handle(ino, None), Ok(()));
+        assert_eq!(seen(&fs, 7), (Vec::new(), 0));
+        assert_eq!(seen(&fs, MOUNT_HANDLE), (Vec::new(), 0));
     }
 
     fn test_graph() -> Arc<dyn Graph> {

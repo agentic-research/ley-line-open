@@ -27,7 +27,13 @@ context, scoping notes, and review history are recoverable.
   largest edit in progress. After a handle's flush lands, its base is the
   file it wrote, held until `release`. A handle whose base no longer
   matches the file gets `ESTALE` at `flush` and `fsync`, and every later
-  edit through it gets the same until the file is opened again. NFSv3 has no
+  edit through it gets the same until the file is opened again. The mount
+  asks the kernel for `FUSE_ATOMIC_O_TRUNC`, so `open(O_TRUNC)` truncates
+  the new handle's own edit. A kernel without it sends the truncate as a
+  SETATTR naming no handle, which goes to the handles open for writing on
+  the file. With none open (`truncate(2)` by path), the truncate lands
+  through the write path before it returns and leaves no edit behind.
+  NFSv3 has no
   opens and names no client on a WRITE, so an NFS edit is the mount
   handle's: its base is taken when the file's first uncommitted write or
   truncate arrives and held until the COMMIT of the file's last staged
@@ -41,6 +47,13 @@ context, scoping notes, and review history are recoverable.
   gains `note_base_as`, `write_content_as`, `read_content_as`,
   `truncate_as`, `flush_node_as` and `release`, defaulting to the methods
   that name no handle.
+
+- **An edit that empties a node lands at its flush** (bead
+  `ley-line-open-8a26d8`). Its flush returned success without landing,
+  and the empty edit stayed pending: the node read and sized as empty
+  through the mount while the stored file kept its text, and `: > f`
+  over NFS never committed. It now reaches the write path like any other
+  edit, which refuses it when the file it makes does not parse.
 
 ## [0.20.5] — 2026-10-13
 

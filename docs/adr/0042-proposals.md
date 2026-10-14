@@ -126,7 +126,7 @@ ______________________________________________________________________
 | `propose` with file bases, typed `Stale` | `d25ec4` | #439 |
 | daemon `read_source` / `propose`, MCP, schema 0.20.3 | `609525` | #440 |
 | mount bases, `ESTALE`, refused edits discarded, fsync reports refusals | `843e03` | — |
-| typed refusals, required `base`, applied-after-commit, atomic head and sidecars, schema 0.21.0 | `5db28e`, `5dc3a5` | — |
+| typed refusals, required `base`, applied-after-commit, atomic head and sidecars, schema 0.20.5 | `5db28e`, `5dc3a5` | — |
 
 ## Falsifiers
 

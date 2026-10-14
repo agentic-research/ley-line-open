@@ -32,7 +32,7 @@ context, scoping notes, and review history are recoverable.
   `source_write::propose` returns a `Refusal` error for each case. The
   daemon schema (`daemon.capnp`) gains `ProposalRefusal` and the
   `RefusalReason` enum, the Go bindings are regenerated, and
-  `SCHEMA_VERSION` moves to 0.21.0. Move clients of `propose` with this
+  `SCHEMA_VERSION` moves to 0.20.5. Move clients of `propose` with this
   release.
 
 ### Fixed

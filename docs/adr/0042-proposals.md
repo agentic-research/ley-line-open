@@ -97,11 +97,42 @@ accepted with persisted, scheme-tagged keys, and claims per key family only what
   step after its commit failed, `post_commit_error`. Both are MCP tools; `propose` is in its own
   cloister group, `write`. This is the only form that checks against what an agent actually
   read.
-- **Implicit, through the mount** (implemented for files) — an edit's base is the file's stored
-  bytes when it is opened for writing (FUSE) or at the first write after the last flush (NFS). A
-  stale flush is refused: FUSE `ESTALE`, NFS an I/O error (`NFS3ERR_STALE` means a dead file handle
-  to the client). POSIX writes do not say what the client read, so a client that reads, closes and
+- **Implicit, through the mount** (implemented for files) — an edit's base is the hash of the
+  file's stored bytes. FUSE takes it per open handle, when the file is opened for writing. A stale
+  flush is refused and its edit discarded: FUSE `ESTALE` at `fsync`/`close`, NFS `NFS3ERR_STALE`
+  (below). POSIX writes do not say what the client read, so a FUSE client that reads, closes and
   reopens to write takes its base at the reopen.
+- **Mount bases over NFS** (bead `6116c9`) — NFSv3 has no open and names no client, so every edit
+  is the mount handle's, with one base per file. A client holds UNSTABLE writes until `fsync` or
+  close, so the server can first see a WRITE after another writer moved the file; a base taken at
+  that WRITE would be the moved file and the edit would land over a change the client never read.
+  The base is therefore taken no later than the server's READ:
+  - every NFS READ of a node of a parsed file, while the mount handle has no edit to that file in
+    progress, re-takes the file's base from its stored bytes before the bytes are served (a change
+    landing in between leaves the base older than what the client got, so the edit is refused);
+  - a READ while an edit to the file is in progress leaves the base the edit was made against;
+  - a landed COMMIT sets the base to the bytes it wrote (the client's cache holds them); a refused
+    edit keeps the base, so a retry from the client's cache with no READ in between is refused
+    again;
+  - a WRITE or truncate with no base yet takes one from the stored bytes, as before.
+
+  A WRITE or truncate (SETATTR size) to a file whose stored bytes no longer hash to the base is
+  refused `NFS3ERR_STALE` before it is staged; a COMMIT whose file moved after its WRITEs is refused
+  `NFS3ERR_STALE` and its edit discarded. The WRITE refusal is the one the client sees: measured end
+  to end against a macOS NFS mount (bead `6116c9`), a failed WRITE surfaces as `ESTALE` at `fsync`, while a failed
+  COMMIT — `NFS3ERR_STALE` or `NFS3ERR_IO` — is ignored and `fsync` and `close` return success.
+
+  What is checked: an edit is staged, and lands, only if the file holds the bytes it held at the
+  client's last server READ of any node of that file with no edit in progress, or at the mount's
+  last landed edit to it, whichever came later. The mount holds one base per file it has served,
+  replaced in place; no timer drops it. Residual cases: (1) a client that sent no READ for the file
+  to this server and made no landed edit to it — a page cached from a previous mount or a previous
+  server process — gets its base at the WRITE, and a change landed between the client's read and
+  that WRITE is overwritten, not refused; (2) the base is per file, not per node, so a client that
+  edits node A from a cache older than its latest server READ of node B of the same file is
+  checked against B's read and not refused; (3) a refusal only the COMMIT can make — the file moved
+  between the WRITE and the COMMIT (another node of the same file committed first), or the edit
+  does not parse — discards the edit, but a macOS client does not report it.
 - **Explicit, through the mount** (not implemented) — `.staging/` (in `leyline-vcs`, unmounted
   today) served by the mount; writes under it record bases at first read; `.commit` proposes them.
 - **Lifecycle points** (not implemented) — a jj or git commit, the end of a confined run (cloister's
@@ -127,6 +158,7 @@ ______________________________________________________________________
 | daemon `read_source` / `propose`, MCP, schema 0.20.3 | `609525` | #440 |
 | mount bases, `ESTALE`, refused edits discarded, fsync reports refusals | `843e03` | — |
 | typed refusals, required `base`, applied-after-commit, atomic head and sidecars, schema 0.20.5 | `5db28e`, `5dc3a5` | — |
+| NFS mount bases taken at READ, a stale WRITE refused, bases kept after a COMMIT | `6116c9` | — |
 
 ## Falsifiers
 

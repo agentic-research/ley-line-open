@@ -211,12 +211,12 @@ fn execution_daemon_options(options: DaemonOptions) -> DaemonOptions {
     }
 }
 
-/// Run the daemon with explicit additive behavior options.
 /// Refuse a mount this build cannot provide. A daemon asked to mount that
 /// ran headless instead gave its caller no mount and no failure (bead
-/// `ley-line-open-2be4a7`).
-fn mount_is_available(mount: Option<&Path>) -> Result<()> {
-    #[cfg(not(feature = "mount"))]
+/// `ley-line-open-2be4a7`). A build with the `mount` feature provides
+/// every mount, so the check exists only without it.
+#[cfg(not(feature = "mount"))]
+fn refuse_unavailable_mount(mount: Option<&Path>) -> Result<()> {
     if let Some(path) = mount {
         anyhow::bail!(
             "cannot mount at {}: this leyline was built without the `mount` feature. \
@@ -224,10 +224,10 @@ fn mount_is_available(mount: Option<&Path>) -> Result<()> {
             path.display()
         );
     }
-    let _ = mount;
     Ok(())
 }
 
+/// Run the daemon with explicit additive behavior options.
 pub async fn run_daemon_with_options(
     config: DaemonConfig,
     ext: Arc<dyn DaemonExt>,
@@ -253,7 +253,8 @@ pub async fn run_daemon_with_options(
     let arena = arena.as_path();
     let control = control.as_deref();
     let mount = mount.as_deref();
-    mount_is_available(mount)?;
+    #[cfg(not(feature = "mount"))]
+    refuse_unavailable_mount(mount)?;
     let source = source.as_deref();
     let backend = backend.as_str();
     let language = language.as_deref();
@@ -706,7 +707,7 @@ pub async fn run_daemon_with_options(
     };
     #[cfg(not(feature = "mount"))]
     {
-        // `mount_is_available` refused a mount path above.
+        // `refuse_unavailable_mount` refused a mount path above.
         let _ = (mount, backend, nfs_port);
         eprintln!("headless mode (no mount)");
     }
@@ -1309,15 +1310,17 @@ pub fn try_snapshot_or_log(
     }
 }
 
-/// `image` as a standalone rollback-mode database. The live db is WAL-mode,
-/// and its serialized image keeps the WAL stamp in header bytes 18 and 19
-/// (file format write and read versions, 2 = WAL). `sqlite3_deserialize`
-/// of a WAL-stamped image fails every query with `SQLITE_CANTOPEN`, so a
-/// published image must say 1 (rollback) there (bead
-/// `ley-line-open-2bd77c`). The pages are unchanged.
+/// `image` as a standalone rollback-mode database, when it is a SQLite
+/// image stamped WAL. The live db is WAL-mode, and its serialized image
+/// keeps the stamp in header bytes 18 and 19 (file format write and read
+/// versions, 2 = WAL). `sqlite3_deserialize` of a WAL-stamped image fails
+/// every query with `SQLITE_CANTOPEN`, so a published image must say 1
+/// (rollback) there (bead `ley-line-open-2bd77c`). The pages are unchanged,
+/// and any other bytes are returned as they are.
 pub(crate) fn rollback_image(mut image: Vec<u8>) -> Vec<u8> {
-    if let Some(versions) = image.get_mut(18..20) {
-        versions.fill(1);
+    const MAGIC: &[u8] = b"SQLite format 3\0";
+    if image.starts_with(MAGIC) && image.get(18..20) == Some(&[2, 2][..]) {
+        image[18..20].fill(1);
     }
     image
 }
@@ -2616,21 +2619,35 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "mount"))]
     #[test]
     fn a_mount_this_build_cannot_provide_is_refused() {
         assert!(
-            mount_is_available(None).is_ok(),
+            refuse_unavailable_mount(None).is_ok(),
             "headless is always available"
         );
-        let asked = mount_is_available(Some(Path::new("/mnt/x")));
-        #[cfg(not(feature = "mount"))]
-        {
-            let err = asked.unwrap_err().to_string();
-            assert!(err.contains("`mount` feature"), "{err}");
-            assert!(err.contains("/mnt/x"), "{err}");
-        }
-        #[cfg(feature = "mount")]
-        assert!(asked.is_ok());
+        let err = refuse_unavailable_mount(Some(Path::new("/mnt/x")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`mount` feature"), "{err}");
+        assert!(err.contains("/mnt/x"), "{err}");
+    }
+
+    #[test]
+    fn only_a_wal_stamped_sqlite_image_is_restamped() {
+        let header = |w: u8, r: u8| {
+            let mut h = b"SQLite format 3\0".to_vec();
+            h.extend_from_slice(&[0x10, 0x00, w, r, 0, 64, 32, 32]);
+            h
+        };
+        assert_eq!(rollback_image(header(2, 2))[18..20], [1, 1]);
+        assert_eq!(rollback_image(header(1, 1)), header(1, 1));
+        assert_eq!(rollback_image(header(2, 1)), header(2, 1), "a mixed stamp");
+        let raw = b"not a database, though byte 18 is \x02\x02 here".to_vec();
+        assert_eq!(rollback_image(raw.clone()), raw, "other bytes as they are");
+        let mut lookalike = header(2, 2);
+        lookalike[0] = b'X';
+        assert_eq!(rollback_image(lookalike.clone()), lookalike);
     }
 
     #[test]

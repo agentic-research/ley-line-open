@@ -48,6 +48,7 @@ use memmap2::MmapMut;
 
 /// One consistent copy of the control block payload, as the seqlock
 /// reader hands it out (see `Controller::snapshot`).
+#[derive(Clone, Copy)]
 struct Snapshot {
     path: [u8; ARENA_PATH_LEN],
     size: [u8; 8],
@@ -121,6 +122,39 @@ const _: () = assert!(
 /// Controller manages a memory-mapped control file.
 pub struct Controller {
     mmap: MmapMut,
+    /// The control file. A publish holds an exclusive lock on it for as
+    /// long as the counter is odd, so a reader facing an odd counter can
+    /// tell a live publisher (lock held) from a dead one (the kernel
+    /// released its lock when it died).
+    file: std::fs::File,
+    /// The last consistent snapshot this handle read: what it answers when
+    /// the publish it faces will never finish (see `snapshot`).
+    last: std::sync::Mutex<Option<Snapshot>>,
+    /// How many times this reader found the publish lock held while the
+    /// counter was odd — the event a test waits on to know a reader is
+    /// waiting out a publish, instead of guessing with a clock.
+    #[cfg(test)]
+    held_probes: std::sync::Arc<AtomicU64>,
+}
+
+/// Holds the publish lock for one publish and releases it on drop, so a
+/// publish that panics mid-way still releases it.
+struct PublishLock(std::fs::File);
+
+impl PublishLock {
+    fn take(file: &std::fs::File) -> Result<Self> {
+        let handle = file.try_clone().context("clone the control file handle")?;
+        handle
+            .lock()
+            .context("take the control block's publish lock")?;
+        Ok(PublishLock(handle))
+    }
+}
+
+impl Drop for PublishLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 impl Controller {
@@ -182,7 +216,13 @@ impl Controller {
             }
         }
 
-        Ok(Controller { mmap })
+        Ok(Controller {
+            mmap,
+            file,
+            last: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            held_probes: std::sync::Arc::new(AtomicU64::new(0)),
+        })
     }
 
     /// Reference the `AtomicU64` embedded in the mapped control block
@@ -275,27 +315,78 @@ impl Controller {
     /// reload the sequence; keep the copy only if the sequence did not
     /// move. A writer that began or finished a publish during the copy
     /// changed the sequence, so a torn copy never escapes.
+    ///
+    /// A publisher holds the publish lock for as long as the counter is
+    /// odd, so an odd counter whose lock a reader can take, and which does
+    /// not move while the reader holds it, belongs to a publish that will
+    /// not finish: its publisher died mid-publish (bead
+    /// ley-line-open-0a8c14), or publishes without the lock. The payload
+    /// may be torn, so it is never handed out as published. A handle that
+    /// has read a consistent snapshot answers that one again: the arena it
+    /// names is stale for the moment, not empty. A handle that has read none
+    /// answers the root as the zero sentinel ("nothing published"), which
+    /// every consumer refuses to load data under, with the path and size as
+    /// they stand, copied under the lock, so a restarted publisher can read
+    /// its arena path and publish, which repairs the counter. The lock
+    /// decides all of this, not a clock.
     fn snapshot(&self) -> Snapshot {
         let seq = self.sequence();
         loop {
             let before = seq.load(Ordering::Acquire);
             if before & 1 == 1 {
+                if let Some(abandoned) = self.abandoned_payload(before) {
+                    let last = *self.last.lock().unwrap_or_else(|e| e.into_inner());
+                    return last.unwrap_or(Snapshot {
+                        root: [0u8; CURRENT_ROOT_LEN],
+                        ..abandoned
+                    });
+                }
                 std::thread::yield_now();
                 continue;
             }
-            let mut snap = Snapshot {
-                path: [0u8; ARENA_PATH_LEN],
-                size: [0u8; 8],
-                root: [0u8; CURRENT_ROOT_LEN],
-            };
-            self.volatile_copy_out(OFF_ARENA_PATH, &mut snap.path);
-            self.volatile_copy_out(OFF_ARENA_SIZE, &mut snap.size);
-            self.volatile_copy_out(OFF_CURRENT_ROOT, &mut snap.root);
+            let snap = self.copy_payload();
             std::sync::atomic::fence(Ordering::Acquire);
             let after = seq.load(Ordering::Relaxed);
             if before == after {
+                *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Some(snap);
                 return snap;
             }
+        }
+    }
+
+    /// A copy of the payload as it stands, consistent or not.
+    fn copy_payload(&self) -> Snapshot {
+        let mut snap = Snapshot {
+            path: [0u8; ARENA_PATH_LEN],
+            size: [0u8; 8],
+            root: [0u8; CURRENT_ROOT_LEN],
+        };
+        self.volatile_copy_out(OFF_ARENA_PATH, &mut snap.path);
+        self.volatile_copy_out(OFF_ARENA_SIZE, &mut snap.size);
+        self.volatile_copy_out(OFF_CURRENT_ROOT, &mut snap.root);
+        snap
+    }
+
+    /// The payload as it stands, if the counter at `odd` belongs to a
+    /// publish that will not finish: no one holds the publish lock, and the
+    /// counter has not moved while this reader holds it shared, which keeps
+    /// a new publish from starting. The copy is taken under that lock, so
+    /// no publisher writes it meanwhile. A held lock, a failed probe, or a
+    /// counter that moved all say "keep waiting" (`None`).
+    fn abandoned_payload(&self, odd: u64) -> Option<Snapshot> {
+        match self.file.try_lock_shared() {
+            Ok(()) => {
+                let unmoved = self.sequence().load(Ordering::Acquire) == odd;
+                let payload = unmoved.then(|| self.copy_payload());
+                let _ = self.file.unlock();
+                payload
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                #[cfg(test)]
+                self.held_probes.fetch_add(1, Ordering::AcqRel);
+                None
+            }
+            Err(_) => None,
         }
     }
 
@@ -375,6 +466,7 @@ impl Controller {
             );
         }
 
+        let _lock = PublishLock::take(&self.file)?;
         self.seq_begin();
         self.write_path_and_size(path, size);
         self.seq_end();
@@ -400,14 +492,35 @@ impl Controller {
     /// payload stores that follow cannot be reordered before the mark;
     /// a reader that sees the odd value knows a publish is in flight.
     ///
-    /// `fetch_add` rather than load-modify-store so concurrent writers
-    /// (cross-process publishers — exactly what mmap-backed control
-    /// blocks enable) cannot lose increments. The substrate's intended
-    /// invariant is a single writer per `(path, size, root)` advance;
-    /// the counter's soundness does not rely on it.
+    /// Every publisher, in any process or runtime, must hold the publish
+    /// lock while the counter is odd: the lock is what serialises
+    /// publishers and what tells a reader a live publish from an abandoned
+    /// one. A publisher that skips it can be overlapped by another, and its
+    /// odd counter reads as abandoned.
+    ///
+    /// Called with the publish lock held. A counter that is already odd
+    /// then cannot belong to a live publish: it was left by a publisher
+    /// that died mid-publish (bead ley-line-open-0a8c14). It stays odd —
+    /// turning it even would let readers copy this publish half-written —
+    /// and this publish's `seq_end` makes it even over a whole payload.
     fn seq_begin(&mut self) {
-        let prev = self.sequence().fetch_add(1, Ordering::AcqRel);
-        debug_assert_eq!(prev & 1, 0, "seq_begin: a publish was already in flight");
+        let seq = self.sequence();
+        let mut current = seq.load(Ordering::Acquire);
+        loop {
+            if current & 1 == 1 {
+                std::sync::atomic::fence(Ordering::AcqRel);
+                return;
+            }
+            match seq.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// Seqlock write side, exit: sequence odd → even. Release publishes
@@ -472,6 +585,7 @@ impl Controller {
             );
         }
 
+        let _lock = PublishLock::take(&self.file)?;
         self.seq_begin();
         self.write_path_and_size(path, size);
         let half = CURRENT_ROOT_LEN / 2;
@@ -557,14 +671,125 @@ mod tests {
     const ROOT_A: [u8; 32] = [0x11; 32];
     const ROOT_B: [u8; 32] = [0x22; 32];
 
+    /// Leave the control block as a publisher killed mid-publish leaves
+    /// it: sequence odd, half of a new root written, no lock held.
+    fn die_mid_publish(c: &mut Controller) {
+        c.sequence().fetch_add(1, Ordering::AcqRel);
+        c.volatile_copy_in(OFF_CURRENT_ROOT, &ROOT_B[..CURRENT_ROOT_LEN / 2]);
+    }
+
+    /// Bead ley-line-open-0a8c14: the next publish after a dead publisher
+    /// restores parity without exposing the torn root. Before, `seq_begin`
+    /// turned the stuck odd counter even, so the new publish ran with the
+    /// counter even and readers could copy it half-written.
+    #[test]
+    fn a_publish_after_a_dead_publisher_restores_parity() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("dead.ctrl");
+        let mut writer = Controller::open_or_create(&path).unwrap();
+        writer.set_arena_with_root("/tmp/a", 1, ROOT_A).unwrap();
+        die_mid_publish(&mut writer);
+
+        let mut restarted = Controller::open_or_create(&path).unwrap();
+        let mut odd_during_payload = false;
+        restarted
+            .set_arena_with_root_hooked("/tmp/a", 1, ROOT_B, &mut || {
+                odd_during_payload = writer.sequence().load(Ordering::Acquire) & 1 == 1;
+            })
+            .unwrap();
+        assert!(
+            odd_during_payload,
+            "the counter must be odd while the payload is written"
+        );
+        assert_eq!(writer.sequence().load(Ordering::Acquire) & 1, 0);
+        assert_eq!(
+            Controller::open_or_create(&path).unwrap().current_root(),
+            ROOT_B
+        );
+    }
+
+    /// Bead ley-line-open-0a8c14: a reader facing a publisher that died
+    /// mid-publish does not spin forever and does not hand out the torn
+    /// root; it answers the zero sentinel ("nothing published"), which
+    /// every consumer already refuses to load data under. The lock decides:
+    /// no publisher holds it, so the publish is over. This is also what a
+    /// publisher built before the publish lock looks like while its counter
+    /// is odd.
+    #[test]
+    fn a_reader_facing_a_dead_publisher_answers_nothing_published() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("dead.ctrl");
+        let mut writer = Controller::open_or_create(&path).unwrap();
+        writer.set_arena_with_root("/tmp/a", 1, ROOT_A).unwrap();
+        die_mid_publish(&mut writer);
+
+        let reader = Controller::open_or_create(&path).unwrap();
+        assert_eq!(
+            reader.current_root(),
+            [0u8; 32],
+            "neither the old nor a torn root"
+        );
+        assert_eq!(
+            reader.arena_path(),
+            "/tmp/a",
+            "the path a restart needs survives"
+        );
+    }
+
+    /// A reader that has seen a consistent root keeps answering it when it
+    /// meets an odd counter nobody holds the lock for: a publisher that died
+    /// mid-publish, or one that publishes without the lock. Its graph goes
+    /// stale for the moment instead of empty, and never torn.
+    #[test]
+    fn a_reader_facing_a_dead_publisher_keeps_its_last_root() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("dead.ctrl");
+        let mut writer = Controller::open_or_create(&path).unwrap();
+        writer.set_arena_with_root("/tmp/a", 1, ROOT_A).unwrap();
+
+        let reader = Controller::open_or_create(&path).unwrap();
+        assert_eq!(reader.current_root(), ROOT_A);
+        die_mid_publish(&mut writer);
+        assert_eq!(reader.current_root(), ROOT_A, "the last root it saw");
+        assert_eq!(reader.arena_path(), "/tmp/a");
+        assert_eq!(reader.arena_size(), 1);
+    }
+
+    /// A publisher that is alive is not taken for dead, however long it
+    /// holds: the reader finds the publish lock held, waits, and gets the
+    /// whole new root. The publish is held until the reader has found the
+    /// lock held at least once — an event, not a duration.
+    #[test]
+    fn a_live_publisher_is_waited_out() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.ctrl");
+        let mut writer = Controller::open_or_create(&path).unwrap();
+        writer.set_arena_with_root("/tmp/a", 1, ROOT_A).unwrap();
+        let reader = Controller::open_or_create(&path).unwrap();
+        let held_probes = reader.held_probes.clone();
+
+        let mut reader = Some(reader);
+        let mut reading = None;
+        writer
+            .set_arena_with_root_hooked("/tmp/a", 1, ROOT_B, &mut || {
+                let r = reader.take().expect("one publish, one hold");
+                reading = Some(std::thread::spawn(move || r.current_root()));
+                while held_probes.load(Ordering::Acquire) == 0 {
+                    std::thread::yield_now();
+                }
+            })
+            .unwrap();
+        assert_eq!(reading.unwrap().join().unwrap(), ROOT_B);
+    }
+
     /// The falsifier mache's reader could not pass against the old
     /// write-then-bump protocol (bead ley-line-open-49a1ef): a reader that
     /// overlaps a publish must never see a root that was never published.
     /// The writer is held between the two halves of its root write until
-    /// a reader has started a read during the hold, so the overlap is
-    /// certain rather than one-in-five-hundred. With write-then-bump the
-    /// reader returns half of A and half of B; with the seqlock it waits
-    /// out the odd counter and returns a whole root.
+    /// the reader has either found the publish lock held (the seqlock: it is
+    /// waiting out the odd counter) or returned a root (a broken protocol:
+    /// it read the half-written one). Both are events the reader reports,
+    /// so every hold overlaps a read with no clock involved.
     #[test]
     fn a_reader_overlapping_a_publish_never_sees_a_torn_root() {
         let dir = tempdir().unwrap();
@@ -572,22 +797,16 @@ mod tests {
         let mut writer = Controller::open_or_create(&path).unwrap();
         writer.set_arena_with_root("/tmp/a", 1, ROOT_A).unwrap();
         let reader = Controller::open_or_create(&path).unwrap();
+        let held_probes = reader.held_probes.clone();
         let probe = Controller::open_or_create(&path).unwrap();
 
-        let attempts = Arc::new(AtomicU64::new(0));
         let completed = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let torn = Arc::new(AtomicU64::new(0));
         let reader_thread = {
-            let (attempts, completed, stop, torn) = (
-                attempts.clone(),
-                completed.clone(),
-                stop.clone(),
-                torn.clone(),
-            );
+            let (completed, stop, torn) = (completed.clone(), stop.clone(), torn.clone());
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Acquire) {
-                    attempts.fetch_add(1, Ordering::AcqRel);
                     let root = reader.current_root();
                     if root != ROOT_A && root != ROOT_B {
                         torn.fetch_add(1, Ordering::AcqRel);
@@ -598,33 +817,19 @@ mod tests {
         };
 
         const PUBLISHES: u64 = 16;
-        // Holds during which a read was in flight: what makes the test a
-        // test. Counted rather than inferred from completed reads, because
-        // one read spinning under the seqlock can span several back-to-back
-        // publishes (bead ley-line-open-7c88ec).
-        let overlapped = Arc::new(AtomicU64::new(0));
+        let mut waited_out = 0;
         for i in 0..PUBLISHES {
             let (root, prev) = if i.is_multiple_of(2) {
                 (ROOT_B, ROOT_A)
             } else {
                 (ROOT_A, ROOT_B)
             };
-            let (attempts, completed, overlapped) =
-                (attempts.clone(), completed.clone(), overlapped.clone());
             writer
                 .set_arena_with_root_hooked("/tmp/a", 1, root, &mut || {
                     // The mapping really is torn at this point: new first
                     // half, old second half. This is the state the seqlock
                     // reader must never hand out.
                     let raw = probe.unsynchronized_root();
-                    assert_ne!(
-                        raw, prev,
-                        "hook must sit after some of the new root was written"
-                    );
-                    assert_ne!(
-                        raw, root,
-                        "hook must sit before the whole new root was written"
-                    );
                     let half = CURRENT_ROOT_LEN / 2;
                     assert_eq!(raw[..half], root[..half], "hook sits after the first half");
                     assert_eq!(
@@ -632,39 +837,15 @@ mod tests {
                         prev[half..],
                         "hook sits before the second half"
                     );
-                    // Hold the half-written root until a read that STARTED
-                    // during the hold has either finished (old protocol:
-                    // it finished torn) or is still waiting on us (seqlock:
-                    // it spins on the odd counter), bounded so neither
-                    // outcome can hang the test.
-                    //
-                    // The two waits have separate bounds. The first waits
-                    // for a read to be in flight during the hold — started
-                    // and not finished, which under the seqlock is the
-                    // reader spinning on the odd counter. It ends as soon as
-                    // the reader thread runs, so its bound only matters on
-                    // a starved machine, where 50 ms let publishes pass with
-                    // no read overlapping them (bead ley-line-open-7c88ec).
-                    // The second waits for that read to finish, which the
-                    // seqlock forbids during the hold, so it runs out its
-                    // bound on every publish and stays short.
+                    let probes = held_probes.load(Ordering::Acquire);
                     let done = completed.load(Ordering::Acquire);
-                    let start_deadline =
-                        std::time::Instant::now() + std::time::Duration::from_secs(5);
-                    while attempts.load(Ordering::Acquire) <= completed.load(Ordering::Acquire)
-                        && std::time::Instant::now() < start_deadline
+                    while held_probes.load(Ordering::Acquire) == probes
+                        && completed.load(Ordering::Acquire) == done
                     {
                         std::thread::yield_now();
                     }
-                    if attempts.load(Ordering::Acquire) > completed.load(Ordering::Acquire) {
-                        overlapped.fetch_add(1, Ordering::AcqRel);
-                    }
-                    let finish_deadline =
-                        std::time::Instant::now() + std::time::Duration::from_millis(50);
-                    while completed.load(Ordering::Acquire) <= done
-                        && std::time::Instant::now() < finish_deadline
-                    {
-                        std::thread::yield_now();
+                    if held_probes.load(Ordering::Acquire) > probes {
+                        waited_out += 1;
                     }
                 })
                 .unwrap();
@@ -678,13 +859,8 @@ mod tests {
             "a reader overlapping a publish observed a root that was never published"
         );
         assert_eq!(
-            overlapped.load(Ordering::Acquire),
-            PUBLISHES,
-            "a read must have been in flight during every half-written root"
-        );
-        assert!(
-            completed.load(Ordering::Acquire) >= 1,
-            "the reader must have returned a root to check"
+            waited_out, PUBLISHES,
+            "during every half-written root the reader was waiting it out"
         );
     }
 
@@ -1117,7 +1293,7 @@ mod tests {
     #[test]
     fn set_arena_with_root_root_never_stale_under_writer_race() {
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AOrd};
         use std::thread;
 
         let dir = tempdir().unwrap();
@@ -1129,6 +1305,11 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_reader = stop.clone();
         let path_for_reader = ctrl_path.clone();
+        // Reads completed so far: the writer advances only after the reader
+        // has read since the last publish, so every publish is observed by
+        // an event rather than given a sleep's worth of time.
+        let reads = Arc::new(AtomicU64::new(0));
+        let reads_in_reader = reads.clone();
 
         let reader = thread::spawn(move || {
             let r = Controller::open_or_create(&path_for_reader).unwrap();
@@ -1147,13 +1328,17 @@ mod tests {
                 if root[0] > last_seen_root_byte {
                     last_seen_root_byte = root[0];
                 }
+                reads_in_reader.fetch_add(1, AOrd::AcqRel);
             }
             (regressions, samples)
         });
 
         for n in 1u8..=50 {
             writer.set_arena_with_root("/x", 8, [n; 32]).unwrap();
-            std::thread::sleep(std::time::Duration::from_micros(100));
+            let seen = reads.load(AOrd::Acquire);
+            while reads.load(AOrd::Acquire) == seen {
+                std::thread::yield_now();
+            }
         }
         stop.store(true, AOrd::Release);
 

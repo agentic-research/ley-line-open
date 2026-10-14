@@ -848,6 +848,51 @@ mod tests {
         );
     }
 
+    /// Through the mount and the real writer, an edit refused because its
+    /// file moved leaves nothing behind: the edited node reads, and the
+    /// published image stores, what the file projects to. The refused text
+    /// never reached the database, so there is nothing for an "unchanged"
+    /// re-parse to leave in place (bead `ley-line-open-5d925d`).
+    #[cfg(feature = "mount")]
+    #[test]
+    fn a_refused_mount_edit_leaves_nothing_in_the_image() {
+        use leyline_fs::graph::{Graph, SqliteGraphAdapter, StaleWrite};
+        let a = arena(&[("a.go", A)]);
+        let image = a.conn.serialize("main").unwrap();
+        let mut graph = SqliteGraphAdapter::new_writable(image.as_ref()).unwrap();
+        graph.set_source_writer(std::sync::Arc::new(MountWriter {
+            grant: Grant::Whole,
+        }));
+        let leaf = "a.go/package_clause/package_identifier";
+        let body = "a.go/function_declaration/block";
+
+        graph.note_base(leaf).unwrap();
+        // The file moves after the edit began: another construct changes.
+        graph
+            .batch_splice(&[(body.to_string(), Some("{ return 7 }".to_string()))])
+            .unwrap();
+        graph.write_content(leaf, b"b", 0).unwrap();
+        let err = graph.flush_node(leaf).unwrap_err();
+        assert!(err.downcast_ref::<StaleWrite>().is_some(), "{err:#}");
+
+        let mut buf = [0u8; 8];
+        let n = graph.read_content(leaf, &mut buf, 0).unwrap();
+        assert_eq!(&buf[..n], b"a", "the node reads as the stored file");
+        let out = tempfile::tempdir().unwrap();
+        let path = out.path().join("published.db");
+        std::fs::write(&path, graph.serialize().unwrap()).unwrap();
+        let published = Connection::open(&path).unwrap();
+        let nid = leyline_schema::resolve_path(&published, leaf)
+            .unwrap()
+            .unwrap();
+        let record: String = published
+            .query_row("SELECT record FROM nodes WHERE nid = ?1", [nid], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(record, "a", "the image holds no trace of the refused edit");
+    }
+
     #[test]
     fn grant_paths_covers_exactly_its_paths() {
         let g = Grant::Paths(BTreeSet::from(["a/b.go".to_string()]));

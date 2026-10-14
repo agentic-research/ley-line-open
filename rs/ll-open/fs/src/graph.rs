@@ -2,8 +2,6 @@ use anyhow::{Context, Result};
 use crossbeam_queue::ArrayQueue;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
-#[cfg(feature = "splice")]
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -270,9 +268,15 @@ pub struct SqliteGraphAdapter {
     /// Key: node ID, Value: old content before truncate.
     #[cfg(feature = "validate")]
     shadow: Mutex<HashMap<String, String>>,
-    /// Nodes with pending splice (write accumulated, splice fires on flush).
+    /// The bytes of each node of a parsed file with an edit in progress,
+    /// keyed by node id: the node's record with every write so far applied.
+    /// They stay here, not in `nodes.record`, until the flush hands the
+    /// spliced file to the source writer: the projection rows are a function
+    /// of the stored source, and anything that publishes the database before
+    /// the flush lands must not carry half an edit (bead
+    /// `ley-line-open-5d8246`). Reads and sizes of the node see them.
     #[cfg(feature = "splice")]
-    pending_splice: Mutex<HashSet<String>>,
+    pending: Mutex<HashMap<String, Vec<u8>>>,
     /// The base of each file with an edit in progress, keyed by
     /// `_source.id`: the hash of its bytes before the edit's first write
     /// (ADR-0041 P2). Taken by `note_base` or the first `write_content`,
@@ -284,6 +288,19 @@ pub struct SqliteGraphAdapter {
     /// refused rather than reported as done.
     #[cfg(feature = "splice")]
     source_writer: Option<Arc<dyn SourceWriter>>,
+}
+
+/// Write `data` into `content` at `offset`, extending it with zeros when the
+/// write starts or ends past its end.
+#[cfg(feature = "splice")]
+fn patch(content: &mut Vec<u8>, data: &[u8], offset: u64) -> Result<()> {
+    let off = usize::try_from(offset).context("write offset exceeds usize")?;
+    let end = off
+        .checked_add(data.len())
+        .context("write offset + length overflow")?;
+    content.resize(content.len().max(end), 0);
+    content[off..end].copy_from_slice(data);
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,6 +318,21 @@ pub(crate) enum WriteRefreshOutcome {
         rehashed: usize,
         bytes_scanned: usize,
     },
+}
+
+impl WriteRefreshOutcome {
+    /// The outcome of a write that touched no stored content.
+    #[cfg(feature = "splice")]
+    fn untouched() -> Self {
+        #[cfg(feature = "cdc")]
+        {
+            WriteRefreshOutcome::Skipped
+        }
+        #[cfg(not(feature = "cdc"))]
+        {
+            WriteRefreshOutcome::Disabled
+        }
+    }
 }
 
 impl SqliteGraphAdapter {
@@ -340,7 +372,7 @@ impl SqliteGraphAdapter {
             #[cfg(feature = "validate")]
             shadow: Mutex::new(HashMap::new()),
             #[cfg(feature = "splice")]
-            pending_splice: Mutex::new(HashSet::new()),
+            pending: Mutex::new(HashMap::new()),
             #[cfg(feature = "splice")]
             bases: Mutex::new(HashMap::new()),
             #[cfg(feature = "splice")]
@@ -394,13 +426,13 @@ impl SqliteGraphAdapter {
         Ok(source_id.map(|s| (file_id, s)))
     }
 
-    /// Discard a refused edit to `file_id`: re-project the stored file so the
-    /// edited records read as it again, drop every pending edit and the base
-    /// of that file, and record `refused` in `_errors` for `node_id`. Best
-    /// effort: a failure here is logged, since the refusal is what the caller
-    /// must see.
+    /// Discard a refused edit to `file_id`: drop every pending edit and the
+    /// base of that file, so its nodes read as the stored file again, and
+    /// record `refused` in `_errors` for `node_id`. Nothing in the database
+    /// needs restoring, because a pending edit never reached it. Recording
+    /// the reason is best effort: the refusal is what the caller must see.
     #[cfg(feature = "splice")]
-    fn restore_file(
+    fn discard_file(
         &self,
         conn: &Connection,
         node_id: &str,
@@ -409,25 +441,13 @@ impl SqliteGraphAdapter {
         refused: &anyhow::Error,
     ) {
         self.bases.lock().remove(source_id);
-        self.pending_splice.lock().retain(|pending| {
+        self.pending.lock().retain(|pending, _| {
             leyline_schema::resolve_path(conn, pending)
                 .ok()
                 .flatten()
                 .and_then(leyline_schema::nid_file_id)
                 != Some(file_id)
         });
-        let restored = leyline_ts::splice::source_bytes(conn, file_id)
-            .and_then(|stored| self.write_source(conn, source_id, stored, None));
-        if let Err(e) = restored {
-            log::warn!("restoring '{source_id}' after a refused edit failed: {e:#}");
-        }
-        #[cfg(feature = "cdc")]
-        if let Err(e) = crate::chunked::invalidate_chunked_content_subtree(
-            conn,
-            leyline_schema::file_nid(file_id, 0),
-        ) {
-            log::warn!("invalidating '{source_id}' chunks after a refused edit failed: {e:#}");
-        }
         if let Err(e) = conn.execute(
             "INSERT OR REPLACE INTO _errors (node_id, line, col, message, timestamp) \
              VALUES (?1, 0, 0, ?2, ?3)",
@@ -435,6 +455,37 @@ impl SqliteGraphAdapter {
         ) {
             log::warn!("recording the refusal of '{node_id}' failed: {e:#}");
         }
+    }
+
+    /// Whether an edit to `nid` is spliced into its file on flush: the node
+    /// has a syntax-tree row, so it belongs to a parsed file.
+    #[cfg(feature = "splice")]
+    fn is_spliced(conn: &Connection, nid: i64) -> bool {
+        conn.query_row("SELECT 1 FROM _ast WHERE nid = ?1", [nid], |_| Ok(()))
+            .is_ok()
+    }
+
+    /// `nid`'s stored record as bytes; empty when it has none.
+    fn record_bytes(conn: &Connection, nid: i64) -> Vec<u8> {
+        conn.query_row("SELECT record FROM nodes WHERE nid = ?1", [nid], |row| {
+            row.get::<_, Option<String>>(0)
+        })
+        .ok()
+        .flatten()
+        .map(String::into_bytes)
+        .unwrap_or_default()
+    }
+
+    /// `node` as the reader sees it: sized as its pending edit, if any.
+    fn with_pending(&self, node: Node) -> Node {
+        #[cfg(feature = "splice")]
+        if let Some(size) = self.pending.lock().get(&node.id).map(Vec::len) {
+            return Node {
+                size: size as u64,
+                ..node
+            };
+        }
+        node
     }
 
     /// Record the base of `nid`'s file — the hash of its stored bytes — if
@@ -723,16 +774,20 @@ impl SqliteGraphAdapter {
             #[cfg(feature = "splice")]
             self.take_base(guard.conn(), nid)?;
 
-            // Read existing content, patch in the new data
-            let existing: Option<String> = guard
-                .conn()
-                .query_row("SELECT record FROM nodes WHERE nid = ?1", [nid], |row| {
-                    row.get(0)
-                })
-                .ok()
-                .flatten();
+            // An edit to a node of a parsed file accumulates in `pending`
+            // and reaches the database only through its flush.
+            #[cfg(feature = "splice")]
+            if Self::is_spliced(guard.conn(), nid) {
+                let mut pending = self.pending.lock();
+                let content = pending
+                    .entry(id.to_string())
+                    .or_insert_with(|| Self::record_bytes(guard.conn(), nid));
+                patch(content, data, offset)?;
+                return Ok((data.len(), WriteRefreshOutcome::untouched()));
+            }
 
-            let mut content = existing.map(|s| s.into_bytes()).unwrap_or_default();
+            // Read existing content, patch in the new data
+            let mut content = Self::record_bytes(guard.conn(), nid);
             #[cfg(feature = "cdc")]
             let old_len = content.len();
             #[cfg(feature = "cdc")]
@@ -861,17 +916,6 @@ impl SqliteGraphAdapter {
             #[cfg(not(feature = "cdc"))]
             let refresh = WriteRefreshOutcome::Disabled;
 
-            // Mark for splice on flush if this node has AST tracking
-            #[cfg(feature = "splice")]
-            {
-                let is_ast: bool = guard
-                    .conn()
-                    .query_row("SELECT 1 FROM _ast WHERE nid = ?1", [nid], |_| Ok(true))
-                    .unwrap_or(false);
-                if is_ast {
-                    self.pending_splice.lock().insert(id.to_string());
-                }
-            }
             refresh
         };
         self.refresh_readers()?;
@@ -996,7 +1040,7 @@ impl Graph for SqliteGraphAdapter {
                 |row| Self::row_to_node(row, id.to_string()),
             );
             match result {
-                Ok(node) => Ok(Some(node)),
+                Ok(node) => Ok(Some(self.with_pending(node))),
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
                 Err(e) => Err(e.into()),
             }
@@ -1037,7 +1081,7 @@ impl Graph for SqliteGraphAdapter {
                 |row| Self::row_to_node(row, id.clone()),
             );
             match result {
-                Ok(node) => Ok(Some(node)),
+                Ok(node) => Ok(Some(self.with_pending(node))),
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
                 Err(e) => Err(e.into()),
             }
@@ -1062,7 +1106,7 @@ impl Graph for SqliteGraphAdapter {
             })?;
             let mut children = Vec::new();
             for row in rows {
-                children.push(row?);
+                children.push(self.with_pending(row?));
             }
             Ok(children)
         })
@@ -1088,6 +1132,12 @@ impl Graph for SqliteGraphAdapter {
             for row in rows {
                 out.push(row?);
             }
+            #[cfg(feature = "splice")]
+            for (id, record) in &mut out {
+                if let Some(content) = self.pending.lock().get(id.as_str()) {
+                    *record = String::from_utf8_lossy(content).into_owned();
+                }
+            }
             Ok(out)
         })
     }
@@ -1103,6 +1153,16 @@ impl Graph for SqliteGraphAdapter {
     /// Both branches go through one accessor so the two storage generations
     /// cannot drift into different range semantics.
     fn read_content(&self, id: &str, buf: &mut [u8], offset: u64) -> Result<usize> {
+        #[cfg(feature = "splice")]
+        if let Some(content) = self.pending.lock().get(id) {
+            let off = usize::try_from(offset).unwrap_or(usize::MAX);
+            if off >= content.len() {
+                return Ok(0);
+            }
+            let n = buf.len().min(content.len() - off);
+            buf[..n].copy_from_slice(&content[off..off + n]);
+            return Ok(n);
+        }
         self.with_reader(|reader| {
             // An unresolvable id reads as empty, matching the pre-v5 miss on
             // `WHERE id = ?` — a read of a vanished node is not an error.
@@ -1217,6 +1277,12 @@ impl Graph for SqliteGraphAdapter {
 
             Self::delete_subtree(conn, nid)?;
         }
+        // An edit in progress to the removed node or beneath it has nowhere
+        // to land.
+        #[cfg(feature = "splice")]
+        self.pending
+            .lock()
+            .retain(|pending, _| pending != id && !pending.starts_with(&format!("{id}/")));
         self.refresh_readers()?;
         Ok(())
     }
@@ -1229,6 +1295,13 @@ impl Graph for SqliteGraphAdapter {
             let Some(nid) = leyline_schema::resolve_path(conn, id)? else {
                 return Ok(());
             };
+
+            #[cfg(feature = "splice")]
+            if Self::is_spliced(conn, nid) {
+                self.take_base(conn, nid)?;
+                self.pending.lock().insert(id.to_string(), Vec::new());
+                return Ok(());
+            }
 
             // Save shadow copy before truncating (for validation rollback)
             #[cfg(feature = "validate")]
@@ -1277,23 +1350,17 @@ impl Graph for SqliteGraphAdapter {
     fn flush_node(&self, id: &str) -> Result<()> {
         #[cfg(feature = "splice")]
         {
-            if !self.pending_splice.lock().contains(id) {
+            let Some(content) = self.pending.lock().get(id).cloned() else {
                 return Ok(());
-            }
+            };
             let guard = self.writer_guard();
             let Some(nid) = leyline_schema::resolve_path(guard.conn(), id)? else {
                 return Ok(());
             };
-            let record: Option<String> = guard
-                .conn()
-                .query_row("SELECT record FROM nodes WHERE nid = ?1", [nid], |r| {
-                    r.get(0)
-                })
-                .ok()
-                .flatten();
-            let Some(text) = record.filter(|s| !s.is_empty()) else {
+            if content.is_empty() {
                 return Ok(());
-            };
+            }
+            let text = String::from_utf8_lossy(&content);
             let bytes = leyline_ts::splice::splice(guard.conn(), nid, &text)?;
             let file_id = leyline_schema::nid_file_id(nid)
                 .context("spliced node must be a file-scoped nid")?;
@@ -1309,12 +1376,11 @@ impl Graph for SqliteGraphAdapter {
                 return self.write_source(guard.conn(), &source_id, bytes, base);
             }
             if let Err(refused) = self.write_source(guard.conn(), &source_id, bytes, base) {
-                // A refused edit is discarded, not left behind: the edited
-                // records go back to what the stored file projects to, every
-                // pending edit to that file is dropped with it, and the
-                // reason is recorded for the node. The refusal stands even
-                // if the restore fails.
-                self.restore_file(guard.conn(), id, file_id, &source_id, &refused);
+                // A refused edit is discarded, not left behind: every
+                // pending edit to that file is dropped, so its nodes read as
+                // the stored file again, and the reason is recorded for the
+                // node.
+                self.discard_file(guard.conn(), id, file_id, &source_id, &refused);
                 drop(guard);
                 self.refresh_readers()?;
                 return Err(refused);
@@ -1341,7 +1407,7 @@ impl Graph for SqliteGraphAdapter {
             )?;
 
             // Only remove from pending on success — failed attempts retry on next flush
-            self.pending_splice.lock().remove(id);
+            self.pending.lock().remove(id);
             // Reproject replaced all nodes — shadows are stale
             #[cfg(feature = "validate")]
             self.shadow.lock().clear();
@@ -1571,8 +1637,14 @@ impl Graph for SqliteGraphAdapter {
             }
         }
 
-        // Clear pending splice set
-        self.pending_splice.lock().clear();
+        // The batch replaced these nodes' text; edits to them in progress
+        // are superseded. Other nodes' pending edits stay for their flush.
+        {
+            let mut pending = self.pending.lock();
+            for (id, _) in edits {
+                pending.remove(id);
+            }
+        }
         #[cfg(feature = "validate")]
         self.shadow.lock().clear();
 
@@ -3279,7 +3351,7 @@ mod tests {
                 b"<p>world</p>\n<!-- kept -->\n".to_vec()
             )],
         );
-        assert!(!adapter.pending_splice.lock().contains(node_id));
+        assert!(!adapter.pending.lock().contains_key(node_id));
 
         writer.writes.lock().clear();
         adapter.batch_splice(&[(node_id.to_string(), Some("hi".to_string()))])?;
@@ -3309,7 +3381,7 @@ mod tests {
         adapter.write_content(node_id, b"world", 0)?;
         let err = adapter.flush_node(node_id).unwrap_err();
         assert!(format!("{err:#}").contains("no source writer"), "{err:#}");
-        assert!(adapter.pending_splice.lock().contains(node_id));
+        assert!(adapter.pending.lock().contains_key(node_id));
 
         let err = adapter
             .batch_splice(&[(node_id.to_string(), Some("x".to_string()))])
@@ -3350,6 +3422,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "splice")]
     fn hash_of(bytes: &[u8]) -> leyline_core::Hash {
         bytes.hash()
     }
@@ -3424,6 +3497,85 @@ mod tests {
         check(&graph, &writer)
     }
 
+    /// An edit to a node of a parsed file stays out of the database until
+    /// its flush lands: the projection rows are a function of the stored
+    /// source, and anything that publishes the database in between (another
+    /// file's flush, a reparse, a snapshot) must not carry half an edit. The
+    /// node still reads, and sizes, as the edit so far.
+    #[test]
+    #[cfg(feature = "splice")]
+    fn an_unflushed_edit_stays_out_of_the_database() -> Result<()> {
+        let db_bytes = leyline_ts::parse_with_source(
+            b"<p>hello</p>",
+            leyline_ts::languages::TsLanguage::Html,
+            "test.html",
+        )?;
+        let mut adapter = SqliteGraphAdapter::new_writable(&db_bytes)?;
+        adapter.set_source_writer(Arc::new(BaseCheckingWriter::default()));
+        let node_id = "test.html/element/text";
+        let stored = |adapter: &SqliteGraphAdapter| -> Result<String> {
+            let guard = adapter.writer_guard();
+            let nid = leyline_schema::resolve_path(guard.conn(), node_id)?.unwrap();
+            Ok(guard
+                .conn()
+                .query_row("SELECT record FROM nodes WHERE nid = ?1", [nid], |r| {
+                    r.get(0)
+                })?)
+        };
+
+        adapter.write_content(node_id, b"worlds", 0)?;
+        assert_eq!(
+            stored(&adapter)?,
+            "hello",
+            "the database holds no half edit"
+        );
+        let mut buf = [0u8; 16];
+        let n = adapter.read_content(node_id, &mut buf, 0)?;
+        assert_eq!(&buf[..n], b"worlds", "the node reads as the edit so far");
+        let n = adapter.read_content(node_id, &mut buf, 2)?;
+        assert_eq!(&buf[..n], b"rlds", "a read at an offset");
+        assert_eq!(
+            adapter.read_content(node_id, &mut buf, 6)?,
+            0,
+            "past the end"
+        );
+        assert_eq!(adapter.get_node(node_id)?.unwrap().size, 6);
+        let listed = adapter.list_children("test.html/element")?;
+        let text = listed.iter().find(|n| n.id == node_id).unwrap();
+        assert_eq!(text.size, 6);
+
+        adapter.flush_node(node_id)?;
+        assert_eq!(stored(&adapter)?, "worlds", "the flush lands the edit");
+        Ok(())
+    }
+
+    /// Removing a node drops the edits in progress to it and to the nodes
+    /// beneath it, which have nowhere to land, and keeps every other.
+    #[test]
+    #[cfg(feature = "splice")]
+    fn removing_a_node_drops_the_edits_beneath_it() -> Result<()> {
+        let db_bytes = leyline_ts::parse_with_source(
+            b"<p>hello</p>",
+            leyline_ts::languages::TsLanguage::Html,
+            "test.html",
+        )?;
+        let mut adapter = SqliteGraphAdapter::new_writable(&db_bytes)?;
+        adapter.set_source_writer(Arc::new(BaseCheckingWriter::default()));
+        let tag = "test.html/element/start_tag";
+        let tag_name = "test.html/element/start_tag/tag_name";
+        let text = "test.html/element/text";
+        adapter.write_content(tag, b"<q>", 0)?;
+        adapter.write_content(tag_name, b"q", 0)?;
+        adapter.write_content(text, b"world", 0)?;
+
+        adapter.remove_node(tag)?;
+        let pending = adapter.pending.lock();
+        assert!(!pending.contains_key(tag), "the removed node's edit");
+        assert!(!pending.contains_key(tag_name), "an edit beneath it");
+        assert!(pending.contains_key(text), "an edit elsewhere stays");
+        Ok(())
+    }
+
     /// A refused edit is discarded, not left behind: the node reads as the
     /// stored file again, nothing stays pending, the refusal is typed as
     /// stale for the mount to answer `ESTALE`, and its reason is recorded
@@ -3450,7 +3602,7 @@ mod tests {
         let mut buf = [0u8; 16];
         let n = adapter.read_content(node_id, &mut buf, 0)?;
         assert_eq!(&buf[..n], b"hello", "the refused edit is discarded");
-        assert!(!adapter.pending_splice.lock().contains(node_id));
+        assert!(!adapter.pending.lock().contains_key(node_id));
         let recorded: String = adapter.writer_guard().conn().query_row(
             "SELECT message FROM _errors WHERE node_id = ?1",
             [node_id],
@@ -3599,7 +3751,7 @@ mod tests {
 
         // Verify pending splice was marked
         assert!(
-            adapter.pending_splice.lock().contains(node_id),
+            adapter.pending.lock().contains_key(node_id),
             "node should be marked for pending splice"
         );
 
@@ -3608,7 +3760,7 @@ mod tests {
 
         // Pending splice should be cleared
         assert!(
-            !adapter.pending_splice.lock().contains(node_id),
+            !adapter.pending.lock().contains_key(node_id),
             "pending splice should be cleared after successful flush"
         );
 
@@ -3640,7 +3792,7 @@ mod tests {
 
         // Should not be pending
         assert!(
-            !adapter.pending_splice.lock().contains("plain.txt"),
+            !adapter.pending.lock().contains_key("plain.txt"),
             "non-AST node should not be marked for splice"
         );
 
@@ -3674,7 +3826,7 @@ mod tests {
             // A refused edit is discarded: nothing stays pending and the
             // node reads as the stored file again.
             assert!(
-                !adapter.pending_splice.lock().contains(node_id),
+                !adapter.pending.lock().contains_key(node_id),
                 "a refused flush drops the edit"
             );
             let mut buf = [0u8; 64];
@@ -3691,7 +3843,7 @@ mod tests {
         adapter.flush_node(node_id)?;
 
         assert!(
-            !adapter.pending_splice.lock().contains(node_id),
+            !adapter.pending.lock().contains_key(node_id),
             "successful flush should clear pending"
         );
 

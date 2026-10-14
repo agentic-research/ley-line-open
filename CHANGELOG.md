@@ -10,6 +10,65 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.20.5] — 2026-10-13
+
+Publication safety. A publisher that dies mid-publish no longer wedges
+readers of the control block, and a reader facing an abandoned publish
+stays on the last snapshot it read instead of an empty one. Every
+publisher now takes a publish lock on the control file; mache's matching
+release takes the same lock, so move mache and leyline together. Mount
+edits stay out of the database until their flush lands, so a snapshot no
+longer publishes half an edit. This also corrects v0.20.4's claim that a
+refused mount edit is discarded: through the real write path its text
+stayed in the node and was published. Found by a design review of the
+proposal stack. The wire stays v1 with `SCHEMA_VERSION` 0.20.4 (no schema
+change), the projection stays `projection-v6`, and the control block
+stays VERSION 3.
+
+### Fixed
+
+- **An unflushed mount edit no longer reaches the database, so a snapshot
+  never publishes half an edit** (beads `ley-line-open-5d8246`,
+  `ley-line-open-5d925d`). A write to a node of a parsed file used to
+  update `nodes.record` at once, outside any proposal. Any publish before
+  the flush (another file's `fsync`, a `propose`, a reparse) handed
+  out-of-process readers half-written text beside the old source, and
+  after a restart the text stayed, because a reparse skips a file whose
+  stored hash has not changed. Pending bytes now stay in the mount until
+  the flush lands them through the source writer; reads and sizes of the
+  node see them. A refused edit is dropped from the mount and leaves
+  nothing to restore: before, the restore re-proposed the stored bytes,
+  the parse skipped the file as unchanged, and the refused text stayed in
+  the node and was published.
+
+- **A publisher killed mid-publish no longer wedges the control block**
+  (bead `ley-line-open-0a8c14`). It left the seqlock counter odd: readers
+  spun forever, and the next publish turned the counter even before
+  writing, so readers could copy that publish half-written. A publish now
+  holds an exclusive lock on the control file for as long as the counter
+  is odd; a publish that finds the counter already odd keeps it odd and
+  ends even over a whole payload. A reader that finds the counter odd and
+  the lock free, unmoved while it holds the lock shared, knows that
+  publish will not finish. It answers the last consistent snapshot its
+  handle read, so a polling mount stays on its current arena; a handle
+  that has read none answers the zero root ("nothing published"), which
+  every consumer refuses to load data under, with the path and size
+  copied under the lock. It never hangs and never returns a torn root.
+  Every publisher must take the lock: one that does not (a publisher
+  built before this release, or mache before its matching release) can
+  be overlapped by another publisher, and readers treat its odd counter
+  as abandoned. Move every process that publishes to one control block
+  (mache, and the ley-line receiver through its `leyline_core` pin) to
+  this release together.
+
+- **Tests wait on events, not time.** The control block tests hold a
+  publish until the reader reports it has found the publish lock held,
+  and the writer-monotonicity test advances when the reader reports a
+  read, instead of sleeping or polling a deadline. The WAL reader pool's
+  p99 latency budget joins its throughput floor in the perf tier
+  (`LLO_PERF_GATES=1`): both measured the machine as much as the pool,
+  and `task ci` keeps the structural assertion that readers are checked
+  out concurrently.
 ## [0.20.4] — 2026-10-13
 
 Proposals and write safety. A write can now name the bytes its author

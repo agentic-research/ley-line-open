@@ -17,6 +17,17 @@ pub const COMMIT_IDLE: Duration = Duration::from_millis(200);
 /// How often the server checks for a standing truncate.
 const COMMIT_TICK: Duration = Duration::from_millis(50);
 
+/// The status a refused COMMIT answers: `NFS3ERR_STALE` when the file moved
+/// since the edit's base was taken (ADR-0042 P2), `NFS3ERR_IO` for any other
+/// refusal.
+fn commit_status(err: &anyhow::Error) -> nfsstat3 {
+    if err.downcast_ref::<crate::graph::StaleWrite>().is_some() {
+        nfsstat3::NFS3ERR_STALE
+    } else {
+        nfsstat3::NFS3ERR_IO
+    }
+}
+
 /// Changes received but not yet committed. A client writes a file as
 /// SETATTR(size), one UNSTABLE WRITE per chunk, then COMMIT at fsync or
 /// close. Splicing each chunk as it arrived published every torn
@@ -30,6 +41,16 @@ const COMMIT_TICK: Duration = Duration::from_millis(50);
 /// write after the truncate makes the COMMIT its commit. Both are committed
 /// before any operation that changes the tree's shape, and when the server
 /// is dropped.
+///
+/// NFSv3 has no opens and names no client on a WRITE, so every change is
+/// the graph's [`MOUNT_HANDLE`](crate::graph::MOUNT_HANDLE) edit (bead
+/// `ley-line-open-5da276`). Its base is the file's bytes when the first
+/// uncommitted write or truncate to the file arrives, and it is held until
+/// the COMMIT of the file's last staged node lands. A COMMIT whose file
+/// moved since that base — through another mount, a batch splice, or the
+/// COMMIT of another node of the same file — is refused `NFS3ERR_STALE`
+/// and its change discarded. Two clients editing one node share its staged
+/// bytes, since nothing on the wire tells them apart.
 pub struct Staged {
     graph: Arc<dyn Graph>,
     nodes: Mutex<HashMap<String, Stage>>,
@@ -400,13 +421,15 @@ impl NFSFileSystem for LeylineNfs {
 
     /// The client's COMMIT (at fsync or close): splice the node's staged
     /// bytes into its file. The whole node is committed whatever range is
-    /// named, since a file is spliced whole. A refused splice is an I/O
-    /// error, so the fsync or close reports it.
+    /// named, since a file is spliced whole. A refused splice fails the
+    /// COMMIT, so the fsync or close reports it: `NFS3ERR_STALE` (`ESTALE`
+    /// at the client) when the file moved since the edit's base was taken,
+    /// `NFS3ERR_IO` otherwise.
     async fn commit(&self, id: fileid3, _offset: u64, _count: u32) -> Result<(), nfsstat3> {
         let node_id = self.resolve_id(id)?;
         self.staged.commit_node(&node_id).map_err(|e| {
             log::warn!("NFS commit of {node_id} refused: {e:#}");
-            nfsstat3::NFS3ERR_IO
+            commit_status(&e)
         })
     }
 
@@ -812,11 +835,11 @@ mod tests {
         use super::*;
         use crate::graph::SourceWriter;
         use crate::graph::SqliteGraphAdapter;
-        use crate::graph::fixtures::ProjectingWriter;
+        use crate::graph::fixtures::CheckingWriter;
         use rusqlite::Connection;
 
-        /// Records every file the commit hands the write path, then projects
-        /// it as the real writer would.
+        /// Records every file the commit hands the write path, then checks
+        /// its base and projects it as the real writer would.
         #[derive(Default)]
         struct Recorder {
             writes: Mutex<Vec<Vec<u8>>>,
@@ -831,13 +854,17 @@ mod tests {
                 base: Option<leyline_core::Hash>,
             ) -> anyhow::Result<()> {
                 self.writes.lock().push(bytes.clone());
-                ProjectingWriter.write(conn, source_id, bytes, base)
+                CheckingWriter.write(conn, source_id, bytes, base)
             }
         }
 
         fn html_nfs() -> (LeylineNfs, Arc<Recorder>) {
+            nfs_over(b"<p>hello</p>\n")
+        }
+
+        fn nfs_over(html: &[u8]) -> (LeylineNfs, Arc<Recorder>) {
             let db = leyline_ts::parse_with_source(
-                b"<p>hello</p>\n",
+                html,
                 leyline_ts::languages::TsLanguage::Html,
                 "test.html",
             )
@@ -851,8 +878,12 @@ mod tests {
         /// The `<p>`'s text leaf, looked up one component at a time as a
         /// client walks a path.
         async fn text_leaf(nfs: &LeylineNfs) -> fileid3 {
+            walk(nfs, &["test.html", "element", "text"]).await
+        }
+
+        async fn walk(nfs: &LeylineNfs, path: &[&str]) -> fileid3 {
             let mut ino = ROOT_FILEID;
-            for name in ["test.html", "element", "text"] {
+            for name in path {
                 ino = nfs
                     .lookup(ino, &name.as_bytes().to_vec().into())
                     .await
@@ -951,6 +982,33 @@ mod tests {
             ));
         }
 
+        /// Two clients edit two nodes of one file with UNSTABLE writes; the
+        /// second's COMMIT lands. The first client's edit was made against
+        /// the file before it, so its COMMIT is refused `NFS3ERR_STALE`
+        /// (the client's fsync or close sees `ESTALE`) and the node reads
+        /// as stored. Before, the first COMMIT dropped the file's base and
+        /// the second landed unchecked over bytes its client never read.
+        #[tokio::test]
+        async fn a_commit_against_a_file_that_moved_is_refused_stale() {
+            let (nfs, recorder) = nfs_over(b"<p>hello</p>\n<p>there</p>\n");
+            let x = walk(&nfs, &["test.html", "element_0", "text"]).await;
+            let y = walk(&nfs, &["test.html", "element_1", "text"]).await;
+            nfs.write(x, 0, b"world").await.unwrap();
+            nfs.write(y, 0, b"again").await.unwrap();
+            nfs.commit(y, 0, 0).await.unwrap();
+            assert!(matches!(
+                nfs.commit(x, 0, 0).await,
+                Err(nfsstat3::NFS3ERR_STALE)
+            ));
+            assert_eq!(
+                recorder.writes.lock().len(),
+                2,
+                "both COMMITs reach the write path, which checks the base"
+            );
+            assert_eq!(read_all(&nfs, x).await, b"hello");
+            assert_eq!(read_all(&nfs, y).await, b"again");
+        }
+
         /// A truncate with no write after it — `: > f` sends SETATTR alone,
         /// and no COMMIT follows — commits once the idle window has passed,
         /// and not before.
@@ -967,6 +1025,19 @@ mod tests {
             assert!(recorder.writes.lock().is_empty());
             assert!(commit_now(&nfs));
             assert_eq!(*recorder.writes.lock(), vec![b"<p>hel</p>\n".to_vec()]);
+        }
+
+        /// `: > f`, a SETATTR to size 0 alone, commits the empty node once
+        /// the idle window has passed (bead `ley-line-open-8a26d8`).
+        /// Before, the commit of an empty edit returned success without
+        /// landing, and the empty edit stayed staged in the mount.
+        #[tokio::test]
+        async fn a_bare_truncate_to_empty_commits() {
+            let (nfs, recorder) = html_nfs();
+            let ino = text_leaf(&nfs).await;
+            nfs.setattr(ino, size(0)).await.unwrap();
+            assert!(commit_now(&nfs));
+            assert_eq!(*recorder.writes.lock(), vec![b"<p></p>\n".to_vec()]);
         }
 
         #[tokio::test]

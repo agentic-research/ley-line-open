@@ -837,10 +837,15 @@ mod tests {
                         prev[half..],
                         "hook sits before the second half"
                     );
+                    // A read that finished before this publish began may
+                    // still count itself after `done` is sampled: one
+                    // straggler. A read that starts now cannot complete
+                    // while the lock is held, so a second completion means
+                    // the reader skipped the wait (ley-line-open-e37aeb).
                     let probes = held_probes.load(Ordering::Acquire);
                     let done = completed.load(Ordering::Acquire);
                     while held_probes.load(Ordering::Acquire) == probes
-                        && completed.load(Ordering::Acquire) == done
+                        && completed.load(Ordering::Acquire) < done + 2
                     {
                         std::thread::yield_now();
                     }

@@ -1,5 +1,5 @@
 //! ADR-0040 D3 — the one write path (bead `ley-line-open-f2ffbd`), and the
-//! proposal it is the one-file case of (ADR-0041 P1-P2).
+//! proposal it is the one-file case of (ADR-0042 P1-P2).
 //!
 //! `propose(grant, writes)` is the only way a file's bytes change in an
 //! arena; `write(grant, path, bytes)` is its one-file, unchecked case. A
@@ -59,10 +59,12 @@ pub struct Written {
     pub source_blob_hash: Hash,
     /// The arena's `treeRoot` after the write.
     pub tree_root: Hash,
+    /// See [`Accepted::post_commit_error`].
+    pub post_commit_error: Option<String>,
 }
 
 /// What a proposal's author read of a file, checked before the proposal is
-/// applied (ADR-0041 P2).
+/// applied (ADR-0042 P2).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Base {
     /// No check: the write replaces whatever the file holds. What a writer
@@ -82,8 +84,8 @@ pub struct Proposed {
     pub bytes: Vec<u8>,
 }
 
-/// A proposal refused because a file it writes moved since its author read
-/// it. Typed so a caller can map it to `ESTALE`.
+/// A file that moved since its author read it: one entry of
+/// [`Refusal::Stale`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Stale {
     pub path: String,
@@ -97,13 +99,100 @@ impl std::fmt::Display for Stale {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "proposal refused: '{}' moved since it was read (read blob {}, now {})",
+            "'{}' moved since it was read (read blob {}, now {})",
             self.path, self.expected, self.current
         )
     }
 }
 
-impl std::error::Error for Stale {}
+/// Why a proposal was refused (ADR-0042 P1, P2). A refusal is decided
+/// before anything is written and changes nothing; it is the error a
+/// refused [`propose`] returns, so a caller tells it apart from an internal
+/// failure by downcasting (bead `ley-line-open-5dc3a5`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Refusal {
+    /// The proposal writes no file.
+    Empty,
+    /// A path is outside the writer's grant.
+    OutsideGrant { path: String },
+    /// A path names no file in the arena.
+    NoSuchFile { path: String },
+    /// A path appears twice.
+    DuplicatePath { path: String },
+    /// The arena records no tree root for a file (it was not produced by
+    /// `leyline parse` or the daemon).
+    NoTreeRoot { path: String },
+    /// A file is under a different tree root than the proposal's first
+    /// file; one proposal projects one tree.
+    DifferentRoots { path: String, detail: String },
+    /// A file's bytes do not parse cleanly in its language.
+    Syntax { path: String, detail: String },
+    /// A base is neither a blob hash nor the "no check" sentinel. Decided
+    /// by the daemon, which reads bases off the wire.
+    MalformedBase { path: String },
+    /// The arena stores no blob for a file (its `content_hash` is NULL), so
+    /// no blob base can match it.
+    NoStoredBlob { path: String },
+    /// Files moved since their author read them: every one that moved.
+    Stale(Vec<Stale>),
+}
+
+impl Refusal {
+    /// The file the refusal names; `None` for [`Refusal::Empty`] and
+    /// [`Refusal::Stale`], which names its files in its list.
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            Refusal::Empty | Refusal::Stale(_) => None,
+            Refusal::OutsideGrant { path }
+            | Refusal::NoSuchFile { path }
+            | Refusal::DuplicatePath { path }
+            | Refusal::NoTreeRoot { path }
+            | Refusal::DifferentRoots { path, .. }
+            | Refusal::Syntax { path, .. }
+            | Refusal::MalformedBase { path }
+            | Refusal::NoStoredBlob { path } => Some(path),
+        }
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("proposal refused: ")?;
+        match self {
+            Refusal::Empty => f.write_str("it writes nothing"),
+            Refusal::OutsideGrant { path } => {
+                write!(f, "'{path}' is outside the grant")
+            }
+            Refusal::NoSuchFile { path } => write!(f, "'{path}': no such file in this arena"),
+            Refusal::DuplicatePath { path } => write!(f, "it writes '{path}' twice"),
+            Refusal::NoTreeRoot { path } => write!(
+                f,
+                "the arena records no tree root for '{path}' \
+                 (it was not produced by `leyline parse` or the daemon)"
+            ),
+            Refusal::DifferentRoots { path, detail } => write!(f, "'{path}' is {detail}"),
+            Refusal::Syntax { path, detail } => write!(f, "'{path}': {detail}"),
+            Refusal::MalformedBase { path } => write!(
+                f,
+                "the base for '{path}' is neither a 64-hex-char blob hash nor \"{BASE_ANY}\""
+            ),
+            Refusal::NoStoredBlob { path } => write!(
+                f,
+                "the arena stores no blob for '{path}', so no blob base matches it"
+            ),
+            Refusal::Stale(moved) => {
+                let each: Vec<String> = moved.iter().map(Stale::to_string).collect();
+                f.write_str(&each.join("; "))
+            }
+        }
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+/// The wire spelling of [`Base::Any`]: a write that names this base is
+/// applied whatever the file holds (bead `ley-line-open-5dc3a5`).
+pub const BASE_ANY: &str = "any";
 
 /// What an accepted proposal produced.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -112,17 +201,26 @@ pub struct Accepted {
     pub blobs: std::collections::BTreeMap<String, Hash>,
     /// The arena's `treeRoot` after the proposal.
     pub tree_root: Hash,
+    /// A step after `COMMIT` that failed (moving the sidecars into place,
+    /// an index build, the head write). The proposal is applied either
+    /// way; the arena's head and sidecars may describe the previous state
+    /// until a later write or reparse advances them (bead
+    /// `ley-line-open-5db28e`).
+    pub post_commit_error: Option<String>,
 }
 
 /// Apply `writes` as one change: every file lands, in one transaction, or
-/// none does (ADR-0041 P1).
+/// none does (ADR-0042 P1).
 ///
-/// Refused, with no change to the arena, when any path is outside `grant`,
-/// names no `_source` row, or appears twice; when the arena does not record
-/// where a file's tree is rooted, or the files are under different roots;
-/// when any base no longer matches the file ([`Stale`]); or when any file's
-/// bytes do not parse cleanly in its language. Any failure inside the
-/// projection rolls the whole proposal back.
+/// Refused with a [`Refusal`], and no change to the arena, when it writes
+/// nothing; when any path is outside `grant`, names no file, or appears
+/// twice; when any base no longer matches its file (every moved file is
+/// named) or names a blob the arena does not store; when the arena does not
+/// record where a file's tree is rooted, or the files are under different
+/// roots; or when any file's bytes do not parse cleanly in its language.
+/// Any failure inside the projection rolls the whole proposal back and is
+/// an untyped error. `Ok` means the proposal committed, even when a step
+/// after `COMMIT` failed ([`Accepted::post_commit_error`]).
 ///
 /// Bases are checked before the projection's transaction opens, on the
 /// writer's connection. They hold against every other writer because the
@@ -131,74 +229,96 @@ pub struct Accepted {
 pub fn propose(conn: &Connection, grant: &Grant, writes: Vec<Proposed>) -> Result<Accepted> {
     use leyline_core::ContentAddressed;
     if writes.is_empty() {
-        bail!("proposal refused: it writes nothing");
+        return Err(Refusal::Empty.into());
     }
-    for w in &writes {
-        if !grant.covers(&w.path) {
-            bail!(
-                "write to '{}' refused: the path is outside the grant",
-                w.path
-            );
+    if let Some(w) = writes.iter().find(|w| !grant.covers(&w.path)) {
+        return Err(Refusal::OutsideGrant {
+            path: w.path.clone(),
         }
+        .into());
+    }
+
+    // Every file's row, and every base checked, before anything else: a
+    // stale refusal names every file that moved.
+    let mut seen = BTreeSet::new();
+    let mut moved = Vec::new();
+    let mut rows = Vec::with_capacity(writes.len());
+    for w in writes {
+        if !seen.insert(w.path.clone()) {
+            return Err(Refusal::DuplicatePath { path: w.path }.into());
+        }
+        let row: Option<(String, Option<String>, Option<Vec<u8>>)> = conn
+            .query_row(
+                "SELECT language, path, content_hash FROM _source WHERE id = ?1",
+                [&w.path],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((language, abs_path, held)) = row else {
+            return Err(Refusal::NoSuchFile { path: w.path }.into());
+        };
+        if let Base::Blob(expected) = w.base {
+            let Some(current) = held
+                .and_then(|h| <[u8; 32]>::try_from(h).ok())
+                .map(Hash::from_bytes)
+            else {
+                return Err(Refusal::NoStoredBlob { path: w.path }.into());
+            };
+            if current != expected {
+                moved.push(Stale {
+                    path: w.path.clone(),
+                    expected,
+                    current,
+                });
+            }
+        }
+        rows.push((w.path, language, abs_path, w.bytes));
+    }
+    if !moved.is_empty() {
+        return Err(Refusal::Stale(moved).into());
     }
 
     let mut root: Option<PathBuf> = None;
     let mut files = std::collections::BTreeMap::new();
     let mut blobs = std::collections::BTreeMap::new();
-    for w in writes {
-        let path = w.path;
-        let (language, abs_path, held): (String, Option<String>, Option<Vec<u8>>) = conn
-            .query_row(
-                "SELECT language, path, content_hash FROM _source WHERE id = ?1",
-                [&path],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()?
-            .with_context(|| format!("write to '{path}' refused: no such file in this arena"))?;
-        if let Base::Blob(expected) = w.base {
-            let current = held
-                .and_then(|h| <[u8; 32]>::try_from(h).ok())
-                .map(Hash::from_bytes)
-                .unwrap_or(Hash::ZERO);
-            if current != expected {
-                return Err(Stale {
-                    path,
-                    expected,
-                    current,
-                }
-                .into());
-            }
-        }
-        let abs_path = abs_path.with_context(|| {
-            format!(
-                "write to '{path}' refused: the arena records no tree root for it \
-                 (it was not produced by `leyline parse` or the daemon)"
-            )
-        })?;
+    for (path, language, abs_path, bytes) in rows {
+        let Some(abs_path) = abs_path else {
+            return Err(Refusal::NoTreeRoot { path }.into());
+        };
         let file_root = tree_root_dir(Path::new(&abs_path), &path)?;
         match &root {
             None => root = Some(file_root),
-            Some(r) if *r != file_root => bail!(
-                "proposal refused: '{path}' is under {}, not the proposal's tree {}",
-                file_root.display(),
-                r.display()
-            ),
+            Some(r) if *r != file_root => {
+                return Err(Refusal::DifferentRoots {
+                    detail: format!(
+                        "under {}, not the proposal's tree {}",
+                        file_root.display(),
+                        r.display()
+                    ),
+                    path,
+                }
+                .into());
+            }
             Some(_) => {}
         }
         let lang = leyline_ts::languages::TsLanguage::from_name(&language)?;
-        leyline_ts::splice::check_syntax(&w.bytes, lang.ts_language())
-            .with_context(|| format!("write to '{path}' refused"))?;
-        blobs.insert(path.clone(), w.bytes.as_slice().hash());
-        if files.insert(path.clone(), w.bytes).is_some() {
-            bail!("proposal refused: it writes '{path}' twice");
+        if let Err(e) = leyline_ts::splice::check_syntax(&bytes, lang.ts_language()) {
+            return Err(Refusal::Syntax {
+                path,
+                detail: format!("{e:#}"),
+            }
+            .into());
         }
+        blobs.insert(path.clone(), bytes.as_slice().hash());
+        files.insert(path, bytes);
     }
 
     let root = root.expect("a non-empty proposal names a root");
-    let result = crate::cmd_parse::parse_written_files(conn, &root, &files)?;
+    let committed = crate::cmd_parse::parse_written_files(conn, &root, &files)?;
     Ok(Accepted {
         blobs,
-        tree_root: result.tree_root,
+        tree_root: committed.result.tree_root,
+        post_commit_error: committed.post_commit.map(|e| format!("{e:#}")),
     })
 }
 
@@ -217,6 +337,7 @@ pub fn write(conn: &Connection, grant: &Grant, path: &str, bytes: Vec<u8>) -> Re
     Ok(Written {
         source_blob_hash: accepted.blobs[path],
         tree_root: accepted.tree_root,
+        post_commit_error: accepted.post_commit_error,
     })
 }
 
@@ -246,14 +367,30 @@ impl leyline_fs::graph::SourceWriter for MountWriter {
             bytes,
         };
         match propose(conn, &self.grant, vec![proposed]) {
-            Ok(_) => Ok(()),
-            Err(err) => match err.downcast::<Stale>() {
-                Ok(stale) => Err(leyline_fs::graph::StaleWrite {
-                    source_id: stale.path,
-                    expected: stale.expected,
-                    current: stale.current,
+            // The edit committed: the mount must not run its refusal path
+            // over it. A failure after `COMMIT` is logged; the next write
+            // or reparse advances the head and sidecars again.
+            Ok(accepted) => {
+                if let Some(problem) = accepted.post_commit_error {
+                    log::warn!("mount write to '{source_id}' landed; after it: {problem}");
                 }
-                .into()),
+                Ok(())
+            }
+            Err(err) => match err.downcast::<Refusal>() {
+                Ok(Refusal::Stale(moved)) => {
+                    // A one-file proposal: its one moved file.
+                    let stale = moved
+                        .into_iter()
+                        .next()
+                        .expect("a stale refusal names a moved file");
+                    Err(leyline_fs::graph::StaleWrite {
+                        source_id: stale.path,
+                        expected: stale.expected,
+                        current: stale.current,
+                    }
+                    .into())
+                }
+                Ok(other) => Err(other.into()),
                 Err(other) => Err(other),
             },
         }
@@ -613,6 +750,107 @@ mod tests {
         );
     }
 
+    /// Bead `ley-line-open-5db28e`: the `ast.capnp` / `source.capnp`
+    /// sidecars are replaced only when the proposal commits. A proposal that
+    /// rolls back leaves them byte-identical; they used to be truncated and
+    /// rewritten inside the transaction and kept the rolled-back rows.
+    #[test]
+    fn a_rolled_back_proposal_leaves_the_sidecars_byte_identical() {
+        let a = arena(&[("a.go", A), ("b.go", B)]);
+        let sidecars = [
+            a.db.with_extension("ast.capnp"),
+            a.db.with_extension("source.capnp"),
+        ];
+        let before: Vec<Vec<u8>> = sidecars.iter().map(|p| std::fs::read(p).unwrap()).collect();
+        assert!(
+            before.iter().all(|b| !b.is_empty()),
+            "a cold parse writes both"
+        );
+        a.conn
+            .execute_batch(
+                "CREATE TRIGGER refuse_derived_from BEFORE INSERT ON _meta
+                   WHEN NEW.key = 'derived_from'
+                 BEGIN SELECT RAISE(ABORT, 'injected stamp failure'); END;",
+            )
+            .unwrap();
+
+        write(&a.conn, &Grant::Whole, "a.go", A2.as_bytes().to_vec()).unwrap_err();
+
+        let after: Vec<Vec<u8>> = sidecars.iter().map(|p| std::fs::read(p).unwrap()).collect();
+        assert!(after == before, "a rolled-back proposal changes no sidecar");
+        let leftovers: Vec<_> = std::fs::read_dir(a._dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n.to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no temp sidecar is left: {leftovers:?}"
+        );
+    }
+
+    /// The sidecars a committed proposal writes are in place once it lands.
+    #[test]
+    fn a_committed_proposal_replaces_the_sidecars() {
+        let a = arena(&[("a.go", A), ("b.go", B)]);
+        let source = a.db.with_extension("source.capnp");
+        let before = std::fs::read(&source).unwrap();
+        write(&a.conn, &Grant::Whole, "a.go", A2.as_bytes().to_vec()).unwrap();
+        assert_ne!(std::fs::read(&source).unwrap(), before);
+    }
+
+    /// Corrupt the head beside the arena, so the head write after `COMMIT`
+    /// refuses to chain onto it.
+    fn corrupt_head(a: &Arena) {
+        std::fs::write(crate::cmd_parse::head_path_for(&a.db), b"not a head").unwrap();
+    }
+
+    /// Bead `ley-line-open-5db28e`: a step after `COMMIT` that fails does
+    /// not turn an applied proposal into a reported failure. The bytes are
+    /// in `source_blobs`, the proposal is accepted, and the failure is
+    /// reported beside it.
+    #[test]
+    fn a_proposal_whose_head_write_fails_after_commit_is_applied() {
+        let a = arena(&[("a.go", A), ("b.go", B)]);
+        corrupt_head(&a);
+        let accepted = propose(&a.conn, &Grant::Whole, vec![proposed("a.go", blob(A), A2)])
+            .expect("an applied proposal is accepted");
+        assert_eq!(accepted.blobs["a.go"], A2.as_bytes().hash());
+        let problem = accepted
+            .post_commit_error
+            .expect("the failed head write is reported");
+        assert!(problem.contains("head"), "{problem}");
+        let stored: Vec<u8> = a
+            .conn
+            .query_row(
+                "SELECT blob_bytes FROM source_blobs WHERE blob_hash = ?1",
+                [A2.as_bytes().hash().as_bytes().to_vec()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, A2.as_bytes());
+
+        let clean = arena(&[("a.go", A), ("b.go", B)]);
+        let accepted = propose(
+            &clean.conn,
+            &Grant::Whole,
+            vec![proposed("a.go", blob(A), A2)],
+        )
+        .unwrap();
+        assert_eq!(accepted.post_commit_error, None);
+    }
+
+    /// A one-file write whose head write fails after `COMMIT` reports the
+    /// landed blob and the failure.
+    #[test]
+    fn a_write_whose_head_write_fails_after_commit_reports_both() {
+        let a = arena(&[("a.go", A)]);
+        corrupt_head(&a);
+        let w = write(&a.conn, &Grant::Whole, "a.go", A2.as_bytes().to_vec()).unwrap();
+        assert_eq!(w.source_blob_hash, A2.as_bytes().hash());
+        assert!(w.post_commit_error.is_some());
+    }
+
     const B2: &str = "package a\n\nfunc C() string { return \"see\" }\n";
 
     fn proposed(path: &str, base: Base, text: &str) -> Proposed {
@@ -691,14 +929,14 @@ mod tests {
             ],
         )
         .unwrap_err();
-        let stale = err.downcast_ref::<Stale>().expect("a typed stale refusal");
         assert_eq!(
-            stale,
-            &Stale {
+            err.downcast_ref::<Refusal>(),
+            Some(&Refusal::Stale(vec![Stale {
                 path: "a.go".to_string(),
                 expected: A.as_bytes().hash(),
                 current: A2.as_bytes().hash(),
-            }
+            }])),
+            "a typed stale refusal: {err:#}"
         );
         assert!(
             whole_image(&a.conn) == before,
@@ -711,6 +949,151 @@ mod tests {
                 && message.contains(&A2.as_bytes().hash().to_string()),
             "the refusal names the file and both blobs: {message}"
         );
+    }
+
+    /// Bead `ley-line-open-5dc3a5`: a stale refusal names every file that
+    /// moved, not only the first, so its author re-reads them all at once.
+    #[test]
+    fn a_stale_refusal_names_every_moved_file() {
+        let a = arena(&[("a.go", A), ("b.go", B)]);
+        write(&a.conn, &Grant::Whole, "a.go", A2.as_bytes().to_vec()).unwrap();
+        write(&a.conn, &Grant::Whole, "b.go", B2.as_bytes().to_vec()).unwrap();
+        let err = propose(
+            &a.conn,
+            &Grant::Whole,
+            vec![proposed("a.go", blob(A), A), proposed("b.go", blob(B), B)],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<Refusal>(),
+            Some(&Refusal::Stale(vec![
+                Stale {
+                    path: "a.go".to_string(),
+                    expected: A.as_bytes().hash(),
+                    current: A2.as_bytes().hash(),
+                },
+                Stale {
+                    path: "b.go".to_string(),
+                    expected: B.as_bytes().hash(),
+                    current: B2.as_bytes().hash(),
+                },
+            ])),
+            "{err:#}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("'a.go' moved") && message.contains("'b.go' moved"),
+            "{message}"
+        );
+    }
+
+    /// Bead `ley-line-open-5dc3a5`: every refusal a client can act on is
+    /// typed, so it is told apart from an internal error, and changes
+    /// nothing.
+    #[test]
+    fn every_refusal_is_typed_and_changes_nothing() {
+        let a = arena(&[("a.go", A), ("b.go", B)]);
+        let before = whole_image(&a.conn);
+        let refusal = |grant: &Grant, writes: Vec<Proposed>| -> Refusal {
+            let err = propose(&a.conn, grant, writes).unwrap_err();
+            err.downcast_ref::<Refusal>()
+                .unwrap_or_else(|| panic!("an untyped refusal: {err:#}"))
+                .clone()
+        };
+        let only_b = Grant::Paths(BTreeSet::from(["b.go".to_string()]));
+
+        assert_eq!(refusal(&Grant::Whole, vec![]), Refusal::Empty);
+        assert_eq!(
+            refusal(&only_b, vec![proposed("a.go", Base::Any, A2)]),
+            Refusal::OutsideGrant {
+                path: "a.go".to_string()
+            }
+        );
+        assert_eq!(
+            refusal(&Grant::Whole, vec![proposed("z.go", Base::Any, A2)]),
+            Refusal::NoSuchFile {
+                path: "z.go".to_string()
+            }
+        );
+        assert_eq!(
+            refusal(
+                &Grant::Whole,
+                vec![
+                    proposed("a.go", Base::Any, A2),
+                    proposed("a.go", Base::Any, A)
+                ]
+            ),
+            Refusal::DuplicatePath {
+                path: "a.go".to_string()
+            }
+        );
+        let Refusal::Syntax { path, detail } = refusal(
+            &Grant::Whole,
+            vec![proposed("a.go", Base::Any, "package a\nfunc (")],
+        ) else {
+            panic!("a syntax refusal");
+        };
+        assert_eq!(path, "a.go");
+        assert!(detail.contains("syntax errors"), "{detail}");
+        assert_eq!(whole_image(&a.conn), before);
+
+        a.conn
+            .execute(
+                "UPDATE _source SET path = '/elsewhere/b.go' WHERE id = 'b.go'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            refusal(
+                &Grant::Whole,
+                vec![proposed("a.go", Base::Any, A2), proposed("b.go", Base::Any, B2)]
+            ),
+            Refusal::DifferentRoots { path, .. } if path == "b.go"
+        ));
+        a.conn
+            .execute("UPDATE _source SET path = NULL WHERE id = 'b.go'", [])
+            .unwrap();
+        assert_eq!(
+            refusal(&Grant::Whole, vec![proposed("b.go", Base::Any, B2)]),
+            Refusal::NoTreeRoot {
+                path: "b.go".to_string()
+            }
+        );
+    }
+
+    /// Bead `ley-line-open-5dc3a5`: a file whose `content_hash` is NULL has
+    /// no stored blob, so no blob base matches it — not even the zero hash
+    /// that once stood in for the missing one. `Base::Any` still writes it.
+    #[test]
+    fn a_file_with_no_stored_blob_refuses_every_blob_base() {
+        let a = arena(&[("a.go", A)]);
+        a.conn
+            .execute(
+                "UPDATE _source SET content_hash = NULL WHERE id = 'a.go'",
+                [],
+            )
+            .unwrap();
+        let before = whole_image(&a.conn);
+        let err = propose(
+            &a.conn,
+            &Grant::Whole,
+            vec![proposed("a.go", Base::Blob(Hash::ZERO), A2)],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<Refusal>(),
+            Some(&Refusal::NoStoredBlob {
+                path: "a.go".to_string()
+            }),
+            "{err:#}"
+        );
+        assert!(whole_image(&a.conn) == before, "nothing lands");
+        propose(
+            &a.conn,
+            &Grant::Whole,
+            vec![proposed("a.go", Base::Any, A2)],
+        )
+        .unwrap();
     }
 
     /// One proposal is one tree: files recorded under different roots are
@@ -845,6 +1228,31 @@ mod tests {
                 expected: A.as_bytes().hash(),
                 current: A2.as_bytes().hash(),
             })
+        );
+    }
+
+    /// Bead `ley-line-open-5db28e`: the mount's writer answers `Ok` once the
+    /// edit committed, even when a step after `COMMIT` fails, so the mount
+    /// never runs its refusal path over an edit that landed.
+    #[cfg(feature = "mount")]
+    #[test]
+    fn the_mount_writer_answers_ok_when_the_edit_landed() {
+        use leyline_fs::graph::SourceWriter;
+        let a = arena(&[("a.go", A)]);
+        corrupt_head(&a);
+        MountWriter {
+            grant: Grant::Whole,
+        }
+        .write(
+            &a.conn,
+            "a.go",
+            A2.as_bytes().to_vec(),
+            Some(A.as_bytes().hash()),
+        )
+        .expect("the edit landed");
+        assert_eq!(
+            leyline_ts::splice::source_bytes(&a.conn, file_id(&a.conn, "a.go")).unwrap(),
+            A2.as_bytes(),
         );
     }
 

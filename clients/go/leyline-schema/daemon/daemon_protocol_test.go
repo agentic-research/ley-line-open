@@ -196,12 +196,21 @@ type staleRefusal struct {
 	Current  string `json:"current"`
 }
 
+// proposalRefusal mirrors ProposalRefusal. `reason` is a RefusalReason
+// enumerant in its snake_case wire spelling.
+type proposalRefusal struct {
+	Reason *string        `json:"reason"`
+	Path   *string        `json:"path,omitempty"`
+	Moved  []staleRefusal `json:"moved,omitempty"`
+}
+
 type proposeResponse struct {
-	OK       *bool         `json:"ok"`
-	TreeRoot *string       `json:"tree_root,omitempty"`
-	Blobs    []pathHash    `json:"blobs,omitempty"`
-	Stale    *staleRefusal `json:"stale,omitempty"`
-	Error    *string       `json:"error,omitempty"`
+	OK              *bool            `json:"ok"`
+	TreeRoot        *string          `json:"tree_root,omitempty"`
+	Blobs           []pathHash       `json:"blobs,omitempty"`
+	Refusal         *proposalRefusal `json:"refusal,omitempty"`
+	Error           *string          `json:"error,omitempty"`
+	PostCommitError *string          `json:"post_commit_error,omitempty"`
 }
 
 type listChildrenResponse struct {

@@ -275,7 +275,7 @@ struct ReadContentResponse {
 }
 
 # A whole source file by its path relative to the tree root (`_source.id`),
-# with the blob hash a later `propose` names as its base (ADR-0041 P2).
+# with the blob hash a later `propose` names as its base (ADR-0042 P2).
 struct ReadSourceRequest {
   path @0 :Text;
 }
@@ -283,15 +283,17 @@ struct ReadSourceRequest {
 struct ReadSourceResponse {
   ok       @0 :Bool;
   content  @1 :Text;
-  # BLAKE3 of `content`'s bytes, 64 hex chars: the `source_blobs` key.
+  # The file's `_source.content_hash`, 64 hex chars: the `source_blobs` key
+  # of `content` and the hash `propose` compares a base against.
   blobHash @2 :Text  $Json.name("blob_hash");
   # The arena's treeRoot (ADR-0040 D1) the file was read under, 64 hex chars.
   treeRoot @3 :Text  $Json.name("tree_root");
   error    @4 :Text;
 }
 
-# One file of a proposal: its path, the blob hash its author read (empty:
-# no check), and its new content.
+# One file of a proposal: its path, the base its author read, and its new
+# content. `base` is required: the `blob_hash` from `read_source` (64 hex
+# chars), or `any` to write whatever the file holds.
 struct ProposedWrite {
   path    @0 :Text;
   base    @1 :Text;
@@ -299,7 +301,7 @@ struct ProposedWrite {
 }
 
 # Several files written as one change, applied whole or refused whole
-# (ADR-0041 P1).
+# (ADR-0042 P1).
 struct ProposeRequest {
   writes @0 :List(ProposedWrite);
 }
@@ -309,7 +311,7 @@ struct PathHash {
   blobHash @1 :Text  $Json.name("blob_hash");
 }
 
-# Why a proposal was refused when a file moved since its author read it.
+# A file that moved since its author read it.
 struct StaleRefusal {
   path     @0 :Text;
   # The blob the author read.
@@ -318,15 +320,56 @@ struct StaleRefusal {
   current  @2 :Text;
 }
 
+# Why a proposal was refused (ADR-0042 P1, P2). Every refusal is decided
+# before anything is written and changes nothing.
+enum RefusalReason {
+  # Files moved since their author read them; `moved` names every one.
+  stale          @0;
+  # A path is outside the writer's grant.
+  outsideGrant   @1 $Json.name("outside_grant");
+  # A path names no file in the arena.
+  noSuchFile     @2 $Json.name("no_such_file");
+  # A path appears twice.
+  duplicatePath  @3 $Json.name("duplicate_path");
+  # A file is under a different tree root than the proposal's first file.
+  differentRoots @4 $Json.name("different_roots");
+  # The arena records no tree root for a file.
+  noTreeRoot     @5 $Json.name("no_tree_root");
+  # A file's content does not parse cleanly in its language.
+  syntax         @6;
+  # A base is neither a 64-hex-char blob hash nor `any`.
+  malformedBase  @7 $Json.name("malformed_base");
+  # The arena stores no blob for a file, so no blob base matches it.
+  noStoredBlob   @8 $Json.name("no_stored_blob");
+  # The proposal writes no file.
+  empty          @9;
+}
+
+struct ProposalRefusal {
+  reason @0 :RefusalReason;
+  # The file the refusal names; unset for `stale` and `empty`.
+  path   @1 :Text;
+  # `stale` only: every file that moved.
+  moved  @2 :List(StaleRefusal);
+}
+
+# `ok` true means the proposal was applied: its files are committed. `ok`
+# false with `refusal` means it was refused and nothing changed; `ok` false
+# without `refusal` is an internal error (a projection failure rolls back,
+# so nothing changed either).
 struct ProposeResponse {
-  ok       @0 :Bool;
+  ok              @0 :Bool;
   # The arena's treeRoot after the proposal (ok only).
-  treeRoot @1 :Text  $Json.name("tree_root");
+  treeRoot        @1 :Text  $Json.name("tree_root");
   # Each written path's new blob hash (ok only).
-  blobs    @2 :List(PathHash);
-  # Set when the proposal was refused because a base moved.
-  stale    @3 :StaleRefusal;
-  error    @4 :Text;
+  blobs           @2 :List(PathHash);
+  # Set when the proposal was refused.
+  refusal         @3 :ProposalRefusal;
+  error           @4 :Text;
+  # ok only: a step after the commit that failed (the head write, an index
+  # build, the publish). The proposal is applied; the head or the published
+  # snapshot may lag it until the next write or reparse advances them.
+  postCommitError @5 :Text  $Json.name("post_commit_error");
 }
 
 struct FindCallersRequest {

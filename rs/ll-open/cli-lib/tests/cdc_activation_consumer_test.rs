@@ -235,6 +235,11 @@ fn downstream_nodes_only_projection_survives_the_complete_cdc_lifecycle() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
+    // A downstream projection is nodes-only: it has no syntax tree. With
+    // the `splice` feature, a write to a node with an `_ast` row is an edit
+    // of a parsed file, which stays pending until its flush proposes it
+    // (bead ley-line-open-5d8246) — not the chunk lifecycle under test.
+    conn.execute("DELETE FROM _ast", []).unwrap();
     drop(conn);
 
     leyline_cli_lib::cmd_cdc::enable_database(

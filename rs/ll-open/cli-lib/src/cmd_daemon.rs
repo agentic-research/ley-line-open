@@ -1309,6 +1309,19 @@ pub fn try_snapshot_or_log(
     }
 }
 
+/// `image` as a standalone rollback-mode database. The live db is WAL-mode,
+/// and its serialized image keeps the WAL stamp in header bytes 18 and 19
+/// (file format write and read versions, 2 = WAL). `sqlite3_deserialize`
+/// of a WAL-stamped image fails every query with `SQLITE_CANTOPEN`, so a
+/// published image must say 1 (rollback) there (bead
+/// `ley-line-open-2bd77c`). The pages are unchanged.
+pub(crate) fn rollback_image(mut image: Vec<u8>) -> Vec<u8> {
+    if let Some(versions) = image.get_mut(18..20) {
+        versions.fill(1);
+    }
+    image
+}
+
 /// Serialize the living db and write it into the arena.
 ///
 /// **Ordering contract** (load-bearing — see closed-source ley-line
@@ -1335,19 +1348,6 @@ pub fn try_snapshot_or_log(
 ///    together under the seqlock. Its error aborts the snapshot;
 ///    callers (snapshot_or_log) move the daemon into Error phase so
 ///    operators see it.
-/// `image` as a standalone rollback-mode database. The live db is WAL-mode,
-/// and its serialized image keeps the WAL stamp in header bytes 18 and 19
-/// (file format write and read versions, 2 = WAL). `sqlite3_deserialize`
-/// of a WAL-stamped image fails every query with `SQLITE_CANTOPEN`, so a
-/// published image must say 1 (rollback) there (bead
-/// `ley-line-open-2bd77c`). The pages are unchanged.
-pub(crate) fn rollback_image(mut image: Vec<u8>) -> Vec<u8> {
-    if let Some(versions) = image.get_mut(18..20) {
-        versions.fill(1);
-    }
-    image
-}
-
 pub fn snapshot_to_arena(conn: &rusqlite::Connection, ctrl_path: &Path) -> Result<()> {
     let db_bytes = rollback_image(
         conn.serialize("main")

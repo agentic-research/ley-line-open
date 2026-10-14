@@ -144,8 +144,13 @@ interleaved.
 | 616 | `projection_schema_version` [32] | NUL-padded text |
 | 1024-1064 | interrupt fields | moved, unchanged |
 
-The sole publisher holds an exclusive lock on the control file and repairs an odd sequence on open
-(closing `0a8c14`); readers bound their spin and re-read the version inside the seqlock.
+Every publisher holds an exclusive lock on the control file for as long as the sequence is odd, and
+a publish that finds the sequence already odd keeps it odd and ends it even over a whole payload.
+A reader facing an odd sequence probes the lock shared: held means a live publish, so it waits; free,
+with the sequence unmoved under the shared lock, means an abandoned publish, so it answers the last
+consistent snapshot its handle read, or nothing published if it has read none, and never the torn
+payload. The lock decides, not a clock. Readers re-read the version inside the seqlock. This shipped
+on control block v3 in v0.20.5 (`0a8c14`, mache's reader mirrors it); v4 keeps it.
 
 ### S5 — One producer
 
@@ -157,8 +162,11 @@ warm-start fallback is removed with the arena.
 
 ### S6 — Transport carries what proposals carry
 
-ADR-0040 D2 makes the sub-manifest plus its source blobs the transport unit, named by `treeRoot`.
-Receiving one is a proposal whose bases are the receiver's current state of those paths; the
+ADR-0040 D2 makes the sub-manifest plus its source blobs the transport unit. `treeRoot` folds in
+`parserId`, so the unit is named by the pair `(treeRoot, parserId)` and the pair travels with it; a
+receiver verifies the received blobs against the sub-manifest's per-path blob hashes, which do not
+depend on the parser, and recomputes `treeRoot` only under the sender's `parserId`. Receiving one is
+a proposal whose bases are the receiver's current state of those paths; the
 receiver re-parses (ADR-0040 F5). Fetching derived rows instead is deferred: today's rows carry the
 source path and arena-local interned ids, so `(sourceHash, parserId) → outputHash` is not a function;
 a later ADR may define a path-free encoding and its signer. ley-line's net layer keeps its
@@ -177,7 +185,7 @@ ______________________________________________________________________
 | H4 | growth is not an event | a snapshot ten times larger publishes with no reader refusal |
 | H5 | publication cost | after 1,000 publishes on APFS: no image-sized memcpy or hash on the write lock |
 | H6 | one producer | only the publisher writes the control block |
-| H7 | a mid-publish death does not wedge readers | kill between seqlock begin and end; readers do not hang; the restart repairs parity (`0a8c14`) |
+| H7 | a mid-publish death does not wedge readers | kill between seqlock begin and end; readers do not hang and keep their last snapshot; the next publish repairs parity (`0a8c14`) |
 | H8 | epochs separate lifecycles | a grant from before `--reset-arena` is refused after it |
 | H9 | receipts attribute | interleaved proposals: `appliedTo`, `resultRoot`, `proposalDigest` separate the run's writes |
 
